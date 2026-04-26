@@ -1,0 +1,52 @@
+{
+  "name": "sovereign-memory",
+  "version": "0.1.0",
+  "description": "Local-first Sovereign Memory spine for KiloCode: automatic recall, vault-first learning, agent-to-agent handoff, and continuity across sessions.",
+  "author": {
+    "name": "Hans Axelsson",
+    "email": "local@localhost",
+    "url": "https://github.com/infektyd"
+  },
+  "homepage": "https://github.com/infektyd/sovereign-memory",
+  "repository": "https://github.com/infektyd/sovereign-memory",
+  "license": "MIT",
+  "keywords": [
+    "sovereign-memory",
+    "obsidian",
+    "llm-wiki",
+    "local-first",
+    "mcp",
+    "spine"
+  ],
+  "mcpServers": {
+    "sovereign-memory": {
+      "command": "node",
+      "args": ["${KILO_PLUGIN_ROOT}/dist/server.js"],
+      "cwd": "${KILO_PLUGIN_ROOT}"
+    }
+  },
+  "skills": "./skills/",
+  "hooks": "./hooks/hooks.json",
+  "interface": {
+    "displayName": "Sovereign Memory",
+    "shortDescription": "Local recall and KiloCode-owned Obsidian memory",
+    "longDescription": "Sovereign Memory gives KiloCode transparent local recall, manual vault-first learning, and readable audit logs through a local MCP server. It talks to the existing Sovereign daemon and keeps expensive extraction out of v1.",
+    "developerName": "Hans Axelsson",
+    "category": "Coding",
+    "capabilities": [
+      "Interactive",
+      "Read",
+      "Write"
+    ],
+    "websiteURL": "https://github.com/infektyd/sovereign-memory",
+    "privacyPolicyURL": "https://github.com/infektyd/sovereign-memory",
+    "termsOfServiceURL": "https://github.com/infektyd/sovereign-memory",
+    "defaultPrompt": [
+      "Recall Sovereign Memory for this task",
+      "Learn this in the KiloCode vault",
+      "Show recent Sovereign Memory audit logs"
+    ],
+    "brandColor": "#2563EB",
+    "screenshots": []
+  }
+}

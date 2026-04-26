@@ -1,7 +1,7 @@
 {
-  "name": "sovereign-memory-codex-plugin",
+  "name": "sovereign-memory-multi-plugin",
   "version": "0.1.0",
-  "description": "Local Codex plugin bridge for Sovereign Memory.",
+  "description": "Local multi-target plugin bridge for Sovereign Memory (Codex, Claude Code, Gemini, KiloCode).",
   "type": "module",
   "main": "dist/server.js",
   "scripts": {
@@ -11,7 +11,8 @@
     "design:lint": "npx @google/design.md lint ../../DESIGN.md",
     "test:live:prepare": "npm run build && node tests/live-prepare-task.mjs",
     "smoke:status": "npm run build && node dist/cli.js status",
-    "smoke:hook": "npm run build && node dist/hook.js SessionStart < /dev/null"
+    "smoke:hook": "npm run build && node dist/hook.js SessionStart < /dev/null",
+    "smoke:kilocode-hook": "npm run build && node dist/kilocode-hook.js SessionStart < /dev/null"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",

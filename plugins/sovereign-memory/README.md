@@ -1,6 +1,6 @@
 # Sovereign Memory Plugin
 
-Local-first plugin for Sovereign Memory. Multi-target: ships a Codex plugin (`.codex-plugin/`), Claude Code plugin (`.claude-plugin/`), and Gemini extension (`.gemini-plugin/`) from the same source tree and shared `dist/` build. Each agent gets its own Obsidian vault; all agents share the same daemon. Exposes recall, AI-facing vault context packs, manual vault-first learning, learning quality checks, structured Obsidian note writes, compile dry-runs, handoffs, information request contracts, and audit tools through MCP. On Claude Code, hooks wire memory in as a session spine.
+Local-first plugin for Sovereign Memory. Multi-target: ships a Codex plugin (`.codex-plugin/`), Claude Code plugin (`.claude-plugin/`), Gemini extension (`.gemini-plugin/`), and KiloCode plugin (`.kilocode-plugin/`) from the same source tree and shared `dist/` build. Each agent gets its own Obsidian vault; all agents share the same daemon. Exposes recall, AI-facing vault context packs, manual vault-first learning, learning quality checks, structured Obsidian note writes, compile dry-runs, handoffs, information request contracts, and audit tools through MCP. On Claude Code and KiloCode, hooks wire memory in as a session spine.
 
 The optional frontend lives in `frontend/`. Run `npm run console` to start the local-only bridge at `http://127.0.0.1:8765/` and generate real `sovereign_prepare_task` and `sovereign_prepare_outcome` packets from the same backend functions used by MCP/CLI. Opening `frontend/index.html` directly still works as a static packet inspector fallback.
 
@@ -9,11 +9,13 @@ The optional frontend lives in `frontend/`. Run `npm run console` to start the l
 - Sovereign daemon socket: `SOVEREIGN_SOCKET_PATH` if set, otherwise `/tmp/sovereign.sock`; v4 JSON-RPC helpers also fall back to `/tmp/sovrd.sock`.
 - AFM health URL: `http://127.0.0.1:11437/health`
 - Codex vault: `~/.sovereign-memory/codex-vault`
+- KiloCode vault: `~/.sovereign-memory/kilocode-vault`
 
 Override with:
 
 ```bash
 export SOVEREIGN_CODEX_VAULT_PATH=/path/to/codex-vault
+export SOVEREIGN_KILOCODE_VAULT_PATH=/path/to/kilocode-vault
 export SOVEREIGN_SOCKET_PATH=/tmp/sovrd.sock
 export SOVEREIGN_AFM_HEALTH_URL=http://127.0.0.1:11437/health
 export SOVEREIGN_AFM_PREPARE_TASK_URL=http://127.0.0.1:11437/v1/chat/completions
@@ -92,6 +94,30 @@ Agent vault roots are resolved from `SOVEREIGN_AGENT_VAULTS`, per-agent
 `SOVEREIGN_<AGENT>_VAULT_PATH`, or the local `~/.sovereign-memory/<agent>-vault`
 default. This keeps identity and storage routing in config/runtime ownership
 rather than in model-provided paths.
+
+## KiloCode Plugin
+
+Install in KiloCode (local plugin dir):
+
+```bash
+kilo plugin install --plugin-dir /path/to/sovereign-memory/plugins/sovereign-memory/.kilocode-plugin
+```
+
+The KiloCode surface adds:
+
+- **Vault**: `~/.sovereign-memory/kilocode-vault` (override: `SOVEREIGN_KILOCODE_VAULT_PATH`).
+- **Agent identity**: `kilocode` (override: `SOVEREIGN_KILOCODE_AGENT_ID`).
+- **Hooks** (`hooks/hooks.json`):
+  - `SessionStart` — boots identity, audit tail, pending-inbox learnings.
+  - `UserPromptSubmit` — auto-recalls before each turn, injects ranked vault + daemon results.
+  - `PreCompact` — captures scar tissue (failed paths, dead ends) so post-compaction KiloCode doesn't repeat them.
+  - `Stop` — drafts candidate learnings to vault inbox; never auto-writes.
+- **Slash commands** (namespaced as `/sovereign-memory:*`): `recall`, `learn`, `status`, `audit`, `prepare-task`, `prepare-outcome`.
+- **Agent-first envelope**: hook output is wrapped as `<sovereign:context version="1" event="..." agent="kilocode" tokens="...">` containing deterministic JSON for prompt-cache stability.
+
+Disable hooks without uninstalling: `export SOVEREIGN_KILOCODE_HOOKS=off`.
+
+The Codex plugin (`.codex-plugin/`), Claude Code plugin (`.claude-plugin/`), Gemini extension (`.gemini-plugin/`), and other integrations (Hermes, OpenClaw) are unaffected — they share the daemon, not the vault.
 
 ## Local Console
 
