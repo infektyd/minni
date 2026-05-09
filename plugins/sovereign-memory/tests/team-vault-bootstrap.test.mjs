@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { after, test } from "node:test";
-import { mkdtemp, readFile, readdir, rm, stat } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
@@ -78,6 +78,25 @@ test("bootstrapApprenticeVault creates a fresh vault tree with seeded files", as
   assert.match(agentsMd, /Promoted from:\*\* team-reviewer-1/);
   assert.match(agentsMd, /Promotion score:\*\* 5/);
   assert.match(agentsMd, /completed assigned task; submitted evidence plus verification/);
+  // Pin the memory-policy line: recall, learn, vault-writes are each labeled correctly.
+  assert.match(agentsMd, /Memory policy:\*\* recall=allowed, learn=manual-only, vault-writes=manual-only/);
+});
+
+test("bootstrapApprenticeVault throws clearly when vaultPath exists as a non-directory", async () => {
+  const root = await makeTmpRoot();
+  const agentsDir = path.join(root, "agents");
+  await mkdir(agentsDir, { recursive: true });
+  const collidingPath = path.join(agentsDir, "collide-vault");
+  await writeFile(collidingPath, "not a directory", "utf8");
+
+  await assert.rejects(
+    bootstrapApprenticeVault({
+      sovereignRoot: root,
+      permanentAgentId: "collide",
+      profile: makePermanentProfile(),
+    }),
+    /vaultPath exists but is not a directory/,
+  );
 });
 
 test("bootstrapApprenticeVault is idempotent on re-call", async () => {

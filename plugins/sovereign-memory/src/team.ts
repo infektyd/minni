@@ -969,6 +969,12 @@ function promotionContextMarkdown(packet: Omit<TeamPromotionPacket, "contextMark
   return sections.join("\n\n");
 }
 
+/**
+ * Async because the optional apprentice-vault bootstrap performs FS writes
+ * when the 4-condition gate is satisfied (approved + bootstrapVault +
+ * promoted-draft + sovereignRoot). When bootstrap is gated off, the function
+ * still returns a Promise but performs no I/O.
+ */
 export async function buildTeamPromotionPacket(
   input: TeamPromotionInput,
   deps: BuildTeamPromotionDeps = {},
