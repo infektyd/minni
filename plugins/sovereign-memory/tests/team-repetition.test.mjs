@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import test from "node:test";
 
 import {
@@ -7,6 +10,7 @@ import {
   MAX_SUGGESTIONS,
   findRepeatedAgents,
 } from "../dist/team-repetition.js";
+import { recordAudit } from "../dist/vault.js";
 
 const NOW = new Date("2026-05-08T12:00:00.000Z");
 
@@ -343,4 +347,37 @@ test("findRepeatedAgents exposes documented defaults", () => {
   assert.equal(DEFAULT_LOOKBACK_DAYS, 14);
   assert.equal(DEFAULT_MIN_REPEATS, 3);
   assert.equal(MAX_SUGGESTIONS, 20);
+});
+
+// Regression guard for the double-counting bug: recordAudit writes every entry
+// to BOTH log.md AND logs/<date>.md. The default reader must prefer dailies and
+// only fall back to log.md when no dailies exist, otherwise every observation
+// would be counted twice and a single repetition would trip suggestPromotion.
+test("findRepeatedAgents integration — real recordAudit writes are not double-counted", async () => {
+  const tmpVault = await mkdtemp(path.join(tmpdir(), "sm-team-repetition-"));
+  try {
+    const sharedAgents = [
+      { agentId: "team-worker-1", role: "worker", focus: "Audit Swift concurrency" },
+    ];
+    for (let i = 0; i < 3; i += 1) {
+      await recordAudit(tmpVault, {
+        tool: "sovereign_team_runtime",
+        summary: `spawn ${i}`,
+        details: {
+          runtimeId: `team-int-${i}`,
+          coordinatorAgentId: "codex",
+          workspaceId: "/repo",
+          agents: sharedAgents,
+          automaticLearning: false,
+        },
+      });
+    }
+    const result = await findRepeatedAgents({ vaultPath: tmpVault });
+    assert.equal(result.length, 1, "expected a single signature");
+    assert.equal(result[0].count, 3, "count must be 3, not 6 (double-counting regression)");
+    assert.equal(result[0].suggestPromotion, true);
+    assert.equal(result[0].normalizedFocus, "audit swift concurrency");
+  } finally {
+    await rm(tmpVault, { recursive: true, force: true });
+  }
 });

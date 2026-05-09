@@ -1,4 +1,4 @@
-import { readdir, readFile } from "node:fs/promises";
+import { readdir, readFile, stat } from "node:fs/promises";
 import path from "node:path";
 
 export const DEFAULT_LOOKBACK_DAYS = 14;
@@ -11,6 +11,13 @@ export interface RepeatedAgentSuggestion {
   role: string;
   normalizedFocus: string;
   count: number;
+  /**
+   * Earliest chronological observations (oldest first), capped at 3.
+   * The first observation is load-bearing for markdown rendering — the
+   * `## Repeated Agent Patterns` bullet renders `examples[0]` as the
+   * grounding example. Do not switch to "most recent" without updating
+   * the renderer in team.ts.
+   */
   examples: Array<{
     runtimeId: string;
     timestamp: string;
@@ -58,6 +65,12 @@ function normalizeFocus(focus: string): string {
     .replace(/\.$/, "");
 }
 
+// JSON parse failures here typically indicate recordAudit truncation
+// (per-line cap >1000 chars or block cap >4000 chars in vault.ts append the
+// `…` sentinel mid-JSON). Truncated entries become invalid JSON and are
+// silently dropped from counts. Today's payloads stay well under, but a
+// runtime with many agents or long focus strings could trip this — fix
+// at the recordAudit layer, not here.
 function parseAuditFile(text: string): ParsedAuditEntry[] {
   const entries: ParsedAuditEntry[] = [];
   // First section before the initial `## [` is file preamble (e.g. the `# 2026-05-08 ...` heading).
@@ -93,21 +106,41 @@ function isoDate(date: Date): string {
   return date.toISOString().slice(0, 10);
 }
 
+async function fileExists(filePath: string): Promise<boolean> {
+  try {
+    const st = await stat(filePath);
+    return st.isFile();
+  } catch {
+    return false;
+  }
+}
+
+// recordAudit writes EVERY entry to BOTH log.md AND logs/<date>.md, so reading
+// both would double-count every observation (a real 2x repetition would land
+// at count=4 and trip suggestPromotion=true at minRepeats=3). Dailies are the
+// canonical per-day record; the rolling log.md is only used as a fallback when
+// no daily files exist (e.g. a vault that has never recorded an audit, or a
+// pre-dailies legacy vault).
 async function defaultReadAuditLogPaths(vaultPath: string): Promise<string[]> {
-  const paths: string[] = [];
+  const dailies: string[] = [];
   const logsDir = path.join(vaultPath, "logs");
   try {
     const entries = await readdir(logsDir);
-    for (const name of entries.sort()) {
+    for (const name of entries) {
       if (/^\d{4}-\d{2}-\d{2}\.md$/.test(name)) {
-        paths.push(path.join(logsDir, name));
+        dailies.push(path.join(logsDir, name));
       }
     }
   } catch {
-    // logs/ may not exist yet on a fresh vault; the rolling log.md still gets scanned.
+    // logs/ missing — fall back to rolling log.md.
   }
-  paths.push(path.join(vaultPath, "log.md"));
-  return paths;
+  if (dailies.length > 0) {
+    dailies.sort();
+    return dailies;
+  }
+  const rolling = path.join(vaultPath, "log.md");
+  if (await fileExists(rolling)) return [rolling];
+  return [];
 }
 
 function dateFromLogFilename(filePath: string): Date | undefined {

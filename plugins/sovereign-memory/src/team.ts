@@ -97,6 +97,8 @@ export interface BuildTeamRuntimeInput {
   includeVault?: boolean;
   useAfm?: boolean;
   ttlSeconds?: number;
+  repetitionLookbackDays?: number;
+  repetitionMinRepeats?: number;
 }
 
 export interface TeamRuntimeDeps {
@@ -377,6 +379,9 @@ async function buildPreparedTeamRuntime(
     }),
   );
 
+  // audit MUST run before findRepeated so the just-spawned runtime is included
+  // in the lookback window. A 3rd repetition correctly tips into "promote" on
+  // its own spawn (rather than only being noticed on the 4th). Do not reorder.
   await audit(vaultPath, {
     tool: "sovereign_team_runtime",
     summary: input.task.slice(0, 120),
@@ -390,13 +395,14 @@ async function buildPreparedTeamRuntime(
   });
 
   // Best-effort: repetition computation must never break runtime building.
-  // Read the audit AFTER recording so the just-spawned runtime is included in the window.
   let repeatedAgentSuggestions: RepeatedAgentSuggestion[] = [];
   try {
     const finder = deps.findRepeated ?? findRepeatedAgents;
     repeatedAgentSuggestions = await finder({
       vaultPath,
       now: createdAtDate,
+      lookbackDays: input.repetitionLookbackDays,
+      minRepeats: input.repetitionMinRepeats,
     });
   } catch {
     repeatedAgentSuggestions = [];
