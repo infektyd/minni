@@ -6,6 +6,7 @@ import { harvestEvidence } from "./team-harvest.js";
 import type { HarvestDeps, HarvestedLearning } from "./team-harvest.js";
 import { findRepeatedAgents } from "./team-repetition.js";
 import type { RepeatedAgentSuggestion } from "./team-repetition.js";
+import { bootstrapApprenticeVault } from "./team-vault-bootstrap.js";
 import { recordAudit } from "./vault.js";
 
 export const DEFAULT_TEAM_TTL_SECONDS = 86400;
@@ -183,6 +184,9 @@ export interface TeamPromotionInput {
   requestedPermissions?: TeamPermission[];
   approved?: boolean;
   permanentAgentId?: string;
+  bootstrapVault?: boolean;
+  sovereignRoot?: string;
+  seedInbox?: Array<{ slug: string; payload: Record<string, unknown> }>;
 }
 
 export interface TeamPromotionPacket {
@@ -197,6 +201,11 @@ export interface TeamPromotionPacket {
   };
   nextStep: string;
   contextMarkdown: string;
+  apprenticeVaultPath?: string;
+}
+
+export interface BuildTeamPromotionDeps {
+  bootstrap?: typeof bootstrapApprenticeVault;
 }
 
 const DEFAULT_TEAM: TeamAgentRequest[] = [
@@ -931,7 +940,7 @@ function normalizeRequestedPermissions(agent: TemporaryAgentProfile, requested?:
 }
 
 function promotionContextMarkdown(packet: Omit<TeamPromotionPacket, "contextMarkdown">): string {
-  return [
+  const sections = [
     "# Sovereign Team Promotion Review",
     `Temporary agent: ${packet.temporaryProfile.agentId}`,
     `Status: ${packet.status}`,
@@ -946,10 +955,24 @@ function promotionContextMarkdown(packet: Omit<TeamPromotionPacket, "contextMark
     packet.status === "needs-approval"
       ? "Promotion requires explicit operator approval before a permanent profile is drafted."
       : "This is a promoted draft only. Review and persist through the approved durable-memory path if desired.",
-  ].join("\n\n");
+  ];
+  if (packet.apprenticeVaultPath) {
+    sections.push(
+      "## Apprentice Vault Bootstrap",
+      [
+        `- **Path:** ${packet.apprenticeVaultPath}`,
+        "- **Status:** initialized",
+        "- **Next step:** Begin populating wiki/ with the apprentice's confirmed learnings.",
+      ].join("\n"),
+    );
+  }
+  return sections.join("\n\n");
 }
 
-export function buildTeamPromotionPacket(input: TeamPromotionInput): TeamPromotionPacket {
+export async function buildTeamPromotionPacket(
+  input: TeamPromotionInput,
+  deps: BuildTeamPromotionDeps = {},
+): Promise<TeamPromotionPacket> {
   const requestedPermissions = normalizeRequestedPermissions(input.agent, input.requestedPermissions);
   const delta = permissionDelta(input.agent.permissions, requestedPermissions);
   const approved = input.approved === true && input.evidence.recommended === true;
@@ -971,16 +994,49 @@ export function buildTeamPromotionPacket(input: TeamPromotionInput): TeamPromoti
         },
       }
     : undefined;
+
+  const status: TeamPromotionPacket["status"] = permanentProfile ? "promoted-draft" : "needs-approval";
+  let nextStep = permanentProfile
+    ? "Human review and persist through an explicit durable profile write if this permanent agent should exist."
+    : "Get explicit operator approval before drafting or persisting a permanent profile.";
+
+  let apprenticeVaultPath: string | undefined;
+  // Only bootstrap when explicitly approved AND opted-in AND we actually drafted a promotion.
+  if (
+    input.approved === true &&
+    input.bootstrapVault === true &&
+    status === "promoted-draft" &&
+    permanentProfile
+  ) {
+    if (!input.sovereignRoot) {
+      // Surface the missing-input as guidance without throwing — the review packet remains valuable.
+      nextStep = `${nextStep} Bootstrap skipped: sovereignRoot was required.`;
+    } else {
+      try {
+        const bootstrap = deps.bootstrap ?? bootstrapApprenticeVault;
+        const result = await bootstrap({
+          sovereignRoot: input.sovereignRoot,
+          permanentAgentId: permanentProfile.agentId,
+          profile: permanentProfile,
+          seedInbox: input.seedInbox,
+        });
+        apprenticeVaultPath = result.vaultPath;
+      } catch {
+        // Best-effort: bootstrap failure must not invalidate the promotion review packet.
+        // Operator can retry by calling bootstrapApprenticeVault directly.
+      }
+    }
+  }
+
   const packet: Omit<TeamPromotionPacket, "contextMarkdown"> = {
-    status: permanentProfile ? "promoted-draft" : "needs-approval",
+    status,
     autoWrite: false,
     temporaryProfile: input.agent,
     evidence: input.evidence,
     permanentProfile,
     permissionDelta: delta,
-    nextStep: permanentProfile
-      ? "Human review and persist through an explicit durable profile write if this permanent agent should exist."
-      : "Get explicit operator approval before drafting or persisting a permanent profile.",
+    nextStep,
+    apprenticeVaultPath,
   };
   return {
     ...packet,

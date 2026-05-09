@@ -162,20 +162,15 @@ async function main() {
     const approved = args.includes("--approved");
     if (agentIndex < 0 || !args[agentIndex + 1]) throw new Error("team-promotion requires --agent-json <json>");
     if (evidenceIndex < 0 || !args[evidenceIndex + 1]) throw new Error("team-promotion requires --evidence-json <json>");
-    console.log(
-      JSON.stringify(
-        buildTeamPromotionPacket({
-          agent: JSON.parse(args[agentIndex + 1]),
-          evidence: JSON.parse(args[evidenceIndex + 1]),
-          requestedPermissions:
-            permissionsIndex >= 0 && args[permissionsIndex + 1] ? JSON.parse(args[permissionsIndex + 1]) : undefined,
-          approved,
-          permanentAgentId: idIndex >= 0 ? args[idIndex + 1] : undefined,
-        }),
-        null,
-        2,
-      ),
-    );
+    const promotionPacket = await buildTeamPromotionPacket({
+      agent: JSON.parse(args[agentIndex + 1]),
+      evidence: JSON.parse(args[evidenceIndex + 1]),
+      requestedPermissions:
+        permissionsIndex >= 0 && args[permissionsIndex + 1] ? JSON.parse(args[permissionsIndex + 1]) : undefined,
+      approved,
+      permanentAgentId: idIndex >= 0 ? args[idIndex + 1] : undefined,
+    });
+    console.log(JSON.stringify(promotionPacket, null, 2));
     return;
   }
 

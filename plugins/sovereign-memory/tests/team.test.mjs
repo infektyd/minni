@@ -231,8 +231,8 @@ test("buildTeamEvidencePacket makes promotion candidates human-review only", () 
   assert.match(packet.contextMarkdown, /Promotion Candidates/);
 });
 
-test("buildTeamPromotionPacket drafts permanent profiles only after explicit approval", () => {
-  const pending = buildTeamPromotionPacket({
+test("buildTeamPromotionPacket drafts permanent profiles only after explicit approval", async () => {
+  const pending = await buildTeamPromotionPacket({
     agent: {
       agentId: "team-worker-2",
       role: "worker",
@@ -259,7 +259,7 @@ test("buildTeamPromotionPacket drafts permanent profiles only after explicit app
   assert.equal(pending.permanentProfile, undefined);
   assert.match(pending.contextMarkdown, /requires explicit operator approval/i);
 
-  const approved = buildTeamPromotionPacket({
+  const approved = await buildTeamPromotionPacket({
     agent: pending.temporaryProfile,
     evidence: pending.evidence,
     requestedPermissions: ["read", "write", "test", "memory-recall", "network"],
@@ -273,6 +273,140 @@ test("buildTeamPromotionPacket drafts permanent profiles only after explicit app
   assert.equal(approved.permanentProfile.lifetime, "permanent");
   assert.ok(approved.permissionDelta.added.includes("network"));
   assert.match(approved.nextStep, /review and persist/i);
+});
+
+function makePromotionTemporaryProfile() {
+  return {
+    agentId: "team-worker-2",
+    role: "worker",
+    focus: "Implement scoped backend changes.",
+    ownership: ["src/team.ts"],
+    permissions: ["read", "write", "test", "memory-recall"],
+    memoryPolicy: { recall: "allowed", learn: "manual-only", vaultWrites: "manual-only" },
+    lifetime: "temporary",
+    promotionRule: "Promote only after completed evidence, repeatable value, and explicit operator approval.",
+  };
+}
+
+function makePromotionEvidence() {
+  return {
+    agentId: "team-worker-2",
+    recommended: true,
+    score: 5,
+    reasons: ["submitted evidence plus verification"],
+    nextStep: "Eligible for human review; do not promote automatically.",
+  };
+}
+
+test("buildTeamPromotionPacket: bootstrap NOT called when approved is false", async () => {
+  let bootstrapCalled = false;
+  const packet = await buildTeamPromotionPacket(
+    {
+      agent: makePromotionTemporaryProfile(),
+      evidence: makePromotionEvidence(),
+      approved: false,
+      bootstrapVault: true,
+      sovereignRoot: "/x",
+    },
+    {
+      bootstrap: async () => {
+        bootstrapCalled = true;
+        throw new Error("must not be called");
+      },
+    },
+  );
+  assert.equal(bootstrapCalled, false);
+  assert.equal(packet.apprenticeVaultPath, undefined);
+  assert.equal(packet.contextMarkdown.includes("## Apprentice Vault Bootstrap"), false);
+});
+
+test("buildTeamPromotionPacket: bootstrap NOT called when bootstrapVault is false", async () => {
+  let bootstrapCalled = false;
+  const packet = await buildTeamPromotionPacket(
+    {
+      agent: makePromotionTemporaryProfile(),
+      evidence: makePromotionEvidence(),
+      approved: true,
+      bootstrapVault: false,
+      sovereignRoot: "/x",
+    },
+    {
+      bootstrap: async () => {
+        bootstrapCalled = true;
+        throw new Error("must not be called");
+      },
+    },
+  );
+  assert.equal(bootstrapCalled, false);
+  assert.equal(packet.status, "promoted-draft");
+  assert.equal(packet.apprenticeVaultPath, undefined);
+});
+
+test("buildTeamPromotionPacket: bootstrap NOT called when sovereignRoot is missing; nextStep mentions skip", async () => {
+  let bootstrapCalled = false;
+  const packet = await buildTeamPromotionPacket(
+    {
+      agent: makePromotionTemporaryProfile(),
+      evidence: makePromotionEvidence(),
+      approved: true,
+      bootstrapVault: true,
+    },
+    {
+      bootstrap: async () => {
+        bootstrapCalled = true;
+        throw new Error("must not be called");
+      },
+    },
+  );
+  assert.equal(bootstrapCalled, false);
+  assert.equal(packet.apprenticeVaultPath, undefined);
+  assert.match(packet.nextStep, /Bootstrap skipped: sovereignRoot was required\./);
+});
+
+test("buildTeamPromotionPacket: bootstrap CALLED when all conditions met; markdown includes section", async () => {
+  let receivedInput;
+  const packet = await buildTeamPromotionPacket(
+    {
+      agent: makePromotionTemporaryProfile(),
+      evidence: makePromotionEvidence(),
+      approved: true,
+      bootstrapVault: true,
+      sovereignRoot: "/x",
+      permanentAgentId: "foo",
+    },
+    {
+      bootstrap: async (input) => {
+        receivedInput = input;
+        return { vaultPath: "/x/agents/foo-vault", bootstrapped: true, filesCreated: [] };
+      },
+    },
+  );
+  assert.equal(packet.apprenticeVaultPath, "/x/agents/foo-vault");
+  assert.equal(receivedInput.permanentAgentId, "foo");
+  assert.equal(receivedInput.sovereignRoot, "/x");
+  assert.equal(receivedInput.profile.lifetime, "permanent");
+  assert.match(packet.contextMarkdown, /## Apprentice Vault Bootstrap/);
+  assert.match(packet.contextMarkdown, /\/x\/agents\/foo-vault/);
+});
+
+test("buildTeamPromotionPacket: bootstrap throw is swallowed", async () => {
+  const packet = await buildTeamPromotionPacket(
+    {
+      agent: makePromotionTemporaryProfile(),
+      evidence: makePromotionEvidence(),
+      approved: true,
+      bootstrapVault: true,
+      sovereignRoot: "/x",
+    },
+    {
+      bootstrap: async () => {
+        throw new Error("disk full");
+      },
+    },
+  );
+  assert.equal(packet.status, "promoted-draft");
+  assert.equal(packet.apprenticeVaultPath, undefined);
+  assert.equal(packet.contextMarkdown.includes("## Apprentice Vault Bootstrap"), false);
 });
 
 const FIXED_NOW_ISO = "2026-05-08T22:30:00.000Z";
