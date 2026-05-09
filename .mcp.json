@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "sovereign-memory": {
+      "command": "node",
+      "args": [
+        "/Users/hansaxelsson/.codex/plugins/cache/sovereign-memory/sovereign-memory/0.1.0/dist/server.js"
+      ],
+      "env": {
+        "SOVEREIGN_AGENT_ID": "claude-code",
+        "SOVEREIGN_WORKSPACE_ID": "/Users/hansaxelsson/sovereignMemory"
+      }
+    }
+  }
+}

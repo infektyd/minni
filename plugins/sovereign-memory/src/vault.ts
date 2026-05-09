@@ -333,13 +333,70 @@ export async function ensureVault(vaultPath: string): Promise<EnsureVaultResult>
   return { vaultPath, created };
 }
 
+// SEC-014: escape a single audit field so injected newlines or leading `#`
+// cannot forge a new `## [...]` log entry that downstream readers split on.
+// `inline` fields (tool, summary) collapse newlines to literal \n / \r so the
+// header line stays single-line. `block` fields (details lines) keep
+// real newlines but escape any leading `#` so the parser cannot mistake them
+// for entry headers.
+function escapeAuditField(
+  value: string,
+  options: { mode: "inline" | "block"; maxLen?: number } = { mode: "inline" },
+): string {
+  let v = value ?? "";
+  if (options.mode === "inline") {
+    v = v.replace(/\\/g, "\\\\").replace(/\r/g, "\\r").replace(/\n/g, "\\n");
+    if (/^#/.test(v)) v = "\\" + v;
+  } else {
+    // block mode: keep real newlines, escape per-line leading `#`
+    v = v
+      .split("\n")
+      .map((ln) => (/^#/.test(ln) ? "\\" + ln : ln))
+      .join("\n");
+  }
+  if (typeof options.maxLen === "number" && v.length > options.maxLen) {
+    v = v.slice(0, Math.max(0, options.maxLen - 1)) + "…";
+  }
+  return v;
+}
+
+export { escapeAuditField };
+
+const AUDIT_SUMMARY_MAX = 500;
+const AUDIT_DETAIL_LINE_MAX = 1000;
+const AUDIT_DETAIL_BLOCK_MAX = 4000;
+
+function escapeAuditDetailsBlock(raw: string): string {
+  // Per-line cap, leading `#` escape, then overall block cap.
+  const lines = raw.split("\n").map((ln) => {
+    const escaped = /^#/.test(ln) ? "\\" + ln : ln;
+    if (escaped.length > AUDIT_DETAIL_LINE_MAX) {
+      return escaped.slice(0, Math.max(0, AUDIT_DETAIL_LINE_MAX - 1)) + "…";
+    }
+    return escaped;
+  });
+  let block = lines.join("\n");
+  if (block.length > AUDIT_DETAIL_BLOCK_MAX) {
+    block = block.slice(0, Math.max(0, AUDIT_DETAIL_BLOCK_MAX - 1)) + "…";
+  }
+  return block;
+}
+
 export async function recordAudit(vaultPath: string, entry: AuditEntry): Promise<string> {
   await ensureVault(vaultPath);
   const timestamp = entry.timestamp ?? new Date();
   const date = isoDate(timestamp);
-  const line = `## [${timestamp.toISOString()}] ${entry.tool} | ${entry.summary}\n\n${
-    entry.details ? `\`\`\`json\n${JSON.stringify(entry.details, null, 2)}\n\`\`\`\n\n` : ""
-  }`;
+  const safeTool = escapeAuditField(entry.tool ?? "", { mode: "inline", maxLen: 200 });
+  const safeSummary = escapeAuditField(entry.summary ?? "", {
+    mode: "inline",
+    maxLen: AUDIT_SUMMARY_MAX,
+  });
+  let detailBlock = "";
+  if (entry.details) {
+    const raw = JSON.stringify(entry.details, null, 2);
+    detailBlock = `\`\`\`json\n${escapeAuditDetailsBlock(raw)}\n\`\`\`\n\n`;
+  }
+  const line = `## [${timestamp.toISOString()}] ${safeTool} | ${safeSummary}\n\n${detailBlock}`;
   await appendFile(path.join(vaultPath, "log.md"), line, "utf8");
   const dailyPath = path.join(vaultPath, "logs", `${date}.md`);
   if (!(await exists(dailyPath))) {

@@ -65,3 +65,18 @@ locks:
 
 If they need cleanup later, move only specific non-runtime artifacts and leave
 symlinks where the owning app expects stable paths.
+
+## Sync-Root Avoidance
+
+Sovereign Memory's "local-first" guarantee assumes the vault and database are
+not under any third-party sync root. The daemon emits a startup warning if its
+vault path or DB path resolves under any of these prefixes:
+
+- `~/Library/Mobile Documents/` (iCloud Drive)
+- `~/Dropbox`
+- `~/Google Drive`
+- `~/OneDrive`
+
+If a warning fires, move the affected path out of the sync root before relying
+on local-first claims. The actual startup-warning code is being implemented in
+Wave 2; this section documents the contract the daemon will enforce.

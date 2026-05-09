@@ -42,13 +42,19 @@ async function startTestServer(overrides = {}) {
         intent: "implement",
         brief: "Real task packet.",
         constraints: ["No automatic learning."],
-        currentState: ["Bridge test state."],
-        relevantSources: [],
+        currentState: ["Bridge test state at /Users/alice/private/repo and /tmp/sovereign.sock."],
+        relevantSources: [
+          {
+            title: "Local source",
+            snippet: "adapter /Users/alice/private/model.fmadapter",
+            relativePath: "/Users/alice/private/vault/wiki/local.md",
+          },
+        ],
         recommendedNextActions: ["Inspect sources."],
         risks: [],
         recall: { daemonOk: true },
         afm: { requested: false, used: false },
-        contextMarkdown: "# Packet",
+        contextMarkdown: "# Packet\n/Users/alice/private/repo\n/tmp/sovereign.sock",
       };
     },
     prepareOutcome: async (input) => {
@@ -70,6 +76,47 @@ async function startTestServer(overrides = {}) {
         afm: { requested: false, used: false },
         contextMarkdown: "# Outcome",
       };
+    },
+    deepResearch: {
+      paths: async () => ({
+        root: "/Users/alice/deep-research-agent",
+        cli: "/Users/alice/deep-research-agent/.venv/bin/deep-research",
+        local_docs: "/Users/alice/deep-research-agent/local-docs",
+        runs: "/Users/alice/deep-research-agent/runs",
+      }),
+      listRuns: async () => [
+        {
+          run_id: "20260429T000000Z-abc12345",
+          created_at: "2026-04-29T00:00:00Z",
+          prompt: "Research local console UX.",
+          mode: "web",
+          interaction_id: "v1_test",
+          status: "completed",
+          has_result: true,
+          has_report: true,
+        },
+      ],
+      getRun: async (runId) => ({
+        metadata: { run_id: runId, status: "completed", interaction_id: "v1_test" },
+        result: { id: "v1_test", status: "completed", outputs: [{ type: "text", text: "report" }] },
+        report: "Deep Research report from /Users/alice/private/run.",
+        events: [],
+      }),
+      localDocsManifest: async () => ({ root: "/Users/alice/deep-research-agent/local-docs", files: [] }),
+      listFileStores: async () => ({ fileStores: [{ name: "fileSearchStores/test" }] }),
+      createFileStore: async (displayName) => ({ name: "fileSearchStores/test", displayName }),
+      deleteFileStore: async (name) => ({ deleted: name }),
+      plan: async (input) => {
+        calls.push(["deepPlan", input]);
+        return { id: "v1_plan", status: "completed", outputs: [{ type: "text", text: "plan" }] };
+      },
+      refinePlan: async (input) => ({ id: input.previousInteractionId, status: "completed" }),
+      approvePlan: async (input) => ({ id: input.previousInteractionId, status: "created" }),
+      run: async (input) => {
+        calls.push(["deepRun", input]);
+        return { run_id: "20260429T000000Z-abc12345", interaction_id: "v1_run" };
+      },
+      status: async (input) => ({ id: input.interactionId, status: "completed" }),
     },
     ...overrides,
   });
@@ -99,6 +146,9 @@ test("UI server exposes local status, prepare, outcome, audit, and static assets
     }).then((response) => response.json());
     assert.equal(prepare.task, "wire the complete frontend");
     assert.equal(prepare.profile, "compact");
+    assert.equal(prepare.relevantSources[0].relativePath, "[local-path]");
+    assert.equal(prepare.relevantSources[0].snippet, "adapter [local-path]");
+    assert.doesNotMatch(JSON.stringify(prepare), /\/Users\/alice|\/tmp\/sovereign\.sock|\.fmadapter/);
 
     const outcome = await fetch(`${server.baseUrl}/api/prepare-outcome`, {
       method: "POST",
@@ -115,10 +165,23 @@ test("UI server exposes local status, prepare, outcome, audit, and static assets
     const audit = await fetch(`${server.baseUrl}/api/audit-tail?limit=5`).then((response) => response.json());
     assert.equal(audit.entries.length, 1);
 
+    const deepPaths = await fetch(`${server.baseUrl}/api/deep-research/paths`).then((response) => response.json());
+    assert.equal(deepPaths.root, "[local-path]");
+
+    const deepRuns = await fetch(`${server.baseUrl}/api/deep-research/runs`).then((response) => response.json());
+    assert.equal(deepRuns[0].run_id, "20260429T000000Z-abc12345");
+
+    const deepPlan = await fetch(`${server.baseUrl}/api/deep-research/plan`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ prompt: "research the console", mode: "web", enabledTools: ["google_search"] }),
+    }).then((response) => response.json());
+    assert.equal(deepPlan.id, "v1_plan");
+
     const indexHtml = await fetch(`${server.baseUrl}/`).then((response) => response.text());
     assert.match(indexHtml, /Sovereign Memory Console/);
 
-    assert.deepEqual(server.calls.map(([name]) => name), ["prepareTask", "prepareOutcome"]);
+    assert.deepEqual(server.calls.map(([name]) => name), ["prepareTask", "prepareOutcome", "deepPlan"]);
   } finally {
     await server.close();
   }
@@ -243,9 +306,39 @@ test("UI server serves HEAD static requests without a body", async () => {
   }
 });
 
-test("frontend source is wired to the bridge endpoints instead of static-only samples", async () => {
+test("frontend bundle calls the local bridge endpoints", async () => {
   const js = await readFile(path.join(process.cwd(), "frontend", "app.js"), "utf8");
   assert.match(js, /\/api\/prepare-task/);
   assert.match(js, /\/api\/prepare-outcome/);
+  assert.match(js, /\/api\/audit-tail/);
   assert.match(js, /\/api\/status/);
+  assert.match(js, /\/api\/health/);
+});
+
+test("frontend ships the sovereign command center design and stays local-only", async () => {
+  const [html, js, css] = await Promise.all([
+    readFile(path.join(process.cwd(), "frontend", "index.html"), "utf8"),
+    readFile(path.join(process.cwd(), "frontend", "app.js"), "utf8"),
+    readFile(path.join(process.cwd(), "frontend", "styles.css"), "utf8"),
+  ]);
+
+  assert.match(html, /Sovereign Memory Console/);
+  assert.match(html, /command-center-shell/);
+  assert.doesNotMatch(html, /unpkg\.com|fonts\.googleapis\.com|text\/babel/);
+
+  // Screen labels from the design bundle's Rail nav
+  assert.match(js, /Recall/);
+  assert.match(js, /Prepare Packet/);
+  assert.match(js, /Dry-run Review/);
+  assert.match(js, /Audit Trail/);
+  assert.match(js, /Settings/);
+  // No write / learn endpoints exposed to the browser
+  assert.doesNotMatch(js, /\/api\/learn|sovereign_learn/);
+
+  // Design tokens from the paper + phosphor themes
+  assert.match(css, /--graphite/);
+  assert.match(css, /--verdigris/);
+  assert.match(css, /--persimmon/);
+  // Minifier drops quotes around static attribute values, so accept either form.
+  assert.match(css, /data-theme=("?)phosphor\1/);
 });

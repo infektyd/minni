@@ -23,7 +23,7 @@ flowchart LR
 
     subgraph Plugin["Shared plugin layer"]
         MCP["MCP server\nsovereign-memory"]
-        Tools["Tools\nrecall, learn, status,\nprepare, handoff, audit"]
+        Tools["Tools\nrecall, learn, status,\nprepare, handoff, audit,\nteam runtime"]
         Hooks["Hook envelopes\nSessionStart, UserPromptSubmit,\nPreCompact, Stop"]
     end
 
@@ -127,6 +127,8 @@ The plugin exposes:
 - `sovereign_audit_tail`
 - `sovereign_compile_vault`
 - `sovereign_negotiate_handoff`
+- `sovereign_team_runtime`
+- `sovereign_team_evidence`
 
 Automatic behavior is recall-only. Durable learning, vault writes, and AFM draft
 acceptance remain explicit human or agent decisions.
@@ -204,6 +206,38 @@ Use short, sourced wiki pages with frontmatter for durable knowledge. Raw sessio
 material and private logs should stay local and out of public git unless they are
 explicitly sanitized.
 
+## Local-First Hygiene
+
+Sovereign Memory is local-first only when four assumptions actually hold on the
+host machine. If any of them break, the marketing claim breaks with it:
+
+1. The macOS user account is the security perimeter (single-user box).
+2. FileVault is enabled, so the database and vault are encrypted at rest.
+3. The vault directory and `sovereign_memory.db` (with its `-wal`/`-shm`
+   sidecars) are **not** under iCloud Drive, Dropbox, Google Drive, or
+   OneDrive sync roots. Any of those silently exfiltrate "local" memory.
+4. The MCP transport is stdio only. There is no remote JSON-RPC fallback at v1.
+
+To keep Time Machine and Spotlight from snapshotting the same data, mark the
+vault and database with the macOS backup-exclude attribute:
+
+```bash
+xattr -w com.apple.metadata:com_apple_backup_excludeItem true ~/path/to/sovereign_memory.db
+xattr -w com.apple.metadata:com_apple_backup_excludeItem true ~/path/to/codex-vault
+```
+
+Substitute the real paths on your machine. Run the same command on the
+`-wal` and `-shm` sidecars if you want belt-and-braces coverage.
+
+A sample launchd agent for the daemon lives at
+[engine/launchd/com.openclaw.sovrd.plist.example](engine/launchd/com.openclaw.sovrd.plist.example).
+It sets `Umask` to octal `077` (decimal `63`), which keeps daemon log files
+mode `0600` instead of world-readable `0644` — daemon stderr can contain
+learning excerpts.
+
+`make audit` will run `pip-audit -r engine/requirements.txt` once SEC-009
+lands; until then, run `pip-audit` manually before cutting a release.
+
 ## Verification Gate
 
 Before pushing a release candidate, run:
@@ -237,3 +271,6 @@ The v4 acceptance baseline is `213 passed, 3 skipped` for engine tests and
 
 For local path layout and symlink compatibility notes, see
 [docs/CANONICAL-PATHS.md](docs/CANONICAL-PATHS.md).
+
+For daemon, socket, plugin-cache, and protocol mismatch fixes, see
+[docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md).

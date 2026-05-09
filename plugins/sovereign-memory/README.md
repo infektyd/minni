@@ -2,7 +2,16 @@
 
 Local-first plugin for Sovereign Memory. Multi-target: ships a Codex plugin (`.codex-plugin/`), Claude Code plugin (`.claude-plugin/`), Gemini extension (`.gemini-plugin/`), and KiloCode plugin (`.kilocode-plugin/`) from the same source tree and shared `dist/` build. Each agent gets its own Obsidian vault; all agents share the same daemon. Exposes recall, AI-facing vault context packs, manual vault-first learning, learning quality checks, structured Obsidian note writes, compile dry-runs, handoffs, and audit tools through MCP. On Claude Code and KiloCode, hooks wire memory in as a session spine.
 
-The optional frontend lives in `frontend/`. Run `npm run console` to start the local-only bridge at `http://127.0.0.1:8765/` and generate real `sovereign_prepare_task` and `sovereign_prepare_outcome` packets from the same backend functions used by MCP/CLI. Opening `frontend/index.html` directly still works as a static packet inspector fallback.
+The frontend is a Vite + React + TypeScript app under [frontend-src/](frontend-src/), built into the served [frontend/](frontend/) directory. Run `npm run console` (which runs `tsc && vite build && node dist/ui-server.js`) to start the local-only bridge at `http://127.0.0.1:8765/`. Eight screens are wired through the Tweaks panel-controlled rail:
+
+- **Recall** — POST `/api/prepare-task`. Type a query, get ranked vault sources with privacy / authority / AFM chips and an Inspector pane.
+- **Prepare Packet** — reads the same `prepare-task` response and renders the `<sovereign:context>` envelope, token-budget meter, included-source list, and risk callouts.
+- **Dry-run Review** — POST `/api/prepare-outcome`. Submit task + summary; the response's `outcomeDraft` partitions into LEARN CANDIDATES / LOG-ONLY / DO-NOT-STORE columns. Approve/Defer/Reject is a UI decision only — nothing is stored.
+- **Audit Trail** — GET `/api/audit-tail?limit=N`. Parses the daemon's `## [iso-ts] tool | summary` markdown into a sortable table.
+- **Settings** — GET `/api/status` + `/api/health`. Shows daemon socket, AFM adapter, vault path, and bridge tools.
+- **Handoffs / Vaults / Policy & AFM** — empty-state placeholders; no API behind them yet.
+
+Two themes ship: **Paper** (default, warm bone + persimmon stamp + verdigris accents) and **Phosphor** (CRT operator board with telemetry rail and live activity stream). Toggle from the gear button bottom-right. Layout sizes and theme persist to `localStorage`.
 
 ## Runtime Defaults
 
@@ -35,6 +44,24 @@ export SOVEREIGN_AFM_PREPARE_TASK_URL=http://127.0.0.1:11437/v1/chat/completions
 - `sovereign_audit_tail`
 - `sovereign_compile_vault` — dry-run AFM compile passes: `session_distillation`, `synthesis`, `procedure_extraction`, `reorganization`, `pruning`
 - `sovereign_negotiate_handoff` — agent-to-agent handoff envelope (top recalls, scar tissue, open questions, inbox pointer)
+- `sovereign_team_runtime` — temporary team packet with agent profiles, task ledger, hydration packets, gates, and non-goals
+- `sovereign_team_evidence` — dry-run evidence report plus promotion candidates; never promotes or learns automatically
+- `sovereign_team_promotion` — dry-run permanent-profile draft gated by explicit approval; never writes durable memory
+
+## Sovereign Team Runtime
+
+`sovereign_team_runtime` is a coordinator-side planning surface for short-lived helper agents. It creates:
+
+- temporary profiles with role, focus, ownership, permissions, and recall-only memory policy
+- a task ledger with evidence requirements and dependencies
+- one hydration packet per temporary agent, built with `sovereign_prepare_task`
+- gates and non-goals that keep promotion, learning, and vault writes explicit
+
+`sovereign_team_evidence` is the matching close-out surface. It grades each temporary agent report as `missing`, `partial`, or `complete`, collects blockers, and marks promotion candidates for human review only.
+
+`sovereign_team_promotion` turns a temporary profile plus evidence candidate into a permanent-profile draft only when `approved` is explicitly true. It still does not write durable memory; the returned profile is a review artifact that must be persisted through an intentional profile/write workflow.
+
+The team runtime does not spawn agents, execute background work, write durable memory, or promote profiles automatically.
 
 ## Claude Code Spine
 
@@ -54,6 +81,7 @@ The Claude Code surface adds:
   - `PreCompact` — captures scar tissue (failed paths, dead ends) so post-compaction Claude doesn't repeat them.
   - `Stop` — drafts candidate learnings to vault inbox; never auto-writes.
 - **Slash commands** (namespaced as `/sovereign-memory:*`): `recall`, `learn`, `status`, `audit`, `prepare-task`, `prepare-outcome`.
+- **Team runtime commands**: `team-runtime`, `team-evidence`, and `team-promotion` help coordinate temporary helper agents without automatic learning or promotion.
 - **Agent-first envelope**: hook output is wrapped as `<sovereign:context version="1" event="..." agent="claude-code" tokens="...">` containing deterministic JSON for prompt-cache stability.
 
 Disable hooks without uninstalling: `export SOVEREIGN_CLAUDECODE_HOOKS=off`.
@@ -89,7 +117,8 @@ The Codex plugin (`.codex-plugin/`), Claude Code plugin (`.claude-plugin/`), Gem
 ## Local Console
 
 ```bash
-npm run console
+npm run console            # tsc + vite build + node dist/ui-server.js
+npm run dev:frontend       # vite dev server with /api proxy to :8765 (HMR)
 ```
 
 The console exposes only local HTTP endpoints:
@@ -101,6 +130,8 @@ The console exposes only local HTTP endpoints:
 - `POST /api/prepare-outcome`
 
 The server binds to `127.0.0.1`, refuses non-local bind hosts, rejects non-local host/origin/fetch-metadata requests, requires JSON POST bodies, caps JSON request bodies, redacts machine-local paths in browser-facing status/audit responses, and does not expose learn or vault-write endpoints. Browser requests cannot override the server-owned vault path or AFM target. `prepare-task` keeps its existing audit behavior; `prepare-outcome` remains dry-run only.
+
+The bridge defaults to `~/.sovereign-memory/codex-vault`. Override with `SOVEREIGN_CODEX_VAULT_PATH=~/.sovereign-memory/claudecode-vault npm run console` to point Recall at a different vault.
 
 ## Development
 

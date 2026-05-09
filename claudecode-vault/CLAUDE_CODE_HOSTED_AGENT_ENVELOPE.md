@@ -57,10 +57,10 @@ is whole-document, not RAG.
   `praxisd` JSON-RPC daemon + Compose Multiplatform thin client + `.praxis/`
   sidecar. Brain (LLMProvider) / Hand (Tool registry) / Loop (ChatService /
   PraxisDaemonCore). Authoritative current-state doc: `Docs/REALITY_MAP.md`.
-- **codex-style-computer-use**: custom MCP server `claude-app-use-mcp`,
+- **codex-style-computer-use** (aka **AXPress**): custom MCP server for
   AX-based macOS app control, registered in `~/.claude.json` as
-  `claude-app-use`. Binary at
-  `~/Projects/codex-style-computer-use-for-claude/.build/arm64-apple-macosx/debug/claude-app-use-mcp`.
+  `axpress`. Binary at
+  `~/Projects/codex-style-computer-use-for-claude/.build/debug/claude-app-use-mcp`.
 
 For anything beyond high-level orientation, read the project's CLAUDE.md and
 `Docs/`.

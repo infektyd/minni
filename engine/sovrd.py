@@ -294,10 +294,56 @@ def _write_json(path: Path, data: dict) -> None:
     path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
+# SEC-014: caps for audit-log fields. Mirrors the TS helper in
+# plugins/sovereign-memory/src/vault.ts so a forged summary written by one
+# daemon cannot be parsed as multiple `## [...]` entries by either reader.
+_AUDIT_SUMMARY_MAX = 500
+_AUDIT_DETAIL_LINE_MAX = 1000
+_AUDIT_DETAIL_BLOCK_MAX = 4000
+
+
+def _escape_audit_field(value: str, *, mode: str = "inline", max_len: Optional[int] = None) -> str:
+    """Escape an audit-log field so injected newlines or leading `#` cannot
+    forge a new `## [...]` log entry.
+
+    - mode="inline" (tool, summary): collapse \\ \\r \\n to literal escapes so
+      the header line stays single-line. Prefix a leading `#` with `\\`.
+    - mode="block" (details): keep real newlines but escape any per-line
+      leading `#` so the parser can't mistake them for entry headers.
+    """
+    v = "" if value is None else str(value)
+    if mode == "inline":
+        v = v.replace("\\", "\\\\").replace("\r", "\\r").replace("\n", "\\n")
+        if v.startswith("#"):
+            v = "\\" + v
+    else:
+        v = "\n".join(("\\" + ln) if ln.startswith("#") else ln for ln in v.split("\n"))
+    if max_len is not None and len(v) > max_len:
+        v = v[: max(0, max_len - 1)] + "…"
+    return v
+
+
+def _escape_audit_details_block(raw: str) -> str:
+    out_lines = []
+    for ln in raw.split("\n"):
+        escaped = ("\\" + ln) if ln.startswith("#") else ln
+        if len(escaped) > _AUDIT_DETAIL_LINE_MAX:
+            escaped = escaped[: max(0, _AUDIT_DETAIL_LINE_MAX - 1)] + "…"
+        out_lines.append(escaped)
+    block = "\n".join(out_lines)
+    if len(block) > _AUDIT_DETAIL_BLOCK_MAX:
+        block = block[: max(0, _AUDIT_DETAIL_BLOCK_MAX - 1)] + "…"
+    return block
+
+
 def _append_handoff_audit(vault_path: Path, tool: str, summary: str, details: dict) -> None:
     _ensure_handoff_vault(vault_path)
     ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    line = f"## [{ts}] {tool} | {summary}\n\n```json\n{json.dumps(details, indent=2, sort_keys=True)}\n```\n\n"
+    safe_tool = _escape_audit_field(tool, mode="inline", max_len=200)
+    safe_summary = _escape_audit_field(summary, mode="inline", max_len=_AUDIT_SUMMARY_MAX)
+    raw_details = json.dumps(details, indent=2, sort_keys=True)
+    safe_details = _escape_audit_details_block(raw_details)
+    line = f"## [{ts}] {safe_tool} | {safe_summary}\n\n```json\n{safe_details}\n```\n\n"
     for path in (vault_path / "log.md", vault_path / "logs" / f"{ts[:10]}.md"):
         if not path.exists():
             path.write_text(f"# {ts[:10]} Sovereign Memory Audit\n\n", encoding="utf-8")
@@ -745,6 +791,28 @@ def _handle_read(params: dict, request_id: Any) -> dict:
         db = SovereignDB()
         lines = []
 
+        # Layer 1: whole-document identity/envelope. This is delivered before
+        # retrieved knowledge so the agent receives its stable local context
+        # first. For hosted agents such as Codex this may be a map, not a soul.
+        with db.cursor() as c:
+            c.execute("""
+                SELECT d.path, ce.chunk_text
+                FROM documents d
+                JOIN chunk_embeddings ce
+                  ON ce.doc_id = d.doc_id AND ce.chunk_index = 0
+                WHERE d.agent = ?
+                  AND d.whole_document = 1
+                ORDER BY d.path
+            """, (f"identity:{agent_id}",))
+            rows = c.fetchall()
+            if rows:
+                lines.append(f"## Agent Identity: {agent_id.title()}")
+                lines.append("Loaded whole (not chunked). This is Layer 1.")
+                for row in rows:
+                    fname = os.path.basename(row["path"]).replace(".md", "").upper()
+                    lines.append(f"\n### {fname}")
+                    lines.append(row["chunk_text"] or "")
+
         # Prior context
         with db.cursor() as c:
             c.execute("""
@@ -849,6 +917,29 @@ def _handle_learn(params: dict, request_id: Any) -> dict:
     content = params.get("content", "")
     if not content:
         return _make_error(-32602, "content is required", request_id)
+
+    # SEC-015: bound caller-supplied learn payload sizes to keep the embedder,
+    # writeback, and contradiction-detection paths from being abused as a DoS
+    # vector. Content cap is generous (64 KiB ≈ a long markdown note); auxiliary
+    # text fields are capped at 4 KiB each.
+    MAX_LEARN_CHARS = 64 * 1024  # 64 KiB; SEC-015
+    MAX_LEARN_FIELD_CHARS = 4 * 1024  # 4 KiB; SEC-015
+
+    if len(content) > MAX_LEARN_CHARS:
+        return _make_error(
+            -32602,
+            f"learn content exceeds {MAX_LEARN_CHARS} chars",
+            request_id,
+        )
+
+    for _field in ("title", "summary"):
+        _val = params.get(_field)
+        if isinstance(_val, str) and len(_val) > MAX_LEARN_FIELD_CHARS:
+            return _make_error(
+                -32602,
+                f"learn {_field} exceeds {MAX_LEARN_FIELD_CHARS} chars",
+                request_id,
+            )
 
     agent_id = params.get("agent_id", "hermes")
     category = params.get("category", "general")
@@ -1151,11 +1242,7 @@ def _handle_status(params: dict, request_id: Any) -> dict:
     except Exception:
         pass
 
-    faiss_ok = False
-    faiss_path = Path(DEFAULT_CONFIG.faiss_index_path)
-    if faiss_path.exists():
-        faiss_size = faiss_path.stat().st_size
-        faiss_ok = faiss_size > 0
+    faiss_path, faiss_ok = _faiss_cache_status(DEFAULT_CONFIG)
 
     uptime = time.time() - _start_time
     return _make_response({
@@ -1171,15 +1258,38 @@ def _handle_status(params: dict, request_id: Any) -> dict:
             "db_ok": db_ok,
             "db_path": DEFAULT_CONFIG.db_path,
             "faiss_ok": faiss_ok,
-            "faiss_path": DEFAULT_CONFIG.faiss_index_path,
+            "faiss_path": str(faiss_path),
             "stats": db_stats,
         },
     }, request_id)
 
 
+def _faiss_cache_status(config=DEFAULT_CONFIG) -> tuple[Path, bool]:
+    legacy_path = Path(config.faiss_index_path)
+    if legacy_path.exists():
+        return legacy_path, legacy_path.stat().st_size > 0
+
+    try:
+        from faiss_persist import _faiss_dir_for_db
+
+        faiss_dir = Path(_faiss_dir_for_db(config.db_path))
+        manifest_path = faiss_dir / "index.manifest.json"
+        faiss_path = faiss_dir / "index.faiss"
+        npz_path = faiss_dir / "index.faiss.npz"
+        if manifest_path.exists():
+            for candidate in (faiss_path, npz_path):
+                if candidate.exists() and candidate.stat().st_size > 0:
+                    return candidate, True
+            return faiss_path, False
+    except Exception:
+        pass
+
+    return legacy_path, False
+
+
 def _faiss_cache_age_seconds(config=DEFAULT_CONFIG) -> Optional[float]:
-    path = Path(config.faiss_index_path)
-    if not path.exists():
+    path, ok = _faiss_cache_status(config)
+    if not ok:
         return None
     return round(max(0.0, time.time() - path.stat().st_mtime), 3)
 
@@ -1485,13 +1595,36 @@ def _dispatch(request: dict) -> dict:
     return handler(params, request_id)
 
 
+# SEC-015: cap a single JSON-RPC request body at 1 MiB to bound peak memory
+# and protect the embedder from caller-controlled mega-payloads.
+_SOCKET_BODY_LIMIT = 1_048_576  # 1 MiB
+
+
 async def _handle_client(reader: asyncio.StreamReader,
                          writer: asyncio.StreamWriter):
     """Handle a single client connection."""
     try:
         while True:
-            # Read until newline (JSON-RPC over line-delimited protocol)
-            data = await reader.readuntil(b"\n")
+            # Read until newline (JSON-RPC over line-delimited protocol).
+            # SEC-015: bound a single line to 1 MiB so a runaway sender cannot
+            # exhaust memory inside asyncio's StreamReader buffer.
+            try:
+                data = await reader.readuntil(b"\n")
+            except asyncio.LimitOverrunError:
+                logger.warning(
+                    "client request exceeded %d-byte body limit; closing connection",
+                    _SOCKET_BODY_LIMIT,
+                )
+                response = _make_error(
+                    -32600,
+                    "request body exceeds 1 MiB limit",
+                )
+                try:
+                    writer.write(json.dumps(response).encode() + b"\n")
+                    await writer.drain()
+                except Exception:
+                    pass
+                break
             if not data:
                 break
 
@@ -1525,7 +1658,13 @@ async def _serve_unix_socket(path: Path):
     if path.exists():
         path.unlink()
 
-    _server = await asyncio.start_unix_server(_handle_client, path=str(path))
+    # SEC-015: cap StreamReader buffer at 1 MiB so readuntil raises
+    # LimitOverrunError instead of growing unbounded.
+    _server = await asyncio.start_unix_server(
+        _handle_client,
+        path=str(path),
+        limit=_SOCKET_BODY_LIMIT,
+    )
 
     # Set socket permissions (owner read/write only)
     try:
@@ -1611,6 +1750,49 @@ async def _serve_http(host: str = "127.0.0.1", port: int = 9900):
         pass
 
 
+# ── Cloud-sync hygiene ────────────────────────────────────────────────────
+# SEC: warn (do not refuse to start) when a daemon-managed path lives under a
+# known cloud-sync root. "Local-first" guarantees do not hold on a path that
+# Apple/Dropbox/Google/Microsoft is silently replicating offsite.
+
+SYNC_ROOTS = (
+    "Library/Mobile Documents",  # iCloud Drive
+    "Dropbox",
+    "Google Drive",
+    "OneDrive",
+)
+
+
+def _warn_if_sync_root(label: str, path: Path) -> None:
+    """Emit a warning if ``path`` is under a known cloud-sync root inside $HOME.
+
+    Never raises. Never refuses to start. Resolution failures are silently
+    treated as "not under a sync root" — this is best-effort hygiene, not a
+    security control.
+    """
+    try:
+        resolved = path.resolve()
+    except OSError:
+        return
+    try:
+        home = Path.home().resolve()
+    except OSError:
+        return
+    try:
+        rel = resolved.relative_to(home)
+    except ValueError:
+        return
+    rel_str = str(rel)
+    for marker in SYNC_ROOTS:
+        if rel_str.startswith(marker) or f"/{marker}" in f"/{rel_str}":
+            logger.warning(
+                "Sovereign Memory %s appears to be inside a cloud-sync root (%s). "
+                "Local-first guarantees do not hold for this path. See README §Local-First Hygiene.",
+                label, marker,
+            )
+            return
+
+
 # ── Entry point ──────────────────────────────────────────────────────────
 
 def main():
@@ -1666,6 +1848,16 @@ def main():
     if args.port:
         logger.info("HTTP:      %s:%d", args.host, args.port)
     logger.info("Dual-write: %s", _dual_write_enabled)
+
+    # Cloud-sync hygiene: warn (do not refuse) if any daemon-managed path is
+    # inside iCloud / Dropbox / Google Drive / OneDrive. See SEC plan
+    # "Cloud-sync hygiene".
+    try:
+        _warn_if_sync_root("socket", _unix_socket_path)
+        _warn_if_sync_root("DB", Path(DEFAULT_CONFIG.db_path))
+        _warn_if_sync_root("vault", Path(DEFAULT_CONFIG.vault_path))
+    except Exception:  # never block startup on hygiene checks
+        logger.exception("cloud-sync hygiene check failed (non-fatal)")
 
     loop = asyncio.new_event_loop()
     main_task = loop.create_task(_serve_unix_socket(_unix_socket_path))

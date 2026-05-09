@@ -7,6 +7,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 export const PLUGIN_ROOT = path.resolve(__dirname, "..");
 
 export const DEFAULT_VAULT_PATH =
+  process.env.SOVEREIGN_VAULT_PATH ??
   process.env.SOVEREIGN_CODEX_VAULT_PATH ??
   path.join(os.homedir(), ".sovereign-memory", "codex-vault");
 
@@ -22,10 +23,23 @@ export const AFM_PREPARE_TASK_URL =
 export const AFM_PREPARE_TASK_MODEL =
   process.env.SOVEREIGN_AFM_PREPARE_TASK_MODEL ?? "apple-foundation-models";
 
-export const DEFAULT_AGENT_ID = process.env.SOVEREIGN_CODEX_AGENT_ID ?? "codex";
+export const DEFAULT_AGENT_ID =
+  process.env.SOVEREIGN_AGENT_ID ??
+  process.env.SOVEREIGN_CODEX_AGENT_ID ??
+  "codex";
 
 export const DEFAULT_WORKSPACE_ID =
-  process.env.SOVEREIGN_CODEX_WORKSPACE_ID ?? "workspace-codex";
+  process.env.SOVEREIGN_WORKSPACE_ID ??
+  process.env.SOVEREIGN_CODEX_WORKSPACE_ID ??
+  "workspace-codex";
+
+export const CODEX_HOOKS_ENABLED =
+  (process.env.SOVEREIGN_CODEX_HOOKS ?? "on").toLowerCase() !== "off";
+
+export const CODEX_CONTEXT_WINDOW = (() => {
+  const raw = Number(process.env.CODEX_CONTEXT_WINDOW ?? process.env.SOVEREIGN_CODEX_CONTEXT_WINDOW);
+  return Number.isFinite(raw) && raw > 0 ? raw : 200_000;
+})();
 
 export const CLAUDECODE_AGENT_ID =
   process.env.SOVEREIGN_CLAUDECODE_AGENT_ID ?? "claude-code";

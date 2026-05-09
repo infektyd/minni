@@ -1,0 +1,680 @@
+/* ============================================================
+   Sovereign Memory · Theme tokens
+   The structural styles in styles.css are theme-agnostic; this
+   file overrides only the design tokens declared on :root.
+
+   Themes:
+     [data-theme="paper"]    — default warm paper + graphite
+     [data-theme="phosphor"] — deep oxide-blue control room
+   ============================================================ */
+
+/* PAPER (default) — already in styles.css :root, declared here too
+   so the data-attribute form works consistently. */
+html[data-theme="paper"] {
+  --primary: #181613;
+  --ink: #181613;
+  --graphite: #242320;
+  --graphite-2: #33312C;
+  --graphite-3: #4E4A42;
+  --bone: #F4F1EA;
+  --bone-2: #E8E2D0;
+  --panel: #FFFEFA;
+  --panel-muted: #F8F5EE;
+  --border: #D6D0C3;
+  --border-strong: #AFA696;
+
+  --verdigris: #2F7D68;
+  --verdigris-dark: #1E5E4C;
+  --verdigris-soft: #D9ECE5;
+  --persimmon: #D2603A;
+  --persimmon-dark: #A4483F;
+  --persimmon-soft: #F7DED6;
+  --mustard: #C9A961;
+  --mustard-dark: #8C681F;
+  --mustard-soft: #F4E8C7;
+  --blue: #3D6F95;
+  --blue-soft: #DCEAF2;
+
+  --private: #A4483F;
+  --owner: #2F7D68;
+  --team: #3D6F95;
+  --system: #60656A;
+  --public: #736B60;
+
+  --afm-safe: #2F7D68;
+  --learn-candidate: #2F7D68;
+  --log-only: #B9852A;
+  --do-not-store: #A4483F;
+
+  --success: #2F7D68;
+  --warning: #B9852A;
+  --danger: #A4483F;
+  --info: #3D6F95;
+  --focus: #3D6F95;
+
+  --selected: #E0E8E2;
+  --hover: #F0EADF;
+  --disabled: #C8C2B8;
+  --loading: #7C817B;
+
+  --on-ink: #F8F5EF;
+  --on-panel: #181613;
+  --on-muted: #4E4A42;
+  --on-action: #FFFFFF;
+
+  --font-ui: "Inter", system-ui, -apple-system, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  --font-archive: "Newsreader", Georgia, serif;
+}
+
+/* ============================================================
+   PHOSPHOR — control-room
+   Deep oxide blue ground, phosphor-green primary, dim amber for
+   review states, signal red for danger. Mono-first typography
+   with an archival serif for headers. CRT scanline + grid
+   textures applied per surface.
+   ============================================================ */
+html[data-theme="phosphor"] {
+  /* base ink — deep oxide blue, not pure black */
+  --primary: #C7D7DC;          /* default text */
+  --ink: #03161B;              /* deepest surface */
+  --graphite: #07212A;
+  --graphite-2: #0E2E38;
+  --graphite-3: #18404C;
+
+  /* "paper" inverted — these are the canvas + panel layers */
+  --bone: #051A21;             /* page canvas */
+  --bone-2: #082530;           /* secondary canvas */
+  --panel: #0A2B36;            /* primary panel */
+  --panel-muted: #082530;      /* muted panel */
+  --border: #14424F;
+  --border-strong: #1E5C6E;
+
+  /* semantic — phosphor palette */
+  --verdigris: #6BE3A2;        /* phosphor green primary */
+  --verdigris-dark: #3CB37A;
+  --verdigris-soft: #0F3A2C;
+
+  --persimmon: #FF6E5A;        /* signal red */
+  --persimmon-dark: #FF4A35;
+  --persimmon-soft: #3A1410;
+
+  --mustard: #E8B860;          /* amber review */
+  --mustard-dark: #F6C772;
+  --mustard-soft: #2E1F08;
+
+  --blue: #6FB8E0;             /* info cyan */
+  --blue-soft: #0B2F45;
+
+  --private: #FF6E5A;
+  --owner: #6BE3A2;
+  --team: #6FB8E0;
+  --system: #8FA2A8;
+  --public: #A5B5BA;
+
+  --afm-safe: #6BE3A2;
+  --learn-candidate: #6BE3A2;
+  --log-only: #E8B860;
+  --do-not-store: #FF6E5A;
+
+  --success: #6BE3A2;
+  --warning: #E8B860;
+  --danger: #FF6E5A;
+  --info: #6FB8E0;
+  --focus: #6BE3A2;
+
+  --selected: #0F3A2C;
+  --hover: #0E3543;
+  --disabled: #2A4651;
+  --loading: #5A7E89;
+
+  --on-ink: #C7D7DC;
+  --on-panel: #C7D7DC;
+  --on-muted: #8FA2A8;
+  --on-action: #03161B;
+
+  --font-ui: "JetBrains Mono", "IBM Plex Mono", ui-monospace, monospace;
+  --font-mono: "JetBrains Mono", "IBM Plex Mono", ui-monospace, monospace;
+  --font-archive: "Newsreader", Georgia, serif;
+}
+
+/* ===== Phosphor surface treatments =====
+   These are theme-specific decorations layered on top of the
+   structural styles. Kept here so swapping themes flips them
+   atomically. */
+
+html[data-theme="phosphor"] body {
+  background:
+    radial-gradient(ellipse at 50% -10%, rgba(107,227,162,0.06), transparent 60%),
+    var(--bone);
+}
+
+/* faint grid on the main canvas */
+html[data-theme="phosphor"] .main {
+  background-image:
+    linear-gradient(rgba(107,227,162,0.025) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(107,227,162,0.025) 1px, transparent 1px);
+  background-size: 32px 32px, 32px 32px;
+}
+
+/* CRT scanlines on status band */
+html[data-theme="phosphor"] .band {
+  background-image: repeating-linear-gradient(
+    to bottom,
+    rgba(107,227,162,0.04) 0,
+    rgba(107,227,162,0.04) 1px,
+    transparent 1px,
+    transparent 3px
+  ), linear-gradient(180deg, var(--graphite) 0%, var(--ink) 100%);
+}
+html[data-theme="phosphor"] .app[data-band="graphite"] .band {
+  background-image: repeating-linear-gradient(
+    to bottom,
+    rgba(107,227,162,0.06) 0,
+    rgba(107,227,162,0.06) 1px,
+    transparent 1px,
+    transparent 3px
+  ), linear-gradient(180deg, #0a2b36 0%, #03161B 100%);
+}
+
+/* rail brand mark — the layered square needs to read on dark */
+html[data-theme="phosphor"] .rail-brand-mark { background: var(--verdigris); }
+html[data-theme="phosphor"] .rail-brand-mark::after { background: var(--ink); }
+html[data-theme="phosphor"] .rail-brand-mark::before { background: var(--verdigris); box-shadow: 0 0 8px var(--verdigris); }
+
+/* phosphor glow on primary action and dots */
+html[data-theme="phosphor"] .btn-primary {
+  text-shadow: 0 0 6px rgba(3,22,27,0.4);
+  box-shadow: 0 0 0 1px rgba(107,227,162,0.3), 0 0 12px rgba(107,227,162,0.18);
+}
+html[data-theme="phosphor"] .band-dot {
+  box-shadow: 0 0 8px var(--verdigris);
+}
+html[data-theme="phosphor"] .band-dot[data-tone="warn"]   { box-shadow: 0 0 8px var(--mustard-dark); }
+html[data-theme="phosphor"] .band-dot[data-tone="danger"] { box-shadow: 0 0 8px var(--persimmon); }
+html[data-theme="phosphor"] .band-dot[data-tone="info"]   { box-shadow: 0 0 8px var(--blue); }
+
+/* ledger row tinting on private */
+html[data-theme="phosphor"] .ledger-row.is-private > * { background: #1A0E10; }
+html[data-theme="phosphor"] .ledger-row.is-private:hover > * { background: #241318; }
+
+/* archival header — serif italic on phosphor reads beautifully */
+html[data-theme="phosphor"] .archival-band {
+  background: linear-gradient(180deg, #0a2b36 0%, #082530 100%);
+  border-color: var(--border-strong);
+}
+html[data-theme="phosphor"] .archival-band-title {
+  color: var(--verdigris);
+  text-shadow: 0 0 16px rgba(107,227,162,0.25);
+}
+
+/* code block — terminal feel */
+html[data-theme="phosphor"] .code-block {
+  background: #03161B;
+  color: #B8E5C9;
+  border-color: var(--border);
+  text-shadow: 0 0 6px rgba(107,227,162,0.15);
+}
+
+/* meter on phosphor */
+html[data-theme="phosphor"] .meter,
+html[data-theme="phosphor"] .score-bar-fill { background: #0E3543; }
+html[data-theme="phosphor"] .meter > span { background: var(--verdigris); box-shadow: 0 0 6px var(--verdigris); }
+html[data-theme="phosphor"] .score-bar-fill > span { background: var(--verdigris); }
+
+/* rail meter glow */
+html[data-theme="phosphor"] .rail-meter > span { box-shadow: 0 0 6px var(--verdigris); }
+
+/* checkbox checked uses phosphor */
+html[data-theme="phosphor"] .ledger-checkbox.is-on { background: var(--verdigris); border-color: var(--verdigris); }
+html[data-theme="phosphor"] .ledger-checkbox.is-on::after { border-color: var(--ink); }
+
+/* risk callout amber tone retains warning intent on dark */
+html[data-theme="phosphor"] .risk-callout {
+  background: var(--mustard-soft);
+  border-color: #5A4318;
+  border-left-color: var(--mustard);
+}
+
+/* dryrun banners on phosphor */
+html[data-theme="phosphor"] .dryrun-col-banner-safe { background: var(--verdigris-soft); color: var(--verdigris); }
+html[data-theme="phosphor"] .dryrun-col-banner-log  { background: var(--mustard-soft); color: var(--mustard); }
+html[data-theme="phosphor"] .dryrun-col-banner-dns  { background: var(--persimmon-soft); color: var(--persimmon); }
+
+/* draft card phosphor approve/reject tints */
+html[data-theme="phosphor"] .draft-card-quote {
+  color: var(--primary);
+  border-left-color: var(--verdigris);
+}
+
+/* table head muted */
+html[data-theme="phosphor"] .ledger-head > *,
+html[data-theme="phosphor"] .audit-table > .head > * {
+  background: #082530;
+  color: var(--on-muted);
+}
+
+/* recall search — terminal prompt vibe */
+html[data-theme="phosphor"] .recall-search {
+  border-color: var(--border-strong);
+  box-shadow: inset 0 0 0 1px rgba(107,227,162,0.06);
+}
+html[data-theme="phosphor"] .recall-search-prefix {
+  background: var(--ink);
+  color: var(--verdigris);
+  border-right-color: var(--border-strong);
+}
+html[data-theme="phosphor"] .recall-search input { color: var(--verdigris); caret-color: var(--verdigris); }
+html[data-theme="phosphor"] .recall-search input::placeholder { color: var(--on-muted); }
+
+/* filter pill on phosphor */
+html[data-theme="phosphor"] .filter-pill.is-on {
+  background: var(--verdigris);
+  color: var(--ink);
+  border-color: var(--verdigris);
+  box-shadow: 0 0 8px rgba(107,227,162,0.3);
+}
+
+/* chip on phosphor — owner/team/etc need to read at small size */
+html[data-theme="phosphor"] .chip-owner { background: var(--owner); color: var(--ink); border-color: var(--verdigris-dark); }
+html[data-theme="phosphor"] .chip-team  { background: var(--team);  color: var(--ink); border-color: #4892B5; }
+html[data-theme="phosphor"] .chip-afm   { background: var(--verdigris); color: var(--ink); border-color: var(--verdigris-dark); }
+html[data-theme="phosphor"] .chip-learn { background: var(--verdigris); color: var(--ink); border-color: var(--verdigris-dark); }
+html[data-theme="phosphor"] .chip-private,
+html[data-theme="phosphor"] .chip-dns   { background: var(--persimmon-soft); color: var(--persimmon); border-color: #5C2018; }
+html[data-theme="phosphor"] .chip-log,
+html[data-theme="phosphor"] .chip-warn  { background: var(--mustard-soft); color: var(--mustard-dark); border-color: #5A4318; }
+html[data-theme="phosphor"] .chip-safe  { background: var(--verdigris-soft); color: var(--verdigris); border-color: #1A5640; }
+html[data-theme="phosphor"] .chip-info  { background: var(--blue-soft); color: var(--blue); border-color: #14506E; }
+html[data-theme="phosphor"] .chip-default,
+html[data-theme="phosphor"] .chip-system,
+html[data-theme="phosphor"] .chip-public { background: #082530; color: var(--on-muted); border-color: var(--border); }
+
+/* secondary button on phosphor */
+html[data-theme="phosphor"] .btn-secondary { background: #0A2B36; color: var(--primary); border-color: var(--border-strong); }
+html[data-theme="phosphor"] .btn-secondary:hover { background: var(--hover); }
+html[data-theme="phosphor"] .btn-icon { background: #0A2B36; border-color: var(--border-strong); color: var(--primary); }
+html[data-theme="phosphor"] .btn-danger { background: var(--persimmon); color: var(--ink); border-color: var(--persimmon-dark); box-shadow: 0 0 12px rgba(255,110,90,0.18); }
+
+/* inputs */
+html[data-theme="phosphor"] .input { background: #03161B; color: var(--verdigris); border-color: var(--border-strong); }
+
+/* kbd / kbd-like elements */
+html[data-theme="phosphor"] .kbd,
+html[data-theme="phosphor"] .rail-item-kbd { background: var(--ink); color: var(--on-muted); border-color: var(--border); }
+
+/* selection highlight */
+html[data-theme="phosphor"] ::selection { background: var(--verdigris); color: var(--ink); }
+
+/* ============================================================
+   RESIZE HANDLES — every visible divider is draggable
+   ============================================================ */
+.resize-handle {
+  position: absolute;
+  z-index: 5;
+  background: transparent;
+  transition: background 0.12s ease;
+}
+.resize-handle:hover,
+.resize-handle:active {
+  background: var(--focus);
+  opacity: 0.7;
+}
+.resize-handle-x {
+  top: 0; bottom: 0; width: 6px; cursor: col-resize;
+}
+.resize-handle-x[data-side="right"] { right: -3px; }
+.resize-handle-x[data-side="left"]  { left: -3px; }
+.resize-handle-y {
+  left: 0; right: 0; height: 6px; cursor: row-resize;
+}
+.resize-handle-y[data-side="top"]    { top: -3px; }
+.resize-handle-y[data-side="bottom"] { bottom: -3px; }
+
+/* every panel that hosts a handle needs position context */
+.rail, .inspector, .inspector-overlay, .telemetry,
+.operator-grid > .activity, .work-grid > *,
+.dryrun-grid > * {
+  position: relative;
+}
+.app { position: relative; }
+
+/* Resize handles positioned to the grid edges */
+.resize-rail {
+  position: absolute;
+  top: 0; bottom: 0;
+  left: var(--rail-w);
+  width: 6px;
+  margin-left: -3px;
+  cursor: col-resize;
+  z-index: 20;
+}
+.resize-band {
+  position: absolute;
+  top: 56px;
+  left: var(--rail-w);
+  right: 0;
+  height: 6px;
+  margin-top: -3px;
+  cursor: row-resize;
+  z-index: 20;
+}
+.resize-insp {
+  position: absolute;
+  top: 56px;
+  left: auto;
+  right: var(--insp-w);
+  bottom: 0;
+  width: 6px;
+  margin-right: -3px;
+  cursor: col-resize;
+  z-index: 20;
+}
+.resize-tele {
+  position: absolute;
+  top: auto;
+  left: var(--rail-w);
+  right: 0;
+  bottom: 144px;
+  height: 6px;
+  margin-bottom: -3px;
+  cursor: row-resize;
+  z-index: 20;
+}
+.app[data-theme-layout="operator"] .resize-tele {
+  bottom: var(--tele-h, 144px);
+}
+
+/* ============================================================
+   PHOSPHOR · OPERATOR LAYOUT
+   When [data-theme-layout="operator"] is set on the app, the
+   shell restructures: 56px band + main + 144px telemetry rail.
+   Inspector becomes overlay-only; right panel of main is taken
+   by the live activity stream on Recall.
+   ============================================================ */
+.app[data-theme-layout="operator"] {
+  grid-template-columns: var(--rail-w) 1fr;
+  grid-template-rows: 56px 1fr 144px;
+  grid-template-areas:
+    "rail band"
+    "rail main"
+    "rail telemetry";
+}
+
+.telemetry {
+  grid-area: telemetry;
+  display: flex;
+  align-items: stretch;
+  background:
+    repeating-linear-gradient(
+      to bottom,
+      rgba(107,227,162,0.04) 0,
+      rgba(107,227,162,0.04) 1px,
+      transparent 1px,
+      transparent 3px
+    ),
+    linear-gradient(180deg, #0a2b36 0%, #03161B 100%);
+  border-top: 1px solid var(--border-strong);
+  overflow: hidden;
+}
+.telemetry-mast {
+  width: 80px;
+  flex: 0 0 80px;
+  border-right: 1px solid var(--border-strong);
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  gap: 8px;
+  background: var(--ink);
+}
+.telemetry-mast-label {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.2em;
+  color: var(--verdigris);
+  text-shadow: 0 0 8px var(--verdigris);
+  writing-mode: vertical-rl;
+  transform: rotate(180deg);
+}
+.telemetry-mast-pid,
+.telemetry-mast-uptime {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--on-muted);
+  letter-spacing: 0.05em;
+}
+.telemetry-cells {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr) 1.5fr 1.4fr;
+  flex: 1;
+  min-width: 0;
+}
+.telemetry-cell {
+  border-right: 1px solid var(--border);
+  padding: 14px 14px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+  overflow: hidden;
+}
+.telemetry-cell:last-child { border-right: 0; }
+.telemetry-cell-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+}
+.telemetry-cell-label {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  color: var(--on-muted);
+  text-transform: uppercase;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.telemetry-cell-value {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--primary);
+  white-space: nowrap;
+}
+.telemetry-trace-line {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  flex-wrap: wrap;
+}
+.telemetry-trace-step {
+  padding: 3px 8px;
+  border: 1px solid var(--border);
+  background: var(--ink);
+  color: var(--on-muted);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.telemetry-trace-step.is-done {
+  color: var(--verdigris-dark);
+  border-color: var(--verdigris-dark);
+}
+.telemetry-trace-step.is-active {
+  color: var(--ink);
+  background: var(--verdigris);
+  border-color: var(--verdigris);
+  box-shadow: 0 0 10px rgba(107,227,162,0.4);
+  animation: phosphor-pulse 1.4s ease-in-out infinite;
+}
+.telemetry-trace-arrow {
+  color: var(--on-muted);
+  font-size: 11px;
+}
+.telemetry-focus-meta {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--on-muted);
+  letter-spacing: 0.04em;
+}
+
+@keyframes phosphor-pulse {
+  0%, 100% { box-shadow: 0 0 10px rgba(107,227,162,0.4); }
+  50%      { box-shadow: 0 0 18px rgba(107,227,162,0.7); }
+}
+
+/* ----- Operator main: split into ledger + activity stream ----- */
+.operator-grid {
+  display: grid;
+  grid-template-columns: 1fr 320px;
+  gap: 16px;
+  align-items: start;
+}
+.operator-main { min-width: 0; display: flex; flex-direction: column; gap: 16px; }
+
+.activity {
+  position: sticky;
+  top: 0;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  border-radius: 2px;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  max-height: calc(100vh - 56px - 144px - 40px);
+}
+.activity-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border-strong);
+  background: var(--ink);
+}
+.activity-head-title {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.16em;
+  color: var(--verdigris);
+  text-shadow: 0 0 8px rgba(107,227,162,0.5);
+}
+.activity-head-dot {
+  width: 8px; height: 8px;
+  border-radius: 50%;
+  background: var(--verdigris);
+  box-shadow: 0 0 10px var(--verdigris);
+  animation: phosphor-pulse 1.6s ease-in-out infinite;
+}
+.activity-list {
+  display: flex;
+  flex-direction: column;
+  overflow: auto;
+  flex: 1;
+}
+.activity-row {
+  display: grid;
+  grid-template-columns: 50px 90px 100px 1fr;
+  gap: 8px;
+  padding: 8px 14px;
+  border-bottom: 1px dashed var(--border);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  align-items: baseline;
+  min-width: 0;
+}
+.activity-row:nth-child(1) {
+  background: rgba(107,227,162,0.06);
+}
+.activity-t {
+  color: var(--on-muted);
+  letter-spacing: 0.04em;
+}
+.activity-src {
+  color: var(--blue);
+}
+.activity-op {
+  color: var(--verdigris);
+  font-weight: 600;
+}
+.activity-note {
+  color: var(--primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+
+/* ----- Operator: tighten archival band on the dense side ----- */
+html[data-theme="phosphor"] .archival-band {
+  padding: 12px 16px;
+}
+html[data-theme="phosphor"] .archival-band-title {
+  font-size: 22px;
+}
+
+/* ----- Phosphor: rail tweaks for unity with the bottom rail ----- */
+html[data-theme="phosphor"] .rail {
+  background:
+    linear-gradient(180deg, #03161B 0%, #051A21 100%);
+  border-right-color: var(--border-strong);
+}
+html[data-theme="phosphor"] .rail-brand {
+  border-bottom-color: var(--border-strong);
+}
+html[data-theme="phosphor"] .rail-section-label {
+  color: var(--verdigris-dark);
+  letter-spacing: 0.18em;
+}
+html[data-theme="phosphor"] .rail-item.is-active::before {
+  background: var(--verdigris);
+  box-shadow: 0 0 6px var(--verdigris);
+}
+
+/* ----- Phosphor: panel chrome ----- */
+html[data-theme="phosphor"] .panel,
+html[data-theme="phosphor"] .panel-muted {
+  border-color: var(--border);
+  box-shadow: inset 0 0 0 1px rgba(107,227,162,0.04);
+}
+html[data-theme="phosphor"] .panel-header {
+  background: var(--ink);
+  border-bottom-color: var(--border-strong);
+}
+html[data-theme="phosphor"] .panel-header-title {
+  color: var(--verdigris);
+  letter-spacing: 0.14em;
+}
+html[data-theme="phosphor"] .panel-body { background: var(--panel); }
+
+html[data-theme="phosphor"] .ledger-row > * {
+  border-bottom-color: var(--border);
+}
+html[data-theme="phosphor"] .ledger-row:hover > * { background: var(--hover); }
+html[data-theme="phosphor"] .ledger-row.is-selected > * { background: var(--selected); }
+html[data-theme="phosphor"] .ledger-source-title { color: var(--primary); }
+html[data-theme="phosphor"] .ledger-source-path  { color: var(--on-muted); }
+
+/* ----- Phosphor: status band stat values glow ----- */
+html[data-theme="phosphor"] .band-stat-value { color: var(--verdigris); text-shadow: 0 0 6px rgba(107,227,162,0.3); }
+html[data-theme="phosphor"] .band-stat-label { color: var(--on-muted); }
+html[data-theme="phosphor"] .band-stat { border-right-color: var(--border-strong); }
+
+/* ----- Phosphor: archival band meta ----- */
+html[data-theme="phosphor"] .archival-band-eyebrow { color: var(--mustard); letter-spacing: 0.22em; }
+html[data-theme="phosphor"] .archival-band-meta { color: var(--on-muted); }
+
+/* Tweaks panel — bring it forward on phosphor */
+html[data-theme="phosphor"] [data-tweaks-host] {
+  --tp-bg: var(--panel) !important;
+  --tp-fg: var(--primary) !important;
+  --tp-border: var(--border-strong) !important;
+  --tp-muted: var(--on-muted) !important;
+  --tp-accent: var(--verdigris) !important;
+}
