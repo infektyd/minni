@@ -7,6 +7,8 @@ import type { HarvestDeps, HarvestedLearning } from "./team-harvest.js";
 import { recordAudit } from "./vault.js";
 
 export const DEFAULT_TEAM_TTL_SECONDS = 86400;
+export const MIN_TEAM_TTL_SECONDS = 60;
+export const MAX_TEAM_TTL_SECONDS = 7 * 24 * 3600;
 
 export type TeamAgentRole = "explorer" | "worker" | "reviewer" | "scribe";
 export type TeamPermission = "read" | "write" | "test" | "network" | "memory-recall";
@@ -149,7 +151,10 @@ export interface TeamEvidencePacket {
   doNotStore: string[];
   contextMarkdown: string;
   harvestedLearnings?: HarvestedLearning[];
+  // Tri-state: undefined = not checked, false = checked and fresh, true = checked and expired.
   runtimeExpired?: boolean;
+  expiredRuntimeId?: string;
+  expiredAt?: string;
 }
 
 export interface PermanentAgentProfile extends Omit<TemporaryAgentProfile, "lifetime" | "memoryPolicy" | "promotionRule"> {
@@ -323,7 +328,7 @@ async function buildPreparedTeamRuntime(
   const temporaryProfiles = normalizeAgents(input.agents);
   const taskLedger = ledgerFor(input.task, temporaryProfiles);
   const runtimeId = stableId("team", `${workspaceId}:${coordinatorAgentId}:${input.task}:${temporaryProfiles.map((agent) => agent.agentId).join(",")}`);
-  const ttlSeconds = Math.max(60, Math.min(input.ttlSeconds ?? DEFAULT_TEAM_TTL_SECONDS, 7 * 86400));
+  const ttlSeconds = Math.max(MIN_TEAM_TTL_SECONDS, Math.min(input.ttlSeconds ?? DEFAULT_TEAM_TTL_SECONDS, MAX_TEAM_TTL_SECONDS));
   const createdAtDate = now();
   const createdAt = createdAtDate.toISOString();
   const expiresAt = new Date(createdAtDate.getTime() + ttlSeconds * 1000).toISOString();
@@ -723,20 +728,32 @@ function promotionFor(report: EvidenceReport): PromotionCandidate {
   };
 }
 
-function evidenceContextMarkdown(
-  packet: Omit<TeamEvidencePacket, "contextMarkdown">,
-  expiration?: { runtimeId: string; expiresAt: string },
-): string {
+function checkRuntimeExpiration(
+  runtime: TeamRuntimePacket | undefined,
+  now: Date,
+): { expired: true; blocker: string; expiredRuntimeId: string; expiredAt: string } | undefined {
+  if (!runtime) return undefined;
+  const expiresDate = new Date(runtime.expiresAt);
+  if (now <= expiresDate) return undefined;
+  return {
+    expired: true,
+    expiredRuntimeId: runtime.runtimeId,
+    expiredAt: runtime.expiresAt,
+    blocker: `Runtime ${runtime.runtimeId} expired at ${runtime.expiresAt} (now ${now.toISOString()}); evidence ignored for promotion.`,
+  };
+}
+
+function evidenceContextMarkdown(packet: Omit<TeamEvidencePacket, "contextMarkdown">): string {
   const sections = [
     "# Sovereign Team Evidence",
     packet.runtimeId ? `Runtime: ${packet.runtimeId}` : "Runtime: unspecified",
     `Task: ${packet.task}`,
   ];
-  if (packet.runtimeExpired === true && expiration) {
+  if (packet.runtimeExpired === true && packet.expiredRuntimeId && packet.expiredAt) {
     sections.push(
       "## Expiration",
       [
-        `Runtime ${expiration.runtimeId} expired at ${expiration.expiresAt}.`,
+        `Runtime ${packet.expiredRuntimeId} expired at ${packet.expiredAt}.`,
         "Evidence was ignored for promotion; gather fresh runtime evidence before retrying.",
       ].join("\n"),
     );
@@ -787,18 +804,17 @@ export function buildTeamEvidencePacket(input: BuildEvidenceReportInput): TeamEv
   });
   let promotionCandidates = reports.map(promotionFor);
   const unresolvedBlockers = reports.flatMap((report) => report.blockers.map((blocker) => `${report.agentId}: ${blocker}`));
+  const expiration = checkRuntimeExpiration(input.runtime, input.now?.() ?? new Date());
   let runtimeExpired: boolean | undefined;
-  let expirationForMarkdown: { runtimeId: string; expiresAt: string } | undefined;
+  let expiredRuntimeId: string | undefined;
+  let expiredAt: string | undefined;
   if (input.runtime) {
-    const nowDate = (input.now?.() ?? new Date());
-    const expiresDate = new Date(input.runtime.expiresAt);
-    if (nowDate > expiresDate) {
-      runtimeExpired = true;
+    runtimeExpired = expiration !== undefined;
+    if (expiration) {
       promotionCandidates = [];
-      unresolvedBlockers.push(
-        `Runtime ${input.runtime.runtimeId} expired at ${input.runtime.expiresAt} (now ${nowDate.toISOString()}); evidence ignored for promotion.`,
-      );
-      expirationForMarkdown = { runtimeId: input.runtime.runtimeId, expiresAt: input.runtime.expiresAt };
+      unresolvedBlockers.push(expiration.blocker);
+      expiredRuntimeId = expiration.expiredRuntimeId;
+      expiredAt = expiration.expiredAt;
     }
   }
   const packet: Omit<TeamEvidencePacket, "contextMarkdown"> = {
@@ -812,10 +828,12 @@ export function buildTeamEvidencePacket(input: BuildEvidenceReportInput): TeamEv
       "Do not promote temporary profiles without explicit operator approval.",
     ],
     runtimeExpired,
+    expiredRuntimeId,
+    expiredAt,
   };
   return {
     ...packet,
-    contextMarkdown: evidenceContextMarkdown(packet, expirationForMarkdown),
+    contextMarkdown: evidenceContextMarkdown(packet),
   };
 }
 
@@ -827,23 +845,18 @@ export async function buildTeamEvidencePacketWithHarvest(
     throw new Error("team evidence harvest requires vaultPath.");
   }
   const packet = buildTeamEvidencePacket(input);
-  let harvestedLearnings: HarvestedLearning[];
-  let expirationForMarkdown: { runtimeId: string; expiresAt: string } | undefined;
-  if (packet.runtimeExpired === true && input.runtime) {
-    // Skip harvest entirely when the runtime is expired so stale evidence cannot pollute the inbox.
-    harvestedLearnings = [];
-    expirationForMarkdown = { runtimeId: input.runtime.runtimeId, expiresAt: input.runtime.expiresAt };
-  } else {
-    harvestedLearnings = await harvestEvidence(
-      {
-        task: input.task,
-        vaultPath: input.vaultPath,
-        runtimeId: input.runtimeId,
-        reports: input.results,
-      },
-      deps,
-    );
-  }
+  // Skip harvest entirely when the runtime is expired so stale evidence cannot pollute the inbox.
+  const harvestedLearnings: HarvestedLearning[] = packet.runtimeExpired === true
+    ? []
+    : await harvestEvidence(
+        {
+          task: input.task,
+          vaultPath: input.vaultPath,
+          runtimeId: input.runtimeId,
+          reports: input.results,
+        },
+        deps,
+      );
   const next: Omit<TeamEvidencePacket, "contextMarkdown"> = {
     runtimeId: packet.runtimeId,
     task: packet.task,
@@ -853,10 +866,12 @@ export async function buildTeamEvidencePacketWithHarvest(
     doNotStore: packet.doNotStore,
     harvestedLearnings,
     runtimeExpired: packet.runtimeExpired,
+    expiredRuntimeId: packet.expiredRuntimeId,
+    expiredAt: packet.expiredAt,
   };
   return {
     ...next,
-    contextMarkdown: evidenceContextMarkdown(next, expirationForMarkdown),
+    contextMarkdown: evidenceContextMarkdown(next),
   };
 }
 

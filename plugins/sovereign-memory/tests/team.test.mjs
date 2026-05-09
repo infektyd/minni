@@ -2,6 +2,9 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  DEFAULT_TEAM_TTL_SECONDS,
+  MAX_TEAM_TTL_SECONDS,
+  MIN_TEAM_TTL_SECONDS,
   buildTeamEvidencePacket,
   buildTeamEvidencePacketWithHarvest,
   buildTeamPromotionPacket,
@@ -215,8 +218,8 @@ test("buildTeamRuntime defaults TTL to 24h and stamps createdAt + expiresAt", as
   const packet = await buildRuntimeAt(FIXED_NOW_ISO);
 
   assert.equal(packet.createdAt, FIXED_NOW_ISO);
-  assert.equal(packet.ttlSeconds, 86400);
-  assert.equal(packet.expiresAt, new Date(FIXED_NOW_MS + 86400 * 1000).toISOString());
+  assert.equal(packet.ttlSeconds, DEFAULT_TEAM_TTL_SECONDS);
+  assert.equal(packet.expiresAt, new Date(FIXED_NOW_MS + DEFAULT_TEAM_TTL_SECONDS * 1000).toISOString());
   assert.match(packet.contextMarkdown, new RegExp(`Created: ${FIXED_NOW_ISO}`));
   assert.match(packet.contextMarkdown, new RegExp(`Expires: ${packet.expiresAt}`));
 });
@@ -227,16 +230,16 @@ test("buildTeamRuntime accepts a custom ttlSeconds", async () => {
   assert.equal(packet.expiresAt, new Date(FIXED_NOW_MS + 3600 * 1000).toISOString());
 });
 
-test("buildTeamRuntime clamps ttlSeconds below the floor up to 60", async () => {
-  const packet = await buildRuntimeAt(FIXED_NOW_ISO, { ttlSeconds: 30 });
-  assert.equal(packet.ttlSeconds, 60);
-  assert.equal(packet.expiresAt, new Date(FIXED_NOW_MS + 60 * 1000).toISOString());
+test("buildTeamRuntime clamps ttlSeconds below the floor up to MIN_TEAM_TTL_SECONDS", async () => {
+  const packet = await buildRuntimeAt(FIXED_NOW_ISO, { ttlSeconds: MIN_TEAM_TTL_SECONDS - 30 });
+  assert.equal(packet.ttlSeconds, MIN_TEAM_TTL_SECONDS);
+  assert.equal(packet.expiresAt, new Date(FIXED_NOW_MS + MIN_TEAM_TTL_SECONDS * 1000).toISOString());
 });
 
-test("buildTeamRuntime clamps ttlSeconds above the ceiling down to 7 days", async () => {
+test("buildTeamRuntime clamps ttlSeconds above the ceiling down to MAX_TEAM_TTL_SECONDS", async () => {
   const packet = await buildRuntimeAt(FIXED_NOW_ISO, { ttlSeconds: 999_999_999 });
-  assert.equal(packet.ttlSeconds, 7 * 86400);
-  assert.equal(packet.expiresAt, new Date(FIXED_NOW_MS + 7 * 86400 * 1000).toISOString());
+  assert.equal(packet.ttlSeconds, MAX_TEAM_TTL_SECONDS);
+  assert.equal(packet.expiresAt, new Date(FIXED_NOW_MS + MAX_TEAM_TTL_SECONDS * 1000).toISOString());
 });
 
 test("buildTeamEvidencePacket without a runtime emits promotion candidates and no expiration blocker", () => {
@@ -255,12 +258,14 @@ test("buildTeamEvidencePacket without a runtime emits promotion candidates and n
   });
 
   assert.equal(packet.runtimeExpired, undefined);
+  assert.equal(packet.expiredRuntimeId, undefined);
+  assert.equal(packet.expiredAt, undefined);
   assert.ok(packet.promotionCandidates.length > 0);
   assert.ok(!packet.unresolvedBlockers.some((entry) => entry.includes("expired")));
   assert.ok(!packet.contextMarkdown.includes("## Expiration"));
 });
 
-test("buildTeamEvidencePacket with a fresh runtime preserves promotion candidates", async () => {
+test("buildTeamEvidencePacket with a fresh runtime marks runtimeExpired === false", async () => {
   const runtime = await buildRuntimeAt(FIXED_NOW_ISO, { ttlSeconds: 3600 });
   const packet = buildTeamEvidencePacket({
     task: "Implement runtime",
@@ -278,7 +283,9 @@ test("buildTeamEvidencePacket with a fresh runtime preserves promotion candidate
     ],
   });
 
-  assert.notEqual(packet.runtimeExpired, true);
+  assert.equal(packet.runtimeExpired, false);
+  assert.equal(packet.expiredRuntimeId, undefined);
+  assert.equal(packet.expiredAt, undefined);
   assert.ok(packet.promotionCandidates.length > 0);
   assert.ok(!packet.unresolvedBlockers.some((entry) => entry.includes("expired")));
   assert.ok(!packet.contextMarkdown.includes("## Expiration"));
@@ -304,6 +311,8 @@ test("buildTeamEvidencePacket with an expired runtime suppresses promotion and a
   });
 
   assert.equal(packet.runtimeExpired, true);
+  assert.equal(packet.expiredRuntimeId, runtime.runtimeId);
+  assert.equal(packet.expiredAt, runtime.expiresAt);
   assert.equal(packet.promotionCandidates.length, 0);
   const expirationBlocker = packet.unresolvedBlockers.find((entry) => entry.includes("expired"));
   assert.ok(expirationBlocker, "expected an expiration blocker");
