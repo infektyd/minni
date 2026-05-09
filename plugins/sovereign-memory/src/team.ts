@@ -2,6 +2,8 @@ import { createHash } from "node:crypto";
 import { DEFAULT_AGENT_ID, DEFAULT_VAULT_PATH, DEFAULT_WORKSPACE_ID } from "./config.js";
 import { prepareTask } from "./task.js";
 import type { PreparedTaskPacket, PrepareTaskInput, TaskProfile } from "./task.js";
+import { harvestEvidence } from "./team-harvest.js";
+import type { HarvestDeps, HarvestedLearning } from "./team-harvest.js";
 import { recordAudit } from "./vault.js";
 
 export type TeamAgentRole = "explorer" | "worker" | "reviewer" | "scribe";
@@ -105,6 +107,8 @@ export interface BuildEvidenceReportInput {
   task: string;
   runtimeId?: string;
   results: TeamAgentResultInput[];
+  harvest?: boolean;
+  vaultPath?: string;
 }
 
 export interface EvidenceReport {
@@ -135,6 +139,7 @@ export interface TeamEvidencePacket {
   unresolvedBlockers: string[];
   doNotStore: string[];
   contextMarkdown: string;
+  harvestedLearnings?: HarvestedLearning[];
 }
 
 export interface PermanentAgentProfile extends Omit<TemporaryAgentProfile, "lifetime" | "memoryPolicy" | "promotionRule"> {
@@ -699,7 +704,7 @@ function promotionFor(report: EvidenceReport): PromotionCandidate {
 }
 
 function evidenceContextMarkdown(packet: Omit<TeamEvidencePacket, "contextMarkdown">): string {
-  return [
+  const sections = [
     "# Sovereign Team Evidence",
     packet.runtimeId ? `Runtime: ${packet.runtimeId}` : "Runtime: unspecified",
     `Task: ${packet.task}`,
@@ -713,10 +718,23 @@ function evidenceContextMarkdown(packet: Omit<TeamEvidencePacket, "contextMarkdo
       .join("\n"),
     "## Do Not Store",
     packet.doNotStore.map((item) => `- ${item}`).join("\n"),
-  ].join("\n\n");
+  ];
+  if (packet.harvestedLearnings && packet.harvestedLearnings.length > 0) {
+    sections.push(
+      "## Harvested Candidates",
+      packet.harvestedLearnings
+        .map((learning) =>
+          learning.source === "afm"
+            ? `- ${learning.agentId}: ${learning.candidateText} (inbox: ${learning.inboxFilePath})`
+            : `- ${learning.agentId}: skipped (${learning.reason ?? "no reason"})`,
+        )
+        .join("\n"),
+    );
+  }
+  return sections.join("\n\n");
 }
 
-export function buildTeamEvidencePacket(input: BuildEvidenceReportInput): TeamEvidencePacket {
+function buildSyncEvidencePacket(input: BuildEvidenceReportInput): TeamEvidencePacket {
   if (!input.task.trim()) throw new Error("team evidence requires task.");
   const reports = input.results.map((result) => {
     const status = evidenceStatus(result);
@@ -751,6 +769,46 @@ export function buildTeamEvidencePacket(input: BuildEvidenceReportInput): TeamEv
     ...packet,
     contextMarkdown: evidenceContextMarkdown(packet),
   };
+}
+
+export function buildTeamEvidencePacket(
+  input: BuildEvidenceReportInput & { harvest: true },
+  deps?: HarvestDeps,
+): Promise<TeamEvidencePacket>;
+export function buildTeamEvidencePacket(input: BuildEvidenceReportInput): TeamEvidencePacket;
+export function buildTeamEvidencePacket(
+  input: BuildEvidenceReportInput,
+  deps?: HarvestDeps,
+): TeamEvidencePacket | Promise<TeamEvidencePacket> {
+  const packet = buildSyncEvidencePacket(input);
+  if (input.harvest !== true) return packet;
+  if (!input.vaultPath || !input.vaultPath.trim()) {
+    throw new Error("team evidence harvest requires vaultPath.");
+  }
+  const vaultPath = input.vaultPath;
+  return harvestEvidence(
+    {
+      task: input.task,
+      vaultPath,
+      runtimeId: input.runtimeId,
+      reports: input.results,
+    },
+    deps,
+  ).then((harvestedLearnings) => {
+    const next: Omit<TeamEvidencePacket, "contextMarkdown"> = {
+      runtimeId: packet.runtimeId,
+      task: packet.task,
+      reports: packet.reports,
+      promotionCandidates: packet.promotionCandidates,
+      unresolvedBlockers: packet.unresolvedBlockers,
+      doNotStore: packet.doNotStore,
+      harvestedLearnings,
+    };
+    return {
+      ...next,
+      contextMarkdown: evidenceContextMarkdown(next),
+    };
+  });
 }
 
 function permissionDelta(current: TeamPermission[], requested: TeamPermission[]): TeamPromotionPacket["permissionDelta"] {
