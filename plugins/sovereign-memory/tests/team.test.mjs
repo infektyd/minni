@@ -1,7 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { buildTeamEvidencePacket, buildTeamPromotionPacket, buildTeamRuntime } from "../dist/team.js";
+import {
+  buildTeamEvidencePacket,
+  buildTeamEvidencePacketWithHarvest,
+  buildTeamPromotionPacket,
+  buildTeamRuntime,
+} from "../dist/team.js";
 
 function fakePreparedTask(input) {
   return {
@@ -182,4 +187,175 @@ test("buildTeamPromotionPacket drafts permanent profiles only after explicit app
   assert.equal(approved.permanentProfile.lifetime, "permanent");
   assert.ok(approved.permissionDelta.added.includes("network"));
   assert.match(approved.nextStep, /review and persist/i);
+});
+
+const FIXED_NOW_ISO = "2026-05-08T22:30:00.000Z";
+const FIXED_NOW_MS = Date.parse(FIXED_NOW_ISO);
+
+function fixedClock(iso = FIXED_NOW_ISO) {
+  return () => new Date(iso);
+}
+
+async function buildRuntimeAt(iso, overrides = {}) {
+  return buildTeamRuntime(
+    {
+      task: "Lifecycle test",
+      vaultPath: "/tmp/vault",
+      ...overrides,
+    },
+    {
+      prepare: async (input) => fakePreparedTask(input),
+      audit: async () => undefined,
+      now: fixedClock(iso),
+    },
+  );
+}
+
+test("buildTeamRuntime defaults TTL to 24h and stamps createdAt + expiresAt", async () => {
+  const packet = await buildRuntimeAt(FIXED_NOW_ISO);
+
+  assert.equal(packet.createdAt, FIXED_NOW_ISO);
+  assert.equal(packet.ttlSeconds, 86400);
+  assert.equal(packet.expiresAt, new Date(FIXED_NOW_MS + 86400 * 1000).toISOString());
+  assert.match(packet.contextMarkdown, new RegExp(`Created: ${FIXED_NOW_ISO}`));
+  assert.match(packet.contextMarkdown, new RegExp(`Expires: ${packet.expiresAt}`));
+});
+
+test("buildTeamRuntime accepts a custom ttlSeconds", async () => {
+  const packet = await buildRuntimeAt(FIXED_NOW_ISO, { ttlSeconds: 3600 });
+  assert.equal(packet.ttlSeconds, 3600);
+  assert.equal(packet.expiresAt, new Date(FIXED_NOW_MS + 3600 * 1000).toISOString());
+});
+
+test("buildTeamRuntime clamps ttlSeconds below the floor up to 60", async () => {
+  const packet = await buildRuntimeAt(FIXED_NOW_ISO, { ttlSeconds: 30 });
+  assert.equal(packet.ttlSeconds, 60);
+  assert.equal(packet.expiresAt, new Date(FIXED_NOW_MS + 60 * 1000).toISOString());
+});
+
+test("buildTeamRuntime clamps ttlSeconds above the ceiling down to 7 days", async () => {
+  const packet = await buildRuntimeAt(FIXED_NOW_ISO, { ttlSeconds: 999_999_999 });
+  assert.equal(packet.ttlSeconds, 7 * 86400);
+  assert.equal(packet.expiresAt, new Date(FIXED_NOW_MS + 7 * 86400 * 1000).toISOString());
+});
+
+test("buildTeamEvidencePacket without a runtime emits promotion candidates and no expiration blocker", () => {
+  const packet = buildTeamEvidencePacket({
+    task: "Implement runtime",
+    results: [
+      {
+        agentId: "worker",
+        status: "completed",
+        summary: "Did it.",
+        evidence: ["a", "b"],
+        changedFiles: ["x.ts"],
+        verification: ["npm test"],
+      },
+    ],
+  });
+
+  assert.equal(packet.runtimeExpired, undefined);
+  assert.ok(packet.promotionCandidates.length > 0);
+  assert.ok(!packet.unresolvedBlockers.some((entry) => entry.includes("expired")));
+  assert.ok(!packet.contextMarkdown.includes("## Expiration"));
+});
+
+test("buildTeamEvidencePacket with a fresh runtime preserves promotion candidates", async () => {
+  const runtime = await buildRuntimeAt(FIXED_NOW_ISO, { ttlSeconds: 3600 });
+  const packet = buildTeamEvidencePacket({
+    task: "Implement runtime",
+    runtime,
+    now: fixedClock("2026-05-08T22:45:00.000Z"),
+    results: [
+      {
+        agentId: "worker",
+        status: "completed",
+        summary: "Did it.",
+        evidence: ["a", "b"],
+        changedFiles: ["x.ts"],
+        verification: ["npm test"],
+      },
+    ],
+  });
+
+  assert.notEqual(packet.runtimeExpired, true);
+  assert.ok(packet.promotionCandidates.length > 0);
+  assert.ok(!packet.unresolvedBlockers.some((entry) => entry.includes("expired")));
+  assert.ok(!packet.contextMarkdown.includes("## Expiration"));
+});
+
+test("buildTeamEvidencePacket with an expired runtime suppresses promotion and adds a blocker", async () => {
+  const runtime = await buildRuntimeAt(FIXED_NOW_ISO, { ttlSeconds: 3600 });
+  const oneSecondPastExpiry = new Date(Date.parse(runtime.expiresAt) + 1000).toISOString();
+  const packet = buildTeamEvidencePacket({
+    task: "Implement runtime",
+    runtime,
+    now: fixedClock(oneSecondPastExpiry),
+    results: [
+      {
+        agentId: "worker",
+        status: "completed",
+        summary: "Did it.",
+        evidence: ["a", "b"],
+        changedFiles: ["x.ts"],
+        verification: ["npm test"],
+      },
+    ],
+  });
+
+  assert.equal(packet.runtimeExpired, true);
+  assert.equal(packet.promotionCandidates.length, 0);
+  const expirationBlocker = packet.unresolvedBlockers.find((entry) => entry.includes("expired"));
+  assert.ok(expirationBlocker, "expected an expiration blocker");
+  assert.match(
+    expirationBlocker,
+    new RegExp(`Runtime ${runtime.runtimeId} expired at ${runtime.expiresAt} \\(now ${oneSecondPastExpiry}\\); evidence ignored for promotion\\.`),
+  );
+  assert.match(packet.contextMarkdown, /## Expiration/);
+  assert.ok(packet.contextMarkdown.includes(runtime.runtimeId));
+});
+
+test("buildTeamEvidencePacketWithHarvest refuses to harvest when runtime expired", async () => {
+  const runtime = await buildRuntimeAt(FIXED_NOW_ISO, { ttlSeconds: 3600 });
+  const oneSecondPastExpiry = new Date(Date.parse(runtime.expiresAt) + 1000).toISOString();
+  let harvestCalled = false;
+  const callAfm = async () => {
+    harvestCalled = true;
+    throw new Error("harvest must not be invoked when runtime expired");
+  };
+  const writeInbox = async () => {
+    harvestCalled = true;
+    throw new Error("harvest must not be invoked when runtime expired");
+  };
+  const audit = async () => {
+    harvestCalled = true;
+    throw new Error("harvest must not be invoked when runtime expired");
+  };
+
+  const packet = await buildTeamEvidencePacketWithHarvest(
+    {
+      task: "Implement runtime",
+      vaultPath: "/tmp/vault",
+      runtime,
+      now: fixedClock(oneSecondPastExpiry),
+      results: [
+        {
+          agentId: "worker",
+          status: "completed",
+          summary: "Did it.",
+          evidence: ["a", "b"],
+          changedFiles: ["x.ts"],
+          verification: ["npm test"],
+        },
+      ],
+    },
+    { callAfm, writeInbox, audit },
+  );
+
+  assert.equal(harvestCalled, false, "harvest deps must not be called when runtime expired");
+  assert.equal(packet.runtimeExpired, true);
+  assert.deepEqual(packet.harvestedLearnings, []);
+  assert.equal(packet.promotionCandidates.length, 0);
+  assert.ok(packet.unresolvedBlockers.some((entry) => entry.includes("expired")));
+  assert.match(packet.contextMarkdown, /## Expiration/);
 });
