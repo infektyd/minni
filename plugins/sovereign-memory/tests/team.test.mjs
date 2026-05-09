@@ -54,6 +54,7 @@ test("buildTeamRuntime creates temporary agent profiles, task ledger, and hydrat
       audit: async (_vaultPath, entry) => {
         audits.push(entry);
       },
+      findRepeated: async () => [],
     },
   );
 
@@ -76,6 +77,88 @@ test("buildTeamRuntime creates temporary agent profiles, task ledger, and hydrat
   assert.match(packet.contextMarkdown, /Sovereign Team Runtime/);
   assert.equal(prepareCalls.length, 3);
   assert.equal(audits[0].tool, "sovereign_team_runtime");
+  // Task 3: audit detail now records focus per agent so repetition signatures can be derived later.
+  assert.equal(audits[0].details.agents[0].focus, "Map prior decisions.");
+  assert.equal(audits[0].details.agents[1].focus, "Implement runtime.");
+  assert.equal(audits[0].details.agents[2].focus, "Review privacy and tests.");
+  assert.deepEqual(packet.repeatedAgentSuggestions, []);
+});
+
+test("buildTeamRuntime attaches repeatedAgentSuggestions from findRepeated and renders them", async () => {
+  const stubSuggestions = [
+    {
+      signature: "worker::audit swift concurrency",
+      role: "worker",
+      normalizedFocus: "audit swift concurrency",
+      count: 4,
+      examples: [
+        {
+          runtimeId: "team-old",
+          timestamp: "2026-04-30T10:00:00.000Z",
+          agentId: "team-worker-1",
+          rawFocus: "Audit Swift concurrency",
+        },
+      ],
+      suggestPromotion: true,
+    },
+  ];
+  let findRepeatedCalls = 0;
+  const packet = await buildTeamRuntime(
+    {
+      task: "Repetition wiring",
+      vaultPath: "/tmp/vault",
+    },
+    {
+      prepare: async (input) => fakePreparedTask(input),
+      audit: async () => undefined,
+      findRepeated: async () => {
+        findRepeatedCalls += 1;
+        return stubSuggestions;
+      },
+    },
+  );
+
+  assert.equal(findRepeatedCalls, 1);
+  assert.deepEqual(packet.repeatedAgentSuggestions, stubSuggestions);
+  assert.match(packet.contextMarkdown, /## Repeated Agent Patterns/);
+  assert.match(packet.contextMarkdown, /worker::audit swift concurrency/);
+  assert.match(packet.contextMarkdown, /observed 4 times/);
+  assert.match(packet.contextMarkdown, /promotion candidate: yes/);
+});
+
+test("buildTeamRuntime omits Repeated Agent Patterns section when no suggestions", async () => {
+  const packet = await buildTeamRuntime(
+    {
+      task: "No repetitions",
+      vaultPath: "/tmp/vault",
+    },
+    {
+      prepare: async (input) => fakePreparedTask(input),
+      audit: async () => undefined,
+      findRepeated: async () => [],
+    },
+  );
+  assert.deepEqual(packet.repeatedAgentSuggestions, []);
+  assert.equal(packet.contextMarkdown.includes("## Repeated Agent Patterns"), false);
+});
+
+test("buildTeamRuntime never breaks when findRepeated throws", async () => {
+  const packet = await buildTeamRuntime(
+    {
+      task: "Resilient against repetition failure",
+      vaultPath: "/tmp/vault",
+    },
+    {
+      prepare: async (input) => fakePreparedTask(input),
+      audit: async () => undefined,
+      findRepeated: async () => {
+        throw new Error("repetition computation exploded");
+      },
+    },
+  );
+  assert.deepEqual(packet.repeatedAgentSuggestions, []);
+  assert.equal(packet.contextMarkdown.includes("## Repeated Agent Patterns"), false);
+  assert.ok(packet.runtimeId.startsWith("team-"));
 });
 
 test("buildTeamRuntime defaults to a complete explorer, worker, reviewer team", async () => {

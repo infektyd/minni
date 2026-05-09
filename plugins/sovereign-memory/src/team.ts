@@ -4,6 +4,8 @@ import { prepareTask } from "./task.js";
 import type { PreparedTaskPacket, PrepareTaskInput, TaskProfile } from "./task.js";
 import { harvestEvidence } from "./team-harvest.js";
 import type { HarvestDeps, HarvestedLearning } from "./team-harvest.js";
+import { findRepeatedAgents } from "./team-repetition.js";
+import type { RepeatedAgentSuggestion } from "./team-repetition.js";
 import { recordAudit } from "./vault.js";
 
 export const DEFAULT_TEAM_TTL_SECONDS = 86400;
@@ -80,6 +82,7 @@ export interface TeamRuntimePacket {
   createdAt: string;
   expiresAt: string;
   ttlSeconds: number;
+  repeatedAgentSuggestions: RepeatedAgentSuggestion[];
   contextMarkdown: string;
 }
 
@@ -100,6 +103,7 @@ export interface TeamRuntimeDeps {
   prepare?: typeof prepareTask;
   audit?: typeof recordAudit;
   now?: () => Date;
+  findRepeated?: typeof findRepeatedAgents;
 }
 
 export interface TeamAgentResultInput {
@@ -291,7 +295,7 @@ function instructionsFor(profile: TemporaryAgentProfile): string[] {
 }
 
 function teamContextMarkdown(packet: Omit<TeamRuntimePacket, "contextMarkdown">): string {
-  return [
+  const sections = [
     "# Sovereign Team Runtime",
     `Runtime: ${packet.runtimeId}`,
     `Task: ${packet.task}`,
@@ -310,7 +314,22 @@ function teamContextMarkdown(packet: Omit<TeamRuntimePacket, "contextMarkdown">)
     packet.gates.map((item) => `- ${item}`).join("\n"),
     "## Non-goals",
     packet.nonGoals.map((item) => `- ${item}`).join("\n"),
-  ].join("\n\n");
+  ];
+  if (packet.repeatedAgentSuggestions.length > 0) {
+    sections.push(
+      "## Repeated Agent Patterns",
+      packet.repeatedAgentSuggestions
+        .map((suggestion) => {
+          const earliest = suggestion.examples[0];
+          const earliestAgent = earliest?.agentId ?? "unknown";
+          const earliestTimestamp = earliest?.timestamp ?? "unknown";
+          const promotion = suggestion.suggestPromotion ? "yes" : "no";
+          return `- ${suggestion.signature} — observed ${suggestion.count} times (${earliestAgent} at ${earliestTimestamp}); promotion candidate: ${promotion}`;
+        })
+        .join("\n"),
+    );
+  }
+  return sections.join("\n\n");
 }
 
 async function buildPreparedTeamRuntime(
@@ -358,6 +377,31 @@ async function buildPreparedTeamRuntime(
     }),
   );
 
+  await audit(vaultPath, {
+    tool: "sovereign_team_runtime",
+    summary: input.task.slice(0, 120),
+    details: {
+      runtimeId,
+      coordinatorAgentId,
+      workspaceId,
+      agents: temporaryProfiles.map((agent) => ({ agentId: agent.agentId, role: agent.role, focus: agent.focus })),
+      automaticLearning: false,
+    },
+  });
+
+  // Best-effort: repetition computation must never break runtime building.
+  // Read the audit AFTER recording so the just-spawned runtime is included in the window.
+  let repeatedAgentSuggestions: RepeatedAgentSuggestion[] = [];
+  try {
+    const finder = deps.findRepeated ?? findRepeatedAgents;
+    repeatedAgentSuggestions = await finder({
+      vaultPath,
+      now: createdAtDate,
+    });
+  } catch {
+    repeatedAgentSuggestions = [];
+  }
+
   const packet: Omit<TeamRuntimePacket, "contextMarkdown"> = {
     runtimeId,
     task: input.task,
@@ -385,19 +429,8 @@ async function buildPreparedTeamRuntime(
     createdAt,
     expiresAt,
     ttlSeconds,
+    repeatedAgentSuggestions,
   };
-
-  await audit(vaultPath, {
-    tool: "sovereign_team_runtime",
-    summary: input.task.slice(0, 120),
-    details: {
-      runtimeId,
-      coordinatorAgentId,
-      workspaceId,
-      agents: temporaryProfiles.map((agent) => ({ agentId: agent.agentId, role: agent.role })),
-      automaticLearning: false,
-    },
-  });
 
   return {
     ...packet,
