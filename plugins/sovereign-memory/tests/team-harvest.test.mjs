@@ -2,7 +2,10 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { harvestEvidence } from "../dist/team-harvest.js";
-import { buildTeamEvidencePacket } from "../dist/team.js";
+import {
+  buildTeamEvidencePacket,
+  buildTeamEvidencePacketWithHarvest,
+} from "../dist/team.js";
 
 function makeReports() {
   return [
@@ -70,12 +73,16 @@ test("harvestEvidence writes one inbox entry per AFM LEARNING, skips SKIP, swall
   assert.equal(written.length, 1);
   assert.equal(written[0].agentId, "worker");
   assert.equal(written[0].candidateText, "small backend changes win");
+  assert.equal(written[0].slug, "harvest-worker");
+  assert.ok(written[0].inboxFilePath, "afm entry should have inboxFilePath");
   assert.equal(skipped.length, 2);
 
   const skipReason = skipped.find((entry) => entry.agentId === "explorer");
   const errorReason = skipped.find((entry) => entry.agentId === "reviewer");
-  assert.match(skipReason.reason ?? "", /skip/i);
-  assert.match(errorReason.reason ?? "", /boom/);
+  assert.equal(skipReason.reason, "AFM returned SKIP");
+  assert.equal(errorReason.reason, "boom");
+  assert.equal(skipReason.slug, undefined, "skipped entries should not carry a slug");
+  assert.equal(skipReason.inboxFilePath, undefined, "skipped entries should not carry an inboxFilePath");
 
   assert.equal(inboxCalls.length, 1);
   assert.equal(inboxCalls[0].slug, "harvest-worker");
@@ -90,6 +97,36 @@ test("harvestEvidence writes one inbox entry per AFM LEARNING, skips SKIP, swall
   assert.equal(audits[0].entry.details.totalReports, 3);
   assert.equal(audits[0].entry.details.written, 1);
   assert.equal(audits[0].entry.details.skipped, 2);
+});
+
+test("harvestEvidence treats off-contract AFM responses as skipped, not learnings", async () => {
+  const inboxCalls = [];
+  const callAfm = async () => "Sure! Here is what I think you should learn: write more tests.";
+  const writeInbox = async (vaultPath, slug, payload) => {
+    const entry = {
+      slug,
+      filePath: `${vaultPath}/${slug}.json`,
+      createdAt: "now",
+      payload: { slug, createdAt: "now", ...payload },
+    };
+    inboxCalls.push(entry);
+    return entry;
+  };
+  const audit = async () => undefined;
+
+  const result = await harvestEvidence(
+    {
+      task: "Off-contract test",
+      vaultPath: "/tmp/vault",
+      reports: [{ agentId: "agent-1", status: "completed", summary: "ok" }],
+    },
+    { callAfm, writeInbox, audit },
+  );
+
+  assert.equal(result.length, 1);
+  assert.equal(result[0].source, "skipped");
+  assert.equal(result[0].reason, "no LEARNING: prefix");
+  assert.equal(inboxCalls.length, 0);
 });
 
 test("harvestEvidence redacts local paths and adapter filenames before inbox write", async () => {
@@ -129,9 +166,82 @@ test("harvestEvidence redacts local paths and adapter filenames before inbox wri
   assert.ok(!payload.candidateText.includes("/Volumes/Data"));
 });
 
-test("buildTeamEvidencePacket wires harvest:true through to harvestEvidence", async () => {
+test("harvestEvidence enforces maxLearningsPerCall as a global cap", async () => {
   const inboxCalls = [];
-  const audits = [];
+  const callAfm = async () => "LEARNING: noteworthy thing";
+  const writeInbox = async (vaultPath, slug, payload) => {
+    const entry = {
+      slug,
+      filePath: `${vaultPath}/inbox/${slug}-${inboxCalls.length}.json`,
+      createdAt: "now",
+      payload: { slug, createdAt: "now", ...payload },
+    };
+    inboxCalls.push(entry);
+    return entry;
+  };
+  const audit = async () => undefined;
+
+  const reports = Array.from({ length: 5 }, (_, index) => ({
+    agentId: `agent-${index + 1}`,
+    status: "completed",
+    summary: `Did thing ${index + 1}`,
+  }));
+
+  const result = await harvestEvidence(
+    {
+      task: "Cap enforcement",
+      vaultPath: "/tmp/vault",
+      reports,
+      maxLearningsPerCall: 2,
+    },
+    { callAfm, writeInbox, audit },
+  );
+
+  assert.equal(result.length, 5);
+  assert.equal(result.filter((entry) => entry.source === "afm").length, 2);
+  const capped = result.filter((entry) => entry.reason === "per-call cap reached");
+  assert.equal(capped.length, 3);
+  assert.equal(inboxCalls.length, 2);
+});
+
+test("harvestEvidence reports audit failures to stderr without dropping the result", async () => {
+  const originalWrite = process.stderr.write.bind(process.stderr);
+  const captured = [];
+  process.stderr.write = (chunk, ...rest) => {
+    captured.push(typeof chunk === "string" ? chunk : chunk.toString());
+    return originalWrite(chunk, ...rest);
+  };
+  try {
+    const result = await harvestEvidence(
+      {
+        task: "Audit failure",
+        vaultPath: "/tmp/vault",
+        reports: [{ agentId: "agent-1", status: "completed", summary: "ok" }],
+      },
+      {
+        callAfm: async () => "LEARNING: keep audit visible",
+        writeInbox: async (vaultPath, slug, payload) => ({
+          slug,
+          filePath: `${vaultPath}/${slug}.json`,
+          createdAt: "now",
+          payload: { slug, createdAt: "now", ...payload },
+        }),
+        audit: async () => {
+          throw new Error("audit-disk-full");
+        },
+      },
+    );
+    assert.equal(result.length, 1);
+    assert.equal(result[0].source, "afm");
+    const matched = captured.find((line) => line.includes("sovereign_team_harvest") && line.includes("audit-disk-full"));
+    assert.ok(matched, "expected stderr line referencing failed audit, got: " + JSON.stringify(captured));
+  } finally {
+    process.stderr.write = originalWrite;
+  }
+});
+
+test("buildTeamEvidencePacketWithHarvest wires harvest end-to-end", async () => {
+  const inboxCalls = [];
   const callAfm = async () => "LEARNING: end-to-end works";
   const writeInbox = async (vaultPath, slug, payload) => {
     const entry = {
@@ -143,15 +253,12 @@ test("buildTeamEvidencePacket wires harvest:true through to harvestEvidence", as
     inboxCalls.push(entry);
     return entry;
   };
-  const audit = async (vaultPath, entry) => {
-    audits.push(entry);
-  };
+  const audit = async () => undefined;
 
-  const packet = await buildTeamEvidencePacket(
+  const packet = await buildTeamEvidencePacketWithHarvest(
     {
       runtimeId: "team-xyz",
       task: "End-to-end harvest",
-      harvest: true,
       vaultPath: "/tmp/vault",
       results: [
         {
@@ -175,8 +282,8 @@ test("buildTeamEvidencePacket wires harvest:true through to harvestEvidence", as
   assert.match(packet.contextMarkdown, /Harvested Candidates/);
 });
 
-test("buildTeamEvidencePacket without harvest flag is unchanged", async () => {
-  const packet = await buildTeamEvidencePacket({
+test("buildTeamEvidencePacket without harvest stays sync and unchanged", () => {
+  const packet = buildTeamEvidencePacket({
     task: "Plain evidence",
     results: [
       { agentId: "worker", status: "completed", summary: "Done" },
@@ -186,12 +293,42 @@ test("buildTeamEvidencePacket without harvest flag is unchanged", async () => {
   assert.ok(!packet.contextMarkdown.includes("Harvested Candidates"));
 });
 
-test("buildTeamEvidencePacket with harvest:true throws when vaultPath missing", () => {
-  assert.throws(
+test("buildTeamEvidencePacketWithHarvest only renders afm rows in markdown", async () => {
+  const callAfm = async (_system, user) => (user.includes("worker") ? "LEARNING: kept" : "SKIP");
+  const writeInbox = async (vaultPath, slug, payload) => ({
+    slug,
+    filePath: `${vaultPath}/inbox/${slug}.json`,
+    createdAt: "now",
+    payload: { slug, createdAt: "now", ...payload },
+  });
+  const audit = async () => undefined;
+
+  const packet = await buildTeamEvidencePacketWithHarvest(
+    {
+      task: "Mixed harvest",
+      vaultPath: "/tmp/vault",
+      results: [
+        { agentId: "worker", status: "completed", summary: "Did" },
+        { agentId: "explorer", status: "completed", summary: "Read" },
+      ],
+    },
+    { callAfm, writeInbox, audit },
+  );
+
+  assert.equal(packet.harvestedLearnings.length, 2);
+  const harvestedSection = packet.contextMarkdown.split("## Harvested Candidates")[1] ?? "";
+  assert.ok(harvestedSection.length > 0, "expected a Harvested Candidates section");
+  assert.match(harvestedSection, /worker: kept/);
+  assert.ok(!harvestedSection.includes("explorer"), "skipped rows must not appear in Harvested Candidates");
+  assert.ok(!harvestedSection.includes("AFM returned SKIP"), "skip reasons must not leak into operator markdown");
+  assert.ok(!packet.contextMarkdown.includes("AFM returned SKIP"));
+});
+
+test("buildTeamEvidencePacketWithHarvest throws when vaultPath missing", async () => {
+  await assert.rejects(
     () =>
-      buildTeamEvidencePacket({
+      buildTeamEvidencePacketWithHarvest({
         task: "missing path",
-        harvest: true,
         results: [{ agentId: "worker", status: "completed", summary: "Done" }],
       }),
     /vaultPath/,

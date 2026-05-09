@@ -107,7 +107,7 @@ export interface BuildEvidenceReportInput {
   task: string;
   runtimeId?: string;
   results: TeamAgentResultInput[];
-  harvest?: boolean;
+  // vaultPath is required by buildTeamEvidencePacketWithHarvest; ignored by the sync packet builder.
   vaultPath?: string;
 }
 
@@ -719,22 +719,19 @@ function evidenceContextMarkdown(packet: Omit<TeamEvidencePacket, "contextMarkdo
     "## Do Not Store",
     packet.doNotStore.map((item) => `- ${item}`).join("\n"),
   ];
-  if (packet.harvestedLearnings && packet.harvestedLearnings.length > 0) {
+  const writtenLearnings = packet.harvestedLearnings?.filter((learning) => learning.source === "afm") ?? [];
+  if (writtenLearnings.length > 0) {
     sections.push(
       "## Harvested Candidates",
-      packet.harvestedLearnings
-        .map((learning) =>
-          learning.source === "afm"
-            ? `- ${learning.agentId}: ${learning.candidateText} (inbox: ${learning.inboxFilePath})`
-            : `- ${learning.agentId}: skipped (${learning.reason ?? "no reason"})`,
-        )
+      writtenLearnings
+        .map((learning) => `- ${learning.agentId}: ${learning.candidateText} (inbox: ${learning.inboxFilePath ?? "unknown"})`)
         .join("\n"),
     );
   }
   return sections.join("\n\n");
 }
 
-function buildSyncEvidencePacket(input: BuildEvidenceReportInput): TeamEvidencePacket {
+export function buildTeamEvidencePacket(input: BuildEvidenceReportInput): TeamEvidencePacket {
   if (!input.task.trim()) throw new Error("team evidence requires task.");
   const reports = input.results.map((result) => {
     const status = evidenceStatus(result);
@@ -771,44 +768,36 @@ function buildSyncEvidencePacket(input: BuildEvidenceReportInput): TeamEvidenceP
   };
 }
 
-export function buildTeamEvidencePacket(
-  input: BuildEvidenceReportInput & { harvest: true },
-  deps?: HarvestDeps,
-): Promise<TeamEvidencePacket>;
-export function buildTeamEvidencePacket(input: BuildEvidenceReportInput): TeamEvidencePacket;
-export function buildTeamEvidencePacket(
+export async function buildTeamEvidencePacketWithHarvest(
   input: BuildEvidenceReportInput,
   deps?: HarvestDeps,
-): TeamEvidencePacket | Promise<TeamEvidencePacket> {
-  const packet = buildSyncEvidencePacket(input);
-  if (input.harvest !== true) return packet;
+): Promise<TeamEvidencePacket> {
   if (!input.vaultPath || !input.vaultPath.trim()) {
     throw new Error("team evidence harvest requires vaultPath.");
   }
-  const vaultPath = input.vaultPath;
-  return harvestEvidence(
+  const packet = buildTeamEvidencePacket(input);
+  const harvestedLearnings = await harvestEvidence(
     {
       task: input.task,
-      vaultPath,
+      vaultPath: input.vaultPath,
       runtimeId: input.runtimeId,
       reports: input.results,
     },
     deps,
-  ).then((harvestedLearnings) => {
-    const next: Omit<TeamEvidencePacket, "contextMarkdown"> = {
-      runtimeId: packet.runtimeId,
-      task: packet.task,
-      reports: packet.reports,
-      promotionCandidates: packet.promotionCandidates,
-      unresolvedBlockers: packet.unresolvedBlockers,
-      doNotStore: packet.doNotStore,
-      harvestedLearnings,
-    };
-    return {
-      ...next,
-      contextMarkdown: evidenceContextMarkdown(next),
-    };
-  });
+  );
+  const next: Omit<TeamEvidencePacket, "contextMarkdown"> = {
+    runtimeId: packet.runtimeId,
+    task: packet.task,
+    reports: packet.reports,
+    promotionCandidates: packet.promotionCandidates,
+    unresolvedBlockers: packet.unresolvedBlockers,
+    doNotStore: packet.doNotStore,
+    harvestedLearnings,
+  };
+  return {
+    ...next,
+    contextMarkdown: evidenceContextMarkdown(next),
+  };
 }
 
 function permissionDelta(current: TeamPermission[], requested: TeamPermission[]): TeamPromotionPacket["permissionDelta"] {

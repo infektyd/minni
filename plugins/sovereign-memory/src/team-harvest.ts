@@ -5,12 +5,15 @@ import { AFM_PREPARE_TASK_MODEL, AFM_PREPARE_TASK_URL } from "./config.js";
 import type { TeamAgentResultInput } from "./team.js";
 import { recordAudit, writeInbox } from "./vault.js";
 
+const MAX_CANDIDATE_LENGTH = 500;
+const DEFAULT_MAX_LEARNINGS_PER_CALL = 3;
+
 export interface HarvestedLearning {
   agentId: string;
-  inboxFilePath: string;
-  slug: string;
   candidateText: string;
   source: "afm" | "skipped";
+  inboxFilePath?: string;
+  slug?: string;
   reason?: string;
 }
 
@@ -21,7 +24,7 @@ export interface HarvestEvidenceInput {
   runtimeId?: string;
   afmUrl?: string;
   afmModel?: string;
-  maxLearningsPerAgent?: number;
+  maxLearningsPerCall?: number;
 }
 
 export interface HarvestDeps {
@@ -39,6 +42,7 @@ const HARVEST_SYSTEM_PROMPT = [
   "No preamble, no chain-of-thought, no markdown, no quotes, no JSON.",
 ].join("\n");
 
+// Redacts machine-local paths only; AFM is trusted not to emit secrets — extend if that assumption changes.
 function redact(value: string): string {
   return value
     .replace(/\/Users\/[^\s"',)]+/g, "[local-path]")
@@ -63,7 +67,13 @@ function buildUserPrompt(input: HarvestEvidenceInput, report: TeamAgentResultInp
   ].join("\n");
 }
 
-function parseAfmResponse(raw: string): { kind: "learning"; text: string } | { kind: "skip" } | { kind: "empty" } {
+type ParsedAfm =
+  | { kind: "learning"; text: string }
+  | { kind: "skip" }
+  | { kind: "empty" }
+  | { kind: "off-contract" };
+
+function parseAfmResponse(raw: string): ParsedAfm {
   const trimmed = (raw ?? "").trim();
   if (!trimmed) return { kind: "empty" };
   if (/^skip\s*$/i.test(trimmed)) return { kind: "skip" };
@@ -72,13 +82,10 @@ function parseAfmResponse(raw: string): { kind: "learning"; text: string } | { k
     const text = learning[1].trim();
     return text ? { kind: "learning", text } : { kind: "empty" };
   }
-  // Fall back to treating the whole response as the learning if it looks substantive.
-  if (/^[a-z0-9]/i.test(trimmed) && trimmed.length <= 500) {
-    return { kind: "learning", text: trimmed };
-  }
-  return { kind: "empty" };
+  return { kind: "off-contract" };
 }
 
+// TODO: extract shared postJson(url, body, opts) helper after Tasks 2-4 (they may need it too).
 async function defaultCallAfm(system: string, user: string, url: string, model: string): Promise<string> {
   const body = JSON.stringify({
     model,
@@ -131,6 +138,10 @@ async function defaultCallAfm(system: string, user: string, url: string, model: 
   });
 }
 
+function skippedEntry(agentId: string, reason: string, candidateText = ""): HarvestedLearning {
+  return { agentId, candidateText, source: "skipped", reason };
+}
+
 export async function harvestEvidence(
   input: HarvestEvidenceInput,
   deps: HarvestDeps = {},
@@ -139,7 +150,7 @@ export async function harvestEvidence(
   if (!input.vaultPath.trim()) throw new Error("harvest requires vaultPath.");
   const afmUrl = input.afmUrl ?? AFM_PREPARE_TASK_URL;
   const afmModel = input.afmModel ?? AFM_PREPARE_TASK_MODEL;
-  const maxPerAgent = Math.max(1, input.maxLearningsPerAgent ?? 3);
+  const maxPerCall = Math.max(1, input.maxLearningsPerCall ?? DEFAULT_MAX_LEARNINGS_PER_CALL);
   const callAfm = deps.callAfm ?? ((system, user) => defaultCallAfm(system, user, afmUrl, afmModel));
   const writer = deps.writeInbox ?? writeInbox;
   const audit = deps.audit ?? recordAudit;
@@ -155,67 +166,37 @@ export async function harvestEvidence(
       raw = await callAfm(HARVEST_SYSTEM_PROMPT, buildUserPrompt(input, report));
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
-      learnings.push({
-        agentId,
-        inboxFilePath: "",
-        slug: `harvest-${agentId}`,
-        candidateText: "",
-        source: "skipped",
-        reason,
-      });
+      learnings.push(skippedEntry(agentId, reason));
       skipped += 1;
       continue;
     }
 
     const parsed = parseAfmResponse(raw);
     if (parsed.kind === "skip") {
-      learnings.push({
-        agentId,
-        inboxFilePath: "",
-        slug: `harvest-${agentId}`,
-        candidateText: "",
-        source: "skipped",
-        reason: "AFM returned SKIP",
-      });
+      learnings.push(skippedEntry(agentId, "AFM returned SKIP"));
       skipped += 1;
       continue;
     }
     if (parsed.kind === "empty") {
-      learnings.push({
-        agentId,
-        inboxFilePath: "",
-        slug: `harvest-${agentId}`,
-        candidateText: "",
-        source: "skipped",
-        reason: "AFM returned empty response",
-      });
+      learnings.push(skippedEntry(agentId, "AFM returned empty response"));
+      skipped += 1;
+      continue;
+    }
+    if (parsed.kind === "off-contract") {
+      learnings.push(skippedEntry(agentId, "no LEARNING: prefix"));
       skipped += 1;
       continue;
     }
 
-    const candidateText = redact(parsed.text).slice(0, 500);
+    const candidateText = redact(parsed.text).slice(0, MAX_CANDIDATE_LENGTH);
     if (!candidateText) {
-      learnings.push({
-        agentId,
-        inboxFilePath: "",
-        slug: `harvest-${agentId}`,
-        candidateText: "",
-        source: "skipped",
-        reason: "candidate empty after redaction",
-      });
+      learnings.push(skippedEntry(agentId, "candidate empty after redaction"));
       skipped += 1;
       continue;
     }
 
-    if (written >= input.reports.length * maxPerAgent) {
-      learnings.push({
-        agentId,
-        inboxFilePath: "",
-        slug: `harvest-${agentId}`,
-        candidateText,
-        source: "skipped",
-        reason: "per-call cap reached",
-      });
+    if (written >= maxPerCall) {
+      learnings.push(skippedEntry(agentId, "per-call cap reached", candidateText));
       skipped += 1;
       continue;
     }
@@ -231,22 +212,15 @@ export async function harvestEvidence(
       });
       learnings.push({
         agentId,
-        inboxFilePath: entry.filePath,
-        slug: entry.slug,
         candidateText,
         source: "afm",
+        inboxFilePath: entry.filePath,
+        slug: entry.slug,
       });
       written += 1;
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
-      learnings.push({
-        agentId,
-        inboxFilePath: "",
-        slug: `harvest-${agentId}`,
-        candidateText,
-        source: "skipped",
-        reason: `inbox write failed: ${reason}`,
-      });
+      learnings.push(skippedEntry(agentId, `inbox write failed: ${reason}`, candidateText));
       skipped += 1;
     }
   }
@@ -262,8 +236,9 @@ export async function harvestEvidence(
         skipped,
       },
     });
-  } catch {
-    // best effort; harvest result still returned
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    process.stderr.write(`sovereign_team_harvest: audit append failed: ${reason}\n`);
   }
 
   return learnings;
