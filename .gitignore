@@ -67,3 +67,17 @@ htmlcov/
 ._*
 .idea/
 .vscode/
+
+# Reports and generated documents
+reports/
+*.docx
+*.pages
+
+# Ignored artifacts
+output/reports/
+*.npz
+claudecode-vault/
+!claudecode-vault/
+claudecode-vault/*
+!claudecode-vault/schema/
+!claudecode-vault/schema/AGENTS.md
