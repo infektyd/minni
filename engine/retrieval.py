@@ -728,12 +728,19 @@ class RetrievalEngine:
                 "filename": result.get("filename", ""),
                 "score": result.get("score", 0),
                 "doc_id": result.get("doc_id"),
+                "chunk_id": result.get("chunk_id"),
                 "confidence": result.get("confidence"),
                 "age_days": result.get("age_days"),
                 "layer": result.get("layer"),
+                "decay_factor": result.get("decay_score") or result.get("decay_factor"),
+                "privacy_level": result.get("privacy_level"),
+                "review_state": result.get("review_state"),
+                "instruction_like": result.get("instruction_like"),
+                "wikilink": result.get("wikilink"),
                 "depth": "headline",
             }
-            out.update(_pr2_fields(result, out))
+            if result.get("provenance") is not None:
+                out["provenance"] = result["provenance"]
             return out
 
         if depth == "snippet":
@@ -1894,6 +1901,31 @@ class RetrievalEngine:
 
             for row in c.fetchall():
                 results.append(dict(row))
+
+        if results:
+            now = time.time()
+            with self.db.cursor() as c:
+                for result in results[:limit]:
+                    c.execute(
+                        """UPDATE learnings
+                           SET access_count = access_count + 1, last_accessed = ?
+                           WHERE learning_id = ?""",
+                        (now, result["learning_id"]),
+                    )
+                    try:
+                        c.execute(
+                            """INSERT INTO learning_reads
+                               (learning_id, agent_id, read_at, source)
+                               VALUES (?, ?, ?, ?)""",
+                            (
+                                result["learning_id"],
+                                agent_id or "unknown",
+                                now,
+                                "retrieval.search_learnings",
+                            ),
+                        )
+                    except Exception:
+                        pass
 
         return results
 
