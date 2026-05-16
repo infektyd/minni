@@ -44,6 +44,9 @@ A useful agent memory layer should do five things well:
 For a concise engineering review of the abstraction, see
 [docs/ENGINEERING-REVIEW.md](docs/ENGINEERING-REVIEW.md).
 
+For practical signals from long-running usage, see
+[docs/OBSERVED-USAGE.md](docs/OBSERVED-USAGE.md).
+
 ## Current Status
 
 This repo currently contains:
@@ -57,6 +60,11 @@ This repo currently contains:
 - Evaluation scaffolding for recall quality gates and comparison reports.
 - Governance contracts for local-first security, learning approval, handoffs,
   policy, threat model, and memory hygiene.
+
+Observed usage so far suggests the system is most useful when it recovers
+specific operational state, tracks open loops, and forces remembered claims
+through verification before acting. It has **not** yet proven artifact-grounded
+comprehension or superiority over disciplined wiki-only workflows.
 
 The important boundary: **SQLite is runtime truth. Vault pages, graph exports,
 FAISS files, context packs, and compile drafts are derived or review surfaces.**
