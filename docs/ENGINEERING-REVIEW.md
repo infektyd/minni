@@ -62,6 +62,22 @@ questions like:
 Sovereign Memory explores whether those structures belong in the memory system
 itself rather than in every prompt.
 
+## Observed Usage Signals
+
+Practical use so far suggests Sovereign Memory is strongest when it does three
+things:
+
+1. Recovers high-specificity working state such as paths, missing artifacts,
+   prior script names, and unfinished checks.
+2. Converts memory into a verification path instead of a confident claim.
+3. Tracks open loops as first-class state rather than burying them in summaries.
+
+The current honest verdict is mixed: the system has demonstrated situational
+rehydration and continuity, but it has not yet proven artifact-grounded
+comprehension or superiority over a disciplined wiki-only workflow.
+
+See [OBSERVED-USAGE.md](OBSERVED-USAGE.md) for the longer note.
+
 ## Desired Resume Packet
 
 A useful resumed session should start with a packet like this:
