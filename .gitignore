@@ -1,77 +1,109 @@
-# ── Python ────────────────────────────────────────
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
+# Sovereign Memory public boundary
 
-# ── Distribution / packaging ─────────────────────
-*.egg-info/
-*.egg
-dist/
-build/
-.eggs/
-node_modules/
+# Local archives and reversible cleanup bins
+_archive/
+_cleanup-quarantine/
+.last_archive
+.last_cleanup_quarantine
 
-# ── Virtual environments ─────────────────────────
-venv/
-.venv/
-env/
-
-# ── Sovereign Memory runtime data ────────────────
-# These are generated at runtime — never commit user data
+# Runtime databases, indexes, and model/adaptor artifacts
 *.db
-*.db-journal
-*.db-wal
-*.db-shm
-*.index
-*.faiss
-
-# ── Embeddings cache ─────────────────────────────
-models_cache/
-embeddings_cache/
-
-# ── OS junk ──────────────────────────────────────
-.DS_Store
-.DS_Store?
-._*
-.Spotlight-V100
-.Trashes
-ehthumbs.db
-Thumbs.db
-
-# ── IDE ──────────────────────────────────────────
-.idea/
-.vscode/
-*.swp
-*.swo
-*~
-.project
-.classpath
-.settings/
-
-# ── Secrets / credentials ────────────────────────
-.env
-.env.*
-!.env.example
-credentials/
-*.pem
-*.key
-.mcp.json
-!plugins/sovereign-memory/.mcp.json
-
-# ── Test / coverage ──────────────────────────────
-.pytest_cache/
-.coverage
-htmlcov/
-.mypy_cache/
-
-# ── Codex plugin local/private state ─────────────
+*.db-*
 *.sqlite
 *.sqlite3
+*.db-wal
+*.db-shm
+*.db-journal
+*.index
+*.faiss
+*.faiss.npz
 *.fmadapter
-codex-vault/raw/
-codex-vault/logs/
+faiss/
+eval/reports/
+output/
+reports/
+
+# Private/session-heavy vault and logs
+codex-vault/
+!codex-vault/
+codex-vault/*
+!codex-vault/schema/
+!codex-vault/schema/AGENTS.md
 codex-vault/**/*.canvas
+claudecode-vault/
+schema/
+index.md
+log.md
+!claudecode-vault/
+claudecode-vault/*
+!claudecode-vault/schema/
+!claudecode-vault/schema/AGENTS.md
+claudecode-vault/**/*.canvas
+logs/
+session-extracts/
+
+# Claude Code agent vault — keep schema/structure, exclude session-heavy content
+claudecode-vault/log.md
+claudecode-vault/wiki/sessions/
+
+# FAISS index artifacts (regenerable from corpus)
+faiss/
+
+# Sovereign Memory runtime audit log + index at workspace root (contain local paths)
+/log.md
+/index.md
+
+# Root-level Codex audit + index files (mirrored from vault, private)
+/log.md
+/index.md
+
+# Runtime FAISS index directory (the *.faiss / *.index globs miss .npz)
+/faiss/
+
+# Local evaluation and build output
+/output/
+/reports/
+
+# Cursor IDE workspace state
+/.cursor/
+
+# Legacy bundles and local downloads
+archives/downloads/
+archives/legacy-vaults/
+
+# Local plugin build/runtime state
 plugins/*/node_modules/
 plugins/*/dist/
 plugins/*/.env
+plugins/*/.playwright-cli/
+plugins/.DS_Store
+
+# Private OpenClaw bridge runtime files
+openclaw-extension/node_modules/
+openclaw-extension/dist/
+openclaw-extension/.import-manifest.json
+openclaw-extension/*.bak
+openclaw-extension/*.day5.*
+openclaw-extension/__pycache__/
+
+# Python/runtime caches
+engine/venv/
+engine/.day5-contamination-backup/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local config, secrets, and app/editor state
+.env
+.env.*
+!.env.example
+.claude/
+.cursor/
+.DS_Store
+._*
+.idea/
+.vscode/

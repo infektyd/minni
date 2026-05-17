@@ -18,6 +18,7 @@
     "mcp"
   ],
   "skills": "./skills/",
+  "hooks": "./hooks/hooks-codex.json",
   "mcpServers": "./.mcp.json",
   "interface": {
     "displayName": "Sovereign Memory",

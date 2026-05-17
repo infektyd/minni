@@ -1,0 +1,995 @@
+{
+  "summary": {
+    "config": "baseline",
+    "n_queries": 51,
+    "total_latency_s": 0.0,
+    "mean_latency_s": 0.0,
+    "recall_at_k": {
+      "1": 0.8824,
+      "3": 0.9608,
+      "5": 0.9608,
+      "10": 0.9608
+    },
+    "mrr": 0.9608,
+    "mean_calibration_error": 0.1367
+  },
+  "per_query": [
+    {
+      "query": "auth migration JWT tokens",
+      "expected_doc_ids": [
+        8412,
+        8413
+      ],
+      "notes": "exact-match",
+      "result_doc_ids": [
+        8412,
+        8413
+      ],
+      "recall_at_k": {
+        "1": 0.5,
+        "3": 1.0,
+        "5": 1.0,
+        "10": 1.0
+      },
+      "mrr": 1.0,
+      "calibration_error": 0.325,
+      "latency_s": 0.0
+    },
+    {
+      "query": "authentication token migration plan",
+      "expected_doc_ids": [
+        8412
+      ],
+      "notes": "partial-match",
+      "result_doc_ids": [
+        8412
+      ],
+      "recall_at_k": {
+        "1": 1.0,
+        "3": 1.0,
+        "5": 1.0,
+        "10": 1.0
+      },
+      "mrr": 1.0,
+      "calibration_error": 0.1,
+      "latency_s": 0.0
+    },
+    {
+      "query": "ECDSA key rotation rationale",
+      "expected_doc_ids": [
+        8414
+      ],
+      "notes": "exact-match",
+      "result_doc_ids": [
+        8414
+      ],
+      "recall_at_k": {
+        "1": 1.0,
+        "3": 1.0,
+        "5": 1.0,
+        "10": 1.0
+      },
+      "mrr": 1.0,
+      "calibration_error": 0.1,
+      "latency_s": 0.0
+    },
+    {
+      "query": "RSA to ECDSA migration decision",
+      "expected_doc_ids": [
+        8414
+      ],
+      "notes": "exact-match",
+      "result_doc_ids": [
+        8414
+      ],
+      "recall_at_k": {
+        "1": 1.0,
+        "3": 1.0,
+        "5": 1.0,
+        "10": 1.0
+      },
+      "mrr": 1.0,
+      "calibration_error": 0.1,
+      "latency_s": 0.0
+    },
+    {
+      "query": "key size security tradeoff",
+      "expected_doc_ids": [
+        8414
+      ],
+      "notes": "partial-match",
+      "result_doc_ids": [
+        8414
+      ],
+      "recall_at_k": {
+        "1": 1.0,
+        "3": 1.0,
+        "5": 1.0,
+        "10": 1.0
+      },
+      "mrr": 1.0,
+      "calibration_error": 0.1,
+      "latency_s": 0.0
+    },
+    {
+      "query": "FAISS index cold start performance",
+      "expected_doc_ids": [
+        8420
+      ],
+      "notes": "exact-match",
+      "result_doc_ids": [
+        8420
+      ],
+      "recall_at_k": {
+        "1": 1.0,
+        "3": 1.0,
+        "5": 1.0,
+        "10": 1.0
+      },
+      "mrr": 1.0,
+      "calibration_error": 0.1,
+      "latency_s": 0.0
+    },
+    {
+      "query": "vector index disk persistence",
+      "expected_doc_ids": [
+        8420,
+        8421
+      ],
+      "notes": "partial-match",
+      "result_doc_ids": [
+        8420,
+        8421
+      ],
+      "recall_at_k": {
+        "1": 0.5,
+        "3": 1.0,
+        "5": 1.0,
+        "10": 1.0
+      },
+      "mrr": 1.0,
+      "calibration_error": 0.325,
+      "latency_s": 0.0
+    },
+    {
+      "query": "embedding model singleton pattern",
+      "expected_doc_ids": [
+        8422
+      ],
+      "notes": "exact-match",
+      "result_doc_ids": [
+        8422
+      ],
+      "recall_at_k": {
+        "1": 1.0,
+        "3": 1.0,
+        "5": 1.0,
+        "10": 1.0
+      },
+      "mrr": 1.0,
+      "calibration_error": 0.1,
+      "latency_s": 0.0
+    },
+    {
+      "query": "how is sentence embedding loaded",
+      "expected_doc_ids": [
+        8422
+      ],
+      "notes": "partial-match",
+      "result_doc_ids": [
+        8422
+      ],
+      "recall_at_k": {
+        "1": 1.0,
+        "3": 1.0,
+        "5": 1.0,
+        "10": 1.0
+      },
+      "mrr": 1.0,
+      "calibration_error": 0.1,
+      "latency_s": 0.0
+    },
+    {
+      "query": "cross-encoder reranking precision",
+      "expected_doc_ids": [
+        8423
+      ],
+      "notes": "exact-match",
+      "result_doc_ids": [
+        8423
+      ],
+      "recall_at_k": {
+        "1": 1.0,
+        "3": 1.0,
+        "5": 1.0,
+        "10": 1.0
+      },
+      "mrr": 1.0,
+      "calibration_error": 0.1,
+      "latency_s": 0.0
+    },
+    {
+      "query": "hybrid FTS FAISS fusion recall",
+      "expected_doc_ids": [
+        8423,
+        8424
+      ],
+      "notes": "multi-hop",
+      "result_doc_ids": [
+        8423,
+        8424
+      ],
+      "recall_at_k": {
+        "1": 0.5,
+        "3": 1.0,
+        "5": 1.0,
+        "10": 1.0
+      },
+      "mrr": 1.0,
+      "calibration_error": 0.325,
+      "latency_s": 0.0
+    },
+    {
+      "query": "reciprocal rank fusion formula",
+      "expected_doc_ids": [
+        8424
+      ],
+      "notes": "exact-match",
+      "result_doc_ids": [
+        8424
+      ],
+      "recall_at_k": {
+        "1": 1.0,
+        "3": 1.0,
+        "5": 1.0,
+        "10": 1.0
+      },
+      "mrr": 1.0,
+      "calibration_error": 0.1,
+      "latency_s": 0.0
+    },
+    {
+      "query": "context window token budget",
+      "expected_doc_ids": [
+        8425
+      ],
+      "notes": "exact-match",
+      "result_doc_ids": [
+        8425
+      ],
+      "recall_at_k": {
+        "1": 1.0,
+        "3": 1.0,
+        "5": 1.0,
+        "10": 1.0
+      },
+      "mrr": 1.0,
+      "calibration_error": 0.1,
+      "latency_s": 0.0
+    },
+    {
+      "query": "tiktoken approximation fallback",
+      "expected_doc_ids": [
+        8425
+      ],
+      "notes": "partial-match",
+      "result_doc_ids": [
+        8425
+      ],
+      "recall_at_k": {
+        "1": 1.0,
+        "3": 1.0,
+        "5": 1.0,
+        "10": 1.0
+      },
+      "mrr": 1.0,
+      "calibration_error": 0.1,
+      "latency_s": 0.0
+    },
+    {
+      "query": "agent identity bootstrap seed",
+      "expected_doc_ids": [
+        8430
+      ],
+      "notes": "exact-match",
+      "result_doc_ids": [
+        8430
+      ],
+      "recall_at_k": {
+        "1": 1.0,
+        "3": 1.0,
+        "5": 1.0,
+        "10": 1.0
+      },
+      "mrr": 1.0,
+      "calibration_error": 0.1,
+      "latency_s": 0.0
+    },
+    {
+      "query": "how to create a new agent",
+      "expected_doc_ids": [
+        8430
+      ],
+      "notes": "partial-match",
+      "result_doc_ids": [
+        8430
+      ],
+      "recall_at_k": {
+        "1": 1.0,
+        "3": 1.0,
+        "5": 1.0,
+        "10": 1.0
+      },
+      "mrr": 1.0,
+      "calibration_error": 0.1,
+      "latency_s": 0.0
+    },
+    {
+      "query": "vault page status lifecycle draft candidate accepted",
+      "expected_doc_ids": [
+        8431
+      ],
+      "notes": "exact-match",
+      "result_doc_ids": [
+        8431
+      ],
+      "recall_at_k": {
+        "1": 1.0,
+        "3": 1.0,
+        "5": 1.0,
+        "10": 1.0
+      },
+      "mrr": 1.0,
+      "calibration_error": 0.1,
+      "latency_s": 0.0
+    },
+    {
+      "query": "when does a page expire",
+      "expected_doc_ids": [
+        8431,
+        8432
+      ],
+      "notes": "partial-match",
+      "result_doc_ids": [
+        8431,
+        8432
+      ],
+      "recall_at_k": {
+        "1": 0.5,
+        "3": 1.0,
+        "5": 1.0,
+        "10": 1.0
+      },
+      "mrr": 1.0,
+      "calibration_error": 0.325,
+      "latency_s": 0.0
+    },
+    {
+      "query": "superseded page wikilink tracking",
+      "expected_doc_ids": [
+        8431
+      ],
+      "notes": "exact-match",
+      "result_doc_ids": [
+        8431
+      ],
+      "recall_at_k": {
+        "1": 1.0,
+        "3": 1.0,
+        "5": 1.0,
+        "10": 1.0
+      },
+      "mrr": 1.0,
+      "calibration_error": 0.1,
+      "latency_s": 0.0
+    },
+    {
+      "query": "privacy level blocked safe local-only",
+      "expected_doc_ids": [
+        8433
+      ],
+      "notes": "exact-match",
+      "result_doc_ids": [
+        8433
+      ],
+      "recall_at_k": {
+        "1": 1.0,
+        "3": 1.0,
+        "5": 1.0,
+        "10": 1.0
+      },
+      "mrr": 1.0,
+      "calibration_error": 0.1,
+      "latency_s": 0.0
+    },
+    {
+      "query": "cross-agent recall pool",
+      "expected_doc_ids": [
+        8434
+      ],
+      "notes": "exact-match",
+      "result_doc_ids": [
+        8434
+      ],
+      "recall_at_k": {
+        "1": 1.0,
+        "3": 1.0,
+        "5": 1.0,
+        "10": 1.0
+      },
+      "mrr": 1.0,
+      "calibration_error": 0.1,
+      "latency_s": 0.0
+    },
+    {
+      "query": "sharing memory between agents",
+      "expected_doc_ids": [
+        8434
+      ],
+      "notes": "partial-match",
+      "result_doc_ids": [
+        8434
+      ],
+      "recall_at_k": {
+        "1": 1.0,
+        "3": 1.0,
+        "5": 1.0,
+        "10": 1.0
+      },
+      "mrr": 1.0,
+      "calibration_error": 0.1,
+      "latency_s": 0.0
+    },
+    {
+      "query": "vault write through daemon socket",
+      "expected_doc_ids": [
+        8435
+      ],
+      "notes": "exact-match",
+      "result_doc_ids": [
+        8435
+      ],
+      "recall_at_k": {
+        "1": 1.0,
+        "3": 1.0,
+        "5": 1.0,
+        "10": 1.0
+      },
+      "mrr": 1.0,
+      "calibration_error": 0.1,
+      "latency_s": 0.0
+    },
+    {
+      "query": "how does index.md get updated",
+      "expected_doc_ids": [
+        8436
+      ],
+      "notes": "partial-match",
+      "result_doc_ids": [
+        8436
+      ],
+      "recall_at_k": {
+        "1": 1.0,
+        "3": 1.0,
+        "5": 1.0,
+        "10": 1.0
+      },
+      "mrr": 1.0,
+      "calibration_error": 0.1,
+      "latency_s": 0.0
+    },
+    {
+      "query": "log.md audit trail append only",
+      "expected_doc_ids": [
+        8436
+      ],
+      "notes": "exact-match",
+      "result_doc_ids": [
+        8436
+      ],
+      "recall_at_k": {
+        "1": 1.0,
+        "3": 1.0,
+        "5": 1.0,
+        "10": 1.0
+      },
+      "mrr": 1.0,
+      "calibration_error": 0.1,
+      "latency_s": 0.0
+    },
+    {
+      "query": "decay score time attenuation",
+      "expected_doc_ids": [
+        8440
+      ],
+      "notes": "exact-match",
+      "result_doc_ids": [
+        8440
+      ],
+      "recall_at_k": {
+        "1": 1.0,
+        "3": 1.0,
+        "5": 1.0,
+        "10": 1.0
+      },
+      "mrr": 1.0,
+      "calibration_error": 0.1,
+      "latency_s": 0.0
+    },
+    {
+      "query": "older documents rank lower",
+      "expected_doc_ids": [
+        8440
+      ],
+      "notes": "time-decayed",
+      "result_doc_ids": [
+        8440
+      ],
+      "recall_at_k": {
+        "1": 1.0,
+        "3": 1.0,
+        "5": 1.0,
+        "10": 1.0
+      },
+      "mrr": 1.0,
+      "calibration_error": 0.1,
+      "latency_s": 0.0
+    },
+    {
+      "query": "score distribution calibration percentile",
+      "expected_doc_ids": [
+        8441
+      ],
+      "notes": "exact-match",
+      "result_doc_ids": [
+        8441
+      ],
+      "recall_at_k": {
+        "1": 1.0,
+        "3": 1.0,
+        "5": 1.0,
+        "10": 1.0
+      },
+      "mrr": 1.0,
+      "calibration_error": 0.1,
+      "latency_s": 0.0
+    },
+    {
+      "query": "confidence calibration cross encoder",
+      "expected_doc_ids": [
+        8441,
+        8442
+      ],
+      "notes": "multi-hop",
+      "result_doc_ids": [
+        8441,
+        8442
+      ],
+      "recall_at_k": {
+        "1": 0.5,
+        "3": 1.0,
+        "5": 1.0,
+        "10": 1.0
+      },
+      "mrr": 1.0,
+      "calibration_error": 0.325,
+      "latency_s": 0.0
+    },
+    {
+      "query": "instruction_like safety filter regex",
+      "expected_doc_ids": [
+        8450
+      ],
+      "notes": "exact-match",
+      "result_doc_ids": [
+        8450
+      ],
+      "recall_at_k": {
+        "1": 1.0,
+        "3": 1.0,
+        "5": 1.0,
+        "10": 1.0
+      },
+      "mrr": 1.0,
+      "calibration_error": 0.1,
+      "latency_s": 0.0
+    },
+    {
+      "query": "prompt injection detection",
+      "expected_doc_ids": [
+        8450
+      ],
+      "notes": "partial-match",
+      "result_doc_ids": [
+        8450
+      ],
+      "recall_at_k": {
+        "1": 1.0,
+        "3": 1.0,
+        "5": 1.0,
+        "10": 1.0
+      },
+      "mrr": 1.0,
+      "calibration_error": 0.1,
+      "latency_s": 0.0
+    },
+    {
+      "query": "memory as evidence not instruction",
+      "expected_doc_ids": [
+        8450,
+        8451
+      ],
+      "notes": "injection",
+      "result_doc_ids": [
+        8450,
+        8451
+      ],
+      "recall_at_k": {
+        "1": 0.5,
+        "3": 1.0,
+        "5": 1.0,
+        "10": 1.0
+      },
+      "mrr": 1.0,
+      "calibration_error": 0.325,
+      "latency_s": 0.0
+    },
+    {
+      "query": "ignore previous instructions jailbreak",
+      "expected_doc_ids": [
+        8450
+      ],
+      "notes": "injection",
+      "result_doc_ids": [
+        8450
+      ],
+      "recall_at_k": {
+        "1": 1.0,
+        "3": 1.0,
+        "5": 1.0,
+        "10": 1.0
+      },
+      "mrr": 1.0,
+      "calibration_error": 0.1,
+      "latency_s": 0.0
+    },
+    {
+      "query": "wiki page sourcing rules",
+      "expected_doc_ids": [
+        8460
+      ],
+      "notes": "exact-match",
+      "result_doc_ids": [
+        8460
+      ],
+      "recall_at_k": {
+        "1": 1.0,
+        "3": 1.0,
+        "5": 1.0,
+        "10": 1.0
+      },
+      "mrr": 1.0,
+      "calibration_error": 0.1,
+      "latency_s": 0.0
+    },
+    {
+      "query": "circular source chain prohibition",
+      "expected_doc_ids": [
+        8460
+      ],
+      "notes": "exact-match",
+      "result_doc_ids": [
+        8460
+      ],
+      "recall_at_k": {
+        "1": 1.0,
+        "3": 1.0,
+        "5": 1.0,
+        "10": 1.0
+      },
+      "mrr": 1.0,
+      "calibration_error": 0.1,
+      "latency_s": 0.0
+    },
+    {
+      "query": "raw source immutable append only",
+      "expected_doc_ids": [
+        8461
+      ],
+      "notes": "exact-match",
+      "result_doc_ids": [
+        8461
+      ],
+      "recall_at_k": {
+        "1": 1.0,
+        "3": 1.0,
+        "5": 1.0,
+        "10": 1.0
+      },
+      "mrr": 1.0,
+      "calibration_error": 0.1,
+      "latency_s": 0.0
+    },
+    {
+      "query": "session excerpt storage raw directory",
+      "expected_doc_ids": [
+        8461
+      ],
+      "notes": "partial-match",
+      "result_doc_ids": [
+        8461
+      ],
+      "recall_at_k": {
+        "1": 1.0,
+        "3": 1.0,
+        "5": 1.0,
+        "10": 1.0
+      },
+      "mrr": 1.0,
+      "calibration_error": 0.1,
+      "latency_s": 0.0
+    },
+    {
+      "query": "handoff packet cross agent write channel",
+      "expected_doc_ids": [
+        8462
+      ],
+      "notes": "exact-match",
+      "result_doc_ids": [
+        8462
+      ],
+      "recall_at_k": {
+        "1": 1.0,
+        "3": 1.0,
+        "5": 1.0,
+        "10": 1.0
+      },
+      "mrr": 1.0,
+      "calibration_error": 0.1,
+      "latency_s": 0.0
+    },
+    {
+      "query": "agent handoff startup context",
+      "expected_doc_ids": [
+        8462,
+        8463
+      ],
+      "notes": "multi-hop",
+      "result_doc_ids": [
+        8462,
+        8463
+      ],
+      "recall_at_k": {
+        "1": 0.5,
+        "3": 1.0,
+        "5": 1.0,
+        "10": 1.0
+      },
+      "mrr": 1.0,
+      "calibration_error": 0.325,
+      "latency_s": 0.0
+    },
+    {
+      "query": "headings breadcrumb chunk context",
+      "expected_doc_ids": [
+        8470
+      ],
+      "notes": "exact-match",
+      "result_doc_ids": [
+        8470
+      ],
+      "recall_at_k": {
+        "1": 1.0,
+        "3": 1.0,
+        "5": 1.0,
+        "10": 1.0
+      },
+      "mrr": 1.0,
+      "calibration_error": 0.1,
+      "latency_s": 0.0
+    },
+    {
+      "query": "progressive disclosure depth tier headline snippet chunk",
+      "expected_doc_ids": [
+        8471
+      ],
+      "notes": "exact-match",
+      "result_doc_ids": [
+        8471
+      ],
+      "recall_at_k": {
+        "1": 1.0,
+        "3": 1.0,
+        "5": 1.0,
+        "10": 1.0
+      },
+      "mrr": 1.0,
+      "calibration_error": 0.1,
+      "latency_s": 0.0
+    },
+    {
+      "query": "query result depth expansion",
+      "expected_doc_ids": [
+        8471
+      ],
+      "notes": "partial-match",
+      "result_doc_ids": [
+        8471
+      ],
+      "recall_at_k": {
+        "1": 1.0,
+        "3": 1.0,
+        "5": 1.0,
+        "10": 1.0
+      },
+      "mrr": 1.0,
+      "calibration_error": 0.1,
+      "latency_s": 0.0
+    },
+    {
+      "query": "episodic event log agent task",
+      "expected_doc_ids": [
+        8472
+      ],
+      "notes": "exact-match",
+      "result_doc_ids": [
+        8472
+      ],
+      "recall_at_k": {
+        "1": 1.0,
+        "3": 1.0,
+        "5": 1.0,
+        "10": 1.0
+      },
+      "mrr": 1.0,
+      "calibration_error": 0.1,
+      "latency_s": 0.0
+    },
+    {
+      "query": "learning writeback flat file sync",
+      "expected_doc_ids": [
+        8473
+      ],
+      "notes": "exact-match",
+      "result_doc_ids": [
+        8473
+      ],
+      "recall_at_k": {
+        "1": 1.0,
+        "3": 1.0,
+        "5": 1.0,
+        "10": 1.0
+      },
+      "mrr": 1.0,
+      "calibration_error": 0.1,
+      "latency_s": 0.0
+    },
+    {
+      "query": "hygiene nightly broken wikilinks",
+      "expected_doc_ids": [
+        8480
+      ],
+      "notes": "exact-match",
+      "result_doc_ids": [
+        8480
+      ],
+      "recall_at_k": {
+        "1": 1.0,
+        "3": 1.0,
+        "5": 1.0,
+        "10": 1.0
+      },
+      "mrr": 1.0,
+      "calibration_error": 0.1,
+      "latency_s": 0.0
+    },
+    {
+      "query": "orphaned pages cleanup",
+      "expected_doc_ids": [
+        8480
+      ],
+      "notes": "partial-match",
+      "result_doc_ids": [
+        8480
+      ],
+      "recall_at_k": {
+        "1": 1.0,
+        "3": 1.0,
+        "5": 1.0,
+        "10": 1.0
+      },
+      "mrr": 1.0,
+      "calibration_error": 0.1,
+      "latency_s": 0.0
+    },
+    {
+      "query": "drift contradiction detection",
+      "expected_doc_ids": [
+        8481
+      ],
+      "notes": "exact-match",
+      "result_doc_ids": [
+        8481
+      ],
+      "recall_at_k": {
+        "1": 1.0,
+        "3": 1.0,
+        "5": 1.0,
+        "10": 1.0
+      },
+      "mrr": 1.0,
+      "calibration_error": 0.1,
+      "latency_s": 0.0
+    },
+    {
+      "query": "synthesis cross source comparison",
+      "expected_doc_ids": [
+        8482
+      ],
+      "notes": "exact-match",
+      "result_doc_ids": [
+        8482
+      ],
+      "recall_at_k": {
+        "1": 1.0,
+        "3": 1.0,
+        "5": 1.0,
+        "10": 1.0
+      },
+      "mrr": 1.0,
+      "calibration_error": 0.1,
+      "latency_s": 0.0
+    },
+    {
+      "query": "nonexistent concept no relevant document",
+      "expected_doc_ids": [],
+      "notes": "no-match",
+      "result_doc_ids": [],
+      "recall_at_k": {
+        "1": 0.0,
+        "3": 0.0,
+        "5": 0.0,
+        "10": 0.0
+      },
+      "mrr": 0.0,
+      "calibration_error": null,
+      "latency_s": 0.0
+    },
+    {
+      "query": "private credential vault secret blocked",
+      "expected_doc_ids": [],
+      "notes": "private",
+      "result_doc_ids": [],
+      "recall_at_k": {
+        "1": 0.0,
+        "3": 0.0,
+        "5": 0.0,
+        "10": 0.0
+      },
+      "mrr": 0.0,
+      "calibration_error": null,
+      "latency_s": 0.0
+    },
+    {
+      "query": "auth migration",
+      "expected_doc_ids": [
+        8412,
+        8413
+      ],
+      "notes": "test-record",
+      "result_doc_ids": [
+        8412,
+        8413
+      ],
+      "recall_at_k": {
+        "1": 0.5,
+        "3": 1.0,
+        "5": 1.0,
+        "10": 1.0
+      },
+      "mrr": 1.0,
+      "calibration_error": 0.325,
+      "latency_s": 0.0
+    }
+  ]
+}

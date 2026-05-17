@@ -1,0 +1,29 @@
+{
+  "name": "sovereign-memory",
+  "version": "0.1.0",
+  "description": "Local-first Sovereign Memory spine for Claude Code: automatic recall, vault-first learning, agent-to-agent handoff, and continuity across compaction.",
+  "author": {
+    "name": "Hans Axelsson",
+    "email": "local@localhost",
+    "url": "https://github.com/infektyd"
+  },
+  "homepage": "https://github.com/infektyd/sovereign-memory",
+  "repository": "https://github.com/infektyd/sovereign-memory",
+  "license": "MIT",
+  "keywords": [
+    "sovereign-memory",
+    "obsidian",
+    "llm-wiki",
+    "local-first",
+    "mcp",
+    "spine"
+  ],
+  "mcpServers": {
+    "sovereign-memory": {
+      "command": "node",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/dist/server.js"],
+      "cwd": "${CLAUDE_PLUGIN_ROOT}"
+    }
+  },
+  "hooks": "./hooks/hooks.json"
+}

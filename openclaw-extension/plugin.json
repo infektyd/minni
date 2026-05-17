@@ -1,0 +1,21 @@
+{
+  "id": "sovereign-memory",
+  "name": "Sovereign Memory",
+  "description": "Local-first semantic memory for OpenClaw agents \u2014 FAISS+FTS5 hybrid retrieval backed by a persistent SQLite vault.",
+  "version": "0.1.0",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "socketPath": {
+        "type": "string",
+        "description": "Unix socket path for the sovrd daemon (default: /tmp/sovereign.sock)"
+      },
+      "vaultDir": {
+        "type": "string",
+        "description": "Path to the wiki/vault directory (default: ~/wiki)"
+      }
+    }
+  },
+  "main": "dist/index.js"
+}

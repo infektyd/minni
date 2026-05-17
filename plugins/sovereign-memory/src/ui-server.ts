@@ -1,7 +1,9 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import { readFile, stat } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { access, readdir, readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 import { DEFAULT_VAULT_PATH, PLUGIN_ROOT } from "./config.js";
 import { buildStatusReport } from "./sovereign.js";
 import { prepareOutcome, prepareTask, type PrepareOutcomeInput, type PrepareTaskInput } from "./task.js";
@@ -10,6 +12,43 @@ import { auditTail } from "./vault.js";
 const MAX_JSON_BYTES = 256 * 1024;
 const DEFAULT_UI_HOST = process.env.SOVEREIGN_UI_HOST ?? "127.0.0.1";
 const DEFAULT_UI_PORT = Number(process.env.SOVEREIGN_UI_PORT ?? "8765");
+const DEFAULT_DEEP_RESEARCH_ROOT = process.env.DEEP_RESEARCH_AGENT_ROOT ?? "/Users/hansaxelsson/deep-research-agent";
+const DEFAULT_DEEP_RESEARCH_CLI =
+  process.env.DEEP_RESEARCH_CLI ?? path.join(DEFAULT_DEEP_RESEARCH_ROOT, ".venv", "bin", "deep-research");
+const DEFAULT_DEEP_RESEARCH_PYTHON =
+  process.env.DEEP_RESEARCH_PYTHON ?? path.join(DEFAULT_DEEP_RESEARCH_ROOT, ".venv", "bin", "python");
+const execFileAsync = promisify(execFile);
+
+type ResearchMode = "web" | "local-docs" | "hybrid";
+type ResearchTool = "google_search" | "url_context" | "code_execution";
+
+interface DeepResearchRunSummary {
+  run_id: string;
+  created_at?: string;
+  updated_at?: string;
+  prompt?: string;
+  mode?: string;
+  interaction_id?: string | null;
+  status?: string;
+  has_result?: boolean;
+  has_report?: boolean;
+  has_events?: boolean;
+}
+
+interface DeepResearchBridge {
+  paths: () => Promise<unknown>;
+  listRuns: () => Promise<unknown>;
+  getRun: (runId: string) => Promise<unknown>;
+  localDocsManifest: () => Promise<unknown>;
+  listFileStores: () => Promise<unknown>;
+  createFileStore: (displayName?: string) => Promise<unknown>;
+  deleteFileStore: (name: string) => Promise<unknown>;
+  plan: (body: Record<string, unknown>) => Promise<unknown>;
+  refinePlan: (body: Record<string, unknown>) => Promise<unknown>;
+  approvePlan: (body: Record<string, unknown>) => Promise<unknown>;
+  run: (body: Record<string, unknown>) => Promise<unknown>;
+  status: (body: Record<string, unknown>) => Promise<unknown>;
+}
 
 export interface UiServerOptions {
   host?: string;
@@ -20,6 +59,7 @@ export interface UiServerOptions {
   prepareOutcome?: (input: PrepareOutcomeInput) => Promise<unknown>;
   status?: () => Promise<unknown>;
   auditTail?: (limit: number) => Promise<unknown>;
+  deepResearch?: DeepResearchBridge;
 }
 
 export interface UiServerHandle {
@@ -126,11 +166,30 @@ function stringValue(value: unknown): string | undefined {
   return typeof value === "string" ? value : undefined;
 }
 
+function researchModeValue(value: unknown): ResearchMode {
+  return value === "local-docs" || value === "hybrid" || value === "web" ? value : "web";
+}
+
+function researchToolArray(value: unknown): ResearchTool[] | undefined {
+  const values = stringArray(value);
+  if (!values) return undefined;
+  return values.filter((item): item is ResearchTool =>
+    item === "google_search" || item === "url_context" || item === "code_execution",
+  );
+}
+
+function appendListArgs(args: string[], flag: string, values: string[] | undefined): void {
+  for (const value of values ?? []) {
+    if (value.trim()) args.push(flag, value);
+  }
+}
+
 function redactLocalValue(value: unknown): unknown {
   if (typeof value === "string") {
     return value
       .replace(/\/Users\/[^\s"',)]+/g, "[local-path]")
       .replace(/\/Volumes\/[^\s"',)]+/g, "[local-path]")
+      .replace(/\/tmp\/sov(?:ereign|rd)\.sock\b/g, "[local-path]")
       .replace(/[^\s"',)]+\.fmadapter\b/g, "[local-path]");
   }
   if (Array.isArray(value)) return value.map(redactLocalValue);
@@ -173,6 +232,180 @@ function prepareOutcomeInput(body: Record<string, unknown>, vaultPath: string): 
     profile: body.profile === "compact" || body.profile === "standard" || body.profile === "deep" ? body.profile : undefined,
     useAfm: boolValue(body.useAfm),
     vaultPath,
+  };
+}
+
+function stripAnsi(value: string): string {
+  return value.replace(/\u001b\[[0-9;]*m/g, "");
+}
+
+function parseJsonOutput(stdout: string): unknown {
+  const text = stripAnsi(stdout).trim();
+  try {
+    return JSON.parse(text);
+  } catch {
+    const firstObject = text.indexOf("{");
+    const firstArray = text.indexOf("[");
+    const starts = [firstObject, firstArray].filter((item) => item >= 0);
+    const start = starts.length ? Math.min(...starts) : -1;
+    const end = Math.max(text.lastIndexOf("}"), text.lastIndexOf("]"));
+    if (start >= 0 && end > start) return JSON.parse(text.slice(start, end + 1));
+    throw new Error("Deep Research command did not return JSON.");
+  }
+}
+
+async function runDeepResearchCli(args: string[]): Promise<unknown> {
+  const { stdout } = await execFileAsync(DEFAULT_DEEP_RESEARCH_CLI, args, {
+    cwd: DEFAULT_DEEP_RESEARCH_ROOT,
+    maxBuffer: 20 * 1024 * 1024,
+    timeout: 10 * 60 * 1000,
+  });
+  return parseJsonOutput(stdout);
+}
+
+const PLAN_FOLLOWUP_SCRIPT = `
+import json
+import sys
+from deep_research_agent.research import ResearchService
+
+payload = json.loads(sys.argv[1])
+service = ResearchService()
+action = payload["action"]
+if action == "refine":
+    result = service.refine_plan(payload["prompt"], previous_interaction_id=payload["previous_interaction_id"])
+elif action == "approve":
+    result = service.approve_plan(payload["prompt"], previous_interaction_id=payload["previous_interaction_id"])
+else:
+    raise ValueError("Unknown action")
+
+if hasattr(result, "model_dump"):
+    result = result.model_dump()
+elif hasattr(result, "__dict__"):
+    result = {k: v for k, v in vars(result).items() if not k.startswith("_")}
+print(json.dumps(result, default=str))
+`;
+
+async function runDeepResearchPlanFollowup(
+  action: "refine" | "approve",
+  previousInteractionId: string,
+  prompt: string,
+): Promise<unknown> {
+  const { stdout } = await execFileAsync(
+    DEFAULT_DEEP_RESEARCH_PYTHON,
+    ["-c", PLAN_FOLLOWUP_SCRIPT, JSON.stringify({ action, previous_interaction_id: previousInteractionId, prompt })],
+    {
+      cwd: DEFAULT_DEEP_RESEARCH_ROOT,
+      maxBuffer: 20 * 1024 * 1024,
+      timeout: 10 * 60 * 1000,
+    },
+  );
+  return parseJsonOutput(stdout);
+}
+
+function deepResearchArgs(command: "plan" | "run", body: Record<string, unknown>): string[] {
+  const prompt = stringValue(body.prompt);
+  if (!prompt?.trim()) throw new Error(`deep-research ${command} requires prompt.`);
+  const args = [command, prompt, "--mode", researchModeValue(body.mode)];
+  appendListArgs(args, "--file-store", stringArray(body.fileSearchStores));
+  appendListArgs(args, "--tool", researchToolArray(body.enabledTools));
+  appendListArgs(args, "--document-uri", stringArray(body.documentUris));
+  appendListArgs(args, "--image-uri", stringArray(body.imageUris));
+  appendListArgs(args, "--mcp-server-json", stringArray(body.mcpServers));
+  if (boolValue(body.maxMode)) args.push("--max-mode");
+  if (command === "run" && boolValue(body.visualization)) args.push("--visualization");
+  return args;
+}
+
+function safeRunId(value: string): string {
+  if (!/^[0-9TZa-f-]+$/i.test(value)) throw new Error("Invalid Deep Research run id.");
+  return value;
+}
+
+async function fileExists(filePath: string): Promise<boolean> {
+  try {
+    await access(filePath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function listDeepResearchRuns(): Promise<DeepResearchRunSummary[]> {
+  const runsRoot = path.join(DEFAULT_DEEP_RESEARCH_ROOT, "runs");
+  const names = await readdir(runsRoot);
+  const runs: DeepResearchRunSummary[] = [];
+  for (const name of names) {
+    if (name.startsWith(".")) continue;
+    const runDir = path.join(runsRoot, name);
+    const metadataPath = path.join(runDir, "metadata.json");
+    try {
+      const metadata = JSON.parse(await readFile(metadataPath, "utf8")) as DeepResearchRunSummary;
+      runs.push({
+        ...metadata,
+        has_result: await fileExists(path.join(runDir, "result.json")),
+        has_report: await fileExists(path.join(runDir, "report.md")),
+        has_events: await fileExists(path.join(runDir, "events.jsonl")),
+      });
+    } catch {
+      /* Ignore incomplete run folders. */
+    }
+  }
+  return runs.sort((a, b) => String(b.created_at ?? b.run_id).localeCompare(String(a.created_at ?? a.run_id)));
+}
+
+async function getDeepResearchRun(runId: string): Promise<unknown> {
+  const id = safeRunId(runId);
+  const runDir = path.join(DEFAULT_DEEP_RESEARCH_ROOT, "runs", id);
+  const metadata = JSON.parse(await readFile(path.join(runDir, "metadata.json"), "utf8")) as DeepResearchRunSummary;
+  const resultPath = path.join(runDir, "result.json");
+  const reportPath = path.join(runDir, "report.md");
+  const eventsPath = path.join(runDir, "events.jsonl");
+  return {
+    metadata,
+    result: (await fileExists(resultPath)) ? JSON.parse(await readFile(resultPath, "utf8")) : null,
+    report: (await fileExists(reportPath)) ? await readFile(reportPath, "utf8") : "",
+    events: (await fileExists(eventsPath)) ? (await readFile(eventsPath, "utf8")).trim().split("\n").filter(Boolean).slice(-100) : [],
+  };
+}
+
+function createDeepResearchBridge(): DeepResearchBridge {
+  return {
+    paths: async () => ({
+      root: DEFAULT_DEEP_RESEARCH_ROOT,
+      cli: DEFAULT_DEEP_RESEARCH_CLI,
+      local_docs: path.join(DEFAULT_DEEP_RESEARCH_ROOT, "local-docs"),
+      runs: path.join(DEFAULT_DEEP_RESEARCH_ROOT, "runs"),
+    }),
+    listRuns: listDeepResearchRuns,
+    getRun: getDeepResearchRun,
+    localDocsManifest: () => runDeepResearchCli(["local-docs-manifest"]),
+    listFileStores: () => runDeepResearchCli(["list-file-stores"]),
+    createFileStore: (displayName = "codex-local-docs") =>
+      runDeepResearchCli(["create-file-store", "--display-name", displayName]),
+    deleteFileStore: (name: string) => runDeepResearchCli(["delete-file-store", name]),
+    plan: (body) => runDeepResearchCli(deepResearchArgs("plan", body)),
+    refinePlan: (body) => {
+      const previousInteractionId = stringValue(body.previousInteractionId);
+      const prompt = stringValue(body.prompt);
+      if (!previousInteractionId?.trim()) throw new Error("refine-plan requires previousInteractionId.");
+      if (!prompt?.trim()) throw new Error("refine-plan requires prompt.");
+      return runDeepResearchPlanFollowup("refine", previousInteractionId, prompt);
+    },
+    approvePlan: (body) => {
+      const previousInteractionId = stringValue(body.previousInteractionId);
+      const prompt = stringValue(body.prompt) ?? "Approve this collaborative plan and start execution.";
+      if (!previousInteractionId?.trim()) throw new Error("approve-plan requires previousInteractionId.");
+      return runDeepResearchPlanFollowup("approve", previousInteractionId, prompt);
+    },
+    run: (body) => runDeepResearchCli(deepResearchArgs("run", body)),
+    status: (body) => {
+      const interactionId = stringValue(body.interactionId);
+      if (!interactionId?.trim()) throw new Error("status requires interactionId.");
+      const args = ["status", interactionId];
+      const runId = stringValue(body.runId);
+      if (runId?.trim()) args.push("--run-id", safeRunId(runId));
+      return runDeepResearchCli(args);
+    },
   };
 }
 
@@ -226,6 +459,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
   const tail = options.auditTail ?? ((limit: number) => auditTail(vaultPath, limit));
   const taskPrep = options.prepareTask ?? ((input: PrepareTaskInput) => prepareTask(input));
   const outcomePrep = options.prepareOutcome ?? ((input: PrepareOutcomeInput) => prepareOutcome(input));
+  const deepResearch = options.deepResearch ?? createDeepResearchBridge();
 
   const server = createServer(async (req, res) => {
     try {
@@ -244,7 +478,16 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           ok: true,
           host,
           port,
-          tools: ["sovereign_prepare_task", "sovereign_prepare_outcome", "sovereign_status", "sovereign_audit_tail"],
+          tools: [
+            "sovereign_prepare_task",
+            "sovereign_prepare_outcome",
+            "sovereign_status",
+            "sovereign_audit_tail",
+            "deep_research_plan",
+            "deep_research_run",
+            "deep_research_status",
+            "deep_research_local_docs",
+          ],
           automaticLearning: false,
         });
         return;
@@ -263,7 +506,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           return;
         }
         const body = await readJsonBody(req);
-        sendJson(res, 200, await taskPrep(prepareTaskInput(body, vaultPath)));
+        sendJson(res, 200, redactLocalValue(await taskPrep(prepareTaskInput(body, vaultPath))));
         return;
       }
       if (req.method === "POST" && url.pathname === "/api/prepare-outcome") {
@@ -272,8 +515,66 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           return;
         }
         const body = await readJsonBody(req);
-        sendJson(res, 200, await outcomePrep(prepareOutcomeInput(body, vaultPath)));
+        sendJson(res, 200, redactLocalValue(await outcomePrep(prepareOutcomeInput(body, vaultPath))));
         return;
+      }
+      if (req.method === "GET" && url.pathname === "/api/deep-research/paths") {
+        sendJson(res, 200, redactLocalValue(await deepResearch.paths()));
+        return;
+      }
+      if (req.method === "GET" && url.pathname === "/api/deep-research/runs") {
+        sendJson(res, 200, redactLocalValue(await deepResearch.listRuns()));
+        return;
+      }
+      const deepRunMatch = url.pathname.match(/^\/api\/deep-research\/runs\/([^/]+)$/);
+      if (req.method === "GET" && deepRunMatch) {
+        sendJson(res, 200, redactLocalValue(await deepResearch.getRun(deepRunMatch[1])));
+        return;
+      }
+      if (req.method === "GET" && url.pathname === "/api/deep-research/local-docs-manifest") {
+        sendJson(res, 200, redactLocalValue(await deepResearch.localDocsManifest()));
+        return;
+      }
+      if (req.method === "GET" && url.pathname === "/api/deep-research/file-stores") {
+        sendJson(res, 200, redactLocalValue(await deepResearch.listFileStores()));
+        return;
+      }
+      if (req.method === "POST" && url.pathname.startsWith("/api/deep-research/")) {
+        if (!jsonContentTypeAllowed(req.headers["content-type"])) {
+          sendText(res, 415, "POST requests must use application/json.");
+          return;
+        }
+        const body = await readJsonBody(req);
+        if (url.pathname === "/api/deep-research/create-file-store") {
+          sendJson(res, 200, redactLocalValue(await deepResearch.createFileStore(stringValue(body.displayName))));
+          return;
+        }
+        if (url.pathname === "/api/deep-research/delete-file-store") {
+          const name = stringValue(body.name);
+          if (!name?.trim()) throw new Error("delete-file-store requires name.");
+          sendJson(res, 200, redactLocalValue(await deepResearch.deleteFileStore(name)));
+          return;
+        }
+        if (url.pathname === "/api/deep-research/plan") {
+          sendJson(res, 200, redactLocalValue(await deepResearch.plan(body)));
+          return;
+        }
+        if (url.pathname === "/api/deep-research/refine-plan") {
+          sendJson(res, 200, redactLocalValue(await deepResearch.refinePlan(body)));
+          return;
+        }
+        if (url.pathname === "/api/deep-research/approve-plan") {
+          sendJson(res, 200, redactLocalValue(await deepResearch.approvePlan(body)));
+          return;
+        }
+        if (url.pathname === "/api/deep-research/run") {
+          sendJson(res, 200, redactLocalValue(await deepResearch.run(body)));
+          return;
+        }
+        if (url.pathname === "/api/deep-research/status") {
+          sendJson(res, 200, redactLocalValue(await deepResearch.status(body)));
+          return;
+        }
       }
       if (url.pathname.startsWith("/api/")) {
         sendText(res, 404, "Unknown API route.");

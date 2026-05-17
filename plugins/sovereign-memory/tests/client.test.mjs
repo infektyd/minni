@@ -1,10 +1,22 @@
 import assert from "node:assert/strict";
 import { mkdtemp, rm } from "node:fs/promises";
+import net from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { buildStatusReport, formatRecall, parseSovrdJson } from "../dist/sovereign.js";
+import {
+  ackHandoff,
+  awaitHandoff,
+  buildStatusReport,
+  compileVault,
+  drillMemory,
+  exportContextPack,
+  formatRecall,
+  listPendingHandoffs,
+  parseSovrdJson,
+  subscribeContradictions,
+} from "../dist/sovereign.js";
 
 test("parseSovrdJson accepts healthy JSON responses", () => {
   assert.deepEqual(parseSovrdJson('{"status":"ok","agent":"shared-daemon"}'), {
@@ -36,6 +48,16 @@ test("formatRecall returns concise markdown with query and provenance", () => {
   assert.match(formatted, /Use \/tmp\/sovereign.sock/);
 });
 
+test("formatRecall includes backend badge when recall reports backend provenance", () => {
+  const formatted = formatRecall("backend provenance", {
+    results: "### result.md (score=1.000)",
+    agent_id: "codex",
+    backend: "faiss-disk+qdrant",
+  });
+
+  assert.match(formatted, /\[faiss-disk\+qdrant\]/);
+});
+
 test("buildStatusReport includes vault, socket, AFM, and audit state", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "sm-status-"));
   try {
@@ -52,4 +74,47 @@ test("buildStatusReport includes vault, socket, AFM, and audit state", async () 
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("compileVault sends daemon.compile JSON-RPC with dry-run default", async () => {
+  const calls = [];
+  const result = await compileVault(
+    { passName: "session_distillation" },
+    async (_socketPath, method, params) => {
+      calls.push({ method, params });
+      return { ok: true, data: { status: "ok", dry_run: params.dry_run } };
+    },
+  );
+
+  assert.equal(result.ok, true);
+  assert.equal(calls[0].method, "daemon.compile");
+  assert.equal(calls[0].params.pass_name, "session_distillation");
+  assert.equal(calls[0].params.dry_run, true);
+});
+
+test("new memory RPC helpers send expected JSON-RPC methods", async () => {
+  const calls = [];
+  const requester = async (_socketPath, method, params) => {
+    calls.push({ method, params });
+    return { ok: true, data: { method, params } };
+  };
+
+  await drillMemory({ resultIds: [1], depth: "chunk" }, requester);
+  await exportContextPack({ query: "q", budgetTokens: 100, cacheKey: "k" }, requester);
+  await ackHandoff({ leaseId: "lease", status: "accepted" }, requester);
+  await listPendingHandoffs({ agentId: "codex" }, requester);
+  await awaitHandoff({ leaseId: "lease", timeoutMs: 1 }, requester);
+  await subscribeContradictions({ agentId: "codex", sinceTs: 123 }, requester);
+
+  assert.deepEqual(calls.map((call) => call.method), [
+    "sm_drill",
+    "sm_export_pack",
+    "sovereign_ack_handoff",
+    "sovereign_list_pending_handoffs",
+    "sovereign_await_handoff",
+    "sovereign_subscribe_contradictions",
+  ]);
+  assert.deepEqual(calls[0].params.result_ids, [1]);
+  assert.equal(calls[1].params.cache_key, "k");
+  assert.equal(calls[2].params.lease_id, "lease");
 });

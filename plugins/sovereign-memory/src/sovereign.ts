@@ -1,6 +1,7 @@
 import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { existsSync } from "node:fs";
+import net from "node:net";
 import { URL } from "node:url";
 import { AFM_HEALTH_URL, DEFAULT_AGENT_ID, DEFAULT_VAULT_PATH, DEFAULT_WORKSPACE_ID, SOCKET_PATH } from "./config.js";
 import { auditTail, ensureVault, recordAudit, vaultExists } from "./vault.js";
@@ -17,6 +18,15 @@ export interface RecallResponse {
   agent_id?: string;
   layer?: string;
   workspace_id?: string;
+  backend?: string;
+  backend_badge?: string;
+}
+
+export interface ReadContextResponse {
+  agent_id?: string;
+  context?: string;
+  backend?: string;
+  backend_badge?: string;
 }
 
 export interface StatusReport {
@@ -114,6 +124,8 @@ export async function afmHealth(url = AFM_HEALTH_URL): Promise<JsonResult> {
 }
 
 export async function socketHealth(): Promise<JsonResult> {
+  const rpc = await jsonRpcSocketRequestWithFallback("status", {});
+  if (rpc.ok) return rpc;
   return socketRequest("GET", "/health");
 }
 
@@ -124,6 +136,14 @@ export async function recallMemory(input: {
   workspaceId?: string;
   limit?: number;
 }): Promise<JsonResult<RecallResponse>> {
+  const rpc = await jsonRpcSocketRequestWithFallback("search", {
+    query: input.query,
+    agent_id: input.agentId ?? DEFAULT_AGENT_ID,
+    layers: input.layer ? [input.layer] : undefined,
+    limit: input.limit,
+  }) as JsonResult<RecallResponse>;
+  if (rpc.ok) return rpc;
+
   const params = new URLSearchParams();
   params.set("q", input.query);
   params.set("agent_id", input.agentId ?? DEFAULT_AGENT_ID);
@@ -139,12 +159,203 @@ export async function learnMemory(input: {
   agentId?: string;
   workspaceId?: string;
 }): Promise<JsonResult> {
-  return socketRequest("POST", "/learn", {
+  const body = {
     content: input.content,
     category: input.category ?? "general",
     agent_id: input.agentId ?? DEFAULT_AGENT_ID,
     workspace_id: input.workspaceId ?? DEFAULT_WORKSPACE_ID,
+  };
+  const rpc = await jsonRpcSocketRequestWithFallback("learn", body);
+  if (rpc.ok) return rpc;
+  return socketRequest("POST", "/learn", body);
+}
+
+export async function readAgentContext(input: {
+  agentId?: string;
+  limit?: number;
+} = {}): Promise<JsonResult<ReadContextResponse>> {
+  return jsonRpcSocketRequestWithFallback("read", {
+    agent_id: input.agentId ?? DEFAULT_AGENT_ID,
+    limit: input.limit ?? 8,
+  }) as Promise<JsonResult<ReadContextResponse>>;
+}
+
+export type JsonRpcRequester = (socketPath: string, method: string, params: Record<string, unknown>) => Promise<JsonResult>;
+
+function jsonRpcSocketCandidates(): string[] {
+  return [...new Set([SOCKET_PATH, "/tmp/sovrd.sock"])];
+}
+
+export function jsonRpcSocketRequest(socketPath: string, method: string, params: Record<string, unknown>): Promise<JsonResult> {
+  return new Promise((resolve) => {
+    if (!existsSync(socketPath)) {
+      resolve({ ok: false, error: `Socket not found: ${socketPath}` });
+      return;
+    }
+    const client = net.createConnection(socketPath);
+    let data = "";
+    let settled = false;
+    const finish = (result: JsonResult) => {
+      if (settled) return;
+      settled = true;
+      client.destroy();
+      resolve(result);
+    };
+    client.setTimeout(30000, () => finish({ ok: false, error: "JSON-RPC request timed out" }));
+    client.on("connect", () => {
+      client.write(`${JSON.stringify({ jsonrpc: "2.0", id: Date.now(), method, params })}\n`);
+    });
+    client.on("data", (chunk) => {
+      data += chunk.toString("utf8");
+      if (!data.includes("\n")) return;
+      const line = data.split("\n")[0];
+      const parsed = parseSovrdJson<{ result?: unknown; error?: { message?: string } }>(line);
+      if (!parsed.ok) {
+        finish(parsed);
+        return;
+      }
+      if (parsed.data?.error) {
+        finish({ ok: false, data: parsed.data, error: parsed.data.error.message ?? "JSON-RPC error" });
+        return;
+      }
+      finish({ ok: true, data: parsed.data?.result });
+    });
+    client.on("error", (error) => finish({ ok: false, error: error.message }));
+    client.on("end", () => {
+      if (!settled && data.trim()) {
+        const parsed = parseSovrdJson<{ result?: unknown }>(data.trim());
+        finish(parsed.ok ? { ok: true, data: parsed.data?.result } : parsed);
+      }
+    });
   });
+}
+
+export async function handoffMemory(input: {
+  fromAgent: string;
+  toAgent: string;
+  packet: Record<string, unknown>;
+}): Promise<JsonResult> {
+  return jsonRpcSocketRequestWithFallback("daemon.handoff", {
+    from_agent: input.fromAgent,
+    to_agent: input.toAgent,
+    packet: input.packet,
+  });
+}
+
+export async function drillMemory(
+  input: {
+    resultIds?: number[];
+    chunkIds?: number[];
+    depth?: "snippet" | "chunk" | "document";
+  },
+  requester: JsonRpcRequester = jsonRpcSocketRequest,
+): Promise<JsonResult> {
+  return jsonRpcSocketRequestWithFallbackRequester("sm_drill", {
+    result_ids: input.resultIds,
+    chunk_ids: input.chunkIds,
+    depth: input.depth ?? "snippet",
+  }, requester);
+}
+
+export async function exportContextPack(
+  input: {
+    query: string;
+    budgetTokens: number;
+    cacheKey: string;
+    agentId?: string;
+    workspaceId?: string;
+  },
+  requester: JsonRpcRequester = jsonRpcSocketRequest,
+): Promise<JsonResult> {
+  return jsonRpcSocketRequestWithFallbackRequester("sm_export_pack", {
+    query: input.query,
+    budget_tokens: input.budgetTokens,
+    cache_key: input.cacheKey,
+    agent_id: input.agentId,
+    workspace_id: input.workspaceId,
+  }, requester);
+}
+
+export async function ackHandoff(
+  input: {
+    leaseId: string;
+    status: "accepted" | "rejected_stale" | "rejected_contradicts" | "rejected_scope";
+    contradictsId?: number;
+  },
+  requester: JsonRpcRequester = jsonRpcSocketRequest,
+): Promise<JsonResult> {
+  return jsonRpcSocketRequestWithFallbackRequester("sovereign_ack_handoff", {
+    lease_id: input.leaseId,
+    status: input.status,
+    contradicts_id: input.contradictsId,
+  }, requester);
+}
+
+export async function listPendingHandoffs(
+  input: { agentId: string },
+  requester: JsonRpcRequester = jsonRpcSocketRequest,
+): Promise<JsonResult> {
+  return jsonRpcSocketRequestWithFallbackRequester("sovereign_list_pending_handoffs", {
+    agent_id: input.agentId,
+  }, requester);
+}
+
+export async function awaitHandoff(
+  input: { leaseId: string; timeoutMs?: number },
+  requester: JsonRpcRequester = jsonRpcSocketRequest,
+): Promise<JsonResult> {
+  return jsonRpcSocketRequestWithFallbackRequester("sovereign_await_handoff", {
+    lease_id: input.leaseId,
+    timeout_ms: input.timeoutMs,
+  }, requester);
+}
+
+export async function subscribeContradictions(
+  input: { agentId: string; sinceTs?: number },
+  requester: JsonRpcRequester = jsonRpcSocketRequest,
+): Promise<JsonResult> {
+  return jsonRpcSocketRequestWithFallbackRequester("sovereign_subscribe_contradictions", {
+    agent_id: input.agentId,
+    since_ts: input.sinceTs,
+  }, requester);
+}
+
+async function jsonRpcSocketRequestWithFallback(method: string, params: Record<string, unknown>): Promise<JsonResult> {
+  return jsonRpcSocketRequestWithFallbackRequester(method, params, jsonRpcSocketRequest);
+}
+
+async function jsonRpcSocketRequestWithFallbackRequester(
+  method: string,
+  params: Record<string, unknown>,
+  requester: JsonRpcRequester,
+): Promise<JsonResult> {
+  let last: JsonResult = { ok: false, error: "No socket attempted" };
+  for (const socketPath of jsonRpcSocketCandidates()) {
+    last = await requester(socketPath, method, params);
+    if (last.ok) return last;
+  }
+  return last;
+}
+
+export async function compileVault(
+  input: {
+    passName?: string;
+    vaultPath?: string;
+    dryRun?: boolean;
+  },
+  requester: JsonRpcRequester = jsonRpcSocketRequest,
+): Promise<JsonResult> {
+  const socketCandidates = jsonRpcSocketCandidates();
+  let last: JsonResult = { ok: false, error: "No socket attempted" };
+  for (const socketPath of socketCandidates) {
+    last = await requester(socketPath, "daemon.compile", {
+      pass_name: input.passName ?? "session_distillation",
+      vault_path: input.vaultPath,
+      dry_run: input.dryRun ?? true,
+    });
+    if (last.ok) return last;
+  }
+  return last;
 }
 
 function firstLine(text: string): string {
@@ -168,6 +379,7 @@ function formatVaultContext(results: VaultSearchResult[]): string {
 }
 
 export function formatRecall(query: string, response: RecallResponse, vaultResults: VaultSearchResult[] = []): string {
+  const backendBadge = response.backend ?? response.backend_badge;
   const results = Array.isArray(response.results)
     ? JSON.stringify(response.results, null, 2)
     : response.results ?? "No recall results.";
@@ -181,7 +393,7 @@ export function formatRecall(query: string, response: RecallResponse, vaultResul
   const daemonLead = firstLine(compactDaemonResults(response.results));
   const sections = [
     "# Sovereign Recall",
-    `Query: ${query}`,
+    `Query: ${query}${backendBadge ? ` [${backendBadge}]` : ""}`,
     provenance ? `Provenance: ${provenance}` : undefined,
     "## AI Context Pack",
     formatVaultContext(vaultResults),

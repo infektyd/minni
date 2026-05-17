@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Sovereign Memory daemon launchd agent — example.
+
+  This is an example, not a live agent. Copy it to
+  ~/Library/LaunchAgents/com.openclaw.sovrd.plist, substitute the
+  placeholders below, then load it with launchctl.
+
+  Substitutions:
+    /path/to/engine/sovrd.py   absolute path to engine/sovrd.py in this repo
+    /path/to/sock              absolute path to the Unix socket
+                               (default: /tmp/sovrd.sock; for SEC-001 prefer
+                               ~/.sovereign-memory/run/sovrd.sock mode 0600)
+    ~                          your home directory; launchd does NOT expand ~,
+                               so replace it with the literal /Users/<you>
+                               before bootstrapping.
+
+  Install / reload:
+    launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.openclaw.sovrd.plist
+    launchctl kickstart -k gui/$UID/com.openclaw.sovrd
+
+  Uninstall:
+    launchctl bootout gui/$UID/com.openclaw.sovrd
+
+  Notes:
+    Umask 63 == octal 077. Files created by the daemon (logs, sockets if
+    chmod is not explicit) end up mode 0600 instead of 0644. This is the
+    SEC-016 fix: stderr can contain learning excerpts and must not be
+    world-readable.
+
+    Make sure ~/Library/Logs/sovereign-memory/ exists and is mode 0700
+    before first load:
+      mkdir -p ~/Library/Logs/sovereign-memory
+      chmod 0700 ~/Library/Logs/sovereign-memory
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.openclaw.sovrd</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>/path/to/engine/sovrd.py</string>
+        <string>--socket</string>
+        <string>/path/to/sock</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>Umask</key>
+    <integer>63</integer>
+
+    <key>StandardOutPath</key>
+    <string>~/Library/Logs/sovereign-memory/sovrd.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>~/Library/Logs/sovereign-memory/sovrd.err.log</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>

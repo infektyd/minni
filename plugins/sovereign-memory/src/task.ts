@@ -727,6 +727,93 @@ function outcomeContextMarkdown(packet: PreparedOutcomePacket): string {
   ].join("\n\n");
 }
 
+export interface ScarTissueEntry {
+  kind: "failed_command" | "dead_end" | "rejected_hypothesis";
+  signal: string;
+  resolution?: string;
+}
+
+export function extractScarTissue(auditEntries: string[]): ScarTissueEntry[] {
+  const scars: ScarTissueEntry[] = [];
+  for (const entry of auditEntries) {
+    const header = entry.match(/^## \[[^\]]+\]\s+([^|]+)\|\s+(.+)$/m);
+    if (!header) continue;
+    const tool = header[1].trim();
+    const summary = header[2].trim();
+    const lower = summary.toLowerCase();
+    if (lower.includes("error") || lower.includes("failed") || lower.includes("quality-blocked")) {
+      scars.push({
+        kind: lower.includes("quality-blocked") ? "rejected_hypothesis" : "failed_command",
+        signal: `${tool}: ${summary}`.slice(0, 220),
+      });
+    } else if (tool === "sovereign_recall" && /no recall results|recall failed/i.test(entry)) {
+      scars.push({
+        kind: "dead_end",
+        signal: `recall miss: ${summary}`.slice(0, 220),
+      });
+    }
+  }
+  return scars.slice(-12);
+}
+
+export interface HandoffPacketInput {
+  task: string;
+  agentId?: string;
+  workspaceId?: string;
+  vaultPath?: string;
+  openQuestions?: string[];
+  inboxPointer?: string;
+  scarTissue?: ScarTissueEntry[];
+  limit?: number;
+}
+
+export interface HandoffPacket {
+  task: string;
+  agentOrigin: string;
+  workspace: string;
+  identity: string;
+  topRecalls: TaskSource[];
+  daemonOk: boolean;
+  daemonLead?: string;
+  scarTissue: ScarTissueEntry[];
+  openQuestions: string[];
+  inboxPointer?: string;
+}
+
+export async function buildHandoffPacket(
+  input: HandoffPacketInput,
+  deps: PrepareTaskDeps = {},
+): Promise<HandoffPacket> {
+  const vaultPath = input.vaultPath ?? DEFAULT_VAULT_PATH;
+  const agentId = input.agentId ?? DEFAULT_AGENT_ID;
+  const workspaceId = input.workspaceId ?? DEFAULT_WORKSPACE_ID;
+  const limit = Math.max(1, Math.min(input.limit ?? 5, 12));
+  const search = deps.searchVault ?? searchVaultNotes;
+  const recall = deps.recall ?? recallMemory;
+  const budget = resolveBudget("compact", undefined);
+
+  const [vaultResults, recallResult] = await Promise.all([
+    search(vaultPath, input.task, limit),
+    recall({ query: input.task, limit, agentId, workspaceId }),
+  ]);
+
+  const topRecalls = taskSourcesFromVault(vaultResults, budget);
+  const daemonLead = recallResult.ok ? firstLine(recallResult.data?.results) : undefined;
+
+  return {
+    task: input.task,
+    agentOrigin: agentId,
+    workspace: workspaceId,
+    identity: `agent=${agentId} workspace=${workspaceId}`,
+    topRecalls,
+    daemonOk: recallResult.ok,
+    daemonLead,
+    scarTissue: input.scarTissue ?? [],
+    openQuestions: input.openQuestions ?? [],
+    inboxPointer: input.inboxPointer,
+  };
+}
+
 export async function prepareOutcome(
   input: PrepareOutcomeInput,
   deps: PrepareOutcomeDeps = {},

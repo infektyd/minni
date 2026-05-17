@@ -1,0 +1,13 @@
+{
+  "name": "sovereign-memory",
+  "version": "0.1.0",
+  "mcpServers": {
+    "sovereign-memory": {
+      "command": "node",
+      "args": [
+        "${extensionPath}${/}..${/}dist${/}server.js"
+      ],
+      "cwd": "${extensionPath}${/}.."
+    }
+  }
+}

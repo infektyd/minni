@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -9,6 +9,7 @@ import {
   auditReport,
   ensureVault,
   recordAudit,
+  resolveInboxHandoffContext,
   searchVaultNotes,
   vaultFirstLearn,
   writeVaultPage,
@@ -22,10 +23,43 @@ test("ensureVault creates the Codex LLM wiki structure and schema", async () => 
     assert.equal(result.vaultPath, root);
     assert.ok(result.created.includes(path.join(root, "raw")));
     assert.ok(result.created.includes(path.join(root, "wiki", "entities")));
+    assert.ok(result.created.includes(path.join(root, "outbox")));
 
     const schema = await readFile(path.join(root, "schema", "AGENTS.md"), "utf8");
     assert.match(schema, /Codex Sovereign Memory Vault/);
     assert.match(schema, /raw sources/i);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("resolveInboxHandoffContext resolves wikilink refs for boot priming", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-handoff-prime-"));
+  try {
+    await ensureVault(root);
+    const decisionDir = path.join(root, "wiki", "decisions");
+    await mkdir(decisionDir, { recursive: true });
+    await writeFile(
+      path.join(decisionDir, "auth-migration.md"),
+      "---\ntitle: Auth Migration\n---\n\nUse the short-lived token exchange for auth migration.",
+      "utf8",
+    );
+
+    const snippets = await resolveInboxHandoffContext(root, [
+      {
+        slug: "auth-handoff",
+        filePath: path.join(root, "inbox", "auth.json"),
+        createdAt: "2026-04-26T00:00:00.000Z",
+        payload: {
+          kind: "handoff",
+          wikilink_refs: ["wiki/decisions/auth-migration"],
+        },
+      },
+    ]);
+
+    assert.equal(snippets.length, 1);
+    assert.equal(snippets[0].ref, "wiki/decisions/auth-migration");
+    assert.match(snippets[0].snippet, /short-lived token exchange/);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
