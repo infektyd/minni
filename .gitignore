@@ -16,7 +16,12 @@ _cleanup-quarantine/
 *.db-journal
 *.index
 *.faiss
+*.faiss.npz
 *.fmadapter
+faiss/
+eval/reports/
+output/
+reports/
 
 # Private/session-heavy vault and logs
 codex-vault/
@@ -25,8 +30,31 @@ codex-vault/*
 !codex-vault/schema/
 !codex-vault/schema/AGENTS.md
 codex-vault/**/*.canvas
+claudecode-vault/
+schema/
+index.md
+log.md
+!claudecode-vault/
+claudecode-vault/*
+!claudecode-vault/schema/
+!claudecode-vault/schema/AGENTS.md
+claudecode-vault/**/*.canvas
 logs/
 session-extracts/
+
+# Root-level Codex audit + index files (mirrored from vault, private)
+/log.md
+/index.md
+
+# Runtime FAISS index directory (the *.faiss / *.index globs miss .npz)
+/faiss/
+
+# Local evaluation and build output
+/output/
+/reports/
+
+# Cursor IDE workspace state
+/.cursor/
 
 # Legacy bundles and local downloads
 archives/downloads/
@@ -63,6 +91,7 @@ htmlcov/
 .env.*
 !.env.example
 .claude/
+.cursor/
 .DS_Store
 ._*
 .idea/

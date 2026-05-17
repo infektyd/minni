@@ -160,7 +160,7 @@ def test_reorganization_respects_horizon_but_includes_recent_neighbors(tmp_path)
         "Recent Hub",
         "Recent page links to [[Old Neighbor]].",
         page_type="entity",
-        updated="2026-04-26T00:00:00Z",
+        updated=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     )
     old_neighbor = _write_page(
         vault,

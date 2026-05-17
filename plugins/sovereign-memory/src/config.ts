@@ -45,3 +45,24 @@ export const CLAUDECODE_CONTEXT_WINDOW = (() => {
   const raw = Number(process.env.CLAUDE_CONTEXT_WINDOW);
   return Number.isFinite(raw) && raw > 0 ? raw : 200_000;
 })();
+
+// --- KiloCode agent defaults ---
+
+export const KILOCODE_AGENT_ID =
+  process.env.SOVEREIGN_KILOCODE_AGENT_ID ?? "kilocode";
+
+export const KILOCODE_WORKSPACE_ID =
+  process.env.SOVEREIGN_KILOCODE_WORKSPACE_ID ??
+  `workspace-${path.basename(process.cwd())}`;
+
+export const KILOCODE_VAULT_PATH =
+  process.env.SOVEREIGN_KILOCODE_VAULT_PATH ??
+  path.join(os.homedir(), ".sovereign-memory", "kilocode-vault");
+
+export const KILOCODE_HOOKS_ENABLED =
+  (process.env.SOVEREIGN_KILOCODE_HOOKS ?? "on").toLowerCase() !== "off";
+
+export const KILOCODE_CONTEXT_WINDOW = (() => {
+  const raw = Number(process.env.KILO_CONTEXT_WINDOW);
+  return Number.isFinite(raw) && raw > 0 ? raw : 200_000;
+})();
