@@ -18,6 +18,7 @@ import {
   subscribeContradictions,
 } from "./sovereign.js";
 import { buildHandoffPacket, extractScarTissue, prepareOutcome, prepareTask } from "./task.js";
+import { buildTeamEvidencePacket, buildTeamPromotionPacket, buildTeamRuntime } from "./team.js";
 import { auditReport, auditTail, recordAudit, searchVaultNotes, vaultFirstLearn, writeVaultPage } from "./vault.js";
 import { wrapEnvelope } from "./agent_envelope.js";
 import {
@@ -122,6 +123,121 @@ server.registerTool(
       afmPrepareUrl,
       afmModel,
     });
+    return textResult(JSON.stringify(packet, null, 2));
+  },
+);
+
+const teamAgentSchema = z.object({
+  agentId: z.string().optional(),
+  role: z.enum(["explorer", "worker", "reviewer", "scribe"]).optional(),
+  focus: z.string().min(1),
+  ownership: z.array(z.string()).optional(),
+  permissions: z.array(z.enum(["read", "write", "test", "network", "memory-recall"])).optional(),
+  model: z.string().optional(),
+});
+
+const teamTemporaryProfileSchema = z.object({
+  agentId: z.string().min(1),
+  role: z.enum(["explorer", "worker", "reviewer", "scribe"]),
+  focus: z.string().min(1),
+  ownership: z.array(z.string()),
+  permissions: z.array(z.enum(["read", "write", "test", "network", "memory-recall"])),
+  model: z.string().optional(),
+  memoryPolicy: z.object({
+    recall: z.literal("allowed"),
+    learn: z.literal("manual-only"),
+    vaultWrites: z.literal("manual-only"),
+  }),
+  lifetime: z.literal("temporary"),
+  promotionRule: z.string().min(1),
+});
+
+const teamPromotionCandidateSchema = z.object({
+  agentId: z.string().min(1),
+  recommended: z.boolean(),
+  score: z.number(),
+  reasons: z.array(z.string()),
+  nextStep: z.string().min(1),
+});
+
+server.registerTool(
+  "sovereign_team_runtime",
+  {
+    title: "Sovereign Team Runtime",
+    description:
+      "Build a deterministic temporary team runtime: agent profiles, task ledger, hydration packets, gates, and non-goals. Does not spawn agents or write durable learnings.",
+    inputSchema: {
+      task: z.string().min(1),
+      agents: z.array(teamAgentSchema).optional(),
+      coordinatorAgentId: z.string().optional(),
+      workspaceId: z.string().optional(),
+      vaultPath: z.string().optional(),
+      profile: z.enum(["compact", "standard", "deep"]).optional(),
+      limit: z.number().int().min(1).max(12).optional(),
+      includeVault: z.boolean().optional(),
+      useAfm: z.boolean().optional(),
+    },
+  },
+  async ({ task, agents, coordinatorAgentId, workspaceId, vaultPath, profile, limit, includeVault, useAfm }) => {
+    const packet = await buildTeamRuntime({
+      task,
+      agents,
+      coordinatorAgentId,
+      workspaceId,
+      vaultPath,
+      profile,
+      limit,
+      includeVault,
+      useAfm,
+    });
+    return textResult(JSON.stringify(packet, null, 2));
+  },
+);
+
+server.registerTool(
+  "sovereign_team_evidence",
+  {
+    title: "Sovereign Team Evidence",
+    description:
+      "Summarize temporary agent evidence reports and promotion candidates. Dry-run only; promotion and learning remain explicit.",
+    inputSchema: {
+      task: z.string().min(1),
+      runtimeId: z.string().optional(),
+      results: z.array(
+        z.object({
+          agentId: z.string().min(1),
+          status: z.enum(["queued", "in_progress", "blocked", "completed"]),
+          summary: z.string().min(1),
+          evidence: z.array(z.string()).optional(),
+          changedFiles: z.array(z.string()).optional(),
+          verification: z.array(z.string()).optional(),
+          blockers: z.array(z.string()).optional(),
+        }),
+      ),
+    },
+  },
+  async ({ task, runtimeId, results }) => {
+    const packet = buildTeamEvidencePacket({ task, runtimeId, results });
+    return textResult(JSON.stringify(packet, null, 2));
+  },
+);
+
+server.registerTool(
+  "sovereign_team_promotion",
+  {
+    title: "Sovereign Team Promotion",
+    description:
+      "Draft a permanent agent profile from a temporary team profile only after explicit approval. Dry-run only; never writes durable memory.",
+    inputSchema: {
+      agent: teamTemporaryProfileSchema,
+      evidence: teamPromotionCandidateSchema,
+      requestedPermissions: z.array(z.enum(["read", "write", "test", "network", "memory-recall"])).optional(),
+      approved: z.boolean().optional(),
+      permanentAgentId: z.string().optional(),
+    },
+  },
+  async ({ agent, evidence, requestedPermissions, approved, permanentAgentId }) => {
+    const packet = await buildTeamPromotionPacket({ agent, evidence, requestedPermissions, approved, permanentAgentId });
     return textResult(JSON.stringify(packet, null, 2));
   },
 );

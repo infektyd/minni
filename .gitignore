@@ -42,6 +42,17 @@ claudecode-vault/**/*.canvas
 logs/
 session-extracts/
 
+# Claude Code agent vault — keep schema/structure, exclude session-heavy content
+claudecode-vault/log.md
+claudecode-vault/wiki/sessions/
+
+# FAISS index artifacts (regenerable from corpus)
+faiss/
+
+# Sovereign Memory runtime audit log + index at workspace root (contain local paths)
+/log.md
+/index.md
+
 # Root-level Codex audit + index files (mirrored from vault, private)
 /log.md
 /index.md

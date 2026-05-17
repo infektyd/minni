@@ -22,6 +22,13 @@ export interface RecallResponse {
   backend_badge?: string;
 }
 
+export interface ReadContextResponse {
+  agent_id?: string;
+  context?: string;
+  backend?: string;
+  backend_badge?: string;
+}
+
 export interface StatusReport {
   vault: {
     path: string;
@@ -161,6 +168,16 @@ export async function learnMemory(input: {
   const rpc = await jsonRpcSocketRequestWithFallback("learn", body);
   if (rpc.ok) return rpc;
   return socketRequest("POST", "/learn", body);
+}
+
+export async function readAgentContext(input: {
+  agentId?: string;
+  limit?: number;
+} = {}): Promise<JsonResult<ReadContextResponse>> {
+  return jsonRpcSocketRequestWithFallback("read", {
+    agent_id: input.agentId ?? DEFAULT_AGENT_ID,
+    limit: input.limit ?? 8,
+  }) as Promise<JsonResult<ReadContextResponse>>;
 }
 
 export type JsonRpcRequester = (socketPath: string, method: string, params: Record<string, unknown>) => Promise<JsonResult>;

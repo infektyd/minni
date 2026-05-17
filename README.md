@@ -112,7 +112,7 @@ flowchart LR
 
     subgraph Plugin["Shared plugin layer"]
         MCP["MCP server\nsovereign-memory"]
-        Tools["Tools\nrecall, learn, status,\nprepare, handoff, audit"]
+        Tools["Tools\nrecall, learn, status,\nprepare, handoff, audit,\nteam runtime"]
         Hooks["Hook envelopes\nSessionStart, UserPromptSubmit,\nPreCompact, Stop"]
     end
 
