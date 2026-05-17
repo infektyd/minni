@@ -275,6 +275,41 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         sendJson(res, 200, await outcomePrep(prepareOutcomeInput(body, vaultPath)));
         return;
       }
+      // G17: Candidates console API (minimal wiring for P1 approval pipeline)
+      if (req.method === "GET" && url.pathname === "/api/candidates") {
+        try {
+          const { jsonRpcSocketRequestWithFallback } = await import("./sovereign.js");
+          const limit = parseInt(url.searchParams.get("limit") || "50", 10);
+          const status = url.searchParams.get("status") || undefined;
+          const rpc = await jsonRpcSocketRequestWithFallback("list_candidates", {
+            limit: Math.min(limit, 200),
+            status,
+          });
+          sendJson(res, 200, rpc);
+        } catch (e) {
+          sendJson(res, 200, { candidates: [], error: String(e) });
+        }
+        return;
+      }
+      if (req.method === "POST" && url.pathname === "/api/resolve-candidate") {
+        if (!jsonContentTypeAllowed(req.headers["content-type"])) {
+          sendText(res, 415, "POST requests must use application/json.");
+          return;
+        }
+        const body = await readJsonBody(req);
+        try {
+          const { jsonRpcSocketRequestWithFallback } = await import("./sovereign.js");
+          const rpc = await jsonRpcSocketRequestWithFallback("resolve_candidate", {
+            candidate_id: body.candidate_id,
+            decision: body.decision,
+            reason: body.reason || body.resolution_reason || "",
+          });
+          sendJson(res, 200, rpc);
+        } catch (e) {
+          sendJson(res, 200, { status: "error", error: String(e) });
+        }
+        return;
+      }
       if (url.pathname.startsWith("/api/")) {
         sendText(res, 404, "Unknown API route.");
         return;

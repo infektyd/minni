@@ -4,6 +4,71 @@ import { statusAndAudit } from "./sovereign.js";
 import { prepareOutcome, prepareTask } from "./task.js";
 import { auditReport, auditTail, ensureVault, vaultFirstLearn, writeVaultPage } from "./vault.js";
 
+function parsePrepareArgs(args: string[]) {
+  const remaining: string[] = [];
+  let useAfm = false;
+  let profile: string | undefined;
+  let afmProviderMode: "auto" | "bridge" | "native" | "off" | undefined;
+
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    if (arg === "--afm") {
+      useAfm = true;
+    } else if (arg === "--profile") {
+      profile = args[index + 1];
+      index += 1;
+    } else if (arg === "--afm-provider") {
+      const value = args[index + 1];
+      afmProviderMode = value === "auto" || value === "bridge" || value === "native" || value === "off" ? value : undefined;
+      index += 1;
+    } else {
+      remaining.push(arg);
+    }
+  }
+
+  return {
+    useAfm,
+    profile,
+    afmProviderMode,
+    task: remaining.join(" "),
+  };
+}
+
+function parsePrepareOutcomeArgs(args: string[]) {
+  const remaining: string[] = [];
+  let useAfm = false;
+  let profile: string | undefined;
+  let afmProviderMode: "auto" | "bridge" | "native" | "off" | undefined;
+  let summary: string | undefined;
+
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    if (arg === "--afm") {
+      useAfm = true;
+    } else if (arg === "--profile") {
+      profile = args[index + 1];
+      index += 1;
+    } else if (arg === "--afm-provider") {
+      const value = args[index + 1];
+      afmProviderMode = value === "auto" || value === "bridge" || value === "native" || value === "off" ? value : undefined;
+      index += 1;
+    } else if (arg === "--summary") {
+      summary = args[index + 1];
+      index += 1;
+    } else {
+      remaining.push(arg);
+    }
+  }
+
+  return {
+    useAfm,
+    profile,
+    afmProviderMode,
+    summary,
+    task: remaining.join(" "),
+  };
+}
+
 async function main() {
   const [command, ...args] = process.argv.slice(2);
 
@@ -42,40 +107,25 @@ async function main() {
   }
 
   if (command === "prepare") {
-    const useAfm = args.includes("--afm");
-    const profileIndex = args.indexOf("--profile");
-    const profile = profileIndex >= 0 ? args[profileIndex + 1] : undefined;
-    const task = args.filter((arg, index) => arg !== "--afm" && arg !== "--profile" && index !== profileIndex + 1).join(" ");
+    const { task, useAfm, profile, afmProviderMode } = parsePrepareArgs(args);
     if (!task) throw new Error("prepare requires a task");
-    console.log(JSON.stringify(await prepareTask({ task, vaultPath: DEFAULT_VAULT_PATH, useAfm, profile: profile as never }), null, 2));
+    console.log(JSON.stringify(await prepareTask({ task, vaultPath: DEFAULT_VAULT_PATH, useAfm, profile: profile as never, afmProviderMode }), null, 2));
     return;
   }
 
   if (command === "prepare-outcome") {
-    const useAfm = args.includes("--afm");
-    const profileIndex = args.indexOf("--profile");
-    const profile = profileIndex >= 0 ? args[profileIndex + 1] : undefined;
-    const summaryIndex = args.indexOf("--summary");
-    if (summaryIndex < 0 || !args[summaryIndex + 1]) throw new Error("prepare-outcome requires --summary <summary>");
-    const task = args
-      .filter(
-        (arg, index) =>
-          arg !== "--afm" &&
-          arg !== "--profile" &&
-          arg !== "--summary" &&
-          index !== profileIndex + 1 &&
-          index !== summaryIndex + 1,
-      )
-      .join(" ");
+    const { task, summary, useAfm, profile, afmProviderMode } = parsePrepareOutcomeArgs(args);
+    if (!summary) throw new Error("prepare-outcome requires --summary <summary>");
     if (!task) throw new Error("prepare-outcome requires a task");
     console.log(
       JSON.stringify(
         await prepareOutcome({
           task,
-          summary: args[summaryIndex + 1],
+          summary,
           vaultPath: DEFAULT_VAULT_PATH,
           useAfm,
           profile: profile as never,
+          afmProviderMode,
         }),
         null,
         2,

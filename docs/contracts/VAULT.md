@@ -36,7 +36,7 @@ Every vault is a directory with the following canonical structure:
 
 ### Key invariants
 
-- `raw/` is **append-only and immutable**. Never edit a raw file in-place; write
+- `raw/` is **append-only and immutable** (IMPLEMENTED). Never edit a raw file in-place; write
   a new one instead.
 - `wiki/` is **LLM-maintained synthesis**. Agents write, revise, and supersede
   wiki pages according to the status lifecycle (Section 4).

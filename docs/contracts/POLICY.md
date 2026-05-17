@@ -1,7 +1,7 @@
 # Sovereign Memory — Privacy and Policy Contract
 
-**Contract version:** 1.0.0
-**Last updated:** 2026-04-26
+**Contract version:** 1.0.0 (IMPLEMENTED — baseline)
+**Last updated:** 2026-04-26 (PARTIAL — G03 matrix update)
 
 This document defines the default privacy posture, redaction rules, retention
 rules, and cross-agent data sharing rules for Sovereign Memory. All agents,

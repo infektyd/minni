@@ -1,14 +1,14 @@
-import { request as httpRequest } from "node:http";
-import { request as httpsRequest } from "node:https";
 import { URL } from "node:url";
 import {
+  AFM_PROVIDER_MODE,
   AFM_PREPARE_TASK_MODEL,
   AFM_PREPARE_TASK_URL,
   DEFAULT_AGENT_ID,
   DEFAULT_VAULT_PATH,
   DEFAULT_WORKSPACE_ID,
 } from "./config.js";
-import { recallMemory } from "./sovereign.js";
+import { callAfmJson, resolveAfmProvider, type AfmProvider, type AfmProviderMode, type AfmProviderResolution } from "./afm.js";
+import { afmHealth, recallMemory } from "./sovereign.js";
 import type { JsonResult, RecallResponse } from "./sovereign.js";
 import { recordAudit, searchVaultNotes } from "./vault.js";
 import type { VaultSearchResult } from "./vault.js";
@@ -17,6 +17,8 @@ export type TaskProfile = "compact" | "standard" | "deep";
 export type SourceAuthority = "schema" | "handoff" | "decision" | "session" | "concept" | "daemon" | "vault";
 export type SourceFreshness = "fresh" | "recent" | "old" | "unknown";
 export type PrivacyLevel = "safe" | "local-only" | "private" | "blocked";
+export type ResolvedAfmProvider = AfmProvider;
+export type AfmProviderContext = AfmProviderResolution;
 
 export interface BudgetPolicy {
   profile: TaskProfile;
@@ -78,6 +80,12 @@ export interface PreparedTaskPacket {
     requested: boolean;
     used: boolean;
     url?: string;
+    provider?: ResolvedAfmProvider;
+    requestedProvider?: AfmProviderMode;
+    backend?: string;
+    availability?: string;
+    adapterConfigured?: boolean;
+    fallbackUsed?: boolean;
     error?: string;
   };
   outcomeDraft?: OutcomeDraft;
@@ -97,6 +105,7 @@ export interface PrepareTaskInput {
   includeVault?: boolean;
   afmPrepareUrl?: string;
   afmModel?: string;
+  afmProviderMode?: AfmProviderMode;
 }
 
 export interface PrepareOutcomeInput {
@@ -109,6 +118,7 @@ export interface PrepareOutcomeInput {
   vaultPath?: string;
   afmPrepareUrl?: string;
   afmModel?: string;
+  afmProviderMode?: AfmProviderMode;
 }
 
 export interface PreparedOutcomePacket {
@@ -124,6 +134,12 @@ export interface PreparedOutcomePacket {
     requested: boolean;
     used: boolean;
     url?: string;
+    provider?: ResolvedAfmProvider;
+    requestedProvider?: AfmProviderMode;
+    backend?: string;
+    availability?: string;
+    adapterConfigured?: boolean;
+    fallbackUsed?: boolean;
     error?: string;
   };
   contextMarkdown: string;
@@ -133,11 +149,13 @@ export interface PrepareTaskDeps {
   searchVault?: typeof searchVaultNotes;
   recall?: typeof recallMemory;
   afmPrepare?: (url: string, payload: Record<string, unknown>) => Promise<JsonResult<Partial<PreparedTaskPacket>>>;
+  afmHealth?: typeof afmHealth;
   audit?: typeof recordAudit;
 }
 
 export interface PrepareOutcomeDeps {
   afmPrepare?: (url: string, payload: Record<string, unknown>) => Promise<JsonResult<Partial<PreparedOutcomePacket>>>;
+  afmHealth?: typeof afmHealth;
 }
 
 const PROFILE_POLICIES: Record<TaskProfile, BudgetPolicy> = {
@@ -172,6 +190,10 @@ const PROFILE_POLICIES: Record<TaskProfile, BudgetPolicy> = {
 
 function resolveProfile(profile: TaskProfile | undefined): TaskProfile {
   return profile && profile in PROFILE_POLICIES ? profile : "standard";
+}
+
+function resolveProviderMode(mode: AfmProviderMode | undefined): AfmProviderMode {
+  return mode ?? AFM_PROVIDER_MODE;
 }
 
 function clampBudgetTokens(value: number | undefined, profile: TaskProfile): number {
@@ -328,6 +350,7 @@ function deterministicPacket(input: {
   recallResult: JsonResult<RecallResponse>;
   afmRequested: boolean;
   afmUrl: string;
+  afmProvider: AfmProviderContext;
   afmError?: string;
 }): PreparedTaskPacket {
   const intent = classifyIntent(input.task);
@@ -403,6 +426,12 @@ function deterministicPacket(input: {
       requested: input.afmRequested,
       used: false,
       url: input.afmUrl,
+      provider: input.afmProvider.provider,
+      requestedProvider: input.afmProvider.mode,
+      backend: input.afmProvider.backend,
+      availability: input.afmProvider.availability,
+      adapterConfigured: input.afmProvider.adapterConfigured,
+      fallbackUsed: input.afmProvider.fallbackUsed,
       error: input.afmError,
     },
     contextMarkdown,
@@ -512,6 +541,14 @@ export function buildAfmChatPayload(payload: Record<string, unknown>): Record<st
       .replace(/\/Users\/[^\s"',)]+/g, "[local-path]")
       .replace(/\/Volumes\/[^\s"',)]+/g, "[local-path]")
       .slice(0, maxLength);
+  const provider = payload.provider && typeof payload.provider === "object" ? (payload.provider as Record<string, unknown>) : undefined;
+  const providerName = provider?.provider ?? provider?.mode;
+  const providerLine = provider
+    ? `AFM provider: ${redactLocal(providerName, 80)} backend=${redactLocal(provider.backend, 120)} availability=${redactLocal(
+        provider.availability,
+        120,
+      )} adapterConfigured=${String(provider.adapterConfigured === true)} fallbackUsed=${String(provider.fallbackUsed === true)}`
+    : "AFM provider: bridge";
   const sourceLines = Array.isArray(payload.relevantSources)
     ? payload.relevantSources
         .filter(sourceAllowedForAfm)
@@ -531,6 +568,7 @@ export function buildAfmChatPayload(payload: Record<string, unknown>): Record<st
           "Return compact JSON only for Codex outcome prep.",
           "Keys: outcomeDraft with learnCandidates, logOnly, expires, doNotStore.",
           "No secrets, no raw private logs, no local absolute paths.",
+          providerLine,
           `Task: ${redactLocal(payload.task, 500)}`,
           `Summary: ${redactLocal(payload.summary, 700)}`,
           `Profile: ${profile}`,
@@ -550,6 +588,7 @@ export function buildAfmChatPayload(payload: Record<string, unknown>): Record<st
           "Return compact JSON only for Codex task prep.",
           "Keys: brief, recommendedNextActions, risks.",
           "No secrets, no raw private logs.",
+          providerLine,
           `Task: ${String(payload.task ?? "").slice(0, 500)}`,
           `Intent: ${String(payload.intent ?? "work")}`,
           `Profile: ${profile}`,
@@ -576,47 +615,32 @@ export async function callAfmPrepareTask(
   url: string,
   payload: Record<string, unknown>,
 ): Promise<JsonResult<Partial<PreparedTaskPacket>>> {
-  return new Promise((resolve) => {
-    const parsedUrl = new URL(url);
-    const client = parsedUrl.protocol === "https:" ? httpsRequest : httpRequest;
-    const isChatCompletions = parsedUrl.pathname.endsWith("/chat/completions");
-    const body = JSON.stringify(isChatCompletions ? buildAfmChatPayload(payload) : payload);
-    const req = client(
-      parsedUrl,
-      {
-        method: "POST",
-        timeout: 45000,
-        headers: {
-          "Content-Type": "application/json",
-          "Content-Length": Buffer.byteLength(body).toString(),
-        },
-      },
-      (res) => {
-        let data = "";
-        res.on("data", (chunk) => {
-          data += chunk;
-        });
-        res.on("end", () => {
-          try {
-            const parsed = JSON.parse(data) as unknown;
-            if (res.statusCode && res.statusCode >= 400) {
-              resolve({ ok: false, data: normalizeAfmResponse(parsed), error: `HTTP ${res.statusCode}` });
-              return;
-            }
-            resolve({ ok: true, data: normalizeAfmResponse(parsed) });
-          } catch (error) {
-            resolve({ ok: false, error: error instanceof Error ? error.message : String(error) });
-          }
-        });
-      },
-    );
-    req.on("timeout", () => {
-      req.destroy(new Error("AFM prepare_task request timed out"));
-    });
-    req.on("error", (error) => resolve({ ok: false, error: error.message }));
-    req.write(body);
-    req.end();
+  const parsedUrl = new URL(url);
+  const isChatCompletions = parsedUrl.pathname.endsWith("/chat/completions");
+  const provider = payload.provider && typeof payload.provider === "object"
+    ? (payload.provider as { provider?: AfmProvider; mode?: AfmProviderMode; requestedMode?: AfmProviderMode })
+    : undefined;
+  const actualProvider = provider?.provider ?? (provider?.mode === "bridge" || provider?.mode === "native" || provider?.mode === "off" ? provider.mode : undefined);
+  const requestedProvider = provider?.mode ?? provider?.requestedMode;
+  const transportMode: AfmProviderMode =
+    actualProvider === "off" || requestedProvider === "off"
+      ? "off"
+      : actualProvider === "native"
+        ? "native"
+        : "bridge";
+  const purpose = payload.purpose === "outcome" ? "prepare_outcome" : "prepare_task";
+  const wirePayload = transportMode === "native"
+    ? payload
+    : isChatCompletions
+      ? buildAfmChatPayload(payload)
+      : payload;
+  const result = await callAfmJson(url, wirePayload, {
+    mode: transportMode,
+    operation: purpose,
   });
+  return result.ok
+    ? { ok: true, data: normalizeAfmResponse(result.data) }
+    : { ok: false, data: normalizeAfmResponse(result.data), error: result.error };
 }
 
 export async function prepareTask(input: PrepareTaskInput, deps: PrepareTaskDeps = {}): Promise<PreparedTaskPacket> {
@@ -627,10 +651,20 @@ export async function prepareTask(input: PrepareTaskInput, deps: PrepareTaskDeps
   const limit = Math.max(1, Math.min(input.limit ?? budget.sourceLimit * 2, 12));
   const budgetTokens = budget.tokens;
   const afmUrl = input.afmPrepareUrl ?? AFM_PREPARE_TASK_URL;
+  const afmRequested = input.useAfm === true;
+  const afmProviderMode = resolveProviderMode(input.afmProviderMode);
   const search = deps.searchVault ?? searchVaultNotes;
   const recall = deps.recall ?? recallMemory;
   const afmPrepare = deps.afmPrepare ?? callAfmPrepareTask;
+  const checkAfmHealth = deps.afmHealth ?? afmHealth;
   const audit = deps.audit ?? recordAudit;
+  const afmHealthResult = afmRequested && (afmProviderMode === "native" || afmProviderMode === "auto") ? await checkAfmHealth() : undefined;
+  const afmProvider = afmRequested
+    ? resolveAfmProvider(afmProviderMode, {
+        health: afmHealthResult,
+        nativeHelperPath: process.env.SOVEREIGN_AFM_NATIVE_HELPER,
+      })
+    : resolveAfmProvider("off");
 
   const [vaultResults, recallResult] = await Promise.all([
     input.includeVault === false ? Promise.resolve([]) : search(vaultPath, input.task, limit),
@@ -649,15 +683,18 @@ export async function prepareTask(input: PrepareTaskInput, deps: PrepareTaskDeps
     budgetTokens,
     vaultResults,
     recallResult,
-    afmRequested: input.useAfm === true,
+    afmRequested,
     afmUrl,
+    afmProvider,
+    afmError: !afmProvider.available && afmRequested ? afmProvider.reason ?? "AFM native provider unavailable." : undefined,
   });
 
-  if (input.useAfm === true) {
+  if (afmRequested && afmProvider.available && afmProvider.provider !== "off") {
     const afmResult = await afmPrepare(afmUrl, {
       task: input.task,
       budgetTokens,
       profile: budget.profile,
+      provider: afmProvider,
       intent: packet.intent,
       constraints: packet.constraints,
       currentState: packet.currentState,
@@ -821,6 +858,16 @@ export async function prepareOutcome(
   const budget = resolveBudget(input.profile, undefined);
   const afmUrl = input.afmPrepareUrl ?? AFM_PREPARE_TASK_URL;
   const afmPrepare = deps.afmPrepare ?? callAfmPrepareTask;
+  const afmRequested = input.useAfm === true;
+  const afmProviderMode = resolveProviderMode(input.afmProviderMode);
+  const checkAfmHealth = deps.afmHealth ?? afmHealth;
+  const afmHealthResult = afmRequested && (afmProviderMode === "native" || afmProviderMode === "auto") ? await checkAfmHealth() : undefined;
+  const afmProvider = afmRequested
+    ? resolveAfmProvider(afmProviderMode, {
+        health: afmHealthResult,
+        nativeHelperPath: process.env.SOVEREIGN_AFM_NATIVE_HELPER,
+      })
+    : resolveAfmProvider("off");
   let packet: PreparedOutcomePacket = {
     task: input.task,
     summary: input.summary,
@@ -831,19 +878,27 @@ export async function prepareOutcome(
     verification: input.verification ?? [],
     outcomeDraft: outcomeDraft(input),
     afm: {
-      requested: input.useAfm === true,
+      requested: afmRequested,
       used: false,
       url: afmUrl,
+      provider: afmProvider.provider,
+      requestedProvider: afmProvider.mode,
+      backend: afmProvider.backend,
+      availability: afmProvider.availability,
+      adapterConfigured: afmProvider.adapterConfigured,
+      fallbackUsed: afmProvider.fallbackUsed,
+      error: !afmProvider.available && afmRequested ? afmProvider.reason ?? "AFM native provider unavailable." : undefined,
     },
     contextMarkdown: "",
   };
   packet.contextMarkdown = outcomeContextMarkdown(packet);
 
-  if (input.useAfm === true) {
+  if (afmRequested && afmProvider.available && afmProvider.provider !== "off") {
     const afmResult = await afmPrepare(afmUrl, {
       task: input.task,
       summary: input.summary,
       purpose: "outcome",
+      provider: afmProvider,
       changedFiles: packet.changedFiles.slice(0, budget.afmSourceLimit),
       verification: packet.verification.slice(0, budget.afmSourceLimit),
       outcomeDraft: packet.outcomeDraft,

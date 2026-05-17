@@ -337,9 +337,16 @@ export async function recordAudit(vaultPath: string, entry: AuditEntry): Promise
   await ensureVault(vaultPath);
   const timestamp = entry.timestamp ?? new Date();
   const date = isoDate(timestamp);
-  const line = `## [${timestamp.toISOString()}] ${entry.tool} | ${entry.summary}\n\n${
-    entry.details ? `\`\`\`json\n${JSON.stringify(entry.details, null, 2)}\n\`\`\`\n\n` : ""
-  }`;
+  const safeTool = escapeAuditField(entry.tool, 200);
+  const safeSummary = escapeAuditField(entry.summary, 500);
+  let detailsBlock = "";
+  if (entry.details) {
+    const json = JSON.stringify(entry.details, null, 2);
+    // escape any line-start # inside the json block too (defense in depth)
+    const safeJson = json.replace(/^#/gm, "\\#");
+    detailsBlock = `\`\`\`json\n${safeJson}\n\`\`\`\n\n`;
+  }
+  const line = `## [${timestamp.toISOString()}] ${safeTool} | ${safeSummary}\n\n${detailsBlock}`;
   await appendFile(path.join(vaultPath, "log.md"), line, "utf8");
   const dailyPath = path.join(vaultPath, "logs", `${date}.md`);
   if (!(await exists(dailyPath))) {
@@ -347,6 +354,16 @@ export async function recordAudit(vaultPath: string, entry: AuditEntry): Promise
   }
   await appendFile(dailyPath, line, "utf8");
   return dailyPath;
+}
+
+/** SEC-014: escape newlines / leading # in audit fields to prevent forged markdown headings in log.md */
+function escapeAuditField(v: unknown, maxLen = 500): string {
+  if (v == null) return "";
+  let s = String(v);
+  s = s.replace(/\\/g, "\\\\").replace(/\r/g, "\\r").replace(/\n/g, "\\n");
+  if (s.startsWith("#")) s = "\\" + s;
+  if (s.length > maxLen) s = s.slice(0, maxLen - 1) + "…";
+  return s;
 }
 
 async function appendIndex(vaultPath: string, title: string, relativePath: string, summary: string): Promise<void> {

@@ -238,6 +238,7 @@ document.querySelectorAll(".nav-item").forEach((button) => {
     button.classList.add("active");
     $(`#${button.dataset.view}-view`).classList.add("active");
     if (button.dataset.view === "audit") void refreshAudit();
+    if (button.dataset.view === "candidates") void refreshCandidates();
   });
 });
 
@@ -302,3 +303,94 @@ renderPrepare(samplePrepare);
 renderOutcome(sampleOutcome);
 renderTokens();
 await refreshStatus();
+
+// ─────────────────────────────────────────────────────────────────────────────
+// G17: Candidates tab JS (minimal, 8 actions round-trip to /api/resolve-candidate)
+// Actions: LEARN (accept), LOG-ONLY, DO-NOT-STORE, REDACT-THEN-LEARN, MERGE WITH EXISTING,
+// MARK SENSITIVE, MARK TEMPORARY, MARK PROJECT-SCOPED
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function refreshCandidates() {
+  const listEl = $("#candidatesList");
+  if (!listEl) return;
+  listEl.innerHTML = `<div class="candidate-card loading">Loading candidates…</div>`;
+  try {
+    const status = $("#candidateStatusFilter")?.value || "";
+    const url = status ? `/api/candidates?status=${encodeURIComponent(status)}` : "/api/candidates";
+    const data = await getJson(url);
+    const cands = data.candidates || data.data || [];
+    if (!cands.length) {
+      listEl.innerHTML = `<div class="candidate-card empty">No candidates (filter: ${status || "all"}). Run a learn via plugin to stage one.</div>`;
+      return;
+    }
+    listEl.innerHTML = cands.map(renderCandidateCard).join("");
+    // wire buttons (event delegation on list)
+    listEl.querySelectorAll("button[data-action]").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        const cid = Number(btn.dataset.candidateId);
+        const decision = btn.dataset.action;
+        const reason = prompt(`Reason for ${decision} on #${cid}? (optional)`, "") || "";
+        try {
+          btn.disabled = true;
+          const res = await postJson("/api/resolve-candidate", { candidate_id: cid, decision, reason });
+          alert(`Resolved #${cid} → ${res.new_status || res.status || "ok"}`);
+          void refreshCandidates();
+        } catch (e) {
+          alert(`Resolve failed: ${e.message || e}`);
+          btn.disabled = false;
+        }
+      });
+    });
+  } catch (e) {
+    listEl.innerHTML = `<div class="candidate-card error">Error loading: ${escapeHtml(String(e))}</div>`;
+  }
+}
+
+function renderCandidateCard(c) {
+  const id = c.candidate_id ?? c.id;
+  const st = c.status || "proposed";
+  const content = (c.content || "").slice(0, 280);
+  const when = c.proposed_at ? new Date(c.proposed_at * 1000).toLocaleString() : "";
+  const actions = [
+    { label: "LEARN", action: "accept" },
+    { label: "LOG-ONLY", action: "log_only" },
+    { label: "DO-NOT-STORE", action: "do_not_store" },
+    { label: "REDACT-THEN-LEARN", action: "redact" },
+    { label: "MERGE WITH EXISTING", action: "merge" },
+    { label: "MARK SENSITIVE", action: "mark_sensitive" },
+    { label: "MARK TEMPORARY", action: "mark_temporary" },
+    { label: "MARK PROJECT-SCOPED", action: "mark_project_scoped" },
+  ];
+  const btns = actions.map((a) => `<button class="action-btn" data-action="${a.action}" data-candidate-id="${id}">${a.label}</button>`).join(" ");
+  return `
+    <article class="candidate-card status-${st}">
+      <header>
+        <strong>#${id}</strong>
+        <span class="badge ${st}">${st}</span>
+        <small>${escapeHtml(c.principal || "")} @ ${when}</small>
+      </header>
+      <pre class="candidate-content">${escapeHtml(content)}${content.length < (c.content || "").length ? "…" : ""}</pre>
+      <div class="action-row">${btns}</div>
+      <div class="meta">
+        <small>workspace: ${escapeHtml(c.workspace_id || "default")} | layer: ${escapeHtml(c.layer || "")}</small>
+      </div>
+    </article>
+  `;
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (m) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[m]));
+}
+
+// Wire candidate controls (idempotent)
+const _candFilter = $("#candidateStatusFilter");
+if (_candFilter) _candFilter.addEventListener("change", () => void refreshCandidates());
+const _candRefresh = $("#refreshCandidates");
+if (_candRefresh) _candRefresh.addEventListener("click", () => void refreshCandidates());
+const _candProposed = $("#loadProposedOnly");
+if (_candProposed) _candProposed.addEventListener("click", () => {
+  if (_candFilter) _candFilter.value = "proposed";
+  void refreshCandidates();
+});
+
+// Initial proposed load not auto (user clicks tab); status strip etc remain untouched.

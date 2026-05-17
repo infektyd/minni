@@ -62,11 +62,23 @@ htmlcov/
 .env
 .env.*
 !.env.example
+.cursor/
 .claude/
 .DS_Store
 ._*
 .idea/
 .vscode/
+
+# Root-level local vault/runtime files
+/inbox/
+/outbox/
+/raw/
+/wiki/
+/.kilo/
+/.obsidian/
+/faiss/
+/index.md
+/log.md
 
 # Reports and generated documents
 reports/

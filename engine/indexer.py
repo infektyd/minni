@@ -16,6 +16,7 @@ import logging
 from typing import Dict, List, Optional
 
 import numpy as np
+import yaml  # G21: safe YAML parser for frontmatter (adversarial body-forge resistance)
 
 from config import SovereignConfig, DEFAULT_CONFIG
 from db import SovereignDB
@@ -47,25 +48,53 @@ class VaultIndexer:
 
     # ── Metadata extraction ────────────────────────────────────
 
+    # G21: shared frontmatter block regex (same pattern as wiki_indexer for consistency)
+    FRONTMATTER_BLOCK_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL | re.MULTILINE)
+
     @staticmethod
     def _extract_frontmatter(content: str) -> Dict[str, str]:
         """
-        Extract agent/sigil and PR-2 status/privacy from YAML-style frontmatter.
+        G21: Extract via YAML frontmatter block + yaml.safe_load (SEC-011/SEC-018).
 
-        PR-2: Also parses status, privacy, and page type.
+        Replaces brittle re.search over *entire* content (which allowed body lines
+        to forge agent/status/privacy). Now requires proper --- delimited block;
+        body content (including fake --- or key: val inside code fences) is ignored.
+
+        Falls back to safe defaults on missing/malformed block.
         """
-        agent_m = re.search(r"agent:\s*([^\s]+)", content)
-        sigil_m = re.search(r"sigil:\s*(.)", content)
-        status_m = re.search(r"status:\s*(\S+)", content)
-        privacy_m = re.search(r"privacy:\s*(\S+)", content)
-        type_m = re.search(r"type:\s*(\S+)", content)
+        match = VaultIndexer.FRONTMATTER_BLOCK_RE.match(content or "")
+        if not match:
+            # No fenced frontmatter → safe defaults (body spoof impossible)
+            return {
+                "agent": "unknown",
+                "sigil": "❓",
+                "page_status": "candidate",
+                "privacy_level": "safe",
+                "page_type": None,
+                "layer": "knowledge",
+            }
 
-        status = (status_m.group(1).strip('"\'') if status_m else "candidate").lower()
-        privacy = (privacy_m.group(1).strip('"\'') if privacy_m else "safe").lower()
-        page_type = type_m.group(1).strip('"\'') if type_m else None
-        agent = agent_m.group(1).strip('"\'') if agent_m else "unknown"
+        yaml_block = match.group(1)
+        try:
+            data = yaml.safe_load(yaml_block) or {}
+            if not isinstance(data, dict):
+                data = {}
+        except Exception:
+            data = {}
 
-        # Clamp to valid values
+        # Pull with safe string coercion (yaml.safe_load already handles quotes/lists)
+        def _str(v, default=""):
+            if v is None:
+                return default
+            return str(v).strip().strip("\"'")
+
+        agent = _str(data.get("agent") or data.get("sigil"), "unknown")
+        sigil = _str(data.get("sigil"), "❓")
+        status = _str(data.get("status"), "candidate").lower()
+        privacy = _str(data.get("privacy"), "safe").lower()
+        page_type = _str(data.get("type") or data.get("page_type"), None) or None
+
+        # Clamp
         valid_statuses = {"draft", "candidate", "accepted", "superseded", "rejected", "expired"}
         valid_privacies = {"safe", "local-only", "private", "blocked"}
         if status not in valid_statuses:
@@ -77,7 +106,7 @@ class VaultIndexer:
 
         return {
             "agent": agent,
-            "sigil": sigil_m.group(1) if sigil_m else "❓",
+            "sigil": sigil,
             "page_status": status,
             "privacy_level": privacy,
             "page_type": page_type,

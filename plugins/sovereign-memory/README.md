@@ -8,6 +8,7 @@ The optional frontend lives in `frontend/`. Run `npm run console` to start the l
 
 - Sovereign daemon socket: `SOVEREIGN_SOCKET_PATH` if set, otherwise `/tmp/sovereign.sock`; v4 JSON-RPC helpers also fall back to `/tmp/sovrd.sock`.
 - AFM health URL: `http://127.0.0.1:11437/health`
+- AFM provider mode: `bridge` by default; set `SOVEREIGN_AFM_PROVIDER_MODE=native`, `auto`, or `off` to change opt-in AFM calls.
 - Codex vault: `~/.sovereign-memory/codex-vault`
 
 Override with:
@@ -17,7 +18,23 @@ export SOVEREIGN_CODEX_VAULT_PATH=/path/to/codex-vault
 export SOVEREIGN_SOCKET_PATH=/tmp/sovrd.sock
 export SOVEREIGN_AFM_HEALTH_URL=http://127.0.0.1:11437/health
 export SOVEREIGN_AFM_PREPARE_TASK_URL=http://127.0.0.1:11437/v1/chat/completions
+export SOVEREIGN_AFM_PROVIDER_MODE=native
 ```
+
+`sovereign_prepare_task` and `sovereign_prepare_outcome` also accept
+`afmProviderMode` per call (`bridge`, `native`, `auto`, or `off`). `native`
+checks the AFM health endpoint for an Apple Foundation Models backend before
+distillation and records sanitized provider metadata (`backend`,
+`availability`, `adapterConfigured`) in the packet. Adapter paths are not
+returned or sent to the model prompt. `bridge` preserves the earlier
+OpenAI-compatible localhost behavior.
+
+Set `SOVEREIGN_AFM_NATIVE_HELPER` to the repo-local
+`engine/native_afm_helper` wrapper to let native prepare-task/outcome
+distillation call Foundation Models directly through the JSON helper contract.
+Future adapter configuration may be indicated with `SOVEREIGN_AFM_ADAPTER_PATH`
+or `SOVEREIGN_AFM_ADAPTER_ID`; status reports only `adapterConfigured`, never
+the private path.
 
 ## Tools
 

@@ -23,6 +23,7 @@ from db import SovereignDB
 from retrieval import RetrievalEngine
 from episodic import EpisodicMemory
 from writeback import WriteBackMemory
+from principal import EffectivePrincipal  # G19: for can_read_document on recall path
 
 
 class SovereignAgent:
@@ -99,10 +100,19 @@ class SovereignAgent:
         """
         Hybrid retrieval: FAISS semantic + FTS5 keyword, re-ranked.
         """
+        # G19: construct minimal principal for this agent so can_read_document + evidence envelope applied
+        p = EffectivePrincipal(
+            agent_id=self.agent_id,
+            workspace_id="default",
+            capabilities=["*"],
+            allowed_vault_roots=[getattr(self, "vault_path", os.path.expanduser("~"))],  # G12: home is reasonable non-strict default (still gated by can_read_document)
+        )
         results = self.retrieval.retrieve(
             query=query,
             agent_id=self.agent_id,
             limit=limit,
+            principal=p,
+            workspace="default",
         )
         if not results:
             return f"No recall results for: {query}"

@@ -38,6 +38,11 @@
             <span class="nav-icon">▣</span>
             Design
           </button>
+          <!-- G17: Candidates tab (P1 approval pipeline) -->
+          <button class="nav-item" data-view="candidates" title="Review and resolve staged learn candidates (human gate)">
+            <span class="nav-icon">✓</span>
+            Candidates
+          </button>
         </nav>
         <div class="rail-note">
           <span class="status-dot"></span>
@@ -271,6 +276,37 @@ npm run design:lint</textarea>
               <span class="badge safe">alpha spec</span>
             </div>
             <div class="token-grid" id="tokenGrid"></div>
+          </section>
+        </section>
+
+        <!-- G17: Minimal Candidates console (P1 human governance gate) -->
+        <section class="view" id="candidates-view">
+          <section class="panel full-width">
+            <div class="panel-header">
+              <div>
+                <h2>Candidates (approval queue)</h2>
+                <p>Human review gate. Proposed items never become durable learnings until resolved by operator principal. 8 actions supported.</p>
+              </div>
+              <button class="icon-button" id="refreshCandidates" title="Refresh candidate list">↻</button>
+            </div>
+            <div class="candidates-controls">
+              <label>Filter status:
+                <select id="candidateStatusFilter">
+                  <option value="">all</option>
+                  <option value="proposed">proposed</option>
+                  <option value="accepted">accepted</option>
+                  <option value="rejected">rejected</option>
+                  <option value="redacted">redacted</option>
+                </select>
+              </label>
+              <button class="secondary-button" id="loadProposedOnly">Show proposed only</button>
+            </div>
+            <div id="candidatesList" class="candidates-list">
+              <!-- Populated by JS: cards with content + 8 action buttons -->
+            </div>
+            <div class="candidates-note">
+              <small>Decisions POST to /api/resolve-candidate and round-trip to daemon. Rejected/redacted rows kept for audit (G14). Contradictions surfaced where present (G18).</small>
+            </div>
           </section>
         </section>
       </main>

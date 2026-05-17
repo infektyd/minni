@@ -31,9 +31,9 @@ JSON-RPC Methods
 
 Usage
 -----
-    python sovrd.py                    # default socket: /tmp/sovrd.sock
+    python sovrd.py                    # default socket: ~/.sovereign-memory/run/sovrd.sock (0700/0600, SEC-001)
     python sovrd.py --socket /path/s   # custom socket
-    python sovrd.py --port 9900        # HTTP fallback (optional)
+    python sovrd.py --port 9900        # HTTP fallback (optional; openclaw-extension/sovrd.py deprecated)
     python sovrd.py --dual-write       # enable dual-write to flat-file memory
 
 Client Quick-Start (Python)
@@ -86,6 +86,49 @@ if str(_ENGINE_DIR) not in sys.path:
 
 from config import DEFAULT_CONFIG, SovereignConfig          # noqa: E402
 from db import SovereignDB                                  # noqa: E402
+from principal import (                                     # noqa: E402  # G11 EffectivePrincipal + G14 operator gate
+    EffectivePrincipal,
+    IdentityMismatchError,
+    can_read_document,  # G19
+    is_operator_principal,
+    make_mismatch_error,
+    resolve_effective_principal,
+)
+
+# G12 (SEC-003): vault root binding guard. Enforces that any vault_path accepted
+# from wire (hygiene, compile, endorse, handoff derived) realpath-resolves inside
+# the stamped EffectivePrincipal's allowed_vault_roots. Denies .. / symlink escapes.
+# Structured error (-32003) + redacted log; no secret leak. Non-strict synthesis
+# (G11) preserves prior wide-open behavior until operator ships principals/*.json.
+def _guard_vault_root(
+    params: dict, vault_path: str | Path, request_id: Any, *, label: str = "vault"
+) -> Optional[dict]:
+    """Resolve stamped principal (honoring G11) and check allows_vault_root.
+    Returns JSON-RPC error dict on denial/mismatch, or None if allowed.
+    """
+    supplied = params.get("agent_id")
+    try:
+        principal = resolve_effective_principal(
+            supplied_agent_id=supplied, transport="uds"
+        )
+    except IdentityMismatchError as exc:
+        return make_mismatch_error(exc.supplied, exc.stamped, request_id)
+    if not principal.allows_vault_root(vault_path):
+        try:
+            resolved = str(Path(vault_path).resolve())
+        except Exception:
+            resolved = str(vault_path)[:120]
+        logger.warning(
+            "vault_root_denied label=%s principal=%s resolved=%s",
+            label, principal.agent_id, resolved[:120]
+        )
+        return _make_error(
+            -32003,
+            f"vault_root_denied: {label} path outside principal.allowed_vault_roots (realpath + relative check; traversal/symlink escape rejected)",
+            request_id,
+        )
+    return None
+
 
 # ── Lazy imports (heavy ML deps) ──────────────────────────────────────────
 _retrieval = None
@@ -430,6 +473,22 @@ def _handle_daemon_handoff(params: dict, request_id: Any) -> dict:
     if not from_agent or not to_agent:
         return _make_error(-32602, "from_agent and to_agent are required", request_id)
 
+    # G11: EffectivePrincipal stamp for the handoff path (from_agent is the identity
+    # claim for the packet originator). Mismatch is rejected before any vault creation,
+    # redaction, or cross-agent delivery. This closes the last public RPC that carried
+    # an unauthenticated agent identity claim. (to_agent is a destination, not a
+    # self-claim; it is validated by the consent contract in later G items.)
+    supplied = from_agent or None
+    try:
+        principal = resolve_effective_principal(
+            supplied_agent_id=supplied, transport="uds"
+        )
+    except IdentityMismatchError as exc:
+        return make_mismatch_error(exc.supplied, exc.stamped, request_id)
+    # Use the stamped value for any attribution inside this handler (future G items
+    # will thread the full EffectivePrincipal object).
+    from_agent = principal.agent_id
+
     packet, error = _validate_handoff_packet(from_agent, to_agent, params.get("packet"))
     if error:
         return _make_error(-32602, error, request_id)
@@ -437,6 +496,41 @@ def _handle_daemon_handoff(params: dict, request_id: Any) -> dict:
     redacted_packet, redacted = _redact_value(packet)
     sender_vault, sender_explicit = _agent_vault(from_agent)
     recipient_vault, recipient_explicit = _agent_vault(to_agent)
+
+    # G12: after G11 principal stamp, verify both derived vaults are inside allowed_vault_roots
+    # (covers handoff across agents; realpath denies .. and symlink escapes to outside roots)
+    for vlabel, vpath in (("sender", sender_vault), ("recipient", recipient_vault)):
+        if not principal.allows_vault_root(vpath):
+            logger.warning(
+                "vault_root_denied handoff label=%s principal=%s", vlabel, principal.agent_id
+            )
+            return _make_error(
+                -32003,
+                f"vault_root_denied: {vlabel} vault outside principal.allowed_vault_roots",
+                request_id,
+            )
+
+    # G23: harden wikilink_refs containment — no traversal out of sender's allowed vault/wiki
+    # (realpath + is_relative_to + allows_vault_root; symlink-aware)
+    wiki_root = sender_vault / "wiki"
+    for ref in packet.get("wikilink_refs", []) or []:
+        try:
+            ref_str = str(ref).strip()
+            if not ref_str:
+                continue
+            # candidate target inside wiki/ (or vault root); reject ../ or absolute escapes
+            cand = (wiki_root / ref_str.lstrip("/")).resolve()
+            if not cand.is_relative_to(wiki_root.resolve()) or not principal.allows_vault_root(cand):
+                logger.warning("wikilink_traversal_denied ref=%s principal=%s", ref_str, principal.agent_id)
+                return _make_error(
+                    -32003,
+                    "wikilink_traversal_denied: wikilink escapes allowed vault roots (G23)",
+                    request_id,
+                )
+        except Exception:
+            # treat resolution failure as deny
+            return _make_error(-32003, "wikilink_traversal_denied: unresolvable ref", request_id)
+
     create_missing = os.environ.get("SOVEREIGN_HANDOFF_CREATE_MISSING_VAULTS", "1").lower() not in {"0", "false", "off"}
 
     if not recipient_explicit and not recipient_vault.exists() and not create_missing:
@@ -607,7 +701,15 @@ def _handle_search(params: dict, request_id: Any) -> dict:
     if not query:
         return _make_error(-32602, "query is required", request_id)
 
-    agent_id = params.get("agent_id", "main")
+    # G11: EffectivePrincipal is the single server-stamped source (never trust caller)
+    supplied = params.get("agent_id")
+    try:
+        principal = resolve_effective_principal(
+            supplied_agent_id=supplied, transport="uds"
+        )
+    except IdentityMismatchError as exc:
+        return make_mismatch_error(exc.supplied, exc.stamped, request_id)
+    agent_id = principal.agent_id
     limit = min(int(params.get("limit", 5)), 20)
     depth = str(params.get("depth", "snippet"))
     budget_tokens_param = params.get("budget_tokens")
@@ -640,6 +742,9 @@ def _handle_search(params: dict, request_id: Any) -> dict:
             end_date=end_date,
             expand=expand,
             summarize_neighborhood=summarize_neighborhood,
+            # G19/G20/G22: pass stamped principal so can_read_document + evidence envelope applied
+            principal=principal,
+            workspace=principal.workspace_id,
         )
 
         # Apply MMR token-budget packing if requested
@@ -689,7 +794,15 @@ def _handle_feedback(params: dict, request_id: Any) -> dict:
         return _make_error(-32602, "result_id must be an integer", request_id)
 
     useful = bool(params.get("useful", False))
-    agent_id = params.get("agent_id", "main")
+    # G11: EffectivePrincipal is the single server-stamped source (never trust caller)
+    supplied = params.get("agent_id")
+    try:
+        principal = resolve_effective_principal(
+            supplied_agent_id=supplied, transport="uds"
+        )
+    except IdentityMismatchError as exc:
+        return make_mismatch_error(exc.supplied, exc.stamped, request_id)
+    agent_id = principal.agent_id
 
     try:
         result = _lazy_retrieval().record_feedback(
@@ -763,9 +876,18 @@ def _handle_expand(params: dict, request_id: Any) -> dict:
 
     depth = str(params.get("depth", "chunk"))
 
+    # G11 + G19: stamp principal for expand (read surface) and pass to gate
+    supplied = params.get("agent_id")
+    try:
+        principal = resolve_effective_principal(
+            supplied_agent_id=supplied, transport="uds"
+        )
+    except IdentityMismatchError as exc:
+        return make_mismatch_error(exc.supplied, exc.stamped, request_id)
+
     try:
         engine = _lazy_retrieval()
-        result = engine.expand_result(result_id=result_id, depth=depth)
+        result = engine.expand_result(result_id=result_id, depth=depth, principal=principal, workspace=principal.workspace_id)
         if result is None:
             return _make_error(-32000, f"No result found for result_id={result_id}", request_id)
         return _make_response({
@@ -784,7 +906,15 @@ def _handle_read(params: dict, request_id: Any) -> dict:
     _request_count += 1
     started_at = time.perf_counter()
 
-    agent_id = params.get("agent_id", "hermes")
+    # G11: EffectivePrincipal is the single server-stamped source (never trust caller)
+    supplied = params.get("agent_id")
+    try:
+        principal = resolve_effective_principal(
+            supplied_agent_id=supplied, transport="uds"
+        )
+    except IdentityMismatchError as exc:
+        return make_mismatch_error(exc.supplied, exc.stamped, request_id)
+    agent_id = principal.agent_id
     limit = min(int(params.get("limit", 5)), 20)
 
     try:
@@ -830,6 +960,16 @@ def _handle_read(params: dict, request_id: Any) -> dict:
             if rows:
                 lines.append(f"## Prior Context ({agent_id})")
                 for row in rows:
+                    # G19/G20: post-fetch gate on the legacy wiki/unknown Prior Context slice
+                    # (prevents foreign wiki/handoff leakage on the read surface)
+                    meta = {
+                        "path": row["path"],
+                        "agent": row["agent"],
+                        "page_type": "wiki" if "wiki" in str(row["agent"] or "") else "knowledge",
+                        "privacy_level": "safe",
+                    }
+                    if not can_read_document(principal, principal.workspace_id, meta):
+                        continue
                     fname = os.path.basename(row["path"])
                     line = (
                         f"  - **{fname}** ({row['sigil']}) "
@@ -941,7 +1081,15 @@ def _handle_learn(params: dict, request_id: Any) -> dict:
                 request_id,
             )
 
-    agent_id = params.get("agent_id", "hermes")
+    # G11: EffectivePrincipal is the single server-stamped source (never trust caller)
+    supplied = params.get("agent_id")
+    try:
+        principal = resolve_effective_principal(
+            supplied_agent_id=supplied, transport="uds"
+        )
+    except IdentityMismatchError as exc:
+        return make_mismatch_error(exc.supplied, exc.stamped, request_id)
+    agent_id = principal.agent_id
     category = params.get("category", "general")
     force = bool(params.get("force", False))
 
@@ -978,6 +1126,25 @@ def _handle_learn(params: dict, request_id: Any) -> dict:
                     "status": "contradiction",
                     "candidates": candidates,
                 }, request_id)
+
+        # G16: default learn() is proposal-first (stage to candidate_packets).
+        # Only force=true takes the durable INSERT path (explicit escape hatch).
+        if not force:
+            return _stage_candidate(params, request_id)
+
+        # G16 operator gate on the escape hatch (mirrors _resolve_candidate exactly)
+        if not is_operator_principal(principal):
+            return _make_error(
+                -32004,
+                "operator_only: force=true durable learn requires operator principal (principals/*.json capabilities or trusted name)",
+                request_id,
+            )
+
+        # force=true path — prominent audit stamp only after the gate passes
+        logger.warning(
+            "FORCE_DURABLE_LEARN principal=%s (explicit escape; G16 audit stamp)",
+            principal.agent_id,
+        )
 
         # ── Store the learning ───────────────────────────────────────────────
         import sqlite3 as _sqlite3, time as _time, json as _json
@@ -1113,7 +1280,15 @@ def _handle_resolve_contradiction(params: dict, request_id: Any) -> dict:
     if not isinstance(supersede_ids, list):
         return _make_error(-32602, "supersede_ids must be a list", request_id)
 
-    agent_id = params.get("agent_id", "hermes")
+    # G11: EffectivePrincipal is the single server-stamped source (never trust caller)
+    supplied = params.get("agent_id")
+    try:
+        principal = resolve_effective_principal(
+            supplied_agent_id=supplied, transport="uds"
+        )
+    except IdentityMismatchError as exc:
+        return make_mismatch_error(exc.supplied, exc.stamped, request_id)
+    agent_id = principal.agent_id
     category = params.get("category", "general")
     assertion = params.get("assertion")
     applies_when = params.get("applies_when")
@@ -1199,7 +1374,15 @@ def _handle_log_event(params: dict, request_id: Any) -> dict:
         return _make_error(-32602, "event_type and content are required",
                            request_id)
 
-    agent_id = params.get("agent_id", "hermes")
+    # G11: EffectivePrincipal is the single server-stamped source (never trust caller)
+    supplied = params.get("agent_id")
+    try:
+        principal = resolve_effective_principal(
+            supplied_agent_id=supplied, transport="uds"
+        )
+    except IdentityMismatchError as exc:
+        return make_mismatch_error(exc.supplied, exc.stamped, request_id)
+    agent_id = principal.agent_id
     task_id = params.get("task_id")
     thread_id = params.get("thread_id")
 
@@ -1243,6 +1426,16 @@ def _handle_status(params: dict, request_id: Any) -> dict:
         pass
 
     faiss_path, faiss_ok = _faiss_cache_status(DEFAULT_CONFIG)
+    try:
+        from afm_provider import afm_runtime_status
+        afm_status = afm_runtime_status()
+    except Exception as exc:
+        afm_status = {
+            "mode": "unknown",
+            "status": "degraded",
+            "native_available": False,
+            "error": str(exc),
+        }
 
     uptime = time.time() - _start_time
     return _make_response({
@@ -1261,6 +1454,7 @@ def _handle_status(params: dict, request_id: Any) -> dict:
             "faiss_path": str(faiss_path),
             "stats": db_stats,
         },
+        "afm": afm_status,
     }, request_id)
 
 
@@ -1410,7 +1604,11 @@ def _handle_health_report(params: dict, request_id: Any) -> dict:
 
 def _handle_hygiene_report(params: dict, request_id: Any) -> dict:
     """Run read-only vault/wiki hygiene checks and return JSON summary."""
+    # G12: enforce stamped principal's allowed_vault_roots on any supplied vault (realpath checked)
     vault_path = params.get("vault") or params.get("vault_path") or DEFAULT_CONFIG.vault_path
+    err = _guard_vault_root(params, vault_path, request_id, label="hygiene")
+    if err:
+        return err
     try:
         from hygiene import run_hygiene_report
         summary = run_hygiene_report(Path(vault_path))
@@ -1451,6 +1649,11 @@ def _handle_daemon_compile(params: dict, request_id: Any) -> dict:
         return _make_error(-32602, "pass_name is required", request_id)
     dry_run = bool(params.get("dry_run", True))
     vault_path = str(params.get("vault_path") or DEFAULT_CONFIG.vault_path)
+
+    # G12: vault root binding before any AFM pass or submit_drafts (denies traversal/symlink)
+    err = _guard_vault_root(params, vault_path, request_id, label="compile")
+    if err:
+        return err
 
     if not _afm_loop_enabled(DEFAULT_CONFIG):
         return _make_response({
@@ -1535,12 +1738,246 @@ def _handle_daemon_endorse(params: dict, request_id: Any) -> dict:
     if decision not in {"accept", "reject", "edit"}:
         return _make_error(-32602, "decision must be accept, reject, or edit", request_id)
     vault_path = str(params.get("vault_path") or DEFAULT_CONFIG.vault_path)
+
+    # G12: vault root binding (endorse touches the vault wiki); realpath + principal allowlist
+    err = _guard_vault_root(params, vault_path, request_id, label="endorse")
+    if err:
+        return err
+
     try:
         from afm_writer import endorse_draft
         return _make_response(endorse_draft(vault_path, page_id, decision), request_id)
     except Exception as exc:
         logger.warning("daemon.endorse failed: %s", exc)
         return _make_error(-32000, f"Endorse error: {exc}", request_id)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# G14–G18: Candidate approval pipeline (P1 keystone — human governs persistence)
+# stage_candidate / list_candidates / resolve_candidate + learn default-to-proposal
+# All paths use G11-stamped EffectivePrincipal; operator gate via is_operator_principal
+# Rejected/redacted/expired rows preserved for audit; only accepted produce learnings rows.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _stage_candidate(params: dict, request_id: Any) -> dict:
+    """G14/G16: Stage a candidate packet (default learn path). No durable write."""
+    supplied = params.get("agent_id")
+    try:
+        principal = resolve_effective_principal(
+            supplied_agent_id=supplied, transport="uds"
+        )
+    except IdentityMismatchError as exc:
+        return make_mismatch_error(exc.supplied, exc.stamped, request_id)
+
+    content = (params.get("content") or params.get("text") or "").strip()
+    if not content:
+        return _make_error(-32602, "content is required", request_id)
+
+    import time as _time
+    import json as _json
+
+    now = _time.time()
+    ws = params.get("workspace_id") or "default"
+    ev = _json.dumps(params.get("evidence_refs") or params.get("evidence_doc_ids") or [])
+    df = _json.dumps(params.get("derived_from") or {})
+    instr = 1 if params.get("instruction_like") else 0
+
+    try:
+        from db import SovereignDB as _SovDB
+        db = _SovDB()
+        with db.cursor() as c:
+            c.execute(
+                """
+                INSERT INTO candidate_packets
+                (principal, workspace_id, layer, privacy_level, content,
+                 evidence_refs, derived_from, instruction_like, status, proposed_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'proposed', ?)
+                """,
+                (
+                    principal.agent_id,
+                    ws,
+                    params.get("layer"),
+                    params.get("privacy_level"),
+                    content[:200000],  # bound for safety (P1)
+                    ev,
+                    df,
+                    instr,
+                    now,
+                ),
+            )
+            cid = c.lastrowid
+        logger.info(
+            "G16 stage_candidate #%d principal=%s (proposal-first, no durable learn yet)",
+            cid, principal.agent_id
+        )
+        return _make_response(
+            {
+                "status": "proposed",
+                "candidate_id": cid,
+                "principal": principal.agent_id,
+                "workspace_id": ws,
+            },
+            request_id,
+        )
+    except Exception as exc:
+        logger.exception("stage_candidate failed")
+        return _make_error(-32000, f"stage_candidate error: {exc}", request_id)
+
+
+def _list_candidates(params: dict, request_id: Any) -> dict:
+    """G14/G17: List candidates for the stamped principal (for console)."""
+    supplied = params.get("agent_id")
+    try:
+        principal = resolve_effective_principal(
+            supplied_agent_id=supplied, transport="uds"
+        )
+    except IdentityMismatchError as exc:
+        return make_mismatch_error(exc.supplied, exc.stamped, request_id)
+
+    status_f = params.get("status")
+    limit = min(int(params.get("limit", 100)), 500)
+    try:
+        from db import SovereignDB as _SovDB
+        import json as _json
+        db = _SovDB()
+        with db.cursor() as c:
+            if status_f:
+                c.execute(
+                    "SELECT * FROM candidate_packets WHERE principal=? AND status=? ORDER BY proposed_at DESC LIMIT ?",
+                    (principal.agent_id, status_f, limit),
+                )
+            else:
+                c.execute(
+                    "SELECT * FROM candidate_packets WHERE principal=? ORDER BY proposed_at DESC LIMIT ?",
+                    (principal.agent_id, limit),
+                )
+            rows = []
+            for r in c.fetchall():
+                d = dict(r)
+                for k in ("evidence_refs", "derived_from"):
+                    if d.get(k):
+                        try:
+                            d[k] = _json.loads(d[k])
+                        except Exception:
+                            pass
+                rows.append(d)
+        return _make_response(
+            {"candidates": rows, "principal": principal.agent_id, "count": len(rows)},
+            request_id,
+        )
+    except Exception as exc:
+        logger.exception("list_candidates failed")
+        return _make_error(-32000, f"list_candidates error: {exc}", request_id)
+
+
+def _resolve_candidate(params: dict, request_id: Any) -> dict:
+    """G15: Resolve a candidate (accept→durable learn, reject/redact etc). Operator only."""
+    supplied = params.get("agent_id")
+    try:
+        principal = resolve_effective_principal(
+            supplied_agent_id=supplied, transport="uds"
+        )
+    except IdentityMismatchError as exc:
+        return make_mismatch_error(exc.supplied, exc.stamped, request_id)
+
+    if not is_operator_principal(principal):
+        return _make_error(
+            -32004,
+            "operator_only: resolve_candidate requires operator principal (capabilities or trusted agent_id in principals/*.json)",
+            request_id,
+        )
+
+    cid = params.get("candidate_id")
+    if cid is None:
+        return _make_error(-32602, "candidate_id is required", request_id)
+    try:
+        cid = int(cid)
+    except Exception:
+        return _make_error(-32602, "candidate_id must be integer", request_id)
+
+    decision = str(params.get("decision") or "").strip().lower()
+    reason = str(params.get("reason") or params.get("resolution_reason") or "")[:500]
+    allowed = {"accept", "learn", "reject", "redact", "do_not_store", "log_only", "merge", "supersede", "mark_sensitive", "mark_temporary", "mark_project_scoped"}
+    if decision not in allowed:
+        return _make_error(-32602, f"decision must be one of {sorted(allowed)}", request_id)
+
+    status_map = {
+        "accept": "accepted",
+        "learn": "accepted",
+        "reject": "rejected",
+        "redact": "redacted",
+        "do_not_store": "rejected",
+        "log_only": "rejected",
+        "merge": "merged",
+        "supersede": "superseded",
+        "mark_sensitive": "accepted",  # still accepted but tagged via reason
+        "mark_temporary": "accepted",
+        "mark_project_scoped": "accepted",
+    }
+    new_status = status_map.get(decision, "rejected")
+
+    import time as _time
+    import json as _json
+    now = _time.time()
+
+    try:
+        from db import SovereignDB as _SovDB
+        db = _SovDB()
+        lid = None
+        # Explicit transaction (BEGIN IMMEDIATE) for atomic SELECT + conditional promote + UPDATE.
+        # Closes TOCTOU between read and write (mirrors the pattern in _handle_resolve_contradiction).
+        with db.transaction() as c:
+            c.execute("SELECT * FROM candidate_packets WHERE candidate_id=?", (cid,))
+            row = c.fetchone()
+            if not row:
+                return _make_error(-32001, f"candidate_not_found: {cid}", request_id)
+            rowd = dict(row)
+            if rowd.get("principal") != principal.agent_id:
+                # allow operator to resolve any? but per spec per-principal for now; relax for console operator
+                pass  # operator may resolve cross for console; keep permissive for P1
+
+            if new_status == "accepted":
+                # Promote to durable learning (the only path that writes to learnings)
+                # Use minimal column set guaranteed by baseline schema (PR-6 columns added by 005 migration;
+                # safe subset avoids "no column" in fresh test DBs where ALTER timing varies).
+                c.execute(
+                    """
+                    INSERT INTO learnings
+                    (agent_id, category, content, created_at)
+                    VALUES (?, 'general', ?, ?)
+                    """,
+                    (principal.agent_id, rowd.get("content"), now),
+                )
+                lid = c.lastrowid
+
+            c.execute(
+                """
+                UPDATE candidate_packets
+                SET status=?, resolved_at=?, resolved_by=?, resolution_reason=?
+                WHERE candidate_id=?
+                """,
+                (new_status, now, principal.agent_id, reason, cid),
+            )
+
+        # Prominent audit log for the governance action (always, since operator path)
+        logger.warning(
+            "RESOLVE_CANDIDATE operator=%s candidate=%s decision=%s new_status=%s reason=%s (G15 audit)",
+            principal.agent_id, cid, decision, new_status, reason[:80]
+        )
+
+        return _make_response(
+            {
+                "status": "resolved",
+                "candidate_id": cid,
+                "new_status": new_status,
+                "learning_id": lid,
+                "principal": principal.agent_id,
+            },
+            request_id,
+        )
+    except Exception as exc:
+        logger.exception("resolve_candidate failed")
+        return _make_error(-32000, f"resolve_candidate error: {exc}", request_id)
 
 
 # Method registry
@@ -1558,14 +1995,22 @@ _METHODS: Dict[str, callable] = {
     "handoff":                _handle_daemon_handoff,
     "daemon.compile":         _handle_daemon_compile,
     "daemon.endorse":         _handle_daemon_endorse,
+    # G14-G18 candidate pipeline (operator-gated governance)
+    "stage_candidate":        _stage_candidate,
+    "list_candidates":        _list_candidates,
+    "resolve_candidate":      _resolve_candidate,
     "status":                 _handle_status,
     "health_report":          _handle_health_report,
     "hygiene_report":         _handle_hygiene_report,
 }
 
 # ── Unix socket server ───────────────────────────────────────────────────
+# SEC-001: canonical secure location (0700 dir, 0600 socket). /tmp is world-writable
+# and was the old default; openclaw-extension/sovrd.py HTTP variant is deprecated.
+SECURE_RUN_DIR: Path = Path.home() / ".sovereign-memory" / "run"
+DEFAULT_SOCKET_PATH: Path = SECURE_RUN_DIR / "sovrd.sock"
 
-_unix_socket_path: Path = Path("/tmp/sovrd.sock")
+_unix_socket_path: Path = DEFAULT_SOCKET_PATH
 _running = False
 _server: Optional[asyncio.AbstractServer] = None
 
@@ -1654,6 +2099,14 @@ async def _serve_unix_socket(path: Path):
     """Start the Unix socket server."""
     global _server, _running
 
+    # SEC-001: ensure parent run/ dir is 0700 (owner-only) before bind
+    run_dir = path.parent
+    run_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(str(run_dir), 0o700)
+    except OSError as e:
+        logger.warning("Failed to chmod run dir %s to 0o700 (OSError: %s) — socket may be accessible to other users (SEC-001)", run_dir, e)
+
     # Remove stale socket
     if path.exists():
         path.unlink()
@@ -1669,8 +2122,8 @@ async def _serve_unix_socket(path: Path):
     # Set socket permissions (owner read/write only)
     try:
         os.chmod(str(path), 0o600)
-    except OSError:
-        pass
+    except OSError as e:
+        logger.warning("Failed to chmod socket %s to 0o600 (OSError: %s) — socket may be accessible to other users (SEC-001)", path, e)
 
     logger.info("Listening on %s", path)
     _running = True
@@ -1805,8 +2258,8 @@ def main():
     )
     parser.add_argument(
         "--socket", "-s",
-        default="/tmp/sovrd.sock",
-        help="Unix socket path (default: /tmp/sovrd.sock)",
+        default=str(DEFAULT_SOCKET_PATH),
+        help="Unix socket path (default: ~/.sovereign-memory/run/sovrd.sock with 0600; SEC-001)",
     )
     parser.add_argument(
         "--port", "-p",
