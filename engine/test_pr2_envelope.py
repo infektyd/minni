@@ -20,12 +20,23 @@ import sqlite3
 import tempfile
 import json
 import time
+import types
 from pathlib import Path
 
 import pytest
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(__file__))
+
+
+def _usable_faiss_or_skip():
+    try:
+        import faiss
+    except ImportError:
+        pytest.skip("faiss-cpu not installed")
+    if not hasattr(faiss, "IndexFlatIP"):
+        pytest.skip("faiss module is incomplete; numpy fallback path is tested separately")
+    return faiss
 
 
 # ---------------------------------------------------------------------------
@@ -71,12 +82,7 @@ class TestFAISSPersistence:
         """save() then load() with matching checksum returns the index."""
         from faiss_persist import save, load
 
-        # Create a tiny FAISS flat index
-        try:
-            import faiss
-        except ImportError:
-            pytest.skip("faiss-cpu not installed")
-
+        faiss = _usable_faiss_or_skip()
         dim = 4
         index = faiss.IndexFlatIP(dim)
         vecs = np.random.rand(3, dim).astype(np.float32)
@@ -105,11 +111,7 @@ class TestFAISSPersistence:
         """load() returns None when DB checksum has changed."""
         from faiss_persist import save, load
 
-        try:
-            import faiss
-        except ImportError:
-            pytest.skip("faiss-cpu not installed")
-
+        faiss = _usable_faiss_or_skip()
         dim = 4
         index = faiss.IndexFlatIP(dim)
         vecs = np.random.rand(2, dim).astype(np.float32)
@@ -165,10 +167,7 @@ class TestFAISSPersistence:
 
     def test_faiss_index_try_load_and_save(self, tmp_path):
         """FAISSIndex.try_load_from_disk() and save_to_disk() round-trip."""
-        try:
-            import faiss
-        except ImportError:
-            pytest.skip("faiss-cpu not installed")
+        _usable_faiss_or_skip()
 
         from faiss_index import FAISSIndex
         from config import SovereignConfig
@@ -199,6 +198,56 @@ class TestFAISSPersistence:
         loaded = idx2.try_load_from_disk(db_conn=conn)
         assert loaded, "try_load_from_disk should succeed after save"
         assert idx2.count == 5
+
+    def test_incomplete_faiss_module_uses_numpy_fallback(self, tmp_path, monkeypatch):
+        """An importable but incomplete faiss namespace must not crash indexing."""
+        monkeypatch.setitem(sys.modules, "faiss", types.SimpleNamespace(__file__=None))
+
+        from faiss_index import FAISSIndex
+        from config import SovereignConfig
+
+        cfg = SovereignConfig(db_path=str(tmp_path / "test.db"), embedding_dim=4)
+        idx = FAISSIndex(cfg)
+        vecs = np.eye(4, dtype=np.float32)
+
+        idx.build_from_vectors([10, 20, 30, 40], vecs)
+        results = idx.search(vecs[0], top_k=2)
+
+        assert idx.get_stats()["index_type"] == "numpy"
+        assert results[0][0] == 10
+
+    def test_load_uses_numpy_cache_when_faiss_module_is_incomplete(self, tmp_path, monkeypatch):
+        """A broken importable faiss module should still allow .npz fallback loads."""
+        from faiss_persist import load
+
+        monkeypatch.setitem(sys.modules, "faiss", types.SimpleNamespace(__file__=None))
+
+        manifest = tmp_path / "index.manifest.json"
+        faiss_path = tmp_path / "index.faiss"
+        faiss_path.write_bytes(b"not a real faiss index")
+        vectors = np.eye(3, 4, dtype=np.float32)
+        np.savez_compressed(
+            str(faiss_path) + ".npz",
+            vectors=vectors,
+            chunk_ids=np.array([101, 102, 103]),
+        )
+        manifest.write_text(json.dumps({
+            "embedding_model": "test-model",
+            "vector_dim": 4,
+            "embedding_quantization": "fp32",
+            "chunk_id_order": [101, 102, 103],
+            "chunk_count": 3,
+            "db_checksum": "abc123",
+            "saved_at": "2026-05-13T00:00:00Z",
+        }), encoding="utf-8")
+
+        result = load(str(manifest), expected_db_checksum="abc123")
+
+        assert result is not None
+        loaded_index, loaded_ids, loaded_vectors = result
+        assert loaded_index is None
+        assert loaded_ids == [101, 102, 103]
+        assert len(loaded_vectors) == 3
 
 
 # ---------------------------------------------------------------------------
@@ -599,12 +648,20 @@ class TestEnvelopeFields:
                 assert key in r, f"Missing key {key!r} in snippet result"
 
     def test_headline_envelope_has_pr2_keys(self, tmp_path):
-        """headline-depth results include all PR-2 envelope keys."""
+        """headline-depth results include only compact routing metadata."""
         engine, db_obj, cfg = _make_engine(tmp_path)
         results = engine.retrieve("test", limit=1, depth="headline")
         for r in results:
-            for key in self.PR2_KEYS:
+            for key in (
+                "confidence", "privacy_level", "review_state",
+                "instruction_like", "wikilink",
+            ):
                 assert key in r, f"Missing key {key!r} in headline result"
+            for verbose_key in (
+                "rationale", "evidence_refs", "recommended_action",
+                "recommended_wiki_updates", "provenance",
+            ):
+                assert verbose_key not in r, f"Unexpected verbose key {verbose_key!r}"
 
     def test_existing_keys_still_present(self, tmp_path):
         """Existing {text, source, heading, score} keys still present at snippet depth."""

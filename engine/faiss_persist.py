@@ -104,16 +104,22 @@ def save(
         if index is not None:
             try:
                 import faiss
+                if not hasattr(faiss, "write_index"):
+                    raise AttributeError("faiss.write_index is unavailable")
                 faiss.write_index(index, faiss_path)
             except Exception as e:
-                logger.warning("Failed to write FAISS index: %s", e)
-                return False
-        else:
+                logger.warning("Failed to write FAISS index: %s; trying numpy fallback", e)
+                index = None
+
+        if index is None:
             # numpy fallback — save as npz
             npz_path = faiss_path + ".npz"
             if vectors:
                 arr = np.array(vectors, dtype=np.float32)
                 np.savez_compressed(npz_path, vectors=arr, chunk_ids=np.array(chunk_ids))
+            else:
+                logger.warning("Cannot save numpy fallback: no raw vectors available")
+                return False
 
         manifest = {
             "embedding_model": embedding_model,
@@ -211,6 +217,8 @@ def load(
     if os.path.exists(faiss_path):
         try:
             import faiss
+            if not hasattr(faiss, "read_index"):
+                raise AttributeError("faiss.read_index is unavailable")
             faiss_index = faiss.read_index(faiss_path)
             logger.info(
                 "FAISS index loaded from disk: %d vectors (checksum=%s)",
@@ -220,8 +228,7 @@ def load(
         except ImportError:
             pass  # faiss not installed, try numpy fallback
         except Exception as e:
-            logger.warning("Cannot load FAISS index file: %s — will rebuild", e)
-            return None
+            logger.warning("Cannot load FAISS index file: %s — trying numpy fallback", e)
 
     # numpy fallback (.npz)
     npz_path = faiss_path + ".npz"

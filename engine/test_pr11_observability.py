@@ -139,6 +139,75 @@ def test_status_includes_latency_histograms(monkeypatch):
     assert latencies["search"]["p95_ms"] >= latencies["search"]["p50_ms"]
 
 
+def test_sovrd_read_includes_layer_1_identity_before_context(tmp_path, monkeypatch):
+    import sovrd
+
+    db_obj, _cfg = _make_db(tmp_path)
+    now = time.time()
+    with db_obj.cursor() as c:
+        c.execute(
+            """
+            INSERT INTO documents
+            (path, agent, sigil, last_modified, indexed_at, access_count, last_accessed,
+             decay_score, whole_document, page_status, privacy_level, page_type, layer)
+            VALUES (?, 'identity:codex', 'C', ?, ?, 0, NULL, 1.0, 1, 'accepted', 'safe', 'schema', 'identity')
+            """,
+            ("/identity/codex/CODEX_HOSTED_AGENT_ENVELOPE.md", now, now),
+        )
+        identity_doc_id = c.lastrowid
+        c.execute(
+            """
+            INSERT INTO chunk_embeddings
+            (doc_id, chunk_index, chunk_text, embedding, model_name, computed_at, layer)
+            VALUES (?, 0, ?, ?, 'test', ?, 'identity')
+            """,
+            (
+                identity_doc_id,
+                "Sovereign Memory gives owned agents a soul. It gives hosted agents a map.",
+                b"0" * 1536,
+                now,
+            ),
+        )
+        _seed_doc(db_obj, path="/wiki/context.md", agent="codex")
+
+    monkeypatch.setattr(sovrd, "SovereignDB", lambda: db_obj)
+
+    resp = sovrd._handle_read({"agent_id": "codex", "limit": 5}, 1)
+    context = resp["result"]["context"]
+
+    assert "## Agent Identity: Codex" in context
+    assert "### CODEX_HOSTED_AGENT_ENVELOPE" in context
+    assert "owned agents a soul" in context
+    assert context.index("## Agent Identity: Codex") < context.index("## Prior Context (codex)")
+
+
+def test_status_accepts_persisted_faiss_npz_cache(tmp_path, monkeypatch):
+    import sovrd
+    from config import SovereignConfig
+
+    db_path = tmp_path / "sovereign_memory.db"
+    faiss_dir = tmp_path / "faiss"
+    faiss_dir.mkdir()
+    (faiss_dir / "index.manifest.json").write_text(
+        '{"chunk_count": 1, "db_checksum": "abc"}',
+        encoding="utf-8",
+    )
+    (faiss_dir / "index.faiss.npz").write_bytes(b"npz-cache")
+
+    cfg = SovereignConfig(
+        db_path=str(db_path),
+        vault_path=str(tmp_path / "vault"),
+        graph_export_dir=str(tmp_path / "graphs"),
+        faiss_index_path=str(tmp_path / "legacy.index"),
+    )
+    monkeypatch.setattr(sovrd, "DEFAULT_CONFIG", cfg)
+
+    result = sovrd._handle_status({}, 1)["result"]
+
+    assert result["engine"]["faiss_ok"] is True
+    assert result["engine"]["faiss_path"] == str(faiss_dir / "index.faiss.npz")
+
+
 def test_python_format_recall_includes_backend_badge():
     import sovrd
 
