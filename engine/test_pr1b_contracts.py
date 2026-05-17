@@ -152,12 +152,116 @@ class TestDepthTiers:
         """_apply_depth('headline') returns only headline fields."""
         engine = self._engine(tmp_path)
         fake = _make_fake_results(1)[0]
+        fake.update({
+            "rationale": "verbose explanation",
+            "evidence_refs": ["doc:a"],
+            "recommended_action": "cite",
+            "recommended_wiki_updates": ["update"],
+        })
         result = engine._apply_depth(fake, "headline")
         assert "score" in result
         assert "depth" in result
         assert result["depth"] == "headline"
+        assert "chunk_id" in result
+        assert "decay_factor" in result
         # headline must NOT include full text
         assert "text" not in result or result.get("text") is None or "text" not in result
+        # headline keeps only cheap routing metadata, not verbose PR-2 guidance.
+        assert "rationale" not in result
+        assert "evidence_refs" not in result
+        assert "recommended_action" not in result
+        assert "recommended_wiki_updates" not in result
+
+    def test_sovrd_search_defaults_to_headline(self, monkeypatch):
+        """Daemon search defaults to headline without changing RetrievalEngine default."""
+        import sovrd
+
+        seen = {}
+
+        class FakeEngine:
+            last_trace_id = "trace-b1"
+
+            def retrieve(self, **kwargs):
+                seen.update(kwargs)
+                return [{"doc_id": 1, "chunk_id": 10, "depth": kwargs["depth"]}]
+
+        monkeypatch.setattr(sovrd, "_lazy_retrieval", lambda: FakeEngine())
+        response = sovrd._dispatch({
+            "jsonrpc": "2.0",
+            "id": 100,
+            "method": "search",
+            "params": {"query": "headline default"},
+        })
+
+        assert "error" not in response
+        assert seen["depth"] == "headline"
+        assert response["result"]["depth"] == "headline"
+
+    def test_sm_drill_batches_result_ids(self, monkeypatch):
+        import sovrd
+
+        calls = []
+
+        class FakeEngine:
+            def expand_result(self, result_id, depth="chunk"):
+                calls.append((result_id, depth))
+                return {"doc_id": result_id, "chunk_id": result_id * 10, "depth": depth}
+
+        monkeypatch.setattr(sovrd, "_lazy_retrieval", lambda: FakeEngine())
+        response = sovrd._dispatch({
+            "jsonrpc": "2.0",
+            "id": 101,
+            "method": "sm_drill",
+            "params": {"result_ids": [1, 2], "depth": "snippet"},
+        })
+
+        assert "error" not in response
+        assert calls == [(1, "snippet"), (2, "snippet")]
+        assert response["result"]["count"] == 2
+
+    def test_sm_export_pack_is_deterministic(self, monkeypatch):
+        import sovrd
+
+        class FakeEngine:
+            def retrieve(self, **kwargs):
+                return [
+                    {
+                        "doc_id": 2,
+                        "chunk_id": 20,
+                        "source": "/vault/b.md",
+                        "wikilink": "[[b]]",
+                        "text": "Second result",
+                        "token_count": 3,
+                        "score": 0.8,
+                        "depth": kwargs["depth"],
+                    },
+                    {
+                        "doc_id": 1,
+                        "chunk_id": 10,
+                        "source": "/vault/a.md",
+                        "wikilink": "[[a]]",
+                        "text": "First result",
+                        "token_count": 3,
+                        "score": 0.9,
+                        "depth": kwargs["depth"],
+                    },
+                ]
+
+        monkeypatch.setattr(sovrd, "_lazy_retrieval", lambda: FakeEngine())
+        request = {
+            "jsonrpc": "2.0",
+            "id": 102,
+            "method": "sm_export_pack",
+            "params": {"query": "cache prefix", "budget_tokens": 100, "cache_key": "k1"},
+        }
+
+        first = sovrd._dispatch(request)["result"]
+        second = sovrd._dispatch(request)["result"]
+
+        assert first["manifest_hash"] == second["manifest_hash"]
+        assert first["cache_key"] == "k1"
+        assert [a["anchor"] for a in first["prefix"]["anchors"]] == ["sm://doc/1/chunk/10", "sm://doc/2/chunk/20"]
+        assert [s["anchor"] for s in first["suffix"]["snippets"]] == ["sm://doc/2/chunk/20", "sm://doc/1/chunk/10"]
 
     def test_apply_depth_snippet_includes_text(self, tmp_path):
         """_apply_depth('snippet') includes truncated text."""

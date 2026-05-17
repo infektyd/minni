@@ -52,6 +52,15 @@ class FAISSIndex:
         """Import faiss with graceful fallback."""
         try:
             import faiss
+            if not hasattr(faiss, "IndexFlatIP"):
+                logger.warning(
+                    "faiss module is importable but incomplete (%s). "
+                    "Falling back to numpy brute-force search.",
+                    getattr(faiss, "__file__", None)
+                    or getattr(faiss, "__path__", "<unknown location>"),
+                )
+                self._faiss = None
+                return
             self._faiss = faiss
         except ImportError:
             logger.warning(

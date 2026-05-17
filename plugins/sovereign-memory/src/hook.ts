@@ -14,9 +14,12 @@ import {
 import type { EnvelopeEvent } from "./agent_envelope.js";
 import { routeMemoryIntent } from "./policy.js";
 import {
+  ackHandoff,
   buildStatusReport,
   formatRecall,
+  listPendingHandoffs,
   recallMemory,
+  subscribeContradictions,
 } from "./sovereign.js";
 import { extractScarTissue, prepareOutcome } from "./task.js";
 import {
@@ -100,6 +103,18 @@ async function handleSessionStart(payload: Record<string, unknown>): Promise<Hoo
   });
   const pending = await readPendingInbox(CLAUDECODE_VAULT_PATH, 3);
   const handoffContext = await resolveInboxHandoffContext(CLAUDECODE_VAULT_PATH, pending);
+  const pendingHandoffs = await listPendingHandoffs({ agentId: CLAUDECODE_AGENT_ID });
+  const pendingHandoffData = pendingHandoffs.ok && pendingHandoffs.data
+    ? pendingHandoffs.data as { handoffs?: Array<{ lease_id?: string; leaseId?: string }> }
+    : { handoffs: [] };
+  const ackedLeases: string[] = [];
+  for (const handoff of pendingHandoffData.handoffs ?? []) {
+    const leaseId = handoff.lease_id ?? handoff.leaseId;
+    if (!leaseId) continue;
+    const ack = await ackHandoff({ leaseId, status: "accepted" });
+    if (ack.ok) ackedLeases.push(leaseId);
+  }
+  const contradictions = await subscribeContradictions({ agentId: CLAUDECODE_AGENT_ID });
 
   const envelope = wrapEnvelope({
     event: "SessionStart",
@@ -128,6 +143,11 @@ async function handleSessionStart(payload: Record<string, unknown>): Promise<Hoo
         path: snippet.relativePath,
         snippet: snippet.snippet,
       })),
+      handoff_acks: ackedLeases,
+      stale_beliefs:
+        contradictions.ok && contradictions.data
+          ? contradictions.data
+          : { ok: false, error: contradictions.error },
       recall:
         recall.ok && recall.data
           ? {
