@@ -2,7 +2,16 @@ import { createHash } from "node:crypto";
 import { DEFAULT_AGENT_ID, DEFAULT_VAULT_PATH, DEFAULT_WORKSPACE_ID } from "./config.js";
 import { prepareTask } from "./task.js";
 import type { PreparedTaskPacket, PrepareTaskInput, TaskProfile } from "./task.js";
+import { harvestEvidence } from "./team-harvest.js";
+import type { HarvestDeps, HarvestedLearning } from "./team-harvest.js";
+import { findRepeatedAgents } from "./team-repetition.js";
+import type { RepeatedAgentSuggestion } from "./team-repetition.js";
+import { bootstrapApprenticeVault } from "./team-vault-bootstrap.js";
 import { recordAudit } from "./vault.js";
+
+export const DEFAULT_TEAM_TTL_SECONDS = 86400;
+export const MIN_TEAM_TTL_SECONDS = 60;
+export const MAX_TEAM_TTL_SECONDS = 7 * 24 * 3600;
 
 export type TeamAgentRole = "explorer" | "worker" | "reviewer" | "scribe";
 export type TeamPermission = "read" | "write" | "test" | "network" | "memory-recall";
@@ -71,6 +80,10 @@ export interface TeamRuntimePacket {
     durableWrites: "explicit-only";
     publicGitBoundary: string[];
   };
+  createdAt: string;
+  expiresAt: string;
+  ttlSeconds: number;
+  repeatedAgentSuggestions: RepeatedAgentSuggestion[];
   contextMarkdown: string;
 }
 
@@ -84,11 +97,16 @@ export interface BuildTeamRuntimeInput {
   limit?: number;
   includeVault?: boolean;
   useAfm?: boolean;
+  ttlSeconds?: number;
+  repetitionLookbackDays?: number;
+  repetitionMinRepeats?: number;
 }
 
 export interface TeamRuntimeDeps {
   prepare?: typeof prepareTask;
   audit?: typeof recordAudit;
+  now?: () => Date;
+  findRepeated?: typeof findRepeatedAgents;
 }
 
 export interface TeamAgentResultInput {
@@ -105,6 +123,10 @@ export interface BuildEvidenceReportInput {
   task: string;
   runtimeId?: string;
   results: TeamAgentResultInput[];
+  // vaultPath is required by buildTeamEvidencePacketWithHarvest; ignored by the sync packet builder.
+  vaultPath?: string;
+  runtime?: TeamRuntimePacket;
+  now?: () => Date;
 }
 
 export interface EvidenceReport {
@@ -135,6 +157,11 @@ export interface TeamEvidencePacket {
   unresolvedBlockers: string[];
   doNotStore: string[];
   contextMarkdown: string;
+  harvestedLearnings?: HarvestedLearning[];
+  // Tri-state: undefined = not checked, false = checked and fresh, true = checked and expired.
+  runtimeExpired?: boolean;
+  expiredRuntimeId?: string;
+  expiredAt?: string;
 }
 
 export interface PermanentAgentProfile extends Omit<TemporaryAgentProfile, "lifetime" | "memoryPolicy" | "promotionRule"> {
@@ -157,6 +184,9 @@ export interface TeamPromotionInput {
   requestedPermissions?: TeamPermission[];
   approved?: boolean;
   permanentAgentId?: string;
+  bootstrapVault?: boolean;
+  sovereignRoot?: string;
+  seedInbox?: Array<{ slug: string; payload: Record<string, unknown> }>;
 }
 
 export interface TeamPromotionPacket {
@@ -171,6 +201,11 @@ export interface TeamPromotionPacket {
   };
   nextStep: string;
   contextMarkdown: string;
+  apprenticeVaultPath?: string;
+}
+
+export interface BuildTeamPromotionDeps {
+  bootstrap?: typeof bootstrapApprenticeVault;
 }
 
 const DEFAULT_TEAM: TeamAgentRequest[] = [
@@ -271,11 +306,13 @@ function instructionsFor(profile: TemporaryAgentProfile): string[] {
 }
 
 function teamContextMarkdown(packet: Omit<TeamRuntimePacket, "contextMarkdown">): string {
-  return [
+  const sections = [
     "# Sovereign Team Runtime",
     `Runtime: ${packet.runtimeId}`,
     `Task: ${packet.task}`,
     `Coordinator: ${packet.coordinatorAgentId}`,
+    `Created: ${packet.createdAt}`,
+    `Expires: ${packet.expiresAt}`,
     "## Temporary Profiles",
     packet.temporaryProfiles
       .map((profile) => `- ${profile.agentId} (${profile.role}) ${profile.focus}`)
@@ -288,7 +325,22 @@ function teamContextMarkdown(packet: Omit<TeamRuntimePacket, "contextMarkdown">)
     packet.gates.map((item) => `- ${item}`).join("\n"),
     "## Non-goals",
     packet.nonGoals.map((item) => `- ${item}`).join("\n"),
-  ].join("\n\n");
+  ];
+  if (packet.repeatedAgentSuggestions.length > 0) {
+    sections.push(
+      "## Repeated Agent Patterns",
+      packet.repeatedAgentSuggestions
+        .map((suggestion) => {
+          const earliest = suggestion.examples[0];
+          const earliestAgent = earliest?.agentId ?? "unknown";
+          const earliestTimestamp = earliest?.timestamp ?? "unknown";
+          const promotion = suggestion.suggestPromotion ? "yes" : "no";
+          return `- ${suggestion.signature} — observed ${suggestion.count} times (${earliestAgent} at ${earliestTimestamp}); promotion candidate: ${promotion}`;
+        })
+        .join("\n"),
+    );
+  }
+  return sections.join("\n\n");
 }
 
 async function buildPreparedTeamRuntime(
@@ -298,6 +350,7 @@ async function buildPreparedTeamRuntime(
   if (!input.task.trim()) throw new Error("team runtime requires task.");
   const prepare = deps.prepare ?? prepareTask;
   const audit = deps.audit ?? recordAudit;
+  const now = deps.now ?? (() => new Date());
   const vaultPath = input.vaultPath ?? DEFAULT_VAULT_PATH;
   const workspaceId = input.workspaceId ?? DEFAULT_WORKSPACE_ID;
   const coordinatorAgentId = input.coordinatorAgentId ?? DEFAULT_AGENT_ID;
@@ -305,6 +358,10 @@ async function buildPreparedTeamRuntime(
   const temporaryProfiles = normalizeAgents(input.agents);
   const taskLedger = ledgerFor(input.task, temporaryProfiles);
   const runtimeId = stableId("team", `${workspaceId}:${coordinatorAgentId}:${input.task}:${temporaryProfiles.map((agent) => agent.agentId).join(",")}`);
+  const ttlSeconds = Math.max(MIN_TEAM_TTL_SECONDS, Math.min(input.ttlSeconds ?? DEFAULT_TEAM_TTL_SECONDS, MAX_TEAM_TTL_SECONDS));
+  const createdAtDate = now();
+  const createdAt = createdAtDate.toISOString();
+  const expiresAt = new Date(createdAtDate.getTime() + ttlSeconds * 1000).toISOString();
 
   const hydrationPackets = await Promise.all(
     temporaryProfiles.map(async (agent) => {
@@ -331,6 +388,35 @@ async function buildPreparedTeamRuntime(
     }),
   );
 
+  // audit MUST run before findRepeated so the just-spawned runtime is included
+  // in the lookback window. A 3rd repetition correctly tips into "promote" on
+  // its own spawn (rather than only being noticed on the 4th). Do not reorder.
+  await audit(vaultPath, {
+    tool: "sovereign_team_runtime",
+    summary: input.task.slice(0, 120),
+    details: {
+      runtimeId,
+      coordinatorAgentId,
+      workspaceId,
+      agents: temporaryProfiles.map((agent) => ({ agentId: agent.agentId, role: agent.role, focus: agent.focus })),
+      automaticLearning: false,
+    },
+  });
+
+  // Best-effort: repetition computation must never break runtime building.
+  let repeatedAgentSuggestions: RepeatedAgentSuggestion[] = [];
+  try {
+    const finder = deps.findRepeated ?? findRepeatedAgents;
+    repeatedAgentSuggestions = await finder({
+      vaultPath,
+      now: createdAtDate,
+      lookbackDays: input.repetitionLookbackDays,
+      minRepeats: input.repetitionMinRepeats,
+    });
+  } catch {
+    repeatedAgentSuggestions = [];
+  }
+
   const packet: Omit<TeamRuntimePacket, "contextMarkdown"> = {
     runtimeId,
     task: input.task,
@@ -355,19 +441,11 @@ async function buildPreparedTeamRuntime(
       durableWrites: "explicit-only",
       publicGitBoundary: PUBLIC_GIT_BOUNDARY,
     },
+    createdAt,
+    expiresAt,
+    ttlSeconds,
+    repeatedAgentSuggestions,
   };
-
-  await audit(vaultPath, {
-    tool: "sovereign_team_runtime",
-    summary: input.task.slice(0, 120),
-    details: {
-      runtimeId,
-      coordinatorAgentId,
-      workspaceId,
-      agents: temporaryProfiles.map((agent) => ({ agentId: agent.agentId, role: agent.role })),
-      automaticLearning: false,
-    },
-  });
 
   return {
     ...packet,
@@ -698,11 +776,37 @@ function promotionFor(report: EvidenceReport): PromotionCandidate {
   };
 }
 
+function checkRuntimeExpiration(
+  runtime: TeamRuntimePacket | undefined,
+  now: Date,
+): { expired: true; blocker: string; expiredRuntimeId: string; expiredAt: string } | undefined {
+  if (!runtime) return undefined;
+  const expiresDate = new Date(runtime.expiresAt);
+  if (now <= expiresDate) return undefined;
+  return {
+    expired: true,
+    expiredRuntimeId: runtime.runtimeId,
+    expiredAt: runtime.expiresAt,
+    blocker: `Runtime ${runtime.runtimeId} expired at ${runtime.expiresAt} (now ${now.toISOString()}); evidence ignored for promotion.`,
+  };
+}
+
 function evidenceContextMarkdown(packet: Omit<TeamEvidencePacket, "contextMarkdown">): string {
-  return [
+  const sections = [
     "# Sovereign Team Evidence",
     packet.runtimeId ? `Runtime: ${packet.runtimeId}` : "Runtime: unspecified",
     `Task: ${packet.task}`,
+  ];
+  if (packet.runtimeExpired === true && packet.expiredRuntimeId && packet.expiredAt) {
+    sections.push(
+      "## Expiration",
+      [
+        `Runtime ${packet.expiredRuntimeId} expired at ${packet.expiredAt}.`,
+        "Evidence was ignored for promotion; gather fresh runtime evidence before retrying.",
+      ].join("\n"),
+    );
+  }
+  sections.push(
     "## Reports",
     packet.reports
       .map((report) => `- ${report.agentId}: ${report.status}/${report.evidenceStatus} - ${report.summary}`)
@@ -713,7 +817,17 @@ function evidenceContextMarkdown(packet: Omit<TeamEvidencePacket, "contextMarkdo
       .join("\n"),
     "## Do Not Store",
     packet.doNotStore.map((item) => `- ${item}`).join("\n"),
-  ].join("\n\n");
+  );
+  const writtenLearnings = packet.harvestedLearnings?.filter((learning) => learning.source === "afm") ?? [];
+  if (writtenLearnings.length > 0) {
+    sections.push(
+      "## Harvested Candidates",
+      writtenLearnings
+        .map((learning) => `- ${learning.agentId}: ${learning.candidateText} (inbox: ${learning.inboxFilePath ?? "unknown"})`)
+        .join("\n"),
+    );
+  }
+  return sections.join("\n\n");
 }
 
 export function buildTeamEvidencePacket(input: BuildEvidenceReportInput): TeamEvidencePacket {
@@ -736,20 +850,76 @@ export function buildTeamEvidencePacket(input: BuildEvidenceReportInput): TeamEv
       risks: risksForEvidence(result, status),
     };
   });
+  let promotionCandidates = reports.map(promotionFor);
+  const unresolvedBlockers = reports.flatMap((report) => report.blockers.map((blocker) => `${report.agentId}: ${blocker}`));
+  const expiration = checkRuntimeExpiration(input.runtime, input.now?.() ?? new Date());
+  let runtimeExpired: boolean | undefined;
+  let expiredRuntimeId: string | undefined;
+  let expiredAt: string | undefined;
+  if (input.runtime) {
+    runtimeExpired = expiration !== undefined;
+    if (expiration) {
+      promotionCandidates = [];
+      unresolvedBlockers.push(expiration.blocker);
+      expiredRuntimeId = expiration.expiredRuntimeId;
+      expiredAt = expiration.expiredAt;
+    }
+  }
   const packet: Omit<TeamEvidencePacket, "contextMarkdown"> = {
     runtimeId: input.runtimeId,
     task: input.task,
     reports,
-    promotionCandidates: reports.map(promotionFor),
-    unresolvedBlockers: reports.flatMap((report) => report.blockers.map((blocker) => `${report.agentId}: ${blocker}`)),
+    promotionCandidates,
+    unresolvedBlockers,
     doNotStore: [
       "Do not store raw transcripts, private local logs, adapter artifacts, database contents, secrets, or unsanitized local paths.",
       "Do not promote temporary profiles without explicit operator approval.",
     ],
+    runtimeExpired,
+    expiredRuntimeId,
+    expiredAt,
   };
   return {
     ...packet,
     contextMarkdown: evidenceContextMarkdown(packet),
+  };
+}
+
+export async function buildTeamEvidencePacketWithHarvest(
+  input: BuildEvidenceReportInput,
+  deps?: HarvestDeps,
+): Promise<TeamEvidencePacket> {
+  if (!input.vaultPath || !input.vaultPath.trim()) {
+    throw new Error("team evidence harvest requires vaultPath.");
+  }
+  const packet = buildTeamEvidencePacket(input);
+  // Skip harvest entirely when the runtime is expired so stale evidence cannot pollute the inbox.
+  const harvestedLearnings: HarvestedLearning[] = packet.runtimeExpired === true
+    ? []
+    : await harvestEvidence(
+        {
+          task: input.task,
+          vaultPath: input.vaultPath,
+          runtimeId: input.runtimeId,
+          reports: input.results,
+        },
+        deps,
+      );
+  const next: Omit<TeamEvidencePacket, "contextMarkdown"> = {
+    runtimeId: packet.runtimeId,
+    task: packet.task,
+    reports: packet.reports,
+    promotionCandidates: packet.promotionCandidates,
+    unresolvedBlockers: packet.unresolvedBlockers,
+    doNotStore: packet.doNotStore,
+    harvestedLearnings,
+    runtimeExpired: packet.runtimeExpired,
+    expiredRuntimeId: packet.expiredRuntimeId,
+    expiredAt: packet.expiredAt,
+  };
+  return {
+    ...next,
+    contextMarkdown: evidenceContextMarkdown(next),
   };
 }
 
@@ -770,7 +940,7 @@ function normalizeRequestedPermissions(agent: TemporaryAgentProfile, requested?:
 }
 
 function promotionContextMarkdown(packet: Omit<TeamPromotionPacket, "contextMarkdown">): string {
-  return [
+  const sections = [
     "# Sovereign Team Promotion Review",
     `Temporary agent: ${packet.temporaryProfile.agentId}`,
     `Status: ${packet.status}`,
@@ -785,10 +955,30 @@ function promotionContextMarkdown(packet: Omit<TeamPromotionPacket, "contextMark
     packet.status === "needs-approval"
       ? "Promotion requires explicit operator approval before a permanent profile is drafted."
       : "This is a promoted draft only. Review and persist through the approved durable-memory path if desired.",
-  ].join("\n\n");
+  ];
+  if (packet.apprenticeVaultPath) {
+    sections.push(
+      "## Apprentice Vault Bootstrap",
+      [
+        `- **Path:** ${packet.apprenticeVaultPath}`,
+        "- **Status:** initialized",
+        "- **Next step:** Begin populating wiki/ with the apprentice's confirmed learnings.",
+      ].join("\n"),
+    );
+  }
+  return sections.join("\n\n");
 }
 
-export function buildTeamPromotionPacket(input: TeamPromotionInput): TeamPromotionPacket {
+/**
+ * Async because the optional apprentice-vault bootstrap performs FS writes
+ * when the 4-condition gate is satisfied (approved + bootstrapVault +
+ * promoted-draft + sovereignRoot). When bootstrap is gated off, the function
+ * still returns a Promise but performs no I/O.
+ */
+export async function buildTeamPromotionPacket(
+  input: TeamPromotionInput,
+  deps: BuildTeamPromotionDeps = {},
+): Promise<TeamPromotionPacket> {
   const requestedPermissions = normalizeRequestedPermissions(input.agent, input.requestedPermissions);
   const delta = permissionDelta(input.agent.permissions, requestedPermissions);
   const approved = input.approved === true && input.evidence.recommended === true;
@@ -810,16 +1000,49 @@ export function buildTeamPromotionPacket(input: TeamPromotionInput): TeamPromoti
         },
       }
     : undefined;
+
+  const status: TeamPromotionPacket["status"] = permanentProfile ? "promoted-draft" : "needs-approval";
+  let nextStep = permanentProfile
+    ? "Human review and persist through an explicit durable profile write if this permanent agent should exist."
+    : "Get explicit operator approval before drafting or persisting a permanent profile.";
+
+  let apprenticeVaultPath: string | undefined;
+  // Only bootstrap when explicitly approved AND opted-in AND we actually drafted a promotion.
+  if (
+    input.approved === true &&
+    input.bootstrapVault === true &&
+    status === "promoted-draft" &&
+    permanentProfile
+  ) {
+    if (!input.sovereignRoot) {
+      // Surface the missing-input as guidance without throwing — the review packet remains valuable.
+      nextStep = `${nextStep} Bootstrap skipped: sovereignRoot was required.`;
+    } else {
+      try {
+        const bootstrap = deps.bootstrap ?? bootstrapApprenticeVault;
+        const result = await bootstrap({
+          sovereignRoot: input.sovereignRoot,
+          permanentAgentId: permanentProfile.agentId,
+          profile: permanentProfile,
+          seedInbox: input.seedInbox,
+        });
+        apprenticeVaultPath = result.vaultPath;
+      } catch {
+        // Best-effort: bootstrap failure must not invalidate the promotion review packet.
+        // Operator can retry by calling bootstrapApprenticeVault directly.
+      }
+    }
+  }
+
   const packet: Omit<TeamPromotionPacket, "contextMarkdown"> = {
-    status: permanentProfile ? "promoted-draft" : "needs-approval",
+    status,
     autoWrite: false,
     temporaryProfile: input.agent,
     evidence: input.evidence,
     permanentProfile,
     permissionDelta: delta,
-    nextStep: permanentProfile
-      ? "Human review and persist through an explicit durable profile write if this permanent agent should exist."
-      : "Get explicit operator approval before drafting or persisting a permanent profile.",
+    nextStep,
+    apprenticeVaultPath,
   };
   return {
     ...packet,

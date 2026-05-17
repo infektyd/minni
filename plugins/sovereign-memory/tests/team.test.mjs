@@ -1,7 +1,15 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { buildTeamEvidencePacket, buildTeamPromotionPacket, buildTeamRuntime } from "../dist/team.js";
+import {
+  DEFAULT_TEAM_TTL_SECONDS,
+  MAX_TEAM_TTL_SECONDS,
+  MIN_TEAM_TTL_SECONDS,
+  buildTeamEvidencePacket,
+  buildTeamEvidencePacketWithHarvest,
+  buildTeamPromotionPacket,
+  buildTeamRuntime,
+} from "../dist/team.js";
 
 function fakePreparedTask(input) {
   return {
@@ -46,6 +54,7 @@ test("buildTeamRuntime creates temporary agent profiles, task ledger, and hydrat
       audit: async (_vaultPath, entry) => {
         audits.push(entry);
       },
+      findRepeated: async () => [],
     },
   );
 
@@ -68,6 +77,88 @@ test("buildTeamRuntime creates temporary agent profiles, task ledger, and hydrat
   assert.match(packet.contextMarkdown, /Sovereign Team Runtime/);
   assert.equal(prepareCalls.length, 3);
   assert.equal(audits[0].tool, "sovereign_team_runtime");
+  // Task 3: audit detail now records focus per agent so repetition signatures can be derived later.
+  assert.equal(audits[0].details.agents[0].focus, "Map prior decisions.");
+  assert.equal(audits[0].details.agents[1].focus, "Implement runtime.");
+  assert.equal(audits[0].details.agents[2].focus, "Review privacy and tests.");
+  assert.deepEqual(packet.repeatedAgentSuggestions, []);
+});
+
+test("buildTeamRuntime attaches repeatedAgentSuggestions from findRepeated and renders them", async () => {
+  const stubSuggestions = [
+    {
+      signature: "worker::audit swift concurrency",
+      role: "worker",
+      normalizedFocus: "audit swift concurrency",
+      count: 4,
+      examples: [
+        {
+          runtimeId: "team-old",
+          timestamp: "2026-04-30T10:00:00.000Z",
+          agentId: "team-worker-1",
+          rawFocus: "Audit Swift concurrency",
+        },
+      ],
+      suggestPromotion: true,
+    },
+  ];
+  let findRepeatedCalls = 0;
+  const packet = await buildTeamRuntime(
+    {
+      task: "Repetition wiring",
+      vaultPath: "/tmp/vault",
+    },
+    {
+      prepare: async (input) => fakePreparedTask(input),
+      audit: async () => undefined,
+      findRepeated: async () => {
+        findRepeatedCalls += 1;
+        return stubSuggestions;
+      },
+    },
+  );
+
+  assert.equal(findRepeatedCalls, 1);
+  assert.deepEqual(packet.repeatedAgentSuggestions, stubSuggestions);
+  assert.match(packet.contextMarkdown, /## Repeated Agent Patterns/);
+  assert.match(packet.contextMarkdown, /worker::audit swift concurrency/);
+  assert.match(packet.contextMarkdown, /observed 4 times/);
+  assert.match(packet.contextMarkdown, /promotion candidate: yes/);
+});
+
+test("buildTeamRuntime omits Repeated Agent Patterns section when no suggestions", async () => {
+  const packet = await buildTeamRuntime(
+    {
+      task: "No repetitions",
+      vaultPath: "/tmp/vault",
+    },
+    {
+      prepare: async (input) => fakePreparedTask(input),
+      audit: async () => undefined,
+      findRepeated: async () => [],
+    },
+  );
+  assert.deepEqual(packet.repeatedAgentSuggestions, []);
+  assert.equal(packet.contextMarkdown.includes("## Repeated Agent Patterns"), false);
+});
+
+test("buildTeamRuntime never breaks when findRepeated throws", async () => {
+  const packet = await buildTeamRuntime(
+    {
+      task: "Resilient against repetition failure",
+      vaultPath: "/tmp/vault",
+    },
+    {
+      prepare: async (input) => fakePreparedTask(input),
+      audit: async () => undefined,
+      findRepeated: async () => {
+        throw new Error("repetition computation exploded");
+      },
+    },
+  );
+  assert.deepEqual(packet.repeatedAgentSuggestions, []);
+  assert.equal(packet.contextMarkdown.includes("## Repeated Agent Patterns"), false);
+  assert.ok(packet.runtimeId.startsWith("team-"));
 });
 
 test("buildTeamRuntime defaults to a complete explorer, worker, reviewer team", async () => {
@@ -140,8 +231,8 @@ test("buildTeamEvidencePacket makes promotion candidates human-review only", () 
   assert.match(packet.contextMarkdown, /Promotion Candidates/);
 });
 
-test("buildTeamPromotionPacket drafts permanent profiles only after explicit approval", () => {
-  const pending = buildTeamPromotionPacket({
+test("buildTeamPromotionPacket drafts permanent profiles only after explicit approval", async () => {
+  const pending = await buildTeamPromotionPacket({
     agent: {
       agentId: "team-worker-2",
       role: "worker",
@@ -168,7 +259,7 @@ test("buildTeamPromotionPacket drafts permanent profiles only after explicit app
   assert.equal(pending.permanentProfile, undefined);
   assert.match(pending.contextMarkdown, /requires explicit operator approval/i);
 
-  const approved = buildTeamPromotionPacket({
+  const approved = await buildTeamPromotionPacket({
     agent: pending.temporaryProfile,
     evidence: pending.evidence,
     requestedPermissions: ["read", "write", "test", "memory-recall", "network"],
@@ -182,4 +273,315 @@ test("buildTeamPromotionPacket drafts permanent profiles only after explicit app
   assert.equal(approved.permanentProfile.lifetime, "permanent");
   assert.ok(approved.permissionDelta.added.includes("network"));
   assert.match(approved.nextStep, /review and persist/i);
+});
+
+function makePromotionTemporaryProfile() {
+  return {
+    agentId: "team-worker-2",
+    role: "worker",
+    focus: "Implement scoped backend changes.",
+    ownership: ["src/team.ts"],
+    permissions: ["read", "write", "test", "memory-recall"],
+    memoryPolicy: { recall: "allowed", learn: "manual-only", vaultWrites: "manual-only" },
+    lifetime: "temporary",
+    promotionRule: "Promote only after completed evidence, repeatable value, and explicit operator approval.",
+  };
+}
+
+function makePromotionEvidence() {
+  return {
+    agentId: "team-worker-2",
+    recommended: true,
+    score: 5,
+    reasons: ["submitted evidence plus verification"],
+    nextStep: "Eligible for human review; do not promote automatically.",
+  };
+}
+
+test("buildTeamPromotionPacket: bootstrap NOT called when approved is false", async () => {
+  let bootstrapCalled = false;
+  const packet = await buildTeamPromotionPacket(
+    {
+      agent: makePromotionTemporaryProfile(),
+      evidence: makePromotionEvidence(),
+      approved: false,
+      bootstrapVault: true,
+      sovereignRoot: "/x",
+    },
+    {
+      bootstrap: async () => {
+        bootstrapCalled = true;
+        throw new Error("must not be called");
+      },
+    },
+  );
+  assert.equal(bootstrapCalled, false);
+  assert.equal(packet.apprenticeVaultPath, undefined);
+  assert.equal(packet.contextMarkdown.includes("## Apprentice Vault Bootstrap"), false);
+});
+
+test("buildTeamPromotionPacket: bootstrap NOT called when bootstrapVault is false", async () => {
+  let bootstrapCalled = false;
+  const packet = await buildTeamPromotionPacket(
+    {
+      agent: makePromotionTemporaryProfile(),
+      evidence: makePromotionEvidence(),
+      approved: true,
+      bootstrapVault: false,
+      sovereignRoot: "/x",
+    },
+    {
+      bootstrap: async () => {
+        bootstrapCalled = true;
+        throw new Error("must not be called");
+      },
+    },
+  );
+  assert.equal(bootstrapCalled, false);
+  assert.equal(packet.status, "promoted-draft");
+  assert.equal(packet.apprenticeVaultPath, undefined);
+});
+
+test("buildTeamPromotionPacket: bootstrap NOT called when sovereignRoot is missing; nextStep mentions skip", async () => {
+  let bootstrapCalled = false;
+  const packet = await buildTeamPromotionPacket(
+    {
+      agent: makePromotionTemporaryProfile(),
+      evidence: makePromotionEvidence(),
+      approved: true,
+      bootstrapVault: true,
+    },
+    {
+      bootstrap: async () => {
+        bootstrapCalled = true;
+        throw new Error("must not be called");
+      },
+    },
+  );
+  assert.equal(bootstrapCalled, false);
+  assert.equal(packet.apprenticeVaultPath, undefined);
+  assert.match(packet.nextStep, /Bootstrap skipped: sovereignRoot was required\./);
+});
+
+test("buildTeamPromotionPacket: bootstrap CALLED when all conditions met; markdown includes section", async () => {
+  let receivedInput;
+  const packet = await buildTeamPromotionPacket(
+    {
+      agent: makePromotionTemporaryProfile(),
+      evidence: makePromotionEvidence(),
+      approved: true,
+      bootstrapVault: true,
+      sovereignRoot: "/x",
+      permanentAgentId: "foo",
+    },
+    {
+      bootstrap: async (input) => {
+        receivedInput = input;
+        return { vaultPath: "/x/agents/foo-vault", bootstrapped: true, filesCreated: [] };
+      },
+    },
+  );
+  assert.equal(packet.apprenticeVaultPath, "/x/agents/foo-vault");
+  assert.equal(receivedInput.permanentAgentId, "foo");
+  assert.equal(receivedInput.sovereignRoot, "/x");
+  assert.equal(receivedInput.profile.lifetime, "permanent");
+  assert.match(packet.contextMarkdown, /## Apprentice Vault Bootstrap/);
+  assert.match(packet.contextMarkdown, /\/x\/agents\/foo-vault/);
+});
+
+test("buildTeamPromotionPacket: bootstrap throw is swallowed", async () => {
+  const packet = await buildTeamPromotionPacket(
+    {
+      agent: makePromotionTemporaryProfile(),
+      evidence: makePromotionEvidence(),
+      approved: true,
+      bootstrapVault: true,
+      sovereignRoot: "/x",
+    },
+    {
+      bootstrap: async () => {
+        throw new Error("disk full");
+      },
+    },
+  );
+  assert.equal(packet.status, "promoted-draft");
+  assert.equal(packet.apprenticeVaultPath, undefined);
+  assert.equal(packet.contextMarkdown.includes("## Apprentice Vault Bootstrap"), false);
+});
+
+const FIXED_NOW_ISO = "2026-05-08T22:30:00.000Z";
+const FIXED_NOW_MS = Date.parse(FIXED_NOW_ISO);
+
+function fixedClock(iso = FIXED_NOW_ISO) {
+  return () => new Date(iso);
+}
+
+async function buildRuntimeAt(iso, overrides = {}) {
+  return buildTeamRuntime(
+    {
+      task: "Lifecycle test",
+      vaultPath: "/tmp/vault",
+      ...overrides,
+    },
+    {
+      prepare: async (input) => fakePreparedTask(input),
+      audit: async () => undefined,
+      now: fixedClock(iso),
+    },
+  );
+}
+
+test("buildTeamRuntime defaults TTL to 24h and stamps createdAt + expiresAt", async () => {
+  const packet = await buildRuntimeAt(FIXED_NOW_ISO);
+
+  assert.equal(packet.createdAt, FIXED_NOW_ISO);
+  assert.equal(packet.ttlSeconds, DEFAULT_TEAM_TTL_SECONDS);
+  assert.equal(packet.expiresAt, new Date(FIXED_NOW_MS + DEFAULT_TEAM_TTL_SECONDS * 1000).toISOString());
+  assert.match(packet.contextMarkdown, new RegExp(`Created: ${FIXED_NOW_ISO}`));
+  assert.match(packet.contextMarkdown, new RegExp(`Expires: ${packet.expiresAt}`));
+});
+
+test("buildTeamRuntime accepts a custom ttlSeconds", async () => {
+  const packet = await buildRuntimeAt(FIXED_NOW_ISO, { ttlSeconds: 3600 });
+  assert.equal(packet.ttlSeconds, 3600);
+  assert.equal(packet.expiresAt, new Date(FIXED_NOW_MS + 3600 * 1000).toISOString());
+});
+
+test("buildTeamRuntime clamps ttlSeconds below the floor up to MIN_TEAM_TTL_SECONDS", async () => {
+  const packet = await buildRuntimeAt(FIXED_NOW_ISO, { ttlSeconds: MIN_TEAM_TTL_SECONDS - 30 });
+  assert.equal(packet.ttlSeconds, MIN_TEAM_TTL_SECONDS);
+  assert.equal(packet.expiresAt, new Date(FIXED_NOW_MS + MIN_TEAM_TTL_SECONDS * 1000).toISOString());
+});
+
+test("buildTeamRuntime clamps ttlSeconds above the ceiling down to MAX_TEAM_TTL_SECONDS", async () => {
+  const packet = await buildRuntimeAt(FIXED_NOW_ISO, { ttlSeconds: 999_999_999 });
+  assert.equal(packet.ttlSeconds, MAX_TEAM_TTL_SECONDS);
+  assert.equal(packet.expiresAt, new Date(FIXED_NOW_MS + MAX_TEAM_TTL_SECONDS * 1000).toISOString());
+});
+
+test("buildTeamEvidencePacket without a runtime emits promotion candidates and no expiration blocker", () => {
+  const packet = buildTeamEvidencePacket({
+    task: "Implement runtime",
+    results: [
+      {
+        agentId: "worker",
+        status: "completed",
+        summary: "Did it.",
+        evidence: ["a", "b"],
+        changedFiles: ["x.ts"],
+        verification: ["npm test"],
+      },
+    ],
+  });
+
+  assert.equal(packet.runtimeExpired, undefined);
+  assert.equal(packet.expiredRuntimeId, undefined);
+  assert.equal(packet.expiredAt, undefined);
+  assert.ok(packet.promotionCandidates.length > 0);
+  assert.ok(!packet.unresolvedBlockers.some((entry) => entry.includes("expired")));
+  assert.ok(!packet.contextMarkdown.includes("## Expiration"));
+});
+
+test("buildTeamEvidencePacket with a fresh runtime marks runtimeExpired === false", async () => {
+  const runtime = await buildRuntimeAt(FIXED_NOW_ISO, { ttlSeconds: 3600 });
+  const packet = buildTeamEvidencePacket({
+    task: "Implement runtime",
+    runtime,
+    now: fixedClock("2026-05-08T22:45:00.000Z"),
+    results: [
+      {
+        agentId: "worker",
+        status: "completed",
+        summary: "Did it.",
+        evidence: ["a", "b"],
+        changedFiles: ["x.ts"],
+        verification: ["npm test"],
+      },
+    ],
+  });
+
+  assert.equal(packet.runtimeExpired, false);
+  assert.equal(packet.expiredRuntimeId, undefined);
+  assert.equal(packet.expiredAt, undefined);
+  assert.ok(packet.promotionCandidates.length > 0);
+  assert.ok(!packet.unresolvedBlockers.some((entry) => entry.includes("expired")));
+  assert.ok(!packet.contextMarkdown.includes("## Expiration"));
+});
+
+test("buildTeamEvidencePacket with an expired runtime suppresses promotion and adds a blocker", async () => {
+  const runtime = await buildRuntimeAt(FIXED_NOW_ISO, { ttlSeconds: 3600 });
+  const oneSecondPastExpiry = new Date(Date.parse(runtime.expiresAt) + 1000).toISOString();
+  const packet = buildTeamEvidencePacket({
+    task: "Implement runtime",
+    runtime,
+    now: fixedClock(oneSecondPastExpiry),
+    results: [
+      {
+        agentId: "worker",
+        status: "completed",
+        summary: "Did it.",
+        evidence: ["a", "b"],
+        changedFiles: ["x.ts"],
+        verification: ["npm test"],
+      },
+    ],
+  });
+
+  assert.equal(packet.runtimeExpired, true);
+  assert.equal(packet.expiredRuntimeId, runtime.runtimeId);
+  assert.equal(packet.expiredAt, runtime.expiresAt);
+  assert.equal(packet.promotionCandidates.length, 0);
+  const expirationBlocker = packet.unresolvedBlockers.find((entry) => entry.includes("expired"));
+  assert.ok(expirationBlocker, "expected an expiration blocker");
+  assert.match(
+    expirationBlocker,
+    new RegExp(`Runtime ${runtime.runtimeId} expired at ${runtime.expiresAt} \\(now ${oneSecondPastExpiry}\\); evidence ignored for promotion\\.`),
+  );
+  assert.match(packet.contextMarkdown, /## Expiration/);
+  assert.ok(packet.contextMarkdown.includes(runtime.runtimeId));
+});
+
+test("buildTeamEvidencePacketWithHarvest refuses to harvest when runtime expired", async () => {
+  const runtime = await buildRuntimeAt(FIXED_NOW_ISO, { ttlSeconds: 3600 });
+  const oneSecondPastExpiry = new Date(Date.parse(runtime.expiresAt) + 1000).toISOString();
+  let harvestCalled = false;
+  const callAfm = async () => {
+    harvestCalled = true;
+    throw new Error("harvest must not be invoked when runtime expired");
+  };
+  const writeInbox = async () => {
+    harvestCalled = true;
+    throw new Error("harvest must not be invoked when runtime expired");
+  };
+  const audit = async () => {
+    harvestCalled = true;
+    throw new Error("harvest must not be invoked when runtime expired");
+  };
+
+  const packet = await buildTeamEvidencePacketWithHarvest(
+    {
+      task: "Implement runtime",
+      vaultPath: "/tmp/vault",
+      runtime,
+      now: fixedClock(oneSecondPastExpiry),
+      results: [
+        {
+          agentId: "worker",
+          status: "completed",
+          summary: "Did it.",
+          evidence: ["a", "b"],
+          changedFiles: ["x.ts"],
+          verification: ["npm test"],
+        },
+      ],
+    },
+    { callAfm, writeInbox, audit },
+  );
+
+  assert.equal(harvestCalled, false, "harvest deps must not be called when runtime expired");
+  assert.equal(packet.runtimeExpired, true);
+  assert.deepEqual(packet.harvestedLearnings, []);
+  assert.equal(packet.promotionCandidates.length, 0);
+  assert.ok(packet.unresolvedBlockers.some((entry) => entry.includes("expired")));
+  assert.match(packet.contextMarkdown, /## Expiration/);
 });

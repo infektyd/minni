@@ -217,7 +217,7 @@ server.registerTool(
     },
   },
   async ({ agent, evidence, requestedPermissions, approved, permanentAgentId }) => {
-    const packet = buildTeamPromotionPacket({ agent, evidence, requestedPermissions, approved, permanentAgentId });
+    const packet = await buildTeamPromotionPacket({ agent, evidence, requestedPermissions, approved, permanentAgentId });
     return textResult(JSON.stringify(packet, null, 2));
   },
 );
