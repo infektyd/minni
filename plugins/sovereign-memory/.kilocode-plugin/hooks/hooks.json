@@ -1,0 +1,42 @@
+{
+  "SessionStart": [
+    {
+      "hooks": [
+        {
+          "type": "command",
+          "command": "node ${KILO_PLUGIN_ROOT}/dist/hook.js SessionStart"
+        }
+      ]
+    }
+  ],
+  "UserPromptSubmit": [
+    {
+      "hooks": [
+        {
+          "type": "command",
+          "command": "node ${KILO_PLUGIN_ROOT}/dist/hook.js UserPromptSubmit"
+        }
+      ]
+    }
+  ],
+  "PreCompact": [
+    {
+      "hooks": [
+        {
+          "type": "command",
+          "command": "node ${KILO_PLUGIN_ROOT}/dist/hook.js PreCompact"
+        }
+      ]
+    }
+  ],
+  "Stop": [
+    {
+      "hooks": [
+        {
+          "type": "command",
+          "command": "node ${KILO_PLUGIN_ROOT}/dist/hook.js Stop"
+        }
+      ]
+    }
+  ]
+}
