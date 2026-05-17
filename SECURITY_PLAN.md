@@ -268,3 +268,64 @@ Plus a manual:
 - 2026-04-26 — Initial broad audit produced SEC-001..SEC-009.
 - 2026-04-26 — Second-pass review added SEC-010..SEC-018 and cloud-sync hygiene.
 - 2026-04-26 — Plan trimmed to marketable-minimum scope: 10 must-fix + 4 must-document, rest deferred to v2. Rationale: this is a single-user local tool; v1 hardening must close embarrassing-to-demo issues and back the marketing claims, not deliver enterprise audit posture.
+- 2026-05-02 — Deep audit addendum added SEC-019..SEC-022 for cross-agent information requests. Implemented a vault-backed request/approval contract in the TypeScript plugin; cryptographic principal binding remains a future remote/multi-user requirement.
+
+## 2026-05-02 Deep Audit Addendum — Cross-Agent Request Contracts
+
+### Threat Model Update
+
+- Asset: agent-owned vaults, private recalled memory, cross-agent handoff/request metadata, audit logs, local daemon socket, and browser-reachable console endpoints.
+- Attacker: prompt-injected model output, a lower-trust local process that can call plugin/daemon surfaces, or a compromised/over-eager agent attempting to get another agent's private context.
+- Deployment posture: localhost/local-first, single-user macOS by default. If exposed on LAN or public internet, this plan is incomplete and auth must be added first.
+- Trust boundaries: model text to MCP tool arguments, MCP plugin to daemon socket, browser to local UI bridge, vault markdown to model context, and one runtime agent principal to another.
+- Agent boundary concerns: runtime identity is still mostly environment/config stamped; display names in prompts remain insufficient. Cross-agent information must flow through attributed inbox/outbox contracts, never direct private memory reads.
+
+### Findings
+
+#### SEC-019 — Direct handoff delivery bypasses recipient consent (HIGH)
+
+**Where:** `plugins/sovereign-memory/src/server.ts`, `plugins/sovereign-memory/src/sovereign.ts`, `engine/sovrd.py`
+
+**What it is:** `sovereign_negotiate_handoff` and `daemon.handoff` can deliver a packet into a recipient inbox without a recipient-side approval decision. It is attributed and audited, but still operates as delivery, not consent.
+
+**Why it matters here:** The product goal is model-agnostic, scale-agnostic memory sharing. Without a consent gate, one agent can push context at another and increase prompt-injection or memory-poisoning risk.
+
+**How to fix:** Add a separate request lifecycle where the requester can ask for information but cannot receive content until the recipient approves or denies under its own runtime principal. Keep direct handoff for handoff envelopes, not private information retrieval.
+
+**Status:** Done in the TypeScript plugin via `sovereign_ping_agent_request`, `sovereign_ping_agent_inbox`, `sovereign_ping_agent_decide`, and `sovereign_ping_agent_status`.
+
+#### SEC-020 — Cross-agent requests need replay and lifecycle state (MEDIUM)
+
+**Where:** `plugins/sovereign-memory/src/agent_ping.ts`
+
+**What it is:** Cross-agent requests need stable IDs, nonces, TTLs, terminal statuses, and audit entries. Otherwise a stale or duplicated request can be approved later without context.
+
+**Why it matters here:** Local-first does not remove replay risk; stale JSON in an inbox/outbox can be re-read by an online agent or copied by another process.
+
+**How to fix:** Persist a pseudo-contract with `pending`, `approved`, `denied`, and `expired` states; reject decisions on anything other than `pending`; include TTL and nonce; sync both sender and recipient copies.
+
+**Status:** Done for plugin-level request contracts.
+
+#### SEC-021 — Agent identity is config-stamped but not cryptographically authenticated (MEDIUM)
+
+**Where:** `plugins/sovereign-memory/src/config.ts`, `plugins/sovereign-memory/src/agent_ping.ts`, `engine/sovrd.py`
+
+**What it is:** The implementation stamps the active principal from environment/config, not from a cryptographic session credential. That is appropriate for the current single-user local plugin, but insufficient for LAN/public or multi-user deployment.
+
+**Why it matters here:** Model-agnostic and scale-agnostic implies future agents and possibly multiple runtimes. A caller that can start the plugin with another `SOVEREIGN_*_AGENT_ID` can impersonate that principal.
+
+**How to fix:** Before remote/multi-user use, add per-agent local capabilities or signed session credentials and reject decisions whose credential does not bind to the recipient principal.
+
+**Status:** Remaining risk; documented as local-only assumption.
+
+#### SEC-022 — Browser UI remains read/prepare only (INFO)
+
+**Where:** `plugins/sovereign-memory/src/ui-server.ts`, `plugins/sovereign-memory/tests/ui-server.test.mjs`
+
+**What it is:** The browser console does not expose learn, vault-write, or the new agent-ping decision endpoints.
+
+**Why it matters here:** Local web pages and extensions can try to hit loopback services. Keeping approval and memory-sharing tools on MCP/stdin reduces drive-by browser risk.
+
+**How to fix:** Preserve the current local-origin checks and avoid adding decision endpoints to the browser bridge without CSRF/session auth.
+
+**Status:** Verified by existing UI tests and unchanged by this addendum.

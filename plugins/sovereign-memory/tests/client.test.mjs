@@ -5,7 +5,18 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { buildStatusReport, compileVault, formatRecall, jsonRpcSocketRequest, parseSovrdJson } from "../dist/sovereign.js";
+import {
+  ackHandoff,
+  awaitHandoff,
+  buildStatusReport,
+  compileVault,
+  drillMemory,
+  exportContextPack,
+  formatRecall,
+  listPendingHandoffs,
+  parseSovrdJson,
+  subscribeContradictions,
+} from "../dist/sovereign.js";
 
 test("parseSovrdJson accepts healthy JSON responses", () => {
   assert.deepEqual(parseSovrdJson('{"status":"ok","agent":"shared-daemon"}'), {
@@ -81,46 +92,29 @@ test("compileVault sends daemon.compile JSON-RPC with dry-run default", async ()
   assert.equal(calls[0].params.dry_run, true);
 });
 
-test("jsonRpcSocketRequest speaks line-delimited JSON-RPC over Unix sockets", async () => {
-  const root = await mkdtemp(path.join(tmpdir(), "sm-jsonrpc-socket-"));
-  const socketPath = path.join(root, "sovrd.sock");
-  const seen = [];
-  const server = net.createServer((socket) => {
-    let data = "";
-    socket.on("data", (chunk) => {
-      data += chunk.toString("utf8");
-      if (!data.includes("\n")) return;
-      const request = JSON.parse(data.split("\n")[0]);
-      seen.push(request);
-      socket.write(JSON.stringify({
-        jsonrpc: "2.0",
-        id: request.id,
-        result: {
-          daemon: { socket_path: socketPath },
-          engine: { db_ok: true },
-        },
-      }) + "\n");
-    });
-  });
+test("new memory RPC helpers send expected JSON-RPC methods", async () => {
+  const calls = [];
+  const requester = async (_socketPath, method, params) => {
+    calls.push({ method, params });
+    return { ok: true, data: { method, params } };
+  };
 
-  try {
-    await new Promise((resolve, reject) => {
-      server.once("error", reject);
-      server.listen(socketPath, resolve);
-    });
+  await drillMemory({ resultIds: [1], depth: "chunk" }, requester);
+  await exportContextPack({ query: "q", budgetTokens: 100, cacheKey: "k" }, requester);
+  await ackHandoff({ leaseId: "lease", status: "accepted" }, requester);
+  await listPendingHandoffs({ agentId: "codex" }, requester);
+  await awaitHandoff({ leaseId: "lease", timeoutMs: 1 }, requester);
+  await subscribeContradictions({ agentId: "codex", sinceTs: 123 }, requester);
 
-    const result = await jsonRpcSocketRequest(socketPath, "status", {});
-
-    assert.equal(result.ok, true);
-    assert.deepEqual(result.data, {
-      daemon: { socket_path: socketPath },
-      engine: { db_ok: true },
-    });
-    assert.equal(seen[0].jsonrpc, "2.0");
-    assert.equal(seen[0].method, "status");
-    assert.deepEqual(seen[0].params, {});
-  } finally {
-    await new Promise((resolve) => server.close(resolve));
-    await rm(root, { recursive: true, force: true });
-  }
+  assert.deepEqual(calls.map((call) => call.method), [
+    "sm_drill",
+    "sm_export_pack",
+    "sovereign_ack_handoff",
+    "sovereign_list_pending_handoffs",
+    "sovereign_await_handoff",
+    "sovereign_subscribe_contradictions",
+  ]);
+  assert.deepEqual(calls[0].params.result_ids, [1]);
+  assert.equal(calls[1].params.cache_key, "k");
+  assert.equal(calls[2].params.lease_id, "lease");
 });

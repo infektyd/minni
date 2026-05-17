@@ -10,9 +10,7 @@ Covers:
 import os
 import sqlite3
 import sys
-import tempfile
 import threading
-import importlib
 
 import pytest
 
@@ -78,7 +76,6 @@ class TestMigrationsRunner:
 
         # Reset module-level flag before test (it may have been set by other tests)
         import db as db_mod
-        import migrations as mig_mod
 
         old_flag = db_mod._migrations_run
         db_mod._migrations_run = False  # force re-run

@@ -242,10 +242,96 @@ export async function handoffMemory(input: {
   });
 }
 
+export async function drillMemory(
+  input: {
+    resultIds?: number[];
+    chunkIds?: number[];
+    depth?: "snippet" | "chunk" | "document";
+  },
+  requester: JsonRpcRequester = jsonRpcSocketRequest,
+): Promise<JsonResult> {
+  return jsonRpcSocketRequestWithFallbackRequester("sm_drill", {
+    result_ids: input.resultIds,
+    chunk_ids: input.chunkIds,
+    depth: input.depth ?? "snippet",
+  }, requester);
+}
+
+export async function exportContextPack(
+  input: {
+    query: string;
+    budgetTokens: number;
+    cacheKey: string;
+    agentId?: string;
+    workspaceId?: string;
+  },
+  requester: JsonRpcRequester = jsonRpcSocketRequest,
+): Promise<JsonResult> {
+  return jsonRpcSocketRequestWithFallbackRequester("sm_export_pack", {
+    query: input.query,
+    budget_tokens: input.budgetTokens,
+    cache_key: input.cacheKey,
+    agent_id: input.agentId,
+    workspace_id: input.workspaceId,
+  }, requester);
+}
+
+export async function ackHandoff(
+  input: {
+    leaseId: string;
+    status: "accepted" | "rejected_stale" | "rejected_contradicts" | "rejected_scope";
+    contradictsId?: number;
+  },
+  requester: JsonRpcRequester = jsonRpcSocketRequest,
+): Promise<JsonResult> {
+  return jsonRpcSocketRequestWithFallbackRequester("sovereign_ack_handoff", {
+    lease_id: input.leaseId,
+    status: input.status,
+    contradicts_id: input.contradictsId,
+  }, requester);
+}
+
+export async function listPendingHandoffs(
+  input: { agentId: string },
+  requester: JsonRpcRequester = jsonRpcSocketRequest,
+): Promise<JsonResult> {
+  return jsonRpcSocketRequestWithFallbackRequester("sovereign_list_pending_handoffs", {
+    agent_id: input.agentId,
+  }, requester);
+}
+
+export async function awaitHandoff(
+  input: { leaseId: string; timeoutMs?: number },
+  requester: JsonRpcRequester = jsonRpcSocketRequest,
+): Promise<JsonResult> {
+  return jsonRpcSocketRequestWithFallbackRequester("sovereign_await_handoff", {
+    lease_id: input.leaseId,
+    timeout_ms: input.timeoutMs,
+  }, requester);
+}
+
+export async function subscribeContradictions(
+  input: { agentId: string; sinceTs?: number },
+  requester: JsonRpcRequester = jsonRpcSocketRequest,
+): Promise<JsonResult> {
+  return jsonRpcSocketRequestWithFallbackRequester("sovereign_subscribe_contradictions", {
+    agent_id: input.agentId,
+    since_ts: input.sinceTs,
+  }, requester);
+}
+
 async function jsonRpcSocketRequestWithFallback(method: string, params: Record<string, unknown>): Promise<JsonResult> {
+  return jsonRpcSocketRequestWithFallbackRequester(method, params, jsonRpcSocketRequest);
+}
+
+async function jsonRpcSocketRequestWithFallbackRequester(
+  method: string,
+  params: Record<string, unknown>,
+  requester: JsonRpcRequester,
+): Promise<JsonResult> {
   let last: JsonResult = { ok: false, error: "No socket attempted" };
   for (const socketPath of jsonRpcSocketCandidates()) {
-    last = await jsonRpcSocketRequest(socketPath, method, params);
+    last = await requester(socketPath, method, params);
     if (last.ok) return last;
   }
   return last;
