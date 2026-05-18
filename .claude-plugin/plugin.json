@@ -6,6 +6,6 @@
     "name": "Sovereign Memory"
   },
   "license": "Apache-2.0",
-  "homepage": "https://github.com/Infektyd/sovereignMemory",
+  "homepage": "https://github.com/infektyd/sovereign-memory",
   "keywords": ["sovereign-memory", "memory", "mcp", "local-only"]
 }
