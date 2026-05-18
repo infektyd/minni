@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
+import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import test from "node:test";
 
 import { buildAfmChatPayload, prepareOutcome, callAfmPrepareTask, prepareTask } from "../dist/task.js";
@@ -161,6 +164,27 @@ test("AFM payload omits blocked and private sources while keeping safe source re
   assert.doesNotMatch(body, /api key secret/);
 });
 
+test("AFM payload includes native provider metadata without adapter paths", () => {
+  const payload = buildAfmChatPayload({
+    task: "prepare native provider context",
+    profile: "compact",
+    provider: {
+      mode: "native",
+      backend: "apple-foundation-models",
+      availability: "available",
+      adapterConfigured: true,
+      adapterPath: "/Users/alice/private/extractor.fmadapter",
+    },
+  });
+  const body = JSON.stringify(payload);
+
+  assert.match(body, /AFM provider: native/);
+  assert.match(body, /backend=apple-foundation-models/);
+  assert.match(body, /adapterConfigured=true/);
+  assert.doesNotMatch(body, /\/Users\/alice/);
+  assert.doesNotMatch(body, /extractor\.fmadapter/);
+});
+
 test("prepareOutcome returns a dry-run outcome packet without audit or learning writes", async () => {
   const packet = await prepareOutcome(
     {
@@ -269,6 +293,91 @@ test("prepareTask uses AFM distillation when requested and available", async () 
   assert.equal(packet.relevantSources[0].relativePath, "wiki/sessions/backend-handoff.md");
 });
 
+test("prepareTask uses native AFM provider metadata when native mode is requested", async () => {
+  const packet = await prepareTask(
+    {
+      task: "plan native AFM adapter wiring",
+      vaultPath: "/tmp/vault",
+      useAfm: true,
+      afmProviderMode: "native",
+    },
+    {
+      searchVault: async () => [vaultMatch],
+      recall: async () => ({ ok: true, data: { results: "daemon lead" } }),
+      afmHealth: async () => ({
+        ok: true,
+        data: {
+          backend: "apple-foundation-models",
+          availability: "available",
+          adapter: "/Users/alice/private/extractor.fmadapter",
+          status: "ok",
+        },
+      }),
+      afmPrepare: async (_url, payload) => {
+        assert.equal(payload.provider.mode, "native");
+        assert.equal(payload.provider.backend, "apple-foundation-models");
+        assert.equal(payload.provider.availability, "available");
+        assert.equal(payload.provider.adapterConfigured, true);
+        assert.equal(payload.provider.adapterPath, undefined);
+        return {
+          ok: true,
+          data: {
+            brief: "Native AFM adapter distilled brief.",
+          },
+        };
+      },
+      audit: async () => "/tmp/vault/logs/today.md",
+    },
+  );
+
+  assert.equal(packet.mode, "afm");
+  assert.equal(packet.afm.used, true);
+  assert.equal(packet.afm.provider, "native");
+  assert.equal(packet.afm.backend, "apple-foundation-models");
+  assert.equal(packet.afm.adapterConfigured, true);
+  assert.equal(packet.afm.adapterPath, undefined);
+  assert.equal(packet.brief, "Native AFM adapter distilled brief.");
+});
+
+test("prepareTask does not call native AFM when shared provider health is unavailable", async () => {
+  const packet = await prepareTask(
+    {
+      task: "plan native AFM adapter wiring",
+      vaultPath: "/tmp/vault",
+      useAfm: true,
+      afmProviderMode: "native",
+    },
+    {
+      searchVault: async () => [],
+      recall: async () => ({ ok: true, data: { results: "daemon lead" } }),
+      afmHealth: async () => ({
+        ok: false,
+        data: {
+          backend: "apple-foundation-models",
+          availability: "unavailable",
+          adapter: "/Users/alice/private/extractor.fmadapter",
+          status: "error",
+        },
+        error: "FoundationModels unavailable at /Users/alice/private/extractor.fmadapter",
+      }),
+      afmPrepare: async () => {
+        throw new Error("native provider must not be called when resolver marks it unavailable");
+      },
+      audit: async () => "/tmp/vault/logs/today.md",
+    },
+  );
+
+  const body = JSON.stringify(packet);
+  assert.equal(packet.mode, "deterministic");
+  assert.equal(packet.afm.used, false);
+  assert.equal(packet.afm.provider, "native");
+  assert.equal(packet.afm.requestedProvider, "native");
+  assert.equal(packet.afm.adapterConfigured, true);
+  assert.match(packet.afm.error ?? "", /FoundationModels unavailable/);
+  assert.doesNotMatch(body, /\/Users\/alice/);
+  assert.doesNotMatch(body, /extractor\.fmadapter/);
+});
+
 test("prepareTask falls back when AFM distillation fails", async () => {
   const packet = await prepareTask(
     {
@@ -335,5 +444,61 @@ test("callAfmPrepareTask parses v0 chat-completions JSON content", async () => {
     assert.deepEqual(result.data.recommendedNextActions, ["Run live test"]);
   } finally {
     await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test("prepareTask native provider uses the configured native helper", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-native-prepare-"));
+  const helper = path.join(root, "helper.mjs");
+  const previousHelper = process.env.SOVEREIGN_AFM_NATIVE_HELPER;
+  await writeFile(
+    helper,
+    [
+      "#!/usr/bin/env node",
+      "let raw = '';",
+      "process.stdin.setEncoding('utf8');",
+      "process.stdin.on('data', chunk => raw += chunk);",
+      "process.stdin.on('end', () => {",
+      "  const request = JSON.parse(raw);",
+      "  if (request.operation !== 'prepare_task') process.exit(2);",
+      "  console.log(JSON.stringify({ ok: true, data: { brief: `native helper: ${request.input.task}` } }));",
+      "});",
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+  await chmod(helper, 0o755);
+  process.env.SOVEREIGN_AFM_NATIVE_HELPER = helper;
+  try {
+    const packet = await prepareTask(
+      {
+        task: "test native provider over FoundationModels helper",
+        useAfm: true,
+        afmProviderMode: "native",
+        afmPrepareUrl: "http://127.0.0.1:1/v1/chat/completions",
+        vaultPath: "/tmp/vault",
+      },
+      {
+        searchVault: async () => [],
+        recall: async () => ({ ok: true, data: { results: "daemon lead" } }),
+        afmHealth: async () => ({
+          ok: true,
+          data: {
+            backend: "apple-foundation-models",
+            availability: "available",
+            status: "ok",
+          },
+        }),
+        audit: async () => "/tmp/vault/logs/today.md",
+      },
+    );
+
+    assert.equal(packet.mode, "afm");
+    assert.equal(packet.afm.provider, "native");
+    assert.equal(packet.brief, "native helper: test native provider over FoundationModels helper");
+  } finally {
+    if (previousHelper === undefined) delete process.env.SOVEREIGN_AFM_NATIVE_HELPER;
+    else process.env.SOVEREIGN_AFM_NATIVE_HELPER = previousHelper;
+    await rm(root, { recursive: true, force: true });
   }
 });

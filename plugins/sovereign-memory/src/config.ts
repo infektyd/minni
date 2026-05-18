@@ -12,7 +12,8 @@ export const DEFAULT_VAULT_PATH =
   path.join(os.homedir(), ".sovereign-memory", "codex-vault");
 
 export const SOCKET_PATH =
-  process.env.SOVEREIGN_SOCKET_PATH ?? "/tmp/sovereign.sock";
+  process.env.SOVEREIGN_SOCKET_PATH ??
+  path.join(os.homedir(), ".sovereign-memory", "run", "sovrd.sock");
 
 export const AFM_HEALTH_URL =
   process.env.SOVEREIGN_AFM_HEALTH_URL ?? "http://127.0.0.1:11437/health";
@@ -22,6 +23,23 @@ export const AFM_PREPARE_TASK_URL =
 
 export const AFM_PREPARE_TASK_MODEL =
   process.env.SOVEREIGN_AFM_PREPARE_TASK_MODEL ?? "apple-foundation-models";
+
+// G13 (SEC-004): explicit operator allowlist for non-loopback AFM targets.
+// Comma-separated hosts (e.g. "192.168.1.10,afm.internal"). Loopback (127.0.0.1,localhost,::1) always allowed.
+// If a non-local target is configured without being listed, callAfmJson will deny with structured error.
+export const AFM_ALLOWED_TARGETS: string[] = (process.env.SOVEREIGN_AFM_ALLOWED_TARGETS || "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+export type AFM_PROVIDER_MODE = "auto" | "bridge" | "native" | "off";
+
+function parseAfmProviderMode(value: string | undefined): AFM_PROVIDER_MODE {
+  return value === "auto" || value === "native" || value === "off" ? value : "bridge";
+}
+
+export const AFM_PROVIDER_MODE =
+  parseAfmProviderMode(process.env.SOVEREIGN_AFM_PROVIDER_MODE);
 
 export const DEFAULT_AGENT_ID =
   process.env.SOVEREIGN_AGENT_ID ??

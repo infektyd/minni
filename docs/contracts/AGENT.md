@@ -33,6 +33,7 @@ Custom agents use any string that does not begin with `identity:` (reserved).
 project or repository context. Agents with the same `agent_id` in different
 workspaces are treated as separate recall pools. Until `workspace_id` is
 promoted to a first-class field, workspace scoping is encoded in the vault path.
+(PLANNED — G11 / PR-3)
 
 ### Reserved identity layer
 

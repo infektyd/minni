@@ -177,14 +177,21 @@ packet that lets an agent resume safely.
 The Python engine lives in [engine/](engine/).
 
 - [engine/sovrd.py](engine/sovrd.py) exposes the local JSON-RPC daemon.
-- [engine/sovereign_memory.py](engine/sovereign_memory.py) exposes CLI commands
-  for indexing, stats, hygiene, vector status, and compile dry-runs.
-- [engine/db.py](engine/db.py) owns schema creation and migrations. Migrations
-  are additive and tracked by name plus `PRAGMA user_version`.
-- [engine/retrieval.py](engine/retrieval.py) combines FTS5, semantic vectors,
-  reranking, feedback, query expansion, HyDE, token budgets, and trace capture.
-- [engine/afm_passes/](engine/afm_passes/) contains the self-organization
-  passes. They default to dry-run and degrade cleanly when unavailable.
+- [engine/sovereign_memory.py](engine/sovereign_memory.py) exposes CLI commands for indexing, stats, hygiene,
+  vector status, and AFM compile dry-runs.
+- [engine/db.py](engine/db.py) owns schema creation and migrations. Migrations are additive and
+  tracked by name plus `PRAGMA user_version`.
+- [engine/retrieval.py](engine/retrieval.py) combines FTS5, semantic vectors, reranking, feedback, query
+  expansion, HyDE, token budgets, and trace capture.
+- [engine/afm_provider.py](engine/afm_provider.py) selects the opt-in AFM provider for retrieval helpers.
+  `SOVEREIGN_AFM_PROVIDER_MODE=bridge` preserves the localhost OpenAI-compatible bridge,
+  `native` uses [engine/native_afm_helper](engine/native_afm_helper), `auto`
+  prefers native and falls back to the bridge, and `off` skips AFM calls.
+- [engine/afm_passes/](engine/afm_passes/) contains the self-organization passes. They default to dry-run
+  and degrade cleanly when AFM is unavailable.
+
+SQLite is the durable runtime truth. Vault pages, graph exports, FAISS files,
+and plugin context packs are derived or review surfaces.
 
 ## Plugin Surfaces
 
@@ -237,6 +244,15 @@ Install Python dependencies for the engine:
 cd engine
 python3 -m pip install -r requirements.txt
 ```
+For reproducible NumPy/FAISS (avoids partial installs on bleeding-edge Python):
+use a clean venv with Python 3.11 or 3.12:
+```bash
+python3.12 -m venv .venv
+source .venv/bin/activate
+pip install --upgrade pip
+pip install -r engine/requirements.txt
+# then: python -m pytest -q engine/   (or cd engine && python -m pytest -q .)
+```
 
 Run the daemon:
 
@@ -260,6 +276,22 @@ cd engine
 SOVEREIGN_AFM_LOOP=on python3 -m sovereign_memory compile --pass session_distillation --dry-run
 SOVEREIGN_AFM_LOOP=on python3 -m sovereign_memory compile --pass synthesis --dry-run
 ```
+
+Use native Foundation Models for opt-in retrieval helpers when the local macOS 26
+SDK/runtime and Apple Intelligence model are available:
+
+```bash
+cd engine
+SOVEREIGN_AFM_PROVIDER_MODE=native python3 -c 'from query_expand import expand; print(expand("AFM recall", mode="afm"))'
+```
+
+The native helper speaks a local JSON contract and returns structured data for
+query expansion, neighborhood summaries, and HyDE probes. If Foundation Models is
+unavailable, the helper reports `native_unavailable`; retrieval degrades instead
+of writing memory or accepting drafts.
+
+Future adapter configuration is reported as boolean metadata only through
+`adapter_configured` / `adapterConfigured`; private adapter paths are not emitted.
 
 Build and test the plugin:
 

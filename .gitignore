@@ -101,9 +101,35 @@ htmlcov/
 .env
 .env.*
 !.env.example
+.cursor/
 .claude/
 .cursor/
 .DS_Store
 ._*
 .idea/
 .vscode/
+
+# Root-level local vault/runtime files
+/inbox/
+/outbox/
+/raw/
+/wiki/
+/.kilo/
+/.obsidian/
+/faiss/
+/index.md
+/log.md
+
+# Reports and generated documents
+reports/
+*.docx
+*.pages
+
+# Ignored artifacts
+output/reports/
+*.npz
+claudecode-vault/
+!claudecode-vault/
+claudecode-vault/*
+!claudecode-vault/schema/
+!claudecode-vault/schema/AGENTS.md
