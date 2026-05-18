@@ -483,6 +483,8 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
             "sovereign_prepare_outcome",
             "sovereign_status",
             "sovereign_audit_tail",
+            "sovereign_candidates",
+            "sovereign_resolve_candidate",
             "deep_research_plan",
             "deep_research_run",
             "deep_research_status",
@@ -516,6 +518,41 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         }
         const body = await readJsonBody(req);
         sendJson(res, 200, redactLocalValue(await outcomePrep(prepareOutcomeInput(body, vaultPath))));
+        return;
+      }
+      // G17: Candidates console API (minimal wiring for P1 approval pipeline)
+      if (req.method === "GET" && url.pathname === "/api/candidates") {
+        try {
+          const { jsonRpcSocketRequestWithFallback } = await import("./sovereign.js");
+          const limit = parseInt(url.searchParams.get("limit") || "50", 10);
+          const status = url.searchParams.get("status") || undefined;
+          const rpc = await jsonRpcSocketRequestWithFallback("list_candidates", {
+            limit: Math.min(limit, 200),
+            status,
+          });
+          sendJson(res, 200, redactLocalValue(rpc));
+        } catch (e) {
+          sendJson(res, 200, { candidates: [], error: String(e) });
+        }
+        return;
+      }
+      if (req.method === "POST" && url.pathname === "/api/resolve-candidate") {
+        if (!jsonContentTypeAllowed(req.headers["content-type"])) {
+          sendText(res, 415, "POST requests must use application/json.");
+          return;
+        }
+        const body = await readJsonBody(req);
+        try {
+          const { jsonRpcSocketRequestWithFallback } = await import("./sovereign.js");
+          const rpc = await jsonRpcSocketRequestWithFallback("resolve_candidate", {
+            candidate_id: body.candidate_id,
+            decision: body.decision,
+            reason: body.reason || body.resolution_reason || "",
+          });
+          sendJson(res, 200, redactLocalValue(rpc));
+        } catch (e) {
+          sendJson(res, 200, { status: "error", error: String(e) });
+        }
         return;
       }
       if (req.method === "GET" && url.pathname === "/api/deep-research/paths") {

@@ -101,6 +101,7 @@ def test_sovrd_learn_with_evidence_adds_derived_from_edges(tmp_path, monkeypatch
                     "content": "Daemon evidence learning",
                     "agent_id": "agent-b",
                     "evidence_doc_ids": [evidence_id],
+                    "force": True,
                 },
             }
         )

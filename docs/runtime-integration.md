@@ -60,3 +60,18 @@ sovereign-memory extract ./session.md --learn-agent hermes --durable-only
 
 This keeps extraction code usable while leaving model binaries, adapters,
 training data, and launchd configuration outside the repository.
+
+## Team Runtime
+
+The Codex/Claude/Kilo plugin exposes a coordinator-side Sovereign Team Runtime
+for temporary helper agents:
+
+- `sovereign_team_runtime` builds temporary profiles, a task ledger, hydration
+  packets, gates, and non-goals.
+- `sovereign_team_evidence` summarizes helper-agent reports and identifies
+  promotion candidates for human review.
+
+This layer is deliberately non-executing. It does not spawn agents, write
+durable learnings, promote profiles, or bypass cross-agent vault boundaries.
+Each hydration packet is derived from `sovereign_prepare_task`, so the same
+recall-only default and public repository boundary apply.

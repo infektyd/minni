@@ -4,7 +4,7 @@
       "hooks": [
         {
           "type": "command",
-          "command": "node ${KILO_PLUGIN_ROOT}/dist/hook.js SessionStart"
+          "command": "node ${KILO_PLUGIN_ROOT}/../dist/kilocode-hook.js SessionStart"
         }
       ]
     }
@@ -14,7 +14,7 @@
       "hooks": [
         {
           "type": "command",
-          "command": "node ${KILO_PLUGIN_ROOT}/dist/hook.js UserPromptSubmit"
+          "command": "node ${KILO_PLUGIN_ROOT}/../dist/kilocode-hook.js UserPromptSubmit"
         }
       ]
     }
@@ -24,7 +24,7 @@
       "hooks": [
         {
           "type": "command",
-          "command": "node ${KILO_PLUGIN_ROOT}/dist/hook.js PreCompact"
+          "command": "node ${KILO_PLUGIN_ROOT}/../dist/kilocode-hook.js PreCompact"
         }
       ]
     }
@@ -34,7 +34,7 @@
       "hooks": [
         {
           "type": "command",
-          "command": "node ${KILO_PLUGIN_ROOT}/dist/hook.js Stop"
+          "command": "node ${KILO_PLUGIN_ROOT}/../dist/kilocode-hook.js Stop"
         }
       ]
     }

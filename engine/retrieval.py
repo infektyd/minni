@@ -35,6 +35,10 @@ from faiss_index import FAISSIndex
 from query_expand import expand as expand_query
 from query_expand import summarize_with_afm
 
+# G19/G20/G22: read gate + evidence envelopes
+from principal import EffectivePrincipal, can_read_document  # type: ignore
+from safety import is_instruction_like
+
 logger = logging.getLogger("sovereign.retrieval")
 
 # Valid depth tiers for progressive disclosure.
@@ -1248,6 +1252,9 @@ class RetrievalEngine:
             if not text and result.get("doc_id") is not None:
                 text = self._fetch_full_document(result["doc_id"]) or ""
             links = self._extract_wiki_links(text)
+            if not links and result.get("doc_id") is not None:
+                text = self._fetch_full_document(result["doc_id"]) or ""
+                links = self._extract_wiki_links(text)
             if not links:
                 continue
             contexts = self._fetch_linked_context(links)
@@ -1285,6 +1292,9 @@ class RetrievalEngine:
         expand=True,
         summarize_neighborhood: bool = False,
         use_hyde: Optional[bool] = None,
+        # G19/G20/G22: principal for can_read_document gate + evidence envelope (default None = back-compat)
+        principal: Optional[EffectivePrincipal] = None,
+        workspace: str = "default",
     ) -> List[Dict]:
         """
         Hybrid retrieval: FTS5 + FAISS semantic, RRF fusion, cross-encoder re-rank,
@@ -1345,6 +1355,8 @@ class RetrievalEngine:
                     expand=False,
                     summarize_neighborhood=False,
                     use_hyde=use_hyde,
+                    principal=principal,
+                    workspace=workspace,
                 ))
             results = self._merge_expanded_results(per_variant, query_variants, limit)
             if summarize_neighborhood:
@@ -1574,9 +1586,10 @@ class RetrievalEngine:
                     logger.debug("HyDE skipped after retrieval pass: %s", exc)
                     trace["hyde"]["skipped"] = "error"
 
-        # Optional agent filter
-        if agent_id:
-            merged = [r for r in merged if r["agent"] == agent_id or r["agent"] == "unknown"]
+        # G19 gate (below, after status filter) is the single source of truth for visibility.
+        # The prior ad-hoc "agent_id or unknown" filter is removed; legacy principal=None
+        # paths get only the status/privacy filter (pre-G19 back-compat shape preserved for
+        # callers that never passed principal).
 
         merged = self._apply_feedback_demotions(merged, query, agent_id)
 
@@ -1605,6 +1618,41 @@ class RetrievalEngine:
                 filtered.append(r)
             merged = filtered
 
+        # G19/G20: ws always defined (hoisted) so G22 envelope loop and legacy principal=None
+        # paths never hit UnboundLocalError. Gate only when principal supplied.
+        ws = workspace or getattr(principal, "workspace_id", "default") if principal is not None else (workspace or "default")
+        if principal is not None:
+            merged = [r for r in merged if can_read_document(principal, ws, r)]
+
+        # G22: attach evidence-only envelope + instruction_like + provenance/reasoning to every result
+        # Model-facing content is always wrapped; raw executable instructions never treated as policy.
+        for r in merged:
+            txt = str(r.get("chunk_text") or r.get("full_document_text") or r.get("content") or "")
+            r["instruction_like"] = bool(is_instruction_like(txt))
+            vis = "authorized"
+            pid = getattr(principal, "agent_id", None) if principal else None
+            if r.get("agent") == pid:
+                vis = "same-agent"
+            elif str(r.get("page_type", "")).lower() in {"wiki", "handoff", "synthesis"}:
+                vis = "shared-wiki-authorized"
+            r["visibility"] = vis
+            r["reasoning"] = f"can_read_document(principal={pid or 'n/a'}, ws={ws}) passed"
+            # Safe wrapper (escape markdown hazards inside evidence)
+            safe = txt.replace("`", "\\`").replace("\n#", "\n\\#")
+            src = r.get("path") or r.get("source") or r.get("filename") or "?"
+            ag = r.get("agent", "?")
+            st = r.get("page_status", "?")
+            pr = r.get("privacy_level", "?")
+            sc = float(r.get("score") or 0)
+            r["evidence_envelope"] = (
+                f'<EVIDENCE source="{src}" agent="{ag}" status="{st}" privacy="{pr}" '
+                f'score="{sc:.3f}" instruction_like="{str(r["instruction_like"]).lower()}" '
+                f'visibility="{vis}">{safe}</EVIDENCE>'
+            )
+            # Primary text field becomes the envelope so downstream (sovrd JSON, agent_api, formatRecall) sees tagged evidence
+            if "chunk_text" in r:
+                r["chunk_text"] = r["evidence_envelope"]
+
         # Step 5: Context budgeting
         if budget_tokens:
             merged = self._budget_results(merged, query)
@@ -1616,7 +1664,6 @@ class RetrievalEngine:
 
         # Format output and update access counts
         import os
-        from safety import is_instruction_like
         from scoring import compute_confidence
         from rationale import explain
 
@@ -1781,6 +1828,9 @@ class RetrievalEngine:
         result_id: int,
         depth: str = "chunk",
         update_access: bool = True,
+        # G19: gate expand (called by _handle_expand which now stamps principal)
+        principal: Optional[EffectivePrincipal] = None,
+        workspace: str = "default",
     ) -> Optional[Dict]:
         """
         Re-fetch a specific result at a deeper depth tier.
@@ -1862,6 +1912,32 @@ class RetrievalEngine:
                        WHERE doc_id = ?""",
                     (time.time(), row["doc_id"]),
                 )
+
+        # G19: gate expand_result (foreign/private docs denied even on direct id)
+        if principal is not None:
+            ws = workspace or getattr(principal, "workspace_id", "default")
+            if not can_read_document(principal, ws, raw):
+                return None
+            # G22 envelope on expanded too
+            txt = str(raw.get("chunk_text") or raw.get("full_document_text") or "")
+            raw["instruction_like"] = bool(is_instruction_like(txt))
+            raw["visibility"] = "authorized-via-expand"
+            raw["reasoning"] = f"expand can_read_document passed for {getattr(principal,'agent_id','?')}"
+            # wrap (full 8-field construction to match retrieve G22 loop)
+            safe = txt.replace("`", "\\`").replace("\n#", "\n\\#")
+            src = raw.get("path", "?")
+            ag = raw.get("agent", "?")
+            st = raw.get("page_status", "?")
+            pr = raw.get("privacy_level", "?")
+            sc = float(raw.get("score") or 0)
+            il = str(raw.get("instruction_like", False)).lower()
+            vis = raw.get("visibility", "authorized-via-expand")
+            raw["evidence_envelope"] = (
+                f'<EVIDENCE source="{src}" agent="{ag}" status="{st}" privacy="{pr}" '
+                f'score="{sc:.3f}" instruction_like="{il}" visibility="{vis}">{safe}</EVIDENCE>'
+            )
+            if "chunk_text" in raw:
+                raw["chunk_text"] = raw["evidence_envelope"]
 
         return self._apply_depth(raw, depth)
 

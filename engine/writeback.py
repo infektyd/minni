@@ -24,6 +24,8 @@ from datetime import datetime
 
 import numpy as np
 
+# G09: SEC-018 frontmatter forgery guard helpers (repo-grounded, smallest addition)
+
 from config import SovereignConfig, DEFAULT_CONFIG
 from db import SovereignDB
 
@@ -394,6 +396,15 @@ class WriteBackMemory:
             filename = f"{dt.strftime('%Y%m%d_%H%M%S')}_{agent_id}_{category}.md"
             filepath = os.path.join(self.config.writeback_path, filename)
 
+            # G09 SEC-018: reject learn bodies containing bare --- lines or fenced code
+            # that could be misparsed as frontmatter when the file is later indexed.
+            if self._contains_forged_frontmatter(content):
+                logger.warning(
+                    "Writeback refused for learning #%d: content contains forged frontmatter fence (---) or fenced code (SEC-018)",
+                    learning_id,
+                )
+                return
+
             md_content = f"""---
 learning_id: {learning_id}
 agent: {agent_id}
@@ -411,6 +422,29 @@ created: {dt.isoformat()}
             logger.debug("Wrote learning to disk: %s", filepath)
         except Exception as e:
             logger.warning("Failed to write learning to disk: %s", e)
+
+    def _contains_forged_frontmatter(self, content: str) -> bool:
+        """Return True if content has a bare '---' line or a code fence containing one.
+        Prevents the written .md from having its frontmatter "re-forged" by body content.
+
+        NOTE (G09 / Issue 7): This is a heuristic and will refuse a *legitimate* fenced
+        code block that happens to contain a '---' line (e.g. a YAML example in docs).
+        The attack surface (learn body forging attribution) is considered higher priority
+        than occasional false-positive refusals on disk writeback. The DB learn still succeeds.
+        """
+        if not content or "---" not in content:
+            return False
+        for line in content.splitlines():
+            if line.strip() == "---":
+                return True
+        if "```" in content:
+            parts = content.split("```")
+            for i in range(1, len(parts), 2):
+                if "---" in parts[i]:
+                    for ln in parts[i].splitlines():
+                        if ln.strip() == "---":
+                            return True
+        return False
 
     def detect_contradictions(
         self,
@@ -510,6 +544,24 @@ created: {dt.isoformat()}
                 continue
 
         candidates.sort(key=lambda x: x["score"], reverse=True)
+
+        # G18: log every detected contradiction for audit + candidate surfacing
+        # (rows preserved; resolution_id wired on resolve_candidate)
+        try:
+            now = time.time()
+            for cand in candidates:
+                with self.db.cursor() as c:
+                    c.execute(
+                        """
+                        INSERT INTO contradiction_log
+                        (memory_a_id, memory_b_id, detected_at, detection_method)
+                        VALUES (?, ?, ?, ?)
+                        """,
+                        (cand.get("id"), None, now, "cosine"),
+                    )
+        except Exception as exc:
+            logger.debug("contradiction_log insert skipped (non-fatal): %s", exc)
+
         return candidates
 
     def get_stats(self) -> Dict:

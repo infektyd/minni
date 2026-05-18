@@ -70,8 +70,54 @@ test("buildStatusReport includes vault, socket, AFM, and audit state", async () 
     assert.equal(report.vault.exists, true);
     assert.equal(report.socket.ok, true);
     assert.equal(report.afm.ok, false);
+    assert.equal(report.afmProvider.provider, "bridge");
+    assert.equal(report.afmProvider.status, "bridge");
     assert.equal(report.audit.entries, 0);
   } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("buildStatusReport sanitizes AFM health and provider status paths", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-status-redact-"));
+  const previousHelper = process.env.SOVEREIGN_AFM_NATIVE_HELPER;
+  const previousAdapter = process.env.SOVEREIGN_AFM_ADAPTER_PATH;
+  process.env.SOVEREIGN_AFM_NATIVE_HELPER = path.join(root, "native-afm-helper");
+  process.env.SOVEREIGN_AFM_ADAPTER_PATH = "/Users/alice/private/extractor.fmadapter";
+  try {
+    const report = await buildStatusReport({
+      vaultPath: root,
+      socket: { ok: true, data: { status: "ok" } },
+      afmProviderMode: "native",
+      afm: {
+        ok: false,
+        data: {
+          backend: "apple-foundation-models",
+          availability: "unavailable",
+          status: "error",
+          adapter: "/Users/alice/private/extractor.fmadapter",
+          db: "/Users/alice/private/sovereign.db",
+          launchd: "/Users/alice/Library/LaunchAgents/com.example.plist",
+        },
+        error: "FoundationModels unavailable at /Users/alice/private/extractor.fmadapter",
+      },
+    });
+    const body = JSON.stringify(report);
+
+    assert.equal(report.afm.data.adapterConfigured, true);
+    assert.equal(report.afm.data.adapter, undefined);
+    assert.equal(report.afm.data.db, undefined);
+    assert.equal(report.afmProvider.adapterConfigured, true);
+    assert.equal(report.afmProvider.status, "native_unavailable");
+    assert.doesNotMatch(body, /\/Users\/alice/);
+    assert.doesNotMatch(body, /\.fmadapter/);
+    assert.doesNotMatch(body, /\.db/);
+    assert.doesNotMatch(body, /LaunchAgents/);
+  } finally {
+    if (previousHelper === undefined) delete process.env.SOVEREIGN_AFM_NATIVE_HELPER;
+    else process.env.SOVEREIGN_AFM_NATIVE_HELPER = previousHelper;
+    if (previousAdapter === undefined) delete process.env.SOVEREIGN_AFM_ADAPTER_PATH;
+    else process.env.SOVEREIGN_AFM_ADAPTER_PATH = previousAdapter;
     await rm(root, { recursive: true, force: true });
   }
 });

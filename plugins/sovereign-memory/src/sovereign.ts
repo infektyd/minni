@@ -3,7 +3,8 @@ import { request as httpsRequest } from "node:https";
 import { existsSync } from "node:fs";
 import net from "node:net";
 import { URL } from "node:url";
-import { AFM_HEALTH_URL, DEFAULT_AGENT_ID, DEFAULT_VAULT_PATH, DEFAULT_WORKSPACE_ID, SOCKET_PATH } from "./config.js";
+import { AFM_HEALTH_URL, AFM_PROVIDER_MODE, DEFAULT_AGENT_ID, DEFAULT_VAULT_PATH, DEFAULT_WORKSPACE_ID, SOCKET_PATH } from "./config.js";
+import { resolveAfmProvider, sanitizeAfmHealth, type AfmProviderMode, type AfmProviderResolution } from "./afm.js";
 import { auditTail, ensureVault, recordAudit, vaultExists } from "./vault.js";
 import type { VaultSearchResult } from "./vault.js";
 
@@ -22,6 +23,13 @@ export interface RecallResponse {
   backend_badge?: string;
 }
 
+export interface ReadContextResponse {
+  agent_id?: string;
+  context?: string;
+  backend?: string;
+  backend_badge?: string;
+}
+
 export interface StatusReport {
   vault: {
     path: string;
@@ -29,6 +37,7 @@ export interface StatusReport {
   };
   socket: JsonResult;
   afm: JsonResult;
+  afmProvider: AfmProviderResolution;
   audit: {
     entries: number;
     latest?: string;
@@ -161,6 +170,16 @@ export async function learnMemory(input: {
   const rpc = await jsonRpcSocketRequestWithFallback("learn", body);
   if (rpc.ok) return rpc;
   return socketRequest("POST", "/learn", body);
+}
+
+export async function readAgentContext(input: {
+  agentId?: string;
+  limit?: number;
+} = {}): Promise<JsonResult<ReadContextResponse>> {
+  return jsonRpcSocketRequestWithFallback("read", {
+    agent_id: input.agentId ?? DEFAULT_AGENT_ID,
+    limit: input.limit ?? 8,
+  }) as Promise<JsonResult<ReadContextResponse>>;
 }
 
 export type JsonRpcRequester = (socketPath: string, method: string, params: Record<string, unknown>) => Promise<JsonResult>;
@@ -303,7 +322,7 @@ export async function subscribeContradictions(
   }, requester);
 }
 
-async function jsonRpcSocketRequestWithFallback(method: string, params: Record<string, unknown>): Promise<JsonResult> {
+export async function jsonRpcSocketRequestWithFallback(method: string, params: Record<string, unknown>): Promise<JsonResult> {
   return jsonRpcSocketRequestWithFallbackRequester(method, params, jsonRpcSocketRequest);
 }
 
@@ -391,17 +410,23 @@ export async function buildStatusReport(input?: {
   vaultPath?: string;
   socket?: JsonResult;
   afm?: JsonResult;
+  afmProviderMode?: AfmProviderMode;
 }): Promise<StatusReport> {
   const vaultPath = input?.vaultPath ?? DEFAULT_VAULT_PATH;
   await ensureVault(vaultPath);
   const tail = await auditTail(vaultPath, 1);
+  const rawAfm = input?.afm ?? (await afmHealth());
   return {
     vault: {
       path: vaultPath,
       exists: await vaultExists(vaultPath),
     },
     socket: input?.socket ?? (await socketHealth()),
-    afm: input?.afm ?? (await afmHealth()),
+    afm: sanitizeAfmHealth(rawAfm),
+    afmProvider: resolveAfmProvider(input?.afmProviderMode ?? AFM_PROVIDER_MODE, {
+      nativeHelperPath: process.env.SOVEREIGN_AFM_NATIVE_HELPER,
+      health: rawAfm,
+    }),
     audit: {
       entries: tail.entries.length,
       latest: tail.entries.at(-1),

@@ -1,10 +1,10 @@
 # Sovereign Memory
 
-**Sovereign Memory is a local-first memory spine for AI agents.**
+**Sovereign Memory is a local-first memory and governance layer for AI agents.**
 
-It is not a chatbot, not a vector database wrapper, and not a claim that agents
-need mystical memory. It is an engineering experiment in making long-running
-agent work recoverable, inspectable, and falsifiable across sessions.
+It gives long-running agent work a durable spine: identity, working state,
+retrieval, evidence, handoffs, learning proposals, and audit trails that remain
+inspectable on the host machine.
 
 The core rule is simple:
 
@@ -12,7 +12,7 @@ The core rule is simple:
 
 Small identity and operating-state packets should be explicit enough to load in
 full. Large knowledge stores should be retrieved, cited, validated, and revised
-without pretending the whole archive is in context.
+without pretending the whole archive is already in context.
 
 ## The Problem
 
@@ -25,9 +25,9 @@ Long-running AI work usually falls into one of three brittle patterns:
 3. **Markdown/wiki notes only**: readable by humans, but weak at enforcing
    provenance, open-loop state, contradiction handling, and session rehydration.
 
-Sovereign Memory tries to sit between those approaches. It gives agents a local
-memory system with explicit state, typed evidence, reviewable learning, and
-portable context packs.
+Sovereign Memory sits between those approaches. It gives agents a local memory
+system with explicit state, typed evidence, reviewable learning, and portable
+context packs.
 
 ## The Thesis
 
@@ -51,20 +51,23 @@ For practical signals from long-running usage, see
 
 This repo currently contains:
 
-- A Python daemon for local recall, indexing, retrieval, migrations, audit, and
-  review-only compile passes.
-- A shared TypeScript MCP plugin surface for Codex, Claude Code, Gemini, and
-  direct MCP registration.
+- A Python daemon for local recall, indexing, hybrid retrieval, migrations,
+  audit, candidate learning, and review-only compile passes.
+- A shared TypeScript MCP plugin surface for Codex, Claude Code, Gemini,
+  KiloCode, and direct MCP registration.
 - Local vault support for human-readable memory pages, logs, raw material,
   inbox/outbox handoffs, and schema notes.
 - Evaluation scaffolding for recall quality gates and comparison reports.
-- Governance contracts for local-first security, learning approval, handoffs,
-  policy, threat model, and memory hygiene.
+- Governance contracts for local-first security, stamped principal identity,
+  read policy, learning approval, handoffs, policy, threat model, and memory
+  hygiene.
 
 Observed usage so far suggests the system is most useful when it recovers
 specific operational state, tracks open loops, and forces remembered claims
-through verification before acting. It has **not** yet proven artifact-grounded
-comprehension or superiority over disciplined wiki-only workflows.
+through verification before acting. Current work has closed the core safety
+gaps around identity binding, proposal-first learning, cross-agent consent, AFM
+provider hardening, and read authorization. It still needs larger comparative
+evaluation against simpler wiki-only and RAG workflows.
 
 The important boundary: **SQLite is runtime truth. Vault pages, graph exports,
 FAISS files, context packs, and compile drafts are derived or review surfaces.**
@@ -112,13 +115,17 @@ flowchart LR
 
     subgraph Plugin["Shared plugin layer"]
         MCP["MCP server\nsovereign-memory"]
-        Tools["Tools\nrecall, learn, status,\nprepare, handoff, audit"]
+        Tools["Tools\nrecall, prepare, learn proposals,\nhandoff, audit, team runtime"]
         Hooks["Hook envelopes\nSessionStart, UserPromptSubmit,\nPreCompact, Stop"]
+        ConsoleAPI["Local console API\nhealth, prepare, audit,\ncandidates"]
     end
 
     subgraph Daemon["Sovereign daemon"]
         Sovrd["sovrd\nline-delimited JSON-RPC"]
+        Principal["EffectivePrincipal\nidentity + vault roots"]
         Retrieval["Hybrid retrieval\nFTS5 + FAISS + rerank"]
+        Policy["Read policy\nprivacy + workspace + roots"]
+        Candidates["Candidate pipeline\npropose, list, resolve"]
         Trace["Feedback and trace ring"]
         Handoff["Inbox/outbox handoff"]
     end
@@ -142,9 +149,13 @@ flowchart LR
     Console --> MCP
     MCP --> Tools
     MCP --> Hooks
+    MCP --> ConsoleAPI
     Tools --> Sovrd
     Hooks --> Sovrd
-    Sovrd --> Retrieval
+    Sovrd --> Principal
+    Principal --> Policy
+    Policy --> Retrieval
+    Sovrd --> Candidates
     Sovrd --> Trace
     Sovrd --> Handoff
     Retrieval --> SQLite
@@ -178,13 +189,20 @@ The Python engine lives in [engine/](engine/).
 
 - [engine/sovrd.py](engine/sovrd.py) exposes the local JSON-RPC daemon.
 - [engine/sovereign_memory.py](engine/sovereign_memory.py) exposes CLI commands
-  for indexing, stats, hygiene, vector status, and compile dry-runs.
+  for indexing, stats, hygiene, vector status, and AFM compile dry-runs.
 - [engine/db.py](engine/db.py) owns schema creation and migrations. Migrations
   are additive and tracked by name plus `PRAGMA user_version`.
+- [engine/principal.py](engine/principal.py) stamps runtime identity, vault
+  roots, capabilities, and read authorization.
 - [engine/retrieval.py](engine/retrieval.py) combines FTS5, semantic vectors,
-  reranking, feedback, query expansion, HyDE, token budgets, and trace capture.
-- [engine/afm_passes/](engine/afm_passes/) contains the self-organization
-  passes. They default to dry-run and degrade cleanly when unavailable.
+  reranking, feedback, query expansion, HyDE, token budgets, trace capture, and
+  the centralized read gate.
+- [engine/afm_passes/](engine/afm_passes/) contains review-only
+  self-organization passes. They default to dry-run and degrade cleanly when AFM
+  is unavailable.
+
+SQLite is the durable runtime truth. Vault pages, graph exports, FAISS files,
+and plugin context packs are derived or review surfaces.
 
 ## Plugin Surfaces
 
@@ -198,6 +216,8 @@ and ships multiple agent-facing manifests from one TypeScript MCP server:
   for Claude Code.
 - [plugins/sovereign-memory/.gemini-plugin/](plugins/sovereign-memory/.gemini-plugin/)
   for Gemini extension usage.
+- [plugins/sovereign-memory/.kilocode-plugin/](plugins/sovereign-memory/.kilocode-plugin/)
+  for KiloCode.
 - [plugins/sovereign-memory/.mcp.json](plugins/sovereign-memory/.mcp.json)
   for direct MCP registration.
 
@@ -219,9 +239,14 @@ The plugin exposes:
 - `sovereign_ping_agent_inbox`
 - `sovereign_ping_agent_decide`
 - `sovereign_ping_agent_status`
+- `sovereign_team_runtime`
+- `sovereign_team_evidence`
+- `sovereign_team_promotion`
 
-Automatic behavior is recall-only. Durable learning, vault writes, handoff syncs,
-and compile draft acceptance remain explicit human or agent decisions.
+Automatic behavior is recall-only. Durable learning now follows a
+proposal-first path: ordinary learn requests stage candidate packets, and only
+operator-gated resolution writes durable learnings. Vault writes, handoff syncs,
+compile draft acceptance, and team profile promotion remain explicit decisions.
 
 Cross-agent information sharing follows the same explicit-decision rule. A model
 cannot directly read another agent's private memory. It can create a
@@ -236,6 +261,16 @@ Install Python dependencies for the engine:
 ```bash
 cd engine
 python3 -m pip install -r requirements.txt
+```
+For reproducible NumPy/FAISS, use a clean virtual environment with Python 3.11
+or 3.12 from the repository root:
+
+```bash
+python3.12 -m venv .venv
+source .venv/bin/activate
+pip install --upgrade pip
+pip install -r engine/requirements.txt
+# then: python -m pytest -q engine/   (or cd engine && python -m pytest -q .)
 ```
 
 Run the daemon:
@@ -261,6 +296,21 @@ SOVEREIGN_AFM_LOOP=on python3 -m sovereign_memory compile --pass session_distill
 SOVEREIGN_AFM_LOOP=on python3 -m sovereign_memory compile --pass synthesis --dry-run
 ```
 
+The TypeScript plugin can optionally send prepare-task and prepare-outcome
+packets through an AFM provider. The default `bridge` mode preserves the
+localhost OpenAI-compatible bridge. `native` uses the configured
+`SOVEREIGN_AFM_NATIVE_HELPER` JSON helper when available, `auto` falls back to
+the bridge, and `off` skips AFM calls.
+
+```bash
+cd plugins/sovereign-memory
+SOVEREIGN_AFM_PROVIDER_MODE=auto npm test -- tests/afm.test.mjs
+```
+
+Native provider metadata is sanitized before it reaches status reports or model
+packets. Adapter configuration is reported as boolean metadata only through
+`adapter_configured` / `adapterConfigured`; private adapter paths are not emitted.
+
 Build and test the plugin:
 
 ```bash
@@ -277,8 +327,9 @@ cd plugins/sovereign-memory
 npm run console
 ```
 
-The console binds locally and exposes status, audit, prepare-task, and
-prepare-outcome endpoints. It does not expose automatic learning.
+The console binds locally and exposes status, audit, prepare-task,
+prepare-outcome, candidate listing, and candidate-resolution endpoints. It does
+not expose automatic learning or browser-controlled vault paths.
 
 ## Vault Model
 
@@ -337,7 +388,8 @@ host machine. If any of them break, the claim breaks with it:
 3. The vault directory and `sovereign_memory.db` with its `-wal` and `-shm`
    sidecars are **not** under iCloud Drive, Dropbox, Google Drive, or OneDrive
    sync roots. Any of those can silently exfiltrate "local" memory.
-4. The MCP transport is stdio only. There is no remote JSON-RPC fallback at v1.
+4. Agent transports and browser-facing routes remain local-only. There is no
+   remote JSON-RPC fallback at v1.
 
 To keep Time Machine and Spotlight from snapshotting the same data, mark the
 vault and database with the macOS backup-exclude attribute:
@@ -376,13 +428,13 @@ Also run a temp-state live smoke:
 - Verify redaction, traceability, and clean SIGTERM shutdown.
 - Run migration safety on a SQLite backup, never directly on the live DB.
 
-The current v4 acceptance baseline is `213 passed, 3 skipped` for engine tests
-and `32 passed` for plugin tests.
+The current acceptance baseline is `318 passed` for engine tests and
+`121 passed` for plugin tests.
 
 ## Repository Map
 
 - [engine/](engine/) - Python daemon, retrieval, migrations, compile passes, and eval harness.
-- [plugins/sovereign-memory/](plugins/sovereign-memory/) - shared MCP plugin for Codex, Claude Code, and Gemini.
+- [plugins/sovereign-memory/](plugins/sovereign-memory/) - shared MCP plugin for Codex, Claude Code, Gemini, and KiloCode.
 - [openclaw-extension/](openclaw-extension/) - OpenClaw bridge and import tooling.
 - [docs/contracts/](docs/contracts/) - policy, threat model, page types, capabilities, and workflow contracts.
 - [docs/plans/execution/](docs/plans/execution/) - rollout PR specs and resume ledger.
