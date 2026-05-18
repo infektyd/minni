@@ -1015,3 +1015,50 @@ class TestFullWorkflow:
         finally:
             from models import get_embedder as _ge
             wb_mod.WriteBackMemory.model = property(lambda self: _ge())
+
+    def test_contradiction_log_rows_written_g18(self, tmp_path, monkeypatch):
+        """G18: detect_contradictions writes rows to contradiction_log (wired in writeback)."""
+        from writeback import WriteBackMemory
+        import writeback as wb_mod
+
+        db_obj, cfg = _make_db(tmp_path)
+        wb = WriteBackMemory(db_obj, cfg)
+
+        base_emb = _fixed_embedding("JWT tokens are used for auth")
+        now = time.time()
+        with db_obj.cursor() as c:
+            c.execute(
+                """
+                INSERT INTO learnings
+                (agent_id, category, content, confidence, embedding, created_at, status)
+                VALUES ('a1', 'fact', 'JWT tokens are used for auth in the API layer', 1.0, ?, ?, 'active')
+                """,
+                (base_emb.astype(np.float32).tobytes(), now),
+            )
+            seeded_id = c.lastrowid
+
+        class _FakeModel:
+            def encode(self, _text):
+                return _nearly_identical_embedding(base_emb, noise=0.001)
+
+        original_model_prop = wb_mod.WriteBackMemory.model.fget
+        wb_mod.WriteBackMemory.model = property(lambda self: _FakeModel())
+        try:
+            cands = wb.detect_contradictions("JWT tokens are used for auth")
+        finally:
+            wb_mod.WriteBackMemory.model = property(original_model_prop)
+
+        assert [cand["id"] for cand in cands] == [seeded_id]
+        with db_obj.cursor() as c:
+            rows = c.execute(
+                """
+                SELECT memory_a_id, detected_at, detection_method, resolution_id
+                FROM contradiction_log
+                WHERE memory_a_id = ?
+                """,
+                (seeded_id,),
+            ).fetchall()
+            assert len(rows) == 1
+            assert rows[0]["detected_at"] is not None
+            assert rows[0]["detection_method"] == "cosine"
+            assert rows[0]["resolution_id"] is None

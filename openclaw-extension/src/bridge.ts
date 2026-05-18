@@ -12,9 +12,11 @@
 import * as http from "http";
 import * as fs from "fs";
 import * as path from "path";
+import * as os from "os";
 import type { MemoryLayer } from "./types.js";
 
-const SOCKET_PATH = "/tmp/sovereign.sock";
+const SOCKET_PATH = process.env.SOVEREIGN_SOCKET_PATH ||
+  path.join(os.homedir(), ".sovereign-memory", "run", "sovrd.sock");
 const MAX_RECONNECTS = 5;
 const RECONNECT_DELAY_MS = 1000;
 

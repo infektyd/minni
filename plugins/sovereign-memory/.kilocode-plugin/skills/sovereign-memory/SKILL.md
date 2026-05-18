@@ -4,7 +4,7 @@ description: Use when the user asks the agent to recall, learn, write, audit, or
 version: 0.1.0
 author: Hans Axelsson
 tags: [sovereign-memory, obsidian, llm-wiki, local-first, mcp]
-compatibility: Requires sovereign-memory MCP server running (node dist/server.js) and optionally the Sovereign daemon at /tmp/sovereign.sock.
+compatibility: Requires sovereign-memory MCP server running (node dist/server.js) and the Sovereign daemon at the canonical per-user socket.
 ---
 
 # Sovereign Memory for KiloCode
@@ -135,7 +135,7 @@ When a recalled snippet has `agent_origin` other than `kilocode` (e.g., Claude C
 | `SOVEREIGN_KILOCODE_AGENT_ID` | `kilocode` | Agent identity string |
 | `SOVEREIGN_KILOCODE_WORKSPACE_ID` | `workspace-<dir>` | Workspace identifier |
 | `SOVEREIGN_KILOCODE_HOOKS` | `on` | Set to `off` to disable hooks |
-| `SOVEREIGN_SOCKET_PATH` | `/tmp/sovereign.sock` | Sovereign daemon socket |
+| `SOVEREIGN_SOCKET_PATH` | `~/.sovereign-memory/run/sovrd.sock` | Sovereign daemon socket |
 | `SOVEREIGN_AFM_HEALTH_URL` | `http://127.0.0.1:11437/health` | AFM bridge health URL |
 
 ## Red Flags

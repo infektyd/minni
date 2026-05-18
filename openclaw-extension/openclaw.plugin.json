@@ -9,7 +9,7 @@
     "properties": {
       "socketPath": {
         "type": "string",
-        "description": "Unix socket path for the sovrd daemon (default: /tmp/sovereign.sock)"
+        "description": "Unix socket path for the sovrd daemon (default: ~/.sovereign-memory/run/sovrd.sock)"
       },
       "vaultDir": {
         "type": "string",

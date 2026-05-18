@@ -14,6 +14,8 @@ import urllib.request
 from pathlib import Path
 from typing import Iterable, List, Optional
 
+from afm_provider import afm_chat_completion, invoke_native_afm, resolve_afm_mode
+
 logger = logging.getLogger("sovereign.query_expand")
 
 AFM_CHAT_COMPLETIONS_URL = "http://127.0.0.1:11437/v1/chat/completions"
@@ -38,9 +40,24 @@ def expand(query: str, mode: str = "rule") -> List[str]:
 
 
 def summarize_with_afm(prompt: str, timeout: float = 1.5) -> Optional[str]:
-    """Ask the local AFM bridge for a short summary; return None on downgrade."""
+    """Ask the configured AFM provider for a short summary; return None on downgrade."""
     if not prompt.strip():
         return None
+    mode = resolve_afm_mode()
+    if mode == "off":
+        return None
+    if mode in {"native", "auto"}:
+        native = invoke_native_afm(
+            "neighborhood_summary",
+            {"prompt": prompt[:6000]},
+            timeout=timeout,
+        )
+        if native.ok:
+            summary = native.data.get("summary")
+            return str(summary).strip() if summary else None
+        if mode == "native":
+            logger.debug("Native AFM neighborhood summary unavailable: %s", native.error)
+            return None
     payload = {
         "model": "afm-local",
         "messages": [
@@ -83,6 +100,22 @@ def _rule_expand(query: str) -> List[str]:
 
 
 def _afm_expand(query: str) -> List[str]:
+    mode = resolve_afm_mode()
+    if mode == "off":
+        return []
+    if mode in {"native", "auto"}:
+        native = invoke_native_afm(
+            "query_expansion",
+            {"query": query},
+            timeout=1.2,
+        )
+        if native.ok:
+            queries = native.data.get("queries", [])
+            if isinstance(queries, list):
+                return [str(q).strip() for q in queries if str(q).strip()][:3]
+        if mode == "native":
+            logger.debug("Native AFM query expansion unavailable: %s", native.error)
+            return []
     payload = {
         "model": "afm-local",
         "messages": [
@@ -110,14 +143,15 @@ def _afm_expand(query: str) -> List[str]:
 
 
 def _post_afm(payload: dict, timeout: float) -> dict:
-    req = urllib.request.Request(
-        AFM_CHAT_COMPLETIONS_URL,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
+    result = afm_chat_completion(
+        payload,
+        mode="bridge",
+        url=AFM_CHAT_COMPLETIONS_URL,
+        timeout=timeout,
     )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 - local bridge
-        return json.loads(resp.read().decode("utf-8"))
+    if result.ok:
+        return result.data
+    raise RuntimeError(result.error or "AFM bridge unavailable")
 
 
 def _extract_message_content(data: dict) -> str:

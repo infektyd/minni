@@ -185,7 +185,7 @@ export async function readAgentContext(input: {
 export type JsonRpcRequester = (socketPath: string, method: string, params: Record<string, unknown>) => Promise<JsonResult>;
 
 function jsonRpcSocketCandidates(): string[] {
-  return [...new Set([SOCKET_PATH, "/tmp/sovrd.sock"])];
+  return [SOCKET_PATH];
 }
 
 export function jsonRpcSocketRequest(socketPath: string, method: string, params: Record<string, unknown>): Promise<JsonResult> {

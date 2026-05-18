@@ -140,6 +140,18 @@ def test_status_includes_latency_histograms(monkeypatch):
     assert latencies["search"]["p95_ms"] >= latencies["search"]["p50_ms"]
 
 
+def test_status_reports_afm_provider_mode(monkeypatch):
+    import sovrd
+
+    monkeypatch.setenv("SOVEREIGN_AFM_MODE", "off")
+
+    result = sovrd._handle_status({}, 1)["result"]
+
+    assert result["afm"]["mode"] == "off"
+    assert result["afm"]["status"] == "off"
+    assert result["afm"]["native_available"] in {True, False}
+
+
 def test_sovrd_read_includes_layer_1_identity_before_context(tmp_path, monkeypatch):
     import sovrd
 

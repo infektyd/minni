@@ -1,7 +1,7 @@
 # Security Plan — Marketable Minimum
 
 Generated: 2026-04-26
-Scope: `/Users/hansaxelsson/sovereignMemory` — Python engine daemon, retrieval, TypeScript MCP plugin, vault helpers, OpenClaw bridge, AFM prep.
+Scope: repository root — Python engine daemon, retrieval, TypeScript MCP plugin, vault helpers, OpenClaw bridge, AFM prep.
 
 This plan covers what Sovereign Memory must ship before public release. It is deliberately scoped to the threats a *local-first, single-user* memory daemon faces — not enterprise multi-tenant hardening. A longer "v2 hardening" backlog is preserved at the bottom; nothing there blocks v1.
 
@@ -24,7 +24,7 @@ Sequencing:
 
 - `sovereign_memory.db` (with `-wal`/`-shm` sidecars) and FAISS index files.
 - Codex-owned Obsidian vault content under `codex-vault/` — wiki, raw, logs, inbox, generated context packs.
-- Runtime sockets: `/tmp/sovereign.sock`, `/tmp/sovrd.sock`, OpenClaw bridge socket.
+- Runtime socket: `~/.sovereign-memory/run/sovrd.sock`, plus any explicitly configured OpenClaw bridge socket.
 - Cross-agent handoff envelopes and audit logs.
 - AFM preparation payloads (task, recall, changed-files, outcome context).
 
@@ -79,7 +79,7 @@ Exit criteria:
 - `~/Library/Logs/sovrd.*.log` is mode 0600 via plist `Umask`.
 - README documents cloud-sync exclusion and the daemon warns at startup if the vault path is under a known sync root.
 
-Verification: `pytest engine/`, `npm test -w plugins/sovereign-memory`, plus a 30-second smoke that asserts `stat -f %A /tmp/sovrd.sock` returns `600`.
+Verification: `pytest engine/`, `npm test -w plugins/sovereign-memory`, plus a 30-second smoke that asserts `stat -f %A ~/.sovereign-memory/run/sovrd.sock` returns `600`.
 
 ### Phase B — Principal Binding (SEC-002 serial; rest parallel)
 

@@ -2,7 +2,7 @@
 
 This folder is the canonical home for Sovereign Memory on this machine:
 
-`/Users/hansaxelsson/sovereignMemory`
+`<repo-root>`
 
 It is also the canonical Git working tree for
 `https://github.com/infektyd/sovereign-memory`. The live layout is intentional:
@@ -12,18 +12,28 @@ runtime integrations use `engine/`, `openclaw-extension/`, and
 Use this page to avoid guessing between older root-level, OpenClaw, Hermes, and
 downloaded paths.
 
-Older notes may still spell this path as `/Users/hansaxelsson/SovereignMemory`.
-On this macOS volume that resolves to the same directory, but new docs and
-symlink targets should use `/Users/hansaxelsson/sovereignMemory`.
+Older notes may still spell this path using retired home-root or temp-main
+names. Treat those as legacy references, not active roots.
 
 ## Active Core
 
 - `engine/` - Sovereign Memory Python engine.
 - `openclaw-extension/` - OpenClaw extension bridge.
 - `plugins/sovereign-memory/` - Codex plugin package.
-- `codex-vault/` - Codex-owned Obsidian vault.
-- `sovereign_memory.db` - active Sovereign Memory database.
 - `session-extracts/` - extracted handoff/session notes.
+
+## Active Runtime
+
+- `~/.sovereign-memory/sovereign_memory.db` - active Sovereign Memory database.
+- `~/.sovereign-memory/faiss/` - active FAISS cache.
+- `~/.sovereign-memory/run/sovrd.sock` - active daemon socket.
+- `~/.sovereign-memory/codex-vault` - Codex-owned Obsidian vault.
+- `~/.sovereign-memory/claudecode-vault` - Claude Code-owned Obsidian vault.
+- `~/.sovereign-memory/kilocode-vault` - KiloCode-owned Obsidian vault.
+
+Agent vault roots must be actual directories. Do not point a new agent at
+Codex's vault and do not bootstrap a new agent by copying another agent's
+`wiki/`, `logs/`, `inbox/`, `index.md`, or `log.md`.
 
 ## Organized Supporting Material
 
@@ -33,24 +43,15 @@ symlink targets should use `/Users/hansaxelsson/sovereignMemory`.
 - `assets/hermes/` - Hermes/OpenClaw visual assets.
 - `logs/openclaw/` - preserved OpenClaw audit logs.
 - `archives/downloads/` - old downloaded bundles and one-off prototypes.
-- `archives/legacy-vaults/` - preserved old vault copies before symlink cleanup.
 - `_archive/` - previous repo/workspace archives.
 
-## Compatibility Symlinks
+## Retired Legacy Roots
 
-These paths are intentionally kept as symlinks for tools or older agent notes
-that still reference the legacy locations:
+Legacy home-root copies, repo-local vault copies, `.openclaw` state, and old
+archives belong in private offsite/cryo storage, outside the public repository.
 
-- `/Users/hansaxelsson/.openclaw/sovereign-memory-v3.1` -> `engine/`
-- `/Users/hansaxelsson/.openclaw/sovereign_memory.db` -> `sovereign_memory.db`
-- `/Users/hansaxelsson/.openclaw/extensions/sovereign-memory` -> `openclaw-extension/`
-- `/Users/hansaxelsson/.sovereign-memory/codex-vault` -> `codex-vault/`
-
-Legacy home-root and project-root symlinks that only duplicated docs, assets,
-or engine source should be retired into `_cleanup-quarantine/` rather than kept
-as active integration points. The 2026-04-26 cleanup moved those duplicate
-links, plus archived duplicate `.git` directories, into
-`_cleanup-quarantine/20260426-081508/` for reversible review.
+Do not recreate compatibility symlinks for those paths unless the user
+explicitly asks for one.
 
 ## Still External On Purpose
 
@@ -58,10 +59,8 @@ Do not casually move these folders wholesale. They are live application state
 for other systems and may contain secrets, sessions, local databases, or runtime
 locks:
 
-- `/Users/hansaxelsson/.openclaw`
-- `/Users/hansaxelsson/.hermes`
-- `/Users/hansaxelsson/.sovereign`
-- `/Volumes/Macmini/06_Development/AppleFoundationModels/...`
+- Agent-host runtime roots such as Hermes/OpenClaw state.
+- Private AFM training, adapter, or model artifact storage.
 
 If they need cleanup later, move only specific non-runtime artifacts and leave
 symlinks where the owning app expects stable paths.

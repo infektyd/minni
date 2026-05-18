@@ -83,6 +83,61 @@ def test_afm_expansion_degrades_to_rule(monkeypatch):
     assert any("Apple Foundation Models" in v for v in variants)
 
 
+def test_afm_mode_off_skips_bridge_call(monkeypatch):
+    import query_expand
+
+    calls = []
+
+    def bridge_call(*args, **kwargs):
+        calls.append((args, kwargs))
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "content": '{"queries":["bridge should not run"]}',
+                    },
+                },
+            ],
+        }
+
+    monkeypatch.setenv("SOVEREIGN_AFM_MODE", "off")
+    monkeypatch.setattr(query_expand, "_post_afm", bridge_call)
+
+    variants = query_expand.expand("AFM recall", mode="afm")
+
+    assert calls == []
+    assert variants[0] == "AFM recall"
+    assert "bridge should not run" not in variants
+
+
+def test_afm_expansion_uses_native_helper_contract(monkeypatch, tmp_path):
+    import os
+    import query_expand
+
+    helper = tmp_path / "native-afm-helper"
+    helper.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, sys\n"
+        "request = json.load(sys.stdin)\n"
+        "assert request['operation'] == 'query_expansion'\n"
+        "print(json.dumps({'ok': True, 'data': {'queries': ['native AFM recall']}}))\n",
+        encoding="utf-8",
+    )
+    helper.chmod(helper.stat().st_mode | 0o111)
+
+    monkeypatch.setenv("SOVEREIGN_AFM_MODE", "native")
+    monkeypatch.setenv("SOVEREIGN_AFM_NATIVE_HELPER", os.fspath(helper))
+    monkeypatch.setattr(
+        query_expand,
+        "_post_afm",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("bridge should not run in native mode")),
+    )
+
+    variants = query_expand.expand("AFM recall", mode="afm")
+
+    assert variants[:2] == ["AFM recall", "native AFM recall"]
+
+
 def test_retrieve_expands_variants_and_merges_by_rrf(monkeypatch, tmp_path):
     engine, db_obj, _ = _make_db(tmp_path)
     doc1, _ = _insert_doc(db_obj, path="/wiki/afm.md", text="Apple Foundation Models adapter")

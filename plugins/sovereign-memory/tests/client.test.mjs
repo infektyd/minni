@@ -27,7 +27,7 @@ test("parseSovrdJson accepts healthy JSON responses", () => {
 
 test("formatRecall returns concise markdown with query and provenance", () => {
   const formatted = formatRecall("socket health", {
-    results: "### daemon.md (score=1.000)\nUse /tmp/sovereign.sock for local health.",
+    results: "### daemon.md (score=1.000)\nUse ~/.sovereign-memory/run/sovrd.sock for local health.",
     agent_id: "codex",
     layer: "knowledge",
   }, [
@@ -36,7 +36,7 @@ test("formatRecall returns concise markdown with query and provenance", () => {
       relativePath: "wiki/sessions/socket-health.md",
       wikilink: "[[wiki/sessions/socket-health]]",
       title: "Socket health",
-      snippet: "Codex should check /tmp/sovereign.sock before using recall.",
+      snippet: "Codex should check ~/.sovereign-memory/run/sovrd.sock before using recall.",
       score: 61,
     },
   ]);
@@ -45,7 +45,7 @@ test("formatRecall returns concise markdown with query and provenance", () => {
   assert.match(formatted, /agent=codex/);
   assert.match(formatted, /AI Context Pack/);
   assert.match(formatted, /\[\[wiki\/sessions\/socket-health\]\]/);
-  assert.match(formatted, /Use \/tmp\/sovereign.sock/);
+  assert.match(formatted, /Use ~\/\.sovereign-memory\/run\/sovrd\.sock/);
 });
 
 test("formatRecall includes backend badge when recall reports backend provenance", () => {

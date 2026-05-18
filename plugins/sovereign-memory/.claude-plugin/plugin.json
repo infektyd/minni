@@ -24,6 +24,5 @@
       "args": ["${CLAUDE_PLUGIN_ROOT}/dist/server.js"],
       "cwd": "${CLAUDE_PLUGIN_ROOT}"
     }
-  },
-  "hooks": "./hooks/hooks.json"
+  }
 }

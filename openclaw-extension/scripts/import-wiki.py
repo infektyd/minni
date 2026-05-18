@@ -7,7 +7,7 @@ Manifest lives at .import-manifest.json in the plugin directory.
 
 Env overrides:
   WIKI_DIR         default ~/wiki
-  SOCKET_PATH      default /tmp/sovereign.sock
+  SOCKET_PATH      default ~/.sovereign-memory/run/sovrd.sock
   DRY_RUN          if set, skip writes
   FORCE_REIMPORT   if set, ignore manifest and re-import everything
   MANIFEST_PATH    override manifest location
@@ -31,7 +31,7 @@ from pathlib import Path
 
 PLUGIN_DIR = Path(__file__).resolve().parent.parent
 WIKI_DIR = Path(os.environ.get("WIKI_DIR", os.path.expanduser("~/wiki")))
-SOCKET_PATH = os.environ.get("SOCKET_PATH", "/tmp/sovereign.sock")
+SOCKET_PATH = os.environ.get("SOCKET_PATH", os.path.expanduser("~/.sovereign-memory/run/sovrd.sock"))
 MANIFEST_PATH = Path(
     os.environ.get("MANIFEST_PATH", str(PLUGIN_DIR / ".import-manifest.json"))
 )

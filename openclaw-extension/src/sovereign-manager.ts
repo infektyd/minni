@@ -333,7 +333,7 @@ export class SovereignMemoryManager implements MemorySearchManager {
         vault: this.vaultDir,
         agentId: this.agentId,
         workspaceId: this.workspaceId,
-        socketPath: "/tmp/sovereign.sock",
+        socketPath: process.env.SOVEREIGN_SOCKET_PATH || "~/.sovereign-memory/run/sovrd.sock",
         chunkSize: 512,
         chunkOverlap: 128,
       },

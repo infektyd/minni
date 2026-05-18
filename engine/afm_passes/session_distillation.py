@@ -14,6 +14,8 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from afm_provider import invoke_native_afm, resolve_afm_mode
+
 
 def _slugify(text: str) -> str:
     slug = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
@@ -155,6 +157,77 @@ def _build_drafts(events: List[Dict[str, Any]], raw_docs: List[Dict[str, Any]], 
     return [draft for draft in drafts if draft.get("sources")]
 
 
+def _normalize_native_draft(candidate: Any, trace_id: str, allowed_sources: set[str]) -> Optional[Dict[str, Any]]:
+    if not isinstance(candidate, dict):
+        return None
+    sources = [
+        str(source).strip()
+        for source in candidate.get("sources", [])
+        if str(source).strip() in allowed_sources
+    ] if isinstance(candidate.get("sources"), list) else []
+    if not sources:
+        return None
+    title = str(candidate.get("title") or "").strip()
+    body = str(candidate.get("body") or "").strip()
+    if not title or not body:
+        return None
+    kind = str(candidate.get("kind") or "concept").strip() or "concept"
+    section = str(candidate.get("section") or f"{kind}s").strip() or f"{kind}s"
+    return {
+        "page_id": _draft_id(kind, title, sources, trace_id),
+        "kind": kind,
+        "section": section,
+        "title": title,
+        "status": "draft",
+        "agent": "afm-loop",
+        "trace_id": trace_id,
+        "prompt_version": "native.compile.v1",
+        "provider": "native",
+        "sources": sources,
+        "citations": sources,
+        "body": "\n".join([
+            body,
+            "",
+            "## Citations",
+            *[f"- `{source}`" for source in sources],
+            "",
+            "- Lifecycle: native AFM proposal only; endorsement is required before acceptance.",
+        ]),
+    }
+
+
+def _native_compile_drafts(pass_input: Dict[str, Any], deterministic_drafts: List[Dict[str, Any]], trace_id: str) -> List[Dict[str, Any]]:
+    mode = resolve_afm_mode()
+    if mode not in {"native", "auto"}:
+        return []
+    allowed_sources = {
+        str(source)
+        for draft in deterministic_drafts
+        for source in draft.get("sources", [])
+        if str(source).strip()
+    }
+    if not allowed_sources:
+        return []
+    payload = {
+        "pass_name": "session_distillation",
+        "trace_id": trace_id,
+        "inputs": pass_input,
+        "deterministic_drafts": deterministic_drafts[:12],
+    }
+    result = invoke_native_afm("compile_pass_proposals", payload, timeout=4.0)
+    if not result.ok:
+        return []
+    candidates = result.data.get("drafts")
+    if not isinstance(candidates, list):
+        return []
+    normalized = [
+        draft
+        for draft in (_normalize_native_draft(candidate, trace_id, allowed_sources) for candidate in candidates)
+        if draft is not None
+    ]
+    return normalized[:5]
+
+
 def run(db, config, vault_path: Optional[str] = None, dry_run: bool = True, trace_id: Optional[str] = None) -> Dict[str, Any]:
     schedule = getattr(config, "afm_loop_schedule", {}) or {}
     pass_cfg = (schedule.get("passes") or {}).get("session_distillation", {})
@@ -163,7 +236,6 @@ def run(db, config, vault_path: Optional[str] = None, dry_run: bool = True, trac
     prompt = _load_prompt()
     events = _recent_events(db, lookback_hours)
     raw_docs = _recent_raw_docs(db, lookback_hours)
-    drafts = _build_drafts(events, raw_docs, trace_id)
     pass_input = {
         "lookback_hours": lookback_hours,
         "event_count": len(events),
@@ -180,6 +252,10 @@ def run(db, config, vault_path: Optional[str] = None, dry_run: bool = True, trac
         ],
         "raw_docs": raw_docs[:20],
     }
+    drafts = _build_drafts(events, raw_docs, trace_id)
+    native_drafts = _native_compile_drafts(pass_input, drafts, trace_id)
+    drafts = [*drafts, *native_drafts]
+    pass_input["native_draft_count"] = len(native_drafts)
     return {
         "status": "ok",
         "pass_name": "session_distillation",

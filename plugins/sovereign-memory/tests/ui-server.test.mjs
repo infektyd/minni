@@ -42,7 +42,7 @@ async function startTestServer(overrides = {}) {
         intent: "implement",
         brief: "Real task packet.",
         constraints: ["No automatic learning."],
-        currentState: ["Bridge test state at /Users/alice/private/repo and /tmp/sovereign.sock."],
+        currentState: ["Bridge test state at /Users/alice/private/repo and ~/.sovereign-memory/run/sovrd.sock."],
         relevantSources: [
           {
             title: "Local source",
@@ -54,7 +54,7 @@ async function startTestServer(overrides = {}) {
         risks: [],
         recall: { daemonOk: true },
         afm: { requested: false, used: false },
-        contextMarkdown: "# Packet\n/Users/alice/private/repo\n/tmp/sovereign.sock",
+        contextMarkdown: "# Packet\n/Users/alice/private/repo\n~/.sovereign-memory/run/sovrd.sock",
       };
     },
     prepareOutcome: async (input) => {

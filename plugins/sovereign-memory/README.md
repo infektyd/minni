@@ -27,7 +27,7 @@ Two themes ship: **Paper** (default, warm bone + persimmon stamp + verdigris acc
 
 ## Runtime Defaults
 
-- Sovereign daemon socket: `SOVEREIGN_SOCKET_PATH` if set, otherwise `/tmp/sovereign.sock`; v4 JSON-RPC helpers also fall back to `/tmp/sovrd.sock`.
+- Sovereign daemon socket: `SOVEREIGN_SOCKET_PATH` if set, otherwise `~/.sovereign-memory/run/sovrd.sock`.
 - AFM health URL: `http://127.0.0.1:11437/health`
 - AFM provider mode: `bridge` by default; set `SOVEREIGN_AFM_PROVIDER_MODE=native`, `auto`, or `off` to change opt-in AFM calls.
 - Codex vault: `~/.sovereign-memory/codex-vault`
@@ -38,7 +38,7 @@ Override with:
 ```bash
 export SOVEREIGN_CODEX_VAULT_PATH=/path/to/codex-vault
 export SOVEREIGN_KILOCODE_VAULT_PATH=/path/to/kilocode-vault
-export SOVEREIGN_SOCKET_PATH=/tmp/sovrd.sock
+export SOVEREIGN_SOCKET_PATH=~/.sovereign-memory/run/sovrd.sock
 export SOVEREIGN_AFM_HEALTH_URL=http://127.0.0.1:11437/health
 export SOVEREIGN_AFM_PREPARE_TASK_URL=http://127.0.0.1:11437/v1/chat/completions
 export SOVEREIGN_AFM_PROVIDER_MODE=native

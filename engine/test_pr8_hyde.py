@@ -45,6 +45,50 @@ def test_generate_hypothetical_answer_returns_none_when_afm_fails():
     assert answer is None
 
 
+def test_generate_hypothetical_answer_native_unavailable_does_not_call_bridge(monkeypatch, tmp_path):
+    from hyde import generate_hypothetical_answer
+
+    calls = []
+
+    def bridge_client(_payload, _url, _timeout):
+        calls.append(_payload)
+        return {"choices": [{"message": {"content": "bridge should not run"}}]}
+
+    monkeypatch.setenv("SOVEREIGN_AFM_MODE", "native")
+    monkeypatch.setenv("SOVEREIGN_AFM_NATIVE_HELPER", str(tmp_path / "missing-helper"))
+
+    answer = generate_hypothetical_answer(
+        "cold query",
+        client=bridge_client,
+        url="http://127.0.0.1:11437/v1/chat/completions",
+    )
+
+    assert answer is None
+    assert calls == []
+
+
+def test_generate_hypothetical_answer_uses_native_helper_contract(monkeypatch, tmp_path):
+    from hyde import generate_hypothetical_answer
+
+    helper = tmp_path / "native-afm-helper"
+    helper.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, sys\n"
+        "request = json.load(sys.stdin)\n"
+        "assert request['operation'] == 'hyde_generation'\n"
+        "print(json.dumps({'ok': True, 'data': {'answer': 'Native hypothetical answer.'}}))\n",
+        encoding="utf-8",
+    )
+    helper.chmod(helper.stat().st_mode | 0o111)
+
+    monkeypatch.setenv("SOVEREIGN_AFM_MODE", "native")
+    monkeypatch.setenv("SOVEREIGN_AFM_NATIVE_HELPER", str(helper))
+
+    answer = generate_hypothetical_answer("cold query")
+
+    assert answer == "Native hypothetical answer."
+
+
 def test_rrf_merge_marks_hyde_contributed_results():
     from hyde import merge_hyde_results
 

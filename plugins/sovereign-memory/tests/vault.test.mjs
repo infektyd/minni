@@ -71,7 +71,7 @@ test("vaultFirstLearn writes a note, updates index, and appends audit logs", asy
     const result = await vaultFirstLearn({
       vaultPath: root,
       title: "Socket daemon health check",
-      content: "Sovereign Memory daemon health is checked through /tmp/sovereign.sock.",
+      content: "Sovereign Memory daemon health is checked through ~/.sovereign-memory/run/sovrd.sock.",
       category: "fact",
       source: "unit-test",
       agentId: "codex",

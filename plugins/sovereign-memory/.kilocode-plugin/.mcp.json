@@ -3,7 +3,12 @@
     "sovereign-memory": {
       "command": "node",
       "args": ["${KILO_PLUGIN_ROOT}/../dist/server.js"],
-      "cwd": "${KILO_PLUGIN_ROOT}/.."
+      "cwd": "${KILO_PLUGIN_ROOT}/..",
+      "env": {
+        "SOVEREIGN_AGENT_ID": "kilocode",
+        "SOVEREIGN_VAULT_PATH": "~/.sovereign-memory/kilocode-vault",
+        "SOVEREIGN_SOCKET_PATH": "~/.sovereign-memory/run/sovrd.sock"
+      }
     }
   }
 }

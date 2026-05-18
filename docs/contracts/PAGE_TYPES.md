@@ -59,7 +59,7 @@ across requests, and maintains per-agent recall context.
 
 ## Key facts
 
-- **Socket:** `/tmp/sovrd.sock` (configurable via `--socket`)
+- **Socket:** `~/.sovereign-memory/run/sovrd.sock` (configurable via `--socket`)
 - **Protocol:** JSON-RPC 2.0, line-delimited (newline-separated messages)
 - **Engine:** FAISS + FTS5 dual retrieval, cross-encoder re-ranking, RRF fusion
 - **Source:** `engine/sovrd.py`
@@ -147,7 +147,7 @@ trace_id: t3c4d5e6
 ## Decision
 
 The Sovereign Memory daemon communicates with clients via a Unix domain socket
-(`/tmp/sovrd.sock`) using JSON-RPC 2.0 over a line-delimited protocol.
+(`~/.sovereign-memory/run/sovrd.sock`) using JSON-RPC 2.0 over a line-delimited protocol.
 
 ## Rationale
 

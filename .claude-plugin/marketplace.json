@@ -1,0 +1,21 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "sovereign-memory",
+  "description": "Local Sovereign Memory agent plugins",
+  "owner": {
+    "name": "Sovereign Memory"
+  },
+  "plugins": [
+    {
+      "name": "sovereign-memory",
+      "description": "Local-first Sovereign Memory spine for Claude Code.",
+      "version": "0.1.0",
+      "source": "./plugins/sovereign-memory",
+      "author": {
+        "name": "Sovereign Memory"
+      },
+      "category": "development",
+      "homepage": "https://github.com/infektyd/sovereign-memory"
+    }
+  ]
+}

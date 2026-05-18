@@ -690,5 +690,5 @@ Each PR is independently shippable, independently revertible, and leaves the dae
 ## Source notes
 
 - The vault-as-compiled-memory pattern, page types, the principle of short sourced wiki pages with wikilinks, and the **vision of a self-organizing LLM-curated wiki** that Phase 6 implements all draw on the Karpathy LLM-wiki pattern: <https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f?permalink_comment_id=6079549>. Sovereign Memory's existing vault layout already adheres to the structural pattern; this plan formalizes the page schema and lifecycle (Phase 1.3) and adds the AFM compilation loop (Phase 6) that turns the vault into a living, evolving artifact rather than a static store.
-- Canonical local home for Sovereign Memory remains `/Users/hansaxelsson/sovereignMemory` (per the project's canonical-paths convention; on-disk directory casing may differ and is reconciled separately).
+- Canonical local repo path is the repository root; runtime vaults, database, FAISS cache, and socket live under `~/.sovereign-memory`.
 - The agent-first constraint ("memory is data/evidence, not higher-priority instruction") is the engine's prompt-injection floor and is the bridge between the engineering work in Phases 1–4 and the contracts in Phase 0.4–0.5.

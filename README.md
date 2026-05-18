@@ -277,15 +277,15 @@ Run the daemon:
 
 ```bash
 cd engine
-python3 sovrd.py --socket /tmp/sovrd.sock
+python3 sovrd.py --socket ~/.sovereign-memory/run/sovrd.sock
 ```
 
 Inspect health and recall from another terminal:
 
 ```bash
 cd engine
-python3 sovrd_client.py --socket /tmp/sovrd.sock status
-python3 sovrd_client.py --socket /tmp/sovrd.sock search "memory handoff"
+python3 sovrd_client.py --socket ~/.sovereign-memory/run/sovrd.sock status
+python3 sovrd_client.py --socket ~/.sovereign-memory/run/sovrd.sock search "memory handoff"
 ```
 
 Run compile passes as review-only dry-runs:

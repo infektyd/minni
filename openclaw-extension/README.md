@@ -4,7 +4,7 @@ OpenClaw plugin bridge for Sovereign Memory integration.
 
 ## Architecture
 
-- **sovrd.py** — Python HTTP daemon over Unix socket (`/tmp/sovereign.sock`)
+- **sovrd.py** — Python HTTP daemon over the canonical per-user Unix socket (`~/.sovereign-memory/run/sovrd.sock`)
 - **src/bridge.ts** — TypeScript client with reconnect logic
 - **src/bridge-process.ts** — Process supervisor for spawning/managing sovrd
 
@@ -31,7 +31,7 @@ cd ~/.openclaw/plugins/sovereign-memory/
 ### 2. Verify with curl
 
 ```bash
-curl --unix-socket /tmp/sovereign.sock http://localhost/health
+curl --unix-socket ~/.sovereign-memory/run/sovrd.sock http://localhost/health
 # => {"status":"ok","agent":"hermes"}
 ```
 

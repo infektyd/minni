@@ -9,8 +9,8 @@
   Substitutions:
     /path/to/engine/sovrd.py   absolute path to engine/sovrd.py in this repo
     /path/to/sock              absolute path to the Unix socket
-                               (default: /tmp/sovrd.sock; for SEC-001 prefer
-                               ~/.sovereign-memory/run/sovrd.sock mode 0600)
+                               (default: ~/.sovereign-memory/run/sovrd.sock
+                               with mode 0600)
     ~                          your home directory; launchd does NOT expand ~,
                                so replace it with the literal /Users/<you>
                                before bootstrapping.

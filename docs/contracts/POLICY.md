@@ -22,7 +22,7 @@ Specific defaults:
 | Vault storage | Local filesystem only (`~/.sovereign-memory/<agent>-vault/`) |
 | Database | Local SQLite only (`sovereign_memory.db`) |
 | FAISS index | Local disk only (`~/.sovereign-memory/*.faiss`) |
-| Daemon socket | Unix domain socket, local only (`/tmp/sovrd.sock`) |
+| Daemon socket | Unix domain socket, local only (`~/.sovereign-memory/run/sovrd.sock`) |
 | Cross-agent recall | Enabled for `privacy_level=safe` pages within the same installation |
 | Handoff packets | Opt-in per handoff; never automatic |
 

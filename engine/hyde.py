@@ -15,6 +15,8 @@ import os
 from typing import Callable, Dict, List, Optional
 from urllib import request
 
+from afm_provider import afm_chat_completion, invoke_native_afm, resolve_afm_mode
+
 logger = logging.getLogger("sovereign.hyde")
 
 DEFAULT_AFM_URL = "http://127.0.0.1:11437/v1/chat/completions"
@@ -35,15 +37,10 @@ def should_trigger_hyde(results: List[Dict], enabled: bool, floor: float) -> boo
 
 
 def _default_chat_client(payload: Dict, url: str, timeout: float) -> Dict:
-    data = json.dumps(payload).encode("utf-8")
-    req = request.Request(
-        url,
-        data=data,
-        headers={"content-type": "application/json"},
-        method="POST",
-    )
-    with request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+    result = afm_chat_completion(payload, mode="bridge", url=url, timeout=timeout)
+    if result.ok:
+        return result.data
+    raise RuntimeError(result.error or "AFM bridge unavailable")
 
 
 def _extract_chat_text(response: Dict) -> Optional[str]:
@@ -67,10 +64,28 @@ def generate_hypothetical_answer(
     timeout: float = 2.0,
 ) -> Optional[str]:
     """
-    Ask the local AFM bridge for a two-sentence hypothetical answer.
+    Ask the configured AFM provider for a two-sentence hypothetical answer.
 
     All failures degrade to None so retrieval can return the original pass.
     """
+    mode = resolve_afm_mode()
+    if mode == "off":
+        return None
+    if mode in {"native", "auto"}:
+        native = invoke_native_afm(
+            "hyde_generation",
+            {"query": query},
+            timeout=timeout,
+        )
+        if native.ok:
+            answer = native.data.get("answer")
+            if isinstance(answer, str):
+                answer = " ".join(answer.split())
+                return answer or None
+        if mode == "native":
+            logger.debug("Native AFM HyDE generation skipped: %s", native.error)
+            return None
+
     afm_url = url or os.environ.get("SOVEREIGN_HYDE_AFM_URL", DEFAULT_AFM_URL)
     model = os.environ.get("SOVEREIGN_HYDE_AFM_MODEL", DEFAULT_AFM_MODEL)
     max_tokens = int(os.environ.get("SOVEREIGN_HYDE_MAX_TOKENS", "96"))

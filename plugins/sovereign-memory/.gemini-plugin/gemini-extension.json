@@ -7,7 +7,12 @@
       "args": [
         "${extensionPath}${/}..${/}dist${/}server.js"
       ],
-      "cwd": "${extensionPath}${/}.."
+      "cwd": "${extensionPath}${/}..",
+      "env": {
+        "SOVEREIGN_AGENT_ID": "gemini",
+        "SOVEREIGN_VAULT_PATH": "~/.sovereign-memory/gemini-vault",
+        "SOVEREIGN_SOCKET_PATH": "~/.sovereign-memory/run/sovrd.sock"
+      }
     }
   }
 }

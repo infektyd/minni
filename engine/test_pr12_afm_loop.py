@@ -67,6 +67,55 @@ def test_session_distillation_dry_run_returns_drafts_without_writing(tmp_path):
     assert not (tmp_path / "vault" / "inbox").exists()
 
 
+def test_session_distillation_accepts_structured_native_compile_proposals(tmp_path, monkeypatch):
+    from afm_provider import AFMResult
+    from afm_passes.session_distillation import run
+
+    db_obj, cfg = _make_db(tmp_path)
+    event_id = _seed_event(db_obj)
+    calls = []
+
+    def fake_native(operation, payload, timeout=2.0):
+        calls.append((operation, payload, timeout))
+        return AFMResult(
+            ok=True,
+            provider="native",
+            status="native_available",
+            data={
+                "drafts": [
+                    {
+                        "kind": "concept",
+                        "section": "concepts",
+                        "title": "Native Draft Discipline",
+                        "body": "- Native proposal cites evidence and remains draft.",
+                        "sources": [f"episodic_events:{event_id}"],
+                    },
+                    {
+                        "kind": "concept",
+                        "title": "Rejected Unsourced Proposal",
+                        "body": "This proposal has no source and must be dropped.",
+                        "sources": [],
+                    },
+                ],
+            },
+        )
+
+    monkeypatch.setenv("SOVEREIGN_AFM_MODE", "native")
+    monkeypatch.setattr("afm_passes.session_distillation.invoke_native_afm", fake_native)
+
+    result = run(db_obj, cfg, vault_path=cfg.vault_path, dry_run=True, trace_id="trace-native")
+
+    native_drafts = [draft for draft in result["drafts"] if draft.get("provider") == "native"]
+    assert calls and calls[0][0] == "compile_pass_proposals"
+    assert calls[0][1]["pass_name"] == "session_distillation"
+    assert len(native_drafts) == 1
+    assert native_drafts[0]["status"] == "draft"
+    assert native_drafts[0]["agent"] == "afm-loop"
+    assert native_drafts[0]["trace_id"] == "trace-native"
+    assert native_drafts[0]["sources"] == [f"episodic_events:{event_id}"]
+    assert all("Rejected Unsourced Proposal" != draft["title"] for draft in result["drafts"])
+
+
 def test_daemon_compile_wet_run_writes_draft_inbox_and_trace(tmp_path, monkeypatch):
     import sovrd
 

@@ -38,9 +38,9 @@ Usage
 
 Client Quick-Start (Python)
 ---------------------------
-    import socket, json
+    import os, socket, json
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    s.connect("/tmp/sovrd.sock")
+    s.connect(os.path.expanduser("~/.sovereign-memory/run/sovrd.sock"))
     def rpc(method, params=None):
         msg = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method,
                           "params": params or {}}) + "\\n"

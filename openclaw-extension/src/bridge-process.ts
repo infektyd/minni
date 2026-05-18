@@ -8,7 +8,8 @@ import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
 
-const SOCKET_PATH = "/tmp/sovereign.sock";
+const SOCKET_PATH = process.env.SOVEREIGN_SOCKET_PATH ||
+  path.join(os.homedir(), ".sovereign-memory", "run", "sovrd.sock");
 const PYTHON_BIN = `${os.homedir()}/.openclaw/sovereign-memory-v3.1/venv/bin/python`;
 const SOVRD_PATH = path.join(__dirname, "..", "sovrd.py");
 

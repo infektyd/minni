@@ -40,8 +40,8 @@ GET /health HTTP/1.1
 Check the live socket:
 
 ```bash
-ls -l /tmp/sovereign.sock /tmp/sovrd.sock 2>&1 || true
-lsof -U | rg 'sovereign\.sock|sovrd\.sock'
+ls -l ~/.sovereign-memory/run/sovrd.sock 2>&1 || true
+lsof -U | rg 'sovereign-memory/run/sovrd\.sock|sovrd\.sock'
 ```
 
 Probe JSON-RPC directly:
@@ -49,7 +49,7 @@ Probe JSON-RPC directly:
 ```bash
 node - <<'NODE'
 const net = require('node:net');
-const socketPath = '/tmp/sovereign.sock';
+const socketPath = `${process.env.HOME}/.sovereign-memory/run/sovrd.sock`;
 const client = net.createConnection(socketPath);
 client.on('connect', () => {
   client.write(JSON.stringify({jsonrpc: '2.0', id: 1, method: 'status', params: {}}) + '\n');

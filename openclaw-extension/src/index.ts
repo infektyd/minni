@@ -82,8 +82,8 @@ const plugin = {
 
     // Plugin loaded — sovereign memory capabilities are exposed via the bridge
     // functions (recall, learn, etc.) already exported as named exports above.
-    // No tools registered at the plugin level; agents consume via the Python
-    // daemon at /tmp/sovereign.sock directly through their tool schemas.
+    // No tools registered at the plugin level; agents consume the shared
+    // daemon through SOVEREIGN_SOCKET_PATH or the canonical per-user socket.
     if (typeof api?.on === "function") {
       api.on("before_agent_start", async () => {
         // Daemon health check on agent start — non-blocking, fire and forget
@@ -91,7 +91,7 @@ const plugin = {
           const { isRunning } = await import("./bridge.js");
           const running = await isRunning();
           if (!running) {
-            console.warn("[sovereign-memory] sovrd daemon not running at /tmp/sovereign.sock — start it with: python3 ~/.openclaw/extensions/sovereign-memory/sovrd.py");
+            console.warn("[sovereign-memory] sovrd daemon not running on the canonical Sovereign Memory socket — check SOVEREIGN_SOCKET_PATH and the launchd service.");
           }
         } catch {
           // Silently skip — daemon may not be needed for this agent run

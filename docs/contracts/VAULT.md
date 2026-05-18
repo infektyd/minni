@@ -67,7 +67,7 @@ Additional env vars:
 |----------|---------|---------|
 | `SOVEREIGN_VAULT_PATH` | Override the vault root for the current agent. | See table above |
 | `SOVEREIGN_DB_PATH` | Override the SQLite database path. | `~/.sovereign-memory/sovereign.db` |
-| `SOVEREIGN_SOCKET` | Override the daemon Unix socket path. | `/tmp/sovrd.sock` |
+| `SOVEREIGN_SOCKET` | Override the daemon Unix socket path. | `~/.sovereign-memory/run/sovrd.sock` |
 
 ### Cross-agent recall
 

@@ -1,5 +1,10 @@
 # RESUME — Sovereign Memory v3.1 → v4 Dispatch State
 
+> Historical dispatch note. Do not use this file to infer live repo, vault,
+> socket, or worktree paths. The active repo is
+> `<repo-root>`; active runtime state lives
+> under `~/.sovereign-memory`.
+
 > **Read this file first if you are picking up dispatch.** It is self-contained: you do not need to read the dispatch plan or any skill file to resume.
 
 ---
@@ -19,9 +24,9 @@
 
 ## Topology
 
-- **Root repo:** `/Users/hansaxelsson/sovereignMemory` — branch `codex/reconcile-gemini-main`. **Do not touch.** Dirty working tree is intentional.
-- **Orchestration worktree:** `/Users/hansaxelsson/sovereignMemory/.claude/worktrees/orchestration` — branch `orchestration/v3.1-to-v4`. This is where RESUME.md and the tracker are committed; per-PR branches are merged here.
-- **Per-PR worktrees:** `/Users/hansaxelsson/sovereignMemory/.claude/worktrees/pr-N-shortname` — created on dispatch, merged + removed on completion.
+- **Historical root repo:** retired local checkout — this note predates the local root cleanup.
+- **Historical orchestration worktree:** retired.
+- **Historical per-PR worktrees:** retired.
 - **Source-of-truth spec:** `docs/plans/SOVEREIGN-MEMORY-CORE-UPGRADES-SCALE-AGNOSTIC.md` (v1, the `-v2` is stale and excluded from this branch).
 - **Final integration target:** `main`. The orchestration branch will be merged to `main` only when the user says so.
 
@@ -86,7 +91,7 @@ From `00_MASTER_TRACKER.md`:
 ## Master verification block (run after every PR merge)
 
 ```bash
-cd /Users/hansaxelsson/sovereignMemory/.claude/worktrees/orchestration
+cd <repo-root>
 
 # Engine tests
 cd engine && pytest -q
