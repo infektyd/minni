@@ -24,7 +24,9 @@ def test_agent_cannot_self_resolve_operator_can(tmp_path, monkeypatch):
     # Case 1: limited "local" (canonical) principal file only (stamped=local, !operator for test)
     pdir_agent = tmp_path / "p_agent"
     pdir_agent.mkdir()
-    (pdir_agent / "local.json").write_text(json.dumps({"agent_id": "local", "capabilities": ["search", "learn"]}))
+    agent_file = pdir_agent / "local.json"
+    agent_file.write_text(json.dumps({"agent_id": "local", "capabilities": ["search", "learn"]}))
+    os.chmod(agent_file, 0o600)
     pr_mod.PRINCIPALS_DIR = pdir_agent
     try:
         p_agent = resolve_effective_principal(supplied_agent_id="local", transport="uds", principals_dir=pdir_agent)
@@ -39,7 +41,9 @@ def test_agent_cannot_self_resolve_operator_can(tmp_path, monkeypatch):
     # Case 2: operator "main" (canonical, last in list but present)
     pdir_op = tmp_path / "p_op"
     pdir_op.mkdir()
-    (pdir_op / "main.json").write_text(json.dumps({"agent_id": "main", "capabilities": ["*", "resolve_candidate"]}))
+    op_file = pdir_op / "main.json"
+    op_file.write_text(json.dumps({"agent_id": "main", "capabilities": ["*", "resolve_candidate"]}))
+    os.chmod(op_file, 0o600)
     pr_mod.PRINCIPALS_DIR = pdir_op
     try:
         p_op = resolve_effective_principal(supplied_agent_id="main", transport="uds", principals_dir=pdir_op)

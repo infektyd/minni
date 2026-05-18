@@ -61,6 +61,18 @@ def test_shared_wiki_authorized():
     assert can_read_document(p, "default", meta2) is True
 
 
+def test_private_shared_wiki_denied_for_foreign_non_operator():
+    p = _p("hermes", caps=["search", "recall"])
+    meta = {
+        "agent": "wiki:meta",
+        "page_type": "wiki",
+        "privacy_level": "private",
+        "path": "/tmp/test-vault/wiki/private-shared.md",
+        "page_status": "accepted",
+    }
+    assert can_read_document(p, "default", meta) is False
+
+
 def test_foreign_private_denied():
     # Non-operator limited principal (no * cap, not main/operator id) must be denied foreign private
     p = _p("hermes", caps=["search", "recall"])

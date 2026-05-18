@@ -107,6 +107,34 @@ def test_resolve_strict_rejects_mismatch(tmp_path: Path):
     assert "operator-prime" in str(exc.value)
 
 
+def test_strict_principal_bad_permissions_fail_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    principals = tmp_path / "principals"
+    principals.mkdir()
+    f = principals / "local.json"
+    f.write_text(
+        json.dumps(
+            {
+                "agent_id": "local",
+                "workspace_id": "prod",
+                "capabilities": ["search"],
+                "allowed_vault_roots": [str(tmp_path)],
+            }
+        ),
+        encoding="utf-8",
+    )
+    os.chmod(f, 0o644)
+
+    def _deny_chmod(*_args, **_kwargs):
+        raise PermissionError("chmod unavailable")
+
+    monkeypatch.setattr(principal.os, "chmod", _deny_chmod)
+
+    with pytest.raises(RuntimeError, match="must be 0600"):
+        resolve_effective_principal(
+            supplied_agent_id="local", transport="uds", principals_dir=principals
+        )
+
+
 def test_make_mismatch_error_shape():
     err = make_mismatch_error("bad", "good", request_id=42)
     assert err["id"] == 42

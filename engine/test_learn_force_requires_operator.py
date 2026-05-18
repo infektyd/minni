@@ -19,7 +19,9 @@ def test_force_learn_operator_gate(tmp_path, monkeypatch):
     pdir = tmp_path / "principals_force"
     pdir.mkdir()
     # Limited non-operator (canonical name so it gets loaded as stamped)
-    (pdir / "local.json").write_text(json.dumps({"agent_id": "local", "capabilities": ["search", "learn"]}))
+    principal_file = pdir / "local.json"
+    principal_file.write_text(json.dumps({"agent_id": "local", "capabilities": ["search", "learn"]}))
+    os.chmod(principal_file, 0o600)
 
     old_db = cfg_mod.DEFAULT_CONFIG.db_path
     old_pr = pr_mod.PRINCIPALS_DIR

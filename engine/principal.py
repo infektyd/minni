@@ -146,27 +146,33 @@ def _load_raw_principal_file(
     try:
         try:
             mode = f.stat().st_mode
-            if (mode & 0o077) != 0:
-                if strict:
-                    raise RuntimeError(
-                        f"principal file {f} must be 0600 (world-readable principal "
-                        "config is a security risk for the identity root-of-trust)"
-                    )
-                logger.warning(
-                    "principal file %s has overly permissive mode %o (expected 0600); "
-                    "best-effort chmod to 0600",
-                    f,
-                    mode,
+        except Exception as exc:
+            if strict:
+                raise RuntimeError(f"failed to stat principal file {f}: {exc}") from exc
+            mode = 0o600
+        if (mode & 0o077) != 0:
+            if strict:
+                raise RuntimeError(
+                    f"principal file {f} must be 0600 (world-readable principal "
+                    "config is a security risk for the identity root-of-trust)"
                 )
-                try:
-                    os.chmod(f, 0o600)
-                except Exception:
-                    pass
-        except Exception:
-            pass
+            logger.warning(
+                "principal file %s has overly permissive mode %o (expected 0600); "
+                "best-effort chmod to 0600",
+                f,
+                mode,
+            )
+            try:
+                os.chmod(f, 0o600)
+            except Exception:
+                pass
         data = json.loads(f.read_text(encoding="utf-8"))
         if isinstance(data, dict):
             return data
+    except RuntimeError:
+        if strict:
+            raise
+        logger.warning("failed to validate principal file %s", f)
     except Exception as exc:
         logger.warning("failed to parse principal file %s: %s", f, exc)
     return None
@@ -222,6 +228,7 @@ def from_local_transport(
     transport: str = "uds",
     *,
     principals_dir: Optional[Path] = None,
+    strict: bool = False,
 ) -> EffectivePrincipal:
     """Return a trusted local principal.
 
@@ -234,7 +241,7 @@ def from_local_transport(
     _ensure_principals_dir(d)
     for name in CANONICAL_PRINCIPAL_NAMES:
         p = from_operator_config(
-            name, principals_dir=d, transport=transport, strict=False
+            name, principals_dir=d, transport=transport, strict=strict
         )
         if p is not None:
             return p
@@ -279,11 +286,11 @@ def resolve_effective_principal(
     strict = any((d / f"{n}.json").is_file() for n in CANONICAL_PRINCIPAL_NAMES)
 
     if transport in ("uds", "stdio", "local", "test"):
-        stamped = from_local_transport(transport, principals_dir=d)
+        stamped = from_local_transport(transport, principals_dir=d, strict=strict)
     else:
         # Non-local transports would normally require authenticated principal id.
         # For G11 minimal we still give a local-style default (future work: mTLS etc.)
-        stamped = from_local_transport("http", principals_dir=d)
+        stamped = from_local_transport("http", principals_dir=d, strict=strict)
 
     if supplied_agent_id is None:
         return stamped
@@ -435,17 +442,6 @@ def can_read_document(
     if agent == principal.agent_id or agent == "unknown":
         return True
 
-    # Shared wiki / handoff / synthesis / decision pages are intentionally cross-visible
-    # when the principal's vault roots allow the path (authorized shared context).
-    page_type = str(doc_metadata.get("page_type") or "").lower()
-    if (
-        page_type in {"wiki", "handoff", "synthesis", "decision", "session"}
-        or agent.lower().startswith(("wiki:", "handoff"))
-        or "wiki" in agent.lower()
-        or "handoff" in agent.lower()
-    ):
-        return True
-
     # Operator/governance principals may read non-blocked foreign content within their roots
     # (for audit, resolve, oversight). Still vault-gated.
     if is_operator_principal(principal):
@@ -454,6 +450,17 @@ def can_read_document(
     # Foreign agent + private or local-only → explicit deny (G20 core)
     if privacy in {"private", "local-only"}:
         return False
+
+    # Shared wiki / handoff / synthesis / decision pages are intentionally cross-visible
+    # when the principal's vault roots allow the path and the page is not private.
+    page_type = str(doc_metadata.get("page_type") or "").lower()
+    if (
+        page_type in {"wiki", "handoff", "synthesis", "decision", "session"}
+        or agent.lower().startswith(("wiki:", "handoff"))
+        or "wiki" in agent.lower()
+        or "handoff" in agent.lower()
+    ):
+        return True
 
     # Default-deny any other cross-agent case
     return False
