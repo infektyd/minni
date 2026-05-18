@@ -1,6 +1,16 @@
 # Sovereign Memory Plugin
 
-Local-first plugin for Sovereign Memory. Multi-target: ships a Codex plugin (`.codex-plugin/`), Claude Code plugin (`.claude-plugin/`), Gemini extension (`.gemini-plugin/`), and KiloCode plugin (`.kilocode-plugin/`) from the same source tree and shared `dist/` build. Each agent gets its own Obsidian vault; all agents share the same daemon. Exposes recall, AI-facing vault context packs, manual vault-first learning, learning quality checks, structured Obsidian note writes, compile dry-runs, handoffs, information request contracts, and audit tools through MCP. On Claude Code and KiloCode, hooks wire memory in as a session spine.
+Local-first plugin for Sovereign Memory. It ships Codex (`.codex-plugin/`),
+Claude Code (`.claude-plugin/`), Gemini (`.gemini-plugin/`), and KiloCode
+(`.kilocode-plugin/`) surfaces from the same TypeScript MCP server and shared
+`dist/` build. Each agent gets its own Obsidian-compatible vault; all agents
+share the same local daemon.
+
+The plugin exposes recall, prepare-task packets, proposal-first learning,
+learning quality checks, structured vault notes, compile dry-runs, handoffs,
+information request contracts, candidate resolution, audit tools, and temporary
+team runtime packets. On Claude Code and KiloCode, hooks wire memory in as a
+session spine.
 
 The frontend is a Vite + React + TypeScript app under [frontend-src/](frontend-src/), built into the served [frontend/](frontend/) directory. Run `npm run console` (which runs `tsc && vite build && node dist/ui-server.js`) to start the local-only bridge at `http://127.0.0.1:8765/`. Eight screens are wired through the Tweaks panel-controlled rail:
 
@@ -9,7 +19,9 @@ The frontend is a Vite + React + TypeScript app under [frontend-src/](frontend-s
 - **Dry-run Review** — POST `/api/prepare-outcome`. Submit task + summary; the response's `outcomeDraft` partitions into LEARN CANDIDATES / LOG-ONLY / DO-NOT-STORE columns. Approve/Defer/Reject is a UI decision only — nothing is stored.
 - **Audit Trail** — GET `/api/audit-tail?limit=N`. Parses the daemon's `## [iso-ts] tool | summary` markdown into a sortable table.
 - **Settings** — GET `/api/status` + `/api/health`. Shows daemon socket, AFM adapter, vault path, and bridge tools.
-- **Handoffs / Vaults / Policy & AFM** — empty-state placeholders; no API behind them yet.
+- **Handoffs / Vaults / Policy & AFM** — read-only placeholders for surfaces
+  that are still operated through MCP tools or daemon calls rather than console
+  screens.
 
 Two themes ship: **Paper** (default, warm bone + persimmon stamp + verdigris accents) and **Phosphor** (CRT operator board with telemetry rail and live activity stream). Toggle from the gear button bottom-right. Layout sizes and theme persist to `localStorage`.
 
@@ -40,12 +52,11 @@ distillation and records sanitized provider metadata (`backend`,
 returned or sent to the model prompt. `bridge` preserves the earlier
 OpenAI-compatible localhost behavior.
 
-Set `SOVEREIGN_AFM_NATIVE_HELPER` to the repo-local
-`engine/native_afm_helper` wrapper to let native prepare-task/outcome
-distillation call Foundation Models directly through the JSON helper contract.
-Future adapter configuration may be indicated with `SOVEREIGN_AFM_ADAPTER_PATH`
-or `SOVEREIGN_AFM_ADAPTER_ID`; status reports only `adapterConfigured`, never
-the private path.
+Set `SOVEREIGN_AFM_NATIVE_HELPER` to an executable JSON helper to let native
+prepare-task/outcome distillation call a local Foundation Models adapter.
+Adapter configuration may be indicated with `SOVEREIGN_AFM_ADAPTER_PATH` or
+`SOVEREIGN_AFM_ADAPTER_ID`; status reports only `adapterConfigured`, never the
+private path.
 
 ## Tools
 
@@ -56,6 +67,8 @@ the private path.
 - `sovereign_recall`
 - `sovereign_learning_quality`
 - `sovereign_learn`
+- `sovereign_resolve_candidate` — operator-gated resolution for staged learning
+  candidates
 - `sovereign_vault_write`
 - `sovereign_audit_report`
 - `sovereign_audit_tail`
@@ -79,6 +92,20 @@ the private path.
 `sovereign_team_promotion` turns a temporary profile plus evidence candidate into a permanent-profile draft only when `approved` is explicitly true. It still does not write durable memory; the returned profile is a review artifact that must be persisted through an intentional profile/write workflow.
 
 The team runtime does not spawn agents, execute background work, write durable memory, or promote profiles automatically.
+
+## Candidate Learning
+
+Durable learning is proposal-first. Ordinary learn calls stage candidate packets
+through the daemon instead of silently mutating long-term memory. Operators can
+list and resolve candidates through the local console API (`/api/candidates`,
+`/api/resolve-candidate`) or the explicit `sovereign_resolve_candidate` tool.
+
+Candidate acceptance writes a durable learning. Rejection, redaction, log-only,
+and sensitivity decisions remain auditable without promoting the content into
+recall.
+
+## Agent Information Requests
+
 - `sovereign_negotiate_handoff` — runtime-stamped agent-to-agent work-transfer envelope (top recalls, scar tissue, open questions, inbox pointer)
 - `sovereign_ping_agent_request` — create a vault-backed information request contract for another agent
 - `sovereign_ping_agent_inbox` — list this runtime agent's pending and decided request contracts
@@ -179,8 +206,10 @@ The console exposes only local HTTP endpoints:
 - `GET /api/audit-tail?limit=20`
 - `POST /api/prepare-task`
 - `POST /api/prepare-outcome`
+- `GET /api/candidates`
+- `POST /api/resolve-candidate`
 
-The server binds to `127.0.0.1`, refuses non-local bind hosts, rejects non-local host/origin/fetch-metadata requests, requires JSON POST bodies, caps JSON request bodies, redacts machine-local paths in browser-facing status/audit responses, and does not expose learn or vault-write endpoints. Browser requests cannot override the server-owned vault path or AFM target. `prepare-task` keeps its existing audit behavior; `prepare-outcome` remains dry-run only.
+The server binds to `127.0.0.1`, refuses non-local bind hosts, rejects non-local host/origin/fetch-metadata requests, requires JSON POST bodies, caps JSON request bodies, redacts machine-local paths in browser-facing status/audit/candidate responses, and does not expose learn or vault-write endpoints. Browser requests cannot override the server-owned vault path or AFM target. `prepare-task` keeps its existing audit behavior; `prepare-outcome` remains dry-run only.
 
 The bridge defaults to `~/.sovereign-memory/codex-vault`. Override with `SOVEREIGN_CODEX_VAULT_PATH=~/.sovereign-memory/claudecode-vault npm run console` to point Recall at a different vault.
 
