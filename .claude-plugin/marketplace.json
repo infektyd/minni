@@ -8,7 +8,7 @@
   "plugins": [
     {
       "name": "sovereign-memory",
-      "description": "Local-first Sovereign Memory spine for Claude Code.",
+      "description": "Local-first Sovereign Memory spine for Claude Code with per-agent vaults, review-first learning, and native AFM provider support.",
       "version": "0.1.0",
       "source": "./plugins/sovereign-memory",
       "author": {

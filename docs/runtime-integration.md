@@ -9,10 +9,10 @@ Sovereign Memory can run in three layers:
    `integrations/openclaw-extension/`, responsible for connecting OpenClaw
    agents to Sovereign Memory through a local Unix-socket daemon.
 3. **Local model services**: optional adjacent services used by an operator,
-   such as an Apple Foundation Models bridge for structured extraction. These
-   services should be configured by environment variables and kept outside the
-   public repository when they contain machine paths, model artifacts, adapter
-   bundles, logs, or private datasets.
+   including the native Apple Foundation Models JSON helper and the
+   OpenAI-compatible localhost bridge. Machine-specific model artifacts,
+   adapter bundles, logs, and private datasets stay outside the public
+   repository.
 
 ## Public Repository Boundary
 
@@ -40,7 +40,7 @@ The OpenClaw extension uses environment-driven defaults:
 This keeps the public integration portable while allowing local installs to
 preserve compatibility with existing runtime layouts.
 
-## Local Extraction
+## Local AFM and Extraction
 
 The package includes `sovereign_memory.extraction`, a small stdlib-only client
 for local OpenAI-compatible model bridges. By default it targets a local Apple
@@ -61,9 +61,28 @@ sovereign-memory extract ./session.md --learn-agent hermes --durable-only
 This keeps extraction code usable while leaving model binaries, adapters,
 training data, and launchd configuration outside the repository.
 
+Runtime AFM calls now use an explicit provider boundary rather than assuming
+only the localhost bridge. Supported modes are `off`, `bridge`, `native`, and
+`auto`. The native path talks JSON over stdin/stdout to an executable helper,
+with `engine/native_afm_helper` providing a compile-safe Apple Foundation Models
+implementation where the framework is available. The bridge path remains for
+compatibility.
+
+The normalized native operation contracts are:
+
+- `query_expansion` -> `{ "queries": string[] }`
+- `neighborhood_summary` -> `{ "summary": string }`
+- `hyde_generation` -> `{ "answer": string }`
+- `prepare_task` -> `{ "brief": string, "recommendedNextActions": string[], "risks": string[] }`
+- `prepare_outcome` -> `{ "outcomeDraft": { ... } }`
+- `compile_pass_proposals` -> `{ "drafts": [...] }`
+
+Status reports expose provider mode, backend, availability, and a boolean
+adapter-configured flag. They do not emit private adapter paths.
+
 ## Team Runtime
 
-The Codex/Claude/Kilo plugin exposes a coordinator-side Sovereign Team Runtime
+The Codex/Claude/Gemini/Kilo plugin exposes a coordinator-side Sovereign Team Runtime
 for temporary helper agents:
 
 - `sovereign_team_runtime` builds temporary profiles, a task ledger, hydration

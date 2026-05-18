@@ -18,7 +18,7 @@ that keep recall useful without making memory authoritative.
 | Prompt injection via recalled content | A hostile note tries to override agent or system instructions. | Recall envelopes carry provenance and action hints; agents treat memory as citation only. Instruction-like content is flagged and never promoted to command authority. |
 | Daemon socket access | A local process calls JSON-RPC methods unexpectedly. | Default binding is local-only. Operators should keep sockets under user-writable private paths and avoid exposing HTTP fallback outside loopback. |
 | Vault path traversal | A plugin or tool attempts to read or write outside the configured vault. | Vault tooling validates paths against the vault root and rejects raw traversal. Generated pages use normalized relative paths. |
-| AFM bridge tampering | Extraction output is altered or confused with source material. | AFM outputs carry trace identifiers, model/backend provenance, source references, and review status before acceptance. |
+| AFM provider tampering | Extraction or distillation output is altered or confused with source material. | AFM outputs carry trace identifiers, provider/backend provenance, source references, redacted status metadata, and review status before acceptance. |
 | Vector backend leakage | Private or blocked content appears through semantic recall. | Retrieval filters by `privacy_level` and page lifecycle status before final assembly. FAISS backends post-filter through SQLite metadata; native backends must enforce the same fields. |
 
 ## Failure Posture
@@ -33,5 +33,5 @@ the conservative posture is local-only.
 - New cross-process envelope fields.
 - New vault write paths.
 - New vector backend adapters.
-- New AFM extraction or synthesis passes.
+- New AFM provider, extraction, or synthesis passes.
 - Any default flip based on eval harness results.

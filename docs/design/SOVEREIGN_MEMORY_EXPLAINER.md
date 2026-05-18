@@ -451,12 +451,16 @@ against live files, commands, or the current application.
 
 ## The AFM Backend Loop
 
-AFM here means a local Apple Foundation Models bridge used as an optional
-backend assistant. It is not the source of truth. It is a compiler and organizer
-that can propose better memory artifacts.
+AFM here means an optional Apple Foundation Models provider used as a backend
+assistant. It can run through the native JSON helper or through the older
+localhost OpenAI-compatible bridge. It is not the source of truth. It is a
+compiler and organizer that can propose better memory artifacts.
 
 The AFM loop is opt-in. It produces drafts, inbox items, traces, and proposals.
-It should not silently rewrite accepted knowledge.
+It should not silently rewrite accepted knowledge. If the native Foundation
+Models framework is unavailable, the system reports that status and either
+falls back to the bridge in `auto` mode or skips AFM work in `native`/`off`
+mode.
 
 ```mermaid
 flowchart TB
@@ -561,6 +565,7 @@ Sovereign Memory has several kinds of truth, and they should not be confused.
 | Raw vault files | Evidence and historical source material. |
 | Recall result | Ranked evidence, not instruction. |
 | AFM draft | Proposed organization, not accepted memory. |
+| Native AFM output | Structured provider result, still subject to review and redaction. |
 | Audit log | Transparency trail of what memory operations happened. |
 
 This distinction keeps the system grounded. If recall says one thing and the
@@ -574,4 +579,3 @@ Sovereign Memory is a local, inspectable LLM wiki with a shared recall daemon:
 Layer 1 gives an agent stable orientation, Layer 2 retrieves task-specific
 knowledge, the vault keeps memory visible, chunking keeps recall precise, and
 AFM backend agents help organize drafts without silently becoming authority.
-

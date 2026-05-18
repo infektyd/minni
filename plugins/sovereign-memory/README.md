@@ -31,12 +31,16 @@ Two themes ship: **Paper** (default, warm bone + persimmon stamp + verdigris acc
 - AFM health URL: `http://127.0.0.1:11437/health`
 - AFM provider mode: `bridge` by default; set `SOVEREIGN_AFM_PROVIDER_MODE=native`, `auto`, or `off` to change opt-in AFM calls.
 - Codex vault: `~/.sovereign-memory/codex-vault`
+- Claude Code vault: `~/.sovereign-memory/claudecode-vault`
+- Gemini vault: `~/.sovereign-memory/gemini-vault`
 - KiloCode vault: `~/.sovereign-memory/kilocode-vault`
 
 Override with:
 
 ```bash
 export SOVEREIGN_CODEX_VAULT_PATH=/path/to/codex-vault
+export SOVEREIGN_CLAUDECODE_VAULT_PATH=/path/to/claudecode-vault
+export SOVEREIGN_GEMINI_VAULT_PATH=/path/to/gemini-vault
 export SOVEREIGN_KILOCODE_VAULT_PATH=/path/to/kilocode-vault
 export SOVEREIGN_SOCKET_PATH=~/.sovereign-memory/run/sovrd.sock
 export SOVEREIGN_AFM_HEALTH_URL=http://127.0.0.1:11437/health
@@ -45,15 +49,19 @@ export SOVEREIGN_AFM_PROVIDER_MODE=native
 ```
 
 `sovereign_prepare_task` and `sovereign_prepare_outcome` also accept
-`afmProviderMode` per call (`bridge`, `native`, `auto`, or `off`). `native`
-checks the AFM health endpoint for an Apple Foundation Models backend before
-distillation and records sanitized provider metadata (`backend`,
-`availability`, `adapterConfigured`) in the packet. Adapter paths are not
-returned or sent to the model prompt. `bridge` preserves the earlier
-OpenAI-compatible localhost behavior.
+`afmProviderMode` per call (`bridge`, `native`, `auto`, or `off`). `bridge`
+preserves the earlier OpenAI-compatible localhost behavior. `native` calls an
+executable JSON helper, checks for an Apple Foundation Models backend, and
+records sanitized provider metadata (`backend`, `availability`,
+`adapterConfigured`) in the packet. `auto` prefers native when healthy and
+falls back to bridge. Adapter paths are not returned or sent to the model
+prompt.
 
 Set `SOVEREIGN_AFM_NATIVE_HELPER` to an executable JSON helper to let native
-prepare-task/outcome distillation call a local Foundation Models adapter.
+prepare-task/outcome distillation call a local Foundation Models backend. The
+repo ships a compile-safe helper at `engine/native_afm_helper`; callers can
+point the plugin at it or at a platform-specific helper with the same JSON
+contract.
 Adapter configuration may be indicated with `SOVEREIGN_AFM_ADAPTER_PATH` or
 `SOVEREIGN_AFM_ADAPTER_ID`; status reports only `adapterConfigured`, never the
 private path.

@@ -57,6 +57,8 @@ This repo currently contains:
   KiloCode, and direct MCP registration.
 - Local vault support for human-readable memory pages, logs, raw material,
   inbox/outbox handoffs, and schema notes.
+- Native AFM provider support for Apple Foundation Models through a local JSON
+  helper, with bridge fallback and opt-out modes.
 - Evaluation scaffolding for recall quality gates and comparison reports.
 - Governance contracts for local-first security, stamped principal identity,
   read policy, learning approval, handoffs, policy, threat model, and memory
@@ -65,9 +67,10 @@ This repo currently contains:
 Observed usage so far suggests the system is most useful when it recovers
 specific operational state, tracks open loops, and forces remembered claims
 through verification before acting. Current work has closed the core safety
-gaps around identity binding, proposal-first learning, cross-agent consent, AFM
-provider hardening, and read authorization. It still needs larger comparative
-evaluation against simpler wiki-only and RAG workflows.
+gaps around identity binding, proposal-first learning, cross-agent consent,
+native AFM provider wiring, provider hardening, and read authorization. It
+still needs larger comparative evaluation against simpler wiki-only and RAG
+workflows.
 
 The important boundary: **SQLite is runtime truth. Vault pages, graph exports,
 FAISS files, context packs, and compile drafts are derived or review surfaces.**
@@ -230,6 +233,7 @@ The plugin exposes:
 - `sovereign_route`
 - `sovereign_learning_quality`
 - `sovereign_learn`
+- `sovereign_resolve_candidate`
 - `sovereign_vault_write`
 - `sovereign_audit_report`
 - `sovereign_audit_tail`
@@ -296,11 +300,26 @@ SOVEREIGN_AFM_LOOP=on python3 -m sovereign_memory compile --pass session_distill
 SOVEREIGN_AFM_LOOP=on python3 -m sovereign_memory compile --pass synthesis --dry-run
 ```
 
-The TypeScript plugin can optionally send prepare-task and prepare-outcome
-packets through an AFM provider. The default `bridge` mode preserves the
-localhost OpenAI-compatible bridge. `native` uses the configured
-`SOVEREIGN_AFM_NATIVE_HELPER` JSON helper when available, `auto` falls back to
-the bridge, and `off` skips AFM calls.
+## AFM Provider Modes
+
+AFM calls are optional and local-only. The provider modes are:
+
+| Mode | Behavior |
+| --- | --- |
+| `off` | Skip AFM calls and use deterministic fallback behavior. |
+| `bridge` | Use the existing localhost OpenAI-compatible bridge. This is the default compatibility mode. |
+| `native` | Use the local JSON helper at `engine/native_afm_helper`, which calls Apple Foundation Models through the Foundation Models framework when available. |
+| `auto` | Prefer native when available, then fall back to the bridge. |
+
+Python retrieval helpers now consume normalized AFM contracts for query
+expansion, neighborhood summary, and HyDE generation through
+[engine/afm_provider.py](engine/afm_provider.py). The session distillation pass
+can also accept structured native compile proposals, but all compile outputs
+remain review-only drafts.
+
+The TypeScript plugin uses the same provider concepts for prepare-task and
+prepare-outcome packets. Configure behavior with `SOVEREIGN_AFM_PROVIDER_MODE`
+or the per-call `afmProviderMode` option.
 
 ```bash
 cd plugins/sovereign-memory
@@ -310,6 +329,9 @@ SOVEREIGN_AFM_PROVIDER_MODE=auto npm test -- tests/afm.test.mjs
 Native provider metadata is sanitized before it reaches status reports or model
 packets. Adapter configuration is reported as boolean metadata only through
 `adapter_configured` / `adapterConfigured`; private adapter paths are not emitted.
+If Foundation Models are unavailable on a machine, native mode reports a clear
+unavailable status and `auto` falls back without blocking recall or compile
+dry-runs.
 
 Build and test the plugin:
 
@@ -428,7 +450,7 @@ Also run a temp-state live smoke:
 - Verify redaction, traceability, and clean SIGTERM shutdown.
 - Run migration safety on a SQLite backup, never directly on the live DB.
 
-The current acceptance baseline is `318 passed` for engine tests and
+The current acceptance baseline is `333 passed` for engine tests and
 `121 passed` for plugin tests.
 
 ## Repository Map

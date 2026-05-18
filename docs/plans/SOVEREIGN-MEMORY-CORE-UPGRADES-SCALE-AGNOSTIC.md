@@ -71,7 +71,7 @@ This is what makes the vault program-agnostic: each consumer (Claude Code, Codex
 
 - **The AFM loop never auto-accepts.** Drafts and candidates live in the same lifecycle every other write does. Endorsement is an explicit act by an agent or human.
 - **The AFM loop never deletes.** It supersedes (writing `superseded_by`) or expires (setting `status: expired`). Originals remain in `_archive/` per the existing project convention.
-- **The AFM loop is gracefully degradable.** If the AFM bridge is down, no compilation happens; existing vault stays valid. Phase 5.4 hygiene continues to surface what *would have been* candidates so the operator/agent can see what the loop missed.
+- **The AFM loop is gracefully degradable.** If the configured AFM provider is unavailable, no compilation happens unless `auto` can fall back to the bridge; existing vault state stays valid. Phase 5.4 hygiene continues to surface what *would have been* candidates so the operator/agent can see what the loop missed.
 - **The AFM loop is auditable.** Every draft it produces carries `agent: afm-loop` + `trace_id` in frontmatter. Phase 4.2's trace endpoint exposes the inputs (which raw sources, which recalls, which prompt) so the operator can inspect why a candidate was proposed.
 
 The AFM loop is described concretely in the new Phase 6 below. Phases 1–5 stand as written; Phase 6 is the layer that turns those into a self-organizing surface.
@@ -374,10 +374,10 @@ Documented, repeatable workflows that agents (and the operator) follow. Each is 
 
 - New file: `engine/query_expand.py`. Two strategies behind a single function `expand(query) -> list[str]`:
   - **Rule-based** (default-on, instant): synonym table (small YAML in `engine/data/synonyms.yml`), acronym expansion, casing variants. ~5ms.
-  - **AFM-assisted** (opt-in via `expand="afm"`): calls existing AFM bridge at `127.0.0.1:11437/v1/chat/completions` with a 2-shot prompt that returns 2-3 reformulations.
+  - **AFM-assisted** (opt-in via `expand="afm"`): calls the configured AFM provider (`native`, `bridge`, `auto`, or `off`) and consumes normalized query reformulations.
 - `search()` accepts `expand: bool | "rule" | "afm"`. Default `True` = rule-based (cheap). Each variant runs full hybrid retrieval; results merged via RRF.
 - Response includes `query_variants: list[str]`.
-- **Graph Neighborhood Summarization (AFM-assisted):** `search()` accepts `summarize_neighborhood: bool`. When an agent recalls a specific entity/concept page, the daemon uses the AFM bridge to quickly summarize its 1-hop wiki links (e.g., "Entity X is heavily cited alongside System Y and was superseded by Z"). This saves the agent from spending multiple `expand()` token roundtrips performing manual graph traversal.
+- **Graph Neighborhood Summarization (AFM-assisted):** `search()` accepts `summarize_neighborhood: bool`. When an agent recalls a specific entity/concept page, the daemon uses the configured AFM provider to quickly summarize its 1-hop wiki links (e.g., "Entity X is heavily cited alongside System Y and was superseded by Z"). This saves the agent from spending multiple `expand()` token roundtrips performing manual graph traversal.
 - **Default-flip gate:** AFM mode only flips on after Phase 3.0 harness shows ≥+5% recall@5.
 - **Risk:** Latency — rule-based is negligible; AFM is +200ms but gated.
 
@@ -474,7 +474,7 @@ A nightly (or on-demand) audit of the vault as a document collection, complement
 
 ## Phase 6 — Vault evolution (the AFM compilation loop)
 
-The vault becomes a self-organizing LLM-wiki. The AFM bridge already exists in the codebase as a distillation helper for `prepare-task`/`prepare-outcome` packets (used by `engine/task.py` analog and the plugin's `task.ts`); Phase 6 generalizes it into a scheduled and on-demand vault-tending loop. Lean by default: the loop is opt-in, observable, fully degradable, and never writes durable memory without lifecycle gating.
+The vault becomes a self-organizing LLM-wiki. AFM support exists as a provider boundary with `off`, `bridge`, `native`, and `auto` modes for retrieval assistance, compile proposals, and prepare-task/prepare-outcome packets. Phase 6 generalizes that provider boundary into a scheduled and on-demand vault-tending loop. Lean by default: the loop is opt-in, observable, fully degradable, and never writes durable memory without lifecycle gating.
 
 ### 6.1 Compilation passes
 
@@ -574,7 +574,7 @@ In addition to the universal verification list:
 1. **Loop dry-run sanity.** `python -m engine.sovereign_memory compile --pass session_distillation --dry-run` against a known vault: returns N drafts, no writes occurred, no daemon state changed.
 2. **Loop wet-run gating.** Same call without `--dry-run`: drafts land as `status: draft`, agent inbox file written, daemon audit shows `afm_loop_*` entries, no `accepted` pages produced without explicit endorsement.
 3. **Endorsement round-trip.** Agent calls `daemon.endorse(page_id, decision="accept")`: page transitions to `candidate` (or `accepted` per policy), audit recorded, draft removed from inbox.
-4. **Degraded-mode safety.** With AFM bridge stopped: scheduler skips runs cleanly, daemon stats show `afm_loop_status: "afm_unavailable"`, vault is unchanged, agents continue working normally.
+4. **Degraded-mode safety.** With the configured AFM provider unavailable: scheduler skips runs cleanly or uses bridge fallback in `auto` mode, daemon stats show the unavailable/fallback state, vault is unchanged, agents continue working normally.
 5. **Quality gate enforcement.** A pass that produces a contradicting draft is blocked at the existing contradiction detection (Phase 3.3), surfaces the conflict, does not write.
 6. **Observability completeness.** Every draft visible in `daemon.trace(trace_id)` with full prompt, inputs, model response.
 
@@ -666,7 +666,7 @@ Each PR is independently shippable, independently revertible, and leaves the dae
 
 1. **Existing test suite green.** `cd engine && pytest -q` (or whatever the project uses; if no Python tests exist yet, the first PR should also bootstrap a `tests/` directory with smoke tests for the existing JSON-RPC contract).
 2. **JSON-RPC contract test.** Spin up the daemon, call every method that existed before the PR, assert response shape unchanged for old fields; new fields are additive.
-3. **Cross-agent integration smoke.** Run the existing Codex plugin test suite (`cd plugins/sovereign-memory && npm test`) — all 29 tests must still pass. Run the Claude Code hook smoke (`npm run smoke:hook`) — must still emit valid envelopes.
+3. **Cross-agent integration smoke.** Run the existing plugin test suite (`cd plugins/sovereign-memory && npm test`) — the current public baseline is 121 tests. Run the Claude Code hook smoke (`npm run smoke:hook`) — must still emit valid envelopes.
 4. **Live recall sanity.** With Sovereign daemon running, `python -m engine.sovereign_memory query "<known query>"` returns the same top result rank (within ±1 position) before and after the PR.
 5. **Migration safety.** Apply all migrations to a copy of the user's live `sovereign_memory.db`; assert no rows lost, all existing JSON-RPC reads return identical results.
 6. **Recall harness regression check** (after Phase 3.0): the eval harness must show no regression vs the prior commit on the seed query set; new feature defaults flip only with ≥+5% recall@5.
@@ -679,7 +679,7 @@ Each PR is independently shippable, independently revertible, and leaves the dae
 - Does not remove FAISS. Persistent FAISS is the new default; in-memory FAISS stays as `faiss-mem`.
 - Does not change the JSON-RPC method signatures. Only adds optional kwargs and additive response fields.
 - Does not change the chunker's existing output for already-indexed content. Reindex is opt-in.
-- Does not introduce mandatory network dependencies. AFM bridge is already optional and stays optional. Vector DB adapters stay stubbed unless extras are installed.
+- Does not introduce mandatory network dependencies. AFM providers are optional and stay optional; bridge mode remains local-only. Vector DB adapters stay stubbed unless extras are installed.
 - Does not touch the four agent-vault directories (Codex, Claude Code, Hermes, OpenClaw). Vault contracts unchanged on disk; new fields are additive frontmatter the existing pages remain valid without.
 - Does not write into another agent's vault. Cross-agent communication is mediated through inbox/outbox + handoff packets only.
 - Does not treat recalled content as instruction. Memory is evidence; the agent decides.
