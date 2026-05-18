@@ -33,14 +33,21 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 from eval.harness import (
     _MockSearcher,
+    RipgrepSearcher,
     _calibration_error,
     _extract_doc_ids,
     _mrr,
+    _ndcg_at_k,
     _recall_at_k,
+    _token_budget_recall_at_k,
     _write_json_report,
     _write_markdown_comparison,
+    evaluate_gate,
+    harvest_queries,
     load_queries,
+    make_searcher,
     run_eval,
+    validate_queries,
 )
 
 
@@ -144,6 +151,52 @@ class TestRecallAtK:
     def test_k_1(self):
         assert _recall_at_k([1], [1, 2, 3], k=1) == 1.0
         assert _recall_at_k([2], [1, 2, 3], k=1) == 0.0
+
+
+# ---------------------------------------------------------------------------
+# 4.3b  nDCG@K and token-budget-normalized recall
+# ---------------------------------------------------------------------------
+
+class TestAdversarialMetrics:
+
+    def test_ndcg_uses_graded_relevance(self):
+        """nDCG rewards putting higher-grade documents earlier."""
+        relevance = {10: 3.0, 20: 2.0, 30: 1.0}
+
+        perfect = _ndcg_at_k(relevance, [10, 20, 30], k=3)
+        weak = _ndcg_at_k(relevance, [30, 20, 10], k=3)
+
+        assert perfect == pytest.approx(1.0)
+        assert 0.0 < weak < perfect
+
+    def test_ndcg_accepts_expected_doc_ids_as_binary_relevance(self):
+        """Legacy expected_doc_ids entries still score as binary relevance."""
+        assert _ndcg_at_k([1, 2], [2, 1, 99], k=3) == pytest.approx(1.0)
+
+    def test_token_budget_recall_counts_only_hits_inside_budget(self):
+        result_ids = [10, 20, 30]
+        token_counts = [100, 100, 100]
+
+        recall = _token_budget_recall_at_k(
+            expected_ids=[10, 20, 30],
+            result_doc_ids=result_ids,
+            result_token_counts=token_counts,
+            k=3,
+            budget_tokens=200,
+        )
+
+        assert recall == pytest.approx(2 / 3)
+
+    def test_token_budget_recall_includes_first_oversized_result(self):
+        recall = _token_budget_recall_at_k(
+            expected_ids=[10],
+            result_doc_ids=[10, 20],
+            result_token_counts=[500, 1],
+            k=2,
+            budget_tokens=100,
+        )
+
+        assert recall == pytest.approx(1.0)
 
 
 # ---------------------------------------------------------------------------
@@ -308,6 +361,115 @@ class TestUnknownKwargs:
         assert not any("use_hyde" in m for m in caplog.messages)
         assert seen["use_hyde"] is True
         assert isinstance(results, list)
+
+
+# ---------------------------------------------------------------------------
+# 4.7b  Pluggable retriever seam
+# ---------------------------------------------------------------------------
+
+class TestRetrieverPlugins:
+
+    def test_make_searcher_returns_mock_searcher(self):
+        searcher = make_searcher(
+            "mock",
+            queries=[{"query": "alpha", "expected_doc_ids": [7]}],
+        )
+
+        results = searcher.search("alpha", limit=1)
+
+        assert results[0]["doc_id"] == 7
+
+    def test_make_searcher_rejects_unknown_retriever(self):
+        with pytest.raises(ValueError, match="Unknown retriever"):
+            make_searcher("imaginary")
+
+    def test_ripgrep_searcher_returns_matching_files(self, tmp_path):
+        (tmp_path / "a.md").write_text("Alpha memory handoff lease protocol\n", encoding="utf-8")
+        (tmp_path / "b.md").write_text("Unrelated note\n", encoding="utf-8")
+
+        searcher = RipgrepSearcher(tmp_path)
+        results = searcher.search("handoff lease", limit=5)
+
+        assert len(results) == 1
+        assert results[0]["retriever"] == "ripgrep"
+        assert results[0]["source"].endswith("a.md")
+        assert "handoff lease" in results[0]["text"].lower()
+
+
+# ---------------------------------------------------------------------------
+# 4.7c  Dataset validation, harvest, and gate helpers
+# ---------------------------------------------------------------------------
+
+class TestDatasetValidationAndGate:
+
+    def test_validate_queries_requires_reviewed_path_or_doc_ids(self):
+        queries = [
+            {
+                "query": "handoff lease",
+                "expected_refs": ["wiki/handoffs/example.md"],
+                "expected_relevance": {"1": 3},
+                "reviewed": True,
+                "notes": "exact-match",
+            },
+            {"query": "placeholder", "expected_doc_ids": [1], "notes": "exact-match"},
+        ]
+
+        report = validate_queries(queries, min_reviewed=1)
+
+        assert report["ok"] is False
+        assert report["reviewed_count"] == 1
+        assert any("reviewed" in err for err in report["errors"])
+
+    def test_validate_queries_passes_reviewed_entries(self):
+        queries = [
+            {
+                "query": "handoff lease",
+                "expected_refs": ["wiki/handoffs/example.md"],
+                "expected_doc_ids": [1],
+                "expected_relevance": {"1": 3},
+                "reviewed": True,
+                "notes": "exact-match",
+                "answer_rubric": "Must mention lease expiry.",
+                "privacy_expectation": "safe",
+            }
+        ]
+
+        report = validate_queries(queries, min_reviewed=1)
+
+        assert report["ok"] is True
+        assert report["errors"] == []
+
+    def test_harvest_queries_creates_review_candidates(self, tmp_path):
+        source = tmp_path / "wiki" / "contracts"
+        source.mkdir(parents=True)
+        (source / "AGENT.md").write_text("# Agent Contract\nHandoff lease ack protocol.\n", encoding="utf-8")
+
+        candidates = harvest_queries([source], limit=5)
+
+        assert len(candidates) == 1
+        assert candidates[0]["reviewed"] is False
+        assert candidates[0]["expected_refs"] == [str(source / "AGENT.md")]
+
+    def test_gate_fails_when_sovrd_loses_to_ripgrep_too_often(self):
+        reports = {
+            "sovrd": {
+                "per_query": [
+                    {"query": "a", "recall_at_k": {5: 0.0}},
+                    {"query": "b", "recall_at_k": {5: 1.0}},
+                ]
+            },
+            "ripgrep": {
+                "per_query": [
+                    {"query": "a", "recall_at_k": {5: 1.0}},
+                    {"query": "b", "recall_at_k": {5: 1.0}},
+                ]
+            },
+        }
+
+        gate = evaluate_gate(reports, primary="sovrd", baseline="ripgrep", max_loss_rate=0.20)
+
+        assert gate["ok"] is False
+        assert gate["loss_rate"] == pytest.approx(0.5)
 
 
 # ---------------------------------------------------------------------------

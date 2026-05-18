@@ -14,6 +14,7 @@ Covers:
 """
 
 import os
+import json
 import tempfile
 from pathlib import Path
 
@@ -26,6 +27,25 @@ from sovrd import (
     _handle_daemon_endorse,
     _guard_vault_root,
 )
+
+
+def _install_strict_principal(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, allowed_root: Path) -> None:
+    import principal as principal_mod
+
+    principals = tmp_path / "principals"
+    principals.mkdir()
+    (principals / "main.json").write_text(
+        json.dumps(
+            {
+                "agent_id": "main",
+                "capabilities": ["*"],
+                "allowed_vault_roots": [str(allowed_root)],
+            }
+        ),
+        encoding="utf-8",
+    )
+    os.chmod(principals / "main.json", 0o600)
+    monkeypatch.setattr(principal_mod, "PRINCIPALS_DIR", principals)
 
 
 def test_allows_vault_root_happy_and_default():
@@ -70,8 +90,8 @@ def test_vault_root_denies_symlink_escape(tmp_path: Path):
     assert not p.allows_vault_root(str(link))
 
 
-def test_guard_vault_root_returns_structured_deny_for_bad_path(tmp_path: Path):
-    # Use a path guaranteed outside the synthesized default (which is CANONICAL_SOVEREIGN_HOME)
+def test_guard_vault_root_returns_structured_deny_for_bad_path(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    _install_strict_principal(monkeypatch, tmp_path, tmp_path / "allowed-vault")
     bad_vault = str(tmp_path / "completely-unrelated-vault-3549")
     params = {"agent_id": "main", "vault_path": bad_vault}
     err = _guard_vault_root(params, bad_vault, "t1", label="test")
@@ -81,7 +101,8 @@ def test_guard_vault_root_returns_structured_deny_for_bad_path(tmp_path: Path):
     assert "realpath" in err["error"]["message"] or "allowed_vault_roots" in err["error"]["message"]
 
 
-def test_hygiene_handler_denies_bad_vault(tmp_path: Path):
+def test_hygiene_handler_denies_bad_vault(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    _install_strict_principal(monkeypatch, tmp_path, tmp_path / "allowed-vault")
     bad = str(tmp_path / "evil-hygiene-vault")
     resp = _handle_hygiene_report({"vault_path": bad}, "req-1")
     assert "error" in resp
@@ -89,7 +110,8 @@ def test_hygiene_handler_denies_bad_vault(tmp_path: Path):
     assert "vault_root_denied" in resp["error"]["message"]
 
 
-def test_compile_handler_denies_bad_vault(tmp_path: Path):
+def test_compile_handler_denies_bad_vault(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    _install_strict_principal(monkeypatch, tmp_path, tmp_path / "allowed-vault")
     bad = str(tmp_path / "evil-compile-vault")
     resp = _handle_daemon_compile({"pass_name": "session_distillation", "vault_path": bad, "dry_run": True}, "req-2")
     # Guard runs immediately after pass_name validation; for a valid pass_name + bad vault we must get -32003
@@ -97,7 +119,8 @@ def test_compile_handler_denies_bad_vault(tmp_path: Path):
     assert resp["error"]["code"] == -32003, "bad vault must be rejected by G12 guard before any further work"
 
 
-def test_endorse_handler_denies_bad_vault(tmp_path: Path):
+def test_endorse_handler_denies_bad_vault(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    _install_strict_principal(monkeypatch, tmp_path, tmp_path / "allowed-vault")
     bad = str(tmp_path / "evil-endorse-vault")
     resp = _handle_daemon_endorse({"page_id": "p1", "decision": "accept", "vault_path": bad}, "req-3")
     assert "error" in resp

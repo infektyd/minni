@@ -61,6 +61,7 @@ import json
 import logging
 import os
 import re
+import hashlib
 import signal
 import socket
 import sys
@@ -337,6 +338,37 @@ def _write_json(path: Path, data: dict) -> None:
     path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
+def _parse_iso_ts(value: Optional[str]) -> Optional[float]:
+    if not value:
+        return None
+    try:
+        from datetime import datetime, timezone
+        text = value.replace("Z", "+00:00")
+        return datetime.fromisoformat(text).astimezone(timezone.utc).timestamp()
+    except Exception:
+        return None
+
+
+def _iso_from_epoch(epoch: float) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(epoch))
+
+
+def _known_agent_vaults() -> list[Path]:
+    vaults = []
+    mapping_raw = os.environ.get("SOVEREIGN_AGENT_VAULTS", "")
+    if mapping_raw:
+        try:
+            mapping = json.loads(mapping_raw)
+            if isinstance(mapping, dict):
+                vaults.extend(Path(os.path.expanduser(str(v))) for v in mapping.values())
+        except json.JSONDecodeError:
+            pass
+    root = Path.home() / ".sovereign-memory"
+    if root.exists():
+        vaults.extend(root.glob("*-vault"))
+    return list(dict.fromkeys(vaults))
+
+
 # SEC-014: caps for audit-log fields. Mirrors the TS helper in
 # plugins/sovereign-memory/src/vault.ts so a forged summary written by one
 # daemon cannot be parsed as multiple `## [...]` entries by either reader.
@@ -402,6 +434,9 @@ def _validate_handoff_packet(from_agent: str, to_agent: str, packet: Any) -> tup
     normalized.setdefault("to_agent", to_agent)
     normalized.setdefault("created_at", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
     normalized.setdefault("trace_id", str(uuid.uuid4()))
+    normalized.setdefault("lease_id", f"handoff-{uuid.uuid4().hex[:16]}")
+    normalized.setdefault("requires_ack", True)
+    normalized.setdefault("expires_at", _iso_from_epoch(time.time() + 24 * 3600))
 
     required = {
         "from_agent": str,
@@ -412,6 +447,9 @@ def _validate_handoff_packet(from_agent: str, to_agent: str, packet: Any) -> tup
         "wikilink_refs": list,
         "trace_id": str,
         "created_at": str,
+        "lease_id": str,
+        "requires_ack": bool,
+        "expires_at": str,
     }
     for key, typ in required.items():
         if key not in normalized:
@@ -553,6 +591,7 @@ def _handle_daemon_handoff(params: dict, request_id: Any) -> dict:
         inbox_path = recipient_vault / "inbox" / suffix
         _write_json(outbox_path, redacted_packet)
         _write_json(inbox_path, redacted_packet)
+        lease_persisted = _store_handoff_lease(redacted_packet, inbox_path, outbox_path)
         page_path = _compile_handoff_page(sender_vault, redacted_packet, stamp)
         audit_details = {
             "trace_id": redacted_packet["trace_id"],
@@ -564,17 +603,25 @@ def _handle_daemon_handoff(params: dict, request_id: Any) -> dict:
             "outbox_path": str(outbox_path),
             "handoff_page": str(page_path) if page_path else None,
             "redacted": redacted,
+            "lease_id": redacted_packet["lease_id"],
+            "expires_at": redacted_packet.get("expires_at"),
+            "lease_persisted": lease_persisted,
         }
         _append_handoff_audit(sender_vault, "handoff_sent", redacted_packet["task"], audit_details)
         _append_handoff_audit(recipient_vault, "handoff_received", redacted_packet["task"], audit_details)
+        status = "ok" if lease_persisted else "degraded"
         return _make_response({
-            "status": "ok",
+            "status": status,
             "delivered": True,
+            "lease_persisted": lease_persisted,
+            "reason": None if lease_persisted else "handoff delivered to JSON packets but SQLite lease persistence failed",
             "redacted": redacted,
             "inbox_path": str(inbox_path),
             "outbox_path": str(outbox_path),
             "handoff_page": str(page_path) if page_path else None,
             "trace_id": redacted_packet["trace_id"],
+            "lease_id": redacted_packet["lease_id"],
+            "expires_at": redacted_packet.get("expires_at"),
         }, request_id)
     except Exception as exc:
         logger.exception("daemon.handoff failed")
@@ -584,6 +631,227 @@ def _handle_daemon_handoff(params: dict, request_id: Any) -> dict:
             "reason": str(exc),
             "to_agent": to_agent,
         }, request_id)
+
+
+_HANDOFF_ACK_STATUSES = {"accepted", "rejected_stale", "rejected_contradicts", "rejected_scope"}
+
+
+def _iter_handoff_files(agent_id: Optional[str] = None):
+    if agent_id:
+        vault, _ = _agent_vault(agent_id)
+        vaults = [vault]
+    else:
+        vaults = _known_agent_vaults()
+    for vault in vaults:
+        for rel in ("inbox", "outbox"):
+            directory = vault / rel
+            if not directory.exists():
+                continue
+            for path in sorted(directory.glob("*.json")):
+                try:
+                    packet = json.loads(path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    continue
+                if isinstance(packet, dict) and packet.get("lease_id"):
+                    yield vault, path, packet
+
+
+def _write_matching_lease_packets(lease_id: str, updates: dict) -> list[str]:
+    changed = []
+    for _vault, path, packet in _iter_handoff_files():
+        if packet.get("lease_id") != lease_id:
+            continue
+        packet.update(updates)
+        _write_json(path, packet)
+        changed.append(str(path))
+    return changed
+
+
+def _store_handoff_lease(packet: dict, inbox_path: Path, outbox_path: Path) -> bool:
+    """Persist the authoritative handoff lease row while keeping JSON packets."""
+    try:
+        created_at = _parse_iso_ts(packet.get("created_at")) or time.time()
+        expires_at = _parse_iso_ts(packet.get("expires_at"))
+        status = "pending" if packet.get("requires_ack", True) else "not_required"
+        db = _lazy_writeback().db
+        with db.cursor() as c:
+            c.execute(
+                """INSERT INTO handoff_leases
+                   (lease_id, from_agent, to_agent, task, status, contradicts_id,
+                    inbox_path, outbox_path, created_at, expires_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(lease_id) DO UPDATE SET
+                     from_agent = excluded.from_agent,
+                     to_agent = excluded.to_agent,
+                     task = excluded.task,
+                     inbox_path = excluded.inbox_path,
+                     outbox_path = excluded.outbox_path,
+                     expires_at = excluded.expires_at""",
+                (
+                    packet["lease_id"],
+                    packet["from_agent"],
+                    packet["to_agent"],
+                    packet.get("task"),
+                    status,
+                    packet.get("contradicts_id"),
+                    str(inbox_path),
+                    str(outbox_path),
+                    created_at,
+                    expires_at,
+                ),
+            )
+        return True
+    except Exception as exc:
+        logger.warning("Could not persist handoff lease %r: %s", packet.get("lease_id"), exc)
+        return False
+
+
+def _update_handoff_lease_status(
+    lease_id: str,
+    status: str,
+    contradicts_id: Any = None,
+) -> bool:
+    try:
+        db = _lazy_writeback().db
+        with db.cursor() as c:
+            c.execute(
+                """UPDATE handoff_leases
+                   SET status = ?,
+                       contradicts_id = COALESCE(?, contradicts_id)
+                   WHERE lease_id = ?""",
+                (status, contradicts_id, lease_id),
+            )
+            return c.rowcount > 0
+    except Exception as exc:
+        logger.warning("Could not update handoff lease %r: %s", lease_id, exc)
+        return False
+
+
+def _pending_handoff_leases(agent_id: str) -> list[dict]:
+    try:
+        now = time.time()
+        db = _lazy_writeback().db
+        with db.cursor() as c:
+            rows = c.execute(
+                """SELECT lease_id, from_agent, to_agent, task, expires_at, inbox_path
+                   FROM handoff_leases
+                   WHERE to_agent = ?
+                     AND status = 'pending'
+                     AND (expires_at IS NULL OR expires_at > ?)
+                   ORDER BY created_at ASC, lease_id ASC""",
+                (agent_id, now),
+            ).fetchall()
+        return [
+            {
+                "lease_id": row["lease_id"],
+                "from_agent": row["from_agent"],
+                "to_agent": row["to_agent"],
+                "task": row["task"],
+                "expires_at": _iso_from_epoch(row["expires_at"]) if row["expires_at"] is not None else None,
+                "path": row["inbox_path"],
+            }
+            for row in rows
+        ]
+    except Exception as exc:
+        logger.warning("Could not list SQLite handoff leases for %r: %s", agent_id, exc)
+        return []
+
+
+def _handoff_lease_status(lease_id: str) -> Optional[dict]:
+    try:
+        db = _lazy_writeback().db
+        with db.cursor() as c:
+            row = c.execute(
+                "SELECT lease_id, status FROM handoff_leases WHERE lease_id = ?",
+                (lease_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {"lease_id": row["lease_id"], "status": row["status"]}
+    except Exception as exc:
+        logger.warning("Could not read handoff lease %r: %s", lease_id, exc)
+        return None
+
+
+def _handle_ack_handoff(params: dict, request_id: Any) -> dict:
+    lease_id = str(params.get("lease_id", "")).strip()
+    status = str(params.get("status", "")).strip()
+    if not lease_id:
+        return _make_error(-32602, "lease_id is required", request_id)
+    if status not in _HANDOFF_ACK_STATUSES:
+        return _make_error(-32602, f"status must be one of {sorted(_HANDOFF_ACK_STATUSES)}", request_id)
+    contradicts_id = params.get("contradicts_id")
+    updates = {
+        "ack_status": status,
+        "acked_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    if contradicts_id is not None:
+        updates["contradicts_id"] = contradicts_id
+    changed = _write_matching_lease_packets(lease_id, updates)
+    db_changed = _update_handoff_lease_status(lease_id, status, contradicts_id)
+    if not changed and not db_changed:
+        return _make_error(-32000, f"No handoff lease found for {lease_id}", request_id)
+    return _make_response({
+        "lease_id": lease_id,
+        "status": status,
+        "updated_paths": changed,
+    }, request_id)
+
+
+def _handle_list_pending_handoffs(params: dict, request_id: Any) -> dict:
+    agent_id = str(params.get("agent_id", "")).strip()
+    if not agent_id:
+        return _make_error(-32602, "agent_id is required", request_id)
+    sqlite_handoffs = _pending_handoff_leases(agent_id)
+    if sqlite_handoffs:
+        return _make_response({"agent_id": agent_id, "handoffs": sqlite_handoffs}, request_id)
+
+    now = time.time()
+    handoffs = []
+    for _vault, path, packet in _iter_handoff_files(agent_id):
+        if packet.get("to_agent") != agent_id:
+            continue
+        if not packet.get("requires_ack", False):
+            continue
+        if packet.get("ack_status"):
+            continue
+        expires_at = _parse_iso_ts(packet.get("expires_at"))
+        if expires_at is not None and expires_at <= now:
+            continue
+        handoffs.append({
+            "lease_id": packet.get("lease_id"),
+            "from_agent": packet.get("from_agent"),
+            "to_agent": packet.get("to_agent"),
+            "task": packet.get("task"),
+            "expires_at": packet.get("expires_at"),
+            "path": str(path),
+        })
+    return _make_response({"agent_id": agent_id, "handoffs": handoffs}, request_id)
+
+
+def _handle_await_handoff(params: dict, request_id: Any) -> dict:
+    lease_id = str(params.get("lease_id", "")).strip()
+    if not lease_id:
+        return _make_error(-32602, "lease_id is required", request_id)
+    timeout_ms = max(0, min(int(params.get("timeout_ms", 30000)), 300000))
+    deadline = time.time() + (timeout_ms / 1000.0)
+    while True:
+        lease = _handoff_lease_status(lease_id)
+        if lease is not None and lease.get("status") not in {None, "pending"}:
+            return _make_response({
+                "lease_id": lease_id,
+                "status": lease.get("status"),
+            }, request_id)
+        for _vault, _path, packet in _iter_handoff_files():
+            if packet.get("lease_id") == lease_id and packet.get("ack_status"):
+                return _make_response({
+                    "lease_id": lease_id,
+                    "status": packet.get("ack_status"),
+                    "acked_at": packet.get("acked_at"),
+                }, request_id)
+        if time.time() >= deadline:
+            return _make_response({"lease_id": lease_id, "status": "timeout"}, request_id)
+        time.sleep(0.05)
 
 
 def _record_latency(method: str, duration_seconds: float) -> None:
@@ -711,7 +979,7 @@ def _handle_search(params: dict, request_id: Any) -> dict:
         return make_mismatch_error(exc.supplied, exc.stamped, request_id)
     agent_id = principal.agent_id
     limit = min(int(params.get("limit", 5)), 20)
-    depth = str(params.get("depth", "snippet"))
+    depth = str(params.get("depth", "headline"))
     budget_tokens_param = params.get("budget_tokens")
     backend_param = params.get("backend", "auto")
     layers = params.get("layers")
@@ -900,6 +1168,141 @@ def _handle_expand(params: dict, request_id: Any) -> dict:
         return _make_error(-32000, f"Expand error: {exc}", request_id)
 
 
+def _handle_sm_drill(params: dict, request_id: Any) -> dict:
+    """Batch drill prior headline results to snippet/chunk/document depth."""
+    global _request_count
+    _request_count += 1
+
+    raw_ids = params.get("chunk_ids", params.get("result_ids"))
+    if raw_ids is None:
+        return _make_error(-32602, "chunk_ids or result_ids is required", request_id)
+    if not isinstance(raw_ids, list):
+        return _make_error(-32602, "chunk_ids/result_ids must be a list", request_id)
+    if len(raw_ids) > 20:
+        return _make_error(-32602, "sm_drill accepts at most 20 ids", request_id)
+
+    depth = str(params.get("depth", "snippet"))
+    if depth not in {"snippet", "chunk", "document"}:
+        return _make_error(-32602, "depth must be snippet, chunk, or document", request_id)
+
+    try:
+        ids = [int(value) for value in raw_ids]
+    except (TypeError, ValueError):
+        return _make_error(-32602, "all ids must be integers", request_id)
+
+    try:
+        engine = _lazy_retrieval()
+        results = []
+        missing = []
+        for result_id in ids:
+            result = engine.expand_result(result_id=result_id, depth=depth)
+            if result is None:
+                missing.append(result_id)
+            else:
+                results.append(result)
+        return _make_response({
+            "depth": depth,
+            "count": len(results),
+            "missing": missing,
+            "results": results,
+        }, request_id)
+    except Exception as exc:
+        logger.exception("sm_drill failed")
+        return _make_error(-32000, f"Drill error: {exc}", request_id)
+
+
+def _anchor_for_result(result: dict) -> str:
+    doc_id = result.get("doc_id")
+    chunk_id = result.get("chunk_id")
+    if doc_id is not None and chunk_id is not None:
+        return f"sm://doc/{doc_id}/chunk/{chunk_id}"
+    if doc_id is not None:
+        return f"sm://doc/{doc_id}"
+    source = str(result.get("source") or result.get("filename") or "unknown")
+    return f"sm://source/{hashlib.sha256(source.encode('utf-8')).hexdigest()[:16]}"
+
+
+def _handle_sm_export_pack(params: dict, request_id: Any) -> dict:
+    """Export deterministic, cache-prefix-stable context pack."""
+    global _request_count
+    _request_count += 1
+
+    query = str(params.get("query", "")).strip()
+    if not query:
+        return _make_error(-32602, "query is required", request_id)
+    budget_tokens = int(params.get("budget_tokens", 4096))
+    cache_key = str(params.get("cache_key", "default"))
+    agent_id = params.get("agent_id", "main")
+    workspace_id = params.get("workspace_id")
+    limit = min(int(params.get("limit", 12)), 50)
+
+    try:
+        engine = _lazy_retrieval()
+        results = engine.retrieve(
+            query=query,
+            agent_id=agent_id,
+            limit=limit,
+            depth="snippet",
+            update_access=False,
+        )
+        prefix_anchors = []
+        for result in sorted(
+            results,
+            key=lambda r: (
+                str(r.get("source", "")),
+                int(r.get("doc_id") or 0),
+                int(r.get("chunk_id") or 0),
+            ),
+        ):
+            prefix_anchors.append({
+                "anchor": _anchor_for_result(result),
+                "doc_id": result.get("doc_id"),
+                "chunk_id": result.get("chunk_id"),
+                "source": result.get("source", ""),
+                "wikilink": result.get("wikilink"),
+            })
+
+        suffix_snippets = []
+        used_tokens = 0
+        for result in results:
+            tokens = int(result.get("token_count") or max(1, len(str(result.get("text", ""))) // 4))
+            if suffix_snippets and used_tokens + tokens > budget_tokens:
+                break
+            suffix_snippets.append({
+                "anchor": _anchor_for_result(result),
+                "text": result.get("text", ""),
+                "score": result.get("score"),
+                "token_count": tokens,
+            })
+            used_tokens += tokens
+
+        pack = {
+            "cache_key": cache_key,
+            "query": query,
+            "budget_tokens": budget_tokens,
+            "prefix": {
+                "identity": {
+                    "agent_id": agent_id,
+                    "workspace_id": workspace_id,
+                    "format": "sovereign-context-pack-v1",
+                },
+                "anchors": prefix_anchors,
+            },
+            "suffix": {
+                "query": query,
+                "snippets": suffix_snippets,
+                "token_count": used_tokens,
+            },
+        }
+        canonical = json.dumps(pack, sort_keys=True, separators=(",", ":"))
+        manifest_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        pack["manifest_hash"] = manifest_hash
+        return _make_response(pack, request_id)
+    except Exception as exc:
+        logger.exception("sm_export_pack failed")
+        return _make_error(-32000, f"Export pack error: {exc}", request_id)
+
+
 def _handle_read(params: dict, request_id: Any) -> dict:
     """Read agent startup context (identity + knowledge + learnings)."""
     global _request_count
@@ -996,6 +1399,15 @@ def _handle_read(params: dict, request_id: Any) -> dict:
                         f"  - [{row['category']}] {row['content'][:150]} "
                         f"(conf={row['confidence']:.1f})"
                     )
+                    try:
+                        c.execute(
+                            """INSERT INTO learning_reads
+                               (learning_id, agent_id, read_at, source)
+                               VALUES (?, ?, ?, ?)""",
+                            (row["learning_id"], agent_id, time.time(), "sovrd.read"),
+                        )
+                    except Exception:
+                        pass
 
         # Recent episodic events
         with db.cursor() as c:
@@ -1343,6 +1755,12 @@ def _handle_resolve_contradiction(params: dict, request_id: Any) -> dict:
                        WHERE learning_id = ?""",
                     (new_lid, sid),
                 )
+                c.execute(
+                    """INSERT INTO contradiction_events
+                       (superseded_learning_id, new_learning_id, originating_agent, created_at)
+                       VALUES (?, ?, ?, ?)""",
+                    (sid, new_lid, agent_id, now),
+                )
 
         logger.info(
             "Resolved contradiction: new learning #%d supersedes %s",
@@ -1361,6 +1779,49 @@ def _handle_resolve_contradiction(params: dict, request_id: Any) -> dict:
     except Exception as exc:
         logger.exception("resolve_contradiction failed")
         return _make_error(-32000, f"Resolve contradiction error: {exc}", request_id)
+
+
+def _handle_subscribe_contradictions(params: dict, request_id: Any) -> dict:
+    """Return contradiction events for learnings recently read by an agent."""
+    agent_id = str(params.get("agent_id", "")).strip()
+    if not agent_id:
+        return _make_error(-32602, "agent_id is required", request_id)
+    since_ts = float(params.get("since_ts", 0) or 0)
+    read_window_hours = float(params.get("read_window_hours", 24) or 24)
+    read_since = time.time() - (read_window_hours * 3600)
+
+    try:
+        db = _lazy_writeback().db
+        with db.cursor() as c:
+            rows = c.execute("""
+                SELECT DISTINCT
+                       ce.event_id,
+                       ce.superseded_learning_id,
+                       ce.new_learning_id,
+                       ce.originating_agent,
+                       ce.created_at
+                FROM contradiction_events ce
+                JOIN learning_reads lr
+                  ON lr.learning_id = ce.superseded_learning_id
+                WHERE lr.agent_id = ?
+                  AND lr.read_at >= ?
+                  AND ce.created_at >= ?
+                ORDER BY ce.created_at ASC, ce.event_id ASC
+            """, (agent_id, read_since, since_ts)).fetchall()
+        events = [
+            {
+                "event_id": row["event_id"],
+                "superseded_learning_id": row["superseded_learning_id"],
+                "new_learning_id": row["new_learning_id"],
+                "originating_agent": row["originating_agent"],
+                "created_at": row["created_at"],
+            }
+            for row in rows
+        ]
+        return _make_response({"agent_id": agent_id, "events": events}, request_id)
+    except Exception as exc:
+        logger.exception("subscribe_contradictions failed")
+        return _make_error(-32000, f"Subscribe contradictions error: {exc}", request_id)
 
 
 def _handle_log_event(params: dict, request_id: Any) -> dict:
@@ -1987,12 +2448,18 @@ _METHODS: Dict[str, callable] = {
     "feedback":               _handle_feedback,
     "trace":                  _handle_trace,
     "expand":                 _handle_expand,
+    "sm_drill":               _handle_sm_drill,
+    "sm_export_pack":         _handle_sm_export_pack,
     "read":                   _handle_read,
     "learn":                  _handle_learn,
     "resolve_contradiction":  _handle_resolve_contradiction,
+    "sovereign_subscribe_contradictions": _handle_subscribe_contradictions,
     "log_event":              _handle_log_event,
     "daemon.handoff":         _handle_daemon_handoff,
     "handoff":                _handle_daemon_handoff,
+    "sovereign_ack_handoff":  _handle_ack_handoff,
+    "sovereign_list_pending_handoffs": _handle_list_pending_handoffs,
+    "sovereign_await_handoff": _handle_await_handoff,
     "daemon.compile":         _handle_daemon_compile,
     "daemon.endorse":         _handle_daemon_endorse,
     # G14-G18 candidate pipeline (operator-gated governance)

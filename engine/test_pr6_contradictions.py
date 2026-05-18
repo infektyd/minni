@@ -441,7 +441,7 @@ class TestHandleLearn:
         return wb, db_obj, cfg
 
     def test_backward_compat_no_new_fields(self, tmp_path, monkeypatch):
-        """Existing learn() calls without new fields still return {status: ok, learning_id}."""
+        """Existing learn() calls without force stage proposal packets under G16."""
         wb, db_obj, cfg = self._patch_writeback(tmp_path, monkeypatch)
 
         # No model → no contradiction detection, should just write
@@ -459,10 +459,10 @@ class TestHandleLearn:
 
         assert "error" not in resp, f"Unexpected error: {resp}"
         result = resp["result"]
-        assert result["status"] == "ok"
-        assert "learning_id" in result
-        assert result["agent_id"] == "forge"
-        assert result["category"] == "fix"
+        assert result["status"] == "proposed"
+        assert "candidate_id" in result
+        assert "learning_id" not in result
+        assert result["principal"] == "forge"
 
     def test_learn_content_required(self, tmp_path, monkeypatch):
         """learn() returns error when content is missing."""
@@ -546,7 +546,7 @@ class TestHandleLearn:
         assert "learning_id" in result
 
     def test_learn_with_contradicts_id_writes_through(self, tmp_path, monkeypatch):
-        """learn(contradicts_id=X) bypasses detection and writes."""
+        """learn(contradicts_id=X) bypasses detection but still stages unless force=true."""
         wb, db_obj, cfg = self._patch_writeback(tmp_path, monkeypatch)
 
         # Insert a real learning to reference as the contradicts_id
@@ -573,7 +573,8 @@ class TestHandleLearn:
 
         assert "error" not in resp, f"Unexpected error: {resp}"
         result = resp["result"]
-        assert result["status"] == "ok"
+        assert result["status"] == "proposed"
+        assert "candidate_id" in result
 
     def test_learn_stores_assertion_field(self, tmp_path, monkeypatch):
         """learn() stores the assertion field in the DB when provided."""
@@ -600,7 +601,7 @@ class TestHandleLearn:
         assert row["assertion"] == "Auth system: JWT"
 
     def test_learn_no_contradiction_when_no_model(self, tmp_path, monkeypatch):
-        """With no model, detection is skipped and write proceeds normally."""
+        """With no model, detection is skipped and the default path stages a proposal."""
         wb, db_obj, cfg = self._patch_writeback(tmp_path, monkeypatch)
 
         import writeback as wb_mod
@@ -615,7 +616,8 @@ class TestHandleLearn:
             wb_mod.WriteBackMemory.model = property(lambda self: _ge())
 
         result = resp["result"]
-        assert result["status"] == "ok"
+        assert result["status"] == "proposed"
+        assert "candidate_id" in result
 
 
 # ---------------------------------------------------------------------------
@@ -692,6 +694,52 @@ class TestHandleResolveContradiction:
             ).fetchone()
             assert "session cookies" in new_row["content"]
             assert new_row["status"] == "active"
+
+            events = c.execute(
+                "SELECT superseded_learning_id, new_learning_id, originating_agent FROM contradiction_events ORDER BY event_id"
+            ).fetchall()
+            assert [(row["superseded_learning_id"], row["new_learning_id"], row["originating_agent"]) for row in events] == [
+                (old_ids[0], new_lid, "test"),
+                (old_ids[1], new_lid, "test"),
+            ]
+
+    def test_subscribe_contradictions_returns_events_for_read_learnings(self, tmp_path, monkeypatch):
+        wb, db_obj, cfg = self._patch_writeback(tmp_path, monkeypatch)
+
+        now = time.time()
+        with db_obj.cursor() as c:
+            c.execute("""
+                INSERT INTO learnings (agent_id, category, content, confidence, created_at, status)
+                VALUES ('a', 'fact', 'old learning', 1.0, ?, 'active')
+            """, (now,))
+            old_id = c.lastrowid
+            c.execute("""
+                INSERT INTO learning_reads (learning_id, agent_id, read_at, source)
+                VALUES (?, 'codex', ?, 'unit-test')
+            """, (old_id, now))
+
+        import writeback as wb_mod
+        wb_mod.WriteBackMemory.model = property(lambda self: None)
+        try:
+            resolved = self._dispatch("resolve_contradiction", {
+                "new_content": "new learning",
+                "supersede_ids": [old_id],
+                "agent_id": "test",
+            })
+        finally:
+            from models import get_embedder as _ge
+            wb_mod.WriteBackMemory.model = property(lambda self: _ge())
+
+        assert resolved["result"]["status"] == "ok"
+        subscribed = self._dispatch("sovereign_subscribe_contradictions", {
+            "agent_id": "codex",
+            "since_ts": now - 1,
+        })
+
+        assert "error" not in subscribed
+        events = subscribed["result"]["events"]
+        assert len(events) == 1
+        assert events[0]["superseded_learning_id"] == old_id
 
     def test_resolve_new_content_required(self, tmp_path, monkeypatch):
         """resolve_contradiction returns error when new_content is missing."""
@@ -945,7 +993,7 @@ class TestFullWorkflow:
     def test_backward_compat_regression(self, tmp_path, monkeypatch):
         """
         Regression: existing learn() calls (no new fields, no force, no contradiction)
-        still complete with {status: ok} and a valid learning_id.
+        now complete as G16 proposal packets without durable writes.
         """
         wb, db_obj, cfg = self._patch_writeback(tmp_path, monkeypatch)
 
@@ -960,9 +1008,10 @@ class TestFullWorkflow:
                 resp = self._dispatch("learn", {"content": content, "agent_id": "forge"})
                 assert "error" not in resp, f"Call {i} errored: {resp}"
                 result = resp["result"]
-                assert result["status"] == "ok", f"Call {i} not ok: {result}"
-                assert isinstance(result["learning_id"], int)
-                assert result["learning_id"] > 0
+                assert result["status"] == "proposed", f"Call {i} not proposed: {result}"
+                assert isinstance(result["candidate_id"], int)
+                assert result["candidate_id"] > 0
+                assert "learning_id" not in result
         finally:
             from models import get_embedder as _ge
             wb_mod.WriteBackMemory.model = property(lambda self: _ge())

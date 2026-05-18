@@ -254,19 +254,25 @@ class VaultIndexer:
 
             # Phase 2: Remove docs no longer on disk
             c.execute("SELECT doc_id, path FROM documents")
+            to_delete = []
             for row in c.fetchall():
                 if row["path"] not in disk_files:
-                    c.execute(
-                        "SELECT chunk_id FROM chunk_embeddings WHERE doc_id = ?",
-                        (row["doc_id"],),
-                    )
-                    self._invalidate_rerank_chunks([r["chunk_id"] for r in c.fetchall()])
-                    c.execute("DELETE FROM documents WHERE doc_id = ?", (row["doc_id"],))
-                    c.execute("DELETE FROM vault_fts WHERE doc_id = ?", (row["doc_id"],))
-                    c.execute("DELETE FROM chunk_embeddings WHERE doc_id = ?", (row["doc_id"],))
+                    to_delete.append((row["doc_id"],))
                     stats["deleted"] += 1
                     if verbose:
                         logger.info("  🗑 Removed: %s", row["path"])
+
+            if to_delete:
+                doc_ids = [doc_id for (doc_id,) in to_delete]
+                placeholders = ",".join("?" for _ in doc_ids)
+                c.execute(
+                    f"SELECT chunk_id FROM chunk_embeddings WHERE doc_id IN ({placeholders})",
+                    doc_ids,
+                )
+                self._invalidate_rerank_chunks([r["chunk_id"] for r in c.fetchall()])
+                c.executemany("DELETE FROM chunk_embeddings WHERE doc_id = ?", to_delete)
+                c.executemany("DELETE FROM vault_fts WHERE doc_id = ?", to_delete)
+                c.executemany("DELETE FROM documents WHERE doc_id = ?", to_delete)
 
         # Phase 3: Rebuild FAISS index from all embeddings
         self._rebuild_faiss_index()

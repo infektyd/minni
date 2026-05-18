@@ -240,13 +240,12 @@ def from_local_transport(
             return p
     # No operator config present — synthesize trusted local default.
     # This keeps the tree green until an operator drops strict principal files.
-    home = CANONICAL_SOVEREIGN_HOME
     return EffectivePrincipal(
         agent_id="main",
         workspace_id="default",
         transport=transport,
         capabilities=["*"],
-        allowed_vault_roots=[home],
+        allowed_vault_roots=[],
     )
 
 
@@ -321,7 +320,7 @@ def resolve_effective_principal(
             workspace_id="default",
             transport=transport,
             capabilities=["*"],
-            allowed_vault_roots=[CANONICAL_SOVEREIGN_HOME],
+            allowed_vault_roots=[],
         )
 
     # Strict mode + mismatch + no alias → hard deny

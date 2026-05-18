@@ -99,6 +99,15 @@ An agent may read from the shared recall pool regardless of which agent indexed
 a document. An agent may never write a vault page into another agent's vault
 directory or impersonate another `agent_id` when calling `learn` or `log_event`.
 
+### Temporary team profiles
+
+The plugin may create temporary team profiles through `sovereign_team_runtime`.
+These profiles are coordination packets, not durable identities. They can carry
+role, focus, ownership, permissions, and hydration context, but they do not
+grant cross-agent vault writes, automatic learning, daemon-side execution, or
+identity promotion. Promotion from temporary profile to reusable agent identity
+requires explicit operator approval after evidence review.
+
 ---
 
 ## 3. Memory-as-Evidence Rule
