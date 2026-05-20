@@ -109,6 +109,8 @@ test("RCM-008: hook rate-limiting timestamp file has strict permissions", async 
 
 test("RCM-008: daily-log pruning (older than 30 days relative to audit timestamp)", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "sm-daily-prune-"));
+  const origHome = process.env.SOVEREIGN_HOME;
+  process.env.SOVEREIGN_HOME = root;
 
   try {
     await ensureVault(root);
@@ -144,12 +146,16 @@ test("RCM-008: daily-log pruning (older than 30 days relative to audit timestamp
     const st29 = await stat(day29Path);
     assert.ok(st29.isFile());
   } finally {
+    if (origHome === undefined) delete process.env.SOVEREIGN_HOME;
+    else process.env.SOVEREIGN_HOME = origHome;
     await rm(root, { recursive: true, force: true });
   }
 });
 
 test("RCM-008: rotation at 5 MB (log.md -> log.1.md -> log.2.md -> log.3.md)", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "sm-rotation-"));
+  const origHome = process.env.SOVEREIGN_HOME;
+  process.env.SOVEREIGN_HOME = root;
 
   try {
     await ensureVault(root);
@@ -179,12 +185,16 @@ test("RCM-008: rotation at 5 MB (log.md -> log.1.md -> log.2.md -> log.3.md)", a
     const stLog = await stat(logPath);
     assert.ok(stLog.size < 1000);
   } finally {
+    if (origHome === undefined) delete process.env.SOVEREIGN_HOME;
+    else process.env.SOVEREIGN_HOME = origHome;
     await rm(root, { recursive: true, force: true });
   }
 });
 
 test("RCM-008: quota check (50 MB cap, pruning oldest daily logs first)", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "sm-quota-"));
+  const origHome = process.env.SOVEREIGN_HOME;
+  process.env.SOVEREIGN_HOME = root;
 
   try {
     await ensureVault(root);
@@ -225,6 +235,8 @@ test("RCM-008: quota check (50 MB cap, pruning oldest daily logs first)", async 
     assert.ok(st2.isFile());
     assert.ok(st3.isFile());
   } finally {
+    if (origHome === undefined) delete process.env.SOVEREIGN_HOME;
+    else process.env.SOVEREIGN_HOME = origHome;
     await rm(root, { recursive: true, force: true });
   }
 });
