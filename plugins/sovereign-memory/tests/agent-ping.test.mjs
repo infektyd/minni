@@ -7,12 +7,15 @@ import test, { after } from "node:test";
 const root = await mkdtemp(path.join(tmpdir(), "sm-agent-ping-"));
 const codexVault = path.join(root, "codex-vault");
 const claudeVault = path.join(root, "claude-vault");
+const geminiVault = path.join(root, "gemini-vault");
 
 process.env.SOVEREIGN_CODEX_AGENT_ID = "codex";
 process.env.SOVEREIGN_CODEX_VAULT_PATH = codexVault;
+process.env.SOVEREIGN_HOME = path.join(root, "sovereign-home");
 process.env.SOVEREIGN_AGENT_VAULTS = JSON.stringify({
   codex: codexVault,
   "claude-code": claudeVault,
+  gemini: geminiVault,
 });
 
 const {
@@ -130,6 +133,159 @@ test("expired requests cannot be approved", async () => {
     /Request is expired/,
   );
 
-  const status = await getAgentPingStatus(created.contract.requestId, "codex", new Date("2026-05-02T00:02:00.000Z"));
-  assert.equal(status.contract.status, "expired");
+  await assert.rejects(
+    () => getAgentPingStatus(created.contract.requestId, "codex", new Date("2026-05-02T00:02:00.000Z")),
+    /Request not found/
+  );
+});
+
+test("RCM-004: ping request does not create recipient inbox on disk", async () => {
+  const created = await createAgentPingRequest(
+    {
+      toAgent: "claude-code",
+      question: "Will you see this before polling?",
+    },
+    "codex"
+  );
+
+  // Recipient inbox file should NOT exist yet
+  const inboxFile = path.join(claudeVault, "inbox", "agent-pings", `${created.contract.requestId}.json`);
+  await assert.rejects(readFile(inboxFile, "utf8"), /ENOENT/);
+});
+
+test("RCM-004: ping materializes on recipient poll (listAgentPingInbox)", async () => {
+  const created = await createAgentPingRequest(
+    {
+      toAgent: "claude-code",
+      question: "Polled request",
+    },
+    "codex"
+  );
+
+  const inboxFile = path.join(claudeVault, "inbox", "agent-pings", `${created.contract.requestId}.json`);
+  await assert.rejects(readFile(inboxFile, "utf8"), /ENOENT/);
+
+  // Recipient polls
+  const inbox = await listAgentPingInbox("claude-code");
+  assert.ok(inbox.requests.some(r => r.requestId === created.contract.requestId));
+
+  // Now it MUST exist on disk
+  const content = await readFile(inboxFile, "utf8");
+  assert.ok(content.includes("Polled request"));
+});
+
+test("RCM-004: recipient getAgentPingStatus sees pending request without polling first", async () => {
+  // Regression for Codex P2 on PR #23: getAgentPingStatus must materialize
+  // from the live lease so the recipient can query status before any inbox
+  // poll has happened.
+  const created = await createAgentPingRequest(
+    {
+      toAgent: "claude-code",
+      question: "Status-before-poll request",
+    },
+    "codex"
+  );
+
+  // Recipient inbox copy must NOT exist yet (precondition).
+  const inboxFile = path.join(claudeVault, "inbox", "agent-pings", `${created.contract.requestId}.json`);
+  await assert.rejects(readFile(inboxFile, "utf8"), /ENOENT/);
+
+  // Recipient calls status directly, with no prior listAgentPingInbox call.
+  const status = await getAgentPingStatus(created.contract.requestId, "claude-code");
+  assert.equal(status.contract.requestId, created.contract.requestId);
+  assert.equal(status.contract.status, "pending");
+  assert.equal(status.contract.toAgent, "claude-code");
+
+  // Side-effect: status call materialized the recipient inbox copy.
+  const content = await readFile(inboxFile, "utf8");
+  assert.ok(content.includes("Status-before-poll request"));
+});
+
+test("RCM-004: ping materializes on recipient decide", async () => {
+  const created = await createAgentPingRequest(
+    {
+      toAgent: "claude-code",
+      question: "Decide request",
+    },
+    "codex"
+  );
+
+  const inboxFile = path.join(claudeVault, "inbox", "agent-pings", `${created.contract.requestId}.json`);
+  await assert.rejects(readFile(inboxFile, "utf8"), /ENOENT/);
+
+  // Recipient decides without polling first
+  await decideAgentPingRequest(
+    {
+      requestId: created.contract.requestId,
+      decision: "deny",
+      reason: "No poll decide"
+    },
+    "claude-code"
+  );
+
+  // Now it MUST exist on disk and be decided
+  const content = JSON.parse(await readFile(inboxFile, "utf8"));
+  assert.equal(content.status, "denied");
+});
+
+test("RCM-004: ping lease expires after TTL and reaps files", async () => {
+  const now = new Date("2026-05-02T00:00:00.000Z");
+  const created = await createAgentPingRequest(
+    {
+      toAgent: "claude-code",
+      question: "Short lease",
+      ttlMinutes: 5,
+      now,
+    },
+    "codex"
+  );
+
+  const leaseFile = path.join(process.env.SOVEREIGN_HOME, "pings", "leases", `${created.contract.requestId}.json`);
+  const senderFile = created.senderPath;
+
+  // Verify they exist initially
+  await readFile(leaseFile, "utf8");
+  await readFile(senderFile, "utf8");
+
+  // Advance time past TTL (5 min)
+  const queryTime = new Date("2026-05-02T00:06:00.000Z");
+
+  // Status check reaps it
+  await assert.rejects(
+    () => getAgentPingStatus(created.contract.requestId, "codex", queryTime),
+    /Request not found/
+  );
+
+  // Files should be reaped/removed
+  await assert.rejects(readFile(leaseFile, "utf8"), /ENOENT/);
+});
+
+test("RCM-004: ping materialization rejects wrong principal", async () => {
+  const created = await createAgentPingRequest(
+    {
+      toAgent: "claude-code",
+      question: "Intruder test",
+    },
+    "codex"
+  );
+
+  // If wrong agent (e.g. "gemini") tries to decide or poll, the request is not materialized for them
+  // and they cannot access it.
+  const inbox = await listAgentPingInbox("gemini");
+  assert.ok(!inbox.requests.some(r => r.requestId === created.contract.requestId));
+  const wrongPrincipalInboxFile = path.join(geminiVault, "inbox", "agent-pings", `${created.contract.requestId}.json`);
+  await assert.rejects(readFile(wrongPrincipalInboxFile, "utf8"), /ENOENT/);
+
+  await assert.rejects(
+    () => decideAgentPingRequest(
+      {
+        requestId: created.contract.requestId,
+        decision: "approve",
+        answer: "intruder answer"
+      },
+      "gemini"
+    ),
+    /Only the recipient agent/
+  );
+  await assert.rejects(readFile(wrongPrincipalInboxFile, "utf8"), /ENOENT/);
 });

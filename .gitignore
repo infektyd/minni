@@ -18,6 +18,7 @@ _cleanup-quarantine/
 *.faiss
 *.faiss.npz
 *.fmadapter
+*.log
 faiss/
 eval/reports/
 output/
@@ -77,6 +78,7 @@ plugins/*/dist/
 plugins/*/.env
 plugins/*/.playwright-cli/
 plugins/.DS_Store
+**/.DS_Store
 
 # Private OpenClaw bridge runtime files
 openclaw-extension/node_modules/
@@ -106,6 +108,7 @@ htmlcov/
 .claude/
 .cursor/
 .DS_Store
+**/.DS_Store
 ._*
 .idea/
 .vscode/

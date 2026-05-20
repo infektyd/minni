@@ -22,9 +22,25 @@ import {
   statusAndAudit,
   subscribeContradictions,
 } from "./sovereign.js";
-import { buildHandoffPacket, extractScarTissue, prepareOutcome, prepareTask } from "./task.js";
-import { buildTeamEvidencePacket, buildTeamPromotionPacket, buildTeamRuntime } from "./team.js";
-import { auditReport, auditTail, recordAudit, searchVaultNotes, vaultFirstLearn, writeVaultPage } from "./vault.js";
+import {
+  buildHandoffPacket,
+  extractScarTissue,
+  prepareOutcome,
+  prepareTask,
+} from "./task.js";
+import {
+  buildTeamEvidencePacket,
+  buildTeamPromotionPacket,
+  buildTeamRuntime,
+} from "./team.js";
+import {
+  auditReport,
+  auditTail,
+  recordAudit,
+  searchVaultNotes,
+  vaultFirstLearn,
+  writeVaultPage,
+} from "./vault.js";
 import { wrapEnvelope } from "./agent_envelope.js";
 import {
   createAgentPingRequest,
@@ -61,7 +77,6 @@ server.registerTool(
         .optional(),
       limit: z.number().int().min(1).max(12).optional(),
       workspaceId: z.string().optional(),
-      vaultPath: z.string().optional(),
       includeVault: z.boolean().optional(),
       // G13: afmPrepareUrl removed from model-facing schema (SEC-004) — LLM can no longer supply
       // a redirect target for AFM preparation. Internal callers still resolve via config default (loopback).
@@ -77,7 +92,6 @@ server.registerTool(
     layer,
     limit,
     workspaceId,
-    vaultPath,
     includeVault,
     afmModel,
     afmProviderMode,
@@ -91,7 +105,7 @@ server.registerTool(
       limit,
       workspaceId,
       agentId: DEFAULT_AGENT_ID, // G11: server-side stamped default; model can no longer supply agentId
-      vaultPath,
+      vaultPath: DEFAULT_VAULT_PATH,
       includeVault,
       afmModel,
       afmProviderMode,
@@ -114,7 +128,6 @@ server.registerTool(
       verification: z.array(z.string()).optional(),
       profile: z.enum(["compact", "standard", "deep"]).optional(),
       useAfm: z.boolean().optional(),
-      vaultPath: z.string().optional(),
       // G13: afmPrepareUrl removed from model-facing schema (SEC-004) — prevents caller-controlled
       // redirect of AFM bridge to attacker host. Loopback default + explicit operator allowlist enforced in afm.ts.
       afmModel: z.string().optional(),
@@ -128,7 +141,6 @@ server.registerTool(
     verification,
     profile,
     useAfm,
-    vaultPath,
     afmModel,
     afmProviderMode,
   }) => {
@@ -139,7 +151,7 @@ server.registerTool(
       verification,
       profile,
       useAfm,
-      vaultPath,
+      vaultPath: DEFAULT_VAULT_PATH,
       afmModel,
       afmProviderMode,
       // afmPrepareUrl omitted (G13); internal resolution uses safe AFM_PREPARE_TASK_URL from config
@@ -153,7 +165,9 @@ const teamAgentSchema = z.object({
   role: z.enum(["explorer", "worker", "reviewer", "scribe"]).optional(),
   focus: z.string().min(1),
   ownership: z.array(z.string()).optional(),
-  permissions: z.array(z.enum(["read", "write", "test", "network", "memory-recall"])).optional(),
+  permissions: z
+    .array(z.enum(["read", "write", "test", "network", "memory-recall"]))
+    .optional(),
   model: z.string().optional(),
 });
 
@@ -162,7 +176,9 @@ const teamTemporaryProfileSchema = z.object({
   role: z.enum(["explorer", "worker", "reviewer", "scribe"]),
   focus: z.string().min(1),
   ownership: z.array(z.string()),
-  permissions: z.array(z.enum(["read", "write", "test", "network", "memory-recall"])),
+  permissions: z.array(
+    z.enum(["read", "write", "test", "network", "memory-recall"]),
+  ),
   model: z.string().optional(),
   memoryPolicy: z.object({
     recall: z.literal("allowed"),
@@ -192,20 +208,28 @@ server.registerTool(
       agents: z.array(teamAgentSchema).optional(),
       coordinatorAgentId: z.string().optional(),
       workspaceId: z.string().optional(),
-      vaultPath: z.string().optional(),
       profile: z.enum(["compact", "standard", "deep"]).optional(),
       limit: z.number().int().min(1).max(12).optional(),
       includeVault: z.boolean().optional(),
       useAfm: z.boolean().optional(),
     },
   },
-  async ({ task, agents, coordinatorAgentId, workspaceId, vaultPath, profile, limit, includeVault, useAfm }) => {
+  async ({
+    task,
+    agents,
+    coordinatorAgentId,
+    workspaceId,
+    profile,
+    limit,
+    includeVault,
+    useAfm,
+  }) => {
     const packet = await buildTeamRuntime({
       task,
       agents,
       coordinatorAgentId,
       workspaceId,
-      vaultPath,
+      vaultPath: DEFAULT_VAULT_PATH,
       profile,
       limit,
       includeVault,
@@ -252,13 +276,27 @@ server.registerTool(
     inputSchema: {
       agent: teamTemporaryProfileSchema,
       evidence: teamPromotionCandidateSchema,
-      requestedPermissions: z.array(z.enum(["read", "write", "test", "network", "memory-recall"])).optional(),
+      requestedPermissions: z
+        .array(z.enum(["read", "write", "test", "network", "memory-recall"]))
+        .optional(),
       approved: z.boolean().optional(),
       permanentAgentId: z.string().optional(),
     },
   },
-  async ({ agent, evidence, requestedPermissions, approved, permanentAgentId }) => {
-    const packet = await buildTeamPromotionPacket({ agent, evidence, requestedPermissions, approved, permanentAgentId });
+  async ({
+    agent,
+    evidence,
+    requestedPermissions,
+    approved,
+    permanentAgentId,
+  }) => {
+    const packet = await buildTeamPromotionPacket({
+      agent,
+      evidence,
+      requestedPermissions,
+      approved,
+      permanentAgentId,
+    });
     return textResult(JSON.stringify(packet, null, 2));
   },
 );
@@ -395,7 +433,8 @@ server.registerTool(
   "sovereign_drill",
   {
     title: "Sovereign Drill",
-    description: "Drill headline recall results to snippet, chunk, or document depth by result/chunk id.",
+    description:
+      "Drill headline recall results to snippet, chunk, or document depth by result/chunk id.",
     inputSchema: {
       resultIds: z.array(z.number().int()).optional(),
       chunkIds: z.array(z.number().int()).optional(),
@@ -412,17 +451,24 @@ server.registerTool(
   "sovereign_export_pack",
   {
     title: "Sovereign Export Context Pack",
-    description: "Export a deterministic cache-prefix-stable context pack for frontier-window models.",
+    description:
+      "Export a deterministic cache-prefix-stable context pack for frontier-window models.",
     inputSchema: {
       query: z.string().min(1),
       budgetTokens: z.number().int().min(1).max(1_000_000),
       cacheKey: z.string().min(1),
-      agentId: z.string().optional(),
       workspaceId: z.string().optional(),
+      // G11: agentId removed from model-facing schema (RCM-003/009). Server stamps DEFAULT_AGENT_ID; daemon enforces via resolve_effective_principal + IdentityMismatchError.
     },
   },
-  async ({ query, budgetTokens, cacheKey, agentId, workspaceId }) => {
-    const result = await exportContextPack({ query, budgetTokens, cacheKey, agentId, workspaceId });
+  async ({ query, budgetTokens, cacheKey, workspaceId }) => {
+    const result = await exportContextPack({
+      query,
+      budgetTokens,
+      cacheKey,
+      agentId: DEFAULT_AGENT_ID,
+      workspaceId,
+    });
     return textResult(JSON.stringify(result, null, 2));
   },
 );
@@ -443,14 +489,7 @@ server.registerTool(
       requireQuality: z.boolean().optional(),
     },
   },
-  async ({
-    title,
-    content,
-    category,
-    source,
-    workspaceId,
-    requireQuality,
-  }) => {
+  async ({ title, content, category, source, workspaceId, requireQuality }) => {
     const quality = assessLearningQuality({ title, content, category, source });
     if (requireQuality === true && !quality.ok) {
       await recordAudit(DEFAULT_VAULT_PATH, {
@@ -499,8 +538,8 @@ server.registerTool(
   },
 );
 
-// G15: sovereign_resolve_candidate — model cannot bypass; only console/operator path
-// (the tool exists for explicit operator use via chat if needed; schema has no spoofable agentId)
+// G15 / RCM-009 "THREE places" literal match: (1) this TS handler surface (no agentId in schema), (2) sovrd._resolve_candidate (does resolve_effective_principal + is_operator_principal check + -32004), (3) principal resolver + is_operator_principal itself.
+// Enforcement delegated to daemon RPC (correct per design); explicit comment here documents the surface for plan fidelity. Model cannot spoof operator.
 server.registerTool(
   "sovereign_resolve_candidate",
   {
@@ -605,14 +644,10 @@ server.registerTool(
       "Summarize recent Sovereign Memory tool activity for transparent self-auditing.",
     inputSchema: {
       limit: z.number().int().min(1).max(200).optional(),
-      vaultPath: z.string().optional(),
     },
   },
-  async ({ limit, vaultPath }) => {
-    const report = await auditReport(
-      vaultPath ?? DEFAULT_VAULT_PATH,
-      limit ?? 100,
-    );
+  async ({ limit }) => {
+    const report = await auditReport(DEFAULT_VAULT_PATH, limit ?? 100);
     return textResult(JSON.stringify(report, null, 2));
   },
 );
@@ -625,11 +660,10 @@ server.registerTool(
       "Show recent Sovereign Memory audit entries from the Codex vault.",
     inputSchema: {
       limit: z.number().int().min(1).max(100).optional(),
-      vaultPath: z.string().optional(),
     },
   },
-  async ({ limit, vaultPath }) => {
-    const tail = await auditTail(vaultPath ?? DEFAULT_VAULT_PATH, limit ?? 20);
+  async ({ limit }) => {
+    const tail = await auditTail(DEFAULT_VAULT_PATH, limit ?? 20);
     return textResult(tail.text || "No audit entries yet.");
   },
 );
@@ -644,7 +678,6 @@ server.registerTool(
       task: z.string().min(1),
       toAgent: z.string().optional(),
       workspaceId: z.string().optional(),
-      vaultPath: z.string().optional(),
       openQuestions: z.array(z.string()).optional(),
       inboxPointer: z.string().optional(),
       limit: z.number().int().min(1).max(12).optional(),
@@ -654,12 +687,11 @@ server.registerTool(
     task,
     toAgent,
     workspaceId,
-    vaultPath,
     openQuestions,
     inboxPointer,
     limit,
   }) => {
-    const effectiveVaultPath = vaultPath ?? DEFAULT_VAULT_PATH;
+    const effectiveVaultPath = DEFAULT_VAULT_PATH;
     const fromAgent = DEFAULT_AGENT_ID; // G11: server-side default only (model no longer supplies agentId)
     const targetAgent = toAgent ?? CLAUDECODE_AGENT_ID;
     const deliveryPlan = planHandoffDelivery({
@@ -868,7 +900,12 @@ server.registerTool(
     description: "Accept or reject a leased handoff with a structured status.",
     inputSchema: {
       leaseId: z.string().min(1),
-      status: z.enum(["accepted", "rejected_stale", "rejected_contradicts", "rejected_scope"]),
+      status: z.enum([
+        "accepted",
+        "rejected_stale",
+        "rejected_contradicts",
+        "rejected_scope",
+      ]),
       contradictsId: z.number().int().optional(),
     },
   },
@@ -884,11 +921,11 @@ server.registerTool(
     title: "Sovereign List Pending Handoffs",
     description: "List unacked handoff leases addressed to an agent.",
     inputSchema: {
-      agentId: z.string().min(1),
+      // G11: agentId removed from model-facing schema (RCM-003/009; self-only tool). Server uses DEFAULT_AGENT_ID; daemon _handle_list_pending_handoffs enforces stamped principal (no spoof of other agents' leases).
     },
   },
-  async ({ agentId }) => {
-    const result = await listPendingHandoffs({ agentId });
+  async () => {
+    const result = await listPendingHandoffs({ agentId: DEFAULT_AGENT_ID });
     return textResult(JSON.stringify(result, null, 2));
   },
 );
@@ -913,14 +950,15 @@ server.registerTool(
   "sovereign_subscribe_contradictions",
   {
     title: "Sovereign Subscribe Contradictions",
-    description: "Return contradiction events touching learnings this agent recently read.",
+    description:
+      "Return contradiction events touching learnings this agent recently read.",
     inputSchema: {
-      agentId: z.string().min(1),
       sinceTs: z.number().optional(),
+      // G11: agentId removed from model-facing schema (RCM-003/009; self-only tool). Server uses DEFAULT_AGENT_ID; daemon _handle_subscribe_contradictions enforces stamped principal (no cross-agent leak of contradiction metadata).
     },
   },
-  async ({ agentId, sinceTs }) => {
-    const result = await subscribeContradictions({ agentId, sinceTs });
+  async ({ sinceTs }) => {
+    const result = await subscribeContradictions({ agentId: DEFAULT_AGENT_ID, sinceTs });
     return textResult(JSON.stringify(result, null, 2));
   },
 );

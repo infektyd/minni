@@ -1,15 +1,13 @@
 """
-G11 — EffectivePrincipal server-stamp binding test (SEC-002 keystone).
+G11 — EffectivePrincipal server-stamp binding test (SEC-002 keystone, RCM-003 updated).
 
 Proves that caller-supplied agent_id is never authoritative:
 - resolve_effective_principal returns a stamped EffectivePrincipal.
-- When no principals/*.json present: back-compat synthesis (supplied or "main").
-- When strict principal config present: stamped value wins; mismatch -> IdentityMismatchError
-  and every public RPC handler (_handle_search, _handle_learn, _handle_read, etc.)
-  returns a structured -32000 identity_mismatch error WITHOUT proceeding to engine work.
+- When no principals/*.json present (fresh): ONLY fixed "main" is synthesized; any other supplied -> IdentityMismatchError.
+- When strict principal config present: stamped value wins; mismatch (or non-main on fresh) -> IdentityMismatchError
+  and every public RPC handler returns structured -32000 identity_mismatch WITHOUT engine work.
 
-This is the only test that exercises the G11 guard. All other engine tests continue
-to run in non-strict mode (no principals/ files) so the tree stays green.
+Covers per RCM-003: (a) strict+file pass, (b) no-principals+"main" pass, (c) no-principals+"other" raises.
 """
 
 from __future__ import annotations
@@ -52,17 +50,36 @@ def test_effective_principal_dataclass_fields():
     assert not p.allows_vault_root("/etc/passwd")
 
 
-def test_resolve_non_strict_backcompat_synthesizes_supplied():
-    """No principals/ files -> supplied value is accepted (rollout safety)."""
-    p = resolve_effective_principal(supplied_agent_id="claude-code", transport="uds")
+def test_resolve_fresh_install_only_main_accepted(tmp_path: Path):
+    """RCM-003: no principals/*.json -> synthesize ONLY "main"; other supplied raises (covers a/b/c).
+    Hermetic: uses explicit empty principals_dir (no global PRINCIPALS_DIR reliance).
+    """
+    principals = tmp_path / "principals"
+    principals.mkdir()  # empty -> fresh synthesize mode for "main" only
+
+    # (b) no-principal + "main" supplied or None -> pass with "main"
+    p = resolve_effective_principal(supplied_agent_id="main", transport="uds", principals_dir=principals)
     assert isinstance(p, EffectivePrincipal)
-    assert p.agent_id == "claude-code"
-    assert p.transport == "uds"
+    assert p.agent_id == "main"
     assert "*" in p.capabilities
 
+    p2 = resolve_effective_principal(supplied_agent_id=None, transport="uds", principals_dir=principals)
+    assert p2.agent_id == "main"
 
-def test_resolve_non_strict_default_main_when_no_supplied():
-    p = resolve_effective_principal(supplied_agent_id=None, transport="uds")
+    # (c) no-principal + other -> IdentityMismatchError
+    with pytest.raises(IdentityMismatchError) as exc:
+        resolve_effective_principal(supplied_agent_id="claude-code", transport="uds", principals_dir=principals)
+    assert "claude-code" in str(exc.value)
+    assert "main" in str(exc.value)
+
+    # (a) strict mode with principal file still passes (existing test covers details)
+
+
+def test_resolve_non_strict_default_main_when_no_supplied(tmp_path: Path):
+    """Hermetic variant (global PRINCIPALS_DIR avoided)."""
+    principals = tmp_path / "principals"
+    principals.mkdir()
+    p = resolve_effective_principal(supplied_agent_id=None, transport="uds", principals_dir=principals)
     assert p.agent_id == "main"
 
 
@@ -169,6 +186,12 @@ def _call_handler_with_mismatch(handler, supplied: str = "evil-spoof"):
     elif handler.__name__ == "_handle_daemon_handoff":
         # G11: handoff now guarded on from_agent claim (Bug 3 / "every MCP/RPC path")
         params = {"from_agent": supplied, "to_agent": "recipient", "packet": {}}
+    elif handler.__name__ == "_handle_sm_export_pack":
+        params = {"agent_id": supplied, "query": "test query for export", "budget_tokens": 100, "cache_key": "t"}
+    elif handler.__name__ == "_handle_list_pending_handoffs":
+        params = {"agent_id": supplied}
+    elif handler.__name__ == "_handle_subscribe_contradictions":
+        params = {"agent_id": supplied, "since_ts": 0}
 
     resp = handler(params, request_id="test-1")
     assert "error" in resp, f"{handler.__name__} did not return error on mismatch"
@@ -214,6 +237,9 @@ def test_all_rpc_paths_deny_mismatched_identity(
         sovrd._handle_log_event,
         sovrd._handle_resolve_contradiction,
         sovrd._handle_daemon_handoff,  # now stamped + denies mismatch (G11)
+        sovrd._handle_sm_export_pack,  # G11 critical: now guarded (was direct agent_id bypass)
+        sovrd._handle_list_pending_handoffs,  # G11 critical: now guarded
+        sovrd._handle_subscribe_contradictions,  # G11 critical: now guarded
     ]
     for h in handlers:
         _call_handler_with_mismatch(h, supplied="not-canonical")

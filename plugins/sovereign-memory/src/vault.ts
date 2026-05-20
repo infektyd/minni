@@ -1,5 +1,18 @@
-import { access, appendFile, mkdir, readFile, readdir, stat, unlink, writeFile } from "node:fs/promises";
+import {
+  access,
+  appendFile,
+  mkdir,
+  readFile,
+  readdir,
+  stat,
+  unlink,
+  writeFile,
+  rename,
+  open,
+} from "node:fs/promises";
 import path from "node:path";
+import os from "node:os";
+import * as fs from "node:fs"; // RCM-005: for realpathSync in assertUnder (G23 equivalent)
 
 export type VaultSection =
   | "raw"
@@ -139,12 +152,15 @@ function slugify(title: string): string {
 
 function yamlValue(value: string | number | boolean | undefined): string {
   if (value === undefined) return "";
-  if (typeof value === "boolean" || typeof value === "number") return String(value);
+  if (typeof value === "boolean" || typeof value === "number")
+    return String(value);
   if (/^[A-Za-z0-9_.:/@ -]+$/.test(value)) return value;
   return JSON.stringify(value);
 }
 
-function frontmatter(data: Record<string, string | number | boolean | undefined>): string {
+function frontmatter(
+  data: Record<string, string | number | boolean | undefined>,
+): string {
   const lines = Object.entries(data)
     .filter(([, value]) => value !== undefined)
     .map(([key, value]) => `${key}: ${yamlValue(value)}`);
@@ -163,12 +179,16 @@ async function exists(filePath: string): Promise<boolean> {
 function sectionPath(section: VaultSection, title: string): string {
   const slug = slugify(title);
   if (section === "raw") return path.join("raw", `${compactDate()}-${slug}.md`);
-  if (section === "sessions") return path.join("wiki", "sessions", `${compactDate()}-${slug}.md`);
+  if (section === "sessions")
+    return path.join("wiki", "sessions", `${compactDate()}-${slug}.md`);
   return path.join("wiki", section, `${slug}.md`);
 }
 
 // PR-2: Infer page type from section
-function inferPageType(section: VaultSection, explicit?: PageType): PageType | undefined {
+function inferPageType(
+  section: VaultSection,
+  explicit?: PageType,
+): PageType | undefined {
   if (explicit) return explicit;
   const sectionTypeMap: Partial<Record<VaultSection, PageType>> = {
     entities: "entity",
@@ -202,7 +222,9 @@ function queryTerms(query: string): string[] {
     "to",
     "with",
   ]);
-  return [...new Set(query.toLowerCase().match(/[a-z0-9_/-]{3,}/g) ?? [])].filter((term) => !stop.has(term));
+  return [
+    ...new Set(query.toLowerCase().match(/[a-z0-9_/-]{3,}/g) ?? []),
+  ].filter((term) => !stop.has(term));
 }
 
 function titleFromMarkdown(relativePath: string, markdown: string): string {
@@ -213,14 +235,22 @@ function titleFromMarkdown(relativePath: string, markdown: string): string {
   return path.basename(relativePath, ".md");
 }
 
-function snippetFor(markdown: string, terms: string[], maxLength = 280): string {
+function snippetFor(
+  markdown: string,
+  terms: string[],
+  maxLength = 280,
+): string {
   const plain = markdown
     .replace(/^---[\s\S]*?---/m, "")
     .replace(/^#+\s+/gm, "")
     .replace(/\s+/g, " ")
     .trim();
   const lower = plain.toLowerCase();
-  const firstHit = terms.map((term) => lower.indexOf(term)).filter((index) => index >= 0).sort((a, b) => a - b)[0] ?? 0;
+  const firstHit =
+    terms
+      .map((term) => lower.indexOf(term))
+      .filter((index) => index >= 0)
+      .sort((a, b) => a - b)[0] ?? 0;
   const start = Math.max(0, firstHit - 80);
   const end = Math.min(plain.length, start + maxLength);
   const prefix = start > 0 ? "..." : "";
@@ -229,10 +259,21 @@ function snippetFor(markdown: string, terms: string[], maxLength = 280): string 
 }
 
 async function listMarkdownFiles(root: string): Promise<string[]> {
+  // RCM-005: containment on every entry (skip escaped symlinks)
+  try {
+    assertUnder(root, root); // self check
+  } catch {
+    return [];
+  }
   const entries = await readdir(root, { withFileTypes: true });
   const files = await Promise.all(
     entries.map(async (entry) => {
       const full = path.join(root, entry.name);
+      try {
+        assertUnder(full, root);
+      } catch {
+        return []; // escaped symlink or bad -> skip (fail closed)
+      }
       if (entry.isDirectory()) return listMarkdownFiles(full);
       if (entry.isFile() && entry.name.endsWith(".md")) return [full];
       return [];
@@ -241,7 +282,13 @@ async function listMarkdownFiles(root: string): Promise<string[]> {
   return files.flat();
 }
 
-function scoreVaultNote(query: string, terms: string[], relativePath: string, title: string, markdown: string): number {
+function scoreVaultNote(
+  query: string,
+  terms: string[],
+  relativePath: string,
+  title: string,
+  markdown: string,
+): number {
   const haystack = `${title}\n${relativePath}\n${markdown}`.toLowerCase();
   const titleLower = title.toLowerCase();
   const queryLower = query.toLowerCase().trim();
@@ -306,7 +353,9 @@ Append-only audit of Codex memory operations.
 `;
 }
 
-export async function ensureVault(vaultPath: string): Promise<EnsureVaultResult> {
+export async function ensureVault(
+  vaultPath: string,
+): Promise<EnsureVaultResult> {
   const created: string[] = [];
   await mkdir(vaultPath, { recursive: true });
   for (const dir of VAULT_DIRS) {
@@ -382,11 +431,164 @@ function escapeAuditDetailsBlock(raw: string): string {
   return block;
 }
 
-export async function recordAudit(vaultPath: string, entry: AuditEntry): Promise<string> {
+function getAgentIdFromVaultPath(vaultPath: string): string {
+  const absPath = path.resolve(vaultPath.replace(/^~(?=$|\/)/, os.homedir()));
+
+  const mappingRaw = process.env.SOVEREIGN_AGENT_VAULTS;
+  if (mappingRaw) {
+    try {
+      const mapping = JSON.parse(mappingRaw) as unknown;
+      if (mapping && typeof mapping === "object" && !Array.isArray(mapping)) {
+        for (const [agentId, mappedPath] of Object.entries(mapping as Record<string, unknown>)) {
+          if (typeof mappedPath === "string") {
+            const absMapped = path.resolve(mappedPath.replace(/^~(?=$|\/)/, os.homedir()));
+            if (absMapped === absPath) return agentId;
+          }
+        }
+      }
+    } catch {}
+  }
+
+  const envKeys = [
+    { key: "SOVEREIGN_CODEX_VAULT_PATH", id: "codex" },
+    { key: "SOVEREIGN_CLAUDECODE_VAULT_PATH", id: "claude-code" },
+    { key: "SOVEREIGN_KILOCODE_VAULT_PATH", id: "kilocode" },
+  ];
+  for (const { key, id } of envKeys) {
+    const val = process.env[key];
+    if (val && path.resolve(val.replace(/^~(?=$|\/)/, os.homedir())) === absPath) {
+      return id;
+    }
+  }
+
+  const homedir = os.homedir();
+  if (absPath === path.join(homedir, ".sovereign-memory", "codex-vault")) return "codex";
+  if (absPath === path.join(homedir, ".sovereign-memory", "claudecode-vault")) return "claude-code";
+  if (absPath === path.join(homedir, ".sovereign-memory", "kilocode-vault")) return "kilocode";
+  if (absPath === path.join(homedir, ".sovereign-memory", "hermes-vault")) return "hermes";
+  if (absPath === path.join(homedir, ".sovereign-memory", "openclaw-vault")) return "openclaw";
+
+  const base = path.basename(absPath);
+  if (base.endsWith("-vault")) return base.substring(0, base.length - 6);
+  return base || "agent";
+}
+
+async function appendFileWithFsync(filePath: string, content: string): Promise<void> {
+  const fh = await open(filePath, "a");
+  try {
+    await fh.writeFile(content, "utf8");
+    await fh.sync();
+  } finally {
+    await fh.close();
+  }
+}
+
+async function writeFileAtomic(filePath: string, content: string): Promise<void> {
+  const tempPath = `${filePath}.${Math.random().toString(36).substring(2)}.tmp`;
+  const fh = await open(tempPath, "w");
+  try {
+    await fh.writeFile(content, "utf8");
+    await fh.sync();
+  } finally {
+    await fh.close();
+  }
+  await rename(tempPath, filePath);
+}
+
+const auditLocks = new Map<string, Promise<void>>();
+
+async function withAuditLock<T>(vaultPath: string, fn: () => Promise<T>): Promise<T> {
+  const key = path.resolve(vaultPath.replace(/^~(?=$|\/)/, os.homedir()));
+  const previous = auditLocks.get(key) ?? Promise.resolve();
+  let release!: () => void;
+  const current = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const tail = previous.then(() => current, () => current);
+  auditLocks.set(key, tail);
+
+  await previous.catch(() => {});
+  try {
+    return await fn();
+  } finally {
+    release();
+    if (auditLocks.get(key) === tail) {
+      auditLocks.delete(key);
+    }
+  }
+}
+
+function shouldThrottleAudit(entry: AuditEntry): boolean {
+  return entry.tool.startsWith("hook_");
+}
+
+export async function recordAudit(
+  vaultPath: string,
+  entry: AuditEntry,
+): Promise<string> {
   await ensureVault(vaultPath);
+  return withAuditLock(vaultPath, async () => {
   const timestamp = entry.timestamp ?? new Date();
+
+  // --- 1. Per-agent rate-limiting ---
+  const agentId = getAgentIdFromVaultPath(vaultPath);
+  const homeDir = process.env.SOVEREIGN_HOME ?? path.join(os.homedir(), ".sovereign-memory");
+  const rateLimitDir = path.join(homeDir, ".hook-audit-ts");
+  await mkdir(rateLimitDir, { recursive: true });
+  const tsPath = path.join(rateLimitDir, `${agentId}.ts`);
+
+  let lastTime: number | undefined;
+  try {
+    const content = await readFile(tsPath, "utf8");
+    lastTime = Date.parse(content.trim());
+  } catch {}
+
+  const bypass = process.env.SOVEREIGN_BYPASS_AUDIT_LIMIT === "true";
+  const logPath = path.join(vaultPath, "log.md");
+  const dailyPath = path.join(vaultPath, "logs", `${isoDate(timestamp)}.md`);
+  if (!bypass && lastTime !== undefined && Number.isFinite(lastTime)) {
+    const diff = timestamp.getTime() - lastTime;
+    if (shouldThrottleAudit(entry) && diff >= 0 && diff < 5000) {
+      return dailyPath;
+    }
+  }
+
+  if (bypass || shouldThrottleAudit(entry)) {
+    await writeFile(tsPath, timestamp.toISOString(), { encoding: "utf8", mode: 0o600 });
+  }
+
+  // --- 2. Rotation check ---
+  let currentSize = 0;
+  try {
+    const st = await stat(logPath);
+    currentSize = st.size;
+  } catch {}
+
+  if (currentSize >= 5 * 1024 * 1024) {
+    const path3 = path.join(vaultPath, "log.3.md");
+    const path2 = path.join(vaultPath, "log.2.md");
+    const path1 = path.join(vaultPath, "log.1.md");
+
+    await unlink(path3).catch(() => {});
+    if (await exists(path2)) {
+      await rename(path2, path3);
+    }
+    if (await exists(path1)) {
+      await rename(path1, path2);
+    }
+    if (await exists(logPath)) {
+      await rename(logPath, path1);
+    }
+
+    await writeFileAtomic(logPath, logContent());
+  }
+
+  // --- 3. Format and Append Audit Line ---
   const date = isoDate(timestamp);
-  const safeTool = escapeAuditField(entry.tool ?? "", { mode: "inline", maxLen: 200 });
+  const safeTool = escapeAuditField(entry.tool ?? "", {
+    mode: "inline",
+    maxLen: 200,
+  });
   const safeSummary = escapeAuditField(entry.summary ?? "", {
     mode: "inline",
     maxLen: AUDIT_SUMMARY_MAX,
@@ -397,16 +599,86 @@ export async function recordAudit(vaultPath: string, entry: AuditEntry): Promise
     detailBlock = `\`\`\`json\n${escapeAuditDetailsBlock(raw)}\n\`\`\`\n\n`;
   }
   const line = `## [${timestamp.toISOString()}] ${safeTool} | ${safeSummary}\n\n${detailBlock}`;
-  await appendFile(path.join(vaultPath, "log.md"), line, "utf8");
-  const dailyPath = path.join(vaultPath, "logs", `${date}.md`);
+
+  await appendFileWithFsync(logPath, line);
+
   if (!(await exists(dailyPath))) {
-    await writeFile(dailyPath, `# ${date} Sovereign Memory Audit\n\n`, "utf8");
+    await writeFileAtomic(dailyPath, `# ${date} Sovereign Memory Audit\n\n`);
   }
-  await appendFile(dailyPath, line, "utf8");
+  await appendFileWithFsync(dailyPath, line);
+
+  // --- 4. Daily-log prune (older than 30 days) ---
+  const logsDir = path.join(vaultPath, "logs");
+  let logFiles: string[] = [];
+  try {
+    logFiles = await readdir(logsDir);
+  } catch {}
+  const nowMs = timestamp.getTime();
+  const thirtyDaysMs = 30 * 24 * 60 * 60 * 1000;
+  for (const file of logFiles) {
+    const match = file.match(/^(\d{4}-\d{2}-\d{2})\.md$/);
+    if (match) {
+      const fileDate = new Date(match[1]);
+      if (Number.isFinite(fileDate.getTime())) {
+        if (nowMs - fileDate.getTime() > thirtyDaysMs) {
+          await unlink(path.join(logsDir, file)).catch(() => {});
+        }
+      }
+    }
+  }
+
+  // --- 5. Quota (50 MB) check and prune ---
+  const auditFiles: { filePath: string; size: number; isDaily: boolean; dateMs?: number }[] = [];
+
+  const logFilesToCheck = ["log.md", "log.1.md", "log.2.md", "log.3.md"];
+  for (const name of logFilesToCheck) {
+    const fp = path.join(vaultPath, name);
+    try {
+      const st = await stat(fp);
+      auditFiles.push({ filePath: fp, size: st.size, isDaily: false });
+    } catch {}
+  }
+
+  try {
+    const dailyNames = await readdir(logsDir);
+    for (const name of dailyNames) {
+      const match = name.match(/^(\d{4}-\d{2}-\d{2})\.md$/);
+      if (match) {
+        const fp = path.join(logsDir, name);
+        try {
+          const st = await stat(fp);
+          const dateMs = new Date(match[1]).getTime();
+          auditFiles.push({ filePath: fp, size: st.size, isDaily: true, dateMs });
+        } catch {}
+      }
+    }
+  } catch {}
+
+  let totalSize = auditFiles.reduce((acc, f) => acc + f.size, 0);
+  const quota = 50 * 1024 * 1024;
+
+  if (totalSize > quota) {
+    const dailyLogs = auditFiles
+      .filter((f) => f.isDaily && f.dateMs !== undefined)
+      .sort((a, b) => a.dateMs! - b.dateMs!);
+
+    for (const daily of dailyLogs) {
+      await unlink(daily.filePath).catch(() => {});
+      totalSize -= daily.size;
+      if (totalSize <= quota) break;
+    }
+  }
+
   return dailyPath;
+  });
 }
 
-async function appendIndex(vaultPath: string, title: string, relativePath: string, summary: string): Promise<void> {
+async function appendIndex(
+  vaultPath: string,
+  title: string,
+  relativePath: string,
+  summary: string,
+): Promise<void> {
   await ensureVault(vaultPath);
   const indexPath = path.join(vaultPath, "index.md");
   const existing = await readFile(indexPath, "utf8");
@@ -416,7 +688,9 @@ async function appendIndex(vaultPath: string, title: string, relativePath: strin
   await appendFile(indexPath, line, "utf8");
 }
 
-export async function writeVaultPage(input: WriteVaultPageInput): Promise<VaultWriteResult> {
+export async function writeVaultPage(
+  input: WriteVaultPageInput,
+): Promise<VaultWriteResult> {
   await ensureVault(input.vaultPath);
   const relativePath = sectionPath(input.section, input.title);
   const notePath = path.join(input.vaultPath, relativePath);
@@ -459,7 +733,9 @@ export async function writeVaultPage(input: WriteVaultPageInput): Promise<VaultW
   return { notePath, relativePath, wikilink: wikilinkFor(relativePath) };
 }
 
-export async function vaultFirstLearn(input: LearnInput): Promise<VaultWriteResult> {
+export async function vaultFirstLearn(
+  input: LearnInput,
+): Promise<VaultWriteResult> {
   const result = await writeVaultPage({
     vaultPath: input.vaultPath,
     title: input.title,
@@ -487,7 +763,10 @@ export async function vaultFirstLearn(input: LearnInput): Promise<VaultWriteResu
   return result;
 }
 
-export async function auditTail(vaultPath: string, limit = 20): Promise<AuditTailResult> {
+export async function auditTail(
+  vaultPath: string,
+  limit = 20,
+): Promise<AuditTailResult> {
   await ensureVault(vaultPath);
   const todayPath = path.join(vaultPath, "logs", `${isoDate()}.md`);
   const fallbackPath = path.join(vaultPath, "log.md");
@@ -506,7 +785,10 @@ export async function auditTail(vaultPath: string, limit = 20): Promise<AuditTai
   return { entries, text: entries.join("\n\n") };
 }
 
-export async function auditReport(vaultPath: string, limit = 100): Promise<AuditReport> {
+export async function auditReport(
+  vaultPath: string,
+  limit = 100,
+): Promise<AuditReport> {
   const tail = await auditTail(vaultPath, limit);
   const tools: Record<string, number> = {};
   const recentSummaries: string[] = [];
@@ -526,7 +808,11 @@ export async function auditReport(vaultPath: string, limit = 100): Promise<Audit
   };
 }
 
-export async function searchVaultNotes(vaultPath: string, query: string, limit = 5): Promise<VaultSearchResult[]> {
+export async function searchVaultNotes(
+  vaultPath: string,
+  query: string,
+  limit = 5,
+): Promise<VaultSearchResult[]> {
   await ensureVault(vaultPath);
   const wikiRoot = path.join(vaultPath, "wiki");
   const terms = queryTerms(query);
@@ -558,7 +844,10 @@ export async function searchVaultNotes(vaultPath: string, query: string, limit =
 
   return scored
     .filter((result) => result.score > 0)
-    .sort((a, b) => b.score - a.score || a.relativePath.localeCompare(b.relativePath))
+    .sort(
+      (a, b) =>
+        b.score - a.score || a.relativePath.localeCompare(b.relativePath),
+    )
     .slice(0, limit);
 }
 
@@ -633,7 +922,29 @@ function normalizeWikilinkRef(ref: string): string {
     .replace(/^\/+/, "");
 }
 
-async function resolveVaultRef(vaultPath: string, ref: string): Promise<HandoffContextSnippet | undefined> {
+/**
+ * RCM-005 / G23: assert path is under root after realpath (symlink escape reject).
+ * Fail closed on any error or escape.
+ */
+function assertUnder(fullPath: string, rootPath: string): void {
+  let realFull: string;
+  try {
+    realFull = fs.realpathSync(fullPath);
+  } catch (e: any) {
+    if (e && e.code === "ENOENT") return; // non-existing candidate: let readFile fail naturally; no escape vector yet
+    throw new Error(`path containment check failed for ${fullPath}`);
+  }
+  const realRoot = fs.realpathSync(rootPath);
+  const rel = path.relative(realRoot, realFull);
+  if (rel.startsWith("..") || path.isAbsolute(rel)) {
+    throw new Error(`path escapes vault root: ${fullPath}`);
+  }
+}
+
+async function resolveVaultRef(
+  vaultPath: string,
+  ref: string,
+): Promise<HandoffContextSnippet | undefined> {
   const normalized = normalizeWikilinkRef(ref);
   const candidates = [
     path.join(vaultPath, `${normalized}.md`),
@@ -641,6 +952,7 @@ async function resolveVaultRef(vaultPath: string, ref: string): Promise<HandoffC
   ];
   for (const notePath of candidates) {
     try {
+      assertUnder(notePath, vaultPath);
       const markdown = await readFile(notePath, "utf8");
       const relativePath = path.relative(vaultPath, notePath);
       return {
@@ -650,7 +962,7 @@ async function resolveVaultRef(vaultPath: string, ref: string): Promise<HandoffC
         snippet: snippetFor(markdown, queryTerms(normalized), 520),
       };
     } catch {
-      // try the next candidate
+      // try the next (or containment reject -> fail closed, treat as absent)
     }
   }
   return undefined;

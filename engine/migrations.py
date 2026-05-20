@@ -105,7 +105,28 @@ def _migration_present_in_schema(conn: sqlite3.Connection, version: int) -> bool
             _column_exists(conn, "documents", "layer")
             and _column_exists(conn, "chunk_embeddings", "layer")
         )
+    if version == 7:
+        return _table_exists(conn, "candidate_packets")
+    if version == 8:
+        return (
+            _table_exists(conn, "handoff_leases")
+            and _table_exists(conn, "learning_reads")
+            and _table_exists(conn, "contradiction_events")
+        )
+    if version == 9:
+        return _table_exists(conn, "contradiction_log")
     return True
+
+
+def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+            (table,),
+        ).fetchone()
+        return row is not None
+    except sqlite3.Error:
+        return False
 
 
 def run_migrations(conn: sqlite3.Connection) -> None:

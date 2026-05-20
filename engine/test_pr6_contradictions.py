@@ -27,6 +27,42 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(__file__))
 
+# Hermetic principal setup for test integrity.
+@pytest.fixture(autouse=True)
+def setup_hermetic_principals(tmp_path, monkeypatch):
+    """Replaces the module-level permissive resolve patch with a wrapper that writes
+    realistic principal files to tmp_path/principals/ (chmod 0o600) and routes
+    through the real principal resolution logic.
+    """
+    import principal
+    import sovrd
+
+    pdir = tmp_path / "principals"
+    pdir.mkdir(exist_ok=True)
+
+    original_resolve = principal.resolve_effective_principal
+
+    def _patched_resolve(*, supplied_agent_id=None, transport="uds", principals_dir=None):
+        target_dir = principals_dir or pdir
+        target_agent = str(supplied_agent_id or "main").strip() or "main"
+        f = target_dir / "local.json"
+        f.write_text(json.dumps({
+            "agent_id": target_agent,
+            "workspace_id": "default",
+            "capabilities": ["*"]
+        }), encoding="utf-8")
+        os.chmod(f, 0o600)
+
+        return original_resolve(
+            supplied_agent_id=supplied_agent_id,
+            transport=transport,
+            principals_dir=target_dir
+        )
+
+    monkeypatch.setattr(principal, "resolve_effective_principal", _patched_resolve)
+    monkeypatch.setattr(sovrd, "resolve_effective_principal", _patched_resolve)
+
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -421,7 +457,7 @@ class TestHandleLearn:
 
     def _dispatch(self, method, params):
         """Invoke the JSON-RPC _dispatch function directly."""
-        from sovrd import _dispatch
+        from sovrd import _dispatch_sync as _dispatch
         resp = _dispatch({
             "jsonrpc": "2.0",
             "id": 1,
@@ -451,7 +487,7 @@ class TestHandleLearn:
         try:
             resp = self._dispatch("learn", {
                 "content": "WebSocket reconnection needs 500ms backoff",
-                "agent_id": "forge",
+                "agent_id": "main",
                 "category": "fix",
             })
         finally:
@@ -462,7 +498,7 @@ class TestHandleLearn:
         assert result["status"] == "proposed"
         assert "candidate_id" in result
         assert "learning_id" not in result
-        assert result["principal"] == "forge"
+        assert result["principal"] == "main"
 
     def test_learn_content_required(self, tmp_path, monkeypatch):
         """learn() returns error when content is missing."""
@@ -627,7 +663,7 @@ class TestHandleLearn:
 class TestHandleResolveContradiction:
 
     def _dispatch(self, method, params):
-        from sovrd import _dispatch
+        from sovrd import _dispatch_sync as _dispatch
         return _dispatch({
             "jsonrpc": "2.0",
             "id": 1,
@@ -910,7 +946,7 @@ class TestFullWorkflow:
     """
 
     def _dispatch(self, method, params):
-        from sovrd import _dispatch
+        from sovrd import _dispatch_sync as _dispatch
         return _dispatch({
             "jsonrpc": "2.0",
             "id": 1,
@@ -1005,7 +1041,7 @@ class TestFullWorkflow:
                 "Always use ECDSA over RSA for new certificates",
                 "Database migrations must be idempotent",
             ]):
-                resp = self._dispatch("learn", {"content": content, "agent_id": "forge"})
+                resp = self._dispatch("learn", {"content": content, "agent_id": "main"})
                 assert "error" not in resp, f"Call {i} errored: {resp}"
                 result = resp["result"]
                 assert result["status"] == "proposed", f"Call {i} not proposed: {result}"

@@ -14,6 +14,7 @@ import {
   vaultFirstLearn,
   writeVaultPage,
 } from "../dist/vault.js";
+import { symlink } from "node:fs/promises"; // for RCM-005 escape test
 
 test("ensureVault creates the Codex LLM wiki structure and schema", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "sm-vault-"));
@@ -25,7 +26,10 @@ test("ensureVault creates the Codex LLM wiki structure and schema", async () => 
     assert.ok(result.created.includes(path.join(root, "wiki", "entities")));
     assert.ok(result.created.includes(path.join(root, "outbox")));
 
-    const schema = await readFile(path.join(root, "schema", "AGENTS.md"), "utf8");
+    const schema = await readFile(
+      path.join(root, "schema", "AGENTS.md"),
+      "utf8",
+    );
     assert.match(schema, /Codex Sovereign Memory Vault/);
     assert.match(schema, /raw sources/i);
   } finally {
@@ -71,14 +75,18 @@ test("vaultFirstLearn writes a note, updates index, and appends audit logs", asy
     const result = await vaultFirstLearn({
       vaultPath: root,
       title: "Socket daemon health check",
-      content: "Sovereign Memory daemon health is checked through ~/.sovereign-memory/run/sovrd.sock.",
+      content:
+        "Sovereign Memory daemon health is checked through ~/.sovereign-memory/run/sovrd.sock.",
       category: "fact",
       source: "unit-test",
       agentId: "codex",
       storeResult: { ok: true, detail: "learned" },
     });
 
-    assert.match(result.notePath, /wiki\/sessions\/\d{8}-socket-daemon-health-check\.md$/);
+    assert.match(
+      result.notePath,
+      /wiki\/sessions\/\d{8}-socket-daemon-health-check\.md$/,
+    );
 
     const note = await readFile(result.notePath, "utf8");
     assert.match(note, /agent: codex/);
@@ -86,7 +94,10 @@ test("vaultFirstLearn writes a note, updates index, and appends audit logs", asy
     assert.match(note, /Sovereign Memory daemon health/);
 
     const index = await readFile(path.join(root, "index.md"), "utf8");
-    assert.match(index, /\[\[wiki\/sessions\/\d{8}-socket-daemon-health-check\]\]/);
+    assert.match(
+      index,
+      /\[\[wiki\/sessions\/\d{8}-socket-daemon-health-check\]\]/,
+    );
 
     const log = await readFile(path.join(root, "log.md"), "utf8");
     assert.match(log, /sovereign_learn/);
@@ -179,7 +190,8 @@ test("searchVaultNotes ranks Codex wiki learnings for recall context", async () 
     await vaultFirstLearn({
       vaultPath: root,
       title: "Codex plugin full suite marker",
-      content: "SM_SEARCH_MARKER confirms vault-first learning is visible to AI recall context packs.",
+      content:
+        "SM_SEARCH_MARKER confirms vault-first learning is visible to AI recall context packs.",
       category: "fact",
       source: "unit-test",
       agentId: "codex",
@@ -193,12 +205,59 @@ test("searchVaultNotes ranks Codex wiki learnings for recall context", async () 
       source: "unit-test",
     });
 
-    const results = await searchVaultNotes(root, "SM_SEARCH_MARKER AI recall context", 3);
+    const results = await searchVaultNotes(
+      root,
+      "SM_SEARCH_MARKER AI recall context",
+      3,
+    );
 
     assert.equal(results.length, 1);
-    assert.match(results[0].relativePath, /wiki\/sessions\/\d{8}-codex-plugin-full-suite-marker\.md$/);
-    assert.match(results[0].wikilink, /\[\[wiki\/sessions\/\d{8}-codex-plugin-full-suite-marker\]\]/);
+    assert.match(
+      results[0].relativePath,
+      /wiki\/sessions\/\d{8}-codex-plugin-full-suite-marker\.md$/,
+    );
+    assert.match(
+      results[0].wikilink,
+      /\[\[wiki\/sessions\/\d{8}-codex-plugin-full-suite-marker\]\]/,
+    );
     assert.match(results[0].snippet, /SM_SEARCH_MARKER/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+// RCM-005: concrete escape test (symlink to outside root must be rejected)
+test("resolveInboxHandoffContext and search reject symlink escape from vault (RCM-005)", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-escape-"));
+  try {
+    await ensureVault(root);
+    const wiki = path.join(root, "wiki");
+    const evilLink = path.join(wiki, "evil.md");
+    // create symlink pointing outside
+    await symlink("/etc/passwd", evilLink);
+
+    // via handoff context (uses resolveVaultRef)
+    const fakeHandoff = {
+      payload: {
+        kind: "handoff",
+        wikilink_refs: ["evil", "[[evil]]"],
+      },
+    };
+    const snippets = await resolveInboxHandoffContext(root, [fakeHandoff], 8);
+    assert.equal(
+      snippets.length,
+      0,
+      "escaped symlink must not resolve to content",
+    );
+
+    // via search (uses listMarkdownFiles which guards)
+    const searchRes = await searchVaultNotes(root, "passwd", 5);
+    // must not include content from /etc/passwd (strong zero-results for symmetry with resolveInboxHandoffContext)
+    assert.equal(
+      searchRes.length,
+      0,
+      "search must return zero results on symlink escape (RCM-005)",
+    );
   } finally {
     await rm(root, { recursive: true, force: true });
   }

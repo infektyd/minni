@@ -46,9 +46,11 @@ def _write_page(
     status="accepted",
     tags=None,
     sources=None,
-    updated="2026-04-20T00:00:00Z",
+    updated=None,
     extra_frontmatter=None,
 ):
+    if updated is None:
+        updated = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 5 * 86400))
     path = vault / rel
     path.parent.mkdir(parents=True, exist_ok=True)
     tags = tags or []
@@ -265,13 +267,13 @@ def test_daemon_compile_routes_reorg_and_pruning_with_traces(tmp_path, monkeypat
     monkeypatch.setattr(sovrd, "_writeback", None)
     monkeypatch.setattr(sovrd, "SovereignDB", lambda config=None: db_obj)
 
-    reorg_resp = sovrd._dispatch({
+    reorg_resp = sovrd._dispatch_sync({
         "jsonrpc": "2.0",
         "id": 1,
         "method": "daemon.compile",
         "params": {"pass_name": "reorganization", "vault_path": str(vault), "dry_run": False},
     })
-    pruning_resp = sovrd._dispatch({
+    pruning_resp = sovrd._dispatch_sync({
         "jsonrpc": "2.0",
         "id": 2,
         "method": "daemon.compile",
@@ -285,13 +287,13 @@ def test_daemon_compile_routes_reorg_and_pruning_with_traces(tmp_path, monkeypat
     draft_text = draft_path.read_text(encoding="utf-8")
     assert "status: draft" in draft_text
     assert "agent: afm-loop" in draft_text
-    reorg_trace = sovrd._dispatch({"jsonrpc": "2.0", "id": 3, "method": "trace", "params": {"trace_id": reorg_resp["result"]["trace_id"]}})
+    reorg_trace = sovrd._dispatch_sync({"jsonrpc": "2.0", "id": 3, "method": "trace", "params": {"trace_id": reorg_resp["result"]["trace_id"]}})
     assert reorg_trace["result"]["trace"]["pass_name"] == "reorganization"
 
     assert "error" not in pruning_resp
     assert pruning_resp["result"]["status"] == "ok"
     assert pruning_resp["result"]["inbox_written"]["path"].startswith("inbox/afm-pruning-")
-    pruning_trace = sovrd._dispatch({"jsonrpc": "2.0", "id": 4, "method": "trace", "params": {"trace_id": pruning_resp["result"]["trace_id"]}})
+    pruning_trace = sovrd._dispatch_sync({"jsonrpc": "2.0", "id": 4, "method": "trace", "params": {"trace_id": pruning_resp["result"]["trace_id"]}})
     assert pruning_trace["result"]["trace"]["pass_name"] == "pruning"
     assert pruning_trace["result"]["trace"]["output"]["proposal_count"] >= 1
 

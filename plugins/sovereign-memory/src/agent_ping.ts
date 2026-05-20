@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, readdir, rename, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, rename, writeFile, unlink } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { DEFAULT_AGENT_ID, DEFAULT_VAULT_PATH } from "./config.js";
@@ -199,6 +199,65 @@ function withExpiry(contract: AgentPingContract, now = new Date()): AgentPingCon
   };
 }
 
+function getLeasePath(requestId: string): string {
+  const baseHome = process.env.SOVEREIGN_HOME ?? path.join(os.homedir(), ".sovereign-memory");
+  return path.join(baseHome, "pings", "leases", `${requestId}.json`);
+}
+
+function getLeaseDir(): string {
+  const baseHome = process.env.SOVEREIGN_HOME ?? path.join(os.homedir(), ".sovereign-memory");
+  return path.join(baseHome, "pings", "leases");
+}
+
+async function checkAndReapLease(requestId: string, now = new Date()): Promise<boolean> {
+  const leasePath = getLeasePath(requestId);
+  try {
+    const contract = await readContract(leasePath);
+    if (Date.parse(contract.expiresAt) <= now.getTime()) {
+      await unlink(leasePath).catch(() => {});
+      const recipientVault = resolveAgentVaultPath(contract.toAgent);
+      await unlink(agentPingPath(recipientVault, "inbox", requestId)).catch(() => {});
+      const senderVault = resolveAgentVaultPath(contract.fromAgent);
+      await unlink(agentPingPath(senderVault, "outbox", requestId)).catch(() => {});
+      return true;
+    }
+  } catch {
+    // Not in lease table
+  }
+  return false;
+}
+
+async function reconcileAndMaterializeLeases(agentId: string, now = new Date()): Promise<void> {
+  const dir = getLeaseDir();
+  let files: string[] = [];
+  try {
+    files = await readdir(dir);
+  } catch {
+    return;
+  }
+  for (const file of files) {
+    if (!file.endsWith(".json")) continue;
+    const leasePath = path.join(dir, file);
+    try {
+      const contract = await readContract(leasePath);
+      if (Date.parse(contract.expiresAt) <= now.getTime()) {
+        await unlink(leasePath).catch(() => {});
+        const recipientVault = resolveAgentVaultPath(contract.toAgent);
+        await unlink(agentPingPath(recipientVault, "inbox", contract.requestId)).catch(() => {});
+        const senderVault = resolveAgentVaultPath(contract.fromAgent);
+        await unlink(agentPingPath(senderVault, "outbox", contract.requestId)).catch(() => {});
+      } else if (contract.toAgent === agentId) {
+        const recipientVault = resolveAgentVaultPath(contract.toAgent);
+        await ensureVault(recipientVault);
+        const recipientPath = agentPingPath(recipientVault, "inbox", contract.requestId);
+        await writeJsonAtomic(recipientPath, contract);
+      }
+    } catch {
+      await unlink(leasePath).catch(() => {});
+    }
+  }
+}
+
 async function syncContract(contract: AgentPingContract): Promise<{ senderPath: string; recipientPath: string }> {
   const senderVault = resolveAgentVaultPath(contract.fromAgent);
   const recipientVault = resolveAgentVaultPath(contract.toAgent);
@@ -239,7 +298,18 @@ export async function createAgentPingRequest(input: CreateAgentPingInput, actorA
     },
     lifecycle: [{ at: nowIso(now), actor: actorAgent, action: "created" }],
   };
-  const paths = await syncContract(contract);
+  const senderVault = resolveAgentVaultPath(actorAgent);
+  await ensureVault(senderVault);
+  const senderPath = agentPingPath(senderVault, "outbox", requestId);
+  await writeJsonAtomic(senderPath, contract);
+
+  const leasePath = getLeasePath(requestId);
+  await writeJsonAtomic(leasePath, contract);
+
+  const recipientVault = resolveAgentVaultPath(toAgent);
+  const recipientPath = agentPingPath(recipientVault, "inbox", requestId);
+  const paths = { senderPath, recipientPath };
+
   await recordAudit(resolveAgentVaultPath(actorAgent), {
     tool: "sovereign_ping_agent_request",
     summary: `${actorAgent}->${toAgent} ${requestId}`,
@@ -255,6 +325,7 @@ export async function createAgentPingRequest(input: CreateAgentPingInput, actorA
 }
 
 export async function listAgentPingInbox(agentId = DEFAULT_AGENT_ID, limit = 20, now = new Date()): Promise<AgentPingListResult> {
+  await reconcileAndMaterializeLeases(agentId, now);
   const vaultPath = resolveAgentVaultPath(agentId);
   await ensureVault(vaultPath);
   const dir = agentPingDir(vaultPath, "inbox");
@@ -289,11 +360,24 @@ export async function listAgentPingInbox(agentId = DEFAULT_AGENT_ID, limit = 20,
 }
 
 export async function decideAgentPingRequest(input: DecideAgentPingInput, actorAgent = DEFAULT_AGENT_ID): Promise<AgentPingWriteResult> {
+  const now = input.now ?? new Date();
+  if (await checkAndReapLease(input.requestId, now)) {
+    throw new Error(`Request is expired; only pending requests can be decided.`);
+  }
+  try {
+    const leaseContract = await readContract(getLeasePath(input.requestId));
+    if (leaseContract.toAgent !== actorAgent) {
+      throw new Error("Only the recipient agent can decide this request.");
+    }
+  } catch (error) {
+    if (error instanceof Error && error.message.includes("Only the recipient agent")) throw error;
+  }
+  await reconcileAndMaterializeLeases(actorAgent, now);
   const vaultPath = resolveAgentVaultPath(actorAgent);
   const requestPath = agentPingPath(vaultPath, "inbox", input.requestId);
   let existing: AgentPingContract;
   try {
-    existing = withExpiry(await readContract(requestPath), input.now ?? new Date());
+    existing = withExpiry(await readContract(requestPath), now);
   } catch (error) {
     // If the requester tries to decide its own outbox copy, return an
     // authorization error instead of leaking path details from the missing
@@ -309,7 +393,6 @@ export async function decideAgentPingRequest(input: DecideAgentPingInput, actorA
   if (existing.toAgent !== actorAgent) throw new Error("Only the recipient agent can decide this request.");
   if (existing.status !== "pending") throw new Error(`Request is ${existing.status}; only pending requests can be decided.`);
 
-  const now = input.now ?? new Date();
   const decision = input.decision;
   if (decision !== "approve" && decision !== "deny") throw new Error("decision must be approve or deny.");
   if (decision === "approve" && !input.answer?.trim()) throw new Error("Approved requests require an answer.");
@@ -340,6 +423,8 @@ export async function decideAgentPingRequest(input: DecideAgentPingInput, actorA
     ],
   };
   const paths = await syncContract(contract);
+  const leasePath = getLeasePath(input.requestId);
+  await unlink(leasePath).catch(() => {});
   await recordAudit(vaultPath, {
     tool: "sovereign_ping_agent_decide",
     summary: `${decision} ${input.requestId}`,
@@ -366,6 +451,11 @@ export async function decideAgentPingRequest(input: DecideAgentPingInput, actorA
 }
 
 export async function getAgentPingStatus(requestId: string, actorAgent = DEFAULT_AGENT_ID, now = new Date()): Promise<AgentPingWriteResult> {
+  await checkAndReapLease(requestId, now);
+  // Materialize the actor's inbox copy from any live lease addressed to them
+  // before resolving status (RCM: recipient must see "pending" without first
+  // having to call listAgentPingInbox).
+  await reconcileAndMaterializeLeases(actorAgent, now);
   const actorVault = resolveAgentVaultPath(actorAgent);
   const candidates = [agentPingPath(actorVault, "outbox", requestId), agentPingPath(actorVault, "inbox", requestId)];
   let contract: AgentPingContract | undefined;
@@ -378,7 +468,7 @@ export async function getAgentPingStatus(requestId: string, actorAgent = DEFAULT
       lastError = error;
     }
   }
-  if (!contract) throw lastError instanceof Error ? lastError : new Error("Request not found.");
+  if (!contract) throw new Error("Request not found.");
   if (contract.fromAgent !== actorAgent && contract.toAgent !== actorAgent) {
     throw new Error("Only the requester or recipient can view this request.");
   }

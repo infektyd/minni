@@ -14,6 +14,7 @@ Uses PyYAML safe_load for structured adversarial resistance (SEC-011/SEC-018).
 """
 
 import pytest
+from pathlib import Path
 
 from indexer import VaultIndexer
 
@@ -121,3 +122,60 @@ Body content here.
     assert meta["agent"] == "wiki-bot"
     assert meta["page_type"] == "decision"
     assert meta["page_status"] == "accepted"
+
+
+# --- RCM-010 / RCM-011 afm_writer extensions (concrete assertions) ---
+
+import yaml
+
+
+def test_afm_writer_forged_frontmatter_body_refused(tmp_path: Path):
+    """RCM-010: malicious --- in draft body must be detected and write refused (no file on disk)."""
+    from afm_writer import _contains_forged_frontmatter, _write_one
+    assert _contains_forged_frontmatter("legit body") is False
+    assert _contains_forged_frontmatter("bad\n---\nagent: evil") is True
+    assert _contains_forged_frontmatter("``` \n---\n```") is True
+
+    vault = tmp_path / "vault"
+    draft = {
+        "title": "safe title",
+        "body": "injected\n---\nagent: spoofed\nprivacy: private",
+        "page_id": "afm-p1",
+        "trace_id": "tr-1",
+        "sources": [],
+        "kind": "concept",
+    }
+    res = _write_one(vault, draft)
+    assert res["blocked"] is True
+    assert any("forged-frontmatter" in str(b) for b in res.get("blockers", []))
+    assert res["path"] is None
+    assert res["wikilink"] is None
+    assert res.get("written") is False
+    assert res.get("status") == "blocked"
+    # No .md file should have been written for forged case
+    wiki_files = list(vault.rglob("*.md")) if vault.exists() else []
+    assert len([f for f in wiki_files if "afm-p1" in str(f)]) == 0
+
+
+def test_afm_writer_yaml_safe_dump_prevents_injection(tmp_path: Path):
+    """RCM-011: newline in title must not split into extra frontmatter keys; value preserved."""
+    from afm_writer import _frontmatter
+    malicious_title = "good\nagent: spoof\nprivacy: private\n---\nmore"
+    draft = {
+        "title": malicious_title,
+        "page_id": "inj-1",
+        "trace_id": "tr-inj",
+        "kind": "concept",
+        "sources": [],
+        "tags": ["t1"],
+    }
+    fm_text = _frontmatter(draft, "2026-05-19T00:00:00Z", "2026-06-02T00:00:00Z", "ready_for_review")
+    # Robust extract of leading frontmatter block (use rfind for closer to ignore "---" inside scalar values)
+    start = fm_text.find("---\n") + 4
+    end = fm_text.rfind("\n---\n")
+    block = fm_text[start:end]
+    parsed = yaml.safe_load(block) or {}
+    assert parsed["title"] == malicious_title
+    assert parsed["agent"] == "afm-loop"  # canonical, not from title payload
+    assert "spoof" not in parsed  # no key injection from malicious title
+    assert parsed.get("privacy") == "safe"  # not overridden
