@@ -452,6 +452,10 @@ export async function decideAgentPingRequest(input: DecideAgentPingInput, actorA
 
 export async function getAgentPingStatus(requestId: string, actorAgent = DEFAULT_AGENT_ID, now = new Date()): Promise<AgentPingWriteResult> {
   await checkAndReapLease(requestId, now);
+  // Materialize the actor's inbox copy from any live lease addressed to them
+  // before resolving status (RCM: recipient must see "pending" without first
+  // having to call listAgentPingInbox).
+  await reconcileAndMaterializeLeases(actorAgent, now);
   const actorVault = resolveAgentVaultPath(actorAgent);
   const candidates = [agentPingPath(actorVault, "outbox", requestId), agentPingPath(actorVault, "inbox", requestId)];
   let contract: AgentPingContract | undefined;

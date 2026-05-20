@@ -174,6 +174,33 @@ test("RCM-004: ping materializes on recipient poll (listAgentPingInbox)", async 
   assert.ok(content.includes("Polled request"));
 });
 
+test("RCM-004: recipient getAgentPingStatus sees pending request without polling first", async () => {
+  // Regression for Codex P2 on PR #23: getAgentPingStatus must materialize
+  // from the live lease so the recipient can query status before any inbox
+  // poll has happened.
+  const created = await createAgentPingRequest(
+    {
+      toAgent: "claude-code",
+      question: "Status-before-poll request",
+    },
+    "codex"
+  );
+
+  // Recipient inbox copy must NOT exist yet (precondition).
+  const inboxFile = path.join(claudeVault, "inbox", "agent-pings", `${created.contract.requestId}.json`);
+  await assert.rejects(readFile(inboxFile, "utf8"), /ENOENT/);
+
+  // Recipient calls status directly, with no prior listAgentPingInbox call.
+  const status = await getAgentPingStatus(created.contract.requestId, "claude-code");
+  assert.equal(status.contract.requestId, created.contract.requestId);
+  assert.equal(status.contract.status, "pending");
+  assert.equal(status.contract.toAgent, "claude-code");
+
+  // Side-effect: status call materialized the recipient inbox copy.
+  const content = await readFile(inboxFile, "utf8");
+  assert.ok(content.includes("Status-before-poll request"));
+});
+
 test("RCM-004: ping materializes on recipient decide", async () => {
   const created = await createAgentPingRequest(
     {
