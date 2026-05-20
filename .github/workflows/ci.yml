@@ -41,6 +41,7 @@ jobs:
       - name: Public boundary guard
         run: |
           bash scripts/check-public-boundary.sh
+          bash scripts/check-migrations.sh
 
       - name: Engine tests
         run: |

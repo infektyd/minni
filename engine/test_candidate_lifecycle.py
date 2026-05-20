@@ -27,14 +27,22 @@ def _fresh_db(tmp_path):
     return db_path
 
 
-def test_migrations_007_008_present_and_replay(tmp_path):
-    """Migration replay coverage for 007/008 (tables + indexes exist)."""
+def test_migrations_007_009_present_and_replay(tmp_path):
+    """Migration replay coverage for 007-009 (tables + indexes exist)."""
     db_path = _fresh_db(tmp_path)
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     tables = {r["name"] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     assert "candidate_packets" in tables
+    assert "handoff_leases" in tables
+    assert "learning_reads" in tables
+    assert "contradiction_events" in tables
     assert "contradiction_log" in tables
+    applied = {
+        r["version"]
+        for r in conn.execute("SELECT version FROM schema_migrations")
+    }
+    assert {7, 8, 9}.issubset(applied)
     # indexes
     idx = {r["name"] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='index'")}
     assert any("candidate" in i.lower() for i in idx)
