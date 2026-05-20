@@ -1,0 +1,267 @@
+/Users/hansaxelsson/Library/Python/3.9/lib/python/site-packages/urllib3/__init__.py:35: NotOpenSSLWarning: urllib3 v2 only supports OpenSSL 1.1.1+, currently the 'ssl' module is compiled with 'LibreSSL 2.8.3'. See: https://github.com/urllib3/urllib3/issues/3020
+  warnings.warn(
+               
+               
+┌─────────────┐
+│ Scan Status │
+└─────────────┘
+  Scanning 111 files tracked by git with 1059 Code rules:
+                                                                                                                        
+  Language      Rules   Files          Origin      Rules                                                                
+ ─────────────────────────────        ───────────────────                                                               
+  <multilang>      47     111          Community    1059                                                                
+  python          243      91                                                                                           
+  bash              4       2                                                                                           
+  yaml             31       1                                                                                           
+  swift             2       1                                                                                           
+                                                                                                                        
+                    
+                    
+┌──────────────────┐
+│ 21 Code Findings │
+└──────────────────┘
+                                             
+    engine/afm_passes/procedure_extraction.py
+    ❯❱ python.lang.security.insecure-hash-algorithms.insecure-hash-algorithm-sha1
+          Detected SHA1 hash algorithm which is considered insecure. SHA1 is not collision resistant and is
+          therefore not suitable as a cryptographic signature. Use SHA256 or SHA3 instead.                 
+          Details: https://sg.run/ydYx                                                                     
+                                                                                                           
+           ▶▶┆ Autofix ▶ hashlib.sha256("|".join(["procedure", title, trace_id, *sources]).encode("utf-8"))
+           23┆ digest = hashlib.sha1("|".join(["procedure", title, trace_id,
+               *sources]).encode("utf-8")).hexdigest()[:10]                 
+                                
+    engine/afm_passes/pruning.py
+    ❯❱ python.lang.security.insecure-hash-algorithms.insecure-hash-algorithm-sha1
+          Detected SHA1 hash algorithm which is considered insecure. SHA1 is not collision resistant and is
+          therefore not suitable as a cryptographic signature. Use SHA256 or SHA3 instead.                 
+          Details: https://sg.run/ydYx                                                                     
+                                                                                                           
+           ▶▶┆ Autofix ▶ hashlib.sha256("|".join(["pruning", kind, path, trace_id]).encode("utf-8"))
+           30┆ digest = hashlib.sha1("|".join(["pruning", kind, path,
+               trace_id]).encode("utf-8")).hexdigest()[:10]          
+                                       
+    engine/afm_passes/reorganization.py
+    ❯❱ python.lang.security.insecure-hash-algorithms.insecure-hash-algorithm-sha1
+          Detected SHA1 hash algorithm which is considered insecure. SHA1 is not collision resistant and is
+          therefore not suitable as a cryptographic signature. Use SHA256 or SHA3 instead.                 
+          Details: https://sg.run/ydYx                                                                     
+                                                                                                           
+           ▶▶┆ Autofix ▶ hashlib.sha256("|".join(["reorg", kind, title, trace_id, *sources]).encode("utf-8"))
+           28┆ digest = hashlib.sha1("|".join(["reorg", kind, title, trace_id,
+               *sources]).encode("utf-8")).hexdigest()[:10]                   
+                                             
+    engine/afm_passes/session_distillation.py
+    ❯❱ python.lang.security.insecure-hash-algorithms.insecure-hash-algorithm-sha1
+          Detected SHA1 hash algorithm which is considered insecure. SHA1 is not collision resistant and is
+          therefore not suitable as a cryptographic signature. Use SHA256 or SHA3 instead.                 
+          Details: https://sg.run/ydYx                                                                     
+                                                                                                           
+           ▶▶┆ Autofix ▶ hashlib.sha256("|".join([kind, title, trace_id, *sources]).encode("utf-8"))
+           68┆ digest = hashlib.sha1("|".join([kind, title, trace_id,
+               *sources]).encode("utf-8")).hexdigest()[:10]          
+                                  
+    engine/afm_passes/synthesis.py
+    ❯❱ python.lang.security.insecure-hash-algorithms.insecure-hash-algorithm-sha1
+          Detected SHA1 hash algorithm which is considered insecure. SHA1 is not collision resistant and is
+          therefore not suitable as a cryptographic signature. Use SHA256 or SHA3 instead.                 
+          Details: https://sg.run/ydYx                                                                     
+                                                                                                           
+           ▶▶┆ Autofix ▶ hashlib.sha256("|".join(["synthesis", title, trace_id, *sources]).encode("utf-8"))
+           34┆ digest = hashlib.sha1("|".join(["synthesis", title, trace_id,
+               *sources]).encode("utf-8")).hexdigest()[:10]                 
+                          
+    engine/afm_provider.py
+    ❯❱ python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected
+          Detected a dynamic value being used with urllib. urllib supports 'file://' schemes, so a dynamic    
+          value controlled by a malicious actor may allow them to read arbitrary files. Audit uses of urllib  
+          calls to ensure user data cannot control the URLs, or consider using the 'requests' library instead.
+          Details: https://sg.run/dKZZ                                                                        
+                                                                                                              
+          211┆ with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 - local-only AFM
+               bridge                                                                                   
+                       
+    engine/agent_api.py
+   ❯❯❱ python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query
+          Avoiding SQL string concatenation: untrusted input concatenated with raw SQL query can result in SQL
+          Injection. In order to execute raw query safely, prepared statement should be used. SQLAlchemy      
+          provides TextualSQL to easily used prepared statement with named parameters. For complex SQL        
+          composition, use SQL Expression Language or Schema Definition Language. In most cases, SQLAlchemy   
+          ORM will be a better option.                                                                        
+          Details: https://sg.run/2b1L                                                                        
+                                                                                                              
+          347┆ c.execute(f"""
+          348┆     SELECT source_doc_id, target_doc_id, link_type, weight
+          349┆     FROM memory_links
+          350┆     WHERE source_doc_id IN ({placeholders})
+          351┆        OR target_doc_id IN ({placeholders})
+          352┆ """, node_ids + node_ids)
+                     
+    engine/indexer.py
+   ❯❯❱ python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query
+          Avoiding SQL string concatenation: untrusted input concatenated with raw SQL query can result in SQL
+          Injection. In order to execute raw query safely, prepared statement should be used. SQLAlchemy      
+          provides TextualSQL to easily used prepared statement with named parameters. For complex SQL        
+          composition, use SQL Expression Language or Schema Definition Language. In most cases, SQLAlchemy   
+          ORM will be a better option.                                                                        
+          Details: https://sg.run/2b1L                                                                        
+                                                                                                              
+          268┆ c.execute(
+          269┆     f"SELECT chunk_id FROM chunk_embeddings WHERE doc_id IN ({placeholders})",
+          270┆     doc_ids,
+          271┆ )
+                        
+    engine/migrations.py
+    ❯❱ python.lang.security.audit.formatted-sql-query.formatted-sql-query
+          Detected possible formatted SQL query. Use parameterized queries instead.
+          Details: https://sg.run/EkWw                                             
+                                                                                   
+           90┆ return column in {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+   
+   ❯❯❱ python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query
+          Avoiding SQL string concatenation: untrusted input concatenated with raw SQL query can result in SQL
+          Injection. In order to execute raw query safely, prepared statement should be used. SQLAlchemy      
+          provides TextualSQL to easily used prepared statement with named parameters. For complex SQL        
+          composition, use SQL Expression Language or Schema Definition Language. In most cases, SQLAlchemy   
+          ORM will be a better option.                                                                        
+          Details: https://sg.run/2b1L                                                                        
+                                                                                                              
+           90┆ return column in {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+   
+    ❯❱ python.lang.security.audit.formatted-sql-query.formatted-sql-query
+          Detected possible formatted SQL query. Use parameterized queries instead.
+          Details: https://sg.run/EkWw                                             
+                                                                                   
+          173┆ conn.execute(f"PRAGMA user_version = {target_version}")
+   
+   ❯❯❱ python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query
+          Avoiding SQL string concatenation: untrusted input concatenated with raw SQL query can result in SQL
+          Injection. In order to execute raw query safely, prepared statement should be used. SQLAlchemy      
+          provides TextualSQL to easily used prepared statement with named parameters. For complex SQL        
+          composition, use SQL Expression Language or Schema Definition Language. In most cases, SQLAlchemy   
+          ORM will be a better option.                                                                        
+          Details: https://sg.run/2b1L                                                                        
+                                                                                                              
+          173┆ conn.execute(f"PRAGMA user_version = {target_version}")
+                       
+    engine/principal.py
+    ❯❱ python.lang.security.audit.insecure-file-permissions.insecure-file-permissions
+          These permissions `0o700` are widely permissive and grant access to more people than may be       
+          necessary. A good default is `0o644` which gives read and write access to yourself and read access
+          to everyone else.                                                                                 
+          Details: https://sg.run/AXY4                                                                      
+                                                                                                            
+          131┆ os.chmod(d, 0o700)
+                       
+    engine/retrieval.py
+   ❯❯❱ python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query
+          Avoiding SQL string concatenation: untrusted input concatenated with raw SQL query can result in SQL
+          Injection. In order to execute raw query safely, prepared statement should be used. SQLAlchemy      
+          provides TextualSQL to easily used prepared statement with named parameters. For complex SQL        
+          composition, use SQL Expression Language or Schema Definition Language. In most cases, SQLAlchemy   
+          ORM will be a better option.                                                                        
+          Details: https://sg.run/2b1L                                                                        
+                                                                                                              
+          287┆ c.execute(f"""
+          288┆     SELECT ce.chunk_id, ce.doc_id, ce.chunk_text, ce.heading_context,
+          289┆            d.path, d.agent, d.sigil, d.decay_score,
+          290┆            d.page_status, d.privacy_level, d.page_type,
+          291┆            d.evidence_refs, d.indexed_at,
+          292┆            COALESCE(ce.layer, d.layer, 'knowledge') AS layer
+          293┆     FROM chunk_embeddings ce
+          294┆     JOIN documents d ON d.doc_id = ce.doc_id
+          295┆     WHERE ce.chunk_id IN ({placeholders})
+          296┆ """, chunk_ids)
+            ⋮┆----------------------------------------
+          869┆ c.execute(f"""
+          870┆     SELECT ce.chunk_id, ce.doc_id, ce.chunk_text, ce.heading_context,
+          871┆            d.path, d.agent, d.sigil, d.decay_score,
+          872┆            d.page_status, d.privacy_level, d.page_type,
+          873┆            d.evidence_refs, d.indexed_at,
+          874┆            COALESCE(ce.layer, d.layer, 'knowledge') AS layer
+          875┆     FROM chunk_embeddings ce
+          876┆     JOIN documents d ON d.doc_id = ce.doc_id
+          877┆     WHERE ce.chunk_id IN ({placeholders})
+          878┆ """, chunk_ids)
+            ⋮┆----------------------------------------
+          932┆ c.execute(f"""
+          933┆     SELECT ce.chunk_id, ce.doc_id, ce.chunk_text, ce.heading_context,
+          934┆            d.path, d.agent, d.sigil, d.decay_score,
+          935┆            d.page_status, d.privacy_level, d.page_type,
+          936┆            d.evidence_refs, d.indexed_at,
+          937┆            COALESCE(ce.layer, d.layer, 'knowledge') AS layer
+          938┆     FROM chunk_embeddings ce
+          939┆     JOIN documents d ON d.doc_id = ce.doc_id
+          940┆     WHERE ce.chunk_id IN ({placeholders})
+          941┆ """, chunk_ids)
+            ⋮┆----------------------------------------
+          1113┆ c.execute(f"""
+          1114┆     SELECT ce.chunk_id, ce.doc_id, ce.chunk_text, ce.heading_context,
+          1115┆            d.path, d.agent, d.sigil, d.decay_score,
+          1116┆            d.page_status, d.privacy_level, d.page_type,
+          1117┆            d.evidence_refs, d.indexed_at,
+          1118┆            COALESCE(ce.layer, d.layer, 'knowledge') AS layer,
+          1119┆            COALESCE(d.indexed_at, d.last_modified, ce.computed_at, 0) AS created_at
+          1120┆     FROM vault_fts f
+          1121┆     JOIN documents d ON d.doc_id = f.doc_id
+          1122┆     JOIN chunk_embeddings ce ON ce.doc_id = d.doc_id
+             [hid 4 additional lines, adjust with --max-lines-per-finding] 
+                   
+    engine/sovrd.py
+    ❯❱ python.lang.security.audit.insecure-file-permissions.insecure-file-permissions
+          These permissions `0o700` are widely permissive and grant access to more people than may be       
+          necessary. A good default is `0o644` which gives read and write access to yourself and read access
+          to everyone else.                                                                                 
+          Details: https://sg.run/AXY4                                                                      
+                                                                                                            
+          2646┆ os.chmod(str(run_dir), 0o700)
+                               
+    engine/test_socket_perms.py
+    ❯❱ python.lang.security.audit.insecure-file-permissions.insecure-file-permissions
+          These permissions `0o700` are widely permissive and grant access to more people than may be       
+          necessary. A good default is `0o644` which gives read and write access to yourself and read access
+          to everyone else.                                                                                 
+          Details: https://sg.run/AXY4                                                                      
+                                                                                                            
+           34┆ os.chmod(run_dir, 0o700)
+                    
+    engine/tokens.py
+    ❯❱ python.lang.security.audit.logging.logger-credential-leak.python-logger-credential-disclosure
+          Detected a python logger call with a potential hardcoded secret "Failed to load tiktoken encoder:
+          %s" being logged. This may lead to secret credentials being exposed. Make sure that the logger is
+          not logging  sensitive information.                                                              
+          Details: https://sg.run/ydNx                                                                     
+                                                                                                           
+           52┆ logger.warning("Failed to load tiktoken encoder: %s", e)
+                       
+    engine/writeback.py
+   ❯❯❱ python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query
+          Avoiding SQL string concatenation: untrusted input concatenated with raw SQL query can result in SQL
+          Injection. In order to execute raw query safely, prepared statement should be used. SQLAlchemy      
+          provides TextualSQL to easily used prepared statement with named parameters. For complex SQL        
+          composition, use SQL Expression Language or Schema Definition Language. In most cases, SQLAlchemy   
+          ORM will be a better option.                                                                        
+          Details: https://sg.run/2b1L                                                                        
+                                                                                                              
+          221┆ c.execute(
+          222┆     "SELECT doc_id FROM documents WHERE doc_id IN ({})".format(
+          223┆         ",".join("?" for _ in valid_ids)
+          224┆     ),
+          225┆     valid_ids,
+          226┆ )
+                
+                
+┌──────────────┐
+│ Scan Summary │
+└──────────────┘
+✅ Scan completed successfully.
+ • Findings: 21 (21 blocking)
+ • Rules run: 325
+ • Targets scanned: 111
+ • Parsed lines: ~100.0%
+ • Scan was limited to files tracked by git
+ • For a detailed list of skipped files and lines, run semgrep with the --verbose flag
+Ran 325 rules on 111 files: 21 findings.
+
+A new version of Semgrep is available. See https://semgrep.dev/docs/upgrading
+

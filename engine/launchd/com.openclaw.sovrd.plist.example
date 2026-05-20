@@ -58,10 +58,10 @@
     <integer>63</integer>
 
     <key>StandardOutPath</key>
-    <string>~/Library/Logs/sovereign-memory/sovrd.out.log</string>
+    <string>/Users/REPLACE_WITH_YOUR_USERNAME/Library/Logs/sovereign-memory/sovrd.out.log</string>
 
     <key>StandardErrorPath</key>
-    <string>~/Library/Logs/sovereign-memory/sovrd.err.log</string>
+    <string>/Users/REPLACE_WITH_YOUR_USERNAME/Library/Logs/sovereign-memory/sovrd.err.log</string>
 
     <key>ProcessType</key>
     <string>Background</string>

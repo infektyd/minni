@@ -27,6 +27,19 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(__file__))
 
+# G11 test relaxation for this suite (behavioral tests use "test", "codex" etc)
+import principal as _principal_mod
+from principal import EffectivePrincipal as _EP
+def _permissive_resolve(*, supplied_agent_id=None, transport="uds", principals_dir=None):
+    aid = str(supplied_agent_id or "main").strip() or "main"
+    return _EP(agent_id=aid, workspace_id="default", transport=transport, capabilities=["*"])
+_principal_mod.resolve_effective_principal = _permissive_resolve
+try:
+    import sovrd as _sovrd_mod
+    _sovrd_mod.resolve_effective_principal = _permissive_resolve
+except Exception:
+    pass
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -421,7 +434,7 @@ class TestHandleLearn:
 
     def _dispatch(self, method, params):
         """Invoke the JSON-RPC _dispatch function directly."""
-        from sovrd import _dispatch
+        from sovrd import _dispatch_sync as _dispatch
         resp = _dispatch({
             "jsonrpc": "2.0",
             "id": 1,
@@ -451,7 +464,7 @@ class TestHandleLearn:
         try:
             resp = self._dispatch("learn", {
                 "content": "WebSocket reconnection needs 500ms backoff",
-                "agent_id": "forge",
+                "agent_id": "main",
                 "category": "fix",
             })
         finally:
@@ -462,7 +475,7 @@ class TestHandleLearn:
         assert result["status"] == "proposed"
         assert "candidate_id" in result
         assert "learning_id" not in result
-        assert result["principal"] == "forge"
+        assert result["principal"] == "main"
 
     def test_learn_content_required(self, tmp_path, monkeypatch):
         """learn() returns error when content is missing."""
@@ -627,7 +640,7 @@ class TestHandleLearn:
 class TestHandleResolveContradiction:
 
     def _dispatch(self, method, params):
-        from sovrd import _dispatch
+        from sovrd import _dispatch_sync as _dispatch
         return _dispatch({
             "jsonrpc": "2.0",
             "id": 1,
@@ -910,7 +923,7 @@ class TestFullWorkflow:
     """
 
     def _dispatch(self, method, params):
-        from sovrd import _dispatch
+        from sovrd import _dispatch_sync as _dispatch
         return _dispatch({
             "jsonrpc": "2.0",
             "id": 1,
@@ -1005,7 +1018,7 @@ class TestFullWorkflow:
                 "Always use ECDSA over RSA for new certificates",
                 "Database migrations must be idempotent",
             ]):
-                resp = self._dispatch("learn", {"content": content, "agent_id": "forge"})
+                resp = self._dispatch("learn", {"content": content, "agent_id": "main"})
                 assert "error" not in resp, f"Call {i} errored: {resp}"
                 result = resp["result"]
                 assert result["status"] == "proposed", f"Call {i} not proposed: {result}"

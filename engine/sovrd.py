@@ -799,7 +799,16 @@ def _handle_ack_handoff(params: dict, request_id: Any) -> dict:
 
 
 def _handle_list_pending_handoffs(params: dict, request_id: Any) -> dict:
-    agent_id = str(params.get("agent_id", "")).strip()
+    # G11 / RCM-003/009: EffectivePrincipal stamp + mismatch guard (closes last model-facing agent_id surfaces)
+    # Model-supplied agent_id is NEVER trusted; use stamped principal.agent_id for leases/queries.
+    supplied = params.get("agent_id")
+    try:
+        principal = resolve_effective_principal(
+            supplied_agent_id=supplied, transport="uds"
+        )
+    except IdentityMismatchError as exc:
+        return make_mismatch_error(exc.supplied, exc.stamped, request_id)
+    agent_id = principal.agent_id
     if not agent_id:
         return _make_error(-32602, "agent_id is required", request_id)
     sqlite_handoffs = _pending_handoff_leases(agent_id)
@@ -829,7 +838,7 @@ def _handle_list_pending_handoffs(params: dict, request_id: Any) -> dict:
     return _make_response({"agent_id": agent_id, "handoffs": handoffs}, request_id)
 
 
-def _handle_await_handoff(params: dict, request_id: Any) -> dict:
+async def _handle_await_handoff(params: dict, request_id: Any) -> dict:
     lease_id = str(params.get("lease_id", "")).strip()
     if not lease_id:
         return _make_error(-32602, "lease_id is required", request_id)
@@ -851,7 +860,7 @@ def _handle_await_handoff(params: dict, request_id: Any) -> dict:
                 }, request_id)
         if time.time() >= deadline:
             return _make_response({"lease_id": lease_id, "status": "timeout"}, request_id)
-        time.sleep(0.05)
+        await asyncio.sleep(0.05)
 
 
 def _record_latency(method: str, duration_seconds: float) -> None:
@@ -1090,6 +1099,15 @@ def _handle_trace(params: dict, request_id: Any) -> dict:
     global _request_count
     _request_count += 1
 
+    # RCM-009: principal gate (redaction applied unconditionally via _redact_value for paths/secrets;
+    # traces are ephemeral/observability and many lack stamped agent_id, so no additional owner-match filter here).
+    try:
+        principal = resolve_effective_principal(
+            supplied_agent_id=params.get("agent_id"), transport="uds"
+        )
+    except IdentityMismatchError as exc:
+        return make_mismatch_error(exc.supplied, exc.stamped, request_id)
+
     trace_id = params.get("trace_id")
     if not trace_id:
         return _make_error(-32602, "trace_id is required", request_id)
@@ -1103,21 +1121,26 @@ def _handle_trace(params: dict, request_id: Any) -> dict:
                 "status": "not_found",
                 "ephemeral": True,
             }, request_id)
+        # RCM-009: redact paths/secrets from trace payload before return (principal resolved for gate;
+        # _redact_value used for consistency with handoff; status uses explicit literals for its 3 known fields).
+        redacted_trace, _ = _redact_value(trace)
         return _make_response({
             "trace_id": trace_id,
-            "trace": trace,
+            "trace": redacted_trace,
             "status": "ok",
             "ephemeral": True,
         }, request_id)
     except Exception as exc:
         logger.warning("trace lookup failed: %s", exc)
+        degraded = {
+            "trace_id": trace_id,
+            "degraded": True,
+            "reason": str(exc),
+        }
+        redacted_degraded, _ = _redact_value(degraded)
         return _make_response({
             "trace_id": trace_id,
-            "trace": {
-                "trace_id": trace_id,
-                "degraded": True,
-                "reason": str(exc),
-            },
+            "trace": redacted_degraded,
             "status": "degraded",
             "ephemeral": True,
         }, request_id)
@@ -1227,13 +1250,23 @@ def _handle_sm_export_pack(params: dict, request_id: Any) -> dict:
     global _request_count
     _request_count += 1
 
+    # G11 / RCM-003/009: EffectivePrincipal stamp + mismatch guard (closes last model-facing agent_id surface for export)
+    # agent_id in pack and retrieve visibility now always from stamped principal; model cannot spoof attribution/exfil view.
+    supplied = params.get("agent_id")
+    try:
+        principal = resolve_effective_principal(
+            supplied_agent_id=supplied, transport="uds"
+        )
+    except IdentityMismatchError as exc:
+        return make_mismatch_error(exc.supplied, exc.stamped, request_id)
+    agent_id = principal.agent_id
+    workspace_id = params.get("workspace_id")
+
     query = str(params.get("query", "")).strip()
     if not query:
         return _make_error(-32602, "query is required", request_id)
     budget_tokens = int(params.get("budget_tokens", 4096))
     cache_key = str(params.get("cache_key", "default"))
-    agent_id = params.get("agent_id", "main")
-    workspace_id = params.get("workspace_id")
     limit = min(int(params.get("limit", 12)), 50)
 
     try:
@@ -1244,6 +1277,11 @@ def _handle_sm_export_pack(params: dict, request_id: Any) -> dict:
             limit=limit,
             depth="snippet",
             update_access=False,
+            # G19/G20/G22: thread stamped principal (from resolve_effective_principal) + workspace
+            # so can_read_document filter + evidence envelope (instruction_like/visibility/reasoning)
+            # are applied uniformly, matching _handle_search (and read/expand) exactly.
+            principal=principal,
+            workspace=principal.workspace_id if principal is not None else (workspace_id or "default"),
         )
         prefix_anchors = []
         for result in sorted(
@@ -1783,7 +1821,16 @@ def _handle_resolve_contradiction(params: dict, request_id: Any) -> dict:
 
 def _handle_subscribe_contradictions(params: dict, request_id: Any) -> dict:
     """Return contradiction events for learnings recently read by an agent."""
-    agent_id = str(params.get("agent_id", "")).strip()
+    # G11 / RCM-003/009: EffectivePrincipal stamp + mismatch guard (closes last model-facing agent_id surfaces)
+    # Model-supplied agent_id is NEVER trusted; use stamped principal.agent_id for queries.
+    supplied = params.get("agent_id")
+    try:
+        principal = resolve_effective_principal(
+            supplied_agent_id=supplied, transport="uds"
+        )
+    except IdentityMismatchError as exc:
+        return make_mismatch_error(exc.supplied, exc.stamped, request_id)
+    agent_id = principal.agent_id
     if not agent_id:
         return _make_error(-32602, "agent_id is required", request_id)
     since_ts = float(params.get("since_ts", 0) or 0)
@@ -1868,6 +1915,15 @@ def _handle_status(params: dict, request_id: Any) -> dict:
     global _request_count
     _request_count += 1
 
+    # RCM-009: principal gate + path redaction (principal bound for consistency with other handlers;
+    # full object available for future scoping if needed; redaction remains explicit for the 3 known fields).
+    try:
+        principal = resolve_effective_principal(
+            supplied_agent_id=params.get("agent_id"), transport="uds"
+        )
+    except IdentityMismatchError as exc:
+        return make_mismatch_error(exc.supplied, exc.stamped, request_id)
+
     db_ok = False
     db_stats = {}
     try:
@@ -1904,15 +1960,15 @@ def _handle_status(params: dict, request_id: Any) -> dict:
             "version": VERSION,
             "uptime_seconds": round(uptime, 1),
             "requests_served": _request_count,
-            "socket_path": str(_unix_socket_path),
+            "socket_path": "[redacted]",
             "dual_write": _dual_write_enabled,
             "latencies": _latency_snapshot(),
         },
         "engine": {
             "db_ok": db_ok,
-            "db_path": DEFAULT_CONFIG.db_path,
+            "db_path": "[redacted]",
             "faiss_ok": faiss_ok,
-            "faiss_path": str(faiss_path),
+            "faiss_path": "[redacted]",
             "stats": db_stats,
         },
         "afm": afm_status,
@@ -2494,7 +2550,7 @@ def _parse_request(data: bytes) -> Optional[dict]:
         return None
 
 
-def _dispatch(request: dict) -> dict:
+async def _dispatch(request: dict) -> dict:
     """Route a JSON-RPC request to the correct handler."""
     method_name = request.get("method", "")
     request_id = request.get("id")
@@ -2504,7 +2560,24 @@ def _dispatch(request: dict) -> dict:
     if handler is None:
         return _make_error(-32601, f"Method not found: {method_name}",
                            request_id)
-    return handler(params, request_id)
+    if method_name in ("search", "learn"):
+        # RCM-006: offload CPU-bound retrieval (encode + cross-encoder predict + possible FAISS) to worker thread.
+        # Keeps event loop responsive for concurrent clients (e.g. one client awaits handoff while another recalls).
+        result = await asyncio.to_thread(handler, params, request_id)
+    else:
+        result = handler(params, request_id)
+        if asyncio.iscoroutine(result):
+            result = await result
+    return result
+
+
+# Sync facade for legacy direct callers in the test suite (post RCM-006/007 async _dispatch refactor).
+# ~30 call sites in test_*.py used synchronous sovrd._dispatch({...})["result"]; they now use this.
+# Real daemon paths (_handle_client, HTTP entry) use await _dispatch or the full async loop.
+# This keeps all tests green without requiring pytest-asyncio or rewriting every site to async.
+def _dispatch_sync(request: dict) -> dict:
+    """Thin sync wrapper: runs the (now async) _dispatch via asyncio.run for test compatibility."""
+    return asyncio.run(_dispatch(request))
 
 
 # SEC-015: cap a single JSON-RPC request body at 1 MiB to bound peak memory
@@ -2547,7 +2620,7 @@ async def _handle_client(reader: asyncio.StreamReader,
                 await writer.drain()
                 continue
 
-            response = _dispatch(request)
+            response = await _dispatch(request)
             writer.write(json.dumps(response).encode() + b"\n")
             await writer.drain()
     except asyncio.IncompleteReadError:
@@ -2641,7 +2714,7 @@ async def _serve_http(host: str = "127.0.0.1", port: int = 9900):
             if request is None:
                 resp = json.dumps(_make_error(-32700, "Parse error"))
             else:
-                resp = json.dumps(_dispatch(request))
+                resp = json.dumps(await _dispatch(request))
 
             resp_bytes = resp.encode()
             writer.write(

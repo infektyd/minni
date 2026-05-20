@@ -1,0 +1,32 @@
+# npm audit report
+
+fast-uri  <=3.1.1
+Severity: high
+fast-uri vulnerable to path traversal via percent-encoded dot segments - https://github.com/advisories/GHSA-q3j6-qgpj-74h6
+fast-uri vulnerable to host confusion via percent-encoded authority delimiters - https://github.com/advisories/GHSA-v39h-62p7-jpjc
+fix available via `npm audit fix`
+node_modules/fast-uri
+
+hono  <=4.12.17
+Severity: moderate
+Hono has CSS Declaration Injection via Style Object Values in JSX SSR - https://github.com/advisories/GHSA-qp7p-654g-cw7p
+Hono has improper validation of NumericDate claims (exp, nbf, iat) in JWT verify() - https://github.com/advisories/GHSA-hm8q-7f3q-5f36
+Hono's Cache Middleware ignores Vary: Authorization / Vary: Cookie leading to cross-user cache leakage - https://github.com/advisories/GHSA-p77w-8qqv-26rm
+Hono: bodyLimit() can be bypassed for chunked / unknown-length requests - https://github.com/advisories/GHSA-9vqf-7f2p-gf9v
+hono/jsx has Unvalidated JSX Tag Names that May Allow HTML Injection - https://github.com/advisories/GHSA-69xw-7hcm-h432
+fix available via `npm audit fix`
+node_modules/hono
+
+ip-address  <=10.1.0
+Severity: moderate
+ip-address has XSS in Address6 HTML-emitting methods - https://github.com/advisories/GHSA-v2v4-37r5-5v8g
+fix available via `npm audit fix`
+node_modules/ip-address
+  express-rate-limit  8.0.1 - 8.5.0
+  Depends on vulnerable versions of ip-address
+  node_modules/express-rate-limit
+
+4 vulnerabilities (3 moderate, 1 high)
+
+To address all issues, run:
+  npm audit fix

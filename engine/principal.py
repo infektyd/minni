@@ -71,6 +71,13 @@ PRINCIPALS_DIR: Path = Path(CANONICAL_SOVEREIGN_HOME) / "principals"
 CANONICAL_PRINCIPAL_NAMES: tuple[str, ...] = ("local", "default", "operator", "main")
 
 
+def _has_any_principal_files(d: Path) -> bool:
+    """Detect strict mode: whether any CANONICAL principal file exists under the dir.
+    Extracted for testability + hygiene (addresses re-review nit on repeated any() walk).
+    """
+    return any((d / f"{n}.json").is_file() for n in CANONICAL_PRINCIPAL_NAMES)
+
+
 @dataclass(frozen=True)
 class EffectivePrincipal:
     """Server-stamped identity. Immutable. Single source of truth for who is calling."""
@@ -235,7 +242,8 @@ def from_local_transport(
     Preference order:
       1. explicit principals/<name>.json for any name in CANONICAL_PRINCIPAL_NAMES
          (local, default, operator, main — "main" last so explicit operator files win)
-      2. synthesize a safe wide-open local default (agent_id="main")
+      2. synthesize a safe wide-open local default (agent_id="main") — used for fresh installs
+         (RCM-003: only "main" accepted when no principal files; mismatches rejected upstream)
     """
     d = principals_dir or PRINCIPALS_DIR
     _ensure_principals_dir(d)
@@ -245,8 +253,8 @@ def from_local_transport(
         )
         if p is not None:
             return p
-    # No operator config present — synthesize trusted local default.
-    # This keeps the tree green until an operator drops strict principal files.
+    # No operator config present — synthesize trusted local default "main".
+    # RCM-003: resolve_effective_principal now rejects non-"main" supplied in this mode.
     return EffectivePrincipal(
         agent_id="main",
         workspace_id="default",
@@ -264,26 +272,23 @@ def resolve_effective_principal(
 ) -> EffectivePrincipal:
     """Resolve the single authoritative EffectivePrincipal for this request.
 
-    Rules (G11):
-    - If a strict principal config file exists under principals_dir, it is authoritative.
-    - If the caller supplied an agent_id that does not match the stamped one
-      (and is not listed in the principal's legacy_agent_ids / aliases), raise
-      IdentityMismatchError.
-    - If NO principal config files exist yet, synthesize from the supplied value
-      (or "main") so that existing call sites and tests continue to observe the
-      same behavior during the G11 rollout. Once an operator creates
-      principals/*.json the system becomes strict.
+    Rules (G11, post-RCM-003):
+    - If any principals/*.json exist, strict mode: use the canonical stamped one (first in CANONICAL list).
+    - If NO principal config files exist (fresh install), synthesize ONLY the fixed local "main"
+      and reject any wire-supplied agent_id that differs (no more wildcard synthesis).
+    - If the caller supplied an agent_id that does not match the stamped (or legacy alias in strict),
+      raise IdentityMismatchError.
+    - Aliases only honored in strict mode from existing principal files.
 
     The returned principal (or the raised error) is the ONLY identity that
-    downstream code (retrieval, writeback, episodic, audit, vault derivation)
-    is allowed to use.
+    downstream code is allowed to use.
     """
     d = principals_dir or PRINCIPALS_DIR
     _ensure_principals_dir(d)
 
     # Decide whether we are in "strict" mode (any principal file present)
     # Uses the single CANONICAL list so "main.json" (or any other) is detected uniformly.
-    strict = any((d / f"{n}.json").is_file() for n in CANONICAL_PRINCIPAL_NAMES)
+    strict = _has_any_principal_files(d)
 
     if transport in ("uds", "stdio", "local", "test"):
         stamped = from_local_transport(transport, principals_dir=d, strict=strict)
@@ -318,19 +323,8 @@ def resolve_effective_principal(
             # Accepted via migration alias from any principal file; return the stamped one.
             return stamped
 
-    # No match, no alias, and we are either strict or the supplied differs from default
-    # In non-strict mode we still accept the supplied value (synthesized) so rollout is safe.
-    if not strict:
-        # synthesize a principal carrying the value the caller used (current behavior)
-        return EffectivePrincipal(
-            agent_id=supplied,
-            workspace_id="default",
-            transport=transport,
-            capabilities=["*"],
-            allowed_vault_roots=[],
-        )
-
-    # Strict mode + mismatch + no alias → hard deny
+    # Mismatch (in strict or in fresh/no-principals mode) → hard deny.
+    # Fresh installs now ONLY accept the fixed "main"; other supplied ids are rejected.
     raise IdentityMismatchError(supplied, stamped.agent_id)
 
 
@@ -362,8 +356,7 @@ def is_operator_principal(p: EffectivePrincipal) -> bool:
     """Return True if principal may perform governance actions (G14-G18).
 
     - resolve_candidate, force=true durable learn, etc.
-    - In non-strict rollout (no principals/*.json) the local synthesized default
-      ("main") is treated as operator (back-compat, safe for dev).
+    - The local "main" (synthesized on fresh installs or from principal file) is operator.
     - In strict mode, explicit capability "resolve_candidate"|"govern" or
       agent_id in the trusted operator set wins.
     - Never trusts caller-supplied strings; the p is already the stamped one.

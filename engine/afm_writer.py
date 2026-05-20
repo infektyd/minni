@@ -10,6 +10,8 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import yaml  # RCM-011: for safe_dump of title/tags to prevent newline key injection
+
 _WORK_QUEUE: "queue.Queue[tuple[dict, threading.Event, dict]]" = queue.Queue()
 _WORKER_STARTED = False
 _WORKER_LOCK = threading.Lock()
@@ -75,36 +77,66 @@ def _contradiction_candidates(draft: dict, writeback: Any = None) -> List[dict]:
         return []
 
 
+# RCM-010: ported from writeback.py _contains_forged_frontmatter (G09 / SEC-018)
+def _contains_forged_frontmatter(content: str) -> bool:
+    """Return True if content has a bare '---' line or a code fence containing one.
+    Prevents the written .md from having its frontmatter "re-forged" by body content.
+    """
+    if not content or "---" not in content:
+        return False
+    for line in content.splitlines():
+        if line.strip() == "---":
+            return True
+    if "```" in content:
+        parts = content.split("```")
+        for i in range(1, len(parts), 2):
+            if "---" in parts[i]:
+                for ln in parts[i].splitlines():
+                    if ln.strip() == "---":
+                        return True
+    return False
+
+
 def _frontmatter(draft: dict, created: str, expires_at: str, gate_status: str) -> str:
-    sources = "\n".join(f"  - {source}" for source in draft.get("sources", []))
-    citations = "\n".join(f"  - {citation}" for citation in draft.get("citations", []))
+    # RCM-011: build via dict + yaml.safe_dump (handles multiline title/tags safely, prevents injection)
     prompt_version = draft.get("prompt_version")
-    tags = ", ".join(str(tag) for tag in draft.get("tags", []) if str(tag).strip())
-    text = (
-        "---\n"
-        f"title: {draft['title']}\n"
-        f"type: {draft.get('kind', 'concept')}\n"
-        "status: draft\n"
-        "agent: afm-loop\n"
-        "privacy: safe\n"
-        f"trace_id: {draft['trace_id']}\n"
-        f"page_id: {draft['page_id']}\n"
-        f"created: {created}\n"
-        f"expires_at: {expires_at}\n"
-        f"gate_status: {gate_status}\n"
-    )
+    tags = [str(tag) for tag in draft.get("tags", []) if str(tag).strip()]
+    fm: dict = {
+        "title": draft["title"],
+        "type": draft.get("kind", "concept"),
+        "status": "draft",
+        "agent": "afm-loop",
+        "privacy": "safe",
+        "trace_id": draft["trace_id"],
+        "page_id": draft["page_id"],
+        "created": created,
+        "expires_at": expires_at,
+        "gate_status": gate_status,
+    }
     if prompt_version:
-        text += f"prompt_version: {prompt_version}\n"
+        fm["prompt_version"] = prompt_version
     if tags:
-        text += f"tags: [{tags}]\n"
-    text += "sources:\n" + f"{sources}\n"
+        fm["tags"] = tags
+    sources = draft.get("sources", [])
+    if sources:
+        fm["sources"] = sources
+    citations = draft.get("citations", [])
     if citations:
-        text += f"citations:\n{citations}\n"
-    return text + "---\n\n"
+        fm["citations"] = citations
+
+    header = yaml.safe_dump(fm, sort_keys=False, default_flow_style=False)
+    return "---\n" + header + "---\n\n"
 
 
 def _write_one(vault: Path, draft: dict, writeback: Any = None) -> dict:
+    """Write one AFM draft (or refuse for forged). Return shape:
+    - normal/quality-blocked: path/wikilink/status present, written implied by file
+    - forged-frontmatter: path=None, wikilink=None, status="blocked", written=False (RCM-010 security)
+    """
     blockers = _quality_blockers(draft)
+    forged = _contains_forged_frontmatter(draft.get("body", ""))
+    if forged:
+        blockers = blockers + ["forged-frontmatter (RCM-010 / SEC-018)"]
     contradictions = _contradiction_candidates(draft, writeback)
     gate_status = "blocked" if blockers or contradictions else "ready_for_review"
     section = draft.get("section") or f"{draft.get('kind', 'concept')}s"
@@ -114,9 +146,12 @@ def _write_one(vault: Path, draft: dict, writeback: Any = None) -> dict:
     created = _utc()
     expires_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 14 * 86400))
     with _page_lock(draft["page_id"]):
+        # Title in markdown heading: minimal hygiene sanitize (newlines/# could mangle ATX; not a YAML key injection
+        # vector — that is fully protected by safe_dump in _frontmatter per RCM-011). Out of RCM-010/011 YAML scope.
+        safe_title = str(draft.get("title", "")).replace("\n", " ").replace("#", "")[:80]
         body = (
             _frontmatter(draft, created, expires_at, gate_status)
-            + f"# {draft['title']}\n\n"
+            + f"# {safe_title}\n\n"
             + f"{draft.get('body', '').strip()}\n\n"
             + "## Sources\n\n"
             + "\n".join(f"- `{source}`" for source in draft.get("sources", []))
@@ -130,7 +165,22 @@ def _write_one(vault: Path, draft: dict, writeback: Any = None) -> dict:
                 body += f"- quality-blocked: {blocker}\n"
             for item in contradictions[:5]:
                 body += f"- contradiction-candidate: `{item}`\n"
-        path.write_text(body, encoding="utf-8")
+        # Only write if not forged (forged bodies are blocked but note is still produced in return)
+        if not forged:
+            path.write_text(body, encoding="utf-8")
+    # RCM-010: forged cases return null path/wikilink + written:false (callers see refusal shape; no fabricated draft loc)
+    if forged:
+        return {
+            "page_id": draft["page_id"],
+            "path": None,
+            "wikilink": None,
+            "status": "blocked",
+            "gate_status": gate_status,
+            "blocked": True,
+            "blockers": blockers,
+            "contradictions": contradictions,
+            "written": False,
+        }
     return {
         "page_id": draft["page_id"],
         "path": str(rel),
@@ -140,6 +190,7 @@ def _write_one(vault: Path, draft: dict, writeback: Any = None) -> dict:
         "blocked": bool(blockers or contradictions),
         "blockers": blockers,
         "contradictions": contradictions,
+        "written": True,
     }
 
 

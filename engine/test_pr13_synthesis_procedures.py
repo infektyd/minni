@@ -155,7 +155,7 @@ def test_daemon_compile_reaches_pr13_passes_and_wet_run_keeps_drafts_pending(tmp
     monkeypatch.setattr(sovrd, "_writeback", None)
     monkeypatch.setattr(sovrd, "SovereignDB", lambda config=None: db_obj)
 
-    synth_resp = sovrd._dispatch(
+    synth_resp = sovrd._dispatch_sync(
         {
             "jsonrpc": "2.0",
             "id": 1,
@@ -163,7 +163,7 @@ def test_daemon_compile_reaches_pr13_passes_and_wet_run_keeps_drafts_pending(tmp
             "params": {"pass_name": "synthesis", "vault_path": str(vault), "dry_run": False},
         }
     )
-    proc_resp = sovrd._dispatch(
+    proc_resp = sovrd._dispatch_sync(
         {
             "jsonrpc": "2.0",
             "id": 2,
@@ -183,7 +183,7 @@ def test_daemon_compile_reaches_pr13_passes_and_wet_run_keeps_drafts_pending(tmp
         assert "agent: afm-loop" in text
         assert "trace_id:" in text
         assert "status: accepted" not in text
-        trace = sovrd._dispatch({"jsonrpc": "2.0", "id": 3, "method": "trace", "params": {"trace_id": result["trace_id"]}})
+        trace = sovrd._dispatch_sync({"jsonrpc": "2.0", "id": 3, "method": "trace", "params": {"trace_id": result["trace_id"]}})
         assert trace["result"]["trace"]["pass_name"] == expected_pass
         assert trace["result"]["trace"]["prompt_version"]
 

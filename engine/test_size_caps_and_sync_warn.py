@@ -70,7 +70,7 @@ def _patch_writeback_no_model(tmp_path: Path, monkeypatch):
 
 
 def _dispatch(method: str, params: dict) -> dict:
-    from sovrd import _dispatch as _d
+    from sovrd import _dispatch_sync as _d
     return _d({
         "jsonrpc": "2.0",
         "id": 1,
