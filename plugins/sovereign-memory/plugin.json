@@ -1,0 +1,6 @@
+{
+  "name": "sovereign-memory",
+  "version": "0.1.0",
+  "description": "Local-first plugin for Sovereign Memory",
+  "license": "Apache-2.0"
+}

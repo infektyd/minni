@@ -1,0 +1,41 @@
+# Auto-detect text files, normalize line endings
+* text=auto eol=lf
+
+# Python source — enforce LF
+*.py text diff=python
+*.pyi text diff=python
+*.pyx text diff=python
+
+# Config / documentation
+*.toml text
+*.yaml text
+*.yml text
+*.json text
+*.md text diff=markdown
+*.txt text
+*.cfg text
+*.ini text
+*.rst text
+
+# Shell scripts — enforce LF
+*.sh text eol=lf
+*.bash text eol=lf
+
+# Windows scripts — keep CRLF
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Binary files — no diff, no normalization
+*.db binary
+*.index binary
+*.faiss binary
+*.pkl binary
+*.npy binary
+*.npz binary
+*.so binary
+*.dylib binary
+*.dll binary
+
+# Large generated files — skip diff
+*.csv binary
+*.parquet binary

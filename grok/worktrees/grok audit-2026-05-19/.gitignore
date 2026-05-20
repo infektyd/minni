@@ -1,0 +1,131 @@
+# Sovereign Memory public boundary
+
+# Local archives and reversible cleanup bins
+_archive/
+_cleanup-quarantine/
+.last_archive
+.last_cleanup_quarantine
+
+# Runtime databases, indexes, and model/adaptor artifacts
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.db-wal
+*.db-shm
+*.db-journal
+*.index
+*.faiss
+*.faiss.npz
+*.fmadapter
+faiss/
+eval/reports/
+output/
+reports/
+
+# Private/session-heavy vault and logs
+codex-vault/
+!codex-vault/
+codex-vault/*
+!codex-vault/schema/
+!codex-vault/schema/AGENTS.md
+codex-vault/**/*.canvas
+claudecode-vault/
+schema/
+index.md
+log.md
+!claudecode-vault/
+claudecode-vault/*
+!claudecode-vault/schema/
+!claudecode-vault/schema/AGENTS.md
+claudecode-vault/**/*.canvas
+logs/
+session-extracts/
+
+# Claude Code agent vault — keep schema/structure, exclude session-heavy content
+claudecode-vault/log.md
+claudecode-vault/wiki/sessions/
+
+# FAISS index artifacts (regenerable from corpus)
+faiss/
+
+# Sovereign Memory runtime audit log + index at workspace root (contain local paths)
+/log.md
+/index.md
+
+# Root-level Codex audit + index files (mirrored from vault, private)
+/log.md
+/index.md
+
+# Runtime FAISS index directory (the *.faiss / *.index globs miss .npz)
+/faiss/
+
+# Local evaluation and build output
+/output/
+/reports/
+
+# Cursor IDE workspace state
+/.cursor/
+
+# Legacy bundles and local downloads
+archives/downloads/
+archives/legacy-vaults/
+
+# Local plugin build/runtime state
+plugins/*/node_modules/
+plugins/*/dist/
+plugins/*/.env
+plugins/*/.playwright-cli/
+plugins/.DS_Store
+
+# Private OpenClaw bridge runtime files
+openclaw-extension/node_modules/
+openclaw-extension/dist/
+openclaw-extension/.import-manifest.json
+openclaw-extension/*.bak
+openclaw-extension/*.day5.*
+openclaw-extension/__pycache__/
+
+# Python/runtime caches
+engine/venv/
+engine/.day5-contamination-backup/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local config, secrets, and app/editor state
+.env
+.env.*
+!.env.example
+/.mcp.json
+.cursor/
+.claude/
+.cursor/
+.DS_Store
+._*
+.idea/
+.vscode/
+
+# Root-level local vault/runtime files
+/inbox/
+/outbox/
+/raw/
+/wiki/
+/.kilo/
+/.obsidian/
+/faiss/
+/index.md
+/log.md
+
+# Reports and generated documents
+reports/
+*.docx
+*.pages
+
+# Ignored artifacts
+output/reports/
+*.npz

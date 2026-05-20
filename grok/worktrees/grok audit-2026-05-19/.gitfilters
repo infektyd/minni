@@ -1,0 +1,65 @@
+# Sovereign Memory public-boundary denylist.
+#
+# These patterns are intentionally stricter than normal source filtering. The
+# pre-commit hook in .githooks/pre-commit reads this file and blocks staged
+# private/runtime artifacts even when they were force-added.
+
+# Root-local machine and agent state
+/.mcp.json
+/.kilo/**
+/.cursor/**
+/.claude/**
+/.obsidian/**
+/.DS_Store
+._*
+
+# Secrets and local environment files
+.env
+.env.*
+!.env.example
+
+# Runtime databases, indexes, logs, and adapter/model artifacts
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.db-wal
+*.db-shm
+*.db-journal
+*.log
+*.index
+*.faiss
+*.faiss.npz
+*.fmadapter
+*.npz
+
+# Private/session-heavy vault surfaces
+/codex-vault/**
+!/codex-vault/schema/AGENTS.md
+/claudecode-vault/**
+!/claudecode-vault/schema/AGENTS.md
+/inbox/**
+/outbox/**
+/raw/**
+/wiki/**
+/logs/**
+/session-extracts/**
+/index.md
+/log.md
+
+# Generated reports, browser output, and build products
+/eval/reports/**
+!/eval/reports/.gitkeep
+/output/**
+/reports/**
+plugins/*/node_modules/**
+plugins/*/dist/**
+plugins/*/output/**
+plugins/*/.playwright-cli/**
+openclaw-extension/node_modules/**
+openclaw-extension/dist/**
+engine/venv/**
+__pycache__/**
+.pytest_cache/**
+.ruff_cache/**
+htmlcov/**

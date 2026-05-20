@@ -1,0 +1,338 @@
+direction: down
+
+title: |md
+  # Sovereign Memory — Detailed Architecture
+| {
+  near: top-center
+  shape: text
+  style.font-size: 24
+}
+
+# ── Agent surfaces ──────────────────────────────────
+
+surfaces: Agent surfaces {
+  style.fill: "#F8F9FA"
+  style.stroke: "#DEE2E6"
+  style.border-radius: 12
+
+  codex: Codex plugin {
+    shape: rectangle
+    style.fill: "#E6F1FB"
+    style.stroke: "#85B7EB"
+    style.font-size: 13
+  }
+  claude: Claude Code plugin {
+    shape: rectangle
+    style.fill: "#E6F1FB"
+    style.stroke: "#85B7EB"
+    style.font-size: 13
+  }
+  gemini: Gemini extension {
+    shape: rectangle
+    style.fill: "#E6F1FB"
+    style.stroke: "#85B7EB"
+    style.font-size: 13
+  }
+  kilocode: KiloCode plugin {
+    shape: rectangle
+    style.fill: "#E6F1FB"
+    style.stroke: "#85B7EB"
+    style.font-size: 13
+  }
+  openclaw: OpenClaw extension {
+    shape: rectangle
+    style.fill: "#E6F1FB"
+    style.stroke: "#85B7EB"
+    style.font-size: 13
+  }
+  console: Local console\n127.0.0.1 only {
+    shape: rectangle
+    style.fill: "#E6F1FB"
+    style.stroke: "#85B7EB"
+    style.font-size: 13
+  }
+}
+
+# ── Shared plugin layer ─────────────────────────────
+
+plugin: Shared plugin layer {
+  style.fill: "#F8F9FA"
+  style.stroke: "#DEE2E6"
+  style.border-radius: 12
+
+  mcp: MCP server\nsovereign-memory {
+    shape: rectangle
+    style.fill: "#E1F5EE"
+    style.stroke: "#5DCAA5"
+    style.font-size: 13
+    style.bold: true
+  }
+  tools: Tools (26 registered) {
+    shape: rectangle
+    style.fill: "#E1F5EE"
+    style.stroke: "#5DCAA5"
+    style.font-size: 12
+    tooltip: "recall, prepare, learn, resolve, vault_write, compile, route, drill, export_pack, audit, handoff, ping, team, contradictions"
+  }
+  hooks: Hook envelopes {
+    shape: rectangle
+    style.fill: "#E1F5EE"
+    style.stroke: "#5DCAA5"
+    style.font-size: 12
+    tooltip: "SessionStart, UserPromptSubmit, PreCompact, Stop"
+  }
+  console-api: Console API {
+    shape: rectangle
+    style.fill: "#E1F5EE"
+    style.stroke: "#5DCAA5"
+    style.font-size: 12
+    tooltip: "health, status, prepare-task, prepare-outcome, audit-tail, candidates, resolve-candidate, deep-research"
+  }
+  policy-ts: Policy routing\nrouteMemoryIntent\nassessLearningQuality {
+    shape: rectangle
+    style.fill: "#E1F5EE"
+    style.stroke: "#5DCAA5"
+    style.font-size: 12
+  }
+  ping-ts: Agent ping contracts\nrequest · inbox · decide · status {
+    shape: rectangle
+    style.fill: "#E1F5EE"
+    style.stroke: "#5DCAA5"
+    style.font-size: 12
+  }
+  team-ts: Team coordination\nruntime · evidence · promotion {
+    shape: rectangle
+    style.fill: "#E1F5EE"
+    style.stroke: "#5DCAA5"
+    style.font-size: 12
+  }
+
+  mcp -> tools
+  mcp -> hooks
+  mcp -> console-api
+  tools -> policy-ts
+  tools -> ping-ts
+  tools -> team-ts
+}
+
+# ── Sovereign daemon ────────────────────────────────
+
+daemon: Sovereign daemon (sovrd) {
+  style.fill: "#F8F9FA"
+  style.stroke: "#DEE2E6"
+  style.border-radius: 12
+
+  sovrd: sovrd\nline-delimited JSON-RPC\nUnix socket {
+    shape: rectangle
+    style.fill: "#EEEDFE"
+    style.stroke: "#AFA9EC"
+    style.font-size: 13
+    style.bold: true
+  }
+  principal: EffectivePrincipal\nidentity · vault roots\ncapabilities · read auth {
+    shape: rectangle
+    style.fill: "#EEEDFE"
+    style.stroke: "#AFA9EC"
+    style.font-size: 12
+  }
+  retrieval: Hybrid retrieval\nFTS5 + FAISS + rerank\nquery expansion + HyDE {
+    shape: rectangle
+    style.fill: "#EEEDFE"
+    style.stroke: "#AFA9EC"
+    style.font-size: 12
+  }
+  candidates: Candidate pipeline\nstage → list → resolve {
+    shape: rectangle
+    style.fill: "#EEEDFE"
+    style.stroke: "#AFA9EC"
+    style.font-size: 12
+  }
+  trace: Feedback + trace ring {
+    shape: rectangle
+    style.fill: "#EEEDFE"
+    style.stroke: "#AFA9EC"
+    style.font-size: 12
+  }
+  handoff: Inbox/outbox handoff {
+    shape: rectangle
+    style.fill: "#EEEDFE"
+    style.stroke: "#AFA9EC"
+    style.font-size: 12
+  }
+  writeback: WriteBackMemory\ndurable learning writes {
+    shape: rectangle
+    style.fill: "#EEEDFE"
+    style.stroke: "#AFA9EC"
+    style.font-size: 12
+  }
+  episodic: EpisodicMemory\nevent/task/thread lifecycle {
+    shape: rectangle
+    style.fill: "#EEEDFE"
+    style.stroke: "#AFA9EC"
+    style.font-size: 12
+  }
+  safety: Safety\ninstruction injection detector {
+    shape: rectangle
+    style.fill: "#EEEDFE"
+    style.stroke: "#AFA9EC"
+    style.font-size: 12
+  }
+  decay: Memory decay\nexponential + access-based {
+    shape: rectangle
+    style.fill: "#EEEDFE"
+    style.stroke: "#AFA9EC"
+    style.font-size: 12
+  }
+  afm-provider: AFM provider\noff · bridge · native · auto {
+    shape: rectangle
+    style.fill: "#EEEDFE"
+    style.stroke: "#AFA9EC"
+    style.font-size: 12
+  }
+
+  sovrd -> principal
+  principal -> retrieval: read gate
+  sovrd -> candidates
+  sovrd -> trace
+  sovrd -> handoff
+  sovrd -> writeback
+  sovrd -> episodic
+  sovrd -> safety
+  retrieval -> afm-provider: query expansion\nHyDE
+  candidates -> writeback: on resolve
+}
+
+# ── Indexing pipeline ───────────────────────────────
+
+indexing: Indexing pipeline {
+  style.fill: "#F8F9FA"
+  style.stroke: "#DEE2E6"
+  style.border-radius: 12
+
+  wiki-indexer: WikiIndexer\nvault files → documents {
+    shape: rectangle
+    style.fill: "#EAF3DE"
+    style.stroke: "#97C459"
+    style.font-size: 12
+  }
+  vault-indexer: VaultIndexer\nmarkdown → SQLite + FAISS {
+    shape: rectangle
+    style.fill: "#EAF3DE"
+    style.stroke: "#97C459"
+    style.font-size: 12
+  }
+
+  wiki-indexer -> vault-indexer
+}
+
+# ── Local storage ───────────────────────────────────
+
+storage: Local memory state {
+  style.fill: "#F8F9FA"
+  style.stroke: "#DEE2E6"
+  style.border-radius: 12
+
+  sqlite: SQLite\nruntime truth\nWAL mode + migrations {
+    shape: cylinder
+    style.fill: "#FAEEDA"
+    style.stroke: "#EF9F27"
+    style.font-size: 12
+    style.bold: true
+  }
+  vectors: Vector backends\nFAISS disk/mem\nqdrant/lance stubs {
+    shape: cylinder
+    style.fill: "#FAEEDA"
+    style.stroke: "#EF9F27"
+    style.font-size: 12
+  }
+  vaults: Obsidian vaults\nwiki · raw · logs · schema\ninbox · outbox {
+    shape: cylinder
+    style.fill: "#FAEEDA"
+    style.stroke: "#EF9F27"
+    style.font-size: 12
+  }
+}
+
+# ── Compile passes ──────────────────────────────────
+
+compile: Review-only self-organization {
+  style.fill: "#F8F9FA"
+  style.stroke: "#DEE2E6"
+  style.border-radius: 12
+
+  scheduler: AFM scheduler\nidle-triggered {
+    shape: rectangle
+    style.fill: "#FAECE7"
+    style.stroke: "#F0997B"
+    style.font-size: 12
+  }
+  passes: Compile passes\nsession distillation · synthesis\nprocedure extraction\nreorganization · pruning {
+    shape: rectangle
+    style.fill: "#FAECE7"
+    style.stroke: "#F0997B"
+    style.font-size: 12
+  }
+  writer: AFM writer\ndraft queue → vault pages {
+    shape: rectangle
+    style.fill: "#FAECE7"
+    style.stroke: "#F0997B"
+    style.font-size: 12
+  }
+
+  scheduler -> passes: triggers
+  passes -> writer
+}
+
+# ── Eval (offline) ──────────────────────────────────
+
+eval: Eval harness (offline) {
+  style.fill: "#F8F9FA"
+  style.stroke: "#DEE2E6"
+  style.border-radius: 12
+
+  harness: Recall quality gates\ndataset · metrics · judging {
+    shape: rectangle
+    style.fill: "#F1EFE8"
+    style.stroke: "#B4B2A9"
+    style.font-size: 12
+  }
+}
+
+# ── Connections between groups ──────────────────────
+
+# Surfaces → Plugin
+surfaces.codex -> plugin.mcp: {style.stroke: "#85B7EB"}
+surfaces.claude -> plugin.mcp: {style.stroke: "#85B7EB"}
+surfaces.gemini -> plugin.mcp: {style.stroke: "#85B7EB"}
+surfaces.kilocode -> plugin.mcp: {style.stroke: "#85B7EB"}
+surfaces.console -> plugin.mcp: {style.stroke: "#85B7EB"}
+surfaces.openclaw -> daemon.sovrd: direct (HTTP) {
+  style.stroke: "#85B7EB"
+  style.stroke-dash: 3
+}
+
+# Plugin → Daemon
+plugin.tools -> daemon.sovrd: JSON-RPC {style.stroke: "#5DCAA5"}
+plugin.hooks -> daemon.sovrd: JSON-RPC {style.stroke: "#5DCAA5"}
+
+# Daemon → Storage
+daemon.retrieval -> storage.sqlite: FTS5 queries {style.stroke: "#AFA9EC"}
+daemon.retrieval -> storage.vectors: semantic search {style.stroke: "#AFA9EC"}
+daemon.handoff -> storage.vaults: writes handoff pages {style.stroke: "#AFA9EC"}
+daemon.writeback -> storage.sqlite: durable writes {style.stroke: "#AFA9EC"}
+daemon.writeback -> storage.vaults: optional vault sync {style.stroke: "#AFA9EC"; style.stroke-dash: 3}
+plugin.tools -> storage.vaults: vault_write tool {style.stroke: "#5DCAA5"; style.stroke-dash: 3}
+
+# Indexing: Vaults → SQLite/FAISS (the missing link)
+storage.vaults -> indexing.wiki-indexer: reads vault files {style.stroke: "#97C459"}
+indexing.vault-indexer -> storage.sqlite: populates {style.stroke: "#97C459"}
+indexing.vault-indexer -> storage.vectors: embeds {style.stroke: "#97C459"}
+
+# Daemon → Compile
+daemon.sovrd -> compile.scheduler: {style.stroke: "#AFA9EC"}
+daemon.afm-provider -> compile.passes: AFM calls {style.stroke: "#AFA9EC"; style.stroke-dash: 3}
+compile.writer -> storage.vaults: review drafts {style.stroke: "#F0997B"; style.stroke-dash: 3}
+
+# Eval (offline, uses retrieval + storage)
+daemon.retrieval -> eval.harness: offline eval {style.stroke: "#B4B2A9"; style.stroke-dash: 3}
+storage.sqlite -> eval.harness: test queries {style.stroke: "#B4B2A9"; style.stroke-dash: 3}

@@ -1,0 +1,39 @@
+afm:
+  - Apple Foundation Models
+apple foundation models:
+  - AFM
+mcp:
+  - Model Context Protocol
+model context protocol:
+  - MCP
+fts:
+  - full text search
+full text search:
+  - FTS
+faiss:
+  - vector index
+  - semantic index
+sovrd:
+  - Sovereign Memory daemon
+sovereign memory daemon:
+  - sovrd
+jwt:
+  - JSON Web Token
+json web token:
+  - JWT
+db:
+  - database
+database:
+  - DB
+rrf:
+  - reciprocal rank fusion
+reciprocal rank fusion:
+  - RRF
+hyde:
+  - hypothetical document embedding
+hypothetical document embedding:
+  - HyDE
+qlora:
+  - quantized lora
+quantized lora:
+  - QLoRA

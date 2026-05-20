@@ -1,0 +1,15 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+source_file="${0}.swift"
+cache_dir="${TMPDIR:-/tmp}/sovereign-memory-afm"
+mkdir -p "${cache_dir}"
+
+source_mtime="$(stat -f %m "${source_file}")"
+binary="${cache_dir}/native-afm-helper-${source_mtime}"
+
+if [[ ! -x "${binary}" ]]; then
+  xcrun --sdk macosx swiftc -parse-as-library "${source_file}" -o "${binary}"
+fi
+
+exec "${binary}"

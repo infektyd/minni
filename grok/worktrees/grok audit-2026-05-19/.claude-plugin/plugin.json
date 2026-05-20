@@ -1,0 +1,11 @@
+{
+  "name": "sovereign-memory",
+  "version": "0.1.0",
+  "description": "Local-only Sovereign Memory bridge: hosted-agent envelope, recall, prepare-task, dry-run review, and audit tail for Claude Code.",
+  "author": {
+    "name": "Sovereign Memory"
+  },
+  "license": "Apache-2.0",
+  "homepage": "https://github.com/infektyd/sovereign-memory",
+  "keywords": ["sovereign-memory", "memory", "mcp", "local-only"]
+}
