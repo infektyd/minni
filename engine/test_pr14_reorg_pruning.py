@@ -46,9 +46,11 @@ def _write_page(
     status="accepted",
     tags=None,
     sources=None,
-    updated="2026-04-20T00:00:00Z",
+    updated=None,
     extra_frontmatter=None,
 ):
+    if updated is None:
+        updated = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 5 * 86400))
     path = vault / rel
     path.parent.mkdir(parents=True, exist_ok=True)
     tags = tags or []

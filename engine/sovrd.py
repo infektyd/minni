@@ -1915,14 +1915,30 @@ def _handle_status(params: dict, request_id: Any) -> dict:
     global _request_count
     _request_count += 1
 
-    # RCM-009: principal gate + path redaction (principal bound for consistency with other handlers;
-    # full object available for future scoping if needed; redaction remains explicit for the 3 known fields).
+    vault_path = params.get("vault") or params.get("vault_path") or DEFAULT_CONFIG.vault_path
+    err = _guard_vault_root(params, vault_path, request_id, label="status")
+    if err:
+        return err
+
+    # Calculate audit volume
+    audit_vol = 0
     try:
-        principal = resolve_effective_principal(
-            supplied_agent_id=params.get("agent_id"), transport="uds"
-        )
-    except IdentityMismatchError as exc:
-        return make_mismatch_error(exc.supplied, exc.stamped, request_id)
+        vp = Path(vault_path)
+        if vp.is_dir():
+            for p in vp.glob("log*.md"):
+                try:
+                    audit_vol += p.stat().st_size
+                except OSError:
+                    pass
+            logs_dir = vp / "logs"
+            if logs_dir.is_dir():
+                for p in logs_dir.glob("*.md"):
+                    try:
+                        audit_vol += p.stat().st_size
+                    except OSError:
+                        pass
+    except Exception:
+        pass
 
     db_ok = False
     db_stats = {}
@@ -1970,6 +1986,7 @@ def _handle_status(params: dict, request_id: Any) -> dict:
             "faiss_ok": faiss_ok,
             "faiss_path": "[redacted]",
             "stats": db_stats,
+            "audit_volume": audit_vol,
         },
         "afm": afm_status,
     }, request_id)
@@ -2851,6 +2868,15 @@ def main():
         _warn_if_sync_root("vault", Path(DEFAULT_CONFIG.vault_path))
     except Exception:  # never block startup on hygiene checks
         logger.exception("cloud-sync hygiene check failed (non-fatal)")
+
+    # Eagerly initialize/migrate database on startup (RCM-028 Phase 0 exit)
+    try:
+        from db import SovereignDB
+        db = SovereignDB(DEFAULT_CONFIG)
+        db._get_conn()
+        logger.info("Database initialized/migrated on startup.")
+    except Exception:
+        logger.exception("Eager database initialization failed")
 
     loop = asyncio.new_event_loop()
     main_task = loop.create_task(_serve_unix_socket(_unix_socket_path))

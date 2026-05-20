@@ -23,17 +23,31 @@ def _patch_handoff_db(monkeypatch, tmp_path):
 
     monkeypatch.setattr(sovrd, "_lazy_writeback", lambda: types.SimpleNamespace(db=db_obj))
 
-    # G11 test relaxation: these handoff tests use concrete agent names ("codex", "claude-code") for vault/env logic.
-    # The dedicated test_principal_binding.py covers strict mismatch/alias cases with principals/*.json.
-    # Here, synthesize EffectivePrincipal from the *supplied* value so tests continue to pass their multi-agent scenarios
-    # without hitting identity_mismatch (real daemon always stamps from principals or "main").
+    # Hermetic principal setup for test integrity (writes real JSON config with 0600 mode).
     import principal as principal_mod
-    from principal import EffectivePrincipal
+    import json
+
+    pdir = tmp_path / "principals"
+    pdir.mkdir(exist_ok=True)
+
     original_resolve = principal_mod.resolve_effective_principal
 
     def _test_resolve(*, supplied_agent_id=None, transport="uds", principals_dir=None):
-        aid = str(supplied_agent_id or "main").strip() or "main"
-        return EffectivePrincipal(agent_id=aid, workspace_id="default", transport=transport, capabilities=["*"])
+        target_dir = principals_dir or pdir
+        target_agent = str(supplied_agent_id or "main").strip() or "main"
+        f = target_dir / "local.json"
+        f.write_text(json.dumps({
+            "agent_id": target_agent,
+            "workspace_id": "default",
+            "capabilities": ["*"]
+        }), encoding="utf-8")
+        os.chmod(f, 0o600)
+
+        return original_resolve(
+            supplied_agent_id=supplied_agent_id,
+            transport=transport,
+            principals_dir=target_dir
+        )
 
     monkeypatch.setattr(principal_mod, "resolve_effective_principal", _test_resolve)
     monkeypatch.setattr(sovrd, "resolve_effective_principal", _test_resolve)

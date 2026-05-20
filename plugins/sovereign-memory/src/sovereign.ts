@@ -1,7 +1,9 @@
 import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { existsSync } from "node:fs";
+import { stat, readdir } from "node:fs/promises";
 import net from "node:net";
+import path from "node:path";
 import { URL } from "node:url";
 import { AFM_HEALTH_URL, AFM_PROVIDER_MODE, DEFAULT_AGENT_ID, DEFAULT_VAULT_PATH, DEFAULT_WORKSPACE_ID, SOCKET_PATH } from "./config.js";
 import { resolveAfmProvider, sanitizeAfmHealth, type AfmProviderMode, type AfmProviderResolution } from "./afm.js";
@@ -41,6 +43,7 @@ export interface StatusReport {
   audit: {
     entries: number;
     latest?: string;
+    volume: number;
   };
 }
 
@@ -416,6 +419,26 @@ export async function buildStatusReport(input?: {
   await ensureVault(vaultPath);
   const tail = await auditTail(vaultPath, 1);
   const rawAfm = input?.afm ?? (await afmHealth());
+
+  let volume = 0;
+  const logFiles = ["log.md", "log.1.md", "log.2.md", "log.3.md"];
+  for (const name of logFiles) {
+    try {
+      const st = await stat(path.join(vaultPath, name));
+      volume += st.size;
+    } catch {}
+  }
+  const logsDir = path.join(vaultPath, "logs");
+  try {
+    const dailyNames = await readdir(logsDir);
+    for (const name of dailyNames) {
+      if (name.endsWith(".md")) {
+        const st = await stat(path.join(logsDir, name));
+        volume += st.size;
+      }
+    }
+  } catch {}
+
   return {
     vault: {
       path: vaultPath,
@@ -430,6 +453,7 @@ export async function buildStatusReport(input?: {
     audit: {
       entries: tail.entries.length,
       latest: tail.entries.at(-1),
+      volume,
     },
   };
 }

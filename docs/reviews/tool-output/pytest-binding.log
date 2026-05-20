@@ -1,9 +1,0 @@
-============================= test session starts ==============================
-platform darwin -- Python 3.14.5, pytest-9.0.3, pluggy-1.6.0
-rootdir: /Users/hansaxelsson/Projects/sovereignMemory/grok/worktrees/rc1-phase-012
-plugins: anyio-4.13.0
-collected 8 items
-
-engine/test_principal_binding.py ........                                [100%]
-
-============================== 8 passed in 0.03s ===============================

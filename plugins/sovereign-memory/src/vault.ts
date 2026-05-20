@@ -7,8 +7,11 @@ import {
   stat,
   unlink,
   writeFile,
+  rename,
+  open,
 } from "node:fs/promises";
 import path from "node:path";
+import os from "node:os";
 import * as fs from "node:fs"; // RCM-005: for realpathSync in assertUnder (G23 equivalent)
 
 export type VaultSection =
@@ -428,12 +431,159 @@ function escapeAuditDetailsBlock(raw: string): string {
   return block;
 }
 
+function getAgentIdFromVaultPath(vaultPath: string): string {
+  const absPath = path.resolve(vaultPath.replace(/^~(?=$|\/)/, os.homedir()));
+
+  const mappingRaw = process.env.SOVEREIGN_AGENT_VAULTS;
+  if (mappingRaw) {
+    try {
+      const mapping = JSON.parse(mappingRaw) as unknown;
+      if (mapping && typeof mapping === "object" && !Array.isArray(mapping)) {
+        for (const [agentId, mappedPath] of Object.entries(mapping as Record<string, unknown>)) {
+          if (typeof mappedPath === "string") {
+            const absMapped = path.resolve(mappedPath.replace(/^~(?=$|\/)/, os.homedir()));
+            if (absMapped === absPath) return agentId;
+          }
+        }
+      }
+    } catch {}
+  }
+
+  const envKeys = [
+    { key: "SOVEREIGN_CODEX_VAULT_PATH", id: "codex" },
+    { key: "SOVEREIGN_CLAUDECODE_VAULT_PATH", id: "claude-code" },
+    { key: "SOVEREIGN_KILOCODE_VAULT_PATH", id: "kilocode" },
+  ];
+  for (const { key, id } of envKeys) {
+    const val = process.env[key];
+    if (val && path.resolve(val.replace(/^~(?=$|\/)/, os.homedir())) === absPath) {
+      return id;
+    }
+  }
+
+  const homedir = os.homedir();
+  if (absPath === path.join(homedir, ".sovereign-memory", "codex-vault")) return "codex";
+  if (absPath === path.join(homedir, ".sovereign-memory", "claudecode-vault")) return "claude-code";
+  if (absPath === path.join(homedir, ".sovereign-memory", "kilocode-vault")) return "kilocode";
+  if (absPath === path.join(homedir, ".sovereign-memory", "hermes-vault")) return "hermes";
+  if (absPath === path.join(homedir, ".sovereign-memory", "openclaw-vault")) return "openclaw";
+
+  const base = path.basename(absPath);
+  if (base.endsWith("-vault")) return base.substring(0, base.length - 6);
+  return base || "agent";
+}
+
+async function appendFileWithFsync(filePath: string, content: string): Promise<void> {
+  const fh = await open(filePath, "a");
+  try {
+    await fh.writeFile(content, "utf8");
+    await fh.sync();
+  } finally {
+    await fh.close();
+  }
+}
+
+async function writeFileAtomic(filePath: string, content: string): Promise<void> {
+  const tempPath = `${filePath}.${Math.random().toString(36).substring(2)}.tmp`;
+  const fh = await open(tempPath, "w");
+  try {
+    await fh.writeFile(content, "utf8");
+    await fh.sync();
+  } finally {
+    await fh.close();
+  }
+  await rename(tempPath, filePath);
+}
+
+const auditLocks = new Map<string, Promise<void>>();
+
+async function withAuditLock<T>(vaultPath: string, fn: () => Promise<T>): Promise<T> {
+  const key = path.resolve(vaultPath.replace(/^~(?=$|\/)/, os.homedir()));
+  const previous = auditLocks.get(key) ?? Promise.resolve();
+  let release!: () => void;
+  const current = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const tail = previous.then(() => current, () => current);
+  auditLocks.set(key, tail);
+
+  await previous.catch(() => {});
+  try {
+    return await fn();
+  } finally {
+    release();
+    if (auditLocks.get(key) === tail) {
+      auditLocks.delete(key);
+    }
+  }
+}
+
+function shouldThrottleAudit(entry: AuditEntry): boolean {
+  return entry.tool.startsWith("hook_");
+}
+
 export async function recordAudit(
   vaultPath: string,
   entry: AuditEntry,
 ): Promise<string> {
   await ensureVault(vaultPath);
+  return withAuditLock(vaultPath, async () => {
   const timestamp = entry.timestamp ?? new Date();
+
+  // --- 1. Per-agent rate-limiting ---
+  const agentId = getAgentIdFromVaultPath(vaultPath);
+  const homeDir = process.env.SOVEREIGN_HOME ?? path.join(os.homedir(), ".sovereign-memory");
+  const rateLimitDir = path.join(homeDir, ".hook-audit-ts");
+  await mkdir(rateLimitDir, { recursive: true });
+  const tsPath = path.join(rateLimitDir, `${agentId}.ts`);
+
+  let lastTime: number | undefined;
+  try {
+    const content = await readFile(tsPath, "utf8");
+    lastTime = Date.parse(content.trim());
+  } catch {}
+
+  const bypass = process.env.SOVEREIGN_BYPASS_AUDIT_LIMIT === "true";
+  const logPath = path.join(vaultPath, "log.md");
+  const dailyPath = path.join(vaultPath, "logs", `${isoDate(timestamp)}.md`);
+  if (!bypass && lastTime !== undefined && Number.isFinite(lastTime)) {
+    const diff = timestamp.getTime() - lastTime;
+    if (shouldThrottleAudit(entry) && diff >= 0 && diff < 5000) {
+      return dailyPath;
+    }
+  }
+
+  if (bypass || shouldThrottleAudit(entry)) {
+    await writeFile(tsPath, timestamp.toISOString(), { encoding: "utf8", mode: 0o600 });
+  }
+
+  // --- 2. Rotation check ---
+  let currentSize = 0;
+  try {
+    const st = await stat(logPath);
+    currentSize = st.size;
+  } catch {}
+
+  if (currentSize >= 5 * 1024 * 1024) {
+    const path3 = path.join(vaultPath, "log.3.md");
+    const path2 = path.join(vaultPath, "log.2.md");
+    const path1 = path.join(vaultPath, "log.1.md");
+
+    await unlink(path3).catch(() => {});
+    if (await exists(path2)) {
+      await rename(path2, path3);
+    }
+    if (await exists(path1)) {
+      await rename(path1, path2);
+    }
+    if (await exists(logPath)) {
+      await rename(logPath, path1);
+    }
+
+    await writeFileAtomic(logPath, logContent());
+  }
+
+  // --- 3. Format and Append Audit Line ---
   const date = isoDate(timestamp);
   const safeTool = escapeAuditField(entry.tool ?? "", {
     mode: "inline",
@@ -449,13 +599,78 @@ export async function recordAudit(
     detailBlock = `\`\`\`json\n${escapeAuditDetailsBlock(raw)}\n\`\`\`\n\n`;
   }
   const line = `## [${timestamp.toISOString()}] ${safeTool} | ${safeSummary}\n\n${detailBlock}`;
-  await appendFile(path.join(vaultPath, "log.md"), line, "utf8");
-  const dailyPath = path.join(vaultPath, "logs", `${date}.md`);
+
+  await appendFileWithFsync(logPath, line);
+
   if (!(await exists(dailyPath))) {
-    await writeFile(dailyPath, `# ${date} Sovereign Memory Audit\n\n`, "utf8");
+    await writeFileAtomic(dailyPath, `# ${date} Sovereign Memory Audit\n\n`);
   }
-  await appendFile(dailyPath, line, "utf8");
+  await appendFileWithFsync(dailyPath, line);
+
+  // --- 4. Daily-log prune (older than 30 days) ---
+  const logsDir = path.join(vaultPath, "logs");
+  let logFiles: string[] = [];
+  try {
+    logFiles = await readdir(logsDir);
+  } catch {}
+  const nowMs = timestamp.getTime();
+  const thirtyDaysMs = 30 * 24 * 60 * 60 * 1000;
+  for (const file of logFiles) {
+    const match = file.match(/^(\d{4}-\d{2}-\d{2})\.md$/);
+    if (match) {
+      const fileDate = new Date(match[1]);
+      if (Number.isFinite(fileDate.getTime())) {
+        if (nowMs - fileDate.getTime() > thirtyDaysMs) {
+          await unlink(path.join(logsDir, file)).catch(() => {});
+        }
+      }
+    }
+  }
+
+  // --- 5. Quota (50 MB) check and prune ---
+  const auditFiles: { filePath: string; size: number; isDaily: boolean; dateMs?: number }[] = [];
+
+  const logFilesToCheck = ["log.md", "log.1.md", "log.2.md", "log.3.md"];
+  for (const name of logFilesToCheck) {
+    const fp = path.join(vaultPath, name);
+    try {
+      const st = await stat(fp);
+      auditFiles.push({ filePath: fp, size: st.size, isDaily: false });
+    } catch {}
+  }
+
+  try {
+    const dailyNames = await readdir(logsDir);
+    for (const name of dailyNames) {
+      const match = name.match(/^(\d{4}-\d{2}-\d{2})\.md$/);
+      if (match) {
+        const fp = path.join(logsDir, name);
+        try {
+          const st = await stat(fp);
+          const dateMs = new Date(match[1]).getTime();
+          auditFiles.push({ filePath: fp, size: st.size, isDaily: true, dateMs });
+        } catch {}
+      }
+    }
+  } catch {}
+
+  let totalSize = auditFiles.reduce((acc, f) => acc + f.size, 0);
+  const quota = 50 * 1024 * 1024;
+
+  if (totalSize > quota) {
+    const dailyLogs = auditFiles
+      .filter((f) => f.isDaily && f.dateMs !== undefined)
+      .sort((a, b) => a.dateMs! - b.dateMs!);
+
+    for (const daily of dailyLogs) {
+      await unlink(daily.filePath).catch(() => {});
+      totalSize -= daily.size;
+      if (totalSize <= quota) break;
+    }
+  }
+
   return dailyPath;
+  });
 }
 
 async function appendIndex(

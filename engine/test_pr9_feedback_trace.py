@@ -10,18 +10,44 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-# G11 test relaxation
-import principal as _principal_mod
-from principal import EffectivePrincipal as _EP
-def _permissive_resolve(*, supplied_agent_id=None, transport="uds", principals_dir=None):
-    aid = str(supplied_agent_id or "main").strip() or "main"
-    return _EP(agent_id=aid, workspace_id="default", transport=transport, capabilities=["*"])
-_principal_mod.resolve_effective_principal = _permissive_resolve
-try:
-    import sovrd as _sovrd_mod
-    _sovrd_mod.resolve_effective_principal = _permissive_resolve
-except Exception:
-    pass
+# Hermetic principal setup for test integrity.
+import pytest
+
+@pytest.fixture(autouse=True)
+def setup_hermetic_principals(tmp_path, monkeypatch):
+    """Replaces the module-level permissive resolve patch with a wrapper that writes
+    realistic principal files to tmp_path/principals/ (chmod 0o600) and routes
+    through the real principal resolution logic.
+    """
+    import principal
+    import sovrd
+    import json
+
+    pdir = tmp_path / "principals"
+    pdir.mkdir(exist_ok=True)
+
+    original_resolve = principal.resolve_effective_principal
+
+    def _patched_resolve(*, supplied_agent_id=None, transport="uds", principals_dir=None):
+        target_dir = principals_dir or pdir
+        target_agent = str(supplied_agent_id or "main").strip() or "main"
+        f = target_dir / "local.json"
+        f.write_text(json.dumps({
+            "agent_id": target_agent,
+            "workspace_id": "default",
+            "capabilities": ["*"]
+        }), encoding="utf-8")
+        os.chmod(f, 0o600)
+
+        return original_resolve(
+            supplied_agent_id=supplied_agent_id,
+            transport=transport,
+            principals_dir=target_dir
+        )
+
+    monkeypatch.setattr(principal, "resolve_effective_principal", _patched_resolve)
+    monkeypatch.setattr(sovrd, "resolve_effective_principal", _patched_resolve)
+
 
 
 def _make_db(tmp_path, feedback_enabled=True):

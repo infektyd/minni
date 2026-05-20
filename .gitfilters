@@ -11,6 +11,7 @@
 /.claude/**
 /.obsidian/**
 /.DS_Store
+**/.DS_Store
 ._*
 
 # Secrets and local environment files

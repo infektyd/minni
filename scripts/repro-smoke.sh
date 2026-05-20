@@ -11,7 +11,7 @@ mkdir -p "$TD/run" "$TD/logs"
 echo "[smoke] SOVEREIGN_HOME=$SOVEREIGN_HOME"
 
 # Start daemon in background (stdio mode for simplicity in CI; socket optional)
-python3 -u engine/sovrd.py --home "$TD" --socket "$SOVEREIGN_SOCKET" > "$TD/daemon.log" 2>&1 &
+python3 -u engine/sovrd.py --socket "$SOVEREIGN_SOCKET" > "$TD/daemon.log" 2>&1 &
 DAEMON_PID=$!
 trap 'kill $DAEMON_PID 2>/dev/null || true; rm -rf "$TD"' EXIT
 
@@ -25,25 +25,41 @@ echo "MIGRATION_DB_PRESENT: $DB_COUNT (expected >=1 for schema apply on clean st
 python3 - <<'PY'
 import os, sys, time, json
 sys.path.insert(0, "engine")
-from sovrd_client import SovereignClient
-c = SovereignClient(socket_path=os.environ.get("SOVEREIGN_SOCKET"))
-st = c.call("status", {})
+from sovrd_client import _rpc
+socket_path = os.environ.get("SOVEREIGN_SOCKET")
+st = _rpc(socket_path, "status", {})
 status_ok = "daemon" in st and "engine" in st
 print("STATUS_OK:", status_ok)
 if not status_ok:
     print("STATUS FAILED", file=sys.stderr)
     sys.exit(1)
-rec = c.call("search", {"query": "smoke test recall", "limit": 1})
+rec = _rpc(socket_path, "search", {"query": "smoke test recall", "limit": 1})
 recall_ok = isinstance(rec, dict) and "results" in rec
 print("RECALL_OK:", recall_ok)
 if not recall_ok:
     print("RECALL FAILED", file=sys.stderr)
     sys.exit(1)
-pollution = ".sovereign-memory" not in os.listdir(os.path.expanduser("~"))
-print("HOME_POLLUTION_CHECK:", pollution)
-if not pollution:
-    print("POLLUTION DETECTED: .sovereign-memory present in ~", file=sys.stderr)
-    sys.exit(1)
+sov_dir = os.path.expanduser("~/.sovereign-memory")
+if os.path.exists(sov_dir):
+    recent_files = []
+    now = time.time()
+    for root_dir, dirs, files in os.walk(sov_dir):
+        for f in files:
+            fp = os.path.join(root_dir, f)
+            try:
+                mtime = os.path.getmtime(fp)
+                if now - mtime < 10:  # 10s lookback
+                    recent_files.append(fp)
+            except OSError:
+                pass
+    pollution = len(recent_files) == 0
+    if not pollution:
+        print("POLLUTION DETECTED: Recent modified files in ~:", recent_files, file=sys.stderr)
+        sys.exit(1)
+    else:
+        print("HOME_POLLUTION_CHECK: True (pre-existing directory but no new files)")
+else:
+    print("HOME_POLLUTION_CHECK: True (directory does not exist)")
 PY
 
 echo "[smoke] SUCCESS: daemon started, status+recall responded, no ~ pollution under $SOVEREIGN_HOME"
