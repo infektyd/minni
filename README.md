@@ -4,7 +4,7 @@
 ![Python](https://img.shields.io/badge/python-3.11+-3776AB?style=flat-square&logo=python&logoColor=white)
 ![Node](https://img.shields.io/badge/node-18+-339933?style=flat-square&logo=node.js&logoColor=white)
 ![Tests](https://img.shields.io/badge/tests-454_passing-brightgreen?style=flat-square)
-![License](https://img.shields.io/badge/license-local--only-lightgrey?style=flat-square)
+![License](https://img.shields.io/badge/license-MIT-blue?style=flat-square)
 
 **Local-first memory and governance layer for AI agents.**
 
