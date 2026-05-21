@@ -1,7 +1,7 @@
 # Core
 # Python 3.11 or 3.12 recommended for reproducible binary wheels (numpy, faiss-cpu, sentence-transformers).
 # Python 3.14 may produce partial installs; use venv + pinned versions below.
-sentence-transformers>=2.2.0
+sentence-transformers>=5.5.1
 numpy>=2.4.6,<3.0
 
 # FAISS (CPU — use faiss-gpu if you have CUDA)
