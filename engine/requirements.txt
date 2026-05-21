@@ -14,7 +14,7 @@ faiss-cpu>=1.13.2
 tiktoken>=0.5.0
 
 # File watcher
-watchdog>=3.0.0
+watchdog>=6.0.0
 
 # Optional: for better SQLite FTS tokenization
 # icu4c (system package)
