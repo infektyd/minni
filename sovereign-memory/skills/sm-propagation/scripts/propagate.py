@@ -60,6 +60,23 @@ def vault_for(agent: str) -> Path:
         return Path("~/.sovereign-memory/codex-vault").expanduser()
     if agent in {"claude", "claude-code"}:
         return Path("~/.sovereign-memory/claudecode-vault").expanduser()
+    if agent == "gemini":
+        # Gemini's canonical location is now ~/.sovereign-memory/gemini-vault,
+        # but older installs may still have content at the legacy ~/.gemini/sovereign-vault
+        # path. To avoid silently stranding prior memory on upgrade, fall back to the
+        # legacy path when the canonical one is missing and the legacy one has data.
+        # Operators should `mv` the legacy directory to the canonical location to
+        # complete the migration.
+        canonical = Path("~/.sovereign-memory/gemini-vault").expanduser()
+        legacy = Path("~/.gemini/sovereign-vault").expanduser()
+        if not canonical.exists() and legacy.exists() and any(legacy.iterdir()):
+            sys.stderr.write(
+                f"[sm-propagation] gemini vault still at legacy path: {legacy}\n"
+                f"  Move it to the canonical layout to silence this warning:\n"
+                f"    mv {legacy} {canonical}\n"
+            )
+            return legacy
+        return canonical
     return Path(f"~/.sovereign-memory/{agent}-vault").expanduser()
 
 
