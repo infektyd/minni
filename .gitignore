@@ -1,5 +1,12 @@
 # Sovereign Memory public boundary
 
+# Private working notes — human-only scratch for audits, RC prep, drafts
+_private/
+
+# Tool/IDE per-session state — never committed
+.antigravitycli/
+.cursor/
+
 # Local archives and reversible cleanup bins
 _archive/
 _cleanup-quarantine/
