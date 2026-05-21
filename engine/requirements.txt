@@ -11,7 +11,7 @@ faiss-cpu>=1.7.4
 # No extra install needed
 
 # Token counting for context budgeting
-tiktoken>=0.5.0
+tiktoken>=0.13.0
 
 # File watcher
 watchdog>=3.0.0
