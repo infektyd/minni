@@ -53,6 +53,7 @@ subsystem — inspired by the
 | Vault model + wiki indexer | ![beta](https://img.shields.io/badge/-beta-blue?style=flat-square) | Structure stable; WikiIndexer → VaultIndexer → SQLite/FAISS pipeline works |
 | Identity + read policy | ![beta](https://img.shields.io/badge/-beta-blue?style=flat-square) | EffectivePrincipal stamps identity, vault roots, capabilities; centralized read gate |
 | Handoff (inbox/outbox) | ![beta](https://img.shields.io/badge/-beta-blue?style=flat-square) | Vault-backed handoff pages; ack and await flows work |
+| Multi-agent propagation (sm-propagation) | ![beta](https://img.shields.io/badge/-beta-blue?style=flat-square) | Seed-hosted / bootstrap-vault / update-plugin / verify across Codex, Claude Code, Gemini, KiloCode, and Grok; canonical envelope + per-platform install stamping |
 | Cross-agent ping contracts | ![alpha](https://img.shields.io/badge/-alpha-orange?style=flat-square) | Protocol works (request → inbox → decide → status); limited real-world testing |
 | AFM provider (native/bridge) | ![alpha](https://img.shields.io/badge/-alpha-orange?style=flat-square) | macOS-only; bridge is default; native requires Foundation Models framework |
 | Compile passes (AFM) | ![alpha](https://img.shields.io/badge/-alpha-orange?style=flat-square) | 5 passes (session, synthesis, procedure, reorg, pruning); dry-run only by default |
@@ -179,6 +180,32 @@ python3 sovrd_client.py --socket ~/.sovereign-memory/run/sovrd.sock search "memo
 > pip install --upgrade pip && pip install -r engine/requirements.txt
 > ```
 
+### Multi-agent install
+
+Per-agent setup — canonical envelope, per-platform plugin install, and
+verification — runs through the `sm-propagation` skill. Each hosted agent
+receives its own workspace envelope at `~/.sovereign-memory/identities/<agent>/`
+and its own vault under `~/.sovereign-memory/<agent>-vault/` — no shared
+state between agents.
+
+```bash
+# Status check (read-only)
+python3 sovereign-memory/skills/sm-propagation/scripts/propagate.py status --agent <agent>
+
+# Full four-step propagation for one hosted agent
+python3 sovereign-memory/skills/sm-propagation/scripts/propagate.py seed-hosted --agent <agent> --workspace "$(pwd)"
+python3 sovereign-memory/skills/sm-propagation/scripts/propagate.py bootstrap-vault --agent <agent>
+python3 sovereign-memory/skills/sm-propagation/scripts/propagate.py update-plugin --platform <platform>
+python3 sovereign-memory/skills/sm-propagation/scripts/propagate.py verify --agent <agent> --workspace "$(pwd)"
+```
+
+Supported platforms: `codex`, `claude-code`, `kilocode`, `gemini`,
+`grok-beta`, `all`, or `generic` (with `--install-root` and `--agent`). See
+[`sovereign-memory/skills/sm-propagation/SKILL.md`](sovereign-memory/skills/sm-propagation/SKILL.md)
+and
+[`sovereign-memory/docs/DESIGN-sovereign-delivery-layer.md`](sovereign-memory/docs/DESIGN-sovereign-delivery-layer.md)
+for the full design.
+
 </details>
 
 ---
@@ -188,7 +215,7 @@ python3 sovrd_client.py --socket ~/.sovereign-memory/run/sovrd.sock search "memo
 
 ```mermaid
 flowchart TD
-    Agents["🔌 Agent surfaces\nCodex · Claude Code · Gemini\nKiloCode · OpenClaw · Console"]
+    Agents["🔌 Agent surfaces\nCodex · Claude Code · Gemini\nKiloCode · Grok Build · OpenClaw · Console"]
     Plugin["📡 MCP plugin layer\ntools · hooks · console API"]
     Daemon["⚙️ Sovereign daemon\nsovrd — JSON-RPC"]
     Identity["🪪 Identity & policy\nprincipal · read gates · audit"]
@@ -324,6 +351,7 @@ resume useful work, and contradiction handling.
 |---|---|
 | [`engine/`](engine/) | Python daemon, retrieval, migrations, compile passes, eval harness |
 | [`plugins/sovereign-memory/`](plugins/sovereign-memory/) | Agent-agnostic MCP plugin with convenience manifests |
+| [`sovereign-memory/`](sovereign-memory/) | Delivery layer — `sm-propagation` skill, generalization workflows, and the [delivery-layer design doc](sovereign-memory/docs/DESIGN-sovereign-delivery-layer.md) |
 | [`openclaw-extension/`](openclaw-extension/) | OpenClaw bridge and import tooling |
 | [`docs/contracts/`](docs/contracts/) | Policy, threat model, page types, capabilities, workflow contracts |
 | [`docs/plans/execution/`](docs/plans/execution/) | Rollout PR specs and resume ledger |
