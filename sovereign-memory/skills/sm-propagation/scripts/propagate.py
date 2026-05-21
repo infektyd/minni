@@ -60,8 +60,6 @@ def vault_for(agent: str) -> Path:
         return Path("~/.sovereign-memory/codex-vault").expanduser()
     if agent in {"claude", "claude-code"}:
         return Path("~/.sovereign-memory/claudecode-vault").expanduser()
-    if agent == "gemini":
-        return Path("~/.gemini/sovereign-vault").expanduser()
     return Path(f"~/.sovereign-memory/{agent}-vault").expanduser()
 
 
