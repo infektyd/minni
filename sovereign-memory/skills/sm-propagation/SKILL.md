@@ -59,7 +59,14 @@ system/developer instructions, safety policy, and active user request.
    - KiloCode vault default: `~/.sovereign-memory/kilocode-vault`.
    - Gemini vault default: `~/.sovereign-memory/gemini-vault`.
    - Grok beta vault default: `~/.sovereign-memory/grok-beta-vault` (legacy full package path, if still referenced).
-   - Grok Build: `~/.sovereign-memory/grok-build-vault`; the Grok-specific session hook integration lives at `~/.grok/plugins/grok-sovereign-memory/` (sourced from this repo under `plugins/grok-sovereign-memory/`) using the canonical `~/.agents/bin/mcp-env-run` wrapper + grok-build identity (seeded via sm-propagation). See the Grok integration under `plugins/grok-sovereign-memory/` and the canonical SKILL for delivery details.
+   - Grok Build: `~/.sovereign-memory/grok-build-vault`; the Grok-specific session hook integration lives at `~/.grok/plugins/grok-sovereign-memory/` (sourced from this repo under `plugins/grok-sovereign-memory/`) using the canonical `~/.agents/bin/mcp-env-run` wrapper + grok-build identity (seeded via sm-propagation). 
+
+     The integration wires four lifecycle events:
+     - SessionStart: injects sovereign status + Layer 1 reminder
+     - UserPromptSubmit: detects native `/flush`, `/compact`, and `/dream` commands, auto-drafts prepare_outcome candidates to the inbox, and prompts the agent to run `sovereign_prepare_outcome`
+     - PreCompact / Stop: captures scar tissue and session outcomes for review
+
+     See `plugins/grok-sovereign-memory/` and the Grok SKILL for exact hook behavior and injection text.
    - New/unknown agents default to `~/.sovereign-memory/<agent-id>-vault`.
    - The vault must be an actual directory owned by that agent surface, not a
      symlink and not a copy of another agent's vault. If an agent was pointed at
@@ -133,7 +140,7 @@ python3 ~/.codex/skills/sm-propagation/scripts/propagate.py update-plugin --plat
 python3 ~/.codex/skills/sm-propagation/scripts/propagate.py update-plugin --platform kilocode
 python3 ~/.codex/skills/sm-propagation/scripts/propagate.py update-plugin --platform gemini
 python3 ~/.codex/skills/sm-propagation/scripts/propagate.py update-plugin --platform grok-beta
-python3 ~/.codex/skills/sm-propagation/scripts/propagate.py update-plugin --platform grok-build   # Grok Build hook integration (grok-sovereign-memory surface + mcp-env-run + grok-build id; no full plugin copy)
+python3 ~/.codex/skills/sm-propagation/scripts/propagate.py update-plugin --platform grok-build   # Grok Build session hook integration (supports /flush /compact /dream via UserPromptSubmit + scar drafting on PreCompact/Stop)
 python3 ~/.codex/skills/sm-propagation/scripts/propagate.py update-plugin --platform all
 ```
 

@@ -288,7 +288,7 @@ def update_one_plugin(platform: str, args: argparse.Namespace) -> dict[str, obje
 
     if canonical_platform(platform) == "grok-build":
         # Grok Build uses its own session-hook integration surface (plugins/grok-sovereign-memory/ in this repo).
-        # The hooks (SessionStart / UserPromptSubmit / PreCompact / Stop) deliver Layer 1 + Layer 2 context.
+        # UserPromptSubmit intercepts /flush, /compact, and /dream (plus scar drafting on PreCompact/Stop).
         # Do not copy the full sovereign plugin tree; just ensure the per-agent vault + .mcp.json stamp.
         install_root.mkdir(parents=True, exist_ok=True)
     else:
