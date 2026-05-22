@@ -177,13 +177,13 @@ try {
     }
     output.systemMessage = msg;
   } else if (event === 'UserPromptSubmit') {
-    // Automatic trigger for native /flush & compaction paths (zero-reminder).
+    // Automatic trigger for native /flush, /compact, and /dream (including when written as ". /compact" etc.).
     // Smallest addition per DESIGN: detect keywords in prompt, draft prepare_outcome-style candidate to inbox,
     // inject contract context so model (with SKILL) does the sovereign reflex.
     const prompt = (payload.prompt || payload.userPrompt || payload.input || payload.text || '').toString();
-    const match = prompt.match(/\/(flush|compact|dream)\b/i);
+    const match = prompt.match(/(?:^|[\s.])\/(flush|compact|dream)\b/i);
     if (match) {
-      const matched = match[0];
+      const matched = '/' + match[1]; // normalize to clean /command even if prompt had ". /xxx"
       const kind = 'flush-trigger';
       // GUARD (preservation contract): This entire block is the ONLY path that may draft flush-trigger artifacts or emit flush-specific systemMessages.
       // Distill logic lives strictly in the !match block below. Never merge or reorder without updating SKILL "Relationship" + tests.
