@@ -50,8 +50,8 @@ system/developer instructions, safety policy, and active user request.
      installed plugin CLI with the canonical socket:
      `SOVEREIGN_SOCKET_PATH=~/.sovereign-memory/run/sovrd.sock node ~/.codex/plugins/cache/sovereign-memory/sovereign-memory/0.1.0/dist/cli.js status`
    - Verify the daemon sees the active Sovereign Memory DB before changing
-     paths. On this machine the healthy baseline is non-empty, currently about
-     295 docs, 714 chunks, 1,263 learnings, and FAISS healthy.
+     paths. A healthy baseline typically shows several hundred documents, hundreds
+     of chunks, and over a thousand learnings with FAISS healthy.
 
 2. **Resolve paths**
    - Codex vault default: `~/.sovereign-memory/codex-vault`.
@@ -80,8 +80,7 @@ system/developer instructions, safety policy, and active user request.
    - Confirm daemon socket: `~/.sovereign-memory/run/sovrd.sock`.
    - Confirm the active DB: `~/.sovereign-memory/sovereign_memory.db`.
      The source repo must not be treated as the vault or database root.
-   - Do not assume `~/.openclaw` is available locally. It is intentionally in
-     cryo/off-machine Mac mini remote storage because it was about 20 GB.
+   - Do not assume large external directories (e.g. `~/.openclaw`) are available locally. Some users keep them in off-machine or cryo storage.
 
 3. **Write recallable vault pages**
    - Use vault API/CLI, not raw manual edits, so `index.md` and `log.md` update.
@@ -119,14 +118,14 @@ Use this before asking an agent on another platform to rely on Sovereign Memory
 after a code, path, socket, vault, or hook change. The update must refresh both
 functionality and configuration:
 
-1. Build from the canonical repo: `/Users/hansaxelsson/Projects/sovereignMemory`.
+1. Build from the canonical repo (example): `~/Projects/sovereignMemory`.
 2. Copy the current plugin package to the platform's installed plugin/cache
    location.
 3. Stamp the platform MCP config with explicit env:
    - `SOVEREIGN_AGENT_ID`
    - `SOVEREIGN_VAULT_PATH`
    - `SOVEREIGN_SOCKET_PATH=~/.sovereign-memory/run/sovrd.sock`
-   - `SOVEREIGN_WORKSPACE_ID=/Users/hansaxelsson/Projects/sovereignMemory`
+   - `SOVEREIGN_WORKSPACE_ID=~/Projects/sovereignMemory` (example)
 4. Bootstrap only an empty actual vault tree for that agent if missing.
 5. Never copy `wiki/`, `logs/`, `inbox/`, `index.md`, or `log.md` from another
    agent.
@@ -182,8 +181,8 @@ Common commands:
 ```bash
 python ~/.codex/skills/sm-propagation/scripts/propagate.py status --agent codex
 python ~/.codex/skills/sm-propagation/scripts/propagate.py update-plugin --platform codex
-python ~/.codex/skills/sm-propagation/scripts/propagate.py seed-hosted --agent codex --workspace /Users/hansaxelsson/Projects/sovereignMemory
-python ~/.codex/skills/sm-propagation/scripts/propagate.py verify --agent codex --workspace /Users/hansaxelsson/Projects/sovereignMemory
+python ~/.codex/skills/sm-propagation/scripts/propagate.py seed-hosted --agent codex --workspace ~/Projects/sovereignMemory
+python ~/.codex/skills/sm-propagation/scripts/propagate.py verify --agent codex --workspace ~/Projects/sovereignMemory
 ```
 
 The script may create/update local identity source files and DB identity rows.

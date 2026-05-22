@@ -27,7 +27,7 @@ DEFAULT_PLUGIN_CLI = Path(
     "~/.codex/plugins/cache/sovereign-memory/sovereign-memory/0.1.0/dist/cli.js"
 ).expanduser()
 DEFAULT_IDENTITY_ROOT = Path("~/.sovereign-memory/identities").expanduser()
-DEFAULT_REPO_ROOT = Path("/Users/hansaxelsson/Projects/sovereignMemory")
+DEFAULT_REPO_ROOT = Path.home() / "Projects" / "sovereignMemory"
 
 
 PLATFORM_ALIASES = {
@@ -47,7 +47,7 @@ def canonical_platform(platform: str) -> str:
 
 
 def repo_engine(workspace: str | None) -> Path:
-    default = Path("/Users/hansaxelsson/Projects/sovereignMemory/engine")
+    default = Path.home() / "Projects" / "sovereignMemory" / "engine"
     if default.exists():
         return default
     if workspace:
