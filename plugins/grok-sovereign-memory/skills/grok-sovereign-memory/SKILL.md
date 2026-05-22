@@ -1,11 +1,11 @@
 ---
 name: sovereign-memory
-description: Thin Grok Build hybrid integration overlay. Extends the canonical ~/.agents/skills/sovereign-memory/SKILL.md with native Grok memory, /flush participation, and TUI-specific delivery details. Load the canonical skill for the full mental model, reflexes, and ritual.
+description: Grok Build session hook integration and TUI-specific delivery for Sovereign Memory. Extends the canonical ~/.agents/skills/sovereign-memory/SKILL.md with native Grok memory, /flush participation, and lifecycle hook delivery. Load the canonical skill for the full mental model, reflexes, and ritual.
 ---
 
 # Sovereign Memory — Grok Build Hybrid Integration
 
-**This is a thin overlay only.**
+**This file contains only the Grok Build TUI-specific integration details.**
 
 The authoritative, portable Sovereign Memory behaviors (Core Mental Model, prepare_task as default reflex, prepare_outcome discipline, Sovereign Distill Ritual V1 with gauges, team coordination, cross-agent contracts, Layer 1 contract, etc.) now live in the canonical skill:
 
@@ -39,7 +39,7 @@ Hold the full map. Don't let lexical anchoring on the substring "sovereign-memor
 
 ## Grok TUI Lifecycle Participation (Zero-Reminder, Because the TUI Keeps Dying on Us)
 
-This thin plugin hooks into the actual Grok Build lifecycle so you don't have to remember the ritual every single time the pager decides to commit suicide:
+The session hooks in this integration participate in the Grok Build lifecycle so you don't have to remember the ritual every single time the TUI restarts or crashes:
 
 - `hooks/hooks.json` + the tiny `bin/grok-sovereign-hook.js` (pure stdlib, no drama)
 - Events we actually care about: `SessionStart`, `UserPromptSubmit`, `PreCompact`, `Stop`
@@ -98,10 +98,10 @@ Your vault at `~/.sovereign-memory/grok-build-vault/` ...
 
 ## Gotchas & Safety, Quick Commands & Governance UI, Maintenance of This Plugin
 
-- (short pointers only; "this plugin is intentionally thin"; "do not edit the shared sovereign source unless you're contributing a proper .grok-plugin/ surface upstream"; "When the old broken `~/.grok/plugins/sovereign-memory/` is deleted, this becomes the only sovereign surface for Grok.")
+- (short pointers only; this is the Grok-specific hook integration surface; do not edit the shared sovereign source unless you're contributing to the canonical plugin; the old full-plugin attempt under `~/.grok/plugins/sovereign-memory/` has been superseded by this hooks-based delivery.)
 
 ---
 
 **Installed for Grok Build 2026-05-19. Agent: grok-build. Use the canonical skill before you guess.**
 
-(End of thin overlay — all rich portable behaviors are in `~/.agents/skills/sovereign-memory/SKILL.md` + ritual package.)
+(End of Grok Build hook integration surface — all rich portable behaviors are in `~/.agents/skills/sovereign-memory/SKILL.md` + ritual package.)

@@ -24,7 +24,7 @@ Use this when the user asks to:
 - propagate memory, pseudoenv, workspace envelope, identity, or Layer 1
 - update or repair the Sovereign Memory plugin/MCP install for a platform
 - repair hydration, recall, daemon read, socket, per-agent vault, plugin cache, or MCP drift
-- make Codex/Claude/Gemini/Grok beta/Grok Build (thin)/Antigravity use Sovereign Memory more smoothly
+- make Codex/Claude/Gemini/Grok beta/Grok Build/Antigravity use Sovereign Memory more smoothly via their native session hook surfaces
 - seed Hermes/OpenClaw/local-worker identity or soul files
 
 Do not use this for ordinary recall-only context lookup. Use `sovereign-memory`
@@ -59,7 +59,7 @@ system/developer instructions, safety policy, and active user request.
    - KiloCode vault default: `~/.sovereign-memory/kilocode-vault`.
    - Gemini vault default: `~/.sovereign-memory/gemini-vault`.
    - Grok beta vault default: `~/.sovereign-memory/grok-beta-vault` (legacy full package path, if still referenced).
-   - Grok Build (thin TUI adapter): `~/.sovereign-memory/grok-build-vault`; thin overlay lives at `~/.grok/plugins/grok-sovereign-memory/` using canonical `~/.agents/bin/mcp-env-run` wrapper + grok-build identity (seeded via sm-propagation). See canonical `~/.agents/skills/sovereign-memory/SKILL.md` + `DESIGN-sovereign-delivery-layer.md` for the thin adapter contract.
+   - Grok Build: `~/.sovereign-memory/grok-build-vault`; the Grok-specific session hook integration lives at `~/.grok/plugins/grok-sovereign-memory/` (sourced from this repo under `plugins/grok-sovereign-memory/`) using the canonical `~/.agents/bin/mcp-env-run` wrapper + grok-build identity (seeded via sm-propagation). See the Grok integration under `plugins/grok-sovereign-memory/` and the canonical SKILL for delivery details.
    - New/unknown agents default to `~/.sovereign-memory/<agent-id>-vault`.
    - The vault must be an actual directory owned by that agent surface, not a
      symlink and not a copy of another agent's vault. If an agent was pointed at
@@ -133,7 +133,7 @@ python3 ~/.codex/skills/sm-propagation/scripts/propagate.py update-plugin --plat
 python3 ~/.codex/skills/sm-propagation/scripts/propagate.py update-plugin --platform kilocode
 python3 ~/.codex/skills/sm-propagation/scripts/propagate.py update-plugin --platform gemini
 python3 ~/.codex/skills/sm-propagation/scripts/propagate.py update-plugin --platform grok-beta
-python3 ~/.codex/skills/sm-propagation/scripts/propagate.py update-plugin --platform grok-build   # thin adapter (grok-sovereign-memory + mcp-env-run + grok-build id; no full plugin copy)
+python3 ~/.codex/skills/sm-propagation/scripts/propagate.py update-plugin --platform grok-build   # Grok Build hook integration (grok-sovereign-memory surface + mcp-env-run + grok-build id; no full plugin copy)
 python3 ~/.codex/skills/sm-propagation/scripts/propagate.py update-plugin --platform all
 ```
 

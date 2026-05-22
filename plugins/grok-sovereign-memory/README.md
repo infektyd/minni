@@ -1,6 +1,6 @@
-# grok-sovereign-memory — Thin Grok Build Delivery Adapter
+# grok-sovereign-memory — Grok Build Session Hook Integration
 
-Thin Grok delivery adapter for the canonical Sovereign Memory Delivery Layer.
+Grok Build session hook delivery surface for the canonical Sovereign Memory Delivery Layer.
 
 See:
 - `~/.agents/skills/sovereign-memory/SKILL.md` (the rich portable mental model, reflexes, ritual, Layer 1 contract, team patterns, etc.)
