@@ -11,9 +11,9 @@
  * so Grok's runner can inject it as additional context.
  */
 
-import fs from 'node:fs';
-import path from 'node:path';
-import os from 'node:os';
+const fs = require('node:fs');
+const path = require('node:path');
+const os = require('node:os');
 
 const HOME = os.homedir();
 const VAULT = process.env.SOVEREIGN_VAULT_PATH || path.join(HOME, '.sovereign-memory/grok-build-vault');
@@ -201,7 +201,7 @@ try {
           `Full prompt context lives in the native Grok session transcript (~/.grok/sessions/...).`,
           `Time: ${new Date().toISOString()}`,
           '',
-          'Hook drafted prepare_outcome-style candidate to inbox (per thin stdlib pattern).',
+          'Hook drafted prepare_outcome-style candidate to inbox (per stdlib hook pattern).',
           'Per SKILL contract (grok-sovereign-memory): sovereign_prepare_outcome is the default durable reflex.',
           'Review this + any model follow-up candidates via sovereign tools / Obsidian / console.',
           'Native flush still runs (hybrid: operational + proposal-grade).'
