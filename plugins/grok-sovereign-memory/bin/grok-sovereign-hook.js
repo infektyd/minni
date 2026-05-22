@@ -230,23 +230,31 @@ try {
       }
     }
   } else if (event === 'PreCompact' || event === 'Stop') {
-    // Draft scar tissue / key outcomes to inbox (never auto-learn). Enhanced with payload for flush/compaction context.
+    // Draft scar tissue / key outcomes to inbox (never auto-learn).
+    // SECURITY: Do not embed raw payload text (trigger/summary/last_user_message) because it can contain
+    // secrets, file paths, or other sensitive material. This mirrors the policy already applied in the
+    // UserPromptSubmit /flush/compact/dream path. We only record that context existed and point to the
+    // native Grok session transcript for the real details.
     const kind = event === 'PreCompact' ? 'scar-tissue' : 'stop-summary';
-    const transcript = (payload.trigger || payload.summary || payload.last_user_message || '').toString().slice(0, 300);
     const summary = [
       `Event: ${event}`,
       `Time: ${new Date().toISOString()}`,
-      transcript ? `Context from payload: ${transcript}` : '',
+      'Payload context was present but redacted for privacy (secrets/paths).',
+      'Review the full native Grok session transcript for details (~/.grok/sessions/...).',
       '',
       'Recent log tail (scar tissue / decisions to review):',
       recentLogSnippet(12) || '(no recent log entries captured)',
       '',
       'Action for human: review this draft, promote strong items via sovereign_resolve_candidate or manual vault write, redact as needed.',
       'See DESIGN-flush-integration.md: this participates in /flush+compaction flow.'
-    ].filter(Boolean).join('\n');
+    ].join('\n');
 
     const file = writeDraftToInbox(kind, summary);
-    output.systemMessage = `Sovereign Memory: drafted ${kind} to ${path.basename(file || 'N/A')} (inbox). Review before end of session.`;
+    if (file) {
+      output.systemMessage = `Sovereign Memory: drafted ${kind} to ${path.basename(file)} (inbox). Review before end of session.`;
+    } else {
+      output.systemMessage = `Sovereign Memory: failed to draft ${kind} to inbox (write error logged to stderr). Review the native session transcript instead.`;
+    }
   }
 } catch (e) {
   // Top-level fail-open guarantee for all new + existing paths (bug fix for write robustness).
