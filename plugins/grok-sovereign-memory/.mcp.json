@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "sovereign-memory": {
+      "command": "node",
+      "args": [
+        "~/.agents/bin/mcp-env-run",
+        "sovereign-memory"
+      ],
+      "env": {
+        "SOVEREIGN_AGENT_ID": "grok-build",
+        "SOVEREIGN_VAULT_PATH": "~/.sovereign-memory/grok-build-vault",
+        "SOVEREIGN_SOCKET_PATH": "~/.sovereign-memory/run/sovrd.sock",
+        "SOVEREIGN_WORKSPACE_ID": "~/Projects/sovereignMemory"
+      }
+    }
+  }
+}

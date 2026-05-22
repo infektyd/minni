@@ -24,7 +24,7 @@ Use this when the user asks to:
 - propagate memory, pseudoenv, workspace envelope, identity, or Layer 1
 - update or repair the Sovereign Memory plugin/MCP install for a platform
 - repair hydration, recall, daemon read, socket, per-agent vault, plugin cache, or MCP drift
-- make Codex/Claude/Gemini/Grok beta/Grok Build (thin)/Antigravity use Sovereign Memory more smoothly
+- make Codex/Claude/Gemini/Grok beta/Grok Build/Antigravity use Sovereign Memory more smoothly via their native session hook surfaces
 - seed Hermes/OpenClaw/local-worker identity or soul files
 
 Do not use this for ordinary recall-only context lookup. Use `sovereign-memory`
@@ -50,8 +50,8 @@ system/developer instructions, safety policy, and active user request.
      installed plugin CLI with the canonical socket:
      `SOVEREIGN_SOCKET_PATH=~/.sovereign-memory/run/sovrd.sock node ~/.codex/plugins/cache/sovereign-memory/sovereign-memory/0.1.0/dist/cli.js status`
    - Verify the daemon sees the active Sovereign Memory DB before changing
-     paths. On this machine the healthy baseline is non-empty, currently about
-     295 docs, 714 chunks, 1,263 learnings, and FAISS healthy.
+     paths. A healthy baseline typically shows several hundred documents, hundreds
+     of chunks, and over a thousand learnings with FAISS healthy.
 
 2. **Resolve paths**
    - Codex vault default: `~/.sovereign-memory/codex-vault`.
@@ -59,7 +59,14 @@ system/developer instructions, safety policy, and active user request.
    - KiloCode vault default: `~/.sovereign-memory/kilocode-vault`.
    - Gemini vault default: `~/.sovereign-memory/gemini-vault`.
    - Grok beta vault default: `~/.sovereign-memory/grok-beta-vault` (legacy full package path, if still referenced).
-   - Grok Build (thin TUI adapter): `~/.sovereign-memory/grok-build-vault`; thin overlay lives at `~/.grok/plugins/grok-sovereign-memory/` using canonical `~/.agents/bin/mcp-env-run` wrapper + grok-build identity (seeded via sm-propagation). See canonical `~/.agents/skills/sovereign-memory/SKILL.md` + `DESIGN-sovereign-delivery-layer.md` for the thin adapter contract.
+   - Grok Build: `~/.sovereign-memory/grok-build-vault`; the Grok-specific session hook integration lives at `~/.grok/plugins/grok-sovereign-memory/` (sourced from this repo under `plugins/grok-sovereign-memory/`) using the canonical `~/.agents/bin/mcp-env-run` wrapper + grok-build identity (seeded via sm-propagation). 
+
+     The integration wires four lifecycle events:
+     - SessionStart: injects sovereign status + Layer 1 reminder
+     - UserPromptSubmit: detects native `/flush`, `/compact`, and `/dream` commands, auto-drafts prepare_outcome candidates to the inbox, and prompts the agent to run `sovereign_prepare_outcome`
+     - PreCompact / Stop: captures scar tissue and session outcomes for review
+
+     See `plugins/grok-sovereign-memory/` and the Grok SKILL for exact hook behavior and injection text.
    - New/unknown agents default to `~/.sovereign-memory/<agent-id>-vault`.
    - The vault must be an actual directory owned by that agent surface, not a
      symlink and not a copy of another agent's vault. If an agent was pointed at
@@ -73,8 +80,7 @@ system/developer instructions, safety policy, and active user request.
    - Confirm daemon socket: `~/.sovereign-memory/run/sovrd.sock`.
    - Confirm the active DB: `~/.sovereign-memory/sovereign_memory.db`.
      The source repo must not be treated as the vault or database root.
-   - Do not assume `~/.openclaw` is available locally. It is intentionally in
-     cryo/off-machine Mac mini remote storage because it was about 20 GB.
+   - Do not assume large external directories (e.g. `~/.openclaw`) are available locally. Some users keep them in off-machine or cryo storage.
 
 3. **Write recallable vault pages**
    - Use vault API/CLI, not raw manual edits, so `index.md` and `log.md` update.
@@ -112,14 +118,14 @@ Use this before asking an agent on another platform to rely on Sovereign Memory
 after a code, path, socket, vault, or hook change. The update must refresh both
 functionality and configuration:
 
-1. Build from the canonical repo: `/Users/hansaxelsson/Projects/sovereignMemory`.
+1. Build from the canonical repo (example): `~/Projects/sovereignMemory`.
 2. Copy the current plugin package to the platform's installed plugin/cache
    location.
 3. Stamp the platform MCP config with explicit env:
    - `SOVEREIGN_AGENT_ID`
    - `SOVEREIGN_VAULT_PATH`
    - `SOVEREIGN_SOCKET_PATH=~/.sovereign-memory/run/sovrd.sock`
-   - `SOVEREIGN_WORKSPACE_ID=/Users/hansaxelsson/Projects/sovereignMemory`
+   - `SOVEREIGN_WORKSPACE_ID=~/Projects/sovereignMemory` (example)
 4. Bootstrap only an empty actual vault tree for that agent if missing.
 5. Never copy `wiki/`, `logs/`, `inbox/`, `index.md`, or `log.md` from another
    agent.
@@ -133,7 +139,7 @@ python3 ~/.codex/skills/sm-propagation/scripts/propagate.py update-plugin --plat
 python3 ~/.codex/skills/sm-propagation/scripts/propagate.py update-plugin --platform kilocode
 python3 ~/.codex/skills/sm-propagation/scripts/propagate.py update-plugin --platform gemini
 python3 ~/.codex/skills/sm-propagation/scripts/propagate.py update-plugin --platform grok-beta
-python3 ~/.codex/skills/sm-propagation/scripts/propagate.py update-plugin --platform grok-build   # thin adapter (grok-sovereign-memory + mcp-env-run + grok-build id; no full plugin copy)
+python3 ~/.codex/skills/sm-propagation/scripts/propagate.py update-plugin --platform grok-build   # Grok Build session hook integration (supports /flush /compact /dream via UserPromptSubmit + scar drafting on PreCompact/Stop)
 python3 ~/.codex/skills/sm-propagation/scripts/propagate.py update-plugin --platform all
 ```
 
@@ -175,8 +181,8 @@ Common commands:
 ```bash
 python ~/.codex/skills/sm-propagation/scripts/propagate.py status --agent codex
 python ~/.codex/skills/sm-propagation/scripts/propagate.py update-plugin --platform codex
-python ~/.codex/skills/sm-propagation/scripts/propagate.py seed-hosted --agent codex --workspace /Users/hansaxelsson/Projects/sovereignMemory
-python ~/.codex/skills/sm-propagation/scripts/propagate.py verify --agent codex --workspace /Users/hansaxelsson/Projects/sovereignMemory
+python ~/.codex/skills/sm-propagation/scripts/propagate.py seed-hosted --agent codex --workspace ~/Projects/sovereignMemory
+python ~/.codex/skills/sm-propagation/scripts/propagate.py verify --agent codex --workspace ~/Projects/sovereignMemory
 ```
 
 The script may create/update local identity source files and DB identity rows.

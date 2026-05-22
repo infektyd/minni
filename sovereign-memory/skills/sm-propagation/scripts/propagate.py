@@ -27,7 +27,7 @@ DEFAULT_PLUGIN_CLI = Path(
     "~/.codex/plugins/cache/sovereign-memory/sovereign-memory/0.1.0/dist/cli.js"
 ).expanduser()
 DEFAULT_IDENTITY_ROOT = Path("~/.sovereign-memory/identities").expanduser()
-DEFAULT_REPO_ROOT = Path("/Users/hansaxelsson/Projects/sovereignMemory")
+DEFAULT_REPO_ROOT = Path.home() / "Projects" / "sovereignMemory"
 
 
 PLATFORM_ALIASES = {
@@ -47,7 +47,7 @@ def canonical_platform(platform: str) -> str:
 
 
 def repo_engine(workspace: str | None) -> Path:
-    default = Path("/Users/hansaxelsson/Projects/sovereignMemory/engine")
+    default = Path.home() / "Projects" / "sovereignMemory" / "engine"
     if default.exists():
         return default
     if workspace:
@@ -255,7 +255,7 @@ def platform_spec(platform: str, repo_root: Path, install_root: str | None = Non
             "agent": "grok-build",
             "install": home / ".grok/plugins/grok-sovereign-memory",
             "config": home / ".grok/config.toml",
-            "config_kind": "mcp-json-only",  # uses ~/.agents/bin/mcp-env-run wrapper + pre-stamped .mcp.json; thin adapter (no full sovereign plugin copy)
+            "config_kind": "mcp-json-only",  # uses ~/.agents/bin/mcp-env-run wrapper + .mcp.json; Grok Build hook integration (no full sovereign plugin copy)
         },
     }
     if platform == "generic":
@@ -287,8 +287,9 @@ def update_one_plugin(platform: str, args: argparse.Namespace) -> dict[str, obje
     bootstrap_vault(bootstrap_args)
 
     if canonical_platform(platform) == "grok-build":
-        # Thin adapter case: the grok-sovereign-memory/ dir is the manually-maintained thin overlay (SKILL, hooks, .mcp.json via mcp-env-run).
-        # Do not copy the full sovereign plugin tree; just ensure vault + .mcp.json stamp (already done below).
+        # Grok Build uses its own session-hook integration surface (plugins/grok-sovereign-memory/ in this repo).
+        # UserPromptSubmit intercepts /flush, /compact, and /dream (plus scar drafting on PreCompact/Stop).
+        # Do not copy the full sovereign plugin tree; just ensure the per-agent vault + .mcp.json stamp.
         install_root.mkdir(parents=True, exist_ok=True)
     else:
         copy_tree(source, install_root)
