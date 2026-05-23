@@ -2577,14 +2577,10 @@ async def _dispatch(request: dict) -> dict:
     if handler is None:
         return _make_error(-32601, f"Method not found: {method_name}",
                            request_id)
-    if method_name in ("search", "learn"):
-        # RCM-006: offload CPU-bound retrieval (encode + cross-encoder predict + possible FAISS) to worker thread.
-        # Keeps event loop responsive for concurrent clients (e.g. one client awaits handoff while another recalls).
-        result = await asyncio.to_thread(handler, params, request_id)
+    if asyncio.iscoroutinefunction(handler):
+        result = await handler(params, request_id)
     else:
-        result = handler(params, request_id)
-        if asyncio.iscoroutine(result):
-            result = await result
+        result = await asyncio.to_thread(handler, params, request_id)
     return result
 
 
