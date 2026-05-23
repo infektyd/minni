@@ -21,6 +21,7 @@ Authentication (SEC-001 temporary local-capability scheme):
 """
 
 import argparse
+import functools
 import hashlib
 import json
 import os
@@ -32,7 +33,7 @@ import threading
 import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse
 
 # Add sovereign-memory engine to path
 ENGINE_PATH = os.path.expanduser("~/.openclaw/sovereign-memory-v3.1")
@@ -186,6 +187,7 @@ def get_agent(agent_id: str = "hermes") -> "SovereignAgent":
     return _agent_instances[agent_id]
 
 
+@functools.lru_cache(maxsize=10000)
 def _content_hash(text: str) -> str:
     """SHA-256 hash of normalized text for dedup."""
     normalized = " ".join(text.lower().split())
@@ -254,7 +256,7 @@ def _is_duplicate(agent_id: str, content_hash: str, content: str = "") -> bool:
                 "SELECT content FROM learnings WHERE agent_id = ? AND superseded_by IS NULL",
                 (agent_id,)
             )
-            for row in c.fetchall():
+            for row in c:
                 if _content_hash(row["content"]) == content_hash:
                     conn.close()
                     return True
