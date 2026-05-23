@@ -1,0 +1,13 @@
+<svg width="140" height="140" viewBox="0 0 140 140" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="HA monogram roundel">
+  <circle cx="70" cy="70" r="62" fill="#242320" stroke="#C9A961" stroke-width="4"/>
+  <g transform="translate(70 70) scale(0.72) translate(-60 -70)">
+    <g fill="none" stroke="#F4F1EA" stroke-width="7" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M40 22 V118"/>
+      <path d="M80 22 V118"/>
+      <path d="M60 24 L43 72"/>
+      <path d="M60 24 L77 72"/>
+      <path d="M40 72 H80"/>
+    </g>
+    <rect x="55.5" y="19.5" width="9" height="9" transform="rotate(45 60 24)" fill="#C9A961"/>
+  </g>
+</svg>

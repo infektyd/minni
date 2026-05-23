@@ -1,0 +1,67 @@
+<svg width="1280" height="540" viewBox="0 0 1280 540" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Component status by tier — stable, beta, alpha">
+  <rect width="1280" height="540" fill="#161512"></rect>
+  <text x="60" y="46" font-family="&#39;Inter&#39;, system-ui, -apple-system, &#39;Segoe UI&#39;, sans-serif" font-size="22" font-weight="680" fill="#F4F1EA" letter-spacing="-0.3">Component status by tier.</text>
+  <text x="60" y="66" font-family="&#39;IBM Plex Mono&#39;, ui-monospace, Menlo, monospace" font-size="11" fill="#a8a294">pre-v1 is uneven by nature  ·  each tier gets equal column real estate, the distribution is honest</text>
+  
+  <rect x="60" y="80" width="400" height="420" fill="#1f1e1a" stroke="#3a382f"></rect>
+  <rect x="60" y="80" width="400" height="56" fill="#1f3a32"></rect>
+  <line x1="60" y1="136" x2="460" y2="136" stroke="#3a382f"></line>
+  <circle cx="78" cy="102" r="5" fill="#4ea890"></circle>
+  <text x="92" y="106" font-family="&#39;IBM Plex Mono&#39;, ui-monospace, Menlo, monospace" font-size="11" font-weight="700" letter-spacing="1.4" fill="#7cc4ad">STABLE</text>
+  <text x="442" y="108" text-anchor="end" font-family="&#39;IBM Plex Mono&#39;, ui-monospace, Menlo, monospace" font-size="14" font-weight="700" fill="#7cc4ad">03</text>
+  <text x="78" y="126" font-family="&#39;IBM Plex Mono&#39;, ui-monospace, Menlo, monospace" font-size="9.5" fill="#7cc4ad" opacity="0.85">tested, relied upon  ·  breaking changes require migration</text>
+  
+  <text x="76" y="160" font-family="&#39;Inter&#39;, system-ui, -apple-system, &#39;Segoe UI&#39;, sans-serif" font-size="13" font-weight="680" fill="#F4F1EA">SQLite + storage runtime</text>
+  <text x="76" y="178" font-family="&#39;IBM Plex Mono&#39;, ui-monospace, Menlo, monospace" font-size="10" fill="#cfc9ba">333 tests · schema + WAL · FTS5 · additive migrations · hygiene</text>
+  <line x1="76" y1="190" x2="444" y2="190" stroke="#3a382f" stroke-width="0.5"></line>
+  <text x="76" y="212" font-family="&#39;Inter&#39;, system-ui, -apple-system, &#39;Segoe UI&#39;, sans-serif" font-size="13" font-weight="680" fill="#F4F1EA">Local-first governance</text>
+  <text x="76" y="230" font-family="&#39;IBM Plex Mono&#39;, ui-monospace, Menlo, monospace" font-size="10" fill="#cfc9ba">docs/contracts/ · POLICY · THREAT_MODEL · AGENT · VAULT · …</text>
+  <line x1="76" y1="242" x2="444" y2="242" stroke="#3a382f" stroke-width="0.5"></line>
+  <text x="76" y="264" font-family="&#39;Inter&#39;, system-ui, -apple-system, &#39;Segoe UI&#39;, sans-serif" font-size="13" font-weight="680" fill="#F4F1EA">Test + verification harness</text>
+  <text x="76" y="282" font-family="&#39;IBM Plex Mono&#39;, ui-monospace, Menlo, monospace" font-size="10" fill="#cfc9ba">454 passing · pytest + node --test · release smoke gates</text>
+  <rect x="474" y="80" width="400" height="420" fill="#1f1e1a" stroke="#3a382f"></rect>
+  <rect x="474" y="80" width="400" height="56" fill="#1f303e"></rect>
+  <line x1="474" y1="136" x2="874" y2="136" stroke="#3a382f"></line>
+  <circle cx="492" cy="102" r="5" fill="#6b96bd"></circle>
+  <text x="506" y="106" font-family="&#39;IBM Plex Mono&#39;, ui-monospace, Menlo, monospace" font-size="11" font-weight="700" letter-spacing="1.4" fill="#6b96bd">BETA</text>
+  <text x="856" y="108" text-anchor="end" font-family="&#39;IBM Plex Mono&#39;, ui-monospace, Menlo, monospace" font-size="14" font-weight="700" fill="#6b96bd">07</text>
+  <text x="492" y="126" font-family="&#39;IBM Plex Mono&#39;, ui-monospace, Menlo, monospace" font-size="9.5" fill="#6b96bd" opacity="0.85">works and is tested  ·  API or behavior may shift before v1</text>
+  
+  <text x="490" y="160" font-family="&#39;Inter&#39;, system-ui, -apple-system, &#39;Segoe UI&#39;, sans-serif" font-size="13" font-weight="680" fill="#F4F1EA">MCP plugin server</text>
+  <text x="490" y="178" font-family="&#39;IBM Plex Mono&#39;, ui-monospace, Menlo, monospace" font-size="10" fill="#cfc9ba">26 tools across 6 categories · 121 tests · any MCP runtime</text>
+  <line x1="490" y1="190" x2="858" y2="190" stroke="#3a382f" stroke-width="0.5"></line>
+  <text x="490" y="212" font-family="&#39;Inter&#39;, system-ui, -apple-system, &#39;Segoe UI&#39;, sans-serif" font-size="13" font-weight="680" fill="#F4F1EA">Hybrid retrieval</text>
+  <text x="490" y="230" font-family="&#39;IBM Plex Mono&#39;, ui-monospace, Menlo, monospace" font-size="10" fill="#cfc9ba">FTS5 + FAISS + RRF + rerank · HyDE · token-budget read gates</text>
+  <line x1="490" y1="242" x2="858" y2="242" stroke="#3a382f" stroke-width="0.5"></line>
+  <text x="490" y="264" font-family="&#39;Inter&#39;, system-ui, -apple-system, &#39;Segoe UI&#39;, sans-serif" font-size="13" font-weight="680" fill="#F4F1EA">Proposal-first learning</text>
+  <text x="490" y="282" font-family="&#39;IBM Plex Mono&#39;, ui-monospace, Menlo, monospace" font-size="10" fill="#cfc9ba">stage → list → resolve · operator-gated · no silent writes</text>
+  <line x1="490" y1="294" x2="858" y2="294" stroke="#3a382f" stroke-width="0.5"></line>
+  <text x="490" y="316" font-family="&#39;Inter&#39;, system-ui, -apple-system, &#39;Segoe UI&#39;, sans-serif" font-size="13" font-weight="680" fill="#F4F1EA">Identity + read policy</text>
+  <text x="490" y="334" font-family="&#39;IBM Plex Mono&#39;, ui-monospace, Menlo, monospace" font-size="10" fill="#cfc9ba">EffectivePrincipal · vault roots · centralized read gate</text>
+  <rect x="474" y="468" width="400" height="32" fill="#272620"></rect>
+  <line x1="474" y1="468" x2="874" y2="468" stroke="#3a382f"></line>
+  <text x="490" y="487" font-family="&#39;IBM Plex Mono&#39;, ui-monospace, Menlo, monospace" font-size="10.5" fill="#cfc9ba">+ 3 more  ·  Vault + handoff  ·  Multi-agent propagation  ·  Cross-vault search</text>
+  <rect x="888" y="80" width="400" height="420" fill="#1f1e1a" stroke="#3a382f"></rect>
+  <rect x="888" y="80" width="400" height="56" fill="#3b3018"></rect>
+  <line x1="888" y1="136" x2="1288" y2="136" stroke="#3a382f"></line>
+  <circle cx="906" cy="102" r="5" fill="#e8cf94"></circle>
+  <text x="920" y="106" font-family="&#39;IBM Plex Mono&#39;, ui-monospace, Menlo, monospace" font-size="11" font-weight="700" letter-spacing="1.4" fill="#e8cf94">ALPHA</text>
+  <text x="1270" y="108" text-anchor="end" font-family="&#39;IBM Plex Mono&#39;, ui-monospace, Menlo, monospace" font-size="14" font-weight="700" fill="#e8cf94">06</text>
+  <text x="906" y="126" font-family="&#39;IBM Plex Mono&#39;, ui-monospace, Menlo, monospace" font-size="9.5" fill="#e8cf94" opacity="0.85">functional but early  ·  rough edges and limited real-world validation</text>
+  
+  <text x="904" y="160" font-family="&#39;Inter&#39;, system-ui, -apple-system, &#39;Segoe UI&#39;, sans-serif" font-size="13" font-weight="680" fill="#F4F1EA">AFM provider</text>
+  <text x="904" y="178" font-family="&#39;IBM Plex Mono&#39;, ui-monospace, Menlo, monospace" font-size="10" fill="#cfc9ba">macOS-only · bridge default · native via Foundation Models</text>
+  <line x1="904" y1="190" x2="1272" y2="190" stroke="#3a382f" stroke-width="0.5"></line>
+  <text x="904" y="212" font-family="&#39;Inter&#39;, system-ui, -apple-system, &#39;Segoe UI&#39;, sans-serif" font-size="13" font-weight="680" fill="#F4F1EA">Alt providers · in flight</text>
+  <text x="904" y="230" font-family="&#39;IBM Plex Mono&#39;, ui-monospace, Menlo, monospace" font-size="10" fill="#cfc9ba">Ollama · MLX · Gemma 4 (cloud · breaks local-only)</text>
+  <line x1="904" y1="242" x2="1272" y2="242" stroke="#3a382f" stroke-width="0.5"></line>
+  <text x="904" y="264" font-family="&#39;Inter&#39;, system-ui, -apple-system, &#39;Segoe UI&#39;, sans-serif" font-size="13" font-weight="680" fill="#F4F1EA">Cross-agent ping contracts</text>
+  <text x="904" y="282" font-family="&#39;IBM Plex Mono&#39;, ui-monospace, Menlo, monospace" font-size="10" fill="#cfc9ba">request → inbox → decide → status · vault-backed</text>
+  <line x1="904" y1="294" x2="1272" y2="294" stroke="#3a382f" stroke-width="0.5"></line>
+  <text x="904" y="316" font-family="&#39;Inter&#39;, system-ui, -apple-system, &#39;Segoe UI&#39;, sans-serif" font-size="13" font-weight="680" fill="#F4F1EA">Compile passes (AFM)</text>
+  <text x="904" y="334" font-family="&#39;IBM Plex Mono&#39;, ui-monospace, Menlo, monospace" font-size="10" fill="#cfc9ba">5 passes · dry-run by default · review-only drafts</text>
+  <rect x="888" y="468" width="400" height="32" fill="#272620"></rect>
+  <line x1="888" y1="468" x2="1288" y2="468" stroke="#3a382f"></line>
+  <text x="904" y="487" font-family="&#39;IBM Plex Mono&#39;, ui-monospace, Menlo, monospace" font-size="10.5" fill="#cfc9ba">+ 2 more  ·  Team coordination  ·  Memory decay tuning</text>
+  <text x="60" y="528" font-family="&#39;IBM Plex Mono&#39;, ui-monospace, Menlo, monospace" font-size="10.5" fill="#a8a294">not in matrix  ·  Qdrant/Lance backends (stub · FAISS is the only active backend)  ·  comparative eval vs baselines (planned · harness exists)</text>
+</svg>

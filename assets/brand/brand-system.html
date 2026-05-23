@@ -1,0 +1,203 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sovereign Memory — Brand System</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;420;680;720&family=IBM+Plex+Mono:wght@500;600&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --ink:#181613; --bone:#F4F1EA; --bone2:#E8E2D0; --panel:#FFFEFA; --panel-muted:#F8F5EE;
+    --border:#D6D0C3; --border-strong:#AFA696; --muted:#7C817B; --on-muted:#4E4A42;
+    --graphite:#242320; --verdigris:#2F7D68; --verdigris-dark:#1E5E4C; --persimmon:#D2603A;
+    --mustard:#C9A961; --mustard-dark:#8C681F; --blue:#3D6F95;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bone);color:var(--ink);
+    font-family:Inter,system-ui,-apple-system,'Segoe UI',sans-serif;font-weight:420;line-height:1.55;
+    -webkit-font-smoothing:antialiased;}
+  .wrap{max-width:1080px;margin:0 auto;padding:64px 40px 96px}
+  .mono{font-family:'IBM Plex Mono',ui-monospace,Menlo,monospace}
+  .kicker{font-family:'IBM Plex Mono',monospace;font-size:11px;letter-spacing:2.5px;color:var(--muted);text-transform:uppercase}
+  h1{font-weight:720;font-size:64px;letter-spacing:-1.8px;line-height:1.02;margin:14px 0 8px}
+  h2{font-weight:700;font-size:13px;letter-spacing:1.5px;text-transform:uppercase;color:var(--on-muted);margin:0 0 20px;font-family:'IBM Plex Mono',monospace}
+  .lede{font-size:20px;color:var(--on-muted);font-style:italic;max-width:680px}
+  .rule{border:0;border-top:1.5px solid var(--ink);margin:8px 0 2px}
+  .rule.thin{border-top:0.5px solid var(--ink);margin:0 0 0}
+  section{padding:48px 0;border-top:1px solid var(--border)}
+  .thesis{font-size:30px;font-weight:680;letter-spacing:-0.6px;line-height:1.25;max-width:780px}
+  .thesis em{font-style:normal;color:var(--verdigris)}
+  .grid{display:grid;gap:18px}
+  .parts{grid-template-columns:repeat(5,1fr);align-items:stretch}
+  .part{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:18px 14px;text-align:center;display:flex;flex-direction:column;align-items:center;gap:10px;min-height:150px;justify-content:space-between}
+  .part .cap{font-family:'IBM Plex Mono',monospace;font-size:10.5px;color:var(--muted);line-height:1.35}
+  .part b{font-weight:680;color:var(--ink);font-family:Inter}
+  .swatches{grid-template-columns:repeat(7,1fr);gap:0;border:1px solid var(--border);border-radius:8px;overflow:hidden}
+  .sw{height:96px;display:flex;flex-direction:column;justify-content:flex-end;padding:10px}
+  .sw span{font-family:'IBM Plex Mono',monospace;font-size:10px}
+  .anchorrow{display:flex;gap:36px;align-items:center;flex-wrap:wrap}
+  .anchorrow .note{max-width:460px}
+  .type-spec{display:flex;flex-direction:column;gap:18px}
+  .twocol{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+  table{width:100%;border-collapse:collapse;font-size:14px}
+  th,td{text-align:left;padding:10px 12px;border-bottom:1px solid var(--border);vertical-align:top}
+  th{font-family:'IBM Plex Mono',monospace;font-size:10.5px;letter-spacing:1px;text-transform:uppercase;color:var(--muted);font-weight:600}
+  .we td:first-child{color:var(--verdigris-dark);font-weight:680}
+  .not td:first-child{color:var(--persimmon);font-weight:680}
+  .assembled{display:flex;gap:30px;align-items:center;background:var(--graphite);border-radius:10px;padding:30px 34px;color:var(--bone);flex-wrap:wrap}
+  .assembled .copy{flex:1;min-width:240px}
+  .assembled h3{font-weight:720;font-size:32px;margin:0 0 6px;letter-spacing:-0.8px}
+  .assembled p{margin:0;color:#C7C2B6;font-style:italic}
+  .dodont{grid-template-columns:1fr 1fr;gap:14px}
+  .card{border:1px solid var(--border);border-radius:8px;padding:18px 20px;background:var(--panel)}
+  .card.do{border-left:4px solid var(--verdigris)}
+  .card.dont{border-left:4px solid var(--persimmon)}
+  .card h4{margin:0 0 10px;font-family:'IBM Plex Mono',monospace;font-size:11px;letter-spacing:1.5px;text-transform:uppercase}
+  .card.do h4{color:var(--verdigris-dark)} .card.dont h4{color:var(--persimmon)}
+  .card ul{margin:0;padding-left:18px} .card li{margin:6px 0;font-size:14px}
+  .foot{margin-top:40px;font-family:'IBM Plex Mono',monospace;font-size:11px;letter-spacing:1.2px;color:var(--muted)}
+  .anchor-badge{display:inline-flex;width:8px;height:8px;background:var(--verdigris);transform:rotate(45deg);margin:0 4px}
+  @media(max-width:760px){.parts{grid-template-columns:repeat(2,1fr)}.swatches{grid-template-columns:repeat(3,1fr)}.twocol,.dodont{grid-template-columns:1fr}h1{font-size:44px}}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <div class="kicker">Sovereign Memory · Brand System · v1 draft · <span class="mono">2026-05-22</span></div>
+    <hr class="rule"><hr class="rule thin">
+    <h1>Individually ambiguous.<br>Together, unmistakable.</h1>
+    <p class="lede">A hat is just a hat. A mug is just a mug. Assemble them and you get a seasoned archivist. The system works the same way — only one element is allowed to be unambiguous: the <strong>HA</strong> mark.</p>
+  </header>
+
+  <section>
+    <h2>The thesis</h2>
+    <p class="thesis">No single part carries the brand. The palette could belong to anyone. The frog could be any frog. The mono labels could be any terminal. <em>The meaning lives in the assembly</em> — and the one fixed point everything orbits is the maker's anchor.</p>
+  </section>
+
+  <section>
+    <h2>The parts — ambiguous alone</h2>
+    <div class="grid parts">
+      <div class="part">
+        <svg width="56" height="56" viewBox="0 0 56 56"><rect width="56" height="56" rx="6" fill="#2F7D68"/></svg>
+        <div class="cap"><b>A green</b><br>could be any product</div>
+      </div>
+      <div class="part">
+        <svg width="56" height="56" viewBox="0 0 56 56"><text x="28" y="40" text-anchor="middle" font-family="IBM Plex Mono,monospace" font-size="30" fill="#181613">›_</text></svg>
+        <div class="cap"><b>A mono label</b><br>could be any CLI</div>
+      </div>
+      <div class="part">
+        <svg width="64" height="56" viewBox="0 0 64 56"><ellipse cx="32" cy="34" rx="30" ry="7" fill="#8C681F"/><path d="M16 34 Q17 14 32 12 Q47 14 48 34 Z" fill="#C9A961"/></svg>
+        <div class="cap"><b>A hat</b><br>could be any explorer</div>
+      </div>
+      <div class="part">
+        <svg width="56" height="56" viewBox="0 0 56 56"><rect x="14" y="16" width="24" height="26" rx="3" fill="none" stroke="#181613" stroke-width="3"/><path d="M38 22 q9 0 9 7 t-9 7" fill="none" stroke="#181613" stroke-width="3"/><path d="M22 10 q2 5 0 8 M30 10 q2 5 0 8" stroke="#7C817B" stroke-width="2" fill="none"/></svg>
+        <div class="cap"><b>A mug</b><br>could be any morning</div>
+      </div>
+      <div class="part">
+        <svg width="56" height="56" viewBox="0 0 56 56"><circle cx="28" cy="28" r="16" fill="#F4F1EA" stroke="#1E5E4C" stroke-width="3"/><circle cx="30" cy="29" r="7" fill="#181613"/></svg>
+        <div class="cap"><b>An eye</b><br>could be any creature</div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>The anchor — the only unambiguous element</h2>
+    <div class="anchorrow">
+      <svg width="120" height="140" viewBox="0 0 120 140" aria-label="HA monogram">
+        <g fill="none" stroke="#181613" stroke-width="7" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M40 22 V118"/><path d="M80 22 V118"/>
+          <path d="M60 24 L43 72"/><path d="M60 24 L77 72"/><path d="M40 72 H80"/></g>
+        <rect x="55.5" y="19.5" width="9" height="9" transform="rotate(45 60 24)" fill="#2F7D68"/>
+      </svg>
+      <svg width="140" height="140" viewBox="0 0 140 140" aria-label="HA roundel">
+        <circle cx="70" cy="70" r="62" fill="#F4F1EA" stroke="#181613" stroke-width="4"/>
+        <g transform="translate(70 70) scale(0.72) translate(-60 -70)">
+          <g fill="none" stroke="#181613" stroke-width="7" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M40 22 V118"/><path d="M80 22 V118"/><path d="M60 24 L43 72"/><path d="M60 24 L77 72"/><path d="M40 72 H80"/></g>
+          <rect x="55.5" y="19.5" width="9" height="9" transform="rotate(45 60 24)" fill="#2F7D68"/></g>
+      </svg>
+      <div class="note">
+        <p><strong>H</strong> stems frame the <strong>A</strong> peak; one crossbar serves both letters. The verdigris node at the apex<span class="anchor-badge"></span>is the literal anchor — the single fixed, unambiguous point. It is a <strong>maker's mark</strong>, never the product logo. Reproduce it in solid ink or bone; never recolor the strokes.</p>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Tokens — color</h2>
+    <div class="grid swatches">
+      <div class="sw" style="background:#181613;color:#F4F1EA"><span>ink<br>#181613</span></div>
+      <div class="sw" style="background:#242320;color:#F4F1EA"><span>graphite<br>#242320</span></div>
+      <div class="sw" style="background:#F4F1EA;color:#181613"><span>bone<br>#F4F1EA</span></div>
+      <div class="sw" style="background:#2F7D68;color:#F4F1EA"><span>verdigris<br>#2F7D68</span></div>
+      <div class="sw" style="background:#D2603A;color:#F4F1EA"><span>persimmon<br>#D2603A</span></div>
+      <div class="sw" style="background:#C9A961;color:#181613"><span>mustard<br>#C9A961</span></div>
+      <div class="sw" style="background:#3D6F95;color:#F4F1EA"><span>blue<br>#3D6F95</span></div>
+    </div>
+    <p class="cap mono" style="margin-top:12px;color:var(--muted)">verdigris = safe / primary action · persimmon = warning · mustard = highlight · blue = info / links · sourced from DESIGN.md</p>
+  </section>
+
+  <section>
+    <h2>Tokens — type</h2>
+    <div class="type-spec">
+      <div><div class="kicker">Display · Inter 720</div><div style="font-weight:720;font-size:44px;letter-spacing:-1.2px">Sovereign Memory</div></div>
+      <div><div class="kicker">Body · Inter 420 · 15px</div><div style="font-size:15px;max-width:620px">Memory should be layered state, not one flat blob. Identity is small and always present; knowledge is large and arrives in chunks, cited.</div></div>
+      <div><div class="kicker">Label / Evidence · IBM Plex Mono 600</div><div class="mono" style="font-size:13px;letter-spacing:1px">454 TESTS PASSING · 26 MCP TOOLS · MIT · NO TELEMETRY</div></div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Voice — constant across everything</h2>
+    <div class="twocol">
+      <table class="we"><tr><th>We are</th></tr>
+        <tr><td>Honest about maturity</td></tr>
+        <tr><td>Technically grounded</td></tr>
+        <tr><td>Direct — first sentence carries weight</td></tr>
+        <tr><td>Skeptical by default — claims need evidence</td></tr>
+        <tr><td>Quietly confident · warm and earthy</td></tr>
+      </table>
+      <table class="not"><tr><th>We are not</th></tr>
+        <tr><td>Hype-driven or buzzword-y</td></tr>
+        <tr><td>Academic or dry</td></tr>
+        <tr><td>Blunt or dismissive</td></tr>
+        <tr><td>Cynical</td></tr>
+        <tr><td>Cute or whimsical</td></tr>
+      </table>
+    </div>
+  </section>
+
+  <section>
+    <h2>Assembled — the system speaking at once</h2>
+    <div class="assembled">
+      <img src="frog-scholar.svg" width="150" alt="The Frog Scholar">
+      <div class="copy">
+        <h3>The Frog Scholar</h3>
+        <p>Earthy palette + explorer hat + journal + coffee + the HA roundel. None of it means anything alone. Together: a real person who reads the code, runs the tests, and built something worth trusting.</p>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Usage — do / don't</h2>
+    <div class="grid dodont">
+      <div class="card do"><h4>✓ Do</h4><ul>
+        <li>Lead product surfaces with the wordmark + <strong>HA</strong> mark; keep the frog as a cameo or footer.</li>
+        <li>Put the full frog on your GitHub profile, social, and announcements.</li>
+        <li>Keep design docs and CLI output mark-free — clean is the point.</li>
+        <li>Reproduce the monogram in a single solid color.</li>
+      </ul></div>
+      <div class="card dont"><h4>✕ Don't</h4><ul>
+        <li>Treat the frog as the product logo or put it on technical docs.</li>
+        <li>Recolor the monogram strokes or stretch the proportions.</li>
+        <li>Pair the brand with hype words — "revolutionary," "AI-powered," "seamless."</li>
+        <li>Mix the retired gold-winged "Hermes" mark with this system.</li>
+      </ul></div>
+    </div>
+  </section>
+
+  <div class="foot">BUILT BY HANS AXELSSON · HA · THE FROG SCHOLAR — palette &amp; type sourced from DESIGN.md · marks live in /assets/brand/</div>
+</div>
+</body>
+</html>

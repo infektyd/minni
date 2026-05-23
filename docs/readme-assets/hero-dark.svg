@@ -1,0 +1,15 @@
+<svg width="1280" height="280" viewBox="0 0 1280 280" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Sovereign Memory — local-first memory and governance layer for AI agents">
+  <rect width="1280" height="280" fill="#161512"></rect>
+  <line x1="60" y1="46" x2="1220" y2="46" stroke="#F4F1EA" stroke-width="1.5"></line>
+  <line x1="60" y1="52" x2="1220" y2="52" stroke="#F4F1EA" stroke-width="0.5"></line>
+  <text x="60" y="78" font-family="&#39;IBM Plex Mono&#39;, ui-monospace, Menlo, monospace" font-size="11" letter-spacing="2" fill="#a8a294">A LOCAL-FIRST MEMORY + GOVERNANCE LAYER FOR AI AGENTS · PRE-V1 ALPHA</text>
+  <text x="58" y="184" font-family="&#39;Inter&#39;, system-ui, -apple-system, &#39;Segoe UI&#39;, sans-serif" font-weight="720" font-size="86" fill="#F4F1EA" letter-spacing="-1.8">Sovereign Memory</text>
+  <text x="62" y="220" font-family="&#39;Inter&#39;, system-ui, -apple-system, &#39;Segoe UI&#39;, sans-serif" font-size="18" font-style="italic" fill="#cfc9ba">Long-running agents forget. Sovereign Memory remembers — locally, on your terms.</text>
+  <text x="62" y="254" font-family="&#39;IBM Plex Mono&#39;, ui-monospace, Menlo, monospace" font-size="10.5" letter-spacing="1.2" fill="#a8a294">454 TESTS PASSING  ·  26 MCP TOOLS  ·  MIT  ·  NO TELEMETRY  ·  NO CLOUD SYNC</text>
+  <g transform="translate(1120 30) scale(0.46)"><circle cx="70" cy="70" r="62" fill="#242320" stroke="#C9A961" stroke-width="4"/>
+        <g transform="translate(70 70) scale(0.72) translate(-60 -70)"><g fill="none" stroke="#F4F1EA" stroke-width="7" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M40 22 V118"/><path d="M80 22 V118"/>
+        <path d="M60 24 L43 72"/><path d="M60 24 L77 72"/><path d="M40 72 H80"/></g>
+      <rect x="55.5" y="19.5" width="9" height="9" transform="rotate(45 60 24)" fill="#C9A961"/></g></g>
+  <text x="1152" y="120" text-anchor="middle" font-family="IBM Plex Mono, ui-monospace, monospace" font-size="9" letter-spacing="2" fill="#a8a294">MAKER</text>
+</svg>

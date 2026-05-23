@@ -1,0 +1,40 @@
+<svg width="1280" height="460" viewBox="0 0 1280 460" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Session rehydration packet — the artifact, not the agent">
+  <rect width="1280" height="460" fill="#F4F1EA"></rect>
+  <text x="60" y="50" font-family="&#39;Inter&#39;, system-ui, -apple-system, &#39;Segoe UI&#39;, sans-serif" font-size="22" font-weight="680" fill="#181613" letter-spacing="-0.3">A resumed session doesn&#39;t retrieve documents.</text>
+  <text x="60" y="76" font-family="&#39;IBM Plex Mono&#39;, ui-monospace, Menlo, monospace" font-size="11" fill="#7C817B">it produces the smallest packet that lets an agent resume safely</text>
+  <rect x="60" y="108" width="1160" height="316" rx="2" fill="#FFFEFA" stroke="#D6D0C3"></rect>
+  <rect x="60" y="108" width="1160" height="32" rx="2" fill="#E8E2D0"></rect>
+  <line x1="60" y1="140" x2="1220" y2="140" stroke="#D6D0C3"></line>
+  <circle cx="78" cy="124" r="3.5" fill="#8C681F"></circle>
+  <text x="92" y="129" font-family="&#39;IBM Plex Mono&#39;, ui-monospace, Menlo, monospace" font-size="11" letter-spacing="1" font-weight="600" fill="#4E4A42">SESSION REHYDRATE  ·  agent=codex  ·  vault=codex-vault  ·  policy=local-only</text>
+  <text x="1208" y="129" text-anchor="end" font-family="&#39;IBM Plex Mono&#39;, ui-monospace, Menlo, monospace" font-size="11" fill="#7C817B">68 tokens · 14ms</text>
+  <text x="78" y="166" font-family="&#39;IBM Plex Mono&#39;, ui-monospace, Menlo, monospace" font-size="11" fill="#7C817B">last session ended  ·  3 days, 14:22:08 ago</text>
+  <text x="1208" y="166" text-anchor="end" font-family="&#39;IBM Plex Mono&#39;, ui-monospace, Menlo, monospace" font-size="11" fill="#7C817B">resume  →</text>
+  <line x1="60" y1="184" x2="1220" y2="184" stroke="#D6D0C3"></line>
+  
+  <circle cx="76" cy="217" r="3.5" fill="#2F7D68"></circle>
+  <text x="92" y="220" font-family="&#39;IBM Plex Mono&#39;, ui-monospace, Menlo, monospace" font-size="12" font-weight="600" fill="#4E4A42">verified_now</text>
+  <text x="320" y="220" font-family="&#39;IBM Plex Mono&#39;, ui-monospace, Menlo, monospace" font-size="12" fill="#181613">auth.md  ·  build-config.yml  ·  deploy-target=staging</text>
+  <text x="92" y="236" font-family="&#39;IBM Plex Mono&#39;, ui-monospace, Menlo, monospace" font-size="10.5" fill="#7C817B">↳ checked against current artifacts</text>
+  <line x1="92" y1="245" x2="1188" y2="245" stroke="#D6D0C3" stroke-width="0.5"></line>
+  <circle cx="76" cy="257" r="3.5" fill="#3D6F95"></circle>
+  <text x="92" y="260" font-family="&#39;IBM Plex Mono&#39;, ui-monospace, Menlo, monospace" font-size="12" font-weight="600" fill="#4E4A42">remembered_unverified</text>
+  <text x="320" y="260" font-family="&#39;IBM Plex Mono&#39;, ui-monospace, Menlo, monospace" font-size="12" fill="#181613">feature-flag rollout still pending review</text>
+  <text x="92" y="276" font-family="&#39;IBM Plex Mono&#39;, ui-monospace, Menlo, monospace" font-size="10.5" fill="#7C817B">↳ plausible — needs confirmation</text>
+  <line x1="92" y1="285" x2="1188" y2="285" stroke="#D6D0C3" stroke-width="0.5"></line>
+  <circle cx="76" cy="297" r="3.5" fill="#8C681F"></circle>
+  <text x="92" y="300" font-family="&#39;IBM Plex Mono&#39;, ui-monospace, Menlo, monospace" font-size="12" font-weight="600" fill="#4E4A42">open_loops</text>
+  <text x="320" y="300" font-family="&#39;IBM Plex Mono&#39;, ui-monospace, Menlo, monospace" font-size="12" fill="#181613">migration smoke-test  ·  rotate audit token  ·  finalize compile dry-run</text>
+  <text x="92" y="316" font-family="&#39;IBM Plex Mono&#39;, ui-monospace, Menlo, monospace" font-size="10.5" fill="#7C817B">↳ left incomplete last session</text>
+  <line x1="92" y1="325" x2="1188" y2="325" stroke="#D6D0C3" stroke-width="0.5"></line>
+  <circle cx="76" cy="337" r="3.5" fill="#8C681F"></circle>
+  <text x="92" y="340" font-family="&#39;IBM Plex Mono&#39;, ui-monospace, Menlo, monospace" font-size="12" font-weight="600" fill="#4E4A42">first_verification</text>
+  <text x="320" y="340" font-family="&#39;IBM Plex Mono&#39;, ui-monospace, Menlo, monospace" font-size="12" fill="#181613">$ make verify   →   diff against current branch</text>
+  <text x="92" y="356" font-family="&#39;IBM Plex Mono&#39;, ui-monospace, Menlo, monospace" font-size="10.5" fill="#7C817B">↳ next concrete check before acting</text>
+  <line x1="92" y1="365" x2="1188" y2="365" stroke="#D6D0C3" stroke-width="0.5"></line>
+  <circle cx="76" cy="377" r="3.5" fill="#7C817B"></circle>
+  <text x="92" y="380" font-family="&#39;IBM Plex Mono&#39;, ui-monospace, Menlo, monospace" font-size="12" font-weight="600" fill="#4E4A42">do_not_claim</text>
+  <text x="320" y="380" font-family="&#39;IBM Plex Mono&#39;, ui-monospace, Menlo, monospace" font-size="12" fill="#181613">old /v1 API surface (removed 2 sessions ago)</text>
+  <text x="92" y="396" font-family="&#39;IBM Plex Mono&#39;, ui-monospace, Menlo, monospace" font-size="10.5" fill="#7C817B">↳ stale or contradicted</text>
+  <text x="640" y="448" text-anchor="middle" font-family="&#39;IBM Plex Mono&#39;, ui-monospace, Menlo, monospace" font-size="10.5" letter-spacing="0.4" fill="#7C817B">fig. iii — the artifact, not the agent</text>
+</svg>

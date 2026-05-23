@@ -1,0 +1,10 @@
+<svg width="1280" height="280" viewBox="0 0 1280 280" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Sovereign Memory">
+<rect width="1280" height="280" fill="#F4F1EA"/>
+<line x1="60" y1="46" x2="1220" y2="46" stroke="#181613" stroke-width="1.5"/><line x1="60" y1="52" x2="1220" y2="52" stroke="#181613" stroke-width="0.5"/>
+<text x="60" y="78" font-family="IBM Plex Mono, monospace" font-size="11" letter-spacing="2" fill="#7C817B">A LOCAL-FIRST MEMORY + GOVERNANCE LAYER FOR AI AGENTS · PRE-V1 ALPHA</text>
+<text x="58" y="184" font-family="Inter, sans-serif" font-weight="720" font-size="86" fill="#181613" letter-spacing="-1.8">Sovereign Memory</text>
+<text x="62" y="220" font-family="Inter, sans-serif" font-size="18" font-style="italic" fill="#4E4A42">Long-running agents forget. Sovereign Memory remembers — locally, on your terms.</text>
+<text x="62" y="254" font-family="IBM Plex Mono, monospace" font-size="10.5" letter-spacing="1.2" fill="#7C817B">454 TESTS PASSING  ·  26 MCP TOOLS  ·  MIT  ·  NO TELEMETRY  ·  NO CLOUD SYNC</text>
+<g transform="translate(1120 28) scale(0.46)"><circle cx="70" cy="70" r="62" fill="#F4F1EA" stroke="#181613" stroke-width="4"/><g transform="translate(70 70) scale(0.72) translate(-60 -70)"><g fill="none" stroke="#181613" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"><path d="M40 22 V118"/><path d="M80 22 V118"/><path d="M60 24 L43 72"/><path d="M60 24 L77 72"/><path d="M40 72 H80"/></g><rect x="55.5" y="19.5" width="9" height="9" transform="rotate(45 60 24)" fill="#2F7D68"/></g></g>
+<text x="1152" y="116" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="9" letter-spacing="2" fill="#7C817B">MAKER</text>
+</svg>

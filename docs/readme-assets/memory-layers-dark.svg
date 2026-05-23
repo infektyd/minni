@@ -1,0 +1,27 @@
+<svg width="1280" height="360" viewBox="0 0 1280 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Memory layers — identity loads whole, knowledge loads chunked">
+  <rect width="1280" height="360" fill="#161512"></rect>
+  <text x="60" y="50" font-family="&#39;Inter&#39;, system-ui, -apple-system, &#39;Segoe UI&#39;, sans-serif" font-size="22" font-weight="680" fill="#F4F1EA" letter-spacing="-0.3">Memory is layered state — not one flat blob.</text>
+  <text x="60" y="76" font-family="&#39;IBM Plex Mono&#39;, ui-monospace, Menlo, monospace" font-size="11" fill="#a8a294">each layer has its own load rule  ·  solid bars load whole, dashed bars retrieve on demand</text>
+  
+  <text x="60" y="100" font-family="&#39;Inter&#39;, system-ui, -apple-system, &#39;Segoe UI&#39;, sans-serif" font-size="16" font-weight="600" fill="#F4F1EA">Identity</text>
+  <text x="60" y="118" font-family="&#39;IBM Plex Mono&#39;, ui-monospace, Menlo, monospace" font-size="10.5" fill="#a8a294">who · role · constraints</text>
+  <line x1="320" y1="95" x2="1020" y2="95" stroke="#4ea890" stroke-width="6" stroke-linecap="round"></line>
+  <text x="1034" y="99" font-family="&#39;IBM Plex Mono&#39;, ui-monospace, Menlo, monospace" font-size="11" font-weight="600" letter-spacing="0.6" fill="#7cc4ad">LOAD WHOLE</text>
+  <text x="60" y="150" font-family="&#39;Inter&#39;, system-ui, -apple-system, &#39;Segoe UI&#39;, sans-serif" font-size="16" font-weight="600" fill="#F4F1EA">Standing principles</text>
+  <text x="60" y="168" font-family="&#39;IBM Plex Mono&#39;, ui-monospace, Menlo, monospace" font-size="10.5" fill="#a8a294">durable rules across sessions</text>
+  <line x1="320" y1="145" x2="1020" y2="145" stroke="#4ea890" stroke-width="6" stroke-linecap="round"></line>
+  <text x="1034" y="149" font-family="&#39;IBM Plex Mono&#39;, ui-monospace, Menlo, monospace" font-size="11" font-weight="600" letter-spacing="0.6" fill="#7cc4ad">LOAD WHOLE</text>
+  <text x="60" y="200" font-family="&#39;Inter&#39;, system-ui, -apple-system, &#39;Segoe UI&#39;, sans-serif" font-size="16" font-weight="600" fill="#F4F1EA">Project state</text>
+  <text x="60" y="218" font-family="&#39;IBM Plex Mono&#39;, ui-monospace, Menlo, monospace" font-size="10.5" fill="#a8a294">active branch · open loops · next</text>
+  <line x1="320" y1="195" x2="780" y2="195" stroke="#4ea890" stroke-width="6" stroke-linecap="round"></line>
+  <text x="794" y="199" font-family="&#39;IBM Plex Mono&#39;, ui-monospace, Menlo, monospace" font-size="11" font-weight="600" letter-spacing="0.6" fill="#7cc4ad">LOAD WHOLE</text>
+  <text x="60" y="250" font-family="&#39;Inter&#39;, system-ui, -apple-system, &#39;Segoe UI&#39;, sans-serif" font-size="16" font-weight="600" fill="#F4F1EA">Evidence</text>
+  <text x="60" y="268" font-family="&#39;IBM Plex Mono&#39;, ui-monospace, Menlo, monospace" font-size="10.5" fill="#a8a294">source-backed facts · citations</text>
+  <line x1="320" y1="245" x2="600" y2="245" stroke="#e8cf94" stroke-width="6" stroke-dasharray="3 5" stroke-linecap="round"></line>
+  <text x="614" y="249" font-family="&#39;IBM Plex Mono&#39;, ui-monospace, Menlo, monospace" font-size="11" font-weight="600" letter-spacing="0.6" fill="#e8cf94">RETRIEVE</text>
+  <text x="60" y="300" font-family="&#39;Inter&#39;, system-ui, -apple-system, &#39;Segoe UI&#39;, sans-serif" font-size="16" font-weight="600" fill="#F4F1EA">Knowledge</text>
+  <text x="60" y="318" font-family="&#39;IBM Plex Mono&#39;, ui-monospace, Menlo, monospace" font-size="10.5" fill="#a8a294">wiki · docs · history</text>
+  <line x1="320" y1="295" x2="500" y2="295" stroke="#e8cf94" stroke-width="6" stroke-dasharray="3 5" stroke-linecap="round"></line>
+  <text x="514" y="299" font-family="&#39;IBM Plex Mono&#39;, ui-monospace, Menlo, monospace" font-size="11" font-weight="600" letter-spacing="0.6" fill="#e8cf94">RETRIEVE</text>
+  <line x1="60" y1="335" x2="1220" y2="335" stroke="#3a382f" stroke-width="0.5"></line>
+</svg>
