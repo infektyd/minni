@@ -31,11 +31,11 @@ jobs:
           # File patterns that should never be added to the repo (extended regex).
           PATTERNS=(
             # PR-description scratch (the Jules / agent failure mode that triggered this gate)
-            '(^|/)pr_description\.(txt|md)$'
-            '(^|/)PR_DESCRIPTION\.(txt|md)$'
-            # Generic scratch / temp / backup files
-            '\.scratch\.(txt|md)$'
-            '\.tmp\.(txt|md|json|ya?ml)$'
+            '(^|/)pr_description\.[^/]+$'
+            '(^|/)PR_DESCRIPTION\.[^/]+$'
+            # Generic scratch / temp / backup files (any extension)
+            '\.scratch\.[^/]+$'
+            '\.tmp\.[^/]+$'
             '\.bak$'
             '~$'
             # OS junk
@@ -43,10 +43,10 @@ jobs:
             '(^|/)Thumbs\.db$'
             # Secrets — block any .env except .env.example / .env.sample / .env.template
             '(^|/)\.env(\..*)?$'
-            # Top-level scratch notes
-            '^notes\.(txt|md)$'
-            '^TODO\.(txt|md)$'
-            '^scratch\.(txt|md)$'
+            # Top-level scratch notes (any extension)
+            '^notes\.[^/]+$'
+            '^TODO\.[^/]+$'
+            '^scratch\.[^/]+$'
           )
 
           # Explicit allowlist (matched before the deny patterns).
@@ -56,13 +56,25 @@ jobs:
             '(^|/)\.env\.template$'
           )
 
-          ADDED=$(git diff --name-only --diff-filter=A "$BASE_SHA" "$HEAD_SHA" || true)
+          # Resolve the merge base so we only flag paths this PR actually introduces.
+          # Comparing tip-to-tip (BASE_SHA ↔ HEAD_SHA) would falsely report files that
+          # main has since deleted but the branch left untouched. Including renames
+          # (R*) catches the case where an existing file is renamed into a forbidden
+          # path (e.g. notes.md → pr_description.md) — the destination is treated as
+          # an addition.
+          MERGE_BASE=$(git merge-base "$BASE_SHA" "$HEAD_SHA")
+          ADDED=$(git diff --name-status --diff-filter=AR "$MERGE_BASE" "$HEAD_SHA" \
+            | awk -F'\t' '
+                /^A\t/  { print $2 }
+                /^R[0-9]*\t/ { print $3 }
+              ' || true)
+
           if [ -z "$ADDED" ]; then
-            echo "✓ No new files added."
+            echo "✓ No new files added (vs merge base $MERGE_BASE)."
             exit 0
           fi
 
-          echo "Added files in PR:"
+          echo "New paths in PR (vs merge base $MERGE_BASE):"
           echo "$ADDED" | sed 's/^/  /'
           echo "---"
 

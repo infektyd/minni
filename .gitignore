@@ -150,30 +150,19 @@ pr_description.txt
 pr_description.md
 PR_DESCRIPTION.txt
 PR_DESCRIPTION.md
-# Generic scratch / temp / backup
-*.scratch.txt
-*.scratch.md
-*.tmp.txt
-*.tmp.md
-*.tmp.json
-*.tmp.yml
-*.tmp.yaml
+# Generic scratch / temp / backup (any extension)
+*.scratch.*
+*.tmp.*
 *.bak
 *~
-# OS junk
-.DS_Store
+# OS junk — .DS_Store is already covered above by **/.DS_Store
 Thumbs.db
-# Top-level scratch notes (deny by name at repo root)
-/notes.txt
-/notes.md
-/TODO.txt
-/TODO.md
-/scratch.txt
-/scratch.md
-# Secrets — .env.example / .env.sample / .env.template are the tracked templates
-.env
-.env.*
-!.env.example
+# Top-level scratch notes (deny by name at repo root, any extension)
+/notes.*
+/TODO.*
+/scratch.*
+# Secrets — .env / .env.* / !.env.example are already covered above (lines 110-112).
+# Extend the allowlist with the additional tracked templates we use:
 !.env.sample
 !.env.template
 
