@@ -87,7 +87,10 @@ def _ensure_tracking_table(conn: sqlite3.Connection) -> None:
 
 def _column_exists(conn: sqlite3.Connection, table: str, column: str) -> bool:
     try:
-        return column in {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        row = conn.execute(
+            "SELECT 1 FROM pragma_table_info(?) WHERE name=?", (table, column)
+        ).fetchone()
+        return row is not None
     except sqlite3.Error:
         return False
 
