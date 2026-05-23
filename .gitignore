@@ -144,4 +144,26 @@ output/reports/
 /assets/brand/
 /assets/design/readme/
 
+# --- PR hygiene (enforced by .github/workflows/pr-hygiene.yml) ---
+# PR-description scratch files — descriptions belong in the GitHub PR body.
+pr_description.txt
+pr_description.md
+PR_DESCRIPTION.txt
+PR_DESCRIPTION.md
+# Generic scratch / temp / backup (any extension)
+*.scratch.*
+*.tmp.*
+*.bak
+*~
+# OS junk — .DS_Store is already covered above by **/.DS_Store
+Thumbs.db
+# Top-level scratch notes (deny by name at repo root, any extension)
+/notes.*
+/TODO.*
+/scratch.*
+# Secrets — .env / .env.* / !.env.example are already covered above (lines 110-112).
+# Extend the allowlist with the additional tracked templates we use:
+!.env.sample
+!.env.template
+
 
