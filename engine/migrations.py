@@ -191,7 +191,8 @@ def run_migrations(conn: sqlite3.Connection) -> None:
             )
 
         # Bump user_version to highest known — PRAGMA cannot be parameterized
-        conn.execute(f"PRAGMA user_version = {int(target_version)}")
+        target_version = int(target_version)
+        conn.execute(f"PRAGMA user_version = {target_version}")
         conn.commit()
         logger.info("Migrations complete. user_version=%d", target_version)
 
