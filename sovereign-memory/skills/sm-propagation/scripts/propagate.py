@@ -27,7 +27,7 @@ DEFAULT_PLUGIN_CLI = Path(
     "~/.codex/plugins/cache/sovereign-memory/sovereign-memory/0.1.0/dist/cli.js"
 ).expanduser()
 DEFAULT_IDENTITY_ROOT = Path("~/.sovereign-memory/identities").expanduser()
-DEFAULT_REPO_ROOT = Path.home() / "Projects" / "sovereignMemory"
+DEFAULT_REPO_ROOT = Path(__file__).resolve().parents[4]
 
 
 PLATFORM_ALIASES = {
