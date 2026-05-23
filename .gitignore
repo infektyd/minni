@@ -139,3 +139,9 @@ reports/
 # Ignored artifacts
 output/reports/
 *.npz
+
+# Brand and design assets (exclude everything that does not deal with rendering the README)
+/assets/brand/*
+!/assets/brand/frog-scholar.svg
+/assets/design/readme/
+
