@@ -1,7 +1,6 @@
 <!-- Sovereign Memory — README
      Narrative direction · DESIGN.md-aligned palette · pre-v1 alpha
      Visuals live in docs/readme-assets/ as light + dark SVG pairs.
-     Maker's mark (HA monogram + Frog Scholar) lives in the hero and footer.
      Collapsible sections use native <details>. Mobile-friendly. -->
 
 <picture>
@@ -323,11 +322,5 @@ Also see · [`docs/CANONICAL-PATHS.md`](docs/CANONICAL-PATHS.md) · [`docs/TROUB
 </details>
 
 ---
-
-<table border="0"><tr>
-<td width="92" valign="middle"><img src="assets/brand/frog-scholar.svg" width="76" alt="The Frog Scholar — HA"></td>
-<td valign="middle">Built by <strong>Hans Axelsson</strong> — the Frog Scholar.<br>
-<sub>The <strong>HA</strong> monogram is a maker's mark, not a product logo. Brand system lives in <a href="assets/brand/">assets/brand/</a>.</sub></td>
-</tr></table>
 
 <sub>LOCAL-ONLY · NO TELEMETRY · NO CLOUD SYNC · NO REMOTE ENDPOINTS · EVER</sub>
