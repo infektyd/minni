@@ -47,7 +47,7 @@ def canonical_platform(platform: str) -> str:
 
 
 def repo_engine(workspace: str | None) -> Path:
-    default = Path.home() / "Projects" / "sovereignMemory" / "engine"
+    default = DEFAULT_REPO_ROOT / "engine"
     if default.exists():
         return default
     if workspace:
