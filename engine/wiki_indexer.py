@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 
 from config import SovereignConfig, DEFAULT_CONFIG
 from db import SovereignDB
-from chunker import MarkdownChunker, Chunk
+from chunker import MarkdownChunker
 from faiss_index import FAISSIndex
 
 logger = logging.getLogger("sovereign.wiki_indexer")
@@ -498,50 +498,66 @@ class WikiIndexer:
         link_count = 0
         seen: Set[Tuple[int, int]] = set()
 
+        # Phase 1: Collect and deduplicate valid target paths
+        target_paths = set()
         for link_target in wikilinks:
             target_path = target_map.get(link_target)
-            if not target_path:
-                continue  # Broken wikilink — skip silently
+            if target_path:
+                target_paths.add(target_path)
 
-            # Look up target doc_id
+        if not target_paths:
+            return 0
+
+        # Phase 2: Batch query target doc_ids (chunked to stay under SQLite limits)
+        target_paths = list(target_paths)
+        target_doc_ids = set()
+
+        for i in range(0, len(target_paths), 500):
+            batch = target_paths[i:i + 500]
+            placeholders = ",".join(["?"] * len(batch))
             cursor.execute(
-                "SELECT doc_id FROM documents WHERE path = ?",
-                (target_path,),
+                f"SELECT doc_id FROM documents WHERE path IN ({placeholders})",
+                batch,
             )
-            target_row = cursor.fetchone()
-            if not target_row:
-                continue  # Target not yet indexed — will resolve on next pass
+            for row in cursor.fetchall():
+                target_doc_ids.add(row["doc_id"])
 
-            target_doc_id = target_row["doc_id"]
-
-            # Verify target exists in DB (paranoid check for FK constraint)
-            cursor.execute(
-                "SELECT 1 FROM documents WHERE doc_id = ?",
-                (target_doc_id,),
-            )
-            if not cursor.fetchone():
-                continue
-
-            # Avoid self-links
+        # Phase 3: Construct batch insert parameters
+        insert_data = []
+        for target_doc_id in target_doc_ids:
             if source_doc_id == target_doc_id:
                 continue
 
-            # Deduplicate within this indexing pass
             edge_key = (source_doc_id, target_doc_id)
             if edge_key in seen:
                 continue
             seen.add(edge_key)
 
-            try:
-                cursor.execute(
+            insert_data.append((source_doc_id, target_doc_id, "wikilink", 1.0, now))
+
+        # Phase 4: Batch insert with fallback
+        try:
+            if insert_data:
+                cursor.executemany(
                     """INSERT OR REPLACE INTO memory_links
                        (source_doc_id, target_doc_id, link_type, weight, created_at)
                        VALUES (?, ?, ?, ?, ?)""",
-                    (source_doc_id, target_doc_id, "wikilink", 1.0, now),
+                    insert_data,
                 )
-                link_count += 1
-            except Exception:
-                continue  # Skip links that fail (FK constraint, etc.)
+                link_count += len(insert_data)
+        except Exception:
+            # Fallback to row-by-row if batch fails (e.g., FK constraint on specific rows)
+            for data in insert_data:
+                try:
+                    cursor.execute(
+                        """INSERT OR REPLACE INTO memory_links
+                           (source_doc_id, target_doc_id, link_type, weight, created_at)
+                           VALUES (?, ?, ?, ?, ?)""",
+                        data,
+                    )
+                    link_count += 1
+                except Exception:
+                    pass
 
         return link_count
 
