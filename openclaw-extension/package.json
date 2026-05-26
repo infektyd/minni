@@ -1,7 +1,7 @@
 {
   "name": "sovereign-memory",
   "version": "0.1.0",
-  "description": "OpenClaw plugin bridge for Sovereign Memory",
+  "description": "OpenClaw plugin bridge for Minni",
   "type": "commonjs",
   "main": "dist/index.js",
   "openclaw": {

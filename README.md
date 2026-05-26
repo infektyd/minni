@@ -1,4 +1,4 @@
-# Sovereign Memory
+# Minni
 
 ![Status](https://img.shields.io/badge/status-pre--v1_alpha-blue?style=flat-square)
 ![Python](https://img.shields.io/badge/python-3.11+-3776AB?style=flat-square&logo=python&logoColor=white)
@@ -10,7 +10,7 @@
 
 > *Identity loads whole. Knowledge loads chunked.*
 
-Sovereign Memory gives long-running agent work a durable spine — identity,
+Minni gives long-running agent work a durable spine — identity,
 working state, retrieval, evidence, handoffs, learning proposals, and audit
 trails that stay inspectable on the host machine. It sits between chat-history-
 as-memory and pure RAG: agents resume with typed state, verified evidence, open
@@ -39,7 +39,7 @@ loops, and a clear next action instead of rediscovering context from scratch.
 
 ## Project status
 
-Sovereign Memory is in active development toward a v1 release. Components are at
+Minni is in active development toward a v1 release. Components are at
 different levels of maturity. This table reflects the honest state of each
 subsystem — inspired by the
 [OpenTelemetry component stability model](https://opentelemetry.io/docs/specs/otel/versioning-and-stability/).
@@ -96,7 +96,7 @@ Long-running AI work usually falls into one of three brittle patterns:
 | **RAG over files** | Useful for lookup, but rediscovers context instead of preserving working state |
 | **Markdown/wiki notes** | Human-readable, but weak at provenance, contradiction handling, and session rehydration |
 
-Sovereign Memory combines the strengths: structured runtime state in SQLite,
+Minni combines the strengths: structured runtime state in SQLite,
 human-readable vault pages for review, and typed evidence with explicit learning
 gates. If a simpler model achieves the same recovery quality, the right move is
 to delete complexity.
@@ -304,13 +304,13 @@ memory machinery looks.
 2. Raw chat summary
 3. Plain RAG over repo/docs
 4. Wiki-only filesystem memory
-5. Sovereign Memory rehydration with typed state and open loops
+5. Minni rehydration with typed state and open loops
 
 **Metrics that matter:** correct next action after restart, unsupported claims
 made during restart, evidence coverage, token cost of rehydration, time to
 resume useful work, and contradiction handling.
 
-> If the wiki-only or plain-RAG baseline matches Sovereign Memory on these
+> If the wiki-only or plain-RAG baseline matches Minni on these
 > metrics, the right engineering answer is to delete complexity.
 
 </details>
@@ -415,7 +415,7 @@ explicitly sanitized.
 <details>
 <summary><h2>Local-first security</h2></summary>
 
-Sovereign Memory is local-first only when four assumptions hold on the host:
+Minni is local-first only when four assumptions hold on the host:
 
 1. **macOS user account** is the security perimeter for a single-user box
 2. **FileVault is enabled** — database and vault are encrypted at rest
@@ -460,4 +460,4 @@ Also run a temp-state live smoke:
 
 ---
 
-<sub>Sovereign Memory is a local-only project. No telemetry, no cloud sync, no remote endpoints.</sub>
+<sub>Minni is a local-only project. No telemetry, no cloud sync, no remote endpoints.</sub>

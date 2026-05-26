@@ -3,7 +3,7 @@
 Generated: 2026-04-26
 Scope: repository root — Python engine daemon, retrieval, TypeScript MCP plugin, vault helpers, OpenClaw bridge, AFM prep.
 
-This plan covers what Sovereign Memory must ship before public release. It is deliberately scoped to the threats a *local-first, single-user* memory daemon faces — not enterprise multi-tenant hardening. A longer "v2 hardening" backlog is preserved at the bottom; nothing there blocks v1.
+This plan covers what Minni must ship before public release. It is deliberately scoped to the threats a *local-first, single-user* memory daemon faces — not enterprise multi-tenant hardening. A longer "v2 hardening" backlog is preserved at the bottom; nothing there blocks v1.
 
 ## Executive Summary
 
@@ -33,14 +33,14 @@ Sequencing:
 - Model/prompt text → MCP tool arguments.
 - MCP plugin process → Python daemon over local socket.
 - Local browser/process → loopback UI server.
-- OpenClaw extension → Sovereign Memory bridge daemon.
+- OpenClaw extension → Minni bridge daemon.
 - Vault markdown → AI context pack and AFM prep.
 - Agent identity claims → cross-agent memory authorization.
 
 ### Adversaries in scope
 
 - Prompt injection delivered via vault content, learned memory, or tool arguments.
-- Lower-trust local processes that can reach a Sovereign Memory socket.
+- Lower-trust local processes that can reach a Minni socket.
 - Operator misuse of caller-supplied override fields (`agentId`, `vaultPath`, `afmPrepareUrl`).
 - A user who unwittingly drops the vault into iCloud/Dropbox/Time Machine.
 
@@ -56,7 +56,7 @@ These hold at v1. If any of them breaks, additional findings open.
 
 1. Single-user macOS account is the security perimeter.
 2. FileVault is enabled for at-rest protection of the DB and vault.
-3. The vault and DB are **not** in iCloud Drive, Dropbox, Google Drive, or any sync root, and Time Machine excludes them. Sovereign Memory will warn if it detects a sync-root location at startup.
+3. The vault and DB are **not** in iCloud Drive, Dropbox, Google Drive, or any sync root, and Time Machine excludes them. Minni will warn if it detects a sync-root location at startup.
 4. MCP transport is stdio only; the optional HTTP JSON-RPC fallback is removed (see SEC-008).
 5. The model provider may cache or train on tool I/O. Anything recalled into context is treated as exported.
 6. The host runtime (Codex, Claude Code, Gemini, OpenClaw) is trusted to stamp the effective principal honestly. A compromised in-process IDE extension breaks principal binding — out of scope.
@@ -73,7 +73,7 @@ Items: SEC-001, SEC-014, SEC-015, SEC-016 (one-line), cloud-sync doc.
 
 Exit criteria:
 
-- No Sovereign Memory socket is group/world writable.
+- No Minni socket is group/world writable.
 - Audit log entries cannot be forged via `\n## …` injection.
 - `learn` and socket reads have a hard size limit.
 - `~/Library/Logs/sovrd.*.log` is mode 0600 via plist `Umask`.

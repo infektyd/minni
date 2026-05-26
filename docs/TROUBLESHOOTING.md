@@ -1,4 +1,4 @@
-# Troubleshooting Sovereign Memory
+# Troubleshooting Minni
 
 This guide records product-level failure modes that can happen when the daemon,
 plugins, and agent runtime are updated at different speeds.
@@ -82,7 +82,7 @@ The stale cache usually still contains HTTP fallback calls such as
 Build and test the repo plugin first:
 
 ```bash
-cd /Users/hansaxelsson/SovereignMemory/plugins/sovereign-memory
+cd ~/Projects/sovereignMemory/plugins/sovereign-memory
 npm run build
 npm test
 node dist/cli.js status

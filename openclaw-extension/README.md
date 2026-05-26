@@ -1,6 +1,6 @@
-# Sovereign Memory Bridge
+# Minni Bridge
 
-OpenClaw plugin bridge for Sovereign Memory integration.
+OpenClaw plugin bridge for Minni integration.
 
 ## Architecture
 

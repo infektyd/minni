@@ -1,6 +1,6 @@
 {
   "id": "sovereign-memory",
-  "name": "Sovereign Memory",
+  "name": "Minni",
   "description": "Local-first semantic memory for OpenClaw agents \u2014 FAISS+FTS5 hybrid retrieval backed by a persistent SQLite vault.",
   "version": "0.1.0",
   "configSchema": {

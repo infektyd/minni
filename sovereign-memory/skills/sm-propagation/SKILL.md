@@ -1,30 +1,30 @@
 ---
 name: sm-propagation
-description: Use when setting up, repairing, propagating, or verifying Sovereign Memory for an agent, especially Layer 1 identity/envelope delivery, Codex/Claude/Gemini hosted-agent maps, Hermes/OpenClaw souls, per-agent vaults, plugin caches, closed MCP transports, or daemon/socket hydration drift.
+description: Use when setting up, repairing, propagating, or verifying Minni for an agent, especially Layer 1 identity/envelope delivery, Codex/Claude/Gemini hosted-agent maps, Hermes/OpenClaw souls, per-agent vaults, plugin caches, closed MCP transports, or daemon/socket hydration drift.
 ---
 
 # SM Propagation
 
 ## Overview
 
-Propagate Sovereign Memory for an agent by creating the right local memory
+Propagate Minni for an agent by creating the right local memory
 surface, seeding the right layer, and verifying delivery. Do not make the agent
 reason from first principles about vaults, identity rows, socket paths, and
 hosted-agent boundaries.
 
 Core rule:
 
-> Sovereign Memory gives owned agents a soul. It gives hosted agents a map.
+> Minni gives owned agents a soul. It gives hosted agents a map.
 
 ## When To Use
 
 Use this when the user asks to:
 
-- set up Sovereign Memory for an agent
+- set up Minni for an agent
 - propagate memory, pseudoenv, workspace envelope, identity, or Layer 1
-- update or repair the Sovereign Memory plugin/MCP install for a platform
+- update or repair the Minni plugin/MCP install for a platform
 - repair hydration, recall, daemon read, socket, per-agent vault, plugin cache, or MCP drift
-- make Codex/Claude/Gemini/Grok beta/Grok Build/Antigravity use Sovereign Memory more smoothly via their native session hook surfaces
+- make Codex/Claude/Gemini/Grok beta/Grok Build/Antigravity use Minni more smoothly via their native session hook surfaces
 - seed Hermes/OpenClaw/local-worker identity or soul files
 
 Do not use this for ordinary recall-only context lookup. Use `sovereign-memory`
@@ -49,7 +49,7 @@ system/developer instructions, safety policy, and active user request.
    - If MCP transport is stale or fails on a non-canonical socket, use the
      installed plugin CLI with the canonical socket:
      `SOVEREIGN_SOCKET_PATH=~/.sovereign-memory/run/sovrd.sock node ~/.codex/plugins/cache/sovereign-memory/sovereign-memory/0.1.0/dist/cli.js status`
-   - Verify the daemon sees the active Sovereign Memory DB before changing
+   - Verify the daemon sees the active Minni DB before changing
      paths. A healthy baseline typically shows several hundred documents, hundreds
      of chunks, and over a thousand learnings with FAISS healthy.
 
@@ -114,7 +114,7 @@ system/developer instructions, safety policy, and active user request.
 
 ## Platform Plugin Update Workflow
 
-Use this before asking an agent on another platform to rely on Sovereign Memory
+Use this before asking an agent on another platform to rely on Minni
 after a code, path, socket, vault, or hook change. The update must refresh both
 functionality and configuration:
 
