@@ -3,7 +3,9 @@
 Generated: 2026-04-26
 Scope: repository root — Python engine daemon, retrieval, TypeScript MCP plugin, vault helpers, OpenClaw bridge, AFM prep.
 
-This plan covers what Sovereign Memory must ship before public release. It is deliberately scoped to the threats a *local-first, single-user* memory daemon faces — not enterprise multi-tenant hardening. A longer "v2 hardening" backlog is preserved at the bottom; nothing there blocks v1.
+> Project name: **Minni**. Internal architecture name: `sovereign-memory` (unchanged — MCP namespace, vault dir, daemon protocol). This document references the architecture name where it discusses the runtime; references to "Sovereign Memory" as the *product* should now be read as "Minni."
+
+This plan covers what Minni must ship before public release. It is deliberately scoped to the threats a *local-first, single-user* memory daemon faces — not enterprise multi-tenant hardening. A longer "v2 hardening" backlog is preserved at the bottom; nothing there blocks v1.
 
 ## Executive Summary
 

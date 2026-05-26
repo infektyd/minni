@@ -1,7 +1,7 @@
 ---
 version: alpha
-name: Sovereign Memory Console
-description: Agent-first operational interface for local memory inspection, context preparation, dry-run learning review, and explicit learning decisions.
+name: Minni Console
+description: Agent-first operational interface for local memory inspection, context preparation, dry-run learning review, and explicit learning decisions. (Project name: Minni. Internal architecture: sovereign-memory — unchanged.)
 colors:
   primary: "#181613"
   ink: "#181613"

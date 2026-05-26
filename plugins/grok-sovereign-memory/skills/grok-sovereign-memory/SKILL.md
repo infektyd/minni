@@ -15,11 +15,11 @@ This file contains **only** the Grok Build TUI-specific integration details that
 
 ---
 
-## Sovereign Memory Project-Specific Rule (V1)
+## Minni Project-Specific Rule (V1)
 
-When we're working inside `~/Projects/sovereignMemory`, the following is active (full version lives in `~/Projects/sovereignMemory/AGENTS.md`):
+When we're working inside `~/Projects/minni` (project name: **Minni**; internal architecture: `sovereign-memory`), the following is active (full version lives in `~/Projects/minni/AGENTS.md`):
 
-Sovereign Memory is a big, sprawling, multi-surface system — not just whatever folder has "sovereign-memory" in the name. `plugins/sovereign-memory/` is one piece, not the whole thing.
+Minni is a big, sprawling, multi-surface system — not just whatever folder has "sovereign-memory" in the name. `plugins/sovereign-memory/` is one piece of the architecture, not the whole thing.
 
 If the user starts talking about "live sovereign", "global sovereign", "the system", "downstream", or "what actually needs updating" after merges on main, treat it as a request to look at the gap between current `main` in the repo and *all* the installed/running/propagated pieces on the machine (daemon + engine behavior, the various skills, the big plugin, thin overlays like this one, hooks, etc.).
 

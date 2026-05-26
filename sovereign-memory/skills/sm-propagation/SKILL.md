@@ -118,14 +118,14 @@ Use this before asking an agent on another platform to rely on Sovereign Memory
 after a code, path, socket, vault, or hook change. The update must refresh both
 functionality and configuration:
 
-1. Build from the canonical repo (example): `~/Projects/sovereignMemory`.
+1. Build from the canonical repo (example): `~/Projects/minni`.
 2. Copy the current plugin package to the platform's installed plugin/cache
    location.
 3. Stamp the platform MCP config with explicit env:
    - `SOVEREIGN_AGENT_ID`
    - `SOVEREIGN_VAULT_PATH`
    - `SOVEREIGN_SOCKET_PATH=~/.sovereign-memory/run/sovrd.sock`
-   - `SOVEREIGN_WORKSPACE_ID=~/Projects/sovereignMemory` (example)
+   - `SOVEREIGN_WORKSPACE_ID=~/Projects/minni` (example)
 4. Bootstrap only an empty actual vault tree for that agent if missing.
 5. Never copy `wiki/`, `logs/`, `inbox/`, `index.md`, or `log.md` from another
    agent.
@@ -181,8 +181,8 @@ Common commands:
 ```bash
 python ~/.codex/skills/sm-propagation/scripts/propagate.py status --agent codex
 python ~/.codex/skills/sm-propagation/scripts/propagate.py update-plugin --platform codex
-python ~/.codex/skills/sm-propagation/scripts/propagate.py seed-hosted --agent codex --workspace ~/Projects/sovereignMemory
-python ~/.codex/skills/sm-propagation/scripts/propagate.py verify --agent codex --workspace ~/Projects/sovereignMemory
+python ~/.codex/skills/sm-propagation/scripts/propagate.py seed-hosted --agent codex --workspace ~/Projects/minni
+python ~/.codex/skills/sm-propagation/scripts/propagate.py verify --agent codex --workspace ~/Projects/minni
 ```
 
 The script may create/update local identity source files and DB identity rows.

@@ -82,7 +82,7 @@ The stale cache usually still contains HTTP fallback calls such as
 Build and test the repo plugin first:
 
 ```bash
-cd /Users/hansaxelsson/SovereignMemory/plugins/sovereign-memory
+cd /Users/hansaxelsson/Projects/minni/plugins/sovereign-memory
 npm run build
 npm test
 node dist/cli.js status
