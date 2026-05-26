@@ -5,20 +5,21 @@ source_file="${0}.swift"
 uid="$(id -u)"
 base_cache_dir="${TMPDIR:-/tmp}/sovereign-memory-afm-${uid}"
 
-if [[ -L "${base_cache_dir}" ]]; then
-  echo "Refusing symlink cache directory: ${base_cache_dir}" >&2
-  exit 1
-fi
-
-if [[ -e "${base_cache_dir}" ]]; then
+umask 077
+if ! mkdir "${base_cache_dir}" 2>/dev/null; then
+  if [[ -L "${base_cache_dir}" ]]; then
+    echo "Refusing symlink cache directory: ${base_cache_dir}" >&2
+    exit 1
+  fi
+  if [[ ! -d "${base_cache_dir}" ]]; then
+    echo "Cache path exists but is not a directory: ${base_cache_dir}" >&2
+    exit 1
+  fi
   owner_uid="$(stat -f %u "${base_cache_dir}")"
   if [[ "${owner_uid}" != "${uid}" ]]; then
     echo "Refusing cache directory not owned by current user: ${base_cache_dir}" >&2
     exit 1
   fi
-else
-  umask 077
-  mkdir -p "${base_cache_dir}"
 fi
 
 chmod 700 "${base_cache_dir}"
@@ -39,7 +40,6 @@ if [[ -x "${binary}" ]]; then
   fi
 else
   tmp_binary="$(mktemp "${base_cache_dir}/.native-afm-helper-${source_mtime}.XXXXXX")"
-  rm -f "${tmp_binary}"
   xcrun --sdk macosx swiftc -parse-as-library "${source_file}" -o "${tmp_binary}"
   chmod 700 "${tmp_binary}"
   mv -f "${tmp_binary}" "${binary}"
