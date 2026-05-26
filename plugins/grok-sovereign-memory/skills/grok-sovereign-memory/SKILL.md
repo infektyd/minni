@@ -1,13 +1,13 @@
 ---
 name: sovereign-memory
-description: Grok Build session hook integration and TUI-specific delivery for Sovereign Memory. Extends the canonical ~/.agents/skills/sovereign-memory/SKILL.md with native Grok memory, /flush participation, and lifecycle hook delivery. Load the canonical skill for the full mental model, reflexes, and ritual.
+description: Grok Build session hook integration and TUI-specific delivery for Minni. Extends the canonical ~/.agents/skills/sovereign-memory/SKILL.md with native Grok memory, /flush participation, and lifecycle hook delivery. Load the canonical skill for the full mental model, reflexes, and ritual.
 ---
 
-# Sovereign Memory — Grok Build Hybrid Integration
+# Minni — Grok Build Hybrid Integration
 
 **This file contains only the Grok Build TUI-specific integration details.**
 
-The authoritative, portable Sovereign Memory behaviors (Core Mental Model, prepare_task as default reflex, prepare_outcome discipline, Sovereign Distill Ritual V1 with gauges, team coordination, cross-agent contracts, Layer 1 contract, etc.) now live in the canonical skill:
+The authoritative, portable Minni behaviors (Core Mental Model, prepare_task as default reflex, prepare_outcome discipline, Sovereign Distill Ritual V1 with gauges, team coordination, cross-agent contracts, Layer 1 contract, etc.) now live in the canonical skill:
 
 **`~/.agents/skills/sovereign-memory/SKILL.md`**
 
@@ -33,7 +33,7 @@ Hold the full map. Don't let lexical anchoring on the substring "sovereign-memor
 - **Durable / governed path** (the stuff that actually survives crashes and matters later): All the `sovereign_*` tools. Especially `sovereign_prepare_task` before any real work and `sovereign_prepare_outcome` before you let anything get written or /flushed.
 - Before you hit native /flush or compact, run `sovereign_prepare_outcome` on the decisions, scar tissue, and open questions. The hooks will quietly draft the good stuff to your sovereign inbox so it doesn't get lost in the noise.
 - Want to actually see the vault? Use the `axpress` MCP or just open Obsidian and browse wiki/, inbox/, the gauges, Layer 1, whatever. It's all there.
-- The whole point: native Grok memory stays snappy and local. Sovereign Memory is the long-term, high-signal, human-gated, cross-agent stuff that actually sticks around when the TUI dies on you (again).
+- The whole point: native Grok memory stays snappy and local. Minni is the long-term, high-signal, human-gated, cross-agent stuff that actually sticks around when the TUI dies on you (again).
 
 ---
 

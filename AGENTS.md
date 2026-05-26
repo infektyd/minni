@@ -1,10 +1,8 @@
 # AGENTS.md — Minni (root)
 
-> **Identity banner.** This project is **Minni**. The substring `sovereign-memory` is the *internal architecture name* — the MCP namespace, vault directory, plugin IDs, daemon protocol. It is **not a separate project**. One repo, two names: Minni (brand) and sovereign-memory (architecture). The working copy lives at `~/Projects/minni/` (repo `infektyd/minni`).
-
 Hey. This file is here because we keep running into the same dumb pattern and it slows us down when we're actually trying to build the damn thing.
 
-We're inside `~/Projects/minni`. This is not a normal codebase. Minni (architecture name: sovereign-memory) is a big, weird, living system with a bunch of different surfaces and tentacles that reach out into the rest of the machine. Treating it like "just the plugin folder" or "just whatever has 'sovereign-memory' in the path" is how we end up in the exact regression loop we were just in.
+We're inside `~/Projects/minni` — this is **Minni**, repo `infektyd/minni`. This is not a normal codebase. Minni is a big, weird, living system with a bunch of different surfaces and tentacles that reach out into the rest of the machine. Treating it like "just the plugin folder" or "just whatever has 'sovereign-memory' in the path" is how we end up in the exact regression loop we were just in. (`sovereign-memory` is the legacy internal identifier — MCP namespace, vault dir, slash-command prefix. Still in use; will be migrated to `minni` in a later pass. Don't let that substring narrow your scope.)
 
 ### The Real Rule
 

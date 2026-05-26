@@ -1,7 +1,7 @@
 ---
 version: alpha
 name: Minni Console
-description: Agent-first operational interface for local memory inspection, context preparation, dry-run learning review, and explicit learning decisions. (Project name: Minni. Internal architecture: sovereign-memory — unchanged.)
+description: Agent-first operational interface for local memory inspection, context preparation, dry-run learning review, and explicit learning decisions.
 colors:
   primary: "#181613"
   ink: "#181613"
@@ -362,11 +362,11 @@ components:
     padding: 16px
 ---
 
-# Sovereign Memory Console
+# Minni Console
 
 ## Overview
 
-Sovereign Memory Console is an operational surface for agents and humans to inspect local memory, prepare context packets, drive Deep Research runs, review evidence, and make explicit learning decisions. It is private by posture and procedural by temperament: the interface should feel like a careful audit desk connected to a local control room.
+Minni Console is an operational surface for agents and humans to inspect local memory, prepare context packets, drive Deep Research runs, review evidence, and make explicit learning decisions. It is private by posture and procedural by temperament: the interface should feel like a careful audit desk connected to a local control room.
 
 The design exists to answer six questions quickly: what is the daemon doing, what research is running, what evidence is included, why was it ranked that way, what privacy or AFM constraints apply, and what action is safe next. Decorative motion, dramatic hero layouts, and brand spectacle are out of scope. Evidence is the visual subject.
 

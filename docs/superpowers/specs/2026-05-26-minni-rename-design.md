@@ -4,9 +4,9 @@
 
 ## Why
 
-Agents repeatedly treat "Minni" and `~/Projects/sovereignMemory` as two different projects, over-engineering integration bridges between what is actually one repo. This is friction in chat, not a code problem. The fix is to make the equivalence loud and unmistakable where any agent looks first.
+Agents repeatedly treat "Minni" and `~/Projects/sovereignMemory` as two different projects, over-engineering integration bridges between what is actually one repo. The user has to keep typing "sovereign memory" everywhere to be understood. This is friction in chat, not a code problem.
 
-The brand voice doc (`.claude/brand-voice-guidelines.md`) frames the rebrand as "presentation-only — no code changes." This spec interprets that as: **no functional change, no runtime-contract rename**. Identity surfaces (directory name, repo name, top-level docs) are in scope.
+The brand voice doc (`.claude/brand-voice-guidelines.md`) framed the rebrand as "presentation-only — no code changes." This spec interprets that as: **no functional change**. Identity surfaces (directory name, repo name, top-level docs, plugin display names, agent-facing skill descriptions) are in scope. Runtime identifiers (slash-command prefix, MCP namespace, vault directory path) stay on the legacy `sovereign-memory` string for now and will be migrated in a separate pass.
 
 ## What changes
 
@@ -14,20 +14,29 @@ The brand voice doc (`.claude/brand-voice-guidelines.md`) frames the rebrand as 
 |---|---|---|
 | 1 | Local working copy | `~/Projects/sovereignMemory/` → `~/Projects/minni/` |
 | 2 | GitHub repo | `infektyd/sovereign-memory` → `infektyd/minni` (auto-redirect) |
-| 3 | `README.md` | Hero + first section rebrand to "Minni"; add one-line disambiguator |
-| 4 | `AGENTS.md` | New top banner: "This project is **Minni**. Substring `sovereign-memory` is internal architecture, not a separate project." Existing anti-narrowing rule stays. |
-| 5 | `DESIGN.md`, `SECURITY_PLAN.md` | Title + one-line note. Body unchanged. |
-| 6 | Hardcoded paths | 5 files reference `/Users/hansaxelsson/Projects/sovereignMemory/...` — replace with `.../minni/...` |
-| 7 | Project memory | Record one sovereign-memory `learn`: "Minni == infektyd/minni == ~/Projects/minni == architecture sovereign-memory"; update global `~/CLAUDE.md` project table |
+| 3 | `README.md` | Hero rebrand to "Minni" — single name, no dual-name disclaimer |
+| 4 | `AGENTS.md` | Header + anti-narrowing rule reworded to use "Minni" as the product noun |
+| 5 | `DESIGN.md` | Title + body "Sovereign Memory Console" → "Minni Console" |
+| 6 | `SECURITY_PLAN.md` | "Sovereign Memory" product mentions → "Minni" |
+| 7 | Hardcoded project paths | 5+ files referencing `~/Projects/sovereignMemory` → `~/Projects/minni` |
+| 8 | Plugin manifests (display name, author, description, homepage) | `.claude-plugin/plugin.json`, `.claude-plugin/marketplace.json`, `openclaw-extension/plugin.json` + `openclaw.plugin.json` + `package.json` + `README.md`. Plugin `name` field stays `sovereign-memory` because it's the slash-command prefix (eventual rename). |
+| 9 | Agent-facing skill descriptions | `sm-propagation` SKILL.md and `grok-sovereign-memory` SKILL.md frontmatter `description` + bodies |
+| 10 | Synonyms / NL aliases | `engine/data/synonyms.yml` adds `minni daemon` alias |
+| 11 | Reference plates README | "Sovereign Memory Reference Plates" → "Minni Reference Plates" |
+| 12 | Project memory | One sovereign-memory `learn` recording the equivalence; update global `~/CLAUDE.md` project table |
 
-## What stays (explicit)
+## What stays (explicit) — runtime contracts, eventual rename
 
-- `plugins/sovereign-memory/`, `plugins/grok-sovereign-memory/`, top-level `sovereign-memory/`
-- `mcp__sovereign-memory__*` MCP tool namespace
-- `~/.sovereign-memory/` vault directory
-- All Python/TS module names, daemon protocol, schema, `agent_origin` tags
+These are the legacy `sovereign-memory` strings still in use. Migration to `minni` is a separate, coordinated pass (it forces MCP re-registration across every agent host).
+
+- Slash-command prefix: `/sovereign-memory:recall`, `/sovereign-memory:learn`, …
+- MCP tool namespace: `mcp__sovereign-memory__*`
+- Vault directory: `~/.sovereign-memory/`
+- Plugin directories: `plugins/sovereign-memory/`, `plugins/grok-sovereign-memory/`, top-level `sovereign-memory/`
+- Plugin manifest `name`/`id` fields (drive the slash prefix above)
+- Python/TS module names, daemon protocol, DB schema, `agent_origin` tags
 - Skill IDs (`sovereign-memory:recall`, etc.)
-- Brand voice doc content (already correct)
+- Deep historical / analytical docs (`docs/RC_PLAN.md`, `docs/OBSERVED-USAGE.md`, `docs/ENGINEERING-REVIEW.md`, `docs/plans/`, `docs/research/`, `docs/reviews/`, `sovereign-memory/workflows/generalization/`) keep their original "Sovereign Memory" product-noun usage as historical record.
 
 ## Order of operations
 
