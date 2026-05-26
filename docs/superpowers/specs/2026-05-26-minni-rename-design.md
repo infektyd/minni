@@ -12,13 +12,13 @@ The brand voice doc (`.claude/brand-voice-guidelines.md`) framed the rebrand as 
 
 | # | Surface | Change |
 |---|---|---|
-| 1 | Local working copy | `~/Projects/sovereignMemory/` → `~/Projects/minni/` |
+| 1 | Local working copy | `~/Projects/sovereignMemory/` → `~/Projects/minni/` — **pending; manual step after daemon restart** |
 | 2 | GitHub repo | `infektyd/sovereign-memory` → `infektyd/minni` (auto-redirect) |
-| 3 | `README.md` | Hero rebrand to "Minni" — single name, no dual-name disclaimer |
+| 3 | `README.md` | Title + body rebrand to "Minni" — single name, no dual-name disclaimer |
 | 4 | `AGENTS.md` | Header + anti-narrowing rule reworded to use "Minni" as the product noun |
 | 5 | `DESIGN.md` | Title + body "Sovereign Memory Console" → "Minni Console" |
 | 6 | `SECURITY_PLAN.md` | "Sovereign Memory" product mentions → "Minni" |
-| 7 | Hardcoded project paths | 5+ files referencing `~/Projects/sovereignMemory` → `~/Projects/minni` |
+| 7 | ~~Hardcoded project paths~~ | **Deferred to a follow-up PR after the local `mv`** — runtime configs (e.g. Grok `SOVEREIGN_WORKSPACE_ID`) and helper-script defaults (`propagate.py --repo`) must change together with the actual filesystem move to avoid breaking workspace scoping. This PR keeps every `~/Projects/sovereignMemory` path intact. |
 | 8 | Plugin manifests (display name, author, description, homepage) | `.claude-plugin/plugin.json`, `.claude-plugin/marketplace.json`, `openclaw-extension/plugin.json` + `openclaw.plugin.json` + `package.json` + `README.md`. Plugin `name` field stays `sovereign-memory` because it's the slash-command prefix (eventual rename). |
 | 9 | Agent-facing skill descriptions | `sm-propagation` SKILL.md and `grok-sovereign-memory` SKILL.md frontmatter `description` + bodies |
 | 10 | Synonyms / NL aliases | `engine/data/synonyms.yml` adds `minni daemon` alias |

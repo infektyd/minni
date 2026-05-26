@@ -4,7 +4,7 @@ Covers:
   - _handle_learn rejects content longer than 64 KiB with code -32602.
   - _handle_learn accepts content of exactly 64 KiB.
   - _warn_if_sync_root emits a warning for paths under ~/Dropbox/...
-  - _warn_if_sync_root stays silent for ordinary paths (~/minni/...).
+  - _warn_if_sync_root stays silent for ordinary paths (~/sovereignMemory/...).
 
 The 1 MiB readuntil limit on the Unix socket is exercised at the asyncio
 StreamReader level and is not unit-tested here — exercising it requires

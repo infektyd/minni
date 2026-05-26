@@ -17,7 +17,7 @@ This file contains **only** the Grok Build TUI-specific integration details that
 
 ## Minni Project-Specific Rule (V1)
 
-When we're working inside `~/Projects/minni` (project name: **Minni**; internal architecture: `sovereign-memory`), the following is active (full version lives in `~/Projects/minni/AGENTS.md`):
+When we're working inside `~/Projects/sovereignMemory` (project name: **Minni** — directory rename pending), the following is active (full version lives in `~/Projects/sovereignMemory/AGENTS.md`):
 
 Minni is a big, sprawling, multi-surface system — not just whatever folder has "sovereign-memory" in the name. `plugins/sovereign-memory/` is one piece of the architecture, not the whole thing.
 
