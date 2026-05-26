@@ -105,12 +105,12 @@ function readDistillMode() {
  */
 function readGaugesForInjection() {
   try {
-    if (!fs.existsSync(DISTILL_GAUGES)) {
-      return '(gauges.md not present — seed via ritual or SOVEREIGN-DISTILL-RITUAL-GUIDE.md; default to explicit mode)';
-    }
     const stat = fs.statSync(DISTILL_GAUGES);
     return `gauges.md present (updated ${stat.mtime.toISOString()}). Read local file distill/gauges.md before ritual decisions.`;
   } catch (e) {
+    if (e.code === 'ENOENT') {
+      return '(gauges.md not present — seed via ritual or SOVEREIGN-DISTILL-RITUAL-GUIDE.md; default to explicit mode)';
+    }
     console.error(`[grok-sovereign-hook] readGaugesForInjection failed: ${e.message}`);
     return '(gauges unavailable — open local distill/gauges.md directly per SKILL)';
   }
