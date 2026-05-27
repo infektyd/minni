@@ -36,8 +36,8 @@ CHUNK_COLUMNS = [
 
 
 def get_existing_columns(conn: sqlite3.Connection, table: str) -> set[str]:
-    cursor = conn.execute(f"PRAGMA table_info({table})")
-    return {row[1] for row in cursor.fetchall()}
+    cursor = conn.execute("SELECT name FROM pragma_table_info(?)", (table,))
+    return {row[0] for row in cursor.fetchall()}
 
 
 def add_columns(conn: sqlite3.Connection, table: str, columns: list[tuple[str, str]]):
