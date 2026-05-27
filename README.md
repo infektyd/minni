@@ -460,4 +460,4 @@ Also run a temp-state live smoke:
 
 ---
 
-<sub>Minni is a local-only project. No telemetry, no cloud sync, no remote endpoints.</sub>
+<sub>Minni is a local-first project. No telemetry, no cloud sync, no remote endpoints needed.</sub>
