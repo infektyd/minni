@@ -103,28 +103,25 @@ function readDistillMode() {
  * Returns short prefix + note to read full file. Never leaks secrets (our controlled artifact).
  * Used for SessionStart (Layer 1 proximity) and distill keyword fallback.
  */
-function readGaugesForInjection(maxLines = 18) {
+function readGaugesForInjection() {
   try {
-    if (!fs.existsSync(DISTILL_GAUGES)) {
+    const stat = fs.statSync(DISTILL_GAUGES);
+    return `gauges.md present (updated ${stat.mtime.toISOString()}). Read local file distill/gauges.md before ritual decisions.`;
+  } catch (e) {
+    if (e.code === 'ENOENT') {
       return '(gauges.md not present — seed via ritual or SOVEREIGN-DISTILL-RITUAL-GUIDE.md; default to explicit mode)';
     }
-    const full = fs.readFileSync(DISTILL_GAUGES, 'utf8');
-    const lines = full.trim().split('\n').slice(0, maxLines);
-    const more = full.split('\n').length > maxLines;
-    return lines.join('\n') + (more ? '\n... (read full distill/gauges.md for complete live context meter + Decision Aids)' : '');
-  } catch (e) {
     console.error(`[grok-sovereign-hook] readGaugesForInjection failed: ${e.message}`);
-    return '(gauges read error — fall back to direct vault file distill/gauges.md per SKILL)';
+    return '(gauges unavailable — open local distill/gauges.md directly per SKILL)';
   }
 }
 
 function buildStatusLine() {
   const pending = countInbox();
-  const snippet = recentLogSnippet(5);
   return [
     `Sovereign Memory (grok-build) active.`,
     pending > 0 ? `${pending} pending item(s) in your inbox — review with sovereign_audit_tail or the console.` : 'Inbox clean.',
-    snippet ? `Recent log tail:\n${snippet}` : ''
+    'Local vault content is never auto-injected into model context; inspect logs/distill files locally via sovereign tools.'
   ].filter(Boolean).join('\n');
 }
 
@@ -172,7 +169,7 @@ try {
     ].join('\n');
     const dmode = readDistillMode();
     if (dmode !== 'disabled') {
-      const g = readGaugesForInjection(12);
+      const g = readGaugesForInjection();
       msg += `\n<sovereign:distill-gauges mode="${dmode}" agent="grok-build">Sovereign Distill ritual active (real Layer 1 = identity:grok-build + layer1/ installed; this V1 injection on top). Read gauges first at wind-down. Gauges:\n${g}\nFollow SKILL "Sovereign Distill Ritual" (explicit yes/no or auto per mode file). Keyword fallback also supported on UserPromptSubmit.</sovereign:distill-gauges>`;
     }
     output.systemMessage = msg;
@@ -224,7 +221,7 @@ try {
       if (distillMatch) {
         const dmode = readDistillMode();
         if (dmode !== 'disabled') {
-          const g = readGaugesForInjection(10);
+          const g = readGaugesForInjection();
           output.systemMessage = `Sovereign Memory: distill keyword detected ("${distillMatch[0]}"). Mode: ${dmode}. Gauges (read full distill/gauges.md first):\n${g}\n\nFollow the Sovereign Distill Ritual workflow in SKILL (explicit gate or auto per mode file).`;
         }
       }
