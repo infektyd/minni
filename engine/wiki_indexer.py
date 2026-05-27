@@ -528,10 +528,7 @@ class WikiIndexer:
             if source_doc_id == target_doc_id:
                 continue
 
-            edge_key = (source_doc_id, target_doc_id)
-            if edge_key in seen:
-                continue
-            seen.add(edge_key)
+            insert_data.append((source_doc_id, target_doc_id, "wikilink", 1.0, now))
 
             insert_data.append((source_doc_id, target_doc_id, "wikilink", 1.0, now))
 
