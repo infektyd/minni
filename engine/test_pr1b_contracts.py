@@ -185,8 +185,8 @@ class TestDepthTiers:
                 seen.update(kwargs)
                 return [{"doc_id": 1, "chunk_id": 10, "depth": kwargs["depth"]}]
 
-        monkeypatch.setattr(sovrd, "_lazy_retrieval", lambda: FakeEngine())
-        response = sovrd._dispatch_sync({
+        monkeypatch.setattr(minnid, "_lazy_retrieval", lambda: FakeEngine())
+        response = minnid._dispatch_sync({
             "jsonrpc": "2.0",
             "id": 100,
             "method": "search",
@@ -207,8 +207,8 @@ class TestDepthTiers:
                 calls.append((result_id, depth))
                 return {"doc_id": result_id, "chunk_id": result_id * 10, "depth": depth}
 
-        monkeypatch.setattr(sovrd, "_lazy_retrieval", lambda: FakeEngine())
-        response = sovrd._dispatch_sync({
+        monkeypatch.setattr(minnid, "_lazy_retrieval", lambda: FakeEngine())
+        response = minnid._dispatch_sync({
             "jsonrpc": "2.0",
             "id": 101,
             "method": "sm_drill",
@@ -247,7 +247,7 @@ class TestDepthTiers:
                     },
                 ]
 
-        monkeypatch.setattr(sovrd, "_lazy_retrieval", lambda: FakeEngine())
+        monkeypatch.setattr(minnid, "_lazy_retrieval", lambda: FakeEngine())
         request = {
             "jsonrpc": "2.0",
             "id": 102,
@@ -255,8 +255,8 @@ class TestDepthTiers:
             "params": {"query": "cache prefix", "budget_tokens": 100, "cache_key": "k1"},
         }
 
-        first = sovrd._dispatch_sync(request)["result"]
-        second = sovrd._dispatch_sync(request)["result"]
+        first = minnid._dispatch_sync(request)["result"]
+        second = minnid._dispatch_sync(request)["result"]
 
         assert first["manifest_hash"] == second["manifest_hash"]
         assert first["cache_key"] == "k1"

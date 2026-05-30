@@ -185,9 +185,9 @@ def test_sovrd_search_forwards_expand_and_summarize(monkeypatch):
             captured.update(kwargs)
             return [{"source": "ok", "query_variants": ["q", "expanded q"]}]
 
-    monkeypatch.setattr(sovrd, "_lazy_retrieval", lambda: FakeEngine())
+    monkeypatch.setattr(minnid, "_lazy_retrieval", lambda: FakeEngine())
 
-    resp = sovrd._handle_search({
+    resp = minnid._handle_search({
         "query": "q",
         "expand": "afm",
         "summarize_neighborhood": True,

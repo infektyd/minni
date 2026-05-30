@@ -56,7 +56,7 @@ def _patch_writeback_no_model(tmp_path: Path, monkeypatch):
 
     db_obj, cfg = _make_db(tmp_path)
     wb = wb_mod.WriteBackMemory(db_obj, cfg)
-    monkeypatch.setattr(sovrd, "_writeback", wb)
+    monkeypatch.setattr(minnid, "_writeback", wb)
 
     # Replace the .model property so contradiction detection + encode skip.
     # monkeypatch.setattr unwinds the change at the end of the test.
@@ -148,7 +148,7 @@ class TestWarnIfSyncRoot:
         sync_dir = tmp_path / "Dropbox" / "foo"
         sync_dir.mkdir(parents=True)
 
-        with caplog.at_level(logging.WARNING, logger="sovrd"):
+        with caplog.at_level(logging.WARNING, logger="minnid"):
             _warn_if_sync_root("vault", sync_dir)
 
         msgs = [r.getMessage() for r in caplog.records]
@@ -164,7 +164,7 @@ class TestWarnIfSyncRoot:
         icloud_dir = tmp_path / "Library" / "Mobile Documents" / "com~apple~CloudDocs" / "vault"
         icloud_dir.mkdir(parents=True)
 
-        with caplog.at_level(logging.WARNING, logger="sovrd"):
+        with caplog.at_level(logging.WARNING, logger="minnid"):
             _warn_if_sync_root("vault", icloud_dir)
 
         msgs = [r.getMessage() for r in caplog.records]
@@ -181,7 +181,7 @@ class TestWarnIfSyncRoot:
         normal_dir = tmp_path / "sovereignMemory" / "foo"
         normal_dir.mkdir(parents=True)
 
-        with caplog.at_level(logging.WARNING, logger="sovrd"):
+        with caplog.at_level(logging.WARNING, logger="minnid"):
             _warn_if_sync_root("vault", normal_dir)
 
         msgs = [r.getMessage() for r in caplog.records]
@@ -202,7 +202,7 @@ class TestWarnIfSyncRoot:
         outside = tmp_path / "etc" / "Dropbox"
         outside.mkdir(parents=True)
 
-        with caplog.at_level(logging.WARNING, logger="sovrd"):
+        with caplog.at_level(logging.WARNING, logger="minnid"):
             _warn_if_sync_root("vault", outside)
 
         msgs = [r.getMessage() for r in caplog.records]

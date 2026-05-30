@@ -450,9 +450,9 @@ class TestDatasetValidationAndGate:
         assert candidates[0]["reviewed"] is False
         assert candidates[0]["expected_refs"] == [str(source / "AGENT.md")]
 
-    def test_gate_fails_when_sovrd_loses_to_ripgrep_too_often(self):
+    def test_gate_fails_when_minnid_loses_to_ripgrep_too_often(self):
         reports = {
-            "sovrd": {
+            "minnid": {
                 "per_query": [
                     {"query": "a", "recall_at_k": {5: 0.0}},
                     {"query": "b", "recall_at_k": {5: 1.0}},
@@ -466,7 +466,7 @@ class TestDatasetValidationAndGate:
             },
         }
 
-        gate = evaluate_gate(reports, primary="sovrd", baseline="ripgrep", max_loss_rate=0.20)
+        gate = evaluate_gate(reports, primary="minnid", baseline="ripgrep", max_loss_rate=0.20)
 
         assert gate["ok"] is False
         assert gate["loss_rate"] == pytest.approx(0.5)

@@ -60,7 +60,7 @@ def setup_hermetic_principals(tmp_path, monkeypatch):
         )
 
     monkeypatch.setattr(principal, "resolve_effective_principal", _patched_resolve)
-    monkeypatch.setattr(sovrd, "resolve_effective_principal", _patched_resolve)
+    monkeypatch.setattr(minnid, "resolve_effective_principal", _patched_resolve)
 
 
 
@@ -473,7 +473,7 @@ class TestHandleLearn:
 
         db_obj, cfg = _make_db(tmp_path)
         wb = WriteBackMemory(db_obj, cfg)
-        monkeypatch.setattr(sovrd, "_writeback", wb)
+        monkeypatch.setattr(minnid, "_writeback", wb)
         return wb, db_obj, cfg
 
     def test_backward_compat_no_new_fields(self, tmp_path, monkeypatch):
@@ -676,7 +676,7 @@ class TestHandleResolveContradiction:
         from writeback import WriteBackMemory
         db_obj, cfg = _make_db(tmp_path)
         wb = WriteBackMemory(db_obj, cfg)
-        monkeypatch.setattr(sovrd, "_writeback", wb)
+        monkeypatch.setattr(minnid, "_writeback", wb)
         return wb, db_obj, cfg
 
     def test_resolve_writes_new_and_supersedes_old(self, tmp_path, monkeypatch):
@@ -959,7 +959,7 @@ class TestFullWorkflow:
         from writeback import WriteBackMemory
         db_obj, cfg = _make_db(tmp_path)
         wb = WriteBackMemory(db_obj, cfg)
-        monkeypatch.setattr(sovrd, "_writeback", wb)
+        monkeypatch.setattr(minnid, "_writeback", wb)
         return wb, db_obj, cfg
 
     def test_seed_detect_resolve(self, tmp_path, monkeypatch):

@@ -151,11 +151,11 @@ def test_daemon_compile_reaches_pr13_passes_and_wet_run_keeps_drafts_pending(tmp
             tags=["endorsement"],
         )
     _seed_repeated_events(db_obj)
-    monkeypatch.setattr(sovrd, "DEFAULT_CONFIG", cfg)
-    monkeypatch.setattr(sovrd, "_writeback", None)
-    monkeypatch.setattr(sovrd, "SovereignDB", lambda config=None: db_obj)
+    monkeypatch.setattr(minnid, "DEFAULT_CONFIG", cfg)
+    monkeypatch.setattr(minnid, "_writeback", None)
+    monkeypatch.setattr(minnid, "SovereignDB", lambda config=None: db_obj)
 
-    synth_resp = sovrd._dispatch_sync(
+    synth_resp = minnid._dispatch_sync(
         {
             "jsonrpc": "2.0",
             "id": 1,
@@ -163,7 +163,7 @@ def test_daemon_compile_reaches_pr13_passes_and_wet_run_keeps_drafts_pending(tmp
             "params": {"pass_name": "synthesis", "vault_path": str(vault), "dry_run": False},
         }
     )
-    proc_resp = sovrd._dispatch_sync(
+    proc_resp = minnid._dispatch_sync(
         {
             "jsonrpc": "2.0",
             "id": 2,
@@ -183,7 +183,7 @@ def test_daemon_compile_reaches_pr13_passes_and_wet_run_keeps_drafts_pending(tmp
         assert "agent: afm-loop" in text
         assert "trace_id:" in text
         assert "status: accepted" not in text
-        trace = sovrd._dispatch_sync({"jsonrpc": "2.0", "id": 3, "method": "trace", "params": {"trace_id": result["trace_id"]}})
+        trace = minnid._dispatch_sync({"jsonrpc": "2.0", "id": 3, "method": "trace", "params": {"trace_id": result["trace_id"]}})
         assert trace["result"]["trace"]["pass_name"] == expected_pass
         assert trace["result"]["trace"]["prompt_version"]
 

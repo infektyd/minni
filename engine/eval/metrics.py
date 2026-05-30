@@ -317,7 +317,7 @@ def _metric_value(per_query: Dict[str, Any], metric: str, k: int) -> float:
 
 def evaluate_gate(
     reports: Dict[str, Dict[str, Any]],
-    primary: str = "sovrd",
+    primary: str = "minnid",
     baseline: str = "ripgrep",
     max_loss_rate: float = 0.20,
     metric: str = "recall_at_k",

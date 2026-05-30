@@ -201,7 +201,7 @@ def make_searcher(
     search_root = root or repo_root()
     if key in {"mock"}:
         return MockSearcher(queries)
-    if key in {"sovrd", "baseline"}:
+    if key in {"minnid", "sovrd", "baseline"}:
         return RealSearcher()
     if key in {"ripgrep", "rg"}:
         return RipgrepSearcher(search_root)
@@ -210,7 +210,7 @@ def make_searcher(
     if key in {"vendor", "vendor-memory", "vendor_memory"}:
         return VendorMemorySearcher()
     raise ValueError(
-        f"Unknown retriever {name!r}. Available: sovrd, ripgrep, raw-context, vendor-memory, mock"
+        f"Unknown retriever {name!r}. Available: minnid, ripgrep, raw-context, vendor-memory, mock"
     )
 
 

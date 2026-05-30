@@ -163,7 +163,7 @@ def test_make_mismatch_error_shape():
 
 
 def _call_handler_with_mismatch(handler, supplied: str = "evil-spoof"):
-    """Invoke a sovrd _handle_* and assert it returns identity_mismatch error without side effects."""
+    """Invoke a minnid _handle_* and assert it returns identity_mismatch error without side effects."""
     params = {
         "agent_id": supplied,
         "query": "test",
@@ -228,18 +228,18 @@ def test_all_rpc_paths_deny_mismatched_identity(
 
     # Use pytest monkeypatch fixture (project idiom, auto-restore, scope-safe)
     monkeypatch.setattr(principal, "resolve_effective_principal", _patched_resolve)
-    monkeypatch.setattr(sovrd, "resolve_effective_principal", _patched_resolve)
+    monkeypatch.setattr(minnid, "resolve_effective_principal", _patched_resolve)
     handlers = [
-        sovrd._handle_search,
-        sovrd._handle_feedback,
-        sovrd._handle_read,
-        sovrd._handle_learn,
-        sovrd._handle_log_event,
-        sovrd._handle_resolve_contradiction,
-        sovrd._handle_daemon_handoff,  # now stamped + denies mismatch (G11)
-        sovrd._handle_sm_export_pack,  # G11 critical: now guarded (was direct agent_id bypass)
-        sovrd._handle_list_pending_handoffs,  # G11 critical: now guarded
-        sovrd._handle_subscribe_contradictions,  # G11 critical: now guarded
+        minnid._handle_search,
+        minnid._handle_feedback,
+        minnid._handle_read,
+        minnid._handle_learn,
+        minnid._handle_log_event,
+        minnid._handle_resolve_contradiction,
+        minnid._handle_daemon_handoff,  # now stamped + denies mismatch (G11)
+        minnid._handle_sm_export_pack,  # G11 critical: now guarded (was direct agent_id bypass)
+        minnid._handle_list_pending_handoffs,  # G11 critical: now guarded
+        minnid._handle_subscribe_contradictions,  # G11 critical: now guarded
     ]
     for h in handlers:
         _call_handler_with_mismatch(h, supplied="not-canonical")

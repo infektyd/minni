@@ -59,7 +59,7 @@ from typing import Any, List, Optional
 
 from config import CANONICAL_SOVEREIGN_HOME
 
-logger = logging.getLogger("sovrd.principal")
+logger = logging.getLogger("minnid.principal")
 
 PRINCIPALS_DIR: Path = Path(CANONICAL_SOVEREIGN_HOME) / "principals"
 
@@ -331,7 +331,7 @@ def resolve_effective_principal(
 # Convenience for handlers that want a ready-made JSON-RPC error payload
 def make_mismatch_error(supplied: str, stamped: str, request_id: Any = None) -> dict:
     """Return a JSON-RPC error dict for identity mismatch (code -32000)."""
-    # Local import to avoid any potential cycle with sovrd
+    # Local import to avoid any potential cycle with minnid
     try:
         from minnid import _make_error  # type: ignore
 
@@ -378,7 +378,7 @@ def can_read_document(
 ) -> bool:
     """G19: Single centralized read authorization gate (SEC-005).
 
-    ALL read surfaces (sovrd _handle_search/_handle_read/_handle_expand + handoff wikilinks,
+    ALL read surfaces (minnid _handle_search/_handle_read/_handle_expand + handoff wikilinks,
     retrieval.retrieve/expand_result/search_*, agent_api.recall, any console/DB read path)
     MUST call this before surfacing doc/chunk content, provenance, or wikilink targets.
 

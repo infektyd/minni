@@ -45,7 +45,7 @@ test("formatRecall returns concise markdown with query and provenance", () => {
   assert.match(formatted, /agent=codex/);
   assert.match(formatted, /AI Context Pack/);
   assert.match(formatted, /\[\[wiki\/sessions\/socket-health\]\]/);
-  assert.match(formatted, /Use ~\/\.minni\/run\/sovrd\.sock/);
+  assert.match(formatted, /Use ~\/\.minni\/run\/minnid\.sock/);
 });
 
 test("formatRecall includes backend badge when recall reports backend provenance", () => {

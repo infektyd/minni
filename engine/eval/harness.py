@@ -127,7 +127,7 @@ def cmd_run(args: argparse.Namespace) -> None:
     """Run evaluation for one or more configs and write reports."""
     config_names = [c.strip() for c in args.config.split(",")]
     retriever_names = [
-        c.strip() for c in getattr(args, "retrievers", "sovrd").split(",") if c.strip()
+        c.strip() for c in getattr(args, "retrievers", "minnid").split(",") if c.strip()
     ]
 
     unknown = [c for c in config_names if c not in CONFIGS]
@@ -264,13 +264,13 @@ def main(argv: Optional[list[str]] = None) -> None:
     )
     run_p.add_argument(
         "--retrievers",
-        default="sovrd",
-        help="Comma-separated retrievers: sovrd,ripgrep,raw-context,vendor,mock",
+        default="minnid",
+        help="Comma-separated retrievers: minnid,ripgrep,raw-context,vendor,mock",
     )
     run_p.add_argument(
         "--gate",
         action="store_true",
-        help="Validate queries and fail if sovrd loses to ripgrep on >20%% of comparable queries",
+        help="Validate queries and fail if minnid loses to ripgrep on >20%% of comparable queries",
     )
 
     rec_p = sub.add_parser("record", help="Append a query to eval/queries.jsonl")

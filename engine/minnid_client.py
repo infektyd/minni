@@ -72,7 +72,7 @@ def _rpc(socket_path: str, method: str, params: dict = None) -> dict:
         return resp.get("result", {})
 
     except ConnectionRefusedError:
-        print("Error: connection refused — is sovrd running?", file=sys.stderr)
+        print("Error: connection refused — is minnid running?", file=sys.stderr)
         sys.exit(1)
     except socket.timeout:
         print("Error: request timed out.", file=sys.stderr)
@@ -127,7 +127,7 @@ def _cmd_status(args):
     engine = result.get("engine", {})
     stats = engine.get("stats", {})
 
-    print("sovrd Daemon Status")
+    print("minnid Daemon Status")
     print("─" * 40)
     print(f"  Version:      {daemon.get('version', '?')}")
     print(f"  Uptime:       {daemon.get('uptime_seconds', 0):.0f}s")
@@ -217,7 +217,7 @@ def _cmd_ping(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="sovrd CLI client")
+    parser = argparse.ArgumentParser(description="minnid CLI client")
     parser.add_argument("--socket", "-s", default=DEFAULT_SOCKET,
                         help="Unix socket path")
     sub = parser.add_subparsers(dest="command")

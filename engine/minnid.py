@@ -74,7 +74,7 @@ from typing import Any, Dict, Optional
 
 # ── Logging ───────────────────────────────────────────────────────────────
 
-logger = logging.getLogger("sovrd")
+logger = logging.getLogger("minnid")
 
 # ── Sovereign engine imports ─────────────────────────────────────────────
 # The daemon lives alongside the Sovereign engine so we can import its
@@ -1441,7 +1441,7 @@ def _handle_read(params: dict, request_id: Any) -> dict:
                             """INSERT INTO learning_reads
                                (learning_id, agent_id, read_at, source)
                                VALUES (?, ?, ?, ?)""",
-                            (row["learning_id"], agent_id, time.time(), "sovrd.read"),
+                            (row["learning_id"], agent_id, time.time(), "minnid.read"),
                         )
                     except Exception:
                         pass
@@ -2588,7 +2588,7 @@ async def _dispatch(request: dict) -> dict:
 
 
 # Sync facade for legacy direct callers in the test suite (post RCM-006/007 async _dispatch refactor).
-# ~30 call sites in test_*.py used synchronous sovrd._dispatch({...})["result"]; they now use this.
+# ~30 call sites in test_*.py used synchronous minnid._dispatch({...})["result"]; they now use this.
 # Real daemon paths (_handle_client, HTTP entry) use await _dispatch or the full async loop.
 # This keeps all tests green without requiring pytest-asyncio or rewriting every site to async.
 def _dispatch_sync(request: dict) -> dict:
@@ -2845,13 +2845,13 @@ def main():
     level = logging.DEBUG if args.verbose else logging.INFO
     logging.basicConfig(
         level=level,
-        format="%(asctime)s [sovrd] %(levelname)s: %(message)s",
+        format="%(asctime)s [minnid] %(levelname)s: %(message)s",
     )
 
     _unix_socket_path = Path(args.socket)
     _dual_write_enabled = args.dual_write
 
-    logger.info("sovrd v%s starting", VERSION)
+    logger.info("minnid v%s starting", VERSION)
     logger.info("Engine dir: %s", _ENGINE_DIR)
     logger.info("Socket:    %s", args.socket)
     if args.port:
@@ -2912,7 +2912,7 @@ def main():
         if _unix_socket_path.exists():
             _unix_socket_path.unlink()
         loop.close()
-        logger.info("sovrd stopped.")
+        logger.info("minnid stopped.")
 
 
 if __name__ == "__main__":
