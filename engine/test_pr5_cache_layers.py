@@ -17,7 +17,7 @@ def setup_hermetic_principals(tmp_path, monkeypatch):
     through the real principal resolution logic.
     """
     import principal
-    import sovrd
+    import minnid
     import json
 
     pdir = tmp_path / "principals"
@@ -309,7 +309,7 @@ def test_chronological_mode_orders_by_created_time_and_filters_dates(tmp_path):
 
 
 def test_sovrd_search_forwards_layer_sort_and_dates(monkeypatch):
-    import sovrd
+    import minnid
 
     captured = {}
 

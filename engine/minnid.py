@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-"""sovrd — Sovereign Memory Daemon (Layer 2 IPC Service).
+"""minnid — Minni Memory Daemon (Layer 2 IPC Service).
 
 A lightweight daemon that exposes Sovereign Memory (FAISS + SQLite) over a
-Unix domain socket using JSON-RPC 2.0.  Enables Hermes Agent and other local
-consumers to execute search, read, and status requests without spawning a new
-Python interpreter or reloading heavy MLX / sentence-transformer weights every
-call.
+Unix domain socket using JSON-RPC 2.0.  Enables local consumers to execute
+search, read, and status requests without spawning a new Python interpreter
+or reloading heavy MLX / sentence-transformer weights every call.
 
 Features
 --------
@@ -31,16 +30,16 @@ JSON-RPC Methods
 
 Usage
 -----
-    python sovrd.py                    # default socket: ~/.minni/run/sovrd.sock (0700/0600, SEC-001)
-    python sovrd.py --socket /path/s   # custom socket
-    python sovrd.py --port 9900        # HTTP fallback (optional; openclaw-extension/sovrd.py deprecated)
-    python sovrd.py --dual-write       # enable dual-write to flat-file memory
+    python minnid.py                    # default socket: ~/.minni/run/minnid.sock (0700/0600, SEC-001)
+    python minnid.py --socket /path/s   # custom socket
+    python minnid.py --port 9900        # HTTP fallback (optional)
+    python minnid.py --dual-write       # enable dual-write to flat-file memory
 
 Client Quick-Start (Python)
 ---------------------------
     import os, socket, json
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    s.connect(os.path.expanduser("~/.minni/run/sovrd.sock"))
+    s.connect(os.path.expanduser("~/.minni/run/minnid.sock"))
     def rpc(method, params=None):
         msg = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method,
                           "params": params or {}}) + "\\n"
@@ -49,7 +48,7 @@ Client Quick-Start (Python)
         return resp.get("result")
 
     rpc("search", {"query": "websocket architecture"})
-    rpc("read",   {"agent_id": "hermes"})
+    rpc("read",   {"agent_id": "minni"})
     rpc("status")
 """
 
@@ -2546,9 +2545,9 @@ _METHODS: Dict[str, callable] = {
 
 # ── Unix socket server ───────────────────────────────────────────────────
 # SEC-001: canonical secure location (0700 dir, 0600 socket). /tmp is world-writable
-# and was the old default; openclaw-extension/sovrd.py HTTP variant is deprecated.
+# and was the old default; the legacy HTTP variant is deprecated.
 SECURE_RUN_DIR: Path = Path.home() / ".minni" / "run"
-DEFAULT_SOCKET_PATH: Path = SECURE_RUN_DIR / "sovrd.sock"
+DEFAULT_SOCKET_PATH: Path = SECURE_RUN_DIR / "minnid.sock"
 
 _unix_socket_path: Path = DEFAULT_SOCKET_PATH
 _running = False
@@ -2811,12 +2810,12 @@ def main():
     _start_time = time.time()
 
     parser = argparse.ArgumentParser(
-        description="sovrd — Sovereign Memory Daemon",
+        description="minnid — Minni Memory Daemon",
     )
     parser.add_argument(
         "--socket", "-s",
         default=str(DEFAULT_SOCKET_PATH),
-        help="Unix socket path (default: ~/.minni/run/sovrd.sock with 0600; SEC-001)",
+        help="Unix socket path (default: ~/.minni/run/minnid.sock with 0600; SEC-001)",
     )
     parser.add_argument(
         "--port", "-p",

@@ -174,7 +174,7 @@ def test_retrieve_expands_variants_and_merges_by_rrf(monkeypatch, tmp_path):
 
 
 def test_sovrd_search_forwards_expand_and_summarize(monkeypatch):
-    import sovrd
+    import minnid
 
     captured = {}
 

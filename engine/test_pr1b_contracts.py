@@ -174,7 +174,7 @@ class TestDepthTiers:
 
     def test_sovrd_search_defaults_to_headline(self, monkeypatch):
         """Daemon search defaults to headline without changing RetrievalEngine default."""
-        import sovrd
+        import minnid
 
         seen = {}
 
@@ -198,7 +198,7 @@ class TestDepthTiers:
         assert response["result"]["depth"] == "headline"
 
     def test_sm_drill_batches_result_ids(self, monkeypatch):
-        import sovrd
+        import minnid
 
         calls = []
 
@@ -220,7 +220,7 @@ class TestDepthTiers:
         assert response["result"]["count"] == 2
 
     def test_sm_export_pack_is_deterministic(self, monkeypatch):
-        import sovrd
+        import minnid
 
         class FakeEngine:
             def retrieve(self, **kwargs):

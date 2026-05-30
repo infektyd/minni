@@ -117,7 +117,7 @@ def test_session_distillation_accepts_structured_native_compile_proposals(tmp_pa
 
 
 def test_daemon_compile_wet_run_writes_draft_inbox_and_trace(tmp_path, monkeypatch):
-    import sovrd
+    import minnid
 
     db_obj, cfg = _make_db(tmp_path)
     _seed_event(db_obj)
@@ -155,7 +155,7 @@ def test_daemon_compile_wet_run_writes_draft_inbox_and_trace(tmp_path, monkeypat
 
 
 def test_daemon_endorse_accepts_draft_and_audits(tmp_path, monkeypatch):
-    import sovrd
+    import minnid
 
     db_obj, cfg = _make_db(tmp_path)
     _seed_event(db_obj)
@@ -187,7 +187,7 @@ def test_daemon_endorse_accepts_draft_and_audits(tmp_path, monkeypatch):
 
 
 def test_compile_skips_cleanly_when_afm_loop_disabled(tmp_path, monkeypatch):
-    import sovrd
+    import minnid
 
     db_obj, cfg = _make_db(tmp_path)
     cfg.afm_loop_schedule["enabled"] = False
@@ -209,7 +209,7 @@ def test_compile_skips_cleanly_when_afm_loop_disabled(tmp_path, monkeypatch):
 
 
 def test_health_report_includes_afm_loop(tmp_path, monkeypatch):
-    import sovrd
+    import minnid
 
     db_obj, cfg = _make_db(tmp_path)
     monkeypatch.setattr(sovrd, "DEFAULT_CONFIG", cfg)

@@ -6,7 +6,7 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-from sovrd import _handle_learn
+from minnid import _handle_learn
 
 
 def test_force_learn_operator_gate(tmp_path, monkeypatch):

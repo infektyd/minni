@@ -122,7 +122,7 @@ def test_vector_sync_upserts_new_chunks_and_tracks_state(tmp_path):
 
 def test_backend_resolver_preserves_default_bit_identical_path():
     from config import SovereignConfig
-    from sovrd import _resolve_backend
+    from minnid import _resolve_backend
 
     assert _resolve_backend("auto", SovereignConfig(vector_backends=["faiss-disk"])) is None
     assert _resolve_backend(None, SovereignConfig(vector_backends=["faiss-disk"])) is None

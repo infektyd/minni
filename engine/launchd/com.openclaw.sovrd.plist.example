@@ -7,7 +7,7 @@
   placeholders below, then load it with launchctl.
 
   Substitutions:
-    /path/to/engine/sovrd.py   absolute path to engine/sovrd.py in this repo
+    /path/to/engine/minnid.py   absolute path to engine/minnid.py in this repo
     /path/to/sock              absolute path to the Unix socket
                                (default: ~/.minni/run/sovrd.sock
                                with mode 0600)
@@ -43,7 +43,7 @@
     <key>ProgramArguments</key>
     <array>
         <string>/usr/bin/python3</string>
-        <string>/path/to/engine/sovrd.py</string>
+        <string>/path/to/engine/minnid.py</string>
         <string>--socket</string>
         <string>/path/to/sock</string>
     </array>

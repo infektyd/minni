@@ -10,7 +10,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from sovrd import _append_handoff_audit, _escape_audit_field
+from minnid import _append_handoff_audit, _escape_audit_field
 
 
 def test_summary_newline_is_escaped(tmp_path: Path) -> None:

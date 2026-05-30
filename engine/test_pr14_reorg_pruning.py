@@ -241,7 +241,7 @@ def test_pruning_dry_run_and_wet_run_write_only_inbox_proposals(tmp_path):
 
 
 def test_daemon_compile_routes_reorg_and_pruning_with_traces(tmp_path, monkeypatch):
-    import sovrd
+    import minnid
 
     db_obj, cfg = _make_db(tmp_path)
     vault = tmp_path / "vault"

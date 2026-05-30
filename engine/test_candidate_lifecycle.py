@@ -15,7 +15,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 from migrations import run_migrations
 from principal import EffectivePrincipal, is_operator_principal
-from sovrd import _stage_candidate, _list_candidates, _resolve_candidate
+from minnid import _stage_candidate, _list_candidates, _resolve_candidate
 
 
 def _fresh_db(tmp_path):

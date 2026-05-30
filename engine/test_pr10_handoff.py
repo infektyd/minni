@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-import sovrd
+import minnid
 
 
 def _patch_handoff_db(monkeypatch, tmp_path):

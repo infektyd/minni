@@ -6,10 +6,10 @@ Covers:
 - denial for path outside allowed_vault_roots
 - .. traversal in input string is defeated by resolve()
 - symlink escape to outside root is denied (resolve follows)
-- integration: sovrd hygiene/compile/endorse paths return -32003 on bad vault
+- integration: minnid hygiene/compile/endorse paths return -32003 on bad vault
   (via the shared _guard_vault_root + G11 stamp). The handoff path performs an equivalent
   inline `principal.allows_vault_root` check on _agent_vault-derived sender/recipient
-  vaults (sovrd.py:501) after its own G11 stamp; the primitive + denial shape are covered
+  vaults (minnid.py:501) after its own G11 stamp; the primitive + denial shape are covered
   by the dataclass tests and the other handler tests (no duplication of the core logic).
 """
 
@@ -21,7 +21,7 @@ from pathlib import Path
 import pytest
 
 from principal import EffectivePrincipal
-from sovrd import (
+from minnid import (
     _handle_hygiene_report,
     _handle_daemon_compile,
     _handle_daemon_endorse,

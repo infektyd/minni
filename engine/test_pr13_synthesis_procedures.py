@@ -138,7 +138,7 @@ def test_procedure_extraction_dry_run_returns_repeated_pattern_draft(tmp_path):
 
 
 def test_daemon_compile_reaches_pr13_passes_and_wet_run_keeps_drafts_pending(tmp_path, monkeypatch):
-    import sovrd
+    import minnid
 
     db_obj, cfg = _make_db(tmp_path)
     vault = tmp_path / "vault"

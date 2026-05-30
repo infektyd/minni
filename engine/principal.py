@@ -333,7 +333,7 @@ def make_mismatch_error(supplied: str, stamped: str, request_id: Any = None) -> 
     """Return a JSON-RPC error dict for identity mismatch (code -32000)."""
     # Local import to avoid any potential cycle with sovrd
     try:
-        from sovrd import _make_error  # type: ignore
+        from minnid import _make_error  # type: ignore
 
         return _make_error(
             -32000,

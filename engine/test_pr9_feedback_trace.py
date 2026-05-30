@@ -20,7 +20,7 @@ def setup_hermetic_principals(tmp_path, monkeypatch):
     through the real principal resolution logic.
     """
     import principal
-    import sovrd
+    import minnid
     import json
 
     pdir = tmp_path / "principals"
@@ -119,7 +119,7 @@ def test_migration_006_creates_feedback_table(tmp_path):
 
 
 def test_daemon_feedback_stores_row(monkeypatch, tmp_path):
-    import sovrd
+    import minnid
 
     engine, db_obj, _ = _make_engine(tmp_path)
     doc_id, chunk_id = _seed_doc(db_obj, "/wiki/auth.md", "main", "auth migration")
@@ -259,7 +259,7 @@ def test_trace_ring_capacity_and_size_bound():
 
 
 def test_daemon_trace_round_trip(monkeypatch, tmp_path):
-    import sovrd
+    import minnid
 
     engine, db_obj, _ = _make_engine(tmp_path)
     doc_id, _ = _seed_doc(db_obj, "/wiki/auth.md", "main", "auth migration")

@@ -8,14 +8,14 @@ from pathlib import Path
 import os
 import tempfile
 
-# Import from sovrd without running main
+# Import from minnid without running main
 import sys
 sys.path.insert(0, str(Path(__file__).parent))
-import sovrd  # type: ignore
+import minnid  # type: ignore
 
 
 def test_default_socket_is_under_secure_run_dir():
-    p = sovrd.DEFAULT_SOCKET_PATH
+    p = minnid.DEFAULT_SOCKET_PATH
     assert isinstance(p, Path)
     assert "minni" in str(p)
     assert p.name == "sovrd.sock"

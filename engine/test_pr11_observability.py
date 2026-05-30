@@ -15,7 +15,7 @@ def setup_hermetic_principals(tmp_path, monkeypatch):
     through the real principal resolution logic.
     """
     import principal
-    import sovrd
+    import minnid
 
     pdir = tmp_path / "principals"
     pdir.mkdir(exist_ok=True)
@@ -118,7 +118,7 @@ def test_writeback_learning_with_evidence_adds_derived_from_edges(tmp_path, monk
 
 
 def test_sovrd_learn_with_evidence_adds_derived_from_edges(tmp_path, monkeypatch):
-    import sovrd
+    import minnid
     import writeback as wb_mod
     from writeback import WriteBackMemory
 
@@ -161,7 +161,7 @@ def test_sovrd_learn_with_evidence_adds_derived_from_edges(tmp_path, monkeypatch
 
 
 def test_status_includes_latency_histograms(monkeypatch):
-    import sovrd
+    import minnid
 
     monkeypatch.setattr(sovrd, "_request_count", 0)
     monkeypatch.setattr(sovrd, "_latencies", {})
@@ -177,7 +177,7 @@ def test_status_includes_latency_histograms(monkeypatch):
 
 
 def test_status_reports_afm_provider_mode(monkeypatch):
-    import sovrd
+    import minnid
 
     monkeypatch.setenv("MINNI_AFM_MODE", "off")
 
@@ -189,7 +189,7 @@ def test_status_reports_afm_provider_mode(monkeypatch):
 
 
 def test_sovrd_read_includes_layer_1_identity_before_context(tmp_path, monkeypatch):
-    import sovrd
+    import minnid
 
     db_obj, _cfg = _make_db(tmp_path)
     now = time.time()
@@ -231,7 +231,7 @@ def test_sovrd_read_includes_layer_1_identity_before_context(tmp_path, monkeypat
 
 
 def test_status_accepts_persisted_faiss_npz_cache(tmp_path, monkeypatch):
-    import sovrd
+    import minnid
     from config import SovereignConfig
 
     db_path = tmp_path / "minni.db"
@@ -261,8 +261,8 @@ def test_trace_redaction_applied_via_redact_value():
     """RCM-009: trace (and handoff) use _redact_value for payload; status uses explicit for its fields.
     Concrete shape check (symmetric to status redaction assert).
     """
-    import sovrd
-    from sovrd import _redact_value  # type: ignore
+    import minnid
+    from minnid import _redact_value  # type: ignore
     sample = {"socket_path": "/Users/secret/sovrd.sock", "db_path": "/tmp/secret.db", "text": "safe content"}
     redacted, _ = _redact_value(sample)
     # Redaction must mask sensitive paths (RCM-009; _redact_text uses [REDACTED_PATH] for local paths)
@@ -272,7 +272,7 @@ def test_trace_redaction_applied_via_redact_value():
 
 
 def test_python_format_recall_includes_backend_badge():
-    import sovrd
+    import minnid
 
     formatted = sovrd.formatRecall(
         "backend provenance",
@@ -282,7 +282,7 @@ def test_python_format_recall_includes_backend_badge():
 
 
 def test_health_report_returns_required_fields(tmp_path, monkeypatch):
-    import sovrd
+    import minnid
     from writeback import WriteBackMemory
 
     db_obj, cfg = _make_db(tmp_path)
@@ -330,7 +330,7 @@ def test_hygiene_report_clean_vault_has_zero_blocks(tmp_path):
 
 
 def test_sovrd_hygiene_report_returns_json_summary(tmp_path):
-    import sovrd
+    import minnid
 
     vault = tmp_path / "vault"
     (vault / "wiki").mkdir(parents=True)

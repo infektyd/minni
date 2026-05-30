@@ -51,7 +51,7 @@ def _make_db(tmp_path: Path):
 def _patch_writeback_no_model(tmp_path: Path, monkeypatch):
     """Patch the global _writeback singleton at a fresh test DB and disable
     the embedder so _handle_learn does not invoke any model."""
-    import sovrd
+    import minnid
     import writeback as wb_mod
 
     db_obj, cfg = _make_db(tmp_path)
@@ -70,7 +70,7 @@ def _patch_writeback_no_model(tmp_path: Path, monkeypatch):
 
 
 def _dispatch(method: str, params: dict) -> dict:
-    from sovrd import _dispatch_sync as _d
+    from minnid import _dispatch_sync as _d
     return _d({
         "jsonrpc": "2.0",
         "id": 1,
@@ -140,7 +140,7 @@ class TestLearnContentCap:
 class TestWarnIfSyncRoot:
     def test_warns_for_path_under_dropbox(self, tmp_path, monkeypatch, caplog):
         """A path under <home>/Dropbox/... must trigger a warning."""
-        from sovrd import _warn_if_sync_root
+        from minnid import _warn_if_sync_root
 
         # Pretend $HOME is tmp_path so we can stage a fake Dropbox folder.
         monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
@@ -157,7 +157,7 @@ class TestWarnIfSyncRoot:
         )
 
     def test_warns_for_icloud_mobile_documents(self, tmp_path, monkeypatch, caplog):
-        from sovrd import _warn_if_sync_root
+        from minnid import _warn_if_sync_root
 
         monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
 
@@ -174,7 +174,7 @@ class TestWarnIfSyncRoot:
 
     def test_no_warning_for_normal_path(self, tmp_path, monkeypatch, caplog):
         """A path under a normal project directory must not trigger a warning."""
-        from sovrd import _warn_if_sync_root
+        from minnid import _warn_if_sync_root
 
         monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
 
@@ -192,7 +192,7 @@ class TestWarnIfSyncRoot:
     def test_no_warning_for_path_outside_home(self, tmp_path, monkeypatch, caplog):
         """A path outside $HOME (e.g. /tmp/...) must not trigger a warning,
         even if the absolute string contains 'Dropbox' downstream."""
-        from sovrd import _warn_if_sync_root
+        from minnid import _warn_if_sync_root
 
         # Move home elsewhere so tmp_path is NOT under home.
         elsewhere = tmp_path / "fake_home"

@@ -31,7 +31,7 @@ from principal import (
     from_local_transport,
     make_mismatch_error,
 )
-import sovrd  # type: ignore  # for the _handle_* entry points
+import minnid  # type: ignore  # for the _handle_* entry points
 
 
 def test_effective_principal_dataclass_fields():

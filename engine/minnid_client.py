@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""sovrd-client — Lightweight CLI client for the Sovereign Memory daemon.
+"""minnid-client — Lightweight CLI client for the Minni Memory daemon.
 
 Usage:
-    python sovrd-client.py status
-    python sovrd-client.py search "websockets"
-    python sovrd-client.py read --agent hermes
-    python sovrd-client.py learn "User prefers dark mode" --category preference
-    python sovrd-client.py log session_start "Hermes started"
-    python sovrd-client.py ping
+    python minnid_client.py status
+    python minnid_client.py search "websockets"
+    python minnid_client.py read --agent minni
+    python minnid_client.py learn "User prefers dark mode" --category preference
+    python minnid_client.py log session_start "Minni started"
+    python minnid_client.py ping
 """
 
 from __future__ import annotations
@@ -25,8 +25,8 @@ DEFAULT_SOCKET = str(Path.home() / ".minni" / "run" / "sovrd.sock")
 def _rpc(socket_path: str, method: str, params: dict = None) -> dict:
     """Send a JSON-RPC request over a Unix domain socket."""
     if not os.path.exists(socket_path):
-        print(f"Error: socksd not running — socket {socket_path} not found.\n"
-              "   Start with: python sovrd.py", file=sys.stderr)
+        print(f"Error: minnid not running — socket {socket_path} not found.\n"
+              "   Start with: python minnid.py", file=sys.stderr)
         sys.exit(1)
 
     request = {
