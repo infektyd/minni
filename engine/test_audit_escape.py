@@ -14,8 +14,8 @@ from sovrd import _append_handoff_audit, _escape_audit_field
 
 
 def test_summary_newline_is_escaped(tmp_path: Path) -> None:
-    forged = "x\n## [2099-01-01] sovereign_learn | injected"
-    _append_handoff_audit(tmp_path, "sovereign_learn", forged, {"k": "v"})
+    forged = "x\n## [2099-01-01] minni_learn | injected"
+    _append_handoff_audit(tmp_path, "minni_learn", forged, {"k": "v"})
 
     log_text = (tmp_path / "log.md").read_text(encoding="utf-8")
 
@@ -34,7 +34,7 @@ def test_summary_newline_is_escaped(tmp_path: Path) -> None:
 def test_tool_newline_is_escaped(tmp_path: Path) -> None:
     _append_handoff_audit(
         tmp_path,
-        "sovereign_learn\n## [2099-01-01] forged | bad",
+        "minni_learn\n## [2099-01-01] forged | bad",
         "ok",
         {},
     )
@@ -47,7 +47,7 @@ def test_tool_newline_is_escaped(tmp_path: Path) -> None:
 
 def test_summary_capped_to_500_chars_with_ellipsis(tmp_path: Path) -> None:
     huge = "a" * 2000
-    _append_handoff_audit(tmp_path, "sovereign_learn", huge, {})
+    _append_handoff_audit(tmp_path, "minni_learn", huge, {})
     log_text = (tmp_path / "log.md").read_text(encoding="utf-8")
     header_line = next(ln for ln in log_text.splitlines() if ln.startswith("## ["))
     after_pipe = header_line.split("| ", 1)[1]

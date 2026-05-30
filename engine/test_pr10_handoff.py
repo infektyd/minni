@@ -181,7 +181,7 @@ def test_handoff_pending_list_and_ack(monkeypatch, tmp_path):
     pending = sovrd._dispatch_sync({
         "jsonrpc": "2.0",
         "id": 21,
-        "method": "sovereign_list_pending_handoffs",
+        "method": "minni_list_pending_handoffs",
         "params": {"agent_id": "claude-code"},
     })["result"]
     assert [item["lease_id"] for item in pending["handoffs"]] == [lease_id]
@@ -189,7 +189,7 @@ def test_handoff_pending_list_and_ack(monkeypatch, tmp_path):
     ack = sovrd._dispatch_sync({
         "jsonrpc": "2.0",
         "id": 22,
-        "method": "sovereign_ack_handoff",
+        "method": "minni_ack_handoff",
         "params": {"lease_id": lease_id, "status": "accepted"},
     })["result"]
     assert ack["status"] == "accepted"
@@ -205,7 +205,7 @@ def test_handoff_pending_list_and_ack(monkeypatch, tmp_path):
     pending_after = sovrd._dispatch_sync({
         "jsonrpc": "2.0",
         "id": 23,
-        "method": "sovereign_list_pending_handoffs",
+        "method": "minni_list_pending_handoffs",
         "params": {"agent_id": "claude-code"},
     })["result"]
     assert pending_after["handoffs"] == []
@@ -218,7 +218,7 @@ def test_await_handoff_times_out(monkeypatch, tmp_path):
     response = sovrd._dispatch_sync({
         "jsonrpc": "2.0",
         "id": 24,
-        "method": "sovereign_await_handoff",
+        "method": "minni_await_handoff",
         "params": {"lease_id": "missing", "timeout_ms": 1},
     })["result"]
 
@@ -285,7 +285,7 @@ def test_handle_await_handoff_does_not_block_other_clients(monkeypatch, tmp_path
         req = {
             "jsonrpc": "2.0",
             "id": 100,
-            "method": "sovereign_await_handoff",
+            "method": "minni_await_handoff",
             "params": {"lease_id": "nonexistent-for-concurrency-test", "timeout_ms": 180},
         }
         return await sovrd._dispatch(req)

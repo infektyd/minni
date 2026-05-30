@@ -767,7 +767,7 @@ class TestHandleResolveContradiction:
             wb_mod.WriteBackMemory.model = property(lambda self: _ge())
 
         assert resolved["result"]["status"] == "ok"
-        subscribed = self._dispatch("sovereign_subscribe_contradictions", {
+        subscribed = self._dispatch("minni_subscribe_contradictions", {
             "agent_id": "codex",
             "since_ts": now - 1,
         })

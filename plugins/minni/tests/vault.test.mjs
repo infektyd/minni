@@ -91,7 +91,7 @@ test("vaultFirstLearn writes a note, updates index, and appends audit logs", asy
     const note = await readFile(result.notePath, "utf8");
     assert.match(note, /agent: codex/);
     assert.match(note, /category: fact/);
-    assert.match(note, /Sovereign Memory daemon health/);
+    assert.match(note, /Minni daemon health/);
 
     const index = await readFile(path.join(root, "index.md"), "utf8");
     assert.match(

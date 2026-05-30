@@ -289,7 +289,7 @@ export async function ackHandoff(
   },
   requester: JsonRpcRequester = jsonRpcSocketRequest,
 ): Promise<JsonResult> {
-  return jsonRpcSocketRequestWithFallbackRequester("sovereign_ack_handoff", {
+  return jsonRpcSocketRequestWithFallbackRequester("minni_ack_handoff", {
     lease_id: input.leaseId,
     status: input.status,
     contradicts_id: input.contradictsId,
@@ -300,7 +300,7 @@ export async function listPendingHandoffs(
   input: { agentId: string },
   requester: JsonRpcRequester = jsonRpcSocketRequest,
 ): Promise<JsonResult> {
-  return jsonRpcSocketRequestWithFallbackRequester("sovereign_list_pending_handoffs", {
+  return jsonRpcSocketRequestWithFallbackRequester("minni_list_pending_handoffs", {
     agent_id: input.agentId,
   }, requester);
 }
@@ -309,7 +309,7 @@ export async function awaitHandoff(
   input: { leaseId: string; timeoutMs?: number },
   requester: JsonRpcRequester = jsonRpcSocketRequest,
 ): Promise<JsonResult> {
-  return jsonRpcSocketRequestWithFallbackRequester("sovereign_await_handoff", {
+  return jsonRpcSocketRequestWithFallbackRequester("minni_await_handoff", {
     lease_id: input.leaseId,
     timeout_ms: input.timeoutMs,
   }, requester);
@@ -319,7 +319,7 @@ export async function subscribeContradictions(
   input: { agentId: string; sinceTs?: number },
   requester: JsonRpcRequester = jsonRpcSocketRequest,
 ): Promise<JsonResult> {
-  return jsonRpcSocketRequestWithFallbackRequester("sovereign_subscribe_contradictions", {
+  return jsonRpcSocketRequestWithFallbackRequester("minni_subscribe_contradictions", {
     agent_id: input.agentId,
     since_ts: input.sinceTs,
   }, requester);

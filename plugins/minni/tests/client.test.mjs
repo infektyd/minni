@@ -155,10 +155,10 @@ test("new memory RPC helpers send expected JSON-RPC methods", async () => {
   assert.deepEqual(calls.map((call) => call.method), [
     "sm_drill",
     "sm_export_pack",
-    "sovereign_ack_handoff",
-    "sovereign_list_pending_handoffs",
-    "sovereign_await_handoff",
-    "sovereign_subscribe_contradictions",
+    "minni_ack_handoff",
+    "minni_list_pending_handoffs",
+    "minni_await_handoff",
+    "minni_subscribe_contradictions",
   ]);
   assert.deepEqual(calls[0].params.result_ids, [1]);
   assert.equal(calls[1].params.cache_key, "k");
