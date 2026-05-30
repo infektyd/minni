@@ -370,7 +370,7 @@ def _known_agent_vaults() -> list[Path]:
 
 
 # SEC-014: caps for audit-log fields. Mirrors the TS helper in
-# plugins/sovereign-memory/src/vault.ts so a forged summary written by one
+# plugins/minni/src/vault.ts so a forged summary written by one
 # daemon cannot be parsed as multiple `## [...]` entries by either reader.
 _AUDIT_SUMMARY_MAX = 500
 _AUDIT_DETAIL_LINE_MAX = 1000

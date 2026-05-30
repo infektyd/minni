@@ -70,7 +70,7 @@ repo plugin and the installed Codex plugin cache:
 
 ```bash
 rg -n 'socketRequest|jsonRpcSocketRequest|/health|/learn|/recall' \
-  plugins/sovereign-memory/src \
+  plugins/minni/src \
   ~/.codex/plugins/cache/sovereign-memory -g '!node_modules'
 ```
 

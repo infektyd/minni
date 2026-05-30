@@ -147,4 +147,4 @@ output/reports/
 
 
 # sovereign skill scripts kept private (model-backend dependent; not for public repo)
-plugins/sovereign-memory/skills/*/scripts/
+plugins/minni/skills/*/scripts/

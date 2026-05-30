@@ -621,13 +621,13 @@ These features add latency and complexity but provide massive scale/density bene
 - `engine/afm_scheduler.py` — **new**, idle-driven AFM compilation scheduler (Phase 6.2)
 - `engine/afm_passes/` — **new directory**, one module per pass (`session_distillation.py`, `synthesis.py`, `procedure_extraction.py`, `reorganization.py`, `pruning.py`)
 - `engine/afm_prompts/` — **new directory**, frozen prompt templates per pass (Phase 6.3)
-- `plugins/sovereign-memory/src/server.ts` — register `sovereign_compile_vault` MCP tool
+- `plugins/minni/src/server.ts` — register `sovereign_compile_vault` MCP tool
 - `engine/chunker.py` — tiktoken integration, optional semantic merge
 - `engine/indexer.py`, `engine/wiki_indexer.py`, `engine/episodic.py`, `engine/seed_identity.py` — switch to `get_embedder()` / `get_cross_encoder()`; honor page-status frontmatter
 - `engine/config.py` — new keys: `vector_backends`, `embedding_quantization`, `chunking_semantic_merge`, `hyde_enabled`, `hyde_confidence_floor`, `query_expand_default`, `feedback_enabled`, `default_search_depth`
 - `engine/requirements.txt` — unchanged for the lean path; new optional `requirements-extras.txt` lists `qdrant-client`, `lancedb`, etc.
-- `plugins/sovereign-memory/src/vault.ts` — extended for Phase 1.3 frontmatter (type/status/privacy/sources/expires/supersededBy); updated `schemaContent()` to emit a stub pointing at `docs/contracts/VAULT.md`
-- `plugins/sovereign-memory/src/agent_envelope.ts` — `MEMORY_CONTRACT` updated to point at `docs/contracts/AGENT.md`
+- `plugins/minni/src/vault.ts` — extended for Phase 1.3 frontmatter (type/status/privacy/sources/expires/supersededBy); updated `schemaContent()` to emit a stub pointing at `docs/contracts/VAULT.md`
+- `plugins/minni/src/agent_envelope.ts` — `MEMORY_CONTRACT` updated to point at `docs/contracts/AGENT.md`
 
 ## Contract/docs reference
 
@@ -666,7 +666,7 @@ Each PR is independently shippable, independently revertible, and leaves the dae
 
 1. **Existing test suite green.** `cd engine && pytest -q` (or whatever the project uses; if no Python tests exist yet, the first PR should also bootstrap a `tests/` directory with smoke tests for the existing JSON-RPC contract).
 2. **JSON-RPC contract test.** Spin up the daemon, call every method that existed before the PR, assert response shape unchanged for old fields; new fields are additive.
-3. **Cross-agent integration smoke.** Run the existing plugin test suite (`cd plugins/sovereign-memory && npm test`) — the current public baseline is 121 tests. Run the Claude Code hook smoke (`npm run smoke:hook`) — must still emit valid envelopes.
+3. **Cross-agent integration smoke.** Run the existing plugin test suite (`cd plugins/minni && npm test`) — the current public baseline is 121 tests. Run the Claude Code hook smoke (`npm run smoke:hook`) — must still emit valid envelopes.
 4. **Live recall sanity.** With Sovereign daemon running, `python -m engine.sovereign_memory query "<known query>"` returns the same top result rank (within ±1 position) before and after the PR.
 5. **Migration safety.** Apply all migrations to a copy of the user's live `sovereign_memory.db`; assert no rows lost, all existing JSON-RPC reads return identical results.
 6. **Recall harness regression check** (after Phase 3.0): the eval harness must show no regression vs the prior commit on the seed query set; new feature defaults flip only with ≥+5% recall@5.

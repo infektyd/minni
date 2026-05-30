@@ -6,7 +6,7 @@
 
 **Architecture:** P1 is **in-git only and reversible**. It deliberately does NOT rename runtime-coupled identifiers (MCP server key `mcp__sovereign-memory__`, tool verbs `sovereign_recall`, `SOVEREIGN_*` env, vault path). Those derive from / wire into the live system and are renamed in **P2 with a simultaneous compat-alias layer** so nothing is ever broken. P1 produces a branch that is brand-correct and structurally renamed but still functionally identical at runtime.
 
-**Tech Stack:** TypeScript MCP plugin (`plugins/sovereign-memory` → `plugins/minni`), Node `--test`, Vite, ripgrep for audit gates.
+**Tech Stack:** TypeScript MCP plugin (`plugins/minni` → `plugins/minni`), Node `--test`, Vite, ripgrep for audit gates.
 
 **Spec:** `docs/superpowers/specs/2026-05-29-minni-deep-rename-design.md`
 
@@ -17,7 +17,7 @@
 ## Scope boundary (READ FIRST)
 
 **P1 RENAMES (safe):**
-- Plugin directory `plugins/sovereign-memory/` → `plugins/minni/` (git mv — path only; install source updated in manifests).
+- Plugin directory `plugins/minni/` → `plugins/minni/` (git mv — path only; install source updated in manifests).
 - Human-facing brand/description strings in manifests and docs ("Sovereign Memory" → "Minni" where it's branding, not an identifier).
 - npm `package.json` `name` fields.
 - Skill *directory names* and SKILL.md frontmatter titles where they are branding.
@@ -75,36 +75,36 @@ git commit -m "chore(minni-p1): capture rename inventory + protected-string base
 ## Task 2: Rename the plugin directory
 
 **Files:**
-- Move: `plugins/sovereign-memory/` → `plugins/minni/`
+- Move: `plugins/minni/` → `plugins/minni/`
 
 - [ ] **Step 1: git mv the directory**
 
 Run:
 ```bash
 cd /Users/hansaxelsson/Projects/Minni
-git mv plugins/sovereign-memory plugins/minni
+git mv plugins/minni plugins/minni
 ```
 
-- [ ] **Step 2: Verify nothing else referenced the literal path `plugins/sovereign-memory`**
+- [ ] **Step 2: Verify nothing else referenced the literal path `plugins/minni`**
 
 Run:
 ```bash
 cd /Users/hansaxelsson/Projects/Minni
-rg -n "plugins/sovereign-memory" --glob '!node_modules' --glob '!dist' --glob '!.git'
+rg -n "plugins/minni" --glob '!node_modules' --glob '!dist' --glob '!.git'
 ```
 Expected: a list of manifest/doc references (marketplace.json source paths, README, etc.) — fix these in the next steps. Note them.
 
 - [ ] **Step 3: Update install-source paths in both marketplace manifests**
 
-In `.claude-plugin/marketplace.json` change `"source": "./plugins/sovereign-memory"` → `"./plugins/minni"`.
-In `.agents/plugins/marketplace.json` change `"path": "./plugins/sovereign-memory"` → `"./plugins/minni"`.
+In `.claude-plugin/marketplace.json` change `"source": "./plugins/minni"` → `"./plugins/minni"`.
+In `.agents/plugins/marketplace.json` change `"path": "./plugins/minni"` → `"./plugins/minni"`.
 
-- [ ] **Step 4: Gate — confirm no stale `plugins/sovereign-memory` path remains (outside dist/node_modules)**
+- [ ] **Step 4: Gate — confirm no stale `plugins/minni` path remains (outside dist/node_modules)**
 
 Run:
 ```bash
 cd /Users/hansaxelsson/Projects/Minni
-rg -n "plugins/sovereign-memory" --glob '!node_modules' --glob '!dist' --glob '!.git' --glob '!docs/migration/minni-p1-inventory.txt'
+rg -n "plugins/minni" --glob '!node_modules' --glob '!dist' --glob '!.git' --glob '!docs/migration/minni-p1-inventory.txt'
 ```
 Expected: no output (empty). If lines remain, fix them.
 
@@ -113,7 +113,7 @@ Expected: no output (empty). If lines remain, fix them.
 ```bash
 cd /Users/hansaxelsson/Projects/Minni
 git add -A
-git commit -m "refactor(minni-p1): rename plugins/sovereign-memory -> plugins/minni + fix install-source paths"
+git commit -m "refactor(minni-p1): rename plugins/minni -> plugins/minni + fix install-source paths"
 ```
 
 ---
@@ -131,7 +131,7 @@ In `plugins/minni/package.json` change `"name": "sovereign-memory-multi-plugin"`
 
 Run:
 ```bash
-cd /Users/hansaxelsson/Projects/Minni/plugins/minni
+cd /Users/hansaxelsson/Projects/Minni/plugins/sovereign-memory
 npm run build:server 2>&1 | tail -20
 ```
 Expected: TypeScript compiles, exit 0. (This proves the dir rename + package edit didn't break the build. We build only the server, not the frontend, to keep it fast.)
@@ -246,7 +246,7 @@ git commit -m "docs(minni-p1): rebrand Sovereign Memory -> Minni in top-level do
 
 Run:
 ```bash
-cd /Users/hansaxelsson/Projects/Minni/plugins/minni
+cd /Users/hansaxelsson/Projects/Minni/plugins/sovereign-memory
 npm run build:server 2>&1 | tail -10
 ```
 Expected: exit 0.
@@ -255,7 +255,7 @@ Expected: exit 0.
 
 Run:
 ```bash
-cd /Users/hansaxelsson/Projects/Minni/plugins/minni
+cd /Users/hansaxelsson/Projects/Minni/plugins/sovereign-memory
 npm test 2>&1 | tail -30
 ```
 Expected: tests pass (or the same pre-existing failures as on `main` — diff against a baseline run if unsure). Record any failures; do not claim green if red.

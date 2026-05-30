@@ -30,7 +30,7 @@ That's the system. Not just the folder with the longest name.
 
 Do not let the substring "sovereign-memory" hypnotize you. It will try. It always tries.
 
-`plugins/sovereign-memory/` is one important piece, not the whole map. If you catch yourself anchoring there and ignoring the rest, stop and re-read this file.
+`plugins/minni/` is one important piece, not the whole map. If you catch yourself anchoring there and ignoring the rest, stop and re-read this file.
 
 When the user is asking for a diff or gap analysis after merges on main, the default move is:
 

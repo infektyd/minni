@@ -5,7 +5,7 @@ The enforcement lives in the TS afm.ts layer (isAfmTargetAllowed + early return 
 These Python tests are lightweight parity / documentation; the real coverage is the TS + plugin tests.
 
 We exercise that bad targets are rejected with the exact structured "afm_target_denied" reason
-(implementation note: full test of the TS guard is in plugins/sovereign-memory/tests/afm.test.mjs and schema tests).
+(implementation note: full test of the TS guard is in plugins/minni/tests/afm.test.mjs and schema tests).
 """
 
 import os
@@ -27,7 +27,7 @@ def test_afm_url_binding_placeholder_and_requirements():
     """
     # The Python side has no direct AFM URL (afm_writer is local file only).
     # We assert the conceptual contract so CI and readers see the G13 coverage intent.
-    assert True  # See plugins/sovereign-memory/tests/ for executable negative cases + schema assertion
+    assert True  # See plugins/minni/tests/ for executable negative cases + schema assertion
 
 
 def test_afm_denial_reason_is_structured():

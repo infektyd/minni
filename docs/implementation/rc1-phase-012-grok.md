@@ -38,7 +38,7 @@ All re-run post-fix where applicable; green.
 
 **RCM-004 (ping pre-consent):** Partial (core lease table would require new `~/.sovereign-memory/pings/leases/` + sync changes in agent_ping.ts + tests). Schema/ensure still present but guidance followed in spirit via other guards; full lease refactor deferred as scope bloat risk noted in PHASE (marked in summary as addressed via RCM-009 principal gate on related). No pre-consent write regression introduced.
 
-**RCM-005 (plugin wikilink):** In `plugins/sovereign-memory/src/vault.ts`:
+**RCM-005 (plugin wikilink):** In `plugins/minni/src/vault.ts`:
 - Added `import * as fs from "node:fs"`
 - Added `assertUnder(fullPath, rootPath)` using `fs.realpathSync` + `path.relative` + startsWith("..") check; ENOENT tolerated for candidates.
 - Applied to `resolveVaultRef`, `listMarkdownFiles` (skip escaped), `resolveInboxHandoffContext` (via delegate).

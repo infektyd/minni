@@ -93,7 +93,7 @@ def test_candidate_lifecycle_propose_list_resolve(tmp_path, monkeypatch):
 def test_new_tool_schema_has_no_spoof_surfaces():
     """Plugin schema test: sovereign_resolve_candidate inputSchema contains none of the G11-G13 caller-controlled spoof keys."""
     import re
-    src = Path(__file__).parent.parent / "plugins/sovereign-memory/src/server.ts"
+    src = Path(__file__).parent.parent / "plugins/minni/src/server.ts"
     if not src.exists():
         pytest.skip("server.ts not in tree for this env")
     text = src.read_text()
@@ -111,7 +111,7 @@ def test_new_tool_schema_has_no_spoof_surfaces():
 def test_ui_server_candidates_routes_exist():
     """UI smoke: the two new G17 Candidates endpoints are registered in ui-server (no import/syntax error + string presence)."""
     import re
-    src = Path(__file__).parent.parent / "plugins/sovereign-memory/src/ui-server.ts"
+    src = Path(__file__).parent.parent / "plugins/minni/src/ui-server.ts"
     if not src.exists():
         pytest.skip("ui-server.ts not present")
     text = src.read_text()

@@ -231,7 +231,7 @@ Rules:
 ### Durable writes through the daemon
 
 All durable vault writes MUST go through the daemon JSON-RPC or the vault plugin
-API (`plugins/sovereign-memory/src/vault.ts`). Direct filesystem writes:
+API (`plugins/minni/src/vault.ts`). Direct filesystem writes:
 
 - Do not trigger index or log appends.
 - Do not trigger re-indexing into SQLite/FAISS.

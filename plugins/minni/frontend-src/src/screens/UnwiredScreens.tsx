@@ -57,7 +57,7 @@ export function PolicyScreen() {
       />
       <StateBanner state="empty">
         Policy & AFM is unwired in this alpha. The bridge does not expose a policy read endpoint yet
-        — see <code>plugins/sovereign-memory/src/policy.ts</code> for the active rule set.
+        — see <code>plugins/minni/src/policy.ts</code> for the active rule set.
       </StateBanner>
     </>
   );

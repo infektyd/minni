@@ -10,7 +10,7 @@ updates:
       - "rc1"
 
   - package-ecosystem: "npm"
-    directory: "/plugins/sovereign-memory"
+    directory: "/plugins/minni"
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 5

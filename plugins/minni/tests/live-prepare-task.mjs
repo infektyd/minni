@@ -93,7 +93,7 @@ async function main() {
     const outcome = await prepareOutcome({
       task: "live low-memory outcome battery for v0 adapter",
       summary: "Verified the prepare outcome dry-run path with tiny prompts.",
-      changedFiles: ["plugins/sovereign-memory/src/task.ts"],
+      changedFiles: ["plugins/minni/src/task.ts"],
       verification: ["live AFM bridge responded"],
       profile: "compact",
       useAfm: true,

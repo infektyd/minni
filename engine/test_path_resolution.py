@@ -39,7 +39,7 @@ def test_plugin_config_ts_unified_on_sovereign_memory_base():
     references the canonical .sovereign-memory paths for both vault and the
     G04-hardened socket. No external node/TS loader or machine-specific paths.
     """
-    plugin_config = Path(__file__).parent.parent / "plugins/sovereign-memory/src/config.ts"
+    plugin_config = Path(__file__).parent.parent / "plugins/minni/src/config.ts"
     assert plugin_config.exists(), "plugin config.ts must exist for G02 parity"
     text = plugin_config.read_text(encoding="utf-8")
     # Vault (pre-existing) and socket (G02/G04 unification we just completed)

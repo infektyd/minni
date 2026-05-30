@@ -14,7 +14,7 @@
 - `engine/native_afm_helper.swift` implements the Foundation Models helper when
   available and returns structured JSON. The wrapper script compiles and caches
   the helper locally.
-- `plugins/sovereign-memory/src/afm.ts` and task preparation paths expose the
+- `plugins/minni/src/afm.ts` and task preparation paths expose the
   same provider modes for prepare-task and prepare-outcome distillation.
 
 ## Provider Modes

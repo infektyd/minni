@@ -119,7 +119,7 @@ The plugin implements the **Model Context Protocol** — any MCP-speaking agent 
 | HANDOFF | 4 | `sovereign_negotiate_handoff` |
 | MULTI-AGENT | 7 | `sovereign_ping_agent_request` |
 
-Source: [`plugins/sovereign-memory/src/server.ts`](plugins/sovereign-memory/src/server.ts)
+Source: [`plugins/minni/src/server.ts`](plugins/minni/src/server.ts)
 
 </details>
 
@@ -183,7 +183,7 @@ python3 sovrd.py --socket ~/.sovereign-memory/run/sovrd.sock
 ### Plugin · typescript MCP server
 
 ```bash
-cd plugins/sovereign-memory
+cd plugins/minni
 npm install
 npm test
 
@@ -280,7 +280,7 @@ Before pushing a release candidate, run the full gate:
 
 ```bash
 cd engine && pytest -q                          # expect 333 passed
-cd ../plugins/sovereign-memory && npm test      # expect 121 passed
+cd ../plugins/minni && npm test      # expect 121 passed
 npm run smoke:hook
 ```
 
@@ -300,7 +300,7 @@ Then a temp-state live smoke: start `sovrd.py` on a temporary Unix socket, call 
 | Path | Contents |
 |---|---|
 | [`engine/`](engine/) | python daemon · retrieval · migrations · compile passes · eval harness |
-| [`plugins/sovereign-memory/`](plugins/sovereign-memory/) | agent-agnostic MCP plugin · 19 ts modules · 19 test files · console UI |
+| [`plugins/minni/`](plugins/minni/) | agent-agnostic MCP plugin · 19 ts modules · 19 test files · console UI |
 | [`sovereign-memory/`](sovereign-memory/) | delivery layer · `sm-propagation` skill · workflows · design docs |
 | [`openclaw-extension/`](openclaw-extension/) | OpenClaw bridge and import tooling |
 | [`docs/contracts/`](docs/contracts/) | AGENT · CAPABILITIES · PAGE_TYPES · POLICY · THREAT_MODEL · VAULT · WORKFLOWS |

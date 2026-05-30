@@ -10,7 +10,7 @@
 ## The two canonical anchors (everything resolves to one of these)
 
 1. **Root project dir** — `~/Projects/minni` (git repo; source of truth).
-2. **Installed plugin** — `~/.agents/plugins/minni@minni` (runtime the agents load).
+2. **Installed plugin** — `~/.agents/plugins/sovereign-memory@minni` (runtime the agents load).
 
 The per-agent **vault** (`~/.minni/<agent>-vault`) is **derived from the daemon**, not a third anchor — see "Vault path simplification" below. No config may reference `~/Projects/sovereignMemory`, bare `sovereign-memory@sovereign-memory`, or any other path.
 

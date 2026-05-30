@@ -53,7 +53,7 @@ jobs:
           PYTHONPATH=engine python -m pytest engine/ -q --tb=short
 
       - name: Plugin tests
-        working-directory: plugins/sovereign-memory
+        working-directory: plugins/minni
         run: |
           npm ci
           npm test

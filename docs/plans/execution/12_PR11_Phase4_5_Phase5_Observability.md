@@ -67,7 +67,7 @@ Implementation: tiny in-memory ring per method (last 100 call durations). Comput
 | Action | Path | Details |
 |--------|------|---------|
 | **MODIFY** | `engine/sovrd.py` | Python-side `formatRecall()` adds backend badge: `[faiss-disk+qdrant]` etc. |
-| **MODIFY** | `plugins/sovereign-memory/src/server.ts` | TS-side `formatRecall()` updated to render backend badge. Optional — JSON envelope always carries it. |
+| **MODIFY** | `plugins/minni/src/server.ts` | TS-side `formatRecall()` updated to render backend badge. Optional — JSON envelope always carries it. |
 
 ---
 

@@ -164,7 +164,7 @@ agent can evaluate the source authority of each result.
 Each agent's vault is scoped to its own path (see `docs/contracts/VAULT.md`
 Section 2). Writing a document into a different agent's vault directory
 violates the vault boundary and is not permitted. The daemon plugin
-(`plugins/sovereign-memory/src/vault.ts`) enforces the path constraint.
+(`plugins/minni/src/vault.ts`) enforces the path constraint.
 
 ### 4.3 Writing — learnings and episodic events
 

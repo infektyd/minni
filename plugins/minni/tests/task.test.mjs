@@ -190,7 +190,7 @@ test("prepareOutcome returns a dry-run outcome packet without audit or learning 
     {
       task: "ship AFM prepare task hardening",
       summary: "Added deterministic tests, privacy metadata, and live AFM opt-in checks.",
-      changedFiles: ["plugins/sovereign-memory/src/task.ts", "plugins/sovereign-memory/tests/task.test.mjs"],
+      changedFiles: ["plugins/minni/src/task.ts", "plugins/minni/tests/task.test.mjs"],
       verification: ["npm test passed"],
       profile: "compact",
       useAfm: false,
@@ -250,7 +250,7 @@ test("AFM outcome payload uses compact outcome instructions and redacts local pa
     purpose: "outcome",
     task: "summarize backend work",
     summary: "Changed /Users/example/private/repo/file.ts and verified behavior.",
-    changedFiles: ["/Users/example/private/repo/file.ts", "plugins/sovereign-memory/src/task.ts"],
+    changedFiles: ["/Users/example/private/repo/file.ts", "plugins/minni/src/task.ts"],
     verification: ["npm test passed", "raw log at /Volumes/private/log.txt"],
     profile: "compact",
     budgetTokens: 1500,

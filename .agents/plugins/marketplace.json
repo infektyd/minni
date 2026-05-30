@@ -8,7 +8,7 @@
       "name": "sovereign-memory",
       "source": {
         "source": "local",
-        "path": "./plugins/sovereign-memory"
+        "path": "./plugins/minni"
       },
       "policy": {
         "installation": "AVAILABLE",

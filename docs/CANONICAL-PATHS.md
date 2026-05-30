@@ -7,7 +7,7 @@ This folder is the canonical home for Sovereign Memory on this machine:
 It is also the canonical Git working tree for
 `https://github.com/infektyd/sovereign-memory`. The live layout is intentional:
 runtime integrations use `engine/`, `openclaw-extension/`, and
-`plugins/sovereign-memory/` directly.
+`plugins/minni/` directly.
 
 Use this page to avoid guessing between older root-level, OpenClaw, Hermes, and
 downloaded paths.
@@ -19,7 +19,7 @@ names. Treat those as legacy references, not active roots.
 
 - `engine/` - Sovereign Memory Python engine.
 - `openclaw-extension/` - OpenClaw extension bridge.
-- `plugins/sovereign-memory/` - Codex plugin package.
+- `plugins/minni/` - Codex plugin package.
 - `session-extracts/` - extracted handoff/session notes.
 
 ## Active Runtime

@@ -125,7 +125,7 @@ recall.
 Install in Claude Code (local plugin dir, or via marketplace):
 
 ```bash
-claude plugin install --plugin-dir /path/to/sovereign-memory/plugins/sovereign-memory
+claude plugin install --plugin-dir /path/to/sovereign-memory/plugins/minni
 ```
 
 The Claude Code surface adds:
@@ -181,7 +181,7 @@ rather than in model-provided paths.
 Install in KiloCode (local plugin dir):
 
 ```bash
-kilo plugin install --plugin-dir /path/to/sovereign-memory/plugins/sovereign-memory/.kilocode-plugin
+kilo plugin install --plugin-dir /path/to/sovereign-memory/plugins/minni/.kilocode-plugin
 ```
 
 The KiloCode surface adds:

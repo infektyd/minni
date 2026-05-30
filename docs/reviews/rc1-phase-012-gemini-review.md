@@ -60,7 +60,7 @@ Additionally, dependency audits revealed several high-severity vulnerabilities i
 ### Tool Audit Results
 - **Ruff:** 47 violations (unused imports, ambiguous names, etc.).
 - **Mypy:** 95 errors (missing library stubs for `faiss`, `tiktoken`, `yaml`, plus several real type-mismatches in `sovrd.py` and `agent_api.py`).
-- **NPM Audit:** 4 vulnerabilities in `plugins/sovereign-memory`:
+- **NPM Audit:** 4 vulnerabilities in `plugins/minni`:
   - `fast-uri <= 3.1.1`: **High** (Path traversal via percent-encoded dots).
   - `hono <= 4.12.17`: **Moderate** (CSS Injection, JWT validation bypass, Cache leakage).
   - `ip-address <= 10.1.0`: **Moderate** (XSS).
