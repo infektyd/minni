@@ -9,9 +9,9 @@
       ],
       "cwd": "${extensionPath}${/}..",
       "env": {
-        "SOVEREIGN_AGENT_ID": "gemini",
-        "SOVEREIGN_VAULT_PATH": "~/.sovereign-memory/gemini-vault",
-        "SOVEREIGN_SOCKET_PATH": "~/.sovereign-memory/run/sovrd.sock"
+        "MINNI_AGENT_ID": "gemini",
+        "MINNI_VAULT_PATH": "~/.minni/gemini-vault",
+        "MINNI_SOCKET_PATH": "~/.minni/run/sovrd.sock"
       }
     }
   }

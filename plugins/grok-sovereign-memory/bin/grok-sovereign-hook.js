@@ -16,7 +16,7 @@ const path = require('node:path');
 const os = require('node:os');
 
 const HOME = os.homedir();
-const VAULT = process.env.SOVEREIGN_VAULT_PATH || path.join(HOME, '.sovereign-memory/grok-build-vault');
+const VAULT = process.env.MINNI_VAULT_PATH || path.join(HOME, '.minni/grok-build-vault');
 const INBOX = path.join(VAULT, 'inbox');
 const LOGS = path.join(VAULT, 'logs');
 const AGENT = 'grok-build';
