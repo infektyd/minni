@@ -259,7 +259,7 @@ test("AFM outcome payload uses compact outcome instructions and redacts local pa
   const body = JSON.stringify(payload);
 
   assert.match(body, /Return compact JSON only for Codex outcome prep/);
-  assert.match(body, /plugins\/sovereign-memory\/src\/task.ts/);
+  assert.match(body, /plugins\/minni\/src\/task.ts/);
   assert.doesNotMatch(body, /\/Users\/example/);
   assert.doesNotMatch(body, /\/Volumes\/private/);
 });
