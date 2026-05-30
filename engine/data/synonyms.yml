@@ -14,8 +14,8 @@ faiss:
   - vector index
   - semantic index
 sovrd:
-  - Sovereign Memory daemon
-sovereign memory daemon:
+  - Minni daemon
+minni daemon:
   - sovrd
 jwt:
   - JSON Web Token

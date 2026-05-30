@@ -1,5 +1,5 @@
 """
-Sovereign Memory — FAISS Disk Persistence.
+Minni — FAISS Disk Persistence.
 
 PR-2: Save/load FAISS index to/from disk with a manifest file.
 

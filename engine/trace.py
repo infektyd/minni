@@ -1,5 +1,5 @@
 """
-Ephemeral per-query trace ring for Sovereign Memory retrieval.
+Ephemeral per-query trace ring for Minni retrieval.
 
 Trace entries are intentionally process-local and bounded. SQLite remains the
 runtime source of truth; this module only keeps recent observability envelopes.

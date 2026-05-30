@@ -1,5 +1,5 @@
 """
-Sovereign Memory V3.1 — Markdown-Aware Chunker (Phase 2).
+Minni V3.1 — Markdown-Aware Chunker (Phase 2).
 
 Phase 2 updates:
 - Chunk size: 512 tokens (word approximation), 128 overlap (25%)

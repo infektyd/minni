@@ -379,7 +379,7 @@ function deterministicPacket(input: {
     constraints[0],
   ].join(" ");
   const contextMarkdown = [
-    "# Sovereign Task Packet",
+    "# Minni Task Packet",
     `Task: ${input.task}`,
     `Intent: ${intent}`,
     `Budget: ${input.budgetTokens} tokens`,
@@ -748,7 +748,7 @@ function outcomeDraft(input: PrepareOutcomeInput): OutcomeDraft {
 
 function outcomeContextMarkdown(packet: PreparedOutcomePacket): string {
   return [
-    "# Sovereign Outcome Packet",
+    "# Minni Outcome Packet",
     `Task: ${packet.task}`,
     `Profile: ${packet.profile}`,
     "## Summary",

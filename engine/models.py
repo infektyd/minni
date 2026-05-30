@@ -1,5 +1,5 @@
 """
-Sovereign Memory — Module-Level Model Singletons.
+Minni — Module-Level Model Singletons.
 
 Provides cached, process-wide singletons for the embedding model and
 cross-encoder re-ranker. Replacing scattered SentenceTransformer(...)

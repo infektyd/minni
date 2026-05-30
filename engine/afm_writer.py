@@ -33,7 +33,7 @@ def _utc() -> str:
 def _ensure_vault(vault: Path) -> None:
     for rel in ("wiki/sessions", "wiki/entities", "wiki/concepts", "inbox", "logs"):
         (vault / rel).mkdir(parents=True, exist_ok=True)
-    for rel, header in (("log.md", "# Sovereign Memory Log\n\n"), ("index.md", "# Sovereign Memory Index\n\n")):
+    for rel, header in (("log.md", "# Minni Log\n\n"), ("index.md", "# Minni Index\n\n")):
         path = vault / rel
         if not path.exists():
             path.write_text(header, encoding="utf-8")
@@ -45,7 +45,7 @@ def _append_audit(vault: Path, tool: str, summary: str, details: dict) -> None:
     line = f"## [{ts}] {tool} | {summary}\n\n```json\n{json.dumps(details, indent=2, sort_keys=True)}\n```\n\n"
     for path in (vault / "log.md", vault / "logs" / f"{ts[:10]}.md"):
         if not path.exists():
-            path.write_text(f"# {ts[:10]} Sovereign Memory Audit\n\n", encoding="utf-8")
+            path.write_text(f"# {ts[:10]} Minni Audit\n\n", encoding="utf-8")
         with path.open("a", encoding="utf-8") as fh:
             fh.write(line)
 

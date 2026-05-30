@@ -1,5 +1,5 @@
 """
-Sovereign Memory offline recall evaluation harness.
+Minni offline recall evaluation harness.
 
 The CLI remains here, while implementation lives in focused modules:
 dataset.py, retrievers.py, metrics.py, and judging.py.
@@ -89,7 +89,7 @@ def _write_markdown_comparison(
 ) -> None:
     """Write a Markdown comparison table across all configs."""
     lines = []
-    lines.append("# Sovereign Memory - Recall Eval Report")
+    lines.append("# Minni - Recall Eval Report")
     lines.append(f"\n**Generated:** {datetime.now(timezone.utc).isoformat()}\n")
     lines.append(f"**Queries:** {next(iter(reports.values()))['summary']['n_queries']}\n")
 
@@ -241,7 +241,7 @@ def cmd_record(args: argparse.Namespace) -> None:
 def main(argv: Optional[list[str]] = None) -> None:
     parser = argparse.ArgumentParser(
         prog="python -m engine.eval.harness",
-        description="Sovereign Memory offline recall evaluation harness.",
+        description="Minni offline recall evaluation harness.",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 

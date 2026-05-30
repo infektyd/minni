@@ -1,5 +1,5 @@
 """
-Sovereign Memory — Safety / Injection Detector.
+Minni — Safety / Injection Detector.
 
 PR-2: is_instruction_like(text) -> bool
 

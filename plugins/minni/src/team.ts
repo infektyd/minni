@@ -307,7 +307,7 @@ function instructionsFor(profile: TemporaryAgentProfile): string[] {
 
 function teamContextMarkdown(packet: Omit<TeamRuntimePacket, "contextMarkdown">): string {
   const sections = [
-    "# Sovereign Team Runtime",
+    "# Minni Team Runtime",
     `Runtime: ${packet.runtimeId}`,
     `Task: ${packet.task}`,
     `Coordinator: ${packet.coordinatorAgentId}`,
@@ -533,7 +533,7 @@ export interface CompatTeamRuntimeInput {
 }
 
 export interface CompatTeamRuntimePacket {
-  kind: "sovereign-team-runtime";
+  kind: "minni-team-runtime";
   version: 1;
   task: string;
   ownerAgentId: string;
@@ -616,7 +616,7 @@ export function buildHydrationPacket(input: {
 }): RuntimeHydrationPacket {
   const evidence = buildEvidenceReport(input.sources).included;
   const contextMarkdown = [
-    "# Sovereign Team Hydration Packet",
+    "# Minni Team Hydration Packet",
     "",
     `Task: ${input.task}`,
     `Owner agent: ${input.ownerAgentId}`,
@@ -703,7 +703,7 @@ function buildCompatRuntime(input: CompatTeamRuntimeInput): CompatTeamRuntimePac
     }),
   );
   return {
-    kind: "sovereign-team-runtime",
+    kind: "minni-team-runtime",
     version: 1,
     task: input.task,
     ownerAgentId: input.ownerAgentId,
@@ -793,7 +793,7 @@ function checkRuntimeExpiration(
 
 function evidenceContextMarkdown(packet: Omit<TeamEvidencePacket, "contextMarkdown">): string {
   const sections = [
-    "# Sovereign Team Evidence",
+    "# Minni Team Evidence",
     packet.runtimeId ? `Runtime: ${packet.runtimeId}` : "Runtime: unspecified",
     `Task: ${packet.task}`,
   ];
@@ -941,7 +941,7 @@ function normalizeRequestedPermissions(agent: TemporaryAgentProfile, requested?:
 
 function promotionContextMarkdown(packet: Omit<TeamPromotionPacket, "contextMarkdown">): string {
   const sections = [
-    "# Sovereign Team Promotion Review",
+    "# Minni Team Promotion Review",
     `Temporary agent: ${packet.temporaryProfile.agentId}`,
     `Status: ${packet.status}`,
     `Auto-write: ${packet.autoWrite}`,

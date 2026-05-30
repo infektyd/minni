@@ -1,5 +1,5 @@
 """
-engine.eval — Offline recall evaluation harness for Sovereign Memory.
+engine.eval — Offline recall evaluation harness for Minni.
 
 Usage:
     python -m engine.eval.harness run --config baseline,with-expand,with-hyde

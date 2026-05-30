@@ -71,7 +71,7 @@ function schemaContent(permanentAgentId: string, profile: PermanentAgentProfile,
 
 ## Bootstrap
 - Created: ${createdAtIso}
-- Source: Sovereign Team Mode promotion
+- Source: Minni Team Mode promotion
 `;
 }
 

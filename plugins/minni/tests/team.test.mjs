@@ -74,7 +74,7 @@ test("buildTeamRuntime creates temporary agent profiles, task ledger, and hydrat
   assert.ok(packet.hydrationPackets[2].instructions.includes("Do not edit files for this assignment."));
   assert.equal(packet.memoryPolicy.automaticLearning, false);
   assert.equal(packet.memoryPolicy.durableWrites, "explicit-only");
-  assert.match(packet.contextMarkdown, /Sovereign Team Runtime/);
+  assert.match(packet.contextMarkdown, /Minni Team Runtime/);
   assert.equal(prepareCalls.length, 3);
   assert.equal(audits[0].tool, "minni_team_runtime");
   // Task 3: audit detail now records focus per agent so repetition signatures can be derived later.

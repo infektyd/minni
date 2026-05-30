@@ -1,5 +1,5 @@
 """
-Sovereign Memory — SQLite ↔ VectorBackend Sync.
+Minni — SQLite ↔ VectorBackend Sync.
 
 PR-3: Keeps each registered VectorBackend in sync with the chunk_embeddings
 table in SQLite.

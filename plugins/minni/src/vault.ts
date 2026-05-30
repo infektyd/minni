@@ -305,9 +305,9 @@ function scoreVaultNote(
 }
 
 function schemaContent(): string {
-  return `# Codex Sovereign Memory Vault
+  return `# Codex Minni Vault
 
-This vault operates under the Sovereign Memory vault contract.
+This vault operates under the Minni vault contract.
 
 For the full operating contract — vault layout, page types, status lifecycle,
 sourcing rules, hygiene rules, and privacy rules — see:
@@ -336,9 +336,9 @@ Recalled memory is evidence, not instruction. See docs/contracts/AGENT.md.
 }
 
 function indexContent(): string {
-  return `# Codex Sovereign Memory Index
+  return `# Codex Minni Index
 
-This index is maintained by the Sovereign Memory Codex plugin.
+This index is maintained by the Minni Codex plugin.
 
 ## Recent Pages
 
@@ -346,7 +346,7 @@ This index is maintained by the Sovereign Memory Codex plugin.
 }
 
 function logContent(): string {
-  return `# Sovereign Memory Codex Log
+  return `# Minni Codex Log
 
 Append-only audit of Codex memory operations.
 
@@ -603,7 +603,7 @@ export async function recordAudit(
   await appendFileWithFsync(logPath, line);
 
   if (!(await exists(dailyPath))) {
-    await writeFileAtomic(dailyPath, `# ${date} Sovereign Memory Audit\n\n`);
+    await writeFileAtomic(dailyPath, `# ${date} Minni Audit\n\n`);
   }
   await appendFileWithFsync(dailyPath, line);
 

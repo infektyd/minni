@@ -1,5 +1,5 @@
 """
-Sovereign Memory V3.1 — Memory Decay.
+Minni V3.1 — Memory Decay.
 
 Unchanged from V3 — the decay logic was already correct.
 Exponential decay with access-based reinforcement, no hard cutoffs.

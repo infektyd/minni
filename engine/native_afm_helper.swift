@@ -73,13 +73,13 @@ import FoundationModels
 
 @Generable
 struct QueryExpansionResult {
-    @Guide(description: "Two or three concise Sovereign Memory search reformulations", .count(3))
+    @Guide(description: "Two or three concise Minni search reformulations", .count(3))
     var queries: [String]
 }
 
 @Generable
 struct NeighborhoodSummaryResult {
-    @Guide(description: "A two sentence summary of linked Sovereign Memory context")
+    @Guide(description: "A two sentence summary of linked Minni context")
     var summary: String
 }
 
@@ -179,7 +179,7 @@ func runFoundationModels(_ request: AFMRequest) async {
                 "data": ["queries": response.content.queries]
             ])
         case "neighborhood_summary":
-            let session = LanguageModelSession(instructions: "Summarize linked Sovereign Memory wiki context in two concise sentences.")
+            let session = LanguageModelSession(instructions: "Summarize linked Minni wiki context in two concise sentences.")
             let response = try await session.respond(
                 to: inputString(request, "prompt"),
                 generating: NeighborhoodSummaryResult.self
@@ -242,7 +242,7 @@ func runFoundationModels(_ request: AFMRequest) async {
                 ]
             ])
         case "compile_pass_proposals":
-            let session = LanguageModelSession(instructions: "Propose review-only Sovereign Memory draft pages. Every proposal must cite only exact source strings present in the input. Do not accept, write, or endorse memory.")
+            let session = LanguageModelSession(instructions: "Propose review-only Minni draft pages. Every proposal must cite only exact source strings present in the input. Do not accept, write, or endorse memory.")
             let response = try await session.respond(
                 to: compactJSONString(request.input ?? [:]),
                 generating: CompilePassProposalsResult.self

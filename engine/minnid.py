@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """minnid — Minni Memory Daemon (Layer 2 IPC Service).
 
-A lightweight daemon that exposes Sovereign Memory (FAISS + SQLite) over a
+A lightweight daemon that exposes Minni (FAISS + SQLite) over a
 Unix domain socket using JSON-RPC 2.0.  Enables local consumers to execute
 search, read, and status requests without spawning a new Python interpreter
 or reloading heavy MLX / sentence-transformer weights every call.
@@ -322,10 +322,10 @@ def _ensure_handoff_vault(vault_path: Path) -> None:
         (vault_path / rel).mkdir(parents=True, exist_ok=True)
     log_path = vault_path / "log.md"
     if not log_path.exists():
-        log_path.write_text("# Sovereign Memory Log\n\n", encoding="utf-8")
+        log_path.write_text("# Minni Log\n\n", encoding="utf-8")
     index_path = vault_path / "index.md"
     if not index_path.exists():
-        index_path.write_text("# Sovereign Memory Index\n\n", encoding="utf-8")
+        index_path.write_text("# Minni Index\n\n", encoding="utf-8")
 
 
 def _slugify(text: str) -> str:
@@ -420,7 +420,7 @@ def _append_handoff_audit(vault_path: Path, tool: str, summary: str, details: di
     line = f"## [{ts}] {safe_tool} | {safe_summary}\n\n```json\n{safe_details}\n```\n\n"
     for path in (vault_path / "log.md", vault_path / "logs" / f"{ts[:10]}.md"):
         if not path.exists():
-            path.write_text(f"# {ts[:10]} Sovereign Memory Audit\n\n", encoding="utf-8")
+            path.write_text(f"# {ts[:10]} Minni Audit\n\n", encoding="utf-8")
         with path.open("a", encoding="utf-8") as fh:
             fh.write(line)
 
@@ -952,7 +952,7 @@ def _resolve_backend(backend_param, config=None):
 
 
 def _handle_search(params: dict, request_id: Any) -> dict:
-    """Search Sovereign Memory via hybrid retrieval.
+    """Search Minni via hybrid retrieval.
 
     Accepts optional ``depth`` parameter for progressive disclosure:
       headline  — wikilink, title, score, confidence, age_days (~30 tokens/result)
@@ -2795,7 +2795,7 @@ def _warn_if_sync_root(label: str, path: Path) -> None:
     for marker in SYNC_ROOTS:
         if rel_str.startswith(marker) or f"/{marker}" in f"/{rel_str}":
             logger.warning(
-                "Sovereign Memory %s appears to be inside a cloud-sync root (%s). "
+                "Minni %s appears to be inside a cloud-sync root (%s). "
                 "Local-first guarantees do not hold for this path. See README §Local-First Hygiene.",
                 label, marker,
             )

@@ -451,7 +451,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
   const host = options.host ?? DEFAULT_UI_HOST;
   const port = options.port ?? DEFAULT_UI_PORT;
   if (!localBindHostAllowed(host)) {
-    throw new Error(`Sovereign Memory console requires a local bind host, got: ${host}`);
+    throw new Error(`Minni console requires a local bind host, got: ${host}`);
   }
   const staticRoot = options.staticRoot ?? path.join(PLUGIN_ROOT, "frontend");
   const vaultPath = options.vaultPath ?? DEFAULT_VAULT_PATH;
@@ -464,11 +464,11 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
   const server = createServer(async (req, res) => {
     try {
       if (!localHostAllowed(req.headers.host)) {
-        sendText(res, 403, "Sovereign Memory console only accepts local host requests.");
+        sendText(res, 403, "Minni console only accepts local host requests.");
         return;
       }
       if (!localOriginAllowed(req.headers.origin) || !fetchSiteAllowed(req.headers["sec-fetch-site"])) {
-        sendText(res, 403, "Sovereign Memory console only accepts same-origin local requests.");
+        sendText(res, 403, "Minni console only accepts same-origin local requests.");
         return;
       }
 
@@ -649,7 +649,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
 async function main(): Promise<void> {
   const app = createUiServer();
   await app.start();
-  console.log(`Sovereign Memory console: http://${app.host}:${app.port}/`);
+  console.log(`Minni console: http://${app.host}:${app.port}/`);
 }
 
 const entry = process.argv[1] ? path.resolve(process.argv[1]) : "";

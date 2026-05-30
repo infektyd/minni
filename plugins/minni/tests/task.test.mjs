@@ -61,7 +61,7 @@ test("prepareTask builds a compact deterministic Codex task packet", async () =>
   assert.equal(packet.relevantSources[0].wikilink, "[[wiki/sessions/backend-handoff]]");
   assert.ok(packet.relevantSources[0].reasons.includes("lexical match"));
   assert.match(packet.constraints.join("\n"), /Do not run AFM extraction/);
-  assert.match(packet.contextMarkdown, /Sovereign Task Packet/);
+  assert.match(packet.contextMarkdown, /Minni Task Packet/);
   assert.equal(packet.afm.used, false);
   assert.equal(audits[0].tool, "minni_prepare_task");
 });

@@ -30,7 +30,7 @@ test("ensureVault creates the Codex LLM wiki structure and schema", async () => 
       path.join(root, "schema", "AGENTS.md"),
       "utf8",
     );
-    assert.match(schema, /Codex Sovereign Memory Vault/);
+    assert.match(schema, /Codex Minni Vault/);
     assert.match(schema, /raw sources/i);
   } finally {
     await rm(root, { recursive: true, force: true });

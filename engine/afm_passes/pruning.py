@@ -139,7 +139,7 @@ def _build_proposals(db, vault_path: str, trace_id: str) -> tuple[List[Dict[str,
 
 def _append_audit(vault: Path, trace_id: str, proposal_count: int, inbox_rel: Optional[str]) -> None:
     ts = _utc()
-    for rel, header in (("log.md", "# Sovereign Memory Log\n\n"), (f"logs/{ts[:10]}.md", f"# {ts[:10]} Sovereign Memory Audit\n\n")):
+    for rel, header in (("log.md", "# Minni Log\n\n"), (f"logs/{ts[:10]}.md", f"# {ts[:10]} Minni Audit\n\n")):
         path = vault / rel
         path.parent.mkdir(parents=True, exist_ok=True)
         if not path.exists():

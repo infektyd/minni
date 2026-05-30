@@ -304,7 +304,7 @@ server.registerTool(
 server.registerTool(
   "minni_status",
   {
-    title: "Sovereign Memory Status",
+    title: "Minni Status",
     description:
       "Check Sovereign daemon, AFM health, Codex vault, and audit state.",
     inputSchema: {
@@ -354,7 +354,7 @@ server.registerTool(
 server.registerTool(
   "minni_route",
   {
-    title: "Sovereign Memory Intent Router",
+    title: "Minni Intent Router",
     description:
       "Classify whether a task should recall, learn, write a vault note, show audit, or do nothing.",
     inputSchema: {
@@ -376,9 +376,9 @@ server.registerTool(
 server.registerTool(
   "minni_recall",
   {
-    title: "Sovereign Memory Recall",
+    title: "Minni Recall",
     description:
-      "Recall Sovereign Memory context and log the lookup in the Codex vault.",
+      "Recall Minni context and log the lookup in the Codex vault.",
     inputSchema: {
       query: z.string().min(1),
       layer: z
@@ -476,9 +476,9 @@ server.registerTool(
 server.registerTool(
   "minni_learn",
   {
-    title: "Sovereign Memory Learn",
+    title: "Minni Learn",
     description:
-      "Write a Codex vault note first, then store the learning through Sovereign Memory.",
+      "Write a Codex vault note first, then store the learning through Minni.",
     inputSchema: {
       title: z.string().min(1),
       content: z.string().min(1),
@@ -641,7 +641,7 @@ server.registerTool(
   {
     title: "Sovereign Audit Report",
     description:
-      "Summarize recent Sovereign Memory tool activity for transparent self-auditing.",
+      "Summarize recent Minni tool activity for transparent self-auditing.",
     inputSchema: {
       limit: z.number().int().min(1).max(200).optional(),
     },
@@ -657,7 +657,7 @@ server.registerTool(
   {
     title: "Sovereign Audit Tail",
     description:
-      "Show recent Sovereign Memory audit entries from the Codex vault.",
+      "Show recent Minni audit entries from the Codex vault.",
     inputSchema: {
       limit: z.number().int().min(1).max(100).optional(),
     },

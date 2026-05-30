@@ -322,9 +322,9 @@ async function handleStop(payload: Record<string, unknown>): Promise<HookOutput>
 
   return {
     continue: true,
-    systemMessage: `Sovereign Memory: ${outcome.outcomeDraft.learnCandidates.length} candidate learning${
+    systemMessage: `Minni: ${outcome.outcomeDraft.learnCandidates.length} candidate learning${
       outcome.outcomeDraft.learnCandidates.length === 1 ? "" : "s"
-    } drafted to inbox (${inbox.filePath}). Use /sovereign-memory:learn to commit.`,
+    } drafted to inbox (${inbox.filePath}). Use /minni:learn to commit.`,
   };
 }
 

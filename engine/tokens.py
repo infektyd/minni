@@ -1,5 +1,5 @@
 """
-Sovereign Memory — Token Counting Utilities.
+Minni — Token Counting Utilities.
 
 Provides a singleton tiktoken encoder and a helper for counting tokens in
 text strings. Used by the chunker and retrieval engine for accurate context

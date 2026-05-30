@@ -1,5 +1,5 @@
 """
-Sovereign Memory — Schema Migrations Runner.
+Minni — Schema Migrations Runner.
 
 Reads PRAGMA user_version from SQLite and runs pending numbered SQL scripts
 from engine/migrations/*.sql in lexicographic order, in a single transaction.

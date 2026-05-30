@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Sovereign Memory V3.1 — Agent API.
+Minni V3.1 — Agent API.
 
-Single entry point for agents to interact with the Sovereign Memory system.
+Single entry point for agents to interact with the Minni system.
 Supports hybrid retrieval (FAISS + FTS5), write-back learnings, episodic events,
 and two-layer startup hydration (identity + knowledge).
 
@@ -28,7 +28,7 @@ from principal import EffectivePrincipal  # G19: for can_read_document on recall
 
 class SovereignAgent:
     """
-    Single entry point for agents to interact with Sovereign Memory.
+    Single entry point for agents to interact with Minni.
 
     Each agent gets:
     - identity_context(): whole-document load of IDENTITY.md + SOUL.md (Layer 1)
@@ -60,7 +60,7 @@ class SovereignAgent:
 
         Identity is NOT chunked — it's loaded in full so the agent knows WHO it is
         before receiving any retrieved knowledge. This is Layer 1 of the two-layer
-        hydration: identity first, sovereign memory second.
+        hydration: identity first, Minni second.
 
         Returns formatted markdown or empty string if no identity exists.
         """

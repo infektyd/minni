@@ -1,5 +1,5 @@
 """
-Sovereign Memory V3.1 — FAISS Index Manager.
+Minni V3.1 — FAISS Index Manager.
 
 V3 used raw numpy loops to compute cosine similarity against all chunks.
 That works fine at small scale but becomes a bottleneck at 200K+ vectors.

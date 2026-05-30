@@ -1,5 +1,5 @@
 """
-Sovereign Memory V3.1 — Centralized Configuration.
+Minni V3.1 — Centralized Configuration.
 
 V3.1 changes:
 - Removed all compression config (TurboQuant stripped entirely)

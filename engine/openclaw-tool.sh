@@ -1,5 +1,5 @@
 #!/bin/bash
-# openclaw-tool.sh — Wrapper for Sovereign Memory agent_api.py
+# openclaw-tool.sh — Wrapper for Minni agent_api.py
 # Used by OpenClaw agents (forge, syntra, recon, pulse) to call
 # sovereign_recall and sovereign_learn without shell-out complexity.
 #
@@ -12,7 +12,7 @@ PYTHON="${SOVEREIGN_DIR}/venv/bin/python"
 API="${SOVEREIGN_DIR}/agent_api.py"
 
 if [ ! -f "$PYTHON" ] || [ ! -f "$API" ]; then
-    echo '{"success": false, "error": "Sovereign Memory engine not found"}'
+    echo '{"success": false, "error": "Minni engine not found"}'
     exit 1
 fi
 
@@ -33,7 +33,7 @@ case "$1" in
         EXIT_CODE=$?
 
         if [ $EXIT_CODE -ne 0 ]; then
-            echo '{"success": false, "error": "Sovereign Memory recall failed"}'
+            echo '{"success": false, "error": "Minni recall failed"}'
             exit 1
         fi
 
@@ -81,7 +81,7 @@ case "$1" in
         EXIT_CODE=$?
 
         if [ $EXIT_CODE -ne 0 ]; then
-            echo '{"success": false, "error": "Sovereign Memory learn failed"}'
+            echo '{"success": false, "error": "Minni learn failed"}'
             exit 1
         fi
 
