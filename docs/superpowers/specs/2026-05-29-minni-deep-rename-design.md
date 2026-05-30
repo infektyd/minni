@@ -33,7 +33,7 @@ Everywhere `sovereign` / `sovereign-memory` appears, the target is `minni`. The 
 | `mcp__sovereign-memory__sovereign_recall` | `mcp__minni__minni_recall` (also drop the redundant prefix → `mcp__minni__recall` where clean) |
 | `sovereign-memory:recall` (skill ID) | `minni:recall` |
 | `~/.sovereign-memory/` (vault) | `~/.minni/` |
-| `plugins/minni/`, `sovereign-memory@sovereign-memory` | `plugins/minni/`, `minni@minni` |
+| `plugins/sovereign-memory/`, `sovereign-memory@sovereign-memory` | `plugins/minni/`, `minni@minni` |
 | `SOVEREIGN_*` env, `sovrd`, `sovereign_memory.db` | `MINNI_*`, `minnid`, `minni.db` |
 | `sovereign_learning:` / tag fields | `minni_*` |
 
@@ -44,7 +44,7 @@ Everywhere `sovereign` / `sovereign-memory` appears, the target is `minni`. The 
 Operator directive (2026-05-29): kill the path/reference sprawl. Every link, workspace pointer, and config reference in the whole system must resolve to **exactly one of two anchors** — nothing else:
 
 1. **The root project dir** — `~/Projects/minni` (the git repo; source of truth for code, skills, manifests, docs).
-2. **The installed plugin** — `~/.agents/plugins/sovereign-memory@minni` (the runtime surface agents actually load: MCP server, hooks, commands, skills).
+2. **The installed plugin** — `~/.agents/plugins/minni@minni` (the runtime surface agents actually load: MCP server, hooks, commands, skills).
 
 **Banned after migration** (each is a sprawl/staleness source to eliminate):
 - `~/Projects/sovereignMemory` (stale workspace pointer — the grok disease)
@@ -96,7 +96,7 @@ Nothing breaks mid-migration because `sovereign` keeps resolving until explicitl
 - All five platforms recall + learn through `mcp__minni__*` / `minni:*`.
 - `~/.minni/` is canonical; no data lost (checksum parity vs pre-migration snapshot).
 - Grok-build no longer references `~/Projects/sovereignMemory`.
-- Every platform config/link resolves to one of the two canonical anchors (§3b) — root project dir or `~/.agents/plugins/sovereign-memory@minni`; no third path survives.
+- Every platform config/link resolves to one of the two canonical anchors (§3b) — root project dir or `~/.agents/plugins/minni@minni`; no third path survives.
 - Skills set has an explicit keep/merge/retire decision per skill.
 - Agent playbook exists and is accurate for each platform.
 - No agent breaks at any phase boundary (compat layer holds).

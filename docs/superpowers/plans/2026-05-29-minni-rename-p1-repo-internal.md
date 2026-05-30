@@ -6,7 +6,9 @@
 
 **Architecture:** P1 is **in-git only and reversible**. It deliberately does NOT rename runtime-coupled identifiers (MCP server key `mcp__sovereign-memory__`, tool verbs `sovereign_recall`, `SOVEREIGN_*` env, vault path). Those derive from / wire into the live system and are renamed in **P2 with a simultaneous compat-alias layer** so nothing is ever broken. P1 produces a branch that is brand-correct and structurally renamed but still functionally identical at runtime.
 
-**Tech Stack:** TypeScript MCP plugin (`plugins/minni` → `plugins/minni`), Node `--test`, Vite, ripgrep for audit gates.
+**Tech Stack:** TypeScript MCP plugin (`plugins/sovereign-memory` → `plugins/minni`), Node `--test`, Vite, ripgrep for audit gates.
+
+> **EXECUTION STATUS (2026-05-30):** Tasks 1–3 COMPLETE (commits `91fe2f7`, `75b85d3`). The plugin dir is renamed and the build passes. NOTE: commit `91fe2f7` also ran an over-broad markdown sweep that flattened some old→new descriptions in this plan (and the spec/playbook, since repaired). The original `plugins/sovereign-memory` "before" strings below were corrupted to `plugins/minni`; treat the Task 1–3 prose as historical. Tasks 4–6 (branding + verify) are driven inline by the controller.
 
 **Spec:** `docs/superpowers/specs/2026-05-29-minni-deep-rename-design.md`
 
@@ -17,7 +19,7 @@
 ## Scope boundary (READ FIRST)
 
 **P1 RENAMES (safe):**
-- Plugin directory `plugins/minni/` → `plugins/minni/` (git mv — path only; install source updated in manifests).
+- Plugin directory `plugins/sovereign-memory/` → `plugins/minni/` (git mv — path only; install source updated in manifests).
 - Human-facing brand/description strings in manifests and docs ("Sovereign Memory" → "Minni" where it's branding, not an identifier).
 - npm `package.json` `name` fields.
 - Skill *directory names* and SKILL.md frontmatter titles where they are branding.
@@ -75,14 +77,14 @@ git commit -m "chore(minni-p1): capture rename inventory + protected-string base
 ## Task 2: Rename the plugin directory
 
 **Files:**
-- Move: `plugins/minni/` → `plugins/minni/`
+- Move: `plugins/sovereign-memory/` → `plugins/minni/`
 
 - [ ] **Step 1: git mv the directory**
 
 Run:
 ```bash
 cd /Users/hansaxelsson/Projects/Minni
-git mv plugins/minni plugins/minni
+git mv plugins/sovereign-memory plugins/minni
 ```
 
 - [ ] **Step 2: Verify nothing else referenced the literal path `plugins/minni`**
@@ -113,7 +115,7 @@ Expected: no output (empty). If lines remain, fix them.
 ```bash
 cd /Users/hansaxelsson/Projects/Minni
 git add -A
-git commit -m "refactor(minni-p1): rename plugins/minni -> plugins/minni + fix install-source paths"
+git commit -m "refactor(minni-p1): rename plugins/sovereign-memory -> plugins/minni + fix install-source paths"
 ```
 
 ---
