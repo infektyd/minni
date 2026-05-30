@@ -306,7 +306,7 @@ server.registerTool(
   {
     title: "Minni Status",
     description:
-      "Check Sovereign daemon, AFM health, Codex vault, and audit state.",
+      "Check Minni daemon, AFM health, vault, and audit state.",
     inputSchema: {
       // G12: vaultPath removed from model-facing schema (consistent with afmPrepareUrl removal for G13).
       // Model can no longer redirect status/audit to arbitrary paths outside the stamped principal's allowed_vault_roots.
@@ -583,7 +583,7 @@ server.registerTool(
   {
     title: "Minni Learning Quality",
     description:
-      "Review a potential memory before writing it to the Codex vault or Sovereign daemon.",
+      "Review a potential memory before writing it to the vault or Minni daemon.",
     inputSchema: {
       title: z.string().min(1),
       content: z.string().min(1),
