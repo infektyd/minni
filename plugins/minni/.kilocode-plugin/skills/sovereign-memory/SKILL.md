@@ -2,7 +2,7 @@
 name: sovereign-memory
 description: Use when the user asks the agent to recall, learn, write, audit, or operate through Sovereign Memory, or when a task likely benefits from prior local memory. Default automatic behavior is recall-only; do not learn unless explicitly requested.
 version: 0.1.0
-author: Hans Axelsson
+author: Infektyd
 tags: [sovereign-memory, obsidian, llm-wiki, local-first, mcp]
 compatibility: Requires sovereign-memory MCP server running (node dist/server.js) and the Sovereign daemon at the canonical per-user socket.
 ---
