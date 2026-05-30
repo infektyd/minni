@@ -55,52 +55,10 @@ export function parseSovrdJson<T = unknown>(raw: string): JsonResult<T> {
   }
 }
 
-function socketRequest(method: "GET" | "POST", endpoint: string, body?: object): Promise<JsonResult> {
-  return new Promise((resolve) => {
-    if (!existsSync(SOCKET_PATH)) {
-      resolve({ ok: false, error: `Socket not found: ${SOCKET_PATH}` });
-      return;
-    }
-
-    const payload = body ? JSON.stringify(body) : undefined;
-    const req = httpRequest(
-      {
-        socketPath: SOCKET_PATH,
-        path: endpoint,
-        method,
-        headers: {
-          "Content-Type": "application/json",
-          ...(payload ? { "Content-Length": Buffer.byteLength(payload).toString() } : {}),
-        },
-      },
-      (res) => {
-        let data = "";
-        res.on("data", (chunk) => {
-          data += chunk;
-        });
-        res.on("end", () => {
-          const parsed = parseSovrdJson(data);
-          if (!parsed.ok) {
-            resolve(parsed);
-            return;
-          }
-          if (res.statusCode && res.statusCode >= 400) {
-            const error =
-              typeof parsed.data === "object" && parsed.data && "error" in parsed.data
-                ? String((parsed.data as { error: unknown }).error)
-                : `HTTP ${res.statusCode}`;
-            resolve({ ok: false, data: parsed.data, error });
-            return;
-          }
-          resolve(parsed);
-        });
-      },
-    );
-    req.on("error", (error) => resolve({ ok: false, error: error.message }));
-    if (payload) req.write(payload);
-    req.end();
-  });
-}
+// NOTE: the old socketRequest() (HTTP-over-unix-socket) was removed. The daemon
+// speaks JSON-RPC only, so that fallback could never succeed and instead masked
+// real daemon errors (e.g. identity_mismatch) as "Parse Error: Expected HTTP/".
+// All daemon calls now go through jsonRpcSocketRequest and surface real errors.
 
 export async function afmHealth(url = AFM_HEALTH_URL): Promise<JsonResult> {
   return new Promise((resolve) => {
@@ -129,9 +87,9 @@ export async function afmHealth(url = AFM_HEALTH_URL): Promise<JsonResult> {
 }
 
 export async function socketHealth(): Promise<JsonResult> {
-  const rpc = await jsonRpcSocketRequestWithFallback("status", {});
-  if (rpc.ok) return rpc;
-  return socketRequest("GET", "/health");
+  // Daemon speaks JSON-RPC only; return its real result (including structured
+  // errors) rather than masking them behind a dead HTTP-over-socket fallback.
+  return jsonRpcSocketRequestWithFallback("status", {});
 }
 
 export async function recallMemory(input: {
@@ -141,21 +99,14 @@ export async function recallMemory(input: {
   workspaceId?: string;
   limit?: number;
 }): Promise<JsonResult<RecallResponse>> {
-  const rpc = await jsonRpcSocketRequestWithFallback("search", {
+  // Daemon is JSON-RPC only; surface its real result/error (e.g. identity_mismatch)
+  // directly instead of masking it behind a dead HTTP-over-socket fallback.
+  return jsonRpcSocketRequestWithFallback("search", {
     query: input.query,
     agent_id: input.agentId ?? DEFAULT_AGENT_ID,
     layers: input.layer ? [input.layer] : undefined,
     limit: input.limit,
-  }) as JsonResult<RecallResponse>;
-  if (rpc.ok) return rpc;
-
-  const params = new URLSearchParams();
-  params.set("q", input.query);
-  params.set("agent_id", input.agentId ?? DEFAULT_AGENT_ID);
-  if (input.layer) params.set("layer", input.layer);
-  if (input.workspaceId) params.set("workspace_id", input.workspaceId);
-  if (input.limit !== undefined) params.set("limit", String(input.limit));
-  return socketRequest("GET", `/recall?${params.toString()}`) as Promise<JsonResult<RecallResponse>>;
+  }) as Promise<JsonResult<RecallResponse>>;
 }
 
 export async function learnMemory(input: {
@@ -170,9 +121,8 @@ export async function learnMemory(input: {
     agent_id: input.agentId ?? DEFAULT_AGENT_ID,
     workspace_id: input.workspaceId ?? DEFAULT_WORKSPACE_ID,
   };
-  const rpc = await jsonRpcSocketRequestWithFallback("learn", body);
-  if (rpc.ok) return rpc;
-  return socketRequest("POST", "/learn", body);
+  // JSON-RPC only; return the daemon's real result/error (no masking HTTP fallback).
+  return jsonRpcSocketRequestWithFallback("learn", body);
 }
 
 export async function readAgentContext(input: {
