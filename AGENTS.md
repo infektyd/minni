@@ -1,8 +1,8 @@
-# AGENTS.md — Sovereign Memory (root)
+# AGENTS.md — Minni (root)
 
 Hey. This file is here because we keep running into the same dumb pattern and it slows us down when we're actually trying to build the damn thing.
 
-We're inside `~/Projects/sovereignMemory`. This is not a normal codebase. Sovereign Memory is a big, weird, living system with a bunch of different surfaces and tentacles that reach out into the rest of the machine. Treating it like "just the plugin folder" or "just whatever has 'sovereign-memory' in the path" is how we end up in the exact regression loop we were just in.
+We're inside `~/Projects/Minni`. This is not a normal codebase. Minni is a big, weird, living system with a bunch of different surfaces and tentacles that reach out into the rest of the machine. Treating it like "just the plugin folder" or "just whatever has 'sovereign-memory' in the path" is how we end up in the exact regression loop we were just in.
 
 ### The Real Rule
 

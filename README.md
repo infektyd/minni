@@ -1,11 +1,11 @@
-<!-- Sovereign Memory — README
+<!-- Minni — README
      Narrative direction · DESIGN.md-aligned palette · pre-v1 alpha
      Visuals live in docs/readme-assets/ as light + dark SVG pairs.
      Collapsible sections use native <details>. Mobile-friendly. -->
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/readme-assets/hero-dark.svg">
-  <img alt="Sovereign Memory — local-first memory and governance layer for AI agents" src="docs/readme-assets/hero-light.svg">
+  <img alt="Minni — local-first memory and governance layer for AI agents" src="docs/readme-assets/hero-light.svg">
 </picture>
 
 <sub>454 tests passing · 26 MCP tools · MIT · no telemetry · no cloud sync</sub>

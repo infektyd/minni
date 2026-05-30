@@ -1,6 +1,6 @@
-# Sovereign Memory Canonical Paths
+# Minni Canonical Paths
 
-This folder is the canonical home for Sovereign Memory on this machine:
+This folder is the canonical home for Minni on this machine:
 
 `<repo-root>`
 
@@ -17,14 +17,14 @@ names. Treat those as legacy references, not active roots.
 
 ## Active Core
 
-- `engine/` - Sovereign Memory Python engine.
+- `engine/` - Minni Python engine.
 - `openclaw-extension/` - OpenClaw extension bridge.
 - `plugins/minni/` - Codex plugin package.
 - `session-extracts/` - extracted handoff/session notes.
 
 ## Active Runtime
 
-- `~/.sovereign-memory/sovereign_memory.db` - active Sovereign Memory database.
+- `~/.sovereign-memory/sovereign_memory.db` - active Minni database.
 - `~/.sovereign-memory/faiss/` - active FAISS cache.
 - `~/.sovereign-memory/run/sovrd.sock` - active daemon socket.
 - `~/.sovereign-memory/codex-vault` - Codex-owned Obsidian vault.
@@ -67,7 +67,7 @@ symlinks where the owning app expects stable paths.
 
 ## Sync-Root Avoidance
 
-Sovereign Memory's "local-first" guarantee assumes the vault and database are
+Minni's "local-first" guarantee assumes the vault and database are
 not under any third-party sync root. The daemon emits a startup warning if its
 vault path or DB path resolves under any of these prefixes:
 
