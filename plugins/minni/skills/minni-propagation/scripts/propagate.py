@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Sovereign Memory propagation helper.
+"""Minni propagation helper.
 
 Local helper for agent Layer 1/envelope setup and verification. It is intentionally
 small: inspect paths, seed a hosted-agent whole-document envelope, and verify
@@ -21,13 +21,13 @@ import time
 from pathlib import Path
 
 
-DEFAULT_DB = Path("~/.sovereign-memory/sovereign_memory.db").expanduser()
-DEFAULT_SOCKET = Path("~/.sovereign-memory/run/sovrd.sock").expanduser()
+DEFAULT_DB = Path("~/.minni/sovereign_memory.db").expanduser()
+DEFAULT_SOCKET = Path("~/.minni/run/sovrd.sock").expanduser()
 DEFAULT_PLUGIN_CLI = Path(
-    "~/.codex/plugins/cache/sovereign-memory/sovereign-memory/0.1.0/dist/cli.js"
+    "~/.codex/plugins/cache/minni/minni/0.1.0/dist/cli.js"
 ).expanduser()
-DEFAULT_IDENTITY_ROOT = Path("~/.sovereign-memory/identities").expanduser()
-DEFAULT_REPO_ROOT = Path.home() / "Projects" / "sovereignMemory"
+DEFAULT_IDENTITY_ROOT = Path("~/.minni/identities").expanduser()
+DEFAULT_REPO_ROOT = Path.home() / "Projects" / "minni"
 
 
 PLATFORM_ALIASES = {
@@ -47,7 +47,7 @@ def canonical_platform(platform: str) -> str:
 
 
 def repo_engine(workspace: str | None) -> Path:
-    default = Path.home() / "Projects" / "sovereignMemory" / "engine"
+    default = Path.home() / "Projects" / "minni" / "engine"
     if default.exists():
         return default
     if workspace:
@@ -57,31 +57,31 @@ def repo_engine(workspace: str | None) -> Path:
 
 def vault_for(agent: str) -> Path:
     if agent == "codex":
-        return Path("~/.sovereign-memory/codex-vault").expanduser()
+        return Path("~/.minni/codex-vault").expanduser()
     if agent in {"claude", "claude-code"}:
-        return Path("~/.sovereign-memory/claudecode-vault").expanduser()
+        return Path("~/.minni/claudecode-vault").expanduser()
     if agent == "gemini":
-        # Gemini's canonical location is now ~/.sovereign-memory/gemini-vault,
-        # but older installs may still have content at the legacy ~/.gemini/sovereign-vault
+        # Gemini's canonical location is now ~/.minni/gemini-vault,
+        # but older installs may still have content at the legacy ~/.gemini/minni-vault
         # path. To avoid silently stranding prior memory on upgrade, fall back to the
         # legacy path when the canonical one is missing and the legacy one has data.
         # Operators should `mv` the legacy directory to the canonical location to
         # complete the migration.
-        canonical = Path("~/.sovereign-memory/gemini-vault").expanduser()
-        legacy = Path("~/.gemini/sovereign-vault").expanduser()
+        canonical = Path("~/.minni/gemini-vault").expanduser()
+        legacy = Path("~/.gemini/minni-vault").expanduser()
         if not canonical.exists() and legacy.exists() and any(legacy.iterdir()):
             sys.stderr.write(
-                f"[sm-propagation] gemini vault still at legacy path: {legacy}\n"
+                f"[minni-propagation] gemini vault still at legacy path: {legacy}\n"
                 f"  Move it to the canonical layout to silence this warning:\n"
                 f"    mv {legacy} {canonical}\n"
             )
             return legacy
         return canonical
-    return Path(f"~/.sovereign-memory/{agent}-vault").expanduser()
+    return Path(f"~/.minni/{agent}-vault").expanduser()
 
 
 def plugin_source(repo_root: Path) -> Path:
-    return repo_root / "plugins" / "sovereign-memory"
+    return repo_root / "plugins" / "minni"
 
 
 def run(cmd: list[str], cwd: Path | None = None) -> None:
@@ -125,15 +125,15 @@ def replace_toml_sections(path: Path, sections: dict[str, str]) -> None:
 def mcp_json(server_path: Path, agent: str, vault: Path, socket_path: Path, workspace: Path) -> dict:
     return {
         "mcpServers": {
-            "sovereign-memory": {
+            "minni": {
                 "command": "node",
                 "args": [str(server_path)],
                 "cwd": str(server_path.parent.parent if server_path.parent.name == "dist" else server_path.parent),
                 "env": {
-                    "SOVEREIGN_AGENT_ID": agent,
-                    "SOVEREIGN_VAULT_PATH": str(vault),
-                    "SOVEREIGN_SOCKET_PATH": str(socket_path),
-                    "SOVEREIGN_WORKSPACE_ID": str(workspace),
+                    "MINNI_AGENT_ID": agent,
+                    "MINNI_VAULT_PATH": str(vault),
+                    "MINNI_SOCKET_PATH": str(socket_path),
+                    "MINNI_WORKSPACE_ID": str(workspace),
                 },
             }
         }
@@ -143,15 +143,15 @@ def mcp_json(server_path: Path, agent: str, vault: Path, socket_path: Path, work
 def update_claude_config(server_path: Path, agent: str, vault: Path, socket_path: Path, workspace: Path) -> None:
     path = Path("~/.claude.json").expanduser()
     data = load_json(path)
-    data.setdefault("mcpServers", {})["sovereign-memory"] = {
+    data.setdefault("mcpServers", {})["minni"] = {
         "type": "stdio",
         "command": "node",
         "args": [str(server_path)],
         "env": {
-            "SOVEREIGN_AGENT_ID": agent,
-            "SOVEREIGN_VAULT_PATH": str(vault),
-            "SOVEREIGN_SOCKET_PATH": str(socket_path),
-            "SOVEREIGN_WORKSPACE_ID": str(workspace),
+            "MINNI_AGENT_ID": agent,
+            "MINNI_VAULT_PATH": str(vault),
+            "MINNI_SOCKET_PATH": str(socket_path),
+            "MINNI_WORKSPACE_ID": str(workspace),
         },
     }
     write_json(path, data)
@@ -160,15 +160,15 @@ def update_claude_config(server_path: Path, agent: str, vault: Path, socket_path
 def update_kilo_config(server_path: Path, agent: str, vault: Path, socket_path: Path, workspace: Path) -> None:
     path = Path("~/.config/kilo/kilo.json").expanduser()
     data = load_json(path)
-    data.setdefault("mcp", {})["sovereign-memory"] = {
+    data.setdefault("mcp", {})["minni"] = {
         "type": "local",
         "command": ["node", str(server_path)],
         "enabled": True,
         "env": {
-            "SOVEREIGN_AGENT_ID": agent,
-            "SOVEREIGN_VAULT_PATH": str(vault),
-            "SOVEREIGN_SOCKET_PATH": str(socket_path),
-            "SOVEREIGN_WORKSPACE_ID": str(workspace),
+            "MINNI_AGENT_ID": agent,
+            "MINNI_VAULT_PATH": str(vault),
+            "MINNI_SOCKET_PATH": str(socket_path),
+            "MINNI_WORKSPACE_ID": str(workspace),
         },
     }
     write_json(path, data)
@@ -178,18 +178,18 @@ def update_gemini_manifest(install_root: Path, agent: str, vault: Path, socket_p
     write_json(
         install_root / "gemini-extension.json",
         {
-            "name": "sovereign-memory",
+            "name": "minni",
             "version": "0.1.0",
             "mcpServers": {
-                "sovereign-memory": {
+                "minni": {
                     "command": "node",
                     "args": ["${extensionPath}${/}dist${/}server.js"],
                     "cwd": "${extensionPath}",
                     "env": {
-                        "SOVEREIGN_AGENT_ID": agent,
-                        "SOVEREIGN_VAULT_PATH": str(vault),
-                        "SOVEREIGN_SOCKET_PATH": str(socket_path),
-                        "SOVEREIGN_WORKSPACE_ID": str(workspace),
+                        "MINNI_AGENT_ID": agent,
+                        "MINNI_VAULT_PATH": str(vault),
+                        "MINNI_SOCKET_PATH": str(socket_path),
+                        "MINNI_WORKSPACE_ID": str(workspace),
                     },
                 }
             },
@@ -201,18 +201,18 @@ def update_toml_mcp_config(path: Path, server_path: Path, agent: str, vault: Pat
     replace_toml_sections(
         path,
         {
-            "mcp_servers.sovereign-memory": (
-                "[mcp_servers.sovereign-memory]\n"
+            "mcp_servers.minni": (
+                "[mcp_servers.minni]\n"
                 'command = "node"\n'
                 f'args = ["{server_path}"]\n'
                 "enabled = true"
             ),
-            "mcp_servers.sovereign-memory.env": (
-                "[mcp_servers.sovereign-memory.env]\n"
-                f'SOVEREIGN_AGENT_ID = "{agent}"\n'
-                f'SOVEREIGN_VAULT_PATH = "{vault}"\n'
-                f'SOVEREIGN_SOCKET_PATH = "{socket_path}"\n'
-                f'SOVEREIGN_WORKSPACE_ID = "{workspace}"'
+            "mcp_servers.minni.env": (
+                "[mcp_servers.minni.env]\n"
+                f'MINNI_AGENT_ID = "{agent}"\n'
+                f'MINNI_VAULT_PATH = "{vault}"\n'
+                f'MINNI_SOCKET_PATH = "{socket_path}"\n'
+                f'MINNI_WORKSPACE_ID = "{workspace}"'
             ),
         },
     )
@@ -224,38 +224,38 @@ def platform_spec(platform: str, repo_root: Path, install_root: str | None = Non
     specs: dict[str, dict[str, object]] = {
         "codex": {
             "agent": "codex",
-            "install": home / ".codex/plugins/cache/sovereign-memory/sovereign-memory/0.1.0",
+            "install": home / ".codex/plugins/cache/minni/minni/0.1.0",
             "config": home / ".codex/config.toml",
             "config_kind": "toml",
         },
         "claude-code": {
             "agent": "claude-code",
-            "install": home / ".claude/plugins/cache/sovereign-memory/sovereign-memory/0.1.0",
+            "install": home / ".claude/plugins/cache/minni/minni/0.1.0",
             "config": home / ".claude.json",
             "config_kind": "claude-json",
         },
         "kilocode": {
             "agent": "kilocode",
-            "install": home / ".config/kilo/plugins/sovereign-memory",
+            "install": home / ".config/kilo/plugins/minni",
             "config": home / ".config/kilo/kilo.json",
             "config_kind": "kilo-json",
         },
         "gemini": {
             "agent": "gemini",
-            "install": home / ".gemini/extensions/sovereign-memory",
+            "install": home / ".gemini/extensions/minni",
             "config_kind": "gemini-manifest",
         },
         "grok-beta": {
             "agent": "grok-beta",
-            "install": home / ".grok/plugins/sovereign-memory",
+            "install": home / ".grok/plugins/minni",
             "config": home / ".grok/config.toml",
             "config_kind": "toml",
         },
         "grok-build": {
             "agent": "grok-build",
-            "install": home / ".grok/plugins/grok-sovereign-memory",
+            "install": home / ".grok/plugins/grok-minni",
             "config": home / ".grok/config.toml",
-            "config_kind": "mcp-json-only",  # uses ~/.agents/bin/mcp-env-run wrapper + .mcp.json; Grok Build hook integration (no full sovereign plugin copy)
+            "config_kind": "mcp-json-only",  # uses ~/.agents/bin/mcp-env-run wrapper + .mcp.json; Grok Build hook integration (no full minni plugin copy)
         },
     }
     if platform == "generic":
@@ -289,7 +289,7 @@ def update_one_plugin(platform: str, args: argparse.Namespace) -> dict[str, obje
     if canonical_platform(platform) == "grok-build":
         # Grok Build uses its own session-hook integration surface (plugins/grok-minni/ in this repo).
         # UserPromptSubmit intercepts /flush, /compact, and /dream (plus scar drafting on PreCompact/Stop).
-        # Do not copy the full sovereign plugin tree; just ensure the per-agent vault + .mcp.json stamp.
+        # Do not copy the full minni plugin tree; just ensure the per-agent vault + .mcp.json stamp.
         install_root.mkdir(parents=True, exist_ok=True)
     else:
         copy_tree(source, install_root)
@@ -344,7 +344,7 @@ def bootstrap_vault(args: argparse.Namespace) -> int:
     schema = vault / "schema" / "AGENTS.md"
     if not schema.exists():
         schema.write_text(
-            f"# {agent} Sovereign Memory Vault\n\n"
+            f"# {agent} Minni Vault\n\n"
             "This is an actual per-agent vault directory. Do not symlink this "
             "vault to another agent's vault and do not bootstrap it by copying "
             "another agent's logs, inbox, or wiki wholesale.\n",
@@ -381,7 +381,7 @@ def render_hosted_envelope(agent: str, workspace: str, socket_path: Path, vault:
     title = f"{agent.title()} Hosted Agent Envelope"
     return f"""# {title}
 
-This is {agent}'s Sovereign Memory Layer 1 whole-document envelope for the
+This is {agent}'s Minni Layer 1 whole-document envelope for the
 {Path(workspace).name} workspace.
 
 It is not a {agent} soul. {agent} runs inside a host runtime that already
@@ -391,10 +391,10 @@ instructions, and to the user's current request.
 
 ## Core Rule
 
-Sovereign Memory gives owned agents a soul. It gives hosted agents a map.
+Minni gives owned agents a soul. It gives hosted agents a map.
 
 Owned agents such as Hermes agents, OpenClaw variants, local workers, and future
-Sovereign-authored agents may receive Layer 1 soul or identity material.
+Minni-authored agents may receive Layer 1 soul or identity material.
 Hosted agents such as Codex, Claude Code, Gemini, and Antigravity receive a
 workspace envelope instead.
 
@@ -402,8 +402,8 @@ workspace envelope instead.
 
 workspace: {workspace}
 agent_surface: {agent}
-sovereign_layer_mode: hosted_agent_envelope
-layer_1_soul: not_for_{agent}
+minni_layer_mode: hosted_agent_envelope
+minni_layer_1_soul: not_for_{agent}
 memory_mode: recall_first_manual_write
 vault_path: {vault}
 socket_path: {socket_path}
@@ -553,7 +553,7 @@ def verify(args: argparse.Namespace) -> int:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Propagate/verify Sovereign Memory for an agent.")
+    parser = argparse.ArgumentParser(description="Propagate/verify Minni for an agent.")
     parser.add_argument("--db", default=str(DEFAULT_DB))
     parser.add_argument("--socket", default=str(DEFAULT_SOCKET))
     parser.add_argument("--repo", default=str(DEFAULT_REPO_ROOT))

@@ -105,7 +105,7 @@ See the full details, schema, and examples in the reference package: `~/.agents/
 - **Whole-document identity**: `<agent>` envelope (e.g. `identity:grok-build`, `identity:claude-code`) stored as a single whole_document=1 chunk at chunk_index=0 in the daemon DB. Never chunked.
 - **Small curated layer1/**: `layer1/core.md` + `layer1/budget.md` (strict <4096 token budget). Agent has full curation rights. Read-first on wake / SessionStart. Ritual hygiene required (protect during distill).
 - **Self-describing**: The envelope + Layer 1 files declare the agent's identity, vault path, workspace, boundaries, and high-level orientation so any consumer (including cross-agent) knows the contract without external lookup.
-- Seeded and verified via `sm-propagation` (or equivalent). See the DESIGN in the sovereignMemory repo (`sovereign-memory/docs/DESIGN-sovereign-delivery-layer.md`) and ritual package for templates parameterized by agent id + workspace.
+- Seeded and verified via `minni-propagation` (or equivalent). See the DESIGN in the Minni repo (`minni/docs/DESIGN-sovereign-delivery-layer.md`) and ritual package for templates parameterized by agent id + workspace.
 
 ## Team Coordination, Cross-Agent Contracts, Evidence & Governance
 

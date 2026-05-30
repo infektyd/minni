@@ -201,15 +201,15 @@ python3 sovrd_client.py --socket ~/.sovereign-memory/run/sovrd.sock search "memo
 
 ### Multi-agent install · sm-propagation
 
-Per-agent setup runs through the **`sm-propagation`** skill. Each hosted agent gets its own workspace envelope at `~/.sovereign-memory/identities/<agent>/` and its own vault — no shared state between agents.
+Per-agent setup runs through the **`minni-propagation`** skill. Each hosted agent gets its own workspace envelope at `~/.sovereign-memory/identities/<agent>/` and its own vault — no shared state between agents.
 
 Supported platforms: `codex` · `claude-code` · `kilocode` · `gemini` · `grok-build` · `grok-beta` (legacy) · `all` · `generic`
 
 ```bash
-python3 sovereign-memory/skills/sm-propagation/scripts/propagate.py update-plugin --platform grok-build
+python3 minni/skills/minni-propagation/scripts/propagate.py update-plugin --platform grok-build
 ```
 
-See [`sovereign-memory/skills/sm-propagation/SKILL.md`](sovereign-memory/skills/sm-propagation/SKILL.md) and [`sovereign-memory/docs/DESIGN-sovereign-delivery-layer.md`](sovereign-memory/docs/DESIGN-sovereign-delivery-layer.md) for the full design.
+See [`minni/skills/minni-propagation/SKILL.md`](minni/skills/minni-propagation/SKILL.md) and [`minni/docs/DESIGN-sovereign-delivery-layer.md`](minni/docs/DESIGN-sovereign-delivery-layer.md) for the full design.
 
 </details>
 
@@ -301,7 +301,7 @@ Then a temp-state live smoke: start `sovrd.py` on a temporary Unix socket, call 
 |---|---|
 | [`engine/`](engine/) | python daemon · retrieval · migrations · compile passes · eval harness |
 | [`plugins/minni/`](plugins/minni/) | agent-agnostic MCP plugin · 19 ts modules · 19 test files · console UI |
-| [`sovereign-memory/`](sovereign-memory/) | delivery layer · `sm-propagation` skill · workflows · design docs |
+| [`minni/`](minni/) | delivery layer · `sm-propagation` skill · workflows · design docs |
 | [`openclaw-extension/`](openclaw-extension/) | OpenClaw bridge and import tooling |
 | [`docs/contracts/`](docs/contracts/) | AGENT · CAPABILITIES · PAGE_TYPES · POLICY · THREAT_MODEL · VAULT · WORKFLOWS |
 | [`eval/`](eval/) | recall fixtures and generated evaluation reports |
