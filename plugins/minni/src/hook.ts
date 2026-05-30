@@ -254,21 +254,13 @@ async function handlePreCompact(payload: Record<string, unknown>): Promise<HookO
   const sessionId = asString(payload.session_id) || asString(payload.sessionId) || "session";
   const transcript = asString(payload.trigger) || asString(payload.summary);
 
-  const envelope = wrapEnvelope({
-    event: "PreCompact",
-    agent: CLAUDECODE_AGENT_ID,
-    body: {
-      identity: {
-        agent: CLAUDECODE_AGENT_ID,
-        workspace: CLAUDECODE_WORKSPACE_ID,
-        session_id: sessionId,
-      },
-      scar_tissue: scarTissue,
-      audit_tail: tail.entries.slice(-10).map((entry) => entry.split("\n")[0]),
-      compaction_trigger: transcript || "compaction in progress",
-    },
-  });
-
+  // NOTE: Claude Code's PreCompact hook does NOT support hookSpecificOutput /
+  // additionalContext injection (only SessionStart, UserPromptSubmit, PostToolUse,
+  // PostToolBatch do). Emitting that shape here fails schema validation with
+  // "(root): Invalid input". Continuity across compaction is instead carried by the
+  // post-compaction SessionStart hook, which rebuilds audit_tail + recall +
+  // pending_learnings from the vault. So PreCompact only records a durable audit
+  // marker (which SessionStart then reads back) and returns a bare continue.
   await recordAudit(CLAUDECODE_VAULT_PATH, {
     tool: "hook_pre_compact",
     summary: `pre-compact ${sessionId}`,
@@ -278,13 +270,7 @@ async function handlePreCompact(payload: Record<string, unknown>): Promise<HookO
     },
   });
 
-  return {
-    continue: true,
-    hookSpecificOutput: {
-      hookEventName: "PreCompact",
-      additionalContext: envelope,
-    },
-  };
+  return { continue: true };
 }
 
 async function handleStop(payload: Record<string, unknown>): Promise<HookOutput> {
