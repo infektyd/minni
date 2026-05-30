@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node ${GROK_PLUGIN_ROOT}/bin/grok-sovereign-hook.js SessionStart",
+            "command": "node ${GROK_PLUGIN_ROOT}/bin/grok-minni-hook.js SessionStart",
             "timeout": 8
           }
         ]
@@ -16,7 +16,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node ${GROK_PLUGIN_ROOT}/bin/grok-sovereign-hook.js UserPromptSubmit",
+            "command": "node ${GROK_PLUGIN_ROOT}/bin/grok-minni-hook.js UserPromptSubmit",
             "timeout": 8
           }
         ]
@@ -27,7 +27,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node ${GROK_PLUGIN_ROOT}/bin/grok-sovereign-hook.js PreCompact",
+            "command": "node ${GROK_PLUGIN_ROOT}/bin/grok-minni-hook.js PreCompact",
             "timeout": 8
           }
         ]
@@ -38,7 +38,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node ${GROK_PLUGIN_ROOT}/bin/grok-sovereign-hook.js Stop",
+            "command": "node ${GROK_PLUGIN_ROOT}/bin/grok-minni-hook.js Stop",
             "timeout": 8
           }
         ]

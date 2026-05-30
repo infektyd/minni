@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Grok Build custom minimal Sovereign Memory hook.
+ * Grok Build custom minimal Minni hook.
  * Own implementation — not copied from any other agent's *-hook.js.
  *
  * Provides lightweight SessionStart spine + scar tissue / decision drafting
@@ -21,7 +21,7 @@ const INBOX = path.join(VAULT, 'inbox');
 const LOGS = path.join(VAULT, 'logs');
 const AGENT = 'grok-build';
 
-// Sovereign Distill V1 (Grok-specific delivery only; real Layer 1 (identity:grok-build + layer1/) now installed via sm-propagation; this plugin provides Grok-specific V1 delivery/ritual on top).
+// Minni Distill V1 (Grok-specific delivery only; real Layer 1 (identity:grok-build + layer1/) now installed via sm-propagation; this plugin provides Grok-specific V1 delivery/ritual on top).
 // Toggle + gauges live in vault/distill/ per DESIGN. Light enhancement: keyword fallback + injection
 // of gauges/mode on SessionStart (now on top of real Layer 1) and UserPromptSubmit. Preserves 100% of flush/compact/dream paths.
 const DISTILL_DIR = path.join(VAULT, 'distill');
@@ -93,7 +93,7 @@ function readDistillMode() {
     }
   } catch (e) {
     // fail-open: treat as explicit so ritual available; errors logged only to stderr
-    console.error(`[grok-sovereign-hook] readDistillMode failed: ${e.message}`);
+    console.error(`[grok-minni-hook] readDistillMode failed: ${e.message}`);
   }
   return 'explicit';
 }
@@ -113,7 +113,7 @@ function readGaugesForInjection(maxLines = 18) {
     const more = full.split('\n').length > maxLines;
     return lines.join('\n') + (more ? '\n... (read full distill/gauges.md for complete live context meter + Decision Aids)' : '');
   } catch (e) {
-    console.error(`[grok-sovereign-hook] readGaugesForInjection failed: ${e.message}`);
+    console.error(`[grok-minni-hook] readGaugesForInjection failed: ${e.message}`);
     return '(gauges read error — fall back to direct vault file distill/gauges.md per SKILL)';
   }
 }
@@ -122,8 +122,8 @@ function buildStatusLine() {
   const pending = countInbox();
   const snippet = recentLogSnippet(5);
   return [
-    `Sovereign Memory (grok-build) active.`,
-    pending > 0 ? `${pending} pending item(s) in your inbox — review with sovereign_audit_tail or the console.` : 'Inbox clean.',
+    `Minni (grok-build) active.`,
+    pending > 0 ? `${pending} pending item(s) in your inbox — review with minni_audit_tail or the console.` : 'Inbox clean.',
     snippet ? `Recent log tail:\n${snippet}` : ''
   ].filter(Boolean).join('\n');
 }
@@ -141,7 +141,7 @@ function writeDraftToInbox(kind, content) {
       'privacy: local-only',
       `agent: ${AGENT}`,
       `created: ${new Date().toISOString()}`,
-      'sovereign_learning: true',
+      'minni_learning: true',
       '---',
       ''
     ].join('\n');
@@ -149,7 +149,7 @@ function writeDraftToInbox(kind, content) {
     return file;
   } catch (e) {
     // Fail-open for hook: log to stderr only, do not throw.
-    console.error(`[grok-sovereign-hook] writeDraftToInbox failed for ${kind}: ${e.message}`);
+    console.error(`[grok-minni-hook] writeDraftToInbox failed for ${kind}: ${e.message}`);
     return null;
   }
 }
@@ -164,22 +164,22 @@ try {
     ensureDir(VAULT);
     const status = buildStatusLine();
     let msg = [
-      '<sovereign:context agent="grok-build" event="SessionStart">',
+      '<minni:context agent="grok-build" event="SessionStart">',
       status,
-      'Before ambitious work (plan mode, refactors, subagents, production): call sovereign_prepare_task.',
-      'Before learning or /flush: call sovereign_prepare_outcome for dry-run candidates.',
-      '</sovereign:context>'
+      'Before ambitious work (plan mode, refactors, subagents, production): call minni_prepare_task.',
+      'Before learning or /flush: call minni_prepare_outcome for dry-run candidates.',
+      '</minni:context>'
     ].join('\n');
     const dmode = readDistillMode();
     if (dmode !== 'disabled') {
       const g = readGaugesForInjection(12);
-      msg += `\n<sovereign:distill-gauges mode="${dmode}" agent="grok-build">Sovereign Distill ritual active (real Layer 1 = identity:grok-build + layer1/ installed; this V1 injection on top). Read gauges first at wind-down. Gauges:\n${g}\nFollow SKILL "Sovereign Distill Ritual" (explicit yes/no or auto per mode file). Keyword fallback also supported on UserPromptSubmit.</sovereign:distill-gauges>`;
+      msg += `\n<minni:distill-gauges mode="${dmode}" agent="grok-build">Minni Distill ritual active (real Layer 1 = identity:grok-build + layer1/ installed; this V1 injection on top). Read gauges first at wind-down. Gauges:\n${g}\nFollow SKILL "Sovereign Distill Ritual" (explicit yes/no or auto per mode file). Keyword fallback also supported on UserPromptSubmit.</minni:distill-gauges>`;
     }
     output.systemMessage = msg;
   } else if (event === 'UserPromptSubmit') {
     // Automatic trigger for native /flush, /compact, and /dream (including when written as ". /compact" etc.).
     // Smallest addition per DESIGN: detect keywords in prompt, draft prepare_outcome-style candidate to inbox,
-    // inject contract context so model (with SKILL) does the sovereign reflex.
+    // inject contract context so model (with SKILL) does the minni reflex.
     const prompt = (payload.prompt || payload.userPrompt || payload.input || payload.text || '').toString();
     const match = prompt.match(/(?:^|[\s.])\/(flush|compact|dream)\b/i);
     if (match) {
@@ -193,7 +193,7 @@ try {
       // DoS guard: skip if inbox is already large (pre-existing PreCompact/Stop have similar surface).
       const current = countInbox();
       if (current > 300) {
-        output.systemMessage = `Sovereign Memory: inbox has ${current} items; skipping new ${matched} draft to avoid resource exhaustion.`;
+        output.systemMessage = `Minni: inbox has ${current} items; skipping new ${matched} draft to avoid resource exhaustion.`;
       } else {
         const summary = [
           `Event: ${event}`,
@@ -202,15 +202,15 @@ try {
           `Time: ${new Date().toISOString()}`,
           '',
           'Hook drafted prepare_outcome-style candidate to inbox (per stdlib hook pattern).',
-          'Per SKILL contract (grok-sovereign-memory): sovereign_prepare_outcome is the default durable reflex.',
-          'Review this + any model follow-up candidates via sovereign tools / Obsidian / console.',
+          'Per SKILL contract (grok-minni): minni_prepare_outcome is the default durable reflex.',
+          'Review this + any model follow-up candidates via minni tools / Obsidian / console.',
           'Native flush still runs (hybrid: operational + proposal-grade).'
         ].join('\n');
         const file = writeDraftToInbox(kind, summary);
         if (file) {
-          output.systemMessage = `Sovereign Memory: ${matched} keyword in prompt; drafted ${path.basename(file)} (inbox). Model: call sovereign_prepare_outcome now for high-signal candidates.`;
+          output.systemMessage = `Minni: ${matched} keyword in prompt; drafted ${path.basename(file)} (inbox). Model: call minni_prepare_outcome now for high-signal candidates.`;
         } else {
-          output.systemMessage = `Sovereign Memory: ${matched} detected but draft write failed (degraded; native flush unaffected).`;
+          output.systemMessage = `Minni: ${matched} detected but draft write failed (degraded; native flush unaffected).`;
         }
       }
     }
@@ -225,7 +225,7 @@ try {
         const dmode = readDistillMode();
         if (dmode !== 'disabled') {
           const g = readGaugesForInjection(10);
-          output.systemMessage = `Sovereign Memory: distill keyword detected ("${distillMatch[0]}"). Mode: ${dmode}. Gauges (read full distill/gauges.md first):\n${g}\n\nFollow the Sovereign Distill Ritual workflow in SKILL (explicit gate or auto per mode file).`;
+          output.systemMessage = `Minni: distill keyword detected ("${distillMatch[0]}"). Mode: ${dmode}. Gauges (read full distill/gauges.md first):\n${g}\n\nFollow the Sovereign Distill Ritual workflow in SKILL (explicit gate or auto per mode file).`;
         }
       }
     }
@@ -245,22 +245,22 @@ try {
       'Recent log tail (scar tissue / decisions to review):',
       recentLogSnippet(12) || '(no recent log entries captured)',
       '',
-      'Action for human: review this draft, promote strong items via sovereign_resolve_candidate or manual vault write, redact as needed.',
+      'Action for human: review this draft, promote strong items via minni_resolve_candidate or manual vault write, redact as needed.',
       'See DESIGN-flush-integration.md: this participates in /flush+compaction flow.'
     ].join('\n');
 
     const file = writeDraftToInbox(kind, summary);
     if (file) {
-      output.systemMessage = `Sovereign Memory: drafted ${kind} to ${path.basename(file)} (inbox). Review before end of session.`;
+      output.systemMessage = `Minni: drafted ${kind} to ${path.basename(file)} (inbox). Review before end of session.`;
     } else {
-      output.systemMessage = `Sovereign Memory: failed to draft ${kind} to inbox (write error logged to stderr). Review the native session transcript instead.`;
+      output.systemMessage = `Minni: failed to draft ${kind} to inbox (write error logged to stderr). Review the native session transcript instead.`;
     }
   }
 } catch (e) {
   // Top-level fail-open guarantee for all new + existing paths (bug fix for write robustness).
   // Hooks must always emit valid JSON + continue:true per 10-hooks.md and DESIGN.
-  console.error(`[grok-sovereign-hook] uncaught error in ${event}: ${e.message}`);
-  output = { continue: true, systemMessage: `Sovereign Memory degraded (hook error on ${event}; native /flush unaffected).` };
+  console.error(`[grok-minni-hook] uncaught error in ${event}: ${e.message}`);
+  output = { continue: true, systemMessage: `Minni degraded (hook error on ${event}; native /flush unaffected).` };
 }
 
 console.log(JSON.stringify(output));
