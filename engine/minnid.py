@@ -288,6 +288,11 @@ def _default_agent_vault(agent_id: str) -> Path:
         "codex": "codex",
         "hermes": "hermes",
         "openclaw": "openclaw",
+        # Preserve hyphenated canonical slugs (the strip fallback would map
+        # grok-build -> grokbuild-vault, which the Grok overlay never polls).
+        "grok-build": "grok-build",
+        "grok-beta": "grok-beta",
+        "grok": "grok",
     }
     slug = aliases.get(agent_id, re.sub(r"[^a-z0-9]+", "", agent_id.lower()) or "agent")
     return Path(CANONICAL_SOVEREIGN_HOME) / f"{slug}-vault"

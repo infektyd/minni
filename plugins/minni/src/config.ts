@@ -6,14 +6,27 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 export const PLUGIN_ROOT = path.resolve(__dirname, "..");
 
-export const DEFAULT_VAULT_PATH =
-  process.env.MINNI_VAULT_PATH ??
-  process.env.MINNI_CODEX_VAULT_PATH ??
-  path.join(os.homedir(), ".minni", "codex-vault");
+/**
+ * Expand a leading `~` to the home dir. Plugin manifests pass env values like
+ * `~/.minni/run/minnid.sock` literally; Node does NOT expand `~`, so an
+ * unexpanded value reaches net.createConnection()/existsSync() and the daemon
+ * socket + vault lookups fail. Expand centrally so every consumer gets an
+ * absolute path.
+ */
+function expandTilde(p: string): string {
+  return p.replace(/^~(?=$|\/)/, os.homedir());
+}
 
-export const SOCKET_PATH =
+export const DEFAULT_VAULT_PATH = expandTilde(
+  process.env.MINNI_VAULT_PATH ??
+    process.env.MINNI_CODEX_VAULT_PATH ??
+    path.join(os.homedir(), ".minni", "codex-vault"),
+);
+
+export const SOCKET_PATH = expandTilde(
   process.env.MINNI_SOCKET_PATH ??
-  path.join(os.homedir(), ".minni", "run", "minnid.sock");
+    path.join(os.homedir(), ".minni", "run", "minnid.sock"),
+);
 
 export const AFM_HEALTH_URL =
   process.env.MINNI_AFM_HEALTH_URL ?? "http://127.0.0.1:11437/health";
@@ -66,9 +79,10 @@ export const CLAUDECODE_WORKSPACE_ID =
   process.env.MINNI_CLAUDECODE_WORKSPACE_ID ??
   `workspace-${path.basename(process.cwd())}`;
 
-export const CLAUDECODE_VAULT_PATH =
+export const CLAUDECODE_VAULT_PATH = expandTilde(
   process.env.MINNI_CLAUDECODE_VAULT_PATH ??
-  path.join(os.homedir(), ".minni", "claudecode-vault");
+    path.join(os.homedir(), ".minni", "claudecode-vault"),
+);
 
 export const CLAUDECODE_HOOKS_ENABLED =
   (process.env.MINNI_CLAUDECODE_HOOKS ?? "on").toLowerCase() !== "off";
@@ -87,9 +101,10 @@ export const KILOCODE_WORKSPACE_ID =
   process.env.MINNI_KILOCODE_WORKSPACE_ID ??
   `workspace-${path.basename(process.cwd())}`;
 
-export const KILOCODE_VAULT_PATH =
+export const KILOCODE_VAULT_PATH = expandTilde(
   process.env.MINNI_KILOCODE_VAULT_PATH ??
-  path.join(os.homedir(), ".minni", "kilocode-vault");
+    path.join(os.homedir(), ".minni", "kilocode-vault"),
+);
 
 export const KILOCODE_HOOKS_ENABLED =
   (process.env.MINNI_KILOCODE_HOOKS ?? "on").toLowerCase() !== "off";

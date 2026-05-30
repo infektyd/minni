@@ -48,7 +48,7 @@ system/developer instructions, safety policy, and active user request.
    - Prefer Minni MCP tools.
    - If MCP transport is stale or fails on a non-canonical socket, use the
      installed plugin CLI with the canonical socket:
-     `SOVEREIGN_SOCKET_PATH=~/.minni/run/sovrd.sock node ~/.codex/plugins/cache/minni/minni/0.1.0/dist/cli.js status`
+     `MINNI_SOCKET_PATH=~/.minni/run/minnid.sock node ~/.codex/plugins/cache/minni/minni/0.1.0/dist/cli.js status`
    - Verify the daemon sees the active Minni DB before changing
      paths. A healthy baseline typically shows several hundred documents, hundreds
      of chunks, and over a thousand learnings with FAISS healthy.
@@ -74,11 +74,11 @@ system/developer instructions, safety policy, and active user request.
    - Assume any agent, regardless of model quality or sophistication, may copy
      another agent's vault when under-specified. Always stamp
      `SOVEREIGN_AGENT_ID`, `SOVEREIGN_VAULT_PATH`, and
-     `SOVEREIGN_SOCKET_PATH` explicitly for that platform.
+     `MINNI_SOCKET_PATH` explicitly for that platform.
    - Resolve symlinks before deciding what is canonical; symlinked vault roots
      are configuration drift unless the user explicitly approves them.
-   - Confirm daemon socket: `~/.minni/run/sovrd.sock`.
-   - Confirm the active DB: `~/.minni/sovereign_memory.db`.
+   - Confirm daemon socket: `~/.minni/run/minnid.sock`.
+   - Confirm the active DB: `~/.minni/minni.db`.
      The source repo must not be treated as the vault or database root.
    - Do not assume large external directories (e.g. `~/.openclaw`) are available locally. Some users keep them in off-machine or cryo storage.
 
@@ -124,7 +124,7 @@ functionality and configuration:
 3. Stamp the platform MCP config with explicit env:
    - `SOVEREIGN_AGENT_ID`
    - `SOVEREIGN_VAULT_PATH`
-   - `SOVEREIGN_SOCKET_PATH=~/.minni/run/sovrd.sock`
+   - `MINNI_SOCKET_PATH=~/.minni/run/minnid.sock`
    - `SOVEREIGN_WORKSPACE_ID=~/Projects/minni` (example)
 4. Bootstrap only an empty actual vault tree for that agent if missing.
 5. Never copy `wiki/`, `logs/`, `inbox/`, `index.md`, or `log.md` from another
@@ -174,7 +174,7 @@ Use this order:
 | Symptom | Repair |
 | --- | --- |
 | MCP tool says `Transport closed` | Use installed plugin CLI or direct MCP subprocess; restart plugin/session later |
-| MCP tool says socket `ENOENT` | Tool is on a stale socket; set or patch `SOVEREIGN_SOCKET_PATH=~/.minni/run/sovrd.sock` |
+| MCP tool says socket `ENOENT` | Tool is on a stale socket; set or patch `MINNI_SOCKET_PATH=~/.minni/run/minnid.sock` |
 | Parse error `Expected HTTP/` over socket | Stale plugin cache is speaking HTTP to JSON-RPC daemon; rebuild/resync cache and restart plugin server |
 | Vault appears empty | Resolve `~/.minni/<agent>-vault` symlink and compare repo-local vault |
 | Agent is using Codex's vault | Repoint to `~/.minni/<agent-id>-vault`; do not copy Codex's logs/wiki/inbox |

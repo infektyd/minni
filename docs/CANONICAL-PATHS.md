@@ -5,7 +5,7 @@ This folder is the canonical home for Minni on this machine:
 `<repo-root>`
 
 It is also the canonical Git working tree for
-`https://github.com/infektyd/sovereign-memory`. The live layout is intentional:
+`https://github.com/infektyd/minni`. The live layout is intentional:
 runtime integrations use `engine/`, `openclaw-extension/`, and
 `plugins/minni/` directly.
 
@@ -24,12 +24,12 @@ names. Treat those as legacy references, not active roots.
 
 ## Active Runtime
 
-- `~/.sovereign-memory/sovereign_memory.db` - active Minni database.
-- `~/.sovereign-memory/faiss/` - active FAISS cache.
-- `~/.sovereign-memory/run/sovrd.sock` - active daemon socket.
-- `~/.sovereign-memory/codex-vault` - Codex-owned Obsidian vault.
-- `~/.sovereign-memory/claudecode-vault` - Claude Code-owned Obsidian vault.
-- `~/.sovereign-memory/kilocode-vault` - KiloCode-owned Obsidian vault.
+- `~/.minni/minni.db` - active Minni database.
+- `~/.minni/faiss/` - active FAISS cache.
+- `~/.minni/run/minnid.sock` - active daemon socket.
+- `~/.minni/codex-vault` - Codex-owned Obsidian vault.
+- `~/.minni/claudecode-vault` - Claude Code-owned Obsidian vault.
+- `~/.minni/kilocode-vault` - KiloCode-owned Obsidian vault.
 
 Agent vault roots must be actual directories. Do not point a new agent at
 Codex's vault and do not bootstrap a new agent by copying another agent's

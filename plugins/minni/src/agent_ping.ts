@@ -102,6 +102,11 @@ function defaultAgentVault(agentId: string): string {
     hermes: "hermes",
     openclaw: "openclaw",
     kilocode: "kilocode",
+    // Preserve hyphenated canonical slugs (the strip-punctuation fallback would
+    // write grok-build -> grokbuild-vault, which the Grok overlay never polls).
+    "grok-build": "grok-build",
+    "grok-beta": "grok-beta",
+    grok: "grok",
   };
   const slug = aliases[agentId] ?? (agentId.toLowerCase().replace(/[^a-z0-9]+/g, "") || "agent");
   return path.join(os.homedir(), ".minni", `${slug}-vault`);

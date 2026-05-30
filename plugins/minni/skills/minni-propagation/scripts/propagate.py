@@ -21,7 +21,7 @@ import time
 from pathlib import Path
 
 
-DEFAULT_DB = Path("~/.minni/sovereign_memory.db").expanduser()
+DEFAULT_DB = Path("~/.minni/minni.db").expanduser()
 DEFAULT_SOCKET = Path("~/.minni/run/minnid.sock").expanduser()
 DEFAULT_PLUGIN_CLI = Path(
     "~/.codex/plugins/cache/minni/minni/0.1.0/dist/cli.js"
