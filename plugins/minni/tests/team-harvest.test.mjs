@@ -92,7 +92,7 @@ test("harvestEvidence writes one inbox entry per AFM LEARNING, skips SKIP, swall
   assert.equal(inboxCalls[0].payload.source, "afm");
 
   assert.equal(audits.length, 1);
-  assert.equal(audits[0].entry.tool, "sovereign_team_harvest");
+  assert.equal(audits[0].entry.tool, "minni_team_harvest");
   assert.equal(audits[0].entry.details.runtimeId, "team-abc");
   assert.equal(audits[0].entry.details.totalReports, 3);
   assert.equal(audits[0].entry.details.written, 1);
@@ -233,7 +233,7 @@ test("harvestEvidence reports audit failures to stderr without dropping the resu
     );
     assert.equal(result.length, 1);
     assert.equal(result[0].source, "afm");
-    const matched = captured.find((line) => line.includes("sovereign_team_harvest") && line.includes("audit-disk-full"));
+    const matched = captured.find((line) => line.includes("minni_team_harvest") && line.includes("audit-disk-full"));
     assert.ok(matched, "expected stderr line referencing failed audit, got: " + JSON.stringify(captured));
   } finally {
     process.stderr.write = originalWrite;
