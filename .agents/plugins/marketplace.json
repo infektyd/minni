@@ -1,11 +1,11 @@
 {
-  "name": "sovereign-memory",
+  "name": "minni",
   "interface": {
     "displayName": "Minni"
   },
   "plugins": [
     {
-      "name": "sovereign-memory",
+      "name": "minni",
       "source": {
         "source": "local",
         "path": "./plugins/minni"

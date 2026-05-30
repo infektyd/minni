@@ -1,8 +1,8 @@
 ---
-description: Show recent Sovereign Memory tool activity from the Claude Code vault audit log.
+description: Show recent Minni tool activity from the Claude Code vault audit log.
 ---
 
-Call `sovereign_audit_tail` with `limit: 20` (or the number in `$ARGUMENTS` if numeric). Then call `sovereign_audit_report` for a tool-call histogram.
+Call `minni_audit_tail` with `limit: 20` (or the number in `$ARGUMENTS` if numeric). Then call `minni_audit_report` for a tool-call histogram.
 
 Present:
 - The histogram (which tools fired, how often).

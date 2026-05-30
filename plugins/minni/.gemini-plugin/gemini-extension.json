@@ -1,8 +1,8 @@
 {
-  "name": "sovereign-memory",
+  "name": "minni",
   "version": "0.1.0",
   "mcpServers": {
-    "sovereign-memory": {
+    "minni": {
       "command": "node",
       "args": [
         "${extensionPath}${/}..${/}dist${/}server.js"

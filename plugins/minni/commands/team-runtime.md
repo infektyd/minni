@@ -2,7 +2,7 @@
 description: Build a temporary Sovereign Team Runtime packet with profiles, task ledger, and hydration packets.
 ---
 
-Call `sovereign_team_runtime` with:
+Call `minni_team_runtime` with:
 - `task`: $ARGUMENTS
 - `coordinatorAgentId`: `claude-code`
 - `profile`: `standard`

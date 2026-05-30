@@ -1,13 +1,13 @@
 ---
-description: Run a non-trivial task through Sovereign Team Mode with temporary agents and evidence gates.
+description: Run a non-trivial task through Minni Team Mode with temporary agents and evidence gates.
 ---
 
-Use Sovereign Team Mode for: $ARGUMENTS
+Use Minni Team Mode for: $ARGUMENTS
 
 Protocol:
-1. Call `sovereign_status`.
+1. Call `minni_status`.
 2. Recall narrow Layer 1 and Layer 2 context for the task.
-3. Call `sovereign_team_runtime` with:
+3. Call `minni_team_runtime` with:
    - `task`: $ARGUMENTS
    - `coordinatorAgentId`: the current host agent id
    - `profile`: `standard` unless the task is architecture-heavy, then `deep`
@@ -15,9 +15,9 @@ Protocol:
    - `agents`: 3-5 temporary lanes only when the work can be split safely
 4. Delegate through the current host adapter. For Codex, map each `temporaryProfile` and `hydrationPacket` onto a Codex subagent.
 5. Require each temporary agent to return evidence: inspected files/APIs/docs, changed files or findings, verification, and blockers.
-6. Call `sovereign_team_evidence` before claiming completion.
+6. Call `minni_team_evidence` before claiming completion.
 7. Integrate, run final verification, and report the result.
-8. Let temporary agents expire. Call `sovereign_team_promotion` only if the user explicitly approves reviewing a reusable permanent agent profile.
+8. Let temporary agents expire. Call `minni_team_promotion` only if the user explicitly approves reviewing a reusable permanent agent profile.
 
 Hard rules:
 - Temporary agents may recall and report; they do not learn, write vault notes, persist identity, or promote themselves.

@@ -1,8 +1,8 @@
 ---
-description: Report Sovereign Memory health for Claude Code — daemon socket, AFM bridge, vault, audit tail.
+description: Report Minni health for Claude Code — daemon socket, AFM bridge, vault, audit tail.
 ---
 
-Call the `sovereign_status` MCP tool. If the user supplied an alternate vault path in `$ARGUMENTS`, pass it as `vaultPath`; otherwise let it default to the Claude Code vault.
+Call the `minni_status` MCP tool. If the user supplied an alternate vault path in `$ARGUMENTS`, pass it as `vaultPath`; otherwise let it default to the Claude Code vault.
 
 Summarize for the user in one paragraph:
 - Daemon socket health (ok/error + reason).

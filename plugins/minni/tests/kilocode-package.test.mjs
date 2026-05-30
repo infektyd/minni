@@ -17,7 +17,7 @@ test("KiloCode package points at shared parent dist build", async () => {
   const mcp = await readJson(".mcp.json");
 
   for (const manifest of [plugin, mcp]) {
-    const server = manifest.mcpServers["sovereign-memory"];
+    const server = manifest.mcpServers["minni"];
     assert.deepEqual(server.args, ["${KILO_PLUGIN_ROOT}/../dist/server.js"]);
     assert.equal(server.cwd, "${KILO_PLUGIN_ROOT}/..");
   }

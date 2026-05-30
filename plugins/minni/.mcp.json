@@ -1,6 +1,6 @@
 {
   "mcpServers": {
-    "sovereign-memory": {
+    "minni": {
       "command": "node",
       "args": ["./dist/server.js"],
       "cwd": "."

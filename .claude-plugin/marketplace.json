@@ -1,13 +1,13 @@
 {
   "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
-  "name": "sovereign-memory",
+  "name": "minni",
   "description": "Local Minni agent plugins",
   "owner": {
     "name": "Minni"
   },
   "plugins": [
     {
-      "name": "sovereign-memory",
+      "name": "minni",
       "description": "Local-first Minni spine for Claude Code with per-agent vaults, review-first learning, and native AFM provider support.",
       "version": "0.1.0",
       "source": "./plugins/minni",

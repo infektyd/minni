@@ -1,8 +1,8 @@
 ---
-description: Recall Sovereign Memory for the given query. Searches the Claude Code vault and the shared daemon, returns ranked context with provenance.
+description: Recall Minni for the given query. Searches the Claude Code vault and the shared daemon, returns ranked context with provenance.
 ---
 
-Use the `sovereign_recall` MCP tool to recall memory for: $ARGUMENTS
+Use the `minni_recall` MCP tool to recall memory for: $ARGUMENTS
 
 Pass these arguments:
 - `query`: $ARGUMENTS

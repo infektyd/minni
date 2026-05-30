@@ -1,5 +1,5 @@
 {
-  "name": "sovereign-memory",
+  "name": "minni",
   "version": "0.1.0",
   "description": "Local-first Minni bridge for Codex with Obsidian vault transparency.",
   "author": {
@@ -11,7 +11,7 @@
   "repository": "https://github.com/infektyd/minni",
   "license": "MIT",
   "keywords": [
-    "sovereign-memory",
+    "minni",
     "obsidian",
     "llm-wiki",
     "local-first",

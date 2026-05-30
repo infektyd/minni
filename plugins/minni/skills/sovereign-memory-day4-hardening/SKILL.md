@@ -234,7 +234,7 @@ Two prerequisites in the plugin directory:
 **1. `openclaw.plugin.json`** (manifest, read before plugin code loads):
 ```json
 {
-  "id": "sovereign-memory",
+  "id": "minni",
   "name": "Sovereign Memory",
   "description": "Local-first vector + FTS5 memory for OpenClaw agents",
   "configSchema": {

@@ -1,5 +1,5 @@
 {
-  "name": "sovereign-memory",
+  "name": "minni",
   "version": "0.1.0",
   "description": "Local-first Minni spine for KiloCode: automatic recall, vault-first learning, agent-to-agent handoff, and continuity across sessions.",
   "author": {
@@ -11,7 +11,7 @@
   "repository": "https://github.com/infektyd/minni",
   "license": "MIT",
   "keywords": [
-    "sovereign-memory",
+    "minni",
     "obsidian",
     "llm-wiki",
     "local-first",
@@ -19,7 +19,7 @@
     "spine"
   ],
   "mcpServers": {
-    "sovereign-memory": {
+    "minni": {
       "command": "node",
       "args": ["${KILO_PLUGIN_ROOT}/../dist/server.js"],
       "cwd": "${KILO_PLUGIN_ROOT}/.."
