@@ -26,21 +26,18 @@ The earlier "identity-only" decision left the friction fully in place (every run
 
 ## 3. Target Vocabulary (canonical scheme)
 
-| Layer | Now | Target | Typed by user? |
-|---|---|---|---|
-| Brand | Sovereign Memory | **Minni** | — |
-| Plugin folder | `plugins/sovereign-memory/` | `plugins/minni/` | rarely |
-| Installed plugin | `sovereign-memory@sovereign-memory` | `minni@minni` | rarely |
-| MCP namespace | `mcp__sovereign-memory__` | `mcp__minni__` | yes |
-| Tool verbs | `sovereign_recall`, `sovereign_learn`, … | `minni_recall`, `minni_learn`, … (drops redundant double-`sovereign`) | yes |
-| Skill IDs | `sovereign-memory:recall` | `minni:recall` | yes |
-| Vault dir | `~/.sovereign-memory/` | `~/.minni/` | yes (cd into it) |
-| Daemon binary | `sovrd` | `minnid` | no |
-| DB file | `sovereign_memory.db` | `minni.db` | no |
-| Env vars | `SOVEREIGN_*` | `MINNI_*` | sometimes |
-| Internal tags / frontmatter | `agent_origin`, `sovereign_learning:` | `minni_*` equivalents | no |
+Everywhere `sovereign` / `sovereign-memory` appears, the target is `minni`. The full rule is "`sovereign-memory` → `minni`, `sovereign_` → `minni_`". Key cases:
 
-**Priority principle:** rename the *typed/ergonomic* surface aggressively and early (skill IDs, tool verbs, namespace, vault path). Rename deep internals (DB filename, daemon binary, wire-protocol strings) **last**, behind the compat shim, because they cause no friction and carry the most migration risk.
+| Now | Target |
+|---|---|
+| `mcp__sovereign-memory__sovereign_recall` | `mcp__minni__minni_recall` (also drop the redundant prefix → `mcp__minni__recall` where clean) |
+| `sovereign-memory:recall` (skill ID) | `minni:recall` |
+| `~/.sovereign-memory/` (vault) | `~/.minni/` |
+| `plugins/sovereign-memory/`, `sovereign-memory@sovereign-memory` | `plugins/minni/`, `minni@minni` |
+| `SOVEREIGN_*` env, `sovrd`, `sovereign_memory.db` | `MINNI_*`, `minnid`, `minni.db` |
+| `sovereign_learning:` / tag fields | `minni_*` |
+
+**Order of attack:** rename the *typed* surface first (skill IDs, tool verbs, namespace, vault path) — that's the whole ergonomic point. Rename deep internals (DB filename, daemon binary, wire strings) **last**, behind the compat shim — zero friction, highest risk.
 
 ## 4. Compatibility Layer (zero-downtime guarantee)
 
@@ -54,27 +51,12 @@ Nothing breaks mid-migration because `sovereign` keeps resolving until explicitl
 
 ## 5. Phases (each ≈ one PR, ordered by ascending risk)
 
-### P1 — Repo-internal rename (in-git only, daemon untouched)
-Rename plugin folder, in-repo code identifiers, skill IDs, docs, README/AGENTS/DESIGN brand strings. No live-system change. Fully reversible via git. Add `sovereign-memory:*` skill shims.
-
-### P2 — Daemon dual-naming
-Daemon exposes `minni_*` tools as aliases of `sovereign_*`; registers `minni` MCP server alongside `sovereign-memory`; accepts `MINNI_*` env alongside `SOVEREIGN_*`. No data moves yet. Verify both namespaces answer identically.
-
-### P3 — Vault migration
-Backup → copy `~/.sovereign-memory` → `~/.minni` → checksum-verify every vault/DB → repoint daemon to `~/.minni` → swap `~/.sovereign-memory` to a symlink. DB file renamed `sovereign_memory.db` → `minni.db` here (daemon-aware), or deferred to P6 if risk is high.
-
-### P4 — Per-platform reconfig + repair (one platform at a time)
-- The **canonical target config is defined by this spec** (Section 3), not by copying any platform.
-- **Gemini/Antigravity FIRST** — best starting point (good, not gold); verify it against the spec, fix any drift, then use the *verified* result as a sanity cross-check for the others.
-- Then audit + repair the four more-suspect platforms against the spec: **Claude Code, Codex, Kilocode, Grok-build**. Each gets independently verified — no platform is trusted by fiat.
-- **Grok-build** additionally: fix stale `~/Projects/sovereignMemory` → canonical path in `plugins/grok-sovereign-memory/.mcp.json` and the grok-build identity envelope.
-- Each platform: switch to `mcp__minni__` + `minni:*`, verify recall/learn round-trips, then move to the next. Sovereign aliases remain as the safety net throughout.
-
-### P5 — Skills consolidation audit
-Resolve the open question (2026-05-29): of the 10 plugin skills (`sovereign-memory` rich delivery, `-auto-indexing`, `-consolidation`, `-day4-hardening`, `-engine`, `-health-check`, `-hydration`, `-packaging`, `-wiki-ingestion`, `sovereign-openclaw-phase2-bridge`) + standalone `sm-propagation`, classify each **keep / merge / retire** against what the plugin's MCP tools + commands already surface. Propose, do not auto-act. Note: consolidation-skill scripts still depend on `~/.hermes` runtime paths + Mac-only MLX servers — flagged, not fixed here (deferred PRIVATE pluggable-backend tree).
-
-### P6 — Deprecation (decision deferred to this point)
-Once all 5 platforms are verified on `minni`: decide whether to delete the `sovereign` aliases/shims for a clean minni-only end state, or keep them as a permanent safety net. **Operator chose to decide at P6, not now.**
+- **P1 — Repo-internal rename** (in-git only, daemon untouched): plugin folder, in-repo code identifiers, skill IDs, docs, brand strings. Add `sovereign-memory:*` skill shims. Fully reversible via git.
+- **P2 — Daemon dual-naming**: daemon serves `minni_*` as aliases of `sovereign_*`, registers the `minni` MCP server alongside `sovereign-memory`, reads `MINNI_*` then `SOVEREIGN_*`. No data moves. Verify both namespaces answer identically.
+- **P3 — Vault migration**: backup → copy `~/.sovereign-memory` → `~/.minni` → checksum-verify → repoint daemon → swap old path to a symlink. DB file rename deferred to P6 if risky.
+- **P4 — Per-platform reconfig + repair** (one at a time, spec is the source of truth — not any platform's config): Gemini/Antigravity first (verify, good-not-gold), then audit+repair Claude Code, Codex, Kilocode, Grok-build. Grok-build also gets its stale `~/Projects/sovereignMemory` pointers fixed. Each independently verified via a recall/learn round-trip; aliases stay live as the net.
+- **P5 — Skills audit**: classify each of the 10 plugin skills + `sm-propagation` as **keep / merge / retire** vs. what the plugin's MCP tools + commands already surface. Propose, don't auto-act. (Flag only: consolidation scripts still assume `~/.hermes` + Mac MLX — deferred backend work.)
+- **P6 — Deprecation** (decided here, not now): delete the `sovereign` aliases for a clean minni-only state, or keep them as a permanent net.
 
 ## 6. Deliverable: Agent Playbook
 
