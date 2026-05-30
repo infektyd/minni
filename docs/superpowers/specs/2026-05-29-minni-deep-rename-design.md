@@ -53,7 +53,15 @@ Operator directive (2026-05-29): kill the path/reference sprawl. Every link, wor
 
 **Rule for every platform config (`SOVEREIGN_WORKSPACE_ID`/`MINNI_WORKSPACE_ID`, `.mcp.json`, identity envelopes):** workspace = the root project dir anchor; plugin invocation = the `~/.agents` plugin anchor. The vault path (`~/.minni/`) is derived/owned by the daemon, not hand-referenced per platform. This is the single rule P4 enforces across all 5 platforms, and it's what permanently fixes grok's stale pointers.
 
-## 4. Compatibility Layer (zero-downtime guarantee)
+## 3c. STRATEGY UPDATE (2026-05-30) — clean direct rename, daemon down throughout
+
+Operator decisions on 2026-05-30 supersede the compat-shim design below:
+- **Daemon DOWN for the entire migration** (not just P3). No live clients during the work → no zero-downtime constraint.
+- **Clean direct rename, NO aliases.** `sovereign_* → minni_*`, `mcp__sovereign-memory__ → mcp__minni__`, `~/.sovereign-memory/ → ~/.minni/`, `SOVEREIGN_* → MINNI_*` are renamed outright. Every platform is reconfigured during the migration, so nothing un-migrated remains at bring-up.
+
+**Consequences:** §4 (Compatibility Layer) and the alias/dual-naming machinery are **NO LONGER USED**. **P6 (deprecation/dealias) is removed** — there are no aliases to remove. The sequence becomes: P1 repo rename (done) → P2 MCP-identifier rename → P3 vault dir + daemon plist + `SOVEREIGN_*`/DB rename → P4 platform manifests → P5 skills audit → **bring-up** (restart daemon as `minnid` on `~/.minni`, verify all platforms). A full grep audit before bring-up is the safety net in place of aliases.
+
+## 4. Compatibility Layer — SUPERSEDED by §3c (kept for history; not executed)
 
 Nothing breaks mid-migration because `sovereign` keeps resolving until explicitly retired:
 
