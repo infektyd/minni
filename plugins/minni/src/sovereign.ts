@@ -461,7 +461,7 @@ export async function buildStatusReport(input?: {
 export async function statusAndAudit(vaultPath = DEFAULT_VAULT_PATH): Promise<StatusReport> {
   const report = await buildStatusReport({ vaultPath });
   await recordAudit(vaultPath, {
-    tool: "sovereign_status",
+    tool: "minni_status",
     summary: `socket=${report.socket.ok ? "ok" : "error"} afm=${report.afm.ok ? "ok" : "error"}`,
     details: report as unknown as Record<string, unknown>,
   });
