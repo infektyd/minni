@@ -21,7 +21,7 @@ def test_afm_url_binding_placeholder_and_requirements():
     G13 guarantees:
     - Model can no longer pass afmPrepareUrl in sovereign_prepare_task / sovereign_prepare_outcome (schemas stripped).
     - Default target (AFM_PREPARE_TASK_URL) is loopback.
-    - Non-loopback requires SOVEREIGN_AFM_ALLOWED_TARGETS and is denied otherwise with structured error
+    - Non-loopback requires MINNI_AFM_ALLOWED_TARGETS and is denied otherwise with structured error
       that does not contain the attacker URL.
     - callAfmJson (bridge) performs the check before any outbound request.
     """

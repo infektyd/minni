@@ -662,7 +662,7 @@ export async function prepareTask(input: PrepareTaskInput, deps: PrepareTaskDeps
   const afmProvider = afmRequested
     ? resolveAfmProvider(afmProviderMode, {
         health: afmHealthResult,
-        nativeHelperPath: process.env.SOVEREIGN_AFM_NATIVE_HELPER,
+        nativeHelperPath: process.env.MINNI_AFM_NATIVE_HELPER,
       })
     : resolveAfmProvider("off");
 
@@ -865,7 +865,7 @@ export async function prepareOutcome(
   const afmProvider = afmRequested
     ? resolveAfmProvider(afmProviderMode, {
         health: afmHealthResult,
-        nativeHelperPath: process.env.SOVEREIGN_AFM_NATIVE_HELPER,
+        nativeHelperPath: process.env.MINNI_AFM_NATIVE_HELPER,
       })
     : resolveAfmProvider("off");
   let packet: PreparedOutcomePacket = {

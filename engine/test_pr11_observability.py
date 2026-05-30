@@ -179,7 +179,7 @@ def test_status_includes_latency_histograms(monkeypatch):
 def test_status_reports_afm_provider_mode(monkeypatch):
     import sovrd
 
-    monkeypatch.setenv("SOVEREIGN_AFM_MODE", "off")
+    monkeypatch.setenv("MINNI_AFM_MODE", "off")
 
     result = sovrd._handle_status({}, 1)["result"]
 
@@ -234,7 +234,7 @@ def test_status_accepts_persisted_faiss_npz_cache(tmp_path, monkeypatch):
     import sovrd
     from config import SovereignConfig
 
-    db_path = tmp_path / "sovereign_memory.db"
+    db_path = tmp_path / "minni.db"
     faiss_dir = tmp_path / "faiss"
     faiss_dir.mkdir()
     (faiss_dir / "index.manifest.json").write_text(

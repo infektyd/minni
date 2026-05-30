@@ -2,13 +2,13 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 const CONFIG_ENV_KEYS = [
-  "SOVEREIGN_VAULT_PATH",
-  "SOVEREIGN_CODEX_VAULT_PATH",
-  "SOVEREIGN_SOCKET_PATH",
-  "SOVEREIGN_AGENT_ID",
-  "SOVEREIGN_CODEX_AGENT_ID",
-  "SOVEREIGN_WORKSPACE_ID",
-  "SOVEREIGN_CODEX_WORKSPACE_ID",
+  "MINNI_VAULT_PATH",
+  "MINNI_CODEX_VAULT_PATH",
+  "MINNI_SOCKET_PATH",
+  "MINNI_AGENT_ID",
+  "MINNI_CODEX_AGENT_ID",
+  "MINNI_WORKSPACE_ID",
+  "MINNI_CODEX_WORKSPACE_ID",
 ];
 
 async function withConfigEnv(env, fn) {
@@ -29,16 +29,16 @@ async function withConfigEnv(env, fn) {
   }
 }
 
-test("generic SOVEREIGN env overrides Codex-specific defaults for Hermes", async () => {
+test("generic MINNI env overrides Codex-specific defaults for Hermes", async () => {
   await withConfigEnv(
     {
-      SOVEREIGN_VAULT_PATH: "/tmp/hermes-vault",
-      SOVEREIGN_CODEX_VAULT_PATH: "/tmp/codex-vault",
-      SOVEREIGN_SOCKET_PATH: "/tmp/hermes-sovereign.sock",
-      SOVEREIGN_AGENT_ID: "hermes",
-      SOVEREIGN_CODEX_AGENT_ID: "codex",
-      SOVEREIGN_WORKSPACE_ID: "/tmp/hermes-workspace",
-      SOVEREIGN_CODEX_WORKSPACE_ID: "/tmp/codex-workspace",
+      MINNI_VAULT_PATH: "/tmp/hermes-vault",
+      MINNI_CODEX_VAULT_PATH: "/tmp/codex-vault",
+      MINNI_SOCKET_PATH: "/tmp/hermes-sovereign.sock",
+      MINNI_AGENT_ID: "hermes",
+      MINNI_CODEX_AGENT_ID: "codex",
+      MINNI_WORKSPACE_ID: "/tmp/hermes-workspace",
+      MINNI_CODEX_WORKSPACE_ID: "/tmp/codex-workspace",
     },
     (config) => {
       assert.equal(config.DEFAULT_VAULT_PATH, "/tmp/hermes-vault");
@@ -52,9 +52,9 @@ test("generic SOVEREIGN env overrides Codex-specific defaults for Hermes", async
 test("Codex-specific env remains a compatibility fallback", async () => {
   await withConfigEnv(
     {
-      SOVEREIGN_CODEX_VAULT_PATH: "/tmp/codex-vault",
-      SOVEREIGN_CODEX_AGENT_ID: "codex-agent",
-      SOVEREIGN_CODEX_WORKSPACE_ID: "/tmp/codex-workspace",
+      MINNI_CODEX_VAULT_PATH: "/tmp/codex-vault",
+      MINNI_CODEX_AGENT_ID: "codex-agent",
+      MINNI_CODEX_WORKSPACE_ID: "/tmp/codex-workspace",
     },
     (config) => {
       assert.equal(config.DEFAULT_VAULT_PATH, "/tmp/codex-vault");

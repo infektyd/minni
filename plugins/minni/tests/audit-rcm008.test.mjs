@@ -11,12 +11,12 @@ test("RCM-008: hook rate-limiting drops duplicate hook audit entries without fai
   const root = await mkdtemp(path.join(tmpdir(), "rate-limit-vault-"));
   const home = await mkdtemp(path.join(tmpdir(), "sm-home-"));
 
-  const origBypass = process.env.SOVEREIGN_BYPASS_AUDIT_LIMIT;
-  const origHome = process.env.SOVEREIGN_HOME;
+  const origBypass = process.env.MINNI_BYPASS_AUDIT_LIMIT;
+  const origHome = process.env.MINNI_HOME;
 
   try {
-    process.env.SOVEREIGN_BYPASS_AUDIT_LIMIT = "false";
-    process.env.SOVEREIGN_HOME = home;
+    process.env.MINNI_BYPASS_AUDIT_LIMIT = "false";
+    process.env.MINNI_HOME = home;
 
     await ensureVault(root);
 
@@ -45,10 +45,10 @@ test("RCM-008: hook rate-limiting drops duplicate hook audit entries without fai
     assert.doesNotMatch(log, /Second audit too fast/);
     assert.match(log, /Third audit ok/);
   } finally {
-    if (origBypass === undefined) delete process.env.SOVEREIGN_BYPASS_AUDIT_LIMIT;
-    else process.env.SOVEREIGN_BYPASS_AUDIT_LIMIT = origBypass;
-    if (origHome === undefined) delete process.env.SOVEREIGN_HOME;
-    else process.env.SOVEREIGN_HOME = origHome;
+    if (origBypass === undefined) delete process.env.MINNI_BYPASS_AUDIT_LIMIT;
+    else process.env.MINNI_BYPASS_AUDIT_LIMIT = origBypass;
+    if (origHome === undefined) delete process.env.MINNI_HOME;
+    else process.env.MINNI_HOME = origHome;
     await rm(root, { recursive: true, force: true });
     await rm(home, { recursive: true, force: true });
   }
@@ -61,12 +61,12 @@ test("RCM-008: hook rate-limiting timestamp file has strict permissions", async 
 
   const home = await mkdtemp(path.join(tmpdir(), "sm-home-"));
 
-  const origBypass = process.env.SOVEREIGN_BYPASS_AUDIT_LIMIT;
-  const origHome = process.env.SOVEREIGN_HOME;
+  const origBypass = process.env.MINNI_BYPASS_AUDIT_LIMIT;
+  const origHome = process.env.MINNI_HOME;
 
   try {
-    process.env.SOVEREIGN_BYPASS_AUDIT_LIMIT = "false";
-    process.env.SOVEREIGN_HOME = home;
+    process.env.MINNI_BYPASS_AUDIT_LIMIT = "false";
+    process.env.MINNI_HOME = home;
 
     await ensureVault(root);
 
@@ -98,10 +98,10 @@ test("RCM-008: hook rate-limiting timestamp file has strict permissions", async 
       assert.equal(mode, 0o600);
     }
   } finally {
-    if (origBypass === undefined) delete process.env.SOVEREIGN_BYPASS_AUDIT_LIMIT;
-    else process.env.SOVEREIGN_BYPASS_AUDIT_LIMIT = origBypass;
-    if (origHome === undefined) delete process.env.SOVEREIGN_HOME;
-    else process.env.SOVEREIGN_HOME = origHome;
+    if (origBypass === undefined) delete process.env.MINNI_BYPASS_AUDIT_LIMIT;
+    else process.env.MINNI_BYPASS_AUDIT_LIMIT = origBypass;
+    if (origHome === undefined) delete process.env.MINNI_HOME;
+    else process.env.MINNI_HOME = origHome;
     await rm(tmpRoot, { recursive: true, force: true });
     await rm(home, { recursive: true, force: true });
   }
@@ -109,8 +109,8 @@ test("RCM-008: hook rate-limiting timestamp file has strict permissions", async 
 
 test("RCM-008: daily-log pruning (older than 30 days relative to audit timestamp)", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "sm-daily-prune-"));
-  const origHome = process.env.SOVEREIGN_HOME;
-  process.env.SOVEREIGN_HOME = root;
+  const origHome = process.env.MINNI_HOME;
+  process.env.MINNI_HOME = root;
 
   try {
     await ensureVault(root);
@@ -128,8 +128,8 @@ test("RCM-008: daily-log pruning (older than 30 days relative to audit timestamp
     // Record audit with a timestamp set to 2026-05-11 (31 days after 2026-04-10, 29 days after 2026-04-12)
     const auditTime = new Date("2026-05-11T12:00:00.000Z");
 
-    const oldBypass = process.env.SOVEREIGN_BYPASS_AUDIT_LIMIT;
-    process.env.SOVEREIGN_BYPASS_AUDIT_LIMIT = "true";
+    const oldBypass = process.env.MINNI_BYPASS_AUDIT_LIMIT;
+    process.env.MINNI_BYPASS_AUDIT_LIMIT = "true";
     try {
       await recordAudit(root, {
         tool: "test_tool",
@@ -137,7 +137,7 @@ test("RCM-008: daily-log pruning (older than 30 days relative to audit timestamp
         timestamp: auditTime,
       });
     } finally {
-      process.env.SOVEREIGN_BYPASS_AUDIT_LIMIT = oldBypass;
+      process.env.MINNI_BYPASS_AUDIT_LIMIT = oldBypass;
     }
 
     // 31-day-old file should be deleted
@@ -146,16 +146,16 @@ test("RCM-008: daily-log pruning (older than 30 days relative to audit timestamp
     const st29 = await stat(day29Path);
     assert.ok(st29.isFile());
   } finally {
-    if (origHome === undefined) delete process.env.SOVEREIGN_HOME;
-    else process.env.SOVEREIGN_HOME = origHome;
+    if (origHome === undefined) delete process.env.MINNI_HOME;
+    else process.env.MINNI_HOME = origHome;
     await rm(root, { recursive: true, force: true });
   }
 });
 
 test("RCM-008: rotation at 5 MB (log.md -> log.1.md -> log.2.md -> log.3.md)", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "sm-rotation-"));
-  const origHome = process.env.SOVEREIGN_HOME;
-  process.env.SOVEREIGN_HOME = root;
+  const origHome = process.env.MINNI_HOME;
+  process.env.MINNI_HOME = root;
 
   try {
     await ensureVault(root);
@@ -166,15 +166,15 @@ test("RCM-008: rotation at 5 MB (log.md -> log.1.md -> log.2.md -> log.3.md)", a
     const dummy = "a".repeat(5 * 1024 * 1024);
     await writeFile(logPath, dummy, "utf8");
 
-    const oldBypass = process.env.SOVEREIGN_BYPASS_AUDIT_LIMIT;
-    process.env.SOVEREIGN_BYPASS_AUDIT_LIMIT = "true";
+    const oldBypass = process.env.MINNI_BYPASS_AUDIT_LIMIT;
+    process.env.MINNI_BYPASS_AUDIT_LIMIT = "true";
     try {
       await recordAudit(root, {
         tool: "test_tool",
         summary: "Trigger rotation",
       });
     } finally {
-      process.env.SOVEREIGN_BYPASS_AUDIT_LIMIT = oldBypass;
+      process.env.MINNI_BYPASS_AUDIT_LIMIT = oldBypass;
     }
 
     // log.md should have been rotated to log.1.md
@@ -185,16 +185,16 @@ test("RCM-008: rotation at 5 MB (log.md -> log.1.md -> log.2.md -> log.3.md)", a
     const stLog = await stat(logPath);
     assert.ok(stLog.size < 1000);
   } finally {
-    if (origHome === undefined) delete process.env.SOVEREIGN_HOME;
-    else process.env.SOVEREIGN_HOME = origHome;
+    if (origHome === undefined) delete process.env.MINNI_HOME;
+    else process.env.MINNI_HOME = origHome;
     await rm(root, { recursive: true, force: true });
   }
 });
 
 test("RCM-008: quota check (50 MB cap, pruning oldest daily logs first)", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "sm-quota-"));
-  const origHome = process.env.SOVEREIGN_HOME;
-  process.env.SOVEREIGN_HOME = root;
+  const origHome = process.env.MINNI_HOME;
+  process.env.MINNI_HOME = root;
 
   try {
     await ensureVault(root);
@@ -215,8 +215,8 @@ test("RCM-008: quota check (50 MB cap, pruning oldest daily logs first)", async 
     await writeFile(log2, dummy, "utf8");
     await writeFile(log3, dummy, "utf8");
 
-    const oldBypass = process.env.SOVEREIGN_BYPASS_AUDIT_LIMIT;
-    process.env.SOVEREIGN_BYPASS_AUDIT_LIMIT = "true";
+    const oldBypass = process.env.MINNI_BYPASS_AUDIT_LIMIT;
+    process.env.MINNI_BYPASS_AUDIT_LIMIT = "true";
     try {
       await recordAudit(root, {
         tool: "test_tool",
@@ -224,7 +224,7 @@ test("RCM-008: quota check (50 MB cap, pruning oldest daily logs first)", async 
         timestamp: auditTime,
       });
     } finally {
-      process.env.SOVEREIGN_BYPASS_AUDIT_LIMIT = oldBypass;
+      process.env.MINNI_BYPASS_AUDIT_LIMIT = oldBypass;
     }
 
     // The oldest daily log (2026-05-18.md) should be deleted
@@ -235,8 +235,8 @@ test("RCM-008: quota check (50 MB cap, pruning oldest daily logs first)", async 
     assert.ok(st2.isFile());
     assert.ok(st3.isFile());
   } finally {
-    if (origHome === undefined) delete process.env.SOVEREIGN_HOME;
-    else process.env.SOVEREIGN_HOME = origHome;
+    if (origHome === undefined) delete process.env.MINNI_HOME;
+    else process.env.MINNI_HOME = origHome;
     await rm(root, { recursive: true, force: true });
   }
 });
@@ -245,12 +245,12 @@ test("RCM-008: vaultFirstLearn succeeds with production audit limiter enabled", 
   const root = await mkdtemp(path.join(tmpdir(), "sm-learn-limit-"));
   const home = await mkdtemp(path.join(tmpdir(), "sm-home-"));
 
-  const origBypass = process.env.SOVEREIGN_BYPASS_AUDIT_LIMIT;
-  const origHome = process.env.SOVEREIGN_HOME;
+  const origBypass = process.env.MINNI_BYPASS_AUDIT_LIMIT;
+  const origHome = process.env.MINNI_HOME;
 
   try {
-    process.env.SOVEREIGN_BYPASS_AUDIT_LIMIT = "false";
-    process.env.SOVEREIGN_HOME = home;
+    process.env.MINNI_BYPASS_AUDIT_LIMIT = "false";
+    process.env.MINNI_HOME = home;
 
     const result = await vaultFirstLearn({
       vaultPath: root,
@@ -269,10 +269,10 @@ test("RCM-008: vaultFirstLearn succeeds with production audit limiter enabled", 
     assert.match(log, /minni_vault_write/);
     assert.match(log, /minni_learn/);
   } finally {
-    if (origBypass === undefined) delete process.env.SOVEREIGN_BYPASS_AUDIT_LIMIT;
-    else process.env.SOVEREIGN_BYPASS_AUDIT_LIMIT = origBypass;
-    if (origHome === undefined) delete process.env.SOVEREIGN_HOME;
-    else process.env.SOVEREIGN_HOME = origHome;
+    if (origBypass === undefined) delete process.env.MINNI_BYPASS_AUDIT_LIMIT;
+    else process.env.MINNI_BYPASS_AUDIT_LIMIT = origBypass;
+    if (origHome === undefined) delete process.env.MINNI_HOME;
+    else process.env.MINNI_HOME = origHome;
     await rm(root, { recursive: true, force: true });
     await rm(home, { recursive: true, force: true });
   }
@@ -282,12 +282,12 @@ test("RCM-008: test_audit_concurrent_writers_no_drop", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "sm-concurrent-audit-"));
   const home = await mkdtemp(path.join(tmpdir(), "sm-home-"));
 
-  const origBypass = process.env.SOVEREIGN_BYPASS_AUDIT_LIMIT;
-  const origHome = process.env.SOVEREIGN_HOME;
+  const origBypass = process.env.MINNI_BYPASS_AUDIT_LIMIT;
+  const origHome = process.env.MINNI_HOME;
 
   try {
-    process.env.SOVEREIGN_BYPASS_AUDIT_LIMIT = "false";
-    process.env.SOVEREIGN_HOME = home;
+    process.env.MINNI_BYPASS_AUDIT_LIMIT = "false";
+    process.env.MINNI_HOME = home;
 
     await ensureVault(root);
 
@@ -306,10 +306,10 @@ test("RCM-008: test_audit_concurrent_writers_no_drop", async () => {
       assert.match(log, new RegExp(`concurrent audit ${index}\\b`));
     }
   } finally {
-    if (origBypass === undefined) delete process.env.SOVEREIGN_BYPASS_AUDIT_LIMIT;
-    else process.env.SOVEREIGN_BYPASS_AUDIT_LIMIT = origBypass;
-    if (origHome === undefined) delete process.env.SOVEREIGN_HOME;
-    else process.env.SOVEREIGN_HOME = origHome;
+    if (origBypass === undefined) delete process.env.MINNI_BYPASS_AUDIT_LIMIT;
+    else process.env.MINNI_BYPASS_AUDIT_LIMIT = origBypass;
+    if (origHome === undefined) delete process.env.MINNI_HOME;
+    else process.env.MINNI_HOME = origHome;
     await rm(root, { recursive: true, force: true });
     await rm(home, { recursive: true, force: true });
   }

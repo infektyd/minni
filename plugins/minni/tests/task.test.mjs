@@ -450,7 +450,7 @@ test("callAfmPrepareTask parses v0 chat-completions JSON content", async () => {
 test("prepareTask native provider uses the configured native helper", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "sm-native-prepare-"));
   const helper = path.join(root, "helper.mjs");
-  const previousHelper = process.env.SOVEREIGN_AFM_NATIVE_HELPER;
+  const previousHelper = process.env.MINNI_AFM_NATIVE_HELPER;
   await writeFile(
     helper,
     [
@@ -468,7 +468,7 @@ test("prepareTask native provider uses the configured native helper", async () =
     "utf8",
   );
   await chmod(helper, 0o755);
-  process.env.SOVEREIGN_AFM_NATIVE_HELPER = helper;
+  process.env.MINNI_AFM_NATIVE_HELPER = helper;
   try {
     const packet = await prepareTask(
       {
@@ -497,8 +497,8 @@ test("prepareTask native provider uses the configured native helper", async () =
     assert.equal(packet.afm.provider, "native");
     assert.equal(packet.brief, "native helper: test native provider over FoundationModels helper");
   } finally {
-    if (previousHelper === undefined) delete process.env.SOVEREIGN_AFM_NATIVE_HELPER;
-    else process.env.SOVEREIGN_AFM_NATIVE_HELPER = previousHelper;
+    if (previousHelper === undefined) delete process.env.MINNI_AFM_NATIVE_HELPER;
+    else process.env.MINNI_AFM_NATIVE_HELPER = previousHelper;
     await rm(root, { recursive: true, force: true });
   }
 });

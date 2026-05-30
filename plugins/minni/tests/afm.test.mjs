@@ -67,8 +67,8 @@ test("resolveAfmProvider does not trust helper presence without healthy native s
 });
 
 test("resolveAfmProvider reports adapter configuration without paths", () => {
-  const previous = process.env.SOVEREIGN_AFM_ADAPTER_PATH;
-  process.env.SOVEREIGN_AFM_ADAPTER_PATH = "/Users/alice/private/extractor.fmadapter";
+  const previous = process.env.MINNI_AFM_ADAPTER_PATH;
+  process.env.MINNI_AFM_ADAPTER_PATH = "/Users/alice/private/extractor.fmadapter";
   try {
     const provider = resolveAfmProvider("bridge", { nativeHelperPath: undefined });
 
@@ -77,8 +77,8 @@ test("resolveAfmProvider reports adapter configuration without paths", () => {
     assert.doesNotMatch(JSON.stringify(provider), /\/Users\/alice/);
     assert.doesNotMatch(JSON.stringify(provider), /extractor\.fmadapter/);
   } finally {
-    if (previous === undefined) delete process.env.SOVEREIGN_AFM_ADAPTER_PATH;
-    else process.env.SOVEREIGN_AFM_ADAPTER_PATH = previous;
+    if (previous === undefined) delete process.env.MINNI_AFM_ADAPTER_PATH;
+    else process.env.MINNI_AFM_ADAPTER_PATH = previous;
   }
 });
 

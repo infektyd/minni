@@ -27,7 +27,7 @@ test("parseSovrdJson accepts healthy JSON responses", () => {
 
 test("formatRecall returns concise markdown with query and provenance", () => {
   const formatted = formatRecall("socket health", {
-    results: "### daemon.md (score=1.000)\nUse ~/.sovereign-memory/run/sovrd.sock for local health.",
+    results: "### daemon.md (score=1.000)\nUse ~/.minni/run/sovrd.sock for local health.",
     agent_id: "codex",
     layer: "knowledge",
   }, [
@@ -36,7 +36,7 @@ test("formatRecall returns concise markdown with query and provenance", () => {
       relativePath: "wiki/sessions/socket-health.md",
       wikilink: "[[wiki/sessions/socket-health]]",
       title: "Socket health",
-      snippet: "Codex should check ~/.sovereign-memory/run/sovrd.sock before using recall.",
+      snippet: "Codex should check ~/.minni/run/sovrd.sock before using recall.",
       score: 61,
     },
   ]);
@@ -45,7 +45,7 @@ test("formatRecall returns concise markdown with query and provenance", () => {
   assert.match(formatted, /agent=codex/);
   assert.match(formatted, /AI Context Pack/);
   assert.match(formatted, /\[\[wiki\/sessions\/socket-health\]\]/);
-  assert.match(formatted, /Use ~\/\.sovereign-memory\/run\/sovrd\.sock/);
+  assert.match(formatted, /Use ~\/\.minni\/run\/sovrd\.sock/);
 });
 
 test("formatRecall includes backend badge when recall reports backend provenance", () => {
@@ -80,10 +80,10 @@ test("buildStatusReport includes vault, socket, AFM, and audit state", async () 
 
 test("buildStatusReport sanitizes AFM health and provider status paths", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "sm-status-redact-"));
-  const previousHelper = process.env.SOVEREIGN_AFM_NATIVE_HELPER;
-  const previousAdapter = process.env.SOVEREIGN_AFM_ADAPTER_PATH;
-  process.env.SOVEREIGN_AFM_NATIVE_HELPER = path.join(root, "native-afm-helper");
-  process.env.SOVEREIGN_AFM_ADAPTER_PATH = "/Users/alice/private/extractor.fmadapter";
+  const previousHelper = process.env.MINNI_AFM_NATIVE_HELPER;
+  const previousAdapter = process.env.MINNI_AFM_ADAPTER_PATH;
+  process.env.MINNI_AFM_NATIVE_HELPER = path.join(root, "native-afm-helper");
+  process.env.MINNI_AFM_ADAPTER_PATH = "/Users/alice/private/extractor.fmadapter";
   try {
     const report = await buildStatusReport({
       vaultPath: root,
@@ -114,10 +114,10 @@ test("buildStatusReport sanitizes AFM health and provider status paths", async (
     assert.doesNotMatch(body, /\.db/);
     assert.doesNotMatch(body, /LaunchAgents/);
   } finally {
-    if (previousHelper === undefined) delete process.env.SOVEREIGN_AFM_NATIVE_HELPER;
-    else process.env.SOVEREIGN_AFM_NATIVE_HELPER = previousHelper;
-    if (previousAdapter === undefined) delete process.env.SOVEREIGN_AFM_ADAPTER_PATH;
-    else process.env.SOVEREIGN_AFM_ADAPTER_PATH = previousAdapter;
+    if (previousHelper === undefined) delete process.env.MINNI_AFM_NATIVE_HELPER;
+    else process.env.MINNI_AFM_NATIVE_HELPER = previousHelper;
+    if (previousAdapter === undefined) delete process.env.MINNI_AFM_ADAPTER_PATH;
+    else process.env.MINNI_AFM_ADAPTER_PATH = previousAdapter;
     await rm(root, { recursive: true, force: true });
   }
 });

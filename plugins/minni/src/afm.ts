@@ -41,11 +41,11 @@ function nativeHelperAvailable(path: string | undefined): boolean {
 function resolvedNativeHelperPath(options: AfmProviderOptions): string | undefined {
   return Object.prototype.hasOwnProperty.call(options, "nativeHelperPath")
     ? options.nativeHelperPath
-    : process.env.SOVEREIGN_AFM_NATIVE_HELPER;
+    : process.env.MINNI_AFM_NATIVE_HELPER;
 }
 
 function adapterConfigured(): boolean {
-  return Boolean(process.env.SOVEREIGN_AFM_ADAPTER_PATH || process.env.SOVEREIGN_AFM_ADAPTER_ID);
+  return Boolean(process.env.MINNI_AFM_ADAPTER_PATH || process.env.MINNI_AFM_ADAPTER_ID);
 }
 
 function stringField(data: unknown, key: string): string | undefined {
@@ -252,7 +252,7 @@ async function callNativeHelper(
 }
 
 // G13 (SEC-004): AFM URL allowlist enforcement. Loopback always permitted (default in config).
-// Non-loopback hosts only if listed in SOVEREIGN_AFM_ALLOWED_TARGETS (comma sep).
+// Non-loopback hosts only if listed in MINNI_AFM_ALLOWED_TARGETS (comma sep).
 // Denial is structured, does not echo the attacker URL in the error payload (no secret leak).
 function isAfmTargetAllowed(targetUrl: string): boolean {
   if (!targetUrl) return false;
@@ -291,7 +291,7 @@ export async function callAfmJson(
         }
       })();
       // Structured denial (no full URL in error to avoid leaking internal/attacker-controlled values)
-      console.warn(`[sovereign-memory] afm_target_denied host=${host} (not loopback and not in SOVEREIGN_AFM_ALLOWED_TARGETS)`);
+      console.warn(`[minni] afm_target_denied host=${host} (not loopback and not in MINNI_AFM_ALLOWED_TARGETS)`);
       return { ok: false, error: "afm_target_denied: target is not loopback-only and not explicitly allowlisted by operator config" };
     }
   }

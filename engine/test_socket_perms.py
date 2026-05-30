@@ -1,6 +1,6 @@
 """
 G04 — SEC-001 socket location + permissions test.
-Asserts that the hardened default lives under ~/.sovereign-memory/run/ with
+Asserts that the hardened default lives under ~/.minni/run/ with
 correct 0700/0600 expectations (the actual bind+chmod is exercised at runtime;
 this unit test covers the constants and the ensure-dir logic).
 """
@@ -17,11 +17,11 @@ import sovrd  # type: ignore
 def test_default_socket_is_under_secure_run_dir():
     p = sovrd.DEFAULT_SOCKET_PATH
     assert isinstance(p, Path)
-    assert "sovereign-memory" in str(p)
+    assert "minni" in str(p)
     assert p.name == "sovrd.sock"
     assert p.parent.name == "run"
-    # parent of run is .sovereign-memory under home
-    assert p.parent.parent == Path.home() / ".sovereign-memory"
+    # parent of run is .minni under home
+    assert p.parent.parent == Path.home() / ".minni"
 
 
 def test_ensure_run_dir_creates_0700_and_socket_0600(tmp_path: Path):

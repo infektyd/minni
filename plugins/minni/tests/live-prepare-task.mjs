@@ -8,8 +8,8 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 
 import { callAfmPrepareTask, prepareOutcome, prepareTask } from "../dist/task.js";
 
-const AFM_URL = process.env.SOVEREIGN_AFM_PREPARE_TASK_URL ?? "http://127.0.0.1:11437/v1/chat/completions";
-const AFM_HEALTH_URL = process.env.SOVEREIGN_AFM_HEALTH_URL ?? "http://127.0.0.1:11437/health";
+const AFM_URL = process.env.MINNI_AFM_PREPARE_TASK_URL ?? "http://127.0.0.1:11437/v1/chat/completions";
+const AFM_HEALTH_URL = process.env.MINNI_AFM_HEALTH_URL ?? "http://127.0.0.1:11437/health";
 
 async function assertAfmHealth() {
   const response = await fetch(AFM_HEALTH_URL);
@@ -80,7 +80,7 @@ async function main() {
         encoding: "utf8",
         env: {
           ...process.env,
-          SOVEREIGN_CODEX_VAULT_PATH: root,
+          MINNI_CODEX_VAULT_PATH: root,
         },
         timeout: 60000,
       },
@@ -117,7 +117,7 @@ async function main() {
       stderr: "pipe",
       env: {
         ...process.env,
-        SOVEREIGN_CODEX_VAULT_PATH: root,
+        MINNI_CODEX_VAULT_PATH: root,
       },
     });
     const client = new Client({ name: "sovereign-memory-live-prepare-test", version: "0.1.0" });

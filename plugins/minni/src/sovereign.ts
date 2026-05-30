@@ -447,7 +447,7 @@ export async function buildStatusReport(input?: {
     socket: input?.socket ?? (await socketHealth()),
     afm: sanitizeAfmHealth(rawAfm),
     afmProvider: resolveAfmProvider(input?.afmProviderMode ?? AFM_PROVIDER_MODE, {
-      nativeHelperPath: process.env.SOVEREIGN_AFM_NATIVE_HELPER,
+      nativeHelperPath: process.env.MINNI_AFM_NATIVE_HELPER,
       health: rawAfm,
     }),
     audit: {

@@ -104,13 +104,13 @@ function defaultAgentVault(agentId: string): string {
     kilocode: "kilocode",
   };
   const slug = aliases[agentId] ?? (agentId.toLowerCase().replace(/[^a-z0-9]+/g, "") || "agent");
-  return path.join(os.homedir(), ".sovereign-memory", `${slug}-vault`);
+  return path.join(os.homedir(), ".minni", `${slug}-vault`);
 }
 
 export function resolveAgentVaultPath(agentId: string): string {
   if (agentId === DEFAULT_AGENT_ID) return DEFAULT_VAULT_PATH;
 
-  const mappingRaw = process.env.SOVEREIGN_AGENT_VAULTS;
+  const mappingRaw = process.env.MINNI_AGENT_VAULTS;
   if (mappingRaw) {
     try {
       const mapping = JSON.parse(mappingRaw) as unknown;
@@ -123,7 +123,7 @@ export function resolveAgentVaultPath(agentId: string): string {
     }
   }
 
-  const envValue = process.env[`SOVEREIGN_${agentEnvKey(agentId)}_VAULT_PATH`];
+  const envValue = process.env[`MINNI_${agentEnvKey(agentId)}_VAULT_PATH`];
   if (envValue?.trim()) return path.resolve(envValue.replace(/^~(?=$|\/)/, os.homedir()));
   return defaultAgentVault(agentId);
 }
@@ -200,12 +200,12 @@ function withExpiry(contract: AgentPingContract, now = new Date()): AgentPingCon
 }
 
 function getLeasePath(requestId: string): string {
-  const baseHome = process.env.SOVEREIGN_HOME ?? path.join(os.homedir(), ".sovereign-memory");
+  const baseHome = process.env.MINNI_HOME ?? path.join(os.homedir(), ".minni");
   return path.join(baseHome, "pings", "leases", `${requestId}.json`);
 }
 
 function getLeaseDir(): string {
-  const baseHome = process.env.SOVEREIGN_HOME ?? path.join(os.homedir(), ".sovereign-memory");
+  const baseHome = process.env.MINNI_HOME ?? path.join(os.homedir(), ".minni");
   return path.join(baseHome, "pings", "leases");
 }
 

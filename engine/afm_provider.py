@@ -37,13 +37,13 @@ def resolve_afm_mode(value: Optional[str] = None) -> AFMMode:
     raw = (
         value
         if value is not None
-        else os.environ.get("SOVEREIGN_AFM_PROVIDER_MODE", os.environ.get("SOVEREIGN_AFM_MODE", "bridge"))
+        else os.environ.get("MINNI_AFM_PROVIDER_MODE", os.environ.get("MINNI_AFM_MODE", "bridge"))
     ).strip().lower()
     return raw if raw in _VALID_MODES else "bridge"  # type: ignore[return-value]
 
 
 def native_helper_path() -> Path:
-    return Path(os.environ.get("SOVEREIGN_AFM_NATIVE_HELPER", os.fspath(_DEFAULT_NATIVE_HELPER))).expanduser()
+    return Path(os.environ.get("MINNI_AFM_NATIVE_HELPER", os.fspath(_DEFAULT_NATIVE_HELPER))).expanduser()
 
 
 def native_available(helper_path: Optional[Path] = None) -> bool:
@@ -64,13 +64,13 @@ def afm_runtime_status(mode: Optional[str] = None) -> Dict[str, Any]:
     resolved = resolve_afm_mode(mode)
     helper = native_helper_path()
     helper_available = native_available(helper)
-    adapter_configured = bool(os.environ.get("SOVEREIGN_AFM_ADAPTER_PATH") or os.environ.get("SOVEREIGN_AFM_ADAPTER_ID"))
+    adapter_configured = bool(os.environ.get("MINNI_AFM_ADAPTER_PATH") or os.environ.get("MINNI_AFM_ADAPTER_ID"))
     if resolved == "off":
         return {
             "mode": resolved,
             "status": "off",
             "native_available": False,
-            "native_helper_configured": bool(os.environ.get("SOVEREIGN_AFM_NATIVE_HELPER")),
+            "native_helper_configured": bool(os.environ.get("MINNI_AFM_NATIVE_HELPER")),
             "adapter_configured": adapter_configured,
         }
     if resolved == "bridge":
@@ -78,7 +78,7 @@ def afm_runtime_status(mode: Optional[str] = None) -> Dict[str, Any]:
             "mode": resolved,
             "status": "bridge",
             "native_available": False,
-            "native_helper_configured": bool(os.environ.get("SOVEREIGN_AFM_NATIVE_HELPER")),
+            "native_helper_configured": bool(os.environ.get("MINNI_AFM_NATIVE_HELPER")),
             "adapter_configured": adapter_configured,
         }
     if not helper_available:
@@ -87,7 +87,7 @@ def afm_runtime_status(mode: Optional[str] = None) -> Dict[str, Any]:
             "status": "native_helper_missing" if resolved == "native" else "fallback_used",
             "native_health": "helper_missing",
             "native_available": False,
-            "native_helper_configured": bool(os.environ.get("SOVEREIGN_AFM_NATIVE_HELPER")),
+            "native_helper_configured": bool(os.environ.get("MINNI_AFM_NATIVE_HELPER")),
             "adapter_configured": adapter_configured,
         }
 
@@ -102,7 +102,7 @@ def afm_runtime_status(mode: Optional[str] = None) -> Dict[str, Any]:
         "status": status,
         "native_health": native_health,
         "native_available": native_is_available,
-        "native_helper_configured": bool(os.environ.get("SOVEREIGN_AFM_NATIVE_HELPER")),
+        "native_helper_configured": bool(os.environ.get("MINNI_AFM_NATIVE_HELPER")),
         "adapter_configured": adapter_configured,
     }
     if isinstance(backend, str):

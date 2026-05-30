@@ -9,7 +9,7 @@
   Substitutions:
     /path/to/engine/sovrd.py   absolute path to engine/sovrd.py in this repo
     /path/to/sock              absolute path to the Unix socket
-                               (default: ~/.sovereign-memory/run/sovrd.sock
+                               (default: ~/.minni/run/sovrd.sock
                                with mode 0600)
     ~                          your home directory; launchd does NOT expand ~,
                                so replace it with the literal /Users/<you>
@@ -28,10 +28,10 @@
     SEC-016 fix: stderr can contain learning excerpts and must not be
     world-readable.
 
-    Make sure ~/Library/Logs/sovereign-memory/ exists and is mode 0700
+    Make sure ~/Library/Logs/minni/ exists and is mode 0700
     before first load:
-      mkdir -p ~/Library/Logs/sovereign-memory
-      chmod 0700 ~/Library/Logs/sovereign-memory
+      mkdir -p ~/Library/Logs/minni
+      chmod 0700 ~/Library/Logs/minni
 -->
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -58,10 +58,10 @@
     <integer>63</integer>
 
     <key>StandardOutPath</key>
-    <string>/Users/REPLACE_WITH_YOUR_USERNAME/Library/Logs/sovereign-memory/sovrd.out.log</string>
+    <string>/Users/REPLACE_WITH_YOUR_USERNAME/Library/Logs/minni/sovrd.out.log</string>
 
     <key>StandardErrorPath</key>
-    <string>/Users/REPLACE_WITH_YOUR_USERNAME/Library/Logs/sovereign-memory/sovrd.err.log</string>
+    <string>/Users/REPLACE_WITH_YOUR_USERNAME/Library/Logs/minni/sovrd.err.log</string>
 
     <key>ProcessType</key>
     <string>Background</string>

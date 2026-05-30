@@ -31,7 +31,7 @@ JSON-RPC Methods
 
 Usage
 -----
-    python sovrd.py                    # default socket: ~/.sovereign-memory/run/sovrd.sock (0700/0600, SEC-001)
+    python sovrd.py                    # default socket: ~/.minni/run/sovrd.sock (0700/0600, SEC-001)
     python sovrd.py --socket /path/s   # custom socket
     python sovrd.py --port 9900        # HTTP fallback (optional; openclaw-extension/sovrd.py deprecated)
     python sovrd.py --dual-write       # enable dual-write to flat-file memory
@@ -40,7 +40,7 @@ Client Quick-Start (Python)
 ---------------------------
     import os, socket, json
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    s.connect(os.path.expanduser("~/.sovereign-memory/run/sovrd.sock"))
+    s.connect(os.path.expanduser("~/.minni/run/sovrd.sock"))
     def rpc(method, params=None):
         msg = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method,
                           "params": params or {}}) + "\\n"
@@ -291,20 +291,20 @@ def _default_agent_vault(agent_id: str) -> Path:
         "openclaw": "openclaw",
     }
     slug = aliases.get(agent_id, re.sub(r"[^a-z0-9]+", "", agent_id.lower()) or "agent")
-    return Path.home() / ".sovereign-memory" / f"{slug}-vault"
+    return Path.home() / ".minni" / f"{slug}-vault"
 
 
 def _agent_vault(agent_id: str) -> tuple[Path, bool]:
-    mapping_raw = os.environ.get("SOVEREIGN_AGENT_VAULTS", "")
+    mapping_raw = os.environ.get("MINNI_AGENT_VAULTS", "")
     if mapping_raw:
         try:
             mapping = json.loads(mapping_raw)
             if isinstance(mapping, dict) and agent_id in mapping:
                 return Path(os.path.expanduser(str(mapping[agent_id]))), True
         except json.JSONDecodeError:
-            logger.warning("Invalid SOVEREIGN_AGENT_VAULTS JSON; using defaults")
+            logger.warning("Invalid MINNI_AGENT_VAULTS JSON; using defaults")
 
-    env_key = f"SOVEREIGN_{_agent_env_key(agent_id)}_VAULT_PATH"
+    env_key = f"MINNI_{_agent_env_key(agent_id)}_VAULT_PATH"
     if os.environ.get(env_key):
         return Path(os.path.expanduser(os.environ[env_key])), True
     return _default_agent_vault(agent_id), False
@@ -355,7 +355,7 @@ def _iso_from_epoch(epoch: float) -> str:
 
 def _known_agent_vaults() -> list[Path]:
     vaults = []
-    mapping_raw = os.environ.get("SOVEREIGN_AGENT_VAULTS", "")
+    mapping_raw = os.environ.get("MINNI_AGENT_VAULTS", "")
     if mapping_raw:
         try:
             mapping = json.loads(mapping_raw)
@@ -363,7 +363,7 @@ def _known_agent_vaults() -> list[Path]:
                 vaults.extend(Path(os.path.expanduser(str(v))) for v in mapping.values())
         except json.JSONDecodeError:
             pass
-    root = Path.home() / ".sovereign-memory"
+    root = Path.home() / ".minni"
     if root.exists():
         vaults.extend(root.glob("*-vault"))
     return list(dict.fromkeys(vaults))
@@ -569,7 +569,7 @@ def _handle_daemon_handoff(params: dict, request_id: Any) -> dict:
             # treat resolution failure as deny
             return _make_error(-32003, "wikilink_traversal_denied: unresolvable ref", request_id)
 
-    create_missing = os.environ.get("SOVEREIGN_HANDOFF_CREATE_MISSING_VAULTS", "1").lower() not in {"0", "false", "off"}
+    create_missing = os.environ.get("MINNI_HANDOFF_CREATE_MISSING_VAULTS", "1").lower() not in {"0", "false", "off"}
 
     if not recipient_explicit and not recipient_vault.exists() and not create_missing:
         if create_missing or sender_explicit:
@@ -2167,7 +2167,7 @@ def _handle_hygiene_report(params: dict, request_id: Any) -> dict:
 
 
 def _afm_loop_enabled(config=DEFAULT_CONFIG) -> bool:
-    if os.environ.get("SOVEREIGN_AFM_LOOP", "").lower() == "off":
+    if os.environ.get("MINNI_AFM_LOOP", "").lower() == "off":
         return False
     return bool((getattr(config, "afm_loop_schedule", {}) or {}).get("enabled"))
 
@@ -2547,7 +2547,7 @@ _METHODS: Dict[str, callable] = {
 # ── Unix socket server ───────────────────────────────────────────────────
 # SEC-001: canonical secure location (0700 dir, 0600 socket). /tmp is world-writable
 # and was the old default; openclaw-extension/sovrd.py HTTP variant is deprecated.
-SECURE_RUN_DIR: Path = Path.home() / ".sovereign-memory" / "run"
+SECURE_RUN_DIR: Path = Path.home() / ".minni" / "run"
 DEFAULT_SOCKET_PATH: Path = SECURE_RUN_DIR / "sovrd.sock"
 
 _unix_socket_path: Path = DEFAULT_SOCKET_PATH
@@ -2816,7 +2816,7 @@ def main():
     parser.add_argument(
         "--socket", "-s",
         default=str(DEFAULT_SOCKET_PATH),
-        help="Unix socket path (default: ~/.sovereign-memory/run/sovrd.sock with 0600; SEC-001)",
+        help="Unix socket path (default: ~/.minni/run/sovrd.sock with 0600; SEC-001)",
     )
     parser.add_argument(
         "--port", "-p",

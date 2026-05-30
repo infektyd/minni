@@ -434,7 +434,7 @@ function escapeAuditDetailsBlock(raw: string): string {
 function getAgentIdFromVaultPath(vaultPath: string): string {
   const absPath = path.resolve(vaultPath.replace(/^~(?=$|\/)/, os.homedir()));
 
-  const mappingRaw = process.env.SOVEREIGN_AGENT_VAULTS;
+  const mappingRaw = process.env.MINNI_AGENT_VAULTS;
   if (mappingRaw) {
     try {
       const mapping = JSON.parse(mappingRaw) as unknown;
@@ -450,9 +450,9 @@ function getAgentIdFromVaultPath(vaultPath: string): string {
   }
 
   const envKeys = [
-    { key: "SOVEREIGN_CODEX_VAULT_PATH", id: "codex" },
-    { key: "SOVEREIGN_CLAUDECODE_VAULT_PATH", id: "claude-code" },
-    { key: "SOVEREIGN_KILOCODE_VAULT_PATH", id: "kilocode" },
+    { key: "MINNI_CODEX_VAULT_PATH", id: "codex" },
+    { key: "MINNI_CLAUDECODE_VAULT_PATH", id: "claude-code" },
+    { key: "MINNI_KILOCODE_VAULT_PATH", id: "kilocode" },
   ];
   for (const { key, id } of envKeys) {
     const val = process.env[key];
@@ -462,11 +462,11 @@ function getAgentIdFromVaultPath(vaultPath: string): string {
   }
 
   const homedir = os.homedir();
-  if (absPath === path.join(homedir, ".sovereign-memory", "codex-vault")) return "codex";
-  if (absPath === path.join(homedir, ".sovereign-memory", "claudecode-vault")) return "claude-code";
-  if (absPath === path.join(homedir, ".sovereign-memory", "kilocode-vault")) return "kilocode";
-  if (absPath === path.join(homedir, ".sovereign-memory", "hermes-vault")) return "hermes";
-  if (absPath === path.join(homedir, ".sovereign-memory", "openclaw-vault")) return "openclaw";
+  if (absPath === path.join(homedir, ".minni", "codex-vault")) return "codex";
+  if (absPath === path.join(homedir, ".minni", "claudecode-vault")) return "claude-code";
+  if (absPath === path.join(homedir, ".minni", "kilocode-vault")) return "kilocode";
+  if (absPath === path.join(homedir, ".minni", "hermes-vault")) return "hermes";
+  if (absPath === path.join(homedir, ".minni", "openclaw-vault")) return "openclaw";
 
   const base = path.basename(absPath);
   if (base.endsWith("-vault")) return base.substring(0, base.length - 6);
@@ -532,7 +532,7 @@ export async function recordAudit(
 
   // --- 1. Per-agent rate-limiting ---
   const agentId = getAgentIdFromVaultPath(vaultPath);
-  const homeDir = process.env.SOVEREIGN_HOME ?? path.join(os.homedir(), ".sovereign-memory");
+  const homeDir = process.env.MINNI_HOME ?? path.join(os.homedir(), ".minni");
   const rateLimitDir = path.join(homeDir, ".hook-audit-ts");
   await mkdir(rateLimitDir, { recursive: true });
   const tsPath = path.join(rateLimitDir, `${agentId}.ts`);
@@ -543,7 +543,7 @@ export async function recordAudit(
     lastTime = Date.parse(content.trim());
   } catch {}
 
-  const bypass = process.env.SOVEREIGN_BYPASS_AUDIT_LIMIT === "true";
+  const bypass = process.env.MINNI_BYPASS_AUDIT_LIMIT === "true";
   const logPath = path.join(vaultPath, "log.md");
   const dailyPath = path.join(vaultPath, "logs", `${isoDate(timestamp)}.md`);
   if (!bypass && lastTime !== undefined && Number.isFinite(lastTime)) {

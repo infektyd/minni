@@ -73,7 +73,7 @@ def test_daemon_handoff_validates_redacts_and_writes_inbox_outbox(monkeypatch, t
     sender = tmp_path / "codex-vault"
     recipient = tmp_path / "claudecode-vault"
     monkeypatch.setenv(
-        "SOVEREIGN_AGENT_VAULTS",
+        "MINNI_AGENT_VAULTS",
         json.dumps({"codex": str(sender), "claude-code": str(recipient)}),
     )
 
@@ -139,7 +139,7 @@ def test_daemon_handoff_reports_degraded_when_lease_persistence_fails(monkeypatc
     sender = tmp_path / "codex-vault"
     recipient = tmp_path / "claudecode-vault"
     monkeypatch.setenv(
-        "SOVEREIGN_AGENT_VAULTS",
+        "MINNI_AGENT_VAULTS",
         json.dumps({"codex": str(sender), "claude-code": str(recipient)}),
     )
     monkeypatch.setattr(sovrd, "_store_handoff_lease", lambda *_args, **_kwargs: False)
@@ -166,7 +166,7 @@ def test_handoff_pending_list_and_ack(monkeypatch, tmp_path):
     sender = tmp_path / "codex-vault"
     recipient = tmp_path / "claudecode-vault"
     monkeypatch.setenv(
-        "SOVEREIGN_AGENT_VAULTS",
+        "MINNI_AGENT_VAULTS",
         json.dumps({"codex": str(sender), "claude-code": str(recipient)}),
     )
 
@@ -214,7 +214,7 @@ def test_handoff_pending_list_and_ack(monkeypatch, tmp_path):
 def test_await_handoff_times_out(monkeypatch, tmp_path):
     _patch_handoff_db(monkeypatch, tmp_path)
     recipient = tmp_path / "claudecode-vault"
-    monkeypatch.setenv("SOVEREIGN_AGENT_VAULTS", json.dumps({"claude-code": str(recipient)}))
+    monkeypatch.setenv("MINNI_AGENT_VAULTS", json.dumps({"claude-code": str(recipient)}))
     response = sovrd._dispatch_sync({
         "jsonrpc": "2.0",
         "id": 24,
@@ -227,7 +227,7 @@ def test_await_handoff_times_out(monkeypatch, tmp_path):
 
 def test_daemon_handoff_rejects_invalid_packet(monkeypatch, tmp_path):
     _patch_handoff_db(monkeypatch, tmp_path)  # ensures G11 test-relaxed resolve (accepts test agent names)
-    monkeypatch.setenv("SOVEREIGN_AGENT_VAULTS", json.dumps({"codex": str(tmp_path / "codex")}))
+    monkeypatch.setenv("MINNI_AGENT_VAULTS", json.dumps({"codex": str(tmp_path / "codex")}))
 
     response = sovrd._dispatch_sync(
         {
@@ -248,8 +248,8 @@ def test_daemon_handoff_rejects_invalid_packet(monkeypatch, tmp_path):
 
 def test_daemon_handoff_gracefully_reports_missing_destination(monkeypatch, tmp_path):
     _patch_handoff_db(monkeypatch, tmp_path)  # ensures G11 test-relaxed resolve (accepts test agent names)
-    monkeypatch.setenv("SOVEREIGN_AGENT_VAULTS", json.dumps({"codex": str(tmp_path / "codex")}))
-    monkeypatch.setenv("SOVEREIGN_HANDOFF_CREATE_MISSING_VAULTS", "0")
+    monkeypatch.setenv("MINNI_AGENT_VAULTS", json.dumps({"codex": str(tmp_path / "codex")}))
+    monkeypatch.setenv("MINNI_HANDOFF_CREATE_MISSING_VAULTS", "0")
 
     response = sovrd._dispatch_sync(
         {

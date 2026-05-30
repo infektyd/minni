@@ -54,8 +54,8 @@ def test_generate_hypothetical_answer_native_unavailable_does_not_call_bridge(mo
         calls.append(_payload)
         return {"choices": [{"message": {"content": "bridge should not run"}}]}
 
-    monkeypatch.setenv("SOVEREIGN_AFM_MODE", "native")
-    monkeypatch.setenv("SOVEREIGN_AFM_NATIVE_HELPER", str(tmp_path / "missing-helper"))
+    monkeypatch.setenv("MINNI_AFM_MODE", "native")
+    monkeypatch.setenv("MINNI_AFM_NATIVE_HELPER", str(tmp_path / "missing-helper"))
 
     answer = generate_hypothetical_answer(
         "cold query",
@@ -81,8 +81,8 @@ def test_generate_hypothetical_answer_uses_native_helper_contract(monkeypatch, t
     )
     helper.chmod(helper.stat().st_mode | 0o111)
 
-    monkeypatch.setenv("SOVEREIGN_AFM_MODE", "native")
-    monkeypatch.setenv("SOVEREIGN_AFM_NATIVE_HELPER", str(helper))
+    monkeypatch.setenv("MINNI_AFM_MODE", "native")
+    monkeypatch.setenv("MINNI_AFM_NATIVE_HELPER", str(helper))
 
     answer = generate_hypothetical_answer("cold query")
 

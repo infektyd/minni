@@ -100,7 +100,7 @@ def test_session_distillation_accepts_structured_native_compile_proposals(tmp_pa
             },
         )
 
-    monkeypatch.setenv("SOVEREIGN_AFM_MODE", "native")
+    monkeypatch.setenv("MINNI_AFM_MODE", "native")
     monkeypatch.setattr("afm_passes.session_distillation.invoke_native_afm", fake_native)
 
     result = run(db_obj, cfg, vault_path=cfg.vault_path, dry_run=True, trace_id="trace-native")

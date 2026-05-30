@@ -9,10 +9,10 @@ const codexVault = path.join(root, "codex-vault");
 const claudeVault = path.join(root, "claude-vault");
 const geminiVault = path.join(root, "gemini-vault");
 
-process.env.SOVEREIGN_CODEX_AGENT_ID = "codex";
-process.env.SOVEREIGN_CODEX_VAULT_PATH = codexVault;
-process.env.SOVEREIGN_HOME = path.join(root, "sovereign-home");
-process.env.SOVEREIGN_AGENT_VAULTS = JSON.stringify({
+process.env.MINNI_CODEX_AGENT_ID = "codex";
+process.env.MINNI_CODEX_VAULT_PATH = codexVault;
+process.env.MINNI_HOME = path.join(root, "sovereign-home");
+process.env.MINNI_AGENT_VAULTS = JSON.stringify({
   codex: codexVault,
   "claude-code": claudeVault,
   gemini: geminiVault,
@@ -240,7 +240,7 @@ test("RCM-004: ping lease expires after TTL and reaps files", async () => {
     "codex"
   );
 
-  const leaseFile = path.join(process.env.SOVEREIGN_HOME, "pings", "leases", `${created.contract.requestId}.json`);
+  const leaseFile = path.join(process.env.MINNI_HOME, "pings", "leases", `${created.contract.requestId}.json`);
   const senderFile = created.senderPath;
 
   // Verify they exist initially

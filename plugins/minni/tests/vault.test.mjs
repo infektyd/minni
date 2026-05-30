@@ -76,7 +76,7 @@ test("vaultFirstLearn writes a note, updates index, and appends audit logs", asy
       vaultPath: root,
       title: "Socket daemon health check",
       content:
-        "Sovereign Memory daemon health is checked through ~/.sovereign-memory/run/sovrd.sock.",
+        "Minni daemon health is checked through ~/.minni/run/sovrd.sock.",
       category: "fact",
       source: "unit-test",
       agentId: "codex",

@@ -5,7 +5,7 @@ Caller-supplied ``agent_id`` (or ``agentId``) on the wire is NEVER authoritative
 This module is the sole resolution point used by the daemon:
 
 * Resolve from explicit operator-controlled principal files under
-  ``$SOVEREIGN_HOME/principals/<id>.json`` (0600) when present, OR
+  ``$MINNI_HOME/principals/<id>.json`` (0600) when present, OR
 * Fall back to a trusted local default synthesized from the transport
   (UDS / stdio from the same host = operator context).
 
