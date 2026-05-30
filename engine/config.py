@@ -198,7 +198,7 @@ def resolve_canonical_path(kind: str) -> str:
         "graph": os.path.join(home, "graphs/"),
         "writeback": os.path.join(home, "learnings/"),
         "vault": os.path.expanduser("~/wiki/"),
-        "socket": os.path.join(home, "run", "sovrd.sock"),
+        "socket": os.path.join(home, "run", "minnid.sock"),
     }
     val = mapping.get(kind, home)
     env_map = {

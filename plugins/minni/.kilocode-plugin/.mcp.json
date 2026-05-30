@@ -7,7 +7,7 @@
       "env": {
         "MINNI_AGENT_ID": "kilocode",
         "MINNI_VAULT_PATH": "~/.minni/kilocode-vault",
-        "MINNI_SOCKET_PATH": "~/.minni/run/sovrd.sock"
+        "MINNI_SOCKET_PATH": "~/.minni/run/minnid.sock"
       }
     }
   }

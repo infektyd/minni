@@ -29,7 +29,7 @@ def test_engine_config_derives_from_canonical_home():
 
 def test_resolver_returns_consistent_values():
     assert resolve_canonical_path("db").endswith("minni.db")
-    assert resolve_canonical_path("socket").endswith("sovrd.sock")
+    assert resolve_canonical_path("socket").endswith("minnid.sock")
     assert "minni" in resolve_canonical_path("home")
 
 
@@ -44,4 +44,4 @@ def test_plugin_config_ts_unified_on_sovereign_memory_base():
     text = plugin_config.read_text(encoding="utf-8")
     # Vault (pre-existing) and socket (G02/G04 unification we just completed)
     assert ".minni" in text, "plugin must reference canonical .minni base"
-    assert "run/sovrd.sock" in text or 'sovrd.sock' in text, "SOCKET_PATH must be unified to the secure engine default (G04)"
+    assert "run/minnid.sock" in text or 'minnid.sock' in text, "SOCKET_PATH must be unified to the secure engine default (G04)"

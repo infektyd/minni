@@ -13,7 +13,7 @@ export const DEFAULT_VAULT_PATH =
 
 export const SOCKET_PATH =
   process.env.MINNI_SOCKET_PATH ??
-  path.join(os.homedir(), ".minni", "run", "sovrd.sock");
+  path.join(os.homedir(), ".minni", "run", "minnid.sock");
 
 export const AFM_HEALTH_URL =
   process.env.MINNI_AFM_HEALTH_URL ?? "http://127.0.0.1:11437/health";

@@ -11,7 +11,7 @@
       "env": {
         "MINNI_AGENT_ID": "gemini",
         "MINNI_VAULT_PATH": "~/.minni/gemini-vault",
-        "MINNI_SOCKET_PATH": "~/.minni/run/sovrd.sock"
+        "MINNI_SOCKET_PATH": "~/.minni/run/minnid.sock"
       }
     }
   }

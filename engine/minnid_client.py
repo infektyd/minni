@@ -19,7 +19,7 @@ import socket
 import sys
 from pathlib import Path
 
-DEFAULT_SOCKET = str(Path.home() / ".minni" / "run" / "sovrd.sock")
+DEFAULT_SOCKET = str(Path.home() / ".minni" / "run" / "minnid.sock")
 
 
 def _rpc(socket_path: str, method: str, params: dict = None) -> dict:

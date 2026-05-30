@@ -263,7 +263,7 @@ def test_trace_redaction_applied_via_redact_value():
     """
     import minnid
     from minnid import _redact_value  # type: ignore
-    sample = {"socket_path": "/Users/secret/sovrd.sock", "db_path": "/tmp/secret.db", "text": "safe content"}
+    sample = {"socket_path": "/Users/secret/minnid.sock", "db_path": "/tmp/secret.db", "text": "safe content"}
     redacted, _ = _redact_value(sample)
     # Redaction must mask sensitive paths (RCM-009; _redact_text uses [REDACTED_PATH] for local paths)
     red_str = str(redacted)

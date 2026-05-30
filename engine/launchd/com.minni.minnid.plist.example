@@ -1,26 +1,26 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
-  Sovereign Memory daemon launchd agent — example.
+  Minni daemon launchd agent — example.
 
   This is an example, not a live agent. Copy it to
-  ~/Library/LaunchAgents/com.openclaw.sovrd.plist, substitute the
+  ~/Library/LaunchAgents/com.minni.minnid.plist, substitute the
   placeholders below, then load it with launchctl.
 
   Substitutions:
     /path/to/engine/minnid.py   absolute path to engine/minnid.py in this repo
     /path/to/sock              absolute path to the Unix socket
-                               (default: ~/.minni/run/sovrd.sock
+                               (default: ~/.minni/run/minnid.sock
                                with mode 0600)
     ~                          your home directory; launchd does NOT expand ~,
                                so replace it with the literal /Users/<you>
                                before bootstrapping.
 
   Install / reload:
-    launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.openclaw.sovrd.plist
-    launchctl kickstart -k gui/$UID/com.openclaw.sovrd
+    launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.minni.minnid.plist
+    launchctl kickstart -k gui/$UID/com.minni.minnid
 
   Uninstall:
-    launchctl bootout gui/$UID/com.openclaw.sovrd
+    launchctl bootout gui/$UID/com.minni.minnid
 
   Notes:
     Umask 63 == octal 077. Files created by the daemon (logs, sockets if
@@ -38,7 +38,7 @@
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.openclaw.sovrd</string>
+    <string>com.minni.minnid</string>
 
     <key>ProgramArguments</key>
     <array>
@@ -47,6 +47,14 @@
         <string>--socket</string>
         <string>/path/to/sock</string>
     </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>MINNI_AGENT_ID</key>
+        <string>minni</string>
+        <key>MINNI_VAULT_PATH</key>
+        <string>/Users/REPLACE_WITH_YOUR_USERNAME/.minni/vault</string>
+    </dict>
 
     <key>RunAtLoad</key>
     <true/>
@@ -58,10 +66,10 @@
     <integer>63</integer>
 
     <key>StandardOutPath</key>
-    <string>/Users/REPLACE_WITH_YOUR_USERNAME/Library/Logs/minni/sovrd.out.log</string>
+    <string>/Users/REPLACE_WITH_YOUR_USERNAME/Library/Logs/minni/minnid.out.log</string>
 
     <key>StandardErrorPath</key>
-    <string>/Users/REPLACE_WITH_YOUR_USERNAME/Library/Logs/minni/sovrd.err.log</string>
+    <string>/Users/REPLACE_WITH_YOUR_USERNAME/Library/Logs/minni/minnid.err.log</string>
 
     <key>ProcessType</key>
     <string>Background</string>

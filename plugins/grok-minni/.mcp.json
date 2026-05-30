@@ -9,7 +9,7 @@
       "env": {
         "MINNI_AGENT_ID": "grok-build",
         "MINNI_VAULT_PATH": "~/.minni/grok-build-vault",
-        "MINNI_SOCKET_PATH": "~/.minni/run/sovrd.sock",
+        "MINNI_SOCKET_PATH": "~/.minni/run/minnid.sock",
         "MINNI_WORKSPACE_ID": "~/Projects/minni"
       }
     }

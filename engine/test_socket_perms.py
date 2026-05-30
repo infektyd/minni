@@ -18,7 +18,7 @@ def test_default_socket_is_under_secure_run_dir():
     p = minnid.DEFAULT_SOCKET_PATH
     assert isinstance(p, Path)
     assert "minni" in str(p)
-    assert p.name == "sovrd.sock"
+    assert p.name == "minnid.sock"
     assert p.parent.name == "run"
     # parent of run is .minni under home
     assert p.parent.parent == Path.home() / ".minni"
@@ -27,7 +27,7 @@ def test_default_socket_is_under_secure_run_dir():
 def test_ensure_run_dir_creates_0700_and_socket_0600(tmp_path: Path):
     """Replicate the mkdir+chmod logic from _serve_unix_socket and assert modes."""
     run_dir = tmp_path / "run"
-    sock = run_dir / "sovrd.sock"
+    sock = run_dir / "minnid.sock"
 
     # Simulate the ensure logic
     run_dir.mkdir(parents=True, exist_ok=True)
