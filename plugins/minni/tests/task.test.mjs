@@ -67,6 +67,10 @@ test("prepareTask builds a compact deterministic Codex task packet", async () =>
 });
 
 test("prepareTask ranks fresh handoff notes above older sessions and explains why", async () => {
+  // Use a dynamically-recent date so the "fresh" (<=30d) assertion does not rot over time.
+  const fresh = new Date(Date.now() - 5 * 86_400_000);
+  const freshYmd = `${fresh.getUTCFullYear()}${String(fresh.getUTCMonth() + 1).padStart(2, "0")}${String(fresh.getUTCDate()).padStart(2, "0")}`;
+  const freshSlug = `${freshYmd}-codex-minni-plugin-backend-handoff-clean`;
   const packet = await prepareTask(
     {
       task: "what is the latest backend handoff before frontend dashboard work",
@@ -82,9 +86,9 @@ test("prepareTask ranks fresh handoff notes above older sessions and explains wh
           score: 40,
         }),
         vaultSource({
-          relativePath: "wiki/sessions/20260425-codex-sovereign-memory-plugin-backend-handoff-clean.md",
-          wikilink: "[[wiki/sessions/20260425-codex-sovereign-memory-plugin-backend-handoff-clean]]",
-          title: "Codex Sovereign Memory plugin backend handoff clean",
+          relativePath: `wiki/sessions/${freshSlug}.md`,
+          wikilink: `[[wiki/sessions/${freshSlug}]]`,
+          title: "Codex Minni plugin backend handoff clean",
           snippet: "Frontend/dashboard work should wait until the plugin backend stabilizes further.",
           score: 18,
         }),
@@ -94,7 +98,7 @@ test("prepareTask ranks fresh handoff notes above older sessions and explains wh
     },
   );
 
-  assert.match(packet.relevantSources[0].relativePath, /20260425-codex-sovereign-memory-plugin-backend-handoff-clean/);
+  assert.match(packet.relevantSources[0].relativePath, new RegExp(freshSlug));
   assert.equal(packet.relevantSources[0].freshness, "fresh");
   assert.equal(packet.relevantSources[0].authority, "handoff");
   assert.ok(packet.relevantSources[0].reasons.includes("fresh handoff"));
