@@ -63,7 +63,7 @@ test("prepareTask builds a compact deterministic Codex task packet", async () =>
   assert.match(packet.constraints.join("\n"), /Do not run AFM extraction/);
   assert.match(packet.contextMarkdown, /Sovereign Task Packet/);
   assert.equal(packet.afm.used, false);
-  assert.equal(audits[0].tool, "sovereign_prepare_task");
+  assert.equal(audits[0].tool, "minni_prepare_task");
 });
 
 test("prepareTask ranks fresh handoff notes above older sessions and explains why", async () => {

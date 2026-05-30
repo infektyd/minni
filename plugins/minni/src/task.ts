@@ -710,7 +710,7 @@ export async function prepareTask(input: PrepareTaskInput, deps: PrepareTaskDeps
   }
 
   await audit(vaultPath, {
-    tool: "sovereign_prepare_task",
+    tool: "minni_prepare_task",
     summary: input.task.slice(0, 120),
     details: {
       mode: packet.mode,

@@ -57,12 +57,12 @@ function textResult(text: string) {
 }
 
 const server = new McpServer({
-  name: "sovereign-memory",
+  name: "minni",
   version: "0.1.0",
 });
 
 server.registerTool(
-  "sovereign_prepare_task",
+  "minni_prepare_task",
   {
     title: "Sovereign Prepare Task",
     description:
@@ -116,7 +116,7 @@ server.registerTool(
 );
 
 server.registerTool(
-  "sovereign_prepare_outcome",
+  "minni_prepare_outcome",
   {
     title: "Sovereign Prepare Outcome",
     description:
@@ -198,7 +198,7 @@ const teamPromotionCandidateSchema = z.object({
 });
 
 server.registerTool(
-  "sovereign_team_runtime",
+  "minni_team_runtime",
   {
     title: "Sovereign Team Runtime",
     description:
@@ -240,7 +240,7 @@ server.registerTool(
 );
 
 server.registerTool(
-  "sovereign_team_evidence",
+  "minni_team_evidence",
   {
     title: "Sovereign Team Evidence",
     description:
@@ -268,7 +268,7 @@ server.registerTool(
 );
 
 server.registerTool(
-  "sovereign_team_promotion",
+  "minni_team_promotion",
   {
     title: "Sovereign Team Promotion",
     description:
@@ -302,7 +302,7 @@ server.registerTool(
 );
 
 server.registerTool(
-  "sovereign_status",
+  "minni_status",
   {
     title: "Sovereign Memory Status",
     description:
@@ -320,7 +320,7 @@ server.registerTool(
 );
 
 server.registerTool(
-  "sovereign_compile_vault",
+  "minni_compile_vault",
   {
     title: "Sovereign Compile Vault",
     description:
@@ -352,7 +352,7 @@ server.registerTool(
 );
 
 server.registerTool(
-  "sovereign_route",
+  "minni_route",
   {
     title: "Sovereign Memory Intent Router",
     description:
@@ -365,7 +365,7 @@ server.registerTool(
   async ({ task }) => {
     const intent = routeMemoryIntent(task);
     await recordAudit(DEFAULT_VAULT_PATH, {
-      tool: "sovereign_route",
+      tool: "minni_route",
       summary: `${intent.action}: ${task.slice(0, 120)}`,
       details: intent as unknown as Record<string, unknown>,
     });
@@ -374,7 +374,7 @@ server.registerTool(
 );
 
 server.registerTool(
-  "sovereign_recall",
+  "minni_recall",
   {
     title: "Sovereign Memory Recall",
     description:
@@ -412,7 +412,7 @@ server.registerTool(
         ? formatRecall(query, result.data, vaultResults)
         : `Recall failed: ${result.error}`;
     await recordAudit(effectiveVaultPath, {
-      tool: "sovereign_recall",
+      tool: "minni_recall",
       summary: query,
       details: {
         ok: result.ok,
@@ -430,7 +430,7 @@ server.registerTool(
 );
 
 server.registerTool(
-  "sovereign_drill",
+  "minni_drill",
   {
     title: "Sovereign Drill",
     description:
@@ -448,7 +448,7 @@ server.registerTool(
 );
 
 server.registerTool(
-  "sovereign_export_pack",
+  "minni_export_pack",
   {
     title: "Sovereign Export Context Pack",
     description:
@@ -474,7 +474,7 @@ server.registerTool(
 );
 
 server.registerTool(
-  "sovereign_learn",
+  "minni_learn",
   {
     title: "Sovereign Memory Learn",
     description:
@@ -493,7 +493,7 @@ server.registerTool(
     const quality = assessLearningQuality({ title, content, category, source });
     if (requireQuality === true && !quality.ok) {
       await recordAudit(DEFAULT_VAULT_PATH, {
-        tool: "sovereign_learn",
+        tool: "minni_learn",
         summary: `quality-blocked: ${title}`,
         details: { quality },
       });
@@ -541,7 +541,7 @@ server.registerTool(
 // G15 / RCM-009 "THREE places" literal match: (1) this TS handler surface (no agentId in schema), (2) sovrd._resolve_candidate (does resolve_effective_principal + is_operator_principal check + -32004), (3) principal resolver + is_operator_principal itself.
 // Enforcement delegated to daemon RPC (correct per design); explicit comment here documents the surface for plan fidelity. Model cannot spoof operator.
 server.registerTool(
-  "sovereign_resolve_candidate",
+  "minni_resolve_candidate",
   {
     title: "Sovereign Resolve Candidate",
     description:
@@ -579,7 +579,7 @@ server.registerTool(
 );
 
 server.registerTool(
-  "sovereign_learning_quality",
+  "minni_learning_quality",
   {
     title: "Sovereign Learning Quality",
     description:
@@ -595,7 +595,7 @@ server.registerTool(
   async ({ title, content, category, source }) => {
     const quality = assessLearningQuality({ title, content, category, source });
     await recordAudit(DEFAULT_VAULT_PATH, {
-      tool: "sovereign_learning_quality",
+      tool: "minni_learning_quality",
       summary: title,
       details: { quality },
     });
@@ -604,7 +604,7 @@ server.registerTool(
 );
 
 server.registerTool(
-  "sovereign_vault_write",
+  "minni_vault_write",
   {
     title: "Sovereign Vault Write",
     description:
@@ -637,7 +637,7 @@ server.registerTool(
 );
 
 server.registerTool(
-  "sovereign_audit_report",
+  "minni_audit_report",
   {
     title: "Sovereign Audit Report",
     description:
@@ -653,7 +653,7 @@ server.registerTool(
 );
 
 server.registerTool(
-  "sovereign_audit_tail",
+  "minni_audit_tail",
   {
     title: "Sovereign Audit Tail",
     description:
@@ -669,7 +669,7 @@ server.registerTool(
 );
 
 server.registerTool(
-  "sovereign_negotiate_handoff",
+  "minni_negotiate_handoff",
   {
     title: "Sovereign Negotiate Handoff",
     description:
@@ -709,7 +709,7 @@ server.registerTool(
         allowedTopics: deliveryPlan.allowedTopics,
       });
       await recordAudit(effectiveVaultPath, {
-        tool: "sovereign_negotiate_handoff",
+        tool: "minni_negotiate_handoff",
         summary: `routed-to-ping: ${task.slice(0, 100)}`,
         details: {
           agent: fromAgent,
@@ -721,7 +721,7 @@ server.registerTool(
       return textResult(
         JSON.stringify(
           {
-            routed_to: "sovereign_ping_agent_request",
+            routed_to: "minni_ping_agent_request",
             reason:
               "Direct handoff is for work-transfer packets. Information requests require recipient approval.",
             request: ping,
@@ -780,7 +780,7 @@ server.registerTool(
       packet: handoffPacket,
     });
     await recordAudit(effectiveVaultPath, {
-      tool: "sovereign_negotiate_handoff",
+      tool: "minni_negotiate_handoff",
       summary: task.slice(0, 120),
       details: {
         agent: packet.agentOrigin,
@@ -803,7 +803,7 @@ server.registerTool(
 );
 
 server.registerTool(
-  "sovereign_ping_agent_request",
+  "minni_ping_agent_request",
   {
     title: "Sovereign Ping Agent Request",
     description:
@@ -838,7 +838,7 @@ server.registerTool(
 );
 
 server.registerTool(
-  "sovereign_ping_agent_inbox",
+  "minni_ping_agent_inbox",
   {
     title: "Sovereign Ping Agent Inbox",
     description:
@@ -854,7 +854,7 @@ server.registerTool(
 );
 
 server.registerTool(
-  "sovereign_ping_agent_decide",
+  "minni_ping_agent_decide",
   {
     title: "Sovereign Ping Agent Decide",
     description:
@@ -878,7 +878,7 @@ server.registerTool(
 );
 
 server.registerTool(
-  "sovereign_ping_agent_status",
+  "minni_ping_agent_status",
   {
     title: "Sovereign Ping Agent Status",
     description:
@@ -894,7 +894,7 @@ server.registerTool(
 );
 
 server.registerTool(
-  "sovereign_ack_handoff",
+  "minni_ack_handoff",
   {
     title: "Sovereign Ack Handoff",
     description: "Accept or reject a leased handoff with a structured status.",
@@ -916,7 +916,7 @@ server.registerTool(
 );
 
 server.registerTool(
-  "sovereign_list_pending_handoffs",
+  "minni_list_pending_handoffs",
   {
     title: "Sovereign List Pending Handoffs",
     description: "List unacked handoff leases addressed to an agent.",
@@ -931,7 +931,7 @@ server.registerTool(
 );
 
 server.registerTool(
-  "sovereign_await_handoff",
+  "minni_await_handoff",
   {
     title: "Sovereign Await Handoff",
     description: "Wait briefly for a handoff lease to be acked.",
@@ -947,7 +947,7 @@ server.registerTool(
 );
 
 server.registerTool(
-  "sovereign_subscribe_contradictions",
+  "minni_subscribe_contradictions",
   {
     title: "Sovereign Subscribe Contradictions",
     description:
