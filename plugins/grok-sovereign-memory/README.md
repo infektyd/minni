@@ -1,9 +1,9 @@
-# grok-sovereign-memory — Grok Build Session Hook Integration
+# grok-minni — Grok Build Session Hook Integration
 
-Grok Build session hook delivery surface for the canonical Sovereign Memory Delivery Layer.
+Grok Build session hook delivery surface for the canonical Minni Delivery Layer.
 
 See:
-- `~/.agents/skills/sovereign-memory/SKILL.md` (the rich portable mental model, reflexes, ritual, Layer 1 contract, team patterns, etc.)
+- `~/.agents/skills/minni/SKILL.md` (the rich portable mental model, reflexes, ritual, Layer 1 contract, team patterns, etc.)
 - `~/.agents/artifacts/sovereign-distill-ritual-v1/` (gauges schema, DESIGN, notes, including the agnostic-vs-grok-specific boundary)
 - `~/.agents/DESIGN-sovereign-delivery-layer.md` (authoritative adapter contract, verification matrix, how to add new surfaces, Grok Build V1 as the worked reference)
 
@@ -13,7 +13,7 @@ This plugin contains **only**:
 - `.mcp.json` (via `~/.agents/bin/mcp-env-run` + grok-build stamp)
 - Local DESIGN docs for Grok TUI mechanics only
 
-**Do not edit the shared sovereign source** unless contributing a proper upstream surface. All portable changes land in the canonical `~/.agents/` locations first.
+**Do not edit the shared minni source** unless contributing a proper upstream surface. All portable changes land in the canonical `~/.agents/` locations first.
 
 Installed for Grok Build. Agent: grok-build. Layer 1 seeded via canonical sm-propagation.
 

@@ -2,7 +2,7 @@
 description: Build a compact task packet — ranked vault sources, daemon recall, constraints, risks — before tackling complex work.
 ---
 
-Call `sovereign_prepare_task` with:
+Call `minni_prepare_task` with:
 - `task`: $ARGUMENTS
 - `agentId`: `kilocode`
 - `profile`: `standard` (use `compact` for quick tasks, `deep` for architecture work)
