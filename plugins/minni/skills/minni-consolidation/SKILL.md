@@ -103,7 +103,7 @@ patch(
 
 **Symptom in `~/.hermes/logs/session-extract.err`:**
 ```
-File "/Users/hansaxelsson/.hermes/scripts/session-extract.py", line 220, in <module>
+File "~/.hermes/scripts/session-extract.py", line 220, in <module>
     def run_gemma_extraction(text: str) -> dict | None:
 TypeError: unsupported operand type(s) for |: 'type' and 'NoneType'
 ```
@@ -124,7 +124,7 @@ which python3 && python3 --version        # shows 3.13/3.11 interactively
 
 1. **Pin shebang to venv python (direct-exec path):**
    ```python
-   #!/Users/hansaxelsson/.hermes/hermes-agent/venv/bin/python3
+   #!~/.hermes/hermes-agent/venv/bin/python3
    ```
    Avoids `#!/usr/bin/env python3` which is subject to PATH order.
 

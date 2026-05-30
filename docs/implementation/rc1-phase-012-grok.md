@@ -1,6 +1,6 @@
 # RC1 Phase 0/1/2 Implementation — Grok (bc21160a)
 
-**Worktree:** `/Users/hansaxelsson/Projects/sovereignMemory/grok/worktrees/rc1-phase-012` (branch `rc1-phase-012`)
+**Worktree:** `~/Projects/sovereignMemory/grok/worktrees/rc1-phase-012` (branch `rc1-phase-012`)
 **Date:** 2026-05-19
 **Source of truth:** `docs/RC_PLAN.md` (full read), `SECURITY_PLAN.md`, `docs/contracts/AGENT.md`, `grok/package/PHASE_012_IMPLEMENT_PROMPT.md`
 

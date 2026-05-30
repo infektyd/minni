@@ -69,7 +69,7 @@ claude plugin marketplace remove sovereign-memory
 
 # 3. Add the new marketplace from the canonical repo path.
 #    Reads <repo>/.claude-plugin/marketplace.json → name "minni".
-claude plugin marketplace add /Users/hansaxelsson/Projects/Minni
+claude plugin marketplace add ~/Projects/Minni
 
 # 4. Install the new identity. Form is <plugin>@<marketplace>.
 claude plugin install minni@minni

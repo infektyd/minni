@@ -81,7 +81,7 @@ Cut over **one platform at a time**, aliases stay live as the net:
 - **Repo config:** `plugins/grok-sovereign-memory/.mcp.json` → becomes `plugins/grok-minni/` (separate plugin from the main one).
 - **Current (verified) — the disease:**
   - `.mcp.json` sets `SOVEREIGN_WORKSPACE_ID=~/Projects/sovereignMemory` (STALE), `SOVEREIGN_VAULT_PATH=~/.sovereign-memory/grok-build-vault`, `SOVEREIGN_SOCKET_PATH=~/.sovereign-memory/run/sovrd.sock`, runs via `~/.agents/bin/mcp-env-run sovereign-memory`.
-  - `~/.sovereign-memory/identities/grok-build/GROK-BUILD_HOSTED_AGENT_ENVELOPE.md` also hardcodes `workspace: /Users/hansaxelsson/Projects/sovereignMemory`.
+  - `~/.sovereign-memory/identities/grok-build/GROK-BUILD_HOSTED_AGENT_ENVELOPE.md` also hardcodes `workspace: ~/Projects/sovereignMemory`.
 - **Change:** rewrite BOTH the `.mcp.json` workspace pointer AND the identity envelope `workspace:` to the anchor `~/Projects/minni`; canonical env rename; point `mcp-env-run` at `minni`.
 - **⚠️ Live verify:** what "symlinked into claude code DB" actually is — confirmed so far as shared daemon socket + stale workspace pointers, **no real symlink found**. Re-confirm at cutover.
 - **Verify:** grok-build recall/learn round-trip on `~/.minni/grok-build-vault`; `grep -r sovereignMemory` over grok config returns nothing.

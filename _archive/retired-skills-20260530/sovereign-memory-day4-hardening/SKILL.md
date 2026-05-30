@@ -143,11 +143,11 @@ SELECT COUNT(*) FROM documents WHERE agent = 'identity:hermes';
     <string>com.openclaw.sovrd</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/hansaxelsson/.openclaw/sovereign-memory-v3.1/venv/bin/python</string>
-        <string>/Users/hansaxelsson/.openclaw/plugins/sovereign-memory/sovrd.py</string>
+        <string>~/.openclaw/sovereign-memory-v3.1/venv/bin/python</string>
+        <string>~/.openclaw/plugins/sovereign-memory/sovrd.py</string>
     </array>
     <key>WorkingDirectory</key>
-    <string>/Users/hansaxelsson/.openclaw/plugins/sovereign-memory</string>
+    <string>~/.openclaw/plugins/sovereign-memory</string>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
@@ -158,15 +158,15 @@ SELECT COUNT(*) FROM documents WHERE agent = 'identity:hermes';
     <key>ThrottleInterval</key>
     <integer>10</integer>
     <key>StandardOutPath</key>
-    <string>/Users/hansaxelsson/Library/Logs/sovrd.out.log</string>
+    <string>~/Library/Logs/sovrd.out.log</string>
     <key>StandardErrorPath</key>
-    <string>/Users/hansaxelsson/Library/Logs/sovrd.err.log</string>
+    <string>~/Library/Logs/sovrd.err.log</string>
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
         <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
         <key>PYTHONPATH</key>
-        <string>/Users/hansaxelsson/.openclaw/plugins/sovereign-memory/src</string>
+        <string>~/.openclaw/plugins/sovereign-memory/src</string>
     </dict>
 </dict>
 </plist>

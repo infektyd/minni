@@ -42,14 +42,14 @@
 
 - [ ] **Step 1: Confirm branch**
 
-Run: `cd /Users/hansaxelsson/Projects/Minni && git branch --show-current`
+Run: `cd ~/Projects/Minni && git branch --show-current`
 Expected: `rebrand/minni-deep-rename`
 
 - [ ] **Step 2: Capture the full sovereign reference inventory as a baseline**
 
 Run:
 ```bash
-cd /Users/hansaxelsson/Projects/Minni
+cd ~/Projects/Minni
 rg -n "sovereign" --glob '!node_modules' --glob '!venv' --glob '!.venv' --glob '!dist' --glob '!.git' --glob '!_archive' --glob '!_cleanup-quarantine' --glob '!package-lock.json' > docs/migration/minni-p1-inventory.txt
 wc -l docs/migration/minni-p1-inventory.txt
 ```
@@ -59,7 +59,7 @@ Expected: a few hundred lines. This is the audit baseline.
 
 Run:
 ```bash
-cd /Users/hansaxelsson/Projects/Minni
+cd ~/Projects/Minni
 rg -n "mcp__sovereign-memory__|sovereign_recall|sovereign_learn|sovereign_vault_write|SOVEREIGN_[A-Z_]+|\.sovereign-memory/|\"sovereign-memory\":" --glob '!node_modules' --glob '!dist' | tee docs/migration/minni-p1-protected.txt | wc -l
 ```
 Expected: a list of protected references. These stay untouched in P1.
@@ -67,7 +67,7 @@ Expected: a list of protected references. These stay untouched in P1.
 - [ ] **Step 4: Commit the inventory as evidence**
 
 ```bash
-cd /Users/hansaxelsson/Projects/Minni
+cd ~/Projects/Minni
 git add docs/migration/minni-p1-inventory.txt docs/migration/minni-p1-protected.txt
 git commit -m "chore(minni-p1): capture rename inventory + protected-string baseline"
 ```
@@ -83,7 +83,7 @@ git commit -m "chore(minni-p1): capture rename inventory + protected-string base
 
 Run:
 ```bash
-cd /Users/hansaxelsson/Projects/Minni
+cd ~/Projects/Minni
 git mv plugins/sovereign-memory plugins/minni
 ```
 
@@ -91,7 +91,7 @@ git mv plugins/sovereign-memory plugins/minni
 
 Run:
 ```bash
-cd /Users/hansaxelsson/Projects/Minni
+cd ~/Projects/Minni
 rg -n "plugins/minni" --glob '!node_modules' --glob '!dist' --glob '!.git'
 ```
 Expected: a list of manifest/doc references (marketplace.json source paths, README, etc.) — fix these in the next steps. Note them.
@@ -105,7 +105,7 @@ In `.agents/plugins/marketplace.json` change `"path": "./plugins/minni"` → `".
 
 Run:
 ```bash
-cd /Users/hansaxelsson/Projects/Minni
+cd ~/Projects/Minni
 rg -n "plugins/minni" --glob '!node_modules' --glob '!dist' --glob '!.git' --glob '!docs/migration/minni-p1-inventory.txt'
 ```
 Expected: no output (empty). If lines remain, fix them.
@@ -113,7 +113,7 @@ Expected: no output (empty). If lines remain, fix them.
 - [ ] **Step 5: Commit**
 
 ```bash
-cd /Users/hansaxelsson/Projects/Minni
+cd ~/Projects/Minni
 git add -A
 git commit -m "refactor(minni-p1): rename plugins/sovereign-memory -> plugins/minni + fix install-source paths"
 ```
@@ -133,7 +133,7 @@ In `plugins/minni/package.json` change `"name": "sovereign-memory-multi-plugin"`
 
 Run:
 ```bash
-cd /Users/hansaxelsson/Projects/Minni/plugins/sovereign-memory
+cd ~/Projects/Minni/plugins/sovereign-memory
 npm run build:server 2>&1 | tail -20
 ```
 Expected: TypeScript compiles, exit 0. (This proves the dir rename + package edit didn't break the build. We build only the server, not the frontend, to keep it fast.)
@@ -141,7 +141,7 @@ Expected: TypeScript compiles, exit 0. (This proves the dir rename + package edi
 - [ ] **Step 3: Commit**
 
 ```bash
-cd /Users/hansaxelsson/Projects/Minni
+cd ~/Projects/Minni
 git add plugins/minni/package.json
 git commit -m "refactor(minni-p1): rename npm package sovereign-memory-multi-plugin -> minni-multi-plugin"
 ```
@@ -175,7 +175,7 @@ Change `description`, `owner.name`/`author.name` "Sovereign Memory" → "Minni",
 
 Run:
 ```bash
-cd /Users/hansaxelsson/Projects/Minni
+cd ~/Projects/Minni
 rg -n '"name": *"sovereign-memory"|"sovereign-memory":|mcp__sovereign-memory__' .claude-plugin .agents plugins/minni/.claude-plugin plugins/minni/.mcp.json
 ```
 Expected: the `name`/`mcpServers`-key/namespace lines STILL present (we intentionally kept them). If any disappeared, restore — they belong to P2.
@@ -183,7 +183,7 @@ Expected: the `name`/`mcpServers`-key/namespace lines STILL present (we intentio
 - [ ] **Step 6: Commit**
 
 ```bash
-cd /Users/hansaxelsson/Projects/Minni
+cd ~/Projects/Minni
 git add .claude-plugin .agents/plugins/marketplace.json plugins/minni/.claude-plugin
 git commit -m "refactor(minni-p1): rebrand human-facing strings in plugin manifests (identifiers untouched)"
 ```
@@ -199,7 +199,7 @@ git commit -m "refactor(minni-p1): rebrand human-facing strings in plugin manife
 
 Run:
 ```bash
-cd /Users/hansaxelsson/Projects/Minni
+cd ~/Projects/Minni
 rg -ln "Sovereign Memory" README.md AGENTS.md DESIGN.md SECURITY_PLAN.md docs/*.md
 ```
 Expected: a file list. Review each.
@@ -210,7 +210,7 @@ For each file, replace the human-readable brand phrase "Sovereign Memory" → "M
 
 Apply per file:
 ```bash
-cd /Users/hansaxelsson/Projects/Minni
+cd ~/Projects/Minni
 # Review-then-apply: do NOT blind-sed paths/identifiers. Edit each file deliberately.
 ```
 
@@ -218,7 +218,7 @@ cd /Users/hansaxelsson/Projects/Minni
 
 Run:
 ```bash
-cd /Users/hansaxelsson/Projects/Minni
+cd ~/Projects/Minni
 rg -c "mcp__sovereign-memory__|~/.sovereign-memory|sovereign_recall|SOVEREIGN_" README.md AGENTS.md DESIGN.md SECURITY_PLAN.md docs/CANONICAL-PATHS.md 2>/dev/null
 ```
 Expected: counts > 0 wherever those identifiers were legitimately documented (they should still be present, now framed as "current runtime name, rename in progress").
@@ -227,7 +227,7 @@ Expected: counts > 0 wherever those identifiers were legitimately documented (th
 
 Run:
 ```bash
-cd /Users/hansaxelsson/Projects/Minni
+cd ~/Projects/Minni
 bash scripts/check-public-boundary.sh 2>&1 | tail -20
 ```
 Expected: pass (exit 0). If it flags the operator's real name in the `plugin.json` author block, replace that name field with the project handle (`infektyd` / `relayBit`) to satisfy the guard.
@@ -235,7 +235,7 @@ Expected: pass (exit 0). If it flags the operator's real name in the `plugin.jso
 - [ ] **Step 5: Commit**
 
 ```bash
-cd /Users/hansaxelsson/Projects/Minni
+cd ~/Projects/Minni
 git add -A
 git commit -m "docs(minni-p1): rebrand Sovereign Memory -> Minni in top-level docs (paths/identifiers preserved)"
 ```
@@ -248,7 +248,7 @@ git commit -m "docs(minni-p1): rebrand Sovereign Memory -> Minni in top-level do
 
 Run:
 ```bash
-cd /Users/hansaxelsson/Projects/Minni/plugins/sovereign-memory
+cd ~/Projects/Minni/plugins/sovereign-memory
 npm run build:server 2>&1 | tail -10
 ```
 Expected: exit 0.
@@ -257,7 +257,7 @@ Expected: exit 0.
 
 Run:
 ```bash
-cd /Users/hansaxelsson/Projects/Minni/plugins/sovereign-memory
+cd ~/Projects/Minni/plugins/sovereign-memory
 npm test 2>&1 | tail -30
 ```
 Expected: tests pass (or the same pre-existing failures as on `main` — diff against a baseline run if unsure). Record any failures; do not claim green if red.
@@ -266,7 +266,7 @@ Expected: tests pass (or the same pre-existing failures as on `main` — diff ag
 
 Run:
 ```bash
-cd /Users/hansaxelsson/Projects/Minni
+cd ~/Projects/Minni
 echo "MCP namespace refs:"; rg -c "mcp__sovereign-memory__" --glob '!dist' --glob '!node_modules' | wc -l
 echo "tool verb refs:";    rg -c "sovereign_recall|sovereign_learn" --glob '!dist' --glob '!node_modules' | wc -l
 echo "vault path refs:";   rg -c "\.sovereign-memory/" --glob '!dist' --glob '!node_modules' | wc -l
@@ -277,7 +277,7 @@ Expected: all still non-zero — confirming P1 did NOT prematurely rename couple
 
 Run:
 ```bash
-cd /Users/hansaxelsson/Projects/Minni
+cd ~/Projects/Minni
 git log --oneline rebrand/minni-deep-rename...main
 git diff --stat main...rebrand/minni-deep-rename
 ```

@@ -2,6 +2,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { execFile } from "node:child_process";
 import { access, readdir, readFile, stat } from "node:fs/promises";
 import path from "node:path";
+import os from "node:os";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { DEFAULT_VAULT_PATH, PLUGIN_ROOT } from "./config.js";
@@ -12,7 +13,7 @@ import { auditTail } from "./vault.js";
 const MAX_JSON_BYTES = 256 * 1024;
 const DEFAULT_UI_HOST = process.env.MINNI_UI_HOST ?? "127.0.0.1";
 const DEFAULT_UI_PORT = Number(process.env.MINNI_UI_PORT ?? "8765");
-const DEFAULT_DEEP_RESEARCH_ROOT = process.env.DEEP_RESEARCH_AGENT_ROOT ?? "/Users/hansaxelsson/deep-research-agent";
+const DEFAULT_DEEP_RESEARCH_ROOT = process.env.DEEP_RESEARCH_AGENT_ROOT ?? path.join(os.homedir(), "deep-research-agent");
 const DEFAULT_DEEP_RESEARCH_CLI =
   process.env.DEEP_RESEARCH_CLI ?? path.join(DEFAULT_DEEP_RESEARCH_ROOT, ".venv", "bin", "deep-research");
 const DEFAULT_DEEP_RESEARCH_PYTHON =

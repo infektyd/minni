@@ -1,7 +1,7 @@
 You are continuing the multi-phase Sovereign Memory Delivery Layer Generalization work from the approved canonical plan.
 
 **Approved Plan Location (read this first in detail)**:
-`/Users/hansaxelsson/.grok/sessions/%2FUsers%2Fhansaxelsson/019e4568-e93c-7ae1-8a9e-ef0fd1b9a08b/plan.md`
+`~/.grok/sessions/%2FUsers%2Fhansaxelsson/019e4568-e93c-7ae1-8a9e-ef0fd1b9a08b/plan.md`
 
 **Current State Snapshot (as of 2026-05-20)**:
 - Phase 0 (general ~/.agents SSoT hygiene + propagate.py diff review) is COMPLETE. The two propagate.py copies were identical; Gemini's changes are unified. System hygiene rule applied fleet-wide.

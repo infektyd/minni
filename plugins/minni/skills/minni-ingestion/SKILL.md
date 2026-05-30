@@ -134,7 +134,7 @@ Output files use this convention:
 - Strip leading `_` if present, prepend `_` for consistency with existing files
 - Single `.md` extension (NOT `.md.md` — avoid appending `.md` to paths that already end in `.md`)
 
-Example: `/Users/hansaxelsson/.hermes/hermes-agent/foundation_models_research.md` → `_Users_hansaxelsson_.hermes_hermes-agent_foundation_models_research.md`
+Example: `~/.hermes/hermes-agent/foundation_models_research.md` → `_Users_hansaxelsson_.hermes_hermes-agent_foundation_models_research.md`
 
 ```python
 name = filepath.replace('/', '_')
