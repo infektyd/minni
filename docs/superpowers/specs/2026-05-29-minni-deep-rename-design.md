@@ -17,7 +17,7 @@ The earlier "identity-only" decision left the friction fully in place (every run
 
 ## 2. Constraints & Hard Facts (verified 2026-05-29)
 
-- **The daemon is LIVE.** `~/.sovereign-memory/sovereign_memory.db-wal` is actively growing. Any vault/DB operation must assume concurrent writes → backup-first, copy+verify, never blind move.
+- **The daemon is LIVE.** `~/.sovereign-memory/sovereign_memory.db-wal` is actively growing. Operator authorized taking the daemon DOWN for the migration (2026-05-29), so P3 runs against a quiescent snapshot — backup-first, copy+verify, never blind move; downtime is acceptable.
 - **Blast radius:** ~226 repo files reference `sovereign` (excluding node_modules/venv/dist/archives). Heaviest: `plugins/sovereign-memory/` (68 files), `docs/` (many plans/contracts), `engine/`, `openclaw-extension/`.
 - **7 live vaults** under `~/.sovereign-memory/`: `claudecode-vault`, `codex-vault`, `gemini-vault`, `grok-beta-vault`, `grok-build-vault`, `kilocode-vault`, plus `identities/`, `learnings/`, `faiss/`, `principals/`, `run/` (socket), and `sovereign_memory.db`.
 - **5 agent platforms** consume the MCP namespace `mcp__sovereign-memory__*`: Claude Code, Codex, Kilocode, Grok-build, Gemini/Antigravity.
@@ -53,7 +53,7 @@ Nothing breaks mid-migration because `sovereign` keeps resolving until explicitl
 
 - **P1 — Repo-internal rename** (in-git only, daemon untouched): plugin folder, in-repo code identifiers, skill IDs, docs, brand strings. Add `sovereign-memory:*` skill shims. Fully reversible via git.
 - **P2 — Daemon dual-naming**: daemon serves `minni_*` as aliases of `sovereign_*`, registers the `minni` MCP server alongside `sovereign-memory`, reads `MINNI_*` then `SOVEREIGN_*`. No data moves. Verify both namespaces answer identically.
-- **P3 — Vault migration**: backup → copy `~/.sovereign-memory` → `~/.minni` → checksum-verify → repoint daemon → swap old path to a symlink. DB file rename deferred to P6 if risky.
+- **P3 — Vault migration** (daemon DOWN — operator authorized downtime 2026-05-29): stop `sovrd` → `git status`/checkpoint the WAL → backup → copy `~/.sovereign-memory` → `~/.minni` → checksum-verify every vault/DB → repoint config to `~/.minni` → symlink old path → restart daemon on `~/.minni` → verify recall/learn. Quiescent snapshot beats a live copy; DB filename rename can safely happen here while stopped.
 - **P4 — Per-platform reconfig + repair** (one at a time, spec is the source of truth — not any platform's config): Gemini/Antigravity first (verify, good-not-gold), then audit+repair Claude Code, Codex, Kilocode, Grok-build. Grok-build also gets its stale `~/Projects/sovereignMemory` pointers fixed. Each independently verified via a recall/learn round-trip; aliases stay live as the net.
 - **P5 — Skills audit**: classify each of the 10 plugin skills + `sm-propagation` as **keep / merge / retire** vs. what the plugin's MCP tools + commands already surface. Propose, don't auto-act. (Flag only: consolidation scripts still assume `~/.hermes` + Mac MLX — deferred backend work.)
 - **P6 — Deprecation** (decided here, not now): delete the `sovereign` aliases for a clean minni-only state, or keep them as a permanent net.
