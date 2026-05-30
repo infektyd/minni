@@ -1,5 +1,5 @@
 """
-Sovereign Memory — Rationale Generator.
+Minni — Rationale Generator.
 
 PR-2: explain(result_record) -> str
 

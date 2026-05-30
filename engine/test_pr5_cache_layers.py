@@ -17,7 +17,7 @@ def setup_hermetic_principals(tmp_path, monkeypatch):
     through the real principal resolution logic.
     """
     import principal
-    import sovrd
+    import minnid
     import json
 
     pdir = tmp_path / "principals"
@@ -43,7 +43,7 @@ def setup_hermetic_principals(tmp_path, monkeypatch):
         )
 
     monkeypatch.setattr(principal, "resolve_effective_principal", _patched_resolve)
-    monkeypatch.setattr(sovrd, "resolve_effective_principal", _patched_resolve)
+    monkeypatch.setattr(minnid, "resolve_effective_principal", _patched_resolve)
 
 
 
@@ -308,8 +308,8 @@ def test_chronological_mode_orders_by_created_time_and_filters_dates(tmp_path):
     assert [os.path.basename(r["source"]) for r in results] == ["second.md", "third.md"]
 
 
-def test_sovrd_search_forwards_layer_sort_and_dates(monkeypatch):
-    import sovrd
+def test_minnid_search_forwards_layer_sort_and_dates(monkeypatch):
+    import minnid
 
     captured = {}
 
@@ -318,9 +318,9 @@ def test_sovrd_search_forwards_layer_sort_and_dates(monkeypatch):
             captured.update(kwargs)
             return [{"source": "ok"}]
 
-    monkeypatch.setattr(sovrd, "_lazy_retrieval", lambda: FakeEngine())
+    monkeypatch.setattr(minnid, "_lazy_retrieval", lambda: FakeEngine())
 
-    resp = sovrd._handle_search({
+    resp = minnid._handle_search({
         "query": "q",
         "agent_id": "main",
         "layers": ["identity"],

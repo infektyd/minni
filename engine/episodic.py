@@ -1,5 +1,5 @@
 """
-Sovereign Memory V3.1 — Episodic Memory.
+Minni V3.1 — Episodic Memory.
 
 V3.1 changes:
 - Removed all compression references (no TurboQuant anywhere)

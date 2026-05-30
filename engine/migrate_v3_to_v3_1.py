@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Migrate Sovereign Memory V3 → V3.1.
+Migrate Minni V3 → V3.1.
 
 What this does:
 1. Adds new tables (learnings, learnings_fts) and columns (heading_context)

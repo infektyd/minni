@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Seed identity (Layer 1) for OpenClaw agents into Sovereign Memory.
+Seed identity (Layer 1) for OpenClaw agents into Minni.
 
 Reads SOUL.md and IDENTITY.md from canonical disk locations and writes them
 into the sovereign_memory.db documents/chunk_embeddings tables as whole

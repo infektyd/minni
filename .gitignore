@@ -167,3 +167,6 @@ Thumbs.db
 !.env.template
 
 
+
+# sovereign skill scripts kept private (model-backend dependent; not for public repo)
+plugins/minni/skills/*/scripts/

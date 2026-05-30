@@ -1,5 +1,5 @@
 """
-Sovereign Memory V3.1 — Vault Indexer.
+Minni V3.1 — Vault Indexer.
 
 V3.1 changes over V3:
 1. Markdown-aware chunking (via chunker.py) instead of blind word-count splitting

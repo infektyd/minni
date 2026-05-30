@@ -1,4 +1,4 @@
-"""Read-only vault/wiki hygiene checks for Sovereign Memory.
+"""Read-only vault/wiki hygiene checks for Minni.
 
 The checker writes a Markdown report plus JSON summary under ``logs/`` in the
 target vault. It does not modify wiki pages, indexes, or SQLite state.
@@ -214,7 +214,7 @@ def run_hygiene_report(vault: str | Path) -> dict:
     }
 
     lines = [
-        f"# Sovereign Memory Hygiene Report - {today}",
+        f"# Minni Hygiene Report - {today}",
         "",
         f"Vault: `{vault}`",
         "",

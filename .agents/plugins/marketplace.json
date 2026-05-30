@@ -1,14 +1,14 @@
 {
-  "name": "sovereign-memory",
+  "name": "minni",
   "interface": {
-    "displayName": "Sovereign Memory"
+    "displayName": "Minni"
   },
   "plugins": [
     {
-      "name": "sovereign-memory",
+      "name": "minni",
       "source": {
         "source": "local",
-        "path": "./plugins/sovereign-memory"
+        "path": "./plugins/minni"
       },
       "policy": {
         "installation": "AVAILABLE",

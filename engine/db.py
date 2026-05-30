@@ -1,5 +1,5 @@
 """
-Sovereign Memory V3.1 — Database Layer.
+Minni V3.1 — Database Layer.
 
 V3.1 changes:
 - Removed 'compressed' and 'norm' columns from chunk_embeddings (no more compression)

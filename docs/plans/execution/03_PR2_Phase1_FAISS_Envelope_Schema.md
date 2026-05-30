@@ -73,7 +73,7 @@
 | **MODIFY** | `engine/wiki_indexer.py` | Read frontmatter. Reject invalid pages (log to `log.md`, exclude from index). |
 | **MODIFY** | `engine/indexer.py` | Honor `status` and `privacy`. Skip `blocked` pages. |
 | **MODIFY** | `engine/retrieval.py` | Default skip `superseded`/`rejected`. Add `include_superseded`, `include_rejected`, `include_drafts` flags. |
-| **MODIFY** | `plugins/sovereign-memory/src/vault.ts` | `writeVaultPage()` accepts `{type, status, privacy, sources, expires, supersededBy}`. Defaults: type from section, status `candidate`, privacy `safe`. |
+| **MODIFY** | `plugins/minni/src/vault.ts` | `writeVaultPage()` accepts `{type, status, privacy, sources, expires, supersededBy}`. Defaults: type from section, status `candidate`, privacy `safe`. |
 | **MODIFY** | `engine/seed_identity.py` | Ensure new dirs: `wiki/procedures/`, `wiki/artifacts/`, `wiki/handoffs/`. |
 
 ### Back-fill: Pages >30 days with sources → `accepted`. Without sources → `draft`. Emit hygiene report.

@@ -1,0 +1,52 @@
+{
+  "name": "minni",
+  "version": "0.1.0",
+  "description": "Local-first Minni spine for KiloCode: automatic recall, vault-first learning, agent-to-agent handoff, and continuity across sessions.",
+  "author": {
+    "name": "Infektyd",
+    "email": "local@localhost",
+    "url": "https://github.com/infektyd"
+  },
+  "homepage": "https://github.com/infektyd/minni",
+  "repository": "https://github.com/infektyd/minni",
+  "license": "MIT",
+  "keywords": [
+    "minni",
+    "obsidian",
+    "llm-wiki",
+    "local-first",
+    "mcp",
+    "spine"
+  ],
+  "mcpServers": {
+    "minni": {
+      "command": "node",
+      "args": ["${KILO_PLUGIN_ROOT}/../dist/server.js"],
+      "cwd": "${KILO_PLUGIN_ROOT}/.."
+    }
+  },
+  "skills": "./skills/",
+  "hooks": "./hooks/hooks.json",
+  "interface": {
+    "displayName": "Minni",
+    "shortDescription": "Local recall and KiloCode-owned Obsidian memory",
+    "longDescription": "Minni gives KiloCode transparent local recall, manual vault-first learning, and readable audit logs through a local MCP server. It talks to the existing Sovereign daemon and keeps expensive extraction out of v1.",
+    "developerName": "Infektyd",
+    "category": "Coding",
+    "capabilities": [
+      "Interactive",
+      "Read",
+      "Write"
+    ],
+    "websiteURL": "https://github.com/infektyd/minni",
+    "privacyPolicyURL": "https://github.com/infektyd/minni",
+    "termsOfServiceURL": "https://github.com/infektyd/minni",
+    "defaultPrompt": [
+      "Recall Minni for this task",
+      "Learn this in the KiloCode vault",
+      "Show recent Minni audit logs"
+    ],
+    "brandColor": "#2563EB",
+    "screenshots": []
+  }
+}

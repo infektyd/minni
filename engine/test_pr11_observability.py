@@ -15,7 +15,7 @@ def setup_hermetic_principals(tmp_path, monkeypatch):
     through the real principal resolution logic.
     """
     import principal
-    import sovrd
+    import minnid
 
     pdir = tmp_path / "principals"
     pdir.mkdir(exist_ok=True)
@@ -40,7 +40,7 @@ def setup_hermetic_principals(tmp_path, monkeypatch):
         )
 
     monkeypatch.setattr(principal, "resolve_effective_principal", _patched_resolve)
-    monkeypatch.setattr(sovrd, "resolve_effective_principal", _patched_resolve)
+    monkeypatch.setattr(minnid, "resolve_effective_principal", _patched_resolve)
 
 
 
@@ -117,18 +117,18 @@ def test_writeback_learning_with_evidence_adds_derived_from_edges(tmp_path, monk
     assert edge is not None
 
 
-def test_sovrd_learn_with_evidence_adds_derived_from_edges(tmp_path, monkeypatch):
-    import sovrd
+def test_minnid_learn_with_evidence_adds_derived_from_edges(tmp_path, monkeypatch):
+    import minnid
     import writeback as wb_mod
     from writeback import WriteBackMemory
 
     db_obj, cfg = _make_db(tmp_path)
     evidence_id = _seed_doc(db_obj)
-    monkeypatch.setattr(sovrd, "_writeback", WriteBackMemory(db_obj, cfg))
+    monkeypatch.setattr(minnid, "_writeback", WriteBackMemory(db_obj, cfg))
     original_prop = wb_mod.WriteBackMemory.model.fget
     wb_mod.WriteBackMemory.model = property(lambda self: None)
     try:
-        resp = sovrd._dispatch_sync(
+        resp = minnid._dispatch_sync(
             {
                 "jsonrpc": "2.0",
                 "id": 1,
@@ -161,14 +161,14 @@ def test_sovrd_learn_with_evidence_adds_derived_from_edges(tmp_path, monkeypatch
 
 
 def test_status_includes_latency_histograms(monkeypatch):
-    import sovrd
+    import minnid
 
-    monkeypatch.setattr(sovrd, "_request_count", 0)
-    monkeypatch.setattr(sovrd, "_latencies", {})
+    monkeypatch.setattr(minnid, "_request_count", 0)
+    monkeypatch.setattr(minnid, "_latencies", {})
     for value in (0.01, 0.02, 0.03, 0.04):
-        sovrd._record_latency("search", value)
+        minnid._record_latency("search", value)
 
-    result = sovrd._handle_status({}, 1)["result"]
+    result = minnid._handle_status({}, 1)["result"]
     latencies = result["daemon"]["latencies"]
     assert set(["search", "learn", "read", "embedding", "cross_encoder"]).issubset(latencies)
     assert latencies["search"]["count"] == 4
@@ -177,19 +177,19 @@ def test_status_includes_latency_histograms(monkeypatch):
 
 
 def test_status_reports_afm_provider_mode(monkeypatch):
-    import sovrd
+    import minnid
 
-    monkeypatch.setenv("SOVEREIGN_AFM_MODE", "off")
+    monkeypatch.setenv("MINNI_AFM_MODE", "off")
 
-    result = sovrd._handle_status({}, 1)["result"]
+    result = minnid._handle_status({}, 1)["result"]
 
     assert result["afm"]["mode"] == "off"
     assert result["afm"]["status"] == "off"
     assert result["afm"]["native_available"] in {True, False}
 
 
-def test_sovrd_read_includes_layer_1_identity_before_context(tmp_path, monkeypatch):
-    import sovrd
+def test_minnid_read_includes_layer_1_identity_before_context(tmp_path, monkeypatch):
+    import minnid
 
     db_obj, _cfg = _make_db(tmp_path)
     now = time.time()
@@ -219,9 +219,9 @@ def test_sovrd_read_includes_layer_1_identity_before_context(tmp_path, monkeypat
         )
         _seed_doc(db_obj, path="/wiki/context.md", agent="codex")
 
-    monkeypatch.setattr(sovrd, "SovereignDB", lambda: db_obj)
+    monkeypatch.setattr(minnid, "SovereignDB", lambda: db_obj)
 
-    resp = sovrd._handle_read({"agent_id": "codex", "limit": 5}, 1)
+    resp = minnid._handle_read({"agent_id": "codex", "limit": 5}, 1)
     context = resp["result"]["context"]
 
     assert "## Agent Identity: Codex" in context
@@ -231,10 +231,10 @@ def test_sovrd_read_includes_layer_1_identity_before_context(tmp_path, monkeypat
 
 
 def test_status_accepts_persisted_faiss_npz_cache(tmp_path, monkeypatch):
-    import sovrd
+    import minnid
     from config import SovereignConfig
 
-    db_path = tmp_path / "sovereign_memory.db"
+    db_path = tmp_path / "minni.db"
     faiss_dir = tmp_path / "faiss"
     faiss_dir.mkdir()
     (faiss_dir / "index.manifest.json").write_text(
@@ -249,9 +249,9 @@ def test_status_accepts_persisted_faiss_npz_cache(tmp_path, monkeypatch):
         graph_export_dir=str(tmp_path / "graphs"),
         faiss_index_path=str(tmp_path / "legacy.index"),
     )
-    monkeypatch.setattr(sovrd, "DEFAULT_CONFIG", cfg)
+    monkeypatch.setattr(minnid, "DEFAULT_CONFIG", cfg)
 
-    result = sovrd._handle_status({}, 1)["result"]
+    result = minnid._handle_status({}, 1)["result"]
 
     assert result["engine"]["faiss_ok"] is True
     assert result["engine"]["faiss_path"] == "[redacted]"  # RCM-009 redaction on status paths
@@ -261,9 +261,9 @@ def test_trace_redaction_applied_via_redact_value():
     """RCM-009: trace (and handoff) use _redact_value for payload; status uses explicit for its fields.
     Concrete shape check (symmetric to status redaction assert).
     """
-    import sovrd
-    from sovrd import _redact_value  # type: ignore
-    sample = {"socket_path": "/Users/secret/sovrd.sock", "db_path": "/tmp/secret.db", "text": "safe content"}
+    import minnid
+    from minnid import _redact_value  # type: ignore
+    sample = {"socket_path": "/Users/secret/minnid.sock", "db_path": "/tmp/secret.db", "text": "safe content"}
     redacted, _ = _redact_value(sample)
     # Redaction must mask sensitive paths (RCM-009; _redact_text uses [REDACTED_PATH] for local paths)
     red_str = str(redacted)
@@ -272,9 +272,9 @@ def test_trace_redaction_applied_via_redact_value():
 
 
 def test_python_format_recall_includes_backend_badge():
-    import sovrd
+    import minnid
 
-    formatted = sovrd.formatRecall(
+    formatted = minnid.formatRecall(
         "backend provenance",
         {"backend": "faiss-disk+qdrant", "results": "### result.md"},
     )
@@ -282,15 +282,15 @@ def test_python_format_recall_includes_backend_badge():
 
 
 def test_health_report_returns_required_fields(tmp_path, monkeypatch):
-    import sovrd
+    import minnid
     from writeback import WriteBackMemory
 
     db_obj, cfg = _make_db(tmp_path)
     _seed_doc(db_obj, path="/wiki/old.md")
-    monkeypatch.setattr(sovrd, "_writeback", WriteBackMemory(db_obj, cfg))
-    monkeypatch.setattr(sovrd, "DEFAULT_CONFIG", cfg)
+    monkeypatch.setattr(minnid, "_writeback", WriteBackMemory(db_obj, cfg))
+    monkeypatch.setattr(minnid, "DEFAULT_CONFIG", cfg)
 
-    resp = sovrd._dispatch_sync({"jsonrpc": "2.0", "id": 1, "method": "health_report", "params": {}})
+    resp = minnid._dispatch_sync({"jsonrpc": "2.0", "id": 1, "method": "health_report", "params": {}})
     assert "error" not in resp
     assert {
         "stale_docs",
@@ -329,8 +329,8 @@ def test_hygiene_report_clean_vault_has_zero_blocks(tmp_path):
     assert any((vault / "logs").glob("hygiene-*.md"))
 
 
-def test_sovrd_hygiene_report_returns_json_summary(tmp_path):
-    import sovrd
+def test_minnid_hygiene_report_returns_json_summary(tmp_path):
+    import minnid
 
     vault = tmp_path / "vault"
     (vault / "wiki").mkdir(parents=True)
@@ -338,7 +338,7 @@ def test_sovrd_hygiene_report_returns_json_summary(tmp_path):
     (vault / "index.md").write_text("", encoding="utf-8")
     (vault / "log.md").write_text("", encoding="utf-8")
 
-    resp = sovrd._dispatch_sync(
+    resp = minnid._dispatch_sync(
         {
             "jsonrpc": "2.0",
             "id": 1,

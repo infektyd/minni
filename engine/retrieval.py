@@ -1,5 +1,5 @@
 """
-Sovereign Memory V3.1 — Retrieval Engine.
+Minni V3.1 — Retrieval Engine.
 
 V3.1 changes over V3:
 1. FAISS-backed semantic search (not raw numpy loops)

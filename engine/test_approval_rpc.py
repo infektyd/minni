@@ -13,7 +13,7 @@ import pytest
 sys.path.insert(0, os.path.dirname(__file__))
 
 from principal import PRINCIPALS_DIR, resolve_effective_principal, is_operator_principal, EffectivePrincipal
-from sovrd import _resolve_candidate, _handle_learn
+from minnid import _resolve_candidate, _handle_learn
 
 
 def test_agent_cannot_self_resolve_operator_can(tmp_path, monkeypatch):

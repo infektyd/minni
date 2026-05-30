@@ -35,7 +35,7 @@ def setup_hermetic_principals(tmp_path, monkeypatch):
     through the real principal resolution logic.
     """
     import principal
-    import sovrd
+    import minnid
 
     pdir = tmp_path / "principals"
     pdir.mkdir(exist_ok=True)
@@ -60,7 +60,7 @@ def setup_hermetic_principals(tmp_path, monkeypatch):
         )
 
     monkeypatch.setattr(principal, "resolve_effective_principal", _patched_resolve)
-    monkeypatch.setattr(sovrd, "resolve_effective_principal", _patched_resolve)
+    monkeypatch.setattr(minnid, "resolve_effective_principal", _patched_resolve)
 
 
 
@@ -457,7 +457,7 @@ class TestHandleLearn:
 
     def _dispatch(self, method, params):
         """Invoke the JSON-RPC _dispatch function directly."""
-        from sovrd import _dispatch_sync as _dispatch
+        from minnid import _dispatch_sync as _dispatch
         resp = _dispatch({
             "jsonrpc": "2.0",
             "id": 1,
@@ -468,12 +468,12 @@ class TestHandleLearn:
 
     def _patch_writeback(self, tmp_path, monkeypatch):
         """Make the global _writeback singleton point at a fresh test DB."""
-        import sovrd
+        import minnid
         from writeback import WriteBackMemory
 
         db_obj, cfg = _make_db(tmp_path)
         wb = WriteBackMemory(db_obj, cfg)
-        monkeypatch.setattr(sovrd, "_writeback", wb)
+        monkeypatch.setattr(minnid, "_writeback", wb)
         return wb, db_obj, cfg
 
     def test_backward_compat_no_new_fields(self, tmp_path, monkeypatch):
@@ -663,7 +663,7 @@ class TestHandleLearn:
 class TestHandleResolveContradiction:
 
     def _dispatch(self, method, params):
-        from sovrd import _dispatch_sync as _dispatch
+        from minnid import _dispatch_sync as _dispatch
         return _dispatch({
             "jsonrpc": "2.0",
             "id": 1,
@@ -672,11 +672,11 @@ class TestHandleResolveContradiction:
         })
 
     def _patch_writeback(self, tmp_path, monkeypatch):
-        import sovrd
+        import minnid
         from writeback import WriteBackMemory
         db_obj, cfg = _make_db(tmp_path)
         wb = WriteBackMemory(db_obj, cfg)
-        monkeypatch.setattr(sovrd, "_writeback", wb)
+        monkeypatch.setattr(minnid, "_writeback", wb)
         return wb, db_obj, cfg
 
     def test_resolve_writes_new_and_supersedes_old(self, tmp_path, monkeypatch):
@@ -767,7 +767,7 @@ class TestHandleResolveContradiction:
             wb_mod.WriteBackMemory.model = property(lambda self: _ge())
 
         assert resolved["result"]["status"] == "ok"
-        subscribed = self._dispatch("sovereign_subscribe_contradictions", {
+        subscribed = self._dispatch("minni_subscribe_contradictions", {
             "agent_id": "codex",
             "since_ts": now - 1,
         })
@@ -901,12 +901,12 @@ class TestConfig:
 class TestExtractAssertion:
 
     def test_short_content_returned_as_is(self):
-        from sovrd import _extract_assertion
+        from minnid import _extract_assertion
         s = "Auth uses JWT."
         assert _extract_assertion(s) == s
 
     def test_long_content_returns_first_sentence(self):
-        from sovrd import _extract_assertion
+        from minnid import _extract_assertion
         # Make sure the string is longer than 120 chars so truncation triggers
         long = ("The auth system uses JWT tokens. " +
                 "This was decided in March 2026 after evaluating several alternatives including "
@@ -918,18 +918,18 @@ class TestExtractAssertion:
         assert "JWT" in result
 
     def test_exactly_120_chars_returned_as_is(self):
-        from sovrd import _extract_assertion
+        from minnid import _extract_assertion
         s = "x" * 120
         assert _extract_assertion(s) == s
 
     def test_no_sentence_terminator_truncates_at_120(self):
-        from sovrd import _extract_assertion
+        from minnid import _extract_assertion
         s = "x" * 200  # no sentence terminator
         result = _extract_assertion(s)
         assert len(result) <= 120
 
     def test_strips_whitespace(self):
-        from sovrd import _extract_assertion
+        from minnid import _extract_assertion
         s = "  Auth uses JWT.  "
         result = _extract_assertion(s)
         assert not result.startswith(" ")
@@ -946,7 +946,7 @@ class TestFullWorkflow:
     """
 
     def _dispatch(self, method, params):
-        from sovrd import _dispatch_sync as _dispatch
+        from minnid import _dispatch_sync as _dispatch
         return _dispatch({
             "jsonrpc": "2.0",
             "id": 1,
@@ -955,11 +955,11 @@ class TestFullWorkflow:
         })
 
     def _patch_writeback(self, tmp_path, monkeypatch):
-        import sovrd
+        import minnid
         from writeback import WriteBackMemory
         db_obj, cfg = _make_db(tmp_path)
         wb = WriteBackMemory(db_obj, cfg)
-        monkeypatch.setattr(sovrd, "_writeback", wb)
+        monkeypatch.setattr(minnid, "_writeback", wb)
         return wb, db_obj, cfg
 
     def test_seed_detect_resolve(self, tmp_path, monkeypatch):

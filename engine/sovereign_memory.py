@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Sovereign Memory V3.1 — Main Entry Point.
+Minni V3.1 — Main Entry Point.
 
 Usage:
     # Index everything (vault + wiki)

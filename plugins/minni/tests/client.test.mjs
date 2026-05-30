@@ -1,0 +1,166 @@
+import assert from "node:assert/strict";
+import { mkdtemp, rm } from "node:fs/promises";
+import net from "node:net";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import test from "node:test";
+
+import {
+  ackHandoff,
+  awaitHandoff,
+  buildStatusReport,
+  compileVault,
+  drillMemory,
+  exportContextPack,
+  formatRecall,
+  listPendingHandoffs,
+  parseSovrdJson,
+  subscribeContradictions,
+} from "../dist/sovereign.js";
+
+test("parseSovrdJson accepts healthy JSON responses", () => {
+  assert.deepEqual(parseSovrdJson('{"status":"ok","agent":"shared-daemon"}'), {
+    ok: true,
+    data: { status: "ok", agent: "shared-daemon" },
+  });
+});
+
+test("formatRecall returns concise markdown with query and provenance", () => {
+  const formatted = formatRecall("socket health", {
+    results: "### daemon.md (score=1.000)\nUse ~/.minni/run/minnid.sock for local health.",
+    agent_id: "codex",
+    layer: "knowledge",
+  }, [
+    {
+      notePath: "/tmp/vault/wiki/sessions/socket-health.md",
+      relativePath: "wiki/sessions/socket-health.md",
+      wikilink: "[[wiki/sessions/socket-health]]",
+      title: "Socket health",
+      snippet: "Codex should check ~/.minni/run/minnid.sock before using recall.",
+      score: 61,
+    },
+  ]);
+
+  assert.match(formatted, /Query: socket health/);
+  assert.match(formatted, /agent=codex/);
+  assert.match(formatted, /AI Context Pack/);
+  assert.match(formatted, /\[\[wiki\/sessions\/socket-health\]\]/);
+  assert.match(formatted, /Use ~\/\.minni\/run\/minnid\.sock/);
+});
+
+test("formatRecall includes backend badge when recall reports backend provenance", () => {
+  const formatted = formatRecall("backend provenance", {
+    results: "### result.md (score=1.000)",
+    agent_id: "codex",
+    backend: "faiss-disk+qdrant",
+  });
+
+  assert.match(formatted, /\[faiss-disk\+qdrant\]/);
+});
+
+test("buildStatusReport includes vault, socket, AFM, and audit state", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-status-"));
+  try {
+    const report = await buildStatusReport({
+      vaultPath: root,
+      socket: { ok: true, data: { status: "ok" } },
+      afm: { ok: false, error: "offline" },
+    });
+
+    assert.equal(report.vault.exists, true);
+    assert.equal(report.socket.ok, true);
+    assert.equal(report.afm.ok, false);
+    assert.equal(report.afmProvider.provider, "bridge");
+    assert.equal(report.afmProvider.status, "bridge");
+    assert.equal(report.audit.entries, 0);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("buildStatusReport sanitizes AFM health and provider status paths", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-status-redact-"));
+  const previousHelper = process.env.MINNI_AFM_NATIVE_HELPER;
+  const previousAdapter = process.env.MINNI_AFM_ADAPTER_PATH;
+  process.env.MINNI_AFM_NATIVE_HELPER = path.join(root, "native-afm-helper");
+  process.env.MINNI_AFM_ADAPTER_PATH = "/Users/alice/private/extractor.fmadapter";
+  try {
+    const report = await buildStatusReport({
+      vaultPath: root,
+      socket: { ok: true, data: { status: "ok" } },
+      afmProviderMode: "native",
+      afm: {
+        ok: false,
+        data: {
+          backend: "apple-foundation-models",
+          availability: "unavailable",
+          status: "error",
+          adapter: "/Users/alice/private/extractor.fmadapter",
+          db: "/Users/alice/private/sovereign.db",
+          launchd: "/Users/alice/Library/LaunchAgents/com.example.plist",
+        },
+        error: "FoundationModels unavailable at /Users/alice/private/extractor.fmadapter",
+      },
+    });
+    const body = JSON.stringify(report);
+
+    assert.equal(report.afm.data.adapterConfigured, true);
+    assert.equal(report.afm.data.adapter, undefined);
+    assert.equal(report.afm.data.db, undefined);
+    assert.equal(report.afmProvider.adapterConfigured, true);
+    assert.equal(report.afmProvider.status, "native_unavailable");
+    assert.doesNotMatch(body, /\/Users\/alice/);
+    assert.doesNotMatch(body, /\.fmadapter/);
+    assert.doesNotMatch(body, /\.db/);
+    assert.doesNotMatch(body, /LaunchAgents/);
+  } finally {
+    if (previousHelper === undefined) delete process.env.MINNI_AFM_NATIVE_HELPER;
+    else process.env.MINNI_AFM_NATIVE_HELPER = previousHelper;
+    if (previousAdapter === undefined) delete process.env.MINNI_AFM_ADAPTER_PATH;
+    else process.env.MINNI_AFM_ADAPTER_PATH = previousAdapter;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("compileVault sends daemon.compile JSON-RPC with dry-run default", async () => {
+  const calls = [];
+  const result = await compileVault(
+    { passName: "session_distillation" },
+    async (_socketPath, method, params) => {
+      calls.push({ method, params });
+      return { ok: true, data: { status: "ok", dry_run: params.dry_run } };
+    },
+  );
+
+  assert.equal(result.ok, true);
+  assert.equal(calls[0].method, "daemon.compile");
+  assert.equal(calls[0].params.pass_name, "session_distillation");
+  assert.equal(calls[0].params.dry_run, true);
+});
+
+test("new memory RPC helpers send expected JSON-RPC methods", async () => {
+  const calls = [];
+  const requester = async (_socketPath, method, params) => {
+    calls.push({ method, params });
+    return { ok: true, data: { method, params } };
+  };
+
+  await drillMemory({ resultIds: [1], depth: "chunk" }, requester);
+  await exportContextPack({ query: "q", budgetTokens: 100, cacheKey: "k" }, requester);
+  await ackHandoff({ leaseId: "lease", status: "accepted" }, requester);
+  await listPendingHandoffs({ agentId: "codex" }, requester);
+  await awaitHandoff({ leaseId: "lease", timeoutMs: 1 }, requester);
+  await subscribeContradictions({ agentId: "codex", sinceTs: 123 }, requester);
+
+  assert.deepEqual(calls.map((call) => call.method), [
+    "sm_drill",
+    "sm_export_pack",
+    "minni_ack_handoff",
+    "minni_list_pending_handoffs",
+    "minni_await_handoff",
+    "minni_subscribe_contradictions",
+  ]);
+  assert.deepEqual(calls[0].params.result_ids, [1]);
+  assert.equal(calls[1].params.cache_key, "k");
+  assert.equal(calls[2].params.lease_id, "lease");
+});

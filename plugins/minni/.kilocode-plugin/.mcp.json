@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "minni": {
+      "command": "node",
+      "args": ["${KILO_PLUGIN_ROOT}/../dist/server.js"],
+      "cwd": "${KILO_PLUGIN_ROOT}/..",
+      "env": {
+        "MINNI_AGENT_ID": "kilocode",
+        "MINNI_VAULT_PATH": "~/.minni/kilocode-vault",
+        "MINNI_SOCKET_PATH": "~/.minni/run/minnid.sock"
+      }
+    }
+  }
+}

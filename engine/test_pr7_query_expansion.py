@@ -100,7 +100,7 @@ def test_afm_mode_off_skips_bridge_call(monkeypatch):
             ],
         }
 
-    monkeypatch.setenv("SOVEREIGN_AFM_MODE", "off")
+    monkeypatch.setenv("MINNI_AFM_MODE", "off")
     monkeypatch.setattr(query_expand, "_post_afm", bridge_call)
 
     variants = query_expand.expand("AFM recall", mode="afm")
@@ -125,8 +125,8 @@ def test_afm_expansion_uses_native_helper_contract(monkeypatch, tmp_path):
     )
     helper.chmod(helper.stat().st_mode | 0o111)
 
-    monkeypatch.setenv("SOVEREIGN_AFM_MODE", "native")
-    monkeypatch.setenv("SOVEREIGN_AFM_NATIVE_HELPER", os.fspath(helper))
+    monkeypatch.setenv("MINNI_AFM_MODE", "native")
+    monkeypatch.setenv("MINNI_AFM_NATIVE_HELPER", os.fspath(helper))
     monkeypatch.setattr(
         query_expand,
         "_post_afm",
@@ -173,8 +173,8 @@ def test_retrieve_expands_variants_and_merges_by_rrf(monkeypatch, tmp_path):
     assert all("expansion_rrf_score" in r["provenance"] for r in results)
 
 
-def test_sovrd_search_forwards_expand_and_summarize(monkeypatch):
-    import sovrd
+def test_minnid_search_forwards_expand_and_summarize(monkeypatch):
+    import minnid
 
     captured = {}
 
@@ -185,9 +185,9 @@ def test_sovrd_search_forwards_expand_and_summarize(monkeypatch):
             captured.update(kwargs)
             return [{"source": "ok", "query_variants": ["q", "expanded q"]}]
 
-    monkeypatch.setattr(sovrd, "_lazy_retrieval", lambda: FakeEngine())
+    monkeypatch.setattr(minnid, "_lazy_retrieval", lambda: FakeEngine())
 
-    resp = sovrd._handle_search({
+    resp = minnid._handle_search({
         "query": "q",
         "expand": "afm",
         "summarize_neighborhood": True,

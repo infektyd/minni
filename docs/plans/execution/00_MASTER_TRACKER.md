@@ -75,7 +75,7 @@ PR-1b (Contracts) ──►├──► PR-10 (Inbox/Outbox + Handoff)
 
 - [ ] `cd engine && pytest -q` — all tests green
 - [ ] JSON-RPC contract test — every pre-existing method returns unchanged shape
-- [ ] `cd plugins/sovereign-memory && npm test` — current plugin baseline passes
+- [ ] `cd plugins/minni && npm test` — current plugin baseline passes
 - [ ] Claude Code hook smoke: `npm run smoke:hook` — valid envelopes
 - [ ] Live recall sanity: known query returns same top result ±1 position
 - [ ] Migration safety: apply to copy of live DB, no rows lost

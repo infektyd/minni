@@ -79,7 +79,7 @@ Exit criteria:
 - `~/Library/Logs/sovrd.*.log` is mode 0600 via plist `Umask`.
 - README documents cloud-sync exclusion and the daemon warns at startup if the vault path is under a known sync root.
 
-Verification: `pytest engine/`, `npm test -w plugins/sovereign-memory`, plus a 30-second smoke that asserts `stat -f %A ~/.sovereign-memory/run/sovrd.sock` returns `600`.
+Verification: `pytest engine/`, `npm test -w plugins/minni`, plus a 30-second smoke that asserts `stat -f %A ~/.sovereign-memory/run/sovrd.sock` returns `600`.
 
 ### Phase B — Principal Binding (SEC-002 serial; rest parallel)
 
@@ -94,7 +94,7 @@ Exit criteria:
 - AFM prep cannot post to a caller-supplied URL.
 - `learn` content cannot smuggle a forged frontmatter block into writeback files.
 
-Verification: same as Phase A plus new tests under `engine/tests/test_principal_binding.py` and `plugins/sovereign-memory/tests/principal-binding.test.ts`.
+Verification: same as Phase A plus new tests under `engine/tests/test_principal_binding.py` and `plugins/minni/tests/principal-binding.test.ts`.
 
 ### Phase C — Read Policy (SEC-005 serial; rest parallel)
 
@@ -109,7 +109,7 @@ Exit criteria:
 - Recalled snippets are wrapped in an explicit "evidence-only" envelope with provenance before being shown to the model.
 - Handoff `wikilink_refs` cannot resolve outside `<vault>/wiki/` (no `..`, symlink-aware).
 
-Verification: extend `engine/test_pr2_envelope.py` and add `plugins/sovereign-memory/tests/read-policy.test.ts`. All findings have at least one negative-path test in `tests/regression/sec-NNN_*`.
+Verification: extend `engine/test_pr2_envelope.py` and add `plugins/minni/tests/read-policy.test.ts`. All findings have at least one negative-path test in `tests/regression/sec-NNN_*`.
 
 ## Findings
 
@@ -125,7 +125,7 @@ Fix: move the socket into `~/.sovereign-memory/run/` mode `0700`, set the socket
 
 ### SEC-002 — Caller-supplied agent identity (HIGH)
 
-Files: [engine/sovrd.py:382,564,741,853,1025,1111](engine/sovrd.py); [plugins/sovereign-memory/src/server.ts:172,221,374](plugins/sovereign-memory/src/server.ts).
+Files: [engine/sovrd.py:382,564,741,853,1025,1111](engine/sovrd.py); [plugins/minni/src/server.ts:172,221,374](plugins/minni/src/server.ts).
 
 `agent_id`/`agentId`/`fromAgent` flow in from caller input and drive recall, learn, handoff, and audit logging. Any caller can claim another identity.
 
@@ -133,7 +133,7 @@ Fix: introduce `EffectivePrincipal` resolved from process/session config or loca
 
 ### SEC-003 — Caller-controlled vaultPath (HIGH)
 
-Files: [plugins/sovereign-memory/src/server.ts:37,88,115,132,153,178,223,286,310,332,348,368](plugins/sovereign-memory/src/server.ts); [plugins/sovereign-memory/src/vault.ts:309,362,472](plugins/sovereign-memory/src/vault.ts).
+Files: [plugins/minni/src/server.ts:37,88,115,132,153,178,223,286,310,332,348,368](plugins/minni/src/server.ts); [plugins/minni/src/vault.ts:309,362,472](plugins/minni/src/vault.ts).
 
 Many MCP tools accept optional `vaultPath`. Vault helpers create directories, write notes, append audit logs, and search markdown under whatever path is supplied.
 
@@ -141,7 +141,7 @@ Fix: map each principal to a configured vault root. Resolve via `realpath`. Reje
 
 ### SEC-004 — Caller-controlled AFM prepare URL (HIGH)
 
-Files: [plugins/sovereign-memory/src/server.ts:39,88](plugins/sovereign-memory/src/server.ts); [plugins/sovereign-memory/src/task.ts:575,583,656,842](plugins/sovereign-memory/src/task.ts).
+Files: [plugins/minni/src/server.ts:39,88](plugins/minni/src/server.ts); [plugins/minni/src/task.ts:575,583,656,842](plugins/minni/src/task.ts).
 
 Task and outcome preparation accept `afmPrepareUrl` from the caller and POST task/recall/outcome context to that URL.
 
@@ -157,7 +157,7 @@ Fix: implement `can_read_document(principal, workspace, doc_metadata)` once. Cal
 
 ### SEC-006 — Vault context packs ignore privacy/status frontmatter (MED→HIGH for marketing)
 
-Files: [plugins/sovereign-memory/src/vault.ts:472](plugins/sovereign-memory/src/vault.ts); [plugins/sovereign-memory/src/task.ts:246](plugins/sovereign-memory/src/task.ts); [plugins/sovereign-memory/src/sovereign.ts:278](plugins/sovereign-memory/src/sovereign.ts).
+Files: [plugins/minni/src/vault.ts:472](plugins/minni/src/vault.ts); [plugins/minni/src/task.ts:246](plugins/minni/src/task.ts); [plugins/minni/src/sovereign.ts:278](plugins/minni/src/sovereign.ts).
 
 Vault search returns markdown snippets without parsing frontmatter; sensitivity inferred from string heuristics. Defeats a marketed feature.
 
@@ -165,7 +165,7 @@ Fix: parse YAML frontmatter; attach metadata to `VaultSearchResult`; gate via th
 
 ### SEC-010 — No prompt-injection fence between recalled memory and model context (HIGH)
 
-Files: [plugins/sovereign-memory/src/task.ts:355,375,382](plugins/sovereign-memory/src/task.ts); [plugins/sovereign-memory/src/sovereign.ts:272](plugins/sovereign-memory/src/sovereign.ts); [engine/sovrd.py:347-374](engine/sovrd.py).
+Files: [plugins/minni/src/task.ts:355,375,382](plugins/minni/src/task.ts); [plugins/minni/src/sovereign.ts:272](plugins/minni/src/sovereign.ts); [engine/sovrd.py:347-374](engine/sovrd.py).
 
 Snippets and wikilinks are interpolated raw into the model context. No fencing, no provenance markers, no escaping of `##` or backticks.
 
@@ -181,7 +181,7 @@ Fix: extract only the leading `---\n…\n---` block. Parse it as YAML. Apply per
 
 ### SEC-012 — Handoff wikilink path traversal (HIGH)
 
-Files: [plugins/sovereign-memory/src/vault.ts:570-599](plugins/sovereign-memory/src/vault.ts); [plugins/sovereign-memory/src/hook.ts:102](plugins/sovereign-memory/src/hook.ts).
+Files: [plugins/minni/src/vault.ts:570-599](plugins/minni/src/vault.ts); [plugins/minni/src/hook.ts:102](plugins/minni/src/hook.ts).
 
 `normalizeWikilinkRef` strips `[[`, `]]`, `.md`, leading `/` — but not `..`. A handoff envelope with `wikilink_refs: ["../../../etc/passwd"]` reads arbitrary files into recipient context.
 
@@ -197,7 +197,7 @@ Fix: reject `---` or YAML-frontmatter-shaped lines in learn content, or write co
 
 ### SEC-014 — Audit log injection (MED, must-fix for "auditable handoffs" claim)
 
-Files: [plugins/sovereign-memory/src/vault.ts:336-348](plugins/sovereign-memory/src/vault.ts); [engine/sovrd.py:297-305](engine/sovrd.py).
+Files: [plugins/minni/src/vault.ts:336-348](plugins/minni/src/vault.ts); [engine/sovrd.py:297-305](engine/sovrd.py).
 
 Audit entries are formatted as `## [ts] tool | summary`. A `summary` containing `\n## […]` injects forged entries.
 
@@ -249,7 +249,7 @@ The release gate before marketing this:
 
 ```bash
 cd engine && pytest -q              # baseline 213 passed, 3 skipped
-cd ../plugins/sovereign-memory
+cd ../plugins/minni
 npm test                             # baseline 32 passed
 npm run smoke:hook
 make -C .. audit                     # SEC-009; pip-audit clean
@@ -284,7 +284,7 @@ Plus a manual:
 
 #### SEC-019 — Direct handoff delivery bypasses recipient consent (HIGH)
 
-**Where:** `plugins/sovereign-memory/src/server.ts`, `plugins/sovereign-memory/src/sovereign.ts`, `engine/sovrd.py`
+**Where:** `plugins/minni/src/server.ts`, `plugins/minni/src/sovereign.ts`, `engine/sovrd.py`
 
 **What it is:** `sovereign_negotiate_handoff` and `daemon.handoff` can deliver a packet into a recipient inbox without a recipient-side approval decision. It is attributed and audited, but still operates as delivery, not consent.
 
@@ -296,7 +296,7 @@ Plus a manual:
 
 #### SEC-020 — Cross-agent requests need replay and lifecycle state (MEDIUM)
 
-**Where:** `plugins/sovereign-memory/src/agent_ping.ts`
+**Where:** `plugins/minni/src/agent_ping.ts`
 
 **What it is:** Cross-agent requests need stable IDs, nonces, TTLs, terminal statuses, and audit entries. Otherwise a stale or duplicated request can be approved later without context.
 
@@ -308,7 +308,7 @@ Plus a manual:
 
 #### SEC-021 — Agent identity is config-stamped but not cryptographically authenticated (MEDIUM)
 
-**Where:** `plugins/sovereign-memory/src/config.ts`, `plugins/sovereign-memory/src/agent_ping.ts`, `engine/sovrd.py`
+**Where:** `plugins/minni/src/config.ts`, `plugins/minni/src/agent_ping.ts`, `engine/sovrd.py`
 
 **What it is:** The implementation stamps the active principal from environment/config, not from a cryptographic session credential. That is appropriate for the current single-user local plugin, but insufficient for LAN/public or multi-user deployment.
 
@@ -320,7 +320,7 @@ Plus a manual:
 
 #### SEC-022 — Browser UI remains read/prepare only (INFO)
 
-**Where:** `plugins/sovereign-memory/src/ui-server.ts`, `plugins/sovereign-memory/tests/ui-server.test.mjs`
+**Where:** `plugins/minni/src/ui-server.ts`, `plugins/minni/tests/ui-server.test.mjs`
 
 **What it is:** The browser console does not expose learn, vault-write, or the new agent-ping decision endpoints.
 

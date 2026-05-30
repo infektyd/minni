@@ -1,5 +1,5 @@
 """
-Sovereign Memory — FAISS Disk Persistence.
+Minni — FAISS Disk Persistence.
 
 PR-2: Save/load FAISS index to/from disk with a manifest file.
 
@@ -19,7 +19,7 @@ On cold start the loader checks:
 
 On checksum mismatch → returns None (caller rebuilds and re-saves).
 
-Default cache location: ${SOVEREIGN_DB_PATH%/*}/faiss/
+Default cache location: ${MINNI_DB_PATH%/*}/faiss/
 """
 
 import hashlib

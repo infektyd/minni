@@ -32,7 +32,7 @@
 |--------|------|---------|
 | **MODIFY** | `engine/sovrd.py` | New JSON-RPC: `daemon.handoff(from_agent, to_agent, packet)`. Validates, redacts per `POLICY.md`, writes to recipient inbox, audits both sides. |
 | **MODIFY** | `engine/seed_identity.py` | Ensure `<vault>/inbox/` and `<vault>/outbox/` directories exist on init. |
-| **MODIFY** | `plugins/sovereign-memory/src/server.ts` | Existing `sovereign_negotiate_handoff` builds the packet; now delivers via `daemon.handoff()`. |
+| **MODIFY** | `plugins/minni/src/server.ts` | Existing `sovereign_negotiate_handoff` builds the packet; now delivers via `daemon.handoff()`. |
 
 ### Outbox
 

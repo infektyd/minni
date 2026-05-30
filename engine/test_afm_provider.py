@@ -32,7 +32,7 @@ def test_afm_chat_completion_off_skips_client():
 def test_afm_chat_completion_native_reports_unavailable_without_helper(monkeypatch):
     from afm_provider import afm_chat_completion
 
-    monkeypatch.setenv("SOVEREIGN_AFM_NATIVE_HELPER", "/tmp/missing-sovereign-native-afm-helper")
+    monkeypatch.setenv("MINNI_AFM_NATIVE_HELPER", "/tmp/missing-sovereign-native-afm-helper")
 
     result = afm_chat_completion({"messages": []}, mode="native")
 
@@ -45,7 +45,7 @@ def test_afm_chat_completion_native_reports_unavailable_without_helper(monkeypat
 def test_afm_chat_completion_auto_uses_bridge_when_native_unavailable(monkeypatch):
     from afm_provider import afm_chat_completion
 
-    monkeypatch.setenv("SOVEREIGN_AFM_NATIVE_HELPER", "/tmp/missing-sovereign-native-afm-helper")
+    monkeypatch.setenv("MINNI_AFM_NATIVE_HELPER", "/tmp/missing-sovereign-native-afm-helper")
     calls = []
 
     def bridge_client(payload, url, timeout):
@@ -68,8 +68,8 @@ def test_afm_chat_completion_auto_uses_bridge_when_native_unavailable(monkeypatc
 def test_afm_runtime_status_prefers_unified_provider_mode(monkeypatch):
     from afm_provider import afm_runtime_status
 
-    monkeypatch.setenv("SOVEREIGN_AFM_MODE", "bridge")
-    monkeypatch.setenv("SOVEREIGN_AFM_PROVIDER_MODE", "off")
+    monkeypatch.setenv("MINNI_AFM_MODE", "bridge")
+    monkeypatch.setenv("MINNI_AFM_PROVIDER_MODE", "off")
 
     status = afm_runtime_status()
 
@@ -80,8 +80,8 @@ def test_afm_runtime_status_prefers_unified_provider_mode(monkeypatch):
 def test_afm_runtime_status_reports_adapter_without_path(monkeypatch):
     from afm_provider import afm_runtime_status
 
-    monkeypatch.setenv("SOVEREIGN_AFM_MODE", "native")
-    monkeypatch.setenv("SOVEREIGN_AFM_ADAPTER_PATH", "/Users/alice/private/extractor.fmadapter")
+    monkeypatch.setenv("MINNI_AFM_MODE", "native")
+    monkeypatch.setenv("MINNI_AFM_ADAPTER_PATH", "/Users/alice/private/extractor.fmadapter")
 
     status = afm_runtime_status()
 
@@ -93,8 +93,8 @@ def test_afm_runtime_status_reports_adapter_without_path(monkeypatch):
 def test_afm_runtime_status_reports_missing_native_helper(monkeypatch):
     from afm_provider import afm_runtime_status
 
-    monkeypatch.setenv("SOVEREIGN_AFM_PROVIDER_MODE", "native")
-    monkeypatch.setenv("SOVEREIGN_AFM_NATIVE_HELPER", "/tmp/missing-sovereign-native-afm-helper")
+    monkeypatch.setenv("MINNI_AFM_PROVIDER_MODE", "native")
+    monkeypatch.setenv("MINNI_AFM_NATIVE_HELPER", "/tmp/missing-sovereign-native-afm-helper")
 
     status = afm_runtime_status()
 
@@ -123,8 +123,8 @@ def test_afm_runtime_status_checks_native_helper_health(monkeypatch, tmp_path):
         encoding="utf-8",
     )
     helper.chmod(helper.stat().st_mode | stat.S_IXUSR)
-    monkeypatch.setenv("SOVEREIGN_AFM_PROVIDER_MODE", "native")
-    monkeypatch.setenv("SOVEREIGN_AFM_NATIVE_HELPER", os.fspath(helper))
+    monkeypatch.setenv("MINNI_AFM_PROVIDER_MODE", "native")
+    monkeypatch.setenv("MINNI_AFM_NATIVE_HELPER", os.fspath(helper))
 
     status = afm_runtime_status()
 
@@ -156,8 +156,8 @@ def test_afm_runtime_status_reports_available_native_health(monkeypatch, tmp_pat
         encoding="utf-8",
     )
     helper.chmod(helper.stat().st_mode | stat.S_IXUSR)
-    monkeypatch.setenv("SOVEREIGN_AFM_PROVIDER_MODE", "native")
-    monkeypatch.setenv("SOVEREIGN_AFM_NATIVE_HELPER", os.fspath(helper))
+    monkeypatch.setenv("MINNI_AFM_PROVIDER_MODE", "native")
+    monkeypatch.setenv("MINNI_AFM_NATIVE_HELPER", os.fspath(helper))
 
     status = afm_runtime_status()
 

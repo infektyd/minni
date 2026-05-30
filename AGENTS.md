@@ -2,7 +2,7 @@
 
 Hey. This file is here because we keep running into the same dumb pattern and it slows us down when we're actually trying to build the damn thing.
 
-We're inside `~/Projects/sovereignMemory` — this is **Minni**, repo `infektyd/minni`. (The working-copy directory rename to `~/Projects/minni` is a pending manual step; the GitHub repo is already `infektyd/minni`.) This is not a normal codebase. Minni is a big, weird, living system with a bunch of different surfaces and tentacles that reach out into the rest of the machine. Treating it like "just the plugin folder" or "just whatever has 'sovereign-memory' in the path" is how we end up in the exact regression loop we were just in. (`sovereign-memory` is the legacy internal identifier — MCP namespace, vault dir, slash-command prefix. Still in use; will be migrated to `minni` in a later pass. Don't let that substring narrow your scope.)
+We're inside `~/Projects/Minni` — this is **Minni**, repo `infektyd/minni`. This is not a normal codebase. Minni is a big, weird, living system with a bunch of different surfaces and tentacles that reach out into the rest of the machine. Treating it like "just the plugin folder" or "just whatever has 'sovereign-memory' in the path" is how we end up in the exact regression loop we were just in. (`sovereign-memory` is the legacy internal identifier — MCP namespace, vault dir, slash-command prefix. Still in use in some surfaces; being migrated to `minni`. Don't let that substring narrow your scope.)
 
 ### The Real Rule
 
@@ -30,7 +30,7 @@ That's the system. Not just the folder with the longest name.
 
 Do not let the substring "sovereign-memory" hypnotize you. It will try. It always tries.
 
-`plugins/sovereign-memory/` is one important piece, not the whole map. If you catch yourself anchoring there and ignoring the rest, stop and re-read this file.
+`plugins/minni/` is one important piece, not the whole map. If you catch yourself anchoring there and ignoring the rest, stop and re-read this file.
 
 When the user is asking for a diff or gap analysis after merges on main, the default move is:
 

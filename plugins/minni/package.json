@@ -1,0 +1,37 @@
+{
+  "name": "minni-multi-plugin",
+  "version": "0.1.0",
+  "description": "Local multi-target plugin bridge for Sovereign Memory (Codex, Claude Code, Gemini, KiloCode).",
+  "type": "module",
+  "main": "dist/server.js",
+  "engines": {
+    "node": ">=20 <21"
+  },
+  "scripts": {
+    "build": "tsc && vite build",
+    "build:server": "tsc",
+    "build:frontend": "vite build",
+    "dev:frontend": "vite --host 127.0.0.1",
+    "test": "npm run build && node --test tests/*.test.mjs",
+    "console": "npm run build && node dist/ui-server.js",
+    "design:lint": "npx @google/design.md lint ../../DESIGN.md",
+    "test:live:prepare": "npm run build && node tests/live-prepare-task.mjs",
+    "smoke:status": "npm run build && node dist/cli.js status",
+    "smoke:hook": "npm run build && node dist/hook.js SessionStart < /dev/null",
+    "smoke:kilocode-hook": "npm run build && node dist/kilocode-hook.js SessionStart < /dev/null"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "react": "^19.2.6",
+    "react-dom": "^19.2.6",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^25.9.1",
+    "@types/react": "^19.2.15",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^6.0.2",
+    "typescript": "^6.0.3",
+    "vite": "^8.0.14"
+  }
+}

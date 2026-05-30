@@ -1,5 +1,5 @@
 """
-Sovereign Memory V3.1 — Graph Exporter.
+Minni V3.1 — Graph Exporter.
 
 V3.1 changes:
 - No compression — semantic edges computed in raw float32 space
@@ -21,7 +21,7 @@ logger = logging.getLogger("sovereign.graph")
 
 
 class GraphExporter:
-    """Export Sovereign Memory graph for visualization."""
+    """Export Minni graph for visualization."""
 
     def __init__(
         self,

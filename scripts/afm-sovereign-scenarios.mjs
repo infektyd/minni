@@ -95,7 +95,7 @@ const PRIVACY_CASES = [
   "When using OpenAI Responses API, flatten nested metadata to top-level string keys.",
   "Set OPENAI_API_KEY=sk-proj-AbCdEf12345 in ~/.zshrc to test daemon startup.",
   "AFM bridge listens on 127.0.0.1:11437 by default; override via SOVEREIGN_AFM_PREPARE_TASK_URL.",
-  "User /Users/hansaxelsson keeps adapter at /Users/hansaxelsson/.adapters/harvest_v3.fmadapter; load it manually.",
+  "User /Users/operator keeps adapter at /Users/operator/.adapters/harvest_v3.fmadapter; load it manually.",
 ];
 
 const RECALL_EXPAND_SYSTEM =

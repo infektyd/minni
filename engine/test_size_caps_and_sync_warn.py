@@ -4,7 +4,7 @@ Covers:
   - _handle_learn rejects content longer than 64 KiB with code -32602.
   - _handle_learn accepts content of exactly 64 KiB.
   - _warn_if_sync_root emits a warning for paths under ~/Dropbox/...
-  - _warn_if_sync_root stays silent for ordinary paths (~/sovereignMemory/...).
+  - _warn_if_sync_root stays silent for ordinary paths (~/minni/...).
 
 The 1 MiB readuntil limit on the Unix socket is exercised at the asyncio
 StreamReader level and is not unit-tested here — exercising it requires
@@ -51,12 +51,12 @@ def _make_db(tmp_path: Path):
 def _patch_writeback_no_model(tmp_path: Path, monkeypatch):
     """Patch the global _writeback singleton at a fresh test DB and disable
     the embedder so _handle_learn does not invoke any model."""
-    import sovrd
+    import minnid
     import writeback as wb_mod
 
     db_obj, cfg = _make_db(tmp_path)
     wb = wb_mod.WriteBackMemory(db_obj, cfg)
-    monkeypatch.setattr(sovrd, "_writeback", wb)
+    monkeypatch.setattr(minnid, "_writeback", wb)
 
     # Replace the .model property so contradiction detection + encode skip.
     # monkeypatch.setattr unwinds the change at the end of the test.
@@ -70,7 +70,7 @@ def _patch_writeback_no_model(tmp_path: Path, monkeypatch):
 
 
 def _dispatch(method: str, params: dict) -> dict:
-    from sovrd import _dispatch_sync as _d
+    from minnid import _dispatch_sync as _d
     return _d({
         "jsonrpc": "2.0",
         "id": 1,
@@ -140,7 +140,7 @@ class TestLearnContentCap:
 class TestWarnIfSyncRoot:
     def test_warns_for_path_under_dropbox(self, tmp_path, monkeypatch, caplog):
         """A path under <home>/Dropbox/... must trigger a warning."""
-        from sovrd import _warn_if_sync_root
+        from minnid import _warn_if_sync_root
 
         # Pretend $HOME is tmp_path so we can stage a fake Dropbox folder.
         monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
@@ -148,7 +148,7 @@ class TestWarnIfSyncRoot:
         sync_dir = tmp_path / "Dropbox" / "foo"
         sync_dir.mkdir(parents=True)
 
-        with caplog.at_level(logging.WARNING, logger="sovrd"):
+        with caplog.at_level(logging.WARNING, logger="minnid"):
             _warn_if_sync_root("vault", sync_dir)
 
         msgs = [r.getMessage() for r in caplog.records]
@@ -157,14 +157,14 @@ class TestWarnIfSyncRoot:
         )
 
     def test_warns_for_icloud_mobile_documents(self, tmp_path, monkeypatch, caplog):
-        from sovrd import _warn_if_sync_root
+        from minnid import _warn_if_sync_root
 
         monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
 
         icloud_dir = tmp_path / "Library" / "Mobile Documents" / "com~apple~CloudDocs" / "vault"
         icloud_dir.mkdir(parents=True)
 
-        with caplog.at_level(logging.WARNING, logger="sovrd"):
+        with caplog.at_level(logging.WARNING, logger="minnid"):
             _warn_if_sync_root("vault", icloud_dir)
 
         msgs = [r.getMessage() for r in caplog.records]
@@ -174,14 +174,14 @@ class TestWarnIfSyncRoot:
 
     def test_no_warning_for_normal_path(self, tmp_path, monkeypatch, caplog):
         """A path under a normal project directory must not trigger a warning."""
-        from sovrd import _warn_if_sync_root
+        from minnid import _warn_if_sync_root
 
         monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
 
-        normal_dir = tmp_path / "sovereignMemory" / "foo"
+        normal_dir = tmp_path / "minni" / "foo"
         normal_dir.mkdir(parents=True)
 
-        with caplog.at_level(logging.WARNING, logger="sovrd"):
+        with caplog.at_level(logging.WARNING, logger="minnid"):
             _warn_if_sync_root("vault", normal_dir)
 
         msgs = [r.getMessage() for r in caplog.records]
@@ -192,7 +192,7 @@ class TestWarnIfSyncRoot:
     def test_no_warning_for_path_outside_home(self, tmp_path, monkeypatch, caplog):
         """A path outside $HOME (e.g. /tmp/...) must not trigger a warning,
         even if the absolute string contains 'Dropbox' downstream."""
-        from sovrd import _warn_if_sync_root
+        from minnid import _warn_if_sync_root
 
         # Move home elsewhere so tmp_path is NOT under home.
         elsewhere = tmp_path / "fake_home"
@@ -202,7 +202,7 @@ class TestWarnIfSyncRoot:
         outside = tmp_path / "etc" / "Dropbox"
         outside.mkdir(parents=True)
 
-        with caplog.at_level(logging.WARNING, logger="sovrd"):
+        with caplog.at_level(logging.WARNING, logger="minnid"):
             _warn_if_sync_root("vault", outside)
 
         msgs = [r.getMessage() for r in caplog.records]

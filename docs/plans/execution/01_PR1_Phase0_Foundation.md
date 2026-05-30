@@ -121,7 +121,7 @@ cd engine && pytest -q
 - [ ] `engine/tokens.py` exists with `count_tokens()`
 - [ ] `engine/chunker.py` uses tiktoken instead of word-count approximation
 - [ ] `cd engine && pytest -q` — green
-- [ ] `cd plugins/sovereign-memory && npm test` — current plugin baseline passes
+- [ ] `cd plugins/minni && npm test` — current plugin baseline passes
 - [ ] JSON-RPC contract: all existing methods return unchanged shapes
 - [ ] Live recall: known query returns same top result ±1 position
 

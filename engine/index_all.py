@@ -1,5 +1,5 @@
 """
-Sovereign Memory V3.1 — Unified Indexer.
+Minni V3.1 — Unified Indexer.
 
 Runs all source indexers (vault + wiki) in sequence, then rebuilds
 the shared FAISS index from all accumulated embeddings.

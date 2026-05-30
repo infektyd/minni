@@ -1,5 +1,5 @@
 """
-Sovereign Memory — Confidence Scoring.
+Minni — Confidence Scoring.
 
 PR-2: compute_confidence() produces a calibrated [0,1] float from raw retrieval signals.
 

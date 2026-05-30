@@ -86,9 +86,9 @@ def generate_hypothetical_answer(
             logger.debug("Native AFM HyDE generation skipped: %s", native.error)
             return None
 
-    afm_url = url or os.environ.get("SOVEREIGN_HYDE_AFM_URL", DEFAULT_AFM_URL)
-    model = os.environ.get("SOVEREIGN_HYDE_AFM_MODEL", DEFAULT_AFM_MODEL)
-    max_tokens = int(os.environ.get("SOVEREIGN_HYDE_MAX_TOKENS", "96"))
+    afm_url = url or os.environ.get("MINNI_HYDE_AFM_URL", DEFAULT_AFM_URL)
+    model = os.environ.get("MINNI_HYDE_AFM_MODEL", DEFAULT_AFM_MODEL)
+    max_tokens = int(os.environ.get("MINNI_HYDE_MAX_TOKENS", "96"))
     chat_client = client or _default_chat_client
     payload = {
         "model": model,

@@ -20,7 +20,7 @@ def setup_hermetic_principals(tmp_path, monkeypatch):
     through the real principal resolution logic.
     """
     import principal
-    import sovrd
+    import minnid
     import json
 
     pdir = tmp_path / "principals"
@@ -46,7 +46,7 @@ def setup_hermetic_principals(tmp_path, monkeypatch):
         )
 
     monkeypatch.setattr(principal, "resolve_effective_principal", _patched_resolve)
-    monkeypatch.setattr(sovrd, "resolve_effective_principal", _patched_resolve)
+    monkeypatch.setattr(minnid, "resolve_effective_principal", _patched_resolve)
 
 
 
@@ -119,13 +119,13 @@ def test_migration_006_creates_feedback_table(tmp_path):
 
 
 def test_daemon_feedback_stores_row(monkeypatch, tmp_path):
-    import sovrd
+    import minnid
 
     engine, db_obj, _ = _make_engine(tmp_path)
     doc_id, chunk_id = _seed_doc(db_obj, "/wiki/auth.md", "main", "auth migration")
 
-    monkeypatch.setattr(sovrd, "_retrieval", engine)
-    response = sovrd._dispatch_sync({
+    monkeypatch.setattr(minnid, "_retrieval", engine)
+    response = minnid._dispatch_sync({
         "jsonrpc": "2.0",
         "id": 1,
         "method": "feedback",
@@ -259,7 +259,7 @@ def test_trace_ring_capacity_and_size_bound():
 
 
 def test_daemon_trace_round_trip(monkeypatch, tmp_path):
-    import sovrd
+    import minnid
 
     engine, db_obj, _ = _make_engine(tmp_path)
     doc_id, _ = _seed_doc(db_obj, "/wiki/auth.md", "main", "auth migration")
@@ -276,9 +276,9 @@ def test_daemon_trace_round_trip(monkeypatch, tmp_path):
         }
     ])
     monkeypatch.setattr(engine, "_semantic_search", lambda query, limit: [])
-    monkeypatch.setattr(sovrd, "_retrieval", engine)
+    monkeypatch.setattr(minnid, "_retrieval", engine)
 
-    search_response = sovrd._dispatch_sync({
+    search_response = minnid._dispatch_sync({
         "jsonrpc": "2.0",
         "id": 1,
         "method": "search",
@@ -286,7 +286,7 @@ def test_daemon_trace_round_trip(monkeypatch, tmp_path):
     })
     trace_id = search_response["result"]["trace_id"]
 
-    trace_response = sovrd._dispatch_sync({
+    trace_response = minnid._dispatch_sync({
         "jsonrpc": "2.0",
         "id": 2,
         "method": "trace",

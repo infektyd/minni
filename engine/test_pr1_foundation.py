@@ -81,7 +81,7 @@ class TestMigrationsRunner:
         db_mod._migrations_run = False  # force re-run
 
         try:
-            os.environ["SOVEREIGN_DB_PATH"] = db_path
+            os.environ["MINNI_DB_PATH"] = db_path
             # Re-import config so db_path env var is picked up
             import config
             cfg = config.SovereignConfig(db_path=db_path)
@@ -93,7 +93,7 @@ class TestMigrationsRunner:
             assert version >= 1, f"Expected user_version >= 1, got {version}"
         finally:
             db_mod._migrations_run = old_flag
-            os.environ.pop("SOVEREIGN_DB_PATH", None)
+            os.environ.pop("MINNI_DB_PATH", None)
 
     def test_once_per_process_flag(self, tmp_path):
         """Module-level _migrations_run flag prevents re-entry."""

@@ -1,0 +1,33 @@
+{
+  "name": "minni",
+  "version": "0.1.0",
+  "description": "Local-first Minni spine for Claude Code: automatic recall, vault-first learning, agent-to-agent handoff, and continuity across compaction.",
+  "author": {
+    "name": "Infektyd",
+    "email": "local@localhost",
+    "url": "https://github.com/infektyd"
+  },
+  "homepage": "https://github.com/infektyd/minni",
+  "repository": "https://github.com/infektyd/minni",
+  "license": "MIT",
+  "keywords": [
+    "minni",
+    "obsidian",
+    "llm-wiki",
+    "local-first",
+    "mcp",
+    "spine"
+  ],
+  "mcpServers": {
+    "minni": {
+      "command": "node",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/dist/server.js"],
+      "cwd": "${CLAUDE_PLUGIN_ROOT}",
+      "env": {
+        "MINNI_AGENT_ID": "claude-code",
+        "MINNI_VAULT_PATH": "~/.minni/claudecode-vault",
+        "MINNI_SOCKET_PATH": "~/.minni/run/minnid.sock"
+      }
+    }
+  }
+}

@@ -1,5 +1,5 @@
 """
-Sovereign Memory V3.1 — Write-Back Memory.
+Minni V3.1 — Write-Back Memory.
 
 Agents don't just read from memory — they write back.
 

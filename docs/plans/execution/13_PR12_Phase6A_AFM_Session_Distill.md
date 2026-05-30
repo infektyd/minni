@@ -18,7 +18,7 @@
 | **CREATE** | `engine/afm_writer.py` | Single-writer queue: dedicated background thread. Drains proposal queue, acquires per-page lock, applies `assessLearningQuality` + contradiction detection, then writes. Eliminates concurrent write corruption. |
 | **MODIFY** | `engine/config.py` | Add `afm_loop_schedule` dict with per-pass intervals. Add `SOVEREIGN_AFM_LOOP` env var check. |
 | **MODIFY** | `engine/sovrd.py` | New JSON-RPC: `daemon.compile(pass_name, vault_path?, dry_run=True)`. Default `dry_run=True`. CLI: `python -m engine.sovereign_memory compile --pass session_distillation --dry-run`. |
-| **MODIFY** | `plugins/sovereign-memory/src/server.ts` | New MCP tool: `sovereign_compile_vault`. |
+| **MODIFY** | `plugins/minni/src/server.ts` | New MCP tool: `sovereign_compile_vault`. |
 
 ### Config
 

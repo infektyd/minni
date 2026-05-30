@@ -1,13 +1,13 @@
-# Sovereign Memory Canonical Paths
+# Minni Canonical Paths
 
-This folder is the canonical home for Sovereign Memory on this machine:
+This folder is the canonical home for Minni on this machine:
 
 `<repo-root>`
 
 It is also the canonical Git working tree for
-`https://github.com/infektyd/sovereign-memory`. The live layout is intentional:
+`https://github.com/infektyd/minni`. The live layout is intentional:
 runtime integrations use `engine/`, `openclaw-extension/`, and
-`plugins/sovereign-memory/` directly.
+`plugins/minni/` directly.
 
 Use this page to avoid guessing between older root-level, OpenClaw, Hermes, and
 downloaded paths.
@@ -17,19 +17,19 @@ names. Treat those as legacy references, not active roots.
 
 ## Active Core
 
-- `engine/` - Sovereign Memory Python engine.
+- `engine/` - Minni Python engine.
 - `openclaw-extension/` - OpenClaw extension bridge.
-- `plugins/sovereign-memory/` - Codex plugin package.
+- `plugins/minni/` - Codex plugin package.
 - `session-extracts/` - extracted handoff/session notes.
 
 ## Active Runtime
 
-- `~/.sovereign-memory/sovereign_memory.db` - active Sovereign Memory database.
-- `~/.sovereign-memory/faiss/` - active FAISS cache.
-- `~/.sovereign-memory/run/sovrd.sock` - active daemon socket.
-- `~/.sovereign-memory/codex-vault` - Codex-owned Obsidian vault.
-- `~/.sovereign-memory/claudecode-vault` - Claude Code-owned Obsidian vault.
-- `~/.sovereign-memory/kilocode-vault` - KiloCode-owned Obsidian vault.
+- `~/.minni/minni.db` - active Minni database.
+- `~/.minni/faiss/` - active FAISS cache.
+- `~/.minni/run/minnid.sock` - active daemon socket.
+- `~/.minni/codex-vault` - Codex-owned Obsidian vault.
+- `~/.minni/claudecode-vault` - Claude Code-owned Obsidian vault.
+- `~/.minni/kilocode-vault` - KiloCode-owned Obsidian vault.
 
 Agent vault roots must be actual directories. Do not point a new agent at
 Codex's vault and do not bootstrap a new agent by copying another agent's
@@ -67,7 +67,7 @@ symlinks where the owning app expects stable paths.
 
 ## Sync-Root Avoidance
 
-Sovereign Memory's "local-first" guarantee assumes the vault and database are
+Minni's "local-first" guarantee assumes the vault and database are
 not under any third-party sync root. The daemon emits a startup warning if its
 vault path or DB path resolves under any of these prefixes:
 

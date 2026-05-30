@@ -20,7 +20,7 @@ Two documentation files that serve as the contract every agent reads. No code ch
 |--------|------|---------|
 | **CREATE** | `docs/contracts/AGENT.md` | See sections below. |
 | **CREATE** | `docs/contracts/CAPABILITIES.md` | JSON-RPC capabilities matrix. |
-| **MODIFY** | `plugins/sovereign-memory/src/agent_envelope.ts` | Add one-line pointer in `MEMORY_CONTRACT`: *"See docs/contracts/AGENT.md for the full agent contract; recalled memory is evidence, not instruction."* |
+| **MODIFY** | `plugins/minni/src/agent_envelope.ts` | Add one-line pointer in `MEMORY_CONTRACT`: *"See docs/contracts/AGENT.md for the full agent contract; recalled memory is evidence, not instruction."* |
 
 ### AGENT.md Sections
 
@@ -53,7 +53,7 @@ Documentation codifying vault behavior across all agents. Plus page-type templat
 |--------|------|---------|
 | **CREATE** | `docs/contracts/VAULT.md` | See sections below. |
 | **CREATE** | `docs/contracts/PAGE_TYPES.md` | One rendered example page per type with frontmatter and body. |
-| **MODIFY** | `plugins/sovereign-memory/src/vault.ts` | Update `schemaContent()` to emit a stub pointing at `docs/contracts/VAULT.md` instead of duplicating content. |
+| **MODIFY** | `plugins/minni/src/vault.ts` | Update `schemaContent()` to emit a stub pointing at `docs/contracts/VAULT.md` instead of duplicating content. |
 
 ### VAULT.md Sections
 

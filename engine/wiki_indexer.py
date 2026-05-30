@@ -1,7 +1,7 @@
 """
-Sovereign Memory V3.1 — Wiki Indexer.
+Minni V3.1 — Wiki Indexer.
 
-Ingests LLM Wiki pages into sovereign memory with agent-optimized enrichment:
+Ingests LLM Wiki pages into Minni with agent-optimized enrichment:
 1. Parses YAML frontmatter (type, tags, sources, title)
 2. Extracts [[wikilinks]] as memory_links graph edges
 3. Enriches chunk heading context with frontmatter metadata
@@ -210,7 +210,7 @@ class WikiPageParser:
 
 class WikiIndexer:
     """
-    Index LLM Wiki pages into sovereign memory with agent-optimized enrichment.
+    Index LLM Wiki pages into Minni with agent-optimized enrichment.
 
     Differences from VaultIndexer:
     - Frontmatter metadata → chunk heading context enriched with type + tags
@@ -490,7 +490,7 @@ class WikiIndexer:
         Convert [[wikilinks]] to memory_links table entries.
 
         This is the graph-building step. When an agent recalls a chunk from
-        a wiki page, the memory_links table lets sovereign memory traverse
+        a wiki page, the memory_links table lets Minni traverse
         to related pages — the knowledge graph is materialized in SQLite.
 
         Returns the number of links created.

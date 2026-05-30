@@ -62,7 +62,7 @@ class TestAgentEnvelopeContract:
         # We test the TypeScript source as a text file to avoid needing ts-node
         plugin_src = os.path.join(
             os.path.dirname(__file__),
-            "..", "plugins", "sovereign-memory", "src", "agent_envelope.ts"
+            "..", "plugins", "minni", "src", "agent_envelope.ts"
         )
         plugin_src = os.path.abspath(plugin_src)
         assert os.path.exists(plugin_src), f"agent_envelope.ts not found: {plugin_src}"
@@ -78,7 +78,7 @@ class TestAgentEnvelopeContract:
         """schemaContent() in vault.ts must reference docs/contracts/VAULT.md."""
         vault_src = os.path.join(
             os.path.dirname(__file__),
-            "..", "plugins", "sovereign-memory", "src", "vault.ts"
+            "..", "plugins", "minni", "src", "vault.ts"
         )
         vault_src = os.path.abspath(vault_src)
         assert os.path.exists(vault_src), f"vault.ts not found: {vault_src}"
@@ -172,9 +172,9 @@ class TestDepthTiers:
         assert "recommended_action" not in result
         assert "recommended_wiki_updates" not in result
 
-    def test_sovrd_search_defaults_to_headline(self, monkeypatch):
+    def test_minnid_search_defaults_to_headline(self, monkeypatch):
         """Daemon search defaults to headline without changing RetrievalEngine default."""
-        import sovrd
+        import minnid
 
         seen = {}
 
@@ -185,8 +185,8 @@ class TestDepthTiers:
                 seen.update(kwargs)
                 return [{"doc_id": 1, "chunk_id": 10, "depth": kwargs["depth"]}]
 
-        monkeypatch.setattr(sovrd, "_lazy_retrieval", lambda: FakeEngine())
-        response = sovrd._dispatch_sync({
+        monkeypatch.setattr(minnid, "_lazy_retrieval", lambda: FakeEngine())
+        response = minnid._dispatch_sync({
             "jsonrpc": "2.0",
             "id": 100,
             "method": "search",
@@ -198,7 +198,7 @@ class TestDepthTiers:
         assert response["result"]["depth"] == "headline"
 
     def test_sm_drill_batches_result_ids(self, monkeypatch):
-        import sovrd
+        import minnid
 
         calls = []
 
@@ -207,8 +207,8 @@ class TestDepthTiers:
                 calls.append((result_id, depth))
                 return {"doc_id": result_id, "chunk_id": result_id * 10, "depth": depth}
 
-        monkeypatch.setattr(sovrd, "_lazy_retrieval", lambda: FakeEngine())
-        response = sovrd._dispatch_sync({
+        monkeypatch.setattr(minnid, "_lazy_retrieval", lambda: FakeEngine())
+        response = minnid._dispatch_sync({
             "jsonrpc": "2.0",
             "id": 101,
             "method": "sm_drill",
@@ -220,7 +220,7 @@ class TestDepthTiers:
         assert response["result"]["count"] == 2
 
     def test_sm_export_pack_is_deterministic(self, monkeypatch):
-        import sovrd
+        import minnid
 
         class FakeEngine:
             def retrieve(self, **kwargs):
@@ -247,7 +247,7 @@ class TestDepthTiers:
                     },
                 ]
 
-        monkeypatch.setattr(sovrd, "_lazy_retrieval", lambda: FakeEngine())
+        monkeypatch.setattr(minnid, "_lazy_retrieval", lambda: FakeEngine())
         request = {
             "jsonrpc": "2.0",
             "id": 102,
@@ -255,8 +255,8 @@ class TestDepthTiers:
             "params": {"query": "cache prefix", "budget_tokens": 100, "cache_key": "k1"},
         }
 
-        first = sovrd._dispatch_sync(request)["result"]
-        second = sovrd._dispatch_sync(request)["result"]
+        first = minnid._dispatch_sync(request)["result"]
+        second = minnid._dispatch_sync(request)["result"]
 
         assert first["manifest_hash"] == second["manifest_hash"]
         assert first["cache_key"] == "k1"

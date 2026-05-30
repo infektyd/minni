@@ -1,5 +1,5 @@
 """
-Sovereign Memory — VectorBackend Protocol and Data Types.
+Minni — VectorBackend Protocol and Data Types.
 
 PR-3: Defines the protocol that all vector-store adapters must satisfy,
 plus the VectorItem and VectorHit data types.

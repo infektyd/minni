@@ -15,7 +15,7 @@ python3 -m pytest \
 ## Plugin Tests
 
 ```bash
-npm --prefix plugins/sovereign-memory test
+npm --prefix plugins/minni test
 ```
 
 ## Reviewed Seed Validation

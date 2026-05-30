@@ -1,9 +1,0 @@
-{
-  "mcpServers": {
-    "sovereign-memory": {
-      "command": "node",
-      "args": ["./dist/server.js"],
-      "cwd": "."
-    }
-  }
-}

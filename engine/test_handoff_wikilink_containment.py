@@ -14,7 +14,7 @@ import tempfile
 import os
 
 from principal import EffectivePrincipal, can_read_document
-from sovrd import _validate_handoff_packet  # the packet validator (will be hardened)
+from minnid import _validate_handoff_packet  # the packet validator (will be hardened)
 
 
 def _p(roots):

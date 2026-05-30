@@ -100,7 +100,7 @@ def test_session_distillation_accepts_structured_native_compile_proposals(tmp_pa
             },
         )
 
-    monkeypatch.setenv("SOVEREIGN_AFM_MODE", "native")
+    monkeypatch.setenv("MINNI_AFM_MODE", "native")
     monkeypatch.setattr("afm_passes.session_distillation.invoke_native_afm", fake_native)
 
     result = run(db_obj, cfg, vault_path=cfg.vault_path, dry_run=True, trace_id="trace-native")
@@ -117,15 +117,15 @@ def test_session_distillation_accepts_structured_native_compile_proposals(tmp_pa
 
 
 def test_daemon_compile_wet_run_writes_draft_inbox_and_trace(tmp_path, monkeypatch):
-    import sovrd
+    import minnid
 
     db_obj, cfg = _make_db(tmp_path)
     _seed_event(db_obj)
-    monkeypatch.setattr(sovrd, "DEFAULT_CONFIG", cfg)
-    monkeypatch.setattr(sovrd, "_writeback", None)
-    monkeypatch.setattr(sovrd, "SovereignDB", lambda config=None: db_obj)
+    monkeypatch.setattr(minnid, "DEFAULT_CONFIG", cfg)
+    monkeypatch.setattr(minnid, "_writeback", None)
+    monkeypatch.setattr(minnid, "SovereignDB", lambda config=None: db_obj)
 
-    resp = sovrd._dispatch_sync(
+    resp = minnid._dispatch_sync(
         {
             "jsonrpc": "2.0",
             "id": 1,
@@ -149,19 +149,19 @@ def test_daemon_compile_wet_run_writes_draft_inbox_and_trace(tmp_path, monkeypat
     assert inbox_files
     assert "afm_loop" in (tmp_path / "vault" / "log.md").read_text(encoding="utf-8")
 
-    trace = sovrd._dispatch_sync({"jsonrpc": "2.0", "id": 2, "method": "trace", "params": {"trace_id": result["trace_id"]}})
+    trace = minnid._dispatch_sync({"jsonrpc": "2.0", "id": 2, "method": "trace", "params": {"trace_id": result["trace_id"]}})
     assert trace["result"]["status"] == "ok"
     assert trace["result"]["trace"]["pass_name"] == "session_distillation"
 
 
 def test_daemon_endorse_accepts_draft_and_audits(tmp_path, monkeypatch):
-    import sovrd
+    import minnid
 
     db_obj, cfg = _make_db(tmp_path)
     _seed_event(db_obj)
-    monkeypatch.setattr(sovrd, "DEFAULT_CONFIG", cfg)
-    monkeypatch.setattr(sovrd, "SovereignDB", lambda config=None: db_obj)
-    compile_resp = sovrd._dispatch_sync(
+    monkeypatch.setattr(minnid, "DEFAULT_CONFIG", cfg)
+    monkeypatch.setattr(minnid, "SovereignDB", lambda config=None: db_obj)
+    compile_resp = minnid._dispatch_sync(
         {
             "jsonrpc": "2.0",
             "id": 1,
@@ -171,7 +171,7 @@ def test_daemon_endorse_accepts_draft_and_audits(tmp_path, monkeypatch):
     )
     page_id = compile_resp["result"]["drafts_written"][0]["page_id"]
 
-    resp = sovrd._dispatch_sync(
+    resp = minnid._dispatch_sync(
         {
             "jsonrpc": "2.0",
             "id": 2,
@@ -187,15 +187,15 @@ def test_daemon_endorse_accepts_draft_and_audits(tmp_path, monkeypatch):
 
 
 def test_compile_skips_cleanly_when_afm_loop_disabled(tmp_path, monkeypatch):
-    import sovrd
+    import minnid
 
     db_obj, cfg = _make_db(tmp_path)
     cfg.afm_loop_schedule["enabled"] = False
     _seed_event(db_obj)
-    monkeypatch.setattr(sovrd, "DEFAULT_CONFIG", cfg)
-    monkeypatch.setattr(sovrd, "SovereignDB", lambda config=None: db_obj)
+    monkeypatch.setattr(minnid, "DEFAULT_CONFIG", cfg)
+    monkeypatch.setattr(minnid, "SovereignDB", lambda config=None: db_obj)
 
-    resp = sovrd._dispatch_sync(
+    resp = minnid._dispatch_sync(
         {
             "jsonrpc": "2.0",
             "id": 1,
@@ -209,13 +209,13 @@ def test_compile_skips_cleanly_when_afm_loop_disabled(tmp_path, monkeypatch):
 
 
 def test_health_report_includes_afm_loop(tmp_path, monkeypatch):
-    import sovrd
+    import minnid
 
     db_obj, cfg = _make_db(tmp_path)
-    monkeypatch.setattr(sovrd, "DEFAULT_CONFIG", cfg)
-    monkeypatch.setattr(sovrd, "SovereignDB", lambda config=None: db_obj)
+    monkeypatch.setattr(minnid, "DEFAULT_CONFIG", cfg)
+    monkeypatch.setattr(minnid, "SovereignDB", lambda config=None: db_obj)
 
-    resp = sovrd._dispatch_sync({"jsonrpc": "2.0", "id": 1, "method": "health_report", "params": {}})
+    resp = minnid._dispatch_sync({"jsonrpc": "2.0", "id": 1, "method": "health_report", "params": {}})
     assert "error" not in resp
     afm_loop = resp["result"]["afm_loop"]
     assert set(["last_run_per_pass", "drafts_pending", "drafts_pending_oldest", "afm_latency_p95", "status"]).issubset(afm_loop)

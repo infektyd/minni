@@ -1,5 +1,5 @@
 """
-Sovereign Memory V3.1 — Centralized Configuration.
+Minni V3.1 — Centralized Configuration.
 
 V3.1 changes:
 - Removed all compression config (TurboQuant stripped entirely)
@@ -17,7 +17,7 @@ from typing import Dict, Optional
 
 # G02 canonical home resolver (single source of truth for path defaults)
 CANONICAL_SOVEREIGN_HOME: str = os.environ.get(
-    "SOVEREIGN_HOME", os.path.expanduser("~/.sovereign-memory")
+    "MINNI_HOME", os.path.expanduser("~/.minni")
 )
 
 
@@ -25,28 +25,26 @@ CANONICAL_SOVEREIGN_HOME: str = os.environ.get(
 class SovereignConfig:
     """All configuration in one place, overridable via env vars or constructor."""
 
-    # Paths — G02 unified canonical (prefer ~/.sovereign-memory over legacy ~/.openclaw)
+    # Paths — G02 unified canonical (prefer ~/.minni over legacy ~/.openclaw)
     vault_path: str = os.environ.get(
-        "SOVEREIGN_VAULT_PATH",
-        os.path.expanduser("~/wiki/")
+        "MINNI_VAULT_PATH",
+        os.path.join(CANONICAL_SOVEREIGN_HOME, "vault/")
     )
     db_path: str = os.environ.get(
-        "SOVEREIGN_DB_PATH",
-        os.path.join(CANONICAL_SOVEREIGN_HOME, "sovereign_memory.db")
+        "MINNI_DB_PATH",
+        os.path.join(CANONICAL_SOVEREIGN_HOME, "minni.db")
     )
     graph_export_dir: str = os.environ.get(
-        "SOVEREIGN_GRAPH_DIR",
+        "MINNI_GRAPH_DIR",
         os.path.join(CANONICAL_SOVEREIGN_HOME, "graphs/")
     )
     faiss_index_path: str = os.environ.get(
-        "SOVEREIGN_FAISS_PATH",
-        os.path.join(CANONICAL_SOVEREIGN_HOME, "sovereign_faiss.index")
+        "MINNI_FAISS_PATH",
+        os.path.join(CANONICAL_SOVEREIGN_HOME, "minni_faiss.index")
     )
 
-    # Multiple wiki paths to index alongside the vault
-    wiki_paths: list = field(default_factory=lambda: [
-        os.path.expanduser("~/wiki"),
-    ])
+    # Additional paths to index alongside the vault (operator-configurable)
+    wiki_paths: list = field(default_factory=lambda: [])
 
     # Embedding model
     embedding_model: str = "all-MiniLM-L6-v2"
@@ -92,7 +90,7 @@ class SovereignConfig:
     # Write-back memory
     writeback_enabled: bool = True
     writeback_path: str = os.environ.get(
-        "SOVEREIGN_WRITEBACK_PATH",
+        "MINNI_WRITEBACK_PATH",
         os.path.join(CANONICAL_SOVEREIGN_HOME, "learnings/")
     )
 
@@ -115,9 +113,9 @@ class SovereignConfig:
     hyde_confidence_floor: float = 0.4
 
     # AFM self-organization loop (PR-12)
-    # Opt-in. Set SOVEREIGN_AFM_LOOP=on/1/true to enable; "off" is a kill switch.
+    # Opt-in. Set MINNI_AFM_LOOP=on/1/true to enable; "off" is a kill switch.
     afm_loop_schedule: dict = field(default_factory=lambda: {
-        "enabled": os.environ.get("SOVEREIGN_AFM_LOOP", "off").lower() in {"1", "true", "yes", "on"},
+        "enabled": os.environ.get("MINNI_AFM_LOOP", "off").lower() in {"1", "true", "yes", "on"},
         "idle_seconds": 300,
         "draft_ttl_days": 14,
         "passes": {
@@ -188,32 +186,32 @@ def resolve_canonical_path(kind: str) -> str:
     """G02 single resolver: returns the unified default for a path kind.
     All call sites (config, sovrd, plugin parity) should go through this or
     the dataclass which now derives from CANONICAL_SOVEREIGN_HOME.
-    Logs on SOVEREIGN_* env vs computed mismatch for operator visibility.
+    Logs on MINNI_* env vs computed mismatch for operator visibility.
     """
     home = CANONICAL_SOVEREIGN_HOME
     mapping = {
         "home": home,
-        "db": os.path.join(home, "sovereign_memory.db"),
-        "faiss": os.path.join(home, "sovereign_faiss.index"),
+        "db": os.path.join(home, "minni.db"),
+        "faiss": os.path.join(home, "minni_faiss.index"),
         "graph": os.path.join(home, "graphs/"),
         "writeback": os.path.join(home, "learnings/"),
-        "vault": os.path.expanduser("~/wiki/"),
-        "socket": os.path.join(home, "run", "sovrd.sock"),
+        "vault": os.path.join(home, "vault/"),
+        "socket": os.path.join(home, "run", "minnid.sock"),
     }
     val = mapping.get(kind, home)
     env_map = {
-        "db": "SOVEREIGN_DB_PATH",
-        "faiss": "SOVEREIGN_FAISS_PATH",
-        "graph": "SOVEREIGN_GRAPH_DIR",
-        "writeback": "SOVEREIGN_WRITEBACK_PATH",
-        "vault": "SOVEREIGN_VAULT_PATH",
+        "db": "MINNI_DB_PATH",
+        "faiss": "MINNI_FAISS_PATH",
+        "graph": "MINNI_GRAPH_DIR",
+        "writeback": "MINNI_WRITEBACK_PATH",
+        "vault": "MINNI_VAULT_PATH",
     }
     env_key = env_map.get(kind)
     if env_key and os.environ.get(env_key):
         env_val = os.path.expanduser(os.environ[env_key])
         if env_val != val:
             logging.getLogger(__name__).info(
-                "Path mismatch: %s=%s but canonical for %s is %s (SOVEREIGN_HOME=%s)",
+                "Path mismatch: %s=%s but canonical for %s is %s (MINNI_HOME=%s)",
                 env_key, env_val, kind, val, home
             )
     return val

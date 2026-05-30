@@ -1,5 +1,5 @@
 """
-Sovereign Memory offline recall evaluation harness.
+Minni offline recall evaluation harness.
 
 The CLI remains here, while implementation lives in focused modules:
 dataset.py, retrievers.py, metrics.py, and judging.py.
@@ -89,7 +89,7 @@ def _write_markdown_comparison(
 ) -> None:
     """Write a Markdown comparison table across all configs."""
     lines = []
-    lines.append("# Sovereign Memory - Recall Eval Report")
+    lines.append("# Minni - Recall Eval Report")
     lines.append(f"\n**Generated:** {datetime.now(timezone.utc).isoformat()}\n")
     lines.append(f"**Queries:** {next(iter(reports.values()))['summary']['n_queries']}\n")
 
@@ -127,7 +127,7 @@ def cmd_run(args: argparse.Namespace) -> None:
     """Run evaluation for one or more configs and write reports."""
     config_names = [c.strip() for c in args.config.split(",")]
     retriever_names = [
-        c.strip() for c in getattr(args, "retrievers", "sovrd").split(",") if c.strip()
+        c.strip() for c in getattr(args, "retrievers", "minnid").split(",") if c.strip()
     ]
 
     unknown = [c for c in config_names if c not in CONFIGS]
@@ -241,7 +241,7 @@ def cmd_record(args: argparse.Namespace) -> None:
 def main(argv: Optional[list[str]] = None) -> None:
     parser = argparse.ArgumentParser(
         prog="python -m engine.eval.harness",
-        description="Sovereign Memory offline recall evaluation harness.",
+        description="Minni offline recall evaluation harness.",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -264,13 +264,13 @@ def main(argv: Optional[list[str]] = None) -> None:
     )
     run_p.add_argument(
         "--retrievers",
-        default="sovrd",
-        help="Comma-separated retrievers: sovrd,ripgrep,raw-context,vendor,mock",
+        default="minnid",
+        help="Comma-separated retrievers: minnid,ripgrep,raw-context,vendor,mock",
     )
     run_p.add_argument(
         "--gate",
         action="store_true",
-        help="Validate queries and fail if sovrd loses to ripgrep on >20%% of comparable queries",
+        help="Validate queries and fail if minnid loses to ripgrep on >20%% of comparable queries",
     )
 
     rec_p = sub.add_parser("record", help="Append a query to eval/queries.jsonl")

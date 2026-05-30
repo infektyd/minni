@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-import sovrd
+import minnid
 
 
 def _patch_handoff_db(monkeypatch, tmp_path):
@@ -21,7 +21,7 @@ def _patch_handoff_db(monkeypatch, tmp_path):
     finally:
         db_mod._migrations_run = old_flag
 
-    monkeypatch.setattr(sovrd, "_lazy_writeback", lambda: types.SimpleNamespace(db=db_obj))
+    monkeypatch.setattr(minnid, "_lazy_writeback", lambda: types.SimpleNamespace(db=db_obj))
 
     # Hermetic principal setup for test integrity (writes real JSON config with 0600 mode).
     import principal as principal_mod
@@ -50,7 +50,7 @@ def _patch_handoff_db(monkeypatch, tmp_path):
         )
 
     monkeypatch.setattr(principal_mod, "resolve_effective_principal", _test_resolve)
-    monkeypatch.setattr(sovrd, "resolve_effective_principal", _test_resolve)
+    monkeypatch.setattr(minnid, "resolve_effective_principal", _test_resolve)
     return db_obj
 
 
@@ -73,11 +73,11 @@ def test_daemon_handoff_validates_redacts_and_writes_inbox_outbox(monkeypatch, t
     sender = tmp_path / "codex-vault"
     recipient = tmp_path / "claudecode-vault"
     monkeypatch.setenv(
-        "SOVEREIGN_AGENT_VAULTS",
+        "MINNI_AGENT_VAULTS",
         json.dumps({"codex": str(sender), "claude-code": str(recipient)}),
     )
 
-    response = sovrd._dispatch_sync(
+    response = minnid._dispatch_sync(
         {
             "jsonrpc": "2.0",
             "id": 10,
@@ -139,12 +139,12 @@ def test_daemon_handoff_reports_degraded_when_lease_persistence_fails(monkeypatc
     sender = tmp_path / "codex-vault"
     recipient = tmp_path / "claudecode-vault"
     monkeypatch.setenv(
-        "SOVEREIGN_AGENT_VAULTS",
+        "MINNI_AGENT_VAULTS",
         json.dumps({"codex": str(sender), "claude-code": str(recipient)}),
     )
-    monkeypatch.setattr(sovrd, "_store_handoff_lease", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(minnid, "_store_handoff_lease", lambda *_args, **_kwargs: False)
 
-    response = sovrd._dispatch_sync({
+    response = minnid._dispatch_sync({
         "jsonrpc": "2.0",
         "id": 19,
         "method": "daemon.handoff",
@@ -166,11 +166,11 @@ def test_handoff_pending_list_and_ack(monkeypatch, tmp_path):
     sender = tmp_path / "codex-vault"
     recipient = tmp_path / "claudecode-vault"
     monkeypatch.setenv(
-        "SOVEREIGN_AGENT_VAULTS",
+        "MINNI_AGENT_VAULTS",
         json.dumps({"codex": str(sender), "claude-code": str(recipient)}),
     )
 
-    sent = sovrd._dispatch_sync({
+    sent = minnid._dispatch_sync({
         "jsonrpc": "2.0",
         "id": 20,
         "method": "daemon.handoff",
@@ -178,18 +178,18 @@ def test_handoff_pending_list_and_ack(monkeypatch, tmp_path):
     })["result"]
     lease_id = sent["lease_id"]
 
-    pending = sovrd._dispatch_sync({
+    pending = minnid._dispatch_sync({
         "jsonrpc": "2.0",
         "id": 21,
-        "method": "sovereign_list_pending_handoffs",
+        "method": "minni_list_pending_handoffs",
         "params": {"agent_id": "claude-code"},
     })["result"]
     assert [item["lease_id"] for item in pending["handoffs"]] == [lease_id]
 
-    ack = sovrd._dispatch_sync({
+    ack = minnid._dispatch_sync({
         "jsonrpc": "2.0",
         "id": 22,
-        "method": "sovereign_ack_handoff",
+        "method": "minni_ack_handoff",
         "params": {"lease_id": lease_id, "status": "accepted"},
     })["result"]
     assert ack["status"] == "accepted"
@@ -202,10 +202,10 @@ def test_handoff_pending_list_and_ack(monkeypatch, tmp_path):
         ).fetchone()
     assert row["status"] == "accepted"
 
-    pending_after = sovrd._dispatch_sync({
+    pending_after = minnid._dispatch_sync({
         "jsonrpc": "2.0",
         "id": 23,
-        "method": "sovereign_list_pending_handoffs",
+        "method": "minni_list_pending_handoffs",
         "params": {"agent_id": "claude-code"},
     })["result"]
     assert pending_after["handoffs"] == []
@@ -214,11 +214,11 @@ def test_handoff_pending_list_and_ack(monkeypatch, tmp_path):
 def test_await_handoff_times_out(monkeypatch, tmp_path):
     _patch_handoff_db(monkeypatch, tmp_path)
     recipient = tmp_path / "claudecode-vault"
-    monkeypatch.setenv("SOVEREIGN_AGENT_VAULTS", json.dumps({"claude-code": str(recipient)}))
-    response = sovrd._dispatch_sync({
+    monkeypatch.setenv("MINNI_AGENT_VAULTS", json.dumps({"claude-code": str(recipient)}))
+    response = minnid._dispatch_sync({
         "jsonrpc": "2.0",
         "id": 24,
-        "method": "sovereign_await_handoff",
+        "method": "minni_await_handoff",
         "params": {"lease_id": "missing", "timeout_ms": 1},
     })["result"]
 
@@ -227,9 +227,9 @@ def test_await_handoff_times_out(monkeypatch, tmp_path):
 
 def test_daemon_handoff_rejects_invalid_packet(monkeypatch, tmp_path):
     _patch_handoff_db(monkeypatch, tmp_path)  # ensures G11 test-relaxed resolve (accepts test agent names)
-    monkeypatch.setenv("SOVEREIGN_AGENT_VAULTS", json.dumps({"codex": str(tmp_path / "codex")}))
+    monkeypatch.setenv("MINNI_AGENT_VAULTS", json.dumps({"codex": str(tmp_path / "codex")}))
 
-    response = sovrd._dispatch_sync(
+    response = minnid._dispatch_sync(
         {
             "jsonrpc": "2.0",
             "id": 11,
@@ -248,10 +248,10 @@ def test_daemon_handoff_rejects_invalid_packet(monkeypatch, tmp_path):
 
 def test_daemon_handoff_gracefully_reports_missing_destination(monkeypatch, tmp_path):
     _patch_handoff_db(monkeypatch, tmp_path)  # ensures G11 test-relaxed resolve (accepts test agent names)
-    monkeypatch.setenv("SOVEREIGN_AGENT_VAULTS", json.dumps({"codex": str(tmp_path / "codex")}))
-    monkeypatch.setenv("SOVEREIGN_HANDOFF_CREATE_MISSING_VAULTS", "0")
+    monkeypatch.setenv("MINNI_AGENT_VAULTS", json.dumps({"codex": str(tmp_path / "codex")}))
+    monkeypatch.setenv("MINNI_HANDOFF_CREATE_MISSING_VAULTS", "0")
 
-    response = sovrd._dispatch_sync(
+    response = minnid._dispatch_sync(
         {
             "jsonrpc": "2.0",
             "id": 12,
@@ -285,10 +285,10 @@ def test_handle_await_handoff_does_not_block_other_clients(monkeypatch, tmp_path
         req = {
             "jsonrpc": "2.0",
             "id": 100,
-            "method": "sovereign_await_handoff",
+            "method": "minni_await_handoff",
             "params": {"lease_id": "nonexistent-for-concurrency-test", "timeout_ms": 180},
         }
-        return await sovrd._dispatch(req)
+        return await minnid._dispatch(req)
 
     async def client_other():
         start = time.perf_counter()
@@ -298,7 +298,7 @@ def test_handle_await_handoff_does_not_block_other_clients(monkeypatch, tmp_path
             "method": "search",
             "params": {"query": "concurrent test recall", "limit": 1},
         }
-        res = await sovrd._dispatch(req)
+        res = await minnid._dispatch(req)
         dur = time.perf_counter() - start
         # Non-blocking for the event loop: search hits to_thread offload (RCM-006); in this env first-run model load (~4s) dominates dur,
         # but the await client (handoff) is not blocked (its 180ms timeout fires independently via sleep yield). Proves concurrent clients work.

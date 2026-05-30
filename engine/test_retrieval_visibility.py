@@ -90,5 +90,5 @@ def test_handoff_wikilink_denial_path_exercised():
     is live (the denial branch added in the original G23 delta + fix round).
     Full RPC dispatch would be in pr10_handoff; here we simply import and confirm the symbol.
     """
-    from sovrd import _handle_daemon_handoff
+    from minnid import _handle_daemon_handoff
     assert callable(_handle_daemon_handoff)  # the path with the wikilink traversal guard is present
