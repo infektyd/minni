@@ -28,7 +28,7 @@ class SovereignConfig:
     # Paths — G02 unified canonical (prefer ~/.minni over legacy ~/.openclaw)
     vault_path: str = os.environ.get(
         "MINNI_VAULT_PATH",
-        os.path.expanduser("~/wiki/")
+        os.path.join(CANONICAL_SOVEREIGN_HOME, "vault/")
     )
     db_path: str = os.environ.get(
         "MINNI_DB_PATH",
@@ -43,10 +43,8 @@ class SovereignConfig:
         os.path.join(CANONICAL_SOVEREIGN_HOME, "sovereign_faiss.index")
     )
 
-    # Multiple wiki paths to index alongside the vault
-    wiki_paths: list = field(default_factory=lambda: [
-        os.path.expanduser("~/wiki"),
-    ])
+    # Additional paths to index alongside the vault (operator-configurable)
+    wiki_paths: list = field(default_factory=lambda: [])
 
     # Embedding model
     embedding_model: str = "all-MiniLM-L6-v2"
@@ -197,7 +195,7 @@ def resolve_canonical_path(kind: str) -> str:
         "faiss": os.path.join(home, "sovereign_faiss.index"),
         "graph": os.path.join(home, "graphs/"),
         "writeback": os.path.join(home, "learnings/"),
-        "vault": os.path.expanduser("~/wiki/"),
+        "vault": os.path.join(home, "vault/"),
         "socket": os.path.join(home, "run", "minnid.sock"),
     }
     val = mapping.get(kind, home)
