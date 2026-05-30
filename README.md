@@ -1,392 +1,254 @@
-<!-- Minni — README
-     Narrative direction · DESIGN.md-aligned palette · pre-v1 alpha
-     Visuals live in docs/readme-assets/ as light + dark SVG pairs.
-     Collapsible sections use native <details>. Mobile-friendly. -->
+# Minni
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/readme-assets/hero-dark.svg">
-  <img alt="Minni — local-first memory and governance layer for AI agents" src="docs/readme-assets/hero-light.svg">
-</picture>
+![Status](https://img.shields.io/badge/status-pre--v1_alpha-blue?style=flat-square)
+![Python](https://img.shields.io/badge/python-3.11+-3776AB?style=flat-square)
+![Node](https://img.shields.io/badge/node-18+-339933?style=flat-square)
+![Tests](https://img.shields.io/badge/tests-474_passing-brightgreen?style=flat-square)
+![License](https://img.shields.io/badge/license-MIT-lightgrey?style=flat-square)
 
-<sub>454 tests passing · 26 MCP tools · MIT · no telemetry · no cloud sync</sub>
+**Local-first memory and governance layer for AI agents.**
 
----
+> *Identity loads whole. Knowledge loads chunked.*
 
-## Contents
+Minni gives long-running agent work a durable spine — identity, working state,
+retrieval, evidence, handoffs, learning proposals, and audit trails that stay
+inspectable on your own machine. It sits between *chat-history-as-memory* and
+*pure RAG*: an agent resumes with typed state, verified evidence, open loops,
+and a clear next action instead of rediscovering context from scratch.
 
-- [§ I — The problem](#-i--the-problem)
-- [§ II — The bet](#-ii--the-bet)
-- [§ III — The proof](#-iii--the-proof)
-- [§ 04 — Component status](#-04--component-status)
-- [§ 05 — Plugin surfaces](#-05--plugin-surfaces)
-- [§ 06 — Getting started](#-06--getting-started)
-- [§ 07 — Vault model](#-07--vault-model)
-- [§ 7b — AFM provider modes](#-7b--afm-provider-modes)
-- [§ 7c — Evaluation](#-7c--evaluation)
-- [§ 08 — Local-first security](#-08--local-first-security)
-- [§ 09 — Verification gate](#-09--verification-gate)
-- [§ 10 — Repository map](#-10--repository-map)
+> **Pre-v1.** Core subsystems work and are tested, but integration depth varies.
+> The [status table](#project-status) below is the honest state of each piece.
 
 ---
 
-## § I — The problem
+## Highlights
 
-**Agent memory keeps failing in three predictable ways.**
-
-Every long-running agent eventually hits the wall of *"what did I learn last session?"* The current answers all break in their own way.
-
-| | Chat history | RAG over files | Wiki / markdown notes |
-|---|---|---|---|
-| **Works** | simple · works out of the box | useful for lookup | human-readable, durable |
-| **Breaks on** | opaque, bloated, hard to audit over time | rediscovers context · loses working state | weak provenance · poor contradiction handling |
-
----
-
-## § II — The bet
-
-**Memory should be layered state, not one flat blob.**
-
-Each layer carries its own load rule — what comes back every session versus what's retrieved only when needed. Identity is small and always present. Knowledge is large and arrives in chunks, cited.
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/readme-assets/memory-layers-dark.svg">
-  <img alt="Memory layers — identity loads whole, knowledge loads chunked" src="docs/readme-assets/memory-layers-light.svg">
-</picture>
-
----
-
-## § III — The proof
-
-**What a session rehydration actually produces.**
-
-A resumed session doesn't retrieve documents — it produces the smallest packet that lets an agent resume safely. Verified facts, plausible-but-unconfirmed state, open loops, the next concrete check, and an explicit "do not claim" list.
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/readme-assets/rehydration-card-dark.svg">
-  <img alt="Session rehydration packet — the artifact, not the agent" src="docs/readme-assets/rehydration-card-light.svg">
-</picture>
-
-<sub><em>fig. iii — the artifact, not the agent</em></sub>
-
----
-
-<details open>
-<summary><strong>§ 04 — Component status</strong></summary>
-
-<br>
-
-Honest maturity by subsystem. **Stable** means tested and relied upon. **Beta** works but the API may shift before v1. **Alpha** is functional with rough edges.
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/readme-assets/status-tiers-dark.svg">
-  <img alt="Component status — 3 stable, 7 beta, 6 alpha" src="docs/readme-assets/status-tiers-light.svg">
-</picture>
-
-**Not in matrix** — Qdrant / Lance vector backends (stub · FAISS is the only active backend) · comparative eval vs RAG / wiki-only baselines (planned · harness exists)
-
-</details>
-
----
-
-<details open>
-<summary><strong>§ 05 — Plugin surfaces</strong></summary>
-
-<br>
-
-The plugin implements the **Model Context Protocol** — any MCP-speaking agent can connect via `.mcp.json`. Convenience manifests below register the same server with specific agent runtimes.
-
-<details>
-<summary><strong>Compatible agents · 6 runtimes</strong></summary>
-
-| Agent | Manifest |
-|---|---|
-| Codex | `.codex-plugin/` |
-| Claude Code | `.claude-plugin/` |
-| Gemini | `.gemini-plugin/` |
-| KiloCode | `.kilocode-plugin/` |
-| Grok Build | `plugins/grok-minni/` |
-| Any MCP client | `.mcp.json` |
-
-</details>
-
-<details>
-<summary><strong>MCP tool surface · 26 tools</strong></summary>
-
-| Category | Count | Example |
+| | Feature | What it does |
 |---|---|---|
-| RECALL | 7 | `minni_status` |
-| LEARNING | 4 | `minni_learn` |
-| AUDIT | 3 | `minni_audit_report` |
-| COMPILE | 1 | `minni_compile_vault` |
-| HANDOFF | 4 | `minni_negotiate_handoff` |
-| MULTI-AGENT | 7 | `minni_ping_agent_request` |
-
-Source: [`plugins/minni/src/server.ts`](plugins/minni/src/server.ts)
-
-</details>
-
-<details>
-<summary><strong>Lifecycle hooks · 4 events</strong> (host-invoked · runs alongside MCP)</summary>
-
-| Event | Runtimes | Purpose |
-|---|---|---|
-| `SessionStart` | Claude Code · Codex · Grok Build | rehydrate identity + state · inject Layer 1 reminder |
-| `UserPromptSubmit` | Claude Code · Codex · Grok Build | intercept · classify intent · record audit |
-| `PreCompact` | Claude Code · Codex · Grok Build | snapshot scar tissue before context window compaction |
-| `Stop` | Claude Code · Grok Build | end-of-session capture · close audit window |
-
-</details>
-
-<details>
-<summary><strong>Slash commands · Grok Build native</strong></summary>
-
-Detected inside `UserPromptSubmit`, each auto-drafts a `prepare_outcome` candidate to the inbox.
-
-| Command | Action |
-|---|---|
-| `/flush` | Grok-native flush → auto-draft `prepare_outcome` candidate |
-| `/compact` | Grok-native compact → auto-draft `prepare_outcome` candidate |
-| `/dream` | Grok-native dream → auto-draft `prepare_outcome` candidate |
-
-</details>
-
-> [!NOTE]
-> **Behavior.** Automatic activity is recall-only. Durable learning follows a proposal-first path — `minni_learn` stages a candidate; only `minni_resolve_candidate` (operator-gated) writes permanent memory. Cross-agent info sharing requires explicit vault-backed ping contracts.
-
-</details>
+| ♻️ | **Session rehydration** | Resume with verified facts, remembered-but-unverified state, open loops, and a first verification step |
+| 🧩 | **Agent-agnostic MCP plugin** | One standard MCP server (`minni@minni`) — works with any MCP client. Ships manifests for Codex, Claude Code, Gemini, KiloCode |
+| 🔒 | **Proposal-first learning** | No silent writes — `minni_learn` stages candidates; only operator-gated resolution writes durable memory |
+| 🔍 | **Hybrid retrieval** | FTS5 + FAISS + reranking, query expansion, HyDE, token budgets, centralized read gates |
+| 🍎 | **Native AFM support** | Apple Foundation Models via a local helper, with bridge fallback and opt-out |
+| 📓 | **Obsidian vaults** | Human-readable wiki, logs, raw material, and per-agent inbox/outbox handoffs |
+| 🤝 | **Cross-agent contracts** | Vault-backed ping contracts with explicit approve/deny — no agent reads another's private memory directly |
+| 🛡️ | **Local-first governance** | Server-stamped identity, read policy, audit trails, and memory-hygiene contracts |
 
 ---
 
-<details open>
-<summary><strong>§ 06 — Getting started</strong></summary>
+## Project status
 
-<br>
+Minni is in active development toward v1. Components sit at different maturity
+levels; this table is the honest picture, not a roadmap.
 
-### Prerequisites
+| Component | Status | Notes |
+|---|---|---|
+| SQLite runtime + migrations | **stable** | WAL mode, additive migrations tracked by `PRAGMA user_version` |
+| MCP plugin server | **beta** | 26 `minni_*` tools, agent-agnostic; any MCP client can connect |
+| Hybrid retrieval (FTS5 + FAISS) | **beta** | FTS5 → FAISS → RRF → rerank works; needs comparative eval vs baselines |
+| Proposal-first learning | **beta** | Stage → list → resolve; operator-gated writes enforced |
+| Vault model + wiki indexer | **beta** | Structure stable; vault files → SQLite/FAISS pipeline works |
+| Identity + read policy | **beta** | `EffectivePrincipal` stamps identity, vault roots, capabilities; one read gate |
+| Handoff (inbox/outbox) | **beta** | Vault-backed handoff pages; ack/await flows work |
+| Cross-agent ping contracts | **alpha** | Protocol works (request → inbox → decide → status); limited real-world use |
+| AFM provider (native/bridge) | **alpha** | macOS-only; bridge is default; native needs the Foundation Models framework |
+| Compile passes (AFM) | **alpha** | 5 passes; dry-run only by default |
+| Team coordination | **alpha** | 3 tools registered; multi-agent scenarios largely untested |
+| Per-agent vault isolation | **alpha** | Enforcement engine built + tested; hardening tracked separately |
+| Qdrant / Lance backends | **stub** | Placeholders; FAISS is the only active vector backend |
+| Comparative eval vs baselines | **not started** | Harness exists; no head-to-head against RAG / wiki-only yet |
 
-| | |
-|---|---|
-| **python** | 3.11 or 3.12 (3.14 may produce partial installs) |
-| **node** | 20 (`package.json` requires `>= 20 < 21`) |
-| **platform** | macOS for AFM features · linux for everything else |
-| **storage** | ~ 50 MB initial · grows with vault size |
-| **network** | none required at runtime |
+*Stable* = relied upon, breaking changes need migration · *Beta* = works + tested, API may shift ·
+*Alpha* = functional but early · *Stub* = interface only.
 
-### Engine · python daemon
+---
+
+## How it works
+
+Memory is layered state, not one flat blob:
+
+| Layer | Loading rule | Purpose |
+|---|---|---|
+| **Identity** | load whole | who the agent is, role, constraints, standing rules |
+| **Project state** | compact packet | active branch, status, blockers, recent decisions, next checks |
+| **Evidence** | retrieve by need | source-backed facts, artifacts, logs, traces, citations |
+| **Knowledge** | retrieve chunked | larger wiki/docs/history — cited and validated, never assumed |
+
+A resumed session doesn't just return documents — it produces a small packet:
+
+```
+Verified now:            facts checked against current artifacts
+Remembered (unverified): plausible memory needing confirmation
+Open loops:              tasks left incomplete
+First verification:      the next concrete check before acting
+Do-not-claim:            stale, contradicted, or unsupported claims
+```
+
+The goal is the *smallest* packet that lets an agent resume safely. **SQLite is
+runtime truth; vault pages, FAISS files, and compile drafts are derived surfaces.**
+If a simpler model achieves the same recovery quality, the right move is to
+delete complexity.
+
+---
+
+## Getting started
+
+**Prerequisites:** Python 3.11+, Node.js 18+.
 
 ```bash
+# 1. Engine (Python daemon)
 cd engine
 python3 -m pip install -r requirements.txt
-
-# start the daemon
 python3 minnid.py --socket ~/.minni/run/minnid.sock
-```
 
-### Plugin · typescript MCP server
-
-```bash
+# 2. Plugin (TypeScript) — in another terminal
 cd plugins/minni
-npm install
-npm test
+npm install && npm test
 
-# optional: local console UI
-npm run console
-```
-
-### Verify · against the running daemon
-
-```bash
+# 3. Verify the daemon answers
 cd engine
 python3 minnid_client.py --socket ~/.minni/run/minnid.sock status
 python3 minnid_client.py --socket ~/.minni/run/minnid.sock search "memory handoff"
 ```
 
-### Multi-agent install · minni-propagation
+> **Tip:** for reproducible NumPy/FAISS, use a clean venv:
+> `python3 -m venv .venv && source .venv/bin/activate && pip install -r engine/requirements.txt`
 
-Per-agent setup runs through the **`minni-propagation`** skill. Each hosted agent gets its own workspace envelope at `~/.minni/identities/<agent>/` and its own vault — no shared state between agents.
+---
 
-Supported platforms: `codex` · `claude-code` · `kilocode` · `gemini` · `grok-build` · `grok-beta` (legacy) · `all` · `generic`
+## Architecture
 
-```bash
-python3 plugins/minni/skills/minni-propagation/scripts/propagate.py update-plugin --platform grok-build
+```mermaid
+flowchart TD
+    Agents["Agents — Codex · Claude Code · Gemini · KiloCode"]
+    Plugin["minni@minni plugin (MCP) — tools · hooks · console"]
+    Daemon["minnid daemon (JSON-RPC over Unix socket)"]
+    Core["Identity & read policy · Hybrid retrieval · Learning pipeline"]
+    Storage[("SQLite + FAISS — runtime truth")]
+    Vaults["Obsidian vaults — wiki · logs · raw · inbox/outbox"]
+
+    Agents --> Plugin --> Daemon --> Core --> Storage
+    Vaults --> Daemon
+    Daemon --> Vaults
 ```
 
-See [`plugins/minni/skills/minni-propagation/SKILL.md`](plugins/minni/skills/minni-propagation/SKILL.md) and [`minni/docs/DESIGN-sovereign-delivery-layer.md`](minni/docs/DESIGN-sovereign-delivery-layer.md) for the full design.
+Each agent is its own pipeline into the plugin; the plugin alone talks to
+`minnid`, which is the single gatekeeper to the vault. Agents never touch the
+filesystem directly — they ask `minnid`, which applies the caller's identity and
+read policy and returns only what that agent is allowed to see.
+
+---
+
+## Plugin surfaces
+
+The plugin implements the [Model Context Protocol](https://modelcontextprotocol.io/),
+so any MCP client can connect. Per-agent manifests are thin wrappers that
+register the same server with a pinned identity and vault:
+
+| Integration | Manifest |
+|---|---|
+| Any MCP client | [`.mcp.json`](plugins/minni/.mcp.json) |
+| Claude Code | [`.claude-plugin/`](plugins/minni/.claude-plugin/) + hooks |
+| Codex | [`.codex-plugin/`](plugins/minni/.codex-plugin/) |
+| Gemini | [`.gemini-plugin/`](plugins/minni/.gemini-plugin/) |
+| KiloCode | [`.kilocode-plugin/`](plugins/minni/.kilocode-plugin/) |
+
+**Automatic behavior is recall-only.** Durable learning is proposal-first
+(`minni_learn` stages → `minni_resolve_candidate` writes), and cross-agent
+sharing requires an explicit vault-backed ping contract.
+
+<details>
+<summary><strong>All 26 tools</strong></summary>
+
+`minni_status` · `minni_recall` · `minni_drill` · `minni_prepare_task` ·
+`minni_prepare_outcome` · `minni_route` · `minni_export_pack` ·
+`minni_learning_quality` · `minni_learn` · `minni_resolve_candidate` ·
+`minni_vault_write` · `minni_audit_report` · `minni_audit_tail` ·
+`minni_compile_vault` · `minni_negotiate_handoff` · `minni_ack_handoff` ·
+`minni_list_pending_handoffs` · `minni_await_handoff` ·
+`minni_ping_agent_request` · `minni_ping_agent_inbox` ·
+`minni_ping_agent_decide` · `minni_ping_agent_status` ·
+`minni_subscribe_contradictions` · `minni_team_runtime` ·
+`minni_team_evidence` · `minni_team_promotion`
 
 </details>
 
 ---
 
-<details>
-<summary><strong>§ 07 — Vault model</strong></summary>
+## AFM provider modes
 
-<br>
-
-Each agent can have its own Obsidian vault while sharing the same daemon and database. The vault is the human-readable memory surface; **SQLite remains runtime truth**.
-
-```
-vault/
-  index.md
-  log.md
-  logs/
-  raw/
-  wiki/
-  wiki/handoffs/
-  inbox/
-  outbox/
-  schema/
-```
-
-The `minni_vault_write` tool accepts six section types: `raw` · `entities` · `concepts` · `decisions` · `syntheses` · `sessions`.
-
-> Short, sourced wiki pages with frontmatter for durable knowledge. Raw / private logs stay local, out of public git.
-
-</details>
-
----
-
-<details>
-<summary><strong>§ 7b — AFM provider modes</strong></summary>
-
-<br>
-
-AFM (Apple Foundation Models) calls are optional and local-only.
+Apple Foundation Models calls are optional and local-only. Set
+`MINNI_AFM_PROVIDER_MODE`:
 
 | Mode | Behavior |
 |---|---|
-| `off` | Skip AFM calls, use deterministic fallback |
-| `bridge` | Use localhost OpenAI-compatible bridge (default) |
-| `native` | Use local JSON helper via Foundation Models framework |
-| `auto` | Prefer native when available, fall back to bridge |
+| `off` | skip AFM, use deterministic fallback |
+| `bridge` | localhost OpenAI-compatible bridge (**default**) |
+| `native` | local helper via the Foundation Models framework |
+| `auto` | native when available, else bridge |
 
-Configure with `MINNI_AFM_PROVIDER_MODE` or the per-call `afmProviderMode` option.
-
-```bash
-# Run AFM tests
-cd plugins/minni
-MINNI_AFM_PROVIDER_MODE=auto npm test -- tests/afm.test.mjs
-```
-
-```bash
-# Run compile passes as review-only dry-runs
-cd engine
-MINNI_AFM_LOOP=on python3 -m sovereign_memory compile --pass session_distillation --dry-run
-MINNI_AFM_LOOP=on python3 -m sovereign_memory compile --pass synthesis --dry-run
-```
-
-Native provider metadata is sanitized before reaching status reports or model
-packets. Adapter configuration is reported as `adapter_configured` /
-`adapterConfigured` (boolean only) — private adapter paths are never emitted.
-
-</details>
+Adapter configuration is reported as a boolean only — private adapter paths are
+never emitted.
 
 ---
 
-<details>
-<summary><strong>§ 7c — Evaluation</strong></summary>
+## Vault model
 
-<br>
+Each agent has its own Obsidian vault under `~/.minni/<agent>-vault`, sharing the
+same daemon and database:
 
-The project should be judged by **recovery quality**, not by how elaborate the
-memory machinery looks.
-
-**Baselines to compare against:**
-
-1. No memory — only the new prompt
-2. Raw chat summary
-3. Plain RAG over repo/docs
-4. Wiki-only filesystem memory
-5. Minni rehydration with typed state and open loops
-
-**Metrics that matter:** correct next action after restart, unsupported claims
-made during restart, evidence coverage, token cost of rehydration, time to
-resume useful work, and contradiction handling.
-
-> If the wiki-only or plain-RAG baseline matches Minni on these
-> metrics, the right engineering answer is to delete complexity.
-
-</details>
-
----
-
-<details>
-<summary><strong>§ 08 — Local-first security</strong></summary>
-
-<br>
-
-Local-first is real only when four assumptions hold on the host:
-
-1. **User account is the security perimeter** — single-user host model
-2. **FileVault is enabled** — database + vault encrypted at rest
-3. **No cloud sync over vault or DB** — iCloud · Dropbox · Drive · OneDrive
-4. **Local-only transports** — no remote JSON-RPC fallback at v1
-
-### Exclude from Time Machine + Spotlight
-
-```bash
-xattr -w com.apple.metadata:com_apple_backup_excludeItem true \
-  ~/.minni/minni.db
-xattr -w com.apple.metadata:com_apple_backup_excludeItem true \
-  ~/.minni/codex-vault
+```
+<agent>-vault/
+  index.md   log.md   logs/   raw/
+  wiki/   wiki/handoffs/   inbox/   outbox/   schema/
 ```
 
-> [!WARNING]
-> Planned providers — Ollama, MLX, Gemma via Google OAuth — break the local-only posture if enabled. They are opt-in only and will be labeled in-product.
-
-</details>
-
----
-
-<details>
-<summary><strong>§ 09 — Verification gate</strong></summary>
-
-<br>
-
-Before pushing a release candidate, run the full gate:
-
-```bash
-cd engine && pytest -q                          # expect 333 passed
-cd ../plugins/minni && npm test      # expect 121 passed
-npm run smoke:hook
-```
-
-Then a temp-state live smoke: start `minnid.py` on a temporary Unix socket, call plugin helpers for status, recall, compile dry-run, and handoff, verify redaction and traceability, and confirm clean `SIGTERM` shutdown. Migration safety is always run on a SQLite backup, **never the live DB**.
-
-</details>
+Use short, sourced wiki pages with frontmatter for durable knowledge. Raw
+session material and private logs stay local and out of public git unless
+explicitly sanitized.
 
 ---
 
-<details>
-<summary><strong>§ 10 — Repository map</strong></summary>
+## Local-first security
 
-<br>
+Minni is local-first only when these hold on the host:
 
-### Top-level directories
+1. The **macOS user account** is the security perimeter (single-user box).
+2. **FileVault on** — database and vault encrypted at rest.
+3. **No cloud sync** — `~/.minni/` (incl. `minni.db` + `-wal`/`-shm`) is not under
+   iCloud / Dropbox / Drive / OneDrive.
+4. **Local-only transport** — JSON-RPC over a Unix socket; no remote fallback at v1.
+
+The daemon ships as a launchd agent (`com.minni.minnid`) with `Umask 077` so logs
+stay `0600`.
+
+---
+
+## Repository map
 
 | Path | Contents |
 |---|---|
-| [`engine/`](engine/) | python daemon · retrieval · migrations · compile passes · eval harness |
-| [`plugins/minni/`](plugins/minni/) | agent-agnostic MCP plugin · 19 ts modules · 19 test files · console UI |
-| [`minni/`](minni/) | delivery layer · `minni-propagation` skill · workflows · design docs |
+| [`engine/`](engine/) | Python daemon (`minnid.py`), retrieval, migrations, compile passes, eval harness |
+| [`plugins/minni/`](plugins/minni/) | Agent-agnostic MCP plugin + per-agent manifests |
 | [`openclaw-extension/`](openclaw-extension/) | OpenClaw bridge and import tooling |
-| [`docs/contracts/`](docs/contracts/) | AGENT · CAPABILITIES · PAGE_TYPES · POLICY · THREAT_MODEL · VAULT · WORKFLOWS |
-| [`eval/`](eval/) | recall fixtures and generated evaluation reports |
+| [`docs/`](docs/) | Contracts, canonical paths, troubleshooting, design specs |
 
-### Heavyweight engine files
-
-| File | Size | Role |
-|---|---|---|
-| [`engine/minnid.py`](engine/minnid.py) | 113 KB | local JSON-RPC daemon — the heart of the runtime |
-| [`engine/retrieval.py`](engine/retrieval.py) | 86 KB | FTS5 + FAISS · rerank · HyDE · query expansion · token budgets · read gate |
-| [`engine/principal.py`](engine/principal.py) | 18 KB | runtime identity · vault roots · capabilities · read authorization |
-| [`engine/sovereign_memory.py`](engine/sovereign_memory.py) | 15 KB | CLI · indexing · stats · hygiene · vector status · compile dry-runs |
-| [`engine/db.py`](engine/db.py) | 14 KB | schema creation · additive migrations via `PRAGMA user_version` |
-| [`engine/afm_provider.py`](engine/afm_provider.py) | 9 KB | normalized AFM contracts · query expansion · neighborhood summary · HyDE |
-
-Also see · [`docs/CANONICAL-PATHS.md`](docs/CANONICAL-PATHS.md) · [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) · [`docs/ENGINEERING-REVIEW.md`](docs/ENGINEERING-REVIEW.md) · [`docs/OBSERVED-USAGE.md`](docs/OBSERVED-USAGE.md)
-
-</details>
+**Key engine files:** `minnid.py` (JSON-RPC daemon) · `principal.py` (identity,
+vault roots, read authorization) · `retrieval.py` (hybrid retrieval + read gate)
+· `db.py` (schema + migrations) · `sovereign_memory.py` (indexing/stats CLI).
 
 ---
 
-<sub>LOCAL-ONLY · NO TELEMETRY · NO CLOUD SYNC · NO REMOTE ENDPOINTS · EVER</sub>
+## Verification
+
+Before cutting a release candidate:
+
+```bash
+cd engine && PYTHONPATH=. pytest -q                 # expect 337 passed, 2 skipped
+cd ../plugins/minni && npm run build && npm test    # expect 137 passed
+bash scripts/repro-smoke.sh                         # hermetic daemon: status + recall + isolation
+```
+
+---
+
+<sub>Minni is a local-only project. No telemetry, no cloud sync, no remote endpoints.</sub>
