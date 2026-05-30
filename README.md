@@ -102,7 +102,7 @@ The plugin implements the **Model Context Protocol** — any MCP-speaking agent 
 | Claude Code | `.claude-plugin/` |
 | Gemini | `.gemini-plugin/` |
 | KiloCode | `.kilocode-plugin/` |
-| Grok Build | `plugins/grok-sovereign-memory/` |
+| Grok Build | `plugins/grok-minni/` |
 | Any MCP client | `.mcp.json` |
 
 </details>

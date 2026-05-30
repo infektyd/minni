@@ -287,7 +287,7 @@ def update_one_plugin(platform: str, args: argparse.Namespace) -> dict[str, obje
     bootstrap_vault(bootstrap_args)
 
     if canonical_platform(platform) == "grok-build":
-        # Grok Build uses its own session-hook integration surface (plugins/grok-sovereign-memory/ in this repo).
+        # Grok Build uses its own session-hook integration surface (plugins/grok-minni/ in this repo).
         # UserPromptSubmit intercepts /flush, /compact, and /dream (plus scar drafting on PreCompact/Stop).
         # Do not copy the full sovereign plugin tree; just ensure the per-agent vault + .mcp.json stamp.
         install_root.mkdir(parents=True, exist_ok=True)
