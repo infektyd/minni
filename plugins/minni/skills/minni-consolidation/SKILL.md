@@ -1,20 +1,20 @@
 ---
-name: sovereign-memory-consolidation
-description: Run Sovereign Memory consolidation pipeline, troubleshoot configuration errors, generate health reports. Handles --limit parameter, timeout diagnostics, and database queries.
+name: minni-consolidation
+description: Run Minni consolidation pipeline, troubleshoot configuration errors, generate health reports. Handles --limit parameter, timeout diagnostics, and database queries.
 version: 1.0.0
 author: Hermes Agent
 license: MIT
 metadata:
   hermes:
-    tags: [sovereign-memory, consolidation, diagnostics, openclaw, cron]
+    tags: [minni, consolidation, diagnostics, openclaw, cron]
     related_skills: [systematic-debugging]
 ---
 
-# Sovereign Memory Consolidation Pipeline
+# Minni Consolidation Pipeline
 
 ## Overview
 
-Run the Sovereign Memory consolidation pipeline to extract facts from session records, consolidate them using local LLMs (E2B/E4B), and update the semantic knowledge base.
+Run the Minni consolidation pipeline to extract facts from session records, consolidate them using local LLMs (E2B/E4B), and update the semantic knowledge base.
 
 ## When to Use
 
@@ -424,7 +424,7 @@ ModuleNotFoundError: No module named 'config'
 
 **Default location checked:**
 ```bash
-SOVEREIGN_PROJECT = ~/Projects/sovereign-memory
+SOVEREIGN_PROJECT = ~/Projects/minni
 ```
 
 **Impact:** Staged facts are successfully consolidated but NOT written to the knowledge graph database. The staging .json file persists and is retried on next run.
@@ -432,10 +432,10 @@ SOVEREIGN_PROJECT = ~/Projects/sovereign-memory
 **Diagnosis:**
 ```bash
 # Check if project directory exists
-ls -d ~/Projects/sovereign-memory && echo "✅ Directory exists" || echo "❌ Directory missing"
+ls -d ~/Projects/minni && echo "✅ Directory exists" || echo "❌ Directory missing"
 
 # Check if config.py exists
-ls -f ~/Projects/sovereign-memory/config.py 2>/dev/null && echo "✅ Module found" || echo "❌ Module missing"
+ls -f ~/Projects/minni/config.py 2>/dev/null && echo "✅ Module found" || echo "❌ Module missing"
 
 # Check environment override
 echo $SOVEREIGN_PROJECT
@@ -446,7 +446,7 @@ echo $SOVEREIGN_PROJECT
 **Option 1 — Install Sovereign Memory (recommended for permanent fix):**
 ```bash
 cd ~/Projects  # or create if missing: mkdir -p ~/Projects
-git clone https://github.com/nous-research/sovereign-memory
+git clone https://github.com/infektyd/minni
 cd sovereign-memory
 pip install -e .
 ```

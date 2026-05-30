@@ -1,20 +1,20 @@
 ---
-name: sovereign-memory-health-check
-description: Automated health monitoring for Sovereign Memory consolidation pipeline. Quick status checks, alerts, and diagnostics for cron jobs and routine monitoring. Detects stalled processes, stale locks, model server issues, and database anomalies.
+name: minni-health-check
+description: Automated health monitoring for Minni consolidation pipeline. Quick status checks, alerts, and diagnostics for cron jobs and routine monitoring. Detects stalled processes, stale locks, model server issues, and database anomalies.
 version: 1.0.0
 author: Hermes Agent
 license: MIT
 metadata:
   hermes:
-    tags: [sovereign-memory, consolidation, health-check, monitoring, cron, diagnostics]
-    related_skills: [sovereign-memory-consolidation, systematic-debugging]
+    tags: [minni, consolidation, health-check, monitoring, cron, diagnostics]
+    related_skills: [minni-consolidation, systematic-debugging]
 ---
 
-# Sovereign Memory Health Check Automation
+# Minni Health Check Automation
 
 ## Overview
 
-Automated health monitoring for the Sovereign Memory consolidation pipeline. Use this skill to:
+Automated health monitoring for the Minni consolidation pipeline. Use this skill to:
 - Generate periodic health reports (hourly, daily, weekly)
 - Detect when models are unresponsive or crashed
 - Identify stale lock files and hung processes
@@ -263,7 +263,7 @@ PYEOF
 # Run at 04:00 UTC (after 03:00 consolidation), send report
 0 4 * * * \
   source ~/.hermes/hermes-agent/venv/bin/activate && \
-  /path/to/health-diagnostic.sh | mail -s "Sovereign Memory Health $(date +%Y-%m-%d)" admin@example.com
+  /path/to/health-diagnostic.sh | mail -s "Minni Health $(date +%Y-%m-%d)" admin@example.com
 ```
 
 ### Alert on Stalled Pipeline
@@ -402,7 +402,7 @@ def send_alert(status, alerts):
     """Send health status to webhook."""
     import httpx
     payload = {
-        "content": f"Sovereign Memory Health: {status}",
+        "content": f"Minni Health: {status}",
         "embeds": [{
             "title": "Pipeline Status",
             "description": "\n".join(alerts),

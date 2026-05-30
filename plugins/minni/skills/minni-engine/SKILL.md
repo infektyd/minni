@@ -1,15 +1,15 @@
 ---
-name: sovereign-memory-engine
-description: Development reference for the Sovereign Memory engine (v3.1/v3.2). Use when modifying the memory system's extraction, reranking, consolidation, or retrieval pipelines.
+name: minni-engine
+description: Development reference for the Minni engine (v3.1/v3.2). Use when modifying the memory system's extraction, reranking, consolidation, or retrieval pipelines.
 tags: [openclaw, memory, llm, faiss, sqlite]
 ---
 
-# Sovereign Memory Engine — Development Reference
+# Minni Engine — Development Reference
 
 ## File Structure
 
 ```
-~/.openclaw/sovereign-memory-v3.1/
+~/.openclaw/minni-v3.1/
 ├── config.py              # Centralized config (dataclass, env var overrides)
 ├── db.py                  # SQLite + FTS5 schema (learnings, chunk_embeddings, episodic_events)
 ├── app.py                 # FastAPI service (all /recall, /learn, /process_conversation endpoints)
@@ -99,7 +99,7 @@ The global `DEFAULT_CONFIG = SovereignConfig()` is imported everywhere.
 ## Testing Changes
 
 ```bash
-cd ~/.openclaw/workspaces/workspace-forge/sovereign-memory-v3.1
+cd ~/.openclaw/workspaces/workspace-forge/minni-v3.1
 source venv/bin/activate
 
 # Syntax check
@@ -118,7 +118,7 @@ curl http://localhost:8312/stats
 
 ## Related Skills
 
-- `sovereign-memory-wiki-ingestion` — Ingest LLM Wiki pages with frontmatter enrichment, wikilink graph extraction, and agent-optimized chunking
+- `minni-wiki-ingestion` — Ingest LLM Wiki pages with frontmatter enrichment, wikilink graph extraction, and agent-optimized chunking
 
 ## Pitfalls
 
