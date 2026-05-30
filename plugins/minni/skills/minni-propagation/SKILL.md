@@ -143,6 +143,20 @@ python3 ~/.codex/skills/sm-propagation/scripts/propagate.py update-plugin --plat
 python3 ~/.codex/skills/sm-propagation/scripts/propagate.py update-plugin --platform all
 ```
 
+### Rebranding / reinstalling a Claude Code plugin identity
+
+The `propagate.py update-plugin` flow refreshes an *existing* install in place.
+When the plugin's marketplace/plugin **name** changes (e.g. the
+`sovereign-memory@sovereign-memory` → `minni@minni` rebrand), `update-plugin` is
+not enough — the install identity `<plugin>@<marketplace>` must be swapped via
+the native `claude plugin` CLI (uninstall old → remove stale marketplace → add
+marketplace from the canonical repo path → install new identity), then verified
+in a **fresh session**.
+
+See `references/claude-code-plugin-rebrand-reinstall.md` for the full verified
+runbook, including the post-rebrand canonical names (`minnid`, `minnid.sock`,
+`MINNI_SOCKET_PATH`, `minni.db`).
+
 For a new platform, make the agent id explicit:
 
 ```bash
