@@ -117,7 +117,7 @@ def test_writeback_learning_with_evidence_adds_derived_from_edges(tmp_path, monk
     assert edge is not None
 
 
-def test_sovrd_learn_with_evidence_adds_derived_from_edges(tmp_path, monkeypatch):
+def test_minnid_learn_with_evidence_adds_derived_from_edges(tmp_path, monkeypatch):
     import minnid
     import writeback as wb_mod
     from writeback import WriteBackMemory
@@ -188,7 +188,7 @@ def test_status_reports_afm_provider_mode(monkeypatch):
     assert result["afm"]["native_available"] in {True, False}
 
 
-def test_sovrd_read_includes_layer_1_identity_before_context(tmp_path, monkeypatch):
+def test_minnid_read_includes_layer_1_identity_before_context(tmp_path, monkeypatch):
     import minnid
 
     db_obj, _cfg = _make_db(tmp_path)
@@ -329,7 +329,7 @@ def test_hygiene_report_clean_vault_has_zero_blocks(tmp_path):
     assert any((vault / "logs").glob("hygiene-*.md"))
 
 
-def test_sovrd_hygiene_report_returns_json_summary(tmp_path):
+def test_minnid_hygiene_report_returns_json_summary(tmp_path):
     import minnid
 
     vault = tmp_path / "vault"

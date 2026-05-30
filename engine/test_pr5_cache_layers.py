@@ -308,7 +308,7 @@ def test_chronological_mode_orders_by_created_time_and_filters_dates(tmp_path):
     assert [os.path.basename(r["source"]) for r in results] == ["second.md", "third.md"]
 
 
-def test_sovrd_search_forwards_layer_sort_and_dates(monkeypatch):
+def test_minnid_search_forwards_layer_sort_and_dates(monkeypatch):
     import minnid
 
     captured = {}

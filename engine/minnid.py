@@ -84,7 +84,7 @@ _ENGINE_DIR = Path(__file__).resolve().parent
 if str(_ENGINE_DIR) not in sys.path:
     sys.path.insert(0, str(_ENGINE_DIR))
 
-from config import DEFAULT_CONFIG, SovereignConfig          # noqa: E402
+from config import CANONICAL_SOVEREIGN_HOME, DEFAULT_CONFIG, SovereignConfig          # noqa: E402
 from db import SovereignDB                                  # noqa: E402
 from principal import (                                     # noqa: E402  # G11 EffectivePrincipal + G14 operator gate
     EffectivePrincipal,
@@ -290,7 +290,7 @@ def _default_agent_vault(agent_id: str) -> Path:
         "openclaw": "openclaw",
     }
     slug = aliases.get(agent_id, re.sub(r"[^a-z0-9]+", "", agent_id.lower()) or "agent")
-    return Path.home() / ".minni" / f"{slug}-vault"
+    return Path(CANONICAL_SOVEREIGN_HOME) / f"{slug}-vault"
 
 
 def _agent_vault(agent_id: str) -> tuple[Path, bool]:

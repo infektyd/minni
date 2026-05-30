@@ -62,7 +62,7 @@ class TestAgentEnvelopeContract:
         # We test the TypeScript source as a text file to avoid needing ts-node
         plugin_src = os.path.join(
             os.path.dirname(__file__),
-            "..", "plugins", "sovereign-memory", "src", "agent_envelope.ts"
+            "..", "plugins", "minni", "src", "agent_envelope.ts"
         )
         plugin_src = os.path.abspath(plugin_src)
         assert os.path.exists(plugin_src), f"agent_envelope.ts not found: {plugin_src}"
@@ -78,7 +78,7 @@ class TestAgentEnvelopeContract:
         """schemaContent() in vault.ts must reference docs/contracts/VAULT.md."""
         vault_src = os.path.join(
             os.path.dirname(__file__),
-            "..", "plugins", "sovereign-memory", "src", "vault.ts"
+            "..", "plugins", "minni", "src", "vault.ts"
         )
         vault_src = os.path.abspath(vault_src)
         assert os.path.exists(vault_src), f"vault.ts not found: {vault_src}"
@@ -172,7 +172,7 @@ class TestDepthTiers:
         assert "recommended_action" not in result
         assert "recommended_wiki_updates" not in result
 
-    def test_sovrd_search_defaults_to_headline(self, monkeypatch):
+    def test_minnid_search_defaults_to_headline(self, monkeypatch):
         """Daemon search defaults to headline without changing RetrievalEngine default."""
         import minnid
 

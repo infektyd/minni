@@ -173,7 +173,7 @@ def test_retrieve_expands_variants_and_merges_by_rrf(monkeypatch, tmp_path):
     assert all("expansion_rrf_score" in r["provenance"] for r in results)
 
 
-def test_sovrd_search_forwards_expand_and_summarize(monkeypatch):
+def test_minnid_search_forwards_expand_and_summarize(monkeypatch):
     import minnid
 
     captured = {}

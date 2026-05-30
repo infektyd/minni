@@ -11,7 +11,7 @@ const geminiVault = path.join(root, "gemini-vault");
 
 process.env.MINNI_CODEX_AGENT_ID = "codex";
 process.env.MINNI_CODEX_VAULT_PATH = codexVault;
-process.env.MINNI_HOME = path.join(root, "sovereign-home");
+process.env.MINNI_HOME = path.join(root, "minni-home");
 process.env.MINNI_AGENT_VAULTS = JSON.stringify({
   codex: codexVault,
   "claude-code": claudeVault,

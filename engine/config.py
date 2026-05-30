@@ -40,7 +40,7 @@ class SovereignConfig:
     )
     faiss_index_path: str = os.environ.get(
         "MINNI_FAISS_PATH",
-        os.path.join(CANONICAL_SOVEREIGN_HOME, "sovereign_faiss.index")
+        os.path.join(CANONICAL_SOVEREIGN_HOME, "minni_faiss.index")
     )
 
     # Additional paths to index alongside the vault (operator-configurable)
@@ -192,7 +192,7 @@ def resolve_canonical_path(kind: str) -> str:
     mapping = {
         "home": home,
         "db": os.path.join(home, "minni.db"),
-        "faiss": os.path.join(home, "sovereign_faiss.index"),
+        "faiss": os.path.join(home, "minni_faiss.index"),
         "graph": os.path.join(home, "graphs/"),
         "writeback": os.path.join(home, "learnings/"),
         "vault": os.path.join(home, "vault/"),

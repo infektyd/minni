@@ -4,7 +4,7 @@ Covers:
   - _handle_learn rejects content longer than 64 KiB with code -32602.
   - _handle_learn accepts content of exactly 64 KiB.
   - _warn_if_sync_root emits a warning for paths under ~/Dropbox/...
-  - _warn_if_sync_root stays silent for ordinary paths (~/sovereignMemory/...).
+  - _warn_if_sync_root stays silent for ordinary paths (~/minni/...).
 
 The 1 MiB readuntil limit on the Unix socket is exercised at the asyncio
 StreamReader level and is not unit-tested here — exercising it requires
@@ -178,7 +178,7 @@ class TestWarnIfSyncRoot:
 
         monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
 
-        normal_dir = tmp_path / "sovereignMemory" / "foo"
+        normal_dir = tmp_path / "minni" / "foo"
         normal_dir.mkdir(parents=True)
 
         with caplog.at_level(logging.WARNING, logger="minnid"):
