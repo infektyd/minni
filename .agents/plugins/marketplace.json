@@ -1,7 +1,7 @@
 {
   "name": "sovereign-memory",
   "interface": {
-    "displayName": "Sovereign Memory"
+    "displayName": "Minni"
   },
   "plugins": [
     {

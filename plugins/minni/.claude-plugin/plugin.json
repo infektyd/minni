@@ -1,14 +1,14 @@
 {
   "name": "sovereign-memory",
   "version": "0.1.0",
-  "description": "Local-first Sovereign Memory spine for Claude Code: automatic recall, vault-first learning, agent-to-agent handoff, and continuity across compaction.",
+  "description": "Local-first Minni spine for Claude Code: automatic recall, vault-first learning, agent-to-agent handoff, and continuity across compaction.",
   "author": {
-    "name": "Hans Axelsson",
+    "name": "Infektyd",
     "email": "local@localhost",
     "url": "https://github.com/infektyd"
   },
-  "homepage": "https://github.com/infektyd/sovereign-memory",
-  "repository": "https://github.com/infektyd/sovereign-memory",
+  "homepage": "https://github.com/infektyd/minni",
+  "repository": "https://github.com/infektyd/minni",
   "license": "MIT",
   "keywords": [
     "sovereign-memory",

@@ -1,14 +1,14 @@
 {
   "name": "sovereign-memory",
   "version": "0.1.0",
-  "description": "Local-first Sovereign Memory spine for KiloCode: automatic recall, vault-first learning, agent-to-agent handoff, and continuity across sessions.",
+  "description": "Local-first Minni spine for KiloCode: automatic recall, vault-first learning, agent-to-agent handoff, and continuity across sessions.",
   "author": {
-    "name": "Hans Axelsson",
+    "name": "Infektyd",
     "email": "local@localhost",
     "url": "https://github.com/infektyd"
   },
-  "homepage": "https://github.com/infektyd/sovereign-memory",
-  "repository": "https://github.com/infektyd/sovereign-memory",
+  "homepage": "https://github.com/infektyd/minni",
+  "repository": "https://github.com/infektyd/minni",
   "license": "MIT",
   "keywords": [
     "sovereign-memory",
@@ -28,23 +28,23 @@
   "skills": "./skills/",
   "hooks": "./hooks/hooks.json",
   "interface": {
-    "displayName": "Sovereign Memory",
+    "displayName": "Minni",
     "shortDescription": "Local recall and KiloCode-owned Obsidian memory",
-    "longDescription": "Sovereign Memory gives KiloCode transparent local recall, manual vault-first learning, and readable audit logs through a local MCP server. It talks to the existing Sovereign daemon and keeps expensive extraction out of v1.",
-    "developerName": "Hans Axelsson",
+    "longDescription": "Minni gives KiloCode transparent local recall, manual vault-first learning, and readable audit logs through a local MCP server. It talks to the existing Sovereign daemon and keeps expensive extraction out of v1.",
+    "developerName": "Infektyd",
     "category": "Coding",
     "capabilities": [
       "Interactive",
       "Read",
       "Write"
     ],
-    "websiteURL": "https://github.com/infektyd/sovereign-memory",
-    "privacyPolicyURL": "https://github.com/infektyd/sovereign-memory",
-    "termsOfServiceURL": "https://github.com/infektyd/sovereign-memory",
+    "websiteURL": "https://github.com/infektyd/minni",
+    "privacyPolicyURL": "https://github.com/infektyd/minni",
+    "termsOfServiceURL": "https://github.com/infektyd/minni",
     "defaultPrompt": [
-      "Recall Sovereign Memory for this task",
+      "Recall Minni for this task",
       "Learn this in the KiloCode vault",
-      "Show recent Sovereign Memory audit logs"
+      "Show recent Minni audit logs"
     ],
     "brandColor": "#2563EB",
     "screenshots": []
