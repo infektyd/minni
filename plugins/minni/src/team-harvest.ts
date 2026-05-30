@@ -227,7 +227,7 @@ export async function harvestEvidence(
 
   try {
     await audit(input.vaultPath, {
-      tool: "sovereign_team_harvest",
+      tool: "minni_team_harvest",
       summary: input.task.slice(0, 120),
       details: {
         runtimeId: input.runtimeId,
@@ -238,7 +238,7 @@ export async function harvestEvidence(
     });
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
-    process.stderr.write(`sovereign_team_harvest: audit append failed: ${reason}\n`);
+    process.stderr.write(`minni_team_harvest: audit append failed: ${reason}\n`);
   }
 
   return learnings;

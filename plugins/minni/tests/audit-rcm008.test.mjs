@@ -266,8 +266,8 @@ test("RCM-008: vaultFirstLearn succeeds with production audit limiter enabled", 
     assert.match(note, /Production limiter smoke/);
 
     const log = await readFile(path.join(root, "log.md"), "utf8");
-    assert.match(log, /sovereign_vault_write/);
-    assert.match(log, /sovereign_learn/);
+    assert.match(log, /minni_vault_write/);
+    assert.match(log, /minni_learn/);
   } finally {
     if (origBypass === undefined) delete process.env.SOVEREIGN_BYPASS_AUDIT_LIMIT;
     else process.env.SOVEREIGN_BYPASS_AUDIT_LIMIT = origBypass;

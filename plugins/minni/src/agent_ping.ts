@@ -311,7 +311,7 @@ export async function createAgentPingRequest(input: CreateAgentPingInput, actorA
   const paths = { senderPath, recipientPath };
 
   await recordAudit(resolveAgentVaultPath(actorAgent), {
-    tool: "sovereign_ping_agent_request",
+    tool: "minni_ping_agent_request",
     summary: `${actorAgent}->${toAgent} ${requestId}`,
     details: {
       requestId,
@@ -348,7 +348,7 @@ export async function listAgentPingInbox(agentId = DEFAULT_AGENT_ID, limit = 20,
     }
   }
   await recordAudit(vaultPath, {
-    tool: "sovereign_ping_agent_inbox",
+    tool: "minni_ping_agent_inbox",
     summary: `${agentId} viewed ${requests.length} ping request(s)`,
     details: {
       agentId,
@@ -426,7 +426,7 @@ export async function decideAgentPingRequest(input: DecideAgentPingInput, actorA
   const leasePath = getLeasePath(input.requestId);
   await unlink(leasePath).catch(() => {});
   await recordAudit(vaultPath, {
-    tool: "sovereign_ping_agent_decide",
+    tool: "minni_ping_agent_decide",
     summary: `${decision} ${input.requestId}`,
     details: {
       requestId: input.requestId,
@@ -437,7 +437,7 @@ export async function decideAgentPingRequest(input: DecideAgentPingInput, actorA
     },
   });
   await recordAudit(resolveAgentVaultPath(contract.fromAgent), {
-    tool: "sovereign_ping_agent_status",
+    tool: "minni_ping_agent_status",
     summary: `${contract.status} ${input.requestId}`,
     details: {
       requestId: input.requestId,
@@ -478,7 +478,7 @@ export async function getAgentPingStatus(requestId: string, actorAgent = DEFAULT
     recipientPath: agentPingPath(resolveAgentVaultPath(contract.toAgent), "inbox", contract.requestId),
   } : await syncContract(normalized);
   await recordAudit(actorVault, {
-    tool: "sovereign_ping_agent_status",
+    tool: "minni_ping_agent_status",
     summary: `${actorAgent} checked ${requestId}`,
     details: {
       requestId,

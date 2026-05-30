@@ -44,7 +44,7 @@ export function planHandoffDelivery(input: PlanHandoffDeliveryInput): HandoffDel
   if (!fromAgent) throw new Error("fromAgent is required.");
   if (!toAgent) throw new Error("toAgent is required.");
   if (fromAgent !== runtimeAgent) {
-    throw new Error("Direct handoff cannot impersonate another agent; run as that agent or use sovereign_ping_agent_request.");
+    throw new Error("Direct handoff cannot impersonate another agent; run as that agent or use minni_ping_agent_request.");
   }
 
   const informationRequest = firstInformationRequest(input.task, input.openQuestions);
@@ -54,7 +54,7 @@ export function planHandoffDelivery(input: PlanHandoffDeliveryInput): HandoffDel
       toAgent,
       question: informationRequest,
       purpose:
-        "Routed from sovereign_negotiate_handoff because the request asks another agent for information; direct handoff is limited to work-transfer packets.",
+        "Routed from minni_negotiate_handoff because the request asks another agent for information; direct handoff is limited to work-transfer packets.",
       allowedTopics: ["handoff", "cross-agent information request"],
     };
   }

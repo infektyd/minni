@@ -783,7 +783,7 @@ export function extractScarTissue(auditEntries: string[]): ScarTissueEntry[] {
         kind: lower.includes("quality-blocked") ? "rejected_hypothesis" : "failed_command",
         signal: `${tool}: ${summary}`.slice(0, 220),
       });
-    } else if (tool === "sovereign_recall" && /no recall results|recall failed/i.test(entry)) {
+    } else if (tool === "minni_recall" && /no recall results|recall failed/i.test(entry)) {
       scars.push({
         kind: "dead_end",
         signal: `recall miss: ${summary}`.slice(0, 220),

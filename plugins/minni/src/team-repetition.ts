@@ -200,7 +200,7 @@ export async function findRepeatedAgents(
     }
     const entries = parseAuditFile(text);
     for (const entry of entries) {
-      if (entry.tool !== "sovereign_team_runtime") continue;
+      if (entry.tool !== "minni_team_runtime") continue;
       if (!entry.details) continue;
       if (entry.timestamp < windowStart) continue;
       const runtimeId = asString(entry.details.runtimeId) ?? "unknown-runtime";

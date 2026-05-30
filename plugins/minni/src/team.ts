@@ -392,7 +392,7 @@ async function buildPreparedTeamRuntime(
   // in the lookback window. A 3rd repetition correctly tips into "promote" on
   // its own spawn (rather than only being noticed on the 4th). Do not reorder.
   await audit(vaultPath, {
-    tool: "sovereign_team_runtime",
+    tool: "minni_team_runtime",
     summary: input.task.slice(0, 120),
     details: {
       runtimeId,

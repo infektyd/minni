@@ -124,10 +124,10 @@ async function main() {
     try {
       await client.connect(transport);
       const tools = await client.listTools();
-      assert.ok(tools.tools.some((tool) => tool.name === "sovereign_prepare_task"));
-      assert.ok(tools.tools.some((tool) => tool.name === "sovereign_prepare_outcome"));
+      assert.ok(tools.tools.some((tool) => tool.name === "minni_prepare_task"));
+      assert.ok(tools.tools.some((tool) => tool.name === "minni_prepare_outcome"));
       const result = await client.callTool({
-        name: "sovereign_prepare_task",
+        name: "minni_prepare_task",
         arguments: {
           task: "live MCP prepare task using v0 adapter",
           useAfm: true,

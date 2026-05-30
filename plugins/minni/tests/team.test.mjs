@@ -76,7 +76,7 @@ test("buildTeamRuntime creates temporary agent profiles, task ledger, and hydrat
   assert.equal(packet.memoryPolicy.durableWrites, "explicit-only");
   assert.match(packet.contextMarkdown, /Sovereign Team Runtime/);
   assert.equal(prepareCalls.length, 3);
-  assert.equal(audits[0].tool, "sovereign_team_runtime");
+  assert.equal(audits[0].tool, "minni_team_runtime");
   // Task 3: audit detail now records focus per agent so repetition signatures can be derived later.
   assert.equal(audits[0].details.agents[0].focus, "Map prior decisions.");
   assert.equal(audits[0].details.agents[1].focus, "Implement runtime.");

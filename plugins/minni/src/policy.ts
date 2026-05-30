@@ -52,7 +52,7 @@ export function routeMemoryIntent(task: string): MemoryIntent {
       confidence: 0.92,
       automaticAllowed: false,
       reason: "The task explicitly asks for durable memory or learning.",
-      suggestedTool: "sovereign_learn",
+      suggestedTool: "minni_learn",
       suggestedQuery: conciseQuery(task),
     };
   }
@@ -62,7 +62,7 @@ export function routeMemoryIntent(task: string): MemoryIntent {
       confidence: 0.88,
       automaticAllowed: false,
       reason: "The task asks for a visible Obsidian/wiki note.",
-      suggestedTool: "sovereign_vault_write",
+      suggestedTool: "minni_vault_write",
       suggestedQuery: conciseQuery(task),
     };
   }
@@ -72,7 +72,7 @@ export function routeMemoryIntent(task: string): MemoryIntent {
       confidence: 0.84,
       automaticAllowed: true,
       reason: "The task asks for transparent memory logs or audit state.",
-      suggestedTool: "sovereign_audit_tail",
+      suggestedTool: "minni_audit_tail",
       suggestedQuery: conciseQuery(task),
     };
   }
@@ -82,7 +82,7 @@ export function routeMemoryIntent(task: string): MemoryIntent {
       confidence: 0.8,
       automaticAllowed: true,
       reason: "The task asks about local service health or plugin status.",
-      suggestedTool: "sovereign_status",
+      suggestedTool: "minni_status",
       suggestedQuery: conciseQuery(task),
     };
   }
@@ -92,7 +92,7 @@ export function routeMemoryIntent(task: string): MemoryIntent {
       confidence: 0.72,
       automaticAllowed: true,
       reason: "The task likely benefits from prior local project context; recall-only is allowed automatically.",
-      suggestedTool: "sovereign_recall",
+      suggestedTool: "minni_recall",
       suggestedQuery: conciseQuery(task),
     };
   }

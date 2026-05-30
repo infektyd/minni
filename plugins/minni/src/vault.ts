@@ -300,7 +300,7 @@ function scoreVaultNote(
     if (titleLower.includes(term)) score += 3;
   }
   if (relativePath.startsWith("wiki/sessions/")) score += 1;
-  if (/sovereign_learning:\s*true/i.test(markdown)) score += 2;
+  if (/minni_learning:\s*true/i.test(markdown)) score += 2;
   return score;
 }
 
@@ -725,7 +725,7 @@ export async function writeVaultPage(
 
   await appendIndex(input.vaultPath, input.title, relativePath, input.content);
   await recordAudit(input.vaultPath, {
-    tool: "sovereign_vault_write",
+    tool: "minni_vault_write",
     summary: input.title,
     details: { notePath, section: input.section, source: input.source },
   });
@@ -745,12 +745,12 @@ export async function vaultFirstLearn(
     frontmatter: {
       agent: input.agentId ?? "codex",
       category: input.category ?? "general",
-      sovereign_learning: true,
+      minni_learning: true,
     },
   });
 
   await recordAudit(input.vaultPath, {
-    tool: "sovereign_learn",
+    tool: "minni_learn",
     summary: input.title,
     details: {
       notePath: result.notePath,

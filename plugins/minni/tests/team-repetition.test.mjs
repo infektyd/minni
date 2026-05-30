@@ -20,7 +20,7 @@ function isoDaysAgo(days, time = "10:00:00.000Z") {
   return `${date.toISOString().slice(0, 10)}T${time}`;
 }
 
-function entry({ timestamp, tool = "sovereign_team_runtime", details, summary = "task" }) {
+function entry({ timestamp, tool = "minni_team_runtime", details, summary = "task" }) {
   const detailBlock = details === undefined
     ? ""
     : `\`\`\`json\n${typeof details === "string" ? details : JSON.stringify(details, null, 2)}\n\`\`\`\n\n`;
@@ -63,13 +63,13 @@ test("findRepeatedAgents ignores entries from other tools", async () => {
   const file = logFile("# log", [
     entry({
       timestamp: isoDaysAgo(1),
-      tool: "sovereign_vault_write",
+      tool: "minni_vault_write",
       details: { foo: "bar" },
       summary: "wrote",
     }),
     entry({
       timestamp: isoDaysAgo(2),
-      tool: "sovereign_team_harvest",
+      tool: "minni_team_harvest",
       details: { runtimeId: "x" },
       summary: "harvested",
     }),
@@ -361,7 +361,7 @@ test("findRepeatedAgents integration — real recordAudit writes are not double-
     ];
     for (let i = 0; i < 3; i += 1) {
       await recordAudit(tmpVault, {
-        tool: "sovereign_team_runtime",
+        tool: "minni_team_runtime",
         summary: `spawn ${i}`,
         details: {
           runtimeId: `team-int-${i}`,

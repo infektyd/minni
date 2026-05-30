@@ -7,12 +7,12 @@ test("routeMemoryIntent allows automatic recall but not learning", () => {
   const recall = routeMemoryIntent("continue testing the Sovereign Memory plugin from prior context");
   assert.equal(recall.action, "recall");
   assert.equal(recall.automaticAllowed, true);
-  assert.equal(recall.suggestedTool, "sovereign_recall");
+  assert.equal(recall.suggestedTool, "minni_recall");
 
   const learn = routeMemoryIntent("remember this decision in Sovereign Memory");
   assert.equal(learn.action, "learn");
   assert.equal(learn.automaticAllowed, false);
-  assert.equal(learn.suggestedTool, "sovereign_learn");
+  assert.equal(learn.suggestedTool, "minni_learn");
 });
 
 test("assessLearningQuality rewards sourced durable notes and warns on weak notes", () => {

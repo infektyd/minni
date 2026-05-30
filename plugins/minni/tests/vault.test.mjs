@@ -100,7 +100,7 @@ test("vaultFirstLearn writes a note, updates index, and appends audit logs", asy
     );
 
     const log = await readFile(path.join(root, "log.md"), "utf8");
-    assert.match(log, /sovereign_learn/);
+    assert.match(log, /minni_learn/);
     assert.match(log, /Socket daemon health check/);
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -140,7 +140,7 @@ test("auditTail returns recent audit entries from daily logs", async () => {
   try {
     await ensureVault(root);
     await recordAudit(root, {
-      tool: "sovereign_status",
+      tool: "minni_status",
       summary: "status checked",
       details: { socket: "ok" },
     });
@@ -148,7 +148,7 @@ test("auditTail returns recent audit entries from daily logs", async () => {
     const tail = await auditTail(root, 5);
 
     assert.equal(tail.entries.length, 1);
-    assert.match(tail.text, /sovereign_status/);
+    assert.match(tail.text, /minni_status/);
     assert.match(tail.text, /status checked/);
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -160,12 +160,12 @@ test("auditReport summarizes recent tool activity", async () => {
   try {
     await ensureVault(root);
     await recordAudit(root, {
-      tool: "sovereign_recall",
+      tool: "minni_recall",
       summary: "recall checked",
       details: { ok: true },
     });
     await recordAudit(root, {
-      tool: "sovereign_learning_quality",
+      tool: "minni_learning_quality",
       summary: "quality checked",
       details: { ok: true },
     });
@@ -173,11 +173,11 @@ test("auditReport summarizes recent tool activity", async () => {
     const report = await auditReport(root, 10);
 
     assert.equal(report.entries, 2);
-    assert.equal(report.tools.sovereign_recall, 1);
-    assert.equal(report.tools.sovereign_learning_quality, 1);
+    assert.equal(report.tools.minni_recall, 1);
+    assert.equal(report.tools.minni_learning_quality, 1);
     assert.deepEqual(report.recentSummaries, [
-      "sovereign_recall: recall checked",
-      "sovereign_learning_quality: quality checked",
+      "minni_recall: recall checked",
+      "minni_learning_quality: quality checked",
     ]);
   } finally {
     await rm(root, { recursive: true, force: true });
