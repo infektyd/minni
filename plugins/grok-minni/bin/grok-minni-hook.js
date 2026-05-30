@@ -103,18 +103,16 @@ function readDistillMode() {
  * Returns short prefix + note to read full file. Never leaks secrets (our controlled artifact).
  * Used for SessionStart (Layer 1 proximity) and distill keyword fallback.
  */
-function readGaugesForInjection(maxLines = 18) {
+function readGaugesForInjection() {
   try {
-    if (!fs.existsSync(DISTILL_GAUGES)) {
+    const stat = fs.statSync(DISTILL_GAUGES);
+    return `gauges.md present (updated ${stat.mtime.toISOString()}). Read local file distill/gauges.md before ritual decisions.`;
+  } catch (e) {
+    if (e.code === 'ENOENT') {
       return '(gauges.md not present — seed via ritual or SOVEREIGN-DISTILL-RITUAL-GUIDE.md; default to explicit mode)';
     }
-    const full = fs.readFileSync(DISTILL_GAUGES, 'utf8');
-    const lines = full.trim().split('\n').slice(0, maxLines);
-    const more = full.split('\n').length > maxLines;
-    return lines.join('\n') + (more ? '\n... (read full distill/gauges.md for complete live context meter + Decision Aids)' : '');
-  } catch (e) {
     console.error(`[grok-minni-hook] readGaugesForInjection failed: ${e.message}`);
-    return '(gauges read error — fall back to direct vault file distill/gauges.md per SKILL)';
+    return '(gauges unavailable — open local distill/gauges.md directly per SKILL)';
   }
 }
 
@@ -172,7 +170,7 @@ try {
     ].join('\n');
     const dmode = readDistillMode();
     if (dmode !== 'disabled') {
-      const g = readGaugesForInjection(12);
+      const g = readGaugesForInjection();
       msg += `\n<minni:distill-gauges mode="${dmode}" agent="grok-build">Minni Distill ritual active (real Layer 1 = identity:grok-build + layer1/ installed; this V1 injection on top). Read gauges first at wind-down. Gauges:\n${g}\nFollow SKILL "Sovereign Distill Ritual" (explicit yes/no or auto per mode file). Keyword fallback also supported on UserPromptSubmit.</minni:distill-gauges>`;
     }
     output.systemMessage = msg;
@@ -224,7 +222,7 @@ try {
       if (distillMatch) {
         const dmode = readDistillMode();
         if (dmode !== 'disabled') {
-          const g = readGaugesForInjection(10);
+          const g = readGaugesForInjection();
           output.systemMessage = `Minni: distill keyword detected ("${distillMatch[0]}"). Mode: ${dmode}. Gauges (read full distill/gauges.md first):\n${g}\n\nFollow the Sovereign Distill Ritual workflow in SKILL (explicit gate or auto per mode file).`;
         }
       }

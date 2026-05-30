@@ -87,6 +87,61 @@ function safeError(error: unknown): string | undefined {
     .slice(0, 240);
 }
 
+
+
+export interface PostJsonOptions {
+  timeoutMs?: number;
+  headers?: Record<string, string>;
+}
+
+export async function postJson<T = unknown>(
+  url: string,
+  body: unknown,
+  opts: PostJsonOptions = {}
+): Promise<T> {
+  const payload = JSON.stringify(body);
+  return new Promise((resolve, reject) => {
+    const parsedUrl = new URL(url);
+    const client = parsedUrl.protocol === "https:" ? httpsRequest : httpRequest;
+    const req = client(
+      parsedUrl,
+      {
+        method: "POST",
+        timeout: opts.timeoutMs ?? 30000,
+        headers: {
+          "Content-Type": "application/json",
+          "Content-Length": Buffer.byteLength(payload).toString(),
+          ...opts.headers,
+        },
+      },
+      (res) => {
+        let data = "";
+        res.on("data", (chunk) => {
+          data += chunk;
+        });
+        res.on("end", () => {
+          if (res.statusCode && res.statusCode >= 400) {
+            reject(new Error(`HTTP ${res.statusCode}`));
+            return;
+          }
+          try {
+            const parsed = JSON.parse(data) as T;
+            resolve(parsed);
+          } catch (error) {
+            reject(error instanceof Error ? error : new Error(String(error)));
+          }
+        });
+      }
+    );
+    req.on("timeout", () => {
+      req.destroy(new Error("AFM request timed out"));
+    });
+    req.on("error", reject);
+    req.write(payload);
+    req.end();
+  });
+}
+
 export function sanitizeAfmHealth(health: JsonResult): JsonResult<Record<string, unknown>> {
   const data: Record<string, unknown> = {};
   for (const key of ["provider", "backend", "availability", "status", "mode"]) {
@@ -163,44 +218,16 @@ export function resolveAfmProvider(mode: AfmProviderMode, options: AfmProviderOp
 }
 
 async function defaultTransport(url: string, payload: Record<string, unknown>): Promise<JsonResult> {
-  return new Promise((resolve) => {
-    const parsedUrl = new URL(url);
-    const client = parsedUrl.protocol === "https:" ? httpsRequest : httpRequest;
-    const body = JSON.stringify(payload);
-    const req = client(
-      parsedUrl,
-      {
-        method: "POST",
-        timeout: 45000,
-        headers: {
-          "Content-Type": "application/json",
-          "Content-Length": Buffer.byteLength(body).toString(),
-        },
-      },
-      (res) => {
-        let data = "";
-        res.on("data", (chunk) => {
-          data += chunk;
-        });
-        res.on("end", () => {
-          try {
-            const parsed = JSON.parse(data);
-            if (res.statusCode && res.statusCode >= 400) {
-              resolve({ ok: false, data: parsed, error: `HTTP ${res.statusCode}` });
-              return;
-            }
-            resolve({ ok: true, data: parsed });
-          } catch (error) {
-            resolve({ ok: false, error: error instanceof Error ? error.message : String(error) });
-          }
-        });
-      },
-    );
-    req.on("timeout", () => req.destroy(new Error("AFM request timed out")));
-    req.on("error", (error) => resolve({ ok: false, error: error.message }));
-    req.write(body);
-    req.end();
-  });
+  try {
+    const parsed = await postJson<any>(url, payload, { timeoutMs: 45000 });
+    return { ok: true, data: parsed };
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith("HTTP ")) {
+      // The old transport sometimes parsed data even on 4xx, but it's okay to just return error
+      return { ok: false, error: error.message };
+    }
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
+  }
 }
 
 async function callNativeHelper(

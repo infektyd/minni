@@ -21,6 +21,8 @@
 - [§ 05 — Plugin surfaces](#-05--plugin-surfaces)
 - [§ 06 — Getting started](#-06--getting-started)
 - [§ 07 — Vault model](#-07--vault-model)
+- [§ 7b — AFM provider modes](#-7b--afm-provider-modes)
+- [§ 7c — Evaluation](#-7c--evaluation)
 - [§ 08 — Local-first security](#-08--local-first-security)
 - [§ 09 — Verification gate](#-09--verification-gate)
 - [§ 10 — Repository map](#-10--repository-map)
@@ -112,12 +114,12 @@ The plugin implements the **Model Context Protocol** — any MCP-speaking agent 
 
 | Category | Count | Example |
 |---|---|---|
-| RECALL | 7 | `sovereign_status` |
-| LEARNING | 4 | `sovereign_learn` |
-| AUDIT | 3 | `sovereign_audit_report` |
-| COMPILE | 1 | `sovereign_compile_vault` |
-| HANDOFF | 4 | `sovereign_negotiate_handoff` |
-| MULTI-AGENT | 7 | `sovereign_ping_agent_request` |
+| RECALL | 7 | `minni_status` |
+| LEARNING | 4 | `minni_learn` |
+| AUDIT | 3 | `minni_audit_report` |
+| COMPILE | 1 | `minni_compile_vault` |
+| HANDOFF | 4 | `minni_negotiate_handoff` |
+| MULTI-AGENT | 7 | `minni_ping_agent_request` |
 
 Source: [`plugins/minni/src/server.ts`](plugins/minni/src/server.ts)
 
@@ -149,7 +151,7 @@ Detected inside `UserPromptSubmit`, each auto-drafts a `prepare_outcome` candida
 </details>
 
 > [!NOTE]
-> **Behavior.** Automatic activity is recall-only. Durable learning follows a proposal-first path — `sovereign_learn` stages a candidate; only `sovereign_resolve_candidate` (operator-gated) writes permanent memory. Cross-agent info sharing requires explicit vault-backed ping contracts.
+> **Behavior.** Automatic activity is recall-only. Durable learning follows a proposal-first path — `minni_learn` stages a candidate; only `minni_resolve_candidate` (operator-gated) writes permanent memory. Cross-agent info sharing requires explicit vault-backed ping contracts.
 
 </details>
 
@@ -177,7 +179,7 @@ cd engine
 python3 -m pip install -r requirements.txt
 
 # start the daemon
-python3 sovrd.py --socket ~/.sovereign-memory/run/sovrd.sock
+python3 minnid.py --socket ~/.minni/run/minnid.sock
 ```
 
 ### Plugin · typescript MCP server
@@ -195,21 +197,21 @@ npm run console
 
 ```bash
 cd engine
-python3 sovrd_client.py --socket ~/.sovereign-memory/run/sovrd.sock status
-python3 sovrd_client.py --socket ~/.sovereign-memory/run/sovrd.sock search "memory handoff"
+python3 minnid_client.py --socket ~/.minni/run/minnid.sock status
+python3 minnid_client.py --socket ~/.minni/run/minnid.sock search "memory handoff"
 ```
 
-### Multi-agent install · sm-propagation
+### Multi-agent install · minni-propagation
 
-Per-agent setup runs through the **`minni-propagation`** skill. Each hosted agent gets its own workspace envelope at `~/.sovereign-memory/identities/<agent>/` and its own vault — no shared state between agents.
+Per-agent setup runs through the **`minni-propagation`** skill. Each hosted agent gets its own workspace envelope at `~/.minni/identities/<agent>/` and its own vault — no shared state between agents.
 
 Supported platforms: `codex` · `claude-code` · `kilocode` · `gemini` · `grok-build` · `grok-beta` (legacy) · `all` · `generic`
 
 ```bash
-python3 minni/skills/minni-propagation/scripts/propagate.py update-plugin --platform grok-build
+python3 plugins/minni/skills/minni-propagation/scripts/propagate.py update-plugin --platform grok-build
 ```
 
-See [`minni/skills/minni-propagation/SKILL.md`](minni/skills/minni-propagation/SKILL.md) and [`minni/docs/DESIGN-sovereign-delivery-layer.md`](minni/docs/DESIGN-sovereign-delivery-layer.md) for the full design.
+See [`plugins/minni/skills/minni-propagation/SKILL.md`](plugins/minni/skills/minni-propagation/SKILL.md) and [`minni/docs/DESIGN-sovereign-delivery-layer.md`](minni/docs/DESIGN-sovereign-delivery-layer.md) for the full design.
 
 </details>
 
@@ -235,9 +237,73 @@ vault/
   schema/
 ```
 
-The `sovereign_vault_write` tool accepts six section types: `raw` · `entities` · `concepts` · `decisions` · `syntheses` · `sessions`.
+The `minni_vault_write` tool accepts six section types: `raw` · `entities` · `concepts` · `decisions` · `syntheses` · `sessions`.
 
 > Short, sourced wiki pages with frontmatter for durable knowledge. Raw / private logs stay local, out of public git.
+
+</details>
+
+---
+
+<details>
+<summary><strong>§ 7b — AFM provider modes</strong></summary>
+
+<br>
+
+AFM (Apple Foundation Models) calls are optional and local-only.
+
+| Mode | Behavior |
+|---|---|
+| `off` | Skip AFM calls, use deterministic fallback |
+| `bridge` | Use localhost OpenAI-compatible bridge (default) |
+| `native` | Use local JSON helper via Foundation Models framework |
+| `auto` | Prefer native when available, fall back to bridge |
+
+Configure with `MINNI_AFM_PROVIDER_MODE` or the per-call `afmProviderMode` option.
+
+```bash
+# Run AFM tests
+cd plugins/minni
+MINNI_AFM_PROVIDER_MODE=auto npm test -- tests/afm.test.mjs
+```
+
+```bash
+# Run compile passes as review-only dry-runs
+cd engine
+MINNI_AFM_LOOP=on python3 -m sovereign_memory compile --pass session_distillation --dry-run
+MINNI_AFM_LOOP=on python3 -m sovereign_memory compile --pass synthesis --dry-run
+```
+
+Native provider metadata is sanitized before reaching status reports or model
+packets. Adapter configuration is reported as `adapter_configured` /
+`adapterConfigured` (boolean only) — private adapter paths are never emitted.
+
+</details>
+
+---
+
+<details>
+<summary><strong>§ 7c — Evaluation</strong></summary>
+
+<br>
+
+The project should be judged by **recovery quality**, not by how elaborate the
+memory machinery looks.
+
+**Baselines to compare against:**
+
+1. No memory — only the new prompt
+2. Raw chat summary
+3. Plain RAG over repo/docs
+4. Wiki-only filesystem memory
+5. Minni rehydration with typed state and open loops
+
+**Metrics that matter:** correct next action after restart, unsupported claims
+made during restart, evidence coverage, token cost of rehydration, time to
+resume useful work, and contradiction handling.
+
+> If the wiki-only or plain-RAG baseline matches Minni on these
+> metrics, the right engineering answer is to delete complexity.
 
 </details>
 
@@ -259,9 +325,9 @@ Local-first is real only when four assumptions hold on the host:
 
 ```bash
 xattr -w com.apple.metadata:com_apple_backup_excludeItem true \
-  ~/.sovereign-memory/sovereign_memory.db
+  ~/.minni/minni.db
 xattr -w com.apple.metadata:com_apple_backup_excludeItem true \
-  ~/.sovereign-memory/codex-vault
+  ~/.minni/codex-vault
 ```
 
 > [!WARNING]
@@ -284,7 +350,7 @@ cd ../plugins/minni && npm test      # expect 121 passed
 npm run smoke:hook
 ```
 
-Then a temp-state live smoke: start `sovrd.py` on a temporary Unix socket, call plugin helpers for status, recall, compile dry-run, and handoff, verify redaction and traceability, and confirm clean `SIGTERM` shutdown. Migration safety is always run on a SQLite backup, **never the live DB**.
+Then a temp-state live smoke: start `minnid.py` on a temporary Unix socket, call plugin helpers for status, recall, compile dry-run, and handoff, verify redaction and traceability, and confirm clean `SIGTERM` shutdown. Migration safety is always run on a SQLite backup, **never the live DB**.
 
 </details>
 
@@ -301,7 +367,7 @@ Then a temp-state live smoke: start `sovrd.py` on a temporary Unix socket, call 
 |---|---|
 | [`engine/`](engine/) | python daemon · retrieval · migrations · compile passes · eval harness |
 | [`plugins/minni/`](plugins/minni/) | agent-agnostic MCP plugin · 19 ts modules · 19 test files · console UI |
-| [`minni/`](minni/) | delivery layer · `sm-propagation` skill · workflows · design docs |
+| [`minni/`](minni/) | delivery layer · `minni-propagation` skill · workflows · design docs |
 | [`openclaw-extension/`](openclaw-extension/) | OpenClaw bridge and import tooling |
 | [`docs/contracts/`](docs/contracts/) | AGENT · CAPABILITIES · PAGE_TYPES · POLICY · THREAT_MODEL · VAULT · WORKFLOWS |
 | [`eval/`](eval/) | recall fixtures and generated evaluation reports |
@@ -310,7 +376,7 @@ Then a temp-state live smoke: start `sovrd.py` on a temporary Unix socket, call 
 
 | File | Size | Role |
 |---|---|---|
-| [`engine/sovrd.py`](engine/sovrd.py) | 113 KB | local JSON-RPC daemon — the heart of the runtime |
+| [`engine/minnid.py`](engine/minnid.py) | 113 KB | local JSON-RPC daemon — the heart of the runtime |
 | [`engine/retrieval.py`](engine/retrieval.py) | 86 KB | FTS5 + FAISS · rerank · HyDE · query expansion · token budgets · read gate |
 | [`engine/principal.py`](engine/principal.py) | 18 KB | runtime identity · vault roots · capabilities · read authorization |
 | [`engine/sovereign_memory.py`](engine/sovereign_memory.py) | 15 KB | CLI · indexing · stats · hygiene · vector status · compile dry-runs |

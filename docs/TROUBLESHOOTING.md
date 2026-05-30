@@ -1,4 +1,4 @@
-# Troubleshooting Sovereign Memory
+# Troubleshooting Minni
 
 This guide records product-level failure modes that can happen when the daemon,
 plugins, and agent runtime are updated at different speeds.
@@ -7,7 +7,7 @@ plugins, and agent runtime are updated at different speeds.
 
 ### Symptom
 
-`sovereign_status`, `sovereign_recall`, or `sovereign_learn` can show a socket
+`minni_status`, `minni_recall`, or `minni_learn` can show a socket
 failure like:
 
 ```text
@@ -19,10 +19,10 @@ fails.
 
 ### Root Cause
 
-This means a client tried to speak HTTP over the Sovereign daemon Unix socket,
+This means a client tried to speak HTTP over the Minni daemon Unix socket,
 but the live daemon is speaking line-delimited JSON-RPC.
 
-This commonly happens after updating Sovereign Memory source code while Codex is
+This commonly happens after updating Minni source code while Codex is
 still running an older installed plugin cache. The v4 daemon socket protocol is:
 
 ```text
@@ -40,8 +40,8 @@ GET /health HTTP/1.1
 Check the live socket:
 
 ```bash
-ls -l ~/.sovereign-memory/run/sovrd.sock 2>&1 || true
-lsof -U | rg 'sovereign-memory/run/sovrd\.sock|sovrd\.sock'
+ls -l ~/.minni/run/minnid.sock 2>&1 || true
+lsof -U | rg 'minni/run/minnid\.sock|minnid\.sock'
 ```
 
 Probe JSON-RPC directly:
@@ -49,7 +49,7 @@ Probe JSON-RPC directly:
 ```bash
 node - <<'NODE'
 const net = require('node:net');
-const socketPath = `${process.env.HOME}/.sovereign-memory/run/sovrd.sock`;
+const socketPath = `${process.env.HOME}/.minni/run/minnid.sock`;
 const client = net.createConnection(socketPath);
 client.on('connect', () => {
   client.write(JSON.stringify({jsonrpc: '2.0', id: 1, method: 'status', params: {}}) + '\n');
@@ -71,7 +71,7 @@ repo plugin and the installed Codex plugin cache:
 ```bash
 rg -n 'socketRequest|jsonRpcSocketRequest|/health|/learn|/recall' \
   plugins/minni/src \
-  ~/.codex/plugins/cache/sovereign-memory -g '!node_modules'
+  ~/.codex/plugins/cache/minni -g '!node_modules'
 ```
 
 The stale cache usually still contains HTTP fallback calls such as
@@ -82,7 +82,7 @@ The stale cache usually still contains HTTP fallback calls such as
 Build and test the repo plugin first:
 
 ```bash
-cd ~/SovereignMemory/plugins/sovereign-memory
+cd ~/Projects/Minni/plugins/minni
 npm run build
 npm test
 node dist/cli.js status
@@ -95,8 +95,8 @@ restart stale plugin server processes or restart Codex.
 On this machine, stale plugin servers can be spotted with:
 
 ```bash
-ps aux | rg 'sovereign-memory|dist/server|sovrd' | rg -v rg
-for pid in $(pgrep -f 'sovereign-memory.*/dist/server.js'); do
+ps aux | rg 'minni|dist/server|minnid' | rg -v rg
+for pid in $(pgrep -f 'minni.*/dist/server.js'); do
   lsof -p "$pid" -a -d cwd
 done
 ```

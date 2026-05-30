@@ -1,6 +1,6 @@
-# Sovereign Memory Reference Plates
+# Minni Reference Plates
 
-These images are synthetic visual references for the Sovereign Memory Console design system. They are not product screenshots, not generated from private vault data, and not normative.
+These images are synthetic visual references for the Minni Console design system. They are not product screenshots, not generated from private vault data, and not normative.
 
 The root [`DESIGN.md`](../../../DESIGN.md) is the source of truth. Use these plates to preserve the intended feel: warm paper, graphite control-room structure, dense evidence panels, mono machine labels, small radii, hairline borders, and clear privacy/AFM/learning states.
 

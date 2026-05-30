@@ -1,6 +1,4 @@
-import { request as httpRequest } from "node:http";
-import { request as httpsRequest } from "node:https";
-import { URL } from "node:url";
+import { postJson } from "./afm.js";
 import { AFM_PREPARE_TASK_MODEL, AFM_PREPARE_TASK_URL } from "./config.js";
 import type { TeamAgentResultInput } from "./team.js";
 import { recordAudit, writeInbox } from "./vault.js";
@@ -85,9 +83,8 @@ function parseAfmResponse(raw: string): ParsedAfm {
   return { kind: "off-contract" };
 }
 
-// TODO: extract shared postJson(url, body, opts) helper after Tasks 2-4 (they may need it too).
 async function defaultCallAfm(system: string, user: string, url: string, model: string): Promise<string> {
-  const body = JSON.stringify({
+  const body = {
     model,
     temperature: 0,
     max_tokens: 120,
@@ -95,47 +92,24 @@ async function defaultCallAfm(system: string, user: string, url: string, model: 
       { role: "system", content: system },
       { role: "user", content: user },
     ],
-  });
-  return new Promise((resolve, reject) => {
-    const parsedUrl = new URL(url);
-    const client = parsedUrl.protocol === "https:" ? httpsRequest : httpRequest;
-    const req = client(
-      parsedUrl,
-      {
-        method: "POST",
-        timeout: 30000,
-        headers: {
-          "Content-Type": "application/json",
-          "Content-Length": Buffer.byteLength(body).toString(),
-        },
-      },
-      (res) => {
-        let data = "";
-        res.on("data", (chunk) => {
-          data += chunk;
-        });
-        res.on("end", () => {
-          if (res.statusCode && res.statusCode >= 400) {
-            reject(new Error(`AFM harvest HTTP ${res.statusCode}`));
-            return;
-          }
-          try {
-            const parsed = JSON.parse(data) as { choices?: Array<{ message?: { content?: string } }> };
-            const content = parsed.choices?.[0]?.message?.content;
-            resolve(typeof content === "string" ? content : "");
-          } catch (error) {
-            reject(error instanceof Error ? error : new Error(String(error)));
-          }
-        });
-      },
+  };
+  try {
+    const parsed = await postJson<{ choices?: Array<{ message?: { content?: string } }> }>(
+      url,
+      body,
+      { timeoutMs: 30000 }
     );
-    req.on("timeout", () => {
-      req.destroy(new Error("AFM harvest request timed out"));
-    });
-    req.on("error", reject);
-    req.write(body);
-    req.end();
-  });
+    const content = parsed.choices?.[0]?.message?.content;
+    return typeof content === "string" ? content : "";
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith("HTTP ")) {
+      throw new Error(`AFM harvest ${error.message}`);
+    }
+    if (error instanceof Error && error.message.endsWith("timed out")) {
+      throw new Error("AFM harvest request timed out");
+    }
+    throw error;
+  }
 }
 
 function skippedEntry(agentId: string, reason: string, candidateText = ""): HarvestedLearning {

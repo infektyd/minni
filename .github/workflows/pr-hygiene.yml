@@ -1,0 +1,114 @@
+name: PR Hygiene
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-hygiene-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  forbidden-files:
+    name: Forbidden Files
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Scan PR for forbidden file additions
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+
+          # File patterns that should never be added to the repo (extended regex).
+          PATTERNS=(
+            # PR-description scratch (the Jules / agent failure mode that triggered this gate)
+            '(^|/)pr_description\.[^/]+$'
+            '(^|/)PR_DESCRIPTION\.[^/]+$'
+            # Generic scratch / temp / backup files (any extension)
+            '\.scratch\.[^/]+$'
+            '\.tmp\.[^/]+$'
+            '\.bak$'
+            '~$'
+            # OS junk
+            '(^|/)\.DS_Store$'
+            '(^|/)Thumbs\.db$'
+            # Secrets — block any .env except .env.example / .env.sample / .env.template
+            '(^|/)\.env(\..*)?$'
+            # Top-level scratch notes (any extension)
+            '^notes\.[^/]+$'
+            '^TODO\.[^/]+$'
+            '^scratch\.[^/]+$'
+          )
+
+          # Explicit allowlist (matched before the deny patterns).
+          ALLOW=(
+            '(^|/)\.env\.example$'
+            '(^|/)\.env\.sample$'
+            '(^|/)\.env\.template$'
+          )
+
+          # Resolve the merge base so we only flag paths this PR actually introduces.
+          # Comparing tip-to-tip (BASE_SHA ↔ HEAD_SHA) would falsely report files that
+          # main has since deleted but the branch left untouched. Including renames
+          # (R*) catches the case where an existing file is renamed into a forbidden
+          # path (e.g. notes.md → pr_description.md) — the destination is treated as
+          # an addition.
+          MERGE_BASE=$(git merge-base "$BASE_SHA" "$HEAD_SHA")
+          ADDED=$(git diff --name-status --diff-filter=AR "$MERGE_BASE" "$HEAD_SHA" \
+            | awk -F'\t' '
+                /^A\t/  { print $2 }
+                /^R[0-9]*\t/ { print $3 }
+              ' || true)
+
+          if [ -z "$ADDED" ]; then
+            echo "✓ No new files added (vs merge base $MERGE_BASE)."
+            exit 0
+          fi
+
+          echo "New paths in PR (vs merge base $MERGE_BASE):"
+          echo "$ADDED" | sed 's/^/  /'
+          echo "---"
+
+          VIOLATIONS=""
+          while IFS= read -r file; do
+            [ -z "$file" ] && continue
+            allowed=0
+            for a in "${ALLOW[@]}"; do
+              if echo "$file" | grep -E -q "$a"; then allowed=1; break; fi
+            done
+            [ "$allowed" -eq 1 ] && continue
+            for p in "${PATTERNS[@]}"; do
+              if echo "$file" | grep -E -q "$p"; then
+                VIOLATIONS="${VIOLATIONS}  ${file}  (matched: ${p})"$'\n'
+                break
+              fi
+            done
+          done <<< "$ADDED"
+
+          if [ -n "$VIOLATIONS" ]; then
+            echo "::error::PR hygiene check failed — forbidden files detected:"
+            printf '%s' "$VIOLATIONS"
+            cat <<'MSG'
+
+            These files should not be committed:
+              - PR descriptions belong in the GitHub PR body, not in tracked files.
+              - Scratch / temp / backup files belong in your local workspace only.
+              - .env files contain secrets — use .env.example as the tracked template.
+              - OS junk (.DS_Store, Thumbs.db) belongs in .gitignore.
+
+            Remove these from your branch (git rm + commit + push) and the check
+            will re-run automatically.
+          MSG
+            exit 1
+          fi
+
+          echo "✓ No forbidden files in PR diff."
