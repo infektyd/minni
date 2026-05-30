@@ -1,5 +1,5 @@
 {
-  "name": "sovereign-memory-multi-plugin",
+  "name": "minni-multi-plugin",
   "version": "0.1.0",
   "description": "Local multi-target plugin bridge for Sovereign Memory (Codex, Claude Code, Gemini, KiloCode).",
   "type": "module",
