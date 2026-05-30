@@ -251,4 +251,4 @@ bash scripts/repro-smoke.sh                         # hermetic daemon: status + 
 
 ---
 
-<sub>Minni is a local-only project. No telemetry, no cloud sync, no remote endpoints.</sub>
+<sub>Minni is local-first — no telemetry, no remote endpoints, no cloud required. It can run on synced or cloud storage, but only stays passively secure (encrypted at rest, no exfil surface) when kept local.</sub>
