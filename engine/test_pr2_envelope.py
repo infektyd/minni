@@ -801,7 +801,7 @@ class TestVaultTsSmoke:
         vault_src = os.path.abspath(
             os.path.join(
                 os.path.dirname(__file__),
-                "..", "plugins", "sovereign-memory", "src", "vault.ts",
+                "..", "plugins", "minni", "src", "vault.ts",
             )
         )
         content = open(vault_src).read()
@@ -814,7 +814,7 @@ class TestVaultTsSmoke:
         vault_src = os.path.abspath(
             os.path.join(
                 os.path.dirname(__file__),
-                "..", "plugins", "sovereign-memory", "src", "vault.ts",
+                "..", "plugins", "minni", "src", "vault.ts",
             )
         )
         content = open(vault_src).read()
@@ -825,7 +825,7 @@ class TestVaultTsSmoke:
         vault_src = os.path.abspath(
             os.path.join(
                 os.path.dirname(__file__),
-                "..", "plugins", "sovereign-memory", "src", "vault.ts",
+                "..", "plugins", "minni", "src", "vault.ts",
             )
         )
         content = open(vault_src).read()
@@ -837,7 +837,7 @@ class TestVaultTsSmoke:
         vault_src = os.path.abspath(
             os.path.join(
                 os.path.dirname(__file__),
-                "..", "plugins", "sovereign-memory", "src", "vault.ts",
+                "..", "plugins", "minni", "src", "vault.ts",
             )
         )
         content = open(vault_src).read()
@@ -849,7 +849,7 @@ class TestVaultTsSmoke:
         vault_src = os.path.abspath(
             os.path.join(
                 os.path.dirname(__file__),
-                "..", "plugins", "sovereign-memory", "src", "vault.ts",
+                "..", "plugins", "minni", "src", "vault.ts",
             )
         )
         content = open(vault_src).read()
