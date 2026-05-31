@@ -1,4 +1,4 @@
-# Minni
+# ᛗ Minni
 
 ![Status](https://img.shields.io/badge/status-pre--v1_alpha-blue?style=flat-square)
 ![Python](https://img.shields.io/badge/python-3.11+-3776AB?style=flat-square)
