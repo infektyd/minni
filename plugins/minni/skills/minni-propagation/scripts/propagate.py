@@ -29,15 +29,35 @@ DEFAULT_PLUGIN_CLI = Path(
 DEFAULT_IDENTITY_ROOT = Path("~/.minni/identities").expanduser()
 DEFAULT_REPO_ROOT = Path.home() / "Projects" / "minni"
 
+# Antigravity (CLI `agy` + IDE + antigravity) share the ~/.gemini tree and use
+# agent id `gemini`. Surface MCP configs are symlinks into ~/.agents/mcp-servers/views/.
+# The mcp-env-run wrapper is the canonical launcher every Gemini-surface server uses,
+# and IDE view entries carry this protobuf type tag which must be preserved on hand-edit.
+GEMINI_MCP_ENV_RUN = Path("~/.agents/bin/mcp-env-run").expanduser()
+GEMINI_IDE_TYPE_NAME = "exa.cascade_plugins_pb.CascadePluginCommandTemplate"
+GEMINI_SURFACE_CONFIGS = (
+    "~/.gemini/config/mcp_config.json",
+    "~/.gemini/antigravity/mcp_config.json",
+    "~/.gemini/antigravity-ide/mcp_config.json",
+    "~/.gemini/antigravity-cli/plugins/minni/mcp_config.json",
+)
+GEMINI_LEGACY_GRANT_MARKERS = ("mcp(sovereign-memory", "mcp(sovereign_memory", "sovereign_")
+
 
 PLATFORM_ALIASES = {
     "claude": "claude-code",
     "claude_code": "claude-code",
     "kilo": "kilocode",
-    "grok": "grok-build",
-    "grok_tui": "grok-build",
-    "grok_beta": "grok-beta",
-    "grok-build": "grok-build",
+    "grok-build": "grok",
+    "grok_build": "grok",
+    "grok_tui": "grok",
+    "grok-beta": "grok",
+    "grok_beta": "grok",
+    "agy": "antigravity",
+    "antigravity-cli": "antigravity",
+    "antigravity-ide": "antigravity",
+    "antigravity_cli": "antigravity",
+    "antigravity_ide": "antigravity",
 }
 
 
@@ -197,6 +217,171 @@ def update_gemini_manifest(install_root: Path, agent: str, vault: Path, socket_p
     )
 
 
+def gemini_minni_entry(
+    server_path: Path,
+    agent: str,
+    vault: Path,
+    socket_path: Path,
+    workspace: Path,
+    type_name: str | None = None,
+) -> dict:
+    """Canonical `minni` server entry for a Gemini/Antigravity MCP view.
+
+    Uses an absolute server path (cwd-independent) plus the mcp-env-run wrapper,
+    matching every other server entry on the Gemini surfaces. When `type_name`
+    is given (IDE views), it is emitted first to match the live shape.
+    """
+    entry: dict = {}
+    if type_name:
+        entry["$typeName"] = type_name
+    entry["command"] = str(GEMINI_MCP_ENV_RUN)
+    entry["args"] = ["node", str(server_path)]
+    entry["cwd"] = str(Path(server_path).parent.parent)
+    entry["env"] = {
+        "MINNI_AGENT_ID": agent,
+        "MINNI_VAULT_PATH": str(vault),
+        "MINNI_SOCKET_PATH": str(socket_path),
+        "MINNI_WORKSPACE_ID": str(workspace),
+    }
+    return entry
+
+
+def write_view_entry(
+    view_path: Path,
+    server_path: Path,
+    agent: str,
+    vault: Path,
+    socket_path: Path,
+    workspace: Path,
+) -> bool:
+    """Idempotently set the `minni` server in a Gemini MCP view file.
+
+    Preserves the IDE `$typeName` wrapper (inherited from existing siblings),
+    drops any legacy `sovereign-memory` server, and leaves everything else
+    untouched. Missing view files are a no-op (the surface simply isn't present).
+    """
+    if not view_path.exists():
+        return False
+    data = load_json(view_path)
+    if not isinstance(data, dict):
+        return False
+    servers = data.setdefault("mcpServers", {})
+    if not isinstance(servers, dict):
+        return False
+    type_name = None
+    for key, value in servers.items():
+        if key == "minni":
+            continue
+        if isinstance(value, dict) and "$typeName" in value:
+            type_name = value["$typeName"]
+            break
+    new_entry = gemini_minni_entry(server_path, agent, vault, socket_path, workspace, type_name)
+    # Skip the write when already in the desired state, so we don't churn the
+    # file and trip IDE/CLI file watchers on every propagation run.
+    if servers.get("minni") == new_entry and "sovereign-memory" not in servers:
+        return True
+    servers.pop("sovereign-memory", None)
+    servers["minni"] = new_entry
+    write_json(view_path, data)
+    return True
+
+
+def _find_allow_owner(node: object, container_key: str, leaf: str) -> dict | None:
+    """Find the dict assigned to `container_key` that holds a `leaf` list, anywhere.
+
+    Antigravity nests its grants (e.g. userSettings.globalPermissionGrants.allow),
+    so a shallow key_path would otherwise create a divergent top-level block. The
+    container keys we look for (globalPermissionGrants, permissions) are unique in
+    these configs, so the first match is the right one.
+    """
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key == container_key and isinstance(value, dict) and isinstance(value.get(leaf), list):
+                return value
+        for value in node.values():
+            found = _find_allow_owner(value, container_key, leaf)
+            if found is not None:
+                return found
+    elif isinstance(node, list):
+        for value in node:
+            found = _find_allow_owner(value, container_key, leaf)
+            if found is not None:
+                return found
+    return None
+
+
+def ensure_permission_grant(
+    path: Path,
+    key_path: list[str],
+    grant: str = "mcp(minni/*)",
+    legacy_markers: tuple[str, ...] = GEMINI_LEGACY_GRANT_MARKERS,
+) -> bool:
+    """Ensure `grant` is in the allow-list at `key_path`, dropping legacy grants.
+
+    Reuses an existing nested allow-list (matched by container key) when present,
+    only creating along `key_path` as a fallback for a fresh config. Missing files
+    are a no-op. Idempotent: a file already in the desired state is rewritten
+    byte-identically.
+    """
+    if not path.exists():
+        return False
+    data = load_json(path)
+    if not isinstance(data, dict):
+        return False
+    leaf = key_path[-1]
+    owner = _find_allow_owner(data, key_path[-2], leaf) if len(key_path) >= 2 else None
+    if owner is None:
+        owner = data
+        for key in key_path[:-1]:
+            child = owner.get(key)
+            if not isinstance(child, dict):
+                child = {}
+                owner[key] = child
+            owner = child
+    allow = owner.get(leaf)
+    if not isinstance(allow, list):
+        allow = []
+    filtered = [g for g in allow if not any(marker in str(g) for marker in legacy_markers)]
+    if grant not in filtered:
+        filtered.append(grant)
+    # No-op when already in the desired state, to avoid rewriting the file and
+    # tripping file watchers on every run.
+    if owner.get(leaf) == filtered:
+        return True
+    owner[leaf] = filtered
+    write_json(path, data)
+    return True
+
+
+def update_antigravity_config(
+    install_root: Path, agent: str, vault: Path, socket_path: Path, workspace: Path
+) -> dict[str, object]:
+    """Wire the `minni` server across the Antigravity/Gemini surfaces.
+
+    Writes every present surface view (resolving the per-surface mcp_config.json
+    symlink to its view file) and ensures the `mcp(minni/*)` permission grant in
+    the CLI settings and the shared config. The gemini-cli extension manifest is
+    handled separately by update_gemini_manifest.
+    """
+    server_path = install_root / "dist" / "server.js"
+    written: list[str] = []
+    for surface in GEMINI_SURFACE_CONFIGS:
+        surface_path = Path(surface).expanduser()
+        # Follow the symlink to the actual view file; skip broken/missing surfaces.
+        target = surface_path.resolve() if surface_path.exists() else surface_path
+        if write_view_entry(target, server_path, agent, vault, socket_path, workspace):
+            written.append(str(target))
+    grants = {
+        "~/.gemini/config/config.json": ["globalPermissionGrants", "allow"],
+        "~/.gemini/antigravity-cli/settings.json": ["permissions", "allow"],
+    }
+    granted: list[str] = []
+    for path_str, key_path in grants.items():
+        if ensure_permission_grant(Path(path_str).expanduser(), key_path):
+            granted.append(path_str)
+    return {"views_written": written, "grants_updated": granted}
+
+
 def update_toml_mcp_config(path: Path, server_path: Path, agent: str, vault: Path, socket_path: Path, workspace: Path) -> None:
     replace_toml_sections(
         path,
@@ -245,17 +430,19 @@ def platform_spec(platform: str, repo_root: Path, install_root: str | None = Non
             "install": home / ".gemini/extensions/minni",
             "config_kind": "gemini-manifest",
         },
-        "grok-beta": {
-            "agent": "grok-beta",
-            "install": home / ".grok/plugins/minni",
+        "antigravity": {
+            # CLI `agy` + IDE + antigravity, all agent id `gemini`, shared ~/.gemini tree.
+            "agent": "gemini",
+            "install": home / ".gemini/extensions/minni",
+            "config_kind": "antigravity",
+        },
+        "grok": {
+            # Grok is a normal agent: same standard minni plugin install as everyone
+            # else (~/.agents/plugins/minni@minni), wired via ~/.grok/config.toml.
+            "agent": "grok-build",
+            "install": home / ".agents/plugins/minni@minni",
             "config": home / ".grok/config.toml",
             "config_kind": "toml",
-        },
-        "grok-build": {
-            "agent": "grok-build",
-            "install": home / ".grok/plugins/grok-minni",
-            "config": home / ".grok/config.toml",
-            "config_kind": "mcp-json-only",  # uses ~/.agents/bin/mcp-env-run wrapper + .mcp.json; Grok Build hook integration (no full minni plugin copy)
         },
     }
     if platform == "generic":
@@ -267,7 +454,7 @@ def platform_spec(platform: str, repo_root: Path, install_root: str | None = Non
             "config_kind": "mcp-json-only",
         }
     if platform not in specs:
-        raise SystemExit(f"Unknown platform {platform!r}. Use codex, claude-code, kilocode, gemini, grok-beta, grok-build, generic, or all.")
+        raise SystemExit(f"Unknown platform {platform!r}. Use codex, claude-code, kilocode, gemini, antigravity, grok, generic, or all.")
     return specs[platform]
 
 
@@ -286,13 +473,7 @@ def update_one_plugin(platform: str, args: argparse.Namespace) -> dict[str, obje
     bootstrap_args = argparse.Namespace(agent=agent)
     bootstrap_vault(bootstrap_args)
 
-    if canonical_platform(platform) == "grok-build":
-        # Grok Build uses its own session-hook integration surface (plugins/grok-minni/ in this repo).
-        # UserPromptSubmit intercepts /flush, /compact, and /dream (plus scar drafting on PreCompact/Stop).
-        # Do not copy the full minni plugin tree; just ensure the per-agent vault + .mcp.json stamp.
-        install_root.mkdir(parents=True, exist_ok=True)
-    else:
-        copy_tree(source, install_root)
+    copy_tree(source, install_root)
     server_path = install_root / "dist" / "server.js"
     write_json(install_root / ".mcp.json", mcp_json(server_path, agent, vault, Path(args.socket).expanduser(), repo_root))
 
@@ -305,8 +486,15 @@ def update_one_plugin(platform: str, args: argparse.Namespace) -> dict[str, obje
         update_kilo_config(server_path, agent, vault, Path(args.socket).expanduser(), repo_root)
     elif config_kind == "gemini-manifest":
         update_gemini_manifest(install_root, agent, vault, Path(args.socket).expanduser(), repo_root)
+    elif config_kind == "antigravity":
+        # Keep the gemini-cli extension manifest correct, then wire the
+        # Antigravity CLI/IDE/antigravity surface views + permission grants.
+        update_gemini_manifest(install_root, agent, vault, Path(args.socket).expanduser(), repo_root)
+        antigravity_result = update_antigravity_config(
+            install_root, agent, vault, Path(args.socket).expanduser(), repo_root
+        )
 
-    return {
+    base: dict[str, object] = {
         "platform": canonical_platform(platform),
         "agent": agent,
         "install_root": str(install_root),
@@ -315,10 +503,13 @@ def update_one_plugin(platform: str, args: argparse.Namespace) -> dict[str, obje
         "vault_is_symlink": vault.is_symlink(),
         "config_kind": config_kind,
     }
+    if config_kind == "antigravity":
+        base["antigravity"] = antigravity_result
+    return base
 
 
 def update_plugin(args: argparse.Namespace) -> int:
-    platforms = ["codex", "claude-code", "kilocode", "gemini", "grok-beta"] if args.platform == "all" else [args.platform]
+    platforms = ["codex", "claude-code", "kilocode", "gemini", "grok"] if args.platform == "all" else [args.platform]
     restore_no_build = args.no_build
     if len(platforms) > 1 and not args.no_build:
         run(["npm", "run", "build"], cwd=plugin_source(Path(args.repo).expanduser()))
@@ -578,7 +769,7 @@ def main() -> int:
     p_verify.set_defaults(func=verify)
 
     p_update = sub.add_parser("update-plugin", help="Build/copy the canonical plugin and stamp platform-specific agent/vault/socket config.")
-    p_update.add_argument("--platform", required=True, help="codex, claude-code, kilocode, gemini, grok-beta, generic, or all")
+    p_update.add_argument("--platform", required=True, help="codex, claude-code, kilocode, gemini, antigravity, grok, generic, or all")
     p_update.add_argument("--agent", help="Override agent id; required for generic platforms")
     p_update.add_argument("--install-root", help="Required for --platform generic; optional override for known platforms")
     p_update.add_argument("--no-build", action="store_true", help="Skip npm run build when dist is already current")

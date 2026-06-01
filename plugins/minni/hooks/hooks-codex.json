@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node ./dist/codex-hook.js SessionStart",
+            "command": "node ${PLUGIN_ROOT}/dist/codex-hook.js SessionStart",
             "timeout": 5
           }
         ]
@@ -16,7 +16,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node ./dist/codex-hook.js UserPromptSubmit",
+            "command": "node ${PLUGIN_ROOT}/dist/codex-hook.js UserPromptSubmit",
             "timeout": 5
           }
         ]
@@ -27,7 +27,18 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node ./dist/codex-hook.js PreCompact",
+            "command": "node ${PLUGIN_ROOT}/dist/codex-hook.js PreCompact",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ${PLUGIN_ROOT}/dist/codex-hook.js Stop",
             "timeout": 5
           }
         ]

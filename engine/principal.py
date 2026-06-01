@@ -307,6 +307,41 @@ def resolve_effective_principal(
     if supplied == stamped.agent_id:
         return stamped
 
+    # Platform-hosted agents are not legacy aliases: they need their own stamped
+    # principal so reads/writes are attributed to the actual surface (e.g. codex)
+    # while the operator-controlled local principal file remains the trust root.
+    if strict:
+        for name in CANONICAL_PRINCIPAL_NAMES:
+            raw = _load_raw_principal_file(name, d, strict=True)
+            if not raw:
+                continue
+            raw_ids = raw.get("platform_agent_ids")
+            platform_ids = [str(a) for a in raw_ids] if isinstance(raw_ids, list) else []
+            if supplied not in platform_ids:
+                continue
+            platform_caps = raw.get("platform_agent_capabilities") or {}
+            caps = platform_caps.get(supplied) if isinstance(platform_caps, dict) else None
+            # An explicit empty list means "no capabilities" and MUST be honoured —
+            # `caps or ...` would wrongly fall through to the broader principal caps,
+            # silently escalating a deliberately-restricted platform agent. Only fall
+            # back when caps is absent (None). Likewise treat explicit null
+            # workspace_id/capabilities as absent rather than coercing to "None".
+            if caps is not None:
+                resolved_caps = caps
+            else:
+                raw_caps = raw.get("capabilities")
+                resolved_caps = raw_caps if raw_caps is not None else stamped.capabilities
+            raw_ws = raw.get("workspace_id")
+            resolved_ws = raw_ws if raw_ws is not None else stamped.workspace_id
+            return EffectivePrincipal(
+                agent_id=supplied,
+                workspace_id=str(resolved_ws),
+                session_id=raw.get("session_id"),
+                transport=transport,
+                capabilities=list(resolved_caps),
+                allowed_vault_roots=stamped.allowed_vault_roots,
+            )
+
     # Check legacy aliases declared across ALL principal files that exist (union).
     # No early break: an alias declared in secondary file (e.g. default.json) must be
     # honoured even if the primary (local.json) exists with an empty list.

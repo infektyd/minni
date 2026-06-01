@@ -259,13 +259,12 @@ When a recalled snippet has `agent_origin` other than your own (e.g., Claude Cod
 
 ## Platform-Specific Delivery Callouts
 
-### Grok Build Hybrid Example (thin overlay + native /flush + TUI hooks)
+### Grok
 
-- See the thin overlay at `~/.grok/plugins/grok-minni/skills/grok-minni/SKILL.md`
-- Grok TUI lifecycle participation (SessionStart/UserPromptSubmit/PreCompact/Stop via custom stdlib hook)
-- Automatic zero-reminder path for native Grok tools (`memory_search`, /flush, /compact, /dream, axpress for visual vault review)
-- "Grok Build V1 delivery" for the Distill Ritual (gauges injection on SessionStart + keyword fallback on UserPromptSubmit; hook auto-drafts prepare_outcome candidates)
-- Local DESIGN-flush-integration.md and SOVEREIGN-DISTILL-RITUAL-GUIDE.md contain the exact Grok TUI delivery mechanics
+- Grok is not special. It installs the standard minni plugin at
+  `~/.agents/plugins/minni@minni` and is wired via `~/.grok/config.toml`
+  `[mcp_servers.minni]`, identical to the other platforms
+  (`propagate.py update-plugin --platform grok`, agent id `grok-build`).
 - All rich portable behaviors come from this canonical SKILL + the ritual package `~/.agents/artifacts/minni-distill-ritual-v1/`
 
 ### (Future sections for Claude Code, Codex, Gemini/Antigravity, Hermes/OpenClaw, etc. — thin notes only)
