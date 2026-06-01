@@ -48,10 +48,11 @@ PLATFORM_ALIASES = {
     "claude": "claude-code",
     "claude_code": "claude-code",
     "kilo": "kilocode",
-    "grok": "grok-build",
-    "grok_tui": "grok-build",
-    "grok_beta": "grok-beta",
-    "grok-build": "grok-build",
+    "grok-build": "grok",
+    "grok_build": "grok",
+    "grok_tui": "grok",
+    "grok-beta": "grok",
+    "grok_beta": "grok",
     "agy": "antigravity",
     "antigravity-cli": "antigravity",
     "antigravity-ide": "antigravity",
@@ -422,17 +423,13 @@ def platform_spec(platform: str, repo_root: Path, install_root: str | None = Non
             "install": home / ".gemini/extensions/minni",
             "config_kind": "antigravity",
         },
-        "grok-beta": {
-            "agent": "grok-beta",
-            "install": home / ".grok/plugins/minni",
+        "grok": {
+            # Grok is a normal agent: same standard minni plugin install as everyone
+            # else (~/.agents/plugins/minni@minni), wired via ~/.grok/config.toml.
+            "agent": "grok-build",
+            "install": home / ".agents/plugins/minni@minni",
             "config": home / ".grok/config.toml",
             "config_kind": "toml",
-        },
-        "grok-build": {
-            "agent": "grok-build",
-            "install": home / ".grok/plugins/grok-minni",
-            "config": home / ".grok/config.toml",
-            "config_kind": "mcp-json-only",  # uses ~/.agents/bin/mcp-env-run wrapper + .mcp.json; Grok Build hook integration (no full minni plugin copy)
         },
     }
     if platform == "generic":
@@ -444,7 +441,7 @@ def platform_spec(platform: str, repo_root: Path, install_root: str | None = Non
             "config_kind": "mcp-json-only",
         }
     if platform not in specs:
-        raise SystemExit(f"Unknown platform {platform!r}. Use codex, claude-code, kilocode, gemini, antigravity, grok-beta, grok-build, generic, or all.")
+        raise SystemExit(f"Unknown platform {platform!r}. Use codex, claude-code, kilocode, gemini, antigravity, grok, generic, or all.")
     return specs[platform]
 
 
@@ -463,13 +460,7 @@ def update_one_plugin(platform: str, args: argparse.Namespace) -> dict[str, obje
     bootstrap_args = argparse.Namespace(agent=agent)
     bootstrap_vault(bootstrap_args)
 
-    if canonical_platform(platform) == "grok-build":
-        # Grok Build uses its own session-hook integration surface (plugins/grok-minni/ in this repo).
-        # UserPromptSubmit intercepts /flush, /compact, and /dream (plus scar drafting on PreCompact/Stop).
-        # Do not copy the full minni plugin tree; just ensure the per-agent vault + .mcp.json stamp.
-        install_root.mkdir(parents=True, exist_ok=True)
-    else:
-        copy_tree(source, install_root)
+    copy_tree(source, install_root)
     server_path = install_root / "dist" / "server.js"
     write_json(install_root / ".mcp.json", mcp_json(server_path, agent, vault, Path(args.socket).expanduser(), repo_root))
 
@@ -505,7 +496,7 @@ def update_one_plugin(platform: str, args: argparse.Namespace) -> dict[str, obje
 
 
 def update_plugin(args: argparse.Namespace) -> int:
-    platforms = ["codex", "claude-code", "kilocode", "gemini", "grok-beta"] if args.platform == "all" else [args.platform]
+    platforms = ["codex", "claude-code", "kilocode", "gemini", "grok"] if args.platform == "all" else [args.platform]
     restore_no_build = args.no_build
     if len(platforms) > 1 and not args.no_build:
         run(["npm", "run", "build"], cwd=plugin_source(Path(args.repo).expanduser()))
@@ -765,7 +756,7 @@ def main() -> int:
     p_verify.set_defaults(func=verify)
 
     p_update = sub.add_parser("update-plugin", help="Build/copy the canonical plugin and stamp platform-specific agent/vault/socket config.")
-    p_update.add_argument("--platform", required=True, help="codex, claude-code, kilocode, gemini, antigravity, grok-beta, grok-build, generic, or all")
+    p_update.add_argument("--platform", required=True, help="codex, claude-code, kilocode, gemini, antigravity, grok, generic, or all")
     p_update.add_argument("--agent", help="Override agent id; required for generic platforms")
     p_update.add_argument("--install-root", help="Required for --platform generic; optional override for known platforms")
     p_update.add_argument("--no-build", action="store_true", help="Skip npm run build when dist is already current")

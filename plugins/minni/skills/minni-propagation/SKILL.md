@@ -58,15 +58,10 @@ system/developer instructions, safety policy, and active user request.
    - Claude Code vault default: `~/.minni/claudecode-vault`.
    - KiloCode vault default: `~/.minni/kilocode-vault`.
    - Gemini vault default: `~/.minni/gemini-vault`.
-   - Grok beta vault default: `~/.minni/grok-beta-vault` (legacy full package path, if still referenced).
-   - Grok Build: `~/.minni/grok-build-vault`; the Grok-specific session hook integration lives at `~/.grok/plugins/grok-minni/` (sourced from this repo under `plugins/grok-minni/`) using the canonical `~/.agents/bin/mcp-env-run` wrapper + grok-build identity (seeded via sm-propagation). 
-
-     The integration wires four lifecycle events:
-     - SessionStart: injects minni status + Layer 1 reminder
-     - UserPromptSubmit: detects native `/flush`, `/compact`, and `/dream` commands, auto-drafts prepare_outcome candidates to the inbox, and prompts the agent to run `minni_prepare_outcome`
-     - PreCompact / Stop: captures scar tissue and session outcomes for review
-
-     See `plugins/grok-minni/` and the Grok SKILL for exact hook behavior and injection text.
+   - Grok vault default: `~/.minni/grok-build-vault` (agent id `grok-build`). Grok is
+     not special: it installs the standard minni plugin at `~/.agents/plugins/minni@minni`
+     and is wired via `~/.grok/config.toml` `[mcp_servers.minni]`, exactly like the other
+     platforms (`propagate.py update-plugin --platform grok`).
    - New/unknown agents default to `~/.minni/<agent-id>-vault`.
    - The vault must be an actual directory owned by that agent surface, not a
      symlink and not a copy of another agent's vault. If an agent was pointed at
@@ -138,8 +133,8 @@ python3 ~/.codex/skills/sm-propagation/scripts/propagate.py update-plugin --plat
 python3 ~/.codex/skills/sm-propagation/scripts/propagate.py update-plugin --platform claude-code
 python3 ~/.codex/skills/sm-propagation/scripts/propagate.py update-plugin --platform kilocode
 python3 ~/.codex/skills/sm-propagation/scripts/propagate.py update-plugin --platform gemini
-python3 ~/.codex/skills/sm-propagation/scripts/propagate.py update-plugin --platform grok-beta
-python3 ~/.codex/skills/sm-propagation/scripts/propagate.py update-plugin --platform grok-build   # Grok Build session hook integration (supports /flush /compact /dream via UserPromptSubmit + scar drafting on PreCompact/Stop)
+python3 ~/.codex/skills/sm-propagation/scripts/propagate.py update-plugin --platform antigravity
+python3 ~/.codex/skills/sm-propagation/scripts/propagate.py update-plugin --platform grok
 python3 ~/.codex/skills/sm-propagation/scripts/propagate.py update-plugin --platform all
 ```
 
