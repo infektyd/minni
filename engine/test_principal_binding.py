@@ -151,6 +151,36 @@ def test_resolve_strict_platform_agent_gets_own_stamp(tmp_path: Path):
     assert not p.can("resolve_candidate")
 
 
+def test_resolve_strict_platform_agent_empty_caps_is_honoured(tmp_path: Path):
+    """An explicit empty capability list must NOT fall back to the broader principal
+    caps (capability-escalation guard): `[]` means "deliberately no capabilities"."""
+    principals = tmp_path / "principals"
+    principals.mkdir()
+    f = principals / "local.json"
+    f.write_text(
+        json.dumps(
+            {
+                "agent_id": "main",
+                "capabilities": ["*"],
+                "platform_agent_ids": ["codex"],
+                "platform_agent_capabilities": {
+                    "codex": [],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    os.chmod(f, 0o600)
+
+    p = resolve_effective_principal(
+        supplied_agent_id="codex", transport="uds", principals_dir=principals
+    )
+    assert p.agent_id == "codex"
+    assert p.capabilities == []
+    assert not p.can("read")
+    assert not p.can("search")
+
+
 def test_strict_principal_bad_permissions_fail_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     principals = tmp_path / "principals"
     principals.mkdir()

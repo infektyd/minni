@@ -263,6 +263,8 @@ def write_view_entry(
     if not view_path.exists():
         return False
     data = load_json(view_path)
+    if not isinstance(data, dict):
+        return False
     servers = data.setdefault("mcpServers", {})
     if not isinstance(servers, dict):
         return False
@@ -273,8 +275,13 @@ def write_view_entry(
         if isinstance(value, dict) and "$typeName" in value:
             type_name = value["$typeName"]
             break
+    new_entry = gemini_minni_entry(server_path, agent, vault, socket_path, workspace, type_name)
+    # Skip the write when already in the desired state, so we don't churn the
+    # file and trip IDE/CLI file watchers on every propagation run.
+    if servers.get("minni") == new_entry and "sovereign-memory" not in servers:
+        return True
     servers.pop("sovereign-memory", None)
-    servers["minni"] = gemini_minni_entry(server_path, agent, vault, socket_path, workspace, type_name)
+    servers["minni"] = new_entry
     write_json(view_path, data)
     return True
 
@@ -319,6 +326,8 @@ def ensure_permission_grant(
     if not path.exists():
         return False
     data = load_json(path)
+    if not isinstance(data, dict):
+        return False
     leaf = key_path[-1]
     owner = _find_allow_owner(data, key_path[-2], leaf) if len(key_path) >= 2 else None
     if owner is None:
@@ -335,6 +344,10 @@ def ensure_permission_grant(
     filtered = [g for g in allow if not any(marker in str(g) for marker in legacy_markers)]
     if grant not in filtered:
         filtered.append(grant)
+    # No-op when already in the desired state, to avoid rewriting the file and
+    # tripping file watchers on every run.
+    if owner.get(leaf) == filtered:
+        return True
     owner[leaf] = filtered
     write_json(path, data)
     return True
