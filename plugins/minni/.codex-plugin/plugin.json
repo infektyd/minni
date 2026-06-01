@@ -23,7 +23,7 @@
   "interface": {
     "displayName": "Minni",
     "shortDescription": "Local recall and Codex-owned Obsidian memory",
-    "longDescription": "Minni gives Codex transparent local recall, manual vault-first learning, and readable audit logs through a local MCP server. It talks to the existing Sovereign daemon and keeps expensive extraction out of v1.",
+    "longDescription": "Minni gives Codex transparent local recall, manual vault-first learning, and readable audit logs through a local MCP server. It talks to the existing Minni daemon and keeps expensive extraction out of v1.",
     "developerName": "Infektyd",
     "category": "Coding",
     "capabilities": [

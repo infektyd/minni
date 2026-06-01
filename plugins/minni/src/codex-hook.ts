@@ -19,7 +19,7 @@ import {
   readAgentContext,
   recallMemory,
 } from "./sovereign.js";
-import { extractScarTissue } from "./task.js";
+import { extractScarTissue, prepareOutcome } from "./task.js";
 import {
   auditTail,
   ensureVault,
@@ -44,6 +44,7 @@ const VALID_EVENTS: ReadonlyArray<EnvelopeEvent> = [
   "SessionStart",
   "UserPromptSubmit",
   "PreCompact",
+  "Stop",
 ];
 
 async function readStdin(): Promise<unknown> {
@@ -294,6 +295,52 @@ async function handlePreCompact(payload: Record<string, unknown>): Promise<HookO
   return withHookContext("PreCompact", envelope);
 }
 
+async function handleStop(payload: Record<string, unknown>): Promise<HookOutput> {
+  await ensureVault(DEFAULT_VAULT_PATH);
+  const sessionId = asString(payload.session_id) || asString(payload.sessionId) || "session";
+  const workspaceId = workspaceFromPayload(payload);
+  const lastTask = asString(payload.last_user_message) || asString(payload.summary) || sessionId;
+  const tail = await auditTail(DEFAULT_VAULT_PATH, 30);
+  const outcome = await prepareOutcome({
+    task: lastTask.slice(0, 200),
+    summary: tail.entries.slice(-5).join("\n").slice(0, 600) || "session ended",
+    profile: "compact",
+    vaultPath: DEFAULT_VAULT_PATH,
+  });
+
+  const inbox = await writeInbox(DEFAULT_VAULT_PATH, sessionId, {
+    kind: "codex_stop_candidates",
+    agent_id: DEFAULT_AGENT_ID,
+    workspace_id: workspaceId,
+    candidates: outcome.outcomeDraft.learnCandidates,
+    log_only: outcome.outcomeDraft.logOnly,
+    expires: outcome.outcomeDraft.expires,
+    do_not_store: outcome.outcomeDraft.doNotStore,
+    last_task: lastTask.slice(0, 200),
+  });
+
+  await recordAudit(DEFAULT_VAULT_PATH, {
+    tool: "hook_codex_stop",
+    summary: `stop ${sessionId}`,
+    details: {
+      candidates: outcome.outcomeDraft.learnCandidates.length,
+      workspace: workspaceId,
+      inbox_path: inbox.filePath,
+    },
+  });
+
+  if (outcome.outcomeDraft.learnCandidates.length === 0) {
+    return { continue: true };
+  }
+
+  return {
+    continue: true,
+    systemMessage: `Minni: ${outcome.outcomeDraft.learnCandidates.length} candidate learning${
+      outcome.outcomeDraft.learnCandidates.length === 1 ? "" : "s"
+    } drafted to inbox (${inbox.filePath}). Use minni_prepare_outcome/minni_learn to review and commit.`,
+  };
+}
+
 async function dispatch(event: string, payload: Record<string, unknown>): Promise<HookOutput> {
   switch (event) {
     case "SessionStart":
@@ -302,6 +349,8 @@ async function dispatch(event: string, payload: Record<string, unknown>): Promis
       return handleUserPromptSubmit(payload);
     case "PreCompact":
       return handlePreCompact(payload);
+    case "Stop":
+      return handleStop(payload);
     default:
       return { continue: true };
   }
