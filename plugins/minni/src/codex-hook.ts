@@ -308,12 +308,6 @@ async function handleStop(payload: Record<string, unknown>): Promise<HookOutput>
     vaultPath: DEFAULT_VAULT_PATH,
   });
 
-  // Nothing worth persisting: skip the inbox write and audit entry so we don't
-  // litter the inbox with empty files or pad the audit log with noise.
-  if (outcome.outcomeDraft.learnCandidates.length === 0) {
-    return { continue: true };
-  }
-
   const inbox = await writeInbox(DEFAULT_VAULT_PATH, sessionId, {
     kind: "codex_stop_candidates",
     agent_id: DEFAULT_AGENT_ID,
@@ -334,6 +328,10 @@ async function handleStop(payload: Record<string, unknown>): Promise<HookOutput>
       inbox_path: inbox.filePath,
     },
   });
+
+  if (outcome.outcomeDraft.learnCandidates.length === 0) {
+    return { continue: true };
+  }
 
   return {
     continue: true,

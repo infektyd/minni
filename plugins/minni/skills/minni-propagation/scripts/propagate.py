@@ -326,7 +326,7 @@ def ensure_permission_grant(
     if not path.exists():
         return False
     data = load_json(path)
-    if not isinstance(data, dict) or not key_path:
+    if not isinstance(data, dict):
         return False
     leaf = key_path[-1]
     owner = _find_allow_owner(data, key_path[-2], leaf) if len(key_path) >= 2 else None
@@ -509,7 +509,7 @@ def update_one_plugin(platform: str, args: argparse.Namespace) -> dict[str, obje
 
 
 def update_plugin(args: argparse.Namespace) -> int:
-    platforms = ["codex", "claude-code", "kilocode", "gemini", "antigravity", "grok"] if args.platform == "all" else [args.platform]
+    platforms = ["codex", "claude-code", "kilocode", "gemini", "grok"] if args.platform == "all" else [args.platform]
     restore_no_build = args.no_build
     if len(platforms) > 1 and not args.no_build:
         run(["npm", "run", "build"], cwd=plugin_source(Path(args.repo).expanduser()))
