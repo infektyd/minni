@@ -137,6 +137,13 @@ class SovereignConfig:
             "pruning": {
                 "interval_seconds": 24 * 60 * 60,
             },
+            # Drains the proposed candidate_packets queue into durable learnings.
+            # Short interval so memory keeps moving; per-run cap bounds each tick.
+            "consolidation": {
+                "interval_seconds": 15 * 60,
+                "max_per_run": 50,
+                "max_batches_per_tick": 40,  # up to 40*50=2000 candidates/tick
+            },
         },
     })
 
