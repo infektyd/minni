@@ -331,6 +331,13 @@ def resolve_effective_principal(
             else:
                 raw_caps = raw.get("capabilities")
                 resolved_caps = raw_caps if raw_caps is not None else stamped.capabilities
+            # Guard against malformed principal files: a bare string would be
+            # silently split into per-character caps by list(), and a scalar
+            # (int/bool) would raise TypeError and crash the daemon.
+            if isinstance(resolved_caps, str):
+                resolved_caps = [resolved_caps]
+            elif not isinstance(resolved_caps, (list, tuple, set)):
+                resolved_caps = []
             raw_ws = raw.get("workspace_id")
             resolved_ws = raw_ws if raw_ws is not None else stamped.workspace_id
             return EffectivePrincipal(
