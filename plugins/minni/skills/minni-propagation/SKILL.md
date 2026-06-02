@@ -61,7 +61,9 @@ system/developer instructions, safety policy, and active user request.
    - Grok vault default: `~/.minni/grok-build-vault` (agent id `grok-build`). Grok is
      not special: it installs the standard minni plugin at `~/.agents/plugins/minni@minni`
      and is wired via `~/.grok/config.toml` `[mcp_servers.minni]`, exactly like the other
-     platforms (`propagate.py update-plugin --platform grok`).
+     platforms (`propagate.py update-plugin --platform grok`). Flagless update-plugin
+     now preserves any existing correct surface env in the target's toml/.mcp.json
+     (see preservation note in Platform Plugin Update Workflow).
    - New/unknown agents default to `~/.minni/<agent-id>-vault`.
    - The vault must be an actual directory owned by that agent surface, not a
      symlink and not a copy of another agent's vault. If an agent was pointed at
@@ -116,15 +118,17 @@ functionality and configuration:
 1. Build from the canonical repo (example): `~/Projects/minni`.
 2. Copy the current plugin package to the platform's installed plugin/cache
    location.
-3. Stamp the platform MCP config with explicit env:
-   - `SOVEREIGN_AGENT_ID`
-   - `SOVEREIGN_VAULT_PATH`
+3. Stamp the platform MCP config with explicit env (but see preservation below):
+   - `MINNI_AGENT_ID`
+   - `MINNI_VAULT_PATH`
    - `MINNI_SOCKET_PATH=~/.minni/run/minnid.sock`
-   - `SOVEREIGN_WORKSPACE_ID=~/Projects/minni` (example)
+   - `MINNI_WORKSPACE_ID=...` (your active project, e.g. ~/Projects/pixelAgents for grok-build; never the Minni source)
 4. Bootstrap only an empty actual vault tree for that agent if missing.
 5. Never copy `wiki/`, `logs/`, `inbox/`, `index.md`, or `log.md` from another
    agent.
 6. Verify the platform's config points to the refreshed `dist/server.js`.
+
+**Belt-and-suspenders preservation (post-2026-06 fix):** `update-plugin` (and the .mcp.json writer + replace_toml_sections) will, when the *target* config already contains surface env keys (MINNI_AGENT_ID / VAULT_PATH / SOCKET_PATH / WORKSPACE_ID), preserve the target's values for those keys instead of overwriting with the --repo / Minni source root. Only the plugin server pointer (command/args/cwd) is refreshed. This means a flagless `update-plugin --platform grok|all` can no longer reintroduce the "Minni source as workspace" artifact for any surface. Use `--workspace /your/project` as the explicit override when you *do* want to set it. A fresh target (no env keys) falls back to --workspace (if given) or the repo default (old behavior). See propagate.py --help for update-plugin and the code comments in replace_toml_sections / mcp_json / platform_spec.
 
 Known platform update commands:
 
