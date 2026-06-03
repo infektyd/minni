@@ -170,3 +170,6 @@ Thumbs.db
 
 # sovereign skill scripts kept private (model-backend dependent; not for public repo)
 plugins/minni/skills/*/scripts/
+
+# Excalidraw scratch diagrams
+*.excalidraw
