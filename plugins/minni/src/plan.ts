@@ -54,7 +54,8 @@ export type PlanEvent =
   | { kind: "gate_passed"; slice_id: string; evidence: string; at: string }
   | { kind: "shelf_pulled"; at: string; reason: string }
   | { kind: "rehydrated"; at: string }
-  | { kind: "restored"; from_rev: number; at: string };
+  | { kind: "restored"; from_rev: number; at: string }
+  | { kind: "scar_added"; signal: string; at: string };
 
 // ---------------------------------------------------------------------------
 // Supporting input/deps (for createPlan testability and callers)
@@ -513,6 +514,36 @@ export function updateSlice(
   return nextPlan;
 }
 
+export function addScar(plan: PlanArtifact, entry: ScarTissueEntry): PlanArtifact {
+  const updated = new Date().toISOString();
+  const kind = entry.kind;
+  const signal = entry.signal;
+  const resolution = entry.resolution;
+
+  const existsIdx = plan.scar_tissue.findIndex(
+    (s) => s.kind === kind && s.signal === signal,
+  );
+  let nextScarTissue: ScarTissueEntry[];
+  if (existsIdx >= 0) {
+    nextScarTissue = plan.scar_tissue.map((s, idx) => {
+      if (idx === existsIdx) {
+        return { ...s, resolution };
+      }
+      return s;
+    });
+  } else {
+    nextScarTissue = [...plan.scar_tissue, { kind, signal, resolution }];
+  }
+
+  const nextPlan: PlanArtifact = {
+    ...plan,
+    scar_tissue: nextScarTissue,
+    updated,
+  };
+  nextPlan.plan_digest = computePlanDigest(nextPlan);
+  return nextPlan;
+}
+
 /** Replan: preserve superset (never drop history). Mark no-longer-proposed non-final slices superseded; append unmatched new ones. Pure. */
 export function replan(
   plan: PlanArtifact,
@@ -629,6 +660,7 @@ export function compactPlanView(plan: PlanArtifact): {
   pending: Array<{ id: string; title: string; status: PlanSliceStatus }>;
   open_questions: string[];
   scar_tissue: number;
+  scars: string[];
   shelf: string | undefined;
   rev: number;
 } {
@@ -638,12 +670,16 @@ export function compactPlanView(plan: PlanArtifact): {
   const shelf = plan.shelf_ref
     ? `${plan.shelf_ref.agent} ${plan.shelf_ref.wikilink} (${plan.shelf_ref.pull_hint})`
     : undefined;
+  const scars = (plan.scar_tissue ?? [])
+    .slice(-3)
+    .map((s) => `${s.kind}: ${s.signal}`);
   return {
     goal: plan.goal,
     next_action: plan.next_action,
     pending,
     open_questions: plan.open_questions,
     scar_tissue: plan.scar_tissue.length,
+    scars,
     shelf,
     rev: plan.rev,
   };

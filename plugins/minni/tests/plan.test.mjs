@@ -13,7 +13,9 @@ import {
   setActivePlan,
   clearActivePlan,
   getActivePlan,
-  resolveActivePlanView
+  resolveActivePlanView,
+  addScar,
+  compactPlanView
 } from "../dist/plan.js";
 import { ensureVault } from "../dist/vault.js";
 
@@ -246,4 +248,52 @@ test("active plan pointer management and resolution", async () => {
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("addScar pure function and compactPlanView scars surfacing", () => {
+  const plan = {
+    plan_id: "test-plan",
+    goal: "Test goal",
+    status: "draft",
+    constraints: [],
+    slices: [],
+    open_questions: [],
+    scar_tissue: [
+      { kind: "failed_command", signal: "run test", resolution: "fixed setup" }
+    ],
+    next_action: "test",
+    plan_digest: "",
+    created: new Date().toISOString(),
+    updated: new Date().toISOString(),
+    rev: 1
+  };
+  plan.plan_digest = computePlanDigest(plan);
+
+  // 1. addScar - new entry
+  const entry1 = { kind: "dead_end", signal: "tried approach X", resolution: "rejected approach" };
+  const plan2 = addScar(plan, entry1);
+
+  assert.notEqual(plan, plan2, "addScar should be pure (return a new object)");
+  assert.equal(plan.scar_tissue.length, 1, "original plan scar_tissue should not be mutated");
+  assert.equal(plan2.scar_tissue.length, 2, "new plan scar_tissue should have the added entry");
+  assert.deepEqual(plan2.scar_tissue[1], entry1);
+
+  // 2. addScar - duplicate entry kind+signal updates resolution instead of duplicating
+  const entry2 = { kind: "failed_command", signal: "run test", resolution: "better fix" };
+  const plan3 = addScar(plan2, entry2);
+  assert.equal(plan3.scar_tissue.length, 2, "duplicate kind+signal should not append");
+  assert.equal(plan3.scar_tissue[0].resolution, "better fix", "resolution should be updated");
+
+  // 3. compactPlanView - scars array contains last 3 entries
+  const entry3 = { kind: "rejected_hypothesis", signal: "hypothesis Y" };
+  const entry4 = { kind: "dead_end", signal: "direction Z" };
+  const plan4 = addScar(addScar(plan3, entry3), entry4); // now has 4 scars: 1 updated, 1 added, 2 more added
+
+  const view = compactPlanView(plan4);
+  assert.equal(view.scar_tissue, 4);
+  assert.ok(Array.isArray(view.scars));
+  assert.equal(view.scars.length, 3);
+  assert.equal(view.scars[0], "dead_end: tried approach X");
+  assert.equal(view.scars[1], "rejected_hypothesis: hypothesis Y");
+  assert.equal(view.scars[2], "dead_end: direction Z");
 });

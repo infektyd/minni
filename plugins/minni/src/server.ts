@@ -28,8 +28,10 @@ import {
   extractScarTissue,
   prepareOutcome,
   prepareTask,
+  type ScarTissueEntry,
 } from "./task.js";
 import {
+  addScar,
   appendJournal,
   compactPlanView,
   createPlan,
@@ -1003,12 +1005,18 @@ server.registerTool(
       constraints: z.array(z.string()).optional(),
       slices: z.array(planSliceInputSchema).optional(),
       open_questions: z.array(z.string()).optional(),
+      seed_scar_from_audit: z.boolean().optional(),
     },
   },
-  async ({ goal, constraints, slices, open_questions }) => {
+  async ({ goal, constraints, slices, open_questions, seed_scar_from_audit }) => {
     const effectiveVaultPath = DEFAULT_VAULT_PATH;
+    let scar_tissue: ScarTissueEntry[] | undefined;
+    if (seed_scar_from_audit) {
+      const tail = await auditTail(effectiveVaultPath, 60);
+      scar_tissue = extractScarTissue(tail.entries);
+    }
     const { plan, write } = await createPlan(
-      { goal, constraints, slices, open_questions, vaultPath: effectiveVaultPath },
+      { goal, constraints, slices, open_questions, scar_tissue, vaultPath: effectiveVaultPath },
       { vaultPath: effectiveVaultPath },
     );
     return textResult(
@@ -1067,6 +1075,38 @@ server.registerTool(
         at: new Date().toISOString(),
       });
     }
+    return textResult(JSON.stringify(next, null, 2));
+  },
+);
+
+server.registerTool(
+  "minni_plan_scar",
+  {
+    title: "Minni Plan Scar",
+    description:
+      "Record a dead-end, failed command, or rejected hypothesis during plan execution to prevent retries.",
+    inputSchema: {
+      plan_id: z.string().min(1),
+      kind: z.enum(["failed_command", "dead_end", "rejected_hypothesis"]),
+      signal: z.string().min(1),
+      resolution: z.string().optional(),
+    },
+  },
+  async ({ plan_id, kind, signal, resolution }) => {
+    const effectiveVaultPath = DEFAULT_VAULT_PATH;
+    const notePath = await findPlanNote(effectiveVaultPath, plan_id);
+    if (!notePath) {
+      return textResult(JSON.stringify({ error: `plan not found: ${plan_id}` }, null, 2));
+    }
+    const plan = await rehydratePlan(notePath);
+    const next = addScar(plan, { kind, signal, resolution });
+    await persistPlan(next, { vaultPath: effectiveVaultPath, notePath });
+    const journalPath = path.join(path.dirname(notePath), `${plan_id}.log.md`);
+    await appendJournal(journalPath, {
+      kind: "scar_added",
+      signal,
+      at: new Date().toISOString(),
+    });
     return textResult(JSON.stringify(next, null, 2));
   },
 );
