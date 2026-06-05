@@ -345,3 +345,65 @@ test("rehydratePlan round-trips evidence containing backslashes (regex/path proo
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("P3: compactPlanView leads with progress headline so a closed slice is not read as a closed plan", () => {
+  const mk = (statuses) => ({
+    plan_id: "p3",
+    goal: "g",
+    status: "draft",
+    constraints: [],
+    slices: statuses.map((st, i) => ({ id: `s${i + 1}`, title: `S${i + 1}`, status: st })),
+    open_questions: [],
+    scar_tissue: [],
+    next_action: "x",
+    plan_digest: "",
+    created: new Date().toISOString(),
+    updated: new Date().toISOString(),
+    rev: 1,
+  });
+
+  // slice 1 of 5 done -> headline must convey 1/5 + remaining + "not complete", NOT completion
+  const v1 = compactPlanView(mk(["done", "pending", "pending", "pending", "pending"]));
+  assert.equal(v1.progress.done, 1);
+  assert.equal(v1.progress.total, 5);
+  assert.equal(v1.progress.remaining, 4);
+  assert.equal(v1.progress.complete, false);
+  assert.match(v1.headline, /1\/5/);
+  assert.match(v1.headline, /NOT complete/i);
+  assert.doesNotMatch(v1.headline, /^PLAN COMPLETE/);
+
+  // all 5 resolved (incl. one superseded) -> complete headline
+  const v2 = compactPlanView(mk(["done", "done", "done", "superseded", "done"]));
+  assert.equal(v2.progress.complete, true);
+  assert.equal(v2.progress.remaining, 0);
+  assert.match(v2.headline, /PLAN COMPLETE/);
+});
+
+test("P10: completing the last slice moves the plan to a terminal status (accepted) and back if reopened", () => {
+  const base = {
+    plan_id: "p10",
+    goal: "g",
+    status: "draft",
+    constraints: [],
+    slices: [
+      { id: "a", title: "A", status: "pending" },
+      { id: "b", title: "B", status: "done", evidence: "B verified in test log output" },
+    ],
+    open_questions: [],
+    scar_tissue: [],
+    next_action: "x",
+    plan_digest: "",
+    created: new Date().toISOString(),
+    updated: new Date().toISOString(),
+    rev: 1,
+  };
+  base.plan_digest = computePlanDigest(base);
+
+  // close the last open slice -> all resolved -> plan auto-transitions draft -> accepted
+  const done = updateSlice(base, "a", "done", "A verified by running the suite, 12/12 passed");
+  assert.equal(done.status, "accepted", "plan should become terminal when all slices resolve");
+
+  // reopening a slice un-finishes the plan -> accepted reverts to draft
+  const reopened = updateSlice(done, "a", "in_progress");
+  assert.equal(reopened.status, "draft", "reopening a slice should revert the terminal status");
+});

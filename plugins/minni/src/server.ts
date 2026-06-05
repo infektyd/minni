@@ -1075,7 +1075,28 @@ server.registerTool(
         at: new Date().toISOString(),
       });
     }
-    return textResult(JSON.stringify(next, null, 2));
+    // P10: if updateSlice moved the plan to a terminal status (all slices resolved), clear the
+    // active pointer when it still points at this plan, so a finished plan stops being injected.
+    if (next.status === "accepted") {
+      try {
+        const active = await getActivePlan(effectiveVaultPath);
+        if (active && active.plan_id === plan_id) {
+          await clearActivePlan(effectiveVaultPath);
+        }
+      } catch {
+        // active pointer maintenance is advisory; never fail the update on it
+      }
+    }
+    // P3: lead the response with plan-level progress so closing one slice is never misread as
+    // closing the whole plan.
+    const view = compactPlanView(next);
+    return textResult(
+      JSON.stringify(
+        { headline: view.headline, progress: view.progress, next_action: next.next_action, plan: next },
+        null,
+        2,
+      ),
+    );
   },
 );
 

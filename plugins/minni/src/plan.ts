@@ -521,9 +521,25 @@ export function updateSlice(
   }
   const newSlices = plan.slices.map((s, i) => (i === idx ? updatedSlice : s));
   const updated = new Date().toISOString();
+
+  // P10 (terminal-state transition): when every slice is resolved (done/superseded), move the
+  // plan to a terminal status so resolveActivePlanView stops injecting a finished plan into
+  // future sessions. "accepted" is a real PageStatus that resolveActivePlanView already skips.
+  // Reopening a slice un-finishes the plan, so revert an auto-accepted plan back to draft.
+  const allResolved =
+    newSlices.length > 0 &&
+    newSlices.every((s) => s.status === "done" || s.status === "superseded");
+  let nextStatus: PageStatus = plan.status;
+  if (allResolved && (plan.status === "draft" || plan.status === "candidate")) {
+    nextStatus = "accepted";
+  } else if (!allResolved && plan.status === "accepted") {
+    nextStatus = "draft";
+  }
+
   const nextPlan: PlanArtifact = {
     ...plan,
     slices: newSlices,
+    status: nextStatus,
     next_action: computeNextAction(newSlices),
     updated,
   };
@@ -672,6 +688,8 @@ export function shelfDrift(
 
 /** Bounded view suitable for injection into agent envelopes (small, no full slices). */
 export function compactPlanView(plan: PlanArtifact): {
+  headline: string;
+  progress: { done: number; total: number; remaining: number; complete: boolean };
   goal: string;
   next_action: string;
   pending: Array<{ id: string; title: string; status: PlanSliceStatus }>;
@@ -690,7 +708,27 @@ export function compactPlanView(plan: PlanArtifact): {
   const scars = (plan.scar_tissue ?? [])
     .slice(-3)
     .map((s) => `${s.kind}: ${s.signal}`);
+
+  // P3 (progress salience): make plan-level progress the headline so closing one slice is
+  // never misread as closing the whole plan. A done/superseded slice counts as resolved.
+  const total = plan.slices.length;
+  const done = plan.slices.filter(
+    (s) => s.status === "done" || s.status === "superseded",
+  ).length;
+  const remaining = total - done;
+  const complete = total > 0 && remaining === 0;
+  const activeSlice = plan.slices.find(
+    (s) => s.status === "pending" || s.status === "in_progress" || s.status === "blocked",
+  );
+  const headline = complete
+    ? `PLAN COMPLETE — all ${total} slice(s) resolved. No further action; this plan is finished.`
+    : `Progress: ${done}/${total} slices done, ${remaining} remaining. ` +
+      `NEXT: ${activeSlice ? activeSlice.id : plan.next_action}. ` +
+      `The plan is NOT complete until all ${total} slices are done — do not stop after one slice.`;
+
   return {
+    headline,
+    progress: { done, total, remaining, complete },
     goal: plan.goal,
     next_action: plan.next_action,
     pending,
