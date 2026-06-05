@@ -13,6 +13,7 @@ export type EnvelopeEvent =
 export interface EnvelopeBody {
   contract?: string;
   identity?: unknown;
+  active_plan?: unknown;
   recall?: unknown;
   vault?: unknown;
   audit_tail?: unknown;
@@ -34,7 +35,7 @@ function estimateTokens(text: string): number {
   return Math.ceil(text.length / 4);
 }
 
-function stableStringify(value: unknown): string {
+export function stableStringify(value: unknown): string {
   if (value === undefined) return "null";
   if (value === null) return "null";
   if (typeof value !== "object") {
@@ -56,6 +57,7 @@ export function wrapEnvelope(options: EnvelopeOptions): string {
   const keyOrder = [
     "contract",
     "identity",
+    "active_plan",
     "pending_learnings",
     "scar_tissue",
     "recall",
