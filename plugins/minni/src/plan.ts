@@ -250,12 +250,29 @@ function parseFrontmatter(raw: string): { frontmatter: Record<string, unknown>; 
     let valStr = line.slice(eq + 1).trim();
     if (!key) continue;
     let value: unknown = valStr;
-    // strip outer quotes if yaml-stringified
-    if (
-      (valStr.startsWith('"') && valStr.endsWith('"')) ||
-      (valStr.startsWith("'") && valStr.endsWith("'"))
-    ) {
-      valStr = valStr.slice(1, -1).replace(/\\"/g, '"').replace(/\\n/g, "\n");
+    // strip outer quotes if yaml-stringified.
+    // The writer (vault.ts `yamlValue`) emits any non-trivial scalar via JSON.stringify,
+    // so a double-quoted scalar MUST be decoded with its exact inverse — JSON.parse —
+    // not a partial hand-rolled unescape. The previous code only reversed \" and \n and
+    // left \\ (plus \t, \r, \uXXXX) un-decoded, which doubled every backslash on each
+    // write->read round-trip and produced false-positive plan_digest mismatches for any
+    // evidence containing regex/path backslashes (e.g. rg 'malloc\(|free\('). Observed
+    // live 2026-06-05 in codex's Runtime V4 plan (uart-rx-driver evidence).
+    if (valStr.startsWith('"') && valStr.endsWith('"')) {
+      try {
+        valStr = JSON.parse(valStr) as string;
+      } catch {
+        // defensive fallback for malformed scalars: reverse the writer's escapes,
+        // backslash LAST so it does not corrupt the \" and \n sequences.
+        valStr = valStr
+          .slice(1, -1)
+          .replace(/\\n/g, "\n")
+          .replace(/\\"/g, '"')
+          .replace(/\\\\/g, "\\");
+      }
+      value = valStr;
+    } else if (valStr.startsWith("'") && valStr.endsWith("'")) {
+      valStr = valStr.slice(1, -1);
       value = valStr;
     }
     // parse json-ish or primitives (our pre-stringified arrays/objects land here)

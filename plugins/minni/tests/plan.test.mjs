@@ -297,3 +297,51 @@ test("addScar pure function and compactPlanView scars surfacing", () => {
   assert.equal(view.scars[1], "rejected_hypothesis: hypothesis Y");
   assert.equal(view.scars[2], "dead_end: direction Z");
 });
+
+test("rehydratePlan round-trips evidence containing backslashes (regex/path proofs) without false digest mismatch", async () => {
+  // Regression for the live defect observed 2026-06-05 in codex's Runtime V4 plan:
+  // a `done` slice whose evidence contained a `rg 'malloc\(|free\('` proof produced a
+  // false-positive plan_digest mismatch on the next status/update, because the custom
+  // frontmatter reader unescaped \" and \n but NOT \\, doubling every backslash on the
+  // write->read round-trip. The writer (vault.ts yamlValue) uses JSON.stringify, so the
+  // reader must use JSON.parse (its exact inverse).
+  const root = await mkdtemp(path.join(tmpdir(), "sm-plan-backslash-"));
+  try {
+    await ensureVault(root);
+    // NOTE: in this JS source, "\\(" is a single literal backslash + "(", matching the
+    // real evidence string codex wrote.
+    const evidence =
+      "Build passed. `rg -n 'malloc\\(|free\\(|swift_' Sources/Support/uart_rx_irq.c` " +
+      "returned no matches; pytest 6/6, full suite 35/35.";
+
+    const { plan } = await createPlan(
+      {
+        goal: "Backslash evidence round-trip",
+        slices: [{ title: "irq driver", gate: "no alloc in IRQ context" }],
+        vaultPath: root,
+      },
+      { vaultPath: root },
+    );
+
+    const sliceId = plan.slices[0].id;
+    const updated = updateSlice(plan, sliceId, "done", evidence);
+    const writeRes = await persistPlan(updated, { vaultPath: root });
+
+    // Must NOT throw a false digest mismatch, and evidence must survive byte-identical.
+    const rehydrated = await rehydratePlan(writeRes.notePath);
+    const got = rehydrated.slices.find((s) => s.id === sliceId);
+    assert.ok(got, "slice should survive rehydrate");
+    assert.equal(
+      got.evidence,
+      evidence,
+      "evidence with backslashes must round-trip byte-identical",
+    );
+    assert.equal(
+      rehydrated.plan_digest,
+      computePlanDigest(rehydrated),
+      "recomputed digest must match the stored digest after a write->read round-trip",
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
