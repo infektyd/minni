@@ -2495,6 +2495,32 @@ async def _afm_loop_runner():
                 # examined candidates (accept/reject/needs_review), so it strictly
                 # makes progress and cannot spin.
                 if name == "consolidation":
+                    # Drain the inbox stop-candidate channel into candidate_packets
+                    # BEFORE the consolidation drain, so freshly-ingested 'proposed'
+                    # rows are triaged in the same tick. Idempotent, respects
+                    # log_only/do_not_store, never deletes. Failure here must NOT
+                    # block consolidation of the existing queue.
+                    if (cfg or {}).get("ingest_inbox", True):
+                        try:
+                            from afm_passes.inbox_ingest import ingest as _ingest_inbox
+                            _ing_db = SovereignDB(DEFAULT_CONFIG)
+                            _ing = _ingest_inbox(
+                                _ing_db, DEFAULT_CONFIG,
+                                fallback_principal=str((cfg or {}).get(
+                                    "inbox_fallback_principal", "codex")),
+                                dry_run=False,
+                            )
+                            if _ing.get("inserted"):
+                                logger.info(
+                                    "AFM loop: inbox ingest -> %d new candidate(s) "
+                                    "(eligible=%d already=%d)",
+                                    _ing["inserted"], _ing["eligible"],
+                                    _ing["already_present"],
+                                )
+                        except Exception:
+                            logger.exception(
+                                "AFM loop: inbox ingest raised (skipped; "
+                                "consolidation continues)")
                     max_batches = int((cfg or {}).get("max_batches_per_tick", 40))
                     batches = total_examined = 0
                     last_summ = None
