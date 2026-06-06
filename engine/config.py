@@ -137,6 +137,19 @@ class SovereignConfig:
             "pruning": {
                 "interval_seconds": 24 * 60 * 60,
             },
+            # Drains the proposed candidate_packets queue into durable learnings.
+            # Short interval so memory keeps moving; per-run cap bounds each tick.
+            "consolidation": {
+                "interval_seconds": 15 * 60,
+                "max_per_run": 50,
+                "max_batches_per_tick": 40,  # up to 40*50=2000 candidates/tick
+                # Before draining, ingest inbox stop-candidate files
+                # (<vault>/inbox/*.json, kind 'codex_stop_candidates') into
+                # candidate_packets so that channel stops piling up. Idempotent;
+                # respects log_only/do_not_store; never deletes.
+                "ingest_inbox": True,
+                "inbox_fallback_principal": "codex",
+            },
         },
     })
 
