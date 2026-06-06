@@ -2800,6 +2800,46 @@ def _resolve_candidate(params: dict, request_id: Any) -> dict:
         logger.exception("resolve_candidate failed")
         return _make_error(-32000, f"resolve_candidate error: {exc}", request_id)
 
+def _handle_ax_snapshot_store(params: dict, request_id: Any) -> dict:
+    from ax_memory import AXMemory
+    agent_id = str(params.get("agent_id", "")).strip()
+    app_name = str(params.get("app_name", "")).strip()
+    tree_json = str(params.get("tree_json", ""))
+    
+    if not agent_id or not app_name or not tree_json:
+        return _make_error(-32602, "agent_id, app_name, and tree_json are required", request_id)
+        
+    try:
+        db = SovereignDB()
+        ax = AXMemory(db)
+        snapshot_id = ax.add_snapshot(
+            agent_id=agent_id,
+            app_name=app_name,
+            tree_json=tree_json,
+            ttl_seconds=params.get("ttl_seconds", 3600)
+        )
+        return _make_response({"snapshot_id": snapshot_id}, request_id)
+    except Exception as exc:
+        logger.exception("ax_snapshot_store failed")
+        return _make_error(-32000, f"ax_snapshot_store error: {exc}", request_id)
+
+def _handle_ax_snapshot_get(params: dict, request_id: Any) -> dict:
+    from ax_memory import AXMemory
+    agent_id = str(params.get("agent_id", "")).strip()
+    app_name = params.get("app_name")
+    
+    if not agent_id:
+        return _make_error(-32602, "agent_id is required", request_id)
+        
+    try:
+        db = SovereignDB()
+        ax = AXMemory(db)
+        snapshot = ax.get_latest_snapshot(agent_id=agent_id, app_name=app_name)
+        return _make_response({"snapshot": snapshot}, request_id)
+    except Exception as exc:
+        logger.exception("ax_snapshot_get failed")
+        return _make_error(-32000, f"ax_snapshot_get error: {exc}", request_id)
+
 
 # Method registry
 _METHODS: Dict[str, callable] = {
@@ -2826,6 +2866,8 @@ _METHODS: Dict[str, callable] = {
     "stage_candidate":        _stage_candidate,
     "list_candidates":        _list_candidates,
     "resolve_candidate":      _resolve_candidate,
+    "ax_snapshot_store":      _handle_ax_snapshot_store,
+    "ax_snapshot_get":        _handle_ax_snapshot_get,
     "status":                 _handle_status,
     "health_report":          _handle_health_report,
     "hygiene_report":         _handle_hygiene_report,
