@@ -159,6 +159,55 @@ def test_ingest_ignores_non_stop_kinds(tmp_path):
     assert _count_proposed(db_obj) == 0
 
 
+def _cc_stop_doc(candidates, **overrides):
+    """Claude Code hook shape: NO `kind` field, no `agent_id`; carries the
+    `slug`/`last_task` session markers and a `candidates` list."""
+    doc = {
+        "slug": "f373b502",
+        "createdAt": "2026-06-08T12:00:00.000Z",
+        "candidates": candidates,
+        "log_only": [],
+        "expires": [],
+        "do_not_store": [],
+        "last_task": "f373b502",
+    }
+    doc.update(overrides)
+    return doc
+
+
+def test_ingests_kindless_claude_code_shape_attributed_to_vault_agent(tmp_path):
+    """Kind-less CC stop-candidate files must be ingested and attributed to the
+    agent that owns the vault (claudecode-vault -> 'claudecode'), not 'codex'."""
+    from afm_passes.inbox_ingest import ingest
+
+    db_obj, cfg = _make_db(tmp_path)
+    inbox = tmp_path / "claudecode-vault" / "inbox"
+    _write_inbox_file(inbox, "cc.json", _cc_stop_doc(["a durable claude code lesson"]))
+
+    res = ingest(db_obj, cfg, inboxes=[inbox], dry_run=False)
+    assert res["inserted"] == 1, res
+    assert _count_proposed(db_obj, principal="claudecode") == 1
+    assert _count_proposed(db_obj, principal="codex") == 0
+    with db_obj.cursor() as c:
+        c.execute("SELECT derived_from FROM candidate_packets WHERE principal='claudecode'")
+        df = json.loads(dict(c.fetchone())["derived_from"])
+    assert df["source"] == "inbox" and df["inbox_file"] == "cc.json"
+
+
+def test_kindless_without_stop_shape_is_ignored(tmp_path):
+    """Kind-less JSON that lacks the stop-candidate shape must NOT be ingested."""
+    from afm_passes.inbox_ingest import ingest
+
+    db_obj, cfg = _make_db(tmp_path)
+    inbox = tmp_path / "claudecode-vault" / "inbox"
+    # has candidates but missing slug/last_task -> not the stop-candidate shape
+    _write_inbox_file(inbox, "weird.json", {"candidates": ["nope"], "foo": "bar"})
+
+    res = ingest(db_obj, cfg, inboxes=[inbox], dry_run=False)
+    assert res["inserted"] == 0, res
+    assert _count_proposed(db_obj, principal="claudecode") == 0
+
+
 def test_dry_run_writes_nothing(tmp_path):
     from afm_passes.inbox_ingest import ingest
 

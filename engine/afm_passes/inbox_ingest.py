@@ -22,8 +22,15 @@ It is invoked by the AFM loop at the start of each ``consolidation`` tick (see
 
 Safety / contract
 -----------------
-* Only ``kind == 'codex_stop_candidates'`` files are processed (NOT handoffs,
-  NOT precompact).
+* Files are processed if ``kind == 'codex_stop_candidates'`` OR the file is
+  kind-less but matches the stop-candidate shape (a ``candidates`` list plus
+  ``slug``/``last_task`` — the shape the Claude Code Stop/PreCompact hook emits
+  with no ``kind`` field). Files carrying any OTHER explicit kind (handoffs,
+  ``*_precompact_handoff``, ``failed_command``, ...) are NOT processed: they
+  always have a ``kind`` and so never reach the kind-less branch.
+* Candidates are attributed to the agent that owns the vault (derived from the
+  ``<agent>-vault`` dir name, e.g. ``claudecode-vault`` -> ``claudecode``) when
+  the file carries no explicit ``agent_id``, instead of a global fallback.
 * A FILE is skipped if ``log_only`` or ``do_not_store`` is boolean ``True``
   (defensive; current files carry these as advisory string LISTS).
 * A CANDIDATE string is skipped if it appears verbatim in that file's
@@ -128,15 +135,46 @@ def _existing_keys(db, principals: set) -> set:
     return keys
 
 
+def _is_stop_candidate_shape(doc: Dict[str, Any]) -> bool:
+    """True for kind-less inbox files matching the stop-candidate shape the
+    Claude Code hook emits: a ``candidates`` list plus the ``slug``/``last_task``
+    session markers. Deliberately strict so arbitrary kind-less JSON is not
+    ingested. Handoff/precompact files always carry a ``kind`` and are excluded
+    upstream by the ``kind != KIND`` check before this is ever consulted."""
+    return (
+        isinstance(doc.get("candidates"), list)
+        and "slug" in doc
+        and "last_task" in doc
+    )
+
+
+def _principal_for_inbox(inbox: Path, fallback_principal: str) -> str:
+    """Derive the owning agent from the vault dir name (``<agent>-vault/inbox``)
+    so kind-less candidates are attributed to the right agent (e.g.
+    ``claudecode-vault`` -> ``claudecode``) instead of the global fallback. The
+    daemon's own bare ``vault/inbox`` (no ``-vault`` suffix) uses the fallback."""
+    parent = inbox.parent.name
+    if parent.endswith("-vault"):
+        return parent[: -len("-vault")] or fallback_principal
+    return fallback_principal
+
+
 def _scan_inbox(inbox: Path, fallback_principal: str) -> List[Dict[str, Any]]:
     """Return candidate dicts for a single inbox dir (no DB, no dedup yet)."""
     out: List[Dict[str, Any]] = []
+    inbox_principal = _principal_for_inbox(inbox, fallback_principal)
     for path in sorted(inbox.glob("*.json")):
         try:
             doc = json.loads(path.read_text(encoding="utf-8"))
         except Exception:
             continue
-        if not isinstance(doc, dict) or doc.get("kind") != KIND:
+        if not isinstance(doc, dict):
+            continue
+        kind = doc.get("kind")
+        # Accept codex's explicitly-tagged stop-candidates AND kind-less files
+        # that carry the stop-candidate shape (the Claude Code hook writes
+        # candidate files with no `kind`). Any other explicit kind is excluded.
+        if kind != KIND and not (kind is None and _is_stop_candidate_shape(doc)):
             continue
         if doc.get("log_only") is True or doc.get("do_not_store") is True:
             continue
@@ -144,7 +182,7 @@ def _scan_inbox(inbox: Path, fallback_principal: str) -> List[Dict[str, Any]]:
         log_only_set = _as_str_set(doc.get("log_only"))
         dns_set = _as_str_set(doc.get("do_not_store"))
         ws = doc.get("workspace_id") or "default"
-        principal = doc.get("agent_id") or fallback_principal
+        principal = doc.get("agent_id") or inbox_principal
         created = _file_createdat_epoch(doc)
         proposed_at = created if created is not None else time.time()
 
@@ -165,6 +203,7 @@ def _scan_inbox(inbox: Path, fallback_principal: str) -> List[Dict[str, Any]]:
                     "inbox_file": path.name,
                     "candidate_index": idx,
                     "proposed_at": proposed_at,
+                    "kind": kind or KIND,
                 }
             )
     return out
@@ -206,7 +245,7 @@ def ingest(db, config, inboxes: Optional[List[Path]] = None,
                         "source": "inbox",
                         "inbox_file": r["inbox_file"],
                         "candidate_index": r["candidate_index"],
-                        "kind": KIND,
+                        "kind": r.get("kind", KIND),
                         "content_sha1": _content_sha1(r["content"]),
                     }
                 )
