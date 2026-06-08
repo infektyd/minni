@@ -359,6 +359,61 @@ export function formatRecall(query: string, response: RecallResponse, vaultResul
   return sections.join("\n\n");
 }
 
+/**
+ * Per-turn lean recall (UserPromptSubmit). Two reductions vs formatRecall:
+ *  1. Drops the verbose per-result provenance (score ranks, decay_factor,
+ *     query_variants, rrf/cross_encoder, trace_id, source path) — keeps only
+ *     wikilink + rounded score + a short headline/snippet.
+ *  2. Omits identity-layer "shelf" hits (boot agent-envelopes): those are loaded
+ *     once at SessionStart and never change, so re-injecting them every turn is
+ *     pure redundancy.
+ * Together this roughly halves the per-turn recall payload. SessionStart still
+ * uses the full formatRecall so boot/rehydration keeps complete context.
+ */
+export function formatRecallLean(
+  query: string,
+  response: RecallResponse,
+  vaultResults: VaultSearchResult[] = [],
+  limit = 5,
+): string {
+  const arr = Array.isArray(response.results) ? response.results : [];
+  const lean = arr
+    .map((r) => (r ?? {}) as Record<string, unknown>)
+    .filter((r) => String(r.layer ?? "") !== "identity")
+    .slice(0, limit)
+    .map((r) => {
+      const wikilink =
+        typeof r.wikilink === "string"
+          ? r.wikilink
+          : typeof r.filename === "string"
+            ? r.filename
+            : "[[?]]";
+      const score =
+        typeof r.score === "number" ? Number((r.score as number).toFixed(2)) : undefined;
+      const headRaw = (r.headline ?? r.snippet ?? "") as unknown;
+      const headline =
+        typeof headRaw === "string" && headRaw.trim()
+          ? headRaw.replace(/\s+/g, " ").slice(0, 140)
+          : undefined;
+      return { wikilink, score, headline };
+    });
+  const omitted = arr.length - lean.length;
+  const sections = [
+    "# Recall (lean)",
+    `Query: ${query}`,
+    "## AI Context Pack",
+    formatVaultContext(vaultResults),
+    lean.length
+      ? "## Daemon Results (wikilink + headline; full provenance and identity-shelf hits omitted to save context — pull via minni_recall if needed)\n" +
+        JSON.stringify(lean, null, 2)
+      : "No non-identity daemon recall results.",
+    omitted > 0
+      ? `(${omitted} identity-shelf/extra hit(s) omitted; identity shelf is loaded at SessionStart.)`
+      : undefined,
+  ].filter(Boolean);
+  return sections.join("\n\n");
+}
+
 export async function buildStatusReport(input?: {
   vaultPath?: string;
   socket?: JsonResult;
