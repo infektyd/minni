@@ -473,7 +473,7 @@ function getAgentIdFromVaultPath(vaultPath: string): string {
   return base || "agent";
 }
 
-async function appendFileWithFsync(filePath: string, content: string): Promise<void> {
+export async function appendFileWithFsync(filePath: string, content: string): Promise<void> {
   const fh = await open(filePath, "a");
   try {
     await fh.writeFile(content, "utf8");

@@ -287,6 +287,21 @@ class SovereignDB:
             )
         """)
 
+        # === AX Snapshots (Project OmniSense) ===
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS ax_snapshots (
+                snapshot_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                agent_id TEXT NOT NULL,
+                app_name TEXT NOT NULL,
+                tree_json TEXT,
+                screenshot_png BLOB,
+                created_at REAL NOT NULL,
+                ttl_seconds INTEGER DEFAULT 3600
+            )
+        """)
+        c.execute("CREATE INDEX IF NOT EXISTS idx_ax_agent ON ax_snapshots(agent_id)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_ax_created ON ax_snapshots(created_at)")
+
         # === Triggers ===
         c.execute("DROP TRIGGER IF EXISTS trg_thread_msg_count")
         c.execute("""

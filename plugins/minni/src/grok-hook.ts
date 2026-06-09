@@ -1,9 +1,9 @@
 import {
-  CODEX_CONTEXT_WINDOW,
-  CODEX_HOOKS_ENABLED,
-  DEFAULT_AGENT_ID,
-  DEFAULT_VAULT_PATH,
-  DEFAULT_WORKSPACE_ID,
+  GROK_CONTEXT_WINDOW,
+  GROK_HOOKS_ENABLED,
+  GROK_AGENT_ID,
+  GROK_VAULT_PATH,
+  GROK_WORKSPACE_ID,
 } from "./config.js";
 import {
   MEMORY_CONTRACT,
@@ -84,7 +84,7 @@ function workspaceFromPayload(payload: Record<string, unknown>): string {
     asString(payload.workspaceId) ||
     asString(payload.cwd) ||
     asString(payload.working_directory) ||
-    DEFAULT_WORKSPACE_ID
+    GROK_WORKSPACE_ID
   );
 }
 
@@ -109,30 +109,30 @@ function withHookContext(event: EnvelopeEvent, additionalContext: string): HookO
 async function handleSessionStart(payload: Record<string, unknown>): Promise<HookOutput> {
   const sessionId = asString(payload.session_id) || asString(payload.sessionId) || "session";
   const workspaceId = workspaceFromPayload(payload);
-  await ensureVault(DEFAULT_VAULT_PATH);
+  await ensureVault(GROK_VAULT_PATH);
 
   const [status, tail, identityRead, pending] = await Promise.all([
-    buildStatusReport({ vaultPath: DEFAULT_VAULT_PATH }),
-    auditTail(DEFAULT_VAULT_PATH, 5),
-    readAgentContext({ agentId: DEFAULT_AGENT_ID, limit: 8 }),
-    readPendingInbox(DEFAULT_VAULT_PATH, 3),
+    buildStatusReport({ vaultPath: GROK_VAULT_PATH }),
+    auditTail(GROK_VAULT_PATH, 5),
+    readAgentContext({ agentId: GROK_AGENT_ID, limit: 8 }),
+    readPendingInbox(GROK_VAULT_PATH, 3),
   ]);
-  const handoffContext = await resolveInboxHandoffContext(DEFAULT_VAULT_PATH, pending);
+  const handoffContext = await resolveInboxHandoffContext(GROK_VAULT_PATH, pending);
 
   const envelope = wrapEnvelope({
     event: "SessionStart",
-    agent: DEFAULT_AGENT_ID,
-    budget: envelopeBudgetFor(CODEX_CONTEXT_WINDOW),
+    agent: GROK_AGENT_ID,
+    budget: envelopeBudgetFor(GROK_CONTEXT_WINDOW),
     body: {
       contract: MEMORY_CONTRACT,
       identity: {
-        agent: DEFAULT_AGENT_ID,
+        agent: GROK_AGENT_ID,
         workspace: workspaceId,
-        vault: DEFAULT_VAULT_PATH,
+        vault: GROK_VAULT_PATH,
         session_id: sessionId,
         daemon_ok: status.socket.ok,
         afm_ok: status.afm.ok,
-        runtime: "codex",
+        runtime: "grok-build",
       },
       pending_learnings: pending.map((entry) => ({
         slug: entry.slug,
@@ -151,21 +151,21 @@ async function handleSessionStart(payload: Record<string, unknown>): Promise<Hoo
         identityRead.ok && identityRead.data?.context
           ? {
               ok: true,
-              agent_origin: identityRead.data.agent_id ?? DEFAULT_AGENT_ID,
+              agent_origin: identityRead.data.agent_id ?? GROK_AGENT_ID,
               backend: identityRead.data.backend,
             }
           : { ok: false, error: identityRead.error },
       fallback_commands: {
-        layer1: "node dist/codex-hook.js SessionStart < /dev/null",
-        daemon_read: "node dist/cli.js read codex",
+        layer1: "node dist/grok-hook.js SessionStart < /dev/null",
+        daemon_read: "node dist/cli.js read grok-build",
         recall: "node dist/cli.js prepare '<task>'",
       },
       audit_tail: tail.entries.slice(-5).map((entry) => entry.split("\n")[0]),
     },
   });
 
-  await recordAudit(DEFAULT_VAULT_PATH, {
-    tool: "hook_codex_session_start",
+  await recordAudit(GROK_VAULT_PATH, {
+    tool: "hook_grok_session_start",
     summary: `boot ${sessionId}`,
     details: {
       daemon_ok: status.socket.ok,
@@ -194,11 +194,11 @@ async function handleUserPromptSubmit(payload: Record<string, unknown>): Promise
   const workspaceId = workspaceFromPayload(payload);
   const signature = hashTaskSignature(prompt);
   const [vaultResults, recall] = await Promise.all([
-    searchVaultNotes(DEFAULT_VAULT_PATH, prompt, 6),
+    searchVaultNotes(GROK_VAULT_PATH, prompt, 6),
     recallMemory({
       query: prompt,
       limit: 6,
-      agentId: DEFAULT_AGENT_ID,
+      agentId: GROK_AGENT_ID,
       workspaceId,
     }),
   ]);
@@ -209,10 +209,10 @@ async function handleUserPromptSubmit(payload: Record<string, unknown>): Promise
 
   const envelope = wrapEnvelope({
     event: "UserPromptSubmit",
-    agent: DEFAULT_AGENT_ID,
+    agent: GROK_AGENT_ID,
     body: {
       identity: {
-        agent: DEFAULT_AGENT_ID,
+        agent: GROK_AGENT_ID,
         workspace: workspaceId,
         task_signature: signature,
       },
@@ -230,8 +230,8 @@ async function handleUserPromptSubmit(payload: Record<string, unknown>): Promise
     },
   });
 
-  await recordAudit(DEFAULT_VAULT_PATH, {
-    tool: "hook_codex_user_prompt_submit",
+  await recordAudit(GROK_VAULT_PATH, {
+    tool: "hook_grok_user_prompt_submit",
     summary: prompt.slice(0, 120),
     details: {
       intent: intent.action,
@@ -247,16 +247,16 @@ async function handleUserPromptSubmit(payload: Record<string, unknown>): Promise
 }
 
 async function handlePreCompact(payload: Record<string, unknown>): Promise<HookOutput> {
-  await ensureVault(DEFAULT_VAULT_PATH);
-  const tail = await auditTail(DEFAULT_VAULT_PATH, 60);
+  await ensureVault(GROK_VAULT_PATH);
+  const tail = await auditTail(GROK_VAULT_PATH, 60);
   const scarTissue = extractScarTissue(tail.entries);
   const sessionId = asString(payload.session_id) || asString(payload.sessionId) || "session";
   const workspaceId = workspaceFromPayload(payload);
   const transcript = asString(payload.trigger) || asString(payload.summary);
 
-  const inbox = await writeInbox(DEFAULT_VAULT_PATH, sessionId, {
-    kind: "codex_precompact_handoff",
-    agent_id: DEFAULT_AGENT_ID,
+  const inbox = await writeInbox(GROK_VAULT_PATH, sessionId, {
+    kind: "grok_precompact_handoff",
+    agent_id: GROK_AGENT_ID,
     workspace_id: workspaceId,
     scar_tissue: scarTissue,
     audit_tail: tail.entries.slice(-10).map((entry) => entry.split("\n")[0]),
@@ -266,10 +266,10 @@ async function handlePreCompact(payload: Record<string, unknown>): Promise<HookO
 
   const envelope = wrapEnvelope({
     event: "PreCompact",
-    agent: DEFAULT_AGENT_ID,
+    agent: GROK_AGENT_ID,
     body: {
       identity: {
-        agent: DEFAULT_AGENT_ID,
+        agent: GROK_AGENT_ID,
         workspace: workspaceId,
         session_id: sessionId,
       },
@@ -281,8 +281,8 @@ async function handlePreCompact(payload: Record<string, unknown>): Promise<HookO
     },
   });
 
-  await recordAudit(DEFAULT_VAULT_PATH, {
-    tool: "hook_codex_pre_compact",
+  await recordAudit(GROK_VAULT_PATH, {
+    tool: "hook_grok_pre_compact",
     summary: `pre-compact ${sessionId}`,
     details: {
       scar_count: scarTissue.length,
@@ -296,21 +296,27 @@ async function handlePreCompact(payload: Record<string, unknown>): Promise<HookO
 }
 
 async function handleStop(payload: Record<string, unknown>): Promise<HookOutput> {
-  await ensureVault(DEFAULT_VAULT_PATH);
+  await ensureVault(GROK_VAULT_PATH);
   const sessionId = asString(payload.session_id) || asString(payload.sessionId) || "session";
   const workspaceId = workspaceFromPayload(payload);
   const lastTask = asString(payload.last_user_message) || asString(payload.summary) || sessionId;
-  const tail = await auditTail(DEFAULT_VAULT_PATH, 30);
+  const tail = await auditTail(GROK_VAULT_PATH, 30);
   const outcome = await prepareOutcome({
     task: lastTask.slice(0, 200),
     summary: tail.entries.slice(-5).join("\n").slice(0, 600) || "session ended",
     profile: "compact",
-    vaultPath: DEFAULT_VAULT_PATH,
+    vaultPath: GROK_VAULT_PATH,
   });
 
-  const inbox = await writeInbox(DEFAULT_VAULT_PATH, sessionId, {
+  // Nothing worth persisting: skip the inbox write and audit entry so we don't
+  // litter the inbox with empty files or pad the audit log with noise.
+  if (outcome.outcomeDraft.learnCandidates.length === 0) {
+    return { continue: true };
+  }
+
+  const inbox = await writeInbox(GROK_VAULT_PATH, sessionId, {
     kind: "stop_candidates",
-    agent_id: DEFAULT_AGENT_ID,
+    agent_id: GROK_AGENT_ID,
     workspace_id: workspaceId,
     candidates: outcome.outcomeDraft.learnCandidates,
     log_only: outcome.outcomeDraft.logOnly,
@@ -319,8 +325,8 @@ async function handleStop(payload: Record<string, unknown>): Promise<HookOutput>
     last_task: lastTask.slice(0, 200),
   });
 
-  await recordAudit(DEFAULT_VAULT_PATH, {
-    tool: "hook_codex_stop",
+  await recordAudit(GROK_VAULT_PATH, {
+    tool: "hook_grok_stop",
     summary: `stop ${sessionId}`,
     details: {
       candidates: outcome.outcomeDraft.learnCandidates.length,
@@ -328,10 +334,6 @@ async function handleStop(payload: Record<string, unknown>): Promise<HookOutput>
       inbox_path: inbox.filePath,
     },
   });
-
-  if (outcome.outcomeDraft.learnCandidates.length === 0) {
-    return { continue: true };
-  }
 
   return {
     continue: true,
@@ -357,7 +359,7 @@ async function dispatch(event: string, payload: Record<string, unknown>): Promis
 }
 
 async function main(): Promise<void> {
-  if (!CODEX_HOOKS_ENABLED) {
+  if (!GROK_HOOKS_ENABLED) {
     emit({ continue: true });
     return;
   }
@@ -376,8 +378,8 @@ async function main(): Promise<void> {
     emit(output);
   } catch (error) {
     try {
-      await recordAudit(DEFAULT_VAULT_PATH, {
-        tool: "hook_codex_error",
+      await recordAudit(GROK_VAULT_PATH, {
+        tool: "hook_grok_error",
         summary: `${event}: ${error instanceof Error ? error.message : String(error)}`,
       });
     } catch {

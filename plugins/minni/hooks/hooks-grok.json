@@ -1,0 +1,48 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ${PLUGIN_ROOT}/dist/grok-hook.js SessionStart",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ${PLUGIN_ROOT}/dist/grok-hook.js UserPromptSubmit",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ${PLUGIN_ROOT}/dist/grok-hook.js PreCompact",
+            "timeout": 20
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ${PLUGIN_ROOT}/dist/grok-hook.js Stop",
+            "timeout": 20
+          }
+        ]
+      }
+    ]
+  }
+}

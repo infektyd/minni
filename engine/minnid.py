@@ -2176,6 +2176,187 @@ def _afm_loop_enabled(config=DEFAULT_CONFIG) -> bool:
     return bool((getattr(config, "afm_loop_schedule", {}) or {}).get("enabled"))
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Consolidation: durable promotion of proposed candidates (AFM loop authority).
+# Mirrors the force=true durable-learn path (embed + INSERT learnings) and stamps
+# consolidation_actions for audit. The privileged write lives here, not in passes.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _promote_candidate_durable(candidate_id: int, reason: str = "afm-consolidation"):
+    """Promote one proposed candidate into a durable, embedded learning.
+
+    Returns the new learning_id, or None if the candidate is missing or no longer
+    'proposed' (idempotent — safe to call twice). Embedding is best-effort.
+    """
+    import time as _time
+    import numpy as _np
+
+    wb = _lazy_writeback()
+    # Read + embed OUTSIDE the write txn to keep the write lock short.
+    with wb.db.cursor() as c:
+        c.execute("SELECT * FROM candidate_packets WHERE candidate_id=?", (candidate_id,))
+        row = c.fetchone()
+    if not row:
+        return None
+    cand = dict(row)
+    if cand.get("status") != "proposed":
+        return None
+    content = cand.get("content") or ""
+    agent_id = cand.get("principal") or "afm-loop"
+    from afm_passes.consolidation import content_hash as _content_hash
+    chash = _content_hash(content)
+
+    emb_bytes = None
+    if getattr(wb, "model", None):
+        try:
+            emb = wb.model.encode(content).astype(_np.float32)
+            emb_bytes = emb.tobytes()
+        except Exception as exc:
+            logger.warning("consolidation: embedding failed (%s) — storing without", exc)
+
+    now = _time.time()
+    with wb.db.transaction() as c:
+        # Re-check status inside the txn (closes TOCTOU with a concurrent resolve).
+        c.execute("SELECT status FROM candidate_packets WHERE candidate_id=?", (candidate_id,))
+        chk = c.fetchone()
+        if not chk or chk["status"] != "proposed":
+            return None
+        c.execute(
+            """
+            INSERT INTO learnings
+            (agent_id, category, content, source_doc_ids, source_query,
+             confidence, embedding, created_at,
+             assertion, applies_when, evidence_doc_ids, contradicts_id, status,
+             content_hash)
+            VALUES (?, 'general', ?, NULL, 'afm-consolidation',
+                    ?, ?, ?, NULL, NULL, ?, NULL, 'active', ?)
+            """,
+            (agent_id, content, 0.9, emb_bytes, now, cand.get("evidence_refs"), chash),
+        )
+        lid = c.lastrowid
+        c.execute(
+            """
+            UPDATE candidate_packets
+            SET status='accepted', resolved_at=?, resolved_by='afm-consolidation',
+                resolution_reason=?
+            WHERE candidate_id=?
+            """,
+            (now, reason[:500], candidate_id),
+        )
+        c.execute(
+            """
+            INSERT INTO consolidation_actions
+            (action_type, target_learning_id, claim, category, confidence,
+             status, detail, created_at)
+            VALUES ('afm_promote', ?, ?, 'general', ?, 'applied', ?, ?)
+            """,
+            (lid, content[:200], 0.9, reason[:500], now),
+        )
+
+    # Best-effort Obsidian markdown parity (never fatal).
+    try:
+        if wb.config.writeback_enabled:
+            wb._write_to_disk(lid, agent_id, "general", content, now)
+    except Exception as exc:
+        logger.warning("consolidation: write_to_disk failed for learning #%s (%s)", lid, exc)
+
+    logger.info("AFM consolidation promoted candidate #%d -> learning #%d", candidate_id, lid)
+    return lid
+
+
+def _reject_candidate_dedup(candidate_id: int) -> bool:
+    """Mark a proposed candidate rejected as a duplicate. Returns True if changed."""
+    import time as _time
+    wb = _lazy_writeback()
+    now = _time.time()
+    with wb.db.transaction() as c:
+        c.execute("SELECT status FROM candidate_packets WHERE candidate_id=?", (candidate_id,))
+        row = c.fetchone()
+        if not row or row["status"] != "proposed":
+            return False
+        c.execute(
+            """
+            UPDATE candidate_packets
+            SET status='rejected', resolved_at=?, resolved_by='afm-consolidation',
+                resolution_reason='duplicate of existing learning'
+            WHERE candidate_id=?
+            """,
+            (now, candidate_id),
+        )
+        c.execute(
+            """
+            INSERT INTO consolidation_actions
+            (action_type, claim, category, status, detail, created_at)
+            VALUES ('afm_dedup', ?, 'general', 'applied', 'duplicate of existing learning', ?)
+            """,
+            (str(candidate_id), now),
+        )
+    logger.info("AFM consolidation deduped candidate #%d (rejected)", candidate_id)
+    return True
+
+
+def _mark_candidate_review(candidate_id: int, reason: str = "afm-consolidation review") -> bool:
+    """Flag a proposed candidate for operator review without changing its status
+    (the schema CHECK only allows proposed/accepted/rejected/redacted/expired/
+    merged/superseded). The 'afm_review' marker makes the consolidation pass skip
+    it on future runs — so the drain loop progresses — while it stays 'proposed'
+    and fully resolvable by the operator. Idempotent. Returns True if newly flagged.
+    """
+    import time as _time
+    wb = _lazy_writeback()
+    now = _time.time()
+    with wb.db.transaction() as c:
+        c.execute("SELECT status FROM candidate_packets WHERE candidate_id=?", (candidate_id,))
+        row = c.fetchone()
+        if not row or row["status"] != "proposed":
+            return False
+        c.execute(
+            "SELECT 1 FROM consolidation_actions WHERE action_type='afm_review' AND claim=? LIMIT 1",
+            (str(candidate_id),),
+        )
+        if c.fetchone():
+            return False  # already flagged
+        c.execute(
+            """
+            INSERT INTO consolidation_actions
+            (action_type, claim, category, status, detail, created_at)
+            VALUES ('afm_review', ?, 'general', 'pending', ?, ?)
+            """,
+            (str(candidate_id), reason[:500], now),
+        )
+    return True
+
+
+def _apply_consolidation_result(result: dict) -> None:
+    """Apply a consolidation pass result: durable promotes, dedup rejections,
+    and review routing. Every branch moves the candidate OUT of 'proposed'."""
+    promoted = deduped = reviewed = 0
+    for cid in (result.get("promote_candidate_ids") or []):
+        try:
+            if _promote_candidate_durable(int(cid)):
+                promoted += 1
+        except Exception:
+            logger.exception("consolidation: promote candidate %s failed", cid)
+    for cid in (result.get("dedup_candidate_ids") or []):
+        try:
+            if _reject_candidate_dedup(int(cid)):
+                deduped += 1
+        except Exception:
+            logger.exception("consolidation: dedup candidate %s failed", cid)
+    for cid in (result.get("review_candidate_ids") or []):
+        try:
+            if _mark_candidate_review(int(cid)):
+                reviewed += 1
+        except Exception:
+            logger.exception("consolidation: review-mark candidate %s failed", cid)
+    if promoted or deduped or reviewed:
+        logger.info(
+            "AFM consolidation applied: promoted=%d deduped=%d reviewed=%d",
+            promoted, deduped, reviewed,
+        )
+    result["applied"] = {"promoted": promoted, "deduped": deduped, "reviewed": reviewed}
+
+
 def _handle_daemon_compile(params: dict, request_id: Any) -> dict:
     """Run an AFM compile pass. Defaults to dry-run and never auto-accepts."""
     global _request_count
@@ -2210,6 +2391,7 @@ def _handle_daemon_compile(params: dict, request_id: Any) -> dict:
             "procedure_extraction": "afm_passes.procedure_extraction",
             "reorganization": "afm_passes.reorganization",
             "pruning": "afm_passes.pruning",
+            "consolidation": "afm_passes.consolidation",
         }
         if pass_name not in pass_runners:
             return _make_error(-32602, f"unsupported pass_name: {pass_name}", request_id)
@@ -2237,6 +2419,15 @@ def _handle_daemon_compile(params: dict, request_id: Any) -> dict:
         else:
             result.setdefault("drafts_written", [])
 
+        # Consolidation pass: apply durable promotions + dedup rejections.
+        # No-op for passes that don't emit these keys. Skipped on dry_run.
+        if not dry_run and (
+            result.get("promote_candidate_ids")
+            or result.get("dedup_candidate_ids")
+            or result.get("review_candidate_ids")
+        ):
+            _apply_consolidation_result(result)
+
         try:
             _trace_ring().put(trace_id, {
                 "kind": "afm_loop",
@@ -2263,6 +2454,102 @@ def _handle_daemon_compile(params: dict, request_id: Any) -> dict:
         }, request_id)
     finally:
         _record_latency("afm", time.perf_counter() - started_at)
+
+
+async def _afm_loop_runner():
+    """Background scheduler for AFM passes (opt-in via MINNI_AFM_LOOP).
+
+    Ticks every idle_seconds; fires each pass when its interval has elapsed.
+    Defensive: a pass that raises is logged and skipped — it can NEVER take down
+    the socket server task. Last-run times are in-memory (reset on restart, which
+    just means each pass runs once shortly after boot — acceptable).
+    """
+    if not _afm_loop_enabled(DEFAULT_CONFIG):
+        logger.info("AFM loop disabled; runner not started.")
+        return
+    schedule = getattr(DEFAULT_CONFIG, "afm_loop_schedule", {}) or {}
+    idle_seconds = int(schedule.get("idle_seconds", 300))
+    passes_cfg = schedule.get("passes") or {}
+    last_run = {name: 0.0 for name in passes_cfg}
+    logger.info(
+        "AFM loop runner started: passes=%s idle=%ds",
+        list(passes_cfg.keys()), idle_seconds,
+    )
+    await asyncio.sleep(min(30, idle_seconds))  # let startup settle
+    while _running:
+        now = time.time()
+        for name, cfg in passes_cfg.items():
+            interval = int((cfg or {}).get("interval_seconds", 24 * 60 * 60))
+            if now - last_run.get(name, 0.0) < interval:
+                continue
+            try:
+                logger.info("AFM loop: running pass '%s'", name)
+                params = {
+                    "pass_name": name,
+                    "dry_run": False,
+                    "vault_path": DEFAULT_CONFIG.vault_path,
+                }
+                # Consolidation drains in a loop until the proposed queue is empty
+                # or a per-tick batch budget is hit — clears bursts (swarms) instead
+                # of trickling one batch per interval. Every batch resolves all its
+                # examined candidates (accept/reject/needs_review), so it strictly
+                # makes progress and cannot spin.
+                if name == "consolidation":
+                    # Drain the inbox stop-candidate channel into candidate_packets
+                    # BEFORE the consolidation drain, so freshly-ingested 'proposed'
+                    # rows are triaged in the same tick. Idempotent, respects
+                    # log_only/do_not_store, never deletes. Failure here must NOT
+                    # block consolidation of the existing queue.
+                    if (cfg or {}).get("ingest_inbox", True):
+                        try:
+                            from afm_passes.inbox_ingest import ingest as _ingest_inbox
+                            # Reuse the daemon's shared handle: SovereignDB
+                            # connections are thread-local and only released
+                            # by close(), so a fresh instance per tick leaks
+                            # one connection per tick in this loop.
+                            _ing_db = _lazy_writeback().db
+                            _ing = _ingest_inbox(
+                                _ing_db, DEFAULT_CONFIG,
+                                fallback_principal=str((cfg or {}).get(
+                                    "inbox_fallback_principal", "unknown")),
+                                dry_run=False,
+                            )
+                            if _ing.get("inserted"):
+                                logger.info(
+                                    "AFM loop: inbox ingest -> %d new candidate(s) "
+                                    "(eligible=%d already=%d)",
+                                    _ing["inserted"], _ing["eligible"],
+                                    _ing["already_present"],
+                                )
+                        except Exception:
+                            logger.exception(
+                                "AFM loop: inbox ingest raised (skipped; "
+                                "consolidation continues)")
+                    max_batches = int((cfg or {}).get("max_batches_per_tick", 40))
+                    batches = total_examined = 0
+                    last_summ = None
+                    while batches < max_batches:
+                        res = _handle_daemon_compile(params, request_id=None)
+                        last_summ = (res.get("result") or {}).get("summary") if isinstance(res, dict) else None
+                        batches += 1
+                        examined = (last_summ or {}).get("examined", 0)
+                        total_examined += examined
+                        if examined == 0:
+                            break
+                        await asyncio.sleep(0)  # yield to the server task between batches
+                    logger.info(
+                        "AFM loop: consolidation drained %d batch(es), %d candidate(s); last=%s",
+                        batches, total_examined, last_summ,
+                    )
+                else:
+                    res = _handle_daemon_compile(params, request_id=None)
+                    summ = (res.get("result") or {}).get("summary") if isinstance(res, dict) else None
+                    logger.info("AFM loop: pass '%s' done: %s", name, summ)
+            except Exception:
+                logger.exception("AFM loop: pass '%s' raised (skipped)", name)
+            last_run[name] = time.time()
+        await asyncio.sleep(idle_seconds)
+    logger.info("AFM loop runner stopped.")
 
 
 def _handle_daemon_endorse(params: dict, request_id: Any) -> dict:
@@ -2517,6 +2804,48 @@ def _resolve_candidate(params: dict, request_id: Any) -> dict:
         logger.exception("resolve_candidate failed")
         return _make_error(-32000, f"resolve_candidate error: {exc}", request_id)
 
+def _handle_ax_snapshot_store(params: dict, request_id: Any) -> dict:
+    from ax_memory import AXMemory
+    agent_id = str(params.get("agent_id", "")).strip()
+    app_name = str(params.get("app_name", "")).strip()
+    tree_json = str(params.get("tree_json", ""))
+    
+    if not agent_id or not app_name or not tree_json:
+        return _make_error(-32602, "agent_id, app_name, and tree_json are required", request_id)
+        
+    try:
+        # Shared daemon handle — per-call SovereignDB() instances leak their
+        # thread-local connection (only close() releases it).
+        db = _lazy_writeback().db
+        ax = AXMemory(db)
+        snapshot_id = ax.add_snapshot(
+            agent_id=agent_id,
+            app_name=app_name,
+            tree_json=tree_json,
+            ttl_seconds=params.get("ttl_seconds", 3600)
+        )
+        return _make_response({"snapshot_id": snapshot_id}, request_id)
+    except Exception as exc:
+        logger.exception("ax_snapshot_store failed")
+        return _make_error(-32000, f"ax_snapshot_store error: {exc}", request_id)
+
+def _handle_ax_snapshot_get(params: dict, request_id: Any) -> dict:
+    from ax_memory import AXMemory
+    agent_id = str(params.get("agent_id", "")).strip()
+    app_name = params.get("app_name")
+    
+    if not agent_id:
+        return _make_error(-32602, "agent_id is required", request_id)
+        
+    try:
+        db = _lazy_writeback().db
+        ax = AXMemory(db)
+        snapshot = ax.get_latest_snapshot(agent_id=agent_id, app_name=app_name)
+        return _make_response({"snapshot": snapshot}, request_id)
+    except Exception as exc:
+        logger.exception("ax_snapshot_get failed")
+        return _make_error(-32000, f"ax_snapshot_get error: {exc}", request_id)
+
 
 # Method registry
 _METHODS: Dict[str, callable] = {
@@ -2543,6 +2872,8 @@ _METHODS: Dict[str, callable] = {
     "stage_candidate":        _stage_candidate,
     "list_candidates":        _list_candidates,
     "resolve_candidate":      _resolve_candidate,
+    "ax_snapshot_store":      _handle_ax_snapshot_store,
+    "ax_snapshot_get":        _handle_ax_snapshot_get,
     "status":                 _handle_status,
     "health_report":          _handle_health_report,
     "hygiene_report":         _handle_hygiene_report,
@@ -2885,6 +3216,11 @@ def main():
     if args.port:
         http_task = loop.create_task(_serve_http(args.host, args.port))
 
+    # Opt-in AFM loop runner (gated by MINNI_AFM_LOOP). Dormant unless enabled.
+    afm_task = None
+    if _afm_loop_enabled(DEFAULT_CONFIG):
+        afm_task = loop.create_task(_afm_loop_runner())
+
     def _shutdown(signum, frame):
         nonlocal _running
         sig_name = signal.Signals(signum).name
@@ -2895,6 +3231,8 @@ def main():
         main_task.cancel()
         if http_task is not None:
             http_task.cancel()
+        if afm_task is not None:
+            afm_task.cancel()
 
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGINT, _shutdown)
