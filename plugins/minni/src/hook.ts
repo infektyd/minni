@@ -5,6 +5,7 @@ import {
   CLAUDECODE_VAULT_PATH,
   CLAUDECODE_WORKSPACE_ID,
 } from "./config.js";
+import { resolveActivePlanView } from "./plan.js";
 import {
   MEMORY_CONTRACT,
   envelopeBudgetFor,
@@ -16,7 +17,7 @@ import { routeMemoryIntent } from "./policy.js";
 import {
   ackHandoff,
   buildStatusReport,
-  formatRecall,
+  formatRecallLean,
   listPendingHandoffs,
   recallMemory,
   subscribeContradictions,
@@ -116,49 +117,62 @@ async function handleSessionStart(payload: Record<string, unknown>): Promise<Hoo
   }
   const contradictions = await subscribeContradictions({ agentId: CLAUDECODE_AGENT_ID });
 
+  let activePlan: any = undefined;
+  try {
+    activePlan = await resolveActivePlanView(CLAUDECODE_VAULT_PATH);
+  } catch {
+    // ignore
+  }
+
+  const envelopeBody: any = {
+    contract: MEMORY_CONTRACT,
+    identity: {
+      agent: CLAUDECODE_AGENT_ID,
+      workspace: CLAUDECODE_WORKSPACE_ID,
+      vault: CLAUDECODE_VAULT_PATH,
+      session_id: sessionId,
+      daemon_ok: status.socket.ok,
+      afm_ok: status.afm.ok,
+    },
+    pending_learnings: pending.map((entry) => ({
+      slug: entry.slug,
+      created: entry.createdAt,
+      path: entry.filePath,
+      candidates: entry.payload.candidates,
+      kind: entry.payload.kind,
+      task: entry.payload.task,
+    })),
+    handoff_context: handoffContext.map((snippet) => ({
+      ref: snippet.ref,
+      path: snippet.relativePath,
+      snippet: snippet.snippet,
+    })),
+    handoff_acks: ackedLeases,
+    stale_beliefs:
+      contradictions.ok && contradictions.data
+        ? contradictions.data
+        : { ok: false, error: contradictions.error },
+    recall:
+      recall.ok && recall.data
+        ? {
+            ok: true,
+            results: recall.data.results,
+            agent_origin: recall.data.agent_id ?? CLAUDECODE_AGENT_ID,
+            layer: recall.data.layer,
+          }
+        : { ok: false, error: recall.error },
+    audit_tail: tail.entries.slice(-5).map((entry) => entry.split("\n")[0]),
+  };
+
+  if (activePlan !== undefined) {
+    envelopeBody.active_plan = activePlan;
+  }
+
   const envelope = wrapEnvelope({
     event: "SessionStart",
     agent: CLAUDECODE_AGENT_ID,
     budget: envelopeBudgetFor(CLAUDECODE_CONTEXT_WINDOW),
-    body: {
-      contract: MEMORY_CONTRACT,
-      identity: {
-        agent: CLAUDECODE_AGENT_ID,
-        workspace: CLAUDECODE_WORKSPACE_ID,
-        vault: CLAUDECODE_VAULT_PATH,
-        session_id: sessionId,
-        daemon_ok: status.socket.ok,
-        afm_ok: status.afm.ok,
-      },
-      pending_learnings: pending.map((entry) => ({
-        slug: entry.slug,
-        created: entry.createdAt,
-        path: entry.filePath,
-        candidates: entry.payload.candidates,
-        kind: entry.payload.kind,
-        task: entry.payload.task,
-      })),
-      handoff_context: handoffContext.map((snippet) => ({
-        ref: snippet.ref,
-        path: snippet.relativePath,
-        snippet: snippet.snippet,
-      })),
-      handoff_acks: ackedLeases,
-      stale_beliefs:
-        contradictions.ok && contradictions.data
-          ? contradictions.data
-          : { ok: false, error: contradictions.error },
-      recall:
-        recall.ok && recall.data
-          ? {
-              ok: true,
-              results: recall.data.results,
-              agent_origin: recall.data.agent_id ?? CLAUDECODE_AGENT_ID,
-              layer: recall.data.layer,
-            }
-          : { ok: false, error: recall.error },
-      audit_tail: tail.entries.slice(-5).map((entry) => entry.split("\n")[0]),
-    },
+    body: envelopeBody,
   });
 
   await recordAudit(CLAUDECODE_VAULT_PATH, {
@@ -178,6 +192,26 @@ async function handleSessionStart(payload: Record<string, unknown>): Promise<Hoo
       hookEventName: "SessionStart",
       additionalContext: envelope,
     },
+  };
+}
+
+/**
+ * Compact plan POINTER for per-turn injection (Option C). Keeps only the
+ * actionable one-liners (headline, next_action, progress) plus counts, and tells
+ * the agent how to pull the rest on demand. Drops the full goal text,
+ * open_questions array (~1.8 KB, static) and pending-slice list.
+ */
+function compactPlanPointer(active: { plan_id: string; rev: number; view: any }): any {
+  const v = active?.view ?? {};
+  return {
+    plan_id: active.plan_id,
+    rev: active.rev,
+    headline: v.headline,
+    next_action: v.next_action,
+    progress: v.progress,
+    open_questions_count: Array.isArray(v.open_questions) ? v.open_questions.length : 0,
+    scar_tissue: v.scar_tissue,
+    pull: "Full plan (goal, open_questions, slices) omitted to save context. Call minni_plan_status for detail on demand.",
   };
 }
 
@@ -205,26 +239,44 @@ async function handleUserPromptSubmit(payload: Record<string, unknown>): Promise
     return { continue: true };
   }
 
+  let activePlan: any = undefined;
+  try {
+    activePlan = await resolveActivePlanView(CLAUDECODE_VAULT_PATH);
+  } catch {
+    // ignore
+  }
+
+  const envelopeBody: any = {
+    identity: {
+      agent: CLAUDECODE_AGENT_ID,
+      workspace: CLAUDECODE_WORKSPACE_ID,
+      task_signature: signature,
+    },
+    recall:
+      recall.ok && recall.data
+        ? formatRecallLean(prompt, recall.data, vaultResults)
+        : { ok: false, error: recall.error },
+    vault: vaultRecallToBody(vaultResults),
+    intent: {
+      action: intent.action,
+      confidence: intent.confidence,
+      suggested_tool: intent.suggestedTool,
+    },
+  };
+
+  // Option C: inject a compact plan POINTER per turn, not the full plan. The
+  // headline + next_action are the actionable one-liners the agent needs every
+  // turn; the full goal/open_questions/pending list is omitted (it barely changes
+  // turn-to-turn) and pulled on demand via minni_plan_status. SessionStart still
+  // injects the full plan view for boot/rehydration.
+  if (activePlan !== undefined) {
+    envelopeBody.active_plan_ref = compactPlanPointer(activePlan);
+  }
+
   const envelope = wrapEnvelope({
     event: "UserPromptSubmit",
     agent: CLAUDECODE_AGENT_ID,
-    body: {
-      identity: {
-        agent: CLAUDECODE_AGENT_ID,
-        workspace: CLAUDECODE_WORKSPACE_ID,
-        task_signature: signature,
-      },
-      recall:
-        recall.ok && recall.data
-          ? formatRecall(prompt, recall.data, vaultResults)
-          : { ok: false, error: recall.error },
-      vault: vaultRecallToBody(vaultResults),
-      intent: {
-        action: intent.action,
-        confidence: intent.confidence,
-        suggested_tool: intent.suggestedTool,
-      },
-    },
+    body: envelopeBody,
   });
 
   await recordAudit(CLAUDECODE_VAULT_PATH, {

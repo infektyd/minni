@@ -197,3 +197,5 @@ plugins/minni/skills/*/scripts/
 /index.md
 /log.md
 *.docx
+# Excalidraw scratch diagrams
+*.excalidraw

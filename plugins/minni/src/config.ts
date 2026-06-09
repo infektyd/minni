@@ -113,3 +113,25 @@ export const KILOCODE_CONTEXT_WINDOW = (() => {
   const raw = Number(process.env.KILO_CONTEXT_WINDOW);
   return Number.isFinite(raw) && raw > 0 ? raw : 200_000;
 })();
+
+// --- Grok-build agent defaults ---
+
+export const GROK_AGENT_ID =
+  process.env.MINNI_GROK_AGENT_ID ?? "grok-build";
+
+export const GROK_WORKSPACE_ID =
+  process.env.MINNI_GROK_WORKSPACE_ID ??
+  `workspace-${path.basename(process.cwd())}`;
+
+export const GROK_VAULT_PATH = expandTilde(
+  process.env.MINNI_GROK_VAULT_PATH ??
+    path.join(os.homedir(), ".minni", "grok-build-vault"),
+);
+
+export const GROK_HOOKS_ENABLED =
+  (process.env.MINNI_GROK_HOOKS ?? "on").toLowerCase() !== "off";
+
+export const GROK_CONTEXT_WINDOW = (() => {
+  const raw = Number(process.env.GROK_CONTEXT_WINDOW ?? process.env.MINNI_GROK_CONTEXT_WINDOW);
+  return Number.isFinite(raw) && raw > 0 ? raw : 256_000;
+})();
