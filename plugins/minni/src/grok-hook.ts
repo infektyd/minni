@@ -315,7 +315,7 @@ async function handleStop(payload: Record<string, unknown>): Promise<HookOutput>
   }
 
   const inbox = await writeInbox(GROK_VAULT_PATH, sessionId, {
-    kind: "grok_stop_candidates",
+    kind: "stop_candidates",
     agent_id: GROK_AGENT_ID,
     workspace_id: workspaceId,
     candidates: outcome.outcomeDraft.learnCandidates,

@@ -2814,7 +2814,9 @@ def _handle_ax_snapshot_store(params: dict, request_id: Any) -> dict:
         return _make_error(-32602, "agent_id, app_name, and tree_json are required", request_id)
         
     try:
-        db = SovereignDB()
+        # Shared daemon handle — per-call SovereignDB() instances leak their
+        # thread-local connection (only close() releases it).
+        db = _lazy_writeback().db
         ax = AXMemory(db)
         snapshot_id = ax.add_snapshot(
             agent_id=agent_id,
@@ -2836,7 +2838,7 @@ def _handle_ax_snapshot_get(params: dict, request_id: Any) -> dict:
         return _make_error(-32602, "agent_id is required", request_id)
         
     try:
-        db = SovereignDB()
+        db = _lazy_writeback().db
         ax = AXMemory(db)
         snapshot = ax.get_latest_snapshot(agent_id=agent_id, app_name=app_name)
         return _make_response({"snapshot": snapshot}, request_id)
