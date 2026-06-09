@@ -75,7 +75,7 @@ def _ensure_dedup_index(db) -> None:
     Normalization needs regex, so the hash is computed in Python, not SQL."""
     with db.cursor() as c:
         c.execute("PRAGMA table_info(learnings)")
-        cols = [dict(r)["name"] for r in c.fetchall()]
+        cols = [r["name"] for r in c.fetchall()]
         if "content_hash" not in cols:
             c.execute("ALTER TABLE learnings ADD COLUMN content_hash TEXT")
         c.execute(
@@ -127,7 +127,7 @@ def _proposed_candidates(db, limit: int) -> List[Dict[str, Any]]:
 def _total_proposed(db) -> int:
     with db.cursor() as c:
         c.execute("SELECT COUNT(*) AS n FROM candidate_packets WHERE status = 'proposed'")
-        return int(dict(c.fetchone())["n"])
+        return int(c.fetchone()["n"])
 
 
 def _review_draft(candidate: Dict[str, Any], reason: str, trace_id: str) -> Dict[str, Any]:

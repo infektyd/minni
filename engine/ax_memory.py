@@ -1,6 +1,5 @@
 import json
 import time
-import zlib
 import logging
 from typing import Dict, List, Optional
 from datetime import datetime
@@ -26,15 +25,6 @@ class AXMemory:
         ttl_seconds: int = 3600
     ) -> int:
         now = time.time()
-        
-        # Compress the tree JSON using zlib to save space
-        compressed_tree = zlib.compress(tree_json.encode('utf-8'), level=6)
-        
-        # We store the compressed tree as BLOB in SQLite, but wait, the schema 
-        # tree_json TEXT. So we shouldn't compress it if it's TEXT, or we should 
-        # base64 encode it, or just store it as raw TEXT. JSON trees can be a few KB.
-        # Let's just store it as TEXT since it's defined as TEXT in schema.
-        
         with self.db.cursor() as c:
             c.execute("""
                 INSERT INTO ax_snapshots

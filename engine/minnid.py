@@ -2219,7 +2219,7 @@ def _promote_candidate_durable(candidate_id: int, reason: str = "afm-consolidati
         # Re-check status inside the txn (closes TOCTOU with a concurrent resolve).
         c.execute("SELECT status FROM candidate_packets WHERE candidate_id=?", (candidate_id,))
         chk = c.fetchone()
-        if not chk or dict(chk)["status"] != "proposed":
+        if not chk or chk["status"] != "proposed":
             return None
         c.execute(
             """
@@ -2272,7 +2272,7 @@ def _reject_candidate_dedup(candidate_id: int) -> bool:
     with wb.db.transaction() as c:
         c.execute("SELECT status FROM candidate_packets WHERE candidate_id=?", (candidate_id,))
         row = c.fetchone()
-        if not row or dict(row)["status"] != "proposed":
+        if not row or row["status"] != "proposed":
             return False
         c.execute(
             """
@@ -2308,7 +2308,7 @@ def _mark_candidate_review(candidate_id: int, reason: str = "afm-consolidation r
     with wb.db.transaction() as c:
         c.execute("SELECT status FROM candidate_packets WHERE candidate_id=?", (candidate_id,))
         row = c.fetchone()
-        if not row or dict(row)["status"] != "proposed":
+        if not row or row["status"] != "proposed":
             return False
         c.execute(
             "SELECT 1 FROM consolidation_actions WHERE action_type='afm_review' AND claim=? LIMIT 1",
@@ -2503,7 +2503,11 @@ async def _afm_loop_runner():
                     if (cfg or {}).get("ingest_inbox", True):
                         try:
                             from afm_passes.inbox_ingest import ingest as _ingest_inbox
-                            _ing_db = SovereignDB(DEFAULT_CONFIG)
+                            # Reuse the daemon's shared handle: SovereignDB
+                            # connections are thread-local and only released
+                            # by close(), so a fresh instance per tick leaks
+                            # one connection per tick in this loop.
+                            _ing_db = _lazy_writeback().db
                             _ing = _ingest_inbox(
                                 _ing_db, DEFAULT_CONFIG,
                                 fallback_principal=str((cfg or {}).get(

@@ -1064,7 +1064,7 @@ export async function clearActivePlan(vaultPath: string): Promise<void> {
     await unlink(pointerPath);
   } catch (err: any) {
     if (err.code !== "ENOENT") {
-      // ignore ENOENT
+      throw err;
     }
   }
 }
