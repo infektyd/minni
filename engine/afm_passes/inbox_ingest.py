@@ -38,6 +38,9 @@ Safety / contract
 * IDEMPOTENT: each row carries ``derived_from`` with the source inbox file +
   candidate index; existing rows (ANY status) are detected and never
   re-inserted. Re-running is a no-op even after the loop resolves a row.
+* ``derived_from.kind`` records what the source file actually declared
+  (``null`` for the kind-less Claude Code shape) — Minni logic never stamps
+  one agent's label onto another agent's rows.
 * NEVER deletes inbox files or candidate rows. Disposal behavior is unchanged.
 """
 
@@ -203,7 +206,10 @@ def _scan_inbox(inbox: Path, fallback_principal: str) -> List[Dict[str, Any]]:
                     "inbox_file": path.name,
                     "candidate_index": idx,
                     "proposed_at": proposed_at,
-                    "kind": kind or KIND,
+                    # Record what the file actually declared; null for the
+                    # kind-less Claude Code shape. Never stamp an agent-specific
+                    # label onto another agent's rows.
+                    "kind": kind,
                 }
             )
     return out
@@ -245,7 +251,7 @@ def ingest(db, config, inboxes: Optional[List[Path]] = None,
                         "source": "inbox",
                         "inbox_file": r["inbox_file"],
                         "candidate_index": r["candidate_index"],
-                        "kind": r.get("kind", KIND),
+                        "kind": r.get("kind"),
                         "content_sha1": _content_sha1(r["content"]),
                     }
                 )

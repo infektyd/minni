@@ -192,6 +192,9 @@ def test_ingests_kindless_claude_code_shape_attributed_to_vault_agent(tmp_path):
         c.execute("SELECT derived_from FROM candidate_packets WHERE principal='claudecode'")
         df = json.loads(dict(c.fetchone())["derived_from"])
     assert df["source"] == "inbox" and df["inbox_file"] == "cc.json"
+    # Provenance must record what the file declared — kind-less CC files must
+    # NOT be stamped with the codex-specific kind (model-agnostic logic).
+    assert df["kind"] is None
 
 
 def test_kindless_without_stop_shape_is_ignored(tmp_path):
