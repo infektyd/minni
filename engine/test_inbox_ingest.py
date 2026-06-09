@@ -197,6 +197,25 @@ def test_ingests_kindless_claude_code_shape_attributed_to_vault_agent(tmp_path):
     assert df["kind"] is None
 
 
+def test_ingests_neutral_stop_candidates_kind(tmp_path):
+    """The canonical agent-neutral kind 'stop_candidates' must be accepted
+    (hooks are being migrated off the legacy codex-prefixed tag)."""
+    from afm_passes.inbox_ingest import ingest
+
+    db_obj, cfg = _make_db(tmp_path)
+    inbox = tmp_path / "gemini-vault" / "inbox"
+    doc = _cc_stop_doc(["a neutral-kind lesson"], kind="stop_candidates")
+    _write_inbox_file(inbox, "neutral.json", doc)
+
+    res = ingest(db_obj, cfg, inboxes=[inbox], dry_run=False)
+    assert res["inserted"] == 1, res
+    assert _count_proposed(db_obj, principal="gemini") == 1
+    with db_obj.cursor() as c:
+        c.execute("SELECT derived_from FROM candidate_packets WHERE principal='gemini'")
+        df = json.loads(dict(c.fetchone())["derived_from"])
+    assert df["kind"] == "stop_candidates"
+
+
 def test_kindless_without_stop_shape_is_ignored(tmp_path):
     """Kind-less JSON that lacks the stop-candidate shape must NOT be ingested."""
     from afm_passes.inbox_ingest import ingest

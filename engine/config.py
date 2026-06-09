@@ -144,11 +144,15 @@ class SovereignConfig:
                 "max_per_run": 50,
                 "max_batches_per_tick": 40,  # up to 40*50=2000 candidates/tick
                 # Before draining, ingest inbox stop-candidate files
-                # (<vault>/inbox/*.json, kind 'codex_stop_candidates') into
-                # candidate_packets so that channel stops piling up. Idempotent;
-                # respects log_only/do_not_store; never deletes.
+                # (<vault>/inbox/*.json — kind 'stop_candidates', legacy
+                # 'codex_stop_candidates', or kind-less stop-candidate shape)
+                # into candidate_packets so that channel stops piling up.
+                # Idempotent; respects log_only/do_not_store; never deletes.
                 "ingest_inbox": True,
-                "inbox_fallback_principal": "codex",
+                # Last-resort attribution when neither agent_id nor the vault
+                # dir identifies the author. Never an agent name: Minni logic
+                # is model-agnostic.
+                "inbox_fallback_principal": "unknown",
             },
         },
     })

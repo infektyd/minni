@@ -23,7 +23,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--vault", required=True, help="vault root (contains inbox/)")
-    ap.add_argument("--principal", default="codex",
+    ap.add_argument("--principal", default="unknown",
                     help="fallback principal if a file lacks agent_id")
     ap.add_argument("--db", default=os.environ.get("MINNI_DB_PATH"),
                     help="override minni.db path (else config/env)")

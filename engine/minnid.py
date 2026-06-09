@@ -2511,7 +2511,7 @@ async def _afm_loop_runner():
                             _ing = _ingest_inbox(
                                 _ing_db, DEFAULT_CONFIG,
                                 fallback_principal=str((cfg or {}).get(
-                                    "inbox_fallback_principal", "codex")),
+                                    "inbox_fallback_principal", "unknown")),
                                 dry_run=False,
                             )
                             if _ing.get("inserted"):

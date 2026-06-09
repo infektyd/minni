@@ -9,7 +9,8 @@ loop:
       -> the loop drains these -> durable ``learnings``. WORKS.
 
   (2) Stop/PreCompact hooks -> ``<vault>/inbox/*.json`` (kind
-      'codex_stop_candidates'). These were NEVER ingested into
+      'stop_candidates'; legacy 'codex_stop_candidates'; or kind-less with
+      the stop-candidate shape). These were NEVER ingested into
       candidate_packets, so the loop never saw them and they piled up.
 
 This module drains channel (2) into candidate_packets using the SAME canonical
@@ -22,7 +23,8 @@ It is invoked by the AFM loop at the start of each ``consolidation`` tick (see
 
 Safety / contract
 -----------------
-* Files are processed if ``kind == 'codex_stop_candidates'`` OR the file is
+* Files are processed if ``kind`` is ``'stop_candidates'`` (or the legacy
+  ``'codex_stop_candidates'``) OR the file is
   kind-less but matches the stop-candidate shape (a ``candidates`` list plus
   ``slug``/``last_task`` — the shape the Claude Code Stop/PreCompact hook emits
   with no ``kind`` field). Files carrying any OTHER explicit kind (handoffs,
@@ -54,7 +56,13 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-KIND = "codex_stop_candidates"
+# Canonical, agent-neutral format tag for stop-candidate inbox files. The
+# legacy codex-prefixed tag is still accepted for files written before the
+# hooks were neutralized. `kind` identifies the FILE FORMAT, never the author —
+# author identity travels via agent_id / the owning vault dir / `principal`.
+STOP_KIND = "stop_candidates"
+LEGACY_STOP_KIND = "codex_stop_candidates"
+STOP_KINDS = frozenset({STOP_KIND, LEGACY_STOP_KIND})
 CONTENT_CAP = 200000  # matches minnid.py canonical insert bound
 
 
@@ -143,7 +151,7 @@ def _is_stop_candidate_shape(doc: Dict[str, Any]) -> bool:
     Claude Code hook emits: a ``candidates`` list plus the ``slug``/``last_task``
     session markers. Deliberately strict so arbitrary kind-less JSON is not
     ingested. Handoff/precompact files always carry a ``kind`` and are excluded
-    upstream by the ``kind != KIND`` check before this is ever consulted."""
+    upstream by the ``kind not in STOP_KINDS`` check before this is consulted."""
     return (
         isinstance(doc.get("candidates"), list)
         and "slug" in doc
@@ -177,7 +185,7 @@ def _scan_inbox(inbox: Path, fallback_principal: str) -> List[Dict[str, Any]]:
         # Accept codex's explicitly-tagged stop-candidates AND kind-less files
         # that carry the stop-candidate shape (the Claude Code hook writes
         # candidate files with no `kind`). Any other explicit kind is excluded.
-        if kind != KIND and not (kind is None and _is_stop_candidate_shape(doc)):
+        if kind not in STOP_KINDS and not (kind is None and _is_stop_candidate_shape(doc)):
             continue
         if doc.get("log_only") is True or doc.get("do_not_store") is True:
             continue
@@ -216,7 +224,7 @@ def _scan_inbox(inbox: Path, fallback_principal: str) -> List[Dict[str, Any]]:
 
 
 def ingest(db, config, inboxes: Optional[List[Path]] = None,
-           fallback_principal: str = "codex", dry_run: bool = False) -> Dict[str, Any]:
+           fallback_principal: str = "unknown", dry_run: bool = False) -> Dict[str, Any]:
     """Ingest eligible inbox stop-candidates into candidate_packets.
 
     Returns a summary dict. Idempotent; respects log_only/do_not_store; never
