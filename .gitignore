@@ -170,3 +170,30 @@ Thumbs.db
 
 # sovereign skill scripts kept private (model-backend dependent; not for public repo)
 plugins/minni/skills/*/scripts/
+
+# --- pruned from tip 2026-06-09: process artifacts kept locally (data is our value) ---
+/patch.diff
+/_archive/
+/minni/
+/docs/plans/
+/docs/superpowers/
+/docs/reviews/
+/docs/migration/
+/docs/decisions/SOVEREIGN-OPENCLAW-OPTION2-DECISIONS.md
+/docs/ARCHITECTURAL-REVIEW-ROADMAP.md
+/docs/ENGINEERING-REVIEW.md
+/docs/OBSERVED-USAGE.md
+/docs/PANEL_EVAL_STABILIZATION.md
+/docs/RC_PLAN.md
+
+# --- local-only hygiene (never belonged on git) ---
+.mypy_cache/
+/venv/
+/archives/
+/codex/
+/grok/
+/antigravity/
+/brand-rebrand/
+/index.md
+/log.md
+*.docx
