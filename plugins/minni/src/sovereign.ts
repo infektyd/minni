@@ -6,7 +6,14 @@ import net from "node:net";
 import path from "node:path";
 import { URL } from "node:url";
 import { AFM_HEALTH_URL, AFM_PROVIDER_MODE, DEFAULT_AGENT_ID, DEFAULT_VAULT_PATH, DEFAULT_WORKSPACE_ID, SOCKET_PATH } from "./config.js";
-import { resolveAfmProvider, sanitizeAfmHealth, type AfmProviderMode, type AfmProviderResolution } from "./afm.js";
+import {
+  getAfmProviderHealth,
+  resolveAfmProvider,
+  sanitizeAfmHealth,
+  type AfmProviderMode,
+  type AfmProviderResolution,
+  type ProviderHealth,
+} from "./afm.js";
 import { auditTail, ensureVault, recordAudit, vaultExists } from "./vault.js";
 import type { VaultSearchResult } from "./vault.js";
 
@@ -32,14 +39,23 @@ export interface ReadContextResponse {
   backend_badge?: string;
 }
 
+export interface ExtractorStatus {
+  provider: string;
+  tier: "local" | "cloud";
+  generationVerified: boolean;
+  probeAgeMs: number;
+}
+
 export interface StatusReport {
   vault: {
     path: string;
     exists: boolean;
   };
   socket: JsonResult;
+  /** afm.ok is generationVerified (honest health), not mere /health reachability. */
   afm: JsonResult;
   afmProvider: AfmProviderResolution;
+  extractor: ExtractorStatus;
   audit: {
     entries: number;
     latest?: string;
@@ -60,6 +76,26 @@ export function parseSovrdJson<T = unknown>(raw: string): JsonResult<T> {
 // real daemon errors (e.g. identity_mismatch) as "Parse Error: Expected HTTP/".
 // All daemon calls now go through jsonRpcSocketRequest and surface real errors.
 
+/**
+ * Honest /health body inspection. The old behavior treated any HTTP<400
+ * parseable-JSON body as ok without ever reading availability/status values,
+ * so a bridge reporting status=error still counted as healthy.
+ */
+function afmHealthBodyProblem(data: unknown): string | undefined {
+  if (!data || typeof data !== "object") return undefined;
+  const record = data as Record<string, unknown>;
+  const okHealthStatuses = new Set(["ok", "ready", "healthy", "available", "bridge"]);
+  if (typeof record.status === "string" && !okHealthStatuses.has(record.status.toLowerCase())) {
+    return `afm health degraded: status=${record.status.slice(0, 40)}`;
+  }
+  if (typeof record.availability === "string" && record.availability.toLowerCase() !== "available") {
+    return `afm health degraded: availability=${record.availability.slice(0, 40)}`;
+  }
+  if (record.available === false) return "afm health degraded: available=false";
+  if (record.ok === false) return "afm health degraded: ok=false";
+  return undefined;
+}
+
 export async function afmHealth(url = AFM_HEALTH_URL): Promise<JsonResult> {
   return new Promise((resolve) => {
     const parsedUrl = new URL(url);
@@ -73,6 +109,15 @@ export async function afmHealth(url = AFM_HEALTH_URL): Promise<JsonResult> {
         const parsed = parseSovrdJson(data);
         if (res.statusCode && res.statusCode >= 400) {
           resolve({ ok: false, data: parsed.data, error: `HTTP ${res.statusCode}` });
+          return;
+        }
+        if (!parsed.ok) {
+          resolve(parsed);
+          return;
+        }
+        const problem = afmHealthBodyProblem(parsed.data);
+        if (problem) {
+          resolve({ ok: false, data: parsed.data, error: problem });
           return;
         }
         resolve(parsed);
@@ -419,6 +464,11 @@ export async function buildStatusReport(input?: {
   socket?: JsonResult;
   afm?: JsonResult;
   afmProviderMode?: AfmProviderMode;
+  /** Test seam: pre-computed verified-generation health (skips the live probe). */
+  afmGeneration?: ProviderHealth;
+  /** Test seam: transport for the 1-token generation probe. */
+  afmGenerationTransport?: (url: string, payload: Record<string, unknown>) => Promise<JsonResult>;
+  afmGenerationTtlMs?: number;
 }): Promise<StatusReport> {
   const vaultPath = input?.vaultPath ?? DEFAULT_VAULT_PATH;
   await ensureVault(vaultPath);
@@ -444,17 +494,46 @@ export async function buildStatusReport(input?: {
     }
   } catch {}
 
+  const afmProvider = resolveAfmProvider(input?.afmProviderMode ?? AFM_PROVIDER_MODE, {
+    nativeHelperPath: process.env.MINNI_AFM_NATIVE_HELPER,
+    health: rawAfm,
+  });
+  const generation =
+    input?.afmGeneration ??
+    (await getAfmProviderHealth({
+      mode: afmProvider.provider,
+      health: rawAfm,
+      transport: input?.afmGenerationTransport,
+      ttlMs: input?.afmGenerationTtlMs,
+      nativeHelperPath: process.env.MINNI_AFM_NATIVE_HELPER,
+    }));
+  const sanitizedAfm = sanitizeAfmHealth(rawAfm);
+  // afm_ok is redefined as generationVerified (field name kept for envelope compat):
+  // a verified 1-token completion within the probe TTL, not mere /health reachability.
+  const afm: JsonResult<Record<string, unknown>> = {
+    ok: generation.generationVerified,
+    data: {
+      ...sanitizedAfm.data,
+      reachable: generation.reachable,
+      generationVerified: generation.generationVerified,
+    },
+    error: sanitizedAfm.error ?? (generation.generationVerified ? undefined : generation.detail),
+  };
+
   return {
     vault: {
       path: vaultPath,
       exists: await vaultExists(vaultPath),
     },
     socket: input?.socket ?? (await socketHealth()),
-    afm: sanitizeAfmHealth(rawAfm),
-    afmProvider: resolveAfmProvider(input?.afmProviderMode ?? AFM_PROVIDER_MODE, {
-      nativeHelperPath: process.env.MINNI_AFM_NATIVE_HELPER,
-      health: rawAfm,
-    }),
+    afm,
+    afmProvider,
+    extractor: {
+      provider: afmProvider.provider,
+      tier: "local",
+      generationVerified: generation.generationVerified,
+      probeAgeMs: generation.probeAgeMs,
+    },
     audit: {
       entries: tail.entries.length,
       latest: tail.entries.at(-1),

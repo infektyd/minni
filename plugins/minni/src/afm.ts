@@ -5,7 +5,8 @@ import { spawn } from "node:child_process";
 import { URL } from "node:url";
 
 import type { JsonResult } from "./sovereign.js";
-import { AFM_ALLOWED_TARGETS } from "./config.js";  // G13: single source for allowlist (fixes duplication noted in review)
+// G13: single source for allowlist (fixes duplication noted in review)
+import { AFM_ALLOWED_TARGETS, AFM_PREPARE_TASK_MODEL, AFM_PREPARE_TASK_URL } from "./config.js";
 
 export type AfmProviderMode = "auto" | "bridge" | "native" | "off";
 export type AfmProvider = "bridge" | "native" | "off";
@@ -166,6 +167,18 @@ export function resolveAfmProvider(mode: AfmProviderMode, options: AfmProviderOp
     return { mode, provider: "off", status: "off", available: false, adapterConfigured: hasAdapter };
   }
   if (mode === "bridge") {
+    // Honest health: when the caller already probed the bridge /health endpoint,
+    // a failed probe means the bridge is NOT available (was previously always true).
+    if (options.health && !options.health.ok) {
+      return {
+        mode,
+        provider: "bridge",
+        status: "bridge",
+        available: false,
+        adapterConfigured: hasAdapter,
+        reason: safeError(options.health.error) ?? "bridge health unavailable",
+      };
+    }
     return { mode, provider: "bridge", status: "bridge", available: true, adapterConfigured: hasAdapter };
   }
   if (options.health && nativeHealthAvailable(options.health)) {
@@ -217,9 +230,9 @@ export function resolveAfmProvider(mode: AfmProviderMode, options: AfmProviderOp
   };
 }
 
-async function defaultTransport(url: string, payload: Record<string, unknown>): Promise<JsonResult> {
+async function defaultTransport(url: string, payload: Record<string, unknown>, timeoutMs = 45000): Promise<JsonResult> {
   try {
-    const parsed = await postJson<any>(url, payload, { timeoutMs: 45000 });
+    const parsed = await postJson<any>(url, payload, { timeoutMs });
     return { ok: true, data: parsed };
   } catch (error) {
     if (error instanceof Error && error.message.startsWith("HTTP ")) {
@@ -325,8 +338,180 @@ export async function callAfmJson(
   if (provider.provider === "native") {
     const helperPath = resolvedNativeHelperPath(options);
     if (!helperPath) return { ok: false, error: provider.reason ?? "native helper unavailable" };
-    return callNativeHelper(helperPath, options.operation ?? "json", payload, options.timeoutMs ?? 45000);
+    const nativeResult = await callNativeHelper(helperPath, options.operation ?? "json", payload, options.timeoutMs ?? 45000);
+    if (!nativeResult.ok) noteAfmGenerationFailure(url);
+    return nativeResult;
   }
-  const transport = options.transport ?? defaultTransport;
-  return transport(url, payload);
+  const transport = options.transport ?? ((targetUrl: string, body: Record<string, unknown>) => defaultTransport(targetUrl, body, options.timeoutMs ?? 45000));
+  const result = await transport(url, payload);
+  // Honest health: a failed live call invalidates the cached generation probe
+  // so the next health read re-verifies instead of serving a stale "ok".
+  if (!result.ok) noteAfmGenerationFailure(url);
+  return result;
+}
+
+// --- Verified generation health (P1: honest health) -------------------------
+//
+// `ok` is only true when a real 1-token completion has been verified within the
+// TTL. /health reachability alone is no longer sufficient (the bridge answered
+// /health while generation was dead — the two health lies this replaces).
+
+export interface ProviderHealth {
+  ok: boolean;
+  reachable: boolean;
+  generationVerified: boolean;
+  probeAgeMs: number;
+  detail?: string;
+}
+
+export interface AfmGenerationProbeOptions {
+  mode?: AfmProviderMode;
+  chatUrl?: string;
+  model?: string;
+  timeoutMs?: number;
+  ttlMs?: number;
+  /** Pre-fetched /health result; a failed health probe skips the generation call. */
+  health?: JsonResult;
+  transport?: (url: string, payload: Record<string, unknown>) => Promise<JsonResult>;
+  nativeHelperPath?: string;
+  now?: () => number;
+}
+
+interface GenerationProbeEntry {
+  reachable: boolean;
+  generationVerified: boolean;
+  detail?: string;
+  probedAt: number;
+}
+
+const GENERATION_PROBE_TTL_MS = 5 * 60 * 1000;
+const GENERATION_PROBE_TIMEOUT_MS = 1500;
+const generationProbeCache = new Map<string, GenerationProbeEntry>();
+const generationProbeInFlight = new Map<string, Promise<GenerationProbeEntry>>();
+
+function generationProbeKey(options: AfmGenerationProbeOptions): string {
+  return `${options.mode ?? "bridge"}|${options.chatUrl ?? AFM_PREPARE_TASK_URL}`;
+}
+
+export function resetAfmGenerationProbeCache(): void {
+  generationProbeCache.clear();
+  generationProbeInFlight.clear();
+}
+
+/** Invalidate cached generation probes (all entries, or those for one chat URL). */
+export function noteAfmGenerationFailure(chatUrl?: string): void {
+  if (!chatUrl) {
+    generationProbeCache.clear();
+    return;
+  }
+  for (const key of [...generationProbeCache.keys()]) {
+    if (key.endsWith(`|${chatUrl}`)) generationProbeCache.delete(key);
+  }
+}
+
+function chatCompletionContent(data: unknown): string | undefined {
+  if (!data || typeof data !== "object") return undefined;
+  const choices = (data as { choices?: unknown }).choices;
+  if (!Array.isArray(choices) || choices.length === 0) return undefined;
+  const message = (choices[0] as { message?: unknown } | undefined)?.message;
+  if (!message || typeof message !== "object") return undefined;
+  const content = (message as { content?: unknown }).content;
+  return typeof content === "string" ? content : undefined;
+}
+
+async function runGenerationProbe(options: AfmGenerationProbeOptions, now: () => number): Promise<GenerationProbeEntry> {
+  const mode = options.mode ?? "bridge";
+  if (mode === "off") {
+    return { reachable: false, generationVerified: false, detail: "AFM mode is off", probedAt: now() };
+  }
+  if (options.health && !options.health.ok) {
+    return {
+      reachable: false,
+      generationVerified: false,
+      detail: safeError(options.health.error) ?? "AFM health unreachable",
+      probedAt: now(),
+    };
+  }
+  const chatUrl = options.chatUrl ?? AFM_PREPARE_TASK_URL;
+  const body = {
+    model: options.model ?? AFM_PREPARE_TASK_MODEL,
+    temperature: 0,
+    max_tokens: 1,
+    messages: [{ role: "user", content: "ok" }],
+  };
+  const payload = mode === "native" ? { payload: body } : body;
+  const result = await callAfmJson(chatUrl, payload, {
+    mode,
+    operation: "chat_completion",
+    timeoutMs: options.timeoutMs ?? GENERATION_PROBE_TIMEOUT_MS,
+    transport: options.transport,
+    nativeHelperPath: options.nativeHelperPath,
+  });
+  const content = chatCompletionContent(result.data);
+  const generationVerified = result.ok && (mode === "native" ? true : typeof content === "string");
+  const reachable =
+    result.ok || (typeof result.error === "string" && result.error.startsWith("HTTP ")) || options.health?.ok === true;
+  return {
+    reachable,
+    generationVerified,
+    detail: generationVerified
+      ? undefined
+      : safeError(result.error) ?? (result.ok ? "generation probe returned no completion content" : "generation probe failed"),
+    probedAt: now(),
+  };
+}
+
+function toProviderHealth(entry: GenerationProbeEntry, now: () => number): ProviderHealth {
+  return {
+    ok: entry.generationVerified,
+    reachable: entry.reachable,
+    generationVerified: entry.generationVerified,
+    probeAgeMs: Math.max(0, now() - entry.probedAt),
+    detail: entry.detail,
+  };
+}
+
+/**
+ * Verified AFM provider health with a ~5 min probe cache.
+ * - Fresh cache entry: served directly (SessionStart stays fast).
+ * - Stale entry: served stale while a background re-probe refreshes the cache
+ *   (stale-while-revalidate); failed live calls invalidate via
+ *   noteAfmGenerationFailure().
+ * - No entry: probes synchronously with a short timeout.
+ */
+export async function getAfmProviderHealth(options: AfmGenerationProbeOptions = {}): Promise<ProviderHealth> {
+  const now = options.now ?? Date.now;
+  const key = generationProbeKey(options);
+  const ttlMs = options.ttlMs ?? GENERATION_PROBE_TTL_MS;
+  const cached = generationProbeCache.get(key);
+  if (cached) {
+    const ageMs = Math.max(0, now() - cached.probedAt);
+    if (ageMs >= ttlMs && !generationProbeInFlight.has(key)) {
+      const refresh = runGenerationProbe(options, now)
+        .then((entry) => {
+          generationProbeCache.set(key, entry);
+          return entry;
+        })
+        .catch(() => cached)
+        .finally(() => {
+          generationProbeInFlight.delete(key);
+        });
+      generationProbeInFlight.set(key, refresh);
+    }
+    return toProviderHealth(cached, now);
+  }
+  let probe = generationProbeInFlight.get(key);
+  if (!probe) {
+    probe = runGenerationProbe(options, now)
+      .then((entry) => {
+        generationProbeCache.set(key, entry);
+        return entry;
+      })
+      .finally(() => {
+        generationProbeInFlight.delete(key);
+      });
+    generationProbeInFlight.set(key, probe);
+  }
+  const entry = await probe;
+  return toProviderHealth(entry, now);
 }
