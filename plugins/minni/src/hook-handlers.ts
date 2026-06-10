@@ -1,11 +1,12 @@
-// Shared hook HANDLERS (review panel, plan-parity follow-up): codex-hook.ts
-// and grok-hook.ts were ~360-line near-clones whose four handler bodies
-// differed ONLY in config constants. hook-utils.ts holds the protocol leaf
-// helpers; this module holds the stateful handler logic, parameterized by a
-// typed per-agent config, so future changes (evidence envelope format, plan
-// injection, inbox drain logic) have ONE maintenance surface instead of four.
-// hook.ts (claude-code) and kilocode-hook.ts diverge structurally and keep
-// their own handlers.
+// Shared hook HANDLERS (review panel, plan-parity follow-up): codex-hook.ts,
+// grok-hook.ts and kilocode-hook.ts were ~360-line near-clones whose four
+// handler bodies differed ONLY in config constants and a few flagged
+// behaviors. hook-utils.ts holds the protocol leaf helpers; this module holds
+// the stateful handler logic, parameterized by a typed per-agent config, so
+// future changes (evidence envelope format, plan injection, inbox drain
+// logic) have ONE maintenance surface instead of four. hook.ts (claude-code)
+// diverges structurally (PreCompact cannot inject context) and keeps its own
+// handlers.
 import {
   MEMORY_CONTRACT,
   envelopeBudgetFor,
@@ -51,21 +52,52 @@ export interface AgentHookConfig {
   defaultWorkspaceId: string;
   contextWindow: number;
   hooksEnabled: boolean;
-  /** identity.runtime AND the `node dist/cli.js read <runtime>` target. */
-  runtime: string;
-  /** Entry-point script name for the layer1 fallback command (e.g. "codex-hook.js"). */
-  hookScript: string;
+  /**
+   * identity.runtime AND the `node dist/cli.js read <runtime>` target.
+   * Required for the default "agent-context" boot identity; omit it (with
+   * `bootIdentity: "identity-recall"`) for agents without a daemon layer1
+   * channel (kilocode).
+   */
+  runtime?: string;
+  /**
+   * Entry-point script name for the layer1 fallback command (e.g.
+   * "codex-hook.js"). Required alongside `runtime` for "agent-context" boots.
+   */
+  hookScript?: string;
   /** Audit tool-name prefix (e.g. "hook_codex" -> hook_codex_session_start). */
   auditPrefix: string;
-  /** Inbox kind for the PreCompact handoff (e.g. "codex_precompact_handoff"). */
-  precompactKind: string;
+  /**
+   * Inbox kind for the PreCompact handoff (e.g. "codex_precompact_handoff").
+   * When omitted, PreCompact does NOT write an inbox handoff file (kilocode's
+   * behavior — its envelope carries the scar tissue directly).
+   */
+  precompactKind?: string;
+  /**
+   * How SessionStart sources boot identity:
+   * - "agent-context" (default; codex/grok): daemon readAgentContext layer1
+   *   read, surfaced as `layer1_source` + `fallback_commands` and prefixed to
+   *   the envelope as native layer1 text.
+   * - "identity-recall" (kilocode): identity-layer recallMemory, surfaced as
+   *   the envelope's `recall` body.
+   */
+  bootIdentity?: "agent-context" | "identity-recall";
+  /**
+   * Stop systemMessage call-to-action after "drafted to inbox (<path>).".
+   * Defaults to the MCP-tool phrasing; kilocode points at /minni:learn.
+   */
+  stopCommitHint?: string;
   /**
    * When true, Stop writes the inbox file + audit entry even with zero
    * candidates (codex's historical behavior); when false, an empty outcome
    * early-returns before any write so the inbox is never littered with empty
-   * files (grok's behavior).
+   * files (grok's and kilocode's behavior).
    */
   alwaysWriteStopInbox: boolean;
+}
+
+/** Test seam: lets behavioral tests drive the zero-candidate Stop branch. */
+export interface AgentHookDeps {
+  prepareOutcome?: typeof prepareOutcome;
 }
 
 export interface AgentHookHandlers {
@@ -76,9 +108,14 @@ export interface AgentHookHandlers {
   dispatch(event: string, payload: Record<string, unknown>): Promise<HookOutput>;
 }
 
-export function createHookHandlers(config: AgentHookConfig): AgentHookHandlers {
+export function createHookHandlers(
+  config: AgentHookConfig,
+  deps: AgentHookDeps = {},
+): AgentHookHandlers {
   const workspaceFor = (payload: Record<string, unknown>): string =>
     workspaceFromPayload(payload, config.defaultWorkspaceId);
+  const bootIdentity = config.bootIdentity ?? "agent-context";
+  const prepareOutcomeFn = deps.prepareOutcome ?? prepareOutcome;
 
   async function handleSessionStart(payload: Record<string, unknown>): Promise<HookOutput> {
     const sessionId = asString(payload.session_id) || asString(payload.sessionId) || "session";
@@ -88,10 +125,21 @@ export function createHookHandlers(config: AgentHookConfig): AgentHookHandlers {
     // TTL-reap stale file handoffs BEFORE the honest read so they neither occupy
     // the capped slice nor inflate totals; they surface once below as 'expired'.
     const expiredHandoffs = await expireStaleInboxHandoffs(config.vaultPath);
-    const [status, tail, identityRead, inboxStatus] = await Promise.all([
+    const [status, tail, identityRead, identityRecall, inboxStatus] = await Promise.all([
       buildStatusReport({ vaultPath: config.vaultPath }),
       auditTail(config.vaultPath, 5),
-      readAgentContext({ agentId: config.agentId, limit: 8 }),
+      bootIdentity === "agent-context"
+        ? readAgentContext({ agentId: config.agentId, limit: 8 })
+        : undefined,
+      bootIdentity === "identity-recall"
+        ? recallMemory({
+            query: `boot identity for ${workspaceId}`,
+            layer: "identity",
+            limit: 4,
+            agentId: config.agentId,
+            workspaceId,
+          })
+        : undefined,
       readInboxStatus(config.vaultPath, 3),
     ]);
     const pending = inboxStatus.entries;
@@ -115,7 +163,7 @@ export function createHookHandlers(config: AgentHookConfig): AgentHookHandlers {
         session_id: sessionId,
         daemon_ok: status.socket.ok,
         afm_ok: status.afm.ok,
-        runtime: config.runtime,
+        ...(config.runtime !== undefined ? { runtime: config.runtime } : {}),
       },
       pending_learnings: buildPendingLearningsSection(inboxStatus, expiredHandoffs),
       handoff_context: handoffContext.map((snippet) => ({
@@ -123,21 +171,36 @@ export function createHookHandlers(config: AgentHookConfig): AgentHookHandlers {
         path: snippet.relativePath,
         snippet: snippet.snippet,
       })),
-      layer1_source:
+      audit_tail: tail.entries.slice(-5).map((entry) => entry.split("\n")[0]),
+    };
+
+    if (identityRead !== undefined) {
+      envelopeBody.layer1_source =
         identityRead.ok && identityRead.data?.context
           ? {
               ok: true,
               agent_origin: identityRead.data.agent_id ?? config.agentId,
               backend: identityRead.data.backend,
             }
-          : { ok: false, error: identityRead.error },
-      fallback_commands: {
+          : { ok: false, error: identityRead.error };
+      envelopeBody.fallback_commands = {
         layer1: `node dist/${config.hookScript} SessionStart < /dev/null`,
         daemon_read: `node dist/cli.js read ${config.runtime}`,
         recall: "node dist/cli.js prepare '<task>'",
-      },
-      audit_tail: tail.entries.slice(-5).map((entry) => entry.split("\n")[0]),
-    };
+      };
+    }
+
+    if (identityRecall !== undefined) {
+      envelopeBody.recall =
+        identityRecall.ok && identityRecall.data
+          ? {
+              ok: true,
+              results: identityRecall.data.results,
+              agent_origin: identityRecall.data.agent_id ?? config.agentId,
+              layer: identityRecall.data.layer,
+            }
+          : { ok: false, error: identityRecall.error };
+    }
 
     if (activePlan !== undefined) {
       envelopeBody.active_plan = activePlan;
@@ -164,7 +227,7 @@ export function createHookHandlers(config: AgentHookConfig): AgentHookHandlers {
     });
 
     const nativeLayer1 =
-      identityRead.ok && identityRead.data?.context ? identityRead.data.context.trim() : "";
+      identityRead?.ok && identityRead.data?.context ? identityRead.data.context.trim() : "";
     return withHookContext("SessionStart", [nativeLayer1, envelope].filter(Boolean).join("\n\n"));
   }
 
@@ -257,15 +320,19 @@ export function createHookHandlers(config: AgentHookConfig): AgentHookHandlers {
     const workspaceId = workspaceFor(payload);
     const transcript = asString(payload.trigger) || asString(payload.summary);
 
-    const inbox = await writeInbox(config.vaultPath, sessionId, {
-      kind: config.precompactKind,
-      agent_id: config.agentId,
-      workspace_id: workspaceId,
-      scar_tissue: scarTissue,
-      audit_tail: tail.entries.slice(-10).map((entry) => entry.split("\n")[0]),
-      compaction_trigger: transcript || "compaction in progress",
-      durable_learning_committed: false,
-    });
+    // Agents WITH a precompactKind persist a durable inbox handoff; agents
+    // without one (kilocode) carry the scar tissue in the envelope only.
+    const inbox = config.precompactKind
+      ? await writeInbox(config.vaultPath, sessionId, {
+          kind: config.precompactKind,
+          agent_id: config.agentId,
+          workspace_id: workspaceId,
+          scar_tissue: scarTissue,
+          audit_tail: tail.entries.slice(-10).map((entry) => entry.split("\n")[0]),
+          compaction_trigger: transcript || "compaction in progress",
+          durable_learning_committed: false,
+        })
+      : undefined;
 
     const envelope = wrapEnvelope({
       event: "PreCompact",
@@ -279,8 +346,9 @@ export function createHookHandlers(config: AgentHookConfig): AgentHookHandlers {
         scar_tissue: scarTissue,
         audit_tail: tail.entries.slice(-10).map((entry) => entry.split("\n")[0]),
         compaction_trigger: transcript || "compaction in progress",
-        inbox_path: inbox.filePath,
-        durable_learning_committed: false,
+        ...(inbox
+          ? { inbox_path: inbox.filePath, durable_learning_committed: false }
+          : {}),
       },
     });
 
@@ -291,7 +359,7 @@ export function createHookHandlers(config: AgentHookConfig): AgentHookHandlers {
         scar_count: scarTissue.length,
         trigger: transcript || "auto",
         workspace: workspaceId,
-        inbox_path: inbox.filePath,
+        ...(inbox ? { inbox_path: inbox.filePath } : {}),
       },
     });
 
@@ -304,7 +372,7 @@ export function createHookHandlers(config: AgentHookConfig): AgentHookHandlers {
     const workspaceId = workspaceFor(payload);
     const lastTask = asString(payload.last_user_message) || asString(payload.summary) || sessionId;
     const tail = await auditTail(config.vaultPath, 30);
-    const outcome = await prepareOutcome({
+    const outcome = await prepareOutcomeFn({
       task: lastTask.slice(0, 200),
       summary: tail.entries.slice(-5).join("\n").slice(0, 600) || "session ended",
       profile: "compact",
@@ -348,7 +416,9 @@ export function createHookHandlers(config: AgentHookConfig): AgentHookHandlers {
       continue: true,
       systemMessage: `Minni: ${candidates.length} candidate learning${
         candidates.length === 1 ? "" : "s"
-      } drafted to inbox (${inbox.filePath}). Use minni_prepare_outcome/minni_learn to review and commit.`,
+      } drafted to inbox (${inbox.filePath}). ${
+        config.stopCommitHint ?? "Use minni_prepare_outcome/minni_learn to review and commit."
+      }`,
     };
   }
 

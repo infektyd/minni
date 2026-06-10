@@ -473,12 +473,14 @@ test("all four hooks build their SessionStart pending_learnings through the shar
   const srcDir = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "src");
   for (const hook of ["hook.ts", "codex-hook.ts", "grok-hook.ts", "kilocode-hook.ts"]) {
     let source = await readFile(path.join(srcDir, hook), "utf8");
-    if (source.includes("runHookMain(")) {
-      // codex/grok delegate their handler bodies to the shared factory
-      // (hook-handlers.ts); pin the shared module instead, plus the delegation.
+    if (hook !== "hook.ts") {
+      // codex/grok/kilocode MUST delegate their handler bodies to the shared
+      // factory (hook-handlers.ts) — pinning the factory only counts as
+      // pinning the hook's LIVE code path while the delegation holds, so a
+      // quiet revert to a standalone near-clone fails here, not silently.
       assert.ok(
-        source.includes('from "./hook-handlers.js"'),
-        `${hook} must delegate to the shared hook-handlers factory`,
+        source.includes("runHookMain(") && source.includes('from "./hook-handlers.js"'),
+        `${hook} must delegate to the shared hook-handlers factory (runHookMain)`,
       );
       source = await readFile(path.join(srcDir, "hook-handlers.ts"), "utf8");
     }
@@ -629,8 +631,13 @@ test("all four hooks inject the active plan through the shared plan helpers (C5 
   const srcDir = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "src");
   for (const hook of ["hook.ts", "codex-hook.ts", "grok-hook.ts", "kilocode-hook.ts"]) {
     let source = await readFile(path.join(srcDir, hook), "utf8");
-    if (source.includes("runHookMain(")) {
-      // codex/grok delegate to the shared factory; pin the shared module.
+    if (hook !== "hook.ts") {
+      // codex/grok/kilocode MUST delegate to the shared factory; pin the
+      // delegation, then the shared module (the hook's live code path).
+      assert.ok(
+        source.includes("runHookMain(") && source.includes('from "./hook-handlers.js"'),
+        `${hook} must delegate to the shared hook-handlers factory (runHookMain)`,
+      );
       source = await readFile(path.join(srcDir, "hook-handlers.ts"), "utf8");
     }
     assert.ok(

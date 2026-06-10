@@ -10,12 +10,14 @@
 // refusal). The live ~/.minni is never read or written.
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
+
+import { createHookHandlers } from "../dist/hook-handlers.js";
 
 const execFileAsync = promisify(execFile);
 const PLUGIN_ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -33,24 +35,34 @@ function dashedName(epochMs, slug) {
   return `${day}-${epochMs.toString(36)}-${slug}.json`;
 }
 
-async function runSessionStart(fixture) {
+async function runHook(hookJs, event, fixture, extraEnv, payload) {
   const env = {
     ...process.env,
-    MINNI_CLAUDECODE_VAULT_PATH: fixture.vault,
-    MINNI_CLAUDECODE_HOOKS: "on",
     MINNI_HOME: fixture.home,
     MINNI_SOCKET_PATH: path.join(fixture.home, "missing.sock"),
     MINNI_AFM_HEALTH_URL: "http://127.0.0.1:1/health",
     MINNI_BYPASS_AUDIT_LIMIT: "true",
+    ...extraEnv,
   };
-  const child = execFileAsync(process.execPath, [HOOK_JS, "SessionStart"], {
+  const child = execFileAsync(process.execPath, [hookJs, event], {
     env,
     timeout: 30_000,
   });
-  child.child.stdin.end(JSON.stringify({ session_id: "fixture-session" }));
+  child.child.stdin.end(JSON.stringify(payload));
   const { stdout } = await child;
   const output = JSON.parse(stdout.trim().split("\n").pop());
   assert.equal(output.continue, true);
+  return output;
+}
+
+async function runSessionStart(fixture) {
+  const output = await runHook(
+    HOOK_JS,
+    "SessionStart",
+    fixture,
+    { MINNI_CLAUDECODE_VAULT_PATH: fixture.vault, MINNI_CLAUDECODE_HOOKS: "on" },
+    { session_id: "fixture-session" },
+  );
   const context = output.hookSpecificOutput?.additionalContext ?? "";
   const body = context.match(/<minni:context [^>]*>\n([\s\S]*?)\n<\/minni:context>/)?.[1];
   assert.ok(body, "SessionStart must emit a minni:context envelope");
@@ -137,6 +149,170 @@ test("SessionStart hook: resolved/archived candidates stay out of pending_learni
     const archiveNames = await readdir(archive);
     assert.equal(liveNames.length, 1);
     assert.equal(archiveNames.length, 2);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+// ── Stop-path parity (review panel): grok/codex/kilocode through the shared ──
+// factory. Subprocess proof per agent that a real `node dist/<agent>-hook.js
+// Stop` writes ONE inbox file carrying the canonical stop_candidates kind and
+// the agent_id/workspace_id stamps the cleanup/ingest tooling keys on.
+
+const STOP_AGENTS = [
+  {
+    name: "grok",
+    hookJs: "grok-hook.js",
+    agentId: "grok-build",
+    env: (vault) => ({ MINNI_GROK_VAULT_PATH: vault, MINNI_GROK_HOOKS: "on" }),
+  },
+  {
+    name: "codex",
+    hookJs: "codex-hook.js",
+    agentId: "codex",
+    env: (vault) => ({ MINNI_VAULT_PATH: vault, MINNI_CODEX_HOOKS: "on" }),
+  },
+  {
+    name: "kilocode",
+    hookJs: "kilocode-hook.js",
+    agentId: "kilocode",
+    env: (vault) => ({ MINNI_KILOCODE_VAULT_PATH: vault, MINNI_KILOCODE_HOOKS: "on" }),
+  },
+];
+
+for (const agent of STOP_AGENTS) {
+  test(`Stop hook (${agent.name}): drafts ONE stop_candidates inbox file with identity stamps`, { timeout: 120_000 }, async () => {
+    const root = await mkdtemp(path.join(tmpdir(), `sm-hook-stop-${agent.name}-`));
+    const fixture = { vault: path.join(root, "vault"), home: path.join(root, "home") };
+    try {
+      await mkdir(fixture.home, { recursive: true });
+      const output = await runHook(
+        path.join(PLUGIN_ROOT, "dist", agent.hookJs),
+        "Stop",
+        fixture,
+        agent.env(fixture.vault),
+        {
+          session_id: "stop-fixture",
+          last_user_message: "fixture stop task",
+          workspace_id: "fixture-workspace",
+        },
+      );
+      assert.match(output.systemMessage ?? "", /drafted to inbox/);
+
+      const names = (await readdir(path.join(fixture.vault, "inbox"))).filter((n) =>
+        n.endsWith(".json"),
+      );
+      assert.equal(names.length, 1, `${agent.name} Stop must write exactly one inbox file`);
+      const body = JSON.parse(
+        await readFile(path.join(fixture.vault, "inbox", names[0]), "utf8"),
+      );
+      assert.equal(body.kind, "stop_candidates", "canonical kind the ingest/cleanup tooling keys on");
+      assert.equal(body.agent_id, agent.agentId);
+      assert.equal(body.workspace_id, "fixture-workspace");
+      assert.ok(Array.isArray(body.candidates) && body.candidates.length > 0);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+}
+
+// The deterministic outcome draft always yields one candidate, so the
+// zero-candidate branch is driven through the factory's test seam: an
+// injected prepareOutcome returning an empty draft.
+function emptyOutcomeStub() {
+  return async () => ({
+    outcomeDraft: { learnCandidates: [], logOnly: [], expires: [], doNotStore: [] },
+  });
+}
+
+function stopConfig(vaultPath, alwaysWriteStopInbox) {
+  return {
+    agentId: alwaysWriteStopInbox ? "codex" : "grok-build",
+    vaultPath,
+    defaultWorkspaceId: "fixture-workspace",
+    contextWindow: 200_000,
+    hooksEnabled: true,
+    auditPrefix: "hook_test",
+    alwaysWriteStopInbox,
+  };
+}
+
+test("Stop divergence: empty candidates skip the inbox write unless alwaysWriteStopInbox", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-hook-stop-empty-"));
+  const savedHome = process.env.MINNI_HOME;
+  const savedBypass = process.env.MINNI_BYPASS_AUDIT_LIMIT;
+  process.env.MINNI_HOME = path.join(root, "home");
+  process.env.MINNI_BYPASS_AUDIT_LIMIT = "true";
+  try {
+    // grok/kilocode behavior (alwaysWriteStopInbox: false): an empty outcome
+    // never litters the inbox with a zero-candidate file.
+    const grokVault = path.join(root, "grok-vault");
+    const grokHandlers = createHookHandlers(stopConfig(grokVault, false), {
+      prepareOutcome: emptyOutcomeStub(),
+    });
+    const grokOut = await grokHandlers.handleStop({ session_id: "empty-stop" });
+    assert.equal(grokOut.continue, true);
+    assert.equal(grokOut.systemMessage, undefined);
+    const grokNames = (await readdir(path.join(grokVault, "inbox"))).filter((n) =>
+      n.endsWith(".json"),
+    );
+    assert.deepEqual(grokNames, [], "empty outcome must not write an inbox file");
+
+    // codex historical behavior (alwaysWriteStopInbox: true): the file IS
+    // written — and still carries the canonical kind + identity stamps.
+    const codexVault = path.join(root, "codex-vault");
+    const codexHandlers = createHookHandlers(stopConfig(codexVault, true), {
+      prepareOutcome: emptyOutcomeStub(),
+    });
+    const codexOut = await codexHandlers.handleStop({ session_id: "empty-stop" });
+    assert.equal(codexOut.continue, true);
+    assert.equal(codexOut.systemMessage, undefined, "no candidates => no call-to-action");
+    const codexNames = (await readdir(path.join(codexVault, "inbox"))).filter((n) =>
+      n.endsWith(".json"),
+    );
+    assert.equal(codexNames.length, 1);
+    const body = JSON.parse(
+      await readFile(path.join(codexVault, "inbox", codexNames[0]), "utf8"),
+    );
+    assert.equal(body.kind, "stop_candidates");
+    assert.equal(body.agent_id, "codex");
+    assert.equal(body.workspace_id, "fixture-workspace");
+    assert.deepEqual(body.candidates, []);
+  } finally {
+    if (savedHome === undefined) delete process.env.MINNI_HOME;
+    else process.env.MINNI_HOME = savedHome;
+    if (savedBypass === undefined) delete process.env.MINNI_BYPASS_AUDIT_LIMIT;
+    else process.env.MINNI_BYPASS_AUDIT_LIMIT = savedBypass;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+// ── kilocode migration proof: factory SessionStart in identity-recall mode ───
+
+test("SessionStart hook (kilocode): identity-recall envelope keeps recall + pending_learnings, no layer1 fallbacks", { timeout: 120_000 }, async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-hook-kilo-boot-"));
+  const fixture = { vault: path.join(root, "kilocode-vault"), home: path.join(root, "home") };
+  try {
+    await mkdir(fixture.home, { recursive: true });
+    const output = await runHook(
+      path.join(PLUGIN_ROOT, "dist", "kilocode-hook.js"),
+      "SessionStart",
+      fixture,
+      { MINNI_KILOCODE_VAULT_PATH: fixture.vault, MINNI_KILOCODE_HOOKS: "on" },
+      { session_id: "kilo-boot" },
+    );
+    const context = output.hookSpecificOutput?.additionalContext ?? "";
+    const raw = context.match(/<minni:context [^>]*>\n([\s\S]*?)\n<\/minni:context>/)?.[1];
+    assert.ok(raw, "kilocode SessionStart must emit a minni:context envelope");
+    const body = JSON.parse(raw);
+    assert.equal(body.identity.agent, "kilocode");
+    assert.ok(body.pending_learnings, "shared pending_learnings builder still runs");
+    // identity-recall boot: recall is present (structured failure with no
+    // daemon socket), while the agent-context-only fields stay absent.
+    assert.ok(body.recall, "identity-recall boot surfaces a recall body");
+    assert.equal(body.layer1_source, undefined);
+    assert.equal(body.fallback_commands, undefined);
+    assert.equal(body.identity.runtime, undefined);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
