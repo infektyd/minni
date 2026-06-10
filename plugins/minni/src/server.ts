@@ -1115,16 +1115,24 @@ server.registerTool(
   {
     title: "Minni Plan Scar",
     description:
-      "Record a dead-end, failed command, or rejected hypothesis during plan execution to prevent retries.",
+      "Record a dead-end, failed command, or rejected hypothesis during plan execution to prevent retries. plan_id defaults to the active plan.",
     inputSchema: {
-      plan_id: z.string().min(1),
+      plan_id: z.string().min(1).optional(),
       kind: z.enum(["failed_command", "dead_end", "rejected_hypothesis"]),
       signal: z.string().min(1),
       resolution: z.string().optional(),
     },
   },
-  async ({ plan_id, kind, signal, resolution }) => {
+  async ({ plan_id: planIdInput, kind, signal, resolution }) => {
     const effectiveVaultPath = DEFAULT_VAULT_PATH;
+    // C5/plan-N3 follow-up (review panel): scar joins its peers in id-less
+    // addressing — recording a dead-end against "the active plan" must not
+    // require a minni_plan_status round-trip to fetch the id.
+    const resolved = await resolvePlanIdOrActive(effectiveVaultPath, planIdInput);
+    if ("error" in resolved) {
+      return textResult(JSON.stringify({ error: resolved.error }, null, 2));
+    }
+    const plan_id = resolved.plan_id;
     const notePath = await findPlanNote(effectiveVaultPath, plan_id);
     if (!notePath) {
       return textResult(JSON.stringify({ error: `plan not found: ${plan_id}` }, null, 2));

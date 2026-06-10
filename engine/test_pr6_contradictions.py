@@ -691,7 +691,7 @@ class TestHandleResolveContradiction:
                 c.execute("""
                     INSERT INTO learnings (agent_id, category, content, confidence,
                                            created_at, status)
-                    VALUES ('a', 'fact', ?, 1.0, ?, 'active')
+                    VALUES ('test', 'fact', ?, 1.0, ?, 'active')
                 """, (f"old learning {i}", now))
                 old_ids.append(c.lastrowid)
 
@@ -746,7 +746,7 @@ class TestHandleResolveContradiction:
         with db_obj.cursor() as c:
             c.execute("""
                 INSERT INTO learnings (agent_id, category, content, confidence, created_at, status)
-                VALUES ('a', 'fact', 'old learning', 1.0, ?, 'active')
+                VALUES ('test', 'fact', 'old learning', 1.0, ?, 'active')
             """, (now,))
             old_id = c.lastrowid
             c.execute("""

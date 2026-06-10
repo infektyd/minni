@@ -472,7 +472,16 @@ test("all four hooks build their SessionStart pending_learnings through the shar
   // pending.map(...) or skip the pre-reap while every test stays green.
   const srcDir = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "src");
   for (const hook of ["hook.ts", "codex-hook.ts", "grok-hook.ts", "kilocode-hook.ts"]) {
-    const source = await readFile(path.join(srcDir, hook), "utf8");
+    let source = await readFile(path.join(srcDir, hook), "utf8");
+    if (source.includes("runHookMain(")) {
+      // codex/grok delegate their handler bodies to the shared factory
+      // (hook-handlers.ts); pin the shared module instead, plus the delegation.
+      assert.ok(
+        source.includes('from "./hook-handlers.js"'),
+        `${hook} must delegate to the shared hook-handlers factory`,
+      );
+      source = await readFile(path.join(srcDir, "hook-handlers.ts"), "utf8");
+    }
     for (const call of [
       "buildPendingLearningsSection(",
       "expireStaleInboxHandoffs(",
@@ -619,7 +628,11 @@ test("expireStaleInboxHandoffs reads the env TTL at call time (C8 behavioral)", 
 test("all four hooks inject the active plan through the shared plan helpers (C5 hook-drift pin)", async () => {
   const srcDir = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "src");
   for (const hook of ["hook.ts", "codex-hook.ts", "grok-hook.ts", "kilocode-hook.ts"]) {
-    const source = await readFile(path.join(srcDir, hook), "utf8");
+    let source = await readFile(path.join(srcDir, hook), "utf8");
+    if (source.includes("runHookMain(")) {
+      // codex/grok delegate to the shared factory; pin the shared module.
+      source = await readFile(path.join(srcDir, "hook-handlers.ts"), "utf8");
+    }
     assert.ok(
       source.includes("resolveActivePlanView("),
       `${hook} must resolve the active plan`,

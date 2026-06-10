@@ -1792,6 +1792,11 @@ def _handle_resolve_contradiction(params: dict, request_id: Any) -> dict:
     supersede_ids = params.get("supersede_ids", [])
     if not isinstance(supersede_ids, list):
         return _make_error(-32602, "supersede_ids must be a list", request_id)
+    # Validate element types BEFORE any SQL binding: a None/float/dict element
+    # would otherwise raise an InterfaceError inside the transaction and leak
+    # internal exception text via the -32000 catch-all below.
+    if not all(isinstance(sid, int) and not isinstance(sid, bool) for sid in supersede_ids):
+        return _make_error(-32602, "supersede_ids must be a list of integers", request_id)
 
     # G11: EffectivePrincipal is the single server-stamped source (never trust caller)
     supplied = params.get("agent_id")
@@ -1833,6 +1838,32 @@ def _handle_resolve_contradiction(params: dict, request_id: Any) -> dict:
 
         # Single transaction: write new + supersede old
         with wb.db.transaction() as c:
+            # A3 authz (mirrors _resolve_candidate's owner check at the same
+            # trust boundary): a caller may only supersede learnings it OWNS;
+            # cross-principal supersession requires an EXPLICITLY allowed
+            # operator. Validated BEFORE the INSERT so an early error return
+            # (which commits the transaction on clean exit) cannot leave an
+            # orphan new learning behind.
+            for sid in supersede_ids:
+                c.execute(
+                    "SELECT agent_id FROM learnings WHERE learning_id = ?",
+                    (sid,),
+                )
+                srow = c.fetchone()
+                if not srow:
+                    return _make_error(
+                        -32001, f"learning_not_found: {sid}", request_id
+                    )
+                owner = str(srow["agent_id"] or "")
+                if owner != agent_id and not _explicitly_allowed_operator(principal):
+                    return _make_error(
+                        -32004,
+                        f"principal_mismatch: learning #{sid} is owned by '{owner}'; "
+                        f"caller principal '{agent_id}' may only supersede its own "
+                        "learnings (cross-principal supersession requires an "
+                        "explicitly allowed operator)",
+                        request_id,
+                    )
             c.execute("""
                 INSERT INTO learnings
                 (agent_id, category, content, source_doc_ids, source_query,

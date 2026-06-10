@@ -334,6 +334,43 @@ def test_cross_vault_same_filename_archives_only_matching_copy(tmp_path, monkeyp
     assert not (inbox_b / ".archive").exists()
 
 
+def test_cross_vault_live_sibling_does_not_block_other_vaults_copy(tmp_path, monkeypatch):
+    """Review panel: a live sibling in vault A's copy must `continue` to the
+    next inbox, not abort the whole loop — vault B's same-named copy (all of
+    its matched rows terminal) still archives."""
+    import afm_passes.inbox_archive as archive_mod
+    from afm_passes.inbox_archive import maybe_archive_for_candidate
+    from afm_passes.inbox_ingest import ingest
+
+    db_obj, cfg = _make_db(tmp_path)
+    inbox_a = tmp_path / "codex-vault" / "inbox"
+    inbox_b = tmp_path / "grok-vault" / "inbox"
+    # Vault A: two candidates -> one stays live (proposed) after resolution.
+    _write_inbox_file(inbox_a, "same.json", _stop_doc(["codex lesson one", "codex lesson two"]))
+    # Vault B: different content (different fingerprints), same filename.
+    _write_inbox_file(
+        inbox_b, "same.json",
+        _stop_doc(["grok lesson, fully resolved"], agent_id="grok"),
+    )
+    # Separate ingest runs: idempotency within one run is name-keyed across
+    # principals, which would skip vault B's same-named file.
+    assert ingest(db_obj, cfg, inboxes=[inbox_a], dry_run=False)["inserted"] == 2
+    assert ingest(db_obj, cfg, inboxes=[inbox_b], dry_run=False)["inserted"] == 1
+    # Vault B's rows go terminal; vault A keeps BOTH rows live ('proposed').
+    _set_status(db_obj, "accepted", principal="grok")
+    (cid_b,) = _candidate_ids(db_obj, principal="grok")
+
+    # Pin enumeration order: the LIVE-sibling vault is visited FIRST, so the
+    # buggy `return None` would abort before vault B is ever checked.
+    monkeypatch.setattr(archive_mod, "discover_inboxes", lambda _cfg: [inbox_a, inbox_b])
+
+    archived = maybe_archive_for_candidate(db_obj, cfg, cid_b)
+    assert archived == str(inbox_b / ".archive" / "same.json")
+    assert not (inbox_b / "same.json").exists()
+    assert (inbox_a / "same.json").is_file(), "live-sibling vault's copy must stay"
+    assert not (inbox_a / ".archive").exists()
+
+
 def _patched_writeback(monkeypatch, db_obj, cfg):
     import types
 

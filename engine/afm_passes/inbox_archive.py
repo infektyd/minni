@@ -247,7 +247,8 @@ def maybe_archive_for_candidate(db, config, candidate_id: int) -> Optional[str]:
         if matched is None:
             continue
         if any(r["status"] not in TERMINAL_STATUSES for r in matched):
-            return None  # a sibling candidate from this file is still live
+            continue  # a sibling candidate from THIS copy is still live; other
+            # inboxes may hold a same-named file whose rows are all terminal
         archived = archive_inbox_file(source)
         if archived:
             logger.info(

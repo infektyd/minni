@@ -250,6 +250,35 @@ test("active plan pointer management and resolution", async () => {
   }
 });
 
+test("getActivePlan discards a tampered pointer whose notePath escapes the vault", async () => {
+  const { activePointerPath } = await import("../dist/plan.js");
+  const root = await mkdtemp(path.join(tmpdir(), "sm-plan-tamper-"));
+  try {
+    await ensureVault(root);
+    await mkdir(path.dirname(activePointerPath(root)), { recursive: true });
+    for (const evil of ["../../outside.md", "/etc/passwd", `${root}/../outside.md`]) {
+      await writeFile(
+        activePointerPath(root),
+        JSON.stringify({ plan_id: "plan-x", notePath: evil, set_at: new Date().toISOString() }),
+        "utf8",
+      );
+      assert.equal(await getActivePlan(root), undefined, `tampered notePath must be discarded: ${evil}`);
+      assert.equal(await resolveActivePlanView(root), undefined, evil);
+    }
+    // A legitimate in-vault pointer still resolves (the guard is not over-broad).
+    const { plan, write } = await createPlan(
+      { goal: "Containment guard sanity", vaultPath: root },
+      { vaultPath: root },
+    );
+    await setActivePlan(root, plan.plan_id, write.notePath);
+    const active = await getActivePlan(root);
+    assert.ok(active);
+    assert.equal(active.plan_id, plan.plan_id);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("addScar pure function and compactPlanView scars surfacing", () => {
   const plan = {
     plan_id: "test-plan",
@@ -458,10 +487,11 @@ test("minni_plan_status/_update/_history accept an OPTIONAL plan_id (C5 schema p
   // The acceptance spec requires the id-less form VERBATIM on these three
   // tools; pin the schemas so a refactor cannot quietly re-require plan_id.
   const source = await readFile(new URL("../src/server.ts", import.meta.url), "utf8");
-  // minni_plan_replan is beyond the verbatim spec but pinned too (review
-  // panel): a hookless agent must be able to replan "the active plan" without
-  // round-tripping the id through minni_plan_status.
-  for (const tool of ["minni_plan_status", "minni_plan_update", "minni_plan_history", "minni_plan_replan"]) {
+  // minni_plan_replan and minni_plan_scar are beyond the verbatim spec but
+  // pinned too (review panel): a hookless agent must be able to replan or
+  // record a dead-end against "the active plan" without round-tripping the id
+  // through minni_plan_status.
+  for (const tool of ["minni_plan_status", "minni_plan_update", "minni_plan_history", "minni_plan_replan", "minni_plan_scar"]) {
     const start = source.indexOf(`"${tool}"`);
     assert.ok(start >= 0, `${tool} must be registered`);
     const block = source.slice(start, source.indexOf("server.registerTool", start + 1));
@@ -478,10 +508,11 @@ test("minni_plan_status/_update/_history accept an OPTIONAL plan_id (C5 schema p
   }
 });
 
-test("minni_plan_status returns the no-active-plan error end-to-end through the MCP server", async (t) => {
+test("every id-less plan tool returns the no-active-plan error end-to-end through the MCP server", async (t) => {
   // Review panel: the C5 schema pin is a text scan; this drives the REAL
-  // registered handler over MCP stdio and asserts the user-visible error JSON
-  // when plan_id is omitted and no plan is active. Fixture vault only — every
+  // registered handlers over MCP stdio and asserts the user-visible error JSON
+  // when plan_id is omitted and no plan is active — the highest-risk
+  // regression path for id-less addressing. Fixture vault only — every
   // vault env var is pointed at a tmpdir so live ~/.minni state is untouched.
   const { spawn } = await import("node:child_process");
   const root = await mkdtemp(path.join(tmpdir(), "sm-plan-mcp-"));
@@ -544,18 +575,31 @@ test("minni_plan_status returns the no-active-plan error end-to-end through the 
     assert.ok(init.result, JSON.stringify(init));
     send({ jsonrpc: "2.0", method: "notifications/initialized" });
 
-    send({
-      jsonrpc: "2.0",
-      id: 2,
-      method: "tools/call",
-      params: { name: "minni_plan_status", arguments: {} },
-    });
-    const reply = await awaitResponse(2);
-    assert.ok(reply.result, JSON.stringify(reply));
-    const body = JSON.parse(reply.result.content[0].text);
-    assert.ok(body.error, JSON.stringify(body));
-    assert.match(body.error, /no plan_id provided and no active plan/);
-    assert.match(body.error, /minni_plan_activate/);
+    // Each tool called WITHOUT plan_id (other required args supplied so zod
+    // validation passes and the handler's resolvePlanIdOrActive path runs).
+    const calls = [
+      ["minni_plan_status", {}],
+      ["minni_plan_update", { slice_id: "slice-1", status: "in_progress" }],
+      ["minni_plan_history", {}],
+      ["minni_plan_replan", { new_slices: [] }],
+      ["minni_plan_scar", { kind: "dead_end", signal: "tried the obvious thing" }],
+    ];
+    let id = 2;
+    for (const [name, args] of calls) {
+      send({
+        jsonrpc: "2.0",
+        id,
+        method: "tools/call",
+        params: { name, arguments: args },
+      });
+      const reply = await awaitResponse(id);
+      assert.ok(reply.result, `${name}: ${JSON.stringify(reply)}`);
+      const body = JSON.parse(reply.result.content[0].text);
+      assert.ok(body.error, `${name}: ${JSON.stringify(body)}`);
+      assert.match(body.error, /no plan_id provided and no active plan/, name);
+      assert.match(body.error, /minni_plan_activate/, name);
+      id += 1;
+    }
   } finally {
     child.kill("SIGKILL");
     await rm(root, { recursive: true, force: true });

@@ -384,7 +384,11 @@ function enhancedSourceFromVault(result: VaultSearchResult, budget: BudgetPolicy
   const authority = authorityForSource(result);
   const freshness = freshnessForSource(result);
   const privacy = privacyForSource(result);
-  if (privacy.privacyLevel === "blocked") return undefined;
+  // SEC-006 hard gate: 'gate on it' means EXCLUSION from model-facing context,
+  // not score demotion. Only 'safe' notes may enter relevantSources (and thus
+  // contextMarkdown); private/local-only/blocked are filtered here, the same
+  // levels sourceAllowedForAfm rejects on the AFM path.
+  if (privacy.privacyLevel !== "safe") return undefined;
   const authorityScore = authorityPoints(authority);
   const reasons = ["lexical match"];
   if (authority === "schema") reasons.push("hard constraint");

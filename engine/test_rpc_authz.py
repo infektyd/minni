@@ -341,3 +341,120 @@ def test_resolve_candidate_owner_resolution_drains_inbox_exactly_once(monkeypatc
     assert again.get("error", {}).get("code") == -32009, again
     archived = sorted(p.name for p in (inbox / ".archive").iterdir())
     assert archived == ["authz-drain.json"], archived
+
+
+# ── resolve_contradiction: owner or explicitly allowed operator ──────────────
+# (Review panel: same cross-principal mutation class as resolve_candidate —
+# any agent could supersede another principal's learnings by integer id.)
+
+def _patch_wb(monkeypatch, tmp_path):
+    """resolve_contradiction needs the fuller writeback surface (model,
+    config.writeback_enabled) on top of _patch_db's db handle."""
+    db_obj = _patch_db(monkeypatch, tmp_path)
+    wb = types.SimpleNamespace(
+        db=db_obj,
+        model=None,
+        config=types.SimpleNamespace(writeback_enabled=False),
+    )
+    monkeypatch.setattr(minnid, "_lazy_writeback", lambda: wb)
+    return db_obj
+
+
+def _insert_learning(db_obj, agent_id, content):
+    import time as _time
+    with db_obj.cursor() as c:
+        c.execute(
+            """INSERT INTO learnings (agent_id, category, content, created_at, status)
+               VALUES (?, 'general', ?, ?, 'active')""",
+            (agent_id, content, _time.time()),
+        )
+        return c.lastrowid
+
+
+def _learning_row(tmp_path, lid):
+    conn = sqlite3.connect(tmp_path / "authz.db")
+    conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        "SELECT status, superseded_by FROM learnings WHERE learning_id=?", (lid,)
+    ).fetchone()
+    count = conn.execute("SELECT COUNT(*) FROM learnings").fetchone()[0]
+    conn.close()
+    return row, count
+
+
+def test_resolve_contradiction_cross_principal_rejected(monkeypatch, tmp_path):
+    """A non-operator 'grok' principal may NOT supersede codex's learning, and
+    the rejection leaves NO orphan new-learning row behind."""
+    db_obj = _patch_wb(monkeypatch, tmp_path)
+    monkeypatch.delenv("MINNI_RESOLVE_OPERATORS", raising=False)
+    lid = _insert_learning(db_obj, "codex", "a fact codex owns")
+
+    _stamp_principal(monkeypatch, "grok", capabilities=["*"])
+    resp = minnid._handle_resolve_contradiction(
+        {"new_content": "grok rewrites history", "supersede_ids": [lid]}, 2
+    )
+    err = resp.get("error", {})
+    assert err.get("code") == -32004, resp
+    assert "principal_mismatch" in err.get("message", "")
+    assert "'codex'" in err.get("message", "")
+    row, count = _learning_row(tmp_path, lid)
+    assert row["status"] == "active" and row["superseded_by"] is None
+    assert count == 1, "rejected resolution must not leave an orphan new learning"
+
+
+def test_resolve_contradiction_owner_succeeds(monkeypatch, tmp_path):
+    db_obj = _patch_wb(monkeypatch, tmp_path)
+    monkeypatch.delenv("MINNI_RESOLVE_OPERATORS", raising=False)
+    lid = _insert_learning(db_obj, "codex", "an outdated codex fact")
+
+    _stamp_principal(monkeypatch, "codex", capabilities=["read"])
+    resp = minnid._handle_resolve_contradiction(
+        {"new_content": "the corrected codex fact", "supersede_ids": [lid]}, 3
+    )
+    assert resp.get("result", {}).get("status") == "ok", resp
+    assert resp["result"]["superseded"] == [lid]
+    row, count = _learning_row(tmp_path, lid)
+    assert row["status"] == "superseded"
+    assert row["superseded_by"] == resp["result"]["new_learning_id"]
+    assert count == 2
+
+
+def test_resolve_contradiction_explicit_operator_allows_cross(monkeypatch, tmp_path):
+    db_obj = _patch_wb(monkeypatch, tmp_path)
+    monkeypatch.delenv("MINNI_RESOLVE_OPERATORS", raising=False)
+    lid = _insert_learning(db_obj, "codex", "operator-superseded fact")
+
+    _stamp_principal(monkeypatch, "main", capabilities=["*", "govern"])
+    resp = minnid._handle_resolve_contradiction(
+        {"new_content": "operator resolution", "supersede_ids": [lid]}, 4
+    )
+    assert resp.get("result", {}).get("status") == "ok", resp
+
+
+def test_resolve_contradiction_missing_learning_rejected(monkeypatch, tmp_path):
+    _patch_wb(monkeypatch, tmp_path)
+    _stamp_principal(monkeypatch, "codex", capabilities=["*"])
+    resp = minnid._handle_resolve_contradiction(
+        {"new_content": "supersedes nothing", "supersede_ids": [9999]}, 5
+    )
+    err = resp.get("error", {})
+    assert err.get("code") == -32001, resp
+    assert "learning_not_found" in err.get("message", "")
+
+
+def test_resolve_contradiction_non_integer_ids_rejected_without_leak(monkeypatch, tmp_path):
+    """Non-int elements are rejected up front with -32602 — never bound into
+    SQL where an InterfaceError would leak internals via the -32000 catch-all."""
+    db_obj = _patch_wb(monkeypatch, tmp_path)
+    lid = _insert_learning(db_obj, "codex", "typed-id guard fixture")
+    _stamp_principal(monkeypatch, "codex", capabilities=["*"])
+    for bad in ([None], ["1"], [1.5], [{"id": 1}], [True], [lid, None]):
+        resp = minnid._handle_resolve_contradiction(
+            {"new_content": "typed ids only", "supersede_ids": bad}, 6
+        )
+        err = resp.get("error", {})
+        assert err.get("code") == -32602, (bad, resp)
+        assert "list of integers" in err.get("message", ""), (bad, resp)
+        assert "InterfaceError" not in err.get("message", "")
+    row, _ = _learning_row(tmp_path, lid)
+    assert row["status"] == "active"

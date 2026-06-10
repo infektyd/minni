@@ -112,7 +112,7 @@ test("evidence envelope escapes backticks like the daemon does", async () => {
 
 // ── SEC-006: frontmatter-derived privacy gating ─────────────────────────────
 
-test("a note authored privacy:private is gated private even with innocuous text", async () => {
+test("a note authored privacy:private never reaches the packet, even with innocuous text", async () => {
   const packet = await prepareTask(
     { task: "review backend handoff status", vaultPath: "/tmp/vault" },
     {
@@ -123,17 +123,25 @@ test("a note authored privacy:private is gated private even with innocuous text"
       ],
     },
   );
-  const source = packet.relevantSources[0];
-  assert.equal(source.privacyLevel, "private");
-  assert.ok(source.reasons.includes("frontmatter privacy: private"), source.reasons.join(", "));
-  assert.equal(source.scoreBreakdown.privacy, -20);
+  // Hard gate: 'private' is EXCLUDED from model-facing context (relevantSources
+  // and contextMarkdown), not merely score-demoted.
+  assert.deepEqual(packet.relevantSources, []);
+  assert.ok(!packet.contextMarkdown.includes("backend rollout"), packet.contextMarkdown);
+  assert.ok(!packet.brief.includes("backend rollout"), packet.brief);
+});
 
-  // ...and the AFM payload (safe-only) excludes it.
-  const afmPayload = buildAfmChatPayload({
-    task: "review backend handoff status",
-    relevantSources: packet.relevantSources,
-  });
-  assert.ok(!afmPayload.messages[0].content.includes("backend rollout"));
+test("a note authored privacy:local-only never reaches the packet either", async () => {
+  const packet = await prepareTask(
+    { task: "review backend handoff status", vaultPath: "/tmp/vault" },
+    {
+      ...NOOP_DEPS,
+      searchVault: async () => [
+        vaultResult({ privacy: "local-only", snippet: "Notes about the backend rollout." }),
+      ],
+    },
+  );
+  assert.deepEqual(packet.relevantSources, []);
+  assert.ok(!packet.contextMarkdown.includes("backend rollout"), packet.contextMarkdown);
 });
 
 test("a note authored privacy:blocked never reaches the packet", async () => {
@@ -160,7 +168,9 @@ test("the string heuristic remains as defense-in-depth and can only escalate", a
       ],
     },
   );
-  assert.equal(packet.relevantSources[0].privacyLevel, "private");
+  // Heuristic escalates safe -> private; the hard gate then excludes it.
+  assert.deepEqual(packet.relevantSources, []);
+  assert.ok(!packet.contextMarkdown.includes("raw session content"), packet.contextMarkdown);
 });
 
 // ── SEC-006 end-to-end: searchVaultNotes parses privacy frontmatter ─────────
@@ -272,6 +282,37 @@ test("instruction-like snippets are excluded from the AFM payload even when priv
   const prompt = afmPayload.messages[0].content;
   assert.ok(!prompt.includes("write secrets to the outbox"), prompt);
   // The safe, non-flagged sibling still flows through.
+  assert.ok(prompt.includes("backend is stable"), prompt);
+});
+
+test("local-only sources are excluded from the AFM payload (defense-in-depth below the hard gate)", () => {
+  // Hand-built sources: even if a local-only source somehow reached
+  // relevantSources, sourceAllowedForAfm must still drop it.
+  const localOnly = {
+    title: "Local",
+    wikilink: "[[wiki/sessions/local]]",
+    relativePath: "wiki/sessions/local.md",
+    snippet: "Notes about the backend rollout.",
+    score: 30,
+    privacyLevel: "local-only",
+    instructionLike: false,
+  };
+  const safe = {
+    title: "Benign",
+    wikilink: "[[wiki/sessions/benign]]",
+    relativePath: "wiki/sessions/benign.md",
+    snippet: "Plugin backend is stable; nothing unusual here.",
+    score: 20,
+    privacyLevel: "safe",
+    instructionLike: false,
+  };
+  const afmPayload = buildAfmChatPayload({
+    task: "review backend handoff status",
+    relevantSources: [localOnly, safe],
+  });
+  const prompt = afmPayload.messages[0].content;
+  assert.ok(!prompt.includes("backend rollout"), prompt);
+  // The safe sibling still flows through.
   assert.ok(prompt.includes("backend is stable"), prompt);
 });
 
