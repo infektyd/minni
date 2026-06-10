@@ -149,10 +149,20 @@ def test_resolve_candidate_rpc_archives_inbox_source(tmp_path, monkeypatch):
     (cid,) = _candidate_ids(db_obj)
 
     import config as cfg_mod
+    import minnid
     from minnid import _resolve_candidate
+    from principal import EffectivePrincipal
 
     monkeypatch.setattr(cfg_mod.DEFAULT_CONFIG, "db_path", cfg.db_path)
     monkeypatch.setattr(cfg_mod.DEFAULT_CONFIG, "vault_path", str(tmp_path / "vault"))
+    # A3 authz: resolution is owner-or-explicit-operator now; the ingest above
+    # attributed the candidate to 'codex' (vault dir name), so stamp the caller
+    # as the owning principal instead of relying on the live principals dir.
+    monkeypatch.setattr(
+        minnid,
+        "resolve_effective_principal",
+        lambda **_kw: EffectivePrincipal(agent_id="codex", capabilities=["*"]),
+    )
 
     resp = _resolve_candidate(
         {"candidate_id": cid, "decision": "accept", "reason": "B1 archive test"}, 1

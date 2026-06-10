@@ -189,11 +189,13 @@ def test_handoff_pending_list_and_ack(monkeypatch, tmp_path):
     inbox_path = Path(sent["inbox_path"])
     outbox_path = Path(sent["outbox_path"])
 
+    # A3 authz: only the lease's recipient may ack — the caller must stamp as
+    # to_agent (the relaxed test resolver honors the supplied agent_id).
     ack = minnid._dispatch_sync({
         "jsonrpc": "2.0",
         "id": 22,
         "method": "minni_ack_handoff",
-        "params": {"lease_id": lease_id, "status": "accepted"},
+        "params": {"lease_id": lease_id, "status": "accepted", "agent_id": "claude-code"},
     })["result"]
     assert ack["status"] == "accepted"
     assert len(ack["updated_paths"]) == 2

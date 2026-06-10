@@ -777,6 +777,27 @@ def _handoff_lease_status(lease_id: str) -> Optional[dict]:
         return None
 
 
+def _lease_to_agent(lease_id: str) -> Optional[str]:
+    """Recipient (``to_agent``) of a handoff lease: authoritative SQLite row
+    first, JSON packets as fallback (leases can exist file-only when SQLite
+    persistence degraded). None when the lease is unknown on both channels."""
+    try:
+        db = _lazy_writeback().db
+        with db.cursor() as c:
+            row = c.execute(
+                "SELECT to_agent FROM handoff_leases WHERE lease_id = ?",
+                (lease_id,),
+            ).fetchone()
+        if row is not None and row["to_agent"]:
+            return str(row["to_agent"])
+    except Exception as exc:
+        logger.warning("Could not read lease %r for authz: %s", lease_id, exc)
+    for _vault, _path, packet in _iter_handoff_files():
+        if packet.get("lease_id") == lease_id and packet.get("to_agent"):
+            return str(packet.get("to_agent"))
+    return None
+
+
 def _handle_ack_handoff(params: dict, request_id: Any) -> dict:
     lease_id = str(params.get("lease_id", "")).strip()
     status = str(params.get("status", "")).strip()
@@ -784,6 +805,27 @@ def _handle_ack_handoff(params: dict, request_id: Any) -> dict:
         return _make_error(-32602, "lease_id is required", request_id)
     if status not in _HANDOFF_ACK_STATUSES:
         return _make_error(-32602, f"status must be one of {sorted(_HANDOFF_ACK_STATUSES)}", request_id)
+    # A3 authz (fixes a live incident: co-located session subagents acked and
+    # archived other agents' live handoffs): only the lease's RECIPIENT may ack
+    # it. The principal is server-stamped (G11) — caller-supplied agent_id is
+    # only honoured through the platform_agent_ids / alias machinery, never raw.
+    supplied = params.get("agent_id")
+    try:
+        principal = resolve_effective_principal(
+            supplied_agent_id=supplied, transport="uds"
+        )
+    except IdentityMismatchError as exc:
+        return make_mismatch_error(exc.supplied, exc.stamped, request_id)
+    to_agent = _lease_to_agent(lease_id)
+    if to_agent is None:
+        return _make_error(-32000, f"No handoff lease found for {lease_id}", request_id)
+    if to_agent != principal.agent_id:
+        return _make_error(
+            -32004,
+            f"principal_mismatch: handoff lease {lease_id} is addressed to "
+            f"'{to_agent}'; caller principal '{principal.agent_id}' may not ack it",
+            request_id,
+        )
     contradicts_id = params.get("contradicts_id")
     updates = {
         "ack_status": status,
@@ -2737,6 +2779,39 @@ def _list_candidates(params: dict, request_id: Any) -> dict:
         return _make_error(-32000, f"list_candidates error: {exc}", request_id)
 
 
+def _explicitly_allowed_operator(principal: EffectivePrincipal) -> bool:
+    """A3 authz: TRUE only for an operator EXPLICITLY granted cross-principal
+    governance — never the synthesized wide-open local default. Grants:
+
+      * a LITERAL ``resolve_candidate`` / ``govern`` capability in the stamped
+        principal's capability list (an operator-authored principals/*.json
+        grant; the synthesized default only carries ``"*"``, which is NOT
+        accepted here), or
+      * the explicit ``operator`` principal (only exists when the operator
+        ships principals/operator.json), or
+      * an agent_id listed in the daemon-env allowlist
+        ``MINNI_RESOLVE_OPERATORS`` (comma-separated; operator-controlled,
+        never wire-controlled).
+
+    Rationale (live incident): every co-located session subagent is stamped
+    'main' on the shared UDS surface, so the blanket is_operator_principal
+    default let workflow subagents repeatedly re-resolve another principal's
+    candidate and archive a live inbox file. Cross-principal resolution now
+    requires one of the explicit grants above.
+    """
+    caps = principal.capabilities or []
+    if "resolve_candidate" in caps or "govern" in caps:
+        return True
+    if principal.agent_id == "operator":
+        return True
+    allow = {
+        a.strip()
+        for a in os.environ.get("MINNI_RESOLVE_OPERATORS", "").split(",")
+        if a.strip()
+    }
+    return principal.agent_id in allow
+
+
 def _resolve_candidate(params: dict, request_id: Any) -> dict:
     """G15: Resolve a candidate (accept→durable learn, reject/redact etc). Operator only."""
     supplied = params.get("agent_id")
@@ -2799,9 +2874,33 @@ def _resolve_candidate(params: dict, request_id: Any) -> dict:
             if not row:
                 return _make_error(-32001, f"candidate_not_found: {cid}", request_id)
             rowd = dict(row)
-            if rowd.get("principal") != principal.agent_id:
-                # allow operator to resolve any? but per spec per-principal for now; relax for console operator
-                pass  # operator may resolve cross for console; keep permissive for P1
+            # A3 authz (live incident: subagents stamped 'main' re-resolved
+            # candidate #999 and archived a live inbox file): a caller may only
+            # resolve its OWN candidates; cross-principal resolution requires an
+            # EXPLICITLY allowed operator (see _explicitly_allowed_operator).
+            owner = str(rowd.get("principal") or "")
+            if owner != principal.agent_id and not _explicitly_allowed_operator(principal):
+                return _make_error(
+                    -32004,
+                    f"principal_mismatch: candidate #{cid} is owned by '{owner}'; "
+                    f"caller principal '{principal.agent_id}' may only resolve its own "
+                    "candidates (cross-principal resolution requires an explicitly "
+                    "allowed operator: 'operator', a literal resolve_candidate/govern "
+                    "capability, or MINNI_RESOLVE_OPERATORS)",
+                    request_id,
+                )
+            # Resolution is terminal and once-only (same incident: repeated
+            # re-resolution re-ran the inbox archive against a LIVE file).
+            # Mirrors the idempotent 'proposed'-only pattern in
+            # _promote_candidate_durable / _reject_candidate_dedup.
+            if rowd.get("status") != "proposed":
+                return _make_error(
+                    -32009,
+                    f"already_resolved: candidate #{cid} is '{rowd.get('status')}' "
+                    f"(resolved_by={rowd.get('resolved_by')!r}); resolution is terminal "
+                    "and cannot be repeated",
+                    request_id,
+                )
 
             if new_status == "accepted":
                 # Promote to durable learning (the only path that writes to learnings)

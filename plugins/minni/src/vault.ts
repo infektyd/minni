@@ -111,6 +111,16 @@ export interface VaultSearchResult {
   title: string;
   snippet: string;
   score: number;
+  /**
+   * SEC-006 (audit C3 / docs-F2): authored privacy, parsed from the note's
+   * `privacy:` frontmatter at search time. `undefined` when the note declares
+   * none (consumers may then apply heuristic fallbacks). An unknown declared
+   * value fails closed to "private". `blocked` notes never reach this struct
+   * — searchVaultNotes drops them outright.
+   */
+  privacy?: PrivacyLevel;
+  /** Authored `status:` frontmatter (lifecycle), when present. */
+  status?: PageStatus;
 }
 
 const VAULT_DIRS = [
@@ -225,6 +235,57 @@ function queryTerms(query: string): string[] {
   return [
     ...new Set(query.toLowerCase().match(/[a-z0-9_/-]{3,}/g) ?? []),
   ].filter((term) => !stop.has(term));
+}
+
+const PRIVACY_LEVELS: ReadonlyArray<PrivacyLevel> = [
+  "safe",
+  "local-only",
+  "private",
+  "blocked",
+];
+
+const PAGE_STATUSES: ReadonlyArray<PageStatus> = [
+  "draft",
+  "candidate",
+  "accepted",
+  "superseded",
+  "rejected",
+  "expired",
+];
+
+/** First frontmatter block of a note (writeVaultPage emits `---\n...\n---`). */
+function frontmatterBlock(markdown: string): string {
+  return markdown.match(/^---\r?\n([\s\S]*?)\r?\n---/)?.[1] ?? "";
+}
+
+/**
+ * SEC-006: privacy as AUTHORED in frontmatter — the authoritative signal for
+ * sharing decisions (the string heuristic in task.ts is defense-in-depth
+ * only). Returns undefined when the note declares no privacy; a declared but
+ * unrecognized value fails closed to "private" rather than silently "safe".
+ */
+function privacyFromMarkdown(markdown: string): PrivacyLevel | undefined {
+  const raw = frontmatterBlock(markdown)
+    .match(/^privacy:\s*(.+)$/m)?.[1]
+    ?.trim()
+    .replace(/^["']|["']$/g, "")
+    .toLowerCase();
+  if (!raw) return undefined;
+  return (PRIVACY_LEVELS as string[]).includes(raw)
+    ? (raw as PrivacyLevel)
+    : "private";
+}
+
+function statusFromMarkdown(markdown: string): PageStatus | undefined {
+  const raw = frontmatterBlock(markdown)
+    .match(/^status:\s*(.+)$/m)?.[1]
+    ?.trim()
+    .replace(/^["']|["']$/g, "")
+    .toLowerCase();
+  if (!raw) return undefined;
+  return (PAGE_STATUSES as string[]).includes(raw)
+    ? (raw as PageStatus)
+    : undefined;
 }
 
 function titleFromMarkdown(relativePath: string, markdown: string): string {
@@ -826,8 +887,13 @@ export async function searchVaultNotes(
   }
 
   const scored = await Promise.all(
-    files.map(async (notePath) => {
+    files.map(async (notePath): Promise<VaultSearchResult | undefined> => {
       const markdown = await readFile(notePath, "utf8");
+      // SEC-006: frontmatter privacy is authoritative. Blocked notes never
+      // leave the search layer (mirrors the daemon's _ALWAYS_EXCLUDED gate);
+      // everything else carries its authored privacy so consumers gate on it.
+      const privacy = privacyFromMarkdown(markdown);
+      if (privacy === "blocked") return undefined;
       const relativePath = path.relative(vaultPath, notePath);
       const title = titleFromMarkdown(relativePath, markdown);
       const score = scoreVaultNote(query, terms, relativePath, title, markdown);
@@ -838,12 +904,14 @@ export async function searchVaultNotes(
         title,
         snippet: snippetFor(markdown, terms),
         score,
+        privacy,
+        status: statusFromMarkdown(markdown),
       };
     }),
   );
 
   return scored
-    .filter((result) => result.score > 0)
+    .filter((result): result is VaultSearchResult => result !== undefined && result.score > 0)
     .sort(
       (a, b) =>
         b.score - a.score || a.relativePath.localeCompare(b.relativePath),
