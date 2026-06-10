@@ -312,3 +312,18 @@ def test_resolve_cloud_api_key_denies_non_regular_file(tmp_path):
     )
     assert "key" not in result
     assert "regular file" in result["error"]
+
+
+def test_check_model_target_ipv6_loopback_parity(monkeypatch):
+    """Cross-language parity: urlparse strips IPv6 brackets ("::1"), the TS
+    mirror strips them explicitly — both must allow an IPv6-loopback bridge."""
+    from config import check_model_target
+
+    monkeypatch.delenv("MINNI_AFM_ALLOWED_TARGETS", raising=False)
+    monkeypatch.delenv("MINNI_MODEL_ALLOWED_TARGETS", raising=False)
+
+    assert check_model_target("http://[::1]:11437/v1/chat/completions")["allowed"] is True
+    assert check_model_target("https://[::1]:11437/v1/chat/completions")["allowed"] is True
+    non_loopback = check_model_target("http://[2001:db8::1]:11437/v1")
+    assert non_loopback["allowed"] is False
+    assert non_loopback["reason"] == "not_allowlisted"

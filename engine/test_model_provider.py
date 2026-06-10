@@ -151,3 +151,63 @@ def test_chain_native_op_without_capable_provider():
     result = chain.native_op("compile_pass_proposals", {})
     assert result.ok is False
     assert result.status == "native_unsupported"
+
+
+def test_afm_provider_unset_mode_consults_env(tmp_path, monkeypatch):
+    """Unset-mode resolution parity with providers.ts: an omitted request/provider
+    mode must consult MINNI_AFM_PROVIDER_MODE (resolve_afm_mode), not default to
+    bridge unconditionally."""
+    from test_afm_contract_golden import _write_fake_helper
+
+    from model_provider import AfmProvider
+
+    helper, capture = _write_fake_helper(tmp_path, {"ok": True, "data": {"answer": "native answer"}})
+    monkeypatch.setenv("MINNI_AFM_NATIVE_HELPER", os.fspath(helper))
+    monkeypatch.setenv("MINNI_AFM_PROVIDER_MODE", "native")
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("env-resolved native mode must not call the bridge")
+
+    result = AfmProvider().chat(_request(timeout=5.0), client=forbidden)
+    assert result.ok is True
+    assert result.provider == "native"
+    import json as _json
+
+    envelope = _json.loads(capture.read_text(encoding="utf-8"))
+    assert envelope["operation"] == "chat_completion"
+
+
+def test_failed_native_call_invalidates_cached_probe(monkeypatch):
+    """P1: 'invalidated on call failure' holds in native mode too (mirror of
+    afm.ts callAfmJson noteAfmGenerationFailure)."""
+    import afm_provider
+    from afm_provider import DEFAULT_AFM_CHAT_COMPLETIONS_URL, note_afm_generation_success
+    from model_provider import AfmProvider
+
+    monkeypatch.setenv("MINNI_AFM_NATIVE_HELPER", "/tmp/missing-native-helper-for-test")
+    afm_provider.reset_afm_generation_probe_cache()
+    note_afm_generation_success(DEFAULT_AFM_CHAT_COMPLETIONS_URL, "native")
+    key = f"native|{DEFAULT_AFM_CHAT_COMPLETIONS_URL}"
+    assert key in afm_provider._generation_probe_cache
+
+    result = AfmProvider().chat(_request(mode="native"))
+    assert result.ok is False
+    assert key not in afm_provider._generation_probe_cache
+    afm_provider.reset_afm_generation_probe_cache()
+
+
+def test_chain_sanitizes_provider_errors_structurally():
+    """SEC (P3): secret hygiene at the chain boundary, not per call site —
+    a provider error embedding auth material is redacted before it can reach
+    audit/inbox/status surfaces (mirror of providers.ts sanitizeChainResult)."""
+    from model_provider import ProviderChain
+
+    secret = "sk-test-vErYsEcReT-cLoUdKeY-12345"
+    leaky = FakeProvider(
+        "leaky",
+        result={"ok": False, "error": f"HTTP 401 authorization: Bearer {secret} x-api-key={secret}"},
+    )
+    result = ProviderChain([leaky]).chat(_request())
+    assert result.ok is False
+    assert secret not in (result.error or "")
+    assert "[redacted" in (result.error or "")

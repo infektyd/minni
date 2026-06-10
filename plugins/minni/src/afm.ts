@@ -11,6 +11,22 @@ import { AFM_PREPARE_TASK_MODEL, AFM_PREPARE_TASK_URL, modelAllowedTargets } fro
 export type AfmProviderMode = "auto" | "bridge" | "native" | "off";
 export type AfmProvider = "bridge" | "native" | "off";
 
+const VALID_AFM_MODES = new Set<AfmProviderMode>(["auto", "bridge", "native", "off"]);
+
+/**
+ * Resolve an AFM provider mode exactly like engine/afm_provider.resolve_afm_mode:
+ * an explicit value wins, otherwise MINNI_AFM_PROVIDER_MODE then MINNI_AFM_MODE,
+ * defaulting to "bridge". Unknown values fall back to "bridge".
+ */
+export function resolveAfmMode(value?: string | null): AfmProviderMode {
+  const raw = (
+    value ?? process.env.MINNI_AFM_PROVIDER_MODE ?? process.env.MINNI_AFM_MODE ?? "bridge"
+  )
+    .trim()
+    .toLowerCase();
+  return VALID_AFM_MODES.has(raw as AfmProviderMode) ? (raw as AfmProviderMode) : "bridge";
+}
+
 export interface AfmProviderResolution {
   mode: AfmProviderMode;
   provider: AfmProvider;
@@ -79,7 +95,7 @@ function nativeHealthAvailable(health: JsonResult | undefined): boolean {
   );
 }
 
-function safeError(error: unknown): string | undefined {
+export function safeError(error: unknown): string | undefined {
   if (typeof error !== "string" || error.length === 0) return undefined;
   return error
     // SEC (P3): strip auth headers / bearer tokens / API keys before anything
@@ -312,7 +328,9 @@ export function checkModelTarget(targetUrl: string): ModelTargetDecision {
   if (!targetUrl) return { allowed: false, reason: "invalid_url" };
   try {
     const u = new URL(targetUrl);
-    const h = (u.hostname || "").toLowerCase();
+    // WHATWG URL keeps brackets on IPv6 hostnames ("[::1]"); strip them so the
+    // loopback/allowlist comparison matches the Python mirror (urlparse strips them).
+    const h = (u.hostname || "").toLowerCase().replace(/^\[|\]$/g, "");
     if (!h) return { allowed: false, reason: "invalid_url" };
     // Explicit loopback per G13 requirement (0.0.0.0 / *.localhost kept for dev/mDNS compat; see plan review note)
     if (h === "127.0.0.1" || h === "localhost" || h === "::1" || h === "0.0.0.0" || h.endsWith(".localhost")) {

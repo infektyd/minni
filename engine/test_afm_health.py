@@ -249,3 +249,23 @@ def test_auto_mode_health_falls_back_to_bridge_probe(monkeypatch):
     # wrapped native envelope.
     assert "payload" not in calls[0]["payload"]
     assert calls[0]["payload"]["max_tokens"] == 1
+
+
+def test_failed_native_call_invalidates_cached_probe(monkeypatch):
+    """P1: 'invalidated on call failure' holds in pure native mode (mirror of
+    afm.ts callAfmJson noteAfmGenerationFailure on the native path)."""
+    import afm_provider
+    from afm_provider import (
+        DEFAULT_AFM_CHAT_COMPLETIONS_URL,
+        afm_chat_completion,
+        note_afm_generation_success,
+    )
+
+    monkeypatch.setenv("MINNI_AFM_NATIVE_HELPER", "/tmp/missing-native-helper-for-test")
+    note_afm_generation_success(DEFAULT_AFM_CHAT_COMPLETIONS_URL, "native")
+    key = f"native|{DEFAULT_AFM_CHAT_COMPLETIONS_URL}"
+    assert key in afm_provider._generation_probe_cache
+
+    failed = afm_chat_completion({"messages": []}, mode="native")
+    assert failed.ok is False
+    assert key not in afm_provider._generation_probe_cache

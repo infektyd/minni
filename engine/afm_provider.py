@@ -412,8 +412,35 @@ def afm_chat_completion(
         native = invoke_native_afm("chat_completion", {"payload": payload}, timeout=timeout)
         if native.ok:
             note_afm_generation_success(url or DEFAULT_AFM_CHAT_COMPLETIONS_URL, resolved)
+        else:
+            # Honest health: a failed native call invalidates the cached probe
+            # (mirror of afm.ts callAfmJson noteAfmGenerationFailure); in auto
+            # mode the bridge fall-through below re-verifies on success.
+            note_afm_generation_failure(url or DEFAULT_AFM_CHAT_COMPLETIONS_URL)
         if native.ok or resolved == "native":
             return native
+
+    # G13 (SEC-004): bridge targets must be loopback or explicitly allowlisted
+    # (MINNI_AFM_ALLOWED_TARGETS / MINNI_MODEL_ALLOWED_TARGETS); non-loopback
+    # additionally requires HTTPS. Enforced at the transport boundary exactly
+    # like afm.ts callAfmJson, so every bridge caller is gated (model_provider
+    # keeps its own check as defense in depth). Structured denial, no URL echo.
+    from config import check_model_target
+
+    decision = check_model_target(url or DEFAULT_AFM_CHAT_COMPLETIONS_URL)
+    if not decision["allowed"]:
+        if decision["reason"] == "https_required":
+            error = "afm_target_denied: non-loopback model targets require https"
+        else:
+            error = "afm_target_denied: target is not loopback-only and not explicitly allowlisted by operator config"
+        return AFMResult(
+            ok=False,
+            data={},
+            provider="bridge",
+            status="target_denied",
+            error=error,
+            fallback_used=resolved == "auto",
+        )
 
     bridge_client = client or _default_bridge_client
     try:

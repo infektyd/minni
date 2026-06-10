@@ -259,3 +259,43 @@ test("AfmProvider keeps the G13 loopback denial for non-allowlisted bridge hosts
   assert.equal(result.ok, false);
   assert.match(result.error ?? "", /afm_target_denied/);
 });
+
+test("AfmProvider unset mode consults MINNI_AFM_PROVIDER_MODE (mirror of resolve_afm_mode)", async () => {
+  await withNativeHelper({ ok: true, data: { answer: "native answer" } }, async (readCapture) => {
+    const previous = process.env.MINNI_AFM_PROVIDER_MODE;
+    process.env.MINNI_AFM_PROVIDER_MODE = "native";
+    try {
+      const payload = { model: "m", messages: [{ role: "user", content: "hi" }] };
+      const result = await new AfmProvider().chat({
+        payload,
+        operation: "prepare",
+        transport: async () => {
+          throw new Error("env-resolved native mode must not call the bridge");
+        },
+      });
+      assert.equal(result.ok, true);
+      const envelope = await readCapture();
+      assert.deepEqual(envelope, {
+        schema_version: 1,
+        operation: "chat_completion",
+        input: { payload },
+      });
+    } finally {
+      if (previous === undefined) delete process.env.MINNI_AFM_PROVIDER_MODE;
+      else process.env.MINNI_AFM_PROVIDER_MODE = previous;
+    }
+  });
+});
+
+test("ProviderChain sanitizes provider errors structurally (no key in chain output)", async () => {
+  const secret = "sk-test-vErYsEcReT-cLoUdKeY-12345";
+  const leaky = fakeProvider({
+    name: "leaky",
+    result: { ok: false, error: `HTTP 401 authorization: Bearer ${secret} x-api-key=${secret}` },
+  });
+  const chain = new ProviderChain([leaky]);
+  const result = await chain.chat({ payload: { messages: [] }, operation: "prepare" });
+  assert.equal(result.ok, false);
+  assert.doesNotMatch(result.error ?? "", new RegExp(secret));
+  assert.match(result.error ?? "", /\[redacted/);
+});

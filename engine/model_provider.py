@@ -15,7 +15,7 @@ the wire behavior is byte-identical to the P0 golden contracts.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import logging
 from typing import Any, Dict, List, Literal, Optional, Protocol, runtime_checkable
 
@@ -106,6 +106,11 @@ class AfmProvider:
             native = afm_provider.invoke_native_afm(operation, payload, timeout=request.timeout)
             if native.ok:
                 afm_provider.note_afm_generation_success(request.url or DEFAULT_AFM_CHAT_COMPLETIONS_URL, resolved)
+            else:
+                # Honest health: a failed native call invalidates the cached
+                # probe (mirror of afm.ts callAfmJson); in auto mode the bridge
+                # fall-through below re-verifies on success.
+                afm_provider.note_afm_generation_failure(request.url or DEFAULT_AFM_CHAT_COMPLETIONS_URL)
             if native.ok or resolved == "native":
                 return ProviderResult(
                     ok=native.ok,
@@ -182,6 +187,22 @@ class OperationPolicy:
     local_only: bool = False
 
 
+def _sanitize_chain_result(result: ProviderResult) -> ProviderResult:
+    """SEC (P3): secret hygiene is structural, not per-call-site.
+
+    Every non-ok result leaving the chain has its error passed through
+    _safe_status_error so future providers (P4-P6 cloud SDKs routinely embed
+    auth headers / key-bearing URLs in exception text) cannot leak secrets
+    into audit/inbox/status surfaces. Mirror of providers.ts sanitizeChainResult.
+    """
+    if result.ok or not result.error:
+        return result
+    sanitized = afm_provider._safe_status_error(result.error)
+    if sanitized == result.error:
+        return result
+    return replace(result, error=sanitized)
+
+
 class ProviderChain:
     """Ordered provider fan-out with per-operation routing policy."""
 
@@ -219,13 +240,13 @@ class ProviderChain:
             last = provider.chat(request, client=client)
             if last.ok:
                 return last
-        return last  # type: ignore[return-value]
+        return _sanitize_chain_result(last)  # type: ignore[arg-type]
 
     def native_op(self, operation: str, payload: Dict[str, Any], timeout: float = 2.0) -> ProviderResult:
         for provider in self.providers:
             handler = getattr(provider, "native_op", None)
             if callable(handler):
-                return handler(operation, payload, timeout=timeout)
+                return _sanitize_chain_result(handler(operation, payload, timeout=timeout))
         return ProviderResult(
             ok=False,
             data={},

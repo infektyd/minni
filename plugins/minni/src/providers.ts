@@ -12,7 +12,14 @@
 // that afm.ts already owns. With the default AFM-only chain the wire behavior
 // is byte-identical to the P0 golden contracts.
 
-import { callAfmJson, getAfmProviderHealth, type AfmProviderMode, type ProviderHealth } from "./afm.js";
+import {
+  callAfmJson,
+  getAfmProviderHealth,
+  resolveAfmMode,
+  safeError,
+  type AfmProviderMode,
+  type ProviderHealth,
+} from "./afm.js";
 import { AFM_PREPARE_TASK_URL, PROVIDERS_CONFIG, type ProvidersConfig } from "./config.js";
 import type { JsonResult } from "./sovereign.js";
 
@@ -69,7 +76,9 @@ export class AfmProvider implements ModelProvider {
   async chat(request: ChatRequest): Promise<ProviderChatResult> {
     // Mode is resolved BEFORE choosing the payload so auto mode sends the
     // native envelope to the native helper (mirror of model_provider.py).
-    const mode = request.mode ?? this.mode ?? "bridge";
+    // Unset modes consult MINNI_AFM_PROVIDER_MODE / MINNI_AFM_MODE exactly
+    // like the Python mirror's resolve_afm_mode(None).
+    const mode = resolveAfmMode(request.mode ?? this.mode);
     const url = request.url ?? AFM_PREPARE_TASK_URL;
     if (mode === "off") {
       return { ok: false, provider: this.name, error: "AFM mode is off" };
@@ -101,12 +110,24 @@ export class AfmProvider implements ModelProvider {
   }
 
   async health(): Promise<ProviderHealth> {
-    return getAfmProviderHealth({ mode: this.mode ?? "bridge" });
+    return getAfmProviderHealth({ mode: resolveAfmMode(this.mode) });
   }
 }
 
 export interface OperationPolicy {
   localOnly?: boolean;
+}
+
+/**
+ * SEC (P3): secret hygiene is structural, not per-call-site. Every non-ok
+ * result leaving the chain has its error passed through safeError so future
+ * providers (P4-P6 cloud SDKs routinely embed auth headers / key-bearing URLs
+ * in exception text) cannot leak secrets into audit/inbox/status surfaces.
+ */
+function sanitizeChainResult(result: ProviderChatResult): ProviderChatResult {
+  if (result.ok || typeof result.error !== "string") return result;
+  const sanitized = safeError(result.error);
+  return sanitized === result.error ? result : { ...result, error: sanitized };
 }
 
 export class ProviderChain {
@@ -137,7 +158,7 @@ export class ProviderChain {
       last = await provider.chat(request);
       if (last.ok) return last;
     }
-    return last as ProviderChatResult;
+    return sanitizeChainResult(last as ProviderChatResult);
   }
 }
 

@@ -502,7 +502,10 @@ export async function buildStatusReport(input?: {
     input?.afmGeneration ??
     (await getAfmProviderHealth({
       mode: afmProvider.provider,
-      health: rawAfm,
+      // The HTTP /health result gates the generation probe only for the bridge
+      // provider; in native mode a dead bridge must not veto the probe — the
+      // native helper is exercised directly (mirror of afm_runtime_status).
+      health: afmProvider.provider === "bridge" ? rawAfm : undefined,
       transport: input?.afmGenerationTransport,
       ttlMs: input?.afmGenerationTtlMs,
       nativeHelperPath: process.env.MINNI_AFM_NATIVE_HELPER,

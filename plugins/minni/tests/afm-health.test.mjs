@@ -339,3 +339,29 @@ test("afmHealth still fails on HTTP errors", async () => {
     assert.equal(result.error, "HTTP 503");
   }, 503);
 });
+
+test("native mode: dead bridge /health must not veto a working native helper", async () => {
+  // The flaky-bridge scenario: hermes /health is down, but the native helper
+  // generates fine. buildStatusReport must probe the helper directly instead
+  // of short-circuiting on the bridge health result.
+  await withProbeHelper({ ok: true, data: { answer: "y" } }, async (helper) => {
+    const root = await mkdtemp(path.join(tmpdir(), "sm-honest-health-"));
+    const previousHelper = process.env.MINNI_AFM_NATIVE_HELPER;
+    process.env.MINNI_AFM_NATIVE_HELPER = helper;
+    try {
+      const report = await buildStatusReport({
+        vaultPath: root,
+        socket: { ok: true, data: { status: "ok" } },
+        afmProviderMode: "native",
+        afm: { ok: false, error: "connect ECONNREFUSED 127.0.0.1:11437" },
+      });
+      assert.equal(report.afm.ok, true, "native generation works; the dead bridge must not invert afm_ok");
+      assert.equal(report.afm.data.generationVerified, true);
+      assert.equal(report.extractor.provider, "native");
+    } finally {
+      if (previousHelper === undefined) delete process.env.MINNI_AFM_NATIVE_HELPER;
+      else process.env.MINNI_AFM_NATIVE_HELPER = previousHelper;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});

@@ -235,6 +235,17 @@ test("checkModelTarget: loopback always allowed, others denied by default", asyn
   });
 });
 
+test("checkModelTarget allows IPv6 loopback (WHATWG URL keeps brackets; Python mirror parity)", async () => {
+  await withEnv({ MINNI_AFM_ALLOWED_TARGETS: undefined, MINNI_MODEL_ALLOWED_TARGETS: undefined }, async () => {
+    // new URL("http://[::1]:11437/x").hostname is "[::1]" — the bracket strip
+    // must make this agree with engine/config.py check_model_target ("::1").
+    assert.deepEqual(checkModelTarget("http://[::1]:11437/v1/chat/completions"), { allowed: true });
+    assert.deepEqual(checkModelTarget("https://[::1]:11437/v1/chat/completions"), { allowed: true });
+    // Non-loopback IPv6 stays denied.
+    assert.deepEqual(checkModelTarget("http://[2001:db8::1]:11437/v1"), { allowed: false, reason: "not_allowlisted" });
+  });
+});
+
 test("checkModelTarget honors the MINNI_MODEL_ALLOWED_TARGETS alias and requires https", async () => {
   await withEnv(
     { MINNI_AFM_ALLOWED_TARGETS: undefined, MINNI_MODEL_ALLOWED_TARGETS: "api.example.com" },
