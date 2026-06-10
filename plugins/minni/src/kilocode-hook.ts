@@ -21,9 +21,9 @@ import {
 import { extractScarTissue, prepareOutcome } from "./task.js";
 import {
   auditTail,
-  clearInboxEntry,
   ensureVault,
-  readPendingInbox,
+  expireStaleInboxHandoffs,
+  readInboxStatus,
   recordAudit,
   resolveInboxHandoffContext,
   searchVaultNotes,
@@ -98,7 +98,11 @@ async function handleSessionStart(payload: Record<string, unknown>): Promise<Hoo
     agentId: KILOCODE_AGENT_ID,
     workspaceId: KILOCODE_WORKSPACE_ID,
   });
-  const pending = await readPendingInbox(KILOCODE_VAULT_PATH, 3);
+  // TTL-reap stale file handoffs BEFORE the honest read so they neither occupy
+  // the capped slice nor inflate totals; they surface once below as 'expired'.
+  const expiredHandoffs = await expireStaleInboxHandoffs(KILOCODE_VAULT_PATH);
+  const inboxStatus = await readInboxStatus(KILOCODE_VAULT_PATH, 3);
+  const pending = inboxStatus.entries;
   const handoffContext = await resolveInboxHandoffContext(KILOCODE_VAULT_PATH, pending);
 
   const envelope = wrapEnvelope({
@@ -115,14 +119,26 @@ async function handleSessionStart(payload: Record<string, unknown>): Promise<Hoo
         daemon_ok: status.socket.ok,
         afm_ok: status.afm.ok,
       },
-      pending_learnings: pending.map((entry) => ({
-        slug: entry.slug,
-        created: entry.createdAt,
-        path: entry.filePath,
-        candidates: entry.payload.candidates,
-        kind: entry.payload.kind,
-        task: entry.payload.task,
-      })),
+      pending_learnings: {
+        total_pending: inboxStatus.totalPending,
+        oldest_age_days: inboxStatus.oldestAgeDays,
+        showing: pending.length,
+        entries: pending.map((entry) => ({
+          slug: entry.slug,
+          created: entry.createdAt,
+          path: entry.filePath,
+          candidates: entry.payload.candidates,
+          kind: entry.payload.kind,
+          task: entry.payload.task,
+        })),
+        expired_handoffs: expiredHandoffs.map((entry) => ({
+          slug: entry.slug,
+          status: entry.status,
+          age_days: entry.ageDays,
+          created: entry.createdAt,
+          archived_to: entry.archivedPath,
+        })),
+      },
       handoff_context: handoffContext.map((snippet) => ({
         ref: snippet.ref,
         path: snippet.relativePath,
@@ -147,7 +163,8 @@ async function handleSessionStart(payload: Record<string, unknown>): Promise<Hoo
     details: {
       daemon_ok: status.socket.ok,
       afm_ok: status.afm.ok,
-      pending_inbox: pending.length,
+      pending_inbox: inboxStatus.totalPending,
+      expired_handoffs: expiredHandoffs.length,
       handoff_context: handoffContext.length,
     },
   });

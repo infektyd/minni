@@ -881,21 +881,73 @@ export async function writeInbox(
   return { slug: safeSlug, filePath, createdAt, payload: body };
 }
 
-export async function readPendingInbox(
+/**
+ * Parse a real timestamp (ms epoch) out of an inbox filename. Two formats exist:
+ *   - `YYYY-MM-DD-<base36 ms>-<slug>.json` (writeInbox above)
+ *   - `YYYYMMDDTHHMMSSZ-<slug>.json` (daemon handoff channel)
+ * Lexicographic sorting interleaves them WRONG (the compact format sorts after
+ * every dashed date, pinning ancient handoffs into the "newest" slice — audit
+ * C2), so callers must sort on this instead. Returns undefined when neither
+ * format parses.
+ */
+export function parseInboxTimestamp(name: string): number | undefined {
+  let m = name.match(/^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z-/);
+  if (m) {
+    const ts = Date.parse(`${m[1]}-${m[2]}-${m[3]}T${m[4]}:${m[5]}:${m[6]}Z`);
+    return Number.isNaN(ts) ? undefined : ts;
+  }
+  m = name.match(/^(\d{4}-\d{2}-\d{2})-([0-9a-z]+)/);
+  if (m) {
+    const dayMs = Date.parse(`${m[1]}T00:00:00Z`);
+    if (Number.isNaN(dayMs)) return undefined;
+    // Second segment is Date.now().toString(36); trust it only when it lands
+    // near the named day (a slug can also match [0-9a-z]+).
+    const ms = parseInt(m[2], 36);
+    if (Number.isFinite(ms) && ms >= dayMs && ms < dayMs + 2 * 86_400_000) {
+      return ms;
+    }
+    return dayMs;
+  }
+  return undefined;
+}
+
+export interface InboxStatus {
+  /** Capped, true-newest-first entries (parsed payloads). */
+  entries: InboxEntry[];
+  /** Total live inbox files — so "3 shown of 1,520" is visible as such. */
+  totalPending: number;
+  /** Age in whole days of the oldest dateable file, or null when none parse. */
+  oldestAgeDays: number | null;
+}
+
+/**
+ * Honest inbox read (audit C2): sorts by REAL timestamp (both filename
+ * formats), newest first, and reports the full backlog size alongside the
+ * capped entries instead of silently showing `limit` of N.
+ */
+export async function readInboxStatus(
   vaultPath: string,
   limit = 5,
-): Promise<InboxEntry[]> {
+  now = Date.now(),
+): Promise<InboxStatus> {
   const dir = path.join(vaultPath, "inbox");
   let names: string[] = [];
   try {
     names = (await readdir(dir)).filter((name) => name.endsWith(".json"));
   } catch {
-    return [];
+    return { entries: [], totalPending: 0, oldestAgeDays: null };
   }
-  names.sort();
-  const recent = names.slice(-limit);
+  const stamped = names.map((name) => ({ name, ts: parseInboxTimestamp(name) }));
+  // Newest first; undated files sort last; name as deterministic tiebreak.
+  stamped.sort(
+    (a, b) => (b.ts ?? 0) - (a.ts ?? 0) || b.name.localeCompare(a.name),
+  );
+  const dated = stamped.filter((s) => s.ts !== undefined);
+  const oldestAgeDays = dated.length
+    ? Math.max(0, Math.floor((now - (dated[dated.length - 1].ts as number)) / 86_400_000))
+    : null;
   const entries: InboxEntry[] = [];
-  for (const name of recent) {
+  for (const { name } of stamped.slice(0, limit)) {
     const filePath = path.join(dir, name);
     try {
       const raw = await readFile(filePath, "utf8");
@@ -910,7 +962,14 @@ export async function readPendingInbox(
       // ignore unreadable inbox files
     }
   }
-  return entries;
+  return { entries, totalPending: names.length, oldestAgeDays };
+}
+
+export async function readPendingInbox(
+  vaultPath: string,
+  limit = 5,
+): Promise<InboxEntry[]> {
+  return (await readInboxStatus(vaultPath, limit)).entries;
 }
 
 function normalizeWikilinkRef(ref: string): string {
@@ -991,12 +1050,104 @@ export async function resolveInboxHandoffContext(
   return snippets;
 }
 
-export async function clearInboxEntry(filePath: string): Promise<void> {
+/**
+ * Archive (never delete) an inbox entry: rename it into the sibling
+ * `inbox/.archive/` dir, preserving the filename (timestamp prefix on
+ * collision). `.archive/` is invisible to readInboxStatus and to the engine's
+ * inbox_ingest glob, so archived entries stop re-surfacing. Best-effort:
+ * returns the archived path, or undefined when the file was already gone.
+ */
+export async function archiveInboxEntry(filePath: string): Promise<string | undefined> {
+  const archiveDir = path.join(path.dirname(filePath), ".archive");
+  const base = path.basename(filePath);
+  let target = path.join(archiveDir, base);
   try {
-    await unlink(filePath);
+    await mkdir(archiveDir, { recursive: true });
+    try {
+      await access(target);
+      target = path.join(archiveDir, `${Date.now().toString(36)}-${base}`);
+    } catch {
+      // no collision
+    }
+    await rename(filePath, target);
+    return target;
   } catch {
-    // best effort; nothing to do if already gone
+    return undefined; // best effort; nothing to do if already gone
   }
+}
+
+export interface ExpiredInboxHandoff {
+  slug: string;
+  filePath: string;
+  archivedPath?: string;
+  createdAt: string;
+  ageDays: number;
+  status: "expired";
+  task?: unknown;
+}
+
+export function inboxHandoffTtlDays(): number {
+  const raw = Number(process.env.MINNI_INBOX_HANDOFF_TTL_DAYS ?? "");
+  return Number.isFinite(raw) && raw > 0 ? raw : 7;
+}
+
+/**
+ * TTL reaper for the FILE handoff channel (audit C2/B3). `kind: handoff`
+ * inbox files are invisible to the lease ack channel (`requires_ack` falsy in
+ * minnid's listing), so without a TTL they pin the inbox forever. Semantics
+ * ported from the agent_ping lease model (agent_ping.ts withExpiry /
+ * checkAndReapLease): expiry is evaluated at read time; an expired entry is
+ * surfaced ONCE — returned with explicit status "expired", never silently
+ * dropped — and immediately archived so it cannot re-surface. Rename only,
+ * never unlink.
+ */
+export async function expireStaleInboxHandoffs(
+  vaultPath: string,
+  ttlDays = inboxHandoffTtlDays(),
+  now = Date.now(),
+): Promise<ExpiredInboxHandoff[]> {
+  const dir = path.join(vaultPath, "inbox");
+  let names: string[] = [];
+  try {
+    names = (await readdir(dir)).filter((name) => name.endsWith(".json"));
+  } catch {
+    return [];
+  }
+  const cutoff = now - ttlDays * 86_400_000;
+  const expired: ExpiredInboxHandoff[] = [];
+  for (const name of names) {
+    const filePath = path.join(dir, name);
+    let ts = parseInboxTimestamp(name);
+    if (ts === undefined) {
+      try {
+        ts = (await stat(filePath)).mtimeMs;
+      } catch {
+        continue;
+      }
+    }
+    if (ts >= cutoff) continue;
+    let payload: Record<string, unknown>;
+    try {
+      payload = JSON.parse(await readFile(filePath, "utf8")) as Record<string, unknown>;
+    } catch {
+      continue; // unreadable files are not handoffs; leave them alone
+    }
+    if (payload.kind !== "handoff") continue;
+    const archivedPath = await archiveInboxEntry(filePath);
+    expired.push({
+      slug: typeof payload.slug === "string" ? payload.slug : name,
+      filePath,
+      archivedPath,
+      createdAt:
+        typeof payload.createdAt === "string"
+          ? payload.createdAt
+          : new Date(ts).toISOString(),
+      ageDays: Math.floor((now - ts) / 86_400_000),
+      status: "expired",
+      task: payload.task,
+    });
+  }
+  return expired;
 }
 
 export async function vaultExists(vaultPath: string): Promise<boolean> {

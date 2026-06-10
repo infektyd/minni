@@ -55,7 +55,8 @@ export type PlanEvent =
   | { kind: "shelf_pulled"; at: string; reason: string }
   | { kind: "rehydrated"; at: string }
   | { kind: "restored"; from_rev: number; at: string }
-  | { kind: "scar_added"; signal: string; at: string };
+  | { kind: "scar_added"; signal: string; at: string }
+  | { kind: "status_reconciled"; from: PageStatus; to: PageStatus; at: string };
 
 // ---------------------------------------------------------------------------
 // Supporting input/deps (for createPlan testability and callers)
@@ -1082,6 +1083,36 @@ export async function resolveActivePlanView(
       plan.status === "superseded" ||
       plan.status === "rejected"
     ) {
+      return undefined;
+    }
+    // Honest-health self-heal (audit C4): plans completed under a stale plugin
+    // deploy can be stuck with every slice terminal but status still
+    // 'draft'/'candidate' (live evidence: plan-3da1b00ca39d2500,
+    // plan-512ee7225dbb1c6f, plan-9fd20af5bc87bee2 — all 100% done, status
+    // draft). Re-derive the terminal status at load time, persist it through
+    // persistPlan (journaled; never a direct file write) and stop injecting
+    // the finished plan.
+    const allResolved =
+      plan.slices.length > 0 &&
+      plan.slices.every((s) => s.status === "done" || s.status === "superseded");
+    if (allResolved && (plan.status === "draft" || plan.status === "candidate")) {
+      const from = plan.status;
+      plan.status = "accepted";
+      await persistPlan(plan, { vaultPath, notePath: active.notePath });
+      const journalPath = path.join(
+        path.dirname(active.notePath),
+        `${plan.plan_id}.log.md`,
+      );
+      try {
+        await appendJournal(journalPath, {
+          kind: "status_reconciled",
+          from,
+          to: "accepted",
+          at: new Date().toISOString(),
+        });
+      } catch {
+        // journal is advisory; the persisted status is the durable fix
+      }
       return undefined;
     }
     return {

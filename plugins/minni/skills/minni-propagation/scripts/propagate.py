@@ -821,6 +821,24 @@ def status(args: argparse.Namespace) -> int:
     return 0
 
 
+# Honest-health (audit C4): verify must not pass vacuously. Every required
+# check — INCLUDING the daemon-read pair, which is simply ABSENT when the
+# socket is missing — must be present AND True, and any *_error key forces
+# ok=False.
+REQUIRED_VERIFY_CHECKS = (
+    "agent_api_has_identity",
+    "agent_api_has_map_rule",
+    "daemon_read_has_identity",
+    "daemon_read_has_map_rule",
+)
+
+
+def verify_ok(checks: dict) -> bool:
+    if any(str(key).endswith("_error") for key in checks):
+        return False
+    return all(checks.get(key) is True for key in REQUIRED_VERIFY_CHECKS)
+
+
 def verify(args: argparse.Namespace) -> int:
     agent = args.agent
     workspace = args.workspace
@@ -846,7 +864,7 @@ def verify(args: argparse.Namespace) -> int:
     else:
         checks["daemon_read_error"] = f"socket missing: {socket_path}"
 
-    ok = all(v is True or not str(k).endswith(("_has_identity", "_has_map_rule")) for k, v in checks.items())
+    ok = verify_ok(checks)
     print(json.dumps({"ok": ok, "checks": checks}, indent=2))
     return 0 if ok else 1
 

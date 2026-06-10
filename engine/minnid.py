@@ -795,10 +795,27 @@ def _handle_ack_handoff(params: dict, request_id: Any) -> dict:
     db_changed = _update_handoff_lease_status(lease_id, status, contradicts_id)
     if not changed and not db_changed:
         return _make_error(-32000, f"No handoff lease found for {lease_id}", request_id)
+    # B1: an explicit ack is terminal for the file channel — archive the
+    # recipient-side inbox copies so they stop re-surfacing at SessionStart.
+    # The outbox copy (and the authoritative lease row) keep the ack_status
+    # for await_handoff. Rename only, never unlink.
+    archived = []
+    for changed_path in changed:
+        p = Path(changed_path)
+        if p.parent.name != "inbox":
+            continue
+        try:
+            from afm_passes.inbox_archive import archive_inbox_file
+            new_path = archive_inbox_file(p)
+            if new_path:
+                archived.append(new_path)
+        except Exception as exc:
+            logger.warning("ack_handoff: archive of %s failed: %s", p, exc)
     return _make_response({
         "lease_id": lease_id,
         "status": status,
         "updated_paths": changed,
+        "archived_paths": archived,
     }, request_id)
 
 
@@ -2182,6 +2199,21 @@ def _afm_loop_enabled(config=DEFAULT_CONFIG) -> bool:
 # consolidation_actions for audit. The privileged write lives here, not in passes.
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _maybe_archive_inbox_source(db, candidate_id: int) -> None:
+    """B1 drain-on-resolution (audit C2): once a candidate sourced from a vault
+    inbox file reaches a terminal state, move the source file into
+    ``<inbox>/.archive/`` so the file channel actually drains instead of
+    re-surfacing resolved candidates forever. Best-effort; never deletes
+    (rename only); never raises into the resolution path."""
+    try:
+        from afm_passes.inbox_archive import maybe_archive_for_candidate
+        maybe_archive_for_candidate(db, DEFAULT_CONFIG, candidate_id)
+    except Exception:
+        logger.exception(
+            "inbox archive for candidate %s failed (non-fatal)", candidate_id
+        )
+
+
 def _promote_candidate_durable(candidate_id: int, reason: str = "afm-consolidation"):
     """Promote one proposed candidate into a durable, embedded learning.
 
@@ -2261,6 +2293,7 @@ def _promote_candidate_durable(candidate_id: int, reason: str = "afm-consolidati
         logger.warning("consolidation: write_to_disk failed for learning #%s (%s)", lid, exc)
 
     logger.info("AFM consolidation promoted candidate #%d -> learning #%d", candidate_id, lid)
+    _maybe_archive_inbox_source(wb.db, candidate_id)
     return lid
 
 
@@ -2292,6 +2325,7 @@ def _reject_candidate_dedup(candidate_id: int) -> bool:
             (str(candidate_id), now),
         )
     logger.info("AFM consolidation deduped candidate #%d (rejected)", candidate_id)
+    _maybe_archive_inbox_source(wb.db, candidate_id)
     return True
 
 
@@ -2520,6 +2554,14 @@ async def _afm_loop_runner():
                                     "(eligible=%d already=%d)",
                                     _ing["inserted"], _ing["eligible"],
                                     _ing["already_present"],
+                                )
+                            # B4: surface kind-gate drops to the audit channel
+                            # instead of silently skipping whole channels.
+                            _skips = _ing.get("skipped_by_kind") or {}
+                            if any(_skips.values()):
+                                logger.info(
+                                    "AFM loop: inbox ingest skipped_by_kind=%s",
+                                    _skips,
                                 )
                         except Exception:
                             logger.exception(
@@ -2789,6 +2831,10 @@ def _resolve_candidate(params: dict, request_id: Any) -> dict:
             "RESOLVE_CANDIDATE operator=%s candidate=%s decision=%s new_status=%s reason=%s (G15 audit)",
             principal.agent_id, cid, decision, new_status, reason[:80]
         )
+
+        # B1 drain-on-resolution: every status in status_map is terminal, so an
+        # inbox-sourced candidate's file can now leave the live inbox.
+        _maybe_archive_inbox_source(db, cid)
 
         return _make_response(
             {
