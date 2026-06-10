@@ -1763,6 +1763,17 @@ def _extract_assertion(content: str) -> str:
     return content[:120].strip()
 
 
+class _ResolveRejected(Exception):
+    """Carries a pre-built JSON-RPC error response out of an OPEN write
+    transaction. Raising (instead of returning) makes the transaction context
+    manager ROLL BACK, so an early rejection releases the BEGIN IMMEDIATE
+    write lock without committing a no-op transaction."""
+
+    def __init__(self, response: dict):
+        super().__init__(str(response.get("error", {}).get("message", "rejected")))
+        self.response = response
+
+
 def _handle_resolve_contradiction(params: dict, request_id: Any) -> dict:
     """Write a new learning and atomically supersede a list of prior learnings.
 
@@ -1797,6 +1808,13 @@ def _handle_resolve_contradiction(params: dict, request_id: Any) -> dict:
     # internal exception text via the -32000 catch-all below.
     if not all(isinstance(sid, int) and not isinstance(sid, bool) for sid in supersede_ids):
         return _make_error(-32602, "supersede_ids must be a list of integers", request_id)
+    # An EMPTY list would pass validation, skip the per-id ownership loop
+    # entirely, and insert an unsupervised learning that bypasses the staging
+    # workflow — resolution must actually resolve something.
+    if not supersede_ids:
+        return _make_error(
+            -32602, "supersede_ids must be a non-empty list of integers", request_id
+        )
 
     # G11: EffectivePrincipal is the single server-stamped source (never trust caller)
     supplied = params.get("agent_id")
@@ -1841,9 +1859,9 @@ def _handle_resolve_contradiction(params: dict, request_id: Any) -> dict:
             # A3 authz (mirrors _resolve_candidate's owner check at the same
             # trust boundary): a caller may only supersede learnings it OWNS;
             # cross-principal supersession requires an EXPLICITLY allowed
-            # operator. Validated BEFORE the INSERT so an early error return
-            # (which commits the transaction on clean exit) cannot leave an
-            # orphan new learning behind.
+            # operator. Validated BEFORE the INSERT, and rejections RAISE
+            # (_ResolveRejected -> rollback) so no orphan new learning can be
+            # left behind and no lock-holding no-op transaction is committed.
             for sid in supersede_ids:
                 c.execute(
                     "SELECT agent_id FROM learnings WHERE learning_id = ?",
@@ -1851,19 +1869,19 @@ def _handle_resolve_contradiction(params: dict, request_id: Any) -> dict:
                 )
                 srow = c.fetchone()
                 if not srow:
-                    return _make_error(
+                    raise _ResolveRejected(_make_error(
                         -32001, f"learning_not_found: {sid}", request_id
-                    )
+                    ))
                 owner = str(srow["agent_id"] or "")
                 if owner != agent_id and not _explicitly_allowed_operator(principal):
-                    return _make_error(
+                    raise _ResolveRejected(_make_error(
                         -32004,
                         f"principal_mismatch: learning #{sid} is owned by '{owner}'; "
                         f"caller principal '{agent_id}' may only supersede its own "
                         "learnings (cross-principal supersession requires an "
                         "explicitly allowed operator)",
                         request_id,
-                    )
+                    ))
             c.execute("""
                 INSERT INTO learnings
                 (agent_id, category, content, source_doc_ids, source_query,
@@ -1908,6 +1926,8 @@ def _handle_resolve_contradiction(params: dict, request_id: Any) -> dict:
             "new_learning_id": new_lid,
             "superseded": supersede_ids,
         }, request_id)
+    except _ResolveRejected as exc:
+        return exc.response
     except Exception as exc:
         logger.exception("resolve_contradiction failed")
         return _make_error(-32000, f"Resolve contradiction error: {exc}", request_id)
@@ -2900,12 +2920,16 @@ def _resolve_candidate(params: dict, request_id: Any) -> dict:
         db = _SovDB()
         lid = None
         # Explicit transaction (BEGIN IMMEDIATE) for atomic SELECT + conditional promote + UPDATE.
-        # Closes TOCTOU between read and write (mirrors the pattern in _handle_resolve_contradiction).
+        # Closes TOCTOU between read and write (mirrors the pattern in
+        # _handle_resolve_contradiction, including _ResolveRejected so early
+        # rejections roll back instead of committing a lock-holding no-op).
         with db.transaction() as c:
             c.execute("SELECT * FROM candidate_packets WHERE candidate_id=?", (cid,))
             row = c.fetchone()
             if not row:
-                return _make_error(-32001, f"candidate_not_found: {cid}", request_id)
+                raise _ResolveRejected(
+                    _make_error(-32001, f"candidate_not_found: {cid}", request_id)
+                )
             rowd = dict(row)
             # A3 authz (live incident: subagents stamped 'main' re-resolved
             # candidate #999 and archived a live inbox file): a caller may only
@@ -2913,7 +2937,7 @@ def _resolve_candidate(params: dict, request_id: Any) -> dict:
             # EXPLICITLY allowed operator (see _explicitly_allowed_operator).
             owner = str(rowd.get("principal") or "")
             if owner != principal.agent_id and not _explicitly_allowed_operator(principal):
-                return _make_error(
+                raise _ResolveRejected(_make_error(
                     -32004,
                     f"principal_mismatch: candidate #{cid} is owned by '{owner}'; "
                     f"caller principal '{principal.agent_id}' may only resolve its own "
@@ -2921,19 +2945,19 @@ def _resolve_candidate(params: dict, request_id: Any) -> dict:
                     "allowed operator: 'operator', a literal resolve_candidate/govern "
                     "capability, or MINNI_RESOLVE_OPERATORS)",
                     request_id,
-                )
+                ))
             # Resolution is terminal and once-only (same incident: repeated
             # re-resolution re-ran the inbox archive against a LIVE file).
             # Mirrors the idempotent 'proposed'-only pattern in
             # _promote_candidate_durable / _reject_candidate_dedup.
             if rowd.get("status") != "proposed":
-                return _make_error(
+                raise _ResolveRejected(_make_error(
                     -32009,
                     f"already_resolved: candidate #{cid} is '{rowd.get('status')}' "
                     f"(resolved_by={rowd.get('resolved_by')!r}); resolution is terminal "
                     "and cannot be repeated",
                     request_id,
-                )
+                ))
 
             if new_status == "accepted":
                 # Promote to durable learning (the only path that writes to learnings)
@@ -2978,6 +3002,8 @@ def _resolve_candidate(params: dict, request_id: Any) -> dict:
             },
             request_id,
         )
+    except _ResolveRejected as exc:
+        return exc.response
     except Exception as exc:
         logger.exception("resolve_candidate failed")
         return _make_error(-32000, f"resolve_candidate error: {exc}", request_id)

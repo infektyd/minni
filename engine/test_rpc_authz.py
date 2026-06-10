@@ -442,6 +442,98 @@ def test_resolve_contradiction_missing_learning_rejected(monkeypatch, tmp_path):
     assert "learning_not_found" in err.get("message", "")
 
 
+def test_resolve_contradiction_empty_supersede_ids_rejected(monkeypatch, tmp_path):
+    """An EMPTY supersede_ids list passes the type checks, skips the per-id
+    ownership loop entirely, and would insert an unsupervised learning that
+    bypasses the staging workflow — it must be a -32602 validation error."""
+    _patch_wb(monkeypatch, tmp_path)
+    _stamp_principal(monkeypatch, "codex", capabilities=["*"])
+    resp = minnid._handle_resolve_contradiction(
+        {"new_content": "supersedes nothing at all", "supersede_ids": []}, 7
+    )
+    err = resp.get("error", {})
+    assert err.get("code") == -32602, resp
+    assert "non-empty" in err.get("message", "")
+    conn = sqlite3.connect(tmp_path / "authz.db")
+    count = conn.execute("SELECT COUNT(*) FROM learnings").fetchone()[0]
+    conn.close()
+    assert count == 0, "empty-list resolution must not insert a learning"
+
+    # Omitting the param entirely is the same shape (defaults to []).
+    resp2 = minnid._handle_resolve_contradiction({"new_content": "still nothing"}, 8)
+    assert resp2.get("error", {}).get("code") == -32602, resp2
+
+
+def test_resolve_contradiction_env_allowlist_path(monkeypatch, tmp_path):
+    """MINNI_RESOLVE_OPERATORS branch of _explicitly_allowed_operator on the
+    resolve_contradiction surface: a LISTED principal may supersede
+    cross-principal; an UNLISTED one is still rejected while the env is set."""
+    db_obj = _patch_wb(monkeypatch, tmp_path)
+    lid = _insert_learning(db_obj, "codex", "env-allowlisted supersession target")
+
+    monkeypatch.setenv("MINNI_RESOLVE_OPERATORS", "ops-console, main")
+    _stamp_principal(monkeypatch, "grok", capabilities=["*"])
+    rejected = minnid._handle_resolve_contradiction(
+        {"new_content": "grok is not on the allowlist", "supersede_ids": [lid]}, 9
+    )
+    assert rejected.get("error", {}).get("code") == -32004, rejected
+    row, count = _learning_row(tmp_path, lid)
+    assert row["status"] == "active" and count == 1
+
+    _stamp_principal(monkeypatch, "main", capabilities=["*"])
+    allowed = minnid._handle_resolve_contradiction(
+        {"new_content": "main is on the allowlist", "supersede_ids": [lid]}, 10
+    )
+    assert allowed.get("result", {}).get("status") == "ok", allowed
+    row, count = _learning_row(tmp_path, lid)
+    assert row["status"] == "superseded" and count == 2
+
+
+def test_resolve_candidate_env_allowlist_unlisted_rejected(monkeypatch, tmp_path):
+    """Setting MINNI_RESOLVE_OPERATORS must not widen access for principals
+    NOT on the list (complements the allows-cross test above)."""
+    _patch_db(monkeypatch, tmp_path)
+    cid = _stage_candidate_as(monkeypatch, "codex", "allowlist excludes grok")
+
+    monkeypatch.setenv("MINNI_RESOLVE_OPERATORS", "ops-console, main")
+    _stamp_principal(monkeypatch, "grok", capabilities=["*"])
+    resp = minnid._resolve_candidate({"candidate_id": cid, "decision": "accept"}, 11)
+    err = resp.get("error", {})
+    assert err.get("code") == -32004, resp
+    assert "principal_mismatch" in err.get("message", "")
+
+
+def test_resolve_contradiction_batch_second_id_foreign_rejects_whole_batch(monkeypatch, tmp_path):
+    """Multi-id batch where only the SECOND id is foreign-owned: the whole
+    batch is rejected with NO partial application — the caller's own first
+    learning stays active and no new learning row is left behind."""
+    db_obj = _patch_wb(monkeypatch, tmp_path)
+    monkeypatch.delenv("MINNI_RESOLVE_OPERATORS", raising=False)
+    own = _insert_learning(db_obj, "grok", "grok's own learning")
+    foreign = _insert_learning(db_obj, "codex", "codex's learning in the same batch")
+
+    _stamp_principal(monkeypatch, "grok", capabilities=["*"])
+    resp = minnid._handle_resolve_contradiction(
+        {"new_content": "batch resolution attempt", "supersede_ids": [own, foreign]}, 12
+    )
+    err = resp.get("error", {})
+    assert err.get("code") == -32004, resp
+    assert f"#{foreign}" in err.get("message", "")
+
+    own_row, count = _learning_row(tmp_path, own)
+    foreign_row, _ = _learning_row(tmp_path, foreign)
+    assert own_row["status"] == "active" and own_row["superseded_by"] is None, (
+        "no partial application: the caller-owned first id must stay active"
+    )
+    assert foreign_row["status"] == "active" and foreign_row["superseded_by"] is None
+    assert count == 2, "rejected batch must not insert the new learning"
+
+    conn = sqlite3.connect(tmp_path / "authz.db")
+    events = conn.execute("SELECT COUNT(*) FROM contradiction_events").fetchone()[0]
+    conn.close()
+    assert events == 0, "rejected batch must not record contradiction events"
+
+
 def test_resolve_contradiction_non_integer_ids_rejected_without_leak(monkeypatch, tmp_path):
     """Non-int elements are rejected up front with -32602 — never bound into
     SQL where an InterfaceError would leak internals via the -32000 catch-all."""
