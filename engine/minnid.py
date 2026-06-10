@@ -956,6 +956,36 @@ def _resolve_backend(backend_param, config=None):
     return backend_param
 
 
+def _record_learning_reads_for_search(agent_id: str, results: list) -> int:
+    """hooks-PL-2 leg (a): the hooks' recall path uses the 'search' RPC, which
+    previously wrote NO learning_reads rows — so subscribe_contradictions
+    (stale_beliefs) could never match a belief that was only ever surfaced via
+    search. Record a read row for every learning-backed result (synthetic
+    ``learning://<id>`` graph documents), mirroring what minnid.read does for
+    its recent-learnings slice.
+    """
+    learning_ids = []
+    for r in results or []:
+        src = str(r.get("source") or r.get("path") or "")
+        if src.startswith("learning://"):
+            try:
+                learning_ids.append(int(src.split("learning://", 1)[1]))
+            except ValueError:
+                continue
+    if not learning_ids:
+        return 0
+    now = time.time()
+    with _lazy_writeback().db.cursor() as c:
+        for lid in learning_ids:
+            c.execute(
+                """INSERT OR IGNORE INTO learning_reads
+                   (learning_id, agent_id, read_at, source)
+                   VALUES (?, ?, ?, ?)""",
+                (lid, agent_id, now, "minnid.search"),
+            )
+    return len(learning_ids)
+
+
 def _handle_search(params: dict, request_id: Any) -> dict:
     """Search Minni via hybrid retrieval.
 
@@ -1036,6 +1066,14 @@ def _handle_search(params: dict, request_id: Any) -> dict:
                 results = pack_results(results, budget_tokens=budget, depth=depth)
             except Exception as pack_exc:
                 logger.warning("pack_results failed: %s — returning unbudgeted results", pack_exc)
+
+        # hooks-PL-2 leg (a): searching is reading — track learning-backed hits
+        # so stale_beliefs can fire when one of them is later corrected.
+        try:
+            _record_learning_reads_for_search(agent_id, results)
+        except Exception as exc:
+            # hooks-PL-5: visible, never silently green
+            logger.warning("search: learning_reads tracking failed: %s", exc)
 
         return _make_response({
             "query": query,
@@ -1448,8 +1486,13 @@ def _handle_read(params: dict, request_id: Any) -> dict:
                                VALUES (?, ?, ?, ?)""",
                             (row["learning_id"], agent_id, time.time(), "minnid.read"),
                         )
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        # hooks-PL-5: a silently dropped read row starves
+                        # subscribe_contradictions (stale_beliefs) of matches.
+                        logger.warning(
+                            "read: learning_reads insert failed for learning #%s: %s",
+                            row["learning_id"], exc,
+                        )
 
         # Recent episodic events
         with db.cursor() as c:
@@ -1838,13 +1881,36 @@ def _handle_subscribe_contradictions(params: dict, request_id: Any) -> dict:
     if not agent_id:
         return _make_error(-32602, "agent_id is required", request_id)
     since_ts = float(params.get("since_ts", 0) or 0)
-    read_window_hours = float(params.get("read_window_hours", 24) or 24)
-    read_since = time.time() - (read_window_hours * 3600)
+    now = time.time()
+
+    # hooks-PL-2 leg (b): the old default required a learning_reads row within
+    # the last 24h for the SUPERSEDED learning. The sole read writer skips
+    # superseded learnings (correctly — stale beliefs must not be re-injected),
+    # so a corrected belief could never get a fresh read row and stale_beliefs
+    # fired events:[] forever for exactly the corrections that matter. The fix:
+    # ANY historical read of the superseded learning now qualifies (the agent
+    # held the belief at some point); recency bounds apply to the *event*, not
+    # the read. Callers can still opt back into read-recency filtering by
+    # passing read_window_hours explicitly.
+    read_window_hours_param = params.get("read_window_hours")
+    read_since = None
+    if read_window_hours_param is not None:
+        read_since = now - (float(read_window_hours_param or 24) * 3600)
+
+    # Bound boot-time noise: with since_ts unset, only surface events from the
+    # last event_window_days (default 30) instead of the full history.
+    event_window_days = float(params.get("event_window_days", 30) or 30)
+    event_since = max(since_ts, now - event_window_days * 86400)
 
     try:
         db = _lazy_writeback().db
+        clauses = ["lr.agent_id = ?", "ce.created_at >= ?"]
+        query_params: list = [agent_id, event_since]
+        if read_since is not None:
+            clauses.append("lr.read_at >= ?")
+            query_params.append(read_since)
         with db.cursor() as c:
-            rows = c.execute("""
+            rows = c.execute(f"""
                 SELECT DISTINCT
                        ce.event_id,
                        ce.superseded_learning_id,
@@ -1854,11 +1920,19 @@ def _handle_subscribe_contradictions(params: dict, request_id: Any) -> dict:
                 FROM contradiction_events ce
                 JOIN learning_reads lr
                   ON lr.learning_id = ce.superseded_learning_id
-                WHERE lr.agent_id = ?
-                  AND lr.read_at >= ?
-                  AND ce.created_at >= ?
+                WHERE {" AND ".join(clauses)}
                 ORDER BY ce.created_at ASC, ce.event_id ASC
-            """, (agent_id, read_since, since_ts)).fetchall()
+            """, query_params).fetchall()
+            # hooks-PL-1: empty events must be distinguishable from a match
+            # failure — count what was actually checked so silence is honest.
+            total_events = c.execute(
+                "SELECT COUNT(*) AS n FROM contradiction_events WHERE created_at >= ?",
+                (event_since,),
+            ).fetchone()["n"]
+            reads_for_agent = c.execute(
+                "SELECT COUNT(*) AS n FROM learning_reads WHERE agent_id = ?",
+                (agent_id,),
+            ).fetchone()["n"]
         events = [
             {
                 "event_id": row["event_id"],
@@ -1869,7 +1943,24 @@ def _handle_subscribe_contradictions(params: dict, request_id: Any) -> dict:
             }
             for row in rows
         ]
-        return _make_response({"agent_id": agent_id, "events": events}, request_id)
+        return _make_response({
+            "agent_id": agent_id,
+            "events": events,
+            # hooks-PL-1 discriminator: "matched" = stale beliefs found;
+            # "checked_no_match" = the join ran and legitimately found nothing.
+            # Errors take the JSON-RPC error path and never look like silence.
+            "status": "matched" if events else "checked_no_match",
+            "checked": {
+                "contradiction_events_in_window": total_events,
+                "learning_reads_for_agent": reads_for_agent,
+                "event_window_days": event_window_days,
+                "read_window_hours": (
+                    float(read_window_hours_param or 24)
+                    if read_window_hours_param is not None else None
+                ),
+                "since_ts": since_ts,
+            },
+        }, request_id)
     except Exception as exc:
         logger.exception("subscribe_contradictions failed")
         return _make_error(-32000, f"Subscribe contradictions error: {exc}", request_id)

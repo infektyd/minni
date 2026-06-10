@@ -174,6 +174,20 @@ class SovereignConfig:
     # contradictory. Callers can override per-request via the 'threshold' param.
     contradiction_threshold: float = 0.85
 
+    # Correction re-injection (audit cluster C1 / recall-F3, recall-F4).
+    # Correction-class notes (corrections, contradiction resolutions, decisions,
+    # fixes) carry a bounded salience channel so a fresh correction can outrank
+    # a stale habitual hit whose decay saturated at 1.0 via access reinforcement.
+    correction_page_types: tuple = ("correction", "contradiction", "decision", "fix")
+    # Bounded multiplicative boost: final_score *= (1 + boost) for correction-class.
+    correction_salience_boost: float = 0.25
+    # Corrections younger than the grace window do not decay at all (recall-F4:
+    # a 1-day-old unaccessed correction must not sit below a reread stale belief).
+    correction_decay_grace_days: float = 7.0
+    # After the grace window, corrections decay normally but never below this
+    # floor, so a correction cannot fade below the belief it superseded.
+    correction_decay_floor: float = 0.5
+
     # Thread propagation
     thread_bind_threshold: float = 0.55
 

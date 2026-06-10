@@ -95,6 +95,16 @@ def _page_type_to_authority(page_type: Optional[str], agent: str) -> Optional[st
     return "vault"
 
 
+def _correction_class_page_types(config) -> set:
+    """Correction-class page types (recall-F3): notes that correct, supersede,
+    or decide against a prior belief. Falls back to the audited default set so
+    duck-typed configs (eval harness) keep the salience channel."""
+    raw = getattr(config, "correction_page_types", None) or (
+        "correction", "contradiction", "decision", "fix",
+    )
+    return {str(t).lower() for t in raw}
+
+
 def _path_to_wikilink(path: str) -> Optional[str]:
     """Convert an absolute path to a [[wikilink]] style reference."""
     if not path:
@@ -581,6 +591,26 @@ class RetrievalEngine:
 
     # ── Reciprocal Rank Fusion ─────────────────────────────────
 
+    def _score_merged_doc(self, d: Dict) -> None:
+        """Compute final_score for one RRF-merged doc, with the correction
+        salience channel (recall-F3) and decay floor (recall-F4).
+
+        Default scoring is unchanged: final_score = rrf_score * decay_score.
+        Correction-class notes (page_type in config.correction_page_types) get
+        a bounded multiplicative boost and a decay floor so a fresh correction
+        can outrank a stale habitual hit whose decay saturated via access
+        reinforcement (decay rewards rereads; corrections start unread).
+        """
+        boost = 0.0
+        decay = d["decay_score"]
+        page_type = str(d.get("page_type") or "").lower()
+        if page_type in _correction_class_page_types(self.config):
+            boost = float(getattr(self.config, "correction_salience_boost", 0.25))
+            floor = float(getattr(self.config, "correction_decay_floor", 0.5))
+            decay = max(decay, floor)
+        d["salience_boost"] = boost
+        d["final_score"] = d["rrf_score"] * decay * (1.0 + boost)
+
     def _rrf_merge(
         self,
         fts_results: List[Dict],
@@ -656,7 +686,7 @@ class RetrievalEngine:
                 doc_scores[did]["layer"] = r["layer"]
 
         for d in doc_scores.values():
-            d["final_score"] = d["rrf_score"] * d["decay_score"]
+            self._score_merged_doc(d)
 
         ranked = sorted(doc_scores.values(), key=lambda x: x["final_score"], reverse=True)
         return ranked[:limit]
@@ -1030,7 +1060,7 @@ class RetrievalEngine:
             _add_stream(extra, self.config.semantic_weight, "extra")
 
         for d in doc_scores.values():
-            d["final_score"] = d["rrf_score"] * d["decay_score"]
+            self._score_merged_doc(d)
 
         ranked = sorted(doc_scores.values(), key=lambda x: x["final_score"], reverse=True)
         return ranked[:limit]
@@ -1734,6 +1764,9 @@ class RetrievalEngine:
             }
             if "feedback_demote" in r:
                 provenance["feedback_demote"] = r.get("feedback_demote", 0.0)
+            if r.get("salience_boost"):
+                # recall-F3: correction-class salience applied in RRF scoring
+                provenance["salience_boost"] = r.get("salience_boost", 0.0)
             if r.get("provenance", {}).get("via_hyde"):
                 provenance["via_hyde"] = True
 
@@ -1978,31 +2011,10 @@ class RetrievalEngine:
             for row in c.fetchall():
                 results.append(dict(row))
 
-        if results:
-            now = time.time()
-            with self.db.cursor() as c:
-                for result in results[:limit]:
-                    c.execute(
-                        """UPDATE learnings
-                           SET access_count = access_count + 1, last_accessed = ?
-                           WHERE learning_id = ?""",
-                        (now, result["learning_id"]),
-                    )
-                    try:
-                        c.execute(
-                            """INSERT INTO learning_reads
-                               (learning_id, agent_id, read_at, source)
-                               VALUES (?, ?, ?, ?)""",
-                            (
-                                result["learning_id"],
-                                agent_id or "unknown",
-                                now,
-                                "retrieval.search_learnings",
-                            ),
-                        )
-                    except Exception:
-                        pass
-
+        # hooks-PL-2: the learning access/read tracking that previously lived
+        # here referenced result["learning_id"], which episodic rows do not
+        # carry (KeyError on any hit) — it belongs in search_learnings, where
+        # it now lives. Episodic events need no learning_reads rows.
         return results
 
     def search_learnings(
@@ -2043,5 +2055,41 @@ class RetrievalEngine:
 
             for row in c.fetchall():
                 results.append(dict(row))
+
+        # hooks-PL-2 leg (a): searching learnings IS reading them. Record
+        # access + a learning_reads row so subscribe_contradictions can later
+        # match a correction against this read (the search path previously
+        # wrote no learning_reads at all — moved here from search_episodic,
+        # where it crashed on a missing learning_id key).
+        if results:
+            now = time.time()
+            with self.db.cursor() as c:
+                for result in results[:limit]:
+                    c.execute(
+                        """UPDATE learnings
+                           SET access_count = access_count + 1, last_accessed = ?
+                           WHERE learning_id = ?""",
+                        (now, result["learning_id"]),
+                    )
+                    try:
+                        c.execute(
+                            """INSERT INTO learning_reads
+                               (learning_id, agent_id, read_at, source)
+                               VALUES (?, ?, ?, ?)""",
+                            (
+                                result["learning_id"],
+                                agent_id or "unknown",
+                                now,
+                                "retrieval.search_learnings",
+                            ),
+                        )
+                    except Exception as exc:
+                        # hooks-PL-5: never silently drop read tracking — a
+                        # missing row here is exactly what makes stale_beliefs
+                        # fire events:[] forever.
+                        logger.warning(
+                            "learning_reads insert failed for learning #%s: %s",
+                            result.get("learning_id"), exc,
+                        )
 
         return results
