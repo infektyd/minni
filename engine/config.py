@@ -209,6 +209,18 @@ class SovereignConfig:
             os.makedirs(self.writeback_path, exist_ok=True)
 
 
+def correction_class_page_types(config) -> set:
+    """Correction-class page types (recall-F3): notes that correct, supersede,
+    or decide against a prior belief. Single source of truth shared by
+    retrieval.py (salience boost) and decay.py (grace window + floor) so the
+    two sides cannot drift. Falls back to the audited default set so
+    duck-typed configs (eval harness) keep the salience channel."""
+    raw = getattr(config, "correction_page_types", None) or (
+        "correction", "contradiction", "decision", "fix",
+    )
+    return {str(t).lower() for t in raw}
+
+
 # Global default config — importable everywhere
 DEFAULT_CONFIG = SovereignConfig()
 

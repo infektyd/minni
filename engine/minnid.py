@@ -1867,7 +1867,19 @@ def _handle_resolve_contradiction(params: dict, request_id: Any) -> dict:
 
 
 def _handle_subscribe_contradictions(params: dict, request_id: Any) -> dict:
-    """Return contradiction events for learnings recently read by an agent."""
+    """Return contradiction events for learnings recently read by an agent.
+
+    Params:
+      since_ts            Cursor for incremental polling. NOTE: event_window_days
+                          is a hard cap — since_ts=0 ("everything") still only
+                          returns the last event_window_days of events. The
+                          effective lower bound is echoed back as
+                          checked.event_since so callers can detect clamping.
+      event_window_days   Boot-noise bound, default 30, clamped to [0, 365].
+      read_window_hours   Optional read-recency filter; 0 means "no reads
+                          qualify" (an explicit zero is honored, not coerced
+                          to the default). Clamped to [0, 8760].
+    """
     # G11 / RCM-003/009: EffectivePrincipal stamp + mismatch guard (closes last model-facing agent_id surfaces)
     # Model-supplied agent_id is NEVER trusted; use stamped principal.agent_id for queries.
     supplied = params.get("agent_id")
@@ -1882,6 +1894,10 @@ def _handle_subscribe_contradictions(params: dict, request_id: Any) -> dict:
         return _make_error(-32602, "agent_id is required", request_id)
     since_ts = float(params.get("since_ts", 0) or 0)
     now = time.time()
+    # Clamp caller-supplied bounds (local-DoS guard): a huge event window or a
+    # far-future since_ts must not force a full-history scan / nonsense JOIN
+    # on the daemon's single-threaded query loop.
+    since_ts = min(since_ts, now + 60)
 
     # hooks-PL-2 leg (b): the old default required a learning_reads row within
     # the last 24h for the SUPERSEDED learning. The sole read writer skips
@@ -1893,13 +1909,19 @@ def _handle_subscribe_contradictions(params: dict, request_id: Any) -> dict:
     # the read. Callers can still opt back into read-recency filtering by
     # passing read_window_hours explicitly.
     read_window_hours_param = params.get("read_window_hours")
+    read_window_hours = None
     read_since = None
     if read_window_hours_param is not None:
-        read_since = now - (float(read_window_hours_param or 24) * 3600)
+        # No falsy-or fallback: an explicit 0 means "no reads qualify" and
+        # must not be silently coerced to the 24h default.
+        read_window_hours = min(max(float(read_window_hours_param), 0.0), 8760.0)
+        read_since = now - read_window_hours * 3600
 
     # Bound boot-time noise: with since_ts unset, only surface events from the
-    # last event_window_days (default 30) instead of the full history.
+    # last event_window_days (default 30) instead of the full history. This is
+    # a HARD CAP: since_ts=0 does not mean "all history" (see docstring).
     event_window_days = float(params.get("event_window_days", 30) or 30)
+    event_window_days = min(max(event_window_days, 0.0), 365.0)
     event_since = max(since_ts, now - event_window_days * 86400)
 
     try:
@@ -1929,6 +1951,16 @@ def _handle_subscribe_contradictions(params: dict, request_id: Any) -> dict:
                 "SELECT COUNT(*) AS n FROM contradiction_events WHERE created_at >= ?",
                 (event_since,),
             ).fetchone()["n"]
+            # Agent-scoped count (the JOIN predicate, minus the read-recency
+            # filter): without it, "N events in window, 0 matched" reads like
+            # a matching bug when the events simply belong to other agents.
+            agent_events = c.execute(
+                """SELECT COUNT(*) AS n FROM contradiction_events
+                   WHERE created_at >= ?
+                     AND superseded_learning_id IN
+                         (SELECT learning_id FROM learning_reads WHERE agent_id = ?)""",
+                (event_since, agent_id),
+            ).fetchone()["n"]
             reads_for_agent = c.execute(
                 "SELECT COUNT(*) AS n FROM learning_reads WHERE agent_id = ?",
                 (agent_id,),
@@ -1952,13 +1984,14 @@ def _handle_subscribe_contradictions(params: dict, request_id: Any) -> dict:
             "status": "matched" if events else "checked_no_match",
             "checked": {
                 "contradiction_events_in_window": total_events,
+                "contradiction_events_for_agent_reads": agent_events,
                 "learning_reads_for_agent": reads_for_agent,
                 "event_window_days": event_window_days,
-                "read_window_hours": (
-                    float(read_window_hours_param or 24)
-                    if read_window_hours_param is not None else None
-                ),
+                "read_window_hours": read_window_hours,
                 "since_ts": since_ts,
+                # Effective lower bound after the event_window_days hard cap,
+                # so callers can detect that since_ts was clamped.
+                "event_since": event_since,
             },
         }, request_id)
     except Exception as exc:

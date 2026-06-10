@@ -14,6 +14,7 @@ import {
 import type { EnvelopeEvent } from "./agent_envelope.js";
 import { routeMemoryIntent } from "./policy.js";
 import {
+  BOOT_RECALL_LAYERS,
   buildStatusReport,
   formatRecall,
   readAgentContext,
@@ -23,6 +24,7 @@ import {
 import { extractScarTissue, prepareOutcome } from "./task.js";
 import {
   auditTail,
+  clearReassertedInboxEntries,
   collectCorrectionsReassert,
   ensureVault,
   readPendingInbox,
@@ -113,7 +115,7 @@ async function handleSessionStart(payload: Record<string, unknown>): Promise<Hoo
   const workspaceId = workspaceFromPayload(payload);
   await ensureVault(GROK_VAULT_PATH);
 
-  const [status, tail, identityRead, pending, contradictions] = await Promise.all([
+  const [status, tail, identityRead, pending, contradictions, recall] = await Promise.all([
     buildStatusReport({ vaultPath: GROK_VAULT_PATH }),
     auditTail(GROK_VAULT_PATH, 5),
     readAgentContext({ agentId: GROK_AGENT_ID, limit: 8 }),
@@ -121,9 +123,22 @@ async function handleSessionStart(payload: Record<string, unknown>): Promise<Hoo
     // hooks-PL-2/PL-3: corrections to beliefs this agent read must re-surface
     // at boot (stale_beliefs), mirroring the Claude Code hook.
     subscribeContradictions({ agentId: GROK_AGENT_ID }),
+    // recall-F1: boot recall must include the correction-bearing layers, not
+    // just the identity shelf (readAgentContext alone is the 'read' surface;
+    // the widened search is what lets knowledge-layer corrections rank in).
+    recallMemory({
+      query: `boot identity for ${workspaceId}`,
+      layers: BOOT_RECALL_LAYERS,
+      limit: 8,
+      agentId: GROK_AGENT_ID,
+      workspaceId,
+    }),
   ]);
   const handoffContext = await resolveInboxHandoffContext(GROK_VAULT_PATH, pending);
+  // Consumed reassert events are cleared so they re-inject exactly once and
+  // the inbox does not accumulate stale reassert files across compactions.
   const correctionsReassert = collectCorrectionsReassert(pending);
+  const clearedReasserts = await clearReassertedInboxEntries(pending);
 
   const envelope = wrapEnvelope({
     event: "SessionStart",
@@ -162,6 +177,16 @@ async function handleSessionStart(payload: Record<string, unknown>): Promise<Hoo
       ...(correctionsReassert.length > 0
         ? { corrections_reassert: correctionsReassert }
         : {}),
+      recall:
+        recall.ok && recall.data
+          ? {
+              ok: true,
+              results: recall.data.results,
+              agent_origin: recall.data.agent_id ?? GROK_AGENT_ID,
+              layer: recall.data.layer,
+              layers: BOOT_RECALL_LAYERS,
+            }
+          : { ok: false, error: recall.error },
       layer1_source:
         identityRead.ok && identityRead.data?.context
           ? {
@@ -188,6 +213,8 @@ async function handleSessionStart(payload: Record<string, unknown>): Promise<Hoo
       pending_inbox: pending.length,
       handoff_context: handoffContext.length,
       workspace: workspaceId,
+      corrections_reassert: correctionsReassert.length,
+      reassert_entries_cleared: clearedReasserts.length,
     },
   });
 

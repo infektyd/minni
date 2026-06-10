@@ -213,19 +213,25 @@ class TestCorrectionSalience:
 
 class TestCorrectionDecay:
 
-    def test_fresh_correction_holds_full_strength(self, tmp_path):
+    # All four correction-class types from config.correction_page_types — a
+    # typo or omission in the config set must fail these, not pass silently.
+    @pytest.mark.parametrize(
+        "page_type", ["correction", "contradiction", "decision", "fix"]
+    )
+    def test_fresh_correction_holds_full_strength(self, tmp_path, page_type):
         """A 1-day-old unaccessed correction must not decay below a stale
         belief that is reread every boot (the audited 0.906-vs-1.0 inversion)."""
         from decay import MemoryDecay
 
         db_obj, cfg = _make_db(tmp_path)
+        assert page_type in cfg.correction_page_types
         now = time.time()
         belief_id = _insert_document(
             db_obj, "/vault/belief.md", None,
             indexed_at=now - 30 * 86400, last_accessed=now, access_count=20,
         )
         correction_id = _insert_document(
-            db_obj, "/vault/correction.md", "correction",
+            db_obj, "/vault/correction.md", page_type,
             indexed_at=now - 1 * 86400, last_accessed=None, access_count=0,
         )
 
@@ -241,15 +247,19 @@ class TestCorrectionDecay:
         assert scores[correction_id] >= scores[belief_id], \
             "correction must not decay below the belief it supersedes"
 
-    def test_old_correction_floors_instead_of_fading(self, tmp_path):
+    @pytest.mark.parametrize(
+        "page_type", ["correction", "contradiction", "decision", "fix"]
+    )
+    def test_old_correction_floors_instead_of_fading(self, tmp_path, page_type):
         """Past the grace window a correction decays normally but never below
         correction_decay_floor."""
         from decay import MemoryDecay
 
         db_obj, cfg = _make_db(tmp_path)
+        assert page_type in cfg.correction_page_types
         now = time.time()
         old_correction = _insert_document(
-            db_obj, "/vault/old-correction.md", "decision",
+            db_obj, "/vault/old-correction.md", page_type,
             indexed_at=now - 90 * 86400, last_accessed=None, access_count=0,
         )
         old_note = _insert_document(
@@ -278,6 +288,17 @@ class TestSearchLearningReads:
         from minnid import _record_learning_reads_for_search
 
         wb, db_obj, cfg = _patch_writeback(tmp_path, monkeypatch)
+        # Real learnings rows for ids 7 and 9 so the test stays valid if a
+        # FK constraint is ever added to learning_reads.learning_id.
+        now = time.time()
+        with db_obj.cursor() as c:
+            for lid in (7, 9):
+                c.execute(
+                    """INSERT INTO learnings
+                       (learning_id, agent_id, category, content, confidence, created_at)
+                       VALUES (?, 'codex', 'fact', ?, 1.0, ?)""",
+                    (lid, f"learning {lid}", now),
+                )
         results = [
             {"source": "learning://7", "score": 1.0},
             {"path": "learning://9"},
@@ -509,3 +530,113 @@ class TestEndToEndReinjection:
         result = subscribed["result"]
         assert result["status"] == "matched"
         assert [e["superseded_learning_id"] for e in result["events"]] == [belief_id]
+
+        # 4. The CORRECTED TEXT must be reachable via new_learning_id — the
+        # production failure was the operator never seeing the new content,
+        # so ID linkage alone does not prove the data path.
+        new_lid = result["events"][0]["new_learning_id"]
+        assert new_lid == resolved["result"]["new_learning_id"]
+        with db_obj.cursor() as c:
+            row = c.execute(
+                "SELECT content, superseded_by FROM learnings WHERE learning_id = ?",
+                (new_lid,),
+            ).fetchone()
+            old = c.execute(
+                "SELECT superseded_by FROM learnings WHERE learning_id = ?",
+                (belief_id,),
+            ).fetchone()
+        assert row is not None
+        assert "port 9090" in row["content"]
+        assert row["superseded_by"] is None, "the correction itself must be active"
+        assert old["superseded_by"] == new_lid
+
+
+# ---------------------------------------------------------------------------
+# subscribe_contradictions parameter hygiene (review round 2)
+# ---------------------------------------------------------------------------
+
+class TestSubscribeContradictionsParams:
+
+    def _seed_corrected_belief(self, db_obj, agent="codex"):
+        now = time.time()
+        with db_obj.cursor() as c:
+            c.execute(
+                """INSERT INTO learnings (agent_id, category, content, confidence, created_at, status)
+                   VALUES ('a', 'fact', 'belief', 1.0, ?, 'active')""",
+                (now - 5 * 86400,),
+            )
+            belief_id = c.lastrowid
+            c.execute(
+                """INSERT INTO learning_reads (learning_id, agent_id, read_at, source)
+                   VALUES (?, ?, ?, 'minnid.search')""",
+                (belief_id, agent, now - 3 * 86400),
+            )
+        resolved = _dispatch("resolve_contradiction", {
+            "new_content": "corrected belief",
+            "supersede_ids": [belief_id],
+            "agent_id": "operator",
+        })
+        assert resolved["result"]["status"] == "ok"
+        return belief_id
+
+    def test_read_window_zero_is_honored_not_coerced(self, tmp_path, monkeypatch):
+        """read_window_hours=0 means 'no reads qualify' — the old falsy-or
+        guard silently substituted 24h."""
+        wb, db_obj, cfg = _patch_writeback(tmp_path, monkeypatch)
+        self._seed_corrected_belief(db_obj)
+
+        subscribed = _dispatch("minni_subscribe_contradictions", {
+            "agent_id": "codex",
+            "read_window_hours": 0,
+        })
+        result = subscribed["result"]
+        assert result["events"] == []
+        assert result["status"] == "checked_no_match"
+        assert result["checked"]["read_window_hours"] == 0
+
+    def test_checked_reports_agent_scoped_event_count(self, tmp_path, monkeypatch):
+        """Another agent's stale belief must show up in the global window
+        count but NOT in the agent-scoped count, so events:[] is explainable."""
+        wb, db_obj, cfg = _patch_writeback(tmp_path, monkeypatch)
+        self._seed_corrected_belief(db_obj, agent="other-agent")
+
+        subscribed = _dispatch("minni_subscribe_contradictions", {"agent_id": "codex"})
+        result = subscribed["result"]
+        assert result["events"] == []
+        checked = result["checked"]
+        assert checked["contradiction_events_in_window"] == 1
+        assert checked["contradiction_events_for_agent_reads"] == 0
+
+    def test_window_params_are_clamped(self, tmp_path, monkeypatch):
+        """Local-DoS guard: huge windows / future since_ts are clamped, and
+        the clamped event_since is echoed so callers can detect it."""
+        wb, db_obj, cfg = _patch_writeback(tmp_path, monkeypatch)
+        self._seed_corrected_belief(db_obj)
+        now = time.time()
+
+        subscribed = _dispatch("minni_subscribe_contradictions", {
+            "agent_id": "codex",
+            "event_window_days": 1e18,
+            "read_window_hours": 1e18,
+            "since_ts": 9999999999999.0,
+        })
+        result = subscribed["result"]
+        checked = result["checked"]
+        assert checked["event_window_days"] == 365.0
+        assert checked["read_window_hours"] == 8760.0
+        assert checked["since_ts"] <= now + 120
+        # event_since stays within the clamped window (never full-history 0).
+        assert checked["event_since"] >= now - 365 * 86400 - 120
+
+    def test_since_ts_zero_is_capped_to_event_window(self, tmp_path, monkeypatch):
+        """since_ts=0 does NOT mean all-history: the 30-day default window is
+        a hard cap, surfaced via checked.event_since."""
+        wb, db_obj, cfg = _patch_writeback(tmp_path, monkeypatch)
+        now = time.time()
+        subscribed = _dispatch("minni_subscribe_contradictions", {
+            "agent_id": "codex",
+            "since_ts": 0,
+        })
+        checked = subscribed["result"]["checked"]
+        assert checked["since_ts"] == 0
+        assert checked["event_since"] == pytest.approx(now - 30 * 86400, abs=120)

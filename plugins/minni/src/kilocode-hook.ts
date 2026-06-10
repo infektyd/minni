@@ -25,7 +25,8 @@ import {
 import { extractScarTissue, prepareOutcome } from "./task.js";
 import {
   auditTail,
-  clearInboxEntry,
+  clearReassertedInboxEntries,
+  collectCorrectionsReassert,
   ensureVault,
   readPendingInbox,
   recordAudit,
@@ -113,6 +114,12 @@ async function handleSessionStart(payload: Record<string, unknown>): Promise<Hoo
   const contradictions = await subscribeContradictions({ agentId: KILOCODE_AGENT_ID });
   const pending = await readPendingInbox(KILOCODE_VAULT_PATH, 3);
   const handoffContext = await resolveInboxHandoffContext(KILOCODE_VAULT_PATH, pending);
+  // hooks-PL-3: re-assert corrections stashed by PreCompact, so the
+  // post-compaction boot re-injects them even if the daemon is down now.
+  // Consumed entries are cleared so they re-inject exactly once and the
+  // inbox does not accumulate stale reassert files across compactions.
+  const correctionsReassert = collectCorrectionsReassert(pending);
+  const clearedReasserts = await clearReassertedInboxEntries(pending);
 
   const envelope = wrapEnvelope({
     event: "SessionStart",
@@ -147,6 +154,9 @@ async function handleSessionStart(payload: Record<string, unknown>): Promise<Hoo
         contradictions.ok && contradictions.data
           ? contradictions.data
           : { ok: false, status: "error", error: contradictions.error },
+      ...(correctionsReassert.length > 0
+        ? { corrections_reassert: correctionsReassert }
+        : {}),
       recall:
         recall.ok && recall.data
           ? {
@@ -178,6 +188,8 @@ async function handleSessionStart(payload: Record<string, unknown>): Promise<Hoo
       afm_ok: status.afm.ok,
       pending_inbox: pending.length,
       handoff_context: handoffContext.length,
+      corrections_reassert: correctionsReassert.length,
+      reassert_entries_cleared: clearedReasserts.length,
     },
   });
 
@@ -263,6 +275,26 @@ async function handlePreCompact(payload: Record<string, unknown>): Promise<HookO
   const sessionId = asString(payload.session_id) || asString(payload.sessionId) || "session";
   const transcript = asString(payload.trigger) || asString(payload.summary);
 
+  // hooks-PL-3: compaction is exactly when a correction the agent already saw
+  // can fall out of context. Stash the current stale-belief/contradiction
+  // events durably in the inbox so the post-compaction SessionStart re-asserts
+  // them (corrections_reassert) even if the daemon is down at next boot.
+  const contradictions = await subscribeContradictions({ agentId: KILOCODE_AGENT_ID });
+  const staleBeliefEvents =
+    contradictions.ok && Array.isArray((contradictions.data as any)?.events)
+      ? ((contradictions.data as any).events as unknown[])
+      : [];
+  let reassertInboxPath: string | undefined;
+  if (staleBeliefEvents.length > 0) {
+    const reassert = await writeInbox(KILOCODE_VAULT_PATH, sessionId, {
+      kind: "precompact_reassert",
+      agent_id: KILOCODE_AGENT_ID,
+      stale_belief_events: staleBeliefEvents,
+      compaction_trigger: transcript || "compaction in progress",
+    });
+    reassertInboxPath = reassert.filePath;
+  }
+
   const envelope = wrapEnvelope({
     event: "PreCompact",
     agent: KILOCODE_AGENT_ID,
@@ -284,6 +316,9 @@ async function handlePreCompact(payload: Record<string, unknown>): Promise<HookO
     details: {
       scar_count: scarTissue.length,
       trigger: transcript || "auto",
+      stale_belief_events: staleBeliefEvents.length,
+      stale_beliefs_ok: contradictions.ok,
+      ...(reassertInboxPath ? { reassert_inbox_path: reassertInboxPath } : {}),
     },
   });
 

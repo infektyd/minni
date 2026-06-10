@@ -29,7 +29,7 @@ from typing import List, Dict, Literal, Optional, Sequence
 
 import numpy as np
 
-from config import SovereignConfig, DEFAULT_CONFIG
+from config import SovereignConfig, DEFAULT_CONFIG, correction_class_page_types
 from db import SovereignDB
 from faiss_index import FAISSIndex
 from query_expand import expand as expand_query
@@ -95,14 +95,10 @@ def _page_type_to_authority(page_type: Optional[str], agent: str) -> Optional[st
     return "vault"
 
 
-def _correction_class_page_types(config) -> set:
-    """Correction-class page types (recall-F3): notes that correct, supersede,
-    or decide against a prior belief. Falls back to the audited default set so
-    duck-typed configs (eval harness) keep the salience channel."""
-    raw = getattr(config, "correction_page_types", None) or (
-        "correction", "contradiction", "decision", "fix",
-    )
-    return {str(t).lower() for t in raw}
+# Correction-class page types (recall-F3) — shared single source of truth in
+# config.py so retrieval and decay cannot drift. Kept as a module alias for
+# existing call sites/tests.
+_correction_class_page_types = correction_class_page_types
 
 
 def _path_to_wikilink(path: str) -> Optional[str]:
@@ -176,6 +172,9 @@ class RetrievalEngine:
         self._feedback_cache = {}
         self._feedback_cache_loaded_at = 0.0
         self.last_trace_id: Optional[str] = None
+        # recall-F3: the correction-class type set is config-invariant — compute
+        # it once here instead of once per scored doc in _score_merged_doc.
+        self._correction_types = _correction_class_page_types(config)
 
     @property
     def model(self):
@@ -600,11 +599,18 @@ class RetrievalEngine:
         a bounded multiplicative boost and a decay floor so a fresh correction
         can outrank a stale habitual hit whose decay saturated via access
         reinforcement (decay rewards rereads; corrections start unread).
+
+        NOTE (known gap): this boost applies to the RRF/final_score channel
+        only. When the cross-encoder reranker is active, its relevance logits
+        drive the final ordering — correction-class candidates are still
+        boosted INTO the reranker candidate set, but their final rank is
+        logit-driven and may override the boost. The boost is not propagated
+        into rerank_score.
         """
         boost = 0.0
         decay = d["decay_score"]
         page_type = str(d.get("page_type") or "").lower()
-        if page_type in _correction_class_page_types(self.config):
+        if page_type in self._correction_types:
             boost = float(getattr(self.config, "correction_salience_boost", 0.25))
             floor = float(getattr(self.config, "correction_decay_floor", 0.5))
             decay = max(decay, floor)

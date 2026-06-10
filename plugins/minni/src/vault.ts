@@ -285,13 +285,15 @@ async function listMarkdownFiles(root: string): Promise<string[]> {
 // recall-F3 mirror (audit cluster C1): correction-class note types — must stay
 // in sync with engine/config.py correction_page_types and the bounded
 // multiplicative boost applied in engine/retrieval.py _score_merged_doc.
-const CORRECTION_CLASS_TYPES = new Set([
+// Exported so the config-contract test can mechanically assert parity with
+// engine/config.py (one-sided drift is this codebase's #1 bug class).
+export const CORRECTION_CLASS_TYPES = new Set([
   "correction",
   "contradiction",
   "decision",
   "fix",
 ]);
-const CORRECTION_SALIENCE_BOOST = 0.25;
+export const CORRECTION_SALIENCE_BOOST = 0.25;
 
 function frontmatterField(markdown: string, key: string): string | undefined {
   const fm = markdown.match(/^---\n([\s\S]*?)\n---/);
@@ -309,10 +311,15 @@ function scoreVaultNote(
   markdown: string,
 ): number {
   // PR-2 status mirror: the engine's retrieval skips superseded/rejected/
-  // expired pages by default (retrieval.py _SKIP_STATUSES); the vault-side
-  // search previously kept re-surfacing corrected-away beliefs forever.
+  // expired/draft pages by default (retrieval.py skip statuses); the vault-
+  // side search previously kept re-surfacing corrected-away beliefs forever.
   const status = frontmatterField(markdown, "status")?.toLowerCase();
-  if (status === "superseded" || status === "rejected" || status === "expired") {
+  if (
+    status === "superseded" ||
+    status === "rejected" ||
+    status === "expired" ||
+    status === "draft"
+  ) {
     return 0;
   }
   if (frontmatterField(markdown, "superseded_by")) return 0;
@@ -948,22 +955,89 @@ export async function readPendingInbox(
   return entries;
 }
 
+/** Hard cap on re-asserted events per boot: the inbox is plain JSON on disk,
+ * so a single crafted/corrupt file must not be able to saturate the context
+ * window via an unbounded stale_belief_events array. */
+export const CORRECTIONS_REASSERT_MAX = 10;
+
+/**
+ * Schema gate for re-asserted events: inbox files are writable by any local
+ * process (AFM writer, CI, npm postinstall...), and their contents are
+ * injected into the model's boot context. Only the expected event shape with
+ * the expected primitive types passes; everything else is dropped (and the
+ * caller logs a warning). No free-form strings beyond originating_agent.
+ */
+function isValidStaleBeliefEvent(value: unknown): boolean {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const e = value as Record<string, unknown>;
+  if (!Number.isInteger(e.event_id)) return false;
+  if (!Number.isInteger(e.superseded_learning_id)) return false;
+  if (!Number.isInteger(e.new_learning_id)) return false;
+  if (
+    e.originating_agent !== undefined &&
+    (typeof e.originating_agent !== "string" ||
+      !/^[\w.:-]{1,64}$/.test(e.originating_agent))
+  ) {
+    return false;
+  }
+  if (e.created_at !== undefined && typeof e.created_at !== "number") return false;
+  return true;
+}
+
 /**
  * hooks-PL-3: collect correction/contradiction events stashed by PreCompact
  * into the inbox so post-compaction boots re-assert them even when the daemon
  * is unreachable at SessionStart. Field-driven (stale_belief_events) rather
  * than kind-driven, so both the dedicated "precompact_reassert" entries
  * (Claude Code) and the codex/grok precompact handoff payloads contribute.
+ *
+ * Inbox content is untrusted (see isValidStaleBeliefEvent): malformed events
+ * are dropped with a stderr warning, and the total is capped.
  */
 export function collectCorrectionsReassert(
-  pending: Array<{ payload: Record<string, unknown> }>,
+  pending: Array<{ payload: Record<string, unknown>; filePath?: string }>,
 ): unknown[] {
   const events: unknown[] = [];
+  let dropped = 0;
   for (const entry of pending) {
     const stashed = entry.payload.stale_belief_events;
-    if (Array.isArray(stashed)) events.push(...stashed);
+    if (!Array.isArray(stashed)) continue;
+    for (const event of stashed) {
+      if (events.length >= CORRECTIONS_REASSERT_MAX) break;
+      if (isValidStaleBeliefEvent(event)) {
+        events.push(event);
+      } else {
+        dropped += 1;
+      }
+    }
+  }
+  if (dropped > 0) {
+    // stderr only: hook stdout is the JSON protocol channel.
+    console.error(
+      `minni: dropped ${dropped} malformed stale_belief_events from inbox (schema gate)`,
+    );
   }
   return events;
+}
+
+/**
+ * After a boot has consumed stashed stale_belief_events (corrections_reassert),
+ * remove the carrying inbox entries so they are not re-injected on every
+ * subsequent SessionStart and do not accumulate without bound across
+ * compaction cycles.
+ */
+export async function clearReassertedInboxEntries(
+  pending: Array<{ payload: Record<string, unknown>; filePath: string }>,
+): Promise<string[]> {
+  const cleared: string[] = [];
+  for (const entry of pending) {
+    const stashed = entry.payload.stale_belief_events;
+    if (Array.isArray(stashed) && stashed.length > 0) {
+      await clearInboxEntry(entry.filePath);
+      cleared.push(entry.filePath);
+    }
+  }
+  return cleared;
 }
 
 function normalizeWikilinkRef(ref: string): string {

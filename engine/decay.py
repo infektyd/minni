@@ -13,7 +13,7 @@ import math
 import logging
 from typing import Dict
 
-from config import SovereignConfig, DEFAULT_CONFIG
+from config import SovereignConfig, DEFAULT_CONFIG, correction_class_page_types
 from db import SovereignDB
 
 logger = logging.getLogger("sovereign.decay")
@@ -40,11 +40,8 @@ class MemoryDecay:
         min_score = self.config.decay_min_score
         # recall-F4: correction-class notes must not lose to stale-but-reread
         # beliefs whose decay saturates at 1.0 via access reinforcement.
-        correction_types = {
-            str(t).lower()
-            for t in (getattr(self.config, "correction_page_types", None)
-                      or ("correction", "contradiction", "decision", "fix"))
-        }
+        # Shared helper (config.py) — same set retrieval.py boosts on.
+        correction_types = correction_class_page_types(self.config)
         grace_sec = float(getattr(self.config, "correction_decay_grace_days", 7.0)) * 86400
         correction_floor = float(getattr(self.config, "correction_decay_floor", 0.5))
         stats = {"updated": 0, "reinforced": 0}

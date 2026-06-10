@@ -28,7 +28,7 @@ import {
 import { extractScarTissue, prepareOutcome } from "./task.js";
 import {
   auditTail,
-  clearInboxEntry,
+  clearReassertedInboxEntries,
   collectCorrectionsReassert,
   ensureVault,
   readPendingInbox,
@@ -143,7 +143,10 @@ async function handleSessionStart(payload: Record<string, unknown>): Promise<Hoo
 
   // hooks-PL-3: re-assert corrections stashed by PreCompact, so the
   // post-compaction boot re-injects them even if the daemon is down now.
+  // Consumed entries are cleared below so they re-inject exactly once and
+  // the inbox does not accumulate stale reassert files across compactions.
   const correctionsReassert = collectCorrectionsReassert(pending);
+  const clearedReasserts = await clearReassertedInboxEntries(pending);
 
   const envelopeBody: any = {
     contract: MEMORY_CONTRACT,
@@ -221,6 +224,8 @@ async function handleSessionStart(payload: Record<string, unknown>): Promise<Hoo
       afm_ok: status.afm.ok,
       pending_inbox: pending.length,
       handoff_context: handoffContext.length,
+      corrections_reassert: correctionsReassert.length,
+      reassert_entries_cleared: clearedReasserts.length,
     },
   });
 
