@@ -362,7 +362,7 @@ export const CORRECTION_CLASS_TYPES = new Set([
 export const CORRECTION_SALIENCE_BOOST = 0.25;
 
 function frontmatterField(markdown: string, key: string): string | undefined {
-  const fm = markdown.match(/^---\n([\s\S]*?)\n---/);
+  const fm = markdown.match(/^---\r?\n([\s\S]*?)\r?\n---/);
   if (!fm) return undefined;
   // Escape regex metacharacters: the key is interpolated into a RegExp, so a
   // key like "a.b" must match literally, not as a pattern.
@@ -1451,7 +1451,9 @@ export async function expireStaleInboxHandoffs(
     } catch {
       continue; // unreadable files are not handoffs; leave them alone
     }
-    if (payload.kind !== "handoff") continue;
+    // JSON.parse("null") succeeds, so a null payload would throw on .kind
+    // below and abort the whole drain loop; non-objects are not handoffs.
+    if (!payload || typeof payload !== "object" || payload.kind !== "handoff") continue;
     let status: "expired" | "acked";
     if (typeof payload.ack_status === "string" && payload.ack_status) {
       status = "acked"; // terminal leftover; archive regardless of age

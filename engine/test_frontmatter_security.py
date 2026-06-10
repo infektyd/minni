@@ -216,3 +216,20 @@ body
 """
     meta = VaultIndexer._extract_frontmatter(single)
     assert meta["privacy_level"] == "local-only"
+
+
+def test_duplicate_privacy_keys_fail_closed_with_crlf_line_endings():
+    """SEC-006 regression: CRLF content must not bypass the duplicate-key
+    differential. _str() strips the trailing \\r before the valid_privacies
+    check (and the indexer's text-mode read normalizes newlines anyway), so a
+    permissive duplicate after a restrictive one still loses."""
+    crlf = (
+        "---\r\n"
+        "agent: alice\r\n"
+        "privacy: private\r\n"
+        "privacy: safe\r\n"
+        "---\r\n"
+        "body\r\n"
+    )
+    meta = VaultIndexer._extract_frontmatter(crlf)
+    assert meta["privacy_level"] == "private"

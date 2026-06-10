@@ -136,6 +136,7 @@ def _read_persistent_probe_entries() -> Dict[str, Dict[str, Any]]:
 
 def _write_persistent_probe_entries(entries: Dict[str, Dict[str, Any]]) -> None:
     # Best-effort: persistence must never break the health path.
+    temp_path = None
     try:
         file_path = _probe_cache_file_path()
         os.makedirs(os.path.dirname(file_path), exist_ok=True)
@@ -144,8 +145,16 @@ def _write_persistent_probe_entries(entries: Dict[str, Dict[str, Any]]) -> None:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(json.dumps({"version": _PROBE_CACHE_FILE_VERSION, "entries": entries}))
         os.replace(temp_path, file_path)
+        temp_path = None  # renamed away; nothing to clean up
     except OSError:
         pass
+    finally:
+        # A failed write/rename must not leak .tmp files into the run dir.
+        if temp_path:
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
 
 
 def _persist_probe_mutation(mutate: Callable[[Dict[str, Dict[str, Any]]], None]) -> None:

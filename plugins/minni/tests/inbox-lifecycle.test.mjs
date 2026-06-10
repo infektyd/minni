@@ -654,3 +654,33 @@ test("all four hooks inject the active plan through the shared plan helpers (C5 
     );
   }
 });
+
+test("expireStaleInboxHandoffs skips non-object JSON payloads without aborting the drain", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-inbox-nonobj-"));
+  try {
+    const now = Date.parse("2026-06-10T12:00:00Z");
+    const agedTs = now - 40 * DAY;
+    const inbox = path.join(root, "inbox");
+    await mkdir(inbox, { recursive: true });
+    // JSON.parse succeeds on these but yields non-objects; .kind access on
+    // null would throw outside the parse catch and abort the whole loop.
+    const nullName = compactName(agedTs, "a-null-payload");
+    await writeFile(path.join(inbox, nullName), "null", "utf8");
+    await writeFile(path.join(inbox, compactName(agedTs, "b-number-payload")), "5", "utf8");
+    // Genuine aged handoff sorted after the poison files: proves the loop survives.
+    const agedName = compactName(agedTs, "c-real-handoff");
+    await writeInboxFixture(root, agedName, {
+      kind: "handoff",
+      slug: "real-handoff",
+      createdAt: new Date(agedTs).toISOString(),
+    });
+
+    const reaped = await expireStaleInboxHandoffs(root, 7, now);
+    assert.equal(reaped.length, 1, "drain must continue past non-object payloads");
+    assert.equal(reaped[0].slug, "real-handoff");
+    const live = (await readdir(inbox)).filter((n) => n.endsWith(".json"));
+    assert.ok(live.includes(nullName), "non-handoff files are left alone");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
