@@ -8,6 +8,7 @@ import test from "node:test";
 
 import {
   archiveInboxEntry,
+  buildPendingLearningsSection,
   ensureVault,
   expireStaleInboxHandoffs,
   parseInboxTimestamp,
@@ -174,6 +175,142 @@ test("expireStaleInboxHandoffs: aged handoff expires, surfaces exactly once, sto
       "utf8",
     );
     assert.equal(JSON.parse(archivedRaw).kind, "handoff");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("expireStaleInboxHandoffs honors live ack-channel leases and labels acked leftovers (lease semantics)", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-inbox-lease-"));
+  try {
+    const now = Date.parse("2026-06-10T12:00:00Z");
+    const agedTs = now - 30 * DAY;
+    // (1) Aged file, but a LIVE pending lease: requires_ack + future
+    // expires_at. The daemon ack channel owns it; the reaper must skip it.
+    const liveName = compactName(agedTs, "live-lease");
+    await writeInboxFixture(root, liveName, {
+      kind: "handoff",
+      slug: "live-lease",
+      lease_id: "handoff-live",
+      requires_ack: true,
+      expires_at: "2026-07-01T00:00:00Z",
+    });
+    // (2) Aged lease whose OWN expiry has passed -> expired.
+    const deadName = compactName(agedTs, "dead-lease");
+    await writeInboxFixture(root, deadName, {
+      kind: "handoff",
+      slug: "dead-lease",
+      lease_id: "handoff-dead",
+      requires_ack: true,
+      expires_at: "2026-05-15T00:00:00Z",
+    });
+    // (3) Aged pending lease with NO expires_at -> skip (ack channel drains it).
+    const noExpName = compactName(agedTs, "noexp-lease");
+    await writeInboxFixture(root, noExpName, {
+      kind: "handoff",
+      slug: "noexp-lease",
+      lease_id: "handoff-noexp",
+      requires_ack: true,
+    });
+    // (4) Already-acked leftover -> archived as "acked", never "expired".
+    const ackedName = compactName(agedTs, "acked-lease");
+    await writeInboxFixture(root, ackedName, {
+      kind: "handoff",
+      slug: "acked-lease",
+      lease_id: "handoff-acked",
+      requires_ack: true,
+      ack_status: "accepted",
+      expires_at: "2026-07-01T00:00:00Z",
+    });
+
+    const reaped = await expireStaleInboxHandoffs(root, 7, now);
+    const bySlug = new Map(reaped.map((e) => [e.slug, e]));
+    assert.deepEqual(
+      [...bySlug.keys()].sort(),
+      ["acked-lease", "dead-lease"],
+      "live/no-expiry leases must be skipped; only own-expiry and acked drain",
+    );
+    assert.equal(bySlug.get("dead-lease").status, "expired");
+    assert.equal(bySlug.get("acked-lease").status, "acked");
+    for (const entry of reaped) {
+      assert.ok(entry.archivedPath, "surfaced entries are always archived");
+    }
+    const live = (await readdir(path.join(root, "inbox"))).filter((n) => n.endsWith(".json"));
+    assert.deepEqual(live.sort(), [liveName, noExpName].sort());
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("expireStaleInboxHandoffs never reads dashed-name files (cheap pre-filter)", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-inbox-prefilter-"));
+  try {
+    const now = Date.parse("2026-06-10T12:00:00Z");
+    // A dashed-name file that CLAIMS kind handoff: the plugin channel never
+    // writes plain handoffs, so the reaper must skip it without reading —
+    // unparseable content proves no JSON.parse was attempted on it.
+    const dashedHandoff = dashedName(now - 40 * DAY, "fake-handoff");
+    const inbox = path.join(root, "inbox");
+    await mkdir(inbox, { recursive: true });
+    await writeFile(path.join(inbox, dashedHandoff), "{not json", "utf8");
+
+    const reaped = await expireStaleInboxHandoffs(root, 7, now);
+    assert.equal(reaped.length, 0);
+    const live = (await readdir(inbox)).filter((n) => n.endsWith(".json"));
+    assert.deepEqual(live, [dashedHandoff], "dashed-name files are untouched");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("buildPendingLearningsSection: shared envelope shape with honest totals (B2 envelope gate)", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-inbox-envelope-"));
+  try {
+    const now = Date.parse("2026-06-10T12:00:00Z");
+    for (let i = 0; i < 5; i++) {
+      const ts = now - (i + 1) * DAY;
+      await writeInboxFixture(root, dashedName(ts, `entry-${i}`), {
+        slug: `entry-${i}`,
+        createdAt: new Date(ts).toISOString(),
+        candidates: [`lesson ${i}`],
+        kind: "stop_candidates",
+        task: `task ${i}`,
+      });
+    }
+    const agedName = compactName(now - 20 * DAY, "stale-handoff");
+    await writeInboxFixture(root, agedName, {
+      kind: "handoff",
+      slug: "stale-handoff",
+      task: "stale",
+    });
+
+    // Mirror the hooks' SessionStart order: reap, then honest read, then build.
+    const expired = await expireStaleInboxHandoffs(root, 7, now);
+    const status = await readInboxStatus(root, 3, now);
+    const section = buildPendingLearningsSection(status, expired);
+
+    assert.equal(section.total_pending, 5, "total is the FULL backlog, not the cap");
+    assert.equal(section.oldest_age_days, 5);
+    assert.equal(section.showing, 3, "3-of-5 visible as such");
+    assert.equal(section.entries.length, 3);
+    for (const entry of section.entries) {
+      assert.deepEqual(
+        Object.keys(entry).sort(),
+        ["candidates", "created", "kind", "path", "slug", "task"],
+      );
+    }
+    assert.equal(section.entries[0].slug, "entry-0", "true newest first");
+    assert.equal(section.expired_handoffs.length, 1);
+    const [eh] = section.expired_handoffs;
+    assert.equal(eh.slug, "stale-handoff");
+    assert.equal(eh.status, "expired");
+    assert.equal(eh.age_days, 20);
+    assert.ok(eh.archived_to.includes(`${path.sep}.archive${path.sep}`));
+    assert.deepEqual(
+      Object.keys(section).sort(),
+      ["entries", "expired_handoffs", "oldest_age_days", "showing", "total_pending"],
+      "envelope section shape is pinned for all four hooks",
+    );
   } finally {
     await rm(root, { recursive: true, force: true });
   }

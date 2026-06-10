@@ -23,6 +23,7 @@ import { extractScarTissue, prepareOutcome } from "./task.js";
 import {
   auditTail,
   ensureVault,
+  buildPendingLearningsSection,
   expireStaleInboxHandoffs,
   readInboxStatus,
   recordAudit,
@@ -139,26 +140,7 @@ async function handleSessionStart(payload: Record<string, unknown>): Promise<Hoo
         afm_ok: status.afm.ok,
         runtime: "grok-build",
       },
-      pending_learnings: {
-        total_pending: inboxStatus.totalPending,
-        oldest_age_days: inboxStatus.oldestAgeDays,
-        showing: pending.length,
-        entries: pending.map((entry) => ({
-          slug: entry.slug,
-          created: entry.createdAt,
-          path: entry.filePath,
-          candidates: entry.payload.candidates,
-          kind: entry.payload.kind,
-          task: entry.payload.task,
-        })),
-        expired_handoffs: expiredHandoffs.map((entry) => ({
-          slug: entry.slug,
-          status: entry.status,
-          age_days: entry.ageDays,
-          created: entry.createdAt,
-          archived_to: entry.archivedPath,
-        })),
-      },
+      pending_learnings: buildPendingLearningsSection(inboxStatus, expiredHandoffs),
       handoff_context: handoffContext.map((snippet) => ({
         ref: snippet.ref,
         path: snippet.relativePath,

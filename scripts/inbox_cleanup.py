@@ -10,13 +10,27 @@ deletes) files that no longer need to live in the hot inbox:
   * ``ingested``          — every eligible candidate string in the file has a
     DB row (any status). The DB rows carry the content from here on; the
     consolidation loop drains rows, not files.
-  * ``expired_handoff``   — ``kind: handoff`` files older than the TTL
-    (default 7 days). These are invisible to the lease ack channel
-    (``requires_ack`` falsy), so without a TTL they pin the inbox forever —
-    e.g. the orphaned 2026-04-26 ``...review-auth-migration-trace-pr.json``.
+  * ``expired_handoff``   — ``kind: handoff`` files past their drain point:
+    pending ack-channel leases (``requires_ack`` truthy) ONLY once their own
+    ``expires_at`` has passed (a live lease is the daemon's to drain, never
+    ours); requires_ack-falsy orphans once older than the TTL (default 7
+    days) — these are invisible to the lease ack channel, so without a TTL
+    they pin the inbox forever, e.g. the orphaned 2026-04-26
+    ``...review-auth-migration-trace-pr.json``.
+  * ``acked_handoff``     — handoff packets whose lease was already
+    acknowledged (``ack_status`` set): terminal leftovers, archived
+    regardless of age and never mislabeled as expired.
+  * ``nothing_ingestible`` — stop-candidate files inbox_ingest will NEVER
+    take anything from (file-level ``log_only``/``do_not_store``, all
+    candidates filtered or blank) with no derived DB rows, once older than
+    the residue threshold (default 14 days).
+  * ``unrecognized_kind`` — explicit non-handoff kinds inbox_ingest drops at
+    its kind gate (``*_precompact_handoff``, ``failed_command``, ...), once
+    older than the residue threshold. Without this the residue has no drain
+    path at all.
 
 Everything else is left in place (not-yet-ingested stop candidates, fresh
-handoffs, unknown kinds, unparseable files).
+handoffs, live ack leases, fresh residue, unparseable files).
 
 Safety contract:
   * DRY-RUN BY DEFAULT. Pass ``--apply`` to actually move files.
@@ -46,7 +60,17 @@ from typing import Any, Dict, List, Optional
 DEFAULT_HOME = "~/.minni"
 DEFAULT_DB = "~/.minni/minni.db"
 DEFAULT_HANDOFF_TTL_DAYS = 7.0
+DEFAULT_RESIDUE_TTL_DAYS = 14.0
 ARCHIVE_DIRNAME = ".archive"
+
+ARCHIVE_REASONS = (
+    "ingested_resolved",
+    "ingested",
+    "expired_handoff",
+    "acked_handoff",
+    "nothing_ingestible",
+    "unrecognized_kind",
+)
 
 # Mirrors afm_passes.inbox_ingest.STOP_KINDS / afm_passes.inbox_archive.
 STOP_KINDS = frozenset({"stop_candidates", "codex_stop_candidates"})
@@ -89,6 +113,28 @@ def parse_name_epoch(name: str) -> Optional[float]:
             pass
         return day
     return None
+
+
+def parse_iso_epoch(value: Any) -> Optional[float]:
+    """Epoch seconds for an ISO-8601 UTC string (the daemon's expires_at
+    format), or None when missing/unparseable."""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        import calendar
+        return float(calendar.timegm(time.strptime(value[:19], "%Y-%m-%dT%H:%M:%S")))
+    except Exception:
+        return None
+
+
+def _file_age_seconds(path: Path, now: float) -> Optional[float]:
+    created = parse_name_epoch(path.name)
+    if created is None:
+        try:
+            created = path.stat().st_mtime
+        except OSError:
+            return None
+    return now - created
 
 
 def load_inbox_rows(db_path: Path) -> Dict[str, List[Dict[str, Any]]]:
@@ -159,8 +205,9 @@ def classify_file(
     rows_by_file: Dict[str, List[Dict[str, Any]]],
     handoff_ttl_days: float,
     now: float,
+    residue_ttl_days: float = DEFAULT_RESIDUE_TTL_DAYS,
 ) -> str:
-    """Return an archive reason for `path`, or 'keep'."""
+    """Return an archive reason for `path` (one of ARCHIVE_REASONS), or 'keep'."""
     try:
         doc = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
@@ -180,21 +227,43 @@ def classify_file(
             if all(r["status"] in TERMINAL_STATUSES for r in rows):
                 return "ingested_resolved"
             return "ingested"
-        return "keep"  # not (fully) ingested yet — or nothing ingestible
+        if not eligible and not rows:
+            # inbox_ingest will NEVER take anything from this file (file-level
+            # log_only/do_not_store, all candidates filtered or blank) and no
+            # DB row will ever drain it — archive the residue once stale.
+            age = _file_age_seconds(path, now)
+            if age is not None and age > residue_ttl_days * 86400:
+                return "nothing_ingestible"
+        return "keep"  # not (fully) ingested yet — or fresh residue
 
     if rows and all(r["status"] in TERMINAL_STATUSES for r in rows):
         # Odd/legacy shape that nonetheless has fully-resolved derived rows.
         return "ingested_resolved"
 
-    if doc.get("kind") == "handoff":
-        created = parse_name_epoch(path.name)
-        if created is None:
-            try:
-                created = path.stat().st_mtime
-            except OSError:
-                return "keep"
-        if now - created > handoff_ttl_days * 86400:
+    kind = doc.get("kind")
+    if kind == "handoff":
+        if doc.get("ack_status"):
+            # Lease already acknowledged — terminal leftover, never 'expired'.
+            return "acked_handoff"
+        if doc.get("requires_ack"):
+            # Live ack-channel lease: the daemon owns it. Only its OWN expiry
+            # drains it here; a missing/unparseable expires_at means keep.
+            expires_at = parse_iso_epoch(doc.get("expires_at"))
+            if expires_at is not None and expires_at <= now:
+                return "expired_handoff"
+            return "keep"
+        age = _file_age_seconds(path, now)
+        if age is not None and age > handoff_ttl_days * 86400:
             return "expired_handoff"
+        return "keep"
+
+    if isinstance(kind, str) and kind:
+        # Explicit non-handoff kinds are dropped at inbox_ingest's kind gate
+        # (*_precompact_handoff, failed_command, ...) and have no drain path —
+        # archive the residue once stale so it stops pinning the inbox.
+        age = _file_age_seconds(path, now)
+        if age is not None and age > residue_ttl_days * 86400:
+            return "unrecognized_kind"
     return "keep"
 
 
@@ -224,6 +293,7 @@ def run_cleanup(
     home: Path,
     db_path: Path,
     handoff_ttl_days: float = DEFAULT_HANDOFF_TTL_DAYS,
+    residue_ttl_days: float = DEFAULT_RESIDUE_TTL_DAYS,
     apply: bool = False,
     now: Optional[float] = None,
 ) -> Dict[str, Any]:
@@ -234,15 +304,16 @@ def run_cleanup(
         "db": str(db_path),
         "dry_run": not apply,
         "handoff_ttl_days": handoff_ttl_days,
+        "residue_ttl_days": residue_ttl_days,
         "vaults": {},
     }
     for inbox in discover_vault_inboxes(home):
         vault_name = inbox.parent.name
-        counts = {"total": 0, "keep": 0, "ingested_resolved": 0, "ingested": 0, "expired_handoff": 0}
+        counts = {"total": 0, "keep": 0, **{reason: 0 for reason in ARCHIVE_REASONS}}
         to_archive: List[Dict[str, str]] = []
         for path in sorted(inbox.glob("*.json")):
             counts["total"] += 1
-            reason = classify_file(path, rows_by_file, handoff_ttl_days, now)
+            reason = classify_file(path, rows_by_file, handoff_ttl_days, now, residue_ttl_days)
             counts[reason] += 1
             if reason == "keep":
                 continue
@@ -264,7 +335,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--db", default=DEFAULT_DB, help="Path to minni.db")
     parser.add_argument(
         "--handoff-ttl-days", type=float, default=DEFAULT_HANDOFF_TTL_DAYS,
-        help="Archive kind:handoff inbox files older than this many days",
+        help="Archive requires_ack-less kind:handoff inbox files older than this many days",
+    )
+    parser.add_argument(
+        "--residue-ttl-days", type=float, default=DEFAULT_RESIDUE_TTL_DAYS,
+        help="Archive never-ingestible residue (nothing_ingestible / "
+        "unrecognized_kind) older than this many days",
     )
     parser.add_argument(
         "--dry-run", action="store_true", default=True,
@@ -280,6 +356,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         home=Path(args.home).expanduser(),
         db_path=Path(args.db).expanduser(),
         handoff_ttl_days=args.handoff_ttl_days,
+        residue_ttl_days=args.residue_ttl_days,
         apply=bool(args.apply),
     )
     print(json.dumps(report, indent=2))

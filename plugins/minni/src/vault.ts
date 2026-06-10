@@ -1079,10 +1079,16 @@ export async function archiveInboxEntry(filePath: string): Promise<string | unde
 export interface ExpiredInboxHandoff {
   slug: string;
   filePath: string;
-  archivedPath?: string;
+  /** Always set: an entry is only surfaced when THIS session archived it. */
+  archivedPath: string;
   createdAt: string;
   ageDays: number;
-  status: "expired";
+  /**
+   * "expired": TTL (or the lease's own expires_at) elapsed unacknowledged.
+   * "acked": leftover packet whose lease was already acknowledged — archived,
+   * never reported as expired.
+   */
+  status: "expired" | "acked";
   task?: unknown;
 }
 
@@ -1092,14 +1098,31 @@ export function inboxHandoffTtlDays(): number {
 }
 
 /**
- * TTL reaper for the FILE handoff channel (audit C2/B3). `kind: handoff`
- * inbox files are invisible to the lease ack channel (`requires_ack` falsy in
- * minnid's listing), so without a TTL they pin the inbox forever. Semantics
- * ported from the agent_ping lease model (agent_ping.ts withExpiry /
- * checkAndReapLease): expiry is evaluated at read time; an expired entry is
- * surfaced ONCE — returned with explicit status "expired", never silently
- * dropped — and immediately archived so it cannot re-surface. Rename only,
- * never unlink.
+ * Plain `kind: handoff` inbox files are written ONLY by the daemon handoff
+ * channel, which uses the compact `YYYYMMDDTHHMMSSZ-` stamp. Plugin-written
+ * (dashed-date) files are stop candidates / precompact handoffs / failed
+ * commands — never plain handoffs — so the reaper can skip them WITHOUT
+ * reading, keeping SessionStart O(handoff files) instead of O(backlog).
+ */
+const COMPACT_HANDOFF_NAME = /^\d{8}T\d{6}Z-/;
+
+/**
+ * TTL reaper for the FILE handoff channel (audit C2/B3). Orphaned
+ * `kind: handoff` inbox files (`requires_ack` falsy) are invisible to the
+ * lease ack channel (minnid's listing skips them), so without a TTL they pin
+ * the inbox forever. Semantics ported from the agent_ping lease model
+ * (agent_ping.ts withExpiry / checkAndReapLease): expiry is evaluated at read
+ * time, honoring each lease's OWN expiry first:
+ *   - `ack_status` set: lease already acknowledged — archive the leftover
+ *     packet, surfaced as "acked" (never mislabeled "expired").
+ *   - `requires_ack` truthy: a live ack-channel lease the daemon owns; only
+ *     reaped once its own `expires_at` has passed (missing/unparseable
+ *     `expires_at` => never reaped here; the ack channel drains it).
+ *   - otherwise (the orphan shape): the TTL applies.
+ * An entry is surfaced AT MOST once — only when this call's archive rename
+ * succeeded — with an explicit status, never silently dropped. A failed or
+ * raced archive surfaces nothing (the winner reports; a failure retries next
+ * session). Rename only, never unlink.
  */
 export async function expireStaleInboxHandoffs(
   vaultPath: string,
@@ -1116,6 +1139,7 @@ export async function expireStaleInboxHandoffs(
   const cutoff = now - ttlDays * 86_400_000;
   const expired: ExpiredInboxHandoff[] = [];
   for (const name of names) {
+    if (!COMPACT_HANDOFF_NAME.test(name)) continue; // cheap pre-filter, no read
     const filePath = path.join(dir, name);
     let ts = parseInboxTimestamp(name);
     if (ts === undefined) {
@@ -1133,7 +1157,19 @@ export async function expireStaleInboxHandoffs(
       continue; // unreadable files are not handoffs; leave them alone
     }
     if (payload.kind !== "handoff") continue;
+    let status: "expired" | "acked";
+    if (typeof payload.ack_status === "string" && payload.ack_status) {
+      status = "acked"; // terminal leftover; archive, do not call it expired
+    } else if (payload.requires_ack) {
+      const leaseExpiry =
+        typeof payload.expires_at === "string" ? Date.parse(payload.expires_at) : NaN;
+      if (!Number.isFinite(leaseExpiry) || leaseExpiry > now) continue; // live lease: daemon owns it
+      status = "expired";
+    } else {
+      status = "expired"; // requires_ack-falsy orphan; TTL already elapsed
+    }
     const archivedPath = await archiveInboxEntry(filePath);
+    if (!archivedPath) continue; // raced (winner reports) or failed (retry next session)
     expired.push({
       slug: typeof payload.slug === "string" ? payload.slug : name,
       filePath,
@@ -1143,11 +1179,44 @@ export async function expireStaleInboxHandoffs(
           ? payload.createdAt
           : new Date(ts).toISOString(),
       ageDays: Math.floor((now - ts) / 86_400_000),
-      status: "expired",
+      status,
       task: payload.task,
     });
   }
   return expired;
+}
+
+/**
+ * Shared SessionStart `pending_learnings` envelope section (audit C2/B2):
+ * honest totals (`total_pending`, `oldest_age_days`, `showing`) alongside the
+ * capped entries, plus the TTL reaper's once-only expired/acked handoffs.
+ * All four hooks (claude-code, codex, grok, kilocode) MUST build the section
+ * through this function so the shape cannot drift per hook.
+ */
+export function buildPendingLearningsSection(
+  inboxStatus: InboxStatus,
+  expiredHandoffs: ExpiredInboxHandoff[],
+): Record<string, unknown> {
+  return {
+    total_pending: inboxStatus.totalPending,
+    oldest_age_days: inboxStatus.oldestAgeDays,
+    showing: inboxStatus.entries.length,
+    entries: inboxStatus.entries.map((entry) => ({
+      slug: entry.slug,
+      created: entry.createdAt,
+      path: entry.filePath,
+      candidates: entry.payload.candidates,
+      kind: entry.payload.kind,
+      task: entry.payload.task,
+    })),
+    expired_handoffs: expiredHandoffs.map((entry) => ({
+      slug: entry.slug,
+      status: entry.status,
+      age_days: entry.ageDays,
+      created: entry.createdAt,
+      archived_to: entry.archivedPath,
+    })),
+  };
 }
 
 export async function vaultExists(vaultPath: string): Promise<boolean> {

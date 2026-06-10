@@ -186,6 +186,9 @@ def test_handoff_pending_list_and_ack(monkeypatch, tmp_path):
     })["result"]
     assert [item["lease_id"] for item in pending["handoffs"]] == [lease_id]
 
+    inbox_path = Path(sent["inbox_path"])
+    outbox_path = Path(sent["outbox_path"])
+
     ack = minnid._dispatch_sync({
         "jsonrpc": "2.0",
         "id": 22,
@@ -194,6 +197,17 @@ def test_handoff_pending_list_and_ack(monkeypatch, tmp_path):
     })["result"]
     assert ack["status"] == "accepted"
     assert len(ack["updated_paths"]) == 2
+
+    # B1 archive-on-ack: exactly the recipient INBOX copy is archived (rename
+    # into inbox/.archive, name preserved); the outbox copy stays put for
+    # await_handoff and carries the ack_status.
+    expected_archive = recipient / "inbox" / ".archive" / inbox_path.name
+    assert ack["archived_paths"] == [str(expected_archive)]
+    assert not inbox_path.exists(), "inbox copy must leave the live inbox"
+    assert expected_archive.is_file(), "inbox copy archived, never deleted"
+    assert json.loads(expected_archive.read_text())["ack_status"] == "accepted"
+    assert outbox_path.is_file(), "outbox copy must survive the ack"
+    assert json.loads(outbox_path.read_text())["ack_status"] == "accepted"
 
     with db_obj.cursor() as c:
         row = c.execute(

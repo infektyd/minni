@@ -57,6 +57,15 @@ def archive_inbox_file(file_path: Path) -> Optional[str]:
     while target.exists():
         target = archive_dir / f"{file_path.stem}.{suffix}{file_path.suffix}"
         suffix += 1
+    # Containment (defense-in-depth behind _derived_inbox_file's basename
+    # guard): the rename target must stay inside the sibling .archive dir —
+    # never let a crafted name move a file anywhere else.
+    try:
+        if target.resolve().parent != archive_dir.resolve():
+            logger.warning("inbox archive: refusing non-contained target %s", target)
+            return None
+    except OSError:
+        return None
     os.replace(file_path, target)
     return str(target)
 
@@ -72,7 +81,22 @@ def _derived_inbox_file(derived_from: Any) -> Optional[str]:
     if not isinstance(obj, dict) or obj.get("source") != "inbox":
         return None
     name = obj.get("inbox_file")
-    return name if isinstance(name, str) and name else None
+    if not isinstance(name, str) or not name:
+        return None
+    # Path-traversal guard: derived_from is client-controllable (any UDS caller
+    # can stage a candidate with an arbitrary blob, and resolve is permissive),
+    # while the legitimate writer (inbox_ingest) only ever stores `path.name`.
+    # Reject anything that is not a pure basename.
+    if (
+        name in {".", ".."}
+        or name != os.path.basename(name)
+        or "/" in name
+        or os.sep in name
+        or (os.altsep and os.altsep in name)
+    ):
+        logger.warning("inbox archive: rejecting non-basename inbox_file %r", name)
+        return None
+    return name
 
 
 def _statuses_for_inbox_file(db, inbox_file: str) -> List[str]:
@@ -116,6 +140,13 @@ def maybe_archive_for_candidate(db, config, candidate_id: int) -> Optional[str]:
     # (mirrors inbox_ingest's name-keyed idempotency semantics).
     for inbox in discover_inboxes(config):
         source = inbox / inbox_file
+        try:
+            # Belt-and-braces containment: the joined path must stay inside
+            # this inbox dir (basename guard above already rejects traversal).
+            if not source.resolve().is_relative_to(inbox.resolve()):
+                continue
+        except OSError:
+            continue
         if source.is_file():
             archived = archive_inbox_file(source)
             if archived:
