@@ -30,13 +30,13 @@ import {
 import { extractScarTissue, prepareOutcome } from "./task.js";
 import {
   auditTail,
-  clearReassertedInboxEntries,
   collectCorrectionsReassert,
   ensureVault,
   readPendingInbox,
   recordAudit,
   resolveInboxHandoffContext,
   searchVaultNotes,
+  settleReassertedInboxEntries,
   writeInbox,
 } from "./vault.js";
 import type { VaultSearchResult } from "./vault.js";
@@ -145,12 +145,15 @@ async function handleSessionStart(payload: Record<string, unknown>): Promise<Hoo
 
   // hooks-PL-3: re-assert corrections stashed by PreCompact, so the
   // post-compaction boot re-injects them even if the daemon is down now.
-  // Only entries whose events were actually consumed are cleared, so they
-  // re-inject exactly once and the inbox does not accumulate stale reassert
-  // files across compactions (all-malformed entries survive for inspection).
-  const { events: correctionsReassert, consumedPaths: reassertConsumed } =
+  // Only fully-consumed entries are cleared (exactly-once re-injection, no
+  // unbounded inbox growth); cap-overflowed tails are rewritten for the next
+  // boot, and all-malformed entries survive for inspection.
+  const { events: correctionsReassert, consumedPaths: reassertConsumed, deferredTails: reassertDeferred } =
     collectCorrectionsReassert(pending);
-  const clearedReasserts = await clearReassertedInboxEntries(reassertConsumed);
+  await settleReassertedInboxEntries({
+    consumedPaths: reassertConsumed,
+    deferredTails: reassertDeferred,
+  });
 
   const envelopeBody: any = {
     contract: MEMORY_CONTRACT,
@@ -229,7 +232,8 @@ async function handleSessionStart(payload: Record<string, unknown>): Promise<Hoo
       pending_inbox: pending.length,
       handoff_context: handoffContext.length,
       corrections_reassert: correctionsReassert.length,
-      reassert_entries_cleared: clearedReasserts.length,
+      reassert_entries_cleared: reassertConsumed.length,
+      reassert_tails_deferred: reassertDeferred.length,
     },
   });
 

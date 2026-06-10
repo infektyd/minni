@@ -25,13 +25,13 @@ import {
 import { extractScarTissue, prepareOutcome } from "./task.js";
 import {
   auditTail,
-  clearReassertedInboxEntries,
   collectCorrectionsReassert,
   ensureVault,
   readPendingInbox,
   recordAudit,
   resolveInboxHandoffContext,
   searchVaultNotes,
+  settleReassertedInboxEntries,
   writeInbox,
 } from "./vault.js";
 import type { VaultSearchResult } from "./vault.js";
@@ -137,10 +137,14 @@ async function handleSessionStart(payload: Record<string, unknown>): Promise<Hoo
   ]);
   const handoffContext = await resolveInboxHandoffContext(DEFAULT_VAULT_PATH, pending);
   // Consumed reassert events are cleared so they re-inject exactly once and
-  // the inbox does not accumulate stale reassert files across compactions.
-  const { events: correctionsReassert, consumedPaths: reassertConsumed } =
+  // the inbox does not accumulate stale reassert files across compactions;
+  // cap-overflowed tails are rewritten so they re-inject on the next boot.
+  const { events: correctionsReassert, consumedPaths: reassertConsumed, deferredTails: reassertDeferred } =
     collectCorrectionsReassert(pending);
-  const clearedReasserts = await clearReassertedInboxEntries(reassertConsumed);
+  await settleReassertedInboxEntries({
+    consumedPaths: reassertConsumed,
+    deferredTails: reassertDeferred,
+  });
 
   const envelope = wrapEnvelope({
     event: "SessionStart",
@@ -216,10 +220,18 @@ async function handleSessionStart(payload: Record<string, unknown>): Promise<Hoo
       handoff_context: handoffContext.length,
       workspace: workspaceId,
       corrections_reassert: correctionsReassert.length,
-      reassert_entries_cleared: clearedReasserts.length,
+      reassert_entries_cleared: reassertConsumed.length,
+      reassert_tails_deferred: reassertDeferred.length,
     },
   });
 
+  // hooks-PL-2 (deliberate asymmetry with hook.ts/kilocode-hook.ts): no
+  // recent_learnings envelope field here. The codex hook injects the FULL
+  // daemon read context as native Layer 1 below — including its recency-
+  // ordered "## Learnings" section — so a trimmed duplicate inside the
+  // envelope would be pure redundancy. The matrix test asserts both sides
+  // of this contract (recent_learnings === undefined AND the Learnings
+  // section present in the native layer).
   const nativeLayer1 = identityRead.ok && identityRead.data?.context ? identityRead.data.context.trim() : "";
   return withHookContext("SessionStart", [nativeLayer1, envelope].filter(Boolean).join("\n\n"));
 }

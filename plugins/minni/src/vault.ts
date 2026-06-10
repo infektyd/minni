@@ -298,7 +298,10 @@ export const CORRECTION_SALIENCE_BOOST = 0.25;
 function frontmatterField(markdown: string, key: string): string | undefined {
   const fm = markdown.match(/^---\n([\s\S]*?)\n---/);
   if (!fm) return undefined;
-  const line = fm[1].match(new RegExp(`^${key}:[ \\t]*(.+)$`, "m"));
+  // Escape regex metacharacters: the key is interpolated into a RegExp, so a
+  // key like "a.b" must match literally, not as a pattern.
+  const safeKey = key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const line = fm[1].match(new RegExp(`^${safeKey}:[ \\t]*(.+)$`, "m"));
   const value = line?.[1]?.trim().replace(/^["']|["']$/g, "");
   return value || undefined;
 }
@@ -980,7 +983,9 @@ function isValidStaleBeliefEvent(value: unknown): boolean {
   ) {
     return false;
   }
-  if (e.created_at !== undefined && typeof e.created_at !== "number") return false;
+  // Number.isFinite (not typeof): NaN/±Infinity are numbers but never valid
+  // timestamps, and they poison any downstream date arithmetic.
+  if (e.created_at !== undefined && !Number.isFinite(e.created_at)) return false;
   return true;
 }
 
@@ -994,13 +999,15 @@ function isValidStaleBeliefEvent(value: unknown): boolean {
  * Inbox content is untrusted (see isValidStaleBeliefEvent): malformed events
  * are dropped with a stderr warning, and the total is capped.
  *
- * Consumption contract (consumedPaths drives clearReassertedInboxEntries):
+ * Consumption contract (settleReassertedInboxEntries acts on the result):
  *  - entry with an EMPTY stale_belief_events array → consumed (nothing to
  *    inject, but codex/grok stash unconditionally and an uncleared empty
  *    entry would accumulate one file per compaction cycle);
- *  - entry contributing ≥1 valid event → consumed. If the cap truncates some
- *    of its valid events, they are discarded with a stderr warning (bounded
- *    injection wins over completeness — the daemon still holds the events);
+ *  - entry whose valid events ALL fit under the cap → consumed;
+ *  - entry whose valid events only PARTIALLY fit → NOT consumed; the
+ *    un-injected valid tail is reported in deferredTails and rewritten over
+ *    the entry, so the remainder re-injects on the next boot instead of
+ *    being permanently lost (and the injected head is not duplicated);
  *  - entry whose valid events were ALL deferred by an already-full cap →
  *    NOT consumed; it re-injects on the next boot instead of being lost;
  *  - entry whose events ALL failed the schema gate → NOT consumed; deleting
@@ -1008,9 +1015,13 @@ function isValidStaleBeliefEvent(value: unknown): boolean {
  */
 export interface CorrectionsReassertResult {
   events: unknown[];
-  /** Inbox file paths whose stashed events were actually consumed (or were
+  /** Inbox file paths whose stashed events were fully consumed (or were
    * empty); only these may be cleared after the boot envelope is built. */
   consumedPaths: string[];
+  /** Entries whose valid events only partially fit under the cap: the
+   * payload carries the un-injected valid tail and replaces the file so the
+   * remainder re-injects on the next boot. */
+  deferredTails: Array<{ filePath: string; payload: Record<string, unknown> }>;
 }
 
 export function collectCorrectionsReassert(
@@ -1018,6 +1029,7 @@ export function collectCorrectionsReassert(
 ): CorrectionsReassertResult {
   const events: unknown[] = [];
   const consumedPaths: string[] = [];
+  const deferredTails: CorrectionsReassertResult["deferredTails"] = [];
   let dropped = 0;
   for (const entry of pending) {
     const stashed = entry.payload.stale_belief_events;
@@ -1029,28 +1041,42 @@ export function collectCorrectionsReassert(
       continue;
     }
     let collected = 0;
-    let truncated = 0;
+    const tail: unknown[] = [];
     for (const event of stashed) {
       if (!isValidStaleBeliefEvent(event)) {
         dropped += 1;
         continue;
       }
       if (events.length >= CORRECTIONS_REASSERT_MAX) {
-        truncated += 1;
+        tail.push(event);
         continue;
       }
       events.push(event);
       collected += 1;
     }
-    if (collected > 0) {
+    if (collected > 0 && tail.length === 0) {
+      // Every valid event injected → safe to clear the entry.
       if (entry.filePath) consumedPaths.push(entry.filePath);
-      if (truncated > 0) {
-        // stderr only: hook stdout is the JSON protocol channel.
+    } else if (collected > 0) {
+      // Partially injected: never consume the entry, or the un-injected tail
+      // would be permanently lost. Rewrite it with just the tail so the
+      // remainder re-injects next boot without duplicating the head.
+      if (entry.filePath) {
+        deferredTails.push({
+          filePath: entry.filePath,
+          payload: { ...entry.payload, stale_belief_events: tail },
+        });
         console.error(
-          `minni: corrections_reassert cap discarded ${truncated} valid event(s) from ${label}`,
+          `minni: corrections_reassert cap deferred ${tail.length} valid event(s) from ${label} to next boot`,
+        );
+      } else {
+        // No backing file to defer into — discard with a warning (the daemon
+        // still holds the events).
+        console.error(
+          `minni: corrections_reassert cap discarded ${tail.length} valid event(s) from ${label}`,
         );
       }
-    } else if (truncated > 0) {
+    } else if (tail.length > 0) {
       // Cap was already full before this entry contributed anything: leave it
       // unconsumed so it re-injects on the next boot instead of being lost.
       console.error(
@@ -1070,26 +1096,36 @@ export function collectCorrectionsReassert(
       `minni: dropped ${dropped} malformed stale_belief_events from inbox (schema gate)`,
     );
   }
-  return { events, consumedPaths };
+  return { events, consumedPaths, deferredTails };
 }
 
 /**
  * After a boot has consumed stashed stale_belief_events (corrections_reassert),
- * remove exactly the carrying inbox entries that collectCorrectionsReassert
- * reported as consumed, so they are not re-injected on every subsequent
- * SessionStart and do not accumulate without bound across compaction cycles.
- * Entries whose events were all malformed or all cap-deferred are NOT in
- * consumedPaths and survive the clear.
+ * settle the inbox: remove exactly the entries collectCorrectionsReassert
+ * reported as consumed (so they re-inject exactly once and do not accumulate
+ * across compaction cycles), and rewrite partially-injected entries with
+ * their un-injected valid tail (so cap overflow defers to the next boot
+ * instead of being lost). Entries whose events were all malformed or all
+ * cap-deferred are untouched and survive as-is.
  */
-export async function clearReassertedInboxEntries(
-  consumedPaths: string[],
-): Promise<string[]> {
-  const cleared: string[] = [];
-  for (const filePath of consumedPaths) {
+export async function settleReassertedInboxEntries(
+  outcome: Pick<CorrectionsReassertResult, "consumedPaths" | "deferredTails">,
+): Promise<void> {
+  for (const filePath of outcome.consumedPaths) {
     await clearInboxEntry(filePath);
-    cleared.push(filePath);
   }
-  return cleared;
+  for (const tail of outcome.deferredTails) {
+    try {
+      await writeFile(
+        tail.filePath,
+        JSON.stringify(tail.payload, null, 2),
+        "utf8",
+      );
+    } catch {
+      // Best effort: an unwritable tail leaves the original entry intact,
+      // which re-injects (with duplicated head events) rather than losing any.
+    }
+  }
 }
 
 function normalizeWikilinkRef(ref: string): string {

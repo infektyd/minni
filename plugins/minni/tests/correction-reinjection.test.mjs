@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -16,6 +16,7 @@ import {
   collectCorrectionsReassert,
   ensureVault,
   searchVaultNotes,
+  settleReassertedInboxEntries,
 } from "../dist/vault.js";
 
 // ---------------------------------------------------------------------------
@@ -169,6 +170,19 @@ test("collectCorrectionsReassert drops malformed events (inbox is untrusted loca
             new_learning_id: 9,
             created_at: "not-a-number",
           },
+          // NaN/Infinity are typeof "number" but never valid timestamps
+          {
+            event_id: 6,
+            superseded_learning_id: 7,
+            new_learning_id: 9,
+            created_at: Number.NaN,
+          },
+          {
+            event_id: 7,
+            superseded_learning_id: 7,
+            new_learning_id: 9,
+            created_at: Number.POSITIVE_INFINITY,
+          },
         ],
       },
     },
@@ -178,27 +192,38 @@ test("collectCorrectionsReassert drops malformed events (inbox is untrusted loca
   assert.equal(events[0].event_id, 1);
 });
 
-test("collectCorrectionsReassert caps total re-asserted events", () => {
+test("collectCorrectionsReassert caps re-asserted events and defers the overflow tail", () => {
   const flood = Array.from({ length: 500 }, (_, i) => ({
     event_id: i + 1,
     superseded_learning_id: i + 1,
     new_learning_id: i + 1000,
   }));
-  const { events, consumedPaths } = collectCorrectionsReassert([
+  const { events, consumedPaths, deferredTails } = collectCorrectionsReassert([
     {
       payload: { kind: "precompact_reassert", stale_belief_events: flood },
       filePath: "/inbox/flood.json",
     },
   ]);
   assert.equal(events.length, CORRECTIONS_REASSERT_MAX);
-  // The entry contributed events, so it is consumed (its overflow is
-  // discarded with a warning — bounded injection wins over completeness).
-  assert.deepEqual(consumedPaths, ["/inbox/flood.json"]);
+  // Partial injection must NOT consume the entry: the un-injected tail is
+  // deferred (the file is rewritten with the tail) instead of being lost.
+  assert.deepEqual(consumedPaths, []);
+  assert.equal(deferredTails.length, 1);
+  assert.equal(deferredTails[0].filePath, "/inbox/flood.json");
+  assert.equal(
+    deferredTails[0].payload.stale_belief_events.length,
+    500 - CORRECTIONS_REASSERT_MAX,
+  );
+  assert.equal(
+    deferredTails[0].payload.stale_belief_events[0].event_id,
+    CORRECTIONS_REASSERT_MAX + 1,
+    "the deferred tail must start exactly where injection stopped",
+  );
 });
 
 test("collectCorrectionsReassert consumption contract: malformed-only entries survive, empty entries are consumed", () => {
   const valid = { event_id: 1, superseded_learning_id: 7, new_learning_id: 9 };
-  const { events, consumedPaths } = collectCorrectionsReassert([
+  const { events, consumedPaths, deferredTails } = collectCorrectionsReassert([
     // all events fail the schema gate → NOT consumed (clearing would silently
     // destroy the stashed correction with zero injection)
     {
@@ -222,35 +247,93 @@ test("collectCorrectionsReassert consumption contract: malformed-only entries su
   ]);
   assert.deepEqual(events, [valid]);
   assert.deepEqual(consumedPaths, ["/inbox/empty-events.json", "/inbox/good.json"]);
+  assert.deepEqual(deferredTails, []);
 });
 
-test("collectCorrectionsReassert defers cap-starved entries to the next boot instead of losing them", () => {
+test("collectCorrectionsReassert defers cap overflow to the next boot instead of losing it", () => {
   const mkEvents = (start, n) =>
     Array.from({ length: n }, (_, i) => ({
       event_id: start + i,
       superseded_learning_id: start + i,
       new_learning_id: start + i + 1000,
     }));
-  const { events, consumedPaths } = collectCorrectionsReassert([
-    // fills 8 of the 10 slots → consumed
+  const { events, consumedPaths, deferredTails } = collectCorrectionsReassert([
+    // fills 8 of the 10 slots, nothing truncated → consumed
     {
       payload: { kind: "precompact_reassert", stale_belief_events: mkEvents(1, 8) },
       filePath: "/inbox/file1.json",
     },
-    // contributes 2, loses 6 to the cap → consumed (warned)
+    // contributes 2, overflows 6 → NOT consumed; the 6-event tail is deferred
+    // so it re-injects next boot instead of being permanently lost
     {
       payload: { kind: "precompact_reassert", stale_belief_events: mkEvents(100, 8) },
       filePath: "/inbox/file2.json",
     },
-    // cap already full before it contributes anything → NOT consumed; it
-    // re-injects on the next boot instead of being silently destroyed
+    // cap already full before it contributes anything → NOT consumed and not
+    // rewritten; the whole entry re-injects on the next boot
     {
       payload: { kind: "precompact_reassert", stale_belief_events: mkEvents(200, 3) },
       filePath: "/inbox/file3.json",
     },
   ]);
   assert.equal(events.length, CORRECTIONS_REASSERT_MAX);
-  assert.deepEqual(consumedPaths, ["/inbox/file1.json", "/inbox/file2.json"]);
+  assert.deepEqual(consumedPaths, ["/inbox/file1.json"]);
+  assert.equal(deferredTails.length, 1);
+  assert.equal(deferredTails[0].filePath, "/inbox/file2.json");
+  assert.deepEqual(
+    deferredTails[0].payload.stale_belief_events.map((e) => e.event_id),
+    [102, 103, 104, 105, 106, 107],
+  );
+});
+
+test("settleReassertedInboxEntries rewrites partial-cap tails so overflow re-injects exactly once", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-reassert-tail-"));
+  try {
+    const inboxDir = path.join(root, "inbox");
+    await mkdir(inboxDir, { recursive: true });
+    const filePath = path.join(inboxDir, "2026-06-10-overflow.json");
+    const mkEvents = (start, n) =>
+      Array.from({ length: n }, (_, i) => ({
+        event_id: start + i,
+        superseded_learning_id: start + i,
+        new_learning_id: start + i + 1000,
+      }));
+    const payload = {
+      slug: "overflow",
+      createdAt: new Date().toISOString(),
+      kind: "precompact_reassert",
+      stale_belief_events: mkEvents(1, CORRECTIONS_REASSERT_MAX + 2),
+    };
+    await writeFile(filePath, JSON.stringify(payload, null, 2), "utf8");
+
+    // Boot 1: injects the cap, rewrites the file with the 2-event tail.
+    const first = collectCorrectionsReassert([{ payload, filePath }]);
+    assert.equal(first.events.length, CORRECTIONS_REASSERT_MAX);
+    assert.deepEqual(first.consumedPaths, []);
+    await settleReassertedInboxEntries(first);
+
+    const rewritten = JSON.parse(await readFile(filePath, "utf8"));
+    assert.deepEqual(
+      rewritten.stale_belief_events.map((e) => e.event_id),
+      [CORRECTIONS_REASSERT_MAX + 1, CORRECTIONS_REASSERT_MAX + 2],
+      "the file must now carry exactly the un-injected tail",
+    );
+    assert.equal(rewritten.kind, "precompact_reassert");
+
+    // Boot 2: the tail fits, is injected, and the entry is finally consumed.
+    const second = collectCorrectionsReassert([{ payload: rewritten, filePath }]);
+    assert.deepEqual(
+      second.events.map((e) => e.event_id),
+      [CORRECTIONS_REASSERT_MAX + 1, CORRECTIONS_REASSERT_MAX + 2],
+    );
+    assert.deepEqual(second.consumedPaths, [filePath]);
+    assert.deepEqual(second.deferredTails, []);
+    await settleReassertedInboxEntries(second);
+    const remaining = (await readdir(inboxDir)).filter((f) => f.endsWith(".json"));
+    assert.deepEqual(remaining, [], "fully-drained entry must be cleared");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -646,6 +729,21 @@ for (const hook of HOOK_MATRIX) {
         !body.recent_learnings.context.includes("Agent Identity"),
         "recent_learnings must be the trimmed learnings slice",
       );
+    } else {
+      // Deliberate asymmetry, asserted from both sides so drift is caught:
+      // codex/grok must NOT duplicate the slice in the envelope...
+      assert.equal(
+        body.recent_learnings,
+        undefined,
+        "codex/grok intentionally omit recent_learnings (native layer 1 carries it)",
+      );
+      // ...because their native Layer 1 (the full daemon read context,
+      // prepended before the envelope) already carries the Learnings section.
+      assert.match(
+        output.hookSpecificOutput.additionalContext,
+        /## Learnings/,
+        "native layer 1 must carry the recency-ordered Learnings section",
+      );
     }
   });
 
@@ -675,6 +773,42 @@ for (const hook of HOOK_MATRIX) {
     );
     assert.ok(body.stale_beliefs.error, "the error message must be carried");
     assert.equal(body.recall.ok, false, "failed boot recall must be explicit");
+  });
+
+  test(`[${hook.name}] PreCompact with daemon down degrades gracefully (no fabricated stash, no crash)`, async (t) => {
+    const home = await mkdtemp(path.join(tmpdir(), "sm-home-"));
+    const vault = await mkdtemp(path.join(tmpdir(), `sm-${hook.name}-vault-`));
+    t.after(async () => {
+      await rm(home, { recursive: true, force: true });
+      await rm(vault, { recursive: true, force: true });
+    });
+    const env = {
+      // Nonexistent socket: fetchStaleBeliefEvents fails. Compaction must
+      // proceed (continue:true) and nothing fabricated may be stashed —
+      // mirror of the daemon-down SessionStart test above (hooks-PL-5).
+      MINNI_HOME: home,
+      MINNI_SOCKET_PATH: path.join(vault, "no-such-daemon.sock"),
+      MINNI_AFM_HEALTH_URL: "http://127.0.0.1:1/health",
+      MINNI_BYPASS_AUDIT_LIMIT: "true",
+      ...hook.env(vault),
+    };
+
+    const output = await runHook("PreCompact", env, { trigger: "auto" }, hook.bin);
+    assert.equal(output.continue, true, "daemon-down PreCompact must not block compaction");
+
+    const inboxDir = path.join(vault, "inbox");
+    const inboxFiles = (await readdir(inboxDir)).filter((f) => f.endsWith(".json"));
+    const writesUnconditionalHandoff = hook.bin === "codex-hook.js" || hook.bin === "grok-hook.js";
+    if (writesUnconditionalHandoff) {
+      // codex/grok still write their handoff entry (scar tissue etc.), but
+      // the stale-belief stash is explicitly empty, never invented.
+      assert.equal(inboxFiles.length, 1);
+      const stash = JSON.parse(await readFile(path.join(inboxDir, inboxFiles[0]), "utf8"));
+      assert.deepEqual(stash.stale_belief_events, []);
+    } else {
+      // CC/kilocode only stash when there is something to stash.
+      assert.deepEqual(inboxFiles, [], "no daemon → nothing to stash");
+    }
   });
 
   test(`[${hook.name}] PreCompact stashes stale-belief events; boot re-asserts ONCE then clears`, async (t) => {
