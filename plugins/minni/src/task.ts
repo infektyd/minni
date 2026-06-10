@@ -7,7 +7,8 @@ import {
   DEFAULT_VAULT_PATH,
   DEFAULT_WORKSPACE_ID,
 } from "./config.js";
-import { callAfmJson, resolveAfmProvider, type AfmProvider, type AfmProviderMode, type AfmProviderResolution } from "./afm.js";
+import { resolveAfmProvider, type AfmProvider, type AfmProviderMode, type AfmProviderResolution } from "./afm.js";
+import { defaultProviderChain } from "./providers.js";
 import { afmHealth, recallMemory } from "./sovereign.js";
 import type { JsonResult, RecallResponse } from "./sovereign.js";
 import { recordAudit, searchVaultNotes } from "./vault.js";
@@ -634,9 +635,15 @@ export async function callAfmPrepareTask(
     : isChatCompletions
       ? buildAfmChatPayload(payload)
       : payload;
-  const result = await callAfmJson(url, wirePayload, {
+  // P2: route through the provider chain (AFM-only chain is byte-identical to
+  // the old direct callAfmJson path — enforced by the P0 golden contracts).
+  const result = await defaultProviderChain().chat({
+    payload: wirePayload,
+    operation: "prepare",
+    url,
     mode: transportMode,
-    operation: purpose,
+    nativeOperation: purpose,
+    nativePayload: payload,
   });
   return result.ok
     ? { ok: true, data: normalizeAfmResponse(result.data) }

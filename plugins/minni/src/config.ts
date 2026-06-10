@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { fileURLToPath } from "node:url";
@@ -44,6 +45,80 @@ export const AFM_ALLOWED_TARGETS: string[] = (process.env.MINNI_AFM_ALLOWED_TARG
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
+
+// --- Model provider chain config (P3) ---------------------------------------
+// ~/.minni/providers.json configures the provider chain and per-operation
+// routing policy. MINNI_AFM_* env vars keep precedence over file values.
+// Secrets are NEVER stored in providers.json: cloud credentials come only from
+// apiKeyEnv (env var name) or apiKeyFile (0600 file under ~/.minni/secrets/).
+
+export interface CloudProviderConfig {
+  enabled?: boolean;
+  vendor?: string;
+  model?: string;
+  apiKeyEnv?: string;
+  apiKeyFile?: string;
+  privacyMax?: boolean;
+}
+
+export interface ProvidersConfig {
+  chain: string[];
+  operations: Record<string, { localOnly?: boolean }>;
+  providers: {
+    mlx?: { baseUrl?: string; model?: string };
+    ollama?: { baseUrl?: string; model?: string };
+    cloud?: CloudProviderConfig;
+  };
+}
+
+const DEFAULT_PROVIDERS_CONFIG: ProvidersConfig = {
+  chain: ["afm"],
+  operations: { retrieval: { localOnly: true } },
+  providers: {},
+};
+
+export const PROVIDERS_CONFIG_PATH = expandTilde(
+  process.env.MINNI_PROVIDERS_CONFIG ?? path.join(os.homedir(), ".minni", "providers.json"),
+);
+
+export function loadProvidersConfig(filePath = PROVIDERS_CONFIG_PATH): ProvidersConfig {
+  let raw: string;
+  try {
+    raw = readFileSync(filePath, "utf8");
+  } catch {
+    return { ...DEFAULT_PROVIDERS_CONFIG };
+  }
+  try {
+    const parsed = JSON.parse(raw) as Partial<ProvidersConfig> & Record<string, unknown>;
+    if (!parsed || typeof parsed !== "object") return { ...DEFAULT_PROVIDERS_CONFIG };
+    const chain = Array.isArray(parsed.chain)
+      ? parsed.chain.filter((item): item is string => typeof item === "string" && item.length > 0)
+      : DEFAULT_PROVIDERS_CONFIG.chain;
+    const operations =
+      parsed.operations && typeof parsed.operations === "object"
+        ? (parsed.operations as ProvidersConfig["operations"])
+        : DEFAULT_PROVIDERS_CONFIG.operations;
+    const providers =
+      parsed.providers && typeof parsed.providers === "object"
+        ? (parsed.providers as ProvidersConfig["providers"])
+        : {};
+    // SEC: inline secrets are rejected outright — keys live in env or 0600 files only.
+    const cloud = providers.cloud as (CloudProviderConfig & { apiKey?: unknown }) | undefined;
+    if (cloud && "apiKey" in cloud) {
+      console.warn(
+        "[minni] providers.json: inline providers.cloud.apiKey is not allowed (use apiKeyEnv or apiKeyFile); cloud provider disabled",
+      );
+      providers.cloud = { ...cloud, apiKey: undefined, enabled: false } as CloudProviderConfig;
+      delete (providers.cloud as Record<string, unknown>).apiKey;
+    }
+    return { chain: chain.length > 0 ? chain : ["afm"], operations, providers };
+  } catch {
+    console.warn("[minni] providers.json: invalid JSON; using default AFM-only chain");
+    return { ...DEFAULT_PROVIDERS_CONFIG };
+  }
+}
+
+export const PROVIDERS_CONFIG: ProvidersConfig = loadProvidersConfig();
 
 export type AFM_PROVIDER_MODE = "auto" | "bridge" | "native" | "off";
 

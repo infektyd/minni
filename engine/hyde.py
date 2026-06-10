@@ -15,7 +15,8 @@ import os
 from typing import Callable, Dict, List, Optional
 from urllib import request
 
-from afm_provider import afm_chat_completion, invoke_native_afm, resolve_afm_mode
+from afm_provider import resolve_afm_mode
+from model_provider import ChatRequest, default_provider_chain
 
 logger = logging.getLogger("sovereign.hyde")
 
@@ -34,13 +35,6 @@ def should_trigger_hyde(results: List[Dict], enabled: bool, floor: float) -> boo
             return False
         confidences.append(float(confidence))
     return bool(confidences) and all(confidence < floor for confidence in confidences)
-
-
-def _default_chat_client(payload: Dict, url: str, timeout: float) -> Dict:
-    result = afm_chat_completion(payload, mode="bridge", url=url, timeout=timeout)
-    if result.ok:
-        return result.data
-    raise RuntimeError(result.error or "AFM bridge unavailable")
 
 
 def _extract_chat_text(response: Dict) -> Optional[str]:
@@ -71,25 +65,10 @@ def generate_hypothetical_answer(
     mode = resolve_afm_mode()
     if mode == "off":
         return None
-    if mode in {"native", "auto"}:
-        native = invoke_native_afm(
-            "hyde_generation",
-            {"query": query},
-            timeout=timeout,
-        )
-        if native.ok:
-            answer = native.data.get("answer")
-            if isinstance(answer, str):
-                answer = " ".join(answer.split())
-                return answer or None
-        if mode == "native":
-            logger.debug("Native AFM HyDE generation skipped: %s", native.error)
-            return None
 
     afm_url = url or os.environ.get("MINNI_HYDE_AFM_URL", DEFAULT_AFM_URL)
     model = os.environ.get("MINNI_HYDE_AFM_MODEL", DEFAULT_AFM_MODEL)
     max_tokens = int(os.environ.get("MINNI_HYDE_MAX_TOKENS", "96"))
-    chat_client = client or _default_chat_client
     payload = {
         "model": model,
         "messages": [
@@ -106,11 +85,31 @@ def generate_hypothetical_answer(
         "max_tokens": max_tokens,
         "temperature": 0.2,
     }
-    try:
-        return _extract_chat_text(chat_client(payload, afm_url, timeout))
-    except Exception as exc:  # noqa: BLE001 - graceful downgrade is required.
-        logger.debug("HyDE AFM generation skipped: %s", exc)
+    # P2: routed through the provider chain (AFM-only chain is byte-identical
+    # to the old direct native/bridge dance — enforced by the P0 goldens).
+    result = default_provider_chain().chat(
+        ChatRequest(
+            payload=payload,
+            operation="retrieval",
+            url=afm_url,
+            timeout=timeout,
+            native_operation="hyde_generation",
+            native_payload={"query": query},
+        ),
+        client=client,
+    )
+    if result.provider == "native":
+        if result.ok:
+            answer = result.data.get("answer")
+            if isinstance(answer, str):
+                answer = " ".join(answer.split())
+                return answer or None
+        logger.debug("Native AFM HyDE generation skipped: %s", result.error)
         return None
+    if not result.ok:
+        logger.debug("HyDE AFM generation skipped: %s", result.error)
+        return None
+    return _extract_chat_text(result.data)
 
 
 def merge_hyde_results(
