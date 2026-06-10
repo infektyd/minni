@@ -12,6 +12,7 @@ import {
   wrapEnvelope,
 } from "./agent_envelope.js";
 import type { EnvelopeEvent } from "./agent_envelope.js";
+import { compactPlanPointer, resolveActivePlanView } from "./plan.js";
 import { routeMemoryIntent } from "./policy.js";
 import {
   buildStatusReport,
@@ -125,42 +126,57 @@ async function handleSessionStart(payload: Record<string, unknown>): Promise<Hoo
   const pending = inboxStatus.entries;
   const handoffContext = await resolveInboxHandoffContext(GROK_VAULT_PATH, pending);
 
+  // Plan parity (audit C5): SessionStart injects the FULL active-plan view for
+  // boot/rehydration, exactly like the claude-code hook.
+  let activePlan: Awaited<ReturnType<typeof resolveActivePlanView>>;
+  try {
+    activePlan = await resolveActivePlanView(GROK_VAULT_PATH);
+  } catch {
+    // ignore
+  }
+
+  const envelopeBody: Record<string, unknown> = {
+    contract: MEMORY_CONTRACT,
+    identity: {
+      agent: GROK_AGENT_ID,
+      workspace: workspaceId,
+      vault: GROK_VAULT_PATH,
+      session_id: sessionId,
+      daemon_ok: status.socket.ok,
+      afm_ok: status.afm.ok,
+      runtime: "grok-build",
+    },
+    pending_learnings: buildPendingLearningsSection(inboxStatus, expiredHandoffs),
+    handoff_context: handoffContext.map((snippet) => ({
+      ref: snippet.ref,
+      path: snippet.relativePath,
+      snippet: snippet.snippet,
+    })),
+    layer1_source:
+      identityRead.ok && identityRead.data?.context
+        ? {
+            ok: true,
+            agent_origin: identityRead.data.agent_id ?? GROK_AGENT_ID,
+            backend: identityRead.data.backend,
+          }
+        : { ok: false, error: identityRead.error },
+    fallback_commands: {
+      layer1: "node dist/grok-hook.js SessionStart < /dev/null",
+      daemon_read: "node dist/cli.js read grok-build",
+      recall: "node dist/cli.js prepare '<task>'",
+    },
+    audit_tail: tail.entries.slice(-5).map((entry) => entry.split("\n")[0]),
+  };
+
+  if (activePlan !== undefined) {
+    envelopeBody.active_plan = activePlan;
+  }
+
   const envelope = wrapEnvelope({
     event: "SessionStart",
     agent: GROK_AGENT_ID,
     budget: envelopeBudgetFor(GROK_CONTEXT_WINDOW),
-    body: {
-      contract: MEMORY_CONTRACT,
-      identity: {
-        agent: GROK_AGENT_ID,
-        workspace: workspaceId,
-        vault: GROK_VAULT_PATH,
-        session_id: sessionId,
-        daemon_ok: status.socket.ok,
-        afm_ok: status.afm.ok,
-        runtime: "grok-build",
-      },
-      pending_learnings: buildPendingLearningsSection(inboxStatus, expiredHandoffs),
-      handoff_context: handoffContext.map((snippet) => ({
-        ref: snippet.ref,
-        path: snippet.relativePath,
-        snippet: snippet.snippet,
-      })),
-      layer1_source:
-        identityRead.ok && identityRead.data?.context
-          ? {
-              ok: true,
-              agent_origin: identityRead.data.agent_id ?? GROK_AGENT_ID,
-              backend: identityRead.data.backend,
-            }
-          : { ok: false, error: identityRead.error },
-      fallback_commands: {
-        layer1: "node dist/grok-hook.js SessionStart < /dev/null",
-        daemon_read: "node dist/cli.js read grok-build",
-        recall: "node dist/cli.js prepare '<task>'",
-      },
-      audit_tail: tail.entries.slice(-5).map((entry) => entry.split("\n")[0]),
-    },
+    body: envelopeBody,
   });
 
   await recordAudit(GROK_VAULT_PATH, {
@@ -207,27 +223,42 @@ async function handleUserPromptSubmit(payload: Record<string, unknown>): Promise
     return { continue: true };
   }
 
+  let activePlan: Awaited<ReturnType<typeof resolveActivePlanView>>;
+  try {
+    activePlan = await resolveActivePlanView(GROK_VAULT_PATH);
+  } catch {
+    // ignore
+  }
+
+  const envelopeBody: Record<string, unknown> = {
+    identity: {
+      agent: GROK_AGENT_ID,
+      workspace: workspaceId,
+      task_signature: signature,
+    },
+    recall:
+      recall.ok && recall.data
+        ? formatRecall(prompt, recall.data, vaultResults)
+        : { ok: false, error: recall.error },
+    vault: vaultRecallToBody(vaultResults),
+    intent: {
+      action: intent.action,
+      confidence: intent.confidence,
+      suggested_tool: intent.suggestedTool,
+      automatic_write: false,
+    },
+  };
+
+  // Plan parity (audit C5): per-turn injection is a compact plan POINTER, not
+  // the full plan — same budget discipline as the claude-code hook (Option C).
+  if (activePlan !== undefined) {
+    envelopeBody.active_plan_ref = compactPlanPointer(activePlan);
+  }
+
   const envelope = wrapEnvelope({
     event: "UserPromptSubmit",
     agent: GROK_AGENT_ID,
-    body: {
-      identity: {
-        agent: GROK_AGENT_ID,
-        workspace: workspaceId,
-        task_signature: signature,
-      },
-      recall:
-        recall.ok && recall.data
-          ? formatRecall(prompt, recall.data, vaultResults)
-          : { ok: false, error: recall.error },
-      vault: vaultRecallToBody(vaultResults),
-      intent: {
-        action: intent.action,
-        confidence: intent.confidence,
-        suggested_tool: intent.suggestedTool,
-        automatic_write: false,
-      },
-    },
+    body: envelopeBody,
   });
 
   await recordAudit(GROK_VAULT_PATH, {

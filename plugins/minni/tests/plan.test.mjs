@@ -407,3 +407,70 @@ test("P10: completing the last slice moves the plan to a terminal status (accept
   const reopened = updateSlice(done, "a", "in_progress");
   assert.equal(reopened.status, "draft", "reopening a slice should revert the terminal status");
 });
+
+// ── C5 / plan-N3: id-less active-plan addressing ─────────────────────────────
+
+test("resolvePlanIdOrActive prefers an explicit plan_id and trims it", async () => {
+  const { resolvePlanIdOrActive } = await import("../dist/plan.js");
+  const root = await mkdtemp(path.join(tmpdir(), "sm-plan-resolve-"));
+  try {
+    await ensureVault(root);
+    assert.deepEqual(await resolvePlanIdOrActive(root, "  plan-abc123  "), {
+      plan_id: "plan-abc123",
+    });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("resolvePlanIdOrActive falls back to the active plan when plan_id is omitted", async () => {
+  const { resolvePlanIdOrActive } = await import("../dist/plan.js");
+  const root = await mkdtemp(path.join(tmpdir(), "sm-plan-resolve-active-"));
+  try {
+    await ensureVault(root);
+    const { plan } = await createPlan(
+      { goal: "id-less addressing", slices: [{ title: "only slice" }], vaultPath: root },
+      { vaultPath: root },
+    );
+    // createPlan set the active pointer; omitted/blank ids resolve to it.
+    assert.deepEqual(await resolvePlanIdOrActive(root, undefined), { plan_id: plan.plan_id });
+    assert.deepEqual(await resolvePlanIdOrActive(root, "   "), { plan_id: plan.plan_id });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("resolvePlanIdOrActive returns a clear error when nothing is active", async () => {
+  const { resolvePlanIdOrActive } = await import("../dist/plan.js");
+  const root = await mkdtemp(path.join(tmpdir(), "sm-plan-resolve-none-"));
+  try {
+    await ensureVault(root);
+    const result = await resolvePlanIdOrActive(root, undefined);
+    assert.ok("error" in result);
+    assert.match(result.error, /no active plan/);
+    assert.match(result.error, /minni_plan_activate/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("minni_plan_status/_update/_history accept an OPTIONAL plan_id (C5 schema pin)", async () => {
+  // The acceptance spec requires the id-less form VERBATIM on these three
+  // tools; pin the schemas so a refactor cannot quietly re-require plan_id.
+  const source = await readFile(new URL("../src/server.ts", import.meta.url), "utf8");
+  for (const tool of ["minni_plan_status", "minni_plan_update", "minni_plan_history"]) {
+    const start = source.indexOf(`"${tool}"`);
+    assert.ok(start >= 0, `${tool} must be registered`);
+    const block = source.slice(start, source.indexOf("server.registerTool", start + 1));
+    assert.match(
+      block,
+      /plan_id:\s*z\.string\(\)\.min\(1\)\.optional\(\)/,
+      `${tool} must accept an optional plan_id (default = active plan)`,
+    );
+    assert.match(
+      block,
+      /resolvePlanIdOrActive\(/,
+      `${tool} must resolve the active plan when plan_id is omitted`,
+    );
+  }
+});

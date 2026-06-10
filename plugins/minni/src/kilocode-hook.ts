@@ -12,6 +12,7 @@ import {
   wrapEnvelope,
 } from "./agent_envelope.js";
 import type { EnvelopeEvent } from "./agent_envelope.js";
+import { compactPlanPointer, resolveActivePlanView } from "./plan.js";
 import { routeMemoryIntent } from "./policy.js";
 import {
   buildStatusReport,
@@ -106,37 +107,52 @@ async function handleSessionStart(payload: Record<string, unknown>): Promise<Hoo
   const pending = inboxStatus.entries;
   const handoffContext = await resolveInboxHandoffContext(KILOCODE_VAULT_PATH, pending);
 
+  // Plan parity (audit C5): SessionStart injects the FULL active-plan view for
+  // boot/rehydration, exactly like the claude-code hook.
+  let activePlan: Awaited<ReturnType<typeof resolveActivePlanView>>;
+  try {
+    activePlan = await resolveActivePlanView(KILOCODE_VAULT_PATH);
+  } catch {
+    // ignore
+  }
+
+  const envelopeBody: Record<string, unknown> = {
+    contract: MEMORY_CONTRACT,
+    identity: {
+      agent: KILOCODE_AGENT_ID,
+      workspace: KILOCODE_WORKSPACE_ID,
+      vault: KILOCODE_VAULT_PATH,
+      session_id: sessionId,
+      daemon_ok: status.socket.ok,
+      afm_ok: status.afm.ok,
+    },
+    pending_learnings: buildPendingLearningsSection(inboxStatus, expiredHandoffs),
+    handoff_context: handoffContext.map((snippet) => ({
+      ref: snippet.ref,
+      path: snippet.relativePath,
+      snippet: snippet.snippet,
+    })),
+    recall:
+      recall.ok && recall.data
+        ? {
+            ok: true,
+            results: recall.data.results,
+            agent_origin: recall.data.agent_id ?? KILOCODE_AGENT_ID,
+            layer: recall.data.layer,
+          }
+        : { ok: false, error: recall.error },
+    audit_tail: tail.entries.slice(-5).map((entry) => entry.split("\n")[0]),
+  };
+
+  if (activePlan !== undefined) {
+    envelopeBody.active_plan = activePlan;
+  }
+
   const envelope = wrapEnvelope({
     event: "SessionStart",
     agent: KILOCODE_AGENT_ID,
     budget: envelopeBudgetFor(KILOCODE_CONTEXT_WINDOW),
-    body: {
-      contract: MEMORY_CONTRACT,
-      identity: {
-        agent: KILOCODE_AGENT_ID,
-        workspace: KILOCODE_WORKSPACE_ID,
-        vault: KILOCODE_VAULT_PATH,
-        session_id: sessionId,
-        daemon_ok: status.socket.ok,
-        afm_ok: status.afm.ok,
-      },
-      pending_learnings: buildPendingLearningsSection(inboxStatus, expiredHandoffs),
-      handoff_context: handoffContext.map((snippet) => ({
-        ref: snippet.ref,
-        path: snippet.relativePath,
-        snippet: snippet.snippet,
-      })),
-      recall:
-        recall.ok && recall.data
-          ? {
-              ok: true,
-              results: recall.data.results,
-              agent_origin: recall.data.agent_id ?? KILOCODE_AGENT_ID,
-              layer: recall.data.layer,
-            }
-          : { ok: false, error: recall.error },
-      audit_tail: tail.entries.slice(-5).map((entry) => entry.split("\n")[0]),
-    },
+    body: envelopeBody,
   });
 
   await recordAudit(KILOCODE_VAULT_PATH, {
@@ -184,26 +200,41 @@ async function handleUserPromptSubmit(payload: Record<string, unknown>): Promise
     return { continue: true };
   }
 
+  let activePlan: Awaited<ReturnType<typeof resolveActivePlanView>>;
+  try {
+    activePlan = await resolveActivePlanView(KILOCODE_VAULT_PATH);
+  } catch {
+    // ignore
+  }
+
+  const envelopeBody: Record<string, unknown> = {
+    identity: {
+      agent: KILOCODE_AGENT_ID,
+      workspace: KILOCODE_WORKSPACE_ID,
+      task_signature: signature,
+    },
+    recall:
+      recall.ok && recall.data
+        ? formatRecall(prompt, recall.data, vaultResults)
+        : { ok: false, error: recall.error },
+    vault: vaultRecallToBody(vaultResults),
+    intent: {
+      action: intent.action,
+      confidence: intent.confidence,
+      suggested_tool: intent.suggestedTool,
+    },
+  };
+
+  // Plan parity (audit C5): per-turn injection is a compact plan POINTER, not
+  // the full plan — same budget discipline as the claude-code hook (Option C).
+  if (activePlan !== undefined) {
+    envelopeBody.active_plan_ref = compactPlanPointer(activePlan);
+  }
+
   const envelope = wrapEnvelope({
     event: "UserPromptSubmit",
     agent: KILOCODE_AGENT_ID,
-    body: {
-      identity: {
-        agent: KILOCODE_AGENT_ID,
-        workspace: KILOCODE_WORKSPACE_ID,
-        task_signature: signature,
-      },
-      recall:
-        recall.ok && recall.data
-          ? formatRecall(prompt, recall.data, vaultResults)
-          : { ok: false, error: recall.error },
-      vault: vaultRecallToBody(vaultResults),
-      intent: {
-        action: intent.action,
-        confidence: intent.confidence,
-        suggested_tool: intent.suggestedTool,
-      },
-    },
+    body: envelopeBody,
   });
 
   await recordAudit(KILOCODE_VAULT_PATH, {

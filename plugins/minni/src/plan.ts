@@ -1070,6 +1070,65 @@ export async function clearActivePlan(vaultPath: string): Promise<void> {
   }
 }
 
+/**
+ * Compact plan POINTER for per-turn injection (Option C). Keeps only the
+ * actionable one-liners (headline, next_action, progress) plus counts, and tells
+ * the agent how to pull the rest on demand. Drops the full goal text,
+ * open_questions array (~1.8 KB, static) and pending-slice list.
+ *
+ * Plan parity (audit C5): ALL hooks (claude-code, codex, grok, kilocode) MUST
+ * build their UserPromptSubmit `active_plan_ref` through this function so the
+ * budget discipline cannot drift per hook.
+ */
+export function compactPlanPointer(active: {
+  plan_id: string;
+  rev: number;
+  view: ReturnType<typeof compactPlanView>;
+}): {
+  plan_id: string;
+  rev: number;
+  headline: string;
+  next_action: string;
+  progress: ReturnType<typeof compactPlanView>["progress"];
+  open_questions_count: number;
+  scar_tissue: number;
+  pull: string;
+} {
+  const v = active.view;
+  return {
+    plan_id: active.plan_id,
+    rev: active.rev,
+    headline: v.headline,
+    next_action: v.next_action,
+    progress: v.progress,
+    open_questions_count: Array.isArray(v.open_questions) ? v.open_questions.length : 0,
+    scar_tissue: v.scar_tissue,
+    pull: "Full plan (goal, open_questions, slices) omitted to save context. Call minni_plan_status for detail on demand.",
+  };
+}
+
+/**
+ * Id-less active-plan addressing (audit C5 / plan-N3): resolve an explicit
+ * plan_id, or fall back to the vault's active plan when none is supplied —
+ * so hookless agents can address "the active plan" without knowing its id.
+ * Returns a clear error when neither is available.
+ */
+export async function resolvePlanIdOrActive(
+  vaultPath: string,
+  planId?: string,
+): Promise<{ plan_id: string } | { error: string }> {
+  const explicit = planId?.trim();
+  if (explicit) return { plan_id: explicit };
+  const active = await getActivePlan(vaultPath);
+  if (!active) {
+    return {
+      error:
+        "no plan_id provided and no active plan is set; pass plan_id explicitly or activate one with minni_plan_activate",
+    };
+  }
+  return { plan_id: active.plan_id };
+}
+
 export async function resolveActivePlanView(
   vaultPath: string
 ): Promise<{ plan_id: string; rev: number; view: ReturnType<typeof compactPlanView> } | undefined> {

@@ -5,7 +5,7 @@ import {
   CLAUDECODE_VAULT_PATH,
   CLAUDECODE_WORKSPACE_ID,
 } from "./config.js";
-import { resolveActivePlanView } from "./plan.js";
+import { compactPlanPointer, resolveActivePlanView } from "./plan.js";
 import {
   MEMORY_CONTRACT,
   envelopeBudgetFor,
@@ -117,7 +117,7 @@ async function handleSessionStart(payload: Record<string, unknown>): Promise<Hoo
   for (const handoff of pendingHandoffData.handoffs ?? []) {
     const leaseId = handoff.lease_id ?? handoff.leaseId;
     if (!leaseId) continue;
-    const ack = await ackHandoff({ leaseId, status: "accepted" });
+    const ack = await ackHandoff({ leaseId, status: "accepted", agentId: CLAUDECODE_AGENT_ID });
     if (ack.ok) ackedLeases.push(leaseId);
   }
   const contradictions = await subscribeContradictions({ agentId: CLAUDECODE_AGENT_ID });
@@ -191,26 +191,6 @@ async function handleSessionStart(payload: Record<string, unknown>): Promise<Hoo
       hookEventName: "SessionStart",
       additionalContext: envelope,
     },
-  };
-}
-
-/**
- * Compact plan POINTER for per-turn injection (Option C). Keeps only the
- * actionable one-liners (headline, next_action, progress) plus counts, and tells
- * the agent how to pull the rest on demand. Drops the full goal text,
- * open_questions array (~1.8 KB, static) and pending-slice list.
- */
-function compactPlanPointer(active: { plan_id: string; rev: number; view: any }): any {
-  const v = active?.view ?? {};
-  return {
-    plan_id: active.plan_id,
-    rev: active.rev,
-    headline: v.headline,
-    next_action: v.next_action,
-    progress: v.progress,
-    open_questions_count: Array.isArray(v.open_questions) ? v.open_questions.length : 0,
-    scar_tissue: v.scar_tissue,
-    pull: "Full plan (goal, open_questions, slices) omitted to save context. Call minni_plan_status for detail on demand.",
   };
 }
 
