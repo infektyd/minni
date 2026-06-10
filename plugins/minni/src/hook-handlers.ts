@@ -27,14 +27,20 @@ import type { HookOutput } from "./hook-utils.js";
 import { compactPlanPointer, resolveActivePlanView } from "./plan.js";
 import { routeMemoryIntent } from "./policy.js";
 import {
+  BOOT_RECALL_LAYERS,
   buildStatusReport,
+  extractLearningsSection,
+  fetchStaleBeliefEvents,
   formatRecall,
   readAgentContext,
   recallMemory,
+  stashPrecompactReassert,
+  subscribeContradictions,
 } from "./sovereign.js";
 import { extractScarTissue, prepareOutcome } from "./task.js";
 import {
   auditTail,
+  collectCorrectionsReassert,
   ensureVault,
   buildPendingLearningsSection,
   expireStaleInboxHandoffs,
@@ -42,6 +48,7 @@ import {
   recordAudit,
   resolveInboxHandoffContext,
   searchVaultNotes,
+  settleReassertedInboxEntries,
   writeInbox,
 } from "./vault.js";
 
@@ -68,17 +75,26 @@ export interface AgentHookConfig {
   auditPrefix: string;
   /**
    * Inbox kind for the PreCompact handoff (e.g. "codex_precompact_handoff").
-   * When omitted, PreCompact does NOT write an inbox handoff file (kilocode's
-   * behavior — its envelope carries the scar tissue directly).
+   * The handoff payload also carries the hooks-PL-3 stale-belief stash
+   * (`stale_belief_events`), written unconditionally — empty stashes are
+   * consumed at the next boot. When omitted, PreCompact does NOT write an
+   * inbox handoff file (kilocode's behavior — its envelope carries the scar
+   * tissue directly) and instead stashes NON-EMPTY stale-belief events as a
+   * dedicated `precompact_reassert` entry, mirroring the claude-code hook.
    */
   precompactKind?: string;
   /**
    * How SessionStart sources boot identity:
    * - "agent-context" (default; codex/grok): daemon readAgentContext layer1
    *   read, surfaced as `layer1_source` + `fallback_commands` and prefixed to
-   *   the envelope as native layer1 text.
-   * - "identity-recall" (kilocode): identity-layer recallMemory, surfaced as
-   *   the envelope's `recall` body.
+   *   the envelope as native layer1 text. The native layer already carries the
+   *   recency-ordered "## Learnings" section, so the envelope intentionally
+   *   omits `recent_learnings` (hooks-PL-2 deliberate asymmetry; the matrix
+   *   test asserts both sides of this contract).
+   * - "identity-recall" (kilocode): no daemon layer1 channel; the read context
+   *   is trimmed to its Learnings slice and surfaced as `recent_learnings`.
+   * Both modes issue the daemon `read` (the learning_reads writer that
+   * stale_beliefs matches on) AND the widened BOOT_RECALL_LAYERS recall.
    */
   bootIdentity?: "agent-context" | "identity-recall";
   /**
@@ -125,33 +141,55 @@ export function createHookHandlers(
     // TTL-reap stale file handoffs BEFORE the honest read so they neither occupy
     // the capped slice nor inflate totals; they surface once below as 'expired'.
     const expiredHandoffs = await expireStaleInboxHandoffs(config.vaultPath);
-    const [status, tail, identityRead, identityRecall, inboxStatus] = await Promise.all([
+    const [status, tail, identityRead, recall, contradictions, inboxStatus] = await Promise.all([
       buildStatusReport({ vaultPath: config.vaultPath }),
       auditTail(config.vaultPath, 5),
-      bootIdentity === "agent-context"
-        ? readAgentContext({ agentId: config.agentId, limit: 8 })
-        : undefined,
-      bootIdentity === "identity-recall"
-        ? recallMemory({
-            query: `boot identity for ${workspaceId}`,
-            layer: "identity",
-            limit: 4,
-            agentId: config.agentId,
-            workspaceId,
-          })
-        : undefined,
+      // hooks-PL-2 leg (a): BOTH boot modes issue the daemon 'read' — it is
+      // the recency-ordered learning surface AND the path that records
+      // learning_reads, which stale_beliefs matches on. agent-context boots
+      // inject it whole as native layer 1; identity-recall boots trim it to
+      // recent_learnings below.
+      readAgentContext({ agentId: config.agentId, limit: 8 }),
+      // recall-F1: boot recall must include the correction-bearing layers, not
+      // just the identity shelf (the widened search is what lets knowledge-
+      // layer corrections rank in). See BOOT_RECALL_LAYERS for the policy.
+      recallMemory({
+        query: `boot identity for ${workspaceId}`,
+        layers: BOOT_RECALL_LAYERS,
+        limit: 8,
+        agentId: config.agentId,
+        workspaceId,
+      }),
+      // hooks-PL-1/PL-2: corrections to beliefs this agent read must
+      // re-surface at boot (stale_beliefs), on every platform.
+      subscribeContradictions({ agentId: config.agentId }),
       readInboxStatus(config.vaultPath, 3),
     ]);
     const pending = inboxStatus.entries;
     const handoffContext = await resolveInboxHandoffContext(config.vaultPath, pending);
+    // hooks-PL-3: re-assert corrections stashed by PreCompact, so the
+    // post-compaction boot re-injects them even if the daemon is down now.
+    // Consumed entries are settled (exactly-once re-injection, no unbounded
+    // inbox growth); cap-overflowed tails are rewritten so they re-inject on
+    // the next boot, and all-malformed entries survive for inspection.
+    const { events: correctionsReassert, consumedPaths: reassertConsumed, deferredTails: reassertDeferred } =
+      collectCorrectionsReassert(pending);
+    await settleReassertedInboxEntries({
+      consumedPaths: reassertConsumed,
+      deferredTails: reassertDeferred,
+    });
 
     // Plan parity (audit C5): SessionStart injects the FULL active-plan view for
     // boot/rehydration, exactly like the claude-code hook.
     let activePlan: Awaited<ReturnType<typeof resolveActivePlanView>>;
     try {
       activePlan = await resolveActivePlanView(config.vaultPath);
-    } catch {
-      // ignore
+    } catch (error) {
+      // hooks-PL-5: a failed plan resolution must not silently boot plan-less.
+      await recordAudit(config.vaultPath, {
+        tool: `${config.auditPrefix}_active_plan_error`,
+        summary: `SessionStart: ${error instanceof Error ? error.message : String(error)}`,
+      }).catch(() => {});
     }
 
     const envelopeBody: Record<string, unknown> = {
@@ -171,10 +209,31 @@ export function createHookHandlers(
         path: snippet.relativePath,
         snippet: snippet.snippet,
       })),
+      // hooks-PL-1: discriminated stale-belief payload (matched /
+      // checked_no_match from the daemon; explicit status:"error" here so
+      // events:[] can never masquerade as "checked and clean").
+      stale_beliefs:
+        contradictions.ok && contradictions.data
+          ? contradictions.data
+          : { ok: false, status: "error", error: contradictions.error },
+      recall:
+        recall.ok && recall.data
+          ? {
+              ok: true,
+              results: recall.data.results,
+              agent_origin: recall.data.agent_id ?? config.agentId,
+              layer: recall.data.layer,
+              layers: BOOT_RECALL_LAYERS,
+            }
+          : { ok: false, error: recall.error },
       audit_tail: tail.entries.slice(-5).map((entry) => entry.split("\n")[0]),
     };
 
-    if (identityRead !== undefined) {
+    if (correctionsReassert.length > 0) {
+      envelopeBody.corrections_reassert = correctionsReassert;
+    }
+
+    if (bootIdentity === "agent-context") {
       envelopeBody.layer1_source =
         identityRead.ok && identityRead.data?.context
           ? {
@@ -188,18 +247,23 @@ export function createHookHandlers(
         daemon_read: `node dist/cli.js read ${config.runtime}`,
         recall: "node dist/cli.js prepare '<task>'",
       };
-    }
-
-    if (identityRecall !== undefined) {
-      envelopeBody.recall =
-        identityRecall.ok && identityRecall.data
+      // hooks-PL-2 (deliberate asymmetry with hook.ts/kilocode): NO
+      // recent_learnings envelope field here. agent-context boots inject the
+      // FULL daemon read context as native Layer 1 below — including its
+      // recency-ordered "## Learnings" section — so a trimmed duplicate
+      // inside the envelope would be pure redundancy. The matrix test asserts
+      // both sides of this contract (recent_learnings === undefined AND the
+      // Learnings section present in the native layer).
+    } else {
+      envelopeBody.recent_learnings =
+        identityRead.ok && identityRead.data?.context
           ? {
               ok: true,
-              results: identityRecall.data.results,
-              agent_origin: identityRecall.data.agent_id ?? config.agentId,
-              layer: identityRecall.data.layer,
+              context:
+                extractLearningsSection(identityRead.data.context) ??
+                "No recent learnings.",
             }
-          : { ok: false, error: identityRecall.error };
+          : { ok: false, error: identityRead.error };
     }
 
     if (activePlan !== undefined) {
@@ -223,11 +287,16 @@ export function createHookHandlers(
         expired_handoffs: expiredHandoffs.length,
         handoff_context: handoffContext.length,
         workspace: workspaceId,
+        corrections_reassert: correctionsReassert.length,
+        reassert_entries_cleared: reassertConsumed.length,
+        reassert_tails_deferred: reassertDeferred.length,
       },
     });
 
     const nativeLayer1 =
-      identityRead?.ok && identityRead.data?.context ? identityRead.data.context.trim() : "";
+      bootIdentity === "agent-context" && identityRead.ok && identityRead.data?.context
+        ? identityRead.data.context.trim()
+        : "";
     return withHookContext("SessionStart", [nativeLayer1, envelope].filter(Boolean).join("\n\n"));
   }
 
@@ -261,8 +330,13 @@ export function createHookHandlers(
     let activePlan: Awaited<ReturnType<typeof resolveActivePlanView>>;
     try {
       activePlan = await resolveActivePlanView(config.vaultPath);
-    } catch {
-      // ignore
+    } catch (error) {
+      // hooks-PL-5: surface plan-resolution failures instead of silently
+      // continuing without the active plan pointer.
+      await recordAudit(config.vaultPath, {
+        tool: `${config.auditPrefix}_active_plan_error`,
+        summary: `UserPromptSubmit: ${error instanceof Error ? error.message : String(error)}`,
+      }).catch(() => {});
     }
 
     const envelopeBody: Record<string, unknown> = {
@@ -320,19 +394,39 @@ export function createHookHandlers(
     const workspaceId = workspaceFor(payload);
     const transcript = asString(payload.trigger) || asString(payload.summary);
 
-    // Agents WITH a precompactKind persist a durable inbox handoff; agents
-    // without one (kilocode) carry the scar tissue in the envelope only.
+    // hooks-PL-3: compaction is exactly when a correction the agent already
+    // saw can fall out of context. Stash the current stale-belief /
+    // contradiction events durably in the inbox so the post-compaction boot
+    // re-asserts them (corrections_reassert) even if the daemon is down at
+    // next boot.
+    const { ok: staleBeliefsOk, events: staleBeliefEvents } =
+      await fetchStaleBeliefEvents(config.agentId);
+
+    // Agents WITH a precompactKind persist a durable inbox handoff (which
+    // carries the stale-belief stash); agents without one (kilocode) carry
+    // the scar tissue in the envelope only and stash non-empty stale-belief
+    // events as a dedicated precompact_reassert entry, like the CC hook.
     const inbox = config.precompactKind
       ? await writeInbox(config.vaultPath, sessionId, {
           kind: config.precompactKind,
           agent_id: config.agentId,
           workspace_id: workspaceId,
           scar_tissue: scarTissue,
+          stale_belief_events: staleBeliefEvents,
           audit_tail: tail.entries.slice(-10).map((entry) => entry.split("\n")[0]),
           compaction_trigger: transcript || "compaction in progress",
           durable_learning_committed: false,
         })
       : undefined;
+    const reassertInboxPath = config.precompactKind
+      ? undefined
+      : await stashPrecompactReassert({
+          vaultPath: config.vaultPath,
+          sessionId,
+          agentId: config.agentId,
+          staleBeliefEvents,
+          trigger: transcript,
+        });
 
     const envelope = wrapEnvelope({
       event: "PreCompact",
@@ -359,7 +453,10 @@ export function createHookHandlers(
         scar_count: scarTissue.length,
         trigger: transcript || "auto",
         workspace: workspaceId,
+        stale_belief_events: staleBeliefEvents.length,
+        stale_beliefs_ok: staleBeliefsOk,
         ...(inbox ? { inbox_path: inbox.filePath } : {}),
+        ...(reassertInboxPath ? { reassert_inbox_path: reassertInboxPath } : {}),
       },
     });
 
@@ -460,14 +557,19 @@ export async function runHookMain(config: AgentHookConfig): Promise<void> {
     const output = await handlers.dispatch(event, payload);
     emit(output);
   } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
     try {
       await recordAudit(config.vaultPath, {
         tool: `${config.auditPrefix}_error`,
-        summary: `${event}: ${error instanceof Error ? error.message : String(error)}`,
+        summary: `${event}: ${message}`,
       });
     } catch {
-      // last-resort swallow
+      // audit unavailable; the systemMessage below still surfaces the failure
     }
-    emit({ continue: true });
+    // hooks-PL-5: a degraded boot must never look like a clean one — say so.
+    emit({
+      continue: true,
+      systemMessage: `Minni hook degraded (${event}): ${message} — memory injection skipped this event; see vault log.md.`,
+    });
   }
 }
