@@ -14,7 +14,8 @@ import urllib.request
 from pathlib import Path
 from typing import Iterable, List, Optional
 
-from afm_provider import afm_chat_completion, invoke_native_afm, resolve_afm_mode
+from afm_provider import resolve_afm_mode
+from model_provider import ChatRequest, default_provider_chain
 
 logger = logging.getLogger("sovereign.query_expand")
 
@@ -47,7 +48,8 @@ def summarize_with_afm(prompt: str, timeout: float = 1.5) -> Optional[str]:
     if mode == "off":
         return None
     if mode in {"native", "auto"}:
-        native = invoke_native_afm(
+        # P2: native helper ops route through the provider chain.
+        native = default_provider_chain().native_op(
             "neighborhood_summary",
             {"prompt": prompt[:6000]},
             timeout=timeout,
@@ -104,7 +106,8 @@ def _afm_expand(query: str) -> List[str]:
     if mode == "off":
         return []
     if mode in {"native", "auto"}:
-        native = invoke_native_afm(
+        # P2: native helper ops route through the provider chain.
+        native = default_provider_chain().native_op(
             "query_expansion",
             {"query": query},
             timeout=1.2,
@@ -143,11 +146,16 @@ def _afm_expand(query: str) -> List[str]:
 
 
 def _post_afm(payload: dict, timeout: float) -> dict:
-    result = afm_chat_completion(
-        payload,
-        mode="bridge",
-        url=AFM_CHAT_COMPLETIONS_URL,
-        timeout=timeout,
+    # P2: bridge chat calls route through the provider chain (AFM-only chain is
+    # byte-identical to the old afm_chat_completion bridge path — P0 goldens).
+    result = default_provider_chain().chat(
+        ChatRequest(
+            payload=payload,
+            operation="retrieval",
+            url=AFM_CHAT_COMPLETIONS_URL,
+            timeout=timeout,
+            mode="bridge",
+        )
     )
     if result.ok:
         return result.data

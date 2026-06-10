@@ -101,7 +101,9 @@ def test_session_distillation_accepts_structured_native_compile_proposals(tmp_pa
         )
 
     monkeypatch.setenv("MINNI_AFM_MODE", "native")
-    monkeypatch.setattr("afm_passes.session_distillation.invoke_native_afm", fake_native)
+    # P2: session_distillation routes through the provider chain, which calls
+    # the canonical afm_provider boundary at call time.
+    monkeypatch.setattr("afm_provider.invoke_native_afm", fake_native)
 
     result = run(db_obj, cfg, vault_path=cfg.vault_path, dry_run=True, trace_id="trace-native")
 

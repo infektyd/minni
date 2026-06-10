@@ -14,7 +14,8 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from afm_provider import invoke_native_afm, resolve_afm_mode
+from afm_provider import resolve_afm_mode
+from model_provider import default_provider_chain
 
 
 def _slugify(text: str) -> str:
@@ -214,7 +215,9 @@ def _native_compile_drafts(pass_input: Dict[str, Any], deterministic_drafts: Lis
         "inputs": pass_input,
         "deterministic_drafts": deterministic_drafts[:12],
     }
-    result = invoke_native_afm("compile_pass_proposals", payload, timeout=4.0)
+    # P2: native helper ops route through the provider chain. The op stays
+    # native-only by contract (bridge mode keeps returning no drafts).
+    result = default_provider_chain().native_op("compile_pass_proposals", payload, timeout=4.0)
     if not result.ok:
         return []
     candidates = result.data.get("drafts")
