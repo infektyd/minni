@@ -97,6 +97,49 @@ def test_default_provider_chain_respects_providers_json(tmp_path, monkeypatch):
     assert chain.operations["retrieval"].local_only is True
 
 
+def test_default_provider_chain_retrieval_local_only_survives_empty_policy(tmp_path, monkeypatch):
+    """Finding 5 (cross-language parity with providers.test.mjs): an empty (or
+    typo'd) retrieval policy object must keep the localOnly=true secure default
+    — {"operations": {"retrieval": {}}} must not flip retrieval cloud-eligible."""
+    from model_provider import default_provider_chain
+
+    file = tmp_path / "providers.json"
+    file.write_text(json.dumps({"operations": {"retrieval": {}}}), encoding="utf-8")
+    monkeypatch.setenv("MINNI_PROVIDERS_CONFIG", os.fspath(file))
+    chain = default_provider_chain()
+    assert chain.operations["retrieval"].local_only is True
+
+
+def test_default_provider_chain_retrieval_explicit_false_only(tmp_path, monkeypatch):
+    from model_provider import default_provider_chain
+
+    file = tmp_path / "providers.json"
+    file.write_text(
+        json.dumps({"operations": {"retrieval": {"localOnly": False}, "prepare": {}}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("MINNI_PROVIDERS_CONFIG", os.fspath(file))
+    chain = default_provider_chain()
+    assert chain.operations["retrieval"].local_only is False
+    # Non-retrieval operations keep the permissive default (false unless true).
+    assert chain.operations["prepare"].local_only is False
+
+
+def test_default_provider_chain_rereads_config_between_calls(tmp_path, monkeypatch):
+    """Finding 6 parity pin: Python re-reads providers.json at every call (the
+    TS mirror was fixed to match — defaultProviderChain must observe edits)."""
+    from model_provider import default_provider_chain
+
+    file = tmp_path / "providers.json"
+    monkeypatch.setenv("MINNI_PROVIDERS_CONFIG", os.fspath(file))
+
+    file.write_text(json.dumps({"operations": {"prepare": {"localOnly": True}}}), encoding="utf-8")
+    assert default_provider_chain().operations["prepare"].local_only is True
+
+    file.write_text(json.dumps({"operations": {"prepare": {"localOnly": False}}}), encoding="utf-8")
+    assert default_provider_chain().operations["prepare"].local_only is False
+
+
 # --- secret resolution ------------------------------------------------------------
 
 

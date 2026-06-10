@@ -5,7 +5,7 @@
 
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
-import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -182,6 +182,151 @@ test("a successful live callAfmJson refreshes a negative cached probe (symmetric
   assert.equal(probeTransport.calls.length, 1, "no extra probe needed after the live success");
 });
 
+// --- finding 1: hot-cache poisoning guard ----------------------------------------
+
+test("hollow 200 live call (no choices) must NOT poison the probe cache", async () => {
+  const chatUrl = "http://127.0.0.1:11437/v1/chat/completions";
+  // A bridge answering 200 {"status":"ok"} without completion content.
+  const hollow = await callAfmJson(chatUrl, { messages: [] }, {
+    mode: "bridge",
+    transport: async () => ({ ok: true, data: { status: "ok" } }),
+  });
+  assert.equal(hollow.ok, true);
+
+  // Health must still run (and trust) the real content-checking probe.
+  const probeTransport = transportStub(GENERATION_DEAD);
+  const health = await getAfmProviderHealth({ mode: "bridge", chatUrl, health: HEALTH_UP, transport: probeTransport });
+  assert.equal(probeTransport.calls.length, 1, "hollow 200 must not satisfy the generation probe");
+  assert.equal(health.ok, false, "afm_ok must come from the real probe, not the hollow live call");
+  assert.equal(health.generationVerified, false);
+});
+
+test("hollow 200 live call is neutral: it does not invalidate a verified probe either", async () => {
+  const chatUrl = "http://127.0.0.1:11437/v1/chat/completions";
+  const probeTransport = transportStub(GENERATION_ALIVE);
+  await getAfmProviderHealth({ mode: "bridge", chatUrl, health: HEALTH_UP, transport: probeTransport });
+
+  await callAfmJson(chatUrl, { messages: [] }, {
+    mode: "bridge",
+    transport: async () => ({ ok: true, data: { status: "ok" } }),
+  });
+
+  const after = await getAfmProviderHealth({ mode: "bridge", chatUrl, health: HEALTH_UP, transport: probeTransport });
+  assert.equal(after.ok, true);
+  assert.equal(probeTransport.calls.length, 1, "neutral signal must not force a re-probe");
+});
+
+// --- finding 3: cross-process persistent probe cache ------------------------------
+
+async function withProbeCacheFile(run) {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-probe-cache-"));
+  const cacheFile = path.join(root, "afm-probe-cache.json");
+  const previous = process.env.MINNI_AFM_PROBE_CACHE;
+  process.env.MINNI_AFM_PROBE_CACHE = cacheFile;
+  resetAfmGenerationProbeCache(); // clears L1 and the (now redirected) file
+  try {
+    return await run(cacheFile);
+  } finally {
+    if (previous === undefined) delete process.env.MINNI_AFM_PROBE_CACHE;
+    else process.env.MINNI_AFM_PROBE_CACHE = previous;
+    resetAfmGenerationProbeCache();
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
+const PROBE_CACHE_KEY = "bridge|http://127.0.0.1:11437/v1/chat/completions";
+
+function persistedCacheBody(probedAtMs, generationVerified = true) {
+  return JSON.stringify({
+    version: 1,
+    entries: {
+      [PROBE_CACHE_KEY]: {
+        reachable: true,
+        generation_verified: generationVerified,
+        detail: null,
+        probed_at_ms: probedAtMs,
+      },
+    },
+  });
+}
+
+test("persistent cache: a fresh process reuses a warm file entry without a live probe", async () => {
+  await withProbeCacheFile(async (cacheFile) => {
+    // Simulates a probe persisted by another process moments ago.
+    await writeFile(cacheFile, persistedCacheBody(Date.now() - 1_000), "utf8");
+    const transport = transportStub(GENERATION_ALIVE);
+    const health = await getAfmProviderHealth({
+      mode: "bridge",
+      chatUrl: "http://127.0.0.1:11437/v1/chat/completions",
+      health: HEALTH_UP,
+      transport,
+    });
+    assert.equal(transport.calls.length, 0, "warm file entry under TTL must skip the live probe");
+    assert.equal(health.ok, true);
+    assert.equal(health.generationVerified, true);
+  });
+});
+
+test("persistent cache: a stale file entry forces a normal probe", async () => {
+  await withProbeCacheFile(async (cacheFile) => {
+    await writeFile(cacheFile, persistedCacheBody(Date.now() - 10 * 60 * 1000), "utf8");
+    const transport = transportStub(GENERATION_ALIVE);
+    const health = await getAfmProviderHealth({
+      mode: "bridge",
+      chatUrl: "http://127.0.0.1:11437/v1/chat/completions",
+      health: HEALTH_UP,
+      transport,
+    });
+    assert.equal(transport.calls.length, 1, "stale file entry must re-probe");
+    assert.equal(health.ok, true);
+    assert.equal(health.probeAgeMs < 60_000, true, "served entry comes from the fresh probe");
+  });
+});
+
+test("persistent cache: a corrupt file is ignored gracefully", async () => {
+  await withProbeCacheFile(async (cacheFile) => {
+    await writeFile(cacheFile, "{not json", "utf8");
+    const transport = transportStub(GENERATION_ALIVE);
+    const health = await getAfmProviderHealth({
+      mode: "bridge",
+      chatUrl: "http://127.0.0.1:11437/v1/chat/completions",
+      health: HEALTH_UP,
+      transport,
+    });
+    assert.equal(transport.calls.length, 1, "corrupt file degrades to a normal probe");
+    assert.equal(health.ok, true);
+  });
+});
+
+test("persistent cache: a probe persists its result for the next process", async () => {
+  await withProbeCacheFile(async (cacheFile) => {
+    const transport = transportStub(GENERATION_ALIVE);
+    await getAfmProviderHealth({
+      mode: "bridge",
+      chatUrl: "http://127.0.0.1:11437/v1/chat/completions",
+      health: HEALTH_UP,
+      transport,
+    });
+    const persisted = JSON.parse(await readFile(cacheFile, "utf8"));
+    assert.equal(persisted.version, 1);
+    assert.equal(persisted.entries[PROBE_CACHE_KEY].generation_verified, true);
+    assert.equal(typeof persisted.entries[PROBE_CACHE_KEY].probed_at_ms, "number");
+  });
+});
+
+test("persistent cache: a failed live call invalidates the file entry too", async () => {
+  await withProbeCacheFile(async (cacheFile) => {
+    const chatUrl = "http://127.0.0.1:11437/v1/chat/completions";
+    await writeFile(cacheFile, persistedCacheBody(Date.now() - 1_000), "utf8");
+    await callAfmJson(chatUrl, { messages: [] }, {
+      mode: "bridge",
+      transport: async () => GENERATION_DEAD,
+    });
+    const persisted = JSON.parse(await readFile(cacheFile, "utf8"));
+    assert.equal(persisted.entries[PROBE_CACHE_KEY], undefined, "poisoned/stale entries must not survive a live failure");
+  });
+});
+
 // --- native-mode generation health ----------------------------------------------
 
 async function withProbeHelper(responseJson, run) {
@@ -330,6 +475,61 @@ test("afmHealth accepts a healthy body (adapter:null is fine)", async () => {
     const result = await afmHealth(url);
     assert.equal(result.ok, true);
   });
+});
+
+// --- finding 2: unknown status strings must not veto the generation probe --------
+
+test("afmHealth lets unknown status strings through (the generation probe decides)", async () => {
+  await withHealthServer({ status: "initializing" }, async (url) => {
+    const result = await afmHealth(url);
+    assert.equal(result.ok, true, "unknown status must not hard-fail health");
+  });
+  await withHealthServer({ status: "degraded-but-serving" }, async (url) => {
+    const result = await afmHealth(url);
+    assert.equal(result.ok, true);
+  });
+});
+
+test("unknown /health status + working generation => afm_ok=true", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-honest-health-"));
+  try {
+    const transport = transportStub(GENERATION_ALIVE);
+    await withHealthServer({ status: "initializing" }, async (url) => {
+      const health = await afmHealth(url);
+      const report = await buildStatusReport({
+        vaultPath: root,
+        socket: { ok: true, data: { status: "ok" } },
+        afm: health,
+        afmGenerationTransport: transport,
+      });
+      assert.equal(report.afm.ok, true, "the probe, not the unknown status string, decides afm_ok");
+      assert.equal(report.afm.data.generationVerified, true);
+      assert.equal(transport.calls.length, 1, "the generation probe must run");
+    });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("availability=unavailable is a definitive negative: probe skipped, afm_ok=false", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-honest-health-"));
+  try {
+    const transport = transportStub(GENERATION_ALIVE);
+    await withHealthServer({ status: "ok", availability: "unavailable" }, async (url) => {
+      const health = await afmHealth(url);
+      assert.equal(health.ok, false);
+      const report = await buildStatusReport({
+        vaultPath: root,
+        socket: { ok: true, data: { status: "ok" } },
+        afm: health,
+        afmGenerationTransport: transport,
+      });
+      assert.equal(report.afm.ok, false);
+      assert.equal(transport.calls.length, 0, "definitive negative must skip the probe");
+    });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("afmHealth still fails on HTTP errors", async () => {

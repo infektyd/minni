@@ -196,6 +196,70 @@ def test_failed_native_call_invalidates_cached_probe(monkeypatch):
     afm_provider.reset_afm_generation_probe_cache()
 
 
+def test_native_op_failure_invalidates_cached_probe(monkeypatch):
+    """Finding 4: native_op must carry the same probe-cache accounting as chat —
+    a dead native helper must not leave a stale generation_verified=true for
+    callers that only use native_op (e.g. compile_pass_proposals)."""
+    import afm_provider
+    from afm_provider import DEFAULT_AFM_CHAT_COMPLETIONS_URL, note_afm_generation_success
+    from model_provider import AfmProvider
+
+    monkeypatch.setenv("MINNI_AFM_NATIVE_HELPER", "/tmp/missing-native-helper-for-test")
+    monkeypatch.setenv("MINNI_AFM_PROVIDER_MODE", "native")
+    afm_provider.reset_afm_generation_probe_cache()
+    note_afm_generation_success(DEFAULT_AFM_CHAT_COMPLETIONS_URL, "native")
+    key = f"native|{DEFAULT_AFM_CHAT_COMPLETIONS_URL}"
+    assert key in afm_provider._generation_probe_cache
+
+    result = AfmProvider().native_op("compile_pass_proposals", {"x": 1})
+    assert result.ok is False
+    assert key not in afm_provider._generation_probe_cache
+    afm_provider.reset_afm_generation_probe_cache()
+
+
+def test_native_op_success_marks_verified_only_with_content(tmp_path, monkeypatch):
+    """Finding 4 + finding 1 consistency: native_op success-marking respects the
+    same content check as the probe — a contentless ok is neutral."""
+    from test_afm_contract_golden import _write_fake_helper
+
+    import afm_provider
+    from afm_provider import DEFAULT_AFM_CHAT_COMPLETIONS_URL
+    from model_provider import AfmProvider
+
+    monkeypatch.setenv("MINNI_AFM_PROVIDER_MODE", "native")
+    afm_provider.reset_afm_generation_probe_cache()
+    key = f"native|{DEFAULT_AFM_CHAT_COMPLETIONS_URL}"
+
+    # Contentless ok (typical compile-style op): neutral, no verified entry.
+    helper, _ = _write_fake_helper(tmp_path, {"ok": True, "data": {"proposals": []}})
+    monkeypatch.setenv("MINNI_AFM_NATIVE_HELPER", os.fspath(helper))
+    hollow = AfmProvider().native_op("compile_pass_proposals", {}, timeout=10.0)
+    assert hollow.ok is True
+    assert key not in afm_provider._generation_probe_cache
+
+    # Completion-shaped ok: counts as a generation proof.
+    helper2, _ = _write_fake_helper(tmp_path, {"ok": True, "data": {"answer": "y"}})
+    monkeypatch.setenv("MINNI_AFM_NATIVE_HELPER", os.fspath(helper2))
+    verified = AfmProvider().native_op("chat_completion", {}, timeout=10.0)
+    assert verified.ok is True
+    assert key in afm_provider._generation_probe_cache
+    afm_provider.reset_afm_generation_probe_cache()
+
+
+def test_hollow_bridge_success_does_not_poison_probe_cache(monkeypatch):
+    """Finding 1 mirror at the model_provider boundary: an HTTP-2xx body with
+    no completion content must not mark the probe cache verified."""
+    import afm_provider
+    from afm_provider import DEFAULT_AFM_CHAT_COMPLETIONS_URL
+    from model_provider import AfmProvider
+
+    afm_provider.reset_afm_generation_probe_cache()
+    result = AfmProvider().chat(_request(mode="bridge"), client=lambda *_a: {"status": "ok"})
+    assert result.ok is True
+    assert f"bridge|{DEFAULT_AFM_CHAT_COMPLETIONS_URL}" not in afm_provider._generation_probe_cache
+    afm_provider.reset_afm_generation_probe_cache()
+
+
 def test_chain_sanitizes_provider_errors_structurally():
     """SEC (P3): secret hygiene at the chain boundary, not per call site —
     a provider error embedding auth material is redacted before it can reach

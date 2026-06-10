@@ -12,7 +12,7 @@
     "build:server": "tsc",
     "build:frontend": "vite build",
     "dev:frontend": "vite --host 127.0.0.1",
-    "test": "npm run build && node --test tests/*.test.mjs",
+    "test": "npm run build && node --test --import ./tests/setup-env.mjs tests/*.test.mjs",
     "console": "npm run build && node dist/ui-server.js",
     "design:lint": "npx @google/design.md lint ../../DESIGN.md",
     "test:live:prepare": "npm run build && node tests/live-prepare-task.mjs",

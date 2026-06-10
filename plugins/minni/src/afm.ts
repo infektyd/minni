@@ -1,12 +1,13 @@
-import { existsSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { spawn } from "node:child_process";
+import path from "node:path";
 import { URL } from "node:url";
 
 import type { JsonResult } from "./sovereign.js";
 // G13: single source for allowlist (fixes duplication noted in review)
-import { AFM_PREPARE_TASK_MODEL, AFM_PREPARE_TASK_URL, modelAllowedTargets } from "./config.js";
+import { AFM_PREPARE_TASK_MODEL, AFM_PREPARE_TASK_URL, minniHome, modelAllowedTargets } from "./config.js";
 
 export type AfmProviderMode = "auto" | "bridge" | "native" | "off";
 export type AfmProvider = "bridge" | "native" | "off";
@@ -379,18 +380,27 @@ export async function callAfmJson(
     const helperPath = resolvedNativeHelperPath(options);
     if (!helperPath) return { ok: false, error: provider.reason ?? "native helper unavailable" };
     const nativeResult = await callNativeHelper(helperPath, options.operation ?? "json", payload, options.timeoutMs ?? 45000);
+    // Cache-poisoning guard: an ok response only counts as a generation proof
+    // when it carries actual completion content — the same check the probe
+    // applies. A contentless ok (e.g. a non-completion native op) is neutral.
     if (!nativeResult.ok) noteAfmGenerationFailure(url);
-    else noteAfmGenerationSuccess(url, options.mode ?? "bridge");
+    else if (nativeCompletionContent(nativeResult.data) !== undefined) {
+      noteAfmGenerationSuccess(url, options.mode ?? "bridge");
+    }
     return nativeResult;
   }
   const transport = options.transport ?? ((targetUrl: string, body: Record<string, unknown>) => defaultTransport(targetUrl, body, options.timeoutMs ?? 45000));
   const result = await transport(url, payload);
   // Honest health: a failed live call invalidates the cached generation probe
   // so the next health read re-verifies instead of serving a stale "ok"; a
-  // successful live call is itself a generation proof and refreshes the cache
-  // (symmetric positive signal — recovery must not wait out a negative TTL).
+  // successful live call refreshes the cache (symmetric positive signal —
+  // recovery must not wait out a negative TTL) but ONLY when the body carries
+  // real completion content. A hollow 2xx ({"status":"ok"} with no choices)
+  // proves nothing about generation and must not poison the probe cache.
   if (!result.ok) noteAfmGenerationFailure(url);
-  else noteAfmGenerationSuccess(url, options.mode ?? "bridge");
+  else if (typeof chatCompletionContent(result.data) === "string") {
+    noteAfmGenerationSuccess(url, options.mode ?? "bridge");
+  }
   return result;
 }
 
@@ -437,20 +447,120 @@ function generationProbeKey(options: AfmGenerationProbeOptions): string {
   return `${options.mode ?? "bridge"}|${options.chatUrl ?? AFM_PREPARE_TASK_URL}`;
 }
 
+// --- cross-process persistent probe cache (L2) -------------------------------
+//
+// SessionStart hooks (hook.ts, codex-hook.ts, grok-hook.ts, kilocode-hook.ts)
+// run as fresh short-lived node processes, so the in-memory Maps above (L1)
+// never help them: without an L2 every session boot pays a full live 1-token
+// generation probe. A small atomic-write JSON file under ~/.minni/run/ (same
+// schema in engine/afm_provider.py) lets a hook reuse a recent verified probe.
+// Trivial versioned schema; any read/parse problem degrades to "no cache".
+const PROBE_CACHE_FILE_VERSION = 1;
+
+interface PersistedProbeEntry {
+  reachable: boolean;
+  generation_verified: boolean;
+  detail?: string | null;
+  probed_at_ms: number;
+}
+
+/** MINNI_AFM_PROBE_CACHE override exists so tests never touch live ~/.minni. */
+function probeCacheFilePath(): string {
+  return process.env.MINNI_AFM_PROBE_CACHE ?? path.join(minniHome(), "run", "afm-probe-cache.json");
+}
+
+function readPersistentProbeEntries(): Record<string, PersistedProbeEntry> {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(probeCacheFilePath(), "utf8"));
+  } catch {
+    return {};
+  }
+  if (!parsed || typeof parsed !== "object") return {};
+  const file = parsed as { version?: unknown; entries?: unknown };
+  if (file.version !== PROBE_CACHE_FILE_VERSION || !file.entries || typeof file.entries !== "object") return {};
+  const valid: Record<string, PersistedProbeEntry> = {};
+  for (const [key, value] of Object.entries(file.entries as Record<string, unknown>)) {
+    const entry = value as PersistedProbeEntry | undefined;
+    if (
+      entry
+      && typeof entry === "object"
+      && typeof entry.reachable === "boolean"
+      && typeof entry.generation_verified === "boolean"
+      && typeof entry.probed_at_ms === "number"
+    ) {
+      valid[key] = entry;
+    }
+  }
+  return valid;
+}
+
+function writePersistentProbeEntries(entries: Record<string, PersistedProbeEntry>): void {
+  // Best-effort: persistence must never break the health path.
+  try {
+    const filePath = probeCacheFilePath();
+    mkdirSync(path.dirname(filePath), { recursive: true });
+    const tempPath = `${filePath}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`;
+    writeFileSync(tempPath, JSON.stringify({ version: PROBE_CACHE_FILE_VERSION, entries }), { mode: 0o600 });
+    renameSync(tempPath, filePath);
+  } catch {
+    /* persistence is an optimization, never a failure */
+  }
+}
+
+function persistProbeMutation(mutate: (entries: Record<string, PersistedProbeEntry>) => void): void {
+  const entries = readPersistentProbeEntries();
+  mutate(entries);
+  writePersistentProbeEntries(entries);
+}
+
+function toPersistedEntry(entry: GenerationProbeEntry): PersistedProbeEntry {
+  return {
+    reachable: entry.reachable,
+    generation_verified: entry.generationVerified,
+    detail: entry.detail ?? null,
+    probed_at_ms: entry.probedAt,
+  };
+}
+
+function loadPersistedProbeEntry(key: string): GenerationProbeEntry | undefined {
+  const entry = readPersistentProbeEntries()[key];
+  if (!entry) return undefined;
+  return {
+    reachable: entry.reachable,
+    generationVerified: entry.generation_verified,
+    detail: typeof entry.detail === "string" ? entry.detail : undefined,
+    probedAt: entry.probed_at_ms,
+  };
+}
+
 export function resetAfmGenerationProbeCache(): void {
   generationProbeCache.clear();
   generationProbeInFlight.clear();
+  try {
+    rmSync(probeCacheFilePath(), { force: true });
+  } catch {
+    /* best-effort */
+  }
 }
 
 /** Invalidate cached generation probes (all entries, or those for one chat URL). */
 export function noteAfmGenerationFailure(chatUrl?: string): void {
   if (!chatUrl) {
     generationProbeCache.clear();
+    persistProbeMutation((entries) => {
+      for (const key of Object.keys(entries)) delete entries[key];
+    });
     return;
   }
   for (const key of [...generationProbeCache.keys()]) {
     if (key.endsWith(`|${chatUrl}`)) generationProbeCache.delete(key);
   }
+  persistProbeMutation((entries) => {
+    for (const key of Object.keys(entries)) {
+      if (key.endsWith(`|${chatUrl}`)) delete entries[key];
+    }
+  });
 }
 
 /**
@@ -465,6 +575,12 @@ export function noteAfmGenerationSuccess(chatUrl: string, mode: AfmProviderMode 
   for (const key of [...generationProbeCache.keys()]) {
     if (key.endsWith(`|${chatUrl}`)) generationProbeCache.set(key, { ...entry });
   }
+  persistProbeMutation((entries) => {
+    entries[`${mode}|${chatUrl}`] = toPersistedEntry(entry);
+    for (const key of Object.keys(entries)) {
+      if (key.endsWith(`|${chatUrl}`)) entries[key] = toPersistedEntry(entry);
+    }
+  });
 }
 
 function chatCompletionContent(data: unknown): string | undefined {
@@ -566,16 +682,29 @@ export async function getAfmProviderHealth(options: AfmGenerationProbeOptions = 
   const now = options.now ?? Date.now;
   const key = generationProbeKey(options);
   const ttlMs = options.ttlMs ?? GENERATION_PROBE_TTL_MS;
-  const cached = generationProbeCache.get(key);
+  let cached = generationProbeCache.get(key);
+  if (!cached) {
+    // L2: a fresh process (SessionStart hook) reuses a recent probe persisted
+    // by another process instead of paying a live generation call every boot.
+    // Stale or missing/corrupt file entries fall through to a normal probe.
+    const persisted = loadPersistedProbeEntry(key);
+    if (persisted && Math.max(0, now() - persisted.probedAt) < ttlMs) {
+      generationProbeCache.set(key, persisted);
+      cached = persisted;
+    }
+  }
   if (cached) {
     const ageMs = Math.max(0, now() - cached.probedAt);
     if (ageMs >= ttlMs && !generationProbeInFlight.has(key)) {
       const refresh = runGenerationProbe(options, now)
         .then((entry) => {
           generationProbeCache.set(key, entry);
+          persistProbeMutation((entries) => {
+            entries[key] = toPersistedEntry(entry);
+          });
           return entry;
         })
-        .catch(() => cached)
+        .catch(() => cached as GenerationProbeEntry)
         .finally(() => {
           generationProbeInFlight.delete(key);
         });
@@ -588,6 +717,9 @@ export async function getAfmProviderHealth(options: AfmGenerationProbeOptions = 
     probe = runGenerationProbe(options, now)
       .then((entry) => {
         generationProbeCache.set(key, entry);
+        persistProbeMutation((entries) => {
+          entries[key] = toPersistedEntry(entry);
+        });
         return entry;
       })
       .finally(() => {

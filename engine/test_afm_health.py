@@ -186,6 +186,164 @@ def test_successful_live_call_refreshes_negative_cached_probe():
     assert after["generation_verified"] is True
 
 
+def test_hollow_200_live_call_must_not_poison_probe_cache():
+    """Finding 1 (cache poisoning): a bridge answering 200 {"status": "ok"}
+    without completion content must NOT mark generation_verified=true; health
+    still runs (and trusts) the real content-checking probe."""
+    from afm_provider import afm_chat_completion, verify_afm_generation
+
+    def hollow_client(payload, url, timeout):
+        return {"status": "ok"}  # HTTP-2xx parseable JSON, zero choices
+
+    live = afm_chat_completion({"messages": []}, mode="bridge", client=hollow_client)
+    assert live.ok is True
+
+    # Health must still run (and trust) the real content-checking probe.
+    calls = []
+    health = verify_afm_generation("bridge", client=_alive_client(calls))
+    assert len(calls) == 1, "hollow 200 must not satisfy the generation probe"
+    assert health["ok"] is True
+
+    from afm_provider import reset_afm_generation_probe_cache
+
+    reset_afm_generation_probe_cache()
+    afm_chat_completion({"messages": []}, mode="bridge", client=hollow_client)
+    poisoned = verify_afm_generation("bridge", client=_dead_client)
+    assert poisoned["ok"] is False, "afm_ok must come from the real probe, not the hollow live call"
+    assert poisoned["generation_verified"] is False
+
+
+def test_hollow_200_live_call_is_neutral_for_verified_cache():
+    """A contentless ok is neutral: it must not invalidate a verified probe."""
+    from afm_provider import afm_chat_completion, verify_afm_generation
+
+    calls = []
+    verify_afm_generation("bridge", client=_alive_client(calls))
+    assert len(calls) == 1
+
+    afm_chat_completion({"messages": []}, mode="bridge", client=lambda *_a: {"status": "ok"})
+
+    after = verify_afm_generation("bridge", client=_alive_client(calls))
+    assert after["ok"] is True
+    assert len(calls) == 1, "neutral signal must not force a re-probe"
+
+
+# --- finding 3: cross-process persistent probe cache (mirror of afm.ts) --------
+
+
+_PROBE_CACHE_KEY = "bridge|http://127.0.0.1:11437/v1/chat/completions"
+
+
+def _persisted_cache_body(probed_at_ms, generation_verified=True):
+    import json
+
+    return json.dumps(
+        {
+            "version": 1,
+            "entries": {
+                _PROBE_CACHE_KEY: {
+                    "reachable": True,
+                    "generation_verified": generation_verified,
+                    "detail": None,
+                    "probed_at_ms": probed_at_ms,
+                }
+            },
+        }
+    )
+
+
+def _forbidden_client(payload, url, timeout):
+    raise AssertionError("warm persistent cache must skip the live probe")
+
+
+def test_persistent_cache_warm_file_skips_live_probe(tmp_path, monkeypatch):
+    import time
+
+    import afm_provider
+    from afm_provider import verify_afm_generation
+
+    cache_file = tmp_path / "afm-probe-cache.json"
+    monkeypatch.setenv("MINNI_AFM_PROBE_CACHE", os.fspath(cache_file))
+    cache_file.write_text(_persisted_cache_body(time.time() * 1000.0 - 1000.0), encoding="utf-8")
+    afm_provider._generation_probe_cache.clear()  # simulate a fresh process
+
+    health = verify_afm_generation("bridge", client=_forbidden_client)
+    assert health["ok"] is True
+    assert health["generation_verified"] is True
+
+
+def test_persistent_cache_stale_file_forces_probe(tmp_path, monkeypatch):
+    import time
+
+    import afm_provider
+    from afm_provider import verify_afm_generation
+
+    cache_file = tmp_path / "afm-probe-cache.json"
+    monkeypatch.setenv("MINNI_AFM_PROBE_CACHE", os.fspath(cache_file))
+    cache_file.write_text(_persisted_cache_body(time.time() * 1000.0 - 600_000.0), encoding="utf-8")
+    afm_provider._generation_probe_cache.clear()
+
+    calls = []
+    health = verify_afm_generation("bridge", client=_alive_client(calls))
+    assert len(calls) == 1, "stale file entry must re-probe"
+    assert health["ok"] is True
+    assert health["probe_age_ms"] < 60_000
+
+
+def test_persistent_cache_corrupt_file_is_ignored(tmp_path, monkeypatch):
+    import afm_provider
+    from afm_provider import verify_afm_generation
+
+    cache_file = tmp_path / "afm-probe-cache.json"
+    monkeypatch.setenv("MINNI_AFM_PROBE_CACHE", os.fspath(cache_file))
+    cache_file.write_text("{not json", encoding="utf-8")
+    afm_provider._generation_probe_cache.clear()
+
+    calls = []
+    health = verify_afm_generation("bridge", client=_alive_client(calls))
+    assert len(calls) == 1, "corrupt file degrades to a normal probe"
+    assert health["ok"] is True
+
+
+def test_persistent_cache_probe_persists_result_for_next_process(tmp_path, monkeypatch):
+    import json
+
+    import afm_provider
+    from afm_provider import verify_afm_generation
+
+    cache_file = tmp_path / "afm-probe-cache.json"
+    monkeypatch.setenv("MINNI_AFM_PROBE_CACHE", os.fspath(cache_file))
+
+    verify_afm_generation("bridge", client=_alive_client())
+    persisted = json.loads(cache_file.read_text(encoding="utf-8"))
+    assert persisted["version"] == 1
+    assert persisted["entries"][_PROBE_CACHE_KEY]["generation_verified"] is True
+    assert isinstance(persisted["entries"][_PROBE_CACHE_KEY]["probed_at_ms"], (int, float))
+
+    # The next "process" (cleared in-memory map) reuses the persisted probe.
+    afm_provider._generation_probe_cache.clear()
+    health = verify_afm_generation("bridge", client=_forbidden_client)
+    assert health["ok"] is True
+
+
+def test_persistent_cache_failed_live_call_invalidates_file_entry(tmp_path, monkeypatch):
+    import json
+    import time
+
+    import afm_provider
+    from afm_provider import afm_chat_completion
+
+    cache_file = tmp_path / "afm-probe-cache.json"
+    monkeypatch.setenv("MINNI_AFM_PROBE_CACHE", os.fspath(cache_file))
+    cache_file.write_text(_persisted_cache_body(time.time() * 1000.0 - 1000.0), encoding="utf-8")
+    afm_provider._generation_probe_cache.clear()
+
+    failed = afm_chat_completion({"messages": []}, mode="bridge", client=_dead_client)
+    assert failed.ok is False
+    persisted = json.loads(cache_file.read_text(encoding="utf-8"))
+    assert _PROBE_CACHE_KEY not in persisted["entries"]
+
+
 # --- native-mode generation health (mirror of afm-health.test.mjs) -------------
 
 

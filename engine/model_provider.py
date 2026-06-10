@@ -104,12 +104,15 @@ class AfmProvider:
                 else ({"payload": request.payload} if request.native_operation is None else request.payload)
             )
             native = afm_provider.invoke_native_afm(operation, payload, timeout=request.timeout)
-            if native.ok:
+            # Cache-poisoning guard: an ok response only counts as a generation
+            # proof when it carries actual completion content — the same check
+            # the probe applies; a contentless ok is neutral. A failed native
+            # call still invalidates the cached probe (mirror of afm.ts
+            # callAfmJson); in auto mode the bridge fall-through below
+            # re-verifies on success.
+            if native.ok and afm_provider._native_completion_content(native.data) is not None:
                 afm_provider.note_afm_generation_success(request.url or DEFAULT_AFM_CHAT_COMPLETIONS_URL, resolved)
-            else:
-                # Honest health: a failed native call invalidates the cached
-                # probe (mirror of afm.ts callAfmJson); in auto mode the bridge
-                # fall-through below re-verifies on success.
+            elif not native.ok:
                 afm_provider.note_afm_generation_failure(request.url or DEFAULT_AFM_CHAT_COMPLETIONS_URL)
             if native.ok or resolved == "native":
                 return ProviderResult(
@@ -136,9 +139,12 @@ class AfmProvider:
         bridge_client = client or afm_provider._default_bridge_client
         try:
             data = bridge_client(request.payload, request.url or DEFAULT_AFM_CHAT_COMPLETIONS_URL, request.timeout)
-            # Honest health: a successful live call is a generation proof and
-            # refreshes the cached probe (symmetric with the failure path below).
-            afm_provider.note_afm_generation_success(request.url or DEFAULT_AFM_CHAT_COMPLETIONS_URL, resolved)
+            # Honest health: a successful live call refreshes the cached probe
+            # (symmetric with the failure path below) but ONLY when the body
+            # carries real completion content — a hollow 2xx must not poison
+            # the probe cache (mirror of afm_provider.afm_chat_completion).
+            if afm_provider._chat_completion_content(data if isinstance(data, dict) else {}) is not None:
+                afm_provider.note_afm_generation_success(request.url or DEFAULT_AFM_CHAT_COMPLETIONS_URL, resolved)
             return ProviderResult(
                 ok=True,
                 data=data if isinstance(data, dict) else {},
@@ -157,7 +163,13 @@ class AfmProvider:
                 fallback_used=resolved == "auto",
             )
 
-    def native_op(self, operation: str, payload: Dict[str, Any], timeout: float = 2.0) -> ProviderResult:
+    def native_op(
+        self,
+        operation: str,
+        payload: Dict[str, Any],
+        timeout: float = 2.0,
+        url: Optional[str] = None,
+    ) -> ProviderResult:
         """AFM-only native helper operation (e.g. compile_pass_proposals).
 
         Native-only by contract: bridge/off modes return a non-ok result so
@@ -173,6 +185,15 @@ class AfmProvider:
                 error=f"native operation {operation} requires native/auto AFM mode",
             )
         native = afm_provider.invoke_native_afm(operation, payload, timeout=timeout)
+        # Probe-cache accounting, symmetric with chat() above: a dead helper
+        # must not leave a stale generation_verified=true for callers that only
+        # use native_op; success-marking respects the same content check (most
+        # native ops return non-completion shapes and stay neutral).
+        target = url or DEFAULT_AFM_CHAT_COMPLETIONS_URL
+        if native.ok and afm_provider._native_completion_content(native.data) is not None:
+            afm_provider.note_afm_generation_success(target, resolved)
+        elif not native.ok:
+            afm_provider.note_afm_generation_failure(target)
         return ProviderResult(
             ok=native.ok,
             data=native.data,
@@ -274,7 +295,14 @@ def default_provider_chain() -> ProviderChain:
     if cfg:
         for name, op_cfg in (cfg.get("operations") or {}).items():
             if name in _OPERATION_CLASSES and isinstance(op_cfg, dict):
-                operations[name] = OperationPolicy(local_only=bool(op_cfg.get("localOnly", False)))
+                # Secure default: retrieval stays local-only unless EXPLICITLY
+                # set false — {"operations": {"retrieval": {}}} must not flip
+                # retrieval cloud-eligible (mirror of providers.ts).
+                if name == "retrieval":
+                    local_only = op_cfg.get("localOnly") is not False
+                else:
+                    local_only = bool(op_cfg.get("localOnly", False))
+                operations[name] = OperationPolicy(local_only=local_only)
 
     providers: List[Any] = []
     for name in (cfg.get("chain") if cfg else None) or ["afm"]:

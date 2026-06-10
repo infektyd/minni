@@ -90,6 +90,44 @@ test("defaultProviderChain falls back to AfmProvider when no configured backend 
   assert.ok(chain.providers[0] instanceof AfmProvider);
 });
 
+// Finding 5 (cross-language parity with engine/test_providers_config.py):
+// an empty retrieval policy object must keep the localOnly=true secure default.
+test("defaultProviderChain keeps retrieval localOnly=true for an empty policy object", () => {
+  const chain = defaultProviderChain({ chain: ["afm"], operations: { retrieval: {} }, providers: {} });
+  assert.equal(chain.operations.retrieval.localOnly, true, "{} must not flip retrieval cloud-eligible");
+});
+
+test("defaultProviderChain honors an EXPLICIT retrieval localOnly=false only", () => {
+  const explicit = defaultProviderChain({ chain: ["afm"], operations: { retrieval: { localOnly: false } }, providers: {} });
+  assert.equal(explicit.operations.retrieval.localOnly, false);
+  // Non-retrieval operations keep the permissive default (false unless true).
+  const prepare = defaultProviderChain({ chain: ["afm"], operations: { prepare: {} }, providers: {} });
+  assert.equal(prepare.operations.prepare.localOnly, false);
+});
+
+// Finding 6: the TS default must observe providers.json edits at call time
+// (the import-time PROVIDERS_CONFIG snapshot froze config for long-lived
+// plugin processes; Python re-reads per call).
+test("defaultProviderChain re-reads providers.json between calls", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "minni-providers-reload-"));
+  const file = path.join(root, "providers.json");
+  const previous = process.env.MINNI_PROVIDERS_CONFIG;
+  process.env.MINNI_PROVIDERS_CONFIG = file;
+  try {
+    await writeFile(file, JSON.stringify({ chain: ["afm"], operations: { prepare: { localOnly: true } } }), "utf8");
+    const first = defaultProviderChain();
+    assert.equal(first.operations.prepare.localOnly, true);
+
+    await writeFile(file, JSON.stringify({ chain: ["afm"], operations: { prepare: { localOnly: false } } }), "utf8");
+    const second = defaultProviderChain();
+    assert.equal(second.operations.prepare.localOnly, false, "config edits must be observed at call time");
+  } finally {
+    if (previous === undefined) delete process.env.MINNI_PROVIDERS_CONFIG;
+    else process.env.MINNI_PROVIDERS_CONFIG = previous;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("retrieval operations are local-only by default", () => {
   const cloud = fakeProvider({ name: "cloud-x", tier: "cloud", result: { ok: true } });
   const local = fakeProvider({ name: "afm", tier: "local", result: { ok: true } });

@@ -20,7 +20,7 @@ import {
   type AfmProviderMode,
   type ProviderHealth,
 } from "./afm.js";
-import { AFM_PREPARE_TASK_URL, PROVIDERS_CONFIG, type ProvidersConfig } from "./config.js";
+import { AFM_PREPARE_TASK_URL, loadProvidersConfig, type ProvidersConfig } from "./config.js";
 import type { JsonResult } from "./sovereign.js";
 
 export type OperationClass = "retrieval" | "prepare" | "extraction";
@@ -168,13 +168,22 @@ export class ProviderChain {
  * by config but skipped here until their transports exist. Retrieval defaults
  * to local-only.
  */
-export function defaultProviderChain(config: ProvidersConfig = PROVIDERS_CONFIG): ProviderChain {
+// Default config is read at CALL time (not the import-time PROVIDERS_CONFIG
+// snapshot) so a long-lived plugin process observes providers.json edits —
+// mirror of model_provider.default_provider_chain, which re-reads per call.
+export function defaultProviderChain(config: ProvidersConfig = loadProvidersConfig()): ProviderChain {
   const operations: Partial<Record<OperationClass, OperationPolicy>> = {
     retrieval: { localOnly: true },
   };
   for (const [name, policy] of Object.entries(config.operations ?? {})) {
     if (OPERATION_CLASSES.has(name as OperationClass) && policy && typeof policy === "object") {
-      operations[name as OperationClass] = { localOnly: Boolean((policy as OperationPolicy).localOnly) };
+      // Secure default: retrieval stays localOnly unless EXPLICITLY set false.
+      // {"operations":{"retrieval":{}}} must not flip retrieval cloud-eligible.
+      const localOnly =
+        name === "retrieval"
+          ? (policy as OperationPolicy).localOnly !== false
+          : Boolean((policy as OperationPolicy).localOnly);
+      operations[name as OperationClass] = { localOnly };
     }
   }
   const providers: ModelProvider[] = [];

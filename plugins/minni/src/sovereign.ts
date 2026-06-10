@@ -84,8 +84,13 @@ export function parseSovrdJson<T = unknown>(raw: string): JsonResult<T> {
 function afmHealthBodyProblem(data: unknown): string | undefined {
   if (!data || typeof data !== "object") return undefined;
   const record = data as Record<string, unknown>;
-  const okHealthStatuses = new Set(["ok", "ready", "healthy", "available", "bridge"]);
-  if (typeof record.status === "string" && !okHealthStatuses.has(record.status.toLowerCase())) {
+  // Only definitive negatives veto the downstream generation probe. Unknown
+  // status strings (a bridge update adding e.g. "initializing" or
+  // "degraded-but-serving") must NOT hard-fail health: the probe runs and
+  // decides. The previous closed allowlist {ok,ready,healthy,available,bridge}
+  // kept afm_ok=false even with working generation.
+  const badHealthStatuses = new Set(["error", "fail", "failed", "down", "dead", "stopped", "unavailable"]);
+  if (typeof record.status === "string" && badHealthStatuses.has(record.status.toLowerCase())) {
     return `afm health degraded: status=${record.status.slice(0, 40)}`;
   }
   if (typeof record.availability === "string" && record.availability.toLowerCase() !== "available") {

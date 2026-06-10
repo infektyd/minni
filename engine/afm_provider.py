@@ -90,19 +90,116 @@ _GENERATION_PROBE_TTL_SECONDS = 300.0
 _GENERATION_PROBE_TIMEOUT_SECONDS = 1.5
 _generation_probe_cache: Dict[str, Dict[str, Any]] = {}
 
+# --- cross-process persistent probe cache (L2) -------------------------------
+#
+# The in-memory dict above (L1) only benefits long-lived processes; SessionStart
+# hooks and short CLI invocations start fresh and would re-probe on every boot.
+# A small atomic-write JSON file under ~/.minni/run/ shares recent probes across
+# processes — same versioned schema as plugins/minni/src/afm.ts (probed_at_ms is
+# epoch milliseconds in the file; converted at this boundary). Any read/parse
+# problem degrades to "no cache" (normal probe); writes are best-effort.
+
+_PROBE_CACHE_FILE_VERSION = 1
+
+
+def _probe_cache_file_path() -> str:
+    """MINNI_AFM_PROBE_CACHE override exists so tests never touch live ~/.minni."""
+    override = os.environ.get("MINNI_AFM_PROBE_CACHE")
+    if override:
+        return os.path.expanduser(override)
+    home = os.path.expanduser(os.environ.get("MINNI_HOME", "~/.minni"))
+    return os.path.join(home, "run", "afm-probe-cache.json")
+
+
+def _read_persistent_probe_entries() -> Dict[str, Dict[str, Any]]:
+    try:
+        with open(_probe_cache_file_path(), "r", encoding="utf-8") as handle:
+            parsed = json.load(handle)
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(parsed, dict) or parsed.get("version") != _PROBE_CACHE_FILE_VERSION:
+        return {}
+    entries = parsed.get("entries")
+    if not isinstance(entries, dict):
+        return {}
+    valid: Dict[str, Dict[str, Any]] = {}
+    for key, value in entries.items():
+        if (
+            isinstance(value, dict)
+            and isinstance(value.get("reachable"), bool)
+            and isinstance(value.get("generation_verified"), bool)
+            and isinstance(value.get("probed_at_ms"), (int, float))
+        ):
+            valid[key] = value
+    return valid
+
+
+def _write_persistent_probe_entries(entries: Dict[str, Dict[str, Any]]) -> None:
+    # Best-effort: persistence must never break the health path.
+    try:
+        file_path = _probe_cache_file_path()
+        os.makedirs(os.path.dirname(file_path), exist_ok=True)
+        temp_path = f"{file_path}.{os.getpid()}.tmp"
+        fd = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps({"version": _PROBE_CACHE_FILE_VERSION, "entries": entries}))
+        os.replace(temp_path, file_path)
+    except OSError:
+        pass
+
+
+def _persist_probe_mutation(mutate: Callable[[Dict[str, Dict[str, Any]]], None]) -> None:
+    entries = _read_persistent_probe_entries()
+    mutate(entries)
+    _write_persistent_probe_entries(entries)
+
+
+def _to_persisted_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "reachable": bool(entry["reachable"]),
+        "generation_verified": bool(entry["generation_verified"]),
+        "detail": entry.get("detail"),
+        "probed_at_ms": float(entry["probed_at"]) * 1000.0,
+    }
+
+
+def _load_persisted_probe_entry(key: str) -> Optional[Dict[str, Any]]:
+    value = _read_persistent_probe_entries().get(key)
+    if value is None:
+        return None
+    detail = value.get("detail")
+    return {
+        "reachable": value["reachable"],
+        "generation_verified": value["generation_verified"],
+        "detail": detail if isinstance(detail, str) else None,
+        "probed_at": float(value["probed_at_ms"]) / 1000.0,
+    }
+
 
 def reset_afm_generation_probe_cache() -> None:
     _generation_probe_cache.clear()
+    try:
+        os.unlink(_probe_cache_file_path())
+    except OSError:
+        pass
 
 
 def note_afm_generation_failure(url: Optional[str] = None) -> None:
     """Invalidate cached generation probes after a live call failure."""
     if url is None:
         _generation_probe_cache.clear()
+        _persist_probe_mutation(lambda entries: entries.clear())
         return
     for key in list(_generation_probe_cache):
         if key.endswith(f"|{url}"):
             del _generation_probe_cache[key]
+
+    def _drop(entries: Dict[str, Dict[str, Any]]) -> None:
+        for key in list(entries):
+            if key.endswith(f"|{url}"):
+                del entries[key]
+
+    _persist_probe_mutation(_drop)
 
 
 def note_afm_generation_success(url: str, mode: str = "bridge", now: Callable[[], float] = time.time) -> None:
@@ -117,6 +214,14 @@ def note_afm_generation_success(url: str, mode: str = "bridge", now: Callable[[]
     for key in list(_generation_probe_cache):
         if key.endswith(f"|{url}"):
             _generation_probe_cache[key] = dict(entry)
+
+    def _upsert(entries: Dict[str, Dict[str, Any]]) -> None:
+        entries[f"{mode}|{url}"] = _to_persisted_entry(entry)
+        for key in list(entries):
+            if key.endswith(f"|{url}"):
+                entries[key] = _to_persisted_entry(entry)
+
+    _persist_probe_mutation(_upsert)
 
 
 def _chat_completion_content(data: Dict[str, Any]) -> Optional[str]:
@@ -198,9 +303,24 @@ def verify_afm_generation(
     target = url or DEFAULT_AFM_CHAT_COMPLETIONS_URL
     key = f"{resolved}|{target}"
     cached = _generation_probe_cache.get(key)
+    if cached is None:
+        # L2: a fresh process (SessionStart hook / short CLI) reuses a recent
+        # probe persisted by another process instead of paying a live
+        # generation call every boot. Stale or missing/corrupt file entries
+        # fall through to a normal probe.
+        persisted = _load_persisted_probe_entry(key)
+        if persisted is not None and (now() - persisted["probed_at"]) < ttl_seconds:
+            _generation_probe_cache[key] = persisted
+            cached = persisted
     if cached is None or (now() - cached["probed_at"]) >= ttl_seconds:
         cached = _run_generation_probe(resolved, target, timeout, client, now)
         _generation_probe_cache[key] = cached
+        fresh = cached
+
+        def _store(entries: Dict[str, Dict[str, Any]]) -> None:
+            entries[key] = _to_persisted_entry(fresh)
+
+        _persist_probe_mutation(_store)
     age_ms = int(max(0.0, now() - cached["probed_at"]) * 1000)
     return {
         "ok": cached["generation_verified"],
@@ -410,12 +530,15 @@ def afm_chat_completion(
 
     if resolved in {"native", "auto"}:
         native = invoke_native_afm("chat_completion", {"payload": payload}, timeout=timeout)
-        if native.ok:
+        # Cache-poisoning guard: an ok response only counts as a generation
+        # proof when it carries actual completion content — the same check the
+        # probe applies. A contentless ok is neutral (neither success nor
+        # failure); a failed call still invalidates the cached probe (mirror
+        # of afm.ts callAfmJson); in auto mode the bridge fall-through below
+        # re-verifies on success.
+        if native.ok and _native_completion_content(native.data) is not None:
             note_afm_generation_success(url or DEFAULT_AFM_CHAT_COMPLETIONS_URL, resolved)
-        else:
-            # Honest health: a failed native call invalidates the cached probe
-            # (mirror of afm.ts callAfmJson noteAfmGenerationFailure); in auto
-            # mode the bridge fall-through below re-verifies on success.
+        elif not native.ok:
             note_afm_generation_failure(url or DEFAULT_AFM_CHAT_COMPLETIONS_URL)
         if native.ok or resolved == "native":
             return native
@@ -445,9 +568,13 @@ def afm_chat_completion(
     bridge_client = client or _default_bridge_client
     try:
         data = bridge_client(payload, url or DEFAULT_AFM_CHAT_COMPLETIONS_URL, timeout)
-        # Honest health: a successful live call is itself a generation proof and
-        # refreshes the cached probe (symmetric counterpart of the failure path).
-        note_afm_generation_success(url or DEFAULT_AFM_CHAT_COMPLETIONS_URL, resolved)
+        # Honest health: a successful live call refreshes the cached probe
+        # (symmetric counterpart of the failure path) but ONLY when the body
+        # carries real completion content. A hollow 2xx ({"status": "ok"} with
+        # no choices) proves nothing about generation and must not poison the
+        # probe cache.
+        if _chat_completion_content(data) is not None:
+            note_afm_generation_success(url or DEFAULT_AFM_CHAT_COMPLETIONS_URL, resolved)
         return AFMResult(
             ok=True,
             data=data,
