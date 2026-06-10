@@ -111,6 +111,16 @@ export interface VaultSearchResult {
   title: string;
   snippet: string;
   score: number;
+  /**
+   * SEC-006 (audit C3 / docs-F2): authored privacy, parsed from the note's
+   * `privacy:` frontmatter at search time. `undefined` when the note declares
+   * none (consumers may then apply heuristic fallbacks). An unknown declared
+   * value fails closed to "private". `blocked` notes never reach this struct
+   * — searchVaultNotes drops them outright.
+   */
+  privacy?: PrivacyLevel;
+  /** Authored `status:` frontmatter (lifecycle), when present. */
+  status?: PageStatus;
 }
 
 const VAULT_DIRS = [
@@ -225,6 +235,62 @@ function queryTerms(query: string): string[] {
   return [
     ...new Set(query.toLowerCase().match(/[a-z0-9_/-]{3,}/g) ?? []),
   ].filter((term) => !stop.has(term));
+}
+
+const PRIVACY_LEVELS: ReadonlyArray<PrivacyLevel> = [
+  "safe",
+  "local-only",
+  "private",
+  "blocked",
+];
+
+const PAGE_STATUSES: ReadonlyArray<PageStatus> = [
+  "draft",
+  "candidate",
+  "accepted",
+  "superseded",
+  "rejected",
+  "expired",
+];
+
+/** First frontmatter block of a note (writeVaultPage emits `---\n...\n---`). */
+function frontmatterBlock(markdown: string): string {
+  return markdown.match(/^---\r?\n([\s\S]*?)\r?\n---/)?.[1] ?? "";
+}
+
+/**
+ * SEC-006: privacy as AUTHORED in frontmatter — the authoritative signal for
+ * sharing decisions (the string heuristic in task.ts is defense-in-depth
+ * only). Returns undefined when the note declares no privacy; a declared but
+ * unrecognized value fails closed to "private" rather than silently "safe".
+ * DUPLICATE `privacy:` keys fail closed too: a permissive duplicate must not
+ * shadow a restrictive one (parser-differential bypass), so the MOST
+ * restrictive declared value wins.
+ */
+function privacyFromMarkdown(markdown: string): PrivacyLevel | undefined {
+  const declared = [...frontmatterBlock(markdown).matchAll(/^privacy:\s*(.+)$/gm)].map((m) =>
+    m[1].trim().replace(/^["']|["']$/g, "").toLowerCase(),
+  );
+  if (declared.length === 0) return undefined;
+  const levels = declared.map((raw) =>
+    (PRIVACY_LEVELS as string[]).includes(raw) ? (raw as PrivacyLevel) : "private",
+  );
+  // PRIVACY_LEVELS is ordered least → most restrictive; take the worst.
+  return levels.reduce((worst, level) =>
+    PRIVACY_LEVELS.indexOf(level) > PRIVACY_LEVELS.indexOf(worst) ? level : worst,
+  );
+}
+
+function statusFromMarkdown(markdown: string): PageStatus | undefined {
+  const raw = frontmatterBlock(markdown)
+    .match(/^status:\s*(.+)$/m)?.[1]
+    ?.trim()
+    .replace(/^["']|["']$/g, "")
+    .toLowerCase();
+  if (!raw) return undefined;
+  return (PAGE_STATUSES as string[]).includes(raw)
+    ? (raw as PageStatus)
+    : undefined;
 }
 
 function titleFromMarkdown(relativePath: string, markdown: string): string {
@@ -826,8 +892,13 @@ export async function searchVaultNotes(
   }
 
   const scored = await Promise.all(
-    files.map(async (notePath) => {
+    files.map(async (notePath): Promise<VaultSearchResult | undefined> => {
       const markdown = await readFile(notePath, "utf8");
+      // SEC-006: frontmatter privacy is authoritative. Blocked notes never
+      // leave the search layer (mirrors the daemon's _ALWAYS_EXCLUDED gate);
+      // everything else carries its authored privacy so consumers gate on it.
+      const privacy = privacyFromMarkdown(markdown);
+      if (privacy === "blocked") return undefined;
       const relativePath = path.relative(vaultPath, notePath);
       const title = titleFromMarkdown(relativePath, markdown);
       const score = scoreVaultNote(query, terms, relativePath, title, markdown);
@@ -838,12 +909,14 @@ export async function searchVaultNotes(
         title,
         snippet: snippetFor(markdown, terms),
         score,
+        privacy,
+        status: statusFromMarkdown(markdown),
       };
     }),
   );
 
   return scored
-    .filter((result) => result.score > 0)
+    .filter((result): result is VaultSearchResult => result !== undefined && result.score > 0)
     .sort(
       (a, b) =>
         b.score - a.score || a.relativePath.localeCompare(b.relativePath),
@@ -881,21 +954,73 @@ export async function writeInbox(
   return { slug: safeSlug, filePath, createdAt, payload: body };
 }
 
-export async function readPendingInbox(
+/**
+ * Parse a real timestamp (ms epoch) out of an inbox filename. Two formats exist:
+ *   - `YYYY-MM-DD-<base36 ms>-<slug>.json` (writeInbox above)
+ *   - `YYYYMMDDTHHMMSSZ-<slug>.json` (daemon handoff channel)
+ * Lexicographic sorting interleaves them WRONG (the compact format sorts after
+ * every dashed date, pinning ancient handoffs into the "newest" slice — audit
+ * C2), so callers must sort on this instead. Returns undefined when neither
+ * format parses.
+ */
+export function parseInboxTimestamp(name: string): number | undefined {
+  let m = name.match(/^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z-/);
+  if (m) {
+    const ts = Date.parse(`${m[1]}-${m[2]}-${m[3]}T${m[4]}:${m[5]}:${m[6]}Z`);
+    return Number.isNaN(ts) ? undefined : ts;
+  }
+  m = name.match(/^(\d{4}-\d{2}-\d{2})-([0-9a-z]+)/);
+  if (m) {
+    const dayMs = Date.parse(`${m[1]}T00:00:00Z`);
+    if (Number.isNaN(dayMs)) return undefined;
+    // Second segment is Date.now().toString(36); trust it only when it lands
+    // near the named day (a slug can also match [0-9a-z]+).
+    const ms = parseInt(m[2], 36);
+    if (Number.isFinite(ms) && ms >= dayMs && ms < dayMs + 2 * 86_400_000) {
+      return ms;
+    }
+    return dayMs;
+  }
+  return undefined;
+}
+
+export interface InboxStatus {
+  /** Capped, true-newest-first entries (parsed payloads). */
+  entries: InboxEntry[];
+  /** Total live inbox files — so "3 shown of 1,520" is visible as such. */
+  totalPending: number;
+  /** Age in whole days of the oldest dateable file, or null when none parse. */
+  oldestAgeDays: number | null;
+}
+
+/**
+ * Honest inbox read (audit C2): sorts by REAL timestamp (both filename
+ * formats), newest first, and reports the full backlog size alongside the
+ * capped entries instead of silently showing `limit` of N.
+ */
+export async function readInboxStatus(
   vaultPath: string,
   limit = 5,
-): Promise<InboxEntry[]> {
+  now = Date.now(),
+): Promise<InboxStatus> {
   const dir = path.join(vaultPath, "inbox");
   let names: string[] = [];
   try {
     names = (await readdir(dir)).filter((name) => name.endsWith(".json"));
   } catch {
-    return [];
+    return { entries: [], totalPending: 0, oldestAgeDays: null };
   }
-  names.sort();
-  const recent = names.slice(-limit);
+  const stamped = names.map((name) => ({ name, ts: parseInboxTimestamp(name) }));
+  // Newest first; undated files sort last; name as deterministic tiebreak.
+  stamped.sort(
+    (a, b) => (b.ts ?? 0) - (a.ts ?? 0) || b.name.localeCompare(a.name),
+  );
+  const dated = stamped.filter((s) => s.ts !== undefined);
+  const oldestAgeDays = dated.length
+    ? Math.max(0, Math.floor((now - (dated[dated.length - 1].ts as number)) / 86_400_000))
+    : null;
   const entries: InboxEntry[] = [];
-  for (const name of recent) {
+  for (const { name } of stamped.slice(0, limit)) {
     const filePath = path.join(dir, name);
     try {
       const raw = await readFile(filePath, "utf8");
@@ -910,7 +1035,14 @@ export async function readPendingInbox(
       // ignore unreadable inbox files
     }
   }
-  return entries;
+  return { entries, totalPending: names.length, oldestAgeDays };
+}
+
+export async function readPendingInbox(
+  vaultPath: string,
+  limit = 5,
+): Promise<InboxEntry[]> {
+  return (await readInboxStatus(vaultPath, limit)).entries;
 }
 
 function normalizeWikilinkRef(ref: string): string {
@@ -991,12 +1123,178 @@ export async function resolveInboxHandoffContext(
   return snippets;
 }
 
-export async function clearInboxEntry(filePath: string): Promise<void> {
+/**
+ * Archive (never delete) an inbox entry: rename it into the sibling
+ * `inbox/.archive/` dir, preserving the filename (timestamp prefix on
+ * collision). `.archive/` is invisible to readInboxStatus and to the engine's
+ * inbox_ingest glob, so archived entries stop re-surfacing. Best-effort:
+ * returns the archived path, or undefined when the file was already gone.
+ */
+export async function archiveInboxEntry(filePath: string): Promise<string | undefined> {
+  const archiveDir = path.join(path.dirname(filePath), ".archive");
+  const base = path.basename(filePath);
+  let target = path.join(archiveDir, base);
   try {
-    await unlink(filePath);
+    await mkdir(archiveDir, { recursive: true });
+    try {
+      await access(target);
+      target = path.join(archiveDir, `${Date.now().toString(36)}-${base}`);
+    } catch {
+      // no collision
+    }
+    await rename(filePath, target);
+    return target;
   } catch {
-    // best effort; nothing to do if already gone
+    return undefined; // best effort; nothing to do if already gone
   }
+}
+
+export interface ExpiredInboxHandoff {
+  slug: string;
+  filePath: string;
+  /** Always set: an entry is only surfaced when THIS session archived it. */
+  archivedPath: string;
+  createdAt: string;
+  ageDays: number;
+  /**
+   * "expired": TTL (or the lease's own expires_at) elapsed unacknowledged.
+   * "acked": leftover packet whose lease was already acknowledged — archived,
+   * never reported as expired.
+   */
+  status: "expired" | "acked";
+  task?: unknown;
+}
+
+export function inboxHandoffTtlDays(): number {
+  const raw = Number(process.env.MINNI_INBOX_HANDOFF_TTL_DAYS ?? "");
+  return Number.isFinite(raw) && raw > 0 ? raw : 7;
+}
+
+/**
+ * Plain `kind: handoff` inbox files are written ONLY by the daemon handoff
+ * channel, which uses the compact `YYYYMMDDTHHMMSSZ-` stamp. Plugin-written
+ * (dashed-date) files are stop candidates / precompact handoffs / failed
+ * commands — never plain handoffs — so the reaper can skip them WITHOUT
+ * reading, keeping SessionStart O(handoff files) instead of O(backlog).
+ */
+const COMPACT_HANDOFF_NAME = /^\d{8}T\d{6}Z-/;
+
+/**
+ * TTL reaper for the FILE handoff channel (audit C2/B3). Orphaned
+ * `kind: handoff` inbox files (`requires_ack` falsy) are invisible to the
+ * lease ack channel (minnid's listing skips them), so without a TTL they pin
+ * the inbox forever. Semantics ported from the agent_ping lease model
+ * (agent_ping.ts withExpiry / checkAndReapLease): expiry is evaluated at read
+ * time, honoring each lease's OWN expiry first — classification happens
+ * BEFORE the TTL so a short lease drains as soon as its own expiry passes
+ * (the daemon default is created_at + 24h, far inside the 7d TTL), matching
+ * scripts/inbox_cleanup.py classify_file:
+ *   - `ack_status` set: lease already acknowledged — archive the leftover
+ *     packet regardless of file age, surfaced as "acked" (never mislabeled
+ *     "expired").
+ *   - `requires_ack` truthy: a live ack-channel lease the daemon owns; reaped
+ *     as soon as its own `expires_at` has passed, regardless of file age
+ *     (missing/unparseable `expires_at` => never reaped here; the ack channel
+ *     drains it).
+ *   - otherwise (the orphan shape): the file-age TTL applies.
+ * An entry is surfaced AT MOST once — only when this call's archive rename
+ * succeeded — with an explicit status, never silently dropped. A failed or
+ * raced archive surfaces nothing (the winner reports; a failure retries next
+ * session). Rename only, never unlink.
+ */
+export async function expireStaleInboxHandoffs(
+  vaultPath: string,
+  ttlDays = inboxHandoffTtlDays(),
+  now = Date.now(),
+): Promise<ExpiredInboxHandoff[]> {
+  const dir = path.join(vaultPath, "inbox");
+  let names: string[] = [];
+  try {
+    names = (await readdir(dir)).filter((name) => name.endsWith(".json"));
+  } catch {
+    return [];
+  }
+  const cutoff = now - ttlDays * 86_400_000;
+  const expired: ExpiredInboxHandoff[] = [];
+  for (const name of names) {
+    if (!COMPACT_HANDOFF_NAME.test(name)) continue; // cheap pre-filter, no read
+    const filePath = path.join(dir, name);
+    let ts = parseInboxTimestamp(name);
+    if (ts === undefined) {
+      try {
+        ts = (await stat(filePath)).mtimeMs;
+      } catch {
+        continue;
+      }
+    }
+    let payload: Record<string, unknown>;
+    try {
+      payload = JSON.parse(await readFile(filePath, "utf8")) as Record<string, unknown>;
+    } catch {
+      continue; // unreadable files are not handoffs; leave them alone
+    }
+    if (payload.kind !== "handoff") continue;
+    let status: "expired" | "acked";
+    if (typeof payload.ack_status === "string" && payload.ack_status) {
+      status = "acked"; // terminal leftover; archive regardless of age
+    } else if (payload.requires_ack) {
+      const leaseExpiry =
+        typeof payload.expires_at === "string" ? Date.parse(payload.expires_at) : NaN;
+      if (!Number.isFinite(leaseExpiry) || leaseExpiry > now) continue; // live lease: daemon owns it
+      status = "expired"; // own expiry passed: drain now, never wait for the TTL
+    } else {
+      if (ts >= cutoff) continue; // orphan shape: the file-age TTL applies
+      status = "expired";
+    }
+    const archivedPath = await archiveInboxEntry(filePath);
+    if (!archivedPath) continue; // raced (winner reports) or failed (retry next session)
+    expired.push({
+      slug: typeof payload.slug === "string" ? payload.slug : name,
+      filePath,
+      archivedPath,
+      createdAt:
+        typeof payload.createdAt === "string"
+          ? payload.createdAt
+          : new Date(ts).toISOString(),
+      ageDays: Math.floor((now - ts) / 86_400_000),
+      status,
+      task: payload.task,
+    });
+  }
+  return expired;
+}
+
+/**
+ * Shared SessionStart `pending_learnings` envelope section (audit C2/B2):
+ * honest totals (`total_pending`, `oldest_age_days`, `showing`) alongside the
+ * capped entries, plus the TTL reaper's once-only expired/acked handoffs.
+ * All four hooks (claude-code, codex, grok, kilocode) MUST build the section
+ * through this function so the shape cannot drift per hook.
+ */
+export function buildPendingLearningsSection(
+  inboxStatus: InboxStatus,
+  expiredHandoffs: ExpiredInboxHandoff[],
+): Record<string, unknown> {
+  return {
+    total_pending: inboxStatus.totalPending,
+    oldest_age_days: inboxStatus.oldestAgeDays,
+    showing: inboxStatus.entries.length,
+    entries: inboxStatus.entries.map((entry) => ({
+      slug: entry.slug,
+      created: entry.createdAt,
+      path: entry.filePath,
+      candidates: entry.payload.candidates,
+      kind: entry.payload.kind,
+      task: entry.payload.task,
+    })),
+    expired_handoffs: expiredHandoffs.map((entry) => ({
+      slug: entry.slug,
+      status: entry.status,
+      age_days: entry.ageDays,
+      created: entry.createdAt,
+      archived_to: entry.archivedPath,
+    })),
+  };
 }
 
 export async function vaultExists(vaultPath: string): Promise<boolean> {

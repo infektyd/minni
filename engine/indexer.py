@@ -102,6 +102,19 @@ class VaultIndexer:
         if privacy not in valid_privacies:
             privacy = "safe"
 
+        # SEC-006 duplicate-key differential (mirrors privacyFromMarkdown in
+        # plugins/minni/src/vault.ts): yaml.safe_load is last-key-wins, so a
+        # permissive `privacy:` duplicate after a restrictive one would relax
+        # the gate. Take the MOST restrictive recognized declaration instead.
+        declared = [
+            _str(v).lower()
+            for v in re.findall(r"^privacy:\s*(.+)$", yaml_block, re.MULTILINE)
+        ]
+        recognized = [v for v in declared if v in valid_privacies]
+        if len(recognized) > 1:
+            order = ["safe", "local-only", "private", "blocked"]
+            privacy = max(recognized, key=order.index)
+
         layer = VaultIndexer._infer_layer(agent=agent, page_type=page_type)
 
         return {

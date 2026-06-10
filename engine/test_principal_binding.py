@@ -239,7 +239,10 @@ def _call_handler_with_mismatch(handler, supplied: str = "evil-spoof"):
     elif handler.__name__ == "_handle_log_event":
         params = {"agent_id": supplied, "event_type": "note", "content": "c"}
     elif handler.__name__ == "_handle_resolve_contradiction":
-        params = {"agent_id": supplied, "new_content": "new", "supersede_ids": []}
+        # Non-empty supersede_ids: the empty list is now a -32602 validation
+        # error BEFORE principal resolution; identity mismatch must still fire
+        # on a well-formed request.
+        params = {"agent_id": supplied, "new_content": "new", "supersede_ids": [1]}
     elif handler.__name__ == "_handle_daemon_handoff":
         # G11: handoff now guarded on from_agent claim (Bug 3 / "every MCP/RPC path")
         params = {"from_agent": supplied, "to_agent": "recipient", "packet": {}}

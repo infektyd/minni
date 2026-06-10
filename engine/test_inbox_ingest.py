@@ -279,3 +279,39 @@ def test_ingested_rows_are_selected_by_consolidation_pass(tmp_path):
     result = consolidation_run(db_obj, cfg, vault_path=cfg.vault_path, dry_run=True)
     assert result["summary"]["total_proposed"] >= 1
     assert result["summary"]["examined"] >= 1
+
+
+def test_ingest_reports_skipped_by_kind(tmp_path):
+    """B4 (audit C2): kind-gate drops must be counted per kind, not silent."""
+    from afm_passes.inbox_ingest import ingest
+
+    db_obj, cfg = _make_db(tmp_path)
+    inbox = tmp_path / "codex-vault" / "inbox"
+    # Eligible: one explicit stop file + one kind-less Claude Code shape.
+    _write_inbox_file(inbox, "a.json", _stop_doc(["an ingestible lesson"]))
+    _write_inbox_file(inbox, "b.json", _cc_stop_doc(["another ingestible lesson"]))
+    # Skipped by the kind gate:
+    _write_inbox_file(inbox, "h1.json", {"kind": "handoff", "task": "t"})
+    _write_inbox_file(inbox, "h2.json", {"kind": "handoff", "task": "t2"})
+    _write_inbox_file(inbox, "f1.json", {"kind": "failed_command", "command": "x"})
+    _write_inbox_file(inbox, "p1.json", {
+        "kind": "codex_precompact_handoff",
+        "candidates": ["should not be ingested"],
+    })
+    # Kind-less but NOT the stop-candidate shape.
+    _write_inbox_file(inbox, "junk.json", {"hello": "world"})
+
+    res = ingest(db_obj, cfg, inboxes=[inbox], dry_run=False)
+    assert res["inserted"] == 2
+    assert res["skipped_by_kind"] == {
+        "handoff": 2,
+        "failed_command": 1,
+        "codex_precompact_handoff": 1,
+        "_unrecognized": 1,
+    }, res
+
+    # No skips -> empty dict (truthiness check used by the loop logger).
+    clean = tmp_path / "clean-vault" / "inbox"
+    _write_inbox_file(clean, "a.json", _stop_doc(["only eligible content"]))
+    res2 = ingest(db_obj, cfg, inboxes=[clean], dry_run=True)
+    assert res2["skipped_by_kind"] == {}

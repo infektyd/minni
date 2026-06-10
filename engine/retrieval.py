@@ -112,6 +112,52 @@ def _path_to_wikilink(path: str) -> Optional[str]:
     return f"[[{name}]]"
 
 
+def _xml_attr_escape(value) -> str:
+    """Escape XML attribute metacharacters so untrusted strings (paths, agent
+    names) cannot break out of an EVIDENCE attribute value and forge
+    attributes/tags. Mirrors xmlAttrEscape in plugins/minni/src/task.ts —
+    the injection floor must be identical on both paths."""
+    return (
+        str(value)
+        .replace("&", "&amp;")
+        .replace('"', "&quot;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+
+
+def _evidence_body_escape(text: str) -> str:
+    """Escape an evidence snippet body so it can neither close its own
+    envelope (``</EVIDENCE>``) nor open a forged one with
+    ``instruction_like="false"``. Also neutralizes markdown hazards (backticks,
+    line-leading #). Mirrors the snippet escaping in plugins/minni/src/task.ts."""
+    safe = str(text).replace("`", "\\`").replace("\n#", "\n\\#")
+    safe = safe.replace("</", "<\\/")
+    safe = re.sub(r"<EVIDENCE", "&#60;EVIDENCE", safe, flags=re.IGNORECASE)
+    return safe
+
+
+def build_evidence_envelope(
+    *,
+    source,
+    agent,
+    status,
+    privacy,
+    score: float,
+    instruction_like: bool,
+    visibility: str,
+    text: str,
+) -> str:
+    """G22 evidence-only envelope with attribute + body escaping (SEC-010).
+    Module-level so the escaping contract is directly testable."""
+    return (
+        f'<EVIDENCE source="{_xml_attr_escape(source)}" agent="{_xml_attr_escape(agent)}" '
+        f'status="{_xml_attr_escape(status)}" privacy="{_xml_attr_escape(privacy)}" '
+        f'score="{float(score):.3f}" instruction_like="{str(bool(instruction_like)).lower()}" '
+        f'visibility="{_xml_attr_escape(visibility)}">{_evidence_body_escape(text)}</EVIDENCE>'
+    )
+
+
 def _parse_evidence_refs(raw) -> Optional[list]:
     """Parse evidence_refs field (stored as JSON string or None)."""
     if raw is None:
@@ -1637,17 +1683,23 @@ class RetrievalEngine:
                 vis = "shared-wiki-authorized"
             r["visibility"] = vis
             r["reasoning"] = f"can_read_document(principal={pid or 'n/a'}, ws={ws}) passed"
-            # Safe wrapper (escape markdown hazards inside evidence)
-            safe = txt.replace("`", "\\`").replace("\n#", "\n\\#")
+            # Safe wrapper: attribute + body escaping lives in
+            # build_evidence_envelope (SEC-010 — untrusted paths/snippets must
+            # not be able to forge attributes or a second EVIDENCE tag).
             src = r.get("path") or r.get("source") or r.get("filename") or "?"
             ag = r.get("agent", "?")
             st = r.get("page_status", "?")
             pr = r.get("privacy_level", "?")
             sc = float(r.get("score") or 0)
-            r["evidence_envelope"] = (
-                f'<EVIDENCE source="{src}" agent="{ag}" status="{st}" privacy="{pr}" '
-                f'score="{sc:.3f}" instruction_like="{str(r["instruction_like"]).lower()}" '
-                f'visibility="{vis}">{safe}</EVIDENCE>'
+            r["evidence_envelope"] = build_evidence_envelope(
+                source=src,
+                agent=ag,
+                status=st,
+                privacy=pr,
+                score=sc,
+                instruction_like=r["instruction_like"],
+                visibility=vis,
+                text=txt,
             )
             # Primary text field becomes the envelope so downstream (sovrd JSON, agent_api, formatRecall) sees tagged evidence
             if "chunk_text" in r:

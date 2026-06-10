@@ -29,7 +29,9 @@ Safety / contract
   ``slug``/``last_task`` — the shape the Claude Code Stop/PreCompact hook emits
   with no ``kind`` field). Files carrying any OTHER explicit kind (handoffs,
   ``*_precompact_handoff``, ``failed_command``, ...) are NOT processed: they
-  always have a ``kind`` and so never reach the kind-less branch.
+  always have a ``kind`` and so never reach the kind-less branch. They ARE
+  counted: ``ingest()`` reports ``skipped_by_kind`` so the gate is observable
+  instead of silently dropping whole channels (B4 / audit C2).
 * Candidates are attributed to the agent that owns the vault (derived from the
   ``<agent>-vault`` dir name, e.g. ``claudecode-vault`` -> ``claudecode``) when
   the file carries no explicit ``agent_id``, instead of a global fallback.
@@ -43,7 +45,9 @@ Safety / contract
 * ``derived_from.kind`` records what the source file actually declared
   (``null`` for the kind-less Claude Code shape) — Minni logic never stamps
   one agent's label onto another agent's rows.
-* NEVER deletes inbox files or candidate rows. Disposal behavior is unchanged.
+* NEVER deletes inbox files or candidate rows. Disposal is handled separately
+  by ``afm_passes.inbox_archive`` (archive-on-resolution; rename into
+  ``inbox/.archive/``, never unlink).
 """
 
 from __future__ import annotations
@@ -170,9 +174,17 @@ def _principal_for_inbox(inbox: Path, fallback_principal: str) -> str:
     return fallback_principal
 
 
-def _scan_inbox(inbox: Path, fallback_principal: str) -> List[Dict[str, Any]]:
-    """Return candidate dicts for a single inbox dir (no DB, no dedup yet)."""
+def _scan_inbox(
+    inbox: Path, fallback_principal: str,
+) -> tuple[List[Dict[str, Any]], Dict[str, int]]:
+    """Return (candidate dicts, skipped-by-kind counts) for a single inbox dir
+    (no DB, no dedup yet). Skipped counts make the kind gate observable: files
+    dropped because they carry a non-stop ``kind`` (handoff, failed_command,
+    ``*_precompact_handoff``, ...) are tallied per kind instead of vanishing
+    silently; kind-less files that fail the stop-candidate shape check are
+    tallied under ``_unrecognized``."""
     out: List[Dict[str, Any]] = []
+    skipped_by_kind: Dict[str, int] = {}
     inbox_principal = _principal_for_inbox(inbox, fallback_principal)
     for path in sorted(inbox.glob("*.json")):
         try:
@@ -184,8 +196,11 @@ def _scan_inbox(inbox: Path, fallback_principal: str) -> List[Dict[str, Any]]:
         kind = doc.get("kind")
         # Accept codex's explicitly-tagged stop-candidates AND kind-less files
         # that carry the stop-candidate shape (the Claude Code hook writes
-        # candidate files with no `kind`). Any other explicit kind is excluded.
+        # candidate files with no `kind`). Any other explicit kind is excluded
+        # — but counted, so the gate is observable (B4 / audit C2).
         if kind not in STOP_KINDS and not (kind is None and _is_stop_candidate_shape(doc)):
+            label = kind if isinstance(kind, str) and kind else "_unrecognized"
+            skipped_by_kind[label] = skipped_by_kind.get(label, 0) + 1
             continue
         if doc.get("log_only") is True or doc.get("do_not_store") is True:
             continue
@@ -220,7 +235,7 @@ def _scan_inbox(inbox: Path, fallback_principal: str) -> List[Dict[str, Any]]:
                     "kind": kind,
                 }
             )
-    return out
+    return out, skipped_by_kind
 
 
 def ingest(db, config, inboxes: Optional[List[Path]] = None,
@@ -234,8 +249,12 @@ def ingest(db, config, inboxes: Optional[List[Path]] = None,
         inboxes = discover_inboxes(config)
 
     scanned: List[Dict[str, Any]] = []
+    skipped_by_kind: Dict[str, int] = {}
     for inbox in inboxes:
-        scanned.extend(_scan_inbox(inbox, fallback_principal))
+        rows, skipped = _scan_inbox(inbox, fallback_principal)
+        scanned.extend(rows)
+        for label, count in skipped.items():
+            skipped_by_kind[label] = skipped_by_kind.get(label, 0) + count
 
     principals = {r["principal"] for r in scanned}
     existing = _existing_keys(db, principals)
@@ -290,5 +309,6 @@ def ingest(db, config, inboxes: Optional[List[Path]] = None,
         "already_present": already,
         "would_insert": len(to_insert),
         "inserted": inserted,
+        "skipped_by_kind": skipped_by_kind,
         "dry_run": dry_run,
     }

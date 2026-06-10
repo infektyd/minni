@@ -5,7 +5,7 @@ import {
   CLAUDECODE_VAULT_PATH,
   CLAUDECODE_WORKSPACE_ID,
 } from "./config.js";
-import { resolveActivePlanView } from "./plan.js";
+import { compactPlanPointer, resolveActivePlanView } from "./plan.js";
 import {
   MEMORY_CONTRACT,
   envelopeBudgetFor,
@@ -13,6 +13,14 @@ import {
   wrapEnvelope,
 } from "./agent_envelope.js";
 import type { EnvelopeEvent } from "./agent_envelope.js";
+import {
+  asString,
+  emit,
+  readStdin,
+  VALID_EVENTS,
+  vaultRecallToBody,
+} from "./hook-utils.js";
+import type { HookOutput } from "./hook-utils.js";
 import { routeMemoryIntent } from "./policy.js";
 import {
   ackHandoff,
@@ -25,70 +33,15 @@ import {
 import { extractScarTissue, prepareOutcome } from "./task.js";
 import {
   auditTail,
-  clearInboxEntry,
   ensureVault,
-  readPendingInbox,
+  buildPendingLearningsSection,
+  expireStaleInboxHandoffs,
+  readInboxStatus,
   recordAudit,
   resolveInboxHandoffContext,
   searchVaultNotes,
   writeInbox,
 } from "./vault.js";
-import type { VaultSearchResult } from "./vault.js";
-
-interface HookOutput {
-  continue?: boolean;
-  hookSpecificOutput?: {
-    hookEventName: EnvelopeEvent;
-    additionalContext: string;
-  };
-  systemMessage?: string;
-}
-
-const VALID_EVENTS: ReadonlyArray<EnvelopeEvent> = [
-  "SessionStart",
-  "UserPromptSubmit",
-  "PreCompact",
-  "Stop",
-];
-
-async function readStdin(): Promise<unknown> {
-  if (process.stdin.isTTY) return {};
-  return new Promise((resolve) => {
-    let data = "";
-    process.stdin.setEncoding("utf8");
-    process.stdin.on("data", (chunk) => {
-      data += chunk;
-    });
-    process.stdin.on("end", () => {
-      if (!data.trim()) {
-        resolve({});
-        return;
-      }
-      try {
-        resolve(JSON.parse(data));
-      } catch {
-        resolve({});
-      }
-    });
-    process.stdin.on("error", () => resolve({}));
-  });
-}
-
-function emit(output: HookOutput): void {
-  process.stdout.write(`${JSON.stringify(output)}\n`);
-}
-
-function asString(value: unknown, fallback = ""): string {
-  return typeof value === "string" ? value : fallback;
-}
-
-function vaultRecallToBody(vault: VaultSearchResult[]): unknown {
-  return vault.slice(0, 6).map((result) => ({
-    wikilink: result.wikilink,
-    score: result.score,
-    snippet: result.snippet.replace(/\s+/g, " ").slice(0, 240),
-  }));
-}
 
 async function handleSessionStart(payload: Record<string, unknown>): Promise<HookOutput> {
   const sessionId = asString(payload.session_id) || asString(payload.sessionId) || "session";
@@ -102,7 +55,11 @@ async function handleSessionStart(payload: Record<string, unknown>): Promise<Hoo
     agentId: CLAUDECODE_AGENT_ID,
     workspaceId: CLAUDECODE_WORKSPACE_ID,
   });
-  const pending = await readPendingInbox(CLAUDECODE_VAULT_PATH, 3);
+  // TTL-reap stale file handoffs BEFORE the honest read so they neither occupy
+  // the capped slice nor inflate totals; they surface once below as 'expired'.
+  const expiredHandoffs = await expireStaleInboxHandoffs(CLAUDECODE_VAULT_PATH);
+  const inboxStatus = await readInboxStatus(CLAUDECODE_VAULT_PATH, 3);
+  const pending = inboxStatus.entries;
   const handoffContext = await resolveInboxHandoffContext(CLAUDECODE_VAULT_PATH, pending);
   const pendingHandoffs = await listPendingHandoffs({ agentId: CLAUDECODE_AGENT_ID });
   const pendingHandoffData = pendingHandoffs.ok && pendingHandoffs.data
@@ -112,7 +69,7 @@ async function handleSessionStart(payload: Record<string, unknown>): Promise<Hoo
   for (const handoff of pendingHandoffData.handoffs ?? []) {
     const leaseId = handoff.lease_id ?? handoff.leaseId;
     if (!leaseId) continue;
-    const ack = await ackHandoff({ leaseId, status: "accepted" });
+    const ack = await ackHandoff({ leaseId, status: "accepted", agentId: CLAUDECODE_AGENT_ID });
     if (ack.ok) ackedLeases.push(leaseId);
   }
   const contradictions = await subscribeContradictions({ agentId: CLAUDECODE_AGENT_ID });
@@ -134,14 +91,7 @@ async function handleSessionStart(payload: Record<string, unknown>): Promise<Hoo
       daemon_ok: status.socket.ok,
       afm_ok: status.afm.ok,
     },
-    pending_learnings: pending.map((entry) => ({
-      slug: entry.slug,
-      created: entry.createdAt,
-      path: entry.filePath,
-      candidates: entry.payload.candidates,
-      kind: entry.payload.kind,
-      task: entry.payload.task,
-    })),
+    pending_learnings: buildPendingLearningsSection(inboxStatus, expiredHandoffs),
     handoff_context: handoffContext.map((snippet) => ({
       ref: snippet.ref,
       path: snippet.relativePath,
@@ -181,7 +131,8 @@ async function handleSessionStart(payload: Record<string, unknown>): Promise<Hoo
     details: {
       daemon_ok: status.socket.ok,
       afm_ok: status.afm.ok,
-      pending_inbox: pending.length,
+      pending_inbox: inboxStatus.totalPending,
+      expired_handoffs: expiredHandoffs.length,
       handoff_context: handoffContext.length,
     },
   });
@@ -192,26 +143,6 @@ async function handleSessionStart(payload: Record<string, unknown>): Promise<Hoo
       hookEventName: "SessionStart",
       additionalContext: envelope,
     },
-  };
-}
-
-/**
- * Compact plan POINTER for per-turn injection (Option C). Keeps only the
- * actionable one-liners (headline, next_action, progress) plus counts, and tells
- * the agent how to pull the rest on demand. Drops the full goal text,
- * open_questions array (~1.8 KB, static) and pending-slice list.
- */
-function compactPlanPointer(active: { plan_id: string; rev: number; view: any }): any {
-  const v = active?.view ?? {};
-  return {
-    plan_id: active.plan_id,
-    rev: active.rev,
-    headline: v.headline,
-    next_action: v.next_action,
-    progress: v.progress,
-    open_questions_count: Array.isArray(v.open_questions) ? v.open_questions.length : 0,
-    scar_tissue: v.scar_tissue,
-    pull: "Full plan (goal, open_questions, slices) omitted to save context. Call minni_plan_status for detail on demand.",
   };
 }
 

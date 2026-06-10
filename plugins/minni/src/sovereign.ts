@@ -286,6 +286,13 @@ export async function ackHandoff(
     leaseId: string;
     status: "accepted" | "rejected_stale" | "rejected_contradicts" | "rejected_scope";
     contradictsId?: number;
+    /**
+     * A3 authz: the daemon now requires the stamped caller principal to match
+     * the lease's to_agent — pass the agent identity (server-side config,
+     * never model-supplied) so the daemon can stamp the platform principal,
+     * mirroring listPendingHandoffs.
+     */
+    agentId?: string;
   },
   requester: JsonRpcRequester = jsonRpcSocketRequest,
 ): Promise<JsonResult> {
@@ -293,6 +300,7 @@ export async function ackHandoff(
     lease_id: input.leaseId,
     status: input.status,
     contradicts_id: input.contradictsId,
+    agent_id: input.agentId,
   }, requester);
 }
 

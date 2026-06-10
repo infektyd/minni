@@ -49,6 +49,7 @@ import {
   setActivePlan,
   clearActivePlan,
   getActivePlan,
+  resolvePlanIdOrActive,
   type PlanArtifact,
 } from "./plan.js";
 import {
@@ -933,7 +934,10 @@ server.registerTool(
     },
   },
   async ({ leaseId, status, contradictsId }) => {
-    const result = await ackHandoff({ leaseId, status, contradictsId });
+    // A3 authz: agentId comes from server config (G11 self-only tool, like
+    // minni_list_pending_handoffs) — the daemon verifies it against the
+    // lease's to_agent; the model never supplies it.
+    const result = await ackHandoff({ leaseId, status, contradictsId, agentId: DEFAULT_AGENT_ID });
     return textResult(JSON.stringify(result, null, 2));
   },
 );
@@ -1034,25 +1038,48 @@ server.registerTool(
   },
 );
 
+// C5/plan-N3: id-less addressing — resolve plan_id (defaulting to the active
+// plan) and locate its vault note. Shared by the five plan tool handlers that
+// accept an optional plan_id.
+async function resolvePlanTarget(
+  planIdInput: string | undefined,
+): Promise<
+  | { ok: true; plan_id: string; notePath: string }
+  | { ok: false; result: ReturnType<typeof textResult> }
+> {
+  const resolved = await resolvePlanIdOrActive(DEFAULT_VAULT_PATH, planIdInput);
+  if ("error" in resolved) {
+    return { ok: false, result: textResult(JSON.stringify({ error: resolved.error }, null, 2)) };
+  }
+  const plan_id = resolved.plan_id;
+  const notePath = await findPlanNote(DEFAULT_VAULT_PATH, plan_id);
+  if (!notePath) {
+    return {
+      ok: false,
+      result: textResult(JSON.stringify({ error: `plan not found: ${plan_id}` }, null, 2)),
+    };
+  }
+  return { ok: true, plan_id, notePath };
+}
+
 server.registerTool(
   "minni_plan_update",
   {
     title: "Minni Plan Update",
     description:
-      "Update one plan slice status (evidence required for done). Persists vault note and appends journal event.",
+      "Update one plan slice status (evidence required for done). Persists vault note and appends journal event. plan_id defaults to the active plan.",
     inputSchema: {
-      plan_id: z.string().min(1),
+      plan_id: z.string().min(1).optional(),
       slice_id: z.string().min(1),
       status: z.enum(["pending", "in_progress", "done", "blocked", "superseded"]),
       evidence: z.string().optional(),
     },
   },
-  async ({ plan_id, slice_id, status, evidence }) => {
+  async ({ plan_id: planIdInput, slice_id, status, evidence }) => {
     const effectiveVaultPath = DEFAULT_VAULT_PATH;
-    const notePath = await findPlanNote(effectiveVaultPath, plan_id);
-    if (!notePath) {
-      return textResult(JSON.stringify({ error: `plan not found: ${plan_id}` }, null, 2));
-    }
+    const target = await resolvePlanTarget(planIdInput);
+    if (!target.ok) return target.result;
+    const { plan_id, notePath } = target;
     const plan = await rehydratePlan(notePath);
     const targetSlice = plan.slices.find((s) => s.id === slice_id);
     const from = targetSlice?.status ?? ("pending" as const);
@@ -1105,20 +1132,19 @@ server.registerTool(
   {
     title: "Minni Plan Scar",
     description:
-      "Record a dead-end, failed command, or rejected hypothesis during plan execution to prevent retries.",
+      "Record a dead-end, failed command, or rejected hypothesis during plan execution to prevent retries. plan_id defaults to the active plan.",
     inputSchema: {
-      plan_id: z.string().min(1),
+      plan_id: z.string().min(1).optional(),
       kind: z.enum(["failed_command", "dead_end", "rejected_hypothesis"]),
       signal: z.string().min(1),
       resolution: z.string().optional(),
     },
   },
-  async ({ plan_id, kind, signal, resolution }) => {
+  async ({ plan_id: planIdInput, kind, signal, resolution }) => {
     const effectiveVaultPath = DEFAULT_VAULT_PATH;
-    const notePath = await findPlanNote(effectiveVaultPath, plan_id);
-    if (!notePath) {
-      return textResult(JSON.stringify({ error: `plan not found: ${plan_id}` }, null, 2));
-    }
+    const target = await resolvePlanTarget(planIdInput);
+    if (!target.ok) return target.result;
+    const { plan_id, notePath } = target;
     const plan = await rehydratePlan(notePath);
     const next = addScar(plan, { kind, signal, resolution });
     await persistPlan(next, { vaultPath: effectiveVaultPath, notePath });
@@ -1137,18 +1163,17 @@ server.registerTool(
   {
     title: "Minni Plan Status",
     description:
-      "Compact plan view for agent context; optional live shelf content surfaces drift only (never auto-pull).",
+      "Compact plan view for agent context; optional live shelf content surfaces drift only (never auto-pull). plan_id defaults to the active plan.",
     inputSchema: {
-      plan_id: z.string().min(1),
+      plan_id: z.string().min(1).optional(),
       live_shelf_content: z.string().optional(),
     },
   },
-  async ({ plan_id, live_shelf_content }) => {
+  async ({ plan_id: planIdInput, live_shelf_content }) => {
     const effectiveVaultPath = DEFAULT_VAULT_PATH;
-    const notePath = await findPlanNote(effectiveVaultPath, plan_id);
-    if (!notePath) {
-      return textResult(JSON.stringify({ error: `plan not found: ${plan_id}` }, null, 2));
-    }
+    const target = await resolvePlanTarget(planIdInput);
+    if (!target.ok) return target.result;
+    const { plan_id, notePath } = target;
     const plan = await rehydratePlan(notePath);
     const view = compactPlanView(plan);
     const drift = live_shelf_content
@@ -1167,20 +1192,19 @@ server.registerTool(
   {
     title: "Minni Plan Replan",
     description:
-      "Replan preserving slice history: supersede dropped non-final slices, append new proposals, persist + journal.",
+      "Replan preserving slice history: supersede dropped non-final slices, append new proposals, persist + journal. plan_id defaults to the active plan.",
     inputSchema: {
-      plan_id: z.string().min(1),
+      plan_id: z.string().min(1).optional(),
       new_slices: z.array(planSliceInputSchema).optional(),
       add_slices: z.array(planSliceInputSchema).optional(),
       drop_slice_ids: z.array(z.string()).optional(),
     },
   },
-  async ({ plan_id, new_slices, add_slices, drop_slice_ids }) => {
+  async ({ plan_id: planIdInput, new_slices, add_slices, drop_slice_ids }) => {
     const effectiveVaultPath = DEFAULT_VAULT_PATH;
-    const notePath = await findPlanNote(effectiveVaultPath, plan_id);
-    if (!notePath) {
-      return textResult(JSON.stringify({ error: `plan not found: ${plan_id}` }, null, 2));
-    }
+    const target = await resolvePlanTarget(planIdInput);
+    if (!target.ok) return target.result;
+    const { plan_id, notePath } = target;
     const plan = await rehydratePlan(notePath);
     let next: PlanArtifact;
     if (add_slices || drop_slice_ids) {
@@ -1205,17 +1229,15 @@ server.registerTool(
   "minni_plan_history",
   {
     title: "Minni Plan History",
-    description: "Read revision history of a Minni plan.",
+    description: "Read revision history of a Minni plan. plan_id defaults to the active plan.",
     inputSchema: {
-      plan_id: z.string().min(1),
+      plan_id: z.string().min(1).optional(),
     },
   },
-  async ({ plan_id }) => {
-    const effectiveVaultPath = DEFAULT_VAULT_PATH;
-    const notePath = await findPlanNote(effectiveVaultPath, plan_id);
-    if (!notePath) {
-      return textResult(JSON.stringify({ error: `plan not found: ${plan_id}` }, null, 2));
-    }
+  async ({ plan_id: planIdInput }) => {
+    const target = await resolvePlanTarget(planIdInput);
+    if (!target.ok) return target.result;
+    const { plan_id, notePath } = target;
     const history = await readHistory(notePath);
     const result = history.map((h) => ({
       rev: h.rev,

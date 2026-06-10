@@ -777,6 +777,27 @@ def _handoff_lease_status(lease_id: str) -> Optional[dict]:
         return None
 
 
+def _lease_to_agent(lease_id: str) -> Optional[str]:
+    """Recipient (``to_agent``) of a handoff lease: authoritative SQLite row
+    first, JSON packets as fallback (leases can exist file-only when SQLite
+    persistence degraded). None when the lease is unknown on both channels."""
+    try:
+        db = _lazy_writeback().db
+        with db.cursor() as c:
+            row = c.execute(
+                "SELECT to_agent FROM handoff_leases WHERE lease_id = ?",
+                (lease_id,),
+            ).fetchone()
+        if row is not None and row["to_agent"]:
+            return str(row["to_agent"])
+    except Exception as exc:
+        logger.warning("Could not read lease %r for authz: %s", lease_id, exc)
+    for _vault, _path, packet in _iter_handoff_files():
+        if packet.get("lease_id") == lease_id and packet.get("to_agent"):
+            return str(packet.get("to_agent"))
+    return None
+
+
 def _handle_ack_handoff(params: dict, request_id: Any) -> dict:
     lease_id = str(params.get("lease_id", "")).strip()
     status = str(params.get("status", "")).strip()
@@ -784,6 +805,27 @@ def _handle_ack_handoff(params: dict, request_id: Any) -> dict:
         return _make_error(-32602, "lease_id is required", request_id)
     if status not in _HANDOFF_ACK_STATUSES:
         return _make_error(-32602, f"status must be one of {sorted(_HANDOFF_ACK_STATUSES)}", request_id)
+    # A3 authz (fixes a live incident: co-located session subagents acked and
+    # archived other agents' live handoffs): only the lease's RECIPIENT may ack
+    # it. The principal is server-stamped (G11) — caller-supplied agent_id is
+    # only honoured through the platform_agent_ids / alias machinery, never raw.
+    supplied = params.get("agent_id")
+    try:
+        principal = resolve_effective_principal(
+            supplied_agent_id=supplied, transport="uds"
+        )
+    except IdentityMismatchError as exc:
+        return make_mismatch_error(exc.supplied, exc.stamped, request_id)
+    to_agent = _lease_to_agent(lease_id)
+    if to_agent is None:
+        return _make_error(-32000, f"No handoff lease found for {lease_id}", request_id)
+    if to_agent != principal.agent_id:
+        return _make_error(
+            -32004,
+            f"principal_mismatch: handoff lease {lease_id} is addressed to "
+            f"'{to_agent}'; caller principal '{principal.agent_id}' may not ack it",
+            request_id,
+        )
     contradicts_id = params.get("contradicts_id")
     updates = {
         "ack_status": status,
@@ -795,10 +837,27 @@ def _handle_ack_handoff(params: dict, request_id: Any) -> dict:
     db_changed = _update_handoff_lease_status(lease_id, status, contradicts_id)
     if not changed and not db_changed:
         return _make_error(-32000, f"No handoff lease found for {lease_id}", request_id)
+    # B1: an explicit ack is terminal for the file channel — archive the
+    # recipient-side inbox copies so they stop re-surfacing at SessionStart.
+    # The outbox copy (and the authoritative lease row) keep the ack_status
+    # for await_handoff. Rename only, never unlink.
+    archived = []
+    for changed_path in changed:
+        p = Path(changed_path)
+        if p.parent.name != "inbox":
+            continue
+        try:
+            from afm_passes.inbox_archive import archive_inbox_file
+            new_path = archive_inbox_file(p)
+            if new_path:
+                archived.append(new_path)
+        except Exception as exc:
+            logger.warning("ack_handoff: archive of %s failed: %s", p, exc)
     return _make_response({
         "lease_id": lease_id,
         "status": status,
         "updated_paths": changed,
+        "archived_paths": archived,
     }, request_id)
 
 
@@ -1704,6 +1763,17 @@ def _extract_assertion(content: str) -> str:
     return content[:120].strip()
 
 
+class _ResolveRejected(Exception):
+    """Carries a pre-built JSON-RPC error response out of an OPEN write
+    transaction. Raising (instead of returning) makes the transaction context
+    manager ROLL BACK, so an early rejection releases the BEGIN IMMEDIATE
+    write lock without committing a no-op transaction."""
+
+    def __init__(self, response: dict):
+        super().__init__(str(response.get("error", {}).get("message", "rejected")))
+        self.response = response
+
+
 def _handle_resolve_contradiction(params: dict, request_id: Any) -> dict:
     """Write a new learning and atomically supersede a list of prior learnings.
 
@@ -1733,6 +1803,18 @@ def _handle_resolve_contradiction(params: dict, request_id: Any) -> dict:
     supersede_ids = params.get("supersede_ids", [])
     if not isinstance(supersede_ids, list):
         return _make_error(-32602, "supersede_ids must be a list", request_id)
+    # Validate element types BEFORE any SQL binding: a None/float/dict element
+    # would otherwise raise an InterfaceError inside the transaction and leak
+    # internal exception text via the -32000 catch-all below.
+    if not all(isinstance(sid, int) and not isinstance(sid, bool) for sid in supersede_ids):
+        return _make_error(-32602, "supersede_ids must be a list of integers", request_id)
+    # An EMPTY list would pass validation, skip the per-id ownership loop
+    # entirely, and insert an unsupervised learning that bypasses the staging
+    # workflow — resolution must actually resolve something.
+    if not supersede_ids:
+        return _make_error(
+            -32602, "supersede_ids must be a non-empty list of integers", request_id
+        )
 
     # G11: EffectivePrincipal is the single server-stamped source (never trust caller)
     supplied = params.get("agent_id")
@@ -1774,6 +1856,32 @@ def _handle_resolve_contradiction(params: dict, request_id: Any) -> dict:
 
         # Single transaction: write new + supersede old
         with wb.db.transaction() as c:
+            # A3 authz (mirrors _resolve_candidate's owner check at the same
+            # trust boundary): a caller may only supersede learnings it OWNS;
+            # cross-principal supersession requires an EXPLICITLY allowed
+            # operator. Validated BEFORE the INSERT, and rejections RAISE
+            # (_ResolveRejected -> rollback) so no orphan new learning can be
+            # left behind and no lock-holding no-op transaction is committed.
+            for sid in supersede_ids:
+                c.execute(
+                    "SELECT agent_id FROM learnings WHERE learning_id = ?",
+                    (sid,),
+                )
+                srow = c.fetchone()
+                if not srow:
+                    raise _ResolveRejected(_make_error(
+                        -32001, f"learning_not_found: {sid}", request_id
+                    ))
+                owner = str(srow["agent_id"] or "")
+                if owner != agent_id and not _explicitly_allowed_operator(principal):
+                    raise _ResolveRejected(_make_error(
+                        -32004,
+                        f"principal_mismatch: learning #{sid} is owned by '{owner}'; "
+                        f"caller principal '{agent_id}' may only supersede its own "
+                        "learnings (cross-principal supersession requires an "
+                        "explicitly allowed operator)",
+                        request_id,
+                    ))
             c.execute("""
                 INSERT INTO learnings
                 (agent_id, category, content, source_doc_ids, source_query,
@@ -1818,6 +1926,8 @@ def _handle_resolve_contradiction(params: dict, request_id: Any) -> dict:
             "new_learning_id": new_lid,
             "superseded": supersede_ids,
         }, request_id)
+    except _ResolveRejected as exc:
+        return exc.response
     except Exception as exc:
         logger.exception("resolve_contradiction failed")
         return _make_error(-32000, f"Resolve contradiction error: {exc}", request_id)
@@ -2182,6 +2292,21 @@ def _afm_loop_enabled(config=DEFAULT_CONFIG) -> bool:
 # consolidation_actions for audit. The privileged write lives here, not in passes.
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _maybe_archive_inbox_source(db, candidate_id: int) -> None:
+    """B1 drain-on-resolution (audit C2): once a candidate sourced from a vault
+    inbox file reaches a terminal state, move the source file into
+    ``<inbox>/.archive/`` so the file channel actually drains instead of
+    re-surfacing resolved candidates forever. Best-effort; never deletes
+    (rename only); never raises into the resolution path."""
+    try:
+        from afm_passes.inbox_archive import maybe_archive_for_candidate
+        maybe_archive_for_candidate(db, DEFAULT_CONFIG, candidate_id)
+    except Exception:
+        logger.exception(
+            "inbox archive for candidate %s failed (non-fatal)", candidate_id
+        )
+
+
 def _promote_candidate_durable(candidate_id: int, reason: str = "afm-consolidation"):
     """Promote one proposed candidate into a durable, embedded learning.
 
@@ -2261,6 +2386,7 @@ def _promote_candidate_durable(candidate_id: int, reason: str = "afm-consolidati
         logger.warning("consolidation: write_to_disk failed for learning #%s (%s)", lid, exc)
 
     logger.info("AFM consolidation promoted candidate #%d -> learning #%d", candidate_id, lid)
+    _maybe_archive_inbox_source(wb.db, candidate_id)
     return lid
 
 
@@ -2292,6 +2418,7 @@ def _reject_candidate_dedup(candidate_id: int) -> bool:
             (str(candidate_id), now),
         )
     logger.info("AFM consolidation deduped candidate #%d (rejected)", candidate_id)
+    _maybe_archive_inbox_source(wb.db, candidate_id)
     return True
 
 
@@ -2521,6 +2648,14 @@ async def _afm_loop_runner():
                                     _ing["inserted"], _ing["eligible"],
                                     _ing["already_present"],
                                 )
+                            # B4: surface kind-gate drops to the audit channel
+                            # instead of silently skipping whole channels.
+                            _skips = _ing.get("skipped_by_kind") or {}
+                            if any(_skips.values()):
+                                logger.info(
+                                    "AFM loop: inbox ingest skipped_by_kind=%s",
+                                    _skips,
+                                )
                         except Exception:
                             logger.exception(
                                 "AFM loop: inbox ingest raised (skipped; "
@@ -2695,8 +2830,50 @@ def _list_candidates(params: dict, request_id: Any) -> dict:
         return _make_error(-32000, f"list_candidates error: {exc}", request_id)
 
 
+def _explicitly_allowed_operator(principal: EffectivePrincipal) -> bool:
+    """A3 authz: TRUE only for an operator EXPLICITLY granted cross-principal
+    governance — never the synthesized wide-open local default. Grants:
+
+      * a LITERAL ``resolve_candidate`` / ``govern`` capability in the stamped
+        principal's capability list (an operator-authored principals/*.json
+        grant; the synthesized default only carries ``"*"``, which is NOT
+        accepted here), or
+      * the explicit ``operator`` principal (only exists when the operator
+        ships principals/operator.json), or
+      * an agent_id listed in the daemon-env allowlist
+        ``MINNI_RESOLVE_OPERATORS`` (comma-separated; operator-controlled,
+        never wire-controlled).
+
+    Rationale (live incident): every co-located session subagent is stamped
+    'main' on the shared UDS surface, so the blanket is_operator_principal
+    default let workflow subagents repeatedly re-resolve another principal's
+    candidate and archive a live inbox file. Cross-principal resolution now
+    requires one of the explicit grants above.
+    """
+    caps = principal.capabilities or []
+    if "resolve_candidate" in caps or "govern" in caps:
+        return True
+    if principal.agent_id == "operator":
+        return True
+    allow = {
+        a.strip()
+        for a in os.environ.get("MINNI_RESOLVE_OPERATORS", "").split(",")
+        if a.strip()
+    }
+    return principal.agent_id in allow
+
+
 def _resolve_candidate(params: dict, request_id: Any) -> dict:
-    """G15: Resolve a candidate (accept→durable learn, reject/redact etc). Operator only."""
+    """G15: Resolve a candidate (accept→durable learn, reject/redact etc).
+
+    Authorization is owner-or-explicit-operator and lives INSIDE the
+    transaction (after the candidate row is read), because ownership cannot be
+    known before the read. There is deliberately NO up-front
+    ``is_operator_principal`` gate: it would reject a restricted-capability
+    platform agent (caps without ``*``/``resolve_candidate``/``govern``)
+    resolving its OWN candidate before the owner check is ever reached, while
+    adding nothing the owner check does not already enforce.
+    """
     supplied = params.get("agent_id")
     try:
         principal = resolve_effective_principal(
@@ -2704,13 +2881,6 @@ def _resolve_candidate(params: dict, request_id: Any) -> dict:
         )
     except IdentityMismatchError as exc:
         return make_mismatch_error(exc.supplied, exc.stamped, request_id)
-
-    if not is_operator_principal(principal):
-        return _make_error(
-            -32004,
-            "operator_only: resolve_candidate requires operator principal (capabilities or trusted agent_id in principals/*.json)",
-            request_id,
-        )
 
     cid = params.get("candidate_id")
     if cid is None:
@@ -2750,16 +2920,44 @@ def _resolve_candidate(params: dict, request_id: Any) -> dict:
         db = _SovDB()
         lid = None
         # Explicit transaction (BEGIN IMMEDIATE) for atomic SELECT + conditional promote + UPDATE.
-        # Closes TOCTOU between read and write (mirrors the pattern in _handle_resolve_contradiction).
+        # Closes TOCTOU between read and write (mirrors the pattern in
+        # _handle_resolve_contradiction, including _ResolveRejected so early
+        # rejections roll back instead of committing a lock-holding no-op).
         with db.transaction() as c:
             c.execute("SELECT * FROM candidate_packets WHERE candidate_id=?", (cid,))
             row = c.fetchone()
             if not row:
-                return _make_error(-32001, f"candidate_not_found: {cid}", request_id)
+                raise _ResolveRejected(
+                    _make_error(-32001, f"candidate_not_found: {cid}", request_id)
+                )
             rowd = dict(row)
-            if rowd.get("principal") != principal.agent_id:
-                # allow operator to resolve any? but per spec per-principal for now; relax for console operator
-                pass  # operator may resolve cross for console; keep permissive for P1
+            # A3 authz (live incident: subagents stamped 'main' re-resolved
+            # candidate #999 and archived a live inbox file): a caller may only
+            # resolve its OWN candidates; cross-principal resolution requires an
+            # EXPLICITLY allowed operator (see _explicitly_allowed_operator).
+            owner = str(rowd.get("principal") or "")
+            if owner != principal.agent_id and not _explicitly_allowed_operator(principal):
+                raise _ResolveRejected(_make_error(
+                    -32004,
+                    f"principal_mismatch: candidate #{cid} is owned by '{owner}'; "
+                    f"caller principal '{principal.agent_id}' may only resolve its own "
+                    "candidates (cross-principal resolution requires an explicitly "
+                    "allowed operator: 'operator', a literal resolve_candidate/govern "
+                    "capability, or MINNI_RESOLVE_OPERATORS)",
+                    request_id,
+                ))
+            # Resolution is terminal and once-only (same incident: repeated
+            # re-resolution re-ran the inbox archive against a LIVE file).
+            # Mirrors the idempotent 'proposed'-only pattern in
+            # _promote_candidate_durable / _reject_candidate_dedup.
+            if rowd.get("status") != "proposed":
+                raise _ResolveRejected(_make_error(
+                    -32009,
+                    f"already_resolved: candidate #{cid} is '{rowd.get('status')}' "
+                    f"(resolved_by={rowd.get('resolved_by')!r}); resolution is terminal "
+                    "and cannot be repeated",
+                    request_id,
+                ))
 
             if new_status == "accepted":
                 # Promote to durable learning (the only path that writes to learnings)
@@ -2784,11 +2982,15 @@ def _resolve_candidate(params: dict, request_id: Any) -> dict:
                 (new_status, now, principal.agent_id, reason, cid),
             )
 
-        # Prominent audit log for the governance action (always, since operator path)
+        # Prominent audit log for the governance action (owner or explicit operator)
         logger.warning(
             "RESOLVE_CANDIDATE operator=%s candidate=%s decision=%s new_status=%s reason=%s (G15 audit)",
             principal.agent_id, cid, decision, new_status, reason[:80]
         )
+
+        # B1 drain-on-resolution: every status in status_map is terminal, so an
+        # inbox-sourced candidate's file can now leave the live inbox.
+        _maybe_archive_inbox_source(db, cid)
 
         return _make_response(
             {
@@ -2800,6 +3002,8 @@ def _resolve_candidate(params: dict, request_id: Any) -> dict:
             },
             request_id,
         )
+    except _ResolveRejected as exc:
+        return exc.response
     except Exception as exc:
         logger.exception("resolve_candidate failed")
         return _make_error(-32000, f"resolve_candidate error: {exc}", request_id)
