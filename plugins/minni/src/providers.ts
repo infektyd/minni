@@ -13,7 +13,7 @@
 // is byte-identical to the P0 golden contracts.
 
 import { callAfmJson, getAfmProviderHealth, type AfmProviderMode, type ProviderHealth } from "./afm.js";
-import { AFM_PREPARE_TASK_URL, PROVIDERS_CONFIG } from "./config.js";
+import { AFM_PREPARE_TASK_URL, PROVIDERS_CONFIG, type ProvidersConfig } from "./config.js";
 import type { JsonResult } from "./sovereign.js";
 
 export type OperationClass = "retrieval" | "prepare" | "extraction";
@@ -67,11 +67,33 @@ export class AfmProvider implements ModelProvider {
   }
 
   async chat(request: ChatRequest): Promise<ProviderChatResult> {
+    // Mode is resolved BEFORE choosing the payload so auto mode sends the
+    // native envelope to the native helper (mirror of model_provider.py).
     const mode = request.mode ?? this.mode ?? "bridge";
-    const payload = mode === "native" ? request.nativePayload ?? request.payload : request.payload;
-    const result = await callAfmJson(request.url ?? AFM_PREPARE_TASK_URL, payload, {
-      mode,
-      operation: request.nativeOperation,
+    const url = request.url ?? AFM_PREPARE_TASK_URL;
+    if (mode === "off") {
+      return { ok: false, provider: this.name, error: "AFM mode is off" };
+    }
+    if (mode === "native" || mode === "auto") {
+      // Identical native semantics to afm_provider.afm_chat_completion: the
+      // operation defaults to chat_completion and a bare chat body is wrapped
+      // as {payload: ...} for that default operation.
+      const operation = request.nativeOperation ?? "chat_completion";
+      const nativePayload =
+        request.nativePayload
+          ?? (request.nativeOperation === undefined ? { payload: request.payload } : request.payload);
+      const native = await callAfmJson(url, nativePayload, {
+        mode: "native",
+        operation,
+        timeoutMs: request.timeoutMs,
+        transport: request.transport,
+      });
+      if (native.ok || mode === "native") {
+        return { ...native, provider: this.name };
+      }
+    }
+    const result = await callAfmJson(url, request.payload, {
+      mode: "bridge",
       timeoutMs: request.timeoutMs,
       transport: request.transport,
     });
@@ -88,9 +110,10 @@ export interface OperationPolicy {
 }
 
 export class ProviderChain {
+  // Public readonly like the Python mirror (model_provider.ProviderChain).
   constructor(
-    private readonly providers: ModelProvider[],
-    private readonly operations: Partial<Record<OperationClass, OperationPolicy>> = {},
+    readonly providers: ModelProvider[],
+    readonly operations: Partial<Record<OperationClass, OperationPolicy>> = {},
   ) {}
 
   providersFor(operation: OperationClass): ModelProvider[] {
@@ -124,17 +147,17 @@ export class ProviderChain {
  * by config but skipped here until their transports exist. Retrieval defaults
  * to local-only.
  */
-export function defaultProviderChain(): ProviderChain {
+export function defaultProviderChain(config: ProvidersConfig = PROVIDERS_CONFIG): ProviderChain {
   const operations: Partial<Record<OperationClass, OperationPolicy>> = {
     retrieval: { localOnly: true },
   };
-  for (const [name, policy] of Object.entries(PROVIDERS_CONFIG.operations ?? {})) {
+  for (const [name, policy] of Object.entries(config.operations ?? {})) {
     if (OPERATION_CLASSES.has(name as OperationClass) && policy && typeof policy === "object") {
       operations[name as OperationClass] = { localOnly: Boolean((policy as OperationPolicy).localOnly) };
     }
   }
   const providers: ModelProvider[] = [];
-  for (const name of PROVIDERS_CONFIG.chain ?? ["afm"]) {
+  for (const name of config.chain ?? ["afm"]) {
     if (name === "afm") providers.push(new AfmProvider());
     // mlx/ollama/cloud transports land in P4-P6; until then they are skipped.
   }

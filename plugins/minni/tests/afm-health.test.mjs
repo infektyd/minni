@@ -5,7 +5,7 @@
 
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
-import { mkdtemp, rm } from "node:fs/promises";
+import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -161,6 +161,89 @@ test("a failed live callAfmJson invalidates the cached generation probe", async 
 
   await getAfmProviderHealth({ mode: "bridge", chatUrl, health: HEALTH_UP, transport });
   assert.equal(transport.calls.length, 2, "call failure must force a fresh probe");
+});
+
+test("a successful live callAfmJson refreshes a negative cached probe (symmetric positive signal)", async () => {
+  const chatUrl = "http://127.0.0.1:11437/v1/chat/completions";
+  const probeTransport = transportStub(GENERATION_DEAD);
+
+  const before = await getAfmProviderHealth({ mode: "bridge", chatUrl, health: HEALTH_UP, transport: probeTransport });
+  assert.equal(before.ok, false, "dead probe caches a negative entry");
+
+  const live = await callAfmJson(chatUrl, { messages: [] }, {
+    mode: "bridge",
+    transport: async () => GENERATION_ALIVE,
+  });
+  assert.equal(live.ok, true);
+
+  const after = await getAfmProviderHealth({ mode: "bridge", chatUrl, health: HEALTH_UP, transport: probeTransport });
+  assert.equal(after.ok, true, "live success is a generation proof; recovery must not wait out the TTL");
+  assert.equal(after.generationVerified, true);
+  assert.equal(probeTransport.calls.length, 1, "no extra probe needed after the live success");
+});
+
+// --- native-mode generation health ----------------------------------------------
+
+async function withProbeHelper(responseJson, run) {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-native-health-"));
+  const helper = path.join(root, "helper.mjs");
+  await writeFile(
+    helper,
+    ["#!/usr/bin/env node", `process.stdout.write(${JSON.stringify(JSON.stringify(responseJson))});`].join("\n"),
+    "utf8",
+  );
+  await chmod(helper, 0o755);
+  try {
+    return await run(helper);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
+test("native mode: helper completion with content => afm_ok=true", async () => {
+  await withProbeHelper({ ok: true, data: { answer: "y" } }, async (helper) => {
+    const health = await getAfmProviderHealth({ mode: "native", nativeHelperPath: helper, timeoutMs: 10_000 });
+    assert.equal(health.ok, true);
+    assert.equal(health.generationVerified, true);
+  });
+});
+
+test("native mode: ok response without completion content is NOT verified", async () => {
+  await withProbeHelper({ ok: true, data: {} }, async (helper) => {
+    const health = await getAfmProviderHealth({ mode: "native", nativeHelperPath: helper, timeoutMs: 10_000 });
+    assert.equal(health.ok, false, "ok with empty output proves nothing about generation");
+    assert.equal(health.generationVerified, false);
+  });
+});
+
+test("native mode: helper rejection => afm_ok=false", async () => {
+  await withProbeHelper({ ok: false, error: "model unavailable" }, async (helper) => {
+    const health = await getAfmProviderHealth({ mode: "native", nativeHelperPath: helper, timeoutMs: 10_000 });
+    assert.equal(health.ok, false);
+    assert.equal(health.generationVerified, false);
+  });
+});
+
+test("native mode: missing helper => afm_ok=false", async () => {
+  const health = await getAfmProviderHealth({ mode: "native", nativeHelperPath: "/tmp/missing-native-helper" });
+  assert.equal(health.ok, false);
+  assert.equal(health.generationVerified, false);
+});
+
+test("auto mode without a helper probes the bridge with the bare chat body", async () => {
+  const transport = transportStub(GENERATION_ALIVE);
+  const health = await getAfmProviderHealth({
+    mode: "auto",
+    health: HEALTH_UP,
+    transport,
+    nativeHelperPath: undefined,
+  });
+  assert.equal(health.ok, true);
+  assert.equal(transport.calls.length, 1);
+  // Auto resolved to bridge: the probe body is the chat payload, not the
+  // wrapped native envelope.
+  assert.equal(transport.calls[0].payload.max_tokens, 1);
+  assert.equal(transport.calls[0].payload.payload, undefined);
 });
 
 test("getAfmProviderHealth sends a 1-token completion probe", async () => {

@@ -1,4 +1,4 @@
-import { readFileSync, statSync } from "node:fs";
+import { readFileSync, realpathSync, statSync } from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { fileURLToPath } from "node:url";
@@ -16,6 +16,16 @@ export const PLUGIN_ROOT = path.resolve(__dirname, "..");
  */
 function expandTilde(p: string): string {
   return p.replace(/^~(?=$|\/)/, os.homedir());
+}
+
+/**
+ * Minni home dir, honoring MINNI_HOME (mirror of engine/config.py, which reads
+ * os.environ["MINNI_HOME"] for the same paths — without this the engine and
+ * the plugin would silently load different provider configs).
+ */
+export function minniHome(): string {
+  const fromEnv = process.env.MINNI_HOME;
+  return fromEnv ? expandTilde(fromEnv) : path.join(os.homedir(), ".minni");
 }
 
 export const DEFAULT_VAULT_PATH = expandTilde(
@@ -84,11 +94,14 @@ const DEFAULT_PROVIDERS_CONFIG: ProvidersConfig = {
   providers: {},
 };
 
-export const PROVIDERS_CONFIG_PATH = expandTilde(
-  process.env.MINNI_PROVIDERS_CONFIG ?? path.join(os.homedir(), ".minni", "providers.json"),
-);
+/** Mirror of engine/config.py providers_config_path (env read at call time). */
+export function providersConfigPath(): string {
+  return expandTilde(process.env.MINNI_PROVIDERS_CONFIG ?? path.join(minniHome(), "providers.json"));
+}
 
-export function loadProvidersConfig(filePath = PROVIDERS_CONFIG_PATH): ProvidersConfig {
+export const PROVIDERS_CONFIG_PATH = providersConfigPath();
+
+export function loadProvidersConfig(filePath = providersConfigPath()): ProvidersConfig {
   let raw: string;
   try {
     raw = readFileSync(filePath, "utf8");
@@ -127,7 +140,12 @@ export function loadProvidersConfig(filePath = PROVIDERS_CONFIG_PATH): Providers
 
 export const PROVIDERS_CONFIG: ProvidersConfig = loadProvidersConfig();
 
-export const MINNI_SECRETS_DIR = path.join(os.homedir(), ".minni", "secrets");
+/** Mirror of engine/config.py minni_secrets_dir (honors MINNI_HOME at call time). */
+export function minniSecretsDir(): string {
+  return path.join(minniHome(), "secrets");
+}
+
+export const MINNI_SECRETS_DIR = minniSecretsDir();
 
 export interface CloudApiKeyResolution {
   key?: string;
@@ -144,7 +162,7 @@ export interface CloudApiKeyResolution {
  */
 export function resolveCloudApiKey(
   cloud: CloudProviderConfig | undefined,
-  secretsDir = MINNI_SECRETS_DIR,
+  secretsDir = minniSecretsDir(),
 ): CloudApiKeyResolution {
   if (!cloud || cloud.enabled !== true) return {};
   if (cloud.apiKeyEnv) {
@@ -152,13 +170,30 @@ export function resolveCloudApiKey(
     return key ? { key } : { error: `cloud_key_unavailable: env ${cloud.apiKeyEnv} is not set` };
   }
   if (cloud.apiKeyFile) {
-    const resolved = path.resolve(expandTilde(cloud.apiKeyFile));
-    const root = path.resolve(secretsDir) + path.sep;
+    // SEC: realpath BOTH sides before the containment check (mirror of
+    // engine/config.py os.path.realpath). path.resolve alone is lexical, so a
+    // symlink under ~/.minni/secrets/ pointing at any 0600 file on disk would
+    // pass containment and turn apiKeyFile into an exfiltration primitive.
+    let resolved: string;
+    try {
+      resolved = realpathSync(path.resolve(expandTilde(cloud.apiKeyFile)));
+    } catch {
+      return { error: "cloud_key_unavailable: apiKeyFile is not readable" };
+    }
+    let root: string;
+    try {
+      root = realpathSync(path.resolve(secretsDir)) + path.sep;
+    } catch {
+      return { error: "cloud_key_denied: apiKeyFile must live under ~/.minni/secrets/" };
+    }
     if (!resolved.startsWith(root)) {
       return { error: "cloud_key_denied: apiKeyFile must live under ~/.minni/secrets/" };
     }
     try {
       const st = statSync(resolved);
+      if (!st.isFile()) {
+        return { error: "cloud_key_denied: apiKeyFile must be a regular file" };
+      }
       if ((st.mode & 0o077) !== 0) {
         return { error: "cloud_key_denied: apiKeyFile must be mode 0600 (no group/other access)" };
       }

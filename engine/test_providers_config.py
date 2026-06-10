@@ -260,3 +260,55 @@ def test_generation_health_detail_never_contains_key(monkeypatch):
     reset_afm_generation_probe_cache()
     assert health["ok"] is False
     assert SECRET_KEY not in json.dumps(health)
+
+
+def test_safe_status_error_redacts_json_quoted_header_keys():
+    """GATE: serialized-header form (quoted key names) must also be redacted —
+    a vendor-style opaque key matches neither the sk- nor the bearer backstop."""
+    from afm_provider import _safe_status_error
+
+    aws_style_key = "QUOTEDFAKEKEY1234567890"
+    leaked = (
+        'request to upstream failed: headers {"x-api-key":"%s",'
+        '"api_key":"%s","access_token":"%s","authorization":"Basic %s"}'
+    ) % (aws_style_key, aws_style_key, aws_style_key, aws_style_key)
+    sanitized = _safe_status_error(leaked)
+    assert aws_style_key not in sanitized
+    assert "[redacted]" in sanitized
+
+
+def test_resolve_cloud_api_key_denies_symlink_escape(tmp_path):
+    """SEC: a symlink under secrets/ pointing at any 0600 file elsewhere must
+    fail containment (realpath on both sides; mirror of config.ts)."""
+    from config import resolve_cloud_api_key
+
+    secrets = tmp_path / "secrets"
+    secrets.mkdir()
+    outside = tmp_path / "exfil-target.key"
+    outside.write_text(SECRET_KEY, encoding="utf-8")
+    outside.chmod(0o600)
+    link = secrets / "cloud.key"
+    link.symlink_to(outside)
+
+    result = resolve_cloud_api_key(
+        {"enabled": True, "apiKeyFile": os.fspath(link)}, secrets_dir=os.fspath(secrets)
+    )
+    assert "key" not in result
+    assert "cloud_key_denied" in result["error"]
+    assert SECRET_KEY not in json.dumps(result)
+
+
+def test_resolve_cloud_api_key_denies_non_regular_file(tmp_path):
+    from config import resolve_cloud_api_key
+
+    secrets = tmp_path / "secrets"
+    secrets.mkdir()
+    dir_key = secrets / "cloud.key"
+    dir_key.mkdir()
+    dir_key.chmod(0o700)
+
+    result = resolve_cloud_api_key(
+        {"enabled": True, "apiKeyFile": os.fspath(dir_key)}, secrets_dir=os.fspath(secrets)
+    )
+    assert "key" not in result
+    assert "regular file" in result["error"]

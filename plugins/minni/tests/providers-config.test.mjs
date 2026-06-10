@@ -5,13 +5,19 @@
 // never appears in status/audit/error output.
 
 import assert from "node:assert/strict";
-import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 
 import { callAfmJson, checkModelTarget, resetAfmGenerationProbeCache, sanitizeAfmHealth } from "../dist/afm.js";
-import { loadProvidersConfig, modelAllowedTargets, resolveCloudApiKey } from "../dist/config.js";
+import {
+  loadProvidersConfig,
+  minniSecretsDir,
+  modelAllowedTargets,
+  providersConfigPath,
+  resolveCloudApiKey,
+} from "../dist/config.js";
 import { buildStatusReport } from "../dist/sovereign.js";
 
 const SECRET_KEY = "sk-test-vErYsEcReT-cLoUdKeY-12345";
@@ -167,6 +173,52 @@ test("resolveCloudApiKey denies key files outside the secrets dir", async () => 
   }
 });
 
+test("resolveCloudApiKey denies symlinks under secrets pointing outside (realpath containment)", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "minni-secrets-"));
+  try {
+    const secrets = path.join(root, "secrets");
+    await mkdir(secrets, { recursive: true });
+    // A legitimately 0600 file elsewhere on disk (e.g. another app's credential).
+    const outside = path.join(root, "exfil-target.key");
+    await writeFile(outside, SECRET_KEY, "utf8");
+    await chmod(outside, 0o600);
+    const link = path.join(secrets, "cloud.key");
+    await symlink(outside, link);
+    const result = resolveCloudApiKey({ enabled: true, apiKeyFile: link }, secrets);
+    assert.equal(result.key, undefined, "symlink escape must not resolve a key");
+    assert.match(result.error ?? "", /cloud_key_denied.*secrets/);
+    assert.doesNotMatch(JSON.stringify(result), new RegExp(SECRET_KEY));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("resolveCloudApiKey denies a non-regular apiKeyFile (directory)", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "minni-secrets-"));
+  try {
+    const secrets = path.join(root, "secrets");
+    const dirKey = path.join(secrets, "cloud.key");
+    await mkdir(dirKey, { recursive: true });
+    await chmod(dirKey, 0o700);
+    const result = resolveCloudApiKey({ enabled: true, apiKeyFile: dirKey }, secrets);
+    assert.equal(result.key, undefined);
+    assert.match(result.error ?? "", /cloud_key_denied.*regular file/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("providersConfigPath and minniSecretsDir honor MINNI_HOME (engine/config.py mirror)", async () => {
+  await withEnv({ MINNI_HOME: "/tmp/minni-home-mirror", MINNI_PROVIDERS_CONFIG: undefined }, async () => {
+    assert.equal(providersConfigPath(), path.join("/tmp/minni-home-mirror", "providers.json"));
+    assert.equal(minniSecretsDir(), path.join("/tmp/minni-home-mirror", "secrets"));
+  });
+  await withEnv({ MINNI_HOME: undefined, MINNI_PROVIDERS_CONFIG: undefined }, async () => {
+    assert.ok(providersConfigPath().endsWith(path.join(".minni", "providers.json")));
+    assert.ok(minniSecretsDir().endsWith(path.join(".minni", "secrets")));
+  });
+});
+
 test("resolveCloudApiKey requires apiKeyEnv or apiKeyFile when enabled", () => {
   const result = resolveCloudApiKey({ enabled: true });
   assert.match(result.error ?? "", /cloud_key_unavailable/);
@@ -256,4 +308,19 @@ test("GATE: cloud key string never appears in status, sanitized health, or denia
     resetAfmGenerationProbeCache();
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("GATE: JSON-quoted header keys (non-sk, non-bearer values) are redacted", () => {
+  // The exact form fetch/axios produce when serializing headers into an error:
+  // quoted key name, colon, quoted value. A vendor-style opaque key matches neither the
+  // sk- nor the bearer backstop, so the header pattern itself must catch it.
+  const awsStyleKey = "QUOTEDFAKEKEY1234567890";
+  const leaked =
+    `request to upstream failed: headers {"x-api-key":"${awsStyleKey}",` +
+    `"api_key":"${awsStyleKey}","access_token":"${awsStyleKey}",` +
+    `"authorization":"Basic ${awsStyleKey}"}`;
+  const sanitized = sanitizeAfmHealth({ ok: false, error: leaked });
+  const body = JSON.stringify(sanitized);
+  assert.doesNotMatch(body, new RegExp(awsStyleKey), "quoted header values must never survive sanitization");
+  assert.match(body, /\[redacted\]/);
 });

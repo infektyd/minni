@@ -518,6 +518,77 @@ test("golden: team-harvest maps HTTP and timeout errors to skip reasons", async 
   }
 });
 
+test("golden: team-harvest maps chain timeouts to the timed-out skip reason", async () => {
+  const restore = snapshotEnv();
+  try {
+    const writes = [];
+    const learnings = await harvestEvidence(
+      {
+        task: "contract check",
+        vaultPath: "/tmp/vault",
+        reports: [HARVEST_REPORT],
+      },
+      {
+        transport: async () => ({ ok: false, error: "AFM request timed out" }),
+        ...harvestDeps(writes),
+      },
+    );
+    assert.equal(learnings[0].source, "skipped");
+    assert.equal(learnings[0].reason, "AFM harvest request timed out");
+    assert.equal(writes.length, 0);
+  } finally {
+    restore();
+  }
+});
+
+test("golden: team-harvest surfaces G13 denials as the structured skip reason", async () => {
+  const restore = snapshotEnv();
+  try {
+    const writes = [];
+    const learnings = await harvestEvidence(
+      {
+        task: "contract check",
+        vaultPath: "/tmp/vault",
+        reports: [HARVEST_REPORT],
+        afmUrl: "https://evil.example.com/v1/chat/completions",
+      },
+      harvestDeps(writes),
+    );
+    assert.equal(learnings[0].source, "skipped");
+    assert.match(
+      learnings[0].reason ?? "",
+      /^afm_target_denied: target is not loopback-only/,
+      "operator must see the structured denial, not a generic failure",
+    );
+    assert.doesNotMatch(learnings[0].reason ?? "", /evil\.example\.com/);
+    assert.equal(writes.length, 0);
+  } finally {
+    restore();
+  }
+});
+
+test("golden: team-harvest surfaces chain errors verbatim (generic branch)", async () => {
+  const restore = snapshotEnv();
+  try {
+    const writes = [];
+    const learnings = await harvestEvidence(
+      {
+        task: "contract check",
+        vaultPath: "/tmp/vault",
+        reports: [HARVEST_REPORT],
+      },
+      {
+        transport: async () => ({ ok: false, error: "no provider eligible for operation extraction" }),
+        ...harvestDeps(writes),
+      },
+    );
+    assert.equal(learnings[0].source, "skipped");
+    assert.equal(learnings[0].reason, "no provider eligible for operation extraction");
+  } finally {
+    restore();
+  }
+});
+
 // --- callAfmJson native envelope golden --------------------------------------
 
 test("golden: callAfmJson native helper envelope is {schema_version, operation, input}", async () => {

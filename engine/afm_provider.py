@@ -58,15 +58,17 @@ def _safe_status_error(error: Optional[str]) -> Optional[str]:
     text = str(error)
     # SEC (P3): strip auth headers / bearer tokens / API keys before anything
     # can reach status, audit, or error output (mirror of afm.ts safeError).
+    # Key names and values may be JSON-quoted (serialized header dumps), so
+    # quotes around the name and separator are tolerated.
     text = re.sub(
-        r"\b(authorization|proxy-authorization)\b\s*[:=]\s*(?:bearer\s+|basic\s+)?[^\s\"',;)]+",
+        r"\b(authorization|proxy-authorization)\b[\"']?\s*[:=]\s*[\"']?(?:bearer\s+|basic\s+)?[^\s\"',;)]+",
         r"\1=[redacted]",
         text,
         flags=re.IGNORECASE,
     )
     text = re.sub(r"\bbearer\s+[A-Za-z0-9._~+/=-]{8,}", "bearer [redacted]", text, flags=re.IGNORECASE)
     text = re.sub(
-        r"\b(x-api-key|api[-_]?key|apikey|access[-_]?token|secret[-_]?key)\b\s*[:=]\s*[^\s\"',;)]+",
+        r"\b(x-api-key|api[-_]?key|apikey|access[-_]?token|secret[-_]?key)\b[\"']?\s*[:=]\s*[\"']?[^\s\"',;)]+",
         r"\1=[redacted]",
         text,
         flags=re.IGNORECASE,
@@ -103,12 +105,39 @@ def note_afm_generation_failure(url: Optional[str] = None) -> None:
             del _generation_probe_cache[key]
 
 
+def note_afm_generation_success(url: str, mode: str = "bridge", now: Callable[[], float] = time.time) -> None:
+    """Upsert a verified probe entry after a successful live call.
+
+    The call IS a generation proof; without this symmetric positive signal a
+    transient bridge outage would keep afm_ok=false for the rest of the TTL
+    even while real calls succeed (mirror of afm.ts noteAfmGenerationSuccess).
+    """
+    entry = {"reachable": True, "generation_verified": True, "detail": None, "probed_at": now()}
+    _generation_probe_cache[f"{mode}|{url}"] = entry
+    for key in list(_generation_probe_cache):
+        if key.endswith(f"|{url}"):
+            _generation_probe_cache[key] = dict(entry)
+
+
 def _chat_completion_content(data: Dict[str, Any]) -> Optional[str]:
     try:
         content = data["choices"][0]["message"]["content"]
     except (KeyError, IndexError, TypeError):
         return None
     return content if isinstance(content, str) else None
+
+
+def _native_completion_content(data: Dict[str, Any]) -> Optional[str]:
+    """Native helpers answer chat_completion probes with a chat-shaped body or
+    a flat {answer|content|text} field; ok with neither proves nothing."""
+    content = _chat_completion_content(data)
+    if content:
+        return content
+    for key in ("answer", "content", "text"):
+        value = data.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None
 
 
 def _run_generation_probe(
@@ -125,8 +154,10 @@ def _run_generation_probe(
         "messages": [{"role": "user", "content": "ok"}],
     }
     result = afm_chat_completion(payload, mode=resolved, url=url, timeout=timeout, client=client)
+    # Native mode no longer auto-verifies on any ok response: both paths must
+    # produce actual completion content before afm_ok may flip true.
     if result.provider == "native":
-        verified = result.ok
+        verified = result.ok and _native_completion_content(result.data) is not None
     else:
         verified = result.ok and isinstance(_chat_completion_content(result.data), str)
     reachable = result.ok or bool(result.error and "HTTP" in str(result.error))
@@ -379,12 +410,17 @@ def afm_chat_completion(
 
     if resolved in {"native", "auto"}:
         native = invoke_native_afm("chat_completion", {"payload": payload}, timeout=timeout)
+        if native.ok:
+            note_afm_generation_success(url or DEFAULT_AFM_CHAT_COMPLETIONS_URL, resolved)
         if native.ok or resolved == "native":
             return native
 
     bridge_client = client or _default_bridge_client
     try:
         data = bridge_client(payload, url or DEFAULT_AFM_CHAT_COMPLETIONS_URL, timeout)
+        # Honest health: a successful live call is itself a generation proof and
+        # refreshes the cached probe (symmetric counterpart of the failure path).
+        note_afm_generation_success(url or DEFAULT_AFM_CHAT_COMPLETIONS_URL, resolved)
         return AFMResult(
             ok=True,
             data=data,

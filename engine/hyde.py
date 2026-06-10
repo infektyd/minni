@@ -104,6 +104,23 @@ def generate_hypothetical_answer(
             if isinstance(answer, str):
                 answer = " ".join(answer.split())
                 return answer or None
+            if mode == "auto":
+                # Pre-chain auto semantics (frozen by the P0 goldens): a native
+                # result that is ok but unusable still falls back to the bridge.
+                result = default_provider_chain().chat(
+                    ChatRequest(
+                        payload=payload,
+                        operation="retrieval",
+                        url=afm_url,
+                        timeout=timeout,
+                        mode="bridge",
+                    ),
+                    client=client,
+                )
+                if not result.ok:
+                    logger.debug("HyDE AFM generation skipped: %s", result.error)
+                    return None
+                return _extract_chat_text(result.data)
         logger.debug("Native AFM HyDE generation skipped: %s", result.error)
         return None
     if not result.ok:

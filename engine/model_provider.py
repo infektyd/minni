@@ -104,6 +104,8 @@ class AfmProvider:
                 else ({"payload": request.payload} if request.native_operation is None else request.payload)
             )
             native = afm_provider.invoke_native_afm(operation, payload, timeout=request.timeout)
+            if native.ok:
+                afm_provider.note_afm_generation_success(request.url or DEFAULT_AFM_CHAT_COMPLETIONS_URL, resolved)
             if native.ok or resolved == "native":
                 return ProviderResult(
                     ok=native.ok,
@@ -129,6 +131,9 @@ class AfmProvider:
         bridge_client = client or afm_provider._default_bridge_client
         try:
             data = bridge_client(request.payload, request.url or DEFAULT_AFM_CHAT_COMPLETIONS_URL, request.timeout)
+            # Honest health: a successful live call is a generation proof and
+            # refreshes the cached probe (symmetric with the failure path below).
+            afm_provider.note_afm_generation_success(request.url or DEFAULT_AFM_CHAT_COMPLETIONS_URL, resolved)
             return ProviderResult(
                 ok=True,
                 data=data if isinstance(data, dict) else {},

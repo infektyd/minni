@@ -83,10 +83,12 @@ function safeError(error: unknown): string | undefined {
   if (typeof error !== "string" || error.length === 0) return undefined;
   return error
     // SEC (P3): strip auth headers / bearer tokens / API keys before anything
-    // can reach status, audit, or error output.
-    .replace(/\b(authorization|proxy-authorization)\b\s*[:=]\s*(?:bearer\s+|basic\s+)?[^\s"',;)]+/gi, "$1=[redacted]")
+    // can reach status, audit, or error output. Key names and values may be
+    // JSON-quoted (serialized header dumps), so quotes around the name and
+    // separator are tolerated.
+    .replace(/\b(authorization|proxy-authorization)\b["']?\s*[:=]\s*["']?(?:bearer\s+|basic\s+)?[^\s"',;)]+/gi, "$1=[redacted]")
     .replace(/\bbearer\s+[A-Za-z0-9._~+/=-]{8,}/gi, "bearer [redacted]")
-    .replace(/\b(x-api-key|api[-_]?key|apikey|access[-_]?token|secret[-_]?key)\b\s*[:=]\s*[^\s"',;)]+/gi, "$1=[redacted]")
+    .replace(/\b(x-api-key|api[-_]?key|apikey|access[-_]?token|secret[-_]?key)\b["']?\s*[:=]\s*["']?[^\s"',;)]+/gi, "$1=[redacted]")
     .replace(/\bsk-[A-Za-z0-9_-]{8,}\b/g, "[redacted-key]")
     .replace(/\/(?:Users|Volumes|private|var|tmp|Library)\/[^\s"',)]+/g, "[local-path]")
     .replace(/[^\s"',)]+\.fmadapter\b/g, "[adapter]")
@@ -360,13 +362,17 @@ export async function callAfmJson(
     if (!helperPath) return { ok: false, error: provider.reason ?? "native helper unavailable" };
     const nativeResult = await callNativeHelper(helperPath, options.operation ?? "json", payload, options.timeoutMs ?? 45000);
     if (!nativeResult.ok) noteAfmGenerationFailure(url);
+    else noteAfmGenerationSuccess(url, options.mode ?? "bridge");
     return nativeResult;
   }
   const transport = options.transport ?? ((targetUrl: string, body: Record<string, unknown>) => defaultTransport(targetUrl, body, options.timeoutMs ?? 45000));
   const result = await transport(url, payload);
   // Honest health: a failed live call invalidates the cached generation probe
-  // so the next health read re-verifies instead of serving a stale "ok".
+  // so the next health read re-verifies instead of serving a stale "ok"; a
+  // successful live call is itself a generation proof and refreshes the cache
+  // (symmetric positive signal — recovery must not wait out a negative TTL).
   if (!result.ok) noteAfmGenerationFailure(url);
+  else noteAfmGenerationSuccess(url, options.mode ?? "bridge");
   return result;
 }
 
@@ -429,6 +435,20 @@ export function noteAfmGenerationFailure(chatUrl?: string): void {
   }
 }
 
+/**
+ * Upsert a verified probe entry after a successful live call — the call IS a
+ * generation proof. Also flips any cached negative entries for the same chat
+ * URL so a recovered bridge does not stay afm_ok=false for the rest of the TTL
+ * (symmetric counterpart of noteAfmGenerationFailure).
+ */
+export function noteAfmGenerationSuccess(chatUrl: string, mode: AfmProviderMode = "bridge"): void {
+  const entry: GenerationProbeEntry = { reachable: true, generationVerified: true, probedAt: Date.now() };
+  generationProbeCache.set(`${mode}|${chatUrl}`, entry);
+  for (const key of [...generationProbeCache.keys()]) {
+    if (key.endsWith(`|${chatUrl}`)) generationProbeCache.set(key, { ...entry });
+  }
+}
+
 function chatCompletionContent(data: unknown): string | undefined {
   if (!data || typeof data !== "object") return undefined;
   const choices = (data as { choices?: unknown }).choices;
@@ -437,6 +457,21 @@ function chatCompletionContent(data: unknown): string | undefined {
   if (!message || typeof message !== "object") return undefined;
   const content = (message as { content?: unknown }).content;
   return typeof content === "string" ? content : undefined;
+}
+
+/**
+ * Native helpers answer chat_completion probes with either a chat-shaped body
+ * or a flat {answer|content|text} field. An ok response with neither carries
+ * no proof of generation and must not flip afm_ok=true.
+ */
+function nativeCompletionContent(data: unknown): string | undefined {
+  const chat = chatCompletionContent(data);
+  if (chat) return chat;
+  for (const key of ["answer", "content", "text"]) {
+    const value = stringField(data, key);
+    if (value) return value;
+  }
+  return undefined;
 }
 
 async function runGenerationProbe(options: AfmGenerationProbeOptions, now: () => number): Promise<GenerationProbeEntry> {
@@ -459,16 +494,26 @@ async function runGenerationProbe(options: AfmGenerationProbeOptions, now: () =>
     max_tokens: 1,
     messages: [{ role: "user", content: "ok" }],
   };
-  const payload = mode === "native" ? { payload: body } : body;
+  // Only forward nativeHelperPath when the caller set it, so an unset option
+  // does not mask the MINNI_AFM_NATIVE_HELPER env fallback inside callAfmJson.
+  const helperOptions = Object.prototype.hasOwnProperty.call(options, "nativeHelperPath")
+    ? { nativeHelperPath: options.nativeHelperPath }
+    : {};
+  // Resolve the provider first so auto mode wraps the native envelope exactly
+  // like an explicit native probe (mirror of afm_provider._run_generation_probe).
+  const usesNative = resolveAfmProvider(mode, helperOptions).provider === "native";
+  const payload = usesNative ? { payload: body } : body;
   const result = await callAfmJson(chatUrl, payload, {
     mode,
     operation: "chat_completion",
     timeoutMs: options.timeoutMs ?? GENERATION_PROBE_TIMEOUT_MS,
     transport: options.transport,
-    nativeHelperPath: options.nativeHelperPath,
+    ...helperOptions,
   });
-  const content = chatCompletionContent(result.data);
-  const generationVerified = result.ok && (mode === "native" ? true : typeof content === "string");
+  const content = usesNative ? nativeCompletionContent(result.data) : chatCompletionContent(result.data);
+  // Native mode no longer auto-verifies on any ok response: both paths must
+  // produce actual completion content before afm_ok may flip true.
+  const generationVerified = result.ok && typeof content === "string";
   const reachable =
     result.ok || (typeof result.error === "string" && result.error.startsWith("HTTP ")) || options.health?.ok === true;
   return {

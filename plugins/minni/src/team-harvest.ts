@@ -1,5 +1,5 @@
 import { AFM_PREPARE_TASK_MODEL, AFM_PREPARE_TASK_URL } from "./config.js";
-import { defaultProviderChain } from "./providers.js";
+import { defaultProviderChain, type ChatRequest } from "./providers.js";
 import type { TeamAgentResultInput } from "./team.js";
 import { recordAudit, writeInbox } from "./vault.js";
 
@@ -27,6 +27,8 @@ export interface HarvestEvidenceInput {
 
 export interface HarvestDeps {
   callAfm?: (system: string, user: string) => Promise<string>;
+  /** Test seam: injected chain transport for the default AFM call path. */
+  transport?: ChatRequest["transport"];
   writeInbox?: typeof writeInbox;
   audit?: typeof recordAudit;
 }
@@ -83,7 +85,13 @@ function parseAfmResponse(raw: string): ParsedAfm {
   return { kind: "off-contract" };
 }
 
-async function defaultCallAfm(system: string, user: string, url: string, model: string): Promise<string> {
+async function defaultCallAfm(
+  system: string,
+  user: string,
+  url: string,
+  model: string,
+  transport?: ChatRequest["transport"],
+): Promise<string> {
   const body = {
     model,
     temperature: 0,
@@ -101,6 +109,7 @@ async function defaultCallAfm(system: string, user: string, url: string, model: 
     url,
     timeoutMs: 30000,
     mode: "bridge",
+    transport,
   });
   if (!result.ok) {
     const message = result.error ?? "AFM harvest failed";
@@ -130,7 +139,7 @@ export async function harvestEvidence(
   const afmUrl = input.afmUrl ?? AFM_PREPARE_TASK_URL;
   const afmModel = input.afmModel ?? AFM_PREPARE_TASK_MODEL;
   const maxPerCall = Math.max(1, input.maxLearningsPerCall ?? DEFAULT_MAX_LEARNINGS_PER_CALL);
-  const callAfm = deps.callAfm ?? ((system, user) => defaultCallAfm(system, user, afmUrl, afmModel));
+  const callAfm = deps.callAfm ?? ((system, user) => defaultCallAfm(system, user, afmUrl, afmModel, deps.transport));
   const writer = deps.writeInbox ?? writeInbox;
   const audit = deps.audit ?? recordAudit;
 

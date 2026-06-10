@@ -165,3 +165,87 @@ def test_probe_requires_completion_content():
     health = verify_afm_generation("bridge", client=hollow_client)
     assert health["ok"] is False
     assert health["generation_verified"] is False
+
+
+def test_successful_live_call_refreshes_negative_cached_probe():
+    """Symmetric positive signal: a real call succeeding IS a generation proof,
+    so recovery from a transient outage must not wait out the negative TTL."""
+    from afm_provider import afm_chat_completion, verify_afm_generation
+
+    before = verify_afm_generation("bridge", client=_dead_client)
+    assert before["ok"] is False
+
+    live = afm_chat_completion({"messages": []}, mode="bridge", client=_alive_client())
+    assert live.ok is True
+
+    def forbidden(payload, url, timeout):
+        raise AssertionError("live success refreshed the cache; no re-probe expected")
+
+    after = verify_afm_generation("bridge", client=forbidden)
+    assert after["ok"] is True
+    assert after["generation_verified"] is True
+
+
+# --- native-mode generation health (mirror of afm-health.test.mjs) -------------
+
+
+def test_native_generation_probe_verifies_on_content(tmp_path, monkeypatch):
+    from test_afm_contract_golden import _write_fake_helper
+
+    from afm_provider import verify_afm_generation
+
+    helper, _ = _write_fake_helper(tmp_path, {"ok": True, "data": {"answer": "y"}})
+    monkeypatch.setenv("MINNI_AFM_NATIVE_HELPER", os.fspath(helper))
+
+    health = verify_afm_generation("native", timeout=10.0)
+    assert health["ok"] is True
+    assert health["generation_verified"] is True
+
+
+def test_native_generation_probe_rejects_ok_without_content(tmp_path, monkeypatch):
+    from test_afm_contract_golden import _write_fake_helper
+
+    from afm_provider import verify_afm_generation
+
+    helper, _ = _write_fake_helper(tmp_path, {"ok": True, "data": {}})
+    monkeypatch.setenv("MINNI_AFM_NATIVE_HELPER", os.fspath(helper))
+
+    health = verify_afm_generation("native", timeout=10.0)
+    assert health["ok"] is False, "ok with empty output proves nothing about generation"
+    assert health["generation_verified"] is False
+
+
+def test_native_generation_probe_rejects_helper_failure(tmp_path, monkeypatch):
+    from test_afm_contract_golden import _write_fake_helper
+
+    from afm_provider import verify_afm_generation
+
+    helper, _ = _write_fake_helper(tmp_path, {"ok": False, "error": "model unavailable"})
+    monkeypatch.setenv("MINNI_AFM_NATIVE_HELPER", os.fspath(helper))
+
+    health = verify_afm_generation("native", timeout=10.0)
+    assert health["ok"] is False
+    assert health["generation_verified"] is False
+
+
+def test_native_generation_probe_missing_helper(monkeypatch):
+    from afm_provider import verify_afm_generation
+
+    monkeypatch.setenv("MINNI_AFM_NATIVE_HELPER", "/tmp/missing-native-health-helper")
+    health = verify_afm_generation("native")
+    assert health["ok"] is False
+    assert health["generation_verified"] is False
+
+
+def test_auto_mode_health_falls_back_to_bridge_probe(monkeypatch):
+    from afm_provider import verify_afm_generation
+
+    monkeypatch.setenv("MINNI_AFM_NATIVE_HELPER", "/tmp/missing-native-health-helper")
+    calls = []
+    health = verify_afm_generation("auto", client=_alive_client(calls))
+    assert health["ok"] is True
+    assert len(calls) == 1
+    # Auto resolved to bridge: the probe body is the chat payload, not the
+    # wrapped native envelope.
+    assert "payload" not in calls[0]["payload"]
+    assert calls[0]["payload"]["max_tokens"] == 1

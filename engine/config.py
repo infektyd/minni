@@ -287,6 +287,8 @@ def resolve_cloud_api_key(cloud: Optional[Dict[str, Any]], secrets_dir: Optional
             return {"error": "cloud_key_denied: apiKeyFile must live under ~/.minni/secrets/"}
         try:
             mode = os.stat(resolved).st_mode
+            if not stat_module.S_ISREG(mode):
+                return {"error": "cloud_key_denied: apiKeyFile must be a regular file"}
             if mode & (stat_module.S_IRWXG | stat_module.S_IRWXO):
                 return {"error": "cloud_key_denied: apiKeyFile must be mode 0600 (no group/other access)"}
             with open(resolved, "r", encoding="utf-8") as handle:

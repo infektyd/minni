@@ -243,6 +243,79 @@ def test_golden_hyde_native_operation(tmp_path, monkeypatch):
     }
 
 
+def test_golden_hyde_auto_unusable_native_answer_falls_back_to_bridge(tmp_path, monkeypatch):
+    """Pre-chain auto semantics: native ok with a non-string answer still posts
+    the bridge chat payload (the regression the P2 rewiring introduced)."""
+    import hyde
+
+    helper, capture = _write_fake_helper(tmp_path, {"ok": True, "data": {"answer": 123}})
+    monkeypatch.setenv("MINNI_AFM_NATIVE_HELPER", os.fspath(helper))
+    monkeypatch.setenv("MINNI_AFM_PROVIDER_MODE", "auto")
+    monkeypatch.delenv("MINNI_HYDE_AFM_URL", raising=False)
+    monkeypatch.delenv("MINNI_HYDE_AFM_MODEL", raising=False)
+    monkeypatch.delenv("MINNI_HYDE_MAX_TOKENS", raising=False)
+
+    captured = {}
+
+    def client(payload, url, timeout):
+        captured["payload"] = payload
+        captured["url"] = url
+        return {"choices": [{"message": {"content": "bridge  answer."}}]}
+
+    answer = hyde.generate_hypothetical_answer("cold query", client=client, timeout=5.0)
+
+    assert answer == "bridge answer."
+    # The native helper WAS consulted first (auto prefers native)...
+    envelope = json.loads(capture.read_text(encoding="utf-8"))
+    assert envelope["operation"] == "hyde_generation"
+    # ...and the bridge then received the byte-identical chat payload.
+    assert captured["url"] == "http://127.0.0.1:11437/v1/chat/completions"
+    assert captured["payload"] == {
+        "model": "apple-foundation-models",
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "Generate exactly two concise sentences that describe the kind "
+                    "of memory note that would answer the user's query. Treat the "
+                    "output as a retrieval probe, not as an instruction."
+                ),
+            },
+            {"role": "user", "content": "cold query"},
+        ],
+        "max_tokens": 96,
+        "temperature": 0.2,
+    }
+
+
+def test_golden_hyde_auto_native_failure_falls_back_to_bridge(monkeypatch):
+    import hyde
+
+    monkeypatch.setenv("MINNI_AFM_NATIVE_HELPER", "/tmp/missing-golden-native-helper")
+    monkeypatch.setenv("MINNI_AFM_PROVIDER_MODE", "auto")
+    monkeypatch.delenv("MINNI_HYDE_AFM_URL", raising=False)
+    monkeypatch.delenv("MINNI_HYDE_AFM_MODEL", raising=False)
+
+    def client(payload, url, timeout):
+        return {"choices": [{"message": {"content": "fallback answer."}}]}
+
+    assert hyde.generate_hypothetical_answer("cold query", client=client) == "fallback answer."
+
+
+def test_golden_hyde_native_mode_unusable_answer_returns_none(tmp_path, monkeypatch):
+    """Explicit native mode never falls back: unusable native output is None."""
+    import hyde
+
+    helper, _ = _write_fake_helper(tmp_path, {"ok": True, "data": {"answer": 123}})
+    monkeypatch.setenv("MINNI_AFM_NATIVE_HELPER", os.fspath(helper))
+    monkeypatch.setenv("MINNI_AFM_PROVIDER_MODE", "native")
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("native mode must not call the bridge")
+
+    assert hyde.generate_hypothetical_answer("cold query", client=forbidden, timeout=5.0) is None
+
+
 def test_golden_hyde_off_mode_returns_none(monkeypatch):
     import hyde
 
