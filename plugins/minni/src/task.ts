@@ -12,12 +12,14 @@ import { afmHealth, recallMemory } from "./sovereign.js";
 import type { JsonResult, RecallResponse } from "./sovereign.js";
 import { isInstructionLike } from "./safety.js";
 import { recordAudit, searchVaultNotes } from "./vault.js";
-import type { VaultSearchResult } from "./vault.js";
+import type { PrivacyLevel, VaultSearchResult } from "./vault.js";
 
 export type TaskProfile = "compact" | "standard" | "deep";
 export type SourceAuthority = "schema" | "handoff" | "decision" | "session" | "concept" | "daemon" | "vault";
 export type SourceFreshness = "fresh" | "recent" | "old" | "unknown";
-export type PrivacyLevel = "safe" | "local-only" | "private" | "blocked";
+// Single source of truth lives in vault.ts (VaultSearchResult.privacy is typed
+// against it); re-exported here for existing consumers of the task module.
+export type { PrivacyLevel } from "./vault.js";
 export type ResolvedAfmProvider = AfmProvider;
 export type AfmProviderContext = AfmProviderResolution;
 
@@ -340,6 +342,20 @@ function authorityPoints(authority: SourceAuthority): number {
  * format (engine/retrieval.py): same tag, same attributes, same escaping —
  * the non-negotiable injection floor must be identical on both paths.
  */
+/**
+ * Escape XML attribute metacharacters so untrusted strings (note paths,
+ * statuses) cannot break out of an EVIDENCE attribute value and forge
+ * attributes/tags (e.g. a filename containing `" instruction_like="false`).
+ * Mirrors _xml_attr_escape in engine/retrieval.py.
+ */
+function xmlAttrEscape(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/"/g, "&quot;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
 function evidenceEnvelopeForSource(source: {
   relativePath: string;
   snippet: string;
@@ -348,10 +364,18 @@ function evidenceEnvelopeForSource(source: {
   status?: string;
   instructionLike: boolean;
 }): string {
-  const safe = source.snippet.replace(/`/g, "\\`").replace(/\n#/g, "\n\\#");
+  // Body escaping: markdown hazards, plus tag-injection — a snippet must not
+  // be able to close its own envelope (</EVIDENCE>) or open a forged one with
+  // instruction_like="false". Mirrors _evidence_body_escape in
+  // engine/retrieval.py.
+  const safe = source.snippet
+    .replace(/`/g, "\\`")
+    .replace(/\n#/g, "\n\\#")
+    .replace(/<\//g, "<\\/")
+    .replace(/<EVIDENCE/gi, "&#60;EVIDENCE");
   return (
-    `<EVIDENCE source="${source.relativePath}" agent="vault" status="${source.status ?? "?"}" ` +
-    `privacy="${source.privacyLevel ?? "?"}" score="${source.score.toFixed(3)}" ` +
+    `<EVIDENCE source="${xmlAttrEscape(source.relativePath)}" agent="vault" status="${xmlAttrEscape(source.status ?? "?")}" ` +
+    `privacy="${xmlAttrEscape(source.privacyLevel ?? "?")}" score="${source.score.toFixed(3)}" ` +
     `instruction_like="${String(source.instructionLike)}" visibility="vault-local">${safe}</EVIDENCE>`
   );
 }
@@ -407,16 +431,6 @@ function taskSourcesFromVault(results: VaultSearchResult[], budget: BudgetPolicy
     .filter((source): source is TaskSource => Boolean(source))
     .sort((a, b) => b.score - a.score || a.relativePath.localeCompare(b.relativePath))
     .slice(0, budget.sourceLimit);
-}
-
-function sourceFromVault(result: VaultSearchResult): TaskSource {
-  return {
-    title: result.title,
-    wikilink: result.wikilink,
-    relativePath: result.relativePath,
-    snippet: result.snippet.replace(/\s+/g, " "),
-    score: result.score,
-  };
 }
 
 function deterministicPacket(input: {
@@ -611,7 +625,14 @@ function normalizeAfmResponse(data: unknown): Partial<PreparedTaskPacket> {
 
 function sourceAllowedForAfm(source: unknown): source is TaskSource {
   if (!source || typeof source !== "object") return false;
-  const privacyLevel = (source as { privacyLevel?: unknown }).privacyLevel;
+  const { privacyLevel, instructionLike } = source as {
+    privacyLevel?: unknown;
+    instructionLike?: unknown;
+  };
+  // SEC-010: instruction-like snippets are evidence-only on the packet path
+  // and never enter the AFM prompt at all (the AFM message carries snippets
+  // RAW, without the envelope, so flagged text must be excluded outright).
+  if (instructionLike === true) return false;
   return privacyLevel === undefined || privacyLevel === "safe";
 }
 

@@ -458,7 +458,10 @@ test("minni_plan_status/_update/_history accept an OPTIONAL plan_id (C5 schema p
   // The acceptance spec requires the id-less form VERBATIM on these three
   // tools; pin the schemas so a refactor cannot quietly re-require plan_id.
   const source = await readFile(new URL("../src/server.ts", import.meta.url), "utf8");
-  for (const tool of ["minni_plan_status", "minni_plan_update", "minni_plan_history"]) {
+  // minni_plan_replan is beyond the verbatim spec but pinned too (review
+  // panel): a hookless agent must be able to replan "the active plan" without
+  // round-tripping the id through minni_plan_status.
+  for (const tool of ["minni_plan_status", "minni_plan_update", "minni_plan_history", "minni_plan_replan"]) {
     const start = source.indexOf(`"${tool}"`);
     assert.ok(start >= 0, `${tool} must be registered`);
     const block = source.slice(start, source.indexOf("server.registerTool", start + 1));
@@ -472,5 +475,89 @@ test("minni_plan_status/_update/_history accept an OPTIONAL plan_id (C5 schema p
       /resolvePlanIdOrActive\(/,
       `${tool} must resolve the active plan when plan_id is omitted`,
     );
+  }
+});
+
+test("minni_plan_status returns the no-active-plan error end-to-end through the MCP server", async (t) => {
+  // Review panel: the C5 schema pin is a text scan; this drives the REAL
+  // registered handler over MCP stdio and asserts the user-visible error JSON
+  // when plan_id is omitted and no plan is active. Fixture vault only — every
+  // vault env var is pointed at a tmpdir so live ~/.minni state is untouched.
+  const { spawn } = await import("node:child_process");
+  const root = await mkdtemp(path.join(tmpdir(), "sm-plan-mcp-"));
+  const serverPath = new URL("../dist/server.js", import.meta.url).pathname;
+  const child = spawn(process.execPath, [serverPath], {
+    env: {
+      ...process.env,
+      MINNI_VAULT_PATH: root,
+      MINNI_CLAUDECODE_VAULT_PATH: root,
+      MINNI_KILOCODE_VAULT_PATH: root,
+      MINNI_GROK_VAULT_PATH: root,
+    },
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  try {
+    const responses = new Map();
+    let buffered = "";
+    const waiters = new Map();
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      buffered += chunk;
+      let nl;
+      while ((nl = buffered.indexOf("\n")) >= 0) {
+        const line = buffered.slice(0, nl).trim();
+        buffered = buffered.slice(nl + 1);
+        if (!line) continue;
+        try {
+          const msg = JSON.parse(line);
+          if (msg.id !== undefined) {
+            responses.set(msg.id, msg);
+            waiters.get(msg.id)?.(msg);
+          }
+        } catch {
+          // non-JSON noise on stdout would be a protocol bug; surface via timeout
+        }
+      }
+    });
+    const send = (msg) => child.stdin.write(`${JSON.stringify(msg)}\n`);
+    const awaitResponse = (id, ms = 15000) =>
+      responses.get(id) ??
+      new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error(`timeout waiting for response ${id}`)), ms);
+        waiters.set(id, (msg) => {
+          clearTimeout(timer);
+          resolve(msg);
+        });
+      });
+
+    send({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "initialize",
+      params: {
+        protocolVersion: "2024-11-05",
+        capabilities: {},
+        clientInfo: { name: "plan-e2e-test", version: "0.0.0" },
+      },
+    });
+    const init = await awaitResponse(1);
+    assert.ok(init.result, JSON.stringify(init));
+    send({ jsonrpc: "2.0", method: "notifications/initialized" });
+
+    send({
+      jsonrpc: "2.0",
+      id: 2,
+      method: "tools/call",
+      params: { name: "minni_plan_status", arguments: {} },
+    });
+    const reply = await awaitResponse(2);
+    assert.ok(reply.result, JSON.stringify(reply));
+    const body = JSON.parse(reply.result.content[0].text);
+    assert.ok(body.error, JSON.stringify(body));
+    assert.match(body.error, /no plan_id provided and no active plan/);
+    assert.match(body.error, /minni_plan_activate/);
+  } finally {
+    child.kill("SIGKILL");
+    await rm(root, { recursive: true, force: true });
   }
 });

@@ -2813,7 +2813,16 @@ def _explicitly_allowed_operator(principal: EffectivePrincipal) -> bool:
 
 
 def _resolve_candidate(params: dict, request_id: Any) -> dict:
-    """G15: Resolve a candidate (accept→durable learn, reject/redact etc). Operator only."""
+    """G15: Resolve a candidate (accept→durable learn, reject/redact etc).
+
+    Authorization is owner-or-explicit-operator and lives INSIDE the
+    transaction (after the candidate row is read), because ownership cannot be
+    known before the read. There is deliberately NO up-front
+    ``is_operator_principal`` gate: it would reject a restricted-capability
+    platform agent (caps without ``*``/``resolve_candidate``/``govern``)
+    resolving its OWN candidate before the owner check is ever reached, while
+    adding nothing the owner check does not already enforce.
+    """
     supplied = params.get("agent_id")
     try:
         principal = resolve_effective_principal(
@@ -2821,13 +2830,6 @@ def _resolve_candidate(params: dict, request_id: Any) -> dict:
         )
     except IdentityMismatchError as exc:
         return make_mismatch_error(exc.supplied, exc.stamped, request_id)
-
-    if not is_operator_principal(principal):
-        return _make_error(
-            -32004,
-            "operator_only: resolve_candidate requires operator principal (capabilities or trusted agent_id in principals/*.json)",
-            request_id,
-        )
 
     cid = params.get("candidate_id")
     if cid is None:
@@ -2925,7 +2927,7 @@ def _resolve_candidate(params: dict, request_id: Any) -> dict:
                 (new_status, now, principal.agent_id, reason, cid),
             )
 
-        # Prominent audit log for the governance action (always, since operator path)
+        # Prominent audit log for the governance action (owner or explicit operator)
         logger.warning(
             "RESOLVE_CANDIDATE operator=%s candidate=%s decision=%s new_status=%s reason=%s (G15 audit)",
             principal.agent_id, cid, decision, new_status, reason[:80]

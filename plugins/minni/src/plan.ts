@@ -1051,6 +1051,14 @@ export async function getActivePlan(
       typeof parsed.notePath === "string" &&
       typeof parsed.set_at === "string"
     ) {
+      // Defense-in-depth containment (review panel): the pointer is only ever
+      // written via the assertUnder-guarded writeVaultPage, but its notePath
+      // is consumed by bare readFile/persistPlan calls downstream — a
+      // tampered pointer must not be able to traverse outside the vault.
+      const rel = path.relative(path.resolve(vaultPath), path.resolve(parsed.notePath));
+      if (!rel || rel.startsWith("..") || path.isAbsolute(rel)) {
+        return undefined;
+      }
       return parsed;
     }
   } catch {

@@ -1183,16 +1183,24 @@ server.registerTool(
   {
     title: "Minni Plan Replan",
     description:
-      "Replan preserving slice history: supersede dropped non-final slices, append new proposals, persist + journal.",
+      "Replan preserving slice history: supersede dropped non-final slices, append new proposals, persist + journal. plan_id defaults to the active plan.",
     inputSchema: {
-      plan_id: z.string().min(1),
+      plan_id: z.string().min(1).optional(),
       new_slices: z.array(planSliceInputSchema).optional(),
       add_slices: z.array(planSliceInputSchema).optional(),
       drop_slice_ids: z.array(z.string()).optional(),
     },
   },
-  async ({ plan_id, new_slices, add_slices, drop_slice_ids }) => {
+  async ({ plan_id: planIdInput, new_slices, add_slices, drop_slice_ids }) => {
     const effectiveVaultPath = DEFAULT_VAULT_PATH;
+    // C5/plan-N3 follow-up (review panel): replan joins status/update/history
+    // in id-less addressing so a hookless agent can replan "the active plan"
+    // without round-tripping the id through minni_plan_status.
+    const resolved = await resolvePlanIdOrActive(effectiveVaultPath, planIdInput);
+    if ("error" in resolved) {
+      return textResult(JSON.stringify({ error: resolved.error }, null, 2));
+    }
+    const plan_id = resolved.plan_id;
     const notePath = await findPlanNote(effectiveVaultPath, plan_id);
     if (!notePath) {
       return textResult(JSON.stringify({ error: `plan not found: ${plan_id}` }, null, 2));

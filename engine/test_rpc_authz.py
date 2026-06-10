@@ -244,3 +244,100 @@ def test_resolve_candidate_already_resolved_is_terminal(monkeypatch, tmp_path):
     err = again.get("error", {})
     assert err.get("code") == -32009, again
     assert "already_resolved" in err.get("message", "")
+
+
+def test_resolve_candidate_owner_with_restricted_caps_succeeds(monkeypatch, tmp_path):
+    """Review-panel regression: a restricted-capability platform agent (caps
+    WITHOUT '*'/resolve_candidate/govern — is_operator_principal is False)
+    must still be able to resolve its OWN candidate. The old up-front
+    is_operator_principal gate rejected it with 'operator_only' before the
+    owner check was ever reached."""
+    _patch_db(monkeypatch, tmp_path)
+    monkeypatch.delenv("MINNI_RESOLVE_OPERATORS", raising=False)
+    cid = _stage_candidate_as(monkeypatch, "codex", "restricted-caps self-resolution")
+
+    _stamp_principal(monkeypatch, "codex", capabilities=["read"])
+    resp = minnid._resolve_candidate({"candidate_id": cid, "decision": "accept"}, 8)
+    assert resp.get("result", {}).get("new_status") == "accepted", resp
+    assert resp["result"]["learning_id"]
+
+    # ...and an empty capabilities list works too (owner is owner).
+    cid2 = _stage_candidate_as(monkeypatch, "codex", "empty-caps self-resolution")
+    _stamp_principal(monkeypatch, "codex", capabilities=[])
+    resp2 = minnid._resolve_candidate({"candidate_id": cid2, "decision": "reject"}, 9)
+    assert resp2.get("result", {}).get("new_status") == "rejected", resp2
+
+
+def test_resolve_candidate_restricted_caps_cross_principal_still_rejected(monkeypatch, tmp_path):
+    """Dropping the up-front operator gate must NOT widen cross-principal
+    access: a restricted-caps non-owner is still rejected (principal_mismatch
+    instead of the old operator_only)."""
+    _patch_db(monkeypatch, tmp_path)
+    monkeypatch.delenv("MINNI_RESOLVE_OPERATORS", raising=False)
+    cid = _stage_candidate_as(monkeypatch, "codex", "still protected from non-owners")
+
+    _stamp_principal(monkeypatch, "grok", capabilities=["read"])
+    resp = minnid._resolve_candidate({"candidate_id": cid, "decision": "accept"}, 10)
+    err = resp.get("error", {})
+    assert err.get("code") == -32004, resp
+    assert "principal_mismatch" in err.get("message", "")
+
+
+def test_resolve_candidate_govern_capability_allows_cross(monkeypatch, tmp_path):
+    """'govern' alone (no wildcard, no resolve_candidate) is an explicit
+    cross-principal grant — pins the govern branch of
+    _explicitly_allowed_operator."""
+    _patch_db(monkeypatch, tmp_path)
+    monkeypatch.delenv("MINNI_RESOLVE_OPERATORS", raising=False)
+    cid = _stage_candidate_as(monkeypatch, "codex", "governed candidate")
+
+    _stamp_principal(monkeypatch, "main", capabilities=["govern"])
+    resp = minnid._resolve_candidate({"candidate_id": cid, "decision": "reject"}, 11)
+    assert resp.get("result", {}).get("new_status") == "rejected", resp
+
+
+def test_resolve_candidate_operator_agent_id_allows_cross(monkeypatch, tmp_path):
+    """The explicit 'operator' principal (no wildcard cap) is an explicit
+    cross-principal grant — pins the agent_id=='operator' branch of
+    _explicitly_allowed_operator."""
+    _patch_db(monkeypatch, tmp_path)
+    monkeypatch.delenv("MINNI_RESOLVE_OPERATORS", raising=False)
+    cid = _stage_candidate_as(monkeypatch, "codex", "operator-principal candidate")
+
+    _stamp_principal(monkeypatch, "operator", capabilities=[])
+    resp = minnid._resolve_candidate({"candidate_id": cid, "decision": "accept"}, 12)
+    assert resp.get("result", {}).get("new_status") == "accepted", resp
+
+
+def test_resolve_candidate_owner_resolution_drains_inbox_exactly_once(monkeypatch, tmp_path):
+    """B1 side effect on the authz success path: a restricted-caps owner
+    resolving its own inbox-sourced candidate archives the source file, and
+    the terminal re-resolution attempt does NOT re-run the archive."""
+    from test_inbox_ingest import _make_db, _stop_doc, _write_inbox_file
+    from afm_passes.inbox_ingest import ingest
+    import config as cfg_mod
+
+    db_obj, cfg = _make_db(tmp_path)
+    inbox = tmp_path / "codex-vault" / "inbox"
+    _write_inbox_file(inbox, "authz-drain.json", _stop_doc(["a lesson the owner resolves"]))
+    res = ingest(db_obj, cfg, inboxes=[inbox], dry_run=False)
+    assert res["inserted"] == 1
+
+    monkeypatch.setattr(cfg_mod.DEFAULT_CONFIG, "db_path", cfg.db_path)
+    monkeypatch.setattr(cfg_mod.DEFAULT_CONFIG, "vault_path", str(tmp_path / "vault"))
+    with db_obj.cursor() as c:
+        c.execute("SELECT candidate_id FROM candidate_packets WHERE principal='codex'")
+        (cid,) = [r["candidate_id"] for r in c.fetchall()]
+
+    # Owner with NON-operator caps: authz passes via ownership alone.
+    _stamp_principal(monkeypatch, "codex", capabilities=["read"])
+    first = minnid._resolve_candidate({"candidate_id": cid, "decision": "accept"}, 13)
+    assert first.get("result", {}).get("new_status") == "accepted", first
+    assert not (inbox / "authz-drain.json").exists(), "file must leave the live inbox"
+    assert (inbox / ".archive" / "authz-drain.json").is_file()
+
+    # Terminal re-resolution: rejected AND no second archive artifact.
+    again = minnid._resolve_candidate({"candidate_id": cid, "decision": "reject"}, 14)
+    assert again.get("error", {}).get("code") == -32009, again
+    archived = sorted(p.name for p in (inbox / ".archive").iterdir())
+    assert archived == ["authz-drain.json"], archived

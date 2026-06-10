@@ -37,6 +37,23 @@ def test_agent_cannot_self_resolve_operator_can(tmp_path, monkeypatch):
     conn.close()
     monkeypatch.setattr(cfg_mod.DEFAULT_CONFIG, "db_path", str(fixture_db))
 
+    # Seed a candidate owned by ANOTHER principal so the cross-principal
+    # denial is exercised against a real row (authz is owner-or-explicit-
+    # operator and lives after the row read: ownership cannot be known
+    # earlier, and the old up-front operator_only gate wrongly blocked
+    # restricted-caps owners from resolving their OWN candidates — see
+    # test_rpc_authz for the owner-success matrix).
+    import time as _time
+    conn = sqlite3.connect(fixture_db)
+    conn.execute(
+        "INSERT INTO candidate_packets (principal, workspace_id, content, status, proposed_at) "
+        "VALUES ('codex', 'default', 'owned by codex', 'proposed', ?)",
+        (_time.time(),),
+    )
+    seeded_cid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    conn.commit()
+    conn.close()
+
     # Case 1: limited "local" (canonical) principal file only (stamped=local, !operator for test)
     pdir_agent = tmp_path / "p_agent"
     pdir_agent.mkdir()
@@ -47,10 +64,9 @@ def test_agent_cannot_self_resolve_operator_can(tmp_path, monkeypatch):
     try:
         p_agent = resolve_effective_principal(supplied_agent_id="local", transport="uds", principals_dir=pdir_agent)
         assert not is_operator_principal(p_agent)
-        resp = _resolve_candidate({"candidate_id": 999, "decision": "accept", "agent_id": "local"}, 1)
+        resp = _resolve_candidate({"candidate_id": seeded_cid, "decision": "accept", "agent_id": "local"}, 1)
         err = resp.get("error", {})
-        # Precise: non-operator denial is -32004 + "operator_only" (before any cid lookup)
-        assert err.get("code") == -32004 and "operator_only" in str(err.get("message", ""))
+        assert err.get("code") == -32004 and "principal_mismatch" in str(err.get("message", ""))
     finally:
         pr_mod.PRINCIPALS_DIR = old_dir
 

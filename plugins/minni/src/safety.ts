@@ -51,9 +51,3 @@ export function isInstructionLike(text: string): boolean {
   if (!text) return false;
   return PATTERNS.some((pattern) => pattern.test(text));
 }
-
-/** Count of injection patterns that match (debugging / severity ranking). */
-export function instructionLikeScore(text: string): number {
-  if (!text) return 0;
-  return PATTERNS.filter((pattern) => pattern.test(text)).length;
-}
