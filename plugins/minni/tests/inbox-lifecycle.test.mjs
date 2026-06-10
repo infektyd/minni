@@ -5,6 +5,7 @@ import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promis
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
 import {
   archiveInboxEntry,
@@ -263,6 +264,100 @@ test("expireStaleInboxHandoffs never reads dashed-name files (cheap pre-filter)"
   }
 });
 
+test("expireStaleInboxHandoffs honors a lease's own expiry BEFORE the file-age TTL (gate ordering)", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-inbox-lease-order-"));
+  try {
+    const now = Date.parse("2026-06-10T12:00:00Z");
+    const freshTs = now - 2 * DAY; // well inside the 7d TTL
+    // (1) Young file, but the lease's OWN expiry already passed (the daemon
+    // default is created_at + 24h): must drain NOW, not in 5 more days.
+    await writeInboxFixture(root, compactName(freshTs, "short-lease"), {
+      kind: "handoff",
+      slug: "short-lease",
+      lease_id: "handoff-short",
+      requires_ack: true,
+      expires_at: new Date(now - DAY).toISOString(),
+    });
+    // (2) Young already-acked leftover: archived immediately as "acked".
+    await writeInboxFixture(root, compactName(freshTs, "young-acked"), {
+      kind: "handoff",
+      slug: "young-acked",
+      lease_id: "handoff-young-acked",
+      requires_ack: true,
+      ack_status: "accepted",
+      expires_at: new Date(now + 10 * DAY).toISOString(),
+    });
+    // (3) Young requires_ack-falsy orphan: the TTL has not elapsed -> keep.
+    await writeInboxFixture(root, compactName(freshTs, "young-orphan"), {
+      kind: "handoff",
+      slug: "young-orphan",
+    });
+
+    const reaped = await expireStaleInboxHandoffs(root, 7, now);
+    const bySlug = new Map(reaped.map((e) => [e.slug, e]));
+    assert.deepEqual(
+      [...bySlug.keys()].sort(),
+      ["short-lease", "young-acked"],
+      "own-expiry and acked must drain inside the TTL window; orphans wait it out",
+    );
+    assert.equal(bySlug.get("short-lease").status, "expired");
+    assert.equal(bySlug.get("young-acked").status, "acked");
+    const live = (await readdir(path.join(root, "inbox"))).filter((n) => n.endsWith(".json"));
+    assert.deepEqual(live, [compactName(freshTs, "young-orphan")]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("archiveInboxEntry collision: both files survive under distinct names", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-inbox-collision-"));
+  try {
+    const name = "20260601T120000Z-twice.json";
+    const archiveDir = path.join(root, "inbox", ".archive");
+    await mkdir(archiveDir, { recursive: true });
+    await writeFile(path.join(archiveDir, name), JSON.stringify({ old: true }), "utf8");
+    const filePath = await writeInboxFixture(root, name, { fresh: true });
+
+    const archived = await archiveInboxEntry(filePath);
+    assert.ok(archived, "collision must not fail the archive");
+    assert.notEqual(archived, path.join(archiveDir, name), "must not overwrite");
+    assert.equal(path.basename(path.dirname(archived)), ".archive");
+    assert.ok(path.basename(archived).endsWith(`-${name}`), "original name preserved in suffix");
+    // Both survive with their own content: never a silent overwrite.
+    assert.equal(JSON.parse(await readFile(path.join(archiveDir, name), "utf8")).old, true);
+    assert.equal(JSON.parse(await readFile(archived, "utf8")).fresh, true);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("expireStaleInboxHandoffs: a failed archive surfaces nothing and retries next session", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-inbox-archivefail-"));
+  try {
+    const now = Date.parse("2026-06-10T12:00:00Z");
+    const agedName = compactName(now - 30 * DAY, "blocked-handoff");
+    await writeInboxFixture(root, agedName, { kind: "handoff", slug: "blocked-handoff" });
+    // Block archiving: .archive exists as a regular FILE, so mkdir fails.
+    const blocker = path.join(root, "inbox", ".archive");
+    await writeFile(blocker, "not a directory", "utf8");
+
+    const blockedRun = await expireStaleInboxHandoffs(root, 7, now);
+    assert.equal(blockedRun.length, 0, "failed archive must not claim surfaced");
+    const live = (await readdir(path.join(root, "inbox"))).filter((n) => n.endsWith(".json"));
+    assert.deepEqual(live, [agedName], "handoff stays live for the next session");
+
+    // Next session (blocker gone): surfaces exactly once, then never again.
+    await rm(blocker);
+    const retried = await expireStaleInboxHandoffs(root, 7, now);
+    assert.equal(retried.length, 1);
+    assert.equal(retried[0].slug, "blocked-handoff");
+    assert.equal(retried[0].status, "expired");
+    assert.equal((await expireStaleInboxHandoffs(root, 7, now)).length, 0);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("buildPendingLearningsSection: shared envelope shape with honest totals (B2 envelope gate)", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "sm-inbox-envelope-"));
   try {
@@ -365,6 +460,99 @@ test("resolveActivePlanView self-heals a stuck-draft plan whose slices are all t
       1,
       "reconciliation journals exactly once",
     );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("all four hooks build their SessionStart pending_learnings through the shared helpers (B2 hook-drift pin)", async () => {
+  // The envelope-shape test above pins buildPendingLearningsSection in
+  // isolation; this pins that each hook actually CALLS the shared helpers in
+  // its SessionStart path, so no hook can quietly revert to an inline
+  // pending.map(...) or skip the pre-reap while every test stays green.
+  const srcDir = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "src");
+  for (const hook of ["hook.ts", "codex-hook.ts", "grok-hook.ts", "kilocode-hook.ts"]) {
+    const source = await readFile(path.join(srcDir, hook), "utf8");
+    for (const call of [
+      "buildPendingLearningsSection(",
+      "expireStaleInboxHandoffs(",
+      "readInboxStatus(",
+    ]) {
+      assert.ok(source.includes(call), `${hook} must call ${call}...)`);
+    }
+    assert.ok(
+      source.includes("pending_learnings: buildPendingLearningsSection("),
+      `${hook} must assign the envelope's pending_learnings from the shared builder`,
+    );
+  }
+});
+
+test("resolveActivePlanView does NOT flip a plan with a non-terminal slice (negative reconciliation)", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-plan-negative-"));
+  try {
+    await ensureVault(root);
+    const { plan, write } = await createPlan(
+      {
+        goal: "Half-finished plan must stay injected",
+        slices: [
+          { id: "s1", title: "Slice one" },
+          { id: "s2", title: "Slice two" },
+        ],
+        vaultPath: root,
+      },
+      { vaultPath: root },
+    );
+    // One slice done, one still pending: the riskiest regression is this plan
+    // getting auto-accepted and silently dropped from injection.
+    plan.slices[0] = { ...plan.slices[0], status: "done", evidence: "tests/inbox-lifecycle.test.mjs passing" };
+    assert.equal(plan.slices[1].status, "pending");
+    await persistPlan(plan, { vaultPath: root, notePath: write.notePath });
+
+    const view = await resolveActivePlanView(root);
+    assert.ok(view, "live plan must keep being injected");
+    assert.equal(view.plan_id, plan.plan_id);
+
+    const reloaded = await rehydratePlan(write.notePath);
+    assert.equal(reloaded.status, "draft", "status must NOT be reconciled");
+    const journalRaw = await readFile(
+      path.join(path.dirname(write.notePath), `${plan.plan_id}.log.md`),
+      "utf8",
+    );
+    assert.ok(
+      !journalRaw.includes('"kind":"status_reconciled"'),
+      "no reconciliation event may be journaled for a live plan",
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("resolveActivePlanView reconciles a stuck-candidate plan too (candidate -> accepted)", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-plan-candidate-"));
+  try {
+    await ensureVault(root);
+    const { plan, write } = await createPlan(
+      {
+        goal: "Finished plan stuck on candidate",
+        slices: [{ id: "s1", title: "Slice one" }],
+        vaultPath: root,
+      },
+      { vaultPath: root },
+    );
+    plan.slices[0] = { ...plan.slices[0], status: "done", evidence: "tests/inbox-lifecycle.test.mjs passing" };
+    plan.status = "candidate";
+    await persistPlan(plan, { vaultPath: root, notePath: write.notePath });
+
+    const view = await resolveActivePlanView(root);
+    assert.equal(view, undefined, "finished plan must stop being injected");
+    const healed = await rehydratePlan(write.notePath);
+    assert.equal(healed.status, "accepted");
+    const journalRaw = await readFile(
+      path.join(path.dirname(write.notePath), `${plan.plan_id}.log.md`),
+      "utf8",
+    );
+    assert.match(journalRaw, /"kind":"status_reconciled"/);
+    assert.match(journalRaw, /"from":"candidate"/);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

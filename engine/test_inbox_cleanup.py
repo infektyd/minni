@@ -22,20 +22,29 @@ NOW = time.mktime((2026, 6, 10, 12, 0, 0, 0, 0, 0))
 
 
 def _make_fixture_db(tmp_path, rows):
-    """rows: list of (status, inbox_file, candidate_index)."""
+    """rows: list of (status, inbox_file, candidate_index, content).
+    Mirrors what inbox_ingest writes: the row carries the candidate content
+    and derived_from carries its content_sha1 fingerprint."""
     db_path = tmp_path / "fixture.db"
     conn = sqlite3.connect(db_path)
     conn.execute(
         "CREATE TABLE candidate_packets ("
-        " candidate_id INTEGER PRIMARY KEY, status TEXT, derived_from TEXT)"
+        " candidate_id INTEGER PRIMARY KEY, status TEXT, content TEXT,"
+        " derived_from TEXT)"
     )
-    for status, inbox_file, idx in rows:
+    for status, inbox_file, idx, content in rows:
         derived = json.dumps(
-            {"source": "inbox", "inbox_file": inbox_file, "candidate_index": idx}
+            {
+                "source": "inbox",
+                "inbox_file": inbox_file,
+                "candidate_index": idx,
+                "content_sha1": inbox_cleanup._content_sha1(content),
+            }
         )
         conn.execute(
-            "INSERT INTO candidate_packets (status, derived_from) VALUES (?, ?)",
-            (status, derived),
+            "INSERT INTO candidate_packets (status, content, derived_from)"
+            " VALUES (?, ?, ?)",
+            (status, content, derived),
         )
     conn.commit()
     conn.close()
@@ -120,8 +129,8 @@ def _build_fixture_vault(tmp_path):
     db_path = _make_fixture_db(
         tmp_path,
         [
-            ("accepted", "2026-05-01-resolved.json", 0),
-            ("proposed", "2026-05-02-ingested.json", 0),
+            ("accepted", "2026-05-01-resolved.json", 0, "lesson one"),
+            ("proposed", "2026-05-02-ingested.json", 0, "lesson two"),
         ],
     )
     return inbox, db_path
@@ -235,11 +244,20 @@ def test_parse_name_epoch_both_formats():
 # archived prematurely against the real backlog, so each one is pinned.
 
 def _classify(tmp_path, name, doc, rows, **kw):
+    """rows: (status, candidate_index) for fingerprint-less legacy rows, or
+    (status, candidate_index, content) for ingest-shaped rows with sha."""
     inbox = tmp_path / "x-vault" / "inbox"
     inbox.mkdir(parents=True, exist_ok=True)
     path = inbox / name
     path.write_text(json.dumps(doc), encoding="utf-8")
-    rows_by_file = {name: [{"candidate_index": i, "status": s} for s, i in rows]}
+    row_dicts = []
+    for r in rows:
+        d = {"candidate_index": r[1], "status": r[0]}
+        if len(r) > 2:
+            d["content"] = r[2]
+            d["content_sha1"] = inbox_cleanup._content_sha1(r[2])
+        row_dicts.append(d)
+    rows_by_file = {name: row_dicts}
     kw.setdefault("handoff_ttl_days", 7.0)
     kw.setdefault("now", NOW)
     return inbox_cleanup.classify_file(path, rows_by_file, **kw)
@@ -321,6 +339,130 @@ def test_classify_handoff_lease_predicates(tmp_path):
         _classify(tmp_path, "20260420T120000Z-acked.json", acked, [])
         == "acked_handoff"
     )
+
+
+def test_cross_vault_same_filename_only_matching_copy_archives(tmp_path):
+    """Rows are keyed by bare filename with no vault scoping: the same name in
+    two vaults must NOT share a fate. Only the copy whose content matches the
+    ingest-written fingerprint archives; the never-ingested copy keeps."""
+    name = "2026-05-01-shared.json"
+    a = tmp_path / "claudecode-vault" / "inbox"
+    a.mkdir(parents=True)
+    b = tmp_path / "codex-vault" / "inbox"
+    b.mkdir(parents=True)
+    (a / name).write_text(json.dumps(_stop_doc(["alpha lesson"])), encoding="utf-8")
+    (b / name).write_text(
+        json.dumps(_stop_doc(["beta lesson never ingested"])), encoding="utf-8"
+    )
+    db_path = _make_fixture_db(tmp_path, [("accepted", name, 0, "alpha lesson")])
+
+    report = inbox_cleanup.run_cleanup(
+        home=tmp_path, db_path=db_path, apply=True, now=NOW
+    )
+    cc = report["vaults"]["claudecode-vault"]["counts"]
+    assert cc["ingested_resolved"] == 1, cc
+    assert not (a / name).exists()
+    assert (a / ".archive" / name).is_file()
+
+    cz = report["vaults"]["codex-vault"]["counts"]
+    assert cz["keep"] == 1 and cz["ingested_resolved"] == 0, cz
+    assert (b / name).is_file(), "un-ingested same-named copy must stay live"
+    assert not (b / ".archive").exists()
+
+
+def test_classify_stop_shape_requires_fingerprint_match(tmp_path):
+    """A row whose fingerprint does not match the file candidate (same name,
+    different content — or a forged row) never counts as ingestion."""
+    doc = _stop_doc(["real lesson text"])
+    assert (
+        _classify(
+            tmp_path,
+            "2026-05-05-mismatch.json",
+            doc,
+            [("accepted", 0, "different content entirely")],
+        )
+        == "keep"
+    )
+    # Matching fingerprint -> archives as before.
+    assert (
+        _classify(
+            tmp_path,
+            "2026-05-05-match.json",
+            doc,
+            [("accepted", 0, "real lesson text")],
+        )
+        == "ingested_resolved"
+    )
+
+
+def test_classify_handoff_never_takes_legacy_resolved_branch(tmp_path):
+    """Forged fully-resolved rows naming a live handoff lease must not drain
+    it through the odd/legacy-shape branch; handoffs only drain via their own
+    ack/expiry/TTL predicates."""
+    live = {
+        "kind": "handoff",
+        "task": "t",
+        "lease_id": "h-live",
+        "requires_ack": True,
+        "expires_at": "2026-07-01T00:00:00Z",
+    }
+    assert (
+        _classify(
+            tmp_path,
+            "20260420T120000Z-forged.json",
+            live,
+            [("accepted", 0, "evil staged content")],
+        )
+        == "keep"
+    )
+
+
+def test_classify_legacy_branch_requires_content_correspondence(tmp_path):
+    """The legacy ingested_resolved branch only fires when each row's stored
+    content provably appears in the file (forged rows naming an arbitrary
+    file fail the substring check)."""
+    doc = {"weird": True, "payload": "legacy"}
+    assert (
+        _classify(
+            tmp_path,
+            "2026-05-05-legacy-forged.json",
+            doc,
+            [("accepted", 0, "evil forged content")],
+        )
+        == "keep"
+    )
+    assert (
+        _classify(
+            tmp_path,
+            "2026-05-05-legacy-match.json",
+            doc,
+            [("accepted", 0, "legacy")],
+        )
+        == "ingested_resolved"
+    )
+
+
+def test_dry_run_and_apply_are_mutually_exclusive(tmp_path, capsys):
+    """Operator safety: an explicitly requested dry run can never mutate —
+    `--dry-run --apply` is an argparse error, and `--dry-run` alone reports
+    without touching anything."""
+    import pytest
+
+    with pytest.raises(SystemExit) as exc:
+        inbox_cleanup.main(
+            ["--dry-run", "--apply", "--home", str(tmp_path), "--db", str(tmp_path / "x.db")]
+        )
+    assert exc.value.code == 2
+    capsys.readouterr()  # discard argparse stderr
+
+    inbox, db_path = _build_fixture_vault(tmp_path)
+    before = sorted(p.name for p in inbox.glob("*.json"))
+    rc = inbox_cleanup.main(["--dry-run", "--home", str(tmp_path), "--db", str(db_path)])
+    assert rc == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["dry_run"] is True
+    assert sorted(p.name for p in inbox.glob("*.json")) == before
+    assert not (inbox / ".archive").exists()
 
 
 def test_parse_iso_epoch():

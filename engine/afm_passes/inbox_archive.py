@@ -31,7 +31,14 @@ import os
 from pathlib import Path
 from typing import Any, List, Optional
 
-from afm_passes.inbox_ingest import discover_inboxes
+from afm_passes.inbox_ingest import (
+    CONTENT_CAP,
+    STOP_KINDS,
+    _as_str_set,
+    _content_sha1,
+    _is_stop_candidate_shape,
+    discover_inboxes,
+)
 
 logger = logging.getLogger("minnid")
 
@@ -99,21 +106,100 @@ def _derived_inbox_file(derived_from: Any) -> Optional[str]:
     return name
 
 
-def _statuses_for_inbox_file(db, inbox_file: str) -> List[str]:
-    """Statuses of every candidate derived from ``inbox_file``. The LIKE is a
-    cheap pre-filter; rows are confirmed by parsing ``derived_from``."""
+def _rows_for_inbox_file(db, inbox_file: str) -> List[dict]:
+    """Every candidate row derived from ``inbox_file`` as
+    ``{status, candidate_index, content_sha1, content}``. The LIKE is a cheap
+    pre-filter; rows are confirmed by parsing ``derived_from``."""
     like = f'%"inbox_file": "{inbox_file}"%'
     with db.cursor() as c:
         c.execute(
-            "SELECT status, derived_from FROM candidate_packets WHERE derived_from LIKE ?",
+            "SELECT status, content, derived_from FROM candidate_packets "
+            "WHERE derived_from LIKE ?",
             (like,),
         )
         rows = c.fetchall()
-    return [
-        row["status"]
-        for row in rows
-        if _derived_inbox_file(row["derived_from"]) == inbox_file
-    ]
+    out: List[dict] = []
+    for row in rows:
+        if _derived_inbox_file(row["derived_from"]) != inbox_file:
+            continue
+        try:
+            df = json.loads(row["derived_from"])
+        except Exception:
+            df = {}
+        out.append(
+            {
+                "status": row["status"],
+                "candidate_index": df.get("candidate_index"),
+                "content_sha1": df.get("content_sha1"),
+                "content": row["content"],
+            }
+        )
+    return out
+
+
+def _eligible_candidates(doc: Any) -> Optional[dict]:
+    """``{index: capped_content}`` for every candidate inbox_ingest would take
+    from ``doc``, or ``None`` when the doc is not a stop-candidate file at all
+    (kind gate). Mirrors ``inbox_ingest._scan_inbox``."""
+    if not isinstance(doc, dict):
+        return None
+    kind = doc.get("kind")
+    if kind not in STOP_KINDS and not (kind is None and _is_stop_candidate_shape(doc)):
+        return None
+    if doc.get("log_only") is True or doc.get("do_not_store") is True:
+        return {}
+    log_only = _as_str_set(doc.get("log_only"))
+    dns = _as_str_set(doc.get("do_not_store"))
+    cands = doc.get("candidates") or []
+    if not isinstance(cands, list):
+        return {}
+    out: dict = {}
+    for idx, cand in enumerate(cands):
+        if not isinstance(cand, str) or not cand.strip():
+            continue
+        if cand in log_only or cand in dns:
+            continue
+        out[idx] = cand.strip()[:CONTENT_CAP]
+    return out
+
+
+def _matching_rows_for_file(doc: Any, rows: List[dict]) -> Optional[List[dict]]:
+    """Rows that genuinely correspond to ``doc``'s candidates, or ``None``
+    when the file is not archivable through this path.
+
+    ``derived_from`` is client-controllable (any local UDS caller can stage a
+    candidate naming an arbitrary ``inbox_file``), and it records only a bare
+    filename — without this check a single forged terminal row could archive
+    ANY agent's live, never-ingested inbox file (cross-vault name match). So a
+    row only counts when it carries ingest-written provenance for THIS file's
+    content: its ``candidate_index`` addresses a real eligible candidate and
+    its ``content_sha1`` (or, for legacy rows without one, the row's stored
+    content) matches that candidate's text. The file is archivable only when
+    every eligible candidate is covered by a matching row — i.e. the DB
+    provably carries all of the file's content. Non-stop-candidate files
+    (handoffs, *_precompact_handoff, ...) are never archived here; they drain
+    through their own TTL/ack channels."""
+    eligible = _eligible_candidates(doc)
+    if not eligible:
+        return None  # not a stop-candidate file, or nothing ingestible in it
+    matched: List[dict] = []
+    covered: set = set()
+    for row in rows:
+        idx = row.get("candidate_index")
+        if not isinstance(idx, int) or idx not in eligible:
+            continue
+        content = eligible[idx]
+        sha = row.get("content_sha1")
+        if isinstance(sha, str) and sha:
+            if sha != _content_sha1(content):
+                continue
+        elif row.get("content") != content:
+            continue
+        matched.append(row)
+        covered.add(idx)
+    if covered != set(eligible):
+        return None  # some eligible candidate has no genuine DB row -> keep
+    return matched
 
 
 def maybe_archive_for_candidate(db, config, candidate_id: int) -> Optional[str]:
@@ -133,11 +219,15 @@ def maybe_archive_for_candidate(db, config, candidate_id: int) -> Optional[str]:
     inbox_file = _derived_inbox_file(row["derived_from"])
     if not inbox_file:
         return None
-    statuses = _statuses_for_inbox_file(db, inbox_file)
-    if not statuses or any(s not in TERMINAL_STATUSES for s in statuses):
+    rows = _rows_for_inbox_file(db, inbox_file)
+    if not rows:
         return None
     # derived_from records only the filename; find it across the known inboxes
-    # (mirrors inbox_ingest's name-keyed idempotency semantics).
+    # (mirrors inbox_ingest's name-keyed idempotency semantics) — but archive a
+    # file ONLY when the rows provably correspond to ITS content and every
+    # matching row is terminal. A same-named file in another vault (or a
+    # never-ingested file targeted by a forged derived_from) fails the
+    # correspondence check and stays live.
     for inbox in discover_inboxes(config):
         source = inbox / inbox_file
         try:
@@ -147,12 +237,22 @@ def maybe_archive_for_candidate(db, config, candidate_id: int) -> Optional[str]:
                 continue
         except OSError:
             continue
-        if source.is_file():
-            archived = archive_inbox_file(source)
-            if archived:
-                logger.info(
-                    "inbox archive: %s -> %s (all derived candidates terminal)",
-                    source, archived,
-                )
-                return archived
+        if not source.is_file():
+            continue
+        try:
+            doc = json.loads(source.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        matched = _matching_rows_for_file(doc, rows)
+        if matched is None:
+            continue
+        if any(r["status"] not in TERMINAL_STATUSES for r in matched):
+            return None  # a sibling candidate from this file is still live
+        archived = archive_inbox_file(source)
+        if archived:
+            logger.info(
+                "inbox archive: %s -> %s (all derived candidates terminal)",
+                source, archived,
+            )
+            return archived
     return None

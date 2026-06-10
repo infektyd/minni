@@ -8,8 +8,10 @@ deletes) files that no longer need to live in the hot inbox:
   * ``ingested_resolved`` — every candidate derived from the file is in a
     terminal state (accepted/rejected/redacted/expired/merged/superseded).
   * ``ingested``          — every eligible candidate string in the file has a
-    DB row (any status). The DB rows carry the content from here on; the
-    consolidation loop drains rows, not files.
+    MATCHING DB row (any status; matched by ingest-written content_sha1 or
+    stored content, so a same-named file in another vault never inherits the
+    rows). The DB rows carry the content from here on; the consolidation loop
+    drains rows, not files.
   * ``expired_handoff``   — ``kind: handoff`` files past their drain point:
     pending ack-channel leases (``requires_ack`` truthy) ONLY once their own
     ``expires_at`` has passed (a live lease is the daemon's to drain, never
@@ -138,15 +140,18 @@ def _file_age_seconds(path: Path, now: float) -> Optional[float]:
 
 
 def load_inbox_rows(db_path: Path) -> Dict[str, List[Dict[str, Any]]]:
-    """Map inbox filename -> [{candidate_index, status}, ...] from
-    candidate_packets.derived_from. DB is opened read-only."""
+    """Map inbox filename -> [{candidate_index, status, content_sha1,
+    content}, ...] from candidate_packets.derived_from. DB is opened
+    read-only. NOTE: derived_from records only a bare filename, so the same
+    name in two vaults shares one row list — classify_file resolves the
+    ambiguity per file via content correspondence."""
     rows_by_file: Dict[str, List[Dict[str, Any]]] = {}
     uri = f"file:{db_path}?mode=ro"
     conn = sqlite3.connect(uri, uri=True)
     conn.row_factory = sqlite3.Row
     try:
         rows = conn.execute(
-            "SELECT status, derived_from FROM candidate_packets "
+            "SELECT status, content, derived_from FROM candidate_packets "
             "WHERE derived_from LIKE '%\"source\": \"inbox\"%'"
         ).fetchall()
     finally:
@@ -163,7 +168,12 @@ def load_inbox_rows(db_path: Path) -> Dict[str, List[Dict[str, Any]]]:
         if not isinstance(name, str) or not name:
             continue
         rows_by_file.setdefault(name, []).append(
-            {"candidate_index": idx, "status": row["status"]}
+            {
+                "candidate_index": idx,
+                "status": row["status"],
+                "content_sha1": obj.get("content_sha1"),
+                "content": row["content"],
+            }
         )
     return rows_by_file
 
@@ -172,9 +182,19 @@ def _as_str_set(value: Any) -> set:
     return {x for x in value if isinstance(x, str)} if isinstance(value, list) else set()
 
 
-def eligible_candidate_indices(doc: Dict[str, Any]) -> Optional[List[int]]:
-    """Indices inbox_ingest would ingest from this doc, or None when the file
-    is not a stop-candidate file at all (kind gate). Mirrors _scan_inbox."""
+CONTENT_CAP = 200000  # mirrors afm_passes.inbox_ingest.CONTENT_CAP
+
+
+def _content_sha1(text: str) -> str:
+    import hashlib
+
+    return hashlib.sha1(text.encode("utf-8")).hexdigest()
+
+
+def eligible_candidates(doc: Dict[str, Any]) -> Optional[Dict[int, str]]:
+    """``{index: capped content}`` inbox_ingest would ingest from this doc, or
+    None when the file is not a stop-candidate file at all (kind gate).
+    Mirrors _scan_inbox."""
     kind = doc.get("kind")
     is_stop_shape = (
         isinstance(doc.get("candidates"), list)
@@ -184,20 +204,45 @@ def eligible_candidate_indices(doc: Dict[str, Any]) -> Optional[List[int]]:
     if kind not in STOP_KINDS and not (kind is None and is_stop_shape):
         return None
     if doc.get("log_only") is True or doc.get("do_not_store") is True:
-        return []
+        return {}
     log_only = _as_str_set(doc.get("log_only"))
     dns = _as_str_set(doc.get("do_not_store"))
     cands = doc.get("candidates") or []
     if not isinstance(cands, list):
-        return []
-    out: List[int] = []
+        return {}
+    out: Dict[int, str] = {}
     for idx, cand in enumerate(cands):
         if not isinstance(cand, str) or not cand.strip():
             continue
         if cand in log_only or cand in dns:
             continue
-        out.append(idx)
+        out[idx] = cand.strip()[:CONTENT_CAP]
     return out
+
+
+def _row_matches_candidate(row: Dict[str, Any], content: str) -> bool:
+    """True when a DB row provably corresponds to a file candidate: its
+    ingest-written content_sha1 matches, or (legacy rows without a sha) its
+    stored content matches. Rows carrying neither fingerprint are tolerated by
+    index alone (pre-fingerprint legacy rows)."""
+    sha = row.get("content_sha1")
+    if isinstance(sha, str) and sha:
+        return sha == _content_sha1(content)
+    stored = row.get("content")
+    if isinstance(stored, str):
+        return stored == content
+    return True  # legacy row without any fingerprint: index-only match
+
+
+def _legacy_row_corresponds(row: Dict[str, Any], raw_text: str) -> bool:
+    """Correspondence check for the odd/legacy-shape branch (no candidate
+    indices to address): the row's stored content must literally appear in the
+    file text. Rows without stored content (fingerprint-less legacy) are
+    tolerated."""
+    stored = row.get("content")
+    if isinstance(stored, str) and stored.strip():
+        return stored in raw_text
+    return True
 
 
 def classify_file(
@@ -209,22 +254,31 @@ def classify_file(
 ) -> str:
     """Return an archive reason for `path` (one of ARCHIVE_REASONS), or 'keep'."""
     try:
-        doc = json.loads(path.read_text(encoding="utf-8"))
+        raw_text = path.read_text(encoding="utf-8")
+        doc = json.loads(raw_text)
     except Exception:
         return "keep"
     if not isinstance(doc, dict):
         return "keep"
 
     rows = rows_by_file.get(path.name, [])
-    eligible = eligible_candidate_indices(doc)
+    eligible = eligible_candidates(doc)
     if eligible is not None:
         # Stop-candidate file: archive only when every eligible candidate has a
-        # DB row (the rows carry the content from here on).
-        ingested_indices = {
-            r["candidate_index"] for r in rows if isinstance(r["candidate_index"], int)
-        }
-        if eligible and set(eligible) <= ingested_indices:
-            if all(r["status"] in TERMINAL_STATUSES for r in rows):
+        # MATCHING DB row (the rows carry the content from here on). Rows are
+        # keyed by bare filename across all vaults, so a same-named file in
+        # another vault (different content) must NOT inherit this file's rows —
+        # _row_matches_candidate pins each row to the candidate text it was
+        # ingested from.
+        matched = [
+            r
+            for r in rows
+            if isinstance(r["candidate_index"], int)
+            and r["candidate_index"] in eligible
+            and _row_matches_candidate(r, eligible[r["candidate_index"]])
+        ]
+        if eligible and set(eligible) <= {r["candidate_index"] for r in matched}:
+            if all(r["status"] in TERMINAL_STATUSES for r in matched):
                 return "ingested_resolved"
             return "ingested"
         if not eligible and not rows:
@@ -236,11 +290,16 @@ def classify_file(
                 return "nothing_ingestible"
         return "keep"  # not (fully) ingested yet — or fresh residue
 
-    if rows and all(r["status"] in TERMINAL_STATUSES for r in rows):
-        # Odd/legacy shape that nonetheless has fully-resolved derived rows.
+    kind = doc.get("kind")
+    if kind != "handoff" and rows and all(
+        r["status"] in TERMINAL_STATUSES for r in rows
+    ) and all(_legacy_row_corresponds(r, raw_text) for r in rows):
+        # Odd/legacy shape that nonetheless has fully-resolved derived rows
+        # whose content provably came from this file. kind:handoff never takes
+        # this branch (forged rows must not drain a live lease early); handoffs
+        # drain through their own TTL/ack predicates below.
         return "ingested_resolved"
 
-    kind = doc.get("kind")
     if kind == "handoff":
         if doc.get("ack_status"):
             # Lease already acknowledged — terminal leftover, never 'expired'.
@@ -342,13 +401,17 @@ def main(argv: Optional[List[str]] = None) -> int:
         help="Archive never-ingestible residue (nothing_ingestible / "
         "unrecognized_kind) older than this many days",
     )
-    parser.add_argument(
-        "--dry-run", action="store_true", default=True,
-        help="Report only (default; use --apply to archive)",
+    # Dry-run is implied by the absence of --apply; the flags are mutually
+    # exclusive so an explicitly requested dry run can never mutate
+    # (`--dry-run --apply` is an argparse error, not a silent apply).
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--dry-run", action="store_true",
+        help="Report only (the default; mutually exclusive with --apply)",
     )
-    parser.add_argument(
+    mode.add_argument(
         "--apply", action="store_true",
-        help="Actually move files into inbox/.archive/ (overrides --dry-run)",
+        help="Actually move files into inbox/.archive/",
     )
     args = parser.parse_args(argv)
 

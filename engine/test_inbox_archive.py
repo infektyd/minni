@@ -209,6 +209,121 @@ def test_traversal_inbox_file_is_rejected(tmp_path, monkeypatch):
     assert archive_inbox_file(weird) is None
 
 
+def test_forged_derived_from_cannot_archive_uningested_file(tmp_path, monkeypatch):
+    """Security (review issue): derived_from is client-controllable, records
+    only a bare filename, and resolve is permissive — a single forged terminal
+    row must NOT archive another agent's live, never-ingested inbox file. The
+    archive path requires ingest-written content correspondence: every
+    eligible candidate in the file needs a row whose fingerprint matches."""
+    from afm_passes.inbox_archive import maybe_archive_for_candidate
+
+    db_obj, cfg = _make_db(tmp_path)
+    monkeypatch.setattr(cfg, "CANONICAL_SOVEREIGN_HOME", str(tmp_path), raising=False)
+    # Victim: a real, never-ingested stop-candidate file in ANOTHER vault.
+    victim_inbox = tmp_path / "grok-vault" / "inbox"
+    _write_inbox_file(
+        victim_inbox, "victim.json", _stop_doc(["precious un-ingested lesson"])
+    )
+    # Attacker: stage a candidate claiming the victim file by name, already
+    # terminal (status flipped via the permissive resolve path).
+    with db_obj.cursor() as c:
+        c.execute(
+            """
+            INSERT INTO candidate_packets
+            (principal, workspace_id, content, evidence_refs, derived_from,
+             instruction_like, status, proposed_at)
+            VALUES ('codex', 'default', 'attacker content', '[]', ?, 0, 'accepted', 1.0)
+            """,
+            (json.dumps({"source": "inbox", "inbox_file": "victim.json",
+                         "candidate_index": 0}),),
+        )
+        cid = c.lastrowid
+    assert maybe_archive_for_candidate(db_obj, cfg, cid) is None
+    assert (victim_inbox / "victim.json").is_file(), "victim must stay live"
+    assert not (victim_inbox / ".archive").exists()
+
+    # Even a forged sha for index 0 cannot cover a multi-candidate file: every
+    # eligible candidate must have a matching row.
+    from afm_passes.inbox_ingest import _content_sha1
+
+    _write_inbox_file(
+        victim_inbox, "victim2.json", _stop_doc(["lesson alpha", "lesson beta"])
+    )
+    with db_obj.cursor() as c:
+        c.execute(
+            """
+            INSERT INTO candidate_packets
+            (principal, workspace_id, content, evidence_refs, derived_from,
+             instruction_like, status, proposed_at)
+            VALUES ('codex', 'default', 'lesson alpha', '[]', ?, 0, 'accepted', 1.0)
+            """,
+            (json.dumps({"source": "inbox", "inbox_file": "victim2.json",
+                         "candidate_index": 0,
+                         "content_sha1": _content_sha1("lesson alpha")}),),
+        )
+        cid2 = c.lastrowid
+    assert maybe_archive_for_candidate(db_obj, cfg, cid2) is None
+    assert (victim_inbox / "victim2.json").is_file()
+
+
+def test_forged_rows_cannot_archive_handoff_file(tmp_path, monkeypatch):
+    """Non-stop-candidate files (kind: handoff & friends) are NEVER archived
+    through the resolution path — they drain via their own TTL/ack channels —
+    so forged rows naming a pending handoff are a no-op."""
+    from afm_passes.inbox_archive import maybe_archive_for_candidate
+
+    db_obj, cfg = _make_db(tmp_path)
+    monkeypatch.setattr(cfg, "CANONICAL_SOVEREIGN_HOME", str(tmp_path), raising=False)
+    inbox = tmp_path / "grok-vault" / "inbox"
+    _write_inbox_file(
+        inbox,
+        "20260609T120000Z-pending.json",
+        {"kind": "handoff", "task": "pending work", "requires_ack": True},
+    )
+    with db_obj.cursor() as c:
+        c.execute(
+            """
+            INSERT INTO candidate_packets
+            (principal, workspace_id, content, evidence_refs, derived_from,
+             instruction_like, status, proposed_at)
+            VALUES ('codex', 'default', 'evil', '[]', ?, 0, 'accepted', 1.0)
+            """,
+            (json.dumps({"source": "inbox",
+                         "inbox_file": "20260609T120000Z-pending.json",
+                         "candidate_index": 0}),),
+        )
+        cid = c.lastrowid
+    assert maybe_archive_for_candidate(db_obj, cfg, cid) is None
+    assert (inbox / "20260609T120000Z-pending.json").is_file()
+
+
+def test_cross_vault_same_filename_archives_only_matching_copy(tmp_path, monkeypatch):
+    """derived_from records only a filename: when the same name exists in two
+    vaults, only the copy whose content matches the ingested rows archives."""
+    from afm_passes.inbox_archive import maybe_archive_for_candidate
+    from afm_passes.inbox_ingest import ingest
+
+    db_obj, cfg = _make_db(tmp_path)
+    monkeypatch.setattr(cfg, "CANONICAL_SOVEREIGN_HOME", str(tmp_path), raising=False)
+    inbox_a = tmp_path / "codex-vault" / "inbox"
+    inbox_b = tmp_path / "grok-vault" / "inbox"
+    _write_inbox_file(inbox_a, "same.json", _stop_doc(["codex lesson"]))
+    _write_inbox_file(
+        inbox_b, "same.json",
+        _stop_doc(["grok lesson, never ingested"], agent_id="grok"),
+    )
+    # Only vault A's copy is ingested.
+    assert ingest(db_obj, cfg, inboxes=[inbox_a], dry_run=False)["inserted"] == 1
+    (cid,) = _candidate_ids(db_obj)
+    _set_status(db_obj, "accepted")
+
+    archived = maybe_archive_for_candidate(db_obj, cfg, cid)
+    assert archived == str(inbox_a / ".archive" / "same.json")
+    assert not (inbox_a / "same.json").exists()
+    assert (inbox_b / "same.json").is_file(), "other vault's copy must stay live"
+    assert not (inbox_b / ".archive").exists()
+
+
 def _patched_writeback(monkeypatch, db_obj, cfg):
     import types
 

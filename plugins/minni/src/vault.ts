@@ -1112,13 +1112,18 @@ const COMPACT_HANDOFF_NAME = /^\d{8}T\d{6}Z-/;
  * lease ack channel (minnid's listing skips them), so without a TTL they pin
  * the inbox forever. Semantics ported from the agent_ping lease model
  * (agent_ping.ts withExpiry / checkAndReapLease): expiry is evaluated at read
- * time, honoring each lease's OWN expiry first:
+ * time, honoring each lease's OWN expiry first — classification happens
+ * BEFORE the TTL so a short lease drains as soon as its own expiry passes
+ * (the daemon default is created_at + 24h, far inside the 7d TTL), matching
+ * scripts/inbox_cleanup.py classify_file:
  *   - `ack_status` set: lease already acknowledged — archive the leftover
- *     packet, surfaced as "acked" (never mislabeled "expired").
- *   - `requires_ack` truthy: a live ack-channel lease the daemon owns; only
- *     reaped once its own `expires_at` has passed (missing/unparseable
- *     `expires_at` => never reaped here; the ack channel drains it).
- *   - otherwise (the orphan shape): the TTL applies.
+ *     packet regardless of file age, surfaced as "acked" (never mislabeled
+ *     "expired").
+ *   - `requires_ack` truthy: a live ack-channel lease the daemon owns; reaped
+ *     as soon as its own `expires_at` has passed, regardless of file age
+ *     (missing/unparseable `expires_at` => never reaped here; the ack channel
+ *     drains it).
+ *   - otherwise (the orphan shape): the file-age TTL applies.
  * An entry is surfaced AT MOST once — only when this call's archive rename
  * succeeded — with an explicit status, never silently dropped. A failed or
  * raced archive surfaces nothing (the winner reports; a failure retries next
@@ -1149,7 +1154,6 @@ export async function expireStaleInboxHandoffs(
         continue;
       }
     }
-    if (ts >= cutoff) continue;
     let payload: Record<string, unknown>;
     try {
       payload = JSON.parse(await readFile(filePath, "utf8")) as Record<string, unknown>;
@@ -1159,14 +1163,15 @@ export async function expireStaleInboxHandoffs(
     if (payload.kind !== "handoff") continue;
     let status: "expired" | "acked";
     if (typeof payload.ack_status === "string" && payload.ack_status) {
-      status = "acked"; // terminal leftover; archive, do not call it expired
+      status = "acked"; // terminal leftover; archive regardless of age
     } else if (payload.requires_ack) {
       const leaseExpiry =
         typeof payload.expires_at === "string" ? Date.parse(payload.expires_at) : NaN;
       if (!Number.isFinite(leaseExpiry) || leaseExpiry > now) continue; // live lease: daemon owns it
-      status = "expired";
+      status = "expired"; // own expiry passed: drain now, never wait for the TTL
     } else {
-      status = "expired"; // requires_ack-falsy orphan; TTL already elapsed
+      if (ts >= cutoff) continue; // orphan shape: the file-age TTL applies
+      status = "expired";
     }
     const archivedPath = await archiveInboxEntry(filePath);
     if (!archivedPath) continue; // raced (winner reports) or failed (retry next session)
