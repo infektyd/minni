@@ -502,10 +502,19 @@ test("minni_plan_status/_update/_history accept an OPTIONAL plan_id (C5 schema p
     );
     assert.match(
       block,
-      /resolvePlanIdOrActive\(/,
+      /resolvePlanTarget\(/,
       `${tool} must resolve the active plan when plan_id is omitted`,
     );
   }
+  // ...and the shared helper itself must defer to resolvePlanIdOrActive so
+  // the five handlers keep the active-plan default through one code path.
+  const helperStart = source.indexOf("async function resolvePlanTarget(");
+  assert.ok(helperStart >= 0, "shared resolvePlanTarget helper must exist");
+  assert.match(
+    source.slice(helperStart, helperStart + 1200),
+    /resolvePlanIdOrActive\(/,
+    "resolvePlanTarget must default to the active plan via resolvePlanIdOrActive",
+  );
 });
 
 test("every id-less plan tool returns the no-active-plan error end-to-end through the MCP server", async (t) => {

@@ -337,12 +337,6 @@ function authorityPoints(authority: SourceAuthority): number {
 }
 
 /**
- * SEC-010 (audit C3 / docs-F1): fence a vault snippet in an evidence-only
- * envelope before it may enter model-facing context. Mirrors the daemon's G22
- * format (engine/retrieval.py): same tag, same attributes, same escaping —
- * the non-negotiable injection floor must be identical on both paths.
- */
-/**
  * Escape XML attribute metacharacters so untrusted strings (note paths,
  * statuses) cannot break out of an EVIDENCE attribute value and forge
  * attributes/tags (e.g. a filename containing `" instruction_like="false`).
@@ -356,6 +350,12 @@ function xmlAttrEscape(value: string): string {
     .replace(/>/g, "&gt;");
 }
 
+/**
+ * SEC-010 (audit C3 / docs-F1): fence a vault snippet in an evidence-only
+ * envelope before it may enter model-facing context. Mirrors the daemon's G22
+ * format (engine/retrieval.py): same tag, same attributes, same escaping —
+ * the non-negotiable injection floor must be identical on both paths.
+ */
 function evidenceEnvelopeForSource(source: {
   relativePath: string;
   snippet: string;
@@ -395,7 +395,6 @@ function enhancedSourceFromVault(result: VaultSearchResult, budget: BudgetPolicy
   if (authority === "handoff") reasons.push(freshness.freshness === "fresh" ? "fresh handoff" : "handoff");
   if (authority === "decision") reasons.push("prior decision");
   if (freshness.reason && freshness.freshness !== "old") reasons.push(freshness.reason);
-  if (privacy.reason && privacy.privacyLevel !== "safe") reasons.push(privacy.reason);
   const total = result.score + authorityScore + freshness.points + privacy.points;
   const snippet = result.snippet.replace(/\s+/g, " ").slice(0, budget.snippetLength);
   const instructionLike = isInstructionLike(snippet);

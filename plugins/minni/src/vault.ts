@@ -263,17 +263,22 @@ function frontmatterBlock(markdown: string): string {
  * sharing decisions (the string heuristic in task.ts is defense-in-depth
  * only). Returns undefined when the note declares no privacy; a declared but
  * unrecognized value fails closed to "private" rather than silently "safe".
+ * DUPLICATE `privacy:` keys fail closed too: a permissive duplicate must not
+ * shadow a restrictive one (parser-differential bypass), so the MOST
+ * restrictive declared value wins.
  */
 function privacyFromMarkdown(markdown: string): PrivacyLevel | undefined {
-  const raw = frontmatterBlock(markdown)
-    .match(/^privacy:\s*(.+)$/m)?.[1]
-    ?.trim()
-    .replace(/^["']|["']$/g, "")
-    .toLowerCase();
-  if (!raw) return undefined;
-  return (PRIVACY_LEVELS as string[]).includes(raw)
-    ? (raw as PrivacyLevel)
-    : "private";
+  const declared = [...frontmatterBlock(markdown).matchAll(/^privacy:\s*(.+)$/gm)].map((m) =>
+    m[1].trim().replace(/^["']|["']$/g, "").toLowerCase(),
+  );
+  if (declared.length === 0) return undefined;
+  const levels = declared.map((raw) =>
+    (PRIVACY_LEVELS as string[]).includes(raw) ? (raw as PrivacyLevel) : "private",
+  );
+  // PRIVACY_LEVELS is ordered least → most restrictive; take the worst.
+  return levels.reduce((worst, level) =>
+    PRIVACY_LEVELS.indexOf(level) > PRIVACY_LEVELS.indexOf(worst) ? level : worst,
+  );
 }
 
 function statusFromMarkdown(markdown: string): PageStatus | undefined {

@@ -1038,6 +1038,30 @@ server.registerTool(
   },
 );
 
+// C5/plan-N3: id-less addressing — resolve plan_id (defaulting to the active
+// plan) and locate its vault note. Shared by the five plan tool handlers that
+// accept an optional plan_id.
+async function resolvePlanTarget(
+  planIdInput: string | undefined,
+): Promise<
+  | { ok: true; plan_id: string; notePath: string }
+  | { ok: false; result: ReturnType<typeof textResult> }
+> {
+  const resolved = await resolvePlanIdOrActive(DEFAULT_VAULT_PATH, planIdInput);
+  if ("error" in resolved) {
+    return { ok: false, result: textResult(JSON.stringify({ error: resolved.error }, null, 2)) };
+  }
+  const plan_id = resolved.plan_id;
+  const notePath = await findPlanNote(DEFAULT_VAULT_PATH, plan_id);
+  if (!notePath) {
+    return {
+      ok: false,
+      result: textResult(JSON.stringify({ error: `plan not found: ${plan_id}` }, null, 2)),
+    };
+  }
+  return { ok: true, plan_id, notePath };
+}
+
 server.registerTool(
   "minni_plan_update",
   {
@@ -1053,16 +1077,9 @@ server.registerTool(
   },
   async ({ plan_id: planIdInput, slice_id, status, evidence }) => {
     const effectiveVaultPath = DEFAULT_VAULT_PATH;
-    // C5/plan-N3: id-less addressing — default to the active plan.
-    const resolved = await resolvePlanIdOrActive(effectiveVaultPath, planIdInput);
-    if ("error" in resolved) {
-      return textResult(JSON.stringify({ error: resolved.error }, null, 2));
-    }
-    const plan_id = resolved.plan_id;
-    const notePath = await findPlanNote(effectiveVaultPath, plan_id);
-    if (!notePath) {
-      return textResult(JSON.stringify({ error: `plan not found: ${plan_id}` }, null, 2));
-    }
+    const target = await resolvePlanTarget(planIdInput);
+    if (!target.ok) return target.result;
+    const { plan_id, notePath } = target;
     const plan = await rehydratePlan(notePath);
     const targetSlice = plan.slices.find((s) => s.id === slice_id);
     const from = targetSlice?.status ?? ("pending" as const);
@@ -1125,18 +1142,9 @@ server.registerTool(
   },
   async ({ plan_id: planIdInput, kind, signal, resolution }) => {
     const effectiveVaultPath = DEFAULT_VAULT_PATH;
-    // C5/plan-N3 follow-up (review panel): scar joins its peers in id-less
-    // addressing — recording a dead-end against "the active plan" must not
-    // require a minni_plan_status round-trip to fetch the id.
-    const resolved = await resolvePlanIdOrActive(effectiveVaultPath, planIdInput);
-    if ("error" in resolved) {
-      return textResult(JSON.stringify({ error: resolved.error }, null, 2));
-    }
-    const plan_id = resolved.plan_id;
-    const notePath = await findPlanNote(effectiveVaultPath, plan_id);
-    if (!notePath) {
-      return textResult(JSON.stringify({ error: `plan not found: ${plan_id}` }, null, 2));
-    }
+    const target = await resolvePlanTarget(planIdInput);
+    if (!target.ok) return target.result;
+    const { plan_id, notePath } = target;
     const plan = await rehydratePlan(notePath);
     const next = addScar(plan, { kind, signal, resolution });
     await persistPlan(next, { vaultPath: effectiveVaultPath, notePath });
@@ -1163,16 +1171,9 @@ server.registerTool(
   },
   async ({ plan_id: planIdInput, live_shelf_content }) => {
     const effectiveVaultPath = DEFAULT_VAULT_PATH;
-    // C5/plan-N3: id-less addressing — default to the active plan.
-    const resolved = await resolvePlanIdOrActive(effectiveVaultPath, planIdInput);
-    if ("error" in resolved) {
-      return textResult(JSON.stringify({ error: resolved.error }, null, 2));
-    }
-    const plan_id = resolved.plan_id;
-    const notePath = await findPlanNote(effectiveVaultPath, plan_id);
-    if (!notePath) {
-      return textResult(JSON.stringify({ error: `plan not found: ${plan_id}` }, null, 2));
-    }
+    const target = await resolvePlanTarget(planIdInput);
+    if (!target.ok) return target.result;
+    const { plan_id, notePath } = target;
     const plan = await rehydratePlan(notePath);
     const view = compactPlanView(plan);
     const drift = live_shelf_content
@@ -1201,18 +1202,9 @@ server.registerTool(
   },
   async ({ plan_id: planIdInput, new_slices, add_slices, drop_slice_ids }) => {
     const effectiveVaultPath = DEFAULT_VAULT_PATH;
-    // C5/plan-N3 follow-up (review panel): replan joins status/update/history
-    // in id-less addressing so a hookless agent can replan "the active plan"
-    // without round-tripping the id through minni_plan_status.
-    const resolved = await resolvePlanIdOrActive(effectiveVaultPath, planIdInput);
-    if ("error" in resolved) {
-      return textResult(JSON.stringify({ error: resolved.error }, null, 2));
-    }
-    const plan_id = resolved.plan_id;
-    const notePath = await findPlanNote(effectiveVaultPath, plan_id);
-    if (!notePath) {
-      return textResult(JSON.stringify({ error: `plan not found: ${plan_id}` }, null, 2));
-    }
+    const target = await resolvePlanTarget(planIdInput);
+    if (!target.ok) return target.result;
+    const { plan_id, notePath } = target;
     const plan = await rehydratePlan(notePath);
     let next: PlanArtifact;
     if (add_slices || drop_slice_ids) {
@@ -1243,17 +1235,9 @@ server.registerTool(
     },
   },
   async ({ plan_id: planIdInput }) => {
-    const effectiveVaultPath = DEFAULT_VAULT_PATH;
-    // C5/plan-N3: id-less addressing — default to the active plan.
-    const resolved = await resolvePlanIdOrActive(effectiveVaultPath, planIdInput);
-    if ("error" in resolved) {
-      return textResult(JSON.stringify({ error: resolved.error }, null, 2));
-    }
-    const plan_id = resolved.plan_id;
-    const notePath = await findPlanNote(effectiveVaultPath, plan_id);
-    if (!notePath) {
-      return textResult(JSON.stringify({ error: `plan not found: ${plan_id}` }, null, 2));
-    }
+    const target = await resolvePlanTarget(planIdInput);
+    if (!target.ok) return target.result;
+    const { plan_id, notePath } = target;
     const history = await readHistory(notePath);
     const result = history.map((h) => ({
       rev: h.rev,

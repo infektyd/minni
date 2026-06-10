@@ -336,3 +336,43 @@ test("searchVaultNotes carries an authored privacy:local-only through unchanged"
     await rm(root, { recursive: true, force: true });
   }
 });
+
+// ── SEC-006: duplicate frontmatter keys cannot relax the privacy gate ────────
+
+test("duplicate privacy: keys fail closed to the MOST restrictive declared value", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-privacy-dup-"));
+  try {
+    await ensureVault(root);
+    const dir = path.join(root, "wiki", "concepts");
+    await mkdir(dir, { recursive: true });
+    // Parser-differential bypass shape: a permissive duplicate AFTER the
+    // restrictive key (last-key-wins YAML parsers would read "safe").
+    await writeFile(
+      path.join(dir, "dup-private-then-safe.md"),
+      "---\ntitle: dup note A\nprivacy: private\nprivacy: safe\nstatus: accepted\n---\n\n# Gating\n\nshared gating keyword content\n",
+      "utf8",
+    );
+    // ...and BEFORE it (first-key-wins parsers would read "safe").
+    await writeFile(
+      path.join(dir, "dup-safe-then-private.md"),
+      "---\ntitle: dup note B\nprivacy: safe\nprivacy: private\nstatus: accepted\n---\n\n# Gating\n\nshared gating keyword content\n",
+      "utf8",
+    );
+    // A blocked duplicate must keep the note out of search results entirely.
+    await writeFile(
+      path.join(dir, "dup-safe-then-blocked.md"),
+      "---\ntitle: dup note C\nprivacy: safe\nprivacy: blocked\nstatus: accepted\n---\n\n# Gating\n\nshared gating keyword content\n",
+      "utf8",
+    );
+    const results = await searchVaultNotes(root, "shared gating keyword", 10);
+    const byName = Object.fromEntries(results.map((r) => [path.basename(r.relativePath), r]));
+    assert.equal(byName["dup-private-then-safe.md"].privacy, "private");
+    assert.equal(byName["dup-safe-then-private.md"].privacy, "private");
+    assert.ok(
+      !("dup-safe-then-blocked.md" in byName),
+      "a blocked duplicate keeps the note out of the search layer",
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
