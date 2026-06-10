@@ -29,7 +29,7 @@ from typing import List, Dict, Literal, Optional, Sequence
 
 import numpy as np
 
-from config import SovereignConfig, DEFAULT_CONFIG
+from config import SovereignConfig, DEFAULT_CONFIG, correction_class_page_types
 from db import SovereignDB
 from faiss_index import FAISSIndex
 from query_expand import expand as expand_query
@@ -93,6 +93,12 @@ def _page_type_to_authority(page_type: Optional[str], agent: str) -> Optional[st
     if agent.startswith("identity:"):
         return "schema"
     return "vault"
+
+
+# Correction-class page types (recall-F3) — shared single source of truth in
+# config.py so retrieval and decay cannot drift. Kept as a module alias for
+# existing call sites/tests.
+_correction_class_page_types = correction_class_page_types
 
 
 def _path_to_wikilink(path: str) -> Optional[str]:
@@ -212,6 +218,9 @@ class RetrievalEngine:
         self._feedback_cache = {}
         self._feedback_cache_loaded_at = 0.0
         self.last_trace_id: Optional[str] = None
+        # recall-F3: the correction-class type set is config-invariant — compute
+        # it once here instead of once per scored doc in _score_merged_doc.
+        self._correction_types = _correction_class_page_types(config)
 
     @property
     def model(self):
@@ -412,6 +421,38 @@ class RetrievalEngine:
 
     # ── Cross-Encoder Re-Ranking ──────────────────────────────
 
+    def _apply_correction_rerank_boost(self, candidates: List[Dict]) -> None:
+        """recall-F3 (reranker leg): propagate the correction salience channel
+        into the cross-encoder ordering. Without this, the boost only lived in
+        final_score and was bypassed whenever reranker_enabled=True (the
+        default) — exactly the warm top-K path the operator cares about.
+
+        rerank_score is a raw logit (can be negative), so the bounded
+        multiplicative boost is applied sign-safely: positive logits scale up,
+        negative logits shrink toward zero — a correction-class candidate
+        always moves up relative to its raw logit. A logit of exactly 0.0 is
+        lifted to +boost (a multiplicative boost on zero is a no-op, which
+        would leave the correction tied with zero-logit habitual hits). The
+        rerank cache stores the raw model score BEFORE this adjustment, so
+        cached entries stay model-pure and the boost is re-derived on every
+        call.
+        """
+        boost = float(self.config.correction_salience_boost)
+        if boost <= 0:
+            return
+        for c in candidates:
+            page_type = str(c.get("page_type") or "").lower()
+            if page_type not in self._correction_types:
+                continue
+            score = float(c.get("rerank_score") or 0.0)
+            if score > 0:
+                c["rerank_score"] = score * (1.0 + boost)
+            elif score < 0:
+                c["rerank_score"] = score / (1.0 + boost)
+            else:
+                c["rerank_score"] = boost
+            c["salience_boost"] = boost
+
     def _rerank(self, query: str, candidates: List[Dict]) -> List[Dict]:
         """
         Re-rank candidates using a cross-encoder.
@@ -454,6 +495,7 @@ class RetrievalEngine:
         if not missing:
             for i, c in enumerate(candidates):
                 c["rerank_score"] = float(all_scores[i])
+            self._apply_correction_rerank_boost(candidates)
             candidates.sort(key=lambda x: x.get("rerank_score", 0), reverse=True)
             return candidates
 
@@ -480,7 +522,8 @@ class RetrievalEngine:
             for i, c in enumerate(candidates):
                 c["rerank_score"] = float(all_scores[i] or 0.0)
 
-            # Sort by cross-encoder score
+            # Sort by cross-encoder score (correction salience applied first)
+            self._apply_correction_rerank_boost(candidates)
             candidates.sort(key=lambda x: x.get("rerank_score", 0), reverse=True)
         except Exception as e:
             logger.warning("Re-ranking failed: %s — falling back to RRF scores", e)
@@ -627,6 +670,39 @@ class RetrievalEngine:
 
     # ── Reciprocal Rank Fusion ─────────────────────────────────
 
+    def _score_merged_doc(self, d: Dict) -> None:
+        """Compute final_score for one RRF-merged doc, with the correction
+        salience channel (recall-F3) and decay floor (recall-F4).
+
+        Default scoring is unchanged: final_score = rrf_score * decay_score.
+        Correction-class notes (page_type in config.correction_page_types) get
+        a bounded multiplicative boost and a decay floor so a fresh correction
+        can outrank a stale habitual hit whose decay saturated via access
+        reinforcement (decay rewards rereads; corrections start unread).
+
+        When the cross-encoder reranker is active, the boost is also
+        propagated into the logit-driven ordering — see
+        _apply_correction_rerank_boost, called from _rerank.
+        """
+        boost = 0.0
+        # Defensive: merged docs are normally built with `or 1.0` defaults,
+        # but an explicit decay_score=None from a downstream caller must not
+        # TypeError inside max(). `is not None` (not falsy-or): a legitimate
+        # decay_score of 0.0 must score as fully decayed, not be coerced to 1.0.
+        decay = d.get("decay_score")
+        if decay is None:
+            decay = 1.0
+        page_type = str(d.get("page_type") or "").lower()
+        if page_type in self._correction_types:
+            # Direct field access: correction_salience_boost / _decay_floor are
+            # SovereignConfig dataclass fields with defaults (config.py); only
+            # correction_class_page_types() tolerates duck-typed configs.
+            boost = float(self.config.correction_salience_boost)
+            floor = float(self.config.correction_decay_floor)
+            decay = max(decay, floor)
+        d["salience_boost"] = boost
+        d["final_score"] = d["rrf_score"] * decay * (1.0 + boost)
+
     def _rrf_merge(
         self,
         fts_results: List[Dict],
@@ -702,7 +778,7 @@ class RetrievalEngine:
                 doc_scores[did]["layer"] = r["layer"]
 
         for d in doc_scores.values():
-            d["final_score"] = d["rrf_score"] * d["decay_score"]
+            self._score_merged_doc(d)
 
         ranked = sorted(doc_scores.values(), key=lambda x: x["final_score"], reverse=True)
         return ranked[:limit]
@@ -1076,7 +1152,7 @@ class RetrievalEngine:
             _add_stream(extra, self.config.semantic_weight, "extra")
 
         for d in doc_scores.values():
-            d["final_score"] = d["rrf_score"] * d["decay_score"]
+            self._score_merged_doc(d)
 
         ranked = sorted(doc_scores.values(), key=lambda x: x["final_score"], reverse=True)
         return ranked[:limit]
@@ -1786,6 +1862,9 @@ class RetrievalEngine:
             }
             if "feedback_demote" in r:
                 provenance["feedback_demote"] = r.get("feedback_demote", 0.0)
+            if r.get("salience_boost"):
+                # recall-F3: correction-class salience applied in RRF scoring
+                provenance["salience_boost"] = r.get("salience_boost", 0.0)
             if r.get("provenance", {}).get("via_hyde"):
                 provenance["via_hyde"] = True
 
@@ -2030,31 +2109,10 @@ class RetrievalEngine:
             for row in c.fetchall():
                 results.append(dict(row))
 
-        if results:
-            now = time.time()
-            with self.db.cursor() as c:
-                for result in results[:limit]:
-                    c.execute(
-                        """UPDATE learnings
-                           SET access_count = access_count + 1, last_accessed = ?
-                           WHERE learning_id = ?""",
-                        (now, result["learning_id"]),
-                    )
-                    try:
-                        c.execute(
-                            """INSERT INTO learning_reads
-                               (learning_id, agent_id, read_at, source)
-                               VALUES (?, ?, ?, ?)""",
-                            (
-                                result["learning_id"],
-                                agent_id or "unknown",
-                                now,
-                                "retrieval.search_learnings",
-                            ),
-                        )
-                    except Exception:
-                        pass
-
+        # hooks-PL-2: the learning access/read tracking that previously lived
+        # here referenced result["learning_id"], which episodic rows do not
+        # carry (KeyError on any hit) — it belongs in search_learnings, where
+        # it now lives. Episodic events need no learning_reads rows.
         return results
 
     def search_learnings(
@@ -2062,8 +2120,14 @@ class RetrievalEngine:
         query: str,
         agent_id: Optional[str] = None,
         limit: int = 10,
+        source: str = "retrieval.search_learnings",
     ) -> List[Dict]:
-        """Search write-back learnings via FTS5."""
+        """Search write-back learnings via FTS5.
+
+        ``source`` labels the learning_reads rows written below, so callers
+        (e.g. the daemon search RPC) can distinguish their read channel in
+        diagnostics.
+        """
         safe_q = self._sanitize_fts_query(query)
         if not safe_q:
             return []
@@ -2095,5 +2159,47 @@ class RetrievalEngine:
 
             for row in c.fetchall():
                 results.append(dict(row))
+
+        # hooks-PL-2 leg (a): searching learnings IS reading them. Record
+        # access + a learning_reads row so subscribe_contradictions can later
+        # match a correction against this read (the search path previously
+        # wrote no learning_reads at all — moved here from search_episodic,
+        # where it crashed on a missing learning_id key).
+        if results:
+            now = time.time()
+            with self.db.cursor() as c:
+                for result in results[:limit]:
+                    c.execute(
+                        """UPDATE learnings
+                           SET access_count = access_count + 1, last_accessed = ?
+                           WHERE learning_id = ?""",
+                        (now, result["learning_id"]),
+                    )
+                    try:
+                        # OR IGNORE: two searches in the same clock tick
+                        # collide on the (learning_id, agent_id, read_at) PK;
+                        # the read is already recorded for that instant, so
+                        # the duplicate is dropped instead of raising an
+                        # IntegrityError that the except below would swallow
+                        # as silently dropped tracking.
+                        c.execute(
+                            """INSERT OR IGNORE INTO learning_reads
+                               (learning_id, agent_id, read_at, source)
+                               VALUES (?, ?, ?, ?)""",
+                            (
+                                result["learning_id"],
+                                agent_id or "unknown",
+                                now,
+                                source,
+                            ),
+                        )
+                    except Exception as exc:
+                        # hooks-PL-5: never silently drop read tracking — a
+                        # missing row here is exactly what makes stale_beliefs
+                        # fire events:[] forever.
+                        logger.warning(
+                            "learning_reads insert failed for learning #%s: %s",
+                            result.get("learning_id"), exc,
+                        )
 
         return results

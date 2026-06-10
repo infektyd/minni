@@ -177,6 +177,20 @@ class SovereignConfig:
     # contradictory. Callers can override per-request via the 'threshold' param.
     contradiction_threshold: float = 0.85
 
+    # Correction re-injection (audit cluster C1 / recall-F3, recall-F4).
+    # Correction-class notes (corrections, contradiction resolutions, decisions,
+    # fixes) carry a bounded salience channel so a fresh correction can outrank
+    # a stale habitual hit whose decay saturated at 1.0 via access reinforcement.
+    correction_page_types: tuple = ("correction", "contradiction", "decision", "fix")
+    # Bounded multiplicative boost: final_score *= (1 + boost) for correction-class.
+    correction_salience_boost: float = 0.25
+    # Corrections younger than the grace window do not decay at all (recall-F4:
+    # a 1-day-old unaccessed correction must not sit below a reread stale belief).
+    correction_decay_grace_days: float = 7.0
+    # After the grace window, corrections decay normally but never below this
+    # floor, so a correction cannot fade below the belief it superseded.
+    correction_decay_floor: float = 0.5
+
     # Thread propagation
     thread_bind_threshold: float = 0.55
 
@@ -196,6 +210,18 @@ class SovereignConfig:
         os.makedirs(self.graph_export_dir, exist_ok=True)
         if self.writeback_enabled:
             os.makedirs(self.writeback_path, exist_ok=True)
+
+
+def correction_class_page_types(config) -> set:
+    """Correction-class page types (recall-F3): notes that correct, supersede,
+    or decide against a prior belief. Single source of truth shared by
+    retrieval.py (salience boost) and decay.py (grace window + floor) so the
+    two sides cannot drift. Falls back to the audited default set so
+    duck-typed configs (eval harness) keep the salience channel."""
+    raw = getattr(config, "correction_page_types", None) or (
+        "correction", "contradiction", "decision", "fix",
+    )
+    return {str(t).lower() for t in raw}
 
 
 # Global default config — importable everywhere

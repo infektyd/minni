@@ -348,6 +348,30 @@ async function listMarkdownFiles(root: string): Promise<string[]> {
   return files.flat();
 }
 
+// recall-F3 mirror (audit cluster C1): correction-class note types — must stay
+// in sync with engine/config.py correction_page_types and the bounded
+// multiplicative boost applied in engine/retrieval.py _score_merged_doc.
+// Exported so the config-contract test can mechanically assert parity with
+// engine/config.py (one-sided drift is this codebase's #1 bug class).
+export const CORRECTION_CLASS_TYPES = new Set([
+  "correction",
+  "contradiction",
+  "decision",
+  "fix",
+]);
+export const CORRECTION_SALIENCE_BOOST = 0.25;
+
+function frontmatterField(markdown: string, key: string): string | undefined {
+  const fm = markdown.match(/^---\n([\s\S]*?)\n---/);
+  if (!fm) return undefined;
+  // Escape regex metacharacters: the key is interpolated into a RegExp, so a
+  // key like "a.b" must match literally, not as a pattern.
+  const safeKey = key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const line = fm[1].match(new RegExp(`^${safeKey}:[ \\t]*(.+)$`, "m"));
+  const value = line?.[1]?.trim().replace(/^["']|["']$/g, "");
+  return value || undefined;
+}
+
 function scoreVaultNote(
   query: string,
   terms: string[],
@@ -355,6 +379,20 @@ function scoreVaultNote(
   title: string,
   markdown: string,
 ): number {
+  // PR-2 status mirror: the engine's retrieval skips superseded/rejected/
+  // expired/draft pages by default (retrieval.py skip statuses); the vault-
+  // side search previously kept re-surfacing corrected-away beliefs forever.
+  const status = frontmatterField(markdown, "status")?.toLowerCase();
+  if (
+    status === "superseded" ||
+    status === "rejected" ||
+    status === "expired" ||
+    status === "draft"
+  ) {
+    return 0;
+  }
+  if (frontmatterField(markdown, "superseded_by")) return 0;
+
   const haystack = `${title}\n${relativePath}\n${markdown}`.toLowerCase();
   const titleLower = title.toLowerCase();
   const queryLower = query.toLowerCase().trim();
@@ -367,6 +405,13 @@ function scoreVaultNote(
   }
   if (relativePath.startsWith("wiki/sessions/")) score += 1;
   if (/minni_learning:\s*true/i.test(markdown)) score += 2;
+
+  // recall-F3 mirror: bounded salience boost so a fresh correction can
+  // outrank a stale habitual hit (same 1 + boost factor as the engine).
+  const pageType = frontmatterField(markdown, "type")?.toLowerCase();
+  if (pageType && CORRECTION_CLASS_TYPES.has(pageType)) {
+    score *= 1 + CORRECTION_SALIENCE_BOOST;
+  }
   return score;
 }
 
@@ -1043,6 +1088,179 @@ export async function readPendingInbox(
   limit = 5,
 ): Promise<InboxEntry[]> {
   return (await readInboxStatus(vaultPath, limit)).entries;
+}
+
+/** Hard cap on re-asserted events per boot: the inbox is plain JSON on disk,
+ * so a single crafted/corrupt file must not be able to saturate the context
+ * window via an unbounded stale_belief_events array. */
+export const CORRECTIONS_REASSERT_MAX = 10;
+
+/**
+ * Schema gate for re-asserted events: inbox files are writable by any local
+ * process (AFM writer, CI, npm postinstall...), and their contents are
+ * injected into the model's boot context. Only the expected event shape with
+ * the expected primitive types passes; everything else is dropped (and the
+ * caller logs a warning). No free-form strings beyond originating_agent.
+ */
+function isValidStaleBeliefEvent(value: unknown): boolean {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const e = value as Record<string, unknown>;
+  if (!Number.isInteger(e.event_id)) return false;
+  if (!Number.isInteger(e.superseded_learning_id)) return false;
+  if (!Number.isInteger(e.new_learning_id)) return false;
+  if (
+    e.originating_agent !== undefined &&
+    (typeof e.originating_agent !== "string" ||
+      !/^[\w.:-]{1,64}$/.test(e.originating_agent))
+  ) {
+    return false;
+  }
+  // Number.isFinite (not typeof): NaN/±Infinity are numbers but never valid
+  // timestamps, and they poison any downstream date arithmetic.
+  if (e.created_at !== undefined && !Number.isFinite(e.created_at)) return false;
+  return true;
+}
+
+/**
+ * hooks-PL-3: collect correction/contradiction events stashed by PreCompact
+ * into the inbox so post-compaction boots re-assert them even when the daemon
+ * is unreachable at SessionStart. Field-driven (stale_belief_events) rather
+ * than kind-driven, so both the dedicated "precompact_reassert" entries
+ * (Claude Code) and the codex/grok precompact handoff payloads contribute.
+ *
+ * Inbox content is untrusted (see isValidStaleBeliefEvent): malformed events
+ * are dropped with a stderr warning, and the total is capped.
+ *
+ * Consumption contract (settleReassertedInboxEntries acts on the result):
+ *  - entry with an EMPTY stale_belief_events array → consumed (nothing to
+ *    inject, but codex/grok stash unconditionally and an uncleared empty
+ *    entry would accumulate one file per compaction cycle);
+ *  - entry whose valid events ALL fit under the cap → consumed;
+ *  - entry whose valid events only PARTIALLY fit → NOT consumed; the
+ *    un-injected valid tail is reported in deferredTails and rewritten over
+ *    the entry, so the remainder re-injects on the next boot instead of
+ *    being permanently lost (and the injected head is not duplicated);
+ *  - entry whose valid events were ALL deferred by an already-full cap →
+ *    NOT consumed; it re-injects on the next boot instead of being lost;
+ *  - entry whose events ALL failed the schema gate → NOT consumed; deleting
+ *    it would silently destroy a correction, so it stays for inspection.
+ */
+export interface CorrectionsReassertResult {
+  events: unknown[];
+  /** Inbox file paths whose stashed events were fully consumed (or were
+   * empty); only these may be cleared after the boot envelope is built. */
+  consumedPaths: string[];
+  /** Entries whose valid events only partially fit under the cap: the
+   * payload carries the un-injected valid tail and replaces the file so the
+   * remainder re-injects on the next boot. */
+  deferredTails: Array<{ filePath: string; payload: Record<string, unknown> }>;
+}
+
+export function collectCorrectionsReassert(
+  pending: Array<{ payload: Record<string, unknown>; filePath?: string }>,
+): CorrectionsReassertResult {
+  const events: unknown[] = [];
+  const consumedPaths: string[] = [];
+  const deferredTails: CorrectionsReassertResult["deferredTails"] = [];
+  let dropped = 0;
+  for (const entry of pending) {
+    const stashed = entry.payload.stale_belief_events;
+    if (!Array.isArray(stashed)) continue;
+    const label = entry.filePath ?? "(inbox entry)";
+    if (stashed.length === 0) {
+      // Empty stash carries nothing to re-assert but must still be cleared.
+      if (entry.filePath) consumedPaths.push(entry.filePath);
+      continue;
+    }
+    let collected = 0;
+    const tail: unknown[] = [];
+    for (const event of stashed) {
+      if (!isValidStaleBeliefEvent(event)) {
+        dropped += 1;
+        continue;
+      }
+      if (events.length >= CORRECTIONS_REASSERT_MAX) {
+        tail.push(event);
+        continue;
+      }
+      events.push(event);
+      collected += 1;
+    }
+    if (collected > 0 && tail.length === 0) {
+      // Every valid event injected → safe to clear the entry.
+      if (entry.filePath) consumedPaths.push(entry.filePath);
+    } else if (collected > 0) {
+      // Partially injected: never consume the entry, or the un-injected tail
+      // would be permanently lost. Rewrite it with just the tail so the
+      // remainder re-injects next boot without duplicating the head.
+      if (entry.filePath) {
+        deferredTails.push({
+          filePath: entry.filePath,
+          payload: { ...entry.payload, stale_belief_events: tail },
+        });
+        console.error(
+          `minni: corrections_reassert cap deferred ${tail.length} valid event(s) from ${label} to next boot`,
+        );
+      } else {
+        // No backing file to defer into — discard with a warning (the daemon
+        // still holds the events).
+        console.error(
+          `minni: corrections_reassert cap discarded ${tail.length} valid event(s) from ${label}`,
+        );
+      }
+    } else if (tail.length > 0) {
+      // Cap was already full before this entry contributed anything: leave it
+      // unconsumed so it re-injects on the next boot instead of being lost.
+      console.error(
+        `minni: corrections_reassert cap full — deferring ${label} to next boot`,
+      );
+    } else {
+      // Every event failed the schema gate. Do NOT consume: clearing here
+      // would silently destroy the stashed correction with zero injection.
+      console.error(
+        `minni: all stale_belief_events in ${label} failed the schema gate — entry left in place`,
+      );
+    }
+  }
+  if (dropped > 0) {
+    // stderr only: hook stdout is the JSON protocol channel.
+    console.error(
+      `minni: dropped ${dropped} malformed stale_belief_events from inbox (schema gate)`,
+    );
+  }
+  return { events, consumedPaths, deferredTails };
+}
+
+/**
+ * After a boot has consumed stashed stale_belief_events (corrections_reassert),
+ * settle the inbox: remove exactly the entries collectCorrectionsReassert
+ * reported as consumed (so they re-inject exactly once and do not accumulate
+ * across compaction cycles), and rewrite partially-injected entries with
+ * their un-injected valid tail (so cap overflow defers to the next boot
+ * instead of being lost). Entries whose events were all malformed or all
+ * cap-deferred are untouched and survive as-is.
+ */
+export async function settleReassertedInboxEntries(
+  outcome: Pick<CorrectionsReassertResult, "consumedPaths" | "deferredTails">,
+): Promise<void> {
+  for (const filePath of outcome.consumedPaths) {
+    // Inbox lifecycle policy (audit C2): archive, never unlink — the entry
+    // moves to inbox/.archive/, which is invisible to readInboxStatus and the
+    // engine's inbox_ingest glob, so the exactly-once contract still holds.
+    await archiveInboxEntry(filePath);
+  }
+  for (const tail of outcome.deferredTails) {
+    try {
+      await writeFile(
+        tail.filePath,
+        JSON.stringify(tail.payload, null, 2),
+        "utf8",
+      );
+    } catch {
+      // Best effort: an unwritable tail leaves the original entry intact,
+      // which re-injects (with duplicated head events) rather than losing any.
+    }
+  }
 }
 
 function normalizeWikilinkRef(ref: string): string {

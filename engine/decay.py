@@ -1,8 +1,11 @@
 """
 Minni V3.1 — Memory Decay.
 
-Unchanged from V3 — the decay logic was already correct.
 Exponential decay with access-based reinforcement, no hard cutoffs.
+
+recall-F4 (audit cluster C1): correction-class notes get a grace window and a
+decay floor — access-recency reinforcement otherwise up-ranks stale-but-reread
+beliefs over the fresh, unread corrections that supersede them.
 """
 
 import time
@@ -10,7 +13,7 @@ import math
 import logging
 from typing import Dict
 
-from config import SovereignConfig, DEFAULT_CONFIG
+from config import SovereignConfig, DEFAULT_CONFIG, correction_class_page_types
 from db import SovereignDB
 
 logger = logging.getLogger("sovereign.decay")
@@ -35,11 +38,21 @@ class MemoryDecay:
         now = time.time()
         half_life_sec = self.config.decay_half_life_days * 86400
         min_score = self.config.decay_min_score
+        # recall-F4: correction-class notes must not lose to stale-but-reread
+        # beliefs whose decay saturates at 1.0 via access reinforcement.
+        # Shared helper (config.py) — same set retrieval.py boosts on.
+        correction_types = correction_class_page_types(self.config)
+        # Direct field access: these are SovereignConfig dataclass fields with
+        # defaults (config.py); only correction_class_page_types() tolerates
+        # duck-typed configs.
+        grace_sec = float(self.config.correction_decay_grace_days) * 86400
+        correction_floor = float(self.config.correction_decay_floor)
         stats = {"updated": 0, "reinforced": 0}
 
         with self.db.transaction() as c:
             c.execute("""
-                SELECT doc_id, indexed_at, last_accessed, access_count, decay_score
+                SELECT doc_id, indexed_at, last_accessed, access_count,
+                       decay_score, page_type
                 FROM documents
             """)
 
@@ -58,6 +71,16 @@ class MemoryDecay:
                 access_boost = min(access_count * 0.05, 0.5)
 
                 new_score = max(min_score, min(1.0, raw_decay + access_boost))
+
+                # recall-F4: corrections start unaccessed, so access-recency
+                # decay up-ranks the very beliefs they supersede. Within the
+                # grace window a correction holds full strength; afterwards it
+                # decays normally but never below the correction floor.
+                if (row["page_type"] or "").lower() in correction_types:
+                    if (now - indexed_at) <= grace_sec:
+                        new_score = 1.0
+                    else:
+                        new_score = max(new_score, correction_floor)
 
                 old_score = row["decay_score"] or 1.0
                 if abs(new_score - old_score) > 0.001:

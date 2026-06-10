@@ -14,7 +14,7 @@ import {
   type AfmProviderResolution,
   type ProviderHealth,
 } from "./afm.js";
-import { auditTail, ensureVault, recordAudit, vaultExists } from "./vault.js";
+import { auditTail, ensureVault, recordAudit, vaultExists, writeInbox } from "./vault.js";
 import type { VaultSearchResult } from "./vault.js";
 
 export interface JsonResult<T = unknown> {
@@ -142,21 +142,36 @@ export async function socketHealth(): Promise<JsonResult> {
   return jsonRpcSocketRequestWithFallback("status", {});
 }
 
+/**
+ * Layer policy (recall-F1/recall-F6): the two recall surfaces are deliberately
+ * complementary, not contradictory —
+ *  - BOOT (SessionStart) queries BOOT_RECALL_LAYERS: the identity shelf PLUS
+ *    the correction/decision-bearing layers (knowledge, episodic). The old
+ *    identity-only whitelist dropped knowledge-layer corrections before rerank,
+ *    which is how an already-corrected belief survived a 3-hour loop.
+ *  - PER-TURN (UserPromptSubmit) recalls all layers but formatRecallLean drops
+ *    identity-shelf hits, because the shelf was already injected at boot and
+ *    never changes mid-session.
+ * Boot = identity + fresh corrections; per-turn = query-relevant non-identity.
+ */
+export const BOOT_RECALL_LAYERS: ReadonlyArray<string> = ["identity", "knowledge", "episodic"];
+
 export async function recallMemory(input: {
   query: string;
   agentId?: string;
   layer?: string;
+  layers?: ReadonlyArray<string>;
   workspaceId?: string;
   limit?: number;
-}): Promise<JsonResult<RecallResponse>> {
+}, requester: JsonRpcRequester = jsonRpcSocketRequest): Promise<JsonResult<RecallResponse>> {
   // Daemon is JSON-RPC only; surface its real result/error (e.g. identity_mismatch)
   // directly instead of masking it behind a dead HTTP-over-socket fallback.
-  return jsonRpcSocketRequestWithFallback("search", {
+  return jsonRpcSocketRequestWithFallbackRequester("search", {
     query: input.query,
     agent_id: input.agentId ?? DEFAULT_AGENT_ID,
-    layers: input.layer ? [input.layer] : undefined,
+    layers: input.layers ?? (input.layer ? [input.layer] : undefined),
     limit: input.limit,
-  }) as Promise<JsonResult<RecallResponse>>;
+  }, requester) as Promise<JsonResult<RecallResponse>>;
 }
 
 export async function learnMemory(input: {
@@ -183,6 +198,22 @@ export async function readAgentContext(input: {
     agent_id: input.agentId ?? DEFAULT_AGENT_ID,
     limit: input.limit ?? 8,
   }) as Promise<JsonResult<ReadContextResponse>>;
+}
+
+/**
+ * recall-F1 / hooks-PL-2: the daemon 'read' context is identity-shelf heavy;
+ * boot hooks only need its recency-ordered "## Learnings" slice (where fresh
+ * corrections land as new active learnings). Extract just that section so the
+ * read round-trip (which also records learning_reads) stays cheap to inject.
+ */
+export function extractLearningsSection(context: string | undefined): string | undefined {
+  if (!context) return undefined;
+  const match = context.match(/^## Learnings[^\n]*$/m);
+  if (!match || match.index === undefined) return undefined;
+  const rest = context.slice(match.index);
+  const next = rest.slice(match[0].length).search(/^## /m);
+  const section = next >= 0 ? rest.slice(0, match[0].length + next) : rest;
+  return section.trim() || undefined;
 }
 
 export type JsonRpcRequester = (socketPath: string, method: string, params: Record<string, unknown>) => Promise<JsonResult>;
@@ -331,6 +362,48 @@ export async function subscribeContradictions(
     agent_id: input.agentId,
     since_ts: input.sinceTs,
   }, requester);
+}
+
+/**
+ * hooks-PL-3 shared PreCompact leg, part 1: fetch the current stale-belief /
+ * contradiction events for an agent. Shared by all four hook binaries so the
+ * extraction logic cannot drift one-sided (the repo's #1 bug class).
+ */
+export async function fetchStaleBeliefEvents(
+  agentId: string,
+  requester: JsonRpcRequester = jsonRpcSocketRequest,
+): Promise<{ ok: boolean; events: unknown[]; error?: string }> {
+  const contradictions = await subscribeContradictions({ agentId }, requester);
+  const events =
+    contradictions.ok && Array.isArray((contradictions.data as any)?.events)
+      ? ((contradictions.data as any).events as unknown[])
+      : [];
+  return { ok: contradictions.ok, events, error: contradictions.error };
+}
+
+/**
+ * hooks-PL-3 shared PreCompact leg, part 2 (Claude Code / kilocode): stash
+ * non-empty stale-belief events durably in the vault inbox as a dedicated
+ * "precompact_reassert" entry so the post-compaction boot re-asserts them
+ * (corrections_reassert) even if the daemon is down at next boot. Returns the
+ * inbox path, or undefined when there was nothing to stash. (codex/grok carry
+ * the same stale_belief_events field on their precompact handoff payloads.)
+ */
+export async function stashPrecompactReassert(input: {
+  vaultPath: string;
+  sessionId: string;
+  agentId: string;
+  staleBeliefEvents: unknown[];
+  trigger?: string;
+}): Promise<string | undefined> {
+  if (input.staleBeliefEvents.length === 0) return undefined;
+  const entry = await writeInbox(input.vaultPath, input.sessionId, {
+    kind: "precompact_reassert",
+    agent_id: input.agentId,
+    stale_belief_events: input.staleBeliefEvents,
+    compaction_trigger: input.trigger || "compaction in progress",
+  });
+  return entry.filePath;
 }
 
 export async function jsonRpcSocketRequestWithFallback(method: string, params: Record<string, unknown>): Promise<JsonResult> {
