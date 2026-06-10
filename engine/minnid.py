@@ -957,36 +957,6 @@ def _resolve_backend(backend_param, config=None):
     return backend_param
 
 
-def _record_learning_reads_for_search(agent_id: str, results: list) -> int:
-    """hooks-PL-2 leg (a): the hooks' recall path uses the 'search' RPC, which
-    previously wrote NO learning_reads rows — so subscribe_contradictions
-    (stale_beliefs) could never match a belief that was only ever surfaced via
-    search. Record a read row for every learning-backed result (synthetic
-    ``learning://<id>`` graph documents), mirroring what minnid.read does for
-    its recent-learnings slice.
-    """
-    learning_ids = []
-    for r in results or []:
-        src = str(r.get("source") or r.get("path") or "")
-        if src.startswith("learning://"):
-            try:
-                learning_ids.append(int(src.split("learning://", 1)[1]))
-            except ValueError:
-                continue
-    if not learning_ids:
-        return 0
-    now = time.time()
-    with _lazy_writeback().db.cursor() as c:
-        for lid in learning_ids:
-            c.execute(
-                """INSERT OR IGNORE INTO learning_reads
-                   (learning_id, agent_id, read_at, source)
-                   VALUES (?, ?, ?, ?)""",
-                (lid, agent_id, now, "minnid.search"),
-            )
-    return len(learning_ids)
-
-
 def _handle_search(params: dict, request_id: Any) -> dict:
     """Search Minni via hybrid retrieval.
 
@@ -1068,13 +1038,22 @@ def _handle_search(params: dict, request_id: Any) -> dict:
             except Exception as pack_exc:
                 logger.warning("pack_results failed: %s — returning unbudgeted results", pack_exc)
 
-        # hooks-PL-2 leg (a): searching is reading — track learning-backed hits
-        # so stale_beliefs can fire when one of them is later corrected.
+        # hooks-PL-2 leg (a): searching is reading. The doc-retrieval stream
+        # above can never carry learnings — ``learning://<id>`` rows exist only
+        # for evidence-backed learnings and are never indexed in vault_fts or
+        # FAISS — so match the learnings table directly. The matched learnings
+        # are surfaced to the caller in the response below, and
+        # search_learnings records a learning_reads row for each (the row
+        # subscribe_contradictions joins on, so stale_beliefs can fire when a
+        # searched belief is later superseded).
+        learnings: list = []
         try:
-            _record_learning_reads_for_search(agent_id, results)
+            learnings = engine.search_learnings(
+                query, agent_id=agent_id, limit=limit, source="minnid.search"
+            )
         except Exception as exc:
             # hooks-PL-5: visible, never silently green
-            logger.warning("search: learning_reads tracking failed: %s", exc)
+            logger.warning("search: learnings surfacing/tracking failed: %s", exc)
 
         return _make_response({
             "query": query,
@@ -1088,6 +1067,8 @@ def _handle_search(params: dict, request_id: Any) -> dict:
                 if results else [query]
             ),
             "results": results,
+            # Active learnings matching the query (read-tracked above).
+            "learnings": learnings,
         }, request_id)
     except Exception as exc:
         logger.exception("search failed")
@@ -1481,8 +1462,13 @@ def _handle_read(params: dict, request_id: Any) -> dict:
                         f"(conf={row['confidence']:.1f})"
                     )
                     try:
+                        # OR IGNORE: a same-tick re-read collides on the
+                        # (learning_id, agent_id, read_at) PK — the read is
+                        # already recorded, so dropping the duplicate is
+                        # correct (a raise here would be swallowed below as
+                        # "dropped tracking").
                         c.execute(
-                            """INSERT INTO learning_reads
+                            """INSERT OR IGNORE INTO learning_reads
                                (learning_id, agent_id, read_at, source)
                                VALUES (?, ?, ?, ?)""",
                             (row["learning_id"], agent_id, time.time(), "minnid.read"),
@@ -1902,7 +1888,13 @@ def _handle_subscribe_contradictions(params: dict, request_id: Any) -> dict:
     agent_id = principal.agent_id
     if not agent_id:
         return _make_error(-32602, "agent_id is required", request_id)
-    since_ts = float(params.get("since_ts", 0) or 0)
+    # Non-numeric params are a caller error (-32602), never an unhandled
+    # exception: a raise here would propagate out of the handler and drop the
+    # whole connection with no JSON-RPC error.
+    try:
+        since_ts = float(params.get("since_ts", 0) or 0)
+    except (TypeError, ValueError):
+        return _make_error(-32602, "since_ts must be a number", request_id)
     if not math.isfinite(since_ts):
         # NaN survives the falsy-or (it is truthy) and turns every SQL
         # comparison false — events:[] would masquerade as checked_no_match.
@@ -1928,7 +1920,12 @@ def _handle_subscribe_contradictions(params: dict, request_id: Any) -> dict:
     if read_window_hours_param is not None:
         # No falsy-or fallback: an explicit 0 means "no reads qualify" and
         # must not be silently coerced to the 24h default.
-        read_window_hours = float(read_window_hours_param)
+        try:
+            read_window_hours = float(read_window_hours_param)
+        except (TypeError, ValueError):
+            return _make_error(
+                -32602, "read_window_hours must be a number", request_id
+            )
         if not math.isfinite(read_window_hours):
             # NaN bypasses min/max clamping; fall back to the default
             # (no read-recency filter) instead of a poisoned read_since.
@@ -1943,9 +1940,14 @@ def _handle_subscribe_contradictions(params: dict, request_id: Any) -> dict:
     # No falsy-or fallback (mirrors read_window_hours): an explicit 0 means
     # "no historic events" and must not be silently coerced to 30.
     event_window_days_param = params.get("event_window_days")
-    event_window_days = (
-        30.0 if event_window_days_param is None else float(event_window_days_param)
-    )
+    try:
+        event_window_days = (
+            30.0 if event_window_days_param is None else float(event_window_days_param)
+        )
+    except (TypeError, ValueError):
+        return _make_error(
+            -32602, "event_window_days must be a number", request_id
+        )
     if not math.isfinite(event_window_days):
         # NaN bypasses min/max clamping and would collapse event_since to 0
         # (full-history scan) — exactly the local DoS this cap blocks.

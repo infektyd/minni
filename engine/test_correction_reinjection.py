@@ -8,7 +8,9 @@ Covers:
   recall-F3   Bounded salience channel for correction-class notes in RRF scoring
   recall-F4   Decay grace window + floor for correction-class notes
   hooks-PL-1  subscribe_contradictions checked/matched discriminator
-  hooks-PL-2  (a) search-path learning_reads tracking
+  hooks-PL-2  (a) search-path learning surfacing + learning_reads tracking
+                  (the search RPC matches the learnings table directly; doc
+                  retrieval can never carry learnings)
               (b) stale_beliefs no longer requires a <24h read of a SUPERSEDED
                   learning (which could never get a fresh read row)
   regression  A superseded belief with a stored correction MUST surface the
@@ -63,13 +65,13 @@ def setup_hermetic_principals(tmp_path, monkeypatch):
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _make_db(tmp_path):
+def _make_db(tmp_path, **cfg_overrides):
     """Return (SovereignDB, SovereignConfig) backed by a temporary SQLite file."""
     import db as db_mod
     from config import SovereignConfig
 
     db_path = str(tmp_path / "test.db")
-    cfg = SovereignConfig(db_path=db_path)
+    cfg = SovereignConfig(db_path=db_path, **cfg_overrides)
 
     old_flag = db_mod._migrations_run
     db_mod._migrations_run = False
@@ -104,6 +106,39 @@ def _patch_writeback(tmp_path, monkeypatch):
         wb_mod.WriteBackMemory, "model", property(lambda self: None)
     )
     return wb, db_obj, cfg
+
+
+def _patch_engine_and_writeback(tmp_path, monkeypatch):
+    """Wire ONE test DB into both minnid singletons: a real RetrievalEngine
+    (embedding model disabled, reranker/HyDE off — pure local FTS + learnings
+    matching) and WriteBackMemory. Dispatch tests can then exercise the
+    production search RPC end to end with no FakeEngine."""
+    import minnid
+    import writeback as wb_mod
+    from retrieval import RetrievalEngine
+    from writeback import WriteBackMemory
+
+    db_obj, cfg = _make_db(tmp_path, reranker_enabled=False, hyde_enabled=False)
+    wb = WriteBackMemory(db_obj, cfg)
+    monkeypatch.setattr(minnid, "_writeback", wb)
+    monkeypatch.setattr(
+        wb_mod.WriteBackMemory, "model", property(lambda self: None)
+    )
+    engine = RetrievalEngine(db_obj, cfg, faiss_index=object())
+    monkeypatch.setattr(RetrievalEngine, "model", property(lambda self: None))
+    monkeypatch.setattr(minnid, "_retrieval", engine)
+    return engine, db_obj, cfg
+
+
+def _insert_learning(db_obj, content, agent="codex", created_at=None):
+    with db_obj.cursor() as c:
+        c.execute(
+            """INSERT INTO learnings
+               (agent_id, category, content, confidence, created_at, status)
+               VALUES (?, 'fact', ?, 1.0, ?, 'active')""",
+            (agent, content, created_at or time.time()),
+        )
+        return c.lastrowid
 
 
 def _dispatch(method, params):
@@ -269,6 +304,80 @@ class TestCorrectionSalience:
             -1.0 / (1 + cfg.correction_salience_boost)
         )
 
+    def test_reranker_boost_lifts_zero_logit_corrections(self, tmp_path):
+        """A correction whose raw logit is exactly 0.0 previously got
+        0.0 * (1 + boost) = 0.0 — no lift at all. It must land at +boost so it
+        outranks zero-logit habitual hits."""
+        engine, db_obj, cfg = _make_engine(tmp_path)
+
+        class FakeReranker:
+            model_name = "fake-ce"
+
+            def predict(self, pairs):
+                return [0.0, 0.0]
+
+        engine._reranker = FakeReranker()
+        habitual = _rrf_doc(1, "concept", 1.0)
+        correction = _rrf_doc(2, "correction", 1.0)
+        ranked = engine._rerank("service x port", [habitual, correction])
+        assert ranked[0]["doc_id"] == 2, \
+            "zero-logit correction must outrank the zero-logit habitual hit"
+        assert ranked[0]["rerank_score"] == pytest.approx(
+            cfg.correction_salience_boost
+        )
+        assert {d["doc_id"]: d for d in ranked}[1]["rerank_score"] == 0.0
+
+    def test_reranker_boost_applies_on_cache_hit_branch(self, tmp_path):
+        """The `not missing` early-return branch (every score served from the
+        rerank cache, model never called) must apply the correction boost too:
+        the cache stores raw model scores, so the boost is re-derived on every
+        call — including fully-cached ones."""
+        from rerank_cache import GLOBAL_RERANK_CACHE
+
+        engine, db_obj, cfg = _make_engine(tmp_path)
+
+        class ExplodingReranker:
+            model_name = "fake-ce"
+
+            def predict(self, pairs):
+                raise AssertionError("cache-hit branch must not call the model")
+
+        engine._reranker = ExplodingReranker()
+        query = "cache-hit correction boost branch query"
+        habitual = _rrf_doc(1, "concept", 1.0)
+        habitual["chunk_id"] = 9101
+        correction = _rrf_doc(2, "correction", 1.0)
+        correction["chunk_id"] = 9102
+        model_name, model_version = engine._reranker_identity(engine._reranker)
+        GLOBAL_RERANK_CACHE.set(model_name, model_version, query, 9101, 1.0)
+        GLOBAL_RERANK_CACHE.set(model_name, model_version, query, 9102, 0.9)
+        try:
+            ranked = engine._rerank(query, [habitual, correction])
+        finally:
+            GLOBAL_RERANK_CACHE.invalidate_chunks([9101, 9102])
+        assert ranked[0]["doc_id"] == 2, \
+            "boost must apply on the all-cached branch, not just after predict()"
+        assert ranked[0]["rerank_score"] == pytest.approx(
+            0.9 * (1 + cfg.correction_salience_boost)
+        )
+        assert {d["doc_id"]: d for d in ranked}[1]["rerank_score"] == pytest.approx(1.0)
+
+    def test_score_merged_doc_zero_decay_is_not_coerced_to_one(self, tmp_path):
+        """decay_score=0.0 is a real value (fully decayed), not a missing one:
+        the old falsy-or coerced it to 1.0, silently un-decaying the doc."""
+        engine, db_obj, cfg = _make_engine(tmp_path)
+        plain = _rrf_doc(6, "concept", 0.0)
+        plain["rrf_score"] = 0.5
+        engine._score_merged_doc(plain)
+        assert plain["final_score"] == 0.0
+        # Corrections lift fully-decayed scores to the decay floor instead.
+        corr = _rrf_doc(7, "correction", 0.0)
+        corr["rrf_score"] = 0.5
+        engine._score_merged_doc(corr)
+        assert corr["final_score"] == pytest.approx(
+            0.5 * cfg.correction_decay_floor * (1 + cfg.correction_salience_boost)
+        )
+
 
 # ---------------------------------------------------------------------------
 # recall-F4 — decay grace window + floor
@@ -342,70 +451,61 @@ class TestCorrectionDecay:
 
 
 # ---------------------------------------------------------------------------
-# hooks-PL-2 leg (a) — search-path learning_reads tracking
+# hooks-PL-2 leg (a) — search-path learning surfacing + learning_reads tracking
 # ---------------------------------------------------------------------------
 
 class TestSearchLearningReads:
 
-    def test_search_records_reads_for_learning_backed_docs(self, tmp_path, monkeypatch):
-        from minnid import _record_learning_reads_for_search
+    def test_search_dispatch_surfaces_and_tracks_learnings(self, tmp_path, monkeypatch):
+        """The production wiring with the REAL RetrievalEngine (no FakeEngine):
+        the 'search' RPC matches the learnings table for the query, surfaces
+        the hits in the response, and writes a learning_reads row for each.
+        The previous learning:// scan over retrieve() results was dead code —
+        learning:// rows are never indexed in vault_fts/FAISS, so retrieve()
+        can never return them."""
+        engine, db_obj, cfg = _patch_engine_and_writeback(tmp_path, monkeypatch)
+        # An ORDINARY learning: no evidence docs, no learning:// document row.
+        lid = _insert_learning(db_obj, "service X listens on port 8080")
 
-        wb, db_obj, cfg = _patch_writeback(tmp_path, monkeypatch)
-        # Real learnings rows for ids 7 and 9 so the test stays valid if a
-        # FK constraint is ever added to learning_reads.learning_id.
-        now = time.time()
-        with db_obj.cursor() as c:
-            for lid in (7, 9):
-                c.execute(
-                    """INSERT INTO learnings
-                       (learning_id, agent_id, category, content, confidence, created_at)
-                       VALUES (?, 'codex', 'fact', ?, 1.0, ?)""",
-                    (lid, f"learning {lid}", now),
-                )
-        results = [
-            {"source": "learning://7", "score": 1.0},
-            {"path": "learning://9"},
-            {"source": "/vault/wiki/regular-note.md"},
-            {"source": "learning://not-a-number"},
-        ]
-        recorded = _record_learning_reads_for_search("codex", results)
-        assert recorded == 2
-
-        with db_obj.cursor() as c:
-            rows = c.execute(
-                "SELECT learning_id, agent_id, source FROM learning_reads ORDER BY learning_id"
-            ).fetchall()
-        assert [(r["learning_id"], r["agent_id"], r["source"]) for r in rows] == [
-            (7, "codex", "minnid.search"),
-            (9, "codex", "minnid.search"),
-        ]
-
-    def test_search_dispatch_records_learning_reads(self, tmp_path, monkeypatch):
-        """The production wiring, not the helper: dispatching the 'search'
-        RPC through _handle_search must write learning_reads for learning://
-        results. Guards against the call site being moved, renamed, or gated
-        behind a flag while the direct-call test above keeps passing."""
-        import minnid
-
-        wb, db_obj, cfg = _patch_writeback(tmp_path, monkeypatch)
-
-        class FakeEngine:
-            def retrieve(self, **kwargs):
-                return [{"source": "learning://7", "score": 1.0}]
-
-        monkeypatch.setattr(minnid, "_lazy_retrieval", lambda: FakeEngine())
-
-        resp = _dispatch("search", {"query": "service x port", "agent_id": "codex"})
+        resp = _dispatch("search", {
+            "query": "service X port", "agent_id": "codex", "expand": False,
+        })
         assert "error" not in resp
-        assert resp["result"]["count"] == 1
+        result = resp["result"]
+        assert [l["learning_id"] for l in result["learnings"]] == [lid]
+        assert "port 8080" in result["learnings"][0]["content"]
 
         with db_obj.cursor() as c:
             rows = c.execute(
                 "SELECT learning_id, agent_id, source FROM learning_reads"
             ).fetchall()
         assert [(r["learning_id"], r["agent_id"], r["source"]) for r in rows] == [
-            (7, "codex", "minnid.search"),
+            (lid, "codex", "minnid.search"),
         ]
+
+    def test_search_dispatch_does_not_resurface_superseded_learnings(self, tmp_path, monkeypatch):
+        """Superseded beliefs must not be re-surfaced (or re-read-tracked) by
+        the search RPC — only active learnings qualify."""
+        engine, db_obj, cfg = _patch_engine_and_writeback(tmp_path, monkeypatch)
+        stale = _insert_learning(db_obj, "service X listens on port 8080")
+        current = _insert_learning(db_obj, "service X moved to port 9090")
+        with db_obj.cursor() as c:
+            c.execute(
+                "UPDATE learnings SET superseded_by = ? WHERE learning_id = ?",
+                (current, stale),
+            )
+
+        resp = _dispatch("search", {
+            "query": "service X port", "agent_id": "codex", "expand": False,
+        })
+        assert "error" not in resp
+        surfaced = [l["learning_id"] for l in resp["result"]["learnings"]]
+        assert surfaced == [current]
+        with db_obj.cursor() as c:
+            rows = c.execute(
+                "SELECT learning_id FROM learning_reads ORDER BY learning_id"
+            ).fetchall()
+        assert [r["learning_id"] for r in rows] == [current]
 
     def test_search_learnings_records_reads(self, tmp_path):
         """retrieval.search_learnings is a read — it must write learning_reads
@@ -436,6 +536,40 @@ class TestSearchLearningReads:
         assert row["agent_id"] == "codex"
         assert row["source"] == "retrieval.search_learnings"
         assert access["access_count"] == 1
+
+    def test_search_learnings_same_tick_rereads_do_not_drop_tracking(self, tmp_path, monkeypatch):
+        """The learning_reads PK is (learning_id, agent_id, read_at): two
+        searches in the same clock tick collide, and the plain INSERT raised
+        an IntegrityError that the except swallowed — dropped tracking.
+        INSERT OR IGNORE keeps the existing row, the results, and the access
+        bump."""
+        engine, db_obj, cfg = _make_engine(tmp_path)
+        now = time.time()
+        with db_obj.cursor() as c:
+            c.execute(
+                """INSERT INTO learnings (agent_id, category, content, confidence, created_at)
+                   VALUES ('codex', 'fix', 'websocket reconnect needs 500ms backoff', 1.0, ?)""",
+                (now,),
+            )
+            lid = c.lastrowid
+
+        frozen = time.time()
+        monkeypatch.setattr(time, "time", lambda: frozen)
+        first = engine.search_learnings("websocket backoff", agent_id="codex")
+        second = engine.search_learnings("websocket backoff", agent_id="codex")
+        assert [r["learning_id"] for r in first] == [lid]
+        assert [r["learning_id"] for r in second] == [lid]
+
+        with db_obj.cursor() as c:
+            count = c.execute(
+                "SELECT COUNT(*) AS n FROM learning_reads WHERE learning_id = ?",
+                (lid,),
+            ).fetchone()["n"]
+            access = c.execute(
+                "SELECT access_count FROM learnings WHERE learning_id = ?", (lid,)
+            ).fetchone()["access_count"]
+        assert count == 1, "same-instant duplicate read collapses to one row"
+        assert access == 2, "the access bump must survive the PK collision"
 
     def test_search_episodic_no_longer_crashes_on_hits(self, tmp_path):
         """search_episodic previously raised KeyError('learning_id') on any hit."""
@@ -587,36 +721,32 @@ class TestStaleBeliefs:
 class TestEndToEndReinjection:
 
     def test_search_read_then_correction_fires_stale_beliefs(self, tmp_path, monkeypatch):
-        """Full chain for the hook recall path: a learning surfaced via the
-        search RPC (learning:// doc), later superseded, MUST fire
-        stale_beliefs — encoding the operator's 3-hour-loop failure. The read
-        is recorded by dispatching the REAL 'search' RPC (only the retrieval
-        engine is faked), so a regression in the _handle_search →
-        _record_learning_reads_for_search wiring fails here too."""
-        import minnid
+        """Full REAL chain for the hook recall path (no FakeEngine): the
+        belief is surfaced by the production search RPC — the real
+        RetrievalEngine matching the learnings table — which writes the
+        learning_reads row; the belief is then superseded; stale_beliefs MUST
+        fire — encoding the operator's 3-hour-loop failure."""
+        engine, db_obj, cfg = _patch_engine_and_writeback(tmp_path, monkeypatch)
+        belief_id = _insert_learning(
+            db_obj, "service X listens on port 8080",
+            created_at=time.time() - 2 * 86400,
+        )
 
-        wb, db_obj, cfg = _patch_writeback(tmp_path, monkeypatch)
-        now = time.time()
-        with db_obj.cursor() as c:
-            c.execute(
-                """INSERT INTO learnings (agent_id, category, content, confidence, created_at, status)
-                   VALUES ('codex', 'fact', 'service X listens on port 8080', 1.0, ?, 'active')""",
-                (now - 2 * 86400,),
-            )
-            belief_id = c.lastrowid
-
-        # 1. The hook recall path surfaces the belief via the search RPC
-        #    (learning:// doc) — dispatched through _handle_search.
-        class FakeEngine:
-            def retrieve(self, **kwargs):
-                return [{"source": f"learning://{belief_id}", "score": 1.0}]
-
-        monkeypatch.setattr(minnid, "_lazy_retrieval", lambda: FakeEngine())
+        # 1. The hook recall path surfaces the belief via the search RPC; the
+        #    real engine matches the learnings table and records the read.
         searched = _dispatch("search", {
-            "query": "service x port", "agent_id": "codex",
+            "query": "service X port", "agent_id": "codex", "expand": False,
         })
         assert "error" not in searched
-        assert searched["result"]["count"] == 1
+        assert [l["learning_id"] for l in searched["result"]["learnings"]] == [belief_id]
+        with db_obj.cursor() as c:
+            read = c.execute(
+                "SELECT agent_id, source FROM learning_reads WHERE learning_id = ?",
+                (belief_id,),
+            ).fetchone()
+        assert read is not None, "the search RPC must record the learning read"
+        assert read["agent_id"] == "codex"
+        assert read["source"] == "minnid.search"
 
         # 2. The belief is corrected (operator stores a correction).
         resolved = _dispatch("resolve_contradiction", {
@@ -631,6 +761,15 @@ class TestEndToEndReinjection:
         result = subscribed["result"]
         assert result["status"] == "matched"
         assert [e["superseded_learning_id"] for e in result["events"]] == [belief_id]
+
+        # 3b. A new search must never re-surface the superseded belief (and
+        #     therefore never write a fresh read row for it) — the correction
+        #     itself reaches codex via stale_beliefs above.
+        searched_again = _dispatch("search", {
+            "query": "service X port", "agent_id": "codex", "expand": False,
+        })
+        surfaced = [l["learning_id"] for l in searched_again["result"]["learnings"]]
+        assert belief_id not in surfaced
 
         # 4. The CORRECTED TEXT must be reachable via new_learning_id — the
         # production failure was the operator never seeing the new content,
@@ -806,3 +945,88 @@ class TestSubscribeContradictionsParams:
         checked = subscribed["result"]["checked"]
         assert checked["since_ts"] == 0
         assert checked["event_since"] == pytest.approx(now - 30 * 86400, abs=120)
+
+    def test_non_numeric_params_return_invalid_params_error(self, tmp_path, monkeypatch):
+        """Non-numeric since_ts/read_window_hours/event_window_days must be a
+        JSON-RPC -32602, never an unhandled ValueError/TypeError — the float()
+        conversions used to sit outside any try, so {"since_ts": "foo"} killed
+        the whole daemon connection with no error response."""
+        wb, db_obj, cfg = _patch_writeback(tmp_path, monkeypatch)
+        for params in (
+            {"since_ts": "foo"},
+            {"read_window_hours": "foo"},
+            {"event_window_days": "foo"},
+            {"since_ts": [1]},
+            {"read_window_hours": {}},
+            {"event_window_days": [1]},
+        ):
+            resp = _dispatch(
+                "minni_subscribe_contradictions", {"agent_id": "codex", **params}
+            )
+            assert "result" not in resp, f"{params} must not succeed"
+            assert resp["error"]["code"] == -32602, \
+                f"{params} must produce JSON-RPC invalid-params, got {resp['error']}"
+
+
+# ---------------------------------------------------------------------------
+# Real-pipeline integration: engine.retrieve() over a corrections DB
+# ---------------------------------------------------------------------------
+
+class TestRetrieveIntegration:
+
+    def _insert_indexed_doc(self, db_obj, path, page_type, decay_score, content):
+        """A document that is actually retrievable: documents row + vault_fts
+        row (the same dual write the indexer performs)."""
+        now = time.time()
+        doc_id = _insert_document(
+            db_obj, path, page_type,
+            indexed_at=now - 86400, last_accessed=now, access_count=0,
+            decay_score=decay_score,
+        )
+        with db_obj.cursor() as c:
+            c.execute(
+                """INSERT INTO vault_fts (doc_id, path, content, agent, sigil)
+                   VALUES (?, ?, ?, 'test', 'T')""",
+                (doc_id, path, content),
+            )
+        return doc_id
+
+    def test_real_retrieve_correction_outranks_saturated_habitual_hit(self, tmp_path, monkeypatch):
+        """No FakeEngine: the full retrieve() pipeline (FTS → RRF → salience
+        scoring → status filter → formatting) over a DB holding a saturated
+        habitual hit (decay=1.0) and a fresher correction (decay=0.906) must
+        rank the correction first — the audited inversion, end to end. Both
+        docs carry identical FTS content so only decay/salience can decide."""
+        from retrieval import RetrievalEngine
+
+        db_obj, cfg = _make_db(tmp_path, reranker_enabled=False, hyde_enabled=False)
+        monkeypatch.setattr(RetrievalEngine, "model", property(lambda self: None))
+        engine = RetrievalEngine(db_obj, cfg, faiss_index=object())
+
+        text = "service X listens on port 8080 per the runbook"
+        habitual_id = self._insert_indexed_doc(
+            db_obj, "/vault/wiki/concepts/habitual.md", None, 1.0, text)
+        correction_id = self._insert_indexed_doc(
+            db_obj, "/vault/wiki/decisions/correction.md", "correction", 0.906, text)
+
+        results = engine.retrieve(
+            "service X port", limit=5, expand=False, use_hyde=False)
+        assert sorted(r["doc_id"] for r in results) == sorted(
+            [habitual_id, correction_id])
+        assert results[0]["doc_id"] == correction_id, \
+            "fresh correction must outrank the saturated habitual hit"
+        assert results[0]["provenance"]["salience_boost"] == pytest.approx(
+            cfg.correction_salience_boost)
+
+        # Control: with the salience boost zeroed the saturated habitual hit
+        # wins — proving the boost (not FTS tie-break order) flips the result.
+        from config import SovereignConfig
+        cfg_off = SovereignConfig(
+            db_path=cfg.db_path, reranker_enabled=False, hyde_enabled=False,
+            correction_salience_boost=0.0,
+        )
+        engine_off = RetrievalEngine(db_obj, cfg_off, faiss_index=object())
+        results_off = engine_off.retrieve(
+            "service X port", limit=5, expand=False, use_hyde=False)
+        assert results_off[0]["doc_id"] == habitual_id, \
+            "without the boost the decay-saturated habitual hit must win"

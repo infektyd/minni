@@ -384,9 +384,12 @@ class RetrievalEngine:
         rerank_score is a raw logit (can be negative), so the bounded
         multiplicative boost is applied sign-safely: positive logits scale up,
         negative logits shrink toward zero — a correction-class candidate
-        always moves up relative to its raw logit. The rerank cache stores the
-        raw model score BEFORE this adjustment, so cached entries stay
-        model-pure and the boost is re-derived on every call.
+        always moves up relative to its raw logit. A logit of exactly 0.0 is
+        lifted to +boost (a multiplicative boost on zero is a no-op, which
+        would leave the correction tied with zero-logit habitual hits). The
+        rerank cache stores the raw model score BEFORE this adjustment, so
+        cached entries stay model-pure and the boost is re-derived on every
+        call.
         """
         boost = float(self.config.correction_salience_boost)
         if boost <= 0:
@@ -396,9 +399,12 @@ class RetrievalEngine:
             if page_type not in self._correction_types:
                 continue
             score = float(c.get("rerank_score") or 0.0)
-            c["rerank_score"] = (
-                score * (1.0 + boost) if score >= 0 else score / (1.0 + boost)
-            )
+            if score > 0:
+                c["rerank_score"] = score * (1.0 + boost)
+            elif score < 0:
+                c["rerank_score"] = score / (1.0 + boost)
+            else:
+                c["rerank_score"] = boost
             c["salience_boost"] = boost
 
     def _rerank(self, query: str, candidates: List[Dict]) -> List[Dict]:
@@ -635,8 +641,11 @@ class RetrievalEngine:
         boost = 0.0
         # Defensive: merged docs are normally built with `or 1.0` defaults,
         # but an explicit decay_score=None from a downstream caller must not
-        # TypeError inside max().
-        decay = d.get("decay_score") or 1.0
+        # TypeError inside max(). `is not None` (not falsy-or): a legitimate
+        # decay_score of 0.0 must score as fully decayed, not be coerced to 1.0.
+        decay = d.get("decay_score")
+        if decay is None:
+            decay = 1.0
         page_type = str(d.get("page_type") or "").lower()
         if page_type in self._correction_types:
             # Direct field access: correction_salience_boost / _decay_floor are
@@ -2059,8 +2068,14 @@ class RetrievalEngine:
         query: str,
         agent_id: Optional[str] = None,
         limit: int = 10,
+        source: str = "retrieval.search_learnings",
     ) -> List[Dict]:
-        """Search write-back learnings via FTS5."""
+        """Search write-back learnings via FTS5.
+
+        ``source`` labels the learning_reads rows written below, so callers
+        (e.g. the daemon search RPC) can distinguish their read channel in
+        diagnostics.
+        """
         safe_q = self._sanitize_fts_query(query)
         if not safe_q:
             return []
@@ -2109,15 +2124,21 @@ class RetrievalEngine:
                         (now, result["learning_id"]),
                     )
                     try:
+                        # OR IGNORE: two searches in the same clock tick
+                        # collide on the (learning_id, agent_id, read_at) PK;
+                        # the read is already recorded for that instant, so
+                        # the duplicate is dropped instead of raising an
+                        # IntegrityError that the except below would swallow
+                        # as silently dropped tracking.
                         c.execute(
-                            """INSERT INTO learning_reads
+                            """INSERT OR IGNORE INTO learning_reads
                                (learning_id, agent_id, read_at, source)
                                VALUES (?, ?, ?, ?)""",
                             (
                                 result["learning_id"],
                                 agent_id or "unknown",
                                 now,
-                                "retrieval.search_learnings",
+                                source,
                             ),
                         )
                     except Exception as exc:
