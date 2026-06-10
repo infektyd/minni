@@ -7,7 +7,7 @@ import path from "node:path";
 import { URL } from "node:url";
 import { AFM_HEALTH_URL, AFM_PROVIDER_MODE, DEFAULT_AGENT_ID, DEFAULT_VAULT_PATH, DEFAULT_WORKSPACE_ID, SOCKET_PATH } from "./config.js";
 import { resolveAfmProvider, sanitizeAfmHealth, type AfmProviderMode, type AfmProviderResolution } from "./afm.js";
-import { auditTail, ensureVault, recordAudit, vaultExists } from "./vault.js";
+import { auditTail, ensureVault, recordAudit, vaultExists, writeInbox } from "./vault.js";
 import type { VaultSearchResult } from "./vault.js";
 
 export interface JsonResult<T = unknown> {
@@ -304,6 +304,48 @@ export async function subscribeContradictions(
     agent_id: input.agentId,
     since_ts: input.sinceTs,
   }, requester);
+}
+
+/**
+ * hooks-PL-3 shared PreCompact leg, part 1: fetch the current stale-belief /
+ * contradiction events for an agent. Shared by all four hook binaries so the
+ * extraction logic cannot drift one-sided (the repo's #1 bug class).
+ */
+export async function fetchStaleBeliefEvents(
+  agentId: string,
+  requester: JsonRpcRequester = jsonRpcSocketRequest,
+): Promise<{ ok: boolean; events: unknown[]; error?: string }> {
+  const contradictions = await subscribeContradictions({ agentId }, requester);
+  const events =
+    contradictions.ok && Array.isArray((contradictions.data as any)?.events)
+      ? ((contradictions.data as any).events as unknown[])
+      : [];
+  return { ok: contradictions.ok, events, error: contradictions.error };
+}
+
+/**
+ * hooks-PL-3 shared PreCompact leg, part 2 (Claude Code / kilocode): stash
+ * non-empty stale-belief events durably in the vault inbox as a dedicated
+ * "precompact_reassert" entry so the post-compaction boot re-asserts them
+ * (corrections_reassert) even if the daemon is down at next boot. Returns the
+ * inbox path, or undefined when there was nothing to stash. (codex/grok carry
+ * the same stale_belief_events field on their precompact handoff payloads.)
+ */
+export async function stashPrecompactReassert(input: {
+  vaultPath: string;
+  sessionId: string;
+  agentId: string;
+  staleBeliefEvents: unknown[];
+  trigger?: string;
+}): Promise<string | undefined> {
+  if (input.staleBeliefEvents.length === 0) return undefined;
+  const entry = await writeInbox(input.vaultPath, input.sessionId, {
+    kind: "precompact_reassert",
+    agent_id: input.agentId,
+    stale_belief_events: input.staleBeliefEvents,
+    compaction_trigger: input.trigger || "compaction in progress",
+  });
+  return entry.filePath;
 }
 
 export async function jsonRpcSocketRequestWithFallback(method: string, params: Record<string, unknown>): Promise<JsonResult> {

@@ -16,6 +16,7 @@ import { routeMemoryIntent } from "./policy.js";
 import {
   BOOT_RECALL_LAYERS,
   buildStatusReport,
+  fetchStaleBeliefEvents,
   formatRecall,
   readAgentContext,
   recallMemory,
@@ -137,8 +138,9 @@ async function handleSessionStart(payload: Record<string, unknown>): Promise<Hoo
   const handoffContext = await resolveInboxHandoffContext(GROK_VAULT_PATH, pending);
   // Consumed reassert events are cleared so they re-inject exactly once and
   // the inbox does not accumulate stale reassert files across compactions.
-  const correctionsReassert = collectCorrectionsReassert(pending);
-  const clearedReasserts = await clearReassertedInboxEntries(pending);
+  const { events: correctionsReassert, consumedPaths: reassertConsumed } =
+    collectCorrectionsReassert(pending);
+  const clearedReasserts = await clearReassertedInboxEntries(reassertConsumed);
 
   const envelope = wrapEnvelope({
     event: "SessionStart",
@@ -299,11 +301,8 @@ async function handlePreCompact(payload: Record<string, unknown>): Promise<HookO
   // hooks-PL-3: stash current stale-belief/contradiction events with the
   // precompact handoff so the post-compaction boot re-asserts them
   // (corrections_reassert) even if the daemon is down at next boot.
-  const contradictions = await subscribeContradictions({ agentId: GROK_AGENT_ID });
-  const staleBeliefEvents =
-    contradictions.ok && Array.isArray((contradictions.data as any)?.events)
-      ? ((contradictions.data as any).events as unknown[])
-      : [];
+  const { ok: staleBeliefsOk, events: staleBeliefEvents } =
+    await fetchStaleBeliefEvents(GROK_AGENT_ID);
 
   const inbox = await writeInbox(GROK_VAULT_PATH, sessionId, {
     kind: "grok_precompact_handoff",
@@ -341,6 +340,8 @@ async function handlePreCompact(payload: Record<string, unknown>): Promise<HookO
       trigger: transcript || "auto",
       workspace: workspaceId,
       inbox_path: inbox.filePath,
+      stale_belief_events: staleBeliefEvents.length,
+      stale_beliefs_ok: staleBeliefsOk,
     },
   });
 

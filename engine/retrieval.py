@@ -375,6 +375,32 @@ class RetrievalEngine:
 
     # ── Cross-Encoder Re-Ranking ──────────────────────────────
 
+    def _apply_correction_rerank_boost(self, candidates: List[Dict]) -> None:
+        """recall-F3 (reranker leg): propagate the correction salience channel
+        into the cross-encoder ordering. Without this, the boost only lived in
+        final_score and was bypassed whenever reranker_enabled=True (the
+        default) — exactly the warm top-K path the operator cares about.
+
+        rerank_score is a raw logit (can be negative), so the bounded
+        multiplicative boost is applied sign-safely: positive logits scale up,
+        negative logits shrink toward zero — a correction-class candidate
+        always moves up relative to its raw logit. The rerank cache stores the
+        raw model score BEFORE this adjustment, so cached entries stay
+        model-pure and the boost is re-derived on every call.
+        """
+        boost = float(self.config.correction_salience_boost)
+        if boost <= 0:
+            return
+        for c in candidates:
+            page_type = str(c.get("page_type") or "").lower()
+            if page_type not in self._correction_types:
+                continue
+            score = float(c.get("rerank_score") or 0.0)
+            c["rerank_score"] = (
+                score * (1.0 + boost) if score >= 0 else score / (1.0 + boost)
+            )
+            c["salience_boost"] = boost
+
     def _rerank(self, query: str, candidates: List[Dict]) -> List[Dict]:
         """
         Re-rank candidates using a cross-encoder.
@@ -417,6 +443,7 @@ class RetrievalEngine:
         if not missing:
             for i, c in enumerate(candidates):
                 c["rerank_score"] = float(all_scores[i])
+            self._apply_correction_rerank_boost(candidates)
             candidates.sort(key=lambda x: x.get("rerank_score", 0), reverse=True)
             return candidates
 
@@ -443,7 +470,8 @@ class RetrievalEngine:
             for i, c in enumerate(candidates):
                 c["rerank_score"] = float(all_scores[i] or 0.0)
 
-            # Sort by cross-encoder score
+            # Sort by cross-encoder score (correction salience applied first)
+            self._apply_correction_rerank_boost(candidates)
             candidates.sort(key=lambda x: x.get("rerank_score", 0), reverse=True)
         except Exception as e:
             logger.warning("Re-ranking failed: %s — falling back to RRF scores", e)
@@ -600,19 +628,22 @@ class RetrievalEngine:
         can outrank a stale habitual hit whose decay saturated via access
         reinforcement (decay rewards rereads; corrections start unread).
 
-        NOTE (known gap): this boost applies to the RRF/final_score channel
-        only. When the cross-encoder reranker is active, its relevance logits
-        drive the final ordering — correction-class candidates are still
-        boosted INTO the reranker candidate set, but their final rank is
-        logit-driven and may override the boost. The boost is not propagated
-        into rerank_score.
+        When the cross-encoder reranker is active, the boost is also
+        propagated into the logit-driven ordering — see
+        _apply_correction_rerank_boost, called from _rerank.
         """
         boost = 0.0
-        decay = d["decay_score"]
+        # Defensive: merged docs are normally built with `or 1.0` defaults,
+        # but an explicit decay_score=None from a downstream caller must not
+        # TypeError inside max().
+        decay = d.get("decay_score") or 1.0
         page_type = str(d.get("page_type") or "").lower()
         if page_type in self._correction_types:
-            boost = float(getattr(self.config, "correction_salience_boost", 0.25))
-            floor = float(getattr(self.config, "correction_decay_floor", 0.5))
+            # Direct field access: correction_salience_boost / _decay_floor are
+            # SovereignConfig dataclass fields with defaults (config.py); only
+            # correction_class_page_types() tolerates duck-typed configs.
+            boost = float(self.config.correction_salience_boost)
+            floor = float(self.config.correction_decay_floor)
             decay = max(decay, floor)
         d["salience_boost"] = boost
         d["final_score"] = d["rrf_score"] * decay * (1.0 + boost)

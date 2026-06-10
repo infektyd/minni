@@ -15,14 +15,16 @@ import {
 import type { EnvelopeEvent } from "./agent_envelope.js";
 import { routeMemoryIntent } from "./policy.js";
 import {
-  BOOT_RECALL_LAYERS,
   ackHandoff,
+  BOOT_RECALL_LAYERS,
   buildStatusReport,
   extractLearningsSection,
+  fetchStaleBeliefEvents,
   formatRecallLean,
   listPendingHandoffs,
   readAgentContext,
   recallMemory,
+  stashPrecompactReassert,
   subscribeContradictions,
 } from "./sovereign.js";
 import { extractScarTissue, prepareOutcome } from "./task.js";
@@ -143,10 +145,12 @@ async function handleSessionStart(payload: Record<string, unknown>): Promise<Hoo
 
   // hooks-PL-3: re-assert corrections stashed by PreCompact, so the
   // post-compaction boot re-injects them even if the daemon is down now.
-  // Consumed entries are cleared below so they re-inject exactly once and
-  // the inbox does not accumulate stale reassert files across compactions.
-  const correctionsReassert = collectCorrectionsReassert(pending);
-  const clearedReasserts = await clearReassertedInboxEntries(pending);
+  // Only entries whose events were actually consumed are cleared, so they
+  // re-inject exactly once and the inbox does not accumulate stale reassert
+  // files across compactions (all-malformed entries survive for inspection).
+  const { events: correctionsReassert, consumedPaths: reassertConsumed } =
+    collectCorrectionsReassert(pending);
+  const clearedReasserts = await clearReassertedInboxEntries(reassertConsumed);
 
   const envelopeBody: any = {
     contract: MEMORY_CONTRACT,
@@ -365,21 +369,15 @@ async function handlePreCompact(payload: Record<string, unknown>): Promise<HookO
   // can fall out of context. Stash the current stale-belief/contradiction
   // events durably in the inbox so the post-compaction SessionStart re-asserts
   // them (corrections_reassert) even if the daemon is down at next boot.
-  const contradictions = await subscribeContradictions({ agentId: CLAUDECODE_AGENT_ID });
-  const staleBeliefEvents =
-    contradictions.ok && Array.isArray((contradictions.data as any)?.events)
-      ? ((contradictions.data as any).events as unknown[])
-      : [];
-  let reassertInboxPath: string | undefined;
-  if (staleBeliefEvents.length > 0) {
-    const reassert = await writeInbox(CLAUDECODE_VAULT_PATH, sessionId, {
-      kind: "precompact_reassert",
-      agent_id: CLAUDECODE_AGENT_ID,
-      stale_belief_events: staleBeliefEvents,
-      compaction_trigger: transcript || "compaction in progress",
-    });
-    reassertInboxPath = reassert.filePath;
-  }
+  const { ok: staleBeliefsOk, events: staleBeliefEvents } =
+    await fetchStaleBeliefEvents(CLAUDECODE_AGENT_ID);
+  const reassertInboxPath = await stashPrecompactReassert({
+    vaultPath: CLAUDECODE_VAULT_PATH,
+    sessionId,
+    agentId: CLAUDECODE_AGENT_ID,
+    staleBeliefEvents,
+    trigger: transcript,
+  });
 
   await recordAudit(CLAUDECODE_VAULT_PATH, {
     tool: "hook_pre_compact",
@@ -388,7 +386,7 @@ async function handlePreCompact(payload: Record<string, unknown>): Promise<HookO
       scar_count: scarTissue.length,
       trigger: transcript || "auto",
       stale_belief_events: staleBeliefEvents.length,
-      stale_beliefs_ok: contradictions.ok,
+      stale_beliefs_ok: staleBeliefsOk,
       ...(reassertInboxPath ? { reassert_inbox_path: reassertInboxPath } : {}),
     },
   });

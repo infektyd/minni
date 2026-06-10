@@ -206,6 +206,69 @@ class TestCorrectionSalience:
         assert merged[0]["doc_id"] == 2
         assert {d["doc_id"]: d for d in merged}[2]["salience_boost"] == pytest.approx(0.25)
 
+    def test_score_merged_doc_tolerates_explicit_none_decay(self, tmp_path):
+        """A merged doc carrying decay_score=None (e.g. from a downstream
+        caller) must score with the 1.0 default, not TypeError in max()."""
+        engine, db_obj, cfg = _make_engine(tmp_path)
+        d = _rrf_doc(4, "correction", None)
+        d["rrf_score"] = 0.5
+        engine._score_merged_doc(d)
+        assert d["final_score"] == pytest.approx(
+            0.5 * 1.0 * (1 + cfg.correction_salience_boost)
+        )
+        plain = _rrf_doc(5, "concept", None)
+        plain["rrf_score"] = 0.5
+        engine._score_merged_doc(plain)
+        assert plain["final_score"] == pytest.approx(0.5)
+
+    def test_reranker_propagates_correction_boost(self, tmp_path):
+        """recall-F3 reranker leg: with the cross-encoder active the final
+        ordering is logit-driven — the salience boost must reach rerank_score
+        or the whole fix is bypassed on the default reranker_enabled=True
+        path."""
+        engine, db_obj, cfg = _make_engine(tmp_path)
+
+        class FakeReranker:
+            model_name = "fake-ce"
+
+            def predict(self, pairs):
+                # habitual hit scores slightly above the correction raw.
+                return [1.0, 0.9]
+
+        engine._reranker = FakeReranker()
+        habitual = _rrf_doc(1, "concept", 1.0)
+        correction = _rrf_doc(2, "correction", 1.0)
+        ranked = engine._rerank("service x port", [habitual, correction])
+        assert ranked[0]["doc_id"] == 2, \
+            "boosted correction logit must outrank the slightly-higher habitual logit"
+        assert ranked[0]["rerank_score"] == pytest.approx(
+            0.9 * (1 + cfg.correction_salience_boost)
+        )
+        assert ranked[0]["salience_boost"] == pytest.approx(cfg.correction_salience_boost)
+        # the non-correction logit is untouched
+        assert {d["doc_id"]: d for d in ranked}[1]["rerank_score"] == pytest.approx(1.0)
+
+    def test_reranker_boost_is_sign_safe_for_negative_logits(self, tmp_path):
+        """Cross-encoder logits can be negative; a multiplicative boost on a
+        negative logit would DEMOTE the correction. The boost must move a
+        correction up regardless of logit sign."""
+        engine, db_obj, cfg = _make_engine(tmp_path)
+
+        class FakeReranker:
+            model_name = "fake-ce"
+
+            def predict(self, pairs):
+                return [-0.9, -1.0]
+
+        engine._reranker = FakeReranker()
+        habitual = _rrf_doc(1, "concept", 1.0)
+        correction = _rrf_doc(2, "correction", 1.0)
+        ranked = engine._rerank("service x port", [habitual, correction])
+        assert ranked[0]["doc_id"] == 2
+        assert ranked[0]["rerank_score"] == pytest.approx(
+            -1.0 / (1 + cfg.correction_salience_boost)
+        )
+
 
 # ---------------------------------------------------------------------------
 # recall-F4 — decay grace window + floor
@@ -315,6 +378,33 @@ class TestSearchLearningReads:
         assert [(r["learning_id"], r["agent_id"], r["source"]) for r in rows] == [
             (7, "codex", "minnid.search"),
             (9, "codex", "minnid.search"),
+        ]
+
+    def test_search_dispatch_records_learning_reads(self, tmp_path, monkeypatch):
+        """The production wiring, not the helper: dispatching the 'search'
+        RPC through _handle_search must write learning_reads for learning://
+        results. Guards against the call site being moved, renamed, or gated
+        behind a flag while the direct-call test above keeps passing."""
+        import minnid
+
+        wb, db_obj, cfg = _patch_writeback(tmp_path, monkeypatch)
+
+        class FakeEngine:
+            def retrieve(self, **kwargs):
+                return [{"source": "learning://7", "score": 1.0}]
+
+        monkeypatch.setattr(minnid, "_lazy_retrieval", lambda: FakeEngine())
+
+        resp = _dispatch("search", {"query": "service x port", "agent_id": "codex"})
+        assert "error" not in resp
+        assert resp["result"]["count"] == 1
+
+        with db_obj.cursor() as c:
+            rows = c.execute(
+                "SELECT learning_id, agent_id, source FROM learning_reads"
+            ).fetchall()
+        assert [(r["learning_id"], r["agent_id"], r["source"]) for r in rows] == [
+            (7, "codex", "minnid.search"),
         ]
 
     def test_search_learnings_records_reads(self, tmp_path):
@@ -499,8 +589,11 @@ class TestEndToEndReinjection:
     def test_search_read_then_correction_fires_stale_beliefs(self, tmp_path, monkeypatch):
         """Full chain for the hook recall path: a learning surfaced via the
         search RPC (learning:// doc), later superseded, MUST fire
-        stale_beliefs — encoding the operator's 3-hour-loop failure."""
-        from minnid import _record_learning_reads_for_search
+        stale_beliefs — encoding the operator's 3-hour-loop failure. The read
+        is recorded by dispatching the REAL 'search' RPC (only the retrieval
+        engine is faked), so a regression in the _handle_search →
+        _record_learning_reads_for_search wiring fails here too."""
+        import minnid
 
         wb, db_obj, cfg = _patch_writeback(tmp_path, monkeypatch)
         now = time.time()
@@ -512,10 +605,18 @@ class TestEndToEndReinjection:
             )
             belief_id = c.lastrowid
 
-        # 1. The hook recall path surfaces the belief via search (learning:// doc).
-        _record_learning_reads_for_search(
-            "codex", [{"source": f"learning://{belief_id}"}]
-        )
+        # 1. The hook recall path surfaces the belief via the search RPC
+        #    (learning:// doc) — dispatched through _handle_search.
+        class FakeEngine:
+            def retrieve(self, **kwargs):
+                return [{"source": f"learning://{belief_id}", "score": 1.0}]
+
+        monkeypatch.setattr(minnid, "_lazy_retrieval", lambda: FakeEngine())
+        searched = _dispatch("search", {
+            "query": "service x port", "agent_id": "codex",
+        })
+        assert "error" not in searched
+        assert searched["result"]["count"] == 1
 
         # 2. The belief is corrected (operator stores a correction).
         resolved = _dispatch("resolve_contradiction", {
@@ -627,6 +728,71 @@ class TestSubscribeContradictionsParams:
         assert checked["since_ts"] <= now + 120
         # event_since stays within the clamped window (never full-history 0).
         assert checked["event_since"] >= now - 365 * 86400 - 120
+
+    def test_event_window_zero_is_honored_not_coerced(self, tmp_path, monkeypatch):
+        """event_window_days=0 means 'no historic events' — the old falsy-or
+        guard silently substituted 30 (mirror of the read_window_hours=0
+        fix; the docstring's [0, 365] clamp must actually reach 0)."""
+        wb, db_obj, cfg = _patch_writeback(tmp_path, monkeypatch)
+        self._seed_corrected_belief(db_obj)
+
+        subscribed = _dispatch("minni_subscribe_contradictions", {
+            "agent_id": "codex",
+            "event_window_days": 0,
+        })
+        result = subscribed["result"]
+        assert result["events"] == []
+        assert result["status"] == "checked_no_match"
+        assert result["checked"]["event_window_days"] == 0
+
+    def test_nan_since_ts_does_not_suppress_matches(self, tmp_path, monkeypatch):
+        """NaN since_ts is truthy (survives the falsy-or) and makes every SQL
+        comparison false — a poisoned query returned the same
+        checked_no_match shape as a genuinely empty table, defeating the
+        hooks-PL-1 discriminator. Non-finite falls back to the default 0."""
+        wb, db_obj, cfg = _patch_writeback(tmp_path, monkeypatch)
+        belief_id = self._seed_corrected_belief(db_obj)
+
+        subscribed = _dispatch("minni_subscribe_contradictions", {
+            "agent_id": "codex",
+            "since_ts": float("nan"),
+        })
+        result = subscribed["result"]
+        assert result["status"] == "matched"
+        assert [e["superseded_learning_id"] for e in result["events"]] == [belief_id]
+
+    def test_nan_event_window_does_not_bypass_dos_cap(self, tmp_path, monkeypatch):
+        """min/max do not clamp NaN: a NaN event_window_days collapsed
+        event_since to 0.0 (max(0.0, nan) is 0.0 in CPython) — the exact
+        full-history scan the cap was introduced to block. Non-finite falls
+        back to the default 30-day window."""
+        wb, db_obj, cfg = _patch_writeback(tmp_path, monkeypatch)
+        self._seed_corrected_belief(db_obj)
+        now = time.time()
+
+        for poisoned in (float("nan"), float("inf"), "nan"):
+            subscribed = _dispatch("minni_subscribe_contradictions", {
+                "agent_id": "codex",
+                "event_window_days": poisoned,
+            })
+            checked = subscribed["result"]["checked"]
+            assert checked["event_window_days"] == 30.0
+            assert checked["event_since"] == pytest.approx(now - 30 * 86400, abs=120)
+
+    def test_nan_read_window_falls_back_to_default(self, tmp_path, monkeypatch):
+        """A non-finite read_window_hours must behave like the default (no
+        read-recency filter), not poison read_since."""
+        wb, db_obj, cfg = _patch_writeback(tmp_path, monkeypatch)
+        belief_id = self._seed_corrected_belief(db_obj)
+
+        subscribed = _dispatch("minni_subscribe_contradictions", {
+            "agent_id": "codex",
+            "read_window_hours": float("nan"),
+        })
+        result = subscribed["result"]
+        assert result["status"] == "matched"
+        assert [e["superseded_learning_id"] for e in result["events"]] == [belief_id]
+        assert result["checked"]["read_window_hours"] is None
 
     def test_since_ts_zero_is_capped_to_event_window(self, tmp_path, monkeypatch):
         """since_ts=0 does NOT mean all-history: the 30-day default window is

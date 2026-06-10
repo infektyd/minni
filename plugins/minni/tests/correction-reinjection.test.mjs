@@ -107,7 +107,7 @@ test("extractLearningsSection handles missing input without throwing", () => {
 // ---------------------------------------------------------------------------
 
 test("collectCorrectionsReassert gathers stashed stale-belief events from inbox entries", () => {
-  const events = collectCorrectionsReassert([
+  const { events } = collectCorrectionsReassert([
     {
       payload: {
         kind: "precompact_reassert",
@@ -137,7 +137,7 @@ test("collectCorrectionsReassert gathers stashed stale-belief events from inbox 
 });
 
 test("collectCorrectionsReassert drops malformed events (inbox is untrusted local input)", () => {
-  const events = collectCorrectionsReassert([
+  const { events } = collectCorrectionsReassert([
     {
       payload: {
         kind: "precompact_reassert",
@@ -184,10 +184,73 @@ test("collectCorrectionsReassert caps total re-asserted events", () => {
     superseded_learning_id: i + 1,
     new_learning_id: i + 1000,
   }));
-  const events = collectCorrectionsReassert([
-    { payload: { kind: "precompact_reassert", stale_belief_events: flood } },
+  const { events, consumedPaths } = collectCorrectionsReassert([
+    {
+      payload: { kind: "precompact_reassert", stale_belief_events: flood },
+      filePath: "/inbox/flood.json",
+    },
   ]);
   assert.equal(events.length, CORRECTIONS_REASSERT_MAX);
+  // The entry contributed events, so it is consumed (its overflow is
+  // discarded with a warning — bounded injection wins over completeness).
+  assert.deepEqual(consumedPaths, ["/inbox/flood.json"]);
+});
+
+test("collectCorrectionsReassert consumption contract: malformed-only entries survive, empty entries are consumed", () => {
+  const valid = { event_id: 1, superseded_learning_id: 7, new_learning_id: 9 };
+  const { events, consumedPaths } = collectCorrectionsReassert([
+    // all events fail the schema gate → NOT consumed (clearing would silently
+    // destroy the stashed correction with zero injection)
+    {
+      payload: {
+        kind: "precompact_reassert",
+        stale_belief_events: [{ event_id: "1", superseded_learning_id: 7, new_learning_id: 9 }],
+      },
+      filePath: "/inbox/all-malformed.json",
+    },
+    // empty stash (codex/grok write unconditionally) → consumed, or it would
+    // accumulate one inbox file per compaction cycle
+    {
+      payload: { kind: "codex_precompact_handoff", stale_belief_events: [] },
+      filePath: "/inbox/empty-events.json",
+    },
+    // normal entry → consumed
+    {
+      payload: { kind: "precompact_reassert", stale_belief_events: [valid] },
+      filePath: "/inbox/good.json",
+    },
+  ]);
+  assert.deepEqual(events, [valid]);
+  assert.deepEqual(consumedPaths, ["/inbox/empty-events.json", "/inbox/good.json"]);
+});
+
+test("collectCorrectionsReassert defers cap-starved entries to the next boot instead of losing them", () => {
+  const mkEvents = (start, n) =>
+    Array.from({ length: n }, (_, i) => ({
+      event_id: start + i,
+      superseded_learning_id: start + i,
+      new_learning_id: start + i + 1000,
+    }));
+  const { events, consumedPaths } = collectCorrectionsReassert([
+    // fills 8 of the 10 slots → consumed
+    {
+      payload: { kind: "precompact_reassert", stale_belief_events: mkEvents(1, 8) },
+      filePath: "/inbox/file1.json",
+    },
+    // contributes 2, loses 6 to the cap → consumed (warned)
+    {
+      payload: { kind: "precompact_reassert", stale_belief_events: mkEvents(100, 8) },
+      filePath: "/inbox/file2.json",
+    },
+    // cap already full before it contributes anything → NOT consumed; it
+    // re-injects on the next boot instead of being silently destroyed
+    {
+      payload: { kind: "precompact_reassert", stale_belief_events: mkEvents(200, 3) },
+      filePath: "/inbox/file3.json",
+    },
+  ]);
+  assert.equal(events.length, CORRECTIONS_REASSERT_MAX);
+  assert.deepEqual(consumedPaths, ["/inbox/file1.json", "/inbox/file2.json"]);
 });
 
 // ---------------------------------------------------------------------------
@@ -366,7 +429,7 @@ const STALE_BELIEF_EVENT = {
   created_at: 1750000000,
 };
 
-function startFakeDaemon(socketPath, calls) {
+function startFakeDaemon(socketPath, calls, opts = {}) {
   const server = net.createServer((socket) => {
     let buffer = "";
     socket.on("data", (chunk) => {
@@ -415,18 +478,33 @@ function startFakeDaemon(socketPath, calls) {
           respond({ handoffs: [] });
           break;
         case "minni_subscribe_contradictions":
-          respond({
-            agent_id: request.params.agent_id,
-            events: [STALE_BELIEF_EVENT],
-            status: "matched",
-            checked: {
-              contradiction_events_in_window: 1,
-              learning_reads_for_agent: 3,
-              event_window_days: 30,
-              read_window_hours: null,
-              since_ts: 0,
-            },
-          });
+          respond(
+            opts.emptyStaleBeliefs
+              ? {
+                  agent_id: request.params.agent_id,
+                  events: [],
+                  status: "checked_no_match",
+                  checked: {
+                    contradiction_events_in_window: 0,
+                    learning_reads_for_agent: 0,
+                    event_window_days: 30,
+                    read_window_hours: null,
+                    since_ts: 0,
+                  },
+                }
+              : {
+                  agent_id: request.params.agent_id,
+                  events: [STALE_BELIEF_EVENT],
+                  status: "matched",
+                  checked: {
+                    contradiction_events_in_window: 1,
+                    learning_reads_for_agent: 3,
+                    event_window_days: 30,
+                    read_window_hours: null,
+                    since_ts: 0,
+                  },
+                },
+          );
           break;
         default:
           respond({ ok: true });
@@ -514,12 +592,12 @@ function runHook(event, env, payload = {}, bin = "hook.js") {
   });
 }
 
-async function bootFixture(t, hook) {
+async function bootFixture(t, hook, opts = {}) {
   const home = await mkdtemp(path.join(tmpdir(), "sm-home-"));
   const vault = await mkdtemp(path.join(tmpdir(), `sm-${hook.name}-vault-`));
   const socketPath = path.join(home, "minnid.sock");
   const calls = [];
-  const server = await startFakeDaemon(socketPath, calls);
+  const server = await startFakeDaemon(socketPath, calls, opts);
   t.after(async () => {
     server.close();
     await rm(home, { recursive: true, force: true });
@@ -631,6 +709,67 @@ for (const hook of HOOK_MATRIX) {
       secondBody.corrections_reassert,
       undefined,
       "re-assertion must happen exactly once per stash",
+    );
+  });
+
+  test(`[${hook.name}] PreCompact with ZERO stale events does not pollute or accumulate inbox`, async (t) => {
+    const { env, vault } = await bootFixture(t, hook, { emptyStaleBeliefs: true });
+    const { readdir } = await import("node:fs/promises");
+    const inboxDir = path.join(vault, "inbox");
+
+    // CC/kilocode write the dedicated reassert entry only when there is
+    // something to stash; codex/grok write their precompact handoff
+    // unconditionally (it carries scar tissue etc.) with an empty
+    // stale_belief_events array.
+    const writesUnconditionalHandoff = hook.bin === "codex-hook.js" || hook.bin === "grok-hook.js";
+    await runHook("PreCompact", env, { trigger: "auto" }, hook.bin);
+    const afterPreCompact = (await readdir(inboxDir)).filter((f) => f.endsWith(".json"));
+    assert.equal(
+      afterPreCompact.length,
+      writesUnconditionalHandoff ? 1 : 0,
+      "zero-event PreCompact must not write a dedicated reassert entry",
+    );
+
+    // Post-compaction boot: nothing to re-assert, and the empty-events
+    // handoff entry (codex/grok) must be cleared, NOT left to accumulate one
+    // file per compaction cycle.
+    const boot = await runHook("SessionStart", env, {}, hook.bin);
+    const body = envelopeJson(boot.hookSpecificOutput.additionalContext);
+    assert.equal(body.corrections_reassert, undefined, "no events → no corrections_reassert");
+    const afterBoot = (await readdir(inboxDir)).filter((f) => f.endsWith(".json"));
+    assert.deepEqual(afterBoot, [], "empty-events inbox entries must be cleared at boot");
+  });
+
+  test(`[${hook.name}] boot does NOT clear an inbox stash whose events all fail the schema gate`, async (t) => {
+    const { env, vault } = await bootFixture(t, hook);
+    const { readdir, writeFile: wf, mkdir: mkd } = await import("node:fs/promises");
+    const inboxDir = path.join(vault, "inbox");
+    await mkd(inboxDir, { recursive: true });
+    const poisoned = path.join(inboxDir, "2026-06-10-poisoned.json");
+    await wf(
+      poisoned,
+      JSON.stringify({
+        slug: "poisoned",
+        createdAt: new Date().toISOString(),
+        kind: "precompact_reassert",
+        stale_belief_events: [
+          { event_id: "not-an-int", superseded_learning_id: 7, new_learning_id: 9 },
+        ],
+      }),
+      "utf8",
+    );
+
+    const boot = await runHook("SessionStart", env, {}, hook.bin);
+    const body = envelopeJson(boot.hookSpecificOutput.additionalContext);
+    assert.equal(
+      body.corrections_reassert,
+      undefined,
+      "malformed events must not be injected",
+    );
+    const afterBoot = (await readdir(inboxDir)).filter((f) => f.endsWith(".json"));
+    assert.ok(
+      afterBoot.includes("2026-06-10-poisoned.json"),
+      "an all-malformed stash must survive the clear (deleting it would silently destroy the correction)",
     );
   });
 }

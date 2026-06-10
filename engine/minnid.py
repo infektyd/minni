@@ -58,6 +58,7 @@ import argparse
 import asyncio
 import json
 import logging
+import math
 import os
 import re
 import hashlib
@@ -1876,9 +1877,18 @@ def _handle_subscribe_contradictions(params: dict, request_id: Any) -> dict:
                           effective lower bound is echoed back as
                           checked.event_since so callers can detect clamping.
       event_window_days   Boot-noise bound, default 30, clamped to [0, 365].
+                          An explicit 0 is honored (no historic events), not
+                          coerced to the default.
       read_window_hours   Optional read-recency filter; 0 means "no reads
                           qualify" (an explicit zero is honored, not coerced
                           to the default). Clamped to [0, 8760].
+
+    Non-finite values (NaN/Inf) for any of the three are rejected and replaced
+    with the parameter's default: NaN poisons min/max clamping (min(nan, x) is
+    nan in CPython), which would either bypass the event-window DoS cap
+    (event_since collapsing to 0 → full-history scan) or make the SQL
+    comparison silently match nothing — defeating the hooks-PL-1
+    checked/no-match discriminator.
     """
     # G11 / RCM-003/009: EffectivePrincipal stamp + mismatch guard (closes last model-facing agent_id surfaces)
     # Model-supplied agent_id is NEVER trusted; use stamped principal.agent_id for queries.
@@ -1893,6 +1903,10 @@ def _handle_subscribe_contradictions(params: dict, request_id: Any) -> dict:
     if not agent_id:
         return _make_error(-32602, "agent_id is required", request_id)
     since_ts = float(params.get("since_ts", 0) or 0)
+    if not math.isfinite(since_ts):
+        # NaN survives the falsy-or (it is truthy) and turns every SQL
+        # comparison false — events:[] would masquerade as checked_no_match.
+        since_ts = 0.0
     now = time.time()
     # Clamp caller-supplied bounds (local-DoS guard): a huge event window or a
     # far-future since_ts must not force a full-history scan / nonsense JOIN
@@ -1914,13 +1928,28 @@ def _handle_subscribe_contradictions(params: dict, request_id: Any) -> dict:
     if read_window_hours_param is not None:
         # No falsy-or fallback: an explicit 0 means "no reads qualify" and
         # must not be silently coerced to the 24h default.
-        read_window_hours = min(max(float(read_window_hours_param), 0.0), 8760.0)
-        read_since = now - read_window_hours * 3600
+        read_window_hours = float(read_window_hours_param)
+        if not math.isfinite(read_window_hours):
+            # NaN bypasses min/max clamping; fall back to the default
+            # (no read-recency filter) instead of a poisoned read_since.
+            read_window_hours = None
+        else:
+            read_window_hours = min(max(read_window_hours, 0.0), 8760.0)
+            read_since = now - read_window_hours * 3600
 
     # Bound boot-time noise: with since_ts unset, only surface events from the
     # last event_window_days (default 30) instead of the full history. This is
     # a HARD CAP: since_ts=0 does not mean "all history" (see docstring).
-    event_window_days = float(params.get("event_window_days", 30) or 30)
+    # No falsy-or fallback (mirrors read_window_hours): an explicit 0 means
+    # "no historic events" and must not be silently coerced to 30.
+    event_window_days_param = params.get("event_window_days")
+    event_window_days = (
+        30.0 if event_window_days_param is None else float(event_window_days_param)
+    )
+    if not math.isfinite(event_window_days):
+        # NaN bypasses min/max clamping and would collapse event_since to 0
+        # (full-history scan) — exactly the local DoS this cap blocks.
+        event_window_days = 30.0
     event_window_days = min(max(event_window_days, 0.0), 365.0)
     event_since = max(since_ts, now - event_window_days * 86400)
 

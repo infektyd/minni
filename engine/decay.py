@@ -42,8 +42,11 @@ class MemoryDecay:
         # beliefs whose decay saturates at 1.0 via access reinforcement.
         # Shared helper (config.py) — same set retrieval.py boosts on.
         correction_types = correction_class_page_types(self.config)
-        grace_sec = float(getattr(self.config, "correction_decay_grace_days", 7.0)) * 86400
-        correction_floor = float(getattr(self.config, "correction_decay_floor", 0.5))
+        # Direct field access: these are SovereignConfig dataclass fields with
+        # defaults (config.py); only correction_class_page_types() tolerates
+        # duck-typed configs.
+        grace_sec = float(self.config.correction_decay_grace_days) * 86400
+        correction_floor = float(self.config.correction_decay_floor)
         stats = {"updated": 0, "reinforced": 0}
 
         with self.db.transaction() as c:
