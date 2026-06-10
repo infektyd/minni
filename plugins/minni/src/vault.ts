@@ -282,6 +282,25 @@ async function listMarkdownFiles(root: string): Promise<string[]> {
   return files.flat();
 }
 
+// recall-F3 mirror (audit cluster C1): correction-class note types — must stay
+// in sync with engine/config.py correction_page_types and the bounded
+// multiplicative boost applied in engine/retrieval.py _score_merged_doc.
+const CORRECTION_CLASS_TYPES = new Set([
+  "correction",
+  "contradiction",
+  "decision",
+  "fix",
+]);
+const CORRECTION_SALIENCE_BOOST = 0.25;
+
+function frontmatterField(markdown: string, key: string): string | undefined {
+  const fm = markdown.match(/^---\n([\s\S]*?)\n---/);
+  if (!fm) return undefined;
+  const line = fm[1].match(new RegExp(`^${key}:[ \\t]*(.+)$`, "m"));
+  const value = line?.[1]?.trim().replace(/^["']|["']$/g, "");
+  return value || undefined;
+}
+
 function scoreVaultNote(
   query: string,
   terms: string[],
@@ -289,6 +308,15 @@ function scoreVaultNote(
   title: string,
   markdown: string,
 ): number {
+  // PR-2 status mirror: the engine's retrieval skips superseded/rejected/
+  // expired pages by default (retrieval.py _SKIP_STATUSES); the vault-side
+  // search previously kept re-surfacing corrected-away beliefs forever.
+  const status = frontmatterField(markdown, "status")?.toLowerCase();
+  if (status === "superseded" || status === "rejected" || status === "expired") {
+    return 0;
+  }
+  if (frontmatterField(markdown, "superseded_by")) return 0;
+
   const haystack = `${title}\n${relativePath}\n${markdown}`.toLowerCase();
   const titleLower = title.toLowerCase();
   const queryLower = query.toLowerCase().trim();
@@ -301,6 +329,13 @@ function scoreVaultNote(
   }
   if (relativePath.startsWith("wiki/sessions/")) score += 1;
   if (/minni_learning:\s*true/i.test(markdown)) score += 2;
+
+  // recall-F3 mirror: bounded salience boost so a fresh correction can
+  // outrank a stale habitual hit (same 1 + boost factor as the engine).
+  const pageType = frontmatterField(markdown, "type")?.toLowerCase();
+  if (pageType && CORRECTION_CLASS_TYPES.has(pageType)) {
+    score *= 1 + CORRECTION_SALIENCE_BOOST;
+  }
   return score;
 }
 
@@ -911,6 +946,24 @@ export async function readPendingInbox(
     }
   }
   return entries;
+}
+
+/**
+ * hooks-PL-3: collect correction/contradiction events stashed by PreCompact
+ * into the inbox so post-compaction boots re-assert them even when the daemon
+ * is unreachable at SessionStart. Field-driven (stale_belief_events) rather
+ * than kind-driven, so both the dedicated "precompact_reassert" entries
+ * (Claude Code) and the codex/grok precompact handoff payloads contribute.
+ */
+export function collectCorrectionsReassert(
+  pending: Array<{ payload: Record<string, unknown> }>,
+): unknown[] {
+  const events: unknown[] = [];
+  for (const entry of pending) {
+    const stashed = entry.payload.stale_belief_events;
+    if (Array.isArray(stashed)) events.push(...stashed);
+  }
+  return events;
 }
 
 function normalizeWikilinkRef(ref: string): string {

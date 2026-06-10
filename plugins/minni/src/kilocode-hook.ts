@@ -14,9 +14,13 @@ import {
 import type { EnvelopeEvent } from "./agent_envelope.js";
 import { routeMemoryIntent } from "./policy.js";
 import {
+  BOOT_RECALL_LAYERS,
   buildStatusReport,
+  extractLearningsSection,
   formatRecall,
+  readAgentContext,
   recallMemory,
+  subscribeContradictions,
 } from "./sovereign.js";
 import { extractScarTissue, prepareOutcome } from "./task.js";
 import {
@@ -91,13 +95,22 @@ async function handleSessionStart(payload: Record<string, unknown>): Promise<Hoo
   await ensureVault(KILOCODE_VAULT_PATH);
   const status = await buildStatusReport({ vaultPath: KILOCODE_VAULT_PATH });
   const tail = await auditTail(KILOCODE_VAULT_PATH, 5);
+  // recall-F1: boot recall previously whitelisted layers=['identity'], which
+  // dropped knowledge-layer corrections before rerank. Widen to the
+  // correction-bearing layers (single query; the engine's correction salience
+  // floor ranks fresh corrections above saturated habitual hits) instead of a
+  // second corrections-only round-trip. See BOOT_RECALL_LAYERS for the policy.
   const recall = await recallMemory({
     query: `boot identity for ${KILOCODE_WORKSPACE_ID}`,
-    layer: "identity",
-    limit: 4,
+    layers: BOOT_RECALL_LAYERS,
+    limit: 8,
     agentId: KILOCODE_AGENT_ID,
     workspaceId: KILOCODE_WORKSPACE_ID,
   });
+  // hooks-PL-2 leg (a): 'read' is the recency-ordered learning surface AND the
+  // daemon path that records learning_reads, which stale_beliefs matches on.
+  const recentLearnings = await readAgentContext({ agentId: KILOCODE_AGENT_ID, limit: 8 });
+  const contradictions = await subscribeContradictions({ agentId: KILOCODE_AGENT_ID });
   const pending = await readPendingInbox(KILOCODE_VAULT_PATH, 3);
   const handoffContext = await resolveInboxHandoffContext(KILOCODE_VAULT_PATH, pending);
 
@@ -128,6 +141,12 @@ async function handleSessionStart(payload: Record<string, unknown>): Promise<Hoo
         path: snippet.relativePath,
         snippet: snippet.snippet,
       })),
+      // hooks-PL-1: discriminated stale-belief payload (matched /
+      // checked_no_match from the daemon; explicit error here).
+      stale_beliefs:
+        contradictions.ok && contradictions.data
+          ? contradictions.data
+          : { ok: false, status: "error", error: contradictions.error },
       recall:
         recall.ok && recall.data
           ? {
@@ -135,8 +154,18 @@ async function handleSessionStart(payload: Record<string, unknown>): Promise<Hoo
               results: recall.data.results,
               agent_origin: recall.data.agent_id ?? KILOCODE_AGENT_ID,
               layer: recall.data.layer,
+              layers: BOOT_RECALL_LAYERS,
             }
           : { ok: false, error: recall.error },
+      recent_learnings:
+        recentLearnings.ok && recentLearnings.data?.context
+          ? {
+              ok: true,
+              context:
+                extractLearningsSection(recentLearnings.data.context) ??
+                "No recent learnings.",
+            }
+          : { ok: false, error: recentLearnings.error },
       audit_tail: tail.entries.slice(-5).map((entry) => entry.split("\n")[0]),
     },
   });
@@ -340,15 +369,20 @@ async function main(): Promise<void> {
     const output = await dispatch(event, payload);
     emit(output);
   } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
     try {
       await recordAudit(KILOCODE_VAULT_PATH, {
         tool: "hook_error",
-        summary: `${event}: ${error instanceof Error ? error.message : String(error)}`,
+        summary: `${event}: ${message}`,
       });
     } catch {
-      // last-resort swallow
+      // audit unavailable; the systemMessage below still surfaces the failure
     }
-    emit({ continue: true });
+    // hooks-PL-5: a degraded boot must never look like a clean one — say so.
+    emit({
+      continue: true,
+      systemMessage: `Minni hook degraded (${event}): ${message} — memory injection skipped this event; see vault log.md.`,
+    });
   }
 }
 

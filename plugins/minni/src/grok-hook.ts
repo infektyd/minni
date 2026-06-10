@@ -18,10 +18,12 @@ import {
   formatRecall,
   readAgentContext,
   recallMemory,
+  subscribeContradictions,
 } from "./sovereign.js";
 import { extractScarTissue, prepareOutcome } from "./task.js";
 import {
   auditTail,
+  collectCorrectionsReassert,
   ensureVault,
   readPendingInbox,
   recordAudit,
@@ -111,13 +113,17 @@ async function handleSessionStart(payload: Record<string, unknown>): Promise<Hoo
   const workspaceId = workspaceFromPayload(payload);
   await ensureVault(GROK_VAULT_PATH);
 
-  const [status, tail, identityRead, pending] = await Promise.all([
+  const [status, tail, identityRead, pending, contradictions] = await Promise.all([
     buildStatusReport({ vaultPath: GROK_VAULT_PATH }),
     auditTail(GROK_VAULT_PATH, 5),
     readAgentContext({ agentId: GROK_AGENT_ID, limit: 8 }),
     readPendingInbox(GROK_VAULT_PATH, 3),
+    // hooks-PL-2/PL-3: corrections to beliefs this agent read must re-surface
+    // at boot (stale_beliefs), mirroring the Claude Code hook.
+    subscribeContradictions({ agentId: GROK_AGENT_ID }),
   ]);
   const handoffContext = await resolveInboxHandoffContext(GROK_VAULT_PATH, pending);
+  const correctionsReassert = collectCorrectionsReassert(pending);
 
   const envelope = wrapEnvelope({
     event: "SessionStart",
@@ -147,6 +153,15 @@ async function handleSessionStart(payload: Record<string, unknown>): Promise<Hoo
         path: snippet.relativePath,
         snippet: snippet.snippet,
       })),
+      // hooks-PL-1: discriminated stale-belief payload (matched /
+      // checked_no_match from the daemon; explicit error here).
+      stale_beliefs:
+        contradictions.ok && contradictions.data
+          ? contradictions.data
+          : { ok: false, status: "error", error: contradictions.error },
+      ...(correctionsReassert.length > 0
+        ? { corrections_reassert: correctionsReassert }
+        : {}),
       layer1_source:
         identityRead.ok && identityRead.data?.context
           ? {
@@ -254,11 +269,21 @@ async function handlePreCompact(payload: Record<string, unknown>): Promise<HookO
   const workspaceId = workspaceFromPayload(payload);
   const transcript = asString(payload.trigger) || asString(payload.summary);
 
+  // hooks-PL-3: stash current stale-belief/contradiction events with the
+  // precompact handoff so the post-compaction boot re-asserts them
+  // (corrections_reassert) even if the daemon is down at next boot.
+  const contradictions = await subscribeContradictions({ agentId: GROK_AGENT_ID });
+  const staleBeliefEvents =
+    contradictions.ok && Array.isArray((contradictions.data as any)?.events)
+      ? ((contradictions.data as any).events as unknown[])
+      : [];
+
   const inbox = await writeInbox(GROK_VAULT_PATH, sessionId, {
     kind: "grok_precompact_handoff",
     agent_id: GROK_AGENT_ID,
     workspace_id: workspaceId,
     scar_tissue: scarTissue,
+    stale_belief_events: staleBeliefEvents,
     audit_tail: tail.entries.slice(-10).map((entry) => entry.split("\n")[0]),
     compaction_trigger: transcript || "compaction in progress",
     durable_learning_committed: false,
@@ -377,15 +402,20 @@ async function main(): Promise<void> {
     const output = await dispatch(event, payload);
     emit(output);
   } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
     try {
       await recordAudit(GROK_VAULT_PATH, {
         tool: "hook_grok_error",
-        summary: `${event}: ${error instanceof Error ? error.message : String(error)}`,
+        summary: `${event}: ${message}`,
       });
     } catch {
-      // last-resort swallow
+      // audit unavailable; the systemMessage below still surfaces the failure
     }
-    emit({ continue: true });
+    // hooks-PL-5: a degraded boot must never look like a clean one — say so.
+    emit({
+      continue: true,
+      systemMessage: `Minni hook degraded (${event}): ${message} — memory injection skipped this event; see vault log.md.`,
+    });
   }
 }
 
