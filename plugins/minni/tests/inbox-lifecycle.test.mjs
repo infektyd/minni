@@ -557,3 +557,80 @@ test("resolveActivePlanView reconciles a stuck-candidate plan too (candidate -> 
     await rm(root, { recursive: true, force: true });
   }
 });
+
+// ── C8: the handoff TTL honors its env override ──────────────────────────────
+
+test("inboxHandoffTtlDays: default, env override, invalid-value fallback", async () => {
+  const { inboxHandoffTtlDays } = await import("../dist/vault.js");
+  const saved = process.env.MINNI_INBOX_HANDOFF_TTL_DAYS;
+  try {
+    delete process.env.MINNI_INBOX_HANDOFF_TTL_DAYS;
+    assert.equal(inboxHandoffTtlDays(), 7, "default TTL is 7 days");
+
+    process.env.MINNI_INBOX_HANDOFF_TTL_DAYS = "3";
+    assert.equal(inboxHandoffTtlDays(), 3, "env override wins");
+
+    process.env.MINNI_INBOX_HANDOFF_TTL_DAYS = "0.5";
+    assert.equal(inboxHandoffTtlDays(), 0.5, "fractional override is honored");
+
+    for (const invalid of ["banana", "", "0", "-2", "NaN"]) {
+      process.env.MINNI_INBOX_HANDOFF_TTL_DAYS = invalid;
+      assert.equal(inboxHandoffTtlDays(), 7, `invalid value ${JSON.stringify(invalid)} falls back to 7`);
+    }
+  } finally {
+    if (saved === undefined) delete process.env.MINNI_INBOX_HANDOFF_TTL_DAYS;
+    else process.env.MINNI_INBOX_HANDOFF_TTL_DAYS = saved;
+  }
+});
+
+test("expireStaleInboxHandoffs reads the env TTL at call time (C8 behavioral)", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-ttl-env-"));
+  const saved = process.env.MINNI_INBOX_HANDOFF_TTL_DAYS;
+  try {
+    const now = Date.now();
+    const fiveDaysOld = now - 5 * DAY;
+    const name = compactName(fiveDaysOld, "env-ttl-orphan");
+    await writeInboxFixture(root, name, {
+      kind: "handoff",
+      slug: "env-ttl-orphan",
+      createdAt: new Date(fiveDaysOld).toISOString(),
+      task: "aged orphan",
+    });
+
+    // Default TTL (7d): a 5-day-old orphan survives.
+    delete process.env.MINNI_INBOX_HANDOFF_TTL_DAYS;
+    assert.deepEqual(await expireStaleInboxHandoffs(root, undefined, now), []);
+
+    // Operator shortens the TTL to 3d via env: the same file now expires.
+    process.env.MINNI_INBOX_HANDOFF_TTL_DAYS = "3";
+    const expired = await expireStaleInboxHandoffs(root, undefined, now);
+    assert.equal(expired.length, 1);
+    assert.equal(expired[0].slug, "env-ttl-orphan");
+    assert.equal(expired[0].status, "expired");
+  } finally {
+    if (saved === undefined) delete process.env.MINNI_INBOX_HANDOFF_TTL_DAYS;
+    else process.env.MINNI_INBOX_HANDOFF_TTL_DAYS = saved;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+// ── C5 plan parity: active-plan injection must exist in ALL four hooks ───────
+
+test("all four hooks inject the active plan through the shared plan helpers (C5 hook-drift pin)", async () => {
+  const srcDir = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "src");
+  for (const hook of ["hook.ts", "codex-hook.ts", "grok-hook.ts", "kilocode-hook.ts"]) {
+    const source = await readFile(path.join(srcDir, hook), "utf8");
+    assert.ok(
+      source.includes("resolveActivePlanView("),
+      `${hook} must resolve the active plan`,
+    );
+    assert.ok(
+      /active_plan\s*=\s*activePlan/.test(source),
+      `${hook} SessionStart must inject the full active_plan view`,
+    );
+    assert.ok(
+      source.includes("active_plan_ref = compactPlanPointer("),
+      `${hook} UserPromptSubmit must inject the compact plan pointer (budget discipline)`,
+    );
+  }
+});
