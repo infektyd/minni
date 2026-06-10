@@ -10,10 +10,13 @@ V3.1 changes:
 - Added markdown-aware chunking config
 """
 
+import json
 import logging
 import os
+import stat as stat_module
 from dataclasses import dataclass, field
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
+from urllib.parse import urlparse
 
 # G02 canonical home resolver (single source of truth for path defaults)
 CANONICAL_SOVEREIGN_HOME: str = os.environ.get(
@@ -197,6 +200,141 @@ class SovereignConfig:
 
 # Global default config — importable everywhere
 DEFAULT_CONFIG = SovereignConfig()
+
+
+# --- Model provider chain config (P3) ----------------------------------------
+# Mirrors plugins/minni/src/config.ts loadProvidersConfig with identical
+# semantics. ~/.minni/providers.json configures the provider chain and
+# per-operation routing policy; MINNI_AFM_* env vars keep precedence over file
+# values. Secrets are NEVER stored in providers.json: cloud credentials come
+# only from apiKeyEnv (env var name) or apiKeyFile (0600 file under
+# ~/.minni/secrets/).
+
+_DEFAULT_PROVIDERS_CONFIG: Dict[str, Any] = {
+    "chain": ["afm"],
+    "operations": {"retrieval": {"localOnly": True}},
+    "providers": {},
+}
+
+
+def providers_config_path() -> str:
+    return os.path.expanduser(
+        os.environ.get(
+            "MINNI_PROVIDERS_CONFIG",
+            os.path.join(os.environ.get("MINNI_HOME", os.path.expanduser("~/.minni")), "providers.json"),
+        )
+    )
+
+
+def load_providers_config(path: Optional[str] = None) -> Dict[str, Any]:
+    """Load ~/.minni/providers.json; degrade to the AFM-only default on any error."""
+    target = path or providers_config_path()
+    try:
+        with open(target, "r", encoding="utf-8") as handle:
+            parsed = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return dict(_DEFAULT_PROVIDERS_CONFIG)
+    if not isinstance(parsed, dict):
+        return dict(_DEFAULT_PROVIDERS_CONFIG)
+    chain = [item for item in parsed.get("chain", []) if isinstance(item, str) and item] if isinstance(
+        parsed.get("chain"), list
+    ) else list(_DEFAULT_PROVIDERS_CONFIG["chain"])
+    operations = parsed.get("operations") if isinstance(parsed.get("operations"), dict) else dict(
+        _DEFAULT_PROVIDERS_CONFIG["operations"]
+    )
+    providers = parsed.get("providers") if isinstance(parsed.get("providers"), dict) else {}
+    cloud = providers.get("cloud")
+    if isinstance(cloud, dict) and "apiKey" in cloud:
+        # SEC: inline secrets are rejected outright — keys live in env or 0600 files only.
+        logging.getLogger(__name__).warning(
+            "providers.json: inline providers.cloud.apiKey is not allowed (use apiKeyEnv or apiKeyFile); cloud provider disabled"
+        )
+        cloud = {key: value for key, value in cloud.items() if key != "apiKey"}
+        cloud["enabled"] = False
+        providers = dict(providers)
+        providers["cloud"] = cloud
+    return {
+        "chain": chain or ["afm"],
+        "operations": operations,
+        "providers": providers,
+    }
+
+
+def minni_secrets_dir() -> str:
+    return os.path.join(os.environ.get("MINNI_HOME", os.path.expanduser("~/.minni")), "secrets")
+
+
+def resolve_cloud_api_key(cloud: Optional[Dict[str, Any]], secrets_dir: Optional[str] = None) -> Dict[str, Any]:
+    """Resolve the cloud provider API key (mirror of config.ts resolveCloudApiKey).
+
+    Secrets come ONLY from apiKeyEnv or a 0600 apiKeyFile under
+    ~/.minni/secrets/, never from providers.json. Returns {"key": ...} or a
+    structured, key-free {"error": ...}.
+    """
+    if not cloud or cloud.get("enabled") is not True:
+        return {}
+    api_key_env = cloud.get("apiKeyEnv")
+    if api_key_env:
+        key = os.environ.get(str(api_key_env))
+        if key:
+            return {"key": key}
+        return {"error": f"cloud_key_unavailable: env {api_key_env} is not set"}
+    api_key_file = cloud.get("apiKeyFile")
+    if api_key_file:
+        resolved = os.path.realpath(os.path.expanduser(str(api_key_file)))
+        root = os.path.realpath(secrets_dir or minni_secrets_dir()) + os.sep
+        if not resolved.startswith(root):
+            return {"error": "cloud_key_denied: apiKeyFile must live under ~/.minni/secrets/"}
+        try:
+            mode = os.stat(resolved).st_mode
+            if mode & (stat_module.S_IRWXG | stat_module.S_IRWXO):
+                return {"error": "cloud_key_denied: apiKeyFile must be mode 0600 (no group/other access)"}
+            with open(resolved, "r", encoding="utf-8") as handle:
+                key = handle.read().strip()
+            if key:
+                return {"key": key}
+            return {"error": "cloud_key_unavailable: apiKeyFile is empty"}
+        except OSError:
+            return {"error": "cloud_key_unavailable: apiKeyFile is not readable"}
+    return {"error": "cloud_key_unavailable: cloud provider enabled without apiKeyEnv or apiKeyFile"}
+
+
+# G13 (SEC-004): explicit operator allowlist for non-loopback model targets.
+# MINNI_MODEL_ALLOWED_TARGETS is the provider-protocol alias for
+# MINNI_AFM_ALLOWED_TARGETS; both are honored (union). Loopback always allowed;
+# non-loopback targets additionally require HTTPS.
+_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1", "0.0.0.0"}
+
+
+def model_allowed_targets() -> list:
+    hosts = []
+    for env_key in ("MINNI_AFM_ALLOWED_TARGETS", "MINNI_MODEL_ALLOWED_TARGETS"):
+        for item in (os.environ.get(env_key) or "").split(","):
+            item = item.strip()
+            if item:
+                hosts.append(item)
+    return hosts
+
+
+def check_model_target(target_url: str) -> Dict[str, Any]:
+    """Mirror of afm.ts checkModelTarget: {"allowed": bool, "reason": str|None}."""
+    if not target_url:
+        return {"allowed": False, "reason": "invalid_url"}
+    try:
+        parsed = urlparse(target_url)
+        host = (parsed.hostname or "").lower()
+    except ValueError:
+        return {"allowed": False, "reason": "invalid_url"}
+    if not host:
+        return {"allowed": False, "reason": "invalid_url"}
+    if host in _LOOPBACK_HOSTS or host.endswith(".localhost"):
+        return {"allowed": True, "reason": None}
+    allowed = {item.lower() for item in model_allowed_targets()}
+    if host not in allowed:
+        return {"allowed": False, "reason": "not_allowlisted"}
+    if parsed.scheme != "https":
+        return {"allowed": False, "reason": "https_required"}
+    return {"allowed": True, "reason": None}
 
 
 def resolve_canonical_path(kind: str) -> str:

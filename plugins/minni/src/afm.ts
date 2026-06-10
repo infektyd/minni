@@ -6,7 +6,7 @@ import { URL } from "node:url";
 
 import type { JsonResult } from "./sovereign.js";
 // G13: single source for allowlist (fixes duplication noted in review)
-import { AFM_ALLOWED_TARGETS, AFM_PREPARE_TASK_MODEL, AFM_PREPARE_TASK_URL } from "./config.js";
+import { AFM_PREPARE_TASK_MODEL, AFM_PREPARE_TASK_URL, modelAllowedTargets } from "./config.js";
 
 export type AfmProviderMode = "auto" | "bridge" | "native" | "off";
 export type AfmProvider = "bridge" | "native" | "off";
@@ -82,6 +82,12 @@ function nativeHealthAvailable(health: JsonResult | undefined): boolean {
 function safeError(error: unknown): string | undefined {
   if (typeof error !== "string" || error.length === 0) return undefined;
   return error
+    // SEC (P3): strip auth headers / bearer tokens / API keys before anything
+    // can reach status, audit, or error output.
+    .replace(/\b(authorization|proxy-authorization)\b\s*[:=]\s*(?:bearer\s+|basic\s+)?[^\s"',;)]+/gi, "$1=[redacted]")
+    .replace(/\bbearer\s+[A-Za-z0-9._~+/=-]{8,}/gi, "bearer [redacted]")
+    .replace(/\b(x-api-key|api[-_]?key|apikey|access[-_]?token|secret[-_]?key)\b\s*[:=]\s*[^\s"',;)]+/gi, "$1=[redacted]")
+    .replace(/\bsk-[A-Za-z0-9_-]{8,}\b/g, "[redacted-key]")
     .replace(/\/(?:Users|Volumes|private|var|tmp|Library)\/[^\s"',)]+/g, "[local-path]")
     .replace(/[^\s"',)]+\.fmadapter\b/g, "[adapter]")
     .replace(/[^\s"',)]+\.(?:db|sqlite|sqlite3|faiss|index|plist)\b/g, "[local-artifact]")
@@ -291,24 +297,32 @@ async function callNativeHelper(
   });
 }
 
-// G13 (SEC-004): AFM URL allowlist enforcement. Loopback always permitted (default in config).
-// Non-loopback hosts only if listed in MINNI_AFM_ALLOWED_TARGETS (comma sep).
+// G13 (SEC-004): model target allowlist enforcement. Loopback always permitted
+// (default in config). Non-loopback hosts only if listed in
+// MINNI_AFM_ALLOWED_TARGETS / MINNI_MODEL_ALLOWED_TARGETS (comma sep), and
+// non-loopback targets additionally require HTTPS (P3).
 // Denial is structured, does not echo the attacker URL in the error payload (no secret leak).
-function isAfmTargetAllowed(targetUrl: string): boolean {
-  if (!targetUrl) return false;
+export type ModelTargetDecision =
+  | { allowed: true }
+  | { allowed: false; reason: "not_allowlisted" | "https_required" | "invalid_url" };
+
+export function checkModelTarget(targetUrl: string): ModelTargetDecision {
+  if (!targetUrl) return { allowed: false, reason: "invalid_url" };
   try {
     const u = new URL(targetUrl);
     const h = (u.hostname || "").toLowerCase();
-    if (!h) return false;
+    if (!h) return { allowed: false, reason: "invalid_url" };
     // Explicit loopback per G13 requirement (0.0.0.0 / *.localhost kept for dev/mDNS compat; see plan review note)
     if (h === "127.0.0.1" || h === "localhost" || h === "::1" || h === "0.0.0.0" || h.endsWith(".localhost")) {
-      return true;
+      return { allowed: true };
     }
-    // Use the canonical parsed list from config (fixes duplication / dead-code noted in reviews)
-    const allowedLower = AFM_ALLOWED_TARGETS.map((s) => s.toLowerCase());
-    return allowedLower.includes(h);
+    // Call-time union of MINNI_AFM_ALLOWED_TARGETS and MINNI_MODEL_ALLOWED_TARGETS.
+    const allowedLower = modelAllowedTargets().map((s) => s.toLowerCase());
+    if (!allowedLower.includes(h)) return { allowed: false, reason: "not_allowlisted" };
+    if (u.protocol !== "https:") return { allowed: false, reason: "https_required" };
+    return { allowed: true };
   } catch {
-    return false;
+    return { allowed: false, reason: "invalid_url" };
   }
 }
 
@@ -322,7 +336,8 @@ export async function callAfmJson(
   });
   if (provider.provider === "off") return { ok: false, error: "AFM mode is off" };
   if (provider.provider === "bridge") {
-    if (!isAfmTargetAllowed(url)) {
+    const decision = checkModelTarget(url);
+    if (!decision.allowed) {
       const host = (() => {
         try {
           return new URL(url).hostname;
@@ -331,7 +346,12 @@ export async function callAfmJson(
         }
       })();
       // Structured denial (no full URL in error to avoid leaking internal/attacker-controlled values)
-      console.warn(`[minni] afm_target_denied host=${host} (not loopback and not in MINNI_AFM_ALLOWED_TARGETS)`);
+      console.warn(
+        `[minni] afm_target_denied host=${host} reason=${decision.reason} (loopback only unless allowlisted via MINNI_AFM_ALLOWED_TARGETS/MINNI_MODEL_ALLOWED_TARGETS; non-loopback requires https)`,
+      );
+      if (decision.reason === "https_required") {
+        return { ok: false, error: "afm_target_denied: non-loopback model targets require https" };
+      }
       return { ok: false, error: "afm_target_denied: target is not loopback-only and not explicitly allowlisted by operator config" };
     }
   }

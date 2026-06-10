@@ -113,6 +113,19 @@ class AfmProvider:
                     error=native.error,
                 )
 
+        # G13 (SEC-004): bridge targets must be loopback or explicitly allowlisted
+        # (MINNI_AFM_ALLOWED_TARGETS / MINNI_MODEL_ALLOWED_TARGETS); non-loopback
+        # additionally requires HTTPS. Structured denial, no URL echo.
+        from config import check_model_target
+
+        decision = check_model_target(request.url or DEFAULT_AFM_CHAT_COMPLETIONS_URL)
+        if not decision["allowed"]:
+            if decision["reason"] == "https_required":
+                error = "afm_target_denied: non-loopback model targets require https"
+            else:
+                error = "afm_target_denied: target is not loopback-only and not explicitly allowlisted by operator config"
+            return ProviderResult(ok=False, data={}, provider="bridge", status="target_denied", error=error)
+
         bridge_client = client or afm_provider._default_bridge_client
         try:
             data = bridge_client(request.payload, request.url or DEFAULT_AFM_CHAT_COMPLETIONS_URL, request.timeout)

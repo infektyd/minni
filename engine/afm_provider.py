@@ -55,7 +55,24 @@ def native_available(helper_path: Optional[Path] = None) -> bool:
 def _safe_status_error(error: Optional[str]) -> Optional[str]:
     if not error:
         return None
-    text = re.sub(r"/(?:Users|Volumes|private|var|tmp|Library)/[^\s\"')]+", "[local-path]", str(error))
+    text = str(error)
+    # SEC (P3): strip auth headers / bearer tokens / API keys before anything
+    # can reach status, audit, or error output (mirror of afm.ts safeError).
+    text = re.sub(
+        r"\b(authorization|proxy-authorization)\b\s*[:=]\s*(?:bearer\s+|basic\s+)?[^\s\"',;)]+",
+        r"\1=[redacted]",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(r"\bbearer\s+[A-Za-z0-9._~+/=-]{8,}", "bearer [redacted]", text, flags=re.IGNORECASE)
+    text = re.sub(
+        r"\b(x-api-key|api[-_]?key|apikey|access[-_]?token|secret[-_]?key)\b\s*[:=]\s*[^\s\"',;)]+",
+        r"\1=[redacted]",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(r"\bsk-[A-Za-z0-9_-]{8,}\b", "[redacted-key]", text)
+    text = re.sub(r"/(?:Users|Volumes|private|var|tmp|Library)/[^\s\"')]+", "[local-path]", text)
     text = re.sub(r"[^\s\"')]+\.fmadapter\b", "[adapter]", text)
     text = re.sub(r"[^\s\"')]+\.(?:db|sqlite|sqlite3|faiss|index|plist)\b", "[local-artifact]", text)
     return text[:240]

@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { fileURLToPath } from "node:url";
@@ -38,13 +38,20 @@ export const AFM_PREPARE_TASK_URL =
 export const AFM_PREPARE_TASK_MODEL =
   process.env.MINNI_AFM_PREPARE_TASK_MODEL ?? "apple-foundation-models";
 
-// G13 (SEC-004): explicit operator allowlist for non-loopback AFM targets.
+// G13 (SEC-004): explicit operator allowlist for non-loopback model targets.
 // Comma-separated hosts (e.g. "192.168.1.10,afm.internal"). Loopback (127.0.0.1,localhost,::1) always allowed.
+// MINNI_MODEL_ALLOWED_TARGETS is the provider-protocol alias for MINNI_AFM_ALLOWED_TARGETS;
+// both are honored (union). Non-loopback targets additionally require HTTPS.
 // If a non-local target is configured without being listed, callAfmJson will deny with structured error.
-export const AFM_ALLOWED_TARGETS: string[] = (process.env.MINNI_AFM_ALLOWED_TARGETS || "")
-  .split(",")
-  .map((s) => s.trim())
-  .filter(Boolean);
+export function modelAllowedTargets(): string[] {
+  return [process.env.MINNI_AFM_ALLOWED_TARGETS, process.env.MINNI_MODEL_ALLOWED_TARGETS]
+    .flatMap((value) => (value ?? "").split(","))
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+export const AFM_ALLOWED_TARGETS: string[] = modelAllowedTargets();
+export const MODEL_ALLOWED_TARGETS: string[] = AFM_ALLOWED_TARGETS;
 
 // --- Model provider chain config (P3) ---------------------------------------
 // ~/.minni/providers.json configures the provider chain and per-operation
@@ -119,6 +126,50 @@ export function loadProvidersConfig(filePath = PROVIDERS_CONFIG_PATH): Providers
 }
 
 export const PROVIDERS_CONFIG: ProvidersConfig = loadProvidersConfig();
+
+export const MINNI_SECRETS_DIR = path.join(os.homedir(), ".minni", "secrets");
+
+export interface CloudApiKeyResolution {
+  key?: string;
+  /** Structured, key-free reason when no usable secret was found. */
+  error?: string;
+}
+
+/**
+ * Resolve the cloud provider API key. Secrets come ONLY from:
+ *   - apiKeyEnv: the named environment variable, or
+ *   - apiKeyFile: a 0600 file under ~/.minni/secrets/
+ * Never from providers.json itself. The resolved key must never be written to
+ * status/audit/error output (safeError strips auth material as a backstop).
+ */
+export function resolveCloudApiKey(
+  cloud: CloudProviderConfig | undefined,
+  secretsDir = MINNI_SECRETS_DIR,
+): CloudApiKeyResolution {
+  if (!cloud || cloud.enabled !== true) return {};
+  if (cloud.apiKeyEnv) {
+    const key = process.env[cloud.apiKeyEnv];
+    return key ? { key } : { error: `cloud_key_unavailable: env ${cloud.apiKeyEnv} is not set` };
+  }
+  if (cloud.apiKeyFile) {
+    const resolved = path.resolve(expandTilde(cloud.apiKeyFile));
+    const root = path.resolve(secretsDir) + path.sep;
+    if (!resolved.startsWith(root)) {
+      return { error: "cloud_key_denied: apiKeyFile must live under ~/.minni/secrets/" };
+    }
+    try {
+      const st = statSync(resolved);
+      if ((st.mode & 0o077) !== 0) {
+        return { error: "cloud_key_denied: apiKeyFile must be mode 0600 (no group/other access)" };
+      }
+      const key = readFileSync(resolved, "utf8").trim();
+      return key ? { key } : { error: "cloud_key_unavailable: apiKeyFile is empty" };
+    } catch {
+      return { error: "cloud_key_unavailable: apiKeyFile is not readable" };
+    }
+  }
+  return { error: "cloud_key_unavailable: cloud provider enabled without apiKeyEnv or apiKeyFile" };
+}
 
 export type AFM_PROVIDER_MODE = "auto" | "bridge" | "native" | "off";
 
