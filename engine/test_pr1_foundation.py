@@ -95,13 +95,20 @@ class TestMigrationsRunner:
             db_mod._migrations_run = old_flag
             os.environ.pop("MINNI_DB_PATH", None)
 
-    def test_once_per_process_flag(self, tmp_path):
-        """Module-level _migrations_run flag prevents re-entry."""
+    def test_once_per_path_flag(self, tmp_path):
+        """Per-path _migrated_paths set prevents re-entry for the same db file."""
+        import os
         import db as db_mod
         # Save state
-        original = db_mod._migrations_run
+        original_run = db_mod._migrations_run
+        original_paths = db_mod._migrated_paths.copy()
         try:
-            db_mod._migrations_run = True  # simulate already run
+            # Simulate the path already having been migrated by adding it to
+            # _migrated_paths (and ensuring _migrations_run is True, the post-first-run state).
+            db_path = self._fresh_db(tmp_path)
+            abs_path = os.path.abspath(db_path)
+            db_mod._migrations_run = True
+            db_mod._migrated_paths = original_paths | {abs_path}
             call_count = {"n": 0}
             original_runner = None
 
@@ -115,16 +122,17 @@ class TestMigrationsRunner:
 
             mig_mod.run_migrations = counting_runner
 
-            # Create a DB — migrations should NOT run because flag is True
-            db_path = self._fresh_db(tmp_path)
+            # Create a DB at the same path — migrations should NOT run because
+            # the path is already in _migrated_paths.
             cfg = __import__("config").SovereignConfig(db_path=db_path)
             d = db_mod.SovereignDB(cfg)
             d._get_conn()
             d.close()
 
-            assert call_count["n"] == 0, "Migrations should not run when flag is True"
+            assert call_count["n"] == 0, "Migrations should not re-run for an already-migrated path"
         finally:
-            db_mod._migrations_run = original
+            db_mod._migrations_run = original_run
+            db_mod._migrated_paths = original_paths
             if original_runner is not None:
                 mig_mod.run_migrations = original_runner
 
