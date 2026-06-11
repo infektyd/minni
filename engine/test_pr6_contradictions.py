@@ -662,6 +662,15 @@ class TestHandleLearn:
 
 class TestHandleResolveContradiction:
 
+    def _seed_learning(self, db_obj, content, agent_id="test"):
+        with db_obj.cursor() as c:
+            c.execute("""
+                INSERT INTO learnings (agent_id, category, content, confidence,
+                                       created_at, status)
+                VALUES (?, 'fact', ?, 1.0, ?, 'active')
+            """, (agent_id, content, time.time()))
+            return c.lastrowid
+
     def _dispatch(self, method, params):
         from minnid import _dispatch_sync as _dispatch
         return _dispatch({
@@ -691,7 +700,7 @@ class TestHandleResolveContradiction:
                 c.execute("""
                     INSERT INTO learnings (agent_id, category, content, confidence,
                                            created_at, status)
-                    VALUES ('a', 'fact', ?, 1.0, ?, 'active')
+                    VALUES ('test', 'fact', ?, 1.0, ?, 'active')
                 """, (f"old learning {i}", now))
                 old_ids.append(c.lastrowid)
 
@@ -746,7 +755,7 @@ class TestHandleResolveContradiction:
         with db_obj.cursor() as c:
             c.execute("""
                 INSERT INTO learnings (agent_id, category, content, confidence, created_at, status)
-                VALUES ('a', 'fact', 'old learning', 1.0, ?, 'active')
+                VALUES ('test', 'fact', 'old learning', 1.0, ?, 'active')
             """, (now,))
             old_id = c.lastrowid
             c.execute("""
@@ -798,35 +807,34 @@ class TestHandleResolveContradiction:
         assert resp["error"]["code"] == -32602
 
     def test_resolve_empty_supersede_ids(self, tmp_path, monkeypatch):
-        """resolve_contradiction with empty supersede_ids still writes the new learning."""
+        """Empty supersede_ids is rejected (review panel): it would skip the
+        per-id ownership loop and insert an unsupervised learning that
+        bypasses the staging workflow."""
         wb, db_obj, cfg = self._patch_writeback(tmp_path, monkeypatch)
 
-        import writeback as wb_mod
-        wb_mod.WriteBackMemory.model = property(lambda self: None)
-        try:
-            resp = self._dispatch("resolve_contradiction", {
-                "new_content": "standalone learning",
-                "supersede_ids": [],
-                "agent_id": "test",
-            })
-        finally:
-            from models import get_embedder as _ge
-            wb_mod.WriteBackMemory.model = property(lambda self: _ge())
+        resp = self._dispatch("resolve_contradiction", {
+            "new_content": "standalone learning",
+            "supersede_ids": [],
+            "agent_id": "test",
+        })
 
-        assert "error" not in resp
-        assert resp["result"]["status"] == "ok"
-        assert resp["result"]["superseded"] == []
+        assert "error" in resp
+        assert resp["error"]["code"] == -32602
+        with db_obj.cursor() as c:
+            count = c.execute("SELECT COUNT(*) FROM learnings").fetchone()[0]
+        assert count == 0, "rejected empty-list resolution must not write a learning"
 
     def test_resolve_atomicity_new_learning_written(self, tmp_path, monkeypatch):
-        """Even with an empty supersede list, the new learning exists in DB."""
+        """On a successful resolution, the new learning exists in DB."""
         wb, db_obj, cfg = self._patch_writeback(tmp_path, monkeypatch)
+        old_id = self._seed_learning(db_obj, "stale fact to supersede")
 
         import writeback as wb_mod
         wb_mod.WriteBackMemory.model = property(lambda self: None)
         try:
             resp = self._dispatch("resolve_contradiction", {
                 "new_content": "confirmed resolution content",
-                "supersede_ids": [],
+                "supersede_ids": [old_id],
                 "agent_id": "test",
             })
         finally:
@@ -844,13 +852,14 @@ class TestHandleResolveContradiction:
     def test_resolve_stores_structured_fields(self, tmp_path, monkeypatch):
         """resolve_contradiction stores assertion, applies_when, evidence_doc_ids."""
         wb, db_obj, cfg = self._patch_writeback(tmp_path, monkeypatch)
+        old_id = self._seed_learning(db_obj, "outdated auth fact")
 
         import writeback as wb_mod
         wb_mod.WriteBackMemory.model = property(lambda self: None)
         try:
             resp = self._dispatch("resolve_contradiction", {
                 "new_content": "Auth migrated to session cookies",
-                "supersede_ids": [],
+                "supersede_ids": [old_id],
                 "agent_id": "test",
                 "assertion": "auth: session-cookies",
                 "applies_when": "production env",

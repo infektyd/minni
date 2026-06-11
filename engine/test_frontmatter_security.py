@@ -179,3 +179,57 @@ def test_afm_writer_yaml_safe_dump_prevents_injection(tmp_path: Path):
     assert parsed["agent"] == "afm-loop"  # canonical, not from title payload
     assert "spoof" not in parsed  # no key injection from malicious title
     assert parsed.get("privacy") == "safe"  # not overridden
+
+
+def test_duplicate_privacy_keys_fail_closed_most_restrictive():
+    """SEC-006 duplicate-key differential (mirrors plugins/minni vault.ts):
+    a permissive `privacy:` duplicate must not relax a restrictive one,
+    regardless of key order — the MOST restrictive declared value wins."""
+    restrictive_then_permissive = """---
+agent: alice
+status: accepted
+privacy: blocked
+privacy: safe
+---
+body
+"""
+    meta = VaultIndexer._extract_frontmatter(restrictive_then_permissive)
+    assert meta["privacy_level"] == "blocked"
+
+    permissive_then_restrictive = """---
+agent: alice
+status: accepted
+privacy: safe
+privacy: private
+---
+body
+"""
+    meta = VaultIndexer._extract_frontmatter(permissive_then_restrictive)
+    assert meta["privacy_level"] == "private"
+
+    # A single declaration is untouched by the duplicate guard.
+    single = """---
+agent: alice
+privacy: local-only
+---
+body
+"""
+    meta = VaultIndexer._extract_frontmatter(single)
+    assert meta["privacy_level"] == "local-only"
+
+
+def test_duplicate_privacy_keys_fail_closed_with_crlf_line_endings():
+    """SEC-006 regression: CRLF content must not bypass the duplicate-key
+    differential. _str() strips the trailing \\r before the valid_privacies
+    check (and the indexer's text-mode read normalizes newlines anyway), so a
+    permissive duplicate after a restrictive one still loses."""
+    crlf = (
+        "---\r\n"
+        "agent: alice\r\n"
+        "privacy: private\r\n"
+        "privacy: safe\r\n"
+        "---\r\n"
+        "body\r\n"
+    )
+    meta = VaultIndexer._extract_frontmatter(crlf)
+    assert meta["privacy_level"] == "private"

@@ -262,3 +262,28 @@ test("resolveInboxHandoffContext and search reject symlink escape from vault (RC
     await rm(root, { recursive: true, force: true });
   }
 });
+
+// Cross-platform frontmatter: a CRLF note's status must still be parsed, so
+// superseded/rejected pages stay filtered on Windows-authored vaults.
+test("searchVaultNotes filters superseded notes with CRLF line endings", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-crlf-"));
+  try {
+    await ensureVault(root);
+    const note =
+      "---\r\ntitle: CRLF superseded note\r\nstatus: superseded\r\n---\r\n\r\nSM_CRLF_MARKER stale belief body.\r\n";
+    await writeFile(path.join(root, "wiki", "crlf-superseded.md"), note, "utf8");
+
+    const results = await searchVaultNotes(root, "SM_CRLF_MARKER stale belief", 5);
+    assert.equal(results.length, 0, "CRLF superseded note must not re-surface");
+
+    // Positive control: same CRLF shape with a live status IS found, proving
+    // the zero above comes from the status filter, not a failed read.
+    const live = note.replace("status: superseded", "status: accepted");
+    await writeFile(path.join(root, "wiki", "crlf-live.md"), live, "utf8");
+    const found = await searchVaultNotes(root, "SM_CRLF_MARKER stale belief", 5);
+    assert.equal(found.length, 1);
+    assert.match(found[0].relativePath, /crlf-live\.md$/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});

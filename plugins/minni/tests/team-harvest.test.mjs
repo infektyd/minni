@@ -334,3 +334,39 @@ test("buildTeamEvidencePacketWithHarvest throws when vaultPath missing", async (
     /vaultPath/,
   );
 });
+
+test("harvest skip reasons from chain errors never carry auth material (structural sanitization)", async () => {
+  const secret = "sk-test-vErYsEcReT-cLoUdKeY-12345";
+  const inboxCalls = [];
+  const audits = [];
+  const result = await harvestEvidence(
+    {
+      task: "Ship harvest loop",
+      vaultPath: "/tmp/vault",
+      reports: [makeReports()[0]],
+    },
+    {
+      // Exercise the real chain -> defaultCallAfm -> skip-reason path: the
+      // transport fails with an error embedding auth material, and the chain
+      // must redact it before it reaches inbox/audit surfaces.
+      transport: async () => ({
+        ok: false,
+        error: `HTTP 401 authorization: Bearer ${secret} x-api-key=${secret}`,
+      }),
+      writeInbox: async (vaultPath, slug, payload) => {
+        const entry = { slug, filePath: `${vaultPath}/inbox/x-${slug}.json`, createdAt: "t", payload };
+        inboxCalls.push(entry);
+        return entry;
+      },
+      audit: async (vaultPath, entry) => {
+        audits.push({ vaultPath, entry });
+      },
+    },
+  );
+
+  assert.equal(result.length, 1);
+  assert.equal(result[0].source, "skipped");
+  assert.doesNotMatch(result[0].reason ?? "", new RegExp(secret));
+  assert.match(result[0].reason ?? "", /\[redacted/);
+  assert.doesNotMatch(JSON.stringify({ inboxCalls, audits }), new RegExp(secret));
+});

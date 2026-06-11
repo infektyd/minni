@@ -58,6 +58,7 @@ import argparse
 import asyncio
 import json
 import logging
+import math
 import os
 import re
 import hashlib
@@ -777,6 +778,27 @@ def _handoff_lease_status(lease_id: str) -> Optional[dict]:
         return None
 
 
+def _lease_to_agent(lease_id: str) -> Optional[str]:
+    """Recipient (``to_agent``) of a handoff lease: authoritative SQLite row
+    first, JSON packets as fallback (leases can exist file-only when SQLite
+    persistence degraded). None when the lease is unknown on both channels."""
+    try:
+        db = _lazy_writeback().db
+        with db.cursor() as c:
+            row = c.execute(
+                "SELECT to_agent FROM handoff_leases WHERE lease_id = ?",
+                (lease_id,),
+            ).fetchone()
+        if row is not None and row["to_agent"]:
+            return str(row["to_agent"])
+    except Exception as exc:
+        logger.warning("Could not read lease %r for authz: %s", lease_id, exc)
+    for _vault, _path, packet in _iter_handoff_files():
+        if packet.get("lease_id") == lease_id and packet.get("to_agent"):
+            return str(packet.get("to_agent"))
+    return None
+
+
 def _handle_ack_handoff(params: dict, request_id: Any) -> dict:
     lease_id = str(params.get("lease_id", "")).strip()
     status = str(params.get("status", "")).strip()
@@ -784,6 +806,27 @@ def _handle_ack_handoff(params: dict, request_id: Any) -> dict:
         return _make_error(-32602, "lease_id is required", request_id)
     if status not in _HANDOFF_ACK_STATUSES:
         return _make_error(-32602, f"status must be one of {sorted(_HANDOFF_ACK_STATUSES)}", request_id)
+    # A3 authz (fixes a live incident: co-located session subagents acked and
+    # archived other agents' live handoffs): only the lease's RECIPIENT may ack
+    # it. The principal is server-stamped (G11) — caller-supplied agent_id is
+    # only honoured through the platform_agent_ids / alias machinery, never raw.
+    supplied = params.get("agent_id")
+    try:
+        principal = resolve_effective_principal(
+            supplied_agent_id=supplied, transport="uds"
+        )
+    except IdentityMismatchError as exc:
+        return make_mismatch_error(exc.supplied, exc.stamped, request_id)
+    to_agent = _lease_to_agent(lease_id)
+    if to_agent is None:
+        return _make_error(-32000, f"No handoff lease found for {lease_id}", request_id)
+    if to_agent != principal.agent_id:
+        return _make_error(
+            -32004,
+            f"principal_mismatch: handoff lease {lease_id} is addressed to "
+            f"'{to_agent}'; caller principal '{principal.agent_id}' may not ack it",
+            request_id,
+        )
     contradicts_id = params.get("contradicts_id")
     updates = {
         "ack_status": status,
@@ -795,10 +838,27 @@ def _handle_ack_handoff(params: dict, request_id: Any) -> dict:
     db_changed = _update_handoff_lease_status(lease_id, status, contradicts_id)
     if not changed and not db_changed:
         return _make_error(-32000, f"No handoff lease found for {lease_id}", request_id)
+    # B1: an explicit ack is terminal for the file channel — archive the
+    # recipient-side inbox copies so they stop re-surfacing at SessionStart.
+    # The outbox copy (and the authoritative lease row) keep the ack_status
+    # for await_handoff. Rename only, never unlink.
+    archived = []
+    for changed_path in changed:
+        p = Path(changed_path)
+        if p.parent.name != "inbox":
+            continue
+        try:
+            from afm_passes.inbox_archive import archive_inbox_file
+            new_path = archive_inbox_file(p)
+            if new_path:
+                archived.append(new_path)
+        except Exception as exc:
+            logger.warning("ack_handoff: archive of %s failed: %s", p, exc)
     return _make_response({
         "lease_id": lease_id,
         "status": status,
         "updated_paths": changed,
+        "archived_paths": archived,
     }, request_id)
 
 
@@ -1037,6 +1097,23 @@ def _handle_search(params: dict, request_id: Any) -> dict:
             except Exception as pack_exc:
                 logger.warning("pack_results failed: %s — returning unbudgeted results", pack_exc)
 
+        # hooks-PL-2 leg (a): searching is reading. The doc-retrieval stream
+        # above can never carry learnings — ``learning://<id>`` rows exist only
+        # for evidence-backed learnings and are never indexed in vault_fts or
+        # FAISS — so match the learnings table directly. The matched learnings
+        # are surfaced to the caller in the response below, and
+        # search_learnings records a learning_reads row for each (the row
+        # subscribe_contradictions joins on, so stale_beliefs can fire when a
+        # searched belief is later superseded).
+        learnings: list = []
+        try:
+            learnings = engine.search_learnings(
+                query, agent_id=agent_id, limit=limit, source="minnid.search"
+            )
+        except Exception as exc:
+            # hooks-PL-5: visible, never silently green
+            logger.warning("search: learnings surfacing/tracking failed: %s", exc)
+
         return _make_response({
             "query": query,
             "agent_id": agent_id,
@@ -1049,6 +1126,8 @@ def _handle_search(params: dict, request_id: Any) -> dict:
                 if results else [query]
             ),
             "results": results,
+            # Active learnings matching the query (read-tracked above).
+            "learnings": learnings,
         }, request_id)
     except Exception as exc:
         logger.exception("search failed")
@@ -1442,14 +1521,24 @@ def _handle_read(params: dict, request_id: Any) -> dict:
                         f"(conf={row['confidence']:.1f})"
                     )
                     try:
+                        # OR IGNORE: a same-tick re-read collides on the
+                        # (learning_id, agent_id, read_at) PK — the read is
+                        # already recorded, so dropping the duplicate is
+                        # correct (a raise here would be swallowed below as
+                        # "dropped tracking").
                         c.execute(
-                            """INSERT INTO learning_reads
+                            """INSERT OR IGNORE INTO learning_reads
                                (learning_id, agent_id, read_at, source)
                                VALUES (?, ?, ?, ?)""",
                             (row["learning_id"], agent_id, time.time(), "minnid.read"),
                         )
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        # hooks-PL-5: a silently dropped read row starves
+                        # subscribe_contradictions (stale_beliefs) of matches.
+                        logger.warning(
+                            "read: learning_reads insert failed for learning #%s: %s",
+                            row["learning_id"], exc,
+                        )
 
         # Recent episodic events
         with db.cursor() as c:
@@ -1704,6 +1793,17 @@ def _extract_assertion(content: str) -> str:
     return content[:120].strip()
 
 
+class _ResolveRejected(Exception):
+    """Carries a pre-built JSON-RPC error response out of an OPEN write
+    transaction. Raising (instead of returning) makes the transaction context
+    manager ROLL BACK, so an early rejection releases the BEGIN IMMEDIATE
+    write lock without committing a no-op transaction."""
+
+    def __init__(self, response: dict):
+        super().__init__(str(response.get("error", {}).get("message", "rejected")))
+        self.response = response
+
+
 def _handle_resolve_contradiction(params: dict, request_id: Any) -> dict:
     """Write a new learning and atomically supersede a list of prior learnings.
 
@@ -1733,6 +1833,18 @@ def _handle_resolve_contradiction(params: dict, request_id: Any) -> dict:
     supersede_ids = params.get("supersede_ids", [])
     if not isinstance(supersede_ids, list):
         return _make_error(-32602, "supersede_ids must be a list", request_id)
+    # Validate element types BEFORE any SQL binding: a None/float/dict element
+    # would otherwise raise an InterfaceError inside the transaction and leak
+    # internal exception text via the -32000 catch-all below.
+    if not all(isinstance(sid, int) and not isinstance(sid, bool) for sid in supersede_ids):
+        return _make_error(-32602, "supersede_ids must be a list of integers", request_id)
+    # An EMPTY list would pass validation, skip the per-id ownership loop
+    # entirely, and insert an unsupervised learning that bypasses the staging
+    # workflow — resolution must actually resolve something.
+    if not supersede_ids:
+        return _make_error(
+            -32602, "supersede_ids must be a non-empty list of integers", request_id
+        )
 
     # G11: EffectivePrincipal is the single server-stamped source (never trust caller)
     supplied = params.get("agent_id")
@@ -1774,6 +1886,32 @@ def _handle_resolve_contradiction(params: dict, request_id: Any) -> dict:
 
         # Single transaction: write new + supersede old
         with wb.db.transaction() as c:
+            # A3 authz (mirrors _resolve_candidate's owner check at the same
+            # trust boundary): a caller may only supersede learnings it OWNS;
+            # cross-principal supersession requires an EXPLICITLY allowed
+            # operator. Validated BEFORE the INSERT, and rejections RAISE
+            # (_ResolveRejected -> rollback) so no orphan new learning can be
+            # left behind and no lock-holding no-op transaction is committed.
+            for sid in supersede_ids:
+                c.execute(
+                    "SELECT agent_id FROM learnings WHERE learning_id = ?",
+                    (sid,),
+                )
+                srow = c.fetchone()
+                if not srow:
+                    raise _ResolveRejected(_make_error(
+                        -32001, f"learning_not_found: {sid}", request_id
+                    ))
+                owner = str(srow["agent_id"] or "")
+                if owner != agent_id and not _explicitly_allowed_operator(principal):
+                    raise _ResolveRejected(_make_error(
+                        -32004,
+                        f"principal_mismatch: learning #{sid} is owned by '{owner}'; "
+                        f"caller principal '{agent_id}' may only supersede its own "
+                        "learnings (cross-principal supersession requires an "
+                        "explicitly allowed operator)",
+                        request_id,
+                    ))
             c.execute("""
                 INSERT INTO learnings
                 (agent_id, category, content, source_doc_ids, source_query,
@@ -1818,13 +1956,36 @@ def _handle_resolve_contradiction(params: dict, request_id: Any) -> dict:
             "new_learning_id": new_lid,
             "superseded": supersede_ids,
         }, request_id)
+    except _ResolveRejected as exc:
+        return exc.response
     except Exception as exc:
         logger.exception("resolve_contradiction failed")
         return _make_error(-32000, f"Resolve contradiction error: {exc}", request_id)
 
 
 def _handle_subscribe_contradictions(params: dict, request_id: Any) -> dict:
-    """Return contradiction events for learnings recently read by an agent."""
+    """Return contradiction events for learnings recently read by an agent.
+
+    Params:
+      since_ts            Cursor for incremental polling. NOTE: event_window_days
+                          is a hard cap — since_ts=0 ("everything") still only
+                          returns the last event_window_days of events. The
+                          effective lower bound is echoed back as
+                          checked.event_since so callers can detect clamping.
+      event_window_days   Boot-noise bound, default 30, clamped to [0, 365].
+                          An explicit 0 is honored (no historic events), not
+                          coerced to the default.
+      read_window_hours   Optional read-recency filter; 0 means "no reads
+                          qualify" (an explicit zero is honored, not coerced
+                          to the default). Clamped to [0, 8760].
+
+    Non-finite values (NaN/Inf) for any of the three are rejected and replaced
+    with the parameter's default: NaN poisons min/max clamping (min(nan, x) is
+    nan in CPython), which would either bypass the event-window DoS cap
+    (event_since collapsing to 0 → full-history scan) or make the SQL
+    comparison silently match nothing — defeating the hooks-PL-1
+    checked/no-match discriminator.
+    """
     # G11 / RCM-003/009: EffectivePrincipal stamp + mismatch guard (closes last model-facing agent_id surfaces)
     # Model-supplied agent_id is NEVER trusted; use stamped principal.agent_id for queries.
     supplied = params.get("agent_id")
@@ -1837,14 +1998,82 @@ def _handle_subscribe_contradictions(params: dict, request_id: Any) -> dict:
     agent_id = principal.agent_id
     if not agent_id:
         return _make_error(-32602, "agent_id is required", request_id)
-    since_ts = float(params.get("since_ts", 0) or 0)
-    read_window_hours = float(params.get("read_window_hours", 24) or 24)
-    read_since = time.time() - (read_window_hours * 3600)
+    # Non-numeric params are a caller error (-32602), never an unhandled
+    # exception: a raise here would propagate out of the handler and drop the
+    # whole connection with no JSON-RPC error.
+    try:
+        since_ts = float(params.get("since_ts", 0) or 0)
+    except (TypeError, ValueError):
+        return _make_error(-32602, "since_ts must be a number", request_id)
+    if not math.isfinite(since_ts):
+        # NaN survives the falsy-or (it is truthy) and turns every SQL
+        # comparison false — events:[] would masquerade as checked_no_match.
+        since_ts = 0.0
+    now = time.time()
+    # Clamp caller-supplied bounds (local-DoS guard): a huge event window or a
+    # far-future since_ts must not force a full-history scan / nonsense JOIN
+    # on the daemon's single-threaded query loop.
+    since_ts = min(since_ts, now + 60)
+
+    # hooks-PL-2 leg (b): the old default required a learning_reads row within
+    # the last 24h for the SUPERSEDED learning. The sole read writer skips
+    # superseded learnings (correctly — stale beliefs must not be re-injected),
+    # so a corrected belief could never get a fresh read row and stale_beliefs
+    # fired events:[] forever for exactly the corrections that matter. The fix:
+    # ANY historical read of the superseded learning now qualifies (the agent
+    # held the belief at some point); recency bounds apply to the *event*, not
+    # the read. Callers can still opt back into read-recency filtering by
+    # passing read_window_hours explicitly.
+    read_window_hours_param = params.get("read_window_hours")
+    read_window_hours = None
+    read_since = None
+    if read_window_hours_param is not None:
+        # No falsy-or fallback: an explicit 0 means "no reads qualify" and
+        # must not be silently coerced to the 24h default.
+        try:
+            read_window_hours = float(read_window_hours_param)
+        except (TypeError, ValueError):
+            return _make_error(
+                -32602, "read_window_hours must be a number", request_id
+            )
+        if not math.isfinite(read_window_hours):
+            # NaN bypasses min/max clamping; fall back to the default
+            # (no read-recency filter) instead of a poisoned read_since.
+            read_window_hours = None
+        else:
+            read_window_hours = min(max(read_window_hours, 0.0), 8760.0)
+            read_since = now - read_window_hours * 3600
+
+    # Bound boot-time noise: with since_ts unset, only surface events from the
+    # last event_window_days (default 30) instead of the full history. This is
+    # a HARD CAP: since_ts=0 does not mean "all history" (see docstring).
+    # No falsy-or fallback (mirrors read_window_hours): an explicit 0 means
+    # "no historic events" and must not be silently coerced to 30.
+    event_window_days_param = params.get("event_window_days")
+    try:
+        event_window_days = (
+            30.0 if event_window_days_param is None else float(event_window_days_param)
+        )
+    except (TypeError, ValueError):
+        return _make_error(
+            -32602, "event_window_days must be a number", request_id
+        )
+    if not math.isfinite(event_window_days):
+        # NaN bypasses min/max clamping and would collapse event_since to 0
+        # (full-history scan) — exactly the local DoS this cap blocks.
+        event_window_days = 30.0
+    event_window_days = min(max(event_window_days, 0.0), 365.0)
+    event_since = max(since_ts, now - event_window_days * 86400)
 
     try:
         db = _lazy_writeback().db
+        clauses = ["lr.agent_id = ?", "ce.created_at >= ?"]
+        query_params: list = [agent_id, event_since]
+        if read_since is not None:
+            clauses.append("lr.read_at >= ?")
+            query_params.append(read_since)
         with db.cursor() as c:
-            rows = c.execute("""
+            rows = c.execute(f"""
                 SELECT DISTINCT
                        ce.event_id,
                        ce.superseded_learning_id,
@@ -1854,11 +2083,29 @@ def _handle_subscribe_contradictions(params: dict, request_id: Any) -> dict:
                 FROM contradiction_events ce
                 JOIN learning_reads lr
                   ON lr.learning_id = ce.superseded_learning_id
-                WHERE lr.agent_id = ?
-                  AND lr.read_at >= ?
-                  AND ce.created_at >= ?
+                WHERE {" AND ".join(clauses)}
                 ORDER BY ce.created_at ASC, ce.event_id ASC
-            """, (agent_id, read_since, since_ts)).fetchall()
+            """, query_params).fetchall()
+            # hooks-PL-1: empty events must be distinguishable from a match
+            # failure — count what was actually checked so silence is honest.
+            total_events = c.execute(
+                "SELECT COUNT(*) AS n FROM contradiction_events WHERE created_at >= ?",
+                (event_since,),
+            ).fetchone()["n"]
+            # Agent-scoped count (the JOIN predicate, minus the read-recency
+            # filter): without it, "N events in window, 0 matched" reads like
+            # a matching bug when the events simply belong to other agents.
+            agent_events = c.execute(
+                """SELECT COUNT(*) AS n FROM contradiction_events
+                   WHERE created_at >= ?
+                     AND superseded_learning_id IN
+                         (SELECT learning_id FROM learning_reads WHERE agent_id = ?)""",
+                (event_since, agent_id),
+            ).fetchone()["n"]
+            reads_for_agent = c.execute(
+                "SELECT COUNT(*) AS n FROM learning_reads WHERE agent_id = ?",
+                (agent_id,),
+            ).fetchone()["n"]
         events = [
             {
                 "event_id": row["event_id"],
@@ -1869,7 +2116,25 @@ def _handle_subscribe_contradictions(params: dict, request_id: Any) -> dict:
             }
             for row in rows
         ]
-        return _make_response({"agent_id": agent_id, "events": events}, request_id)
+        return _make_response({
+            "agent_id": agent_id,
+            "events": events,
+            # hooks-PL-1 discriminator: "matched" = stale beliefs found;
+            # "checked_no_match" = the join ran and legitimately found nothing.
+            # Errors take the JSON-RPC error path and never look like silence.
+            "status": "matched" if events else "checked_no_match",
+            "checked": {
+                "contradiction_events_in_window": total_events,
+                "contradiction_events_for_agent_reads": agent_events,
+                "learning_reads_for_agent": reads_for_agent,
+                "event_window_days": event_window_days,
+                "read_window_hours": read_window_hours,
+                "since_ts": since_ts,
+                # Effective lower bound after the event_window_days hard cap,
+                # so callers can detect that since_ts was clamped.
+                "event_since": event_since,
+            },
+        }, request_id)
     except Exception as exc:
         logger.exception("subscribe_contradictions failed")
         return _make_error(-32000, f"Subscribe contradictions error: {exc}", request_id)
@@ -2182,6 +2447,21 @@ def _afm_loop_enabled(config=DEFAULT_CONFIG) -> bool:
 # consolidation_actions for audit. The privileged write lives here, not in passes.
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _maybe_archive_inbox_source(db, candidate_id: int) -> None:
+    """B1 drain-on-resolution (audit C2): once a candidate sourced from a vault
+    inbox file reaches a terminal state, move the source file into
+    ``<inbox>/.archive/`` so the file channel actually drains instead of
+    re-surfacing resolved candidates forever. Best-effort; never deletes
+    (rename only); never raises into the resolution path."""
+    try:
+        from afm_passes.inbox_archive import maybe_archive_for_candidate
+        maybe_archive_for_candidate(db, DEFAULT_CONFIG, candidate_id)
+    except Exception:
+        logger.exception(
+            "inbox archive for candidate %s failed (non-fatal)", candidate_id
+        )
+
+
 def _promote_candidate_durable(candidate_id: int, reason: str = "afm-consolidation"):
     """Promote one proposed candidate into a durable, embedded learning.
 
@@ -2261,6 +2541,7 @@ def _promote_candidate_durable(candidate_id: int, reason: str = "afm-consolidati
         logger.warning("consolidation: write_to_disk failed for learning #%s (%s)", lid, exc)
 
     logger.info("AFM consolidation promoted candidate #%d -> learning #%d", candidate_id, lid)
+    _maybe_archive_inbox_source(wb.db, candidate_id)
     return lid
 
 
@@ -2292,6 +2573,7 @@ def _reject_candidate_dedup(candidate_id: int) -> bool:
             (str(candidate_id), now),
         )
     logger.info("AFM consolidation deduped candidate #%d (rejected)", candidate_id)
+    _maybe_archive_inbox_source(wb.db, candidate_id)
     return True
 
 
@@ -2521,6 +2803,14 @@ async def _afm_loop_runner():
                                     _ing["inserted"], _ing["eligible"],
                                     _ing["already_present"],
                                 )
+                            # B4: surface kind-gate drops to the audit channel
+                            # instead of silently skipping whole channels.
+                            _skips = _ing.get("skipped_by_kind") or {}
+                            if any(_skips.values()):
+                                logger.info(
+                                    "AFM loop: inbox ingest skipped_by_kind=%s",
+                                    _skips,
+                                )
                         except Exception:
                             logger.exception(
                                 "AFM loop: inbox ingest raised (skipped; "
@@ -2695,8 +2985,50 @@ def _list_candidates(params: dict, request_id: Any) -> dict:
         return _make_error(-32000, f"list_candidates error: {exc}", request_id)
 
 
+def _explicitly_allowed_operator(principal: EffectivePrincipal) -> bool:
+    """A3 authz: TRUE only for an operator EXPLICITLY granted cross-principal
+    governance — never the synthesized wide-open local default. Grants:
+
+      * a LITERAL ``resolve_candidate`` / ``govern`` capability in the stamped
+        principal's capability list (an operator-authored principals/*.json
+        grant; the synthesized default only carries ``"*"``, which is NOT
+        accepted here), or
+      * the explicit ``operator`` principal (only exists when the operator
+        ships principals/operator.json), or
+      * an agent_id listed in the daemon-env allowlist
+        ``MINNI_RESOLVE_OPERATORS`` (comma-separated; operator-controlled,
+        never wire-controlled).
+
+    Rationale (live incident): every co-located session subagent is stamped
+    'main' on the shared UDS surface, so the blanket is_operator_principal
+    default let workflow subagents repeatedly re-resolve another principal's
+    candidate and archive a live inbox file. Cross-principal resolution now
+    requires one of the explicit grants above.
+    """
+    caps = principal.capabilities or []
+    if "resolve_candidate" in caps or "govern" in caps:
+        return True
+    if principal.agent_id == "operator":
+        return True
+    allow = {
+        a.strip()
+        for a in os.environ.get("MINNI_RESOLVE_OPERATORS", "").split(",")
+        if a.strip()
+    }
+    return principal.agent_id in allow
+
+
 def _resolve_candidate(params: dict, request_id: Any) -> dict:
-    """G15: Resolve a candidate (accept→durable learn, reject/redact etc). Operator only."""
+    """G15: Resolve a candidate (accept→durable learn, reject/redact etc).
+
+    Authorization is owner-or-explicit-operator and lives INSIDE the
+    transaction (after the candidate row is read), because ownership cannot be
+    known before the read. There is deliberately NO up-front
+    ``is_operator_principal`` gate: it would reject a restricted-capability
+    platform agent (caps without ``*``/``resolve_candidate``/``govern``)
+    resolving its OWN candidate before the owner check is ever reached, while
+    adding nothing the owner check does not already enforce.
+    """
     supplied = params.get("agent_id")
     try:
         principal = resolve_effective_principal(
@@ -2704,13 +3036,6 @@ def _resolve_candidate(params: dict, request_id: Any) -> dict:
         )
     except IdentityMismatchError as exc:
         return make_mismatch_error(exc.supplied, exc.stamped, request_id)
-
-    if not is_operator_principal(principal):
-        return _make_error(
-            -32004,
-            "operator_only: resolve_candidate requires operator principal (capabilities or trusted agent_id in principals/*.json)",
-            request_id,
-        )
 
     cid = params.get("candidate_id")
     if cid is None:
@@ -2750,16 +3075,44 @@ def _resolve_candidate(params: dict, request_id: Any) -> dict:
         db = _SovDB()
         lid = None
         # Explicit transaction (BEGIN IMMEDIATE) for atomic SELECT + conditional promote + UPDATE.
-        # Closes TOCTOU between read and write (mirrors the pattern in _handle_resolve_contradiction).
+        # Closes TOCTOU between read and write (mirrors the pattern in
+        # _handle_resolve_contradiction, including _ResolveRejected so early
+        # rejections roll back instead of committing a lock-holding no-op).
         with db.transaction() as c:
             c.execute("SELECT * FROM candidate_packets WHERE candidate_id=?", (cid,))
             row = c.fetchone()
             if not row:
-                return _make_error(-32001, f"candidate_not_found: {cid}", request_id)
+                raise _ResolveRejected(
+                    _make_error(-32001, f"candidate_not_found: {cid}", request_id)
+                )
             rowd = dict(row)
-            if rowd.get("principal") != principal.agent_id:
-                # allow operator to resolve any? but per spec per-principal for now; relax for console operator
-                pass  # operator may resolve cross for console; keep permissive for P1
+            # A3 authz (live incident: subagents stamped 'main' re-resolved
+            # candidate #999 and archived a live inbox file): a caller may only
+            # resolve its OWN candidates; cross-principal resolution requires an
+            # EXPLICITLY allowed operator (see _explicitly_allowed_operator).
+            owner = str(rowd.get("principal") or "")
+            if owner != principal.agent_id and not _explicitly_allowed_operator(principal):
+                raise _ResolveRejected(_make_error(
+                    -32004,
+                    f"principal_mismatch: candidate #{cid} is owned by '{owner}'; "
+                    f"caller principal '{principal.agent_id}' may only resolve its own "
+                    "candidates (cross-principal resolution requires an explicitly "
+                    "allowed operator: 'operator', a literal resolve_candidate/govern "
+                    "capability, or MINNI_RESOLVE_OPERATORS)",
+                    request_id,
+                ))
+            # Resolution is terminal and once-only (same incident: repeated
+            # re-resolution re-ran the inbox archive against a LIVE file).
+            # Mirrors the idempotent 'proposed'-only pattern in
+            # _promote_candidate_durable / _reject_candidate_dedup.
+            if rowd.get("status") != "proposed":
+                raise _ResolveRejected(_make_error(
+                    -32009,
+                    f"already_resolved: candidate #{cid} is '{rowd.get('status')}' "
+                    f"(resolved_by={rowd.get('resolved_by')!r}); resolution is terminal "
+                    "and cannot be repeated",
+                    request_id,
+                ))
 
             if new_status == "accepted":
                 # Promote to durable learning (the only path that writes to learnings)
@@ -2784,11 +3137,15 @@ def _resolve_candidate(params: dict, request_id: Any) -> dict:
                 (new_status, now, principal.agent_id, reason, cid),
             )
 
-        # Prominent audit log for the governance action (always, since operator path)
+        # Prominent audit log for the governance action (owner or explicit operator)
         logger.warning(
             "RESOLVE_CANDIDATE operator=%s candidate=%s decision=%s new_status=%s reason=%s (G15 audit)",
             principal.agent_id, cid, decision, new_status, reason[:80]
         )
+
+        # B1 drain-on-resolution: every status in status_map is terminal, so an
+        # inbox-sourced candidate's file can now leave the live inbox.
+        _maybe_archive_inbox_source(db, cid)
 
         return _make_response(
             {
@@ -2800,6 +3157,8 @@ def _resolve_candidate(params: dict, request_id: Any) -> dict:
             },
             request_id,
         )
+    except _ResolveRejected as exc:
+        return exc.response
     except Exception as exc:
         logger.exception("resolve_candidate failed")
         return _make_error(-32000, f"resolve_candidate error: {exc}", request_id)

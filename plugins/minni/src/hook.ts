@@ -5,7 +5,7 @@ import {
   CLAUDECODE_VAULT_PATH,
   CLAUDECODE_WORKSPACE_ID,
 } from "./config.js";
-import { resolveActivePlanView } from "./plan.js";
+import { compactPlanPointer, resolveActivePlanView } from "./plan.js";
 import {
   MEMORY_CONTRACT,
   envelopeBudgetFor,
@@ -13,96 +13,69 @@ import {
   wrapEnvelope,
 } from "./agent_envelope.js";
 import type { EnvelopeEvent } from "./agent_envelope.js";
+import {
+  asString,
+  emit,
+  readStdin,
+  VALID_EVENTS,
+  vaultRecallToBody,
+} from "./hook-utils.js";
+import type { HookOutput } from "./hook-utils.js";
 import { routeMemoryIntent } from "./policy.js";
 import {
   ackHandoff,
+  BOOT_RECALL_LAYERS,
   buildStatusReport,
+  extractLearningsSection,
+  fetchStaleBeliefEvents,
   formatRecallLean,
   listPendingHandoffs,
+  readAgentContext,
   recallMemory,
+  stashPrecompactReassert,
   subscribeContradictions,
 } from "./sovereign.js";
 import { extractScarTissue, prepareOutcome } from "./task.js";
 import {
   auditTail,
-  clearInboxEntry,
+  collectCorrectionsReassert,
   ensureVault,
-  readPendingInbox,
+  buildPendingLearningsSection,
+  expireStaleInboxHandoffs,
+  readInboxStatus,
   recordAudit,
   resolveInboxHandoffContext,
   searchVaultNotes,
+  settleReassertedInboxEntries,
   writeInbox,
 } from "./vault.js";
-import type { VaultSearchResult } from "./vault.js";
-
-interface HookOutput {
-  continue?: boolean;
-  hookSpecificOutput?: {
-    hookEventName: EnvelopeEvent;
-    additionalContext: string;
-  };
-  systemMessage?: string;
-}
-
-const VALID_EVENTS: ReadonlyArray<EnvelopeEvent> = [
-  "SessionStart",
-  "UserPromptSubmit",
-  "PreCompact",
-  "Stop",
-];
-
-async function readStdin(): Promise<unknown> {
-  if (process.stdin.isTTY) return {};
-  return new Promise((resolve) => {
-    let data = "";
-    process.stdin.setEncoding("utf8");
-    process.stdin.on("data", (chunk) => {
-      data += chunk;
-    });
-    process.stdin.on("end", () => {
-      if (!data.trim()) {
-        resolve({});
-        return;
-      }
-      try {
-        resolve(JSON.parse(data));
-      } catch {
-        resolve({});
-      }
-    });
-    process.stdin.on("error", () => resolve({}));
-  });
-}
-
-function emit(output: HookOutput): void {
-  process.stdout.write(`${JSON.stringify(output)}\n`);
-}
-
-function asString(value: unknown, fallback = ""): string {
-  return typeof value === "string" ? value : fallback;
-}
-
-function vaultRecallToBody(vault: VaultSearchResult[]): unknown {
-  return vault.slice(0, 6).map((result) => ({
-    wikilink: result.wikilink,
-    score: result.score,
-    snippet: result.snippet.replace(/\s+/g, " ").slice(0, 240),
-  }));
-}
 
 async function handleSessionStart(payload: Record<string, unknown>): Promise<HookOutput> {
   const sessionId = asString(payload.session_id) || asString(payload.sessionId) || "session";
   await ensureVault(CLAUDECODE_VAULT_PATH);
   const status = await buildStatusReport({ vaultPath: CLAUDECODE_VAULT_PATH });
   const tail = await auditTail(CLAUDECODE_VAULT_PATH, 5);
+  // recall-F1: boot recall previously whitelisted layers=['identity'], which
+  // dropped knowledge-layer corrections before rerank. Widen to the
+  // correction-bearing layers (single query; the engine's correction salience
+  // floor ranks fresh corrections above saturated habitual hits) instead of a
+  // second corrections-only round-trip. See BOOT_RECALL_LAYERS for the policy.
   const recall = await recallMemory({
     query: `boot identity for ${CLAUDECODE_WORKSPACE_ID}`,
-    layer: "identity",
-    limit: 4,
+    layers: BOOT_RECALL_LAYERS,
+    limit: 8,
     agentId: CLAUDECODE_AGENT_ID,
     workspaceId: CLAUDECODE_WORKSPACE_ID,
   });
-  const pending = await readPendingInbox(CLAUDECODE_VAULT_PATH, 3);
+  // hooks-PL-2 leg (a): the 'read' RPC is the recency-ordered learning surface
+  // AND the daemon path that records learning_reads — without it, corrections
+  // to beliefs this agent saw can never match in stale_beliefs.
+  const recentLearnings = await readAgentContext({ agentId: CLAUDECODE_AGENT_ID, limit: 8 });
+  // TTL-reap stale file handoffs BEFORE the honest read so they neither occupy
+  // the capped slice nor inflate totals; they surface once below as 'expired'.
+  const expiredHandoffs = await expireStaleInboxHandoffs(CLAUDECODE_VAULT_PATH);
+  const inboxStatus = await readInboxStatus(CLAUDECODE_VAULT_PATH, 3);
+  const pending = inboxStatus.entries;
   const handoffContext = await resolveInboxHandoffContext(CLAUDECODE_VAULT_PATH, pending);
   const pendingHandoffs = await listPendingHandoffs({ agentId: CLAUDECODE_AGENT_ID });
   const pendingHandoffData = pendingHandoffs.ok && pendingHandoffs.data
@@ -112,7 +85,7 @@ async function handleSessionStart(payload: Record<string, unknown>): Promise<Hoo
   for (const handoff of pendingHandoffData.handoffs ?? []) {
     const leaseId = handoff.lease_id ?? handoff.leaseId;
     if (!leaseId) continue;
-    const ack = await ackHandoff({ leaseId, status: "accepted" });
+    const ack = await ackHandoff({ leaseId, status: "accepted", agentId: CLAUDECODE_AGENT_ID });
     if (ack.ok) ackedLeases.push(leaseId);
   }
   const contradictions = await subscribeContradictions({ agentId: CLAUDECODE_AGENT_ID });
@@ -120,9 +93,25 @@ async function handleSessionStart(payload: Record<string, unknown>): Promise<Hoo
   let activePlan: any = undefined;
   try {
     activePlan = await resolveActivePlanView(CLAUDECODE_VAULT_PATH);
-  } catch {
-    // ignore
+  } catch (error) {
+    // hooks-PL-5: a failed plan resolution must not silently boot plan-less.
+    await recordAudit(CLAUDECODE_VAULT_PATH, {
+      tool: "hook_active_plan_error",
+      summary: `SessionStart: ${error instanceof Error ? error.message : String(error)}`,
+    }).catch(() => {});
   }
+
+  // hooks-PL-3: re-assert corrections stashed by PreCompact, so the
+  // post-compaction boot re-injects them even if the daemon is down now.
+  // Only fully-consumed entries are cleared (exactly-once re-injection, no
+  // unbounded inbox growth); cap-overflowed tails are rewritten for the next
+  // boot, and all-malformed entries survive for inspection.
+  const { events: correctionsReassert, consumedPaths: reassertConsumed, deferredTails: reassertDeferred } =
+    collectCorrectionsReassert(pending);
+  await settleReassertedInboxEntries({
+    consumedPaths: reassertConsumed,
+    deferredTails: reassertDeferred,
+  });
 
   const envelopeBody: any = {
     contract: MEMORY_CONTRACT,
@@ -134,24 +123,20 @@ async function handleSessionStart(payload: Record<string, unknown>): Promise<Hoo
       daemon_ok: status.socket.ok,
       afm_ok: status.afm.ok,
     },
-    pending_learnings: pending.map((entry) => ({
-      slug: entry.slug,
-      created: entry.createdAt,
-      path: entry.filePath,
-      candidates: entry.payload.candidates,
-      kind: entry.payload.kind,
-      task: entry.payload.task,
-    })),
+    pending_learnings: buildPendingLearningsSection(inboxStatus, expiredHandoffs),
     handoff_context: handoffContext.map((snippet) => ({
       ref: snippet.ref,
       path: snippet.relativePath,
       snippet: snippet.snippet,
     })),
     handoff_acks: ackedLeases,
+    // hooks-PL-1: pass the daemon's checked/matched discriminator through;
+    // the error branch is explicitly status:"error" so events:[] can never
+    // masquerade as "checked and clean".
     stale_beliefs:
       contradictions.ok && contradictions.data
         ? contradictions.data
-        : { ok: false, error: contradictions.error },
+        : { ok: false, status: "error", error: contradictions.error },
     recall:
       recall.ok && recall.data
         ? {
@@ -159,10 +144,24 @@ async function handleSessionStart(payload: Record<string, unknown>): Promise<Hoo
             results: recall.data.results,
             agent_origin: recall.data.agent_id ?? CLAUDECODE_AGENT_ID,
             layer: recall.data.layer,
+            layers: BOOT_RECALL_LAYERS,
           }
         : { ok: false, error: recall.error },
+    recent_learnings:
+      recentLearnings.ok && recentLearnings.data?.context
+        ? {
+            ok: true,
+            context:
+              extractLearningsSection(recentLearnings.data.context) ??
+              "No recent learnings.",
+          }
+        : { ok: false, error: recentLearnings.error },
     audit_tail: tail.entries.slice(-5).map((entry) => entry.split("\n")[0]),
   };
+
+  if (correctionsReassert.length > 0) {
+    envelopeBody.corrections_reassert = correctionsReassert;
+  }
 
   if (activePlan !== undefined) {
     envelopeBody.active_plan = activePlan;
@@ -181,8 +180,12 @@ async function handleSessionStart(payload: Record<string, unknown>): Promise<Hoo
     details: {
       daemon_ok: status.socket.ok,
       afm_ok: status.afm.ok,
-      pending_inbox: pending.length,
+      pending_inbox: inboxStatus.totalPending,
+      expired_handoffs: expiredHandoffs.length,
       handoff_context: handoffContext.length,
+      corrections_reassert: correctionsReassert.length,
+      reassert_entries_cleared: reassertConsumed.length,
+      reassert_tails_deferred: reassertDeferred.length,
     },
   });
 
@@ -192,26 +195,6 @@ async function handleSessionStart(payload: Record<string, unknown>): Promise<Hoo
       hookEventName: "SessionStart",
       additionalContext: envelope,
     },
-  };
-}
-
-/**
- * Compact plan POINTER for per-turn injection (Option C). Keeps only the
- * actionable one-liners (headline, next_action, progress) plus counts, and tells
- * the agent how to pull the rest on demand. Drops the full goal text,
- * open_questions array (~1.8 KB, static) and pending-slice list.
- */
-function compactPlanPointer(active: { plan_id: string; rev: number; view: any }): any {
-  const v = active?.view ?? {};
-  return {
-    plan_id: active.plan_id,
-    rev: active.rev,
-    headline: v.headline,
-    next_action: v.next_action,
-    progress: v.progress,
-    open_questions_count: Array.isArray(v.open_questions) ? v.open_questions.length : 0,
-    scar_tissue: v.scar_tissue,
-    pull: "Full plan (goal, open_questions, slices) omitted to save context. Call minni_plan_status for detail on demand.",
   };
 }
 
@@ -242,8 +225,13 @@ async function handleUserPromptSubmit(payload: Record<string, unknown>): Promise
   let activePlan: any = undefined;
   try {
     activePlan = await resolveActivePlanView(CLAUDECODE_VAULT_PATH);
-  } catch {
-    // ignore
+  } catch (error) {
+    // hooks-PL-5: surface plan-resolution failures instead of silently
+    // continuing without the active plan pointer.
+    await recordAudit(CLAUDECODE_VAULT_PATH, {
+      tool: "hook_active_plan_error",
+      summary: `UserPromptSubmit: ${error instanceof Error ? error.message : String(error)}`,
+    }).catch(() => {});
   }
 
   const envelopeBody: any = {
@@ -311,14 +299,31 @@ async function handlePreCompact(payload: Record<string, unknown>): Promise<HookO
   // PostToolBatch do). Emitting that shape here fails schema validation with
   // "(root): Invalid input". Continuity across compaction is instead carried by the
   // post-compaction SessionStart hook, which rebuilds audit_tail + recall +
-  // pending_learnings from the vault. So PreCompact only records a durable audit
-  // marker (which SessionStart then reads back) and returns a bare continue.
+  // pending_learnings from the vault.
+  //
+  // hooks-PL-3: compaction is exactly when a correction the agent already saw
+  // can fall out of context. Stash the current stale-belief/contradiction
+  // events durably in the inbox so the post-compaction SessionStart re-asserts
+  // them (corrections_reassert) even if the daemon is down at next boot.
+  const { ok: staleBeliefsOk, events: staleBeliefEvents } =
+    await fetchStaleBeliefEvents(CLAUDECODE_AGENT_ID);
+  const reassertInboxPath = await stashPrecompactReassert({
+    vaultPath: CLAUDECODE_VAULT_PATH,
+    sessionId,
+    agentId: CLAUDECODE_AGENT_ID,
+    staleBeliefEvents,
+    trigger: transcript,
+  });
+
   await recordAudit(CLAUDECODE_VAULT_PATH, {
     tool: "hook_pre_compact",
     summary: `pre-compact ${sessionId}`,
     details: {
       scar_count: scarTissue.length,
       trigger: transcript || "auto",
+      stale_belief_events: staleBeliefEvents.length,
+      stale_beliefs_ok: staleBeliefsOk,
+      ...(reassertInboxPath ? { reassert_inbox_path: reassertInboxPath } : {}),
     },
   });
 
@@ -398,15 +403,20 @@ async function main(): Promise<void> {
     const output = await dispatch(event, payload);
     emit(output);
   } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
     try {
       await recordAudit(CLAUDECODE_VAULT_PATH, {
         tool: "hook_error",
-        summary: `${event}: ${error instanceof Error ? error.message : String(error)}`,
+        summary: `${event}: ${message}`,
       });
     } catch {
-      // last-resort swallow
+      // audit unavailable; the systemMessage below still surfaces the failure
     }
-    emit({ continue: true });
+    // hooks-PL-5: a degraded boot must never look like a clean one — say so.
+    emit({
+      continue: true,
+      systemMessage: `Minni hook degraded (${event}): ${message} — memory injection skipped this event; see vault log.md.`,
+    });
   }
 }
 

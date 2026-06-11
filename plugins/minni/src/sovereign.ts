@@ -6,8 +6,15 @@ import net from "node:net";
 import path from "node:path";
 import { URL } from "node:url";
 import { AFM_HEALTH_URL, AFM_PROVIDER_MODE, DEFAULT_AGENT_ID, DEFAULT_VAULT_PATH, DEFAULT_WORKSPACE_ID, SOCKET_PATH } from "./config.js";
-import { resolveAfmProvider, sanitizeAfmHealth, type AfmProviderMode, type AfmProviderResolution } from "./afm.js";
-import { auditTail, ensureVault, recordAudit, vaultExists } from "./vault.js";
+import {
+  getAfmProviderHealth,
+  resolveAfmProvider,
+  sanitizeAfmHealth,
+  type AfmProviderMode,
+  type AfmProviderResolution,
+  type ProviderHealth,
+} from "./afm.js";
+import { auditTail, ensureVault, recordAudit, vaultExists, writeInbox } from "./vault.js";
 import type { VaultSearchResult } from "./vault.js";
 
 export interface JsonResult<T = unknown> {
@@ -32,14 +39,23 @@ export interface ReadContextResponse {
   backend_badge?: string;
 }
 
+export interface ExtractorStatus {
+  provider: string;
+  tier: "local" | "cloud";
+  generationVerified: boolean;
+  probeAgeMs: number;
+}
+
 export interface StatusReport {
   vault: {
     path: string;
     exists: boolean;
   };
   socket: JsonResult;
+  /** afm.ok is generationVerified (honest health), not mere /health reachability. */
   afm: JsonResult;
   afmProvider: AfmProviderResolution;
+  extractor: ExtractorStatus;
   audit: {
     entries: number;
     latest?: string;
@@ -60,6 +76,31 @@ export function parseSovrdJson<T = unknown>(raw: string): JsonResult<T> {
 // real daemon errors (e.g. identity_mismatch) as "Parse Error: Expected HTTP/".
 // All daemon calls now go through jsonRpcSocketRequest and surface real errors.
 
+/**
+ * Honest /health body inspection. The old behavior treated any HTTP<400
+ * parseable-JSON body as ok without ever reading availability/status values,
+ * so a bridge reporting status=error still counted as healthy.
+ */
+function afmHealthBodyProblem(data: unknown): string | undefined {
+  if (!data || typeof data !== "object") return undefined;
+  const record = data as Record<string, unknown>;
+  // Only definitive negatives veto the downstream generation probe. Unknown
+  // status strings (a bridge update adding e.g. "initializing" or
+  // "degraded-but-serving") must NOT hard-fail health: the probe runs and
+  // decides. The previous closed allowlist {ok,ready,healthy,available,bridge}
+  // kept afm_ok=false even with working generation.
+  const badHealthStatuses = new Set(["error", "fail", "failed", "down", "dead", "stopped", "unavailable"]);
+  if (typeof record.status === "string" && badHealthStatuses.has(record.status.toLowerCase())) {
+    return `afm health degraded: status=${record.status.slice(0, 40)}`;
+  }
+  if (typeof record.availability === "string" && record.availability.toLowerCase() !== "available") {
+    return `afm health degraded: availability=${record.availability.slice(0, 40)}`;
+  }
+  if (record.available === false) return "afm health degraded: available=false";
+  if (record.ok === false) return "afm health degraded: ok=false";
+  return undefined;
+}
+
 export async function afmHealth(url = AFM_HEALTH_URL): Promise<JsonResult> {
   return new Promise((resolve) => {
     const parsedUrl = new URL(url);
@@ -73,6 +114,15 @@ export async function afmHealth(url = AFM_HEALTH_URL): Promise<JsonResult> {
         const parsed = parseSovrdJson(data);
         if (res.statusCode && res.statusCode >= 400) {
           resolve({ ok: false, data: parsed.data, error: `HTTP ${res.statusCode}` });
+          return;
+        }
+        if (!parsed.ok) {
+          resolve(parsed);
+          return;
+        }
+        const problem = afmHealthBodyProblem(parsed.data);
+        if (problem) {
+          resolve({ ok: false, data: parsed.data, error: problem });
           return;
         }
         resolve(parsed);
@@ -92,21 +142,36 @@ export async function socketHealth(): Promise<JsonResult> {
   return jsonRpcSocketRequestWithFallback("status", {});
 }
 
+/**
+ * Layer policy (recall-F1/recall-F6): the two recall surfaces are deliberately
+ * complementary, not contradictory —
+ *  - BOOT (SessionStart) queries BOOT_RECALL_LAYERS: the identity shelf PLUS
+ *    the correction/decision-bearing layers (knowledge, episodic). The old
+ *    identity-only whitelist dropped knowledge-layer corrections before rerank,
+ *    which is how an already-corrected belief survived a 3-hour loop.
+ *  - PER-TURN (UserPromptSubmit) recalls all layers but formatRecallLean drops
+ *    identity-shelf hits, because the shelf was already injected at boot and
+ *    never changes mid-session.
+ * Boot = identity + fresh corrections; per-turn = query-relevant non-identity.
+ */
+export const BOOT_RECALL_LAYERS: ReadonlyArray<string> = ["identity", "knowledge", "episodic"];
+
 export async function recallMemory(input: {
   query: string;
   agentId?: string;
   layer?: string;
+  layers?: ReadonlyArray<string>;
   workspaceId?: string;
   limit?: number;
-}): Promise<JsonResult<RecallResponse>> {
+}, requester: JsonRpcRequester = jsonRpcSocketRequest): Promise<JsonResult<RecallResponse>> {
   // Daemon is JSON-RPC only; surface its real result/error (e.g. identity_mismatch)
   // directly instead of masking it behind a dead HTTP-over-socket fallback.
-  return jsonRpcSocketRequestWithFallback("search", {
+  return jsonRpcSocketRequestWithFallbackRequester("search", {
     query: input.query,
     agent_id: input.agentId ?? DEFAULT_AGENT_ID,
-    layers: input.layer ? [input.layer] : undefined,
+    layers: input.layers ?? (input.layer ? [input.layer] : undefined),
     limit: input.limit,
-  }) as Promise<JsonResult<RecallResponse>>;
+  }, requester) as Promise<JsonResult<RecallResponse>>;
 }
 
 export async function learnMemory(input: {
@@ -133,6 +198,22 @@ export async function readAgentContext(input: {
     agent_id: input.agentId ?? DEFAULT_AGENT_ID,
     limit: input.limit ?? 8,
   }) as Promise<JsonResult<ReadContextResponse>>;
+}
+
+/**
+ * recall-F1 / hooks-PL-2: the daemon 'read' context is identity-shelf heavy;
+ * boot hooks only need its recency-ordered "## Learnings" slice (where fresh
+ * corrections land as new active learnings). Extract just that section so the
+ * read round-trip (which also records learning_reads) stays cheap to inject.
+ */
+export function extractLearningsSection(context: string | undefined): string | undefined {
+  if (!context) return undefined;
+  const match = context.match(/^## Learnings[^\n]*$/m);
+  if (!match || match.index === undefined) return undefined;
+  const rest = context.slice(match.index);
+  const next = rest.slice(match[0].length).search(/^## /m);
+  const section = next >= 0 ? rest.slice(0, match[0].length + next) : rest;
+  return section.trim() || undefined;
 }
 
 export type JsonRpcRequester = (socketPath: string, method: string, params: Record<string, unknown>) => Promise<JsonResult>;
@@ -236,6 +317,13 @@ export async function ackHandoff(
     leaseId: string;
     status: "accepted" | "rejected_stale" | "rejected_contradicts" | "rejected_scope";
     contradictsId?: number;
+    /**
+     * A3 authz: the daemon now requires the stamped caller principal to match
+     * the lease's to_agent — pass the agent identity (server-side config,
+     * never model-supplied) so the daemon can stamp the platform principal,
+     * mirroring listPendingHandoffs.
+     */
+    agentId?: string;
   },
   requester: JsonRpcRequester = jsonRpcSocketRequest,
 ): Promise<JsonResult> {
@@ -243,6 +331,7 @@ export async function ackHandoff(
     lease_id: input.leaseId,
     status: input.status,
     contradicts_id: input.contradictsId,
+    agent_id: input.agentId,
   }, requester);
 }
 
@@ -273,6 +362,48 @@ export async function subscribeContradictions(
     agent_id: input.agentId,
     since_ts: input.sinceTs,
   }, requester);
+}
+
+/**
+ * hooks-PL-3 shared PreCompact leg, part 1: fetch the current stale-belief /
+ * contradiction events for an agent. Shared by all four hook binaries so the
+ * extraction logic cannot drift one-sided (the repo's #1 bug class).
+ */
+export async function fetchStaleBeliefEvents(
+  agentId: string,
+  requester: JsonRpcRequester = jsonRpcSocketRequest,
+): Promise<{ ok: boolean; events: unknown[]; error?: string }> {
+  const contradictions = await subscribeContradictions({ agentId }, requester);
+  const events =
+    contradictions.ok && Array.isArray((contradictions.data as any)?.events)
+      ? ((contradictions.data as any).events as unknown[])
+      : [];
+  return { ok: contradictions.ok, events, error: contradictions.error };
+}
+
+/**
+ * hooks-PL-3 shared PreCompact leg, part 2 (Claude Code / kilocode): stash
+ * non-empty stale-belief events durably in the vault inbox as a dedicated
+ * "precompact_reassert" entry so the post-compaction boot re-asserts them
+ * (corrections_reassert) even if the daemon is down at next boot. Returns the
+ * inbox path, or undefined when there was nothing to stash. (codex/grok carry
+ * the same stale_belief_events field on their precompact handoff payloads.)
+ */
+export async function stashPrecompactReassert(input: {
+  vaultPath: string;
+  sessionId: string;
+  agentId: string;
+  staleBeliefEvents: unknown[];
+  trigger?: string;
+}): Promise<string | undefined> {
+  if (input.staleBeliefEvents.length === 0) return undefined;
+  const entry = await writeInbox(input.vaultPath, input.sessionId, {
+    kind: "precompact_reassert",
+    agent_id: input.agentId,
+    stale_belief_events: input.staleBeliefEvents,
+    compaction_trigger: input.trigger || "compaction in progress",
+  });
+  return entry.filePath;
 }
 
 export async function jsonRpcSocketRequestWithFallback(method: string, params: Record<string, unknown>): Promise<JsonResult> {
@@ -419,6 +550,11 @@ export async function buildStatusReport(input?: {
   socket?: JsonResult;
   afm?: JsonResult;
   afmProviderMode?: AfmProviderMode;
+  /** Test seam: pre-computed verified-generation health (skips the live probe). */
+  afmGeneration?: ProviderHealth;
+  /** Test seam: transport for the 1-token generation probe. */
+  afmGenerationTransport?: (url: string, payload: Record<string, unknown>) => Promise<JsonResult>;
+  afmGenerationTtlMs?: number;
 }): Promise<StatusReport> {
   const vaultPath = input?.vaultPath ?? DEFAULT_VAULT_PATH;
   await ensureVault(vaultPath);
@@ -444,17 +580,49 @@ export async function buildStatusReport(input?: {
     }
   } catch {}
 
+  const afmProvider = resolveAfmProvider(input?.afmProviderMode ?? AFM_PROVIDER_MODE, {
+    nativeHelperPath: process.env.MINNI_AFM_NATIVE_HELPER,
+    health: rawAfm,
+  });
+  const generation =
+    input?.afmGeneration ??
+    (await getAfmProviderHealth({
+      mode: afmProvider.provider,
+      // The HTTP /health result gates the generation probe only for the bridge
+      // provider; in native mode a dead bridge must not veto the probe — the
+      // native helper is exercised directly (mirror of afm_runtime_status).
+      health: afmProvider.provider === "bridge" ? rawAfm : undefined,
+      transport: input?.afmGenerationTransport,
+      ttlMs: input?.afmGenerationTtlMs,
+      nativeHelperPath: process.env.MINNI_AFM_NATIVE_HELPER,
+    }));
+  const sanitizedAfm = sanitizeAfmHealth(rawAfm);
+  // afm_ok is redefined as generationVerified (field name kept for envelope compat):
+  // a verified 1-token completion within the probe TTL, not mere /health reachability.
+  const afm: JsonResult<Record<string, unknown>> = {
+    ok: generation.generationVerified,
+    data: {
+      ...sanitizedAfm.data,
+      reachable: generation.reachable,
+      generationVerified: generation.generationVerified,
+    },
+    error: sanitizedAfm.error ?? (generation.generationVerified ? undefined : generation.detail),
+  };
+
   return {
     vault: {
       path: vaultPath,
       exists: await vaultExists(vaultPath),
     },
     socket: input?.socket ?? (await socketHealth()),
-    afm: sanitizeAfmHealth(rawAfm),
-    afmProvider: resolveAfmProvider(input?.afmProviderMode ?? AFM_PROVIDER_MODE, {
-      nativeHelperPath: process.env.MINNI_AFM_NATIVE_HELPER,
-      health: rawAfm,
-    }),
+    afm,
+    afmProvider,
+    extractor: {
+      provider: afmProvider.provider,
+      tier: "local",
+      generationVerified: generation.generationVerified,
+      probeAgeMs: generation.probeAgeMs,
+    },
     audit: {
       entries: tail.entries.length,
       latest: tail.entries.at(-1),
