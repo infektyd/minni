@@ -1,0 +1,394 @@
+diff --git a/engine/principal.py b/engine/principal.py
+index 1ecd18d..e7c47bf 100644
+--- a/engine/principal.py
++++ b/engine/principal.py
+@@ -65,19 +65,18 @@
+ 
+ PRINCIPALS_DIR: Path = Path(CANONICAL_SOVEREIGN_HOME) / "principals"
+ 
+-# Single source of truth for the canonical principal file names (G11 root-of-trust).
++# Single source of truth for the canonical operator principal file names (G11 root-of-trust).
+ # "main" is included because it is the synthesized default and a reasonable operator choice
+ # for the primary local identity file. All probe, strict-detection, and legacy-alias logic
+ # must use this list so that an operator who only ships principals/main.json is handled
+ # uniformly (no synthesis override, aliases respected, etc.).
+ CANONICAL_PRINCIPAL_NAMES: tuple[str, ...] = ("local", "default", "operator", "main")
++OPERATOR_RESERVED_AGENT_IDS: tuple[str, ...] = ("operator", "main")
+ 
+ 
+ def _has_any_principal_files(d: Path) -> bool:
+-    """Detect strict mode: whether any CANONICAL principal file exists under the dir.
+-    Extracted for testability + hygiene (addresses re-review nit on repeated any() walk).
+-    """
+-    return any((d / f"{n}.json").is_file() for n in CANONICAL_PRINCIPAL_NAMES)
++    """Detect strict mode: whether any principal JSON file exists under the dir."""
++    return any(p.is_file() and p.suffix == ".json" for p in d.glob("*.json"))
+ 
+ 
+ @dataclass(frozen=True)
+@@ -98,6 +97,8 @@ def can(self, capability: str) -> bool:
+     def allows_vault_root(self, path: str | Path) -> bool:
+         """Return True if path is under one of the allowed vault roots (or no restriction)."""
+         if not self.allowed_vault_roots:
++            if not self.capabilities:
++                return False
+             return True
+         try:
+             p = Path(path).resolve()
+@@ -191,7 +192,7 @@ def _principal_from_raw(
+     raw: dict, *, transport: str, principals_dir: Path
+ ) -> EffectivePrincipal:
+     """Construct EffectivePrincipal from a raw JSON dict (with sane defaults)."""
+-    aid = str(raw.get("agent_id") or raw.get("id") or "main")
++    aid = validate_agent_id(str(raw.get("agent_id") or raw.get("id") or "main"))
+     raw_roots = raw.get("allowed_vault_roots", []) or []
+     norm_roots = []
+     for x in raw_roots:
+@@ -366,16 +367,17 @@ def resolve_effective_principal(
+     supplied_agent_id: Optional[str] = None,
+     transport: str = "uds",
+     principals_dir: Optional[Path] = None,
++    operator_context: bool = False,
+ ) -> EffectivePrincipal:
+     """Resolve the single authoritative EffectivePrincipal for this request.
+ 
+-    Rules (G11, post-RCM-003):
+-    - If any principals/*.json exist, strict mode: use the canonical stamped one (first in CANONICAL list).
+-    - If NO principal config files exist (fresh install), synthesize ONLY the fixed local "main"
+-      and reject any wire-supplied agent_id that differs (no more wildcard synthesis).
+-    - If the caller supplied an agent_id that does not match the stamped (or legacy alias in strict),
+-      raise IdentityMismatchError.
+-    - Aliases only honored in strict mode from existing principal files.
++    Rules:
++    - No supplied id means explicit local/operator context and resolves through
++      the canonical operator principal order.
++    - A supplied non-operator agent id first resolves principals/<agent_id>.json.
++    - Unknown/fileless valid agent ids resolve to a default-deny principal.
++    - Reserved operator ids ("main", "operator") require operator_context=True.
++    - Per-agent file id mismatches still raise IdentityMismatchError.
+ 
+     The returned principal (or the raised error) is the ONLY identity that
+     downstream code is allowed to use.
+@@ -397,7 +399,38 @@ def resolve_effective_principal(
+     if supplied_agent_id is None:
+         return stamped
+ 
+-    supplied = str(supplied_agent_id).strip()
++    supplied_raw = str(supplied_agent_id).strip()
++    if not supplied_raw:
++        return stamped
++    try:
++        supplied = validate_agent_id(supplied_raw)
++    except ValueError as exc:
++        raise IdentityMismatchError(supplied_raw, stamped.agent_id, str(exc)) from exc
++
++    if supplied in OPERATOR_RESERVED_AGENT_IDS and not operator_context:
++        return _default_deny_principal(supplied, transport=transport)
++
++    if operator_context:
++        if supplied == stamped.agent_id:
++            return stamped
++        if strict:
++            aliases: list[str] = []
++            for name in CANONICAL_PRINCIPAL_NAMES:
++                raw = _load_raw_principal_file(name, d, strict=True)
++                if raw:
++                    aliases.extend(_principal_aliases(raw))
++            if supplied in aliases:
++                return stamped
++        raise IdentityMismatchError(supplied, stamped.agent_id)
++
++    agent_file_principal = from_operator_config(
++        supplied, principals_dir=d, transport=transport, strict=True
++    )
++    if agent_file_principal is not None:
++        if agent_file_principal.agent_id != supplied:
++            raise IdentityMismatchError(supplied, agent_file_principal.agent_id)
++        return agent_file_principal
++
+     if not supplied:
+         return stamped
+ 
+@@ -455,9 +488,21 @@ def resolve_effective_principal(
+             # Accepted via migration alias from any principal file; return the stamped one.
+             return stamped
+ 
+-    # Mismatch (in strict or in fresh/no-principals mode) → hard deny.
+-    # Fresh installs now ONLY accept the fixed "main"; other supplied ids are rejected.
+-    raise IdentityMismatchError(supplied, stamped.agent_id)
++    if strict and stamped.agent_id not in OPERATOR_RESERVED_AGENT_IDS:
++        raise IdentityMismatchError(supplied, stamped.agent_id)
++
++    return _default_deny_principal(supplied, transport=transport)
++
++
++def _default_deny_principal(agent_id: str, *, transport: str) -> EffectivePrincipal:
++    """Return a valid caller stamp with no capabilities and no vault roots."""
++    return EffectivePrincipal(
++        agent_id=validate_agent_id(agent_id),
++        workspace_id="default",
++        transport=transport,
++        capabilities=[],
++        allowed_vault_roots=[],
++    )
+ 
+ 
+ # Convenience for handlers that want a ready-made JSON-RPC error payload
+@@ -498,7 +543,7 @@ def is_operator_principal(p: EffectivePrincipal) -> bool:
+         return True
+     # Only the explicit operator identities (not all canonical names) get governance by default.
+     # "local"/"default" can be operator if they carry the cap or are the chosen main.
+-    if p.agent_id in ("main", "operator"):
++    if p.agent_id in ("main", "operator") and bool(caps):
+         return True
+     return False
+ 
+diff --git a/engine/test_approval_rpc.py b/engine/test_approval_rpc.py
+index 986fd31..a30e3bb 100644
+--- a/engine/test_approval_rpc.py
++++ b/engine/test_approval_rpc.py
+@@ -78,9 +78,16 @@ def test_agent_cannot_self_resolve_operator_can(tmp_path, monkeypatch):
+     os.chmod(op_file, 0o600)
+     pr_mod.PRINCIPALS_DIR = pdir_op
+     try:
+-        p_op = resolve_effective_principal(supplied_agent_id="main", transport="uds", principals_dir=pdir_op)
++        p_op = resolve_effective_principal(
++            supplied_agent_id="main",
++            transport="uds",
++            principals_dir=pdir_op,
++            operator_context=True,
++        )
+         assert is_operator_principal(p_op)
+-        resp2 = _resolve_candidate({"candidate_id": 999, "decision": "accept", "agent_id": "main"}, 2)
++        # Operator context for RPC is the no-agent-id local path; an agent
++        # explicitly claiming "main" is default-denied by principal.py.
++        resp2 = _resolve_candidate({"candidate_id": 999, "decision": "accept"}, 2)
+         err2 = resp2.get("error", {})
+         assert "operator_only" not in str(err2)
+         # The operator gets PAST the gate; on the empty fixture DB the next
+diff --git a/engine/test_principal_binding.py b/engine/test_principal_binding.py
+index 37cae39..69d0643 100644
+--- a/engine/test_principal_binding.py
++++ b/engine/test_principal_binding.py
+@@ -57,20 +57,20 @@ def test_resolve_fresh_install_only_main_accepted(tmp_path: Path):
+     principals = tmp_path / "principals"
+     principals.mkdir()  # empty -> fresh synthesize mode for "main" only
+ 
+-    # (b) no-principal + "main" supplied or None -> pass with "main"
+-    p = resolve_effective_principal(supplied_agent_id="main", transport="uds", principals_dir=principals)
++    # (b) no-principal + no supplied id is the explicit local/operator path.
++    p = resolve_effective_principal(supplied_agent_id=None, transport="uds", principals_dir=principals)
+     assert isinstance(p, EffectivePrincipal)
+     assert p.agent_id == "main"
+     assert "*" in p.capabilities
+ 
+-    p2 = resolve_effective_principal(supplied_agent_id=None, transport="uds", principals_dir=principals)
+-    assert p2.agent_id == "main"
+-
+-    # (c) no-principal + other -> IdentityMismatchError
+-    with pytest.raises(IdentityMismatchError) as exc:
+-        resolve_effective_principal(supplied_agent_id="claude-code", transport="uds", principals_dir=principals)
+-    assert "claude-code" in str(exc.value)
+-    assert "main" in str(exc.value)
++    # (c) no-principal + valid agent claim -> default-deny caller scope, not operator.
++    p2 = resolve_effective_principal(
++        supplied_agent_id="claude-code", transport="uds", principals_dir=principals
++    )
++    assert p2.agent_id == "claude-code"
++    assert p2.capabilities == []
++    assert p2.allowed_vault_roots == []
++    assert not p2.can("read")
+ 
+     # (a) strict mode with principal file still passes (existing test covers details)
+ 
+@@ -181,6 +181,132 @@ def test_resolve_strict_platform_agent_empty_caps_is_honoured(tmp_path: Path):
+     assert not p.can("search")
+ 
+ 
++def test_resolve_matching_per_agent_principal_file_wins(tmp_path: Path):
++    principals = tmp_path / "principals"
++    principals.mkdir()
++    (principals / "local.json").write_text(
++        json.dumps(
++            {
++                "agent_id": "main",
++                "capabilities": ["*"],
++                "allowed_vault_roots": [str(tmp_path / "operator-vault")],
++            }
++        ),
++        encoding="utf-8",
++    )
++    os.chmod(principals / "local.json", 0o600)
++    codex_root = tmp_path / "codex-vault"
++    shared_root = tmp_path / "shared"
++    (principals / "codex.json").write_text(
++        json.dumps(
++            {
++                "agent_id": "codex",
++                "workspace_id": "default",
++                "capabilities": ["search", "read", "learn"],
++                "allowed_vault_roots": [str(codex_root), str(shared_root)],
++            }
++        ),
++        encoding="utf-8",
++    )
++    os.chmod(principals / "codex.json", 0o600)
++
++    p = resolve_effective_principal(
++        supplied_agent_id="codex", transport="uds", principals_dir=principals
++    )
++
++    assert p.agent_id == "codex"
++    assert p.workspace_id == "default"
++    assert p.capabilities == ["search", "read", "learn"]
++    assert p.allowed_vault_roots == [str(codex_root.resolve()), str(shared_root.resolve())]
++    assert p.allows_vault_root(codex_root / "wiki" / "note.md")
++    assert not p.allows_vault_root(tmp_path / "operator-vault" / "wiki" / "note.md")
++
++
++def test_resolve_unknown_fileless_agent_is_default_deny_not_operator(tmp_path: Path):
++    principals = tmp_path / "principals"
++    principals.mkdir()
++    (principals / "local.json").write_text(
++        json.dumps({"agent_id": "main", "capabilities": ["*"]}),
++        encoding="utf-8",
++    )
++    os.chmod(principals / "local.json", 0o600)
++
++    p = resolve_effective_principal(
++        supplied_agent_id="gemini", transport="uds", principals_dir=principals
++    )
++
++    assert p.agent_id == "gemini"
++    assert p.capabilities == []
++    assert p.allowed_vault_roots == []
++    assert not p.can("search")
++    assert not p.allows_vault_root(tmp_path / "gemini-vault")
++    assert not principal.is_operator_principal(p)
++
++
++def test_agent_claiming_main_is_deny_without_operator_context(tmp_path: Path):
++    principals = tmp_path / "principals"
++    principals.mkdir()
++    (principals / "main.json").write_text(
++        json.dumps({"agent_id": "main", "capabilities": ["*"]}),
++        encoding="utf-8",
++    )
++    os.chmod(principals / "main.json", 0o600)
++
++    p = resolve_effective_principal(
++        supplied_agent_id="main", transport="uds", principals_dir=principals
++    )
++
++    assert p.agent_id == "main"
++    assert p.capabilities == []
++    assert p.allowed_vault_roots == []
++    assert not p.allows_vault_root(tmp_path)
++    assert not principal.is_operator_principal(p)
++
++
++def test_operator_context_can_resolve_main_principal(tmp_path: Path):
++    principals = tmp_path / "principals"
++    principals.mkdir()
++    (principals / "main.json").write_text(
++        json.dumps(
++            {
++                "agent_id": "main",
++                "capabilities": ["*"],
++                "allowed_vault_roots": [str(tmp_path / "operator-vault")],
++            }
++        ),
++        encoding="utf-8",
++    )
++    os.chmod(principals / "main.json", 0o600)
++
++    p = resolve_effective_principal(
++        supplied_agent_id="main",
++        transport="uds",
++        principals_dir=principals,
++        operator_context=True,
++    )
++
++    assert p.agent_id == "main"
++    assert p.capabilities == ["*"]
++    assert principal.is_operator_principal(p)
++
++
++def test_per_agent_principal_file_agent_id_mismatch_raises(tmp_path: Path):
++    principals = tmp_path / "principals"
++    principals.mkdir()
++    (principals / "codex.json").write_text(
++        json.dumps({"agent_id": "gemini", "capabilities": ["read"]}),
++        encoding="utf-8",
++    )
++    os.chmod(principals / "codex.json", 0o600)
++
++    with pytest.raises(IdentityMismatchError) as exc:
++        resolve_effective_principal(
++            supplied_agent_id="codex", transport="uds", principals_dir=principals
++        )
++    assert "codex" in str(exc.value)
++    assert "gemini" in str(exc.value)
++
++
+ def test_strict_principal_bad_permissions_fail_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+     principals = tmp_path / "principals"
+     principals.mkdir()
+@@ -308,20 +434,20 @@ def _patched_resolve(
+ def test_happy_path_with_strict_principal_uses_stamped(
+     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+ ):
+-    """When match (or legacy alias), handler proceeds with the *stamped* agent_id."""
++    """When match (or non-operator legacy alias), handler proceeds with the *stamped* agent_id."""
+     principals = tmp_path / "principals"
+     principals.mkdir()
+     f = principals / "local.json"
+     f.write_text(
+         json.dumps(
+-            {
+-                "agent_id": "stamped-one",
+-                "workspace_id": "g11-test",
+-                "legacy_agent_ids": ["main"],
+-            }
+-        ),
+-        encoding="utf-8",
+-    )
++                {
++                    "agent_id": "stamped-one",
++                    "workspace_id": "g11-test",
++                    "legacy_agent_ids": ["stamped-legacy"],
++                }
++            ),
++            encoding="utf-8",
++        )
+     os.chmod(f, 0o600)  # satisfy strict 0600 hard requirement (Bug 4)
+ 
+     original_resolve = principal.resolve_effective_principal
+@@ -334,7 +460,7 @@ def _patched(*, supplied_agent_id=None, transport="uds", principals_dir=None):
+         )
+ 
+     monkeypatch.setattr(principal, "resolve_effective_principal", _patched)
+-    # Supply legacy alias "main" -> must get stamped "stamped-one" back
+-    p = resolve_effective_principal(supplied_agent_id="main", principals_dir=principals)
++    # Supply a non-operator legacy alias -> must get stamped "stamped-one" back.
++    p = resolve_effective_principal(supplied_agent_id="stamped-legacy", principals_dir=principals)
+     assert p.agent_id == "stamped-one"
+     assert p.workspace_id == "g11-test"
+diff --git a/engine/test_vault_root_binding.py b/engine/test_vault_root_binding.py
+index 2da59ea..8fc3779 100644
+--- a/engine/test_vault_root_binding.py
++++ b/engine/test_vault_root_binding.py
+@@ -52,9 +52,12 @@ def test_allows_vault_root_happy_and_default():
+     p = EffectivePrincipal(agent_id="main", allowed_vault_roots=["/tmp/allowed-root"])
+     assert p.allows_vault_root("/tmp/allowed-root/sub/dir")
+     assert p.allows_vault_root(Path("/tmp/allowed-root"))
+-    # No restriction if empty list (wide open, non-strict default behavior in some synth)
++    # No restriction if empty list for an otherwise-capable operator/default principal.
+     p_open = EffectivePrincipal(agent_id="main", allowed_vault_roots=[])
+     assert p_open.allows_vault_root("/any/place")
++    # Empty caps + empty roots is the explicit default-deny principal shape.
++    p_deny = EffectivePrincipal(agent_id="unknown-agent", capabilities=[], allowed_vault_roots=[])
++    assert not p_deny.allows_vault_root("/any/place")
+ 
+ 
+ def test_vault_root_denies_outside_and_traversal(tmp_path: Path):

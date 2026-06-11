@@ -52,9 +52,12 @@ def test_allows_vault_root_happy_and_default():
     p = EffectivePrincipal(agent_id="main", allowed_vault_roots=["/tmp/allowed-root"])
     assert p.allows_vault_root("/tmp/allowed-root/sub/dir")
     assert p.allows_vault_root(Path("/tmp/allowed-root"))
-    # No restriction if empty list (wide open, non-strict default behavior in some synth)
+    # No restriction if empty list for an otherwise-capable operator/default principal.
     p_open = EffectivePrincipal(agent_id="main", allowed_vault_roots=[])
     assert p_open.allows_vault_root("/any/place")
+    # Empty caps + empty roots is the explicit default-deny principal shape.
+    p_deny = EffectivePrincipal(agent_id="unknown-agent", capabilities=[], allowed_vault_roots=[])
+    assert not p_deny.allows_vault_root("/any/place")
 
 
 def test_vault_root_denies_outside_and_traversal(tmp_path: Path):

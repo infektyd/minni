@@ -65,19 +65,18 @@ logger = logging.getLogger("minnid.principal")
 
 PRINCIPALS_DIR: Path = Path(CANONICAL_SOVEREIGN_HOME) / "principals"
 
-# Single source of truth for the canonical principal file names (G11 root-of-trust).
+# Single source of truth for the canonical operator principal file names (G11 root-of-trust).
 # "main" is included because it is the synthesized default and a reasonable operator choice
 # for the primary local identity file. All probe, strict-detection, and legacy-alias logic
 # must use this list so that an operator who only ships principals/main.json is handled
 # uniformly (no synthesis override, aliases respected, etc.).
 CANONICAL_PRINCIPAL_NAMES: tuple[str, ...] = ("local", "default", "operator", "main")
+OPERATOR_RESERVED_AGENT_IDS: tuple[str, ...] = ("operator", "main")
 
 
 def _has_any_principal_files(d: Path) -> bool:
-    """Detect strict mode: whether any CANONICAL principal file exists under the dir.
-    Extracted for testability + hygiene (addresses re-review nit on repeated any() walk).
-    """
-    return any((d / f"{n}.json").is_file() for n in CANONICAL_PRINCIPAL_NAMES)
+    """Detect strict mode: whether any principal JSON file exists under the dir."""
+    return any(p.is_file() and p.suffix == ".json" for p in d.glob("*.json"))
 
 
 @dataclass(frozen=True)
@@ -98,6 +97,8 @@ class EffectivePrincipal:
     def allows_vault_root(self, path: str | Path) -> bool:
         """Return True if path is under one of the allowed vault roots (or no restriction)."""
         if not self.allowed_vault_roots:
+            if not self.capabilities:
+                return False
             return True
         try:
             p = Path(path).resolve()
@@ -191,7 +192,7 @@ def _principal_from_raw(
     raw: dict, *, transport: str, principals_dir: Path
 ) -> EffectivePrincipal:
     """Construct EffectivePrincipal from a raw JSON dict (with sane defaults)."""
-    aid = str(raw.get("agent_id") or raw.get("id") or "main")
+    aid = validate_agent_id(str(raw.get("agent_id") or raw.get("id") or "main"))
     raw_roots = raw.get("allowed_vault_roots", []) or []
     norm_roots = []
     for x in raw_roots:
@@ -366,16 +367,17 @@ def resolve_effective_principal(
     supplied_agent_id: Optional[str] = None,
     transport: str = "uds",
     principals_dir: Optional[Path] = None,
+    operator_context: bool = False,
 ) -> EffectivePrincipal:
     """Resolve the single authoritative EffectivePrincipal for this request.
 
-    Rules (G11, post-RCM-003):
-    - If any principals/*.json exist, strict mode: use the canonical stamped one (first in CANONICAL list).
-    - If NO principal config files exist (fresh install), synthesize ONLY the fixed local "main"
-      and reject any wire-supplied agent_id that differs (no more wildcard synthesis).
-    - If the caller supplied an agent_id that does not match the stamped (or legacy alias in strict),
-      raise IdentityMismatchError.
-    - Aliases only honored in strict mode from existing principal files.
+    Rules:
+    - No supplied id means explicit local/operator context and resolves through
+      the canonical operator principal order.
+    - A supplied non-operator agent id first resolves principals/<agent_id>.json.
+    - Unknown/fileless valid agent ids resolve to a default-deny principal.
+    - Reserved operator ids ("main", "operator") require operator_context=True.
+    - Per-agent file id mismatches still raise IdentityMismatchError.
 
     The returned principal (or the raised error) is the ONLY identity that
     downstream code is allowed to use.
@@ -397,7 +399,38 @@ def resolve_effective_principal(
     if supplied_agent_id is None:
         return stamped
 
-    supplied = str(supplied_agent_id).strip()
+    supplied_raw = str(supplied_agent_id).strip()
+    if not supplied_raw:
+        return stamped
+    try:
+        supplied = validate_agent_id(supplied_raw)
+    except ValueError as exc:
+        raise IdentityMismatchError(supplied_raw, stamped.agent_id, str(exc)) from exc
+
+    if supplied in OPERATOR_RESERVED_AGENT_IDS and not operator_context:
+        return _default_deny_principal(supplied, transport=transport)
+
+    if operator_context:
+        if supplied == stamped.agent_id:
+            return stamped
+        if strict:
+            aliases: list[str] = []
+            for name in CANONICAL_PRINCIPAL_NAMES:
+                raw = _load_raw_principal_file(name, d, strict=True)
+                if raw:
+                    aliases.extend(_principal_aliases(raw))
+            if supplied in aliases:
+                return stamped
+        raise IdentityMismatchError(supplied, stamped.agent_id)
+
+    agent_file_principal = from_operator_config(
+        supplied, principals_dir=d, transport=transport, strict=True
+    )
+    if agent_file_principal is not None:
+        if agent_file_principal.agent_id != supplied:
+            raise IdentityMismatchError(supplied, agent_file_principal.agent_id)
+        return agent_file_principal
+
     if not supplied:
         return stamped
 
@@ -455,9 +488,21 @@ def resolve_effective_principal(
             # Accepted via migration alias from any principal file; return the stamped one.
             return stamped
 
-    # Mismatch (in strict or in fresh/no-principals mode) → hard deny.
-    # Fresh installs now ONLY accept the fixed "main"; other supplied ids are rejected.
-    raise IdentityMismatchError(supplied, stamped.agent_id)
+    if strict and stamped.agent_id not in OPERATOR_RESERVED_AGENT_IDS:
+        raise IdentityMismatchError(supplied, stamped.agent_id)
+
+    return _default_deny_principal(supplied, transport=transport)
+
+
+def _default_deny_principal(agent_id: str, *, transport: str) -> EffectivePrincipal:
+    """Return a valid caller stamp with no capabilities and no vault roots."""
+    return EffectivePrincipal(
+        agent_id=validate_agent_id(agent_id),
+        workspace_id="default",
+        transport=transport,
+        capabilities=[],
+        allowed_vault_roots=[],
+    )
 
 
 # Convenience for handlers that want a ready-made JSON-RPC error payload
@@ -498,7 +543,7 @@ def is_operator_principal(p: EffectivePrincipal) -> bool:
         return True
     # Only the explicit operator identities (not all canonical names) get governance by default.
     # "local"/"default" can be operator if they carry the cap or are the chosen main.
-    if p.agent_id in ("main", "operator"):
+    if p.agent_id in ("main", "operator") and bool(caps):
         return True
     return False
 
