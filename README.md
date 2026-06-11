@@ -167,7 +167,7 @@ register the same server with a pinned identity and vault:
 | Codex | [`.codex-plugin/`](plugins/minni/.codex-plugin/) |
 | Gemini | [`.gemini-plugin/`](plugins/minni/.gemini-plugin/) |
 | KiloCode | [`.kilocode-plugin/`](plugins/minni/.kilocode-plugin/) |
-| Grok CLI | native hooks ([`src/grok-hook.ts`](plugins/minni/src/grok-hook.ts)), registered via the `minni-install` skill |
+| Grok CLI | MCP wired via `~/.grok/config.toml`; native hooks ([`src/grok-hook.ts`](plugins/minni/src/grok-hook.ts), [`hooks/hooks-grok.json`](plugins/minni/hooks/hooks-grok.json)) registered manually in Grok's hook config |
 
 **Automatic behavior is recall-only.** Durable learning is proposal-first
 (`minni_learn` stages → `minni_resolve_candidate` writes), and cross-agent

@@ -20,11 +20,13 @@ the first failing layer; everything below it will look broken too.
 ## Quick Triage (60 seconds)
 
 1. Call `minni_status` (or `/minni:status`). Read it strictly:
-   - `daemon_ok: true` — the daemon answered on the socket. If false, nothing
+   - `socket.ok: true` — the daemon answered on the socket. If false, nothing
      else matters; go to Layer 1 below.
-   - `afm_ok: true` — means a **verified one-token completion** succeeded, not
+   - `afm.ok: true` — means a **verified one-token completion** succeeded, not
      merely "a process responded". (Honest-health contract, PR #69. If an older
      install reports ok without a completion, that itself is a finding.)
+     (`minni_status` returns `StatusReport` with `socket.ok`/`afm.ok`; hook
+     envelopes alias these as `daemon_ok`/`afm_ok` — do not confuse the two.)
    - `vault` — must be THIS agent's vault (`~/.minni/<agent-id>-vault`), an
      actual directory, not a symlink, not another agent's path.
 2. Call `minni_recall` with a term you know exists. Empty-but-healthy recall
@@ -121,8 +123,8 @@ Healthy inboxes drain. PR #69 semantics:
 On a source checkout, these are the ground truth (counts as of 2026-06-11):
 
 ```bash
-cd engine && PYTHONPATH=. pytest -q          # expect ~560 passed
-cd plugins/minni && npm run build && npm test # expect ~327 passed
+cd engine && PYTHONPATH=. pytest -q          # expect 538 passed, 5 skipped
+cd plugins/minni && npm run build && npm test # expect 327 passed
 bash scripts/repro-smoke.sh                   # hermetic daemon smoke
 ```
 
