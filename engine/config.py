@@ -398,3 +398,33 @@ def resolve_canonical_path(kind: str) -> str:
                 env_key, env_val, kind, val, home
             )
     return val
+
+
+# --- Workspace ID normalization (G14) ----------------------------------------
+# Canonical convention: 'workspace-<lowercased basename of workspace path>'
+# Examples: /Users/hansaxelsson/Projects/Minni -> 'workspace-minni'
+#          /path/to/PROJECT -> 'workspace-project'
+#          'workspace-minni' -> 'workspace-minni' (idempotent)
+#          empty/None -> '' (passthrough)
+
+def normalize_workspace_id(value: Optional[str]) -> str:
+    """Normalize workspace_id to canonical form 'workspace-<basename>'.
+
+    - If value is already 'workspace-*', lowercase and return it.
+    - If value is a filesystem path, extract basename, lowercase, prepend 'workspace-'.
+    - If empty or None, return empty string.
+    """
+    if not value:
+        return ""
+    value = str(value).strip()
+    if not value:
+        return ""
+    # Already canonical form: normalize the suffix to lowercase
+    if value.startswith("workspace-"):
+        return "workspace-" + value[len("workspace-"):].lower()
+    # Treat as filesystem path: extract basename, lowercase, prepend prefix
+    basename = os.path.basename(value.rstrip("/"))
+    if not basename:
+        # Edge case: "/" -> use empty (no valid basename)
+        return ""
+    return "workspace-" + basename.lower()

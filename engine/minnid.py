@@ -94,6 +94,7 @@ from principal import (                                     # noqa: E402  # G11 
     is_operator_principal,
     make_mismatch_error,
     resolve_effective_principal,
+    validate_agent_id,
 )
 
 # G12 (SEC-003): vault root binding guard. Enforces that any vault_path accepted
@@ -1042,7 +1043,10 @@ def _handle_search(params: dict, request_id: Any) -> dict:
     if not query:
         return _make_error(-32602, "query is required", request_id)
 
-    # G11: EffectivePrincipal is the single server-stamped source (never trust caller)
+    # G11: EffectivePrincipal is the single server-stamped source (never trust caller).
+    # Some legacy/mixed clients can still arrive without a usable principal; that
+    # path keeps learning recall unscoped for back-compat instead of silently
+    # dropping other agents' rows.
     supplied = params.get("agent_id")
     try:
         principal = resolve_effective_principal(
@@ -1050,7 +1054,8 @@ def _handle_search(params: dict, request_id: Any) -> dict:
         )
     except IdentityMismatchError as exc:
         return make_mismatch_error(exc.supplied, exc.stamped, request_id)
-    agent_id = principal.agent_id
+    agent_id = principal.agent_id if principal is not None else None
+    cross_agent = bool(params.get("cross_agent", False)) or principal is None
     limit = min(int(params.get("limit", 5)), 20)
     depth = str(params.get("depth", "headline"))
     budget_tokens_param = params.get("budget_tokens")
@@ -1083,9 +1088,10 @@ def _handle_search(params: dict, request_id: Any) -> dict:
             end_date=end_date,
             expand=expand,
             summarize_neighborhood=summarize_neighborhood,
+            cross_agent=cross_agent,
             # G19/G20/G22: pass stamped principal so can_read_document + evidence envelope applied
             principal=principal,
-            workspace=principal.workspace_id,
+            workspace=principal.workspace_id if principal is not None else "default",
         )
 
         # Apply MMR token-budget packing if requested
@@ -1108,7 +1114,11 @@ def _handle_search(params: dict, request_id: Any) -> dict:
         learnings: list = []
         try:
             learnings = engine.search_learnings(
-                query, agent_id=agent_id, limit=limit, source="minnid.search"
+                query,
+                agent_id=agent_id,
+                cross_agent=cross_agent,
+                limit=limit,
+                source="minnid.search",
             )
         except Exception as exc:
             # hooks-PL-5: visible, never silently green
@@ -1633,6 +1643,10 @@ def _handle_learn(params: dict, request_id: Any) -> dict:
     except IdentityMismatchError as exc:
         return make_mismatch_error(exc.supplied, exc.stamped, request_id)
     agent_id = principal.agent_id
+    try:
+        validate_agent_id(agent_id)
+    except ValueError as exc:
+        return _make_error(-32602, str(exc), request_id)
     category = params.get("category", "general")
     force = bool(params.get("force", False))
 
@@ -1855,6 +1869,10 @@ def _handle_resolve_contradiction(params: dict, request_id: Any) -> dict:
     except IdentityMismatchError as exc:
         return make_mismatch_error(exc.supplied, exc.stamped, request_id)
     agent_id = principal.agent_id
+    try:
+        validate_agent_id(agent_id)
+    except ValueError as exc:
+        return _make_error(-32602, str(exc), request_id)
     category = params.get("category", "general")
     assertion = params.get("assertion")
     applies_when = params.get("applies_when")
@@ -2483,6 +2501,15 @@ def _promote_candidate_durable(candidate_id: int, reason: str = "afm-consolidati
         return None
     content = cand.get("content") or ""
     agent_id = cand.get("principal") or "afm-loop"
+    try:
+        validate_agent_id(agent_id)
+    except ValueError as exc:
+        logger.warning(
+            "_promote_candidate_durable: invalid agent_id %r (%s) — skipping",
+            agent_id,
+            exc,
+        )
+        return None
     from afm_passes.consolidation import content_hash as _content_hash
     chash = _content_hash(content)
 
@@ -2898,8 +2925,7 @@ def _stage_candidate(params: dict, request_id: Any) -> dict:
     instr = 1 if params.get("instruction_like") else 0
 
     try:
-        from db import SovereignDB as _SovDB
-        db = _SovDB()
+        db = _lazy_writeback().db
         with db.cursor() as c:
             c.execute(
                 """
@@ -3036,6 +3062,11 @@ def _resolve_candidate(params: dict, request_id: Any) -> dict:
         )
     except IdentityMismatchError as exc:
         return make_mismatch_error(exc.supplied, exc.stamped, request_id)
+
+    try:
+        validate_agent_id(principal.agent_id)
+    except ValueError as exc:
+        return _make_error(-32602, str(exc), request_id)
 
     cid = params.get("candidate_id")
     if cid is None:

@@ -19,6 +19,24 @@ function expandTilde(p: string): string {
 }
 
 /**
+ * Normalize workspace_id to canonical form 'workspace-<basename>'.
+ * - If already 'workspace-*', lowercase and return it.
+ * - If a filesystem path, extract basename, lowercase, prepend 'workspace-'.
+ * - Empty/undefined returns empty string.
+ */
+function normalizeWorkspaceId(value: string | undefined): string {
+  if (!value) return "";
+  value = value.trim();
+  if (!value) return "";
+  if (value.startsWith("workspace-")) {
+    return "workspace-" + value.slice("workspace-".length).toLowerCase();
+  }
+  const basename = path.basename(value.replace(/\/$/, ""));
+  if (!basename) return "";
+  return "workspace-" + basename.toLowerCase();
+}
+
+/**
  * Minni home dir, honoring MINNI_HOME (mirror of engine/config.py, which reads
  * os.environ["MINNI_HOME"] for the same paths — without this the engine and
  * the plugin would silently load different provider configs).
@@ -237,8 +255,10 @@ export const CLAUDECODE_AGENT_ID =
   process.env.MINNI_CLAUDECODE_AGENT_ID ?? "claude-code";
 
 export const CLAUDECODE_WORKSPACE_ID =
-  process.env.MINNI_CLAUDECODE_WORKSPACE_ID ??
-  `workspace-${path.basename(process.cwd())}`;
+  normalizeWorkspaceId(
+    process.env.MINNI_CLAUDECODE_WORKSPACE_ID ??
+      `workspace-${path.basename(process.cwd())}`
+  );
 
 export const CLAUDECODE_VAULT_PATH = expandTilde(
   process.env.MINNI_CLAUDECODE_VAULT_PATH ??
@@ -259,8 +279,10 @@ export const KILOCODE_AGENT_ID =
   process.env.MINNI_KILOCODE_AGENT_ID ?? "kilocode";
 
 export const KILOCODE_WORKSPACE_ID =
-  process.env.MINNI_KILOCODE_WORKSPACE_ID ??
-  `workspace-${path.basename(process.cwd())}`;
+  normalizeWorkspaceId(
+    process.env.MINNI_KILOCODE_WORKSPACE_ID ??
+      `workspace-${path.basename(process.cwd())}`
+  );
 
 export const KILOCODE_VAULT_PATH = expandTilde(
   process.env.MINNI_KILOCODE_VAULT_PATH ??
@@ -281,8 +303,10 @@ export const GROK_AGENT_ID =
   process.env.MINNI_GROK_AGENT_ID ?? "grok-build";
 
 export const GROK_WORKSPACE_ID =
-  process.env.MINNI_GROK_WORKSPACE_ID ??
-  `workspace-${path.basename(process.cwd())}`;
+  normalizeWorkspaceId(
+    process.env.MINNI_GROK_WORKSPACE_ID ??
+      `workspace-${path.basename(process.cwd())}`
+  );
 
 export const GROK_VAULT_PATH = expandTilde(
   process.env.MINNI_GROK_VAULT_PATH ??

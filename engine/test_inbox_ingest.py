@@ -177,7 +177,7 @@ def _cc_stop_doc(candidates, **overrides):
 
 def test_ingests_kindless_claude_code_shape_attributed_to_vault_agent(tmp_path):
     """Kind-less CC stop-candidate files must be ingested and attributed to the
-    agent that owns the vault (claudecode-vault -> 'claudecode'), not 'codex'."""
+    agent that owns the vault (claudecode-vault -> 'claude-code'), not 'codex'."""
     from afm_passes.inbox_ingest import ingest
 
     db_obj, cfg = _make_db(tmp_path)
@@ -186,10 +186,10 @@ def test_ingests_kindless_claude_code_shape_attributed_to_vault_agent(tmp_path):
 
     res = ingest(db_obj, cfg, inboxes=[inbox], dry_run=False)
     assert res["inserted"] == 1, res
-    assert _count_proposed(db_obj, principal="claudecode") == 1
+    assert _count_proposed(db_obj, principal="claude-code") == 1
     assert _count_proposed(db_obj, principal="codex") == 0
     with db_obj.cursor() as c:
-        c.execute("SELECT derived_from FROM candidate_packets WHERE principal='claudecode'")
+        c.execute("SELECT derived_from FROM candidate_packets WHERE principal='claude-code'")
         df = json.loads(dict(c.fetchone())["derived_from"])
     assert df["source"] == "inbox" and df["inbox_file"] == "cc.json"
     # Provenance must record what the file declared — kind-less CC files must

@@ -163,14 +163,29 @@ def _is_stop_candidate_shape(doc: Dict[str, Any]) -> bool:
     )
 
 
+# Maps vault slug (dir name without -vault suffix) -> canonical agent_id
+# Derived from _default_agent_vault aliases in minnid.py (source of truth).
+# claude-code is preferred over claudecode because it is the canonical id.
+_VAULT_SLUG_TO_AGENT_ID: dict[str, str] = {
+    "claudecode": "claude-code",
+    "codex": "codex",
+    "hermes": "hermes",
+    "openclaw": "openclaw",
+    "grok-build": "grok-build",
+    "grok-beta": "grok-beta",
+    "grok": "grok",
+}
+
+
 def _principal_for_inbox(inbox: Path, fallback_principal: str) -> str:
     """Derive the owning agent from the vault dir name (``<agent>-vault/inbox``)
     so kind-less candidates are attributed to the right agent (e.g.
-    ``claudecode-vault`` -> ``claudecode``) instead of the global fallback. The
+    ``claudecode-vault`` -> ``claude-code``) instead of the global fallback. The
     daemon's own bare ``vault/inbox`` (no ``-vault`` suffix) uses the fallback."""
     parent = inbox.parent.name
     if parent.endswith("-vault"):
-        return parent[: -len("-vault")] or fallback_principal
+        slug = parent[: -len("-vault")]
+        return _VAULT_SLUG_TO_AGENT_ID.get(slug, slug) or fallback_principal
     return fallback_principal
 
 

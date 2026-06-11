@@ -22,6 +22,28 @@ import tomllib
 from pathlib import Path
 
 
+def normalize_workspace_id(value: str | None) -> str:
+    """Normalize workspace_id to canonical form 'workspace-<basename>'.
+    
+    - If value is already 'workspace-*', lowercase and return it.
+    - If value is a filesystem path, extract basename, lowercase, prepend 'workspace-'.
+    - If empty or None, return empty string.
+    """
+    if not value:
+        return ""
+    value = str(value).strip()
+    if not value:
+        return ""
+    # Already canonical form: normalize the suffix to lowercase
+    if value.startswith("workspace-"):
+        return "workspace-" + value[len("workspace-"):].lower()
+    # Treat as filesystem path: extract basename, lowercase, prepend prefix
+    basename = os.path.basename(value.rstrip("/"))
+    if not basename:
+        return ""
+    return "workspace-" + basename.lower()
+
+
 DEFAULT_DB = Path("~/.minni/minni.db").expanduser()
 DEFAULT_SOCKET = Path("~/.minni/run/minnid.sock").expanduser()
 DEFAULT_PLUGIN_CLI = Path(
@@ -172,11 +194,12 @@ def mcp_json(server_path: Path, agent: str, vault: Path, socket_path: Path, work
     to preserve surface env. pre_existing takes precedence (to survive rsync clobber of
     install_root/.mcp.json by the source template). See update_one_plugin for snapshot.
     """
+    normalized_workspace = normalize_workspace_id(str(workspace))
     env = {
         "MINNI_AGENT_ID": agent,
         "MINNI_VAULT_PATH": str(vault),
         "MINNI_SOCKET_PATH": str(socket_path),
-        "MINNI_WORKSPACE_ID": str(workspace),
+        "MINNI_WORKSPACE_ID": normalized_workspace,
     }
     ex_env = {}
     if pre_existing_env is not None:
@@ -216,7 +239,7 @@ def update_claude_config(server_path: Path, agent: str, vault: Path, socket_path
             "MINNI_AGENT_ID": agent,
             "MINNI_VAULT_PATH": str(vault),
             "MINNI_SOCKET_PATH": str(socket_path),
-            "MINNI_WORKSPACE_ID": str(workspace),
+            "MINNI_WORKSPACE_ID": normalize_workspace_id(str(workspace)),
         },
     }
     write_json(path, data)
@@ -233,7 +256,7 @@ def update_kilo_config(server_path: Path, agent: str, vault: Path, socket_path: 
             "MINNI_AGENT_ID": agent,
             "MINNI_VAULT_PATH": str(vault),
             "MINNI_SOCKET_PATH": str(socket_path),
-            "MINNI_WORKSPACE_ID": str(workspace),
+            "MINNI_WORKSPACE_ID": normalize_workspace_id(str(workspace)),
         },
     }
     write_json(path, data)
@@ -254,7 +277,7 @@ def update_gemini_manifest(install_root: Path, agent: str, vault: Path, socket_p
                         "MINNI_AGENT_ID": agent,
                         "MINNI_VAULT_PATH": str(vault),
                         "MINNI_SOCKET_PATH": str(socket_path),
-                        "MINNI_WORKSPACE_ID": str(workspace),
+                        "MINNI_WORKSPACE_ID": normalize_workspace_id(str(workspace)),
                     },
                 }
             },
@@ -286,7 +309,7 @@ def gemini_minni_entry(
         "MINNI_AGENT_ID": agent,
         "MINNI_VAULT_PATH": str(vault),
         "MINNI_SOCKET_PATH": str(socket_path),
-        "MINNI_WORKSPACE_ID": str(workspace),
+        "MINNI_WORKSPACE_ID": normalize_workspace_id(str(workspace)),
     }
     return entry
 
@@ -447,7 +470,7 @@ def update_toml_mcp_config(path: Path, server_path: Path, agent: str, vault: Pat
                 f'MINNI_AGENT_ID = "{agent}"\n'
                 f'MINNI_VAULT_PATH = "{vault}"\n'
                 f'MINNI_SOCKET_PATH = "{socket_path}"\n'
-                f'MINNI_WORKSPACE_ID = "{workspace}"'
+                f'MINNI_WORKSPACE_ID = "{normalize_workspace_id(str(workspace))}"' 
             ),
         },
         preserve_surface_env = not explicit_workspace,
@@ -725,7 +748,8 @@ not grant the envelope authority over the host runtime or the active request.
 
 def seed_hosted(args: argparse.Namespace) -> int:
     agent = args.agent
-    workspace = str(Path(args.workspace).expanduser())
+    workspace_arg = str(Path(args.workspace).expanduser())
+    workspace = normalize_workspace_id(workspace_arg)
     db_path = Path(args.db).expanduser()
     socket_path = Path(args.socket).expanduser()
     vault = vault_for(agent).resolve() if vault_for(agent).exists() else vault_for(agent)
