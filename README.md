@@ -103,7 +103,7 @@ delete complexity.
 
 ## Getting started
 
-**Prerequisites:** Python 3.11+, Node.js 20+.
+**Prerequisites:** Python 3.11+ (3.11/3.12 recommended for reproducible numpy/FAISS wheels), Node.js 20+.
 
 <details>
 <summary><strong>Setup steps</strong> — engine daemon, plugin, smoke check</summary>
