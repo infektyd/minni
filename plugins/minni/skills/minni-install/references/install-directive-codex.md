@@ -80,7 +80,7 @@ npm test
 Install the plugin cache:
 
 ```bash
-python3 /Users/hansaxelsson/Projects/Minni/plugins/minni/skills/minni-propagation/scripts/propagate.py \
+python3 /Users/hansaxelsson/Projects/Minni/plugins/minni/skills/minni-install/scripts/propagate.py \
   --repo /Users/hansaxelsson/Projects/Minni \
   --socket /Users/hansaxelsson/.minni/run/minnid.sock \
   update-plugin --platform codex
@@ -118,7 +118,7 @@ launchctl kickstart -k gui/$UID/com.minni.minnid
 Regenerate the hosted envelope after install:
 
 ```bash
-python3 /Users/hansaxelsson/Projects/Minni/plugins/minni/skills/minni-propagation/scripts/propagate.py \
+python3 /Users/hansaxelsson/Projects/Minni/plugins/minni/skills/minni-install/scripts/propagate.py \
   --repo /Users/hansaxelsson/Projects/Minni \
   --socket /Users/hansaxelsson/.minni/run/minnid.sock \
   seed-hosted --agent codex --workspace /Users/hansaxelsson/Projects/Minni
@@ -156,7 +156,7 @@ cd /Users/hansaxelsson/Projects/Minni/plugins/minni && npm test
 cd /Users/hansaxelsson/Projects/Minni
 python3 -m pytest engine/test_principal_binding.py engine/test_approval_rpc.py -q
 /Applications/Codex.app/Contents/Resources/codex doctor
-python3 plugins/minni/skills/minni-propagation/scripts/propagate.py \
+python3 plugins/minni/skills/minni-install/scripts/propagate.py \
   --repo /Users/hansaxelsson/Projects/Minni \
   --socket /Users/hansaxelsson/.minni/run/minnid.sock \
   verify --agent codex --workspace /Users/hansaxelsson/Projects/Minni

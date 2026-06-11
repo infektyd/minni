@@ -92,7 +92,7 @@ def vault_for(agent: str) -> Path:
         legacy = Path("~/.gemini/minni-vault").expanduser()
         if not canonical.exists() and legacy.exists() and any(legacy.iterdir()):
             sys.stderr.write(
-                f"[minni-propagation] gemini vault still at legacy path: {legacy}\n"
+                f"[minni-install] gemini vault still at legacy path: {legacy}\n"
                 f"  Move it to the canonical layout to silence this warning:\n"
                 f"    mv {legacy} {canonical}\n"
             )

@@ -12,7 +12,7 @@ from pathlib import Path
 
 SCRIPTS_DIR = str(
     Path(__file__).resolve().parent.parent
-    / "plugins" / "minni" / "skills" / "minni-propagation" / "scripts"
+    / "plugins" / "minni" / "skills" / "minni-install" / "scripts"
 )
 if SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, SCRIPTS_DIR)
