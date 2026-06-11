@@ -241,7 +241,7 @@ export const DEFAULT_AGENT_ID =
 export const DEFAULT_WORKSPACE_ID =
   process.env.MINNI_WORKSPACE_ID ??
   process.env.MINNI_CODEX_WORKSPACE_ID ??
-  "workspace-codex";
+  "workspace-unknown";
 
 export const CODEX_HOOKS_ENABLED =
   (process.env.MINNI_CODEX_HOOKS ?? "on").toLowerCase() !== "off";
