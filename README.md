@@ -103,7 +103,7 @@ delete complexity.
 
 ## Getting started
 
-**Prerequisites:** Python 3.11+ (3.11/3.12 recommended for reproducible numpy/FAISS wheels), Node.js 20+.
+**Prerequisites:** Python 3.11+, Node.js 20+.
 
 <details>
 <summary><strong>Setup steps</strong> — engine daemon, plugin, smoke check</summary>
@@ -167,7 +167,7 @@ register the same server with a pinned identity and vault:
 | Codex | [`.codex-plugin/`](plugins/minni/.codex-plugin/) |
 | Gemini | [`.gemini-plugin/`](plugins/minni/.gemini-plugin/) |
 | KiloCode | [`.kilocode-plugin/`](plugins/minni/.kilocode-plugin/) |
-| Grok CLI | MCP wired via `~/.grok/config.toml`; native hooks ([`src/grok-hook.ts`](plugins/minni/src/grok-hook.ts), [`hooks/hooks-grok.json`](plugins/minni/hooks/hooks-grok.json)) registered manually in Grok's hook config |
+| Grok CLI | native hooks ([`src/grok-hook.ts`](plugins/minni/src/grok-hook.ts)), registered via the propagation skill |
 
 **Automatic behavior is recall-only.** Durable learning is proposal-first
 (`minni_learn` stages → `minni_resolve_candidate` writes), and cross-agent
