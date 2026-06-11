@@ -6,6 +6,11 @@ import test from "node:test";
 
 import { ensureVault, recordAudit, auditTail } from "../dist/vault.js";
 
+// Hermetic guard: recordAudit writes per-agent rate-limit state under
+// MINNI_HOME (falling back to ~/.minni) — point it at a temp dir so the
+// suite never touches the real home (CI smoke asserts zero ~ pollution).
+process.env.MINNI_HOME = await mkdtemp(path.join(tmpdir(), "sm-test-home-"));
+
 // SEC-014: a forged summary containing `\n## [...]` must not be split into
 // multiple audit entries by either the TS or Python reader.
 

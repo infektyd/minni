@@ -12,6 +12,11 @@ import {
 } from "../dist/team-repetition.js";
 import { recordAudit } from "../dist/vault.js";
 
+// Hermetic guard: recordAudit writes per-agent rate-limit state under
+// MINNI_HOME (falling back to ~/.minni) — point it at a temp dir so the
+// suite never touches the real home (CI smoke asserts zero ~ pollution).
+process.env.MINNI_HOME = await mkdtemp(path.join(tmpdir(), "sm-test-home-"));
+
 const NOW = new Date("2026-05-08T12:00:00.000Z");
 
 function isoDaysAgo(days, time = "10:00:00.000Z") {

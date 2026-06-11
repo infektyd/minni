@@ -63,7 +63,7 @@ levels; this table is the honest picture, not a roadmap.
 | Compile passes (AFM) | **alpha** | 8 passes incl. inbox ingest/archive; dry-run only by default |
 | Team coordination | **alpha** | 3 tools registered; multi-agent scenarios largely untested |
 | Per-agent vault isolation | **alpha** | Enforcement engine built + tested; hardening tracked separately |
-| Qdrant / Lance backends | **stub** | Placeholders; FAISS is the only active vector backend |
+| Qdrant / Lance backends | **stub** | Planned — Minni targets solo dev and enterprise scale; the backend seam is kept clean so proven at-scale stores slot in. FAISS is the only active backend today |
 | Comparative eval vs baselines | **not started** | Harness exists; no head-to-head against RAG / wiki-only yet |
 
 *Stable* = relied upon, breaking changes need migration · *Beta* = works + tested, API may shift ·

@@ -186,6 +186,9 @@ plugins/minni/skills/*/scripts/
 /docs/PANEL_EVAL_STABILIZATION.md
 /docs/RC_PLAN.md
 
+# Run-harvest tooling kept private for now (operator decision 2026-06-11)
+scripts/run_harvest.py
+
 # --- local-only hygiene (never belonged on git) ---
 .mypy_cache/
 /venv/

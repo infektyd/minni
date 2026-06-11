@@ -8,6 +8,7 @@ V3.1 changes:
 - Embeddings are always raw float32 blobs (384-dim = 1536 bytes each)
 """
 
+import os
 import sqlite3
 import threading
 import time
@@ -16,9 +17,16 @@ from typing import Optional
 
 from config import SovereignConfig, DEFAULT_CONFIG
 
-# Module-level flag: migrations run exactly once per process, regardless of
-# how many SovereignDB instances are created or how many threads call connect.
+# Module-level flag: True once any SovereignDB has run migrations this process.
+# Kept as a bool for backward-compatibility with test code that manipulates it
+# directly (e.g. ``db_mod._migrations_run = False`` to force a re-run).
 _migrations_run = False
+# Per-path tracking: set of absolute db_path strings that have been migrated
+# this process. This lets each unique database file (e.g. per-test tmp paths)
+# receive its own migrations run even after _migrations_run is True, which
+# fixes the CI isolation failure where test-scoped dbs were skipped because the
+# process-wide flag was already set by an earlier test's db.
+_migrated_paths: set = set()
 _migrations_lock = threading.Lock()
 
 
@@ -340,13 +348,29 @@ class SovereignDB:
 
         conn.commit()
 
-        # Run schema migrations exactly once per process, after the base schema
-        # is committed. The module-level flag ensures re-entry is impossible
-        # even if multiple SovereignDB instances are created.
-        global _migrations_run
-        if not _migrations_run:
+        # Run schema migrations for this db file, guarded by two independent
+        # checks that both must clear before migrations run:
+        #
+        # 1. _migrations_run (bool): legacy per-process flag, still respected so
+        #    that test helpers which set ``db_mod._migrations_run = False`` to
+        #    force a re-run continue to work.
+        #
+        # 2. _migrated_paths (set): per-file tracking introduced so that each
+        #    unique db path receives migrations even when _migrations_run is True
+        #    (which happens when a previous test db set the flag while a new tmp
+        #    path db has never been migrated — the root cause of CI failures with
+        #    "no such table: candidate_packets" in test_pr6_contradictions).
+        #
+        # Migrations run when EITHER flag says they should:
+        #   - _migrations_run is False  (global re-run forced, e.g. by test setup)
+        #   - db_path not in _migrated_paths  (first contact with this file)
+        global _migrations_run, _migrated_paths
+        abs_db_path = os.path.abspath(self.config.db_path)
+        needs_run = (not _migrations_run) or (abs_db_path not in _migrated_paths)
+        if needs_run:
             with _migrations_lock:
-                if not _migrations_run:
+                needs_run = (not _migrations_run) or (abs_db_path not in _migrated_paths)
+                if needs_run:
                     try:
                         from migrations import run_migrations
                         run_migrations(conn)
@@ -359,6 +383,7 @@ class SovereignDB:
                             "Migrations runner failed (non-fatal): %s", e
                         )
                     _migrations_run = True
+                    _migrated_paths.add(abs_db_path)
 
     def close(self):
         """Close thread-local connection."""

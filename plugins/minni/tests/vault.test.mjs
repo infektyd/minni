@@ -16,6 +16,11 @@ import {
 } from "../dist/vault.js";
 import { symlink } from "node:fs/promises"; // for RCM-005 escape test
 
+// Hermetic guard: recordAudit writes per-agent rate-limit state under
+// MINNI_HOME (falling back to ~/.minni) — point it at a temp dir so the
+// suite never touches the real home (CI smoke asserts zero ~ pollution).
+process.env.MINNI_HOME = await mkdtemp(path.join(tmpdir(), "sm-test-home-"));
+
 test("ensureVault creates the Codex LLM wiki structure and schema", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "sm-vault-"));
   try {

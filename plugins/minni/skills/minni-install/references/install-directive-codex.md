@@ -73,16 +73,15 @@ cp ~/.codex/config.toml ~/.codex/plugin-install-backups/<run>/config.toml.before
 Build and test:
 
 ```bash
-cd /Users/hansaxelsson/Projects/Minni/plugins/minni
-npm test
+cd plugins/minni && npm test && cd ../..
 ```
 
 Install the plugin cache:
 
 ```bash
-python3 /Users/hansaxelsson/Projects/Minni/plugins/minni/skills/minni-propagation/scripts/propagate.py \
-  --repo /Users/hansaxelsson/Projects/Minni \
-  --socket /Users/hansaxelsson/.minni/run/minnid.sock \
+python3 plugins/minni/skills/minni-install/scripts/propagate.py \
+  --repo . \
+  --socket ~/.minni/run/minnid.sock \
   update-plugin --platform codex
 ```
 
@@ -118,10 +117,10 @@ launchctl kickstart -k gui/$UID/com.minni.minnid
 Regenerate the hosted envelope after install:
 
 ```bash
-python3 /Users/hansaxelsson/Projects/Minni/plugins/minni/skills/minni-propagation/scripts/propagate.py \
-  --repo /Users/hansaxelsson/Projects/Minni \
-  --socket /Users/hansaxelsson/.minni/run/minnid.sock \
-  seed-hosted --agent codex --workspace /Users/hansaxelsson/Projects/Minni
+python3 plugins/minni/skills/minni-install/scripts/propagate.py \
+  --repo . \
+  --socket ~/.minni/run/minnid.sock \
+  seed-hosted --agent codex --workspace .
 ```
 
 Also check `/Users/hansaxelsson/.minni/identities/codex/CODEX_LAYER1_SHELF.md`.
@@ -152,28 +151,27 @@ The 2026-05-31 run used:
 Run these before declaring GO:
 
 ```bash
-cd /Users/hansaxelsson/Projects/Minni/plugins/minni && npm test
-cd /Users/hansaxelsson/Projects/Minni
+cd plugins/minni && npm test && cd ../..
 python3 -m pytest engine/test_principal_binding.py engine/test_approval_rpc.py -q
 /Applications/Codex.app/Contents/Resources/codex doctor
-python3 plugins/minni/skills/minni-propagation/scripts/propagate.py \
-  --repo /Users/hansaxelsson/Projects/Minni \
-  --socket /Users/hansaxelsson/.minni/run/minnid.sock \
-  verify --agent codex --workspace /Users/hansaxelsson/Projects/Minni
-MINNI_AGENT_ID=codex MINNI_VAULT_PATH=/Users/hansaxelsson/.minni/codex-vault \
-MINNI_SOCKET_PATH=/Users/hansaxelsson/.minni/run/minnid.sock \
-MINNI_WORKSPACE_ID=/Users/hansaxelsson/Projects/Minni \
-node /Users/hansaxelsson/.codex/plugins/cache/minni/minni/0.1.0/dist/cli.js status
+python3 plugins/minni/skills/minni-install/scripts/propagate.py \
+  --repo . \
+  --socket ~/.minni/run/minnid.sock \
+  verify --agent codex --workspace .
+MINNI_AGENT_ID=codex MINNI_VAULT_PATH=~/.minni/codex-vault \
+MINNI_SOCKET_PATH=~/.minni/run/minnid.sock \
+MINNI_WORKSPACE_ID=$(pwd) \
+node ~/.codex/plugins/cache/minni/minni/0.1.0/dist/cli.js status
 ```
 
 Hook smoke:
 
 ```bash
-MINNI_AGENT_ID=codex MINNI_VAULT_PATH=/Users/hansaxelsson/.minni/codex-vault \
-MINNI_SOCKET_PATH=/Users/hansaxelsson/.minni/run/minnid.sock \
-MINNI_WORKSPACE_ID=/Users/hansaxelsson/Projects/Minni \
-PLUGIN_ROOT=/Users/hansaxelsson/.codex/plugins/cache/minni/minni/0.1.0 \
-node /Users/hansaxelsson/.codex/plugins/cache/minni/minni/0.1.0/dist/codex-hook.js SessionStart < /dev/null
+MINNI_AGENT_ID=codex MINNI_VAULT_PATH=~/.minni/codex-vault \
+MINNI_SOCKET_PATH=~/.minni/run/minnid.sock \
+MINNI_WORKSPACE_ID=$(pwd) \
+PLUGIN_ROOT=~/.codex/plugins/cache/minni/minni/0.1.0 \
+node ~/.codex/plugins/cache/minni/minni/0.1.0/dist/codex-hook.js SessionStart < /dev/null
 ```
 
 Expected GO criteria:
