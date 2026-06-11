@@ -1,0 +1,5 @@
+No source diff for slice-0-baseline.
+
+This baseline slice intentionally committed evidence only:
+- `evidence/slice-0-baseline/result.md`
+- `evidence/slice-0-baseline/diff.patch`
