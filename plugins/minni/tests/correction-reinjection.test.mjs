@@ -748,13 +748,16 @@ for (const hook of HOOK_MATRIX) {
   });
 
   test(`[${hook.name}] SessionStart with daemon down reports stale_beliefs status:'error'`, async (t) => {
+    const home = await mkdtemp(path.join(tmpdir(), "sm-home-"));
     const vault = await mkdtemp(path.join(tmpdir(), `sm-${hook.name}-vault-`));
     t.after(async () => {
+      await rm(home, { recursive: true, force: true });
       await rm(vault, { recursive: true, force: true });
     });
     const env = {
       // Nonexistent socket: every RPC fails. The boot must still emit a clean
       // envelope where the failure is explicit, not silent (hooks-PL-1/PL-5).
+      MINNI_HOME: home,
       MINNI_SOCKET_PATH: path.join(vault, "no-such-daemon.sock"),
       MINNI_AFM_HEALTH_URL: "http://127.0.0.1:1/health",
       MINNI_BYPASS_AUDIT_LIMIT: "true",
