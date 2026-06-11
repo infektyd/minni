@@ -203,8 +203,8 @@ class TestDepthTiers:
         calls = []
 
         class FakeEngine:
-            def expand_result(self, result_id, depth="chunk"):
-                calls.append((result_id, depth))
+            def expand_result(self, result_id, depth="chunk", principal=None, workspace=None):
+                calls.append((result_id, depth, getattr(principal, "agent_id", None), workspace))
                 return {"doc_id": result_id, "chunk_id": result_id * 10, "depth": depth}
 
         monkeypatch.setattr(minnid, "_lazy_retrieval", lambda: FakeEngine())
@@ -216,7 +216,7 @@ class TestDepthTiers:
         })
 
         assert "error" not in response
-        assert calls == [(1, "snippet"), (2, "snippet")]
+        assert calls == [(1, "snippet", "main", "default"), (2, "snippet", "main", "default")]
         assert response["result"]["count"] == 2
 
     def test_sm_export_pack_is_deterministic(self, monkeypatch):

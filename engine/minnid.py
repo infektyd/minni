@@ -1301,6 +1301,14 @@ def _handle_sm_drill(params: dict, request_id: Any) -> dict:
     if depth not in {"snippet", "chunk", "document"}:
         return _make_error(-32602, "depth must be snippet, chunk, or document", request_id)
 
+    supplied = params.get("agent_id")
+    try:
+        principal = resolve_effective_principal(
+            supplied_agent_id=supplied, transport="uds"
+        )
+    except IdentityMismatchError as exc:
+        return make_mismatch_error(exc.supplied, exc.stamped, request_id)
+
     try:
         ids = [int(value) for value in raw_ids]
     except (TypeError, ValueError):
@@ -1311,7 +1319,12 @@ def _handle_sm_drill(params: dict, request_id: Any) -> dict:
         results = []
         missing = []
         for result_id in ids:
-            result = engine.expand_result(result_id=result_id, depth=depth)
+            result = engine.expand_result(
+                result_id=result_id,
+                depth=depth,
+                principal=principal,
+                workspace=principal.workspace_id,
+            )
             if result is None:
                 missing.append(result_id)
             else:
