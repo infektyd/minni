@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
 
 const CONFIG_ENV_KEYS = [
@@ -62,4 +65,22 @@ test("Codex-specific env remains a compatibility fallback", async () => {
       assert.equal(config.DEFAULT_WORKSPACE_ID, "/tmp/codex-workspace");
     },
   );
+});
+
+test("no env falls back to unknown deny identity, not codex vault", async () => {
+  await withConfigEnv({}, (config) => {
+    assert.equal(config.DEFAULT_AGENT_ID, "unknown-agent");
+    assert.equal(
+      config.DEFAULT_VAULT_PATH,
+      path.join(os.homedir(), ".minni", "unknown-vault"),
+    );
+  });
+});
+
+test("Codex MCP manifest pins codex env explicitly", () => {
+  const manifest = JSON.parse(readFileSync(new URL("../.mcp.json", import.meta.url), "utf8"));
+  const env = manifest.mcpServers?.minni?.env;
+  assert.equal(env?.MINNI_AGENT_ID, "codex");
+  assert.equal(env?.MINNI_VAULT_PATH, "~/.minni/codex-vault");
+  assert.equal(env?.MINNI_SOCKET_PATH, "~/.minni/run/minnid.sock");
 });

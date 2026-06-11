@@ -3,7 +3,12 @@
     "minni": {
       "command": "node",
       "args": ["./dist/server.js"],
-      "cwd": "."
+      "cwd": ".",
+      "env": {
+        "MINNI_AGENT_ID": "codex",
+        "MINNI_VAULT_PATH": "~/.minni/codex-vault",
+        "MINNI_SOCKET_PATH": "~/.minni/run/minnid.sock"
+      }
     }
   }
 }

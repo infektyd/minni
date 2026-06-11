@@ -49,7 +49,7 @@ export function minniHome(): string {
 export const DEFAULT_VAULT_PATH = expandTilde(
   process.env.MINNI_VAULT_PATH ??
     process.env.MINNI_CODEX_VAULT_PATH ??
-    path.join(os.homedir(), ".minni", "codex-vault"),
+    path.join(os.homedir(), ".minni", "unknown-vault"),
 );
 
 export const SOCKET_PATH = expandTilde(
@@ -236,7 +236,7 @@ export const AFM_PROVIDER_MODE =
 export const DEFAULT_AGENT_ID =
   process.env.MINNI_AGENT_ID ??
   process.env.MINNI_CODEX_AGENT_ID ??
-  "codex";
+  "unknown-agent";
 
 export const DEFAULT_WORKSPACE_ID =
   process.env.MINNI_WORKSPACE_ID ??
