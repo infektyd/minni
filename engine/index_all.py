@@ -8,14 +8,18 @@ Usage:
     python index_all.py              # Index everything (vault + wiki)
     python index_all.py --vault-only # Index only the Obsidian vault
     python index_all.py --wiki-only  # Index only wiki directories
+    python index_all.py --vault-ingest-all
+                                      # Index all ~/.minni/*-vault wiki trees
     python index_all.py --verbose    # Show per-file progress
 """
 
+import argparse
 import sys
 import logging
+from pathlib import Path
 from typing import Dict
 
-from config import SovereignConfig, DEFAULT_CONFIG
+from config import CANONICAL_SOVEREIGN_HOME, SovereignConfig, DEFAULT_CONFIG
 from db import SovereignDB
 from indexer import VaultIndexer
 from wiki_indexer import WikiIndexer
@@ -87,28 +91,95 @@ def index_all(
     return combined_stats
 
 
-if __name__ == "__main__":
+def discover_agent_vaults(minni_home: str | Path | None = None) -> list[Path]:
+    """Return ~/.minni/*-vault dirs, excluding the legacy bare ~/.minni/vault."""
+    home = Path(minni_home or CANONICAL_SOVEREIGN_HOME).expanduser()
+    if not home.is_dir():
+        return []
+    return sorted(
+        path
+        for path in home.glob("*-vault")
+        if path.is_dir() and path.name != "vault"
+    )
+
+
+def index_agent_vaults(
+    config: SovereignConfig = None,
+    *,
+    minni_home: str | Path | None = None,
+    dry_run: bool = False,
+    verbose: bool = False,
+) -> Dict[str, Dict]:
+    """Run vault_ingest across every discovered agent vault."""
+    config = config or DEFAULT_CONFIG
+    db = SovereignDB(config)
+    from afm_passes.vault_ingest import run as run_vault_ingest
+
+    combined: Dict[str, Dict] = {}
+    for vault in discover_agent_vaults(minni_home):
+        if verbose:
+            logger.info("═══ Vault ingest: %s ═══", vault)
+        stats = run_vault_ingest(
+            db,
+            config,
+            vault_path=str(vault),
+            dry_run=dry_run,
+            trace_id="manual-index-all",
+        )
+        combined[str(vault)] = stats
+        if verbose:
+            logger.info("Vault ingest %s: %s", vault, stats)
+    db.close()
+    return combined
+
+
+def _print_stats(title: str, stats: Dict) -> None:
+    print(f"\n{'═' * 50}")
+    print(title)
+    if not stats:
+        print("  no sources found")
+        return
+    for source, s in stats.items():
+        if isinstance(s, dict):
+            details = ", ".join(
+                f"{k}={v}" for k, v in s.items()
+                if k not in {"status", "drafts"}
+            )
+            print(f"  {source}: {details}")
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Run Minni indexers.")
+    parser.add_argument("--vault-only", action="store_true", help="Index only the legacy configured vault")
+    parser.add_argument("--wiki-only", action="store_true", help="Index only configured wiki paths")
+    parser.add_argument("--vault-ingest-all", action="store_true", help="Run vault_ingest for every ~/.minni/*-vault")
+    parser.add_argument("--dry-run", action="store_true", help="Report vault_ingest work without writing index stores")
+    parser.add_argument("--minni-home", help="Override ~/.minni for --vault-ingest-all")
+    parser.add_argument("--verbose", action="store_true", help="Show per-file progress")
+    args = parser.parse_args(argv)
+
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(name)s] %(message)s",
         datefmt="%H:%M:%S",
     )
 
-    args = set(sys.argv[1:])
-    verbose = "--verbose" in args
-    vault_only = "--vault-only" in args
-    wiki_only = "--wiki-only" in args
+    if args.vault_ingest_all:
+        stats = index_agent_vaults(
+            minni_home=args.minni_home,
+            dry_run=args.dry_run,
+            verbose=args.verbose,
+        )
+        _print_stats("Vault ingest complete:", stats)
+        return 0
 
-    do_vault = not wiki_only
-    do_wiki = not vault_only
+    do_vault = not args.wiki_only
+    do_wiki = not args.vault_only
 
-    stats = index_all(vault=do_vault, wiki=do_wiki, verbose=verbose)
-    print(f"\n{'═' * 50}")
-    print("Index complete:")
-    for source, s in stats.items():
-        if isinstance(s, dict):
-            details = ", ".join(
-                f"{k}={v}" for k, v in s.items()
-                if k != "status"
-            )
-            print(f"  {source}: {details}")
+    stats = index_all(vault=do_vault, wiki=do_wiki, verbose=args.verbose)
+    _print_stats("Index complete:", stats)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
