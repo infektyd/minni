@@ -143,6 +143,12 @@ def _search(params: dict):
     return _dispatch_sync({"jsonrpc": "2.0", "id": 1, "method": "search", "params": params})
 
 
+def _drill(params: dict):
+    from minnid import _dispatch_sync
+
+    return _dispatch_sync({"jsonrpc": "2.0", "id": 1, "method": "sm_drill", "params": params})
+
+
 def _sources(resp: dict) -> list[str]:
     assert "error" not in resp, resp
     return [Path(row["source"]).name for row in resp["result"]["results"]]
@@ -156,6 +162,18 @@ def _src_markers(resp: dict) -> list[str]:
 def _rows(resp: dict) -> list[dict]:
     assert "error" not in resp, resp
     return resp["result"]["results"]
+
+
+def _hit_reference(row: dict) -> dict:
+    return {
+        "doc_id": row.get("doc_id"),
+        "chunk_id": row.get("chunk_id"),
+        "src": row.get("src"),
+        "source": row.get("source"),
+        "wikilink": row.get("wikilink"),
+        "score": row.get("score"),
+        "provenance": row.get("provenance"),
+    }
 
 
 def _build_indexes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -263,6 +281,77 @@ def test_scope_combined_merges_all_existing_vault_indexes_plus_shared(tmp_path, 
 
     assert set(_sources(resp)) == {"codex.md", "claude.md", "shared.md"}
     assert set(_src_markers(resp)) == {"c"}
+
+
+def test_drill_reference_returns_personal_full_provenance(tmp_path, monkeypatch):
+    from vault_index import vault_index_paths
+
+    _, cfg, codex_vault, claude_vault = _build_indexes(tmp_path, monkeypatch)
+    _install_principal(monkeypatch, tmp_path, "codex")
+    _install_runtime(
+        monkeypatch,
+        tmp_path,
+        cfg,
+        {"codex": codex_vault, "claude-code": claude_vault},
+    )
+    search = _search(
+        {
+            "query": "beacon",
+            "agent_id": "codex",
+            "scope": "personal",
+            "expand": False,
+            "limit": 5,
+        }
+    )
+    ref = _hit_reference(_rows(search)[0])
+
+    drilled = _drill({"references": [ref], "depth": "chunk"})
+
+    assert "error" not in drilled, drilled
+    result = drilled["result"]["results"][0]
+    assert Path(result["source"]).name == "codex.md"
+    assert result["src"] == "p"
+    full = result["full_provenance"]
+    assert full["owning_agent_id"] == "codex"
+    assert full["source_vault"] == str(codex_vault.resolve())
+    assert full["index_db_path"] == str(vault_index_paths(codex_vault).db_path.resolve())
+    assert isinstance(full["indexed_at"], float)
+    assert full["score_components"]["score"] == ref["score"]
+
+
+def test_drill_reference_resolves_combined_foreign_vault_provenance(tmp_path, monkeypatch):
+    from vault_index import vault_index_paths
+
+    _, cfg, codex_vault, claude_vault = _build_indexes(tmp_path, monkeypatch)
+    _install_principal(monkeypatch, tmp_path, "codex")
+    _install_runtime(
+        monkeypatch,
+        tmp_path,
+        cfg,
+        {"codex": codex_vault, "claude-code": claude_vault},
+    )
+    search = _search(
+        {
+            "query": "beacon",
+            "agent_id": "codex",
+            "scope": "combined",
+            "expand": False,
+            "limit": 10,
+        }
+    )
+    claude_hit = next(row for row in _rows(search) if Path(row["source"]).name == "claude.md")
+
+    drilled = _drill({"references": [_hit_reference(claude_hit)], "depth": "chunk"})
+
+    assert "error" not in drilled, drilled
+    result = drilled["result"]["results"][0]
+    assert Path(result["source"]).name == "claude.md"
+    assert result["src"] == "c"
+    full = result["full_provenance"]
+    assert full["owning_agent_id"] == "claude-code"
+    assert full["source_vault"] == str(claude_vault.resolve())
+    assert full["index_db_path"] == str(vault_index_paths(claude_vault).db_path.resolve())
+    assert isinstance(full["indexed_at"], float)
 
 
 @pytest.mark.parametrize(

@@ -1492,18 +1492,240 @@ def _handle_expand(params: dict, request_id: Any) -> dict:
         return _make_error(-32000, f"Expand error: {exc}", request_id)
 
 
+def _indexed_at_for_result(retrieval_engine, result: dict) -> Optional[float]:
+    doc_id = result.get("doc_id")
+    if doc_id is None:
+        return None
+    try:
+        with retrieval_engine.db.cursor() as c:
+            c.execute("SELECT indexed_at FROM documents WHERE doc_id = ?", (int(doc_id),))
+            row = c.fetchone()
+        if row is None:
+            return None
+        value = row["indexed_at"]
+        return float(value) if value is not None else None
+    except Exception:
+        return None
+
+
+def _score_components(reference: dict, result: dict) -> dict:
+    ref_prov = reference.get("provenance") if isinstance(reference.get("provenance"), dict) else {}
+    result_prov = result.get("provenance") if isinstance(result.get("provenance"), dict) else {}
+
+    def pick(*names):
+        for name in names:
+            if name in reference and reference.get(name) is not None:
+                return reference.get(name)
+            if name in ref_prov and ref_prov.get(name) is not None:
+                return ref_prov.get(name)
+            if name in result and result.get(name) is not None:
+                return result.get(name)
+            if name in result_prov and result_prov.get(name) is not None:
+                return result_prov.get(name)
+        return None
+
+    return {
+        "score": pick("score"),
+        "fts_rank": pick("fts_rank"),
+        "semantic_rank": pick("semantic_rank", "sem_rank"),
+        "rrf_score": pick("rrf_score"),
+        "cross_encoder_score": pick("cross_encoder_score", "rerank_score"),
+        "decay_factor": pick("decay_factor", "decay_score"),
+        "backend": pick("backend"),
+    }
+
+
+def _full_provenance(
+    *,
+    retrieval_engine,
+    source_agent: str,
+    source_vault: str,
+    index_db_path: str,
+    reference: dict,
+    result: dict,
+) -> dict:
+    return {
+        "owning_agent_id": source_agent,
+        "document_agent": result.get("agent"),
+        "source_vault": source_vault,
+        "index_db_path": index_db_path,
+        "indexed_at": _indexed_at_for_result(retrieval_engine, result),
+        "score_components": _score_components(reference, result),
+    }
+
+
+def _reference_candidates(reference: dict, principal, agent_id: Optional[str], shared_engine) -> list:
+    marker = reference.get("src")
+    candidates = []
+
+    def add(candidate):
+        if candidate is None:
+            return
+        retrieval_engine, source_agent, index_db_path, principal_for_documents = candidate
+        key = str(index_db_path)
+        if any(str(existing[3]) == key for existing in candidates):
+            return
+        source_vault = str(Path(getattr(retrieval_engine.config, "vault_path", "")).expanduser().resolve())
+        candidates.append(
+            (
+                retrieval_engine,
+                source_agent,
+                source_vault,
+                index_db_path,
+                principal_for_documents,
+            )
+        )
+
+    shared_candidate = (
+        shared_engine,
+        "shared",
+        DEFAULT_CONFIG.db_path,
+        None,
+    )
+
+    if principal is None:
+        add(shared_candidate)
+        return candidates
+
+    personal = _agent_vault_retrieval(agent_id) if agent_id else None
+    if marker == "p":
+        if personal is not None:
+            vault_engine, source_agent, index_db_path = personal
+            add((vault_engine, source_agent, index_db_path, principal))
+        add(shared_candidate)
+        return candidates
+
+    if marker == "c":
+        for vault_engine, source_agent, index_db_path in _all_vault_retrievals():
+            add((vault_engine, source_agent, index_db_path, None))
+        add(shared_candidate)
+        return candidates
+
+    if personal is not None:
+        vault_engine, source_agent, index_db_path = personal
+        add((vault_engine, source_agent, index_db_path, principal))
+    for vault_engine, source_agent, index_db_path in _all_vault_retrievals():
+        add((vault_engine, source_agent, index_db_path, None))
+    add(shared_candidate)
+    return candidates
+
+
+def _reference_matches(result: dict, reference: dict) -> bool:
+    ref_source = reference.get("source") or reference.get("path")
+    if ref_source:
+        try:
+            return Path(str(result.get("source") or "")).resolve() == Path(str(ref_source)).resolve()
+        except Exception:
+            return str(result.get("source") or "") == str(ref_source)
+    ref_wikilink = reference.get("wikilink")
+    if ref_wikilink:
+        return str(result.get("wikilink") or "") == str(ref_wikilink)
+    return True
+
+
+def _reference_ids_for_engine(reference: dict, retrieval_engine) -> list[int]:
+    raw_id = reference.get("chunk_id") or reference.get("doc_id") or reference.get("result_id")
+    if raw_id is not None:
+        try:
+            return [int(raw_id)]
+        except (TypeError, ValueError):
+            return []
+
+    ref_source = reference.get("source") or reference.get("path")
+    ref_wikilink = reference.get("wikilink")
+    normalized_wikilink = str(ref_wikilink).strip() if ref_wikilink else ""
+    if normalized_wikilink and not normalized_wikilink.startswith("[["):
+        normalized_wikilink = f"[[{normalized_wikilink.removesuffix('.md')}]]"
+
+    ids = []
+    try:
+        from retrieval import _path_to_wikilink  # type: ignore
+
+        with retrieval_engine.db.cursor() as c:
+            c.execute("SELECT doc_id, path FROM documents")
+            rows = c.fetchall()
+        for row in rows:
+            path_value = str(row["path"])
+            if ref_source:
+                try:
+                    if Path(path_value).resolve() == Path(str(ref_source)).resolve():
+                        ids.append(int(row["doc_id"]))
+                        continue
+                except Exception:
+                    if path_value == str(ref_source):
+                        ids.append(int(row["doc_id"]))
+                        continue
+            if normalized_wikilink and _path_to_wikilink(path_value) == normalized_wikilink:
+                ids.append(int(row["doc_id"]))
+    except Exception:
+        return ids
+    return ids
+
+
+def _expand_reference(
+    reference: dict,
+    *,
+    depth: str,
+    principal,
+    agent_id: Optional[str],
+    shared_engine,
+) -> Optional[dict]:
+    for retrieval_engine, source_agent, source_vault, index_db_path, principal_for_documents in _reference_candidates(
+        reference,
+        principal,
+        agent_id,
+        shared_engine,
+    ):
+        for result_id in _reference_ids_for_engine(reference, retrieval_engine):
+            result = retrieval_engine.expand_result(
+                result_id=result_id,
+                depth=depth,
+                principal=principal_for_documents,
+                workspace=(
+                    principal_for_documents.workspace_id
+                    if principal_for_documents is not None
+                    else "default"
+                ),
+            )
+            if result is None or not _reference_matches(result, reference):
+                continue
+            marker = "p" if reference.get("src") == "p" else "c"
+            full = _full_provenance(
+                retrieval_engine=retrieval_engine,
+                source_agent=source_agent,
+                source_vault=source_vault,
+                index_db_path=str(Path(index_db_path).expanduser().resolve()),
+                reference=reference,
+                result=result,
+            )
+            result["src"] = marker
+            result["full_provenance"] = full
+            provenance = result.get("provenance")
+            if not isinstance(provenance, dict):
+                provenance = {}
+            provenance.update(full)
+            result["provenance"] = provenance
+            return result
+    return None
+
+
 def _handle_sm_drill(params: dict, request_id: Any) -> dict:
     """Batch drill prior headline results to snippet/chunk/document depth."""
     global _request_count
     _request_count += 1
 
     raw_ids = params.get("chunk_ids", params.get("result_ids"))
-    if raw_ids is None:
-        return _make_error(-32602, "chunk_ids or result_ids is required", request_id)
-    if not isinstance(raw_ids, list):
+    raw_references = params.get("references", params.get("refs"))
+    if raw_ids is None and raw_references is None:
+        return _make_error(-32602, "chunk_ids, result_ids, references, or refs is required", request_id)
+    if raw_ids is not None and not isinstance(raw_ids, list):
         return _make_error(-32602, "chunk_ids/result_ids must be a list", request_id)
-    if len(raw_ids) > 20:
-        return _make_error(-32602, "sm_drill accepts at most 20 ids", request_id)
+    if raw_references is not None and not isinstance(raw_references, list):
+        return _make_error(-32602, "references/refs must be a list", request_id)
+    raw_ids = raw_ids or []
+    raw_references = raw_references or []
+    if len(raw_ids) + len(raw_references) > 20:
+        return _make_error(-32602, "sm_drill accepts at most 20 ids/references", request_id)
 
     depth = str(params.get("depth", "snippet"))
     if depth not in {"snippet", "chunk", "document"}:
@@ -1514,7 +1736,26 @@ def _handle_sm_drill(params: dict, request_id: Any) -> dict:
     except (TypeError, ValueError):
         return _make_error(-32602, "all ids must be integers", request_id)
 
+    references = []
+    for ref in raw_references:
+        if isinstance(ref, dict):
+            references.append(ref)
+        elif isinstance(ref, str):
+            stripped = ref.strip()
+            references.append({"wikilink": stripped} if stripped.startswith("[[") else {"source": stripped})
+        else:
+            return _make_error(-32602, "references must be objects or strings", request_id)
+
     try:
+        supplied = params.get("agent_id")
+        try:
+            principal = resolve_effective_principal(
+                supplied_agent_id=supplied, transport="uds"
+            )
+        except IdentityMismatchError as exc:
+            return make_mismatch_error(exc.supplied, exc.stamped, request_id)
+        agent_id = principal.agent_id if principal is not None else None
+
         engine = _lazy_retrieval()
         results = []
         missing = []
@@ -1522,6 +1763,18 @@ def _handle_sm_drill(params: dict, request_id: Any) -> dict:
             result = engine.expand_result(result_id=result_id, depth=depth)
             if result is None:
                 missing.append(result_id)
+            else:
+                results.append(result)
+        for index, reference in enumerate(references):
+            result = _expand_reference(
+                reference,
+                depth=depth,
+                principal=principal,
+                agent_id=agent_id,
+                shared_engine=engine,
+            )
+            if result is None:
+                missing.append(reference.get("doc_id") or reference.get("chunk_id") or reference.get("source") or index)
             else:
                 results.append(result)
         return _make_response({
