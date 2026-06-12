@@ -148,9 +148,14 @@ def _sources(resp: dict) -> list[str]:
     return [Path(row["source"]).name for row in resp["result"]["results"]]
 
 
-def _source_agents(resp: dict) -> list[str]:
+def _src_markers(resp: dict) -> list[str]:
     assert "error" not in resp, resp
-    return [row.get("source_agent") for row in resp["result"]["results"]]
+    return [row.get("src") for row in resp["result"]["results"]]
+
+
+def _rows(resp: dict) -> list[dict]:
+    assert "error" not in resp, resp
+    return resp["result"]["results"]
 
 
 def _build_indexes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -168,38 +173,7 @@ def _build_indexes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     return db_obj, cfg, codex_vault, claude_vault
 
 
-def test_principal_default_searches_callers_per_vault_index(tmp_path, monkeypatch):
-    _, cfg, codex_vault, claude_vault = _build_indexes(tmp_path, monkeypatch)
-    _install_principal(monkeypatch, tmp_path, "codex")
-    _install_runtime(
-        monkeypatch,
-        tmp_path,
-        cfg,
-        {"codex": codex_vault, "claude-code": claude_vault},
-    )
-
-    resp = _search({"query": "beacon", "agent_id": "codex", "expand": False, "limit": 5})
-
-    assert _sources(resp) == ["codex.md"]
-    assert _source_agents(resp) == ["codex"]
-
-
-def test_missing_personal_index_falls_back_to_shared_legacy(tmp_path, monkeypatch):
-    _install_fake_embedder(monkeypatch)
-    db_obj, cfg = _make_cfg(tmp_path)
-    codex_vault = tmp_path / "codex-vault"
-    codex_vault.mkdir()
-    _seed_shared_doc(db_obj, tmp_path / "legacy" / "shared.md", _long_body("legacy-shared"))
-    _install_principal(monkeypatch, tmp_path, "codex")
-    _install_runtime(monkeypatch, tmp_path, cfg, {"codex": codex_vault})
-
-    resp = _search({"query": "beacon", "agent_id": "codex", "expand": False, "limit": 5})
-
-    assert _sources(resp) == ["shared.md"]
-    assert _source_agents(resp) == ["shared"]
-
-
-def test_cross_agent_merges_all_existing_vault_indexes_plus_shared(tmp_path, monkeypatch):
+def test_scope_personal_searches_callers_per_vault_index(tmp_path, monkeypatch):
     _, cfg, codex_vault, claude_vault = _build_indexes(tmp_path, monkeypatch)
     _install_principal(monkeypatch, tmp_path, "codex")
     _install_runtime(
@@ -213,14 +187,118 @@ def test_cross_agent_merges_all_existing_vault_indexes_plus_shared(tmp_path, mon
         {
             "query": "beacon",
             "agent_id": "codex",
-            "cross_agent": True,
+            "scope": "personal",
+            "expand": False,
+            "limit": 5,
+        }
+    )
+
+    assert _sources(resp) == ["codex.md"]
+    assert _src_markers(resp) == ["p"]
+    assert "source_agent" not in _rows(resp)[0]
+    assert "source_index_db_path" not in _rows(resp)[0]
+
+
+def test_default_scope_both_merges_personal_and_combined(tmp_path, monkeypatch):
+    _, cfg, codex_vault, claude_vault = _build_indexes(tmp_path, monkeypatch)
+    _install_principal(monkeypatch, tmp_path, "codex")
+    _install_runtime(
+        monkeypatch,
+        tmp_path,
+        cfg,
+        {"codex": codex_vault, "claude-code": claude_vault},
+    )
+
+    resp = _search({"query": "beacon", "agent_id": "codex", "expand": False, "limit": 10})
+
+    assert set(_sources(resp)) == {"codex.md", "claude.md", "shared.md"}
+    by_source = {Path(row["source"]).name: row["src"] for row in _rows(resp)}
+    assert by_source["codex.md"] == "p"
+    assert by_source["claude.md"] == "c"
+    assert by_source["shared.md"] == "c"
+
+
+def test_missing_personal_index_falls_back_to_shared_legacy(tmp_path, monkeypatch):
+    _install_fake_embedder(monkeypatch)
+    db_obj, cfg = _make_cfg(tmp_path)
+    codex_vault = tmp_path / "codex-vault"
+    codex_vault.mkdir()
+    _seed_shared_doc(db_obj, tmp_path / "legacy" / "shared.md", _long_body("legacy-shared"))
+    _install_principal(monkeypatch, tmp_path, "codex")
+    _install_runtime(monkeypatch, tmp_path, cfg, {"codex": codex_vault})
+
+    resp = _search(
+        {
+            "query": "beacon",
+            "agent_id": "codex",
+            "scope": "personal",
+            "expand": False,
+            "limit": 5,
+        }
+    )
+
+    assert _sources(resp) == ["shared.md"]
+    assert _src_markers(resp) == ["c"]
+
+
+def test_scope_combined_merges_all_existing_vault_indexes_plus_shared(tmp_path, monkeypatch):
+    _, cfg, codex_vault, claude_vault = _build_indexes(tmp_path, monkeypatch)
+    _install_principal(monkeypatch, tmp_path, "codex")
+    _install_runtime(
+        monkeypatch,
+        tmp_path,
+        cfg,
+        {"codex": codex_vault, "claude-code": claude_vault},
+    )
+
+    resp = _search(
+        {
+            "query": "beacon",
+            "agent_id": "codex",
+            "scope": "combined",
             "expand": False,
             "limit": 10,
         }
     )
 
-    assert set(_source_agents(resp)) == {"codex", "claude-code", "shared"}
     assert set(_sources(resp)) == {"codex.md", "claude.md", "shared.md"}
+    assert set(_src_markers(resp)) == {"c"}
+
+
+@pytest.mark.parametrize(
+    ("params", "expected_sources"),
+    [
+        ({"cross_agent": True}, {"codex.md", "claude.md", "shared.md"}),
+        ({"cross_agent": False}, {"codex.md", "claude.md", "shared.md"}),
+        ({}, {"codex.md", "claude.md", "shared.md"}),
+    ],
+)
+def test_cross_agent_alias_mapping_is_back_compatible(
+    tmp_path,
+    monkeypatch,
+    params,
+    expected_sources,
+):
+    _, cfg, codex_vault, claude_vault = _build_indexes(tmp_path, monkeypatch)
+    _install_principal(monkeypatch, tmp_path, "codex")
+    _install_runtime(
+        monkeypatch,
+        tmp_path,
+        cfg,
+        {"codex": codex_vault, "claude-code": claude_vault},
+    )
+
+    resp = _search(
+        {
+            "query": "beacon",
+            "agent_id": "codex",
+            "expand": False,
+            "limit": 10,
+            **params,
+        }
+    )
+
+    assert set(_sources(resp)) == expected_sources
 
 
 def test_no_principal_keeps_shared_legacy_only(tmp_path, monkeypatch):
@@ -242,4 +320,4 @@ def test_no_principal_keeps_shared_legacy_only(tmp_path, monkeypatch):
     resp = _search({"query": "beacon", "expand": False, "limit": 10})
 
     assert _sources(resp) == ["shared.md"]
-    assert _source_agents(resp) == ["shared"]
+    assert _src_markers(resp) == ["c"]

@@ -219,26 +219,67 @@ def _all_vault_retrievals() -> list:
     return out
 
 
-def _tag_document_results(results: list, *, source_agent: str, source_index_db_path: str) -> list:
+def _tag_document_results(results: list, *, src: str) -> list:
     for row in results:
-        row["source_agent"] = source_agent
-        row["source_index_db_path"] = source_index_db_path
+        row["src"] = src
+        # Previous vault-scope experiments exposed ownership/index paths inline.
+        # Keep recall tiny; full provenance is available through drill.
+        row.pop("source_agent", None)
+        row.pop("source_index_db_path", None)
         provenance = row.get("provenance")
         if isinstance(provenance, dict):
-            provenance["source_agent"] = source_agent
-            provenance["source_index_db_path"] = source_index_db_path
+            provenance.pop("source_agent", None)
+            provenance.pop("source_index_db_path", None)
     return results
 
 
-def _merge_document_results(result_sets: list, limit: int) -> list:
+def _result_identity(row: dict) -> tuple:
+    return (
+        str(row.get("source") or row.get("path") or ""),
+        row.get("doc_id"),
+        row.get("chunk_id"),
+    )
+
+
+def _merge_document_results(result_sets: list, limit: int, *, prefer_personal: bool = False) -> list:
     merged = []
     for rows in result_sets:
         merged.extend(rows)
+    if prefer_personal:
+        deduped = {}
+        for row in merged:
+            key = _result_identity(row)
+            existing = deduped.get(key)
+            if existing is None:
+                deduped[key] = row
+                continue
+            row_score = float(row.get("score") or 0.0)
+            existing_score = float(existing.get("score") or 0.0)
+            row_priority = 1 if row.get("src") == "p" else 0
+            existing_priority = 1 if existing.get("src") == "p" else 0
+            if (row_score, row_priority) > (existing_score, existing_priority):
+                deduped[key] = row
+        merged = list(deduped.values())
     return sorted(
         merged,
-        key=lambda row: float(row.get("score") or 0.0),
+        key=lambda row: (
+            float(row.get("score") or 0.0),
+            1 if prefer_personal and row.get("src") == "p" else 0,
+        ),
         reverse=True,
     )[:limit]
+
+
+def _resolve_document_scope(params: dict) -> str:
+    raw_scope = params.get("scope")
+    if raw_scope is not None:
+        scope = str(raw_scope)
+        if scope not in {"personal", "combined", "both"}:
+            raise ValueError("scope must be personal, combined, or both")
+        return scope
+    if bool(params.get("cross_agent", False)):
+        return "combined"
+    return "both"
 
 
 def _lazy_writeback():
@@ -1149,7 +1190,11 @@ def _handle_search(params: dict, request_id: Any) -> dict:
     except IdentityMismatchError as exc:
         return make_mismatch_error(exc.supplied, exc.stamped, request_id)
     agent_id = principal.agent_id if principal is not None else None
-    cross_agent = bool(params.get("cross_agent", False)) or principal is None
+    learnings_cross_agent = bool(params.get("cross_agent", False)) or principal is None
+    try:
+        document_scope = _resolve_document_scope(params)
+    except ValueError as exc:
+        return _make_error(-32602, str(exc), request_id)
     limit = min(int(params.get("limit", 5)), 20)
     depth = str(params.get("depth", "headline"))
     budget_tokens_param = params.get("budget_tokens")
@@ -1174,8 +1219,7 @@ def _handle_search(params: dict, request_id: Any) -> dict:
         def _retrieve_from(
             retrieval_engine,
             *,
-            source_agent: str,
-            source_index_db_path: str,
+            src: str,
             principal_for_documents,
         ) -> list:
             rows = retrieval_engine.retrieve(
@@ -1190,11 +1234,10 @@ def _handle_search(params: dict, request_id: Any) -> dict:
                 end_date=end_date,
                 expand=expand,
                 summarize_neighborhood=summarize_neighborhood,
-                cross_agent=cross_agent,
-                # G19/G20/G22: pass stamped principal for personal/default recall.
-                # Explicit cross_agent searches intentionally gather all vault
-                # indexes, so they use the legacy document path without the
-                # same-agent can_read_document narrowing.
+                cross_agent=learnings_cross_agent,
+                # G19/G20/G22: pass stamped principal for personal recall.
+                # Combined searches intentionally gather all vault indexes, so
+                # they use the legacy document path without same-agent narrowing.
                 principal=principal_for_documents,
                 workspace=(
                     principal_for_documents.workspace_id
@@ -1204,48 +1247,24 @@ def _handle_search(params: dict, request_id: Any) -> dict:
             )
             return _tag_document_results(
                 rows,
-                source_agent=source_agent,
-                source_index_db_path=source_index_db_path,
+                src=src,
             )
 
-        if principal is None:
-            # Back-compat: callers with no stamped principal use the shared
-            # legacy document layer only.
-            results = _retrieve_from(
+        def _retrieve_shared() -> list:
+            return _retrieve_from(
                 engine,
-                source_agent="shared",
-                source_index_db_path=DEFAULT_CONFIG.db_path,
+                src="c",
                 principal_for_documents=None,
             )
-        elif cross_agent:
-            result_sets = []
-            for vault_engine, source_agent, source_db_path in _all_vault_retrievals():
-                result_sets.append(
-                    _retrieve_from(
-                        vault_engine,
-                        source_agent=source_agent,
-                        source_index_db_path=source_db_path,
-                        principal_for_documents=None,
-                    )
-                )
-            result_sets.append(
-                _retrieve_from(
-                    engine,
-                    source_agent="shared",
-                    source_index_db_path=DEFAULT_CONFIG.db_path,
-                    principal_for_documents=None,
-                )
-            )
-            results = _merge_document_results(result_sets, limit)
-        else:
+
+        def _retrieve_personal() -> list:
             vault_retrieval = _agent_vault_retrieval(agent_id) if agent_id else None
             if vault_retrieval is not None:
-                vault_engine, source_agent, source_db_path = vault_retrieval
+                vault_engine, _source_agent, _source_db_path = vault_retrieval
                 try:
-                    results = _retrieve_from(
+                    return _retrieve_from(
                         vault_engine,
-                        source_agent=source_agent,
-                        source_index_db_path=source_db_path,
+                        src="p",
                         principal_for_documents=principal,
                     )
                 except Exception as exc:
@@ -1254,19 +1273,34 @@ def _handle_search(params: dict, request_id: Any) -> dict:
                         agent_id,
                         exc,
                     )
-                    results = _retrieve_from(
-                        engine,
-                        source_agent="shared",
-                        source_index_db_path=DEFAULT_CONFIG.db_path,
-                        principal_for_documents=principal,
+            return _retrieve_shared()
+
+        def _retrieve_combined() -> list:
+            result_sets = []
+            for vault_engine, _source_agent, _source_db_path in _all_vault_retrievals():
+                result_sets.append(
+                    _retrieve_from(
+                        vault_engine,
+                        src="c",
+                        principal_for_documents=None,
                     )
-            else:
-                results = _retrieve_from(
-                    engine,
-                    source_agent="shared",
-                    source_index_db_path=DEFAULT_CONFIG.db_path,
-                    principal_for_documents=principal,
                 )
+            result_sets.append(_retrieve_shared())
+            return _merge_document_results(result_sets, limit)
+
+        if principal is None:
+            # Back-compat: callers with no stamped principal use the shared
+            # legacy document layer only.
+            results = _retrieve_shared()
+        elif document_scope == "personal":
+            results = _retrieve_personal()
+        elif document_scope == "combined":
+            # Combined is the pooled/fleet view: all existing per-vault indexes
+            # including the caller when present, plus shared legacy documents.
+            results = _retrieve_combined()
+        else:
+            result_sets = [_retrieve_personal(), _retrieve_combined()]
+            results = _merge_document_results(result_sets, limit, prefer_personal=True)
 
         # Apply MMR token-budget packing if requested
         if budget_tokens_param is not None:
@@ -1290,7 +1324,7 @@ def _handle_search(params: dict, request_id: Any) -> dict:
             learnings = engine.search_learnings(
                 query,
                 agent_id=agent_id,
-                cross_agent=cross_agent,
+                cross_agent=learnings_cross_agent,
                 limit=limit,
                 source="minnid.search",
             )
