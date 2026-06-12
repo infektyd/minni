@@ -504,7 +504,9 @@ def _known_agent_vaults() -> list[Path]:
                 vaults.extend(Path(os.path.expanduser(str(v))) for v in mapping.values())
         except json.JSONDecodeError:
             pass
-    root = Path.home() / ".minni"
+    # Resolve at call time (matches config.py providers/secrets pattern) so
+    # MINNI_HOME overrides are honored without hardcoding ~/.minni.
+    root = Path(os.environ.get("MINNI_HOME", os.path.expanduser("~/.minni")))
     if root.exists():
         vaults.extend(root.glob("*-vault"))
     return list(dict.fromkeys(vaults))
