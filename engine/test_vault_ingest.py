@@ -58,7 +58,7 @@ def _long_body(marker: str, *, link: str = "") -> str:
     return f"{link}\n\n## Notes\n\n{words}\n"
 
 
-def _write_page(path: Path, title: str, body: str) -> None:
+def _write_page(path: Path, title: str, body: str, privacy: str = "safe") -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         "\n".join(
@@ -67,7 +67,7 @@ def _write_page(path: Path, title: str, body: str) -> None:
                 f"title: {title}",
                 "type: concept",
                 "status: accepted",
-                "privacy: safe",
+                f"privacy: {privacy}",
                 "---",
                 "",
                 body,
@@ -211,6 +211,38 @@ def test_vault_ingest_isolates_two_vault_stores_and_shared_db(tmp_path, monkeypa
     assert [Path(row["path"]).name for row in claude_rows] == ["claude.md"]
     assert [row["agent"] for row in claude_rows] == ["claude-code"]
     assert _count_shared_documents(shared_db) == 0
+
+
+def test_vault_ingest_purges_index_rows_when_page_becomes_blocked(tmp_path, monkeypatch):
+    from afm_passes.vault_ingest import run
+    from vault_index import vault_index_paths
+
+    _install_fake_embedder(monkeypatch)
+    shared_db, cfg = _make_shared_db(tmp_path)
+    vault = tmp_path / "codex-vault"
+    alpha = vault / "wiki" / "alpha.md"
+    _write_page(alpha, "Alpha", _long_body("alpha"))
+
+    first = run(shared_db, cfg, vault_path=str(vault), dry_run=False)
+    assert first["indexed"] == 1
+
+    _write_page(alpha, "Alpha", _long_body("alpha"), privacy="blocked")
+    future = time.time() + 5
+    os.utime(alpha, (future, future))
+    second = run(shared_db, cfg, vault_path=str(vault), dry_run=False)
+
+    assert second["indexed"] == 0
+    assert second["pruned"] == 1
+    db_path = vault_index_paths(vault).db_path
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM vault_fts").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM chunk_embeddings").fetchone()[0] == 0
+    assert alpha.exists()
+
+    third = run(shared_db, cfg, vault_path=str(vault), dry_run=False)
+    assert third["indexed"] == 0
+    assert third["pruned"] == 0
 
 
 def test_vault_ingest_dry_run_writes_nothing(tmp_path, monkeypatch):
