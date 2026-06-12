@@ -134,6 +134,7 @@ def _guard_vault_root(
 
 # ── Lazy imports (heavy ML deps) ──────────────────────────────────────────
 _retrieval = None
+_vault_retrieval_cache = {}
 _episodic = None
 _writeback = None
 
@@ -143,8 +144,101 @@ def _lazy_retrieval():
     global _retrieval
     if _retrieval is None:
         from retrieval import RetrievalEngine
-        _retrieval = RetrievalEngine(SovereignDB(), DEFAULT_CONFIG)
+        _retrieval = RetrievalEngine(SovereignDB(DEFAULT_CONFIG), DEFAULT_CONFIG)
     return _retrieval
+
+
+def _vault_agent_id(vault_path: Path) -> Optional[str]:
+    try:
+        from afm_passes.inbox_ingest import _VAULT_SLUG_TO_AGENT_ID
+
+        name = vault_path.name
+        if not name.endswith("-vault"):
+            return None
+        agent_id = _VAULT_SLUG_TO_AGENT_ID.get(name[: -len("-vault")])
+        return validate_agent_id(agent_id) if agent_id else None
+    except Exception:
+        return None
+
+
+def _vault_index_ready(vault_path: Path) -> bool:
+    try:
+        from vault_index import vault_index_paths
+
+        return vault_index_paths(vault_path).db_path.exists()
+    except Exception:
+        return False
+
+
+def _lazy_vault_retrieval(vault_path: Path):
+    """Return (RetrievalEngine, source_agent, db_path) for an indexed vault."""
+    try:
+        vault = Path(vault_path).expanduser().resolve()
+    except Exception:
+        vault = Path(vault_path).expanduser()
+    if not _vault_index_ready(vault):
+        return None
+    agent_id = _vault_agent_id(vault)
+    if not agent_id:
+        return None
+
+    key = str(vault)
+    cached = _vault_retrieval_cache.get(key)
+    if cached is not None:
+        return cached
+
+    from faiss_index import FAISSIndex
+    from retrieval import RetrievalEngine
+    from vault_index import build_vault_index_config
+
+    cfg = build_vault_index_config(vault, base_config=DEFAULT_CONFIG)
+    db = SovereignDB(cfg)
+    engine = RetrievalEngine(db, cfg, faiss_index=FAISSIndex(cfg))
+    cached = (engine, agent_id, cfg.db_path)
+    _vault_retrieval_cache[key] = cached
+    return cached
+
+
+def _agent_vault_retrieval(agent_id: str):
+    vault_path, _ = _agent_vault(agent_id)
+    return _lazy_vault_retrieval(vault_path)
+
+
+def _all_vault_retrievals() -> list:
+    out = []
+    seen = set()
+    for vault_path in _known_agent_vaults():
+        cached = _lazy_vault_retrieval(vault_path)
+        if cached is None:
+            continue
+        key = cached[2]
+        if key in seen:
+            continue
+        out.append(cached)
+        seen.add(key)
+    return out
+
+
+def _tag_document_results(results: list, *, source_agent: str, source_index_db_path: str) -> list:
+    for row in results:
+        row["source_agent"] = source_agent
+        row["source_index_db_path"] = source_index_db_path
+        provenance = row.get("provenance")
+        if isinstance(provenance, dict):
+            provenance["source_agent"] = source_agent
+            provenance["source_index_db_path"] = source_index_db_path
+    return results
+
+
+def _merge_document_results(result_sets: list, limit: int) -> list:
+    merged = []
+    for rows in result_sets:
+        merged.extend(rows)
+    return sorted(
+        merged,
+        key=lambda row: float(row.get("score") or 0.0),
+        reverse=True,
+    )[:limit]
 
 
 def _lazy_writeback():
@@ -1076,23 +1170,103 @@ def _handle_search(params: dict, request_id: Any) -> dict:
 
     try:
         engine = _lazy_retrieval()
-        results = engine.retrieve(
-            query=query,
-            agent_id=agent_id,
-            limit=limit,
-            depth=depth,
-            backend=_resolved_backend,
-            layers=layers,
-            sort=sort,
-            start_date=start_date,
-            end_date=end_date,
-            expand=expand,
-            summarize_neighborhood=summarize_neighborhood,
-            cross_agent=cross_agent,
-            # G19/G20/G22: pass stamped principal so can_read_document + evidence envelope applied
-            principal=principal,
-            workspace=principal.workspace_id if principal is not None else "default",
-        )
+
+        def _retrieve_from(
+            retrieval_engine,
+            *,
+            source_agent: str,
+            source_index_db_path: str,
+            principal_for_documents,
+        ) -> list:
+            rows = retrieval_engine.retrieve(
+                query=query,
+                agent_id=agent_id,
+                limit=limit,
+                depth=depth,
+                backend=_resolved_backend,
+                layers=layers,
+                sort=sort,
+                start_date=start_date,
+                end_date=end_date,
+                expand=expand,
+                summarize_neighborhood=summarize_neighborhood,
+                cross_agent=cross_agent,
+                # G19/G20/G22: pass stamped principal for personal/default recall.
+                # Explicit cross_agent searches intentionally gather all vault
+                # indexes, so they use the legacy document path without the
+                # same-agent can_read_document narrowing.
+                principal=principal_for_documents,
+                workspace=(
+                    principal_for_documents.workspace_id
+                    if principal_for_documents is not None
+                    else "default"
+                ),
+            )
+            return _tag_document_results(
+                rows,
+                source_agent=source_agent,
+                source_index_db_path=source_index_db_path,
+            )
+
+        if principal is None:
+            # Back-compat: callers with no stamped principal use the shared
+            # legacy document layer only.
+            results = _retrieve_from(
+                engine,
+                source_agent="shared",
+                source_index_db_path=DEFAULT_CONFIG.db_path,
+                principal_for_documents=None,
+            )
+        elif cross_agent:
+            result_sets = []
+            for vault_engine, source_agent, source_db_path in _all_vault_retrievals():
+                result_sets.append(
+                    _retrieve_from(
+                        vault_engine,
+                        source_agent=source_agent,
+                        source_index_db_path=source_db_path,
+                        principal_for_documents=None,
+                    )
+                )
+            result_sets.append(
+                _retrieve_from(
+                    engine,
+                    source_agent="shared",
+                    source_index_db_path=DEFAULT_CONFIG.db_path,
+                    principal_for_documents=None,
+                )
+            )
+            results = _merge_document_results(result_sets, limit)
+        else:
+            vault_retrieval = _agent_vault_retrieval(agent_id) if agent_id else None
+            if vault_retrieval is not None:
+                vault_engine, source_agent, source_db_path = vault_retrieval
+                try:
+                    results = _retrieve_from(
+                        vault_engine,
+                        source_agent=source_agent,
+                        source_index_db_path=source_db_path,
+                        principal_for_documents=principal,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "search: personal vault index failed for %s (%s); falling back to shared",
+                        agent_id,
+                        exc,
+                    )
+                    results = _retrieve_from(
+                        engine,
+                        source_agent="shared",
+                        source_index_db_path=DEFAULT_CONFIG.db_path,
+                        principal_for_documents=principal,
+                    )
+            else:
+                results = _retrieve_from(
+                    engine,
+                    source_agent="shared",
+                    source_index_db_path=DEFAULT_CONFIG.db_path,
+                    principal_for_documents=principal,
+                )
 
         # Apply MMR token-budget packing if requested
         if budget_tokens_param is not None:

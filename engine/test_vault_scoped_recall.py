@@ -1,0 +1,245 @@
+"""Daemon document recall over per-vault indexes.
+
+All state is tmp_path-backed. These tests prove scoped document recall uses
+agent-local vault indexes without touching live ~/.minni.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+sys.path.insert(0, os.path.dirname(__file__))
+
+
+class _FakeEmbedder:
+    def encode(self, text: str):
+        vec = np.zeros(384, dtype=np.float32)
+        vec[sum(text.encode("utf-8")) % 384] = 1.0
+        return vec
+
+
+def _install_fake_embedder(monkeypatch: pytest.MonkeyPatch) -> None:
+    import models
+
+    monkeypatch.setattr(models, "get_embedder", lambda: _FakeEmbedder())
+
+
+def _long_body(marker: str) -> str:
+    return " ".join(f"{marker}-beacon-{i}" for i in range(100))
+
+
+def _write_page(path: Path, title: str, marker: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "\n".join(
+            [
+                "---",
+                f"title: {title}",
+                "type: concept",
+                "status: accepted",
+                "privacy: safe",
+                "---",
+                "",
+                _long_body(marker),
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+
+def _make_cfg(tmp_path: Path):
+    import db as db_mod
+    from config import SovereignConfig
+
+    cfg = SovereignConfig(
+        db_path=str(tmp_path / "shared" / "minni.db"),
+        vault_path=str(tmp_path / "shared-vault"),
+        graph_export_dir=str(tmp_path / "graphs"),
+        faiss_index_path=str(tmp_path / "shared.faiss"),
+        writeback_enabled=False,
+        reranker_enabled=False,
+        hyde_enabled=False,
+        afm_loop_schedule={"enabled": True, "idle_seconds": 300, "passes": {}},
+    )
+    old_flag = db_mod._migrations_run
+    db_mod._migrations_run = False
+    try:
+        db_obj = db_mod.SovereignDB(cfg)
+        db_obj._get_conn()
+    finally:
+        db_mod._migrations_run = old_flag
+    return db_obj, cfg
+
+
+def _seed_shared_doc(db_obj, path: Path, content: str) -> None:
+    now = time.time()
+    vec = _FakeEmbedder().encode(content).astype(np.float32).tobytes()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+    with db_obj.cursor() as c:
+        c.execute(
+            """INSERT INTO documents
+               (path, agent, sigil, last_modified, indexed_at,
+                page_status, privacy_level, page_type, layer)
+               VALUES (?, 'wiki:concept', 'wiki', ?, ?, 'accepted', 'safe', 'concept', 'knowledge')""",
+            (str(path), now, now),
+        )
+        doc_id = c.lastrowid
+        c.execute(
+            "INSERT INTO vault_fts (doc_id, path, content, agent, sigil) VALUES (?, ?, ?, 'wiki:concept', 'wiki')",
+            (doc_id, str(path), content),
+        )
+        c.execute(
+            """INSERT INTO chunk_embeddings
+               (doc_id, chunk_index, chunk_text, embedding, heading_context, model_name, computed_at, layer)
+               VALUES (?, 0, ?, ?, 'shared', 'fake', ?, 'knowledge')""",
+            (doc_id, content, vec, now),
+        )
+
+
+def _install_principal(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, agent_id: str = "codex") -> None:
+    import principal as principal_mod
+
+    principals = tmp_path / "principals"
+    principals.mkdir()
+    f = principals / "main.json"
+    f.write_text(
+        json.dumps(
+            {
+                "agent_id": agent_id,
+                "capabilities": ["*"],
+                "allowed_vault_roots": [str(tmp_path)],
+            }
+        ),
+        encoding="utf-8",
+    )
+    os.chmod(f, 0o600)
+    monkeypatch.setattr(principal_mod, "PRINCIPALS_DIR", principals)
+
+
+def _install_runtime(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, cfg, vaults: dict[str, Path]) -> None:
+    import minnid
+
+    monkeypatch.setattr(minnid, "DEFAULT_CONFIG", cfg)
+    monkeypatch.setattr(minnid, "_retrieval", None)
+    monkeypatch.setattr(minnid, "_vault_retrieval_cache", {})
+    monkeypatch.setenv("MINNI_AGENT_VAULTS", json.dumps({k: str(v) for k, v in vaults.items()}))
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+
+
+def _search(params: dict):
+    from minnid import _dispatch_sync
+
+    return _dispatch_sync({"jsonrpc": "2.0", "id": 1, "method": "search", "params": params})
+
+
+def _sources(resp: dict) -> list[str]:
+    assert "error" not in resp, resp
+    return [Path(row["source"]).name for row in resp["result"]["results"]]
+
+
+def _source_agents(resp: dict) -> list[str]:
+    assert "error" not in resp, resp
+    return [row.get("source_agent") for row in resp["result"]["results"]]
+
+
+def _build_indexes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    from afm_passes.vault_ingest import run
+
+    _install_fake_embedder(monkeypatch)
+    db_obj, cfg = _make_cfg(tmp_path)
+    codex_vault = tmp_path / "codex-vault"
+    claude_vault = tmp_path / "claudecode-vault"
+    _write_page(codex_vault / "wiki" / "codex.md", "Codex", "codex-personal")
+    _write_page(claude_vault / "wiki" / "claude.md", "Claude", "claude-foreign")
+    run(db_obj, cfg, vault_path=str(codex_vault), dry_run=False)
+    run(db_obj, cfg, vault_path=str(claude_vault), dry_run=False)
+    _seed_shared_doc(db_obj, tmp_path / "legacy" / "shared.md", _long_body("legacy-shared"))
+    return db_obj, cfg, codex_vault, claude_vault
+
+
+def test_principal_default_searches_callers_per_vault_index(tmp_path, monkeypatch):
+    _, cfg, codex_vault, claude_vault = _build_indexes(tmp_path, monkeypatch)
+    _install_principal(monkeypatch, tmp_path, "codex")
+    _install_runtime(
+        monkeypatch,
+        tmp_path,
+        cfg,
+        {"codex": codex_vault, "claude-code": claude_vault},
+    )
+
+    resp = _search({"query": "beacon", "agent_id": "codex", "expand": False, "limit": 5})
+
+    assert _sources(resp) == ["codex.md"]
+    assert _source_agents(resp) == ["codex"]
+
+
+def test_missing_personal_index_falls_back_to_shared_legacy(tmp_path, monkeypatch):
+    _install_fake_embedder(monkeypatch)
+    db_obj, cfg = _make_cfg(tmp_path)
+    codex_vault = tmp_path / "codex-vault"
+    codex_vault.mkdir()
+    _seed_shared_doc(db_obj, tmp_path / "legacy" / "shared.md", _long_body("legacy-shared"))
+    _install_principal(monkeypatch, tmp_path, "codex")
+    _install_runtime(monkeypatch, tmp_path, cfg, {"codex": codex_vault})
+
+    resp = _search({"query": "beacon", "agent_id": "codex", "expand": False, "limit": 5})
+
+    assert _sources(resp) == ["shared.md"]
+    assert _source_agents(resp) == ["shared"]
+
+
+def test_cross_agent_merges_all_existing_vault_indexes_plus_shared(tmp_path, monkeypatch):
+    _, cfg, codex_vault, claude_vault = _build_indexes(tmp_path, monkeypatch)
+    _install_principal(monkeypatch, tmp_path, "codex")
+    _install_runtime(
+        monkeypatch,
+        tmp_path,
+        cfg,
+        {"codex": codex_vault, "claude-code": claude_vault},
+    )
+
+    resp = _search(
+        {
+            "query": "beacon",
+            "agent_id": "codex",
+            "cross_agent": True,
+            "expand": False,
+            "limit": 10,
+        }
+    )
+
+    assert set(_source_agents(resp)) == {"codex", "claude-code", "shared"}
+    assert set(_sources(resp)) == {"codex.md", "claude.md", "shared.md"}
+
+
+def test_no_principal_keeps_shared_legacy_only(tmp_path, monkeypatch):
+    import minnid
+
+    _, cfg, codex_vault, claude_vault = _build_indexes(tmp_path, monkeypatch)
+    _install_runtime(
+        monkeypatch,
+        tmp_path,
+        cfg,
+        {"codex": codex_vault, "claude-code": claude_vault},
+    )
+    monkeypatch.setattr(
+        minnid,
+        "resolve_effective_principal",
+        lambda *, supplied_agent_id=None, transport="uds": None,
+    )
+
+    resp = _search({"query": "beacon", "expand": False, "limit": 10})
+
+    assert _sources(resp) == ["shared.md"]
+    assert _source_agents(resp) == ["shared"]
