@@ -89,6 +89,14 @@ def _count_shared_documents(db_obj) -> int:
         return c.fetchone()[0]
 
 
+def _wiki_snapshot(vault: Path) -> dict[str, bytes]:
+    wiki = vault / "wiki"
+    return {
+        str(path.relative_to(wiki)): path.read_bytes()
+        for path in sorted(wiki.rglob("*.md"))
+    }
+
+
 def test_vault_ingest_indexes_wiki_into_per_vault_store_only(tmp_path, monkeypatch):
     from afm_passes.vault_ingest import run
     from vault_index import vault_index_paths
@@ -122,6 +130,22 @@ def test_vault_ingest_indexes_wiki_into_per_vault_store_only(tmp_path, monkeypat
         chunk_count = conn.execute("SELECT COUNT(*) FROM chunk_embeddings").fetchone()[0]
     assert link_count == 1
     assert chunk_count > 0
+
+
+def test_vault_ingest_wet_run_never_modifies_wiki_markdown(tmp_path, monkeypatch):
+    from afm_passes.vault_ingest import run
+
+    _install_fake_embedder(monkeypatch)
+    shared_db, cfg = _make_shared_db(tmp_path)
+    vault = tmp_path / "codex-vault"
+    _write_page(vault / "wiki" / "alpha.md", "Alpha", _long_body("alpha", link="[[beta]]"))
+    _write_page(vault / "wiki" / "beta.md", "Beta", _long_body("beta"))
+    before = _wiki_snapshot(vault)
+
+    result = run(shared_db, cfg, vault_path=str(vault), dry_run=False)
+
+    assert result["status"] == "ok"
+    assert _wiki_snapshot(vault) == before
 
 
 def test_vault_ingest_incremental_reindexes_and_prunes_index_rows_only(tmp_path, monkeypatch):
@@ -158,6 +182,35 @@ def test_vault_ingest_incremental_reindexes_and_prunes_index_rows_only(tmp_path,
     paths = vault_index_paths(vault)
     rows = _doc_rows(paths.db_path)
     assert [Path(row["path"]).name for row in rows] == ["alpha.md"]
+
+
+def test_vault_ingest_isolates_two_vault_stores_and_shared_db(tmp_path, monkeypatch):
+    from afm_passes.vault_ingest import run
+    from vault_index import vault_index_paths
+
+    _install_fake_embedder(monkeypatch)
+    shared_db, cfg = _make_shared_db(tmp_path)
+    codex_vault = tmp_path / "codex-vault"
+    claude_vault = tmp_path / "claudecode-vault"
+    _write_page(codex_vault / "wiki" / "codex.md", "Codex", _long_body("codex-only"))
+    _write_page(claude_vault / "wiki" / "claude.md", "Claude", _long_body("claude-only"))
+
+    codex = run(shared_db, cfg, vault_path=str(codex_vault), dry_run=False)
+    claude = run(shared_db, cfg, vault_path=str(claude_vault), dry_run=False)
+
+    codex_db = vault_index_paths(codex_vault).db_path
+    claude_db = vault_index_paths(claude_vault).db_path
+    assert codex["index_db_path"] == str(codex_db)
+    assert claude["index_db_path"] == str(claude_db)
+    assert codex_db != claude_db
+
+    codex_rows = _doc_rows(codex_db)
+    claude_rows = _doc_rows(claude_db)
+    assert [Path(row["path"]).name for row in codex_rows] == ["codex.md"]
+    assert [row["agent"] for row in codex_rows] == ["codex"]
+    assert [Path(row["path"]).name for row in claude_rows] == ["claude.md"]
+    assert [row["agent"] for row in claude_rows] == ["claude-code"]
+    assert _count_shared_documents(shared_db) == 0
 
 
 def test_vault_ingest_dry_run_writes_nothing(tmp_path, monkeypatch):
