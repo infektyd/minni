@@ -69,6 +69,28 @@ test("recallMemory keeps single-layer back-compat", async () => {
   assert.equal(calls[1].params.layers, undefined);
 });
 
+test("recallMemory passes document scope and legacy cross_agent alias", async () => {
+  const calls = [];
+  const requester = async (_socketPath, method, params) => {
+    calls.push({ method, params });
+    return { ok: true, data: { results: [] } };
+  };
+
+  await recallMemory(
+    {
+      query: "vault docs",
+      scope: "combined",
+      crossAgent: true,
+      limit: 3,
+    },
+    requester,
+  );
+
+  assert.equal(calls[0].method, "search");
+  assert.equal(calls[0].params.scope, "combined");
+  assert.equal(calls[0].params.cross_agent, true);
+});
+
 // ---------------------------------------------------------------------------
 // hooks-PL-2 — boot read context trimming (the read RPC records learning_reads;
 // only its recency-ordered Learnings slice is re-injected)
