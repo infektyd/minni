@@ -21,6 +21,7 @@ const sampleResponse = {
     },
     {
       wikilink: "[[wiki/sessions/20260608-aetherkernel-v63]]",
+      src: "p",
       layer: "episodic",
       score: 33.1234,
       snippet: "  v63   xHCI  MMIO   0xDEADDEAD is device-side, not the window.  ",
@@ -44,6 +45,7 @@ test("formatRecallLean strips verbose provenance and keeps wikilink + score + he
   assert.ok(!out.includes("query_variants"), "query_variants must be stripped");
   assert.ok(!out.includes("trace_id"), "trace_id must be stripped");
   assert.ok(out.includes("33.12"), "score should be rounded to 2dp and kept");
+  assert.ok(out.includes('"src": "p"'), "compact source marker should be kept");
   // snippet whitespace collapsed into the headline
   assert.ok(out.includes("v63 xHCI MMIO 0xDEADDEAD is device-side"), "headline/snippet kept and whitespace-collapsed");
 });

@@ -45,6 +45,9 @@ class SovereignConfig:
         "MINNI_FAISS_PATH",
         os.path.join(CANONICAL_SOVEREIGN_HOME, "minni_faiss.index")
     )
+    # Optional manifest override for explicit stores such as per-vault indexes.
+    # When unset, FAISS persistence keeps the legacy db-dir-derived cache path.
+    faiss_manifest_path: Optional[str] = None
 
     # Additional paths to index alongside the vault (operator-configurable)
     wiki_paths: list = field(default_factory=lambda: [])

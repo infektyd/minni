@@ -72,3 +72,16 @@ test("model-facing MCP input schemas do not expose local path authority", async 
     }
   }
 });
+
+test("minni_recall schema exposes scope enum and keeps cross_agent back-compat", async () => {
+  const source = stripLineComments(
+    await readFile(new URL("../src/server.ts", import.meta.url), "utf8"),
+  );
+  const recallStart = source.indexOf('"minni_recall"');
+  assert.notEqual(recallStart, -1, "minni_recall tool registration not found");
+  const nextTool = source.indexOf("server.registerTool(", recallStart + 1);
+  const recallBlock = source.slice(recallStart, nextTool === -1 ? undefined : nextTool);
+
+  assert.match(recallBlock, /scope:\s*z\.enum\(\["personal",\s*"combined",\s*"both"\]\)\.optional\(\)/);
+  assert.match(recallBlock, /cross_agent:\s*z\.boolean\(\)\.optional\(\)/);
+});

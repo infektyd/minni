@@ -323,6 +323,10 @@ class FAISSIndex:
 
     def _manifest_path(self) -> str:
         """Default manifest path: <db_dir>/faiss/index.manifest.json."""
+        explicit_manifest = getattr(self.config, "faiss_manifest_path", None)
+        if explicit_manifest:
+            return os.fspath(explicit_manifest)
+
         from faiss_persist import _faiss_dir_for_db
         faiss_dir = _faiss_dir_for_db(self.config.db_path)
         return os.path.join(faiss_dir, "index.manifest.json")
