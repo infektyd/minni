@@ -42,12 +42,31 @@ agent IDs.
 
 When the daemon handles `search` with a stamped caller principal:
 
-- Default: search the caller's per-vault index if it exists.
-- Missing caller index: fall back to the shared legacy document layer.
-- `cross_agent=true`: search all existing per-vault indexes plus the shared
-  legacy document layer, merge by score, and tag hits with `source_agent`.
+- `scope="personal"`: search the caller's per-vault index only. If the caller's
+  index does not exist or cannot be read, fall back to the shared legacy
+  document layer.
+- `scope="combined"`: search the pooled document view: all existing per-vault
+  indexes, including the caller's when present, plus the shared legacy document
+  layer. Results are merged by score.
+- `scope="both"`: default when `scope` is absent. Merge the personal path with
+  the combined path, de-duplicating the caller's own hit so it appears once as
+  personal. Personal hits rank first on score ties.
+- Back-compat: `cross_agent=true` maps the document leg to the
+  `combined`-equivalent breadth. `cross_agent=false` or absent maps to the new
+  default `both`. This alias does not change learnings recall scoping.
 - No principal: preserve old behavior and search only the shared legacy document
   layer.
+
+Each returned document hit carries one compact source marker:
+
+- `src: "p"` means the hit came from the caller's personal path.
+- `src: "c"` means the hit came from the combined/shared path.
+
+The recall envelope does not add owning agent IDs, source vault paths, index DB
+paths, or expanded score breakdowns inline. Use `minni_drill` / daemon
+`sm_drill` with a returned hit reference (`references` / `refs`, or the existing
+numeric `resultIds` / `chunkIds`) to retrieve full provenance on demand:
+owning agent ID, source vault, index DB path, score components, and `indexed_at`.
 
 Learnings recall still comes from the shared daemon DB. This change is only the
 documents/semantic leg.
@@ -81,5 +100,5 @@ python index_all.py --wiki-only
 
 The shared `~/.minni/minni.db` keeps its existing legacy `documents`,
 `chunk_embeddings`, and FAISS state. Those rows are still used as the fallback
-and as the shared leg for `cross_agent=true`. Agent vault markdown lives in the
-per-vault `.index` stores only.
+and as the shared leg for `scope="combined"` / `scope="both"`. Agent vault
+markdown lives in the per-vault `.index` stores only.
