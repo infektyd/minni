@@ -2701,6 +2701,7 @@ def _handle_daemon_compile(params: dict, request_id: Any) -> dict:
             "reorganization": "afm_passes.reorganization",
             "pruning": "afm_passes.pruning",
             "consolidation": "afm_passes.consolidation",
+            "vault_ingest": "afm_passes.vault_ingest",
         }
         if pass_name not in pass_runners:
             return _make_error(-32602, f"unsupported pass_name: {pass_name}", request_id)
