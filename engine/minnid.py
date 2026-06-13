@@ -1466,7 +1466,7 @@ def _handle_read(params: dict, request_id: Any) -> dict:
                   ON ce.doc_id = d.doc_id AND ce.chunk_index = 0
                 WHERE d.agent = ?
                   AND d.whole_document = 1
-                ORDER BY d.path
+                ORDER BY d.path  -- intentional: deterministic alpha order; primary envelope sorts first by naming convention
             """, (f"identity:{agent_id}",))
             rows = c.fetchall()
             if rows:

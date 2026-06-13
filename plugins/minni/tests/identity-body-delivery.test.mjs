@@ -199,3 +199,38 @@ test("SessionStart agent-context boot includes identity_body (codex hook)", asyn
   );
   assert.match(context, /## Agent Identity: claude-code/, "native layer 1 prefix must remain");
 });
+
+test("extractIdentityBody captures both shelf docs in a multi-doc identity block", () => {
+  const MULTI_DOC_CONTEXT = [
+    "## Agent Identity: Codex",
+    "Loaded whole (not chunked). This is Layer 1.",
+    "",
+    "### CODEX_HOSTED_AGENT_ENVELOPE",
+    "envelope body content",
+    "",
+    "### CODEX_LAYER1_SHELF",
+    "shelf body content",
+    "",
+    "## Prior Context (codex)",
+    "  - **note.md** accessed 1x",
+  ].join("\n");
+
+  const body = extractIdentityBody(MULTI_DOC_CONTEXT);
+  assert.ok(body?.startsWith("## Agent Identity: Codex"));
+  assert.match(body, /CODEX_HOSTED_AGENT_ENVELOPE/);
+  assert.match(body, /envelope body content/);
+  assert.match(body, /CODEX_LAYER1_SHELF/);
+  assert.match(body, /shelf body content/);
+  assert.ok(!body.includes("## Prior Context"), "must not bleed into Prior Context");
+  assert.ok(body.indexOf("CODEX_HOSTED_AGENT_ENVELOPE") < body.indexOf("CODEX_LAYER1_SHELF"));
+});
+
+test("truncateToTokenCharBudget trims combined multi-doc identity body to budget", () => {
+  const doc1 = "### CODEX_HOSTED_AGENT_ENVELOPE\n" + "x".repeat(300);
+  const doc2 = "### CODEX_LAYER1_SHELF\n" + "y".repeat(300);
+  const combined = `## Agent Identity: Codex\nLoaded whole.\n\n${doc1}\n\n${doc2}`;
+  const tokenBudget = 100;
+  const result = truncateToTokenCharBudget(combined, tokenBudget);
+  assert.equal(result.length, tokenBudget * 4);
+  assert.ok(result.startsWith("## Agent Identity: Codex"));
+});
