@@ -216,6 +216,30 @@ export function extractLearningsSection(context: string | undefined): string | u
   return section.trim() || undefined;
 }
 
+/**
+ * Boot identity delivery: the daemon `read` context leads with the whole-
+ * document Layer 1 identity block (## Agent Identity …) before Prior Context /
+ * Learnings. Extract that slice so SessionStart can rank it in the envelope as
+ * `identity_body` instead of stripping it via extractLearningsSection().
+ */
+export function extractIdentityBody(context: string | undefined): string | undefined {
+  if (!context) return undefined;
+  const match = context.match(/^## Agent Identity[^\n]*$/m);
+  if (!match || match.index === undefined) return undefined;
+  const rest = context.slice(match.index);
+  const afterHeader = rest.slice(match[0].length);
+  const next = afterHeader.search(/^## (?:Prior Context|Learnings|Recent Activity)/m);
+  const section = next >= 0 ? rest.slice(0, match[0].length + next) : rest;
+  return section.trim() || undefined;
+}
+
+/** Rough token→char budget (4 chars/token) for Layer-1 envelope gating. */
+export function truncateToTokenCharBudget(text: string, tokenBudget: number): string {
+  if (tokenBudget <= 0) return "";
+  const maxChars = tokenBudget * 4;
+  return text.length <= maxChars ? text : text.slice(0, maxChars);
+}
+
 export type JsonRpcRequester = (socketPath: string, method: string, params: Record<string, unknown>) => Promise<JsonResult>;
 
 function jsonRpcSocketCandidates(): string[] {

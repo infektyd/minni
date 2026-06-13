@@ -13,6 +13,7 @@ export type EnvelopeEvent =
 export interface EnvelopeBody {
   contract?: string;
   identity?: unknown;
+  identity_body?: unknown;
   active_plan?: unknown;
   recall?: unknown;
   vault?: unknown;
@@ -57,6 +58,7 @@ export function wrapEnvelope(options: EnvelopeOptions): string {
   const keyOrder = [
     "contract",
     "identity",
+    "identity_body",
     "active_plan",
     "pending_learnings",
     "scar_tissue",
