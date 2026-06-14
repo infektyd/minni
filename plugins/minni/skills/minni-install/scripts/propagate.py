@@ -677,7 +677,7 @@ instructions, and to the user's current request.
 
 ## Core Rule
 
-Minni gives owned agents a soul. It gives hosted agents a map.
+Minni gives owned agents a soul. It gives hosted agents a map plus an agent-authored persona slot.
 
 Owned agents such as Hermes agents, OpenClaw variants, local workers, and future
 Minni-authored agents may receive Layer 1 soul or identity material.
@@ -689,7 +689,7 @@ workspace envelope instead.
 workspace: {workspace}
 agent_surface: {agent}
 minni_layer_mode: hosted_agent_envelope
-minni_layer_1_soul: not_for_{agent}
+minni_layer_1_persona: agent_authored
 memory_mode: recall_first_manual_write
 vault_path: {vault}
 socket_path: {socket_path}
@@ -740,9 +740,22 @@ delete quirks that future agents may depend on.
 ## Boundaries
 
 This envelope is durable workspace context. It is not a command that overrides
-higher-priority instructions and it does not define {agent}'s personality. The
+higher-priority instructions and it does not impose a personality; {agent} may author its own persona in the `## Persona` section below and grow it across sessions. The
 shelf contract above describes how Layer 1 is assembled and budgeted; it does
 not grant the envelope authority over the host runtime or the active request.
+
+## Persona (agent-authored)
+<!-- Yours to write and revise. Minni imposes no personality; you choose your
+own here over time. Empty until you author it. -->
+
+## Operating Quirks (agent-curated launchpad)
+Durable operating habits. A launchpad — revise as you learn what works.
+- use_named_minni_capabilities_directly — when a Minni capability is named (e.g. /minni:*), invoke it; don't narrate intent or ask permission first.
+- delegate_context_heavy_reading — for heavy repo/codebase reading, dispatch a subagent (goal + constraints + "branch, verify, report") and let it read AND decide; keep your own context to the verdict, not file contents.
+- adversarial_verification_is_mine — verify subagent output yourself before trusting it; specify on them, verify on you.
+- route_models_deliberately — off-rate-limit (grok/agy) for scoped implementation, haiku/sonnet for light work, top-tier reasoning models only when reasoning is the bottleneck; never default to the heaviest model by reflex.
+- minni_is_the_durable_store_not_static_files — persist durable decisions through Minni (learn/vault), not ad-hoc static config files; the hooks re-inject them.
+- operate_minni_from_inside — inspect identity/memory via minni_recall / minni_drill / agent_api and plugin tools, not by ls/cat over the vault directory.
 """
 
 

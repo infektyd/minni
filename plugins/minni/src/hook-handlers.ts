@@ -29,7 +29,9 @@ import { routeMemoryIntent } from "./policy.js";
 import {
   BOOT_RECALL_LAYERS,
   buildStatusReport,
+  extractIdentityBody,
   extractLearningsSection,
+  truncateToTokenCharBudget,
   fetchStaleBeliefEvents,
   formatRecall,
   readAgentContext,
@@ -270,10 +272,21 @@ export function createHookHandlers(
       envelopeBody.active_plan = activePlan;
     }
 
+    const budget = envelopeBudgetFor(config.contextWindow);
+    if (identityRead.ok && identityRead.data?.context) {
+      const identityBody = extractIdentityBody(identityRead.data.context);
+      if (identityBody) {
+        envelopeBody.identity_body = truncateToTokenCharBudget(
+          identityBody,
+          Math.max(budget - 500, 0),
+        );
+      }
+    }
+
     const envelope = wrapEnvelope({
       event: "SessionStart",
       agent: config.agentId,
-      budget: envelopeBudgetFor(config.contextWindow),
+      budget,
       body: envelopeBody,
     });
 
@@ -295,7 +308,7 @@ export function createHookHandlers(
 
     const nativeLayer1 =
       bootIdentity === "agent-context" && identityRead.ok && identityRead.data?.context
-        ? identityRead.data.context.trim()
+        ? truncateToTokenCharBudget(identityRead.data.context.trim(), budget)
         : "";
     return withHookContext("SessionStart", [nativeLayer1, envelope].filter(Boolean).join("\n\n"));
   }
