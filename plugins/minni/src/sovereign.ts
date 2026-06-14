@@ -163,6 +163,9 @@ export async function recallMemory(input: {
   layers?: ReadonlyArray<string>;
   workspaceId?: string;
   limit?: number;
+  scope?: "personal" | "combined" | "both";
+  crossAgent?: boolean;
+  cross_agent?: boolean;
 }, requester: JsonRpcRequester = jsonRpcSocketRequest): Promise<JsonResult<RecallResponse>> {
   // Daemon is JSON-RPC only; surface its real result/error (e.g. identity_mismatch)
   // directly instead of masking it behind a dead HTTP-over-socket fallback.
@@ -171,6 +174,8 @@ export async function recallMemory(input: {
     agent_id: input.agentId ?? DEFAULT_AGENT_ID,
     layers: input.layers ?? (input.layer ? [input.layer] : undefined),
     limit: input.limit,
+    scope: input.scope,
+    cross_agent: input.crossAgent ?? input.cross_agent,
   }, requester) as Promise<JsonResult<RecallResponse>>;
 }
 
@@ -306,6 +311,7 @@ export async function drillMemory(
   input: {
     resultIds?: number[];
     chunkIds?: number[];
+    references?: Array<Record<string, unknown> | string>;
     depth?: "snippet" | "chunk" | "document";
   },
   requester: JsonRpcRequester = jsonRpcSocketRequest,
@@ -313,6 +319,7 @@ export async function drillMemory(
   return jsonRpcSocketRequestWithFallbackRequester("sm_drill", {
     result_ids: input.resultIds,
     chunk_ids: input.chunkIds,
+    references: input.references,
     depth: input.depth ?? "snippet",
   }, requester);
 }
@@ -545,12 +552,13 @@ export function formatRecallLean(
             : "[[?]]";
       const score =
         typeof r.score === "number" ? Number((r.score as number).toFixed(2)) : undefined;
+      const src = typeof r.src === "string" ? r.src : undefined;
       const headRaw = (r.headline ?? r.snippet ?? "") as unknown;
       const headline =
         typeof headRaw === "string" && headRaw.trim()
           ? headRaw.replace(/\s+/g, " ").slice(0, 140)
           : undefined;
-      return { wikilink, score, headline };
+      return { wikilink, src, score, headline };
     });
   const omitted = arr.length - lean.length;
   const sections = [

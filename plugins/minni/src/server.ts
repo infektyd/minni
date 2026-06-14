@@ -410,11 +410,13 @@ server.registerTool(
         .optional(),
       limit: z.number().int().min(1).max(20).optional(),
       workspaceId: z.string().optional(),
+      scope: z.enum(["personal", "combined", "both"]).optional(),
+      cross_agent: z.boolean().optional(),
       // G12: vaultPath removed from model-facing schema (SEC-003). Model cannot redirect recall/search to arbitrary vaults.
       includeVault: z.boolean().optional(),
     },
   },
-  async ({ query, layer, limit, workspaceId, includeVault }) => {
+  async ({ query, layer, limit, workspaceId, scope, cross_agent, includeVault }) => {
     const effectiveVaultPath = DEFAULT_VAULT_PATH;
     const vaultResults =
       includeVault === false
@@ -428,6 +430,8 @@ server.registerTool(
       query,
       layer,
       limit,
+      scope,
+      crossAgent: cross_agent,
       workspaceId: workspaceId ?? DEFAULT_WORKSPACE_ID,
       agentId: DEFAULT_AGENT_ID, // G11: server-side default only (model no longer supplies agentId)
     });
@@ -443,6 +447,8 @@ server.registerTool(
         layer,
         limit,
         workspaceId,
+        scope,
+        cross_agent,
         agentId: DEFAULT_AGENT_ID, // G11: no longer from model
         includeVault: includeVault !== false,
         vaultMatches: vaultResults.map((match) => match.relativePath),
@@ -462,11 +468,12 @@ server.registerTool(
     inputSchema: {
       resultIds: z.array(z.number().int()).optional(),
       chunkIds: z.array(z.number().int()).optional(),
+      references: z.array(z.union([z.string(), z.object({}).passthrough()])).optional(),
       depth: z.enum(["snippet", "chunk", "document"]).optional(),
     },
   },
-  async ({ resultIds, chunkIds, depth }) => {
-    const result = await drillMemory({ resultIds, chunkIds, depth });
+  async ({ resultIds, chunkIds, references, depth }) => {
+    const result = await drillMemory({ resultIds, chunkIds, references, depth });
     return textResult(JSON.stringify(result, null, 2));
   },
 );

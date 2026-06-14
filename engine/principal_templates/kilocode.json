@@ -1,0 +1,17 @@
+{
+  "agent_id": "kilocode",
+  "workspace_id": "default",
+  "capabilities": [
+    "search",
+    "read",
+    "learn",
+    "feedback",
+    "log_event",
+    "handoff",
+    "export"
+  ],
+  "allowed_vault_roots": [
+    "__MINNI_HOME__/kilocode-vault",
+    "__MINNI_HOME__/shared"
+  ]
+}
