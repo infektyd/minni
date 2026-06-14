@@ -297,6 +297,17 @@ def test_handle_await_handoff_does_not_block_other_clients(monkeypatch, tmp_path
     """
     _patch_handoff_db(monkeypatch, tmp_path)
 
+    class FakeRetrieval:
+        last_trace_id = "trace-concurrency"
+
+        def retrieve(self, **kwargs):
+            return [{"doc_id": 1, "chunk_id": 1, "depth": kwargs["depth"], "source": "fake.md"}]
+
+        def search_learnings(self, *_args, **_kwargs):
+            return []
+
+    monkeypatch.setattr(minnid, "_lazy_retrieval", lambda: FakeRetrieval())
+
     async def client_await_handoff():
         req = {
             "jsonrpc": "2.0",
