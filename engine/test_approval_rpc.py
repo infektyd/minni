@@ -78,9 +78,16 @@ def test_agent_cannot_self_resolve_operator_can(tmp_path, monkeypatch):
     os.chmod(op_file, 0o600)
     pr_mod.PRINCIPALS_DIR = pdir_op
     try:
-        p_op = resolve_effective_principal(supplied_agent_id="main", transport="uds", principals_dir=pdir_op)
+        p_op = resolve_effective_principal(
+            supplied_agent_id="main",
+            transport="uds",
+            principals_dir=pdir_op,
+            operator_context=True,
+        )
         assert is_operator_principal(p_op)
-        resp2 = _resolve_candidate({"candidate_id": 999, "decision": "accept", "agent_id": "main"}, 2)
+        # Operator context for RPC is the no-agent-id local path; an agent
+        # explicitly claiming "main" is default-denied by principal.py.
+        resp2 = _resolve_candidate({"candidate_id": 999, "decision": "accept"}, 2)
         err2 = resp2.get("error", {})
         assert "operator_only" not in str(err2)
         # The operator gets PAST the gate; on the empty fixture DB the next

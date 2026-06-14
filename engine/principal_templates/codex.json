@@ -1,0 +1,17 @@
+{
+  "agent_id": "codex",
+  "workspace_id": "default",
+  "capabilities": [
+    "search",
+    "read",
+    "learn",
+    "feedback",
+    "log_event",
+    "handoff",
+    "export"
+  ],
+  "allowed_vault_roots": [
+    "__MINNI_HOME__/codex-vault",
+    "__MINNI_HOME__/shared"
+  ]
+}
