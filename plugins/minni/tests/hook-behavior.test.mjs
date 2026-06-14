@@ -170,7 +170,7 @@ const STOP_AGENTS = [
     name: "codex",
     hookJs: "codex-hook.js",
     agentId: "codex",
-    env: (vault) => ({ MINNI_VAULT_PATH: vault, MINNI_CODEX_HOOKS: "on" }),
+    env: (vault) => ({ MINNI_AGENT_ID: "codex", MINNI_VAULT_PATH: vault, MINNI_CODEX_HOOKS: "on" }),
   },
   {
     name: "kilocode",
