@@ -11,6 +11,6 @@ UPDATE learnings SET agent_id = 'claude-code' WHERE agent_id = 'claudecode';
 -- Grok agent, before grok-build entered platform_agent_ids. Reversible via backup.
 UPDATE learnings SET agent_id = 'grok-build' WHERE agent_id IN ('grok', 'grok-4.3');
 
--- learning_id=2: pre-G11 CLI corruption swapped --agent value and content; the row
--- belongs to syntra (content is the literal '--agent syntra' fragment).
-UPDATE learnings SET agent_id = 'syntra' WHERE agent_id LIKE 'Discord bot tags%';
+-- learning_id=2: pre-G11 CLI corruption swapped --agent value and content; the
+-- row belongs to syntra while the real learning text is currently in agent_id.
+UPDATE learnings SET content = agent_id, agent_id = 'syntra' WHERE agent_id LIKE 'Discord bot tags%';

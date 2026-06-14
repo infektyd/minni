@@ -322,8 +322,6 @@ def _tokenize_sql(sql: str):
             yield sql[i:j]
             i = j
         elif sql[i].isalpha() or sql[i] == '_':
-        # Try to match a keyword token at a word boundary
-        if sql[i].isalpha() or sql[i] == '_':
             j = i
             while j < n and (sql[j].isalnum() or sql[j] == '_'):
                 j += 1
@@ -343,7 +341,6 @@ def _tokenize_sql(sql: str):
                 and sql[j:j + 2] != "/*"
                 and not (sql[j].isalpha() or sql[j] == '_')
             ):
-            while j < n and sql[j] != ';' and not (sql[j].isalpha() or sql[j] == '_'):
                 j += 1
             yield sql[i:j]
             i = j
