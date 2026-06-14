@@ -663,8 +663,37 @@ def socket_rpc(socket_path: Path, method: str, params: dict) -> dict:
     return json.loads(b"".join(chunks).decode("utf-8").strip())
 
 
-def render_hosted_envelope(agent: str, workspace: str, socket_path: Path, vault: Path) -> str:
+def extract_agent_persona(existing_content: str | None) -> str:
+    if not existing_content:
+        return ""
+    match = re.search(
+        r"(?ms)^## Persona \(agent-authored\)[ \t\r]*\n(?P<body>.*?)(?=^## |\Z)",
+        existing_content,
+    )
+    if not match:
+        return ""
+    body = match.group("body").strip()
+    placeholder = "Empty until you author it."
+    if placeholder in body and not re.sub(r"<!--.*?-->", "", body, flags=re.S).strip():
+        return ""
+    return body
+
+
+def render_hosted_envelope(
+    agent: str,
+    workspace: str,
+    socket_path: Path,
+    vault: Path,
+    *,
+    existing_content: str | None = None,
+) -> str:
     title = f"{agent.title()} Hosted Agent Envelope"
+    persona = extract_agent_persona(existing_content)
+    persona_body = (
+        persona
+        if persona
+        else "<!-- Yours to write and revise. Minni imposes no personality; you choose your\nown here over time. Empty until you author it. -->"
+    )
     return f"""# {title}
 
 This is {agent}'s Minni Layer 1 whole-document envelope for the
@@ -745,8 +774,7 @@ shelf contract above describes how Layer 1 is assembled and budgeted; it does
 not grant the envelope authority over the host runtime or the active request.
 
 ## Persona (agent-authored)
-<!-- Yours to write and revise. Minni imposes no personality; you choose your
-own here over time. Empty until you author it. -->
+{persona_body}
 
 ## Operating Quirks (agent-curated launchpad)
 Durable operating habits. A launchpad — revise as you learn what works.
@@ -769,7 +797,14 @@ def seed_hosted(args: argparse.Namespace) -> int:
     source_dir = DEFAULT_IDENTITY_ROOT / agent
     source_dir.mkdir(parents=True, exist_ok=True)
     source_path = source_dir / f"{agent.upper()}_HOSTED_AGENT_ENVELOPE.md"
-    content = render_hosted_envelope(agent, workspace, socket_path, vault)
+    existing_content = source_path.read_text(encoding="utf-8") if source_path.exists() else None
+    content = render_hosted_envelope(
+        agent,
+        workspace,
+        socket_path,
+        vault,
+        existing_content=existing_content,
+    )
     source_path.write_text(content, encoding="utf-8")
 
     engine = repo_engine(workspace)
