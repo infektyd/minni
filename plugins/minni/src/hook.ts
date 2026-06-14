@@ -26,7 +26,9 @@ import {
   ackHandoff,
   BOOT_RECALL_LAYERS,
   buildStatusReport,
+  extractIdentityBody,
   extractLearningsSection,
+  truncateToTokenCharBudget,
   fetchStaleBeliefEvents,
   formatRecallLean,
   listPendingHandoffs,
@@ -167,10 +169,21 @@ async function handleSessionStart(payload: Record<string, unknown>): Promise<Hoo
     envelopeBody.active_plan = activePlan;
   }
 
+  const budget = envelopeBudgetFor(CLAUDECODE_CONTEXT_WINDOW);
+  if (recentLearnings.ok && recentLearnings.data?.context) {
+    const identityBody = extractIdentityBody(recentLearnings.data.context);
+    if (identityBody) {
+      envelopeBody.identity_body = truncateToTokenCharBudget(
+        identityBody,
+        Math.max(budget - 500, 0),
+      );
+    }
+  }
+
   const envelope = wrapEnvelope({
     event: "SessionStart",
     agent: CLAUDECODE_AGENT_ID,
-    budget: envelopeBudgetFor(CLAUDECODE_CONTEXT_WINDOW),
+    budget,
     body: envelopeBody,
   });
 

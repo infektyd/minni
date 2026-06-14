@@ -274,6 +274,36 @@ class WikiIndexer:
                     # Skip SCHEMA.md, index.md, log.md from rich indexing
                     # (they're still indexed but don't get wiki metadata treatment)
                     fname = os.path.basename(path)
+                    fname_upper = fname.upper()
+                    basename_upper = fname.replace('.md', '').upper()
+
+                    # Identity envelopes are whole-document Layer 1 docs
+                    # (agent=identity:*, whole_document=1). Skip wiki ingestion
+                    # when the same basename is already seeded as identity —
+                    # auto-indexed copies must not compete as knowledge-layer
+                    # candidates (doc 829 regression).
+                    c.execute(
+                        """SELECT 1 FROM documents
+                           WHERE whole_document = 1
+                             AND agent LIKE 'identity:%'
+                             AND (UPPER(path) = ? OR UPPER(path) LIKE '%/' || ?)""",
+                        (fname_upper, fname_upper),
+                    )
+                    if c.fetchone():
+                        stats["skipped"] += 1
+                        continue
+
+                    # Narrow guard: auto-indexed identity envelope filenames.
+                    if (
+                        "auto-indexed" in path
+                        and (
+                            "HOSTED_AGENT_ENVELOPE" in basename_upper
+                            or "AGENT_ENVELOPE" in basename_upper
+                        )
+                    ):
+                        stats["skipped"] += 1
+                        continue
+
                     is_meta = fname in ('SCHEMA.md', 'index.md', 'log.md')
 
                     c.execute(
