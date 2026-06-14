@@ -94,6 +94,7 @@ from principal import (                                     # noqa: E402  # G11 
     is_operator_principal,
     make_mismatch_error,
     resolve_effective_principal,
+    validate_agent_id,
 )
 
 # G12 (SEC-003): vault root binding guard. Enforces that any vault_path accepted
@@ -133,6 +134,7 @@ def _guard_vault_root(
 
 # ── Lazy imports (heavy ML deps) ──────────────────────────────────────────
 _retrieval = None
+_vault_retrieval_cache = {}
 _episodic = None
 _writeback = None
 
@@ -142,8 +144,142 @@ def _lazy_retrieval():
     global _retrieval
     if _retrieval is None:
         from retrieval import RetrievalEngine
-        _retrieval = RetrievalEngine(SovereignDB(), DEFAULT_CONFIG)
+        _retrieval = RetrievalEngine(SovereignDB(DEFAULT_CONFIG), DEFAULT_CONFIG)
     return _retrieval
+
+
+def _vault_agent_id(vault_path: Path) -> Optional[str]:
+    try:
+        from afm_passes.inbox_ingest import _VAULT_SLUG_TO_AGENT_ID
+
+        name = vault_path.name
+        if not name.endswith("-vault"):
+            return None
+        agent_id = _VAULT_SLUG_TO_AGENT_ID.get(name[: -len("-vault")])
+        return validate_agent_id(agent_id) if agent_id else None
+    except Exception:
+        return None
+
+
+def _vault_index_ready(vault_path: Path) -> bool:
+    try:
+        from vault_index import vault_index_paths
+
+        return vault_index_paths(vault_path).db_path.exists()
+    except Exception:
+        return False
+
+
+def _lazy_vault_retrieval(vault_path: Path):
+    """Return (RetrievalEngine, source_agent, db_path) for an indexed vault."""
+    try:
+        vault = Path(vault_path).expanduser().resolve()
+    except Exception:
+        vault = Path(vault_path).expanduser()
+    if not _vault_index_ready(vault):
+        return None
+    agent_id = _vault_agent_id(vault)
+    if not agent_id:
+        return None
+
+    key = str(vault)
+    cached = _vault_retrieval_cache.get(key)
+    if cached is not None:
+        return cached
+
+    from faiss_index import FAISSIndex
+    from retrieval import RetrievalEngine
+    from vault_index import build_vault_index_config
+
+    cfg = build_vault_index_config(vault, base_config=DEFAULT_CONFIG)
+    db = SovereignDB(cfg)
+    engine = RetrievalEngine(db, cfg, faiss_index=FAISSIndex(cfg))
+    cached = (engine, agent_id, cfg.db_path)
+    _vault_retrieval_cache[key] = cached
+    return cached
+
+
+def _agent_vault_retrieval(agent_id: str):
+    vault_path, _ = _agent_vault(agent_id)
+    return _lazy_vault_retrieval(vault_path)
+
+
+def _all_vault_retrievals() -> list:
+    out = []
+    seen = set()
+    for vault_path in _known_agent_vaults():
+        cached = _lazy_vault_retrieval(vault_path)
+        if cached is None:
+            continue
+        key = cached[2]
+        if key in seen:
+            continue
+        out.append(cached)
+        seen.add(key)
+    return out
+
+
+def _tag_document_results(results: list, *, src: str) -> list:
+    for row in results:
+        row["src"] = src
+        # Previous vault-scope experiments exposed ownership/index paths inline.
+        # Keep recall tiny; full provenance is available through drill.
+        row.pop("source_agent", None)
+        row.pop("source_index_db_path", None)
+        provenance = row.get("provenance")
+        if isinstance(provenance, dict):
+            provenance.pop("source_agent", None)
+            provenance.pop("source_index_db_path", None)
+    return results
+
+
+def _result_identity(row: dict) -> tuple:
+    return (
+        str(row.get("source") or row.get("path") or ""),
+        row.get("doc_id"),
+        row.get("chunk_id"),
+    )
+
+
+def _merge_document_results(result_sets: list, limit: int, *, prefer_personal: bool = False) -> list:
+    merged = []
+    for rows in result_sets:
+        merged.extend(rows)
+    if prefer_personal:
+        deduped = {}
+        for row in merged:
+            key = _result_identity(row)
+            existing = deduped.get(key)
+            if existing is None:
+                deduped[key] = row
+                continue
+            row_score = float(row.get("score") or 0.0)
+            existing_score = float(existing.get("score") or 0.0)
+            row_priority = 1 if row.get("src") == "p" else 0
+            existing_priority = 1 if existing.get("src") == "p" else 0
+            if (row_score, row_priority) > (existing_score, existing_priority):
+                deduped[key] = row
+        merged = list(deduped.values())
+    return sorted(
+        merged,
+        key=lambda row: (
+            float(row.get("score") or 0.0),
+            1 if prefer_personal and row.get("src") == "p" else 0,
+        ),
+        reverse=True,
+    )[:limit]
+
+
+def _resolve_document_scope(params: dict) -> str:
+    raw_scope = params.get("scope")
+    if raw_scope is not None:
+        scope = str(raw_scope)
+        if scope not in {"personal", "combined", "both"}:
+            raise ValueError("scope must be personal, combined, or both")
+        return scope
+    if bool(params.get("cross_agent", False)):
+        return "combined"
+    return "both"
 
 
 def _lazy_writeback():
@@ -368,7 +504,9 @@ def _known_agent_vaults() -> list[Path]:
                 vaults.extend(Path(os.path.expanduser(str(v))) for v in mapping.values())
         except json.JSONDecodeError:
             pass
-    root = Path.home() / ".minni"
+    # Resolve at call time (matches config.py providers/secrets pattern) so
+    # MINNI_HOME overrides are honored without hardcoding ~/.minni.
+    root = Path(os.environ.get("MINNI_HOME", os.path.expanduser("~/.minni")))
     if root.exists():
         vaults.extend(root.glob("*-vault"))
     return list(dict.fromkeys(vaults))
@@ -1042,7 +1180,10 @@ def _handle_search(params: dict, request_id: Any) -> dict:
     if not query:
         return _make_error(-32602, "query is required", request_id)
 
-    # G11: EffectivePrincipal is the single server-stamped source (never trust caller)
+    # G11: EffectivePrincipal is the single server-stamped source (never trust caller).
+    # Some legacy/mixed clients can still arrive without a usable principal; that
+    # path keeps learning recall unscoped for back-compat instead of silently
+    # dropping other agents' rows.
     supplied = params.get("agent_id")
     try:
         principal = resolve_effective_principal(
@@ -1050,7 +1191,12 @@ def _handle_search(params: dict, request_id: Any) -> dict:
         )
     except IdentityMismatchError as exc:
         return make_mismatch_error(exc.supplied, exc.stamped, request_id)
-    agent_id = principal.agent_id
+    agent_id = principal.agent_id if principal is not None else None
+    learnings_cross_agent = bool(params.get("cross_agent", False)) or principal is None
+    try:
+        document_scope = _resolve_document_scope(params)
+    except ValueError as exc:
+        return _make_error(-32602, str(exc), request_id)
     limit = min(int(params.get("limit", 5)), 20)
     depth = str(params.get("depth", "headline"))
     budget_tokens_param = params.get("budget_tokens")
@@ -1071,22 +1217,92 @@ def _handle_search(params: dict, request_id: Any) -> dict:
 
     try:
         engine = _lazy_retrieval()
-        results = engine.retrieve(
-            query=query,
-            agent_id=agent_id,
-            limit=limit,
-            depth=depth,
-            backend=_resolved_backend,
-            layers=layers,
-            sort=sort,
-            start_date=start_date,
-            end_date=end_date,
-            expand=expand,
-            summarize_neighborhood=summarize_neighborhood,
-            # G19/G20/G22: pass stamped principal so can_read_document + evidence envelope applied
-            principal=principal,
-            workspace=principal.workspace_id,
-        )
+
+        def _retrieve_from(
+            retrieval_engine,
+            *,
+            src: str,
+            principal_for_documents,
+        ) -> list:
+            rows = retrieval_engine.retrieve(
+                query=query,
+                agent_id=agent_id,
+                limit=limit,
+                depth=depth,
+                backend=_resolved_backend,
+                layers=layers,
+                sort=sort,
+                start_date=start_date,
+                end_date=end_date,
+                expand=expand,
+                summarize_neighborhood=summarize_neighborhood,
+                cross_agent=learnings_cross_agent,
+                # G19/G20/G22: the stamped principal gates every document
+                # stream. Combined/shared paths still gather all vault indexes,
+                # but each hit must pass can_read_document for the caller.
+                principal=principal_for_documents,
+                workspace=(
+                    principal_for_documents.workspace_id
+                    if principal_for_documents is not None
+                    else "default"
+                ),
+            )
+            return _tag_document_results(
+                rows,
+                src=src,
+            )
+
+        def _retrieve_shared() -> list:
+            return _retrieve_from(
+                engine,
+                src="c",
+                principal_for_documents=principal,
+            )
+
+        def _retrieve_personal() -> list:
+            vault_retrieval = _agent_vault_retrieval(agent_id) if agent_id else None
+            if vault_retrieval is not None:
+                vault_engine, _source_agent, _source_db_path = vault_retrieval
+                try:
+                    return _retrieve_from(
+                        vault_engine,
+                        src="p",
+                        principal_for_documents=principal,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "search: personal vault index failed for %s (%s); falling back to shared",
+                        agent_id,
+                        exc,
+                    )
+            return _retrieve_shared()
+
+        def _retrieve_combined() -> list:
+            result_sets = []
+            for vault_engine, _source_agent, _source_db_path in _all_vault_retrievals():
+                result_sets.append(
+                    _retrieve_from(
+                        vault_engine,
+                        src="c",
+                        principal_for_documents=principal,
+                    )
+                )
+            result_sets.append(_retrieve_shared())
+            return _merge_document_results(result_sets, limit)
+
+        if principal is None:
+            # Back-compat: callers with no stamped principal use the shared
+            # legacy document layer only.
+            results = _retrieve_shared()
+        elif document_scope == "personal":
+            results = _retrieve_personal()
+        elif document_scope == "combined":
+            # Combined is the pooled/fleet view: all existing per-vault indexes
+            # including the caller when present, plus shared legacy documents.
+            results = _retrieve_combined()
+        else:
+            result_sets = [_retrieve_personal(), _retrieve_combined()]
+            results = _merge_document_results(result_sets, limit, prefer_personal=True)
 
         # Apply MMR token-budget packing if requested
         if budget_tokens_param is not None:
@@ -1108,7 +1324,11 @@ def _handle_search(params: dict, request_id: Any) -> dict:
         learnings: list = []
         try:
             learnings = engine.search_learnings(
-                query, agent_id=agent_id, limit=limit, source="minnid.search"
+                query,
+                agent_id=agent_id,
+                cross_agent=learnings_cross_agent,
+                limit=limit,
+                source="minnid.search",
             )
         except Exception as exc:
             # hooks-PL-5: visible, never silently green
@@ -1274,18 +1494,242 @@ def _handle_expand(params: dict, request_id: Any) -> dict:
         return _make_error(-32000, f"Expand error: {exc}", request_id)
 
 
+def _indexed_at_for_result(retrieval_engine, result: dict) -> Optional[float]:
+    doc_id = result.get("doc_id")
+    if doc_id is None:
+        return None
+    try:
+        with retrieval_engine.db.cursor() as c:
+            c.execute("SELECT indexed_at FROM documents WHERE doc_id = ?", (int(doc_id),))
+            row = c.fetchone()
+        if row is None:
+            return None
+        value = row["indexed_at"]
+        return float(value) if value is not None else None
+    except Exception:
+        return None
+
+
+def _score_components(reference: dict, result: dict) -> dict:
+    ref_prov = reference.get("provenance") if isinstance(reference.get("provenance"), dict) else {}
+    result_prov = result.get("provenance") if isinstance(result.get("provenance"), dict) else {}
+
+    def pick(*names):
+        for name in names:
+            if name in reference and reference.get(name) is not None:
+                return reference.get(name)
+            if name in ref_prov and ref_prov.get(name) is not None:
+                return ref_prov.get(name)
+            if name in result and result.get(name) is not None:
+                return result.get(name)
+            if name in result_prov and result_prov.get(name) is not None:
+                return result_prov.get(name)
+        return None
+
+    return {
+        "score": pick("score"),
+        "fts_rank": pick("fts_rank"),
+        "semantic_rank": pick("semantic_rank", "sem_rank"),
+        "rrf_score": pick("rrf_score"),
+        "cross_encoder_score": pick("cross_encoder_score", "rerank_score"),
+        "decay_factor": pick("decay_factor", "decay_score"),
+        "backend": pick("backend"),
+    }
+
+
+def _full_provenance(
+    *,
+    retrieval_engine,
+    source_agent: str,
+    source_vault: str,
+    index_db_path: str,
+    reference: dict,
+    result: dict,
+) -> dict:
+    return {
+        "owning_agent_id": source_agent,
+        "document_agent": result.get("agent"),
+        "source_vault": source_vault,
+        "index_db_path": index_db_path,
+        "indexed_at": _indexed_at_for_result(retrieval_engine, result),
+        "score_components": _score_components(reference, result),
+    }
+
+
+def _reference_candidates(reference: dict, principal, agent_id: Optional[str], shared_engine) -> list:
+    marker = reference.get("src")
+    candidates = []
+
+    def add(candidate):
+        if candidate is None:
+            return
+        retrieval_engine, source_agent, index_db_path, principal_for_documents = candidate
+        key = str(index_db_path)
+        if any(str(existing[3]) == key for existing in candidates):
+            return
+        source_vault = str(Path(getattr(retrieval_engine.config, "vault_path", "")).expanduser().resolve())
+        candidates.append(
+            (
+                retrieval_engine,
+                source_agent,
+                source_vault,
+                index_db_path,
+                principal_for_documents,
+            )
+        )
+
+    # G19: the stamped principal gates every candidate index (shared and
+    # per-vault alike); expand_result applies can_read_document per hit.
+    shared_candidate = (
+        shared_engine,
+        "shared",
+        DEFAULT_CONFIG.db_path,
+        principal,
+    )
+
+    if principal is None:
+        add(shared_candidate)
+        return candidates
+
+    personal = _agent_vault_retrieval(agent_id) if agent_id else None
+    if marker == "p":
+        if personal is not None:
+            vault_engine, source_agent, index_db_path = personal
+            add((vault_engine, source_agent, index_db_path, principal))
+        add(shared_candidate)
+        return candidates
+
+    if marker == "c":
+        for vault_engine, source_agent, index_db_path in _all_vault_retrievals():
+            add((vault_engine, source_agent, index_db_path, principal))
+        add(shared_candidate)
+        return candidates
+
+    if personal is not None:
+        vault_engine, source_agent, index_db_path = personal
+        add((vault_engine, source_agent, index_db_path, principal))
+    for vault_engine, source_agent, index_db_path in _all_vault_retrievals():
+        add((vault_engine, source_agent, index_db_path, principal))
+    add(shared_candidate)
+    return candidates
+
+
+def _reference_matches(result: dict, reference: dict) -> bool:
+    ref_source = reference.get("source") or reference.get("path")
+    if ref_source:
+        try:
+            return Path(str(result.get("source") or "")).resolve() == Path(str(ref_source)).resolve()
+        except Exception:
+            return str(result.get("source") or "") == str(ref_source)
+    ref_wikilink = reference.get("wikilink")
+    if ref_wikilink:
+        return str(result.get("wikilink") or "") == str(ref_wikilink)
+    return True
+
+
+def _reference_ids_for_engine(reference: dict, retrieval_engine) -> list[int]:
+    raw_id = reference.get("chunk_id") or reference.get("doc_id") or reference.get("result_id")
+    if raw_id is not None:
+        try:
+            return [int(raw_id)]
+        except (TypeError, ValueError):
+            return []
+
+    ref_source = reference.get("source") or reference.get("path")
+    ref_wikilink = reference.get("wikilink")
+    normalized_wikilink = str(ref_wikilink).strip() if ref_wikilink else ""
+    if normalized_wikilink and not normalized_wikilink.startswith("[["):
+        normalized_wikilink = f"[[{normalized_wikilink.removesuffix('.md')}]]"
+
+    ids = []
+    try:
+        from retrieval import _path_to_wikilink  # type: ignore
+
+        with retrieval_engine.db.cursor() as c:
+            c.execute("SELECT doc_id, path FROM documents")
+            rows = c.fetchall()
+        for row in rows:
+            path_value = str(row["path"])
+            if ref_source:
+                try:
+                    if Path(path_value).resolve() == Path(str(ref_source)).resolve():
+                        ids.append(int(row["doc_id"]))
+                        continue
+                except Exception:
+                    if path_value == str(ref_source):
+                        ids.append(int(row["doc_id"]))
+                        continue
+            if normalized_wikilink and _path_to_wikilink(path_value) == normalized_wikilink:
+                ids.append(int(row["doc_id"]))
+    except Exception:
+        return ids
+    return ids
+
+
+def _expand_reference(
+    reference: dict,
+    *,
+    depth: str,
+    principal,
+    agent_id: Optional[str],
+    shared_engine,
+) -> Optional[dict]:
+    for retrieval_engine, source_agent, source_vault, index_db_path, principal_for_documents in _reference_candidates(
+        reference,
+        principal,
+        agent_id,
+        shared_engine,
+    ):
+        for result_id in _reference_ids_for_engine(reference, retrieval_engine):
+            result = retrieval_engine.expand_result(
+                result_id=result_id,
+                depth=depth,
+                principal=principal_for_documents,
+                workspace=(
+                    principal_for_documents.workspace_id
+                    if principal_for_documents is not None
+                    else "default"
+                ),
+            )
+            if result is None or not _reference_matches(result, reference):
+                continue
+            marker = "p" if reference.get("src") == "p" else "c"
+            full = _full_provenance(
+                retrieval_engine=retrieval_engine,
+                source_agent=source_agent,
+                source_vault=source_vault,
+                index_db_path=str(Path(index_db_path).expanduser().resolve()),
+                reference=reference,
+                result=result,
+            )
+            result["src"] = marker
+            result["full_provenance"] = full
+            provenance = result.get("provenance")
+            if not isinstance(provenance, dict):
+                provenance = {}
+            provenance.update(full)
+            result["provenance"] = provenance
+            return result
+    return None
+
+
 def _handle_sm_drill(params: dict, request_id: Any) -> dict:
     """Batch drill prior headline results to snippet/chunk/document depth."""
     global _request_count
     _request_count += 1
 
     raw_ids = params.get("chunk_ids", params.get("result_ids"))
-    if raw_ids is None:
-        return _make_error(-32602, "chunk_ids or result_ids is required", request_id)
-    if not isinstance(raw_ids, list):
+    raw_references = params.get("references", params.get("refs"))
+    if raw_ids is None and raw_references is None:
+        return _make_error(-32602, "chunk_ids, result_ids, references, or refs is required", request_id)
+    if raw_ids is not None and not isinstance(raw_ids, list):
         return _make_error(-32602, "chunk_ids/result_ids must be a list", request_id)
-    if len(raw_ids) > 20:
-        return _make_error(-32602, "sm_drill accepts at most 20 ids", request_id)
+    if raw_references is not None and not isinstance(raw_references, list):
+        return _make_error(-32602, "references/refs must be a list", request_id)
+    raw_ids = raw_ids or []
+    raw_references = raw_references or []
+    if len(raw_ids) + len(raw_references) > 20:
+        return _make_error(-32602, "sm_drill accepts at most 20 ids/references", request_id)
 
     depth = str(params.get("depth", "snippet"))
     if depth not in {"snippet", "chunk", "document"}:
@@ -1296,14 +1740,54 @@ def _handle_sm_drill(params: dict, request_id: Any) -> dict:
     except (TypeError, ValueError):
         return _make_error(-32602, "all ids must be integers", request_id)
 
+    references = []
+    for ref in raw_references:
+        if isinstance(ref, dict):
+            references.append(ref)
+        elif isinstance(ref, str):
+            stripped = ref.strip()
+            references.append({"wikilink": stripped} if stripped.startswith("[[") else {"source": stripped})
+        else:
+            return _make_error(-32602, "references must be objects or strings", request_id)
+
     try:
+        supplied = params.get("agent_id")
+        try:
+            principal = resolve_effective_principal(
+                supplied_agent_id=supplied, transport="uds"
+            )
+        except IdentityMismatchError as exc:
+            return make_mismatch_error(exc.supplied, exc.stamped, request_id)
+        agent_id = principal.agent_id if principal is not None else None
+
         engine = _lazy_retrieval()
         results = []
         missing = []
         for result_id in ids:
-            result = engine.expand_result(result_id=result_id, depth=depth)
+            # G19: same gate as reference drills — direct numeric ids must not
+            # bypass can_read_document on the shared index.
+            result = engine.expand_result(
+                result_id=result_id,
+                depth=depth,
+                principal=principal,
+                workspace=(
+                    principal.workspace_id if principal is not None else "default"
+                ),
+            )
             if result is None:
                 missing.append(result_id)
+            else:
+                results.append(result)
+        for index, reference in enumerate(references):
+            result = _expand_reference(
+                reference,
+                depth=depth,
+                principal=principal,
+                agent_id=agent_id,
+                shared_engine=engine,
+            )
+            if result is None:
+                missing.append(reference.get("doc_id") or reference.get("chunk_id") or reference.get("source") or index)
             else:
                 results.append(result)
         return _make_response({
@@ -1633,6 +2117,10 @@ def _handle_learn(params: dict, request_id: Any) -> dict:
     except IdentityMismatchError as exc:
         return make_mismatch_error(exc.supplied, exc.stamped, request_id)
     agent_id = principal.agent_id
+    try:
+        validate_agent_id(agent_id)
+    except ValueError as exc:
+        return _make_error(-32602, str(exc), request_id)
     category = params.get("category", "general")
     force = bool(params.get("force", False))
 
@@ -1855,6 +2343,10 @@ def _handle_resolve_contradiction(params: dict, request_id: Any) -> dict:
     except IdentityMismatchError as exc:
         return make_mismatch_error(exc.supplied, exc.stamped, request_id)
     agent_id = principal.agent_id
+    try:
+        validate_agent_id(agent_id)
+    except ValueError as exc:
+        return _make_error(-32602, str(exc), request_id)
     category = params.get("category", "general")
     assertion = params.get("assertion")
     applies_when = params.get("applies_when")
@@ -2483,6 +2975,15 @@ def _promote_candidate_durable(candidate_id: int, reason: str = "afm-consolidati
         return None
     content = cand.get("content") or ""
     agent_id = cand.get("principal") or "afm-loop"
+    try:
+        validate_agent_id(agent_id)
+    except ValueError as exc:
+        logger.warning(
+            "_promote_candidate_durable: invalid agent_id %r (%s) — skipping",
+            agent_id,
+            exc,
+        )
+        return None
     from afm_passes.consolidation import content_hash as _content_hash
     chash = _content_hash(content)
 
@@ -2674,6 +3175,7 @@ def _handle_daemon_compile(params: dict, request_id: Any) -> dict:
             "reorganization": "afm_passes.reorganization",
             "pruning": "afm_passes.pruning",
             "consolidation": "afm_passes.consolidation",
+            "vault_ingest": "afm_passes.vault_ingest",
         }
         if pass_name not in pass_runners:
             return _make_error(-32602, f"unsupported pass_name: {pass_name}", request_id)
@@ -2898,8 +3400,7 @@ def _stage_candidate(params: dict, request_id: Any) -> dict:
     instr = 1 if params.get("instruction_like") else 0
 
     try:
-        from db import SovereignDB as _SovDB
-        db = _SovDB()
+        db = _lazy_writeback().db
         with db.cursor() as c:
             c.execute(
                 """
@@ -3036,6 +3537,11 @@ def _resolve_candidate(params: dict, request_id: Any) -> dict:
         )
     except IdentityMismatchError as exc:
         return make_mismatch_error(exc.supplied, exc.stamped, request_id)
+
+    try:
+        validate_agent_id(principal.agent_id)
+    except ValueError as exc:
+        return _make_error(-32602, str(exc), request_id)
 
     cid = params.get("candidate_id")
     if cid is None:

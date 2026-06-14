@@ -36,7 +36,7 @@ from query_expand import expand as expand_query
 from query_expand import summarize_with_afm
 
 # G19/G20/G22: read gate + evidence envelopes
-from principal import EffectivePrincipal, can_read_document  # type: ignore
+from principal import EffectivePrincipal, agent_scope_for, can_read_document  # type: ignore
 from safety import is_instruction_like
 
 logger = logging.getLogger("sovereign.retrieval")
@@ -258,15 +258,44 @@ class RetrievalEngine:
 
     # ── FTS5 Search ────────────────────────────────────────────
 
-    def _fts_search(self, query: str, limit: int) -> List[Dict]:
+    @staticmethod
+    def _normalize_agent_filter(agent_filter: Optional[Sequence[str]]) -> list[str]:
+        if agent_filter is None:
+            return []
+        if isinstance(agent_filter, str):
+            raw = [agent_filter]
+        else:
+            raw = list(agent_filter)
+        scope: list[str] = []
+        seen: set[str] = set()
+        for item in raw:
+            agent = str(item).strip()
+            if agent and agent not in seen:
+                scope.append(agent)
+                seen.add(agent)
+        return scope
+
+    def _fts_search(
+        self,
+        query: str,
+        limit: int,
+        agent_filter: Optional[Sequence[str]] = None,
+    ) -> List[Dict]:
         """FTS5 search using BM25 ranking."""
         results = []
         safe_query = self._sanitize_fts_query(query)
         if not safe_query:
             return results
+        agent_scope = self._normalize_agent_filter(agent_filter)
 
         with self.db.cursor() as c:
-            c.execute("""
+            agent_clause = ""
+            params: list = [safe_query]
+            if agent_scope:
+                agent_clause = f" AND d.agent IN ({','.join('?' * len(agent_scope))})"
+                params.extend(agent_scope)
+            params.append(limit * 3)
+            c.execute(f"""
                 SELECT f.doc_id, d.path, d.agent, d.sigil,
                        rank AS bm25_rank, d.decay_score,
                        d.page_status, d.privacy_level, d.page_type,
@@ -274,9 +303,10 @@ class RetrievalEngine:
                 FROM vault_fts f
                 JOIN documents d ON d.doc_id = f.doc_id
                 WHERE vault_fts MATCH ?
+                {agent_clause}
                 ORDER BY rank
                 LIMIT ?
-            """, (safe_query, limit * 3))
+            """, params)
 
             for row in c.fetchall():
                 results.append({
@@ -309,7 +339,12 @@ class RetrievalEngine:
 
     # ── FAISS Semantic Search ─────────────────────────────────
 
-    def _semantic_search(self, query: str, limit: int) -> List[Dict]:
+    def _semantic_search(
+        self,
+        query: str,
+        limit: int,
+        agent_filter: Optional[Sequence[str]] = None,
+    ) -> List[Dict]:
         """
         Semantic search via FAISS index.
         Returns best-chunk-per-doc with chunk text and heading context.
@@ -336,9 +371,15 @@ class RetrievalEngine:
         score_map = {cid: score for cid, score in faiss_results}
 
         doc_best: Dict[int, Dict] = {}  # doc_id → best result
+        agent_scope = self._normalize_agent_filter(agent_filter)
 
         with self.db.cursor() as c:
             placeholders = ",".join("?" * len(chunk_ids))
+            agent_clause = ""
+            params: list = list(chunk_ids)
+            if agent_scope:
+                agent_clause = f" AND d.agent IN ({','.join('?' * len(agent_scope))})"
+                params.extend(agent_scope)
             c.execute(f"""
                 SELECT ce.chunk_id, ce.doc_id, ce.chunk_text, ce.heading_context,
                        d.path, d.agent, d.sigil, d.decay_score,
@@ -348,7 +389,8 @@ class RetrievalEngine:
                 FROM chunk_embeddings ce
                 JOIN documents d ON d.doc_id = ce.doc_id
                 WHERE ce.chunk_id IN ({placeholders})
-            """, chunk_ids)
+                {agent_clause}
+            """, params)
 
             for row in c.fetchall():
                 cid = row["chunk_id"]
@@ -1414,6 +1456,8 @@ class RetrievalEngine:
         expand=True,
         summarize_neighborhood: bool = False,
         use_hyde: Optional[bool] = None,
+        cross_agent: bool = False,
+        document_agent_filter: Optional[Sequence[str]] = None,
         # G19/G20/G22: principal for can_read_document gate + evidence envelope (default None = back-compat)
         principal: Optional[EffectivePrincipal] = None,
         workspace: str = "default",
@@ -1449,6 +1493,10 @@ class RetrievalEngine:
                     (default "rule"). "rule" and "afm" select explicit modes.
             summarize_neighborhood: If true, summarize 1-hop wikilinks when AFM is available.
             use_hyde: Optional PR-8 override. None follows config.hyde_enabled.
+            cross_agent: Learning-recall flag threaded from daemon handlers. It
+                does not scope the shared document layer.
+            document_agent_filter: Optional explicit document agent taxonomy
+                filter for future callers. Default None preserves shared wiki recall.
 
         Returns list of ranked results filtered to the requested depth tier.
         Existing callers that pass no depth receive identical results (snippet).
@@ -1477,6 +1525,8 @@ class RetrievalEngine:
                     expand=False,
                     summarize_neighborhood=False,
                     use_hyde=use_hyde,
+                    cross_agent=cross_agent,
+                    document_agent_filter=document_agent_filter,
                     principal=principal,
                     workspace=workspace,
                 ))
@@ -1555,7 +1605,12 @@ class RetrievalEngine:
         else:
             # Step 1-2: Dual retrieval
             fts_t0 = time.perf_counter()
-            fts_results = self._fts_search(query, rerank_k)
+            if document_agent_filter is None:
+                fts_results = self._fts_search(query, rerank_k)
+            else:
+                fts_results = self._fts_search(
+                    query, rerank_k, agent_filter=document_agent_filter
+                )
             timing["fts_ms"] = round((time.perf_counter() - fts_t0) * 1000, 3)
             trace["fts_hits"] = [
                 {
@@ -1574,7 +1629,12 @@ class RetrievalEngine:
             semantic_t0 = time.perf_counter()
             if backend is None:
                 # Default path — bit-identical to pre-PR-3
-                semantic_results = self._semantic_search(query, rerank_k)
+                if document_agent_filter is None:
+                    semantic_results = self._semantic_search(query, rerank_k)
+                else:
+                    semantic_results = self._semantic_search(
+                        query, rerank_k, agent_filter=document_agent_filter
+                    )
                 trace["backends"] = ["faiss-disk"]
             elif isinstance(backend, list):
                 # Fan-out: build a MultiBackend from the list of backend names/objects
@@ -1682,8 +1742,16 @@ class RetrievalEngine:
                         hypothetical = generate_hypothetical_answer(query, config=self.config)
                         if hypothetical:
                             trace["hyde"]["hypothetical_chars"] = len(hypothetical)
-                            hyde_fts = self._fts_search(hypothetical, rerank_k)
-                            hyde_semantic = self._semantic_search(hypothetical, rerank_k)
+                            if document_agent_filter is None:
+                                hyde_fts = self._fts_search(hypothetical, rerank_k)
+                                hyde_semantic = self._semantic_search(hypothetical, rerank_k)
+                            else:
+                                hyde_fts = self._fts_search(
+                                    hypothetical, rerank_k, agent_filter=document_agent_filter
+                                )
+                                hyde_semantic = self._semantic_search(
+                                    hypothetical, rerank_k, agent_filter=document_agent_filter
+                                )
                             hyde_merged = self._rrf_merge(hyde_fts, hyde_semantic, rerank_k)
                             hyde_merged = self._filter_candidates(
                                 hyde_merged, layers, start_date, end_date
@@ -2119,6 +2187,8 @@ class RetrievalEngine:
         self,
         query: str,
         agent_id: Optional[str] = None,
+        agent_scope: Optional[Sequence[str]] = None,
+        cross_agent: bool = False,
         limit: int = 10,
         source: str = "retrieval.search_learnings",
     ) -> List[Dict]:
@@ -2131,20 +2201,29 @@ class RetrievalEngine:
         safe_q = self._sanitize_fts_query(query)
         if not safe_q:
             return []
+        if cross_agent:
+            scope = []
+        elif agent_scope is not None:
+            scope = self._normalize_agent_filter(agent_scope)
+        elif agent_id:
+            scope = agent_scope_for(agent_id)
+        else:
+            scope = []
 
         results = []
         with self.db.cursor() as c:
-            if agent_id:
-                c.execute("""
+            if scope:
+                placeholders = ",".join("?" * len(scope))
+                c.execute(f"""
                     SELECT lf.learning_id, lf.agent_id, lf.content, lf.category,
                            l.confidence, l.created_at, l.access_count
                     FROM learnings_fts lf
                     JOIN learnings l ON l.learning_id = lf.learning_id
-                    WHERE learnings_fts MATCH ? AND lf.agent_id = ?
+                    WHERE learnings_fts MATCH ? AND lf.agent_id IN ({placeholders})
                           AND l.superseded_by IS NULL
                     ORDER BY rank
                     LIMIT ?
-                """, (safe_q, agent_id, limit))
+                """, [safe_q, *scope, limit])
             else:
                 c.execute("""
                     SELECT lf.learning_id, lf.agent_id, lf.content, lf.category,

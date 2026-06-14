@@ -53,7 +53,9 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re as _re
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, List, Optional
 
@@ -262,6 +264,101 @@ def from_local_transport(
         capabilities=["*"],
         allowed_vault_roots=[],
     )
+
+
+_AGENT_ID_RE = _re.compile(r'^[a-z0-9][a-z0-9._-]{0,63}$')
+
+
+def validate_agent_id(agent_id: str) -> str:
+    """Validate an agent_id string against the canonical format.
+
+    Accepts: lowercase alphanumeric, dots, underscores, hyphens. Must start
+    with [a-z0-9]. Maximum 64 characters.
+
+    Returns the agent_id unchanged if valid.
+    Raises ValueError with a descriptive message if invalid.
+    """
+    if not isinstance(agent_id, str) or not agent_id:
+        raise ValueError(f"agent_id must be a non-empty string, got {agent_id!r}")
+    if not _AGENT_ID_RE.match(agent_id):
+        raise ValueError(
+            f"invalid agent_id {agent_id!r}: must match ^[a-z0-9][a-z0-9._-]{{0,63}}$ "
+            f"(lowercase alphanumeric/dots/underscores/hyphens, max 64 chars)"
+        )
+    return agent_id
+
+
+def _string_list(value: Any) -> list[str]:
+    if isinstance(value, list):
+        raw = value
+    elif isinstance(value, str):
+        raw = [value]
+    else:
+        return []
+    return [str(item).strip() for item in raw if str(item).strip()]
+
+
+def _principal_aliases(raw: dict) -> list[str]:
+    # Support both spellings; legacy_agent_ids wins in resolve_effective_principal
+    # for auth, but recall scope can safely include the union declared by the
+    # same operator-owned file.
+    aliases: list[str] = []
+    aliases.extend(_string_list(raw.get("legacy_agent_ids")))
+    aliases.extend(_string_list(raw.get("aliases")))
+    return aliases
+
+
+def _add_valid_agent(scope: list[str], seen: set[str], agent_id: str) -> None:
+    try:
+        agent_id = validate_agent_id(agent_id)
+    except ValueError:
+        logger.warning("Ignoring invalid principal alias in recall scope: %r", agent_id)
+        return
+    if agent_id not in seen:
+        scope.append(agent_id)
+        seen.add(agent_id)
+
+
+@lru_cache(maxsize=128)
+def _agent_scope_for_cached(agent_id: str, principals_dir: str) -> tuple[str, ...]:
+    scope: list[str] = []
+    seen: set[str] = set()
+    _add_valid_agent(scope, seen, agent_id)
+
+    d = Path(principals_dir)
+    _ensure_principals_dir(d)
+    for name in CANONICAL_PRINCIPAL_NAMES:
+        raw = _load_raw_principal_file(name, d, strict=False)
+        if not raw:
+            continue
+        canonical = str(raw.get("agent_id") or raw.get("id") or "main").strip()
+        aliases = _principal_aliases(raw)
+        platform_ids = _string_list(raw.get("platform_agent_ids"))
+
+        if agent_id == canonical or agent_id in platform_ids:
+            for alias in aliases:
+                _add_valid_agent(scope, seen, alias)
+        elif agent_id in aliases:
+            _add_valid_agent(scope, seen, canonical)
+            for alias in aliases:
+                _add_valid_agent(scope, seen, alias)
+
+    return tuple(scope)
+
+
+def agent_scope_for(agent_id: str, principals_dir: Optional[Path] = None) -> list[str]:
+    """Return the learning agent-id scope for a stamped caller.
+
+    The scope is the caller id plus any legacy aliases declared in the same
+    operator principal files that resolve_effective_principal reads. This is
+    intentionally for learning rows only; document agents are a page taxonomy.
+    """
+    agent_id = validate_agent_id(str(agent_id))
+    d = principals_dir or PRINCIPALS_DIR
+    return list(_agent_scope_for_cached(agent_id, str(d)))
+
+
+agent_scope_for.cache_clear = _agent_scope_for_cached.cache_clear  # type: ignore[attr-defined]
 
 
 def resolve_effective_principal(

@@ -346,6 +346,28 @@ class SovereignDB:
             END
         """)
 
+        c.execute("DROP TRIGGER IF EXISTS trg_learnings_fts_update")
+        c.execute("""
+            CREATE TRIGGER trg_learnings_fts_update
+            AFTER UPDATE OF agent_id, category, content ON learnings
+            BEGIN
+                UPDATE learnings_fts
+                SET agent_id = NEW.agent_id,
+                    category = NEW.category,
+                    content = NEW.content
+                WHERE learning_id = OLD.learning_id;
+            END
+        """)
+
+        c.execute("DROP TRIGGER IF EXISTS trg_learnings_fts_delete")
+        c.execute("""
+            CREATE TRIGGER trg_learnings_fts_delete
+            AFTER DELETE ON learnings
+            BEGIN
+                DELETE FROM learnings_fts WHERE learning_id = OLD.learning_id;
+            END
+        """)
+
         conn.commit()
 
         # Run schema migrations for this db file, guarded by two independent

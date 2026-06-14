@@ -145,7 +145,14 @@ test("new memory RPC helpers send expected JSON-RPC methods", async () => {
     return { ok: true, data: { method, params } };
   };
 
-  await drillMemory({ resultIds: [1], depth: "chunk" }, requester);
+  await drillMemory(
+    {
+      resultIds: [1],
+      references: [{ doc_id: 2, src: "p", wikilink: "[[wiki/codex]]" }],
+      depth: "chunk",
+    },
+    requester,
+  );
   await exportContextPack({ query: "q", budgetTokens: 100, cacheKey: "k" }, requester);
   await ackHandoff({ leaseId: "lease", status: "accepted" }, requester);
   await listPendingHandoffs({ agentId: "codex" }, requester);
@@ -161,6 +168,7 @@ test("new memory RPC helpers send expected JSON-RPC methods", async () => {
     "minni_subscribe_contradictions",
   ]);
   assert.deepEqual(calls[0].params.result_ids, [1]);
+  assert.deepEqual(calls[0].params.references, [{ doc_id: 2, src: "p", wikilink: "[[wiki/codex]]" }]);
   assert.equal(calls[1].params.cache_key, "k");
   assert.equal(calls[2].params.lease_id, "lease");
 });

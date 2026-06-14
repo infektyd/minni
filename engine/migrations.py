@@ -213,6 +213,14 @@ def _execute_tolerant(conn: sqlite3.Connection, statement: str) -> None:
       This happens when migrations are re-applied to a DB that was partially migrated
       or when the base schema already contains the column.
     - "table already exists" → caught by IF NOT EXISTS, but included for safety.
+    - "no such table" for CREATE TRIGGER / CREATE INDEX / ALTER / UPDATE / DELETE
+      against a partial schema: the base schema initializer or a later full migration
+      will supply the missing table. Triggers are always recreated by _init_schema on
+      fresh databases, so missing-table here is safe to skip. DELETE is included
+      because SQLite validates trigger bodies at fire time, not creation time — a
+      data-fix DELETE can surface "no such table" for a table referenced only by a
+      trigger (e.g. 013's DELETE FROM learnings firing trg_learnings_fts_delete on
+      a schema without learnings_fts).
 
     Any other error is re-raised so the caller's transaction can roll back.
     """
@@ -227,7 +235,9 @@ def _execute_tolerant(conn: sqlite3.Connection, statement: str) -> None:
         elif ("no such table" in msg or "no such column" in msg) and (
             statement.strip().upper().startswith("ALTER")
             or statement.strip().upper().startswith("CREATE INDEX")
+            or statement.strip().upper().startswith("CREATE TRIGGER")
             or statement.strip().upper().startswith("UPDATE")
+            or statement.strip().upper().startswith("DELETE")
         ):
             # Additive migration against a partial test/legacy schema: the
             # base schema initializer or a later full migration will supply
@@ -239,11 +249,13 @@ def _execute_tolerant(conn: sqlite3.Connection, statement: str) -> None:
 
 def _split_statements(sql: str):
     """
-    Split a SQL script into individual statements on semicolons.
+    Split a SQL script into individual statements.
 
-    Comment lines (starting with --) are stripped before splitting so that
-    semicolons inside comments do not create spurious statements.
-    Sufficient for DDL-only migration files (no string literals with semicolons).
+    Comment lines (starting with --) are stripped before splitting.
+    Statements containing BEGIN...END blocks (triggers, etc.) are kept whole
+    by counting BEGIN/END depth so embedded semicolons do not produce
+    spurious splits.
+    Sufficient for DDL-only migration files.
     """
     # Strip comment lines first so embedded semicolons in comments are ignored
     clean_lines = [
@@ -252,7 +264,56 @@ def _split_statements(sql: str):
     ]
     clean_sql = "\n".join(clean_lines)
 
-    for part in clean_sql.split(";"):
-        statement = part.strip()
-        if statement:
-            yield statement
+    # State machine: accumulate chars; split on ';' only when begin_depth == 0
+    current: list[str] = []
+    begin_depth = 0
+
+    for token in _tokenize_sql(clean_sql):
+        upper = token.strip().upper()
+        if upper == "BEGIN":
+            begin_depth += 1
+            current.append(token)
+        elif upper == "END" and begin_depth > 0:
+            begin_depth -= 1
+            current.append(token)
+        elif token == ";" and begin_depth == 0:
+            stmt = "".join(current).strip()
+            if stmt:
+                yield stmt
+            current = []
+        else:
+            current.append(token)
+
+    # Yield any trailing statement without a final semicolon
+    stmt = "".join(current).strip()
+    if stmt:
+        yield stmt
+
+
+def _tokenize_sql(sql: str):
+    """
+    Yield tokens from a SQL string: keywords (BEGIN/END), semicolons, and
+    everything else as opaque character runs. Used by _split_statements to
+    track BEGIN/END depth without a full parser.
+    """
+    i = 0
+    n = len(sql)
+    while i < n:
+        # Try to match a keyword token at a word boundary
+        if sql[i].isalpha() or sql[i] == '_':
+            j = i
+            while j < n and (sql[j].isalnum() or sql[j] == '_'):
+                j += 1
+            word = sql[i:j]
+            yield word
+            i = j
+        elif sql[i] == ';':
+            yield ';'
+            i += 1
+        else:
+            # Accumulate non-keyword, non-semicolon chars
+            j = i
+            while j < n and sql[j] != ';' and not (sql[j].isalpha() or sql[j] == '_'):
+                j += 1
+            yield sql[i:j]
+            i = j
