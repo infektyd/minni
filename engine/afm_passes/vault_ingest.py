@@ -66,7 +66,7 @@ def _collect_markdown(wiki_root: Path) -> Dict[str, float]:
     return disk_files
 
 
-def _read_index_state(db_path: Path) -> Dict[str, Dict[str, Any]]:
+def _read_index_state(db_path: Path) -> Dict[str, sqlite3.Row]:
     if not db_path.exists():
         return {}
     try:
@@ -76,23 +76,24 @@ def _read_index_state(db_path: Path) -> Dict[str, Dict[str, Any]]:
             rows = conn.execute(
                 "SELECT doc_id, path, last_modified, indexed_at FROM documents"
             ).fetchall()
-            return {str(row["path"]): dict(row) for row in rows}
+            return {str(row["path"]): row for row in rows}
         finally:
             conn.close()
     except sqlite3.Error:
         return {}
 
 
-def _count_plan(disk_files: Dict[str, float], existing: Dict[str, Dict[str, Any]]) -> tuple[int, int, int]:
+def _count_plan(disk_files: Dict[str, float], existing: Dict[str, sqlite3.Row]) -> tuple[int, int, int]:
     would_index = 0
     skipped = 0
     for path, mtime in disk_files.items():
         row = existing.get(path)
-        indexed_at = float((row or {}).get("indexed_at") or 0)
-        if row and mtime <= indexed_at:
-            skipped += 1
-        else:
-            would_index += 1
+        if row is not None:
+            indexed_at = float(row["indexed_at"] or 0)
+            if mtime <= indexed_at:
+                skipped += 1
+                continue
+        would_index += 1
     would_prune = sum(1 for path in existing if path not in disk_files)
     return would_index, skipped, would_prune
 
@@ -179,8 +180,6 @@ def _index_changed_pages(
                     continue
                 if page.frontmatter.privacy == "blocked":
                     if row:
-                        # safe→blocked edit: purge the stale rows so the old
-                        # content stops serving at its prior privacy level.
                         doc_id = int(row["doc_id"])
                         _delete_doc_payload(c, doc_id)
                         c.execute("DELETE FROM documents WHERE doc_id = ?", (doc_id,))
@@ -357,25 +356,28 @@ def run(db, config, vault_path=None, dry_run=False, trace_id=None) -> Dict[str, 
         }
 
     index_db, _ = open_vault_index(vault, base_config=config)
-    indexer = WikiIndexer(index_db, index_db.config)
-    stats = _index_changed_pages(
-        indexer=indexer,
-        disk_files=disk_files,
-        agent_id=agent_id,
-        wiki_root=wiki_root,
-    )
-    faiss_saved = _save_faiss(indexer)
+    try:
+        indexer = WikiIndexer(index_db, index_db.config)
+        stats = _index_changed_pages(
+            indexer=indexer,
+            disk_files=disk_files,
+            agent_id=agent_id,
+            wiki_root=wiki_root,
+        )
+        faiss_saved = _save_faiss(indexer)
 
-    return {
-        **base,
-        "indexed": stats["indexed"],
-        "skipped_unchanged": stats["skipped_unchanged"],
-        "pruned": stats["pruned"],
-        "would_index": would_index,
-        "would_prune": would_prune,
-        "chunks": stats["chunks"],
-        "wikilinks": stats["wikilinks"],
-        "errors": stats["errors"],
-        "rejected": stats["rejected"],
-        "faiss_saved": faiss_saved,
-    }
+        return {
+            **base,
+            "indexed": stats["indexed"],
+            "skipped_unchanged": stats["skipped_unchanged"],
+            "pruned": stats["pruned"],
+            "would_index": would_index,
+            "would_prune": would_prune,
+            "chunks": stats["chunks"],
+            "wikilinks": stats["wikilinks"],
+            "errors": stats["errors"],
+            "rejected": stats["rejected"],
+            "faiss_saved": faiss_saved,
+        }
+    finally:
+        index_db.close()
