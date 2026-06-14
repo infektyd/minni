@@ -9,7 +9,7 @@
 Command run from `engine/` after adding tests and before implementation:
 
 ```bash
-/Users/hansaxelsson/Projects/Minni/engine/.venv/bin/python -m pytest -q test_principal_binding.py test_vault_root_binding.py
+<repo>/engine/.venv/bin/python -m pytest -q test_principal_binding.py test_vault_root_binding.py
 ```
 
 Expected RED result:
@@ -31,7 +31,7 @@ The failures covered:
 Focused command from `engine/`:
 
 ```bash
-/Users/hansaxelsson/Projects/Minni/engine/.venv/bin/python -m pytest -q test_principal_binding.py test_vault_root_binding.py test_approval_rpc.py test_scoped_recall.py
+<repo>/engine/.venv/bin/python -m pytest -q test_principal_binding.py test_vault_root_binding.py test_approval_rpc.py test_scoped_recall.py
 ```
 
 Result:
@@ -43,7 +43,7 @@ Result:
 Full gate command from `engine/`:
 
 ```bash
-/Users/hansaxelsson/Projects/Minni/engine/.venv/bin/python -m pytest -q
+<repo>/engine/.venv/bin/python -m pytest -q
 ```
 
 Result:

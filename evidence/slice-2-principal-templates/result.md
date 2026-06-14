@@ -9,7 +9,7 @@
 Command run from `engine/` before adding templates/script:
 
 ```bash
-/Users/hansaxelsson/Projects/Minni/engine/.venv/bin/python -m pytest -q test_principal_templates.py
+<repo>/engine/.venv/bin/python -m pytest -q test_principal_templates.py
 ```
 
 Expected RED result:
@@ -25,7 +25,7 @@ All failures were `ModuleNotFoundError: No module named 'tools.author_principals
 Focused command from `engine/`:
 
 ```bash
-/Users/hansaxelsson/Projects/Minni/engine/.venv/bin/python -m pytest -q test_principal_templates.py test_principal_binding.py test_vault_root_binding.py
+<repo>/engine/.venv/bin/python -m pytest -q test_principal_templates.py test_principal_binding.py test_vault_root_binding.py
 ```
 
 Result:
@@ -37,7 +37,7 @@ Result:
 Full gate command from `engine/`:
 
 ```bash
-/Users/hansaxelsson/Projects/Minni/engine/.venv/bin/python -m pytest -q
+<repo>/engine/.venv/bin/python -m pytest -q
 ```
 
 Result:

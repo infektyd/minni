@@ -9,7 +9,7 @@
 Command run from `engine/`:
 
 ```bash
-/Users/hansaxelsson/Projects/Minni/engine/.venv/bin/python -m pytest -q
+<repo>/engine/.venv/bin/python -m pytest -q
 ```
 
 Result:

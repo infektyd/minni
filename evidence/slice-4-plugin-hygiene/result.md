@@ -9,7 +9,7 @@
 Command run from `plugins/minni/` after adding tests and before implementation:
 
 ```bash
-PATH=/Users/hansaxelsson/Projects/Minni/plugins/minni/node_modules/.bin:$PATH npm run build:server && node --test --import ./tests/setup-env.mjs tests/config.test.mjs
+PATH=<repo>/plugins/minni/node_modules/.bin:$PATH npm run build:server && node --test --import ./tests/setup-env.mjs tests/config.test.mjs
 ```
 
 Expected RED result:
@@ -28,7 +28,7 @@ The failures proved:
 Focused command from `plugins/minni/`:
 
 ```bash
-PATH=/Users/hansaxelsson/Projects/Minni/plugins/minni/node_modules/.bin:$PATH npm run build:server && node --test --import ./tests/setup-env.mjs tests/config.test.mjs
+PATH=<repo>/plugins/minni/node_modules/.bin:$PATH npm run build:server && node --test --import ./tests/setup-env.mjs tests/config.test.mjs
 ```
 
 Result:
@@ -40,7 +40,7 @@ Result:
 Plugin build gate from `plugins/minni/`:
 
 ```bash
-PATH=/Users/hansaxelsson/Projects/Minni/plugins/minni/node_modules/.bin:$PATH npm run build
+PATH=<repo>/plugins/minni/node_modules/.bin:$PATH npm run build
 ```
 
 Result:

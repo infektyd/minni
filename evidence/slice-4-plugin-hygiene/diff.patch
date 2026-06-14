@@ -27,7 +27,7 @@ index efc3815..a6493b5 100644
 -    path.join(os.homedir(), ".minni", "codex-vault"),
 +    path.join(os.homedir(), ".minni", "unknown-vault"),
  );
- 
+
  export const SOCKET_PATH = expandTilde(
 @@ -236,7 +236,7 @@ export const AFM_PROVIDER_MODE =
  export const DEFAULT_AGENT_ID =
@@ -35,7 +35,7 @@ index efc3815..a6493b5 100644
    process.env.MINNI_CODEX_AGENT_ID ??
 -  "codex";
 +  "unknown-agent";
- 
+
  export const DEFAULT_WORKSPACE_ID =
    process.env.MINNI_WORKSPACE_ID ??
 diff --git a/plugins/minni/tests/config.test.mjs b/plugins/minni/tests/config.test.mjs
@@ -48,7 +48,7 @@ index c295de2..dffb8a3 100644
 +import os from "node:os";
 +import path from "node:path";
  import test from "node:test";
- 
+
  const CONFIG_ENV_KEYS = [
 @@ -63,3 +66,21 @@ test("Codex-specific env remains a compatibility fallback", async () => {
      },

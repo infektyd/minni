@@ -5,7 +5,7 @@ index 668225a..1c75cdd 100644
 @@ -1301,6 +1301,14 @@ def _handle_sm_drill(params: dict, request_id: Any) -> dict:
      if depth not in {"snippet", "chunk", "document"}:
          return _make_error(-32602, "depth must be snippet, chunk, or document", request_id)
- 
+
 +    supplied = params.get("agent_id")
 +    try:
 +        principal = resolve_effective_principal(
@@ -37,23 +37,23 @@ index 36bfafc..ee1c110 100644
 +++ b/engine/test_pr1b_contracts.py
 @@ -203,8 +203,8 @@ def test_sm_drill_batches_result_ids(self, monkeypatch):
          calls = []
- 
+
          class FakeEngine:
 -            def expand_result(self, result_id, depth="chunk"):
 -                calls.append((result_id, depth))
 +            def expand_result(self, result_id, depth="chunk", principal=None, workspace=None):
 +                calls.append((result_id, depth, getattr(principal, "agent_id", None), workspace))
                  return {"doc_id": result_id, "chunk_id": result_id * 10, "depth": depth}
- 
+
          monkeypatch.setattr(minnid, "_lazy_retrieval", lambda: FakeEngine())
 @@ -216,7 +216,7 @@ def expand_result(self, result_id, depth="chunk"):
          })
- 
+
          assert "error" not in response
 -        assert calls == [(1, "snippet"), (2, "snippet")]
 +        assert calls == [(1, "snippet", "main", "default"), (2, "snippet", "main", "default")]
          assert response["result"]["count"] == 2
- 
+
      def test_sm_export_pack_is_deterministic(self, monkeypatch):
 diff --git a/engine/test_retrieval_visibility.py b/engine/test_retrieval_visibility.py
 index 16c31ca..d275c85 100644
@@ -62,16 +62,16 @@ index 16c31ca..d275c85 100644
 @@ -9,9 +9,11 @@
  Now retrieve(..., principal=EffectivePrincipal) routes every result through can_read_document.
  """
- 
+
 -import pytest
 +from types import SimpleNamespace
  from unittest.mock import patch, MagicMock
- 
+
 +import pytest
 +
  from retrieval import RetrievalEngine
  from principal import EffectivePrincipal, can_read_document
- 
+
 @@ -91,4 +93,125 @@ def test_handoff_wikilink_denial_path_exercised():
      Full RPC dispatch would be in pr10_handoff; here we simply import and confirm the symbol.
      """

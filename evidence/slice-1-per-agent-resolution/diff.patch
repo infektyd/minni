@@ -3,9 +3,9 @@ index 1ecd18d..e7c47bf 100644
 --- a/engine/principal.py
 +++ b/engine/principal.py
 @@ -65,19 +65,18 @@
- 
+
  PRINCIPALS_DIR: Path = Path(CANONICAL_SOVEREIGN_HOME) / "principals"
- 
+
 -# Single source of truth for the canonical principal file names (G11 root-of-trust).
 +# Single source of truth for the canonical operator principal file names (G11 root-of-trust).
  # "main" is included because it is the synthesized default and a reasonable operator choice
@@ -14,8 +14,8 @@ index 1ecd18d..e7c47bf 100644
  # uniformly (no synthesis override, aliases respected, etc.).
  CANONICAL_PRINCIPAL_NAMES: tuple[str, ...] = ("local", "default", "operator", "main")
 +OPERATOR_RESERVED_AGENT_IDS: tuple[str, ...] = ("operator", "main")
- 
- 
+
+
  def _has_any_principal_files(d: Path) -> bool:
 -    """Detect strict mode: whether any CANONICAL principal file exists under the dir.
 -    Extracted for testability + hygiene (addresses re-review nit on repeated any() walk).
@@ -23,8 +23,8 @@ index 1ecd18d..e7c47bf 100644
 -    return any((d / f"{n}.json").is_file() for n in CANONICAL_PRINCIPAL_NAMES)
 +    """Detect strict mode: whether any principal JSON file exists under the dir."""
 +    return any(p.is_file() and p.suffix == ".json" for p in d.glob("*.json"))
- 
- 
+
+
  @dataclass(frozen=True)
 @@ -98,6 +97,8 @@ def can(self, capability: str) -> bool:
      def allows_vault_root(self, path: str | Path) -> bool:
@@ -51,7 +51,7 @@ index 1ecd18d..e7c47bf 100644
 +    operator_context: bool = False,
  ) -> EffectivePrincipal:
      """Resolve the single authoritative EffectivePrincipal for this request.
- 
+
 -    Rules (G11, post-RCM-003):
 -    - If any principals/*.json exist, strict mode: use the canonical stamped one (first in CANONICAL list).
 -    - If NO principal config files exist (fresh install), synthesize ONLY the fixed local "main"
@@ -66,13 +66,13 @@ index 1ecd18d..e7c47bf 100644
 +    - Unknown/fileless valid agent ids resolve to a default-deny principal.
 +    - Reserved operator ids ("main", "operator") require operator_context=True.
 +    - Per-agent file id mismatches still raise IdentityMismatchError.
- 
+
      The returned principal (or the raised error) is the ONLY identity that
      downstream code is allowed to use.
 @@ -397,7 +399,38 @@ def resolve_effective_principal(
      if supplied_agent_id is None:
          return stamped
- 
+
 -    supplied = str(supplied_agent_id).strip()
 +    supplied_raw = str(supplied_agent_id).strip()
 +    if not supplied_raw:
@@ -108,11 +108,11 @@ index 1ecd18d..e7c47bf 100644
 +
      if not supplied:
          return stamped
- 
+
 @@ -455,9 +488,21 @@ def resolve_effective_principal(
              # Accepted via migration alias from any principal file; return the stamped one.
              return stamped
- 
+
 -    # Mismatch (in strict or in fresh/no-principals mode) → hard deny.
 -    # Fresh installs now ONLY accept the fixed "main"; other supplied ids are rejected.
 -    raise IdentityMismatchError(supplied, stamped.agent_id)
@@ -131,8 +131,8 @@ index 1ecd18d..e7c47bf 100644
 +        capabilities=[],
 +        allowed_vault_roots=[],
 +    )
- 
- 
+
+
  # Convenience for handlers that want a ready-made JSON-RPC error payload
 @@ -498,7 +543,7 @@ def is_operator_principal(p: EffectivePrincipal) -> bool:
          return True
@@ -142,7 +142,7 @@ index 1ecd18d..e7c47bf 100644
 +    if p.agent_id in ("main", "operator") and bool(caps):
          return True
      return False
- 
+
 diff --git a/engine/test_approval_rpc.py b/engine/test_approval_rpc.py
 index 986fd31..a30e3bb 100644
 --- a/engine/test_approval_rpc.py
@@ -173,7 +173,7 @@ index 37cae39..69d0643 100644
 @@ -57,20 +57,20 @@ def test_resolve_fresh_install_only_main_accepted(tmp_path: Path):
      principals = tmp_path / "principals"
      principals.mkdir()  # empty -> fresh synthesize mode for "main" only
- 
+
 -    # (b) no-principal + "main" supplied or None -> pass with "main"
 -    p = resolve_effective_principal(supplied_agent_id="main", transport="uds", principals_dir=principals)
 +    # (b) no-principal + no supplied id is the explicit local/operator path.
@@ -181,7 +181,7 @@ index 37cae39..69d0643 100644
      assert isinstance(p, EffectivePrincipal)
      assert p.agent_id == "main"
      assert "*" in p.capabilities
- 
+
 -    p2 = resolve_effective_principal(supplied_agent_id=None, transport="uds", principals_dir=principals)
 -    assert p2.agent_id == "main"
 -
@@ -198,13 +198,13 @@ index 37cae39..69d0643 100644
 +    assert p2.capabilities == []
 +    assert p2.allowed_vault_roots == []
 +    assert not p2.can("read")
- 
+
      # (a) strict mode with principal file still passes (existing test covers details)
- 
+
 @@ -181,6 +181,132 @@ def test_resolve_strict_platform_agent_empty_caps_is_honoured(tmp_path: Path):
      assert not p.can("search")
- 
- 
+
+
 +def test_resolve_matching_per_agent_principal_file_wins(tmp_path: Path):
 +    principals = tmp_path / "principals"
 +    principals.mkdir()
@@ -362,11 +362,11 @@ index 37cae39..69d0643 100644
 +            encoding="utf-8",
 +        )
      os.chmod(f, 0o600)  # satisfy strict 0600 hard requirement (Bug 4)
- 
+
      original_resolve = principal.resolve_effective_principal
 @@ -334,7 +460,7 @@ def _patched(*, supplied_agent_id=None, transport="uds", principals_dir=None):
          )
- 
+
      monkeypatch.setattr(principal, "resolve_effective_principal", _patched)
 -    # Supply legacy alias "main" -> must get stamped "stamped-one" back
 -    p = resolve_effective_principal(supplied_agent_id="main", principals_dir=principals)
@@ -389,6 +389,6 @@ index 2da59ea..8fc3779 100644
 +    # Empty caps + empty roots is the explicit default-deny principal shape.
 +    p_deny = EffectivePrincipal(agent_id="unknown-agent", capabilities=[], allowed_vault_roots=[])
 +    assert not p_deny.allows_vault_root("/any/place")
- 
- 
+
+
  def test_vault_root_denies_outside_and_traversal(tmp_path: Path):

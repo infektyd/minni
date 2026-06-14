@@ -9,7 +9,7 @@
 Command run from `engine/` after adding visibility/drill coverage and before implementation:
 
 ```bash
-/Users/hansaxelsson/Projects/Minni/engine/.venv/bin/python -m pytest -q test_retrieval_visibility.py
+<repo>/engine/.venv/bin/python -m pytest -q test_retrieval_visibility.py
 ```
 
 Expected RED result after test harness fixes:
@@ -25,7 +25,7 @@ The remaining failure proved `_handle_sm_drill` called `expand_result` with `pri
 Focused command from `engine/`:
 
 ```bash
-/Users/hansaxelsson/Projects/Minni/engine/.venv/bin/python -m pytest -q test_retrieval_visibility.py test_handoff_wikilink_containment.py test_scoped_recall.py test_pr1b_contracts.py::TestDepthTiers::test_sm_drill_batches_result_ids
+<repo>/engine/.venv/bin/python -m pytest -q test_retrieval_visibility.py test_handoff_wikilink_containment.py test_scoped_recall.py test_pr1b_contracts.py::TestDepthTiers::test_sm_drill_batches_result_ids
 ```
 
 Result:
@@ -37,7 +37,7 @@ Result:
 Full gate command from `engine/`:
 
 ```bash
-/Users/hansaxelsson/Projects/Minni/engine/.venv/bin/python -m pytest -q
+<repo>/engine/.venv/bin/python -m pytest -q
 ```
 
 Result:
