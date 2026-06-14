@@ -294,8 +294,29 @@ def _tokenize_sql(sql: str):
     i = 0
     n = len(sql)
     while i < n:
-        # Try to match a keyword token at a word boundary
-        if sql[i].isalpha() or sql[i] == '_':
+        if sql[i] in ("'", '"'):
+            quote = sql[i]
+            j = i + 1
+            while j < n:
+                if sql[j] == quote:
+                    if j + 1 < n and sql[j + 1] == quote:
+                        j += 2
+                    else:
+                        j += 1
+                        break
+                else:
+                    j += 1
+            yield sql[i:j]
+            i = j
+        elif sql[i:i + 2] == "/*":
+            j = sql.find("*/", i + 2)
+            if j == -1:
+                j = n
+            else:
+                j += 2
+            yield sql[i:j]
+            i = j
+        elif sql[i].isalpha() or sql[i] == '_':
             j = i
             while j < n and (sql[j].isalnum() or sql[j] == '_'):
                 j += 1
@@ -308,7 +329,13 @@ def _tokenize_sql(sql: str):
         else:
             # Accumulate non-keyword, non-semicolon chars
             j = i
-            while j < n and sql[j] != ';' and not (sql[j].isalpha() or sql[j] == '_'):
+            while (
+                j < n
+                and sql[j] != ';'
+                and sql[j] not in ("'", '"')
+                and sql[j:j + 2] != "/*"
+                and not (sql[j].isalpha() or sql[j] == '_')
+            ):
                 j += 1
             yield sql[i:j]
             i = j

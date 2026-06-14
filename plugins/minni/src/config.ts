@@ -239,9 +239,11 @@ export const DEFAULT_AGENT_ID =
   "unknown-agent";
 
 export const DEFAULT_WORKSPACE_ID =
-  process.env.MINNI_WORKSPACE_ID ??
-  process.env.MINNI_CODEX_WORKSPACE_ID ??
-  "workspace-unknown";
+  normalizeWorkspaceId(
+    process.env.MINNI_WORKSPACE_ID ??
+      process.env.MINNI_CODEX_WORKSPACE_ID ??
+      "workspace-unknown"
+  );
 
 export const CODEX_HOOKS_ENABLED =
   (process.env.MINNI_CODEX_HOOKS ?? "on").toLowerCase() !== "off";

@@ -47,7 +47,7 @@ test("generic MINNI env overrides Codex-specific defaults for Hermes", async () 
       assert.equal(config.DEFAULT_VAULT_PATH, "/tmp/hermes-vault");
       assert.equal(config.SOCKET_PATH, "/tmp/hermes-sovereign.sock");
       assert.equal(config.DEFAULT_AGENT_ID, "hermes");
-      assert.equal(config.DEFAULT_WORKSPACE_ID, "/tmp/hermes-workspace");
+      assert.equal(config.DEFAULT_WORKSPACE_ID, "workspace-hermes-workspace");
     },
   );
 });
@@ -62,7 +62,7 @@ test("Codex-specific env remains a compatibility fallback", async () => {
     (config) => {
       assert.equal(config.DEFAULT_VAULT_PATH, "/tmp/codex-vault");
       assert.equal(config.DEFAULT_AGENT_ID, "codex-agent");
-      assert.equal(config.DEFAULT_WORKSPACE_ID, "/tmp/codex-workspace");
+      assert.equal(config.DEFAULT_WORKSPACE_ID, "workspace-codex-workspace");
     },
   );
 });
