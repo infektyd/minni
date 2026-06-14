@@ -27,40 +27,18 @@ def _basename_upper(path: str) -> str:
 
 def find_stray_wiki_docs(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     conn.row_factory = sqlite3.Row
-    rows = conn.execute(
-        """
-        SELECT w.doc_id, w.path, w.agent
-        FROM documents w
-        WHERE w.agent LIKE 'wiki:%'
-          AND EXISTS (
-            SELECT 1 FROM documents i
-            WHERE i.whole_document = 1
-              AND i.agent LIKE 'identity:%'
-              AND UPPER(i.path) LIKE '%' || UPPER(substr(w.path, instr(w.path, '/') + 1)) || '%'
-          )
-        """
+    identity_rows = conn.execute(
+        "SELECT path FROM documents WHERE whole_document = 1 AND agent LIKE 'identity:%'"
     ).fetchall()
-
-    # Fallback: basename match (handles differing directory prefixes).
-    if rows:
-        return rows
+    identity_stems = {_basename_upper(row["path"]) for row in identity_rows}
 
     wiki_rows = conn.execute(
         "SELECT doc_id, path, agent FROM documents WHERE agent LIKE 'wiki:%'"
     ).fetchall()
+
     stray: list[sqlite3.Row] = []
     for row in wiki_rows:
-        base = _basename_upper(row["path"])
-        hit = conn.execute(
-            """
-            SELECT 1 FROM documents
-            WHERE whole_document = 1
-              AND agent LIKE 'identity:%'
-              AND UPPER(path) LIKE ?
-            """,
-            (f"%{base}%",),
-        ).fetchone()
-        if hit:
+        if _basename_upper(row["path"]) in identity_stems:
             stray.append(row)
     return stray
 

@@ -117,3 +117,34 @@ class TestWikiIdentityExclusion:
         assert stats["indexed"] == 0
         assert stats["skipped"] >= 1
         db_obj.close()
+
+    def test_does_not_skip_substring_filename_collision(self, tmp_path):
+        from wiki_indexer import WikiIndexer
+
+        db_obj, cfg = _make_db(tmp_path)
+        conn = db_obj._get_conn()
+
+        identity_path = str(tmp_path / "identities" / "CODEX_HOSTED_AGENT_ENVELOPE.md")
+        os.makedirs(os.path.dirname(identity_path), exist_ok=True)
+        _seed_identity_doc(conn, identity_path)
+
+        wiki_dir = tmp_path / "wiki"
+        wiki_dir.mkdir(parents=True)
+        note = wiki_dir / "agent.md"
+        note.write_text(
+            "---\ntitle: Agent Note\nstatus: accepted\nprivacy: safe\ntype: concept\n"
+            "---\n\n"
+            + " ".join(f"agent-note-{i}" for i in range(90)),
+            encoding="utf-8",
+        )
+
+        indexer = WikiIndexer(db=db_obj, config=cfg)
+        stats = indexer.index_wiki(str(wiki_dir))
+
+        assert stats["indexed"] == 1
+        row = conn.execute(
+            "SELECT doc_id FROM documents WHERE agent LIKE 'wiki:%' AND path = ?",
+            (str(note),),
+        ).fetchone()
+        assert row is not None
+        db_obj.close()
