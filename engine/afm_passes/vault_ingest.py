@@ -89,7 +89,7 @@ def _count_plan(disk_files: Dict[str, float], existing: Dict[str, sqlite3.Row]) 
     for path, mtime in disk_files.items():
         row = existing.get(path)
         if row is not None:
-            indexed_at = float(row["indexed_at"])
+            indexed_at = float(row["indexed_at"] or 0)
             if mtime <= indexed_at:
                 skipped += 1
                 continue

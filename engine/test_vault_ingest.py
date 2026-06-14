@@ -120,6 +120,23 @@ def test_collect_markdown_skips_files_that_vanish_during_walk(tmp_path, monkeypa
     assert str(missing) not in result
 
 
+def test_count_plan_handles_legacy_null_indexed_at():
+    from afm_passes.vault_ingest import _count_plan
+
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute("CREATE TABLE documents (path TEXT, indexed_at REAL)")
+    conn.execute("INSERT INTO documents(path, indexed_at) VALUES ('/vault/wiki/stale.md', NULL)")
+    row = conn.execute("SELECT path, indexed_at FROM documents").fetchone()
+
+    would_index, skipped, would_prune = _count_plan(
+        {"/vault/wiki/stale.md": 100.0},
+        {row["path"]: row},
+    )
+
+    assert (would_index, skipped, would_prune) == (1, 0, 0)
+
+
 def test_vault_ingest_indexes_wiki_into_per_vault_store_only(tmp_path, monkeypatch):
     from afm_passes.vault_ingest import run
     from vault_index import vault_index_paths
