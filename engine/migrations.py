@@ -213,10 +213,14 @@ def _execute_tolerant(conn: sqlite3.Connection, statement: str) -> None:
       This happens when migrations are re-applied to a DB that was partially migrated
       or when the base schema already contains the column.
     - "table already exists" → caught by IF NOT EXISTS, but included for safety.
-    - "no such table" for CREATE TRIGGER / CREATE INDEX / ALTER / UPDATE against a
-      partial schema: the base schema initializer or a later full migration will
-      supply the missing table. Triggers are always recreated by _init_schema on
-      fresh databases, so missing-table here is safe to skip.
+    - "no such table" for CREATE TRIGGER / CREATE INDEX / ALTER / UPDATE / DELETE
+      against a partial schema: the base schema initializer or a later full migration
+      will supply the missing table. Triggers are always recreated by _init_schema on
+      fresh databases, so missing-table here is safe to skip. DELETE is included
+      because SQLite validates trigger bodies at fire time, not creation time — a
+      data-fix DELETE can surface "no such table" for a table referenced only by a
+      trigger (e.g. 013's DELETE FROM learnings firing trg_learnings_fts_delete on
+      a schema without learnings_fts).
 
     Any other error is re-raised so the caller's transaction can roll back.
     """
@@ -233,6 +237,7 @@ def _execute_tolerant(conn: sqlite3.Connection, statement: str) -> None:
             or statement.strip().upper().startswith("CREATE INDEX")
             or statement.strip().upper().startswith("CREATE TRIGGER")
             or statement.strip().upper().startswith("UPDATE")
+            or statement.strip().upper().startswith("DELETE")
         ):
             # Additive migration against a partial test/legacy schema: the
             # base schema initializer or a later full migration will supply
@@ -317,6 +322,8 @@ def _tokenize_sql(sql: str):
             yield sql[i:j]
             i = j
         elif sql[i].isalpha() or sql[i] == '_':
+        # Try to match a keyword token at a word boundary
+        if sql[i].isalpha() or sql[i] == '_':
             j = i
             while j < n and (sql[j].isalnum() or sql[j] == '_'):
                 j += 1
@@ -336,6 +343,7 @@ def _tokenize_sql(sql: str):
                 and sql[j:j + 2] != "/*"
                 and not (sql[j].isalpha() or sql[j] == '_')
             ):
+            while j < n and sql[j] != ';' and not (sql[j].isalpha() or sql[j] == '_'):
                 j += 1
             yield sql[i:j]
             i = j

@@ -169,11 +169,13 @@ def _is_stop_candidate_shape(doc: Dict[str, Any]) -> bool:
 _VAULT_SLUG_TO_AGENT_ID: dict[str, str] = {
     "claudecode": "claude-code",
     "codex": "codex",
+    "gemini": "gemini",
     "hermes": "hermes",
+    "kilocode": "kilocode",
     "openclaw": "openclaw",
     "grok-build": "grok-build",
-    "grok-beta": "grok-beta",
-    "grok": "grok",
+    "grok-beta": "grok-build",
+    "grok": "grok-build",
 }
 
 
