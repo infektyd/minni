@@ -97,6 +97,29 @@ def _wiki_snapshot(vault: Path) -> dict[str, bytes]:
     }
 
 
+def test_collect_markdown_skips_files_that_vanish_during_walk(tmp_path, monkeypatch):
+    from afm_passes.vault_ingest import _collect_markdown
+
+    wiki = tmp_path / "codex-vault" / "wiki"
+    _write_page(wiki / "keep.md", "Keep", _long_body("keep"))
+    missing = wiki / "gone.md"
+    _write_page(missing, "Gone", _long_body("gone"))
+
+    original_stat = Path.stat
+
+    def flaky_stat(self, *args, **kwargs):
+        if self.name == "gone.md":
+            raise OSError("file vanished")
+        return original_stat(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", flaky_stat)
+
+    result = _collect_markdown(wiki)
+
+    assert str(wiki / "keep.md") in result
+    assert str(missing) not in result
+
+
 def test_vault_ingest_indexes_wiki_into_per_vault_store_only(tmp_path, monkeypatch):
     from afm_passes.vault_ingest import run
     from vault_index import vault_index_paths
