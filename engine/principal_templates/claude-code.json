@@ -1,0 +1,17 @@
+{
+  "agent_id": "claude-code",
+  "workspace_id": "default",
+  "capabilities": [
+    "search",
+    "read",
+    "learn",
+    "feedback",
+    "log_event",
+    "handoff",
+    "export"
+  ],
+  "allowed_vault_roots": [
+    "__MINNI_HOME__/claudecode-vault",
+    "__MINNI_HOME__/shared"
+  ]
+}

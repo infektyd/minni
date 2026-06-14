@@ -1,0 +1,17 @@
+{
+  "agent_id": "gemini",
+  "workspace_id": "default",
+  "capabilities": [
+    "search",
+    "read",
+    "learn",
+    "feedback",
+    "log_event",
+    "handoff",
+    "export"
+  ],
+  "allowed_vault_roots": [
+    "__MINNI_HOME__/gemini-vault",
+    "__MINNI_HOME__/shared"
+  ]
+}

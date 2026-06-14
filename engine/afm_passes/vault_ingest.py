@@ -179,7 +179,14 @@ def _index_changed_pages(
                     stats["errors"] += 1
                     continue
                 if page.frontmatter.privacy == "blocked":
-                    stats["skipped_unchanged"] += 1
+                    if row:
+                        doc_id = int(row["doc_id"])
+                        _delete_doc_payload(c, doc_id)
+                        c.execute("DELETE FROM documents WHERE doc_id = ?", (doc_id,))
+                        stats.setdefault("pruned", 0)
+                        stats["pruned"] += 1
+                    else:
+                        stats["skipped_unchanged"] += 1
                     continue
 
                 now = time.time()

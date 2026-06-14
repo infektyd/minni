@@ -504,7 +504,9 @@ def _known_agent_vaults() -> list[Path]:
                 vaults.extend(Path(os.path.expanduser(str(v))) for v in mapping.values())
         except json.JSONDecodeError:
             pass
-    root = Path.home() / ".minni"
+    # Resolve at call time (matches config.py providers/secrets pattern) so
+    # MINNI_HOME overrides are honored without hardcoding ~/.minni.
+    root = Path(os.environ.get("MINNI_HOME", os.path.expanduser("~/.minni")))
     if root.exists():
         vaults.extend(root.glob("*-vault"))
     return list(dict.fromkeys(vaults))
@@ -1235,9 +1237,9 @@ def _handle_search(params: dict, request_id: Any) -> dict:
                 expand=expand,
                 summarize_neighborhood=summarize_neighborhood,
                 cross_agent=learnings_cross_agent,
-                # G19/G20/G22: pass stamped principal for personal recall.
-                # Combined searches intentionally gather all vault indexes, so
-                # they use the legacy document path without same-agent narrowing.
+                # G19/G20/G22: the stamped principal gates every document
+                # stream. Combined/shared paths still gather all vault indexes,
+                # but each hit must pass can_read_document for the caller.
                 principal=principal_for_documents,
                 workspace=(
                     principal_for_documents.workspace_id
@@ -1254,7 +1256,7 @@ def _handle_search(params: dict, request_id: Any) -> dict:
             return _retrieve_from(
                 engine,
                 src="c",
-                principal_for_documents=None,
+                principal_for_documents=principal,
             )
 
         def _retrieve_personal() -> list:
@@ -1282,7 +1284,7 @@ def _handle_search(params: dict, request_id: Any) -> dict:
                     _retrieve_from(
                         vault_engine,
                         src="c",
-                        principal_for_documents=None,
+                        principal_for_documents=principal,
                     )
                 )
             result_sets.append(_retrieve_shared())
@@ -1576,11 +1578,13 @@ def _reference_candidates(reference: dict, principal, agent_id: Optional[str], s
             )
         )
 
+    # G19: the stamped principal gates every candidate index (shared and
+    # per-vault alike); expand_result applies can_read_document per hit.
     shared_candidate = (
         shared_engine,
         "shared",
         DEFAULT_CONFIG.db_path,
-        None,
+        principal,
     )
 
     if principal is None:
@@ -1597,7 +1601,7 @@ def _reference_candidates(reference: dict, principal, agent_id: Optional[str], s
 
     if marker == "c":
         for vault_engine, source_agent, index_db_path in _all_vault_retrievals():
-            add((vault_engine, source_agent, index_db_path, None))
+            add((vault_engine, source_agent, index_db_path, principal))
         add(shared_candidate)
         return candidates
 
@@ -1605,7 +1609,7 @@ def _reference_candidates(reference: dict, principal, agent_id: Optional[str], s
         vault_engine, source_agent, index_db_path = personal
         add((vault_engine, source_agent, index_db_path, principal))
     for vault_engine, source_agent, index_db_path in _all_vault_retrievals():
-        add((vault_engine, source_agent, index_db_path, None))
+        add((vault_engine, source_agent, index_db_path, principal))
     add(shared_candidate)
     return candidates
 
@@ -1731,6 +1735,14 @@ def _handle_sm_drill(params: dict, request_id: Any) -> dict:
     if depth not in {"snippet", "chunk", "document"}:
         return _make_error(-32602, "depth must be snippet, chunk, or document", request_id)
 
+    supplied = params.get("agent_id")
+    try:
+        principal = resolve_effective_principal(
+            supplied_agent_id=supplied, transport="uds"
+        )
+    except IdentityMismatchError as exc:
+        return make_mismatch_error(exc.supplied, exc.stamped, request_id)
+
     try:
         ids = [int(value) for value in raw_ids]
     except (TypeError, ValueError):
@@ -1760,7 +1772,16 @@ def _handle_sm_drill(params: dict, request_id: Any) -> dict:
         results = []
         missing = []
         for result_id in ids:
-            result = engine.expand_result(result_id=result_id, depth=depth)
+            # G19: same gate as reference drills — direct numeric ids must not
+            # bypass can_read_document on the shared index.
+            result = engine.expand_result(
+                result_id=result_id,
+                depth=depth,
+                principal=principal,
+                workspace=(
+                    principal.workspace_id if principal is not None else "default"
+                ),
+            )
             if result is None:
                 missing.append(result_id)
             else:

@@ -1,0 +1,74 @@
+diff --git a/plugins/minni/.mcp.json b/plugins/minni/.mcp.json
+index 413acac..fdf08e7 100644
+--- a/plugins/minni/.mcp.json
++++ b/plugins/minni/.mcp.json
+@@ -3,7 +3,12 @@
+     "minni": {
+       "command": "node",
+       "args": ["./dist/server.js"],
+-      "cwd": "."
++      "cwd": ".",
++      "env": {
++        "MINNI_AGENT_ID": "codex",
++        "MINNI_VAULT_PATH": "~/.minni/codex-vault",
++        "MINNI_SOCKET_PATH": "~/.minni/run/minnid.sock"
++      }
+     }
+   }
+ }
+diff --git a/plugins/minni/src/config.ts b/plugins/minni/src/config.ts
+index efc3815..a6493b5 100644
+--- a/plugins/minni/src/config.ts
++++ b/plugins/minni/src/config.ts
+@@ -49,7 +49,7 @@ export function minniHome(): string {
+ export const DEFAULT_VAULT_PATH = expandTilde(
+   process.env.MINNI_VAULT_PATH ??
+     process.env.MINNI_CODEX_VAULT_PATH ??
+-    path.join(os.homedir(), ".minni", "codex-vault"),
++    path.join(os.homedir(), ".minni", "unknown-vault"),
+ );
+
+ export const SOCKET_PATH = expandTilde(
+@@ -236,7 +236,7 @@ export const AFM_PROVIDER_MODE =
+ export const DEFAULT_AGENT_ID =
+   process.env.MINNI_AGENT_ID ??
+   process.env.MINNI_CODEX_AGENT_ID ??
+-  "codex";
++  "unknown-agent";
+
+ export const DEFAULT_WORKSPACE_ID =
+   process.env.MINNI_WORKSPACE_ID ??
+diff --git a/plugins/minni/tests/config.test.mjs b/plugins/minni/tests/config.test.mjs
+index c295de2..dffb8a3 100644
+--- a/plugins/minni/tests/config.test.mjs
++++ b/plugins/minni/tests/config.test.mjs
+@@ -1,4 +1,7 @@
+ import assert from "node:assert/strict";
++import { readFileSync } from "node:fs";
++import os from "node:os";
++import path from "node:path";
+ import test from "node:test";
+
+ const CONFIG_ENV_KEYS = [
+@@ -63,3 +66,21 @@ test("Codex-specific env remains a compatibility fallback", async () => {
+     },
+   );
+ });
++
++test("no env falls back to unknown deny identity, not codex vault", async () => {
++  await withConfigEnv({}, (config) => {
++    assert.equal(config.DEFAULT_AGENT_ID, "unknown-agent");
++    assert.equal(
++      config.DEFAULT_VAULT_PATH,
++      path.join(os.homedir(), ".minni", "unknown-vault"),
++    );
++  });
++});
++
++test("Codex MCP manifest pins codex env explicitly", () => {
++  const manifest = JSON.parse(readFileSync(new URL("../.mcp.json", import.meta.url), "utf8"));
++  const env = manifest.mcpServers?.minni?.env;
++  assert.equal(env?.MINNI_AGENT_ID, "codex");
++  assert.equal(env?.MINNI_VAULT_PATH, "~/.minni/codex-vault");
++  assert.equal(env?.MINNI_SOCKET_PATH, "~/.minni/run/minnid.sock");
++});

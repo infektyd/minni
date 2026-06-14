@@ -35,7 +35,7 @@ def _long_body(marker: str) -> str:
     return " ".join(f"{marker}-beacon-{i}" for i in range(100))
 
 
-def _write_page(path: Path, title: str, marker: str) -> None:
+def _write_page(path: Path, title: str, marker: str, privacy: str = "safe") -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         "\n".join(
@@ -44,7 +44,7 @@ def _write_page(path: Path, title: str, marker: str) -> None:
                 f"title: {title}",
                 "type: concept",
                 "status: accepted",
-                "privacy: safe",
+                f"privacy: {privacy}",
                 "---",
                 "",
                 _long_body(marker),
@@ -79,7 +79,14 @@ def _make_cfg(tmp_path: Path):
     return db_obj, cfg
 
 
-def _seed_shared_doc(db_obj, path: Path, content: str) -> None:
+def _seed_shared_doc(
+    db_obj,
+    path: Path,
+    content: str,
+    *,
+    agent: str = "wiki:concept",
+    privacy: str = "safe",
+) -> int:
     now = time.time()
     vec = _FakeEmbedder().encode(content).astype(np.float32).tobytes()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -89,13 +96,13 @@ def _seed_shared_doc(db_obj, path: Path, content: str) -> None:
             """INSERT INTO documents
                (path, agent, sigil, last_modified, indexed_at,
                 page_status, privacy_level, page_type, layer)
-               VALUES (?, 'wiki:concept', 'wiki', ?, ?, 'accepted', 'safe', 'concept', 'knowledge')""",
-            (str(path), now, now),
+               VALUES (?, ?, 'wiki', ?, ?, 'accepted', ?, 'concept', 'knowledge')""",
+            (str(path), agent, now, now, privacy),
         )
         doc_id = c.lastrowid
         c.execute(
-            "INSERT INTO vault_fts (doc_id, path, content, agent, sigil) VALUES (?, ?, ?, 'wiki:concept', 'wiki')",
-            (doc_id, str(path), content),
+            "INSERT INTO vault_fts (doc_id, path, content, agent, sigil) VALUES (?, ?, ?, ?, 'wiki')",
+            (doc_id, str(path), content, agent),
         )
         c.execute(
             """INSERT INTO chunk_embeddings
@@ -103,9 +110,15 @@ def _seed_shared_doc(db_obj, path: Path, content: str) -> None:
                VALUES (?, 0, ?, ?, 'shared', 'fake', ?, 'knowledge')""",
             (doc_id, content, vec, now),
         )
+        return int(c.lastrowid)
 
 
-def _install_principal(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, agent_id: str = "codex") -> None:
+def _install_principal(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    agent_id: str = "codex",
+    capabilities: list[str] | None = None,
+) -> None:
     import principal as principal_mod
 
     principals = tmp_path / "principals"
@@ -115,7 +128,7 @@ def _install_principal(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, agent_id
         json.dumps(
             {
                 "agent_id": agent_id,
-                "capabilities": ["*"],
+                "capabilities": capabilities or ["*"],
                 "allowed_vault_roots": [str(tmp_path)],
             }
         ),
@@ -410,3 +423,129 @@ def test_no_principal_keeps_shared_legacy_only(tmp_path, monkeypatch):
 
     assert _sources(resp) == ["shared.md"]
     assert _src_markers(resp) == ["c"]
+
+
+def _build_private_foreign_indexes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Codex owns a safe page; claude-code's vault holds a privacy: private page."""
+    from afm_passes.vault_ingest import run
+
+    _install_fake_embedder(monkeypatch)
+    db_obj, cfg = _make_cfg(tmp_path)
+    codex_vault = tmp_path / "codex-vault"
+    claude_vault = tmp_path / "claudecode-vault"
+    _write_page(codex_vault / "wiki" / "codex.md", "Codex", "codex-personal")
+    _write_page(
+        claude_vault / "wiki" / "claude-private.md",
+        "Claude Private",
+        "claude-private",
+        privacy="private",
+    )
+    run(db_obj, cfg, vault_path=str(codex_vault), dry_run=False)
+    run(db_obj, cfg, vault_path=str(claude_vault), dry_run=False)
+    _seed_shared_doc(db_obj, tmp_path / "legacy" / "shared.md", _long_body("legacy-shared"))
+    return db_obj, cfg, codex_vault, claude_vault
+
+
+@pytest.mark.parametrize("scope", ["combined", None])
+def test_combined_scope_gates_foreign_private_pages_for_non_operator(
+    tmp_path, monkeypatch, scope
+):
+    _, cfg, codex_vault, claude_vault = _build_private_foreign_indexes(tmp_path, monkeypatch)
+    _install_principal(monkeypatch, tmp_path, "codex", capabilities=["search"])
+    _install_runtime(
+        monkeypatch,
+        tmp_path,
+        cfg,
+        {"codex": codex_vault, "claude-code": claude_vault},
+    )
+
+    params = {"query": "beacon", "agent_id": "codex", "expand": False, "limit": 10}
+    if scope is not None:
+        params["scope"] = scope
+    resp = _search(params)
+
+    assert set(_sources(resp)) == {"codex.md", "shared.md"}
+
+
+def test_shared_fallback_gates_foreign_private_docs_for_non_operator(tmp_path, monkeypatch):
+    _install_fake_embedder(monkeypatch)
+    db_obj, cfg = _make_cfg(tmp_path)
+    codex_vault = tmp_path / "codex-vault"
+    codex_vault.mkdir()
+    _seed_shared_doc(db_obj, tmp_path / "legacy" / "shared.md", _long_body("legacy-shared"))
+    _seed_shared_doc(
+        db_obj,
+        tmp_path / "legacy" / "claude-private.md",
+        _long_body("legacy-private"),
+        agent="claude-code",
+        privacy="private",
+    )
+    _install_principal(monkeypatch, tmp_path, "codex", capabilities=["search"])
+    _install_runtime(monkeypatch, tmp_path, cfg, {"codex": codex_vault})
+
+    resp = _search(
+        {
+            "query": "beacon",
+            "agent_id": "codex",
+            "scope": "personal",
+            "expand": False,
+            "limit": 5,
+        }
+    )
+
+    assert _sources(resp) == ["shared.md"]
+    assert _src_markers(resp) == ["c"]
+
+
+def test_drill_reference_gates_foreign_private_page_for_non_operator(tmp_path, monkeypatch):
+    _, cfg, codex_vault, claude_vault = _build_private_foreign_indexes(tmp_path, monkeypatch)
+    _install_principal(monkeypatch, tmp_path, "codex", capabilities=["search"])
+    _install_runtime(
+        monkeypatch,
+        tmp_path,
+        cfg,
+        {"codex": codex_vault, "claude-code": claude_vault},
+    )
+
+    own_source = str(codex_vault / "wiki" / "codex.md")
+    foreign_source = str(claude_vault / "wiki" / "claude-private.md")
+    drilled = _drill(
+        {
+            "references": [
+                {"source": own_source, "src": "c"},
+                {"source": foreign_source, "src": "c"},
+            ],
+            "depth": "chunk",
+        }
+    )
+
+    assert "error" not in drilled, drilled
+    result_sources = [Path(row["source"]).name for row in drilled["result"]["results"]]
+    assert result_sources == ["codex.md"]
+    assert drilled["result"]["missing"] == [foreign_source]
+
+
+def test_drill_numeric_ids_gate_foreign_private_shared_docs(tmp_path, monkeypatch):
+    _install_fake_embedder(monkeypatch)
+    db_obj, cfg = _make_cfg(tmp_path)
+    codex_vault = tmp_path / "codex-vault"
+    codex_vault.mkdir()
+    shared_chunk = _seed_shared_doc(
+        db_obj, tmp_path / "legacy" / "shared.md", _long_body("legacy-shared")
+    )
+    private_chunk = _seed_shared_doc(
+        db_obj,
+        tmp_path / "legacy" / "claude-private.md",
+        _long_body("legacy-private"),
+        agent="claude-code",
+        privacy="private",
+    )
+    _install_principal(monkeypatch, tmp_path, "codex", capabilities=["search"])
+    _install_runtime(monkeypatch, tmp_path, cfg, {"codex": codex_vault})
+
+    drilled = _drill({"chunk_ids": [shared_chunk, private_chunk], "depth": "chunk"})
+
+    assert "error" not in drilled, drilled
+    result_sources = [Path(row["source"]).name for row in drilled["result"]["results"]]
+    assert result_sources == ["shared.md"]
+    assert drilled["result"]["missing"] == [private_chunk]
