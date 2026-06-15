@@ -1,10 +1,11 @@
 # Sovereign Memory — JSON-RPC Capabilities Matrix
 
-**Contract version:** 1.0.0
-**Last updated:** 2026-04-26
+**Contract version:** 1.1.0
+**Last updated:** 2026-06-15
 
 This document lists every JSON-RPC method exposed by the Sovereign Memory daemon
-(`engine/sovrd.py`). Methods not yet implemented are marked `[PLANNED: PR-N]`.
+(`engine/minnid.py`; the authoritative dispatch table is `_METHODS`). Methods not
+yet implemented are marked `[PLANNED: PR-N]`.
 
 ---
 
@@ -28,14 +29,20 @@ This document lists every JSON-RPC method exposed by the Sovereign Memory daemon
 | `learn` | agent | Writes a row to `learnings`; optionally appends to `~/.openclaw/MEMORY.md` (dual-write mode). | Stores a durable learning keyed by `agent_id` and `category`. |
 | `log_event` | agent | Writes a row to `episodic_events`. | Appends an episodic event. Fields: `event_type`, `content`, `agent_id`, `task_id?`, `thread_id?`. |
 | `expand` | agent | Updates `access_count` and `last_accessed` on the expanded document. | Re-fetch a specific result at a deeper depth tier. Accepts `result_id` (chunk_id or doc_id) and `depth`. |
-| `recall` | agent | Same as `read`. | Alias for `read`. [PLANNED: PR-2] |
-| `health_report` | agent | None | Structured health report including index freshness, decay stats, and schema version. [PLANNED: PR-2] |
-| `feedback` | agent | Writes a row to `feedback_events`. | Signal quality of a recall result (thumbs-up / thumbs-down + comment). Used to calibrate confidence scoring. [PLANNED: PR-9] |
-| `trace` | agent | None | Retrieve full provenance trace for a `result_id`. Returns the chain of FTS rank, semantic rank, RRF score, cross-encoder score, decay factor. [PLANNED: PR-9] |
-| `handoff` | agent | Writes a handoff packet to `wiki/handoffs/` and `inbox/`. | Package current agent context (identity, pending learnings, open questions) for a peer agent. [PLANNED: PR-10] |
-| `compile` | agent | Writes vault pages; updates index.md and log.md. | Synthesize raw notes + learnings into structured wiki pages (entity, concept, decision, etc.). [PLANNED: PR-13] |
-| `endorse` | agent | Updates `review_state` from `candidate` to `accepted` on a vault page. | Peer-agent endorsement of a candidate page. [PLANNED: PR-13] |
-| `hygiene_report` | agent | None | Report on vault health: orphan pages, pages missing sources, expired pages, supersession chains. [PLANNED: PR-11] |
+| `recall` | agent | Same as `read`. | Served as an alias of `read` (no distinct `recall` method in `_METHODS`). |
+| `health_report` | agent | None | Structured health report including index freshness, decay stats, and schema version. |
+| `feedback` | agent | Writes a row to `feedback_events`. | Signal quality of a recall result (thumbs-up / thumbs-down + comment). Used to calibrate confidence scoring. |
+| `trace` | agent | None | Retrieve full provenance trace for a `result_id`. Returns the chain of FTS rank, semantic rank, RRF score, cross-encoder score, decay factor. |
+| `handoff` | agent | Writes a handoff packet to `wiki/handoffs/` and `inbox/`. | Package current agent context (identity, pending learnings, open questions) for a peer agent. Also reachable as `daemon.handoff`. |
+| `compile` | agent | Writes vault pages; updates index.md and log.md. | Synthesize raw notes + learnings into structured wiki pages (entity, concept, decision, etc.). Wired as `daemon.compile`. |
+| `endorse` | agent | Updates `review_state` from `candidate` to `accepted` on a vault page. | Peer-agent endorsement of a candidate page. Wired as `daemon.endorse`. |
+| `hygiene_report` | agent | None | Report on vault health: orphan pages, pages missing sources, expired pages, supersession chains. |
+| `minni_subscribe_contradictions` | agent | None | Return contradiction events for learnings recently read by the calling agent (belief-correction surface). |
+| `stage_candidate` | agent | None (no durable write). | G14/G16 candidate pipeline: stage a candidate packet (default learn path) for operator review. |
+| `list_candidates` | agent | None | G14/G17: list staged candidates for the stamped principal (console/governance view). |
+| `resolve_candidate` | operator | Accept → durable `learn`; reject/redact otherwise. | G15: resolve a staged candidate. Authorization is owner-or-explicit-operator, enforced inside the transaction. |
+| `ax_snapshot_store` | agent | Writes an accessibility-tree snapshot (TTL-bounded, default 3600s). | OmniSense: persist an AX/app snapshot (`agent_id`, `app_name`, `tree_json`). Returns `snapshot_id`. |
+| `ax_snapshot_get` | agent | None | OmniSense: retrieve a stored AX/app snapshot by `agent_id` / `app_name`. |
 
 ---
 
