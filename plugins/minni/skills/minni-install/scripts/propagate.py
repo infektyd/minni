@@ -669,6 +669,42 @@ def socket_rpc(socket_path: Path, method: str, params: dict) -> dict:
 # sessions. This mirrors the preserve_surface_env pattern (read prior state,
 # splice it back in before overwrite) for the markdown body instead of TOML env.
 PERSONA_HEADER = "## Persona (agent-authored)"
+# The section that immediately follows persona in the template. Persona is
+# bounded by THIS known header (not just any `## `) so an agent may use `## `
+# subheadings inside their own persona without the body being truncated.
+QUIRKS_HEADER = "## Operating Quirks (agent-curated launchpad)"
+
+
+def _persona_bounds(text: str) -> tuple[int, int, str] | None:
+    """Locate the persona section, bounded by the Operating Quirks header.
+
+    Returns (persona_header_index, end_index, body). The body runs from the
+    line after the persona header up to the Operating Quirks header when that
+    header is present; otherwise it falls back to the next `## ` header or EOF
+    (back-compat for templates that lack the quirks section). Bounding by the
+    known following header lets an agent author `## `-level subheadings inside
+    their persona without losing everything after the first one.
+    """
+    lines = text.splitlines(keepends=True)
+    start = None
+    for i, line in enumerate(lines):
+        if line.strip() == PERSONA_HEADER:
+            start = i
+            break
+    if start is None:
+        return None
+    end = None
+    for j in range(start + 1, len(lines)):
+        if lines[j].strip() == QUIRKS_HEADER:
+            end = j
+            break
+    if end is None:
+        end = len(lines)
+        for j in range(start + 1, len(lines)):
+            if lines[j].startswith("## "):
+                end = j
+                break
+    return start, end, "".join(lines[start + 1 : end])
 
 
 def _extract_section(text: str, header: str) -> tuple[int, int, str] | None:
@@ -716,10 +752,10 @@ def preserve_persona(new_content: str, prior_content: str | None) -> str:
     """
     if not prior_content:
         return new_content
-    prior = _extract_section(prior_content, PERSONA_HEADER)
+    prior = _persona_bounds(prior_content)
     if prior is None or not _persona_is_authored(prior[2]):
         return new_content
-    cur = _extract_section(new_content, PERSONA_HEADER)
+    cur = _persona_bounds(new_content)
     if cur is None:
         return new_content
     lines = new_content.splitlines(keepends=True)

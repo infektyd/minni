@@ -85,6 +85,26 @@ def test_rerender_is_idempotent_after_preserve():
     assert second == first
 
 
+def test_persona_with_h2_subheadings_survives_intact():
+    """An agent may structure their persona with `## ` subheadings; the whole
+    body (not just the part before the first subheading) must be preserved.
+
+    Regression: the original boundary stopped at the first `## ` after the
+    persona header, silently dropping everything from an agent's first h2
+    onward. Persona is now bounded by the Operating Quirks header instead.
+    """
+    authored = "\nIntro line.\n\n## Voice\nterse, skeptical.\n\n## Style\nshell over pixels.\n\n"
+    prior = _author_persona(_rendered(), authored)
+    merged = propagate.preserve_persona(_rendered(), prior)
+
+    assert "Intro line." in merged
+    assert "## Voice" in merged and "terse, skeptical." in merged
+    assert "## Style" in merged and "shell over pixels." in merged
+    # And the template's own trailing section is untouched.
+    assert "## Operating Quirks (agent-curated launchpad)" in merged
+    assert "use_named_minni_capabilities_directly" in merged
+
+
 def test_persona_is_authored_detection():
     assert propagate._persona_is_authored("\nreal content\n") is True
     assert propagate._persona_is_authored("<!-- only a comment -->") is False
