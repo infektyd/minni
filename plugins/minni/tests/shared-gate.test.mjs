@@ -34,3 +34,16 @@ test("isSharedGateUnavailable classifies old/down daemon errors as degraded gate
   assert.equal(isSharedGateUnavailable("identity unresolved: unknown agent codex"), false);
   assert.equal(isSharedGateUnavailable("gate rejected: principal mismatch"), false);
 });
+
+test("isSharedGateUnavailable keeps identity rejections loud even when reason text mentions a transport code", () => {
+  // Regression: an IDENTITY/authz rejection whose reason merely *mentions* an
+  // error code must NOT be classified as an availability degrade — otherwise
+  // fail-loud-on-identity inverts into fail-open. Codes only count when they
+  // anchor the start of the message (the shape Node surfaces transport errors).
+  assert.equal(isSharedGateUnavailable("identity unresolved: vault path ENOENT under root"), false);
+  assert.equal(isSharedGateUnavailable("gate rejected: principal ECONNREFUSED-lookalike"), false);
+  assert.equal(isSharedGateUnavailable("recovery_required: ETIMEDOUT mentioned in reason"), false);
+  // ...but genuine transport errors at the start still degrade.
+  assert.equal(isSharedGateUnavailable("ENOENT: no such file or directory, /tmp/minnid.sock"), true);
+  assert.equal(isSharedGateUnavailable("Error: connect ECONNREFUSED /tmp/minnid.sock"), true);
+});

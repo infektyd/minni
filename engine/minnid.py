@@ -3879,10 +3879,19 @@ async def _dispatch(request: dict) -> dict:
         return _make_error(-32601, f"Method not found: {method_name}",
                            request_id)
 
+    # Handlers index params with .get(); a positional-array params (JSON-RPC
+    # allows `"params": [...]`) would crash them with AttributeError, and
+    # recovery-allowed methods (ping/status/...) reach the handler even before
+    # identity resolves. Reject non-dict params loudly here so no handler — gated
+    # or recovery-allowed — ever sees a list.
+    if not isinstance(params, dict):
+        return _make_error(-32602, "Invalid params: expected a JSON object",
+                           request_id)
+
     provenance = resolve_provenance(request)
     if provenance.recovery is not None and method_name not in RECOVERY_ALLOWED_METHODS:
         return _make_response(provenance.recovery, request_id)
-    if isinstance(params, dict) and provenance.principal is not None:
+    if provenance.principal is not None:
         params.setdefault("_principal", provenance.principal)
 
     if asyncio.iscoroutinefunction(handler):

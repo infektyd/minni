@@ -118,6 +118,29 @@ def test_dispatch_routes_unresolved_identity_to_recovery_before_handler(monkeypa
     assert result["identity"] is None
 
 
+def test_dispatch_rejects_positional_array_params_with_invalid_params(monkeypatch: pytest.MonkeyPatch):
+    # JSON-RPC permits `"params": [...]`. Handlers index params with .get(), and
+    # recovery-allowed methods (status/ping/...) reach the handler even pre-identity.
+    # A list must be rejected loudly (-32602) at the gate, never crash a handler.
+    def _handler_should_not_run(_params, _request_id):
+        raise AssertionError("handler ran on non-dict params")
+
+    monkeypatch.setitem(minnid._METHODS, "status", _handler_should_not_run)
+
+    response = minnid._dispatch_sync(
+        {
+            "jsonrpc": "2.0",
+            "id": "badparams-1",
+            "method": "status",  # a RECOVERY_ALLOWED method — must still be guarded
+            "params": [1, 2, 3],
+        }
+    )
+
+    assert "result" not in response
+    assert response["error"]["code"] == -32602
+    assert "expected a JSON object" in response["error"]["message"]
+
+
 def test_gate_shared_reports_resolved_principal_before_shared_operation(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(
         minnid,

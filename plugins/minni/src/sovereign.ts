@@ -329,7 +329,13 @@ export function isSharedGateUnavailable(error: string | undefined): boolean {
   if (message.includes("Method not found: gate.shared")) return true;
   if (message.startsWith("Socket not found:")) return true;
   if (message === "JSON-RPC request timed out") return true;
-  return /\b(?:ECONNREFUSED|ENOENT|EPERM|EHOSTUNREACH|ENETUNREACH|ETIMEDOUT|ENOTSOCK)\b/.test(message);
+  // Anchor transport error codes to the START of the message (the shape Node
+  // surfaces them in: "connect ECONNREFUSED ...", "ENOENT: no such file ...").
+  // Matching them anywhere would let an IDENTITY/authz rejection whose reason
+  // text merely *mentions* a code (e.g. "...path ENOENT...") be misclassified
+  // as an availability degrade — inverting fail-loud-on-identity into
+  // fail-open. Availability degrades; identity must stay loud.
+  return /^(?:Error:\s*)?(?:connect\s+)?(?:ECONNREFUSED|ENOENT|EPERM|EHOSTUNREACH|ENETUNREACH|ETIMEDOUT|ENOTSOCK)\b/.test(message);
 }
 
 export async function drillMemory(
