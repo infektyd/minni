@@ -141,6 +141,48 @@ def test_dispatch_rejects_positional_array_params_with_invalid_params(monkeypatc
     assert "expected a JSON object" in response["error"]["message"]
 
 
+def test_gate_shared_fails_loud_on_default_deny_principal(monkeypatch: pytest.MonkeyPatch):
+    # B2: a default-deny principal (no caps, no vault roots = unknown/unauthorized
+    # identity) must NOT get a bare status:ok from gate.shared — it must surface
+    # the recovery route, so the gate reads as authorization, not mere attribution.
+    monkeypatch.setattr(
+        minnid,
+        "resolve_effective_principal",
+        lambda **_kwargs: EffectivePrincipal(
+            agent_id="ghost-unknown-xyz",
+            workspace_id="default",
+            capabilities=[],
+            allowed_vault_roots=[],
+        ),
+    )
+    response = minnid._dispatch_sync(
+        {
+            "jsonrpc": "2.0",
+            "id": "deny-1",
+            "method": "gate.shared",
+            "params": {"agent_id": "ghost-unknown-xyz", "operation": "plan.update"},
+        }
+    )
+    assert "error" not in response
+    assert response["result"]["status"] == "recovery_required"
+    assert response["result"]["reason"] == "unknown_identity"
+    assert response["result"]["identity"] is None
+
+
+def test_can_read_document_denies_default_deny_principal_unknown_docs():
+    # B2: a legacy agent="unknown" document is readable by a capable principal,
+    # but a default-deny stamp must NOT read it (defense-in-depth for pathless
+    # unknown docs that allows_vault_root would otherwise let through).
+    from principal import can_read_document, EffectivePrincipal as _EP
+
+    capable = _EP(agent_id="codex", capabilities=["read"], allowed_vault_roots=[])
+    default_deny = _EP(agent_id="ghost", capabilities=[], allowed_vault_roots=[])
+    doc = {"agent": "unknown", "privacy_level": "safe"}  # pathless unknown doc
+
+    assert can_read_document(capable, "default", doc) is True
+    assert can_read_document(default_deny, "default", doc) is False
+
+
 def test_gate_shared_reports_resolved_principal_before_shared_operation(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(
         minnid,

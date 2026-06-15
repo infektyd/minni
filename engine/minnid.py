@@ -1267,6 +1267,21 @@ def _handle_gate_shared(params: dict, request_id: Any) -> dict:
     operation = str(params.get("operation") or "").strip()
     if not operation:
         return _make_error(-32602, "operation is required", request_id)
+    # Fail-loud on an unknown/unauthorized identity: a default-deny principal
+    # (no capabilities AND no vault roots) must NOT receive a bare status:ok —
+    # that would read as authorization when the gate only attributed. Surface
+    # the recovery route instead so the caller re-establishes identity. Capable
+    # principals (the plugin always calls as DEFAULT_AGENT_ID, and registered
+    # platform agents) are unaffected. (B2 narrow-harden.)
+    if not principal.capabilities and not principal.allowed_vault_roots:
+        return _make_response(
+            recover(
+                "unknown_identity",
+                {"method": "gate.shared", "supplied_agent_id": params.get("agent_id")},
+                render_mode="machine",
+            ),
+            request_id,
+        )
     return _make_response(
         {
             "status": "ok",
