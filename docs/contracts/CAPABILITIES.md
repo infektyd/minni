@@ -25,11 +25,11 @@ yet implemented are marked `[PLANNED: PR-N]`.
 | `ping` | agent | None | Liveness probe. Returns `"pong"`. |
 | `status` | agent | None | Daemon uptime, request count, DB and FAISS health snapshot. |
 | `search` | agent | Updates `access_count` and `last_accessed` on matched documents. | Hybrid FTS5 + FAISS + cross-encoder retrieval. Accepts optional `depth` (`headline | snippet | chunk | document`, default `snippet`) and `budget_tokens`. |
-| `read` | agent | Updates `access_count` and `last_accessed` on returned documents. | Agent startup context: identity anchor, top documents, recent learnings, recent episodic events. Alias: `recall`. |
+| `read` | agent | Updates `access_count` and `last_accessed` on returned documents. | Agent startup context: identity anchor, top documents, recent learnings, recent episodic events. The plugin's `minni_recall` tool routes here (and to `search`); `read` is the JSON-RPC method — see `recall` row. |
 | `learn` | agent | Writes a row to `learnings`; optionally appends to `~/.openclaw/MEMORY.md` (dual-write mode). | Stores a durable learning keyed by `agent_id` and `category`. |
 | `log_event` | agent | Writes a row to `episodic_events`. | Appends an episodic event. Fields: `event_type`, `content`, `agent_id`, `task_id?`, `thread_id?`. |
 | `expand` | agent | Updates `access_count` and `last_accessed` on the expanded document. | Re-fetch a specific result at a deeper depth tier. Accepts `result_id` (chunk_id or doc_id) and `depth`. |
-| `recall` | agent | Same as `read`. | Served as an alias of `read` (no distinct `recall` method in `_METHODS`). |
+| `recall` | — | n/a | **Not a JSON-RPC method.** `_METHODS` has no `recall` entry and dispatch does no aliasing, so a raw `recall` call returns `-32601 Method not found`. "Recall" is the plugin-side `minni_recall` tool, which routes to the `read`/`search` daemon methods. JSON-RPC clients must call `read` (or `search`) directly. |
 | `health_report` | agent | None | Structured health report including index freshness, decay stats, and schema version. |
 | `feedback` | agent | Writes a row to `feedback_events`. | Signal quality of a recall result (thumbs-up / thumbs-down + comment). Used to calibrate confidence scoring. |
 | `trace` | agent | None | Retrieve full provenance trace for a `result_id`. Returns the chain of FTS rank, semantic rank, RRF score, cross-encoder score, decay factor. |
