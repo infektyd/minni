@@ -17,7 +17,7 @@ import sqlite3
 import sys
 from pathlib import Path
 
-DEFAULT_DB = os.path.expanduser("~/.minni/sovereign.db")
+DEFAULT_DB = os.path.expanduser("~/.minni/minni.db")
 DEFAULT_AUTO_INDEXED = os.path.expanduser("~/wiki/auto-indexed")
 
 
