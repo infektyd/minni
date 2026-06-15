@@ -307,6 +307,31 @@ export async function handoffMemory(input: {
   });
 }
 
+export async function gateSharedOperation(
+  input: {
+    operation: string;
+    agentId?: string;
+    workspaceId?: string;
+    details?: Record<string, unknown>;
+  },
+  requester: JsonRpcRequester = jsonRpcSocketRequest,
+): Promise<JsonResult> {
+  return jsonRpcSocketRequestWithFallbackRequester("gate.shared", {
+    operation: input.operation,
+    agent_id: input.agentId ?? DEFAULT_AGENT_ID,
+    workspace_id: input.workspaceId ?? DEFAULT_WORKSPACE_ID,
+    details: input.details,
+  }, requester);
+}
+
+export function isSharedGateUnavailable(error: string | undefined): boolean {
+  const message = error ?? "";
+  if (message.includes("Method not found: gate.shared")) return true;
+  if (message.startsWith("Socket not found:")) return true;
+  if (message === "JSON-RPC request timed out") return true;
+  return /\b(?:ECONNREFUSED|ENOENT|EPERM|EHOSTUNREACH|ENETUNREACH|ETIMEDOUT|ENOTSOCK)\b/.test(message);
+}
+
 export async function drillMemory(
   input: {
     resultIds?: number[];
