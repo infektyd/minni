@@ -307,6 +307,37 @@ export async function handoffMemory(input: {
   });
 }
 
+export async function gateSharedOperation(
+  input: {
+    operation: string;
+    agentId?: string;
+    workspaceId?: string;
+    details?: Record<string, unknown>;
+  },
+  requester: JsonRpcRequester = jsonRpcSocketRequest,
+): Promise<JsonResult> {
+  return jsonRpcSocketRequestWithFallbackRequester("gate.shared", {
+    operation: input.operation,
+    agent_id: input.agentId ?? DEFAULT_AGENT_ID,
+    workspace_id: input.workspaceId ?? DEFAULT_WORKSPACE_ID,
+    details: input.details,
+  }, requester);
+}
+
+export function isSharedGateUnavailable(error: string | undefined): boolean {
+  const message = error ?? "";
+  if (message.includes("Method not found: gate.shared")) return true;
+  if (message.startsWith("Socket not found:")) return true;
+  if (message === "JSON-RPC request timed out") return true;
+  // Anchor transport error codes to the START of the message (the shape Node
+  // surfaces them in: "connect ECONNREFUSED ...", "ENOENT: no such file ...").
+  // Matching them anywhere would let an IDENTITY/authz rejection whose reason
+  // text merely *mentions* a code (e.g. "...path ENOENT...") be misclassified
+  // as an availability degrade — inverting fail-loud-on-identity into
+  // fail-open. Availability degrades; identity must stay loud.
+  return /^(?:Error:\s*)?(?:connect\s+)?(?:ECONNREFUSED|ENOENT|EPERM|EHOSTUNREACH|ENETUNREACH|ETIMEDOUT|ENOTSOCK)\b/.test(message);
+}
+
 export async function drillMemory(
   input: {
     resultIds?: number[];

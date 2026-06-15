@@ -70,6 +70,7 @@ import threading
 import importlib.util
 import uuid
 from collections import deque
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -90,12 +91,146 @@ from db import SovereignDB                                  # noqa: E402
 from principal import (                                     # noqa: E402  # G11 EffectivePrincipal + G14 operator gate
     EffectivePrincipal,
     IdentityMismatchError,
+    agent_scope_for,
     can_read_document,  # G19
     is_operator_principal,
     make_mismatch_error,
     resolve_effective_principal,
     validate_agent_id,
 )
+
+RECOVERY_ALLOWED_METHODS = ("ping", "status", "health_report", "hygiene_report")
+
+
+@dataclass(frozen=True)
+class ProvenanceResolution:
+    principal: Optional[EffectivePrincipal]
+    recovery: Optional[dict]
+
+
+def recover(
+    reason: str,
+    caller_ctx: dict,
+    *,
+    render_mode: str = "machine",
+) -> dict | str:
+    """Return the single fail-loud route for unresolved provenance.
+
+    Unknown callers get a diagnostic route, never a synthesized/default identity
+    and never silence. ``render_mode="machine"`` is the JSON-RPC payload;
+    ``"human"`` is for interactive surfaces.
+    """
+    method = str(caller_ctx.get("method") or "unknown")
+    supplied = caller_ctx.get("supplied_agent_id")
+    route = {
+        "zone": "pre_identity",
+        "surface": "diagnostic",
+        "allowed_methods": list(RECOVERY_ALLOWED_METHODS),
+        "next": "Call status/health_report, then stamp the runtime with MINNI_AGENT_ID and a principals/<agent>.json entry.",
+    }
+    remediation = [
+        "Stamp this runtime surface with MINNI_AGENT_ID.",
+        "Create or fix the matching operator-owned principals/<agent>.json file.",
+        "Send SIGHUP to minnid or restart it so identity caches reload.",
+        f"Use one of the pre-identity diagnostic methods: {', '.join(RECOVERY_ALLOWED_METHODS)}.",
+    ]
+    if render_mode == "human":
+        supplied_msg = f" supplied={supplied!r}" if supplied is not None else ""
+        return (
+            f"Minni provenance recovery required for method {method!r}{supplied_msg}: "
+            f"{reason}. Stamp this runtime with MINNI_AGENT_ID and a matching "
+            f"principals/<agent>.json file; diagnostics available via "
+            f"{', '.join(RECOVERY_ALLOWED_METHODS)}."
+        )
+    if render_mode != "machine":
+        raise ValueError("render_mode must be 'machine' or 'human'")
+    return {
+        "ok": False,
+        "status": "recovery_required",
+        "reason": reason,
+        "identity": None,
+        "caller": {
+            "method": method,
+            "supplied_agent_id": supplied,
+        },
+        "route": route,
+        "remediation": remediation,
+    }
+
+
+def _provenance_claim(method_name: str, params: dict) -> Optional[str]:
+    if method_name in {"daemon.handoff", "handoff"}:
+        claim = params.get("from_agent")
+    else:
+        claim = params.get("agent_id")
+    if claim is None:
+        return None
+    claim = str(claim).strip()
+    return claim or None
+
+
+def resolve_provenance(request: dict, *, transport: str = "uds") -> ProvenanceResolution:
+    """Resolve the caller at the daemon gate before any handler runs."""
+    method_name = str(request.get("method", ""))
+    params = request.get("params", {}) or {}
+    if not isinstance(params, dict):
+        return ProvenanceResolution(
+            principal=None,
+            recovery=recover(
+                "invalid_params",
+                {"method": method_name, "supplied_agent_id": None},
+                render_mode="machine",
+            ),
+        )
+    supplied = _provenance_claim(method_name, params)
+    try:
+        principal = resolve_effective_principal(
+            supplied_agent_id=supplied,
+            transport=transport,
+        )
+    except IdentityMismatchError as exc:
+        return ProvenanceResolution(
+            principal=None,
+            recovery=recover(
+                "identity_mismatch",
+                {
+                    "method": method_name,
+                    "supplied_agent_id": exc.supplied,
+                    "stamped_agent_id": exc.stamped,
+                },
+                render_mode="machine",
+            ),
+        )
+    except Exception as exc:
+        return ProvenanceResolution(
+            principal=None,
+            recovery=recover(
+                f"provenance_error: {exc}",
+                {"method": method_name, "supplied_agent_id": supplied},
+                render_mode="machine",
+            ),
+        )
+    return ProvenanceResolution(principal=principal, recovery=None)
+
+
+def _handler_principal(
+    params: dict,
+    request_id: Any,
+    *,
+    claim_key: str = "agent_id",
+) -> tuple[Optional[EffectivePrincipal], Optional[dict]]:
+    """Return the dispatch-stamped principal, resolving only for direct calls."""
+    stamped = params.get("_principal") if isinstance(params, dict) else None
+    if isinstance(stamped, EffectivePrincipal):
+        return stamped, None
+    supplied = params.get(claim_key) if isinstance(params, dict) else None
+    try:
+        return (
+            resolve_effective_principal(supplied_agent_id=supplied, transport="uds"),
+            None,
+        )
+    except IdentityMismatchError as exc:
+        return None, make_mismatch_error(exc.supplied, exc.stamped, request_id)
 
 # G12 (SEC-003): vault root binding guard. Enforces that any vault_path accepted
 # from wire (hygiene, compile, endorse, handoff derived) realpath-resolves inside
@@ -108,13 +243,9 @@ def _guard_vault_root(
     """Resolve stamped principal (honoring G11) and check allows_vault_root.
     Returns JSON-RPC error dict on denial/mismatch, or None if allowed.
     """
-    supplied = params.get("agent_id")
-    try:
-        principal = resolve_effective_principal(
-            supplied_agent_id=supplied, transport="uds"
-        )
-    except IdentityMismatchError as exc:
-        return make_mismatch_error(exc.supplied, exc.stamped, request_id)
+    principal, err = _handler_principal(params, request_id)
+    if err:
+        return err
     if not principal.allows_vault_root(vault_path):
         try:
             resolved = str(Path(vault_path).resolve())
@@ -137,6 +268,13 @@ _retrieval = None
 _vault_retrieval_cache = {}
 _episodic = None
 _writeback = None
+
+
+def _reload_runtime_config(signum=None, frame=None) -> None:
+    """Clear identity and per-vault caches after operator config changes."""
+    agent_scope_for.cache_clear()
+    _vault_retrieval_cache.clear()
+    logger.info("SIGHUP received — cleared identity/runtime caches")
 
 
 def _lazy_retrieval():
@@ -659,13 +797,9 @@ def _handle_daemon_handoff(params: dict, request_id: Any) -> dict:
     # redaction, or cross-agent delivery. This closes the last public RPC that carried
     # an unauthenticated agent identity claim. (to_agent is a destination, not a
     # self-claim; it is validated by the consent contract in later G items.)
-    supplied = from_agent or None
-    try:
-        principal = resolve_effective_principal(
-            supplied_agent_id=supplied, transport="uds"
-        )
-    except IdentityMismatchError as exc:
-        return make_mismatch_error(exc.supplied, exc.stamped, request_id)
+    principal, err = _handler_principal(params, request_id, claim_key="from_agent")
+    if err:
+        return err
     # Use the stamped value for any attribution inside this handler (future G items
     # will thread the full EffectivePrincipal object).
     from_agent = principal.agent_id
@@ -948,13 +1082,9 @@ def _handle_ack_handoff(params: dict, request_id: Any) -> dict:
     # archived other agents' live handoffs): only the lease's RECIPIENT may ack
     # it. The principal is server-stamped (G11) — caller-supplied agent_id is
     # only honoured through the platform_agent_ids / alias machinery, never raw.
-    supplied = params.get("agent_id")
-    try:
-        principal = resolve_effective_principal(
-            supplied_agent_id=supplied, transport="uds"
-        )
-    except IdentityMismatchError as exc:
-        return make_mismatch_error(exc.supplied, exc.stamped, request_id)
+    principal, err = _handler_principal(params, request_id)
+    if err:
+        return err
     to_agent = _lease_to_agent(lease_id)
     if to_agent is None:
         return _make_error(-32000, f"No handoff lease found for {lease_id}", request_id)
@@ -1003,13 +1133,9 @@ def _handle_ack_handoff(params: dict, request_id: Any) -> dict:
 def _handle_list_pending_handoffs(params: dict, request_id: Any) -> dict:
     # G11 / RCM-003/009: EffectivePrincipal stamp + mismatch guard (closes last model-facing agent_id surfaces)
     # Model-supplied agent_id is NEVER trusted; use stamped principal.agent_id for leases/queries.
-    supplied = params.get("agent_id")
-    try:
-        principal = resolve_effective_principal(
-            supplied_agent_id=supplied, transport="uds"
-        )
-    except IdentityMismatchError as exc:
-        return make_mismatch_error(exc.supplied, exc.stamped, request_id)
+    principal, err = _handler_principal(params, request_id)
+    if err:
+        return err
     agent_id = principal.agent_id
     if not agent_id:
         return _make_error(-32602, "agent_id is required", request_id)
@@ -1128,6 +1254,46 @@ def _handle_ping(params: dict, request_id: Any) -> dict:
     return _make_response("pong", request_id)
 
 
+def _handle_gate_shared(params: dict, request_id: Any) -> dict:
+    """Authorize a shared operation through the daemon provenance gate.
+
+    The gate itself is resolved in _dispatch before this handler runs. This
+    method gives plugin-local shared flows a daemon checkpoint without moving
+    personal vault mirrors into the daemon.
+    """
+    principal, err = _handler_principal(params, request_id)
+    if err:
+        return err
+    operation = str(params.get("operation") or "").strip()
+    if not operation:
+        return _make_error(-32602, "operation is required", request_id)
+    # Fail-loud on an unknown/unauthorized identity: a default-deny principal
+    # (no capabilities AND no vault roots) must NOT receive a bare status:ok —
+    # that would read as authorization when the gate only attributed. Surface
+    # the recovery route instead so the caller re-establishes identity. Capable
+    # principals (the plugin always calls as DEFAULT_AGENT_ID, and registered
+    # platform agents) are unaffected. (B2 narrow-harden.)
+    if not principal.capabilities and not principal.allowed_vault_roots:
+        return _make_response(
+            recover(
+                "unknown_identity",
+                {"method": "gate.shared", "supplied_agent_id": params.get("agent_id")},
+                render_mode="machine",
+            ),
+            request_id,
+        )
+    return _make_response(
+        {
+            "status": "ok",
+            "operation": operation,
+            "principal": principal.agent_id,
+            "workspace_id": principal.workspace_id,
+            "gate": "minnid",
+        },
+        request_id,
+    )
+
+
 def _resolve_backend(backend_param, config=None):
     """
     Resolve the backend parameter for a search request.
@@ -1184,13 +1350,9 @@ def _handle_search(params: dict, request_id: Any) -> dict:
     # Some legacy/mixed clients can still arrive without a usable principal; that
     # path keeps learning recall unscoped for back-compat instead of silently
     # dropping other agents' rows.
-    supplied = params.get("agent_id")
-    try:
-        principal = resolve_effective_principal(
-            supplied_agent_id=supplied, transport="uds"
-        )
-    except IdentityMismatchError as exc:
-        return make_mismatch_error(exc.supplied, exc.stamped, request_id)
+    principal, err = _handler_principal(params, request_id)
+    if err:
+        return err
     agent_id = principal.agent_id if principal is not None else None
     learnings_cross_agent = bool(params.get("cross_agent", False)) or principal is None
     try:
@@ -1375,13 +1537,9 @@ def _handle_feedback(params: dict, request_id: Any) -> dict:
 
     useful = bool(params.get("useful", False))
     # G11: EffectivePrincipal is the single server-stamped source (never trust caller)
-    supplied = params.get("agent_id")
-    try:
-        principal = resolve_effective_principal(
-            supplied_agent_id=supplied, transport="uds"
-        )
-    except IdentityMismatchError as exc:
-        return make_mismatch_error(exc.supplied, exc.stamped, request_id)
+    principal, err = _handler_principal(params, request_id)
+    if err:
+        return err
     agent_id = principal.agent_id
 
     try:
@@ -1404,12 +1562,9 @@ def _handle_trace(params: dict, request_id: Any) -> dict:
 
     # RCM-009: principal gate (redaction applied unconditionally via _redact_value for paths/secrets;
     # traces are ephemeral/observability and many lack stamped agent_id, so no additional owner-match filter here).
-    try:
-        principal = resolve_effective_principal(
-            supplied_agent_id=params.get("agent_id"), transport="uds"
-        )
-    except IdentityMismatchError as exc:
-        return make_mismatch_error(exc.supplied, exc.stamped, request_id)
+    principal, err = _handler_principal(params, request_id)
+    if err:
+        return err
 
     trace_id = params.get("trace_id")
     if not trace_id:
@@ -1471,13 +1626,9 @@ def _handle_expand(params: dict, request_id: Any) -> dict:
     depth = str(params.get("depth", "chunk"))
 
     # G11 + G19: stamp principal for expand (read surface) and pass to gate
-    supplied = params.get("agent_id")
-    try:
-        principal = resolve_effective_principal(
-            supplied_agent_id=supplied, transport="uds"
-        )
-    except IdentityMismatchError as exc:
-        return make_mismatch_error(exc.supplied, exc.stamped, request_id)
+    principal, err = _handler_principal(params, request_id)
+    if err:
+        return err
 
     try:
         engine = _lazy_retrieval()
@@ -1735,13 +1886,9 @@ def _handle_sm_drill(params: dict, request_id: Any) -> dict:
     if depth not in {"snippet", "chunk", "document"}:
         return _make_error(-32602, "depth must be snippet, chunk, or document", request_id)
 
-    supplied = params.get("agent_id")
-    try:
-        principal = resolve_effective_principal(
-            supplied_agent_id=supplied, transport="uds"
-        )
-    except IdentityMismatchError as exc:
-        return make_mismatch_error(exc.supplied, exc.stamped, request_id)
+    principal, err = _handler_principal(params, request_id)
+    if err:
+        return err
 
     try:
         ids = [int(value) for value in raw_ids]
@@ -1759,13 +1906,9 @@ def _handle_sm_drill(params: dict, request_id: Any) -> dict:
             return _make_error(-32602, "references must be objects or strings", request_id)
 
     try:
-        supplied = params.get("agent_id")
-        try:
-            principal = resolve_effective_principal(
-                supplied_agent_id=supplied, transport="uds"
-            )
-        except IdentityMismatchError as exc:
-            return make_mismatch_error(exc.supplied, exc.stamped, request_id)
+        principal, err = _handler_principal(params, request_id)
+        if err:
+            return err
         agent_id = principal.agent_id if principal is not None else None
 
         engine = _lazy_retrieval()
@@ -1827,13 +1970,9 @@ def _handle_sm_export_pack(params: dict, request_id: Any) -> dict:
 
     # G11 / RCM-003/009: EffectivePrincipal stamp + mismatch guard (closes last model-facing agent_id surface for export)
     # agent_id in pack and retrieve visibility now always from stamped principal; model cannot spoof attribution/exfil view.
-    supplied = params.get("agent_id")
-    try:
-        principal = resolve_effective_principal(
-            supplied_agent_id=supplied, transport="uds"
-        )
-    except IdentityMismatchError as exc:
-        return make_mismatch_error(exc.supplied, exc.stamped, request_id)
+    principal, err = _handler_principal(params, request_id)
+    if err:
+        return err
     agent_id = principal.agent_id
     workspace_id = params.get("workspace_id")
 
@@ -1923,13 +2062,9 @@ def _handle_read(params: dict, request_id: Any) -> dict:
     started_at = time.perf_counter()
 
     # G11: EffectivePrincipal is the single server-stamped source (never trust caller)
-    supplied = params.get("agent_id")
-    try:
-        principal = resolve_effective_principal(
-            supplied_agent_id=supplied, transport="uds"
-        )
-    except IdentityMismatchError as exc:
-        return make_mismatch_error(exc.supplied, exc.stamped, request_id)
+    principal, err = _handler_principal(params, request_id)
+    if err:
+        return err
     agent_id = principal.agent_id
     limit = min(int(params.get("limit", 5)), 20)
 
@@ -2117,13 +2252,9 @@ def _handle_learn(params: dict, request_id: Any) -> dict:
             )
 
     # G11: EffectivePrincipal is the single server-stamped source (never trust caller)
-    supplied = params.get("agent_id")
-    try:
-        principal = resolve_effective_principal(
-            supplied_agent_id=supplied, transport="uds"
-        )
-    except IdentityMismatchError as exc:
-        return make_mismatch_error(exc.supplied, exc.stamped, request_id)
+    principal, err = _handler_principal(params, request_id)
+    if err:
+        return err
     agent_id = principal.agent_id
     try:
         validate_agent_id(agent_id)
@@ -2343,13 +2474,9 @@ def _handle_resolve_contradiction(params: dict, request_id: Any) -> dict:
         )
 
     # G11: EffectivePrincipal is the single server-stamped source (never trust caller)
-    supplied = params.get("agent_id")
-    try:
-        principal = resolve_effective_principal(
-            supplied_agent_id=supplied, transport="uds"
-        )
-    except IdentityMismatchError as exc:
-        return make_mismatch_error(exc.supplied, exc.stamped, request_id)
+    principal, err = _handler_principal(params, request_id)
+    if err:
+        return err
     agent_id = principal.agent_id
     try:
         validate_agent_id(agent_id)
@@ -2488,13 +2615,9 @@ def _handle_subscribe_contradictions(params: dict, request_id: Any) -> dict:
     """
     # G11 / RCM-003/009: EffectivePrincipal stamp + mismatch guard (closes last model-facing agent_id surfaces)
     # Model-supplied agent_id is NEVER trusted; use stamped principal.agent_id for queries.
-    supplied = params.get("agent_id")
-    try:
-        principal = resolve_effective_principal(
-            supplied_agent_id=supplied, transport="uds"
-        )
-    except IdentityMismatchError as exc:
-        return make_mismatch_error(exc.supplied, exc.stamped, request_id)
+    principal, err = _handler_principal(params, request_id)
+    if err:
+        return err
     agent_id = principal.agent_id
     if not agent_id:
         return _make_error(-32602, "agent_id is required", request_id)
@@ -2652,13 +2775,9 @@ def _handle_log_event(params: dict, request_id: Any) -> dict:
                            request_id)
 
     # G11: EffectivePrincipal is the single server-stamped source (never trust caller)
-    supplied = params.get("agent_id")
-    try:
-        principal = resolve_effective_principal(
-            supplied_agent_id=supplied, transport="uds"
-        )
-    except IdentityMismatchError as exc:
-        return make_mismatch_error(exc.supplied, exc.stamped, request_id)
+    principal, err = _handler_principal(params, request_id)
+    if err:
+        return err
     agent_id = principal.agent_id
     task_id = params.get("task_id")
     thread_id = params.get("thread_id")
@@ -3386,13 +3505,9 @@ def _handle_daemon_endorse(params: dict, request_id: Any) -> dict:
 
 def _stage_candidate(params: dict, request_id: Any) -> dict:
     """G14/G16: Stage a candidate packet (default learn path). No durable write."""
-    supplied = params.get("agent_id")
-    try:
-        principal = resolve_effective_principal(
-            supplied_agent_id=supplied, transport="uds"
-        )
-    except IdentityMismatchError as exc:
-        return make_mismatch_error(exc.supplied, exc.stamped, request_id)
+    principal, err = _handler_principal(params, request_id)
+    if err:
+        return err
 
     content = (params.get("content") or params.get("text") or "").strip()
     if not content:
@@ -3450,13 +3565,9 @@ def _stage_candidate(params: dict, request_id: Any) -> dict:
 
 def _list_candidates(params: dict, request_id: Any) -> dict:
     """G14/G17: List candidates for the stamped principal (for console)."""
-    supplied = params.get("agent_id")
-    try:
-        principal = resolve_effective_principal(
-            supplied_agent_id=supplied, transport="uds"
-        )
-    except IdentityMismatchError as exc:
-        return make_mismatch_error(exc.supplied, exc.stamped, request_id)
+    principal, err = _handler_principal(params, request_id)
+    if err:
+        return err
 
     status_f = params.get("status")
     limit = min(int(params.get("limit", 100)), 500)
@@ -3538,13 +3649,9 @@ def _resolve_candidate(params: dict, request_id: Any) -> dict:
     resolving its OWN candidate before the owner check is ever reached, while
     adding nothing the owner check does not already enforce.
     """
-    supplied = params.get("agent_id")
-    try:
-        principal = resolve_effective_principal(
-            supplied_agent_id=supplied, transport="uds"
-        )
-    except IdentityMismatchError as exc:
-        return make_mismatch_error(exc.supplied, exc.stamped, request_id)
+    principal, err = _handler_principal(params, request_id)
+    if err:
+        return err
 
     try:
         validate_agent_id(principal.agent_id)
@@ -3723,6 +3830,7 @@ def _handle_ax_snapshot_get(params: dict, request_id: Any) -> dict:
 # Method registry
 _METHODS: Dict[str, callable] = {
     "ping":                   _handle_ping,
+    "gate.shared":            _handle_gate_shared,
     "search":                 _handle_search,
     "feedback":               _handle_feedback,
     "trace":                  _handle_trace,
@@ -3785,6 +3893,22 @@ async def _dispatch(request: dict) -> dict:
     if handler is None:
         return _make_error(-32601, f"Method not found: {method_name}",
                            request_id)
+
+    # Handlers index params with .get(); a positional-array params (JSON-RPC
+    # allows `"params": [...]`) would crash them with AttributeError, and
+    # recovery-allowed methods (ping/status/...) reach the handler even before
+    # identity resolves. Reject non-dict params loudly here so no handler — gated
+    # or recovery-allowed — ever sees a list.
+    if not isinstance(params, dict):
+        return _make_error(-32602, "Invalid params: expected a JSON object",
+                           request_id)
+
+    provenance = resolve_provenance(request)
+    if provenance.recovery is not None and method_name not in RECOVERY_ALLOWED_METHODS:
+        return _make_response(provenance.recovery, request_id)
+    if provenance.principal is not None:
+        params.setdefault("_principal", provenance.principal)
+
     if asyncio.iscoroutinefunction(handler):
         result = await handler(params, request_id)
     else:
@@ -4110,9 +4234,7 @@ def main():
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGINT, _shutdown)
 
-    def _reload(signum, frame):
-        logger.info("SIGHUP received — config reload (no-op for now)")
-    signal.signal(signal.SIGHUP, _reload)
+    signal.signal(signal.SIGHUP, _reload_runtime_config)
 
     try:
         loop.run_until_complete(main_task)

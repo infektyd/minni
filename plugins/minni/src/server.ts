@@ -16,6 +16,8 @@ import {
   drillMemory,
   exportContextPack,
   formatRecall,
+  gateSharedOperation,
+  isSharedGateUnavailable,
   handoffMemory,
   learnMemory,
   listPendingHandoffs,
@@ -78,6 +80,35 @@ function textResult(text: string) {
   return {
     content: [{ type: "text" as const, text }],
   };
+}
+
+async function requireSharedGate(
+  operation: string,
+  details?: Record<string, unknown>,
+): Promise<ReturnType<typeof textResult> | undefined> {
+  const gate = await gateSharedOperation({
+    operation,
+    agentId: DEFAULT_AGENT_ID,
+    workspaceId: DEFAULT_WORKSPACE_ID,
+    details,
+  });
+  if (gate.ok) return undefined;
+  const error = gate.error ?? "";
+  if (isSharedGateUnavailable(error)) {
+    console.warn(`[minni] shared gate unavailable for ${operation}: ${error}; using local degraded path`);
+    return undefined;
+  }
+  return textResult(
+    JSON.stringify(
+      {
+        status: "gate-rejected",
+        operation,
+        gate,
+      },
+      null,
+      2,
+    ),
+  );
 }
 
 const server = new McpServer({
@@ -248,6 +279,11 @@ server.registerTool(
     includeVault,
     useAfm,
   }) => {
+    const gated = await requireSharedGate("team.runtime", {
+      agents: agents?.length ?? 0,
+      coordinatorAgentId,
+    });
+    if (gated) return gated;
     const packet = await buildTeamRuntime({
       task,
       agents,
@@ -286,6 +322,11 @@ server.registerTool(
     },
   },
   async ({ task, runtimeId, results }) => {
+    const gated = await requireSharedGate("team.evidence", {
+      runtimeId,
+      results: results.length,
+    });
+    if (gated) return gated;
     const packet = buildTeamEvidencePacket({ task, runtimeId, results });
     return textResult(JSON.stringify(packet, null, 2));
   },
@@ -314,6 +355,11 @@ server.registerTool(
     approved,
     permanentAgentId,
   }) => {
+    const gated = await requireSharedGate("team.promotion", {
+      agentId: agent.agentId,
+      approved: approved === true,
+    });
+    if (gated) return gated;
     const packet = await buildTeamPromotionPacket({
       agent,
       evidence,
@@ -338,6 +384,8 @@ server.registerTool(
     },
   },
   async () => {
+    const gated = await requireSharedGate("audit.status", { tool: "minni_status" });
+    if (gated) return gated;
     const report = await statusAndAudit(DEFAULT_VAULT_PATH);
     return textResult(JSON.stringify(report, null, 2));
   },
@@ -387,6 +435,8 @@ server.registerTool(
     },
   },
   async ({ task }) => {
+    const gated = await requireSharedGate("audit.route", { tool: "minni_route" });
+    if (gated) return gated;
     const intent = routeMemoryIntent(task);
     await recordAudit(DEFAULT_VAULT_PATH, {
       tool: "minni_route",
@@ -597,6 +647,8 @@ server.registerTool(
     },
   },
   async ({ candidate_id, decision, reason }) => {
+    const gated = await requireSharedGate("candidates.resolve", { candidate_id, decision });
+    if (gated) return gated;
     // Delegate to daemon RPC (will enforce operator principal on server)
     const { jsonRpcSocketRequestWithFallback } = await import("./sovereign.js");
     const rpc = await jsonRpcSocketRequestWithFallback("resolve_candidate", {
@@ -624,6 +676,8 @@ server.registerTool(
     },
   },
   async ({ title, content, category, source }) => {
+    const gated = await requireSharedGate("audit.learning_quality", { tool: "minni_learning_quality" });
+    if (gated) return gated;
     const quality = assessLearningQuality({ title, content, category, source });
     await recordAudit(DEFAULT_VAULT_PATH, {
       tool: "minni_learning_quality",
@@ -678,6 +732,8 @@ server.registerTool(
     },
   },
   async ({ limit }) => {
+    const gated = await requireSharedGate("audit.report", { limit: limit ?? 100 });
+    if (gated) return gated;
     const report = await auditReport(DEFAULT_VAULT_PATH, limit ?? 100);
     return textResult(JSON.stringify(report, null, 2));
   },
@@ -694,6 +750,8 @@ server.registerTool(
     },
   },
   async ({ limit }) => {
+    const gated = await requireSharedGate("audit.tail", { limit: limit ?? 20 });
+    if (gated) return gated;
     const tail = await auditTail(DEFAULT_VAULT_PATH, limit ?? 20);
     return textResult(tail.text || "No audit entries yet.");
   },
@@ -722,6 +780,10 @@ server.registerTool(
     inboxPointer,
     limit,
   }) => {
+    const gated = await requireSharedGate("handoff.negotiate", {
+      toAgent: toAgent ?? CLAUDECODE_AGENT_ID,
+    });
+    if (gated) return gated;
     const effectiveVaultPath = DEFAULT_VAULT_PATH;
     const fromAgent = DEFAULT_AGENT_ID; // G11: server-side default only (model no longer supplies agentId)
     const targetAgent = toAgent ?? CLAUDECODE_AGENT_ID;
@@ -856,6 +918,8 @@ server.registerTool(
     ttlMinutes,
     maxResponseChars,
   }) => {
+    const gated = await requireSharedGate("ping.request", { toAgent });
+    if (gated) return gated;
     const result = await createAgentPingRequest({
       toAgent,
       question,
@@ -879,6 +943,8 @@ server.registerTool(
     },
   },
   async ({ limit }) => {
+    const gated = await requireSharedGate("ping.inbox", { limit: limit ?? 20 });
+    if (gated) return gated;
     const result = await listAgentPingInbox(DEFAULT_AGENT_ID, limit ?? 20);
     return textResult(JSON.stringify(result, null, 2));
   },
@@ -898,6 +964,8 @@ server.registerTool(
     },
   },
   async ({ requestId, decision, answer, reason }) => {
+    const gated = await requireSharedGate("ping.decide", { requestId, decision });
+    if (gated) return gated;
     const result = await decideAgentPingRequest({
       requestId,
       decision,
@@ -919,6 +987,8 @@ server.registerTool(
     },
   },
   async ({ requestId }) => {
+    const gated = await requireSharedGate("ping.status", { requestId });
+    if (gated) return gated;
     const result = await getAgentPingStatus(requestId);
     return textResult(JSON.stringify(result, null, 2));
   },
@@ -941,6 +1011,8 @@ server.registerTool(
     },
   },
   async ({ leaseId, status, contradictsId }) => {
+    const gated = await requireSharedGate("handoff.ack", { leaseId, status });
+    if (gated) return gated;
     // A3 authz: agentId comes from server config (G11 self-only tool, like
     // minni_list_pending_handoffs) — the daemon verifies it against the
     // lease's to_agent; the model never supplies it.
@@ -959,6 +1031,8 @@ server.registerTool(
     },
   },
   async () => {
+    const gated = await requireSharedGate("handoff.pending");
+    if (gated) return gated;
     const result = await listPendingHandoffs({ agentId: DEFAULT_AGENT_ID });
     return textResult(JSON.stringify(result, null, 2));
   },
@@ -975,6 +1049,8 @@ server.registerTool(
     },
   },
   async ({ leaseId, timeoutMs }) => {
+    const gated = await requireSharedGate("handoff.await", { leaseId });
+    if (gated) return gated;
     const result = await awaitHandoff({ leaseId, timeoutMs });
     return textResult(JSON.stringify(result, null, 2));
   },
@@ -992,6 +1068,8 @@ server.registerTool(
     },
   },
   async ({ sinceTs }) => {
+    const gated = await requireSharedGate("contradictions.subscribe", { sinceTs });
+    if (gated) return gated;
     const result = await subscribeContradictions({ agentId: DEFAULT_AGENT_ID, sinceTs });
     return textResult(JSON.stringify(result, null, 2));
   },
@@ -1020,6 +1098,8 @@ server.registerTool(
     },
   },
   async ({ goal, constraints, slices, open_questions, seed_scar_from_audit }) => {
+    const gated = await requireSharedGate("plan.create", { slices: slices?.length ?? 0 });
+    if (gated) return gated;
     const effectiveVaultPath = DEFAULT_VAULT_PATH;
     let scar_tissue: ScarTissueEntry[] | undefined;
     if (seed_scar_from_audit) {
@@ -1083,6 +1163,8 @@ server.registerTool(
     },
   },
   async ({ plan_id: planIdInput, slice_id, status, evidence }) => {
+    const gated = await requireSharedGate("plan.update", { plan_id: planIdInput, slice_id, status });
+    if (gated) return gated;
     const effectiveVaultPath = DEFAULT_VAULT_PATH;
     const target = await resolvePlanTarget(planIdInput);
     if (!target.ok) return target.result;
@@ -1148,6 +1230,8 @@ server.registerTool(
     },
   },
   async ({ plan_id: planIdInput, kind, signal, resolution }) => {
+    const gated = await requireSharedGate("plan.scar", { plan_id: planIdInput, kind });
+    if (gated) return gated;
     const effectiveVaultPath = DEFAULT_VAULT_PATH;
     const target = await resolvePlanTarget(planIdInput);
     if (!target.ok) return target.result;
@@ -1177,6 +1261,8 @@ server.registerTool(
     },
   },
   async ({ plan_id: planIdInput, live_shelf_content }) => {
+    const gated = await requireSharedGate("plan.status", { plan_id: planIdInput });
+    if (gated) return gated;
     const effectiveVaultPath = DEFAULT_VAULT_PATH;
     const target = await resolvePlanTarget(planIdInput);
     if (!target.ok) return target.result;
@@ -1208,6 +1294,8 @@ server.registerTool(
     },
   },
   async ({ plan_id: planIdInput, new_slices, add_slices, drop_slice_ids }) => {
+    const gated = await requireSharedGate("plan.replan", { plan_id: planIdInput });
+    if (gated) return gated;
     const effectiveVaultPath = DEFAULT_VAULT_PATH;
     const target = await resolvePlanTarget(planIdInput);
     if (!target.ok) return target.result;
@@ -1242,6 +1330,8 @@ server.registerTool(
     },
   },
   async ({ plan_id: planIdInput }) => {
+    const gated = await requireSharedGate("plan.history", { plan_id: planIdInput });
+    if (gated) return gated;
     const target = await resolvePlanTarget(planIdInput);
     if (!target.ok) return target.result;
     const { plan_id, notePath } = target;
@@ -1267,6 +1357,8 @@ server.registerTool(
     },
   },
   async ({ plan_id, rev }) => {
+    const gated = await requireSharedGate("plan.revision", { plan_id, rev });
+    if (gated) return gated;
     const effectiveVaultPath = DEFAULT_VAULT_PATH;
     const notePath = await findPlanNote(effectiveVaultPath, plan_id);
     if (!notePath) {
@@ -1292,6 +1384,8 @@ server.registerTool(
     },
   },
   async ({ plan_id, from_rev, to_rev }) => {
+    const gated = await requireSharedGate("plan.diff", { plan_id, from_rev, to_rev });
+    if (gated) return gated;
     const effectiveVaultPath = DEFAULT_VAULT_PATH;
     const notePath = await findPlanNote(effectiveVaultPath, plan_id);
     if (!notePath) {
@@ -1321,6 +1415,8 @@ server.registerTool(
     },
   },
   async ({ plan_id, rev }) => {
+    const gated = await requireSharedGate("plan.restore", { plan_id, rev });
+    if (gated) return gated;
     const effectiveVaultPath = DEFAULT_VAULT_PATH;
     const notePath = await findPlanNote(effectiveVaultPath, plan_id);
     if (!notePath) {
@@ -1353,6 +1449,8 @@ server.registerTool(
     },
   },
   async ({ plan_id }) => {
+    const gated = await requireSharedGate("plan.activate", { plan_id });
+    if (gated) return gated;
     const effectiveVaultPath = DEFAULT_VAULT_PATH;
     const notePath = await findPlanNote(effectiveVaultPath, plan_id);
     if (!notePath) {
@@ -1371,6 +1469,8 @@ server.registerTool(
     inputSchema: {},
   },
   async () => {
+    const gated = await requireSharedGate("plan.deactivate");
+    if (gated) return gated;
     const effectiveVaultPath = DEFAULT_VAULT_PATH;
     await clearActivePlan(effectiveVaultPath);
     return textResult(JSON.stringify({ active: null }, null, 2));
