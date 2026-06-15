@@ -608,8 +608,14 @@ def can_read_document(
         doc_metadata.get("agent") or doc_metadata.get("sigil") or "unknown"
     ).strip()
 
-    # Same-agent or legacy "unknown" → visible (if vault/privacy passed)
-    if agent == principal.agent_id or agent == "unknown":
+    # Same-agent → visible (if vault/privacy passed).
+    if agent == principal.agent_id:
+        return True
+    # Legacy "unknown"-attributed docs are visible to any *capable* principal,
+    # but never to a default-deny stamp (no capabilities AND no vault roots = an
+    # unknown/unauthorized identity). allows_vault_root already gates pathed docs
+    # for default-deny; this also closes pathless agent="unknown" docs. (B2.)
+    if agent == "unknown" and (principal.capabilities or principal.allowed_vault_roots):
         return True
 
     # Operator/governance principals may read non-blocked foreign content within their roots

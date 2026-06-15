@@ -1333,6 +1333,23 @@ class RetrievalEngine:
             variants = [query]
         return variants or [query]
 
+    def _chunk_index_empty(self) -> bool:
+        """True when there are no vectors for semantic retrieval.
+
+        A clean Minni home should answer recall with an empty result set after
+        the cheap FTS pass, without cold-loading embedding or reranker models.
+        Public CI exercises that path via scripts/repro-smoke.sh.
+        """
+        try:
+            with self.db.cursor() as c:
+                has_chunks = c.execute(
+                    "SELECT 1 FROM chunk_embeddings LIMIT 1"
+                ).fetchone()
+            return has_chunks is None
+        except Exception as exc:  # noqa: BLE001 - recall should degrade, not fail.
+            logger.debug("empty chunk-index probe failed: %s", exc)
+            return False
+
     def _merge_expanded_results(
         self,
         variant_results: List[List[Dict]],
@@ -1627,7 +1644,10 @@ class RetrievalEngine:
             # _semantic_search path is taken — bit-identical to pre-PR-3.
             extra_backend_results: List[List[Dict]] = []
             semantic_t0 = time.perf_counter()
-            if backend is None:
+            if backend is None and not fts_results and self._chunk_index_empty():
+                semantic_results = []
+                trace["backends"] = ["faiss-disk-empty"]
+            elif backend is None:
                 # Default path — bit-identical to pre-PR-3
                 if document_agent_filter is None:
                     semantic_results = self._semantic_search(query, rerank_k)
@@ -1697,7 +1717,7 @@ class RetrievalEngine:
             merged = self._filter_candidates(merged, layers, start_date, end_date)
 
             # Step 4: Cross-encoder re-rank
-            if self.config.reranker_enabled and self.reranker:
+            if merged and self.config.reranker_enabled and self.reranker:
                 ce_t0 = time.perf_counter()
                 merged = self._rerank(query, merged)
                 timing["ce_ms"] = round((time.perf_counter() - ce_t0) * 1000, 3)

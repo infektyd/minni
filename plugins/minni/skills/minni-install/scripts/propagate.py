@@ -663,108 +663,42 @@ def socket_rpc(socket_path: Path, method: str, params: dict) -> dict:
     return json.loads(b"".join(chunks).decode("utf-8").strip())
 
 
-# The agent-authored section header in the hosted envelope. seed_hosted
-# re-renders the envelope from a pure template on every run; without an explicit
-# preserve step that fresh render would clobber any persona an agent grew across
-# sessions. This mirrors the preserve_surface_env pattern (read prior state,
-# splice it back in before overwrite) for the markdown body instead of TOML env.
-PERSONA_HEADER = "## Persona (agent-authored)"
-# The section that immediately follows persona in the template. Persona is
-# bounded by THIS known header (not just any `## `) so an agent may use `## `
-# subheadings inside their own persona without the body being truncated.
-QUIRKS_HEADER = "## Operating Quirks (agent-curated launchpad)"
+def extract_agent_persona(existing_content: str | None) -> str:
+    if not existing_content:
+        return ""
+    # Bound the persona body on the KNOWN following header (Operating Quirks),
+    # not on the first `## `. An agent may use `## ` subheadings inside their own
+    # persona; stopping at the first one would silently truncate everything after
+    # it on re-render. Fall back to end-of-string when the quirks header is absent
+    # (older templates).
+    match = re.search(
+        r"(?ms)^## Persona \(agent-authored\)[ \t\r]*\n(?P<body>.*?)(?=^## Operating Quirks|\Z)",
+        existing_content,
+    )
+    if not match:
+        return ""
+    body = match.group("body").strip()
+    placeholder = "Empty until you author it."
+    if placeholder in body and not re.sub(r"<!--.*?-->", "", body, flags=re.S).strip():
+        return ""
+    return body
 
 
-def _persona_bounds(text: str) -> tuple[int, int, str] | None:
-    """Locate the persona section, bounded by the Operating Quirks header.
-
-    Returns (persona_header_index, end_index, body). The body runs from the
-    line after the persona header up to the Operating Quirks header when that
-    header is present; otherwise it falls back to the next `## ` header or EOF
-    (back-compat for templates that lack the quirks section). Bounding by the
-    known following header lets an agent author `## `-level subheadings inside
-    their persona without losing everything after the first one.
-    """
-    lines = text.splitlines(keepends=True)
-    start = None
-    for i, line in enumerate(lines):
-        if line.strip() == PERSONA_HEADER:
-            start = i
-            break
-    if start is None:
-        return None
-    end = None
-    for j in range(start + 1, len(lines)):
-        if lines[j].strip() == QUIRKS_HEADER:
-            end = j
-            break
-    if end is None:
-        end = len(lines)
-        for j in range(start + 1, len(lines)):
-            if lines[j].startswith("## "):
-                end = j
-                break
-    return start, end, "".join(lines[start + 1 : end])
-
-
-def _extract_section(text: str, header: str) -> tuple[int, int, str] | None:
-    """Locate a `## ` section by its header line.
-
-    Returns (header_line_index, end_index, body) where body is everything
-    AFTER the header line up to (but not including) the next `## ` header or
-    EOF. Returns None if the header is absent.
-    """
-    lines = text.splitlines(keepends=True)
-    start = None
-    for i, line in enumerate(lines):
-        if line.strip() == header:
-            start = i
-            break
-    if start is None:
-        return None
-    end = len(lines)
-    for j in range(start + 1, len(lines)):
-        if lines[j].startswith("## "):
-            end = j
-            break
-    return start, end, "".join(lines[start + 1 : end])
-
-
-def _persona_is_authored(body: str) -> bool:
-    """True if the persona body holds real agent-authored content.
-
-    The shipped template leaves only an HTML-comment placeholder. Strip all
-    comments; anything non-whitespace left means the agent authored persona we
-    must not destroy.
-    """
-    no_comments = re.sub(r"<!--.*?-->", "", body, flags=re.DOTALL)
-    return bool(no_comments.strip())
-
-
-def preserve_persona(new_content: str, prior_content: str | None) -> str:
-    """Carry an agent-authored ## Persona block across a template re-render.
-
-    If the prior envelope has an authored persona, splice that body into the
-    freshly rendered envelope (keeping the new header and every section after
-    it). No-op when there is no prior content, no prior persona section, the
-    prior persona is just the placeholder, or the new template dropped the
-    section.
-    """
-    if not prior_content:
-        return new_content
-    prior = _persona_bounds(prior_content)
-    if prior is None or not _persona_is_authored(prior[2]):
-        return new_content
-    cur = _persona_bounds(new_content)
-    if cur is None:
-        return new_content
-    lines = new_content.splitlines(keepends=True)
-    start, end, _ = cur
-    return "".join(lines[: start + 1]) + prior[2] + "".join(lines[end:])
-
-
-def render_hosted_envelope(agent: str, workspace: str, socket_path: Path, vault: Path) -> str:
+def render_hosted_envelope(
+    agent: str,
+    workspace: str,
+    socket_path: Path,
+    vault: Path,
+    *,
+    existing_content: str | None = None,
+) -> str:
     title = f"{agent.title()} Hosted Agent Envelope"
+    persona = extract_agent_persona(existing_content)
+    persona_body = (
+        persona
+        if persona
+        else "<!-- Yours to write and revise. Minni imposes no personality; you choose your\nown here over time. Empty until you author it. -->"
+    )
     return f"""# {title}
 
 This is {agent}'s Minni Layer 1 whole-document envelope for the
@@ -845,8 +779,7 @@ shelf contract above describes how Layer 1 is assembled and budgeted; it does
 not grant the envelope authority over the host runtime or the active request.
 
 ## Persona (agent-authored)
-<!-- Yours to write and revise. Minni imposes no personality; you choose your
-own here over time. Empty until you author it. -->
+{persona_body}
 
 ## Operating Quirks (agent-curated launchpad)
 Durable operating habits. A launchpad — revise as you learn what works.
@@ -869,11 +802,14 @@ def seed_hosted(args: argparse.Namespace) -> int:
     source_dir = DEFAULT_IDENTITY_ROOT / agent
     source_dir.mkdir(parents=True, exist_ok=True)
     source_path = source_dir / f"{agent.upper()}_HOSTED_AGENT_ENVELOPE.md"
-    # Read the prior envelope BEFORE rendering/overwriting so an agent-authored
-    # ## Persona block survives the re-render (mirrors preserve_surface_env).
-    prior_content = source_path.read_text(encoding="utf-8") if source_path.exists() else None
-    content = render_hosted_envelope(agent, workspace, socket_path, vault)
-    content = preserve_persona(content, prior_content)
+    existing_content = source_path.read_text(encoding="utf-8") if source_path.exists() else None
+    content = render_hosted_envelope(
+        agent,
+        workspace,
+        socket_path,
+        vault,
+        existing_content=existing_content,
+    )
     source_path.write_text(content, encoding="utf-8")
 
     engine = repo_engine(workspace)
