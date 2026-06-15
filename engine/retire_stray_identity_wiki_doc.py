@@ -119,7 +119,7 @@ def retire_stray_identity_wiki_docs(
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--db", default=DEFAULT_DB, help="Path to sovereign.db")
+    parser.add_argument("--db", default=DEFAULT_DB, help="Path to minni.db")
     parser.add_argument(
         "--auto-indexed",
         default=DEFAULT_AUTO_INDEXED,
