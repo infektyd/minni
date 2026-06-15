@@ -666,8 +666,13 @@ def socket_rpc(socket_path: Path, method: str, params: dict) -> dict:
 def extract_agent_persona(existing_content: str | None) -> str:
     if not existing_content:
         return ""
+    # Bound the persona body on the KNOWN following header (Operating Quirks),
+    # not on the first `## `. An agent may use `## ` subheadings inside their own
+    # persona; stopping at the first one would silently truncate everything after
+    # it on re-render. Fall back to end-of-string when the quirks header is absent
+    # (older templates).
     match = re.search(
-        r"(?ms)^## Persona \(agent-authored\)[ \t\r]*\n(?P<body>.*?)(?=^## |\Z)",
+        r"(?ms)^## Persona \(agent-authored\)[ \t\r]*\n(?P<body>.*?)(?=^## Operating Quirks|\Z)",
         existing_content,
     )
     if not match:
