@@ -38,6 +38,12 @@ Usage:
     python sovereign_memory.py vectors --sync
     python sovereign_memory.py vectors --status
 
+    # FAISS index management (build / inspect / rebuild)
+    python sovereign_memory.py faiss
+
+    # Run an AFM compile pass (session distillation; defaults to dry-run)
+    python sovereign_memory.py compile
+
     # Vault/wiki hygiene report
     python -m engine.sovereign_memory hygiene --vault <path>
 """
