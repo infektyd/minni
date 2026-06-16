@@ -675,6 +675,21 @@ class MinniAdapter:
             doc_count=promoted,
             index_size_bytes=0,
             ingest_tokens_used=0,
+            # DISCLOSED PARTIAL INGEST (§9.5): every doc the adapter declined to
+            # promote is accounted for here so the §9.5 gate sees a FULLY
+            # accounted run (promoted + skipped == corpus) rather than a silent
+            # undercount. The bench adapter does single-RPC `learn`, so a doc
+            # whose framed payload exceeds the daemon's 1 MiB cap is skipped (the
+            # live minni pipeline chunks these); a daemon-alive per-doc fault is
+            # also recorded here. doc_count stays = promoted (over-count guard).
+            skipped_doc_count=len(skipped),
+            skipped_doc_ids=tuple(skipped),
+            skip_reason=(
+                "oversize for single-RPC daemon cap (live minni chunks these; "
+                "the bench adapter does not) or a per-doc daemon-alive fault"
+                if skipped
+                else ""
+            ),
         )
 
     def _raise_if_daemon_dead(

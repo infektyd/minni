@@ -47,6 +47,7 @@ from .judge import StubJudge
 from .report import render_report
 from .runner_layer1 import (
     GoldScoredRecord,
+    assert_ingest_accounting,
     build_scorecards,
     canonical_json as layer1_canonical_json,
     score_gold_query,
@@ -91,28 +92,44 @@ class AdapterRun:
     l2_result: AdapterLayer2Result | None = None
     ingest_tokens_used: int = 0
     doc_count: int = 0
+    # DISCLOSED PARTIAL INGEST (§9.5): docs the adapter honestly declined to
+    # ingest. ``doc_count + skipped_doc_count`` must account for the whole corpus
+    # (else it is a silent undercount and the adapter aborts). Surfaced into the
+    # results so a partial run can never look complete.
+    skipped_doc_count: int = 0
+    partial_ingest: dict | None = None  # set when 0 < doc_count < corpus size
 
 
 # Local-path redaction for anything we surface in a redacted error. Mirrors
 # minni_adapter._LOCAL_PATH_PATTERN — a bare ``str(Path.home())`` substitution
 # only strips the CURRENT operator's home and lets ANY other /Users/*,
 # /home/runner/*, /var/folders/*, etc. path leak into results.json / report.md.
+#
+# SPACE-IN-PATH: a POSIX path may legally contain spaces (e.g. ``/Users/jane
+# doe/.minni``). A stop class that halts at a bare space (``[^ \n\r\t"'<>]+``)
+# would redact only ``/Users/jane`` and LEAK the ``doe/.minni`` continuation.
+# Mirroring minni_adapter._PATH_TAIL, the tail consumes a space ONLY when it is
+# INTERNAL to the path — immediately followed by another path char. A trailing
+# space, or a space before a quote/newline/tab/angle-bracket, still terminates
+# the token so we never greedily swallow following prose.
+_PATH_CHAR = r"[^\s\"'<>]"
+_PATH_TAIL = rf"{_PATH_CHAR}(?:{_PATH_CHAR}| {_PATH_CHAR})*"
 _LOCAL_PATH_PATTERN = re.compile(
-    r"(?:/Users/[^ \n\r\t\"'<>]+"
-    r"|/Volumes/[^ \n\r\t\"'<>]+"
-    r"|/private/[^ \n\r\t\"'<>]+"
-    r"|/var/folders/[^ \n\r\t\"'<>]+"  # macOS per-user temp (TMPDIR / mkdtemp)
-    r"|/var/[^ \n\r\t\"'<>]+"
-    r"|/home/[^ \n\r\t\"'<>]+"  # Linux CI runners (e.g. /home/runner/)
-    r"|/opt/[^ \n\r\t\"'<>]+"  # Homebrew / opt installs (e.g. /opt/homebrew/)
-    r"|/root/[^ \n\r\t\"'<>]+"  # Linux root home
-    r"|/tmp/[^ \n\r\t\"'<>]+"
-    r"|/proc/[^ \n\r\t\"'<>]+"  # Linux process table (e.g. /proc/1/environ)
-    r"|/dev/[^ \n\r\t\"'<>]+"  # device nodes (e.g. /dev/sda1)
-    r"|/etc/[^ \n\r\t\"'<>]+"  # system config (e.g. /etc/shadow)
-    r"|/sys/[^ \n\r\t\"'<>]+"  # Linux sysfs
-    r"|/run/[^ \n\r\t\"'<>]+"  # runtime state (e.g. /run/secrets)
-    r"|/mnt/[^ \n\r\t\"'<>]+)"  # mount points
+    r"(?:/Users/" + _PATH_TAIL
+    + r"|/Volumes/" + _PATH_TAIL
+    + r"|/private/" + _PATH_TAIL
+    + r"|/var/folders/" + _PATH_TAIL  # macOS per-user temp (TMPDIR / mkdtemp)
+    + r"|/var/" + _PATH_TAIL
+    + r"|/home/" + _PATH_TAIL  # Linux CI runners (e.g. /home/runner/)
+    + r"|/opt/" + _PATH_TAIL  # Homebrew / opt installs (e.g. /opt/homebrew/)
+    + r"|/root/" + _PATH_TAIL  # Linux root home
+    + r"|/tmp/" + _PATH_TAIL
+    + r"|/proc/" + _PATH_TAIL  # Linux process table (e.g. /proc/1/environ)
+    + r"|/dev/" + _PATH_TAIL  # device nodes (e.g. /dev/sda1)
+    + r"|/etc/" + _PATH_TAIL  # system config (e.g. /etc/shadow)
+    + r"|/sys/" + _PATH_TAIL  # Linux sysfs
+    + r"|/run/" + _PATH_TAIL  # runtime state (e.g. /run/secrets)
+    + r"|/mnt/" + _PATH_TAIL + r")"  # mount points
 )
 
 
@@ -129,6 +146,42 @@ def _redact(exc: BaseException) -> str:
     if len(msg) > 160:
         msg = msg[:160] + "…"
     return f"{type(exc).__name__}: {msg}" if msg else type(exc).__name__
+
+
+# Cap on a single skipped doc-id stored in the manifest (relative corpus paths
+# are short; a pathological adapter must not bloat results.json with one giant id).
+_MAX_SKIP_ID_LEN = 256
+
+
+def _redact_str(text: str) -> str:
+    """Path-strip + length-bound an ADAPTER-SUPPLIED free string (e.g. skip_reason).
+
+    ``skip_reason`` is an open string any adapter populates; without this it could
+    leak a local temp path or run-specific detail into results.json / report.md
+    (the error-isolation path already redacts via ``_redact``; this gives the same
+    treatment to the skip-reason that does NOT arrive as an exception). First line
+    only, every known local path stripped, length-capped.
+    """
+    msg = str(text).splitlines()[0] if str(text) else ""
+    msg = _LOCAL_PATH_PATTERN.sub("[REDACTED_PATH]", msg)
+    if len(msg) > 160:
+        msg = msg[:160] + "…"
+    return msg
+
+
+def _normalize_skip_id(doc_id: str) -> str:
+    """Path-strip + length-bound a skipped corpus doc-id for the manifest.
+
+    Corpus doc-ids are relative paths inside the corpus dir; on a real private
+    vault they can encode operator-specific structure. Strip any absolute local
+    path that leaked into the id (defence in depth — ids should already be
+    relative) and bound the length, mirroring ``_display_path`` for manifest
+    paths so nothing operator-specific reaches results.json.
+    """
+    out = _LOCAL_PATH_PATTERN.sub("[REDACTED_PATH]", str(doc_id))
+    if len(out) > _MAX_SKIP_ID_LEN:
+        out = out[:_MAX_SKIP_ID_LEN] + "…"
+    return out
 
 
 def _run_one_adapter(
@@ -159,12 +212,40 @@ def _run_one_adapter(
             ingest_report = adapter.ingest(corpus)
             run.ingest_tokens_used = ingest_report.ingest_tokens_used
             run.doc_count = ingest_report.doc_count
-            if ingest_report.doc_count != len(corpus.doc_ids()):
-                raise RuntimeError(
-                    f"ingest doc_count={ingest_report.doc_count} != "
-                    f"len(corpus.doc_ids())={len(corpus.doc_ids())} — aborting "
-                    "this adapter (§9.5)."
-                )
+            run.skipped_doc_count = ingest_report.skipped_doc_count
+            corpus_size = len(corpus.doc_ids())
+            # §9.5 ingest accounting — the SINGLE shared gate (runner_layer1) so
+            # every caller of ingest() applies identical rules (over-count abort;
+            # fully-accounted partial proceeds; silent undercount or fabricated
+            # non-corpus skip-id aborts). ``doc_count`` counts ONLY promoted docs,
+            # so inflating ``skipped_doc_count`` cannot game the gate into scoring
+            # an adapter that didn't actually index: a skipped doc is never
+            # retrievable, and IngestReport.__post_init__ forces the count to equal
+            # the id-list length.
+            assert_ingest_accounting(ingest_report, corpus)
+            if ingest_report.doc_count < corpus_size:
+                # Disclosed partial ingest — record it so the report/manifest
+                # surfaces that this adapter did NOT ingest the whole corpus and
+                # is scored only on what it did. skip_reason is adapter-supplied
+                # free text and skipped_doc_ids are corpus doc-ids (relative
+                # paths): both are path-redacted + length-bounded before they land
+                # in results.json (mirroring the error-isolation path) so no
+                # operator-specific path leaks. The id list is truncated to a
+                # bound and ``skipped_doc_ids_truncated`` flags when that happened
+                # so a consumer can tell the manifest does not list every id.
+                _MAX_SKIP_IDS = 50
+                truncated = len(ingest_report.skipped_doc_ids) > _MAX_SKIP_IDS
+                run.partial_ingest = {
+                    "doc_count": ingest_report.doc_count,
+                    "skipped_doc_count": ingest_report.skipped_doc_count,
+                    "corpus_size": corpus_size,
+                    "skip_reason": _redact_str(ingest_report.skip_reason),
+                    "skipped_doc_ids": [
+                        _normalize_skip_id(d)
+                        for d in ingest_report.skipped_doc_ids[:_MAX_SKIP_IDS]
+                    ],
+                    "skipped_doc_ids_truncated": truncated,
+                }
             run.phase = "query"
             run.l1_records = [
                 score_gold_query(adapter, corpus, item, budget)
@@ -515,13 +596,26 @@ def orchestrate(
     layer2 = layer2_results_to_dict(l2_by_adapter) if l2_by_adapter else {}
     efficiency = efficiency_block(l2_by_adapter) if l2_by_adapter else {}
 
-    # §6.8 ingest cost (every survivor, 0 for non-LLM adapters).
+    # §6.8 ingest cost (every survivor, 0 for non-LLM adapters). ``skipped`` is
+    # surfaced per-adapter so the table is machine-readable + reproducible: a
+    # survivor that ingested the whole corpus reports skipped 0.
     ingest_cost = {
         r.name: {
             "ingest_tokens_used": r.ingest_tokens_used,
             "doc_count": r.doc_count,
+            "skipped_doc_count": r.skipped_doc_count,
         }
         for r in survivors
+    }
+
+    # DISCLOSED PARTIAL INGEST (§9.5): adapters that honestly ingested FEWER docs
+    # than the corpus (fully accounted: doc_count + skipped == corpus). Surfaced
+    # as a machine-readable block AND in the report so a partial run can never
+    # look complete. Empty when every survivor ingested the whole corpus.
+    partial_ingest = {
+        r.name: r.partial_ingest
+        for r in survivors
+        if r.partial_ingest is not None
     }
 
     episode_set_hash = compute_episode_set_hash(episodes_path)
@@ -546,6 +640,7 @@ def orchestrate(
         "layer2": layer2,
         "efficiency": efficiency,
         "ingest_cost": ingest_cost,
+        "partial_ingest": partial_ingest,
         "failures": failures,
         "partial_failures": partial_failures,
     }

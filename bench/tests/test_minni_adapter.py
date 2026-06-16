@@ -802,6 +802,13 @@ def test_ingest_skips_doc_without_candidate_id_when_daemon_alive(
             f"doc_count must count only promoted docs; got {report.doc_count} "
             f"for {len(doc_ids)} docs with 1 skipped"
         )
+        # The skip must be DISCLOSED (§9.5), not just dropped from doc_count: the
+        # no-candidate_id branch must populate the skip fields and stay fully
+        # accounted, else the gate sees a silent undercount.
+        assert report.skipped_doc_count == 1
+        assert report.skipped_doc_ids == (first,)
+        assert report.skip_reason, "a disclosed skip must carry a reason"
+        assert report.doc_count + report.skipped_doc_count == len(doc_ids)
     finally:
         adapter._corpus = None
         adapter.teardown()
@@ -847,6 +854,12 @@ def test_ingest_skips_nondict_learn_result_when_daemon_alive(
             f"a non-dict learn result must skip exactly one doc; got "
             f"doc_count={report.doc_count} for {len(doc_ids)} docs"
         )
+        # The skip must be DISCLOSED (§9.5): the non-dict-learn branch populates
+        # the skip fields and stays fully accounted (no silent undercount).
+        assert report.skipped_doc_count == 1
+        assert report.skipped_doc_ids == (first,)
+        assert report.skip_reason, "a disclosed skip must carry a reason"
+        assert report.doc_count + report.skipped_doc_count == len(doc_ids)
     finally:
         adapter._corpus = None
         adapter.teardown()
@@ -895,6 +908,15 @@ def test_ingest_skips_doc_on_resolve_failure_when_daemon_alive(
             f"a resolve_candidate fault (daemon alive) must skip exactly one doc; "
             f"got doc_count={report.doc_count} for {len(doc_ids)} docs"
         )
+        # The skip must be DISCLOSED (§9.5): the resolve-failure branch populates
+        # the skip fields and stays fully accounted. The failing doc is whichever
+        # resolve fired first, so assert the id is a real corpus member (not a
+        # hardcoded position) rather than which specific doc.
+        assert report.skipped_doc_count == 1
+        assert len(report.skipped_doc_ids) == 1
+        assert report.skipped_doc_ids[0] in set(doc_ids)
+        assert report.skip_reason, "a disclosed skip must carry a reason"
+        assert report.doc_count + report.skipped_doc_count == len(doc_ids)
     finally:
         adapter._corpus = None
         adapter.teardown()
@@ -1172,6 +1194,13 @@ def test_ingest_skips_oversize_doc_without_killing_ingest(monkeypatch, tmp_path)
         # (the small doc), and doc_count counts only that one promotion.
         assert report.doc_count == 1, f"only the small doc should promote; {report}"
         assert len(sent_learns) == 1, "oversize doc must be skipped before sending"
+        # The disclosed-skip fields are populated on THIS path too (not only in
+        # test_ingest_populates_disclosed_skip_fields): the oversize-skip and the
+        # disclosure live in the same code path, so assert both here to remove any
+        # ambiguity about which property each test covers.
+        assert report.skipped_doc_count == 1
+        assert report.skipped_doc_ids == ("huge.md",)
+        assert report.skip_reason, "a disclosed skip must carry a reason"
         # The framed payload (the bytes actually sent) of every learn must be
         # within the daemon's cap — the guard measures the framed request now.
         assert all(
@@ -1182,6 +1211,81 @@ def test_ingest_skips_oversize_doc_without_killing_ingest(monkeypatch, tmp_path)
             )) <= mod.MAX_FRAMED_REQUEST_BYTES
             for c in sent_learns
         )
+    finally:
+        adapter._corpus = None
+        adapter.teardown()
+
+
+def test_ingest_populates_disclosed_skip_fields(monkeypatch, tmp_path):
+    """The minni adapter must DISCLOSE the docs it skipped (§9.5): an oversize doc
+    (over the single-RPC daemon cap) is skipped, and IngestReport carries
+    skipped_doc_count, skipped_doc_ids (the skipped id) and a concise skip_reason,
+    while doc_count stays = promoted. doc_count + skipped == corpus, so the §9.5
+    gate ACCEPTS this as a disclosed partial ingest."""
+    import membench.adapters.minni_adapter as mod
+    from membench.corpus import compute_content_hash, load_corpus
+
+    cdir = tmp_path / "skip_corpus"
+    cdir.mkdir()
+    (cdir / "small.md").write_text("# small\n\nnormal content here\n")
+    (cdir / "huge.md").write_text("x " * (1_200_000))  # ~2.4 MB -> over the cap
+    corpus = load_corpus(
+        cdir, pinned_hash=compute_content_hash(cdir), scrubbed=False
+    )
+    corpus_size = len(list(corpus.doc_ids()))
+
+    adapter = MinniAdapter()
+
+    def _fake_spawn(self):
+        self._socket_path = tmp_path / "fake.sock"
+        self._proc = _AliveProc()
+        self._log_path = None
+
+    monkeypatch.setattr(mod.MinniAdapter, "_spawn_daemon", _fake_spawn)
+    monkeypatch.setattr(
+        mod, "_rpc", lambda sock, method, params, **k: (
+            {"candidate_id": 1, "status": "proposed"} if method == "learn" else {}
+        ),
+    )
+
+    try:
+        report = adapter.ingest(corpus)
+        assert report.doc_count == 1, f"only the small doc should promote; {report}"
+        assert report.skipped_doc_count == 1
+        assert report.skipped_doc_ids == ("huge.md",)
+        assert report.skip_reason, "a disclosed skip must carry a reason"
+        # Fully accounted: promoted + skipped == corpus (the §9.5 accept condition).
+        assert report.doc_count + report.skipped_doc_count == corpus_size
+    finally:
+        adapter._corpus = None
+        adapter.teardown()
+
+
+def test_full_ingest_reports_zero_skips(monkeypatch, corpus, tmp_path):
+    """When every doc promotes, the disclosed skip fields are empty (skipped 0,
+    no ids, no reason) — a full ingest carries no partial-ingest disclosure."""
+    import membench.adapters.minni_adapter as mod
+
+    adapter = MinniAdapter()
+
+    def _fake_spawn(self):
+        self._socket_path = tmp_path / "fake.sock"
+        self._proc = _AliveProc()
+        self._log_path = None
+
+    monkeypatch.setattr(mod.MinniAdapter, "_spawn_daemon", _fake_spawn)
+    monkeypatch.setattr(
+        mod, "_rpc", lambda sock, method, params, **k: (
+            {"candidate_id": 1, "status": "proposed"} if method == "learn" else {}
+        ),
+    )
+
+    try:
+        report = adapter.ingest(corpus)
+        assert report.doc_count == len(list(corpus.doc_ids()))
+        assert report.skipped_doc_count == 0
+        assert report.skipped_doc_ids == ()
+        assert report.skip_reason == ""
     finally:
         adapter._corpus = None
         adapter.teardown()

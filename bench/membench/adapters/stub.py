@@ -237,6 +237,126 @@ class MiscountStubAdapter(StubAdapter):
         )
 
 
+class PartialIngestStubAdapter(StubAdapter):
+    """A DISCLOSED partial ingest: skips one doc but accounts for it (§9.5).
+
+    Models the minni single-RPC oversize case: it indexes all but the LAST corpus
+    doc (so that doc is genuinely not retrievable) and reports the shortfall via
+    ``skipped_doc_count`` / ``skipped_doc_ids`` so ``doc_count + skipped ==
+    corpus``. The §9.5 gate must ACCEPT this (fully accounted) and the adapter is
+    scored only on what it ingested — never gamed by inflating skipped, because a
+    skipped doc is dropped from the retrievable index here.
+    """
+
+    name = "stub_partial"
+
+    def ingest(self, corpus: FrozenCorpus) -> IngestReport:
+        report = super().ingest(corpus)
+        ids = list(corpus.doc_ids())
+        if not ids:
+            return report
+        skipped_id = ids[-1]
+        # Genuinely drop the skipped doc from the retrievable index so it cannot
+        # be retrieved — a skipped doc must never score (no gaming the gate).
+        self._docs.pop(skipped_id, None)
+        return IngestReport(
+            build_wall_clock_ms=report.build_wall_clock_ms,
+            doc_count=report.doc_count - 1,  # one fewer PROMOTED
+            index_size_bytes=report.index_size_bytes,
+            ingest_tokens_used=report.ingest_tokens_used,
+            skipped_doc_count=1,
+            skipped_doc_ids=(skipped_id,),
+            skip_reason="oversize for single-RPC daemon cap (test stub)",
+        )
+
+
+class LeakyReasonSkipStubAdapter(StubAdapter):
+    """A DISCLOSED partial ingest whose free-form ``skip_reason`` embeds an
+    absolute local path (§9.5 redaction).
+
+    Models a careless adapter that leaks an operator-specific temp path into the
+    open ``skip_reason`` string. The harness MUST redact it via ``_redact_str``
+    before it reaches results.json / report.md. The accounting stays honest
+    (doc_count + skipped == corpus) and the skipped id stays a real corpus member,
+    so the §9.5 gate PROCEEDS — proving redaction runs on a PASSING run, not only
+    on the error-isolation path. (Note: a leaked absolute path in the skipped ID
+    itself can never reach _normalize_skip_id through orchestration — the gate's
+    corpus-subset check rejects a non-corpus id first; _normalize_skip_id is
+    unit-tested directly as defence-in-depth.)
+    """
+
+    name = "stub_leaky_skip"
+
+    def ingest(self, corpus: FrozenCorpus) -> IngestReport:
+        report = super().ingest(corpus)
+        ids = list(corpus.doc_ids())
+        if not ids:
+            return report
+        skipped_id = ids[-1]
+        # Genuinely drop the doc so it cannot be retrieved (no gaming).
+        self._docs.pop(skipped_id, None)
+        return IngestReport(
+            build_wall_clock_ms=report.build_wall_clock_ms,
+            doc_count=report.doc_count - 1,
+            index_size_bytes=report.index_size_bytes,
+            ingest_tokens_used=report.ingest_tokens_used,
+            skipped_doc_count=1,
+            skipped_doc_ids=(skipped_id,),  # a REAL corpus member (passes gate)
+            skip_reason=(
+                "oversize at /var/folders/x/tmp/docs/huge.md for single-RPC cap"
+            ),
+        )
+
+
+class FullySkippedStubAdapter(StubAdapter):
+    """A degenerate but FULLY ACCOUNTED partial: indexes nothing, skips all (§9.5).
+
+    ``doc_count == 0`` and ``skipped_doc_count == corpus`` so ``doc_count +
+    skipped == corpus`` — fully accounted, NOT a silent undercount. The §9.5 gate
+    ALLOWS it (only over-count and silent undercount abort). It drops every doc
+    from the retrievable index, so it scores recall 0 on every query — the report
+    states plainly that it ingested 0 docs. Pins the doc_count=0 edge.
+    """
+
+    name = "stub_fully_skipped"
+
+    def ingest(self, corpus: FrozenCorpus) -> IngestReport:
+        report = super().ingest(corpus)
+        ids = tuple(corpus.doc_ids())
+        # Drop EVERY doc so nothing is retrievable (no gaming: indexed nothing).
+        self._docs = {}
+        return IngestReport(
+            build_wall_clock_ms=report.build_wall_clock_ms,
+            doc_count=0,  # indexed nothing
+            index_size_bytes=report.index_size_bytes,
+            ingest_tokens_used=report.ingest_tokens_used,
+            skipped_doc_count=len(ids),
+            skipped_doc_ids=ids,
+            skip_reason="fully-skipped test stub (indexed nothing)",
+        )
+
+
+class SilentUndercountStubAdapter(StubAdapter):
+    """Under-reports doc_count WITHOUT accounting for the missing docs (§9.5).
+
+    ``doc_count`` is short by one and ``skipped_doc_count`` stays 0, so
+    ``doc_count + skipped < corpus`` — a SILENT undercount (docs unaccounted
+    for). The §9.5 gate MUST abort this adapter: a partial run that silently
+    omits docs can never look complete.
+    """
+
+    name = "stub_undercount"
+
+    def ingest(self, corpus: FrozenCorpus) -> IngestReport:
+        report = super().ingest(corpus)
+        return IngestReport(
+            build_wall_clock_ms=report.build_wall_clock_ms,
+            doc_count=report.doc_count - 1,  # short, with NO skip accounting
+            index_size_bytes=report.index_size_bytes,
+            ingest_tokens_used=report.ingest_tokens_used,
+        )
+
+
 class GatedStubAdapter(StubAdapter):
     """A stub WITH a governance gate that refuses on a retrieval miss (§6.5).
 

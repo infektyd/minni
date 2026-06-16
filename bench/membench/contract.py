@@ -98,14 +98,56 @@ class RankedDoc:
 class IngestReport:
     """What ``ingest()`` returns (§3.1).
 
-    ``doc_count`` MUST equal the number of source corpus FILES processed (one
-    per ``corpus.doc_ids()`` entry), NOT the number of internal chunks.
+    ``doc_count`` is the number of source corpus FILES actually PROMOTED/indexed
+    (one per ``corpus.doc_ids()`` entry), NOT the number of internal chunks.
+
+    DISCLOSED PARTIAL INGEST (§9.5): an adapter MAY honestly decline to ingest
+    some docs (e.g. the minni adapter skips docs whose single-RPC ``learn``
+    payload would exceed the daemon's 1 MiB cap — the live minni pipeline chunks
+    these, the bench adapter does not). Such docs are reported in
+    ``skipped_doc_count`` / ``skipped_doc_ids`` with a human ``skip_reason``. The
+    §9.5 gate ACCEPTS a run when ``doc_count + skipped_doc_count`` accounts for
+    the WHOLE corpus (a disclosed partial ingest, scored on what it ingested);
+    only a SILENT undercount (docs unaccounted for) — or an over-count
+    (``doc_count`` exceeding corpus size) — aborts the adapter. ``doc_count``
+    counts ONLY promoted docs, so an adapter cannot game the gate by inflating
+    ``skipped_doc_count``: a skipped doc is never scored and naturally penalizes
+    the adapter on any gold query whose doc it skipped.
     """
 
     build_wall_clock_ms: float
     doc_count: int
     index_size_bytes: int = 0
     ingest_tokens_used: int = 0  # generation tokens at ingest (0 for non-LLM)
+    skipped_doc_count: int = 0  # docs honestly NOT ingested (disclosed, §9.5)
+    skipped_doc_ids: tuple[str, ...] = ()  # the doc-ids in skipped_doc_count
+    skip_reason: str = ""  # concise human reason (e.g. 'oversize for daemon cap')
+
+    def __post_init__(self) -> None:
+        # The count and the id list MUST agree: the §9.5 gate does arithmetic on
+        # ``skipped_doc_count`` while the manifest records ``skipped_doc_ids``, so
+        # a divergence would let the machine-readable block claim N skips while
+        # listing a different number of ids — an unreproducible inconsistency.
+        # Enforced at construction so NO adapter can emit a mismatched report.
+        if len(self.skipped_doc_ids) != self.skipped_doc_count:
+            raise ContractError(
+                "IngestReport.skipped_doc_count="
+                f"{self.skipped_doc_count} disagrees with "
+                f"len(skipped_doc_ids)={len(self.skipped_doc_ids)} — the count "
+                "must equal the id-list length (§9.5 reproducibility)."
+            )
+        # Each corpus doc may appear at most once in the skip list. A duplicate
+        # real-corpus id inflates skipped_doc_count past the number of DISTINCT
+        # docs actually declined, letting the §9.5 gate's arithmetic
+        # (doc_count + skipped_doc_count) reach corpus_size while a genuinely
+        # unaccounted doc is hidden behind the repeated id — a silent undercount
+        # masquerading as fully accounted. Enforced at construction.
+        if len(set(self.skipped_doc_ids)) != len(self.skipped_doc_ids):
+            raise ContractError(
+                "IngestReport.skipped_doc_ids contains duplicate ids — each "
+                "corpus doc may appear at most once; a repeated id would inflate "
+                "skipped_doc_count and hide a silent undercount (§9.5)."
+            )
 
 
 @dataclass(frozen=True)

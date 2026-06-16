@@ -20,7 +20,7 @@ import pytest
 
 from membench import config, report
 from membench.adapters.stub import StubAdapter
-from membench.contract import IngestReport, QueryResult
+from membench.contract import IngestReport, QueryResult, TokenBudget
 from membench import run_bench
 
 _PKG = Path(run_bench.__file__).resolve().parent
@@ -153,7 +153,8 @@ def test_orchestration_runs_fixture_end_to_end(tmp_path):
     # results JSON parses and carries every top-level block.
     parsed = json.loads(paths["results_json"].read_text())
     for block in ("manifest", "scorecards", "layer2", "efficiency",
-                  "ingest_cost", "failures", "partial_failures"):
+                  "ingest_cost", "partial_ingest", "failures",
+                  "partial_failures"):
         assert block in parsed, f"results JSON missing {block!r}"
 
 
@@ -170,6 +171,7 @@ def test_report_contains_every_required_section_and_manifest_fields(tmp_path):
         "## Significance — pairwise task success",
         "## Token-efficiency composite (§6.7)",
         "## Ingest cost (§6.8",
+        "## Partial ingest (disclosed",
         "## Failed adapters",
         "## Partial failures",
         "## Threats to validity & honesty caveats",
@@ -396,6 +398,390 @@ def test_layer2_partial_failure_survives_teardown_crash(monkeypatch, tmp_path):
     assert "+teardown" in md
     assert "/tmp/partial/lock" not in md
     assert "/var/folders/qq/leak" not in md
+
+
+# ---------------------------------------------------------------------------
+# DISCLOSED PARTIAL INGEST (§9.5)
+# ---------------------------------------------------------------------------
+def test_disclosed_partial_ingest_proceeds_and_is_surfaced(tmp_path):
+    """An adapter with doc_count + skipped == corpus PROCEEDS (it is scored on
+    the docs it ingested) and the disclosed note reaches BOTH the results block
+    and the rendered report — a partial run can never read as complete."""
+    from membench.adapters.stub import PartialIngestStubAdapter
+
+    partial = PartialIngestStubAdapter()
+    results = _orchestrate(adapters=[partial, StubAdapter()])
+
+    doc_ids = _corpus_doc_ids()
+    corpus_size = len(doc_ids)
+    n_gold = len(_gold_items())
+    skipped_id = doc_ids[-1]  # PartialIngestStubAdapter skips ids[-1]
+    # PROCEEDED: scored, not failed.
+    assert "stub_partial" in results["scorecards"]["adapters"]
+    assert "stub_partial" not in results.get("failures", {})
+
+    # FAIRNESS: every gold query is still scored — the skipped doc's gold query
+    # is NOT dropped to flatter the adapter (it scores recall 0, asserted below
+    # via a direct query). n_scored must equal the FULL gold set.
+    assert (
+        results["scorecards"]["adapters"]["stub_partial"]["overall"]["n_scored"]
+        == n_gold
+    ), "a partial-ingest adapter must be scored on the FULL gold set (no drops)"
+
+    # Machine-readable disclosure in the results block.
+    pi = results["partial_ingest"]["stub_partial"]
+    assert pi["doc_count"] == corpus_size - 1
+    assert pi["skipped_doc_count"] == 1
+    assert pi["corpus_size"] == corpus_size
+    assert pi["skip_reason"]
+    assert len(pi["skipped_doc_ids"]) == 1
+    # The CONCRETE skipped id must be the one actually dropped (not some other
+    # doc mislabelled as skipped) — otherwise the wrong doc's gold query would be
+    # blamed while the real un-indexed doc scored anomalously.
+    assert pi["skipped_doc_ids"] == [skipped_id]
+    assert pi["skipped_doc_ids_truncated"] is False
+    # The ingest_cost block also carries the per-adapter skipped count.
+    assert results["ingest_cost"]["stub_partial"]["skipped_doc_count"] == 1
+    assert results["ingest_cost"]["stub"]["skipped_doc_count"] == 0
+
+    # The rendered report surfaces the disclosure text.
+    md = report.render_report(results)
+    assert "## Partial ingest (disclosed" in md
+    assert "stub_partial" in md
+    assert f"ingested {corpus_size - 1}/{corpus_size}" in md
+    assert "skipped 1" in md
+    assert "penalized" in md.lower()
+
+
+def test_silent_undercount_aborts_adapter(tmp_path):
+    """An adapter whose doc_count + skipped < corpus (docs UNACCOUNTED for) is a
+    silent undercount and MUST abort (§9.5) — never scored, surfaced as failed."""
+    from membench.adapters.stub import SilentUndercountStubAdapter
+
+    bad = SilentUndercountStubAdapter()
+    results = _orchestrate(adapters=[bad, StubAdapter()])
+
+    assert "stub_undercount" in results["failures"], (
+        "a silent undercount must abort the adapter, not pass the §9.5 gate"
+    )
+    info = results["failures"]["stub_undercount"]
+    assert info["phase"] == "ingest"
+    assert "undercount" in info["error"].lower()
+    # It is NOT scored and NOT recorded as a disclosed partial ingest.
+    assert "stub_undercount" not in results["scorecards"]["adapters"]
+    assert "stub_undercount" not in results.get("partial_ingest", {})
+    # The survivor still ran.
+    assert "stub" in results["scorecards"]["adapters"]
+
+
+def test_over_count_still_aborts_adapter(tmp_path):
+    """doc_count EXCEEDING corpus size (an over-count) still aborts (§9.5) — the
+    over-count guard is not weakened by the partial-ingest accounting."""
+    from membench.adapters.stub import MiscountStubAdapter
+
+    over = MiscountStubAdapter()  # reports doc_count + 1
+    results = _orchestrate(adapters=[over, StubAdapter()])
+
+    assert "stub_miscount" in results["failures"]
+    info = results["failures"]["stub_miscount"]
+    assert info["phase"] == "ingest"
+    assert "exceeds" in info["error"].lower() or "over-count" in info["error"].lower()
+    assert "stub_miscount" not in results["scorecards"]["adapters"]
+    assert "stub_miscount" not in results.get("partial_ingest", {})
+
+
+def test_over_total_accounting_aborts_adapter():
+    """assert_ingest_accounting MUST abort when doc_count + skipped_doc_count
+    EXCEEDS corpus_size, even though doc_count alone is within bounds. An
+    over-total is as wrong as an undercount: it claims to account for more docs
+    than the corpus holds (a double-count), so it must never clear the §9.5 gate.
+    """
+    from membench.runner_layer1 import assert_ingest_accounting
+
+    corpus = _load_corpus()
+    ids = corpus.doc_ids()
+    corpus_size = len(ids)
+    # doc_count within bounds (corpus_size - 1) but 2 real skips ⇒ total =
+    # corpus_size + 1 > corpus_size. Both skipped ids are genuine unique members,
+    # so the over-total — not the subset/dup guards — is what trips the gate.
+    bad = IngestReport(
+        build_wall_clock_ms=0.0,
+        doc_count=corpus_size - 1,
+        skipped_doc_count=2,
+        skipped_doc_ids=(ids[0], ids[1]),
+        skip_reason="accounted total exceeds corpus",
+    )
+    with pytest.raises(RuntimeError, match="mismatch"):
+        assert_ingest_accounting(bad, corpus)
+
+
+def test_full_ingest_records_no_partial_disclosure(tmp_path):
+    """An adapter that ingests the WHOLE corpus produces NO partial-ingest entry
+    and the report renders the 'none' line (nothing changes for full adapters)."""
+    results = _orchestrate(adapters=[StubAdapter()])
+    assert results["partial_ingest"] == {}
+    md = report.render_report(results)
+    assert "every scored adapter ingested the whole corpus" in md
+
+
+def test_non_corpus_skip_id_aborts_adapter():
+    """assert_ingest_accounting MUST abort when skipped_doc_ids contains an id
+    that is NOT a corpus member — the load-bearing anti-gaming guard that stops an
+    adapter padding skipped_doc_count with fabricated ids to clear the §9.5 gate.
+    """
+    from membench.runner_layer1 import assert_ingest_accounting
+
+    corpus = _load_corpus()
+    corpus_size = len(corpus.doc_ids())
+    # doc_count + skipped == corpus arithmetically, but the skipped id is fake.
+    bad = IngestReport(
+        build_wall_clock_ms=0.0,
+        doc_count=corpus_size - 1,
+        skipped_doc_count=1,
+        skipped_doc_ids=("fake-not-in-corpus.md",),
+        skip_reason="fabricated id padding the skip count",
+    )
+    with pytest.raises(RuntimeError, match="non-corpus ids"):
+        assert_ingest_accounting(bad, corpus)
+
+
+def test_duplicate_skip_id_rejected_at_construction():
+    """IngestReport.__post_init__ MUST reject a duplicate id in skipped_doc_ids — a
+    repeated real-corpus id would inflate skipped_doc_count and let the gate's
+    arithmetic reach corpus_size while a genuinely unaccounted doc hides behind the
+    repeat (a silent undercount masquerading as fully accounted)."""
+    from membench.contract import ContractError
+
+    with pytest.raises(ContractError, match="duplicate ids"):
+        IngestReport(
+            build_wall_clock_ms=0.0,
+            doc_count=2,
+            skipped_doc_count=2,
+            skipped_doc_ids=("a.md", "a.md"),
+            skip_reason="duplicated id inflating the skip count",
+        )
+
+
+def test_duplicate_skip_id_aborts_at_gate():
+    """Defence-in-depth: even if a duplicated skip-id list bypassed the dataclass
+    constructor (e.g. via object.__setattr__ on the frozen instance),
+    assert_ingest_accounting MUST still abort — the set-subset check passes for a
+    duplicate but the raw skipped_doc_count is inflated."""
+    from membench.runner_layer1 import assert_ingest_accounting
+
+    corpus = _load_corpus()
+    ids = corpus.doc_ids()
+    # Build a VALID report, then mutate it past the constructor to a duplicate.
+    rep = IngestReport(
+        build_wall_clock_ms=0.0,
+        doc_count=len(ids) - 2,
+        skipped_doc_count=2,
+        skipped_doc_ids=(ids[0], ids[1]),
+        skip_reason="valid then mutated",
+    )
+    object.__setattr__(rep, "skipped_doc_ids", (ids[0], ids[0]))
+    with pytest.raises(RuntimeError, match="duplicate ids"):
+        assert_ingest_accounting(rep, corpus)
+
+
+def test_count_inflation_bypass_aborts_at_gate():
+    """Defence-in-depth: a report whose skipped_doc_count was inflated PAST
+    len(skipped_doc_ids) (e.g. via object.__setattr__ on the frozen instance,
+    bypassing IngestReport.__post_init__) MUST abort at the gate. The inflated
+    count would otherwise let the accounting arithmetic treat phantom skips as
+    accounted, hiding one genuinely unaccounted corpus doc."""
+    from membench.runner_layer1 import assert_ingest_accounting
+
+    corpus = _load_corpus()
+    ids = corpus.doc_ids()
+    corpus_size = len(ids)
+    # Build a VALID report (2 real unique skipped members), then mutate it past
+    # the constructor: claim 3 skips + doc_count short by 3, while the id-list
+    # still holds only 2 real members. Arithmetic would reach corpus_size and
+    # falsely clear the gate; the count↔id-length check must catch it first.
+    rep = IngestReport(
+        build_wall_clock_ms=0.0,
+        doc_count=corpus_size - 2,
+        skipped_doc_count=2,
+        skipped_doc_ids=(ids[0], ids[1]),
+        skip_reason="valid then inflated",
+    )
+    object.__setattr__(rep, "skipped_doc_count", 3)
+    object.__setattr__(rep, "doc_count", corpus_size - 3)
+    with pytest.raises(RuntimeError, match="disagrees"):
+        assert_ingest_accounting(rep, corpus)
+
+
+def test_ingest_report_count_id_mismatch_rejected():
+    """IngestReport.__post_init__ MUST reject a report whose skipped_doc_count
+    disagrees with len(skipped_doc_ids) — the gate does arithmetic on the count
+    while the manifest records the ids, so a divergence is an unreproducible lie."""
+    from membench.contract import ContractError
+
+    with pytest.raises(ContractError, match="disagrees with"):
+        IngestReport(
+            build_wall_clock_ms=0.0,
+            doc_count=1,
+            skipped_doc_count=2,
+            skipped_doc_ids=("a.md",),
+            skip_reason="count says 2, id-list has 1",
+        )
+
+
+def test_partial_ingest_skip_reason_is_redacted(tmp_path):
+    """A leaky absolute path in an adapter's free-form skip_reason MUST be redacted
+    before it reaches the results block and the rendered report — mirroring the
+    error-isolation redaction so a passing partial run never leaks a local path."""
+    from membench.adapters.stub import LeakyReasonSkipStubAdapter
+
+    results = _orchestrate(adapters=[LeakyReasonSkipStubAdapter(), StubAdapter()])
+
+    pi = results["partial_ingest"]["stub_leaky_skip"]
+    assert "/var/folders/x/tmp/docs/huge.md" not in pi["skip_reason"]
+    assert "[REDACTED_PATH]" in pi["skip_reason"]
+
+    md = report.render_report(results)
+    assert "/var/folders/x/tmp/docs/huge.md" not in md
+    assert "[REDACTED_PATH]" in md
+
+
+def test_redact_strips_path_with_internal_space():
+    """A POSIX path may legally contain a space (e.g. ``/Users/jane doe/.minni``).
+    A stop class that halts at a bare space would redact only ``/Users/jane`` and
+    LEAK the ``doe/.minni`` continuation into results.json / report.md. The
+    space-consuming pattern (mirroring minni_adapter) must redact the WHOLE path
+    while a space that genuinely terminates the token still ends it."""
+    err = FileNotFoundError(
+        "could not open '/Users/jane doe/.minni/vault/secret.md' (denied)"
+    )
+    redacted = run_bench._redact(err)
+    assert "/Users/jane doe/.minni/vault/secret.md" not in redacted
+    assert "jane doe" not in redacted
+    assert ".minni" not in redacted
+    assert "[REDACTED_PATH]" in redacted
+    # A quote genuinely terminates the path token (it is NOT a path char), so the
+    # trailing prose after the closing quote survives un-swallowed.
+    assert "(denied)" in redacted
+
+
+def test_render_partial_ingest_truncated_ids_branch():
+    """render_partial_ingest MUST surface the truncation note when an adapter
+    skips MORE ids than the manifest cap stores (skipped_doc_ids_truncated=True)
+    — a consumer must be able to tell the listed ids are a partial sample, not
+    the complete skip set."""
+    many = [f"doc-{i:03d}.md" for i in range(50)]  # the stored (capped) sample
+    partial_ingest = {
+        "stub_big_skip": {
+            "doc_count": 10,
+            "skipped_doc_count": 200,  # far more than the 50 listed ids
+            "corpus_size": 210,
+            "skip_reason": "oversize for daemon cap",
+            "skipped_doc_ids": many,
+            "skipped_doc_ids_truncated": True,
+        }
+    }
+    out = report.render_partial_ingest(partial_ingest)
+    assert "truncated" in out
+    assert "lists 50 of 200" in out
+    assert "ingested 10/210" in out
+
+
+def test_normalize_skip_id_redacts_leaked_path():
+    """Defence-in-depth: _normalize_skip_id strips an absolute local path that
+    leaked into a skipped doc-id (such an id cannot reach the manifest via
+    orchestration — the gate's corpus-subset check rejects a non-corpus id first —
+    so this guard is unit-tested directly)."""
+    out = run_bench._normalize_skip_id("/Users/operator/vault/huge.md")
+    assert "/Users/operator/vault" not in out
+    assert "[REDACTED_PATH]" in out
+
+
+def _corpus_doc_ids():
+    """The fixture corpus doc-ids (for sizing assertions)."""
+    from membench.corpus import compute_content_hash, load_corpus
+
+    corpus = load_corpus(
+        _CORPUS, pinned_hash=compute_content_hash(_CORPUS), scrubbed=False
+    )
+    return corpus.doc_ids()
+
+
+def _load_corpus():
+    """The fixture FrozenCorpus (for direct adapter query tests)."""
+    from membench.corpus import compute_content_hash, load_corpus
+
+    return load_corpus(
+        _CORPUS, pinned_hash=compute_content_hash(_CORPUS), scrubbed=False
+    )
+
+
+def _gold_items():
+    """The fixture gold items (for full-gold-set scoring assertions)."""
+    from membench.goldset import load_jsonl
+
+    return load_jsonl(_GOLD)
+
+
+def test_partial_ingest_skipped_doc_is_unretrievable():
+    """ANTI-GAMING: the skipped doc must be genuinely dropped from the index — a
+    query for its content must NOT return the skipped id. This is what makes the
+    disclosed-partial recall-0 honest: a future refactor that forgot to drop the
+    doc (leaving it retrievable) would flatter the adapter while still clearing
+    the §9.5 gate, so it is asserted directly here."""
+    from membench.adapters.stub import PartialIngestStubAdapter
+
+    corpus = _load_corpus()
+    skipped_id = corpus.doc_ids()[-1]  # the doc PartialIngestStubAdapter skips
+    budget = TokenBudget(max_tokens=config.DEFAULT_MAX_TOKENS, max_docs=config.K)
+
+    adapter = PartialIngestStubAdapter()
+    report = adapter.ingest(corpus)
+    assert skipped_id in report.skipped_doc_ids
+    try:
+        # Query with the EXACT bytes of the skipped doc — if it were still
+        # indexed it would rank first; it must be absent.
+        skipped_text = corpus.read(skipped_id).decode("utf-8", "replace")
+        result = adapter.query(skipped_text[:400] or "digest", budget)
+        returned = {rd.doc_id for rd in result.ranked_results}
+        assert skipped_id not in returned, (
+            "skipped doc is still retrievable — the §9.5 gate would flatter an "
+            "adapter that did not actually drop it"
+        )
+    finally:
+        adapter.teardown()
+
+
+def test_fully_skipped_adapter_proceeds_and_report_shows_zero_indexed():
+    """A degenerate fully-accounted partial: doc_count=0, skipped==corpus. It is
+    fully accounted (0 + corpus == corpus) so the §9.5 gate ALLOWS it — it is NOT
+    a silent undercount. It appears in the scorecards (scoring recall 0 on every
+    query, since it indexed nothing) and the report clearly states 0 docs were
+    ingested. This pins the intended behaviour of the doc_count=0 edge."""
+    from membench.adapters.stub import FullySkippedStubAdapter
+
+    full_skip = FullySkippedStubAdapter()
+    results = _orchestrate(adapters=[full_skip, StubAdapter()])
+
+    corpus_size = len(_corpus_doc_ids())
+    assert "stub_fully_skipped" in results["scorecards"]["adapters"], (
+        "a fully-accounted (0 + corpus == corpus) adapter is ALLOWED, not aborted"
+    )
+    assert "stub_fully_skipped" not in results.get("failures", {})
+    pi = results["partial_ingest"]["stub_fully_skipped"]
+    assert pi["doc_count"] == 0
+    assert pi["skipped_doc_count"] == corpus_size
+    # It indexed nothing, so it scores recall 0 on every positive gold query.
+    overall = results["scorecards"]["adapters"]["stub_fully_skipped"]["overall"]
+    assert overall["recall_at_k"] == 0.0
+    # FAIRNESS: even a fully-skipped adapter is scored over the ENTIRE gold set —
+    # no gold query is dropped to flatter a partial adapter. n_scored must equal
+    # the full gold set (each query scores a miss, never silent omission).
+    assert overall["n_scored"] == len(_gold_items()), (
+        "a fully-skipped adapter must be scored on ALL gold queries (no drops)"
+    )
+    # The report makes the zero-indexed state explicit.
+    md = report.render_report(results)
+    assert f"ingested 0/{corpus_size}" in md
 
 
 def test_redact_strips_system_paths():

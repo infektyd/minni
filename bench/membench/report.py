@@ -265,13 +265,62 @@ def render_ingest_cost(ingest_cost: dict) -> str:
     """§6.8 dedicated ingest-cost table (0 for non-LLM adapters)."""
     lines = ["## Ingest cost (§6.8 — reported separately, NOT in the composite)",
              ""]
-    headers = ["adapter", "ingest_tokens", "doc_count"]
+    headers = ["adapter", "ingest_tokens", "doc_count", "skipped"]
     rows = [
         [name, str(block.get("ingest_tokens_used", 0)),
-         str(block.get("doc_count", 0))]
+         str(block.get("doc_count", 0)),
+         str(block.get("skipped_doc_count", 0))]
         for name, block in sorted(ingest_cost.items())
     ]
     lines.append(_md_table(headers, rows))
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Disclosed partial-ingest section (§9.5)
+# ---------------------------------------------------------------------------
+def render_partial_ingest(partial_ingest: dict) -> str:
+    """Surface any adapter that honestly ingested FEWER docs than the corpus.
+
+    A disclosed partial ingest is fully accounted (``doc_count + skipped ==
+    corpus``) and ALLOWED by the §9.5 gate: the adapter is scored on the docs it
+    DID ingest and is penalized (recall 0) on gold queries whose doc it skipped —
+    a real, measured limitation, NOT something papered over by dropping those
+    gold queries. This section makes that explicit so a partial run can never
+    read as complete.
+    """
+    lines = ["## Partial ingest (disclosed — §9.5)", ""]
+    if not partial_ingest:
+        lines.append(
+            "_none — every scored adapter ingested the whole corpus._"
+        )
+        return "\n".join(lines)
+    lines.append(
+        "> The following adapters did NOT ingest the whole corpus. Each skip is "
+        "DISCLOSED and fully accounted (doc_count + skipped == corpus), so the "
+        "adapter is ALLOWED through the §9.5 gate. It is scored ONLY on the docs "
+        "it ingested and is penalized (recall 0) on any gold query whose gold "
+        "doc it skipped — those gold queries are NOT excluded (that would flatter "
+        "the adapter). A silent undercount (docs unaccounted for) still aborts."
+    )
+    lines.append("")
+    for name, info in sorted(partial_ingest.items()):
+        doc_count = info.get("doc_count", 0)
+        skipped = info.get("skipped_doc_count", 0)
+        size = info.get("corpus_size", doc_count + skipped)
+        reason = info.get("skip_reason", "") or "(no reason given)"
+        listed = len(info.get("skipped_doc_ids", []))
+        truncated = info.get("skipped_doc_ids_truncated", False)
+        ids_note = (
+            f" (skipped_doc_ids lists {listed} of {skipped}; truncated)"
+            if truncated
+            else ""
+        )
+        lines.append(
+            f"- **{name}**: ingested {doc_count}/{size}, skipped {skipped} "
+            f"({reason}){ids_note}. {name} is scored on the docs it ingested and "
+            f"is penalized on gold queries whose doc was skipped."
+        )
     return "\n".join(lines)
 
 
@@ -412,6 +461,8 @@ def render_report(results: dict, *, plots_dir=None) -> str:
         render_efficiency(results.get("efficiency", {})),
         "",
         render_ingest_cost(results.get("ingest_cost", {})),
+        "",
+        render_partial_ingest(results.get("partial_ingest", {})),
         "",
         render_failures(results.get("failures", {})),
         "",

@@ -34,6 +34,7 @@ from .contract import (
     assert_well_formed,
     validate_query,
 )
+from .contract import IngestReport
 from .goldset import BAND_NEGATIVE, BANDS, GoldItem
 from .tokenizer import count_tokens
 
@@ -135,6 +136,68 @@ def score_query(
     )
 
 
+def assert_ingest_accounting(
+    ingest_report: IngestReport, corpus: FrozenCorpus
+) -> None:
+    """The §9.5 ingest-accounting gate, shared by EVERY caller of ingest().
+
+    THREE outcomes (identical to run_bench._run_one_adapter so no caller is a
+    weaker path):
+      • doc_count > corpus -> OVER-COUNT: a bug. ALWAYS abort (never weakened).
+      • doc_count + skipped == corpus -> FULLY ACCOUNTED. PROCEED. A shortfall
+        is a DISCLOSED partial ingest (scored on what it ingested, penalized on
+        gold queries whose doc it skipped). Anti-gaming: skipped_doc_ids MUST be
+        real corpus members, so an adapter cannot pad skipped_doc_count with
+        fabricated/non-corpus ids to clear the gate. (IngestReport.__post_init__
+        already enforces len(skipped_doc_ids) == skipped_doc_count.)
+      • doc_count + skipped < corpus -> SILENT UNDERCOUNT: docs unaccounted for.
+        Abort.
+    """
+    corpus_ids = set(corpus.doc_ids())
+    corpus_size = len(corpus_ids)
+    if ingest_report.doc_count > corpus_size:
+        raise RuntimeError(
+            f"ingest doc_count={ingest_report.doc_count} EXCEEDS "
+            f"len(corpus.doc_ids())={corpus_size} — over-count, aborting "
+            "this adapter (§9.5)."
+        )
+    # Count↔id-list agreement (the primary guard is IngestReport.__post_init__).
+    # A path that bypassed the constructor (e.g. object.__setattr__ raising
+    # skipped_doc_count above len(skipped_doc_ids)) would let the accounting
+    # arithmetic below treat phantom skips as accounted, hiding one unaccounted
+    # doc behind the inflated count. Re-assert here before any arithmetic.
+    if ingest_report.skipped_doc_count != len(ingest_report.skipped_doc_ids):
+        raise RuntimeError(
+            f"skipped_doc_count={ingest_report.skipped_doc_count} disagrees with "
+            f"len(skipped_doc_ids)={len(ingest_report.skipped_doc_ids)} — "
+            "bypassed constructor; aborting"
+        )
+    if not set(ingest_report.skipped_doc_ids).issubset(corpus_ids):
+        raise RuntimeError(
+            "ingest skipped_doc_ids contains non-corpus ids — an adapter cannot "
+            "pad skipped_doc_count with fabricated ids to clear the §9.5 gate; "
+            "aborting this adapter."
+        )
+    # Defensive secondary check (the primary guard is IngestReport.__post_init__):
+    # the subset test above passes for duplicated ids, but the accounting below
+    # uses the raw skipped_doc_count, which a duplicate inflates. Catch any path
+    # that bypassed the dataclass constructor (e.g. dataclasses.replace).
+    if len(set(ingest_report.skipped_doc_ids)) != len(ingest_report.skipped_doc_ids):
+        raise RuntimeError(
+            "ingest skipped_doc_ids contains duplicate ids — a repeated corpus id "
+            "inflates skipped_doc_count and hides a silent undercount; aborting "
+            "this adapter (§9.5)."
+        )
+    accounted = ingest_report.doc_count + ingest_report.skipped_doc_count
+    if accounted != corpus_size:
+        raise RuntimeError(
+            f"ingest accounting mismatch: doc_count={ingest_report.doc_count} + "
+            f"skipped_doc_count={ingest_report.skipped_doc_count} = {accounted} "
+            f"!= len(corpus.doc_ids())={corpus_size} — silent undercount (docs "
+            "unaccounted for), aborting this adapter (§9.5)."
+        )
+
+
 def run_layer1(
     adapter: MemoryAdapter,
     corpus: FrozenCorpus,
@@ -148,11 +211,7 @@ def run_layer1(
     adapter down.
     """
     ingest_report = adapter.ingest(corpus)
-    if ingest_report.doc_count != len(corpus.doc_ids()):
-        raise RuntimeError(
-            f"ingest doc_count={ingest_report.doc_count} != "
-            f"len(corpus.doc_ids())={len(corpus.doc_ids())} — aborting (§9.5)."
-        )
+    assert_ingest_accounting(ingest_report, corpus)
     records: list[ScoredRecord] = []
     for i, q in enumerate(queries):
         records.append(score_query(adapter, corpus, q, budget, i))
@@ -263,16 +322,12 @@ def run_layer1_gold(
 ) -> list[GoldScoredRecord]:
     """Ingest the frozen corpus, then score EVERY gold query (s4 loop).
 
-    Same fairness/safety machinery as ``run_layer1`` (doc-count integrity check,
-    per-query budget abort), but produces gold-keyed records the aggregator can
+    Same fairness/safety machinery as ``run_layer1`` (the §9.5 ingest-accounting
+    gate, per-query budget abort), but produces gold-keyed records the aggregator can
     score against ground truth. The caller tears the adapter down.
     """
     ingest_report = adapter.ingest(corpus)
-    if ingest_report.doc_count != len(corpus.doc_ids()):
-        raise RuntimeError(
-            f"ingest doc_count={ingest_report.doc_count} != "
-            f"len(corpus.doc_ids())={len(corpus.doc_ids())} — aborting (§9.5)."
-        )
+    assert_ingest_accounting(ingest_report, corpus)
     return [score_gold_query(adapter, corpus, item, budget) for item in gold_items]
 
 
