@@ -100,11 +100,55 @@ class ModelPin:
     model_family: str
 
 
-AGENT_MODEL: ModelPin = ModelPin(model_id="", model_family="")  # s5/s6
-JUDGE_MODEL: ModelPin = ModelPin(model_id="", model_family="")  # s5
+# Pinned in s5 (judge calibration). The no-self-judge gate (§3.3) requires the
+# agent and judge to differ in model_family — NOT merely model_id. The pair is
+# printed in the report header. Model ids verified against current Anthropic
+# model docs at s5 (per §10.2 / the Anthropic-model triage rule): the agent is
+# Claude Opus 4.8 (family "claude-opus"); the judge is Claude Sonnet 4.6 (family
+# "claude-sonnet") — a DIFFERENT family, so the no-self-judge gate is satisfied.
+# These are pinned strings only: NO LLM is constructed at config import and the
+# real agent/judge clients are NEVER called in tests (the StubAgent/StubJudge
+# carry the offline path).
+AGENT_MODEL: ModelPin = ModelPin(
+    model_id="claude-opus-4-8", model_family="claude-opus"
+)  # s5/s6
+JUDGE_MODEL: ModelPin = ModelPin(
+    model_id="claude-sonnet-4-6", model_family="claude-sonnet"
+)  # s5
 LLM_WIKI_CURATION_MODEL: ModelPin = ModelPin(model_id="", model_family="")  # s6
 # CI rule (later slice): LLM_WIKI_CURATION_MODEL.model_id == AGENT_MODEL.model_id
-# CI rule (later slice): AGENT_MODEL.model_family != JUDGE_MODEL.model_family
+# CI rule (s5, enforced by assert_config_valid): AGENT_MODEL.model_family !=
+# JUDGE_MODEL.model_family (no self-judging — §3.3).
+
+
+class ConfigError(ValueError):
+    """Raised by :func:`assert_config_valid` on an invalid pinned config (§3.3)."""
+
+
+def assert_config_valid() -> None:
+    """Validate the pinned config at config-validation time (§3.3, §5 / s5 scope).
+
+    The LOAD-BEARING check for s5 is the **no-self-judge gate**: a judge that
+    shares the agent's ``model_family`` could rubber-stamp the agent's own
+    answers, so CI rejects any config where they are equal. A different *version*
+    within the same family does NOT satisfy the gate — the family STRINGS must
+    differ (§3.3). Also asserts both pins are populated (an empty family would
+    spuriously "differ" from a populated one and silently pass the gate).
+
+    Raises :class:`ConfigError` on violation. Pure/offline — constructs no
+    client and makes no network call.
+    """
+    if not AGENT_MODEL.model_family:
+        raise ConfigError("AGENT_MODEL.model_family is unset (§3.3)")
+    if not JUDGE_MODEL.model_family:
+        raise ConfigError("JUDGE_MODEL.model_family is unset (§3.3)")
+    if AGENT_MODEL.model_family == JUDGE_MODEL.model_family:
+        raise ConfigError(
+            "no-self-judge gate (§3.3): judge_model.model_family == "
+            f"agent_model.model_family == {AGENT_MODEL.model_family!r}; the judge "
+            "MUST differ in family from the agent-under-test (a different version "
+            "within the same family does NOT satisfy the gate)."
+        )
 
 # ── Runtime / lockfile hash (§3.2) ───────────────────────────────────────────
 # SHA-256 of requirements.lock, recorded in the report header so a float-bit

@@ -141,7 +141,16 @@ class FrozenCorpus(Protocol):
 
 @runtime_checkable
 class MemoryAdapter(Protocol):
-    """The single interface every system under test implements (§3.1)."""
+    """The single interface every system under test implements (§3.1).
+
+    ``ingest`` CONTRACT (load-bearing for Layer 2): ``ingest(corpus)`` MUST
+    REPLACE the adapter's current index with one built solely from ``corpus``;
+    it MUST NOT accumulate across calls. The Layer-2 runner re-ingests a fresh
+    per-episode corpus before each episode's trials; an adapter whose ``ingest``
+    accumulated would silently contaminate later episodes' results with earlier
+    episodes' sessions. Every shipped adapter (StubAdapter, MinniAdapter, the
+    baselines) replaces; a new adapter MUST do the same.
+    """
 
     name: str
     config_hash: str
