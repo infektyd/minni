@@ -12,6 +12,20 @@ imports NOTHING from ``engine/`` or ``plugins/``. The JSON-RPC envelope is
 re-implemented here (it is a stable public wire format) rather than imported, to
 keep ``bench/`` structurally isolated.
 
+RETRIEVAL MODE (honest disclosure): the only PUBLIC, import-isolated,
+governance-gated ingest+retrieve path Minni exposes over the socket is
+``learn`` -> ``resolve_candidate(accept)`` -> ``search``. That path stores each
+corpus doc as a durable *learning*, and the daemon surfaces learning matches
+through its LEXICAL FTS5 index (the ``learnings`` field of the search response),
+NOT the semantic FAISS document index — by engine design, learnings are "never
+indexed in vault_fts or FAISS". There is no public socket RPC to push arbitrary
+ingested text into the semantic document/FAISS index without the AFM/LLM compile
+machinery, which the adapter must not drive. So **Minni is measured here in
+lexical (FTS5) retrieval mode over governed learnings**, and the report must say
+so. The semantic ``results`` stream is still read for forward-compat (should a
+future public RPC index ingested docs semantically), but it is empty for this
+path. See :data:`_DOC_ID_MARKER_PREFIX` for the ingest↔retrieval mapping.
+
 If standing up an isolated daemon headlessly is infeasible in this environment,
 the live round-trip is SKIPPED (not failed) with a clear reason — the contract,
 corpus loader, and token enforcement are still proven by the deterministic stub
@@ -76,11 +90,83 @@ def _redact(text: str) -> str:
     """Redact local filesystem paths from text bound for an exception/log."""
     return _LOCAL_PATH_PATTERN.sub("[REDACTED_PATH]", text)
 
+
+# ── doc-id marker (ingest↔retrieval mapping) ───────────────────────────────
+# RETRIEVAL MODE (honest disclosure, see module docstring): the only PUBLIC,
+# import-isolated, governance-gated ingest+retrieve path Minni exposes over the
+# socket is learn -> resolve_candidate(accept) -> search. That path stores each
+# corpus doc as a durable *learning*, and Minni surfaces learning matches via
+# the daemon's lexical FTS5 index (engine ``search_learnings`` → the ``learnings``
+# field of the search response). By engine design (minnid.py: learnings are
+# "never indexed in vault_fts or FAISS"), this ingest path yields LEXICAL (FTS5)
+# retrieval, not semantic FAISS — so Minni is measured here in lexical mode and
+# the report must say so. The semantic document/FAISS stream (the ``results``
+# field) returns nothing for this path; the adapter still reads it for
+# forward-compat should a future public RPC index ingested docs semantically.
+#
+# Minni drops caller ``metadata`` on the learn→durable promotion (only
+# agent_id/category/content/created_at are persisted), so a metadata tag cannot
+# survive to map a retrieved learning back to its canonical corpus doc-id.
+# Instead we stamp a compact marker INTO the learned content at ingest and parse
+# it back out of the returned learning content at query time. This is an
+# ingest-time provenance tag carried THROUGH the daemon's own store+retrieve — it
+# is NOT a corpus reach-around: the mapping only fires for content the daemon
+# actually indexed and returned for the query.
+_DOC_ID_MARKER_PREFIX = "[membench_doc_id::"
+_DOC_ID_MARKER_RE = re.compile(r"\[membench_doc_id::([^\]\n]+)\]")
+
+
+def _encode_doc_id(doc_id: str) -> str:
+    """Percent-encode marker-breaking chars so the doc-id survives the regex.
+
+    A corpus doc-id is derived from a relative filepath; POSIX filenames may
+    legally contain ``]`` or a newline, both of which are the marker's own
+    delimiters. Un-escaped, the recovery regex ``[^\\]\\n]+`` would stop early and
+    recover a TRUNCATED id, which then fails the ``valid_ids`` membership check —
+    silently dropping that doc from recall while ``doc_count`` still counts it
+    (review finding #4). Encode ``%`` first so the decode is unambiguous.
+    """
+    return (
+        doc_id.replace("%", "%25").replace("]", "%5D").replace("\n", "%0A")
+    )
+
+
+def _decode_doc_id(encoded: str) -> str:
+    """Inverse of :func:`_encode_doc_id` (decode ``%`` last to stay unambiguous)."""
+    return (
+        encoded.replace("%5D", "]").replace("%0A", "\n").replace("%25", "%")
+    )
+
+
+def _mark_content(doc_id: str, text: str) -> str:
+    """Stamp the canonical doc-id into learn content (survives the daemon store)."""
+    return f"{_DOC_ID_MARKER_PREFIX}{_encode_doc_id(doc_id)}]\n\n{text}"
+
+
+def _doc_id_from_content(content: str, valid_ids: set[str]) -> str | None:
+    """Recover the canonical doc-id stamped into a retrieved learning's content."""
+    if not isinstance(content, str):
+        return None
+    m = _DOC_ID_MARKER_RE.search(content)
+    if not m:
+        return None
+    decoded = _decode_doc_id(m.group(1))
+    if decoded in valid_ids:
+        return decoded
+    return None
+
 # Live paths the adapter must NEVER use. Asserted against at spawn time as a
 # belt-and-suspenders data-safety guard.
 _LIVE_HOME = Path.home() / ".minni"
 _LIVE_SOCKET = _LIVE_HOME / "run" / "minnid.sock"
 _LIVE_DB = _LIVE_HOME / "minni.db"
+# The engine's dual-write flat-file lives at a HARDCODED real-home path
+# (minnid.py: _OPENCLAW_DIR = Path.home() / ".openclaw") that ignores MINNI_HOME.
+# It is only written when minnid is launched with --dual-write — which the
+# throwaway daemon command below MUST NEVER pass (see _spawn_daemon). We still
+# include it in the live-path guard so the guard's "any live path aborts"
+# assurance is HONEST and uniform, not silently scoped to ~/.minni (finding #4).
+_LIVE_OPENCLAW = Path.home() / ".openclaw"
 
 # Path to the engine's minnid entrypoint and its venv python. The adapter
 # *launches* these as a subprocess (a public process boundary), it does not
@@ -226,14 +312,22 @@ class MinniAdapter:
         # uniform for every path: anything equal to _LIVE_HOME or under it aborts
         # — not just the one exact live socket file. (A temp socket like
         # ~/.minni/run/bench.sock must abort too.)
-        live_real = Path(os.path.realpath(_LIVE_HOME))
-        live_prefix = str(live_real) + os.sep
+        # Guard against BOTH live roots: ~/.minni (db/socket/vault) AND ~/.openclaw
+        # (the hardcoded dual-write flat-file root, finding #4). Any candidate path
+        # equal to or under either aborts.
+        live_roots = [
+            Path(os.path.realpath(_LIVE_HOME)),
+            Path(os.path.realpath(_LIVE_OPENCLAW)),
+        ]
         for p, label in ((tmp_home, "home"), (sock, "socket")):
             real = Path(os.path.realpath(p))
-            if real == live_real or str(real).startswith(live_prefix):
-                raise MinniStandupError(
-                    f"refusing: {label} path resolves inside the LIVE home"
-                )
+            for live_real in live_roots:
+                live_prefix = str(live_real) + os.sep
+                if real == live_real or str(real).startswith(live_prefix):
+                    raise MinniStandupError(
+                        f"refusing: {label} path resolves inside a LIVE root "
+                        f"({live_real.name})"
+                    )
 
         # Guard passed — NOW it is safe to create directories under tmp_home.
         run_dir.mkdir(parents=True, exist_ok=True)
@@ -265,6 +359,11 @@ class MinniAdapter:
         # explicitly, never inherited wholesale.
         env["PYTHONPATH"] = str(_ENGINE_DIR)
 
+        # NEVER add --dual-write to this command: the engine's dual-write target
+        # (~/.openclaw/MEMORY.md) is a HARDCODED real-home path that ignores
+        # MINNI_HOME, so enabling it would write fixture content into the
+        # operator's live flat-file. Absent --dual-write, _dual_write_enabled stays
+        # False and _flatfile_append is never reached (finding #4).
         proc = subprocess.Popen(
             [str(python), str(_MINNID_PY), "--socket", str(sock)],
             cwd=str(_ENGINE_DIR),
@@ -299,46 +398,103 @@ class MinniAdapter:
     # -- contract --------------------------------------------------------
     def ingest(self, corpus: FrozenCorpus) -> IngestReport:
         self._require_live()
+        # Layer 2 contract (contract.py / runner_layer2.py): ingest() MUST REPLACE
+        # the current index, not accumulate. The runner holds a single adapter
+        # instance alive across all N trials × episodes and calls ingest() fresh
+        # per trial; if we kept the throwaway daemon and merely appended, trial 2
+        # would carry trial 1's learnings (cross-trial contamination inflating
+        # recall). So on every ingest() we TEAR DOWN any existing throwaway daemon
+        # + temp home and spawn a brand-new one over a clean DB (finding #1).
+        #
+        # TIMING (review finding #2): build_wall_clock_ms must cover ONLY the
+        # current trial's actual corpus ingest (the learn + resolve_candidate
+        # loop), NOT the teardown of the PRIOR trial's daemon. _teardown_daemon()
+        # waits (up to 10s terminate + 5s kill) on the previous trial's process —
+        # that is not part of THIS trial's index-build cost and would inflate the
+        # reported latency of every trial after the first. _spawn_daemon() (daemon
+        # startup + socket-ready wait) is likewise standup overhead, kept OUT of
+        # the measured ingest window to match other adapters that start their timer
+        # after state-reset/standup. So the perf_counter starts AFTER both.
+        self._teardown_daemon()
+        self._spawn_daemon()
         start = time.perf_counter()
-        if self._proc is None:
-            self._spawn_daemon()
         self._corpus = corpus
         assert self._socket_path is not None
 
         # Ingest each frozen-corpus doc through Minni's PUBLIC governance path:
         # learn (stages a proposed candidate) -> resolve_candidate(accept)
-        # (promotes it to a durable learning). We tag the doc-id so query
-        # results can be mapped back to canonical doc-ids. This goes through the
-        # real gate — no engine internals, no index reach-around (§7.5).
+        # (promotes it to a durable learning, surfaced at query time via the
+        # daemon's lexical FTS5 learnings index — see _DOC_ID_MARKER_PREFIX note
+        # for the retrieval-mode disclosure). The doc-id is stamped INTO the
+        # learned content (Minni drops caller metadata on promotion) so a
+        # retrieved learning maps back to its canonical corpus doc-id. This goes
+        # through the real gate — no engine internals, no index reach-around
+        # (§7.5).
+        promoted = 0
         for doc_id in corpus.doc_ids():
             text = corpus.read(doc_id).decode("utf-8", "replace")
             learned = _rpc(
                 self._socket_path,
                 "learn",
                 {
-                    "content": text,
+                    "content": _mark_content(doc_id, text),
                     "category": "membench_fixture",
                     "metadata": {"membench_doc_id": doc_id},
                 },
                 timeout=60.0,
             )
+            # Contract: IngestReport.doc_count MUST equal the number of corpus docs
+            # actually PROCESSED (promoted to a durable, retrievable learning). A
+            # learn response with no candidate_id (e.g. a contradiction/non-proposed
+            # path) means the doc was NOT staged for promotion — silently skipping
+            # it would over-count doc_count and mask a dropped doc. In a fresh
+            # throwaway daemon (no prior learnings) this should never happen, so
+            # treat it as a hard standup failure rather than swallowing it
+            # (finding #2).
+            status = learned.get("status")
             cid = learned.get("candidate_id")
-            if cid is not None:
-                # Promote through the public operator-gated resolution RPC.
-                _rpc(
-                    self._socket_path,
-                    "resolve_candidate",
-                    {
-                        "candidate_id": cid,
-                        "decision": "accept",
-                        "reason": "membench fixture ingest",
-                    },
-                    timeout=60.0,
+            if cid is None:
+                # `status` is daemon-controlled. In the normal case it is a fixed
+                # engine enum string, but a rogue process on the throwaway socket
+                # (e.g. via a temp-dir symlink race) could return arbitrary content
+                # here. Redact local paths and truncate before surfacing so it
+                # cannot leak sensitive paths or blow up the exception size in
+                # pytest/CI output (review finding #3), matching the daemon-error
+                # redaction pattern above.
+                safe_status = _redact(repr(status))[:200]
+                raise MinniStandupError(
+                    f"learn returned no candidate_id for a fixture doc "
+                    f"(status={safe_status}); doc was not staged for promotion — "
+                    "refusing to over-count doc_count."
                 )
+            # `candidate_id` is daemon-controlled and forwarded VERBATIM into the
+            # resolve_candidate RPC below. A rogue process on the throwaway socket
+            # could return any JSON type here; forwarding a non-integer is an
+            # amplification path into resolve_candidate. Require a real int (and
+            # reject bool, an int subclass) — consistent with the status-field
+            # hardening above — aborting on anything else (review finding #2).
+            if not isinstance(cid, int) or isinstance(cid, bool):
+                safe_cid = _redact(repr(cid))[:200]
+                raise MinniStandupError(
+                    f"learn returned a non-integer candidate_id "
+                    f"({safe_cid}) — refusing to forward into resolve_candidate."
+                )
+            # Promote through the public operator-gated resolution RPC.
+            _rpc(
+                self._socket_path,
+                "resolve_candidate",
+                {
+                    "candidate_id": cid,
+                    "decision": "accept",
+                    "reason": "membench fixture ingest",
+                },
+                timeout=60.0,
+            )
+            promoted += 1
         elapsed_ms = (time.perf_counter() - start) * 1000.0
         return IngestReport(
             build_wall_clock_ms=elapsed_ms,
-            doc_count=len(corpus.doc_ids()),
+            doc_count=promoted,
             index_size_bytes=0,
             ingest_tokens_used=0,
         )
@@ -356,24 +512,40 @@ class MinniAdapter:
         )
         elapsed_ms = (time.perf_counter() - start) * 1000.0
 
-        # `results` may be ABSENT, an explicit null, or (from a malformed daemon)
-        # a non-list. `.get("results", [])` only defaults on an ABSENT key, so an
-        # explicit `"results": null` would yield None and `for item in None` would
-        # raise a raw TypeError OUTSIDE the MinniStandupError path (bypassing the
-        # test's skip guard). Coerce null/absent to [] with `or []`, and reject any
-        # other non-list as a redacted MinniStandupError rather than crashing.
-        results = result.get("results") or []
-        if not isinstance(results, list):
-            detail = _redact(repr(results))[:200]
-            raise MinniStandupError(
-                f"daemon 'results' field is not a list for search: {detail}"
-            )
+        # The search RPC returns TWO ranked streams (see _DOC_ID_MARKER_PREFIX
+        # note): `results` (the document/FAISS stream) and `learnings` (the
+        # lexical FTS5 learnings stream). The governance ingest path stores corpus
+        # docs as LEARNINGS, so for this adapter the actual retrieval arrives in
+        # `learnings`; `results` is read too for forward-compat (a future public
+        # RPC that semantically indexes ingested docs would populate it). Both are
+        # consumed in rank order — `results` first (semantic doc hits rank above
+        # lexical learning hits when present), then `learnings`.
+        #
+        # Each field may be ABSENT, explicit null, or (from a malformed daemon) a
+        # non-list. `.get(k, [])` only defaults on an ABSENT key, so an explicit
+        # `null` would yield None and `for item in None` would raise a raw
+        # TypeError OUTSIDE the MinniStandupError path (bypassing the test's skip
+        # guard). Coerce null/absent to [] with `or []`, and reject any other
+        # non-list as a redacted MinniStandupError rather than crashing.
+        def _as_list(field: str):
+            value = result.get(field) or []
+            if not isinstance(value, list):
+                detail = _redact(repr(value))[:200]
+                raise MinniStandupError(
+                    f"daemon {field!r} field is not a list for search: {detail}"
+                )
+            return value
+
+        results = _as_list("results")
+        learnings = _as_list("learnings")
 
         valid_ids = set(self._corpus.doc_ids())
         ranked: list[RankedDoc] = []
         seen: set[str] = set()
         doc_ids_in_order: list[str] = []
         for item in results:
+            if not isinstance(item, dict):
+                continue
             doc_id = self._map_doc_id(item, valid_ids)
             if doc_id is None or doc_id in seen:
                 continue
@@ -383,6 +555,44 @@ class MinniAdapter:
             doc_ids_in_order.append(doc_id)
             if len(ranked) >= budget.max_docs:
                 break
+        # Lexical learnings stream — FTS5 returns these already rank-ordered
+        # (ORDER BY rank). Map each back to its canonical doc-id via the marker
+        # stamped into the content at ingest. The learning row carries no numeric
+        # relevance, so synthesize a strictly-descending rank score (1.0, 0.99, …)
+        # to preserve the daemon's ordering through the RankedDoc score field.
+        # rank_idx counts only docs ACTUALLY appended (not enumerate offset over
+        # skipped items), so the FIRST VALID LEARNING ALWAYS SCORES 1.0 and the
+        # scores stay strictly descending with no gaps from skipped rows.
+        #
+        # SCORE-ORDERING CAVEAT (review findings #1/#8): rank_idx is initialized to
+        # 0, NOT len(ranked). This means the synthesized learning scores are
+        # INDEPENDENT of how many semantic `results` hits precede them — the first
+        # learning scores 1.0 even when N semantic hits were already appended. The
+        # learnings are therefore ranked by POSITION (appended AFTER the semantic
+        # stream, which is the daemon's own rank order) but NOT by a globally
+        # consistent descending score: a learning can carry a score (e.g. 1.0)
+        # ABOVE a preceding semantic hit's score (e.g. 0.5). Downstream membench
+        # metrics consume ranked_results in POSITION order (the list order), which
+        # is correct here. Any consumer that re-sorts by `.score` descending would
+        # reorder learnings above lower-scored semantic hits — that is the
+        # documented, accepted behavior of this adapter, not a guarantee that
+        # lexical hits never outscore semantic ones. In this adapter's actual
+        # measured path `results` is empty (learnings are the real retrieval), so
+        # N is 0 and the distinction does not arise in practice.
+        rank_idx = 0
+        for item in learnings:
+            if len(ranked) >= budget.max_docs:
+                break
+            if not isinstance(item, dict):
+                continue
+            doc_id = _doc_id_from_content(item.get("content", ""), valid_ids)
+            if doc_id is None or doc_id in seen:
+                continue
+            seen.add(doc_id)
+            score = max(0.0, 1.0 - 0.01 * rank_idx)
+            ranked.append(RankedDoc(doc_id=doc_id, score=score))
+            doc_ids_in_order.append(doc_id)
+            rank_idx += 1
 
         # Build the context through the SHARED budget-trimming helper so the minni
         # adapter is budget-SYMMETRIC with the other adapters (NIT-a): an
@@ -418,8 +628,12 @@ class MinniAdapter:
             refused=refused,
         )
 
-    def teardown(self) -> None:
-        self._torn_down = True
+    def _teardown_daemon(self) -> None:
+        """Terminate the throwaway daemon + delete its temp home (idempotent).
+
+        Shared by ingest() (fresh-daemon-per-trial, finding #1) and teardown().
+        Does NOT set ``_torn_down`` — ingest() must remain usable afterwards.
+        """
         if self._proc is not None:
             try:
                 self._proc.terminate()
@@ -433,8 +647,12 @@ class MinniAdapter:
             self._proc = None
         if self._tmp_home is not None and self._tmp_home.exists():
             shutil.rmtree(self._tmp_home, ignore_errors=True)
-            self._tmp_home = None
+        self._tmp_home = None
         self._socket_path = None
+
+    def teardown(self) -> None:
+        self._torn_down = True
+        self._teardown_daemon()
         self._corpus = None
 
     # -- helpers ---------------------------------------------------------
