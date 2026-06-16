@@ -129,12 +129,28 @@ def load_corpus(
     *,
     pinned_hash: str,
     scrubbed: bool = True,
+    snapshot_dir: str | os.PathLike[str] | None = None,
 ) -> DirectoryFrozenCorpus:
     """Load a corpus directory and FAIL-CLOSED on hash mismatch (§5.1).
 
     Recomputes the content-hash over the on-disk tree and REFUSES to run
     (raises :class:`CorpusHashMismatch`) if it differs from ``pinned_hash``.
     Every adapter therefore ingests provably identical bytes (fairness §7.1).
+
+    SCRUB-GATE ENFORCEMENT (§5.1): the spec requires the loader to REJECT a
+    corpus that claims ``scrubbed=True`` unless its ``scrub_manifest_hash``
+    recomputes over the actual bytes — a bare boolean over raw bytes is never
+    trusted. So when ``scrubbed=True``:
+      - if ``snapshot_dir`` is given (the snapshot root holding ``manifest.json``
+        + ``scrub_spans.jsonl``), the full cryptographic cross-check runs via
+        :func:`membench.scrub.verify_scrubbed` and a forged/unscrubbed corpus is
+        refused;
+      - if no ``snapshot_dir`` is given, the loader still tries to locate the
+        manifest at ``corpus_dir.parent`` (the canonical snapshot layout). If a
+        manifest there claims ``scrubbed=True``, the cross-check is enforced. If
+        no manifest can be found, ``scrubbed=True`` cannot be honored and the
+        loader RAISES — the caller must pass ``scrubbed=False`` (synthetic/public
+        fixtures with no secrets) or point at a verifiable snapshot.
     """
     corpus_dir = Path(corpus_dir)
     if not corpus_dir.is_dir():
@@ -147,4 +163,59 @@ def load_corpus(
             f"  computed: {actual}\n"
             f"  corpus:   {corpus_dir}"
         )
+    if scrubbed:
+        _enforce_scrub_gate(corpus_dir, snapshot_dir)
     return DirectoryFrozenCorpus(corpus_dir, actual, scrubbed)
+
+
+def _enforce_scrub_gate(
+    corpus_dir: Path, snapshot_dir: str | os.PathLike[str] | None
+) -> None:
+    """Run the scrub cross-check before honoring ``scrubbed=True`` (§5.1).
+
+    Lazy-imports :mod:`membench.scrub` to avoid a circular import (scrub imports
+    corpus). Raises if the snapshot's scrub gate does not verify.
+    """
+    from pathlib import Path as _P
+
+    # Locate the snapshot root: explicit arg wins; else assume the canonical
+    # layout where corpus_dir is "<snapshot>/corpus" and the manifest is at
+    # corpus_dir.parent.
+    snap = _P(snapshot_dir) if snapshot_dir is not None else corpus_dir.parent
+    manifest_path = snap / "manifest.json"
+    if not manifest_path.is_file():
+        raise CorpusPathError(
+            "load_corpus(scrubbed=True) requires a verifiable snapshot manifest, "
+            f"none found at {manifest_path}. Pass scrubbed=False for public "
+            "synthetic fixtures (no secrets), or point snapshot_dir at a frozen, "
+            "scrub-gated snapshot (§5.1)."
+        )
+    # The scrub gate verifies snap/corpus/, but load_corpus serves corpus_dir.
+    # If those diverge, the gate would pass over a DIFFERENT (e.g. empty) tree
+    # while the served corpus stays unscrubbed — stamping scrubbed=True on
+    # never-verified bytes. Require they are the SAME directory (§5.1).
+    from .snapshot import corpus_subdir as _corpus_subdir
+
+    expected = _corpus_subdir(snap).resolve()
+    if corpus_dir.resolve() != expected:
+        raise CorpusPathError(
+            "load_corpus(scrubbed=True): corpus_dir does not match the snapshot's "
+            "corpus subdir — the scrub gate would verify a different tree than the "
+            "one served, letting unscrubbed bytes pass.\n"
+            f"  corpus_dir:        {corpus_dir.resolve()}\n"
+            f"  snapshot corpus/:  {expected}\n"
+            "Pass corpus_dir == corpus_subdir(snapshot_dir) (§5.1)."
+        )
+
+    # Read the manifest's scrubbed flag; only enforce the cross-check when the
+    # manifest itself claims scrubbed=True (an unscrubbed snapshot loaded with
+    # scrubbed=True is a caller error caught here).
+    from .scrub import ScrubGateError, verify_scrubbed
+
+    try:
+        verify_scrubbed(snap)
+    except ScrubGateError as exc:
+        raise CorpusPathError(
+            "load_corpus(scrubbed=True) refused: the snapshot's scrub gate did "
+            f"not verify — {exc}"
+        ) from exc

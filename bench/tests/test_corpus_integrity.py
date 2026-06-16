@@ -41,12 +41,13 @@ def test_loader_refuses_on_hash_mismatch(tmp_path, fixture_dir):
     victim = work / "01-aurora-protocol.md"
     victim.write_bytes(victim.read_bytes() + b"X")  # one tampered byte
     with pytest.raises(CorpusHashMismatch):
-        load_corpus(work, pinned_hash=config.FIXTURE_CORPUS_HASH)
+        load_corpus(work, pinned_hash=config.FIXTURE_CORPUS_HASH, scrubbed=False)
 
 
 def test_loader_accepts_matching_hash(corpus):
     assert corpus.content_hash == config.FIXTURE_CORPUS_HASH
-    assert corpus.scrubbed is True
+    # The synthetic fixture is public (no secrets) and loaded scrubbed=False.
+    assert corpus.scrubbed is False
 
 
 def test_doc_count_equals_doc_ids(corpus):
@@ -89,7 +90,7 @@ def test_read_realpath_containment_branch_raises(tmp_path, fixture_dir):
     work = tmp_path / "corpus"
     shutil.copytree(fixture_dir, work)
     recomputed = compute_content_hash(work)
-    loaded = load_corpus(work, pinned_hash=recomputed)
+    loaded = load_corpus(work, pinned_hash=recomputed, scrubbed=False)
 
     # Plant a doc-id whose realpath resolves OUTSIDE the corpus root via a
     # symlink, and register it in _files so the membership check passes — forcing
@@ -133,7 +134,7 @@ def test_symlink_escaping_corpus_never_enters_doc_ids(tmp_path, fixture_dir):
     # The hash changes because the tree changed; load with the recomputed hash
     # so we can exercise doc_ids() containment independent of the hash gate.
     recomputed = compute_content_hash(work)
-    loaded = load_corpus(work, pinned_hash=recomputed)
+    loaded = load_corpus(work, pinned_hash=recomputed, scrubbed=False)
     assert "escape.md" not in loaded.doc_ids(), (
         "symlink escaping corpus_dir must not enter doc_ids()"
     )

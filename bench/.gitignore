@@ -8,3 +8,15 @@ reports/
 *.sock
 *.index
 *.db
+
+# s2(a): frozen real-vault snapshots + raw labels are PRIVATE — belt-and-
+# suspenders over the root `_private/` rule. These names must never be staged
+# from a public-git path even if a writer is misconfigured to land under bench/.
+_private/
+**/_private/
+corpus_real/
+gold_real.jsonl
+gold_drafts.jsonl
+**/manifest.json
+**/scrub_spans.jsonl
+snapshot_*/

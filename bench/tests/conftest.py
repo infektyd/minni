@@ -22,8 +22,15 @@ def fixture_dir():
 
 @pytest.fixture
 def corpus():
-    """The pinned synthetic fixture corpus, loaded with hash verification."""
-    return load_corpus(_fixture_path(), pinned_hash=config.FIXTURE_CORPUS_HASH)
+    """The pinned synthetic fixture corpus, loaded with hash verification.
+
+    Loaded with ``scrubbed=False``: the synthetic fixture is PUBLIC and contains
+    no secrets, so it has no scrub-gated snapshot manifest to verify. Real-data
+    runs (s2(b)) load a frozen, scrub-gated snapshot with ``scrubbed=True``.
+    """
+    return load_corpus(
+        _fixture_path(), pinned_hash=config.FIXTURE_CORPUS_HASH, scrubbed=False
+    )
 
 
 @pytest.fixture
