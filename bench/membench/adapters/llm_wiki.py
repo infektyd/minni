@@ -38,7 +38,6 @@ No governance layer -> never refuses (§6.5). Deterministic throughout.
 from __future__ import annotations
 
 import re
-import threading
 import time
 from typing import Callable, Protocol
 
@@ -64,40 +63,25 @@ def _tokenize(text: str) -> list[str]:
     return [w.lower() for w in _WORD.findall(text)]
 
 
-# ── PROCESS-GLOBAL LLM call counter (§7.15) ──────────────────────────────────
-# MAX_API_CALLS is a PROCESS-WIDE cap on cumulative real generation calls, so the
-# counter MUST be module-level, not per-instance: N curators each with their own
-# counter would let the run make N*MAX_API_CALLS calls and silently blow past the
-# ceiling. Guarded by a lock so the check-then-increment is atomic if the real run
-# ever curates concurrently. Tests reset it via _reset_api_calls() (below) so the
-# global does not leak budget across test cases.
-_API_CALLS_LOCK = threading.Lock()
-_API_CALLS = 0
+# ── SHARED cumulative API-call budget (§7.15, review fix 4) ──────────────────
+# MAX_API_CALLS is a PROCESS-WIDE cap on CUMULATIVE LLM calls across ALL roles —
+# agent + judge + curation. A per-role counter (the old bug) let the run make up
+# to 3*MAX_API_CALLS calls before any single counter aborted. Curation now
+# reserves against the ONE shared counter in membench.api_budget, so the cap is a
+# true combined ceiling. These wrappers preserve the module-local names the tests
+# use and delegate to the shared budget. The cap is read inside the shared lock,
+# so a test that monkeypatches config.MAX_API_CALLS is honoured.
+from .. import api_budget
 
 
 def _reserve_api_call() -> None:
-    """Atomically reserve one process-global LLM call or raise if over the cap.
-
-    Checks the CUMULATIVE call count across ALL LlmCurator instances against
-    ``config.MAX_API_CALLS`` and increments under a lock so the gate cannot be
-    bypassed by constructing multiple curators (each previously had its own
-    per-instance counter). Read MAX_API_CALLS inside the lock so a test that
-    monkeypatches it is honoured.
-    """
-    global _API_CALLS
-    with _API_CALLS_LOCK:
-        if _API_CALLS >= config.MAX_API_CALLS:
-            raise RuntimeError(
-                f"LlmCurator exceeded MAX_API_CALLS={config.MAX_API_CALLS} (§7.15)"
-            )
-        _API_CALLS += 1
+    """Reserve one call on the SHARED cumulative budget (delegates, fix 4)."""
+    api_budget.reserve(role="LlmCurator")
 
 
 def _reset_api_calls() -> None:
-    """Reset the process-global LLM call counter (test-only helper)."""
-    global _API_CALLS
-    with _API_CALLS_LOCK:
-        _API_CALLS = 0
+    """Reset the SHARED cumulative call counter (test-only helper)."""
+    api_budget.reset()
 
 
 # Characters allowed verbatim in a doc_id once embedded in the curator prompt.
@@ -160,12 +144,12 @@ class LlmCurator:
 
     The adapter never instantiates this by default. It requires an explicitly
     injected ``generate`` callable; absent one, ``curate`` raises rather than
-    silently doing nothing or reaching the network. Every call increments a
-    PROCESS-GLOBAL counter (module-level ``_API_CALLS``, guarded by a lock)
+    silently doing nothing or reaching the network. Every call reserves against
+    the SHARED cumulative counter in ``membench.api_budget`` (lock-guarded),
     checked against ``config.MAX_API_CALLS`` (§7.15), so the real run cannot make
     unbounded generation calls — and CANNOT bypass the cap by constructing
-    multiple curators (the counter is shared across ALL instances, not per-
-    instance).
+    multiple curators, NOR by spreading calls across the agent/judge roles: all
+    three roles share ONE cumulative ceiling (review fix 4).
 
     PROMPT-INJECTION SURFACE (corpus is untrusted input): ``curate`` builds the
     prompt by interpolating the raw corpus ``doc_id`` and ``text``. Once the
@@ -223,8 +207,9 @@ class LlmCurator:
                 "injection surface (see class docstring). The real-run caller must "
                 "run its scrub gate and pass scrubbed=True (§7.10 residual risk)."
             )
-        # Reserve a slot against the PROCESS-GLOBAL cap BEFORE generating — shared
-        # across all curator instances so N curators cannot make N*MAX_API_CALLS.
+        # Reserve a slot against the SHARED cumulative cap BEFORE generating —
+        # one counter across all curator instances AND the agent/judge roles, so
+        # the combined spend cannot exceed MAX_API_CALLS (review fix 4).
         _reserve_api_call()
         # doc_id is SANITIZED (whitelist + length cap) then delimited — see class
         # docstring: filenames are attacker-controlled and the content-scrub gate

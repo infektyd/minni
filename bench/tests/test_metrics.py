@@ -253,3 +253,35 @@ def test_percentile_out_of_range_raises():
         metrics.percentile([1.0, 2.0, 3.0], -1.0)
     with pytest.raises(ValueError):
         metrics.percentile([1.0, 2.0, 3.0], 101.0)
+
+
+# ── Determinism strip footgun guard (fix 7, §3.2/§9.1) ───────────────────────
+def test_score_field_names_are_disjoint_from_strip_set():
+    """Score field names MUST NOT collide with the recursively-stripped timing
+    fields — else strip_excluded_fields would silently erase a real score at some
+    nesting level and the determinism gate would pass vacuously (fix 7)."""
+    collision = set(metrics.REQUIRED_SCORE_FIELDS) & metrics.DETERMINISM_STRIP_FIELDS
+    assert collision == set(), (
+        "score field(s) collide with stripped timing fields: " f"{sorted(collision)}"
+    )
+
+
+def test_strip_does_not_erase_a_score_nested_under_a_non_timing_key():
+    """A score block nested under an ARBITRARY key survives the strip; only the
+    explicitly-named timing fields are dropped, at every level."""
+    obj = {
+        "overall": {
+            "recall_at_k": 0.5,
+            "latency_ms": {"p50": 1.2, "p95": 3.4},  # stripped (timing)
+            "bootstrap": {"recall_at_k": 0.5, "p50": 0.4},  # p50 here IS stripped
+        }
+    }
+    out = metrics.strip_excluded_fields(obj)
+    # Score survives at both nesting levels; timing leaves are gone everywhere.
+    assert out["overall"]["recall_at_k"] == 0.5
+    assert "latency_ms" not in out["overall"]
+    assert out["overall"]["bootstrap"]["recall_at_k"] == 0.5
+    # p50 is a registered timing field, so it is (correctly) stripped wherever it
+    # appears — which is exactly why the disjointness invariant above protects the
+    # score names from ever being chosen to collide with it.
+    assert "p50" not in out["overall"]["bootstrap"]

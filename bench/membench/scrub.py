@@ -3,7 +3,17 @@
 Slice s2(a). A redaction pass over snapshot text removes/aliases secrets and PII
 per a configurable denylist:
 
-- **API-key / token patterns** — ``sk-...`` and common bearer/token shapes.
+- **API-key / token patterns** — ``sk-...`` (incl. ``sk-ant-api03-`` Anthropic
+  keys), ``ghp_``/``github_pat_``, ``AKIA...``, Slack ``xox*``, bearer tokens.
+- **PEM private-key blocks** — the whole ``-----BEGIN ... PRIVATE KEY-----`` …
+  ``-----END ... PRIVATE KEY-----`` armored block (fix 6).
+- **JWTs** — ``eyJ...``-headed three-segment ``header.payload.signature`` tokens
+  (fix 6).
+- **Inline credential assignments** — ``password=`` / ``secret=`` / ``token=`` /
+  ``api_key=`` value spans, redacting ONLY the value and keeping the key name so
+  prose is not corrupted (fix 6). QUOTED multi-word values (e.g.
+  ``password="correct horse battery staple"``) are redacted as one span — the
+  closing quote delimits the value so internal spaces are covered (review fix 3).
 - **Email addresses** — replaced with a fixed alias.
 - **Real-name -> alias map** — by default maps the operator's real name to the
   ``Infektyd`` alias.
@@ -39,13 +49,33 @@ from .snapshot import (
 # scrub_manifest_hash is reproducible.
 REDACTED_KEY = "[REDACTED_KEY]"
 REDACTED_EMAIL = "[REDACTED_EMAIL]"
+# Distinct sentinels for the new (fix 6) classes so the scrub manifest records
+# WHAT was redacted, not just that something was.
+REDACTED_PEM = "[REDACTED_PRIVATE_KEY]"
+REDACTED_JWT = "[REDACTED_JWT]"
+REDACTED_SECRET = "[REDACTED_SECRET]"
 DEFAULT_NAME_ALIAS = "Infektyd"
+
+# All replacement sentinels — used by the assignment-pattern idempotence guard so
+# a re-scan of already-scrubbed bytes never treats a sentinel as a fresh secret
+# (nit a). REDACTED_EMAIL/the name alias are not assignment VALUES so they are not
+# needed here, but every sentinel that can legitimately appear as a redacted
+# credential value is included.
+_ALL_SENTINELS = frozenset(
+    {REDACTED_KEY, REDACTED_PEM, REDACTED_JWT, REDACTED_SECRET, REDACTED_EMAIL}
+)
 
 # API keys / tokens: sk-... (OpenAI-shape), generic long base62 token after a
 # token-ish prefix, and bearer tokens. Ordered longest-first conceptually; the
 # engine applies them in sequence.
+#
+# NOTE on sk-ant-api03- (Anthropic) coverage (fix 6): the sk- pattern below
+# matches ``sk-`` then an optional ``proj-`` then >=16 of [A-Za-z0-9_-]. An
+# Anthropic key ``sk-ant-api03-<base64url>`` has ``ant-api03-<...>`` as a single
+# [A-Za-z0-9_-] run >=16 chars, so it is ALREADY covered; a dedicated test plants
+# one and asserts redaction (no separate pattern needed, but verified).
 _KEY_PATTERNS: tuple[re.Pattern[str], ...] = (
-    # sk-... and sk-proj-... style (>=16 trailing key chars)
+    # sk-... / sk-proj-... / sk-ant-api03-... style (>=16 trailing key chars)
     re.compile(r"\bsk-(?:proj-)?[A-Za-z0-9_-]{16,}\b"),
     # ghp_/gho_/github_pat_ and similar prefixed tokens
     re.compile(r"\b(?:ghp|gho|ghs|ghr)_[A-Za-z0-9]{20,}\b"),
@@ -56,6 +86,72 @@ _KEY_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"\bBearer\s+[A-Za-z0-9._\-]{16,}\b"),
     # Slack-style xoxb/xoxp tokens
     re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b"),
+)
+
+# ── New (fix 6) high-value secret classes ────────────────────────────────────
+# PEM private-key BLOCKS — match the whole armored block, header to footer, so
+# the key body is removed in one span. DOTALL so the base64 body (with newlines)
+# is captured. Non-greedy to stop at the FIRST matching END line (one block per
+# match). Anchored on the literal PEM armor so it cannot over-match prose.
+_PEM_PATTERN = re.compile(
+    r"-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----"
+    r".*?"
+    r"-----END (?:[A-Z0-9 ]+ )?PRIVATE KEY-----",
+    re.DOTALL,
+)
+
+# JWTs — three base64url segments separated by dots: header.payload.signature.
+# Each segment is base64url ([A-Za-z0-9_-]). Require realistic minimum lengths so
+# an ordinary dotted token like "a.b.c" or a version "1.2.3" cannot match: the
+# header is >=10, payload >=10, signature >=10 chars. JWT headers virtually always
+# begin "eyJ" (base64 of '{"'), so anchor on it to avoid matching arbitrary
+# triple-dotted alphanumerics (e.g. package coordinates) — narrow, not greedy.
+_JWT_PATTERN = re.compile(
+    r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b"
+)
+
+# Inline credential ASSIGNMENTS — password=, secret=, token= (and api_key=,
+# apikey=) with an optional quote, capturing the VALUE only so the KEY name stays
+# (redacting just the secret, never the surrounding prose). Case-insensitive key;
+# ``=`` or ``:`` separator with optional spaces. The value must be non-trivial
+# (>=6 chars) so an empty or placeholder ``password=`` and a bare ``token: true``
+# boolean are left alone (avoids corpus corruption). Separator whitespace is
+# restricted to SPACES/TABS (no newline) so a bare ``password=\n`` cannot let the
+# value run consume the NEXT line's content.
+#
+# The value has TWO alternatives (review fix 3):
+#   1. QUOTED span — ``"<value>"`` / ``'<value>'``: a multi-word credential like
+#      password="correct horse battery staple" MUST be redacted. The old single
+#      ``[^\s'"]{6,}`` value stopped at the first space, so a quoted passphrase
+#      survived scrubbing — a scrub-gate FALSE NEGATIVE (verify_scrubbed re-scans
+#      with the same pattern, so the residual went undetected). The quoted branch
+#      permits internal spaces because the closing quote delimits it; it cannot
+#      run away across lines because the body excludes the quote chars (and any
+#      newline before a closing quote leaves the value spanning at most the line).
+#   2. UNQUOTED single-token span — ``[^\s'"]{6,}``: retains the anti-swallow
+#      behaviour for bare ``password=hunter2foo`` (stops at the first space/quote).
+# Quoted is tried FIRST (alternation order) so a quoted value is matched as one
+# span rather than the unquoted branch grabbing only its first token.
+#
+# Branch-minimum ALIGNMENT (review suggestion 4): the closed-quote branch (1)
+# uses ``{5,}`` so a properly-closed 5-char value (``password='abcde'``) is
+# matched by it — consuming its CLOSING quote — instead of falling through to the
+# unclosed-quote branch (3, ``qval_open >= 5``) which would match ``'abcde`` and
+# leave a stray closing ``'`` as literal text. Branch 1 is tried first in the
+# alternation, so whenever a closing quote exists the closed branch wins; the
+# unclosed branch only fires for a genuinely unterminated quote. The unquoted
+# branch (2) keeps its ``{6,}`` minimum so a bare ``token=true``-style trivial
+# value is left alone.
+_ASSIGNMENT_PATTERN = re.compile(
+    r"(?P<key>\b(?:password|passwd|pwd|secret|token|api[_-]?key)\b[ \t]*[:=][ \t]*)"
+    r"(?:"
+    r"(?P<q>['\"])(?P<qval>[^'\"]{5,})(?P=q)"  # 1. quoted (spaces allowed inside)
+    r"|"
+    r"(?P<qopen>['\"])(?P<qval_open>[^\s'\"]{5,})"  # 3. leading-quote, NO close
+    r"|"
+    r"(?P<val>[^\s'\"]{6,})"  # 2. unquoted single token
+    r")",
+    re.IGNORECASE,
 )
 
 _EMAIL_PATTERN = re.compile(
@@ -159,6 +255,45 @@ def scrub_text(
         for pat in _KEY_PATTERNS:
             for m in pat.finditer(text):
                 matches.append((m.start(), m.end(), "key", REDACTED_KEY))
+        # PEM private-key blocks — redact the whole armored block (fix 6).
+        for m in _PEM_PATTERN.finditer(text):
+            matches.append((m.start(), m.end(), "pem", REDACTED_PEM))
+        # JWTs — redact the whole three-segment token (fix 6).
+        for m in _JWT_PATTERN.finditer(text):
+            matches.append((m.start(), m.end(), "jwt", REDACTED_JWT))
+        # Inline credential assignments — redact ONLY the value, KEEP the key name
+        # and separator so prose like "the password=..." stays readable (fix 6).
+        for m in _ASSIGNMENT_PATTERN.finditer(text):
+            # The value came from one of THREE branches: the quoted branch
+            # (groups q/qval), the leading-quote-no-close branch (groups
+            # qopen/qval_open — an accidentally unclosed quote, review fix), or
+            # the unquoted branch (group val). Normalise to (open_quote,
+            # close_quote, value). Only a properly closed quote re-emits a
+            # trailing quote; the unclosed branch leaves the close empty so we do
+            # not invent a delimiter the source never had.
+            if m.group("qval") is not None:
+                open_q = close_q = m.group("q")
+                value = m.group("qval")
+            elif m.group("qval_open") is not None:
+                open_q = m.group("qopen")
+                close_q = ""
+                value = m.group("qval_open")
+            else:
+                open_q = close_q = ""
+                value = m.group("val")
+            # IDEMPOTENCE: skip an already-redacted value so a re-scan of scrubbed
+            # bytes (residual_secrets / verify_scrubbed) does NOT flag a sentinel
+            # itself as a fresh secret — that would make a genuinely scrubbed tree
+            # fail the gate. Check ALL sentinels, not just REDACTED_SECRET (nit a):
+            # a PEM/JWT/key value that landed as an assignment value is replaced by
+            # its own sentinel (e.g. ``password=[REDACTED_PRIVATE_KEY]``), and a
+            # re-scan must not treat that sentinel as a new secret to redact again.
+            if value in _ALL_SENTINELS:
+                continue
+            # Replacement preserves the captured key+separator and the quote;
+            # only the secret value is swapped for the sentinel.
+            repl = m.group("key") + open_q + REDACTED_SECRET + close_q
+            matches.append((m.start(), m.end(), "secret", repl))
     if policy.redact_emails:
         for m in _EMAIL_PATTERN.finditer(text):
             matches.append((m.start(), m.end(), "email", REDACTED_EMAIL))
@@ -166,16 +301,30 @@ def scrub_text(
         for m in pat.finditer(text):
             matches.append((m.start(), m.end(), "name", alias))
 
-    # Resolve overlaps: sort by start, then by widest span first; greedily keep
-    # non-overlapping matches (a key match subsuming an email inside it wins).
-    matches.sort(key=lambda t: (t[0], -(t[1] - t[0])))
+    # Resolve overlaps by preferring the LONGER match (security fix): when two
+    # matches overlap, the wider span wins. This matters when a PEM private-key
+    # block is the VALUE of an assignment, e.g.
+    # ``password=-----BEGIN RSA PRIVATE KEY-----\n<body>\n-----END...``. There the
+    # _ASSIGNMENT_PATTERN match starts EARLIER (at ``password=``) but its value
+    # regex ``[^\s'"]{6,}`` stops at the first whitespace, so it covers only
+    # ``-----BEGIN`` and would leave the key BODY in the clear. The _PEM_PATTERN
+    # match is much longer (the whole armored block). A start-first greedy keep
+    # would pick the short assignment span and skip the overlapping PEM block;
+    # a LONGEST-first greedy keep picks the PEM block instead, so the body is
+    # fully redacted. The prior "key subsuming an email inside it wins" behaviour
+    # is preserved — the key span is longer than the email it contains.
+    #
+    # Sort longest-first (ties broken by earliest start, then kind for
+    # determinism), greedily accept a match only if it overlaps no already-chosen
+    # span, then re-sort the accepted spans into left-to-right order for emit.
+    matches.sort(key=lambda t: (-(t[1] - t[0]), t[0], t[2]))
     chosen: list[tuple[int, int, str, str]] = []
-    last_end = -1
-    for start, end, kind, repl in matches:
-        if start < last_end:
-            continue  # overlaps an already-chosen span; skip
-        chosen.append((start, end, kind, repl))
-        last_end = end
+    for cand in matches:
+        c_start, c_end = cand[0], cand[1]
+        if any(c_start < ch[1] and ch[0] < c_end for ch in chosen):
+            continue  # overlaps an already-chosen (longer/earlier) span; skip
+        chosen.append(cand)
+    chosen.sort(key=lambda t: t[0])
 
     # Rebuild the scrubbed text left-to-right.
     out_parts: list[str] = []
@@ -524,8 +673,17 @@ def _load_spans(snapshot_dir: Path) -> list[RedactionSpan]:
         line = line.strip()
         if not line:
             continue
-        d = json.loads(line)
+        # scrub_spans.jsonl is edit-controlled; EVERY way of parsing a span line
+        # must surface as a scrub-gate failure (so the gate reports a clean
+        # refusal that corpus._enforce_scrub_gate catches), not a bare crash
+        # before the hash gate runs (item 4). Three failure modes are caught here
+        # together: (a) malformed JSON (json.JSONDecodeError) — so json.loads is
+        # INSIDE the try; (b) a missing field (KeyError); (c) a valid-but-non-dict
+        # line such as a JSON array, where d["doc_id"] raises TypeError. Redact
+        # context: report ONLY the field/kind, never the line bytes (which may
+        # carry residual PII).
         try:
+            d = json.loads(line)
             span = RedactionSpan(
                 doc_id=d["doc_id"],
                 kind=d["kind"],
@@ -533,14 +691,19 @@ def _load_spans(snapshot_dir: Path) -> list[RedactionSpan]:
                 end=d["end"],
                 replacement=d["replacement"],
             )
+        except json.JSONDecodeError:
+            raise ScrubGateError(
+                "malformed scrub span: line is not valid JSON"
+            ) from None
         except KeyError as exc:
-            # scrub_spans.jsonl is edit-controlled; a missing field must surface
-            # as a scrub-gate failure (so the gate reports a clean refusal), not
-            # a bare KeyError crash before the hash gate runs (item 4). Redact
-            # context: report ONLY the missing field name, never the line bytes
-            # (which may carry residual PII).
             raise ScrubGateError(
                 f"malformed scrub span: missing {exc.args[0]!r} field"
+            ) from None
+        except TypeError:
+            # A valid JSON value that is not a dict (e.g. an array or scalar):
+            # d["doc_id"] raises TypeError. Report the shape, never the bytes.
+            raise ScrubGateError(
+                "malformed scrub span: line is not a JSON object"
             ) from None
         # TYPE validation (item 3): the span fields are annotated but the JSONL
         # is attacker-controlled, so the annotations are not enforced at load.

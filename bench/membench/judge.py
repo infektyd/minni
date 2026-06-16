@@ -40,6 +40,25 @@ from . import config
 MAX_JUDGE_FIXTURE_BYTES = 8 * 1024 * 1024
 MAX_JUDGE_PAIRS = 100_000
 
+
+# ── SHARED cumulative API-call budget (§7.15, review fix 4) ──────────────────
+# Same rationale as the agent: MAX_API_CALLS is a CUMULATIVE cap across ALL LLM
+# roles (agent + judge + llm_wiki curation), not a per-role one. The judge now
+# reserves against the ONE shared counter in membench.api_budget so agent + judge
+# + curation calls share a single ceiling. These wrappers preserve the names the
+# tests use and delegate to the shared budget.
+from . import api_budget
+
+
+def _reserve_api_call(max_api_calls: int) -> None:
+    """Reserve one call on the SHARED cumulative budget (delegates, fix 4)."""
+    api_budget.reserve(max_api_calls, role="judge")
+
+
+def _reset_api_calls() -> None:
+    """Reset the SHARED cumulative call counter (test-only helper)."""
+    api_budget.reset()
+
 # Calibration thresholds (§3.3 / §9.6). Single source of truth so the gate and
 # any metric re-validation (e.g. runner_layer2.results_to_dict) agree exactly.
 _CALIBRATION_MIN_AGREEMENT = 0.80
@@ -176,7 +195,6 @@ class LLMJudge:
         self.max_api_calls = (
             config.MAX_API_CALLS if max_api_calls is None else max_api_calls
         )
-        self._calls = 0
 
     def _resolve_key(self) -> str:
         env_name = config.CREDENTIAL_ENV_VARS["judge_api_key"]
@@ -189,13 +207,17 @@ class LLMJudge:
         return key
 
     def score(self, answer: str, gold_fact: str) -> int:
-        if self._calls >= self.max_api_calls:
-            raise RuntimeError(
-                f"MAX_API_CALLS={self.max_api_calls} reached — aborting run "
-                "(API-cost guard, §7.15)."
-            )
-        self._resolve_key()
-        self._calls += 1
+        # Reserve on the PROCESS-GLOBAL counter first so N judges share one budget.
+        _reserve_api_call(self.max_api_calls)
+        # SECURITY (review fix): do NOT bind the API key to a named local in this
+        # stub. ``_resolve_key()`` is deliberately NOT called here — it is
+        # meaningless without the real network call, and any error-reporting
+        # framework that captures locals on an exception (Sentry, cgitb, logging
+        # with exc_info) would otherwise expose the plaintext key from this frame
+        # at the NotImplementedError below. The key is resolved at call time ONLY
+        # in the real implementation, immediately before the Anthropic client call
+        # (wired in the run slice, never reached by any test). This mirrors the
+        # identical fix in LLMAgent.answer().
         raise NotImplementedError(
             "LLMJudge.score is the gated live path; not implemented in s5 "
             "(offline-only). Use StubJudge in tests."

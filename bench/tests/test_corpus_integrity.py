@@ -121,6 +121,53 @@ def test_read_unknown_doc_id_raises(corpus):
         corpus.read("does-not-exist.md")
 
 
+# ── §9.5(a) / §7.1: ALL adapters must ingest the SAME corpus content-hash ─────
+def test_all_adapters_report_same_corpus_hash(corpus):
+    """The fairness control (§7.1/§9.5a): hand the SAME frozen corpus to every
+    adapter and assert the cross-adapter hash check passes and returns that hash
+    (kills "Minni got a cleaner corpus")."""
+    from membench.runner_layer1 import assert_corpus_hash_agreement
+    from membench.adapters.markdown_grep import MarkdownGrepAdapter
+    from membench.adapters.naive_rag import NaiveRagAdapter
+    from membench.adapters.native_platform import NativePlatformAdapter
+    from membench.adapters.llm_wiki import LlmWikiAdapter
+    from membench.adapters.sanity_random import SanityRandomAdapter
+
+    factories = [
+        StubAdapter,
+        MarkdownGrepAdapter,
+        NaiveRagAdapter,
+        NativePlatformAdapter,
+        LlmWikiAdapter,
+        SanityRandomAdapter,
+    ]
+    adapters = [f() for f in factories]
+    try:
+        for a in adapters:
+            a.ingest(corpus)  # every adapter ingests the IDENTICAL corpus object
+        agreed = assert_corpus_hash_agreement({a.name: corpus for a in adapters})
+        assert agreed == config.FIXTURE_CORPUS_HASH
+    finally:
+        for a in adapters:
+            a.teardown()
+
+
+def test_corpus_hash_mismatch_aborts(corpus, fixture_dir, tmp_path):
+    """Two adapters handed corpora with DIFFERENT content-hashes -> the run ABORTS
+    (§7.1/§9.5a); a mismatch is never silently tolerated."""
+    from membench.runner_layer1 import assert_corpus_hash_agreement
+
+    work = tmp_path / "corpus2"
+    shutil.copytree(fixture_dir, work)
+    a_doc = sorted(work.glob("*.md"))[0]
+    a_doc.write_text(a_doc.read_text(encoding="utf-8") + "\nDRIFT\n", encoding="utf-8")
+    other = load_corpus(work, pinned_hash=compute_content_hash(work), scrubbed=False)
+    assert other.content_hash != corpus.content_hash  # guard: the test is real
+
+    with pytest.raises(CorpusHashMismatch, match="MISMATCH"):
+        assert_corpus_hash_agreement({"a": corpus, "b": other})
+
+
 def test_symlink_escaping_corpus_never_enters_doc_ids(tmp_path, fixture_dir):
     """A symlink inside the corpus pointing OUTSIDE it is filtered at build
     time (§3.1/§5.1) — it never appears in doc_ids() and cannot be read."""

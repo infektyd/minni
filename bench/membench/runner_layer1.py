@@ -25,6 +25,7 @@ from dataclasses import asdict, dataclass
 
 from . import metrics
 from .config import CONTEXT_LOG_TRUNCATE
+from .corpus import CorpusHashMismatch
 from .contract import (
     FrozenCorpus,
     MemoryAdapter,
@@ -156,6 +157,39 @@ def run_layer1(
     for i, q in enumerate(queries):
         records.append(score_query(adapter, corpus, q, budget, i))
     return records
+
+
+def assert_corpus_hash_agreement(
+    adapter_corpora: dict[str, FrozenCorpus],
+) -> str:
+    """Assert EVERY adapter ingests the SAME corpus content-hash; abort on drift.
+
+    Spec §7.1 / §9.5(a): "All five ingest the same content-hashed snapshot. The
+    hash is asserted equal across adapters at run start; a mismatch aborts the
+    run." This is the fairness control that kills *"Minni got a cleaner corpus."*
+
+    ``adapter_corpora`` maps each adapter name to the :class:`FrozenCorpus` it is
+    about to ingest. The common case hands the SAME corpus object to all adapters,
+    but the check is meaningful precisely because a wiring bug could hand a
+    DIFFERENT corpus (different bytes -> different ``content_hash``) to one
+    adapter. Returns the single agreed hash on success; raises
+    :class:`CorpusHashMismatch` (aborting the run) the moment two adapters report
+    different ``content_hash`` values.
+    """
+    if not adapter_corpora:
+        raise CorpusHashMismatch(
+            "no adapters supplied — cannot assert corpus-hash agreement (§9.5a)"
+        )
+    hashes = {name: corpus.content_hash for name, corpus in adapter_corpora.items()}
+    distinct = set(hashes.values())
+    if len(distinct) != 1:
+        # Report the per-adapter hashes so the mismatch is diagnosable.
+        detail = ", ".join(f"{n}={h}" for n, h in sorted(hashes.items()))
+        raise CorpusHashMismatch(
+            "corpus content-hash MISMATCH across adapters — every adapter MUST "
+            "ingest identical bytes (§7.1/§9.5a); aborting the run.\n  " + detail
+        )
+    return next(iter(distinct))
 
 
 def record_to_json(rec: ScoredRecord) -> dict:

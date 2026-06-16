@@ -15,8 +15,13 @@ Pipeline (all deterministic):
   chunk index at the CHUNK level (``config.CHUNK_RETRIEVE_K``), then collapse
   chunks -> whole-file doc-ids with first-hit dedup capped at ``budget.max_docs``
   (== K), build a content-only ``context_string`` within the token budget.
-  ``refused`` is ALWAYS False — there is no governance mechanism, so it would be
-  dishonest to ever report a refusal (§6.5).
+  **Threshold refusal (fix 4, §6.5):** when the TOP cosine score is below the
+  pinned ``config.REFUSAL_SCORE_THRESHOLD`` the query is a clear non-match and the
+  adapter HONESTLY returns an empty ranked list + ``refused=True``. This is the
+  textbook RAG similarity-floor behaviour (NOT governance), so correct-refusal is
+  an earnable axis for an ungoverned baseline — not a Minni-only one. A genuine
+  positive scores well above the floor and is still answered (no false-refusal
+  regression on positives).
 
 FAIRNESS: this adapter and every other vector adapter use the IDENTICAL embedder
 id and the IDENTICAL k (both from ``config``). The fairness-conformance test
@@ -107,12 +112,26 @@ class NaiveRagAdapter:
             ingest_tokens_used=0,  # embedding is not generation
         )
 
-    def query(self, q: str, budget: TokenBudget) -> QueryResult:
+    def rank_candidates(self, q: str, max_docs: int) -> list:
+        """Raw pre-refusal retrieval ranking for INDEX-INTEGRITY introspection.
+
+        Returns the collapsed whole-file ``RankedDoc`` list the vector index
+        produces for ``q``, BEFORE the query-time threshold-refusal floor is
+        applied. The §9.5 over-count cross-check probes this — it asks "did the
+        adapter actually index the contents?" (an INGEST property), which is
+        independent of whether the adapter chooses to SURFACE or REFUSE that
+        retrieval at query time (a query-time POLICY). Exact-token lookups (a
+        random UUID) embed poorly and legitimately fall under the cosine floor,
+        so the integrity check must read the raw ranking, not the gated result.
+        Not part of the MemoryAdapter contract; used only by the harness's own
+        integrity tests.
+        """
         self._require_live()
         if not self._ingested:
-            raise PreIngestError("query() before ingest()")
-        start = time.perf_counter()
+            raise PreIngestError("rank_candidates() before ingest()")
+        return self._rank(q, max_docs)
 
+    def _rank(self, q: str, max_docs: int) -> list:
         ranked_chunks: list[tuple[str, float]] = []
         if self._index is not None and self._chunk_docs:
             qvec = _shared.embed([q])
@@ -127,14 +146,39 @@ class NaiveRagAdapter:
             ]
             hits.sort(key=lambda h: (-h[1], h[2]))
             ranked_chunks = [(doc_id, score) for doc_id, score, _ in hits]
+        return _shared.collapse_chunks_to_docs(ranked_chunks, max_docs)
 
-        ranked = _shared.collapse_chunks_to_docs(ranked_chunks, budget.max_docs)
+    def query(self, q: str, budget: TokenBudget) -> QueryResult:
+        self._require_live()
+        if not self._ingested:
+            raise PreIngestError("query() before ingest()")
+        start = time.perf_counter()
+
+        ranked = self._rank(q, budget.max_docs)
+
+        # THRESHOLD REFUSAL (§6.5, fix 4): this is NOT governance — it is the
+        # standard RAG "best similarity below the confidence floor -> return
+        # nothing" behaviour. When the TOP cosine score is below the pinned
+        # ``config.REFUSAL_SCORE_THRESHOLD``, the query is a clear non-match: the
+        # adapter HONESTLY returns an empty ranked list AND sets refused=True (the
+        # §6.5 predicate requires BOTH). On a genuine positive the top cosine is
+        # well above the floor, so positives are still answered (no false-refusal
+        # regression). This makes correct-refusal an EARNABLE axis for an
+        # ungoverned baseline, not a Minni-only one.
+        top_score = ranked[0].score if ranked else float("-inf")
+        if not ranked or top_score < config.REFUSAL_SCORE_THRESHOLD:
+            elapsed_ms = (time.perf_counter() - start) * 1000.0
+            return QueryResult(
+                ranked_results=[],
+                context_string="",
+                wall_clock_ms=elapsed_ms,
+                refused=True,
+            )
+
         context = _shared.build_context(
             [rd.doc_id for rd in ranked], self._docs, budget
         )
         elapsed_ms = (time.perf_counter() - start) * 1000.0
-        # NO governance layer -> never an explicit refusal (§6.5). An empty
-        # result is a plain retrieval miss, not a refusal.
         return QueryResult(
             ranked_results=ranked,
             context_string=context,

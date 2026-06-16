@@ -105,3 +105,58 @@ def test_fake_refuser_with_nonempty_negative_results_earns_no_credit():
     # Over a population of negatives, a fake-refuser that returns docs scores 0.0.
     fake_refuser_negatives = [(True, ["doc-a"]), (True, ["doc-b"])]
     assert correct_refusal_rate(fake_refuser_negatives) == 0.0
+
+
+# ── Fix 4: correct-refusal is an EARNABLE axis, NOT Minni-only ───────────────
+def test_at_least_two_distinct_adapters_can_refuse_on_negatives():
+    """≥ TWO distinct ungoverned baselines produce is_refusal==True on the
+    negative band (fix 4) — the correct-refusal axis is earnable, not Minni-only.
+
+    naive_rag refuses when top cosine < REFUSAL_SCORE_THRESHOLD; markdown_grep
+    refuses on zero lexical hits. The synthetic negatives have vocabulary DISJOINT
+    from every corpus doc, so both honestly refuse on them. We assert BOTH earn a
+    POSITIVE correct_refusal_rate AND a ZERO false_refusal_rate (no regression on
+    positives — the panel's exact target)."""
+    from membench.adapters.markdown_grep import MarkdownGrepAdapter
+    from membench.adapters.naive_rag import NaiveRagAdapter
+
+    refusers = []
+    for factory in (NaiveRagAdapter, MarkdownGrepAdapter):
+        card = _score(factory())["overall"]
+        # Earns correct-refusal credit on the negative band. The negatives have
+        # vocabulary DISJOINT from every corpus doc, so a correct adapter refuses
+        # on ALL of them — assert == 1.0 (review fix: > 0.0 would let a partial-
+        # refusal regression of 1/N pass unnoticed; mirrors the gated-stub test).
+        assert card["correct_refusal_rate"] == 1.0, (factory.__name__, card)
+        # ...WITHOUT refusing on positives (no false-refusal regression — the
+        # positives are built to be retrievable, so tau never fires on them).
+        assert card["false_refusal_rate"] == 0.0, (factory.__name__, card)
+        # ...and still retrieves positives well (tau is not set so high it
+        # suppresses real answers).
+        assert card["recall_at_k"] > 0.5, (factory.__name__, card)
+        refusers.append(factory.__name__)
+
+    # The load-bearing claim: at least TWO DISTINCT adapters can refuse.
+    assert len(set(refusers)) >= 2, refusers
+
+
+def test_threshold_refusal_does_not_fire_on_positives():
+    """The panel's regression target: tau must NOT make a baseline refuse a
+    POSITIVE it can retrieve. Drive a single clear-positive query and assert
+    neither threshold-refuser refuses it."""
+    from membench.adapters.markdown_grep import MarkdownGrepAdapter
+    from membench.adapters.naive_rag import NaiveRagAdapter
+
+    corpus, _ = build_synthetic_corpus(n_docs=150)
+    budget = TokenBudget(max_tokens=config.DEFAULT_MAX_TOKENS, max_docs=config.K)
+    # A query that names a real corpus topic -> a clear positive.
+    q = "What document is exclusively about mineral0007xyz?"
+    for factory in (NaiveRagAdapter, MarkdownGrepAdapter):
+        a = factory()
+        try:
+            a.ingest(corpus)
+            r = a.query(q, budget)
+            assert r.refused is False, (factory.__name__, "refused a clear positive")
+            assert r.ranked_results, (factory.__name__, "returned nothing on a positive")
+        finally:
+            a.teardown()

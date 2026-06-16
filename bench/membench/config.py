@@ -65,7 +65,48 @@ MIN_PER_BAND: dict[str, int] = {
 JUDGE_MIN_SUBSET_N: int = 40
 
 # ── API-cost guard (§7.15) ───────────────────────────────────────────────────
-MAX_API_CALLS: int = 5000  # hard-abort ceiling on cumulative LLM calls
+# Hard-abort ceiling on CUMULATIVE LLM calls across ALL roles. Per review fix 4,
+# the agent, judge, and llm_wiki curator share ONE process-global counter
+# (membench.api_budget), so this is a true combined cap on agent + judge +
+# curation calls — NOT three independent per-role ceilings (the old behaviour
+# that silently permitted up to 3*MAX_API_CALLS).
+MAX_API_CALLS: int = 5000
+
+# ── Threshold-refusal for the ungoverned vector/lexical baselines (§6.5, fix 4)─
+# correct-refusal must NOT be a Minni-only axis. An ungoverned baseline can still
+# HONESTLY refuse when its OWN top retrieval score is below a confidence floor —
+# this is the standard "no result above similarity threshold -> say nothing" RAG
+# behaviour, not governance. Two scales are involved, so two pinned floors:
+#
+#   REFUSAL_SCORE_THRESHOLD       — COSINE floor for the normalised-embedding
+#                                   adapters (naive_rag). Normalised embeddings
+#                                   put a genuine topical match well above ~0.30
+#                                   and a clear non-match near 0; 0.30 fires on
+#                                   the synthetic disjoint-vocab negatives while
+#                                   leaving real positives (≫0.30) answered, so it
+#                                   does NOT regress false-refusal on positives.
+#   LEXICAL_REFUSAL_MIN_HITS      — for the lexical adapter (markdown_grep): a
+#                                   query with ZERO positive-BM25 hits (no shared
+#                                   term with any doc) is a clear non-match -> the
+#                                   adapter honestly returns nothing AND refuses.
+#                                   A query that lexically matches any doc answers.
+#
+# Both floors are deliberately LOW/strict so they fire only on CLEAR non-matches,
+# never on a retrievable positive.
+#
+# CHOSEN tau JUSTIFICATION (fix 6). REFUSAL_SCORE_THRESHOLD=0.30 is verified to
+# NOT false-fire on the Layer-2 distractor episodes' POSITIVE establishing
+# questions: even with ~28 dense distractor sessions diluting the candidate pool,
+# a real topical match for the establishing question scores well above 0.30, so
+# naive_rag does NOT refuse a positive. (LEXICAL_REFUSAL_MIN_HITS=1 likewise: a
+# positive question shares lexical terms with its establishing session, so
+# markdown_grep gets >=1 BM25 hit and answers.) This is enforced by
+# test_layer2_negative_control.test_threshold_adapters_do_not_falsely_refuse_positives
+# (false-refusal rate must be 0.0): if either floor ever false-fired on a positive
+# it would corrupt the negative control by measuring false-refusal instead of
+# retrieval. The floors still fire on the §6.5 disjoint-vocab synthetic negatives.
+REFUSAL_SCORE_THRESHOLD: float = 0.30
+LEXICAL_REFUSAL_MIN_HITS: int = 1
 
 # ── Log-exposure defense in depth (§5.1) ─────────────────────────────────────
 CONTEXT_LOG_TRUNCATE: int = 256  # max chars of context_string ever logged

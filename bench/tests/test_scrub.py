@@ -15,13 +15,17 @@ import pytest
 from membench.scrub import (
     DEFAULT_NAME_ALIAS,
     REDACTED_EMAIL,
+    REDACTED_JWT,
     REDACTED_KEY,
+    REDACTED_PEM,
+    REDACTED_SECRET,
     ScrubGateError,
     ScrubPolicy,
     compute_scrub_manifest_hash,
     default_policy,
-    scrub_snapshot,
+    residual_secrets,
     scrub_text,
+    scrub_snapshot,
     verify_scrubbed,
 )
 from membench.corpus import compute_content_hash
@@ -58,6 +62,198 @@ def test_scrub_text_redacts_key_email_name():
     assert DEFAULT_NAME_ALIAS in scrubbed
     kinds = {s.kind for s in spans}
     assert kinds == {"key", "email", "name"}
+
+
+# ── Fix 6: new secret classes (all FAKE values, fake-fixture convention) ─────
+# A FAKE PEM private key (clearly bogus body), a FAKE JWT, fake credential
+# assignments, and a FAKE Anthropic sk-ant-api03- key.
+FAKE_PEM = (
+    "-----BEGIN RSA PRIVATE KEY-----\n"
+    "MIIBOgIBAAJBAKj34GkxFhD90vcNLYLInFEX6Ppy1tPf9Cnzj4p4WGeKLs1Pt8Q\n"
+    "uKUpRKfFLfRYC9AIKjbJTWit+CqvjKkfakefakefakefakefakefakefakefake==\n"
+    "-----END RSA PRIVATE KEY-----"
+)
+FAKE_JWT = (
+    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"
+    ".eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkZha2UifQ"
+    ".SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
+)
+FAKE_ANT_KEY = "sk-ant-api03-FAKEFAKEfakefake0123456789abcdefABCDEF_-deadbeef00"
+
+
+def test_scrub_text_redacts_pem_private_key():
+    text = f"Here is a deploy key:\n{FAKE_PEM}\nuse it.\n"
+    scrubbed, spans = scrub_text("k.md", text, ScrubPolicy())
+    assert "PRIVATE KEY" not in scrubbed or REDACTED_PEM in scrubbed
+    assert "MIIBOgIBAAJBAKj34" not in scrubbed  # the key body is gone
+    assert REDACTED_PEM in scrubbed
+    # Surrounding prose is preserved (no over-match).
+    assert scrubbed.startswith("Here is a deploy key:")
+    assert scrubbed.rstrip().endswith("use it.")
+    assert {s.kind for s in spans} == {"pem"}
+
+
+def test_scrub_text_redacts_jwt():
+    text = f"token header.payload below: {FAKE_JWT} end"
+    scrubbed, spans = scrub_text("j.md", text, ScrubPolicy())
+    assert FAKE_JWT not in scrubbed
+    assert REDACTED_JWT in scrubbed
+    assert "jwt" in {s.kind for s in spans}
+
+
+def test_scrub_text_redacts_credential_assignments():
+    text = (
+        'password="hunter2secret"\n'
+        "secret=supersecretvalue123\n"
+        "api_key: abcdef0123456789\n"
+        "token=tok_FAKE_aaaaaaaaaaaa\n"
+    )
+    scrubbed, spans = scrub_text("c.md", text, ScrubPolicy())
+    for plaintext in ("hunter2secret", "supersecretvalue123",
+                      "abcdef0123456789", "tok_FAKE_aaaaaaaaaaaa"):
+        assert plaintext not in scrubbed, plaintext
+    assert REDACTED_SECRET in scrubbed
+    # The KEY names survive — only the value is redacted (no prose corruption).
+    assert "password=" in scrubbed
+    assert "secret=" in scrubbed
+    assert "api_key:" in scrubbed
+    assert "token=" in scrubbed
+    assert "secret" in {s.kind for s in spans}
+    # Fix 8: PIN the delimiter for the QUOTED case so a regex change that drops
+    # the closing quote is caught. The quoted value was double-quoted, so the
+    # redacted form must re-emit BOTH quotes around the sentinel — a stray
+    # unbalanced quote (e.g. password="[REDACTED_SECRET]\n) would fail here.
+    assert f'password="{REDACTED_SECRET}"' in scrubbed
+    # And the UNQUOTED cases must NOT have spurious quotes added around them.
+    assert f"secret={REDACTED_SECRET}" in scrubbed
+    assert f"token={REDACTED_SECRET}" in scrubbed
+
+
+def test_scrub_text_redacts_quoted_multiword_credential(review_fix=True):
+    # Review fix 3: a QUOTED multi-word passphrase must be fully redacted. The old
+    # value pattern stopped at the first space, leaving "horse battery staple"
+    # plaintext — a scrub-gate FALSE NEGATIVE (verify_scrubbed re-scans with the
+    # same pattern). The quoted branch now spans the whole quoted value.
+    text = 'password="correct horse battery staple"\n'
+    scrubbed, spans = scrub_text("mw.md", text, ScrubPolicy())
+    assert "correct horse battery staple" not in scrubbed
+    assert "horse battery staple" not in scrubbed
+    assert REDACTED_SECRET in scrubbed
+    assert "password=" in scrubbed  # key name + separator survive
+    assert "secret" in {s.kind for s in spans}
+    # Single-quoted multi-word value too.
+    s2, _ = scrub_text("mw2.md", "secret='multi word secret value here'\n", ScrubPolicy())
+    assert "multi word secret value here" not in s2
+    assert REDACTED_SECRET in s2
+    # And it survives a re-scan (idempotent: the sentinel is not re-flagged).
+    rescrub, residual = scrub_text("mw.md", scrubbed, ScrubPolicy())
+    assert rescrub == scrubbed and residual == []
+
+
+def test_scrub_text_redacts_unclosed_quote_credential():
+    # Review fix: a value that OPENS a quote but never closes it (a missing
+    # delimiter in a shell script or a concatenated config fragment) was matched
+    # by NEITHER branch: the quoted branch needs a closing quote, the unquoted
+    # branch excludes the leading quote char. The value survived scrubbing AND
+    # verify_scrubbed re-scanned with the same pattern, so the residual was
+    # invisible. The leading-quote-no-close branch now catches it.
+    text = 'password="noclosevalue rest of line\n'
+    scrubbed, spans = scrub_text("uq.md", text, ScrubPolicy())
+    assert "noclosevalue" not in scrubbed
+    assert REDACTED_SECRET in scrubbed
+    assert "password=" in scrubbed  # key + separator survive
+    assert "secret" in {s.kind for s in spans}
+    # The trailing prose after the (unclosed) value is left intact.
+    assert "rest of line" in scrubbed
+    # Idempotent: the sentinel is not re-flagged on a re-scan.
+    rescrub, residual = scrub_text("uq.md", scrubbed, ScrubPolicy())
+    assert rescrub == scrubbed and residual == []
+
+
+def test_scrub_text_redacts_pem_as_assignment_value():
+    # Fix 2 (security): a PEM private-key block planted as the VALUE of an
+    # assignment. The _ASSIGNMENT_PATTERN match starts EARLIER (at "password=")
+    # and its unquoted value regex [^\s'"]{6,} stops at the first whitespace, so a
+    # start-first overlap resolution would redact only "-----BEGIN" and leave the
+    # key BODY in the clear. Longest-match overlap resolution must let the PEM
+    # span win so the ENTIRE block (body + END line) is redacted.
+    text = f"password={FAKE_PEM}\nrest of config\n"
+    scrubbed, spans = scrub_text("pemval.md", text, ScrubPolicy())
+    # The key body and the END armor line must both be gone.
+    assert "MIIBOgIBAAJBAKj34" not in scrubbed
+    assert "PRIVATE KEY" not in scrubbed
+    assert "-----END" not in scrubbed
+    assert REDACTED_PEM in scrubbed
+    # The PEM span (not a truncated 'secret' span) is what fired.
+    assert "pem" in {s.kind for s in spans}
+    # Surrounding prose survives.
+    assert "rest of config" in scrubbed
+
+
+def test_scrub_text_redacts_five_char_closed_quote():
+    # Fix 4: a properly-closed quoted value of exactly 5 chars. The closed-quote
+    # branch must match it (consuming its closing quote) rather than the
+    # unclosed-quote branch leaving a stray closing quote as literal text.
+    text = "password='abcde'\n"
+    scrubbed, spans = scrub_text("five.md", text, ScrubPolicy())
+    assert "abcde" not in scrubbed
+    assert "secret" in {s.kind for s in spans}
+    # The closing quote is CONSUMED — the redacted form re-emits both quotes and
+    # leaves NO stray trailing quote before the newline.
+    assert f"password='{REDACTED_SECRET}'\n" in scrubbed
+    assert "''" not in scrubbed  # no doubled/stray quote
+
+
+def test_quoted_credential_residual_caught_by_verify(tmp_path):
+    # End-to-end: a quoted multi-word password planted in a snapshot must be a
+    # residual the scrub gate catches if it ever survived — proves the §5.1 gate
+    # (residual_secrets / verify_scrubbed) now sees quoted spans. Here we confirm
+    # scrub removes it so the gate ACCEPTS the genuinely-scrubbed snapshot.
+    from membench.scrub import default_policy, scrub_snapshot, verify_scrubbed
+
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "01.md").write_text(
+        'config: password="correct horse battery staple"\n', encoding="utf-8"
+    )
+    dest = tmp_path / "snap"
+    freeze_snapshot(src, dest, allow_public=True)
+    policy = default_policy()
+    scrub_snapshot(dest, policy, allow_public=True)
+    # The scrubbed bytes no longer carry the passphrase, and the gate accepts.
+    body = (dest / "corpus" / "01.md").read_text(encoding="utf-8")
+    assert "horse battery staple" not in body
+    verify_scrubbed(dest, policy)
+
+
+def test_scrub_text_redacts_anthropic_sk_ant_key():
+    # Confirm the existing sk- pattern covers sk-ant-api03- (fix 6 verification).
+    text = f"ANTHROPIC_API_KEY env holds {FAKE_ANT_KEY} for the run."
+    scrubbed, spans = scrub_text("a.md", text, ScrubPolicy())
+    assert FAKE_ANT_KEY not in scrubbed
+    assert REDACTED_KEY in scrubbed
+    assert "key" in {s.kind for s in spans}
+
+
+def test_assignment_does_not_overmatch_short_or_placeholder_values():
+    # A boolean-ish or short value must NOT be redacted (avoids corpus corruption).
+    text = "token: true\npassword=\nsecret=ab\n"
+    scrubbed, _ = scrub_text("p.md", text, ScrubPolicy())
+    assert scrubbed == text  # nothing matched -> bytes unchanged
+
+
+def test_new_patterns_are_idempotent_under_rescan():
+    # A genuinely scrubbed tree must yield ZERO residual hits on re-scan, so the
+    # sentinels themselves must not re-match (else verify_scrubbed would fail).
+    text = (
+        f"key:\n{FAKE_PEM}\n"
+        f"jwt {FAKE_JWT}\n"
+        'password="hunter2secret"\n'
+    )
+    scrubbed, _ = scrub_text("m.md", text, ScrubPolicy())
+    rescrubbed, spans = scrub_text("m.md", scrubbed, ScrubPolicy())
+    assert rescrubbed == scrubbed  # no further redaction
+    assert spans == []  # no residual secret detected in the scrubbed bytes
 
 
 def _make_snapshot(tmp_path, extra_text=PLANTED):
@@ -190,6 +386,38 @@ def test_verify_name_only_caught_via_persisted_keys(tmp_path):
     with pytest.raises(ScrubGateError) as exc:
         verify_scrubbed(dest)  # default policy, name dimension from private keys
     assert "re-scan" in str(exc.value)  # caught by the residual re-scan, not a hash
+
+
+def test_load_spans_rejects_malformed_json_line(tmp_path):
+    # Fix 3: a malformed-JSON line in scrub_spans.jsonl must raise ScrubGateError
+    # (caught by corpus._enforce_scrub_gate), NOT a raw json.JSONDecodeError that
+    # escapes the gate. json.loads is now INSIDE the try.
+    from membench.scrub import _load_spans
+
+    dest = _make_snapshot(tmp_path)
+    (dest / "scrub_spans.jsonl").write_text(
+        "{not valid json at all\n", encoding="utf-8"
+    )
+    with pytest.raises(ScrubGateError) as exc:
+        _load_spans(dest)
+    assert "malformed scrub span" in str(exc.value)
+    # The raw line bytes must NOT be echoed (redaction).
+    assert "not valid json at all" not in str(exc.value)
+
+
+def test_load_spans_rejects_non_dict_line(tmp_path):
+    # Fix 3: a VALID-but-non-dict JSON line (e.g. a JSON array) makes d["doc_id"]
+    # raise TypeError, which the bare `except KeyError` missed and which escaped
+    # the gate as a raw TypeError. It must now raise ScrubGateError.
+    from membench.scrub import _load_spans
+
+    dest = _make_snapshot(tmp_path)
+    (dest / "scrub_spans.jsonl").write_text(
+        '["doc", "kind", 0, 5, "x"]\n', encoding="utf-8"
+    )
+    with pytest.raises(ScrubGateError) as exc:
+        _load_spans(dest)
+    assert "malformed scrub span" in str(exc.value)
 
 
 def test_verify_rejects_scrubbed_true_without_hash(tmp_path):

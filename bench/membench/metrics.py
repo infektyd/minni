@@ -80,6 +80,27 @@ REQUIRED_SCORE_FIELDS: tuple[str, ...] = (
     "false_refusal_rate",
 )
 
+# DETERMINISM STRIP FOOTGUN GUARD (§3.2 / §9.1, fix 7). ``strip_excluded_fields``
+# drops timing field NAMES recursively at EVERY nesting level. If a future score
+# were ever nested under a key that COLLIDES with a stripped timing name (e.g. a
+# bootstrap CI block carrying its own ``p50``/``p95``, or a score literally named
+# ``wall_clock_ms``), the recursive strip would silently erase it and the
+# determinism gate would pass vacuously over a record missing a real score.
+# Make that collision a LOAD-TIME failure: the score-field names MUST be disjoint
+# from the strip set. This is the assertion the task mandates ("score-field names
+# are disjoint from DETERMINISM_EXCLUDED_FIELDS") generalised to the full strip
+# set the recursive walk actually uses.
+_SCORE_STRIP_COLLISION = set(REQUIRED_SCORE_FIELDS) & DETERMINISM_STRIP_FIELDS
+if _SCORE_STRIP_COLLISION:
+    raise AssertionError(
+        "DETERMINISM strip footgun (§3.2/§9.1): score field name(s) "
+        f"{sorted(_SCORE_STRIP_COLLISION)} collide with the recursively-stripped "
+        "timing fields DETERMINISM_STRIP_FIELDS — strip_excluded_fields would "
+        "silently erase a real score at some nesting level. Rename the score or "
+        "scope the strip; the two name sets MUST be disjoint."
+    )
+del _SCORE_STRIP_COLLISION
+
 
 # ---------------------------------------------------------------------------
 # Per-query primitives (§6.1 – §6.4). Each is a pure function with a single,

@@ -6,8 +6,12 @@ stores is *"no embedding cliff, no provider lock-in"* — i.e. LEXICAL / file-ba
 search over real files. This adapter reconstructs exactly that: the frozen corpus
 treated as on-disk markdown files, answered by **BM25 lexical retrieval** (Okapi
 BM25 via ``rank_bm25``) over WHOLE files. No embeddings (this archetype is
-lexical, matching how people actually search an Obsidian vault). No governance,
-so it never refuses (§6.5).
+lexical, matching how people actually search an Obsidian vault). No governance —
+but it DOES honestly refuse when its lexical search finds ZERO matching notes
+(threshold refusal, fix 4 / §6.5): a query with no shared term against any note
+returns nothing AND ``refused=True``. This is the lexical analogue of "no result
+above the confidence floor", not a governance gate, and it makes correct-refusal
+an EARNABLE axis for this baseline rather than a Minni-only one.
 
 Why whole-file BM25 (not chunked): an Obsidian user greps/searches files and
 opens the matching NOTE, not a sub-window. Scoring at the file granularity is
@@ -100,7 +104,10 @@ class MarkdownGrepAdapter:
             raise PreIngestError("query() before ingest()")
         start = time.perf_counter()
 
+        from .. import config
+
         ranked: list[RankedDoc] = []
+        n_hits = 0
         if self._bm25 is not None:
             qtokens = _tokenize(q)
             scores = self._bm25.get_scores(qtokens)
@@ -112,16 +119,33 @@ class MarkdownGrepAdapter:
                 for i, s in enumerate(scores)
                 if s > 0.0
             ]
+            n_hits = len(hits)
             hits.sort(key=lambda h: (-h[1], h[0]))
             ranked = [
                 RankedDoc(doc_id=d, score=s) for d, s in hits[: budget.max_docs]
             ]
 
+        # THRESHOLD REFUSAL (§6.5, fix 4): an Obsidian-style lexical searcher that
+        # finds ZERO matching notes (no shared term with ANY doc, < the pinned
+        # ``config.LEXICAL_REFUSAL_MIN_HITS``) HONESTLY surfaces nothing — it
+        # returns an empty ranked list AND refused=True (both fields, §6.5). This
+        # is the lexical analogue of "no hit above the confidence floor", NOT
+        # governance, and it makes correct-refusal earnable for this baseline too.
+        # Any query that lexically matches a note is answered, so positives (which
+        # the synthetic fixture builds to be lexically findable) never false-refuse.
+        if n_hits < config.LEXICAL_REFUSAL_MIN_HITS:
+            elapsed_ms = (time.perf_counter() - start) * 1000.0
+            return QueryResult(
+                ranked_results=[],
+                context_string="",
+                wall_clock_ms=elapsed_ms,
+                refused=True,
+            )
+
         context = _shared.build_context(
             [rd.doc_id for rd in ranked], self._docs, budget
         )
         elapsed_ms = (time.perf_counter() - start) * 1000.0
-        # No governance -> never an explicit refusal (§6.5).
         return QueryResult(
             ranked_results=ranked,
             context_string=context,

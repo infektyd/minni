@@ -76,8 +76,18 @@ def test_query_result_well_formed_and_within_budget(adapter_factory, corpus, bud
         assert_well_formed(result, corpus, budget)
         # Harness-owned budget: context never exceeds the cap.
         assert tokenizer.count_tokens(result.context_string) <= budget.max_tokens
-        # None of these adapters has a governance mechanism -> never refuses (§6.5).
-        assert result.refused is False
+        # REFUSAL CONTRACT (§6.5, fix 5): naive_rag / markdown_grep can now
+        # THRESHOLD-REFUSE (top score below tau / zero lexical hits), so we no
+        # longer bake in "never refuses". The contract is: refused may be True
+        # ONLY when there is nothing to return (ranked_results == []). For the
+        # matching query _Q the threshold should NOT fire (so we expect a normal
+        # answered result), but the assertion must not assume that — it only
+        # enforces the refused<->empty invariant.
+        if result.refused:
+            assert result.ranked_results == [], (
+                "refused=True must imply an empty ranked_results (§6.5 refusal "
+                "contract) — a refusal cannot also return ranked docs."
+            )
     finally:
         adapter.teardown()
 
@@ -172,6 +182,34 @@ def test_teardown_then_ingest_raises(adapter_factory, corpus):
         adapter.ingest(corpus)
 
 
+def test_naive_rag_rank_candidates_before_ingest_raises(budget):
+    """Fix 7: rank_candidates() before ingest() must raise PreIngestError.
+
+    The §9.5 integrity cross-check calls rank_candidates() directly; its guard
+    paths were only happy-path tested. A pre-ingest call has no index to probe and
+    must refuse rather than return a misleading empty ranking.
+    """
+    adapter = NaiveRagAdapter()
+    try:
+        with pytest.raises(PreIngestError):
+            adapter.rank_candidates(_Q, budget.max_docs)
+    finally:
+        adapter.teardown()
+
+
+def test_naive_rag_rank_candidates_after_teardown_raises(corpus, budget):
+    """Fix 7: rank_candidates() after teardown() must raise TeardownError.
+
+    The teardown contract is one-shot; the integrity-probe path must honour it too.
+    """
+    adapter = NaiveRagAdapter()
+    adapter.ingest(corpus)
+    adapter.rank_candidates(_Q, budget.max_docs)  # happy path while live
+    adapter.teardown()
+    with pytest.raises(TeardownError):
+        adapter.rank_candidates(_Q, budget.max_docs)
+
+
 def test_ranked_scores_non_increasing(adapter_factory, corpus, budget):
     """ranked_results scores must be in NON-INCREASING order for a matching query.
 
@@ -232,9 +270,16 @@ def test_naive_rag_unique_uuid_cross_check(corpus, budget):
     try:
         report = adapter.ingest(corpus)
         assert report.doc_count == len(corpus.doc_ids())
-        # Query for the unique UUID string present in exactly ONE fixture doc.
-        result = adapter.query(config.FIXTURE_UNIQUE_UUID, budget)
-        retrieved = {d.doc_id for d in result.ranked_results}
+        # Probe the RAW pre-refusal retrieval ranking (rank_candidates), NOT the
+        # gated query() result. The over-count cross-check is an INGEST-integrity
+        # check ("did the adapter actually index the contents?"); it must be
+        # independent of the query-time threshold-refusal POLICY. A random UUID is
+        # an exact-token lookup that embeds poorly and legitimately falls under
+        # the cosine floor, so gating it through query() would conflate index
+        # integrity with refusal policy. rank_candidates surfaces what the index
+        # CAN retrieve regardless of the floor (§9.5).
+        ranked = adapter.rank_candidates(config.FIXTURE_UNIQUE_UUID, budget.max_docs)
+        retrieved = {d.doc_id for d in ranked}
         assert "03-teal-ledger.md" in retrieved, (
             "naive_rag must retrieve the doc containing the unique UUID — proving "
             "doc_count reflects actual indexed contents, not a hardcoded constant "
@@ -517,30 +562,37 @@ def test_llm_wiki_accepts_injected_custom_curator(corpus, budget):
 _NO_MATCH_Q = "zqxjvkwqbblfghmptnz xkcdfqzwbvm nomatchnonsensetoken"
 
 
-# Only the LEXICAL adapters have a true zero-hit path (BM25 score > 0.0 filter):
-# a nonsense query shares no term with any doc, so they surface nothing. naive_rag
-# is DENSE retrieval — nearest-neighbour always returns its top-k regardless of
-# similarity, so it has no empty path (asserting empty would be wrong). All four,
-# lexical or dense, must still NEVER refuse on a miss (§6.5).
-_LEXICAL_ZERO_HIT = {MarkdownGrepAdapter, LlmWikiAdapter}
+# THRESHOLD-REFUSAL adapters (fix 4, §6.5): naive_rag (cosine below
+# REFUSAL_SCORE_THRESHOLD) and markdown_grep (zero lexical hits) now HONESTLY
+# refuse on a CLEAR non-match — empty ranked list AND refused=True. This makes
+# correct-refusal an EARNABLE axis for ungoverned baselines, not Minni-only.
+_THRESHOLD_REFUSERS = {NaiveRagAdapter, MarkdownGrepAdapter}
+# llm_wiki has NO threshold refusal (lexical BM25 over curated pages, no floor);
+# it returns an empty, NON-refused result on a true miss. native_platform stuffs
+# recent docs regardless of relevance and never refuses.
+_NON_REFUSING_ON_MISS = {LlmWikiAdapter, NativePlatformAdapter}
 
 
-def test_no_match_returns_empty_non_refused(adapter_factory, corpus, budget):
+def test_no_match_behaviour_per_adapter(adapter_factory, corpus, budget):
+    # A nonsense query shares no term / has no similar doc. Per fix 4:
+    #   * naive_rag + markdown_grep -> THRESHOLD REFUSAL (empty + refused=True);
+    #   * llm_wiki -> empty, NON-refused (no confidence floor wired);
+    #   * native_platform -> NON-refused (recency-stuffer, may still return docs).
     adapter = adapter_factory()
     try:
         adapter.ingest(corpus)
         result = adapter.query(_NO_MATCH_Q, budget)
-        # NOTE: ``adapter`` is an INSTANCE; ``_LEXICAL_ZERO_HIT`` holds CLASSES, so
-        # ``adapter in _LEXICAL_ZERO_HIT`` is always False (it was dead code that
-        # never executed the zero-hit assertions). Use isinstance so the empty-
-        # result assertions actually run for the lexical adapters (markdown_grep,
-        # llm_wiki). naive_rag is DENSE retrieval (nearest-neighbour always returns
-        # its top-k regardless of similarity), so it legitimately returns docs on a
-        # no-match query and is NOT asserted empty — only that it never refuses.
-        if isinstance(adapter, tuple(_LEXICAL_ZERO_HIT)):
-            assert result.ranked_results == [], "no-match must surface zero hits"
-            assert result.context_string == "", "no-match must yield empty context"
-        assert result.refused is False, "a retrieval miss is never a refusal (§6.5)"
+        if isinstance(adapter, tuple(_THRESHOLD_REFUSERS)):
+            assert result.ranked_results == [], "clear non-match must surface zero hits"
+            assert result.context_string == "", "clear non-match must yield empty context"
+            assert result.refused is True, (
+                "threshold-refusal: a clear non-match is an honest refusal (fix 4, §6.5)"
+            )
+        else:
+            assert isinstance(adapter, tuple(_NON_REFUSING_ON_MISS))
+            assert result.refused is False, "no confidence floor -> a miss is not a refusal"
+            if isinstance(adapter, LlmWikiAdapter):
+                assert result.ranked_results == [], "llm_wiki: lexical miss surfaces nothing"
     finally:
         adapter.teardown()
 

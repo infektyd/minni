@@ -18,12 +18,15 @@ from membench.judge import (
 )
 from membench.layer2_prompt import build_agent_prompt, wrap_context
 from membench.runner_layer2 import (
+    AdapterLayer2Result,
+    TrialResult,
     _EpisodeCorpus,
     canonical_json,
     publish_layer2_results,
     results_to_dict,
     run_episode_trial,
     run_layer2,
+    significance_block,
 )
 from membench.tokenizer import count_tokens
 
@@ -169,18 +172,25 @@ def test_run_layer2_correctness_and_zero_variance_for_deterministic_stub(episode
     stub = results["stub"].block()
     blind = results["blind"].block()
 
-    # N actually varied: one observation per trial per episode.
+    # N actually varied: one observation per trial per episode (raw flattened).
     assert stub["n_observations"] == n_obs
-    assert stub["task_success"]["n"] == n_obs
+    assert stub["flattened_observations"]["task_success"]["n"] == n_obs
 
     # The lexical StubAdapter retrieves the fact for every fixture episode ->
-    # task success is 1.0 everywhere, so the overall task-success variance is 0.
-    assert stub["task_success"]["mean"] == 1.0
-    assert stub["task_success"]["variance"] == 0.0
-    assert stub["answer_correctness"]["variance"] == 0.0
-    # The blind adapter never returns the fact -> 0 success, 0 variance.
-    assert blind["task_success"]["mean"] == 0.0
-    assert blind["task_success"]["variance"] == 0.0
+    # task success is 1.0 everywhere. Per-episode-aggregated point == 1.0, with
+    # BOTH between-trial reliability AND per-episode dispersion at 0 (fix 2).
+    assert stub["task_success"]["point"] == 1.0
+    assert stub["task_success"]["per_episode_dispersion"]["variance"] == 0.0
+    assert (
+        stub["task_success"]["between_trial_reliability"][
+            "mean_within_episode_variance"
+        ]
+        == 0.0
+    )
+    assert stub["answer_correctness"]["per_episode_dispersion"]["variance"] == 0.0
+    # The blind adapter never returns the fact -> 0 success, 0 dispersion.
+    assert blind["task_success"]["point"] == 0.0
+    assert blind["task_success"]["per_episode_dispersion"]["variance"] == 0.0
 
     # Deterministic stubs -> the N TRIALS OF A GIVEN EPISODE are identical
     # (non-flaky). The OVERALL tokens_to_model variance is non-zero only because
@@ -194,7 +204,7 @@ def test_run_layer2_correctness_and_zero_variance_for_deterministic_stub(episode
         assert len(set(ttms)) == 1, f"episode {ep_id} flaky across trials"
 
     # tokens-to-model counted and within budget.
-    assert stub["tokens_to_model"]["mean"] > 0
+    assert stub["tokens_to_model"]["point"] > 0
     for t in results["stub"].trials:
         assert t.tokens_to_model <= config.DEFAULT_MAX_TOKENS
 
@@ -207,15 +217,115 @@ def test_variance_is_nonzero_when_trials_actually_differ(episodes):
         adapters, episodes, StubAgent(), StubJudge(), n_trials=config.N,
         fixed_nonce=_FIXED_NONCE,
     )
-    block = results["seeded_flaky"].block()
-    succ = [float(t.success) for t in results["seeded_flaky"].trials]
-    # Hand-compute population variance and compare to the runner's aggregate.
-    mean = sum(succ) / len(succ)
-    expected_var = sum((v - mean) ** 2 for v in succ) / len(succ)
-    assert block["task_success"]["variance"] == pytest.approx(expected_var)
-    # The fixture set must produce at least one hit AND one miss for variance>0.
-    assert 0.0 < block["task_success"]["mean"] < 1.0
-    assert block["task_success"]["variance"] > 0.0
+    res = results["seeded_flaky"]
+    block = res.block()
+    # Hand-compute the per-episode aggregation (fix 2) and compare to the block.
+    per_ep = res.per_episode_success_rates()  # {episode: mean over N trials}
+    ep_means = [per_ep[e] for e in sorted(per_ep)]
+    point = sum(ep_means) / len(ep_means)
+    disp = sum((m - point) ** 2 for m in ep_means) / len(ep_means)
+    assert block["task_success"]["point"] == pytest.approx(point)
+    assert block["task_success"]["per_episode_dispersion"]["variance"] == pytest.approx(disp)
+    # The raw flattened variance is reported SEPARATELY and explicitly labeled.
+    succ = [float(t.success) for t in res.trials]
+    flat_mean = sum(succ) / len(succ)
+    flat_var = sum((v - flat_mean) ** 2 for v in succ) / len(succ)
+    assert block["flattened_observations"]["task_success"]["variance"] == pytest.approx(flat_var)
+    # The flaky adapter hits AND misses -> between-trial reliability is NON-zero
+    # (trials within an episode actually differ), which is the variance the OLD
+    # code mislabeled as "across trials" — now correctly its OWN field (fix 2).
+    assert block["task_success"]["between_trial_reliability"]["mean_within_episode_variance"] > 0.0
+    assert 0.0 < block["task_success"]["point"] < 1.0
+
+
+def _trial(adapter, ep, trial, success):
+    # Minimal hand-crafted TrialResult; only adapter/episode/trial/success/correct
+    # matter for the per-episode aggregation under test.
+    return TrialResult(
+        adapter=adapter, episode_id=ep, trial=trial, correct=success,
+        success=success, tokens_to_model=10, ctx_tokens=5, wall_clock_ms=0.1,
+        answer="x",
+    )
+
+
+def test_per_episode_rates_are_per_episode_under_uneven_trial_counts():
+    # Review fix 8: per_episode_success_rates() must aggregate PER EPISODE, not
+    # flatten — and be correct even if episodes carry DIFFERENT trial counts.
+    # ep1 has 2 trials (1 hit, 1 miss -> 0.5); ep2 has 3 trials (all hit -> 1.0).
+    # A flattened mean would be 3/5 = 0.6 and is WRONG as a per-episode statistic.
+    trials = [
+        _trial("a", "ep1", 0, 1),
+        _trial("a", "ep1", 1, 0),
+        _trial("a", "ep2", 0, 1),
+        _trial("a", "ep2", 1, 1),
+        _trial("a", "ep2", 2, 1),
+    ]
+    res = AdapterLayer2Result(adapter="a", n_trials=3, n_episodes=2, trials=trials)
+    rates = res.per_episode_success_rates()
+    assert rates == {"ep1": pytest.approx(0.5), "ep2": pytest.approx(1.0)}
+    # The headline point is the mean OF the per-episode means (each episode weighted
+    # equally regardless of its trial count): (0.5 + 1.0) / 2 = 0.75, NOT 0.6.
+    block = res.block()
+    assert block["task_success"]["point"] == pytest.approx(0.75)
+    # ep1's two differing trials -> nonzero within-episode (between-trial) variance.
+    assert block["task_success"]["between_trial_reliability"][
+        "mean_within_episode_variance"
+    ] > 0.0
+    # Review fix: uneven trial counts must be VISIBLE in the artifact, not hidden
+    # behind the first sorted episode's scalar. {min,max} exposes ep1=2, ep2=3.
+    assert block["task_success"]["n_trials_per_episode"] == {"min": 2, "max": 3}
+
+
+def test_significance_block_end_to_end_winner_is_correct():
+    # Review fix 5: the existing runner tests only assert the significance block's
+    # KEYS exist. This drives the FULL wiring — per_episode_success_rates ->
+    # significance_block -> pairwise content — with a KNOWN difference, and asserts
+    # winner / significant / n_episodes / means, not just key presence.
+    # "good" succeeds on every trial of 8 episodes; "bad" fails on every one.
+    good = [_trial("good", f"ep{e}", t, 1) for e in range(8) for t in range(3)]
+    bad = [_trial("bad", f"ep{e}", t, 0) for e in range(8) for t in range(3)]
+    results = {
+        "good": AdapterLayer2Result("good", 3, 8, good),
+        "bad": AdapterLayer2Result("bad", 3, 8, bad),
+    }
+    block = significance_block(results, q=0.05)
+    assert block["test"].startswith("wilcoxon")
+    pairwise = block["pairwise"]
+    assert len(pairwise) == 1
+    p = pairwise[0]
+    assert {p["adapter_a"], p["adapter_b"]} == {"good", "bad"}
+    assert p["n_episodes"] == 8
+    assert p["winner"] == "good"
+    assert p["significant"] is True
+    # Review fix: ground the p-value end-to-end, not just "significant is True".
+    # 8 episodes, every per-episode diff = (1.0 - 0.0) = +1.0 -> all same sign,
+    # so the exact two-sided Wilcoxon p is 2/2**8 = 0.0078125. With a single
+    # comparison in the family, BH-FDR leaves p_adjusted == p_value.
+    assert p["p_value"] == pytest.approx(2 / 2 ** 8)
+    assert p["p_adjusted"] == pytest.approx(2 / 2 ** 8)
+    # Means are the per-episode success rates (good=1.0, bad=0.0).
+    means = {p["adapter_a"]: p["mean_a"], p["adapter_b"]: p["mean_b"]}
+    assert means["good"] == pytest.approx(1.0)
+    assert means["bad"] == pytest.approx(0.0)
+    # CIs are reported per adapter.
+    assert block["task_success_ci95"]["good"]["mean"] == pytest.approx(1.0)
+    assert block["task_success_ci95"]["bad"]["mean"] == pytest.approx(0.0)
+
+
+def test_significance_block_tie_yields_no_winner():
+    # Symmetric negative: two adapters tied on every episode -> not significant,
+    # empty winner, p_value 1.0. Proves the wiring does not fabricate a winner.
+    a = [_trial("a", f"ep{e}", t, 1) for e in range(5) for t in range(2)]
+    b = [_trial("b", f"ep{e}", t, 1) for e in range(5) for t in range(2)]
+    results = {
+        "a": AdapterLayer2Result("a", 2, 5, a),
+        "b": AdapterLayer2Result("b", 2, 5, b),
+    }
+    p = significance_block(results)["pairwise"][0]
+    assert p["n_episodes"] == 5
+    assert p["significant"] is False
+    assert p["winner"] == ""
+    assert p["p_value"] == 1.0
 
 
 def test_run_layer2_is_reproducible(episodes):
@@ -264,8 +374,8 @@ def test_ctx_tokens_counted_for_nonempty_context(episodes):
         assert t.ctx_tokens < t.tokens_to_model  # context-only < full prompt
     for t in results["blind"].trials:
         assert t.ctx_tokens == 0
-    assert results["stub"].block()["ctx_tokens"]["mean"] > 0
-    assert results["blind"].block()["ctx_tokens"]["mean"] == 0.0
+    assert results["stub"].block()["ctx_tokens"]["point"] > 0
+    assert results["blind"].block()["ctx_tokens"]["point"] == 0.0
 
 
 # ── §9.5 abort: adapter ingest doc_count must match the corpus ───────────────
@@ -467,7 +577,10 @@ def test_publish_succeeds_on_passing_calibration_gate(episodes):
     human, judge = load_paired_judgments(judge_gate_fixture_path("n40.jsonl"))
     d = publish_layer2_results(results, human, judge)
     assert d["n_trials"] == 2
-    assert d["adapters"]["stub"]["task_success"]["mean"] == 1.0
+    assert d["adapters"]["stub"]["task_success"]["point"] == 1.0
+    # The pre-registered significance block is present (§6.9, fix 3).
+    assert d["significance"]["test"].startswith("wilcoxon")
+    assert "stub" in d["significance"]["task_success_ci95"]
 
 
 def test_results_to_dict_rejects_unpassed_calibration(episodes):
@@ -519,11 +632,33 @@ def test_episode_corpus_is_multi_session(episodes):
 # ── NO real LLM / network call reachable in any offline run ──────────────────
 def test_real_agent_never_invoked_offline(monkeypatch):
     # Forbid the real client path: the LLMAgent must not make a network call.
-    # No agent API key in the environment -> answer() raises before any call.
+    # The s5 stub deliberately does NOT resolve the key (review fix: no plaintext
+    # key in the exception frame), so it raises NotImplementedError before any
+    # network client could be reached — the live path is simply not wired.
     monkeypatch.delenv(config.CREDENTIAL_ENV_VARS["agent_api_key"], raising=False)
     agent = LLMAgent()
-    with pytest.raises(RuntimeError, match="API key env var"):
+    with pytest.raises(NotImplementedError):
         agent.answer("ctx", "q", gold_fact="x")
+
+
+def test_real_agent_stub_does_not_resolve_key_into_a_local(monkeypatch):
+    # SECURITY regression guard (review fix): the s5 LLMAgent stub must not call
+    # _resolve_key() — a resolved key bound to a frame local would leak into any
+    # exception-capturing logger at the NotImplementedError. Spy on _resolve_key
+    # and assert it is never invoked on the offline stub path.
+    monkeypatch.setenv(config.CREDENTIAL_ENV_VARS["agent_api_key"], "sk-fake")
+    agent = LLMAgent()
+    called = {"n": 0}
+    orig = agent._resolve_key
+
+    def spy():
+        called["n"] += 1
+        return orig()
+
+    monkeypatch.setattr(agent, "_resolve_key", spy)
+    with pytest.raises(NotImplementedError):
+        agent.answer("ctx", "q", gold_fact="x")
+    assert called["n"] == 0, "stub must not resolve the API key (leak risk)"
 
 
 def test_real_agent_with_key_still_does_not_call_network(monkeypatch):
@@ -536,10 +671,33 @@ def test_real_agent_with_key_still_does_not_call_network(monkeypatch):
 
 
 def test_real_judge_never_invoked_offline(monkeypatch):
+    # The live judge path is unimplemented in s5 — it raises NotImplementedError
+    # before any network call, regardless of whether a key is present. (It no
+    # longer resolves the key in the stub path; see the security guard below.)
     monkeypatch.delenv(config.CREDENTIAL_ENV_VARS["judge_api_key"], raising=False)
     judge = LLMJudge()
-    with pytest.raises(RuntimeError, match="API key env var"):
+    with pytest.raises(NotImplementedError):
         judge.score("answer", "gold")
+
+
+def test_real_judge_stub_does_not_resolve_key_into_a_local(monkeypatch):
+    # SECURITY regression guard (review fix): the s5 LLMJudge stub must not call
+    # _resolve_key() — a resolved key bound to a frame local would leak into any
+    # exception-capturing logger at the NotImplementedError. Mirrors the agent
+    # guard above. Spy on _resolve_key and assert it is never invoked offline.
+    monkeypatch.setenv(config.CREDENTIAL_ENV_VARS["judge_api_key"], "sk-fake")
+    judge = LLMJudge()
+    called = {"n": 0}
+    orig = judge._resolve_key
+
+    def spy():
+        called["n"] += 1
+        return orig()
+
+    monkeypatch.setattr(judge, "_resolve_key", spy)
+    with pytest.raises(NotImplementedError):
+        judge.score("answer", "gold")
+    assert called["n"] == 0, "judge stub must not resolve the API key (leak risk)"
 
 
 def test_real_judge_with_key_still_does_not_call_network(monkeypatch):
@@ -575,5 +733,64 @@ def test_max_api_calls_guard_on_real_judge(monkeypatch):
     # key present but max_api_calls=0, the judge aborts before any network call.
     monkeypatch.setenv(config.CREDENTIAL_ENV_VARS["judge_api_key"], "sk-fake")
     judge = LLMJudge(max_api_calls=0)
+    with pytest.raises(RuntimeError, match="MAX_API_CALLS"):
+        judge.score("a", "g")
+
+
+# ── Process-global API cap: N instances SHARE one budget (fix 5, §7.15) ──────
+def test_two_agents_share_one_process_global_api_budget(monkeypatch):
+    # Two LLMAgent instances must NOT each get their own MAX_API_CALLS budget — a
+    # per-instance counter (the bug) would let N agents make N*cap calls. With the
+    # process-global counter, a cap of 1 is consumed by the FIRST agent's call and
+    # the SECOND agent is refused immediately (its call would be the 2nd globally).
+    from membench import agent as agent_mod
+
+    agent_mod._reset_api_calls()
+    monkeypatch.setenv(config.CREDENTIAL_ENV_VARS["agent_api_key"], "sk-fake")
+    a1 = LLMAgent(max_api_calls=1)
+    a2 = LLMAgent(max_api_calls=1)
+    # a1's first call reserves the single global slot, then hits the unimplemented
+    # live path (NotImplementedError) — the slot is consumed regardless.
+    with pytest.raises(NotImplementedError):
+        a1.answer("ctx", "q", gold_fact="x")
+    # a2 shares the SAME global counter: its call would be the 2nd, over cap=1, so
+    # it aborts on the API-cost guard BEFORE reaching the live path.
+    with pytest.raises(RuntimeError, match="MAX_API_CALLS"):
+        a2.answer("ctx", "q", gold_fact="x")
+
+
+def test_two_judges_share_one_process_global_api_budget(monkeypatch):
+    # Symmetric proof for the judge: a single global slot is consumed by judge #1,
+    # so judge #2 is refused — the cap is NOT per-instance (fix 5, §7.15).
+    from membench import judge as judge_mod
+
+    judge_mod._reset_api_calls()
+    monkeypatch.setenv(config.CREDENTIAL_ENV_VARS["judge_api_key"], "sk-fake")
+    j1 = LLMJudge(max_api_calls=1)
+    j2 = LLMJudge(max_api_calls=1)
+    with pytest.raises(NotImplementedError):
+        j1.score("a", "g")
+    with pytest.raises(RuntimeError, match="MAX_API_CALLS"):
+        j2.score("a", "g")
+
+
+def test_agent_and_judge_share_one_cumulative_budget(monkeypatch):
+    # Review fix 4: MAX_API_CALLS is a CUMULATIVE cap across ALL roles, not a
+    # per-role one. The agent and the judge reserve against the SAME shared
+    # counter (membench.api_budget). With a cap of 1, the agent's single call
+    # consumes the only slot, so the JUDGE's call is refused — proving the agent
+    # and judge do NOT each get their own MAX_API_CALLS budget.
+    from membench import api_budget
+
+    api_budget.reset()
+    monkeypatch.setenv(config.CREDENTIAL_ENV_VARS["agent_api_key"], "sk-fake")
+    monkeypatch.setenv(config.CREDENTIAL_ENV_VARS["judge_api_key"], "sk-fake")
+    agent = LLMAgent(max_api_calls=1)
+    judge = LLMJudge(max_api_calls=1)
+    # Agent consumes the one shared slot (then hits the unimplemented live path).
+    with pytest.raises(NotImplementedError):
+        agent.answer("ctx", "q", gold_fact="x")
+    assert api_budget.calls_made() == 1
+    # Judge shares the SAME counter — the 2nd call is over the cumulative cap.
     with pytest.raises(RuntimeError, match="MAX_API_CALLS"):
         judge.score("a", "g")

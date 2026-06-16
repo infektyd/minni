@@ -36,6 +36,26 @@ from .tokenizer import count_tokens
 IDK = "I don't know"
 
 
+# ── SHARED cumulative API-call budget (§7.15, review fix 4) ──────────────────
+# MAX_API_CALLS is a PROCESS-WIDE cap on CUMULATIVE LLM calls across ALL roles —
+# agent + judge + llm_wiki curation. A per-role counter (the old bug) let the run
+# make up to 3*MAX_API_CALLS calls before any single counter aborted. The agent
+# now reserves against the ONE shared counter in membench.api_budget, so the cap
+# is a true combined ceiling. These thin wrappers preserve the module-local names
+# the tests already use; both delegate to the shared budget.
+from . import api_budget
+
+
+def _reserve_api_call(max_api_calls: int) -> None:
+    """Reserve one call on the SHARED cumulative budget (delegates, fix 4)."""
+    api_budget.reserve(max_api_calls, role="agent")
+
+
+def _reset_api_calls() -> None:
+    """Reset the SHARED cumulative call counter (test-only helper)."""
+    api_budget.reset()
+
+
 @dataclass(frozen=True)
 class AgentResult:
     """One agent turn's output (§3.3)."""
@@ -116,7 +136,6 @@ class LLMAgent:
         self.max_api_calls = (
             config.MAX_API_CALLS if max_api_calls is None else max_api_calls
         )
-        self._calls = 0
 
     def _resolve_key(self) -> str:
         env_name = config.CREDENTIAL_ENV_VARS["agent_api_key"]
@@ -131,19 +150,19 @@ class LLMAgent:
     def answer(
         self, context: str, question: str, *, gold_fact: str, nonce: str | None = None
     ) -> AgentResult:
-        if self._calls >= self.max_api_calls:
-            raise RuntimeError(
-                f"MAX_API_CALLS={self.max_api_calls} reached — aborting run "
-                "(API-cost guard, §7.15)."
-            )
-        key = self._resolve_key()
-        system, user = build_agent_prompt(context, question, nonce=nonce)
-        tokens = count_tokens(system) + count_tokens(user)
-        self._calls += 1
-        # Real Anthropic Messages API call would happen here, using `key`,
-        # config.AGENT_MODEL.model_id, `system` and `user`. Deliberately left
-        # unimplemented: this slice ships the OFFLINE path; the live call is wired
-        # in the run slice and is never reached by any test.
+        # Reserve a slot on the PROCESS-GLOBAL counter BEFORE building the prompt,
+        # so N agents sharing one budget cannot collectively exceed MAX_API_CALLS
+        # (the per-instance counter was the bug, §7.15).
+        _reserve_api_call(self.max_api_calls)
+        # SECURITY (review fix): do NOT bind the API key to a named local in this
+        # stub. ``_resolve_key()`` is deliberately NOT called here — it is
+        # meaningless without the real network call, and any error-reporting
+        # framework that captures locals on an exception (Sentry, cgitb, logging
+        # with exc_info) would otherwise expose the plaintext key from this frame
+        # at the NotImplementedError below. The key is resolved at call time ONLY
+        # in the real implementation, immediately before the Anthropic client call
+        # (wired in the run slice, never reached by any test).
+        build_agent_prompt(context, question, nonce=nonce)
         raise NotImplementedError(
             "LLMAgent.answer is the gated live path; not implemented in s5 "
             "(offline-only). Use StubAgent in tests."

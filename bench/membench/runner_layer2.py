@@ -134,7 +134,7 @@ def run_episode_trial(
 
 
 def _stats(values: list[float]) -> dict[str, float]:
-    """Mean, population variance, and stddev of a sample (variance across trials)."""
+    """Mean, population variance, and stddev of a sample."""
     n = len(values)
     if n == 0:
         return {"mean": 0.0, "variance": 0.0, "stddev": 0.0, "n": 0}
@@ -148,6 +148,99 @@ def _stats(values: list[float]) -> dict[str, float]:
     }
 
 
+def _group_by_episode(
+    trials: list[TrialResult], key
+) -> dict[str, list[float]]:
+    """Group a per-trial metric by episode id (sorted episode order).
+
+    ``key`` extracts the float metric from one ``TrialResult``. Returns
+    ``{episode_id: [trial_0_value, trial_1_value, ...]}`` for the per-episode
+    aggregation the §6.9 paired tests and the corrected variance reporting need
+    (fix 2). Deterministic: episodes are emitted in sorted id order downstream.
+    """
+    out: dict[str, list[float]] = {}
+    for t in trials:
+        out.setdefault(t.episode_id, []).append(float(key(t)))
+    return out
+
+
+def _per_episode_means(trials: list[TrialResult], key) -> dict[str, float]:
+    """Each episode's MEAN of ``key`` over its N trials (the §6.9 unit)."""
+    grouped = _group_by_episode(trials, key)
+    return {
+        ep: (sum(vals) / len(vals) if vals else 0.0)
+        for ep, vals in grouped.items()
+    }
+
+
+def _aggregated_stats(trials: list[TrialResult], key) -> dict:
+    """Correctly-labeled per-episode aggregation of a per-trial metric (fix 2).
+
+    The OLD code fed the FLATTENED (episode x trial) observations to ``_stats``
+    and mislabeled the result "variance across trials" — it actually conflated
+    between-trial noise WITH between-episode dispersion. This reports them
+    SEPARATELY and accurately:
+
+    - ``point`` — the headline value: the mean of the PER-EPISODE means (each
+      episode weighted equally regardless of trial count), with its 95% CI taken
+      over the per-episode means (the §6.7 / §6.9 reporting unit).
+    - ``between_trial_reliability`` — how REPRODUCIBLE a single episode's score is
+      across its N trials: the MEAN of the per-episode within-episode variances
+      (and the max, the worst episode). Near zero means trials are reliable.
+    - ``per_episode_dispersion`` — how much episodes DIFFER from each other: the
+      variance/stddev OF the per-episode means. This is the spread the CI is built
+      on; it is NOT trial noise and must not be conflated with it.
+    """
+    from .stats import task_success_ci
+
+    grouped = _group_by_episode(trials, key)  # {episode: [trial values]}
+    episodes = sorted(grouped)
+    per_ep_means = [sum(grouped[e]) / len(grouped[e]) for e in episodes]
+
+    # Between-trial reliability: within-episode variance, summarized across eps.
+    within_vars = [
+        (sum((v - (sum(grouped[e]) / len(grouped[e]))) ** 2 for v in grouped[e])
+         / len(grouped[e]))
+        for e in episodes
+    ]
+    mean_within = (sum(within_vars) / len(within_vars)) if within_vars else 0.0
+    max_within = max(within_vars) if within_vars else 0.0
+
+    # Per-episode dispersion: variance OF the per-episode means.
+    disp = _stats(per_ep_means)
+
+    ci = task_success_ci(per_ep_means)
+    # Per-episode trial counts as a {min, max} summary so UNEVEN counts are
+    # visible in the artifact (review fix: the old scalar reported only the first
+    # sorted episode's count, silently hiding unevenness).
+    trial_counts = [len(grouped[e]) for e in episodes]
+    return {
+        "point": disp["mean"],  # mean of per-episode means
+        "n_episodes": len(episodes),
+        "n_trials_per_episode": {
+            "min": min(trial_counts) if trial_counts else 0,
+            "max": max(trial_counts) if trial_counts else 0,
+        },
+        "ci95": {"low": ci.low, "high": ci.high, "n": ci.n},
+        "between_trial_reliability": {
+            "mean_within_episode_variance": mean_within,
+            "max_within_episode_variance": max_within,
+            "note": (
+                "within-episode variance ACROSS the N trials, summarized over "
+                "episodes — how reproducible one episode's score is (fix 2)."
+            ),
+        },
+        "per_episode_dispersion": {
+            "variance": disp["variance"],
+            "stddev": disp["stddev"],
+            "note": (
+                "variance OF the per-episode means — how episodes differ from "
+                "each other; NOT trial noise (fix 2)."
+            ),
+        },
+    }
+
+
 @dataclass
 class AdapterLayer2Result:
     """Per-adapter Layer-2 aggregate over N trials × all episodes (§3.3)."""
@@ -157,8 +250,29 @@ class AdapterLayer2Result:
     n_episodes: int
     trials: list[TrialResult] = field(default_factory=list)
 
+    def per_episode_success_rates(self) -> dict[str, float]:
+        """``{episode_id: mean success over its N trials}`` — the §6.9 unit (fix 2).
+
+        This per-episode aggregation is the paired-test substrate consumed by
+        ``membench.stats.compare_adapters_task_success`` (fix 3) and the basis for
+        the correctly-labeled variance reporting in ``block()`` (fix 2).
+        """
+        return _per_episode_means(self.trials, lambda t: t.success)
+
+    def per_episode_correctness_rates(self) -> dict[str, float]:
+        """``{episode_id: mean answer-correctness over its N trials}`` (fix 2)."""
+        return _per_episode_means(self.trials, lambda t: t.correct)
+
     def block(self) -> dict:
-        """Aggregate: correctness/task-success/tokens-to-model with variance."""
+        """Per-episode-aggregated correctness / task-success / tokens (fix 2).
+
+        Each metric is aggregated PER EPISODE first (mean over its N trials), then
+        reported with between-trial reliability and per-episode dispersion kept
+        SEPARATE and accurately labeled — never the old flattened "variance across
+        trials" that conflated the two. ``flattened_observations`` carries the raw
+        (episode x trial) means/variance for the token-sanity checks and is
+        EXPLICITLY named so its variance is never mistaken for trial reliability.
+        """
         correct = [float(t.correct) for t in self.trials]
         success = [float(t.success) for t in self.trials]
         ttm = [float(t.tokens_to_model) for t in self.trials]
@@ -168,10 +282,21 @@ class AdapterLayer2Result:
             "n_trials": self.n_trials,
             "n_episodes": self.n_episodes,
             "n_observations": len(self.trials),
-            "answer_correctness": _stats(correct),
-            "task_success": _stats(success),
-            "tokens_to_model": _stats(ttm),
-            "ctx_tokens": _stats(ctx),
+            # Correctly per-episode-aggregated (fix 2): reliability vs dispersion.
+            "answer_correctness": _aggregated_stats(self.trials, lambda t: t.correct),
+            "task_success": _aggregated_stats(self.trials, lambda t: t.success),
+            "tokens_to_model": _aggregated_stats(
+                self.trials, lambda t: t.tokens_to_model
+            ),
+            "ctx_tokens": _aggregated_stats(self.trials, lambda t: t.ctx_tokens),
+            # Raw flattened (episode x trial) observations — EXPLICITLY labeled so
+            # nothing here is mistaken for between-trial reliability (fix 2).
+            "flattened_observations": {
+                "answer_correctness": _stats(correct),
+                "task_success": _stats(success),
+                "tokens_to_model": _stats(ttm),
+                "ctx_tokens": _stats(ctx),
+            },
         }
 
 
@@ -288,6 +413,47 @@ def results_to_dict(
         "adapters": {
             name: res.block() for name, res in sorted(results.items())
         },
+        # Pre-registered comparison test (§6.9, fix 3): per-episode paired
+        # Wilcoxon + BH-FDR on OVERALL task success. This is the ONLY basis for an
+        # "A beats B" claim; the per-adapter means/CIs alone do NOT ground one.
+        "significance": significance_block(results),
+    }
+
+
+def significance_block(
+    results: dict[str, AdapterLayer2Result], *, q: float = 0.05
+) -> dict:
+    """Confirmatory pairwise significance on overall task success (§6.9, fix 3).
+
+    Builds the per-episode paired success-rate map from each adapter's trials
+    (fix 2 aggregation), runs the pre-registered Wilcoxon + Benjamini-Hochberg
+    FDR family (``membench.stats``), and returns a canonical, sorted block:
+    per-adapter 95% CIs plus every pairwise comparison with its raw and
+    BH-adjusted p, significance flag, and winner. Deterministic.
+    """
+    from .stats import (
+        compare_adapters_task_success,
+        comparison_to_dict,
+        task_success_ci,
+    )
+
+    per_episode = {
+        name: res.per_episode_success_rates()
+        for name, res in results.items()
+    }
+    comparisons = compare_adapters_task_success(per_episode, q=q)
+    cis = {}
+    for name in sorted(per_episode):
+        rates = [per_episode[name][e] for e in sorted(per_episode[name])]
+        ci = task_success_ci(rates)
+        cis[name] = {"mean": ci.mean, "low": ci.low, "high": ci.high, "n": ci.n}
+    return {
+        "q": q,
+        "unit": "per-episode mean success rate (paired by episode)",
+        "test": "wilcoxon signed-rank + benjamini-hochberg FDR",
+        "confirmatory_family": "overall task success",
+        "task_success_ci95": cis,
+        "pairwise": [comparison_to_dict(c) for c in comparisons],
     }
 
 

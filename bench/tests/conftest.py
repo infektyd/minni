@@ -36,3 +36,24 @@ def corpus():
 @pytest.fixture
 def budget():
     return TokenBudget(max_tokens=config.DEFAULT_MAX_TOKENS, max_docs=config.K)
+
+
+@pytest.fixture(autouse=True)
+def _reset_process_global_api_counters():
+    """Reset every process-global LLM call counter before AND after each test.
+
+    The agent/judge/llm_wiki API caps are PROCESS-GLOBAL (§7.15, fix 5): a stale
+    count from one test could otherwise trip another's guard or mask a real one.
+    Reset around every test so the global never leaks budget across cases.
+    """
+    from membench import agent as _agent
+    from membench import judge as _judge
+    from membench.adapters import llm_wiki as _llm_wiki
+
+    _agent._reset_api_calls()
+    _judge._reset_api_calls()
+    _llm_wiki._reset_api_calls()
+    yield
+    _agent._reset_api_calls()
+    _judge._reset_api_calls()
+    _llm_wiki._reset_api_calls()
