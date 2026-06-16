@@ -30,6 +30,25 @@ K: int = 10  # default top-k, pinned (§6)
 DEFAULT_MAX_TOKENS: int = 2048  # default TokenBudget.max_tokens (§3.1)
 # TokenBudget.max_docs defaults to K (§3.1: "max_docs == k by default").
 
+# ── Chunking knobs (s3 baseline adapters) ────────────────────────────────────
+# Fixed, documented chunking shared by every CHUNK-level adapter (naive_rag, and
+# any future semantic pass). Pinned HERE so chunking is a shared constant, never
+# a per-adapter knob a reviewer could call rigged. Word-based windows keep the
+# scheme tokenizer-agnostic and deterministic. Chunk vector-retrieval uses K
+# (above) at the CHUNK level, then collapses chunks -> whole-file doc-ids with
+# first-hit dedup (§3.1), so ranked_results still has <= K unique docs.
+CHUNK_SIZE_WORDS: int = 180  # words per chunk
+CHUNK_OVERLAP_WORDS: int = 40  # overlapping words between consecutive chunks
+# How many CHUNK hits a vector adapter inspects before collapsing to docs. Set
+# generously above K so that K distinct parent docs can still be recovered even
+# when the top chunks cluster in a few files (first-hit dedup, §3.1).
+CHUNK_RETRIEVE_K: int = 50
+
+# Deterministic ingest seed (§3.1: "Deterministic ingest (fixed seed, sorted
+# tie-breaks)"). Embedding models are deterministic in eval mode, but we pin a
+# seed for any library that consults global RNG state at load/encode time.
+INGEST_SEED: int = 1729
+
 # ── Layer-2 trial count (§3.3) ───────────────────────────────────────────────
 N: int = 5  # N trials per episode per adapter, pinned (§3.3)
 

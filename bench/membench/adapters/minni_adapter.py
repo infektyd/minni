@@ -41,6 +41,7 @@ from ..contract import (
     TeardownError,
     TokenBudget,
 )
+from . import _shared
 
 # Cap on bytes accepted from the daemon over the socket. A valid JSON-RPC
 # response in this protocol is kilobytes; 4 MB is far beyond that. Bounds memory
@@ -118,9 +119,16 @@ def _rpc(socket_path: Path, method: str, params: dict, timeout: float = 30.0) ->
                 break
     finally:
         s.close()
-    data = b"".join(chunks)
-    if not data:
+    buffer = b"".join(chunks)
+    if not buffer:
         raise MinniStandupError(f"empty response from daemon for {method!r}")
+    # The daemon speaks NEWLINE-DELIMITED JSON: one frame per line. A single
+    # recv() can deliver the first frame PLUS the leading bytes of a following
+    # frame (or trailing padding). Parsing the whole accumulated buffer would
+    # then fail with json "Extra data". Take ONLY the first frame (up to the
+    # first newline) and parse that.
+    nl = buffer.find(b"\n")
+    data = buffer[:nl] if nl != -1 else buffer
     try:
         resp = json.loads(data.decode("utf-8"))
     except json.JSONDecodeError as exc:
@@ -149,7 +157,12 @@ def _rpc(socket_path: Path, method: str, params: dict, timeout: float = 30.0) ->
         msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
         msg = _redact(str(msg))[:500]
         raise MinniStandupError(f"daemon error on {method!r}: {msg}")
-    return resp.get("result", {})
+    # A valid JSON-RPC response may carry an explicit `result: null`; `.get`
+    # with a default only fires when the KEY is absent, so use `or {}` to also
+    # coerce an explicit null to a dict. Downstream callers (query) do
+    # `result.get(...)`; a None here would raise a raw AttributeError that
+    # bypasses MinniStandupError handling (and the test's skip guard).
+    return resp.get("result") or {}
 
 
 class MinniAdapter:
@@ -164,6 +177,24 @@ class MinniAdapter:
         self._socket_path: Path | None = None
         self._corpus: FrozenCorpus | None = None
         self._torn_down = False
+
+    # -- introspection used by the fairness-conformance test --------------
+    # Minni IS a vector adapter and is the competitor being benchmarked, so it
+    # must be held to the SAME shared-embedder/k fairness control as naive_rag —
+    # not exempted by trust. These read the pinned config values (the same ids
+    # Minni's engine pins by construction), so the fairness test machine-asserts
+    # that Minni did not silently diverge onto a different embedder or k (§7.2/
+    # §7.3). Reading from config (not the live daemon) is intentional: the bench
+    # config is the single pinned source of truth every adapter is measured
+    # against; a future engine reconfig that moved off this id is exactly the
+    # divergence the test must catch (config stays the contract).
+    @property
+    def embedder_id(self) -> str:
+        return config.EMBEDDER_MODEL_ID
+
+    @property
+    def retrieval_k(self) -> int:
+        return config.K
 
     # -- isolated daemon lifecycle --------------------------------------
     def _spawn_daemon(self) -> None:
@@ -201,19 +232,21 @@ class MinniAdapter:
         # Guard passed — NOW it is safe to create directories under tmp_home.
         run_dir.mkdir(parents=True, exist_ok=True)
 
-        # Build a MINIMAL environment for the throwaway daemon. The full parent
-        # os.environ may carry credential env vars (e.g. MEMBENCH_AGENT_API_KEY,
-        # ANTHROPIC_API_KEY) the throwaway has no legitimate need for — passing
-        # them risks leaking secrets into the subprocess context (§7.14). We pass
-        # only the vars the daemon needs and never anything matching a known
-        # credential name.
+        # Build a MINIMAL environment for the throwaway daemon as a strict
+        # ALLOWLIST: only the handful of vars the daemon actually needs are
+        # passed through, and the env is otherwise built FROM SCRATCH (not copied
+        # from os.environ). The allowlist is the security property — because the
+        # daemon's known credential env-var names (config.CREDENTIAL_ENV_VARS,
+        # e.g. MEMBENCH_AGENT_API_KEY) are NOT in this list, they can never reach
+        # the subprocess (§7.14). There is deliberately no credential-name filter
+        # here: filtering an allowlist that already excludes creds would be dead
+        # code and a false 'we filter credentials' assurance. To keep the
+        # allowlist honest, assert it shares no name with a known credential.
         _PASSTHROUGH = ("PATH", "HOME", "LANG", "LC_ALL", "TMPDIR")
-        _credential_names = set(config.CREDENTIAL_ENV_VARS.values())
-        env = {
-            k: os.environ[k]
-            for k in _PASSTHROUGH
-            if k in os.environ and k not in _credential_names
-        }
+        assert not (set(_PASSTHROUGH) & set(config.CREDENTIAL_ENV_VARS.values())), (
+            "_PASSTHROUGH allowlist must never name a credential env var (§7.14)"
+        )
+        env = {k: os.environ[k] for k in _PASSTHROUGH if k in os.environ}
         env["MINNI_HOME"] = str(tmp_home)
         env["MINNI_VAULT_PATH"] = str(tmp_home / "vault")
         env["MINNI_DB_PATH"] = str(tmp_home / "minni.db")
@@ -317,22 +350,43 @@ class MinniAdapter:
         )
         elapsed_ms = (time.perf_counter() - start) * 1000.0
 
+        # `results` may be ABSENT, an explicit null, or (from a malformed daemon)
+        # a non-list. `.get("results", [])` only defaults on an ABSENT key, so an
+        # explicit `"results": null` would yield None and `for item in None` would
+        # raise a raw TypeError OUTSIDE the MinniStandupError path (bypassing the
+        # test's skip guard). Coerce null/absent to [] with `or []`, and reject any
+        # other non-list as a redacted MinniStandupError rather than crashing.
+        results = result.get("results") or []
+        if not isinstance(results, list):
+            detail = _redact(repr(results))[:200]
+            raise MinniStandupError(
+                f"daemon 'results' field is not a list for search: {detail}"
+            )
+
         valid_ids = set(self._corpus.doc_ids())
         ranked: list[RankedDoc] = []
         seen: set[str] = set()
-        parts: list[str] = []
-        for item in result.get("results", []):
+        doc_ids_in_order: list[str] = []
+        for item in results:
             doc_id = self._map_doc_id(item, valid_ids)
             if doc_id is None or doc_id in seen:
                 continue
             seen.add(doc_id)
             score = float(item.get("score", item.get("relevance", 0.0)) or 0.0)
             ranked.append(RankedDoc(doc_id=doc_id, score=score))
-            parts.append(self._corpus.read(doc_id).decode("utf-8", "replace").strip())
+            doc_ids_in_order.append(doc_id)
             if len(ranked) >= budget.max_docs:
                 break
 
-        context = "\n\n".join(parts)
+        # Build the context through the SHARED budget-trimming helper so the minni
+        # adapter is budget-SYMMETRIC with the other adapters (NIT-a): an
+        # over-budget context_string would otherwise trip the runner's authoritative
+        # budget ABORT and kill the whole run. Same harness tokenizer + trim rule.
+        bodies = {
+            d: self._corpus.read(d).decode("utf-8", "replace")
+            for d in doc_ids_in_order
+        }
+        context = _shared.build_context(doc_ids_in_order, bodies, budget)
         # §3.1: `refused` is True ONLY when the system EXPLICITLY declines (e.g.
         # Minni's gate refuses on insufficient provenance). Prefer an explicit
         # flag from the daemon if the search RPC exposes one; only then is a

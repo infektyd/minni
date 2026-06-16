@@ -106,6 +106,39 @@ def test_rpc_rejects_non_dict_json_response(monkeypatch, tmp_path):
     assert "non-dict" in str(exc.value)
 
 
+def test_rpc_parses_first_frame_with_trailing_bytes(monkeypatch, tmp_path):
+    """A single recv() delivering JSON + newline + trailing bytes must parse the
+    FIRST frame only (newline-delimited JSON), not choke on 'Extra data' (#7)."""
+    import membench.adapters.minni_adapter as mod
+
+    class _FakeSock:
+        def __init__(self, *a, **k):
+            self._sent = False
+
+        def settimeout(self, *_a):
+            pass
+
+        def connect(self, *_a):
+            pass
+
+        def sendall(self, *_a):
+            pass
+
+        def recv(self, _n):
+            if self._sent:
+                return b""
+            self._sent = True
+            # First frame + newline + leading bytes of a following frame.
+            return b'{"result": {"ok": 1}}\n{"result": {"next":'
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(mod.socket, "socket", lambda *a, **k: _FakeSock())
+    out = mod._rpc(tmp_path / "fake.sock", "ping", {})
+    assert out == {"ok": 1}
+
+
 def test_redact_covers_linux_ci_paths():
     """/home/, /opt/, /root/ absolute paths must be redacted (finding #6)."""
     from membench.adapters.minni_adapter import _redact
@@ -156,6 +189,67 @@ def test_spawn_daemon_env_pythonpath_is_engine_only(monkeypatch):
     assert env is not None
     assert env["PYTHONPATH"] == str(mod._ENGINE_DIR)
     assert "/evil/inject/path" not in env["PYTHONPATH"]
+
+
+def _prime_adapter_for_query(adapter, corpus, tmp_path):
+    """Put a fresh MinniAdapter into the post-ingest state WITHOUT a live daemon.
+
+    Sets the socket path + corpus so query() runs its result-parsing path; the
+    actual socket round-trip is monkeypatched out per-test via _rpc.
+    """
+    adapter._socket_path = tmp_path / "fake.sock"
+    adapter._corpus = corpus
+
+
+@pytest.mark.parametrize("bad_results", [None, {"not": "a list"}, 42, "str"])
+def test_query_handles_null_or_nonlist_results(monkeypatch, corpus, budget, tmp_path, bad_results):
+    """`results: null` must be coerced to [] (no TypeError); a non-list results
+    must raise a redacted MinniStandupError, never a raw TypeError (finding #3)."""
+    import membench.adapters.minni_adapter as mod
+
+    adapter = MinniAdapter()
+    _prime_adapter_for_query(adapter, corpus, tmp_path)
+    monkeypatch.setattr(mod, "_rpc", lambda *a, **k: {"results": bad_results})
+    try:
+        if bad_results is None:
+            # null -> [] -> empty, well-formed result (graceful skip, no crash).
+            result = adapter.query("anything", budget)
+            assert result.ranked_results == []
+            assert result.context_string == ""
+        else:
+            # A non-list results value raises MinniStandupError (not TypeError).
+            with pytest.raises(MinniStandupError):
+                adapter.query("anything", budget)
+    finally:
+        adapter._corpus = None  # avoid teardown touching anything real
+        adapter.teardown()
+
+
+def test_query_context_respects_budget(monkeypatch, corpus, tmp_path):
+    """The minni adapter must trim context_string to the TokenBudget like the
+    other adapters, so an over-budget result can't trip the runner abort (NIT-a)."""
+    import membench.adapters.minni_adapter as mod
+    from membench import tokenizer
+    from membench.contract import TokenBudget
+
+    adapter = MinniAdapter()
+    _prime_adapter_for_query(adapter, corpus, tmp_path)
+    # Return EVERY corpus doc as a hit so the untrimmed context would be large.
+    doc_ids = list(corpus.doc_ids())
+    hits = [{"metadata": {"membench_doc_id": d}, "score": 1.0} for d in doc_ids]
+    monkeypatch.setattr(mod, "_rpc", lambda *a, **k: {"results": hits})
+
+    from membench import config
+
+    tight = TokenBudget(max_tokens=40, max_docs=config.K)
+    try:
+        result = adapter.query("anything", tight)
+        assert tokenizer.count_tokens(result.context_string) <= 40, (
+            "minni context must be trimmed to the token budget"
+        )
+    finally:
+        adapter._corpus = None
+        adapter.teardown()
 
 
 def test_minni_live_roundtrip(corpus, budget, tmp_path):
