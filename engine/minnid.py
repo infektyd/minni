@@ -1471,9 +1471,11 @@ def _handle_search(params: dict, request_id: Any) -> dict:
 
     Accepts optional ``depth`` parameter for progressive disclosure:
       headline  — wikilink, title, score, confidence, age_days (~30 tokens/result)
-      snippet   — + text (≤280 chars) (~120 tokens/result) [DEFAULT]
+      snippet   — + text (≤280 chars) (~120 tokens/result) [DEFAULT]  (M-2 fix)
       chunk     — + full chunk text, heading context, provenance (~500 tokens)
       document  — + full source document (whole_document=1 rows only)
+    Omitting depth returns "snippet". Previous default was "headline" (no text)
+    which was a documentation/implementation mismatch — fixed.
 
     Accepts optional ``budget_tokens`` for MMR-diverse token-budgeted packing.
     When provided, selects a diverse subset fitting within the token budget.
@@ -1506,7 +1508,11 @@ def _handle_search(params: dict, request_id: Any) -> dict:
     except ValueError as exc:
         return _make_error(-32602, str(exc), request_id)
     limit = min(int(params.get("limit", 5)), 20)
-    depth = str(params.get("depth", "headline"))
+    # M-2 fix: default was "headline" (no text) despite the docstring claiming
+    # "snippet". Callers that omit depth (e.g. recallMemory() in sovereign.ts)
+    # received wikilink+score only — no evidence text for the agent to read.
+    # Changed to "snippet" to match the documented intent (~120 tokens/result).
+    depth = str(params.get("depth", "snippet"))
     budget_tokens_param = params.get("budget_tokens")
     backend_param = params.get("backend", "auto")
     layers = params.get("layers")
@@ -3993,6 +3999,77 @@ def _handle_ax_snapshot_get(params: dict, request_id: Any) -> dict:
         return _make_error(-32000, f"ax_snapshot_get error: {exc}", request_id)
 
 
+def _handle_vault_index_doc(params: dict, request_id: Any) -> dict:
+    """Index a vault page into the semantic recall index without going through
+    the learn/candidate governance pipeline.
+
+    M-4 fix: minni_vault_write writes a page to disk but did NOT trigger the
+    recall bridge, so vault_write content was NOT semantically recall-able until
+    a separate VaultIndexer run. This RPC lets the TypeScript MCP handler call
+    ``vault_index_doc`` immediately after writing, matching the instant-recall
+    semantics of ``learn`` (which calls index_durable_document on promote).
+
+    Params (all required unless noted):
+        content    — full page content (markdown, including frontmatter if any)
+        path       — relative path within the vault (e.g. "wiki/sessions/foo.md")
+        agent      — agent_id owning this document
+        sigil      — optional emoji sigil (default "❓")
+        privacy_level — optional, default "safe"
+        page_status   — optional, default "accepted"
+        layer      — optional, default "knowledge"
+
+    Returns {"status": "ok", "doc_id": <int>, "chunks": <int>} on success.
+    FAIL-OPEN: engine errors are caught internally (never raises); returns an
+    error envelope only for missing required params.
+    """
+    global _request_count
+    _request_count += 1
+    started_at = time.perf_counter()
+
+    content = params.get("content", "")
+    path = params.get("path", "")
+    agent = params.get("agent", "")
+
+    if not content:
+        return _make_error(-32602, "content is required", request_id)
+    if not path:
+        return _make_error(-32602, "path is required", request_id)
+    if not agent:
+        return _make_error(-32602, "agent is required", request_id)
+
+    # SEC-015-style size cap: vault pages capped at 256 KiB (larger than learn
+    # which is 64 KiB, because vault pages include rich frontmatter + prose).
+    _MAX_VAULT_PAGE_CHARS = 256 * 1024
+    if len(content) > _MAX_VAULT_PAGE_CHARS:
+        return _make_error(
+            -32602,
+            f"vault_index_doc content exceeds {_MAX_VAULT_PAGE_CHARS} chars",
+            request_id,
+        )
+
+    sigil = str(params.get("sigil", "❓"))
+    privacy_level = str(params.get("privacy_level", "safe"))
+    page_status = str(params.get("page_status", "accepted"))
+    layer = str(params.get("layer", "knowledge"))
+
+    try:
+        engine = _lazy_retrieval()
+        result = engine.index_durable_document(
+            content=content,
+            path=path,
+            agent=agent,
+            sigil=sigil,
+            privacy_level=privacy_level,
+            page_status=page_status,
+            layer=layer,
+        )
+        _record_latency("vault_index_doc", time.perf_counter() - started_at)
+        return _make_response(result, request_id)
+    except Exception as exc:
+        logger.exception("vault_index_doc failed")
+        return _make_error(-32000, f"vault_index_doc error: {exc}", request_id)
+
+
 # Method registry
 _METHODS: Dict[str, callable] = {
     "ping":                   _handle_ping,
@@ -4021,6 +4098,8 @@ _METHODS: Dict[str, callable] = {
     "resolve_candidate":      _resolve_candidate,
     "ax_snapshot_store":      _handle_ax_snapshot_store,
     "ax_snapshot_get":        _handle_ax_snapshot_get,
+    # M-4 fix: vault_write now triggers immediate semantic indexing via this RPC.
+    "vault_index_doc":        _handle_vault_index_doc,
     "status":                 _handle_status,
     "health_report":          _handle_health_report,
     "hygiene_report":         _handle_hygiene_report,

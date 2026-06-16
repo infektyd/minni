@@ -169,6 +169,10 @@ export async function recallMemory(input: {
 }, requester: JsonRpcRequester = jsonRpcSocketRequest): Promise<JsonResult<RecallResponse>> {
   // Daemon is JSON-RPC only; surface its real result/error (e.g. identity_mismatch)
   // directly instead of masking it behind a dead HTTP-over-socket fallback.
+  // M-2 fix: explicitly pass depth="snippet" so agents receive evidence text
+  // (~120 tokens/result) rather than headline-only (wikilink + score, no text).
+  // The daemon's previous default was "headline" despite the docstring claiming
+  // "snippet". Both the daemon default and this call-site now agree on "snippet".
   return jsonRpcSocketRequestWithFallbackRequester("search", {
     query: input.query,
     agent_id: input.agentId ?? DEFAULT_AGENT_ID,
@@ -176,6 +180,7 @@ export async function recallMemory(input: {
     limit: input.limit,
     scope: input.scope,
     cross_agent: input.crossAgent ?? input.cross_agent,
+    depth: "snippet",
   }, requester) as Promise<JsonResult<RecallResponse>>;
 }
 

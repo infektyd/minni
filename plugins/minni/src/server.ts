@@ -717,7 +717,36 @@ server.registerTool(
       section,
       source,
     });
-    return textResult(JSON.stringify({ status: "written", note }, null, 2));
+
+    // M-4 fix: vault_write was not triggering the recall bridge — the page
+    // landed on disk but was NOT semantically searchable until a separate
+    // VaultIndexer run. Call vault_index_doc to index it immediately so a
+    // subsequent minni_recall can find it, matching learn's instant-recall
+    // semantics. Fail-open: if the daemon is unavailable or the index fails,
+    // the write still succeeds (the page is on disk; recall degrades to lexical
+    // until the next VaultIndexer run).
+    try {
+      const { jsonRpcSocketRequestWithFallback } = await import("./sovereign.js");
+      const fullContent = `---\ntitle: ${title}\nsection: ${section}\nstatus: candidate\nprivacy: safe\n---\n# ${title}\n\n${content}`;
+      const indexResult = await jsonRpcSocketRequestWithFallback("vault_index_doc", {
+        content: fullContent,
+        path: note.relativePath,
+        agent: DEFAULT_AGENT_ID,
+        sigil: "📄",
+        privacy_level: "safe",
+        page_status: "candidate",
+        layer: "knowledge",
+      });
+      return textResult(JSON.stringify({
+        status: "written",
+        note,
+        indexed: indexResult.ok ? "ok" : "degraded",
+        index_detail: indexResult.ok ? indexResult.data : indexResult.error,
+      }, null, 2));
+    } catch {
+      // Fail-open: write succeeded even if indexing failed
+      return textResult(JSON.stringify({ status: "written", note, indexed: "degraded" }, null, 2));
+    }
   },
 );
 
