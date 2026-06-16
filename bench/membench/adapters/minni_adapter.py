@@ -15,16 +15,18 @@ keep ``bench/`` structurally isolated.
 RETRIEVAL MODE (honest disclosure): the only PUBLIC, import-isolated,
 governance-gated ingest+retrieve path Minni exposes over the socket is
 ``learn`` -> ``resolve_candidate(accept)`` -> ``search``. That path stores each
-corpus doc as a durable *learning*, and the daemon surfaces learning matches
-through its LEXICAL FTS5 index (the ``learnings`` field of the search response),
-NOT the semantic FAISS document index — by engine design, learnings are "never
-indexed in vault_fts or FAISS". There is no public socket RPC to push arbitrary
-ingested text into the semantic document/FAISS index without the AFM/LLM compile
-machinery, which the adapter must not drive. So **Minni is measured here in
-lexical (FTS5) retrieval mode over governed learnings**, and the report must say
-so. The semantic ``results`` stream is still read for forward-compat (should a
-future public RPC index ingested docs semantically), but it is empty for this
-path. See :data:`_DOC_ID_MARKER_PREFIX` for the ingest↔retrieval mapping.
+corpus doc as a durable *learning*. As of the store-time semantic-indexing fix,
+when content becomes durable via the socket the engine ALSO chunks + embeds it
+into the semantic FAISS document index (documents + chunk_embeddings) and
+refreshes the daemon's live in-memory index — so the throwaway daemon answers a
+subsequent ``search`` with real SEMANTIC hits in the ``results`` field, in the
+same process, with NO out-of-band indexer run. **Minni is therefore measured
+here in its native SEMANTIC (FAISS) retrieval mode** over governed durable
+memory; the lexical ``learnings`` stream is still read and merged for the short
+durable items that fall below the chunker's min-token floor (and thus produce no
+embedded chunk). See :data:`_DOC_ID_MARKER_PREFIX` for the ingest↔retrieval
+mapping that maps each semantic hit back to its canonical corpus doc-id THROUGH
+the daemon's own store+retrieve (never a corpus reach-around).
 
 If standing up an isolated daemon headlessly is infeasible in this environment,
 the live round-trip is SKIPPED (not failed) with a clear reason — the contract,
@@ -132,17 +134,15 @@ def _redact(text: str) -> str:
 
 
 # ── doc-id marker (ingest↔retrieval mapping) ───────────────────────────────
-# RETRIEVAL MODE (honest disclosure, see module docstring): the only PUBLIC,
+# RETRIEVAL MODE (honest disclosure, see module docstring): the PUBLIC,
 # import-isolated, governance-gated ingest+retrieve path Minni exposes over the
 # socket is learn -> resolve_candidate(accept) -> search. That path stores each
-# corpus doc as a durable *learning*, and Minni surfaces learning matches via
-# the daemon's lexical FTS5 index (engine ``search_learnings`` → the ``learnings``
-# field of the search response). By engine design (minnid.py: learnings are
-# "never indexed in vault_fts or FAISS"), this ingest path yields LEXICAL (FTS5)
-# retrieval, not semantic FAISS — so Minni is measured here in lexical mode and
-# the report must say so. The semantic document/FAISS stream (the ``results``
-# field) returns nothing for this path; the adapter still reads it for
-# forward-compat should a future public RPC index ingested docs semantically.
+# corpus doc as a durable *learning*, and the engine's store-time semantic
+# indexing now ALSO chunks+embeds it into the FAISS document index and refreshes
+# the daemon's live in-memory index — so the ``results`` field of the search
+# response carries the stored docs as real SEMANTIC hits, in-process, with no
+# out-of-band indexer. The lexical ``learnings`` field is still read+merged for
+# short items that fall below the chunker's min-token floor (no embedded chunk).
 #
 # Minni drops caller ``metadata`` on the learn→durable promotion (only
 # agent_id/category/content/created_at are persisted), so a metadata tag cannot
@@ -179,8 +179,34 @@ def _decode_doc_id(encoded: str) -> str:
 
 
 def _mark_content(doc_id: str, text: str) -> str:
-    """Stamp the canonical doc-id into learn content (survives the daemon store)."""
-    return f"{_DOC_ID_MARKER_PREFIX}{_encode_doc_id(doc_id)}]\n\n{text}"
+    """Stamp the canonical doc-id into learn content so it survives BOTH the
+    daemon's learnings store AND its semantic chunking.
+
+    The engine now ALSO chunks+embeds durable content into the semantic FAISS
+    index (so the `results` stream carries stored docs). The markdown chunker
+    splits on ``#`` headings and DROPS sub-min-token sections, so a marker placed
+    as a standalone preamble line ABOVE the first heading lands in its own tiny
+    pre-heading section that the chunker discards — the marker would then be
+    absent from every embedded chunk and unrecoverable from a semantic hit.
+
+    We therefore stamp the marker INLINE at the start of the first real body
+    paragraph (the first non-blank, non-heading line). That line is part of a
+    full-size body chunk, so the marker rides INTO the embedded chunk text and is
+    recoverable from the semantic ``chunk_text`` of a returned hit — exactly as it
+    is recoverable from the learnings ``content``. The whole stamped string is
+    still stored verbatim as the learning, so the lexical learnings path is
+    unaffected.
+    """
+    marker = f"{_DOC_ID_MARKER_PREFIX}{_encode_doc_id(doc_id)}] "
+    lines = text.splitlines(keepends=True)
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#"):
+            lines[i] = marker + line.lstrip()
+            return "".join(lines)
+    # No body line (heading-only / empty doc): fall back to a leading marker line
+    # so the lexical learnings path still recovers it.
+    return f"{marker.rstrip()}\n\n{text}"
 
 
 def _doc_id_from_content(content: str, valid_ids: set[str]) -> str | None:
@@ -717,10 +743,21 @@ class MinniAdapter:
         if self._socket_path is None or self._corpus is None:
             raise PreIngestError("query() before ingest()")
         start = time.perf_counter()
+        # depth="chunk" (not "snippet"): the doc-id marker is stamped INLINE in
+        # the chunk body (see _mark_content), and at snippet depth the daemon
+        # wraps each hit in an <EVIDENCE …> envelope whose long attribute header
+        # (incl. the absolute source path) consumes most of the 280-char snippet
+        # window — pushing the marker out of the truncated body for longer docs,
+        # so it could not be recovered from the semantic stream. chunk depth
+        # returns the full chunk text, so the marker is always recoverable and
+        # the SEMANTIC results map back to corpus doc-ids. The context the adapter
+        # returns to the harness is built from the FROZEN CORPUS bodies (below),
+        # not from the daemon text, so the larger daemon payload does not affect
+        # the budget-enforced context_string.
         result = _rpc(
             self._socket_path,
             "search",
-            {"query": q, "limit": budget.max_docs, "depth": "snippet"},
+            {"query": q, "limit": budget.max_docs, "depth": "chunk"},
             timeout=60.0,
         )
         elapsed_ms = (time.perf_counter() - start) * 1000.0
@@ -739,13 +776,13 @@ class MinniAdapter:
             )
 
         # The search RPC returns TWO ranked streams (see _DOC_ID_MARKER_PREFIX
-        # note): `results` (the document/FAISS stream) and `learnings` (the
-        # lexical FTS5 learnings stream). The governance ingest path stores corpus
-        # docs as LEARNINGS, so for this adapter the actual retrieval arrives in
-        # `learnings`; `results` is read too for forward-compat (a future public
-        # RPC that semantically indexes ingested docs would populate it). Both are
-        # consumed in rank order — `results` first (semantic doc hits rank above
-        # lexical learning hits when present), then `learnings`.
+        # note): `results` (the document/FAISS semantic stream) and `learnings`
+        # (the lexical FTS5 learnings stream). With store-time semantic indexing,
+        # the governance ingest path now populates the SEMANTIC `results` stream
+        # for every durable doc that produces an embedded chunk, so `results` is
+        # the primary retrieval here; `learnings` is still merged after it to
+        # cover short items below the chunker's min-token floor. Both are consumed
+        # in rank order — `results` first (semantic doc hits), then `learnings`.
         #
         # Each field may be ABSENT, explicit null, or (from a malformed daemon) a
         # non-list. Coerce ONLY null/absent to [] (mirroring _rpc's null-only
@@ -807,9 +844,11 @@ class MinniAdapter:
         # is correct here. Any consumer that re-sorts by `.score` descending would
         # reorder learnings above lower-scored semantic hits — that is the
         # documented, accepted behavior of this adapter, not a guarantee that
-        # lexical hits never outscore semantic ones. In this adapter's actual
-        # measured path `results` is empty (learnings are the real retrieval), so
-        # N is 0 and the distinction does not arise in practice.
+        # lexical hits never outscore semantic ones. With store-time semantic
+        # indexing the semantic `results` stream is now the primary retrieval and
+        # `seen` already dedups any learning whose doc was returned semantically,
+        # so the learnings loop only contributes short, sub-min-token items the
+        # semantic stream could not carry.
         rank_idx = 0
         for item in learnings:
             if len(ranked) >= budget.max_docs:
@@ -893,11 +932,19 @@ class MinniAdapter:
             raise TeardownError("adapter used after teardown() (§9.4)")
 
     def _map_doc_id(self, item: dict, valid_ids: set[str]) -> str | None:
-        """Map a search hit back to a canonical corpus doc-id.
+        """Map a SEMANTIC search hit back to a canonical corpus doc-id.
 
-        Prefers the membench metadata tag stamped at ingest; falls back to any
-        field that already equals a known canonical doc-id. Hits that cannot be
-        mapped are dropped (they are not corpus docs).
+        The engine's store-time semantic indexing now chunks+embeds each ingested
+        doc into the FAISS document index, so the `results` stream carries the
+        stored docs. Minni drops caller ``metadata`` on the durable promotion, so
+        the canonical doc-id does NOT ride along as a structured field — it is the
+        marker stamped INTO the content at ingest (see ``_mark_content``), which
+        the engine chunks into ``chunk_text``. We recover it from the hit's chunk
+        text the same way the learnings stream recovers it from learning content
+        — a provenance tag carried THROUGH the daemon's own store+retrieve, NOT a
+        corpus reach-around. Falls back to the metadata tag / any field that is
+        already a canonical id (forward-compat), then to the marker in chunk text.
+        Hits that cannot be mapped are dropped (they are not corpus docs).
         """
         meta = item.get("metadata") or {}
         tagged = meta.get("membench_doc_id")
@@ -907,4 +954,14 @@ class MinniAdapter:
             val = item.get(key)
             if isinstance(val, str) and val in valid_ids:
                 return val
+        # Recover the ingest-time marker from the semantically-indexed chunk text
+        # (or any text-bearing field the depth tier exposes). This is the same
+        # marker the learnings stream parses — the engine now also stores it in
+        # chunk_embeddings, so the SEMANTIC stream maps back to corpus doc-ids.
+        for key in ("chunk_text", "full_document_text", "text", "snippet", "content"):
+            val = item.get(key)
+            if isinstance(val, str):
+                recovered = _doc_id_from_content(val, valid_ids)
+                if recovered is not None:
+                    return recovered
         return None

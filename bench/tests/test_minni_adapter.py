@@ -249,6 +249,28 @@ def test_mark_content_roundtrip(doc_id):
     assert "some body text" in marked
 
 
+def test_map_doc_id_recovers_from_chunk_text():
+    """_map_doc_id must recover the corpus id from a REAL daemon hit shape.
+
+    The live engine search response returns semantic hits as dicts carrying
+    ``chunk_text`` (the embedded chunk), NOT a structured ``metadata.membench_doc_id``
+    field — Minni drops caller metadata on the durable promotion. The doc-id rides
+    through as the marker stamped into the content at ingest. Every other mock test
+    uses the metadata fast-path; this one exercises the ACTUAL live fallthrough so a
+    regression in the chunk_text recovery (regex/key ordering) can't silently zero
+    out semantic recall while the mock suite stays green (finding #6)."""
+    from membench.adapters.minni_adapter import MinniAdapter, _mark_content
+
+    adapter = MinniAdapter()
+    valid_ids = {"03-teal-ledger.md", "07-other.md"}
+    hit = {"chunk_text": _mark_content("03-teal-ledger.md", "body"), "score": 0.8}
+    assert adapter._map_doc_id(hit, valid_ids) == "03-teal-ledger.md"
+
+    # A chunk for an id that is NOT a corpus doc must map to None (dropped).
+    bogus = {"chunk_text": _mark_content("not-a-corpus-doc.md", "x"), "score": 0.9}
+    assert adapter._map_doc_id(bogus, valid_ids) is None
+
+
 @pytest.mark.parametrize(
     "content, valid_ids, expected",
     [
@@ -405,10 +427,12 @@ def test_query_handles_null_or_nonlist_results(monkeypatch, corpus, budget, tmp_
 def test_query_handles_null_or_nonlist_learnings(
     monkeypatch, corpus, budget, tmp_path, bad_learnings
 ):
-    """The learnings stream is the ACTUAL retrieval path after the fix; the same
-    _as_list() contract must hold for it: `learnings: null` -> [] (no TypeError),
-    any other non-list — INCLUDING falsy 0/False/'' (finding #1) — -> redacted
-    MinniStandupError, never a silent coercion to []. results is absent."""
+    """The learnings stream is the SECONDARY (lexical) fallback path after the
+    fix — the semantic `results` stream (FAISS) is primary, with learnings merged
+    after it. This test pins the `learnings`-only branch (results absent): the
+    same _as_list() contract must hold for it: `learnings: null` -> [] (no
+    TypeError), any other non-list — INCLUDING falsy 0/False/'' (finding #1) — ->
+    redacted MinniStandupError, never a silent coercion to []."""
     import membench.adapters.minni_adapter as mod
 
     adapter = MinniAdapter()
@@ -668,11 +692,12 @@ def test_query_neutralizes_banned_markers_in_context(monkeypatch, tmp_path):
         adapter.teardown()
 
 
-def test_minni_live_roundtrip(corpus, budget, tmp_path):
+def test_minni_live_roundtrip(corpus, budget, tmp_path, monkeypatch):
     """Full contract round-trip through an isolated throwaway daemon.
 
     SKIPs (does not fail) if the daemon cannot be stood up headlessly.
     """
+    import membench.adapters.minni_adapter as mod
     adapter = MinniAdapter()
     try:
         try:
@@ -709,22 +734,46 @@ def test_minni_live_roundtrip(corpus, budget, tmp_path):
         assert report.doc_count > 0
         assert report.doc_count <= len(corpus.doc_ids())
 
+        # Capture the RAW daemon response so we can confirm the SEMANTIC `results`
+        # stream (the new primary path after store-time semantic indexing) is the
+        # one actually carrying hits — not merely the lexical `learnings` fallback.
+        captured = {}
+        orig_rpc = mod._rpc
+
+        def _capture_rpc(socket_path, method, params, *a, **k):
+            resp = orig_rpc(socket_path, method, params, *a, **k)
+            if method == "search" and isinstance(resp, dict):
+                captured["resp"] = resp
+            return resp
+
+        monkeypatch.setattr(mod, "_rpc", _capture_rpc)
+
         result = adapter.query("Aurora Protocol", budget)
         # The round-trip must complete and return a well-formed QueryResult
         # through the contract. The throwaway daemon ingests through the real
-        # governance path (learn -> resolve_candidate accept) and serves retrieval
-        # via the daemon's LEXICAL FTS5 learnings index (see the adapter docstring
-        # for the retrieval-mode disclosure). Post-fix, that path RETRIEVES: the
-        # over-count and recall tests enforce non-empty retrieval, and this
-        # roundtrip — which has already paid the daemon-standup cost — asserts it
-        # too with a distinctive verbatim probe ("Aurora Protocol").
+        # governance path (learn -> resolve_candidate accept), which now ALSO
+        # populates the SEMANTIC index at store time, so retrieval is served
+        # PRIMARILY via the daemon's `results` (FAISS/document) stream — the
+        # lexical `learnings` stream is merged after it (see the adapter docstring
+        # for the retrieval-mode disclosure). This roundtrip — which has already
+        # paid the daemon-standup cost — asserts retrieval with a distinctive
+        # verbatim probe ("Aurora Protocol").
         assert isinstance(result, QueryResult)
         assert_well_formed(result, corpus, budget)
         assert isinstance(result.refused, bool)
         assert isinstance(result.wall_clock_ms, float)
         assert len(result.ranked_results) > 0, (
-            "live throwaway daemon must RETRIEVE through the lexical learnings "
+            "live throwaway daemon must RETRIEVE through the semantic results "
             f"path, not return empty; ranked_results={result.ranked_results!r}"
+        )
+        # Confirm the NEW primary path is actually exercised: the semantic
+        # `results` stream (not only the lexical `learnings` stream) carried hits
+        # for the stored doc. A regression that silently reverts store-time
+        # semantic indexing would leave `results` empty and is caught here.
+        resp = captured.get("resp", {})
+        assert resp.get("results"), (
+            "semantic `results` stream is empty — store-time semantic indexing "
+            f"did not populate the primary path; raw response keys={list(resp)}"
         )
         # NOTE: we do NOT assert refused == (ranked_results == []). Per §3.1
         # `refused` means an EXPLICIT governance decline, which is distinct from
@@ -1528,8 +1577,10 @@ def test_minni_overcount_crosscheck_unique_uuid(corpus, budget):
     is a tautology).
 
     RETRIEVAL MODE: this rides Minni's PUBLIC governance path (learn ->
-    resolve_candidate(accept) -> search) and is therefore served by the daemon's
-    LEXICAL FTS5 learnings index (see minni_adapter docstring) — a genuine
+    resolve_candidate(accept) -> search). After store-time semantic indexing the
+    accept path also populates the SEMANTIC index, so retrieval is served
+    PRIMARILY by the daemon's `results` (FAISS/document) stream, with the lexical
+    `learnings` stream merged after it (see minni_adapter docstring) — a genuine
     retrieval through the daemon, not a corpus reach-around. Only daemon-standup
     failures SKIP; a stood-up daemon that does NOT return the UUID doc is a real
     FAILURE (the over-count cross-check no longer self-defeats by skipping on a
@@ -1562,11 +1613,11 @@ def test_minni_recall_over_gold_is_nonempty(corpus, budget):
     """Minni recall@k over the fixture gold set is > 0 — it actually retrieves
     relevant docs through the real daemon, not an empty/None result.
 
-    RETRIEVAL MODE (honest): Minni's public governance ingest path serves
-    retrieval via the daemon's LEXICAL FTS5 learnings index (see the adapter
-    docstring). Lexical FTS5 implicit-ANDs query terms, so a full natural-language
-    question often misses; we therefore probe with DISTINCTIVE gold-derived terms
-    that appear verbatim in the gold doc — the SAME query string is handed to the
+    RETRIEVAL MODE (honest): Minni's public governance ingest path now serves
+    retrieval PRIMARILY via the daemon's SEMANTIC `results` stream (store-time
+    semantic indexing), with the lexical `learnings` stream merged after it (see
+    the adapter docstring). We probe with DISTINCTIVE gold-derived terms that
+    appear verbatim in the gold doc — the SAME query string is handed to the
     daemon's own retriever (no rewrite that rigs a semantic score). Each probe's
     gold doc is asserted to land in the top-k ranked results, and aggregate
     recall@k is asserted > 0. SKIPs only if the isolated daemon cannot stand up.

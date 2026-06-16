@@ -429,6 +429,124 @@ def _lazy_writeback():
     return _writeback
 
 
+def _durable_doc_path(
+    agent_id: str, key: str, vault_path: Optional[str] = None,
+    content: Optional[str] = None,
+) -> str:
+    """Stable synthetic ``documents.path`` for a store-time-indexed learning.
+
+    Keyed on (agent_id, CONTENT) — NOT the per-store ``key``/learning_id — so
+    re-storing the SAME content upserts the SAME documents row (idempotent — no
+    duplicate chunk_embeddings). This matters because _resolve_candidate enforces
+    terminal once-only resolution: a re-store of identical content always goes
+    through a NEW candidate -> NEW learning_id, so keying on learning_id would
+    mint a fresh path each time and accumulate duplicate semantic-index rows.
+    Hashing the content collapses those to one upsert target. When ``content`` is
+    not supplied we fall back to the legacy ``key`` digest (callers that already
+    pass a content-stable key, or have no content to hash).
+
+    Rooted under the configured vault_path so the path is contained in an
+    operator/agent vault root and passes can_read_document's vault-root check
+    (G19) for the storing principal. The file is virtual (we never write it to
+    disk here — the markdown writeback is handled separately); the path is only
+    a stable identity for the documents/chunk_embeddings rows.
+    """
+    import hashlib
+    seed = content if content is not None else key
+    digest = hashlib.sha1(f"{agent_id}\x00{seed}".encode("utf-8")).hexdigest()[:16]
+    base = vault_path or DEFAULT_CONFIG.vault_path
+    return os.path.join(base, "_durable", f"{agent_id}__{digest}.md")
+
+
+_UNSET = object()
+
+
+def _index_durable_learning(agent_id: str, content: str, key: str, db=_UNSET) -> None:
+    """Semantically index a just-stored durable learning (FAIL-OPEN).
+
+    Hook for BOTH durable-store socket paths (_resolve_candidate(accept) and
+    _handle_learn force=true). It chunks+embeds the content into the SAME
+    semantic index (documents + chunk_embeddings + vault_fts) the out-of-band
+    VaultIndexer writes, and refreshes the live RetrievalEngine's in-memory
+    FAISS so a subsequent search in THIS process returns the new chunks without
+    an index_all run or restart.
+
+    DB BINDING (data-safety): the semantic index MUST land in the SAME database
+    the durable store just committed to — never a separately-resolved one. The
+    caller passes the store's ``db`` handle; we index there. CRITICALLY, we only
+    reuse the shared _lazy_retrieval() singleton (whose FAISS _handle_search
+    reads) when its db_path matches the store's — the normal production case
+    where both are DEFAULT_CONFIG. If they differ (e.g. a test that points the
+    store at a temp DB but leaves DEFAULT_CONFIG at the live home), we build a
+    TRANSIENT engine bound to the store's DB so the write goes to the right
+    place and the live singleton/DB is never touched. Without this guard a
+    db-divergent caller would write durable rows into DEFAULT_CONFIG's DB —
+    i.e. the operator's LIVE ~/.minni — which must never happen.
+
+    Never raises — neither a programmer error (omitted ``db=``) nor an
+    availability failure (embedder/FAISS down) may undo or fail a durable store
+    that already committed. Both degrade gracefully (log + return).
+    """
+    try:
+        # Data-safety: ``db`` MUST be supplied explicitly. A ``None``/omitted
+        # default would silently fall through to the live-DB singleton
+        # (DEFAULT_CONFIG.db_path — the operator's ~/.minni), so a future caller
+        # forgetting ``db=`` in a live context would write durable
+        # semantic-index rows into the operator's real database. We refuse to
+        # default to the live DB — but we degrade gracefully rather than raise,
+        # because the durable store has ALREADY committed by the time we run:
+        # raising here would surface a failure to the RPC client for a memory
+        # that was in fact persisted (and could trigger a duplicate-write
+        # retry). So we log and return without indexing; recall degrades to
+        # lexical-only until the next out-of-band index run.
+        if db is _UNSET or db is None:
+            logger.warning(
+                "durable store: _index_durable_learning called without an "
+                "explicit db= (the handle the durable store committed to) — "
+                "refusing to default to the live DEFAULT_CONFIG database; "
+                "skipping store-time semantic index (recall degraded to "
+                "lexical until reindex). agent=%s",
+                agent_id,
+            )
+            return
+
+        from retrieval import RetrievalEngine
+
+        try:
+            store_db_path = os.path.abspath(db.config.db_path)
+        except Exception:
+            store_db_path = None
+        default_db_path = os.path.abspath(DEFAULT_CONFIG.db_path)
+
+        if store_db_path is not None and store_db_path == default_db_path:
+            # Production path: index via the shared singleton so its in-memory
+            # FAISS refreshes for the next _handle_search in this process.
+            engine = _lazy_retrieval()
+        else:
+            # Divergent-DB caller: bind a transient engine to the STORE's DB so
+            # the durable rows land there and the live DEFAULT_CONFIG DB is left
+            # untouched (data-safety). No shared FAISS to refresh in this case.
+            engine = RetrievalEngine(db, db.config)
+
+        engine.index_durable_document(
+            content=content,
+            path=_durable_doc_path(
+                agent_id, key, vault_path=engine.config.vault_path,
+                content=content,
+            ),
+            agent=agent_id,
+            page_status="accepted",
+            privacy_level="safe",
+            layer="knowledge",
+        )
+    except Exception as exc:
+        logger.warning(
+            "durable store: store-time semantic index failed for agent=%s (%s) "
+            "— store stands, recall degraded to lexical until reindex",
+            agent_id, exc,
+        )
+
+
 def _lazy_episodic():
     """Lazy-load EpisodicMemory."""
     global _episodic
@@ -2384,6 +2502,13 @@ def _handle_learn(params: dict, request_id: Any) -> dict:
         if wb.config.writeback_enabled:
             wb._write_to_disk(lid, agent_id, category, content, now)
 
+        # Store-time semantic indexing: make this durable learning recall-able
+        # via the semantic `results` stream immediately, in-process (FAIL-OPEN).
+        # Keyed on the learning_id so a re-store of the same learning upserts
+        # rather than duplicating chunk_embeddings. Bound to wb.db so the index
+        # lands in the SAME DB this learning was committed to.
+        _index_durable_learning(agent_id, content, key=f"learning:{lid}", db=wb.db)
+
         dw_ok = False
         if _dual_write_enabled:
             dw_ok = _flatfile_append(content, category)
@@ -3756,6 +3881,19 @@ def _resolve_candidate(params: dict, request_id: Any) -> dict:
                 WHERE candidate_id=?
                 """,
                 (new_status, now, principal.agent_id, reason, cid),
+            )
+
+        # Store-time semantic indexing for the governed promote path: a candidate
+        # accepted into a durable learning is now chunked+embedded into the
+        # semantic index and the live FAISS is refreshed, so an agent recalling
+        # what it just promoted gets semantic hits (the `results` stream), not
+        # lexical-only. Runs AFTER the transaction commits (the learning is
+        # already durable) and FAILS-OPEN — a semantic-index hiccup never undoes
+        # the resolution. Keyed on the learning_id for idempotent re-accept.
+        if lid is not None:
+            _index_durable_learning(
+                principal.agent_id, str(rowd.get("content") or ""),
+                key=f"learning:{lid}", db=db,
             )
 
         # Prominent audit log for the governance action (owner or explicit operator)
