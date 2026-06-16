@@ -528,16 +528,44 @@ def _index_durable_learning(agent_id: str, content: str, key: str, db=_UNSET) ->
             # untouched (data-safety). No shared FAISS to refresh in this case.
             engine = RetrievalEngine(db, db.config)
 
+        # Derive indexing metadata from YAML frontmatter (M-3 privacy bridge).
+        # Reuse VaultIndexer._extract_frontmatter so durable-store indexing
+        # honors the same privacy floor as out-of-band vault indexing.
+        doc_agent = agent_id
+        sigil = "❓"
+        page_status = "accepted"
+        privacy_level = "safe"
+        page_type = None
+        layer = "knowledge"
+        try:
+            from indexer import VaultIndexer
+
+            meta = VaultIndexer._extract_frontmatter(content)
+            doc_agent = meta["agent"] if meta["agent"] != "unknown" else agent_id
+            sigil = meta.get("sigil", "❓")
+            page_status = (
+                meta["page_status"]
+                if meta["page_status"] != "candidate"
+                else "accepted"
+            )
+            privacy_level = meta["privacy_level"]
+            page_type = meta.get("page_type")
+            layer = meta["layer"]
+        except Exception:
+            pass  # fail-open: keep prior defaults
+
         engine.index_durable_document(
             content=content,
             path=_durable_doc_path(
                 agent_id, key, vault_path=engine.config.vault_path,
                 content=content,
             ),
-            agent=agent_id,
-            page_status="accepted",
-            privacy_level="safe",
-            layer="knowledge",
+            agent=doc_agent,
+            sigil=sigil,
+            page_status=page_status,
+            privacy_level=privacy_level,
+            page_type=page_type,
+            layer=layer,
         )
     except Exception as exc:
         logger.warning(
