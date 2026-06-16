@@ -1,0 +1,10 @@
+# membench-local ignores (the repo-root .gitignore already covers _private/,
+# reports/, and most build artifacts; this is bench-scoped belt-and-suspenders).
+__pycache__/
+*.pyc
+.pytest_cache/
+reports/
+# never commit local throwaway daemon state if it ever lands under bench/
+*.sock
+*.index
+*.db
