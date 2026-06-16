@@ -62,6 +62,31 @@ BAND_TO_CONFIG_KEY: dict[str, str] = {
 # Total gold-set floor when finalized (§5.3: "Target >= 150").
 MIN_TOTAL = 150
 
+# ── Adversarial-input limits (items 5 & 6) ──────────────────────────────────
+# A gold JSONL path can be operator/agent-supplied (the --gold CLI flag). An
+# attacker who controls it could otherwise exhaust memory with a huge file or a
+# 10 MB single field, or forge log lines via an oversized id. These caps bound
+# every untrusted byte BEFORE it is held in RAM or echoed into a log message.
+# Per-field maxima (bytes/chars): generous enough for any real label, tight
+# enough to make a crafted field harmless.
+MAX_FIELD_LEN: dict[str, int] = {
+    "id": 256,
+    "question": 1024,
+    "gold_fact": 4096,
+    "notes": 2048,
+    "drafted_by": 256,
+    "approved_by": 256,
+}
+# A single gold doc-id is a corpus-relative path; cap it like an id.
+MAX_DOC_ID_LEN = 512
+# A finalized set targets ~150 items; cap parsing well above that so a real set
+# loads but an adversarial one cannot allocate unbounded GoldItems.
+MAX_GOLD_ITEMS = 100_000
+# Whole-file byte cap (a 150-item set is tens of KB; a few MB is ample headroom).
+MAX_GOLD_FILE_BYTES = 8 * 1024 * 1024
+# Truncate any value embedded in an error/log message to this many chars.
+MAX_LOG_VALUE_LEN = 120
+
 
 def min_for_band(band: str) -> int:
     """The per-band minimum from the single pinned source (``config``)."""
@@ -80,9 +105,13 @@ def _safe_id(item_id: str) -> str:
     "[fake-id] forged error" prefix) into errors()/warnings() output. ``repr``
     escapes newlines (``\\n``), carriage returns and other control bytes and
     quotes the value, so the rendered id can never break out onto a second line
-    or forge a log prefix.
+    or forge a log prefix. The repr is ALSO truncated (item 6): a 10 MB id would
+    otherwise produce a 10 MB log line and DoS any log consumer.
     """
-    return repr(item_id)
+    rendered = repr(item_id)
+    if len(rendered) > MAX_LOG_VALUE_LEN:
+        rendered = rendered[:MAX_LOG_VALUE_LEN] + "...(truncated)"
+    return rendered
 
 
 @dataclass
@@ -115,11 +144,38 @@ class GoldItem:
         missing = {"id", "question", "band"} - set(d)
         if missing:
             raise GoldSetError(f"gold item missing required field(s): {sorted(missing)}")
+        # Cap every string field BEFORE constructing the item (items 5 & 6): an
+        # adversarial JSONL must not be able to hold a multi-MB field in RAM or
+        # forge a giant log line through an oversized id. Length is checked in
+        # characters; a crafted field is rejected, not silently truncated.
+        for fname, cap in MAX_FIELD_LEN.items():
+            val = d.get(fname)
+            if isinstance(val, str) and len(val) > cap:
+                raise GoldSetError(
+                    f"gold item field {fname!r} exceeds max length "
+                    f"{cap} (got {len(val)})"
+                )
+        doc_ids = list(d.get("gold_doc_ids", []))
+        for did in doc_ids:
+            # A non-string element (int, None, dict) must be rejected up front:
+            # a dict later crashes set(gold_doc_ids) with an unhashable TypeError,
+            # and an int/None silently never matches a corpus id while still being
+            # truthy — corrupting recall/precision denominators or flipping a
+            # negative item into a phantom positive. Mirror the string-cap guard.
+            if not isinstance(did, str):
+                raise GoldSetError(
+                    f"gold_doc_id must be a str, got {type(did).__name__}"
+                )
+            if len(did) > MAX_DOC_ID_LEN:
+                raise GoldSetError(
+                    f"gold_doc_id exceeds max length {MAX_DOC_ID_LEN} "
+                    f"(got {len(did)})"
+                )
         return cls(
             id=d["id"],
             question=d["question"],
             band=d["band"],
-            gold_doc_ids=list(d.get("gold_doc_ids", [])),
+            gold_doc_ids=doc_ids,
             gold_fact=d.get("gold_fact", ""),
             drafted_by=d.get("drafted_by", ""),
             approved_by=d.get("approved_by", None),
@@ -323,12 +379,31 @@ def check_finalized(
 
 # ── Disk I/O (JSONL) ─────────────────────────────────────────────────────────
 def load_jsonl(path: str | os.PathLike[str]) -> list[GoldItem]:
-    """Load a gold set from JSONL. Each non-blank line is one GoldItem."""
+    """Load a gold set from JSONL. Each non-blank line is one GoldItem.
+
+    The path may be operator/agent-supplied (the ``--gold`` CLI flag), so the
+    loader bounds untrusted input (item 5): it REJECTS a file larger than
+    :data:`MAX_GOLD_FILE_BYTES` BEFORE reading it into memory and caps the number
+    of parsed items at :data:`MAX_GOLD_ITEMS`. Per-field length caps are enforced
+    in :meth:`GoldItem.from_dict`.
+    """
+    path = Path(path)
+    size = path.stat().st_size
+    if size > MAX_GOLD_FILE_BYTES:
+        raise GoldSetError(
+            f"gold JSONL {path.name!r} is {size} bytes, exceeds the "
+            f"{MAX_GOLD_FILE_BYTES}-byte cap (refusing to load)"
+        )
     items: list[GoldItem] = []
-    for raw in Path(path).read_text(encoding="utf-8").splitlines():
+    for raw in path.read_text(encoding="utf-8").splitlines():
         raw = raw.strip()
         if not raw:
             continue
+        if len(items) >= MAX_GOLD_ITEMS:
+            raise GoldSetError(
+                f"gold JSONL exceeds the {MAX_GOLD_ITEMS}-item cap (refusing "
+                "to load more)"
+            )
         items.append(GoldItem.from_dict(json.loads(raw)))
     return items
 

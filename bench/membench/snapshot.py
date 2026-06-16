@@ -175,6 +175,17 @@ def load_manifest(snapshot_dir: str | os.PathLike[str]) -> SnapshotManifest:
     """Load a previously-frozen ``manifest.json`` from a snapshot dir."""
     snapshot_dir = Path(snapshot_dir)
     raw = json.loads((snapshot_dir / MANIFEST_FILENAME).read_text(encoding="utf-8"))
+    # Light type validation before constructing the manifest (NIT d, mirrors the
+    # scrub-span fix): manifest.json is edit-controlled, so a tampered shape must
+    # surface as a clean ValueError here rather than corrupting downstream
+    # hash/scrub logic with a wrong-typed field. content_hash must be a str and
+    # files a list (the hash gate and loader iterate them).
+    if not isinstance(raw, dict):
+        raise ValueError("malformed manifest.json: top level must be an object")
+    if not isinstance(raw.get("content_hash"), str):
+        raise ValueError("malformed manifest.json: content_hash must be a string")
+    if not isinstance(raw.get("files"), list):
+        raise ValueError("malformed manifest.json: files must be a list")
     return SnapshotManifest(
         content_hash=raw["content_hash"],
         files=raw["files"],

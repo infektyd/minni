@@ -221,6 +221,77 @@ class MiscountStubAdapter(StubAdapter):
         )
 
 
+class GatedStubAdapter(StubAdapter):
+    """A stub WITH a governance gate that refuses on a retrieval miss (§6.5).
+
+    Unlike the plain StubAdapter (which never refuses), this variant models a
+    provenance gate: when lexical retrieval finds NO overlapping doc, it returns
+    ``refused=True`` with an empty ranked list — the §6.5 refusal predicate. On a
+    well-built negative query (no doc legitimately matches) this earns a correct
+    refusal; on a positive query where it DID find docs it answers normally. Used
+    by the §9.7 refusal-pair test to show correct_refusal_rate rewards correct
+    refusals without gaming.
+    """
+
+    name = "stub_gated"
+
+    def query(self, q: str, budget: TokenBudget) -> QueryResult:
+        result = super().query(q, budget)
+        if not result.ranked_results:
+            # Retrieval miss -> explicit governance refusal (refused AND empty).
+            return QueryResult(
+                ranked_results=[],
+                context_string="",
+                wall_clock_ms=result.wall_clock_ms,
+                refused=True,
+            )
+        return result
+
+
+class RefuseEverythingStubAdapter(StubAdapter):
+    """Refuses on EVERY query (§6.5 gaming exposure).
+
+    Sets ``refused=True`` with an empty ranked list unconditionally. It maxes
+    correct_refusal_rate (1.0 on negatives) but the SAME predicate fires on
+    positives, so false_refusal_rate is 1.0 and recall@k is 0 across all positive
+    bands — the pair of rates exposes the gaming (§6.5). Used by the §9.7
+    refusal-pair test.
+    """
+
+    name = "stub_refuse_all"
+
+    def query(self, q: str, budget: TokenBudget) -> QueryResult:
+        self._require_live()
+        if self._corpus is None:
+            raise PreIngestError("query() before ingest()")
+        return QueryResult(
+            ranked_results=[],
+            context_string="",
+            wall_clock_ms=0.1,
+            refused=True,
+        )
+
+
+class FakeRefuseStubAdapter(StubAdapter):
+    """Sets ``refused=True`` but STILL returns docs (§6.5 credit-farming hole).
+
+    Per §6.5 the ``refused`` flag is only honored when ranked_results is also
+    empty, so this adapter earns NO correct-refusal credit despite the flag. Used
+    to prove the refusal predicate reads BOTH fields.
+    """
+
+    name = "stub_fake_refuse"
+
+    def query(self, q: str, budget: TokenBudget) -> QueryResult:
+        result = super().query(q, budget)
+        return QueryResult(
+            ranked_results=result.ranked_results,
+            context_string=result.context_string,
+            wall_clock_ms=result.wall_clock_ms,
+            refused=True,  # claims refusal while returning docs -> NOT a refusal
+        )
+
+
 class DuplicateDocStubAdapter(StubAdapter):
     """Returns a duplicate doc-id. Proves the dedup/uniqueness check trips."""
 

@@ -71,6 +71,12 @@ NAME_KEYS_DIRNAME = "scrub_spans"
 NAME_KEYS_PRIVATE_SUBDIR = "_private"
 NAME_KEYS_FILENAME = "name_keys.json"
 
+# Byte cap for the scrub sidecars (scrub_spans.jsonl, name_keys.json). These live
+# in operator/attacker-controlled snapshot dirs and are slurped whole into memory
+# during the scrub gate; without a stat()-before-read cap a multi-GB file OOMs the
+# verifier before the hash gate runs. Mirrors goldset.MAX_GOLD_FILE_BYTES.
+MAX_SCRUB_SPANS_FILE_BYTES = 32 * 1024 * 1024
+
 
 def _name_keys_path(snapshot_dir: Path) -> Path:
     return (
@@ -481,10 +487,24 @@ def _load_private_name_keys(snapshot_dir: Path) -> list[str]:
     keys_path = _name_keys_path(snapshot_dir)
     if not keys_path.exists():
         return []
+    size = keys_path.stat().st_size
+    if size > MAX_SCRUB_SPANS_FILE_BYTES:
+        raise ScrubGateError(
+            f"name_keys.json is {size} bytes, over the "
+            f"{MAX_SCRUB_SPANS_FILE_BYTES}-byte cap (refusing to load)"
+        )
     try:
         d = json.loads(keys_path.read_text(encoding="utf-8"))
         names = d["names"]
     except (KeyError, ValueError):
+        return []
+    # ``names`` is attacker-controllable (the sidecar is edit-controlled). A
+    # non-list value (null / str / dict) must yield [] — NEVER fall through to
+    # the comprehension, which would (a) raise an UNCAUGHT TypeError on null
+    # (escaping the scrub gate as a raw crash) and (b) on a bare string iterate
+    # PER CHARACTER, producing single-letter \b name patterns that false-match
+    # the whole corpus. The isinstance guard closes both holes at once.
+    if not isinstance(names, list):
         return []
     return [str(n) for n in names]
 
@@ -493,6 +513,12 @@ def _load_spans(snapshot_dir: Path) -> list[RedactionSpan]:
     spans_path = snapshot_dir / "scrub_spans.jsonl"
     if not spans_path.exists():
         return []
+    size = spans_path.stat().st_size
+    if size > MAX_SCRUB_SPANS_FILE_BYTES:
+        raise ScrubGateError(
+            f"scrub_spans.jsonl is {size} bytes, over the "
+            f"{MAX_SCRUB_SPANS_FILE_BYTES}-byte cap (refusing to load)"
+        )
     out: list[RedactionSpan] = []
     for line in spans_path.read_text(encoding="utf-8").splitlines():
         line = line.strip()
@@ -516,5 +542,21 @@ def _load_spans(snapshot_dir: Path) -> list[RedactionSpan]:
             raise ScrubGateError(
                 f"malformed scrub span: missing {exc.args[0]!r} field"
             ) from None
+        # TYPE validation (item 3): the span fields are annotated but the JSONL
+        # is attacker-controlled, so the annotations are not enforced at load.
+        # A non-int start/end would later corrupt offset arithmetic; non-str
+        # doc_id/kind/replacement would poison the re-scan. Reject as a clean
+        # scrub-gate failure. ``bool`` is an int subclass — reject it explicitly
+        # so a JSON ``true`` cannot masquerade as an offset. Report ONLY the
+        # field name, never the value (which may carry residual PII).
+        if isinstance(span.start, bool) or not isinstance(span.start, int):
+            raise ScrubGateError("malformed scrub span: start/end must be int")
+        if isinstance(span.end, bool) or not isinstance(span.end, int):
+            raise ScrubGateError("malformed scrub span: start/end must be int")
+        for fname in ("doc_id", "kind", "replacement"):
+            if not isinstance(getattr(span, fname), str):
+                raise ScrubGateError(
+                    f"malformed scrub span: {fname} must be str"
+                )
         out.append(span)
     return out

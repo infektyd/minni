@@ -31,6 +31,7 @@ from .contract import FrozenCorpus
 from .corpus import load_corpus
 from .goldset import (
     BAND_SINGLE_HOP,
+    MAX_GOLD_FILE_BYTES,
     GoldItem,
     check_finalized,
     check_item,
@@ -127,15 +128,22 @@ def apply_review(
             continue
         if action not in ("approve", "edit"):
             raise ValueError(f"unknown review action {action!r} for {d.id}")
-        edited = GoldItem(
-            id=decision.get("id", d.id),
-            question=decision.get("question", d.question),
-            band=decision.get("band", d.band),
-            gold_doc_ids=list(decision.get("gold_doc_ids", d.gold_doc_ids)),
-            gold_fact=decision.get("gold_fact", d.gold_fact),
-            drafted_by=d.drafted_by,
-            approved_by=approved_by,  # stamp on approval
-            notes=decision.get("notes", d.notes),
+        # Route the edited item through GoldItem.from_dict so the SAME field-length
+        # caps (MAX_FIELD_LEN / MAX_DOC_ID_LEN) and gold_doc_id type checks enforced
+        # at load time are enforced at write time — an attacker-controlled decisions
+        # dict must not be able to forge an oversized field by going around the
+        # validating constructor.
+        edited = GoldItem.from_dict(
+            {
+                "id": decision.get("id", d.id),
+                "question": decision.get("question", d.question),
+                "band": decision.get("band", d.band),
+                "gold_doc_ids": list(decision.get("gold_doc_ids", d.gold_doc_ids)),
+                "gold_fact": decision.get("gold_fact", d.gold_fact),
+                "drafted_by": d.drafted_by,
+                "approved_by": approved_by,  # stamp on approval
+                "notes": decision.get("notes", d.notes),
+            }
         )
         rep = check_item(edited, corpus_doc_ids)
         if not rep.ok:
@@ -207,7 +215,17 @@ def cmd_review(args: argparse.Namespace) -> int:
     import json as _json
 
     drafts = load_jsonl(args.drafts)
-    decisions = _json.loads(Path(args.decisions).read_text(encoding="utf-8"))
+    # Cap the decisions file BEFORE read_text (analogous to load_jsonl's guard): the
+    # path is operator/attacker-controlled and a multi-GB file would OOM before any
+    # dict validation runs.
+    _dec_path = Path(args.decisions)
+    _dec_size = _dec_path.stat().st_size
+    if _dec_size > MAX_GOLD_FILE_BYTES:
+        raise GoldSetError(
+            f"decisions file is {_dec_size} bytes, over the "
+            f"{MAX_GOLD_FILE_BYTES}-byte cap (refusing to load)"
+        )
+    decisions = _json.loads(_dec_path.read_text(encoding="utf-8"))
     # Structural guard (task item 5): a top-level array or non-dict per-item
     # value would otherwise blow up deep inside apply_review with a confusing
     # traceback. Reject early with a clear, path-free message.

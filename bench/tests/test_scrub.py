@@ -388,3 +388,50 @@ def test_load_spans_malformed_raises_scrub_gate_error(tmp_path):
     # And the full gate surfaces it as a ScrubGateError too (not a KeyError).
     with pytest.raises(ScrubGateError):
         verify_scrubbed(dest, policy=_policy())
+
+
+@pytest.mark.parametrize("bad_names", [None, "Hans", {}])
+def test_load_private_name_keys_non_list_yields_empty(tmp_path, bad_names):
+    """A tampered name_keys.json with a non-list ``names`` (null / str / dict)
+    yields [] — NO uncaught TypeError, and crucially NO per-character iteration
+    of a bare string (items 1 & 2). The string case is the security-critical one:
+    iterating ``"Hans"`` would emit single-letter \\b patterns that false-match
+    the whole corpus, so we assert the result is empty (no patterns at all)."""
+    from membench.scrub import _load_private_name_keys, _name_keys_path
+
+    dest = _make_snapshot(tmp_path)
+    scrub_snapshot(dest, _policy(), allow_public=True)
+    sidecar = _name_keys_path(dest)
+    sidecar.write_text(json.dumps({"names": bad_names}), encoding="utf-8")
+
+    keys = _load_private_name_keys(dest)  # must NOT raise TypeError
+    assert keys == []
+    # Belt-and-braces for item 2: no single-character key leaked from a string.
+    assert all(len(k) != 1 for k in keys)
+
+
+def test_load_spans_non_int_offset_raises_scrub_gate_error(tmp_path):
+    """A scrub_spans.jsonl span with a non-int start/end raises ScrubGateError,
+    not a downstream offset-arithmetic crash (item 3). The fields are annotated
+    int but the JSONL is edit-controlled, so the type is enforced at load."""
+    from membench.scrub import _load_spans
+
+    dest = _make_snapshot(tmp_path)
+    scrub_snapshot(dest, _policy(), allow_public=True)
+    spans_path = dest / "scrub_spans.jsonl"
+    spans_path.write_text(
+        json.dumps(
+            {
+                "doc_id": "01-secrets.md",
+                "kind": "key",
+                "start": "not_an_int",
+                "end": 5,
+                "replacement": "[REDACTED]",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ScrubGateError) as exc:
+        _load_spans(dest)
+    assert "start/end must be int" in str(exc.value)
