@@ -62,7 +62,13 @@ _LOCAL_PATH_PATTERN = re.compile(
     r"|/home/[^ \n\r\t\"'<>]+"  # Linux CI runners (e.g. /home/runner/)
     r"|/opt/[^ \n\r\t\"'<>]+"  # Homebrew / opt installs (e.g. /opt/homebrew/)
     r"|/root/[^ \n\r\t\"'<>]+"  # Linux root home
-    r"|/tmp/[^ \n\r\t\"'<>]+)"
+    r"|/tmp/[^ \n\r\t\"'<>]+"
+    r"|/proc/[^ \n\r\t\"'<>]+"  # Linux process table (e.g. /proc/1/environ)
+    r"|/dev/[^ \n\r\t\"'<>]+"  # device nodes (e.g. /dev/sda1)
+    r"|/etc/[^ \n\r\t\"'<>]+"  # system config (e.g. /etc/shadow)
+    r"|/sys/[^ \n\r\t\"'<>]+"  # Linux sysfs
+    r"|/run/[^ \n\r\t\"'<>]+"  # runtime state (e.g. /run/secrets)
+    r"|/mnt/[^ \n\r\t\"'<>]+)"  # mount points
 )
 
 

@@ -4,6 +4,11 @@ __pycache__/
 *.pyc
 .pytest_cache/
 reports/
+# s7: the orchestration (run_bench / `make bench`) writes its report + results
+# JSON + manifest here BY DEFAULT. Real runs may carry private-derived numbers,
+# so results/ must never reach public git. The committed example fixture report
+# lives elsewhere under a clearly-marked non-private path.
+results/
 # never commit local throwaway daemon state if it ever lands under bench/
 *.sock
 *.index

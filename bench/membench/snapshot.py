@@ -39,6 +39,11 @@ MANIFEST_FILENAME = "manifest.json"
 CORPUS_SUBDIR = "corpus"
 # Schema version of the emitted manifest — bumped if the on-disk shape changes.
 MANIFEST_SCHEMA_VERSION = 1
+# File-size cap for manifest.json (mirrors scrub.MAX_SCRUB_SPANS_FILE_BYTES). A
+# crafted/compromised snapshot dir with a multi-GB manifest.json would exhaust
+# process memory in read_text() BEFORE the cryptographic hash-gate runs; this cap
+# refuses to load it, matching the guard the scrub loaders already apply.
+MAX_MANIFEST_FILE_BYTES = 32 * 1024 * 1024
 
 
 def corpus_subdir(snapshot_dir: str | os.PathLike[str]) -> Path:
@@ -174,7 +179,16 @@ def freeze_snapshot(
 def load_manifest(snapshot_dir: str | os.PathLike[str]) -> SnapshotManifest:
     """Load a previously-frozen ``manifest.json`` from a snapshot dir."""
     snapshot_dir = Path(snapshot_dir)
-    raw = json.loads((snapshot_dir / MANIFEST_FILENAME).read_text(encoding="utf-8"))
+    manifest_path = snapshot_dir / MANIFEST_FILENAME
+    # Size-gate BEFORE read_text() — a multi-GB crafted manifest.json would
+    # exhaust memory before the hash-gate runs (mirrors scrub._load_spans).
+    size = manifest_path.stat().st_size
+    if size > MAX_MANIFEST_FILE_BYTES:
+        raise ValueError(
+            f"manifest.json is {size} bytes, over the "
+            f"{MAX_MANIFEST_FILE_BYTES}-byte cap (refusing to load)"
+        )
+    raw = json.loads(manifest_path.read_text(encoding="utf-8"))
     # Light type validation before constructing the manifest (NIT d, mirrors the
     # scrub-span fix): manifest.json is edit-controlled, so a tampered shape must
     # surface as a clean ValueError here rather than corrupting downstream
