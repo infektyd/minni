@@ -2266,8 +2266,17 @@ class RetrievalEngine:
             if depth == "document":
                 raw["full_document_text"] = self._fetch_full_document(r["doc_id"])
 
-            results.append(self._apply_depth(raw, depth))
-            results[-1]["query_variants"] = query_variants
+            # S7: self-labeling recall package — primary (rank 1) vs related (2..N).
+            # Rank is 1-based by position in the final results list (post-rerank order).
+            _result_rank = len(results) + 1
+            raw["match_kind"] = "primary" if _result_rank == 1 else "related"
+            raw["related_rank"] = None if _result_rank == 1 else _result_rank - 1
+
+            projected = self._apply_depth(raw, depth)
+            projected["match_kind"] = raw["match_kind"]
+            projected["related_rank"] = raw["related_rank"]
+            projected["query_variants"] = query_variants
+            results.append(projected)
 
             if update_access:
                 with self.db.cursor() as c:
