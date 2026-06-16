@@ -1983,7 +1983,14 @@ class RetrievalEngine:
                     {"doc_id": r.get("doc_id"), "score": r.get("rerank_score")}
                     for r in merged
                 ]
-                merged = merged[:self.config.reranker_final_k]
+                # S-1 fix: respect the caller's limit. reranker_final_k is a
+                # precision-tuning floor (controls how many cross-encoder scores
+                # we pay for), NOT a hard recall cap. When limit > final_k
+                # (e.g. limit=10, final_k=5) the old code structurally capped
+                # recall@10 at 0.5 — we keep max(final_k, limit) so that
+                # limit=5 callers see no behaviour change and limit=10 callers
+                # get up to 10 post-rerank results.
+                merged = merged[:max(self.config.reranker_final_k, limit)]
             else:
                 merged = merged[:limit]
 
@@ -2036,7 +2043,10 @@ class RetrievalEngine:
                             )
                             if self.config.reranker_enabled and self.reranker:
                                 hyde_merged = self._rerank(query, hyde_merged)
-                                hyde_merged = hyde_merged[:self.config.reranker_final_k]
+                                # S-1 fix (HyDE branch): same max() guard as the
+                                # main rerank path — limit must not be capped
+                                # below the caller's requested count.
+                                hyde_merged = hyde_merged[:max(self.config.reranker_final_k, limit)]
                             else:
                                 hyde_merged = hyde_merged[:limit]
                             merged = merge_hyde_results(
