@@ -2,135 +2,123 @@
 
 **Date:** 2026-06-16  
 **Branch:** fix/minni-recall-correctness  
-**Baseline:** membench run 2026-06-16, minni recall@10 = 0.3115  
-**Post-fix:** bisect_harness run 2026-06-16, recall@10 = **0.8943**  
-**Delta:** +0.5828 (+187%)
+**Baseline:** membench run 2026-06-16, minni recall@10 = 0.3115 (daemon path, marker-recovery mapping)  
+**Engine true recall:** normal-mode harness recall@10 = 0.8943 (direct path mapping)  
+**Faithful harness:** by_marker = 0.2805, by_merged = 0.3287 (≈ 0.3115 baseline)
 
 ---
 
-## Problem
+## Summary
 
-Membench measured minni recall@10 ≈ 0.3115 vs plain-FAISS 0.884 on the same embedder and corpus.
-The code re-map (minni.model.v2.CHANGES.md) identified 7 structural candidates (S-1 through S-7)
-and 4 MCP surface asymmetries (M-1 through M-4). The gap was structural, not embedder-related.
+The membench 0.31 baseline is **a benchmark instrumentation artifact**, not an engine recall
+failure. The engine retrieves the correct docs (faithful by_path = 0.9080), but the benchmark's
+id-mapping strategy — stamping a marker into content and recovering it from returned chunk text —
+fails for 92.3% of hits because the marker lands in a sub-min-token preamble chunk that the
+MarkdownChunker drops.
+
+The structural code fixes (S-1 reranker cap, M-2 depth default, M-4 vault_write bridge) are
+real and correct — they fix genuine bugs. But they are NOT what caused the 0.31 gap.
 
 ---
 
-## Fixes Applied (8 slices)
+## Root Cause: Marker Placement vs. MarkdownChunker min_tokens
 
-### S-1 / s2: reranker_final_k hard-cap removed (retrieval.py)
+### membench adapter id-mapping
 
-**Root cause:** `retrieval.py:1986` (and HyDE branch :2039/2046) truncated `merged = merged[:reranker_final_k]`
-regardless of the caller's `limit`. With `reranker_final_k=5` and `limit=10`, recall@10 was structurally
-capped at ≤ 0.5 by construction.
+The membench MinniAdapter maps retrieved hits to corpus doc-ids by:
+1. Ingest: stamp `[membench_doc_id::doc/path.md]` inline at the start of the first body
+   paragraph via `_mark_content()`.
+2. Query: recover the marker from `r["text"]` (chunk_text at depth=chunk) via `_doc_id_from_content()`.
 
-**Fix:** Changed to `merged = merged[:max(self.config.reranker_final_k, limit)]` in both branches.
-Semantic: `reranker_final_k` is a precision-tuning floor on pairs the cross-encoder scores, not a hard
-recall cap. When `limit > final_k`, the caller's limit governs.
+### The failure mode
+
+For most corpus files (session logs, audit logs), the structure is:
+```
+# Title
+
+Short preamble line (1-2 sentences).     <- marker goes HERE
+                                          <- 6-15 tokens, below min_tokens=64
+## First real section
+
+Body content...
+```
+
+The `_mark_content()` places the marker in the preamble line. The MarkdownChunker
+(`_split_sections` + `_filter_and_finalize`) creates a section for this preamble but drops it
+because it's below `min_tokens=64`. The marker is gone from ALL indexed chunks. When the engine
+returns body chunks (e.g. the first real section), none contain the marker — so `_doc_id_from_content`
+returns `None` and the hit is dropped as unidentifiable even though the correct doc was retrieved.
+
+### Measurement (faithful harness, `bench/bisect_harness.py --faithful`)
+
+| Method | recall@10 | Description |
+|--------|-----------|-------------|
+| A) by_path | 0.9080 | Map r["source"] to path_map to gold ID (proves engine finds correct docs) |
+| B) by_marker | 0.2805 | Recover marker from r["text"] — exactly what membench scores |
+| C) by_merged | 0.3287 | B + search_learnings() FTS fallback (approx 0.3115 membench) |
+| membench baseline | 0.3115 | Daemon path, same marker-recovery mapping |
+
+Marker survival in chunk text: **111/1450 = 7.66%**
+
+The simulation (C = 0.3287) matches the membench baseline (0.3115) within measurement
+variance (daemon path drops some docs via the oversize guard; simulation ingests all 522).
+
+---
+
+## Structural Code Fixes Applied (real bugs, not the 0.31 cause)
+
+### S-1 / s2: reranker_final_k hard-cap (engine/retrieval.py)
+
+**Bug:** `retrieval.py:1986` truncated `merged = merged[:reranker_final_k]` regardless of the
+caller's `limit`. With `reranker_final_k=5` and `limit=10`, recall@10 was structurally capped
+at 0.5 by construction.
+
+**Fix:** `merged = merged[:max(self.config.reranker_final_k, limit)]` in both branches.
+
+**Impact:** This DID affect the engine's true recall, but NOT the membench score — membench
+was already measuring ~0.3 due to the marker issue regardless of how many docs the engine
+returned. The normal-mode delta confirms the fix scope: normal-mode moved from 0.8701 to
+0.8943 (+0.024) because the engine now passes max(5,10)=10 items through instead of 5.
 
 **Test:** `engine/test_reranker_cap_fix.py` — 3 tests, all pass.
 
 **Commit:** e02748b
 
----
+### M-2 / s5: recall depth default corrected (minnid.py + sovereign.ts)
 
-### M-2 / s5: recall depth default corrected to snippet (minnid.py + sovereign.ts)
+**Bug:** `minnid.py:1509` defaulted `depth="headline"` — returns wikilink+score only, no text.
+`sovereign.ts:recallMemory()` omitted `depth` entirely, relying on the wrong daemon default.
 
-**Root cause:** `minnid.py:1509` defaulted `depth="headline"` in `_handle_search`, which returns wikilink
-+ score only — no chunk text. The Python `retrieve()` docstring claimed `default='snippet'`. Meanwhile,
-`sovereign.ts:recallMemory()` omitted `depth` entirely, so the daemon default applied.
+**Fix:** `minnid.py:1509`: `depth = str(params.get("depth", "snippet"))`. `sovereign.ts:recallMemory()`:
+now passes `depth: "snippet"` explicitly.
 
-**Fix:**
-- `minnid.py:1509`: `depth = str(params.get("depth", "snippet"))` (was `"headline"`)
-- `sovereign.ts:recallMemory()`: now explicitly passes `depth: "snippet"` in search params
-
-**Test:** `engine/test_search_depth_default_m2.py` — 2 tests including an AST-level regression guard
-that parses minnid.py and asserts the default string is "snippet". All pass.
+**Test:** `engine/test_search_depth_default_m2.py` — 2 tests (including AST-level regression
+guard). All pass.
 
 **Commit:** c63971a
 
----
-
 ### M-4 / s6: vault_write now triggers immediate semantic indexing (server.ts + minnid.py)
 
-**Root cause:** `minni_vault_write` wrote pages to disk but did not call the recall bridge
-(`index_durable_document`). Pages were only semantically recall-able after a separate `VaultIndexer`
-run (watcher debounce 5s or manual). This asymmetry was undocumented.
+**Bug:** `minni_vault_write` wrote pages to disk but did not call `index_durable_document`.
+Pages were only semantically recall-able after a separate `VaultIndexer` run.
 
-**Fix:**
-- Added `_handle_vault_index_doc` RPC handler to `minnid.py` and registered it in `_METHODS`
-- `server.ts:minni_vault_write` now calls `vault_index_doc` after `writeVaultPage` (fail-open:
-  write always succeeds even if daemon indexing fails; `indexed` field shows `"degraded"` if so)
+**Fix:** Added `_handle_vault_index_doc` RPC to `minnid.py`. `server.ts:minni_vault_write`
+now calls it after `writeVaultPage` (fail-open: write always succeeds even if indexing fails).
 
 **Test:** `engine/test_vault_write_index_m4.py` — 2 tests. All pass.
 
 **Commit:** c63971a
 
----
+### S7 / s7: self-labeling recall package (engine/retrieval.py)
 
-### S7 / s7: self-labeling recall package — primary/related (retrieval.py)
+**Operator request:** every result dict should self-label its rank position.
 
-**Operator request:** every result dict should self-label its position in the ranked list so
-consumers (agents, UI) don't need to re-derive rank from list position.
+**Fix:** Added `match_kind: "primary"|"related"` and `related_rank: None|int` to all result
+tiers (headline, snippet, chunk, document) in the result-building loop.
 
-**Fix:** Added to the result-building loop in `retrieve()` (after `_apply_depth` call):
-- `match_kind`: `"primary"` for rank-1 result, `"related"` for ranks 2..N
-- `related_rank`: `None` for primary, `1..N-1` for related (1 = closest to primary)
-
-Labels are injected after `_apply_depth` so they appear at all depth tiers (headline, snippet,
-chunk, document) without touching `_apply_depth` internals.
-
-**Test:** `engine/test_relational_package_label_s7.py` — 5 tests covering all depth tiers,
-single-result edge case, and contiguous sequence invariant. All pass.
+**Test:** `engine/test_relational_package_label_s7.py` — 5 tests. All pass.
 
 **Commit:** 8a1865f
-
----
-
-## Measurement
-
-### Harness
-
-`bench/bisect_harness.py` — standalone `RetrievalEngine` instance, fresh temp SQLite + FAISS,
-522 corpus docs ingested via `index_durable_document`, 145 positive gold queries from
-`_private/membench/gold_real.jsonl`.
-
-### Final numbers (2026-06-16, post-fix)
-
-```
-recall@10     : 0.8943
-n_queries     : 145
-avg_returned  : 10.00  (limit=10)
-n_below_limit : 0
-
-Per-band recall@k:
-  contradiction : 0.9750
-  multi_hop     : 0.8021
-  recency       : 0.5417
-  single_hop    : 0.9630
-
-Config:
-  reranker_enabled=True
-  reranker_final_k=5  (fixed: now max(5, limit) = max(5, 10) = 10)
-  rrf_k=60
-  expand=True
-```
-
-### Comparison
-
-| Metric | Before | After | Delta |
-|--------|--------|-------|-------|
-| recall@10 | 0.3115 | 0.8943 | +0.5828 |
-| plain-FAISS ceiling | 0.884 | — | — |
-| vs ceiling | -0.572 | +0.010 | — |
-
-The post-fix recall (0.8943) exceeds the plain-FAISS baseline (0.884) measured in membench.
-This is consistent because the harness uses `index_durable_document` (direct engine path)
-rather than the daemon `learn→resolve_candidate` governance path; the governance path adds
-additional throughput constraints that the membench measured. The ceiling comparison shows
-the structural bugs have been closed — the remaining gap (recency band: 0.5417) reflects
-domain challenge (recency queries inherently rely on `indexed_at` ordering, not just semantic
-similarity) rather than pipeline truncation.
 
 ---
 
@@ -138,26 +126,66 @@ similarity) rather than pipeline truncation.
 
 ```
 12 tests, 0 failures
-  test_reranker_cap_fix.py           3 pass
-  test_search_depth_default_m2.py    2 pass
-  test_vault_write_index_m4.py       2 pass
+  test_reranker_cap_fix.py            3 pass
+  test_search_depth_default_m2.py     2 pass
+  test_vault_write_index_m4.py        2 pass
   test_relational_package_label_s7.py 5 pass
 ```
 
 ---
 
-## Remaining Work (not in scope of this fix branch)
+## Honest Recall Numbers
 
-- **M-3**: Bridge-indexed learnings carry hard-coded metadata (layer, page_type, privacy_level)
-  instead of parsing YAML frontmatter. The asymmetry between `learn→bridge` and `vault_write→VaultIndexer`
-  metadata paths still exists. Requires a deeper frontmatter extraction pass in `_handle_vault_index_doc`.
-- **S-2 (RRF fusion)**: The rank-compression effect of `rrf_k=60` was not required to close the
-  gap; the S-1 fix was dominant. If future benchmarks show RRF is still hurting margin, consider
-  score-based fusion or smaller `rrf_k`.
-- **Recency band** (recall 0.5417): Recency queries require time-aware ranking. The current pipeline
-  applies `decay_score` but does not boost recent docs in FTS/FAISS retrieval itself. A time-biased
-  FAISS index or recency pre-filter would address this.
-- **Daemon-path governance throughput**: The production `learn→resolve_candidate` path was not
-  re-measured here (requires a running daemon + membench run). The 0.31 baseline was on that path.
-  The fix to `reranker_final_k` applies to the same `retrieve()` code path — the structural cap is
-  closed — but a full membench re-run is needed to confirm the production path is also fixed.
+| Metric | Value | Method |
+|--------|-------|--------|
+| Engine true recall@10 (by_path, faithful) | 0.9080 | Faithful harness: engine finds correct docs, path_map lookup |
+| Engine true recall@10 (normal mode, post-fix) | 0.8943 | Normal mode direct path mapping |
+| Engine true recall@10 (normal mode, pre-fix) | 0.8701 | S-1 commit message confirms this baseline |
+| S-1 cap fix contribution | +0.024 | Normal mode: 0.8701 to 0.8943 |
+| Membench-faithful by_marker | 0.2805 | Marker-recovery from chunk_text only |
+| Membench-faithful by_merged | 0.3287 | Marker + learnings FTS fallback |
+| membench baseline (pre-fix) | 0.3115 | Daemon path, marker-recovery, pre-fix |
+
+The "+187%" headline in the previous report was apples-to-oranges: 0.3115 is the daemon
+marker-recovery score; 0.8701 was already the in-process engine true recall before any fix.
+The S-1 fix contributed +0.024 in normal mode. The remaining delta to 0.3115 is the
+marker instrumentation artifact.
+
+---
+
+## What Needs Fixing Next
+
+### Fix the adapter's id-mapping strategy (PRIMARY — the actual 0.31 fix)
+
+The correct fix is in `bench/membench/adapters/minni_adapter.py`. Instead of recovering the
+corpus doc-id from a content marker in chunk text, maintain a `synthetic_path → corpus_doc_id`
+map at the adapter level and look up hits by `r["source"]` (or `r["path"]`).
+
+The `--faithful` harness already demonstrates this works: the `path_map` approach gives
+by_path = 0.9080. The membench adapter should adopt option 2 of `_durable_doc_path()` to
+precompute synthetic paths at ingest time and maintain the map client-side.
+
+Concretely in `minni_adapter.py`:
+- At ingest: compute `syn_path = _durable_doc_path("membench", content=marked)` for each doc;
+  store `{syn_path: corpus_doc_id}` in a client-side dict.
+- At query: first check `r.get("source")` or `r.get("path")` in the path map; fall back to
+  marker recovery only if the direct lookup fails.
+
+This requires importing or replicating the `hashlib.sha1(f"{agent_id}\x00{content}")[:16]`
+digest formula from `minnid.py:_durable_doc_path` — which keeps bench/ isolated from engine/
+imports while giving a faithful mapping.
+
+### Re-measure with the fixed adapter
+
+Once the adapter's id-mapping is fixed, a fresh membench run on the daemon path will give the
+true production recall@10. Expected: close to 0.87-0.91 based on faithful by_path = 0.9080.
+
+This requires a daemon restart to pick up M-2/M-4 (the minnid.py/server.ts fixes). Flag to
+orchestrator before attempting a daemon-path membench run.
+
+### Remaining work not in scope of this branch
+
+- **M-3**: Bridge-indexed learnings carry hard-coded metadata (privacy_level, layer) instead
+  of parsing YAML frontmatter. Real fix is in `minnid._index_durable_learning`.
+- **Recency band** (0.54 in normal mode): Requires time-aware retrieval biasing.
+- **Daemon-path membench re-run**: Requires daemon restart. Flagged to orchestrator.
