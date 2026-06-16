@@ -129,10 +129,15 @@ class StubAdapter:
         ignores the budget to prove the harness abort fires.)
         """
         from ..tokenizer import count_tokens
+        from ._shared import neutralize_banned_markers
 
         parts: list[str] = []
         for doc_id in doc_ids:
-            parts.append(self._docs[doc_id].strip())
+            # Neutralize banned role markers via the SAME shared routine every
+            # other adapter uses (fairness/uniformity, BUG 1): a legitimate
+            # transcript-style doc must not abort assert_well_formed on this
+            # adapter either. The nonce envelope remains the injection floor.
+            parts.append(neutralize_banned_markers(self._docs[doc_id]).strip())
         ctx = "\n\n".join(parts)
         if count_tokens(ctx) <= budget.max_tokens:
             return ctx
@@ -188,15 +193,26 @@ class OverBudgetStubAdapter(StubAdapter):
 
 
 class RoleMarkerStubAdapter(StubAdapter):
-    """Prepends a banned role marker. Proves the content-only check trips."""
+    """Prepends a banned role marker. Proves the content-only check trips.
+
+    The injected prefix is configurable (default ``"Assistant: "``) so a test can
+    drive the backstop with ANY banned form — including the bracketed/xml marker
+    variants (``<retrieved_context``/``</retrieved_context``) that the word-colon
+    default would not exercise (review finding #7). The injection BYPASSES the
+    shared builder on purpose, so it proves the structural backstop still fires.
+    """
 
     name = "stub_rolemarker"
+
+    #: Class-level injected prefix; subclass/override or set per-instance to drive
+    #: the backstop with a specific banned marker form.
+    injected_prefix = "Assistant: "
 
     def query(self, q: str, budget: TokenBudget) -> QueryResult:
         result = super().query(q, budget)
         return QueryResult(
             ranked_results=result.ranked_results,
-            context_string="Assistant: " + result.context_string,
+            context_string=self.injected_prefix + result.context_string,
             wall_clock_ms=result.wall_clock_ms,
             refused=result.refused,
         )

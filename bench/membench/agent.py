@@ -111,7 +111,18 @@ class StubAgent:
         self, context: str, question: str, *, gold_fact: str, nonce: str | None = None
     ) -> AgentResult:
         tokens = _count_prompt_tokens(context, question, nonce)
-        if gold_fact and gold_fact in context:
+        # Banned role markers in the retrieved context are NEUTRALIZED by the
+        # shared context-builder (a zero-width space is inserted inside any
+        # ``ASSISTANT:``/``HUMAN:``/… so a benign transcript-style corpus doc is
+        # preserved without forging a turn boundary — see
+        # adapters/_shared.neutralize_banned_markers). The gold fact is matched
+        # against the SAME neutralized text the model sees, so a gold fact that
+        # legitimately contains a marker still matches after neutralization.
+        from .adapters._shared import neutralize_banned_markers
+
+        if gold_fact and neutralize_banned_markers(gold_fact) in neutralize_banned_markers(
+            context
+        ):
             # The stub "answers correctly" by asserting the gold fact verbatim.
             return AgentResult(answer=gold_fact, tokens_to_model=tokens)
         return AgentResult(answer=IDK, tokens_to_model=tokens)

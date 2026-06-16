@@ -39,6 +39,7 @@ BANNED_ROLE_MARKERS: tuple[str, ...] = (
     "<system>",
     "</system>",
     "<retrieved_context",
+    "</retrieved_context",
 )
 
 # Harness-side input validation bound (§3.1).

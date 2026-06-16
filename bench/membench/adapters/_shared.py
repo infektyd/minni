@@ -17,10 +17,93 @@ import functools
 import re
 
 from .. import config
-from ..contract import FrozenCorpus, RankedDoc, TokenBudget
+from ..contract import BANNED_ROLE_MARKERS, FrozenCorpus, RankedDoc, TokenBudget
 from ..tokenizer import count_tokens
 
 _WORD = re.compile(r"\S+")
+
+# ---------------------------------------------------------------------------
+# Banned-role-marker NEUTRALIZATION (real-corpus hardening)
+# ---------------------------------------------------------------------------
+# Real vault docs (session transcripts, agent-design notes) legitimately contain
+# turn markers like ``ASSISTANT:`` / ``HUMAN:`` / ``SYSTEM:``. The original
+# ``assert_well_formed`` hard-REJECTED any context_string containing one of
+# ``contract.BANNED_ROLE_MARKERS`` (case-insensitive substring), so every adapter
+# that surfaced such a doc ABORTED the whole run — 5 of 7 adapters failed on the
+# operator's 522-doc vault even though the docs were benign corpus content.
+#
+# The injection defense that actually matters is NOT this substring reject: it is
+# the s5 nonce-delimited untrusted-data envelope in ``layer2_prompt.py`` (a
+# per-run hex nonce the corpus cannot predict, plus literal-tag escaping). That
+# envelope is the injection FLOOR. Discarding legitimate corpus content because it
+# happens to contain the literal string ``ASSISTANT:`` neither raises that floor
+# nor preserves recall — it just throws away real signal.
+#
+# So instead of hard-rejecting, we NEUTRALIZE: every banned role marker found in
+# document-derived text is rewritten by inserting a zero-width space before its
+# trailing colon (``ASSISTANT:`` -> ``ASSISTANT​:``) or, for the bracketed /
+# chat-template forms, before the closing delimiter. The literal turn-marker
+# SUBSTRING therefore no longer appears in the context_string, so the harness's
+# own string-level backstop (``assert_well_formed`` / ``find_banned_markers``)
+# stops firing on legitimate corpus content, BUT the real content (and any
+# gold-fact substring up to the marker token) is preserved and the run is NOT
+# aborted. ``assert_well_formed`` keeps its check as a structural BACKSTOP on the
+# harness's own wrapping — after neutralization it should never trip on
+# document-derived content.
+#
+# PRECISION (review finding #4): the ZWSP defeats the HARNESS's substring check;
+# it does NOT guarantee an LLM tokenizer cannot reassemble the marker (ZWSP is
+# commonly stripped as whitespace). The model-level injection defenses are the
+# nonce envelope and the system-prompt data-only instruction (above) — NOT this
+# neutralization. This change does not weaken those.
+#
+# This neutralization lives in the SHARED ``build_context`` so it is applied
+# UNIFORMLY for every adapter that routes through it (fairness §7.2/§7.5): no
+# adapter can quietly skip it or apply a different rule.
+_ZWSP = "​"  # zero-width space — breaks the literal marker, invisible to readers
+
+# Pre-compile a case-insensitive pattern for each banned marker. Neutralization
+# inserts a zero-width space before the marker's final character (the ``:`` for
+# ``WORD:`` markers, the closing ``>``/``|>`` delimiter for the bracketed/template
+# forms) so the literal delimiter is never reconstructible by a substring scan.
+_MARKER_REPLACEMENTS: tuple[tuple[re.Pattern[str], str], ...] = tuple(
+    # Case-insensitive: the contract matches markers case-insensitively, so a
+    # doc containing ``Assistant:`` must be neutralized too. ``re.escape`` keeps
+    # the bracketed/template forms (``<|assistant|>`` etc.) literal.
+    (re.compile(re.escape(marker), re.IGNORECASE), marker)
+    for marker in BANNED_ROLE_MARKERS
+)
+
+
+def neutralize_banned_markers(text: str) -> str:
+    """Neutralize every banned role marker in document-derived ``text``.
+
+    Inserts a zero-width space inside each occurrence of a marker from
+    ``contract.BANNED_ROLE_MARKERS`` (case-insensitively) so the literal
+    turn-marker substring can never reach the model, while the surrounding real
+    content is preserved verbatim. Idempotent on already-neutralized text (a
+    marker split by ``\\u200b`` no longer matches).
+
+    SCOPE OF THIS PROTECTION (review finding #4 — be precise, do not overstate):
+    this neutralization stops the harness's OWN string-level backstop
+    (``assert_well_formed`` / ``find_banned_markers``, plain substring checks) from
+    firing on legitimate corpus content. It does NOT prevent an LLM tokenizer from
+    reassembling the marker — most tokenizers either strip U+200B as whitespace or
+    emit a token sequence identical to the un-split marker, so the model MAY still
+    read ``ASSISTANT​:`` as a turn boundary. The ACTUAL injection mitigations are
+    (1) the s5 nonce-delimited untrusted-data envelope in ``layer2_prompt.py`` that
+    wraps the entire context block, and (2) the system-prompt instruction to treat
+    everything inside as data. Neither is weakened here; this change neither raises
+    nor lowers that injection floor.
+    """
+    for pattern, marker in _MARKER_REPLACEMENTS:
+        # Preserve the matched case: rebuild the neutralized form from the actual
+        # matched substring (so ``Assistant:`` stays ``Assistant​:``), not
+        # from the canonical upper-case marker.
+        text = pattern.sub(
+            lambda m: m.group(0)[:-1] + _ZWSP + m.group(0)[-1:], text
+        )
+    return text
 
 
 # ---------------------------------------------------------------------------
@@ -114,7 +197,11 @@ def build_context(
 ) -> str:
     """Concatenate retrieved whole-file doc bodies, trimmed to fit the budget.
 
-    Content-only (no role markers, no boundary tags — §3.1). Adds docs in rank
+    Content-only (no boundary tags — §3.1); any banned role marker in the
+    document bodies is NEUTRALIZED (zero-width space) rather than rejected, so a
+    legitimate transcript-style doc is preserved without tripping the harness's
+    string-level backstop or aborting the run (see ``neutralize_banned_markers``
+    for the precise — string-level, not model-level — scope of that). Adds docs in rank
     order while the running token count stays within ``budget.max_tokens``; the
     first doc that would overflow is trimmed at a word boundary to fill the
     remaining budget exactly, and construction stops. The harness still owns the
@@ -125,7 +212,15 @@ def build_context(
     used = 0
     sep_tokens = count_tokens("\n\n")
     for doc_id in doc_ids:
-        body = docs[doc_id].strip()
+        # Neutralize banned role markers in the document-derived body BEFORE
+        # measuring/trimming so the budgeted string never carries the literal
+        # turn-marker SUBSTRING (and so the harness's string-level backstop never
+        # trips on legitimate corpus content). Done in the shared builder so the
+        # rule is uniform for every adapter (fairness). The nonce envelope + the
+        # data-only system prompt remain the actual model-level injection floor;
+        # this neutralization is a harness-string concern, not a model-level guard
+        # (see neutralize_banned_markers), and it preserves real content.
+        body = neutralize_banned_markers(docs[doc_id]).strip()
         if not body:
             continue
         add_sep = sep_tokens if parts else 0

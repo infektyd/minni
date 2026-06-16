@@ -62,27 +62,67 @@ from . import _shared
 # against a crash-looping or rogue process on the socket path.
 MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 
+# The daemon caps a single JSON-RPC REQUEST line at 1 MiB (minnid.py
+# _SOCKET_BODY_LIMIT): a request whose framed bytes exceed that makes the daemon
+# emit an error and CLOSE the connection. Over a large real corpus a single
+# multi-megabyte doc would therefore (a) be rejected and (b) drop the connection,
+# and the NEXT send on that already-closed socket would surface as a bare
+# BrokenPipeError with no diagnosis. We keep a slightly-conservative client-side
+# cap so an oversized doc is detected BEFORE we write it: such a doc is recorded
+# and SKIPPED (counted as skipped, not promoted) instead of killing the ingest.
+#
+# CRITICAL (review finding #1): the guard MUST measure the ACTUAL bytes that go
+# on the wire — i.e. the framed `json.dumps(request) + "\n"` payload — NOT the raw
+# UTF-8 byte count of the content. `json.dumps` defaults to ensure_ascii=True,
+# which escapes every non-ASCII codepoint as a 6-byte `\uXXXX` sequence (vs. up
+# to 4 UTF-8 bytes). For CJK/emoji-heavy real-world docs the JSON payload can be
+# ~2x the raw UTF-8 size, so measuring the raw size would let a ~700 KB doc pass
+# the guard yet produce a >1 MiB payload that the daemon rejects — dropping the
+# connection and resurrecting the exact BrokenPipeError this guard prevents. We
+# therefore frame the real request and measure THAT.
+DAEMON_REQUEST_LIMIT_BYTES = 1_048_576  # mirrors minnid.py _SOCKET_BODY_LIMIT
+# Small headroom under the daemon's hard cap so a doc sitting exactly at the limit
+# (or a daemon whose cap is measured slightly differently) is skipped rather than
+# racing the boundary.
+_REQUEST_FRAMING_MARGIN = 4096
+MAX_FRAMED_REQUEST_BYTES = DAEMON_REQUEST_LIMIT_BYTES - _REQUEST_FRAMING_MARGIN
+
 # Local-path redaction for anything we surface in an exception (pytest output,
 # logs). Mirrors minnid.py's _LOCAL_PATH_PATTERN but is defined here to keep
 # bench/ structurally isolated from engine/ (§7.5). Applied to raw daemon
 # stdout/stderr before embedding — the daemon does NOT redact what it writes to
 # the subprocess pipe.
+#
+# SPACE-IN-PATH (review finding #2): a POSIX path may legally contain spaces
+# (e.g. ``/Users/jane doe/.minni``). A stop class that halts at a bare space
+# (``[^ \n\r\t"'<>]+``) would redact only ``/Users/jane`` and LEAK the
+# ``doe/.minni`` continuation. We therefore build the per-root tail so it
+# consumes a space ONLY when it is INTERNAL to the path — i.e. immediately
+# followed by another path-character (``(?: [^\s"'<>])`` ). A trailing space, or
+# a space before a quote/newline/tab/angle-bracket, is still treated as the path
+# boundary, so we do not greedily swallow following prose. This is the safer
+# practical fix: paths with single internal spaces are fully redacted, while a
+# space that genuinely terminates the token still ends it.
+_PATH_CHAR = r"[^\s\"'<>]"
+# One path char, then zero-or-more of (path char | a single space wedged before
+# another path char). The space alternative cannot match a run-ending space.
+_PATH_TAIL = rf"{_PATH_CHAR}(?:{_PATH_CHAR}| {_PATH_CHAR})*"
 _LOCAL_PATH_PATTERN = re.compile(
-    r"(?:/Users/[^ \n\r\t\"'<>]+"
-    r"|/Volumes/[^ \n\r\t\"'<>]+"
-    r"|/private/[^ \n\r\t\"'<>]+"
-    r"|/var/folders/[^ \n\r\t\"'<>]+"  # macOS per-user temp (TMPDIR / mkdtemp)
-    r"|/var/[^ \n\r\t\"'<>]+"
-    r"|/home/[^ \n\r\t\"'<>]+"  # Linux CI runners (e.g. /home/runner/)
-    r"|/opt/[^ \n\r\t\"'<>]+"  # Homebrew / opt installs (e.g. /opt/homebrew/)
-    r"|/root/[^ \n\r\t\"'<>]+"  # Linux root home
-    r"|/tmp/[^ \n\r\t\"'<>]+"
-    r"|/proc/[^ \n\r\t\"'<>]+"  # Linux process table (e.g. /proc/1/environ)
-    r"|/dev/[^ \n\r\t\"'<>]+"  # device nodes (e.g. /dev/sda1)
-    r"|/etc/[^ \n\r\t\"'<>]+"  # system config (e.g. /etc/shadow)
-    r"|/sys/[^ \n\r\t\"'<>]+"  # Linux sysfs
-    r"|/run/[^ \n\r\t\"'<>]+"  # runtime state (e.g. /run/secrets)
-    r"|/mnt/[^ \n\r\t\"'<>]+)"  # mount points
+    r"(?:/Users/" + _PATH_TAIL
+    + r"|/Volumes/" + _PATH_TAIL
+    + r"|/private/" + _PATH_TAIL
+    + r"|/var/folders/" + _PATH_TAIL  # macOS per-user temp (TMPDIR / mkdtemp)
+    + r"|/var/" + _PATH_TAIL
+    + r"|/home/" + _PATH_TAIL  # Linux CI runners (e.g. /home/runner/)
+    + r"|/opt/" + _PATH_TAIL  # Homebrew / opt installs (e.g. /opt/homebrew/)
+    + r"|/root/" + _PATH_TAIL  # Linux root home
+    + r"|/tmp/" + _PATH_TAIL
+    + r"|/proc/" + _PATH_TAIL  # Linux process table (e.g. /proc/1/environ)
+    + r"|/dev/" + _PATH_TAIL  # device nodes (e.g. /dev/sda1)
+    + r"|/etc/" + _PATH_TAIL  # system config (e.g. /etc/shadow)
+    + r"|/sys/" + _PATH_TAIL  # Linux sysfs
+    + r"|/run/" + _PATH_TAIL  # runtime state (e.g. /run/secrets)
+    + r"|/mnt/" + _PATH_TAIL + r")"  # mount points
 )
 
 
@@ -184,14 +224,37 @@ class MinniStandupError(RuntimeError):
     """
 
 
-def _rpc(socket_path: Path, method: str, params: dict, timeout: float = 30.0) -> dict:
-    """Send one JSON-RPC request over the public Unix-socket protocol."""
+def _frame_request(method: str, params: dict) -> bytes:
+    """Frame a JSON-RPC request EXACTLY as it is written on the wire.
+
+    Single source of truth for the bytes a request occupies: both ``_rpc`` (which
+    sends it) and the ingest oversize guard (which measures it) call this, so the
+    guard can never diverge from the actual payload size. ``json.dumps`` defaults
+    to ``ensure_ascii=True`` (the wire format), so non-ASCII content expands to
+    ``\\uXXXX`` escapes here — measuring this byte string is byte-accurate for the
+    framed payload (review finding #1).
+    """
     request = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
-    payload = (json.dumps(request) + "\n").encode("utf-8")
+    return (json.dumps(request) + "\n").encode("utf-8")
+
+
+def _rpc(socket_path: Path, method: str, params: dict, timeout: float = 30.0) -> dict:
+    """Send one JSON-RPC request over the public Unix-socket protocol.
+
+    Resilient to a daemon that has died or closed the connection: a broken pipe,
+    connection reset, refused connect, or EOF-before-response is surfaced as a
+    redacted ``MinniStandupError`` (never a bare ``BrokenPipeError``) so a daemon
+    death mid-ingest is diagnosable rather than an opaque socket traceback.
+    """
+    payload = _frame_request(method, params)
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     s.settimeout(timeout)
     try:
         s.connect(str(socket_path))
+        # sendall on an already-closed/dead daemon raises BrokenPipeError /
+        # ConnectionResetError (EPIPE/ECONNRESET). Convert to MinniStandupError so
+        # the ingest loop can attribute it to a daemon death and surface a clear,
+        # redacted reason — never a bare broken pipe escaping to pytest/CI.
         s.sendall(payload)
         chunks: list[bytes] = []
         total_bytes = 0
@@ -209,6 +272,15 @@ def _rpc(socket_path: Path, method: str, params: dict, timeout: float = 30.0) ->
                 )
             if b"\n" in chunk:
                 break
+    except (BrokenPipeError, ConnectionError, socket.timeout, OSError) as exc:
+        # ConnectionError covers ConnectionResetError/ConnectionRefusedError/
+        # BrokenPipeError; OSError covers ENOENT (socket gone) and friends. All of
+        # these mean the daemon is unreachable — a death/standup failure, not a
+        # protocol error. Surface redacted so no internal path leaks.
+        raise MinniStandupError(
+            f"socket I/O failed for {method!r} "
+            f"({type(exc).__name__}): {_redact(str(exc))[:200]}"
+        ) from None
     finally:
         s.close()
     buffer = b"".join(chunks)
@@ -249,12 +321,17 @@ def _rpc(socket_path: Path, method: str, params: dict, timeout: float = 30.0) ->
         msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
         msg = _redact(str(msg))[:500]
         raise MinniStandupError(f"daemon error on {method!r}: {msg}")
-    # A valid JSON-RPC response may carry an explicit `result: null`; `.get`
-    # with a default only fires when the KEY is absent, so use `or {}` to also
-    # coerce an explicit null to a dict. Downstream callers (query) do
-    # `result.get(...)`; a None here would raise a raw AttributeError that
-    # bypasses MinniStandupError handling (and the test's skip guard).
-    return resp.get("result") or {}
+    # A valid JSON-RPC response may carry an explicit `result: null`; coerce ONLY
+    # null/absent to {} so downstream `result.get(...)` callers never hit a raw
+    # AttributeError. We do NOT use `or {}` here: that also swallows other falsy
+    # JSON results ([], 0, False, "") into {}, which would (a) erase a legitimate
+    # empty-list result and (b) let a malformed `{'result': 0}`/`{'result': False}`
+    # bypass the non-dict guard above. Only None is the intended coercion
+    # (review finding #2).
+    result = resp.get("result")
+    if result is None:
+        result = {}
+    return result
 
 
 class MinniAdapter:
@@ -269,6 +346,12 @@ class MinniAdapter:
         self._socket_path: Path | None = None
         self._corpus: FrozenCorpus | None = None
         self._torn_down = False
+        # Daemon stdout+stderr are redirected to this file (NOT a pipe) so a
+        # chatty daemon ingesting hundreds of docs can never deadlock on a full
+        # 64 KiB OS pipe buffer with no reader — a real root cause of a daemon
+        # hanging/dying mid-ingest. We read it back (redacted) for diagnostics
+        # when the daemon dies.
+        self._log_path: Path | None = None
 
     # -- introspection used by the fairness-conformance test --------------
     # Minni IS a vector adapter and is the competitor being benchmarked, so it
@@ -342,11 +425,20 @@ class MinniAdapter:
         # here: filtering an allowlist that already excludes creds would be dead
         # code and a false 'we filter credentials' assurance. To keep the
         # allowlist honest, assert it shares no name with a known credential.
-        _PASSTHROUGH = ("PATH", "HOME", "LANG", "LC_ALL", "TMPDIR")
+        _PASSTHROUGH = ("PATH", "LANG", "LC_ALL", "TMPDIR")
         assert not (set(_PASSTHROUGH) & set(config.CREDENTIAL_ENV_VARS.values())), (
             "_PASSTHROUGH allowlist must never name a credential env var (§7.14)"
         )
         env = {k: os.environ[k] for k in _PASSTHROUGH if k in os.environ}
+        # HOME is NOT passed through from the operator's environment (review
+        # finding #3): the engine computes some paths relative to HOME at module
+        # load and IGNORES MINNI_HOME for them (e.g. _OPENCLAW_DIR = Path.home() /
+        # ".openclaw"). If the throwaway daemon inherited the real HOME, any such
+        # home-rooted path would land in the operator's real home. We pin HOME to
+        # the temp home so every home-rooted path the daemon derives stays under
+        # the throwaway dir, not ~. (The data-safety guard above has already
+        # proven tmp_home is outside every live root.)
+        env["HOME"] = str(tmp_home)
         env["MINNI_HOME"] = str(tmp_home)
         env["MINNI_VAULT_PATH"] = str(tmp_home / "vault")
         env["MINNI_DB_PATH"] = str(tmp_home / "minni.db")
@@ -364,13 +456,26 @@ class MinniAdapter:
         # MINNI_HOME, so enabling it would write fixture content into the
         # operator's live flat-file. Absent --dual-write, _dual_write_enabled stays
         # False and _flatfile_append is never reached (finding #4).
-        proc = subprocess.Popen(
-            [str(python), str(_MINNID_PY), "--socket", str(sock)],
-            cwd=str(_ENGINE_DIR),
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-        )
+        #
+        # stdout+stderr go to a FILE, not a pipe. With a PIPE that nobody drains,
+        # a daemon that logs heavily while ingesting hundreds of docs fills the
+        # ~64 KiB OS pipe buffer and BLOCKS on its next write — the daemon then
+        # stops answering RPCs and the next client send sees a broken pipe. A file
+        # sink has no such backpressure, and we can still read it for diagnostics.
+        log_path = tmp_home / "daemon.log"
+        self._log_path = log_path
+        log_fh = open(log_path, "wb")
+        try:
+            proc = subprocess.Popen(
+                [str(python), str(_MINNID_PY), "--socket", str(sock)],
+                cwd=str(_ENGINE_DIR),
+                env=env,
+                stdout=log_fh,
+                stderr=subprocess.STDOUT,
+            )
+        finally:
+            # The child inherits the fd; the parent does not need its own handle.
+            log_fh.close()
         self._proc = proc
         self._socket_path = sock
 
@@ -378,13 +483,9 @@ class MinniAdapter:
         deadline = time.time() + 30.0
         while time.time() < deadline:
             if proc.poll() is not None:
-                out = proc.stdout.read().decode("utf-8", "replace") if proc.stdout else ""
-                # Redact local paths (username under /Users/<name>/, vault/DB
-                # paths) before surfacing — the daemon does not redact its raw
-                # stdout captured by the subprocess pipe.
-                safe_out = _redact(out[-2000:])
                 raise MinniStandupError(
-                    f"daemon exited early (rc={proc.returncode}):\n{safe_out}"
+                    f"daemon exited early (rc={proc.returncode}):\n"
+                    f"{self._daemon_log_tail()}"
                 )
             if sock.exists():
                 try:
@@ -394,6 +495,25 @@ class MinniAdapter:
                     pass
             time.sleep(0.25)
         raise MinniStandupError("daemon did not become ready within 30s")
+
+    def _daemon_log_tail(self, limit: int = 2000) -> str:
+        """Read the throwaway daemon's captured stdout/stderr tail, redacted.
+
+        Returns ``"<no daemon log captured>"`` if the sink is unavailable. The
+        daemon does NOT redact what it writes to its own log, so every byte is run
+        through ``_redact`` before it can reach an exception / pytest / CI output.
+        """
+        if self._log_path is None or not self._log_path.exists():
+            return "<no daemon log captured>"
+        try:
+            raw = self._log_path.read_bytes()[-limit:]
+        except OSError as exc:  # pragma: no cover - defensive
+            return f"<daemon log unreadable: {type(exc).__name__}>"
+        return _redact(raw.decode("utf-8", "replace")) or "<empty daemon log>"
+
+    def _daemon_alive(self) -> bool:
+        """True iff the throwaway daemon process is still running."""
+        return self._proc is not None and self._proc.poll() is None
 
     # -- contract --------------------------------------------------------
     def ingest(self, corpus: FrozenCorpus) -> IngestReport:
@@ -430,49 +550,93 @@ class MinniAdapter:
         # retrieved learning maps back to its canonical corpus doc-id. This goes
         # through the real gate — no engine internals, no index reach-around
         # (§7.5).
+        # ROBUST large-corpus ingest (BUG 2). Over 500+ real docs the throwaway
+        # daemon must survive, and a single problematic doc must NOT abort the run.
+        # Policy:
+        #   • A doc whose framed `learn` request would exceed the daemon's 1 MiB
+        #     line cap is SKIPPED before sending (it would otherwise be rejected
+        #     AND drop the connection). Recorded as skipped, never counted as
+        #     promoted.
+        #   • A per-doc RPC failure (daemon-side error, transient I/O) while the
+        #     daemon is STILL ALIVE is recorded + SKIPPED so one bad doc does not
+        #     kill the whole ingest.
+        #   • If the daemon has DIED, we raise a clear, redacted MinniStandupError
+        #     naming how many docs succeeded — never a bare BrokenPipeError, and
+        #     never masking a real daemon crash as a successful (partial) ingest.
+        # doc_count reflects ONLY docs actually promoted (the over-count guard),
+        # so a skip can never silently inflate the reported index size.
+        all_ids = list(corpus.doc_ids())
         promoted = 0
-        for doc_id in corpus.doc_ids():
+        skipped: list[str] = []
+        for idx, doc_id in enumerate(all_ids):
             text = corpus.read(doc_id).decode("utf-8", "replace")
-            learned = _rpc(
-                self._socket_path,
-                "learn",
-                {
-                    "content": _mark_content(doc_id, text),
-                    "category": "membench_fixture",
-                    "metadata": {"membench_doc_id": doc_id},
-                },
-                timeout=60.0,
-            )
+            marked = _mark_content(doc_id, text)
+            learn_params = {
+                "content": marked,
+                "category": "membench_fixture",
+                "metadata": {"membench_doc_id": doc_id},
+            }
+
+            # Oversize guard: a request larger than the daemon's body limit is
+            # rejected by the daemon and CLOSES the connection. Skip it up front
+            # (counted as skipped) rather than letting it drop the socket and
+            # surface as a broken pipe on the NEXT doc. We measure the ACTUAL
+            # FRAMED payload (the same bytes _rpc puts on the wire), not the raw
+            # UTF-8 size of the content — JSON ascii-escaping can ~double a
+            # non-ASCII doc's byte size, and a raw-size guard would wave through a
+            # doc whose framed payload then blows the daemon's cap (finding #1).
+            if len(_frame_request("learn", learn_params)) > MAX_FRAMED_REQUEST_BYTES:
+                skipped.append(doc_id)
+                continue
+
+            try:
+                learned = _rpc(
+                    self._socket_path,
+                    "learn",
+                    learn_params,
+                    timeout=60.0,
+                )
+            except MinniStandupError as exc:
+                # A socket/daemon failure. If the daemon is gone this is a hard,
+                # diagnosable death — surface it (never mask as success). If the
+                # daemon is still alive it was a transient/per-doc fault; skip the
+                # doc and continue.
+                self._raise_if_daemon_dead(exc, promoted, idx, len(all_ids))
+                skipped.append(doc_id)
+                continue
+
+            # `_rpc` may now return a non-dict result verbatim (finding #2 stopped
+            # coercing falsy values to {}). A learn result that is not a dict can't
+            # carry a candidate_id; treat it as a per-doc miss (skip) while the
+            # daemon is alive rather than crashing on `.get`.
+            if not isinstance(learned, dict):
+                skipped.append(doc_id)
+                continue
             # Contract: IngestReport.doc_count MUST equal the number of corpus docs
             # actually PROCESSED (promoted to a durable, retrievable learning). A
             # learn response with no candidate_id (e.g. a contradiction/non-proposed
-            # path) means the doc was NOT staged for promotion — silently skipping
-            # it would over-count doc_count and mask a dropped doc. In a fresh
-            # throwaway daemon (no prior learnings) this should never happen, so
-            # treat it as a hard standup failure rather than swallowing it
-            # (finding #2).
-            status = learned.get("status")
+            # path) means the doc was NOT staged for promotion. Over a real corpus
+            # this CAN legitimately happen (a near-duplicate doc the engine treats
+            # as a contradiction rather than a fresh proposal), so we SKIP+record
+            # it rather than aborting — but we NEVER count it as promoted, so
+            # doc_count stays honest (over-count guard preserved).
+            #
+            # NOTE: the learn `status` field ('proposed'/'contradiction'/…) is
+            # informational only; the AUTHORITATIVE not-promoted indicator is
+            # candidate_id being None (a doc with no candidate cannot be resolved).
+            # We deliberately do NOT read status here (review finding #3): gating on
+            # it would duplicate the cid check and risk diverging from it.
             cid = learned.get("candidate_id")
             if cid is None:
-                # `status` is daemon-controlled. In the normal case it is a fixed
-                # engine enum string, but a rogue process on the throwaway socket
-                # (e.g. via a temp-dir symlink race) could return arbitrary content
-                # here. Redact local paths and truncate before surfacing so it
-                # cannot leak sensitive paths or blow up the exception size in
-                # pytest/CI output (review finding #3), matching the daemon-error
-                # redaction pattern above.
-                safe_status = _redact(repr(status))[:200]
-                raise MinniStandupError(
-                    f"learn returned no candidate_id for a fixture doc "
-                    f"(status={safe_status}); doc was not staged for promotion — "
-                    "refusing to over-count doc_count."
-                )
+                skipped.append(doc_id)
+                continue
             # `candidate_id` is daemon-controlled and forwarded VERBATIM into the
             # resolve_candidate RPC below. A rogue process on the throwaway socket
             # could return any JSON type here; forwarding a non-integer is an
             # amplification path into resolve_candidate. Require a real int (and
-            # reject bool, an int subclass) — consistent with the status-field
-            # hardening above — aborting on anything else (review finding #2).
+            # reject bool, an int subclass) — aborting on anything else
+            # (review finding #2). This is a protocol-integrity violation, not a
+            # benign per-doc miss, so it stays a hard failure.
             if not isinstance(cid, int) or isinstance(cid, bool):
                 safe_cid = _redact(repr(cid))[:200]
                 raise MinniStandupError(
@@ -480,24 +644,58 @@ class MinniAdapter:
                     f"({safe_cid}) — refusing to forward into resolve_candidate."
                 )
             # Promote through the public operator-gated resolution RPC.
-            _rpc(
-                self._socket_path,
-                "resolve_candidate",
-                {
-                    "candidate_id": cid,
-                    "decision": "accept",
-                    "reason": "membench fixture ingest",
-                },
-                timeout=60.0,
-            )
+            try:
+                _rpc(
+                    self._socket_path,
+                    "resolve_candidate",
+                    {
+                        "candidate_id": cid,
+                        "decision": "accept",
+                        "reason": "membench fixture ingest",
+                    },
+                    timeout=60.0,
+                )
+            except MinniStandupError as exc:
+                self._raise_if_daemon_dead(exc, promoted, idx, len(all_ids))
+                skipped.append(doc_id)
+                continue
             promoted += 1
         elapsed_ms = (time.perf_counter() - start) * 1000.0
+        # Loud, diagnosable failure if NOTHING ingested over a non-empty corpus —
+        # an empty index that silently "succeeds" would let the harness measure
+        # minni as a zero-recall system instead of surfacing the standup problem.
+        if all_ids and promoted == 0:
+            raise MinniStandupError(
+                f"ingest promoted 0 of {len(all_ids)} docs "
+                f"({len(skipped)} skipped); throwaway daemon indexed nothing. "
+                f"daemon log tail:\n{self._daemon_log_tail()}"
+            )
         return IngestReport(
             build_wall_clock_ms=elapsed_ms,
             doc_count=promoted,
             index_size_bytes=0,
             ingest_tokens_used=0,
         )
+
+    def _raise_if_daemon_dead(
+        self, exc: "MinniStandupError", promoted: int, idx: int, total: int
+    ) -> None:
+        """Re-raise a redacted death error if the throwaway daemon has exited.
+
+        Called when a per-doc RPC fails. If the daemon process is gone the failure
+        is a real crash — surface it LOUDLY (with how many docs succeeded and the
+        redacted daemon log) so it can never be mistaken for a benign per-doc skip
+        or masked as a successful partial ingest. If the daemon is still alive the
+        caller treats the failure as a transient per-doc fault and skips the doc.
+        """
+        if not self._daemon_alive():
+            rc = self._proc.returncode if self._proc is not None else None
+            raise MinniStandupError(
+                f"throwaway daemon DIED mid-ingest after promoting {promoted} "
+                f"of {total} docs (at doc index {idx}; rc={rc}): "
+                f"{_redact(str(exc))[:200]}\ndaemon log tail:\n"
+                f"{self._daemon_log_tail()}"
+            ) from None
 
     def query(self, q: str, budget: TokenBudget) -> QueryResult:
         self._require_live()
@@ -512,6 +710,19 @@ class MinniAdapter:
         )
         elapsed_ms = (time.perf_counter() - start) * 1000.0
 
+        # `_rpc` coerces only null/absent to {} (review finding #2): a falsy-but-
+        # non-null result ([], 0, False, "") is now returned VERBATIM rather than
+        # silently flattened to {}. The search result MUST be a dict (it carries
+        # the `results`/`learnings` streams); any other type — including an empty
+        # list — is a malformed/unsupported response. Reject it as a redacted
+        # MinniStandupError here so `result.get(...)` below never raises a raw
+        # AttributeError outside the MinniStandupError path.
+        if not isinstance(result, dict):
+            detail = _redact(repr(result))[:200]
+            raise MinniStandupError(
+                f"daemon search result is not a dict: {detail}"
+            )
+
         # The search RPC returns TWO ranked streams (see _DOC_ID_MARKER_PREFIX
         # note): `results` (the document/FAISS stream) and `learnings` (the
         # lexical FTS5 learnings stream). The governance ingest path stores corpus
@@ -522,17 +733,22 @@ class MinniAdapter:
         # lexical learning hits when present), then `learnings`.
         #
         # Each field may be ABSENT, explicit null, or (from a malformed daemon) a
-        # non-list. `.get(k, [])` only defaults on an ABSENT key, so an explicit
-        # `null` would yield None and `for item in None` would raise a raw
-        # TypeError OUTSIDE the MinniStandupError path (bypassing the test's skip
-        # guard). Coerce null/absent to [] with `or []`, and reject any other
-        # non-list as a redacted MinniStandupError rather than crashing.
-        def _as_list(field: str):
-            value = result.get(field) or []
+        # non-list. Coerce ONLY null/absent to [] (mirroring _rpc's null-only
+        # coercion, review finding #1): a falsy-but-non-null value (0, False, '')
+        # is NOT a list and must be REJECTED as a redacted MinniStandupError, never
+        # silently flattened to []. `value or []` would have swallowed every falsy
+        # type into [], contradicting this helper's own non-list guard and the
+        # _rpc fix. `for item in None` would otherwise raise a raw TypeError
+        # OUTSIDE the MinniStandupError path (bypassing the test's skip guard), so
+        # null/absent is the sole intended coercion.
+        def _as_list(field):
+            value = result.get(field)
+            if value is None:
+                return []
             if not isinstance(value, list):
-                detail = _redact(repr(value))[:200]
                 raise MinniStandupError(
-                    f"daemon {field!r} field is not a list for search: {detail}"
+                    f"daemon {field!r} field is not a list for search: "
+                    f"{_redact(repr(value))[:200]}"
                 )
             return value
 
@@ -649,6 +865,7 @@ class MinniAdapter:
             shutil.rmtree(self._tmp_home, ignore_errors=True)
         self._tmp_home = None
         self._socket_path = None
+        self._log_path = None
 
     def teardown(self) -> None:
         self._torn_down = True
