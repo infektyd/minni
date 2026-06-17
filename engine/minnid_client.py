@@ -133,7 +133,6 @@ def _cmd_status(args):
     print(f"  Uptime:       {daemon.get('uptime_seconds', 0):.0f}s")
     print(f"  Requests:     {daemon.get('requests_served', 0)}")
     print(f"  Socket:       {daemon.get('socket_path', '?')}")
-    print(f"  Dual-write:   {daemon.get('dual_write', False)}")
     print()
     print("Engine Health")
     print("─" * 40)
@@ -193,8 +192,6 @@ def _cmd_learn(args):
     result = _rpc(args.socket, "learn", params)
     print(f"Stored learning #{result.get('learning_id', '?')}  "
           f"[{result.get('category', '?')}]")
-    if result.get("dual_write"):
-        print("  (also written to MEMORY.md)")
     print()
 
 
