@@ -41,6 +41,21 @@ enum JSONValue: Decodable {
         if case .string(let value) = self { return value }
         return nil
     }
+
+    var objectValue: [String: JSONValue]? {
+        if case .object(let value) = self { return value }
+        return nil
+    }
+
+    var arrayValue: [JSONValue]? {
+        if case .array(let value) = self { return value }
+        return nil
+    }
+
+    var doubleValue: Double? {
+        if case .number(let value) = self { return value }
+        return nil
+    }
 }
 
 func emit(_ payload: [String: Any]) {
@@ -262,6 +277,45 @@ func runFoundationModels(_ request: AFMRequest) async {
                             "sources": draft.sources
                         ] as [String: Any]
                     }
+                ]
+            ])
+        case "chat_completion":
+            // Generic OpenAI-shaped chat completion (probe + bridge-contract
+            // parity). input = {"payload": {messages:[{role,content}], ...}}.
+            // Free-text generation (no @Generable); returns choices[0].message.content.
+            let payload = request.input?["payload"]?.objectValue ?? [:]
+            let messages = payload["messages"]?.arrayValue ?? []
+            var systemText = ""
+            var userParts: [String] = []
+            for message in messages {
+                guard let mo = message.objectValue else { continue }
+                let role = mo["role"]?.stringValue ?? "user"
+                let content = mo["content"]?.stringValue ?? ""
+                if content.isEmpty { continue }
+                if role == "system" {
+                    systemText += systemText.isEmpty ? content : "\n" + content
+                } else {
+                    userParts.append(content)
+                }
+            }
+            let prompt = userParts.joined(separator: "\n")
+            let session = systemText.isEmpty
+                ? LanguageModelSession()
+                : LanguageModelSession(instructions: systemText)
+            let response = try await session.respond(to: prompt.isEmpty ? "ok" : prompt)
+            emit([
+                "ok": true,
+                "provider": "native",
+                "backend": "apple-foundation-models",
+                "availability": "available",
+                "data": [
+                    "choices": [
+                        [
+                            "index": 0,
+                            "message": ["role": "assistant", "content": response.content],
+                            "finish_reason": "stop"
+                        ] as [String: Any]
+                    ]
                 ]
             ])
         default:

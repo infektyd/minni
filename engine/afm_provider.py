@@ -87,7 +87,13 @@ def _safe_status_error(error: Optional[str]) -> Optional[str]:
 # been verified within the TTL — /health reachability alone never counts.
 
 _GENERATION_PROBE_TTL_SECONDS = 300.0
-_GENERATION_PROBE_TIMEOUT_SECONDS = 1.5
+# Native mode spawns a fresh helper that cold-loads FoundationModels on the
+# first call (~2-3s measured; warm calls ~0.5s). The 1.5s bridge-era default
+# clipped that cold start. Generous default (env-overridable) so the cold probe
+# succeeds and warms the model for every subsequent call; cached for the TTL.
+_GENERATION_PROBE_TIMEOUT_SECONDS = float(
+    os.environ.get("MINNI_AFM_PROBE_TIMEOUT", "10.0")
+)
 _generation_probe_cache: Dict[str, Dict[str, Any]] = {}
 
 # --- cross-process persistent probe cache (L2) -------------------------------
