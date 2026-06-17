@@ -120,16 +120,65 @@ tiers (headline, snippet, chunk, document) in the result-building loop.
 
 **Commit:** 8a1865f
 
+### S8 / s8: adapter id-mapping fix (bench/membench/adapters/minni_adapter.py)
+
+**Bug (instrumentation artifact):** The membench MinniAdapter mapped semantic hits to corpus
+doc-ids by recovering a marker (`[membench_doc_id::...]`) from returned `chunk_text`. For most
+real-corpus docs the marker lands in a sub-min-token preamble section that the MarkdownChunker
+drops — marker survival rate: 7.66%. Result: membench scored the engine at recall@10 ≈ 0.31
+even though the engine retrieved the correct docs (faithful by_path = 0.9080).
+
+**Fix:** Added a client-side `{synthetic_path → corpus_doc_id}` map built at ingest time.
+For each promoted doc, `_compute_synthetic_path(marked_content, vault_path)` replicates the
+daemon's own `_durable_doc_path` SHA1 formula client-side (no engine/ import, §7.5 isolation
+preserved). At query time, `_map_doc_id()` looks up `r["source"]` in this dict FIRST (O(1)),
+falling back to marker recovery only for belt-and-suspenders coverage.
+
+**Agent_id invariant:** The throwaway daemon always resolves to `agent_id="main"` because it
+starts with a fresh temp HOME (no principals/ config files), so `from_local_transport` returns
+`EffectivePrincipal(agent_id="main", ...)` per RCM-003 (see `engine/principal.py`). The
+formula hardcodes `"main"` with this comment.
+
+**This is NOT a corpus reach-around:** The map keys are derived from the marked_content the
+adapter sent — not from corpus content peeked to decide relevance.
+
+**Changes:**
+- `bench/membench/adapters/minni_adapter.py`: `hashlib` import; `_compute_synthetic_path()` helper;
+  `self._doc_id_map: dict[str, str]` in `__init__`; map populated in `ingest()` per promoted doc;
+  map reset in `_teardown_daemon()`; `_map_doc_id()` updated with path-map primary.
+
+**Tests added:**
+- `test_map_doc_id_uses_path_map_primary`: verifies path-map fires for a hit with source in
+  the map but NO marker in chunk_text, and that map takes priority over marker.
+- `test_ingest_populates_doc_id_map`: verifies ingest builds the correct map (one entry per
+  promoted doc, correct synthetic paths, map cleared by `_teardown_daemon()`).
+
+**Expected production improvement:** With this fix, the daemon-path membench recall@10 should
+approach the faithful by_path = 0.9080. Requires a daemon-path membench re-run to confirm
+(daemon restart needed to pick up M-2/M-4 fixes; flagged to orchestrator).
+
+**Commit:** see bench/ diff in Projects/Minni
+
 ---
 
 ## All Tests
 
 ```
-12 tests, 0 failures
+engine/:
+  12 tests, 0 failures
   test_reranker_cap_fix.py            3 pass
   test_search_depth_default_m2.py     2 pass
   test_vault_write_index_m4.py        2 pass
   test_relational_package_label_s7.py 5 pass
+
+bench/ (Projects/Minni):
+  83 tests, 0 failures (test_minni_adapter.py + test_adapter_contract.py)
+  test_map_doc_id_uses_path_map_primary    PASS  (new — S8 path-map primary)
+  test_ingest_populates_doc_id_map         PASS  (new — S8 map build + reset)
+  [81 pre-existing tests]                  PASS  (no regression)
+
+  NOTE: test_determinism.py has 6 pre-existing failures — ModuleNotFoundError:
+  rank_bm25 (a missing-dep issue in markdown_grep.py unrelated to these changes).
 ```
 
 ---
@@ -153,39 +202,18 @@ marker instrumentation artifact.
 
 ---
 
-## What Needs Fixing Next
+## Remaining Work
 
-### Fix the adapter's id-mapping strategy (PRIMARY — the actual 0.31 fix)
+### Daemon-path membench re-run (S8 gate final step)
 
-The correct fix is in `bench/membench/adapters/minni_adapter.py`. Instead of recovering the
-corpus doc-id from a content marker in chunk text, maintain a `synthetic_path → corpus_doc_id`
-map at the adapter level and look up hits by `r["source"]` (or `r["path"]`).
-
-The `--faithful` harness already demonstrates this works: the `path_map` approach gives
-by_path = 0.9080. The membench adapter should adopt option 2 of `_durable_doc_path()` to
-precompute synthetic paths at ingest time and maintain the map client-side.
-
-Concretely in `minni_adapter.py`:
-- At ingest: compute `syn_path = _durable_doc_path("membench", content=marked)` for each doc;
-  store `{syn_path: corpus_doc_id}` in a client-side dict.
-- At query: first check `r.get("source")` or `r.get("path")` in the path map; fall back to
-  marker recovery only if the direct lookup fails.
-
-This requires importing or replicating the `hashlib.sha1(f"{agent_id}\x00{content}")[:16]`
-digest formula from `minnid.py:_durable_doc_path` — which keeps bench/ isolated from engine/
-imports while giving a faithful mapping.
-
-### Re-measure with the fixed adapter
-
-Once the adapter's id-mapping is fixed, a fresh membench run on the daemon path will give the
+The adapter id-mapping is now fixed. A fresh membench run on the daemon path will give the
 true production recall@10. Expected: close to 0.87-0.91 based on faithful by_path = 0.9080.
 
-This requires a daemon restart to pick up M-2/M-4 (the minnid.py/server.ts fixes). Flag to
-orchestrator before attempting a daemon-path membench run.
+**Blocked on daemon restart** to pick up M-2/M-4 engine fixes (minnid.py/server.ts). This
+requires the operator / orchestrator to authorize and execute the restart. Flagged.
 
-### Remaining work not in scope of this branch
+### Remaining engine work not in scope of this branch
 
 - **M-3**: Bridge-indexed learnings carry hard-coded metadata (privacy_level, layer) instead
   of parsing YAML frontmatter. Real fix is in `minnid._index_durable_learning`.
 - **Recency band** (0.54 in normal mode): Requires time-aware retrieval biasing.
-- **Daemon-path membench re-run**: Requires daemon restart. Flagged to orchestrator.
