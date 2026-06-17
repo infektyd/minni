@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import json
 import os
+import hashlib
 import re
 import shutil
 import socket
@@ -221,6 +222,44 @@ def _doc_id_from_content(content: str, valid_ids: set[str]) -> str | None:
         return decoded
     return None
 
+
+# Synthetic durable document path the engine assigns to every store-time-indexed
+# learning (engine minnid.py:_durable_doc_path):
+#     {vault}/_durable/{agent_id}__{sha1(agent_id\x00content)[:16]}.md
+# The 16-hex digest is the LAST ``__``-delimited field of the basename (agent ids
+# like ``claude-code`` never contain ``__``); the agent id is everything before it.
+_DURABLE_SOURCE_RE = re.compile(r"_durable/(?P<agent>.+)__(?P<digest>[0-9a-f]{16})\.md$")
+
+
+def _parse_durable_source(source: str) -> tuple[str, str] | None:
+    """Parse ``(agent_id, digest)`` out of a synthetic durable document path.
+
+    Returns ``None`` for any source that is not a ``_durable/…`` path (e.g. a
+    real vault file, or an empty/None source), so the caller can fall through to
+    the marker-recovery path. This reads ONLY the daemon-emitted identity string —
+    never corpus content — so it is not a reach-around.
+    """
+    if not isinstance(source, str):
+        return None
+    m = _DURABLE_SOURCE_RE.search(source)
+    if not m:
+        return None
+    return m.group("agent"), m.group("digest")
+
+
+def _durable_digest(agent_id: str, content: str) -> str:
+    """Recompute the engine's synthetic-path digest for content WE submitted.
+
+    Mirrors engine minnid.py:_durable_doc_path, which seeds on the STORED learning
+    content. The learn path persists the candidate content whitespace-stripped, so
+    the daemon hashes ``content.strip()`` — we strip here too (empirically verified:
+    the unstripped digest does NOT match the daemon-emitted source; the stripped one
+    does). The ``content`` is the marked string the adapter sent through ``learn``.
+    """
+    return hashlib.sha1(
+        f"{agent_id}\x00{content.strip()}".encode("utf-8")
+    ).hexdigest()[:16]
+
 # Live paths the adapter must NEVER use. Asserted against at spawn time as a
 # belt-and-suspenders data-safety guard.
 _LIVE_HOME = Path.home() / ".minni"
@@ -372,6 +411,20 @@ class MinniAdapter:
         self._socket_path: Path | None = None
         self._corpus: FrozenCorpus | None = None
         self._torn_down = False
+        # PRIMARY id-mapping (s8 fix): the daemon stamps every store-time-indexed
+        # learning with a synthetic document path of the form
+        # ``…/_durable/{agent_id}__{sha1(agent_id\x00content)[:16]}.md`` and returns
+        # it verbatim as the hit's ``source``/``path`` — present on EVERY semantic
+        # hit regardless of which chunk matched. We record the exact marked content
+        # we sent per corpus doc, then recover the doc-id by parsing the digest out
+        # of the hit's source and matching it against digests we recompute from our
+        # OWN ingested content. This is NOT a corpus reach-around: the map is built
+        # solely from the bytes we submitted through the public learn path; it never
+        # peeks at corpus content to decide relevance. It replaces the fragile
+        # marker-in-chunk-text recovery (which failed for ~92% of hits because the
+        # chunker drops the sub-min-token preamble the marker rode in).
+        self._marked_by_doc_id: dict[str, str] = {}
+        self._digest_to_doc_id: dict[str, str] | None = None  # lazily built per trial
         # Daemon stdout+stderr are redirected to this file (NOT a pipe) so a
         # chatty daemon ingesting hundreds of docs can never deadlock on a full
         # 64 KiB OS pipe buffer with no reader — a real root cause of a daemon
@@ -565,6 +618,9 @@ class MinniAdapter:
         self._spawn_daemon()
         start = time.perf_counter()
         self._corpus = corpus
+        # Fresh per-trial id-map state (the daemon + DB are brand-new this trial).
+        self._marked_by_doc_id = {}
+        self._digest_to_doc_id = None
         assert self._socket_path is not None
 
         # Ingest each frozen-corpus doc through Minni's PUBLIC governance path:
@@ -685,6 +741,11 @@ class MinniAdapter:
                 self._raise_if_daemon_dead(exc, promoted, idx, len(all_ids))
                 skipped.append(doc_id)
                 continue
+            # Record the EXACT bytes we sent for this doc so the primary id-mapping
+            # (parse digest from the hit's synthetic source → match our recomputed
+            # digest) can resolve it at query time. Keyed on the same marked content
+            # the daemon hashes into the synthetic document path.
+            self._marked_by_doc_id[doc_id] = marked
             promoted += 1
         elapsed_ms = (time.perf_counter() - start) * 1000.0
         # Loud, diagnosable failure if NOTHING ingested over a non-empty corpus —
@@ -931,20 +992,42 @@ class MinniAdapter:
         if self._torn_down:
             raise TeardownError("adapter used after teardown() (§9.4)")
 
+    def _digest_doc_id(self, source: str) -> str | None:
+        """PRIMARY id-mapping: resolve a hit to a corpus doc-id via its synthetic
+        document ``source`` path.
+
+        The engine stamps every store-time-indexed learning with a synthetic path
+        ``…/_durable/{agent_id}__{digest}.md`` and returns it as the hit's
+        ``source``/``path`` — present on EVERY hit no matter which chunk matched,
+        so (unlike the in-chunk marker) it never gets dropped by the chunker. We
+        parse the digest, then match it against digests recomputed from the exact
+        content WE submitted per corpus doc. The ``{digest → doc_id}`` map is built
+        lazily on the first durable hit using the agent id parsed from the daemon's
+        own source string (the adapter never sets MINNI_AGENT_ID, so we read it
+        rather than assume it).
+        """
+        parsed = _parse_durable_source(source)
+        if parsed is None:
+            return None
+        agent_id, digest = parsed
+        if self._digest_to_doc_id is None:
+            self._digest_to_doc_id = {
+                _durable_digest(agent_id, marked): doc_id
+                for doc_id, marked in self._marked_by_doc_id.items()
+            }
+        return self._digest_to_doc_id.get(digest)
+
     def _map_doc_id(self, item: dict, valid_ids: set[str]) -> str | None:
         """Map a SEMANTIC search hit back to a canonical corpus doc-id.
 
-        The engine's store-time semantic indexing now chunks+embeds each ingested
-        doc into the FAISS document index, so the `results` stream carries the
-        stored docs. Minni drops caller ``metadata`` on the durable promotion, so
-        the canonical doc-id does NOT ride along as a structured field — it is the
-        marker stamped INTO the content at ingest (see ``_mark_content``), which
-        the engine chunks into ``chunk_text``. We recover it from the hit's chunk
-        text the same way the learnings stream recovers it from learning content
-        — a provenance tag carried THROUGH the daemon's own store+retrieve, NOT a
-        corpus reach-around. Falls back to the metadata tag / any field that is
-        already a canonical id (forward-compat), then to the marker in chunk text.
-        Hits that cannot be mapped are dropped (they are not corpus docs).
+        PRIMARY: parse the synthetic ``_durable`` document path the daemon returns
+        as the hit's ``source`` and match its digest against content we ingested
+        (``_digest_doc_id``) — robust because the document identity is on every hit
+        regardless of which chunk matched. FALLBACK (belt-and-suspenders): the
+        in-content marker recovered from chunk text — retained for any hit whose
+        source is not a ``_durable`` path. Both carry the id THROUGH the daemon's
+        own store+retrieve; neither is a corpus reach-around. Hits that cannot be
+        mapped are dropped (they are not corpus docs).
         """
         meta = item.get("metadata") or {}
         tagged = meta.get("membench_doc_id")
@@ -954,10 +1037,15 @@ class MinniAdapter:
             val = item.get(key)
             if isinstance(val, str) and val in valid_ids:
                 return val
-        # Recover the ingest-time marker from the semantically-indexed chunk text
-        # (or any text-bearing field the depth tier exposes). This is the same
-        # marker the learnings stream parses — the engine now also stores it in
-        # chunk_embeddings, so the SEMANTIC stream maps back to corpus doc-ids.
+        # PRIMARY: synthetic-source digest map (handles ~all semantic hits).
+        for key in ("source", "path"):
+            val = item.get(key)
+            if isinstance(val, str):
+                mapped = self._digest_doc_id(val)
+                if mapped is not None and mapped in valid_ids:
+                    return mapped
+        # FALLBACK: ingest-time marker recovered from chunk text (only fires for
+        # hits whose source is not a _durable path — e.g. a future RPC shape).
         for key in ("chunk_text", "full_document_text", "text", "snippet", "content"):
             val = item.get(key)
             if isinstance(val, str):
