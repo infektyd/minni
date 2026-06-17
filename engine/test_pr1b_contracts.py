@@ -172,8 +172,8 @@ class TestDepthTiers:
         assert "recommended_action" not in result
         assert "recommended_wiki_updates" not in result
 
-    def test_minnid_search_defaults_to_headline(self, monkeypatch):
-        """Daemon search defaults to headline without changing RetrievalEngine default."""
+    def test_minnid_search_defaults_to_snippet(self, monkeypatch):
+        """Daemon search defaults to snippet (M-2) without changing RetrievalEngine default."""
         import minnid
 
         seen = {}
@@ -194,8 +194,8 @@ class TestDepthTiers:
         })
 
         assert "error" not in response
-        assert seen["depth"] == "headline"
-        assert response["result"]["depth"] == "headline"
+        assert seen["depth"] == "snippet"
+        assert response["result"]["depth"] == "snippet"
 
     def test_sm_drill_batches_result_ids(self, monkeypatch):
         import minnid
