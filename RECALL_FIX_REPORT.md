@@ -2,7 +2,29 @@
 
 **Date:** 2026-06-16  
 **Branch:** fix/minni-recall-correctness  
-**Baseline:** membench run 2026-06-16, minni recall@10 = 0.3115 (daemon path, marker-recovery mapping)  
+**Baseline:** membench run 2026-06-16, minni recall@10 = 0.3115 (OLD adapter, marker-recovery mapping)  
+**OFFICIAL re-run:** membench, real corpus + fixed engine + fixed adapter → **minni recall@10 = 0.8839**
+
+### Official membench scorecard (real corpus, 522 docs, 145 positive gold queries, k=10)
+
+| adapter | recall@10 | MRR | nDCG | tokens |
+|---|---|---|---|---|
+| **minni** | **0.8839** | **0.817** | **0.818** | 2042 |
+| naive_rag | 0.8839 | 0.758 | 0.773 | 2029 |
+| markdown_grep | 0.8276 | 0.705 | 0.721 | 2042 |
+| stub | 0.8184 | 0.618 | 0.651 | 1458 |
+| llm_wiki | 0.7563 | 0.622 | 0.636 | 2040 |
+| native_platform | 0.0437 | 0.024 | 0.028 | 1530 |
+| sanity_random | 0.0207 | 0.006 | 0.009 | 2042 |
+
+minni per-band recall@10: single_hop 0.963, contradiction 0.925, multi_hop 0.740, recency 0.667.
+Corpus content-hash `07c7d0d8…`; negative controls (sanity_random 0.021) validate the bench.
+Scorecard JSON archived at `_private/membench/results_official/` (gitignored).
+
+Minni **ties plain RAG on recall and beats it on ranking quality** (higher MRR + nDCG). The 0.3115
+was a BENCHMARK INSTRUMENTATION ARTIFACT (the adapter's doc-id marker shredded by the chunker, 7.66%
+survival → ~92% of correct hits scored as misses), now fixed by mapping hits to the daemon's own
+synthetic document identity. Supporting harness measurements below:
 **Engine true recall:** normal-mode harness recall@10 = 0.8943 (direct path mapping)  
 **Faithful harness:** by_marker = 0.2805, by_merged = 0.3287 (≈ 0.3115 baseline)
 
