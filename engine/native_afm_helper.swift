@@ -155,6 +155,65 @@ struct CompilePassProposalsResult {
     var drafts: [CompilePassDraftResult]
 }
 
+// GREEN surfaces wired without tools (verified reliable in fm-boundary raw harness).
+@Generable
+struct ContradictionResult {
+    @Guide(description: "true if the new statement contradicts the existing one")
+    var contradicts: Bool
+    @Guide(description: "Concise reason")
+    var reason: String
+}
+
+@Generable
+struct TriageResult {
+    @Guide(description: "Exactly one of: accept, reject, redact")
+    var decision: String
+    @Guide(description: "Concise reason")
+    var reason: String
+}
+
+@Generable
+struct ExtractedEntity {
+    @Guide(description: "Entity name")
+    var name: String
+    @Guide(description: "Entity type")
+    var type: String
+}
+
+@Generable
+struct EntityExtractResult {
+    @Guide(description: "Key entities mentioned", .count(5))
+    var entities: [ExtractedEntity]
+}
+
+@Generable
+struct DistilledLearningResult {
+    @Guide(description: "Short title")
+    var title: String
+    @Guide(description: "The durable assertion in one sentence")
+    var assertion: String
+    @Guide(description: "When this applies")
+    var appliesWhen: String
+    @Guide(description: "One of: decision, concept, procedure, session")
+    var category: String
+}
+
+// Distinguish the two recoverable LanguageModelError edges (raw-verified): a 4K
+// context overflow (caller should chunk) vs a guardrail false-positive (caller
+// should rephrase/skip). Everything else is "other". String-matched on the
+// stable error text since the public enum cases are not all nameable yet.
+func classifyAFMError(_ error: Error) -> (kind: String, message: String) {
+    let blob = "\(error) \(error.localizedDescription)".lowercased()
+    if blob.contains("context size") || blob.contains("exceeds the maximum")
+        || blob.contains("exceeded the model") {
+        return ("context_overflow", String(describing: error))
+    }
+    if blob.contains("unsafe content") || blob.contains("guardrail") {
+        return ("guardrail", String(describing: error))
+    }
+    return ("other", String(describing: error))
+}
+
 @available(macOS 26.0, *)
 func runFoundationModels(_ request: AFMRequest) async {
     let model = SystemLanguageModel.default
@@ -318,11 +377,86 @@ func runFoundationModels(_ request: AFMRequest) async {
                     ]
                 ]
             ])
+        case "contradiction":
+            let session = LanguageModelSession(instructions: "Judge whether the new statement contradicts the existing one. Be precise; do not invent.")
+            let existing = inputString(request, "existing")
+            let candidate = inputString(request, "candidate")
+            let response = try await session.respond(
+                to: "Existing: \(existing)\nNew: \(candidate)",
+                generating: ContradictionResult.self
+            )
+            emit([
+                "ok": true,
+                "provider": "native",
+                "backend": "apple-foundation-models",
+                "availability": "available",
+                "data": ["contradicts": response.content.contradicts, "reason": response.content.reason]
+            ])
+        case "triage":
+            let session = LanguageModelSession(instructions: "Decide accept, reject, or redact for durable memory. Keep technical decisions; drop small talk; redact secrets.")
+            let response = try await session.respond(
+                to: inputString(request, "candidate"),
+                generating: TriageResult.self
+            )
+            emit([
+                "ok": true,
+                "provider": "native",
+                "backend": "apple-foundation-models",
+                "availability": "available",
+                "data": ["decision": response.content.decision, "reason": response.content.reason]
+            ])
+        case "entity_extract":
+            let session = LanguageModelSession(instructions: "Extract the key entities and their types. Use only entities present in the text.")
+            let response = try await session.respond(
+                to: inputString(request, "text"),
+                generating: EntityExtractResult.self
+            )
+            emit([
+                "ok": true,
+                "provider": "native",
+                "backend": "apple-foundation-models",
+                "availability": "available",
+                "data": ["entities": response.content.entities.map { ["name": $0.name, "type": $0.type] }]
+            ])
+        case "session_distill":
+            let session = LanguageModelSession(instructions: "Distill one durable learning. Be faithful to the text; do not invent.")
+            let response = try await session.respond(
+                to: inputString(request, "text"),
+                generating: DistilledLearningResult.self
+            )
+            emit([
+                "ok": true,
+                "provider": "native",
+                "backend": "apple-foundation-models",
+                "availability": "available",
+                "data": [
+                    "title": response.content.title,
+                    "assertion": response.content.assertion,
+                    "appliesWhen": response.content.appliesWhen,
+                    "category": response.content.category
+                ]
+            ])
         default:
             unavailable("unsupported native AFM operation")
         }
     } catch {
-        unavailable(String(describing: error))
+        let (kind, message) = classifyAFMError(error)
+        // Recoverable edges (context_overflow, guardrail) report availability=available
+        // so the caller can branch (chunk / rephrase) instead of treating AFM as down.
+        let recoverable = (kind == "context_overflow" || kind == "guardrail")
+        emit([
+            "ok": false,
+            "provider": "native",
+            "backend": "apple-foundation-models",
+            "availability": recoverable ? "available" : "unavailable",
+            "error_kind": kind,
+            "error": message,
+            "data": [
+                "status": "error",
+                "backend": "apple-foundation-models",
+                "error_kind": kind
+            ]
+        ])
     }
 }
 #endif
