@@ -76,9 +76,11 @@ for _p in [str(_ENGINE_DIR), str(_BENCH_DIR)]:
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-# Default paths (private, gitignored).
-_DEFAULT_CORPUS = Path("/Users/hansaxelsson/Projects/Minni/_private/membench/corpus_real/corpus")
-_DEFAULT_GOLD   = Path("/Users/hansaxelsson/Projects/Minni/_private/membench/gold_real.jsonl")
+# Default paths (private, gitignored). Repo-relative with env override so no
+# absolute home path is baked in; set MEMBENCH_CORPUS / MEMBENCH_GOLD to relocate.
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_DEFAULT_CORPUS = Path(os.environ.get("MEMBENCH_CORPUS", _REPO_ROOT / "_private/membench/corpus_real/corpus"))
+_DEFAULT_GOLD   = Path(os.environ.get("MEMBENCH_GOLD", _REPO_ROOT / "_private/membench/gold_real.jsonl"))
 
 
 # ── doc-id marker (mirrors minni_adapter.py exactly; no import — isolation) ──
