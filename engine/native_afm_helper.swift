@@ -198,6 +198,34 @@ struct DistilledLearningResult {
     var category: String
 }
 
+// Tool-backed triage: the model orchestrates, the tool decides deterministically.
+// Pure-guided triage was prompt-fragile (resample flipped reject->accept); the
+// tool pins the decision (verified reliable in fm-boundary tool harness).
+final class TriageState: @unchecked Sendable {
+    static let shared = TriageState()
+    var lastDecision: String?
+}
+
+struct TriageRulesTool: Tool {
+    let name = "triage_rules"
+    let description = "Return the correct durable-memory decision (accept|reject|redact) for a candidate using strict rules."
+    @Generable struct Arguments {
+        @Guide(description: "The candidate text to triage")
+        var text: String
+    }
+    func call(arguments: Arguments) async throws -> String {
+        let t = arguments.text.lowercased()
+        let secret = ["password", "api key", "secret", "token", "credential", "sk-", "private key", "hunter2"]
+        let smalltalk = ["weather", "how are you", "good morning", "good night", "thanks", "lol", "haha", "nice day", "hello there"]
+        let decision: String
+        if secret.contains(where: t.contains) { decision = "redact" }
+        else if smalltalk.contains(where: t.contains) { decision = "reject" }
+        else { decision = "accept" }
+        TriageState.shared.lastDecision = decision   // ground truth captured for the helper
+        return decision
+    }
+}
+
 // Distinguish the two recoverable LanguageModelError edges (raw-verified): a 4K
 // context overflow (caller should chunk) vs a guardrail false-positive (caller
 // should rephrase/skip). Everything else is "other". String-matched on the
@@ -393,17 +421,22 @@ func runFoundationModels(_ request: AFMRequest) async {
                 "data": ["contradicts": response.content.contradicts, "reason": response.content.reason]
             ])
         case "triage":
-            let session = LanguageModelSession(instructions: "Decide accept, reject, or redact for durable memory. Keep technical decisions; drop small talk; redact secrets.")
-            let response = try await session.respond(
-                to: inputString(request, "candidate"),
-                generating: TriageResult.self
+            // Plain respond + tool (no guided output — avoids tools+generating
+            // transcript blowup). Decision = the tool's deterministic ground truth;
+            // the model's free text is the reason.
+            TriageState.shared.lastDecision = nil
+            let session = LanguageModelSession(
+                tools: [TriageRulesTool()],
+                instructions: "Call triage_rules with the candidate text, then state its decision and a one-line reason."
             )
+            let response = try await session.respond(to: inputString(request, "candidate"))
+            let decision = TriageState.shared.lastDecision ?? "accept"
             emit([
                 "ok": true,
                 "provider": "native",
                 "backend": "apple-foundation-models",
                 "availability": "available",
-                "data": ["decision": response.content.decision, "reason": response.content.reason]
+                "data": ["decision": decision, "reason": response.content, "tool_used": TriageState.shared.lastDecision != nil]
             ])
         case "entity_extract":
             let session = LanguageModelSession(instructions: "Extract the key entities and their types. Use only entities present in the text.")
