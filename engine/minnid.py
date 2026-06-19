@@ -10,8 +10,6 @@ Features
 --------
 * Unix domain socket IPC (JSON-RPC 2.0) for sub-millisecond latency.
 * Per-agent scoping — every request carries an optional ``agent_id`` tag.
-* Dual-write support — writes can optionally also go to the flat-file
-  ``~/.openclaw/MEMORY.md`` that the builtin provider uses.
 * Hot-reloadable config via SIGHUP.
 * Health / status endpoint.
 * Graceful shutdown via SIGTERM / SIGINT.
@@ -23,7 +21,7 @@ JSON-RPC Methods
   budget_tokens: if set, applies MMR-diverse token-budget packing.
 * ``expand(result_id, depth?)``          — Re-fetch a result at a deeper depth tier.
 * ``read(agent_id?, limit?)``            — Agent startup context (recall).
-* ``learn(content, agent_id?, category?)`` — Write a learning (dual-write).
+* ``learn(content, agent_id?, category?)`` — Write a learning.
 * ``log_event(event_type, content, agent_id?)`` — Episodic event.
 * ``status()``                           — Daemon + engine health.
 * ``ping()``                             — Liveness probe.
@@ -33,7 +31,6 @@ Usage
     python minnid.py                    # default socket: ~/.minni/run/minnid.sock (0700/0600, SEC-001)
     python minnid.py --socket /path/s   # custom socket
     python minnid.py --port 9900        # HTTP fallback (optional)
-    python minnid.py --dual-write       # enable dual-write to flat-file memory
 
 Client Quick-Start (Python)
 ---------------------------
@@ -66,7 +63,6 @@ import signal
 import socket
 import sys
 import time
-import threading
 import importlib.util
 import uuid
 from collections import deque
@@ -598,44 +594,11 @@ def _trace_ring():
     spec.loader.exec_module(module)
     return module.GLOBAL_TRACE_RING
 
-# ── Dual-write helper (flat-file MEMORY.md) ──────────────────────────────
-
-_OPENCLAW_DIR = Path.home() / ".openclaw"
-_MEMORY_MD = _OPENCLAW_DIR / "MEMORY.md"
-_MEMORY_LOCK = threading.Lock()
-
-
-def _flatfile_append(entry: str, category: str = "learn") -> bool:
-    """Append a formatted entry to ~/.openclaw/MEMORY.md.
-
-    Format:
-        ## [category] content  (2025-04-18 20:09)
-
-    Returns True on success.
-    """
-    try:
-        ts = time.strftime("%Y-%m-%d %H:%M")
-        line = f"- [{category}] {entry} ({ts})\n"
-        with _MEMORY_LOCK:
-            if _MEMORY_MD.exists():
-                text = _MEMORY_MD.read_text()
-                if line.strip() not in text:
-                    _MEMORY_MD.write_text(text + line)
-            else:
-                _MEMORY_MD.parent.mkdir(parents=True, exist_ok=True)
-                _MEMORY_MD.write_text(f"# Hermes Memory\n\n{line}")
-        return True
-    except Exception as exc:
-        logger.warning("Dual-write to MEMORY.md failed: %s", exc)
-        return False
-
-
 # ── JSON-RPC 2.0 server ──────────────────────────────────────────────────
 
 VERSION = "0.1.0"
 _start_time = 0.0
 _request_count = 0
-_dual_write_enabled = False
 _LATENCY_METHODS = ("search", "learn", "read", "embedding", "cross_encoder", "afm")
 _latencies = {name: deque(maxlen=100) for name in _LATENCY_METHODS}
 
@@ -2353,7 +2316,7 @@ def _handle_read(params: dict, request_id: Any) -> dict:
 
 
 def _handle_learn(params: dict, request_id: Any) -> dict:
-    """Store a learning with optional dual-write to flat-file.
+    """Store a learning.
 
     PR-6 behavior change: if contradictions are detected and ``force`` is not
     True (default False), returns::
@@ -2366,13 +2329,13 @@ def _handle_learn(params: dict, request_id: Any) -> dict:
 
     On success the return shape is unchanged::
 
-        {"status": "ok", "learning_id": <int>, "agent_id": ..., "category": ..., "dual_write": <bool>}
+        {"status": "ok", "learning_id": <int>, "agent_id": ..., "category": ...}
 
     Backward compatibility: existing calls without the new fields (assertion,
     applies_when, evidence_doc_ids, contradicts_id, force) continue to work
     exactly as before — the default of force=False is the only new behavior.
     """
-    global _request_count, _dual_write_enabled
+    global _request_count
     _request_count += 1
     started_at = time.perf_counter()
 
@@ -2543,16 +2506,11 @@ def _handle_learn(params: dict, request_id: Any) -> dict:
         # lands in the SAME DB this learning was committed to.
         _index_durable_learning(agent_id, content, key=f"learning:{lid}", db=wb.db)
 
-        dw_ok = False
-        if _dual_write_enabled:
-            dw_ok = _flatfile_append(content, category)
-
         return _make_response({
             "status": "ok",
             "learning_id": lid,
             "agent_id": agent_id,
             "category": category,
-            "dual_write": dw_ok,
         }, request_id)
     except Exception as exc:
         logger.exception("learn failed")
@@ -3024,7 +2982,6 @@ def _handle_status(params: dict, request_id: Any) -> dict:
             "uptime_seconds": round(uptime, 1),
             "requests_served": _request_count,
             "socket_path": "[redacted]",
-            "dual_write": _dual_write_enabled,
             "latencies": _latency_snapshot(),
         },
         "engine": {
@@ -4379,7 +4336,7 @@ def _warn_if_sync_root(label: str, path: Path) -> None:
 # ── Entry point ──────────────────────────────────────────────────────────
 
 def main():
-    global _start_time, _unix_socket_path, _dual_write_enabled
+    global _start_time, _unix_socket_path
 
     _start_time = time.time()
 
@@ -4403,12 +4360,6 @@ def main():
         help="HTTP bind address (default: 127.0.0.1)",
     )
     parser.add_argument(
-        "--dual-write",
-        action="store_true",
-        default=False,
-        help="Enable dual-write to ~/.openclaw/MEMORY.md",
-    )
-    parser.add_argument(
         "--verbose", "-v",
         action="store_true",
         help="Verbose logging",
@@ -4423,14 +4374,12 @@ def main():
     )
 
     _unix_socket_path = Path(args.socket)
-    _dual_write_enabled = args.dual_write
 
     logger.info("minnid v%s starting", VERSION)
     logger.info("Engine dir: %s", _ENGINE_DIR)
     logger.info("Socket:    %s", args.socket)
     if args.port:
         logger.info("HTTP:      %s:%d", args.host, args.port)
-    logger.info("Dual-write: %s", _dual_write_enabled)
 
     # Cloud-sync hygiene: warn (do not refuse) if any daemon-managed path is
     # inside iCloud / Dropbox / Google Drive / OneDrive. See SEC plan

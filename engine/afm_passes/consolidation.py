@@ -25,9 +25,12 @@ Design notes:
 from __future__ import annotations
 
 import hashlib
+import logging
 import re
 import time
 from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger("sovereign.afm.consolidation")
 
 _SAFE_PRIVACY = {"", "safe", "public", "low"}
 _MIN_CONTENT_LEN = 12
@@ -153,6 +156,62 @@ def _review_draft(candidate: Dict[str, Any], reason: str, trace_id: str) -> Dict
     }
 
 
+def _triage_advisory(candidates: List[Dict[str, Any]],
+                     promote_candidate_ids: List[int],
+                     trace_id: str) -> Optional[Dict[str, Any]]:
+    """ADVISORY-ONLY native triage signal for one representative candidate.
+
+    Strictly informational: it is attached to the pass output and is NEVER read
+    by the deterministic accept/reject/redact gate above (which stays
+    deterministic by design — "never reject plausible short facts"). Native-only
+    by contract; bridge/off modes no-op.
+    """
+    # Lazy imports keep the deterministic pass dependency-light and avoid paying
+    # provider-chain import cost when AFM is off.
+    try:
+        from afm_provider import resolve_afm_mode
+        from model_provider import default_provider_chain
+    except Exception:  # noqa: BLE001 - advisory must never break consolidation
+        return None
+    if resolve_afm_mode() not in {"native", "auto"}:
+        return None
+    # Prefer a candidate the deterministic gate already chose to promote, so the
+    # advisory is comparable to a real decision; else fall back to the first one.
+    chosen = None
+    if promote_candidate_ids:
+        promote_set = set(promote_candidate_ids)
+        chosen = next((c for c in candidates if c.get("candidate_id") in promote_set), None)
+    if chosen is None and candidates:
+        chosen = candidates[0]
+    if chosen is None:
+        return None
+    content = (chosen.get("content") or "").strip()
+    if not content:
+        return None
+    try:
+        result = default_provider_chain().native_op(
+            "triage", {"candidate": content[:6000]}, timeout=4.0
+        )
+    except Exception:  # noqa: BLE001 - advisory must never break consolidation
+        return None
+    if not result.ok:
+        data = result.data if isinstance(result.data, dict) else {}
+        error_kind = str(data.get("error_kind") or "").strip() or "unknown"
+        logger.info(
+            "afm native op triage unavailable (error_kind=%s): status=%s error=%s trace=%s",
+            error_kind, result.status, result.error, trace_id,
+        )
+        return None
+    data = result.data if isinstance(result.data, dict) else {}
+    return {
+        "candidate_id": chosen.get("candidate_id"),
+        "decision": str(data.get("decision") or "").strip(),
+        "reason": str(data.get("reason") or "").strip(),
+        "tool_used": bool(data.get("tool_used")),
+        "note": "advisory only; deterministic gate decision is authoritative",
+    }
+
+
 def run(db, config, vault_path: Optional[str] = None,
         dry_run: bool = True, trace_id: Optional[str] = None) -> Dict[str, Any]:
     schedule = getattr(config, "afm_loop_schedule", {}) or {}
@@ -215,6 +274,8 @@ def run(db, config, vault_path: Optional[str] = None,
         "dry_run": dry_run,
     }
 
+    triage_advisory = _triage_advisory(candidates, promote_candidate_ids, trace_id)
+
     return {
         "pass_name": "consolidation",
         "trace_id": trace_id,
@@ -224,5 +285,6 @@ def run(db, config, vault_path: Optional[str] = None,
         "dedup_candidate_ids": dedup_candidate_ids,
         "review_candidate_ids": review_candidate_ids,
         "drafts": drafts,
+        "triage_advisory": triage_advisory,
         "prompt_version": "consolidation-v1-deterministic",
     }

@@ -29,6 +29,19 @@ def test_afm_chat_completion_off_skips_client():
     assert result.status == "off"
 
 
+def test_generation_probe_timeout_env_falls_back_for_invalid_values(monkeypatch):
+    from afm_provider import _generation_probe_timeout_seconds
+
+    monkeypatch.setenv("MINNI_AFM_PROBE_TIMEOUT", "not-a-float")
+    assert _generation_probe_timeout_seconds() == 10.0
+
+    monkeypatch.setenv("MINNI_AFM_PROBE_TIMEOUT", "-1")
+    assert _generation_probe_timeout_seconds() == 10.0
+
+    monkeypatch.setenv("MINNI_AFM_PROBE_TIMEOUT", "2.5")
+    assert _generation_probe_timeout_seconds() == 2.5
+
+
 def test_afm_chat_completion_native_reports_unavailable_without_helper(monkeypatch):
     from afm_provider import afm_chat_completion
 

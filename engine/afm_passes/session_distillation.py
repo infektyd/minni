@@ -9,13 +9,36 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
+import sqlite3
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from afm_provider import resolve_afm_mode
 from model_provider import default_provider_chain
+
+logger = logging.getLogger("sovereign.afm.session_distillation")
+
+
+def _log_native_error_kind(op: str, trace_id: str, result: Any) -> str:
+    """Surface the helper's error_kind so a recoverable trip (context_overflow /
+    guardrail) is no longer indistinguishable from "AFM down". Returns the
+    classified kind for the caller to record; behavior otherwise unchanged."""
+    data = result.data if isinstance(getattr(result, "data", None), dict) else {}
+    error_kind = str(data.get("error_kind") or "").strip() or "unknown"
+    if error_kind in {"context_overflow", "guardrail"}:
+        logger.info(
+            "afm native op %s recoverable trip (%s): status=%s error=%s trace=%s",
+            op, error_kind, getattr(result, "status", None), getattr(result, "error", None), trace_id,
+        )
+    else:
+        logger.info(
+            "afm native op %s unavailable (error_kind=%s): status=%s error=%s trace=%s",
+            op, error_kind, getattr(result, "status", None), getattr(result, "error", None), trace_id,
+        )
+    return error_kind
 
 
 def _slugify(text: str) -> str:
@@ -219,6 +242,7 @@ def _native_compile_drafts(pass_input: Dict[str, Any], deterministic_drafts: Lis
     # native-only by contract (bridge mode keeps returning no drafts).
     result = default_provider_chain().native_op("compile_pass_proposals", payload, timeout=4.0)
     if not result.ok:
+        _log_native_error_kind("compile_pass_proposals", trace_id, result)
         return []
     candidates = result.data.get("drafts")
     if not isinstance(candidates, list):
@@ -229,6 +253,171 @@ def _native_compile_drafts(pass_input: Dict[str, Any], deterministic_drafts: Lis
         if draft is not None
     ]
     return normalized[:5]
+
+
+def _combined_session_text(events: List[Dict[str, Any]], raw_docs: List[Dict[str, Any]]) -> str:
+    """Flatten the session into one text blob for the guided AFM ops, capped
+    well under the helper's ~4K token budget (first ~6000 chars)."""
+    lines: List[str] = []
+    for event in events:
+        content = (event.get("content") or "").strip()
+        if content:
+            lines.append(f"{event.get('event_type', 'event')}: {content}")
+    for doc in raw_docs:
+        path = (doc.get("path") or "").strip()
+        if path:
+            lines.append(f"raw document: {path}")
+    return "\n".join(lines)[:6000]
+
+
+def _native_session_distill_draft(
+    text: str, sources: List[str], trace_id: str
+) -> Optional[Dict[str, Any]]:
+    """Additive review-only draft from the guided `session_distill` op. Never
+    replaces the existing compile_pass drafts; emitted alongside them."""
+    mode = resolve_afm_mode()
+    if mode not in {"native", "auto"}:
+        return None
+    if not text.strip() or not sources:
+        return None
+    result = default_provider_chain().native_op("session_distill", {"text": text}, timeout=4.0)
+    if not result.ok:
+        _log_native_error_kind("session_distill", trace_id, result)
+        return None
+    data = result.data if isinstance(result.data, dict) else {}
+    title = str(data.get("title") or "").strip()
+    assertion = str(data.get("assertion") or "").strip()
+    if not title or not assertion:
+        return None
+    applies_when = str(data.get("appliesWhen") or "").strip()
+    category = str(data.get("category") or "").strip() or "concept"
+    cited = sources[:12]
+    body_lines = [
+        assertion,
+        "",
+        f"- Applies when: {applies_when}" if applies_when else "- Applies when: (unspecified)",
+        f"- Category: {category}",
+        "",
+        "## Citations",
+        *[f"- `{source}`" for source in cited],
+        "",
+        "- Lifecycle: native AFM session_distill proposal only; endorsement is required before acceptance.",
+    ]
+    return {
+        "page_id": _draft_id("session-distill", title, cited, trace_id),
+        "kind": "concept",
+        "section": "concepts",
+        "title": title,
+        "status": "draft",
+        "agent": "afm-loop",
+        "trace_id": trace_id,
+        "prompt_version": "native.session_distill.v1",
+        "provider": "native",
+        "sources": cited,
+        "citations": cited,
+        "body": "\n".join(body_lines),
+    }
+
+
+def _native_entity_extract(text: str, trace_id: str) -> List[Dict[str, str]]:
+    """Additive review-only entities for the wikilink graph seed. Proposal only:
+    NEVER writes durable links."""
+    mode = resolve_afm_mode()
+    if mode not in {"native", "auto"}:
+        return []
+    if not text.strip():
+        return []
+    result = default_provider_chain().native_op("entity_extract", {"text": text}, timeout=4.0)
+    if not result.ok:
+        _log_native_error_kind("entity_extract", trace_id, result)
+        return []
+    data = result.data if isinstance(result.data, dict) else {}
+    raw = data.get("entities")
+    if not isinstance(raw, list):
+        return []
+    entities: List[Dict[str, str]] = []
+    seen: set = set()
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        etype = str(item.get("type") or "").strip()
+        key = name.lower()
+        if name and key not in seen:
+            seen.add(key)
+            entities.append({"name": name, "type": etype})
+    return entities[:20]
+
+
+def _similar_existing_learning(db, query: str) -> Optional[str]:
+    """Cheap, self-contained FTS lookup of the most similar existing learning.
+    Returns the learning content or None. Sanitizes the FTS query so a candidate
+    full of punctuation cannot break the MATCH (mirror of retrieval's guard)."""
+    tokens = re.findall(r"[A-Za-z0-9]+", query or "")
+    tokens = [t for t in tokens if len(t) > 2][:8]
+    if not tokens:
+        return None
+    safe_q = " OR ".join(tokens)
+    try:
+        with db.cursor() as c:
+            c.execute(
+                """
+                SELECT lf.content AS content
+                FROM learnings_fts lf
+                JOIN learnings l ON l.learning_id = lf.learning_id
+                WHERE learnings_fts MATCH ? AND l.superseded_by IS NULL
+                ORDER BY rank
+                LIMIT 1
+                """,
+                (safe_q,),
+            )
+            row = c.fetchone()
+    except sqlite3.Error as exc:
+        logger.info("advisory similar-learning lookup skipped: %s", exc)
+        return None
+    if not row:
+        return None
+    content = row["content"]
+    return str(content).strip() if content else None
+
+
+def _native_contradiction_signal(
+    db, drafts: List[Dict[str, Any]], trace_id: str
+) -> Optional[Dict[str, Any]]:
+    """Advisory-only contradiction check: compares the strongest candidate draft
+    this pass against the most similar existing learning (cheap FTS lookup). No
+    durable write, no decision change — returns a {contradicts,reason} signal."""
+    mode = resolve_afm_mode()
+    if mode not in {"native", "auto"}:
+        return None
+    # Strongest candidate = the native session_distill / compile draft if present,
+    # else the first deterministic draft. Use its body as the candidate text.
+    candidate = None
+    for draft in drafts:
+        if draft.get("provider") == "native":
+            candidate = draft
+            break
+    if candidate is None and drafts:
+        candidate = drafts[0]
+    if candidate is None:
+        return None
+    candidate_text = str(candidate.get("title") or "") + ". " + str(candidate.get("body") or "")
+    candidate_text = candidate_text.strip()
+    existing = _similar_existing_learning(db, candidate.get("title") or candidate.get("body") or "")
+    if not existing:
+        return None
+    result = default_provider_chain().native_op(
+        "contradiction", {"existing": existing, "candidate": candidate_text[:6000]}, timeout=4.0
+    )
+    if not result.ok:
+        _log_native_error_kind("contradiction", trace_id, result)
+        return None
+    data = result.data if isinstance(result.data, dict) else {}
+    return {
+        "candidate_page_id": candidate.get("page_id"),
+        "contradicts": bool(data.get("contradicts")),
+        "reason": str(data.get("reason") or "").strip(),
+    }
 
 
 def run(db, config, vault_path: Optional[str] = None, dry_run: bool = True, trace_id: Optional[str] = None) -> Dict[str, Any]:
@@ -259,6 +448,28 @@ def run(db, config, vault_path: Optional[str] = None, dry_run: bool = True, trac
     native_drafts = _native_compile_drafts(pass_input, drafts, trace_id)
     drafts = [*drafts, *native_drafts]
     pass_input["native_draft_count"] = len(native_drafts)
+
+    # Additive guided AFM ops (review-only; never replace the existing path).
+    allowed_sources = [
+        str(source)
+        for draft in drafts
+        for source in draft.get("sources", [])
+        if str(source).strip()
+    ]
+    combined_text = _combined_session_text(events, raw_docs)
+    distill_draft = _native_session_distill_draft(combined_text, allowed_sources, trace_id)
+    if distill_draft is not None:
+        drafts = [*drafts, distill_draft]
+    pass_input["session_distill_draft_count"] = 1 if distill_draft is not None else 0
+
+    # Entity extraction seeds the wikilink graph — proposal only, no durable links.
+    entities = _native_entity_extract(combined_text, trace_id)
+    pass_input["entities"] = entities
+
+    # Advisory contradiction signal for the strongest candidate this pass.
+    contradiction = _native_contradiction_signal(db, drafts, trace_id)
+    if contradiction is not None:
+        pass_input["contradiction"] = contradiction
     return {
         "status": "ok",
         "pass_name": "session_distillation",
