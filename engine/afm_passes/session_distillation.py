@@ -11,6 +11,7 @@ import hashlib
 import json
 import logging
 import re
+import sqlite3
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -361,7 +362,7 @@ def _similar_existing_learning(db, query: str) -> Optional[str]:
         with db.cursor() as c:
             c.execute(
                 """
-                SELECT lf.content
+                SELECT lf.content AS content
                 FROM learnings_fts lf
                 JOIN learnings l ON l.learning_id = lf.learning_id
                 WHERE learnings_fts MATCH ? AND l.superseded_by IS NULL
@@ -371,7 +372,8 @@ def _similar_existing_learning(db, query: str) -> Optional[str]:
                 (safe_q,),
             )
             row = c.fetchone()
-    except Exception:  # noqa: BLE001 - advisory lookup must never break the pass
+    except sqlite3.Error as exc:
+        logger.info("advisory similar-learning lookup skipped: %s", exc)
         return None
     if not row:
         return None

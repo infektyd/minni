@@ -7,7 +7,9 @@ assert the new signals appear WITHOUT changing the existing draft/decision path.
 """
 
 import json
+import logging
 import os
+import sqlite3
 import sys
 import time
 
@@ -259,6 +261,29 @@ def test_contradiction_skipped_when_no_existing_learning(tmp_path, monkeypatch):
     result = run(db_obj, cfg, vault_path=cfg.vault_path, dry_run=True, trace_id="t")
     # No existing learnings -> no contradiction call fires -> no signal.
     assert result["inputs"].get("contradiction") is None
+
+
+def test_similar_existing_learning_logs_sql_failures(caplog):
+    from afm_passes.session_distillation import _similar_existing_learning
+
+    class _Cursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, *_args, **_kwargs):
+            raise sqlite3.OperationalError("missing learnings_fts")
+
+    class _DB:
+        def cursor(self):
+            return _Cursor()
+
+    with caplog.at_level(logging.INFO, logger="sovereign.afm.session_distillation"):
+        assert _similar_existing_learning(_DB(), "native helper ops") is None
+
+    assert any("similar-learning lookup skipped" in rec.getMessage() for rec in caplog.records)
 
 
 # --- Task 1: error_kind surfacing ------------------------------------------

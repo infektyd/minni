@@ -92,10 +92,12 @@ _GENERATION_PROBE_TTL_SECONDS = 300.0
 # clipped that cold start. Generous default (env-overridable) so the cold probe
 # succeeds and warms the model for every subsequent call; cached for the TTL.
 def _generation_probe_timeout_seconds() -> float:
+    raw = os.environ.get("MINNI_AFM_PROBE_TIMEOUT", "10.0")
     try:
-        return float(os.environ.get("MINNI_AFM_PROBE_TIMEOUT", "10.0"))
-    except ValueError:
+        timeout = float(raw)
+    except (TypeError, ValueError):
         return 10.0
+    return timeout if timeout > 0 else 10.0
 
 
 _GENERATION_PROBE_TIMEOUT_SECONDS = _generation_probe_timeout_seconds()
