@@ -41,6 +41,45 @@ def _orchestrate(adapters=None, n_trials=2):
     )
 
 
+def test_main_forwards_scrubbed_flag(monkeypatch, tmp_path, capsys):
+    """CLI opt-in for real scrubbed corpora must reach load_corpus via orchestrate."""
+    seen = {}
+
+    def fake_orchestrate(**kwargs):
+        seen.update(kwargs)
+        return {"failures": {}}
+
+    def fake_write_artifacts(results, out_dir):
+        assert results == {"failures": {}}
+        assert out_dir == tmp_path
+        return {"results": tmp_path / "results.json"}
+
+    monkeypatch.setattr(run_bench, "orchestrate", fake_orchestrate)
+    monkeypatch.setattr(run_bench, "write_artifacts", fake_write_artifacts)
+
+    rc = run_bench.main(["--scrubbed", "--out", str(tmp_path)])
+
+    assert rc == 0
+    assert seen["corpus_scrubbed"] is True
+    assert "results.json" in capsys.readouterr().out
+
+
+def test_main_no_scrubbed_keeps_public_fixture_default(monkeypatch, tmp_path):
+    """The default public fixture path stays unscrubbed unless explicitly opted in."""
+    seen = {}
+    monkeypatch.setattr(
+        run_bench,
+        "orchestrate",
+        lambda **kwargs: seen.update(kwargs) or {"failures": {}},
+    )
+    monkeypatch.setattr(run_bench, "write_artifacts", lambda *_args, **_kwargs: {})
+
+    rc = run_bench.main(["--no-scrubbed", "--out", str(tmp_path)])
+
+    assert rc == 0
+    assert seen["corpus_scrubbed"] is False
+
+
 # ---------------------------------------------------------------------------
 # Crashing adapter (per-adapter error isolation fixture)
 # ---------------------------------------------------------------------------

@@ -738,6 +738,12 @@ def main(argv: list[str] | None = None) -> int:
                         "offline stubs). Requires env keys + MAX_API_CALLS.")
     parser.add_argument("--live-minni", action="store_true",
                         help="attempt the real isolated Minni daemon")
+    parser.add_argument(
+        "--scrubbed",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="enforce the scrub gate check on the corpus",
+    )
     args = parser.parse_args(argv)
 
     is_fixture = (
@@ -753,6 +759,7 @@ def main(argv: list[str] | None = None) -> int:
         real_llm=args.real_llm,
         live_minni=args.live_minni,
         is_fixture_run=is_fixture,
+        corpus_scrubbed=args.scrubbed,
     )
     paths = write_artifacts(results, Path(args.out))
 
