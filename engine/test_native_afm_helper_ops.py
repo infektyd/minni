@@ -226,6 +226,24 @@ def test_contradiction_signal_emitted_against_existing_learning(tmp_path, monkey
     assert signal["candidate_page_id"]
 
 
+def test_similar_existing_learning_reads_selected_column_directly(tmp_path):
+    from afm_passes.session_distillation import _similar_existing_learning
+
+    db_obj, _cfg = _make_db(tmp_path)
+    with db_obj.cursor() as c:
+        c.execute(
+            """
+            INSERT INTO learnings (agent_id, category, content, confidence, created_at)
+            VALUES (?, 'general', ?, 0.9, ?)
+            """,
+            ("codex", "Native AFM helper ops stay review-only.", time.time()),
+        )
+
+    assert _similar_existing_learning(db_obj, "native helper review") == (
+        "Native AFM helper ops stay review-only."
+    )
+
+
 def test_contradiction_skipped_when_no_existing_learning(tmp_path, monkeypatch):
     from afm_passes.session_distillation import run
 

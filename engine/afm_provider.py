@@ -91,9 +91,14 @@ _GENERATION_PROBE_TTL_SECONDS = 300.0
 # first call (~2-3s measured; warm calls ~0.5s). The 1.5s bridge-era default
 # clipped that cold start. Generous default (env-overridable) so the cold probe
 # succeeds and warms the model for every subsequent call; cached for the TTL.
-_GENERATION_PROBE_TIMEOUT_SECONDS = float(
-    os.environ.get("MINNI_AFM_PROBE_TIMEOUT", "10.0")
-)
+def _generation_probe_timeout_seconds() -> float:
+    try:
+        return float(os.environ.get("MINNI_AFM_PROBE_TIMEOUT", "10.0"))
+    except ValueError:
+        return 10.0
+
+
+_GENERATION_PROBE_TIMEOUT_SECONDS = _generation_probe_timeout_seconds()
 _generation_probe_cache: Dict[str, Dict[str, Any]] = {}
 
 # --- cross-process persistent probe cache (L2) -------------------------------

@@ -375,7 +375,7 @@ def _similar_existing_learning(db, query: str) -> Optional[str]:
         return None
     if not row:
         return None
-    content = dict(row).get("content")
+    content = row["content"]
     return str(content).strip() if content else None
 
 

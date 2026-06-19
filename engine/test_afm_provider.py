@@ -12,6 +12,14 @@ import stat
 sys.path.insert(0, os.path.dirname(__file__))
 
 
+def test_invalid_generation_probe_timeout_env_falls_back(monkeypatch):
+    import afm_provider
+
+    monkeypatch.setenv("MINNI_AFM_PROBE_TIMEOUT", "not-a-float")
+
+    assert afm_provider._generation_probe_timeout_seconds() == 10.0
+
+
 def test_afm_chat_completion_off_skips_client():
     from afm_provider import afm_chat_completion
 
