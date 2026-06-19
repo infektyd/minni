@@ -5,7 +5,7 @@ sentence-transformers>=5.5.1
 numpy>=2.4.6,<3.0
 
 # FAISS (CPU — use faiss-gpu if you have CUDA)
-faiss-cpu>=1.14.2
+faiss-cpu>=1.14.3
 
 # Cross-encoder re-ranking (included in sentence-transformers)
 # No extra install needed
