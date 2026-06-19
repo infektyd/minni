@@ -25,7 +25,7 @@ import importlib.util
 import re
 import sys
 from pathlib import Path
-from typing import List, Dict, Literal, Optional, Sequence
+from typing import Any, List, Dict, Literal, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -460,6 +460,264 @@ class RetrievalEngine:
                 self.faiss_index.save_to_disk(db_conn=conn)
             except Exception as e:
                 logger.debug("FAISS disk save failed (non-fatal): %s", e)
+
+    # ── Store-time semantic indexing (durable recall) ─────────
+
+    @property
+    def chunker(self):
+        """Lazy MarkdownChunker — the SAME chunker VaultIndexer uses.
+
+        Reusing the exact chunker (and the bi-encoder ``self.model`` below)
+        keeps store-time semantic indexing bit-consistent with the out-of-band
+        ``VaultIndexer.index_vault`` path, so a document indexed at store time is
+        chunked/embedded identically to one indexed from disk — fairness +
+        a single semantic index, not two divergent schemes.
+        """
+        if getattr(self, "_chunker", None) is None:
+            from chunker import MarkdownChunker
+            self._chunker = MarkdownChunker(self.config)
+        return self._chunker
+
+    def index_durable_document(
+        self,
+        *,
+        content: str,
+        path: str,
+        agent: str,
+        sigil: str = "❓",
+        privacy_level: str = "safe",
+        page_status: str = "accepted",
+        page_type: Optional[str] = None,
+        layer: str = "knowledge",
+        whole_document: int = 0,
+        model_name: Optional[str] = None,
+    ) -> Dict:
+        """Chunk + embed + index a durable document into the SEMANTIC index.
+
+        Called when content becomes durable via the socket (governed promote in
+        _resolve_candidate(accept), or the immediate-durable _handle_learn
+        force=true path). It writes the SAME tables ``VaultIndexer.index_vault``
+        writes — ``documents`` + ``vault_fts`` + ``chunk_embeddings`` — using the
+        SAME chunker and bi-encoder embedder, then refreshes THIS engine's live
+        in-memory FAISS index so a subsequent ``search`` in the same process
+        returns the new chunks WITHOUT an out-of-band indexer run or restart.
+
+        Idempotency: keyed on ``documents.path`` (UNIQUE). Re-storing the same
+        path UPDATEs the doc row and DELETEs+reinserts its chunks/fts, so no
+        duplicate ``chunk_embeddings`` rows accumulate on re-store/re-accept.
+
+        FAIL-OPEN (Minni availability principle): every failure mode here —
+        embedder unavailable, encode error, FAISS error — is caught and logged;
+        this method NEVER raises. The caller's durable store has already
+        committed before this runs, so a semantic-index hiccup degrades recall
+        to lexical-only (the prior behaviour) but NEVER loses the memory.
+
+        Returns a small status dict (status, doc_id, chunks) for diagnostics.
+        """
+        try:
+            if not content or not content.strip():
+                return {"status": "skipped", "reason": "empty_content"}
+
+            now = time.time()
+            model_name = model_name or self.config.embedding_model
+
+            # 0) Chunk + embed OUTSIDE the write transaction. Computing every
+            #    embedding up front means an encode failure on chunk N aborts
+            #    the whole batch BEFORE any chunk row is INSERTed — so we never
+            #    commit a partially-indexed document (all-or-nothing semantic
+            #    chunks). FAIL-OPEN: if any chunk fails to embed, we drop the
+            #    semantic chunks for this doc entirely but still land the doc +
+            #    FTS row below (lexical recall), rather than aborting the store.
+            prepared_chunks: List[Tuple[Any, np.ndarray]] = []
+            embed_failed = False
+            if self.model:
+                chunks = self.chunker.chunk_document(content)
+                for chunk in chunks:
+                    try:
+                        emb = self.model.encode(chunk.text).astype(np.float32)
+                    except Exception as exc:
+                        logger.warning(
+                            "durable-index: embed failed for doc %r chunk %s "
+                            "(%s) — dropping semantic chunks for this doc, "
+                            "keeping lexical (FTS) recall",
+                            path, chunk.chunk_index, exc,
+                        )
+                        embed_failed = True
+                        break
+                    prepared_chunks.append((chunk, emb))
+                if embed_failed:
+                    prepared_chunks = []
+
+            # 1) Upsert the document row (idempotent by UNIQUE path) + reset its
+            #    FTS/chunk rows. Mirrors the new/changed-file branch of
+            #    index_vault so retrieval's chunk↔document JOIN reads it the same.
+            with self.db.transaction() as c:
+                c.execute(
+                    "SELECT doc_id FROM documents WHERE path = ?", (path,)
+                )
+                row = c.fetchone()
+                if row:
+                    doc_id = row["doc_id"]
+                    c.execute(
+                        """UPDATE documents
+                           SET agent=?, sigil=?, last_modified=?, indexed_at=?,
+                               page_status=?, privacy_level=?, page_type=?,
+                               layer=?, whole_document=?
+                           WHERE doc_id=?""",
+                        (agent, sigil, now, now, page_status, privacy_level,
+                         page_type, layer, whole_document, doc_id),
+                    )
+                    old_chunk_ids = [
+                        r["chunk_id"]
+                        for r in c.execute(
+                            "SELECT chunk_id FROM chunk_embeddings WHERE doc_id = ?",
+                            (doc_id,),
+                        ).fetchall()
+                    ]
+                    self._invalidate_durable_rerank(old_chunk_ids)
+                    # Drop the superseded chunks from the LIVE in-memory FAISS
+                    # index too. Query correctness already holds (the
+                    # chunk↔document JOIN filters orphaned chunk_ids out), but
+                    # without this the in-memory index keeps the old chunk_ids in
+                    # its active maps and inflates on every re-store. remove()
+                    # tombstones each id (drops it from the searchable maps) so
+                    # the live index stays bounded to the doc's CURRENT chunks.
+                    self._remove_live_faiss(old_chunk_ids)
+                    c.execute("DELETE FROM vault_fts WHERE doc_id = ?", (doc_id,))
+                    c.execute(
+                        "DELETE FROM chunk_embeddings WHERE doc_id = ?", (doc_id,)
+                    )
+                else:
+                    c.execute(
+                        """INSERT INTO documents
+                           (path, agent, sigil, last_modified, indexed_at,
+                            page_status, privacy_level, page_type, layer,
+                            whole_document)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (path, agent, sigil, now, now, page_status,
+                         privacy_level, page_type, layer, whole_document),
+                    )
+                    doc_id = c.lastrowid
+
+                # FTS5 full-content row (keyword stream parity with index_vault).
+                c.execute(
+                    """INSERT INTO vault_fts (doc_id, path, content, agent, sigil)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    (doc_id, path, content, agent, sigil),
+                )
+
+                # 2) Insert the pre-computed (chunk, embedding) pairs. All
+                #    embeddings were already computed in step 0, so every INSERT
+                #    here is guaranteed to succeed or none ran at all — no
+                #    partial semantic index can commit. If embedding was
+                #    unavailable/failed, prepared_chunks is empty and only the
+                #    doc + FTS row above land (lexical recall, FAIL-OPEN).
+                new_chunk_ids: List[int] = []
+                new_vectors: List[np.ndarray] = []
+                for chunk, emb in prepared_chunks:
+                    c.execute(
+                        """INSERT INTO chunk_embeddings
+                           (doc_id, chunk_index, chunk_text, embedding,
+                            heading_context, model_name, computed_at, layer)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (doc_id, chunk.chunk_index, chunk.text,
+                         emb.tobytes(), chunk.heading_path, model_name,
+                         now, layer),
+                    )
+                    new_chunk_ids.append(c.lastrowid)
+                    new_vectors.append(emb)
+
+            # 3) Refresh the LIVE in-memory FAISS index so the very next search
+            #    in this long-lived process sees the new chunks (no restart, no
+            #    out-of-band index_all run). If the index is already warm we add
+            #    the new vectors in place; if it is cold we leave it cold so the
+            #    next search's _ensure_faiss_loaded rebuilds the full set from DB
+            #    (which now includes these rows). Either way the chunks become
+            #    searchable in-process.
+            self._refresh_live_faiss(new_chunk_ids, new_vectors)
+
+            return {
+                "status": "ok",
+                "doc_id": doc_id,
+                "chunks": len(new_chunk_ids),
+            }
+        except Exception as exc:
+            # FAIL-OPEN: never let a semantic-index failure surface to the
+            # caller's durable store. The memory is already persisted; recall
+            # degrades to lexical-only until the next index run.
+            logger.warning(
+                "durable-index: semantic indexing failed for %r (%s) — "
+                "store succeeded, recall degraded to lexical until reindex",
+                path, exc,
+            )
+            return {"status": "degraded", "reason": str(exc)}
+
+    def _invalidate_durable_rerank(self, chunk_ids: List[int]) -> None:
+        """Best-effort rerank-cache invalidation for replaced chunks."""
+        if not chunk_ids:
+            return
+        try:
+            from rerank_cache import invalidate_chunks
+            invalidate_chunks(chunk_ids)
+        except Exception as exc:
+            logger.debug("durable-index: rerank invalidation skipped: %s", exc)
+
+    def _remove_live_faiss(self, chunk_ids: List[int]) -> None:
+        """Tombstone superseded chunk_ids out of the live FAISS index.
+
+        Called on a re-store before the new chunks are added, so the in-memory
+        index stays bounded to the document's CURRENT chunks instead of growing
+        on every re-store. Best-effort: the rows are already being DELETEd from
+        chunk_embeddings, so even if this is a no-op (cold index) a later
+        search/rebuild reflects the correct set. faiss_index.remove drops the id
+        from the searchable maps (_reverse_map / _id_map); search() filters on
+        those, so a tombstoned chunk is no longer returned.
+        """
+        if not chunk_ids:
+            return
+        try:
+            if self.faiss_index.count > 0:
+                for cid in chunk_ids:
+                    self.faiss_index.remove(cid)
+        except Exception as exc:
+            logger.debug("durable-index: live FAISS remove skipped: %s", exc)
+
+    def _refresh_live_faiss(
+        self, chunk_ids: List[int], vectors: List[np.ndarray]
+    ) -> None:
+        """Make new chunks searchable in the live FAISS index without restart.
+
+        Warm index → add the new vectors directly (cheap, immediate). Cold index
+        → leave it cold; the next search's _ensure_faiss_loaded rebuilds from the
+        DB, which now contains these rows. Failures here are non-fatal: the rows
+        are durably in chunk_embeddings, so a later search/rebuild still finds
+        them.
+        """
+        if not chunk_ids:
+            return
+        try:
+            if self.faiss_index.count > 0:
+                for cid, vec in zip(chunk_ids, vectors):
+                    self.faiss_index.add(cid, vec)
+        except Exception as exc:
+            logger.warning(
+                "durable-index: live FAISS refresh failed (%s) — invalidating "
+                "so next search reloads from DB", exc,
+            )
+            # Force a cold reload on the next search so the new DB rows are
+            # picked up even if the in-place add path failed. Clearing the
+            # in-memory state drops count to 0, which makes the next search's
+            # _ensure_faiss_loaded rebuild the full set from chunk_embeddings
+            # (now including these rows).
+            try:
+                fi = self.faiss_index
+                fi._chunk_ids = []
+                fi._vectors = []
+                fi._id_map = {}
+                fi._reverse_map = {}
+                fi._index = None
+            except Exception:
+                pass
 
     # ── Cross-Encoder Re-Ranking ──────────────────────────────
 
@@ -1725,7 +1983,14 @@ class RetrievalEngine:
                     {"doc_id": r.get("doc_id"), "score": r.get("rerank_score")}
                     for r in merged
                 ]
-                merged = merged[:self.config.reranker_final_k]
+                # S-1 fix: respect the caller's limit. reranker_final_k is a
+                # precision-tuning floor (controls how many cross-encoder scores
+                # we pay for), NOT a hard recall cap. When limit > final_k
+                # (e.g. limit=10, final_k=5) the old code structurally capped
+                # recall@10 at 0.5 — we keep max(final_k, limit) so that
+                # limit=5 callers see no behaviour change and limit=10 callers
+                # get up to 10 post-rerank results.
+                merged = merged[:max(self.config.reranker_final_k, limit)]
             else:
                 merged = merged[:limit]
 
@@ -1778,7 +2043,10 @@ class RetrievalEngine:
                             )
                             if self.config.reranker_enabled and self.reranker:
                                 hyde_merged = self._rerank(query, hyde_merged)
-                                hyde_merged = hyde_merged[:self.config.reranker_final_k]
+                                # S-1 fix (HyDE branch): same max() guard as the
+                                # main rerank path — limit must not be capped
+                                # below the caller's requested count.
+                                hyde_merged = hyde_merged[:max(self.config.reranker_final_k, limit)]
                             else:
                                 hyde_merged = hyde_merged[:limit]
                             merged = merge_hyde_results(
@@ -1998,8 +2266,17 @@ class RetrievalEngine:
             if depth == "document":
                 raw["full_document_text"] = self._fetch_full_document(r["doc_id"])
 
-            results.append(self._apply_depth(raw, depth))
-            results[-1]["query_variants"] = query_variants
+            # S7: self-labeling recall package — primary (rank 1) vs related (2..N).
+            # Rank is 1-based by position in the final results list (post-rerank order).
+            _result_rank = len(results) + 1
+            raw["match_kind"] = "primary" if _result_rank == 1 else "related"
+            raw["related_rank"] = None if _result_rank == 1 else _result_rank - 1
+
+            projected = self._apply_depth(raw, depth)
+            projected["match_kind"] = raw["match_kind"]
+            projected["related_rank"] = raw["related_rank"]
+            projected["query_variants"] = query_variants
+            results.append(projected)
 
             if update_access:
                 with self.db.cursor() as c:

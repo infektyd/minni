@@ -429,6 +429,152 @@ def _lazy_writeback():
     return _writeback
 
 
+def _durable_doc_path(
+    agent_id: str, key: str, vault_path: Optional[str] = None,
+    content: Optional[str] = None,
+) -> str:
+    """Stable synthetic ``documents.path`` for a store-time-indexed learning.
+
+    Keyed on (agent_id, CONTENT) — NOT the per-store ``key``/learning_id — so
+    re-storing the SAME content upserts the SAME documents row (idempotent — no
+    duplicate chunk_embeddings). This matters because _resolve_candidate enforces
+    terminal once-only resolution: a re-store of identical content always goes
+    through a NEW candidate -> NEW learning_id, so keying on learning_id would
+    mint a fresh path each time and accumulate duplicate semantic-index rows.
+    Hashing the content collapses those to one upsert target. When ``content`` is
+    not supplied we fall back to the legacy ``key`` digest (callers that already
+    pass a content-stable key, or have no content to hash).
+
+    Rooted under the configured vault_path so the path is contained in an
+    operator/agent vault root and passes can_read_document's vault-root check
+    (G19) for the storing principal. The file is virtual (we never write it to
+    disk here — the markdown writeback is handled separately); the path is only
+    a stable identity for the documents/chunk_embeddings rows.
+    """
+    import hashlib
+    seed = content if content is not None else key
+    digest = hashlib.sha1(f"{agent_id}\x00{seed}".encode("utf-8")).hexdigest()[:16]
+    base = vault_path or DEFAULT_CONFIG.vault_path
+    return os.path.join(base, "_durable", f"{agent_id}__{digest}.md")
+
+
+_UNSET = object()
+
+
+def _index_durable_learning(agent_id: str, content: str, key: str, db=_UNSET) -> None:
+    """Semantically index a just-stored durable learning (FAIL-OPEN).
+
+    Hook for BOTH durable-store socket paths (_resolve_candidate(accept) and
+    _handle_learn force=true). It chunks+embeds the content into the SAME
+    semantic index (documents + chunk_embeddings + vault_fts) the out-of-band
+    VaultIndexer writes, and refreshes the live RetrievalEngine's in-memory
+    FAISS so a subsequent search in THIS process returns the new chunks without
+    an index_all run or restart.
+
+    DB BINDING (data-safety): the semantic index MUST land in the SAME database
+    the durable store just committed to — never a separately-resolved one. The
+    caller passes the store's ``db`` handle; we index there. CRITICALLY, we only
+    reuse the shared _lazy_retrieval() singleton (whose FAISS _handle_search
+    reads) when its db_path matches the store's — the normal production case
+    where both are DEFAULT_CONFIG. If they differ (e.g. a test that points the
+    store at a temp DB but leaves DEFAULT_CONFIG at the live home), we build a
+    TRANSIENT engine bound to the store's DB so the write goes to the right
+    place and the live singleton/DB is never touched. Without this guard a
+    db-divergent caller would write durable rows into DEFAULT_CONFIG's DB —
+    i.e. the operator's LIVE ~/.minni — which must never happen.
+
+    Never raises — neither a programmer error (omitted ``db=``) nor an
+    availability failure (embedder/FAISS down) may undo or fail a durable store
+    that already committed. Both degrade gracefully (log + return).
+    """
+    try:
+        # Data-safety: ``db`` MUST be supplied explicitly. A ``None``/omitted
+        # default would silently fall through to the live-DB singleton
+        # (DEFAULT_CONFIG.db_path — the operator's ~/.minni), so a future caller
+        # forgetting ``db=`` in a live context would write durable
+        # semantic-index rows into the operator's real database. We refuse to
+        # default to the live DB — but we degrade gracefully rather than raise,
+        # because the durable store has ALREADY committed by the time we run:
+        # raising here would surface a failure to the RPC client for a memory
+        # that was in fact persisted (and could trigger a duplicate-write
+        # retry). So we log and return without indexing; recall degrades to
+        # lexical-only until the next out-of-band index run.
+        if db is _UNSET or db is None:
+            logger.warning(
+                "durable store: _index_durable_learning called without an "
+                "explicit db= (the handle the durable store committed to) — "
+                "refusing to default to the live DEFAULT_CONFIG database; "
+                "skipping store-time semantic index (recall degraded to "
+                "lexical until reindex). agent=%s",
+                agent_id,
+            )
+            return
+
+        from retrieval import RetrievalEngine
+
+        try:
+            store_db_path = os.path.abspath(db.config.db_path)
+        except Exception:
+            store_db_path = None
+        default_db_path = os.path.abspath(DEFAULT_CONFIG.db_path)
+
+        if store_db_path is not None and store_db_path == default_db_path:
+            # Production path: index via the shared singleton so its in-memory
+            # FAISS refreshes for the next _handle_search in this process.
+            engine = _lazy_retrieval()
+        else:
+            # Divergent-DB caller: bind a transient engine to the STORE's DB so
+            # the durable rows land there and the live DEFAULT_CONFIG DB is left
+            # untouched (data-safety). No shared FAISS to refresh in this case.
+            engine = RetrievalEngine(db, db.config)
+
+        # Derive indexing metadata from YAML frontmatter (M-3 privacy bridge).
+        # Reuse VaultIndexer._extract_frontmatter so durable-store indexing
+        # honors the same privacy floor as out-of-band vault indexing.
+        doc_agent = agent_id
+        sigil = "❓"
+        page_status = "accepted"
+        privacy_level = "safe"
+        page_type = None
+        layer = "knowledge"
+        try:
+            from indexer import VaultIndexer
+
+            meta = VaultIndexer._extract_frontmatter(content)
+            doc_agent = meta["agent"] if meta["agent"] != "unknown" else agent_id
+            sigil = meta.get("sigil", "❓")
+            page_status = (
+                meta["page_status"]
+                if meta["page_status"] != "candidate"
+                else "accepted"
+            )
+            privacy_level = meta["privacy_level"]
+            page_type = meta.get("page_type")
+            layer = meta["layer"]
+        except Exception:
+            pass  # fail-open: keep prior defaults
+
+        engine.index_durable_document(
+            content=content,
+            path=_durable_doc_path(
+                agent_id, key, vault_path=engine.config.vault_path,
+                content=content,
+            ),
+            agent=doc_agent,
+            sigil=sigil,
+            page_status=page_status,
+            privacy_level=privacy_level,
+            page_type=page_type,
+            layer=layer,
+        )
+    except Exception as exc:
+        logger.warning(
+            "durable store: store-time semantic index failed for agent=%s (%s) "
+            "— store stands, recall degraded to lexical until reindex",
+            agent_id, exc,
+        )
+
+
 def _lazy_episodic():
     """Lazy-load EpisodicMemory."""
     global _episodic
@@ -1325,9 +1471,11 @@ def _handle_search(params: dict, request_id: Any) -> dict:
 
     Accepts optional ``depth`` parameter for progressive disclosure:
       headline  — wikilink, title, score, confidence, age_days (~30 tokens/result)
-      snippet   — + text (≤280 chars) (~120 tokens/result) [DEFAULT]
+      snippet   — + text (≤280 chars) (~120 tokens/result) [DEFAULT]  (M-2 fix)
       chunk     — + full chunk text, heading context, provenance (~500 tokens)
       document  — + full source document (whole_document=1 rows only)
+    Omitting depth returns "snippet". Previous default was "headline" (no text)
+    which was a documentation/implementation mismatch — fixed.
 
     Accepts optional ``budget_tokens`` for MMR-diverse token-budgeted packing.
     When provided, selects a diverse subset fitting within the token budget.
@@ -1360,7 +1508,11 @@ def _handle_search(params: dict, request_id: Any) -> dict:
     except ValueError as exc:
         return _make_error(-32602, str(exc), request_id)
     limit = min(int(params.get("limit", 5)), 20)
-    depth = str(params.get("depth", "headline"))
+    # M-2 fix: default was "headline" (no text) despite the docstring claiming
+    # "snippet". Callers that omit depth (e.g. recallMemory() in sovereign.ts)
+    # received wikilink+score only — no evidence text for the agent to read.
+    # Changed to "snippet" to match the documented intent (~120 tokens/result).
+    depth = str(params.get("depth", "snippet"))
     budget_tokens_param = params.get("budget_tokens")
     backend_param = params.get("backend", "auto")
     layers = params.get("layers")
@@ -2383,6 +2535,13 @@ def _handle_learn(params: dict, request_id: Any) -> dict:
         # Write to disk as markdown (Obsidian integration — existing behaviour)
         if wb.config.writeback_enabled:
             wb._write_to_disk(lid, agent_id, category, content, now)
+
+        # Store-time semantic indexing: make this durable learning recall-able
+        # via the semantic `results` stream immediately, in-process (FAIL-OPEN).
+        # Keyed on the learning_id so a re-store of the same learning upserts
+        # rather than duplicating chunk_embeddings. Bound to wb.db so the index
+        # lands in the SAME DB this learning was committed to.
+        _index_durable_learning(agent_id, content, key=f"learning:{lid}", db=wb.db)
 
         dw_ok = False
         if _dual_write_enabled:
@@ -3758,6 +3917,19 @@ def _resolve_candidate(params: dict, request_id: Any) -> dict:
                 (new_status, now, principal.agent_id, reason, cid),
             )
 
+        # Store-time semantic indexing for the governed promote path: a candidate
+        # accepted into a durable learning is now chunked+embedded into the
+        # semantic index and the live FAISS is refreshed, so an agent recalling
+        # what it just promoted gets semantic hits (the `results` stream), not
+        # lexical-only. Runs AFTER the transaction commits (the learning is
+        # already durable) and FAILS-OPEN — a semantic-index hiccup never undoes
+        # the resolution. Keyed on the learning_id for idempotent re-accept.
+        if lid is not None:
+            _index_durable_learning(
+                principal.agent_id, str(rowd.get("content") or ""),
+                key=f"learning:{lid}", db=db,
+            )
+
         # Prominent audit log for the governance action (owner or explicit operator)
         logger.warning(
             "RESOLVE_CANDIDATE operator=%s candidate=%s decision=%s new_status=%s reason=%s (G15 audit)",
@@ -3827,6 +3999,77 @@ def _handle_ax_snapshot_get(params: dict, request_id: Any) -> dict:
         return _make_error(-32000, f"ax_snapshot_get error: {exc}", request_id)
 
 
+def _handle_vault_index_doc(params: dict, request_id: Any) -> dict:
+    """Index a vault page into the semantic recall index without going through
+    the learn/candidate governance pipeline.
+
+    M-4 fix: minni_vault_write writes a page to disk but did NOT trigger the
+    recall bridge, so vault_write content was NOT semantically recall-able until
+    a separate VaultIndexer run. This RPC lets the TypeScript MCP handler call
+    ``vault_index_doc`` immediately after writing, matching the instant-recall
+    semantics of ``learn`` (which calls index_durable_document on promote).
+
+    Params (all required unless noted):
+        content    — full page content (markdown, including frontmatter if any)
+        path       — relative path within the vault (e.g. "wiki/sessions/foo.md")
+        agent      — agent_id owning this document
+        sigil      — optional emoji sigil (default "❓")
+        privacy_level — optional, default "safe"
+        page_status   — optional, default "accepted"
+        layer      — optional, default "knowledge"
+
+    Returns {"status": "ok", "doc_id": <int>, "chunks": <int>} on success.
+    FAIL-OPEN: engine errors are caught internally (never raises); returns an
+    error envelope only for missing required params.
+    """
+    global _request_count
+    _request_count += 1
+    started_at = time.perf_counter()
+
+    content = params.get("content", "")
+    path = params.get("path", "")
+    agent = params.get("agent", "")
+
+    if not content:
+        return _make_error(-32602, "content is required", request_id)
+    if not path:
+        return _make_error(-32602, "path is required", request_id)
+    if not agent:
+        return _make_error(-32602, "agent is required", request_id)
+
+    # SEC-015-style size cap: vault pages capped at 256 KiB (larger than learn
+    # which is 64 KiB, because vault pages include rich frontmatter + prose).
+    _MAX_VAULT_PAGE_CHARS = 256 * 1024
+    if len(content) > _MAX_VAULT_PAGE_CHARS:
+        return _make_error(
+            -32602,
+            f"vault_index_doc content exceeds {_MAX_VAULT_PAGE_CHARS} chars",
+            request_id,
+        )
+
+    sigil = str(params.get("sigil", "❓"))
+    privacy_level = str(params.get("privacy_level", "safe"))
+    page_status = str(params.get("page_status", "accepted"))
+    layer = str(params.get("layer", "knowledge"))
+
+    try:
+        engine = _lazy_retrieval()
+        result = engine.index_durable_document(
+            content=content,
+            path=path,
+            agent=agent,
+            sigil=sigil,
+            privacy_level=privacy_level,
+            page_status=page_status,
+            layer=layer,
+        )
+        _record_latency("vault_index_doc", time.perf_counter() - started_at)
+        return _make_response(result, request_id)
+    except Exception as exc:
+        logger.exception("vault_index_doc failed")
+        return _make_error(-32000, f"vault_index_doc error: {exc}", request_id)
+
+
 # Method registry
 _METHODS: Dict[str, callable] = {
     "ping":                   _handle_ping,
@@ -3855,6 +4098,8 @@ _METHODS: Dict[str, callable] = {
     "resolve_candidate":      _resolve_candidate,
     "ax_snapshot_store":      _handle_ax_snapshot_store,
     "ax_snapshot_get":        _handle_ax_snapshot_get,
+    # M-4 fix: vault_write now triggers immediate semantic indexing via this RPC.
+    "vault_index_doc":        _handle_vault_index_doc,
     "status":                 _handle_status,
     "health_report":          _handle_health_report,
     "hygiene_report":         _handle_hygiene_report,
