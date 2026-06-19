@@ -249,6 +249,36 @@ test("prepareOutcome applies AFM outcome draft suggestions when requested", asyn
   assert.deepEqual(packet.outcomeDraft.doNotStore, ["Do not store raw AFM responses."]);
 });
 
+test("prepareOutcome keeps AFM governance buckets mutually exclusive with restrictive bucket priority", async () => {
+  const packet = await prepareOutcome(
+    {
+      task: "summarize native AFM wiring repair",
+      summary: "Removed stale bridge status and verified native helper behavior.",
+      profile: "compact",
+      useAfm: true,
+      vaultPath: "/tmp/vault",
+    },
+    {
+      afmPrepare: async () => ({
+        ok: true,
+        data: {
+          outcomeDraft: {
+            learnCandidates: ["Native helper is configured", "Do not store raw logs"],
+            logOnly: ["Native helper is configured", "Changed /Users/alice/private/file.ts"],
+            expires: ["Native helper is configured"],
+            doNotStore: ["Do not store raw logs"],
+          },
+        },
+      }),
+    },
+  );
+
+  assert.deepEqual(packet.outcomeDraft.doNotStore, ["Do not store raw logs"]);
+  assert.deepEqual(packet.outcomeDraft.expires, ["Native helper is configured"]);
+  assert.deepEqual(packet.outcomeDraft.logOnly, ["Changed [local-path]"]);
+  assert.deepEqual(packet.outcomeDraft.learnCandidates, []);
+});
+
 test("AFM outcome payload uses compact outcome instructions and redacts local paths", () => {
   const payload = buildAfmChatPayload({
     purpose: "outcome",
@@ -341,6 +371,46 @@ test("prepareTask uses native AFM provider metadata when native mode is requeste
   assert.equal(packet.afm.adapterConfigured, true);
   assert.equal(packet.afm.adapterPath, undefined);
   assert.equal(packet.brief, "Native AFM adapter distilled brief.");
+});
+
+test("prepareTask native mode ignores dead bridge health when helper is configured", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-native-dead-bridge-"));
+  const helper = path.join(root, "helper.mjs");
+  const previousHelper = process.env.MINNI_AFM_NATIVE_HELPER;
+  await writeFile(helper, "#!/usr/bin/env node\n", "utf8");
+  await chmod(helper, 0o755);
+  process.env.MINNI_AFM_NATIVE_HELPER = helper;
+  try {
+    const packet = await prepareTask(
+      {
+        task: "audit AFM wiring",
+        vaultPath: "/tmp/vault",
+        useAfm: true,
+        afmProviderMode: "native",
+      },
+      {
+        searchVault: async () => [],
+        recall: async () => ({ ok: true, data: { results: "daemon lead" } }),
+        afmHealth: async () => ({ ok: false, error: "connect ECONNREFUSED 127.0.0.1:11437" }),
+        afmPrepare: async (_url, payload) => {
+          assert.equal(payload.provider.provider, "native");
+          assert.equal(payload.provider.status, "native_available");
+          assert.doesNotMatch(JSON.stringify(payload.provider), /11437/);
+          return { ok: true, data: { brief: "Audit Minni AFM provider configuration." } };
+        },
+        audit: async () => "/tmp/vault/logs/today.md",
+      },
+    );
+
+    assert.equal(packet.mode, "afm");
+    assert.equal(packet.afm.provider, "native");
+    assert.equal(packet.afm.error, undefined);
+    assert.equal(packet.brief, "Audit Minni AFM provider configuration.");
+  } finally {
+    if (previousHelper === undefined) delete process.env.MINNI_AFM_NATIVE_HELPER;
+    else process.env.MINNI_AFM_NATIVE_HELPER = previousHelper;
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("prepareTask does not call native AFM when shared provider health is unavailable", async () => {

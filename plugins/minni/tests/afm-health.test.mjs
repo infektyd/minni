@@ -557,7 +557,10 @@ test("native mode: dead bridge /health must not veto a working native helper", a
       });
       assert.equal(report.afm.ok, true, "native generation works; the dead bridge must not invert afm_ok");
       assert.equal(report.afm.data.generationVerified, true);
+      assert.equal(report.afm.error, undefined);
       assert.equal(report.extractor.provider, "native");
+      assert.equal(report.afmProvider.status, "native_available");
+      assert.doesNotMatch(JSON.stringify(report), /11437/);
     } finally {
       if (previousHelper === undefined) delete process.env.MINNI_AFM_NATIVE_HELPER;
       else process.env.MINNI_AFM_NATIVE_HELPER = previousHelper;

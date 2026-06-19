@@ -98,6 +98,16 @@ def repo_engine(workspace: str | None) -> Path:
     return Path.cwd() / "engine"
 
 
+def native_afm_env(repo_root: Path) -> dict[str, str]:
+    helper = repo_root.expanduser() / "engine" / "native_afm_helper"
+    if helper.exists():
+        return {
+            "MINNI_AFM_PROVIDER_MODE": "native",
+            "MINNI_AFM_NATIVE_HELPER": str(helper),
+        }
+    return {}
+
+
 def vault_for(agent: str) -> Path:
     if agent == "codex":
         return Path("~/.minni/codex-vault").expanduser()
@@ -172,7 +182,14 @@ def replace_toml_sections(path: Path, sections: dict[str, str], *, preserve_surf
             ex_env = data.get("mcp_servers", {}).get("minni", {}).get("env", {}) or {}
             if ex_env:
                 preserved_lines = []
-                for k in ("MINNI_AGENT_ID", "MINNI_VAULT_PATH", "MINNI_SOCKET_PATH", "MINNI_WORKSPACE_ID"):
+                for k in (
+                    "MINNI_AGENT_ID",
+                    "MINNI_VAULT_PATH",
+                    "MINNI_SOCKET_PATH",
+                    "MINNI_WORKSPACE_ID",
+                    "MINNI_AFM_PROVIDER_MODE",
+                    "MINNI_AFM_NATIVE_HELPER",
+                ):
                     if k in ex_env:
                         preserved_lines.append(f'{k} = "{ex_env[k]}"')
                 if preserved_lines:
@@ -187,7 +204,7 @@ def replace_toml_sections(path: Path, sections: dict[str, str], *, preserve_surf
     path.write_text(text, encoding="utf-8")
 
 
-def mcp_json(server_path: Path, agent: str, vault: Path, socket_path: Path, workspace: Path, target_path: Path | None = None, explicit_workspace: bool = False, pre_existing_env: dict | None = None) -> dict:
+def mcp_json(server_path: Path, agent: str, vault: Path, socket_path: Path, workspace: Path, target_path: Path | None = None, explicit_workspace: bool = False, pre_existing_env: dict | None = None, afm_env: dict[str, str] | None = None) -> dict:
     """Build the mcpServers.minni manifest dict.
 
     pre_existing_env (snapshot before copy_tree) or target_path (if no clobber) is used
@@ -201,6 +218,7 @@ def mcp_json(server_path: Path, agent: str, vault: Path, socket_path: Path, work
         "MINNI_SOCKET_PATH": str(socket_path),
         "MINNI_WORKSPACE_ID": normalized_workspace,
     }
+    env.update(afm_env or {})
     ex_env = {}
     if pre_existing_env is not None:
         ex_env = pre_existing_env
@@ -211,7 +229,7 @@ def mcp_json(server_path: Path, agent: str, vault: Path, socket_path: Path, work
         except Exception:
             pass
     if ex_env:
-        for k in ("MINNI_AGENT_ID", "MINNI_VAULT_PATH", "MINNI_SOCKET_PATH"):
+        for k in ("MINNI_AGENT_ID", "MINNI_VAULT_PATH", "MINNI_SOCKET_PATH", "MINNI_AFM_PROVIDER_MODE", "MINNI_AFM_NATIVE_HELPER"):
             if k in ex_env:
                 env[k] = ex_env[k]
         if "MINNI_WORKSPACE_ID" in ex_env and not explicit_workspace:
@@ -228,7 +246,7 @@ def mcp_json(server_path: Path, agent: str, vault: Path, socket_path: Path, work
     }
 
 
-def update_claude_config(server_path: Path, agent: str, vault: Path, socket_path: Path, workspace: Path) -> None:
+def update_claude_config(server_path: Path, agent: str, vault: Path, socket_path: Path, workspace: Path, afm_env: dict[str, str] | None = None) -> None:
     path = Path("~/.claude.json").expanduser()
     data = load_json(path)
     data.setdefault("mcpServers", {})["minni"] = {
@@ -240,12 +258,13 @@ def update_claude_config(server_path: Path, agent: str, vault: Path, socket_path
             "MINNI_VAULT_PATH": str(vault),
             "MINNI_SOCKET_PATH": str(socket_path),
             "MINNI_WORKSPACE_ID": normalize_workspace_id(str(workspace)),
+            **(afm_env or {}),
         },
     }
     write_json(path, data)
 
 
-def update_kilo_config(server_path: Path, agent: str, vault: Path, socket_path: Path, workspace: Path) -> None:
+def update_kilo_config(server_path: Path, agent: str, vault: Path, socket_path: Path, workspace: Path, afm_env: dict[str, str] | None = None) -> None:
     path = Path("~/.config/kilo/kilo.json").expanduser()
     data = load_json(path)
     data.setdefault("mcp", {})["minni"] = {
@@ -257,12 +276,13 @@ def update_kilo_config(server_path: Path, agent: str, vault: Path, socket_path: 
             "MINNI_VAULT_PATH": str(vault),
             "MINNI_SOCKET_PATH": str(socket_path),
             "MINNI_WORKSPACE_ID": normalize_workspace_id(str(workspace)),
+            **(afm_env or {}),
         },
     }
     write_json(path, data)
 
 
-def update_gemini_manifest(install_root: Path, agent: str, vault: Path, socket_path: Path, workspace: Path) -> None:
+def update_gemini_manifest(install_root: Path, agent: str, vault: Path, socket_path: Path, workspace: Path, afm_env: dict[str, str] | None = None) -> None:
     write_json(
         install_root / "gemini-extension.json",
         {
@@ -278,6 +298,7 @@ def update_gemini_manifest(install_root: Path, agent: str, vault: Path, socket_p
                         "MINNI_VAULT_PATH": str(vault),
                         "MINNI_SOCKET_PATH": str(socket_path),
                         "MINNI_WORKSPACE_ID": normalize_workspace_id(str(workspace)),
+                        **(afm_env or {}),
                     },
                 }
             },
@@ -291,6 +312,7 @@ def gemini_minni_entry(
     vault: Path,
     socket_path: Path,
     workspace: Path,
+    afm_env: dict[str, str] | None = None,
     type_name: str | None = None,
 ) -> dict:
     """Canonical `minni` server entry for a Gemini/Antigravity MCP view.
@@ -310,6 +332,7 @@ def gemini_minni_entry(
         "MINNI_VAULT_PATH": str(vault),
         "MINNI_SOCKET_PATH": str(socket_path),
         "MINNI_WORKSPACE_ID": normalize_workspace_id(str(workspace)),
+        **(afm_env or {}),
     }
     return entry
 
@@ -321,6 +344,7 @@ def write_view_entry(
     vault: Path,
     socket_path: Path,
     workspace: Path,
+    afm_env: dict[str, str] | None = None,
 ) -> bool:
     """Idempotently set the `minni` server in a Gemini MCP view file.
 
@@ -343,7 +367,7 @@ def write_view_entry(
         if isinstance(value, dict) and "$typeName" in value:
             type_name = value["$typeName"]
             break
-    new_entry = gemini_minni_entry(server_path, agent, vault, socket_path, workspace, type_name)
+    new_entry = gemini_minni_entry(server_path, agent, vault, socket_path, workspace, afm_env, type_name)
     # Skip the write when already in the desired state, so we don't churn the
     # file and trip IDE/CLI file watchers on every propagation run.
     if servers.get("minni") == new_entry and "sovereign-memory" not in servers:
@@ -422,7 +446,7 @@ def ensure_permission_grant(
 
 
 def update_antigravity_config(
-    install_root: Path, agent: str, vault: Path, socket_path: Path, workspace: Path
+    install_root: Path, agent: str, vault: Path, socket_path: Path, workspace: Path, afm_env: dict[str, str] | None = None
 ) -> dict[str, object]:
     """Wire the `minni` server across the Antigravity/Gemini surfaces.
 
@@ -437,7 +461,7 @@ def update_antigravity_config(
         surface_path = Path(surface).expanduser()
         # Follow the symlink to the actual view file; skip broken/missing surfaces.
         target = surface_path.resolve() if surface_path.exists() else surface_path
-        if write_view_entry(target, server_path, agent, vault, socket_path, workspace):
+        if write_view_entry(target, server_path, agent, vault, socket_path, workspace, afm_env):
             written.append(str(target))
     grants = {
         "~/.gemini/config/config.json": ["globalPermissionGrants", "allow"],
@@ -450,7 +474,7 @@ def update_antigravity_config(
     return {"views_written": written, "grants_updated": granted}
 
 
-def update_toml_mcp_config(path: Path, server_path: Path, agent: str, vault: Path, socket_path: Path, workspace: Path, explicit_workspace: bool = False) -> None:
+def update_toml_mcp_config(path: Path, server_path: Path, agent: str, vault: Path, socket_path: Path, workspace: Path, explicit_workspace: bool = False, afm_env: dict[str, str] | None = None) -> None:
     # Build sections with the (possibly --workspace or repo-derived) values.
     # Pass preserve_surface_env = not explicit so that replace_toml_sections will
     # override the env section with target's existing surface values if present.
@@ -470,7 +494,8 @@ def update_toml_mcp_config(path: Path, server_path: Path, agent: str, vault: Pat
                 f'MINNI_AGENT_ID = "{agent}"\n'
                 f'MINNI_VAULT_PATH = "{vault}"\n'
                 f'MINNI_SOCKET_PATH = "{socket_path}"\n'
-                f'MINNI_WORKSPACE_ID = "{normalize_workspace_id(str(workspace))}"' 
+                f'MINNI_WORKSPACE_ID = "{normalize_workspace_id(str(workspace))}"'
+                + "".join(f'\n{k} = "{v}"' for k, v in (afm_env or {}).items())
             ),
         },
         preserve_surface_env = not explicit_workspace,
@@ -547,6 +572,7 @@ def update_one_plugin(platform: str, args: argparse.Namespace) -> dict[str, obje
         run(["npm", "run", "build"], cwd=source)
 
     spec = platform_spec(platform, repo_root, args.install_root)
+    afm_env = native_afm_env(repo_root)
     if canonical_platform(platform) == "generic" and not args.agent:
         raise SystemExit("generic update-plugin requires --agent so it cannot inherit another agent's vault")
     agent = args.agent or str(spec["agent"])
@@ -570,23 +596,23 @@ def update_one_plugin(platform: str, args: argparse.Namespace) -> dict[str, obje
 
     copy_tree(source, install_root)
     server_path = install_root / "dist" / "server.js"
-    write_json(mcp_target, mcp_json(server_path, agent, vault, Path(args.socket).expanduser(), stamp_workspace, target_path=None, explicit_workspace=explicit_workspace, pre_existing_env=pre_mcp_env))
+    write_json(mcp_target, mcp_json(server_path, agent, vault, Path(args.socket).expanduser(), stamp_workspace, target_path=None, explicit_workspace=explicit_workspace, pre_existing_env=pre_mcp_env, afm_env=afm_env))
 
     config_kind = str(spec["config_kind"])
     if config_kind == "toml":
-        update_toml_mcp_config(Path(spec["config"]).expanduser(), server_path, agent, vault, Path(args.socket).expanduser(), stamp_workspace, explicit_workspace=explicit_workspace)
+        update_toml_mcp_config(Path(spec["config"]).expanduser(), server_path, agent, vault, Path(args.socket).expanduser(), stamp_workspace, explicit_workspace=explicit_workspace, afm_env=afm_env)
     elif config_kind == "claude-json":
-        update_claude_config(server_path, agent, vault, Path(args.socket).expanduser(), stamp_workspace)
+        update_claude_config(server_path, agent, vault, Path(args.socket).expanduser(), stamp_workspace, afm_env)
     elif config_kind == "kilo-json":
-        update_kilo_config(server_path, agent, vault, Path(args.socket).expanduser(), stamp_workspace)
+        update_kilo_config(server_path, agent, vault, Path(args.socket).expanduser(), stamp_workspace, afm_env)
     elif config_kind == "gemini-manifest":
-        update_gemini_manifest(install_root, agent, vault, Path(args.socket).expanduser(), stamp_workspace)
+        update_gemini_manifest(install_root, agent, vault, Path(args.socket).expanduser(), stamp_workspace, afm_env)
     elif config_kind == "antigravity":
         # Keep the gemini-cli extension manifest correct, then wire the
         # Antigravity CLI/IDE/antigravity surface views + permission grants.
-        update_gemini_manifest(install_root, agent, vault, Path(args.socket).expanduser(), stamp_workspace)
+        update_gemini_manifest(install_root, agent, vault, Path(args.socket).expanduser(), stamp_workspace, afm_env)
         antigravity_result = update_antigravity_config(
-            install_root, agent, vault, Path(args.socket).expanduser(), stamp_workspace
+            install_root, agent, vault, Path(args.socket).expanduser(), stamp_workspace, afm_env
         )
 
     base: dict[str, object] = {
