@@ -220,7 +220,7 @@ function resolveBudget(profileInput: TaskProfile | undefined, budgetTokens: numb
   };
 }
 
-function classifyIntent(task: string): string {
+export function classifyIntent(task: string): string {
   const text = task.toLowerCase();
   if (/review|audit|risk/.test(text)) return "review";
   if (/debug|fix|broken|failing|error/.test(text)) return "debug";
