@@ -341,6 +341,11 @@ async function handleUserPromptSubmit(payload: Record<string, unknown>): Promise
   // STRENGTH gate below (NOT keyword classification). Substantive 'none'-intent
   // turns still run recall and get a pointer iff the hits are strong.
   if (!intent.automaticAllowed) {
+    // Clear any stale strong state from a previous turn BEFORE returning: an
+    // unconsumed pointer must not leak into this write-intent turn and let the
+    // s6 guard deny an unrelated read/search here (parity with the weak-turn
+    // path below, which also clears).
+    await clearRecallState(CLAUDECODE_VAULT_PATH).catch(() => {});
     // c3: persistent lifecycle visibility must survive this write-intent
     // early-return — the agent still sees the 4 surfaces on learn/vault_write turns.
     return lifecycleOnlyOutput(signature, lifecycleFields);

@@ -201,7 +201,12 @@ export async function readRecallState(vaultPath: string): Promise<RecallState | 
   try {
     const raw = await readFile(recallStatePath(vaultPath), "utf8");
     const parsed = JSON.parse(raw) as RecallState;
-    if (parsed && typeof parsed === "object" && typeof parsed.task_signature === "string") {
+    if (
+      parsed &&
+      typeof parsed === "object" &&
+      typeof parsed.task_signature === "string" &&
+      Array.isArray(parsed.top_hits)
+    ) {
       return parsed;
     }
   } catch {

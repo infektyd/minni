@@ -474,6 +474,13 @@ def update_antigravity_config(
     return {"views_written": written, "grants_updated": granted}
 
 
+def _toml_basic_str(value: object) -> str:
+    # Escape a value for embedding in a TOML basic (double-quoted) string.
+    # Critically: backslashes must be doubled first, else Windows paths like
+    # C:\Users\... are read back as invalid TOML escape sequences.
+    return str(value).replace("\\", "\\\\").replace('"', '\\"')
+
+
 def update_toml_mcp_config(path: Path, server_path: Path, agent: str, vault: Path, socket_path: Path, workspace: Path, explicit_workspace: bool = False, afm_env: dict[str, str] | None = None) -> None:
     # Build sections with the (possibly --workspace or repo-derived) values.
     # Pass preserve_surface_env = not explicit so that replace_toml_sections will
@@ -486,16 +493,16 @@ def update_toml_mcp_config(path: Path, server_path: Path, agent: str, vault: Pat
             "mcp_servers.minni": (
                 "[mcp_servers.minni]\n"
                 'command = "node"\n'
-                f'args = ["{server_path}"]\n'
+                f'args = ["{_toml_basic_str(server_path)}"]\n'
                 "enabled = true"
             ),
             "mcp_servers.minni.env": (
                 "[mcp_servers.minni.env]\n"
-                f'MINNI_AGENT_ID = "{agent}"\n'
-                f'MINNI_VAULT_PATH = "{vault}"\n'
-                f'MINNI_SOCKET_PATH = "{socket_path}"\n'
-                f'MINNI_WORKSPACE_ID = "{normalize_workspace_id(str(workspace))}"'
-                + "".join(f'\n{k} = "{v}"' for k, v in (afm_env or {}).items())
+                f'MINNI_AGENT_ID = "{_toml_basic_str(agent)}"\n'
+                f'MINNI_VAULT_PATH = "{_toml_basic_str(vault)}"\n'
+                f'MINNI_SOCKET_PATH = "{_toml_basic_str(socket_path)}"\n'
+                f'MINNI_WORKSPACE_ID = "{_toml_basic_str(normalize_workspace_id(str(workspace)))}"'
+                + "".join(f'\n{k} = "{_toml_basic_str(v)}"' for k, v in (afm_env or {}).items())
             ),
         },
         preserve_surface_env = not explicit_workspace,

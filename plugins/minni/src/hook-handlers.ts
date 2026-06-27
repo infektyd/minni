@@ -359,6 +359,11 @@ export function createHookHandlers(
     // the user dictating memory, not asking the agent to recall — inject no
     // pointer and write no state. (s5 parity with the claude-code hook.)
     if (!intent.automaticAllowed) {
+      // Clear any stale strong state from a previous turn BEFORE returning: an
+      // unconsumed pointer must not leak into this write-intent turn and let the
+      // s6 guard deny an unrelated read/search here (parity with the weak-turn
+      // path below, which also clears).
+      await clearRecallState(config.vaultPath).catch(() => {});
       return { continue: true };
     }
 
