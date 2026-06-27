@@ -328,6 +328,11 @@ function privacyForSource(result: VaultSearchResult): { privacyLevel: PrivacyLev
   return { privacyLevel, points: PRIVACY_POINTS[privacyLevel], reason };
 }
 
+/** SEC-006: only privacy:safe vault hits may enter recall/hook surfaces. */
+export function filterSafeVaultResults(results: VaultSearchResult[]): VaultSearchResult[] {
+  return results.filter((result) => privacyForSource(result).privacyLevel === "safe");
+}
+
 function authorityPoints(authority: SourceAuthority): number {
   if (authority === "schema") return 60;
   if (authority === "handoff") return 42;

@@ -450,17 +450,15 @@ def resolve_effective_principal(
             if supplied not in platform_ids:
                 continue
             platform_caps = raw.get("platform_agent_capabilities") or {}
-            caps = platform_caps.get(supplied) if isinstance(platform_caps, dict) else None
-            # An explicit empty list means "no capabilities" and MUST be honoured —
-            # `caps or ...` would wrongly fall through to the broader principal caps,
-            # silently escalating a deliberately-restricted platform agent. Only fall
-            # back when caps is absent (None). Likewise treat explicit null
-            # workspace_id/capabilities as absent rather than coercing to "None".
-            if caps is not None:
-                resolved_caps = caps
+            platform_caps_map = (
+                platform_caps if isinstance(platform_caps, dict) else {}
+            )
+            # Platform agents must NOT inherit the operator wildcard when no per-agent
+            # entry exists — listed ids without an explicit cap map entry default-deny.
+            if supplied in platform_caps_map:
+                resolved_caps = platform_caps_map[supplied]
             else:
-                raw_caps = raw.get("capabilities")
-                resolved_caps = raw_caps if raw_caps is not None else stamped.capabilities
+                resolved_caps = []
             raw_ws = raw.get("workspace_id")
             resolved_ws = raw_ws if raw_ws is not None else stamped.workspace_id
             return EffectivePrincipal(
@@ -640,3 +638,34 @@ def can_read_document(
 
     # Default-deny any other cross-agent case
     return False
+
+
+def allows_cross_agent_recall(principal: EffectivePrincipal) -> bool:
+    """Return True if principal may opt into cross-agent learning recall (search.cross_agent)."""
+    caps = principal.capabilities or []
+    if "*" in caps or "cross_agent" in caps or "govern" in caps:
+        return True
+    return is_operator_principal(principal)
+
+
+def make_capability_denied_error(
+    capability: str,
+    method: str,
+    request_id: Any = None,
+    *,
+    principal_id: Optional[str] = None,
+) -> dict:
+    """Return JSON-RPC -32004 for a missing stamped-principal capability."""
+    msg = f"capability_denied: {capability!r} required for {method!r}"
+    if principal_id:
+        msg += f" (principal={principal_id!r})"
+    try:
+        from minnid import _make_error  # type: ignore
+
+        return _make_error(-32004, msg, request_id)
+    except Exception:
+        return {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "error": {"code": -32004, "message": msg},
+        }

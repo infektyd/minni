@@ -312,6 +312,6 @@ def test_ingest_reports_skipped_by_kind(tmp_path):
 
     # No skips -> empty dict (truthiness check used by the loop logger).
     clean = tmp_path / "clean-vault" / "inbox"
-    _write_inbox_file(clean, "a.json", _stop_doc(["only eligible content"]))
+    _write_inbox_file(clean, "a.json", _stop_doc(["only eligible content"], agent_id="clean"))
     res2 = ingest(db_obj, cfg, inboxes=[clean], dry_run=True)
     assert res2["skipped_by_kind"] == {}

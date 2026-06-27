@@ -28,6 +28,7 @@ import {
 import {
   buildHandoffPacket,
   extractScarTissue,
+  filterSafeVaultResults,
   prepareOutcome,
   prepareTask,
   type ScarTissueEntry,
@@ -92,11 +93,35 @@ async function requireSharedGate(
     workspaceId: DEFAULT_WORKSPACE_ID,
     details,
   });
+  const data = gate.data as Record<string, unknown> | undefined;
+  if (gate.ok && data?.status === "recovery_required") {
+    return textResult(
+      JSON.stringify(
+        {
+          status: "gate-rejected",
+          operation,
+          reason: data.reason ?? "recovery_required",
+          gate: data,
+        },
+        null,
+        2,
+      ),
+    );
+  }
   if (gate.ok) return undefined;
   const error = gate.error ?? "";
   if (isSharedGateUnavailable(error)) {
-    console.warn(`[minni] shared gate unavailable for ${operation}: ${error}; using local degraded path`);
-    return undefined;
+    return textResult(
+      JSON.stringify(
+        {
+          status: "gate-unavailable",
+          operation,
+          error,
+        },
+        null,
+        2,
+      ),
+    );
   }
   return textResult(
     JSON.stringify(
@@ -471,10 +496,12 @@ server.registerTool(
     const vaultResults =
       includeVault === false
         ? []
-        : await searchVaultNotes(
-            effectiveVaultPath,
-            query,
-            Math.min(limit ?? 5, 8),
+        : filterSafeVaultResults(
+            await searchVaultNotes(
+              effectiveVaultPath,
+              query,
+              Math.min(limit ?? 5, 8),
+            ),
           );
     const result = await recallMemory({
       query,

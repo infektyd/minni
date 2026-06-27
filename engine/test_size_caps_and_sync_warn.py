@@ -25,6 +25,76 @@ import pytest
 sys.path.insert(0, os.path.dirname(__file__))
 
 
+@pytest.fixture(autouse=True)
+def setup_hermetic_principals(tmp_path, monkeypatch):
+    import principal
+    import minnid
+    import json
+
+    pdir = tmp_path / "principals"
+    pdir.mkdir(exist_ok=True)
+    original_resolve = principal.resolve_effective_principal
+
+    def _patched_resolve(
+        *,
+        supplied_agent_id=None,
+        transport="uds",
+        principals_dir=None,
+        operator_context=False,
+    ):
+        target_dir = principals_dir or pdir
+        if supplied_agent_id is None:
+            f = target_dir / "local.json"
+            f.write_text(
+                json.dumps(
+                    {
+                        "agent_id": "main",
+                        "workspace_id": "default",
+                        "capabilities": ["*"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            os.chmod(f, 0o600)
+            return original_resolve(
+                supplied_agent_id=None,
+                transport=transport,
+                principals_dir=target_dir,
+            )
+
+        target_agent = str(supplied_agent_id).strip()
+        if not target_agent:
+            return original_resolve(
+                supplied_agent_id=None,
+                transport=transport,
+                principals_dir=target_dir,
+            )
+
+        f = target_dir / f"{target_agent}.json"
+        f.write_text(
+            json.dumps(
+                {
+                    "agent_id": target_agent,
+                    "workspace_id": "default",
+                    "capabilities": ["*"],
+                }
+            ),
+            encoding="utf-8",
+        )
+        os.chmod(f, 0o600)
+
+        op_ctx = operator_context or target_agent in principal.OPERATOR_RESERVED_AGENT_IDS
+        return original_resolve(
+            supplied_agent_id=supplied_agent_id,
+            transport=transport,
+            principals_dir=target_dir,
+            operator_context=op_ctx,
+        )
+
+    monkeypatch.setattr(principal, "resolve_effective_principal", _patched_resolve)
+    monkeypatch.setattr(minnid, "resolve_effective_principal", _patched_resolve)
+
+
 # ---------------------------------------------------------------------------
 # Helpers — keep parity with engine/test_pr6_contradictions.py
 # ---------------------------------------------------------------------------

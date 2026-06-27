@@ -58,7 +58,7 @@ import {
   stashPrecompactReassert,
   subscribeContradictions,
 } from "./sovereign.js";
-import { classifyIntent, extractScarTissue, prepareOutcome } from "./task.js";
+import { classifyIntent, extractScarTissue, filterSafeVaultResults, prepareOutcome } from "./task.js";
 import {
   auditTail,
   collectCorrectionsReassert,
@@ -346,7 +346,7 @@ async function handleUserPromptSubmit(payload: Record<string, unknown>): Promise
     return lifecycleOnlyOutput(signature, lifecycleFields);
   }
   const threshold = recallPointerThreshold();
-  const [vaultResults, recall] = await Promise.all([
+  const [vaultResultsRaw, recall] = await Promise.all([
     searchVaultNotes(CLAUDECODE_VAULT_PATH, prompt, 6),
     recallMemory({
       query: prompt,
@@ -355,6 +355,7 @@ async function handleUserPromptSubmit(payload: Record<string, unknown>): Promise
       workspaceId: CLAUDECODE_WORKSPACE_ID,
     }),
   ]);
+  const vaultResults = filterSafeVaultResults(vaultResultsRaw);
 
   // s5 strength gate: emit the light pointer + recall-state file ONLY when the
   // top recall strength clears the threshold; otherwise inject nothing and clear
@@ -392,10 +393,13 @@ async function handleUserPromptSubmit(payload: Record<string, unknown>): Promise
     }).catch(() => {});
   }
 
-  const planRef = activePlan !== undefined ? compactPlanPointer(activePlan) : undefined;
+  let active_plan_ref: ReturnType<typeof compactPlanPointer> | undefined;
+  if (activePlan !== undefined) {
+    active_plan_ref = compactPlanPointer(activePlan);
+  }
 
   // Nothing salient to inject this turn: no strong recall AND no active plan.
-  if (!strong && planRef === undefined) {
+  if (!strong && active_plan_ref === undefined) {
     await recordAudit(CLAUDECODE_VAULT_PATH, {
       tool: "hook_user_prompt_submit",
       summary: prompt.slice(0, 120),
@@ -433,8 +437,8 @@ async function handleUserPromptSubmit(payload: Record<string, unknown>): Promise
   // turn; the full goal/open_questions/pending list is omitted (it barely changes
   // turn-to-turn) and pulled on demand via minni_plan_status. SessionStart still
   // injects the full plan view for boot/rehydration.
-  if (planRef !== undefined) {
-    envelopeBody.active_plan_ref = planRef;
+  if (active_plan_ref !== undefined) {
+    envelopeBody.active_plan_ref = active_plan_ref;
   }
 
   const envelope = wrapEnvelope({

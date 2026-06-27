@@ -13,6 +13,7 @@ import logging
 import re
 import sqlite3
 import time
+import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -51,36 +52,63 @@ def _load_prompt() -> str:
     return prompt_path.read_text(encoding="utf-8")
 
 
-def _recent_events(db, lookback_hours: int) -> List[Dict[str, Any]]:
+def _recent_events(db, lookback_hours: int, agent_id: Optional[str] = None) -> List[Dict[str, Any]]:
     cutoff = time.time() - (lookback_hours * 3600)
     with db.cursor() as c:
-        c.execute(
-            """
-            SELECT event_id, agent_id, event_type, content, task_id, thread_id, metadata, created_at
-            FROM episodic_events
-            WHERE created_at >= ?
-            ORDER BY created_at DESC
-            LIMIT 100
-            """,
-            (cutoff,),
-        )
+        if agent_id:
+            c.execute(
+                """
+                SELECT event_id, agent_id, event_type, content, task_id, thread_id, metadata, created_at
+                FROM episodic_events
+                WHERE created_at >= ? AND agent_id = ?
+                ORDER BY created_at DESC
+                LIMIT 100
+                """,
+                (cutoff, agent_id),
+            )
+        else:
+            c.execute(
+                """
+                SELECT event_id, agent_id, event_type, content, task_id, thread_id, metadata, created_at
+                FROM episodic_events
+                WHERE created_at >= ?
+                ORDER BY created_at DESC
+                LIMIT 100
+                """,
+                (cutoff,),
+            )
         return [dict(row) for row in c.fetchall()]
 
 
-def _recent_raw_docs(db, lookback_hours: int) -> List[Dict[str, Any]]:
+def _recent_raw_docs(db, lookback_hours: int, agent_id: Optional[str] = None) -> List[Dict[str, Any]]:
     cutoff = time.time() - (lookback_hours * 3600)
     with db.cursor() as c:
-        c.execute(
-            """
-            SELECT doc_id, path, agent, page_type, page_status, indexed_at, last_modified
-            FROM documents
-            WHERE (path LIKE '%/raw/%' OR path LIKE 'raw/%' OR agent = 'raw')
-              AND COALESCE(indexed_at, last_modified, 0) >= ?
-            ORDER BY COALESCE(indexed_at, last_modified, 0) DESC
-            LIMIT 50
-            """,
-            (cutoff,),
-        )
+        if agent_id:
+            c.execute(
+                """
+                SELECT doc_id, path, agent, page_type, page_status, privacy_level, indexed_at, last_modified
+                FROM documents
+                WHERE (path LIKE '%/raw/%' OR path LIKE 'raw/%' OR agent = 'raw' OR agent = ?)
+                  AND COALESCE(indexed_at, last_modified, 0) >= ?
+                  AND COALESCE(privacy_level, 'safe') = 'safe'
+                ORDER BY COALESCE(indexed_at, last_modified, 0) DESC
+                LIMIT 50
+                """,
+                (agent_id, cutoff),
+            )
+        else:
+            c.execute(
+                """
+                SELECT doc_id, path, agent, page_type, page_status, privacy_level, indexed_at, last_modified
+                FROM documents
+                WHERE (path LIKE '%/raw/%' OR path LIKE 'raw/%' OR agent = 'raw')
+                  AND COALESCE(indexed_at, last_modified, 0) >= ?
+                  AND COALESCE(privacy_level, 'safe') = 'safe'
+                ORDER BY COALESCE(indexed_at, last_modified, 0) DESC
+                LIMIT 50
+                """,
+                (cutoff,),
+            )
         return [dict(row) for row in c.fetchall()]
 
 
@@ -426,8 +454,10 @@ def run(db, config, vault_path: Optional[str] = None, dry_run: bool = True, trac
     lookback_hours = int(pass_cfg.get("lookback_hours", 24))
     trace_id = trace_id or f"afm-{int(time.time())}"
     prompt = _load_prompt()
-    events = _recent_events(db, lookback_hours)
-    raw_docs = _recent_raw_docs(db, lookback_hours)
+    bound_agent = os.environ.get("MINNI_AGENT_ID") or getattr(config, "agent_id", None)
+    bound_agent = str(bound_agent).strip() if bound_agent else None
+    events = _recent_events(db, lookback_hours, agent_id=bound_agent)
+    raw_docs = _recent_raw_docs(db, lookback_hours, agent_id=bound_agent)
     pass_input = {
         "lookback_hours": lookback_hours,
         "event_count": len(events),

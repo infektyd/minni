@@ -16,6 +16,7 @@ import os
 import re
 import time
 import logging
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Set
 from dataclasses import dataclass, field
 
@@ -249,13 +250,19 @@ class WikiIndexer:
         # Build wikilink target map for resolution
         target_map = self.parser.get_wikilink_targets(wiki_path)
 
+        wiki_root_resolved = Path(wiki_path).resolve()
+
         # Collect current files on disk
         disk_files: Dict[str, float] = {}
         for root, _, files in os.walk(wiki_path):
             for fname in files:
                 if fname.endswith(".md") and not fname.startswith('.'):
-                    full = os.path.join(root, fname)
-                    disk_files[full] = os.path.getmtime(full)
+                    full = Path(root) / fname
+                    from path_safety import path_within_root
+                    if not path_within_root(full, wiki_root_resolved):
+                        continue
+                    full_resolved = str(full.resolve())
+                    disk_files[full_resolved] = full.stat().st_mtime
 
         stats = {
             "indexed": 0, "skipped": 0, "deleted": 0,
@@ -344,12 +351,16 @@ class WikiIndexer:
                             stats["errors"] += 1
                             continue
 
-                    # PR-2: Skip pages with privacy: blocked
+                    # PR-2: blocked pages must purge stale index rows, not just skip
                     if not is_meta and page.frontmatter.privacy == "blocked":
-                        logger.info(
-                            "Skipping blocked page: %s", os.path.basename(path)
-                        )
-                        stats["skipped"] += 1
+                        if row:
+                            doc_id = row["doc_id"]
+                            c.execute("DELETE FROM vault_fts WHERE doc_id = ?", (doc_id,))
+                            c.execute("DELETE FROM chunk_embeddings WHERE doc_id = ?", (doc_id,))
+                            c.execute("DELETE FROM documents WHERE doc_id = ?", (doc_id,))
+                            stats["deleted"] += 1
+                        else:
+                            stats["skipped"] += 1
                         continue
 
                     now = time.time()
