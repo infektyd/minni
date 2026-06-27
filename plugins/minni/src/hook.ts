@@ -434,7 +434,9 @@ async function handleUserPromptSubmit(payload: Record<string, unknown>): Promise
   // turn-to-turn) and pulled on demand via minni_plan_status. SessionStart still
   // injects the full plan view for boot/rehydration.
   if (planRef !== undefined) {
-    envelopeBody.active_plan_ref = planRef;
+    // Plan parity (audit C5): inline the compact-pointer call so all four hooks
+    // share the same wire shape (planRef !== undefined implies activePlan is set).
+    envelopeBody.active_plan_ref = compactPlanPointer(activePlan);
   }
 
   const envelope = wrapEnvelope({
