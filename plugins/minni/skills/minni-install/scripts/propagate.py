@@ -181,6 +181,22 @@ def replace_toml_sections(path: Path, sections: dict[str, str], *, preserve_surf
             data = tomllib.loads(text)
             ex_env = data.get("mcp_servers", {}).get("minni", {}).get("env", {}) or {}
             if ex_env:
+                # Parse the freshly-computed env section so we can MERGE in AFM
+                # defaults this run detected but the existing surface lacks.
+                # Without this, a surface that already has the identity keys but
+                # predates native-AFM wiring would silently drop the newly
+                # computed MINNI_AFM_* defaults (existing surface value still
+                # wins when present, so per-agent wiring is never clobbered).
+                try:
+                    fresh_env = (
+                        tomllib.loads(sections["mcp_servers.minni.env"])
+                        .get("mcp_servers", {})
+                        .get("minni", {})
+                        .get("env", {})
+                        or {}
+                    )
+                except Exception:
+                    fresh_env = {}
                 preserved_lines = []
                 for k in (
                     "MINNI_AGENT_ID",
@@ -191,7 +207,12 @@ def replace_toml_sections(path: Path, sections: dict[str, str], *, preserve_surf
                     "MINNI_AFM_NATIVE_HELPER",
                 ):
                     if k in ex_env:
-                        preserved_lines.append(f'{k} = "{ex_env[k]}"')
+                        val = ex_env[k]
+                    elif k in fresh_env:
+                        val = fresh_env[k]
+                    else:
+                        continue
+                    preserved_lines.append(f'{k} = "{_toml_basic_str(val)}"')
                 if preserved_lines:
                     sections["mcp_servers.minni.env"] = "[mcp_servers.minni.env]\n" + "\n".join(preserved_lines)
         except Exception:
