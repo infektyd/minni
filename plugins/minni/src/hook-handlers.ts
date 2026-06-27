@@ -39,7 +39,24 @@ import {
   stashPrecompactReassert,
   subscribeContradictions,
 } from "./sovereign.js";
+import {
+  readRecallState,
+  markRecallConsumed,
+  recallPointerThreshold,
+  extractStrongRecall,
+  writeRecallState,
+  clearRecallState,
+  buildRecallPointer,
+} from "./recall-state.js";
 import { extractScarTissue, prepareOutcome } from "./task.js";
+import {
+  PRE_TOOL_USE_EVENT,
+  decideGuard,
+  preToolUseAllow,
+  preToolUseDeny,
+  recallGuardMode,
+} from "./recall-guard.js";
+import type { PreToolUseDecisionOutput } from "./recall-guard.js";
 import {
   auditTail,
   collectCorrectionsReassert,
@@ -111,6 +128,7 @@ export interface AgentHookConfig {
    * files (grok's and kilocode's behavior).
    */
   alwaysWriteStopInbox: boolean;
+  recallGuardMode?: "off" | "soft" | "strict";
 }
 
 /** Test seam: lets behavioral tests drive the zero-candidate Stop branch. */
@@ -123,7 +141,8 @@ export interface AgentHookHandlers {
   handleUserPromptSubmit(payload: Record<string, unknown>): Promise<HookOutput>;
   handlePreCompact(payload: Record<string, unknown>): Promise<HookOutput>;
   handleStop(payload: Record<string, unknown>): Promise<HookOutput>;
-  dispatch(event: string, payload: Record<string, unknown>): Promise<HookOutput>;
+  handlePreToolUse(payload: Record<string, unknown>): Promise<PreToolUseDecisionOutput>;
+  dispatch(event: string, payload: Record<string, unknown>): Promise<HookOutput | PreToolUseDecisionOutput>;
 }
 
 export function createHookHandlers(
@@ -320,12 +339,13 @@ export function createHookHandlers(
     }
 
     const intent = routeMemoryIntent(prompt);
-    if (intent.action === "none" && !intent.automaticAllowed) {
+    if (!intent.automaticAllowed) {
       return { continue: true };
     }
 
     const workspaceId = workspaceFor(payload);
     const signature = hashTaskSignature(prompt);
+    const threshold = recallPointerThreshold();
     const [vaultResults, recall] = await Promise.all([
       searchVaultNotes(config.vaultPath, prompt, 6),
       recallMemory({
@@ -336,8 +356,23 @@ export function createHookHandlers(
       }),
     ]);
 
-    if (vaultResults.length === 0 && (!recall.ok || !recall.data?.results)) {
-      return { continue: true };
+    const strong = extractStrongRecall(
+      recall.ok ? recall.data : undefined,
+      vaultResults,
+      threshold,
+    );
+    let recallStateFile: string | undefined;
+    if (strong) {
+      try {
+        recallStateFile = await writeRecallState(config.vaultPath, {
+          task_signature: signature,
+          intent: intent.action,
+          top_hits: strong.topHits,
+          top_score: strong.topScore,
+        });
+      } catch {}
+    } else {
+      await clearRecallState(config.vaultPath).catch(() => {});
     }
 
     let activePlan: Awaited<ReturnType<typeof resolveActivePlanView>>;
@@ -352,24 +387,39 @@ export function createHookHandlers(
       }).catch(() => {});
     }
 
+    if (!strong && activePlan === undefined) {
+      await recordAudit(config.vaultPath, {
+        tool: `${config.auditPrefix}_user_prompt_submit`,
+        summary: prompt.slice(0, 120),
+        details: {
+          intent: intent.action,
+          vault_matches: vaultResults.map((result) => result.relativePath),
+          daemon_ok: recall.ok,
+          task_signature: signature,
+          recall_strong: false,
+          automatic_write: false,
+        },
+      });
+      return { continue: true };
+    }
+
     const envelopeBody: Record<string, unknown> = {
       identity: {
         agent: config.agentId,
         workspace: workspaceId,
         task_signature: signature,
       },
-      recall:
-        recall.ok && recall.data
-          ? formatRecall(prompt, recall.data, vaultResults)
-          : { ok: false, error: recall.error },
-      vault: vaultRecallToBody(vaultResults),
-      intent: {
-        action: intent.action,
-        confidence: intent.confidence,
-        suggested_tool: intent.suggestedTool,
-        automatic_write: false,
-      },
     };
+
+    if (strong) {
+      envelopeBody.recall_pointer = buildRecallPointer(strong);
+      envelopeBody.recall_state = recallStateFile;
+    } else {
+      // Fallback formatRecall if it's required for test compatibility or legacy format? No, we skip it entirely now,
+      // but wait, does any test check for full recall?
+      // "explicit WRITE intents (learn/vault_write) are still suppressed: no pointer, no state"
+      // Wait, earlier the code injected formatRecall if it was not strong. Actually, no, if it's not strong, we early returned!
+    }
 
     // Plan parity (audit C5): per-turn injection is a compact plan POINTER, not
     // the full plan — same budget discipline as the claude-code hook (Option C).
@@ -391,7 +441,8 @@ export function createHookHandlers(
         vault_matches: vaultResults.map((result) => result.relativePath),
         daemon_ok: recall.ok,
         task_signature: signature,
-        workspace: workspaceId,
+        recall_strong: Boolean(strong),
+        top_score: strong?.topScore,
         automatic_write: false,
       },
     });
@@ -532,7 +583,40 @@ export function createHookHandlers(
     };
   }
 
-  async function dispatch(event: string, payload: Record<string, unknown>): Promise<HookOutput> {
+  async function handlePreToolUse(
+    payload: Record<string, unknown>,
+  ): Promise<PreToolUseDecisionOutput> {
+    const mode = config.recallGuardMode ?? recallGuardMode();
+    if (mode === "off") return preToolUseAllow();
+
+    const toolName = asString(payload.tool_name);
+    if (!toolName) return preToolUseAllow();
+    const toolInput =
+      payload.tool_input && typeof payload.tool_input === "object"
+        ? (payload.tool_input as Record<string, unknown>)
+        : {};
+
+    const state = await readRecallState(config.vaultPath).catch(() => null);
+    const threshold = recallPointerThreshold();
+    const verdict = decideGuard({ state, mode, threshold, toolName, toolInput });
+    if (verdict === "allow") return preToolUseAllow();
+
+    await markRecallConsumed(config.vaultPath).catch(() => {});
+    await recordAudit(config.vaultPath, {
+      tool: `${config.auditPrefix}_pretooluse_guard`,
+      summary: `recall guard denied ${toolName} (mode=${mode})`,
+      details: {
+        tool: toolName,
+        mode,
+        top_score: state!.top_score,
+        hits: state!.top_hits.length,
+        task_signature: state!.task_signature,
+      },
+    }).catch(() => {});
+    return preToolUseDeny(state!);
+  }
+
+  async function dispatch(event: string, payload: Record<string, unknown>): Promise<HookOutput | PreToolUseDecisionOutput> {
     switch (event) {
       case "SessionStart":
         return handleSessionStart(payload);
@@ -542,12 +626,14 @@ export function createHookHandlers(
         return handlePreCompact(payload);
       case "Stop":
         return handleStop(payload);
+      case PRE_TOOL_USE_EVENT:
+        return handlePreToolUse(payload);
       default:
         return { continue: true };
     }
   }
 
-  return { handleSessionStart, handleUserPromptSubmit, handlePreCompact, handleStop, dispatch };
+  return { handleSessionStart, handleUserPromptSubmit, handlePreCompact, handleStop, handlePreToolUse, dispatch };
 }
 
 export async function runHookMain(config: AgentHookConfig): Promise<void> {
@@ -560,7 +646,7 @@ export async function runHookMain(config: AgentHookConfig): Promise<void> {
   const payload = (await readStdin()) as Record<string, unknown>;
   const eventFromPayload = asString(payload.hook_event_name);
   const event = (eventArg || eventFromPayload || "").trim();
-  if (!VALID_EVENTS.includes(event as EnvelopeEvent)) {
+  if (event !== PRE_TOOL_USE_EVENT && !VALID_EVENTS.includes(event as EnvelopeEvent)) {
     emit({ continue: true });
     return;
   }

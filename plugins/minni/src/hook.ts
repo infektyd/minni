@@ -392,10 +392,8 @@ async function handleUserPromptSubmit(payload: Record<string, unknown>): Promise
     }).catch(() => {});
   }
 
-  const planRef = activePlan !== undefined ? compactPlanPointer(activePlan) : undefined;
-
   // Nothing salient to inject this turn: no strong recall AND no active plan.
-  if (!strong && planRef === undefined) {
+  if (!strong && activePlan === undefined) {
     await recordAudit(CLAUDECODE_VAULT_PATH, {
       tool: "hook_user_prompt_submit",
       summary: prompt.slice(0, 120),
@@ -433,8 +431,8 @@ async function handleUserPromptSubmit(payload: Record<string, unknown>): Promise
   // turn; the full goal/open_questions/pending list is omitted (it barely changes
   // turn-to-turn) and pulled on demand via minni_plan_status. SessionStart still
   // injects the full plan view for boot/rehydration.
-  if (planRef !== undefined) {
-    envelopeBody.active_plan_ref = planRef;
+    if (activePlan !== undefined) {
+    envelopeBody.active_plan_ref = compactPlanPointer(activePlan);
   }
 
   const envelope = wrapEnvelope({

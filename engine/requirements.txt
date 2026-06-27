@@ -16,5 +16,8 @@ tiktoken>=0.13.0
 # File watcher
 watchdog>=6.0.0
 
+# Testing
+pytest
+
 # Optional: for better SQLite FTS tokenization
 # icu4c (system package)

@@ -5,7 +5,7 @@
   "type": "module",
   "main": "dist/server.js",
   "engines": {
-    "node": ">=20 <21"
+    "node": ">=20"
   },
   "scripts": {
     "build": "tsc && vite build",

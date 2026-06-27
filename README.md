@@ -200,6 +200,8 @@ cd ../plugins/minni && npm test
 bash scripts/repro-smoke.sh
 ```
 
+**Note:** `scripts/repro-smoke.sh` enforces strict environment hygiene checks. It requires an isolated environment and will fail if it detects existing state pollution (e.g., an existing `~/.minni` directory) to ensure reproducibility.
+
 ## Documentation
 
 | Topic | File |
