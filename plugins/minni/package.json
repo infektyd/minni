@@ -12,7 +12,11 @@
     "build:server": "tsc",
     "build:frontend": "vite build",
     "dev:frontend": "vite --host 127.0.0.1",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint .",
     "test": "npm run build && node --test --import ./tests/setup-env.mjs tests/*.test.mjs",
+    "test:server": "npm run build:server && node --test --import ./tests/setup-env.mjs tests/*.test.mjs",
+    "test:file": "npm run build:server && node --test --import ./tests/setup-env.mjs",
     "console": "npm run build && node dist/ui-server.js",
     "design:lint": "npx @google/design.md lint ../../DESIGN.md",
     "test:live:prepare": "npm run build && node tests/live-prepare-task.mjs",
@@ -27,11 +31,15 @@
     "zod": "^4.4.3"
   },
   "devDependencies": {
+    "@eslint/js": "^10.0.1",
     "@types/node": "^25.9.3",
     "@types/react": "^19.2.15",
     "@types/react-dom": "^19.2.3",
     "@vitejs/plugin-react": "^6.0.2",
+    "eslint": "^10.6.0",
+    "globals": "^17.7.0",
     "typescript": "^6.0.3",
+    "typescript-eslint": "^8.62.0",
     "vite": "^8.0.16"
   }
 }

@@ -19,7 +19,7 @@ names. Treat those as legacy references, not active roots.
 
 - `engine/` - Minni Python engine.
 - `openclaw-extension/` - OpenClaw extension bridge.
-- `plugins/minni/` - Codex plugin package.
+- `plugins/minni/` - `minni-multi-plugin` multi-host plugin package (Codex, Claude Code, Gemini, KiloCode surfaces sharing one MCP server and daemon).
 - `session-extracts/` - extracted handoff/session notes.
 
 ## Active Runtime
@@ -38,9 +38,7 @@ Codex's vault and do not bootstrap a new agent by copying another agent's
 ## Organized Supporting Material
 
 - `docs/plans/` - planning documents and prompt plans.
-- `docs/decisions/` - decision records.
 - `docs/research/` - related research notes.
-- `assets/hermes/` - Hermes/OpenClaw visual assets.
 - `logs/openclaw/` - preserved OpenClaw audit logs.
 - `archives/downloads/` - old downloaded bundles and one-off prototypes.
 - `_archive/` - previous repo/workspace archives.
@@ -68,13 +66,15 @@ symlinks where the owning app expects stable paths.
 ## Sync-Root Avoidance
 
 Minni's "local-first" guarantee assumes the vault and database are
-not under any third-party sync root. In Wave 2, the daemon will be updated to emit a startup warning if its
-vault path or DB path resolves under any of these prefixes:
+not under any third-party sync root. The daemon (`engine/minnid.py`,
+`_warn_if_sync_root`) emits a startup warning — non-fatal, best-effort —
+when any daemon-managed path resolves under one of these prefixes:
 
 - `~/Library/Mobile Documents/` (iCloud Drive)
 - `~/Dropbox`
 - `~/Google Drive`
 - `~/OneDrive`
 
-If such a warning fires (once implemented), move the affected path out of the sync root before relying
-on local-first claims. (This section documents the contract the daemon will enforce.)
+The check runs at startup for the socket, DB, and vault paths. If such a
+warning fires, move the affected path out of the sync root before relying
+on local-first claims. The daemon warns only; it does not refuse to start.

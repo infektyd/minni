@@ -172,8 +172,11 @@ Code-backed local-first boundaries:
 
 ## Setup
 
+Python 3.11 or 3.12 in a venv, Node >=20 (see `.nvmrc`):
+
 ```bash
 cd engine
+python3.12 -m venv .venv && source .venv/bin/activate
 python3 -m pip install -r requirements.txt
 python3 minnid.py --socket ~/.minni/run/minnid.sock
 ```
@@ -183,6 +186,8 @@ cd plugins/minni
 npm install
 npm test
 ```
+
+Node >=20 is required for the plugin (see `.nvmrc` and `plugins/minni/package.json` `engines.node`).
 
 ```bash
 cd engine

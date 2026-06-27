@@ -1,0 +1,34 @@
+# Ruff config for the Minni engine.
+#
+# Conservative gate: select E (pycodestyle errors), F (pyflakes), and I
+# (import sorting) only. This will NOT reformat the codebase and is not
+# meant to mass-fail on pre-existing style noise. Run with `ruff check .`
+# from the engine/ directory.
+#
+# Do not run `ruff check --fix .` across the engine as a sweep; fix only
+# the violations your own change introduces.
+
+target-version = "py311"
+line-length = 120
+
+[lint]
+# E = pycodestyle errors, F = pyflakes. I (isort) is intentionally NOT selected:
+# the engine predates ruff's import ordering and enabling it would mass-fail
+# across every module without a value-adding sweep. Add I back only as a
+# per-file opt-in when a module is already compliant.
+select = ["E", "F"]
+ignore = [
+  "E501",   # line length is not enforced as an error (warn-only would still gate)
+  "E402",   # module-level import-after-code is common in minnid.py entry block
+  "E731",   # lambda assignments are used in a few dispatch tables
+  "F401",   # unused imports surface across optional/guarded paths; not gated
+  "F841",   # local unused vars appear in exception handlers intentionally
+  "F541",   # f-strings without placeholders are harmless; not worth a gate failure
+  "E741",   # single-letter variable names are used in tight loops
+]
+
+[lint.per-file-ignores]
+# Daemon entry module mixes argparse/setup with imports and broad exception guards.
+"minnid.py" = ["E402", "E401", "E722", "F841", "F401"]
+# Test fixtures often import for side effects and use broad excepts.
+"tests/**/*.py" = ["F401", "F841", "E722"]
