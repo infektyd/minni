@@ -71,6 +71,10 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 # ── Logging ───────────────────────────────────────────────────────────────
+# Logging setup and the operational metrics counters are centralized in obs.py
+# (imported with the other engine-local modules once sys.path is bootstrapped
+# below) so every engine entry point shares one configured logger and the same
+# status-surfaced counters. See obs.py for the integration rationale.
 
 logger = logging.getLogger("minnid")
 
@@ -82,6 +86,7 @@ _ENGINE_DIR = Path(__file__).resolve().parent
 if str(_ENGINE_DIR) not in sys.path:
     sys.path.insert(0, str(_ENGINE_DIR))
 
+import obs                                                  # noqa: E402  # centralized logging + metrics counters
 from config import CANONICAL_SOVEREIGN_HOME, DEFAULT_CONFIG, SovereignConfig          # noqa: E402
 from db import SovereignDB                                  # noqa: E402
 from principal import (                                     # noqa: E402  # G11 EffectivePrincipal + G14 operator gate
@@ -2983,6 +2988,8 @@ def _handle_status(params: dict, request_id: Any) -> dict:
             "requests_served": _request_count,
             "socket_path": "[redacted]",
             "latencies": _latency_snapshot(),
+            "errors": obs.metrics_snapshot().get("errors", 0),
+            "counters": obs.metrics_snapshot(),
         },
         "engine": {
             "db_ok": db_ok,
@@ -4111,10 +4118,25 @@ async def _dispatch(request: dict) -> dict:
     if provenance.principal is not None:
         params.setdefault("_principal", provenance.principal)
 
-    if asyncio.iscoroutinefunction(handler):
-        result = await handler(params, request_id)
-    else:
-        result = await asyncio.to_thread(handler, params, request_id)
+    # Centralized error reporting on the daemon's main failure paths: count
+    # both raised handler exceptions and structured error responses per method,
+    # then surface the totals on the `status` RPC. Behavior is otherwise
+    # unchanged — raised exceptions are re-raised so the connection-level
+    # handler still owns the response shape.
+    try:
+        if asyncio.iscoroutinefunction(handler):
+            result = await handler(params, request_id)
+        else:
+            result = await asyncio.to_thread(handler, params, request_id)
+    except Exception:
+        obs.incr("errors")
+        obs.incr(f"errors.{method_name}")
+        logger.exception("dispatch failed for method %s", method_name)
+        raise
+
+    if isinstance(result, dict) and "error" in result:
+        obs.incr("errors")
+        obs.incr(f"errors.{method_name}")
     return result
 
 
@@ -4366,12 +4388,10 @@ def main():
     )
     args = parser.parse_args()
 
-    # Logging
-    level = logging.DEBUG if args.verbose else logging.INFO
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s [minnid] %(levelname)s: %(message)s",
-    )
+    # Logging: route through the centralized obs setup so format/level honor
+    # MINNI_LOG_FORMAT (text|json) and MINNI_LOG_LEVEL, and so every engine
+    # entry point logs identically.
+    obs.configure_logging(verbose=args.verbose)
 
     _unix_socket_path = Path(args.socket)
 

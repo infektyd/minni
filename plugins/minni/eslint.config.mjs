@@ -7,14 +7,17 @@
 // surface without failing `npm run lint`; only hard errors gate.
 import eslint from "@eslint/js";
 import tseslint from "typescript-eslint";
+import reactHooks from "eslint-plugin-react-hooks";
 import globals from "globals";
 
 export default tseslint.config(
   {
     ignores: [
       "dist/**",
+      // frontend/** is the built Vite bundle (minified app.js etc.), a
+      // generated artifact — linting it is meaningless. The real frontend
+      // SOURCE under frontend-src/** IS linted (see the config block below).
       "frontend/**",
-      "frontend-src/**",
       "node_modules/**",
       "skills/**",
       "**/*.d.ts",
@@ -39,6 +42,29 @@ export default tseslint.config(
       ],
       "@typescript-eslint/no-empty-object-type": "off",
       "@typescript-eslint/no-wrapper-object-types": "off",
+    },
+  },
+  {
+    // Frontend React/TS source (compiled separately by Vite). Browser globals,
+    // and the same conservative warn-not-error posture as src/** so the gate
+    // surfaces issues without mass-failing on a pre-existing UI codebase.
+    files: ["frontend-src/**/*.{ts,tsx}"],
+    plugins: { "react-hooks": reactHooks },
+    languageOptions: {
+      ecmaVersion: 2022,
+      sourceType: "module",
+      globals: globals.browser,
+    },
+    rules: {
+      // Rules of Hooks is a real correctness gate; exhaustive-deps stays a warn
+      // (the source already opts out in one place with a disable directive).
+      "react-hooks/rules-of-hooks": "error",
+      "react-hooks/exhaustive-deps": "warn",
+      "@typescript-eslint/no-explicit-any": "warn",
+      "@typescript-eslint/no-unused-vars": [
+        "warn",
+        { argsIgnorePattern: "^_", varsIgnorePattern: "^_" },
+      ],
     },
   },
   {

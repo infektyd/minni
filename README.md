@@ -172,18 +172,26 @@ Code-backed local-first boundaries:
 
 ## Setup
 
-Python 3.11 or 3.12 in a venv, Node >=20 (see `.nvmrc`):
+Python 3.11 or 3.12 in a venv, Node >=20 (see `.nvmrc`). The supported
+interpreter is pinned in `.python-version` (`3.12` preferred, `3.11` fallback),
+mirroring how `.nvmrc` pins Node.
+
+> **Use 3.11 or 3.12.** Newer interpreters (e.g. the macOS system `python3.14`)
+> produce partial installs of the binary wheels in `engine/requirements.txt`
+> (`numpy`, `faiss-cpu`, `sentence-transformers`) and can crash at import with
+> libomp `OMP: Error #15`. If you only have `python3.11`, substitute it for
+> `python3.12` in the command below.
 
 ```bash
 cd engine
-python3.12 -m venv .venv && source .venv/bin/activate
+python3.12 -m venv .venv && source .venv/bin/activate   # or: python3.11 -m venv .venv
 python3 -m pip install -r requirements.txt
 python3 minnid.py --socket ~/.minni/run/minnid.sock
 ```
 
 ```bash
 cd plugins/minni
-npm install
+npm ci          # deterministic install from the committed package-lock.json
 npm test
 ```
 
@@ -202,10 +210,48 @@ Run the suites rather than trusting stale README counts:
 ```bash
 cd engine && PYTHONPATH=. pytest -q
 cd ../plugins/minni && npm test
-bash scripts/repro-smoke.sh
+cd ../.. && bash scripts/repro-smoke.sh   # smoke runs from the repo root: it calls engine/minnid.py relative to cwd
 ```
 
+Or run the whole loop from the repo root in one command with `make check`
+(see [Unified commands](#unified-commands) below).
+
 **Note:** `scripts/repro-smoke.sh` enforces strict environment hygiene checks. It requires an isolated environment and will fail if it detects existing state pollution (e.g., an existing `~/.minni` directory) to ensure reproducibility.
+
+### Unified commands
+
+A root `Makefile` wraps both surfaces so you do not have to remember the
+per-directory commands. Each target calls the same commands documented above.
+
+```bash
+make setup        # engine venv + deps, plugin npm ci
+make lint         # ruff (engine) + eslint (plugin)
+make typecheck    # tsc --noEmit (plugin)
+make build        # build the plugin (tsc + vite)
+make check        # fast gate: lint + typecheck + plugin build/test + scoped engine pytest
+make coverage     # plugin (node built-in) + engine (pytest-cov) coverage with floors
+make test         # full engine pytest + plugin test (heavy: loads embedding/FAISS models)
+make smoke        # hermetic engine repro smoke
+make daemon       # run the minnid daemon on the default socket
+make help         # list all targets
+```
+
+`make check` is the fast pre-push / CI gate. It runs both surfaces' static
+gates plus a scoped engine pytest (override the scope with
+`make check CHECK_PYTEST="-q"` to run the full Python suite, or use
+`make test-engine`). The engine venv is expected at `engine/.venv`; `ruff` is
+resolved from `PATH`.
+
+### Local hooks
+
+Enable the repo's git hooks (engine `ruff` + plugin `eslint`/`typecheck` on
+commit, `make check` on push) once per clone:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+See `.githooks/README.md` for details and the `MINNI_SKIP_HOOKS` escape hatch.
 
 ## Documentation
 

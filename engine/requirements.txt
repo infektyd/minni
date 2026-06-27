@@ -18,6 +18,9 @@ watchdog>=6.0.0
 
 # Testing
 pytest
+# Coverage visibility (see `make coverage` / engine/.coveragerc). Not wired into
+# default pytest addopts so ordinary `pytest` runs stay fast; opt-in via --cov.
+pytest-cov>=5.0.0
 
 # Linting (gate: `ruff check .` from engine/)
 ruff>=0.6.0

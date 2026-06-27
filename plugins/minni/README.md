@@ -261,13 +261,17 @@ The bridge defaults to the Codex vault resolved from `MINNI_VAULT_PATH` (or `MIN
 ## Development
 
 ```bash
-npm install
+npm ci                   # deterministic install from package-lock.json
 npm test                 # full pipeline: build + node --test suite
 npm run test:server      # server/hook tests only (build:server + node --test, no vite build)
 npm run test:file tests/hook-behavior.test.mjs   # single test file
 npm run typecheck        # tsc --noEmit
-npm run lint             # eslint on src/ and tests/
+npm run lint             # eslint . — lints src/, tests/, and frontend-src/ (built frontend/ is ignored)
+npm run coverage         # node --test coverage with line/branch/function floors
 npm run console
-npm run design:lint
+npm run design:lint      # validate ../../DESIGN.md via the pinned @google/design.md dev dependency
 npm run test:live:prepare
 ```
+
+> `npm install` is only needed when adding/updating dependencies. Use `npm ci`
+> for reproducible installs from the committed `package-lock.json`.

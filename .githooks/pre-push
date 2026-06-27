@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# Minni pre-push hook: run the full fast validation gate before publishing.
+#
+# `make check` = ruff (engine) + eslint/typecheck/build/test (plugin) + a scoped
+# engine pytest. This is the same gate CI should run. It is heavier than the
+# pre-commit lint gate (it builds and tests the plugin), which is why it runs on
+# push rather than every commit.
+#
+# Enable once per clone:  git config core.hooksPath .githooks
+# Escape hatch:  MINNI_SKIP_HOOKS=1 git push ...
+set -euo pipefail
+
+if [ "${MINNI_SKIP_HOOKS:-0}" = "1" ]; then
+  echo "[pre-push] MINNI_SKIP_HOOKS=1 — skipping make check." >&2
+  exit 0
+fi
+
+repo_root="$(git rev-parse --show-toplevel)"
+cd "$repo_root"
+
+if ! command -v make >/dev/null 2>&1; then
+  echo "[pre-push] make not found — cannot run validation gate; skipping." >&2
+  exit 0
+fi
+
+echo "[pre-push] running 'make check'…" >&2
+make check
+echo "[pre-push] OK" >&2
