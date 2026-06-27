@@ -655,7 +655,7 @@ server.registerTool(
       candidate_id,
       decision,
       reason: reason || "",
-      // agentId omitted → server stamps DEFAULT / local operator
+      agent_id: DEFAULT_AGENT_ID,
     });
     return textResult(JSON.stringify(rpc, null, 2));
   },

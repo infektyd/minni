@@ -307,7 +307,7 @@ func runFoundationModels(_ request: AFMRequest) async {
                 "data": ["answer": response.content.answer]
             ])
         case "prepare_task":
-            let session = LanguageModelSession(instructions: "Prepare a compact Codex task packet. Do not include secrets, raw private logs, local paths, adapter paths, or durable-write instructions.")
+            let session = LanguageModelSession(instructions: "Prepare a compact Codex task packet for Minni software work. Interpret wiring/config/providers as software integration, never physical or electrical wiring. Do not include secrets, raw private logs, local paths, adapter paths, or durable-write instructions.")
             let response = try await session.respond(
                 to: compactJSONString(request.input ?? [:]),
                 generating: PrepareTaskResult.self
@@ -324,7 +324,7 @@ func runFoundationModels(_ request: AFMRequest) async {
                 ]
             ])
         case "prepare_outcome":
-            let session = LanguageModelSession(instructions: "Prepare a review-only outcome draft. Do not create durable memory. Keep private material out of learn candidates.")
+            let session = LanguageModelSession(instructions: "Prepare a review-only outcome draft. Do not create durable memory. Keep private material out of learn candidates. Buckets must be mutually exclusive; uncertain or sensitive items belong in the most restrictive applicable bucket.")
             let response = try await session.respond(
                 to: compactJSONString(request.input ?? [:]),
                 generating: PrepareOutcomeDraftResult.self

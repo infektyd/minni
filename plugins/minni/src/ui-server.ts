@@ -5,7 +5,7 @@ import path from "node:path";
 import os from "node:os";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
-import { DEFAULT_VAULT_PATH, PLUGIN_ROOT } from "./config.js";
+import { DEFAULT_AGENT_ID, DEFAULT_VAULT_PATH, PLUGIN_ROOT } from "./config.js";
 import { buildStatusReport } from "./sovereign.js";
 import { prepareOutcome, prepareTask, type PrepareOutcomeInput, type PrepareTaskInput } from "./task.js";
 import { auditTail } from "./vault.js";
@@ -549,6 +549,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
             candidate_id: body.candidate_id,
             decision: body.decision,
             reason: body.reason || body.resolution_reason || "",
+            agent_id: DEFAULT_AGENT_ID,
           });
           sendJson(res, 200, redactLocalValue(rpc));
         } catch (e) {

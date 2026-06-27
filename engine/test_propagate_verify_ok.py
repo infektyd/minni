@@ -20,6 +20,47 @@ if SCRIPTS_DIR not in sys.path:
 import propagate  # noqa: E402
 
 
+def test_native_afm_env_is_emitted_when_repo_helper_exists(tmp_path):
+    repo = tmp_path / "Minni"
+    helper = repo / "engine" / "native_afm_helper"
+    helper.parent.mkdir(parents=True)
+    helper.write_text("#!/bin/sh\n", encoding="utf-8")
+
+    env = propagate.native_afm_env(repo)
+
+    assert env == {
+        "MINNI_AFM_PROVIDER_MODE": "native",
+        "MINNI_AFM_NATIVE_HELPER": str(helper),
+    }
+
+
+def test_mcp_json_preserves_existing_afm_env_over_repo_default(tmp_path):
+    server = tmp_path / "install" / "dist" / "server.js"
+    server.parent.mkdir(parents=True)
+    server.write_text("", encoding="utf-8")
+
+    manifest = propagate.mcp_json(
+        server,
+        "codex",
+        tmp_path / "codex-vault",
+        tmp_path / "minnid.sock",
+        tmp_path / "workspace",
+        pre_existing_env={
+            "MINNI_AFM_PROVIDER_MODE": "off",
+            "MINNI_AFM_NATIVE_HELPER": "/custom/helper",
+        },
+        afm_env={
+            "MINNI_AFM_PROVIDER_MODE": "native",
+            "MINNI_AFM_NATIVE_HELPER": "/repo/helper",
+        },
+    )
+
+    env = manifest["mcpServers"]["minni"]["env"]
+    assert env["MINNI_AGENT_ID"] == "codex"
+    assert env["MINNI_AFM_PROVIDER_MODE"] == "off"
+    assert env["MINNI_AFM_NATIVE_HELPER"] == "/custom/helper"
+
+
 def _good_checks():
     return {
         "agent_api_returncode": 0,
