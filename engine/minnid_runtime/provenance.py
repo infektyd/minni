@@ -1,20 +1,23 @@
 import logging
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+import principal as principal_mod
 from principal import (
     EffectivePrincipal,
     IdentityMismatchError,
     make_capability_denied_error,
     make_mismatch_error,
-    resolve_effective_principal,
 )
 
 from .rpc import make_error
 
 
 logger = logging.getLogger("minnid")
+resolve_effective_principal = principal_mod.resolve_effective_principal
+_DEFAULT_RESOLVE_EFFECTIVE_PRINCIPAL = resolve_effective_principal
 
 RECOVERY_ALLOWED_METHODS = ("ping", "status", "health_report", "hygiene_report")
 
@@ -46,6 +49,16 @@ RPC_CAPABILITY_REQUIREMENTS: Dict[str, str] = {
     "daemon.compile": "read",
     "daemon.endorse": "govern",
 }
+
+
+def _resolve_effective_principal(**kwargs):
+    minnid_mod = sys.modules.get("minnid")
+    minnid_resolver = getattr(minnid_mod, "resolve_effective_principal", None)
+    if minnid_resolver is not None and minnid_resolver is not _DEFAULT_RESOLVE_EFFECTIVE_PRINCIPAL:
+        return minnid_resolver(**kwargs)
+    if resolve_effective_principal is not _DEFAULT_RESOLVE_EFFECTIVE_PRINCIPAL:
+        return resolve_effective_principal(**kwargs)
+    return principal_mod.resolve_effective_principal(**kwargs)
 
 
 def enforce_method_capability(
@@ -149,7 +162,7 @@ def resolve_provenance(request: dict, *, transport: str = "uds") -> ProvenanceRe
         )
     supplied = provenance_claim(method_name, params)
     try:
-        principal = resolve_effective_principal(
+        principal = _resolve_effective_principal(
             supplied_agent_id=supplied,
             transport=transport,
         )
@@ -191,7 +204,7 @@ def handler_principal(
     supplied = params.get(claim_key) if isinstance(params, dict) else None
     try:
         return (
-            resolve_effective_principal(supplied_agent_id=supplied, transport="uds"),
+            _resolve_effective_principal(supplied_agent_id=supplied, transport="uds"),
             None,
         )
     except IdentityMismatchError as exc:
@@ -222,4 +235,3 @@ def guard_vault_root(
             request_id,
         )
     return None
-
