@@ -56,6 +56,7 @@ setup:
 	cd engine && if [ -x .venv/bin/python ] && .venv/bin/python -c "import sys; sys.exit(0 if sys.version_info >= (3, 14) else 1)"; then echo "engine/.venv already uses Python 3.14+"; else echo "recreating engine/.venv with $(PYTHON_FOR_VENV)"; rm -rf .venv && $(PYTHON_FOR_VENV) -m venv .venv; fi
 	cd engine && .venv/bin/python -m pip install --upgrade pip && .venv/bin/python -m pip install -r requirements.txt
 	cd $(PLUGIN_DIR) && npm ci
+	git config core.hooksPath .githooks
 
 # ── Lint / typecheck ──────────────────────────────────────────────────────
 .PHONY: lint lint-engine lint-plugin
