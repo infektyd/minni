@@ -193,7 +193,16 @@ class AfmProvider:
         if native.ok and afm_provider._native_completion_content(native.data) is not None:
             afm_provider.note_afm_generation_success(target, resolved)
         elif not native.ok:
-            afm_provider.note_afm_generation_failure(target)
+            # PR84-1: a RECOVERABLE green-op trip (context_overflow / guardrail)
+            # means the helper is alive and generation-capable — it just refused
+            # THIS input. Invalidating the generation-verified probe cache on
+            # such a trip falsely marks AFM "down" and forces a needless re-probe.
+            # Only a real helper/generation failure invalidates the probe.
+            error_kind = ""
+            if isinstance(native.data, dict):
+                error_kind = str(native.data.get("error_kind") or "").strip().lower()
+            if error_kind not in {"context_overflow", "guardrail"}:
+                afm_provider.note_afm_generation_failure(target)
         return ProviderResult(
             ok=native.ok,
             data=native.data,
