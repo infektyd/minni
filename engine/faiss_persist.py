@@ -9,7 +9,7 @@ The manifest captures:
   - embedding_quantization: FAISS-side quantization mode ("fp32" or "int8")
   - chunk_id_order: ordered list of chunk_ids (position → chunk_id)
   - chunk_count: total vectors
-  - db_checksum: hash of live DB state (count, max rowid, max updated_at)
+  - db_checksum: hash of live DB state (count, max chunk_id, max updated_at)
   - saved_at: ISO8601 timestamp
 
 On cold start the loader checks:
@@ -50,12 +50,12 @@ def compute_db_checksum(conn: sqlite3.Connection) -> str:
     """
     Compute a lightweight fingerprint of the chunk_embeddings table.
 
-    Hash of: (row count, max rowid, max computed_at).
+    Hash of: (row count, max chunk_id, max computed_at).
     If the table is empty or missing, returns 'empty'.
     """
     try:
         row = conn.execute(
-            "SELECT COUNT(*) as cnt, MAX(rowid) as maxrow, MAX(computed_at) as maxts "
+            "SELECT COUNT(*) as cnt, MAX(chunk_id) as maxrow, MAX(computed_at) as maxts "
             "FROM chunk_embeddings"
         ).fetchone()
         if row is None or row[0] == 0:

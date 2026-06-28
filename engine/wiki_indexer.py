@@ -577,9 +577,11 @@ class WikiIndexer:
         try:
             if insert_data:
                 cursor.executemany(
-                    """INSERT OR REPLACE INTO memory_links
+                    """INSERT INTO memory_links
                        (source_doc_id, target_doc_id, link_type, weight, created_at)
-                       VALUES (?, ?, ?, ?, ?)""",
+                       VALUES (?, ?, ?, ?, ?)
+                       ON CONFLICT(source_doc_id, target_doc_id, link_type)
+                       DO UPDATE SET weight=excluded.weight""",
                     insert_data,
                 )
                 link_count += len(insert_data)
@@ -588,9 +590,11 @@ class WikiIndexer:
             for data in insert_data:
                 try:
                     cursor.execute(
-                        """INSERT OR REPLACE INTO memory_links
+                        """INSERT INTO memory_links
                            (source_doc_id, target_doc_id, link_type, weight, created_at)
-                           VALUES (?, ?, ?, ?, ?)""",
+                           VALUES (?, ?, ?, ?, ?)
+                           ON CONFLICT(source_doc_id, target_doc_id, link_type)
+                           DO UPDATE SET weight=excluded.weight""",
                         data,
                     )
                     link_count += 1

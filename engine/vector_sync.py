@@ -5,7 +5,7 @@ PR-3: Keeps each registered VectorBackend in sync with the chunk_embeddings
 table in SQLite.
 
 Sync strategy:
-  - Incremental: reads chunk_embeddings rows WHERE rowid > last_synced_chunk_rowid.
+  - Incremental: reads chunk_embeddings rows WHERE chunk_id > last_synced_chunk_rowid.
   - Batched: processes up to batch_size rows per pass.
   - Per-backend independent: a slow backend does not block others.
   - Idempotent: safe to call multiple times; re-syncing the same rows is a no-op
@@ -95,7 +95,7 @@ def mark_dirty(backend_name: str, db) -> None:
     Mark a backend as dirty so the idle hook will re-sync it.
 
     Call this whenever chunk_embeddings rows are deleted (the incremental
-    rowid approach only catches INSERTs, not DELETEs).
+    chunk_id cursor only catches INSERTs, not DELETEs).
     """
     with db.cursor() as c:
         c.execute(
@@ -145,10 +145,12 @@ def sync_backend(
 
     with db.cursor() as c:
         c.execute(
-            "SELECT rowid AS chunk_rowid, chunk_id, doc_id, embedding "
+            # chunk_id is INTEGER PRIMARY KEY, a strict rowid alias in SQLite.
+            # Use the named key so the sync cursor stays portable.
+            "SELECT chunk_id AS chunk_rowid, chunk_id, doc_id, embedding "
             "FROM chunk_embeddings "
-            "WHERE rowid > ? "
-            "ORDER BY rowid "
+            "WHERE chunk_id > ? "
+            "ORDER BY chunk_id "
             "LIMIT ?",
             (start_rowid, batch_size),
         )

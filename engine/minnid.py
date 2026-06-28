@@ -3173,7 +3173,10 @@ def _handle_health_report(params: dict, request_id: Any) -> dict:
             ]
 
             try:
-                c.execute("SELECT COALESCE(MAX(rowid), 0) AS max_rowid, COUNT(*) AS n FROM chunk_embeddings")
+                c.execute(
+                    "SELECT COALESCE(MAX(chunk_id), 0) AS max_rowid, "
+                    "COUNT(*) AS n FROM chunk_embeddings"
+                )
                 chunk_state = c.fetchone()
                 max_rowid = int(chunk_state["max_rowid"] or 0)
                 c.execute(
