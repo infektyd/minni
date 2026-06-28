@@ -99,7 +99,9 @@ from principal import (                                     # noqa: E402  # G11 
     resolve_effective_principal,
     validate_agent_id,
 )
+from minnid_runtime.dispatch import DispatchContext, dispatch_request  # noqa: E402
 from minnid_runtime.rpc import make_error as _make_error, make_response as _make_response  # noqa: E402
+from minnid_runtime.transport import SOCKET_BODY_LIMIT as _SOCKET_BODY_LIMIT, parse_request as _parse_request  # noqa: E402
 
 RECOVERY_ALLOWED_METHODS = ("ping", "status", "health_report", "hygiene_report")
 
@@ -4150,63 +4152,21 @@ _running = False
 _server: Optional[asyncio.AbstractServer] = None
 
 
-def _parse_request(data: bytes) -> Optional[dict]:
-    """Parse a JSON-RPC request from raw bytes."""
-    try:
-        text = data.decode("utf-8").strip()
-        if not text:
-            return None
-        return json.loads(text)
-    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-        logger.warning("Invalid request: %s", exc)
-        return None
-
-
 async def _dispatch(request: dict) -> dict:
     """Route a JSON-RPC request to the correct handler."""
-    method_name = request.get("method", "")
-    request_id = request.get("id")
-    params = request.get("params", {}) or {}
-
-    handler = _METHODS.get(method_name)
-    if handler is None:
-        return _make_error(-32601, f"Method not found: {method_name}",
-                           request_id)
-
-    # Handlers index params with .get(); a positional-array params (JSON-RPC
-    # allows `"params": [...]`) would crash them with AttributeError, and
-    # recovery-allowed methods (ping/status/...) reach the handler even before
-    # identity resolves. Reject non-dict params loudly here so no handler — gated
-    # or recovery-allowed — ever sees a list.
-    if not isinstance(params, dict):
-        return _make_error(-32602, "Invalid params: expected a JSON object",
-                           request_id)
-
-    provenance = resolve_provenance(request)
-    if provenance.recovery is not None and method_name not in RECOVERY_ALLOWED_METHODS:
-        return _make_response(provenance.recovery, request_id)
-    if provenance.principal is not None:
-        params.setdefault("_principal", provenance.principal)
-
-    cap_err = _enforce_method_capability(method_name, provenance.principal, request_id)
-    if cap_err is not None:
-        return cap_err
-
-    try:
-        if asyncio.iscoroutinefunction(handler):
-            result = await handler(params, request_id)
-        else:
-            result = await asyncio.to_thread(handler, params, request_id)
-    except Exception:
-        obs.incr("errors")
-        obs.incr(f"errors.{method_name}")
-        logger.exception("dispatch failed for method %s", method_name)
-        raise
-
-    if isinstance(result, dict) and "error" in result:
-        obs.incr("errors")
-        obs.incr(f"errors.{method_name}")
-    return result
+    return await dispatch_request(
+        request,
+        DispatchContext(
+            methods=_METHODS,
+            recovery_allowed_methods=RECOVERY_ALLOWED_METHODS,
+            resolve_provenance=resolve_provenance,
+            enforce_method_capability=_enforce_method_capability,
+            make_error=_make_error,
+            make_response=_make_response,
+            obs=obs,
+            logger=logger,
+        ),
+    )
 
 
 # Sync facade for legacy direct callers in the test suite (post RCM-006/007 async _dispatch refactor).
@@ -4216,11 +4176,6 @@ async def _dispatch(request: dict) -> dict:
 def _dispatch_sync(request: dict) -> dict:
     """Thin sync wrapper: runs the (now async) _dispatch via asyncio.run for test compatibility."""
     return asyncio.run(_dispatch(request))
-
-
-# SEC-015: cap a single JSON-RPC request body at 1 MiB to bound peak memory
-# and protect the embedder from caller-controlled mega-payloads.
-_SOCKET_BODY_LIMIT = 1_048_576  # 1 MiB
 
 
 async def _handle_client(reader: asyncio.StreamReader,
