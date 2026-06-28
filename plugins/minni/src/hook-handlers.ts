@@ -61,23 +61,6 @@ import {
 } from "./sovereign.js";
 import { extractScarTissue, filterSafeVaultResults, prepareOutcome } from "./task.js";
 import {
-  decideGuard,
-  preToolUseAllow,
-  preToolUseDeny,
-  PRE_TOOL_USE_EVENT,
-  recallGuardMode,
-  type PreToolUseDecisionOutput,
-} from "./recall-guard.js";
-import {
-  buildRecallPointer,
-  clearRecallState,
-  extractStrongRecall,
-  markRecallConsumed,
-  readRecallState,
-  recallPointerThreshold,
-  writeRecallState,
-} from "./recall-state.js";
-import {
   auditTail,
   collectCorrectionsReassert,
   ensureVault,
@@ -678,8 +661,6 @@ export function createHookHandlers(
         return handlePreCompact(payload);
       case "Stop":
         return handleStop(payload);
-      case PRE_TOOL_USE_EVENT:
-        return handlePreToolUse(payload);
       default:
         return { continue: true };
     }

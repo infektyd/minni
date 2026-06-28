@@ -114,8 +114,8 @@ system/developer instructions, safety policy, and active user request.
      Codex's vault, stop and create a clean vault for that agent instead.
    - Assume any agent, regardless of model quality or sophistication, may copy
      another agent's vault when under-specified. Always stamp
-     `SOVEREIGN_AGENT_ID`, `SOVEREIGN_VAULT_PATH`, and
-     `MINNI_SOCKET_PATH` explicitly for that platform.
+     `MINNI_AGENT_ID`, `MINNI_VAULT_PATH`, and `MINNI_SOCKET_PATH` explicitly
+     for that platform.
    - Resolve symlinks before deciding what is canonical; symlinked vault roots
      are configuration drift unless the user explicitly approves them.
    - Confirm daemon socket: `~/.minni/run/minnid.sock`.
@@ -178,13 +178,13 @@ Known platform update commands (run from your Minni checkout; the script ships
 with this skill at `plugins/minni/skills/minni-install/scripts/propagate.py`):
 
 ```bash
-python3 plugins/minni/skills/minni-install/scripts/propagate.py update-plugin --platform codex
-python3 plugins/minni/skills/minni-install/scripts/propagate.py update-plugin --platform claude-code
-python3 plugins/minni/skills/minni-install/scripts/propagate.py update-plugin --platform kilocode
-python3 plugins/minni/skills/minni-install/scripts/propagate.py update-plugin --platform gemini
-python3 plugins/minni/skills/minni-install/scripts/propagate.py update-plugin --platform antigravity
-python3 plugins/minni/skills/minni-install/scripts/propagate.py update-plugin --platform grok
-python3 plugins/minni/skills/minni-install/scripts/propagate.py update-plugin --platform all
+engine/.venv/bin/python plugins/minni/skills/minni-install/scripts/propagate.py update-plugin --platform codex
+engine/.venv/bin/python plugins/minni/skills/minni-install/scripts/propagate.py update-plugin --platform claude-code
+engine/.venv/bin/python plugins/minni/skills/minni-install/scripts/propagate.py update-plugin --platform kilocode
+engine/.venv/bin/python plugins/minni/skills/minni-install/scripts/propagate.py update-plugin --platform gemini
+engine/.venv/bin/python plugins/minni/skills/minni-install/scripts/propagate.py update-plugin --platform antigravity
+engine/.venv/bin/python plugins/minni/skills/minni-install/scripts/propagate.py update-plugin --platform grok
+engine/.venv/bin/python plugins/minni/skills/minni-install/scripts/propagate.py update-plugin --platform all
 ```
 
 ### Rebranding / reinstalling a Claude Code plugin identity

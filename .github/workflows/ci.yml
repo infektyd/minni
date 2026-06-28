@@ -26,7 +26,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
-          python-version: '3.11'
+          python-version: '3.14'
 
       - name: Set up Node
         uses: actions/setup-node@v6
@@ -38,10 +38,10 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends ripgrep
 
-      - name: Install Python deps
+      - name: Install project deps
         run: |
-          python -m pip install --upgrade pip
-          pip install -r engine/requirements.txt pytest pyyaml
+          make setup
+          engine/.venv/bin/python -m pip install pyyaml
 
       - name: Public boundary guard
         run: |
@@ -50,12 +50,11 @@ jobs:
 
       - name: Engine tests
         run: |
-          PYTHONPATH=engine python -m pytest engine/ -q --tb=short
+          PYTHONPATH=engine engine/.venv/bin/python -m pytest engine/ -q --tb=short
 
       - name: Plugin tests
         working-directory: plugins/minni
         run: |
-          npm ci
           npm test
           npm audit --audit-level=moderate
 

@@ -1,0 +1,15 @@
+{
+  "ignoredPaths": [
+    ".antigravitycli",
+    ".DS_Store",
+    ".worktrees",
+    "_archive",
+    "_cleanup-quarantine",
+    "_private",
+    "bench/tests/.DS_Store",
+    "bench/results",
+    "engine/.venv",
+    "plugins/minni/dist",
+    "plugins/minni/node_modules"
+  ]
+}

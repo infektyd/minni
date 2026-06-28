@@ -172,33 +172,101 @@ Code-backed local-first boundaries:
 
 ## Setup
 
-```bash
-cd engine
-python3 -m pip install -r requirements.txt
-python3 minnid.py --socket ~/.minni/run/minnid.sock
-```
+Python 3.14 in a venv, Node >=20 (see `.nvmrc`). The supported interpreter is
+declared in `.python-version`, and the root `Makefile` builds the engine venv
+with the system `python3`.
+
+The normal fresh-clone path is:
 
 ```bash
-cd plugins/minni
-npm install
-npm test
+make setup
+make daemon
 ```
 
+In another shell, verify the daemon:
+
 ```bash
-cd engine
-python3 minnid_client.py --socket ~/.minni/run/minnid.sock status
-python3 minnid_client.py --socket ~/.minni/run/minnid.sock search "memory handoff"
+engine/.venv/bin/python engine/minnid_client.py --socket ~/.minni/run/minnid.sock status
+engine/.venv/bin/python engine/minnid_client.py --socket ~/.minni/run/minnid.sock search "memory handoff"
 ```
+
+Node >=20 is required for the plugin (see `.nvmrc` and `plugins/minni/package.json` `engines.node`).
 
 ## Development Checks
 
 Run the suites rather than trusting stale README counts:
 
 ```bash
-cd engine && PYTHONPATH=. pytest -q
+cd engine && PYTHONPATH=. .venv/bin/python -m pytest -q
 cd ../plugins/minni && npm test
-bash scripts/repro-smoke.sh
+cd ../.. && bash scripts/repro-smoke.sh   # smoke runs from the repo root: it calls engine/minnid.py relative to cwd
 ```
+
+Or run the whole loop from the repo root in one command with `make check`
+(see [Unified commands](#unified-commands) below).
+
+**Note:** `scripts/repro-smoke.sh` uses a temporary `MINNI_HOME` and the engine
+venv. It tolerates a pre-existing `~/.minni` directory, but fails if the smoke
+run creates or modifies files there.
+
+### Unified commands
+
+A root `Makefile` wraps both surfaces so you do not have to remember the
+per-directory commands. Each target calls the same commands documented above.
+
+```bash
+make setup        # engine venv + deps, plugin npm ci
+make lint         # ruff (engine) + eslint (plugin)
+make typecheck    # tsc --noEmit (plugin)
+make build        # build the plugin (tsc + vite)
+make check        # fast gate: lint + typecheck + plugin build/test + scoped engine pytest
+make coverage     # plugin (node built-in) + engine (pytest-cov) coverage with floors
+make test         # full engine pytest + plugin test (heavy: loads embedding/FAISS models)
+make smoke        # hermetic engine repro smoke
+make daemon       # run the minnid daemon on the default socket
+make help         # list all targets
+```
+
+For branch-level agent compatibility scans, use the committed scanner config so
+local scratch/worktree state does not pollute the result:
+
+```bash
+npx -y agent-compatibility@latest --config ./agent-compatibility.config.json --json .
+```
+
+`make check` is the fast pre-push / CI gate. It runs both surfaces' static
+gates plus a NumPy health probe and scoped engine pytest (override the scope
+with `make check CHECK_PYTEST="-q"` to run the full Python suite, or use
+`make test-engine`). The engine venv is expected at `engine/.venv`; `ruff` runs
+from that venv.
+
+### Daemon lifecycle
+
+For foreground development, run `make daemon` from the repo root. A healthy
+startup logs the configured socket path (`~/.minni/run/minnid.sock` by default)
+and keeps running until interrupted. Check readiness with:
+
+```bash
+engine/.venv/bin/python engine/minnid_client.py --socket ~/.minni/run/minnid.sock status
+```
+
+If clients report `Socket not found`, start or restart the daemon with
+`make daemon`, then rerun the status command. If a daemon crashed and left a
+stale socket, `engine/minnid.py` removes that socket during startup before it
+binds the new one. For launchd-managed installs, use
+`launchctl kickstart -k gui/$UID/com.minni.minnid` to restart and
+`launchctl bootout gui/$UID/com.minni.minnid` to stop.
+
+### Local hooks
+
+Enable the repo's git hooks (engine `ruff` + plugin `eslint`/`typecheck` on
+commit, `make check` on push) once per clone:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+See `.githooks/README.md` for details and the `MINNI_SKIP_HOOKS` escape hatch.
 
 ## Documentation
 

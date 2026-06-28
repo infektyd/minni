@@ -135,7 +135,7 @@ When a recalled snippet has `agent_origin` other than `kilocode` (e.g., Claude C
 | `MINNI_KILOCODE_AGENT_ID` | `kilocode` | Agent identity string |
 | `MINNI_KILOCODE_WORKSPACE_ID` | `workspace-<dir>` | Workspace identifier |
 | `MINNI_KILOCODE_HOOKS` | `on` | Set to `off` to disable hooks |
-| `MINNI_SOCKET_PATH` | `~/.minni/run/sovrd.sock` | Minni daemon socket |
+| `MINNI_SOCKET_PATH` | `~/.minni/run/minnid.sock` | Minni daemon socket |
 | `MINNI_AFM_HEALTH_URL` | `http://127.0.0.1:11437/health` | AFM bridge health URL |
 
 ## Red Flags

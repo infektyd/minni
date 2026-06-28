@@ -26,8 +26,8 @@
 | `native` | Calls the configured JSON helper and reports unavailable on failure. |
 | `auto` | Tries native first, then falls back to bridge. |
 
-`SOVEREIGN_AFM_PROVIDER_MODE` is the preferred environment variable.
-`SOVEREIGN_AFM_MODE` remains a compatibility fallback.
+`MINNI_AFM_PROVIDER_MODE` is the preferred environment variable.
+`MINNI_AFM_MODE` remains the Python helper alias.
 
 ## Normalized Contracts
 
