@@ -19,7 +19,7 @@
 // ONLY when the recall itself is strong (top strength ≥ a configurable
 // threshold). Weak/absent hits inject nothing and write no state.
 import path from "node:path";
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 
 import type { RecallResponse } from "./sovereign.js";
 import type { VaultSearchResult } from "./vault.js";
@@ -246,7 +246,22 @@ export async function markRecallConsumed(vaultPath: string): Promise<boolean> {
     const parsed = JSON.parse(raw) as RecallState;
     if (!parsed || typeof parsed !== "object") return false;
     parsed.consumed = true;
-    await writeFile(filePath, JSON.stringify(parsed, null, 2), "utf8");
+    // NEW-03/PR90-3: atomic write. Parallel tool batches run as separate hook
+    // processes that each read-modify-write this file; a direct writeFile can
+    // interleave and leave a reader seeing truncated/half-written JSON. Write a
+    // unique temp sibling, then rename into place (atomic on the same FS). All
+    // racers write consumed=true, so the final state converges regardless of
+    // which rename wins last.
+    const tmpPath = `${filePath}.tmp-${process.pid}-${Date.now()}-${Math.random()
+      .toString(36)
+      .slice(2)}`;
+    await writeFile(tmpPath, JSON.stringify(parsed, null, 2), "utf8");
+    try {
+      await rename(tmpPath, filePath);
+    } catch (renameErr) {
+      await rm(tmpPath, { force: true }).catch(() => {});
+      throw renameErr;
+    }
     return true;
   } catch {
     return false;
