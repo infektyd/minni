@@ -40,21 +40,32 @@ def setup_hermetic_principals(tmp_path, monkeypatch):
 
     original_resolve = principal.resolve_effective_principal
 
-    def _patched_resolve(*, supplied_agent_id=None, transport="uds", principals_dir=None):
+    def _patched_resolve(*, supplied_agent_id=None, transport="uds", principals_dir=None, operator_context=False):
         target_dir = principals_dir or pdir
-        target_agent = str(supplied_agent_id or "main").strip() or "main"
-        f = target_dir / "local.json"
+        target_agent = str(supplied_agent_id or "").strip()
+        # The principal file must be named for the agent it grants, else resolve
+        # never matches it and the "*" grant silently degrades to caps [] (the
+        # bug that let pre-cap-gate resolve_contradiction pass on operator
+        # owner-check alone). {agent}.json for a named agent; local.json for the
+        # default. Mirrors test_pr6_contradictions' hermetic helper.
+        if target_agent:
+            fname, file_agent = f"{target_agent}.json", target_agent
+        else:
+            fname, file_agent = "local.json", "main"
+        f = target_dir / fname
         f.write_text(json.dumps({
-            "agent_id": target_agent,
+            "agent_id": file_agent,
             "workspace_id": "default",
             "capabilities": ["*"]
         }), encoding="utf-8")
         os.chmod(f, 0o600)
 
+        op_ctx = operator_context or (target_agent in principal.OPERATOR_RESERVED_AGENT_IDS)
         return original_resolve(
             supplied_agent_id=supplied_agent_id,
             transport=transport,
-            principals_dir=target_dir
+            principals_dir=target_dir,
+            operator_context=op_ctx,
         )
 
     monkeypatch.setattr(principal, "resolve_effective_principal", _patched_resolve)
