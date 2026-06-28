@@ -1,6 +1,6 @@
 import logging
-import sys
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -16,8 +16,18 @@ from .rpc import make_error
 
 
 logger = logging.getLogger("minnid")
+# Patch target for provenance-gate tests; default resolver comes from principal.py.
 resolve_effective_principal = principal_mod.resolve_effective_principal
-_DEFAULT_RESOLVE_EFFECTIVE_PRINCIPAL = resolve_effective_principal
+
+
+@dataclass(frozen=True)
+class ProvenanceContext:
+    """DI surface for provenance resolution (mirrors other minnid_runtime *Context types)."""
+
+    resolve_effective_principal: Callable[..., EffectivePrincipal] = field(
+        default_factory=lambda: resolve_effective_principal
+    )
+
 
 RECOVERY_ALLOWED_METHODS = ("ping", "status", "health_report", "hygiene_report")
 
@@ -49,16 +59,6 @@ RPC_CAPABILITY_REQUIREMENTS: Dict[str, str] = {
     "daemon.compile": "read",
     "daemon.endorse": "govern",
 }
-
-
-def _resolve_effective_principal(**kwargs):
-    minnid_mod = sys.modules.get("minnid")
-    minnid_resolver = getattr(minnid_mod, "resolve_effective_principal", None)
-    if minnid_resolver is not None and minnid_resolver is not _DEFAULT_RESOLVE_EFFECTIVE_PRINCIPAL:
-        return minnid_resolver(**kwargs)
-    if resolve_effective_principal is not _DEFAULT_RESOLVE_EFFECTIVE_PRINCIPAL:
-        return resolve_effective_principal(**kwargs)
-    return principal_mod.resolve_effective_principal(**kwargs)
 
 
 def enforce_method_capability(
@@ -147,8 +147,14 @@ def provenance_claim(method_name: str, params: dict) -> Optional[str]:
     return claim or None
 
 
-def resolve_provenance(request: dict, *, transport: str = "uds") -> ProvenanceResolution:
+def resolve_provenance(
+    request: dict,
+    *,
+    transport: str = "uds",
+    context: ProvenanceContext | None = None,
+) -> ProvenanceResolution:
     """Resolve the caller at the daemon gate before any handler runs."""
+    ctx = context or ProvenanceContext()
     method_name = str(request.get("method", ""))
     params = request.get("params", {}) or {}
     if not isinstance(params, dict):
@@ -162,7 +168,7 @@ def resolve_provenance(request: dict, *, transport: str = "uds") -> ProvenanceRe
         )
     supplied = provenance_claim(method_name, params)
     try:
-        principal = _resolve_effective_principal(
+        principal = ctx.resolve_effective_principal(
             supplied_agent_id=supplied,
             transport=transport,
         )
@@ -196,15 +202,17 @@ def handler_principal(
     request_id: Any,
     *,
     claim_key: str = "agent_id",
+    context: ProvenanceContext | None = None,
 ) -> tuple[Optional[EffectivePrincipal], Optional[dict]]:
     """Return the dispatch-stamped principal, resolving only for direct calls."""
+    ctx = context or ProvenanceContext()
     stamped = params.get("_principal") if isinstance(params, dict) else None
     if isinstance(stamped, EffectivePrincipal):
         return stamped, None
     supplied = params.get(claim_key) if isinstance(params, dict) else None
     try:
         return (
-            _resolve_effective_principal(supplied_agent_id=supplied, transport="uds"),
+            ctx.resolve_effective_principal(supplied_agent_id=supplied, transport="uds"),
             None,
         )
     except IdentityMismatchError as exc:

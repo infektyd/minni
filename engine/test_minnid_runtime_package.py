@@ -105,13 +105,14 @@ def test_provenance_core_lives_in_runtime_package_and_remains_compat_exports():
     from minnid_runtime.provenance import (
         RECOVERY_ALLOWED_METHODS,
         RPC_CAPABILITY_REQUIREMENTS,
+        ProvenanceContext,
         ProvenanceResolution,
         enforce_method_capability,
         guard_vault_root,
         handler_principal,
         provenance_claim,
         recover,
-        resolve_provenance,
+        resolve_provenance as runtime_resolve_provenance,
     )
 
     assert minnid.RECOVERY_ALLOWED_METHODS is RECOVERY_ALLOWED_METHODS
@@ -119,8 +120,9 @@ def test_provenance_core_lives_in_runtime_package_and_remains_compat_exports():
     assert minnid.ProvenanceResolution is ProvenanceResolution
     assert minnid.recover is recover
     assert minnid._provenance_claim is provenance_claim
-    assert minnid.resolve_provenance is resolve_provenance
-    assert minnid._handler_principal is handler_principal
+    assert minnid._runtime_resolve_provenance is runtime_resolve_provenance
+    assert minnid._runtime_handler_principal is handler_principal
+    assert minnid.ProvenanceContext is ProvenanceContext
     assert minnid._guard_vault_root is guard_vault_root
     assert minnid._enforce_method_capability is enforce_method_capability
 

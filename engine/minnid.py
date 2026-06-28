@@ -85,12 +85,12 @@ from config import CANONICAL_SOVEREIGN_HOME, DEFAULT_CONFIG, SovereignConfig    
 from db import SovereignDB                                  # noqa: E402
 from principal import (                                     # noqa: E402  # G11 EffectivePrincipal + G14 operator gate
     EffectivePrincipal,
-    IdentityMismatchError,
     agent_scope_for,
     make_mismatch_error,
-    resolve_effective_principal,
+    resolve_effective_principal,  # re-export: ProvenanceContext test seam + handler calls
     validate_agent_id,
 )
+_ORIGINAL_RESOLVE_EFFECTIVE_PRINCIPAL = resolve_effective_principal
 from minnid_runtime.afm import (  # noqa: E402
     AFMContext,
     afm_loop_enabled as _runtime_afm_loop_enabled,
@@ -166,13 +166,14 @@ from minnid_runtime.health import (  # noqa: E402
 from minnid_runtime.provenance import (  # noqa: E402
     RECOVERY_ALLOWED_METHODS,
     RPC_CAPABILITY_REQUIREMENTS as _RPC_CAPABILITY_REQUIREMENTS,
+    ProvenanceContext,
     ProvenanceResolution,
     enforce_method_capability as _enforce_method_capability,
     guard_vault_root as _guard_vault_root,
-    handler_principal as _handler_principal,
+    handler_principal as _runtime_handler_principal,
     provenance_claim as _provenance_claim,
     recover,
-    resolve_provenance,
+    resolve_provenance as _runtime_resolve_provenance,
 )
 from minnid_runtime.recall import (  # noqa: E402
     RecallContext,
@@ -211,6 +212,34 @@ _retrieval = None
 _vault_retrieval_cache = {}
 _episodic = None
 _writeback = None
+
+
+def _provenance_context() -> ProvenanceContext:
+    from minnid_runtime import provenance as _provenance_mod
+
+    default = _ORIGINAL_RESOLVE_EFFECTIVE_PRINCIPAL
+    minnid_resolver = resolve_effective_principal
+    provenance_resolver = _provenance_mod.resolve_effective_principal
+    if minnid_resolver is not default:
+        resolver = minnid_resolver
+    elif provenance_resolver is not default:
+        resolver = provenance_resolver
+    else:
+        resolver = default
+    return ProvenanceContext(resolve_effective_principal=resolver)
+
+
+def resolve_provenance(request: dict, **kwargs) -> ProvenanceResolution:
+    return _runtime_resolve_provenance(request, context=_provenance_context(), **kwargs)
+
+
+def _handler_principal(params, request_id, **kwargs):
+    return _runtime_handler_principal(
+        params,
+        request_id,
+        context=_provenance_context(),
+        **kwargs,
+    )
 
 
 def _reload_runtime_config(signum=None, frame=None) -> None:

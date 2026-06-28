@@ -100,6 +100,7 @@ def test_dispatch_routes_unresolved_identity_to_recovery_before_handler(monkeypa
         raise AssertionError("handler ran before provenance recovery")
 
     monkeypatch.setattr(provenance, "resolve_effective_principal", _boom_resolve)
+    monkeypatch.setattr(minnid, "resolve_effective_principal", _boom_resolve)
     monkeypatch.setitem(minnid._METHODS, "gate_test", _handler_should_not_run)
 
     response = minnid._dispatch_sync(
