@@ -75,6 +75,11 @@ def _safe_status_error(error: Optional[str]) -> Optional[str]:
     )
     text = re.sub(r"\bsk-[A-Za-z0-9_-]{8,}\b", "[redacted-key]", text)
     text = re.sub(r"/(?:Users|Volumes|private|var|tmp|Library)/[^\s\"')]+", "[local-path]", text)
+    # Windows drive-letter paths (C:\Users\..., D:/data/...) — the POSIX pattern
+    # above only matches forward-slash unix paths, so Windows paths leaked raw.
+    # \b avoids eating multi-letter URL schemes (http:// etc., where the letter
+    # before ':' is not a word boundary).
+    text = re.sub(r"\b[A-Za-z]:[\\/][^\s\"')]+", "[local-path]", text)
     text = re.sub(r"[^\s\"')]+\.fmadapter\b", "[adapter]", text)
     text = re.sub(r"[^\s\"')]+\.(?:db|sqlite|sqlite3|faiss|index|plist)\b", "[local-artifact]", text)
     return text[:240]
