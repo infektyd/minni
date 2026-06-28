@@ -7,6 +7,14 @@ import test from "node:test";
 
 import { createUiServer } from "../dist/ui-server.js";
 
+const CONSOLE_AUTH = {
+  Authorization: `Bearer ${process.env.MINNI_CONSOLE_TOKEN}`,
+};
+
+function authHeaders(extra = {}) {
+  return { ...CONSOLE_AUTH, ...extra };
+}
+
 async function freePort() {
   const server = createNetServer();
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -135,13 +143,13 @@ test("UI server exposes local status, prepare, outcome, audit, and static assets
     assert.equal(health.ok, true);
     assert.equal(health.host, "127.0.0.1");
 
-    const status = await fetch(`${server.baseUrl}/api/status`).then((response) => response.json());
+    const status = await fetch(`${server.baseUrl}/api/status`, { headers: authHeaders() }).then((response) => response.json());
     assert.equal(status.vault.exists, true);
     assert.equal(status.afm.data.adapter, "[local-path]");
 
     const prepare = await fetch(`${server.baseUrl}/api/prepare-task`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: authHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify({ task: "wire the complete frontend", profile: "compact", useAfm: false }),
     }).then((response) => response.json());
     assert.equal(prepare.task, "wire the complete frontend");
@@ -152,7 +160,7 @@ test("UI server exposes local status, prepare, outcome, audit, and static assets
 
     const outcome = await fetch(`${server.baseUrl}/api/prepare-outcome`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: authHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify({
         task: "wire the complete frontend",
         summary: "Added a real local bridge.",
@@ -162,23 +170,23 @@ test("UI server exposes local status, prepare, outcome, audit, and static assets
     }).then((response) => response.json());
     assert.match(outcome.outcomeDraft.learnCandidates[0], /real local bridge/);
 
-    const audit = await fetch(`${server.baseUrl}/api/audit-tail?limit=5`).then((response) => response.json());
+    const audit = await fetch(`${server.baseUrl}/api/audit-tail?limit=5`, { headers: authHeaders() }).then((response) => response.json());
     assert.equal(audit.entries.length, 1);
 
-    const deepPaths = await fetch(`${server.baseUrl}/api/deep-research/paths`).then((response) => response.json());
+    const deepPaths = await fetch(`${server.baseUrl}/api/deep-research/paths`, { headers: authHeaders() }).then((response) => response.json());
     assert.equal(deepPaths.root, "[local-path]");
 
-    const deepRuns = await fetch(`${server.baseUrl}/api/deep-research/runs`).then((response) => response.json());
+    const deepRuns = await fetch(`${server.baseUrl}/api/deep-research/runs`, { headers: authHeaders() }).then((response) => response.json());
     assert.equal(deepRuns[0].run_id, "20260429T000000Z-abc12345");
 
     const deepPlan = await fetch(`${server.baseUrl}/api/deep-research/plan`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: authHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify({ prompt: "research the console", mode: "web", enabledTools: ["google_search"] }),
     }).then((response) => response.json());
     assert.equal(deepPlan.id, "v1_plan");
 
-    const indexHtml = await fetch(`${server.baseUrl}/`).then((response) => response.text());
+    const indexHtml = await fetch(`${server.baseUrl}/`, { headers: authHeaders() }).then((response) => response.text());
     assert.match(indexHtml, /Sovereign Memory Console/);
 
     assert.deepEqual(server.calls.map(([name]) => name), ["prepareTask", "prepareOutcome", "deepPlan"]);
@@ -231,7 +239,7 @@ test("UI server rejects cross-origin and non-JSON POST requests before side effe
 
     const formPost = await fetch(`${server.baseUrl}/api/prepare-task`, {
       method: "POST",
-      headers: { "Content-Type": "text/plain" },
+      headers: authHeaders({ "Content-Type": "text/plain" }),
       body: JSON.stringify({ task: "simple post drive-by" }),
     });
     assert.equal(formPost.status, 415);
@@ -246,7 +254,7 @@ test("UI server ignores client-controlled vault and AFM targets", async () => {
   try {
     await fetch(`${server.baseUrl}/api/prepare-task`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: authHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify({
         task: "do not trust client paths",
         vaultPath: "/tmp/evil-vault",
@@ -274,7 +282,7 @@ test("UI server validates audit limit and redacts audit-tail local paths", async
     },
   });
   try {
-    const audit = await fetch(`${server.baseUrl}/api/audit-tail?limit=bad`).then((response) => response.json());
+    const audit = await fetch(`${server.baseUrl}/api/audit-tail?limit=bad`, { headers: authHeaders() }).then((response) => response.json());
     assert.deepEqual(seenLimits, [20]);
     assert.deepEqual(audit.entries, ["adapter [local-path]"]);
     assert.equal(audit.text, "adapter [local-path]");
@@ -287,7 +295,7 @@ test("UI server serves HEAD static requests without a body", async () => {
   const server = await startTestServer();
   try {
     const response = await new Promise((resolve, reject) => {
-      const req = request(server.baseUrl + "/", { method: "HEAD" }, (res) => {
+      const req = request(server.baseUrl + "/", { method: "HEAD", headers: authHeaders() }, (res) => {
         let body = "";
         res.setEncoding("utf8");
         res.on("data", (chunk) => {

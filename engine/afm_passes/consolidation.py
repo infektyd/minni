@@ -185,6 +185,14 @@ def _triage_advisory(candidates: List[Dict[str, Any]],
         chosen = candidates[0]
     if chosen is None:
         return None
+    promote_set = set(promote_candidate_ids)
+    if promote_candidate_ids and chosen.get("candidate_id") not in promote_set:
+        return None
+    privacy = str(chosen.get("privacy_level") or "safe").strip().lower()
+    if privacy not in {"safe", ""}:
+        return None
+    if int(chosen.get("instruction_like") or 0) == 1:
+        return None
     content = (chosen.get("content") or "").strip()
     if not content:
         return None

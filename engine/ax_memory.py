@@ -36,21 +36,25 @@ class AXMemory:
             return c.lastrowid
 
     def get_latest_snapshot(self, agent_id: str, app_name: Optional[str] = None) -> Optional[Dict]:
+        now = time.time()
+        self.cleanup_expired()
         with self.db.cursor() as c:
             if app_name:
                 c.execute("""
-                    SELECT snapshot_id, agent_id, app_name, tree_json, created_at
+                    SELECT snapshot_id, agent_id, app_name, tree_json, created_at, ttl_seconds
                     FROM ax_snapshots
                     WHERE agent_id = ? AND app_name = ?
+                      AND created_at + ttl_seconds >= ?
                     ORDER BY created_at DESC LIMIT 1
-                """, (agent_id, app_name))
+                """, (agent_id, app_name, now))
             else:
                 c.execute("""
-                    SELECT snapshot_id, agent_id, app_name, tree_json, created_at
+                    SELECT snapshot_id, agent_id, app_name, tree_json, created_at, ttl_seconds
                     FROM ax_snapshots
                     WHERE agent_id = ?
+                      AND created_at + ttl_seconds >= ?
                     ORDER BY created_at DESC LIMIT 1
-                """, (agent_id,))
+                """, (agent_id, now))
                 
             row = c.fetchone()
             if not row:

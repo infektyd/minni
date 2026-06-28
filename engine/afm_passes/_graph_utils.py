@@ -21,6 +21,7 @@ class VaultPage:
     page_type: str
     status: str
     tags: List[str] = field(default_factory=list)
+    privacy: str = "safe"
     sources: List[str] = field(default_factory=list)
     wikilinks: List[str] = field(default_factory=list)
     body: str = ""
@@ -68,7 +69,7 @@ def _parse_frontmatter(text: str) -> tuple[Dict[str, str], str]:
 
 
 def load_vault_pages(vault_path: str) -> List[VaultPage]:
-    vault = Path(vault_path).expanduser()
+    vault = Path(vault_path).expanduser().resolve()
     wiki = vault / "wiki"
     if not wiki.exists():
         return []
@@ -76,6 +77,9 @@ def load_vault_pages(vault_path: str) -> List[VaultPage]:
     pages: List[VaultPage] = []
     for path in sorted(wiki.glob("**/*.md")):
         try:
+            resolved = path.resolve()
+            if not resolved.is_relative_to(vault):
+                continue
             text = path.read_text(encoding="utf-8")
         except Exception:
             continue
@@ -92,6 +96,7 @@ def load_vault_pages(vault_path: str) -> List[VaultPage]:
                 title=frontmatter.get("title") or path.stem.replace("-", " ").title(),
                 page_type=(frontmatter.get("type") or "unknown").lower(),
                 status=(frontmatter.get("status") or "candidate").lower(),
+                privacy=(frontmatter.get("privacy") or "safe").lower(),
                 tags=[tag.lower() for tag in _parse_list(frontmatter.get("tags", ""))],
                 sources=_parse_list(frontmatter.get("sources", "")),
                 wikilinks=WIKILINK_RE.findall(body),
@@ -102,8 +107,34 @@ def load_vault_pages(vault_path: str) -> List[VaultPage]:
     return pages
 
 
-def accepted_pages(pages: Iterable[VaultPage]) -> List[VaultPage]:
-    return [page for page in pages if page.status == "accepted" and page.page_type != "synthesis"]
+def accepted_pages(
+    pages: Iterable[VaultPage],
+    *,
+    principal: Optional[object] = None,
+) -> List[VaultPage]:
+    out: List[VaultPage] = []
+    for page in pages:
+        if page.status != "accepted" or page.page_type == "synthesis":
+            continue
+        privacy = (page.privacy or "safe").lower()
+        if privacy in {"blocked", "private", "local-only"}:
+            continue
+        if principal is not None:
+            try:
+                from principal import can_read_document
+
+                meta = {
+                    "agent": f"wiki:{page.page_type}",
+                    "privacy_level": privacy,
+                    "page_type": page.page_type,
+                    "path": str(page.path),
+                }
+                if not can_read_document(principal, "default", meta):
+                    continue
+            except Exception:
+                continue
+        out.append(page)
+    return out
 
 
 def pages_by_tag(pages: Iterable[VaultPage]) -> Dict[str, List[VaultPage]]:

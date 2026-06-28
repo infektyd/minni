@@ -59,7 +59,24 @@ import {
   stashPrecompactReassert,
   subscribeContradictions,
 } from "./sovereign.js";
-import { extractScarTissue, prepareOutcome } from "./task.js";
+import { extractScarTissue, filterSafeVaultResults, prepareOutcome } from "./task.js";
+import {
+  decideGuard,
+  preToolUseAllow,
+  preToolUseDeny,
+  PRE_TOOL_USE_EVENT,
+  recallGuardMode,
+  type PreToolUseDecisionOutput,
+} from "./recall-guard.js";
+import {
+  buildRecallPointer,
+  clearRecallState,
+  extractStrongRecall,
+  markRecallConsumed,
+  readRecallState,
+  recallPointerThreshold,
+  writeRecallState,
+} from "./recall-state.js";
 import {
   auditTail,
   collectCorrectionsReassert,
@@ -147,6 +164,7 @@ export interface AgentHookDeps {
 export interface AgentHookHandlers {
   handleSessionStart(payload: Record<string, unknown>): Promise<HookOutput>;
   handleUserPromptSubmit(payload: Record<string, unknown>): Promise<HookOutput>;
+  handlePreToolUse(payload: Record<string, unknown>): Promise<PreToolUseDecisionOutput>;
   handlePreCompact(payload: Record<string, unknown>): Promise<HookOutput>;
   handleStop(payload: Record<string, unknown>): Promise<HookOutput>;
   handlePreToolUse(
@@ -377,7 +395,6 @@ export function createHookHandlers(
         workspaceId,
       }),
     ]);
-
     // s5 strength gate: emit the light pointer + recall-state file ONLY when the
     // top recall strength clears the threshold; otherwise inject nothing and
     // clear any stale state left by a previous strong turn.
@@ -406,8 +423,6 @@ export function createHookHandlers(
     try {
       activePlan = await resolveActivePlanView(config.vaultPath);
     } catch (error) {
-      // hooks-PL-5: surface plan-resolution failures instead of silently
-      // continuing without the active plan pointer.
       await recordAudit(config.vaultPath, {
         tool: `${config.auditPrefix}_active_plan_error`,
         summary: `UserPromptSubmit: ${error instanceof Error ? error.message : String(error)}`,
@@ -657,6 +672,8 @@ export function createHookHandlers(
         return handleSessionStart(payload);
       case "UserPromptSubmit":
         return handleUserPromptSubmit(payload);
+      case PRE_TOOL_USE_EVENT:
+        return handlePreToolUse(payload);
       case "PreCompact":
         return handlePreCompact(payload);
       case "Stop":
