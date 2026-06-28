@@ -32,6 +32,9 @@ def _make_db(tmp_path):
             "passes": {"session_distillation": {"interval_seconds": 3600}},
         },
     )
+    # PR91-2: session_distillation binds to a single agent (no global scan).
+    # Bind to the agent these tests seed events under (_seed_event uses "codex").
+    cfg.agent_id = "codex"
     old_flag = db_mod._migrations_run
     db_mod._migrations_run = False
     try:

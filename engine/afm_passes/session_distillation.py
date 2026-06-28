@@ -454,8 +454,14 @@ def run(db, config, vault_path: Optional[str] = None, dry_run: bool = True, trac
     lookback_hours = int(pass_cfg.get("lookback_hours", 24))
     trace_id = trace_id or f"afm-{int(time.time())}"
     prompt = _load_prompt()
+    # PR91-2: never query GLOBALLY when unbound — a None agent_id would pull
+    # EVERY agent's session events/docs into one agent's distillation. Fall back
+    # to the "unknown" sentinel (matches only unattributed rows) so an unbound
+    # run fails closed instead of leaking cross-agent context. The CLI
+    # consolidation entrypoint propagates --agent/MINNI_AGENT_ID so real runs are
+    # properly scoped.
     bound_agent = os.environ.get("MINNI_AGENT_ID") or getattr(config, "agent_id", None)
-    bound_agent = str(bound_agent).strip() if bound_agent else None
+    bound_agent = str(bound_agent).strip() if bound_agent and str(bound_agent).strip() else "unknown"
     events = _recent_events(db, lookback_hours, agent_id=bound_agent)
     raw_docs = _recent_raw_docs(db, lookback_hours, agent_id=bound_agent)
     pass_input = {
