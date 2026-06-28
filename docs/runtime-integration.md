@@ -80,6 +80,11 @@ The normalized native operation contracts are:
 Status reports expose provider mode, backend, availability, and a boolean
 adapter-configured flag. They do not emit private adapter paths.
 
+FoundationModels transcripts or asset metadata prove only the local native
+runtime path that produced them. They do not prove Private Cloud Compute/offload
+behavior. Treat PCC/offload claims as unverified unless Apple documentation or
+an explicit runtime telemetry/API signal is cited in the same finding.
+
 ## Team Runtime
 
 The Codex/Claude/Gemini/Kilo plugin exposes a coordinator-side Sovereign Team Runtime

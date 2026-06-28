@@ -8,20 +8,42 @@ import {
 import { compactPlanPointer, resolveActivePlanView } from "./plan.js";
 import {
   MEMORY_CONTRACT,
+  MINNI_LIFECYCLE_LINE,
+  buildLifecycleEmphasis,
   envelopeBudgetFor,
   hashTaskSignature,
+  lifecycleNudgeMode,
+  lifecycleSurfaceForIntent,
   wrapEnvelope,
 } from "./agent_envelope.js";
-import type { EnvelopeEvent } from "./agent_envelope.js";
+import type { EnvelopeEvent, LifecycleSurface } from "./agent_envelope.js";
 import {
   asString,
   emit,
   readStdin,
   VALID_EVENTS,
-  vaultRecallToBody,
 } from "./hook-utils.js";
 import type { HookOutput } from "./hook-utils.js";
 import { routeMemoryIntent } from "./policy.js";
+import {
+  buildRecallPointer,
+  clearRecallState,
+  extractStrongRecall,
+  markRecallConsumed,
+  readLifecycleState,
+  readRecallState,
+  recallPointerThreshold,
+  writeLifecycleState,
+  writeRecallState,
+} from "./recall-state.js";
+import {
+  PRE_TOOL_USE_EVENT,
+  decideGuard,
+  preToolUseAllow,
+  preToolUseDeny,
+  recallGuardMode,
+} from "./recall-guard.js";
+import type { PreToolUseDecisionOutput } from "./recall-guard.js";
 import {
   ackHandoff,
   BOOT_RECALL_LAYERS,
@@ -30,14 +52,13 @@ import {
   extractLearningsSection,
   truncateToTokenCharBudget,
   fetchStaleBeliefEvents,
-  formatRecallLean,
   listPendingHandoffs,
   readAgentContext,
   recallMemory,
   stashPrecompactReassert,
   subscribeContradictions,
 } from "./sovereign.js";
-import { extractScarTissue, prepareOutcome } from "./task.js";
+import { classifyIntent, extractScarTissue, prepareOutcome } from "./task.js";
 import {
   auditTail,
   collectCorrectionsReassert,
@@ -55,6 +76,12 @@ import {
 async function handleSessionStart(payload: Record<string, unknown>): Promise<HookOutput> {
   const sessionId = asString(payload.session_id) || asString(payload.sessionId) || "session";
   await ensureVault(CLAUDECODE_VAULT_PATH);
+  // c4: reset the once-per-session lifecycle emphasis on a fresh session, so the
+  // situational focus can fire again this session.
+  await writeLifecycleState(CLAUDECODE_VAULT_PATH, {
+    session_id: sessionId,
+    emphasized: [],
+  }).catch(() => {});
   const status = await buildStatusReport({ vaultPath: CLAUDECODE_VAULT_PATH });
   const tail = await auditTail(CLAUDECODE_VAULT_PATH, 5);
   // recall-F1: boot recall previously whitelisted layers=['identity'], which
@@ -161,6 +188,13 @@ async function handleSessionStart(payload: Record<string, unknown>): Promise<Hoo
     audit_tail: tail.entries.slice(-5).map((entry) => entry.split("\n")[0]),
   };
 
+  // c2/c5 (claude-code only): the standing 4-surface lifecycle line at boot so the
+  // agent sees the spine from session start (unless the feature is off).
+  // hook-handlers.ts is NOT touched.
+  if (lifecycleNudgeMode() !== "off") {
+    envelopeBody.lifecycle = MINNI_LIFECYCLE_LINE;
+  }
+
   if (correctionsReassert.length > 0) {
     envelopeBody.corrections_reassert = correctionsReassert;
   }
@@ -211,16 +245,112 @@ async function handleSessionStart(payload: Record<string, unknown>): Promise<Hoo
   };
 }
 
+/**
+ * c4/c5 (claude-code only): build the lifecycle representation fields for this
+ * turn. The PERSISTENT line (c3) is always present in "soft" mode so the 4
+ * surfaces stay in view; the situational `lifecycle_focus` (c4) is added when the
+ * prompt's ambition intent (task.ts `classifyIntent`) maps to a surface NOT yet
+ * emphasized this session. "off" mode (c5) returns {} — fully silent. The caller
+ * must persist any returned `emphasizedSurface` so the focus fires at most once
+ * per surface per session. Representation only — never a permission decision.
+ */
+function lifecycleFieldsFor(
+  prompt: string,
+  emphasized: Set<string>,
+): {
+  fields: { lifecycle?: string; lifecycle_focus?: string };
+  emphasizedSurface?: LifecycleSurface;
+} {
+  if (lifecycleNudgeMode() === "off") return { fields: {} };
+  const fields: { lifecycle?: string; lifecycle_focus?: string } = {
+    lifecycle: MINNI_LIFECYCLE_LINE,
+  };
+  const surface = lifecycleSurfaceForIntent(classifyIntent(prompt));
+  if (surface && !emphasized.has(surface)) {
+    fields.lifecycle_focus = buildLifecycleEmphasis(surface);
+    return { fields, emphasizedSurface: surface };
+  }
+  return { fields };
+}
+
+/**
+ * c3/c4: emit an envelope carrying the lifecycle representation only. Used at the
+ * two early-returns of handleUserPromptSubmit (write-intent and nothing-salient
+ * gates) so the surfaces survive turns that previously injected nothing. When the
+ * feature is off (c5) `fields` is empty and this degrades to the original no-op.
+ */
+function lifecycleOnlyOutput(
+  signature: string,
+  fields: { lifecycle?: string; lifecycle_focus?: string },
+): HookOutput {
+  if (fields.lifecycle === undefined && fields.lifecycle_focus === undefined) {
+    return { continue: true };
+  }
+  const envelope = wrapEnvelope({
+    event: "UserPromptSubmit",
+    agent: CLAUDECODE_AGENT_ID,
+    body: {
+      identity: {
+        agent: CLAUDECODE_AGENT_ID,
+        workspace: CLAUDECODE_WORKSPACE_ID,
+        task_signature: signature,
+      },
+      ...fields,
+    },
+  });
+  return {
+    continue: true,
+    hookSpecificOutput: {
+      hookEventName: "UserPromptSubmit",
+      additionalContext: envelope,
+    },
+  };
+}
+
 async function handleUserPromptSubmit(payload: Record<string, unknown>): Promise<HookOutput> {
   const prompt = asString(payload.prompt) || asString(payload.user_prompt);
   if (!prompt.trim()) {
     return { continue: true };
   }
-  const intent = routeMemoryIntent(prompt);
-  if (intent.action === "none" && !intent.automaticAllowed) {
-    return { continue: true };
-  }
   const signature = hashTaskSignature(prompt);
+
+  // c4/c5: compute the lifecycle representation once for this turn, BEFORE the
+  // early-return gates, so the persistent line survives them. Read the
+  // once-per-session emphasis set and persist any newly-emphasized surface.
+  const lifecycleStatePrev = await readLifecycleState(CLAUDECODE_VAULT_PATH);
+  const emphasizedSurfaces = new Set(lifecycleStatePrev?.emphasized ?? []);
+  const { fields: lifecycleFields, emphasizedSurface } = lifecycleFieldsFor(
+    prompt,
+    emphasizedSurfaces,
+  );
+  if (emphasizedSurface) {
+    emphasizedSurfaces.add(emphasizedSurface);
+    await writeLifecycleState(CLAUDECODE_VAULT_PATH, {
+      session_id: lifecycleStatePrev?.session_id ?? "session",
+      emphasized: [...emphasizedSurfaces],
+    }).catch(() => {});
+  }
+
+  const intent = routeMemoryIntent(prompt);
+  // Keep the existing suppression of auto-recall on explicit WRITE intents
+  // (learn/vault_write are the only intents with automaticAllowed:false): on
+  // those turns the user is dictating memory, not asking the agent to recall, so
+  // we inject no pointer and write no state. The historical guard
+  // `intent.action === "none" && !intent.automaticAllowed` was dead — "none"
+  // always carries automaticAllowed:true — and is replaced by the recall
+  // STRENGTH gate below (NOT keyword classification). Substantive 'none'-intent
+  // turns still run recall and get a pointer iff the hits are strong.
+  if (!intent.automaticAllowed) {
+    // Clear any stale strong state from a previous turn BEFORE returning: an
+    // unconsumed pointer must not leak into this write-intent turn and let the
+    // s6 guard deny an unrelated read/search here (parity with the weak-turn
+    // path below, which also clears).
+    await clearRecallState(CLAUDECODE_VAULT_PATH).catch(() => {});
+    // c3: persistent lifecycle visibility must survive this write-intent
+    // early-return — the agent still sees the 4 surfaces on learn/vault_write turns.
+    return lifecycleOnlyOutput(signature, lifecycleFields);
+  }
+  const threshold = recallPointerThreshold();
   const [vaultResults, recall] = await Promise.all([
     searchVaultNotes(CLAUDECODE_VAULT_PATH, prompt, 6),
     recallMemory({
@@ -231,8 +361,28 @@ async function handleUserPromptSubmit(payload: Record<string, unknown>): Promise
     }),
   ]);
 
-  if (vaultResults.length === 0 && (!recall.ok || !recall.data?.results)) {
-    return { continue: true };
+  // s5 strength gate: emit the light pointer + recall-state file ONLY when the
+  // top recall strength clears the threshold; otherwise inject nothing and clear
+  // any stale state from a previous strong turn.
+  const strong = extractStrongRecall(
+    recall.ok ? recall.data : undefined,
+    vaultResults,
+    threshold,
+  );
+  let recallStateFile: string | undefined;
+  if (strong) {
+    try {
+      recallStateFile = await writeRecallState(CLAUDECODE_VAULT_PATH, {
+        task_signature: signature,
+        intent: intent.action,
+        top_hits: strong.topHits,
+        top_score: strong.topScore,
+      });
+    } catch {
+      // best-effort: a state-write failure must not break the hook
+    }
+  } else {
+    await clearRecallState(CLAUDECODE_VAULT_PATH).catch(() => {});
   }
 
   let activePlan: any = undefined;
@@ -247,30 +397,50 @@ async function handleUserPromptSubmit(payload: Record<string, unknown>): Promise
     }).catch(() => {});
   }
 
+  const planRef = activePlan !== undefined ? compactPlanPointer(activePlan) : undefined;
+
+  // Nothing salient to inject this turn: no strong recall AND no active plan.
+  if (!strong && planRef === undefined) {
+    await recordAudit(CLAUDECODE_VAULT_PATH, {
+      tool: "hook_user_prompt_submit",
+      summary: prompt.slice(0, 120),
+      details: {
+        intent: intent.action,
+        vault_matches: vaultResults.map((result) => result.relativePath),
+        daemon_ok: recall.ok,
+        task_signature: signature,
+        recall_strong: false,
+      },
+    });
+    // c3: even with nothing salient (no strong recall, no active plan) the
+    // persistent lifecycle line still rides this turn's envelope.
+    return lifecycleOnlyOutput(signature, lifecycleFields);
+  }
+
   const envelopeBody: any = {
+    // c3/c4: persistent lifecycle line (+ situational focus) rides the salient turn too.
+    ...lifecycleFields,
     identity: {
       agent: CLAUDECODE_AGENT_ID,
       workspace: CLAUDECODE_WORKSPACE_ID,
       task_signature: signature,
     },
-    recall:
-      recall.ok && recall.data
-        ? formatRecallLean(prompt, recall.data, vaultResults)
-        : { ok: false, error: recall.error },
-    vault: vaultRecallToBody(vaultResults),
-    intent: {
-      action: intent.action,
-      confidence: intent.confidence,
-      suggested_tool: intent.suggestedTool,
-    },
   };
+  if (strong) {
+    // LIGHT POINTER, not the full pack: the full top hits live in the portable
+    // recall-state file (read by the s6 guard); the prompt only gets a signpost.
+    envelopeBody.recall_pointer = buildRecallPointer(strong);
+    envelopeBody.recall_state = recallStateFile;
+  }
 
   // Option C: inject a compact plan POINTER per turn, not the full plan. The
   // headline + next_action are the actionable one-liners the agent needs every
   // turn; the full goal/open_questions/pending list is omitted (it barely changes
   // turn-to-turn) and pulled on demand via minni_plan_status. SessionStart still
   // injects the full plan view for boot/rehydration.
-  if (activePlan !== undefined) {
+  if (planRef !== undefined) {
+    // Plan parity (audit C5): inline the compact-pointer call so all four hooks
+    // share the same wire shape (planRef !== undefined implies activePlan is set).
     envelopeBody.active_plan_ref = compactPlanPointer(activePlan);
   }
 
@@ -288,6 +458,8 @@ async function handleUserPromptSubmit(payload: Record<string, unknown>): Promise
       vault_matches: vaultResults.map((result) => result.relativePath),
       daemon_ok: recall.ok,
       task_signature: signature,
+      recall_strong: Boolean(strong),
+      top_score: strong?.topScore,
     },
   });
 
@@ -384,7 +556,48 @@ async function handleStop(payload: Record<string, unknown>): Promise<HookOutput>
   };
 }
 
-async function dispatch(event: string, payload: Record<string, unknown>): Promise<HookOutput> {
+// s6 PreToolUse recall guard (BACKSTOP). claude-code is NOT special: same logic
+// as the shared factory's handlePreToolUse, against the claude-code vault. The
+// output is the permissionDecision shape (deny-to-surface), NOT an envelope.
+async function handlePreToolUse(
+  payload: Record<string, unknown>,
+): Promise<PreToolUseDecisionOutput> {
+  const mode = recallGuardMode();
+  if (mode === "off") return preToolUseAllow();
+
+  const toolName = asString(payload.tool_name);
+  if (!toolName) return preToolUseAllow();
+  const toolInput =
+    payload.tool_input && typeof payload.tool_input === "object"
+      ? (payload.tool_input as Record<string, unknown>)
+      : {};
+
+  const state = await readRecallState(CLAUDECODE_VAULT_PATH).catch(() => null);
+  const threshold = recallPointerThreshold();
+  const verdict = decideGuard({ state, mode, threshold, toolName, toolInput });
+  if (verdict === "allow") return preToolUseAllow();
+
+  // DENY: flip consumed=true BEFORE returning so the re-issued call (and every
+  // other tool call this turn) ALWAYS passes. The guard fires at most once.
+  await markRecallConsumed(CLAUDECODE_VAULT_PATH).catch(() => {});
+  await recordAudit(CLAUDECODE_VAULT_PATH, {
+    tool: "hook_pretooluse_guard",
+    summary: `recall guard denied ${toolName} (mode=${mode})`,
+    details: {
+      tool: toolName,
+      mode,
+      top_score: state!.top_score,
+      hits: state!.top_hits.length,
+      task_signature: state!.task_signature,
+    },
+  }).catch(() => {});
+  return preToolUseDeny(state!);
+}
+
+async function dispatch(
+  event: string,
+  payload: Record<string, unknown>,
+): Promise<HookOutput | PreToolUseDecisionOutput> {
   switch (event) {
     case "SessionStart":
       return handleSessionStart(payload);
@@ -394,6 +607,8 @@ async function dispatch(event: string, payload: Record<string, unknown>): Promis
       return handlePreCompact(payload);
     case "Stop":
       return handleStop(payload);
+    case PRE_TOOL_USE_EVENT:
+      return handlePreToolUse(payload);
     default:
       return { continue: true };
   }
@@ -408,7 +623,9 @@ async function main(): Promise<void> {
   const payload = (await readStdin()) as Record<string, unknown>;
   const eventFromPayload = asString(payload.hook_event_name);
   const event = (eventArg || eventFromPayload || "").trim();
-  if (!VALID_EVENTS.includes(event as EnvelopeEvent)) {
+  // PreToolUse is dispatched here too but is NOT an EnvelopeEvent (its output is
+  // the permissionDecision shape), so it is gated alongside VALID_EVENTS.
+  if (event !== PRE_TOOL_USE_EVENT && !VALID_EVENTS.includes(event as EnvelopeEvent)) {
     emit({ continue: true });
     return;
   }

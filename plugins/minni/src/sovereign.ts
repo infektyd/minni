@@ -9,6 +9,7 @@ import { AFM_HEALTH_URL, AFM_PROVIDER_MODE, DEFAULT_AGENT_ID, DEFAULT_VAULT_PATH
 import {
   getAfmProviderHealth,
   resolveAfmProvider,
+  resolvedNativeHelperPath,
   sanitizeAfmHealth,
   type AfmProviderMode,
   type AfmProviderResolution,
@@ -649,7 +650,7 @@ export async function buildStatusReport(input?: {
   } catch {}
 
   const afmProvider = resolveAfmProvider(input?.afmProviderMode ?? AFM_PROVIDER_MODE, {
-    nativeHelperPath: process.env.MINNI_AFM_NATIVE_HELPER,
+    nativeHelperPath: resolvedNativeHelperPath(),
     health: rawAfm,
   });
   const generation =
@@ -662,9 +663,13 @@ export async function buildStatusReport(input?: {
       health: afmProvider.provider === "bridge" ? rawAfm : undefined,
       transport: input?.afmGenerationTransport,
       ttlMs: input?.afmGenerationTtlMs,
-      nativeHelperPath: process.env.MINNI_AFM_NATIVE_HELPER,
+      nativeHelperPath: resolvedNativeHelperPath(),
     }));
   const sanitizedAfm = sanitizeAfmHealth(rawAfm);
+  const generationError =
+    generation.generationVerified
+      ? undefined
+      : generation.detail ?? (afmProvider.provider === "bridge" ? sanitizedAfm.error : undefined);
   // afm_ok is redefined as generationVerified (field name kept for envelope compat):
   // a verified 1-token completion within the probe TTL, not mere /health reachability.
   const afm: JsonResult<Record<string, unknown>> = {
@@ -674,7 +679,7 @@ export async function buildStatusReport(input?: {
       reachable: generation.reachable,
       generationVerified: generation.generationVerified,
     },
-    error: sanitizedAfm.error ?? (generation.generationVerified ? undefined : generation.detail),
+    error: generationError,
   };
 
   return {

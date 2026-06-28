@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { callAfmJson, resolveAfmProvider } from "../dist/afm.js";
+import { callAfmJson, defaultNativeHelperPath, resolveAfmProvider, resolvedNativeHelperPath } from "../dist/afm.js";
 
 test("resolveAfmProvider keeps off mode local and unavailable", () => {
   const provider = resolveAfmProvider("off", { nativeHelperPath: undefined });
@@ -23,6 +23,18 @@ test("resolveAfmProvider reports native unavailable without helper", () => {
   assert.equal(provider.status, "native_unavailable");
   assert.equal(provider.available, false);
   assert.match(provider.reason ?? "", /helper/);
+});
+
+test("TS native helper default mirrors the repo engine helper when env is unset", () => {
+  const previous = process.env.MINNI_AFM_NATIVE_HELPER;
+  delete process.env.MINNI_AFM_NATIVE_HELPER;
+  try {
+    assert.match(defaultNativeHelperPath() ?? "", /engine\/native_afm_helper$/);
+    assert.equal(resolvedNativeHelperPath(), defaultNativeHelperPath());
+  } finally {
+    if (previous === undefined) delete process.env.MINNI_AFM_NATIVE_HELPER;
+    else process.env.MINNI_AFM_NATIVE_HELPER = previous;
+  }
 });
 
 test("resolveAfmProvider auto falls back to existing bridge without native helper", () => {
@@ -61,6 +73,26 @@ test("resolveAfmProvider does not trust helper presence without healthy native s
     assert.equal(provider.adapterConfigured, true);
     assert.doesNotMatch(JSON.stringify(provider), /\/Users\/alice/);
     assert.doesNotMatch(JSON.stringify(provider), /extractor\.fmadapter/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("resolveAfmProvider native ignores dead bridge health when a helper is available", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-afm-dead-bridge-"));
+  const helper = path.join(root, "helper.mjs");
+  await writeFile(helper, "#!/usr/bin/env node\n", "utf8");
+  await chmod(helper, 0o755);
+  try {
+    const provider = resolveAfmProvider("native", {
+      nativeHelperPath: helper,
+      health: { ok: false, error: "connect ECONNREFUSED 127.0.0.1:11437" },
+    });
+
+    assert.equal(provider.provider, "native");
+    assert.equal(provider.status, "native_available");
+    assert.equal(provider.available, true);
+    assert.doesNotMatch(JSON.stringify(provider), /11437/);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
