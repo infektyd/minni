@@ -3043,6 +3043,8 @@ def _handle_status(params: dict, request_id: Any) -> dict:
         }
 
     uptime = time.time() - _start_time
+    # PR92-3: snapshot once and reuse (it was called twice consecutively).
+    metrics = obs.metrics_snapshot()
     return _make_response({
         "daemon": {
             "version": VERSION,
@@ -3050,8 +3052,8 @@ def _handle_status(params: dict, request_id: Any) -> dict:
             "requests_served": _request_count,
             "socket_path": "[redacted]",
             "latencies": _latency_snapshot(),
-            "errors": obs.metrics_snapshot().get("errors", 0),
-            "counters": obs.metrics_snapshot(),
+            "errors": metrics.get("errors", 0),
+            "counters": metrics,
         },
         "engine": {
             "db_ok": db_ok,

@@ -306,7 +306,7 @@ def verify_afm_generation(
     mode: Optional[str] = None,
     *,
     url: Optional[str] = None,
-    timeout: float = _GENERATION_PROBE_TIMEOUT_SECONDS,
+    timeout: Optional[float] = None,
     ttl_seconds: float = _GENERATION_PROBE_TTL_SECONDS,
     client: Optional["BridgeClient"] = None,
     now: Callable[[], float] = time.time,
@@ -318,6 +318,11 @@ def verify_afm_generation(
     re-probed synchronously here (the probe is bounded by `timeout`); the TS
     mirror refreshes in the background because SessionStart latency matters there.
     """
+    if timeout is None:
+        # PR84-5: read the probe timeout at CALL time so a runtime/test override
+        # of MINNI_AFM_PROBE_TIMEOUT takes effect — it was previously bound once
+        # at import into the default argument.
+        timeout = _generation_probe_timeout_seconds()
     resolved = resolve_afm_mode(mode)
     if resolved == "off":
         return {

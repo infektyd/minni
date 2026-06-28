@@ -215,10 +215,17 @@ struct TriageRulesTool: Tool {
     }
     func call(arguments: Arguments) async throws -> String {
         let t = arguments.text.lowercased()
-        let secret = ["password", "api key", "secret", "token", "credential", "sk-", "private key", "hunter2"]
+        // PR84-6: single-word secret indicators match at a WORD BOUNDARY so
+        // "token" fires on "access token" but NOT on "tokenization". Multi-word /
+        // prefix patterns ("api key", "private key", "sk-") stay substring checks
+        // because they are already distinctive.
+        let secretWords = #"\b(password|secret|token|credential|hunter2)\b"#
+        let secretPhrases = ["api key", "private key", "sk-"]
+        let isSecret = t.range(of: secretWords, options: .regularExpression) != nil
+            || secretPhrases.contains(where: t.contains)
         let smalltalk = ["weather", "how are you", "good morning", "good night", "thanks", "lol", "haha", "nice day", "hello there"]
         let decision: String
-        if secret.contains(where: t.contains) { decision = "redact" }
+        if isSecret { decision = "redact" }
         else if smalltalk.contains(where: t.contains) { decision = "reject" }
         else { decision = "accept" }
         TriageState.shared.lastDecision = decision   // ground truth captured for the helper
