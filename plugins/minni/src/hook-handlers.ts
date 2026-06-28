@@ -27,6 +27,26 @@ import type { HookOutput } from "./hook-utils.js";
 import { compactPlanPointer, resolveActivePlanView } from "./plan.js";
 import { routeMemoryIntent } from "./policy.js";
 import {
+  buildRecallPointer,
+  clearRecallState,
+  extractStrongRecall,
+  markRecallConsumed,
+  readRecallState,
+  recallPointerThreshold,
+  writeRecallState,
+} from "./recall-state.js";
+import {
+  PRE_TOOL_USE_EVENT,
+  decideGuard,
+  preToolUseAllow,
+  preToolUseDeny,
+  recallGuardMode as resolveRecallGuardModeFromEnv,
+} from "./recall-guard.js";
+import type {
+  PreToolUseDecisionOutput,
+  RecallGuardMode,
+} from "./recall-guard.js";
+import {
   BOOT_RECALL_LAYERS,
   buildStatusReport,
   extractIdentityBody,
@@ -39,24 +59,7 @@ import {
   stashPrecompactReassert,
   subscribeContradictions,
 } from "./sovereign.js";
-import {
-  readRecallState,
-  markRecallConsumed,
-  recallPointerThreshold,
-  extractStrongRecall,
-  writeRecallState,
-  clearRecallState,
-  buildRecallPointer,
-} from "./recall-state.js";
-import { extractScarTissue, prepareOutcome } from "./task.js";
-import {
-  PRE_TOOL_USE_EVENT,
-  decideGuard,
-  preToolUseAllow,
-  preToolUseDeny,
-  recallGuardMode,
-} from "./recall-guard.js";
-import type { PreToolUseDecisionOutput } from "./recall-guard.js";
+import { extractScarTissue, filterSafeVaultResults, prepareOutcome } from "./task.js";
 import {
   auditTail,
   collectCorrectionsReassert,
@@ -128,7 +131,12 @@ export interface AgentHookConfig {
    * files (grok's and kilocode's behavior).
    */
   alwaysWriteStopInbox: boolean;
-  recallGuardMode?: "off" | "soft" | "strict";
+  /**
+   * s6 PreToolUse recall-guard mode override. When set, it wins over the
+   * MINNI_RECALL_GUARD_MODE env default ("off" | "soft" | "strict"). Omit to
+   * resolve from the environment (default "soft").
+   */
+  recallGuardMode?: RecallGuardMode;
 }
 
 /** Test seam: lets behavioral tests drive the zero-candidate Stop branch. */
@@ -139,10 +147,16 @@ export interface AgentHookDeps {
 export interface AgentHookHandlers {
   handleSessionStart(payload: Record<string, unknown>): Promise<HookOutput>;
   handleUserPromptSubmit(payload: Record<string, unknown>): Promise<HookOutput>;
+  handlePreToolUse(payload: Record<string, unknown>): Promise<PreToolUseDecisionOutput>;
   handlePreCompact(payload: Record<string, unknown>): Promise<HookOutput>;
   handleStop(payload: Record<string, unknown>): Promise<HookOutput>;
-  handlePreToolUse(payload: Record<string, unknown>): Promise<PreToolUseDecisionOutput>;
-  dispatch(event: string, payload: Record<string, unknown>): Promise<HookOutput | PreToolUseDecisionOutput>;
+  handlePreToolUse(
+    payload: Record<string, unknown>,
+  ): Promise<PreToolUseDecisionOutput>;
+  dispatch(
+    event: string,
+    payload: Record<string, unknown>,
+  ): Promise<HookOutput | PreToolUseDecisionOutput>;
 }
 
 export function createHookHandlers(
@@ -338,13 +352,22 @@ export function createHookHandlers(
       return { continue: true };
     }
 
+    const workspaceId = workspaceFor(payload);
+    const signature = hashTaskSignature(prompt);
+
     const intent = routeMemoryIntent(prompt);
+    // Explicit WRITE intents (learn/vault_write carry automaticAllowed:false) are
+    // the user dictating memory, not asking the agent to recall — inject no
+    // pointer and write no state. (s5 parity with the claude-code hook.)
     if (!intent.automaticAllowed) {
+      // Clear any stale strong state from a previous turn BEFORE returning: an
+      // unconsumed pointer must not leak into this write-intent turn and let the
+      // s6 guard deny an unrelated read/search here (parity with the weak-turn
+      // path below, which also clears).
+      await clearRecallState(config.vaultPath).catch(() => {});
       return { continue: true };
     }
 
-    const workspaceId = workspaceFor(payload);
-    const signature = hashTaskSignature(prompt);
     const threshold = recallPointerThreshold();
     const [vaultResults, recall] = await Promise.all([
       searchVaultNotes(config.vaultPath, prompt, 6),
@@ -355,7 +378,9 @@ export function createHookHandlers(
         workspaceId,
       }),
     ]);
-
+    // s5 strength gate: emit the light pointer + recall-state file ONLY when the
+    // top recall strength clears the threshold; otherwise inject nothing and
+    // clear any stale state left by a previous strong turn.
     const strong = extractStrongRecall(
       recall.ok ? recall.data : undefined,
       vaultResults,
@@ -370,7 +395,9 @@ export function createHookHandlers(
           top_hits: strong.topHits,
           top_score: strong.topScore,
         });
-      } catch {}
+      } catch {
+        // best-effort: a state-write failure must not break the hook
+      }
     } else {
       await clearRecallState(config.vaultPath).catch(() => {});
     }
@@ -379,15 +406,16 @@ export function createHookHandlers(
     try {
       activePlan = await resolveActivePlanView(config.vaultPath);
     } catch (error) {
-      // hooks-PL-5: surface plan-resolution failures instead of silently
-      // continuing without the active plan pointer.
       await recordAudit(config.vaultPath, {
         tool: `${config.auditPrefix}_active_plan_error`,
         summary: `UserPromptSubmit: ${error instanceof Error ? error.message : String(error)}`,
       }).catch(() => {});
     }
 
-    if (!strong && activePlan === undefined) {
+    const planRef = activePlan !== undefined ? compactPlanPointer(activePlan) : undefined;
+
+    // Nothing salient to inject this turn: no strong recall AND no active plan.
+    if (!strong && planRef === undefined) {
       await recordAudit(config.vaultPath, {
         tool: `${config.auditPrefix}_user_prompt_submit`,
         summary: prompt.slice(0, 120),
@@ -396,8 +424,8 @@ export function createHookHandlers(
           vault_matches: vaultResults.map((result) => result.relativePath),
           daemon_ok: recall.ok,
           task_signature: signature,
+          workspace: workspaceId,
           recall_strong: false,
-          automatic_write: false,
         },
       });
       return { continue: true };
@@ -410,19 +438,17 @@ export function createHookHandlers(
         task_signature: signature,
       },
     };
-
     if (strong) {
+      // LIGHT POINTER, not the full pack: the full top hits live in the portable
+      // recall-state file (read by the s6 guard); the prompt only gets a signpost.
       envelopeBody.recall_pointer = buildRecallPointer(strong);
       envelopeBody.recall_state = recallStateFile;
-    } else {
-      // Fallback formatRecall if it's required for test compatibility or legacy format? No, we skip it entirely now,
-      // but wait, does any test check for full recall?
-      // "explicit WRITE intents (learn/vault_write) are still suppressed: no pointer, no state"
-      // Wait, earlier the code injected formatRecall if it was not strong. Actually, no, if it's not strong, we early returned!
     }
 
     // Plan parity (audit C5): per-turn injection is a compact plan POINTER, not
     // the full plan — same budget discipline as the claude-code hook (Option C).
+    // (planRef !== undefined iff activePlan !== undefined; guard on activePlan so
+    // the compiler narrows it for compactPlanPointer.)
     if (activePlan !== undefined) {
       envelopeBody.active_plan_ref = compactPlanPointer(activePlan);
     }
@@ -441,13 +467,50 @@ export function createHookHandlers(
         vault_matches: vaultResults.map((result) => result.relativePath),
         daemon_ok: recall.ok,
         task_signature: signature,
+        workspace: workspaceId,
         recall_strong: Boolean(strong),
-        top_score: strong?.topScore,
-        automatic_write: false,
       },
     });
 
     return withHookContext("UserPromptSubmit", envelope);
+  }
+
+  // s6 PreToolUse recall guard (BACKSTOP). Same logic as the claude-code hook's
+  // handlePreToolUse, against this agent's vault. The output is the
+  // permissionDecision shape (deny-to-surface), NOT an envelope.
+  async function handlePreToolUse(
+    payload: Record<string, unknown>,
+  ): Promise<PreToolUseDecisionOutput> {
+    const mode = config.recallGuardMode ?? resolveRecallGuardModeFromEnv();
+    if (mode === "off") return preToolUseAllow();
+
+    const toolName = asString(payload.tool_name);
+    if (!toolName) return preToolUseAllow();
+    const toolInput =
+      payload.tool_input && typeof payload.tool_input === "object"
+        ? (payload.tool_input as Record<string, unknown>)
+        : {};
+
+    const state = await readRecallState(config.vaultPath).catch(() => null);
+    const threshold = recallPointerThreshold();
+    const verdict = decideGuard({ state, mode, threshold, toolName, toolInput });
+    if (verdict === "allow") return preToolUseAllow();
+
+    // DENY: flip consumed=true BEFORE returning so the re-issued call (and every
+    // other tool call this turn) ALWAYS passes. The guard fires at most once.
+    await markRecallConsumed(config.vaultPath).catch(() => {});
+    await recordAudit(config.vaultPath, {
+      tool: `${config.auditPrefix}_pretooluse_guard`,
+      summary: `recall guard denied ${toolName} (mode=${mode})`,
+      details: {
+        tool: toolName,
+        mode,
+        top_score: state!.top_score,
+        hits: state!.top_hits.length,
+        task_signature: state!.task_signature,
+      },
+    }).catch(() => {});
+    return preToolUseDeny(state!);
   }
 
   async function handlePreCompact(payload: Record<string, unknown>): Promise<HookOutput> {
@@ -583,57 +646,34 @@ export function createHookHandlers(
     };
   }
 
-  async function handlePreToolUse(
+  async function dispatch(
+    event: string,
     payload: Record<string, unknown>,
-  ): Promise<PreToolUseDecisionOutput> {
-    const mode = config.recallGuardMode ?? recallGuardMode();
-    if (mode === "off") return preToolUseAllow();
-
-    const toolName = asString(payload.tool_name);
-    if (!toolName) return preToolUseAllow();
-    const toolInput =
-      payload.tool_input && typeof payload.tool_input === "object"
-        ? (payload.tool_input as Record<string, unknown>)
-        : {};
-
-    const state = await readRecallState(config.vaultPath).catch(() => null);
-    const threshold = recallPointerThreshold();
-    const verdict = decideGuard({ state, mode, threshold, toolName, toolInput });
-    if (verdict === "allow") return preToolUseAllow();
-
-    await markRecallConsumed(config.vaultPath).catch(() => {});
-    await recordAudit(config.vaultPath, {
-      tool: `${config.auditPrefix}_pretooluse_guard`,
-      summary: `recall guard denied ${toolName} (mode=${mode})`,
-      details: {
-        tool: toolName,
-        mode,
-        top_score: state!.top_score,
-        hits: state!.top_hits.length,
-        task_signature: state!.task_signature,
-      },
-    }).catch(() => {});
-    return preToolUseDeny(state!);
-  }
-
-  async function dispatch(event: string, payload: Record<string, unknown>): Promise<HookOutput | PreToolUseDecisionOutput> {
+  ): Promise<HookOutput | PreToolUseDecisionOutput> {
     switch (event) {
       case "SessionStart":
         return handleSessionStart(payload);
       case "UserPromptSubmit":
         return handleUserPromptSubmit(payload);
+      case PRE_TOOL_USE_EVENT:
+        return handlePreToolUse(payload);
       case "PreCompact":
         return handlePreCompact(payload);
       case "Stop":
         return handleStop(payload);
-      case PRE_TOOL_USE_EVENT:
-        return handlePreToolUse(payload);
       default:
         return { continue: true };
     }
   }
 
-  return { handleSessionStart, handleUserPromptSubmit, handlePreCompact, handleStop, handlePreToolUse, dispatch };
+  return {
+    handleSessionStart,
+    handleUserPromptSubmit,
+    handlePreCompact,
+    handleStop,
+    handlePreToolUse,
+    dispatch,
+  };
 }
 
 export async function runHookMain(config: AgentHookConfig): Promise<void> {
@@ -646,6 +686,8 @@ export async function runHookMain(config: AgentHookConfig): Promise<void> {
   const payload = (await readStdin()) as Record<string, unknown>;
   const eventFromPayload = asString(payload.hook_event_name);
   const event = (eventArg || eventFromPayload || "").trim();
+  // PreToolUse is dispatched here too but is NOT an EnvelopeEvent (its output is
+  // the permissionDecision shape), so it is gated alongside VALID_EVENTS.
   if (event !== PRE_TOOL_USE_EVENT && !VALID_EVENTS.includes(event as EnvelopeEvent)) {
     emit({ continue: true });
     return;

@@ -320,7 +320,7 @@ def test_cross_vault_same_filename_archives_only_matching_copy(tmp_path, monkeyp
     _write_inbox_file(inbox_a, "same.json", _stop_doc(["codex lesson"]))
     _write_inbox_file(
         inbox_b, "same.json",
-        _stop_doc(["grok lesson, never ingested"], agent_id="grok"),
+        _stop_doc(["grok lesson, never ingested"], agent_id="grok-build"),
     )
     # Only vault A's copy is ingested.
     assert ingest(db_obj, cfg, inboxes=[inbox_a], dry_run=False)["inserted"] == 1
@@ -350,15 +350,15 @@ def test_cross_vault_live_sibling_does_not_block_other_vaults_copy(tmp_path, mon
     # Vault B: different content (different fingerprints), same filename.
     _write_inbox_file(
         inbox_b, "same.json",
-        _stop_doc(["grok lesson, fully resolved"], agent_id="grok"),
+        _stop_doc(["grok lesson, fully resolved"], agent_id="grok-build"),
     )
     # Separate ingest runs: idempotency within one run is name-keyed across
     # principals, which would skip vault B's same-named file.
     assert ingest(db_obj, cfg, inboxes=[inbox_a], dry_run=False)["inserted"] == 2
     assert ingest(db_obj, cfg, inboxes=[inbox_b], dry_run=False)["inserted"] == 1
     # Vault B's rows go terminal; vault A keeps BOTH rows live ('proposed').
-    _set_status(db_obj, "accepted", principal="grok")
-    (cid_b,) = _candidate_ids(db_obj, principal="grok")
+    _set_status(db_obj, "accepted", principal="grok-build")
+    (cid_b,) = _candidate_ids(db_obj, principal="grok-build")
 
     # Pin enumeration order: the LIVE-sibling vault is visited FIRST, so the
     # buggy `return None` would abort before vault B is ever checked.

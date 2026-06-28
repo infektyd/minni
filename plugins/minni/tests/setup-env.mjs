@@ -18,6 +18,13 @@ if (!process.env.MINNI_AFM_PROBE_CACHE) {
   );
 }
 
+if (!process.env.MINNI_CONSOLE_TOKEN) {
+  process.env.MINNI_CONSOLE_TOKEN = "test-console-token";
+}
+if (!process.env.MINNI_CONSOLE_DEEP_RESEARCH) {
+  process.env.MINNI_CONSOLE_DEEP_RESEARCH = "1";
+}
+
 if (!process.env.MINNI_SOCKET_PATH) {
   process.env.MINNI_SOCKET_PATH = path.join(
     mkdtempSync(path.join(tmpdir(), "minni-test-socket-")),

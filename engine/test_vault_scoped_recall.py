@@ -119,11 +119,12 @@ def _install_principal(
     agent_id: str = "codex",
     capabilities: list[str] | None = None,
 ) -> None:
+    import minnid
     import principal as principal_mod
 
     principals = tmp_path / "principals"
-    principals.mkdir()
-    f = principals / "main.json"
+    principals.mkdir(exist_ok=True)
+    f = principals / f"{agent_id}.json"
     f.write_text(
         json.dumps(
             {
@@ -136,6 +137,27 @@ def _install_principal(
     )
     os.chmod(f, 0o600)
     monkeypatch.setattr(principal_mod, "PRINCIPALS_DIR", principals)
+
+    original_resolve = principal_mod.resolve_effective_principal
+
+    def _resolve(
+        *,
+        supplied_agent_id=None,
+        transport="uds",
+        principals_dir=None,
+        operator_context=False,
+    ):
+        target = str(supplied_agent_id or agent_id).strip() or agent_id
+        op_ctx = operator_context or target in principal_mod.OPERATOR_RESERVED_AGENT_IDS
+        return original_resolve(
+            supplied_agent_id=supplied_agent_id or agent_id,
+            transport=transport,
+            principals_dir=principals_dir or principals,
+            operator_context=op_ctx,
+        )
+
+    monkeypatch.setattr(principal_mod, "resolve_effective_principal", _resolve)
+    monkeypatch.setattr(minnid, "resolve_effective_principal", _resolve)
 
 
 def _install_runtime(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, cfg, vaults: dict[str, Path]) -> None:
@@ -451,7 +473,7 @@ def test_combined_scope_gates_foreign_private_pages_for_non_operator(
     tmp_path, monkeypatch, scope
 ):
     _, cfg, codex_vault, claude_vault = _build_private_foreign_indexes(tmp_path, monkeypatch)
-    _install_principal(monkeypatch, tmp_path, "codex", capabilities=["search"])
+    _install_principal(monkeypatch, tmp_path, "codex", capabilities=["search", "read"])
     _install_runtime(
         monkeypatch,
         tmp_path,
@@ -480,7 +502,7 @@ def test_shared_fallback_gates_foreign_private_docs_for_non_operator(tmp_path, m
         agent="claude-code",
         privacy="private",
     )
-    _install_principal(monkeypatch, tmp_path, "codex", capabilities=["search"])
+    _install_principal(monkeypatch, tmp_path, "codex", capabilities=["search", "read"])
     _install_runtime(monkeypatch, tmp_path, cfg, {"codex": codex_vault})
 
     resp = _search(
@@ -499,7 +521,7 @@ def test_shared_fallback_gates_foreign_private_docs_for_non_operator(tmp_path, m
 
 def test_drill_reference_gates_foreign_private_page_for_non_operator(tmp_path, monkeypatch):
     _, cfg, codex_vault, claude_vault = _build_private_foreign_indexes(tmp_path, monkeypatch)
-    _install_principal(monkeypatch, tmp_path, "codex", capabilities=["search"])
+    _install_principal(monkeypatch, tmp_path, "codex", capabilities=["search", "read"])
     _install_runtime(
         monkeypatch,
         tmp_path,
@@ -540,7 +562,7 @@ def test_drill_numeric_ids_gate_foreign_private_shared_docs(tmp_path, monkeypatc
         agent="claude-code",
         privacy="private",
     )
-    _install_principal(monkeypatch, tmp_path, "codex", capabilities=["search"])
+    _install_principal(monkeypatch, tmp_path, "codex", capabilities=["search", "read"])
     _install_runtime(monkeypatch, tmp_path, cfg, {"codex": codex_vault})
 
     drilled = _drill({"chunk_ids": [shared_chunk, private_chunk], "depth": "chunk"})

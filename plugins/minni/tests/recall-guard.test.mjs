@@ -18,7 +18,12 @@ import path from "node:path";
 import test from "node:test";
 
 import { createHookHandlers } from "../dist/hook-handlers.js";
-import { RECALL_STATE_RELPATH } from "../dist/recall-state.js";
+import {
+  LIFECYCLE_STATE_RELPATH,
+  RECALL_STATE_RELPATH,
+  readLifecycleState,
+  readRecallState,
+} from "../dist/recall-state.js";
 import {
   decideGuard,
   isReadSearchBashCommand,
@@ -176,6 +181,23 @@ test("allow-when-no-state: no recall-state file => allow", async () => {
   });
 });
 
+test("state readers ignore absent or malformed files but surface filesystem errors", async () => {
+  await withFixture(async ({ vault }) => {
+    await mkdir(path.join(vault, ".runtime"), { recursive: true });
+    assert.equal(await readRecallState(vault), null);
+    assert.equal(await readLifecycleState(vault), null);
+
+    await writeFile(path.join(vault, RECALL_STATE_RELPATH), "null", "utf8");
+    await writeFile(path.join(vault, LIFECYCLE_STATE_RELPATH), "{", "utf8");
+    assert.equal(await readRecallState(vault), null);
+    assert.equal(await readLifecycleState(vault), null);
+
+    await rm(path.join(vault, RECALL_STATE_RELPATH), { force: true });
+    await mkdir(path.join(vault, RECALL_STATE_RELPATH), { recursive: true });
+    await assert.rejects(() => readRecallState(vault));
+  });
+});
+
 test("allow-in-off-mode: mode=off never denies even with strong unconsumed state", async () => {
   await withFixture(async ({ vault }) => {
     await writeState(vault, STRONG_STATE);
@@ -248,11 +270,11 @@ test("never blocks a non-scope tool (Edit) or a minni_* / mcp__ tool", async () 
 
 test("isReadSearchBashCommand fires on pure read/search, allows mutations", () => {
   // fire
-  for (const c of ["grep -r x .", "rg foo", "cat a b", "find . -name x", "ls -la", "head -n 5 f", "tail f", "egrep x f", "/usr/bin/grep x f", "cat a | grep b"]) {
+  for (const c of ["grep -r x .", "rg foo", "rg foo 2>&1", "cat a b", "find . -name x", "ls -la", "head -n 5 f", "tail f", "egrep x f", "/usr/bin/grep x f", "cat a | grep b", "cat missing 2>&1 | grep error"]) {
     assert.equal(isReadSearchBashCommand(c), true, `should fire: ${c}`);
   }
   // allow (do not fire)
-  for (const c of ["npm run build", "git commit -m x", "mv a b", "rm f", "node x.js", "python y.py", "grep x > out", "grep x >> out", "sed -i s/a/b/ f", "cat f | node parse.js", "FOO=1 grep x f", "echo hi", ""]) {
+  for (const c of ["npm run build", "git commit -m x", "mv a b", "rm f", "node x.js", "python y.py", "grep x > out", "grep x >> out", "grep x 2> err.log", "grep x &> out", "sed -i s/a/b/ f", "cat f | node parse.js", "FOO=1 grep x f", "echo hi", ""]) {
     assert.equal(isReadSearchBashCommand(c), false, `should allow: ${c}`);
   }
 });

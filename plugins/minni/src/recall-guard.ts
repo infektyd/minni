@@ -68,18 +68,18 @@ const READ_SEARCH_VERBS = new Set([
 ]);
 
 // Mutation / side-effecting signals anywhere in the command => never guard.
-// Output redirection (`>`, `>>`), in-place sed, and any non-read verb are the
-// danger cases the spec calls out (npm, git commit, mv, rm, sed -i, python, node).
-const MUTATION_SIGNAL = /(^|[^>])>>?[^>]|\|\s*tee\b|\bsed\b.*-i|\bxargs\b/;
+// File redirection is handled separately so descriptor merges like `2>&1` do
+// not bypass the guard for otherwise pure read/search commands.
+const MUTATION_SIGNAL = /\|\s*tee\b|\bsed\b.*-i|\bxargs\b/;
+const FILE_REDIRECT_SIGNAL = /(?:^|[\s;|&])(?:\d*)>>?\s*(?!&)\S/;
 
 export function isReadSearchBashCommand(command: string): boolean {
   const cmd = (command ?? "").trim();
   if (!cmd) return false;
 
-  // Any output redirect / pipe-to-tee / in-place edit / xargs fan-out => ALLOW.
-  // (`2>&1` style redirects are fine, but to stay conservative we treat ANY
-  //  `>`/`>>` as a mutation signal; a read command rarely needs them.)
-  if (/>>?/.test(cmd)) return false;
+  // File redirects / pipe-to-tee / in-place edit / xargs fan-out => ALLOW.
+  // Descriptor merges such as `2>&1` are read-safe and common in agent shells.
+  if (FILE_REDIRECT_SIGNAL.test(cmd)) return false;
   if (MUTATION_SIGNAL.test(cmd)) return false;
 
   // Split on shell separators that chain commands; every segment must be a
@@ -121,7 +121,8 @@ export function isToolInScope(
 
   if (toolName === "Bash") {
     if (mode !== "strict") return false; // soft mode leaves Bash untouched
-    const command = typeof toolInput.command === "string" ? toolInput.command : "";
+    const command =
+      toolInput && typeof toolInput.command === "string" ? toolInput.command : "";
     return isReadSearchBashCommand(command);
   }
 

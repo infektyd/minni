@@ -68,10 +68,11 @@ class JsonLogFormatter(logging.Formatter):
         for key, value in record.__dict__.items():
             if key in self._RESERVED or key.startswith("_"):
                 continue
-            try:
-                json.dumps(value)
-            except (TypeError, ValueError):
-                value = repr(value)
+            if not isinstance(value, (str, int, float, bool, type(None))):
+                try:
+                    json.dumps(value)
+                except (TypeError, ValueError):
+                    value = repr(value)
             payload[key] = value
         return json.dumps(payload, default=str, separators=(",", ":"))
 

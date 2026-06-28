@@ -59,8 +59,11 @@ def _collect_markdown(wiki_root: Path) -> Dict[str, float]:
             if not fname.endswith(".md") or fname.startswith("."):
                 continue
             full = Path(root) / fname
+            from path_safety import path_within_root
+            if not path_within_root(full, wiki_root):
+                continue
             try:
-                disk_files[str(full)] = full.stat().st_mtime
+                disk_files[str(full.resolve())] = full.stat().st_mtime
             except OSError:
                 continue
     return disk_files

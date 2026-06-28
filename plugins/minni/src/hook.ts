@@ -58,7 +58,7 @@ import {
   stashPrecompactReassert,
   subscribeContradictions,
 } from "./sovereign.js";
-import { classifyIntent, extractScarTissue, prepareOutcome } from "./task.js";
+import { classifyIntent, extractScarTissue, filterSafeVaultResults, prepareOutcome } from "./task.js";
 import {
   auditTail,
   collectCorrectionsReassert,
@@ -341,12 +341,17 @@ async function handleUserPromptSubmit(payload: Record<string, unknown>): Promise
   // STRENGTH gate below (NOT keyword classification). Substantive 'none'-intent
   // turns still run recall and get a pointer iff the hits are strong.
   if (!intent.automaticAllowed) {
+    // Clear any stale strong state from a previous turn BEFORE returning: an
+    // unconsumed pointer must not leak into this write-intent turn and let the
+    // s6 guard deny an unrelated read/search here (parity with the weak-turn
+    // path below, which also clears).
+    await clearRecallState(CLAUDECODE_VAULT_PATH).catch(() => {});
     // c3: persistent lifecycle visibility must survive this write-intent
     // early-return — the agent still sees the 4 surfaces on learn/vault_write turns.
     return lifecycleOnlyOutput(signature, lifecycleFields);
   }
   const threshold = recallPointerThreshold();
-  const [vaultResults, recall] = await Promise.all([
+  const [vaultResultsRaw, recall] = await Promise.all([
     searchVaultNotes(CLAUDECODE_VAULT_PATH, prompt, 6),
     recallMemory({
       query: prompt,
@@ -355,6 +360,7 @@ async function handleUserPromptSubmit(payload: Record<string, unknown>): Promise
       workspaceId: CLAUDECODE_WORKSPACE_ID,
     }),
   ]);
+  const vaultResults = filterSafeVaultResults(vaultResultsRaw);
 
   // s5 strength gate: emit the light pointer + recall-state file ONLY when the
   // top recall strength clears the threshold; otherwise inject nothing and clear
@@ -392,8 +398,13 @@ async function handleUserPromptSubmit(payload: Record<string, unknown>): Promise
     }).catch(() => {});
   }
 
+  let active_plan_ref: ReturnType<typeof compactPlanPointer> | undefined;
+  if (activePlan !== undefined) {
+    active_plan_ref = compactPlanPointer(activePlan);
+  }
+
   // Nothing salient to inject this turn: no strong recall AND no active plan.
-  if (!strong && activePlan === undefined) {
+  if (!strong && active_plan_ref === undefined) {
     await recordAudit(CLAUDECODE_VAULT_PATH, {
       tool: "hook_user_prompt_submit",
       summary: prompt.slice(0, 120),
@@ -431,7 +442,9 @@ async function handleUserPromptSubmit(payload: Record<string, unknown>): Promise
   // turn; the full goal/open_questions/pending list is omitted (it barely changes
   // turn-to-turn) and pulled on demand via minni_plan_status. SessionStart still
   // injects the full plan view for boot/rehydration.
-    if (activePlan !== undefined) {
+  if (activePlan !== undefined) {
+    // Plan parity (audit C5): inline the compact-pointer call so all four hooks
+    // share the same wire shape.
     envelopeBody.active_plan_ref = compactPlanPointer(activePlan);
   }
 

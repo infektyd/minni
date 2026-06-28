@@ -84,6 +84,16 @@ export interface StrongRecall {
   topHits: RecallStateHit[];
 }
 
+function shouldIgnoreStateReadError(error: unknown): boolean {
+  if (error instanceof SyntaxError) return true;
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    (error as { code?: unknown }).code === "ENOENT"
+  );
+}
+
 function titleFromWikilink(wikilink: string): string {
   // "[[wiki/sessions/20260608-aetherkernel-v63]]" -> "20260608-aetherkernel-v63"
   const inner = wikilink.replace(/^\[\[/, "").replace(/\]\]$/, "");
@@ -201,11 +211,18 @@ export async function readRecallState(vaultPath: string): Promise<RecallState | 
   try {
     const raw = await readFile(recallStatePath(vaultPath), "utf8");
     const parsed = JSON.parse(raw) as RecallState;
-    if (parsed && typeof parsed === "object" && typeof parsed.task_signature === "string") {
+    if (
+      parsed &&
+      typeof parsed === "object" &&
+      typeof parsed.task_signature === "string" &&
+      Array.isArray(parsed.top_hits)
+    ) {
       return parsed;
     }
-  } catch {
-    // absent or malformed
+  } catch (error) {
+    if (!shouldIgnoreStateReadError(error)) {
+      throw error;
+    }
   }
   return null;
 }
@@ -282,8 +299,10 @@ export async function readLifecycleState(vaultPath: string): Promise<LifecycleSt
     if (parsed && typeof parsed === "object" && Array.isArray(parsed.emphasized)) {
       return parsed;
     }
-  } catch {
-    // absent or malformed
+  } catch (error) {
+    if (!shouldIgnoreStateReadError(error)) {
+      throw error;
+    }
   }
   return null;
 }
