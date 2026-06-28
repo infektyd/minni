@@ -120,6 +120,49 @@ def test_vector_sync_upserts_new_chunks_and_tracks_state(tmp_path):
     assert state["status"] == "ok"
 
 
+def test_vector_sync_removes_deleted_chunks_when_dirty(tmp_path):
+    """NEW-02: a deleted chunk's vector must leave the backend on the next sync.
+
+    The incremental cursor only sees INSERTs (chunk_id > last_synced), so a
+    delete leaves a stale vector in FAISS forever unless the dirty sync
+    reconciles removals. Regression test for index-to-DB deletion drift.
+    """
+    from vector_sync import get_backend_state, mark_dirty, sync_backend
+
+    db_obj, _cfg = _make_db(tmp_path)
+    now = time.time()
+    vec = np.ones(384, dtype=np.float32)
+    with db_obj.cursor() as c:
+        c.execute("INSERT INTO documents (path, indexed_at) VALUES (?, ?)", ("wiki/a.md", now))
+        doc_id = c.lastrowid
+        for i in range(2):
+            c.execute(
+                """INSERT INTO chunk_embeddings
+                   (doc_id, chunk_index, chunk_text, embedding, computed_at)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (doc_id, i, f"chunk{i}", vec.tobytes(), now),
+            )
+
+    backend = FakeBackend()
+    sync_backend(backend, db_obj)
+    assert {it.chunk_id for it in backend.items} == {1, 2}
+
+    # Delete chunk 2 (mirrors a real deletion that calls mark_dirty).
+    with db_obj.cursor() as c:
+        c.execute("DELETE FROM chunk_embeddings WHERE chunk_id = 2")
+    mark_dirty("fake", db_obj)
+
+    result = sync_backend(backend, db_obj)
+    state = get_backend_state("fake", db_obj)
+    db_obj.close()
+
+    remaining = {it.chunk_id for it in backend.items}
+    assert 2 not in remaining, "deleted chunk's vector must be removed from the backend"
+    assert remaining == {1}
+    assert result["status"] == "ok"
+    assert state["status"] == "ok"
+
+
 def test_backend_resolver_preserves_default_bit_identical_path():
     from config import SovereignConfig
     from minnid import _resolve_backend
