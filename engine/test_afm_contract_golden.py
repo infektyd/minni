@@ -16,11 +16,62 @@ Enumerated call sites frozen here:
 import json
 import os
 import stat
+import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
 sys.path.insert(0, os.path.dirname(__file__))
+
+_ENGINE_DIR = Path(__file__).resolve().parent
+_NATIVE_AFM_HELPER = _ENGINE_DIR / "native_afm_helper"
+
+# Canonical on-wire JSONL from native_afm_helper.swift (sortedKeys via JSONSerialization).
+_GOLDEN_NATIVE_UNAVAILABLE_MISSING_REQUEST = (
+    '{"availability":"unavailable","backend":"apple-foundation-models",'
+    '"data":{"availability":"unavailable","backend":"apple-foundation-models","status":"error"},'
+    '"error":"missing request","ok":false,"provider":"native"}\n'
+)
+_GOLDEN_NATIVE_UNAVAILABLE_INVALID_JSON = (
+    '{"availability":"unavailable","backend":"apple-foundation-models",'
+    '"data":{"availability":"unavailable","backend":"apple-foundation-models","status":"error"},'
+    '"error":"invalid request JSON","ok":false,"provider":"native"}\n'
+)
+_GOLDEN_NATIVE_HEALTH_AVAILABLE = (
+    '{"availability":"available","backend":"apple-foundation-models",'
+    '"data":{"availability":"available","backend":"apple-foundation-models","status":"ok"},'
+    '"ok":true,"provider":"native"}\n'
+)
+
+
+def _native_afm_helper_available() -> bool:
+    """True when the repo's Swift wrapper can compile and execute (skipped on CI without Xcode)."""
+    if not _NATIVE_AFM_HELPER.is_file() or not os.access(_NATIVE_AFM_HELPER, os.X_OK):
+        return False
+    try:
+        completed = subprocess.run(
+            [os.fspath(_NATIVE_AFM_HELPER)],
+            input="",
+            text=True,
+            capture_output=True,
+            timeout=120,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return completed.returncode == 0 and completed.stdout == _GOLDEN_NATIVE_UNAVAILABLE_MISSING_REQUEST
+
+
+def _invoke_native_helper(stdin_payload: str, *, timeout: float = 120.0) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [os.fspath(_NATIVE_AFM_HELPER)],
+        input=stdin_payload,
+        text=True,
+        capture_output=True,
+        timeout=timeout,
+        check=False,
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -655,3 +706,42 @@ def test_golden_afm_runtime_status_core_fields(monkeypatch):
     assert bridge["native_available"] is False
     assert bridge["ok"] is True
     assert bridge["generation_verified"] is True
+
+
+# --- native Swift helper wire goldens (host-gated; CI has no Swift toolchain) ---
+
+
+@pytest.mark.skipif(
+    not _native_afm_helper_available(),
+    reason="Swift toolchain/native_afm_helper unavailable",
+)
+def test_golden_native_swift_helper_unavailable_missing_request_wire_bytes():
+    completed = _invoke_native_helper("")
+    assert completed.returncode == 0
+    assert completed.stdout == _GOLDEN_NATIVE_UNAVAILABLE_MISSING_REQUEST
+    assert completed.stderr == ""
+
+
+@pytest.mark.skipif(
+    not _native_afm_helper_available(),
+    reason="Swift toolchain/native_afm_helper unavailable",
+)
+def test_golden_native_swift_helper_unavailable_invalid_json_wire_bytes():
+    completed = _invoke_native_helper("not-json")
+    assert completed.returncode == 0
+    assert completed.stdout == _GOLDEN_NATIVE_UNAVAILABLE_INVALID_JSON
+    assert completed.stderr == ""
+
+
+@pytest.mark.skipif(
+    not _native_afm_helper_available(),
+    reason="Swift toolchain/native_afm_helper unavailable",
+)
+def test_golden_native_swift_helper_health_wire_bytes():
+    payload = json.dumps({"schema_version": 1, "operation": "health", "input": {}})
+    completed = _invoke_native_helper(payload)
+    assert completed.returncode == 0
+    assert completed.stderr == ""
+    if completed.stdout != _GOLDEN_NATIVE_HEALTH_AVAILABLE:
+        pytest.skip("FoundationModels health path unavailable on this host")
+    assert completed.stdout == _GOLDEN_NATIVE_HEALTH_AVAILABLE
