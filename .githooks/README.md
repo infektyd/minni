@@ -19,7 +19,7 @@ your global git config beyond this repository.
 
 | Hook | When | What it does |
 |---|---|---|
-| `pre-commit` | every commit | 1) public-boundary guard (blocks staged paths matching `.gitignore`/`.gitfilters`); 2) fast lint gate: `ruff` (only if `engine/*.py` staged) + `eslint` + `tsc --noEmit` (only if `plugins/minni/{src,tests}` staged). No full test run, so commits stay fast. |
+| `pre-commit` | every commit | 1) public-boundary guard (blocks staged paths matching `.gitignore`/`.gitfilters`); 2) fast lint gate: engine venv `ruff` (only if `engine/*.py` staged) + `eslint` + `tsc --noEmit` (only if `plugins/minni/{src,tests}` staged). No full test run, so commits stay fast. |
 | `pre-push` | every push | `make check` — ruff + plugin eslint/typecheck/build/test + scoped engine pytest. The full gate before code leaves your machine. |
 
 ## Escape hatch
@@ -32,6 +32,6 @@ MINNI_SKIP_HOOKS=1 git commit -m "wip"
 MINNI_SKIP_HOOKS=1 git push
 ```
 
-The hooks degrade gracefully: if `ruff` is not on `PATH`, or
-`plugins/minni/node_modules` / `make` are missing, the affected step is skipped
-with a warning rather than blocking the operation.
+The hooks degrade gracefully: if `engine/.venv`, `plugins/minni/node_modules`,
+or `make` are missing, the affected step is skipped with a warning rather than
+blocking the operation. Run `make setup` to install the expected local tools.

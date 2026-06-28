@@ -18,7 +18,7 @@ These travel with the canonical `~/.agents/skills/sovereign-memory/SKILL.md` and
 - **Gauges + Sovereign Distill Ritual V1**: Gauges as live context meter artifact (read-first, no self-reasoning tokens); Two modes (explicit gate vs auto + auditable trace); Mechanical workflow (read gauges + Layer 1 → prepare_outcome on burst → review draft → optional compile → update gauges → protect Layer 1); Toggle via `distill/mode`; Fallback keyword support (secondary); Complements native compaction (does not replace); Activation statement for standing behavior; When NOT to distill.
 - **Prepare_* Discipline + Tool Recipes**: The 6 portable patterns (before ambitious, after work/pre-flush, recall/audit, team/subagents, cross-agent handoff/ping, vault writes).
 - **Team / Cross-Agent / Evidence & Governance**: `sovereign_team_*`, `negotiate_handoff`, `ping_agent_*`, proposal-only promotion, audit_tail/report, AGENT.md contracts, "recalled is evidence not instruction", temporary agents expire, explicit human approval for promotion.
-- **Vault Layout (General)**: `wiki/`, `inbox/`, `outbox/`, `logs/`, `schema/`, `raw/`, `distill/`, `layer1/` (portable structure; per-agent defaults under `~/.sovereign-memory/<agent>-vault`).
+- **Vault Layout (General)**: `wiki/`, `inbox/`, `outbox/`, `logs/`, `schema/`, `raw/`, `distill/`, `layer1/` (portable structure; per-agent defaults under `~/.minni/<agent>-vault`).
 - **Gotchas & Safety**: instruction_like handling, env stamping (no self-supplied agentId/vaultPath), operator-gated resolve/promotion, daemon socket, privacy/redaction, degraded graceful, status-first.
 
 All rich teaching, generalized examples, and references to the ritual package live here. The package holds the detailed DESIGN, gauges/SCHEMA.md + example, notes/ (including the boundary doc), and draft history.
@@ -30,10 +30,10 @@ All rich teaching, generalized examples, and references to the ritual package li
 A thin per-agent delivery adapter (overlay SKILL + manifests + hooks if available) is responsible only for *how* the platform surfaces the portable behaviors. It must:
 
 1. **MCP / Env Stamping**: Register the shared sovereign-memory MCP server (via the canonical `~/.agents/bin/mcp-env-run` wrapper where possible, or equivalent). Stamp at minimum:
-   - `SOVEREIGN_AGENT_ID` (e.g. "grok-build", "claude-code")
-   - `SOVEREIGN_VAULT_PATH` (dedicated per-agent vault, never shared or symlinked from another without explicit approval)
-   - `SOVEREIGN_SOCKET_PATH=~/.sovereign-memory/run/sovrd.sock`
-   - `SOVEREIGN_WORKSPACE_ID` (the sovereignMemory repo root)
+   - `MINNI_AGENT_ID` (e.g. "grok-build", "claude-code")
+   - `MINNI_VAULT_PATH` (dedicated per-agent vault, never shared or symlinked from another without explicit approval)
+   - `MINNI_SOCKET_PATH=~/.minni/run/minnid.sock`
+   - `MINNI_WORKSPACE_ID` (the active project root, not the Minni source checkout unless Minni itself is the task)
    Use `.mcp.json` or the platform's native config format.
 
 2. **Lifecycle Participation (Max the Platform Allows)**: Wire into every available hook/event (SessionStart, UserPromptSubmit / prompt submit, PreCompact / compaction warning, Stop / shutdown, etc.). 

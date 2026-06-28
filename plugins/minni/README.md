@@ -262,6 +262,7 @@ The bridge defaults to the Codex vault resolved from `MINNI_VAULT_PATH` (or `MIN
 
 ```bash
 npm ci                   # deterministic install from package-lock.json
+npm run build            # writes dist/server.js for MCP/plugin manifests
 npm test                 # full pipeline: build + node --test suite
 npm run test:server      # server/hook tests only (build:server + node --test, no vite build)
 npm run test:file tests/hook-behavior.test.mjs   # single test file

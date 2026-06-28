@@ -1,9 +1,9 @@
-# Sovereign Memory Vault Operating Contract
+# Minni Vault Operating Contract
 
 **Contract version:** 1.0.0
 **Last updated:** 2026-04-26
 
-This document is the canonical operating contract for all Sovereign Memory vaults.
+This document is the canonical operating contract for all Minni vaults.
 It governs how agents read, write, and maintain vault pages. All agents — Claude
 Code, Codex, Hermes, OpenClaw, and any future peer — are bound by this contract.
 
@@ -56,18 +56,18 @@ variable, with a documented default:
 
 | Agent | Default vault path | Override env var |
 |-------|--------------------|-----------------|
-| Claude Code | `~/.sovereign-memory/claudecode-vault` | `SOVEREIGN_VAULT_PATH` |
-| Codex | `~/.sovereign-memory/codex-vault` | `SOVEREIGN_VAULT_PATH` |
-| Hermes | `~/.sovereign-memory/hermes-vault` | `SOVEREIGN_VAULT_PATH` |
-| OpenClaw | `~/.sovereign-memory/openclaw-vault` | `SOVEREIGN_VAULT_PATH` |
+| Claude Code | `~/.minni/claudecode-vault` | `MINNI_VAULT_PATH` |
+| Codex | `~/.minni/codex-vault` | `MINNI_VAULT_PATH` |
+| Hermes | `~/.minni/hermes-vault` | `MINNI_VAULT_PATH` |
+| OpenClaw | `~/.minni/openclaw-vault` | `MINNI_VAULT_PATH` |
 
 Additional env vars:
 
 | Variable | Purpose | Default |
 |----------|---------|---------|
-| `SOVEREIGN_VAULT_PATH` | Override the vault root for the current agent. | See table above |
-| `SOVEREIGN_DB_PATH` | Override the SQLite database path. | `~/.sovereign-memory/sovereign.db` |
-| `SOVEREIGN_SOCKET` | Override the daemon Unix socket path. | `~/.sovereign-memory/run/sovrd.sock` |
+| `MINNI_VAULT_PATH` | Override the vault root for the current agent. | See table above |
+| `MINNI_DB_PATH` | Override the SQLite database path. | `~/.minni/minni.db` |
+| `MINNI_SOCKET_PATH` | Plugin/client Unix socket path for daemon RPC. Daemon startup uses `--socket` / `make daemon SOCKET=...`. | `~/.minni/run/minnid.sock` |
 
 ### Cross-agent recall
 

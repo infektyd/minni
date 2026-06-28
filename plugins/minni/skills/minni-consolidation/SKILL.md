@@ -193,7 +193,7 @@ The MLX server accepts three crucial bounds flags (verify with `mlx_lm.server --
 <!-- ~/Library/LaunchAgents/com.openclaw.mlx-gemma-e4b.plist -->
 <key>ProgramArguments</key>
 <array>
-    <string>/opt/homebrew/bin/python3.11</string>
+    <string>/opt/homebrew/bin/python3</string>
     <string>-m</string>
     <string>mlx_lm.server</string>
     <string>--model</string><string>mlx-community/gemma-4-e4b-it-4bit</string>
@@ -411,7 +411,7 @@ This is safe because:
 
 ---
 
-### Error: ModuleNotFoundError — Missing SOVEREIGN_PROJECT Dependency
+### Error: ModuleNotFoundError — Missing Minni engine path
 
 **Symptom:** Pipeline completes E2B/E4B health checks, extracts and consolidates facts, then fails:
 ```
@@ -420,11 +420,12 @@ ModuleNotFoundError: No module named 'config'
     from config import DEFAULT_CONFIG as SOV_CONFIG
 ```
 
-**Root cause:** The Sovereign Memory Python library is not installed or SOVEREIGN_PROJECT environment variable points to a non-existent path.
+**Root cause:** The Minni engine path is not on `PYTHONPATH`, or the configured
+project path points to a non-existent checkout.
 
 **Default location checked:**
 ```bash
-SOVEREIGN_PROJECT = ~/Projects/minni
+MINNI_PROJECT=~/Projects/Minni
 ```
 
 **Impact:** Staged facts are successfully consolidated but NOT written to the knowledge graph database. The staging .json file persists and is retried on next run.
@@ -432,30 +433,27 @@ SOVEREIGN_PROJECT = ~/Projects/minni
 **Diagnosis:**
 ```bash
 # Check if project directory exists
-ls -d ~/Projects/minni && echo "✅ Directory exists" || echo "❌ Directory missing"
+ls -d ~/Projects/Minni && echo "Directory exists" || echo "Directory missing"
 
 # Check if config.py exists
-ls -f ~/Projects/minni/config.py 2>/dev/null && echo "✅ Module found" || echo "❌ Module missing"
+test -f ~/Projects/Minni/engine/config.py && echo "Module found" || echo "Module missing"
 
 # Check environment override
-echo $SOVEREIGN_PROJECT
+echo "$MINNI_PROJECT"
 ```
 
 **Fix (choose one):**
 
-**Option 1 — Install Sovereign Memory (recommended for permanent fix):**
+**Option 1 — Prepare Minni (recommended for permanent fix):**
 ```bash
-cd ~/Projects  # or create if missing: mkdir -p ~/Projects
-git clone https://github.com/infektyd/minni
-cd sovereign-memory
-pip install -e .
+cd ~/Projects/Minni
+make setup
 ```
 
 **Option 2 — Set custom path (if project is elsewhere):**
 ```bash
-export SOVEREIGN_PROJECT=/path/to/sovereign-memory
-source ~/.hermes/hermes-agent/venv/bin/activate
-python3 ~/.hermes/scripts/sovereign-consolidate.py --limit 5
+export MINNI_PROJECT=/path/to/Minni
+PYTHONPATH="$MINNI_PROJECT/engine" "$MINNI_PROJECT/engine/.venv/bin/python" ~/.hermes/scripts/sovereign-consolidate.py --limit 5
 ```
 
 **Option 3 — Assess health without write-back (temporary diagnostics):**

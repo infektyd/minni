@@ -4,9 +4,9 @@
 # Two gates, in order:
 #   1. Public-boundary guard — block staged paths that match .gitignore/.gitfilters
 #      (private runtime state, logs, databases, generated output).
-#   2. Fast lint gate — ruff (engine) + eslint/typecheck (plugin), but only when
-#      files in that surface are actually staged. Kept to lint/typecheck (no full
-#      test run) so commits stay fast.
+#   2. Fast lint gate — venv ruff (engine) + eslint/typecheck (plugin), but only
+#      when files in that surface are actually staged. Kept to lint/typecheck
+#      (no full test run) so commits stay fast.
 #
 # Enable once per clone:  git config core.hooksPath .githooks
 # Escape hatch (skip both gates):  MINNI_SKIP_HOOKS=1 git commit ...
@@ -99,7 +99,7 @@ for path in staged_paths():
         blocked[path] = "matches .gitfilters"
 
 if blocked:
-    print("Sovereign Memory public-boundary guard blocked this commit.", file=sys.stderr)
+    print("Minni public-boundary guard blocked this commit.", file=sys.stderr)
     print("These staged paths look like private runtime state, logs, databases, or generated output:", file=sys.stderr)
     for path, reason in sorted(blocked.items()):
         print(f"  - {path} ({reason})", file=sys.stderr)
@@ -113,10 +113,10 @@ staged="$(git diff --cached --name-only --diff-filter=ACMR)"
 
 if echo "$staged" | grep -Eq '^engine/.*\.py$'; then
   echo "[pre-commit] engine Python staged — running ruff…" >&2
-  if command -v ruff >/dev/null 2>&1; then
-    ( cd engine && ruff check . )
+  if [ -x engine/.venv/bin/python ]; then
+    ( cd engine && .venv/bin/python -m ruff check . )
   else
-    echo "[pre-commit] ruff not found on PATH — skipping engine lint (install: pip install ruff)." >&2
+    echo "[pre-commit] engine/.venv missing — run 'make setup'; skipping engine lint." >&2
   fi
 fi
 

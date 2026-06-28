@@ -16,18 +16,21 @@
 #   make daemon  - run the minnid daemon on the default socket
 #   make help    - list targets
 #
-# Tooling: the engine venv lives at engine/.venv (Python 3.11/3.12 — see
-# .python-version). ruff is resolved from PATH (see engine/requirements.txt).
+# Tooling: the engine venv lives at engine/.venv and is built with the system
+# python3, which is the supported Python 3.14 path for this repo. Ruff runs from
+# that venv so local hooks, CI, and agent shells share the same dependency set.
 
 VENV_PY ?= engine/.venv/bin/python
-RUFF ?= ruff
+PYTHON_FOR_VENV ?= python3
+ENGINE_VENV_PY ?= .venv/bin/python
+RUFF ?= $(ENGINE_VENV_PY) -m ruff
 PLUGIN_DIR := plugins/minni
 SOCKET ?= $(HOME)/.minni/run/minnid.sock
 
 # Scoped engine pytest for `make check`: a fast, model-free core that exercises
 # daemon import, dispatch, status, learn/read, and the observability surface.
 # Override to widen, e.g. `make check CHECK_PYTEST="-q"` for the full suite.
-CHECK_PYTEST ?= test_obs.py test_pr11_observability.py -q
+CHECK_PYTEST ?= test_g01_numpy_env.py test_obs.py test_pr11_observability.py -q
 
 .DEFAULT_GOAL := help
 
@@ -49,7 +52,9 @@ help:
 # ── Setup ────────────────────────────────────────────────────────────────
 .PHONY: setup
 setup:
-	cd engine && python3 -m venv .venv && .venv/bin/python -m pip install -r requirements.txt
+	cd engine && $(PYTHON_FOR_VENV) -c "import sys; sys.exit('Python 3.14+ is required for the Minni engine venv' if sys.version_info < (3, 14) else 0)"
+	cd engine && if [ -x .venv/bin/python ] && .venv/bin/python -c "import sys; sys.exit(0 if sys.version_info >= (3, 14) else 1)"; then echo "engine/.venv already uses Python 3.14+"; else echo "recreating engine/.venv with $(PYTHON_FOR_VENV)"; rm -rf .venv && $(PYTHON_FOR_VENV) -m venv .venv; fi
+	cd engine && .venv/bin/python -m pip install --upgrade pip && .venv/bin/python -m pip install -r requirements.txt
 	cd $(PLUGIN_DIR) && npm ci
 
 # ── Lint / typecheck ──────────────────────────────────────────────────────

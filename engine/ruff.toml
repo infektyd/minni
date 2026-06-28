@@ -8,7 +8,7 @@
 # Do not run `ruff check --fix .` across the engine as a sweep; fix only
 # the violations your own change introduces.
 
-target-version = "py311"
+target-version = "py314"
 line-length = 120
 
 [lint]

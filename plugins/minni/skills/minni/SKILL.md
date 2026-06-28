@@ -183,9 +183,9 @@ all share one semantics factory):
 - **PreCompact** — captures scar tissue (failed paths, dead ends) so post-compaction Claude doesn't re-walk them; corrections re-assert after compaction.
 - **Stop** — drafts candidate learnings into the vault inbox (never auto-writes); next session reviews them.
 
-All hook output is wrapped in `<sovereign:context version="1" event="..." agent="claude-code" tokens="...">` envelopes containing JSON. Parse the JSON; don't reformat the envelope. Disable with `SOVEREIGN_CLAUDECODE_HOOKS=off`.
+All hook output is wrapped in `<sovereign:context version="1" event="..." agent="claude-code" tokens="...">` envelopes containing JSON. Parse the JSON; don't reformat the envelope. Disable with `MINNI_CLAUDECODE_HOOKS=off`.
 
-The Claude Code vault lives at `~/.minni/claudecode-vault` (override: `SOVEREIGN_CLAUDECODE_VAULT_PATH`). The Codex vault at `~/.minni/codex-vault` is a peer, not a parent — they share a daemon, not a directory.
+The Claude Code vault lives at `~/.minni/claudecode-vault` (override: `MINNI_CLAUDECODE_VAULT_PATH`). The Codex vault at `~/.minni/codex-vault` is a peer, not a parent — they share a daemon, not a directory.
 
 ## Default Behavior
 
@@ -272,8 +272,8 @@ Use Sovereign Team Mode for this. Hydrate from Layer 1 and Layer 2, create tempo
 ## Vault Rules
 
 Each agent has its own vault. Defaults:
-- Claude Code: `~/.minni/claudecode-vault` (override: `SOVEREIGN_CLAUDECODE_VAULT_PATH`).
-- Codex: `~/.minni/codex-vault` (override: `SOVEREIGN_CODEX_VAULT_PATH`).
+- Claude Code: `~/.minni/claudecode-vault` (override: `MINNI_CLAUDECODE_VAULT_PATH`).
+- Codex: `~/.minni/codex-vault` (override: `MINNI_CODEX_VAULT_PATH`).
 
 - `raw/` is immutable raw sources.
 - `wiki/` is agent-maintained synthesis.

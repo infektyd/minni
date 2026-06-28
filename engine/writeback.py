@@ -22,14 +22,18 @@ import logging
 from typing import Dict, List, Optional
 from datetime import datetime
 
-import numpy as np
-
 # G09: SEC-018 frontmatter forgery guard helpers (repo-grounded, smallest addition)
 
 from config import SovereignConfig, DEFAULT_CONFIG
 from db import SovereignDB
 
 logger = logging.getLogger("sovereign.writeback")
+
+
+def _numpy():
+    """Import NumPy only when an embedding path actually needs vector math."""
+    import numpy as np
+    return np
 
 
 # Categories for learnings
@@ -113,6 +117,7 @@ class WriteBackMemory:
         # Embed the learning for semantic search
         emb_bytes = None
         if self.model:
+            np = _numpy()
             emb = self.model.encode(content).astype(np.float32)
             emb_bytes = emb.tobytes()
 
@@ -334,6 +339,7 @@ class WriteBackMemory:
         if not self.model:
             return []
 
+        np = _numpy()
         query_emb = self.model.encode(query).astype(np.float32)
         query_norm = np.linalg.norm(query_emb)
         if query_norm < 1e-8:
@@ -478,6 +484,7 @@ created: {dt.isoformat()}
             )
             return []
 
+        np = _numpy()
         effective_threshold = (
             threshold if threshold is not None else self.config.contradiction_threshold
         )
