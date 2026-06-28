@@ -350,3 +350,58 @@ test("frontend ships the sovereign command center design and stays local-only", 
   // Minifier drops quotes around static attribute values, so accept either form.
   assert.match(css, /data-theme=("?)phosphor\1/);
 });
+
+// ── S6: PR91-4 — console auth fails closed (403) on missing/invalid token ────
+// A token IS configured (setup-env sets MINNI_CONSOLE_TOKEN), so /api/status and
+// /api/prepare-* must reject a request with no or a wrong Authorization header.
+
+test("PR91-4: /api/status returns 403 on missing or invalid bearer token", async () => {
+  const server = await startTestServer();
+  try {
+    const missing = await fetch(`${server.baseUrl}/api/status`);
+    assert.equal(missing.status, 403, "no token => 403");
+    const body = await missing.json();
+    assert.equal(body.error, "console_auth_required");
+
+    const wrong = await fetch(`${server.baseUrl}/api/status`, {
+      headers: { Authorization: "Bearer not-the-real-token" },
+    });
+    assert.equal(wrong.status, 403, "wrong token => 403");
+
+    // Sanity: the correct token still authorizes.
+    const ok = await fetch(`${server.baseUrl}/api/status`, { headers: authHeaders() });
+    assert.equal(ok.status, 200, "correct token => 200");
+  } finally {
+    await server.close();
+  }
+});
+
+test("PR91-4: /api/prepare-task returns 403 on missing or invalid bearer token", async () => {
+  const server = await startTestServer();
+  try {
+    const body = JSON.stringify({ task: "x", profile: "compact", useAfm: false });
+    const missing = await fetch(`${server.baseUrl}/api/prepare-task`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body,
+    });
+    assert.equal(missing.status, 403, "no token => 403");
+
+    const wrong = await fetch(`${server.baseUrl}/api/prepare-task`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: "Bearer nope" },
+      body,
+    });
+    assert.equal(wrong.status, 403, "wrong token => 403");
+
+    // A bearer of the wrong LENGTH must also 403 (constant-time compare path).
+    const wrongLen = await fetch(`${server.baseUrl}/api/prepare-outcome`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: "Bearer x" },
+      body: JSON.stringify({ task: "x", summary: "y", changedFiles: [], verification: [] }),
+    });
+    assert.equal(wrongLen.status, 403, "wrong-length token => 403");
+  } finally {
+    await server.close();
+  }
+});

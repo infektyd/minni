@@ -1,5 +1,6 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { execFile } from "node:child_process";
+import { timingSafeEqual } from "node:crypto";
 import { access, readdir, readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
@@ -117,10 +118,30 @@ function fetchSiteAllowed(value: string | undefined): boolean {
   return !value || value === "same-origin" || value === "same-site" || value === "none";
 }
 
+// Constant-time string comparison (PR91-7). timingSafeEqual requires equal-length
+// buffers and throws otherwise, so on a length mismatch we run a dummy compare to
+// keep the timing profile flat and return false. Token length is the only thing a
+// length-based timing signal could leak, which is acceptable.
+function safeStrEqual(a: string, b: string): boolean {
+  const ab = Buffer.from(a, "utf8");
+  const bb = Buffer.from(b, "utf8");
+  if (ab.length !== bb.length) {
+    timingSafeEqual(bb, bb);
+    return false;
+  }
+  return timingSafeEqual(ab, bb);
+}
+
 function consoleAuthRequired(pathname: string): boolean {
   if (pathname === "/api/health") return false;
   if (pathname.startsWith("/api/deep-research")) return true;
   if (pathname === "/api/audit-tail") return true;
+  // PR91-3: /api/status and /api/prepare-* require a token only WHEN one is
+  // configured. The baseline protection is the loopback-only bind (createUiServer
+  // throws on a non-loopback host) plus the Host/Origin/sec-fetch-site gates, so
+  // the tokenless localhost console keeps working; a configured token is
+  // enforced fail-closed as defense-in-depth. (deep-research and audit-tail
+  // above always require a token.)
   return configuredConsoleAuth.length > 0;
 }
 
@@ -128,7 +149,7 @@ function consoleAuthorized(req: IncomingMessage, pathname: string): boolean {
   if (!consoleAuthRequired(pathname)) return true;
   if (!configuredConsoleAuth) return false;
   const auth = req.headers.authorization ?? "";
-  return auth === `Bearer ${configuredConsoleAuth}`;
+  return safeStrEqual(auth, `Bearer ${configuredConsoleAuth}`);
 }
 
 function jsonContentTypeAllowed(value: string | undefined): boolean {
