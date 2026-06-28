@@ -18,6 +18,9 @@ def _make_db(tmp_path):
         writeback_enabled=False,
         afm_loop_schedule={"enabled": True, "idle_seconds": 300, "passes": {"session_distillation": {"interval_seconds": 3600}}},
     )
+    # PR91-2: session_distillation now binds to a single agent (no global scan).
+    # Bind the config to the agent these tests seed events under (_seed_event).
+    cfg.agent_id = "codex"
     old_flag = db_mod._migrations_run
     db_mod._migrations_run = False
     try:

@@ -12,7 +12,7 @@
 // vault and (2) the mode/threshold config. We write the state file directly to
 // drive each scenario — no daemon, no UserPromptSubmit run needed.
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -21,6 +21,7 @@ import { createHookHandlers } from "../dist/hook-handlers.js";
 import {
   LIFECYCLE_STATE_RELPATH,
   RECALL_STATE_RELPATH,
+  markRecallConsumed,
   readLifecycleState,
   readRecallState,
 } from "../dist/recall-state.js";
@@ -308,4 +309,47 @@ test("recallGuardMode default is soft; honors override; unknown falls back to so
   assert.equal(recallGuardMode({ MINNI_RECALL_GUARD_MODE: "off" }), "off");
   assert.equal(recallGuardMode({ MINNI_RECALL_GUARD_MODE: "STRICT" }), "strict");
   assert.equal(recallGuardMode({ MINNI_RECALL_GUARD_MODE: "nonsense" }), "soft");
+});
+
+// ── S4: NEW-03 / PR90-2 / PR90-3 — atomic consume + fail-open guard ──────────
+
+test("PR90-3/NEW-03: concurrent markRecallConsumed converges to consumed=true, no corruption", async () => {
+  await withFixture(async ({ vault }) => {
+    await writeState(vault, STRONG_STATE);
+    // Fire many concurrent consume writes (simulating a parallel tool batch of
+    // separate hook processes). The atomic temp+rename must never leave the file
+    // truncated; all racers write consumed=true so the result converges.
+    const results = await Promise.all(
+      Array.from({ length: 20 }, () => markRecallConsumed(vault)),
+    );
+    assert.ok(results.every((r) => r === true));
+    const after = await readState(vault); // throws if JSON is corrupt/truncated
+    assert.equal(after.consumed, true);
+    assert.equal(after.top_score, STRONG_STATE.top_score); // payload intact
+  });
+});
+
+test("PR90-2: consume-write failure => guard ALLOWS (no whole-turn block loop)", async () => {
+  await withFixture(async ({ vault }) => {
+    const statePath = await writeState(vault, STRONG_STATE);
+    const stateDir = path.dirname(statePath);
+    // Make the recall-state directory read-only so the atomic temp write fails;
+    // the file itself stays readable (state still strong+unconsumed).
+    await chmod(stateDir, 0o500);
+    try {
+      // Precondition: the consume write genuinely fails now.
+      assert.equal(await markRecallConsumed(vault), false);
+
+      const handlers = createHookHandlers(turnConfig(vault, { recallGuardMode: "soft" }));
+      // First call would normally DENY (strong+unconsumed). With the consume
+      // write failing, the guard must FAIL OPEN and allow — and stay allow on
+      // re-issue (no block loop), because it can never persist consumed=true.
+      const first = await handlers.handlePreToolUse({ tool_name: "Grep", tool_input: { pattern: "x" } });
+      const second = await handlers.handlePreToolUse({ tool_name: "Grep", tool_input: { pattern: "x" } });
+      assert.equal(isDeny(first), false);
+      assert.equal(isDeny(second), false);
+    } finally {
+      await chmod(stateDir, 0o700);
+    }
+  });
 });

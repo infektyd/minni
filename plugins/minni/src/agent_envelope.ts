@@ -62,13 +62,19 @@ export function buildLifecycleEmphasis(surface: LifecycleSurface): string {
 export type LifecycleNudgeMode = "off" | "soft";
 
 /**
- * c5: master switch for the lifecycle representation (claude-code only). Default
+ * c5: master switch for the lifecycle REPRESENTATION (claude-code only). Default
  * "soft" (persistent line + once-per-session situational emphasis). "off" makes
  * the whole feature silent — a conservative escape hatch, tunable especially when
  * working IN the minni repo. Override with MINNI_LIFECYCLE_NUDGE_MODE.
+ *
+ * PR90-1: this controls ONLY the lifecycle nudge representation. It does NOT
+ * disable the s6 PreToolUse recall guard — that is MINNI_RECALL_GUARD_MODE
+ * (recall-guard.ts). Don't conflate the two switches.
  */
 export function lifecycleNudgeMode(env: NodeJS.ProcessEnv = process.env): LifecycleNudgeMode {
-  return env.MINNI_LIFECYCLE_NUDGE_MODE === "off" ? "off" : "soft";
+  // PR90-7: trim + lowercase so "OFF", " off ", "Off" all disable, matching the
+  // MINNI_RECALL_GUARD_MODE parsing in recall-guard.ts.
+  return (env.MINNI_LIFECYCLE_NUDGE_MODE ?? "").trim().toLowerCase() === "off" ? "off" : "soft";
 }
 
 export type EnvelopeEvent =

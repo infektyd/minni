@@ -103,9 +103,10 @@ from principal import (                                     # noqa: E402  # G11 
 RECOVERY_ALLOWED_METHODS = ("ping", "status", "health_report", "hygiene_report")
 
 # P0 principal enforcement: required stamped capability per DB-backed RPC method.
-# Methods with bespoke ownership gates (resolve_candidate, resolve_contradiction,
-# minni_ack_handoff) are intentionally omitted — they enforce principal binding
-# inside the handler. Recovery/diagnostic methods are also omitted.
+# resolve_candidate keeps a bespoke in-handler gate (literal resolve_candidate /
+# govern capability + ownership, see _explicitly_allowed_operator) and is
+# intentionally omitted here. Recovery/diagnostic methods
+# (RECOVERY_ALLOWED_METHODS) are also omitted.
 _RPC_CAPABILITY_REQUIREMENTS: Dict[str, str] = {
     "search": "search",
     "feedback": "feedback",
@@ -115,6 +116,10 @@ _RPC_CAPABILITY_REQUIREMENTS: Dict[str, str] = {
     "sm_export_pack": "export",
     "read": "read",
     "learn": "learn",
+    # resolve_contradiction writes a new (superseding) learning, so it needs the
+    # write capability on top of the in-handler ownership check — a read-only
+    # principal that happens to own a learning must not be able to mutate it.
+    "resolve_contradiction": "learn",
     "minni_subscribe_contradictions": "read",
     "log_event": "log_event",
     "daemon.handoff": "handoff",
@@ -124,7 +129,8 @@ _RPC_CAPABILITY_REQUIREMENTS: Dict[str, str] = {
     "minni_await_handoff": "handoff",
     "stage_candidate": "learn",
     "list_candidates": "learn",
-    "ax_snapshot_store": "read",
+    # ax_snapshot_store WRITES an accessibility snapshot — a write op, not read.
+    "ax_snapshot_store": "learn",
     "ax_snapshot_get": "read",
     "vault_index_doc": "learn",
     "daemon.compile": "read",
@@ -3037,6 +3043,8 @@ def _handle_status(params: dict, request_id: Any) -> dict:
         }
 
     uptime = time.time() - _start_time
+    # PR92-3: snapshot once and reuse (it was called twice consecutively).
+    metrics = obs.metrics_snapshot()
     return _make_response({
         "daemon": {
             "version": VERSION,
@@ -3044,8 +3052,8 @@ def _handle_status(params: dict, request_id: Any) -> dict:
             "requests_served": _request_count,
             "socket_path": "[redacted]",
             "latencies": _latency_snapshot(),
-            "errors": obs.metrics_snapshot().get("errors", 0),
-            "counters": obs.metrics_snapshot(),
+            "errors": metrics.get("errors", 0),
+            "counters": metrics,
         },
         "engine": {
             "db_ok": db_ok,
@@ -3087,6 +3095,29 @@ def _faiss_cache_age_seconds(config=DEFAULT_CONFIG) -> Optional[float]:
     if not ok:
         return None
     return round(max(0.0, time.time() - path.stat().st_mtime), 3)
+
+
+# NEW-01: health_report is reachable pre-identity (in RECOVERY_ALLOWED_METHODS),
+# so its per-record fields — document paths and learning contents — must be
+# withheld from an unstamped recovery-mode caller. Liveness/aggregate signals stay.
+_HEALTH_REPORT_SENSITIVE_KEYS = ("stale_docs", "never_recalled", "contradicting_learnings")
+
+
+def _redact_health_report_for_recovery(report: dict) -> dict:
+    """Strip document paths and learning contents from a pre-identity health_report.
+
+    Per-record detail is replaced with a count so an unauthenticated caller
+    cannot enumerate filesystem paths or learning text; non-sensitive liveness
+    fields (afm_loop, faiss_cache_age_seconds, vector_backend_lag) are retained.
+    Returns a new dict; the input is not mutated.
+    """
+    redacted = dict(report)
+    for key in _HEALTH_REPORT_SENSITIVE_KEYS:
+        items = report.get(key) or []
+        redacted[f"{key}_count"] = len(items)
+        redacted[key] = []
+    redacted["redacted"] = "pre-identity diagnostic: per-record detail withheld until a principal is stamped"
+    return redacted
 
 
 def _handle_health_report(params: dict, request_id: Any) -> dict:
@@ -3202,6 +3233,12 @@ def _handle_health_report(params: dict, request_id: Any) -> dict:
     except Exception as exc:
         logger.warning("health_report degraded: %s", exc)
         report["error"] = str(exc)
+
+    # Fail-closed: redact unless the dispatcher's trusted flag says this is a
+    # fully-identified (non-recovery) caller. `_recovery` is set by dispatch and
+    # cannot be spoofed by the client.
+    if params.get("_recovery") is not False:
+        report = _redact_health_report_for_recovery(report)
 
     return _make_response(report, request_id)
 
@@ -4195,6 +4232,10 @@ async def _dispatch(request: dict) -> dict:
     provenance = resolve_provenance(request)
     if provenance.recovery is not None and method_name not in RECOVERY_ALLOWED_METHODS:
         return _make_response(provenance.recovery, request_id)
+    # Trusted recovery flag: overwrite any caller-supplied value so a pre-identity
+    # client cannot spoof authenticated detail out of recovery-allowed handlers
+    # (e.g. health_report path/content redaction keys off this).
+    params["_recovery"] = provenance.recovery is not None
     if provenance.principal is not None:
         params.setdefault("_principal", provenance.principal)
 

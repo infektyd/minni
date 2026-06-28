@@ -20,6 +20,9 @@
 # python3, which is the supported Python 3.14 path for this repo. Ruff runs from
 # that venv so local hooks, CI, and agent shells share the same dependency set.
 
+# Engine venv python. Two forms for two working dirs (PR92-2): VENV_PY is
+# repo-root-relative (daemon + bench, run from the repo root); ENGINE_VENV_PY is
+# the same interpreter addressed from inside engine/ (ruff, run after `cd engine`).
 VENV_PY ?= engine/.venv/bin/python
 PYTHON_FOR_VENV ?= python3
 ENGINE_VENV_PY ?= .venv/bin/python
@@ -56,6 +59,7 @@ setup:
 	cd engine && if [ -x .venv/bin/python ] && .venv/bin/python -c "import sys; sys.exit(0 if sys.version_info >= (3, 14) else 1)"; then echo "engine/.venv already uses Python 3.14+"; else echo "recreating engine/.venv with $(PYTHON_FOR_VENV)"; rm -rf .venv && $(PYTHON_FOR_VENV) -m venv .venv; fi
 	cd engine && .venv/bin/python -m pip install --upgrade pip && .venv/bin/python -m pip install -r requirements.txt
 	cd $(PLUGIN_DIR) && npm ci
+	git config core.hooksPath .githooks
 
 # ── Lint / typecheck ──────────────────────────────────────────────────────
 .PHONY: lint lint-engine lint-plugin
@@ -133,7 +137,8 @@ daemon start:
 # Reproducibility: two `make bench` runs produce a BYTE-IDENTICAL Layer-1
 # scorecard JSON (results/layer1_scorecard.json) — Layer-2 is CI-only.
 
-PYTHON ?= engine/.venv/bin/python
+# PR92-2: reuse VENV_PY rather than re-declaring the same interpreter path.
+PYTHON ?= $(VENV_PY)
 BENCH_DIR := bench
 OUT ?= $(BENCH_DIR)/results
 

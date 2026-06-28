@@ -530,6 +530,16 @@ def update_toml_mcp_config(path: Path, server_path: Path, agent: str, vault: Pat
     )
 
 
+# PreToolUse parity (Claude-only-by-capability):
+# The s6 recall GUARD relies on a PreToolUse hook that can DENY a tool call
+# before it runs. Among the supported surfaces, only Claude Code exposes a
+# deny-capable pre-tool hook (registered in plugins/minni/hooks/hooks.json).
+# codex / grok / kilocode / gemini wire Minni through MCP servers + CLI and do
+# NOT expose an equivalent deny-capable pre-tool event, so the guard is
+# intentionally NOT wired into their manifests — this is a platform capability
+# gap, not a Minni omission. The lifecycle nudge + UserPromptSubmit recall
+# pointer still reach those surfaces; only the deny-to-surface backstop is
+# Claude-only. See docs/contracts/AGENT.md §8.
 def platform_spec(platform: str, repo_root: Path, install_root: str | None = None) -> dict[str, object]:
     platform = canonical_platform(platform)
     home = Path.home()

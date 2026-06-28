@@ -26,7 +26,13 @@ logger = logging.getLogger("sovereign.afm.session_distillation")
 def _log_native_error_kind(op: str, trace_id: str, result: Any) -> str:
     """Surface the helper's error_kind so a recoverable trip (context_overflow /
     guardrail) is no longer indistinguishable from "AFM down". Returns the
-    classified kind for the caller to record; behavior otherwise unchanged."""
+    classified kind for the caller to record; behavior otherwise unchanged.
+
+    NOTE (PR84-2 retraction): this CLASSIFIES and LOGS the trip only — it does
+    NOT chunk on context_overflow or rephrase on guardrail. The pass still
+    returns empty on a trip. The #84 description's "(chunk)" / "(rephrase/skip)"
+    wording describes intended future recovery, not shipped behavior; real
+    recovery is tracked as separate follow-up work."""
     data = result.data if isinstance(getattr(result, "data", None), dict) else {}
     error_kind = str(data.get("error_kind") or "").strip() or "unknown"
     if error_kind in {"context_overflow", "guardrail"}:
@@ -454,8 +460,14 @@ def run(db, config, vault_path: Optional[str] = None, dry_run: bool = True, trac
     lookback_hours = int(pass_cfg.get("lookback_hours", 24))
     trace_id = trace_id or f"afm-{int(time.time())}"
     prompt = _load_prompt()
+    # PR91-2: never query GLOBALLY when unbound — a None agent_id would pull
+    # EVERY agent's session events/docs into one agent's distillation. Fall back
+    # to the "unknown" sentinel (matches only unattributed rows) so an unbound
+    # run fails closed instead of leaking cross-agent context. The CLI
+    # consolidation entrypoint propagates --agent/MINNI_AGENT_ID so real runs are
+    # properly scoped.
     bound_agent = os.environ.get("MINNI_AGENT_ID") or getattr(config, "agent_id", None)
-    bound_agent = str(bound_agent).strip() if bound_agent else None
+    bound_agent = str(bound_agent).strip() if bound_agent and str(bound_agent).strip() else "unknown"
     events = _recent_events(db, lookback_hours, agent_id=bound_agent)
     raw_docs = _recent_raw_docs(db, lookback_hours, agent_id=bound_agent)
     pass_input = {

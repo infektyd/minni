@@ -150,9 +150,6 @@ export interface AgentHookHandlers {
   handlePreToolUse(payload: Record<string, unknown>): Promise<PreToolUseDecisionOutput>;
   handlePreCompact(payload: Record<string, unknown>): Promise<HookOutput>;
   handleStop(payload: Record<string, unknown>): Promise<HookOutput>;
-  handlePreToolUse(
-    payload: Record<string, unknown>,
-  ): Promise<PreToolUseDecisionOutput>;
   dispatch(
     event: string,
     payload: Record<string, unknown>,
@@ -496,20 +493,26 @@ export function createHookHandlers(
     const verdict = decideGuard({ state, mode, threshold, toolName, toolInput });
     if (verdict === "allow") return preToolUseAllow();
 
-    // DENY: flip consumed=true BEFORE returning so the re-issued call (and every
-    // other tool call this turn) ALWAYS passes. The guard fires at most once.
-    await markRecallConsumed(config.vaultPath).catch(() => {});
+    // DENY surfaces the recall ONCE: flip consumed=true FIRST so the re-issued
+    // call (and every other tool call this turn) passes. PR90-2: only deny if
+    // that flag actually persisted — if the write failed, denying would loop the
+    // WHOLE turn (every re-issued call re-reads consumed=false and is denied
+    // again). On a persistence failure we FAIL OPEN and allow, trading a missed
+    // nudge for availability.
+    const consumed = await markRecallConsumed(config.vaultPath).catch(() => false);
     await recordAudit(config.vaultPath, {
       tool: `${config.auditPrefix}_pretooluse_guard`,
-      summary: `recall guard denied ${toolName} (mode=${mode})`,
+      summary: `recall guard ${consumed ? "denied" : "allowed (consume write failed)"} ${toolName} (mode=${mode})`,
       details: {
         tool: toolName,
         mode,
+        consumed,
         top_score: state!.top_score,
         hits: state!.top_hits.length,
         task_signature: state!.task_signature,
       },
     }).catch(() => {});
+    if (!consumed) return preToolUseAllow();
     return preToolUseDeny(state!);
   }
 

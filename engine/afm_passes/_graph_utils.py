@@ -117,7 +117,10 @@ def accepted_pages(
         if page.status != "accepted" or page.page_type == "synthesis":
             continue
         privacy = (page.privacy or "safe").lower()
-        if privacy in {"blocked", "private", "local-only"}:
+        # PR91-5: allowlist, not blocklist — an unrecognized label (e.g.
+        # "sensitive") must fail CLOSED rather than slip past a known-bad set into
+        # AFM graph synthesis. Only explicitly-safe levels are accepted.
+        if privacy not in {"safe", "public"}:
             continue
         if principal is not None:
             try:

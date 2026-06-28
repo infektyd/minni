@@ -124,7 +124,9 @@ def test_cross_agent_search_allowed_with_wildcard_cap(monkeypatch, tmp_path):
 
 def test_ax_snapshot_store_uses_stamped_principal_not_wire_agent(monkeypatch, tmp_path):
     _patch_db(monkeypatch, tmp_path)
-    _stamp(monkeypatch, "codex", ["read"])
+    # ax_snapshot_store is a WRITE op (PR91-6): it requires the "learn" cap, so a
+    # principal that can store snapshots needs it alongside "read".
+    _stamp(monkeypatch, "codex", ["read", "learn"])
     captured = {}
 
     class _FakeAx:
@@ -145,6 +147,33 @@ def test_ax_snapshot_store_uses_stamped_principal_not_wire_agent(monkeypatch, tm
     )
     assert "error" not in resp, resp
     assert captured.get("agent_id") == "codex"
+
+
+def test_read_only_principal_denied_ax_snapshot_store(monkeypatch, tmp_path):
+    """PR91-6: a read-only principal must NOT be able to write an AX snapshot."""
+    _patch_db(monkeypatch, tmp_path)
+    _stamp(monkeypatch, "codex", ["read"])
+    resp = _rpc(
+        "ax_snapshot_store",
+        {"agent_id": "codex", "app_name": "Finder", "tree_json": "{}"},
+    )
+    err = resp.get("error", {})
+    assert err.get("code") == -32004, resp
+    assert "learn" in err.get("message", "")
+
+
+def test_read_only_principal_denied_resolve_contradiction(monkeypatch, tmp_path):
+    """PR91-1: resolve_contradiction mutates learnings — deny a read-only principal
+    at the capability gate before the owner check is even reached."""
+    _patch_db(monkeypatch, tmp_path)
+    _stamp(monkeypatch, "codex", ["read"])
+    resp = _rpc(
+        "resolve_contradiction",
+        {"agent_id": "codex", "new_content": "resolution", "supersede_ids": [1]},
+    )
+    err = resp.get("error", {})
+    assert err.get("code") == -32004, resp
+    assert "learn" in err.get("message", "")
 
 
 def test_platform_agent_without_cap_map_does_not_inherit_operator_wildcard(tmp_path: Path):
