@@ -56,9 +56,7 @@ import asyncio
 import json
 import logging
 import os
-import re
 import signal
-import socket
 import sys
 import time
 import importlib.util
@@ -81,7 +79,7 @@ if str(_ENGINE_DIR) not in sys.path:
     sys.path.insert(0, str(_ENGINE_DIR))
 
 import obs                                                  # noqa: E402  # centralized logging + metrics counters
-from config import CANONICAL_SOVEREIGN_HOME, DEFAULT_CONFIG, SovereignConfig          # noqa: E402
+from config import DEFAULT_CONFIG          # noqa: E402
 from db import SovereignDB                                  # noqa: E402
 from principal import (                                     # noqa: E402  # G11 EffectivePrincipal + G14 operator gate
     EffectivePrincipal,
@@ -157,8 +155,6 @@ from minnid_runtime.handoff import (  # noqa: E402
 )
 from minnid_runtime.health import (  # noqa: E402
     HealthContext,
-    faiss_cache_age_seconds as _runtime_faiss_cache_age_seconds,
-    faiss_cache_status as _runtime_faiss_cache_status,
     handle_health_report as _runtime_handle_health_report,
     handle_hygiene_report as _runtime_handle_hygiene_report,
     handle_status as _runtime_handle_status,
@@ -177,10 +173,6 @@ from minnid_runtime.provenance import (  # noqa: E402
 )
 from minnid_runtime.recall import (  # noqa: E402
     RecallContext,
-    anchor_for_result as _runtime_anchor_for_result,
-    backend_badge as _runtime_backend_badge,
-    expand_reference as _runtime_expand_reference,
-    full_provenance as _runtime_full_provenance,
     handle_expand as _runtime_handle_expand,
     handle_feedback as _runtime_handle_feedback,
     handle_read as _runtime_handle_read,
@@ -188,15 +180,7 @@ from minnid_runtime.recall import (  # noqa: E402
     handle_sm_drill as _runtime_handle_sm_drill,
     handle_sm_export_pack as _runtime_handle_sm_export_pack,
     handle_trace as _runtime_handle_trace,
-    indexed_at_for_result as _runtime_indexed_at_for_result,
-    merge_document_results as _runtime_merge_document_results,
-    reference_candidates as _runtime_reference_candidates,
-    reference_ids_for_engine as _runtime_reference_ids_for_engine,
-    reference_matches as _runtime_reference_matches,
     resolve_backend as _runtime_resolve_backend,
-    resolve_document_scope as _runtime_resolve_document_scope,
-    score_components as _runtime_score_components,
-    tag_document_results as _runtime_tag_document_results,
 )
 from minnid_runtime.redaction import redact_text as _redact_text, redact_value as _redact_value  # noqa: E402
 from minnid_runtime.rpc import make_error as _make_error, make_response as _make_response  # noqa: E402
@@ -327,28 +311,6 @@ def _all_vault_retrievals() -> list:
         out.append(cached)
         seen.add(key)
     return out
-
-
-def _tag_document_results(results: list, *, src: str) -> list:
-    return _runtime_tag_document_results(results, src=src)
-
-
-def _result_identity(row: dict) -> tuple:
-    from minnid_runtime.recall import result_identity
-
-    return result_identity(row)
-
-
-def _merge_document_results(result_sets: list, limit: int, *, prefer_personal: bool = False) -> list:
-    return _runtime_merge_document_results(
-        result_sets,
-        limit,
-        prefer_personal=prefer_personal,
-    )
-
-
-def _resolve_document_scope(params: dict) -> str:
-    return _runtime_resolve_document_scope(params)
 
 
 def _lazy_writeback():
@@ -640,10 +602,6 @@ def _latency_snapshot() -> Dict[str, Dict[str, float]]:
     return snapshot
 
 
-def _backend_badge(backends: Any) -> str:
-    return _runtime_backend_badge(backends)
-
-
 def formatRecall(query: str, response: Dict[str, Any]) -> str:
     """Python-side recall formatting with backend provenance badge."""
     backend = response.get("backend") or response.get("backend_badge")
@@ -744,75 +702,8 @@ def _handle_expand(params: dict, request_id: Any) -> dict:
     return _runtime_handle_expand(params, request_id, _recall_context())
 
 
-def _indexed_at_for_result(retrieval_engine, result: dict) -> Optional[float]:
-    return _runtime_indexed_at_for_result(retrieval_engine, result)
-
-
-def _score_components(reference: dict, result: dict) -> dict:
-    return _runtime_score_components(reference, result)
-
-
-def _full_provenance(
-    *,
-    retrieval_engine,
-    source_agent: str,
-    source_vault: str,
-    index_db_path: str,
-    reference: dict,
-    result: dict,
-) -> dict:
-    return _runtime_full_provenance(
-        retrieval_engine=retrieval_engine,
-        source_agent=source_agent,
-        source_vault=source_vault,
-        index_db_path=index_db_path,
-        reference=reference,
-        result=result,
-    )
-
-
-def _reference_candidates(reference: dict, principal, agent_id: Optional[str], shared_engine) -> list:
-    return _runtime_reference_candidates(
-        reference,
-        principal,
-        agent_id,
-        shared_engine,
-        _recall_context(),
-    )
-
-
-def _reference_matches(result: dict, reference: dict) -> bool:
-    return _runtime_reference_matches(result, reference)
-
-
-def _reference_ids_for_engine(reference: dict, retrieval_engine) -> list[int]:
-    return _runtime_reference_ids_for_engine(reference, retrieval_engine)
-
-
-def _expand_reference(
-    reference: dict,
-    *,
-    depth: str,
-    principal,
-    agent_id: Optional[str],
-    shared_engine,
-) -> Optional[dict]:
-    return _runtime_expand_reference(
-        reference,
-        depth=depth,
-        principal=principal,
-        agent_id=agent_id,
-        shared_engine=shared_engine,
-        context=_recall_context(),
-    )
-
-
 def _handle_sm_drill(params: dict, request_id: Any) -> dict:
     return _runtime_handle_sm_drill(params, request_id, _recall_context())
-
-
-def _anchor_for_result(result: dict) -> str:
-    return _runtime_anchor_for_result(result)
 
 
 def _handle_sm_export_pack(params: dict, request_id: Any) -> dict:
@@ -892,14 +783,6 @@ def _health_context() -> HealthContext:
 
 def _handle_status(params: dict, request_id: Any) -> dict:
     return _runtime_handle_status(params, request_id, _health_context())
-
-
-def _faiss_cache_status(config=DEFAULT_CONFIG) -> tuple[Path, bool]:
-    return _runtime_faiss_cache_status(config)
-
-
-def _faiss_cache_age_seconds(config=DEFAULT_CONFIG) -> Optional[float]:
-    return _runtime_faiss_cache_age_seconds(config)
 
 
 def _handle_health_report(params: dict, request_id: Any) -> dict:
@@ -1204,8 +1087,8 @@ async def _serve_http(host: str = "127.0.0.1", port: int = 9900):
 
     async def handler(reader, writer):
         try:
-            # Read HTTP request
-            request_line = await reader.readline()
+            # Read HTTP request (discard request line; only POST body matters here).
+            await reader.readline()
             headers = {}
             while True:
                 line = await reader.readline()

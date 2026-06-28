@@ -215,8 +215,6 @@ def test_recall_domain_lives_in_runtime_module_and_registry_delegates():
     import minnid
     from minnid_runtime.recall import (
         RecallContext,
-        anchor_for_result,
-        expand_reference,
         handle_expand,
         handle_feedback,
         handle_read,
@@ -224,10 +222,7 @@ def test_recall_domain_lives_in_runtime_module_and_registry_delegates():
         handle_sm_drill,
         handle_sm_export_pack,
         handle_trace,
-        merge_document_results,
         resolve_backend,
-        resolve_document_scope,
-        tag_document_results,
     )
 
     context = minnid._recall_context()
@@ -240,12 +235,7 @@ def test_recall_domain_lives_in_runtime_module_and_registry_delegates():
     assert minnid._runtime_handle_sm_drill is handle_sm_drill
     assert minnid._runtime_handle_sm_export_pack is handle_sm_export_pack
     assert minnid._runtime_handle_read is handle_read
-    assert minnid._runtime_tag_document_results is tag_document_results
-    assert minnid._runtime_merge_document_results is merge_document_results
-    assert minnid._runtime_resolve_document_scope is resolve_document_scope
     assert minnid._runtime_resolve_backend is resolve_backend
-    assert minnid._runtime_expand_reference is expand_reference
-    assert minnid._runtime_anchor_for_result is anchor_for_result
     assert minnid._METHODS["search"] is minnid._handle_search
     assert minnid._METHODS["feedback"] is minnid._handle_feedback
     assert minnid._METHODS["trace"] is minnid._handle_trace
@@ -306,8 +296,6 @@ def test_operational_domains_live_in_runtime_modules_and_registry_delegates():
     from minnid_runtime.ax import AXContext, handle_ax_snapshot_get, handle_ax_snapshot_store
     from minnid_runtime.health import (
         HealthContext,
-        faiss_cache_age_seconds,
-        faiss_cache_status,
         handle_health_report,
         handle_hygiene_report,
         handle_status,
@@ -322,8 +310,6 @@ def test_operational_domains_live_in_runtime_modules_and_registry_delegates():
     assert minnid._runtime_handle_status is handle_status
     assert minnid._runtime_handle_health_report is handle_health_report
     assert minnid._runtime_handle_hygiene_report is handle_hygiene_report
-    assert minnid._runtime_faiss_cache_status is faiss_cache_status
-    assert minnid._runtime_faiss_cache_age_seconds is faiss_cache_age_seconds
     assert minnid._METHODS["status"] is minnid._handle_status
     assert minnid._METHODS["health_report"] is minnid._handle_health_report
     assert minnid._METHODS["hygiene_report"] is minnid._handle_hygiene_report
