@@ -55,16 +55,13 @@ import argparse
 import asyncio
 import json
 import logging
-import math
 import os
 import re
-import hashlib
 import signal
 import socket
 import sys
 import time
 import importlib.util
-import uuid
 from collections import deque
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -90,13 +87,26 @@ from principal import (                                     # noqa: E402  # G11 
     EffectivePrincipal,
     IdentityMismatchError,
     agent_scope_for,
-    can_read_document,  # G19
-    is_operator_principal,
-    make_capability_denied_error,
     make_mismatch_error,
-    allows_cross_agent_recall,
     resolve_effective_principal,
     validate_agent_id,
+)
+from minnid_runtime.afm import (  # noqa: E402
+    AFMContext,
+    afm_loop_enabled as _runtime_afm_loop_enabled,
+    afm_loop_runner as _runtime_afm_loop_runner,
+    apply_consolidation_result as _runtime_apply_consolidation_result,
+    handle_daemon_compile as _runtime_handle_daemon_compile,
+    handle_daemon_endorse as _runtime_handle_daemon_endorse,
+    mark_candidate_review as _runtime_mark_candidate_review,
+    maybe_archive_inbox_source as _runtime_maybe_archive_inbox_source,
+    promote_candidate_durable as _runtime_promote_candidate_durable,
+    reject_candidate_dedup as _runtime_reject_candidate_dedup,
+)
+from minnid_runtime.ax import (  # noqa: E402
+    AXContext,
+    handle_ax_snapshot_get as _runtime_handle_ax_snapshot_get,
+    handle_ax_snapshot_store as _runtime_handle_ax_snapshot_store,
 )
 from minnid_runtime.dispatch import DispatchContext, dispatch_request  # noqa: E402
 from minnid_runtime.governance import (  # noqa: E402
@@ -145,6 +155,14 @@ from minnid_runtime.handoff import (  # noqa: E402
     write_matching_lease_packets as _runtime_write_matching_lease_packets,
     write_json as _write_json,
 )
+from minnid_runtime.health import (  # noqa: E402
+    HealthContext,
+    faiss_cache_age_seconds as _runtime_faiss_cache_age_seconds,
+    faiss_cache_status as _runtime_faiss_cache_status,
+    handle_health_report as _runtime_handle_health_report,
+    handle_hygiene_report as _runtime_handle_hygiene_report,
+    handle_status as _runtime_handle_status,
+)
 from minnid_runtime.provenance import (  # noqa: E402
     RECOVERY_ALLOWED_METHODS,
     RPC_CAPABILITY_REQUIREMENTS as _RPC_CAPABILITY_REQUIREMENTS,
@@ -182,6 +200,11 @@ from minnid_runtime.recall import (  # noqa: E402
 from minnid_runtime.redaction import redact_text as _redact_text, redact_value as _redact_value  # noqa: E402
 from minnid_runtime.rpc import make_error as _make_error, make_response as _make_response  # noqa: E402
 from minnid_runtime.transport import SOCKET_BODY_LIMIT as _SOCKET_BODY_LIMIT, parse_request as _parse_request  # noqa: E402
+from minnid_runtime.vault_index import (  # noqa: E402
+    MAX_VAULT_PAGE_CHARS as _MAX_VAULT_PAGE_CHARS,
+    VaultIndexContext,
+    handle_vault_index_doc as _runtime_handle_vault_index_doc,
+)
 
 # ── Lazy imports (heavy ML deps) ──────────────────────────────────────────
 _retrieval = None
@@ -815,270 +838,69 @@ def _handle_log_event(params: dict, request_id: Any) -> dict:
     return _runtime_handle_log_event(params, request_id, _governance_context())
 
 
-def _handle_status(params: dict, request_id: Any) -> dict:
-    """Return daemon and engine status."""
+def _increment_ops_request_count() -> None:
     global _request_count
     _request_count += 1
 
-    vault_path = params.get("vault") or params.get("vault_path") or DEFAULT_CONFIG.vault_path
-    err = _guard_vault_root(params, vault_path, request_id, label="status")
-    if err:
-        return err
 
-    # Calculate audit volume
-    audit_vol = 0
-    try:
-        vp = Path(vault_path)
-        if vp.is_dir():
-            for p in vp.glob("log*.md"):
-                try:
-                    audit_vol += p.stat().st_size
-                except OSError:
-                    pass
-            logs_dir = vp / "logs"
-            if logs_dir.is_dir():
-                for p in logs_dir.glob("*.md"):
-                    try:
-                        audit_vol += p.stat().st_size
-                    except OSError:
-                        pass
-    except Exception:
-        pass
+def _health_context() -> HealthContext:
+    return HealthContext(
+        make_error=_make_error,
+        make_response=_make_response,
+        guard_vault_root=_guard_vault_root,
+        latency_snapshot=_latency_snapshot,
+        metrics_snapshot=obs.metrics_snapshot,
+        afm_loop_enabled=_afm_loop_enabled,
+        increment_request_count=_increment_ops_request_count,
+        request_count=lambda: _request_count,
+        start_time=lambda: _start_time,
+        version=VERSION,
+        sovereign_db=SovereignDB,
+        default_config=DEFAULT_CONFIG,
+        logger=logger,
+    )
 
-    db_ok = False
-    db_stats = {}
-    try:
-        db = SovereignDB()
-        with db.cursor() as c:
-            c.execute("SELECT COUNT(*) as n FROM documents")
-            db_stats["documents"] = c.fetchone()["n"]
-            c.execute("SELECT COUNT(*) as n FROM chunk_embeddings")
-            db_stats["chunks"] = c.fetchone()["n"]
-            c.execute("SELECT COUNT(*) as n FROM learnings")
-            db_stats["learnings"] = c.fetchone()["n"]
-            c.execute("SELECT COUNT(*) as n FROM episodic_events")
-            db_stats["events"] = c.fetchone()["n"]
-        db.close()
-        db_ok = True
-    except Exception:
-        pass
 
-    faiss_path, faiss_ok = _faiss_cache_status(DEFAULT_CONFIG)
-    try:
-        from afm_provider import afm_runtime_status
-        afm_status = afm_runtime_status()
-    except Exception as exc:
-        afm_status = {
-            "mode": "unknown",
-            "status": "degraded",
-            "native_available": False,
-            "error": str(exc),
-        }
-
-    uptime = time.time() - _start_time
-    return _make_response({
-        "daemon": {
-            "version": VERSION,
-            "uptime_seconds": round(uptime, 1),
-            "requests_served": _request_count,
-            "socket_path": "[redacted]",
-            "latencies": _latency_snapshot(),
-            "errors": obs.metrics_snapshot().get("errors", 0),
-            "counters": obs.metrics_snapshot(),
-        },
-        "engine": {
-            "db_ok": db_ok,
-            "db_path": "[redacted]",
-            "faiss_ok": faiss_ok,
-            "faiss_path": "[redacted]",
-            "stats": db_stats,
-            "audit_volume": audit_vol,
-        },
-        "afm": afm_status,
-    }, request_id)
+def _handle_status(params: dict, request_id: Any) -> dict:
+    return _runtime_handle_status(params, request_id, _health_context())
 
 
 def _faiss_cache_status(config=DEFAULT_CONFIG) -> tuple[Path, bool]:
-    legacy_path = Path(config.faiss_index_path)
-    if legacy_path.exists():
-        return legacy_path, legacy_path.stat().st_size > 0
-
-    try:
-        from faiss_persist import _faiss_dir_for_db
-
-        faiss_dir = Path(_faiss_dir_for_db(config.db_path))
-        manifest_path = faiss_dir / "index.manifest.json"
-        faiss_path = faiss_dir / "index.faiss"
-        npz_path = faiss_dir / "index.faiss.npz"
-        if manifest_path.exists():
-            for candidate in (faiss_path, npz_path):
-                if candidate.exists() and candidate.stat().st_size > 0:
-                    return candidate, True
-            return faiss_path, False
-    except Exception:
-        pass
-
-    return legacy_path, False
+    return _runtime_faiss_cache_status(config)
 
 
 def _faiss_cache_age_seconds(config=DEFAULT_CONFIG) -> Optional[float]:
-    path, ok = _faiss_cache_status(config)
-    if not ok:
-        return None
-    return round(max(0.0, time.time() - path.stat().st_mtime), 3)
+    return _runtime_faiss_cache_age_seconds(config)
 
 
 def _handle_health_report(params: dict, request_id: Any) -> dict:
-    """Return deeper read-only memory health diagnostics."""
-    now = time.time()
-    stale_cutoff = now - (30 * 24 * 60 * 60)
-    report = {
-        "stale_docs": [],
-        "never_recalled": [],
-        "contradicting_learnings": [],
-        "vector_backend_lag": [],
-        "faiss_cache_age_seconds": _faiss_cache_age_seconds(DEFAULT_CONFIG),
-        "afm_loop": {
-            "last_run_per_pass": {},
-            "drafts_pending": 0,
-            "drafts_pending_oldest": None,
-            "afm_latency_p95": 0.0,
-            "status": "disabled" if not _afm_loop_enabled(DEFAULT_CONFIG) else "ok",
-        },
-    }
-
-    try:
-        try:
-            from afm_writer import writer_status
-            report["afm_loop"] = writer_status(DEFAULT_CONFIG.vault_path)
-            if not _afm_loop_enabled(DEFAULT_CONFIG):
-                report["afm_loop"]["status"] = "disabled"
-        except Exception as exc:
-            report["afm_loop"]["status"] = "degraded"
-            report["afm_loop"]["error"] = str(exc)
-
-        db = SovereignDB(DEFAULT_CONFIG)
-        with db.cursor() as c:
-            c.execute(
-                """
-                SELECT doc_id, path, indexed_at, last_modified
-                FROM documents
-                WHERE COALESCE(indexed_at, last_modified, 0) < ?
-                ORDER BY COALESCE(indexed_at, last_modified, 0) ASC
-                LIMIT 25
-                """,
-                (stale_cutoff,),
-            )
-            for row in c.fetchall():
-                ts = row["indexed_at"] or row["last_modified"] or 0
-                report["stale_docs"].append({
-                    "doc_id": row["doc_id"],
-                    "path": row["path"],
-                    "age_days": round((now - ts) / 86400, 1) if ts else None,
-                })
-
-            c.execute(
-                """
-                SELECT doc_id, path
-                FROM documents
-                WHERE COALESCE(access_count, 0) = 0
-                ORDER BY indexed_at DESC NULLS LAST
-                LIMIT 25
-                """
-            )
-            report["never_recalled"] = [
-                {"doc_id": row["doc_id"], "path": row["path"]}
-                for row in c.fetchall()
-            ]
-
-            c.execute(
-                """
-                SELECT learning_id, agent_id, content, contradicts_id, status
-                FROM learnings
-                WHERE contradicts_id IS NOT NULL OR status = 'contradiction'
-                ORDER BY created_at DESC
-                LIMIT 25
-                """
-            )
-            report["contradicting_learnings"] = [
-                {
-                    "learning_id": row["learning_id"],
-                    "agent_id": row["agent_id"],
-                    "content": (row["content"] or "")[:160],
-                    "contradicts_id": row["contradicts_id"],
-                    "status": row["status"],
-                }
-                for row in c.fetchall()
-            ]
-
-            try:
-                c.execute(
-                    "SELECT COALESCE(MAX(chunk_id), 0) AS max_rowid, "
-                    "COUNT(*) AS n FROM chunk_embeddings"
-                )
-                chunk_state = c.fetchone()
-                max_rowid = int(chunk_state["max_rowid"] or 0)
-                c.execute(
-                    """
-                    SELECT name, status, last_synced_chunk_rowid, last_synced_at, vector_count
-                    FROM vector_backends
-                    ORDER BY name
-                    """
-                )
-                for row in c.fetchall():
-                    lag = max(0, max_rowid - int(row["last_synced_chunk_rowid"] or 0))
-                    if lag or row["status"] not in ("ok", "empty"):
-                        report["vector_backend_lag"].append({
-                            "name": row["name"],
-                            "status": row["status"],
-                            "lag_chunks": lag,
-                            "last_synced_at": row["last_synced_at"],
-                            "vector_count": row["vector_count"],
-                        })
-            except Exception as exc:
-                report["vector_backend_lag"].append({"status": "unknown", "error": str(exc)})
-        db.close()
-    except Exception as exc:
-        logger.warning("health_report degraded: %s", exc)
-        report["error"] = str(exc)
-
-    return _make_response(report, request_id)
+    return _runtime_handle_health_report(params, request_id, _health_context())
 
 
 def _handle_hygiene_report(params: dict, request_id: Any) -> dict:
-    """Run read-only vault/wiki hygiene checks and return JSON summary."""
-    # G12: enforce stamped principal's allowed_vault_roots on any supplied vault (realpath checked)
-    vault_path = params.get("vault") or params.get("vault_path") or DEFAULT_CONFIG.vault_path
-    err = _guard_vault_root(params, vault_path, request_id, label="hygiene")
-    if err:
-        return err
-    try:
-        from hygiene import run_hygiene_report
-        summary = run_hygiene_report(Path(vault_path))
-        return _make_response(summary, request_id)
-    except Exception as exc:
-        logger.warning("hygiene_report degraded: %s", exc)
-        return _make_response({
-            "status": "degraded",
-            "vault": str(vault_path),
-            "counts": {"block": 1, "warn": 0, "info": 0},
-            "findings": {
-                "block": [{
-                    "check": "hygiene_report",
-                    "path": str(vault_path),
-                    "message": str(exc),
-                }],
-                "warn": [],
-                "info": [],
-            },
-            "report_path": None,
-        }, request_id)
+    return _runtime_handle_hygiene_report(params, request_id, _health_context())
+
+
+def _afm_context() -> AFMContext:
+    return AFMContext(
+        make_error=_make_error,
+        make_response=_make_response,
+        guard_vault_root=_guard_vault_root,
+        lazy_writeback=_lazy_writeback,
+        trace_ring=_trace_ring,
+        record_latency=_record_latency,
+        maybe_archive_inbox_source=_maybe_archive_inbox_source,
+        increment_request_count=_increment_ops_request_count,
+        writeback_ref=lambda: _writeback,
+        sovereign_db=SovereignDB,
+        default_config=DEFAULT_CONFIG,
+        is_running=lambda: _running,
+        logger=logger,
+    )
 
 
 def _afm_loop_enabled(config=DEFAULT_CONFIG) -> bool:
-    if os.environ.get("MINNI_AFM_LOOP", "").lower() == "off":
-        return False
-    return bool((getattr(config, "afm_loop_schedule", {}) or {}).get("enabled"))
+    return _runtime_afm_loop_enabled(config)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1088,433 +910,35 @@ def _afm_loop_enabled(config=DEFAULT_CONFIG) -> bool:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _maybe_archive_inbox_source(db, candidate_id: int) -> None:
-    """B1 drain-on-resolution (audit C2): once a candidate sourced from a vault
-    inbox file reaches a terminal state, move the source file into
-    ``<inbox>/.archive/`` so the file channel actually drains instead of
-    re-surfacing resolved candidates forever. Best-effort; never deletes
-    (rename only); never raises into the resolution path."""
-    try:
-        from afm_passes.inbox_archive import maybe_archive_for_candidate
-        maybe_archive_for_candidate(db, DEFAULT_CONFIG, candidate_id)
-    except Exception:
-        logger.exception(
-            "inbox archive for candidate %s failed (non-fatal)", candidate_id
-        )
+    return _runtime_maybe_archive_inbox_source(db, candidate_id, DEFAULT_CONFIG, logger)
 
 
 def _promote_candidate_durable(candidate_id: int, reason: str = "afm-consolidation"):
-    """Promote one proposed candidate into a durable, embedded learning.
-
-    Returns the new learning_id, or None if the candidate is missing or no longer
-    'proposed' (idempotent — safe to call twice). Embedding is best-effort.
-    """
-    import time as _time
-    import numpy as _np
-
-    wb = _lazy_writeback()
-    # Read + embed OUTSIDE the write txn to keep the write lock short.
-    with wb.db.cursor() as c:
-        c.execute("SELECT * FROM candidate_packets WHERE candidate_id=?", (candidate_id,))
-        row = c.fetchone()
-    if not row:
-        return None
-    cand = dict(row)
-    if cand.get("status") != "proposed":
-        return None
-    content = cand.get("content") or ""
-    agent_id = cand.get("principal") or "afm-loop"
-    try:
-        validate_agent_id(agent_id)
-    except ValueError as exc:
-        logger.warning(
-            "_promote_candidate_durable: invalid agent_id %r (%s) — skipping",
-            agent_id,
-            exc,
-        )
-        return None
-    from afm_passes.consolidation import content_hash as _content_hash
-    chash = _content_hash(content)
-
-    emb_bytes = None
-    if getattr(wb, "model", None):
-        try:
-            emb = wb.model.encode(content).astype(_np.float32)
-            emb_bytes = emb.tobytes()
-        except Exception as exc:
-            logger.warning("consolidation: embedding failed (%s) — storing without", exc)
-
-    now = _time.time()
-    with wb.db.transaction() as c:
-        # Re-check status inside the txn (closes TOCTOU with a concurrent resolve).
-        c.execute("SELECT status FROM candidate_packets WHERE candidate_id=?", (candidate_id,))
-        chk = c.fetchone()
-        if not chk or chk["status"] != "proposed":
-            return None
-        c.execute(
-            """
-            INSERT INTO learnings
-            (agent_id, category, content, source_doc_ids, source_query,
-             confidence, embedding, created_at,
-             assertion, applies_when, evidence_doc_ids, contradicts_id, status,
-             content_hash)
-            VALUES (?, 'general', ?, NULL, 'afm-consolidation',
-                    ?, ?, ?, NULL, NULL, ?, NULL, 'active', ?)
-            """,
-            (agent_id, content, 0.9, emb_bytes, now, cand.get("evidence_refs"), chash),
-        )
-        lid = c.lastrowid
-        c.execute(
-            """
-            UPDATE candidate_packets
-            SET status='accepted', resolved_at=?, resolved_by='afm-consolidation',
-                resolution_reason=?
-            WHERE candidate_id=?
-            """,
-            (now, reason[:500], candidate_id),
-        )
-        c.execute(
-            """
-            INSERT INTO consolidation_actions
-            (action_type, target_learning_id, claim, category, confidence,
-             status, detail, created_at)
-            VALUES ('afm_promote', ?, ?, 'general', ?, 'applied', ?, ?)
-            """,
-            (lid, content[:200], 0.9, reason[:500], now),
-        )
-
-    # Best-effort Obsidian markdown parity (never fatal).
-    try:
-        if wb.config.writeback_enabled:
-            wb._write_to_disk(lid, agent_id, "general", content, now)
-    except Exception as exc:
-        logger.warning("consolidation: write_to_disk failed for learning #%s (%s)", lid, exc)
-
-    logger.info("AFM consolidation promoted candidate #%d -> learning #%d", candidate_id, lid)
-    _maybe_archive_inbox_source(wb.db, candidate_id)
-    return lid
+    return _runtime_promote_candidate_durable(candidate_id, reason, _afm_context())
 
 
 def _reject_candidate_dedup(candidate_id: int) -> bool:
-    """Mark a proposed candidate rejected as a duplicate. Returns True if changed."""
-    import time as _time
-    wb = _lazy_writeback()
-    now = _time.time()
-    with wb.db.transaction() as c:
-        c.execute("SELECT status FROM candidate_packets WHERE candidate_id=?", (candidate_id,))
-        row = c.fetchone()
-        if not row or row["status"] != "proposed":
-            return False
-        c.execute(
-            """
-            UPDATE candidate_packets
-            SET status='rejected', resolved_at=?, resolved_by='afm-consolidation',
-                resolution_reason='duplicate of existing learning'
-            WHERE candidate_id=?
-            """,
-            (now, candidate_id),
-        )
-        c.execute(
-            """
-            INSERT INTO consolidation_actions
-            (action_type, claim, category, status, detail, created_at)
-            VALUES ('afm_dedup', ?, 'general', 'applied', 'duplicate of existing learning', ?)
-            """,
-            (str(candidate_id), now),
-        )
-    logger.info("AFM consolidation deduped candidate #%d (rejected)", candidate_id)
-    _maybe_archive_inbox_source(wb.db, candidate_id)
-    return True
+    return _runtime_reject_candidate_dedup(candidate_id, _afm_context())
 
 
 def _mark_candidate_review(candidate_id: int, reason: str = "afm-consolidation review") -> bool:
-    """Flag a proposed candidate for operator review without changing its status
-    (the schema CHECK only allows proposed/accepted/rejected/redacted/expired/
-    merged/superseded). The 'afm_review' marker makes the consolidation pass skip
-    it on future runs — so the drain loop progresses — while it stays 'proposed'
-    and fully resolvable by the operator. Idempotent. Returns True if newly flagged.
-    """
-    import time as _time
-    wb = _lazy_writeback()
-    now = _time.time()
-    with wb.db.transaction() as c:
-        c.execute("SELECT status FROM candidate_packets WHERE candidate_id=?", (candidate_id,))
-        row = c.fetchone()
-        if not row or row["status"] != "proposed":
-            return False
-        c.execute(
-            "SELECT 1 FROM consolidation_actions WHERE action_type='afm_review' AND claim=? LIMIT 1",
-            (str(candidate_id),),
-        )
-        if c.fetchone():
-            return False  # already flagged
-        c.execute(
-            """
-            INSERT INTO consolidation_actions
-            (action_type, claim, category, status, detail, created_at)
-            VALUES ('afm_review', ?, 'general', 'pending', ?, ?)
-            """,
-            (str(candidate_id), reason[:500], now),
-        )
-    return True
+    return _runtime_mark_candidate_review(candidate_id, reason, _afm_context())
 
 
 def _apply_consolidation_result(result: dict) -> None:
-    """Apply a consolidation pass result: durable promotes, dedup rejections,
-    and review routing. Every branch moves the candidate OUT of 'proposed'."""
-    promoted = deduped = reviewed = 0
-    for cid in (result.get("promote_candidate_ids") or []):
-        try:
-            if _promote_candidate_durable(int(cid)):
-                promoted += 1
-        except Exception:
-            logger.exception("consolidation: promote candidate %s failed", cid)
-    for cid in (result.get("dedup_candidate_ids") or []):
-        try:
-            if _reject_candidate_dedup(int(cid)):
-                deduped += 1
-        except Exception:
-            logger.exception("consolidation: dedup candidate %s failed", cid)
-    for cid in (result.get("review_candidate_ids") or []):
-        try:
-            if _mark_candidate_review(int(cid)):
-                reviewed += 1
-        except Exception:
-            logger.exception("consolidation: review-mark candidate %s failed", cid)
-    if promoted or deduped or reviewed:
-        logger.info(
-            "AFM consolidation applied: promoted=%d deduped=%d reviewed=%d",
-            promoted, deduped, reviewed,
-        )
-    result["applied"] = {"promoted": promoted, "deduped": deduped, "reviewed": reviewed}
+    return _runtime_apply_consolidation_result(result, _afm_context())
 
 
 def _handle_daemon_compile(params: dict, request_id: Any) -> dict:
-    """Run an AFM compile pass. Defaults to dry-run and never auto-accepts."""
-    global _request_count
-    _request_count += 1
-    started_at = time.perf_counter()
-
-    pass_name = str(params.get("pass_name") or "").strip()
-    if not pass_name:
-        return _make_error(-32602, "pass_name is required", request_id)
-    dry_run = bool(params.get("dry_run", True))
-    vault_path = str(params.get("vault_path") or DEFAULT_CONFIG.vault_path)
-
-    # G12: vault root binding before any AFM pass or submit_drafts (denies traversal/symlink)
-    err = _guard_vault_root(params, vault_path, request_id, label="compile")
-    if err:
-        return err
-
-    if not _afm_loop_enabled(DEFAULT_CONFIG):
-        return _make_response({
-            "status": "afm_unavailable",
-            "reason": "AFM loop disabled",
-            "pass_name": pass_name,
-            "dry_run": dry_run,
-            "drafts": [],
-            "drafts_written": [],
-        }, request_id)
-
-    try:
-        pass_runners = {
-            "session_distillation": "afm_passes.session_distillation",
-            "synthesis": "afm_passes.synthesis",
-            "procedure_extraction": "afm_passes.procedure_extraction",
-            "reorganization": "afm_passes.reorganization",
-            "pruning": "afm_passes.pruning",
-            "consolidation": "afm_passes.consolidation",
-            "vault_ingest": "afm_passes.vault_ingest",
-        }
-        if pass_name not in pass_runners:
-            return _make_error(-32602, f"unsupported pass_name: {pass_name}", request_id)
-        trace_id = f"afm-{uuid.uuid4().hex[:12]}"
-        db = SovereignDB(DEFAULT_CONFIG)
-        pass_module = __import__(pass_runners[pass_name], fromlist=["run"])
-
-        result = pass_module.run(
-            db,
-            DEFAULT_CONFIG,
-            vault_path=vault_path,
-            dry_run=dry_run,
-            trace_id=trace_id,
-        )
-        if not dry_run and result.get("drafts"):
-            from afm_writer import submit_drafts
-            write_result = submit_drafts({
-                "pass_name": pass_name,
-                "trace_id": trace_id,
-                "vault_path": vault_path,
-                "drafts": result["drafts"],
-                "writeback": _writeback,
-            })
-            result.update(write_result)
-        else:
-            result.setdefault("drafts_written", [])
-
-        # Consolidation pass: apply durable promotions + dedup rejections.
-        # No-op for passes that don't emit these keys. Skipped on dry_run.
-        if not dry_run and (
-            result.get("promote_candidate_ids")
-            or result.get("dedup_candidate_ids")
-            or result.get("review_candidate_ids")
-        ):
-            _apply_consolidation_result(result)
-
-        try:
-            _trace_ring().put(trace_id, {
-                "kind": "afm_loop",
-                "pass_name": pass_name,
-                "inputs": result.get("inputs"),
-                "prompt": result.get("prompt"),
-                "prompt_version": result.get("prompt_version"),
-                "output": result.get("output"),
-                "draft_page_ids": [draft.get("page_id") for draft in result.get("drafts", [])],
-                "dry_run": dry_run,
-            })
-        except Exception as exc:
-            logger.warning("AFM trace capture degraded: %s", exc)
-        return _make_response(result, request_id)
-    except Exception as exc:
-        logger.exception("daemon.compile failed")
-        return _make_response({
-            "status": "afm_unavailable",
-            "reason": str(exc),
-            "pass_name": pass_name,
-            "dry_run": dry_run,
-            "drafts": [],
-            "drafts_written": [],
-        }, request_id)
-    finally:
-        _record_latency("afm", time.perf_counter() - started_at)
+    return _runtime_handle_daemon_compile(params, request_id, _afm_context())
 
 
 async def _afm_loop_runner():
-    """Background scheduler for AFM passes (opt-in via MINNI_AFM_LOOP).
-
-    Ticks every idle_seconds; fires each pass when its interval has elapsed.
-    Defensive: a pass that raises is logged and skipped — it can NEVER take down
-    the socket server task. Last-run times are in-memory (reset on restart, which
-    just means each pass runs once shortly after boot — acceptable).
-    """
-    if not _afm_loop_enabled(DEFAULT_CONFIG):
-        logger.info("AFM loop disabled; runner not started.")
-        return
-    schedule = getattr(DEFAULT_CONFIG, "afm_loop_schedule", {}) or {}
-    idle_seconds = int(schedule.get("idle_seconds", 300))
-    passes_cfg = schedule.get("passes") or {}
-    last_run = {name: 0.0 for name in passes_cfg}
-    logger.info(
-        "AFM loop runner started: passes=%s idle=%ds",
-        list(passes_cfg.keys()), idle_seconds,
-    )
-    await asyncio.sleep(min(30, idle_seconds))  # let startup settle
-    while _running:
-        now = time.time()
-        for name, cfg in passes_cfg.items():
-            interval = int((cfg or {}).get("interval_seconds", 24 * 60 * 60))
-            if now - last_run.get(name, 0.0) < interval:
-                continue
-            try:
-                logger.info("AFM loop: running pass '%s'", name)
-                params = {
-                    "pass_name": name,
-                    "dry_run": False,
-                    "vault_path": DEFAULT_CONFIG.vault_path,
-                }
-                # Consolidation drains in a loop until the proposed queue is empty
-                # or a per-tick batch budget is hit — clears bursts (swarms) instead
-                # of trickling one batch per interval. Every batch resolves all its
-                # examined candidates (accept/reject/needs_review), so it strictly
-                # makes progress and cannot spin.
-                if name == "consolidation":
-                    # Drain the inbox stop-candidate channel into candidate_packets
-                    # BEFORE the consolidation drain, so freshly-ingested 'proposed'
-                    # rows are triaged in the same tick. Idempotent, respects
-                    # log_only/do_not_store, never deletes. Failure here must NOT
-                    # block consolidation of the existing queue.
-                    if (cfg or {}).get("ingest_inbox", True):
-                        try:
-                            from afm_passes.inbox_ingest import ingest as _ingest_inbox
-                            # Reuse the daemon's shared handle: SovereignDB
-                            # connections are thread-local and only released
-                            # by close(), so a fresh instance per tick leaks
-                            # one connection per tick in this loop.
-                            _ing_db = _lazy_writeback().db
-                            _ing = _ingest_inbox(
-                                _ing_db, DEFAULT_CONFIG,
-                                fallback_principal=str((cfg or {}).get(
-                                    "inbox_fallback_principal", "unknown")),
-                                dry_run=False,
-                            )
-                            if _ing.get("inserted"):
-                                logger.info(
-                                    "AFM loop: inbox ingest -> %d new candidate(s) "
-                                    "(eligible=%d already=%d)",
-                                    _ing["inserted"], _ing["eligible"],
-                                    _ing["already_present"],
-                                )
-                            # B4: surface kind-gate drops to the audit channel
-                            # instead of silently skipping whole channels.
-                            _skips = _ing.get("skipped_by_kind") or {}
-                            if any(_skips.values()):
-                                logger.info(
-                                    "AFM loop: inbox ingest skipped_by_kind=%s",
-                                    _skips,
-                                )
-                        except Exception:
-                            logger.exception(
-                                "AFM loop: inbox ingest raised (skipped; "
-                                "consolidation continues)")
-                    max_batches = int((cfg or {}).get("max_batches_per_tick", 40))
-                    batches = total_examined = 0
-                    last_summ = None
-                    while batches < max_batches:
-                        res = _handle_daemon_compile(params, request_id=None)
-                        last_summ = (res.get("result") or {}).get("summary") if isinstance(res, dict) else None
-                        batches += 1
-                        examined = (last_summ or {}).get("examined", 0)
-                        total_examined += examined
-                        if examined == 0:
-                            break
-                        await asyncio.sleep(0)  # yield to the server task between batches
-                    logger.info(
-                        "AFM loop: consolidation drained %d batch(es), %d candidate(s); last=%s",
-                        batches, total_examined, last_summ,
-                    )
-                else:
-                    res = _handle_daemon_compile(params, request_id=None)
-                    summ = (res.get("result") or {}).get("summary") if isinstance(res, dict) else None
-                    logger.info("AFM loop: pass '%s' done: %s", name, summ)
-            except Exception:
-                logger.exception("AFM loop: pass '%s' raised (skipped)", name)
-            last_run[name] = time.time()
-        await asyncio.sleep(idle_seconds)
-    logger.info("AFM loop runner stopped.")
+    return await _runtime_afm_loop_runner(_afm_context())
 
 
 def _handle_daemon_endorse(params: dict, request_id: Any) -> dict:
-    """Endorse a draft page by page_id. Accept/reject/edit only."""
-    global _request_count
-    _request_count += 1
-    page_id = str(params.get("page_id") or "").strip()
-    decision = str(params.get("decision") or "").strip()
-    if not page_id:
-        return _make_error(-32602, "page_id is required", request_id)
-    if decision not in {"accept", "reject", "edit"}:
-        return _make_error(-32602, "decision must be accept, reject, or edit", request_id)
-    vault_path = str(params.get("vault_path") or DEFAULT_CONFIG.vault_path)
-
-    # G12: vault root binding (endorse touches the vault wiki); realpath + principal allowlist
-    err = _guard_vault_root(params, vault_path, request_id, label="endorse")
-    if err:
-        return err
-
-    try:
-        from afm_writer import endorse_draft
-        return _make_response(endorse_draft(vault_path, page_id, decision), request_id)
-    except Exception as exc:
-        logger.warning("daemon.endorse failed: %s", exc)
-        return _make_error(-32000, f"Endorse error: {exc}", request_id)
+    return _runtime_handle_daemon_endorse(params, request_id, _afm_context())
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1539,139 +963,42 @@ def _explicitly_allowed_operator(principal: EffectivePrincipal) -> bool:
 def _resolve_candidate(params: dict, request_id: Any) -> dict:
     return _runtime_resolve_candidate(params, request_id, _governance_context())
 
+
+def _ax_context() -> AXContext:
+    return AXContext(
+        make_error=_make_error,
+        make_response=_make_response,
+        handler_principal=_handler_principal,
+        lazy_writeback=_lazy_writeback,
+        logger=logger,
+    )
+
+
 def _handle_ax_snapshot_store(params: dict, request_id: Any) -> dict:
-    from ax_memory import AXMemory
-    principal, err = _handler_principal(params, request_id)
-    if err:
-        return err
-    agent_id = principal.agent_id
-    app_name = str(params.get("app_name", "")).strip()
-    tree_json = str(params.get("tree_json", ""))
-    
-    if not app_name or not tree_json:
-        return _make_error(-32602, "app_name and tree_json are required", request_id)
-        
-    try:
-        # Shared daemon handle — per-call SovereignDB() instances leak their
-        # thread-local connection (only close() releases it).
-        db = _lazy_writeback().db
-        ax = AXMemory(db)
-        snapshot_id = ax.add_snapshot(
-            agent_id=agent_id,
-            app_name=app_name,
-            tree_json=tree_json,
-            ttl_seconds=params.get("ttl_seconds", 3600)
-        )
-        return _make_response({"snapshot_id": snapshot_id}, request_id)
-    except Exception as exc:
-        logger.exception("ax_snapshot_store failed")
-        return _make_error(-32000, f"ax_snapshot_store error: {exc}", request_id)
+    return _runtime_handle_ax_snapshot_store(params, request_id, _ax_context())
+
 
 def _handle_ax_snapshot_get(params: dict, request_id: Any) -> dict:
-    from ax_memory import AXMemory
-    principal, err = _handler_principal(params, request_id)
-    if err:
-        return err
-    agent_id = principal.agent_id
-    app_name = params.get("app_name")
-        
-    try:
-        db = _lazy_writeback().db
-        ax = AXMemory(db)
-        snapshot = ax.get_latest_snapshot(agent_id=agent_id, app_name=app_name)
-        return _make_response({"snapshot": snapshot}, request_id)
-    except Exception as exc:
-        logger.exception("ax_snapshot_get failed")
-        return _make_error(-32000, f"ax_snapshot_get error: {exc}", request_id)
+    return _runtime_handle_ax_snapshot_get(params, request_id, _ax_context())
+
+
+def _vault_index_context() -> VaultIndexContext:
+    return VaultIndexContext(
+        make_error=_make_error,
+        make_response=_make_response,
+        make_mismatch_error=make_mismatch_error,
+        handler_principal=_handler_principal,
+        guard_vault_root=_guard_vault_root,
+        lazy_retrieval=_lazy_retrieval,
+        agent_vault=_agent_vault,
+        record_latency=_record_latency,
+        increment_request_count=_increment_ops_request_count,
+        logger=logger,
+    )
 
 
 def _handle_vault_index_doc(params: dict, request_id: Any) -> dict:
-    """Index a vault page into the semantic recall index without going through
-    the learn/candidate governance pipeline.
-
-    M-4 fix: minni_vault_write writes a page to disk but did NOT trigger the
-    recall bridge, so vault_write content was NOT semantically recall-able until
-    a separate VaultIndexer run. This RPC lets the TypeScript MCP handler call
-    ``vault_index_doc`` immediately after writing, matching the instant-recall
-    semantics of ``learn`` (which calls index_durable_document on promote).
-
-    Params (all required unless noted):
-        content    — full page content (markdown, including frontmatter if any)
-        path       — relative path within the vault (e.g. "wiki/sessions/foo.md")
-        agent      — agent_id owning this document
-        sigil      — optional emoji sigil (default "❓")
-        privacy_level — optional, default "safe"
-        page_status   — optional, default "accepted"
-        layer      — optional, default "knowledge"
-
-    Returns {"status": "ok", "doc_id": <int>, "chunks": <int>} on success.
-    FAIL-OPEN: engine errors are caught internally (never raises); returns an
-    error envelope only for missing required params.
-    """
-    global _request_count
-    _request_count += 1
-    started_at = time.perf_counter()
-
-    principal, err = _handler_principal(params, request_id)
-    if err:
-        return err
-
-    content = params.get("content", "")
-    path = params.get("path", "")
-    wire_agent = str(params.get("agent", "")).strip()
-    if wire_agent and wire_agent != principal.agent_id:
-        return make_mismatch_error(wire_agent, principal.agent_id, request_id)
-    agent = principal.agent_id
-
-    if not content:
-        return _make_error(-32602, "content is required", request_id)
-    if not path:
-        return _make_error(-32602, "path is required", request_id)
-
-    rel_path = str(path).replace("\\", "/").lstrip("/")
-    if not rel_path or ".." in Path(rel_path).parts:
-        return _make_error(-32602, "path must be a relative path within the vault", request_id)
-
-    vault_path = params.get("vault_path")
-    if not vault_path:
-        vault_path, _ = _agent_vault(principal.agent_id)
-    vault_path = str(vault_path)
-    full_path = Path(vault_path).resolve() / rel_path
-    root_err = _guard_vault_root(params, full_path, request_id, label="vault_index_doc")
-    if root_err:
-        return root_err
-
-    # SEC-015-style size cap: vault pages capped at 256 KiB (larger than learn
-    # which is 64 KiB, because vault pages include rich frontmatter + prose).
-    _MAX_VAULT_PAGE_CHARS = 256 * 1024
-    if len(content) > _MAX_VAULT_PAGE_CHARS:
-        return _make_error(
-            -32602,
-            f"vault_index_doc content exceeds {_MAX_VAULT_PAGE_CHARS} chars",
-            request_id,
-        )
-
-    sigil = str(params.get("sigil", "❓"))
-    privacy_level = str(params.get("privacy_level", "safe"))
-    page_status = str(params.get("page_status", "accepted"))
-    layer = str(params.get("layer", "knowledge"))
-
-    try:
-        engine = _lazy_retrieval()
-        result = engine.index_durable_document(
-            content=content,
-            path=rel_path,
-            agent=agent,
-            sigil=sigil,
-            privacy_level=privacy_level,
-            page_status=page_status,
-            layer=layer,
-        )
-        _record_latency("vault_index_doc", time.perf_counter() - started_at)
-        return _make_response(result, request_id)
-    except Exception as exc:
-        logger.exception("vault_index_doc failed")
-        return _make_error(-32000, f"vault_index_doc error: {exc}", request_id)
+    return _runtime_handle_vault_index_doc(params, request_id, _vault_index_context())
 
 
 # Method registry

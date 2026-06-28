@@ -273,3 +273,67 @@ def test_governance_domain_lives_in_runtime_module_and_registry_delegates():
     assert minnid._METHODS["stage_candidate"] is minnid._stage_candidate
     assert minnid._METHODS["list_candidates"] is minnid._list_candidates
     assert minnid._METHODS["resolve_candidate"] is minnid._resolve_candidate
+
+
+def test_operational_domains_live_in_runtime_modules_and_registry_delegates():
+    import minnid
+    from minnid_runtime.afm import (
+        AFMContext,
+        afm_loop_enabled,
+        afm_loop_runner,
+        apply_consolidation_result,
+        handle_daemon_compile,
+        handle_daemon_endorse,
+        mark_candidate_review,
+        maybe_archive_inbox_source,
+        promote_candidate_durable,
+        reject_candidate_dedup,
+    )
+    from minnid_runtime.ax import AXContext, handle_ax_snapshot_get, handle_ax_snapshot_store
+    from minnid_runtime.health import (
+        HealthContext,
+        faiss_cache_age_seconds,
+        faiss_cache_status,
+        handle_health_report,
+        handle_hygiene_report,
+        handle_status,
+    )
+    from minnid_runtime.vault_index import (
+        MAX_VAULT_PAGE_CHARS,
+        VaultIndexContext,
+        handle_vault_index_doc,
+    )
+
+    assert isinstance(minnid._health_context(), HealthContext)
+    assert minnid._runtime_handle_status is handle_status
+    assert minnid._runtime_handle_health_report is handle_health_report
+    assert minnid._runtime_handle_hygiene_report is handle_hygiene_report
+    assert minnid._runtime_faiss_cache_status is faiss_cache_status
+    assert minnid._runtime_faiss_cache_age_seconds is faiss_cache_age_seconds
+    assert minnid._METHODS["status"] is minnid._handle_status
+    assert minnid._METHODS["health_report"] is minnid._handle_health_report
+    assert minnid._METHODS["hygiene_report"] is minnid._handle_hygiene_report
+
+    assert isinstance(minnid._afm_context(), AFMContext)
+    assert minnid._runtime_afm_loop_enabled is afm_loop_enabled
+    assert minnid._runtime_afm_loop_runner is afm_loop_runner
+    assert minnid._runtime_apply_consolidation_result is apply_consolidation_result
+    assert minnid._runtime_handle_daemon_compile is handle_daemon_compile
+    assert minnid._runtime_handle_daemon_endorse is handle_daemon_endorse
+    assert minnid._runtime_maybe_archive_inbox_source is maybe_archive_inbox_source
+    assert minnid._runtime_promote_candidate_durable is promote_candidate_durable
+    assert minnid._runtime_reject_candidate_dedup is reject_candidate_dedup
+    assert minnid._runtime_mark_candidate_review is mark_candidate_review
+    assert minnid._METHODS["daemon.compile"] is minnid._handle_daemon_compile
+    assert minnid._METHODS["daemon.endorse"] is minnid._handle_daemon_endorse
+
+    assert isinstance(minnid._ax_context(), AXContext)
+    assert minnid._runtime_handle_ax_snapshot_store is handle_ax_snapshot_store
+    assert minnid._runtime_handle_ax_snapshot_get is handle_ax_snapshot_get
+    assert minnid._METHODS["ax_snapshot_store"] is minnid._handle_ax_snapshot_store
+    assert minnid._METHODS["ax_snapshot_get"] is minnid._handle_ax_snapshot_get
+
+    assert isinstance(minnid._vault_index_context(), VaultIndexContext)
+    assert minnid._MAX_VAULT_PAGE_CHARS == MAX_VAULT_PAGE_CHARS
+    assert minnid._runtime_handle_vault_index_doc is handle_vault_index_doc
+    assert minnid._METHODS["vault_index_doc"] is minnid._handle_vault_index_doc
