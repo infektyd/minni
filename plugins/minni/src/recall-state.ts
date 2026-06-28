@@ -255,12 +255,13 @@ export async function markRecallConsumed(vaultPath: string): Promise<boolean> {
     const tmpPath = `${filePath}.tmp-${process.pid}-${Date.now()}-${Math.random()
       .toString(36)
       .slice(2)}`;
-    await writeFile(tmpPath, JSON.stringify(parsed, null, 2), "utf8");
     try {
+      await writeFile(tmpPath, JSON.stringify(parsed, null, 2), "utf8");
       await rename(tmpPath, filePath);
-    } catch (renameErr) {
+    } catch (writeErr) {
+      // Never leak the temp sibling — a failed write OR rename must clean up.
       await rm(tmpPath, { force: true }).catch(() => {});
-      throw renameErr;
+      throw writeErr;
     }
     return true;
   } catch {

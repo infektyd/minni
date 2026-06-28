@@ -303,11 +303,11 @@ struct TriageRulesTool: Tool {
         let secretWords = #"\b(password|secret|token|credential|hunter2)\b"#
         let secretPhrases = ["api key", "private key", "sk-"]
         let isSecret = t.range(of: secretWords, options: .regularExpression) != nil
-            || secretPhrases.contains(where: t.contains)
+            || secretPhrases.contains { t.contains($0) }
         let smalltalk = ["weather", "how are you", "good morning", "good night", "thanks", "lol", "haha", "nice day", "hello there"]
         let decision: String
         if isSecret { decision = "redact" }
-        else if smalltalk.contains(where: t.contains) { decision = "reject" }
+        else if smalltalk.contains(where: { t.contains($0) }) { decision = "reject" }
         else { decision = "accept" }
         TriageState.shared.lastDecision = decision   // ground truth captured for the helper
         return decision

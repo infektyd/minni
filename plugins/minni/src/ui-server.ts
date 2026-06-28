@@ -1,6 +1,6 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { execFile } from "node:child_process";
-import { timingSafeEqual } from "node:crypto";
+import { createHash, timingSafeEqual } from "node:crypto";
 import { access, readdir, readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
@@ -119,17 +119,14 @@ function fetchSiteAllowed(value: string | undefined): boolean {
 }
 
 // Constant-time string comparison (PR91-7). timingSafeEqual requires equal-length
-// buffers and throws otherwise, so on a length mismatch we run a dummy compare to
-// keep the timing profile flat and return false. Token length is the only thing a
-// length-based timing signal could leak, which is acceptable.
+// buffers, so we first hash both inputs to fixed-length SHA-256 digests and
+// compare those: the comparison is constant-time AND leaks nothing about the
+// token's length (an early length-mismatch return would have been a timing
+// oracle on length). Equal strings -> equal digests -> true.
 function safeStrEqual(a: string, b: string): boolean {
-  const ab = Buffer.from(a, "utf8");
-  const bb = Buffer.from(b, "utf8");
-  if (ab.length !== bb.length) {
-    timingSafeEqual(bb, bb);
-    return false;
-  }
-  return timingSafeEqual(ab, bb);
+  const ah = createHash("sha256").update(a, "utf8").digest();
+  const bh = createHash("sha256").update(b, "utf8").digest();
+  return timingSafeEqual(ah, bh);
 }
 
 function consoleAuthRequired(pathname: string): boolean {

@@ -25,7 +25,12 @@ import tempfile
 _LIVE_MINNI_HOME = os.path.abspath(os.path.expanduser("~/.minni"))
 _configured_home = os.environ.get("MINNI_HOME")
 if not _configured_home or os.path.abspath(_configured_home) == _LIVE_MINNI_HOME:
-    os.environ["MINNI_HOME"] = tempfile.mkdtemp(prefix="minni-test-home-")
+    _session_home = tempfile.mkdtemp(prefix="minni-test-home-")
+    os.environ["MINNI_HOME"] = _session_home
+    # Don't leak the throwaway dir in the system tmp folder across runs.
+    import atexit
+    import shutil
+    atexit.register(shutil.rmtree, _session_home, ignore_errors=True)
 
 import pytest  # noqa: E402  (import after MINNI_HOME redirect, by design)
 
