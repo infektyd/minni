@@ -297,10 +297,12 @@ struct TriageRulesTool: Tool {
     func call(arguments: Arguments) async throws -> String {
         let t = arguments.text.lowercased()
         // PR84-6: single-word secret indicators match at a WORD BOUNDARY so
-        // "token" fires on "access token" but NOT on "tokenization". Multi-word /
+        // "token" fires on "access token"/"tokens" but NOT on "tokenization".
+        // The `s?` keeps plurals (tokens/passwords/secrets/credentials) matching —
+        // a plain \bword\b regressed those vs the old substring check. Multi-word /
         // prefix patterns ("api key", "private key", "sk-") stay substring checks
         // because they are already distinctive.
-        let secretWords = #"\b(password|secret|token|credential|hunter2)\b"#
+        let secretWords = #"\b(passwords?|secrets?|tokens?|credentials?|hunter2)\b"#
         let secretPhrases = ["api key", "private key", "sk-"]
         let isSecret = t.range(of: secretWords, options: .regularExpression) != nil
             || secretPhrases.contains { t.contains($0) }

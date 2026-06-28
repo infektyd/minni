@@ -121,3 +121,28 @@ def test_diff_prune_scoped_to_wikilinks_preserves_other_edges(tmp_path):
     assert by_type["derived_from"]["target"] == gamma
     assert by_type["derived_from"]["created_at"] == 500.0
     assert by_type["wikilink"]["created_at"] == 1000.0
+
+
+def _prune_all_battery(tmp_path, index_fn):
+    """codex review: a re-index where EVERY wikilink became unresolvable
+    (target renamed/deleted, [[old]] -> [[missing]]) must still prune the now
+    -stale edges — earlier the wiki path early-returned before the prune."""
+    db = _make_db(tmp_path)
+    alpha, beta, gamma, target_map = _setup(db)
+
+    index_fn(db, alpha, ["beta", "gamma"], target_map, 1000.0)
+    with db.cursor() as c:
+        assert len(_links(c, alpha)) == 2
+
+    # All wikilinks now point at unresolvable targets (not in target_map).
+    index_fn(db, alpha, ["ghost-one", "ghost-two"], target_map, 2000.0)
+    with db.cursor() as c:
+        assert _links(c, alpha) == [], "stale wikilinks must be pruned when no target resolves"
+
+
+def test_wiki_indexer_prunes_when_all_targets_unresolvable(tmp_path):
+    _prune_all_battery(tmp_path, _index_wiki)
+
+
+def test_vault_ingest_prunes_when_all_targets_unresolvable(tmp_path):
+    _prune_all_battery(tmp_path, _index_vault)

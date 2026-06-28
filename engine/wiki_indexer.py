@@ -538,20 +538,18 @@ class WikiIndexer:
         """
         link_count = 0
 
-        # Phase 1: Collect and deduplicate valid target paths
-        target_paths = set()
-        for link_target in wikilinks:
-            target_path = target_map.get(link_target)
-            if target_path:
-                target_paths.add(target_path)
-
-        if not target_paths:
-            return 0
+        # Phase 1: Collect and deduplicate valid target paths. NOTE: we do NOT
+        # early-return on an empty set — a page whose wikilinks all became
+        # unresolvable (target renamed/deleted, [[old]] -> [[missing]]) still
+        # needs its now-stale edges pruned below.
+        target_paths = list({
+            target_map[link_target]
+            for link_target in wikilinks
+            if target_map.get(link_target)
+        })
 
         # Phase 2: Batch query target doc_ids (chunked to stay under SQLite limits)
-        target_paths = list(target_paths)
         target_doc_ids = set()
-
         for i in range(0, len(target_paths), 500):
             batch = target_paths[i:i + 500]
             placeholders = ",".join(["?"] * len(batch))
@@ -562,24 +560,27 @@ class WikiIndexer:
             for row in cursor.fetchall():
                 target_doc_ids.add(row["doc_id"])
 
-        # Phase 3: Diff-based update. Keep-set = valid targets minus self.
-        keep_ids = {tid for tid in target_doc_ids if tid != source_doc_id}
-
-        # Prune ONLY stale wikilinks for this source (targets no longer present).
+        # Phase 3: Diff-based prune. Keep-set = valid targets minus self. Compute
+        # which existing wikilink edges are now stale (existing - keep) and delete
+        # only those, in chunks — this runs even when keep_ids is empty (all links
+        # gone) and never builds an unbounded NOT IN list (SQLite var limit).
         # Scoped to link_type='wikilink' so other edge types (derived_from)
-        # survive a re-index, and so surviving wikilinks keep their created_at via
-        # the upsert below (PR94-1 — a blunt delete-before-insert defeated that).
-        if keep_ids:
-            ph = ",".join(["?"] * len(keep_ids))
+        # survive a re-index; surviving links keep created_at via the upsert below.
+        keep_ids = {tid for tid in target_doc_ids if tid != source_doc_id}
+        cursor.execute(
+            "SELECT target_doc_id FROM memory_links "
+            "WHERE source_doc_id = ? AND link_type = 'wikilink'",
+            (source_doc_id,),
+        )
+        existing_ids = {row["target_doc_id"] for row in cursor.fetchall()}
+        stale_ids = list(existing_ids - keep_ids)
+        for i in range(0, len(stale_ids), 500):
+            batch = stale_ids[i:i + 500]
+            placeholders = ",".join(["?"] * len(batch))
             cursor.execute(
                 "DELETE FROM memory_links WHERE source_doc_id = ? "
-                f"AND link_type = 'wikilink' AND target_doc_id NOT IN ({ph})",
-                (source_doc_id, *keep_ids),
-            )
-        else:
-            cursor.execute(
-                "DELETE FROM memory_links WHERE source_doc_id = ? AND link_type = 'wikilink'",
-                (source_doc_id,),
+                f"AND link_type = 'wikilink' AND target_doc_id IN ({placeholders})",
+                (source_doc_id, *batch),
             )
 
         # One row per unique target (PR94-3: removed the duplicate append that
