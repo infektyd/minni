@@ -239,3 +239,37 @@ def test_recall_domain_lives_in_runtime_module_and_registry_delegates():
     assert minnid._METHODS["sm_drill"] is minnid._handle_sm_drill
     assert minnid._METHODS["sm_export_pack"] is minnid._handle_sm_export_pack
     assert minnid._METHODS["read"] is minnid._handle_read
+
+
+def test_governance_domain_lives_in_runtime_module_and_registry_delegates():
+    import minnid
+    from minnid_runtime.governance import (
+        GovernanceContext,
+        extract_assertion,
+        handle_learn,
+        handle_log_event,
+        handle_resolve_contradiction,
+        handle_subscribe_contradictions,
+        list_candidates,
+        resolve_candidate,
+        stage_candidate,
+    )
+
+    context = minnid._governance_context()
+
+    assert isinstance(context, GovernanceContext)
+    assert minnid._runtime_handle_learn is handle_learn
+    assert minnid._runtime_handle_log_event is handle_log_event
+    assert minnid._runtime_handle_resolve_contradiction is handle_resolve_contradiction
+    assert minnid._runtime_handle_subscribe_contradictions is handle_subscribe_contradictions
+    assert minnid._runtime_stage_candidate is stage_candidate
+    assert minnid._runtime_list_candidates is list_candidates
+    assert minnid._runtime_resolve_candidate is resolve_candidate
+    assert minnid._runtime_extract_assertion is extract_assertion
+    assert minnid._METHODS["learn"] is minnid._handle_learn
+    assert minnid._METHODS["resolve_contradiction"] is minnid._handle_resolve_contradiction
+    assert minnid._METHODS["minni_subscribe_contradictions"] is minnid._handle_subscribe_contradictions
+    assert minnid._METHODS["log_event"] is minnid._handle_log_event
+    assert minnid._METHODS["stage_candidate"] is minnid._stage_candidate
+    assert minnid._METHODS["list_candidates"] is minnid._list_candidates
+    assert minnid._METHODS["resolve_candidate"] is minnid._resolve_candidate
