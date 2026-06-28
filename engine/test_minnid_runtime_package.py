@@ -195,3 +195,47 @@ def test_handoff_domain_lives_in_runtime_module_and_registry_delegates():
     assert minnid._METHODS["minni_ack_handoff"] is minnid._handle_ack_handoff
     assert minnid._METHODS["minni_list_pending_handoffs"] is minnid._handle_list_pending_handoffs
     assert minnid._METHODS["minni_await_handoff"] is minnid._handle_await_handoff
+
+
+def test_recall_domain_lives_in_runtime_module_and_registry_delegates():
+    import minnid
+    from minnid_runtime.recall import (
+        RecallContext,
+        anchor_for_result,
+        expand_reference,
+        handle_expand,
+        handle_feedback,
+        handle_read,
+        handle_search,
+        handle_sm_drill,
+        handle_sm_export_pack,
+        handle_trace,
+        merge_document_results,
+        resolve_backend,
+        resolve_document_scope,
+        tag_document_results,
+    )
+
+    context = minnid._recall_context()
+
+    assert isinstance(context, RecallContext)
+    assert minnid._runtime_handle_search is handle_search
+    assert minnid._runtime_handle_feedback is handle_feedback
+    assert minnid._runtime_handle_trace is handle_trace
+    assert minnid._runtime_handle_expand is handle_expand
+    assert minnid._runtime_handle_sm_drill is handle_sm_drill
+    assert minnid._runtime_handle_sm_export_pack is handle_sm_export_pack
+    assert minnid._runtime_handle_read is handle_read
+    assert minnid._runtime_tag_document_results is tag_document_results
+    assert minnid._runtime_merge_document_results is merge_document_results
+    assert minnid._runtime_resolve_document_scope is resolve_document_scope
+    assert minnid._runtime_resolve_backend is resolve_backend
+    assert minnid._runtime_expand_reference is expand_reference
+    assert minnid._runtime_anchor_for_result is anchor_for_result
+    assert minnid._METHODS["search"] is minnid._handle_search
+    assert minnid._METHODS["feedback"] is minnid._handle_feedback
+    assert minnid._METHODS["trace"] is minnid._handle_trace
+    assert minnid._METHODS["expand"] is minnid._handle_expand
+    assert minnid._METHODS["sm_drill"] is minnid._handle_sm_drill
+    assert minnid._METHODS["sm_export_pack"] is minnid._handle_sm_export_pack
+    assert minnid._METHODS["read"] is minnid._handle_read
