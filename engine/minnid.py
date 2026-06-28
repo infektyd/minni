@@ -99,6 +99,26 @@ from principal import (                                     # noqa: E402  # G11 
     validate_agent_id,
 )
 from minnid_runtime.dispatch import DispatchContext, dispatch_request  # noqa: E402
+from minnid_runtime.handoff import (  # noqa: E402
+    AUDIT_DETAIL_BLOCK_MAX as _AUDIT_DETAIL_BLOCK_MAX,
+    AUDIT_DETAIL_LINE_MAX as _AUDIT_DETAIL_LINE_MAX,
+    AUDIT_SUMMARY_MAX as _AUDIT_SUMMARY_MAX,
+    HANDOFF_KINDS as _HANDOFF_KINDS,
+    agent_env_key as _agent_env_key,
+    agent_vault as _agent_vault,
+    append_handoff_audit as _append_handoff_audit,
+    compile_handoff_page as _compile_handoff_page,
+    default_agent_vault as _default_agent_vault,
+    ensure_handoff_vault as _ensure_handoff_vault,
+    escape_audit_details_block as _escape_audit_details_block,
+    escape_audit_field as _escape_audit_field,
+    iso_from_epoch as _iso_from_epoch,
+    known_agent_vaults as _known_agent_vaults,
+    parse_iso_ts as _parse_iso_ts,
+    slugify as _slugify,
+    validate_handoff_packet as _validate_handoff_packet,
+    write_json as _write_json,
+)
 from minnid_runtime.provenance import (  # noqa: E402
     RECOVERY_ALLOWED_METHODS,
     RPC_CAPABILITY_REQUIREMENTS as _RPC_CAPABILITY_REQUIREMENTS,
@@ -110,6 +130,7 @@ from minnid_runtime.provenance import (  # noqa: E402
     recover,
     resolve_provenance,
 )
+from minnid_runtime.redaction import redact_text as _redact_text, redact_value as _redact_value  # noqa: E402
 from minnid_runtime.rpc import make_error as _make_error, make_response as _make_response  # noqa: E402
 from minnid_runtime.transport import SOCKET_BODY_LIMIT as _SOCKET_BODY_LIMIT, parse_request as _parse_request  # noqa: E402
 
@@ -455,283 +476,6 @@ _start_time = 0.0
 _request_count = 0
 _LATENCY_METHODS = ("search", "learn", "read", "embedding", "cross_encoder", "afm")
 _latencies = {name: deque(maxlen=100) for name in _LATENCY_METHODS}
-
-
-_HANDOFF_KINDS = frozenset({"handoff", "candidate_learning", "request", "answer"})
-_SECRET_PATTERNS = [
-    re.compile(r"(?i)\b(api[_-]?key|password|secret|credential|private[_ -]?key)\b\s*[:=]\s*([^\s,;<>\"']+)"),
-    re.compile(r"(?i)\b(bearer|access[_-]?token|refresh[_-]?token|token)\b\s*[:=]\s*([^\s,;<>\"']+)"),
-    re.compile(r"(?i)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----", re.DOTALL),
-]
-_LOCAL_PATH_PATTERN = re.compile(r"(?<!\w)(?:/Users/[^ \n\r\t\"'<>]+|/Volumes/[^ \n\r\t\"'<>]+|/private/[^ \n\r\t\"'<>]+)")
-
-
-def _redact_text(text: str) -> tuple[str, bool]:
-    redacted = text
-    changed = False
-    for pattern in _SECRET_PATTERNS:
-        if pattern.search(redacted):
-            if pattern.groups >= 2:
-                redacted = pattern.sub(lambda m: f"{m.group(1)}=[REDACTED]", redacted)
-            else:
-                redacted = pattern.sub("[REDACTED]", redacted)
-            changed = True
-    if _LOCAL_PATH_PATTERN.search(redacted):
-        redacted = _LOCAL_PATH_PATTERN.sub("[REDACTED_PATH]", redacted)
-        changed = True
-    return redacted, changed
-
-
-def _redact_value(value: Any) -> tuple[Any, bool]:
-    if isinstance(value, str):
-        return _redact_text(value)
-    if isinstance(value, list):
-        items = []
-        changed = False
-        for item in value:
-            redacted, item_changed = _redact_value(item)
-            items.append(redacted)
-            changed = changed or item_changed
-        return items, changed
-    if isinstance(value, dict):
-        obj = {}
-        changed = False
-        for key, item in value.items():
-            redacted, item_changed = _redact_value(item)
-            obj[key] = redacted
-            changed = changed or item_changed
-        return obj, changed
-    return value, False
-
-
-def _agent_env_key(agent_id: str) -> str:
-    return re.sub(r"[^A-Z0-9]+", "_", agent_id.upper()).strip("_")
-
-
-def _default_agent_vault(agent_id: str) -> Path:
-    aliases = {
-        "claude-code": "claudecode",
-        "claudecode": "claudecode",
-        "codex": "codex",
-        "hermes": "hermes",
-        "openclaw": "openclaw",
-        # Preserve hyphenated canonical slugs (the strip fallback would map
-        # grok-build -> grokbuild-vault, which the Grok overlay never polls).
-        "grok-build": "grok-build",
-        "grok-beta": "grok-beta",
-        "grok": "grok",
-    }
-    slug = aliases.get(agent_id, re.sub(r"[^a-z0-9]+", "", agent_id.lower()) or "agent")
-    return Path(CANONICAL_SOVEREIGN_HOME) / f"{slug}-vault"
-
-
-def _agent_vault(agent_id: str) -> tuple[Path, bool]:
-    mapping_raw = os.environ.get("MINNI_AGENT_VAULTS", "")
-    if mapping_raw:
-        try:
-            mapping = json.loads(mapping_raw)
-            if isinstance(mapping, dict) and agent_id in mapping:
-                return Path(os.path.expanduser(str(mapping[agent_id]))), True
-        except json.JSONDecodeError:
-            logger.warning("Invalid MINNI_AGENT_VAULTS JSON; using defaults")
-
-    env_key = f"MINNI_{_agent_env_key(agent_id)}_VAULT_PATH"
-    if os.environ.get(env_key):
-        return Path(os.path.expanduser(os.environ[env_key])), True
-    return _default_agent_vault(agent_id), False
-
-
-def _ensure_handoff_vault(vault_path: Path) -> None:
-    for rel in (
-        "raw",
-        "wiki",
-        "wiki/handoffs",
-        "schema",
-        "logs",
-        "inbox",
-        "outbox",
-    ):
-        (vault_path / rel).mkdir(parents=True, exist_ok=True)
-    log_path = vault_path / "log.md"
-    if not log_path.exists():
-        log_path.write_text("# Minni Log\n\n", encoding="utf-8")
-    index_path = vault_path / "index.md"
-    if not index_path.exists():
-        index_path.write_text("# Minni Index\n\n", encoding="utf-8")
-
-
-def _slugify(text: str) -> str:
-    slug = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
-    return slug[:80] or "handoff"
-
-
-def _write_json(path: Path, data: dict) -> None:
-    path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-
-
-def _parse_iso_ts(value: Optional[str]) -> Optional[float]:
-    if not value:
-        return None
-    try:
-        from datetime import datetime, timezone
-        text = value.replace("Z", "+00:00")
-        return datetime.fromisoformat(text).astimezone(timezone.utc).timestamp()
-    except Exception:
-        return None
-
-
-def _iso_from_epoch(epoch: float) -> str:
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(epoch))
-
-
-def _known_agent_vaults() -> list[Path]:
-    vaults = []
-    mapping_raw = os.environ.get("MINNI_AGENT_VAULTS", "")
-    if mapping_raw:
-        try:
-            mapping = json.loads(mapping_raw)
-            if isinstance(mapping, dict):
-                vaults.extend(Path(os.path.expanduser(str(v))) for v in mapping.values())
-        except json.JSONDecodeError:
-            pass
-    # Resolve at call time (matches config.py providers/secrets pattern) so
-    # MINNI_HOME overrides are honored without hardcoding ~/.minni.
-    root = Path(os.environ.get("MINNI_HOME", os.path.expanduser("~/.minni")))
-    if root.exists():
-        vaults.extend(root.glob("*-vault"))
-    return list(dict.fromkeys(vaults))
-
-
-# SEC-014: caps for audit-log fields. Mirrors the TS helper in
-# plugins/minni/src/vault.ts so a forged summary written by one
-# daemon cannot be parsed as multiple `## [...]` entries by either reader.
-_AUDIT_SUMMARY_MAX = 500
-_AUDIT_DETAIL_LINE_MAX = 1000
-_AUDIT_DETAIL_BLOCK_MAX = 4000
-
-
-def _escape_audit_field(value: str, *, mode: str = "inline", max_len: Optional[int] = None) -> str:
-    """Escape an audit-log field so injected newlines or leading `#` cannot
-    forge a new `## [...]` log entry.
-
-    - mode="inline" (tool, summary): collapse \\ \\r \\n to literal escapes so
-      the header line stays single-line. Prefix a leading `#` with `\\`.
-    - mode="block" (details): keep real newlines but escape any per-line
-      leading `#` so the parser can't mistake them for entry headers.
-    """
-    v = "" if value is None else str(value)
-    if mode == "inline":
-        v = v.replace("\\", "\\\\").replace("\r", "\\r").replace("\n", "\\n")
-        if v.startswith("#"):
-            v = "\\" + v
-    else:
-        v = "\n".join(("\\" + ln) if ln.startswith("#") else ln for ln in v.split("\n"))
-    if max_len is not None and len(v) > max_len:
-        v = v[: max(0, max_len - 1)] + "…"
-    return v
-
-
-def _escape_audit_details_block(raw: str) -> str:
-    out_lines = []
-    for ln in raw.split("\n"):
-        escaped = ("\\" + ln) if ln.startswith("#") else ln
-        if len(escaped) > _AUDIT_DETAIL_LINE_MAX:
-            escaped = escaped[: max(0, _AUDIT_DETAIL_LINE_MAX - 1)] + "…"
-        out_lines.append(escaped)
-    block = "\n".join(out_lines)
-    if len(block) > _AUDIT_DETAIL_BLOCK_MAX:
-        block = block[: max(0, _AUDIT_DETAIL_BLOCK_MAX - 1)] + "…"
-    return block
-
-
-def _append_handoff_audit(vault_path: Path, tool: str, summary: str, details: dict) -> None:
-    _ensure_handoff_vault(vault_path)
-    ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    safe_tool = _escape_audit_field(tool, mode="inline", max_len=200)
-    safe_summary = _escape_audit_field(summary, mode="inline", max_len=_AUDIT_SUMMARY_MAX)
-    raw_details = json.dumps(details, indent=2, sort_keys=True)
-    safe_details = _escape_audit_details_block(raw_details)
-    line = f"## [{ts}] {safe_tool} | {safe_summary}\n\n```json\n{safe_details}\n```\n\n"
-    for path in (vault_path / "log.md", vault_path / "logs" / f"{ts[:10]}.md"):
-        if not path.exists():
-            path.write_text(f"# {ts[:10]} Minni Audit\n\n", encoding="utf-8")
-        with path.open("a", encoding="utf-8") as fh:
-            fh.write(line)
-
-
-def _validate_handoff_packet(from_agent: str, to_agent: str, packet: Any) -> tuple[Optional[dict], Optional[str]]:
-    if not isinstance(packet, dict):
-        return None, "packet must be an object"
-    normalized = dict(packet)
-    normalized.setdefault("from_agent", from_agent)
-    normalized.setdefault("to_agent", to_agent)
-    normalized.setdefault("created_at", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
-    normalized.setdefault("trace_id", str(uuid.uuid4()))
-    normalized.setdefault("lease_id", f"handoff-{uuid.uuid4().hex[:16]}")
-    normalized.setdefault("requires_ack", True)
-    normalized.setdefault("expires_at", _iso_from_epoch(time.time() + 24 * 3600))
-
-    required = {
-        "from_agent": str,
-        "to_agent": str,
-        "kind": str,
-        "task": str,
-        "envelope": str,
-        "wikilink_refs": list,
-        "trace_id": str,
-        "created_at": str,
-        "lease_id": str,
-        "requires_ack": bool,
-        "expires_at": str,
-    }
-    for key, typ in required.items():
-        if key not in normalized:
-            return None, f"{key} is required"
-        if not isinstance(normalized[key], typ):
-            return None, f"{key} must be {typ.__name__}"
-        if typ is str and not normalized[key].strip():
-            return None, f"{key} must not be empty"
-    if normalized["from_agent"] != from_agent:
-        return None, "from_agent must match params.from_agent"
-    if normalized["to_agent"] != to_agent:
-        return None, "to_agent must match params.to_agent"
-    if normalized["kind"] not in _HANDOFF_KINDS:
-        return None, f"kind must be one of {sorted(_HANDOFF_KINDS)}"
-    if not all(isinstance(ref, str) and ref.strip() for ref in normalized["wikilink_refs"]):
-        return None, "wikilink_refs must be a list of strings"
-    if "expires_at" in normalized and normalized["expires_at"] is not None and not isinstance(normalized["expires_at"], str):
-        return None, "expires_at must be a string"
-    return normalized, None
-
-
-def _compile_handoff_page(sender_vault: Path, packet: dict, stamp: str) -> Optional[Path]:
-    if packet.get("kind") != "handoff":
-        return None
-    title = packet["task"].strip()
-    slug = _slugify(f"{packet['from_agent']}-to-{packet['to_agent']}-{title}")
-    page_path = sender_vault / "wiki" / "handoffs" / f"{stamp[:8]}-{slug}.md"
-    refs = "\n".join(f"- [[{ref.removesuffix('.md')}]]" for ref in packet.get("wikilink_refs", []))
-    page = (
-        "---\n"
-        f"title: {title}\n"
-        "type: handoff\n"
-        "status: accepted\n"
-        "privacy: safe\n"
-        f"from_agent: {packet['from_agent']}\n"
-        f"to_agent: {packet['to_agent']}\n"
-        f"trace_id: {packet['trace_id']}\n"
-        f"created: {packet['created_at']}\n"
-        "---\n\n"
-        f"# {title}\n\n"
-        f"From: `{packet['from_agent']}`\n\n"
-        f"To: `{packet['to_agent']}`\n\n"
-        "## Envelope\n\n"
-        f"```xml\n{packet['envelope']}\n```\n\n"
-        "## Wikilink References\n\n"
-        f"{refs or '- None'}\n"
-    )
-    page_path.write_text(page, encoding="utf-8")
-    return page_path
 
 
 def _handle_daemon_handoff(params: dict, request_id: Any) -> dict:

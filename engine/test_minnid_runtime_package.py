@@ -111,3 +111,49 @@ def test_provenance_core_lives_in_runtime_package_and_remains_compat_exports():
     assert minnid._handler_principal is handler_principal
     assert minnid._guard_vault_root is guard_vault_root
     assert minnid._enforce_method_capability is enforce_method_capability
+
+
+def test_handoff_primitives_live_in_runtime_modules_and_remain_compat_exports():
+    import minnid
+    from minnid_runtime.handoff import (
+        AUDIT_DETAIL_BLOCK_MAX,
+        AUDIT_DETAIL_LINE_MAX,
+        AUDIT_SUMMARY_MAX,
+        HANDOFF_KINDS,
+        agent_env_key,
+        agent_vault,
+        append_handoff_audit,
+        compile_handoff_page,
+        default_agent_vault,
+        ensure_handoff_vault,
+        escape_audit_details_block,
+        escape_audit_field,
+        iso_from_epoch,
+        known_agent_vaults,
+        parse_iso_ts,
+        slugify,
+        validate_handoff_packet,
+        write_json,
+    )
+    from minnid_runtime.redaction import redact_text, redact_value
+
+    assert minnid._HANDOFF_KINDS is HANDOFF_KINDS
+    assert minnid._AUDIT_SUMMARY_MAX == AUDIT_SUMMARY_MAX
+    assert minnid._AUDIT_DETAIL_LINE_MAX == AUDIT_DETAIL_LINE_MAX
+    assert minnid._AUDIT_DETAIL_BLOCK_MAX == AUDIT_DETAIL_BLOCK_MAX
+    assert minnid._redact_text is redact_text
+    assert minnid._redact_value is redact_value
+    assert minnid._agent_env_key is agent_env_key
+    assert minnid._default_agent_vault is default_agent_vault
+    assert minnid._agent_vault is agent_vault
+    assert minnid._ensure_handoff_vault is ensure_handoff_vault
+    assert minnid._slugify is slugify
+    assert minnid._write_json is write_json
+    assert minnid._parse_iso_ts is parse_iso_ts
+    assert minnid._iso_from_epoch is iso_from_epoch
+    assert minnid._known_agent_vaults is known_agent_vaults
+    assert minnid._escape_audit_field is escape_audit_field
+    assert minnid._escape_audit_details_block is escape_audit_details_block
+    assert minnid._append_handoff_audit is append_handoff_audit
+    assert minnid._validate_handoff_packet is validate_handoff_packet
+    assert minnid._compile_handoff_page is compile_handoff_page
