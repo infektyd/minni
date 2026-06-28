@@ -103,9 +103,10 @@ from principal import (                                     # noqa: E402  # G11 
 RECOVERY_ALLOWED_METHODS = ("ping", "status", "health_report", "hygiene_report")
 
 # P0 principal enforcement: required stamped capability per DB-backed RPC method.
-# Methods with bespoke ownership gates (resolve_candidate, resolve_contradiction,
-# minni_ack_handoff) are intentionally omitted — they enforce principal binding
-# inside the handler. Recovery/diagnostic methods are also omitted.
+# resolve_candidate keeps a bespoke in-handler gate (literal resolve_candidate /
+# govern capability + ownership, see _explicitly_allowed_operator) and is
+# intentionally omitted here. Recovery/diagnostic methods
+# (RECOVERY_ALLOWED_METHODS) are also omitted.
 _RPC_CAPABILITY_REQUIREMENTS: Dict[str, str] = {
     "search": "search",
     "feedback": "feedback",
@@ -115,6 +116,10 @@ _RPC_CAPABILITY_REQUIREMENTS: Dict[str, str] = {
     "sm_export_pack": "export",
     "read": "read",
     "learn": "learn",
+    # resolve_contradiction writes a new (superseding) learning, so it needs the
+    # write capability on top of the in-handler ownership check — a read-only
+    # principal that happens to own a learning must not be able to mutate it.
+    "resolve_contradiction": "learn",
     "minni_subscribe_contradictions": "read",
     "log_event": "log_event",
     "daemon.handoff": "handoff",
@@ -124,7 +129,8 @@ _RPC_CAPABILITY_REQUIREMENTS: Dict[str, str] = {
     "minni_await_handoff": "handoff",
     "stage_candidate": "learn",
     "list_candidates": "learn",
-    "ax_snapshot_store": "read",
+    # ax_snapshot_store WRITES an accessibility snapshot — a write op, not read.
+    "ax_snapshot_store": "learn",
     "ax_snapshot_get": "read",
     "vault_index_doc": "learn",
     "daemon.compile": "read",
