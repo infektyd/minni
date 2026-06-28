@@ -225,7 +225,11 @@ def _scan_inbox(
         log_only_set = _as_str_set(doc.get("log_only"))
         dns_set = _as_str_set(doc.get("do_not_store"))
         ws = doc.get("workspace_id") or "default"
-        principal = doc.get("agent_id") or inbox_principal
+        file_agent = str(doc.get("agent_id") or "").strip()
+        if file_agent and file_agent != inbox_principal:
+            skipped_by_kind["_agent_mismatch"] = skipped_by_kind.get("_agent_mismatch", 0) + 1
+            continue
+        principal = inbox_principal
         created = _file_createdat_epoch(doc)
         proposed_at = created if created is not None else time.time()
 

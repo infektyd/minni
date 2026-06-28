@@ -1,6 +1,7 @@
 # Core
-# Python 3.11 or 3.12 recommended for reproducible binary wheels (numpy, faiss-cpu, sentence-transformers).
-# Python 3.14 may produce partial installs; use venv + pinned versions below.
+# Python 3.14 is the supported local/CI interpreter. Keep the engine in
+# engine/.venv so binary wheels (numpy, faiss-cpu, sentence-transformers) are
+# isolated from system site packages.
 sentence-transformers>=5.6.0
 numpy>=2.4.6,<3.0
 
@@ -15,6 +16,15 @@ tiktoken>=0.13.0
 
 # File watcher
 watchdog>=6.0.0
+
+# Testing
+pytest
+# Coverage visibility (see `make coverage` / engine/.coveragerc). Not wired into
+# default pytest addopts so ordinary `pytest` runs stay fast; opt-in via --cov.
+pytest-cov>=5.0.0
+
+# Linting (gate: `.venv/bin/python -m ruff check .` from engine/)
+ruff>=0.6.0
 
 # Optional: for better SQLite FTS tokenization
 # icu4c (system package)

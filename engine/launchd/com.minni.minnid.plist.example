@@ -7,6 +7,8 @@
   placeholders below, then load it with launchctl.
 
   Substitutions:
+    /path/to/engine/.venv/bin/python
+                              absolute path to the engine venv interpreter
     /path/to/engine/minnid.py   absolute path to engine/minnid.py in this repo
     /path/to/sock              absolute path to the Unix socket
                                (default: ~/.minni/run/minnid.sock
@@ -42,7 +44,7 @@
 
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/bin/python3</string>
+        <string>/path/to/engine/.venv/bin/python</string>
         <string>/path/to/engine/minnid.py</string>
         <string>--socket</string>
         <string>/path/to/sock</string>

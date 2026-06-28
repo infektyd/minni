@@ -3,6 +3,7 @@ import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { spawn } from "node:child_process";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { URL } from "node:url";
 
 import type { JsonResult } from "./sovereign.js";
@@ -56,10 +57,16 @@ function nativeHelperAvailable(path: string | undefined): boolean {
   return Boolean(path && existsSync(path));
 }
 
-function resolvedNativeHelperPath(options: AfmProviderOptions): string | undefined {
+export function defaultNativeHelperPath(): string | undefined {
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  const repoHelper = path.resolve(here, "..", "..", "..", "engine", "native_afm_helper");
+  return existsSync(repoHelper) ? repoHelper : undefined;
+}
+
+export function resolvedNativeHelperPath(options: AfmProviderOptions = {}): string | undefined {
   return Object.prototype.hasOwnProperty.call(options, "nativeHelperPath")
     ? options.nativeHelperPath
-    : process.env.MINNI_AFM_NATIVE_HELPER;
+    : process.env.MINNI_AFM_NATIVE_HELPER ?? defaultNativeHelperPath();
 }
 
 function adapterConfigured(): boolean {
@@ -93,6 +100,13 @@ function nativeHealthAvailable(health: JsonResult | undefined): boolean {
       && stringField(health.data, "backend") === "apple-foundation-models"
       && stringField(health.data, "availability") === "available"
       && (stringField(health.data, "status") ?? "ok") === "ok",
+  );
+}
+
+function nativeHealthReported(health: JsonResult | undefined): boolean {
+  return Boolean(
+    stringField(health?.data, "backend") === "apple-foundation-models"
+      || stringField(health?.data, "provider") === "native",
   );
 }
 
@@ -217,7 +231,7 @@ export function resolveAfmProvider(mode: AfmProviderMode, options: AfmProviderOp
       adapterConfigured: hasAdapter,
     };
   }
-  if (options.health) {
+  if (options.health && nativeHealthReported(options.health)) {
     const unavailable = {
       mode,
       provider: mode === "auto" ? "bridge" as const : "native" as const,

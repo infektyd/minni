@@ -24,7 +24,7 @@ Sequencing:
 
 - `sovereign_memory.db` (with `-wal`/`-shm` sidecars) and FAISS index files.
 - Codex-owned Obsidian vault content under `codex-vault/` — wiki, raw, logs, inbox, generated context packs.
-- Runtime socket: `~/.sovereign-memory/run/sovrd.sock`, plus any explicitly configured OpenClaw bridge socket.
+- Runtime socket: `~/.minni/run/minnid.sock`, plus any explicitly configured legacy OpenClaw bridge socket.
 - Cross-agent handoff envelopes and audit logs.
 - AFM preparation payloads (task, recall, changed-files, outcome context).
 
@@ -79,7 +79,7 @@ Exit criteria:
 - `~/Library/Logs/sovrd.*.log` is mode 0600 via plist `Umask`.
 - README documents cloud-sync exclusion and the daemon warns at startup if the vault path is under a known sync root.
 
-Verification: `pytest engine/`, `npm test -w plugins/minni`, plus a 30-second smoke that asserts `stat -f %A ~/.sovereign-memory/run/sovrd.sock` returns `600`.
+Verification: `PYTHONPATH=engine engine/.venv/bin/python -m pytest engine/`, `npm test --prefix plugins/minni`, plus a smoke that asserts `stat -f %A ~/.minni/run/minnid.sock` returns `600` for a live daemon.
 
 ### Phase B — Principal Binding (SEC-002 serial; rest parallel)
 
@@ -121,7 +121,7 @@ Files: [openclaw-extension/sovrd.py:323,410,467,508](openclaw-extension/sovrd.py
 
 The legacy OpenClaw daemon chmods its Unix socket to `0o666`, exposes `/read` for absolute paths, and exposes `/learn` with no runtime auth.
 
-Fix: move the socket into `~/.sovereign-memory/run/` mode `0700`, set the socket itself to `0600`, restrict `/read` to vault/project roots via realpath containment, require a runtime principal token for `/learn`, cap request bodies.
+Fix: move the socket into `~/.minni/run/` mode `0700`, set the socket itself to `0600`, restrict `/read` to vault/project roots via realpath containment, require a runtime principal token for `/learn`, cap request bodies.
 
 ### SEC-002 — Caller-supplied agent identity (HIGH)
 
@@ -312,7 +312,7 @@ Plus a manual:
 
 **What it is:** The implementation stamps the active principal from environment/config, not from a cryptographic session credential. That is appropriate for the current single-user local plugin, but insufficient for LAN/public or multi-user deployment.
 
-**Why it matters here:** Model-agnostic and scale-agnostic implies future agents and possibly multiple runtimes. A caller that can start the plugin with another `SOVEREIGN_*_AGENT_ID` can impersonate that principal.
+**Why it matters here:** Model-agnostic and scale-agnostic implies future agents and possibly multiple runtimes. A caller that can start the plugin with another `MINNI_*_AGENT_ID` can impersonate that principal.
 
 **How to fix:** Before remote/multi-user use, add per-agent local capabilities or signed session credentials and reject decisions whose credential does not bind to the recipient principal.
 

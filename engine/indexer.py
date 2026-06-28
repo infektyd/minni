@@ -13,6 +13,7 @@ import os
 import re
 import time
 import logging
+from pathlib import Path
 from typing import Dict, List, Optional
 
 import numpy as np
@@ -154,13 +155,19 @@ class VaultIndexer:
         if not os.path.isdir(vault):
             return {"status": "error", "message": f"Vault not found: {vault}"}
 
+        vault_root = Path(vault).resolve()
+
         # Collect current files on disk
         disk_files: Dict[str, float] = {}
         for root, _, files in os.walk(vault):
             for fname in files:
                 if fname.endswith(".md"):
-                    full = os.path.join(root, fname)
-                    disk_files[full] = os.path.getmtime(full)
+                    full = Path(root) / fname
+                    from path_safety import path_within_root
+                    if not path_within_root(full, vault_root):
+                        continue
+                    full_resolved = str(full.resolve())
+                    disk_files[full_resolved] = full.stat().st_mtime
 
         stats = {"indexed": 0, "skipped": 0, "deleted": 0, "chunks": 0, "errors": 0}
 
@@ -184,10 +191,16 @@ class VaultIndexer:
                     meta = self._extract_frontmatter(content)
                     now = time.time()
 
-                    # PR-2: Skip pages with privacy: blocked
+                    # PR-2: Skip pages with privacy: blocked — purge any stale index rows
                     if meta.get("privacy_level") == "blocked":
-                        logger.info("Skipping blocked page: %s", os.path.basename(path))
-                        stats["skipped"] += 1
+                        if row:
+                            doc_id = row["doc_id"]
+                            c.execute("DELETE FROM vault_fts WHERE doc_id = ?", (doc_id,))
+                            c.execute("DELETE FROM chunk_embeddings WHERE doc_id = ?", (doc_id,))
+                            c.execute("DELETE FROM documents WHERE doc_id = ?", (doc_id,))
+                            stats["deleted"] += 1
+                        else:
+                            stats["skipped"] += 1
                         continue
 
                     if row:

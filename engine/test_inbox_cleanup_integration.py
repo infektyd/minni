@@ -52,9 +52,9 @@ def _build_ingested_fixture(tmp_path):
     inbox = tmp_path / "claudecode-vault" / "inbox"
 
     # 1) Stop file whose candidate will be RESOLVED -> ingested_resolved.
-    _write_inbox_file(inbox, "2026-05-01-resolved.json", _stop_doc(["lesson fully resolved"]))
+    _write_inbox_file(inbox, "2026-05-01-resolved.json", _stop_doc(["lesson fully resolved"], agent_id="claude-code"))
     # 2) Stop file whose candidate stays proposed -> ingested (rows carry it).
-    _write_inbox_file(inbox, "2026-05-02-pending.json", _stop_doc(["lesson still proposed"]))
+    _write_inbox_file(inbox, "2026-05-02-pending.json", _stop_doc(["lesson still proposed"], agent_id="claude-code"))
     # 3) Stop file written AFTER the ingest pass (not in DB) -> keep.
     # 4) Aged orphan handoff (no requires_ack) -> expired_handoff.
     _write_inbox_file(
@@ -75,7 +75,7 @@ def _build_ingested_fixture(tmp_path):
     assert res["skipped_by_kind"].get("handoff") == 2
 
     # The not-yet-ingested file arrives after the ingest tick.
-    _write_inbox_file(inbox, "2026-06-09-not-ingested.json", _stop_doc(["lesson not ingested yet"]))
+    _write_inbox_file(inbox, "2026-06-09-not-ingested.json", _stop_doc(["lesson not ingested yet"], agent_id="claude-code"))
 
     # Resolve exactly the candidate derived from file (1) — legacy backlog
     # shape: terminal row, file still in the live inbox.
