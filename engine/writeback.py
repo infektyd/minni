@@ -233,9 +233,11 @@ class WriteBackMemory:
                 for evidence_doc_id in existing:
                     c.execute(
                         """
-                        INSERT OR REPLACE INTO memory_links
+                        INSERT INTO memory_links
                         (source_doc_id, target_doc_id, link_type, weight, created_at)
                         VALUES (?, ?, 'derived_from', 1.0, ?)
+                        ON CONFLICT(source_doc_id, target_doc_id, link_type)
+                        DO UPDATE SET weight=excluded.weight, created_at=excluded.created_at
                         """,
                         (learning_doc_id, evidence_doc_id, now),
                     )

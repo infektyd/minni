@@ -135,9 +135,11 @@ def _insert_wikilinks(cursor, source_doc_id: int, wikilinks: List[str], target_m
         if target_doc_id == source_doc_id:
             continue
         cursor.execute(
-            """INSERT OR REPLACE INTO memory_links
+            """INSERT INTO memory_links
                (source_doc_id, target_doc_id, link_type, weight, created_at)
-               VALUES (?, ?, 'wikilink', 1.0, ?)""",
+               VALUES (?, ?, 'wikilink', 1.0, ?)
+               ON CONFLICT(source_doc_id, target_doc_id, link_type)
+               DO UPDATE SET weight=excluded.weight, created_at=excluded.created_at""",
             (source_doc_id, target_doc_id, now),
         )
         inserted += 1
