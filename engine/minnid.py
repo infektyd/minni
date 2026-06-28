@@ -3089,6 +3089,29 @@ def _faiss_cache_age_seconds(config=DEFAULT_CONFIG) -> Optional[float]:
     return round(max(0.0, time.time() - path.stat().st_mtime), 3)
 
 
+# NEW-01: health_report is reachable pre-identity (in RECOVERY_ALLOWED_METHODS),
+# so its per-record fields — document paths and learning contents — must be
+# withheld from an unstamped recovery-mode caller. Liveness/aggregate signals stay.
+_HEALTH_REPORT_SENSITIVE_KEYS = ("stale_docs", "never_recalled", "contradicting_learnings")
+
+
+def _redact_health_report_for_recovery(report: dict) -> dict:
+    """Strip document paths and learning contents from a pre-identity health_report.
+
+    Per-record detail is replaced with a count so an unauthenticated caller
+    cannot enumerate filesystem paths or learning text; non-sensitive liveness
+    fields (afm_loop, faiss_cache_age_seconds, vector_backend_lag) are retained.
+    Returns a new dict; the input is not mutated.
+    """
+    redacted = dict(report)
+    for key in _HEALTH_REPORT_SENSITIVE_KEYS:
+        items = report.get(key) or []
+        redacted[f"{key}_count"] = len(items)
+        redacted[key] = []
+    redacted["redacted"] = "pre-identity diagnostic: per-record detail withheld until a principal is stamped"
+    return redacted
+
+
 def _handle_health_report(params: dict, request_id: Any) -> dict:
     """Return deeper read-only memory health diagnostics."""
     now = time.time()
@@ -3202,6 +3225,12 @@ def _handle_health_report(params: dict, request_id: Any) -> dict:
     except Exception as exc:
         logger.warning("health_report degraded: %s", exc)
         report["error"] = str(exc)
+
+    # Fail-closed: redact unless the dispatcher's trusted flag says this is a
+    # fully-identified (non-recovery) caller. `_recovery` is set by dispatch and
+    # cannot be spoofed by the client.
+    if params.get("_recovery") is not False:
+        report = _redact_health_report_for_recovery(report)
 
     return _make_response(report, request_id)
 
@@ -4195,6 +4224,10 @@ async def _dispatch(request: dict) -> dict:
     provenance = resolve_provenance(request)
     if provenance.recovery is not None and method_name not in RECOVERY_ALLOWED_METHODS:
         return _make_response(provenance.recovery, request_id)
+    # Trusted recovery flag: overwrite any caller-supplied value so a pre-identity
+    # client cannot spoof authenticated detail out of recovery-allowed handlers
+    # (e.g. health_report path/content redaction keys off this).
+    params["_recovery"] = provenance.recovery is not None
     if provenance.principal is not None:
         params.setdefault("_principal", provenance.principal)
 
