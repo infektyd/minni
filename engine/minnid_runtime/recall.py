@@ -129,7 +129,25 @@ def backend_badge(backends: Any) -> str:
 
 
 def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict:
-    """Search Minni via hybrid retrieval."""
+    """Search Minni via hybrid retrieval.
+
+    Accepts optional ``depth`` parameter for progressive disclosure:
+      headline  — wikilink, title, score, confidence, age_days (~30 tokens/result)
+      snippet   — + text (≤280 chars) (~120 tokens/result) [DEFAULT]  (M-2 fix)
+      chunk     — + full chunk text, heading context, provenance (~500 tokens)
+      document  — + full source document (whole_document=1 rows only)
+    Omitting depth returns "snippet". Previous default was "headline" (no text)
+    which was a documentation/implementation mismatch — fixed.
+
+    Accepts optional ``budget_tokens`` for MMR-diverse token-budgeted packing.
+    When provided, selects a diverse subset fitting within the token budget.
+    ``depth="auto"`` with ``budget_tokens`` uses "snippet" as the base tier.
+
+    Accepts optional ``backend`` parameter:
+      "auto" (default)   — use config.vector_backends priority cascade
+      "faiss-disk"       — force specific backend
+      ["faiss-disk", X]  — fan-out via multi-backend
+    """
     if context.increment_request_count is not None:
         context.increment_request_count()
     started_at = time.perf_counter()

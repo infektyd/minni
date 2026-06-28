@@ -51,7 +51,25 @@ def extract_assertion(content: str) -> str:
 
 
 def handle_learn(params: dict, request_id: Any, context: GovernanceContext) -> dict:
-    """Store or propose a learning."""
+    """Store a learning.
+
+    PR-6 behavior change: if contradictions are detected and ``force`` is not
+    True (default False), returns::
+
+        {"status": "contradiction", "candidates": [...]}
+
+    without writing anything.  The caller must either resubmit with
+    ``force=true`` to bypass detection, or supply a ``contradicts_id`` to
+    explicitly record which prior learning is contradicted.
+
+    On success the return shape is unchanged::
+
+        {"status": "ok", "learning_id": <int>, "agent_id": ..., "category": ...}
+
+    Backward compatibility: existing calls without the new fields (assertion,
+    applies_when, evidence_doc_ids, contradicts_id, force) continue to work
+    exactly as before — the default of force=False is the only new behavior.
+    """
     if context.increment_request_count is not None:
         context.increment_request_count()
     started_at = time.perf_counter()
@@ -336,7 +354,28 @@ def handle_resolve_contradiction(params: dict, request_id: Any, context: Governa
 
 
 def handle_subscribe_contradictions(params: dict, request_id: Any, context: GovernanceContext) -> dict:
-    """Return contradiction events for learnings recently read by an agent."""
+    """Return contradiction events for learnings recently read by an agent.
+
+    Params:
+      since_ts            Cursor for incremental polling. NOTE: event_window_days
+                          is a hard cap — since_ts=0 ("everything") still only
+                          returns the last event_window_days of events. The
+                          effective lower bound is echoed back as
+                          checked.event_since so callers can detect clamping.
+      event_window_days   Boot-noise bound, default 30, clamped to [0, 365].
+                          An explicit 0 is honored (no historic events), not
+                          coerced to the default.
+      read_window_hours   Optional read-recency filter; 0 means "no reads
+                          qualify" (an explicit zero is honored, not coerced
+                          to the default). Clamped to [0, 8760].
+
+    Non-finite values (NaN/Inf) for any of the three are rejected and replaced
+    with the parameter's default: NaN poisons min/max clamping (min(nan, x) is
+    nan in CPython), which would either bypass the event-window DoS cap
+    (event_since collapsing to 0 → full-history scan) or make the SQL
+    comparison silently match nothing — defeating the hooks-PL-1
+    checked/no-match discriminator.
+    """
     principal, err = context.handler_principal(params, request_id)
     if err:
         return err
@@ -577,6 +616,25 @@ def list_candidates(params: dict, request_id: Any, context: GovernanceContext) -
 
 
 def explicitly_allowed_operator(principal: EffectivePrincipal) -> bool:
+    """A3 authz: TRUE only for an operator EXPLICITLY granted cross-principal
+    governance — never the synthesized wide-open local default. Grants:
+
+      * a LITERAL ``resolve_candidate`` / ``govern`` capability in the stamped
+        principal's capability list (an operator-authored principals/*.json
+        grant; the synthesized default only carries ``"*"``, which is NOT
+        accepted here), or
+      * the explicit ``operator`` principal (only exists when the operator
+        ships principals/operator.json), or
+      * an agent_id listed in the daemon-env allowlist
+        ``MINNI_RESOLVE_OPERATORS`` (comma-separated; operator-controlled,
+        never wire-controlled).
+
+    Rationale (live incident): every co-located session subagent is stamped
+    'main' on the shared UDS surface, so the blanket is_operator_principal
+    default let workflow subagents repeatedly re-resolve another principal's
+    candidate and archive a live inbox file. Cross-principal resolution now
+    requires one of the explicit grants above.
+    """
     caps = principal.capabilities or []
     if "resolve_candidate" in caps or "govern" in caps:
         return True
@@ -591,7 +649,16 @@ def explicitly_allowed_operator(principal: EffectivePrincipal) -> bool:
 
 
 def resolve_candidate(params: dict, request_id: Any, context: GovernanceContext) -> dict:
-    """Resolve a candidate into a terminal state, optionally promoting it."""
+    """G15: Resolve a candidate (accept→durable learn, reject/redact etc).
+
+    Authorization is owner-or-explicit-operator and lives INSIDE the
+    transaction (after the candidate row is read), because ownership cannot be
+    known before the read. There is deliberately NO up-front
+    ``is_operator_principal`` gate: it would reject a restricted-capability
+    platform agent (caps without ``*``/``resolve_candidate``/``govern``)
+    resolving its OWN candidate before the owner check is ever reached, while
+    adding nothing the owner check does not already enforce.
+    """
     principal, err = context.handler_principal(params, request_id)
     if err:
         return err

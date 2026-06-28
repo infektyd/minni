@@ -50,10 +50,15 @@ def maybe_archive_inbox_source(db, candidate_id: int, config=DEFAULT_CONFIG, log
 
 
 def promote_candidate_durable(candidate_id: int, reason: str, context: AFMContext):
-    """Promote one proposed candidate into a durable, embedded learning."""
+    """Promote one proposed candidate into a durable, embedded learning.
+
+    Returns the new learning_id, or None if the candidate is missing or no longer
+    'proposed' (idempotent — safe to call twice). Embedding is best-effort.
+    """
     import numpy as np
 
     wb = context.lazy_writeback()
+    # Read + embed OUTSIDE the write txn to keep the write lock short.
     with wb.db.cursor() as c:
         c.execute("SELECT * FROM candidate_packets WHERE candidate_id=?", (candidate_id,))
         row = c.fetchone()
@@ -87,6 +92,7 @@ def promote_candidate_durable(candidate_id: int, reason: str, context: AFMContex
 
     now = time.time()
     with wb.db.transaction() as c:
+        # Re-check status inside the txn (closes TOCTOU with a concurrent resolve).
         c.execute("SELECT status FROM candidate_packets WHERE candidate_id=?", (candidate_id,))
         chk = c.fetchone()
         if not chk or chk["status"] != "proposed":
@@ -319,7 +325,13 @@ def handle_daemon_compile(params: dict, request_id: Any, context: AFMContext) ->
 
 
 async def afm_loop_runner(context: AFMContext):
-    """Background scheduler for AFM passes."""
+    """Background scheduler for AFM passes (opt-in via MINNI_AFM_LOOP).
+
+    Ticks every idle_seconds; fires each pass when its interval has elapsed.
+    Defensive: a pass that raises is logged and skipped — it can NEVER take down
+    the socket server task. Last-run times are in-memory (reset on restart, which
+    just means each pass runs once shortly after boot — acceptable).
+    """
     if not afm_loop_enabled(context.default_config):
         context.logger.info("AFM loop disabled; runner not started.")
         return
@@ -331,7 +343,7 @@ async def afm_loop_runner(context: AFMContext):
         "AFM loop runner started: passes=%s idle=%ds",
         list(passes_cfg.keys()), idle_seconds,
     )
-    await asyncio.sleep(min(30, idle_seconds))
+    await asyncio.sleep(min(30, idle_seconds))  # let startup settle
     while context.is_running():
         now = time.time()
         for name, cfg in passes_cfg.items():
@@ -345,11 +357,24 @@ async def afm_loop_runner(context: AFMContext):
                     "dry_run": False,
                     "vault_path": context.default_config.vault_path,
                 }
+                # Consolidation drains in a loop until the proposed queue is empty
+                # or a per-tick batch budget is hit — clears bursts (swarms) instead
+                # of trickling one batch per interval. Every batch resolves all its
+                # examined candidates (accept/reject/needs_review), so it strictly
+                # makes progress and cannot spin.
                 if name == "consolidation":
+                    # Drain the inbox stop-candidate channel into candidate_packets
+                    # BEFORE the consolidation drain, so freshly-ingested 'proposed'
+                    # rows are triaged in the same tick. Idempotent, respects
+                    # log_only/do_not_store, never deletes. Failure here must NOT
+                    # block consolidation of the existing queue.
                     if (cfg or {}).get("ingest_inbox", True):
                         try:
                             from afm_passes.inbox_ingest import ingest as _ingest_inbox
-
+                            # Reuse the daemon's shared handle: SovereignDB
+                            # connections are thread-local and only released
+                            # by close(), so a fresh instance per tick leaks
+                            # one connection per tick in this loop.
                             _ing_db = context.lazy_writeback().db
                             _ing = _ingest_inbox(
                                 _ing_db,
@@ -366,6 +391,8 @@ async def afm_loop_runner(context: AFMContext):
                                     _ing["eligible"],
                                     _ing["already_present"],
                                 )
+                            # B4: surface kind-gate drops to the audit channel
+                            # instead of silently skipping whole channels.
                             _skips = _ing.get("skipped_by_kind") or {}
                             if any(_skips.values()):
                                 context.logger.info(
@@ -388,7 +415,7 @@ async def afm_loop_runner(context: AFMContext):
                         total_examined += examined
                         if examined == 0:
                             break
-                        await asyncio.sleep(0)
+                        await asyncio.sleep(0)  # yield to the server task between batches
                     context.logger.info(
                         "AFM loop: consolidation drained %d batch(es), %d candidate(s); last=%s",
                         batches,

@@ -29,6 +29,8 @@ def handle_ax_snapshot_store(params: dict, request_id: Any, context: AXContext) 
         return context.make_error(-32602, "app_name and tree_json are required", request_id)
 
     try:
+        # Shared daemon handle — per-call SovereignDB() instances leak their
+        # thread-local connection (only close() releases it).
         db = context.lazy_writeback().db
         ax = AXMemory(db)
         snapshot_id = ax.add_snapshot(

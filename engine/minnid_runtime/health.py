@@ -274,6 +274,7 @@ def handle_health_report(params: dict, request_id: Any, context: HealthContext) 
 
 def handle_hygiene_report(params: dict, request_id: Any, context: HealthContext) -> dict:
     """Run read-only vault/wiki hygiene checks and return JSON summary."""
+    # G12: enforce stamped principal's allowed_vault_roots on any supplied vault (realpath checked)
     vault_path = params.get("vault") or params.get("vault_path") or context.default_config.vault_path
     err = context.guard_vault_root(params, vault_path, request_id, label="hygiene")
     if err:

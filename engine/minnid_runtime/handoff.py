@@ -109,21 +109,31 @@ def known_agent_vaults() -> list[Path]:
                 vaults.extend(Path(os.path.expanduser(str(v))) for v in mapping.values())
         except json.JSONDecodeError:
             pass
-    # Resolve at call time so MINNI_HOME overrides are honored without hardcoding ~/.minni.
+    # Resolve at call time (matches config.py providers/secrets pattern) so
+    # MINNI_HOME overrides are honored without hardcoding ~/.minni.
     root = Path(os.environ.get("MINNI_HOME", os.path.expanduser("~/.minni")))
     if root.exists():
         vaults.extend(root.glob("*-vault"))
     return list(dict.fromkeys(vaults))
 
 
-# Caps mirror the TypeScript helper so forged summaries cannot parse as new audit entries.
+# SEC-014: caps for audit-log fields. Mirrors the TS helper in
+# plugins/minni/src/vault.ts so a forged summary written by one
+# daemon cannot be parsed as multiple `## [...]` entries by either reader.
 AUDIT_SUMMARY_MAX = 500
 AUDIT_DETAIL_LINE_MAX = 1000
 AUDIT_DETAIL_BLOCK_MAX = 4000
 
 
 def escape_audit_field(value: str, *, mode: str = "inline", max_len: Optional[int] = None) -> str:
-    """Escape an audit-log field so injected newlines cannot forge entries."""
+    """Escape an audit-log field so injected newlines or leading `#` cannot
+    forge a new `## [...]` log entry.
+
+    - mode="inline" (tool, summary): collapse \\ \\r \\n to literal escapes so
+      the header line stays single-line. Prefix a leading `#` with `\\`.
+    - mode="block" (details): keep real newlines but escape any per-line
+      leading `#` so the parser can't mistake them for entry headers.
+    """
     v = "" if value is None else str(value)
     if mode == "inline":
         v = v.replace("\\", "\\\\").replace("\r", "\\r").replace("\n", "\\n")
@@ -548,7 +558,9 @@ def handoff_lease_status(lease_id: str, *, context: HandoffContext) -> Optional[
 
 
 def lease_to_agent(lease_id: str, *, context: HandoffContext) -> Optional[str]:
-    """Return the recipient of a handoff lease from SQLite, falling back to JSON packets."""
+    """Recipient (``to_agent``) of a handoff lease: authoritative SQLite row
+    first, JSON packets as fallback (leases can exist file-only when SQLite
+    persistence degraded). None when the lease is unknown on both channels."""
     try:
         db = context.lazy_writeback().db
         with db.cursor() as c:

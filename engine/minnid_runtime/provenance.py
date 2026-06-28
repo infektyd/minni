@@ -211,10 +211,17 @@ def handler_principal(
         return None, make_mismatch_error(exc.supplied, exc.stamped, request_id)
 
 
+# G12 (SEC-003): vault root binding guard. Enforces that any vault_path accepted
+# from wire (hygiene, compile, endorse, handoff derived) realpath-resolves inside
+# the stamped EffectivePrincipal's allowed_vault_roots. Denies .. / symlink escapes.
+# Structured error (-32003) + redacted log; no secret leak. Non-strict synthesis
+# (G11) preserves prior wide-open behavior until operator ships principals/*.json.
 def guard_vault_root(
     params: dict, vault_path: str | Path, request_id: Any, *, label: str = "vault"
 ) -> Optional[dict]:
-    """Resolve stamped principal and check allows_vault_root."""
+    """Resolve stamped principal (honoring G11) and check allows_vault_root.
+    Returns JSON-RPC error dict on denial/mismatch, or None if allowed.
+    """
     principal, err = handler_principal(params, request_id)
     if err:
         return err

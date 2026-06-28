@@ -25,7 +25,28 @@ class VaultIndexContext:
 
 
 def handle_vault_index_doc(params: dict, request_id: Any, context: VaultIndexContext) -> dict:
-    """Index a vault page into semantic recall without learn/candidate governance."""
+    """Index a vault page into the semantic recall index without going through
+    the learn/candidate governance pipeline.
+
+    M-4 fix: minni_vault_write writes a page to disk but did NOT trigger the
+    recall bridge, so vault_write content was NOT semantically recall-able until
+    a separate VaultIndexer run. This RPC lets the TypeScript MCP handler call
+    ``vault_index_doc`` immediately after writing, matching the instant-recall
+    semantics of ``learn`` (which calls index_durable_document on promote).
+
+    Params (all required unless noted):
+        content    — full page content (markdown, including frontmatter if any)
+        path       — relative path within the vault (e.g. "wiki/sessions/foo.md")
+        agent      — agent_id owning this document
+        sigil      — optional emoji sigil (default "❓")
+        privacy_level — optional, default "safe"
+        page_status   — optional, default "accepted"
+        layer      — optional, default "knowledge"
+
+    Returns {"status": "ok", "doc_id": <int>, "chunks": <int>} on success.
+    FAIL-OPEN: engine errors are caught internally (never raises); returns an
+    error envelope only for missing required params.
+    """
     if context.increment_request_count is not None:
         context.increment_request_count()
     started_at = time.perf_counter()
@@ -59,6 +80,8 @@ def handle_vault_index_doc(params: dict, request_id: Any, context: VaultIndexCon
     if root_err:
         return root_err
 
+    # SEC-015-style size cap: vault pages capped at 256 KiB (larger than learn
+    # which is 64 KiB, because vault pages include rich frontmatter + prose).
     if len(content) > MAX_VAULT_PAGE_CHARS:
         return context.make_error(
             -32602,
