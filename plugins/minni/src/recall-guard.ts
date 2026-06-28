@@ -121,7 +121,8 @@ export function isToolInScope(
 
   if (toolName === "Bash") {
     if (mode !== "strict") return false; // soft mode leaves Bash untouched
-    const command = typeof toolInput.command === "string" ? toolInput.command : "";
+    const command =
+      toolInput && typeof toolInput.command === "string" ? toolInput.command : "";
     return isReadSearchBashCommand(command);
   }
 
