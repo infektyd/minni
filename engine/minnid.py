@@ -99,6 +99,7 @@ from principal import (                                     # noqa: E402  # G11 
     resolve_effective_principal,
     validate_agent_id,
 )
+from minnid_runtime.rpc import make_error as _make_error, make_response as _make_response  # noqa: E402
 
 RECOVERY_ALLOWED_METHODS = ("ping", "status", "health_report", "hygiene_report")
 
@@ -654,17 +655,6 @@ _start_time = 0.0
 _request_count = 0
 _LATENCY_METHODS = ("search", "learn", "read", "embedding", "cross_encoder", "afm")
 _latencies = {name: deque(maxlen=100) for name in _LATENCY_METHODS}
-
-
-def _make_response(result: Any, request_id: Any = None) -> dict:
-    """Build a JSON-RPC success response."""
-    return {"jsonrpc": "2.0", "id": request_id, "result": result}
-
-
-def _make_error(code: int, message: str, request_id: Any = None) -> dict:
-    """Build a JSON-RPC error response."""
-    return {"jsonrpc": "2.0", "id": request_id,
-            "error": {"code": code, "message": message}}
 
 
 _HANDOFF_KINDS = frozenset({"handoff", "candidate_learning", "request", "answer"})
