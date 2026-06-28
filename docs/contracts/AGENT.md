@@ -304,7 +304,7 @@ memory is degraded.
 
 ## 7. No New Filesystem Side-Channels
 
-**The rule:** new features communicate through `minnid` RPC. Do not introduce
+**The rule:** New features must communicate through `minnid` RPC. Do not introduce
 new folder-of-files channels, watch directories, drop-file queues, lock files as
 shared state, or cross-agent communication via paths.
 
@@ -318,7 +318,7 @@ and plan-artifact file surfaces are grandfathered because their semantics are
 already gatekeeper-controlled. Future work should treat them as storage-backed
 contracts, not precedents for new path polling.
 
-**The test for new work:** if another process must watch a path or poll a
+**The test for new work:** If another process must watch a path or poll a
 directory to learn something happened, put it behind an RPC method or a
 storage-backed queue instead. If a reviewer cannot tell whether a file is a
 derived artifact or a communication channel, the feature needs a design note
