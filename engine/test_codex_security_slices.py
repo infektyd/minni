@@ -131,3 +131,21 @@ def test_graph_accepted_pages_skips_private(tmp_path):
     safe = accepted_pages(pages)
     assert len(safe) == 1
     assert safe[0].rel_path == "wiki/safe.md"
+
+
+def test_graph_accepted_pages_allowlist_rejects_unknown_privacy(tmp_path):
+    """PR91-5: an UNRECOGNIZED privacy label must fail closed (allowlist), not
+    slip past a known-bad blocklist into AFM graph synthesis."""
+    from afm_passes._graph_utils import VaultPage, accepted_pages
+
+    pages = [
+        VaultPage("wiki/safe.md", tmp_path / "safe.md", "Safe", "concept", "accepted", privacy="safe"),
+        VaultPage("wiki/pub.md", tmp_path / "pub.md", "Pub", "concept", "accepted", privacy="public"),
+        VaultPage("wiki/unset.md", tmp_path / "unset.md", "Unset", "concept", "accepted", privacy=""),
+        VaultPage("wiki/sensitive.md", tmp_path / "sensitive.md", "Sensitive", "concept", "accepted", privacy="sensitive"),
+        VaultPage("wiki/internal.md", tmp_path / "internal.md", "Internal", "concept", "accepted", privacy="internal"),
+    ]
+    accepted = {p.rel_path for p in accepted_pages(pages)}
+    assert accepted == {"wiki/safe.md", "wiki/pub.md", "wiki/unset.md"}
+    assert "wiki/sensitive.md" not in accepted
+    assert "wiki/internal.md" not in accepted
