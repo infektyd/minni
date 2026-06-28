@@ -22,8 +22,8 @@ All MCP config views point at the **legacy `sovereign-memory`** server → dead 
    - `mcp(minni/minni_prepare_task)`
    - `mcp(minni/minni_plan_status)`
    - `mcp(minni/minni_plan_history)`
-   - `mcp(minni/minni_ping_inbox)`
-   - `mcp(minni/minni_ping_status)`
+   - `mcp(minni/minni_ping_agent_inbox)`
+   - `mcp(minni/minni_ping_agent_status)`
    Writes (`minni_learn`, `minni_vault_write`, `minni_resolve_candidate`, `minni_plan_update`, handoff/ping decide, etc.) must **not** appear in auto-grant — they require per-session prompt approval.
    Drop the old `sovereign-memory/sovereign_*` grants.
 4. (gemini-cli, optional) add the `minni` block to `~/.gemini/settings.json mcpServers` with `"trust": true`.

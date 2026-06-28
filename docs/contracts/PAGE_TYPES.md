@@ -487,7 +487,7 @@ SQLite DB  +  FAISS index  +  Vault (filesystem)
 ## Write pipeline
 
 1. Agent calls `learn(content)` or writes vault page via plugin.
-2. Daemon stores learning in `learnings` table (+ optional flat-file dual-write).
+2. Daemon stores learning in `learnings` table.
 3. Vault writes trigger indexer → chunker → embedder → SQLite + FAISS update.
 4. `index.md` and `log.md` are appended; agent can immediately recall new content.
 
