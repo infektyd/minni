@@ -73,9 +73,21 @@ def test_dispatch_runtime_rejects_non_object_params_before_handler():
         logger=Logger(),
     )
 
+    # Faithful main behavior: JSON-RPC `"params": []` is falsy and coerces to {}.
     response = asyncio.run(
         dispatch_request(
-            {"jsonrpc": "2.0", "id": "bad", "method": "echo", "params": []},
+            {"jsonrpc": "2.0", "id": "empty-list", "method": "echo", "params": []},
+            context,
+        )
+    )
+
+    assert response == make_response({"called": True}, "empty-list")
+    assert calls == [({}, "empty-list")]
+
+    calls.clear()
+    response = asyncio.run(
+        dispatch_request(
+            {"jsonrpc": "2.0", "id": "bad", "method": "echo", "params": [1, 2, 3]},
             context,
         )
     )

@@ -22,9 +22,7 @@ async def dispatch_request(request: dict, context: DispatchContext) -> dict:
     """Route a JSON-RPC request to the correct handler."""
     method_name = request.get("method", "")
     request_id = request.get("id")
-    params = request.get("params", {})
-    if params is None:
-        params = {}
+    params = request.get("params", {}) or {}
 
     handler = context.methods.get(method_name)
     if handler is None:
