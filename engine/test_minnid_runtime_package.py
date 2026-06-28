@@ -157,3 +157,41 @@ def test_handoff_primitives_live_in_runtime_modules_and_remain_compat_exports():
     assert minnid._append_handoff_audit is append_handoff_audit
     assert minnid._validate_handoff_packet is validate_handoff_packet
     assert minnid._compile_handoff_page is compile_handoff_page
+
+
+def test_handoff_domain_lives_in_runtime_module_and_registry_delegates():
+    import minnid
+    from minnid_runtime.handoff import (
+        HandoffContext,
+        handle_ack_handoff,
+        handle_await_handoff,
+        handle_daemon_handoff,
+        handle_list_pending_handoffs,
+        handoff_lease_status,
+        iter_handoff_files,
+        lease_to_agent,
+        pending_handoff_leases,
+        store_handoff_lease,
+        update_handoff_lease_status,
+        write_matching_lease_packets,
+    )
+
+    context = minnid._handoff_context()
+
+    assert isinstance(context, HandoffContext)
+    assert minnid._runtime_handle_daemon_handoff is handle_daemon_handoff
+    assert minnid._runtime_handle_ack_handoff is handle_ack_handoff
+    assert minnid._runtime_handle_list_pending_handoffs is handle_list_pending_handoffs
+    assert minnid._runtime_handle_await_handoff is handle_await_handoff
+    assert minnid._runtime_iter_handoff_files is iter_handoff_files
+    assert minnid._runtime_write_matching_lease_packets is write_matching_lease_packets
+    assert minnid._runtime_store_handoff_lease is store_handoff_lease
+    assert minnid._runtime_update_handoff_lease_status is update_handoff_lease_status
+    assert minnid._runtime_pending_handoff_leases is pending_handoff_leases
+    assert minnid._runtime_handoff_lease_status is handoff_lease_status
+    assert minnid._runtime_lease_to_agent is lease_to_agent
+    assert minnid._METHODS["daemon.handoff"] is minnid._handle_daemon_handoff
+    assert minnid._METHODS["handoff"] is minnid._handle_daemon_handoff
+    assert minnid._METHODS["minni_ack_handoff"] is minnid._handle_ack_handoff
+    assert minnid._METHODS["minni_list_pending_handoffs"] is minnid._handle_list_pending_handoffs
+    assert minnid._METHODS["minni_await_handoff"] is minnid._handle_await_handoff
