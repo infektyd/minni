@@ -1,5 +1,6 @@
 import json
 import os
+import subprocess
 import sys
 import time
 
@@ -78,6 +79,17 @@ def _seed_doc(db_obj, path="/wiki/source.md", agent="wiki:concept"):
             (path, agent, now, now),
         )
         return c.lastrowid
+
+
+def test_writeback_import_is_lightweight_without_numpy():
+    script = (
+        "import sys; "
+        "sys.path.insert(0, '.'); "
+        "import writeback; "
+        "raise SystemExit(1 if 'numpy' in sys.modules else 0)"
+    )
+    proc = subprocess.run([sys.executable, "-c", script], cwd=os.path.dirname(__file__))
+    assert proc.returncode == 0
 
 
 def test_writeback_learning_with_evidence_adds_derived_from_edges(tmp_path, monkeypatch):

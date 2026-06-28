@@ -4,14 +4,22 @@
 set -euo pipefail
 
 TD=$(mktemp -d /tmp/minnid-smoke-XXXXXX)
+export HOME="$TD/home"
 export MINNI_HOME="$TD"
 export MINNI_SOCKET="$TD/run/minnid.sock"
-mkdir -p "$TD/run" "$TD/logs"
+mkdir -p "$TD/run" "$TD/logs" "$HOME"
 
 echo "[smoke] MINNI_HOME=$MINNI_HOME"
+echo "[smoke] HOME=$HOME"
+
+VENV_PY="${VENV_PY:-engine/.venv/bin/python}"
+if [ ! -x "$VENV_PY" ]; then
+  echo "[smoke] Missing $VENV_PY; run 'make setup' first." >&2
+  exit 1
+fi
 
 # Start daemon in background (stdio mode for simplicity in CI; socket optional)
-python3 -u engine/minnid.py --socket "$MINNI_SOCKET" > "$TD/daemon.log" 2>&1 &
+"$VENV_PY" -u engine/minnid.py --socket "$MINNI_SOCKET" > "$TD/daemon.log" 2>&1 &
 DAEMON_PID=$!
 trap 'kill $DAEMON_PID 2>/dev/null || true; rm -rf "$TD"' EXIT
 
@@ -22,7 +30,7 @@ DB_COUNT=$(find "$TD" -maxdepth 1 -name "*.db" -o -name "*minni*.db" 2>/dev/null
 echo "MIGRATION_DB_PRESENT: $DB_COUNT (expected >=1 for schema apply on clean start)"
 
 # Probe status via python (uses minnid_client if possible, else direct import)
-python3 - <<'PY'
+"$VENV_PY" - <<'PY'
 import os, sys, time, json
 sys.path.insert(0, "engine")
 from minnid_client import _rpc

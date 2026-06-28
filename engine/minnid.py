@@ -71,6 +71,8 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 # ── Logging ───────────────────────────────────────────────────────────────
+# Logging setup and the operational metrics counters are centralized in obs.py
+# so every engine entry point shares one configured logger and status counters.
 
 logger = logging.getLogger("minnid")
 
@@ -82,6 +84,7 @@ _ENGINE_DIR = Path(__file__).resolve().parent
 if str(_ENGINE_DIR) not in sys.path:
     sys.path.insert(0, str(_ENGINE_DIR))
 
+import obs                                                  # noqa: E402  # centralized logging + metrics counters
 from config import CANONICAL_SOVEREIGN_HOME, DEFAULT_CONFIG, SovereignConfig          # noqa: E402
 from db import SovereignDB                                  # noqa: E402
 from principal import (                                     # noqa: E402  # G11 EffectivePrincipal + G14 operator gate
@@ -90,12 +93,62 @@ from principal import (                                     # noqa: E402  # G11 
     agent_scope_for,
     can_read_document,  # G19
     is_operator_principal,
+    make_capability_denied_error,
     make_mismatch_error,
+    allows_cross_agent_recall,
     resolve_effective_principal,
     validate_agent_id,
 )
 
 RECOVERY_ALLOWED_METHODS = ("ping", "status", "health_report", "hygiene_report")
+
+# P0 principal enforcement: required stamped capability per DB-backed RPC method.
+# Methods with bespoke ownership gates (resolve_candidate, resolve_contradiction,
+# minni_ack_handoff) are intentionally omitted — they enforce principal binding
+# inside the handler. Recovery/diagnostic methods are also omitted.
+_RPC_CAPABILITY_REQUIREMENTS: Dict[str, str] = {
+    "search": "search",
+    "feedback": "feedback",
+    "trace": "read",
+    "expand": "read",
+    "sm_drill": "read",
+    "sm_export_pack": "export",
+    "read": "read",
+    "learn": "learn",
+    "minni_subscribe_contradictions": "read",
+    "log_event": "log_event",
+    "daemon.handoff": "handoff",
+    "handoff": "handoff",
+    "minni_ack_handoff": "handoff",
+    "minni_list_pending_handoffs": "handoff",
+    "minni_await_handoff": "handoff",
+    "stage_candidate": "learn",
+    "list_candidates": "learn",
+    "ax_snapshot_store": "read",
+    "ax_snapshot_get": "read",
+    "vault_index_doc": "learn",
+    "daemon.compile": "read",
+    "daemon.endorse": "govern",
+}
+
+
+def _enforce_method_capability(
+    method_name: str,
+    principal: Optional[EffectivePrincipal],
+    request_id: Any,
+) -> Optional[dict]:
+    """Return a JSON-RPC error when the stamped principal lacks the method cap."""
+    if principal is None:
+        return None
+    required = _RPC_CAPABILITY_REQUIREMENTS.get(method_name)
+    if not required or principal.can(required):
+        return None
+    return make_capability_denied_error(
+        required,
+        method_name,
+        request_id,
+        principal_id=principal.agent_id,
+    )
 
 
 @dataclass(frozen=True)
@@ -537,7 +590,7 @@ def _index_durable_learning(agent_id: str, content: str, key: str, db=_UNSET) ->
             from indexer import VaultIndexer
 
             meta = VaultIndexer._extract_frontmatter(content)
-            doc_agent = meta["agent"] if meta["agent"] != "unknown" else agent_id
+            doc_agent = agent_id  # server-stamped ownership; never trust frontmatter agent
             sigil = meta.get("sigil", "❓")
             page_status = (
                 meta["page_status"]
@@ -1464,6 +1517,14 @@ def _handle_search(params: dict, request_id: Any) -> dict:
     principal, err = _handler_principal(params, request_id)
     if err:
         return err
+    if bool(params.get("cross_agent", False)) and principal is not None:
+        if not allows_cross_agent_recall(principal):
+            return make_capability_denied_error(
+                "cross_agent",
+                "search",
+                request_id,
+                principal_id=principal.agent_id,
+            )
     agent_id = principal.agent_id if principal is not None else None
     learnings_cross_agent = bool(params.get("cross_agent", False)) or principal is None
     try:
@@ -2983,6 +3044,8 @@ def _handle_status(params: dict, request_id: Any) -> dict:
             "requests_served": _request_count,
             "socket_path": "[redacted]",
             "latencies": _latency_snapshot(),
+            "errors": obs.metrics_snapshot().get("errors", 0),
+            "counters": obs.metrics_snapshot(),
         },
         "engine": {
             "db_ok": db_ok,
@@ -3915,12 +3978,15 @@ def _resolve_candidate(params: dict, request_id: Any) -> dict:
 
 def _handle_ax_snapshot_store(params: dict, request_id: Any) -> dict:
     from ax_memory import AXMemory
-    agent_id = str(params.get("agent_id", "")).strip()
+    principal, err = _handler_principal(params, request_id)
+    if err:
+        return err
+    agent_id = principal.agent_id
     app_name = str(params.get("app_name", "")).strip()
     tree_json = str(params.get("tree_json", ""))
     
-    if not agent_id or not app_name or not tree_json:
-        return _make_error(-32602, "agent_id, app_name, and tree_json are required", request_id)
+    if not app_name or not tree_json:
+        return _make_error(-32602, "app_name and tree_json are required", request_id)
         
     try:
         # Shared daemon handle — per-call SovereignDB() instances leak their
@@ -3940,11 +4006,11 @@ def _handle_ax_snapshot_store(params: dict, request_id: Any) -> dict:
 
 def _handle_ax_snapshot_get(params: dict, request_id: Any) -> dict:
     from ax_memory import AXMemory
-    agent_id = str(params.get("agent_id", "")).strip()
+    principal, err = _handler_principal(params, request_id)
+    if err:
+        return err
+    agent_id = principal.agent_id
     app_name = params.get("app_name")
-    
-    if not agent_id:
-        return _make_error(-32602, "agent_id is required", request_id)
         
     try:
         db = _lazy_writeback().db
@@ -3983,16 +4049,34 @@ def _handle_vault_index_doc(params: dict, request_id: Any) -> dict:
     _request_count += 1
     started_at = time.perf_counter()
 
+    principal, err = _handler_principal(params, request_id)
+    if err:
+        return err
+
     content = params.get("content", "")
     path = params.get("path", "")
-    agent = params.get("agent", "")
+    wire_agent = str(params.get("agent", "")).strip()
+    if wire_agent and wire_agent != principal.agent_id:
+        return make_mismatch_error(wire_agent, principal.agent_id, request_id)
+    agent = principal.agent_id
 
     if not content:
         return _make_error(-32602, "content is required", request_id)
     if not path:
         return _make_error(-32602, "path is required", request_id)
-    if not agent:
-        return _make_error(-32602, "agent is required", request_id)
+
+    rel_path = str(path).replace("\\", "/").lstrip("/")
+    if not rel_path or ".." in Path(rel_path).parts:
+        return _make_error(-32602, "path must be a relative path within the vault", request_id)
+
+    vault_path = params.get("vault_path")
+    if not vault_path:
+        vault_path, _ = _agent_vault(principal.agent_id)
+    vault_path = str(vault_path)
+    full_path = Path(vault_path).resolve() / rel_path
+    root_err = _guard_vault_root(params, full_path, request_id, label="vault_index_doc")
+    if root_err:
+        return root_err
 
     # SEC-015-style size cap: vault pages capped at 256 KiB (larger than learn
     # which is 64 KiB, because vault pages include rich frontmatter + prose).
@@ -4013,7 +4097,7 @@ def _handle_vault_index_doc(params: dict, request_id: Any) -> dict:
         engine = _lazy_retrieval()
         result = engine.index_durable_document(
             content=content,
-            path=path,
+            path=rel_path,
             agent=agent,
             sigil=sigil,
             privacy_level=privacy_level,
@@ -4111,10 +4195,24 @@ async def _dispatch(request: dict) -> dict:
     if provenance.principal is not None:
         params.setdefault("_principal", provenance.principal)
 
-    if asyncio.iscoroutinefunction(handler):
-        result = await handler(params, request_id)
-    else:
-        result = await asyncio.to_thread(handler, params, request_id)
+    cap_err = _enforce_method_capability(method_name, provenance.principal, request_id)
+    if cap_err is not None:
+        return cap_err
+
+    try:
+        if asyncio.iscoroutinefunction(handler):
+            result = await handler(params, request_id)
+        else:
+            result = await asyncio.to_thread(handler, params, request_id)
+    except Exception:
+        obs.incr("errors")
+        obs.incr(f"errors.{method_name}")
+        logger.exception("dispatch failed for method %s", method_name)
+        raise
+
+    if isinstance(result, dict) and "error" in result:
+        obs.incr("errors")
+        obs.incr(f"errors.{method_name}")
     return result
 
 
@@ -4366,12 +4464,9 @@ def main():
     )
     args = parser.parse_args()
 
-    # Logging
-    level = logging.DEBUG if args.verbose else logging.INFO
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s [minnid] %(levelname)s: %(message)s",
-    )
+    # Logging: route through the centralized obs setup so format/level honor
+    # MINNI_LOG_FORMAT (text|json) and MINNI_LOG_LEVEL.
+    obs.configure_logging(verbose=args.verbose)
 
     _unix_socket_path = Path(args.socket)
 

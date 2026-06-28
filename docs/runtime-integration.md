@@ -1,13 +1,12 @@
 # Runtime Integration
 
-Sovereign Memory can run in three layers:
+Minni can run in three layers:
 
-1. **Python package core**: the installable `sovereign_memory` package under
-   `src/`, responsible for SQLite, FAISS, retrieval, learnings, episodic
-   events, and graph export.
-2. **OpenClaw extension**: the optional TypeScript bridge under
-   `integrations/openclaw-extension/`, responsible for connecting OpenClaw
-   agents to Sovereign Memory through a local Unix-socket daemon.
+1. **Python engine**: the code under `engine/`, responsible for SQLite, FAISS,
+   retrieval, learnings, episodic events, daemon JSON-RPC, and graph export.
+2. **Multi-host plugin**: the TypeScript bridge under `plugins/minni/`,
+   responsible for connecting Codex, Claude, Gemini, Kilo, Grok, and related
+   agent surfaces to Minni through a local Unix-socket daemon.
 3. **Local model services**: optional adjacent services used by an operator,
    including the native Apple Foundation Models JSON helper and the
    OpenAI-compatible localhost bridge. Machine-specific model artifacts,
@@ -26,36 +25,35 @@ instructions. It should not contain:
 - launchd plists with local machine paths
 - logs, conversation exports, or user-derived training data
 
-## OpenClaw Bridge
+## Plugin Bridge
 
-The OpenClaw extension uses environment-driven defaults:
+The plugin bridge uses environment-driven defaults:
 
-- `SOVEREIGN_SOCKET_PATH` for the Unix socket
-- `SOVEREIGN_DB_PATH` for the SQLite database
-- `SOVEREIGN_VAULT_PATH` for markdown/vault reads
-- `SOVEREIGN_DEFAULT_AGENT_ID` for requests without an agent ID
-- `SOVEREIGN_PYTHON` for the process supervisor
-- `OPENCLAW_HOME` for optional flat-file mirroring
+- `MINNI_SOCKET_PATH` for the Unix socket
+- `MINNI_DB_PATH` for the SQLite database
+- `MINNI_VAULT_PATH` for markdown/vault reads
+- `MINNI_AGENT_ID` for requests without an agent ID
+- `MINNI_HOME` for the local runtime root
 
 This keeps the public integration portable while allowing local installs to
 preserve compatibility with existing runtime layouts.
 
 ## Local AFM and Extraction
 
-The package includes `sovereign_memory.extraction`, a small stdlib-only client
-for local OpenAI-compatible model bridges. By default it targets a local Apple
-Foundation Models style bridge at `http://127.0.0.1:11437/v1/chat/completions`.
-Operators can override the endpoint and model with:
+The engine includes local provider helpers for OpenAI-compatible model bridges.
+By default, bridge mode targets a local Apple Foundation Models style bridge at
+`http://127.0.0.1:11437/v1/chat/completions`. Operators can override the
+provider behavior with:
 
-- `SOVEREIGN_EXTRACTOR_URL`
-- `SOVEREIGN_EXTRACTOR_MODEL`
-- `SOVEREIGN_EXTRACTOR_TIMEOUT`
+- `MINNI_AFM_PROVIDER_MODE`
+- `MINNI_AFM_MODE`
+- `MINNI_AFM_HEALTH_URL`
+- `MINNI_AFM_PREPARE_TASK_URL`
 
-The CLI entrypoint is:
+The daemon entrypoint is:
 
 ```bash
-sovereign-memory extract ./session.md
-sovereign-memory extract ./session.md --learn-agent hermes --durable-only
+engine/.venv/bin/python engine/minnid.py --socket ~/.minni/run/minnid.sock
 ```
 
 This keeps extraction code usable while leaving model binaries, adapters,
@@ -80,9 +78,14 @@ The normalized native operation contracts are:
 Status reports expose provider mode, backend, availability, and a boolean
 adapter-configured flag. They do not emit private adapter paths.
 
+FoundationModels transcripts or asset metadata prove only the local native
+runtime path that produced them. They do not prove Private Cloud Compute/offload
+behavior. Treat PCC/offload claims as unverified unless Apple documentation or
+an explicit runtime telemetry/API signal is cited in the same finding.
+
 ## Team Runtime
 
-The Codex/Claude/Gemini/Kilo plugin exposes a coordinator-side Sovereign Team Runtime
+The Codex/Claude/Gemini/Kilo plugin exposes a coordinator-side Minni Team Runtime
 for temporary helper agents:
 
 - `sovereign_team_runtime` builds temporary profiles, a task ledger, hydration

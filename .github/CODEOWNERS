@@ -1,0 +1,25 @@
+# Code ownership for infektyd/minni.
+#
+# Syntax: https://docs.github.com/articles/about-code-owners
+# Last matching pattern wins. @infektyd is the repo owner and the catch-all
+# reviewer; per-surface lines exist so ownership stays explicit as the project
+# grows additional maintainers.
+
+# Catch-all: everything is owned by the repo owner unless overridden below.
+*                       @infektyd
+
+# Python engine + daemon.
+/engine/                @infektyd
+
+# Multi-host TypeScript plugin.
+/plugins/               @infektyd
+
+# Docs, contracts, and top-level project surface.
+/docs/                  @infektyd
+/README.md              @infektyd
+/AGENTS.md              @infektyd
+
+# Build/CI/ownership tooling and git hooks.
+/.github/               @infektyd
+/.githooks/             @infektyd
+/Makefile               @infektyd

@@ -7,7 +7,7 @@ import {
   DEFAULT_VAULT_PATH,
   DEFAULT_WORKSPACE_ID,
 } from "./config.js";
-import { resolveAfmProvider, type AfmProvider, type AfmProviderMode, type AfmProviderResolution } from "./afm.js";
+import { resolveAfmProvider, resolvedNativeHelperPath, type AfmProvider, type AfmProviderMode, type AfmProviderResolution } from "./afm.js";
 import { defaultProviderChain } from "./providers.js";
 import { afmHealth, recallMemory } from "./sovereign.js";
 import type { JsonResult, RecallResponse } from "./sovereign.js";
@@ -220,7 +220,7 @@ function resolveBudget(profileInput: TaskProfile | undefined, budgetTokens: numb
   };
 }
 
-function classifyIntent(task: string): string {
+export function classifyIntent(task: string): string {
   const text = task.toLowerCase();
   if (/review|audit|risk/.test(text)) return "review";
   if (/debug|fix|broken|failing|error/.test(text)) return "debug";
@@ -326,6 +326,11 @@ function privacyForSource(result: VaultSearchResult): { privacyLevel: PrivacyLev
       ? `frontmatter privacy: ${authored}`
       : heuristic.reason;
   return { privacyLevel, points: PRIVACY_POINTS[privacyLevel], reason };
+}
+
+/** SEC-006: only privacy:safe vault hits may enter recall/hook surfaces. */
+export function filterSafeVaultResults(results: VaultSearchResult[]): VaultSearchResult[] {
+  return results.filter((result) => privacyForSource(result).privacyLevel === "safe");
 }
 
 function authorityPoints(authority: SourceAuthority): number {
@@ -613,18 +618,46 @@ function normalizeAfmResponse(data: unknown): Partial<PreparedTaskPacket> {
     }
     if (Array.isArray(partial.risks)) normalized.risks = partial.risks.filter((item) => typeof item === "string");
     if (partial.outcomeDraft && typeof partial.outcomeDraft === "object") {
-      const draft = partial.outcomeDraft as Partial<OutcomeDraft>;
-      normalized.outcomeDraft = {
-        learnCandidates: Array.isArray(draft.learnCandidates) ? draft.learnCandidates.filter((item) => typeof item === "string") : [],
-        logOnly: Array.isArray(draft.logOnly) ? draft.logOnly.filter((item) => typeof item === "string") : [],
-        expires: Array.isArray(draft.expires) ? draft.expires.filter((item) => typeof item === "string") : [],
-        doNotStore: Array.isArray(draft.doNotStore) ? draft.doNotStore.filter((item) => typeof item === "string") : [],
-      };
+      normalized.outcomeDraft = normalizeOutcomeDraft(partial.outcomeDraft as Partial<OutcomeDraft>);
     }
     if (Object.keys(normalized).length > 0) return normalized;
   }
   if (chatContent?.trim()) return { brief: chatContent.trim() };
   return {};
+}
+
+function normalizeOutcomeDraft(draft: Partial<OutcomeDraft> | undefined): OutcomeDraft {
+  const source = draft ?? {};
+  const raw: Record<keyof OutcomeDraft, string[]> = {
+    learnCandidates: Array.isArray(source.learnCandidates) ? source.learnCandidates.filter((item) => typeof item === "string") : [],
+    logOnly: Array.isArray(source.logOnly) ? source.logOnly.filter((item) => typeof item === "string") : [],
+    expires: Array.isArray(source.expires) ? source.expires.filter((item) => typeof item === "string") : [],
+    doNotStore: Array.isArray(source.doNotStore) ? source.doNotStore.filter((item) => typeof item === "string") : [],
+  };
+  const redact = (item: string): string =>
+    item
+      .replace(/\/Users\/[^\s"',)]+/g, "[local-path]")
+      .replace(/\/Volumes\/[^\s"',)]+/g, "[local-path]")
+      .replace(/\s+/g, " ")
+      .trim();
+  const seen = new Set<string>();
+  const pick = (items: string[]) => {
+    const out: string[] = [];
+    for (const item of items) {
+      const clean = redact(item);
+      const key = clean.toLowerCase();
+      if (!clean || seen.has(key)) continue;
+      seen.add(key);
+      out.push(clean);
+    }
+    return out;
+  };
+  // Most restrictive buckets win when a model duplicates content across classes.
+  const doNotStore = pick(raw.doNotStore);
+  const expires = pick(raw.expires);
+  const logOnly = pick(raw.logOnly);
+  const learnCandidates = pick(raw.learnCandidates);
+  return { learnCandidates, logOnly, expires, doNotStore };
 }
 
 function sourceAllowedForAfm(source: unknown): source is TaskSource {
@@ -675,6 +708,7 @@ export function buildAfmChatPayload(payload: Record<string, unknown>): Record<st
       ? [
           "Return compact JSON only for Codex outcome prep.",
           "Keys: outcomeDraft with learnCandidates, logOnly, expires, doNotStore.",
+          "Buckets must be mutually exclusive; put uncertain or sensitive items in the most restrictive applicable bucket.",
           "No secrets, no raw private logs, no local absolute paths.",
           providerLine,
           `Task: ${redactLocal(payload.task, 500)}`,
@@ -695,6 +729,7 @@ export function buildAfmChatPayload(payload: Record<string, unknown>): Record<st
       : [
           "Return compact JSON only for Codex task prep.",
           "Keys: brief, recommendedNextActions, risks.",
+          "Interpret wiring/config/providers as Minni software integration work, never physical or electrical wiring.",
           "No secrets, no raw private logs.",
           providerLine,
           `Task: ${String(payload.task ?? "").slice(0, 500)}`,
@@ -775,8 +810,8 @@ export async function prepareTask(input: PrepareTaskInput, deps: PrepareTaskDeps
   const afmHealthResult = afmRequested && (afmProviderMode === "native" || afmProviderMode === "auto") ? await checkAfmHealth() : undefined;
   const afmProvider = afmRequested
     ? resolveAfmProvider(afmProviderMode, {
-        health: afmHealthResult,
-        nativeHelperPath: process.env.MINNI_AFM_NATIVE_HELPER,
+      health: afmHealthResult,
+      nativeHelperPath: resolvedNativeHelperPath(),
       })
     : resolveAfmProvider("off");
 
@@ -850,14 +885,14 @@ function outcomeDraft(input: PrepareOutcomeInput): OutcomeDraft {
     ...verification.map((item) => `Verification: ${item}`),
     changedFiles.length > 0 ? `Changed files: ${changedFiles.join(", ")}` : "",
   ].filter(Boolean);
-  return {
+  return normalizeOutcomeDraft({
     learnCandidates,
     logOnly,
     expires: ["Implementation-specific status should be refreshed after the next backend pass."],
     doNotStore: [
       "Do not store raw logs, raw sessions, local DB contents, adapter files, launchd plists, secrets, or machine-local paths.",
     ],
-  };
+  });
 }
 
 function outcomeContextMarkdown(packet: PreparedOutcomePacket): string {
@@ -978,8 +1013,8 @@ export async function prepareOutcome(
   const afmHealthResult = afmRequested && (afmProviderMode === "native" || afmProviderMode === "auto") ? await checkAfmHealth() : undefined;
   const afmProvider = afmRequested
     ? resolveAfmProvider(afmProviderMode, {
-        health: afmHealthResult,
-        nativeHelperPath: process.env.MINNI_AFM_NATIVE_HELPER,
+      health: afmHealthResult,
+      nativeHelperPath: resolvedNativeHelperPath(),
       })
     : resolveAfmProvider("off");
   let packet: PreparedOutcomePacket = {
@@ -1025,7 +1060,7 @@ export async function prepareOutcome(
       packet = {
         ...packet,
         mode: "afm",
-        outcomeDraft: data.outcomeDraft ?? packet.outcomeDraft,
+        outcomeDraft: normalizeOutcomeDraft(data.outcomeDraft ?? packet.outcomeDraft),
         afm: {
           ...packet.afm,
           used: true,

@@ -1,10 +1,10 @@
-# Sovereign Memory — Privacy and Policy Contract
+# Minni — Privacy and Policy Contract
 
 **Contract version:** 1.0.0 (IMPLEMENTED — baseline)
 **Last updated:** 2026-04-26 (PARTIAL — G03 matrix update)
 
 This document defines the default privacy posture, redaction rules, retention
-rules, and cross-agent data sharing rules for Sovereign Memory. All agents,
+rules, and cross-agent data sharing rules for Minni. All agents,
 operators, and integrations are bound by this contract.
 
 ---
@@ -19,10 +19,10 @@ Specific defaults:
 
 | Surface | Default |
 |---------|---------|
-| Vault storage | Local filesystem only (`~/.sovereign-memory/<agent>-vault/`) |
-| Database | Local SQLite only (`sovereign_memory.db`) |
-| FAISS index | Local disk only (`~/.sovereign-memory/*.faiss`) |
-| Daemon socket | Unix domain socket, local only (`~/.sovereign-memory/run/sovrd.sock`) |
+| Vault storage | Local filesystem only (`~/.minni/<agent>-vault/`) |
+| Database | Local SQLite only (`~/.minni/minni.db`) |
+| FAISS index | Local disk only (`~/.minni/minni_faiss.index`) |
+| Daemon socket | Unix domain socket, local only (`~/.minni/run/minnid.sock`) |
 | Cross-agent recall | Enabled for `privacy_level=safe` pages within the same installation |
 | Handoff packets | Opt-in per handoff; never automatic |
 
@@ -90,7 +90,7 @@ result is returned, and is not overridable by any flag or config.
 
 ### 2.5 Enforcement
 
-Redaction is the responsibility of the daemon (`engine/sovrd.py`). Agents that
+Redaction is the responsibility of the daemon (`engine/minnid.py`). Agents that
 receive recalled content MUST NOT strip or bypass redaction markers. An agent
 that receives `[REDACTED]` in a result MUST treat the redacted field as absent.
 

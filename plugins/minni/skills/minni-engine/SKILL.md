@@ -9,24 +9,20 @@ tags: [openclaw, memory, llm, faiss, sqlite]
 ## File Structure
 
 ```
-~/.openclaw/minni-v3.1/
-├── config.py              # Centralized config (dataclass, env var overrides)
-├── db.py                  # SQLite + FTS5 schema (learnings, chunk_embeddings, episodic_events)
-├── app.py                 # FastAPI service (all /recall, /learn, /process_conversation endpoints)
-├── extraction.py          # LLM fact extraction via OpenClaw gateway
-├── retrieval.py           # Hybrid FTS5 + FAISS + RRF + Cohere rerank pipeline
-├── writeback.py           # Write-back memory, contradiction detection, learning lifecycle
-├── consolidation.py       # Idle-time memory compression (background)
-├── agent_api.py           # SovereignAgent — agent-facing API
-├── chunker.py             # Markdown-aware document chunking
-├── faiss_index.py         # FAISS index manager (flat ↔ HNSW auto-switch)
-├── episodic.py            # Episodic event logging
-├── decay.py               # Memory decay (half-life scoring)
-├── indexer.py             # Vault indexing pipeline
-├── graph_export.py        # Graph exporter
-├── sovereign_memory.py    # CLI entry point
-├── venv/                  # Python 3.14 venv with all deps
-└── requirements.txt
+~/Projects/Minni/
+├── Makefile               # Root setup/check/test/daemon entrypoint
+├── engine/
+│   ├── .venv/             # Python 3.14 venv with all deps
+│   ├── config.py          # Centralized config (dataclass, MINNI_* overrides)
+│   ├── db.py              # SQLite + FTS5 schema
+│   ├── minnid.py          # JSON-RPC daemon over Unix socket
+│   ├── retrieval.py       # Hybrid FTS5 + FAISS + RRF pipeline
+│   ├── writeback.py       # Write-back memory and learning lifecycle
+│   ├── faiss_index.py     # FAISS index manager
+│   ├── episodic.py        # Episodic event logging
+│   ├── indexer.py         # Vault indexing pipeline
+│   └── requirements.txt
+└── plugins/minni/         # Multi-host TypeScript plugin
 ```
 
 ## Key Interfaces (don't break these)
@@ -90,30 +86,29 @@ To swap to a different LLM backend:
 ## Config (config.py)
 
 All settings are fields on the `SovereignConfig` dataclass. Env var overrides:
-- `SOVEREIGN_VAULT_PATH`, `SOVEREIGN_DB_PATH`, `SOVEREIGN_FAISS_PATH`
-- `OPENROUTER_API_KEY` — for reranking API
-- `OPENCLAW_GATEWAY_URL` — for LLM extraction (default: `http://localhost:18789`)
+- `MINNI_HOME`, `MINNI_VAULT_PATH`, `MINNI_DB_PATH`, `MINNI_FAISS_PATH`
+- `MINNI_AFM_PROVIDER_MODE`, `MINNI_AFM_MODE`, `MINNI_AFM_ALLOWED_TARGETS`
+- `MINNI_PROVIDERS_CONFIG` and provider-specific secret references
 
 The global `DEFAULT_CONFIG = SovereignConfig()` is imported everywhere.
 
 ## Testing Changes
 
 ```bash
-cd ~/.openclaw/workspaces/workspace-forge/minni-v3.1
-source venv/bin/activate
+cd ~/Projects/Minni
+make setup
 
 # Syntax check
-python3 -c "import py_compile; py_compile.compile('extraction.py', doraise=True)"
+engine/.venv/bin/python -c "import py_compile; py_compile.compile('engine/minnid.py', doraise=True)"
 
 # Import check (verify no broken deps)
-python3 -c "from extraction import get_extractor; from retrieval import RetrievalEngine; from config import DEFAULT_CONFIG; print('OK')"
+(cd engine && .venv/bin/python -c "from retrieval import RetrievalEngine; from config import DEFAULT_CONFIG; print('OK')")
 
-# Start the service
-uvicorn app:app --host 0.0.0.0 --port 8312 --reload
+# Start the daemon
+make daemon
 
-# Test endpoints
-curl http://localhost:8312/extraction_status
-curl http://localhost:8312/stats
+# Check daemon readiness
+engine/.venv/bin/python engine/minnid_client.py --socket ~/.minni/run/minnid.sock status
 ```
 
 ## Related Skills

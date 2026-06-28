@@ -202,3 +202,4 @@ scripts/run_harvest.py
 *.docx
 # Excalidraw scratch diagrams
 *.excalidraw
+.worktrees/
