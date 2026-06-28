@@ -301,3 +301,25 @@ the following fields are always present in every result:
 return something — even if that something is only `{text, source, heading, score}`
 — rather than a stack trace. Agents must never crash or refuse to respond because
 memory is degraded.
+
+## 7. No New Filesystem Side-Channels
+
+**The rule:** new features communicate through `minnid` RPC. Do not introduce
+new folder-of-files channels, watch directories, drop-file queues, lock files as
+shared state, or cross-agent communication via paths.
+
+**Why:** Minni's scaling path depends on stateless `minnid` replicas coordinating
+through storage and RPC boundaries, not shared local filesystem observations.
+Every filesystem side-channel added today is something that must be re-homed
+before multi-node deployment can work.
+
+**This rule is not retroactive.** Existing vault, inbox/outbox, FAISS manifest,
+and plan-artifact file surfaces are grandfathered because their semantics are
+already gatekeeper-controlled. Future work should treat them as storage-backed
+contracts, not precedents for new path polling.
+
+**The test for new work:** if another process must watch a path or poll a
+directory to learn something happened, put it behind an RPC method or a
+storage-backed queue instead. If a reviewer cannot tell whether a file is a
+derived artifact or a communication channel, the feature needs a design note
+before it merges.
