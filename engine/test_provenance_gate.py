@@ -17,6 +17,7 @@ import pytest
 sys.path.insert(0, os.path.dirname(__file__))
 
 import minnid  # type: ignore
+import minnid_runtime.provenance as provenance  # type: ignore
 import principal  # type: ignore
 from principal import EffectivePrincipal, IdentityMismatchError
 
@@ -80,7 +81,7 @@ def test_resolve_provenance_returns_specific_known_identity(tmp_path: Path, monk
             operator_context=operator_context,
         )
 
-    monkeypatch.setattr(minnid, "resolve_effective_principal", _patched_resolve)
+    monkeypatch.setattr(provenance, "resolve_effective_principal", _patched_resolve)
 
     result = minnid.resolve_provenance(
         {"jsonrpc": "2.0", "id": 1, "method": "search", "params": {"agent_id": "codex"}}
@@ -98,7 +99,7 @@ def test_dispatch_routes_unresolved_identity_to_recovery_before_handler(monkeypa
     def _handler_should_not_run(_params, _request_id):
         raise AssertionError("handler ran before provenance recovery")
 
-    monkeypatch.setattr(minnid, "resolve_effective_principal", _boom_resolve)
+    monkeypatch.setattr(provenance, "resolve_effective_principal", _boom_resolve)
     monkeypatch.setitem(minnid._METHODS, "gate_test", _handler_should_not_run)
 
     response = minnid._dispatch_sync(

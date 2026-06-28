@@ -86,3 +86,28 @@ def test_dispatch_runtime_rejects_non_object_params_before_handler():
         "bad",
     )
     assert calls == []
+
+
+def test_provenance_core_lives_in_runtime_package_and_remains_compat_exports():
+    import minnid
+    from minnid_runtime.provenance import (
+        RECOVERY_ALLOWED_METHODS,
+        RPC_CAPABILITY_REQUIREMENTS,
+        ProvenanceResolution,
+        enforce_method_capability,
+        guard_vault_root,
+        handler_principal,
+        provenance_claim,
+        recover,
+        resolve_provenance,
+    )
+
+    assert minnid.RECOVERY_ALLOWED_METHODS is RECOVERY_ALLOWED_METHODS
+    assert minnid._RPC_CAPABILITY_REQUIREMENTS is RPC_CAPABILITY_REQUIREMENTS
+    assert minnid.ProvenanceResolution is ProvenanceResolution
+    assert minnid.recover is recover
+    assert minnid._provenance_claim is provenance_claim
+    assert minnid.resolve_provenance is resolve_provenance
+    assert minnid._handler_principal is handler_principal
+    assert minnid._guard_vault_root is guard_vault_root
+    assert minnid._enforce_method_capability is enforce_method_capability

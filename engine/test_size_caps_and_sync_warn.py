@@ -28,6 +28,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 @pytest.fixture(autouse=True)
 def setup_hermetic_principals(tmp_path, monkeypatch):
     import principal
+    import minnid_runtime.provenance as provenance
     import minnid
     import json
 
@@ -92,6 +93,7 @@ def setup_hermetic_principals(tmp_path, monkeypatch):
         )
 
     monkeypatch.setattr(principal, "resolve_effective_principal", _patched_resolve)
+    monkeypatch.setattr(provenance, "resolve_effective_principal", _patched_resolve)
     monkeypatch.setattr(minnid, "resolve_effective_principal", _patched_resolve)
 
 

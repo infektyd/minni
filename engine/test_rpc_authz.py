@@ -28,6 +28,7 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(__file__))
 
 import minnid
+import minnid_runtime.provenance as provenance
 from principal import EffectivePrincipal
 
 
@@ -57,7 +58,7 @@ def _stamp_principal(monkeypatch, agent_id, capabilities=("*",)):
     """Force the server-stamped EffectivePrincipal for the next handler calls
     (the handlers only ever trust the stamp, never wire strings)."""
     principal = EffectivePrincipal(agent_id=agent_id, capabilities=list(capabilities))
-    monkeypatch.setattr(minnid, "resolve_effective_principal", lambda **_kw: principal)
+    monkeypatch.setattr(provenance, "resolve_effective_principal", lambda **_kw: principal)
     return principal
 
 
