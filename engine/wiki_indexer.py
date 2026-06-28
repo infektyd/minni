@@ -581,7 +581,7 @@ class WikiIndexer:
                        (source_doc_id, target_doc_id, link_type, weight, created_at)
                        VALUES (?, ?, ?, ?, ?)
                        ON CONFLICT(source_doc_id, target_doc_id, link_type)
-                       DO UPDATE SET weight=excluded.weight, created_at=excluded.created_at""",
+                       DO UPDATE SET weight=excluded.weight""",
                     insert_data,
                 )
                 link_count += len(insert_data)
@@ -594,7 +594,7 @@ class WikiIndexer:
                            (source_doc_id, target_doc_id, link_type, weight, created_at)
                            VALUES (?, ?, ?, ?, ?)
                            ON CONFLICT(source_doc_id, target_doc_id, link_type)
-                           DO UPDATE SET weight=excluded.weight, created_at=excluded.created_at""",
+                           DO UPDATE SET weight=excluded.weight""",
                         data,
                     )
                     link_count += 1

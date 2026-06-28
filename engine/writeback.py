@@ -237,7 +237,7 @@ class WriteBackMemory:
                         (source_doc_id, target_doc_id, link_type, weight, created_at)
                         VALUES (?, ?, 'derived_from', 1.0, ?)
                         ON CONFLICT(source_doc_id, target_doc_id, link_type)
-                        DO UPDATE SET weight=excluded.weight, created_at=excluded.created_at
+                        DO UPDATE SET weight=excluded.weight
                         """,
                         (learning_doc_id, evidence_doc_id, now),
                     )
