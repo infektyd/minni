@@ -133,6 +133,7 @@ def sync_backend(
     dim = embedding_dim or backend.dim or cfg.embedding_dim
 
     state = get_backend_state(backend.name, db)
+    is_dirty = state["status"] == "dirty"
     start_rowid = 0 if full_rebuild else state["last_synced_chunk_rowid"]
 
     logger.debug(
@@ -202,6 +203,47 @@ def sync_backend(
                     "vector_count": state["vector_count"],
                     "status": "error",
                 }
+
+    # Reconcile deletions. The incremental cursor above only catches INSERTs
+    # (chunk_id > start_rowid); a deleted chunk leaves a stale vector in the
+    # backend forever. On a dirty (post-delete) or full_rebuild pass, drop any
+    # vector whose chunk_id is no longer present in chunk_embeddings — otherwise
+    # deleted memories keep surfacing in recall (index-to-DB deletion drift).
+    if is_dirty or full_rebuild:
+        prior_max = state["last_synced_chunk_rowid"]
+        if prior_max > 0:
+            with db.cursor() as c:
+                c.execute(
+                    "SELECT chunk_id FROM chunk_embeddings WHERE chunk_id <= ?",
+                    (prior_max,),
+                )
+                existing = {row["chunk_id"] for row in c.fetchall()}
+            to_remove = [cid for cid in range(1, prior_max + 1) if cid not in existing]
+            if to_remove:
+                try:
+                    backend.remove(to_remove)
+                    logger.info(
+                        "Removed %d deleted vectors from backend %r",
+                        len(to_remove), backend.name,
+                    )
+                except Exception as exc:
+                    logger.error(
+                        "Backend %r remove failed during dirty sync: %s",
+                        backend.name, exc,
+                    )
+                    _upsert_backend_state(
+                        backend.name, db,
+                        last_synced_chunk_rowid=start_rowid,
+                        vector_count=state["vector_count"],
+                        status="error",
+                    )
+                    return {
+                        "backend": backend.name,
+                        "upserted": upserted,
+                        "last_rowid": last_rowid,
+                        "vector_count": state["vector_count"],
+                        "status": "error",
+                    }
 
     # Count total vectors in the backend (use stats() if available)
     try:

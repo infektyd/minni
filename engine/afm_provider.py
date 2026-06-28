@@ -75,6 +75,11 @@ def _safe_status_error(error: Optional[str]) -> Optional[str]:
     )
     text = re.sub(r"\bsk-[A-Za-z0-9_-]{8,}\b", "[redacted-key]", text)
     text = re.sub(r"/(?:Users|Volumes|private|var|tmp|Library)/[^\s\"')]+", "[local-path]", text)
+    # Windows drive-letter paths (C:\Users\..., D:/data/...) — the POSIX pattern
+    # above only matches forward-slash unix paths, so Windows paths leaked raw.
+    # \b avoids eating multi-letter URL schemes (http:// etc., where the letter
+    # before ':' is not a word boundary).
+    text = re.sub(r"\b[A-Za-z]:[\\/][^\s\"')]+", "[local-path]", text)
     text = re.sub(r"[^\s\"')]+\.fmadapter\b", "[adapter]", text)
     text = re.sub(r"[^\s\"')]+\.(?:db|sqlite|sqlite3|faiss|index|plist)\b", "[local-artifact]", text)
     return text[:240]
@@ -301,7 +306,7 @@ def verify_afm_generation(
     mode: Optional[str] = None,
     *,
     url: Optional[str] = None,
-    timeout: float = _GENERATION_PROBE_TIMEOUT_SECONDS,
+    timeout: Optional[float] = None,
     ttl_seconds: float = _GENERATION_PROBE_TTL_SECONDS,
     client: Optional["BridgeClient"] = None,
     now: Callable[[], float] = time.time,
@@ -313,6 +318,11 @@ def verify_afm_generation(
     re-probed synchronously here (the probe is bounded by `timeout`); the TS
     mirror refreshes in the background because SessionStart latency matters there.
     """
+    if timeout is None:
+        # PR84-5: read the probe timeout at CALL time so a runtime/test override
+        # of MINNI_AFM_PROBE_TIMEOUT takes effect — it was previously bound once
+        # at import into the default argument.
+        timeout = _generation_probe_timeout_seconds()
     resolved = resolve_afm_mode(mode)
     if resolved == "off":
         return {

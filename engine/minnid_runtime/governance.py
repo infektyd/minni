@@ -583,6 +583,7 @@ def list_candidates(params: dict, request_id: Any, context: GovernanceContext) -
 
     status_f = params.get("status")
     limit = min(int(params.get("limit", 100)), 500)
+    db = None
     try:
         db = context.sovereign_db()
         with db.cursor() as c:
@@ -613,6 +614,12 @@ def list_candidates(params: dict, request_id: Any, context: GovernanceContext) -
     except Exception as exc:
         context.logger.exception("list_candidates failed")
         return context.make_error(-32000, f"list_candidates error: {exc}", request_id)
+    finally:
+        if db is not None and hasattr(db, "close"):
+            try:
+                db.close()
+            except Exception:
+                pass
 
 
 def explicitly_allowed_operator(principal: EffectivePrincipal) -> bool:
@@ -710,6 +717,7 @@ def resolve_candidate(params: dict, request_id: Any, context: GovernanceContext)
     new_status = status_map.get(decision, "rejected")
     now = time.time()
 
+    db = None
     try:
         db = context.sovereign_db()
         lid = None
@@ -791,3 +799,9 @@ def resolve_candidate(params: dict, request_id: Any, context: GovernanceContext)
     except Exception as exc:
         context.logger.exception("resolve_candidate failed")
         return context.make_error(-32000, f"resolve_candidate error: {exc}", request_id)
+    finally:
+        if db is not None and hasattr(db, "close"):
+            try:
+                db.close()
+            except Exception:
+                pass

@@ -34,6 +34,11 @@ const CORE_SCOPE_TOOLS = new Set(["Grep", "Read", "Glob"]);
  * Resolve the guard mode from config. Default "soft" (Grep/Read/Glob only; Bash
  * untouched). "strict" additionally guards read/search Bash; "off" disables it.
  * Anything unrecognized falls back to the default rather than guessing.
+ *
+ * PR90-1: MINNI_RECALL_GUARD_MODE is the master switch for the s6 PreToolUse
+ * RECALL GUARD — set it to "off" to disable the deny-to-surface backstop. This
+ * is DISTINCT from MINNI_LIFECYCLE_NUDGE_MODE (agent_envelope.ts), which only
+ * governs the lifecycle representation/nudge and does NOT control this guard.
  */
 export function recallGuardMode(
   env: NodeJS.ProcessEnv = process.env,

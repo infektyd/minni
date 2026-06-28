@@ -252,6 +252,7 @@ def handle_daemon_compile(params: dict, request_id: Any, context: AFMContext) ->
             "drafts_written": [],
         }, request_id)
 
+    db = None
     try:
         pass_runners = {
             "session_distillation": "afm_passes.session_distillation",
@@ -321,6 +322,11 @@ def handle_daemon_compile(params: dict, request_id: Any, context: AFMContext) ->
             "drafts_written": [],
         }, request_id)
     finally:
+        if db is not None and hasattr(db, "close"):
+            try:
+                db.close()
+            except Exception:
+                pass
         context.record_latency("afm", time.perf_counter() - started_at)
 
 

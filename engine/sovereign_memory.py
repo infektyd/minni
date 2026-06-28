@@ -48,6 +48,7 @@ Usage:
     python -m engine.sovereign_memory hygiene --vault <path>
 """
 
+import os
 import sys
 import json
 import logging
@@ -398,6 +399,7 @@ def cmd_compile(args):
     pass_name = "session_distillation"
     dry_run = True
     vault = DEFAULT_CONFIG.vault_path
+    agent = None
     i = 0
     while i < len(args):
         if args[i] == "--pass" and i + 1 < len(args):
@@ -406,6 +408,9 @@ def cmd_compile(args):
         elif args[i] == "--vault" and i + 1 < len(args):
             vault = args[i + 1]
             i += 2
+        elif args[i] == "--agent" and i + 1 < len(args):
+            agent = args[i + 1]
+            i += 2
         elif args[i] == "--dry-run":
             dry_run = True
             i += 1
@@ -413,8 +418,14 @@ def cmd_compile(args):
             dry_run = False
             i += 1
         else:
-            print("Usage: sovereign_memory.py compile --pass <session_distillation|synthesis|procedure_extraction|reorganization|pruning> [--dry-run|--wet-run] [--vault <path>]")
+            print("Usage: sovereign_memory.py compile --pass <session_distillation|synthesis|procedure_extraction|reorganization|pruning> [--dry-run|--wet-run] [--vault <path>] [--agent <id>]")
             sys.exit(1)
+
+    # PR91-2: propagate the agent scope so the passes bind to a single agent's
+    # session instead of querying globally. session_distillation reads
+    # MINNI_AGENT_ID; an explicit --agent wins over an inherited env value.
+    if agent and str(agent).strip():
+        os.environ["MINNI_AGENT_ID"] = str(agent).strip()
 
     if not getattr(DEFAULT_CONFIG, "afm_loop_schedule", {}).get("enabled", False):
         print(json.dumps({

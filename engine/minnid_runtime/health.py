@@ -10,6 +10,30 @@ from db import SovereignDB
 
 logger = logging.getLogger("minnid")
 
+# NEW-01: health_report is reachable pre-identity (in RECOVERY_ALLOWED_METHODS),
+# so its per-record fields — document paths and learning contents — must be
+# withheld from an unstamped recovery-mode caller. Liveness/aggregate signals stay.
+_HEALTH_REPORT_SENSITIVE_KEYS = ("stale_docs", "never_recalled", "contradicting_learnings")
+
+
+def redact_health_report_for_recovery(report: dict) -> dict:
+    """Strip document paths and learning contents from a pre-identity health_report.
+
+    Per-record detail is replaced with a count so an unauthenticated caller
+    cannot enumerate filesystem paths or learning text; non-sensitive liveness
+    fields (afm_loop, faiss_cache_age_seconds, vector_backend_lag) are retained.
+    Returns a new dict; the input is not mutated.
+    """
+    redacted = dict(report)
+    for key in _HEALTH_REPORT_SENSITIVE_KEYS:
+        items = report.get(key) or []
+        redacted[f"{key}_count"] = len(items)
+        redacted[key] = []
+    redacted["redacted"] = (
+        "pre-identity diagnostic: per-record detail withheld until a principal is stamped"
+    )
+    return redacted
+
 
 @dataclass(frozen=True)
 class HealthContext:
@@ -268,6 +292,12 @@ def handle_health_report(params: dict, request_id: Any, context: HealthContext) 
                 db.close()
             except Exception:
                 pass
+
+    # Fail-closed: redact unless the dispatcher's trusted flag says this is a
+    # fully-identified (non-recovery) caller. `_recovery` is set by dispatch and
+    # cannot be spoofed by the client.
+    if params.get("_recovery") is not False:
+        report = redact_health_report_for_recovery(report)
 
     return context.make_response(report, request_id)
 

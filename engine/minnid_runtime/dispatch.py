@@ -50,6 +50,10 @@ async def dispatch_request(request: dict, context: DispatchContext) -> dict:
         and method_name not in context.recovery_allowed_methods
     ):
         return context.make_response(provenance.recovery, request_id)
+    # Trusted recovery flag: overwrite any caller-supplied value so a pre-identity
+    # client cannot spoof authenticated detail out of recovery-allowed handlers
+    # (e.g. health_report path/content redaction keys off this).
+    params["_recovery"] = provenance.recovery is not None
     if provenance.principal is not None:
         params.setdefault("_principal", provenance.principal)
 

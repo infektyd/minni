@@ -314,12 +314,31 @@ Every filesystem side-channel added today is something that must be re-homed
 before multi-node deployment can work.
 
 **This rule is not retroactive.** Existing vault, inbox/outbox, FAISS manifest,
-and plan-artifact file surfaces are grandfathered because their semantics are
-already gatekeeper-controlled. Future work should treat them as storage-backed
-contracts, not precedents for new path polling.
+plan-artifact, and the per-vault `.runtime/recall-state.json` /
+`.runtime/lifecycle-state.json` lifecycle files are grandfathered because their
+semantics are already gatekeeper-controlled (single-writer, vault-scoped, reset
+per session). Future work should treat them as storage-backed contracts, not
+precedents for new path polling.
 
 **The test for new work:** If another process must watch a path or poll a
 directory to learn something happened, put it behind an RPC method or a
 storage-backed queue instead. If a reviewer cannot tell whether a file is a
 derived artifact or a communication channel, the feature needs a design note
 before it merges.
+
+## 8. Hook capability parity (PreToolUse is Claude-only)
+
+The s6 recall **guard** is a `PreToolUse` hook that can **deny** a tool call
+before it runs (deny-to-surface: the agent re-issues the call after consulting
+recall). Among the supported surfaces, **only Claude Code exposes a deny-capable
+pre-tool hook**, so the guard is registered only in Claude's
+`plugins/minni/hooks/hooks.json`.
+
+`codex`, `grok`, `kilocode`, and `gemini` integrate Minni through MCP servers and
+CLI entrypoints and do **not** expose an equivalent deny-capable pre-tool event.
+The guard is therefore intentionally **not** wired into their manifests — this is
+a platform capability gap, **not** a Minni omission. Those surfaces still receive
+the lifecycle nudge and the `UserPromptSubmit` recall pointer; only the
+deny-to-surface backstop is Claude-only. If a non-Claude surface later exposes a
+deny-capable pre-tool hook, wire it in `propagate.py` (see the note above
+`platform_spec`).

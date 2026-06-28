@@ -158,6 +158,7 @@ from minnid_runtime.health import (  # noqa: E402
     handle_health_report as _runtime_handle_health_report,
     handle_hygiene_report as _runtime_handle_hygiene_report,
     handle_status as _runtime_handle_status,
+    redact_health_report_for_recovery as _redact_health_report_for_recovery,
 )
 from minnid_runtime.provenance import (  # noqa: E402
     RECOVERY_ALLOWED_METHODS,

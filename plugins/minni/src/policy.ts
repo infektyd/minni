@@ -36,6 +36,16 @@ function includesAny(text: string, terms: string[]): boolean {
   return terms.some((term) => text.includes(term));
 }
 
+/** Interrogative form: ends with "?" or opens with a question word. */
+function isQuestion(text: string): boolean {
+  return (
+    text.trim().endsWith("?") ||
+    /^\s*(what|which|who|whom|whose|when|where|why|how|did|do|does|is|are|was|were|have|has|had|can|could|should|would|anything|everything)\b/.test(
+      text,
+    )
+  );
+}
+
 function clampScore(score: number): number {
   return Math.max(0, Math.min(1, Number(score.toFixed(2))));
 }
@@ -46,6 +56,22 @@ function conciseQuery(task: string): string {
 
 export function routeMemoryIntent(task: string): MemoryIntent {
   const text = task.toLowerCase();
+  // A QUESTION that mentions "learn" (e.g. "what did we learn about X?") asks to
+  // RETRIEVE prior learnings — it must route to recall, not be swallowed by the
+  // bare-"learn" write check below (which previously suppressed recall). Recall
+  // is read-only and automatic, so erring this way on an ambiguous question is
+  // safe; an explicit imperative ("learn this …") is not a question and still
+  // routes to learn.
+  if (isQuestion(text) && /\blearn(ed|ing|t|ings|s)?\b/.test(text)) {
+    return {
+      action: "recall",
+      confidence: 0.74,
+      automaticAllowed: true,
+      reason: "Question about prior learnings — recall, not a durable write.",
+      suggestedTool: "minni_recall",
+      suggestedQuery: conciseQuery(task),
+    };
+  }
   if (includesAny(text, LEARN_TERMS)) {
     return {
       action: "learn",

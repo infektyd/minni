@@ -51,6 +51,17 @@ call sites consume normalized data after the provider boundary.
 - Private adapter paths, DB paths, vault material, logs, and raw sessions must
   stay out of public git and out of model-facing provider metadata.
 
+## Known limitation: native `error_kind` is observe-and-log only
+
+When a native op trips a recoverable `LanguageModelError`, the passes CLASSIFY
+and LOG the `error_kind` (`context_overflow` / `guardrail`) so a recoverable trip
+is distinguishable from "AFM down" — but they do NOT yet act on it. The original
+PR #84 description's "`context_overflow` (chunk)" / "`guardrail` (rephrase/skip)"
+wording describes the *intended* recovery, not behavior that shipped: today the
+pass simply returns empty on any trip. Real recovery (re-chunk on overflow,
+rephrase on guardrail) is tracked as separate follow-up work and is not part of
+the merged #84 behavior.
+
 ## Verification
 
 This work was verified with:

@@ -854,6 +854,7 @@ def handle_read(params: dict, request_id: Any, context: RecallContext) -> dict:
     agent_id = principal.agent_id
     limit = min(int(params.get("limit", 5)), 20)
 
+    db = None
     try:
         db = context.sovereign_db()
         lines = []
@@ -959,7 +960,6 @@ def handle_read(params: dict, request_id: Any, context: RecallContext) -> dict:
                         f"  - [{row['event_type']}] "
                         f"{row['content'][:120]} ({ts})"
                     )
-        db.close()
 
         return context.make_response({
             "agent_id": agent_id,
@@ -969,4 +969,9 @@ def handle_read(params: dict, request_id: Any, context: RecallContext) -> dict:
         context.logger.exception("read failed")
         return context.make_error(-32000, f"Read error: {exc}", request_id)
     finally:
+        if db is not None and hasattr(db, "close"):
+            try:
+                db.close()
+            except Exception:
+                pass
         context.record_latency("read", time.perf_counter() - started_at)

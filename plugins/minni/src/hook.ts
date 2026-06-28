@@ -581,20 +581,26 @@ async function handlePreToolUse(
   const verdict = decideGuard({ state, mode, threshold, toolName, toolInput });
   if (verdict === "allow") return preToolUseAllow();
 
-  // DENY: flip consumed=true BEFORE returning so the re-issued call (and every
-  // other tool call this turn) ALWAYS passes. The guard fires at most once.
-  await markRecallConsumed(CLAUDECODE_VAULT_PATH).catch(() => {});
+  // DENY surfaces the recall ONCE: flip consumed=true FIRST so the re-issued
+  // call (and every other tool call this turn) passes. PR90-2: only deny if that
+  // flag actually persisted — if the write failed, denying would loop the WHOLE
+  // turn (every re-issued call re-reads consumed=false and is denied again). On
+  // a persistence failure we FAIL OPEN and allow, trading a missed nudge for
+  // availability.
+  const consumed = await markRecallConsumed(CLAUDECODE_VAULT_PATH).catch(() => false);
   await recordAudit(CLAUDECODE_VAULT_PATH, {
     tool: "hook_pretooluse_guard",
-    summary: `recall guard denied ${toolName} (mode=${mode})`,
+    summary: `recall guard ${consumed ? "denied" : "allowed (consume write failed)"} ${toolName} (mode=${mode})`,
     details: {
       tool: toolName,
       mode,
+      consumed,
       top_score: state!.top_score,
       hits: state!.top_hits.length,
       task_signature: state!.task_signature,
     },
   }).catch(() => {});
+  if (!consumed) return preToolUseAllow();
   return preToolUseDeny(state!);
 }
 

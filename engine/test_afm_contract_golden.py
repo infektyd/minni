@@ -334,7 +334,10 @@ def test_golden_hyde_auto_unusable_native_answer_falls_back_to_bridge(tmp_path, 
     # The native helper WAS consulted first (auto prefers native)...
     envelope = json.loads(capture.read_text(encoding="utf-8"))
     assert envelope["operation"] == "hyde_generation"
-    # ...and the bridge then received the byte-identical chat payload.
+    # ...and the bridge then received the same chat payload SHAPE. NOTE (PR84-4):
+    # "model" is the canonical AFM bridge identifier ("apple-foundation-models"),
+    # not an echo of any configured model name — so this is structurally
+    # equivalent, not literally byte-identical across arbitrary configs.
     assert captured["url"] == "http://127.0.0.1:11437/v1/chat/completions"
     assert captured["payload"] == {
         "model": "apple-foundation-models",

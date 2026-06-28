@@ -95,18 +95,32 @@ def save(
     Returns:
         True on success, False on failure.
     """
+    # NEW-04: every artifact is written to a sibling temp file first and only
+    # os.replace()'d into place once fully written, so an interrupted or
+    # out-of-disk save can never leave a half-written index or a manifest
+    # pointing at partial data. The manifest is renamed LAST — it is the
+    # commit point the loader keys on, so it only becomes visible once the
+    # index/npz is already in place. Any temp that never made it into place is
+    # cleaned up in the finally block.
+    tmp_paths: List[str] = []
     try:
         os.makedirs(os.path.dirname(manifest_path), exist_ok=True)
 
         faiss_path = _index_path(manifest_path)
+        pending: List[Tuple[str, str]] = []  # (tmp_path, final_path)
 
-        # Write FAISS index (if faiss available) or numpy backup
+        # Write FAISS index (if faiss available) or numpy backup, to TEMP first.
+        # Each temp path is registered in tmp_paths BEFORE the write, so the
+        # finally block cleans it up even if the write itself raises midway.
         if index is not None:
             try:
                 import faiss
                 if not hasattr(faiss, "write_index"):
                     raise AttributeError("faiss.write_index is unavailable")
-                faiss.write_index(index, faiss_path)
+                tmp_faiss = faiss_path + ".tmp"
+                tmp_paths.append(tmp_faiss)
+                faiss.write_index(index, tmp_faiss)
+                pending.append((tmp_faiss, faiss_path))
             except Exception as e:
                 logger.warning("Failed to write FAISS index: %s; trying numpy fallback", e)
                 index = None
@@ -116,7 +130,15 @@ def save(
             npz_path = faiss_path + ".npz"
             if vectors:
                 arr = np.array(vectors, dtype=np.float32)
-                np.savez_compressed(npz_path, vectors=arr, chunk_ids=np.array(chunk_ids))
+                tmp_npz = npz_path + ".tmp"
+                tmp_paths.append(tmp_npz)
+                # Pass a file handle so numpy does not append a second ".npz" to
+                # the temp name (it only auto-appends when given a path string).
+                with open(tmp_npz, "wb") as fh:
+                    np.savez_compressed(fh, vectors=arr, chunk_ids=np.array(chunk_ids))
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                pending.append((tmp_npz, npz_path))
             else:
                 logger.warning("Cannot save numpy fallback: no raw vectors available")
                 return False
@@ -130,8 +152,19 @@ def save(
             "db_checksum": db_checksum,
             "saved_at": datetime.now(timezone.utc).isoformat(),
         }
-        with open(manifest_path, "w", encoding="utf-8") as f:
+        tmp_manifest = manifest_path + ".tmp"
+        tmp_paths.append(tmp_manifest)
+        with open(tmp_manifest, "w", encoding="utf-8") as f:
             json.dump(manifest, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+
+        # Commit atomically: data artifact(s) first, manifest last.
+        for tmp, final in pending:
+            os.replace(tmp, final)
+            tmp_paths.remove(tmp)
+        os.replace(tmp_manifest, manifest_path)
+        tmp_paths.remove(tmp_manifest)
 
         logger.info(
             "FAISS index saved: %d vectors → %s (checksum=%s)",
@@ -142,6 +175,13 @@ def save(
     except Exception as e:
         logger.warning("FAISS save failed: %s", e)
         return False
+    finally:
+        # Remove any temp file that was not renamed into place (failed save).
+        for tmp in tmp_paths:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
 
 
 def load(

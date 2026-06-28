@@ -453,11 +453,11 @@ class WikiIndexer:
             # Phase 2: Resolve [[wikilinks]] NOW (all pages are in the DB)
             target_map = self.parser.get_wikilink_targets(wiki_path)
             for doc_id, wikilinks, source_path in pages_to_link:
-                # Clean old links for this source
-                c.execute(
-                    "DELETE FROM memory_links WHERE source_doc_id = ?",
-                    (doc_id,),
-                )
+                # PR94-1: _index_wikilinks does a diff-based update (prune only
+                # stale wikilinks, upsert the rest) so surviving links keep their
+                # original created_at. The old blunt delete-before-insert here
+                # defeated the ON CONFLICT preservation AND nuked other link
+                # types (e.g. derived_from) on every re-index.
                 link_count = self._index_wikilinks(
                     c, doc_id, wikilinks, target_map, time.time()
                 )
@@ -537,22 +537,19 @@ class WikiIndexer:
         Returns the number of links created.
         """
         link_count = 0
-        seen: Set[Tuple[int, int]] = set()
 
-        # Phase 1: Collect and deduplicate valid target paths
-        target_paths = set()
-        for link_target in wikilinks:
-            target_path = target_map.get(link_target)
-            if target_path:
-                target_paths.add(target_path)
-
-        if not target_paths:
-            return 0
+        # Phase 1: Collect and deduplicate valid target paths. NOTE: we do NOT
+        # early-return on an empty set — a page whose wikilinks all became
+        # unresolvable (target renamed/deleted, [[old]] -> [[missing]]) still
+        # needs its now-stale edges pruned below.
+        target_paths = list({
+            target_map[link_target]
+            for link_target in wikilinks
+            if target_map.get(link_target)
+        })
 
         # Phase 2: Batch query target doc_ids (chunked to stay under SQLite limits)
-        target_paths = list(target_paths)
         target_doc_ids = set()
-
         for i in range(0, len(target_paths), 500):
             batch = target_paths[i:i + 500]
             placeholders = ",".join(["?"] * len(batch))
@@ -563,15 +560,35 @@ class WikiIndexer:
             for row in cursor.fetchall():
                 target_doc_ids.add(row["doc_id"])
 
-        # Phase 3: Construct batch insert parameters
-        insert_data = []
-        for target_doc_id in target_doc_ids:
-            if source_doc_id == target_doc_id:
-                continue
+        # Phase 3: Diff-based prune. Keep-set = valid targets minus self. Compute
+        # which existing wikilink edges are now stale (existing - keep) and delete
+        # only those, in chunks — this runs even when keep_ids is empty (all links
+        # gone) and never builds an unbounded NOT IN list (SQLite var limit).
+        # Scoped to link_type='wikilink' so other edge types (derived_from)
+        # survive a re-index; surviving links keep created_at via the upsert below.
+        keep_ids = {tid for tid in target_doc_ids if tid != source_doc_id}
+        cursor.execute(
+            "SELECT target_doc_id FROM memory_links "
+            "WHERE source_doc_id = ? AND link_type = 'wikilink'",
+            (source_doc_id,),
+        )
+        existing_ids = {row["target_doc_id"] for row in cursor.fetchall()}
+        stale_ids = list(existing_ids - keep_ids)
+        for i in range(0, len(stale_ids), 500):
+            batch = stale_ids[i:i + 500]
+            placeholders = ",".join(["?"] * len(batch))
+            cursor.execute(
+                "DELETE FROM memory_links WHERE source_doc_id = ? "
+                f"AND link_type = 'wikilink' AND target_doc_id IN ({placeholders})",
+                (source_doc_id, *batch),
+            )
 
-            insert_data.append((source_doc_id, target_doc_id, "wikilink", 1.0, now))
-
-            insert_data.append((source_doc_id, target_doc_id, "wikilink", 1.0, now))
+        # One row per unique target (PR94-3: removed the duplicate append that
+        # double-counted every wikilink).
+        insert_data = [
+            (source_doc_id, target_doc_id, "wikilink", 1.0, now)
+            for target_doc_id in keep_ids
+        ]
 
         # Phase 4: Batch insert with fallback
         try:

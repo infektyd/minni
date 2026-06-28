@@ -217,6 +217,56 @@ def test_native_op_failure_invalidates_cached_probe(monkeypatch):
     afm_provider.reset_afm_generation_probe_cache()
 
 
+def test_native_op_recoverable_trip_preserves_cached_probe(monkeypatch):
+    """PR84-1: a RECOVERABLE green-op trip (context_overflow / guardrail) means
+    the helper is alive and generation-capable — it must NOT invalidate the
+    generation-verified probe cache. A real (non-recoverable) failure still does."""
+    import afm_provider
+    from afm_provider import (
+        AFMResult,
+        DEFAULT_AFM_CHAT_COMPLETIONS_URL,
+        note_afm_generation_success,
+    )
+    from model_provider import AfmProvider
+
+    monkeypatch.setenv("MINNI_AFM_PROVIDER_MODE", "native")
+    key = f"native|{DEFAULT_AFM_CHAT_COMPLETIONS_URL}"
+
+    def _seed():
+        afm_provider.reset_afm_generation_probe_cache()
+        note_afm_generation_success(DEFAULT_AFM_CHAT_COMPLETIONS_URL, "native")
+        assert key in afm_provider._generation_probe_cache
+
+    # Recoverable trips keep the probe.
+    for kind in ("context_overflow", "guardrail"):
+        _seed()
+        monkeypatch.setattr(
+            afm_provider,
+            "invoke_native_afm",
+            lambda op, payload, timeout=2.0, _k=kind: AFMResult(
+                ok=False, data={"error_kind": _k}, provider="native",
+                status="error", error="recoverable trip",
+            ),
+        )
+        result = AfmProvider().native_op("compile_pass_proposals", {"x": 1})
+        assert result.ok is False
+        assert key in afm_provider._generation_probe_cache, kind
+
+    # A real failure (no/unknown error_kind) still invalidates the probe.
+    _seed()
+    monkeypatch.setattr(
+        afm_provider,
+        "invoke_native_afm",
+        lambda op, payload, timeout=2.0: AFMResult(
+            ok=False, data={}, provider="native", status="error", error="helper dead",
+        ),
+    )
+    result = AfmProvider().native_op("compile_pass_proposals", {"x": 1})
+    assert result.ok is False
+    assert key not in afm_provider._generation_probe_cache
+    afm_provider.reset_afm_generation_probe_cache()
+
+
 def test_native_op_success_marks_verified_only_with_content(tmp_path, monkeypatch):
     """Finding 4 + finding 1 consistency: native_op success-marking respects the
     same content check as the probe — a contentless ok is neutral."""

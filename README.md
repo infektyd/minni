@@ -75,7 +75,7 @@ The primary surface is organized by tool family:
 
 | Family | Actions |
 |---|---|
-| `minni_prepare` | task, outcome |
+| `minni_prepare_task` / `minni_prepare_outcome` | task packet; outcome dry-run |
 | `minni_recall` | recall, drill, route, export pack |
 | `minni_plan` | create, update, status, activate, deactivate, replan, history, diff, restore, scar |
 | `minni_learn` | quality review or durable commit; gated mode stages candidates |
@@ -130,8 +130,8 @@ are concrete:
 
 - startup hooks can inject compact identity, active plan state, correction
   re-assertions, and bounded inbox/candidate state;
-- `minni_prepare` returns ranked `relevantSources` for task prep and an
-  `outcomeDraft` for post-task learning review;
+- `minni_prepare_task` returns ranked `relevantSources` for task prep and
+  `minni_prepare_outcome` returns an `outcomeDraft` for post-task learning review;
 - `minni_recall` returns cited snippets/chunks/documents with provenance,
   review state, privacy level, and depth controls.
 

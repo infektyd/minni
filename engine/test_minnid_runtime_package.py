@@ -82,7 +82,7 @@ def test_dispatch_runtime_rejects_non_object_params_before_handler():
     )
 
     assert response == make_response({"called": True}, "empty-list")
-    assert calls == [({}, "empty-list")]
+    assert calls == [({"_recovery": False}, "empty-list")]
 
     calls.clear()
     response = asyncio.run(
