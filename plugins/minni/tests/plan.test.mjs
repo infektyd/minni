@@ -518,17 +518,36 @@ test("minni_plan_status/_update/_history accept an OPTIONAL plan_id (C5 schema p
 });
 
 test("every id-less plan tool returns the no-active-plan error end-to-end through the MCP server", async (t) => {
-  // Review panel: the C5 schema pin is a text scan; this drives the REAL
-  // registered handlers over MCP stdio and asserts the user-visible error JSON
-  // when plan_id is omitted and no plan is active — the highest-risk
-  // regression path for id-less addressing. Fixture vault only — every
-  // vault env var is pointed at a tmpdir so live ~/.minni state is untouched.
   const { spawn } = await import("node:child_process");
+  const net = await import("node:net");
   const root = await mkdtemp(path.join(tmpdir(), "sm-plan-mcp-"));
+  const home = path.join(root, "home");
+  const socketPath = path.join(home, "minnid.sock");
+  await mkdir(home, { recursive: true });
+  const fakeDaemon = net.createServer((socket) => {
+    let buffer = "";
+    socket.on("data", (chunk) => {
+      buffer += chunk.toString("utf8");
+      if (!buffer.includes("\n")) return;
+      const request = JSON.parse(buffer.split("\n")[0]);
+      const respond = (result) => {
+        socket.write(`${JSON.stringify({ jsonrpc: "2.0", id: request.id, result })}\n`);
+      };
+      if (request.method === "gate.shared") {
+        respond({ ok: true, status: "allowed" });
+        return;
+      }
+      respond({ ok: true });
+    });
+  });
+  await new Promise((resolve) => fakeDaemon.listen(socketPath, resolve));
+  t.after(() => fakeDaemon.close());
   const serverPath = new URL("../dist/server.js", import.meta.url).pathname;
   const child = spawn(process.execPath, [serverPath], {
     env: {
       ...process.env,
+      MINNI_HOME: home,
+      MINNI_SOCKET_PATH: socketPath,
       MINNI_VAULT_PATH: root,
       MINNI_CLAUDECODE_VAULT_PATH: root,
       MINNI_KILOCODE_VAULT_PATH: root,

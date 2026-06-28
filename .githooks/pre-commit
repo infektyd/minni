@@ -1,5 +1,21 @@
 #!/usr/bin/env bash
+# Minni pre-commit hook.
+#
+# Two gates, in order:
+#   1. Public-boundary guard — block staged paths that match .gitignore/.gitfilters
+#      (private runtime state, logs, databases, generated output).
+#   2. Fast lint gate — venv ruff (engine) + eslint/typecheck (plugin), but only
+#      when files in that surface are actually staged. Kept to lint/typecheck
+#      (no full test run) so commits stay fast.
+#
+# Enable once per clone:  git config core.hooksPath .githooks
+# Escape hatch (skip both gates):  MINNI_SKIP_HOOKS=1 git commit ...
 set -euo pipefail
+
+if [ "${MINNI_SKIP_HOOKS:-0}" = "1" ]; then
+  echo "[pre-commit] MINNI_SKIP_HOOKS=1 — skipping guard + lint gates." >&2
+  exit 0
+fi
 
 repo_root="$(git rev-parse --show-toplevel)"
 cd "$repo_root"
@@ -83,7 +99,7 @@ for path in staged_paths():
         blocked[path] = "matches .gitfilters"
 
 if blocked:
-    print("Sovereign Memory public-boundary guard blocked this commit.", file=sys.stderr)
+    print("Minni public-boundary guard blocked this commit.", file=sys.stderr)
     print("These staged paths look like private runtime state, logs, databases, or generated output:", file=sys.stderr)
     for path, reason in sorted(blocked.items()):
         print(f"  - {path} ({reason})", file=sys.stderr)
@@ -91,3 +107,26 @@ if blocked:
     print("Move durable docs/source into an allowed path, or update .gitfilters only if the file is intentionally public.", file=sys.stderr)
     sys.exit(1)
 PY
+
+# ── Gate 2: fast lint/typecheck on touched surfaces ─────────────────────────
+staged="$(git diff --cached --name-only --diff-filter=ACMR)"
+
+if echo "$staged" | grep -Eq '^engine/.*\.py$'; then
+  echo "[pre-commit] engine Python staged — running ruff…" >&2
+  if [ -x engine/.venv/bin/python ]; then
+    ( cd engine && .venv/bin/python -m ruff check . )
+  else
+    echo "[pre-commit] engine/.venv missing — run 'make setup'; skipping engine lint." >&2
+  fi
+fi
+
+if echo "$staged" | grep -Eq '^plugins/minni/(src|tests)/.*\.(ts|mts|cts|mjs|cjs|js)$'; then
+  echo "[pre-commit] plugin sources staged — running eslint + typecheck…" >&2
+  if [ -d plugins/minni/node_modules ]; then
+    ( cd plugins/minni && npm run --silent lint && npm run --silent typecheck )
+  else
+    echo "[pre-commit] plugins/minni/node_modules missing — run 'npm ci' there; skipping plugin lint." >&2
+  fi
+fi
+
+echo "[pre-commit] OK" >&2

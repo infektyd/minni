@@ -1,4 +1,4 @@
-#!/usr/bin/env python3.11
+#!/usr/bin/env python3
 """Standalone recall bisect harness for Minni (plan-5631eeaec8000f40, s1).
 
 Builds a fresh in-process RetrievalEngine against a temp SQLite DB + FAISS
@@ -44,10 +44,10 @@ Knobs (all overridable via CLI flags):
 
 Usage (from worktree root or bench/):
   PYTHONPATH=/path/to/worktree/engine \\
-  /opt/homebrew/bin/python3.11 bench/bisect_harness.py [--faithful]
+  engine/.venv/bin/python bench/bisect_harness.py [--faithful]
 
-The script must be run with python3.11 (engine target). Using python3 (3.14)
-crashes the engine.
+Run with the engine venv so it uses the same Python 3.14 dependencies as
+`make check` and CI.
 """
 from __future__ import annotations
 
@@ -64,8 +64,8 @@ from pathlib import Path
 from typing import Optional
 
 # ── path setup ──────────────────────────────────────────────────────────────
-# Allow both:  python3.11 bench/bisect_harness.py  (cwd = worktree root)
-# and:         python3.11 bisect_harness.py         (cwd = bench/)
+# Allow both:  engine/.venv/bin/python bench/bisect_harness.py  (cwd = worktree root)
+# and:         ../engine/.venv/bin/python bisect_harness.py      (cwd = bench/)
 _HERE = Path(__file__).resolve().parent          # bench/
 _REPO = _HERE.parent                              # worktree root
 

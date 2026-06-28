@@ -5,7 +5,7 @@ import path from "node:path";
 import os from "node:os";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
-import { DEFAULT_VAULT_PATH, PLUGIN_ROOT } from "./config.js";
+import { DEFAULT_AGENT_ID, DEFAULT_VAULT_PATH, PLUGIN_ROOT } from "./config.js";
 import { buildStatusReport } from "./sovereign.js";
 import { prepareOutcome, prepareTask, type PrepareOutcomeInput, type PrepareTaskInput } from "./task.js";
 import { auditTail } from "./vault.js";
@@ -18,6 +18,8 @@ const DEFAULT_DEEP_RESEARCH_CLI =
   process.env.DEEP_RESEARCH_CLI ?? path.join(DEFAULT_DEEP_RESEARCH_ROOT, ".venv", "bin", "deep-research");
 const DEFAULT_DEEP_RESEARCH_PYTHON =
   process.env.DEEP_RESEARCH_PYTHON ?? path.join(DEFAULT_DEEP_RESEARCH_ROOT, ".venv", "bin", "python");
+const configuredConsoleAuth = (process.env.MINNI_CONSOLE_TOKEN ?? "").trim();
+const DEEP_RESEARCH_ENABLED = process.env.MINNI_CONSOLE_DEEP_RESEARCH === "1";
 const execFileAsync = promisify(execFile);
 
 type ResearchMode = "web" | "local-docs" | "hybrid";
@@ -113,6 +115,20 @@ function localOriginAllowed(origin: string | undefined): boolean {
 
 function fetchSiteAllowed(value: string | undefined): boolean {
   return !value || value === "same-origin" || value === "same-site" || value === "none";
+}
+
+function consoleAuthRequired(pathname: string): boolean {
+  if (pathname === "/api/health") return false;
+  if (pathname.startsWith("/api/deep-research")) return true;
+  if (pathname === "/api/audit-tail") return true;
+  return configuredConsoleAuth.length > 0;
+}
+
+function consoleAuthorized(req: IncomingMessage, pathname: string): boolean {
+  if (!consoleAuthRequired(pathname)) return true;
+  if (!configuredConsoleAuth) return false;
+  const auth = req.headers.authorization ?? "";
+  return auth === `Bearer ${configuredConsoleAuth}`;
 }
 
 function jsonContentTypeAllowed(value: string | undefined): boolean {
@@ -474,6 +490,15 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       }
 
       const url = new URL(req.url ?? "/", `http://${req.headers.host ?? `${host}:${port}`}`);
+      if (!consoleAuthorized(req, url.pathname)) {
+        sendJson(res, 403, { error: "console_auth_required", hint: "Set MINNI_CONSOLE_TOKEN and send Authorization: Bearer <token>" });
+        return;
+      }
+      if (url.pathname.startsWith("/api/deep-research") && !DEEP_RESEARCH_ENABLED) {
+        sendJson(res, 403, { error: "deep_research_disabled", hint: "Set MINNI_CONSOLE_DEEP_RESEARCH=1 to enable" });
+        return;
+      }
+
       if (req.method === "GET" && url.pathname === "/api/health") {
         sendJson(res, 200, {
           ok: true,
@@ -549,6 +574,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
             candidate_id: body.candidate_id,
             decision: body.decision,
             reason: body.reason || body.resolution_reason || "",
+            agent_id: DEFAULT_AGENT_ID,
           });
           sendJson(res, 200, redactLocalValue(rpc));
         } catch (e) {

@@ -33,7 +33,7 @@ def _install_strict_principal(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, a
     import principal as principal_mod
 
     principals = tmp_path / "principals"
-    principals.mkdir()
+    principals.mkdir(exist_ok=True)
     (principals / "main.json").write_text(
         json.dumps(
             {

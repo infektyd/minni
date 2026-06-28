@@ -44,7 +44,11 @@ export async function readStdin(): Promise<unknown> {
   });
 }
 
-export function emit(output: HookOutput): void {
+// Accepts both the envelope HookOutput and the s6 PreToolUse permissionDecision
+// shape (a structurally different object); both are plain JSON-serializable, so
+// the param is the broad `object` rather than a union that would couple this
+// protocol leaf to the guard module.
+export function emit(output: object): void {
   process.stdout.write(`${JSON.stringify(output)}\n`);
 }
 

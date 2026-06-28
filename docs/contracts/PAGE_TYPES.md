@@ -59,7 +59,7 @@ across requests, and maintains per-agent recall context.
 
 ## Key facts
 
-- **Socket:** `~/.sovereign-memory/run/sovrd.sock` (configurable via `--socket`)
+- **Socket:** `~/.minni/run/minnid.sock` (configurable via `--socket`)
 - **Protocol:** JSON-RPC 2.0, line-delimited (newline-separated messages)
 - **Engine:** FAISS + FTS5 dual retrieval, cross-encoder re-ranking, RRF fusion
 - **Source:** `engine/sovrd.py`
@@ -147,7 +147,7 @@ trace_id: t3c4d5e6
 ## Decision
 
 The Sovereign Memory daemon communicates with clients via a Unix domain socket
-(`~/.sovereign-memory/run/sovrd.sock`) using JSON-RPC 2.0 over a line-delimited protocol.
+(`~/.minni/run/minnid.sock`) using JSON-RPC 2.0 over a line-delimited protocol.
 
 ## Rationale
 
@@ -217,7 +217,7 @@ to the shared recall pool.
 
 2. **Run the indexer** against the vault:
    ```bash
-   python engine/index_all.py --vault-path ~/.sovereign-memory/claudecode-vault \
+   engine/.venv/bin/python engine/index_all.py --vault-path ~/.minni/claudecode-vault \
        --agent claude-code
    ```
 
@@ -422,7 +422,7 @@ human sessions.
 
 ## Open questions
 
-- Where to store agent identity keys? Proposal: `~/.sovereign-memory/keys/`
+- Where to store agent identity keys? Proposal: `~/.minni/keys/`
 - Refresh tokens needed for long-running tasks? Leaning no; re-auth instead.
 
 ## Files touched in my session

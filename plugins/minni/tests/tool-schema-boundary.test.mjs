@@ -85,3 +85,26 @@ test("minni_recall schema exposes scope enum and keeps cross_agent back-compat",
   assert.match(recallBlock, /scope:\s*z\.enum\(\["personal",\s*"combined",\s*"both"\]\)\.optional\(\)/);
   assert.match(recallBlock, /cross_agent:\s*z\.boolean\(\)\.optional\(\)/);
 });
+
+test("minni_resolve_candidate carries server principal without model-facing identity spoofing", async () => {
+  const source = stripLineComments(
+    await readFile(new URL("../src/server.ts", import.meta.url), "utf8"),
+  );
+  const start = source.indexOf('"minni_resolve_candidate"');
+  assert.notEqual(start, -1, "minni_resolve_candidate tool registration not found");
+  const nextTool = source.indexOf("server.registerTool(", start + 1);
+  const block = source.slice(start, nextTool === -1 ? undefined : nextTool);
+
+  const schemaStart = block.indexOf("inputSchema:");
+  const handlerStart = block.indexOf("async");
+  const schema = block.slice(schemaStart, handlerStart);
+  assert.doesNotMatch(schema, /\bagent(?:_id|Id)?\s*:/, "model-facing schema must not accept caller identity");
+  assert.match(block, /agent_id:\s*DEFAULT_AGENT_ID/, "resolve RPC must stamp the configured server principal");
+});
+
+test("Codex hook remains Codex-native instead of reusing Claude hook entrypoint", async () => {
+  const codexHook = await readFile(new URL("../src/codex-hook.ts", import.meta.url), "utf8");
+  assert.match(codexHook, /runtime:\s*"codex"/);
+  assert.match(codexHook, /hookScript:\s*"codex-hook\.js"/);
+  assert.doesNotMatch(codexHook, /CLAUDECODE_AGENT_ID|CLAUDECODE_VAULT_PATH|hookScript:\s*"hook\.js"/);
+});
