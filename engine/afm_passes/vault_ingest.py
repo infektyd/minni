@@ -120,20 +120,37 @@ def _delete_doc_payload(cursor, doc_id: int) -> None:
 
 def _insert_wikilinks(cursor, source_doc_id: int, wikilinks: List[str], target_map: Dict[str, str], now: float) -> int:
     target_paths = {target_map[target] for target in wikilinks if target in target_map}
-    if not target_paths:
-        return 0
 
-    placeholders = ",".join("?" for _ in target_paths)
-    cursor.execute(
-        f"SELECT doc_id FROM documents WHERE path IN ({placeholders})",
-        list(target_paths),
-    )
-    target_doc_ids = {int(row["doc_id"]) for row in cursor.fetchall()}
+    keep_ids: set = set()
+    if target_paths:
+        placeholders = ",".join("?" for _ in target_paths)
+        cursor.execute(
+            f"SELECT doc_id FROM documents WHERE path IN ({placeholders})",
+            list(target_paths),
+        )
+        keep_ids = {
+            int(row["doc_id"]) for row in cursor.fetchall() if int(row["doc_id"]) != source_doc_id
+        }
+
+    # PR94-1: diff-based prune scoped to wikilinks — drop only links whose target
+    # is gone, so surviving links keep created_at via the upsert below; other edge
+    # types (derived_from) survive a re-index. Replaces the caller's blunt
+    # delete-before-insert that overwrote created_at on every pass.
+    if keep_ids:
+        ph = ",".join(["?"] * len(keep_ids))
+        cursor.execute(
+            "DELETE FROM memory_links WHERE source_doc_id = ? "
+            f"AND link_type = 'wikilink' AND target_doc_id NOT IN ({ph})",
+            (source_doc_id, *keep_ids),
+        )
+    else:
+        cursor.execute(
+            "DELETE FROM memory_links WHERE source_doc_id = ? AND link_type = 'wikilink'",
+            (source_doc_id,),
+        )
 
     inserted = 0
-    for target_doc_id in target_doc_ids:
-        if target_doc_id == source_doc_id:
-            continue
+    for target_doc_id in keep_ids:
         cursor.execute(
             """INSERT INTO memory_links
                (source_doc_id, target_doc_id, link_type, weight, created_at)
@@ -276,7 +293,8 @@ def _index_changed_pages(
                 logger.warning("vault_ingest: failed to index %s: %s", path, exc)
 
         for source_doc_id, wikilinks in pages_to_link:
-            c.execute("DELETE FROM memory_links WHERE source_doc_id = ?", (source_doc_id,))
+            # PR94-1: _insert_wikilinks now diff-prunes stale wikilinks and
+            # upserts the rest, preserving created_at — no blunt delete here.
             stats["wikilinks"] += _insert_wikilinks(
                 c, source_doc_id, wikilinks, target_map, time.time()
             )

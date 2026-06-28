@@ -453,11 +453,11 @@ class WikiIndexer:
             # Phase 2: Resolve [[wikilinks]] NOW (all pages are in the DB)
             target_map = self.parser.get_wikilink_targets(wiki_path)
             for doc_id, wikilinks, source_path in pages_to_link:
-                # Clean old links for this source
-                c.execute(
-                    "DELETE FROM memory_links WHERE source_doc_id = ?",
-                    (doc_id,),
-                )
+                # PR94-1: _index_wikilinks does a diff-based update (prune only
+                # stale wikilinks, upsert the rest) so surviving links keep their
+                # original created_at. The old blunt delete-before-insert here
+                # defeated the ON CONFLICT preservation AND nuked other link
+                # types (e.g. derived_from) on every re-index.
                 link_count = self._index_wikilinks(
                     c, doc_id, wikilinks, target_map, time.time()
                 )
@@ -537,7 +537,6 @@ class WikiIndexer:
         Returns the number of links created.
         """
         link_count = 0
-        seen: Set[Tuple[int, int]] = set()
 
         # Phase 1: Collect and deduplicate valid target paths
         target_paths = set()
@@ -563,15 +562,32 @@ class WikiIndexer:
             for row in cursor.fetchall():
                 target_doc_ids.add(row["doc_id"])
 
-        # Phase 3: Construct batch insert parameters
-        insert_data = []
-        for target_doc_id in target_doc_ids:
-            if source_doc_id == target_doc_id:
-                continue
+        # Phase 3: Diff-based update. Keep-set = valid targets minus self.
+        keep_ids = {tid for tid in target_doc_ids if tid != source_doc_id}
 
-            insert_data.append((source_doc_id, target_doc_id, "wikilink", 1.0, now))
+        # Prune ONLY stale wikilinks for this source (targets no longer present).
+        # Scoped to link_type='wikilink' so other edge types (derived_from)
+        # survive a re-index, and so surviving wikilinks keep their created_at via
+        # the upsert below (PR94-1 — a blunt delete-before-insert defeated that).
+        if keep_ids:
+            ph = ",".join(["?"] * len(keep_ids))
+            cursor.execute(
+                "DELETE FROM memory_links WHERE source_doc_id = ? "
+                f"AND link_type = 'wikilink' AND target_doc_id NOT IN ({ph})",
+                (source_doc_id, *keep_ids),
+            )
+        else:
+            cursor.execute(
+                "DELETE FROM memory_links WHERE source_doc_id = ? AND link_type = 'wikilink'",
+                (source_doc_id,),
+            )
 
-            insert_data.append((source_doc_id, target_doc_id, "wikilink", 1.0, now))
+        # One row per unique target (PR94-3: removed the duplicate append that
+        # double-counted every wikilink).
+        insert_data = [
+            (source_doc_id, target_doc_id, "wikilink", 1.0, now)
+            for target_doc_id in keep_ids
+        ]
 
         # Phase 4: Batch insert with fallback
         try:
