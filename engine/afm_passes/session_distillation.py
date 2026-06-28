@@ -26,7 +26,13 @@ logger = logging.getLogger("sovereign.afm.session_distillation")
 def _log_native_error_kind(op: str, trace_id: str, result: Any) -> str:
     """Surface the helper's error_kind so a recoverable trip (context_overflow /
     guardrail) is no longer indistinguishable from "AFM down". Returns the
-    classified kind for the caller to record; behavior otherwise unchanged."""
+    classified kind for the caller to record; behavior otherwise unchanged.
+
+    NOTE (PR84-2 retraction): this CLASSIFIES and LOGS the trip only — it does
+    NOT chunk on context_overflow or rephrase on guardrail. The pass still
+    returns empty on a trip. The #84 description's "(chunk)" / "(rephrase/skip)"
+    wording describes intended future recovery, not shipped behavior; real
+    recovery is tracked as separate follow-up work."""
     data = result.data if isinstance(getattr(result, "data", None), dict) else {}
     error_kind = str(data.get("error_kind") or "").strip() or "unknown"
     if error_kind in {"context_overflow", "guardrail"}:
