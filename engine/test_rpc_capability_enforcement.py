@@ -13,6 +13,7 @@ import pytest
 sys.path.insert(0, os.path.dirname(__file__))
 
 import minnid
+import minnid_runtime.provenance as provenance
 from principal import EffectivePrincipal
 
 
@@ -34,7 +35,7 @@ def _patch_db(monkeypatch, tmp_path):
 
 def _stamp(monkeypatch, agent_id, capabilities):
     principal = EffectivePrincipal(agent_id=agent_id, capabilities=list(capabilities))
-    monkeypatch.setattr(minnid, "resolve_effective_principal", lambda **_kw: principal)
+    monkeypatch.setattr(provenance, "resolve_effective_principal", lambda **_kw: principal)
     return principal
 
 

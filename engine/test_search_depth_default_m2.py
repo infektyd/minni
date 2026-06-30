@@ -1,9 +1,10 @@
-"""Test: _handle_search must default to depth='snippet', not 'headline' (M-2 fix).
+"""Test: daemon search must default to depth='snippet', not 'headline' (M-2 fix).
 
 Before the fix: minnid.py:1509 defaulted to depth='headline' which returns
-wikilink + score only — no text for the agent to read. The docstring claimed
-the default was 'snippet'. This test verifies the implementation now matches
-the documented intent.
+wikilink + score only - no text for the agent to read. The docstring claimed
+the default was 'snippet'. The search handler now lives in
+minnid_runtime/recall.py; this test verifies the implementation still matches
+the documented intent after modularization.
 """
 from __future__ import annotations
 
@@ -94,7 +95,7 @@ applies MMR-based diversity selection to fit within this budget.
 
 
 def test_minnid_search_default_depth_param_is_snippet():
-    """Verify the literal default string in minnid._handle_search is 'snippet'.
+    """Verify the literal default string in the runtime search handler is 'snippet'.
 
     This is a source-level assertion so a future diff that re-introduces the
     'headline' default will fail this test immediately — the fix is not silently
@@ -103,8 +104,8 @@ def test_minnid_search_default_depth_param_is_snippet():
     import ast
     import pathlib
 
-    minnid_path = pathlib.Path(__file__).parent / "minnid.py"
-    source = minnid_path.read_text()
+    recall_path = pathlib.Path(__file__).parent / "minnid_runtime" / "recall.py"
+    source = recall_path.read_text()
 
     # Find the line with the depth default
     for line in source.splitlines():
@@ -122,7 +123,7 @@ def test_minnid_search_default_depth_param_is_snippet():
     for node in ast.walk(tree):
         if not isinstance(node, ast.FunctionDef):
             continue
-        if node.name != "_handle_search":
+        if node.name != "handle_search":
             continue
         # Walk the body to find the depth assignment with params.get
         for stmt in ast.walk(node):
@@ -152,12 +153,13 @@ def test_minnid_search_default_depth_param_is_snippet():
                 continue
             actual_default = default_node.value
             assert actual_default == "snippet", (
-                f"_handle_search depth default must be 'snippet' (M-2 fix), "
-                f"got {actual_default!r}. The fix at minnid.py:1509 was reverted."
+                f"handle_search depth default must be 'snippet' (M-2 fix), "
+                f"got {actual_default!r}. The fix was reverted."
             )
             return
 
     pytest.fail(
-        "_handle_search: could not locate the depth=params.get('depth', ...) "
-        "assignment. The M-2 fix may have been removed or the function renamed."
+        "handle_search: could not locate the depth=params.get('depth', ...) "
+        "assignment in minnid_runtime/recall.py. The M-2 fix may have been removed "
+        "or the function renamed."
     )
