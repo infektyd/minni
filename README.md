@@ -3,9 +3,8 @@
 
 **Local-first memory and continuity for AI agents.**
 
-![status: pre-v1](https://img.shields.io/badge/status-pre--v1-orange)
-![transport: local-first](https://img.shields.io/badge/transport-local--first-2ea44f)
-![runtimes: Claude Code · Codex · Gemini · Grok](https://img.shields.io/badge/runtimes-Claude%20Code%20%C2%B7%20Codex%20%C2%B7%20Gemini%20%C2%B7%20Grok-555)
+![status: pre-v1](https://img.shields.io/badge/status-pre--v1-orange) 
+![transport: local-first](https://img.shields.io/badge/transport-local--first-2ea44f) 
 [![Buy me a beer](https://img.buymeacoffee.com/button-api/?text=Buy%20me%20a%20beer&emoji=%F0%9F%8D%BA&slug=y57d6h29td5&button_colour=40DCA5&font_colour=ffffff&font_family=Arial&outline_colour=000000&coffee_colour=FFDD00)](https://www.buymeacoffee.com/y57d6h29td5)
 
 Your agents forget everything between sessions. Minni gives them a local, inspectable memory that survives compaction, restarts, and handoffs — and is shared across Claude Code, Codex, Gemini, and Grok (with Kilo and Antigravity riding the same surfaces).
