@@ -14,7 +14,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
-from afm_chunking import call_native_op_chunked, reduce_via_same_op
+from afm_chunking import call_native_op_and_reduce
 from afm_provider import resolve_afm_mode
 from model_provider import ChatRequest, default_provider_chain
 
@@ -58,21 +58,16 @@ def summarize_with_afm(prompt: str, timeout: float = 1.5) -> Optional[str]:
         # prompts are chunked (not truncated) and, if chunked, reduced back
         # into one summary via a second neighborhood_summary call.
         chain = default_provider_chain()
-        chunk_results, was_chunked = call_native_op_chunked(
-            chain, "neighborhood_summary", {"prompt": prompt}, text_field="prompt", timeout=timeout,
+        native = call_native_op_and_reduce(
+            chain, "neighborhood_summary", {"prompt": prompt}, text_field="prompt",
+            build_reduce_payload=_build_neighborhood_summary_reduce_payload,
+            timeout=timeout,
         )
-        if was_chunked:
-            native = reduce_via_same_op(
-                chain, "neighborhood_summary", chunk_results, _build_neighborhood_summary_reduce_payload,
-                text_field="prompt", timeout=timeout,
-            )
-        else:
-            native = chunk_results[0] if chunk_results else None
-        if native is not None and native.ok:
+        if native is not None:
             summary = native.data.get("summary")
             return str(summary).strip() if summary else None
         if mode == "native":
-            logger.debug("Native AFM neighborhood summary unavailable: %s", native.error if native else "no result")
+            logger.debug("Native AFM neighborhood summary unavailable")
             return None
     payload = {
         "model": "afm-local",

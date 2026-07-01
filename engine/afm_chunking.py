@@ -289,3 +289,97 @@ def reduce_via_same_op(
     # Final safety net: every reduce attempt failed — a partial answer beats
     # nothing, so fall back to the first successful chunk.
     return next((r for r in chunk_results if r.ok), None)
+
+
+class _FoldedResult:
+    """Result-shaped wrapper for deterministic fold outputs, so callers read
+    .ok/.data uniformly whether the reduce was an AFM call or a pure fold."""
+    __slots__ = ("ok", "data", "status", "error")
+
+    def __init__(self, data: Dict[str, Any]):
+        self.ok = True
+        self.data = data
+        self.status = None
+        self.error = None
+
+
+def log_native_error_kind(op: str, trace_id: str, result: Any) -> str:
+    """Surface the helper's error_kind so a recoverable trip (context_overflow /
+    guardrail) is no longer indistinguishable from "AFM down". Returns the
+    classified kind for the caller to record; behavior otherwise unchanged.
+
+    NOTE (PR84-2 retraction): this CLASSIFIES and LOGS the trip only — it does
+    NOT chunk on context_overflow or rephrase on guardrail. The pass still
+    returns empty on a trip. The #84 description's "(chunk)" / "(rephrase/skip)"
+    wording describes intended future recovery, not shipped behavior; real
+    recovery is tracked as separate follow-up work."""
+    data = result.data if isinstance(getattr(result, "data", None), dict) else {}
+    error_kind = str(data.get("error_kind") or "").strip() or "unknown"
+    if error_kind in {"context_overflow", "guardrail"}:
+        logger.info(
+            "afm native op %s recoverable trip (%s): status=%s error=%s trace=%s",
+            op, error_kind, getattr(result, "status", None), getattr(result, "error", None), trace_id,
+        )
+    else:
+        logger.info(
+            "afm native op %s unavailable (error_kind=%s): status=%s error=%s trace=%s",
+            op, error_kind, getattr(result, "status", None), getattr(result, "error", None), trace_id,
+        )
+    return error_kind
+
+
+def call_native_op_and_reduce(
+    chain: Any,
+    op_name: str,
+    payload: Dict[str, Any],
+    text_field: str,
+    build_reduce_payload: Optional[Callable[[List[Dict[str, Any]]], Dict[str, Any]]] = None,
+    fold: Optional[Callable[[List[Dict[str, Any]]], Optional[Dict[str, Any]]]] = None,
+    timeout: float = 4.0,
+    budget_tokens: Optional[int] = None,
+    trace_id: str = "",
+) -> Optional[Any]:
+    """Shared orchestration for every text-field native op call site:
+    chunk-call op_name, then reduce multi-chunk results back to one.
+
+    Reduce strategy — exactly one of:
+    - fold: deterministic fold over the successful chunks' .data dicts
+      (judgment ops like triage/contradiction, where re-judging the model's
+      own verdicts via a second AFM call is unsound). The fold returns the
+      final data dict, or None to signal no usable outcome.
+    - build_reduce_payload: reduce-via-same-op (synthesis ops like
+      session_distill/neighborhood_summary, where a second AFM call over the
+      partials is the intended synthesis).
+
+    Returns the final ok result, or None after logging the error_kind via
+    log_native_error_kind — including when EVERY chunk failed, the case the
+    per-site copies of this block used to drop without any diagnostic."""
+    chunk_results, was_chunked = call_native_op_chunked(
+        chain, op_name, payload, text_field=text_field,
+        timeout=timeout, budget_tokens=budget_tokens,
+    )
+    if not was_chunked:
+        result = chunk_results[0] if chunk_results else None
+    elif fold is not None:
+        successes = [r.data for r in chunk_results if r.ok and isinstance(r.data, dict)]
+        if not successes:
+            result = None
+        elif len(successes) == 1:
+            result = next(r for r in chunk_results if r.ok)
+        else:
+            folded = fold(successes)
+            result = _FoldedResult(folded) if folded is not None else None
+    else:
+        result = reduce_via_same_op(
+            chain, op_name, chunk_results, build_reduce_payload, text_field=text_field,
+            timeout=timeout, budget_tokens=budget_tokens,
+        )
+    if result is None:
+        failed = next((r for r in chunk_results if not getattr(r, "ok", False)), None)
+        if failed is not None:
+            log_native_error_kind(op_name, trace_id, failed)
+        return None
+    if not result.ok:
+        log_native_error_kind(op_name, trace_id, result)
+        return None
+    return result

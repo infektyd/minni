@@ -362,3 +362,85 @@ def test_reduce_via_same_op_final_safety_net_falls_back_to_first_success():
     )
     assert reduced is not None
     assert reduced.data["summary"] == "first success"
+
+
+def test_call_native_op_and_reduce_returns_result_when_under_budget():
+    from afm_chunking import call_native_op_and_reduce
+
+    chain = _FakeChain(lambda op, payload: _FakeResult(True, {"summary": "ok"}))
+    result = call_native_op_and_reduce(
+        chain, "neighborhood_summary", {"prompt": "short prompt"}, text_field="prompt",
+        build_reduce_payload=lambda partials: {"prompt": "joined"},
+    )
+    assert result is not None
+    assert result.data == {"summary": "ok"}
+    assert len(chain.calls) == 1
+
+
+def test_call_native_op_and_reduce_logs_error_kind_when_every_chunk_fails(caplog):
+    import logging
+
+    from afm_chunking import call_native_op_and_reduce
+
+    long_prompt = "word " * 5000  # forces chunking
+    chain = _FakeChain(lambda op, payload: _FakeResult(
+        False, {"error_kind": "guardrail"}, status="native_error", error="blocked",
+    ))
+    with caplog.at_level(logging.INFO, logger="sovereign.afm_chunking"):
+        result = call_native_op_and_reduce(
+            chain, "session_distill", {"text": long_prompt}, text_field="text",
+            build_reduce_payload=lambda partials: {"text": "joined"},
+            trace_id="trace-total-failure",
+        )
+    assert result is None
+    # The total-failure diagnostic must surface the classified error_kind and
+    # trace id — this used to be silently dropped when result was None.
+    assert any(
+        "session_distill" in record.message and "guardrail" in record.message
+        and "trace-total-failure" in record.message
+        for record in caplog.records
+    )
+
+
+def test_call_native_op_and_reduce_logs_and_returns_none_on_single_failed_call(caplog):
+    import logging
+
+    from afm_chunking import call_native_op_and_reduce
+
+    chain = _FakeChain(lambda op, payload: _FakeResult(
+        False, {"error_kind": "unavailable"}, status="native_error", error="down",
+    ))
+    with caplog.at_level(logging.INFO, logger="sovereign.afm_chunking"):
+        result = call_native_op_and_reduce(
+            chain, "triage", {"candidate": "short"}, text_field="candidate",
+            build_reduce_payload=lambda partials: {"candidate": "joined"},
+            trace_id="trace-single",
+        )
+    assert result is None
+    assert any(
+        "triage" in record.message and "trace-single" in record.message
+        for record in caplog.records
+    )
+
+
+def test_call_native_op_and_reduce_fold_merges_chunk_data_without_reduce_call():
+    from afm_chunking import call_native_op_and_reduce
+
+    long_text = "word " * 5000  # forces chunking
+    chain = _FakeChain(lambda op, payload: _FakeResult(True, {"contradicts": False, "reason": "fine"}))
+    folded_inputs = []
+
+    def fold(successes):
+        folded_inputs.extend(successes)
+        return {"contradicts": any(s.get("contradicts") for s in successes), "reason": "folded"}
+
+    result = call_native_op_and_reduce(
+        chain, "contradiction", {"existing": "e", "candidate": long_text},
+        text_field="candidate", fold=fold,
+    )
+    assert result is not None
+    assert result.ok is True
+    assert result.data["reason"] == "folded"
+    assert len(folded_inputs) == len(chain.calls)  # fold saw every chunk success
+    # Deterministic fold: no extra AFM reduce call beyond the map-phase chunks.
+    assert all(op == "contradiction" for op, _ in chain.calls)

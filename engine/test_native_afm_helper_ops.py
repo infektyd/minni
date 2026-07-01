@@ -310,7 +310,9 @@ def test_error_kind_logged_distinctly_on_native_failure(tmp_path, monkeypatch, c
     monkeypatch.setenv("MINNI_AFM_MODE", "native")
     monkeypatch.setattr("afm_provider.invoke_native_afm", _route(op_map))
 
-    with caplog.at_level(logging.INFO, logger="sovereign.afm.session_distillation"):
+    # error_kind logging is canonical in afm_chunking.log_native_error_kind now,
+    # so it emits on that module's logger.
+    with caplog.at_level(logging.INFO, logger="sovereign.afm_chunking"):
         result = run(db_obj, cfg, vault_path=cfg.vault_path, dry_run=True, trace_id="t")
 
     assert result["status"] == "ok"  # behavior otherwise unchanged

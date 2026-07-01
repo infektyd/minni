@@ -20,40 +20,16 @@ from typing import Any, Callable, Dict, List, Optional
 from afm_chunking import (
     AFM_INPUT_BUDGET_TOKENS,
     MIN_CHUNK_TOKENS,
+    call_native_op_and_reduce,
     call_native_op_chunked,
     estimate_native_payload_tokens,
-    reduce_via_same_op,
+    log_native_error_kind as _log_native_error_kind,
     split_list_by_token_budget,
 )
 from afm_provider import resolve_afm_mode
 from model_provider import default_provider_chain
 
 logger = logging.getLogger("sovereign.afm.session_distillation")
-
-
-def _log_native_error_kind(op: str, trace_id: str, result: Any) -> str:
-    """Surface the helper's error_kind so a recoverable trip (context_overflow /
-    guardrail) is no longer indistinguishable from "AFM down". Returns the
-    classified kind for the caller to record; behavior otherwise unchanged.
-
-    NOTE (PR84-2 retraction): this CLASSIFIES and LOGS the trip only — it does
-    NOT chunk on context_overflow or rephrase on guardrail. The pass still
-    returns empty on a trip. The #84 description's "(chunk)" / "(rephrase/skip)"
-    wording describes intended future recovery, not shipped behavior; real
-    recovery is tracked as separate follow-up work."""
-    data = result.data if isinstance(getattr(result, "data", None), dict) else {}
-    error_kind = str(data.get("error_kind") or "").strip() or "unknown"
-    if error_kind in {"context_overflow", "guardrail"}:
-        logger.info(
-            "afm native op %s recoverable trip (%s): status=%s error=%s trace=%s",
-            op, error_kind, getattr(result, "status", None), getattr(result, "error", None), trace_id,
-        )
-    else:
-        logger.info(
-            "afm native op %s unavailable (error_kind=%s): status=%s error=%s trace=%s",
-            op, error_kind, getattr(result, "status", None), getattr(result, "error", None), trace_id,
-        )
-    return error_kind
 
 
 def _slugify(text: str) -> str:
@@ -352,19 +328,12 @@ def _native_session_distill_draft(
     if not text.strip() or not sources:
         return None
     chain = default_provider_chain()
-    chunk_results, was_chunked = call_native_op_chunked(
-        chain, "session_distill", {"text": text}, text_field="text", timeout=4.0,
+    result = call_native_op_and_reduce(
+        chain, "session_distill", {"text": text}, text_field="text",
+        build_reduce_payload=_build_session_distill_reduce_payload,
+        timeout=4.0, trace_id=trace_id,
     )
-    if was_chunked:
-        result = reduce_via_same_op(
-            chain, "session_distill", chunk_results, _build_session_distill_reduce_payload,
-            text_field="text", timeout=4.0,
-        )
-    else:
-        result = chunk_results[0] if chunk_results else None
-    if result is None or not result.ok:
-        if result is not None:
-            _log_native_error_kind("session_distill", trace_id, result)
+    if result is None:
         return None
     data = result.data if isinstance(result.data, dict) else {}
     title = str(data.get("title") or "").strip()
@@ -502,20 +471,13 @@ def _native_contradiction_signal(
     if not existing:
         return None
     chain = default_provider_chain()
-    chunk_results, was_chunked = call_native_op_chunked(
+    result = call_native_op_and_reduce(
         chain, "contradiction", {"existing": existing, "candidate": candidate_text},
-        text_field="candidate", timeout=4.0,
+        text_field="candidate",
+        build_reduce_payload=_build_contradiction_reduce_payload(existing),
+        timeout=4.0, trace_id=trace_id,
     )
-    if was_chunked:
-        result = reduce_via_same_op(
-            chain, "contradiction", chunk_results, _build_contradiction_reduce_payload(existing),
-            text_field="candidate", timeout=4.0,
-        )
-    else:
-        result = chunk_results[0] if chunk_results else None
-    if result is None or not result.ok:
-        if result is not None:
-            _log_native_error_kind("contradiction", trace_id, result)
+    if result is None:
         return None
     data = result.data if isinstance(result.data, dict) else {}
     return {

@@ -174,7 +174,7 @@ def _triage_advisory(candidates: List[Dict[str, Any]],
     # Lazy imports keep the deterministic pass dependency-light and avoid paying
     # provider-chain import cost when AFM is off.
     try:
-        from afm_chunking import call_native_op_chunked, reduce_via_same_op
+        from afm_chunking import call_native_op_and_reduce
         from afm_provider import resolve_afm_mode
         from model_provider import default_provider_chain
     except Exception:  # noqa: BLE001 - advisory must never break consolidation
@@ -204,26 +204,14 @@ def _triage_advisory(candidates: List[Dict[str, Any]],
         return None
     try:
         chain = default_provider_chain()
-        chunk_results, was_chunked = call_native_op_chunked(
-            chain, "triage", {"candidate": content}, text_field="candidate", timeout=4.0,
+        result = call_native_op_and_reduce(
+            chain, "triage", {"candidate": content}, text_field="candidate",
+            build_reduce_payload=_build_triage_reduce_payload,
+            timeout=4.0, trace_id=trace_id,
         )
-        if was_chunked:
-            result = reduce_via_same_op(
-                chain, "triage", chunk_results, _build_triage_reduce_payload,
-                text_field="candidate", timeout=4.0,
-            )
-        else:
-            result = chunk_results[0] if chunk_results else None
     except Exception:  # noqa: BLE001 - advisory must never break consolidation
         return None
-    if result is None or not result.ok:
-        if result is not None:
-            data = result.data if isinstance(result.data, dict) else {}
-            error_kind = str(data.get("error_kind") or "").strip() or "unknown"
-            logger.info(
-                "afm native op triage unavailable (error_kind=%s): status=%s error=%s trace=%s",
-                error_kind, result.status, result.error, trace_id,
-            )
+    if result is None:
         return None
     data = result.data if isinstance(result.data, dict) else {}
     return {
