@@ -69,7 +69,7 @@ def promote_candidate_durable(candidate_id: int, reason: str, context: AFMContex
     if cand.get("status") != "proposed":
         return None
     content = cand.get("content") or ""
-    if int(cand.get("instruction_like") or 0) == 1 or is_instruction_like(content):
+    if int(cand["instruction_like"] or 0) == 1 or is_instruction_like(content):
         now = time.time()
         with wb.db.transaction() as c:
             c.execute("SELECT status FROM candidate_packets WHERE candidate_id=?", (candidate_id,))

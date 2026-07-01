@@ -257,7 +257,7 @@ def run(db, config, vault_path: Optional[str] = None,
             dedup_candidate_ids.append(cand["candidate_id"])
             continue
 
-        if int(cand.get("instruction_like") or 0) == 1 or is_instruction_like(content):
+        if int(cand["instruction_like"] or 0) == 1 or is_instruction_like(content):
             _review(cand, "instruction_like")
             continue
 

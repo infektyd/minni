@@ -757,15 +757,14 @@ def resolve_candidate(params: dict, request_id: Any, context: GovernanceContext)
                     request_id,
                 ))
 
-            content = str(rowd.get("content") or "")
-            stored_instruction_like = bool(int(rowd.get("instruction_like") or 0))
+            content = str(rowd["content"] or "")
+            stored_instruction_like = bool(int(rowd["instruction_like"] or 0))
             computed_instruction_like = stored_instruction_like or is_instruction_like(content)
             if computed_instruction_like and not stored_instruction_like:
                 c.execute(
                     "UPDATE candidate_packets SET instruction_like=1 WHERE candidate_id=?",
                     (cid,),
                 )
-                rowd["instruction_like"] = 1
 
             if (
                 new_status == "accepted"

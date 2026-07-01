@@ -181,7 +181,7 @@ def _build_drafts(events: List[Dict[str, Any]], raw_docs: List[Dict[str, Any]], 
     # the synthesized draft inherits the flag even if the summarized body itself
     # no longer trips is_instruction_like.
     own_flag = is_instruction_like(session_body)
-    source_flag = any(is_instruction_like(event.get("content") or "") for event in events)
+    source_flag = any(is_instruction_like(event["content"] or "") for event in events)
     session_instruction_like = own_flag or source_flag
     if session_instruction_like and not own_flag:
         logger.warning(

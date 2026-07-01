@@ -107,7 +107,7 @@ def load_vault_pages(vault_path: str) -> List[VaultPage]:
                 # something it was itself synthesized from, tripped is_instruction_like.
                 # Read here so downstream synthesis passes can propagate rather than
                 # silently re-launder the flag away.
-                instruction_like=(frontmatter.get("instruction_like") or "").strip().lower() in {"true", "1", "yes"},
+                instruction_like=str(frontmatter.get("instruction_like") or "").strip().lower() in {"true", "1", "yes"},
             )
         )
     return pages
