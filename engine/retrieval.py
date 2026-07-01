@@ -143,6 +143,34 @@ def _evidence_body_escape(text: str) -> str:
     return safe
 
 
+INSTRUCTION_BODY_BOUNDARY = "\u2063"
+_INSTRUCTION_BODY_LITERAL = INSTRUCTION_BODY_BOUNDARY * 2
+_INSTRUCTION_BODY_PLACEHOLDER = "\0MINNI_BOUNDARY\0"
+
+
+def _perturb_instruction_like_body(escaped_text: str) -> str:
+    """Insert reversible token-boundary markers into instruction-like evidence."""
+    escaped_text = str(escaped_text).replace(
+        INSTRUCTION_BODY_BOUNDARY,
+        _INSTRUCTION_BODY_LITERAL,
+    )
+    return re.sub(
+        r"(?<=\w)(\s+)(?=\w)",
+        INSTRUCTION_BODY_BOUNDARY + r"\1",
+        escaped_text,
+    )
+
+
+def _recover_instruction_like_body(perturbed_text: str) -> str:
+    """Recover the escaped evidence body produced before perturbation."""
+    return (
+        str(perturbed_text)
+        .replace(_INSTRUCTION_BODY_LITERAL, _INSTRUCTION_BODY_PLACEHOLDER)
+        .replace(INSTRUCTION_BODY_BOUNDARY, "")
+        .replace(_INSTRUCTION_BODY_PLACEHOLDER, INSTRUCTION_BODY_BOUNDARY)
+    )
+
+
 def build_evidence_envelope(
     *,
     source,
@@ -153,14 +181,18 @@ def build_evidence_envelope(
     instruction_like: bool,
     visibility: str,
     text: str,
+    perturbation_enabled: bool = True,
 ) -> str:
     """G22 evidence-only envelope with attribute + body escaping (SEC-010).
     Module-level so the escaping contract is directly testable."""
+    body = _evidence_body_escape(text)
+    if instruction_like and perturbation_enabled:
+        body = _perturb_instruction_like_body(body)
     return (
         f'<EVIDENCE source="{_xml_attr_escape(source)}" agent="{_xml_attr_escape(agent)}" '
         f'status="{_xml_attr_escape(status)}" privacy="{_xml_attr_escape(privacy)}" '
         f'score="{float(score):.3f}" instruction_like="{str(bool(instruction_like)).lower()}" '
-        f'visibility="{_xml_attr_escape(visibility)}">{_evidence_body_escape(text)}</EVIDENCE>'
+        f'visibility="{_xml_attr_escape(visibility)}">{body}</EVIDENCE>'
     )
 
 
@@ -1143,6 +1175,8 @@ class RetrievalEngine:
                 "recommended_action": result.get("recommended_action"),
                 "recommended_wiki_updates": result.get("recommended_wiki_updates") or [],
             }
+            if result.get("full_provenance") is not None:
+                fields["full_provenance"] = result.get("full_provenance")
             # Only include provenance if not already in existing dict
             if existing is None or "provenance" not in existing:
                 fields["provenance"] = result.get("provenance")
@@ -2132,7 +2166,18 @@ class RetrievalEngine:
                 instruction_like=r["instruction_like"],
                 visibility=vis,
                 text=txt,
+                perturbation_enabled=getattr(
+                    self.config, "instruction_body_perturbation_enabled", True
+                ),
             )
+            if r["instruction_like"]:
+                existing_full = r.get("full_provenance")
+                if not isinstance(existing_full, dict):
+                    existing_full = {}
+                r["full_provenance"] = {
+                    **existing_full,
+                    "original_evidence_text": txt,
+                }
             # Primary text field becomes the envelope so downstream (sovrd JSON, agent_api, formatRecall) sees tagged evidence
             if "chunk_text" in r:
                 r["chunk_text"] = r["evidence_envelope"]
@@ -2182,10 +2227,12 @@ class RetrievalEngine:
 
             # Detect injection in chunk text
             chunk_text = r.get("chunk_text", "")
-            try:
-                instr_like = is_instruction_like(chunk_text)
-            except Exception:
-                instr_like = None
+            instr_like = r.get("instruction_like")
+            if instr_like is None:
+                try:
+                    instr_like = is_instruction_like(chunk_text)
+                except Exception:
+                    instr_like = None
 
             # Infer page type → source_authority mapping
             page_type = r.get("page_type")
@@ -2255,6 +2302,8 @@ class RetrievalEngine:
                 "recommended_action": _recommended_action(page_status, instr_like, confidence),
                 "recommended_wiki_updates": [],
             }
+            if r.get("full_provenance") is not None:
+                raw["full_provenance"] = r.get("full_provenance")
 
             # Rationale is computed after provenance is assembled
             try:
@@ -2419,19 +2468,33 @@ class RetrievalEngine:
             raw["instruction_like"] = bool(is_instruction_like(txt))
             raw["visibility"] = "authorized-via-expand"
             raw["reasoning"] = f"expand can_read_document passed for {getattr(principal,'agent_id','?')}"
-            # wrap (full 8-field construction to match retrieve G22 loop)
-            safe = txt.replace("`", "\\`").replace("\n#", "\n\\#")
             src = raw.get("path", "?")
             ag = raw.get("agent", "?")
             st = raw.get("page_status", "?")
             pr = raw.get("privacy_level", "?")
             sc = float(raw.get("score") or 0)
-            il = str(raw.get("instruction_like", False)).lower()
             vis = raw.get("visibility", "authorized-via-expand")
-            raw["evidence_envelope"] = (
-                f'<EVIDENCE source="{src}" agent="{ag}" status="{st}" privacy="{pr}" '
-                f'score="{sc:.3f}" instruction_like="{il}" visibility="{vis}">{safe}</EVIDENCE>'
+            raw["evidence_envelope"] = build_evidence_envelope(
+                source=src,
+                agent=ag,
+                status=st,
+                privacy=pr,
+                score=sc,
+                instruction_like=raw["instruction_like"],
+                visibility=vis,
+                text=txt,
+                perturbation_enabled=getattr(
+                    self.config, "instruction_body_perturbation_enabled", True
+                ),
             )
+            if raw["instruction_like"]:
+                existing_full = raw.get("full_provenance")
+                if not isinstance(existing_full, dict):
+                    existing_full = {}
+                raw["full_provenance"] = {
+                    **existing_full,
+                    "original_evidence_text": txt,
+                }
             if "chunk_text" in raw:
                 raw["chunk_text"] = raw["evidence_envelope"]
 
