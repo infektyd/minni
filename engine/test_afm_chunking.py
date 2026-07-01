@@ -89,6 +89,23 @@ def test_split_list_by_token_budget_never_returns_empty_group_list():
     assert groups == [[]]
 
 
+def test_split_list_by_token_budget_splits_minified_json_without_tiktoken(monkeypatch):
+    from afm_chunking import split_list_by_token_budget
+
+    monkeypatch.setattr("afm_chunking.get_encoder", lambda: None)
+    # Minified JSON has almost no whitespace; whitespace fallback would keep
+    # this as one group and risk a native overflow.
+    items = [{"payload": "x" * 500} for _ in range(20)]
+    groups = split_list_by_token_budget(
+        items,
+        budget_tokens=100,
+        serialize=lambda item: __import__("json").dumps(item, separators=(",", ":")),
+    )
+    assert len(groups) > 1
+    flattened = [item for group in groups for item in group]
+    assert flattened == items
+
+
 class _FakeResult:
     """Stand-in matching model_provider.ProviderResult for the fields the
     chunking wrapper reads (same shape used by engine/test_native_afm_helper_ops.py's

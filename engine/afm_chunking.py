@@ -19,9 +19,9 @@ import json
 import logging
 import os
 import re
-from typing import Any, Callable, Dict, List
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from tokens import count_tokens
+from tokens import count_tokens, get_encoder
 
 logger = logging.getLogger("sovereign.afm_chunking")
 
@@ -62,13 +62,29 @@ def resolve_afm_input_budget_tokens() -> int:
     return AFM_INPUT_BUDGET_TOKENS
 
 
+def _budget_token_count(text: str) -> int:
+    """Conservative token estimate for proactive AFM budget checks.
+
+    When tiktoken is unavailable, count_tokens() falls back to whitespace
+    splitting, which severely underestimates minified JSON and other dense
+    serialized payloads. For chunking decisions we take the max of that
+    fallback and a char/4 floor so list bin-packing stays under the cap.
+    """
+    counted = count_tokens(text)
+    if get_encoder() is not None:
+        return counted
+    if not text:
+        return 0
+    return max(counted, max(len(text) // 4, 1))
+
+
 def estimate_native_payload_tokens(payload: Dict[str, Any]) -> int:
     """Token-count the compact JSON serialization of payload — mirrors the
     Swift side's compactJSONString sizing closely enough for a proactive
     budget check (exactness isn't required; the reactive fallback in
     call_native_op_chunked catches underestimates)."""
     serialized = json.dumps(payload, separators=(",", ":"), ensure_ascii=False, default=str)
-    return count_tokens(serialized)
+    return _budget_token_count(serialized)
 
 
 def split_text(
@@ -141,7 +157,7 @@ def split_list_by_token_budget(
     current: List[Any] = []
     current_tokens = 0
     for item in items:
-        item_tokens = count_tokens(serialize(item))
+        item_tokens = _budget_token_count(serialize(item))
         if current and current_tokens + item_tokens > budget_tokens:
             groups.append(current)
             current = []
@@ -151,9 +167,6 @@ def split_list_by_token_budget(
     if current:
         groups.append(current)
     return groups or [[]]
-
-
-from typing import Optional, Tuple  # noqa: E402 - grouped with the rest below
 
 
 def _classify_error_kind(result: Any) -> str:
