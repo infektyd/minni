@@ -732,3 +732,32 @@ def test_contradiction_fold_preserves_single_contradicting_chunk(tmp_path, monke
     assert signal is not None
     assert signal["contradicts"] is True
     assert signal["reason"] == "chunk 2 conflicts with the existing fact"
+
+
+def test_entity_extract_cap_logs_dropped_count(tmp_path, monkeypatch, caplog):
+    """When the merged multi-chunk entity list exceeds the cap, the drop is
+    logged with a count — silent truncation was the pre-fix behavior."""
+    from afm_passes.session_distillation import _native_entity_extract
+
+    call_count = {"n": 0}
+
+    def fake_entity_extract(payload):
+        call_count["n"] += 1
+        base = call_count["n"] * 100
+        return _AFMResult(ok=True, data={
+            "entities": [{"name": f"Entity-{base + i}", "type": "concept"} for i in range(15)],
+        })
+
+    monkeypatch.setenv("MINNI_AFM_MODE", "native")
+    monkeypatch.setattr("afm_provider.invoke_native_afm", _route({"entity_extract": fake_entity_extract}))
+
+    long_text = "Session content about many systems. " * 2000  # forces chunking
+    with caplog.at_level(logging.INFO, logger="sovereign.afm.session_distillation"):
+        entities = _native_entity_extract(long_text, "trace-cap")
+
+    assert call_count["n"] > 1  # actually chunked, 15 entities per chunk
+    assert len(entities) == 20  # cap still applies
+    assert any(
+        "entity_extract" in rec.message and "dropped" in rec.message
+        for rec in caplog.records
+    )

@@ -31,6 +31,10 @@ from model_provider import default_provider_chain
 
 logger = logging.getLogger("sovereign.afm.session_distillation")
 
+# Post-merge cap on entity_extract results (carried over from the
+# pre-chunking single-call cap; the drop is logged when it bites).
+_ENTITY_CAP = 20
+
 
 def _slugify(text: str) -> str:
     slug = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
@@ -373,8 +377,9 @@ def _native_session_distill_draft(
 def _native_entity_extract(text: str, trace_id: str) -> List[Dict[str, str]]:
     """Additive review-only entities for the wikilink graph seed. Proposal only:
     NEVER writes durable links. List-shaped: merged deterministically across
-    chunks (dedupe by name.lower(), cap 20) rather than via an AFM reduce
-    pass — no synthesis is needed for a flat entity list."""
+    chunks (dedupe by name.lower(), cap _ENTITY_CAP) rather than via an AFM
+    reduce pass — no synthesis is needed for a flat entity list. Entities
+    dropped by the cap are logged so the truncation is observable."""
     mode = resolve_afm_mode()
     if mode not in {"native", "auto"}:
         return []
@@ -403,7 +408,13 @@ def _native_entity_extract(text: str, trace_id: str) -> List[Dict[str, str]]:
             if name and key not in seen:
                 seen.add(key)
                 entities.append({"name": name, "type": etype})
-    return entities[:20]
+    if len(entities) > _ENTITY_CAP:
+        logger.info(
+            "afm native op entity_extract: cap %d dropped %d merged entities "
+            "(chunk order, not relevance) trace=%s",
+            _ENTITY_CAP, len(entities) - _ENTITY_CAP, trace_id,
+        )
+    return entities[:_ENTITY_CAP]
 
 
 def _similar_existing_learning(db, query: str) -> Optional[str]:
