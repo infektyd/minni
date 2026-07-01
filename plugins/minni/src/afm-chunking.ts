@@ -15,6 +15,21 @@ export const AFM_INPUT_BUDGET_TOKENS = 3200;
 export const MIN_CHUNK_TOKENS = 200;
 
 /**
+ * Mirror of engine/afm_chunking.resolve_afm_input_budget_tokens(): the
+ * MINNI_AFM_INPUT_BUDGET_TOKENS env override first, then the shared default.
+ * Resolved at call time so an operator override takes effect without a
+ * rebuild.
+ */
+export function resolveAfmInputBudgetTokens(): number {
+  const raw = (process.env.MINNI_AFM_INPUT_BUDGET_TOKENS ?? "").trim();
+  if (raw) {
+    const value = Number.parseInt(raw, 10);
+    if (Number.isFinite(value) && value > 0) return value;
+  }
+  return AFM_INPUT_BUDGET_TOKENS;
+}
+
+/**
  * Estimate tokens for a payload via a chars/4 heuristic — the common
  * rule-of-thumb approximation for BPE-style tokenizers (~4 chars/token in
  * English) used when no tokenizer is available. engine/tokens.py's fallback
@@ -86,7 +101,7 @@ export async function callNativeOpChunked(
   callOp: (payload: Record<string, unknown>) => Promise<NativeOpResult>,
   payload: Record<string, unknown>,
   listField: string,
-  budgetTokens: number = AFM_INPUT_BUDGET_TOKENS,
+  budgetTokens: number = resolveAfmInputBudgetTokens(),
 ): Promise<{ results: NativeOpResult[]; wasChunked: boolean }> {
   const estimated = estimateNativePayloadTokens(payload);
   if (estimated <= budgetTokens) {
@@ -130,7 +145,7 @@ export async function reduceViaSameOp(
   results: NativeOpResult[],
   buildReducePayload: (partials: Record<string, unknown>[]) => Record<string, unknown>,
   listField: string,
-  budgetTokens: number = AFM_INPUT_BUDGET_TOKENS,
+  budgetTokens: number = resolveAfmInputBudgetTokens(),
 ): Promise<NativeOpResult | undefined> {
   const successes = results.filter((r) => r.ok && r.data).map((r) => r.data as Record<string, unknown>);
   if (successes.length === 0) return undefined;

@@ -444,3 +444,18 @@ def test_call_native_op_and_reduce_fold_merges_chunk_data_without_reduce_call():
     assert len(folded_inputs) == len(chain.calls)  # fold saw every chunk success
     # Deterministic fold: no extra AFM reduce call beyond the map-phase chunks.
     assert all(op == "contradiction" for op, _ in chain.calls)
+
+
+def test_env_override_changes_proactive_chunk_trigger(monkeypatch):
+    from afm_chunking import call_native_op_chunked
+
+    text = "word " * 600  # ~600 tokens: under the 3200 default, over a 100 override
+    chain = _FakeChain(lambda op, payload: _FakeResult(True, {"summary": "ok"}))
+    _, was_chunked = call_native_op_chunked(chain, "op", {"text": text}, text_field="text")
+    assert was_chunked is False
+
+    monkeypatch.setenv("MINNI_AFM_INPUT_BUDGET_TOKENS", "100")
+    chain_low = _FakeChain(lambda op, payload: _FakeResult(True, {"summary": "ok"}))
+    _, was_chunked_low = call_native_op_chunked(chain_low, "op", {"text": text}, text_field="text")
+    assert was_chunked_low is True
+    assert len(chain_low.calls) > 1

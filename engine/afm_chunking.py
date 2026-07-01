@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 from typing import Any, Callable, Dict, List
 
@@ -36,6 +37,29 @@ _SENTENCE_END = re.compile(r'(?<=[.!?])\s+')
 # How many extra words to look ahead when snapping a chunk boundary forward
 # to the next sentence end.
 _SENTENCE_SNAP_LOOKAHEAD_WORDS = 20
+
+
+def resolve_afm_input_budget_tokens() -> int:
+    """Resolve the proactive chunk-trigger budget at call time:
+    MINNI_AFM_INPUT_BUDGET_TOKENS env override, then the config field
+    (SovereignConfig.afm_input_budget_tokens, mirroring how
+    context_budget_tokens is config-driven), then the module fallback."""
+    raw = os.environ.get("MINNI_AFM_INPUT_BUDGET_TOKENS", "").strip()
+    if raw:
+        try:
+            value = int(raw)
+            if value > 0:
+                return value
+        except ValueError:
+            pass
+    try:
+        from config import DEFAULT_CONFIG
+        value = int(getattr(DEFAULT_CONFIG, "afm_input_budget_tokens", 0))
+        if value > 0:
+            return value
+    except Exception:  # noqa: BLE001 - config must never break chunking
+        pass
+    return AFM_INPUT_BUDGET_TOKENS
 
 
 def estimate_native_payload_tokens(payload: Dict[str, Any]) -> int:
@@ -228,7 +252,7 @@ def call_native_op_chunked(
     Does NOT reduce results — reduction is domain-specific; see
     reduce_via_same_op for the shared reduce-pass helper.
     """
-    budget = budget_tokens if budget_tokens is not None else AFM_INPUT_BUDGET_TOKENS
+    budget = budget_tokens if budget_tokens is not None else resolve_afm_input_budget_tokens()
     size = chunk_tokens if chunk_tokens is not None else DEFAULT_CHUNK_TOKENS
 
     estimated = estimate_native_payload_tokens(payload)

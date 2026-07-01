@@ -18,12 +18,12 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from afm_chunking import (
-    AFM_INPUT_BUDGET_TOKENS,
     MIN_CHUNK_TOKENS,
     call_native_op_and_reduce,
     call_native_op_chunked,
     estimate_native_payload_tokens,
     log_native_error_kind as _log_native_error_kind,
+    resolve_afm_input_budget_tokens,
     split_list_by_token_budget,
 )
 from afm_provider import resolve_afm_mode
@@ -253,7 +253,7 @@ def _native_compile_drafts(pass_input: Dict[str, Any], deterministic_drafts: Lis
     chain = default_provider_chain()
     base_payload = {"pass_name": "session_distillation", "trace_id": trace_id, "inputs": pass_input}
     base_tokens = estimate_native_payload_tokens(base_payload)
-    draft_group_budget = max(AFM_INPUT_BUDGET_TOKENS - base_tokens, MIN_CHUNK_TOKENS)
+    draft_group_budget = max(resolve_afm_input_budget_tokens() - base_tokens, MIN_CHUNK_TOKENS)
     # List-shaped input (deterministic_drafts): group by token budget instead
     # of the old hard cap of 12 (which silently dropped anything beyond it).
     groups = split_list_by_token_budget(

@@ -133,3 +133,46 @@ test("AFM_INPUT_BUDGET_TOKENS and MIN_CHUNK_TOKENS are exported with expected de
   assert.equal(AFM_INPUT_BUDGET_TOKENS, 3200);
   assert.equal(MIN_CHUNK_TOKENS, 200);
 });
+
+test("resolveAfmInputBudgetTokens honors MINNI_AFM_INPUT_BUDGET_TOKENS", async () => {
+  const { resolveAfmInputBudgetTokens } = await import("../dist/afm-chunking.js");
+  const prev = process.env.MINNI_AFM_INPUT_BUDGET_TOKENS;
+  try {
+    delete process.env.MINNI_AFM_INPUT_BUDGET_TOKENS;
+    assert.equal(resolveAfmInputBudgetTokens(), AFM_INPUT_BUDGET_TOKENS);
+    process.env.MINNI_AFM_INPUT_BUDGET_TOKENS = "1234";
+    assert.equal(resolveAfmInputBudgetTokens(), 1234);
+    process.env.MINNI_AFM_INPUT_BUDGET_TOKENS = "garbage";
+    assert.equal(resolveAfmInputBudgetTokens(), AFM_INPUT_BUDGET_TOKENS);
+  } finally {
+    if (prev === undefined) delete process.env.MINNI_AFM_INPUT_BUDGET_TOKENS;
+    else process.env.MINNI_AFM_INPUT_BUDGET_TOKENS = prev;
+  }
+});
+
+test("callNativeOpChunked chunk trigger respects env budget override", async () => {
+  const prev = process.env.MINNI_AFM_INPUT_BUDGET_TOKENS;
+  try {
+    // Payload ~500 tokens: under the 3200 default, over a 100 override.
+    const payload = { relevantSources: Array.from({ length: 10 }, (_, i) => ({ id: i, body: "x".repeat(200) })) };
+    const callsDefault = [];
+    delete process.env.MINNI_AFM_INPUT_BUDGET_TOKENS;
+    const resDefault = await callNativeOpChunked(async (p) => {
+      callsDefault.push(p);
+      return { ok: true, data: {} };
+    }, payload, "relevantSources");
+    assert.equal(resDefault.wasChunked, false);
+
+    process.env.MINNI_AFM_INPUT_BUDGET_TOKENS = "100";
+    const callsLow = [];
+    const resLow = await callNativeOpChunked(async (p) => {
+      callsLow.push(p);
+      return { ok: true, data: {} };
+    }, payload, "relevantSources");
+    assert.equal(resLow.wasChunked, true);
+    assert.ok(callsLow.length > 1);
+  } finally {
+    if (prev === undefined) delete process.env.MINNI_AFM_INPUT_BUDGET_TOKENS;
+    else process.env.MINNI_AFM_INPUT_BUDGET_TOKENS = prev;
+  }
+});

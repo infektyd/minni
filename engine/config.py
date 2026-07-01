@@ -24,6 +24,20 @@ CANONICAL_SOVEREIGN_HOME: str = os.environ.get(
 )
 
 
+def _positive_int_env(name: str, default: int) -> int:
+    """Parse a positive-int env override; malformed or non-positive values
+    fall back to the default rather than breaking config construction."""
+    raw = (os.environ.get(name) or "").strip()
+    if raw:
+        try:
+            value = int(raw)
+            if value > 0:
+                return value
+        except ValueError:
+            pass
+    return default
+
+
 @dataclass
 class SovereignConfig:
     """All configuration in one place, overridable via env vars or constructor."""
@@ -108,7 +122,11 @@ class SovereignConfig:
     # headroom below the ~4096-token model context window for the Swift
     # helper's instructions string + @Generable schema guide + JSON envelope
     # overhead, none of which is visible to Python/TypeScript callers.
-    afm_input_budget_tokens: int = 3200
+    # Overridable via MINNI_AFM_INPUT_BUDGET_TOKENS (read at instance
+    # creation); afm_chunking.resolve_afm_input_budget_tokens() consumes it.
+    afm_input_budget_tokens: int = field(
+        default_factory=lambda: _positive_int_env("MINNI_AFM_INPUT_BUDGET_TOKENS", 3200)
+    )
 
     # Feedback demotion (PR-9)
     feedback_enabled: bool = True
