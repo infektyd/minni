@@ -12,8 +12,9 @@ import logging
 import re
 import urllib.request
 from pathlib import Path
-from typing import Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
+from afm_chunking import call_native_op_chunked, reduce_via_same_op
 from afm_provider import resolve_afm_mode
 from model_provider import ChatRequest, default_provider_chain
 
@@ -40,6 +41,11 @@ def expand(query: str, mode: str = "rule") -> List[str]:
     return _dedupe([query, *afm_variants, *rule_variants])[:_MAX_VARIANTS]
 
 
+def _build_neighborhood_summary_reduce_payload(partials: List[Dict[str, Any]]) -> Dict[str, Any]:
+    summaries = [str(p.get("summary") or "").strip() for p in partials if p.get("summary")]
+    return {"prompt": "\n".join(s for s in summaries if s)}
+
+
 def summarize_with_afm(prompt: str, timeout: float = 1.5) -> Optional[str]:
     """Ask the configured AFM provider for a short summary; return None on downgrade."""
     if not prompt.strip():
@@ -48,17 +54,25 @@ def summarize_with_afm(prompt: str, timeout: float = 1.5) -> Optional[str]:
     if mode == "off":
         return None
     if mode in {"native", "auto"}:
-        # P2: native helper ops route through the provider chain.
-        native = default_provider_chain().native_op(
-            "neighborhood_summary",
-            {"prompt": prompt[:6000]},
-            timeout=timeout,
+        # P2: native helper ops route through the provider chain. Oversized
+        # prompts are chunked (not truncated) and, if chunked, reduced back
+        # into one summary via a second neighborhood_summary call.
+        chain = default_provider_chain()
+        chunk_results, was_chunked = call_native_op_chunked(
+            chain, "neighborhood_summary", {"prompt": prompt}, text_field="prompt", timeout=timeout,
         )
-        if native.ok:
+        if was_chunked:
+            native = reduce_via_same_op(
+                chain, "neighborhood_summary", chunk_results, _build_neighborhood_summary_reduce_payload,
+                text_field="prompt", timeout=timeout,
+            )
+        else:
+            native = chunk_results[0] if chunk_results else None
+        if native is not None and native.ok:
             summary = native.data.get("summary")
             return str(summary).strip() if summary else None
         if mode == "native":
-            logger.debug("Native AFM neighborhood summary unavailable: %s", native.error)
+            logger.debug("Native AFM neighborhood summary unavailable: %s", native.error if native else "no result")
             return None
     payload = {
         "model": "afm-local",
