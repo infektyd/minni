@@ -199,6 +199,11 @@ def _chunk_and_call(
     pieces = split_text(text, chunk_tokens=chunk_tokens, overlap_tokens=effective_overlap)
     if len(pieces) <= 1:
         if chunk_tokens <= MIN_CHUNK_TOKENS:
+            logger.info(
+                "afm native op %s: %s cannot be split below the %d-token floor; "
+                "issuing a single call with the full payload",
+                op_name, text_field, MIN_CHUNK_TOKENS,
+            )
             return [chain.native_op(op_name, payload, timeout=timeout)]
         return _chunk_and_call(
             chain, op_name, payload, text_field, timeout,
@@ -264,6 +269,21 @@ def call_native_op_chunked(
             "afm native op %s: reactive chunk trigger (estimated=%d <= budget=%d but call overflowed)",
             op_name, estimated, budget,
         )
+
+    # Size chunks to the room actually left after the non-text fields — a
+    # large sidecar (e.g. contradiction's `existing`) would otherwise make
+    # every "chunked" payload still exceed the real budget and waste a
+    # halving-recursion round per chunk.
+    base_payload = {k: v for k, v in payload.items() if k != text_field}
+    base_tokens = estimate_native_payload_tokens(base_payload)
+    if base_tokens > budget:
+        logger.info(
+            "afm native op %s: payload over budget from non-%s fields alone "
+            "(base=%d > budget=%d) — text chunking cannot help; calling once as-is",
+            op_name, text_field, base_tokens, budget,
+        )
+        return [chain.native_op(op_name, payload, timeout=timeout)], False
+    size = max(min(size, budget - base_tokens), MIN_CHUNK_TOKENS)
 
     return _chunk_and_call(chain, op_name, payload, text_field, timeout, size, overlap_tokens), True
 

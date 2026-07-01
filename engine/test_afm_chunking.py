@@ -459,3 +459,41 @@ def test_env_override_changes_proactive_chunk_trigger(monkeypatch):
     _, was_chunked_low = call_native_op_chunked(chain_low, "op", {"text": text}, text_field="text")
     assert was_chunked_low is True
     assert len(chain_low.calls) > 1
+
+
+def test_oversized_non_text_fields_fail_fast_with_distinct_log(caplog):
+    import logging
+
+    from afm_chunking import call_native_op_chunked
+
+    chain = _FakeChain(lambda op, payload: _FakeResult(False, {"error_kind": "context_overflow"}))
+    # Sidecar alone exceeds the budget; the text field is short.
+    payload = {"existing": "fact " * 8000, "candidate": "One short sentence."}
+    with caplog.at_level(logging.INFO, logger="sovereign.afm_chunking"):
+        results, was_chunked = call_native_op_chunked(
+            chain, "contradiction", payload, text_field="candidate",
+        )
+    # No pointless halving loop: exactly one call, clearly diagnosed.
+    assert len(chain.calls) == 1
+    assert was_chunked is False
+    assert any("text chunking cannot help" in rec.message for rec in caplog.records)
+
+
+def test_chunk_sizing_subtracts_non_text_field_tokens():
+    from afm_chunking import call_native_op_chunked, estimate_native_payload_tokens
+
+    chain = _FakeChain(lambda op, payload: _FakeResult(True, {"contradicts": False, "reason": "ok"}))
+    # Moderate sidecar (~1800 tokens) + long text: chunks must be sized to the
+    # remaining room so each chunked payload stays near the budget instead of
+    # blowing past it by the sidecar's size.
+    payload = {"existing": "fact " * 1800, "candidate": "word " * 4000}
+    budget = 3200
+    results, was_chunked = call_native_op_chunked(
+        chain, "contradiction", payload, text_field="candidate", budget_tokens=budget,
+    )
+    assert was_chunked is True
+    assert len(chain.calls) > 1
+    for _, chunk_payload in chain.calls:
+        # Word-approximation slack (sentence snap + tokenizer variance) is
+        # bounded; a sidecar-blind split would exceed the budget by ~1800.
+        assert estimate_native_payload_tokens(chunk_payload) <= budget * 1.25
