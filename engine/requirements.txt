@@ -24,7 +24,7 @@ pytest
 pytest-cov>=5.0.0
 
 # Linting (gate: `.venv/bin/python -m ruff check .` from engine/)
-ruff>=0.6.0
+ruff>=0.15.20
 
 # Optional: for better SQLite FTS tokenization
 # icu4c (system package)
