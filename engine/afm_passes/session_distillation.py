@@ -438,11 +438,16 @@ def _similar_existing_learning(db, query: str) -> Optional[str]:
     return str(content).strip() if content else None
 
 
-def _build_contradiction_reduce_payload(existing: str) -> Callable[[List[Dict[str, Any]]], Dict[str, Any]]:
-    def build(partials: List[Dict[str, Any]]) -> Dict[str, Any]:
-        reasons = [str(p.get("reason") or "").strip() for p in partials if p.get("reason")]
-        return {"existing": existing, "candidate": "\n".join(r for r in reasons if r)}
-    return build
+def _fold_contradiction_signals(partials: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Deterministic OR-fold over per-chunk contradiction verdicts: any chunk
+    that contradicts wins, with that chunk's reason. Contradiction is a
+    judgment op — re-judging the concatenated reasons with a second AFM call
+    would let non-contradicting chunks dilute a real contradiction to false."""
+    hit = next((p for p in partials if bool(p.get("contradicts"))), None)
+    if hit is not None:
+        return {"contradicts": True, "reason": str(hit.get("reason") or "").strip()}
+    first_reason = next((str(p.get("reason") or "").strip() for p in partials if p.get("reason")), "")
+    return {"contradicts": False, "reason": first_reason}
 
 
 def _native_contradiction_signal(
@@ -474,7 +479,7 @@ def _native_contradiction_signal(
     result = call_native_op_and_reduce(
         chain, "contradiction", {"existing": existing, "candidate": candidate_text},
         text_field="candidate",
-        build_reduce_payload=_build_contradiction_reduce_payload(existing),
+        fold=_fold_contradiction_signals,
         timeout=4.0, trace_id=trace_id,
     )
     if result is None:

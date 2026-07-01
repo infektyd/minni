@@ -687,3 +687,48 @@ def test_triage_advisory_fold_preserves_redact_from_any_chunk(tmp_path, monkeypa
     assert advisory["decision"] == "redact"
     assert "flagged sensitive material" in advisory["reason"]
     assert advisory["tool_used"] is True  # any-chunk OR
+
+
+def test_contradiction_fold_preserves_single_contradicting_chunk(tmp_path, monkeypatch):
+    """One contradicting chunk among non-contradicting ones must yield
+    contradicts=True with that chunk's reason — deterministic OR-fold, not a
+    second AFM call that re-judges the concatenated reasons."""
+    from afm_passes import session_distillation
+
+    db_obj, cfg = _make_db(tmp_path)
+    _seed_event(db_obj)
+    with db_obj.cursor() as c:
+        c.execute(
+            """
+            INSERT INTO learnings (agent_id, category, content, confidence, created_at)
+            VALUES (?, 'general', ?, 0.9, ?)
+            """,
+            ("codex", "Built the native AFM helper wiring, an existing durable fact.", time.time()),
+        )
+
+    call_count = {"n": 0}
+
+    def fake_contradiction(payload):
+        call_count["n"] += 1
+        if call_count["n"] == 2:
+            return _AFMResult(ok=True, data={"contradicts": True, "reason": "chunk 2 conflicts with the existing fact"})
+        return _AFMResult(ok=True, data={"contradicts": False, "reason": f"no conflict in chunk {call_count['n']}"})
+
+    op_map = {
+        "session_distill": lambda p: _AFMResult(ok=True, data={
+            "title": "Built the native AFM helper wiring",
+            "assertion": "long assertion body. " * 1000,
+            "appliesWhen": "always", "category": "concept",
+        }),
+        "contradiction": fake_contradiction,
+    }
+    monkeypatch.setenv("MINNI_AFM_MODE", "native")
+    monkeypatch.setattr("afm_provider.invoke_native_afm", _route(op_map))
+
+    result = session_distillation.run(db_obj, cfg, vault_path=cfg.vault_path, dry_run=True, trace_id="t")
+
+    signal = result["inputs"].get("contradiction")
+    assert call_count["n"] > 1  # candidate actually got chunked
+    assert signal is not None
+    assert signal["contradicts"] is True
+    assert signal["reason"] == "chunk 2 conflicts with the existing fact"
