@@ -506,3 +506,40 @@ def test_entity_extract_merges_entities_across_chunks_deterministically(tmp_path
     names = [e["name"] for e in entities]
     assert names.count("Minni") == 1  # deduped across chunks
     assert len(entities) <= 20  # existing cap preserved
+
+
+def test_contradiction_signal_chunks_oversized_candidate(tmp_path, monkeypatch):
+    from afm_passes import session_distillation
+
+    db_obj, cfg = _make_db(tmp_path)
+    _seed_event(db_obj)
+    with db_obj.cursor() as c:
+        c.execute(
+            """
+            INSERT INTO learnings (agent_id, category, content, confidence, created_at)
+            VALUES (?, 'general', ?, 0.9, ?)
+            """,
+            ("codex", "Built the native AFM helper wiring, an existing durable fact.", time.time()),
+        )
+
+    call_count = {"n": 0}
+
+    def fake_contradiction(payload):
+        call_count["n"] += 1
+        return _AFMResult(ok=True, data={"contradicts": False, "reason": f"partial reason {call_count['n']}"})
+
+    op_map = {
+        "session_distill": lambda p: _AFMResult(ok=True, data={
+            "title": "Built the native AFM helper wiring",
+            "assertion": "long assertion body. " * 1000,
+            "appliesWhen": "always", "category": "concept",
+        }),
+        "contradiction": fake_contradiction,
+    }
+    monkeypatch.setenv("MINNI_AFM_MODE", "native")
+    monkeypatch.setattr("afm_provider.invoke_native_afm", _route(op_map))
+
+    result = session_distillation.run(db_obj, cfg, vault_path=cfg.vault_path, dry_run=True, trace_id="trace-contradiction")
+
+    assert call_count["n"] > 1
+    assert result["inputs"].get("contradiction") is not None

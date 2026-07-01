@@ -15,7 +15,7 @@ import sqlite3
 import time
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from afm_chunking import call_native_op_chunked, reduce_via_same_op
 from afm_provider import resolve_afm_mode
@@ -449,6 +449,13 @@ def _similar_existing_learning(db, query: str) -> Optional[str]:
     return str(content).strip() if content else None
 
 
+def _build_contradiction_reduce_payload(existing: str) -> Callable[[List[Dict[str, Any]]], Dict[str, Any]]:
+    def build(partials: List[Dict[str, Any]]) -> Dict[str, Any]:
+        reasons = [str(p.get("reason") or "").strip() for p in partials if p.get("reason")]
+        return {"existing": existing, "candidate": "\n".join(r for r in reasons if r)}
+    return build
+
+
 def _native_contradiction_signal(
     db, drafts: List[Dict[str, Any]], trace_id: str
 ) -> Optional[Dict[str, Any]]:
@@ -474,11 +481,21 @@ def _native_contradiction_signal(
     existing = _similar_existing_learning(db, candidate.get("title") or candidate.get("body") or "")
     if not existing:
         return None
-    result = default_provider_chain().native_op(
-        "contradiction", {"existing": existing, "candidate": candidate_text[:6000]}, timeout=4.0
+    chain = default_provider_chain()
+    chunk_results, was_chunked = call_native_op_chunked(
+        chain, "contradiction", {"existing": existing, "candidate": candidate_text},
+        text_field="candidate", timeout=4.0,
     )
-    if not result.ok:
-        _log_native_error_kind("contradiction", trace_id, result)
+    if was_chunked:
+        result = reduce_via_same_op(
+            chain, "contradiction", chunk_results, _build_contradiction_reduce_payload(existing),
+            text_field="candidate", timeout=4.0,
+        )
+    else:
+        result = chunk_results[0] if chunk_results else None
+    if result is None or not result.ok:
+        if result is not None:
+            _log_native_error_kind("contradiction", trace_id, result)
         return None
     data = result.data if isinstance(result.data, dict) else {}
     return {
