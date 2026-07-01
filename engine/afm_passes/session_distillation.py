@@ -17,6 +17,7 @@ import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from afm_chunking import call_native_op_chunked, reduce_via_same_op
 from afm_provider import resolve_afm_mode
 from model_provider import default_provider_chain
 
@@ -290,8 +291,10 @@ def _native_compile_drafts(pass_input: Dict[str, Any], deterministic_drafts: Lis
 
 
 def _combined_session_text(events: List[Dict[str, Any]], raw_docs: List[Dict[str, Any]]) -> str:
-    """Flatten the session into one text blob for the guided AFM ops, capped
-    well under the helper's ~4K token budget (first ~6000 chars)."""
+    """Flatten the session into one text blob for the guided AFM ops.
+    Unbounded — oversized input is chunked by call_native_op_chunked at the
+    call site (session_distill, entity_extract) instead of being silently
+    truncated here."""
     lines: List[str] = []
     for event in events:
         content = (event.get("content") or "").strip()
@@ -301,7 +304,21 @@ def _combined_session_text(events: List[Dict[str, Any]], raw_docs: List[Dict[str
         path = (doc.get("path") or "").strip()
         if path:
             lines.append(f"raw document: {path}")
-    return "\n".join(lines)[:6000]
+    return "\n".join(lines)
+
+
+def _build_session_distill_reduce_payload(partials: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Synthesize a compact 'text' input for a second session_distill call
+    from N per-chunk DistilledLearningResult-shaped dicts — reduce-via-
+    same-op, no new Swift surface needed."""
+    lines = []
+    for partial in partials:
+        title = str(partial.get("title") or "").strip()
+        assertion = str(partial.get("assertion") or "").strip()
+        applies_when = str(partial.get("appliesWhen") or "").strip()
+        if title or assertion:
+            lines.append(f"{title}: {assertion} ({applies_when})".strip())
+    return {"text": "\n".join(lines)}
 
 
 def _native_session_distill_draft(
@@ -314,9 +331,20 @@ def _native_session_distill_draft(
         return None
     if not text.strip() or not sources:
         return None
-    result = default_provider_chain().native_op("session_distill", {"text": text}, timeout=4.0)
-    if not result.ok:
-        _log_native_error_kind("session_distill", trace_id, result)
+    chain = default_provider_chain()
+    chunk_results, was_chunked = call_native_op_chunked(
+        chain, "session_distill", {"text": text}, text_field="text", timeout=4.0,
+    )
+    if was_chunked:
+        result = reduce_via_same_op(
+            chain, "session_distill", chunk_results, _build_session_distill_reduce_payload,
+            text_field="text", timeout=4.0,
+        )
+    else:
+        result = chunk_results[0] if chunk_results else None
+    if result is None or not result.ok:
+        if result is not None:
+            _log_native_error_kind("session_distill", trace_id, result)
         return None
     data = result.data if isinstance(result.data, dict) else {}
     title = str(data.get("title") or "").strip()

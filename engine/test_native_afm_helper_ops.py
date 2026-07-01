@@ -405,3 +405,58 @@ def test_consolidation_triage_advisory_none_when_afm_off(tmp_path, monkeypatch):
 
     result = consolidation.run(db_obj, cfg, vault_path=cfg.vault_path, dry_run=True, trace_id="t")
     assert result["triage_advisory"] is None
+
+
+# --- Task 4: session_distill chunks oversized text --------------------------
+
+
+def test_session_distill_chunks_and_reduces_oversized_text(tmp_path, monkeypatch):
+    from afm_passes import session_distillation
+
+    db_obj, cfg = _make_db(tmp_path)
+    # Seed enough events that _combined_session_text produces well over
+    # AFM_INPUT_BUDGET_TOKENS (3200) worth of text — previously this would
+    # have been silently truncated to [:6000] chars.
+    now = time.time()
+    with db_obj.cursor() as c:
+        for i in range(80):
+            c.execute(
+                """
+                INSERT INTO episodic_events
+                (agent_id, event_type, content, task_id, thread_id, metadata, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "codex", "session",
+                    f"Event {i}: " + ("substantial detail about the AFM chunking work. " * 20),
+                    "task-x", "thread-x", json.dumps({"source": "unit-test"}), now,
+                ),
+            )
+
+    call_count = {"n": 0}
+
+    def fake_session_distill(payload):
+        call_count["n"] += 1
+        # The reduce call joins per-chunk "title: assertion (appliesWhen)"
+        # lines, so its text won't contain "Event " — use that to
+        # distinguish a map call from the reduce call.
+        if "Event " in payload.get("text", ""):
+            return _AFMResult(ok=True, data={
+                "title": f"Chunk {call_count['n']}", "assertion": "partial assertion",
+                "appliesWhen": "during chunking", "category": "concept",
+            })
+        return _AFMResult(ok=True, data={
+            "title": "Synthesized final learning", "assertion": "the reduced assertion",
+            "appliesWhen": "always", "category": "concept",
+        })
+
+    op_map = {"session_distill": fake_session_distill}
+    monkeypatch.setenv("MINNI_AFM_MODE", "native")
+    monkeypatch.setattr("afm_provider.invoke_native_afm", _route(op_map))
+
+    result = session_distillation.run(db_obj, cfg, vault_path=cfg.vault_path, dry_run=True, trace_id="trace-chunked")
+
+    assert call_count["n"] > 1  # multiple map calls + one reduce call
+    distill = [d for d in result["drafts"] if d.get("prompt_version") == "native.session_distill.v1"]
+    assert len(distill) == 1
+    assert distill[0]["title"] == "Synthesized final learning"
