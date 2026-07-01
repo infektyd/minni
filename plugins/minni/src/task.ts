@@ -8,7 +8,8 @@ import {
   DEFAULT_WORKSPACE_ID,
 } from "./config.js";
 import { resolveAfmProvider, resolvedNativeHelperPath, type AfmProvider, type AfmProviderMode, type AfmProviderResolution } from "./afm.js";
-import { defaultProviderChain } from "./providers.js";
+import { defaultProviderChain, type ProviderChain } from "./providers.js";
+import { callNativeOpChunked, reduceViaSameOp, type NativeOpResult } from "./afm-chunking.js";
 import { afmHealth, recallMemory } from "./sovereign.js";
 import type { JsonResult, RecallResponse } from "./sovereign.js";
 import { isInstructionLike } from "./safety.js";
@@ -754,9 +755,26 @@ export function buildAfmChatPayload(payload: Record<string, unknown>): Record<st
   };
 }
 
+function buildPrepareReducePayload(purpose: string): (partials: Record<string, unknown>[]) => Record<string, unknown> {
+  return (partials: Record<string, unknown>[]): Record<string, unknown> => {
+    if (purpose === "prepare_outcome") {
+      return { purpose, partialOutcomeDrafts: partials };
+    }
+    return {
+      purpose,
+      partialBriefs: partials.map((p) => ({
+        brief: p.brief,
+        recommendedNextActions: p.recommendedNextActions,
+        risks: p.risks,
+      })),
+    };
+  };
+}
+
 export async function callAfmPrepareTask(
   url: string,
   payload: Record<string, unknown>,
+  chain: ProviderChain = defaultProviderChain(),
 ): Promise<JsonResult<Partial<PreparedTaskPacket>>> {
   const parsedUrl = new URL(url);
   const isChatCompletions = parsedUrl.pathname.endsWith("/chat/completions");
@@ -772,24 +790,50 @@ export async function callAfmPrepareTask(
         ? "native"
         : "bridge";
   const purpose = payload.purpose === "outcome" ? "prepare_outcome" : "prepare_task";
-  const wirePayload = transportMode === "native"
-    ? payload
-    : isChatCompletions
-      ? buildAfmChatPayload(payload)
-      : payload;
-  // P2: route through the provider chain (AFM-only chain is byte-identical to
-  // the old direct callAfmJson path — enforced by the P0 golden contracts).
-  const result = await defaultProviderChain().chat({
-    payload: wirePayload,
-    operation: "prepare",
-    url,
-    mode: transportMode,
-    nativeOperation: purpose,
-    nativePayload: payload,
-  });
-  return result.ok
-    ? { ok: true, data: normalizeAfmResponse(result.data) }
-    : { ok: false, data: normalizeAfmResponse(result.data), error: result.error };
+
+  const callOp = async (opPayload: Record<string, unknown>): Promise<NativeOpResult> => {
+    const opWirePayload = transportMode === "native"
+      ? opPayload
+      : isChatCompletions
+        ? buildAfmChatPayload(opPayload)
+        : opPayload;
+    // P2: route through the provider chain (AFM-only chain is byte-identical to
+    // the old direct callAfmJson path — enforced by the P0 golden contracts).
+    const result = await chain.chat({
+      payload: opWirePayload,
+      operation: "prepare",
+      url,
+      mode: transportMode,
+      nativeOperation: purpose,
+      nativePayload: opPayload,
+    });
+    return { ok: result.ok, data: result.data as Record<string, unknown> | undefined, error: result.error };
+  };
+
+  if (transportMode !== "native") {
+    // Chunking only applies to the native path (the one with no size limit
+    // today, per the reported incident) — the bridge/chat-completions path
+    // already slices relevantSources via buildAfmChatPayload's
+    // sourceLines.slice(0, 1200), a separate, already-bounded transport.
+    const result = await callOp(payload);
+    return result.ok
+      ? { ok: true, data: normalizeAfmResponse(result.data) }
+      : { ok: false, data: normalizeAfmResponse(result.data), error: result.error };
+  }
+
+  const { results, wasChunked } = await callNativeOpChunked(callOp, payload, "relevantSources");
+  let finalResult: NativeOpResult | undefined;
+  if (wasChunked) {
+    finalResult = await reduceViaSameOp(callOp, results, buildPrepareReducePayload(purpose), "relevantSources");
+  } else {
+    finalResult = results[0];
+  }
+  if (!finalResult) {
+    return { ok: false, data: normalizeAfmResponse(undefined), error: "AFM prepare returned no data." };
+  }
+  return finalResult.ok
+    ? { ok: true, data: normalizeAfmResponse(finalResult.data) }
+    : { ok: false, data: normalizeAfmResponse(finalResult.data), error: finalResult.error };
 }
 
 export async function prepareTask(input: PrepareTaskInput, deps: PrepareTaskDeps = {}): Promise<PreparedTaskPacket> {

@@ -6,6 +6,7 @@ import path from "node:path";
 import test from "node:test";
 
 import { buildAfmChatPayload, prepareOutcome, callAfmPrepareTask, prepareTask } from "../dist/task.js";
+import { ProviderChain } from "../dist/providers.js";
 
 const vaultMatch = {
   notePath: "/tmp/vault/wiki/sessions/backend-handoff.md",
@@ -519,6 +520,57 @@ test("callAfmPrepareTask parses v0 chat-completions JSON content", async () => {
   } finally {
     await new Promise((resolve) => server.close(resolve));
   }
+});
+
+test("callAfmPrepareTask chunks oversized relevantSources instead of sending them all in one native call", async () => {
+  const nativeCalls = [];
+  // Fake native helper: records every payload's relevantSources length: the
+  // first "map" calls see a slice, the final "reduce" call sees none
+  // (partialBriefs instead).
+  const fakeChat = async (request) => {
+    nativeCalls.push(request.nativePayload);
+    const sources = Array.isArray(request.nativePayload?.relevantSources)
+      ? request.nativePayload.relevantSources
+      : [];
+    if (sources.length > 0) {
+      return { ok: true, data: { brief: `partial brief ${nativeCalls.length}`, recommendedNextActions: [], risks: [] } };
+    }
+    return { ok: true, data: { brief: "synthesized final brief", recommendedNextActions: [], risks: [] } };
+  };
+
+  // A plain object literal implementing ModelProvider directly — NOT a
+  // spread of a class instance, which would drop AfmProvider's prototype
+  // methods (supports/chat/health) and make ProviderChain.chat() throw when
+  // it calls provider.supports(operation).
+  const fakeProvider = {
+    name: "afm",
+    tier: "local",
+    supports: (_operation) => true,
+    chat: fakeChat,
+  };
+  const chain = new ProviderChain([fakeProvider]);
+  const bigSources = Array.from({ length: 60 }, (_, i) => ({
+    relativePath: `note-${i}.md`,
+    wikilink: `[[note-${i}]]`,
+    evidenceEnvelope: "context text ".repeat(50),
+  }));
+
+  const result = await callAfmPrepareTask("http://127.0.0.1:11437/v1/chat/completions", {
+    task: "a task",
+    budgetTokens: 4096,
+    profile: "default",
+    provider: { provider: "native", mode: "native" },
+    intent: "intent",
+    constraints: [],
+    currentState: [],
+    relevantSources: bigSources,
+    daemonLead: "",
+    model: "afm-local",
+  }, chain);
+
+  assert.equal(result.ok, true);
+  assert.ok(nativeCalls.length > 1, `expected multiple native calls, got ${nativeCalls.length}`);
+  assert.equal(result.data.brief, "synthesized final brief");
 });
 
 test("prepareTask native provider uses the configured native helper", async () => {
