@@ -543,3 +543,83 @@ def test_contradiction_signal_chunks_oversized_candidate(tmp_path, monkeypatch):
 
     assert call_count["n"] > 1
     assert result["inputs"].get("contradiction") is not None
+
+
+def test_compile_pass_proposals_groups_large_draft_lists_by_token_budget(tmp_path, monkeypatch):
+    from afm_passes import session_distillation
+
+    db_obj, cfg = _make_db(tmp_path)
+    now = time.time()
+    with db_obj.cursor() as c:
+        c.execute(
+            """
+            INSERT INTO episodic_events
+            (agent_id, event_type, content, task_id, thread_id, metadata, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "codex", "session", "Seed event for compile_pass_proposals chunking test.",
+                "task-seed", "thread-seed", json.dumps({"source": "unit-test"}), now,
+            ),
+        )
+
+    # session_distillation._build_drafts's own deterministic extraction is
+    # hard-capped well below 12 (1 session draft + <=5 concepts + <=5
+    # entities, deduped) — no amount of seeded episodic_events content can
+    # push its output past 12. To genuinely exercise the >12-drafts,
+    # token-budgeted-grouping path in _native_compile_drafts, monkeypatch
+    # _build_drafts itself to return a large, realistically-sized list of
+    # deterministic drafts (as if a future/richer deterministic pass had
+    # produced them), matching this test's actual target: the
+    # compile_pass_proposals call site's handling of an oversized
+    # deterministic_drafts list, not the extraction heuristics upstream of it.
+    big_drafts = [
+        {
+            "page_id": f"draft-{i}",
+            "kind": "concept",
+            "section": "concepts",
+            "title": f"Distinct concept {i}",
+            "status": "draft",
+            "agent": "afm-loop",
+            "trace_id": "trace-compile",
+            "sources": [f"episodic_events:{i}"],
+            "body": f"- Candidate concept {i} extracted from substantial synthetic body content. " * 20,
+        }
+        for i in range(20)
+    ]
+    monkeypatch.setattr(session_distillation, "_build_drafts", lambda events, raw_docs, trace_id: big_drafts)
+
+    call_count = {"n": 0}
+    seen_group_sizes = []
+
+    def fake_compile(payload):
+        call_count["n"] += 1
+        drafts_in = payload.get("deterministic_drafts") or []
+        seen_group_sizes.append(len(drafts_in))
+        sources = drafts_in[0]["sources"] if drafts_in and drafts_in[0].get("sources") else []
+        return _AFMResult(ok=True, data={
+            "drafts": [{
+                "kind": "concept", "section": "concepts",
+                "title": f"Draft from call {call_count['n']}",
+                "body": "review-only body",
+                "sources": sources,
+            }]
+        })
+
+    op_map = {"compile_pass_proposals": fake_compile}
+    monkeypatch.setenv("MINNI_AFM_MODE", "native")
+    monkeypatch.setattr("afm_provider.invoke_native_afm", _route(op_map))
+
+    result = session_distillation.run(db_obj, cfg, vault_path=cfg.vault_path, dry_run=True, trace_id="trace-compile")
+
+    assert result is not None
+    # With 20 synthetic deterministic drafts (far more than the old
+    # deterministic_drafts[:12] cap), verify the migrated code processes the
+    # FULL list across token-budgeted groups instead of silently dropping
+    # anything past the 12th: either multiple calls were made, or a single
+    # call's group carries more than 12 drafts, and in all cases every
+    # draft must have been seen across the group(s).
+    assert call_count["n"] >= 1
+    assert sum(seen_group_sizes) == len(big_drafts)
+    if call_count["n"] == 1:
+        assert seen_group_sizes[0] > 12

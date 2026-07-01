@@ -17,7 +17,14 @@ import os
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
-from afm_chunking import call_native_op_chunked, reduce_via_same_op
+from afm_chunking import (
+    AFM_INPUT_BUDGET_TOKENS,
+    MIN_CHUNK_TOKENS,
+    call_native_op_chunked,
+    estimate_native_payload_tokens,
+    reduce_via_same_op,
+    split_list_by_token_budget,
+)
 from afm_provider import resolve_afm_mode
 from model_provider import default_provider_chain
 
@@ -267,26 +274,39 @@ def _native_compile_drafts(pass_input: Dict[str, Any], deterministic_drafts: Lis
     }
     if not allowed_sources:
         return []
-    payload = {
-        "pass_name": "session_distillation",
-        "trace_id": trace_id,
-        "inputs": pass_input,
-        "deterministic_drafts": deterministic_drafts[:12],
-    }
-    # P2: native helper ops route through the provider chain. The op stays
-    # native-only by contract (bridge mode keeps returning no drafts).
-    result = default_provider_chain().native_op("compile_pass_proposals", payload, timeout=4.0)
-    if not result.ok:
-        _log_native_error_kind("compile_pass_proposals", trace_id, result)
-        return []
-    candidates = result.data.get("drafts")
-    if not isinstance(candidates, list):
-        return []
-    normalized = [
-        draft
-        for draft in (_normalize_native_draft(candidate, trace_id, allowed_sources) for candidate in candidates)
-        if draft is not None
-    ]
+    chain = default_provider_chain()
+    base_payload = {"pass_name": "session_distillation", "trace_id": trace_id, "inputs": pass_input}
+    base_tokens = estimate_native_payload_tokens(base_payload)
+    draft_group_budget = max(AFM_INPUT_BUDGET_TOKENS - base_tokens, MIN_CHUNK_TOKENS)
+    # List-shaped input (deterministic_drafts): group by token budget instead
+    # of the old hard cap of 12 (which silently dropped anything beyond it).
+    groups = split_list_by_token_budget(
+        deterministic_drafts, draft_group_budget,
+        serialize=lambda draft: json.dumps(draft, default=str),
+    )
+
+    normalized: List[Dict[str, Any]] = []
+    seen_titles: set = set()
+    for group in groups:
+        payload = dict(base_payload, deterministic_drafts=group)
+        # P2: native helper ops route through the provider chain. The op stays
+        # native-only by contract (bridge mode keeps returning no drafts).
+        result = chain.native_op("compile_pass_proposals", payload, timeout=4.0)
+        if not result.ok:
+            _log_native_error_kind("compile_pass_proposals", trace_id, result)
+            continue
+        candidates = result.data.get("drafts") if isinstance(result.data, dict) else None
+        if not isinstance(candidates, list):
+            continue
+        for candidate in candidates:
+            draft = _normalize_native_draft(candidate, trace_id, allowed_sources)
+            if draft is None:
+                continue
+            key = draft["title"].strip().lower()
+            if key in seen_titles:
+                continue
+            seen_titles.add(key)
+            normalized.append(draft)
     return normalized[:5]
 
 
