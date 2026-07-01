@@ -80,11 +80,16 @@ def call_native_op_chunked(
       chain.native_op(op_name, chunk_payload, timeout) once per chunk,
       sequentially (the native helper is one subprocess; no parallelism
       benefit). Returns (list_of_N_results, True).
-    - Recursion guard: chunking recurses at most ONE level. If an individual
-      chunk call itself trips context_overflow, that chunk's result is
-      dropped (logged, not retried again) rather than recursively re-split —
-      chunk_tokens is chosen well under budget so this should not happen in
-      practice, but the guard prevents infinite recursion if it does.
+    - Recursion, not a one-level cap: AFM calls are free (on-device, no API
+      cost), so there is no reason to economize on call count. If an
+      individual chunk call itself trips context_overflow (chunk_tokens was
+      still too large for that particular chunk — e.g. a pathological
+      run of unbroken text with no sentence boundaries), that chunk is
+      recursively re-split at a smaller chunk_tokens and retried, same as
+      the top-level payload. The only guard against true infinite recursion
+      is a hard floor on chunk_tokens (e.g. 200 tokens) — below that, further
+      splitting cannot help and the chunk is dropped (logged) rather than
+      looping forever.
     """
 ```
 
@@ -103,9 +108,9 @@ Per your answer, single-object ops get an **AFM reduce pass** — but instead of
 | `triage` | decision, reason | `candidate` = joined per-chunk `"{decision}: {reason}"` |
 | `contradiction` | contradicts, reason | `candidate` = joined per-chunk reasons; `existing` unchanged |
 
-The reduce input is always small (a handful of short structured fields per chunk, not raw source text), so it should never itself need chunking — but it still goes through `call_native_op_chunked` for defense in depth.
+The reduce input is small per chunk, but with enough source chunks (e.g. a very long session) the concatenated per-chunk candidates can themselves exceed budget. Since AFM calls are free, the reduce step is a proper **tree reduction**, not a single flat pass: the reduce input goes through `call_native_op_chunked` like anything else, and if IT is over budget, it gets split and reduced again (reduce-of-reduces), repeating until one call's input fits. There is no artificial single-pass ceiling — call count is not a cost concern here, only correctness (every level uses the same op, so no new Swift surface is needed at any depth).
 
-**Final safety net:** if the reduce call also fails, deterministically pick the first successful chunk's result rather than returning nothing — a partial answer beats an empty one, and this only degrades (never silently drops all content, unlike today's `[:6000]` truncation).
+**Final safety net:** only if a reduce level itself returns zero successful results (every chunk at that level tripped `context_overflow` even at the chunk_tokens floor) does the code fall back to deterministically picking the first successful result from the level below — a partial answer beats an empty one, and this only degrades (never silently drops all content, unlike today's `[:6000]` truncation). In practice this should be very rare given free, unlimited reduce depth.
 
 List-shaped ops (`entity_extract`, `compile_pass_proposals`) skip the AFM reduce pass entirely — they're merged deterministically, matching each site's existing dedupe/cap logic (entity_extract already dedupes by `name.lower()` and caps at 20; compile_pass_proposals already caps at 5): concatenate all chunks' list items, dedupe by the existing key, apply the existing cap. No new AFM call needed for these.
 
@@ -144,7 +149,7 @@ afm_input_budget_tokens: int = 3200   # Proactive chunk trigger for native AFM
 
 - `call_native_op_chunked` never raises for a recoverable trip; it returns partial results, exactly like today's ops return `ProviderResult(ok=False, ...)`.
 - The existing `_log_native_error_kind` classification (recoverable `context_overflow`/`guardrail` vs. genuine failure) is preserved and reused inside the chunked path for each chunk call and the reduce call.
-- If **every** chunk fails (all recoverable trips, e.g. chunk_tokens still somehow too large for a pathological single "chunk" — shouldn't happen given chunk sizing, but possible if overlap math is off), the caller falls back to today's behavior: return empty / no draft. This is a strict improvement (chunking only ever adds a *chance* of recovery, never removes the existing fallback).
+- If **every** chunk fails at the chunk_tokens floor (recursive re-splitting exhausted, §3.1), the caller falls back to today's behavior: return empty / no draft. This is a strict improvement (chunking only ever adds a *chance* of recovery, never removes the existing fallback) and should be very rare given recursive splitting and free reduce depth.
 
 ### 3.7 Testing
 
