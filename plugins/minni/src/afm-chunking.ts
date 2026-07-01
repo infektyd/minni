@@ -114,9 +114,21 @@ export async function callNativeOpChunked(
 
   const items = Array.isArray(payload[listField]) ? (payload[listField] as unknown[]) : [];
   if (items.length <= 1) {
-    // Nothing to split further — make the call once more as-is and let the
-    // caller see the failure.
-    return { results: [await callOp(payload)], wasChunked: false };
+    // Nothing to split further — make the call once more as-is, but tag a
+    // failure with why no recovery was possible (mirrors the Python side's
+    // "text chunking cannot help" diagnostic) instead of returning a bare
+    // failed result that looks like chunked recovery was attempted.
+    const result = await callOp(payload);
+    if (!result.ok) {
+      const detail =
+        `payload over budget (~${estimated} tokens > ${budgetTokens}) with ` +
+        `${items.length} ${listField} item(s) — chunking cannot help`;
+      return {
+        results: [{ ...result, error: result.error ? `${result.error} (${detail})` : detail }],
+        wasChunked: false,
+      };
+    }
+    return { results: [result], wasChunked: false };
   }
 
   const { [listField]: _omitted, ...basePayload } = payload;

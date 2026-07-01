@@ -176,3 +176,18 @@ test("callNativeOpChunked chunk trigger respects env budget override", async () 
     else process.env.MINNI_AFM_INPUT_BUDGET_TOKENS = prev;
   }
 });
+
+test("callNativeOpChunked tags failures it cannot recover by splitting", async () => {
+  // Single huge item: over budget, but nothing to split.
+  const payload = { relevantSources: [{ body: "x".repeat(20000) }] };
+  const res = await callNativeOpChunked(
+    async () => ({ ok: false, data: { error_kind: "context_overflow" }, error: "context window exceeded" }),
+    payload,
+    "relevantSources",
+  );
+  assert.equal(res.wasChunked, false);
+  assert.equal(res.results.length, 1);
+  assert.equal(res.results[0].ok, false);
+  assert.match(res.results[0].error, /chunking cannot help/);
+  assert.match(res.results[0].error, /context window exceeded/);
+});
