@@ -755,14 +755,48 @@ export function buildAfmChatPayload(payload: Record<string, unknown>): Record<st
   };
 }
 
-function buildPrepareReducePayload(purpose: string): (partials: Record<string, unknown>[]) => Record<string, unknown> {
+// Single source of truth for the reduce payload's list key per purpose —
+// buildPrepareReducePayload and the reduceViaSameOp call must agree on it,
+// or the recursive re-chunk of an oversized reduce payload silently no-ops
+// (the exact drift 3c0e4b0 fixed once already).
+const PREPARE_REDUCE_LIST_FIELD: Record<string, string> = {
+  prepare_outcome: "partialOutcomeDrafts",
+  prepare_task: "partialBriefs",
+};
+
+function prepareReduceListField(purpose: string): string {
+  return PREPARE_REDUCE_LIST_FIELD[purpose] ?? "partialBriefs";
+}
+
+function buildPrepareReducePayload(
+  purpose: string,
+  payload: Record<string, unknown>,
+): (partials: Record<string, unknown>[]) => Record<string, unknown> {
+  // Compact task context rides along on the reduce call: the synthesis model
+  // otherwise sees only fragmentary partials with no idea what the actual
+  // task/outcome was — exactly in the large-input case chunking exists for.
+  const context: Record<string, unknown> =
+    purpose === "prepare_outcome"
+      ? {
+          task: String(payload.task ?? "").slice(0, 500),
+          summary: String(payload.summary ?? "").slice(0, 700),
+        }
+      : {
+          task: String(payload.task ?? "").slice(0, 500),
+          intent: String(payload.intent ?? "work"),
+          budgetTokens: payload.budgetTokens ?? 4000,
+          constraints: Array.isArray(payload.constraints) ? payload.constraints.slice(0, 8) : [],
+          currentState: Array.isArray(payload.currentState) ? payload.currentState.slice(0, 8) : [],
+        };
+  const listField = prepareReduceListField(purpose);
   return (partials: Record<string, unknown>[]): Record<string, unknown> => {
     if (purpose === "prepare_outcome") {
-      return { purpose, partialOutcomeDrafts: partials };
+      return { purpose, ...context, [listField]: partials };
     }
     return {
       purpose,
-      partialBriefs: partials.map((p) => ({
+      ...context,
+      [listField]: partials.map((p) => ({
         brief: p.brief,
         recommendedNextActions: p.recommendedNextActions,
         risks: p.risks,
@@ -824,8 +858,9 @@ export async function callAfmPrepareTask(
   const { results, wasChunked } = await callNativeOpChunked(callOp, payload, "relevantSources");
   let finalResult: NativeOpResult | undefined;
   if (wasChunked) {
-    const reduceListField = purpose === "prepare_outcome" ? "partialOutcomeDrafts" : "partialBriefs";
-    finalResult = await reduceViaSameOp(callOp, results, buildPrepareReducePayload(purpose), reduceListField);
+    finalResult = await reduceViaSameOp(
+      callOp, results, buildPrepareReducePayload(purpose, payload), prepareReduceListField(purpose),
+    );
   } else {
     finalResult = results[0];
   }
