@@ -156,6 +156,11 @@ def _review_draft(candidate: Dict[str, Any], reason: str, trace_id: str) -> Dict
     }
 
 
+def _build_triage_reduce_payload(partials: List[Dict[str, Any]]) -> Dict[str, Any]:
+    lines = [f"{p.get('decision', '')}: {p.get('reason', '')}" for p in partials if p.get("decision")]
+    return {"candidate": "\n".join(lines)}
+
+
 def _triage_advisory(candidates: List[Dict[str, Any]],
                      promote_candidate_ids: List[int],
                      trace_id: str) -> Optional[Dict[str, Any]]:
@@ -169,6 +174,7 @@ def _triage_advisory(candidates: List[Dict[str, Any]],
     # Lazy imports keep the deterministic pass dependency-light and avoid paying
     # provider-chain import cost when AFM is off.
     try:
+        from afm_chunking import call_native_op_chunked, reduce_via_same_op
         from afm_provider import resolve_afm_mode
         from model_provider import default_provider_chain
     except Exception:  # noqa: BLE001 - advisory must never break consolidation
@@ -197,18 +203,27 @@ def _triage_advisory(candidates: List[Dict[str, Any]],
     if not content:
         return None
     try:
-        result = default_provider_chain().native_op(
-            "triage", {"candidate": content[:6000]}, timeout=4.0
+        chain = default_provider_chain()
+        chunk_results, was_chunked = call_native_op_chunked(
+            chain, "triage", {"candidate": content}, text_field="candidate", timeout=4.0,
         )
+        if was_chunked:
+            result = reduce_via_same_op(
+                chain, "triage", chunk_results, _build_triage_reduce_payload,
+                text_field="candidate", timeout=4.0,
+            )
+        else:
+            result = chunk_results[0] if chunk_results else None
     except Exception:  # noqa: BLE001 - advisory must never break consolidation
         return None
-    if not result.ok:
-        data = result.data if isinstance(result.data, dict) else {}
-        error_kind = str(data.get("error_kind") or "").strip() or "unknown"
-        logger.info(
-            "afm native op triage unavailable (error_kind=%s): status=%s error=%s trace=%s",
-            error_kind, result.status, result.error, trace_id,
-        )
+    if result is None or not result.ok:
+        if result is not None:
+            data = result.data if isinstance(result.data, dict) else {}
+            error_kind = str(data.get("error_kind") or "").strip() or "unknown"
+            logger.info(
+                "afm native op triage unavailable (error_kind=%s): status=%s error=%s trace=%s",
+                error_kind, result.status, result.error, trace_id,
+            )
         return None
     data = result.data if isinstance(result.data, dict) else {}
     return {

@@ -623,3 +623,31 @@ def test_compile_pass_proposals_groups_large_draft_lists_by_token_budget(tmp_pat
     assert sum(seen_group_sizes) == len(big_drafts)
     if call_count["n"] == 1:
         assert seen_group_sizes[0] > 12
+
+
+def test_triage_advisory_chunks_oversized_candidate(tmp_path, monkeypatch):
+    from afm_passes import consolidation
+
+    db_obj, cfg = _make_db(tmp_path)
+    _ensure_candidate_tables(db_obj)
+    long_content = "A plausible durable fact about the build pipeline cache. " * 1000
+    cid = _seed_candidate(db_obj, long_content)
+
+    call_count = {"n": 0}
+
+    def fake_triage(payload):
+        call_count["n"] += 1
+        candidate = payload.get("candidate", "")
+        if "build pipeline cache" in candidate and len(candidate) > 500:
+            return _AFMResult(ok=True, data={"decision": "accept", "reason": f"partial {call_count['n']}", "tool_used": True})
+        return _AFMResult(ok=True, data={"decision": "accept", "reason": "synthesized reason", "tool_used": True})
+
+    op_map = {"triage": fake_triage}
+    monkeypatch.setenv("MINNI_AFM_MODE", "native")
+    monkeypatch.setattr("afm_provider.invoke_native_afm", _route(op_map))
+
+    result = consolidation.run(db_obj, cfg, vault_path=cfg.vault_path, dry_run=True, trace_id="t")
+
+    assert call_count["n"] > 1
+    assert result["triage_advisory"] is not None
+    assert result["triage_advisory"]["candidate_id"] == cid
