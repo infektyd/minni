@@ -104,6 +104,12 @@ class SovereignConfig:
     context_budget_tokens: int = 4096     # Max tokens to return in a single recall
     token_model: str = "cl100k_base"      # tiktoken encoding for counting
 
+    # Proactive chunk trigger for native AFM calls (engine/afm_chunking.py) —
+    # headroom below the ~4096-token model context window for the Swift
+    # helper's instructions string + @Generable schema guide + JSON envelope
+    # overhead, none of which is visible to Python/TypeScript callers.
+    afm_input_budget_tokens: int = 3200
+
     # Feedback demotion (PR-9)
     feedback_enabled: bool = True
 
