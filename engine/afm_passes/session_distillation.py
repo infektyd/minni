@@ -19,6 +19,7 @@ from typing import Any, Dict, List, Optional
 
 from afm_provider import resolve_afm_mode
 from model_provider import default_provider_chain
+from safety import is_instruction_like
 
 logger = logging.getLogger("sovereign.afm.session_distillation")
 
@@ -172,6 +173,23 @@ def _build_drafts(events: List[Dict[str, Any]], raw_docs: List[Dict[str, Any]], 
     if raw_docs:
         summary_lines.extend(f"- raw document: {doc['path']}" for doc in raw_docs[:5])
 
+    session_body = "\n".join(summary_lines) if summary_lines else "- No eligible cited evidence."
+
+    # Finding #4: this draft's body is synthesized from multiple episodic_events
+    # (events don't carry a precomputed instruction_like column, so each source's
+    # own content is recomputed here). If ANY source event tripped the detector,
+    # the synthesized draft inherits the flag even if the summarized body itself
+    # no longer trips is_instruction_like.
+    own_flag = is_instruction_like(session_body)
+    source_flag = any(is_instruction_like(event.get("content") or "") for event in events)
+    session_instruction_like = own_flag or source_flag
+    if session_instruction_like and not own_flag:
+        logger.warning(
+            "session_distillation draft %r inherits instruction_like from source "
+            "event(s); the synthesized summary did not itself trip the detector",
+            title,
+        )
+
     drafts: List[Dict[str, Any]] = [{
         "page_id": _draft_id("session", title, sources, trace_id),
         "kind": "session",
@@ -181,7 +199,8 @@ def _build_drafts(events: List[Dict[str, Any]], raw_docs: List[Dict[str, Any]], 
         "agent": "afm-loop",
         "trace_id": trace_id,
         "sources": sources,
-        "body": "\n".join(summary_lines) if summary_lines else "- No eligible cited evidence.",
+        "body": session_body,
+        "instruction_like": 1 if session_instruction_like else 0,
     }]
 
     for concept in _extract_concepts(events):
@@ -337,6 +356,23 @@ def _native_session_distill_draft(
         "",
         "- Lifecycle: native AFM session_distill proposal only; endorsement is required before acceptance.",
     ]
+    body = "\n".join(body_lines)
+
+    # Finding #4: the native op synthesizes `assertion` from the combined session
+    # `text` (multiple events/docs flattened). Inherit instruction_like from that
+    # combined source text even if the model's paraphrased assertion no longer
+    # trips the regex.
+    own_flag = is_instruction_like(body)
+    source_flag = is_instruction_like(text)
+    distill_instruction_like = own_flag or source_flag
+    if distill_instruction_like and not own_flag:
+        logger.warning(
+            "session_distillation native draft %r inherits instruction_like from "
+            "combined source text; the synthesized assertion did not itself trip "
+            "the detector",
+            title,
+        )
+
     return {
         "page_id": _draft_id("session-distill", title, cited, trace_id),
         "kind": "concept",
@@ -349,7 +385,8 @@ def _native_session_distill_draft(
         "provider": "native",
         "sources": cited,
         "citations": cited,
-        "body": "\n".join(body_lines),
+        "body": body,
+        "instruction_like": 1 if distill_instruction_like else 0,
     }
 
 

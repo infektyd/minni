@@ -30,6 +30,8 @@ import re
 import time
 from typing import Any, Dict, List, Optional
 
+from safety import is_instruction_like
+
 logger = logging.getLogger("sovereign.afm.consolidation")
 
 _SAFE_PRIVACY = {"", "safe", "public", "low"}
@@ -255,7 +257,7 @@ def run(db, config, vault_path: Optional[str] = None,
             dedup_candidate_ids.append(cand["candidate_id"])
             continue
 
-        if int(cand.get("instruction_like") or 0) == 1:
+        if int(cand.get("instruction_like") or 0) == 1 or is_instruction_like(content):
             _review(cand, "instruction_like")
             continue
 

@@ -9,6 +9,7 @@ from typing import Any, Callable, Optional
 from config import DEFAULT_CONFIG
 from db import SovereignDB
 from principal import validate_agent_id
+from safety import is_instruction_like
 
 
 logger = logging.getLogger("minnid")
@@ -68,6 +69,35 @@ def promote_candidate_durable(candidate_id: int, reason: str, context: AFMContex
     if cand.get("status") != "proposed":
         return None
     content = cand.get("content") or ""
+    if int(cand.get("instruction_like") or 0) == 1 or is_instruction_like(content):
+        now = time.time()
+        with wb.db.transaction() as c:
+            c.execute("SELECT status FROM candidate_packets WHERE candidate_id=?", (candidate_id,))
+            chk = c.fetchone()
+            if not chk or chk["status"] != "proposed":
+                return None
+            c.execute(
+                "UPDATE candidate_packets SET instruction_like=1 WHERE candidate_id=?",
+                (candidate_id,),
+            )
+            c.execute(
+                "SELECT 1 FROM consolidation_actions WHERE action_type='afm_review' AND claim=? LIMIT 1",
+                (str(candidate_id),),
+            )
+            if not c.fetchone():
+                c.execute(
+                    """
+                    INSERT INTO consolidation_actions
+                    (action_type, claim, category, status, detail, created_at)
+                    VALUES ('afm_review', ?, 'general', 'pending', ?, ?)
+                    """,
+                    (str(candidate_id), f"{reason[:450]}: instruction_like", now),
+                )
+        context.logger.warning(
+            "AFM consolidation routed instruction_like candidate #%d to review",
+            candidate_id,
+        )
+        return None
     agent_id = cand.get("principal") or "afm-loop"
     try:
         validate_agent_id(agent_id)

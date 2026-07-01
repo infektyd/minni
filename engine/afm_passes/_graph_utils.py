@@ -26,6 +26,7 @@ class VaultPage:
     wikilinks: List[str] = field(default_factory=list)
     body: str = ""
     updated_ts: float = 0.0
+    instruction_like: bool = False
 
     @property
     def slug(self) -> str:
@@ -102,6 +103,11 @@ def load_vault_pages(vault_path: str) -> List[VaultPage]:
                 wikilinks=WIKILINK_RE.findall(body),
                 body=body.strip(),
                 updated_ts=_parse_time(frontmatter.get("updated") or frontmatter.get("created") or "", stat_mtime),
+                # Inherited flag (Finding #4): a source page carries this when it, or
+                # something it was itself synthesized from, tripped is_instruction_like.
+                # Read here so downstream synthesis passes can propagate rather than
+                # silently re-launder the flag away.
+                instruction_like=(frontmatter.get("instruction_like") or "").strip().lower() in {"true", "1", "yes"},
             )
         )
     return pages
