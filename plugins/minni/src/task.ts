@@ -824,7 +824,8 @@ export async function callAfmPrepareTask(
   const { results, wasChunked } = await callNativeOpChunked(callOp, payload, "relevantSources");
   let finalResult: NativeOpResult | undefined;
   if (wasChunked) {
-    finalResult = await reduceViaSameOp(callOp, results, buildPrepareReducePayload(purpose), "relevantSources");
+    const reduceListField = purpose === "prepare_outcome" ? "partialOutcomeDrafts" : "partialBriefs";
+    finalResult = await reduceViaSameOp(callOp, results, buildPrepareReducePayload(purpose), reduceListField);
   } else {
     finalResult = results[0];
   }
