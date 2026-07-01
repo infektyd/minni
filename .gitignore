@@ -176,7 +176,10 @@ plugins/minni/skills/*/scripts/
 /_archive/
 /minni/
 /docs/plans/
-/docs/superpowers/
+/docs/superpowers/*
+!/docs/superpowers/specs/
+/docs/superpowers/specs/*
+!/docs/superpowers/specs/*.md
 /docs/reviews/
 /docs/migration/
 /docs/decisions/SOVEREIGN-OPENCLAW-OPTION2-DECISIONS.md
