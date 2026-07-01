@@ -460,3 +460,49 @@ def test_session_distill_chunks_and_reduces_oversized_text(tmp_path, monkeypatch
     distill = [d for d in result["drafts"] if d.get("prompt_version") == "native.session_distill.v1"]
     assert len(distill) == 1
     assert distill[0]["title"] == "Synthesized final learning"
+
+
+def test_entity_extract_merges_entities_across_chunks_deterministically(tmp_path, monkeypatch):
+    from afm_passes import session_distillation
+
+    db_obj, cfg = _make_db(tmp_path)
+    now = time.time()
+    with db_obj.cursor() as c:
+        for i in range(80):
+            c.execute(
+                """
+                INSERT INTO episodic_events
+                (agent_id, event_type, content, task_id, thread_id, metadata, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "codex", "session",
+                    f"Event {i}: " + ("substantial detail about the AFM chunking work. " * 20),
+                    "task-x", "thread-x", json.dumps({"source": "unit-test"}), now,
+                ),
+            )
+
+    call_count = {"n": 0}
+
+    def fake_entity_extract(payload):
+        call_count["n"] += 1
+        # Each chunk call reports one distinct entity plus a duplicate
+        # ("Minni") shared across chunks, to verify dedupe.
+        return _AFMResult(ok=True, data={
+            "entities": [
+                {"name": f"Entity{call_count['n']}", "type": "concept"},
+                {"name": "Minni", "type": "system"},
+            ]
+        })
+
+    op_map = {"entity_extract": fake_entity_extract}
+    monkeypatch.setenv("MINNI_AFM_MODE", "native")
+    monkeypatch.setattr("afm_provider.invoke_native_afm", _route(op_map))
+
+    result = session_distillation.run(db_obj, cfg, vault_path=cfg.vault_path, dry_run=True, trace_id="trace-entities")
+
+    assert call_count["n"] > 1
+    entities = result["inputs"].get("entities") or []
+    names = [e["name"] for e in entities]
+    assert names.count("Minni") == 1  # deduped across chunks
+    assert len(entities) <= 20  # existing cap preserved

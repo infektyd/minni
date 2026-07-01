@@ -383,31 +383,37 @@ def _native_session_distill_draft(
 
 def _native_entity_extract(text: str, trace_id: str) -> List[Dict[str, str]]:
     """Additive review-only entities for the wikilink graph seed. Proposal only:
-    NEVER writes durable links."""
+    NEVER writes durable links. List-shaped: merged deterministically across
+    chunks (dedupe by name.lower(), cap 20) rather than via an AFM reduce
+    pass — no synthesis is needed for a flat entity list."""
     mode = resolve_afm_mode()
     if mode not in {"native", "auto"}:
         return []
     if not text.strip():
         return []
-    result = default_provider_chain().native_op("entity_extract", {"text": text}, timeout=4.0)
-    if not result.ok:
-        _log_native_error_kind("entity_extract", trace_id, result)
-        return []
-    data = result.data if isinstance(result.data, dict) else {}
-    raw = data.get("entities")
-    if not isinstance(raw, list):
+    chain = default_provider_chain()
+    chunk_results, _ = call_native_op_chunked(chain, "entity_extract", {"text": text}, text_field="text", timeout=4.0)
+    if not any(r.ok for r in chunk_results):
+        _log_native_error_kind("entity_extract", trace_id, chunk_results[0])
         return []
     entities: List[Dict[str, str]] = []
     seen: set = set()
-    for item in raw:
-        if not isinstance(item, dict):
+    for result in chunk_results:
+        if not result.ok:
             continue
-        name = str(item.get("name") or "").strip()
-        etype = str(item.get("type") or "").strip()
-        key = name.lower()
-        if name and key not in seen:
-            seen.add(key)
-            entities.append({"name": name, "type": etype})
+        data = result.data if isinstance(result.data, dict) else {}
+        raw = data.get("entities")
+        if not isinstance(raw, list):
+            continue
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "").strip()
+            etype = str(item.get("type") or "").strip()
+            key = name.lower()
+            if name and key not in seen:
+                seen.add(key)
+                entities.append({"name": name, "type": etype})
     return entities[:20]
 
 
