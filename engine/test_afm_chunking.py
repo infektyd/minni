@@ -253,6 +253,100 @@ def test_reduce_via_same_op_calls_op_again_to_synthesize_final_result():
     assert len(chain.calls) == 1
 
 
+def test_call_native_op_chunked_persistent_overflow_stays_bounded_in_call_count():
+    from afm_chunking import call_native_op_chunked
+
+    # Regression test for the combinatorial blow-up bug: overlap_tokens used
+    # to stay fixed at its default (300) even as chunk_tokens shrank toward
+    # MIN_CHUNK_TOKENS (200) during recursive re-splitting. Once
+    # chunk_tokens <= overlap_tokens, split_text's step collapsed to 1,
+    # producing roughly one chunk per word — and since every overflowing
+    # chunk recurses, a 20,000-word input that overflows persistently used
+    # to trigger on the order of millions of chain.native_op calls.
+    #
+    # With overlap_tokens properly clamped relative to chunk_tokens at every
+    # recursive step, the number of calls must stay small and bounded no
+    # matter how large the input or how persistent the overflow.
+    chain = _FakeChain(lambda op, payload: _FakeResult(False, {"error_kind": "context_overflow"}))
+    prompt = "word " * 20000
+    results, was_chunked = call_native_op_chunked(
+        chain, "neighborhood_summary", {"prompt": prompt}, text_field="prompt",
+    )
+    assert was_chunked is True
+    assert all(not r.ok for r in results)
+    # Sane, explicit bound: with the overlap clamp, the recursive re-split
+    # tree has a small constant branching factor (~2-3 pieces per split) and
+    # a small constant depth (bounded by log2(chunk_tokens / MIN_CHUNK_TOKENS)
+    # ~= 4-5 halvings from the 2400-token default down to the 200-token
+    # floor) — so the total call count is a small bounded constant,
+    # independent of the input's word count. Before the fix this same input
+    # drove step to 1 and produced on the order of millions of calls; a
+    # correctly bounded tree stays well under 1000 regardless of input size.
+    assert len(chain.calls) < 1000
+
+
+def test_reduce_via_same_op_recurses_when_reduce_pass_itself_gets_chunked():
+    from afm_chunking import reduce_via_same_op
+
+    # Drives the recursive tree-reduction branch:
+    #     if len(reduced_successes) > 1: return reduce_via_same_op(...)
+    #
+    # Scenario: 4 initial chunk_results succeed. build_reduce_payload joins
+    # their summaries into one big "reduce-level-1" prompt that is itself
+    # over budget, so call_native_op_chunked chunks it into 2 pieces. Both
+    # of those reduce-level-1 sub-calls succeed, producing 2 successes —
+    # forcing reduce_via_same_op to recurse once more on those 2 results.
+    # That final reduce-level-2 call succeeds with a single synthesized
+    # result, which should be what's ultimately returned.
+    # Note: a text marker like "REDUCE1" can't be used to tag every chunked
+    # sub-call, because split_text's sliding window only guarantees the
+    # marker survives in whichever piece happens to contain the first word —
+    # later pieces are plain substrings of the long filler text. Instead,
+    # discriminate purely on payload length/shape, which every piece (and
+    # the final small payload) reliably differs on.
+    def handler(op, payload):
+        prompt = payload["prompt"]
+        if prompt.startswith("FINAL "):
+            return _FakeResult(True, {"summary": "FINAL synthesized result"})
+        # Any other call reaching native_op is one of the reduce-level-1
+        # chunked sub-calls (long filler payload split into pieces) —
+        # succeed each one so call_native_op_chunked reports 2+ successes.
+        return _FakeResult(True, {"summary": "reduce1 partial (len=%d)" % len(prompt)})
+
+    chain = _FakeChain(handler)
+
+    chunk_results = [
+        _FakeResult(True, {"summary": f"chunk summary {i}"}) for i in range(4)
+    ]
+
+    call_depth = {"n": 0}
+
+    def build_reduce_payload(partials):
+        call_depth["n"] += 1
+        if call_depth["n"] == 1:
+            # First reduce pass: build a payload big enough to itself
+            # require chunking (forces call_native_op_chunked to split it).
+            joined = " ".join(p["summary"] for p in partials)
+            big_prompt = joined + " filler " * 5000
+            return {"prompt": big_prompt}
+        # Second reduce pass: small payload over the 2 reduce-level-1
+        # results — stays under budget, single direct call.
+        return {"prompt": "FINAL " + " ".join(p["summary"] for p in partials)}
+
+    reduced = reduce_via_same_op(
+        chain, "neighborhood_summary", chunk_results,
+        build_reduce_payload=build_reduce_payload,
+        text_field="prompt",
+    )
+
+    assert reduced is not None
+    assert reduced.data["summary"] == "FINAL synthesized result"
+    # Confirms the recursive path was actually taken: two build_reduce_payload
+    # calls (level-1 chunked reduce, then level-2 final reduce over its 2
+    # successes) rather than the single-pass or safety-net fallback path.
+    assert call_depth["n"] == 2
+
+
 def test_reduce_via_same_op_final_safety_net_falls_back_to_first_success():
     from afm_chunking import reduce_via_same_op
 

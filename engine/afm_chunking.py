@@ -137,6 +137,23 @@ def _classify_error_kind(result: Any) -> str:
     return str(data.get("error_kind") or "").strip().lower()
 
 
+def _effective_overlap_tokens(chunk_tokens: int, overlap_tokens: int) -> int:
+    """Clamp overlap_tokens so it always stays meaningfully smaller than
+    chunk_tokens, regardless of how far chunk_tokens has shrunk during
+    recursive re-splitting.
+
+    Without this clamp, a caller-supplied overlap_tokens (e.g. the default
+    300) never shrinks as _chunk_and_call halves chunk_tokens toward
+    MIN_CHUNK_TOKENS. Once chunk_tokens <= overlap_tokens, split_text's
+    step = max(chunk_tokens - overlap_tokens, 1) collapses to 1, producing
+    roughly one chunk per word instead of a small, bounded number of
+    chunks — and since _chunk_and_call recurses per-chunk, that blows up
+    combinatorially. Clamping to at most a quarter of chunk_tokens keeps
+    step comfortably above 1 for any chunk_tokens >= MIN_CHUNK_TOKENS.
+    """
+    return max(min(overlap_tokens, chunk_tokens // 4), 0)
+
+
 def _chunk_and_call(
     chain: Any,
     op_name: str,
@@ -154,7 +171,8 @@ def _chunk_and_call(
     if not text.strip() or chunk_tokens < MIN_CHUNK_TOKENS:
         return [chain.native_op(op_name, payload, timeout=timeout)]
 
-    pieces = split_text(text, chunk_tokens=chunk_tokens, overlap_tokens=overlap_tokens)
+    effective_overlap = _effective_overlap_tokens(chunk_tokens, overlap_tokens)
+    pieces = split_text(text, chunk_tokens=chunk_tokens, overlap_tokens=effective_overlap)
     if len(pieces) <= 1:
         if chunk_tokens <= MIN_CHUNK_TOKENS:
             return [chain.native_op(op_name, payload, timeout=timeout)]
