@@ -127,3 +127,147 @@ def split_list_by_token_budget(
     if current:
         groups.append(current)
     return groups or [[]]
+
+
+from typing import Optional, Tuple  # noqa: E402 - grouped with the rest below
+
+
+def _classify_error_kind(result: Any) -> str:
+    data = result.data if isinstance(getattr(result, "data", None), dict) else {}
+    return str(data.get("error_kind") or "").strip().lower()
+
+
+def _chunk_and_call(
+    chain: Any,
+    op_name: str,
+    payload: Dict[str, Any],
+    text_field: str,
+    timeout: float,
+    chunk_tokens: int,
+    overlap_tokens: int,
+) -> List[Any]:
+    """Already committed to chunking payload[text_field]. Recurses (shrinking
+    chunk_tokens) on individual chunks that still trip context_overflow,
+    down to MIN_CHUNK_TOKENS — AFM calls are free, so there is no reason to
+    give up early; the only real stop condition is the floor."""
+    text = str(payload.get(text_field) or "")
+    if not text.strip() or chunk_tokens < MIN_CHUNK_TOKENS:
+        return [chain.native_op(op_name, payload, timeout=timeout)]
+
+    pieces = split_text(text, chunk_tokens=chunk_tokens, overlap_tokens=overlap_tokens)
+    if len(pieces) <= 1:
+        if chunk_tokens <= MIN_CHUNK_TOKENS:
+            return [chain.native_op(op_name, payload, timeout=timeout)]
+        return _chunk_and_call(
+            chain, op_name, payload, text_field, timeout,
+            max(chunk_tokens // 2, MIN_CHUNK_TOKENS), overlap_tokens,
+        )
+
+    results: List[Any] = []
+    for piece in pieces:
+        chunk_payload = dict(payload)
+        chunk_payload[text_field] = piece
+        chunk_result = chain.native_op(op_name, chunk_payload, timeout=timeout)
+        if (
+            not chunk_result.ok
+            and _classify_error_kind(chunk_result) == "context_overflow"
+            and chunk_tokens > MIN_CHUNK_TOKENS
+        ):
+            logger.info(
+                "afm native op %s: chunk still overflowed at chunk_tokens=%d, re-splitting",
+                op_name, chunk_tokens,
+            )
+            results.extend(_chunk_and_call(
+                chain, op_name, chunk_payload, text_field, timeout,
+                max(chunk_tokens // 2, MIN_CHUNK_TOKENS), overlap_tokens,
+            ))
+        else:
+            results.append(chunk_result)
+    return results
+
+
+def call_native_op_chunked(
+    chain: Any,
+    op_name: str,
+    payload: Dict[str, Any],
+    text_field: str,
+    timeout: float = 4.0,
+    budget_tokens: Optional[int] = None,
+    chunk_tokens: Optional[int] = None,
+    overlap_tokens: int = DEFAULT_OVERLAP_TOKENS,
+) -> Tuple[List[Any], bool]:
+    """Call chain.native_op(op_name, payload, timeout), chunking
+    payload[text_field] first if the serialized payload is over budget (or
+    reactively, if a single call unexpectedly trips context_overflow).
+
+    Returns (results, was_chunked):
+    - Under budget: calls chain.native_op() exactly once, byte-identical to
+      today's un-chunked behavior. Returns ([result], False).
+    - Over budget (proactively or reactively): splits payload[text_field]
+      into N pieces via split_text and calls chain.native_op once per
+      piece, sequentially. Returns (list_of_N_results, True).
+
+    Does NOT reduce results — reduction is domain-specific; see
+    reduce_via_same_op for the shared reduce-pass helper.
+    """
+    budget = budget_tokens if budget_tokens is not None else AFM_INPUT_BUDGET_TOKENS
+    size = chunk_tokens if chunk_tokens is not None else DEFAULT_CHUNK_TOKENS
+
+    estimated = estimate_native_payload_tokens(payload)
+    if estimated <= budget:
+        result = chain.native_op(op_name, payload, timeout=timeout)
+        if result.ok or _classify_error_kind(result) != "context_overflow":
+            return [result], False
+        logger.info(
+            "afm native op %s: reactive chunk trigger (estimated=%d <= budget=%d but call overflowed)",
+            op_name, estimated, budget,
+        )
+
+    return _chunk_and_call(chain, op_name, payload, text_field, timeout, size, overlap_tokens), True
+
+
+def reduce_via_same_op(
+    chain: Any,
+    op_name: str,
+    chunk_results: List[Any],
+    build_reduce_payload: Callable[[List[Dict[str, Any]]], Dict[str, Any]],
+    text_field: str,
+    timeout: float = 4.0,
+    budget_tokens: Optional[int] = None,
+) -> Optional[Any]:
+    """Reduce N successful per-chunk results into one, by calling op_name
+    again with a payload built from the chunks' .data (build_reduce_payload
+    decides the shape — e.g. {"text": joined_titles_and_assertions} for
+    session_distill). No new Swift-side op is needed: the reduce call uses
+    the exact same op_name as the map phase.
+
+    If the reduce payload is itself over budget, this recurses (tree
+    reduction) via call_native_op_chunked + another reduce_via_same_op pass
+    over the reduced pieces — AFM calls are free, so there is no single-pass
+    ceiling.
+
+    Returns None if there are zero successful chunk_results to reduce.
+    Returns the sole result unreduced if there is exactly one success (no
+    reduce call needed).
+    """
+    successes_data = [r.data for r in chunk_results if r.ok and isinstance(r.data, dict)]
+    if not successes_data:
+        return None
+    if len(successes_data) == 1:
+        return next(r for r in chunk_results if r.ok)
+
+    reduce_payload = build_reduce_payload(successes_data)
+    results, _ = call_native_op_chunked(
+        chain, op_name, reduce_payload, text_field, timeout=timeout, budget_tokens=budget_tokens,
+    )
+    reduced_successes = [r for r in results if r.ok]
+    if len(reduced_successes) == 1:
+        return reduced_successes[0]
+    if len(reduced_successes) > 1:
+        return reduce_via_same_op(
+            chain, op_name, reduced_successes, build_reduce_payload, text_field,
+            timeout=timeout, budget_tokens=budget_tokens,
+        )
+    # Final safety net: every reduce attempt failed — a partial answer beats
+    # nothing, so fall back to the first successful chunk.
+    return next((r for r in chunk_results if r.ok), None)
