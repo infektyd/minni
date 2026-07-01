@@ -156,9 +156,30 @@ def _review_draft(candidate: Dict[str, Any], reason: str, trace_id: str) -> Dict
     }
 
 
-def _build_triage_reduce_payload(partials: List[Dict[str, Any]]) -> Dict[str, Any]:
-    lines = [f"{p.get('decision', '')}: {p.get('reason', '')}" for p in partials if p.get("decision")]
-    return {"candidate": "\n".join(lines)}
+def _fold_triage_decisions(partials: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Deterministic priority-fold over per-chunk triage verdicts:
+    any chunk redact -> redact, else any reject -> reject, else accept.
+
+    Triage is a judgment op — re-judging the model's own per-chunk verdicts
+    with a second triage call would make the final decision depend on whether
+    a reason string happens to echo a trigger word, not on the candidate
+    content, silently losing a redact signal."""
+    def _decision(p: Dict[str, Any]) -> str:
+        return str(p.get("decision") or "").strip().lower()
+
+    winner = None
+    for priority in ("redact", "reject"):
+        winner = next((p for p in partials if _decision(p) == priority), None)
+        if winner is not None:
+            break
+    if winner is None:
+        winner = next((p for p in partials if _decision(p) == "accept"), partials[0])
+    hits = sum(1 for p in partials if _decision(p) == _decision(winner))
+    return {
+        "decision": _decision(winner),
+        "reason": f"chunked fold ({hits}/{len(partials)} chunks): {str(winner.get('reason') or '').strip()}",
+        "tool_used": any(bool(p.get("tool_used")) for p in partials),
+    }
 
 
 def _triage_advisory(candidates: List[Dict[str, Any]],
@@ -206,7 +227,7 @@ def _triage_advisory(candidates: List[Dict[str, Any]],
         chain = default_provider_chain()
         result = call_native_op_and_reduce(
             chain, "triage", {"candidate": content}, text_field="candidate",
-            build_reduce_payload=_build_triage_reduce_payload,
+            fold=_fold_triage_decisions,
             timeout=4.0, trace_id=trace_id,
         )
     except Exception:  # noqa: BLE001 - advisory must never break consolidation

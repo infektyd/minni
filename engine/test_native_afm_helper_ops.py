@@ -653,3 +653,37 @@ def test_triage_advisory_chunks_oversized_candidate(tmp_path, monkeypatch):
     assert call_count["n"] > 1
     assert result["triage_advisory"] is not None
     assert result["triage_advisory"]["candidate_id"] == cid
+
+
+def test_triage_advisory_fold_preserves_redact_from_any_chunk(tmp_path, monkeypatch):
+    """A redact verdict from one chunk must survive the reduce even when its
+    reason text contains no trigger words — the fold is deterministic, not a
+    second AFM call re-judging the model's own verdicts."""
+    from afm_passes import consolidation
+
+    db_obj, cfg = _make_db(tmp_path)
+    _ensure_candidate_tables(db_obj)
+    long_content = "A plausible durable fact about the build pipeline cache. " * 1000
+    _seed_candidate(db_obj, long_content)
+
+    call_count = {"n": 0}
+
+    def fake_triage(payload):
+        call_count["n"] += 1
+        # First chunk saw sensitive content; reason deliberately avoids any
+        # trigger word so a re-judging reduce would lose the redact signal.
+        if call_count["n"] == 1:
+            return _AFMResult(ok=True, data={"decision": "redact", "reason": "flagged sensitive material", "tool_used": False})
+        return _AFMResult(ok=True, data={"decision": "accept", "reason": "ordinary note", "tool_used": True})
+
+    monkeypatch.setenv("MINNI_AFM_MODE", "native")
+    monkeypatch.setattr("afm_provider.invoke_native_afm", _route({"triage": fake_triage}))
+
+    result = consolidation.run(db_obj, cfg, vault_path=cfg.vault_path, dry_run=True, trace_id="t")
+
+    advisory = result["triage_advisory"]
+    assert advisory is not None
+    assert call_count["n"] > 1  # candidate actually got chunked
+    assert advisory["decision"] == "redact"
+    assert "flagged sensitive material" in advisory["reason"]
+    assert advisory["tool_used"] is True  # any-chunk OR
