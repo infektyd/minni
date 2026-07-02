@@ -310,7 +310,9 @@ def test_error_kind_logged_distinctly_on_native_failure(tmp_path, monkeypatch, c
     monkeypatch.setenv("MINNI_AFM_MODE", "native")
     monkeypatch.setattr("afm_provider.invoke_native_afm", _route(op_map))
 
-    with caplog.at_level(logging.INFO, logger="sovereign.afm.session_distillation"):
+    # error_kind logging is canonical in afm_chunking.log_native_error_kind now,
+    # so it emits on that module's logger.
+    with caplog.at_level(logging.INFO, logger="sovereign.afm_chunking"):
         result = run(db_obj, cfg, vault_path=cfg.vault_path, dry_run=True, trace_id="t")
 
     assert result["status"] == "ok"  # behavior otherwise unchanged
@@ -405,3 +407,357 @@ def test_consolidation_triage_advisory_none_when_afm_off(tmp_path, monkeypatch):
 
     result = consolidation.run(db_obj, cfg, vault_path=cfg.vault_path, dry_run=True, trace_id="t")
     assert result["triage_advisory"] is None
+
+
+# --- Task 4: session_distill chunks oversized text --------------------------
+
+
+def test_session_distill_chunks_and_reduces_oversized_text(tmp_path, monkeypatch):
+    from afm_passes import session_distillation
+
+    db_obj, cfg = _make_db(tmp_path)
+    # Seed enough events that _combined_session_text produces well over
+    # AFM_INPUT_BUDGET_TOKENS (3200) worth of text — previously this would
+    # have been silently truncated to [:6000] chars.
+    now = time.time()
+    with db_obj.cursor() as c:
+        for i in range(80):
+            c.execute(
+                """
+                INSERT INTO episodic_events
+                (agent_id, event_type, content, task_id, thread_id, metadata, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "codex", "session",
+                    f"Event {i}: " + ("substantial detail about the AFM chunking work. " * 20),
+                    "task-x", "thread-x", json.dumps({"source": "unit-test"}), now,
+                ),
+            )
+
+    call_count = {"n": 0}
+
+    def fake_session_distill(payload):
+        call_count["n"] += 1
+        # The reduce call joins per-chunk "title: assertion (appliesWhen)"
+        # lines, so its text won't contain "Event " — use that to
+        # distinguish a map call from the reduce call.
+        if "Event " in payload.get("text", ""):
+            return _AFMResult(ok=True, data={
+                "title": f"Chunk {call_count['n']}", "assertion": "partial assertion",
+                "appliesWhen": "during chunking", "category": "concept",
+            })
+        return _AFMResult(ok=True, data={
+            "title": "Synthesized final learning", "assertion": "the reduced assertion",
+            "appliesWhen": "always", "category": "concept",
+        })
+
+    op_map = {"session_distill": fake_session_distill}
+    monkeypatch.setenv("MINNI_AFM_MODE", "native")
+    monkeypatch.setattr("afm_provider.invoke_native_afm", _route(op_map))
+
+    result = session_distillation.run(db_obj, cfg, vault_path=cfg.vault_path, dry_run=True, trace_id="trace-chunked")
+
+    assert call_count["n"] > 1  # multiple map calls + one reduce call
+    distill = [d for d in result["drafts"] if d.get("prompt_version") == "native.session_distill.v1"]
+    assert len(distill) == 1
+    assert distill[0]["title"] == "Synthesized final learning"
+
+
+def test_entity_extract_merges_entities_across_chunks_deterministically(tmp_path, monkeypatch):
+    from afm_passes import session_distillation
+
+    db_obj, cfg = _make_db(tmp_path)
+    now = time.time()
+    with db_obj.cursor() as c:
+        for i in range(80):
+            c.execute(
+                """
+                INSERT INTO episodic_events
+                (agent_id, event_type, content, task_id, thread_id, metadata, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "codex", "session",
+                    f"Event {i}: " + ("substantial detail about the AFM chunking work. " * 20),
+                    "task-x", "thread-x", json.dumps({"source": "unit-test"}), now,
+                ),
+            )
+
+    call_count = {"n": 0}
+
+    def fake_entity_extract(payload):
+        call_count["n"] += 1
+        # Each chunk call reports one distinct entity plus a duplicate
+        # ("Minni") shared across chunks, to verify dedupe.
+        return _AFMResult(ok=True, data={
+            "entities": [
+                {"name": f"Entity{call_count['n']}", "type": "concept"},
+                {"name": "Minni", "type": "system"},
+            ]
+        })
+
+    op_map = {"entity_extract": fake_entity_extract}
+    monkeypatch.setenv("MINNI_AFM_MODE", "native")
+    monkeypatch.setattr("afm_provider.invoke_native_afm", _route(op_map))
+
+    result = session_distillation.run(db_obj, cfg, vault_path=cfg.vault_path, dry_run=True, trace_id="trace-entities")
+
+    assert call_count["n"] > 1
+    entities = result["inputs"].get("entities") or []
+    names = [e["name"] for e in entities]
+    assert names.count("Minni") == 1  # deduped across chunks
+    assert len(entities) <= 20  # existing cap preserved
+
+
+def test_contradiction_signal_chunks_oversized_candidate(tmp_path, monkeypatch):
+    from afm_passes import session_distillation
+
+    db_obj, cfg = _make_db(tmp_path)
+    _seed_event(db_obj)
+    with db_obj.cursor() as c:
+        c.execute(
+            """
+            INSERT INTO learnings (agent_id, category, content, confidence, created_at)
+            VALUES (?, 'general', ?, 0.9, ?)
+            """,
+            ("codex", "Built the native AFM helper wiring, an existing durable fact.", time.time()),
+        )
+
+    call_count = {"n": 0}
+
+    def fake_contradiction(payload):
+        call_count["n"] += 1
+        return _AFMResult(ok=True, data={"contradicts": False, "reason": f"partial reason {call_count['n']}"})
+
+    op_map = {
+        "session_distill": lambda p: _AFMResult(ok=True, data={
+            "title": "Built the native AFM helper wiring",
+            "assertion": "long assertion body. " * 1000,
+            "appliesWhen": "always", "category": "concept",
+        }),
+        "contradiction": fake_contradiction,
+    }
+    monkeypatch.setenv("MINNI_AFM_MODE", "native")
+    monkeypatch.setattr("afm_provider.invoke_native_afm", _route(op_map))
+
+    result = session_distillation.run(db_obj, cfg, vault_path=cfg.vault_path, dry_run=True, trace_id="trace-contradiction")
+
+    assert call_count["n"] > 1
+    assert result["inputs"].get("contradiction") is not None
+
+
+def test_compile_pass_proposals_groups_large_draft_lists_by_token_budget(tmp_path, monkeypatch):
+    from afm_passes import session_distillation
+
+    db_obj, cfg = _make_db(tmp_path)
+    now = time.time()
+    with db_obj.cursor() as c:
+        c.execute(
+            """
+            INSERT INTO episodic_events
+            (agent_id, event_type, content, task_id, thread_id, metadata, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "codex", "session", "Seed event for compile_pass_proposals chunking test.",
+                "task-seed", "thread-seed", json.dumps({"source": "unit-test"}), now,
+            ),
+        )
+
+    # session_distillation._build_drafts's own deterministic extraction is
+    # hard-capped well below 12 (1 session draft + <=5 concepts + <=5
+    # entities, deduped) — no amount of seeded episodic_events content can
+    # push its output past 12. To genuinely exercise the >12-drafts,
+    # token-budgeted-grouping path in _native_compile_drafts, monkeypatch
+    # _build_drafts itself to return a large, realistically-sized list of
+    # deterministic drafts (as if a future/richer deterministic pass had
+    # produced them), matching this test's actual target: the
+    # compile_pass_proposals call site's handling of an oversized
+    # deterministic_drafts list, not the extraction heuristics upstream of it.
+    big_drafts = [
+        {
+            "page_id": f"draft-{i}",
+            "kind": "concept",
+            "section": "concepts",
+            "title": f"Distinct concept {i}",
+            "status": "draft",
+            "agent": "afm-loop",
+            "trace_id": "trace-compile",
+            "sources": [f"episodic_events:{i}"],
+            "body": f"- Candidate concept {i} extracted from substantial synthetic body content. " * 20,
+        }
+        for i in range(20)
+    ]
+    monkeypatch.setattr(session_distillation, "_build_drafts", lambda events, raw_docs, trace_id: big_drafts)
+
+    call_count = {"n": 0}
+    seen_group_sizes = []
+
+    def fake_compile(payload):
+        call_count["n"] += 1
+        drafts_in = payload.get("deterministic_drafts") or []
+        seen_group_sizes.append(len(drafts_in))
+        sources = drafts_in[0]["sources"] if drafts_in and drafts_in[0].get("sources") else []
+        return _AFMResult(ok=True, data={
+            "drafts": [{
+                "kind": "concept", "section": "concepts",
+                "title": f"Draft from call {call_count['n']}",
+                "body": "review-only body",
+                "sources": sources,
+            }]
+        })
+
+    op_map = {"compile_pass_proposals": fake_compile}
+    monkeypatch.setenv("MINNI_AFM_MODE", "native")
+    monkeypatch.setattr("afm_provider.invoke_native_afm", _route(op_map))
+
+    result = session_distillation.run(db_obj, cfg, vault_path=cfg.vault_path, dry_run=True, trace_id="trace-compile")
+
+    assert result is not None
+    # With 20 synthetic deterministic drafts (far more than the old
+    # deterministic_drafts[:12] cap), verify the migrated code processes the
+    # FULL list across token-budgeted groups instead of silently dropping
+    # anything past the 12th: either multiple calls were made, or a single
+    # call's group carries more than 12 drafts, and in all cases every
+    # draft must have been seen across the group(s).
+    assert call_count["n"] >= 1
+    assert sum(seen_group_sizes) == len(big_drafts)
+    if call_count["n"] == 1:
+        assert seen_group_sizes[0] > 12
+
+
+def test_triage_advisory_chunks_oversized_candidate(tmp_path, monkeypatch):
+    from afm_passes import consolidation
+
+    db_obj, cfg = _make_db(tmp_path)
+    _ensure_candidate_tables(db_obj)
+    long_content = "A plausible durable fact about the build pipeline cache. " * 1000
+    cid = _seed_candidate(db_obj, long_content)
+
+    call_count = {"n": 0}
+
+    def fake_triage(payload):
+        call_count["n"] += 1
+        candidate = payload.get("candidate", "")
+        if "build pipeline cache" in candidate and len(candidate) > 500:
+            return _AFMResult(ok=True, data={"decision": "accept", "reason": f"partial {call_count['n']}", "tool_used": True})
+        return _AFMResult(ok=True, data={"decision": "accept", "reason": "synthesized reason", "tool_used": True})
+
+    op_map = {"triage": fake_triage}
+    monkeypatch.setenv("MINNI_AFM_MODE", "native")
+    monkeypatch.setattr("afm_provider.invoke_native_afm", _route(op_map))
+
+    result = consolidation.run(db_obj, cfg, vault_path=cfg.vault_path, dry_run=True, trace_id="t")
+
+    assert call_count["n"] > 1
+    assert result["triage_advisory"] is not None
+    assert result["triage_advisory"]["candidate_id"] == cid
+
+
+def test_triage_advisory_fold_preserves_redact_from_any_chunk(tmp_path, monkeypatch):
+    """A redact verdict from one chunk must survive the reduce even when its
+    reason text contains no trigger words — the fold is deterministic, not a
+    second AFM call re-judging the model's own verdicts."""
+    from afm_passes import consolidation
+
+    db_obj, cfg = _make_db(tmp_path)
+    _ensure_candidate_tables(db_obj)
+    long_content = "A plausible durable fact about the build pipeline cache. " * 1000
+    _seed_candidate(db_obj, long_content)
+
+    call_count = {"n": 0}
+
+    def fake_triage(payload):
+        call_count["n"] += 1
+        # First chunk saw sensitive content; reason deliberately avoids any
+        # trigger word so a re-judging reduce would lose the redact signal.
+        if call_count["n"] == 1:
+            return _AFMResult(ok=True, data={"decision": "redact", "reason": "flagged sensitive material", "tool_used": False})
+        return _AFMResult(ok=True, data={"decision": "accept", "reason": "ordinary note", "tool_used": True})
+
+    monkeypatch.setenv("MINNI_AFM_MODE", "native")
+    monkeypatch.setattr("afm_provider.invoke_native_afm", _route({"triage": fake_triage}))
+
+    result = consolidation.run(db_obj, cfg, vault_path=cfg.vault_path, dry_run=True, trace_id="t")
+
+    advisory = result["triage_advisory"]
+    assert advisory is not None
+    assert call_count["n"] > 1  # candidate actually got chunked
+    assert advisory["decision"] == "redact"
+    assert "flagged sensitive material" in advisory["reason"]
+    assert advisory["tool_used"] is True  # any-chunk OR
+
+
+def test_contradiction_fold_preserves_single_contradicting_chunk(tmp_path, monkeypatch):
+    """One contradicting chunk among non-contradicting ones must yield
+    contradicts=True with that chunk's reason — deterministic OR-fold, not a
+    second AFM call that re-judges the concatenated reasons."""
+    from afm_passes import session_distillation
+
+    db_obj, cfg = _make_db(tmp_path)
+    _seed_event(db_obj)
+    with db_obj.cursor() as c:
+        c.execute(
+            """
+            INSERT INTO learnings (agent_id, category, content, confidence, created_at)
+            VALUES (?, 'general', ?, 0.9, ?)
+            """,
+            ("codex", "Built the native AFM helper wiring, an existing durable fact.", time.time()),
+        )
+
+    call_count = {"n": 0}
+
+    def fake_contradiction(payload):
+        call_count["n"] += 1
+        if call_count["n"] == 2:
+            return _AFMResult(ok=True, data={"contradicts": True, "reason": "chunk 2 conflicts with the existing fact"})
+        return _AFMResult(ok=True, data={"contradicts": False, "reason": f"no conflict in chunk {call_count['n']}"})
+
+    op_map = {
+        "session_distill": lambda p: _AFMResult(ok=True, data={
+            "title": "Built the native AFM helper wiring",
+            "assertion": "long assertion body. " * 1000,
+            "appliesWhen": "always", "category": "concept",
+        }),
+        "contradiction": fake_contradiction,
+    }
+    monkeypatch.setenv("MINNI_AFM_MODE", "native")
+    monkeypatch.setattr("afm_provider.invoke_native_afm", _route(op_map))
+
+    result = session_distillation.run(db_obj, cfg, vault_path=cfg.vault_path, dry_run=True, trace_id="t")
+
+    signal = result["inputs"].get("contradiction")
+    assert call_count["n"] > 1  # candidate actually got chunked
+    assert signal is not None
+    assert signal["contradicts"] is True
+    assert signal["reason"] == "chunk 2 conflicts with the existing fact"
+
+
+def test_entity_extract_cap_logs_dropped_count(tmp_path, monkeypatch, caplog):
+    """When the merged multi-chunk entity list exceeds the cap, the drop is
+    logged with a count — silent truncation was the pre-fix behavior."""
+    from afm_passes.session_distillation import _native_entity_extract
+
+    call_count = {"n": 0}
+
+    def fake_entity_extract(payload):
+        call_count["n"] += 1
+        base = call_count["n"] * 100
+        return _AFMResult(ok=True, data={
+            "entities": [{"name": f"Entity-{base + i}", "type": "concept"} for i in range(15)],
+        })
+
+    monkeypatch.setenv("MINNI_AFM_MODE", "native")
+    monkeypatch.setattr("afm_provider.invoke_native_afm", _route({"entity_extract": fake_entity_extract}))
+
+    long_text = "Session content about many systems. " * 2000  # forces chunking
+    with caplog.at_level(logging.INFO, logger="sovereign.afm.session_distillation"):
+        entities = _native_entity_extract(long_text, "trace-cap")
+
+    assert call_count["n"] > 1  # actually chunked, 15 entities per chunk
+    assert len(entities) == 20  # cap still applies
+    assert any(
+        "entity_extract" in rec.message and "dropped" in rec.message
+        for rec in caplog.records
+    )

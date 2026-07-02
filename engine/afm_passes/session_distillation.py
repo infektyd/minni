@@ -15,38 +15,26 @@ import sqlite3
 import time
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
+from afm_chunking import (
+    MIN_CHUNK_TOKENS,
+    call_native_op_and_reduce,
+    call_native_op_chunked,
+    estimate_native_payload_tokens,
+    log_native_error_kind as _log_native_error_kind,
+    resolve_afm_input_budget_tokens,
+    split_list_by_token_budget,
+)
 from afm_provider import resolve_afm_mode
 from model_provider import default_provider_chain
 from safety import is_instruction_like
 
 logger = logging.getLogger("sovereign.afm.session_distillation")
 
-
-def _log_native_error_kind(op: str, trace_id: str, result: Any) -> str:
-    """Surface the helper's error_kind so a recoverable trip (context_overflow /
-    guardrail) is no longer indistinguishable from "AFM down". Returns the
-    classified kind for the caller to record; behavior otherwise unchanged.
-
-    NOTE (PR84-2 retraction): this CLASSIFIES and LOGS the trip only — it does
-    NOT chunk on context_overflow or rephrase on guardrail. The pass still
-    returns empty on a trip. The #84 description's "(chunk)" / "(rephrase/skip)"
-    wording describes intended future recovery, not shipped behavior; real
-    recovery is tracked as separate follow-up work."""
-    data = result.data if isinstance(getattr(result, "data", None), dict) else {}
-    error_kind = str(data.get("error_kind") or "").strip() or "unknown"
-    if error_kind in {"context_overflow", "guardrail"}:
-        logger.info(
-            "afm native op %s recoverable trip (%s): status=%s error=%s trace=%s",
-            op, error_kind, getattr(result, "status", None), getattr(result, "error", None), trace_id,
-        )
-    else:
-        logger.info(
-            "afm native op %s unavailable (error_kind=%s): status=%s error=%s trace=%s",
-            op, error_kind, getattr(result, "status", None), getattr(result, "error", None), trace_id,
-        )
-    return error_kind
+# Post-merge cap on entity_extract results (carried over from the
+# pre-chunking single-call cap; the drop is logged when it bites).
+_ENTITY_CAP = 20
 
 
 def _slugify(text: str) -> str:
@@ -317,49 +305,64 @@ def _native_compile_drafts(pass_input: Dict[str, Any], deterministic_drafts: Lis
     }
     if not allowed_sources:
         return []
-    payload = {
-        "pass_name": "session_distillation",
-        "trace_id": trace_id,
-        "inputs": pass_input,
-        "deterministic_drafts": deterministic_drafts[:12],
-    }
-    # P2: native helper ops route through the provider chain. The op stays
-    # native-only by contract (bridge mode keeps returning no drafts).
-    result = default_provider_chain().native_op("compile_pass_proposals", payload, timeout=4.0)
-    if not result.ok:
-        _log_native_error_kind("compile_pass_proposals", trace_id, result)
-        return []
-    candidates = result.data.get("drafts")
-    if not isinstance(candidates, list):
-        return []
-    # Finding #4 (native compile path): the provider may paraphrase a poisoned
-    # event into clean prose. If ANY deterministic input draft fed to this call
-    # was flagged instruction_like, every native output inherits the flag even
-    # when the paraphrased body no longer trips is_instruction_like().
-    inputs_flagged = any(
-        draft.get("instruction_like") for draft in deterministic_drafts
+    chain = default_provider_chain()
+    base_payload = {"pass_name": "session_distillation", "trace_id": trace_id, "inputs": pass_input}
+    base_tokens = estimate_native_payload_tokens(base_payload)
+    draft_group_budget = max(resolve_afm_input_budget_tokens() - base_tokens, MIN_CHUNK_TOKENS)
+    # List-shaped input (deterministic_drafts): group by token budget instead
+    # of the old hard cap of 12 (which silently dropped anything beyond it).
+    groups = split_list_by_token_budget(
+        deterministic_drafts, draft_group_budget,
+        serialize=lambda draft: json.dumps(draft, default=str),
     )
+
     normalized: List[Dict[str, Any]] = []
-    for candidate in candidates:
-        draft = _normalize_native_draft(candidate, trace_id, allowed_sources)
-        if draft is None:
+    seen_titles: set = set()
+    for group in groups:
+        payload = dict(base_payload, deterministic_drafts=group)
+        # P2: native helper ops route through the provider chain. The op stays
+        # native-only by contract (bridge mode keeps returning no drafts).
+        result = chain.native_op("compile_pass_proposals", payload, timeout=4.0)
+        if not result.ok:
+            _log_native_error_kind("compile_pass_proposals", trace_id, result)
             continue
-        own_flag = bool(draft.get("instruction_like"))
-        if inputs_flagged and not own_flag:
-            logger.warning(
-                "session_distillation native draft %r inherits instruction_like "
-                "from flagged deterministic input draft(s); the provider's "
-                "paraphrase did not itself trip the detector",
-                draft.get("title"),
-            )
-        draft["instruction_like"] = 1 if (own_flag or inputs_flagged) else 0
-        normalized.append(draft)
+        candidates = result.data.get("drafts") if isinstance(result.data, dict) else None
+        if not isinstance(candidates, list):
+            continue
+        # Finding #4 (native compile path): the provider may paraphrase a
+        # poisoned event into clean prose. Inherit per GROUP: if any input
+        # draft fed to THIS call was flagged instruction_like, this call's
+        # outputs inherit the flag even when the paraphrased body no longer
+        # trips is_instruction_like().
+        inputs_flagged = any(
+            draft.get("instruction_like") for draft in group
+        )
+        for candidate in candidates:
+            draft = _normalize_native_draft(candidate, trace_id, allowed_sources)
+            if draft is None:
+                continue
+            key = draft["title"].strip().lower()
+            if key in seen_titles:
+                continue
+            seen_titles.add(key)
+            own_flag = bool(draft.get("instruction_like"))
+            if inputs_flagged and not own_flag:
+                logger.warning(
+                    "session_distillation native draft %r inherits instruction_like "
+                    "from flagged deterministic input draft(s); the provider's "
+                    "paraphrase did not itself trip the detector",
+                    draft.get("title"),
+                )
+            draft["instruction_like"] = 1 if (own_flag or inputs_flagged) else 0
+            normalized.append(draft)
     return normalized[:5]
 
 
 def _combined_session_text(events: List[Dict[str, Any]], raw_docs: List[Dict[str, Any]]) -> str:
-    """Flatten the session into one text blob for the guided AFM ops, capped
-    well under the helper's ~4K token budget (first ~6000 chars)."""
+    """Flatten the session into one text blob for the guided AFM ops.
+    Unbounded — oversized input is chunked by call_native_op_chunked at the
+    call site (session_distill, entity_extract) instead of being silently
+    truncated here."""
     lines: List[str] = []
     for event in events:
         content = (event.get("content") or "").strip()
@@ -369,7 +372,21 @@ def _combined_session_text(events: List[Dict[str, Any]], raw_docs: List[Dict[str
         path = (doc.get("path") or "").strip()
         if path:
             lines.append(f"raw document: {path}")
-    return "\n".join(lines)[:6000]
+    return "\n".join(lines)
+
+
+def _build_session_distill_reduce_payload(partials: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Synthesize a compact 'text' input for a second session_distill call
+    from N per-chunk DistilledLearningResult-shaped dicts — reduce-via-
+    same-op, no new Swift surface needed."""
+    lines = []
+    for partial in partials:
+        title = str(partial.get("title") or "").strip()
+        assertion = str(partial.get("assertion") or "").strip()
+        applies_when = str(partial.get("appliesWhen") or "").strip()
+        if title or assertion:
+            lines.append(f"{title}: {assertion} ({applies_when})".strip())
+    return {"text": "\n".join(lines)}
 
 
 def _native_session_distill_draft(
@@ -382,9 +399,13 @@ def _native_session_distill_draft(
         return None
     if not text.strip() or not sources:
         return None
-    result = default_provider_chain().native_op("session_distill", {"text": text}, timeout=4.0)
-    if not result.ok:
-        _log_native_error_kind("session_distill", trace_id, result)
+    chain = default_provider_chain()
+    result = call_native_op_and_reduce(
+        chain, "session_distill", {"text": text}, text_field="text",
+        build_reduce_payload=_build_session_distill_reduce_payload,
+        timeout=4.0, trace_id=trace_id,
+    )
+    if result is None:
         return None
     data = result.data if isinstance(result.data, dict) else {}
     title = str(data.get("title") or "").strip()
@@ -441,32 +462,45 @@ def _native_session_distill_draft(
 
 def _native_entity_extract(text: str, trace_id: str) -> List[Dict[str, str]]:
     """Additive review-only entities for the wikilink graph seed. Proposal only:
-    NEVER writes durable links."""
+    NEVER writes durable links. List-shaped: merged deterministically across
+    chunks (dedupe by name.lower(), cap _ENTITY_CAP) rather than via an AFM
+    reduce pass — no synthesis is needed for a flat entity list. Entities
+    dropped by the cap are logged so the truncation is observable."""
     mode = resolve_afm_mode()
     if mode not in {"native", "auto"}:
         return []
     if not text.strip():
         return []
-    result = default_provider_chain().native_op("entity_extract", {"text": text}, timeout=4.0)
-    if not result.ok:
-        _log_native_error_kind("entity_extract", trace_id, result)
-        return []
-    data = result.data if isinstance(result.data, dict) else {}
-    raw = data.get("entities")
-    if not isinstance(raw, list):
+    chain = default_provider_chain()
+    chunk_results, _ = call_native_op_chunked(chain, "entity_extract", {"text": text}, text_field="text", timeout=4.0)
+    if not any(r.ok for r in chunk_results):
+        _log_native_error_kind("entity_extract", trace_id, chunk_results[0])
         return []
     entities: List[Dict[str, str]] = []
     seen: set = set()
-    for item in raw:
-        if not isinstance(item, dict):
+    for result in chunk_results:
+        if not result.ok:
             continue
-        name = str(item.get("name") or "").strip()
-        etype = str(item.get("type") or "").strip()
-        key = name.lower()
-        if name and key not in seen:
-            seen.add(key)
-            entities.append({"name": name, "type": etype})
-    return entities[:20]
+        data = result.data if isinstance(result.data, dict) else {}
+        raw = data.get("entities")
+        if not isinstance(raw, list):
+            continue
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "").strip()
+            etype = str(item.get("type") or "").strip()
+            key = name.lower()
+            if name and key not in seen:
+                seen.add(key)
+                entities.append({"name": name, "type": etype})
+    if len(entities) > _ENTITY_CAP:
+        logger.info(
+            "afm native op entity_extract: cap %d dropped %d merged entities "
+            "(chunk order, not relevance) trace=%s",
+            _ENTITY_CAP, len(entities) - _ENTITY_CAP, trace_id,
+        )
+    return entities[:_ENTITY_CAP]
 
 
 def _similar_existing_learning(db, query: str) -> Optional[str]:
@@ -501,6 +535,18 @@ def _similar_existing_learning(db, query: str) -> Optional[str]:
     return str(content).strip() if content else None
 
 
+def _fold_contradiction_signals(partials: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Deterministic OR-fold over per-chunk contradiction verdicts: any chunk
+    that contradicts wins, with that chunk's reason. Contradiction is a
+    judgment op — re-judging the concatenated reasons with a second AFM call
+    would let non-contradicting chunks dilute a real contradiction to false."""
+    hit = next((p for p in partials if bool(p.get("contradicts"))), None)
+    if hit is not None:
+        return {"contradicts": True, "reason": str(hit.get("reason") or "").strip()}
+    first_reason = next((str(p.get("reason") or "").strip() for p in partials if p.get("reason")), "")
+    return {"contradicts": False, "reason": first_reason}
+
+
 def _native_contradiction_signal(
     db, drafts: List[Dict[str, Any]], trace_id: str
 ) -> Optional[Dict[str, Any]]:
@@ -526,11 +572,14 @@ def _native_contradiction_signal(
     existing = _similar_existing_learning(db, candidate.get("title") or candidate.get("body") or "")
     if not existing:
         return None
-    result = default_provider_chain().native_op(
-        "contradiction", {"existing": existing, "candidate": candidate_text[:6000]}, timeout=4.0
+    chain = default_provider_chain()
+    result = call_native_op_and_reduce(
+        chain, "contradiction", {"existing": existing, "candidate": candidate_text},
+        text_field="candidate",
+        fold=_fold_contradiction_signals,
+        timeout=4.0, trace_id=trace_id,
     )
-    if not result.ok:
-        _log_native_error_kind("contradiction", trace_id, result)
+    if result is None:
         return None
     data = result.data if isinstance(result.data, dict) else {}
     return {

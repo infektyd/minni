@@ -6,6 +6,7 @@ import path from "node:path";
 import test from "node:test";
 
 import { buildAfmChatPayload, prepareOutcome, callAfmPrepareTask, prepareTask } from "../dist/task.js";
+import { ProviderChain } from "../dist/providers.js";
 
 const vaultMatch = {
   notePath: "/tmp/vault/wiki/sessions/backend-handoff.md",
@@ -521,6 +522,142 @@ test("callAfmPrepareTask parses v0 chat-completions JSON content", async () => {
   }
 });
 
+test("callAfmPrepareTask chunks oversized relevantSources instead of sending them all in one native call", async () => {
+  const nativeCalls = [];
+  // Fake native helper: records every payload's relevantSources length: the
+  // first "map" calls see a slice, the final "reduce" call sees none
+  // (partialBriefs instead).
+  const fakeChat = async (request) => {
+    nativeCalls.push(request.nativePayload);
+    const sources = Array.isArray(request.nativePayload?.relevantSources)
+      ? request.nativePayload.relevantSources
+      : [];
+    if (sources.length > 0) {
+      return { ok: true, data: { brief: `partial brief ${nativeCalls.length}`, recommendedNextActions: [], risks: [] } };
+    }
+    return { ok: true, data: { brief: "synthesized final brief", recommendedNextActions: [], risks: [] } };
+  };
+
+  // A plain object literal implementing ModelProvider directly — NOT a
+  // spread of a class instance, which would drop AfmProvider's prototype
+  // methods (supports/chat/health) and make ProviderChain.chat() throw when
+  // it calls provider.supports(operation).
+  const fakeProvider = {
+    name: "afm",
+    tier: "local",
+    supports: (_operation) => true,
+    chat: fakeChat,
+  };
+  const chain = new ProviderChain([fakeProvider]);
+  const bigSources = Array.from({ length: 60 }, (_, i) => ({
+    relativePath: `note-${i}.md`,
+    wikilink: `[[note-${i}]]`,
+    evidenceEnvelope: "context text ".repeat(50),
+  }));
+
+  const result = await callAfmPrepareTask("http://127.0.0.1:11437/v1/chat/completions", {
+    task: "a task",
+    budgetTokens: 4096,
+    profile: "default",
+    provider: { provider: "native", mode: "native" },
+    intent: "intent",
+    constraints: [],
+    currentState: [],
+    relevantSources: bigSources,
+    daemonLead: "",
+    model: "afm-local",
+  }, chain);
+
+  assert.equal(result.ok, true);
+  assert.ok(nativeCalls.length > 1, `expected multiple native calls, got ${nativeCalls.length}`);
+  assert.equal(result.data.brief, "synthesized final brief");
+});
+
+test("callAfmPrepareTask tree-reduces when the reduce payload itself is oversized", async () => {
+  const nativeCalls = [];
+  let mapCallCount = 0;
+  // Fake native helper: map-phase calls (payload still carries
+  // relevantSources) return a partial brief with a large `brief` string, so
+  // that once all partials are gathered into a single partialBriefs reduce
+  // payload, that payload itself busts the ~3200 token budget. Reduce-phase
+  // calls (payload carries partialBriefs instead of relevantSources) return
+  // a much smaller synthesized brief so the recursive reduce converges.
+  const fakeChat = async (request) => {
+    nativeCalls.push(request.nativePayload);
+    const sources = Array.isArray(request.nativePayload?.relevantSources)
+      ? request.nativePayload.relevantSources
+      : [];
+    if (sources.length > 0) {
+      mapCallCount += 1;
+      return {
+        ok: true,
+        data: {
+          // Long enough that a handful of these together exceed the
+          // AFM_INPUT_BUDGET_TOKENS (3200) budget used for the reduce call.
+          brief: `partial brief ${mapCallCount} `.padEnd(3500, "x"),
+          recommendedNextActions: [],
+          risks: [],
+        },
+      };
+    }
+    return {
+      ok: true,
+      data: { brief: "synthesized final brief", recommendedNextActions: [], risks: [] },
+    };
+  };
+
+  // A plain object literal implementing ModelProvider directly — NOT a
+  // spread of a class instance, which would drop AfmProvider's prototype
+  // methods (supports/chat/health) and make ProviderChain.chat() throw when
+  // it calls provider.supports(operation).
+  const fakeProvider = {
+    name: "afm",
+    tier: "local",
+    supports: (_operation) => true,
+    chat: fakeChat,
+  };
+  const chain = new ProviderChain([fakeProvider]);
+  const bigSources = Array.from({ length: 60 }, (_, i) => ({
+    relativePath: `note-${i}.md`,
+    wikilink: `[[note-${i}]]`,
+    evidenceEnvelope: "context text ".repeat(50),
+  }));
+
+  const result = await callAfmPrepareTask("http://127.0.0.1:11437/v1/chat/completions", {
+    task: "a task",
+    budgetTokens: 4096,
+    profile: "default",
+    provider: { provider: "native", mode: "native" },
+    intent: "intent",
+    constraints: [],
+    currentState: [],
+    relevantSources: bigSources,
+    daemonLead: "",
+    model: "afm-local",
+  }, chain);
+
+  assert.equal(result.ok, true);
+  assert.equal(result.data.brief, "synthesized final brief");
+
+  // Map phase must have chunked relevantSources into 3+ groups so there are
+  // 3+ large partial briefs to reduce.
+  assert.ok(mapCallCount >= 3, `expected 3+ map calls, got ${mapCallCount}`);
+
+  const reduceCalls = nativeCalls.filter(
+    (payload) => !Array.isArray(payload?.relevantSources) || payload.relevantSources.length === 0,
+  );
+  // With the listField bug (passing "relevantSources" instead of
+  // "partialBriefs" to reduceViaSameOp), callNativeOpChunked can never find
+  // an array to split inside the reduce payload, so it always collapses to
+  // exactly one flat reduce call regardless of size. The fix must make the
+  // oversized partialBriefs reduce payload actually split into multiple
+  // native calls (one per group), which then get reduced again.
+  assert.ok(
+    reduceCalls.length > 1,
+    `expected the reduce phase to make more than one native call (true tree reduction), got ${reduceCalls.length}`,
+  );
+});
+
 test("prepareTask native provider uses the configured native helper", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "sm-native-prepare-"));
   const helper = path.join(root, "helper.mjs");
@@ -575,4 +712,53 @@ test("prepareTask native provider uses the configured native helper", async () =
     else process.env.MINNI_AFM_NATIVE_HELPER = previousHelper;
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("callAfmPrepareTask reduce payload carries task context under the purpose's list key", async () => {
+  const nativeCalls = [];
+  const fakeChat = async (request) => {
+    nativeCalls.push(request.nativePayload);
+    const sources = Array.isArray(request.nativePayload?.relevantSources)
+      ? request.nativePayload.relevantSources
+      : [];
+    if (sources.length > 0) {
+      return { ok: true, data: { brief: `partial brief ${nativeCalls.length}`, recommendedNextActions: [], risks: [] } };
+    }
+    return { ok: true, data: { brief: "synthesized final brief", recommendedNextActions: [], risks: [] } };
+  };
+  const fakeProvider = { name: "afm", tier: "local", supports: (_operation) => true, chat: fakeChat };
+  const chain = new ProviderChain([fakeProvider]);
+  const bigSources = Array.from({ length: 60 }, (_, i) => ({
+    relativePath: `note-${i}.md`,
+    wikilink: `[[note-${i}]]`,
+    evidenceEnvelope: "context text ".repeat(50),
+  }));
+
+  const result = await callAfmPrepareTask("http://127.0.0.1:11437/v1/chat/completions", {
+    task: "upgrade the retrieval pipeline",
+    budgetTokens: 4096,
+    profile: "default",
+    provider: { provider: "native", mode: "native" },
+    intent: "refactor",
+    constraints: ["no schema changes"],
+    currentState: ["tests green"],
+    relevantSources: bigSources,
+    daemonLead: "",
+    model: "afm-local",
+  }, chain);
+
+  assert.equal(result.ok, true);
+  assert.equal(result.data.brief, "synthesized final brief");
+
+  // The reduce payload's list key comes from the single purpose mapping...
+  const reduceCalls = nativeCalls.filter((p) => Array.isArray(p?.partialBriefs));
+  assert.ok(reduceCalls.length >= 1, "expected at least one reduce call keyed by partialBriefs");
+  // ...and the synthesis call sees the compact task context, not just partials.
+  const reduce = reduceCalls[0];
+  assert.equal(reduce.task, "upgrade the retrieval pipeline");
+  assert.equal(reduce.intent, "refactor");
+  assert.deepEqual(reduce.constraints, ["no schema changes"]);
+  assert.deepEqual(reduce.currentState, ["tests green"]);
+  assert.equal(reduce.budgetTokens, 4096);
+  assert.ok(reduce.partialBriefs.length > 1);
 });
