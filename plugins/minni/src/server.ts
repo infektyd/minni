@@ -42,6 +42,7 @@ import {
   createPlan,
   findPlanNote,
   persistPlan,
+  PlanDigestVersionError,
   rehydratePlan,
   rehydratePlanScalars,
   replan,
@@ -1501,11 +1502,17 @@ server.registerTool(
     // scalars from `current` (every digest-covered field comes from the history
     // snapshot, and persistPlan recomputes the digest on write), so when the
     // strict rehydrate throws — e.g. a bricked plan_digest — fall back to the
-    // bare-scalar read and proceed with the restore.
+    // bare-scalar read and proceed with the restore. EXCEPT for the typed
+    // PlanDigestVersionError: a note declaring a NEWER digest version belongs
+    // to a newer writer, and restoring through this (older) plugin would
+    // silently downgrade fields the newer schema introduced — refuse instead.
     let current: PlanArtifact;
     try {
       current = await rehydratePlan(notePath);
-    } catch {
+    } catch (err) {
+      if (err instanceof PlanDigestVersionError) {
+        return textResult(JSON.stringify({ error: err.message }, null, 2));
+      }
       current = await rehydratePlanScalars(notePath);
     }
     const snapshot = await getRevision(notePath, rev);

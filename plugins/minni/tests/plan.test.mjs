@@ -664,7 +664,11 @@ test("H7: rehydratePlan upgrades a pre-H7 (v1-digest) plan instead of hard-faili
     assert.notEqual(v1, v2, "v1 and v2 digests must differ for this to be a real migration");
 
     const before = await readFile(notePath, "utf8");
-    const withLegacy = before.replace(/^plan_digest: .*$/m, `plan_digest: ${v1}`);
+    const withLegacy = before
+      .replace(/^plan_digest: .*$/m, `plan_digest: ${v1}`)
+      // #122: a real pre-H7 note carries no plan_digest_v field either; with it
+      // present the declared-version check would (correctly) flag the v1 hex.
+      .replace(/^plan_digest_v:.*\n/m, "");
     assert.notEqual(withLegacy, before, "expected to rewrite the plan_digest line");
     await writeFile(notePath, withLegacy, "utf8");
 

@@ -155,12 +155,17 @@ function computePlanDigestHexV2(plan: PlanArtifact): string {
 }
 
 /**
- * #122 F-PLAN-DIGEST-CROSSPROC: the stored digest is version-tagged
- * ("v<N>:<hex>") and read-time recognition dispatches on the tag through a
- * registry of every historical algorithm, so a future payload widening (v3)
- * cannot re-open the single-legacy-fn cliff that transiently bricked plan
- * tools during the v1->v2 rollout. Untagged stored digests (written by
- * pre-tagging builds) are still recognized as v2-or-v1 exactly as before.
+ * #122 F-PLAN-DIGEST-CROSSPROC (revised after codex review on PR #130): the
+ * persisted plan_digest VALUE stays a bare hex so pre-tagging readers on other
+ * hosts keep validating it during a rolling update; the algorithm version
+ * travels in the separate plan_digest_v frontmatter field (old readers ignore
+ * unknown fields). Read-time recognition dispatches on the declared version
+ * through a registry of every historical algorithm, so a future payload
+ * widening (v3) cannot re-open the single-legacy-fn cliff that transiently
+ * bricked plan tools during the v1->v2 rollout. Notes without plan_digest_v
+ * are still recognized as bare v2-or-v1 exactly as before, and "vN:<hex>"
+ * digest prefixes (written by interim builds of this PR) are accepted on read
+ * and normalized to bare hex on the next write.
  */
 export const PLAN_DIGEST_VERSION = 2;
 
@@ -169,14 +174,30 @@ const PLAN_DIGEST_ALGORITHMS: Record<number, (plan: PlanArtifact) => string> = {
   2: computePlanDigestHexV2,
 };
 
-/** Current digest, version-tagged for cross-version read dispatch. */
+/** Current digest (bare hex; the algorithm version is persisted separately as plan_digest_v). */
 export function computePlanDigest(plan: PlanArtifact): string {
-  return `v${PLAN_DIGEST_VERSION}:${computePlanDigestHexV2(plan)}`;
+  return computePlanDigestHexV2(plan);
 }
 
 function parsePlanDigestTag(stored: string): { version: number; hex: string } | undefined {
   const m = stored.match(/^v(\d+):([0-9a-f]+)$/);
   return m ? { version: Number(m[1]), hex: m[2] } : undefined;
+}
+
+/**
+ * A note whose declared digest version is newer than this plugin understands.
+ * Typed (not a bare Error) so recovery paths can tell it apart from a tamper:
+ * minni_plan_restore must refuse to "heal" such a note — writing it back with
+ * this plugin's older schema would silently downgrade newer fields.
+ */
+export class PlanDigestVersionError extends Error {
+  readonly code = "PLAN_DIGEST_NEWER" as const;
+  constructor(version: number, notePath: string) {
+    super(
+      `rehydratePlan: plan_digest version v${version} on ${notePath} is newer than this plugin supports (max v${PLAN_DIGEST_VERSION}); update the minni plugin to read this note`,
+    );
+    this.name = "PlanDigestVersionError";
+  }
 }
 
 /**
@@ -322,6 +343,10 @@ function planFrontmatterFields(
     plan_id: plan.plan_id,
     plan_rev: plan.rev,
     plan_digest: plan.plan_digest,
+    // #122: version marker kept OUT of the digest string so pre-tagging
+    // readers (which compare plan_digest byte-for-byte) never see a value
+    // they cannot match; they simply ignore this extra field.
+    plan_digest_v: PLAN_DIGEST_VERSION,
     plan_goal: plan.goal,
     plan_constraints: JSON.stringify(plan.constraints),
     plan_slices: JSON.stringify(plan.slices),
@@ -937,43 +962,51 @@ export async function rehydratePlan(notePath: string): Promise<PlanArtifact> {
   }
 
   // Check for digest mismatch instead of silent repair.
+  //
+  // #122 F-PLAN-DIGEST-CROSSPROC (revised after codex review on PR #130):
+  // dispatch on the DECLARED algorithm version — the plan_digest_v frontmatter
+  // field, or a defensive "vN:<hex>" digest prefix from interim builds of the
+  // PR — through the algorithm registry. An UNKNOWN (newer) version throws the
+  // typed PlanDigestVersionError so callers (and the restore recovery path)
+  // can tell "note is newer than me" apart from a genuine tamper. A KNOWN
+  // version verifies with that exact algorithm; a note with NO declared
+  // version validates against bare v2-or-v1 exactly as before. Anything but
+  // the current bare-hex form is upgraded/normalized in place on a successful
+  // read (re-persist stamps plan_digest_v and a bare-hex plan_digest).
+  const storedTag = parsePlanDigestTag(plan.plan_digest);
+  const fmDigestV = typeof fm.plan_digest_v === "number" ? fm.plan_digest_v : undefined;
+  const declaredVersion = storedTag?.version ?? fmDigestV;
+  if (declaredVersion !== undefined && !PLAN_DIGEST_ALGORITHMS[declaredVersion]) {
+    throw new PlanDigestVersionError(declaredVersion, notePath);
+  }
+  const storedHex = storedTag ? storedTag.hex : plan.plan_digest;
   const recomputed = computePlanDigest(plan);
-  if (plan.plan_digest !== recomputed) {
-    // #122 F-PLAN-DIGEST-CROSSPROC: dispatch on the stored digest's version tag
-    // through the algorithm registry. Any KNOWN prior version (or an untagged
-    // stamp from a pre-tagging build, which validates against v2-or-v1 exactly
-    // as before) is a legitimate plan and gets UPGRADED in place (re-persist
-    // with the current tagged digest) rather than hard-failed as "tampered".
-    // An UNKNOWN (newer) version degrades gracefully instead of claiming
-    // tamper; only a stamp matching no known algorithm is a genuine tamper.
-    const tagged = parsePlanDigestTag(plan.plan_digest);
-    let recognized: boolean;
-    if (tagged) {
-      const algo = PLAN_DIGEST_ALGORITHMS[tagged.version];
-      if (!algo) {
-        throw new Error(
-          `rehydratePlan: plan_digest version v${tagged.version} on ${notePath} is newer than this plugin supports (max v${PLAN_DIGEST_VERSION}); update the minni plugin to read this note`,
-        );
-      }
-      recognized = algo(plan) === tagged.hex;
-    } else {
-      recognized =
-        plan.plan_digest === computePlanDigestHexV2(plan) ||
-        plan.plan_digest === computePlanDigestV1(plan);
+  let needsUpgrade = false;
+  if (declaredVersion !== undefined) {
+    const algo = PLAN_DIGEST_ALGORITHMS[declaredVersion];
+    if (algo(plan) !== storedHex) {
+      throw new Error(`rehydratePlan: plan_digest mismatch (stored=${plan.plan_digest} computed=${recomputed}); note may be tampered`);
     }
-    if (recognized) {
-      plan.plan_digest = recomputed;
-      // Best-effort re-persist so the note carries the current tagged digest
-      // going forward. Never a direct file write (persistPlan journals); a write
-      // failure leaves the in-memory upgrade intact so this read still succeeds.
-      try {
-        const vaultPath = path.resolve(path.dirname(notePath), "..", "..");
-        await persistPlan(plan, { vaultPath, notePath });
-      } catch {
-        // advisory: the in-memory upgraded digest is enough for this read to proceed
-      }
+    needsUpgrade = storedTag !== undefined || storedHex !== recomputed;
+  } else if (plan.plan_digest !== recomputed) {
+    // No declared version: legacy recognition (pre-H7 v1 upgrades in place).
+    if (plan.plan_digest === computePlanDigestV1(plan)) {
+      needsUpgrade = true;
     } else {
       throw new Error(`rehydratePlan: plan_digest mismatch (stored=${plan.plan_digest} computed=${recomputed}); note may be tampered`);
+    }
+  }
+  if (needsUpgrade) {
+    plan.plan_digest = recomputed;
+    // Best-effort re-persist so the note carries the current bare-hex digest
+    // plus plan_digest_v going forward. Never a direct file write (persistPlan
+    // journals); a write failure leaves the in-memory upgrade intact so this
+    // read still succeeds.
+    try {
+      const vaultPath = path.resolve(path.dirname(notePath), "..", "..");
+      await persistPlan(plan, { vaultPath, notePath });
+    } catch {
+      // advisory: the in-memory upgraded digest is enough for this read to proceed
     }
   }
 

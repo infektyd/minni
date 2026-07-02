@@ -12,7 +12,9 @@ import test from "node:test";
 import {
   activatePlanChecked,
   clearActivePlan,
+  computePlanDigest,
   createPlan,
+  PlanDigestVersionError,
   getActivePlan,
   getRevision,
   persistPlan,
@@ -210,8 +212,13 @@ test("#122/3: minni_plan_activate handler routes through the guard (source pin)"
 });
 
 // ---- 4. F-PLAN-DIGEST-CROSSPROC ----------------------------------------------
+// Codex review (PR #130): the persisted plan_digest value stays a BARE hex so
+// pre-tagging readers on other hosts keep validating it during a rolling
+// update; the algorithm version travels in the separate plan_digest_v
+// frontmatter field. "vN:<hex>"-prefixed stored digests (written by interim
+// builds of this PR) are still accepted on read and normalized on write.
 
-test("#122/4: new plans persist a version-tagged digest and round-trip cleanly", async () => {
+test("#122/4: new plans persist a bare-hex digest plus plan_digest_v and stay readable to pre-tagging readers", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "i122-digest-tag-"));
   try {
     await ensureVault(root);
@@ -220,15 +227,21 @@ test("#122/4: new plans persist a version-tagged digest and round-trip cleanly",
       { vaultPath: root },
     );
     const raw = await readFile(write.notePath, "utf8");
-    assert.match(raw, /^plan_digest: "?v2:[0-9a-f]{16}"?$/m, "stored digest must carry a version tag");
+    assert.match(raw, /^plan_digest: "?[0-9a-f]{16}"?$/m, "stored digest must stay bare hex for old readers");
+    assert.match(raw, /^plan_digest_v: 2$/m, "algorithm version must travel in plan_digest_v");
     const rehydrated = await rehydratePlan(write.notePath);
-    assert.match(rehydrated.plan_digest, /^v2:[0-9a-f]{16}$/);
+    // Simulated pre-tagging reader check: an old reader compares the stored
+    // value byte-for-byte against its own bare v2 computation — which is
+    // exactly computePlanDigest here, so equality proves old-reader compat.
+    const storedHex = raw.match(/^plan_digest: "?([0-9a-f]{16})"?$/m)[1];
+    assert.equal(computePlanDigest(rehydrated), storedHex, "old readers must match the stored digest");
+    assert.equal(rehydrated.plan_digest, storedHex);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
 });
 
-test("#122/4: untagged v2 digest (pre-tagging build) is recognized and upgraded in place", async () => {
+test("#122/4: note without plan_digest_v (pre-tagging writer) is recognized as bare v2, as before", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "i122-digest-untagged-"));
   try {
     await ensureVault(root);
@@ -236,30 +249,75 @@ test("#122/4: untagged v2 digest (pre-tagging build) is recognized and upgraded 
       { goal: "untagged compat", slices: [{ id: "s1", title: "t1" }], vaultPath: root },
       { vaultPath: root },
     );
-    // Simulate a note written by a pre-tagging build: strip the version prefix.
+    // Simulate a note written by a pre-tagging build: drop the version field.
     const raw = await readFile(write.notePath, "utf8");
-    const bare = raw.match(/^plan_digest: "?v2:([0-9a-f]{16})"?$/m)?.[1];
-    assert.ok(bare, "expected a tagged digest to strip");
-    await writeFile(
-      write.notePath,
-      raw.replace(/^plan_digest:.*$/m, `plan_digest: ${bare}`),
-      "utf8",
-    );
+    assert.match(raw, /^plan_digest_v: 2$/m);
+    await writeFile(write.notePath, raw.replace(/^plan_digest_v:.*\n/m, ""), "utf8");
     const rehydrated = await rehydratePlan(write.notePath);
-    assert.equal(rehydrated.plan_digest, `v2:${bare}`, "in-memory digest must be upgraded");
-    const rewritten = await readFile(write.notePath, "utf8");
-    assert.match(rewritten, /^plan_digest: "?v2:[0-9a-f]{16}"?$/m, "note must be re-stamped tagged");
+    assert.equal(rehydrated.plan_digest, computePlanDigest(rehydrated));
   } finally {
     await rm(root, { recursive: true, force: true });
   }
 });
 
-test("#122/4: unknown newer digest version degrades gracefully, not as tampered", async () => {
+test("#122/4: 'v2:<hex>'-prefixed stored digest (interim PR build) is accepted and normalized to bare hex", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "i122-digest-prefixed-"));
+  try {
+    await ensureVault(root);
+    const { write } = await createPlan(
+      { goal: "prefixed compat", slices: [{ id: "s1", title: "t1" }], vaultPath: root },
+      { vaultPath: root },
+    );
+    const raw = await readFile(write.notePath, "utf8");
+    const bare = raw.match(/^plan_digest: "?([0-9a-f]{16})"?$/m)?.[1];
+    assert.ok(bare, "expected a bare-hex digest to prefix");
+    await writeFile(
+      write.notePath,
+      raw.replace(/^plan_digest:.*$/m, `plan_digest: v2:${bare}`),
+      "utf8",
+    );
+    const rehydrated = await rehydratePlan(write.notePath);
+    assert.match(rehydrated.plan_digest, /^[0-9a-f]{16}$/, "in-memory digest must be normalized bare hex");
+    const rewritten = await readFile(write.notePath, "utf8");
+    assert.match(rewritten, /^plan_digest: "?[0-9a-f]{16}"?$/m, "note must be re-stamped bare hex");
+    assert.match(rewritten, /^plan_digest_v: 2$/m);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("#122/4: unknown newer plan_digest_v degrades gracefully with a typed error, not as tampered", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "i122-digest-newer-"));
   try {
     await ensureVault(root);
     const { write } = await createPlan(
       { goal: "future version", slices: [{ id: "s1", title: "t1" }], vaultPath: root },
+      { vaultPath: root },
+    );
+    // Leave the (valid v2) digest untouched: the version field alone must gate.
+    const raw = await readFile(write.notePath, "utf8");
+    await writeFile(write.notePath, raw.replace(/^plan_digest_v:.*$/m, "plan_digest_v: 3"), "utf8");
+    await assert.rejects(
+      () => rehydratePlan(write.notePath),
+      (err) => {
+        assert.ok(err instanceof PlanDigestVersionError, "must be the typed newer-version error");
+        assert.equal(err.code, "PLAN_DIGEST_NEWER");
+        assert.match(err.message, /newer than this plugin/);
+        assert.doesNotMatch(err.message, /tampered/);
+        return true;
+      },
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("#122/4: unknown 'v99:' digest prefix also degrades gracefully, not as tampered", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "i122-digest-newer-prefix-"));
+  try {
+    await ensureVault(root);
+    const { write } = await createPlan(
+      { goal: "future prefix", slices: [{ id: "s1", title: "t1" }], vaultPath: root },
       { vaultPath: root },
     );
     const raw = await readFile(write.notePath, "utf8");
@@ -271,6 +329,7 @@ test("#122/4: unknown newer digest version degrades gracefully, not as tampered"
     await assert.rejects(
       () => rehydratePlan(write.notePath),
       (err) => {
+        assert.ok(err instanceof PlanDigestVersionError);
         assert.match(err.message, /newer than this plugin/);
         assert.doesNotMatch(err.message, /tampered/);
         return true;
@@ -281,7 +340,7 @@ test("#122/4: unknown newer digest version degrades gracefully, not as tampered"
   }
 });
 
-test("#122/4: tagged digest with wrong hex is still rejected as tampered", async () => {
+test("#122/4: declared-version digest with wrong hex is still rejected as tampered", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "i122-digest-tamper-"));
   try {
     await ensureVault(root);
@@ -290,13 +349,52 @@ test("#122/4: tagged digest with wrong hex is still rejected as tampered", async
       { vaultPath: root },
     );
     const raw = await readFile(write.notePath, "utf8");
+    // plan_digest_v: 2 stays; the hex itself is wrong -> genuine tamper.
     await writeFile(
       write.notePath,
-      raw.replace(/^plan_digest:.*$/m, 'plan_digest: "v2:deadbeefdeadbeef"'),
+      raw.replace(/^plan_digest:.*$/m, 'plan_digest: "deadbeefdeadbeef"'),
       "utf8",
     );
-    await assert.rejects(() => rehydratePlan(write.notePath), /plan_digest mismatch/);
+    await assert.rejects(() => rehydratePlan(write.notePath), (err) => {
+      assert.match(err.message, /plan_digest mismatch/);
+      assert.ok(!(err instanceof PlanDigestVersionError));
+      return true;
+    });
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("#122/4: restore refuses a newer-version note instead of downgrade-writing it", async () => {
+  // The restore fallback (#122/1) must only swallow recoverable corruption; a
+  // PlanDigestVersionError means a NEWER writer owns this note, and restoring
+  // through an older plugin would silently downgrade newer fields.
+  const root = await mkdtemp(path.join(tmpdir(), "i122-restore-newer-"));
+  try {
+    await ensureVault(root);
+    const { write } = await createPlan(
+      { goal: "no downgrade restore", slices: [{ id: "s1", title: "t1" }], vaultPath: root },
+      { vaultPath: root },
+    );
+    const raw = await readFile(write.notePath, "utf8");
+    await writeFile(write.notePath, raw.replace(/^plan_digest_v:.*$/m, "plan_digest_v: 3"), "utf8");
+    // The typed error is what the restore handler re-throws instead of healing.
+    await assert.rejects(
+      () => rehydratePlan(write.notePath),
+      (err) => err instanceof PlanDigestVersionError && err.code === "PLAN_DIGEST_NEWER",
+    );
+    const untouched = await readFile(write.notePath, "utf8");
+    assert.match(untouched, /^plan_digest_v: 3$/m, "newer-version note must not be rewritten");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("#122/4: minni_plan_restore handler re-throws PlanDigestVersionError (source pin)", () => {
+  const block = handlerBlock("minni_plan_restore");
+  assert.match(
+    block,
+    /PlanDigestVersionError/,
+    "restore fallback must not swallow the newer-version error and downgrade-write the note",
+  );
 });

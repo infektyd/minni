@@ -170,7 +170,10 @@ test("H7: rehydratePlan upgrades a pre-H7 (legacy-digest) plan gracefully instea
 
     const legacyRaw = raw
       .replace(/plan_digest:\s*"?[a-f0-9]+"?/, `plan_digest: "${v1Digest}"`)
-      .replace(/^plan_digest:.*$/m, `plan_digest: "${v1Digest}"`);
+      .replace(/^plan_digest:.*$/m, `plan_digest: "${v1Digest}"`)
+      // #122: a real pre-H7 note carries no plan_digest_v field either; with it
+      // present the declared-version check would (correctly) flag the v1 hex.
+      .replace(/^plan_digest_v:.*\n/m, "");
     await writeFile(notePath, legacyRaw, "utf8");
 
     // Must NOT throw — it should upgrade the legacy plan.
