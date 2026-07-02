@@ -102,6 +102,27 @@ test("minni_resolve_candidate carries server principal without model-facing iden
   assert.match(block, /agent_id:\s*DEFAULT_AGENT_ID/, "resolve RPC must stamp the configured server principal");
 });
 
+test("minni_resolve_candidate no longer advertises the unenforced mark_* decisions (issue #123)", async () => {
+  const source = stripLineComments(
+    await readFile(new URL("../src/server.ts", import.meta.url), "utf8"),
+  );
+  const start = source.indexOf('"minni_resolve_candidate"');
+  assert.notEqual(start, -1, "minni_resolve_candidate tool registration not found");
+  const nextTool = source.indexOf("server.registerTool(", start + 1);
+  const block = source.slice(start, nextTool === -1 ? undefined : nextTool);
+
+  for (const removed of ["mark_sensitive", "mark_temporary", "mark_project_scoped"]) {
+    assert.doesNotMatch(
+      block,
+      new RegExp(removed),
+      `${removed} maps to a plain accept with no privacy/expiry/scope enforcement and must not be advertised`,
+    );
+  }
+  for (const kept of ["accept", "reject", "redact", "merge", "supersede"]) {
+    assert.match(block, new RegExp(`"${kept}"`), `real decision ${kept} must remain in the enum`);
+  }
+});
+
 test("Codex hook remains Codex-native instead of reusing Claude hook entrypoint", async () => {
   const codexHook = await readFile(new URL("../src/codex-hook.ts", import.meta.url), "utf8");
   assert.match(codexHook, /runtime:\s*"codex"/);

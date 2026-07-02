@@ -526,7 +526,7 @@ def handle_log_event(params: dict, request_id: Any, context: GovernanceContext) 
 
     try:
         ep = context.lazy_episodic()
-        eid = ep.log_event(
+        eid = ep.add_event(
             agent_id=agent_id,
             event_type=event_type,
             content=content,
@@ -721,10 +721,20 @@ def resolve_candidate(params: dict, request_id: Any, context: GovernanceContext)
         "log_only",
         "merge",
         "supersede",
-        "mark_sensitive",
-        "mark_temporary",
-        "mark_project_scoped",
     }
+    # Issue #123: mark_sensitive/mark_temporary/mark_project_scoped were
+    # unenforced no-ops that mapped to a plain "accepted" — no privacy flag,
+    # no expiry, no scope was ever stored or honored. Rejected explicitly
+    # until real privacy/TTL/scope semantics land (schema + retrieval).
+    unimplemented = {"mark_sensitive", "mark_temporary", "mark_project_scoped"}
+    if decision in unimplemented:
+        return context.make_error(
+            -32602,
+            f"decision '{decision}' is not yet implemented: it previously mapped to a "
+            f"plain accept with no privacy/expiry/scope enforcement (see issue #123); "
+            f"decision must be one of {sorted(allowed)}",
+            request_id,
+        )
     if decision not in allowed:
         return context.make_error(-32602, f"decision must be one of {sorted(allowed)}", request_id)
 
@@ -737,9 +747,6 @@ def resolve_candidate(params: dict, request_id: Any, context: GovernanceContext)
         "log_only": "rejected",
         "merge": "merged",
         "supersede": "superseded",
-        "mark_sensitive": "accepted",
-        "mark_temporary": "accepted",
-        "mark_project_scoped": "accepted",
     }
     new_status = status_map.get(decision, "rejected")
     now = time.time()

@@ -15,9 +15,11 @@ flowchart LR
     Handoff --> Stores
 ```
 
-One daemon per host; one plugin process per agent runtime; identity is stamped
-server-side (`EffectivePrincipal`, the single source of identity) — callers
-cannot claim capabilities.
+One daemon per host; one plugin process per agent runtime; for daemon-mediated
+operations, identity is stamped server-side (`EffectivePrincipal`, the single
+source of identity) — callers cannot claim capabilities. Plugin-local vault and
+audit writes do not cross this boundary; see
+[security](security.md#identity-and-capability-gating).
 
 ## Components
 
