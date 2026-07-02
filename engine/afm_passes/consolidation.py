@@ -34,7 +34,11 @@ from safety import is_instruction_like
 
 logger = logging.getLogger("sovereign.afm.consolidation")
 
-_SAFE_PRIVACY = {"", "safe", "public", "low"}
+# NOTE: "" (unset/NULL privacy) is deliberately excluded. Inbox-sourced
+# candidates (afm_passes.inbox_ingest) are inserted with privacy_level=None —
+# unknown privacy is NOT the same as "known safe" and must never auto-promote
+# to durable learnings without a review pass (I1/I2 security fix).
+_SAFE_PRIVACY = {"safe", "public", "low"}
 _MIN_CONTENT_LEN = 12
 _DEFAULT_MAX_PER_RUN = 50
 

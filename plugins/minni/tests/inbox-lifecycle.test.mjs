@@ -437,7 +437,7 @@ test("resolveActivePlanView self-heals a stuck-draft plan whose slices are all t
     assert.equal(view, undefined, "finished plan must stop being injected");
 
     const healed = await rehydratePlan(write.notePath);
-    assert.equal(healed.status, "accepted", "terminal status re-derived and persisted");
+    assert.equal(healed.status, "complete", "terminal status re-derived and persisted (H6: complete, not accepted)");
 
     const journalRaw = await readFile(
       path.join(path.dirname(write.notePath), `${plan.plan_id}.log.md`),
@@ -445,7 +445,7 @@ test("resolveActivePlanView self-heals a stuck-draft plan whose slices are all t
     );
     assert.match(journalRaw, /"kind":"status_reconciled"/);
     assert.match(journalRaw, /"from":"draft"/);
-    assert.match(journalRaw, /"to":"accepted"/);
+    assert.match(journalRaw, /"to":"complete"/);
 
     // Idempotent: a second resolve still returns undefined and does not
     // re-journal another reconciliation.
@@ -538,7 +538,7 @@ test("resolveActivePlanView does NOT flip a plan with a non-terminal slice (nega
   }
 });
 
-test("resolveActivePlanView reconciles a stuck-candidate plan too (candidate -> accepted)", async () => {
+test("resolveActivePlanView reconciles a stuck-candidate plan too (candidate -> complete)", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "sm-plan-candidate-"));
   try {
     await ensureVault(root);
@@ -557,7 +557,7 @@ test("resolveActivePlanView reconciles a stuck-candidate plan too (candidate -> 
     const view = await resolveActivePlanView(root);
     assert.equal(view, undefined, "finished plan must stop being injected");
     const healed = await rehydratePlan(write.notePath);
-    assert.equal(healed.status, "accepted");
+    assert.equal(healed.status, "complete");
     const journalRaw = await readFile(
       path.join(path.dirname(write.notePath), `${plan.plan_id}.log.md`),
       "utf8",

@@ -174,3 +174,67 @@ def test_backend_resolver_preserves_default_bit_identical_path():
         "faiss-disk",
         "faiss-mem",
     ]
+
+
+def _fresh_engine(tmp_path, name):
+    from db import SovereignDB
+    from config import SovereignConfig
+    from retrieval import RetrievalEngine
+
+    cfg = SovereignConfig(db_path=str(tmp_path / name))
+    return RetrievalEngine(SovereignDB(cfg), cfg)
+
+
+def test_normalize_backend_names_dedups_and_preserves_order(tmp_path):
+    """R9: a caller-supplied backend list is deduped (order-preserving) before
+    any backend is constructed/loaded — e.g. ["faiss-disk"]*N must collapse to
+    a single entry, not build N disk-loading backends."""
+    engine = _fresh_engine(tmp_path, "t1.db")
+
+    result = engine._normalize_backend_names(["faiss-disk"] * 50)
+    assert result == ["faiss-disk"]
+
+    result2 = engine._normalize_backend_names(["faiss-mem", "faiss-disk", "faiss-mem"])
+    assert result2 == ["faiss-mem", "faiss-disk"]
+
+
+def test_normalize_backend_names_caps_length(tmp_path):
+    """R9: a backend list beyond _MAX_BACKENDS distinct known names is
+    rejected loudly, not silently truncated/fanned-out unbounded."""
+    from retrieval import RetrievalEngine
+
+    engine = _fresh_engine(tmp_path, "t2.db")
+    assert engine._MAX_BACKENDS == 4
+
+    # Exactly at the cap (the 4 known backends): allowed.
+    engine._normalize_backend_names(["faiss-disk", "faiss-mem", "qdrant", "lance"])
+
+    # One more DISTINCT known name pushes past the cap -> must raise.
+    original_known = RetrievalEngine._KNOWN_BACKENDS
+    RetrievalEngine._KNOWN_BACKENDS = original_known + ("fifth-backend",)
+    try:
+        try:
+            engine._normalize_backend_names(
+                ["faiss-disk", "faiss-mem", "qdrant", "lance", "fifth-backend"]
+            )
+            raised = None
+        except ValueError as exc:
+            raised = str(exc)
+    finally:
+        RetrievalEngine._KNOWN_BACKENDS = original_known
+
+    assert raised is not None and "too many backends" in raised, raised
+
+
+def test_normalize_backend_names_rejects_unknown_backend_loudly(tmp_path):
+    """R9: an unknown backend name must raise, not be silently skipped (which
+    would let a caller's typo/probe pass through unnoticed)."""
+    engine = _fresh_engine(tmp_path, "t3.db")
+
+    try:
+        engine._normalize_backend_names(["faiss-disk", "totally-not-a-backend"])
+        raised = None
+    except ValueError as exc:
+        raised = str(exc)
+
+    assert raised is not None and "unknown backend" in raised, raised

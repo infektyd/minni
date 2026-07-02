@@ -67,6 +67,7 @@ import {
   buildPendingLearningsSection,
   expireStaleInboxHandoffs,
   readInboxStatus,
+  readReassertPending,
   recordAudit,
   resolveInboxHandoffContext,
   searchVaultNotes,
@@ -204,9 +205,12 @@ export function createHookHandlers(
     // Consumed entries are settled (exactly-once re-injection, no unbounded
     // inbox growth); cap-overflowed tails are rewritten so they re-inject on
     // the next boot, and all-malformed entries survive for inspection.
+    // I5: use the reassert-specific window so recent all-malformed files cannot
+    // crowd valid corrections out of the newest-N slots.
+    const reassertPending = await readReassertPending(config.vaultPath, 3);
     const { events: correctionsReassert, consumedPaths: reassertConsumed, deferredTails: reassertDeferred } =
-      collectCorrectionsReassert(pending);
-    await settleReassertedInboxEntries({
+      collectCorrectionsReassert(reassertPending);
+    await settleReassertedInboxEntries(config.vaultPath, {
       consumedPaths: reassertConsumed,
       deferredTails: reassertDeferred,
     });
@@ -304,7 +308,7 @@ export function createHookHandlers(
 
     const budget = envelopeBudgetFor(config.contextWindow);
     if (identityRead.ok && identityRead.data?.context) {
-      const identityBody = extractIdentityBody(identityRead.data.context);
+      const identityBody = extractIdentityBody(identityRead.data.context, config.agentId);
       if (identityBody) {
         envelopeBody.identity_body = truncateToTokenCharBudget(
           identityBody,

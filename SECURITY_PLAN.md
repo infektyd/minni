@@ -269,6 +269,7 @@ Plus a manual:
 - 2026-04-26 — Second-pass review added SEC-010..SEC-018 and cloud-sync hygiene.
 - 2026-04-26 — Plan trimmed to marketable-minimum scope: 10 must-fix + 4 must-document, rest deferred to v2. Rationale: this is a single-user local tool; v1 hardening must close embarrassing-to-demo issues and back the marketing claims, not deliver enterprise audit posture.
 - 2026-05-02 — Deep audit addendum added SEC-019..SEC-022 for cross-agent information requests. Implemented a vault-backed request/approval contract in the TypeScript plugin; cryptographic principal binding remains a future remote/multi-user requirement.
+- 2026-07-02 — Codex findings triage identified M1 (migration 013 unconditionally rewrote `main` → `claude-code`, risking silent reattribution of genuine operator memory on fresh/un-migrated installs). Fixed by gating the rewrite behind an explicit opt-in flag rather than shipping it as unconditional SQL. See "2026-07-02 — Migration 013 `main` → `claude-code` Rewrite Guard" below.
 
 ## 2026-05-02 Deep Audit Addendum — Cross-Agent Request Contracts
 
@@ -329,3 +330,38 @@ Plus a manual:
 **How to fix:** Preserve the current local-origin checks and avoid adding decision endpoints to the browser bridge without CSRF/session auth.
 
 **Status:** Verified by existing UI tests and unchanged by this addendum.
+
+## 2026-07-02 — Migration 013 `main` → `claude-code` Rewrite Guard (M1)
+
+### What the original migration did
+
+`engine/migrations/013_candidate_and_main_identity_unification.sql` originally contained an unconditional:
+
+```sql
+UPDATE candidate_packets SET principal = 'claude-code' WHERE principal IN ('claudecode', 'main');
+UPDATE learnings SET agent_id = 'claude-code' WHERE agent_id = 'main';
+```
+
+This was correct **for the specific database it was written against** — Hans's already-migrated 2026-06-11 install, where an operator statement confirmed that historical `main`-tagged rows were actually claude-code writes collapsed by an old `legacy_agent_ids` alias config (see the migration file's header comment and the pre-migration backup note below).
+
+### Why that was unsafe as shipped
+
+`engine/migrations.py` applies every numbered `.sql` file in `engine/migrations/` to **any** un-migrated database that reaches the schema-migrations runner (`run_migrations()`, `engine/migrations.py:135-205`). There is no way to "unship" a migration that has already run against Hans's database — but the SQL itself would also fire, unconditionally, against a completely different, previously-un-migrated Minni install (e.g. a fresh install, or a database where `main` is a genuine, distinct operator principal that has nothing to do with claude-code). On such an install, migration 013 would silently reattribute genuine operator `main` memory (`candidate_packets.principal`, `learnings.agent_id`) to `claude-code`, with no audit trail distinguishing "this was a legacy alias fold" from "this was a real principal's memory getting relabeled."
+
+### The fix
+
+1. **SQL file** (`engine/migrations/013_candidate_and_main_identity_unification.sql`) no longer contains the `main` → `claude-code` UPDATE at all. It still folds the `claudecode` slug variant into `claude-code` unconditionally — that fold is safe because `claudecode` has never been a valid distinct operator principal, only a legacy slug spelling of the same agent id (012 already did the equivalent fold for `learnings`).
+2. **Python guard** (`engine/migrations.py`, `_apply_migration_013_legacy_main_rewrite`): after the 013 SQL script runs, `run_migrations()` calls a Python step that performs the `main` → `claude-code` rewrite **only if** the environment flag `MINNI_LEGACY_MAIN_IS_CLAUDE_CODE=1` (or `true`/`yes`/`on`) is set. A `.sql` migration file cannot read environment state, so the conditional logic lives in the Python runner, special-cased on `version == 13`. Idempotent either way, and `schema_migrations` bookkeeping is unaffected — version 13 is recorded as applied regardless of whether the flag was set, since the schema-level intent (agent-identity unification is available) is satisfied; only the destructive data rewrite is gated.
+3. **Default behavior on any fresh/un-migrated install**: migration 013 now leaves `main` rows untouched unless an operator explicitly opts in via the env flag.
+4. **Operators who need the original 2026-06-11 behavior** (i.e. Hans's own install, or any install where `main` is confirmed to be a legacy claude-code alias) should set `MINNI_LEGACY_MAIN_IS_CLAUDE_CODE=1` before the daemon's next startup so the rewrite fires as originally intended.
+
+### Backup / restore note for installs with genuine operator `main` memory
+
+If an operator is unsure whether their `main`-tagged rows are a legacy claude-code alias or genuine distinct memory:
+
+- **Before upgrading**, back up the SQLite database (default `~/.minni/sovereign_memory.db`, plus `-wal`/`-shm` sidecars if present): `cp ~/.minni/sovereign_memory.db ~/.minni/backups/minni-pre-013-guard.db` (mirrors the precedent set by the original migration's own pre-migration backup at `~/.minni/backups/minni-pre-013.db`, 2026-06-11).
+- **Do not set `MINNI_LEGACY_MAIN_IS_CLAUDE_CODE`** unless you have positively confirmed (e.g. by inspecting `candidate_packets`/`learnings` rows tagged `main` and recognizing them as claude-code content) that the alias condition holds. Leaving the flag unset is the safe default and simply preserves `main` rows as-is.
+- **If you set the flag and later discover `main` rows were genuine operator memory**, restore from the pre-upgrade backup rather than attempting to reverse the UPDATE in place (the original `agent_id`/`principal` value is not otherwise recoverable once rewritten).
+- Tests covering both branches: `engine/test_migration_013_main_guard.py` (`test_migration_013_does_not_reattribute_genuine_main_rows_by_default`, `test_migration_013_rewrites_main_when_legacy_alias_flag_set`, `test_migration_013_claudecode_slug_always_folds`).
+
+**Status:** Fixed. Default-safe for all fresh/un-migrated installs; opt-in flag preserves the intended behavior for Hans's already-migrated database.

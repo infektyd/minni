@@ -29,6 +29,88 @@ def test_afm_chat_completion_off_skips_client():
     assert result.status == "off"
 
 
+def test_default_bridge_client_rejects_oversized_response(monkeypatch):
+    """R7: the AFM bridge is an unauthenticated loopback endpoint with no
+    response cap otherwise — a port-squatter (or a misbehaving real AFM
+    bridge) could stream an unbounded body and exhaust memory. The default
+    client must refuse to buffer a response larger than
+    _AFM_BRIDGE_MAX_RESPONSE_BYTES instead of reading it in full.
+
+    Simulates an actual streaming socket.read(n)-style response object (only
+    ever returns up to n bytes, like a real http.client response) so this
+    only passes if the client itself calls read() with a bounded size — a
+    read() with no/negative size (the pre-fix behavior) would stream the
+    entire multi-terabyte body from this fake before ever reaching a cap
+    check, which is exactly the DoS this closes.
+    """
+    import afm_provider
+
+    total_size = afm_provider._AFM_BRIDGE_MAX_RESPONSE_BYTES * 4
+
+    class _UnboundedStreamResp:
+        """Mimics a real streaming socket response: read(-1)/read() drains
+        the WHOLE stream (here: emulated as a large-but-finite body), while
+        read(n>0) returns at most n bytes per call."""
+
+        def __init__(self):
+            self._remaining = total_size
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self, n=-1):
+            if n is None or n < 0:
+                n = self._remaining
+            chunk = b"x" * min(n, self._remaining)
+            self._remaining -= len(chunk)
+            return chunk
+
+    monkeypatch.setattr(
+        afm_provider.urllib.request, "urlopen", lambda *a, **k: _UnboundedStreamResp()
+    )
+
+    try:
+        afm_provider._default_bridge_client(
+            {"messages": []}, "http://127.0.0.1:11437/v1/chat/completions", 2.0
+        )
+        raised_msg = None
+    except ValueError as exc:
+        raised_msg = str(exc)
+
+    assert raised_msg is not None, "an oversized bridge response must raise, not buffer"
+    assert "exceeded" in raised_msg and "refusing to buffer" in raised_msg, raised_msg
+
+
+def test_default_bridge_client_allows_response_within_cap(monkeypatch):
+    """R7 companion: a normal-sized response is unaffected by the cap."""
+    import json as _json
+    import afm_provider
+
+    body = _json.dumps({"choices": [{"message": {"content": "ok"}}]}).encode("utf-8")
+
+    class _FakeResp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self, n=-1):
+            return body[:n] if n and n > 0 else body
+
+    monkeypatch.setattr(
+        afm_provider.urllib.request, "urlopen", lambda *a, **k: _FakeResp()
+    )
+
+    result = afm_provider._default_bridge_client(
+        {"messages": []}, "http://127.0.0.1:11437/v1/chat/completions", 2.0
+    )
+    assert result["choices"][0]["message"]["content"] == "ok"
+
+
 def test_generation_probe_timeout_env_falls_back_for_invalid_values(monkeypatch):
     from afm_provider import _generation_probe_timeout_seconds
 

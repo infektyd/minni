@@ -5,6 +5,9 @@ import time
 
 sys.path.insert(0, os.path.dirname(__file__))
 
+import minnid_runtime.provenance as provenance  # type: ignore
+from principal import EffectivePrincipal  # type: ignore
+
 
 def _make_db(tmp_path):
     import db as db_mod
@@ -157,6 +160,75 @@ def test_daemon_compile_wet_run_writes_draft_inbox_and_trace(tmp_path, monkeypat
     trace = minnid._dispatch_sync({"jsonrpc": "2.0", "id": 2, "method": "trace", "params": {"trace_id": result["trace_id"]}})
     assert trace["result"]["status"] == "ok"
     assert trace["result"]["trace"]["pass_name"] == "session_distillation"
+
+
+def test_daemon_compile_wet_run_requires_operator_principal(tmp_path, monkeypatch):
+    """P1: dry_run=false runs submit_drafts/apply_consolidation_result, which
+    promote candidates to durable learnings -- a write op. The method-capability
+    table only requires 'read' (so a read-only caller may still dry_run/preview),
+    so the durable path must gate on is_operator_principal itself. A stamped
+    principal with only 'read' capability (no wildcard/govern/resolve_candidate)
+    must be rejected for dry_run=false and must NOT write the draft/inbox/trace
+    that test_daemon_compile_wet_run_writes_draft_inbox_and_trace proves for an
+    operator caller."""
+    import minnid
+
+    db_obj, cfg = _make_db(tmp_path)
+    _seed_event(db_obj)
+    monkeypatch.setattr(minnid, "DEFAULT_CONFIG", cfg)
+    monkeypatch.setattr(minnid, "_writeback", None)
+    monkeypatch.setattr(minnid, "SovereignDB", lambda config=None: db_obj)
+
+    read_only = EffectivePrincipal(agent_id="codex", capabilities=["read"])
+    monkeypatch.setattr(
+        provenance, "resolve_effective_principal", lambda **_kw: read_only
+    )
+
+    resp = minnid._dispatch_sync(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "daemon.compile",
+            "params": {"pass_name": "session_distillation", "vault_path": cfg.vault_path, "dry_run": False},
+        }
+    )
+
+    err = resp.get("error", {})
+    assert err.get("code") == -32004, resp
+    assert "operator" in err.get("message", "").lower()
+    assert not (tmp_path / "vault" / "inbox").exists() or not list(
+        (tmp_path / "vault" / "inbox").glob("afm-drafts-*.json")
+    )
+
+
+def test_daemon_compile_dry_run_allowed_for_read_only_principal(tmp_path, monkeypatch):
+    """P1 companion: dry_run=true (the read-only preview path) must still work
+    for a non-operator, read-capable principal -- the fix must not regress the
+    legitimate preview use case."""
+    import minnid
+
+    db_obj, cfg = _make_db(tmp_path)
+    _seed_event(db_obj)
+    monkeypatch.setattr(minnid, "DEFAULT_CONFIG", cfg)
+    monkeypatch.setattr(minnid, "_writeback", None)
+    monkeypatch.setattr(minnid, "SovereignDB", lambda config=None: db_obj)
+
+    read_only = EffectivePrincipal(agent_id="codex", capabilities=["read"])
+    monkeypatch.setattr(
+        provenance, "resolve_effective_principal", lambda **_kw: read_only
+    )
+
+    resp = minnid._dispatch_sync(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "daemon.compile",
+            "params": {"pass_name": "session_distillation", "vault_path": cfg.vault_path, "dry_run": True},
+        }
+    )
+
+    assert "error" not in resp, resp
+    assert resp["result"]["dry_run"] is True
 
 
 def test_daemon_endorse_accepts_draft_and_audits(tmp_path, monkeypatch):

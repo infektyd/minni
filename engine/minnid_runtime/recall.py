@@ -363,7 +363,12 @@ def handle_trace(params: dict, request_id: Any, context: RecallContext) -> dict:
         return context.make_error(-32602, "trace_id is required", request_id)
 
     try:
-        trace = context.trace_ring().get(str(trace_id))
+        # R8: bind the read to the requesting principal — a trace_id is not an
+        # authorization token, so another authenticated principal cannot read a
+        # trace it did not create (owner-bound entries deny a non-owner).
+        trace = context.trace_ring().get(
+            str(trace_id), requester=getattr(principal, "agent_id", None)
+        )
         if trace is None:
             return context.make_response({
                 "trace_id": trace_id,
@@ -416,6 +421,7 @@ def record_attribution_trace(
     operation: str,
     claim: Optional[str],
     results: list,
+    owner: Optional[str] = None,
 ) -> Optional[str]:
     claim_text = str(claim or "").strip()
     if not claim_text:
@@ -424,12 +430,14 @@ def record_attribution_trace(
     if not items:
         return None
     try:
+        # R8: bind the creating principal so a different authenticated caller
+        # cannot read this attribution trace just by knowing/guessing the id.
         return context.trace_ring().add({
             "operation": operation,
             "claim": claim_text,
             "attribution_scores": items,
             "timing": {},
-        })
+        }, owner=owner)
     except Exception as exc:
         context.logger.debug("%s attribution trace capture failed: %s", operation, exc)
         return None
@@ -472,6 +480,7 @@ def handle_expand(params: dict, request_id: Any, context: RecallContext) -> dict
             operation="expand",
             claim=claim,
             results=[result],
+            owner=getattr(principal, "agent_id", None),
         )
         if trace_id is not None:
             result["trace_id"] = trace_id
@@ -802,6 +811,7 @@ def handle_sm_drill(params: dict, request_id: Any, context: RecallContext) -> di
             operation="sm_drill",
             claim=claim,
             results=results,
+            owner=getattr(principal, "agent_id", None),
         )
         if trace_id is not None:
             for result in results:

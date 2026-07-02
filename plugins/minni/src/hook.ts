@@ -137,7 +137,7 @@ async function handleSessionStart(payload: Record<string, unknown>): Promise<Hoo
   // boot, and all-malformed entries survive for inspection.
   const { events: correctionsReassert, consumedPaths: reassertConsumed, deferredTails: reassertDeferred } =
     collectCorrectionsReassert(pending);
-  await settleReassertedInboxEntries({
+  await settleReassertedInboxEntries(CLAUDECODE_VAULT_PATH, {
     consumedPaths: reassertConsumed,
     deferredTails: reassertDeferred,
   });
@@ -205,7 +205,7 @@ async function handleSessionStart(payload: Record<string, unknown>): Promise<Hoo
 
   const budget = envelopeBudgetFor(CLAUDECODE_CONTEXT_WINDOW);
   if (recentLearnings.ok && recentLearnings.data?.context) {
-    const identityBody = extractIdentityBody(recentLearnings.data.context);
+    const identityBody = extractIdentityBody(recentLearnings.data.context, CLAUDECODE_AGENT_ID);
     if (identityBody) {
       envelopeBody.identity_body = truncateToTokenCharBudget(
         identityBody,

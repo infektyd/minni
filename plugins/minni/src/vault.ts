@@ -42,6 +42,11 @@ export type PageStatus =
   | "draft"
   | "candidate"
   | "accepted"
+  // H6: terminal "all slices resolved" state for plans. Distinct from
+  // "accepted" (which is an operator/approval outcome and is default-recallable)
+  // so a model-driven plan completion cannot self-promote into recallable
+  // memory. resolveActivePlanView skips it exactly like accepted/superseded.
+  | "complete"
   | "superseded"
   | "rejected"
   | "expired";
@@ -248,6 +253,7 @@ const PAGE_STATUSES: ReadonlyArray<PageStatus> = [
   "draft",
   "candidate",
   "accepted",
+  "complete",
   "superseded",
   "rejected",
   "expired",
@@ -594,7 +600,7 @@ export async function appendFileWithFsync(filePath: string, content: string): Pr
   }
 }
 
-async function writeFileAtomic(filePath: string, content: string): Promise<void> {
+export async function writeFileAtomic(filePath: string, content: string): Promise<void> {
   const tempPath = `${filePath}.${Math.random().toString(36).substring(2)}.tmp`;
   const fh = await open(tempPath, "w");
   try {
@@ -899,6 +905,7 @@ export async function auditTail(
 export async function auditReport(
   vaultPath: string,
   limit = 100,
+  options: { includeLatest?: boolean } = {},
 ): Promise<AuditReport> {
   const tail = await auditTail(vaultPath, limit);
   const tools: Record<string, number> = {};
@@ -911,12 +918,20 @@ export async function auditReport(
     tools[tool] = (tools[tool] ?? 0) + 1;
     recentSummaries.push(`${tool}: ${summary}`);
   }
-  return {
+  const report: AuditReport = {
     entries: tail.entries.length,
     tools,
     recentSummaries: recentSummaries.slice(-10),
-    latest: tail.entries.at(-1),
   };
+  // X10: the audit-report intent routes automaticAllowed:true, so the default
+  // path must be aggregate-only. The `latest` field is the full markdown audit
+  // entry (paths, metadata, error strings) and only ships when a caller
+  // explicitly opts in (a confirmed / operator path), never on the automatic
+  // path.
+  if (options.includeLatest) {
+    report.latest = tail.entries.at(-1);
+  }
+  return report;
 }
 
 export async function searchVaultNotes(
@@ -1090,6 +1105,55 @@ export async function readPendingInbox(
   return (await readInboxStatus(vaultPath, limit)).entries;
 }
 
+/**
+ * I5: window over inbox entries for correction reassert. The plain
+ * newest-`limit` window (readInboxStatus) lets a few recent all-malformed files
+ * crowd out an older, still-valid correction indefinitely. This reads the whole
+ * inbox, keeps only entries that either carry ≥1 schema-valid stale-belief event
+ * OR an empty stash (which still needs consuming so it can't accumulate), and
+ * applies the newest-`limit` window over that filtered set — so malformed-only
+ * files never occupy a reassert slot. Malformed-only files are simply skipped
+ * here; they survive on disk for inspection (collectCorrectionsReassert's
+ * all-malformed branch already refuses to consume them).
+ */
+export async function readReassertPending(
+  vaultPath: string,
+  limit = 3,
+): Promise<InboxEntry[]> {
+  const dir = path.join(vaultPath, "inbox");
+  let names: string[] = [];
+  try {
+    names = (await readdir(dir)).filter((name) => name.endsWith(".json"));
+  } catch {
+    return [];
+  }
+  const stamped = names.map((name) => ({ name, ts: parseInboxTimestamp(name) }));
+  stamped.sort(
+    (a, b) => (b.ts ?? 0) - (a.ts ?? 0) || b.name.localeCompare(a.name),
+  );
+  const eligible: InboxEntry[] = [];
+  for (const { name } of stamped) {
+    if (eligible.length >= limit) break;
+    const filePath = path.join(dir, name);
+    let parsed: Record<string, unknown>;
+    try {
+      parsed = JSON.parse(await readFile(filePath, "utf8")) as Record<string, unknown>;
+    } catch {
+      continue; // unreadable/corrupt file: never occupies a reassert slot
+    }
+    const stashed = parsed.stale_belief_events;
+    const emptyStash = Array.isArray(stashed) && stashed.length === 0;
+    if (!emptyStash && !payloadHasValidStaleBeliefEvent(parsed)) continue;
+    eligible.push({
+      slug: typeof parsed.slug === "string" ? parsed.slug : name,
+      filePath,
+      createdAt: typeof parsed.createdAt === "string" ? parsed.createdAt : "",
+      payload: parsed,
+    });
+  }
+  return eligible;
+}
+
 /** Hard cap on re-asserted events per boot: the inbox is plain JSON on disk,
  * so a single crafted/corrupt file must not be able to saturate the context
  * window via an unbounded stale_belief_events array. */
@@ -1119,6 +1183,43 @@ function isValidStaleBeliefEvent(value: unknown): boolean {
   // timestamps, and they poison any downstream date arithmetic.
   if (e.created_at !== undefined && !Number.isFinite(e.created_at)) return false;
   return true;
+}
+
+/** The only fields allowed to reach the boot envelope from an inbox event. */
+export interface SanitizedStaleBeliefEvent {
+  event_id: number;
+  superseded_learning_id: number;
+  new_learning_id: number;
+  originating_agent?: string;
+  created_at?: number;
+}
+
+/**
+ * I6: an event that passed isValidStaleBeliefEvent may still carry attacker
+ * free-form props (inbox files are locally writable, and the object is injected
+ * verbatim into the model's boot context). Build a NEW object with only the
+ * allowlisted fields so smuggled strings never reach the envelope.
+ */
+function sanitizeStaleBeliefEvent(value: unknown): SanitizedStaleBeliefEvent {
+  const e = value as Record<string, unknown>;
+  const out: SanitizedStaleBeliefEvent = {
+    event_id: e.event_id as number,
+    superseded_learning_id: e.superseded_learning_id as number,
+    new_learning_id: e.new_learning_id as number,
+  };
+  if (e.originating_agent !== undefined) out.originating_agent = e.originating_agent as string;
+  if (e.created_at !== undefined) out.created_at = e.created_at as number;
+  return out;
+}
+
+/** True when the inbox payload carries at least one schema-valid stale-belief
+ * event. Used to keep malformed-only entries from consuming the reassert window
+ * (I5). An empty stash returns false here but is still consumable (it must be
+ * cleared) — the reassert reader treats empty stashes as window-eligible. */
+function payloadHasValidStaleBeliefEvent(payload: Record<string, unknown>): boolean {
+  const stashed = payload.stale_belief_events;
+  if (!Array.isArray(stashed)) return false;
+  return stashed.some((event) => isValidStaleBeliefEvent(event));
 }
 
 /**
@@ -1180,10 +1281,14 @@ export function collectCorrectionsReassert(
         continue;
       }
       if (events.length >= CORRECTIONS_REASSERT_MAX) {
+        // The tail is re-serialized to disk and re-read (and re-sanitized) on
+        // the next boot, so it keeps the raw event; only the injected `events`
+        // array is sanitized here.
         tail.push(event);
         continue;
       }
-      events.push(event);
+      // I6: push only the allowlisted-field copy into the boot envelope.
+      events.push(sanitizeStaleBeliefEvent(event));
       collected += 1;
     }
     if (collected > 0 && tail.length === 0) {
@@ -1241,8 +1346,13 @@ export function collectCorrectionsReassert(
  * cap-deferred are untouched and survive as-is.
  */
 export async function settleReassertedInboxEntries(
+  vaultPath: string,
   outcome: Pick<CorrectionsReassertResult, "consumedPaths" | "deferredTails">,
 ): Promise<void> {
+  // I4: the containment root is the TRUSTED inbox directory, never a path derived
+  // from the (attacker-writable) tail.filePath. Passing path.dirname(tail.filePath)
+  // would compare the target's own parent against itself and defeat the check.
+  const inboxRoot = path.join(vaultPath, "inbox");
   for (const filePath of outcome.consumedPaths) {
     // Inbox lifecycle policy (audit C2): archive, never unlink — the entry
     // moves to inbox/.archive/, which is invisible to readInboxStatus and the
@@ -1251,10 +1361,13 @@ export async function settleReassertedInboxEntries(
   }
   for (const tail of outcome.deferredTails) {
     try {
-      await writeFile(
+      // I4: the inbox file is attacker-writable; a bare writeFile would follow a
+      // symlink swapped in under inbox/. Contain to the trusted inbox root and
+      // write atomically (both helpers live in this module).
+      assertWriteTargetUnder(tail.filePath, inboxRoot);
+      await writeFileAtomic(
         tail.filePath,
         JSON.stringify(tail.payload, null, 2),
-        "utf8",
       );
     } catch {
       // Best effort: an unwritable tail leaves the original entry intact,
@@ -1276,7 +1389,7 @@ function normalizeWikilinkRef(ref: string): string {
  * RCM-005 / G23: assert path is under root after realpath (symlink escape reject).
  * Fail closed on any error or escape.
  */
-function assertUnder(fullPath: string, rootPath: string): void {
+export function assertUnder(fullPath: string, rootPath: string): void {
   let realFull: string;
   try {
     realFull = fs.realpathSync(fullPath);
@@ -1288,6 +1401,42 @@ function assertUnder(fullPath: string, rootPath: string): void {
   const rel = path.relative(realRoot, realFull);
   if (rel.startsWith("..") || path.isAbsolute(rel)) {
     throw new Error(`path escapes vault root: ${fullPath}`);
+  }
+}
+
+/**
+ * H2/I4: symlink-safe write containment for a target that may not exist yet.
+ * A bare `writeFile(target)` follows symlinks — an attacker who controls a
+ * parent component (e.g. `<vault>/.runtime` → outside dir) or the target file
+ * itself (an existing symlink) can redirect the write out of the vault, or make
+ * a read-modify-write clobber an arbitrary file.
+ *
+ * This resolves the parent directory's realpath and asserts it stays under
+ * `rootPath`, and rejects when the immediate target is itself a symlink. It does
+ * NOT require the target to exist. Fail closed on any error.
+ */
+export function assertWriteTargetUnder(targetPath: string, rootPath: string): void {
+  const realRoot = fs.realpathSync(rootPath);
+  const parent = path.dirname(targetPath);
+  let realParent: string;
+  try {
+    realParent = fs.realpathSync(parent);
+  } catch {
+    throw new Error(`write path containment check failed for ${targetPath}`);
+  }
+  const relParent = path.relative(realRoot, realParent);
+  if (relParent.startsWith("..") || path.isAbsolute(relParent)) {
+    throw new Error(`write path escapes root: ${targetPath}`);
+  }
+  // Reject a target that is itself a symlink (a read-modify-write or overwrite
+  // would follow it out of the contained tree).
+  try {
+    const st = fs.lstatSync(targetPath);
+    if (st.isSymbolicLink()) {
+      throw new Error(`write target is a symlink: ${targetPath}`);
+    }
+  } catch (e: any) {
+    if (!e || e.code !== "ENOENT") throw e; // ENOENT == fresh write, allowed
   }
 }
 

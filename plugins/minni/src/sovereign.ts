@@ -232,15 +232,34 @@ export function extractLearningsSection(context: string | undefined): string | u
  * document Layer 1 identity block (## Agent Identity …) before Prior Context /
  * Learnings. Extract that slice so SessionStart can rank it in the envelope as
  * `identity_body` instead of stripping it via extractLearningsSection().
+ *
+ * H5: the block is only trusted when it (a) sits at the LEADING position of the
+ * context — an unanchored match anywhere in the body lets a learning/prior-
+ * context entry smuggle a `## Agent Identity:` header that would be injected as
+ * Layer 1 — and (b) names the stamped agent, when one is supplied. A header for
+ * a different agent (or one buried mid-context) is rejected.
  */
-export function extractIdentityBody(context: string | undefined): string | undefined {
+export function extractIdentityBody(
+  context: string | undefined,
+  stampedAgent?: string,
+): string | undefined {
   if (!context) return undefined;
-  const match = context.match(/^## Agent Identity[^\n]*$/m);
-  if (!match || match.index === undefined) return undefined;
-  const rest = context.slice(match.index);
-  const afterHeader = rest.slice(match[0].length);
+  // Anchor to the leading position: allow only leading whitespace before the
+  // identity header. A header found anywhere else is untrusted smuggled content.
+  const lead = context.match(/^\s*(## Agent Identity[^\n]*)$/m);
+  if (!lead || lead.index === undefined) return undefined;
+  if (context.slice(0, lead.index).trim() !== "") return undefined;
+  const headerLine = lead[1];
+  // Validate the named agent against the server-stamped identity when provided.
+  if (stampedAgent !== undefined) {
+    const named = headerLine.replace(/^## Agent Identity:?\s*/, "").trim();
+    if (named !== stampedAgent) return undefined;
+  }
+  const headerStart = lead.index + lead[0].indexOf(headerLine);
+  const rest = context.slice(headerStart);
+  const afterHeader = rest.slice(headerLine.length);
   const next = afterHeader.search(/^## (?:Prior Context|Learnings|Recent Activity)/m);
-  const section = next >= 0 ? rest.slice(0, match[0].length + next) : rest;
+  const section = next >= 0 ? rest.slice(0, headerLine.length + next) : rest;
   return section.trim() || undefined;
 }
 
@@ -556,6 +575,20 @@ export function formatRecall(query: string, response: RecallResponse, vaultResul
     results,
   ].filter(Boolean);
   return sections.join("\n\n");
+}
+
+/**
+ * X5: decide whether to run the local `searchVaultNotes` pre-scan for a recall.
+ *
+ * The local pre-scan reads Markdown straight off disk and is NOT subject to the
+ * daemon's workspace scoping / read-privacy policy. When the daemon recall
+ * succeeds, its (properly scoped) results are authoritative and the unscoped
+ * local snippets must not be injected alongside them. The pre-scan therefore
+ * runs only as an OFFLINE FALLBACK: daemon unreachable AND the caller did not
+ * opt out via includeVault=false.
+ */
+export function shouldPrescanVault(daemonOk: boolean, includeVault: boolean): boolean {
+  return includeVault && !daemonOk;
 }
 
 /**

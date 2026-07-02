@@ -117,8 +117,9 @@ def test_retrieve_with_claim_surfaces_attribution_and_logs_trace(monkeypatch):
     captured = {}
 
     class FakeTraceRing:
-        def add(self, trace):
+        def add(self, trace, owner=None):
             captured.update(trace)
+            captured["_owner"] = owner
             return "trace-attribution"
 
     monkeypatch.setattr(retrieval_module, "_trace_ring", lambda: FakeTraceRing())
@@ -139,3 +140,41 @@ def test_retrieve_with_claim_surfaces_attribution_and_logs_trace(monkeypatch):
     assert captured["attribution_scores"] == [
         {"doc_id": 7, "chunk_id": 70, "attribution": "entailed", "score": 0.91}
     ]
+
+
+def test_record_attribution_trace_threads_owner(monkeypatch):
+    """R8: expand/sm_drill's attribution traces must bind the requesting
+    principal as owner (like retrieve()'s trace above), so a different
+    authenticated caller cannot read another agent's expand/sm_drill trace
+    just by knowing/guessing the trace_id."""
+    from minnid_runtime.recall import record_attribution_trace
+
+    captured = {}
+
+    class FakeTraceRing:
+        def add(self, trace, owner=None):
+            captured.update(trace)
+            captured["_owner"] = owner
+            return "trace-expand"
+
+    class FakeContext:
+        def trace_ring(self):
+            return FakeTraceRing()
+
+        logger = None
+
+    trace_id = record_attribution_trace(
+        context=FakeContext(),
+        operation="expand",
+        claim="Paris is in France.",
+        results=[{
+            "doc_id": 7,
+            "chunk_id": 70,
+            "attribution": "entailed",
+            "attribution_score": 0.91,
+        }],
+        owner="codex",
+    )
+
+    assert trace_id == "trace-expand"
+    assert captured["_owner"] == "codex"

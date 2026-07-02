@@ -66,6 +66,124 @@ def test_expand_result_with_principal_denies_forbidden(monkeypatch):
     assert "principal" in sig.parameters
 
 
+def _seed_expand_doc(conn, path, agent, privacy_level, page_type="session"):
+    """Insert a real documents+chunk_embeddings row (M3 regression needs the
+    actual SELECT in expand_result to run, not a mocked dict)."""
+    import time
+    import numpy as np
+
+    now = time.time()
+    conn.execute(
+        """INSERT INTO documents
+           (path, agent, sigil, last_modified, indexed_at, privacy_level, page_type, page_status)
+           VALUES (?, ?, 'T', ?, ?, ?, ?, 'accepted')""",
+        (path, agent, now, now, privacy_level, page_type),
+    )
+    doc_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    emb_bytes = np.zeros(384, dtype="float32").tobytes()
+    conn.execute(
+        """INSERT INTO chunk_embeddings
+           (doc_id, chunk_index, chunk_text, embedding, model_name, computed_at)
+           VALUES (?, 0, ?, ?, 'test', ?)""",
+        (doc_id, f"secret content of {path}", emb_bytes, now),
+    )
+    conn.commit()
+    return doc_id
+
+
+def _make_expand_db(tmp_path, name):
+    import db as db_mod
+    from config import SovereignConfig
+
+    db_path = str(tmp_path / name)
+    cfg = SovereignConfig(db_path=db_path)
+    old_flag = db_mod._migrations_run
+    db_mod._migrations_run = False
+    try:
+        db_obj = db_mod.SovereignDB(cfg)
+        db_obj._get_conn()
+    finally:
+        db_mod._migrations_run = old_flag
+    return db_obj, cfg
+
+
+def test_expand_result_select_populates_fields_so_shared_wiki_type_is_read(tmp_path):
+    """M3: expand_result's SELECT previously omitted privacy_level/page_type/
+    page_status, so can_read_document saw an empty dict for every key it looks
+    at. Because can_read_document's final branches key off the REAL page_type
+    ("wiki"/"handoff"/"synthesis"/...) to allow legitimately shared foreign-
+    agent content through, a doc_metadata with no page_type at all silently
+    fell through can_read_document's default-deny -- a foreign agent's
+    explicitly shared, safe wiki page was wrongly hidden on the direct-expand
+    (chunk_id/doc_id) path. This drives expand_result against a REAL
+    SovereignDB row (not a mocked dict) so the actual SELECT is exercised, and
+    proves the now-populated privacy_level/page_type let the legitimate
+    shared-wiki grant fire.
+    """
+    db_obj, cfg = _make_expand_db(tmp_path, "m3.db")
+    conn = db_obj._get_conn()
+
+    doc_id = _seed_expand_doc(
+        conn,
+        "vault/shared/wiki-note.md",
+        agent="gemini",
+        privacy_level="safe",
+        page_type="wiki",
+    )
+
+    eng = RetrievalEngine(db_obj, cfg)
+    caller = EffectivePrincipal(agent_id="codex", capabilities=["search", "read"])
+
+    result = eng.expand_result(doc_id, depth="chunk", update_access=False, principal=caller)
+
+    assert result is not None, (
+        "a safe, foreign-agent page_type=wiki doc must be readable via the "
+        "shared-wiki grant once privacy_level/page_type are actually populated"
+    )
+
+
+def test_expand_result_select_populates_fields_so_foreign_private_wiki_denied(tmp_path):
+    """M3 companion: the SAME page_type=wiki foreign doc, but with a genuinely
+    PRIVATE privacy_level, must still be denied -- proves privacy_level (not
+    just page_type) is read from the real row, not silently defaulted."""
+    db_obj, cfg = _make_expand_db(tmp_path, "m3c.db")
+    conn = db_obj._get_conn()
+
+    doc_id = _seed_expand_doc(
+        conn,
+        "vault/shared/private-wiki-note.md",
+        agent="gemini",
+        privacy_level="private",
+        page_type="wiki",
+    )
+
+    eng = RetrievalEngine(db_obj, cfg)
+    caller = EffectivePrincipal(agent_id="codex", capabilities=["search", "read"])
+
+    result = eng.expand_result(doc_id, depth="chunk", update_access=False, principal=caller)
+
+    assert result is None, "private foreign doc must stay denied even with a shared page_type"
+
+
+def test_expand_result_select_allows_same_agent_private_doc(tmp_path):
+    """M3 companion: the same-agent path must still work once privacy/status/
+    type are genuinely populated from the DB row (not just always-deny)."""
+    db_obj, cfg = _make_expand_db(tmp_path, "m3b.db")
+    conn = db_obj._get_conn()
+
+    doc_id = _seed_expand_doc(
+        conn, "vault/codex/own-note.md", agent="codex", privacy_level="private"
+    )
+
+    eng = RetrievalEngine(db_obj, cfg)
+    caller = EffectivePrincipal(agent_id="codex", capabilities=["search", "read"])
+
+    result = eng.expand_result(doc_id, depth="chunk", update_access=False, principal=caller)
+
+    assert result is not None
+    assert "secret content" in result.get("text", "")
+
+
 # --- Minimal driving integration smokes added in fix round (exercises the exact fixed paths) ---
 
 def test_retrieve_legacy_no_principal_no_unbound_and_g22_envelope_present():

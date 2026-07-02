@@ -167,7 +167,15 @@ test("SessionStart agent-context boot includes identity_body (codex hook)", asyn
   const home = await mkdtemp(path.join(tmpdir(), "sm-identity-codex-home-"));
   const vault = await mkdtemp(path.join(tmpdir(), "sm-identity-codex-vault-"));
   const socketPath = path.join(home, "minnid.sock");
-  const server = await startFakeDaemon(socketPath);
+  // H5: extractIdentityBody now validates that the identity block names the
+  // stamped agent. The codex hook stamps agentId=codex, so the daemon context
+  // must lead with a codex identity block (a claude-code block would be
+  // correctly rejected as a spoof).
+  const codexContext = IDENTITY_CONTEXT.replaceAll("claude-code", "codex").replace(
+    "CLAUDE-CODE_HOSTED_AGENT_ENVELOPE",
+    "CODEX_HOSTED_AGENT_ENVELOPE",
+  );
+  const server = await startFakeDaemon(socketPath, codexContext);
   t.after(async () => {
     server.close();
     await rm(home, { recursive: true, force: true });
@@ -192,12 +200,13 @@ test("SessionStart agent-context boot includes identity_body (codex hook)", asyn
   const body = envelopeJson(context);
 
   assert.match(String(body.identity_body), new RegExp(IDENTITY_MARKER));
+  assert.match(String(body.identity_body), /## Agent Identity: codex/);
   assert.equal(
     body.recent_learnings,
     undefined,
     "agent-context must not duplicate recent_learnings",
   );
-  assert.match(context, /## Agent Identity: claude-code/, "native layer 1 prefix must remain");
+  assert.match(context, /## Agent Identity: codex/, "native layer 1 prefix must remain");
 });
 
 test("extractIdentityBody captures both shelf docs in a multi-doc identity block", () => {

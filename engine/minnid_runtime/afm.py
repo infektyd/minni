@@ -8,7 +8,7 @@ from typing import Any, Callable, Optional
 
 from config import DEFAULT_CONFIG
 from db import SovereignDB
-from principal import validate_agent_id
+from principal import EffectivePrincipal, is_operator_principal, validate_agent_id
 from safety import is_instruction_like
 
 
@@ -268,6 +268,25 @@ def handle_daemon_compile(params: dict, request_id: Any, context: AFMContext) ->
     dry_run = bool(params.get("dry_run", True))
     vault_path = str(params.get("vault_path") or context.default_config.vault_path)
 
+    # P1: dry_run=false runs submit_drafts/apply_consolidation_result, promoting
+    # candidates to durable learnings — a write op. The method-capability table
+    # only requires 'read' (so read principals may still dry-run/preview). Gate
+    # the durable path on operator/govern status here. dry_run=true is untouched.
+    if not dry_run:
+        stamped = params.get("_principal")
+        if not isinstance(stamped, EffectivePrincipal) or not is_operator_principal(stamped):
+            principal_id = (
+                stamped.agent_id if isinstance(stamped, EffectivePrincipal) else None
+            )
+            return context.make_error(
+                -32004,
+                "operator_only: daemon.compile with dry_run=false promotes candidates "
+                "to durable learnings and requires an operator/govern principal "
+                f"(caller principal '{principal_id}' is not authorized); "
+                "run with dry_run=true to preview without writing",
+                request_id,
+            )
+
     err = context.guard_vault_root(params, vault_path, request_id, label="compile")
     if err:
         return err
@@ -328,6 +347,11 @@ def handle_daemon_compile(params: dict, request_id: Any, context: AFMContext) ->
             apply_consolidation_result(result, context)
 
         try:
+            # R8: bind the compile trace to the calling principal (present in
+            # params for both the operator-gated wet path and the read-only
+            # dry-run path above) so it is not readable by an arbitrary caller.
+            _stamped = params.get("_principal")
+            _owner = _stamped.agent_id if isinstance(_stamped, EffectivePrincipal) else None
             context.trace_ring().put(trace_id, {
                 "kind": "afm_loop",
                 "pass_name": pass_name,
@@ -337,7 +361,7 @@ def handle_daemon_compile(params: dict, request_id: Any, context: AFMContext) ->
                 "output": result.get("output"),
                 "draft_page_ids": [draft.get("page_id") for draft in result.get("drafts", [])],
                 "dry_run": dry_run,
-            })
+            }, owner=_owner)
         except Exception as exc:
             context.logger.warning("AFM trace capture degraded: %s", exc)
         return context.make_response(result, request_id)

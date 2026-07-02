@@ -29,6 +29,10 @@ class GovernanceContext:
     record_latency: Callable[[str, float], None]
     index_durable_learning: Callable[..., None]
     maybe_archive_inbox_source: Callable[[Any, int], None]
+    # M4: purge the synthetic durable doc when a learning is superseded/rejected
+    # so its stale chunks stop surfacing in doc search. Default no-op keeps
+    # existing constructions/tests working without threading a real purger.
+    purge_durable_learning: Callable[..., None] = lambda *a, **k: None
     increment_request_count: Callable[[], None] | None = None
     sovereign_db: Callable[..., Any] = SovereignDB
     logger: logging.Logger = logger
@@ -118,9 +122,15 @@ def handle_learn(params: dict, request_id: Any, context: GovernanceContext) -> d
         if not force and contradicts_id is None:
             check_text = assertion or extract_assertion(content)
             try:
+                # R5: scope contradiction detection to the caller's own agent.
+                # A global (agent_id=None) scan returned full cross-agent
+                # content/assertion/agent_id, letting a caller probe and
+                # exfiltrate other agents' durable learnings by crafting an
+                # assertion. The learn write is same-agent, so same-agent scoping
+                # loses no legitimate signal.
                 candidates = wb.detect_contradictions(
                     content_or_assertion=check_text,
-                    agent_id=None,
+                    agent_id=agent_id,
                 )
             except Exception as exc:
                 context.logger.warning(
@@ -284,10 +294,13 @@ def handle_resolve_contradiction(params: dict, request_id: Any, context: Governa
                     exc,
                 )
 
+        # M4: (agent_id, content) of each superseded learning, captured inside the
+        # txn so we can purge their now-stale synthetic docs after commit.
+        superseded_docs: list[tuple[str, str]] = []
         with wb.db.transaction() as c:
             for sid in supersede_ids:
                 c.execute(
-                    "SELECT agent_id FROM learnings WHERE learning_id = ?",
+                    "SELECT agent_id, content FROM learnings WHERE learning_id = ?",
                     (sid,),
                 )
                 srow = c.fetchone()
@@ -296,6 +309,7 @@ def handle_resolve_contradiction(params: dict, request_id: Any, context: Governa
                         -32001, f"learning_not_found: {sid}", request_id
                     ))
                 owner = str(srow["agent_id"] or "")
+                superseded_docs.append((owner, str(srow["content"] or "")))
                 if owner != agent_id and not explicitly_allowed_operator(principal):
                     raise ResolveRejected(context.make_error(
                         -32004,
@@ -339,6 +353,13 @@ def handle_resolve_contradiction(params: dict, request_id: Any, context: Governa
             "Resolved contradiction: new learning #%d supersedes %s",
             new_lid, supersede_ids,
         )
+
+        # M4: superseded learnings must stop surfacing in doc search — purge each
+        # one's synthetic durable doc (FTS/chunks/FAISS). Best-effort; never
+        # undoes the committed supersession.
+        for sup_agent, sup_content in superseded_docs:
+            if sup_content:
+                context.purge_durable_learning(sup_agent, sup_content, db=wb.db)
 
         if wb.config.writeback_enabled:
             wb._write_to_disk(new_lid, agent_id, category, new_content, now)
@@ -444,10 +465,9 @@ def handle_subscribe_contradictions(params: dict, request_id: Any, context: Gove
                 WHERE {" AND ".join(clauses)}
                 ORDER BY ce.created_at ASC, ce.event_id ASC
             """, query_params).fetchall()
-            total_events = c.execute(
-                "SELECT COUNT(*) AS n FROM contradiction_events WHERE created_at >= ?",
-                (event_since,),
-            ).fetchone()["n"]
+            # R10: the global "events in window" count leaked cross-agent
+            # activity (an unscoped SELECT COUNT(*) over all contradiction_events)
+            # to any caller. Dropped — only agent-scoped counts are returned.
             agent_events = c.execute(
                 """SELECT COUNT(*) AS n FROM contradiction_events
                    WHERE created_at >= ?
@@ -474,7 +494,6 @@ def handle_subscribe_contradictions(params: dict, request_id: Any, context: Gove
             "events": events,
             "status": "matched" if events else "checked_no_match",
             "checked": {
-                "contradiction_events_in_window": total_events,
                 "contradiction_events_for_agent_reads": agent_events,
                 "learning_reads_for_agent": reads_for_agent,
                 "event_window_days": event_window_days,
@@ -777,6 +796,28 @@ def resolve_candidate(params: dict, request_id: Any, context: GovernanceContext)
                     "accepting it requires literal 'accept_flagged' capability",
                     request_id,
                 )
+
+            # P2/P5: a decision that durably promotes the candidate to a learning
+            # (accept/learn and the mark_* accepts) requires operator/govern
+            # authority even for a SELF-OWNED candidate. Owner-only principals may
+            # still reject/redact/do_not_store/log_only/merge/supersede their own
+            # candidate, but must not stage-then-self-approve into durable memory.
+            # (The owner check above still governs the reject/redact branch; the
+            # instruction_like gate above still runs first so poisoned content is
+            # rejected uniformly regardless of operator status.)
+            if (
+                new_status == "accepted"
+                and not is_operator_principal(principal)
+                and not explicitly_allowed_operator(principal)
+            ):
+                raise ResolveRejected(context.make_error(
+                    -32004,
+                    f"operator_only: accepting candidate #{cid} into a durable learning "
+                    f"requires an operator/govern principal (caller '{principal.agent_id}' "
+                    "owns the candidate but may only reject/redact it, not self-approve "
+                    "it into durable memory)",
+                    request_id,
+                ))
 
             if new_status == "accepted":
                 c.execute(

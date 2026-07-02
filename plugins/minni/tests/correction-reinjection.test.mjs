@@ -332,7 +332,7 @@ test("settleReassertedInboxEntries rewrites partial-cap tails so overflow re-inj
     const first = collectCorrectionsReassert([{ payload, filePath }]);
     assert.equal(first.events.length, CORRECTIONS_REASSERT_MAX);
     assert.deepEqual(first.consumedPaths, []);
-    await settleReassertedInboxEntries(first);
+    await settleReassertedInboxEntries(root, first);
 
     const rewritten = JSON.parse(await readFile(filePath, "utf8"));
     assert.deepEqual(
@@ -350,7 +350,7 @@ test("settleReassertedInboxEntries rewrites partial-cap tails so overflow re-inj
     );
     assert.deepEqual(second.consumedPaths, [filePath]);
     assert.deepEqual(second.deferredTails, []);
-    await settleReassertedInboxEntries(second);
+    await settleReassertedInboxEntries(root, second);
     const remaining = (await readdir(inboxDir)).filter((f) => f.endsWith(".json"));
     assert.deepEqual(remaining, [], "fully-drained entry must be cleared");
   } finally {

@@ -300,6 +300,79 @@ def test_ingested_rows_are_selected_by_consolidation_pass(tmp_path):
     assert result["summary"]["examined"] >= 1
 
 
+def _make_consolidation_actions_table(db_obj):
+    with db_obj.cursor() as c:
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS consolidation_actions (
+                action_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                action_type TEXT NOT NULL,
+                source_event_id INTEGER,
+                target_learning_id INTEGER,
+                superseded_learning_id INTEGER,
+                claim TEXT,
+                category TEXT,
+                confidence REAL,
+                status TEXT DEFAULT 'pending',
+                detail TEXT,
+                created_at REAL NOT NULL
+            )
+            """
+        )
+
+
+def test_inbox_candidate_with_null_privacy_is_not_auto_promoted(tmp_path):
+    """I1/I2: inbox_ingest inserts candidate_packets with privacy_level=None
+    (inbox_ingest.py never learns a privacy level from stop-candidate files).
+    Consolidation must NOT treat unset/NULL privacy as safe — it must route
+    these to review, not auto-promote them straight to durable learnings."""
+    from afm_passes.inbox_ingest import ingest
+    from afm_passes.consolidation import run as consolidation_run
+
+    db_obj, cfg = _make_db(tmp_path)
+    _make_consolidation_actions_table(db_obj)
+    inbox = tmp_path / "codex-vault" / "inbox"
+    _write_inbox_file(inbox, "a.json",
+                      _stop_doc(["a clear durable lesson worth promoting maybe"]))
+
+    ingest(db_obj, cfg, inboxes=[inbox], dry_run=False)
+    with db_obj.cursor() as c:
+        c.execute("SELECT privacy_level FROM candidate_packets WHERE principal='codex'")
+        row = dict(c.fetchone())
+    assert row["privacy_level"] is None, "inbox ingest must stamp NULL privacy (precondition)"
+
+    result = consolidation_run(db_obj, cfg, vault_path=cfg.vault_path, dry_run=True)
+    assert result["summary"]["to_promote"] == 0, result
+    assert result["summary"]["to_review"] == 1, result
+
+
+def test_explicitly_safe_privacy_candidate_still_promotes(tmp_path):
+    """No over-blocking: a candidate explicitly marked privacy=safe must still
+    be eligible for auto-promotion by the consolidation pass."""
+    from afm_passes.consolidation import run as consolidation_run
+
+    db_obj, cfg = _make_db(tmp_path)
+    _make_consolidation_actions_table(db_obj)
+    with db_obj.transaction() as c:
+        c.execute(
+            """
+            INSERT INTO candidate_packets
+            (principal, workspace_id, layer, privacy_level, content,
+             evidence_refs, derived_from, instruction_like, status, proposed_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'proposed', ?)
+            """,
+            (
+                "codex", "default", None, "safe",
+                "an explicitly safe durable lesson worth promoting",
+                json.dumps([]), json.dumps({"source": "test"}), 0, 1.0,
+            ),
+        )
+
+    result = consolidation_run(db_obj, cfg, vault_path=cfg.vault_path, dry_run=True)
+    assert result["summary"]["to_promote"] == 1, result
+    assert result["summary"]["to_review"] == 0, result
+
+
 def test_ingest_reports_skipped_by_kind(tmp_path):
     """B4 (audit C2): kind-gate drops must be counted per kind, not silent."""
     from afm_passes.inbox_ingest import ingest
@@ -334,3 +407,33 @@ def test_ingest_reports_skipped_by_kind(tmp_path):
     _write_inbox_file(clean, "a.json", _stop_doc(["only eligible content"], agent_id="clean"))
     res2 = ingest(db_obj, cfg, inboxes=[clean], dry_run=True)
     assert res2["skipped_by_kind"] == {}
+
+
+def test_unhashable_kind_does_not_abort_the_whole_ingest_pass(tmp_path):
+    """I3: a `kind` that's a list/dict is unhashable, so `kind not in STOP_KINDS`
+    raises TypeError. That must not abort the whole ingest() pass (which would
+    leave the poison file undeleted and starve every other file forever) — the
+    poisoned file is skipped, and a valid stop-candidate file in the same
+    inbox is still ingested."""
+    from afm_passes.inbox_ingest import ingest
+
+    db_obj, cfg = _make_db(tmp_path)
+    inbox = tmp_path / "codex-vault" / "inbox"
+    # Poisoned: kind is a list (unhashable), so `in STOP_KINDS` would raise.
+    _write_inbox_file(inbox, "poison_list.json", {
+        "kind": ["stop_candidates"],
+        "candidates": ["should not crash the pass"],
+        "slug": "s", "last_task": "t",
+    })
+    # Poisoned: kind is a dict (unhashable).
+    _write_inbox_file(inbox, "poison_dict.json", {
+        "kind": {"nested": "stop_candidates"},
+        "candidates": ["also should not crash"],
+        "slug": "s", "last_task": "t",
+    })
+    # Valid file that must still be ingested despite the poisoned siblings.
+    _write_inbox_file(inbox, "z_valid.json", _stop_doc(["a legitimate stop candidate"]))
+
+    res = ingest(db_obj, cfg, inboxes=[inbox], dry_run=False)
+    assert res["inserted"] == 1, res
+    assert _count_proposed(db_obj) == 1

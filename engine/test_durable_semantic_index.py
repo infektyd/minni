@@ -179,6 +179,49 @@ def test_learn_force_makes_doc_semantically_recallable(temp_engine):
     assert "tide" in _result_text(top).lower()
 
 
+def test_learn_force_ignores_model_supplied_wiki_page_type(temp_engine):
+    """M2: page_type was previously copied verbatim from the model's own
+    frontmatter into the durable-learn synthetic doc. can_read_document treats
+    page_type in {wiki,handoff,synthesis,decision,session} as cross-agent
+    visible, so a force=true learn whose content frontmatter declared
+    `type: wiki` would make an otherwise owner-scoped durable learning
+    readable by every other agent. The synthetic doc's page_type must be
+    pinned to a fixed non-cross-visible value ("learning") regardless of any
+    model-supplied frontmatter type.
+    """
+    op = _operator()
+    doc_with_wiki_frontmatter = (
+        "---\n"
+        "type: wiki\n"
+        "status: accepted\n"
+        "---\n\n"
+        + _DOC_TIDES
+    )
+    resp = minnid._handle_learn(
+        {"content": doc_with_wiki_frontmatter, "force": True, "_principal": op}, 1
+    )
+    assert resp["result"]["status"] == "ok"
+
+    from db import SovereignDB
+    db_obj = SovereignDB()
+    with db_obj.cursor() as c:
+        c.execute(
+            "SELECT page_type FROM documents WHERE path LIKE '%_durable%' "
+            "ORDER BY doc_id DESC LIMIT 1"
+        )
+        row = c.fetchone()
+    assert row is not None, "durable-learn synthetic doc was not indexed"
+    assert row["page_type"] == "learning", (
+        f"model-supplied frontmatter 'type: wiki' leaked into the synthetic "
+        f"doc's page_type (got {row['page_type']!r}); a foreign agent could "
+        "read this owner-scoped learning via the shared-wiki cross-visibility "
+        "grant in can_read_document"
+    )
+    assert row["page_type"] not in {
+        "wiki", "handoff", "synthesis", "decision", "session",
+    }
+
+
 def test_multiple_relevant_docs_ranked(temp_engine):
     """Two stored docs → the relevant one ranks, both are semantically present."""
     op = _operator()

@@ -213,6 +213,15 @@ def _scan_inbox(
         if not isinstance(doc, dict):
             continue
         kind = doc.get("kind")
+        # `kind` must be a hashable, comparable value (str or None) before it
+        # can be tested against STOP_KINDS (a set) — `x in <set>` raises
+        # TypeError for unhashable types (list/dict), which would otherwise
+        # abort the whole ingest() pass and starve every other file behind a
+        # single malformed one (I3 security fix). Treat malformed kind like
+        # any other excluded kind: skip and count it, keep scanning.
+        if not isinstance(kind, str) and kind is not None:
+            skipped_by_kind["_malformed_kind"] = skipped_by_kind.get("_malformed_kind", 0) + 1
+            continue
         # Accept codex's explicitly-tagged stop-candidates AND kind-less files
         # that carry the stop-candidate shape (the Claude Code hook writes
         # candidate files with no `kind`). Any other explicit kind is excluded

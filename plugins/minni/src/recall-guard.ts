@@ -21,6 +21,7 @@
 // call ALWAYS passes. A block loop here would be catastrophic; the consumed flag
 // is what prevents it.
 import type { RecallState } from "./recall-state.js";
+import { sanitizeRecallField } from "./recall-state.js";
 
 /** PreToolUse is NOT an EnvelopeEvent — its output is the permissionDecision shape. */
 export const PRE_TOOL_USE_EVENT = "PreToolUse";
@@ -153,9 +154,17 @@ export function preToolUseAllow(): PreToolUseDecisionOutput {
  * followed by the instruction to consult memory and re-issue the exact call.
  */
 export function buildGuardDenyReason(state: RecallState): string {
+  // H3: hit.title / hit.wikilink are untrusted vault content. Sanitize (strip
+  // newlines/control chars, clamp length) and present each as a clearly-quoted
+  // inert datum so a crafted title cannot introduce its own line that reads as a
+  // fresh instruction. The imperative framing stays a fixed template.
   const lines = state.top_hits
     .slice(0, 5)
-    .map((hit) => `  - ${hit.title} ${hit.wikilink} (score ${hit.score.toFixed(2)})`);
+    .map(
+      (hit) =>
+        `  - "${sanitizeRecallField(hit.title)}" ${sanitizeRecallField(hit.wikilink)} ` +
+        `(score ${hit.score.toFixed(2)})`,
+    );
   return (
     "📓 Minni recall guard: you have UNCONSULTED recall for this turn.\n" +
     `Top ${lines.length} relevant ${lines.length === 1 ? "memory" : "memories"}:\n` +

@@ -103,16 +103,35 @@ def test_handle_health_report_redacts_when_recovery(monkeypatch):
     assert rep["stale_docs_count"] == 0
 
 
-def test_handle_health_report_full_detail_when_not_recovery(monkeypatch):
+def test_handle_health_report_full_detail_when_operator(monkeypatch):
     import minnid
+    from principal import EffectivePrincipal
 
     monkeypatch.setattr(minnid, "SovereignDB", _FakeDB)
-    resp = minnid._handle_health_report({"_recovery": False}, 1)
+    op = EffectivePrincipal(agent_id="main", capabilities=["*"])
+    resp = minnid._handle_health_report({"_recovery": False, "_principal": op}, 1)
     rep = resp["result"]
 
-    # Authenticated callers get the un-redacted shape (no redaction marker).
+    # An identified OPERATOR caller gets the un-redacted shape.
     assert "redacted" not in rep
     assert "stale_docs" in rep
+
+
+def test_handle_health_report_redacts_identified_non_operator(monkeypatch):
+    """R6: an identified but non-operator caller must not see cross-agent doc
+    paths / learning content — it gets the same aggregate-only redaction."""
+    import minnid
+    from principal import EffectivePrincipal
+
+    monkeypatch.setattr(minnid, "SovereignDB", _FakeDB)
+    limited = EffectivePrincipal(agent_id="codex", capabilities=["read", "search"])
+    resp = minnid._handle_health_report({"_recovery": False, "_principal": limited}, 1)
+    rep = resp["result"]
+
+    assert "redacted" in rep
+    assert rep["stale_docs"] == []
+    assert rep["never_recalled"] == []
+    assert rep["contradicting_learnings"] == []
 
 
 def test_handle_health_report_redacts_by_default_when_flag_absent(monkeypatch):

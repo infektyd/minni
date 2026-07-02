@@ -650,7 +650,9 @@ class TestStaleBeliefs:
         assert result["events"] == []
         assert result["status"] == "checked_no_match"
         checked = result["checked"]
-        assert checked["contradiction_events_in_window"] == 0
+        # R10: the unscoped global "events in window" count is no longer returned.
+        assert "contradiction_events_in_window" not in checked
+        assert checked["contradiction_events_for_agent_reads"] == 0
         assert checked["learning_reads_for_agent"] == 0
         assert checked["read_window_hours"] is None
         assert checked["event_window_days"] == 30
@@ -687,7 +689,12 @@ class TestStaleBeliefs:
         assert result["events"] == []
         assert result["status"] == "checked_no_match"
         assert result["checked"]["read_window_hours"] == 24
-        assert result["checked"]["contradiction_events_in_window"] == 1
+        # R10: global count dropped; the agent-scoped read count remains the
+        # meaningful, non-leaking signal. codex DID read the superseded belief,
+        # so the agent-scoped count is 1 even though the read_window filtered the
+        # event out of the returned list.
+        assert "contradiction_events_in_window" not in result["checked"]
+        assert result["checked"]["contradiction_events_for_agent_reads"] == 1
 
     def test_event_window_bounds_old_events(self, tmp_path, monkeypatch):
         """Events older than event_window_days are not re-surfaced at boot."""
@@ -855,7 +862,9 @@ class TestSubscribeContradictionsParams:
         result = subscribed["result"]
         assert result["events"] == []
         checked = result["checked"]
-        assert checked["contradiction_events_in_window"] == 1
+        # R10: another agent's contradiction event must NOT be visible to codex.
+        # The global count that leaked it is dropped; the agent-scoped count is 0.
+        assert "contradiction_events_in_window" not in checked
         assert checked["contradiction_events_for_agent_reads"] == 0
 
     def test_window_params_are_clamped(self, tmp_path, monkeypatch):

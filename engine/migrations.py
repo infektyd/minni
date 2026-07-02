@@ -188,6 +188,8 @@ def run_migrations(conn: sqlite3.Connection) -> None:
             for statement in _split_statements(sql):
                 if statement.strip():
                     _execute_tolerant(conn, statement)
+            if version == 13:
+                _apply_migration_013_legacy_main_rewrite(conn)
             conn.execute(
                 "INSERT OR REPLACE INTO schema_migrations(version, name, applied_at) VALUES (?, ?, ?)",
                 (version, os.path.basename(filepath), now),
@@ -203,6 +205,55 @@ def run_migrations(conn: sqlite3.Connection) -> None:
         conn.rollback()
         logger.exception("Migration failed — rolled back. State unchanged.")
         raise
+
+
+# M1 (security): migration 013's original SQL unconditionally rewrote
+# principal/agent_id 'main' -> 'claude-code', on the operator-asserted premise
+# that historical 'main' rows were actually claude-code writes collapsed by an
+# old legacy_agent_ids alias config. That premise is true for the specific
+# already-migrated database it was written against, but is NOT true in
+# general: a fresh/un-migrated install may have genuine operator 'main'
+# memory that has nothing to do with claude-code. Since an already-applied
+# migration can't be unshipped, the rewrite is gated here in Python behind an
+# explicit opt-in flag instead of being unconditional SQL, so it only ever
+# fires where an operator has asserted the legacy-alias condition. See
+# docs/CANONICAL-PATHS.md and SECURITY_PLAN.md decision log.
+_LEGACY_MAIN_ALIAS_ENV = "MINNI_LEGACY_MAIN_IS_CLAUDE_CODE"
+
+
+def _legacy_main_is_claude_code() -> bool:
+    return (os.environ.get(_LEGACY_MAIN_ALIAS_ENV) or "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
+def _apply_migration_013_legacy_main_rewrite(conn: sqlite3.Connection) -> None:
+    """Rewrite principal/agent_id 'main' -> 'claude-code' for
+    candidate_packets and learnings, but ONLY when the operator has asserted
+    (via MINNI_LEGACY_MAIN_IS_CLAUDE_CODE=1) that 'main' rows on this
+    database are a legacy claude-code alias. Otherwise a no-op: genuine
+    operator 'main' rows on fresh/un-migrated installs are left untouched.
+    Idempotent either way — matches nothing on a second run."""
+    if not _legacy_main_is_claude_code():
+        logger.info(
+            "Migration 013: %s not set — leaving 'main' rows untouched "
+            "(no legacy-alias rewrite applied).",
+            _LEGACY_MAIN_ALIAS_ENV,
+        )
+        return
+    logger.warning(
+        "Migration 013: %s is set — rewriting principal/agent_id 'main' -> "
+        "'claude-code' for candidate_packets and learnings.",
+        _LEGACY_MAIN_ALIAS_ENV,
+    )
+    _execute_tolerant(
+        conn,
+        "UPDATE candidate_packets SET principal = 'claude-code' WHERE principal = 'main'",
+    )
+    _execute_tolerant(
+        conn,
+        "UPDATE learnings SET agent_id = 'claude-code' WHERE agent_id = 'main'",
+    )
 
 
 def _execute_tolerant(conn: sqlite3.Connection, statement: str) -> None:

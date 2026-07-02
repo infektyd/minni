@@ -277,6 +277,7 @@ class WriteBackMemory:
                 JOIN learnings l ON l.learning_id = lf.learning_id
                 WHERE learnings_fts MATCH ?
                       AND l.superseded_by IS NULL
+                      AND (l.status IS NULL OR l.status NOT IN ('rejected','expired','superseded'))
             """
             params = [fts_query]
 
@@ -355,6 +356,7 @@ class WriteBackMemory:
                        created_at, access_count, source_query, embedding
                 FROM learnings
                 WHERE superseded_by IS NULL AND embedding IS NOT NULL
+                      AND (status IS NULL OR status NOT IN ('rejected','expired','superseded'))
             """
             params = []
             if agent_id:

@@ -90,6 +90,19 @@ class VaultIndexer:
             return str(v).strip().strip("\"'")
 
         agent = _str(data.get("agent") or data.get("sigil"), "unknown")
+        # M6: the "identity:" agent prefix self-assigns the trusted identity
+        # recall layer via _infer_layer. On-disk vault markdown is untrusted
+        # input (anyone who can write a file could forge `agent: identity:codex`),
+        # so strip the prefix here — the identity layer is only assignable through
+        # the trusted seed path, never from indexed frontmatter.
+        if agent.startswith("identity:"):
+            stripped = agent[len("identity:"):].strip()
+            logger.warning(
+                "indexer: stripping untrusted 'identity:' prefix from frontmatter "
+                "agent %r (identity layer is not self-assignable from vault markdown)",
+                agent,
+            )
+            agent = stripped or "unknown"
         sigil = _str(data.get("sigil"), "❓")
         status = _str(data.get("status"), "candidate").lower()
         privacy = _str(data.get("privacy"), "safe").lower()

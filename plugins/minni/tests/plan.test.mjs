@@ -7,6 +7,7 @@ import test from "node:test";
 import {
   updateSlice,
   computePlanDigest,
+  computePlanDigestV1,
   rehydratePlan,
   createPlan,
   persistPlan,
@@ -408,7 +409,7 @@ test("P3: compactPlanView leads with progress headline so a closed slice is not 
   assert.match(v2.headline, /PLAN COMPLETE/);
 });
 
-test("P10: completing the last slice moves the plan to a terminal status (accepted) and back if reopened", () => {
+test("P10: completing the last slice moves the plan to a terminal status (complete) and back if reopened", () => {
   const base = {
     plan_id: "p10",
     goal: "g",
@@ -428,11 +429,14 @@ test("P10: completing the last slice moves the plan to a terminal status (accept
   };
   base.plan_digest = computePlanDigest(base);
 
-  // close the last open slice -> all resolved -> plan auto-transitions draft -> accepted
+  // H6: closing the last open slice -> all resolved -> plan auto-transitions
+  // draft -> "complete" (a terminal, NON-recallable status; model-driven
+  // completion must never self-promote into the recallable "accepted").
   const done = updateSlice(base, "a", "done", "A verified by running the suite, 12/12 passed");
-  assert.equal(done.status, "accepted", "plan should become terminal when all slices resolve");
+  assert.equal(done.status, "complete", "plan should become terminal (complete) when all slices resolve");
+  assert.notEqual(done.status, "accepted", "model completion must not reach the recallable accepted status");
 
-  // reopening a slice un-finishes the plan -> accepted reverts to draft
+  // reopening a slice un-finishes the plan -> complete reverts to draft
   const reopened = updateSlice(done, "a", "in_progress");
   assert.equal(reopened.status, "draft", "reopening a slice should revert the terminal status");
 });
@@ -630,6 +634,50 @@ test("every id-less plan tool returns the no-active-plan error end-to-end throug
     }
   } finally {
     child.kill("SIGKILL");
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+// H7: a plan persisted before the digest was widened carries the legacy (v1)
+// digest. rehydratePlan must NOT hard-fail it as "tampered" — it must recognize
+// the v1 digest, load the plan, and UPGRADE the stored digest to v2 in place.
+// (A digest matching NEITHER algorithm is still a genuine tamper and throws,
+// which the "rejects note with mismatched/tampered digest" test above covers.)
+test("H7: rehydratePlan upgrades a pre-H7 (v1-digest) plan instead of hard-failing it", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-plan-h7-migrate-"));
+  try {
+    await ensureVault(root);
+
+    // Build and persist a real plan (persistPlan writes the current v2 digest).
+    const { plan, write } = await createPlan(
+      { goal: "Digest migration coverage", vaultPath: root },
+      { vaultPath: root },
+    );
+    const notePath = write.notePath;
+
+    // Canonicalize by rehydrating once, then compute what the OLD (v1) digest
+    // would have been for this exact plan, and rewrite the note to carry it —
+    // simulating a plan persisted before the H7 widening.
+    const canonical = await rehydratePlan(notePath);
+    const v1 = computePlanDigestV1(canonical);
+    const v2 = computePlanDigest(canonical);
+    assert.notEqual(v1, v2, "v1 and v2 digests must differ for this to be a real migration");
+
+    const before = await readFile(notePath, "utf8");
+    const withLegacy = before.replace(/^plan_digest: .*$/m, `plan_digest: ${v1}`);
+    assert.notEqual(withLegacy, before, "expected to rewrite the plan_digest line");
+    await writeFile(notePath, withLegacy, "utf8");
+
+    // Rehydrate the pre-H7 note: must succeed (no throw) and report the v2 digest.
+    const upgraded = await rehydratePlan(notePath);
+    assert.equal(upgraded.plan_id, plan.plan_id);
+    assert.equal(upgraded.plan_digest, v2, "loaded plan must carry the upgraded v2 digest");
+
+    // And the upgrade must be persisted back to the note (v2 on disk now).
+    const after = await readFile(notePath, "utf8");
+    assert.match(after, new RegExp(`^plan_digest: ${v2}$`, "m"), "note must be re-persisted with the v2 digest");
+    assert.doesNotMatch(after, new RegExp(`^plan_digest: ${v1}$`, "m"), "legacy digest must be replaced");
+  } finally {
     await rm(root, { recursive: true, force: true });
   }
 });

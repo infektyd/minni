@@ -18,6 +18,15 @@ per a configurable denylist:
 - **Real-name -> alias map** — by default maps the operator's real name to the
   ``Infektyd`` alias.
 
+The scrub pass also applies the SAME denylist to each file's DOC-ID (its
+corpus-relative path, filename-derived per ``corpus._iter_corpus_files``):
+a source file literally named after a person (e.g. ``jane-doe-notes.md`` or
+``jane.doe@example.com.md``) is RENAMED on disk to a scrubbed doc-id before the
+text pass runs, so the real name/email never survives as the ``doc_id`` key in
+``manifest.json``, ``scrub_spans.jsonl``, or downstream gold labels (X6, §5.1).
+:func:`verify_scrubbed` re-scans doc-ids (not just file bytes) for residual
+name/email patterns and rejects a snapshot whose doc-ids still carry PII.
+
 It records a ``scrub_manifest_hash`` = SHA-256 over the canonical sorted list of
 redacted spans AND the resulting scrubbed file tree (§5.1). The cross-check rule:
 the loader/runner MUST REJECT a corpus claiming ``scrubbed=True`` unless the
@@ -342,6 +351,135 @@ def scrub_text(
     return "".join(out_parts), spans
 
 
+def _filename_name_patterns(
+    policy: ScrubPolicy,
+) -> list[tuple[re.Pattern[str], str]]:
+    """Name patterns tolerant of filename-style separators (X6, §5.1).
+
+    A real name in prose is space-separated ("Jane Doe"), but the SAME name in a
+    filename is conventionally ``-``/``_``/``.``-separated ("jane-doe",
+    "jane_doe", "Jane.Doe"). ``_name_patterns`` (used for file TEXT) only matches
+    the literal space form, so it silently misses the filename spelling — this
+    builds an equivalent pattern per real name that accepts space, ``-``, ``_``,
+    or ``.`` between the name's words, still whole-word and case-insensitive.
+    """
+    out: list[tuple[re.Pattern[str], str]] = []
+    for real, alias in policy.name_aliases.items():
+        words = [w for w in re.split(r"\s+", real.strip()) if w]
+        if not words:
+            continue
+        escaped = [re.escape(w) for w in words]
+        pattern = r"\b" + r"[-_. ]+".join(escaped) + r"\b"
+        out.append((re.compile(pattern, re.IGNORECASE), alias))
+    return out
+
+
+def scrub_doc_id(doc_id: str, policy: ScrubPolicy) -> tuple[str, bool]:
+    """Apply the name/email denylist to a corpus-relative doc-id (X6, §5.1).
+
+    ``doc_id`` is filename-derived (``corpus._iter_corpus_files``), so a source
+    file literally NAMED after a person or an email address leaks that PII into
+    ``manifest.json`` / ``scrub_spans.jsonl`` / gold labels even after the file's
+    TEXT is scrubbed — the doc-id itself was never touched. This runs the same
+    email + real-name->alias patterns used by :func:`scrub_text` over the doc-id
+    string (matched per path SEGMENT, so a directory name can be scrubbed too,
+    and the ``.md``-style extension is preserved), returning the scrubbed doc-id
+    and whether it changed. Key/secret/PEM/JWT/assignment patterns are NOT
+    applied here — those match multi-char runs that would corrupt an otherwise
+    innocuous filename; only email + explicit real-name aliases are meaningful
+    doc-id PII classes.
+    """
+    parts = doc_id.split("/")
+    changed = False
+    out_parts: list[str] = []
+    for part in parts:
+        stem, dot, ext = part.rpartition(".")
+        segment = stem if dot else part
+        new_segment = segment
+        if policy.redact_emails:
+            new_segment = _EMAIL_PATTERN.sub(REDACTED_EMAIL, new_segment)
+        for pat, alias in _filename_name_patterns(policy):
+            new_segment = pat.sub(alias, new_segment)
+        rebuilt = f"{new_segment}.{ext}" if dot else new_segment
+        if rebuilt != part:
+            changed = True
+        out_parts.append(rebuilt)
+    return "/".join(out_parts), changed
+
+
+def rename_scrubbed_doc_ids(
+    corpus_dir: str | os.PathLike[str], policy: ScrubPolicy
+) -> dict[str, str]:
+    """Rename on-disk files whose doc-id carries name/email PII (X6, §5.1).
+
+    Walks the corpus dir (same enumeration as the s1 loader), computes each
+    file's scrubbed doc-id via :func:`scrub_doc_id`, and RENAMES the file when
+    it changed. Collisions (two distinct original doc-ids scrubbing to the same
+    target) are disambiguated by appending a short content-hash suffix to the
+    scrubbed stem, so no file is silently overwritten/lost. Returns a
+    ``{old_doc_id: new_doc_id}`` map for renamed files only (empty if nothing
+    changed) — used by :func:`scrub_snapshot` to keep the manifest/spans in
+    sync with the renamed tree.
+    """
+    corpus_dir = Path(corpus_dir)
+    renames: dict[str, str] = {}
+    used: set[str] = {doc_id for doc_id, _ in _iter_corpus_files(corpus_dir)}
+    for doc_id, abs_path in _iter_corpus_files(corpus_dir):
+        new_doc_id, changed = scrub_doc_id(doc_id, policy)
+        if not changed:
+            continue
+        if new_doc_id in used and new_doc_id != doc_id:
+            # Disambiguate a collision with a short, deterministic suffix derived
+            # from the ORIGINAL doc-id (not the file bytes, which may not exist
+            # yet at this offset if a prior rename already moved a colliding
+            # sibling) — stable across repeated runs over the same source tree.
+            digest = hashlib.sha256(doc_id.encode("utf-8")).hexdigest()[:8]
+            stem, dot, ext = new_doc_id.rpartition(".")
+            base = stem if dot else new_doc_id
+            candidate = f"{base}-{digest}.{ext}" if dot else f"{base}-{digest}"
+            n = 1
+            while candidate in used:
+                candidate = (
+                    f"{base}-{digest}-{n}.{ext}" if dot else f"{base}-{digest}-{n}"
+                )
+                n += 1
+            new_doc_id = candidate
+        used.discard(doc_id)
+        used.add(new_doc_id)
+        new_path = corpus_dir / new_doc_id
+        new_path.parent.mkdir(parents=True, exist_ok=True)
+        abs_path.rename(new_path)
+        # Prune now-empty parent directories left behind by the rename so a
+        # nested PII directory name does not linger as an empty shell.
+        parent = abs_path.parent
+        while parent != corpus_dir and not any(parent.iterdir()):
+            empty = parent
+            parent = parent.parent
+            empty.rmdir()
+        renames[doc_id] = new_doc_id
+    return renames
+
+
+# Doc-id-shaped name/email residue: used by verify_scrubbed to catch a doc-id
+# that still carries PII even when the on-disk file bytes are clean (X6).
+def residual_doc_id_pii(
+    corpus_dir: str | os.PathLike[str], policy: ScrubPolicy
+) -> list[str]:
+    """Return doc-ids that still change under :func:`scrub_doc_id` (X6, §5.1).
+
+    A non-empty result means at least one file's PATH (not just its text) still
+    carries a real name/email the policy would redact — the independent,
+    bytes-level defense for doc-ids, mirroring :func:`residual_secrets` for file
+    content.
+    """
+    hits: list[str] = []
+    for doc_id, _ in _iter_corpus_files(Path(corpus_dir)):
+        _, changed = scrub_doc_id(doc_id, policy)
+        if changed:
+            hits.append(doc_id)
+    return hits
+
+
 def compute_scrub_manifest_hash(
     corpus_dir: str | os.PathLike[str], spans: list[RedactionSpan]
 ) -> str:
@@ -391,6 +529,14 @@ def scrub_snapshot(
     # PRIVATE-PATH WRITE GUARD — scrub_snapshot is an in-place writer.
     assert_private_path(snapshot_dir, allow_public=allow_public)
     corpus_dir = corpus_subdir(snapshot_dir)
+
+    # DOC-ID SCRUB (X6, §5.1): rename any file whose corpus-relative path still
+    # carries a real name/email BEFORE the text pass, so (a) the spans recorded
+    # below are keyed by the ALREADY-scrubbed doc-id (never the PII-bearing
+    # original) and (b) the rebuilt manifest/doc-id set downstream (gold labels
+    # via label_cli's StubDrafter, which iterates corpus.doc_ids()) never sees
+    # the original filename.
+    rename_scrubbed_doc_ids(corpus_dir, policy)
 
     all_spans: list[RedactionSpan] = []
     for doc_id, abs_path in _iter_corpus_files(corpus_dir):
@@ -622,6 +768,24 @@ def verify_scrubbed(
             f"{len(residual)} redactable span(s) of kind(s) {kinds} — the bytes "
             "are NOT actually scrubbed (forged flag/hash over unscrubbed bytes "
             "is rejected, §5.1)."
+        )
+
+    # DOC-ID residual re-scan (X6, §5.1): the checks above only re-scan file
+    # BYTES. A scrubber that redacted every file's TEXT but left a PII-bearing
+    # FILENAME untouched (or a tampered/forged snapshot whose files were renamed
+    # back) would otherwise pass with the real name/email still present as the
+    # doc-id — which flows straight into manifest.json, scrub_spans.jsonl (via
+    # doc_id-keyed spans), and gold labels (StubDrafter ids/gold_doc_ids/gold_fact
+    # all embed the raw doc_id). Independently re-derive the doc-id set and
+    # reject if any doc-id still changes under the denylist.
+    doc_id_residual = residual_doc_id_pii(corpus_dir, rescan_policy)
+    if doc_id_residual:
+        raise ScrubGateError(
+            "corpus claims scrubbed=True but the doc-id re-scan still finds "
+            f"{len(doc_id_residual)} PII-bearing doc-id(s) (name/email in the "
+            "filename/path survives despite scrubbed file text) — the doc-ids "
+            "are NOT actually scrubbed (X6, §5.1). Offending doc-id(s) (first 5): "
+            f"{doc_id_residual[:5]}"
         )
 
 
