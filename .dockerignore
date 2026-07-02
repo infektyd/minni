@@ -1,0 +1,25 @@
+# Keep the eval image build context small and free of local state.
+.git
+.github
+.githooks
+.claude
+.worktrees
+node_modules
+**/node_modules
+**/dist
+engine/.venv
+engine/venv
+**/__pycache__
+**/.pytest_cache
+**/.ruff_cache
+*.db
+*.sqlite*
+*.faiss
+*.log
+bench
+eval
+evidence
+assets
+docs
+plugins/minni/frontend
+openclaw-extension
