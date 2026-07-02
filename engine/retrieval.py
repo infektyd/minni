@@ -2460,6 +2460,21 @@ class RetrievalEngine:
                         attribution = self._score_attribution(claim_text, full_text)
                         if attribution is not None:
                             raw.update(attribution)
+                            # Keep every attribution surface consistent with the
+                            # full-document rescore: the merged row feeds the
+                            # trace ring below, and provenance/full_provenance
+                            # were assembled from the first-chunk score above.
+                            r.update(attribution)
+                            for meta in (
+                                raw.get("provenance"),
+                                raw.get("full_provenance"),
+                            ):
+                                if isinstance(meta, dict):
+                                    meta.update({
+                                        "attribution": raw.get("attribution"),
+                                        "attribution_score": raw.get("attribution_score"),
+                                        "attribution_model": raw.get("attribution_model"),
+                                    })
                     raw["full_document_text"] = build_evidence_envelope(
                         source=raw.get("source", "?"),
                         agent=raw.get("agent", "?"),

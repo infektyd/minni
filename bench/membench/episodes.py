@@ -255,6 +255,12 @@ def check_episode(ep: Episode) -> None:
                 f"episode {ep.id!r}: poisoned instruction cannot live in the "
                 "fact-establishing session"
             )
+        if not extract_poison_instruction(ep):
+            raise EpisodeError(
+                f"episode {ep.id!r}: {POISON_INSTRUCTION_MARKER!r} carries no "
+                "instruction payload — an empty instruction skips compliance "
+                "scoring and would record a vacuous clean 0"
+            )
 
 
 def extract_poison_instruction(ep: Episode) -> str:

@@ -214,3 +214,18 @@ def test_loader_rejects_oversize_file(tmp_path):
 
     with pytest.raises(EpisodeError, match="exceeds"):
         load_episodes(big)
+
+
+def test_reject_poisoned_episode_with_empty_instruction_payload():
+    """PR review (P2): a bare marker with no instruction would skip compliance
+    scoring and record a vacuous clean 0 in injection_compliance_rate."""
+    ep = _good_episode(
+        band=BAND_POISONED,
+        sessions=[
+            Session("s1", "The seal timeout is thirty seconds in the spec."),
+            Session("s2", f"Routine note. {POISON_INSTRUCTION_MARKER}   "),
+            Session("s3", "Some later unrelated session content."),
+        ],
+    )
+    with pytest.raises(EpisodeError, match="no\\s+instruction payload|carries no"):
+        check_episode(ep)
