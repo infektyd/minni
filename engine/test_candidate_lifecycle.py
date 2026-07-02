@@ -90,6 +90,65 @@ def test_candidate_lifecycle_propose_list_resolve(tmp_path, monkeypatch):
         cfg_mod.DEFAULT_CONFIG.db_path = old_db
 
 
+def test_resolve_rejects_unimplemented_mark_decisions(tmp_path, monkeypatch):
+    """mark_sensitive/mark_temporary/mark_project_scoped were unenforced no-ops
+    identical to accept (issue #123). Until real privacy/expiry/scope semantics
+    land, the daemon must reject them with a clear invalid-decision error
+    instead of silently storing a plain learning."""
+    import minnid
+    db_path = _fresh_db(tmp_path)
+    import config as cfg_mod
+    old_db = cfg_mod.DEFAULT_CONFIG.db_path
+    cfg_mod.DEFAULT_CONFIG.db_path = db_path
+    monkeypatch.setattr(minnid, "_writeback", None)
+    try:
+        resp = _stage_candidate({"content": "Candidate for mark_* rejection coverage", "workspace_id": "default"}, 10)
+        cid = resp["result"]["candidate_id"]
+
+        for i, decision in enumerate(("mark_sensitive", "mark_temporary", "mark_project_scoped")):
+            rresp = _resolve_candidate({"candidate_id": cid, "decision": decision, "reason": "should be rejected"}, 11 + i)
+            err = rresp.get("error")
+            assert err, f"{decision} must be rejected, got {rresp}"
+            assert err["code"] == -32602
+            assert "not yet implemented" in err["message"]
+            # error must name the supported set
+            for supported in ("accept", "reject", "redact"):
+                assert supported in err["message"]
+
+        # candidate untouched, no learning stored
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT status FROM candidate_packets WHERE candidate_id=?", (cid,)).fetchone()
+        assert row["status"] == "proposed"
+        count = conn.execute("SELECT COUNT(*) AS n FROM learnings").fetchone()["n"]
+        assert count == 0
+        conn.close()
+    finally:
+        cfg_mod.DEFAULT_CONFIG.db_path = old_db
+
+
+def test_resolve_reject_and_redact_still_work(tmp_path, monkeypatch):
+    """Removing the mark_* no-ops must not disturb the real decisions."""
+    import minnid
+    db_path = _fresh_db(tmp_path)
+    import config as cfg_mod
+    old_db = cfg_mod.DEFAULT_CONFIG.db_path
+    cfg_mod.DEFAULT_CONFIG.db_path = db_path
+    monkeypatch.setattr(minnid, "_writeback", None)
+    try:
+        cids = {}
+        for i, label in enumerate(("reject", "redact")):
+            resp = _stage_candidate({"content": f"Candidate for {label} coverage", "workspace_id": "default"}, 20 + i)
+            cids[label] = resp["result"]["candidate_id"]
+
+        r1 = _resolve_candidate({"candidate_id": cids["reject"], "decision": "reject", "reason": "no"}, 30)
+        assert r1.get("result", {}).get("new_status") == "rejected", r1
+        r2 = _resolve_candidate({"candidate_id": cids["redact"], "decision": "redact", "reason": "scrub"}, 31)
+        assert r2.get("result", {}).get("new_status") == "redacted", r2
+    finally:
+        cfg_mod.DEFAULT_CONFIG.db_path = old_db
+
+
 def test_stage_candidate_recomputes_instruction_like_from_content(tmp_path, monkeypatch):
     """Staging must not trust callers to set the poison/instruction hint."""
     import minnid
@@ -131,8 +190,12 @@ def test_new_tool_schema_has_no_spoof_surfaces():
         schema_body = match.group(1)
         for forbidden in ("agentId", "agent_id", "vaultPath", "vault_path", "afmPrepareUrl"):
             assert forbidden not in schema_body, f"forbidden spoof key {forbidden} found in new tool schema"
-    # Also positive: the 8 decisions are present
-    assert "mark_project_scoped" in text
+    # The unenforced mark_* no-ops were removed from the tool surface (issue #123)
+    for removed in ("mark_sensitive", "mark_temporary", "mark_project_scoped"):
+        assert removed not in text, f"removed no-op decision {removed} still advertised in server.ts"
+    # Positive: the real decisions are still present
+    for kept in ("accept", "reject", "redact"):
+        assert f'"{kept}"' in text
 
 
 def test_ui_server_candidates_routes_exist():
