@@ -46,9 +46,11 @@ the promote path doesn't act on it.
 **Evidence of the gap:** a live Grok session ID ("Current live Grok Build TUI session ID
 f6d63707…") was promoted as a **durable** learning — exactly what the new field is meant to catch.
 **Fix:** in the promote path (`engine/afm_writer.py::_write_one` / the durable-promote in
-`engine/minnid.py`), branch on `draft.durability`: route `temporary` to `mark_temporary`
-(candidate_packets already supports it) instead of `INSERT learnings`. Add a test: a draft marked
-`temporary` does NOT land in durable `learnings`.
+`engine/minnid.py`), branch on `draft.durability` and give `temporary` drafts a real TTL/expiry
+treatment instead of `INSERT learnings`. Note: the old `mark_temporary` resolve decision was an
+unenforced no-op (identical to accept) and has been removed from `resolve_candidate` — see
+issue #123; implementing genuine TTL semantics (schema + retrieval filter) is the prerequisite
+here. Add a test: a draft marked `temporary` does NOT land in durable `learnings`.
 **Done when:** ephemeral-classified drafts get a TTL/temporary treatment, not durable promotion.
 
 ## prepare-task observations (added 2026-06-04 from a live `minni_prepare_task` run)

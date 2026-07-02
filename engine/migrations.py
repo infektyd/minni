@@ -118,6 +118,8 @@ def _migration_present_in_schema(conn: sqlite3.Connection, version: int) -> bool
         )
     if version == 9:
         return _table_exists(conn, "contradiction_log")
+    if version == 14:
+        return _table_exists(conn, "consolidation_actions")
     return True
 
 

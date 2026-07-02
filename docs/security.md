@@ -24,11 +24,32 @@ means in code.
 
 ## Identity and capability gating
 
-Every durable write and cross-agent operation passes the server-stamped
-`EffectivePrincipal` gate — identity is resolved daemon-side, so a caller
-cannot claim capabilities it doesn't have. Candidate resolution is
+Every **daemon-mediated** durable write and cross-agent operation passes the
+server-stamped `EffectivePrincipal` gate — identity is resolved daemon-side,
+so a caller cannot claim capabilities it doesn't have. Candidate resolution is
 owner-or-explicit-operator; the `force=true` durable-learn escape is
 operator-only and audit-stamped (`FORCE_DURABLE_LEARN`).
+
+The gate is **not** universal, and it is honest to say so. Local vault-note
+and audit writes — `writeVaultPage`/`recordAudit` in
+`plugins/minni/src/vault.ts`, which back `minni_vault_write`, the vault-note
+half of `minni_learn`, `minni_recall`'s audit entry, the CLI `write` command,
+and all hook-side vault/audit/inbox writes — are local-first filesystem
+writes that never reach daemon dispatch and never pass this gate. Their
+safety derives from the schema-pinned write target (the operator-controlled
+agent id and vault path — SEC-003/G11/G12), not from the shared gate. See the
+[provenance-gate findings](implementation/minni-provenance-gate-ground-and-resolve-findings.md)
+for the grounded file-by-file split.
+
+Two consequences worth knowing when auditing the trust boundary:
+
+- **`gate.shared` is attribution, not authorization.** The daemon's
+  `gate.shared` handler resolves the caller principal and returns a stamped
+  envelope for provenance; it never performs (or blocks) the vault write
+  itself.
+- **Daemon-down behavior is asymmetric.** Gated tools (`plan.*`, `team.*`,
+  handoff, ping) fail closed — they no-op when the gate is unavailable —
+  while the ungated local-write tools above proceed and write the same vault.
 
 ## Memory-poisoning defenses
 
