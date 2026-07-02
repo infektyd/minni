@@ -278,6 +278,8 @@ def test_document_depth_never_ships_raw_instruction_text(tmp_path):
     assert full.startswith("<EVIDENCE"), "full_document_text must be enveloped"
     # The matched chunk may be clean — the flag must reflect the WHOLE document.
     assert hit.get("instruction_like") is True
+    # Routing metadata must match the recomputed flag (round 6, P2).
+    assert hit.get("recommended_action") == "escalate"
     serialized = json.dumps(results)
     assert injected not in serialized, (
         "raw injected text must never ship outside the perturbed envelope"

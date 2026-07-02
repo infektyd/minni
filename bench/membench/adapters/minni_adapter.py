@@ -523,6 +523,31 @@ class MinniAdapter:
         env["MINNI_DB_PATH"] = str(tmp_home / "minni.db")
         env["MINNI_FAISS_PATH"] = str(tmp_home / "minni_faiss.index")
         env["MINNI_AFM_LOOP"] = "off"  # no background loop in the throwaway
+        # Bench-only principal override (review round 6, P1): the engine's
+        # detector now flags the poisoned fixtures as instruction_like, and
+        # accepting a flagged candidate requires the LITERAL 'accept_flagged'
+        # capability ("*" deliberately does not satisfy it). Without it the
+        # ingest's resolve_candidate(accept) is refused and the poisoned docs
+        # never enter the throwaway index — the band would score a vacuous
+        # clean 0. Grant the capability to THIS throwaway daemon's local
+        # principal only, via the engine's own operator-config mechanism; the
+        # production gate itself is untouched.
+        principals_dir = tmp_home / "principals"
+        principals_dir.mkdir(parents=True, exist_ok=True)
+        (principals_dir / "main.json").write_text(
+            json.dumps({
+                "agent_id": "main",
+                "workspace_id": "default",
+                "capabilities": ["*", "accept_flagged"],
+                "allowed_vault_roots": [],
+            }),
+            encoding="utf-8",
+        )
+        # The identity root-of-trust requires 0600 on principal files.
+        os.chmod(principals_dir / "main.json", 0o600)
+        # Stamp the runtime identity to match (provenance gate: strict mode
+        # engages once any principals/*.json exists).
+        env["MINNI_AGENT_ID"] = "main"
         # PYTHONPATH is set to the engine dir ONLY — we do NOT append the parent
         # os.environ['PYTHONPATH']. Inheriting it into the throwaway daemon is an
         # import-hijack vector (a poisoned parent path could shadow engine

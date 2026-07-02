@@ -2456,6 +2456,12 @@ class RetrievalEngine:
                         is_instruction_like(full_text)
                     )
                     raw["instruction_like"] = doc_flag
+                    # recommended_action was computed from the chunk-level flag
+                    # above — recompute so routing metadata matches the flag the
+                    # full-document recheck just set (escalate, not cite).
+                    raw["recommended_action"] = _recommended_action(
+                        raw.get("review_state"), doc_flag, raw.get("confidence")
+                    )
                     if claim_text:
                         attribution = self._score_attribution(claim_text, full_text)
                         if attribution is not None:
