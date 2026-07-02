@@ -16,9 +16,24 @@ with an `operator_only` error.
 
 ## Delegating approval
 
-Human approval is the **default policy, not the architecture**. Who gets to
-resolve candidates is decided per principal, and the operator can delegate it.
-Three resolution paths exist, all landing in the same audit trail:
+Human approval is the **default policy, not the architecture**. Governance has
+two independent dials — **who initiates a learn** (stages the candidate) and
+**who approves it** (makes it durable) — and the operator sets each one.
+
+**Initiation.** By default the human drives: they invoke `/minni:learn` (or
+ask for it) and the agent stages the candidate. The plugin never auto-fires a
+learn from hooks — recall is automatic, writes are deliberate. But the human
+can hand the agent the initiative by allowing the `minni_learn` tool to run
+without per-call confirmation in their runtime's permission settings (e.g. the
+Claude Code permission allowlist). Then an agent that cracks a problem three
+hours into a session stages the learning on the spot instead of losing it
+because the human was AFK. This is safe to grant precisely because of
+proposal-first: an unprompted `learn` only ever creates a `proposed`
+candidate — quality-gated, audit-logged, invisible to recall until resolved.
+
+**Approval.** Who gets to resolve candidates is decided per principal, and the
+operator can delegate it. Three resolution paths exist, all landing in the
+same audit trail:
 
 1. **Manual (the default).** A human (or the local operator session) calls
    `resolve_candidate`. On a fresh install the anonymous local caller over the
