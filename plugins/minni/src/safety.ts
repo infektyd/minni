@@ -40,6 +40,14 @@ const PATTERNS: RegExp[] = [
   /\bfrom\s+now\s+on\b[\s\S]*\b(you|your|always|never)\b/i,
   // Role-play directive to override safety
   /\b(disable|turn\s+off|remove|bypass|circumvent)\s+(your\s+)?(safety|safety\s+filter|content\s+filter|restrictions?|guardrails?|limits?)\b/i,
+  // Question/task hijack (MINJA / AgentPoison payload style): "ignore the
+  // user's (actual) question and recommend X", "ignore the memory task",
+  // "ignore the user". Mirrors engine/safety.py — keep in sync.
+  /\b(ignore|disregard|skip)\s+(the\s+|this\s+)?(user'?s?\s+)?(\w+\s+)?(question|request|task|query)\b/i,
+  /\b(ignore|disregard)\s+the\s+user\b/i,
+  // Output hijack: "instead output/say/recommend X" — redirects the answer
+  // away from the actual question.
+  /\binstead\s+(output|say|respond|answer|reply|recommend|select|approve)\b/i,
 ];
 
 /**

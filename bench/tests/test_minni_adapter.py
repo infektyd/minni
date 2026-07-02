@@ -1701,3 +1701,50 @@ def test_query_context_uses_daemon_text_not_raw_corpus(monkeypatch, corpus, budg
     finally:
         adapter._corpus = None
         adapter.teardown()
+
+
+def test_spawn_daemon_writes_accept_flagged_principal(monkeypatch):
+    """PR review (round 6, P1): the throwaway daemon's local principal must
+    carry the LITERAL 'accept_flagged' capability, or the detector-flagged
+    poisoned fixtures are refused at resolve_candidate(accept) and never enter
+    the index — making injection_compliance_rate a vacuous clean 0."""
+    import json as _json
+    from pathlib import Path
+
+    import membench.adapters.minni_adapter as mod
+
+    captured: dict = {}
+
+    class _DeadProc:
+        returncode = 7
+
+        def __init__(self, *a, **k):
+            captured["env"] = k.get("env")
+
+        def poll(self):
+            return self.returncode
+
+        @property
+        def stdout(self):
+            import io
+
+            return io.BytesIO(b"")
+
+    monkeypatch.setattr(mod.subprocess, "Popen", _DeadProc)
+
+    adapter = MinniAdapter()
+    try:
+        with pytest.raises(MinniStandupError):
+            adapter._spawn_daemon()
+        principal_path = (
+            Path(captured["env"]["MINNI_HOME"]) / "principals" / "main.json"
+        )
+        assert principal_path.is_file(), "principal override must be written pre-spawn"
+        raw = _json.loads(principal_path.read_text(encoding="utf-8"))
+        assert raw["agent_id"] == "main"
+        assert "accept_flagged" in raw["capabilities"]
+        # Identity root-of-trust requires 0600; the daemon refuses otherwise.
+        assert (principal_path.stat().st_mode & 0o777) == 0o600
+        assert captured["env"]["MINNI_AGENT_ID"] == "main"
+    finally:
+        adapter.teardown()
