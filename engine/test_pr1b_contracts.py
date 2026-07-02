@@ -203,7 +203,7 @@ class TestDepthTiers:
         calls = []
 
         class FakeEngine:
-            def expand_result(self, result_id, depth="chunk", principal=None, workspace=None):
+            def expand_result(self, result_id, depth="chunk", principal=None, workspace=None, claim=None):
                 calls.append((result_id, depth, getattr(principal, "agent_id", None), workspace))
                 return {"doc_id": result_id, "chunk_id": result_id * 10, "depth": depth}
 

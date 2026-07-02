@@ -60,6 +60,8 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from safety import is_instruction_like
+
 # Canonical, agent-neutral format tag for stop-candidate inbox files. The
 # legacy codex-prefixed tag is still accepted for files written before the
 # hooks were neutralized. `kind` identifies the FILE FORMAT, never the author —
@@ -318,7 +320,7 @@ def ingest(db, config, inboxes: Optional[List[Path]] = None,
                         r["content"],
                         json.dumps([]),
                         derived_from,
-                        0,
+                        1 if is_instruction_like(r["content"]) else 0,
                         r["proposed_at"],
                     ),
                 )

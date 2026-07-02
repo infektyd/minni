@@ -204,7 +204,7 @@ def test_sm_drill_threads_principal_to_expand_result(monkeypatch):
     calls = []
 
     class FakeEngine:
-        def expand_result(self, *, result_id, depth, principal=None, workspace=None):
+        def expand_result(self, *, result_id, depth, principal=None, workspace=None, claim=None):
             calls.append({"principal": principal, "workspace": workspace})
             return {"doc_id": result_id, "chunk_text": "ok"}
 
@@ -215,3 +215,80 @@ def test_sm_drill_threads_principal_to_expand_result(monkeypatch):
 
     assert "error" not in resp
     assert calls == [{"principal": principal, "workspace": "default"}]
+
+
+def test_search_threads_claim_to_retrieve(monkeypatch):
+    import minnid
+
+    principal = EffectivePrincipal(
+        agent_id="codex",
+        capabilities=["search", "read"],
+        allowed_vault_roots=["/tmp/codex-vault"],
+    )
+    calls = []
+
+    class FakeEngine:
+        last_trace_id = "trace-search"
+
+        def retrieve(self, **kwargs):
+            calls.append(kwargs)
+            return []
+
+        def search_learnings(self, *_args, **_kwargs):
+            return []
+
+    monkeypatch.setattr(minnid, "resolve_effective_principal", lambda **_kw: principal)
+    monkeypatch.setattr(minnid, "_lazy_retrieval", lambda: FakeEngine())
+    monkeypatch.setattr(minnid, "_agent_vault_retrieval", lambda _agent_id: None)
+
+    resp = minnid._handle_search(
+        {
+            "agent_id": "codex",
+            "query": "Paris location",
+            "claim": "Paris is in France.",
+            "scope": "personal",
+        },
+        "r-search",
+    )
+
+    assert "error" not in resp
+    assert calls
+    assert all(call["claim"] == "Paris is in France." for call in calls)
+
+
+def test_sm_drill_threads_claim_to_expand_result(monkeypatch):
+    import minnid
+
+    principal = EffectivePrincipal(
+        agent_id="codex",
+        capabilities=["search", "read"],
+        allowed_vault_roots=["/tmp/codex-vault"],
+    )
+    calls = []
+
+    class FakeEngine:
+        def expand_result(self, *, result_id, depth, principal=None, workspace=None, claim=None):
+            calls.append({"principal": principal, "workspace": workspace, "claim": claim})
+            return {"doc_id": result_id, "chunk_text": "ok"}
+
+    monkeypatch.setattr(minnid, "resolve_effective_principal", lambda **_kw: principal)
+    monkeypatch.setattr(minnid, "_lazy_retrieval", lambda: FakeEngine())
+
+    resp = minnid._handle_sm_drill(
+        {
+            "agent_id": "codex",
+            "chunk_ids": [42],
+            "depth": "snippet",
+            "claim": "This result supports the user claim.",
+        },
+        "r-drill",
+    )
+
+    assert "error" not in resp
+    assert calls == [
+        {
+            "principal": principal,
+            "workspace": "default",
+            "claim": "This result supports the user claim.",
+        }
+    ]

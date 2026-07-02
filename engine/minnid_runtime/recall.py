@@ -184,6 +184,7 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
     end_date = params.get("end_date")
     expand = params.get("expand", True)
     summarize_neighborhood = bool(params.get("summarize_neighborhood", False))
+    claim = str(params.get("claim", "")).strip() or None
 
     if depth == "auto":
         depth = "snippet"
@@ -212,6 +213,7 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
                 expand=expand,
                 summarize_neighborhood=summarize_neighborhood,
                 cross_agent=learnings_cross_agent,
+                claim=claim,
                 principal=principal_for_documents,
                 workspace=(
                     principal_for_documents.workspace_id
@@ -392,6 +394,47 @@ def handle_trace(params: dict, request_id: Any, context: RecallContext) -> dict:
         }, request_id)
 
 
+def _attribution_trace_items(results: list) -> list:
+    items = []
+    for result in results:
+        if not isinstance(result, dict):
+            continue
+        if result.get("attribution_score") is None:
+            continue
+        items.append({
+            "doc_id": result.get("doc_id"),
+            "chunk_id": result.get("chunk_id"),
+            "attribution": result.get("attribution"),
+            "score": result.get("attribution_score"),
+        })
+    return items
+
+
+def record_attribution_trace(
+    *,
+    context: RecallContext,
+    operation: str,
+    claim: Optional[str],
+    results: list,
+) -> Optional[str]:
+    claim_text = str(claim or "").strip()
+    if not claim_text:
+        return None
+    items = _attribution_trace_items(results)
+    if not items:
+        return None
+    try:
+        return context.trace_ring().add({
+            "operation": operation,
+            "claim": claim_text,
+            "attribution_scores": items,
+            "timing": {},
+        })
+    except Exception as exc:
+        context.logger.debug("%s attribution trace capture failed: %s", operation, exc)
+        return None
+
+
 def handle_expand(params: dict, request_id: Any, context: RecallContext) -> dict:
     """Re-fetch a specific result at a deeper depth tier."""
     if context.increment_request_count is not None:
@@ -407,6 +450,7 @@ def handle_expand(params: dict, request_id: Any, context: RecallContext) -> dict
         return context.make_error(-32602, "result_id must be an integer", request_id)
 
     depth = str(params.get("depth", "chunk"))
+    claim = str(params.get("claim", "")).strip() or None
 
     principal, err = context.handler_principal(params, request_id)
     if err:
@@ -419,9 +463,18 @@ def handle_expand(params: dict, request_id: Any, context: RecallContext) -> dict
             depth=depth,
             principal=principal,
             workspace=principal.workspace_id,
+            claim=claim,
         )
         if result is None:
             return context.make_error(-32000, f"No result found for result_id={result_id}", request_id)
+        trace_id = record_attribution_trace(
+            context=context,
+            operation="expand",
+            claim=claim,
+            results=[result],
+        )
+        if trace_id is not None:
+            result["trace_id"] = trace_id
         return context.make_response({
             "result_id": result_id,
             "depth": depth,
@@ -471,6 +524,9 @@ def score_components(reference: dict, result: dict) -> dict:
         "rrf_score": pick("rrf_score"),
         "cross_encoder_score": pick("cross_encoder_score", "rerank_score"),
         "decay_factor": pick("decay_factor", "decay_score"),
+        "attribution": pick("attribution"),
+        "attribution_score": pick("attribution_score"),
+        "attribution_model": pick("attribution_model"),
         "backend": pick("backend"),
     }
 
@@ -484,7 +540,10 @@ def full_provenance(
     reference: dict,
     result: dict,
 ) -> dict:
+    existing = result.get("full_provenance")
+    base = existing if isinstance(existing, dict) else {}
     return {
+        **base,
         "owning_agent_id": source_agent,
         "document_agent": result.get("agent"),
         "source_vault": source_vault,
@@ -616,6 +675,7 @@ def expand_reference(
     agent_id: Optional[str],
     shared_engine,
     context: RecallContext,
+    claim: Optional[str] = None,
 ) -> Optional[dict]:
     for retrieval_engine, source_agent, source_vault, index_db_path, principal_for_documents in reference_candidates(
         reference,
@@ -634,6 +694,7 @@ def expand_reference(
                     if principal_for_documents is not None
                     else "default"
                 ),
+                claim=claim,
             )
             if result is None or not reference_matches(result, reference):
                 continue
@@ -678,6 +739,7 @@ def handle_sm_drill(params: dict, request_id: Any, context: RecallContext) -> di
     depth = str(params.get("depth", "snippet"))
     if depth not in {"snippet", "chunk", "document"}:
         return context.make_error(-32602, "depth must be snippet, chunk, or document", request_id)
+    claim = str(params.get("claim", "")).strip() or None
 
     principal, err = context.handler_principal(params, request_id)
     if err:
@@ -715,6 +777,7 @@ def handle_sm_drill(params: dict, request_id: Any, context: RecallContext) -> di
                 workspace=(
                     principal.workspace_id if principal is not None else "default"
                 ),
+                claim=claim,
             )
             if result is None:
                 missing.append(result_id)
@@ -728,11 +791,22 @@ def handle_sm_drill(params: dict, request_id: Any, context: RecallContext) -> di
                 agent_id=agent_id,
                 shared_engine=engine,
                 context=context,
+                claim=claim,
             )
             if result is None:
                 missing.append(reference.get("doc_id") or reference.get("chunk_id") or reference.get("source") or index)
             else:
                 results.append(result)
+        trace_id = record_attribution_trace(
+            context=context,
+            operation="sm_drill",
+            claim=claim,
+            results=results,
+        )
+        if trace_id is not None:
+            for result in results:
+                if isinstance(result, dict) and result.get("attribution_score") is not None:
+                    result["trace_id"] = trace_id
         return context.make_response({
             "depth": depth,
             "count": len(results),

@@ -80,6 +80,22 @@ _PATTERNS: List[re.Pattern] = [
         r"(your\s+)?(safety|safety\s+filter|content\s+filter|restrictions?|guardrails?|limits?)\b",
         re.IGNORECASE,
     ),
+    # Question/task hijack (MINJA / AgentPoison payload style): "ignore the
+    # user's (actual) question and recommend X", "ignore the memory task",
+    # "ignore the user". One optional intervening word covers "the memory
+    # task" / "the original query". FPs are acceptable by contract.
+    re.compile(
+        r"\b(ignore|disregard|skip)\s+(the\s+|this\s+)?(user'?s?\s+)?"
+        r"(\w+\s+)?(question|request|task|query)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\b(ignore|disregard)\s+the\s+user\b", re.IGNORECASE),
+    # Output hijack: "instead output/say/recommend X" — redirects the answer
+    # away from the actual question.
+    re.compile(
+        r"\binstead\s+(output|say|respond|answer|reply|recommend|select|approve)\b",
+        re.IGNORECASE,
+    ),
 ]
 
 

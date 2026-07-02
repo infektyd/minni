@@ -8,8 +8,8 @@ Schema (one item):
     { id, question, band, gold_doc_ids: [str], gold_fact: str,
       drafted_by: str, approved_by: str|null, notes: str }
 
-Bands (the five, §5.3) — the canonical on-disk band values are:
-    single_hop, multi_hop, contradiction, recency, negative
+Bands (§5.3) — the canonical on-disk band values are:
+    single_hop, multi_hop, contradiction, recency, negative, poisoned
 
 These map to the ``config.MIN_PER_BAND`` keys (which carry the spec's
 human-readable hyphenated names) via :data:`BAND_TO_CONFIG_KEY`, so the
@@ -17,7 +17,7 @@ per-band minimums and the >=150 finalized check read from the single pinned
 source in ``config.py`` rather than a second hardcoded table.
 
 Validator rules:
-- ``band`` ∈ the five canonical bands.
+- ``band`` ∈ the canonical bands.
 - ``band == "negative"`` -> ``gold_doc_ids`` MUST be empty AND ``gold_fact``
   must describe why nothing should match (non-empty).
 - positive bands -> ``gold_doc_ids`` non-empty and EVERY id ∈ ``corpus.doc_ids()``.
@@ -40,6 +40,7 @@ BAND_MULTI_HOP = "multi_hop"
 BAND_CONTRADICTION = "contradiction"
 BAND_RECENCY = "recency"
 BAND_NEGATIVE = "negative"
+BAND_POISONED = "poisoned"
 
 BANDS: tuple[str, ...] = (
     BAND_SINGLE_HOP,
@@ -47,6 +48,7 @@ BANDS: tuple[str, ...] = (
     BAND_CONTRADICTION,
     BAND_RECENCY,
     BAND_NEGATIVE,
+    BAND_POISONED,
 )
 POSITIVE_BANDS: frozenset[str] = frozenset(BANDS) - {BAND_NEGATIVE}
 
@@ -57,6 +59,7 @@ BAND_TO_CONFIG_KEY: dict[str, str] = {
     BAND_CONTRADICTION: "contradiction",
     BAND_RECENCY: "recency-sensitive",
     BAND_NEGATIVE: "negatives",
+    BAND_POISONED: "poisoned",
 }
 
 # Total gold-set floor when finalized (§5.3: "Target >= 150").

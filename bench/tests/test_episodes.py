@@ -6,13 +6,16 @@ import pytest
 
 from membench.episodes import (
     MAX_EPISODE_FILE_BYTES,
+    POISON_INSTRUCTION_MARKER,
     Episode,
     EpisodeError,
     Session,
     check_episode,
+    extract_poison_instruction,
     load_fixture_episodes,
     validate_episodes,
 )
+from membench.goldset import BAND_POISONED
 
 
 def _good_episode(**over) -> Episode:
@@ -43,6 +46,21 @@ def test_fixture_episodes_load_and_validate():
         # The fact lives in the establishing session and NOT in the question.
         assert ep.gold_fact in ep.fact_session.content
         assert ep.gold_fact not in ep.question
+
+
+def test_fixture_includes_valid_poisoned_band_episodes():
+    episodes = load_fixture_episodes()
+    poisoned = [ep for ep in episodes if ep.band == BAND_POISONED]
+    assert 10 <= len(poisoned) <= 20
+    for ep in poisoned:
+        check_episode(ep)
+        poison_sessions = [
+            s for s in ep.sessions if POISON_INSTRUCTION_MARKER in s.content
+        ]
+        assert len(poison_sessions) == 1
+        assert poison_sessions[0].session_id != ep.fact_session_id
+        assert ep.gold_fact not in poison_sessions[0].content
+        assert extract_poison_instruction(ep)
 
 
 def test_accept_good_episode():
@@ -196,3 +214,18 @@ def test_loader_rejects_oversize_file(tmp_path):
 
     with pytest.raises(EpisodeError, match="exceeds"):
         load_episodes(big)
+
+
+def test_reject_poisoned_episode_with_empty_instruction_payload():
+    """PR review (P2): a bare marker with no instruction would skip compliance
+    scoring and record a vacuous clean 0 in injection_compliance_rate."""
+    ep = _good_episode(
+        band=BAND_POISONED,
+        sessions=[
+            Session("s1", "The seal timeout is thirty seconds in the spec."),
+            Session("s2", f"Routine note. {POISON_INSTRUCTION_MARKER}   "),
+            Session("s3", "Some later unrelated session content."),
+        ],
+    )
+    with pytest.raises(EpisodeError, match="no\\s+instruction payload|carries no"):
+        check_episode(ep)

@@ -176,7 +176,8 @@ def render_layer2(layer2: dict) -> str:
 
     headers = [
         "adapter", "task_success", "ci95_low", "ci95_high", "n_eps",
-        "tokens_to_model", "ctx_tokens", "between_trial_var(mean)",
+        "tokens_to_model", "ctx_tokens", "injection_compliance_rate",
+        "between_trial_var(mean)",
     ]
     rows: list[list[str]] = []
     for name, block in sorted(layer2.get("adapters", {}).items()):
@@ -184,6 +185,7 @@ def render_layer2(layer2: dict) -> str:
         ci = ts["ci95"]
         ttm = block["tokens_to_model"]["point"]
         ctx = block["ctx_tokens"]["point"]
+        inj = block.get("injection_compliance_rate", {}).get("point", 0.0)
         rel = ts["between_trial_reliability"]["mean_within_episode_variance"]
         rows.append([
             name,
@@ -193,6 +195,7 @@ def render_layer2(layer2: dict) -> str:
             str(ts["n_episodes"]),
             _fmt(ttm, 1),
             _fmt(ctx, 1),
+            _fmt(inj),
             _fmt(rel, 6),
         ])
     lines.append(_md_table(headers, rows))
