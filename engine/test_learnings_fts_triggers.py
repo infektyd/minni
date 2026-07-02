@@ -163,3 +163,79 @@ def test_search_learnings_or_fallback_survives_operator_tokens(tmp_path):
         "production OR staging deploy gate ordering", agent_id="main"
     )
     assert [r["learning_id"] for r in results] == [lid]
+
+
+def test_search_learnings_or_fallback_ranks_answer_above_shared_term_decoys(tmp_path):
+    """bm25 precision under the OR fallback on a corpus with heavy term overlap.
+
+    Many learnings share common terms ("protocol", "seal", "phase") with the
+    question; only one answers it. The OR fallback must still rank the
+    answering learning first — bm25 weights the hit that matches more (and
+    rarer) query terms above decoys brushing a single common term.
+    """
+    from retrieval import RetrievalEngine
+
+    db_obj, cfg = _make_db(tmp_path)
+    engine = RetrievalEngine(db_obj, cfg, faiss_index=object())
+
+    decoys = [
+        "The transfer protocol docs moved to the wiki last sprint.",
+        "Seal the deployment ticket before the retro meeting.",
+        "Phase two of the migration starts after the freeze window.",
+        "The hard drive on the build box was replaced on Tuesday.",
+        "Timeout budgets for the ingest workers are tracked in the runbook.",
+        "The protocol review board meets on the first Monday of the month.",
+    ]
+    with db_obj.cursor() as c:
+        for content in decoys:
+            c.execute(
+                "INSERT INTO learnings (agent_id, category, content, confidence, created_at)"
+                " VALUES (?, ?, ?, ?, ?)",
+                ("main", "general", content, 1.0, 1000.0),
+            )
+        c.execute(
+            "INSERT INTO learnings (agent_id, category, content, confidence, created_at)"
+            " VALUES (?, ?, ?, ?, ?)",
+            (
+                "main",
+                "general",
+                "The Aurora Protocol seal phase has a hard timeout of thirty seconds.",
+                1.0,
+                1000.0,
+            ),
+        )
+        answer_lid = c.lastrowid
+
+    results = engine.search_learnings(
+        "What is the hard timeout of the Aurora Protocol seal phase?",
+        agent_id="main",
+    )
+    assert results, "OR fallback returned nothing on a shared-term corpus"
+    assert results[0]["learning_id"] == answer_lid, (
+        f"bm25 must rank the answering learning first, got: {results[0]['content']!r}"
+    )
+
+
+def test_search_learnings_fallback_survives_fts_syntax_characters(tmp_path):
+    """FTS5 syntax in the raw query (*, :, quotes, -, ^, parens) must not make
+    either the strict pass or the OR fallback raise — _sanitize_fts_query
+    strips all non-word characters before terms are joined."""
+    from retrieval import RetrievalEngine
+
+    db_obj, cfg = _make_db(tmp_path)
+    engine = RetrievalEngine(db_obj, cfg, faiss_index=object())
+
+    with db_obj.cursor() as c:
+        c.execute(
+            "INSERT INTO learnings (agent_id, category, content, confidence, created_at)"
+            " VALUES (?, ?, ?, ?, ?)",
+            ("main", "general", "the caret module exports a quoted prefix helper", 1.0, 1000.0),
+        )
+        lid = c.lastrowid
+
+    results = engine.search_learnings(
+        'caret:* "quoted phrase" -prefix ^helper NEAR(module export)',
+        agent_id="main",
+    )
+    assert results, "syntax-heavy query matched nothing through the fallback"
+    assert results[0]["learning_id"] == lid
