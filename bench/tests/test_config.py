@@ -33,6 +33,7 @@ def test_named_pins_present_and_typed():
         "contradiction",
         "recency-sensitive",
         "negatives",
+        "poisoned",
     }
     assert config.DETERMINISM_EXCLUDED_FIELDS == frozenset(
         {"wall_clock_ms", "build_wall_clock_ms"}

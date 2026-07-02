@@ -19,6 +19,7 @@ from typing import Any, Dict, List, Optional
 
 from afm_provider import resolve_afm_mode
 from model_provider import default_provider_chain
+from safety import is_instruction_like
 
 logger = logging.getLogger("sovereign.afm.session_distillation")
 
@@ -172,6 +173,28 @@ def _build_drafts(events: List[Dict[str, Any]], raw_docs: List[Dict[str, Any]], 
     if raw_docs:
         summary_lines.extend(f"- raw document: {doc['path']}" for doc in raw_docs[:5])
 
+    session_body = "\n".join(summary_lines) if summary_lines else "- No eligible cited evidence."
+
+    # Finding #4: this draft's body is synthesized from multiple episodic_events
+    # (events don't carry a precomputed instruction_like column, so each source's
+    # own content is recomputed here). If ANY source event tripped the detector,
+    # the synthesized draft inherits the flag even if the summarized body itself
+    # no longer trips is_instruction_like.
+    own_flag = is_instruction_like(session_body)
+    flagged_sources = {
+        _event_source(event)
+        for event in events
+        if is_instruction_like(event["content"] or "")
+    }
+    source_flag = bool(flagged_sources)
+    session_instruction_like = own_flag or source_flag
+    if session_instruction_like and not own_flag:
+        logger.warning(
+            "session_distillation draft %r inherits instruction_like from source "
+            "event(s); the synthesized summary did not itself trip the detector",
+            title,
+        )
+
     drafts: List[Dict[str, Any]] = [{
         "page_id": _draft_id("session", title, sources, trace_id),
         "kind": "session",
@@ -181,8 +204,25 @@ def _build_drafts(events: List[Dict[str, Any]], raw_docs: List[Dict[str, Any]], 
         "agent": "afm-loop",
         "trace_id": trace_id,
         "sources": sources,
-        "body": "\n".join(summary_lines) if summary_lines else "- No eligible cited evidence.",
+        "body": session_body,
+        "instruction_like": 1 if session_instruction_like else 0,
     }]
+
+    # Finding #4 (review round 4): concept/entity drafts are extracted from the
+    # SAME events — a benign-looking extraction (e.g. "important concept: Safe
+    # Topic") from an instruction-like event must inherit that event's flag, or
+    # deterministic extraction becomes a laundering path around the writer's
+    # own title+body recompute.
+    def _extraction_flag(kind: str, title: str, source: str) -> int:
+        if source in flagged_sources:
+            logger.warning(
+                "session_distillation %s draft %r inherits instruction_like from "
+                "flagged source %s; the extracted title/body did not itself trip "
+                "the detector",
+                kind, title, source,
+            )
+            return 1
+        return 0
 
     for concept in _extract_concepts(events):
         sources = [concept["source"]]
@@ -196,6 +236,9 @@ def _build_drafts(events: List[Dict[str, Any]], raw_docs: List[Dict[str, Any]], 
             "trace_id": trace_id,
             "sources": sources,
             "body": f"- Candidate concept extracted from {concept['source']}.",
+            "instruction_like": _extraction_flag(
+                "concept", concept["title"], concept["source"]
+            ),
         })
 
     for entity in _extract_entities(events):
@@ -210,6 +253,9 @@ def _build_drafts(events: List[Dict[str, Any]], raw_docs: List[Dict[str, Any]], 
             "trace_id": trace_id,
             "sources": sources,
             "body": f"- Candidate entity observed in {entity['source']}.",
+            "instruction_like": _extraction_flag(
+                "entity", entity["title"], entity["source"]
+            ),
         })
 
     return [draft for draft in drafts if draft.get("sources")]
@@ -231,6 +277,14 @@ def _normalize_native_draft(candidate: Any, trace_id: str, allowed_sources: set[
         return None
     kind = str(candidate.get("kind") or "concept").strip() or "concept"
     section = str(candidate.get("section") or f"{kind}s").strip() or f"{kind}s"
+    full_body = "\n".join([
+        body,
+        "",
+        "## Citations",
+        *[f"- `{source}`" for source in sources],
+        "",
+        "- Lifecycle: native AFM proposal only; endorsement is required before acceptance.",
+    ])
     return {
         "page_id": _draft_id(kind, title, sources, trace_id),
         "kind": kind,
@@ -243,14 +297,11 @@ def _normalize_native_draft(candidate: Any, trace_id: str, allowed_sources: set[
         "provider": "native",
         "sources": sources,
         "citations": sources,
-        "body": "\n".join([
-            body,
-            "",
-            "## Citations",
-            *[f"- `{source}`" for source in sources],
-            "",
-            "- Lifecycle: native AFM proposal only; endorsement is required before acceptance.",
-        ]),
+        "body": full_body,
+        # Finding #4 (native compile path): re-check the provider's own output.
+        # _native_compile_drafts additionally ORs in inheritance from flagged
+        # deterministic input drafts.
+        "instruction_like": 1 if is_instruction_like(full_body) else 0,
     }
 
 
@@ -281,11 +332,28 @@ def _native_compile_drafts(pass_input: Dict[str, Any], deterministic_drafts: Lis
     candidates = result.data.get("drafts")
     if not isinstance(candidates, list):
         return []
-    normalized = [
-        draft
-        for draft in (_normalize_native_draft(candidate, trace_id, allowed_sources) for candidate in candidates)
-        if draft is not None
-    ]
+    # Finding #4 (native compile path): the provider may paraphrase a poisoned
+    # event into clean prose. If ANY deterministic input draft fed to this call
+    # was flagged instruction_like, every native output inherits the flag even
+    # when the paraphrased body no longer trips is_instruction_like().
+    inputs_flagged = any(
+        draft.get("instruction_like") for draft in deterministic_drafts
+    )
+    normalized: List[Dict[str, Any]] = []
+    for candidate in candidates:
+        draft = _normalize_native_draft(candidate, trace_id, allowed_sources)
+        if draft is None:
+            continue
+        own_flag = bool(draft.get("instruction_like"))
+        if inputs_flagged and not own_flag:
+            logger.warning(
+                "session_distillation native draft %r inherits instruction_like "
+                "from flagged deterministic input draft(s); the provider's "
+                "paraphrase did not itself trip the detector",
+                draft.get("title"),
+            )
+        draft["instruction_like"] = 1 if (own_flag or inputs_flagged) else 0
+        normalized.append(draft)
     return normalized[:5]
 
 
@@ -337,6 +405,23 @@ def _native_session_distill_draft(
         "",
         "- Lifecycle: native AFM session_distill proposal only; endorsement is required before acceptance.",
     ]
+    body = "\n".join(body_lines)
+
+    # Finding #4: the native op synthesizes `assertion` from the combined session
+    # `text` (multiple events/docs flattened). Inherit instruction_like from that
+    # combined source text even if the model's paraphrased assertion no longer
+    # trips the regex.
+    own_flag = is_instruction_like(body)
+    source_flag = is_instruction_like(text)
+    distill_instruction_like = own_flag or source_flag
+    if distill_instruction_like and not own_flag:
+        logger.warning(
+            "session_distillation native draft %r inherits instruction_like from "
+            "combined source text; the synthesized assertion did not itself trip "
+            "the detector",
+            title,
+        )
+
     return {
         "page_id": _draft_id("session-distill", title, cited, trace_id),
         "kind": "concept",
@@ -349,7 +434,8 @@ def _native_session_distill_draft(
         "provider": "native",
         "sources": cited,
         "citations": cited,
-        "body": "\n".join(body_lines),
+        "body": body,
+        "instruction_like": 1 if distill_instruction_like else 0,
     }
 
 

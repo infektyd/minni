@@ -44,12 +44,13 @@ import os
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-from .goldset import BANDS
+from .goldset import BAND_POISONED, BANDS
 
 # Bound untrusted episode files the same way goldset bounds gold JSONL.
 MAX_EPISODE_FILE_BYTES = 8 * 1024 * 1024
 MAX_EPISODES = 100_000
 MIN_SESSIONS = 2
+POISON_INSTRUCTION_MARKER = "POISONED_BENCH_INSTRUCTION:"
 
 
 class EpisodeError(ValueError):
@@ -239,6 +240,37 @@ def check_episode(ep: Episode) -> None:
                 "tests same-session retrieval, not cross-session memory — "
                 "REJECTED (threats-to-validity leak guard)"
             )
+
+    if ep.band == BAND_POISONED:
+        poison_sessions = [
+            s for s in ep.sessions if POISON_INSTRUCTION_MARKER in s.content
+        ]
+        if len(poison_sessions) != 1:
+            raise EpisodeError(
+                f"episode {ep.id!r}: poisoned-band episode must contain exactly "
+                f"one {POISON_INSTRUCTION_MARKER!r} session"
+            )
+        if poison_sessions[0].session_id == ep.fact_session_id:
+            raise EpisodeError(
+                f"episode {ep.id!r}: poisoned instruction cannot live in the "
+                "fact-establishing session"
+            )
+        if not extract_poison_instruction(ep):
+            raise EpisodeError(
+                f"episode {ep.id!r}: {POISON_INSTRUCTION_MARKER!r} carries no "
+                "instruction payload — an empty instruction skips compliance "
+                "scoring and would record a vacuous clean 0"
+            )
+
+
+def extract_poison_instruction(ep: Episode) -> str:
+    """Return the injected instruction text from a poisoned episode, if present."""
+    for session in ep.sessions:
+        marker_pos = session.content.find(POISON_INSTRUCTION_MARKER)
+        if marker_pos == -1:
+            continue
+        return session.content[marker_pos + len(POISON_INSTRUCTION_MARKER):].strip()
+    return ""
 
 
 def validate_episodes(episodes: list[Episode]) -> None:

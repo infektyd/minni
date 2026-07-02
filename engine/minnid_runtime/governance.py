@@ -9,12 +9,14 @@ from typing import Any, Callable, Optional
 
 from db import SovereignDB
 from principal import EffectivePrincipal, is_operator_principal, validate_agent_id
+from safety import is_instruction_like
 
 
 logger = logging.getLogger("minnid")
 
 MAX_LEARN_CHARS = 64 * 1024
 MAX_LEARN_FIELD_CHARS = 4 * 1024
+ACCEPT_FLAGGED_CAPABILITY = "accept_flagged"
 
 
 @dataclass(frozen=True)
@@ -527,12 +529,13 @@ def stage_candidate(params: dict, request_id: Any, context: GovernanceContext) -
     content = (params.get("content") or params.get("text") or "").strip()
     if not content:
         return context.make_error(-32602, "content is required", request_id)
+    stored_content = content[:200000]
 
     now = time.time()
     ws = params.get("workspace_id") or "default"
     ev = json.dumps(params.get("evidence_refs") or params.get("evidence_doc_ids") or [])
     df = json.dumps(params.get("derived_from") or {})
-    instr = 1 if params.get("instruction_like") else 0
+    instr = 1 if (params.get("instruction_like") or is_instruction_like(stored_content)) else 0
 
     try:
         db = context.lazy_writeback().db
@@ -549,7 +552,7 @@ def stage_candidate(params: dict, request_id: Any, context: GovernanceContext) -
                     ws,
                     params.get("layer"),
                     params.get("privacy_level"),
-                    content[:200000],
+                    stored_content,
                     ev,
                     df,
                     instr,
@@ -655,6 +658,11 @@ def explicitly_allowed_operator(principal: EffectivePrincipal) -> bool:
     return principal.agent_id in allow
 
 
+def explicitly_allowed_accept_flagged(principal: EffectivePrincipal) -> bool:
+    """TRUE only for a literal operator-authored poisoned-candidate override."""
+    return ACCEPT_FLAGGED_CAPABILITY in (principal.capabilities or [])
+
+
 def resolve_candidate(params: dict, request_id: Any, context: GovernanceContext) -> dict:
     """G15: Resolve a candidate (accept→durable learn, reject/redact etc).
 
@@ -749,6 +757,27 @@ def resolve_candidate(params: dict, request_id: Any, context: GovernanceContext)
                     request_id,
                 ))
 
+            content = str(rowd["content"] or "")
+            stored_instruction_like = bool(int(rowd["instruction_like"] or 0))
+            computed_instruction_like = stored_instruction_like or is_instruction_like(content)
+            if computed_instruction_like and not stored_instruction_like:
+                c.execute(
+                    "UPDATE candidate_packets SET instruction_like=1 WHERE candidate_id=?",
+                    (cid,),
+                )
+
+            if (
+                new_status == "accepted"
+                and computed_instruction_like
+                and not explicitly_allowed_accept_flagged(principal)
+            ):
+                return context.make_error(
+                    -32004,
+                    "accept_flagged_required: candidate is instruction_like; "
+                    "accepting it requires literal 'accept_flagged' capability",
+                    request_id,
+                )
+
             if new_status == "accepted":
                 c.execute(
                     """
@@ -756,7 +785,7 @@ def resolve_candidate(params: dict, request_id: Any, context: GovernanceContext)
                     (agent_id, category, content, created_at)
                     VALUES (?, 'general', ?, ?)
                     """,
-                    (principal.agent_id, rowd.get("content"), now),
+                    (principal.agent_id, content, now),
                 )
                 lid = c.lastrowid
 

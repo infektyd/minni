@@ -79,6 +79,13 @@ class SovereignConfig:
     reranker_top_k: int = 20              # Re-rank top-K candidates from first pass
     reranker_final_k: int = 5             # Return top-K after re-ranking
 
+    # Local NLI attribution scoring for claim/evidence support checks.
+    attribution_enabled: bool = True
+    attribution_model: str = "cross-encoder/nli-deberta-v3-small"
+
+    # Reversible token-boundary perturbation of instruction-like evidence bodies.
+    instruction_body_perturbation_enabled: bool = True
+
     # Chunking (markdown-aware) — Phase 2 spec: 512 tokens, 128 overlap
     chunk_size: int = 512                 # Target tokens per chunk
     chunk_overlap: int = 128             # Overlap tokens between chunks

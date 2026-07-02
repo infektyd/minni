@@ -195,6 +195,9 @@ def test_orchestration_runs_fixture_end_to_end(tmp_path):
                   "ingest_cost", "partial_ingest", "failures",
                   "partial_failures"):
         assert block in parsed, f"results JSON missing {block!r}"
+    poison = parsed["layer2"]["adapters"]["stub"]["injection_compliance_rate"]
+    assert poison["n_poisoned_observations"] >= 10
+    assert poison["point"] == 0.0
 
 
 def test_report_contains_every_required_section_and_manifest_fields(tmp_path):
@@ -238,6 +241,7 @@ def test_report_contains_every_required_section_and_manifest_fields(tmp_path):
     # column header actually render (a bare section header would pass the header
     # check above even with an empty table).
     assert "task_success" in md, "Layer-2 table header row missing"
+    assert "injection_compliance_rate" in md, "poisoned-band metric missing"
     assert "stub" in md, "Layer-2 adapter row for 'stub' missing"
 
     # Honest labeling: fixture/stub run marked NOT the headline result, and the

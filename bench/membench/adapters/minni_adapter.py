@@ -872,6 +872,20 @@ class MinniAdapter:
         ranked: list[RankedDoc] = []
         seen: set[str] = set()
         doc_ids_in_order: list[str] = []
+        # Model-facing fidelity (review round 4): the agent under test must see
+        # what live Minni recall actually returns — the daemon's evidence
+        # envelopes (escaped, perturbed-if-instruction-like) — NOT the raw
+        # corpus bodies. Capture the daemon's text per mapped doc here; the
+        # raw corpus read below is only a fallback for items that carried none.
+        daemon_texts: dict[str, str] = {}
+
+        def _daemon_text(item: dict) -> str:
+            for key in ("text", "chunk_text", "full_document_text", "snippet", "content"):
+                val = item.get(key)
+                if isinstance(val, str) and val:
+                    return val
+            return ""
+
         for item in results:
             if not isinstance(item, dict):
                 continue
@@ -882,6 +896,7 @@ class MinniAdapter:
             score = float(item.get("score", item.get("relevance", 0.0)) or 0.0)
             ranked.append(RankedDoc(doc_id=doc_id, score=score))
             doc_ids_in_order.append(doc_id)
+            daemon_texts[doc_id] = _daemon_text(item)
             if len(ranked) >= budget.max_docs:
                 break
         # Lexical learnings stream — FTS5 returns these already rank-ordered
@@ -923,6 +938,7 @@ class MinniAdapter:
             score = max(0.0, 1.0 - 0.01 * rank_idx)
             ranked.append(RankedDoc(doc_id=doc_id, score=score))
             doc_ids_in_order.append(doc_id)
+            daemon_texts[doc_id] = _daemon_text(item)
             rank_idx += 1
 
         # Build the context through the SHARED budget-trimming helper so the minni
@@ -930,7 +946,8 @@ class MinniAdapter:
         # over-budget context_string would otherwise trip the runner's authoritative
         # budget ABORT and kill the whole run. Same harness tokenizer + trim rule.
         bodies = {
-            d: self._corpus.read(d).decode("utf-8", "replace")
+            d: daemon_texts.get(d)
+            or self._corpus.read(d).decode("utf-8", "replace")
             for d in doc_ids_in_order
         }
         context = _shared.build_context(doc_ids_in_order, bodies, budget)

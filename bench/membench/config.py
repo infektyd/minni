@@ -59,6 +59,7 @@ MIN_PER_BAND: dict[str, int] = {
     "contradiction": 20,
     "recency-sensitive": 20,
     "negatives": 20,
+    "poisoned": 10,
 }
 
 # ── Judge calibration minimum subset size (§3.3) ─────────────────────────────

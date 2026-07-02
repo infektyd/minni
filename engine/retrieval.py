@@ -143,6 +143,48 @@ def _evidence_body_escape(text: str) -> str:
     return safe
 
 
+INSTRUCTION_BODY_BOUNDARY = "\u2063"
+_INSTRUCTION_BODY_LITERAL = INSTRUCTION_BODY_BOUNDARY * 2
+_INSTRUCTION_BODY_PLACEHOLDER = "\0MINNI_BOUNDARY\0"
+_ATTRIBUTION_LABELS = {"entailed", "neutral", "contradicted"}
+_NLI_OUTPUT_TO_ATTRIBUTION = {
+    "entailment": "entailed",
+    "entailed": "entailed",
+    "neutral": "neutral",
+    "contradiction": "contradicted",
+    "contradicted": "contradicted",
+}
+_NLI_LABEL_ORDER = ("contradicted", "entailed", "neutral")
+
+
+def _perturb_instruction_like_body(escaped_text: str) -> str:
+    """Insert reversible token-boundary markers into instruction-like evidence."""
+    escaped_text = str(escaped_text).replace(
+        INSTRUCTION_BODY_BOUNDARY,
+        _INSTRUCTION_BODY_LITERAL,
+    )
+    return re.sub(
+        r"(?<=\w)(\s+)(?=\w)",
+        INSTRUCTION_BODY_BOUNDARY + r"\1",
+        escaped_text,
+    )
+
+
+def _recover_instruction_like_body(perturbed_text: str) -> str:
+    """Recover the escaped evidence body produced before perturbation."""
+    return (
+        str(perturbed_text)
+        .replace(_INSTRUCTION_BODY_LITERAL, _INSTRUCTION_BODY_PLACEHOLDER)
+        .replace(INSTRUCTION_BODY_BOUNDARY, "")
+        .replace(_INSTRUCTION_BODY_PLACEHOLDER, INSTRUCTION_BODY_BOUNDARY)
+    )
+
+
+def _normalize_attribution_label(label) -> Optional[str]:
+    normalized = _NLI_OUTPUT_TO_ATTRIBUTION.get(str(label or "").strip().lower())
+    return normalized if normalized in _ATTRIBUTION_LABELS else None
+
+
 def build_evidence_envelope(
     *,
     source,
@@ -153,14 +195,25 @@ def build_evidence_envelope(
     instruction_like: bool,
     visibility: str,
     text: str,
+    attribution: Optional[str] = None,
+    perturbation_enabled: bool = True,
 ) -> str:
     """G22 evidence-only envelope with attribute + body escaping (SEC-010).
     Module-level so the escaping contract is directly testable."""
+    body = _evidence_body_escape(text)
+    if instruction_like and perturbation_enabled:
+        body = _perturb_instruction_like_body(body)
+    attribution_label = _normalize_attribution_label(attribution)
+    attribution_attr = (
+        f' attribution="{_xml_attr_escape(attribution_label)}"'
+        if attribution_label
+        else ""
+    )
     return (
         f'<EVIDENCE source="{_xml_attr_escape(source)}" agent="{_xml_attr_escape(agent)}" '
         f'status="{_xml_attr_escape(status)}" privacy="{_xml_attr_escape(privacy)}" '
-        f'score="{float(score):.3f}" instruction_like="{str(bool(instruction_like)).lower()}" '
-        f'visibility="{_xml_attr_escape(visibility)}">{_evidence_body_escape(text)}</EVIDENCE>'
+        f'score="{float(score):.3f}" instruction_like="{str(bool(instruction_like)).lower()}"{attribution_attr} '
+        f'visibility="{_xml_attr_escape(visibility)}">{body}</EVIDENCE>'
     )
 
 
@@ -214,6 +267,7 @@ class RetrievalEngine:
         self.faiss_index = faiss_index or FAISSIndex(config)
         self._model = None
         self._reranker = None
+        self._attribution_model = None
         self._tokenizer = None
         self._feedback_cache = {}
         self._feedback_cache_loaded_at = 0.0
@@ -236,6 +290,70 @@ class RetrievalEngine:
         from models import get_cross_encoder
         self._reranker = get_cross_encoder()
         return self._reranker
+
+    @property
+    def attribution_model(self):
+        """Return the process-wide NLI cross-encoder singleton."""
+        if self._attribution_model is not None:
+            return self._attribution_model
+        from models import get_attribution_cross_encoder
+        self._attribution_model = get_attribution_cross_encoder()
+        return self._attribution_model
+
+    def _score_attribution(self, claim: Optional[str], evidence_text: str) -> Optional[Dict]:
+        """Score whether evidence supports a caller-supplied claim using local NLI."""
+        claim_text = str(claim or "").strip()
+        if not claim_text:
+            return None
+        if not getattr(self.config, "attribution_enabled", True):
+            return None
+        model = self.attribution_model
+        if model is None:
+            return None
+        try:
+            raw = model.predict([(str(evidence_text or ""), claim_text)])
+        except Exception as exc:  # noqa: BLE001 - recall degrades when NLI is unavailable.
+            logger.debug("attribution scoring skipped: %s", exc)
+            return None
+        parsed = self._parse_attribution_prediction(raw)
+        if parsed is None:
+            return None
+        label, score = parsed
+        return {
+            "attribution": label,
+            "attribution_score": round(float(score), 6),
+            "attribution_model": getattr(self.config, "attribution_model", "unknown"),
+        }
+
+    @staticmethod
+    def _parse_attribution_prediction(raw) -> Optional[Tuple[str, float]]:
+        """Normalize common CrossEncoder NLI outputs to Minni attribution labels."""
+        if raw is None:
+            return None
+
+        first = raw[0] if isinstance(raw, (list, tuple)) and raw else raw
+        if isinstance(first, dict):
+            label = _normalize_attribution_label(first.get("label"))
+            if label is None:
+                return None
+            score = first.get("score", first.get("probability", 1.0))
+            return label, float(score)
+
+        arr = np.asarray(first, dtype=float)
+        if arr.ndim == 0:
+            return None
+        arr = arr.reshape(-1)
+        if arr.size < 3:
+            return None
+        logits = arr[:3]
+        shifted = logits - np.max(logits)
+        exp = np.exp(shifted)
+        total = float(exp.sum())
+        if not math.isfinite(total) or total <= 0:
+            return None
+        probs = exp / total
+        best = int(np.argmax(probs))
+        return _NLI_LABEL_ORDER[best], float(probs[best])
 
     @property
     def tokenizer(self):
@@ -1142,7 +1260,12 @@ class RetrievalEngine:
                 "evidence_refs": result.get("evidence_refs"),
                 "recommended_action": result.get("recommended_action"),
                 "recommended_wiki_updates": result.get("recommended_wiki_updates") or [],
+                "attribution": result.get("attribution"),
+                "attribution_score": result.get("attribution_score"),
+                "attribution_model": result.get("attribution_model"),
             }
+            if result.get("full_provenance") is not None:
+                fields["full_provenance"] = result.get("full_provenance")
             # Only include provenance if not already in existing dict
             if existing is None or "provenance" not in existing:
                 fields["provenance"] = result.get("provenance")
@@ -1162,6 +1285,9 @@ class RetrievalEngine:
                 "privacy_level": result.get("privacy_level"),
                 "review_state": result.get("review_state"),
                 "instruction_like": result.get("instruction_like"),
+                "attribution": result.get("attribution"),
+                "attribution_score": result.get("attribution_score"),
+                "attribution_model": result.get("attribution_model"),
                 "wikilink": result.get("wikilink"),
                 "depth": "headline",
             }
@@ -1732,6 +1858,7 @@ class RetrievalEngine:
         summarize_neighborhood: bool = False,
         use_hyde: Optional[bool] = None,
         cross_agent: bool = False,
+        claim: Optional[str] = None,
         document_agent_filter: Optional[Sequence[str]] = None,
         # G19/G20/G22: principal for can_read_document gate + evidence envelope (default None = back-compat)
         principal: Optional[EffectivePrincipal] = None,
@@ -1770,6 +1897,8 @@ class RetrievalEngine:
             use_hyde: Optional PR-8 override. None follows config.hyde_enabled.
             cross_agent: Learning-recall flag threaded from daemon handlers. It
                 does not scope the shared document layer.
+            claim: Optional claim that retrieved evidence should support. When
+                supplied, Minni runs local NLI attribution scoring.
             document_agent_filter: Optional explicit document agent taxonomy
                 filter for future callers. Default None preserves shared wiki recall.
 
@@ -1777,6 +1906,7 @@ class RetrievalEngine:
         Existing callers that pass no depth receive identical results (snippet).
         With backend=None (default), results are bit-identical to pre-PR-3.
         """
+        claim_text = str(claim or "").strip()
         query_variants = self._resolve_query_variants(query, expand)
         if len(query_variants) > 1:
             total_t0 = time.perf_counter()
@@ -1801,6 +1931,7 @@ class RetrievalEngine:
                     summarize_neighborhood=False,
                     use_hyde=use_hyde,
                     cross_agent=cross_agent,
+                    claim=claim,
                     document_agent_filter=document_agent_filter,
                     principal=principal,
                     workspace=workspace,
@@ -1820,7 +1951,7 @@ class RetrievalEngine:
                             (time.time(), result["doc_id"]),
                         )
             try:
-                self.last_trace_id = _trace_ring().add({
+                expanded_trace = {
                     "query": query,
                     "variants": query_variants,
                     "expansion": {"mode": expand, "variant_count": len(query_variants)},
@@ -1835,7 +1966,21 @@ class RetrievalEngine:
                     "timing": {
                         "total_ms": round((time.perf_counter() - total_t0) * 1000, 3),
                     },
-                })
+                }
+                claim_text = str(claim or "").strip()
+                if claim_text:
+                    expanded_trace["claim"] = claim_text
+                    expanded_trace["attribution_scores"] = [
+                        {
+                            "doc_id": r.get("doc_id"),
+                            "chunk_id": r.get("chunk_id"),
+                            "attribution": r.get("attribution"),
+                            "score": r.get("attribution_score"),
+                        }
+                        for r in results
+                        if r.get("attribution_score") is not None
+                    ]
+                self.last_trace_id = _trace_ring().add(expanded_trace)
                 for result in results:
                     result["trace_id"] = self.last_trace_id
             except Exception as exc:
@@ -2107,6 +2252,9 @@ class RetrievalEngine:
         for r in merged:
             txt = str(r.get("chunk_text") or r.get("full_document_text") or r.get("content") or "")
             r["instruction_like"] = bool(is_instruction_like(txt))
+            attribution = self._score_attribution(claim_text, txt) if claim_text else None
+            if attribution is not None:
+                r.update(attribution)
             vis = "authorized"
             pid = getattr(principal, "agent_id", None) if principal else None
             if r.get("agent") == pid:
@@ -2132,7 +2280,29 @@ class RetrievalEngine:
                 instruction_like=r["instruction_like"],
                 visibility=vis,
                 text=txt,
+                attribution=r.get("attribution"),
+                perturbation_enabled=getattr(
+                    self.config, "instruction_body_perturbation_enabled", True
+                ),
             )
+            if r["instruction_like"] or r.get("attribution_score") is not None:
+                existing_full = r.get("full_provenance")
+                if not isinstance(existing_full, dict):
+                    existing_full = {}
+                r["full_provenance"] = {
+                    **existing_full,
+                }
+                # Deliberately NOT storing the raw unperturbed body here: recall
+                # results are stringified into model-facing context, so shipping
+                # the raw text would defeat the instruction-like perturbation.
+                # The perturbation is reversible by construction — audit/display
+                # can recover the original via _recover_instruction_like_body().
+                if r.get("attribution_score") is not None:
+                    r["full_provenance"].update({
+                        "attribution": r.get("attribution"),
+                        "attribution_score": r.get("attribution_score"),
+                        "attribution_model": r.get("attribution_model"),
+                    })
             # Primary text field becomes the envelope so downstream (sovrd JSON, agent_api, formatRecall) sees tagged evidence
             if "chunk_text" in r:
                 r["chunk_text"] = r["evidence_envelope"]
@@ -2182,10 +2352,12 @@ class RetrievalEngine:
 
             # Detect injection in chunk text
             chunk_text = r.get("chunk_text", "")
-            try:
-                instr_like = is_instruction_like(chunk_text)
-            except Exception:
-                instr_like = None
+            instr_like = r.get("instruction_like")
+            if instr_like is None:
+                try:
+                    instr_like = is_instruction_like(chunk_text)
+                except Exception:
+                    instr_like = None
 
             # Infer page type → source_authority mapping
             page_type = r.get("page_type")
@@ -2223,6 +2395,10 @@ class RetrievalEngine:
                 provenance["salience_boost"] = r.get("salience_boost", 0.0)
             if r.get("provenance", {}).get("via_hyde"):
                 provenance["via_hyde"] = True
+            if r.get("attribution_score") is not None:
+                provenance["attribution"] = r.get("attribution")
+                provenance["attribution_score"] = r.get("attribution_score")
+                provenance["attribution_model"] = r.get("attribution_model")
 
             raw = {
                 "doc_id": r["doc_id"],
@@ -2254,7 +2430,12 @@ class RetrievalEngine:
                 "evidence_refs": evidence_refs,
                 "recommended_action": _recommended_action(page_status, instr_like, confidence),
                 "recommended_wiki_updates": [],
+                "attribution": r.get("attribution"),
+                "attribution_score": r.get("attribution_score"),
+                "attribution_model": r.get("attribution_model"),
             }
+            if r.get("full_provenance") is not None:
+                raw["full_provenance"] = r.get("full_provenance")
 
             # Rationale is computed after provenance is assembled
             try:
@@ -2262,9 +2443,54 @@ class RetrievalEngine:
             except Exception:
                 raw["rationale"] = None
 
-            # For document depth, attach full document text if available
+            # For document depth, attach full document text if available.
+            # Detection/attribution ran on the chunk above; the whole document is
+            # what actually ships at this depth, so re-check the flag and re-score
+            # the claim against it, and wrap it in an envelope — the raw body must
+            # never ride outside the perturbed <EVIDENCE> form (same leak class as
+            # chunk_text).
             if depth == "document":
-                raw["full_document_text"] = self._fetch_full_document(r["doc_id"])
+                full_text = self._fetch_full_document(r["doc_id"])
+                if full_text:
+                    doc_flag = bool(raw.get("instruction_like")) or bool(
+                        is_instruction_like(full_text)
+                    )
+                    raw["instruction_like"] = doc_flag
+                    if claim_text:
+                        attribution = self._score_attribution(claim_text, full_text)
+                        if attribution is not None:
+                            raw.update(attribution)
+                            # Keep every attribution surface consistent with the
+                            # full-document rescore: the merged row feeds the
+                            # trace ring below, and provenance/full_provenance
+                            # were assembled from the first-chunk score above.
+                            r.update(attribution)
+                            for meta in (
+                                raw.get("provenance"),
+                                raw.get("full_provenance"),
+                            ):
+                                if isinstance(meta, dict):
+                                    meta.update({
+                                        "attribution": raw.get("attribution"),
+                                        "attribution_score": raw.get("attribution_score"),
+                                        "attribution_model": raw.get("attribution_model"),
+                                    })
+                    raw["full_document_text"] = build_evidence_envelope(
+                        source=raw.get("source", "?"),
+                        agent=raw.get("agent", "?"),
+                        status=raw.get("review_state", "?"),
+                        privacy=raw.get("privacy_level", "?"),
+                        score=float(raw.get("score") or 0),
+                        instruction_like=doc_flag,
+                        visibility=r.get("visibility", "authorized"),
+                        text=full_text,
+                        attribution=raw.get("attribution"),
+                        perturbation_enabled=getattr(
+                            self.config, "instruction_body_perturbation_enabled", True
+                        ),
+                    )
+                else:
+                    raw["full_document_text"] = full_text
 
             # S7: self-labeling recall package — primary (rank 1) vs related (2..N).
             # Rank is 1-based by position in the final results list (post-rerank order).
@@ -2301,6 +2527,18 @@ class RetrievalEngine:
             }
             for r in merged
         ]
+        if claim_text:
+            trace["claim"] = claim_text
+            trace["attribution_scores"] = [
+                {
+                    "doc_id": r.get("doc_id"),
+                    "chunk_id": r.get("chunk_id"),
+                    "attribution": r.get("attribution"),
+                    "score": r.get("attribution_score"),
+                }
+                for r in merged
+                if r.get("attribution_score") is not None
+            ]
         timing["total_ms"] = round((time.perf_counter() - total_t0) * 1000, 3)
         try:
             self.last_trace_id = _trace_ring().add(trace)
@@ -2327,6 +2565,7 @@ class RetrievalEngine:
         # G19: gate expand (called by _handle_expand which now stamps principal)
         principal: Optional[EffectivePrincipal] = None,
         workspace: str = "default",
+        claim: Optional[str] = None,
     ) -> Optional[Dict]:
         """
         Re-fetch a specific result at a deeper depth tier.
@@ -2414,26 +2653,60 @@ class RetrievalEngine:
             ws = workspace or getattr(principal, "workspace_id", "default")
             if not can_read_document(principal, ws, raw):
                 return None
-            # G22 envelope on expanded too
-            txt = str(raw.get("chunk_text") or raw.get("full_document_text") or "")
+            # G22 envelope on expanded too. Prefer the full document text when it
+            # was fetched (depth="document"): _apply_depth returns the whole
+            # document, so instruction_like detection and attribution must be
+            # scored against what is actually returned, not just the first chunk.
+            txt = str(raw.get("full_document_text") or raw.get("chunk_text") or "")
             raw["instruction_like"] = bool(is_instruction_like(txt))
+            attribution = self._score_attribution(claim, txt)
+            if attribution is not None:
+                raw.update(attribution)
             raw["visibility"] = "authorized-via-expand"
             raw["reasoning"] = f"expand can_read_document passed for {getattr(principal,'agent_id','?')}"
-            # wrap (full 8-field construction to match retrieve G22 loop)
-            safe = txt.replace("`", "\\`").replace("\n#", "\n\\#")
             src = raw.get("path", "?")
             ag = raw.get("agent", "?")
             st = raw.get("page_status", "?")
             pr = raw.get("privacy_level", "?")
             sc = float(raw.get("score") or 0)
-            il = str(raw.get("instruction_like", False)).lower()
             vis = raw.get("visibility", "authorized-via-expand")
-            raw["evidence_envelope"] = (
-                f'<EVIDENCE source="{src}" agent="{ag}" status="{st}" privacy="{pr}" '
-                f'score="{sc:.3f}" instruction_like="{il}" visibility="{vis}">{safe}</EVIDENCE>'
+            raw["evidence_envelope"] = build_evidence_envelope(
+                source=src,
+                agent=ag,
+                status=st,
+                privacy=pr,
+                score=sc,
+                instruction_like=raw["instruction_like"],
+                visibility=vis,
+                text=txt,
+                attribution=raw.get("attribution"),
+                perturbation_enabled=getattr(
+                    self.config, "instruction_body_perturbation_enabled", True
+                ),
             )
+            if raw["instruction_like"] or raw.get("attribution_score") is not None:
+                existing_full = raw.get("full_provenance")
+                if not isinstance(existing_full, dict):
+                    existing_full = {}
+                raw["full_provenance"] = {
+                    **existing_full,
+                }
+                # Deliberately NOT storing the raw unperturbed body here (see
+                # retrieve()): the raw form must never ride outside the perturbed
+                # <EVIDENCE> envelope; _recover_instruction_like_body() restores
+                # it for audit/display.
+                if raw.get("attribution_score") is not None:
+                    raw["full_provenance"].update({
+                        "attribution": raw.get("attribution"),
+                        "attribution_score": raw.get("attribution_score"),
+                        "attribution_model": raw.get("attribution_model"),
+                    })
             if "chunk_text" in raw:
                 raw["chunk_text"] = raw["evidence_envelope"]
+            # The envelope body IS the full text at document depth — never ship
+            # the raw document body alongside it (same leak class as chunk_text).
+            if "full_document_text" in raw:
+                raw["full_document_text"] = raw["evidence_envelope"]
 
         return self._apply_depth(raw, depth)
 
