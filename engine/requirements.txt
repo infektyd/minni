@@ -21,10 +21,10 @@ watchdog>=6.0.0
 pytest
 # Coverage visibility (see `make coverage` / engine/.coveragerc). Not wired into
 # default pytest addopts so ordinary `pytest` runs stay fast; opt-in via --cov.
-pytest-cov>=5.0.0
+pytest-cov>=7.1.0
 
 # Linting (gate: `.venv/bin/python -m ruff check .` from engine/)
-ruff>=0.6.0
+ruff>=0.15.20
 
 # Optional: for better SQLite FTS tokenization
 # icu4c (system package)
