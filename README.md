@@ -26,6 +26,10 @@ Four verbs cover the lifecycle:
 
 All of it is local-first: no hosted dependency, no cloud tier, and vaults you can open in any editor.
 
+![40-second demo: doctor, then learn stages a candidate, approve makes it durable, recall returns it as cited evidence, and handoff is default-deny until granted](docs/assets/demo.gif)
+
+*Recorded live against a real daemon ([cast file](docs/assets/demo.cast)) — including the `capability_denied` at the end: handoff is default-deny until a capability is explicitly granted. That's the governance working, not the demo failing.*
+
 ## Recall is evidence, not instruction
 
 Recalled memory in Minni is **cited and weighed, never obeyed**. Every recall result comes back inside an evidence envelope with provenance (source, owning agent, score, review state) — framed as material for the agent to evaluate, not as text with authority. Content that looks like an instruction is detected and defused at the data layer before it ever reaches a prompt.
