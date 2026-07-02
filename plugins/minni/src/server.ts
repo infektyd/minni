@@ -665,7 +665,7 @@ server.registerTool(
   {
     title: "Minni Resolve Candidate",
     description:
-      "Resolve a staged candidate (accept→durable learn, reject, redact, merge, etc.). Operator-only via principal gating.",
+      "Resolve a staged candidate (accept→durable learn, reject, redact, merge, etc.). Operator-only via principal gating. Privacy/expiry/scope marking decisions are not yet implemented and were removed from this surface — see issue #123.",
     inputSchema: {
       candidate_id: z.number().int(),
       decision: z.enum([
@@ -677,9 +677,6 @@ server.registerTool(
         "log_only",
         "merge",
         "supersede",
-        "mark_sensitive",
-        "mark_temporary",
-        "mark_project_scoped",
       ]),
       reason: z.string().optional(),
       // No caller-controlled identity or redirect fields (agent/vault/afm) on the wire; server uses DEFAULT + G11 stamp

@@ -164,7 +164,7 @@ class SovereignAgent:
         metadata: Optional[dict] = None,
     ) -> int:
         """Log an episodic event."""
-        return self.episodic.log_event(
+        return self.episodic.add_event(
             agent_id=self.agent_id,
             event_type=event_type,
             content=content,
