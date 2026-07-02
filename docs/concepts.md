@@ -32,8 +32,9 @@ grant: nothing enters the shared durable tier without approval. Know exactly
 what you are allowing, though — `minni_learn` does two things per call. It
 stages the `proposed` candidate, and it also writes a Markdown note into the
 agent's **own vault** immediately (audit-logged, and indexed into that
-agent's personal tier by `vault_ingest`). The quality gate blocks the call
-only when it is invoked with `requireQuality: true`. Allowlisting the tool
+agent's personal tier by `vault_ingest`). The quality gate blocks weak
+content by default (`requireQuality` defaults to `true`; a caller must pass
+`requireQuality: false` to store a weak note deliberately). Allowlisting the tool
 therefore means trusting the agent to write its own vault notes unprompted —
 the shared tier still waits for a resolution decision.
 
@@ -101,7 +102,13 @@ the daemon into strict identity mode, where the anonymous local caller is no
 longer auto-elevated to operator. If you add per-agent grants, also author a
 `principals/main.json` (for example `{"agent_id": "main", "capabilities":
 ["*"]}`) — or set `MINNI_LOCAL_OPERATOR` — so your own local sessions keep
-operator access.
+operator access. That `main.json` remediation applies to the **anonymous**
+caller only (one that omits `agent_id` entirely): a wire caller that
+explicitly claims a reserved operator id (`main`/`operator`) is denied with a
+`reserved_agent_id` diagnostic regardless of `main.json`, unless the daemon
+itself runs with `MINNI_LOCAL_OPERATOR` set. Named agents (`claude-code`,
+`codex`, …) always need their own `principals/<agent>.json` — see
+[Provision agent identities](install.md#provision-agent-identities-principals).
 
 Alongside the four verbs, sessions carry a lifecycle spine —
 `prepare_task → prepare_outcome → plan → learn` — injected via the
