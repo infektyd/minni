@@ -32,6 +32,27 @@ class AFMContext:
     logger: logging.Logger = logger
 
 
+def loop_principal() -> EffectivePrincipal:
+    """Synthesized operator stamp for the background AFM loop's wet runs.
+
+    Issue #119 (defect 1): handle_daemon_compile gates dry_run=false on an
+    operator params["_principal"], but afm_loop_runner built params without
+    one — so every background wet run was rejected and the loop was a silent
+    no-op. The loop is an in-process trusted caller (it never crosses the
+    wire; wire callers get their principal stamped by dispatch and cannot
+    inject "_principal"), so stamp a daemon-internal operator here rather
+    than weakening the wire-side gate. agent_id "afm-loop" keeps the audit
+    trail (trace-ring owner, logs) attributed to the loop, not an operator.
+    """
+    return EffectivePrincipal(
+        agent_id="afm-loop",
+        workspace_id="default",
+        transport="internal",
+        capabilities=["govern"],
+        allowed_vault_roots=[],
+    )
+
+
 def afm_loop_enabled(config=DEFAULT_CONFIG) -> bool:
     if os.environ.get("MINNI_AFM_LOOP", "").lower() == "off":
         return False
@@ -416,6 +437,10 @@ async def afm_loop_runner(context: AFMContext):
                     "pass_name": name,
                     "dry_run": False,
                     "vault_path": context.default_config.vault_path,
+                    # Daemon-internal operator stamp: the wet-run gate in
+                    # handle_daemon_compile otherwise rejects the loop's own
+                    # dry_run=false calls (issue #119).
+                    "_principal": loop_principal(),
                 }
                 # Consolidation drains in a loop until the proposed queue is empty
                 # or a per-tick batch budget is hit — clears bursts (swarms) instead
