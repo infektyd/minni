@@ -2292,8 +2292,11 @@ class RetrievalEngine:
                 r["full_provenance"] = {
                     **existing_full,
                 }
-                if r["instruction_like"]:
-                    r["full_provenance"]["original_evidence_text"] = txt
+                # Deliberately NOT storing the raw unperturbed body here: recall
+                # results are stringified into model-facing context, so shipping
+                # the raw text would defeat the instruction-like perturbation.
+                # The perturbation is reversible by construction — audit/display
+                # can recover the original via _recover_instruction_like_body().
                 if r.get("attribution_score") is not None:
                     r["full_provenance"].update({
                         "attribution": r.get("attribution"),
@@ -2640,8 +2643,10 @@ class RetrievalEngine:
                 raw["full_provenance"] = {
                     **existing_full,
                 }
-                if raw["instruction_like"]:
-                    raw["full_provenance"]["original_evidence_text"] = txt
+                # Deliberately NOT storing the raw unperturbed body here (see
+                # retrieve()): the raw form must never ride outside the perturbed
+                # <EVIDENCE> envelope; _recover_instruction_like_body() restores
+                # it for audit/display.
                 if raw.get("attribution_score") is not None:
                     raw["full_provenance"].update({
                         "attribution": raw.get("attribution"),

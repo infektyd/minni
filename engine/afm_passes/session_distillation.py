@@ -250,6 +250,14 @@ def _normalize_native_draft(candidate: Any, trace_id: str, allowed_sources: set[
         return None
     kind = str(candidate.get("kind") or "concept").strip() or "concept"
     section = str(candidate.get("section") or f"{kind}s").strip() or f"{kind}s"
+    full_body = "\n".join([
+        body,
+        "",
+        "## Citations",
+        *[f"- `{source}`" for source in sources],
+        "",
+        "- Lifecycle: native AFM proposal only; endorsement is required before acceptance.",
+    ])
     return {
         "page_id": _draft_id(kind, title, sources, trace_id),
         "kind": kind,
@@ -262,14 +270,11 @@ def _normalize_native_draft(candidate: Any, trace_id: str, allowed_sources: set[
         "provider": "native",
         "sources": sources,
         "citations": sources,
-        "body": "\n".join([
-            body,
-            "",
-            "## Citations",
-            *[f"- `{source}`" for source in sources],
-            "",
-            "- Lifecycle: native AFM proposal only; endorsement is required before acceptance.",
-        ]),
+        "body": full_body,
+        # Finding #4 (native compile path): re-check the provider's own output.
+        # _native_compile_drafts additionally ORs in inheritance from flagged
+        # deterministic input drafts.
+        "instruction_like": 1 if is_instruction_like(full_body) else 0,
     }
 
 
@@ -300,11 +305,28 @@ def _native_compile_drafts(pass_input: Dict[str, Any], deterministic_drafts: Lis
     candidates = result.data.get("drafts")
     if not isinstance(candidates, list):
         return []
-    normalized = [
-        draft
-        for draft in (_normalize_native_draft(candidate, trace_id, allowed_sources) for candidate in candidates)
-        if draft is not None
-    ]
+    # Finding #4 (native compile path): the provider may paraphrase a poisoned
+    # event into clean prose. If ANY deterministic input draft fed to this call
+    # was flagged instruction_like, every native output inherits the flag even
+    # when the paraphrased body no longer trips is_instruction_like().
+    inputs_flagged = any(
+        draft.get("instruction_like") for draft in deterministic_drafts
+    )
+    normalized: List[Dict[str, Any]] = []
+    for candidate in candidates:
+        draft = _normalize_native_draft(candidate, trace_id, allowed_sources)
+        if draft is None:
+            continue
+        own_flag = bool(draft.get("instruction_like"))
+        if inputs_flagged and not own_flag:
+            logger.warning(
+                "session_distillation native draft %r inherits instruction_like "
+                "from flagged deterministic input draft(s); the provider's "
+                "paraphrase did not itself trip the detector",
+                draft.get("title"),
+            )
+        draft["instruction_like"] = 1 if (own_flag or inputs_flagged) else 0
+        normalized.append(draft)
     return normalized[:5]
 
 
