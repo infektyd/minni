@@ -352,5 +352,3 @@ Key changes from the prior draft, all sourced from [docs/VAULT_INGEST.md](docs/V
 - **Core Invariants** — replaced the single "SQLite is daemon storage" row with "Documents are two-tier" + "Learnings are shared-DB".
 - **Quickstart `search` sample** — now shows `[src=p]` / `[src=c]` markers so the two legs are visible.
 - Smaller touch-ups in *What Minni does*, *Runtime Components*, *Retrieval And Continuity*, *Learning Lifecycle* (consolidation proposes, daemon applies), *Setup* (manual `vault-ingest`), and a new doc-table row for `VAULT_INGEST.md`.
-
-Want me to write this to `README.md` on a fresh branch off `main`?
