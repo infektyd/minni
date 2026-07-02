@@ -14,6 +14,48 @@ writes a durable learning directly, **only** for an operator principal, and is
 audit-stamped `FORCE_DURABLE_LEARN`. A non-operator force attempt is denied
 with an `operator_only` error.
 
+## Delegating approval
+
+Human approval is the **default policy, not the architecture**. Who gets to
+resolve candidates is decided per principal, and the operator can delegate it.
+Three resolution paths exist, all landing in the same audit trail:
+
+1. **Manual (the default).** A human (or the local operator session) calls
+   `resolve_candidate`. On a fresh install the anonymous local caller over the
+   Unix socket is the synthesized `main` operator, so this works with zero
+   configuration.
+
+2. **A trusted agent.** Author `~/.minni/principals/<agent>.json` (mode 0600)
+   granting the agent governance capability:
+
+   ```json
+   {"agent_id": "codex", "capabilities": ["learn", "search", "govern"]}
+   ```
+
+   With `govern` (or `resolve_candidate`, or `*`) in its capability list, that
+   agent may resolve candidates itself and may use the `force=true` durable
+   learn — its memory writes no longer wait for a human. Without it, the same
+   agent can still `learn` (staging candidates) but a `force` attempt is
+   denied `operator_only`. Principal files are read per request; no daemon
+   restart is needed.
+
+3. **The background consolidation pass.** Start the daemon with
+   `MINNI_AFM_LOOP=on` and the AFM consolidation pass drains staged candidates
+   roughly every 15 minutes, auto-promoting the low-risk subset — explicitly
+   safe privacy level, not instruction-like, not a duplicate, passing the
+   deterministic quality gate — into durable learnings with no human in the
+   loop. Everything spicier is routed to review, never silently dropped. This
+   loop is **off by default**, and `MINNI_AFM_MODE` does not affect it — mode
+   only toggles an advisory triage annotation that the promotion gate never
+   consults.
+
+One operational caveat: creating your **first** `principals/*.json` file flips
+the daemon into strict identity mode, where the anonymous local caller is no
+longer auto-elevated to operator. If you add per-agent grants, also author a
+`principals/main.json` (for example `{"agent_id": "main", "capabilities":
+["*"]}`) — or set `MINNI_LOCAL_OPERATOR` — so your own local sessions keep
+operator access.
+
 Alongside the four verbs, sessions carry a lifecycle spine —
 `prepare_task → prepare_outcome → plan → learn` — injected via the
 `<minni:context>` envelope so agents orient before ambitious work and distill

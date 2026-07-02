@@ -21,7 +21,7 @@ Four verbs cover the lifecycle:
 
 - **Recall** — cited, provenance-tagged retrieval (lexical + vector + rank fusion + rerank) across the personal and shared legs.
 - **Learn** — propose, don't write: `learn` stages a **candidate**, not a memory.
-- **Approve** — a human-governed gate (`resolve_candidate`) accepts, rejects, redacts, merges, or supersedes the candidate. Only accepted candidates become durable memory.
+- **Approve** — a governance gate (`resolve_candidate`) accepts, rejects, redacts, merges, or supersedes the candidate. Only accepted candidates become durable memory. Human-gated by default; the operator can [delegate approval](docs/concepts.md#delegating-approval) to a trusted agent or to the background consolidation pass.
 - **Handoff** — explicit cross-agent transfers with leases, so work and context move between runtimes deliberately.
 
 All of it is local-first: no hosted dependency, no cloud tier, and vaults you can open in any editor.
@@ -42,7 +42,7 @@ This is a memory-poisoning defense, enforced in the engine rather than asserted 
 |---|---|---|---|---|
 | Where memory lives | **Your machine** (Markdown + SQLite) | Hosted service / SDK | Research memory-OS | Your machine (Markdown) |
 | Agents | **Multi-agent, one governed daemon** | Single-agent focus | Research multi-memory | Single personal vault |
-| Writes to memory | **Proposal-first, human-approved** | Automatic extraction | Managed by the OS | Direct |
+| Writes to memory | **Proposal-first, approval-gated** (human by default, delegable) | Automatic extraction | Managed by the OS | Direct |
 | You can read it in an editor | **Yes** | No | Partially | Yes |
 | Benchmark claims | **None published** | Benchmark-optimized | Research benchmarks | n/a |
 
