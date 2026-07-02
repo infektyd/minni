@@ -119,6 +119,41 @@ def test_reserved_id_with_local_operator_env_resolves_operator(tmp_path: Path, m
     assert p.deny_reason is None
 
 
+def test_reserved_operator_alias_with_local_operator_env_resolves_operator(
+    tmp_path: Path, monkeypatch
+):
+    """PR #132 review (P2): under MINNI_LOCAL_OPERATOR the reserved alias
+    'operator' must normalize to the stamped local operator ('main' on a
+    fresh install) instead of raising IdentityMismatchError('operator' !=
+    'main') — otherwise the escape hatch is unusable for that alias."""
+    monkeypatch.setenv("MINNI_LOCAL_OPERATOR", "1")
+    principals = tmp_path / "principals"
+    principals.mkdir()
+    p = resolve_effective_principal(
+        supplied_agent_id="operator", transport="uds", principals_dir=principals
+    )
+    assert p.agent_id == "main"
+    assert p.capabilities == ["*"]
+    assert p.deny_reason is None
+
+
+def test_reserved_operator_alias_with_local_operator_env_strict_main_json(
+    tmp_path: Path, monkeypatch
+):
+    """Same alias normalization against an authored operator file: a claim of
+    'operator' under MINNI_LOCAL_OPERATOR resolves to the main.json stamp."""
+    monkeypatch.setenv("MINNI_LOCAL_OPERATOR", "1")
+    principals = tmp_path / "principals"
+    principals.mkdir()
+    _author(principals, "main", ["*"])
+    p = resolve_effective_principal(
+        supplied_agent_id="operator", transport="uds", principals_dir=principals
+    )
+    assert p.agent_id == "main"
+    assert p.capabilities == ["*"]
+    assert p.deny_reason is None
+
+
 def test_authored_principal_has_no_deny_reason(tmp_path: Path):
     principals = tmp_path / "principals"
     principals.mkdir()

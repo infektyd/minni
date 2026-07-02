@@ -464,6 +464,16 @@ def resolve_effective_principal(
     if operator_context:
         if supplied == stamped.agent_id:
             return stamped
+        # The reserved operator ids are aliases of ONE local operator: an
+        # operator-context claim of "operator" must normalize to the stamped
+        # operator (synthesized/authored as e.g. "main"), not mismatch against
+        # it (#132 review, P2). Only fires under trusted operator context —
+        # wire callers without it were already denied above.
+        if (
+            supplied in OPERATOR_RESERVED_AGENT_IDS
+            and stamped.agent_id in OPERATOR_RESERVED_AGENT_IDS
+        ):
+            return stamped
         if strict:
             aliases: list[str] = []
             for name in CANONICAL_PRINCIPAL_NAMES:
