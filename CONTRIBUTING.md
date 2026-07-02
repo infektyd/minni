@@ -55,20 +55,28 @@ See the Makefile (`make help`) for the full target list, including `lint`,
   If your branch trips this check, `git rm` the offending path, commit, and
   push again — the check reruns automatically.
 
-## The engine firewall
+## The memory firewall
 
-Changes that touch memory storage, retrieval, scoring, or governance —
-roughly, anything under `engine/` that affects how memories are written,
-ranked, retrieved, or authorized (`engine/db.py`, `engine/retrieval.py`,
-`engine/principal.py`, the AFM passes, candidate/learning lifecycle) — need a
+Changes that touch memory storage, retrieval, scoring, or governance need a
 maintainer discussion **before** you write code. Open an issue describing the
-problem and proposed approach first. This surface is covered by
-`SECURITY_PLAN.md` and has correctness/security properties that are easy to
-break silently; a PR that changes this behavior without prior discussion is
-likely to be asked to start over as an issue.
+problem and proposed approach first. That surface spans both languages:
 
-Everything else — docs, the plugin surface, tests, tooling — doesn't need
-pre-approval; just open the PR.
+- **Engine (`engine/`)** — anything that affects how memories are written,
+  ranked, retrieved, or authorized: `engine/db.py`, `engine/retrieval.py`,
+  `engine/principal.py`, the AFM passes, the candidate/learning lifecycle.
+- **Plugin security paths (`plugins/minni/src/`)** — the recall/privacy and
+  model-facing-context gates enforced plugin-side: privacy gating and evidence
+  fencing of vault content (e.g. the SEC-006/SEC-010 gates in `task.ts`),
+  recall-guard and hook context injection, and AFM context preparation.
+  Touching what reaches a model or bypasses a privacy gate is firewall
+  territory even though it lives in TypeScript.
+
+This surface is covered by `SECURITY_PLAN.md` and has correctness/security
+properties that are easy to break silently; a PR that changes this behavior
+without prior discussion is likely to be asked to start over as an issue.
+
+Everything else — docs, plugin UI/tooling that doesn't gate model-facing
+content, tests, packaging — doesn't need pre-approval; just open the PR.
 
 ## Commit style
 
