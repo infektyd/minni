@@ -1249,7 +1249,8 @@ server.registerTool(
     }
     // P10: if updateSlice moved the plan to a terminal status (all slices resolved), clear the
     // active pointer when it still points at this plan, so a finished plan stops being injected.
-    if (next.status === "accepted") {
+    // H6: model-driven completion lands in "complete" (not "accepted").
+    if (next.status === "complete" || next.status === "accepted") {
       try {
         const active = await getActivePlan(effectiveVaultPath);
         if (active && active.plan_id === plan_id) {

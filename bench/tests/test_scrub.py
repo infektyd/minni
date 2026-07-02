@@ -638,6 +638,151 @@ def test_load_private_name_keys_non_list_yields_empty(tmp_path, bad_names):
     assert all(len(k) != 1 for k in keys)
 
 
+# ── X6: PII in filename-derived doc_id must not survive scrubbing ───────────
+def test_scrub_snapshot_renames_pii_bearing_filename(tmp_path):
+    """A source file NAMED after a person/email is renamed so the real name/
+    email does not survive as the doc_id in manifest.json, scrub_spans.jsonl, or
+    downstream gold labels, even though its TEXT is also scrubbed (X6, §5.1)."""
+    from membench.scrub import scrub_snapshot, verify_scrubbed
+    from membench.snapshot import corpus_subdir, load_manifest
+
+    src = tmp_path / "src"
+    src.mkdir()
+    # The filename itself carries the real name AND an email — the vector X6
+    # describes (corpus.py:60 derives doc_id straight from the relative path).
+    (src / f"{FAKE_NAME.replace(' ', '-')}-notes.md").write_text(
+        "# Notes\n\nSome unrelated content.\n", encoding="utf-8"
+    )
+    (src / f"{FAKE_EMAIL}.md").write_text(
+        "# Contact\n\nSome other content.\n", encoding="utf-8"
+    )
+    (src / "02-clean.md").write_text("# Clean\n\nNothing here.\n", encoding="utf-8")
+    dest = tmp_path / "snap"
+    freeze_snapshot(src, dest, allow_public=True)
+
+    scrub_snapshot(dest, _policy(), allow_public=True)
+
+    corpus_dir = corpus_subdir(dest)
+    on_disk_ids = {p.name for p in corpus_dir.iterdir()}
+    # The real name and the raw email must not appear in any on-disk filename.
+    for doc_id in on_disk_ids:
+        assert FAKE_NAME not in doc_id
+        assert FAKE_NAME.replace(" ", "-") not in doc_id
+        assert FAKE_EMAIL not in doc_id
+    assert "02-clean.md" in on_disk_ids  # untouched file survives unrenamed
+
+    # manifest.json's file paths (== doc_ids) must not carry the PII either.
+    manifest = load_manifest(dest)
+    manifest_ids = {e["path"] for e in manifest.files}
+    for doc_id in manifest_ids:
+        assert FAKE_NAME not in doc_id
+        assert FAKE_NAME.replace(" ", "-") not in doc_id
+        assert FAKE_EMAIL not in doc_id
+    manifest_raw = (dest / MANIFEST_FILENAME).read_text(encoding="utf-8")
+    assert FAKE_NAME not in manifest_raw
+    assert FAKE_EMAIL not in manifest_raw
+
+    # scrub_spans.jsonl's doc_id field must not carry the PII either.
+    spans_raw = (dest / "scrub_spans.jsonl").read_text(encoding="utf-8")
+    assert FAKE_NAME not in spans_raw
+    assert FAKE_EMAIL not in spans_raw
+
+    # A genuinely doc-id-scrubbed snapshot still verifies clean end-to-end.
+    verify_scrubbed(dest, policy=_policy())
+
+
+def test_scrub_snapshot_doc_id_rename_flows_into_gold_labels(tmp_path):
+    """End-to-end: the StubDrafter (label_cli) derives gold_doc_ids/gold_fact
+    straight from corpus.doc_ids() (label_cli.py:85-86) — after a doc-id-scrubbing
+    snapshot, drafted gold labels must not embed the real name/email either."""
+    from membench.corpus import load_corpus
+    from membench.label_cli import StubDrafter
+    from membench.scrub import scrub_snapshot
+    from membench.snapshot import corpus_subdir, load_manifest
+
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / f"{FAKE_NAME.replace(' ', '-')}-diary.md").write_text(
+        "# Diary\n\nJust some notes.\n", encoding="utf-8"
+    )
+    dest = tmp_path / "snap"
+    freeze_snapshot(src, dest, allow_public=True)
+    scrub_snapshot(dest, _policy(), allow_public=True)
+
+    manifest = load_manifest(dest)
+    corpus = load_corpus(
+        corpus_subdir(dest),
+        pinned_hash=manifest.content_hash,
+        scrubbed=True,
+        snapshot_dir=dest,
+    )
+    drafts = StubDrafter().draft(corpus)
+    for item in drafts:
+        blob = item.to_json()
+        assert FAKE_NAME not in blob
+        assert FAKE_NAME.replace(" ", "-") not in blob
+
+
+def test_verify_scrubbed_rejects_pii_bearing_doc_id(tmp_path):
+    """verify_scrubbed REJECTS a snapshot whose doc-id still carries PII, even
+    when the file BYTES are clean and the hash/content checks all match (X6).
+
+    Simulates a scrubber that redacted TEXT but never renamed the file: the
+    doc-id residual re-scan must catch what the byte-level residual_secrets scan
+    cannot see (a doc-id is not file content)."""
+    from membench.scrub import ScrubGateError, scrub_snapshot, verify_scrubbed
+    from membench.snapshot import corpus_subdir
+
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "02-clean.md").write_text("# Clean\n\nNothing here.\n", encoding="utf-8")
+    dest = tmp_path / "snap"
+    freeze_snapshot(src, dest, allow_public=True)
+    scrub_snapshot(dest, _policy(), allow_public=True)  # legitimately clean
+
+    # Now simulate the OLD (vulnerable) behaviour: plant a file whose NAME still
+    # carries the real name, with already-scrubbed-looking text, WITHOUT updating
+    # scrub_spans.jsonl/manifest (as a text-only scrubber would leave it).
+    corpus_dir = corpus_subdir(dest)
+    pii_path = corpus_dir / f"{FAKE_NAME.replace(' ', '-')}-notes.md"
+    pii_path.write_text("# Notes\n\nAlready-clean text.\n", encoding="utf-8")
+
+    with pytest.raises(ScrubGateError):
+        verify_scrubbed(dest, policy=_policy())
+
+
+def test_scrub_doc_id_rename_disambiguates_collisions(tmp_path):
+    """Two distinct source files that scrub to the SAME doc-id must not clobber
+    each other — the renamer disambiguates rather than silently dropping one."""
+    from membench.scrub import rename_scrubbed_doc_ids
+    from membench.snapshot import corpus_subdir
+
+    src = tmp_path / "src"
+    src.mkdir()
+    name_a = FAKE_NAME.replace(" ", "-")
+    name_b = FAKE_NAME.replace(" ", "_")  # different separator, SAME real name
+    # Both filenames carry the same real name (just a different filename-style
+    # separator), so both scrub to the identical target doc-id "Infektyd.md" —
+    # a genuine collision the renamer must disambiguate rather than clobber.
+    (src / f"{name_a}.md").write_text("# One\n", encoding="utf-8")
+    (src / f"{name_b}.md").write_text("# Two\n", encoding="utf-8")
+    dest = tmp_path / "snap"
+    freeze_snapshot(src, dest, allow_public=True)
+    corpus_dir = corpus_subdir(dest)
+
+    renames = rename_scrubbed_doc_ids(corpus_dir, _policy())
+    assert len(renames) == 2
+    assert len(set(renames.values())) == 2  # disambiguated, not collapsed
+    on_disk = {p.name for p in corpus_dir.iterdir()}
+    assert len(on_disk) == 2  # neither file was lost/overwritten
+    contents = {p.read_text(encoding="utf-8") for p in corpus_dir.iterdir()}
+    assert contents == {"# One\n", "# Two\n"}  # both distinct bodies survived
+    for doc_id in on_disk:
+        assert FAKE_NAME not in doc_id
+        assert name_a not in doc_id
+        assert name_b not in doc_id
+
+
 def test_load_spans_non_int_offset_raises_scrub_gate_error(tmp_path):
     """A scrub_spans.jsonl span with a non-int start/end raises ScrubGateError,
     not a downstream offset-arithmetic crash (item 3). The fields are annotated

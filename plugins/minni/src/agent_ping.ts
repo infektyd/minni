@@ -205,6 +205,12 @@ function withExpiry(contract: AgentPingContract, now = new Date()): AgentPingCon
 }
 
 function getLeasePath(requestId: string): string {
+  // X8: getLeasePath is reached (via checkAndReapLease/getAgentPingStatus/
+  // decideAgentPingRequest) before any other validation, and path.join with an
+  // unvalidated `requestId` allows `../` traversal to read/unlink arbitrary
+  // `.json` files. Validate the request-id shape here, at the join site, so no
+  // caller can slip a traversal through.
+  if (!REQUEST_ID_PATTERN.test(requestId)) throw new Error("Invalid requestId.");
   const baseHome = process.env.MINNI_HOME ?? path.join(os.homedir(), ".minni");
   return path.join(baseHome, "pings", "leases", `${requestId}.json`);
 }
@@ -366,6 +372,9 @@ export async function listAgentPingInbox(agentId = DEFAULT_AGENT_ID, limit = 20,
 
 export async function decideAgentPingRequest(input: DecideAgentPingInput, actorAgent = DEFAULT_AGENT_ID): Promise<AgentPingWriteResult> {
   const now = input.now ?? new Date();
+  // X8: reject a malformed request-id before any path.join/read (the reaper
+  // swallows the getLeasePath throw in a catch, so validate explicitly).
+  if (!REQUEST_ID_PATTERN.test(input.requestId)) throw new Error("Invalid requestId.");
   if (await checkAndReapLease(input.requestId, now)) {
     throw new Error(`Request is expired; only pending requests can be decided.`);
   }
@@ -455,7 +464,63 @@ export async function decideAgentPingRequest(input: DecideAgentPingInput, actorA
   return { contract, ...paths };
 }
 
+/**
+ * X9: resolve the authoritative view of a ping contract, defending against a
+ * requester who forges a decision in their own (locally-writable) outbox copy.
+ *
+ * A legitimate decision is written only by the recipient: `decideAgentPingRequest`
+ * sets `response.decidedBy = actorAgent` where the actor is asserted to be
+ * `toAgent`, then syncs identical copies to both mailboxes. So a genuine decided
+ * contract always satisfies `response.decidedBy === toAgent`.
+ *
+ * Given a candidate contract (which may be the requester's own outbox copy),
+ * this returns:
+ *   - the candidate unchanged when it is still pending, or its decision is
+ *     properly stamped by the recipient AND matches the recipient's own inbox
+ *     copy (the recipient-owned authoritative record);
+ *   - otherwise a pending view (decision stripped) — a forged/unauthenticated
+ *     decision is never reported as approved/denied.
+ */
+async function authoritativePingContract(
+  requestId: string,
+  candidate: AgentPingContract,
+): Promise<AgentPingContract> {
+  if (candidate.status !== "approved" && candidate.status !== "denied") {
+    return candidate; // pending/expired carry no decision to forge
+  }
+  const decidedByRecipient =
+    candidate.response !== undefined && candidate.response.decidedBy === candidate.toAgent;
+  if (decidedByRecipient) {
+    // Cross-check against the recipient-owned inbox copy: only the recipient
+    // writes there (via syncContract), so it is the authoritative record. A
+    // requester who tampered only their outbox copy will not match it.
+    try {
+      const recipientCopy = await readContract(
+        agentPingPath(resolveAgentVaultPath(candidate.toAgent), "inbox", requestId),
+      );
+      if (
+        recipientCopy.status === candidate.status &&
+        recipientCopy.response?.decidedBy === candidate.toAgent
+      ) {
+        return recipientCopy;
+      }
+    } catch {
+      // recipient copy gone: fall through to the safe pending view below
+    }
+  }
+  // Unauthenticated or unverifiable decision → report as pending, not decided.
+  return {
+    ...candidate,
+    status: "pending",
+    response: undefined,
+  };
+}
+
 export async function getAgentPingStatus(requestId: string, actorAgent = DEFAULT_AGENT_ID, now = new Date()): Promise<AgentPingWriteResult> {
+  // X8: reject a malformed request-id up front, before any path.join/read. The
+  // downstream checkAndReapLease/getLeasePath swallow the throw in a catch, so
+  // validate explicitly here too.
+  if (!REQUEST_ID_PATTERN.test(requestId)) throw new Error("Invalid requestId.");
   await checkAndReapLease(requestId, now);
   // Materialize the actor's inbox copy from any live lease addressed to them
   // before resolving status (RCM: recipient must see "pending" without first
@@ -477,6 +542,13 @@ export async function getAgentPingStatus(requestId: string, actorAgent = DEFAULT
   if (contract.fromAgent !== actorAgent && contract.toAgent !== actorAgent) {
     throw new Error("Only the requester or recipient can view this request.");
   }
+  // X9: the requester's own outbox copy is read first and is locally writable,
+  // so a requester could forge status:"approved" in it. A genuine decision is
+  // only ever written by the recipient (decidedBy === toAgent). Reject any
+  // "decided" status whose response is missing or was not stamped by the
+  // recipient — fall back to the authoritative lease record (recipient-owned)
+  // when one still exists, otherwise treat the request as unresolved (pending).
+  contract = await authoritativePingContract(requestId, contract);
   const normalized = withExpiry(contract, now);
   const paths = normalized.status === contract.status ? {
     senderPath: agentPingPath(resolveAgentVaultPath(contract.fromAgent), "outbox", contract.requestId),

@@ -66,6 +66,51 @@ GEMINI_SURFACE_CONFIGS = (
 )
 GEMINI_LEGACY_GRANT_MARKERS = ("mcp(sovereign-memory", "mcp(sovereign_memory", "sovereign_")
 
+# X1: the antigravity/gemini allow-lists must auto-grant ONLY the read-only
+# minni tools. A blanket `mcp(minni/*)` wildcard also covers write/export tools
+# (learn, vault_write, plan writers, export_pack, ping decide, handoff ack/negotiate),
+# so those would run without per-call confirmation. These names are verified
+# against the server.registerTool(...) registrations in src/server.ts. Write and
+# export tools are intentionally omitted so they still require a session prompt.
+# (minni_audit_report is safe here because X10 makes its automatic path
+# aggregate-only — the full latest entry is only returned on the confirmed path.)
+MINNI_READONLY_TOOLS = (
+    "minni_recall",
+    "minni_drill",
+    "minni_status",
+    "minni_audit_tail",
+    "minni_audit_report",
+    "minni_route",
+    "minni_list_pending_handoffs",
+    "minni_ping_agent_inbox",
+    "minni_ping_agent_status",
+)
+MINNI_READONLY_GRANTS = tuple(f"mcp(minni/{tool})" for tool in MINNI_READONLY_TOOLS)
+# The old blanket wildcard is now a LEGACY grant to be stripped on sight, so an
+# earlier install that wrote it gets narrowed to the per-tool set on the next run.
+MINNI_WILDCARD_GRANT = "mcp(minni/*)"
+
+# X3: agent ids become filesystem path components (vault_for) AND TOML string
+# values (_toml_basic_str). An unvalidated `--agent` allows `../` path traversal
+# out of ~/.minni and, via a raw newline, TOML section injection into a stamped
+# config. This single character-set gate closes both: no `.`, `/`, `\`, `\n`,
+# `\r`, or quote can pass, so neither traversal nor injection is expressible.
+AGENT_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
+
+
+def valid_agent_id(agent: str) -> str:
+    """Return `agent` if it is a safe agent id, else raise ArgumentTypeError.
+
+    Used as an argparse `type=` so the gate fires at argument-parse time, before
+    any value reaches vault_for() or a TOML/JSON stamp.
+    """
+    if not isinstance(agent, str) or not AGENT_ID_PATTERN.match(agent):
+        raise argparse.ArgumentTypeError(
+            f"invalid --agent {agent!r}: must match {AGENT_ID_PATTERN.pattern} "
+            "(lowercase alphanumerics and hyphens, 1-64 chars)"
+        )
+    return agent
+
 
 PLATFORM_ALIASES = {
     "claude": "claude-code",
@@ -133,6 +178,84 @@ def vault_for(agent: str) -> Path:
     return Path(f"~/.minni/{agent}-vault").expanduser()
 
 
+def _vault_path_is_safe(value: str, agent: str) -> bool:
+    """X2: is a preserved MINNI_VAULT_PATH trustworthy for `agent`?
+
+    A stale/attacker-planted value in an existing config must not be carried
+    forward verbatim. Accept it only when it (a) equals the freshly-computed
+    canonical vault for this agent, (b) resolves under ~/.minni/ (the gemini
+    legacy path is exempt because it IS the computed value), (c) is not a symlink,
+    and (d) is owned by the current user. Any failure => reject (caller falls
+    back to the freshly-computed path).
+    """
+    expected = vault_for(agent)
+    minni_root = Path("~/.minni").expanduser()
+    try:
+        candidate = Path(value).expanduser()
+    except Exception:
+        return False
+    # (a) Must match the canonical computed vault exactly.
+    if str(candidate) != str(expected):
+        return False
+    # The computed gemini legacy path lives outside ~/.minni by design; since we
+    # already required equality with the computed value, containment is only an
+    # extra guard for the normal ~/.minni layout.
+    is_under_minni = str(candidate) == str(minni_root) or str(candidate).startswith(
+        str(minni_root) + os.sep
+    )
+    is_gemini_legacy = str(candidate) == str(Path("~/.gemini/minni-vault").expanduser())
+    if not (is_under_minni or is_gemini_legacy):
+        return False
+    # (c)/(d): only enforce symlink/ownership when the path actually exists — a
+    # not-yet-created vault is fine (it will be created under the safe path).
+    try:
+        if candidate.is_symlink():
+            return False
+        if candidate.exists():
+            st = candidate.stat()
+            if hasattr(os, "getuid") and st.st_uid != os.getuid():
+                return False
+    except OSError:
+        return False
+    return True
+
+
+def _validate_preserved_identity(ex_env: dict, agent: str) -> dict:
+    """X2: return a copy of `ex_env` with the security-sensitive identity keys
+    replaced by the freshly-computed correct values whenever the preserved value
+    fails validation. Non-identity keys (AFM_*, WORKSPACE_ID) pass through so
+    per-agent AFM/workspace wiring is still preserved.
+
+    - MINNI_AGENT_ID must equal `agent`.
+    - MINNI_VAULT_PATH must pass _vault_path_is_safe.
+    - MINNI_SOCKET_PATH must equal the canonical default socket path.
+    """
+    validated = dict(ex_env)
+    expected_vault = str(vault_for(agent))
+    expected_socket = str(DEFAULT_SOCKET)
+    if validated.get("MINNI_AGENT_ID") != agent and "MINNI_AGENT_ID" in validated:
+        sys.stderr.write(
+            f"[minni-install] preserved MINNI_AGENT_ID {validated.get('MINNI_AGENT_ID')!r} "
+            f"!= {agent!r}; using computed value\n"
+        )
+        validated["MINNI_AGENT_ID"] = agent
+    if "MINNI_VAULT_PATH" in validated and not _vault_path_is_safe(
+        str(validated["MINNI_VAULT_PATH"]), agent
+    ):
+        sys.stderr.write(
+            f"[minni-install] preserved MINNI_VAULT_PATH {validated.get('MINNI_VAULT_PATH')!r} "
+            f"is not a trusted vault for {agent!r}; using {expected_vault}\n"
+        )
+        validated["MINNI_VAULT_PATH"] = expected_vault
+    if "MINNI_SOCKET_PATH" in validated and str(validated["MINNI_SOCKET_PATH"]) != expected_socket:
+        sys.stderr.write(
+            f"[minni-install] preserved MINNI_SOCKET_PATH {validated.get('MINNI_SOCKET_PATH')!r} "
+            f"!= {expected_socket}; using computed value\n"
+        )
+        validated["MINNI_SOCKET_PATH"] = expected_socket
+    return validated
+
+
 def plugin_source(repo_root: Path) -> Path:
     return repo_root / "plugins" / "minni"
 
@@ -197,6 +320,13 @@ def replace_toml_sections(path: Path, sections: dict[str, str], *, preserve_surf
                     )
                 except Exception:
                     fresh_env = {}
+                # X2: never carry preserved identity keys forward unvalidated — a
+                # stale/attacker-planted MINNI_VAULT_PATH/SOCKET_PATH/AGENT_ID in
+                # the target config must not be re-stamped. Validate against the
+                # freshly-computed agent id (which the fresh section always carries).
+                expected_agent = fresh_env.get("MINNI_AGENT_ID")
+                if expected_agent:
+                    ex_env = _validate_preserved_identity(ex_env, expected_agent)
                 preserved_lines = []
                 for k in (
                     "MINNI_AGENT_ID",
@@ -250,6 +380,10 @@ def mcp_json(server_path: Path, agent: str, vault: Path, socket_path: Path, work
         except Exception:
             pass
     if ex_env:
+        # X2: validate preserved identity keys before carrying them forward, so a
+        # stale/attacker-planted MINNI_VAULT_PATH/SOCKET_PATH/AGENT_ID in the
+        # target config is replaced with the freshly-computed correct value.
+        ex_env = _validate_preserved_identity(ex_env, agent)
         for k in ("MINNI_AGENT_ID", "MINNI_VAULT_PATH", "MINNI_SOCKET_PATH", "MINNI_AFM_PROVIDER_MODE", "MINNI_AFM_NATIVE_HELPER"):
             if k in ex_env:
                 env[k] = ex_env[k]
@@ -426,10 +560,14 @@ def _find_allow_owner(node: object, container_key: str, leaf: str) -> dict | Non
 def ensure_permission_grant(
     path: Path,
     key_path: list[str],
-    grant: str = "mcp(minni/*)",
+    grants: tuple[str, ...] = MINNI_READONLY_GRANTS,
     legacy_markers: tuple[str, ...] = GEMINI_LEGACY_GRANT_MARKERS,
 ) -> bool:
-    """Ensure `grant` is in the allow-list at `key_path`, dropping legacy grants.
+    """Ensure the read-only `grants` are in the allow-list at `key_path`.
+
+    X1: grants the READ-ONLY minni tool set per tool (default MINNI_READONLY_GRANTS)
+    and strips the blanket `mcp(minni/*)` wildcard — that wildcard would also
+    auto-allow write/export tools, which must require per-call confirmation.
 
     Reuses an existing nested allow-list (matched by container key) when present,
     only creating along `key_path` as a fallback for a fresh config. Missing files
@@ -454,9 +592,16 @@ def ensure_permission_grant(
     allow = owner.get(leaf)
     if not isinstance(allow, list):
         allow = []
-    filtered = [g for g in allow if not any(marker in str(g) for marker in legacy_markers)]
-    if grant not in filtered:
-        filtered.append(grant)
+    # Drop legacy sovereign-memory grants AND the over-broad minni wildcard.
+    filtered = [
+        g
+        for g in allow
+        if str(g) != MINNI_WILDCARD_GRANT
+        and not any(marker in str(g) for marker in legacy_markers)
+    ]
+    for grant in grants:
+        if grant not in filtered:
+            filtered.append(grant)
     # No-op when already in the desired state, to avoid rewriting the file and
     # tripping file watchers on every run.
     if owner.get(leaf) == filtered:
@@ -472,9 +617,10 @@ def update_antigravity_config(
     """Wire the `minni` server across the Antigravity/Gemini surfaces.
 
     Writes every present surface view (resolving the per-surface mcp_config.json
-    symlink to its view file) and ensures the `mcp(minni/*)` permission grant in
-    the CLI settings and the shared config. The gemini-cli extension manifest is
-    handled separately by update_gemini_manifest.
+    symlink to its view file) and ensures the per-tool READ-ONLY permission grants
+    (X1: no `mcp(minni/*)` wildcard) in the CLI settings and the shared config.
+    The gemini-cli extension manifest is handled separately by
+    update_gemini_manifest.
     """
     server_path = install_root / "dist" / "server.js"
     written: list[str] = []
@@ -1018,26 +1164,26 @@ def main() -> int:
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_status = sub.add_parser("status", help="Show paths and identity rows.")
-    p_status.add_argument("--agent", default="codex")
+    p_status.add_argument("--agent", default="codex", type=valid_agent_id)
     p_status.set_defaults(func=status)
 
     p_bootstrap = sub.add_parser("bootstrap-vault", help="Create an actual per-agent vault directory without copying another agent.")
-    p_bootstrap.add_argument("--agent", required=True)
+    p_bootstrap.add_argument("--agent", required=True, type=valid_agent_id)
     p_bootstrap.set_defaults(func=bootstrap_vault)
 
     p_seed = sub.add_parser("seed-hosted", help="Create/update hosted-agent Layer 1 envelope.")
-    p_seed.add_argument("--agent", default="codex")
+    p_seed.add_argument("--agent", default="codex", type=valid_agent_id)
     p_seed.add_argument("--workspace", required=True)
     p_seed.set_defaults(func=seed_hosted)
 
     p_verify = sub.add_parser("verify", help="Verify Layer 1 delivery.")
-    p_verify.add_argument("--agent", default="codex")
+    p_verify.add_argument("--agent", default="codex", type=valid_agent_id)
     p_verify.add_argument("--workspace", required=True)
     p_verify.set_defaults(func=verify)
 
     p_update = sub.add_parser("update-plugin", help="Build/copy the canonical plugin and stamp platform-specific agent/vault/socket config.")
     p_update.add_argument("--platform", required=True, help="codex, claude-code, kilocode, gemini, antigravity, grok, generic, or all")
-    p_update.add_argument("--agent", help="Override agent id; required for generic platforms")
+    p_update.add_argument("--agent", type=valid_agent_id, help="Override agent id; required for generic platforms")
     p_update.add_argument("--install-root", help="Required for --platform generic; optional override for known platforms")
     p_update.add_argument("--workspace", help="Explicit MINNI_WORKSPACE_ID (and surface env) to stamp. If omitted (flagless), and the target config already has surface env keys (MINNI_AGENT_ID/VAULT_PATH/SOCKET_PATH/WORKSPACE_ID), those are preserved (belt-and-suspenders); only the plugin server pointer (command/args/cwd) is refreshed. Falls back to --repo for fresh targets. Explicit --workspace forces the value.")
     p_update.add_argument("--no-build", action="store_true", help="Skip npm run build when dist is already current")

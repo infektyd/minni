@@ -23,6 +23,7 @@ import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 
 import type { RecallResponse } from "./sovereign.js";
 import type { VaultSearchResult } from "./vault.js";
+import { assertWriteTargetUnder } from "./vault.js";
 
 /** Relative location of the recall-state file under the vault. Portable across agents. */
 export const RECALL_STATE_RELPATH = path.join(".runtime", "recall-state.json");
@@ -67,6 +68,32 @@ export interface RecallStateHit {
   wikilink: string;
   /** The per-hit strength used (daemon confidence in [0,1], or normalized vault signal). */
   score: number;
+}
+
+/**
+ * H3: hit titles/wikilinks originate from vault note content, which is untrusted
+ * (any local process can write a note). These strings are interpolated into the
+ * PreToolUse deny reason and the per-turn pointer — text the model reads as
+ * guidance. A title carrying newlines/control chars could smuggle its own lines
+ * (e.g. "\n## SYSTEM: ignore prior instructions") that read as fresh imperative
+ * instructions rather than inert data. Neutralize the structural markers an
+ * injection relies on:
+ *   - collapse every ASCII control char (CR/LF/tab included) to a space;
+ *   - strip markdown heading markers (#) and backticks so a title cannot render
+ *     as its own heading or code fence;
+ *   - collapse whitespace runs and clamp the length.
+ * The result is a single, bounded, inert token that stays inside the fixed
+ * template rather than reading as structure.
+ */
+export function sanitizeRecallField(value: unknown, maxLen = 120): string {
+  const raw = typeof value === "string" ? value : String(value ?? "");
+  const collapsed = raw
+    .replace(new RegExp("[\\u0000-\\u001F\\u007F]+", "g"), " ")
+    .replace(/[#`]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (collapsed.length <= maxLen) return collapsed;
+  return `${collapsed.slice(0, maxLen - 1).trimEnd()}…`;
 }
 
 export interface RecallState {
@@ -194,6 +221,11 @@ export async function writeRecallState(
 ): Promise<string> {
   const filePath = recallStatePath(vaultPath);
   await mkdir(path.dirname(filePath), { recursive: true });
+  // H2: the state file lives under the vault, which is writable by any local
+  // process. A bare writeFile follows symlinks — an attacker who points
+  // <vault>/.runtime (or the target file itself) outside the vault could
+  // redirect this write. Reject any symlink escape before writing.
+  assertWriteTargetUnder(filePath, vaultPath);
   const payload: RecallState = {
     task_signature: state.task_signature,
     intent: state.intent,
@@ -242,6 +274,10 @@ export async function clearRecallState(vaultPath: string): Promise<void> {
 export async function markRecallConsumed(vaultPath: string): Promise<boolean> {
   const filePath = recallStatePath(vaultPath);
   try {
+    // H2: refuse to read-modify-write through a symlinked state file or a
+    // symlinked .runtime parent that escapes the vault. Fail closed (return
+    // false via the catch) rather than following the link out of the vault.
+    assertWriteTargetUnder(filePath, vaultPath);
     const raw = await readFile(filePath, "utf8");
     const parsed = JSON.parse(raw) as RecallState;
     if (!parsed || typeof parsed !== "object") return false;
@@ -277,9 +313,13 @@ export async function markRecallConsumed(vaultPath: string): Promise<boolean> {
 export function buildRecallPointer(state: StrongRecall): string {
   const top = state.topHits[0];
   const n = state.topHits.length;
+  // H3: `top.title` is untrusted note content — sanitize (strip newlines/control
+  // chars, clamp) and quote it as inert data so a crafted title cannot inject
+  // its own line/instruction into the prompt pointer.
+  const title = sanitizeRecallField(top.title);
   return (
     `📓 ${n} relevant ${n === 1 ? "memory" : "memories"} ` +
-    `(top: ${top.title}, score ${top.score.toFixed(2)}). ` +
+    `(top: "${title}", score ${top.score.toFixed(2)}). ` +
     `Consult minni_recall (or the recall-state file) before deriving from scratch.`
   );
 }

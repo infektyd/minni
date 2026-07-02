@@ -541,18 +541,25 @@ class TestHandleLearn:
         assert resp["error"]["code"] == -32602
 
     def test_learn_force_false_blocked_on_contradiction(self, tmp_path, monkeypatch):
-        """learn(force=False) returns {status: contradiction} when a match exists."""
+        """learn(force=False) returns {status: contradiction} when a match exists.
+
+        R5: contradiction detection on learn is now scoped to the CALLER's own
+        agent (a global scan leaked other agents' content on the learn probe),
+        so the seeded contradiction is owned by the same agent as the learn
+        call ('test').
+        """
         wb, db_obj, cfg = self._patch_writeback(tmp_path, monkeypatch)
 
         base_emb = _fixed_embedding("The auth system uses JWT tokens")
 
-        # Seed an existing learning with that embedding
+        # Seed an existing learning with that embedding, owned by the SAME agent
+        # ('test') that the learn call below is stamped as (R5 same-agent scope).
         now = time.time()
         with db_obj.cursor() as c:
             c.execute("""
                 INSERT INTO learnings (agent_id, category, content, confidence,
                                        embedding, created_at, status)
-                VALUES ('agent1', 'fact', 'The auth system uses JWT tokens', 1.0, ?, ?, 'active')
+                VALUES ('test', 'fact', 'The auth system uses JWT tokens', 1.0, ?, ?, 'active')
             """, (base_emb.tobytes(), now))
 
         # Patch model to return a near-identical embedding
@@ -578,6 +585,46 @@ class TestHandleLearn:
         assert result["status"] == "contradiction"
         assert "candidates" in result
         assert len(result["candidates"]) >= 1
+
+    def test_learn_does_not_leak_cross_agent_contradictions(self, tmp_path, monkeypatch):
+        """R5: a learn(force=False) probe must NOT surface another agent's
+        durable learning. A near-identical assertion owned by 'agent1' must be
+        invisible to a caller stamped as 'test' — otherwise crafted assertions
+        exfiltrate cross-agent content/agent_id via the contradiction candidates.
+        """
+        wb, db_obj, cfg = self._patch_writeback(tmp_path, monkeypatch)
+
+        base_emb = _fixed_embedding("The auth system uses JWT tokens")
+        now = time.time()
+        with db_obj.cursor() as c:
+            c.execute("""
+                INSERT INTO learnings (agent_id, category, content, confidence,
+                                       embedding, created_at, status)
+                VALUES ('agent1', 'fact', 'The auth system uses JWT tokens', 1.0, ?, ?, 'active')
+            """, (base_emb.tobytes(), now))
+
+        close_emb = _nearly_identical_embedding(base_emb, noise=0.001)
+
+        import writeback as wb_mod
+        class _FakeModel:
+            def encode(self, text):
+                return close_emb
+        wb_mod.WriteBackMemory.model = property(lambda self: _FakeModel())
+        try:
+            resp = self._dispatch("learn", {
+                "content": "The auth system uses session cookies, not JWT",
+                "agent_id": "test",
+            })
+        finally:
+            from models import get_embedder as _ge
+            wb_mod.WriteBackMemory.model = property(lambda self: _ge())
+
+        assert "error" not in resp, f"Unexpected error: {resp}"
+        result = resp["result"]
+        # No cross-agent contradiction leaked: the probe is staged as a
+        # candidate (or written), NOT returned with agent1's content.
+        assert result["status"] != "contradiction", result
+        assert "agent1" not in json.dumps(result)
 
     def test_learn_force_true_writes_through(self, tmp_path, monkeypatch):
         """learn(force=True) writes even when contradictions exist."""
@@ -781,6 +828,80 @@ class TestHandleResolveContradiction:
                 (old_ids[1], new_lid, "test"),
             ]
 
+    def test_resolve_supersede_purges_old_synthetic_doc(self, tmp_path, monkeypatch):
+        """M4: resolve_contradiction's supersede must purge the OLD learning's
+        synthetic durable doc (documents/vault_fts/chunk_embeddings) via the
+        same content-hashed path _index_durable_learning would have indexed it
+        under -- otherwise a superseded learning's stale content keeps
+        surfacing in semantic/lexical doc search even though the learnings
+        table correctly marks it superseded."""
+        wb, db_obj, cfg = self._patch_writeback(tmp_path, monkeypatch)
+
+        import minnid
+        monkeypatch.setattr(minnid, "_writeback", wb)
+        monkeypatch.setattr(minnid, "_retrieval", None, raising=False)
+        import config as cfg_mod
+        monkeypatch.setattr(cfg_mod.DEFAULT_CONFIG, "db_path", cfg.db_path, raising=False)
+        monkeypatch.setattr(
+            cfg_mod.DEFAULT_CONFIG, "vault_path", cfg.vault_path, raising=False
+        )
+
+        old_content = "Old superseded fact about the auth flow before April 2026"
+        now = time.time()
+        with db_obj.cursor() as c:
+            c.execute("""
+                INSERT INTO learnings (agent_id, category, content, confidence,
+                                       created_at, status)
+                VALUES ('test', 'fact', ?, 1.0, ?, 'active')
+            """, (old_content, now))
+            old_id = c.lastrowid
+
+        # Index the OLD learning's synthetic doc exactly like the durable-store
+        # path would have, so there is something real for supersede to purge.
+        minnid._index_durable_learning(
+            "test", old_content, key=f"learning:{old_id}", db=db_obj
+        )
+        durable_path = minnid._durable_doc_path(
+            "test", f"learning:{old_id}", vault_path=cfg.vault_path, content=old_content
+        )
+        with db_obj.cursor() as c:
+            pre = c.execute(
+                "SELECT doc_id FROM documents WHERE path = ?", (durable_path,)
+            ).fetchone()
+        assert pre is not None, "test setup: synthetic doc was not indexed"
+        pre_doc_id = pre["doc_id"]
+
+        import writeback as wb_mod
+        wb_mod.WriteBackMemory.model = property(lambda self: None)
+        try:
+            resp = self._dispatch("resolve_contradiction", {
+                "new_content": "New fact: auth uses session cookies since April 2026",
+                "supersede_ids": [old_id],
+                "agent_id": "test",
+            })
+        finally:
+            from models import get_embedder as _ge
+            wb_mod.WriteBackMemory.model = property(lambda self: _ge())
+
+        assert "error" not in resp, f"Unexpected error: {resp}"
+        assert resp["result"]["status"] == "ok"
+
+        with db_obj.cursor() as c:
+            post_doc = c.execute(
+                "SELECT doc_id FROM documents WHERE doc_id = ?", (pre_doc_id,)
+            ).fetchone()
+            post_chunks = c.execute(
+                "SELECT COUNT(*) AS n FROM chunk_embeddings WHERE doc_id = ?",
+                (pre_doc_id,),
+            ).fetchone()
+            post_fts = c.execute(
+                "SELECT COUNT(*) AS n FROM vault_fts WHERE doc_id = ?", (pre_doc_id,)
+            ).fetchone()
+
+        assert post_doc is None, "superseded learning's synthetic doc row must be purged"
+        assert post_chunks["n"] == 0, "superseded learning's chunks must be purged"
+        assert post_fts["n"] == 0, "superseded learning's FTS row must be purged"
+
     def test_subscribe_contradictions_returns_events_for_read_learnings(self, tmp_path, monkeypatch):
         wb, db_obj, cfg = self._patch_writeback(tmp_path, monkeypatch)
 
@@ -818,6 +939,79 @@ class TestHandleResolveContradiction:
         events = subscribed["result"]["events"]
         assert len(events) == 1
         assert events[0]["superseded_learning_id"] == old_id
+
+    def test_subscribe_contradictions_never_leaks_global_event_count(self, tmp_path, monkeypatch):
+        """R10: subscribe_contradictions previously returned an UNSCOPED global
+        `SELECT COUNT(*) FROM contradiction_events` alongside the caller's own
+        (correctly scoped) events -- leaking cross-agent contradiction volume
+        to any identified caller. The response's "checked" diagnostics must
+        contain ONLY agent-scoped counts, and the agent-scoped count must not
+        include another agent's contradiction events.
+        """
+        wb, db_obj, cfg = self._patch_writeback(tmp_path, monkeypatch)
+
+        now = time.time()
+        with db_obj.cursor() as c:
+            # "codex" has one read+superseded learning (its own event).
+            c.execute("""
+                INSERT INTO learnings (agent_id, category, content, confidence, created_at, status)
+                VALUES ('test', 'fact', 'codex-relevant learning', 1.0, ?, 'active')
+            """, (now,))
+            codex_learning_id = c.lastrowid
+            c.execute("""
+                INSERT INTO learning_reads (learning_id, agent_id, read_at, source)
+                VALUES (?, 'codex', ?, 'unit-test')
+            """, (codex_learning_id, now))
+
+            # A DIFFERENT agent ("hermes") has its own unrelated read+superseded
+            # learning -- codex must never see or be counted against this.
+            c.execute("""
+                INSERT INTO learnings (agent_id, category, content, confidence, created_at, status)
+                VALUES ('test', 'fact', 'hermes-relevant learning', 1.0, ?, 'active')
+            """, (now,))
+            hermes_learning_id = c.lastrowid
+            c.execute("""
+                INSERT INTO learning_reads (learning_id, agent_id, read_at, source)
+                VALUES (?, 'hermes', ?, 'unit-test')
+            """, (hermes_learning_id, now))
+
+        import writeback as wb_mod
+        wb_mod.WriteBackMemory.model = property(lambda self: None)
+        try:
+            for lid in (codex_learning_id, hermes_learning_id):
+                resp = self._dispatch("resolve_contradiction", {
+                    "new_content": f"resolution for learning {lid}",
+                    "supersede_ids": [lid],
+                    "agent_id": "test",
+                })
+                assert resp["result"]["status"] == "ok"
+        finally:
+            from models import get_embedder as _ge
+            wb_mod.WriteBackMemory.model = property(lambda self: _ge())
+
+        subscribed = self._dispatch("minni_subscribe_contradictions", {
+            "agent_id": "codex",
+            "since_ts": now - 1,
+        })
+
+        assert "error" not in subscribed
+        checked = subscribed["result"]["checked"]
+
+        # No key anywhere in "checked" may carry the unscoped, cross-agent
+        # total (2 events exist globally; codex's own scope is 1).
+        for key, value in checked.items():
+            if isinstance(value, int):
+                assert value != 2, (
+                    f"checked[{key!r}]={value} looks like the unscoped global "
+                    "contradiction_events count leaking cross-agent volume"
+                )
+        assert checked["contradiction_events_for_agent_reads"] == 1
+        assert checked["learning_reads_for_agent"] == 1
+
+        # And the events list itself must never include hermes's event.
+        superseded_ids = {e["superseded_learning_id"] for e in subscribed["result"]["events"]}
+        assert hermes_learning_id not in superseded_ids
+        assert superseded_ids == {codex_learning_id}
 
     def test_resolve_new_content_required(self, tmp_path, monkeypatch):
         """resolve_contradiction returns error when new_content is missing."""

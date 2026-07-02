@@ -245,8 +245,17 @@ def from_local_transport(
     Preference order:
       1. explicit principals/<name>.json for any name in CANONICAL_PRINCIPAL_NAMES
          (local, default, operator, main — "main" last so explicit operator files win)
-      2. synthesize a safe wide-open local default (agent_id="main") — used for fresh installs
-         (RCM-003: only "main" accepted when no principal files; mismatches rejected upstream)
+      2. synthesize a local default (agent_id="main"):
+         - Fresh install (non-strict: NO principal files at all) → wide-open ``["*"]``
+           operator, preserving the single-user zero-config UX.
+         - Strict install (P3): principal files EXIST but none is a canonical
+           operator/main file. The operator has clearly set up an identity model
+           and did NOT author an operator principal, so a no-agent-id caller must
+           NOT be silently elevated to a wide-open operator ``main`` — that let any
+           local process on a shared multi-agent daemon claim full governance.
+           Synthesize a default-deny ``main`` instead, unless the operator asserts
+           the authenticated local-operator signal ``MINNI_LOCAL_OPERATOR`` (an
+           operator-/env-controlled channel, never wire-controlled).
     """
     d = principals_dir or PRINCIPALS_DIR
     _ensure_principals_dir(d)
@@ -256,14 +265,40 @@ def from_local_transport(
         )
         if p is not None:
             return p
-    # No operator config present — synthesize trusted local default "main".
+    # No canonical operator config present.
     # RCM-003: resolve_effective_principal now rejects non-"main" supplied in this mode.
+    if strict and not _local_operator_asserted():
+        # P3: strict install without an authored operator/main file → default-deny.
+        return EffectivePrincipal(
+            agent_id="main",
+            workspace_id="default",
+            transport=transport,
+            capabilities=[],
+            allowed_vault_roots=[],
+        )
+    # Fresh install (or operator-asserted local operator) → trusted wide-open main.
     return EffectivePrincipal(
         agent_id="main",
         workspace_id="default",
         transport=transport,
         capabilities=["*"],
         allowed_vault_roots=[],
+    )
+
+
+def _local_operator_asserted() -> bool:
+    """True when the operator has asserted the authenticated local-operator signal.
+
+    ``MINNI_LOCAL_OPERATOR`` is set in the daemon's own environment (operator-
+    controlled), never derived from wire input, so it is a trustworthy channel
+    for re-enabling a wide-open synthesized ``main`` in a strict install that
+    deliberately relies on the zero-config operator (single-user who added a
+    per-agent file but wants the no-agent-id caller to remain operator)."""
+    return os.environ.get("MINNI_LOCAL_OPERATOR", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
     )
 
 

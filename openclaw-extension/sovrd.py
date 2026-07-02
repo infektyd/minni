@@ -21,7 +21,6 @@ Authentication (SEC-001 temporary local-capability scheme):
 """
 
 import argparse
-import functools
 import hashlib
 import json
 import os
@@ -187,9 +186,13 @@ def get_agent(agent_id: str = "hermes") -> "SovereignAgent":
     return _agent_instances[agent_id]
 
 
-@functools.lru_cache(maxsize=10000)
 def _content_hash(text: str) -> str:
-    """SHA-256 hash of normalized text for dedup."""
+    """SHA-256 hash of normalized text for dedup.
+
+    X7: no lru_cache. SHA-256 over normalized text is cheap, and caching keyed on
+    the raw text retained up to 10k full payloads in memory for the process
+    lifetime (an unbounded-growth / sensitive-content-retention hazard).
+    """
     normalized = " ".join(text.lower().split())
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 

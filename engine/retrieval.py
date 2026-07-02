@@ -770,6 +770,49 @@ class RetrievalEngine:
             )
             return {"status": "degraded", "reason": str(exc)}
 
+    def purge_durable_document(self, path: str) -> dict:
+        """M4: remove a durable synthetic doc (by path) from every index.
+
+        When a durable learning is superseded/rejected, its synthetic document
+        row is left with page_status='accepted' and its chunks stay in FTS/FAISS,
+        so the stale content keeps surfacing in semantic/lexical doc search.
+        This mirrors the indexer's blocked-page purge: drop the FTS row, the
+        chunk_embeddings rows (tombstoning them out of the live FAISS index and
+        invalidating the rerank cache), then the document row itself.
+
+        Best-effort and fail-open: the learnings-table lifecycle is the source of
+        truth; a purge hiccup only means recall stays slightly stale until the
+        next reindex, never a lost write.
+        """
+        try:
+            with self.db.transaction() as c:
+                c.execute("SELECT doc_id FROM documents WHERE path = ?", (path,))
+                row = c.fetchone()
+                if row is None:
+                    return {"status": "not_found", "path": path}
+                doc_id = row["doc_id"]
+                old_chunk_ids = [
+                    r["chunk_id"]
+                    for r in c.execute(
+                        "SELECT chunk_id FROM chunk_embeddings WHERE doc_id = ?",
+                        (doc_id,),
+                    ).fetchall()
+                ]
+                c.execute("DELETE FROM vault_fts WHERE doc_id = ?", (doc_id,))
+                c.execute("DELETE FROM chunk_embeddings WHERE doc_id = ?", (doc_id,))
+                c.execute("DELETE FROM documents WHERE doc_id = ?", (doc_id,))
+            # Outside the txn: live-index maintenance is best-effort.
+            self._invalidate_durable_rerank(old_chunk_ids)
+            self._remove_live_faiss(old_chunk_ids)
+            return {"status": "ok", "doc_id": doc_id, "chunks": len(old_chunk_ids)}
+        except Exception as exc:
+            logger.warning(
+                "durable-index: purge failed for %r (%s) — learnings lifecycle "
+                "stands, doc-search recall stays stale until reindex",
+                path, exc,
+            )
+            return {"status": "degraded", "reason": str(exc)}
+
     def _invalidate_durable_rerank(self, chunk_ids: List[int]) -> None:
         """Best-effort rerank-cache invalidation for replaced chunks."""
         if not chunk_ids:
@@ -1369,15 +1412,45 @@ class RetrievalEngine:
 
     # ── Public API ─────────────────────────────────────────────
 
+    # R9: fan-out guard. A wire-supplied backend list of ["faiss-disk"]*N would
+    # build N disk-loading backends; dedup and cap the list, and reject unknown
+    # members loudly instead of silently skipping (a silent skip hid typos and
+    # let an attacker probe backend names).
+    _KNOWN_BACKENDS = ("faiss-disk", "faiss-mem", "qdrant", "lance")
+    _MAX_BACKENDS = 4
+
+    def _normalize_backend_names(self, backend_names: list) -> list:
+        """Dedup (order-preserving), cap length, and reject unknown members."""
+        seen: set = set()
+        deduped: list = []
+        for raw in backend_names:
+            name = str(raw)
+            if name not in self._KNOWN_BACKENDS:
+                raise ValueError(
+                    f"unknown backend {name!r}; known backends: "
+                    f"{list(self._KNOWN_BACKENDS)}"
+                )
+            if name not in seen:
+                seen.add(name)
+                deduped.append(name)
+        if len(deduped) > self._MAX_BACKENDS:
+            raise ValueError(
+                f"too many backends ({len(deduped)}); max {self._MAX_BACKENDS}"
+            )
+        return deduped
+
     def _resolve_backends(self, backend_names: list) -> list:
         """
         Resolve a list of backend name strings to VectorBackend instances.
 
         Currently supports: "faiss-disk", "faiss-mem".
         Stubs ("qdrant", "lance") raise ImportError at construction.
+
+        R9: the input list is deduped, capped, and validated first; an unknown
+        or over-long member is rejected loudly.
         """
         resolved = []
-        for name in backend_names:
+        for name in self._normalize_backend_names(backend_names):
             if name == "faiss-disk":
                 from backends.faiss_disk import FaissDiskBackend
                 b = FaissDiskBackend(self.config, self.db)
@@ -1394,8 +1467,6 @@ class RetrievalEngine:
                 from backends.lance import LanceBackend
                 b = LanceBackend(self.config)  # raises ImportError if not installed
                 resolved.append(b)
-            else:
-                logger.warning("Unknown backend %r — skipping", name)
         return resolved
 
     def _hits_to_dicts(self, hits, query_emb: np.ndarray) -> List[Dict]:
@@ -1779,18 +1850,43 @@ class RetrievalEngine:
                 links.append(target)
         return links
 
-    def _fetch_linked_context(self, links: List[str], limit: int = 8) -> List[Dict]:
+    @staticmethod
+    def _wikilink_has_like_metachar(candidate: str) -> bool:
+        """R4: reject wikilink candidates carrying SQL LIKE metacharacters.
+
+        A '[[%]]' or '[[_]]' wikilink would otherwise match every (or arbitrary)
+        document path via the LIKE predicate, so any candidate containing an
+        unescaped '%' or '_' is treated as untrusted and skipped rather than
+        allowed to fan out across the whole documents table.
+        """
+        return "%" in candidate or "_" in candidate
+
+    def _fetch_linked_context(
+        self,
+        links: List[str],
+        limit: int = 8,
+        *,
+        principal: Optional[EffectivePrincipal] = None,
+        workspace: str = "default",
+    ) -> List[Dict]:
         if not links:
             return []
         contexts = []
+        ws = workspace or getattr(principal, "workspace_id", "default") or "default"
         with self.db.cursor() as c:
             for link in links[:limit]:
                 stem = link[:-3] if link.endswith(".md") else link
                 basename = stem.split("/")[-1]
                 row = None
                 for candidate in (stem, f"{stem}.md", basename, f"{basename}.md"):
+                    # R4: '%'/'_' are LIKE metacharacters; a wikilink containing
+                    # them (e.g. '[[%]]') must not fan out across all docs.
+                    if self._wikilink_has_like_metachar(candidate):
+                        continue
                     c.execute(
-                        """SELECT d.doc_id, d.path, ce.chunk_text
+                        """SELECT d.doc_id, d.path, d.agent, d.privacy_level,
+                                  d.page_type, d.page_status,
+                                  ce.chunk_text
                            FROM documents d
                            JOIN chunk_embeddings ce ON ce.doc_id = d.doc_id
                            WHERE d.path LIKE ?
@@ -1802,6 +1898,22 @@ class RetrievalEngine:
                     if row is not None:
                         break
                 if row is not None:
+                    # R4: neighborhood summaries are a read surface — gate every
+                    # linked doc through can_read_document so restricted/foreign/
+                    # blocked memory never leaks via the wikilink graph. When no
+                    # principal is supplied (legacy back-compat), fall through
+                    # ungated as before.
+                    if principal is not None:
+                        raw = {
+                            "doc_id": row["doc_id"],
+                            "path": row["path"],
+                            "agent": row["agent"],
+                            "privacy_level": row["privacy_level"],
+                            "page_type": row["page_type"],
+                            "page_status": row["page_status"],
+                        }
+                        if not can_read_document(principal, ws, raw):
+                            continue
                     contexts.append({
                         "link": link,
                         "doc_id": row["doc_id"],
@@ -1810,7 +1922,13 @@ class RetrievalEngine:
                     })
         return contexts
 
-    def _add_neighborhood_summaries(self, results: List[Dict]) -> List[Dict]:
+    def _add_neighborhood_summaries(
+        self,
+        results: List[Dict],
+        *,
+        principal: Optional[EffectivePrincipal] = None,
+        workspace: str = "default",
+    ) -> List[Dict]:
         """Attach AFM summaries of 1-hop wikilinks; degrade to metadata."""
         for result in results:
             text = result.get("text") or result.get("full_document_text") or ""
@@ -1822,7 +1940,9 @@ class RetrievalEngine:
                 links = self._extract_wiki_links(text)
             if not links:
                 continue
-            contexts = self._fetch_linked_context(links)
+            contexts = self._fetch_linked_context(
+                links, principal=principal, workspace=workspace
+            )
             prompt = "\n\n".join(
                 f"{ctx['link']} ({ctx['path']}):\n{ctx['text']}" for ctx in contexts
             )
@@ -1938,7 +2058,9 @@ class RetrievalEngine:
                 ))
             results = self._merge_expanded_results(per_variant, query_variants, limit)
             if summarize_neighborhood:
-                results = self._add_neighborhood_summaries(results)
+                results = self._add_neighborhood_summaries(
+                    results, principal=principal, workspace=workspace
+                )
             if update_access:
                 with self.db.cursor() as c:
                     for result in results:
@@ -1980,7 +2102,9 @@ class RetrievalEngine:
                         for r in results
                         if r.get("attribution_score") is not None
                     ]
-                self.last_trace_id = _trace_ring().add(expanded_trace)
+                self.last_trace_id = _trace_ring().add(
+                    expanded_trace, owner=getattr(principal, "agent_id", None)
+                )
                 for result in results:
                     result["trace_id"] = self.last_trace_id
             except Exception as exc:
@@ -2547,7 +2671,9 @@ class RetrievalEngine:
             ]
         timing["total_ms"] = round((time.perf_counter() - total_t0) * 1000, 3)
         try:
-            self.last_trace_id = _trace_ring().add(trace)
+            self.last_trace_id = _trace_ring().add(
+                trace, owner=getattr(principal, "agent_id", None)
+            )
             for result in results:
                 result["trace_id"] = self.last_trace_id
         except Exception as exc:
@@ -2555,7 +2681,9 @@ class RetrievalEngine:
             self.last_trace_id = None
 
         if summarize_neighborhood:
-            results = self._add_neighborhood_summaries(results)
+            results = self._add_neighborhood_summaries(
+                results, principal=principal, workspace=workspace
+            )
 
         return results
 
@@ -2597,7 +2725,8 @@ class RetrievalEngine:
             # Try chunk_id first
             c.execute("""
                 SELECT ce.chunk_id, ce.doc_id, ce.chunk_text, ce.heading_context,
-                       d.path, d.agent, d.sigil, d.decay_score
+                       d.path, d.agent, d.sigil, d.decay_score,
+                       d.privacy_level, d.page_type, d.page_status
                 FROM chunk_embeddings ce
                 JOIN documents d ON d.doc_id = ce.doc_id
                 WHERE ce.chunk_id = ?
@@ -2609,7 +2738,8 @@ class RetrievalEngine:
             with self.db.cursor() as c:
                 c.execute("""
                     SELECT ce.chunk_id, ce.doc_id, ce.chunk_text, ce.heading_context,
-                           d.path, d.agent, d.sigil, d.decay_score
+                           d.path, d.agent, d.sigil, d.decay_score,
+                           d.privacy_level, d.page_type, d.page_status
                     FROM chunk_embeddings ce
                     JOIN documents d ON d.doc_id = ce.doc_id
                     WHERE ce.doc_id = ?
@@ -2640,6 +2770,16 @@ class RetrievalEngine:
             "token_count": 0,
             "confidence": None,
             "age_days": None,
+            # M3: surface real privacy/status/type so can_read_document does not
+            # silently default privacy to "safe" (which leaked private/blocked
+            # docs on the direct-expand path).
+            "privacy_level": row["privacy_level"] or "safe",
+            "page_type": row["page_type"],
+            "page_status": row["page_status"] or "candidate",
+            # Note: `documents` has no workspace_id column in this schema (see
+            # db.py CREATE TABLE documents); can_read_document already treats a
+            # missing workspace_id as call-scope-matching "default", which is
+            # the correct behavior here, not a privacy gap.
         }
 
         if depth == "document":
@@ -2797,6 +2937,7 @@ class RetrievalEngine:
                     JOIN learnings l ON l.learning_id = lf.learning_id
                     WHERE learnings_fts MATCH ? AND lf.agent_id IN ({placeholders})
                           AND l.superseded_by IS NULL
+                          AND (l.status IS NULL OR l.status NOT IN ('rejected','expired','superseded'))
                     ORDER BY rank
                     LIMIT ?
                 """, [safe_q, *scope, limit])
@@ -2808,6 +2949,7 @@ class RetrievalEngine:
                     JOIN learnings l ON l.learning_id = lf.learning_id
                     WHERE learnings_fts MATCH ?
                           AND l.superseded_by IS NULL
+                          AND (l.status IS NULL OR l.status NOT IN ('rejected','expired','superseded'))
                     ORDER BY rank
                     LIMIT ?
                 """, (safe_q, limit))

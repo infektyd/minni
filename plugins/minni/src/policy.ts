@@ -28,6 +28,16 @@ const RECALL_TERMS = [
 ];
 
 const LEARN_TERMS = ["learn", "remember this", "save to memory", "store this", "keep this", "make a note"];
+
+/**
+ * H1: imperative "write THIS" markers. A question can still carry an imperative
+ * durable-write ("Can you learn this: …?") — that must route to `learn` (which
+ * is not automatically allowed and goes through write-intent suppression), NOT
+ * to the automatic recall branch below. Distinguishes "learn this/that/it" (a
+ * command to store the following) from "learn about/anything" (a recall query).
+ */
+const IMPERATIVE_WRITE_MARKER =
+  /\b(learn|remember|save|store|note)\s+(this|that|the following|it)\b/;
 const VAULT_TERMS = ["vault note", "obsidian", "write note", "wiki page", "source note"];
 const AUDIT_TERMS = ["audit", "logs", "log tail", "transparency"];
 const STATUS_TERMS = ["status", "health", "daemon", "afm"];
@@ -62,7 +72,11 @@ export function routeMemoryIntent(task: string): MemoryIntent {
   // is read-only and automatic, so erring this way on an ambiguous question is
   // safe; an explicit imperative ("learn this …") is not a question and still
   // routes to learn.
-  if (isQuestion(text) && /\blearn(ed|ing|t|ings|s)?\b/.test(text)) {
+  if (
+    isQuestion(text) &&
+    /\blearn(ed|ing|t|ings|s)?\b/.test(text) &&
+    !IMPERATIVE_WRITE_MARKER.test(text)
+  ) {
     return {
       action: "recall",
       confidence: 0.74,

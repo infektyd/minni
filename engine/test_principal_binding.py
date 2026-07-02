@@ -222,6 +222,68 @@ def test_resolve_matching_per_agent_principal_file_wins(tmp_path: Path):
     assert not p.allows_vault_root(tmp_path / "operator-vault" / "wiki" / "note.md")
 
 
+def test_strict_install_without_operator_file_synthesizes_non_operator_main(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """P3: a strict install (some principals/*.json exists) that never authored a
+    canonical operator/local/default/main file must NOT let a no-agent-id caller
+    synthesize a wide-open ``main`` with ``capabilities=["*"]``. Previously
+    ``from_local_transport`` always fell through to the wide-open synthesis
+    whenever no canonical file matched, regardless of strict mode -- so any
+    local process on a shared multi-agent daemon got full governance for free,
+    with zero authentication. Only a non-canonical per-agent file (e.g.
+    codex.json) is present here, so strict=True but no operator/main file
+    exists; the no-agent-id resolution must come back default-deny (no caps,
+    no vault roots) and NOT is_operator_principal.
+    """
+    monkeypatch.delenv("MINNI_LOCAL_OPERATOR", raising=False)
+    principals = tmp_path / "principals"
+    principals.mkdir()
+    (principals / "codex.json").write_text(
+        json.dumps({"agent_id": "codex", "capabilities": ["search", "read"]}),
+        encoding="utf-8",
+    )
+    os.chmod(principals / "codex.json", 0o600)
+
+    p = resolve_effective_principal(
+        supplied_agent_id=None, transport="uds", principals_dir=principals
+    )
+
+    assert p.agent_id == "main"
+    assert p.capabilities == []
+    assert p.allowed_vault_roots == []
+    assert not principal.is_operator_principal(p)
+
+
+def test_strict_install_local_operator_env_signal_restores_wide_open_main(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """P3 escape hatch: the operator-controlled (never wire-controlled)
+    MINNI_LOCAL_OPERATOR env signal re-enables the wide-open synthesized
+    ``main`` in an otherwise-strict install with no authored operator file --
+    for the legitimate single-user case of "I added a per-agent file but the
+    no-agent-id caller (e.g. this same local daemon operator) should still
+    have full access"."""
+    monkeypatch.setenv("MINNI_LOCAL_OPERATOR", "1")
+    principals = tmp_path / "principals"
+    principals.mkdir()
+    (principals / "codex.json").write_text(
+        json.dumps({"agent_id": "codex", "capabilities": ["search", "read"]}),
+        encoding="utf-8",
+    )
+    os.chmod(principals / "codex.json", 0o600)
+
+    p = resolve_effective_principal(
+        supplied_agent_id=None, transport="uds", principals_dir=principals
+    )
+
+    assert p.agent_id == "main"
+    assert p.capabilities == ["*"]
+    assert principal.is_operator_principal(p)
+
+
 def test_resolve_unknown_fileless_agent_is_default_deny_not_operator(tmp_path: Path):
     principals = tmp_path / "principals"
     principals.mkdir()

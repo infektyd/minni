@@ -443,7 +443,13 @@ def _index_durable_learning(agent_id: str, content: str, key: str, db=_UNSET) ->
                 else "accepted"
             )
             privacy_level = meta["privacy_level"]
-            page_type = meta.get("page_type")
+            # M2: do NOT copy page_type from model-supplied frontmatter into the
+            # durable-learn synthetic doc. can_read_document treats page_type in
+            # {wiki,handoff,synthesis,decision,session} as cross-agent-readable, so
+            # a `type: wiki` learn would make a private learning cross-visible.
+            # A durable learning is always owner-scoped: pin a fixed, non-cross-
+            # visible type.
+            page_type = "learning"
             layer = meta["layer"]
         except Exception:
             pass  # fail-open: keep prior defaults
@@ -465,6 +471,53 @@ def _index_durable_learning(agent_id: str, content: str, key: str, db=_UNSET) ->
         logger.warning(
             "durable store: store-time semantic index failed for agent=%s (%s) "
             "— store stands, recall degraded to lexical until reindex",
+            agent_id, exc,
+        )
+
+
+def _purge_durable_learning(agent_id: str, content: str, db=_UNSET) -> None:
+    """M4: purge the synthetic doc for a superseded/rejected durable learning.
+
+    Mirrors ``_index_durable_learning``'s db/engine resolution (never touches the
+    live DEFAULT_CONFIG DB for a divergent-DB caller) and removes the durable
+    document row + FTS + chunks + live FAISS for the content-derived synthetic
+    path, so a superseded/rejected learning stops surfacing in semantic/lexical
+    document search. FAIL-OPEN: never raises; the learnings-table lifecycle is the
+    source of truth and a purge hiccup only leaves recall slightly stale.
+    """
+    try:
+        if db is _UNSET or db is None:
+            logger.warning(
+                "durable purge: _purge_durable_learning called without an explicit "
+                "db= — refusing to default to the live DEFAULT_CONFIG database; "
+                "skipping synthetic-doc purge (superseded content may linger in "
+                "doc-search until reindex). agent=%s",
+                agent_id,
+            )
+            return
+
+        from retrieval import RetrievalEngine
+
+        try:
+            store_db_path = os.path.abspath(db.config.db_path)
+        except Exception:
+            store_db_path = None
+        default_db_path = os.path.abspath(DEFAULT_CONFIG.db_path)
+
+        if store_db_path is not None and store_db_path == default_db_path:
+            engine = _lazy_retrieval()
+        else:
+            engine = RetrievalEngine(db, db.config)
+
+        path = _durable_doc_path(
+            agent_id, f"learning:{content}", vault_path=engine.config.vault_path,
+            content=content,
+        )
+        engine.purge_durable_document(path)
+    except Exception as exc:
+        logger.warning(
+            "durable purge: synthetic-doc purge failed for agent=%s (%s) — "
+            "learnings lifecycle stands, doc-search stays stale until reindex",
             agent_id, exc,
         )
 
@@ -729,6 +782,7 @@ def _governance_context() -> GovernanceContext:
         lazy_episodic=_lazy_episodic,
         record_latency=_record_latency,
         index_durable_learning=_index_durable_learning,
+        purge_durable_learning=_purge_durable_learning,
         maybe_archive_inbox_source=_maybe_archive_inbox_source,
         increment_request_count=_increment_governance_request_count,
         sovereign_db=SovereignDB,

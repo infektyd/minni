@@ -247,8 +247,12 @@ def test_indexer_infers_layers_from_frontmatter_and_identity_agent():
         "---\nagent: codex\ntype: concept\n---\nKnowledge"
     )
 
-    assert identity["agent"] == "identity:codex"
-    assert identity["layer"] == "identity"
+    # M6: on-disk vault markdown is untrusted; a forged `agent: identity:codex`
+    # must NOT self-assign the trusted identity recall layer. The extractor now
+    # strips the 'identity:' prefix so the identity layer is only assignable via
+    # the trusted seed path, never from indexed frontmatter.
+    assert identity["agent"] == "codex"
+    assert identity["layer"] != "identity"
     assert artifact["layer"] == "artifact"
     assert knowledge["layer"] == "knowledge"
 

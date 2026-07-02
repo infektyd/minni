@@ -296,7 +296,17 @@ def handle_health_report(params: dict, request_id: Any, context: HealthContext) 
     # Fail-closed: redact unless the dispatcher's trusted flag says this is a
     # fully-identified (non-recovery) caller. `_recovery` is set by dispatch and
     # cannot be spoofed by the client.
-    if params.get("_recovery") is not False:
+    #
+    # R6: the un-redacted report enumerates cross-agent document paths and
+    # contradicting-learning content with no agent/privacy/status filter, so a
+    # merely-identified non-operator caller must NOT see it. Full detail now
+    # additionally requires an operator/govern principal; every other identified
+    # caller gets the same aggregate-only redaction as a recovery caller.
+    from principal import EffectivePrincipal, is_operator_principal
+
+    stamped = params.get("_principal")
+    is_operator = isinstance(stamped, EffectivePrincipal) and is_operator_principal(stamped)
+    if params.get("_recovery") is not False or not is_operator:
         report = redact_health_report_for_recovery(report)
 
     return context.make_response(report, request_id)

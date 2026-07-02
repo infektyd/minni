@@ -531,6 +531,12 @@ def invoke_native_afm(operation: str, payload: Dict[str, Any], timeout: float = 
 BridgeClient = Callable[[Dict[str, Any], str, float], Dict[str, Any]]
 
 
+# R7: cap the AFM bridge response so an unauthenticated/port-squatting loopback
+# endpoint cannot stream an unbounded body and exhaust memory. 4 MiB is far above
+# any legitimate two-sentence HyDE / chat-completion payload.
+_AFM_BRIDGE_MAX_RESPONSE_BYTES = 4 * 1024 * 1024
+
+
 def _default_bridge_client(payload: Dict[str, Any], url: str, timeout: float) -> Dict[str, Any]:
     req = urllib.request.Request(
         url,
@@ -539,7 +545,15 @@ def _default_bridge_client(payload: Dict[str, Any], url: str, timeout: float) ->
         method="POST",
     )
     with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 - local-only AFM bridge
-        return json.loads(resp.read().decode("utf-8"))
+        # Read one byte past the cap so we can detect (and reject) an oversized
+        # body instead of silently truncating it into invalid JSON.
+        raw = resp.read(_AFM_BRIDGE_MAX_RESPONSE_BYTES + 1)
+        if len(raw) > _AFM_BRIDGE_MAX_RESPONSE_BYTES:
+            raise ValueError(
+                "AFM bridge response exceeded "
+                f"{_AFM_BRIDGE_MAX_RESPONSE_BYTES} bytes; refusing to buffer"
+            )
+        return json.loads(raw.decode("utf-8"))
 
 
 def afm_chat_completion(

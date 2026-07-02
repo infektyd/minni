@@ -146,7 +146,11 @@ class SovereignConfig:
     reorg_horizon_days: int = 30
 
     # HyDE cold-query second pass (PR-8)
-    hyde_enabled: bool = True
+    # R7: default OFF. HyDE posts the recall query to an unauthenticated loopback
+    # AFM endpoint (127.0.0.1:11437); a local port-squatter could otherwise
+    # harvest queries. Resolving the open question in favor of safety: opt in
+    # explicitly (config or MINNI-side) once a trusted local AFM is in place.
+    hyde_enabled: bool = False
     hyde_confidence_floor: float = 0.4
 
     # AFM self-organization loop (PR-12)

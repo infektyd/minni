@@ -87,12 +87,69 @@ function computeShelfHash(content: string): string {
   return createHash("sha256").update(content ?? "").digest("hex").slice(0, 16);
 }
 
-export function computePlanDigest(plan: PlanArtifact): string {
-  // sha256 over goal + (id,status,evidence) triplets for slices; sorted + stable keys for determinism.
+/**
+ * Legacy (v1) digest: goal + (id,status,evidence) slice triplets only. Retained
+ * so rehydratePlan can recognize plans persisted before H7 and upgrade them in
+ * place rather than hard-failing them as "tampered". Exported so the H7
+ * migration regression test can stamp a plan with a pre-H7 digest.
+ */
+export function computePlanDigestV1(plan: PlanArtifact): string {
   const sliceInfo = plan.slices
     .map((s) => ({ id: s.id, status: s.status, evidence: s.evidence }))
     .sort((a, b) => a.id.localeCompare(b.id));
   const payload = { goal: plan.goal, slices: sliceInfo };
+  const str = stableStringify(payload);
+  return createHash("sha256").update(str).digest("hex").slice(0, 16);
+}
+
+/**
+ * H7: the digest must cover EVERY field that compactPlanView / compactPlanPointer
+ * inject into agent-visible envelopes — otherwise a vault edit to an uncovered
+ * field (slice title, next_action, open_questions, constraints, scar_tissue,
+ * shelf_ref, gate/depends_on/superseded_by) passes digest validation and reaches
+ * the model unnoticed. Hash the full slice records plus all injected plan-level
+ * fields. Sorted + stable keys for determinism.
+ *
+ * The payload is versioned ("v2") so rehydratePlan can distinguish a genuine
+ * tamper from a pre-H7 plan (which validates against computePlanDigestV1) and
+ * upgrade the latter gracefully.
+ */
+export function computePlanDigest(plan: PlanArtifact): string {
+  const slices = plan.slices
+    .map((sl) => ({
+      id: sl.id,
+      title: sl.title,
+      status: sl.status,
+      gate: sl.gate,
+      depends_on: sl.depends_on ? [...sl.depends_on].sort() : undefined,
+      evidence: sl.evidence,
+      superseded_by: sl.superseded_by,
+    }))
+    .sort((a, b) => a.id.localeCompare(b.id));
+  const scar_tissue = (plan.scar_tissue ?? []).map((sc) => ({
+    kind: sc.kind,
+    signal: sc.signal,
+    resolution: sc.resolution,
+  }));
+  const shelf_ref = plan.shelf_ref
+    ? {
+        agent: plan.shelf_ref.agent,
+        wikilink: plan.shelf_ref.wikilink,
+        pull_hint: plan.shelf_ref.pull_hint,
+        approx_tokens: plan.shelf_ref.approx_tokens,
+        shelf_hash: plan.shelf_ref.shelf_hash,
+      }
+    : undefined;
+  const payload = {
+    v: 2,
+    goal: plan.goal,
+    next_action: plan.next_action,
+    constraints: plan.constraints ?? [],
+    open_questions: plan.open_questions ?? [],
+    scar_tissue,
+    shelf_ref,
+    slices,
+  };
   const str = stableStringify(payload);
   return createHash("sha256").update(str).digest("hex").slice(0, 16);
 }
@@ -525,15 +582,22 @@ export function updateSlice(
 
   // P10 (terminal-state transition): when every slice is resolved (done/superseded), move the
   // plan to a terminal status so resolveActivePlanView stops injecting a finished plan into
-  // future sessions. "accepted" is a real PageStatus that resolveActivePlanView already skips.
-  // Reopening a slice un-finishes the plan, so revert an auto-accepted plan back to draft.
+  // future sessions.
+  //
+  // H6: this auto-promotion is driven entirely by model-supplied evidence
+  // (isTrivialEvidence is a weak floor). It must NOT land the plan in "accepted"
+  // — that is an operator/approval outcome and is default-recallable, so a model
+  // could self-promote its own plan into recallable memory. Use the terminal,
+  // NON-recallable "complete" status instead (resolveActivePlanView skips it the
+  // same way). Reopening a slice un-finishes the plan, so revert a
+  // model-completed plan back to draft.
   const allResolved =
     newSlices.length > 0 &&
     newSlices.every((s) => s.status === "done" || s.status === "superseded");
   let nextStatus: PageStatus = plan.status;
   if (allResolved && (plan.status === "draft" || plan.status === "candidate")) {
-    nextStatus = "accepted";
-  } else if (!allResolved && plan.status === "accepted") {
+    nextStatus = "complete";
+  } else if (!allResolved && plan.status === "complete") {
     nextStatus = "draft";
   }
 
@@ -806,10 +870,30 @@ export async function rehydratePlan(notePath: string): Promise<PlanArtifact> {
     }
   }
 
-  // Check for digest mismatch instead of silent repair
+  // Check for digest mismatch instead of silent repair.
   const recomputed = computePlanDigest(plan);
   if (plan.plan_digest !== recomputed) {
-    throw new Error(`rehydratePlan: plan_digest mismatch (stored=${plan.plan_digest} computed=${recomputed}); note may be tampered`);
+    // H7: computePlanDigest was widened to cover all injected fields, which
+    // changes the stored digest value. A plan persisted before that change
+    // validates against the legacy (v1) digest. Recognize that case and UPGRADE
+    // it in place (re-persist with the v2 digest) rather than hard-failing a
+    // legitimate pre-H7 plan as "tampered". A digest that matches NEITHER the v2
+    // nor the v1 algorithm is a genuine tamper and still throws.
+    const legacy = computePlanDigestV1(plan);
+    if (plan.plan_digest === legacy) {
+      plan.plan_digest = recomputed;
+      // Best-effort re-persist so the note carries the v2 digest going forward.
+      // Never a direct file write (persistPlan journals); a write failure leaves
+      // the in-memory upgrade intact so this read still succeeds.
+      try {
+        const vaultPath = path.resolve(path.dirname(notePath), "..", "..");
+        await persistPlan(plan, { vaultPath, notePath });
+      } catch {
+        // advisory: the in-memory v2 digest is enough for this read to proceed
+      }
+    } else {
+      throw new Error(`rehydratePlan: plan_digest mismatch (stored=${plan.plan_digest} computed=${recomputed}); note may be tampered`);
+    }
   }
 
   // Record access (best-effort, append-only journal lives next to the note)
@@ -1164,7 +1248,8 @@ export async function resolveActivePlanView(
       plan.slices.every((s) => s.status === "done" || s.status === "superseded");
     if (allResolved && (plan.status === "draft" || plan.status === "candidate")) {
       const from = plan.status;
-      plan.status = "accepted";
+      // H6: terminal, non-recallable completion (not the recallable "accepted").
+      plan.status = "complete";
       await persistPlan(plan, { vaultPath, notePath: active.notePath });
       const journalPath = path.join(
         path.dirname(active.notePath),
@@ -1174,7 +1259,7 @@ export async function resolveActivePlanView(
         await appendJournal(journalPath, {
           kind: "status_reconciled",
           from,
-          to: "accepted",
+          to: "complete",
           at: new Date().toISOString(),
         });
       } catch {
