@@ -12,6 +12,7 @@ import path from "node:path";
 import test from "node:test";
 
 import {
+  identityDenialFrom,
   jsonRpcSocketRequest,
   recallResponseText,
   recoveryRouteFrom,
@@ -154,4 +155,68 @@ test("recallResponseText keeps the ok and offline-fallback paths unchanged", () 
     [],
   );
   assert.match(failedText, /Recall failed: Socket not found/);
+});
+
+// ── PR #132 P2: reserved-id (and other -32004) denials are live daemon answers,
+// not outages — they must never be mislabeled as "Daemon unavailable" nor be
+// masked by the offline vault fallback. ─────────────────────────────────────
+
+const RESERVED_ID_MESSAGE =
+  "reserved_agent_id: reserved agent_id 'main' requires operator context for 'search' — " +
+  "omit agent_id for the zero-config operator path, or set MINNI_LOCAL_OPERATOR in the " +
+  "daemon environment (operator-controlled, never wire-supplied)";
+
+const VAULT_MATCH = {
+  notePath: "/tmp/vault/wiki/sessions/socket-health.md",
+  relativePath: "wiki/sessions/socket-health.md",
+  wikilink: "[[wiki/sessions/socket-health]]",
+  title: "Socket health",
+  snippet: "check the socket",
+  score: 61,
+};
+
+test("identityDenialFrom extracts a live -32004 diagnostic, ignores transport failures", () => {
+  const envelope = {
+    jsonrpc: "2.0",
+    id: 1,
+    error: { code: -32004, message: RESERVED_ID_MESSAGE },
+  };
+  assert.equal(identityDenialFrom(envelope), RESERVED_ID_MESSAGE);
+  assert.equal(identityDenialFrom(undefined), undefined);
+  assert.equal(identityDenialFrom({ results: "hit" }), undefined);
+  // Other JSON-RPC errors (e.g. -32602 invalid params) are not identity denials.
+  assert.equal(
+    identityDenialFrom({ error: { code: -32602, message: "Invalid params" } }),
+    undefined,
+  );
+});
+
+test("minni_recall surfaces the reserved-id diagnostic, never the offline fallback", async () => {
+  const result = await withFakeDaemon(
+    (request) => ({
+      jsonrpc: "2.0",
+      id: request.id,
+      error: { code: -32004, message: RESERVED_ID_MESSAGE },
+    }),
+    (socketPath) => jsonRpcSocketRequest(socketPath, "search", { query: "x" }),
+  );
+  assert.equal(result.ok, false);
+  // Even with a local vault match on hand, the denial wins — the daemon
+  // ANSWERED; this is a misconfiguration, not an outage.
+  const text = recallResponseText("socket health", result, [VAULT_MATCH]);
+  assert.match(text, /reserved_agent_id/);
+  assert.match(text, /MINNI_LOCAL_OPERATOR/);
+  assert.doesNotMatch(text, /Daemon unavailable/);
+  assert.doesNotMatch(text, /offline vault fallback/);
+  assert.doesNotMatch(text, /socket-health/);
+});
+
+test("a true transport failure still falls back to the offline vault scan", () => {
+  const text = recallResponseText(
+    "socket health",
+    { ok: false, error: "connect ECONNREFUSED /tmp/nope.sock" },
+    [VAULT_MATCH],
+  );
+  assert.match(text, /Daemon unavailable — offline vault fallback/);
+  assert.match(text, /socket-health/);
 });

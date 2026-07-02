@@ -305,6 +305,25 @@ function recoveryErrorMessage(route: Record<string, unknown>): string {
 }
 
 /**
+ * Extract a live identity/authz denial from a JSON-RPC error envelope
+ * (#132 P2). A -32004 (capability_denied / reserved_agent_id / recovery)
+ * means the daemon ANSWERED and refused the caller's identity — a
+ * misconfiguration, not an outage — so callers must not fall back to
+ * offline framing. Transport failures carry no JSON-RPC error envelope
+ * and return undefined, keeping the offline fallback intact.
+ */
+export function identityDenialFrom(payload: unknown): string | undefined {
+  if (!payload || typeof payload !== "object") return undefined;
+  const error = (payload as Record<string, unknown>).error;
+  if (!error || typeof error !== "object") return undefined;
+  const record = error as Record<string, unknown>;
+  if (record.code !== -32004) return undefined;
+  return typeof record.message === "string" && record.message
+    ? record.message
+    : "capability_denied";
+}
+
+/**
  * Convert a JSON-RPC success `result` into a JsonResult. A success-wrapped
  * recovery envelope means identity is unresolved and the call did NOT do what
  * was asked — it must read as a FAILED RPC (surfacing the remediation route),
@@ -654,6 +673,13 @@ export function recallResponseText(
       "Recall denied — Minni identity recovery required (not a recall miss).",
       JSON.stringify(recovery, null, 2),
     ].join("\n");
+  }
+  // #132 P2: a routeless -32004 (e.g. reserved_agent_id, capability_denied)
+  // is still a live daemon answer — surface its diagnostic, never the
+  // "Daemon unavailable" offline framing or the unscoped local fallback.
+  const denial = identityDenialFrom(result.data);
+  if (denial) {
+    return `Recall denied by the daemon (identity/authz misconfiguration, not an outage): ${denial}`;
   }
   if (vaultResults.length) {
     return formatRecall(
