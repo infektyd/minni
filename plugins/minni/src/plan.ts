@@ -114,7 +114,7 @@ export function computePlanDigestV1(plan: PlanArtifact): string {
  * tamper from a pre-H7 plan (which validates against computePlanDigestV1) and
  * upgrade the latter gracefully.
  */
-export function computePlanDigest(plan: PlanArtifact): string {
+function computePlanDigestHexV2(plan: PlanArtifact): string {
   const slices = plan.slices
     .map((sl) => ({
       id: sl.id,
@@ -153,6 +153,43 @@ export function computePlanDigest(plan: PlanArtifact): string {
   const str = stableStringify(payload);
   return createHash("sha256").update(str).digest("hex").slice(0, 16);
 }
+
+/**
+ * #122 F-PLAN-DIGEST-CROSSPROC: the stored digest is version-tagged
+ * ("v<N>:<hex>") and read-time recognition dispatches on the tag through a
+ * registry of every historical algorithm, so a future payload widening (v3)
+ * cannot re-open the single-legacy-fn cliff that transiently bricked plan
+ * tools during the v1->v2 rollout. Untagged stored digests (written by
+ * pre-tagging builds) are still recognized as v2-or-v1 exactly as before.
+ */
+export const PLAN_DIGEST_VERSION = 2;
+
+const PLAN_DIGEST_ALGORITHMS: Record<number, (plan: PlanArtifact) => string> = {
+  1: computePlanDigestV1,
+  2: computePlanDigestHexV2,
+};
+
+/** Current digest, version-tagged for cross-version read dispatch. */
+export function computePlanDigest(plan: PlanArtifact): string {
+  return `v${PLAN_DIGEST_VERSION}:${computePlanDigestHexV2(plan)}`;
+}
+
+function parsePlanDigestTag(stored: string): { version: number; hex: string } | undefined {
+  const m = stored.match(/^v(\d+):([0-9a-f]+)$/);
+  return m ? { version: Number(m[1]), hex: m[2] } : undefined;
+}
+
+/**
+ * Statuses a plan never returns from. Mirrors resolveActivePlanView's
+ * injection-suppression set; shared by createPlan's displacement warning and
+ * the minni_plan_activate terminal guard (#122).
+ */
+export const TERMINAL_PLAN_STATUSES: ReadonlySet<string> = new Set([
+  "accepted",
+  "complete",
+  "rejected",
+  "superseded",
+]);
 
 export function slugifySliceId(title: string, taken: Set<string>): string {
   let slug = title
@@ -417,7 +454,7 @@ export function parseJournal(journalText: string): PlanEvent[] {
 export async function createPlan(
   input: CreatePlanInput,
   deps: CreatePlanDeps = {},
-): Promise<{ plan: PlanArtifact; write: VaultWriteResult }> {
+): Promise<{ plan: PlanArtifact; write: VaultWriteResult; displaced_active?: string }> {
   if (!input.goal?.trim()) {
     throw new Error("plan requires non-empty goal");
   }
@@ -465,12 +502,32 @@ export async function createPlan(
   const plan: PlanArtifact = basePlan;
   const writeRes = await persistPlan(plan, { vaultPath, writeVaultPage: writeFn });
 
+  // #122 F-PLAN-CREATE-OVERWRITES-ACTIVE: auto-activate still wins the pointer,
+  // but displacing a non-terminal in-flight plan must be surfaced, not silent —
+  // otherwise subsequent id-less plan_update/plan_status calls retarget the
+  // wrong plan without notice. First-plan and terminal-incumbent cases stay
+  // silent. An unreadable incumbent note is treated as in-flight (warn).
+  let displaced_active: string | undefined;
+  const incumbent = await getActivePlan(vaultPath);
+  if (incumbent && incumbent.plan_id !== plan.plan_id) {
+    let incumbentStatus = "";
+    try {
+      const raw = await readFile(incumbent.notePath, "utf8");
+      incumbentStatus = String(parseFrontmatter(raw).frontmatter.status ?? "");
+    } catch {
+      // unreadable incumbent: conservatively report the displacement
+    }
+    if (!TERMINAL_PLAN_STATUSES.has(incumbentStatus)) {
+      displaced_active = incumbent.plan_id;
+    }
+  }
+
   await setActivePlan(vaultPath, plan.plan_id, writeRes.notePath);
 
   const journalPath = path.join(path.dirname(writeRes.notePath), `${plan.plan_id}.log.md`);
   await appendJournal(journalPath, { kind: "rehydrated", at: plan.created });
 
-  return { plan, write: writeRes };
+  return { plan, write: writeRes, displaced_active };
 }
 
 /** Write plan artifact back to vault (create or update). Recomputes updated + plan_digest. */
@@ -873,23 +930,38 @@ export async function rehydratePlan(notePath: string): Promise<PlanArtifact> {
   // Check for digest mismatch instead of silent repair.
   const recomputed = computePlanDigest(plan);
   if (plan.plan_digest !== recomputed) {
-    // H7: computePlanDigest was widened to cover all injected fields, which
-    // changes the stored digest value. A plan persisted before that change
-    // validates against the legacy (v1) digest. Recognize that case and UPGRADE
-    // it in place (re-persist with the v2 digest) rather than hard-failing a
-    // legitimate pre-H7 plan as "tampered". A digest that matches NEITHER the v2
-    // nor the v1 algorithm is a genuine tamper and still throws.
-    const legacy = computePlanDigestV1(plan);
-    if (plan.plan_digest === legacy) {
+    // #122 F-PLAN-DIGEST-CROSSPROC: dispatch on the stored digest's version tag
+    // through the algorithm registry. Any KNOWN prior version (or an untagged
+    // stamp from a pre-tagging build, which validates against v2-or-v1 exactly
+    // as before) is a legitimate plan and gets UPGRADED in place (re-persist
+    // with the current tagged digest) rather than hard-failed as "tampered".
+    // An UNKNOWN (newer) version degrades gracefully instead of claiming
+    // tamper; only a stamp matching no known algorithm is a genuine tamper.
+    const tagged = parsePlanDigestTag(plan.plan_digest);
+    let recognized: boolean;
+    if (tagged) {
+      const algo = PLAN_DIGEST_ALGORITHMS[tagged.version];
+      if (!algo) {
+        throw new Error(
+          `rehydratePlan: plan_digest version v${tagged.version} on ${notePath} is newer than this plugin supports (max v${PLAN_DIGEST_VERSION}); update the minni plugin to read this note`,
+        );
+      }
+      recognized = algo(plan) === tagged.hex;
+    } else {
+      recognized =
+        plan.plan_digest === computePlanDigestHexV2(plan) ||
+        plan.plan_digest === computePlanDigestV1(plan);
+    }
+    if (recognized) {
       plan.plan_digest = recomputed;
-      // Best-effort re-persist so the note carries the v2 digest going forward.
-      // Never a direct file write (persistPlan journals); a write failure leaves
-      // the in-memory upgrade intact so this read still succeeds.
+      // Best-effort re-persist so the note carries the current tagged digest
+      // going forward. Never a direct file write (persistPlan journals); a write
+      // failure leaves the in-memory upgrade intact so this read still succeeds.
       try {
         const vaultPath = path.resolve(path.dirname(notePath), "..", "..");
         await persistPlan(plan, { vaultPath, notePath });
       } catch {
-        // advisory: the in-memory v2 digest is enough for this read to proceed
+        // advisory: the in-memory upgraded digest is enough for this read to proceed
       }
     } else {
       throw new Error(`rehydratePlan: plan_digest mismatch (stored=${plan.plan_digest} computed=${recomputed}); note may be tampered`);
@@ -905,6 +977,41 @@ export async function rehydratePlan(notePath: string): Promise<PlanArtifact> {
   }
 
   return plan;
+}
+
+/**
+ * #122 F-PLAN-RESTORE-SELFBLOCK: bare-scalar read for recovery paths. Returns a
+ * skeleton PlanArtifact carrying only the frontmatter scalars that restorePlan
+ * consumes from `current` (plan_id, status, created, updated, plan_digest, rev)
+ * with NO digest or evidence validation — so minni_plan_restore can heal a note
+ * whose strict rehydratePlan throws (the exact bricked state it exists to fix).
+ * Every digest-covered field comes from the history snapshot, and persistPlan
+ * recomputes the digest on write, so nothing corrupt survives the restore.
+ */
+export async function rehydratePlanScalars(notePath: string): Promise<PlanArtifact> {
+  const raw = await readFile(notePath, "utf8");
+  const { frontmatter: fm } = parseFrontmatter(raw);
+  const plan_id = String(fm.plan_id ?? "");
+  if (!plan_id) {
+    throw new Error(`rehydratePlanScalars: note ${notePath} missing plan_id in frontmatter`);
+  }
+  const created = typeof fm.created === "string" ? fm.created : new Date().toISOString();
+  const revVal = fm.plan_rev;
+  const rev = typeof revVal === "number" ? revVal : (typeof revVal === "string" ? parseInt(revVal, 10) : 0) || 0;
+  return {
+    plan_id,
+    goal: "",
+    status: (fm.status as PageStatus) || "draft",
+    constraints: [],
+    slices: [],
+    open_questions: [],
+    scar_tissue: [],
+    next_action: "",
+    plan_digest: typeof fm.plan_digest === "string" ? fm.plan_digest : "",
+    created,
+    updated: typeof fm.updated === "string" ? fm.updated : created,
+    rev,
+  };
 }
 
 export function historyPathFor(notePath: string): string {
@@ -1122,6 +1229,28 @@ export async function setActivePlan(
   await writeFile(pointerPath, data, "utf8");
 }
 
+/**
+ * #122 F-PLAN-ACTIVATE-NO-TERMINAL-GUARD: setActivePlan gated on the plan's
+ * status — a terminal plan (resolveActivePlanView's suppression set) must not
+ * be re-activated. Status is read via the bare-scalar path so a digest-bricked
+ * but non-terminal plan can still be activated (as before this guard).
+ */
+export async function activatePlanChecked(
+  vaultPath: string,
+  plan_id: string,
+  notePath: string,
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  const scalars = await rehydratePlanScalars(notePath);
+  if (TERMINAL_PLAN_STATUSES.has(scalars.status)) {
+    return {
+      ok: false,
+      error: `plan ${plan_id} has terminal status '${scalars.status}' and cannot be re-activated; create a new plan (minni_plan_create) or restore a prior revision (minni_plan_restore) instead`,
+    };
+  }
+  await setActivePlan(vaultPath, plan_id, notePath);
+  return { ok: true };
+}
+
 export async function getActivePlan(
   vaultPath: string
 ): Promise<{ plan_id: string; notePath: string; set_at: string } | undefined> {
@@ -1228,12 +1357,7 @@ export async function resolveActivePlanView(
     const active = await getActivePlan(vaultPath);
     if (!active) return undefined;
     const plan = await rehydratePlan(active.notePath);
-    if (
-      plan.status === "accepted" ||
-      (plan.status as string) === "complete" ||
-      plan.status === "superseded" ||
-      plan.status === "rejected"
-    ) {
+    if (TERMINAL_PLAN_STATUSES.has(plan.status)) {
       return undefined;
     }
     // Honest-health self-heal (audit C4): plans completed under a stale plugin
