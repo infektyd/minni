@@ -578,6 +578,20 @@ export function formatRecall(query: string, response: RecallResponse, vaultResul
 }
 
 /**
+ * X5: decide whether to run the local `searchVaultNotes` pre-scan for a recall.
+ *
+ * The local pre-scan reads Markdown straight off disk and is NOT subject to the
+ * daemon's workspace scoping / read-privacy policy. When the daemon recall
+ * succeeds, its (properly scoped) results are authoritative and the unscoped
+ * local snippets must not be injected alongside them. The pre-scan therefore
+ * runs only as an OFFLINE FALLBACK: daemon unreachable AND the caller did not
+ * opt out via includeVault=false.
+ */
+export function shouldPrescanVault(daemonOk: boolean, includeVault: boolean): boolean {
+  return includeVault && !daemonOk;
+}
+
+/**
  * Per-turn lean recall (UserPromptSubmit). Two reductions vs formatRecall:
  *  1. Drops the verbose per-result provenance (score ranks, decay_factor,
  *     query_variants, rrf/cross_encoder, trace_id, source path) — keeps only

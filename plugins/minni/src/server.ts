@@ -22,8 +22,10 @@ import {
   learnMemory,
   listPendingHandoffs,
   recallMemory,
+  shouldPrescanVault,
   statusAndAudit,
   subscribeContradictions,
+  type RecallResponse,
 } from "./sovereign.js";
 import {
   buildHandoffPacket,
@@ -493,16 +495,11 @@ server.registerTool(
   },
   async ({ query, layer, limit, workspaceId, scope, cross_agent, includeVault }) => {
     const effectiveVaultPath = DEFAULT_VAULT_PATH;
-    const vaultResults =
-      includeVault === false
-        ? []
-        : filterSafeVaultResults(
-            await searchVaultNotes(
-              effectiveVaultPath,
-              query,
-              Math.min(limit ?? 5, 8),
-            ),
-          );
+    // X5: run the daemon recall FIRST. Its results are workspace/agent-scoped and
+    // subject to read policy. The local searchVaultNotes pre-scan is NOT scoped, so
+    // it must only be used as an offline fallback (daemon unreachable) — never
+    // injected alongside a successful daemon recall where it would leak
+    // workspace-foreign snippets past the daemon boundary.
     const result = await recallMemory({
       query,
       layer,
@@ -512,9 +509,23 @@ server.registerTool(
       workspaceId: workspaceId ?? DEFAULT_WORKSPACE_ID,
       agentId: DEFAULT_AGENT_ID, // G11: server-side default only (model no longer supplies agentId)
     });
-    const responseText =
-      result.ok && result.data
-        ? formatRecall(query, result.data, vaultResults)
+    const daemonOk = result.ok && !!result.data;
+    const vaultResults = shouldPrescanVault(daemonOk, includeVault !== false)
+      ? filterSafeVaultResults(
+          await searchVaultNotes(
+            effectiveVaultPath,
+            query,
+            Math.min(limit ?? 5, 8),
+          ),
+        )
+      : [];
+    const fallbackResponse: RecallResponse = {
+      results: "Daemon unavailable — offline vault fallback (workspace-unscoped).",
+    };
+    const responseText = daemonOk
+      ? formatRecall(query, result.data!, [])
+      : vaultResults.length
+        ? formatRecall(query, fallbackResponse, vaultResults)
         : `Recall failed: ${result.error}`;
     await recordAudit(effectiveVaultPath, {
       tool: "minni_recall",
