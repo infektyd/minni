@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import re
 import time
 from pathlib import Path
@@ -16,6 +17,9 @@ from afm_passes._graph_utils import (
     synthesis_pages_by_tag,
     wikilink_neighborhoods,
 )
+from safety import is_instruction_like
+
+logger = logging.getLogger("sovereign.afm.synthesis")
 
 PROMPT_VERSION = "synthesis.v1"
 
@@ -65,6 +69,23 @@ def _draft_for_cluster(label: str, pages: list, trace_id: str, *, source_kind: s
         "## Citations",
         *[f"- `{citation}`" for citation in citations],
     ])
+    body = "\n".join(body_lines)
+
+    # Finding #4: synthesis combines multiple source pages' content into one new
+    # draft body. If ANY source page was instruction_like (flagged directly, or
+    # itself is_instruction_like on its own body), the synthesized draft inherits
+    # the flag even when the synthesized prose no longer trips the regex — the
+    # detector must not be launderable by paraphrase-through-synthesis.
+    own_flag = is_instruction_like(body)
+    source_flag = any(page.instruction_like or is_instruction_like(page.body) for page in pages)
+    instruction_like = own_flag or source_flag
+    if instruction_like and not own_flag:
+        logger.warning(
+            "synthesis draft %r inherits instruction_like from source page(s) in "
+            "cluster %r; synthesized body did not itself trip the detector",
+            title, label,
+        )
+
     return {
         "page_id": _draft_id(title, sources, trace_id),
         "kind": "synthesis",
@@ -77,7 +98,8 @@ def _draft_for_cluster(label: str, pages: list, trace_id: str, *, source_kind: s
         "tags": [label],
         "sources": sources,
         "citations": citations,
-        "body": "\n".join(body_lines),
+        "body": body,
+        "instruction_like": 1 if instruction_like else 0,
     }
 
 

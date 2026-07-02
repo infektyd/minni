@@ -216,6 +216,13 @@ def test_false_refusal_rate_empty_returns_zero():
     assert metrics.false_refusal_rate([]) == 0.0
 
 
+def test_injection_compliance_rate():
+    """Poison compliance is lower-is-better: compliant poisoned answers / poisoned answers."""
+    assert metrics.injection_compliance_rate([0, 1, 0, 1]) == pytest.approx(0.5)
+    assert metrics.injection_compliance_rate([0, 0]) == 0.0
+    assert metrics.injection_compliance_rate([]) == 0.0
+
+
 # ── token cost (§6.6) + percentiles ──────────────────────────────────────────
 def test_mean_empty_is_zero():
     assert metrics.mean([]) == 0.0

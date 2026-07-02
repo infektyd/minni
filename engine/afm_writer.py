@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import queue
 import re
 import threading
@@ -11,6 +12,10 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import yaml  # RCM-011: for safe_dump of title/tags to prevent newline key injection
+
+from safety import is_instruction_like
+
+logger = logging.getLogger("sovereign.afm.afm_writer")
 
 _WORK_QUEUE: "queue.Queue[tuple[dict, threading.Event, dict]]" = queue.Queue()
 _WORKER_STARTED = False
@@ -97,7 +102,7 @@ def _contains_forged_frontmatter(content: str) -> bool:
     return False
 
 
-def _frontmatter(draft: dict, created: str, expires_at: str, gate_status: str) -> str:
+def _frontmatter(draft: dict, created: str, expires_at: str, gate_status: str, instruction_like: bool = False) -> str:
     # RCM-011: build via dict + yaml.safe_dump (handles multiline title/tags safely, prevents injection)
     prompt_version = draft.get("prompt_version")
     tags = [str(tag) for tag in draft.get("tags", []) if str(tag).strip()]
@@ -113,6 +118,10 @@ def _frontmatter(draft: dict, created: str, expires_at: str, gate_status: str) -
         "expires_at": expires_at,
         "gate_status": gate_status,
     }
+    if instruction_like:
+        # Finding #4: carried so a later synthesis pass reading this page back via
+        # load_vault_pages() sees the flag rather than losing it once it is staged.
+        fm["instruction_like"] = True
     if prompt_version:
         fm["prompt_version"] = prompt_version
     if tags:
@@ -139,6 +148,26 @@ def _write_one(vault: Path, draft: dict, writeback: Any = None) -> dict:
         blockers = blockers + ["forged-frontmatter (RCM-010 / SEC-018)"]
     contradictions = _contradiction_candidates(draft, writeback)
     gate_status = "blocked" if blockers or contradictions else "ready_for_review"
+
+    # Finding #4: this is the staging point where a synthesized draft becomes a
+    # durable vault page. Trust-but-verify the draft's own instruction_like (set by
+    # a synthesis pass that inherited it from its source inputs), and OR in a fresh
+    # recompute on the final body so the flag can never be laundered away by a
+    # pass that forgot to propagate it.
+    # Scan the actual text being written — title included: a poisoned title over
+    # a benign body (e.g. a concept extracted from an injected heading) lands in
+    # the frontmatter and the markdown heading just the same.
+    draft_body = draft.get("body") or ""
+    own_flag = is_instruction_like(f"{draft.get('title') or ''}\n{draft_body}")
+    carried_flag = bool(draft.get("instruction_like"))
+    instruction_like = own_flag or carried_flag
+    if instruction_like and not own_flag:
+        logger.warning(
+            "afm_writer staging draft %r (page_id=%s) as instruction_like via "
+            "inherited flag; the written body did not itself trip the detector",
+            draft.get("title"), draft.get("page_id"),
+        )
+
     section = draft.get("section") or f"{draft.get('kind', 'concept')}s"
     rel = Path("wiki") / section / f"{_utc()[:10].replace('-', '')}-{_slugify(draft['title'])}-{draft['page_id'][-6:]}.md"
     path = vault / rel
@@ -150,7 +179,7 @@ def _write_one(vault: Path, draft: dict, writeback: Any = None) -> dict:
         # vector — that is fully protected by safe_dump in _frontmatter per RCM-011). Out of RCM-010/011 YAML scope.
         safe_title = str(draft.get("title", "")).replace("\n", " ").replace("#", "")[:80]
         body = (
-            _frontmatter(draft, created, expires_at, gate_status)
+            _frontmatter(draft, created, expires_at, gate_status, instruction_like)
             + f"# {safe_title}\n\n"
             + f"{draft.get('body', '').strip()}\n\n"
             + "## Sources\n\n"

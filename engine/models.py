@@ -2,16 +2,17 @@
 Minni — Module-Level Model Singletons.
 
 Provides cached, process-wide singletons for the embedding model and
-cross-encoder re-ranker. Replacing scattered SentenceTransformer(...)
+cross-encoder re-ranker and NLI attribution scorer. Replacing scattered SentenceTransformer(...)
 instantiations with these helpers means models are loaded exactly once
 per process, cutting cold-start time when multiple engine components are
 active simultaneously.
 
 Usage:
-    from models import get_embedder, get_cross_encoder
+    from models import get_embedder, get_cross_encoder, get_attribution_cross_encoder
 
     embedder = get_embedder()          # SentenceTransformer singleton
     cross_enc = get_cross_encoder()    # CrossEncoder singleton (or None)
+    nli_enc = get_attribution_cross_encoder()  # NLI CrossEncoder singleton (or None)
 
 Both functions are safe to call from multiple threads; functools.cache
 provides the lock-free singleton guarantee after the first call completes.
@@ -76,4 +77,30 @@ def get_cross_encoder():
         return None
     except Exception as e:
         logger.warning("Failed to load cross-encoder %s: %s", DEFAULT_CONFIG.reranker_model, e)
+        return None
+
+
+@functools.cache
+def get_attribution_cross_encoder():
+    """
+    Return the process-wide CrossEncoder singleton for NLI attribution scoring.
+
+    Model name is taken from DEFAULT_CONFIG.attribution_model.
+    Returns the CrossEncoder instance, or None if unavailable or disabled.
+    """
+    if not DEFAULT_CONFIG.attribution_enabled:
+        return None
+    os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+    try:
+        from sentence_transformers import CrossEncoder
+        model = CrossEncoder(DEFAULT_CONFIG.attribution_model)
+        logger.info("Attribution cross-encoder loaded (singleton): %s", DEFAULT_CONFIG.attribution_model)
+        return model
+    except ImportError:
+        logger.warning(
+            "sentence-transformers not installed — attribution cross-encoder unavailable"
+        )
+        return None
+    except Exception as e:
+        logger.warning("Failed to load attribution cross-encoder %s: %s", DEFAULT_CONFIG.attribution_model, e)
         return None

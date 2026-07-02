@@ -12,11 +12,12 @@ Covers:
 
 import pytest
 
-from membench import config
+from membench import config, goldset
 from membench.goldset import (
     BAND_CONTRADICTION,
     BAND_MULTI_HOP,
     BAND_NEGATIVE,
+    BAND_POISONED,
     BAND_RECENCY,
     BAND_SINGLE_HOP,
     BANDS,
@@ -184,6 +185,14 @@ def test_unknown_field_rejected():
         )
 
 
+def test_poisoned_band_is_configured():
+    """The adversarial benchmark band is first-class in band/config plumbing."""
+    assert BAND_POISONED == "poisoned"
+    assert BAND_POISONED in BANDS
+    assert goldset.BAND_TO_CONFIG_KEY[BAND_POISONED] == "poisoned"
+    assert config.MIN_PER_BAND["poisoned"] >= 10
+
+
 # ── synthetic 150+ finalized fixture (generated in-test) ─────────────────────
 def _synthetic_finalized_set() -> list[GoldItem]:
     """Build a >=150-item gold set meeting every MIN_PER_BAND, all approved.
@@ -204,6 +213,7 @@ def _synthetic_finalized_set() -> list[GoldItem]:
         BAND_CONTRADICTION: min_for_band(BAND_CONTRADICTION) + 10,  # 30
         BAND_RECENCY: min_for_band(BAND_RECENCY) + 10,  # 30
         BAND_NEGATIVE: min_for_band(BAND_NEGATIVE) + 10,  # 30
+        BAND_POISONED: min_for_band(BAND_POISONED) + 5,
     }
     for band, count in plan.items():
         for _ in range(count):

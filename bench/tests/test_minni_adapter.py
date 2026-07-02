@@ -1669,3 +1669,35 @@ def test_minni_recall_over_gold_is_nonempty(corpus, budget):
         )
     finally:
         adapter.teardown()
+
+
+def test_query_context_uses_daemon_text_not_raw_corpus(monkeypatch, corpus, budget, tmp_path):
+    """PR review (round 4, P2): the agent under test must see the daemon's
+    model-facing text (evidence envelopes) in context_string — not the raw
+    corpus bodies, which live Minni recall would never return unwrapped."""
+    import membench.adapters.minni_adapter as mod
+
+    adapter = MinniAdapter()
+    _prime_adapter_for_query(adapter, corpus, tmp_path)
+    doc_id = sorted(corpus.doc_ids())[0]
+    marker = f"{mod._DOC_ID_MARKER_PREFIX}{mod._encode_doc_id(doc_id)}]"
+    envelope = (
+        f'<EVIDENCE source="x" instruction_like="true">{marker} '
+        f"enveloped daemon body</EVIDENCE>"
+    )
+    monkeypatch.setattr(
+        mod,
+        "_rpc",
+        lambda *a, **k: {"results": [{"text": envelope, "content": envelope, "score": 0.9}]},
+    )
+    try:
+        result = adapter.query("anything", budget)
+        assert [r.doc_id for r in result.ranked_results] == [doc_id]
+        assert "enveloped daemon body" in result.context_string
+        raw_body = corpus.read(doc_id).decode("utf-8", "replace").strip()
+        assert raw_body not in result.context_string, (
+            "context must carry the daemon's returned text, not the raw corpus body"
+        )
+    finally:
+        adapter._corpus = None
+        adapter.teardown()
