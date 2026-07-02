@@ -26,7 +26,10 @@ that keep recall useful without making memory authoritative.
 Failure degrades to a less-rich response, not to an unsafe response. If vector
 search fails, recall can fall back to FTS. If provenance is missing, results
 should be treated as lower-confidence evidence. If privacy metadata is missing,
-the conservative posture is local-only.
+it is treated as `safe` (the most permissive level) — the read gate,
+retrieval, ingest, and the schema default all fall back to `safe`, not
+`local-only`. Fail-closed behavior requires an explicit `private`,
+`local-only`, or `blocked` stamp on the document.
 
 ## Review Triggers
 
