@@ -181,7 +181,12 @@ def _build_drafts(events: List[Dict[str, Any]], raw_docs: List[Dict[str, Any]], 
     # the synthesized draft inherits the flag even if the summarized body itself
     # no longer trips is_instruction_like.
     own_flag = is_instruction_like(session_body)
-    source_flag = any(is_instruction_like(event["content"] or "") for event in events)
+    flagged_sources = {
+        _event_source(event)
+        for event in events
+        if is_instruction_like(event["content"] or "")
+    }
+    source_flag = bool(flagged_sources)
     session_instruction_like = own_flag or source_flag
     if session_instruction_like and not own_flag:
         logger.warning(
@@ -203,6 +208,22 @@ def _build_drafts(events: List[Dict[str, Any]], raw_docs: List[Dict[str, Any]], 
         "instruction_like": 1 if session_instruction_like else 0,
     }]
 
+    # Finding #4 (review round 4): concept/entity drafts are extracted from the
+    # SAME events — a benign-looking extraction (e.g. "important concept: Safe
+    # Topic") from an instruction-like event must inherit that event's flag, or
+    # deterministic extraction becomes a laundering path around the writer's
+    # own title+body recompute.
+    def _extraction_flag(kind: str, title: str, source: str) -> int:
+        if source in flagged_sources:
+            logger.warning(
+                "session_distillation %s draft %r inherits instruction_like from "
+                "flagged source %s; the extracted title/body did not itself trip "
+                "the detector",
+                kind, title, source,
+            )
+            return 1
+        return 0
+
     for concept in _extract_concepts(events):
         sources = [concept["source"]]
         drafts.append({
@@ -215,6 +236,9 @@ def _build_drafts(events: List[Dict[str, Any]], raw_docs: List[Dict[str, Any]], 
             "trace_id": trace_id,
             "sources": sources,
             "body": f"- Candidate concept extracted from {concept['source']}.",
+            "instruction_like": _extraction_flag(
+                "concept", concept["title"], concept["source"]
+            ),
         })
 
     for entity in _extract_entities(events):
@@ -229,6 +253,9 @@ def _build_drafts(events: List[Dict[str, Any]], raw_docs: List[Dict[str, Any]], 
             "trace_id": trace_id,
             "sources": sources,
             "body": f"- Candidate entity observed in {entity['source']}.",
+            "instruction_like": _extraction_flag(
+                "entity", entity["title"], entity["source"]
+            ),
         })
 
     return [draft for draft in drafts if draft.get("sources")]
