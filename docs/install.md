@@ -44,6 +44,33 @@ For a login-persistent daemon on macOS, a launchd template ships at
 Logging knobs: `MINNI_LOG_LEVEL` (`DEBUG`/`INFO`/…) and `MINNI_LOG_FORMAT`
 (`text` default, `json` for structured output).
 
+## Provision agent identities (principals)
+
+The daemon fail-closes any **named** caller it cannot attribute: an agent that
+supplies an `agent_id` (the shipped plugins always do — `claude-code`, `codex`,
+…) needs a matching operator-owned `~/.minni/principals/<agent>.json` before
+gated tools and handoffs work. Without it, gated calls return a structured
+`recovery_required` route (reason `unknown_identity`) telling you exactly this.
+Author the shipped agents' files from the repo root:
+
+```bash
+engine/.venv/bin/python engine/tools/author_principals.py            # dry-run (default)
+engine/.venv/bin/python engine/tools/author_principals.py --apply    # write principals/*.json (0600)
+```
+
+For an unlisted agent, hand-author `~/.minni/principals/<agent>.json` (for
+example `{"agent_id": "myagent", "capabilities": ["search", "read", "learn",
+"handoff"]}`) and `chmod 600` it. Either way, `kill -HUP` the daemon (or
+restart it) so identity caches reload.
+
+Only the anonymous caller — one that omits `agent_id` entirely — gets the
+zero-config operator synthesis on a fresh install. Explicitly claiming the
+reserved ids `main`/`operator` over the wire is always denied (with a
+`reserved_agent_id` diagnostic) unless the daemon itself runs with
+`MINNI_LOCAL_OPERATOR=1`. See the strict-mode caveat in
+[concepts.md](concepts.md#delegating-approval) before authoring your first
+principal file.
+
 ## Docker eval image
 
 To evaluate the daemon without any local Python/Node setup:

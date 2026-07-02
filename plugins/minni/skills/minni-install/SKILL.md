@@ -116,6 +116,16 @@ system/developer instructions, safety policy, and active user request.
      another agent's vault when under-specified. Always stamp
      `MINNI_AGENT_ID`, `MINNI_VAULT_PATH`, and `MINNI_SOCKET_PATH` explicitly
      for that platform.
+   - Stamping `MINNI_AGENT_ID` is necessary but not sufficient: the daemon
+     default-denies any **named** agent that has no matching operator-owned
+     `~/.minni/principals/<agent-id>.json` — gated tools and handoffs return a
+     `recovery_required` route until it exists. Author the shipped agents'
+     files with `engine/.venv/bin/python engine/tools/author_principals.py
+     --apply` (dry-run without `--apply`), or hand-author the JSON with the
+     needed capabilities and `chmod 600` it, then SIGHUP/restart the daemon so
+     identity caches reload. Claiming the reserved ids `main`/`operator` on
+     the wire is always denied; only the anonymous (no `agent_id`) caller gets
+     the zero-config operator synthesis.
    - Resolve symlinks before deciding what is canonical; symlinked vault roots
      are configuration drift unless the user explicitly approves them.
    - Confirm daemon socket: `~/.minni/run/minnid.sock`.

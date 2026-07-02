@@ -12,7 +12,7 @@ from principal import (
     make_mismatch_error,
 )
 
-from .rpc import make_error
+from .rpc import make_error, make_response
 
 
 logger = logging.getLogger("minnid")
@@ -67,6 +67,22 @@ RPC_CAPABILITY_REQUIREMENTS: Dict[str, str] = {
 }
 
 
+def make_reserved_agent_id_error(agent_id: str, method: str, request_id: Any) -> dict:
+    """Distinct diagnostic for a wire claim of a reserved operator id (#121 Root B).
+
+    Same fail-closed -32004 code, but the message names the actual cause —
+    the reserved agent_id, not a missing grant — and the two operator-side
+    ways out (neither of which is wire-controllable)."""
+    return make_error(
+        -32004,
+        f"reserved_agent_id: reserved agent_id {agent_id!r} requires operator "
+        f"context for {method!r} — omit agent_id for the zero-config operator "
+        "path, or set MINNI_LOCAL_OPERATOR in the daemon environment "
+        "(operator-controlled, never wire-supplied)",
+        request_id,
+    )
+
+
 def enforce_method_capability(
     method_name: str,
     principal: Optional[EffectivePrincipal],
@@ -78,6 +94,22 @@ def enforce_method_capability(
     required = RPC_CAPABILITY_REQUIREMENTS.get(method_name)
     if not required or principal.can(required):
         return None
+    # Resolver default-denies stay fail-closed but fail LOUD (#121): report WHY
+    # instead of a bare capability_denied that is byte-identical to a
+    # provisioned-but-ungranted caller. deny_reason is only ever set by
+    # principal.py's default-deny paths, so provisioned callers are unaffected.
+    deny_reason = getattr(principal, "deny_reason", None)
+    if deny_reason == "unknown_identity":
+        return make_response(
+            recover(
+                "unknown_identity",
+                {"method": method_name, "supplied_agent_id": principal.agent_id},
+                render_mode="machine",
+            ),
+            request_id,
+        )
+    if deny_reason == "reserved_agent_id":
+        return make_reserved_agent_id_error(principal.agent_id, method_name, request_id)
     return make_capability_denied_error(
         required,
         method_name,
@@ -114,7 +146,9 @@ def recover(
     }
     remediation = [
         "Stamp this runtime surface with MINNI_AGENT_ID.",
-        "Create or fix the matching operator-owned principals/<agent>.json file.",
+        "Author the matching operator-owned principals/<agent>.json file "
+        "(engine/.venv/bin/python engine/tools/author_principals.py --apply "
+        "for the shipped agents, or hand-author it) and chmod it 0600.",
         "Send SIGHUP to minnid or restart it so identity caches reload.",
         f"Use one of the pre-identity diagnostic methods: {', '.join(RECOVERY_ALLOWED_METHODS)}.",
     ]
