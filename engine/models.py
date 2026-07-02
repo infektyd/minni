@@ -21,10 +21,44 @@ provides the lock-free singleton guarantee after the first call completes.
 import functools
 import logging
 import os
+import sys
+from pathlib import Path
 
 from config import DEFAULT_CONFIG
 
 logger = logging.getLogger("sovereign.models")
+
+# Packaging-only first-run visibility (PACKAGING_PLAN.md §3, approved hook):
+# sentence-transformers downloads model weights silently on first use, which
+# reads as a multi-minute hang on a fresh install. Announce the one-time
+# download before it starts. No load behavior changes.
+_APPROX_SIZES = {
+    "embedding": "~90 MB",
+    "reranker": "~90 MB",
+    "attribution": "~140 MB",
+}
+
+
+def _announce_download_once(model_name: str, role: str) -> None:
+    """Print a one-time notice if `model_name` is not in the local HF cache."""
+    try:
+        if "HF_HUB_CACHE" in os.environ:
+            cache = Path(os.environ["HF_HUB_CACHE"])
+        else:
+            cache = Path(os.environ.get(
+                "HF_HOME", Path.home() / ".cache" / "huggingface")) / "hub"
+        snapshots = cache / ("models--" + model_name.replace("/", "--")) / "snapshots"
+        if snapshots.is_dir() and any(snapshots.iterdir()):
+            return
+        message = (
+            f"First run: downloading {role} model {model_name} "
+            f"({_APPROX_SIZES.get(role, 'tens of MB')}, one time, cached in "
+            f"{cache}). This can take a few minutes."
+        )
+        logger.info(message)
+        print(f"[minni] {message}", file=sys.stderr, flush=True)
+    except OSError:
+        pass  # visibility must never block a load
 
 
 @functools.cache
@@ -41,6 +75,7 @@ def get_embedder():
     os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
     try:
         from sentence_transformers import SentenceTransformer
+        _announce_download_once(DEFAULT_CONFIG.embedding_model, "embedding")
         model = SentenceTransformer(DEFAULT_CONFIG.embedding_model)
         logger.info("Embedding model loaded (singleton): %s", DEFAULT_CONFIG.embedding_model)
         return model
@@ -67,6 +102,7 @@ def get_cross_encoder():
     os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
     try:
         from sentence_transformers import CrossEncoder
+        _announce_download_once(DEFAULT_CONFIG.reranker_model, "reranker")
         model = CrossEncoder(DEFAULT_CONFIG.reranker_model)
         logger.info("Cross-encoder loaded (singleton): %s", DEFAULT_CONFIG.reranker_model)
         return model
@@ -93,6 +129,7 @@ def get_attribution_cross_encoder():
     os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
     try:
         from sentence_transformers import CrossEncoder
+        _announce_download_once(DEFAULT_CONFIG.attribution_model, "attribution")
         model = CrossEncoder(DEFAULT_CONFIG.attribution_model)
         logger.info("Attribution cross-encoder loaded (singleton): %s", DEFAULT_CONFIG.attribution_model)
         return model
