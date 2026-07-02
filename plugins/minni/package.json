@@ -2,8 +2,30 @@
   "name": "minni-multi-plugin",
   "version": "0.1.0",
   "description": "Local multi-target plugin bridge for Minni (Codex, Claude Code, Gemini, KiloCode).",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/infektyd/minni.git",
+    "directory": "plugins/minni"
+  },
+  "homepage": "https://github.com/infektyd/minni",
   "type": "module",
   "main": "dist/server.js",
+  "exports": {
+    ".": "./dist/server.js"
+  },
+  "files": [
+    "dist",
+    ".claude-plugin",
+    ".codex-plugin",
+    ".gemini-plugin",
+    ".kilocode-plugin",
+    ".mcp.json",
+    "commands",
+    "hooks",
+    "skills",
+    "README.md"
+  ],
   "engines": {
     "node": ">=20"
   },

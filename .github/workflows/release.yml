@@ -1,0 +1,71 @@
+# Release: on a v* tag, gate on the same hermetic smoke CI runs, build the
+# distributable artifacts, and attach them to a GitHub Release.
+#
+# Secrets: none beyond the built-in GITHUB_TOKEN. PyPI and npm publishing are
+# intentionally absent — both are gated on maintainer decisions recorded in
+# PACKAGING_PLAN.md §6 (PyPI: v0.2 package-layout rename; npm: name is taken,
+# publication deferred). When those unblock, add trusted publishing here.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Gate, build, publish GitHub Release
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.14'
+
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: '20'
+
+      - name: Install project deps
+        run: make setup
+
+      - name: Release gate — hermetic smoke
+        run: bash scripts/repro-smoke.sh
+
+      - name: Release gate — fast check
+        run: make check
+
+      - name: Build Python sdist
+        working-directory: engine
+        run: |
+          .venv/bin/python -m pip install build
+          .venv/bin/python -m build --sdist --outdir ../release-artifacts
+
+      - name: Build npm package tarball
+        working-directory: plugins/minni
+        run: |
+          npm run build
+          npm pack --pack-destination ../../release-artifacts
+
+      - name: Check tag matches package versions
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          PY_V="$(engine/.venv/bin/python -c "import tomllib;print(tomllib.load(open('engine/pyproject.toml','rb'))['project']['version'])")"
+          NPM_V="$(node -p "require('./plugins/minni/package.json').version")"
+          test "$TAG" = "$PY_V" || { echo "tag $TAG != engine version $PY_V"; exit 1; }
+          test "$TAG" = "$NPM_V" || { echo "tag $TAG != plugin version $NPM_V"; exit 1; }
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "Minni $GITHUB_REF_NAME" \
+            --generate-notes \
+            release-artifacts/*
