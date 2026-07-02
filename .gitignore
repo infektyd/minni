@@ -97,6 +97,7 @@ openclaw-extension/__pycache__/
 
 # Python/runtime caches
 engine/venv/
+.venv/
 engine/.day5-contamination-backup/
 __pycache__/
 *.py[cod]
