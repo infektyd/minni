@@ -27,13 +27,23 @@ can hand the agent the initiative by allowing the `minni_learn` tool to run
 without per-call confirmation in their runtime's permission settings (e.g. the
 Claude Code permission allowlist). Then an agent that cracks a problem three
 hours into a session stages the learning on the spot instead of losing it
-because the human was AFK. This is safe to grant precisely because of
-proposal-first: an unprompted `learn` only ever creates a `proposed`
-candidate — quality-gated, audit-logged, invisible to recall until resolved.
+because the human was AFK. Proposal-first is what makes this a reasonable
+grant: nothing enters the shared durable tier without approval. Know exactly
+what you are allowing, though — `minni_learn` does two things per call. It
+stages the `proposed` candidate, and it also writes a Markdown note into the
+agent's **own vault** immediately (audit-logged, and indexed into that
+agent's personal tier by `vault_ingest`). The quality gate blocks the call
+only when it is invoked with `requireQuality: true`. Allowlisting the tool
+therefore means trusting the agent to write its own vault notes unprompted —
+the shared tier still waits for a resolution decision.
 
-The initiative grant applies to the primary agent you are working with, not
-to anything it spawns: temporary team agents (`minni_team_*`) are hard-coded
-`learn: "manual-only"` in their memory policy and cannot inherit it. A note
+The initiative grant is intended for the primary agent you are working with,
+not for anything it spawns: temporary team agents (`minni_team_*`) carry
+`learn: "manual-only"` in their memory policy. Note this is an instruction
+serialized into the team packet for host adapters to honor, not a boundary
+the daemon enforces — a spawned helper handed the same host-level
+`minni_learn` tool access can still call it, so scope tool permissions at
+the runtime level if that matters for your setup. A note
 on maturity while we're here: the temporary-team surface itself hasn't been
 exercised beyond its unit tests yet. What *is* battle-tested daily is the
 core multi-agent loop — several approved principals (e.g. `claude-code` and
