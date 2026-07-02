@@ -167,6 +167,36 @@ test("#122/3: activatePlanChecked rejects terminal plans and activates non-termi
   }
 });
 
+test("#122/3: activatePlanChecked rejects a stale all-resolved plan whose status scalar is still draft", async () => {
+  // Codex review (PR #130): legacy/stale notes completed under an old plugin
+  // deploy can have every slice done/superseded while the status scalar is
+  // still 'draft'/'candidate'. resolveActivePlanView treats that all-resolved
+  // shape as terminal (self-heals to 'complete'); the activate guard must
+  // reject it too, or id-less plan tools get retargeted to a finished plan.
+  const root = await mkdtemp(path.join(tmpdir(), "i122-activate-stale-"));
+  try {
+    await ensureVault(root);
+    const { plan, write } = await createPlan(
+      { goal: "stale draft guard", slices: [{ id: "s1", title: "t1" }], vaultPath: root },
+      { vaultPath: root },
+    );
+    // Persist the stale shape directly (updateSlice would reconcile status).
+    const p = await rehydratePlan(write.notePath);
+    p.slices[0].status = "done";
+    p.slices[0].evidence = "verified via test output, exit 0";
+    assert.equal(p.status, "draft", "precondition: status scalar stays draft");
+    await persistPlan(p, { vaultPath: root, notePath: write.notePath });
+    await clearActivePlan(root);
+
+    const res = await activatePlanChecked(root, plan.plan_id, write.notePath);
+    assert.equal(res.ok, false, "all-resolved stale plan must not be re-activated");
+    assert.match(res.error, /every slice resolved/);
+    assert.equal(await getActivePlan(root), undefined, "pointer must stay clear on rejection");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("#122/3: terminal set mirrors resolveActivePlanView's suppression set", () => {
   assert.deepEqual(
     [...TERMINAL_PLAN_STATUSES].sort(),

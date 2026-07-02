@@ -191,6 +191,17 @@ export const TERMINAL_PLAN_STATUSES: ReadonlySet<string> = new Set([
   "superseded",
 ]);
 
+/**
+ * All-resolved predicate: every slice terminal (done/superseded) on a non-empty
+ * slice list. Single source of truth for updateSlice's terminal-state
+ * transition, resolveActivePlanView's honest-health self-heal, and the
+ * activate guard — a plan in this shape is finished even when a stale deploy
+ * left its status scalar at 'draft'/'candidate' (#122 review follow-up).
+ */
+export function allSlicesResolved(slices: PlanSlice[]): boolean {
+  return slices.length > 0 && slices.every((s) => s.status === "done" || s.status === "superseded");
+}
+
 export function slugifySliceId(title: string, taken: Set<string>): string {
   let slug = title
     .toLowerCase()
@@ -648,9 +659,7 @@ export function updateSlice(
   // NON-recallable "complete" status instead (resolveActivePlanView skips it the
   // same way). Reopening a slice un-finishes the plan, so revert a
   // model-completed plan back to draft.
-  const allResolved =
-    newSlices.length > 0 &&
-    newSlices.every((s) => s.status === "done" || s.status === "superseded");
+  const allResolved = allSlicesResolved(newSlices);
   let nextStatus: PageStatus = plan.status;
   if (allResolved && (plan.status === "draft" || plan.status === "candidate")) {
     nextStatus = "complete";
@@ -981,9 +990,10 @@ export async function rehydratePlan(notePath: string): Promise<PlanArtifact> {
 
 /**
  * #122 F-PLAN-RESTORE-SELFBLOCK: bare-scalar read for recovery paths. Returns a
- * skeleton PlanArtifact carrying only the frontmatter scalars that restorePlan
+ * skeleton PlanArtifact carrying the frontmatter scalars that restorePlan
  * consumes from `current` (plan_id, status, created, updated, plan_digest, rev)
- * with NO digest or evidence validation — so minni_plan_restore can heal a note
+ * plus leniently-parsed slices for the activate guard, with NO digest or
+ * evidence validation — so minni_plan_restore can heal a note
  * whose strict rehydratePlan throws (the exact bricked state it exists to fix).
  * Every digest-covered field comes from the history snapshot, and persistPlan
  * recomputes the digest on write, so nothing corrupt survives the restore.
@@ -998,12 +1008,18 @@ export async function rehydratePlanScalars(notePath: string): Promise<PlanArtifa
   const created = typeof fm.created === "string" ? fm.created : new Date().toISOString();
   const revVal = fm.plan_rev;
   const rev = typeof revVal === "number" ? revVal : (typeof revVal === "string" ? parseInt(revVal, 10) : 0) || 0;
+  // Slices are carried leniently (no evidence validation) so the activate
+  // guard can apply the all-resolved terminal check; restorePlan ignores them
+  // (every digest-covered field comes from the history snapshot).
+  const slices: PlanSlice[] = Array.isArray(fm.plan_slices)
+    ? (fm.plan_slices as PlanSlice[])
+    : safeParse(fm.plan_slices, []);
   return {
     plan_id,
     goal: "",
     status: (fm.status as PageStatus) || "draft",
     constraints: [],
-    slices: [],
+    slices: slices.map((s) => ({ ...s })),
     open_questions: [],
     scar_tissue: [],
     next_action: "",
@@ -1232,8 +1248,11 @@ export async function setActivePlan(
 /**
  * #122 F-PLAN-ACTIVATE-NO-TERMINAL-GUARD: setActivePlan gated on the plan's
  * status — a terminal plan (resolveActivePlanView's suppression set) must not
- * be re-activated. Status is read via the bare-scalar path so a digest-bricked
- * but non-terminal plan can still be activated (as before this guard).
+ * be re-activated. A stale note with every slice done/superseded but a status
+ * scalar stuck at 'draft'/'candidate' (the shape resolveActivePlanView
+ * self-heals) counts as terminal too. Fields are read via the lenient
+ * bare-scalar path so a digest-bricked but non-terminal plan can still be
+ * activated (as before this guard).
  */
 export async function activatePlanChecked(
   vaultPath: string,
@@ -1245,6 +1264,12 @@ export async function activatePlanChecked(
     return {
       ok: false,
       error: `plan ${plan_id} has terminal status '${scalars.status}' and cannot be re-activated; create a new plan (minni_plan_create) or restore a prior revision (minni_plan_restore) instead`,
+    };
+  }
+  if (allSlicesResolved(scalars.slices)) {
+    return {
+      ok: false,
+      error: `plan ${plan_id} has every slice resolved (done/superseded) and is effectively complete despite its '${scalars.status}' status; it cannot be re-activated — create a new plan (minni_plan_create) or restore a prior revision (minni_plan_restore) instead`,
     };
   }
   await setActivePlan(vaultPath, plan_id, notePath);
@@ -1367,9 +1392,7 @@ export async function resolveActivePlanView(
     // draft). Re-derive the terminal status at load time, persist it through
     // persistPlan (journaled; never a direct file write) and stop injecting
     // the finished plan.
-    const allResolved =
-      plan.slices.length > 0 &&
-      plan.slices.every((s) => s.status === "done" || s.status === "superseded");
+    const allResolved = allSlicesResolved(plan.slices);
     if (allResolved && (plan.status === "draft" || plan.status === "candidate")) {
       const from = plan.status;
       // H6: terminal, non-recallable completion (not the recallable "accepted").
