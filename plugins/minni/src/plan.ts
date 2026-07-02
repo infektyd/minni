@@ -546,14 +546,20 @@ export async function createPlan(
   let displaced_active: string | undefined;
   const incumbent = await getActivePlan(vaultPath);
   if (incumbent && incumbent.plan_id !== plan.plan_id) {
-    let incumbentStatus = "";
+    // Effectively-terminal predicate shared with resolveActivePlanView and
+    // activatePlanChecked (codex round 4): a terminal status OR a stale
+    // all-resolved shape (status scalar stuck at draft/candidate with every
+    // slice done/superseded) is a finished plan — displace it silently rather
+    // than warn the user toward re-activating it.
+    let incumbentTerminal = false;
     try {
-      const raw = await readFile(incumbent.notePath, "utf8");
-      incumbentStatus = String(parseFrontmatter(raw).frontmatter.status ?? "");
+      const scalars = await rehydratePlanScalars(incumbent.notePath);
+      incumbentTerminal =
+        TERMINAL_PLAN_STATUSES.has(scalars.status) || allSlicesResolved(scalars.slices);
     } catch {
       // unreadable incumbent: conservatively report the displacement
     }
-    if (!TERMINAL_PLAN_STATUSES.has(incumbentStatus)) {
+    if (!incumbentTerminal) {
       displaced_active = incumbent.plan_id;
     }
   }

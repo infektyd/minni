@@ -131,6 +131,34 @@ test("#122/2: createPlan stays silent when the incumbent active plan is terminal
   }
 });
 
+test("#122/2: createPlan stays silent when the incumbent is stale all-resolved (draft status, slices done)", async () => {
+  // Codex round 4 (PR #130): the displacement check must use the same
+  // effective-terminal predicate as resolveActivePlanView/activatePlanChecked —
+  // a stale incumbent (status scalar stuck at draft/candidate but every slice
+  // done/superseded) is finished, so displacing it must not warn the user
+  // toward re-activating a finished plan.
+  const root = await mkdtemp(path.join(tmpdir(), "i122-create-stale-"));
+  try {
+    await ensureVault(root);
+    const a = await createPlan(
+      { goal: "plan A", slices: [{ id: "s1", title: "t1" }], vaultPath: root },
+      { vaultPath: root },
+    );
+    // Persist the stale shape directly (updateSlice would reconcile status).
+    const planA = await rehydratePlan(a.write.notePath);
+    planA.slices[0].status = "done";
+    planA.slices[0].evidence = "verified via test output, exit 0";
+    assert.equal(planA.status, "draft", "precondition: status scalar stays draft");
+    await persistPlan(planA, { vaultPath: root, notePath: a.write.notePath });
+
+    const b = await createPlan({ goal: "plan B", vaultPath: root }, { vaultPath: root });
+    assert.equal(b.displaced_active, undefined, "stale all-resolved incumbent must displace silently");
+    assert.equal((await getActivePlan(root))?.plan_id, b.plan.plan_id);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("#122/2: minni_plan_create handler returns displaced_active + warning (source pin)", () => {
   const block = handlerBlock("minni_plan_create");
   assert.match(block, /displaced_active/, "create response must surface the displaced plan_id");
