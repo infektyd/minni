@@ -526,7 +526,7 @@ def handle_log_event(params: dict, request_id: Any, context: GovernanceContext) 
 
     try:
         ep = context.lazy_episodic()
-        eid = ep.log_event(
+        eid = ep.add_event(
             agent_id=agent_id,
             event_type=event_type,
             content=content,
