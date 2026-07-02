@@ -199,5 +199,41 @@ Target: clean machine → passing doctor in <10 min, unattended.
 | 7 | Demo | ➕ `docs/readme-assets/demo.cast` (+ GIF), ✏️ `README.md` (embed) |
 | 8 | (optional, if approved) Docker eval image | ➕ `Dockerfile`, ✏️ `release.yml` |
 
-Definition of done tracks the brief verbatim; this file will be updated at the end to
-record what was done, the channel decisions, and every deferred item.
+Definition of done tracks the brief verbatim; §8 below records the outcome.
+
+---
+
+## 8. Outcome record (2026-07-02)
+
+All planned work shipped the same day, as ten merged PRs plus the `v0.1.0` tag:
+
+| PR | Delivered |
+|----|-----------|
+| #107 | Hygiene quick fixes (license → MIT, `.venv/` ignore, README tail, bench doc) + this plan |
+| #108 | `minni` CLI (`up`/`down`/`status`/`doctor`), `engine/pyproject.toml`, uv-compiled `requirements.lock`, uv-managed interpreter path in `make setup`, doctor gate in CI, 10 CLI tests |
+| #110 | The one flagged engine diff: first-run model-download announcements in `engine/models.py` (approved §6.2) |
+| #111 | `CHANGELOG.md`, tag-gated `release.yml` (smoke + check as release gates, sdist + npm tarball on GitHub Releases, zero extra secrets), completed npm metadata |
+| #109 + #116 | CONTRIBUTING (with the **memory firewall**, widened per Codex review to plugin model-facing paths), CoC, SECURITY.md → SECURITY_PLAN.md, issue/PR templates |
+| #112 | Docker eval image (engine-only, non-root, lazy models), CI-built + in-container smoke, GHCR publish on tags |
+| #113 | Audit-grounded README rewrite (4 wrong + 3 stale claims fixed, comparison table, evidence section) + `docs/` tree (concepts, install, architecture with literal MCP tool list, security, per-runtime pages) |
+| #114 | Live asciinema demo (cast + GIF): doctor → learn-stages → approve → recall-with-`<EVIDENCE>`; handoff shown as default-deny |
+| #115 | Client fix: staged candidates reported as staged, not "Stored learning #?" |
+
+**Channel decisions as implemented:** hardened source install (uv-provisioned 3.14)
+as primary; Docker/GHCR as the eval channel; GitHub Releases for artifacts; PyPI and
+npm publishing deliberately absent (§6.1/§6.6).
+
+**Deferred to the maintainer / v0.2:**
+- The `engine/` → `minni/` package rename that unblocks `pipx install minni`
+  (approved in principle for v0.2; PyPI name `minni` was free as of 2026-07-02).
+- npm publication (name `minni` is taken; `minni-multi-plugin` metadata is
+  publish-ready if ever wanted).
+- A two-runtime handoff segment for the demo — needs real seeded identities via
+  `minni-install`; a wildcard principal file did not grant `handoff` in testing,
+  so the demo honestly shows the default-deny instead.
+- MkDocs/GitHub Pages site (plan §5 marked it optional-last; the docs tree reads
+  fine as plain GitHub Markdown).
+- `docs/readme-assets/*.svg` are stale per the maintainer and unused — delete or
+  regenerate at leisure.
+- The engine venv on the primary dev machine predates the 3.14 floor (3.13.14);
+  the next `make setup` will rebuild it (multi-GB model/dep download).
