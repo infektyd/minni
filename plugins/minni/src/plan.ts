@@ -194,10 +194,32 @@ export class PlanDigestVersionError extends Error {
   readonly code = "PLAN_DIGEST_NEWER" as const;
   constructor(version: number, notePath: string) {
     super(
-      `rehydratePlan: plan_digest version v${version} on ${notePath} is newer than this plugin supports (max v${PLAN_DIGEST_VERSION}); update the minni plugin to read this note`,
+      `plan_digest version v${version} on ${notePath} is newer than this plugin supports (max v${PLAN_DIGEST_VERSION}); update the minni plugin to read this note`,
     );
     this.name = "PlanDigestVersionError";
   }
+}
+
+/**
+ * #122 (codex round 5): single declared-version gate for EVERY path that reads
+ * plan frontmatter — strict or lenient. A note declaring an unknown (newer)
+ * digest version, via plan_digest_v or a "vN:<hex>" digest prefix, throws the
+ * typed PlanDigestVersionError before this build judges the note against its
+ * own schema in any way. Returns the parsed declaration for callers that go on
+ * to verify the digest hex.
+ */
+function assertKnownDigestVersion(
+  fm: Record<string, unknown>,
+  notePath: string,
+): { storedTag?: { version: number; hex: string }; declaredVersion?: number } {
+  const rawStoredDigest = typeof fm.plan_digest === "string" ? fm.plan_digest : "";
+  const storedTag = parsePlanDigestTag(rawStoredDigest);
+  const fmDigestV = typeof fm.plan_digest_v === "number" ? fm.plan_digest_v : undefined;
+  const declaredVersion = storedTag?.version ?? fmDigestV;
+  if (declaredVersion !== undefined && !PLAN_DIGEST_ALGORITHMS[declaredVersion]) {
+    throw new PlanDigestVersionError(declaredVersion, notePath);
+  }
+  return { storedTag, declaredVersion };
 }
 
 /**
@@ -919,13 +941,7 @@ export async function rehydratePlan(notePath: string): Promise<PlanArtifact> {
   // schema, and a generic validation error thrown first would be misread by
   // recovery paths (minni_plan_restore) as recoverable corruption, letting an
   // older plugin downgrade-write the newer note.
-  const rawStoredDigest = typeof fm.plan_digest === "string" ? fm.plan_digest : "";
-  const storedTag = parsePlanDigestTag(rawStoredDigest);
-  const fmDigestV = typeof fm.plan_digest_v === "number" ? fm.plan_digest_v : undefined;
-  const declaredVersion = storedTag?.version ?? fmDigestV;
-  if (declaredVersion !== undefined && !PLAN_DIGEST_ALGORITHMS[declaredVersion]) {
-    throw new PlanDigestVersionError(declaredVersion, notePath);
-  }
+  const { storedTag, declaredVersion } = assertKnownDigestVersion(fm, notePath);
 
   const status = (fm.status as PageStatus) || "draft";
   const goal = typeof fm.plan_goal === "string" ? fm.plan_goal : extractGoalFromBody(raw);
@@ -1042,6 +1058,12 @@ export async function rehydratePlan(notePath: string): Promise<PlanArtifact> {
  * whose strict rehydratePlan throws (the exact bricked state it exists to fix).
  * Every digest-covered field comes from the history snapshot, and persistPlan
  * recomputes the digest on write, so nothing corrupt survives the restore.
+ *
+ * Lenient does NOT mean version-blind (codex round 5): a note declaring a
+ * NEWER digest version still throws the typed PlanDigestVersionError — this
+ * build cannot judge (or safely operate on) a newer writer's note, and e.g.
+ * activating one would strand the host with an active plan no reader can
+ * rehydrate. Only current-schema validation is skipped, never the version gate.
  */
 export async function rehydratePlanScalars(notePath: string): Promise<PlanArtifact> {
   const raw = await readFile(notePath, "utf8");
@@ -1050,6 +1072,7 @@ export async function rehydratePlanScalars(notePath: string): Promise<PlanArtifa
   if (!plan_id) {
     throw new Error(`rehydratePlanScalars: note ${notePath} missing plan_id in frontmatter`);
   }
+  assertKnownDigestVersion(fm, notePath);
   const created = typeof fm.created === "string" ? fm.created : new Date().toISOString();
   const revVal = fm.plan_rev;
   const rev = typeof revVal === "number" ? revVal : (typeof revVal === "string" ? parseInt(revVal, 10) : 0) || 0;

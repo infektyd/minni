@@ -159,6 +159,29 @@ test("#122/2: createPlan stays silent when the incumbent is stale all-resolved (
   }
 });
 
+test("#122/2: createPlan conservatively warns when the incumbent is a newer-version note", async () => {
+  // Codex round 5 sweep: the displacement check consumes the gated lenient
+  // reader too. A newer-version incumbent cannot be judged by this build, so
+  // the check degrades to the conservative unreadable-incumbent path: the new
+  // plan still takes the pointer, and the displacement is reported.
+  const root = await mkdtemp(path.join(tmpdir(), "i122-create-newer-"));
+  try {
+    await ensureVault(root);
+    const a = await createPlan(
+      { goal: "plan A", slices: [{ id: "s1", title: "t1" }], vaultPath: root },
+      { vaultPath: root },
+    );
+    const raw = await readFile(a.write.notePath, "utf8");
+    await writeFile(a.write.notePath, raw.replace(/^plan_digest_v:.*$/m, "plan_digest_v: 3"), "utf8");
+
+    const b = await createPlan({ goal: "plan B", vaultPath: root }, { vaultPath: root });
+    assert.equal(b.displaced_active, a.plan.plan_id, "unjudgeable incumbent must be reported, not silent");
+    assert.equal((await getActivePlan(root))?.plan_id, b.plan.plan_id);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("#122/2: minni_plan_create handler returns displaced_active + warning (source pin)", () => {
   const block = handlerBlock("minni_plan_create");
   assert.match(block, /displaced_active/, "create response must surface the displaced plan_id");
@@ -222,6 +245,32 @@ test("#122/3: activatePlanChecked rejects a stale all-resolved plan whose status
     assert.equal(res.ok, false, "all-resolved stale plan must not be re-activated");
     assert.match(res.error, /every slice resolved/);
     assert.equal(await getActivePlan(root), undefined, "pointer must stay clear on rejection");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("#122/3: activatePlanChecked refuses a newer-version note instead of activating an unusable plan", async () => {
+  // Codex round 5 (PR #130): the lenient scalar path must apply the
+  // declared-version gate first — activating a plan_digest_v-newer note writes
+  // a pointer every reader (resolveActivePlanView, plan_status/update) then
+  // fails to rehydrate, leaving the host with an active plan it cannot use.
+  const root = await mkdtemp(path.join(tmpdir(), "i122-activate-newer-"));
+  try {
+    await ensureVault(root);
+    const { plan, write } = await createPlan(
+      { goal: "newer version activate", slices: [{ id: "s1", title: "t1" }], vaultPath: root },
+      { vaultPath: root },
+    );
+    await clearActivePlan(root);
+    const raw = await readFile(write.notePath, "utf8");
+    await writeFile(write.notePath, raw.replace(/^plan_digest_v:.*$/m, "plan_digest_v: 3"), "utf8");
+
+    await assert.rejects(
+      () => activatePlanChecked(root, plan.plan_id, write.notePath),
+      (err) => err instanceof PlanDigestVersionError && err.code === "PLAN_DIGEST_NEWER",
+    );
+    assert.equal(await getActivePlan(root), undefined, "pointer must NOT be written for a newer-version note");
   } finally {
     await rm(root, { recursive: true, force: true });
   }
