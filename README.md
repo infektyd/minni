@@ -21,7 +21,7 @@ Four verbs cover the lifecycle:
 
 - **Recall** — cited, provenance-tagged retrieval (lexical + vector + rank fusion + rerank) across the personal and shared legs.
 - **Learn** — propose, don't write: `learn` stages a **candidate**, not a memory.
-- **Approve** — a human-governed gate (`resolve_candidate`) accepts, rejects, redacts, merges, or supersedes the candidate. Only accepted candidates become durable memory.
+- **Approve** — a governance gate (`resolve_candidate`) accepts, rejects, redacts, merges, or supersedes the candidate. Only accepted candidates become durable memory. Human-gated by default; the operator can [delegate approval](docs/concepts.md#delegating-approval) to a trusted agent (a background auto-consolidation path is designed but not yet functional — [#119](https://github.com/infektyd/minni/issues/119)).
 - **Handoff** — explicit cross-agent transfers with leases, so work and context move between runtimes deliberately.
 
 All of it is local-first: no hosted dependency, no cloud tier, and vaults you can open in any editor.
@@ -42,7 +42,7 @@ This is a memory-poisoning defense, enforced in the engine rather than asserted 
 |---|---|---|---|---|
 | Where memory lives | **Your machine** (Markdown + SQLite) | Hosted service / SDK | Research memory-OS | Your machine (Markdown) |
 | Agents | **Multi-agent, one governed daemon** | Single-agent focus | Research multi-memory | Single personal vault |
-| Writes to memory | **Proposal-first, human-approved** | Automatic extraction | Managed by the OS | Direct |
+| Writes to memory | **Proposal-first, approval-gated** (human by default, delegable) | Automatic extraction | Managed by the OS | Direct |
 | You can read it in an editor | **Yes** | No | Partially | Yes |
 | Benchmark claims | **None published** | Benchmark-optimized | Research benchmarks | n/a |
 
@@ -136,7 +136,7 @@ Request flow: agent → MCP plugin → Unix socket → daemon → identity gate 
 
 ## Status
 
-Minni is **pre-v1** and says so: small adoption, an intentionally smaller public contract than the implementation, and interfaces that can still change. What "works" is not asserted, it is *executed in public*: CI stands the daemon up from nothing on a clean runner and proves status, recall, and home-directory isolation on every push — the same check `minni doctor` gives you locally. A benchmark harness (`bench/membench`, byte-reproducible scorecards) exists, but no headline numbers are published until real-model runs are: when in doubt, this project under-claims.
+Minni is **pre-v1** and says so: small adoption, an intentionally smaller public contract than the implementation, and interfaces that can still change. What "works" is not asserted, it is *executed in public*: CI stands the daemon up from nothing on a clean runner and proves status, recall, and home-directory isolation on every push — the same check `minni doctor` gives you locally. A benchmark harness (`bench/membench`, byte-reproducible scorecards) exists, but no headline numbers are published until real-model runs are: when in doubt, this project under-claims. In that spirit: the core multi-agent loop — multiple approved agents sharing one governed daemon — is dogfooded daily (Minni is developed using Minni), while the temporary-team orchestration surface (`minni_team_*`) has unit tests but no real-world mileage yet.
 
 ## Documentation
 

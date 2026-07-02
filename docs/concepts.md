@@ -14,6 +14,95 @@ writes a durable learning directly, **only** for an operator principal, and is
 audit-stamped `FORCE_DURABLE_LEARN`. A non-operator force attempt is denied
 with an `operator_only` error.
 
+## Delegating approval
+
+Human approval is the **default policy, not the architecture**. Governance has
+two independent dials — **who initiates a learn** (stages the candidate) and
+**who approves it** (makes it durable) — and the operator sets each one.
+
+**Initiation.** By default the human drives: they invoke `/minni:learn` (or
+ask for it) and the agent stages the candidate. The plugin never auto-fires a
+learn from hooks — recall is automatic, writes are deliberate. But the human
+can hand the agent the initiative by allowing the `minni_learn` tool to run
+without per-call confirmation in their runtime's permission settings (e.g. the
+Claude Code permission allowlist). Then an agent that cracks a problem three
+hours into a session stages the learning on the spot instead of losing it
+because the human was AFK. Proposal-first is what makes this a reasonable
+grant: nothing enters the shared durable tier without approval. Know exactly
+what you are allowing, though — `minni_learn` does two things per call. It
+stages the `proposed` candidate, and it also writes a Markdown note into the
+agent's **own vault** immediately (audit-logged, and indexed into that
+agent's personal tier by `vault_ingest`). The quality gate blocks the call
+only when it is invoked with `requireQuality: true`. Allowlisting the tool
+therefore means trusting the agent to write its own vault notes unprompted —
+the shared tier still waits for a resolution decision.
+
+The initiative grant is intended for the primary agent you are working with,
+not for anything it spawns: temporary team agents (`minni_team_*`) carry
+`learn: "manual-only"` in their memory policy. Note this is an instruction
+serialized into the team packet for host adapters to honor, not a boundary
+the daemon enforces — a spawned helper handed the same host-level
+`minni_learn` tool access can still call it, so scope tool permissions at
+the runtime level if that matters for your setup. A note
+on maturity while we're here: the temporary-team surface itself hasn't been
+exercised beyond its unit tests yet. What *is* battle-tested daily is the
+core multi-agent loop — several approved principals (e.g. `claude-code` and
+`codex`) sharing one daemon, staging and resolving each other's candidates —
+because Minni is developed using Minni. At that scale it holds up; the team
+harness is the untested frontier.
+
+**Approval.** Who gets to resolve candidates is decided per principal, and the
+operator can delegate it. Three resolution paths exist, all landing in the
+same audit trail:
+
+1. **Manual (the default).** A human (or the local operator session) calls
+   `resolve_candidate`. On a fresh install the anonymous local caller over the
+   Unix socket is the synthesized `main` operator, so this works with zero
+   configuration.
+
+2. **A trusted agent.** Author `~/.minni/principals/<agent>.json` (mode 0600)
+   granting the agent governance capability:
+
+   ```json
+   {"agent_id": "codex", "capabilities": ["learn", "resolve_candidate"]}
+   ```
+
+   With `resolve_candidate` (or `govern`, or `*`) in its capability list, that
+   agent may resolve candidates itself and may use the `force=true` durable
+   learn — its memory writes no longer wait for a human. Without it, the same
+   agent can still `learn` (staging candidates) but a `force` attempt is
+   denied `operator_only`. Principal files are read per request; no daemon
+   restart is needed.
+
+   Grant least privilege: any of these capabilities makes the principal an
+   **operator**, which carries governance authority beyond approving its own
+   candidates. In particular, adding `search` to an operator grant widens
+   recall — the default combined scope can surface results from other agents'
+   vaults — so scope capabilities (and `allowed_vault_roots`, if you use it)
+   to what the delegation actually needs.
+
+3. **The background consolidation pass** *(designed, currently broken —
+   [#119](https://github.com/infektyd/minni/issues/119))*. With
+   `MINNI_AFM_LOOP=on` the AFM consolidation pass is meant to drain staged
+   candidates roughly every 15 minutes, auto-promoting the low-risk subset —
+   explicitly safe privacy level, not instruction-like, not a duplicate,
+   passing the deterministic quality gate — into durable learnings with no
+   human in the loop, routing everything spicier to review. The gate and the
+   promotion write are implemented and tested, but as of v0.1.0 the assembled
+   path does not function: the background loop's wet run is rejected by the
+   daemon's own operator gate, and fresh installs are missing the
+   `consolidation_actions` table. Until #119 lands, treat this path as a
+   design commitment, not a working toggle. (The loop is off by default
+   regardless, and `MINNI_AFM_MODE` is unrelated — mode only toggles an
+   advisory triage annotation that the promotion gate never consults.)
+
+One operational caveat: creating your **first** `principals/*.json` file flips
+the daemon into strict identity mode, where the anonymous local caller is no
+longer auto-elevated to operator. If you add per-agent grants, also author a
+`principals/main.json` (for example `{"agent_id": "main", "capabilities":
+["*"]}`) — or set `MINNI_LOCAL_OPERATOR` — so your own local sessions keep
+operator access.
+
 Alongside the four verbs, sessions carry a lifecycle spine —
 `prepare_task → prepare_outcome → plan → learn` — injected via the
 `<minni:context>` envelope so agents orient before ambitious work and distill
