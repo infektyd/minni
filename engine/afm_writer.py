@@ -154,8 +154,11 @@ def _write_one(vault: Path, draft: dict, writeback: Any = None) -> dict:
     # a synthesis pass that inherited it from its source inputs), and OR in a fresh
     # recompute on the final body so the flag can never be laundered away by a
     # pass that forgot to propagate it.
+    # Scan the actual text being written — title included: a poisoned title over
+    # a benign body (e.g. a concept extracted from an injected heading) lands in
+    # the frontmatter and the markdown heading just the same.
     draft_body = draft.get("body") or ""
-    own_flag = is_instruction_like(draft_body)
+    own_flag = is_instruction_like(f"{draft.get('title') or ''}\n{draft_body}")
     carried_flag = bool(draft.get("instruction_like"))
     instruction_like = own_flag or carried_flag
     if instruction_like and not own_flag:

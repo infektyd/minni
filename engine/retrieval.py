@@ -2443,9 +2443,39 @@ class RetrievalEngine:
             except Exception:
                 raw["rationale"] = None
 
-            # For document depth, attach full document text if available
+            # For document depth, attach full document text if available.
+            # Detection/attribution ran on the chunk above; the whole document is
+            # what actually ships at this depth, so re-check the flag and re-score
+            # the claim against it, and wrap it in an envelope — the raw body must
+            # never ride outside the perturbed <EVIDENCE> form (same leak class as
+            # chunk_text).
             if depth == "document":
-                raw["full_document_text"] = self._fetch_full_document(r["doc_id"])
+                full_text = self._fetch_full_document(r["doc_id"])
+                if full_text:
+                    doc_flag = bool(raw.get("instruction_like")) or bool(
+                        is_instruction_like(full_text)
+                    )
+                    raw["instruction_like"] = doc_flag
+                    if claim_text:
+                        attribution = self._score_attribution(claim_text, full_text)
+                        if attribution is not None:
+                            raw.update(attribution)
+                    raw["full_document_text"] = build_evidence_envelope(
+                        source=raw.get("source", "?"),
+                        agent=raw.get("agent", "?"),
+                        status=raw.get("review_state", "?"),
+                        privacy=raw.get("privacy_level", "?"),
+                        score=float(raw.get("score") or 0),
+                        instruction_like=doc_flag,
+                        visibility=r.get("visibility", "authorized"),
+                        text=full_text,
+                        attribution=raw.get("attribution"),
+                        perturbation_enabled=getattr(
+                            self.config, "instruction_body_perturbation_enabled", True
+                        ),
+                    )
+                else:
+                    raw["full_document_text"] = full_text
 
             # S7: self-labeling recall package — primary (rank 1) vs related (2..N).
             # Rank is 1-based by position in the final results list (post-rerank order).
@@ -2608,8 +2638,11 @@ class RetrievalEngine:
             ws = workspace or getattr(principal, "workspace_id", "default")
             if not can_read_document(principal, ws, raw):
                 return None
-            # G22 envelope on expanded too
-            txt = str(raw.get("chunk_text") or raw.get("full_document_text") or "")
+            # G22 envelope on expanded too. Prefer the full document text when it
+            # was fetched (depth="document"): _apply_depth returns the whole
+            # document, so instruction_like detection and attribution must be
+            # scored against what is actually returned, not just the first chunk.
+            txt = str(raw.get("full_document_text") or raw.get("chunk_text") or "")
             raw["instruction_like"] = bool(is_instruction_like(txt))
             attribution = self._score_attribution(claim, txt)
             if attribution is not None:
@@ -2655,6 +2688,10 @@ class RetrievalEngine:
                     })
             if "chunk_text" in raw:
                 raw["chunk_text"] = raw["evidence_envelope"]
+            # The envelope body IS the full text at document depth — never ship
+            # the raw document body alongside it (same leak class as chunk_text).
+            if "full_document_text" in raw:
+                raw["full_document_text"] = raw["evidence_envelope"]
 
         return self._apply_depth(raw, depth)
 
