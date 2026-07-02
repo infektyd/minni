@@ -390,6 +390,46 @@ test("#122/4: restore refuses a newer-version note instead of downgrade-writing 
   }
 });
 
+test("#122/4: newer-version gate fires BEFORE current-schema validations (evidence check)", async () => {
+  // Codex re-review round 3: a plan_digest_v: 3 note whose slice shape is
+  // invalid under the CURRENT schema (e.g. v3 moved evidence elsewhere) must
+  // throw the typed PlanDigestVersionError, not the generic evidence error —
+  // otherwise minni_plan_restore's downgrade guard (which keys on the typed
+  // error) falls through to the bare-scalar heal path and can persist a v2
+  // restore over a newer writer's note.
+  const root = await mkdtemp(path.join(tmpdir(), "i122-digest-newer-schema-"));
+  try {
+    await ensureVault(root);
+    const { write } = await createPlan(
+      { goal: "newer schema shape", slices: [{ id: "s1", title: "t1" }], vaultPath: root },
+      { vaultPath: root },
+    );
+    // Persist a shape that is invalid under the current schema: a 'done' slice
+    // with empty evidence (persistPlan does not validate; rehydratePlan does).
+    const p = await rehydratePlan(write.notePath);
+    p.slices[0].status = "done";
+    p.slices[0].evidence = "";
+    await persistPlan(p, { vaultPath: root, notePath: write.notePath });
+    // Sanity: under the declared CURRENT version this shape trips the evidence check.
+    await assert.rejects(() => rehydratePlan(write.notePath), /without evidence/);
+    // Declare a newer version: the version gate must now fire first.
+    const raw = await readFile(write.notePath, "utf8");
+    await writeFile(write.notePath, raw.replace(/^plan_digest_v:.*$/m, "plan_digest_v: 3"), "utf8");
+    await assert.rejects(
+      () => rehydratePlan(write.notePath),
+      (err) => {
+        assert.ok(err instanceof PlanDigestVersionError, "version gate must precede schema validation");
+        assert.doesNotMatch(err.message, /without evidence/);
+        return true;
+      },
+    );
+    const untouched = await readFile(write.notePath, "utf8");
+    assert.match(untouched, /^plan_digest_v: 3$/m, "newer-version note must not be rewritten");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("#122/4: minni_plan_restore handler re-throws PlanDigestVersionError (source pin)", () => {
   const block = handlerBlock("minni_plan_restore");
   assert.match(

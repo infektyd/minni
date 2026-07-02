@@ -906,6 +906,21 @@ export async function rehydratePlan(notePath: string): Promise<PlanArtifact> {
     throw new Error(`rehydratePlan: note ${notePath} missing plan_id in frontmatter`);
   }
 
+  // #122 (codex re-review round 3): the declared-digest-version gate runs
+  // BEFORE any current-schema validation (done-slice evidence, digest
+  // verification). A note declaring a NEWER version must throw the typed
+  // PlanDigestVersionError immediately — this plugin cannot judge a newer
+  // schema, and a generic validation error thrown first would be misread by
+  // recovery paths (minni_plan_restore) as recoverable corruption, letting an
+  // older plugin downgrade-write the newer note.
+  const rawStoredDigest = typeof fm.plan_digest === "string" ? fm.plan_digest : "";
+  const storedTag = parsePlanDigestTag(rawStoredDigest);
+  const fmDigestV = typeof fm.plan_digest_v === "number" ? fm.plan_digest_v : undefined;
+  const declaredVersion = storedTag?.version ?? fmDigestV;
+  if (declaredVersion !== undefined && !PLAN_DIGEST_ALGORITHMS[declaredVersion]) {
+    throw new PlanDigestVersionError(declaredVersion, notePath);
+  }
+
   const status = (fm.status as PageStatus) || "draft";
   const goal = typeof fm.plan_goal === "string" ? fm.plan_goal : extractGoalFromBody(raw);
   const constraints: string[] = Array.isArray(fm.plan_constraints)
@@ -964,21 +979,12 @@ export async function rehydratePlan(notePath: string): Promise<PlanArtifact> {
   // Check for digest mismatch instead of silent repair.
   //
   // #122 F-PLAN-DIGEST-CROSSPROC (revised after codex review on PR #130):
-  // dispatch on the DECLARED algorithm version — the plan_digest_v frontmatter
-  // field, or a defensive "vN:<hex>" digest prefix from interim builds of the
-  // PR — through the algorithm registry. An UNKNOWN (newer) version throws the
-  // typed PlanDigestVersionError so callers (and the restore recovery path)
-  // can tell "note is newer than me" apart from a genuine tamper. A KNOWN
+  // dispatch on the DECLARED algorithm version (resolved above, before any
+  // current-schema validation) through the algorithm registry. A KNOWN
   // version verifies with that exact algorithm; a note with NO declared
   // version validates against bare v2-or-v1 exactly as before. Anything but
   // the current bare-hex form is upgraded/normalized in place on a successful
   // read (re-persist stamps plan_digest_v and a bare-hex plan_digest).
-  const storedTag = parsePlanDigestTag(plan.plan_digest);
-  const fmDigestV = typeof fm.plan_digest_v === "number" ? fm.plan_digest_v : undefined;
-  const declaredVersion = storedTag?.version ?? fmDigestV;
-  if (declaredVersion !== undefined && !PLAN_DIGEST_ALGORITHMS[declaredVersion]) {
-    throw new PlanDigestVersionError(declaredVersion, notePath);
-  }
   const storedHex = storedTag ? storedTag.hex : plan.plan_digest;
   const recomputed = computePlanDigest(plan);
   let needsUpgrade = false;
