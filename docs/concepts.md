@@ -29,15 +29,22 @@ Three resolution paths exist, all landing in the same audit trail:
    granting the agent governance capability:
 
    ```json
-   {"agent_id": "codex", "capabilities": ["learn", "search", "govern"]}
+   {"agent_id": "codex", "capabilities": ["learn", "resolve_candidate"]}
    ```
 
-   With `govern` (or `resolve_candidate`, or `*`) in its capability list, that
+   With `resolve_candidate` (or `govern`, or `*`) in its capability list, that
    agent may resolve candidates itself and may use the `force=true` durable
    learn — its memory writes no longer wait for a human. Without it, the same
    agent can still `learn` (staging candidates) but a `force` attempt is
    denied `operator_only`. Principal files are read per request; no daemon
    restart is needed.
+
+   Grant least privilege: any of these capabilities makes the principal an
+   **operator**, which carries governance authority beyond approving its own
+   candidates. In particular, adding `search` to an operator grant widens
+   recall — the default combined scope can surface results from other agents'
+   vaults — so scope capabilities (and `allowed_vault_roots`, if you use it)
+   to what the delegation actually needs.
 
 3. **The background consolidation pass.** Start the daemon with
    `MINNI_AFM_LOOP=on` and the AFM consolidation pass drains staged candidates
