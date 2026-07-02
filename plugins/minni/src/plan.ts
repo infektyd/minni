@@ -207,6 +207,15 @@ export class PlanDigestVersionError extends Error {
  * typed PlanDigestVersionError before this build judges the note against its
  * own schema in any way. Returns the parsed declaration for callers that go on
  * to verify the digest hex.
+ *
+ * Codex round 6: when BOTH declarations are present the note's effective
+ * version is the NEWEST declared — a "v2:<hex>" prefix must not shadow a
+ * plan_digest_v: 3 marker, or this older build would verify the note as v2
+ * and the normalization rewrite would stamp plan_digest_v back to 2,
+ * bypassing the downgrade guard. If both are known but disagree, the digest
+ * is likewise verified under the newest declared version (a stale lower
+ * declaration never weakens verification); a hex that fails under it is
+ * reported as tampered.
  */
 function assertKnownDigestVersion(
   fm: Record<string, unknown>,
@@ -215,7 +224,10 @@ function assertKnownDigestVersion(
   const rawStoredDigest = typeof fm.plan_digest === "string" ? fm.plan_digest : "";
   const storedTag = parsePlanDigestTag(rawStoredDigest);
   const fmDigestV = typeof fm.plan_digest_v === "number" ? fm.plan_digest_v : undefined;
-  const declaredVersion = storedTag?.version ?? fmDigestV;
+  const declared = [storedTag?.version, fmDigestV].filter(
+    (v): v is number => typeof v === "number",
+  );
+  const declaredVersion = declared.length > 0 ? Math.max(...declared) : undefined;
   if (declaredVersion !== undefined && !PLAN_DIGEST_ALGORITHMS[declaredVersion]) {
     throw new PlanDigestVersionError(declaredVersion, notePath);
   }

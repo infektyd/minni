@@ -507,6 +507,73 @@ test("#122/4: newer-version gate fires BEFORE current-schema validations (eviden
   }
 });
 
+test("#122/4: dual declaration — 'v2:' prefix plus newer plan_digest_v: 3 gates as newer everywhere, nothing rewritten", async () => {
+  // Codex round 6 (PR #130): when a note carries BOTH an interim prefixed
+  // digest (plan_digest: v2:<hex>) AND a newer plan_digest_v: 3, the effective
+  // version is the NEWEST declared. Preferring the prefix would let this older
+  // build verify the note as v2 and the normalization path rewrite it back
+  // with plan_digest_v: 2, bypassing the downgrade guard.
+  const root = await mkdtemp(path.join(tmpdir(), "i122-digest-dual-"));
+  try {
+    await ensureVault(root);
+    const { plan, write } = await createPlan(
+      { goal: "dual declaration", slices: [{ id: "s1", title: "t1" }], vaultPath: root },
+      { vaultPath: root },
+    );
+    const raw = await readFile(write.notePath, "utf8");
+    const bare = raw.match(/^plan_digest: "?([0-9a-f]{16})"?$/m)?.[1];
+    assert.ok(bare, "expected a bare-hex digest to prefix");
+    await writeFile(
+      write.notePath,
+      raw
+        .replace(/^plan_digest:.*$/m, `plan_digest: v2:${bare}`)
+        .replace(/^plan_digest_v:.*$/m, "plan_digest_v: 3"),
+      "utf8",
+    );
+
+    const isNewerErr = (err) =>
+      err instanceof PlanDigestVersionError && err.code === "PLAN_DIGEST_NEWER";
+    await assert.rejects(() => rehydratePlan(write.notePath), isNewerErr);
+    await assert.rejects(() => rehydratePlanScalars(write.notePath), isNewerErr);
+    await clearActivePlan(root);
+    await assert.rejects(() => activatePlanChecked(root, plan.plan_id, write.notePath), isNewerErr);
+    assert.equal(await getActivePlan(root), undefined, "pointer must NOT be written");
+
+    const untouched = await readFile(write.notePath, "utf8");
+    assert.match(untouched, /^plan_digest_v: 3$/m, "plan_digest_v: 3 must survive untouched");
+    assert.match(untouched, new RegExp(`^plan_digest: v2:${bare}$`, "m"), "digest must not be normalized");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("#122/4: dual declaration that AGREES ('v2:' prefix + plan_digest_v: 2) still verifies and normalizes", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "i122-digest-dual-agree-"));
+  try {
+    await ensureVault(root);
+    const { write } = await createPlan(
+      { goal: "dual agreement", slices: [{ id: "s1", title: "t1" }], vaultPath: root },
+      { vaultPath: root },
+    );
+    const raw = await readFile(write.notePath, "utf8");
+    const bare = raw.match(/^plan_digest: "?([0-9a-f]{16})"?$/m)?.[1];
+    assert.ok(bare, "expected a bare-hex digest to prefix");
+    // plan_digest_v: 2 already present; only prefix the digest.
+    await writeFile(
+      write.notePath,
+      raw.replace(/^plan_digest:.*$/m, `plan_digest: v2:${bare}`),
+      "utf8",
+    );
+    const rehydrated = await rehydratePlan(write.notePath);
+    assert.equal(rehydrated.plan_digest, bare, "in-memory digest must be normalized bare hex");
+    const rewritten = await readFile(write.notePath, "utf8");
+    assert.match(rewritten, /^plan_digest: "?[0-9a-f]{16}"?$/m, "note must be re-stamped bare hex");
+    assert.match(rewritten, /^plan_digest_v: 2$/m);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("#122/4: minni_plan_restore handler re-throws PlanDigestVersionError (source pin)", () => {
   const block = handlerBlock("minni_plan_restore");
   assert.match(
