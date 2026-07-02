@@ -102,7 +102,13 @@ the daemon into strict identity mode, where the anonymous local caller is no
 longer auto-elevated to operator. If you add per-agent grants, also author a
 `principals/main.json` (for example `{"agent_id": "main", "capabilities":
 ["*"]}`) — or set `MINNI_LOCAL_OPERATOR` — so your own local sessions keep
-operator access.
+operator access. That `main.json` remediation applies to the **anonymous**
+caller only (one that omits `agent_id` entirely): a wire caller that
+explicitly claims a reserved operator id (`main`/`operator`) is denied with a
+`reserved_agent_id` diagnostic regardless of `main.json`, unless the daemon
+itself runs with `MINNI_LOCAL_OPERATOR` set. Named agents (`claude-code`,
+`codex`, …) always need their own `principals/<agent>.json` — see
+[Provision agent identities](install.md#provision-agent-identities-principals).
 
 Alongside the four verbs, sessions carry a lifecycle spine —
 `prepare_task → prepare_outcome → plan → learn` — injected via the

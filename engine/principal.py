@@ -89,6 +89,12 @@ class EffectivePrincipal:
     transport: str = "uds"
     capabilities: List[str] = field(default_factory=lambda: ["*"])
     allowed_vault_roots: List[str] = field(default_factory=list)
+    # Why the resolver default-denied this stamp (None for capable principals):
+    # "unknown_identity"  — supplied non-reserved id with no principals/<id>.json
+    # "reserved_agent_id" — wire claim of an operator-reserved id ("main"/"operator")
+    # Diagnostic only: it lets the dispatch capability gate report WHY the deny
+    # happened without re-deriving; it never grants anything (issue #121).
+    deny_reason: Optional[str] = None
 
     def can(self, capability: str) -> bool:
         """Return True if the principal is allowed the named operation."""
@@ -443,10 +449,30 @@ def resolve_effective_principal(
         raise IdentityMismatchError(supplied_raw, stamped.agent_id, str(exc)) from exc
 
     if supplied in OPERATOR_RESERVED_AGENT_IDS and not operator_context:
-        return _default_deny_principal(supplied, transport=transport)
+        # RCM-003 anti-spoofing: a wire claim of a reserved operator id is never
+        # honored on its own. MINNI_LOCAL_OPERATOR is the trusted escape hatch:
+        # set in the daemon's own environment (operator-controlled, never
+        # wire-controlled), it asserts operator context exactly like the
+        # explicit operator_context flag (issue #121, Root B).
+        if _local_operator_asserted():
+            operator_context = True
+        else:
+            return _default_deny_principal(
+                supplied, transport=transport, deny_reason="reserved_agent_id"
+            )
 
     if operator_context:
         if supplied == stamped.agent_id:
+            return stamped
+        # The reserved operator ids are aliases of ONE local operator: an
+        # operator-context claim of "operator" must normalize to the stamped
+        # operator (synthesized/authored as e.g. "main"), not mismatch against
+        # it (#132 review, P2). Only fires under trusted operator context —
+        # wire callers without it were already denied above.
+        if (
+            supplied in OPERATOR_RESERVED_AGENT_IDS
+            and stamped.agent_id in OPERATOR_RESERVED_AGENT_IDS
+        ):
             return stamped
         if strict:
             aliases: list[str] = []
@@ -524,10 +550,14 @@ def resolve_effective_principal(
     if strict and stamped.agent_id not in OPERATOR_RESERVED_AGENT_IDS:
         raise IdentityMismatchError(supplied, stamped.agent_id)
 
-    return _default_deny_principal(supplied, transport=transport)
+    return _default_deny_principal(
+        supplied, transport=transport, deny_reason="unknown_identity"
+    )
 
 
-def _default_deny_principal(agent_id: str, *, transport: str) -> EffectivePrincipal:
+def _default_deny_principal(
+    agent_id: str, *, transport: str, deny_reason: Optional[str] = None
+) -> EffectivePrincipal:
     """Return a valid caller stamp with no capabilities and no vault roots."""
     return EffectivePrincipal(
         agent_id=validate_agent_id(agent_id),
@@ -535,6 +565,7 @@ def _default_deny_principal(agent_id: str, *, transport: str) -> EffectivePrinci
         transport=transport,
         capabilities=[],
         allowed_vault_roots=[],
+        deny_reason=deny_reason,
     )
 
 

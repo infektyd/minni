@@ -168,6 +168,7 @@ from minnid_runtime.provenance import (  # noqa: E402
     enforce_method_capability as _enforce_method_capability,
     guard_vault_root as _guard_vault_root,
     handler_principal as _runtime_handler_principal,
+    make_reserved_agent_id_error as _make_reserved_agent_id_error,
     provenance_claim as _provenance_claim,
     recover,
     resolve_provenance as _runtime_resolve_provenance,
@@ -688,6 +689,14 @@ def _handle_gate_shared(params: dict, request_id: Any) -> dict:
     operation = str(params.get("operation") or "").strip()
     if not operation:
         return _make_error(-32602, "operation is required", request_id)
+    # A wire claim of a reserved operator id gets the distinct reserved-id
+    # diagnostic (#121 Root B), not the generic unknown-identity route — the
+    # remediation differs (omit agent_id / MINNI_LOCAL_OPERATOR, not authoring
+    # a principals/<agent>.json for a reserved name).
+    if getattr(principal, "deny_reason", None) == "reserved_agent_id":
+        return _make_reserved_agent_id_error(
+            principal.agent_id, "gate.shared", request_id
+        )
     # Fail-loud on an unknown/unauthorized identity: a default-deny principal
     # (no capabilities AND no vault roots) must NOT receive a bare status:ok —
     # that would read as authorization when the gate only attributed. Surface

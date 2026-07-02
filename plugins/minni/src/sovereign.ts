@@ -276,6 +276,69 @@ function jsonRpcSocketCandidates(): string[] {
   return [SOCKET_PATH];
 }
 
+/**
+ * Extract the daemon's structured identity-recovery route from an RPC payload
+ * (#121 / PR #132 P1). Handles both wire shapes:
+ *  - a success-wrapped recovery envelope (`result.status === "recovery_required"`,
+ *    e.g. gate.shared), and
+ *  - a JSON-RPC error whose `error.data` carries the machine route (gated
+ *    method capability denials).
+ * Returns the route object, or undefined when the payload is not a recovery.
+ */
+export function recoveryRouteFrom(payload: unknown): Record<string, unknown> | undefined {
+  if (!payload || typeof payload !== "object") return undefined;
+  const record = payload as Record<string, unknown>;
+  if (record.status === "recovery_required") return record;
+  const error = record.error;
+  if (!error || typeof error !== "object") return undefined;
+  const data = (error as Record<string, unknown>).data;
+  if (data && typeof data === "object" && (data as Record<string, unknown>).status === "recovery_required") {
+    return data as Record<string, unknown>;
+  }
+  return undefined;
+}
+
+function recoveryErrorMessage(route: Record<string, unknown>): string {
+  const reason = typeof route.reason === "string" ? route.reason : "recovery_required";
+  const remediation = Array.isArray(route.remediation) ? route.remediation.join(" ") : "";
+  return `recovery_required (${reason}): ${remediation}`.trim();
+}
+
+/**
+ * Extract a live identity/authz denial from a JSON-RPC error envelope
+ * (#132 P2). A -32004 (capability_denied / reserved_agent_id / recovery)
+ * means the daemon ANSWERED and refused the caller's identity — a
+ * misconfiguration, not an outage — so callers must not fall back to
+ * offline framing. Transport failures carry no JSON-RPC error envelope
+ * and return undefined, keeping the offline fallback intact.
+ */
+export function identityDenialFrom(payload: unknown): string | undefined {
+  if (!payload || typeof payload !== "object") return undefined;
+  const error = (payload as Record<string, unknown>).error;
+  if (!error || typeof error !== "object") return undefined;
+  const record = error as Record<string, unknown>;
+  if (record.code !== -32004) return undefined;
+  return typeof record.message === "string" && record.message
+    ? record.message
+    : "capability_denied";
+}
+
+/**
+ * Convert a JSON-RPC success `result` into a JsonResult. A success-wrapped
+ * recovery envelope means identity is unresolved and the call did NOT do what
+ * was asked — it must read as a FAILED RPC (surfacing the remediation route),
+ * never as ok (#132 P1: minni_recall rendered it as "No recall results" and
+ * minni_learn as "learned"). The route stays on `data` for shape-aware
+ * callers (e.g. requireSharedGate).
+ */
+function jsonRpcResultToJsonResult(result: unknown): JsonResult {
+  const route = recoveryRouteFrom(result);
+  if (route) {
+    return { ok: false, data: result, error: recoveryErrorMessage(route) };
+  }
+  return { ok: true, data: result };
+}
+
 export function jsonRpcSocketRequest(socketPath: string, method: string, params: Record<string, unknown>): Promise<JsonResult> {
   return new Promise((resolve) => {
     if (!existsSync(socketPath)) {
@@ -308,13 +371,13 @@ export function jsonRpcSocketRequest(socketPath: string, method: string, params:
         finish({ ok: false, data: parsed.data, error: parsed.data.error.message ?? "JSON-RPC error" });
         return;
       }
-      finish({ ok: true, data: parsed.data?.result });
+      finish(jsonRpcResultToJsonResult(parsed.data?.result));
     });
     client.on("error", (error) => finish({ ok: false, error: error.message }));
     client.on("end", () => {
       if (!settled && data.trim()) {
         const parsed = parseSovrdJson<{ result?: unknown }>(data.trim());
-        finish(parsed.ok ? { ok: true, data: parsed.data?.result } : parsed);
+        finish(parsed.ok ? jsonRpcResultToJsonResult(parsed.data?.result) : parsed);
       }
     });
   });
@@ -589,6 +652,43 @@ export function formatRecall(query: string, response: RecallResponse, vaultResul
  */
 export function shouldPrescanVault(daemonOk: boolean, includeVault: boolean): boolean {
   return includeVault && !daemonOk;
+}
+
+/**
+ * Decide the minni_recall response text for a daemon recall result (#132 P1).
+ * An identity-recovery denial is neither a recall miss nor a daemon outage:
+ * it must surface the remediation route verbatim — never "No recall results"
+ * (fake success) and never the "Daemon unavailable" offline-fallback framing
+ * (the daemon answered; the caller's identity is unprovisioned).
+ */
+export function recallResponseText(
+  query: string,
+  result: JsonResult<RecallResponse>,
+  vaultResults: VaultSearchResult[],
+): string {
+  if (result.ok && result.data) return formatRecall(query, result.data, []);
+  const recovery = recoveryRouteFrom(result.data);
+  if (recovery) {
+    return [
+      "Recall denied — Minni identity recovery required (not a recall miss).",
+      JSON.stringify(recovery, null, 2),
+    ].join("\n");
+  }
+  // #132 P2: a routeless -32004 (e.g. reserved_agent_id, capability_denied)
+  // is still a live daemon answer — surface its diagnostic, never the
+  // "Daemon unavailable" offline framing or the unscoped local fallback.
+  const denial = identityDenialFrom(result.data);
+  if (denial) {
+    return `Recall denied by the daemon (identity/authz misconfiguration, not an outage): ${denial}`;
+  }
+  if (vaultResults.length) {
+    return formatRecall(
+      query,
+      { results: "Daemon unavailable — offline vault fallback (workspace-unscoped)." },
+      vaultResults,
+    );
+  }
+  return `Recall failed: ${result.error}`;
 }
 
 /**

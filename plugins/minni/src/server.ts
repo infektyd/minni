@@ -15,17 +15,18 @@ import {
   compileVault,
   drillMemory,
   exportContextPack,
-  formatRecall,
   gateSharedOperation,
   isSharedGateUnavailable,
   handoffMemory,
+  identityDenialFrom,
   learnMemory,
   listPendingHandoffs,
   recallMemory,
+  recallResponseText,
+  recoveryRouteFrom,
   shouldPrescanVault,
   statusAndAudit,
   subscribeContradictions,
-  type RecallResponse,
 } from "./sovereign.js";
 import {
   buildHandoffPacket,
@@ -96,7 +97,10 @@ async function requireSharedGate(
     details,
   });
   const data = gate.data as Record<string, unknown> | undefined;
-  if (gate.ok && data?.status === "recovery_required") {
+  // Shape-based, not ok-based: the RPC client now reports a recovery envelope
+  // as a failed call (#132 P1), but this gate's structured rejection payload
+  // must stay identical for both the old (ok-wrapped) and new shapes.
+  if (data?.status === "recovery_required") {
     return textResult(
       JSON.stringify(
         {
@@ -510,7 +514,14 @@ server.registerTool(
       agentId: DEFAULT_AGENT_ID, // G11: server-side default only (model no longer supplies agentId)
     });
     const daemonOk = result.ok && !!result.data;
-    const vaultResults = shouldPrescanVault(daemonOk, includeVault !== false)
+    // An identity denial is not a daemon outage: whether it carries a recovery
+    // route (#132 P1) or is a routeless -32004 like reserved_agent_id (#132 P2),
+    // the daemon ANSWERED — skip the unscoped offline pre-scan and surface the
+    // diagnostic instead of the "Daemon unavailable" framing.
+    const identityDenied =
+      recoveryRouteFrom(result.data) !== undefined ||
+      identityDenialFrom(result.data) !== undefined;
+    const vaultResults = !identityDenied && shouldPrescanVault(daemonOk, includeVault !== false)
       ? filterSafeVaultResults(
           await searchVaultNotes(
             effectiveVaultPath,
@@ -519,14 +530,7 @@ server.registerTool(
           ),
         )
       : [];
-    const fallbackResponse: RecallResponse = {
-      results: "Daemon unavailable — offline vault fallback (workspace-unscoped).",
-    };
-    const responseText = daemonOk
-      ? formatRecall(query, result.data!, [])
-      : vaultResults.length
-        ? formatRecall(query, fallbackResponse, vaultResults)
-        : `Recall failed: ${result.error}`;
+    const responseText = recallResponseText(query, result, vaultResults);
     await recordAudit(effectiveVaultPath, {
       tool: "minni_recall",
       summary: query,
@@ -644,10 +648,17 @@ server.registerTool(
       agentId: DEFAULT_AGENT_ID, // G11: server-side default only
       storeResult: { ok: store.ok, data: store.data, error: store.error },
     });
+    // #132 P1: an identity-recovery denial must never read as "learned" —
+    // name it distinctly so the remediation route (in store.data) is acted on.
+    const storeRecovery = recoveryRouteFrom(store.data);
     return textResult(
       JSON.stringify(
         {
-          status: store.ok ? "learned" : "vault-written-memory-store-failed",
+          status: store.ok
+            ? "learned"
+            : storeRecovery
+              ? "identity-recovery-required"
+              : "vault-written-memory-store-failed",
           quality,
           note,
           store,
