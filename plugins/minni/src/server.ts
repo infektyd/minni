@@ -43,7 +43,9 @@ import {
   createPlan,
   findPlanNote,
   persistPlan,
+  PlanDigestVersionError,
   rehydratePlan,
+  rehydratePlanScalars,
   replan,
   shelfDrift,
   updateSlice,
@@ -52,7 +54,7 @@ import {
   getRevision,
   diffPlans,
   restorePlan,
-  setActivePlan,
+  activatePlanChecked,
   clearActivePlan,
   getActivePlan,
   resolvePlanIdOrActive,
@@ -1183,7 +1185,7 @@ server.registerTool(
       const tail = await auditTail(effectiveVaultPath, 60);
       scar_tissue = extractScarTissue(tail.entries);
     }
-    const { plan, write } = await createPlan(
+    const { plan, write, displaced_active } = await createPlan(
       { goal, constraints, slices, open_questions, scar_tissue, vaultPath: effectiveVaultPath },
       { vaultPath: effectiveVaultPath },
     );
@@ -1194,6 +1196,14 @@ server.registerTool(
           notePath: write.notePath,
           wikilink: write.wikilink,
           plan,
+          // #122 F-PLAN-CREATE-OVERWRITES-ACTIVE: displacing a non-terminal
+          // in-flight plan must be visible in the response, not silent.
+          ...(displaced_active
+            ? {
+                displaced_active,
+                warning: `active plan ${displaced_active} was in-flight and has been displaced by this new plan; id-less plan tools now target the new plan. Re-activate it with minni_plan_activate if that was unintended.`,
+              }
+            : {}),
         },
         null,
         2,
@@ -1500,7 +1510,24 @@ server.registerTool(
     if (!notePath) {
       return textResult(JSON.stringify({ error: `plan not found: ${plan_id}` }, null, 2));
     }
-    const current = await rehydratePlan(notePath);
+    // #122 F-PLAN-RESTORE-SELFBLOCK: the recovery tool must not be gated on the
+    // corrupt state it exists to heal. restorePlan consumes only frontmatter
+    // scalars from `current` (every digest-covered field comes from the history
+    // snapshot, and persistPlan recomputes the digest on write), so when the
+    // strict rehydrate throws — e.g. a bricked plan_digest — fall back to the
+    // bare-scalar read and proceed with the restore. EXCEPT for the typed
+    // PlanDigestVersionError: a note declaring a NEWER digest version belongs
+    // to a newer writer, and restoring through this (older) plugin would
+    // silently downgrade fields the newer schema introduced — refuse instead.
+    let current: PlanArtifact;
+    try {
+      current = await rehydratePlan(notePath);
+    } catch (err) {
+      if (err instanceof PlanDigestVersionError) {
+        return textResult(JSON.stringify({ error: err.message }, null, 2));
+      }
+      current = await rehydratePlanScalars(notePath);
+    }
     const snapshot = await getRevision(notePath, rev);
     if (!snapshot) {
       return textResult(JSON.stringify({ error: `revision ${rev} not found` }, null, 2));
@@ -1534,7 +1561,12 @@ server.registerTool(
     if (!notePath) {
       return textResult(JSON.stringify({ error: `plan not found: ${plan_id}` }, null, 2));
     }
-    await setActivePlan(effectiveVaultPath, plan_id, notePath);
+    // #122 F-PLAN-ACTIVATE-NO-TERMINAL-GUARD: refuse to re-activate a plan in a
+    // terminal status (mirrors resolveActivePlanView's suppression set).
+    const activated = await activatePlanChecked(effectiveVaultPath, plan_id, notePath);
+    if (!activated.ok) {
+      return textResult(JSON.stringify({ error: activated.error }, null, 2));
+    }
     return textResult(JSON.stringify({ active: plan_id }, null, 2));
   },
 );
