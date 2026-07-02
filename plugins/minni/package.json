@@ -42,7 +42,12 @@
     "eslint-plugin-react-hooks": "^7.1.1",
     "globals": "^17.7.0",
     "typescript": "^6.0.3",
+<<<<<<< dependabot/npm_and_yarn/plugins/minni/vite-8.1.2
+    "typescript-eslint": "^8.62.0",
+    "vite": "^8.1.2"
+=======
     "typescript-eslint": "^8.62.1",
     "vite": "^8.1.0"
+>>>>>>> main
   }
 }
