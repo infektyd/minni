@@ -34,7 +34,10 @@ wraps the doctor. The daemon listens on a Unix socket at
 `minni doctor` runs the same probes CI's hermetic smoke runs on every push:
 interpreter floor, socket presence and permissions, `status` RPC shape
 (`daemon` + `engine`), a recall round-trip, and model-cache presence. If
-doctor passes, the install works.
+doctor passes, the daemon is up and answering recalls. It does not exercise
+the background AFM consolidation pass
+(see [#119](https://github.com/infektyd/minni/issues/119) for that path's
+history), so doctor stays green regardless of that path's health.
 
 For a login-persistent daemon on macOS, a launchd template ships at
 `engine/launchd/com.minni.minnid.plist.example` (restart with

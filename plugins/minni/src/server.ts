@@ -605,12 +605,14 @@ server.registerTool(
       source: z.string().optional(),
       workspaceId: z.string().optional(),
       // G12: vaultPath removed from model-facing schema. Writes now target the operator-controlled DEFAULT_VAULT_PATH only.
-      requireQuality: z.boolean().optional(),
+      // Issue #125: quality floor is default-on; pass requireQuality:false to
+      // deliberately store a weak note.
+      requireQuality: z.boolean().optional().default(true),
     },
   },
   async ({ title, content, category, source, workspaceId, requireQuality }) => {
     const quality = assessLearningQuality({ title, content, category, source });
-    if (requireQuality === true && !quality.ok) {
+    if (requireQuality !== false && !quality.ok) {
       await recordAudit(DEFAULT_VAULT_PATH, {
         tool: "minni_learn",
         summary: `quality-blocked: ${title}`,

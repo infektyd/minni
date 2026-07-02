@@ -32,8 +32,9 @@ grant: nothing enters the shared durable tier without approval. Know exactly
 what you are allowing, though — `minni_learn` does two things per call. It
 stages the `proposed` candidate, and it also writes a Markdown note into the
 agent's **own vault** immediately (audit-logged, and indexed into that
-agent's personal tier by `vault_ingest`). The quality gate blocks the call
-only when it is invoked with `requireQuality: true`. Allowlisting the tool
+agent's personal tier by `vault_ingest`). The quality gate blocks weak
+content by default (`requireQuality` defaults to `true`; a caller must pass
+`requireQuality: false` to store a weak note deliberately). Allowlisting the tool
 therefore means trusting the agent to write its own vault notes unprompted —
 the shared tier still waits for a resolution decision.
 

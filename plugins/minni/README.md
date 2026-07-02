@@ -181,7 +181,7 @@ Disable hooks without uninstalling: `export MINNI_CLAUDECODE_HOOKS=off`.
 
 The Codex plugin (`.codex-plugin/`), Gemini extension (`.gemini-plugin/`), and other integrations (Hermes, OpenClaw, Grok Build) are unaffected — they share the daemon, not the vault.
 
-Automatic behavior should remain recall-only. `minni_route` can recommend recall/status/audit automatically, but learning and vault writes stay manual and vault-first. `minni_learn` returns a quality report and can block weak memories with `requireQuality`.
+Automatic behavior should remain recall-only. `minni_route` can recommend recall/status/audit automatically, but learning and vault writes stay manual and vault-first. `minni_learn` returns a quality report and blocks weak memories by default (`requireQuality` defaults to `true`; pass `requireQuality: false` to store a weak note deliberately).
 
 ## Agent Information Requests
 
