@@ -12,7 +12,7 @@ from principal import (
     make_mismatch_error,
 )
 
-from .rpc import make_error, make_response
+from .rpc import make_error
 
 
 logger = logging.getLogger("minnid")
@@ -100,13 +100,17 @@ def enforce_method_capability(
     # principal.py's default-deny paths, so provisioned callers are unaffected.
     deny_reason = getattr(principal, "deny_reason", None)
     if deny_reason == "unknown_identity":
-        return make_response(
-            recover(
-                "unknown_identity",
-                {"method": method_name, "supplied_agent_id": principal.agent_id},
-                render_mode="machine",
-            ),
+        # A proper JSON-RPC ERROR, not a success-wrapped recovery envelope:
+        # clients that only check for `error` (the shipped plugin included)
+        # must fail loudly, never render the denial as an empty success
+        # (PR #132 review, P1). error.message carries the human route for old
+        # clients; error.data carries the full structured machine route.
+        caller_ctx = {"method": method_name, "supplied_agent_id": principal.agent_id}
+        return make_error(
+            -32004,
+            str(recover("unknown_identity", caller_ctx, render_mode="human")),
             request_id,
+            data=recover("unknown_identity", caller_ctx, render_mode="machine"),
         )
     if deny_reason == "reserved_agent_id":
         return make_reserved_agent_id_error(principal.agent_id, method_name, request_id)

@@ -166,28 +166,38 @@ def test_authored_principal_has_no_deny_reason(tmp_path: Path):
     assert p.deny_reason is None
 
 
-# ── dispatch: Root A → structured recovery route, not bare -32004 ───────────
+# ── dispatch: Root A → JSON-RPC ERROR carrying the recovery route ───────────
+# (PR #132 review, P1: a success-wrapped recovery envelope reads as "ok" to
+# clients that only check for `error` — the shipped plugin rendered it as
+# "No recall results" / "learned". The denial must be a proper JSON-RPC error
+# with the structured route in error.data so every client fails loudly.)
 
-def test_fresh_install_gated_method_returns_recovery_route(monkeypatch, tmp_path: Path):
+def test_fresh_install_gated_method_returns_recovery_error(monkeypatch, tmp_path: Path):
     principals = tmp_path / "principals"
     principals.mkdir()
     _use_principals_dir(monkeypatch, principals)
 
     resp = _rpc("search", {"agent_id": "claude-code", "query": "anything"})
 
-    assert "error" not in resp, resp
-    result = resp["result"]
-    assert result["status"] == "recovery_required"
-    assert result["reason"] == "unknown_identity"
-    assert result["caller"]["method"] == "search"
-    assert result["caller"]["supplied_agent_id"] == "claude-code"
-    assert result["route"]["zone"] == "pre_identity"
-    remediation = " ".join(result["remediation"])
+    assert "result" not in resp, resp
+    err = resp["error"]
+    assert err["code"] == -32004
+    # error.message is the human recovery route (old clients surface it as-is)
+    assert "recovery" in err["message"]
+    assert "claude-code" in err["message"]
+    # error.data carries the full structured machine route
+    data = err["data"]
+    assert data["status"] == "recovery_required"
+    assert data["reason"] == "unknown_identity"
+    assert data["caller"]["method"] == "search"
+    assert data["caller"]["supplied_agent_id"] == "claude-code"
+    assert data["route"]["zone"] == "pre_identity"
+    remediation = " ".join(data["remediation"])
     assert "author_principals" in remediation
     assert "0600" in remediation
 
 
-def test_fresh_install_handoff_returns_recovery_route(monkeypatch, tmp_path: Path):
+def test_fresh_install_handoff_returns_recovery_error(monkeypatch, tmp_path: Path):
     principals = tmp_path / "principals"
     principals.mkdir()
     _use_principals_dir(monkeypatch, principals)
@@ -197,11 +207,13 @@ def test_fresh_install_handoff_returns_recovery_route(monkeypatch, tmp_path: Pat
         {"from_agent": "claude-code", "to_agent": "codex", "packet": {}},
     )
 
-    assert "error" not in resp, resp
-    result = resp["result"]
-    assert result["status"] == "recovery_required"
-    assert result["reason"] == "unknown_identity"
-    assert result["caller"]["supplied_agent_id"] == "claude-code"
+    assert "result" not in resp, resp
+    err = resp["error"]
+    assert err["code"] == -32004
+    data = err["data"]
+    assert data["status"] == "recovery_required"
+    assert data["reason"] == "unknown_identity"
+    assert data["caller"]["supplied_agent_id"] == "claude-code"
 
 
 # ── dispatch: Root B → distinct reserved-id diagnostic ──────────────────────
@@ -319,11 +331,12 @@ def test_authoring_principal_file_unlocks_handoff_end_to_end(monkeypatch, tmp_pa
         json.dumps({"codex": str(sender), "claude-code": str(recipient)}),
     )
 
-    # Fresh install: the gated handoff is denied with the recovery route.
+    # Fresh install: the gated handoff is denied with a recovery-route ERROR.
     denied = _rpc("daemon.handoff", _handoff_params())
-    assert "error" not in denied, denied
-    assert denied["result"]["status"] == "recovery_required"
-    assert denied["result"]["reason"] == "unknown_identity"
+    assert "result" not in denied, denied
+    assert denied["error"]["code"] == -32004
+    assert denied["error"]["data"]["status"] == "recovery_required"
+    assert denied["error"]["data"]["reason"] == "unknown_identity"
 
     # Operator authors principals/codex.json (the documented remediation)...
     _author(principals, "codex", ["handoff"])
