@@ -18,10 +18,11 @@ Why is this change needed? Link an issue if there is one.
 paste relevant command output here
 ```
 
-## Engine firewall
+## Memory firewall
 
 - [ ] This PR does **not** change memory storage, retrieval, scoring, or
-      governance logic under `engine/` (see the "engine firewall" section of
+      governance logic — under `engine/` or in the plugin's recall/privacy/
+      model-facing-context gates (see the "memory firewall" section of
       `CONTRIBUTING.md`).
 - [ ] This PR **does** touch that surface, and it was discussed with a
       maintainer first — link the issue/discussion: ...

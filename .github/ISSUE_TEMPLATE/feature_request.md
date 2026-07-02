@@ -23,7 +23,8 @@ instead.
 ## Scope check
 
 - [ ] This does **not** touch memory storage, retrieval, scoring, or
-      governance in `engine/` (the "engine firewall" in `CONTRIBUTING.md`).
+      governance — in `engine/` or the plugin's recall/privacy gates (the
+      "memory firewall" in `CONTRIBUTING.md`).
 - [ ] This **does** touch that surface, and I understand it needs a
       maintainer discussion here before any implementation PR.
 
