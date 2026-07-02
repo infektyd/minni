@@ -32,8 +32,8 @@ slices (s2–s7).
 
 ## Running the tests
 
-Use the repo's 3.11 venv (bare `python3` is 3.14 and segfaults on faiss/embedding
-imports):
+Use the repo's engine venv (built by `make setup` with Python 3.14) rather than a
+bare `python3`, so faiss/embedding imports resolve against the pinned dependencies:
 
 ```sh
 cd ~/Projects/Minni && engine/.venv/bin/python -m pytest -q bench

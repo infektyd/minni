@@ -342,13 +342,3 @@ Minni is **pre-v1**. The architecture is useful now, but the public contract is 
 If Minni saves you a session's worth of lost context, you can say thanks:
 
 [![Buy me a beer](https://img.buymeacoffee.com/button-api/?text=Buy%20me%20a%20beer&emoji=%F0%9F%8D%BA&slug=y57d6h29td5&button_colour=40DCA5&font_colour=ffffff&font_family=Arial&outline_colour=000000&coffee_colour=FFDD00)](https://www.buymeacoffee.com/y57d6h29td5)
-
----
-
-Key changes from the prior draft, all sourced from [docs/VAULT_INGEST.md](docs/VAULT_INGEST.md) and the AFM passes:
-
-- **New mermaid** — two distinct storage nodes (personal `.index/vault.db` + shared `minni.db`), with AFM feeding both and Retrieval drawing a personal leg + shared leg.
-- **Data Model table** — split into shared DB / shared FAISS / per-vault `.index` / vault surfaces, with the scope + `src` semantics spelled out.
-- **Core Invariants** — replaced the single "SQLite is daemon storage" row with "Documents are two-tier" + "Learnings are shared-DB".
-- **Quickstart `search` sample** — now shows `[src=p]` / `[src=c]` markers so the two legs are visible.
-- Smaller touch-ups in *What Minni does*, *Runtime Components*, *Retrieval And Continuity*, *Learning Lifecycle* (consolidation proposes, daemon applies), *Setup* (manual `vault-ingest`), and a new doc-table row for `VAULT_INGEST.md`.
