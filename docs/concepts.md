@@ -31,6 +31,16 @@ because the human was AFK. This is safe to grant precisely because of
 proposal-first: an unprompted `learn` only ever creates a `proposed`
 candidate — quality-gated, audit-logged, invisible to recall until resolved.
 
+The initiative grant applies to the primary agent you are working with, not
+to anything it spawns: temporary team agents (`minni_team_*`) are hard-coded
+`learn: "manual-only"` in their memory policy and cannot inherit it. A note
+on maturity while we're here: the temporary-team surface itself hasn't been
+exercised beyond its unit tests yet. What *is* battle-tested daily is the
+core multi-agent loop — several approved principals (e.g. `claude-code` and
+`codex`) sharing one daemon, staging and resolving each other's candidates —
+because Minni is developed using Minni. At that scale it holds up; the team
+harness is the untested frontier.
+
 **Approval.** Who gets to resolve candidates is decided per principal, and the
 operator can delegate it. Three resolution paths exist, all landing in the
 same audit trail:

@@ -136,7 +136,7 @@ Request flow: agent → MCP plugin → Unix socket → daemon → identity gate 
 
 ## Status
 
-Minni is **pre-v1** and says so: small adoption, an intentionally smaller public contract than the implementation, and interfaces that can still change. What "works" is not asserted, it is *executed in public*: CI stands the daemon up from nothing on a clean runner and proves status, recall, and home-directory isolation on every push — the same check `minni doctor` gives you locally. A benchmark harness (`bench/membench`, byte-reproducible scorecards) exists, but no headline numbers are published until real-model runs are: when in doubt, this project under-claims.
+Minni is **pre-v1** and says so: small adoption, an intentionally smaller public contract than the implementation, and interfaces that can still change. What "works" is not asserted, it is *executed in public*: CI stands the daemon up from nothing on a clean runner and proves status, recall, and home-directory isolation on every push — the same check `minni doctor` gives you locally. A benchmark harness (`bench/membench`, byte-reproducible scorecards) exists, but no headline numbers are published until real-model runs are: when in doubt, this project under-claims. In that spirit: the core multi-agent loop — multiple approved agents sharing one governed daemon — is dogfooded daily (Minni is developed using Minni), while the temporary-team orchestration surface (`minni_team_*`) has unit tests but no real-world mileage yet.
 
 ## Documentation
 
