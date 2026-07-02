@@ -650,6 +650,23 @@ class RetrievalEngine:
             embed_failed = False
             if self.model:
                 chunks = self.chunker.chunk_document(content)
+                if not chunks:
+                    # Short-content floor: the chunker's min_tokens (64) filter
+                    # drops intra-document fragments, but a WHOLE durable memory
+                    # below that floor ("the lock code is X") would otherwise get
+                    # ZERO embedded chunks — semantically invisible forever, with
+                    # only lexical FTS recall. Embed the whole content as one
+                    # chunk so short memories are first-class in the semantic
+                    # index.
+                    from chunker import Chunk
+                    chunks = [
+                        Chunk(
+                            text=content.strip(),
+                            heading="",
+                            heading_path="",
+                            chunk_index=0,
+                        )
+                    ]
                 for chunk in chunks:
                     try:
                         emb = self.model.encode(chunk.text).astype(np.float32)
@@ -2926,36 +2943,52 @@ class RetrievalEngine:
         else:
             scope = []
 
-        results = []
-        with self.db.cursor() as c:
-            if scope:
-                placeholders = ",".join("?" * len(scope))
-                c.execute(f"""
-                    SELECT lf.learning_id, lf.agent_id, lf.content, lf.category,
-                           l.confidence, l.created_at, l.access_count
-                    FROM learnings_fts lf
-                    JOIN learnings l ON l.learning_id = lf.learning_id
-                    WHERE learnings_fts MATCH ? AND lf.agent_id IN ({placeholders})
-                          AND l.superseded_by IS NULL
-                          AND (l.status IS NULL OR l.status NOT IN ('rejected','expired','superseded'))
-                    ORDER BY rank
-                    LIMIT ?
-                """, [safe_q, *scope, limit])
-            else:
-                c.execute("""
-                    SELECT lf.learning_id, lf.agent_id, lf.content, lf.category,
-                           l.confidence, l.created_at, l.access_count
-                    FROM learnings_fts lf
-                    JOIN learnings l ON l.learning_id = lf.learning_id
-                    WHERE learnings_fts MATCH ?
-                          AND l.superseded_by IS NULL
-                          AND (l.status IS NULL OR l.status NOT IN ('rejected','expired','superseded'))
-                    ORDER BY rank
-                    LIMIT ?
-                """, (safe_q, limit))
+        def _match(match_q: str) -> List[Dict]:
+            rows = []
+            with self.db.cursor() as c:
+                if scope:
+                    placeholders = ",".join("?" * len(scope))
+                    c.execute(f"""
+                        SELECT lf.learning_id, lf.agent_id, lf.content, lf.category,
+                               l.confidence, l.created_at, l.access_count
+                        FROM learnings_fts lf
+                        JOIN learnings l ON l.learning_id = lf.learning_id
+                        WHERE learnings_fts MATCH ? AND lf.agent_id IN ({placeholders})
+                              AND l.superseded_by IS NULL
+                              AND (l.status IS NULL OR l.status NOT IN ('rejected','expired','superseded'))
+                        ORDER BY rank
+                        LIMIT ?
+                    """, [match_q, *scope, limit])
+                else:
+                    c.execute("""
+                        SELECT lf.learning_id, lf.agent_id, lf.content, lf.category,
+                               l.confidence, l.created_at, l.access_count
+                        FROM learnings_fts lf
+                        JOIN learnings l ON l.learning_id = lf.learning_id
+                        WHERE learnings_fts MATCH ?
+                              AND l.superseded_by IS NULL
+                              AND (l.status IS NULL OR l.status NOT IN ('rejected','expired','superseded'))
+                        ORDER BY rank
+                        LIMIT ?
+                    """, (match_q, limit))
+                for row in c.fetchall():
+                    rows.append(dict(row))
+            return rows
 
-            for row in c.fetchall():
-                results.append(dict(row))
+        # Strict pass first: FTS5 space-joined terms are implicit AND — precise
+        # when every term appears in the learning. But a natural-language
+        # question ("What is the hard timeout of the …?") almost never has ALL
+        # its tokens in the stored content, so a zero-hit AND query degrades to
+        # OR semantics: bm25 rank still puts the learning matching the most /
+        # rarest terms first, restoring recall without diluting queries the
+        # strict pass already answers.
+        results = _match(safe_q)
+        terms = safe_q.split()
+        if not results and len(terms) > 1:
+            # Lowercase the operands: FTS5 matching is case-insensitive, but a
+            # literal uppercase "OR"/"AND"/"NOT" token from the query would be
+            # parsed as an operator and corrupt the joined expression.
+            results = _match(" OR ".join(t.lower() for t in terms))
 
         # hooks-PL-2 leg (a): searching learnings IS reading them. Record
         # access + a learning_reads row so subscribe_contradictions can later
