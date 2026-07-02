@@ -190,8 +190,14 @@ def _cmd_learn(args):
         params["agent_id"] = args.agent
 
     result = _rpc(args.socket, "learn", params)
-    print(f"Stored learning #{result.get('learning_id', '?')}  "
-          f"[{result.get('category', '?')}]")
+    # Proposal-first path: the daemon stages a candidate for review instead of
+    # writing a durable learning. Say so, or the staging reads as a failure.
+    if result.get("status") == "proposed":
+        print(f"Staged candidate #{result.get('candidate_id', '?')} for review  "
+              "(not yet durable — approve with resolve_candidate)")
+    else:
+        print(f"Stored learning #{result.get('learning_id', '?')}  "
+              f"[{result.get('category', '?')}]")
     print()
 
 
