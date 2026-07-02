@@ -17,7 +17,9 @@
 #   make help    - list targets
 #
 # Tooling: the engine venv lives at engine/.venv and is built with the system
-# python3, which is the supported Python 3.14 path for this repo. Ruff runs from
+# python3, which is the supported Python 3.14 path for this repo; when system
+# python3 is older than 3.14 and uv is installed, setup provisions a uv-managed
+# Python 3.14 instead (the version floor itself never changes). Ruff runs from
 # that venv so local hooks, CI, and agent shells share the same dependency set.
 
 # Engine venv python. Two forms for two working dirs (PR92-2): VENV_PY is
@@ -33,7 +35,7 @@ SOCKET ?= $(HOME)/.minni/run/minnid.sock
 # Scoped engine pytest for `make check`: a fast, model-free core that exercises
 # daemon import, dispatch, status, learn/read, and the observability surface.
 # Override to widen, e.g. `make check CHECK_PYTEST="-q"` for the full suite.
-CHECK_PYTEST ?= test_g01_numpy_env.py test_obs.py test_pr11_observability.py -q
+CHECK_PYTEST ?= test_g01_numpy_env.py test_obs.py test_pr11_observability.py test_minni_cli.py -q
 
 .DEFAULT_GOAL := help
 
@@ -50,14 +52,36 @@ help:
 	@echo "  coverage   plugin (node) + engine (pytest-cov) coverage with floors"
 	@echo "  smoke      hermetic engine repro smoke"
 	@echo "  daemon     run the minnid daemon (SOCKET=$(SOCKET))"
+	@echo "  doctor     verify the install end to end (daemon must be running)"
 	@echo "  bench      run the membench fixture end-to-end"
 
 # ── Setup ────────────────────────────────────────────────────────────────
 .PHONY: setup
+# The interpreter gate: system python3 >= 3.14 is the classic path; when it is
+# older, uv (https://docs.astral.sh/uv/) provisions a managed Python 3.14 so
+# newcomers never install an interpreter by hand. The 3.14 floor itself is
+# unchanged. Deps install from the compiled lockfile (requirements.lock) for
+# reproducibility; requirements.txt stays the human-edited source spec. The
+# final editable install exposes the `minni` CLI (up/down/status/doctor) inside
+# the venv without touching engine import paths.
 setup:
-	cd engine && $(PYTHON_FOR_VENV) -c "import sys; sys.exit('Python 3.14+ is required for the Minni engine venv' if sys.version_info < (3, 14) else 0)"
-	cd engine && if [ -x .venv/bin/python ] && .venv/bin/python -c "import sys; sys.exit(0 if sys.version_info >= (3, 14) else 1)"; then echo "engine/.venv already uses Python 3.14+"; else echo "recreating engine/.venv with $(PYTHON_FOR_VENV)"; rm -rf .venv && $(PYTHON_FOR_VENV) -m venv .venv; fi
-	cd engine && .venv/bin/python -m pip install --upgrade pip && .venv/bin/python -m pip install -r requirements.txt
+	cd engine && if $(PYTHON_FOR_VENV) -c "import sys; sys.exit(0 if sys.version_info >= (3, 14) else 1)" 2>/dev/null; then \
+	  true; \
+	elif command -v uv >/dev/null 2>&1; then \
+	  echo "system python3 is older than 3.14 — uv will provision Python 3.14 for engine/.venv"; \
+	else \
+	  echo "Python 3.14+ is required for the Minni engine venv."; \
+	  echo "Install Python 3.14, or install uv (https://docs.astral.sh/uv/) and re-run make setup — uv downloads the interpreter for you."; \
+	  exit 1; \
+	fi
+	cd engine && if [ -x .venv/bin/python ] && .venv/bin/python -c "import sys; sys.exit(0 if sys.version_info >= (3, 14) else 1)"; then \
+	  echo "engine/.venv already uses Python 3.14+"; \
+	elif $(PYTHON_FOR_VENV) -c "import sys; sys.exit(0 if sys.version_info >= (3, 14) else 1)" 2>/dev/null; then \
+	  echo "recreating engine/.venv with $(PYTHON_FOR_VENV)"; rm -rf .venv && $(PYTHON_FOR_VENV) -m venv .venv; \
+	else \
+	  echo "recreating engine/.venv with uv-managed Python 3.14"; rm -rf .venv && uv venv --seed --python 3.14 .venv; \
+	fi
+	cd engine && .venv/bin/python -m pip install --upgrade pip && .venv/bin/python -m pip install -r requirements.lock && .venv/bin/python -m pip install --no-deps -e .
 	cd $(PLUGIN_DIR) && npm ci
 	git config core.hooksPath .githooks
 
@@ -127,6 +151,12 @@ smoke:
 .PHONY: daemon start
 daemon start:
 	$(VENV_PY) engine/minnid.py --socket $(SOCKET)
+
+# Health check a non-contributor can read: same probes as scripts/repro-smoke.sh
+# (status shape + recall round-trip) plus socket perms and model-cache presence.
+.PHONY: doctor
+doctor:
+	$(VENV_PY) engine/minni_cli.py --socket $(SOCKET) doctor
 
 # ── membench (s7) — one-command orchestration ──────────────────────────────
 #

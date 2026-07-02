@@ -61,3 +61,18 @@ jobs:
       - name: Hermetic smoke (status + recall + isolation)
         run: |
           bash scripts/repro-smoke.sh
+
+      # The newcomer-facing health check must stay truthful: stand up a daemon
+      # in an isolated $HOME (same pattern as repro-smoke.sh) and require
+      # `minni doctor` to pass against it.
+      - name: minni doctor (newcomer health check)
+        run: |
+          TD="$(mktemp -d /tmp/minnid-doctor-XXXXXX)"
+          mkdir -p "$TD/home"
+          export HOME="$TD/home" MINNI_HOME="$TD"
+          SOCK="$TD/run/minnid.sock"
+          engine/.venv/bin/python -u engine/minnid.py --socket "$SOCK" > "$TD/daemon.log" 2>&1 &
+          DPID=$!
+          trap 'kill "$DPID" 2>/dev/null || true; rm -rf "$TD"' EXIT
+          sleep 3
+          engine/.venv/bin/python engine/minni_cli.py --socket "$SOCK" doctor || { cat "$TD/daemon.log"; exit 1; }
