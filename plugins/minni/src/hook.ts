@@ -137,7 +137,7 @@ async function handleSessionStart(payload: Record<string, unknown>): Promise<Hoo
   // boot, and all-malformed entries survive for inspection.
   const { events: correctionsReassert, consumedPaths: reassertConsumed, deferredTails: reassertDeferred } =
     collectCorrectionsReassert(pending);
-  await settleReassertedInboxEntries({
+  await settleReassertedInboxEntries(CLAUDECODE_VAULT_PATH, {
     consumedPaths: reassertConsumed,
     deferredTails: reassertDeferred,
   });

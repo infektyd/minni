@@ -1346,8 +1346,13 @@ export function collectCorrectionsReassert(
  * cap-deferred are untouched and survive as-is.
  */
 export async function settleReassertedInboxEntries(
+  vaultPath: string,
   outcome: Pick<CorrectionsReassertResult, "consumedPaths" | "deferredTails">,
 ): Promise<void> {
+  // I4: the containment root is the TRUSTED inbox directory, never a path derived
+  // from the (attacker-writable) tail.filePath. Passing path.dirname(tail.filePath)
+  // would compare the target's own parent against itself and defeat the check.
+  const inboxRoot = path.join(vaultPath, "inbox");
   for (const filePath of outcome.consumedPaths) {
     // Inbox lifecycle policy (audit C2): archive, never unlink — the entry
     // moves to inbox/.archive/, which is invisible to readInboxStatus and the
@@ -1357,9 +1362,9 @@ export async function settleReassertedInboxEntries(
   for (const tail of outcome.deferredTails) {
     try {
       // I4: the inbox file is attacker-writable; a bare writeFile would follow a
-      // symlink swapped in under inbox/. Contain to the inbox root and write
-      // atomically (both helpers live in this module).
-      assertWriteTargetUnder(tail.filePath, path.dirname(tail.filePath));
+      // symlink swapped in under inbox/. Contain to the trusted inbox root and
+      // write atomically (both helpers live in this module).
+      assertWriteTargetUnder(tail.filePath, inboxRoot);
       await writeFileAtomic(
         tail.filePath,
         JSON.stringify(tail.payload, null, 2),

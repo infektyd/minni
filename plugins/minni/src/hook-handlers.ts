@@ -210,7 +210,7 @@ export function createHookHandlers(
     const reassertPending = await readReassertPending(config.vaultPath, 3);
     const { events: correctionsReassert, consumedPaths: reassertConsumed, deferredTails: reassertDeferred } =
       collectCorrectionsReassert(reassertPending);
-    await settleReassertedInboxEntries({
+    await settleReassertedInboxEntries(config.vaultPath, {
       consumedPaths: reassertConsumed,
       deferredTails: reassertDeferred,
     });

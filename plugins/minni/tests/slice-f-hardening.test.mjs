@@ -180,13 +180,44 @@ test("I4: settleReassertedInboxEntries does not rewrite a deferred tail through 
   const entryPath = path.join(inbox, "2026-01-01-abc-evt.json");
   await symlink(decoy, entryPath, "file");
 
-  await settleReassertedInboxEntries({
+  await settleReassertedInboxEntries(vault, {
     consumedPaths: [],
     deferredTails: [{ filePath: entryPath, payload: { stale_belief_events: [] } }],
   });
   // The write must NOT have followed the symlink to clobber the outside file.
   const after = await readFile(decoy, "utf8");
   assert.equal(after, "ORIGINAL", "deferred-tail rewrite must not escape the inbox root");
+});
+
+// Gemini (PR #106): the containment root must be the trusted inbox dir, NOT
+// path.dirname(tail.filePath). If the target's PARENT is a symlink escaping the
+// inbox, a dirname-derived root compares the parent to itself and passes,
+// letting the rewrite land outside the vault. This exercises that exact bypass.
+test("I4: deferred-tail rewrite is contained even when the target's parent dir escapes the inbox", async (t) => {
+  const vault = await mkVault();
+  const outside = await mkdtemp(path.join(tmpdir(), "slice-f-i4b-"));
+  t.after(async () => {
+    await rm(vault, { recursive: true, force: true });
+    await rm(outside, { recursive: true, force: true });
+  });
+  const inbox = path.join(vault, "inbox");
+  await mkdir(inbox, { recursive: true });
+  // A directory symlink under inbox/ pointing outside the vault.
+  const escapeDir = path.join(inbox, "escape");
+  await symlink(outside, escapeDir, "dir");
+  // Target is a fresh (non-existent) file *inside* the escaping parent dir.
+  const target = path.join(escapeDir, "tail.json");
+
+  await settleReassertedInboxEntries(vault, {
+    consumedPaths: [],
+    deferredTails: [{ filePath: target, payload: { stale_belief_events: [] } }],
+  });
+  // The file must NOT have been written into the outside dir.
+  await assert.rejects(
+    () => readFile(path.join(outside, "tail.json"), "utf8"),
+    /ENOENT/,
+    "rewrite must not land outside the inbox via a symlinked parent dir",
+  );
 });
 
 // ---- I5: all-malformed entries can't crowd out valid reasserts --------------
