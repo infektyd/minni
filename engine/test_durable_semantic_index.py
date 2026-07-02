@@ -680,3 +680,48 @@ def test_partial_encode_failure_writes_no_chunks_and_store_succeeds(
         "partial encode failure committed a half-indexed document "
         f"({n_chunks} chunk rows) — all-or-nothing invariant breached"
     )
+
+
+# A SHORT durable memory — the natural shape of a real learning ("the lock code
+# is X") — well below the markdown chunker's 64-token min floor. Before the
+# short-content fix, chunk_document() dropped it entirely, so the doc landed
+# with ZERO chunk_embeddings rows and was invisible to the semantic stream: the
+# exact membench Layer-2 failure where every gold session (~40 tokens) was
+# unretrievable while long distractors filled the top-k.
+_DOC_SHORT = (
+    "Planning note (winter cycle). The Sentinel invoice lock code is violet "
+    "prism. Confirm with operations before the quarterly close."
+)
+
+
+def test_short_durable_learning_is_semantically_recallable(temp_engine):
+    """A sub-min-token durable learning must still be embedded (single chunk)."""
+    db_path, _ = temp_engine
+    op = _operator()
+
+    staged = minnid._stage_candidate(
+        {"content": _DOC_SHORT, "_principal": op, "workspace_id": "default"}, 1
+    )
+    cid = staged["result"]["candidate_id"]
+    resolved = minnid._resolve_candidate(
+        {"candidate_id": cid, "decision": "accept", "_principal": op}, 2
+    )
+    assert resolved["result"]["new_status"] == "accepted"
+
+    # The short content must produce at least one embedded chunk — the min-token
+    # floor applies to intra-document fragments, not to a whole short memory.
+    conn = sqlite3.connect(db_path)
+    n_chunks = conn.execute("SELECT COUNT(*) FROM chunk_embeddings").fetchone()[0]
+    conn.close()
+    assert n_chunks >= 1, (
+        "short durable content produced no embedded chunks — sub-64-token "
+        "memories are semantically invisible"
+    )
+
+    # And it must actually surface in the SEMANTIC results stream.
+    resp = _search("what is the Sentinel invoice lock code", op)
+    results = resp["result"]["results"]
+    assert results, "semantic results stream empty for a short stored memory"
+    assert "violet prism" in _result_text(results[0]).lower(), (
+        f"expected the short durable doc on top, got: {_result_source(results[0])}"
+    )
