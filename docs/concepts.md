@@ -61,15 +61,20 @@ same audit trail:
    vaults — so scope capabilities (and `allowed_vault_roots`, if you use it)
    to what the delegation actually needs.
 
-3. **The background consolidation pass.** Start the daemon with
-   `MINNI_AFM_LOOP=on` and the AFM consolidation pass drains staged candidates
-   roughly every 15 minutes, auto-promoting the low-risk subset — explicitly
-   safe privacy level, not instruction-like, not a duplicate, passing the
-   deterministic quality gate — into durable learnings with no human in the
-   loop. Everything spicier is routed to review, never silently dropped. This
-   loop is **off by default**, and `MINNI_AFM_MODE` does not affect it — mode
-   only toggles an advisory triage annotation that the promotion gate never
-   consults.
+3. **The background consolidation pass** *(designed, currently broken —
+   [#119](https://github.com/infektyd/minni/issues/119))*. With
+   `MINNI_AFM_LOOP=on` the AFM consolidation pass is meant to drain staged
+   candidates roughly every 15 minutes, auto-promoting the low-risk subset —
+   explicitly safe privacy level, not instruction-like, not a duplicate,
+   passing the deterministic quality gate — into durable learnings with no
+   human in the loop, routing everything spicier to review. The gate and the
+   promotion write are implemented and tested, but as of v0.1.0 the assembled
+   path does not function: the background loop's wet run is rejected by the
+   daemon's own operator gate, and fresh installs are missing the
+   `consolidation_actions` table. Until #119 lands, treat this path as a
+   design commitment, not a working toggle. (The loop is off by default
+   regardless, and `MINNI_AFM_MODE` is unrelated — mode only toggles an
+   advisory triage annotation that the promotion gate never consults.)
 
 One operational caveat: creating your **first** `principals/*.json` file flips
 the daemon into strict identity mode, where the anonymous local caller is no
