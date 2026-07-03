@@ -367,7 +367,7 @@ import { readFileSync } from "node:fs";
 
 test("vault.ts correction constants match engine/config.py", () => {
   const configPy = readFileSync(
-    new URL("../../../engine/config.py", import.meta.url),
+    new URL("../../../src/minni/config.py", import.meta.url),
     "utf8",
   );
 

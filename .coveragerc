@@ -1,0 +1,27 @@
+# Coverage config for the Minni engine.
+#
+# Usage (opt-in; not part of default pytest addopts so plain `pytest` stays fast):
+#   .venv/bin/python -m pytest --cov=minni --cov-report=term-missing tests
+# or via the root Makefile:
+#   make coverage
+#
+# The full engine suite loads embedding/FAISS models and is heavy. For a quick
+# signal, scope it: `make coverage COV_PYTEST="tests/test_obs.py --cov-fail-under=0"`.
+
+[run]
+branch = True
+source = minni
+omit =
+    tests/*
+    .venv/*
+    */site-packages/*
+
+[report]
+show_missing = True
+skip_covered = False
+# Conservative floor for the full suite. Kept well below typical coverage so it
+# surfaces regressions without failing the current suite.
+fail_under = 40
+
+[html]
+directory = .coverage_html

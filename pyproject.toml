@@ -1,0 +1,78 @@
+# Packaging metadata for Minni (PACKAGING_PLAN.md §3; v0.2 restructure §6.1).
+#
+# v0.2 scope: the engine is a real package now — src/minni/ (src layout), all
+# internal imports package-qualified via the codemod, tests at tests/. A wheel
+# built from here is what `pipx install minni` delivers; the repo checkout
+# installs editably via `pip install -e .` (make setup does this).
+
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "minni"
+version = "0.2.0"
+description = "Minni (ᛗ): local-first, multi-agent memory daemon — recall is evidence, not instruction."
+readme = { text = "Minni is a local-first, multi-agent memory daemon. Full documentation: https://github.com/infektyd/minni", content-type = "text/markdown" }
+requires-python = ">=3.14"
+license = "MIT"
+authors = [{ name = "infektyd" }]
+keywords = ["memory", "agents", "mcp", "local-first", "daemon"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: No Input/Output (Daemon)",
+    "Intended Audience :: Developers",
+    "Operating System :: POSIX",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+# Runtime dependencies mirror engine/requirements.txt (the source spec).
+# Reproducible installs use engine/requirements.lock (make setup, CI).
+dependencies = [
+    "sentence-transformers>=5.6.0",
+    "numpy>=2.5.0,<3.0",
+    "faiss-cpu>=1.14.3",
+    "tiktoken>=0.13.0",
+    "rank-bm25>=0.2.2",
+    "watchdog>=6.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-cov>=7.1.0",
+    "ruff>=0.15.20",
+]
+
+[project.scripts]
+minni = "minni.minni_cli:main"
+minnid = "minni.minnid:main"
+
+[project.urls]
+Homepage = "https://github.com/infektyd/minni"
+Repository = "https://github.com/infektyd/minni"
+Issues = "https://github.com/infektyd/minni/issues"
+Security = "https://github.com/infektyd/minni/blob/main/SECURITY_PLAN.md"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+# Non-.py files the package needs at runtime: AFM pass prompts, principal
+# templates, SQL migrations, the AFM helper scripts, launchd example, and
+# bundled data. (tools/ is dev-only and deliberately excluded.)
+[tool.setuptools.package-data]
+minni = [
+    "afm_prompts/*.md",
+    "afm_passes/*.md",
+    "principal_templates/*",
+    "migrations/*",
+    "data/*",
+    "launchd/*.example",
+    "native_afm_helper",
+    "native_afm_helper.swift",
+    "openclaw-tool.sh",
+]

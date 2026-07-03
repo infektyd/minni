@@ -111,12 +111,12 @@ PY
 # ── Gate 2: fast lint/typecheck on touched surfaces ─────────────────────────
 staged="$(git diff --cached --name-only --diff-filter=ACMR)"
 
-if echo "$staged" | grep -Eq '^engine/.*\.py$'; then
+if echo "$staged" | grep -Eq '^(src/minni|tests)/.*\.py$'; then
   echo "[pre-commit] engine Python staged — running ruff…" >&2
-  if [ -x engine/.venv/bin/python ]; then
-    ( cd engine && .venv/bin/python -m ruff check . )
+  if [ -x .venv/bin/python ]; then
+    .venv/bin/python -m ruff check src/minni tests
   else
-    echo "[pre-commit] engine/.venv missing — run 'make setup'; skipping engine lint." >&2
+    echo "[pre-commit] .venv missing — run 'make setup'; skipping engine lint." >&2
   fi
 fi
 

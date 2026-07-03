@@ -41,11 +41,10 @@ jobs:
       - name: Release gate — fast check
         run: make check
 
-      - name: Build Python sdist
-        working-directory: engine
+      - name: Build Python sdist + wheel
         run: |
           .venv/bin/python -m pip install build
-          .venv/bin/python -m build --sdist --outdir ../release-artifacts
+          .venv/bin/python -m build --outdir release-artifacts
 
       - name: Build npm package tarball
         working-directory: plugins/minni
@@ -56,7 +55,7 @@ jobs:
       - name: Check tag matches package versions
         run: |
           TAG="${GITHUB_REF_NAME#v}"
-          PY_V="$(engine/.venv/bin/python -c "import tomllib;print(tomllib.load(open('engine/pyproject.toml','rb'))['project']['version'])")"
+          PY_V="$(.venv/bin/python -c "import tomllib;print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")"
           NPM_V="$(node -p "require('./plugins/minni/package.json').version")"
           test "$TAG" = "$PY_V" || { echo "tag $TAG != engine version $PY_V"; exit 1; }
           test "$TAG" = "$NPM_V" || { echo "tag $TAG != plugin version $NPM_V"; exit 1; }

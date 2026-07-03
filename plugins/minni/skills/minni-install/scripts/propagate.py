@@ -135,17 +135,33 @@ def canonical_platform(platform: str) -> str:
     return PLATFORM_ALIASES.get(normalized, normalized)
 
 
+# v0.2 rename: the engine package lives at src/minni/ (was the flat engine/
+# dir). Fall back to the legacy engine/ location so propagate keeps working
+# against an un-migrated checkout.
+_ENGINE_SUBDIRS = (Path("src") / "minni", Path("engine"))
+
+
+def _engine_under(root: Path) -> Path:
+    for sub in _ENGINE_SUBDIRS:
+        candidate = root / sub
+        if candidate.exists():
+            return candidate
+    return root / _ENGINE_SUBDIRS[0]
+
+
 def repo_engine(workspace: str | None) -> Path:
-    default = Path.home() / "Projects" / "minni" / "engine"
+    default = Path.home() / "Projects" / "minni"
     if default.exists():
-        return default
+        found = _engine_under(default)
+        if found.exists():
+            return found
     if workspace:
-        return Path(workspace).expanduser() / "engine"
-    return Path.cwd() / "engine"
+        return _engine_under(Path(workspace).expanduser())
+    return _engine_under(Path.cwd())
 
 
 def native_afm_env(repo_root: Path) -> dict[str, str]:
-    helper = repo_root.expanduser() / "engine" / "native_afm_helper"
+    helper = _engine_under(repo_root.expanduser()) / "native_afm_helper"
     if helper.exists():
         return {
             "MINNI_AFM_PROVIDER_MODE": "native",
