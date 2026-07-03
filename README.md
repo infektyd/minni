@@ -3,6 +3,7 @@
 **Local-first memory for AI agents — one governed daemon, human-readable vaults, shared across every runtime you use.**
 
 [![CI](https://github.com/infektyd/minni/actions/workflows/ci.yml/badge.svg)](https://github.com/infektyd/minni/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/minni)](https://pypi.org/project/minni/)
 ![license: MIT](https://img.shields.io/badge/license-MIT-blue)
 ![python: 3.14](https://img.shields.io/badge/python-3.14-3776ab)
 ![status: pre-v1](https://img.shields.io/badge/status-pre--v1-orange)
@@ -48,20 +49,27 @@ This is a memory-poisoning defense, enforced in the engine rather than asserted 
 
 **TL;DR:** Minni is the local-first **and** multi-agent **and** governed corner of the space. mem0 is the mature hosted layer optimizing single-agent recall benchmarks; MemOS is a heavier research memory-OS; basic-memory shares the Markdown-first DNA but is one personal knowledge graph without a governing daemon on top.
 
-Honest caveats: Minni is **pre-v1**, with tiny adoption, no published benchmarks, no hosted or multi-device option, and a heavier footprint (a Python 3.14 venv, Node for the plugin, a running daemon, FAISS/embedding models) than `pip install mem0`-style tools. "Multi-agent" means multiple agent runtimes sharing one local daemon on one host, not agents distributed across machines.
+Honest caveats: Minni is **pre-v1**, with tiny adoption, no published benchmarks, and no hosted or multi-device option. The daemon installs with one `pipx install minni` since v0.2, but the runtime footprint is still heavier than SDK-style tools (a running daemon, FAISS/embedding models, and — for wiring agents — a repo checkout with Node). "Multi-agent" means multiple agent runtimes sharing one local daemon on one host, not agents distributed across machines.
 
 ## Quickstart
 
-You need `git`, `make`, and Node >= 20. You do **not** need Python 3.14 preinstalled: if your system `python3` is older and [uv](https://docs.astral.sh/uv/) is installed, `make setup` provisions a managed Python 3.14 for you. First run downloads ~320 MB of embedding models (announced, one time).
+Since v0.2 the daemon and CLI install straight from PyPI (Python >= 3.14; [pipx](https://pipx.pypa.io/) or `uv tool install` both work). First recall downloads ~320 MB of embedding models (announced, one time).
+
+```bash
+pipx install minni
+minni up       # start the daemon in the background
+minni doctor   # verify the install end to end
+```
+
+`doctor` runs the same probes CI uses on every push — daemon status shape, a recall round-trip, socket permissions, model cache — and reports in plain language. `minni down` stops the daemon.
+
+**Working from source instead** (contributors, or anything that needs the repo — including wiring agents, below): you need `git`, `make`, and Node >= 20; `make setup` provisions a Python 3.14 venv via [uv](https://docs.astral.sh/uv/) if your system `python3` is older.
 
 ```bash
 git clone https://github.com/infektyd/minni.git && cd minni
 make setup          # venv + deps + plugin install (a few minutes on first run)
-.venv/bin/minni up       # start the daemon in the background
-.venv/bin/minni doctor   # verify the install end to end
+.venv/bin/minni up && .venv/bin/minni doctor
 ```
-
-`doctor` runs the same probes CI uses on every push — daemon status shape, a recall round-trip, socket permissions, model cache — and reports in plain language. `minni down` stops the daemon; `make daemon` runs it in the foreground instead.
 
 Then run a search against it:
 
@@ -87,7 +95,7 @@ Prefer a container? The eval image runs the daemon with zero local setup: `docke
 
 ### Wire it into your agent
 
-The daemon is the shared memory; the plugin is how an agent reaches it. From your checkout:
+The daemon is the shared memory; the plugin is how an agent reaches it. This part needs the repo checkout (the MCP plugin is a Node package and the installer lives in the repo — a pipx-only install runs the daemon, but agents wire up from source for now). From your checkout:
 
 ```bash
 .venv/bin/python plugins/minni/skills/minni-install/scripts/propagate.py update-plugin --platform claude-code
