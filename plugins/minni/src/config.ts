@@ -322,3 +322,31 @@ export const GROK_CONTEXT_WINDOW = (() => {
   const raw = Number(process.env.GROK_CONTEXT_WINDOW ?? process.env.MINNI_GROK_CONTEXT_WINDOW);
   return Number.isFinite(raw) && raw > 0 ? raw : 256_000;
 })();
+
+// --- Gemini / Antigravity agent defaults ---
+// One agent identity ("gemini") across the Antigravity family: the agy CLI,
+// Antigravity 2.0, and the Antigravity IDE all share the ~/.gemini tree and
+// the same vault. The hook entrypoint (gemini-hook.ts) currently only fires
+// on the agy CLI, whose plugin system dispatches PreToolUse/PostToolUse/Stop.
+
+export const GEMINI_AGENT_ID =
+  process.env.MINNI_GEMINI_AGENT_ID ?? "gemini";
+
+export const GEMINI_WORKSPACE_ID =
+  normalizeWorkspaceId(
+    process.env.MINNI_GEMINI_WORKSPACE_ID ??
+      `workspace-${path.basename(process.cwd())}`
+  );
+
+export const GEMINI_VAULT_PATH = expandTilde(
+  process.env.MINNI_GEMINI_VAULT_PATH ??
+    path.join(os.homedir(), ".minni", "gemini-vault"),
+);
+
+export const GEMINI_HOOKS_ENABLED =
+  (process.env.MINNI_GEMINI_HOOKS ?? "on").toLowerCase() !== "off";
+
+export const GEMINI_CONTEXT_WINDOW = (() => {
+  const raw = Number(process.env.GEMINI_CONTEXT_WINDOW ?? process.env.MINNI_GEMINI_CONTEXT_WINDOW);
+  return Number.isFinite(raw) && raw > 0 ? raw : 1_000_000;
+})();
