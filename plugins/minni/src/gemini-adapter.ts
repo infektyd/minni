@@ -19,6 +19,8 @@
 //     after 1.0.15, per the agy changelog). The accepted allow value is
 //     "approve" (verified live); "block" is the deny value from the same
 //     legacy Claude Code decision vocabulary agy borrows from.
+import { open, stat } from "node:fs/promises";
+
 import type { PreToolUseDecisionOutput } from "./recall-guard.js";
 import { asString } from "./hook-utils.js";
 
@@ -110,4 +112,71 @@ export function adaptPreToolUseOutput(
     };
   }
   return agyApprove();
+}
+
+/** Never read more than this much transcript tail; sessions can grow unbounded. */
+const TRANSCRIPT_TAIL_BYTES = 4 * 1024 * 1024;
+/** handleStop truncates its task to 200 chars; a small margin keeps this cheap. */
+const LAST_USER_MESSAGE_MAX = 400;
+
+/**
+ * Codex review (PR #134): agy's Stop payload carries no task text, so the
+ * shared handleStop would fall back to the conversation id and could draft
+ * "session ended"-grade candidates. agy DOES point at its transcript
+ * (transcript_full.jsonl: one JSON object per line; explicit user prompts are
+ * source USER_EXPLICIT / type USER_INPUT with the prompt wrapped in
+ * <USER_REQUEST> tags — format live-verified on agy 1.0.15). Pull the LAST
+ * explicit user message out of the transcript tail and surface it as
+ * last_user_message. Best-effort on purpose: any miss (no path, unreadable
+ * file, format drift) leaves the payload untouched, and handleStop's existing
+ * fallback chain applies.
+ */
+export async function enrichAgyStopPayload(
+  payload: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
+  if (asString(payload.last_user_message) || asString(payload.summary)) {
+    return payload;
+  }
+  const transcriptPath = asString(payload.transcriptPath);
+  if (!transcriptPath) return payload;
+
+  let tail: string;
+  try {
+    const info = await stat(transcriptPath);
+    if (!info.isFile() || info.size === 0) return payload;
+    const start = Math.max(0, info.size - TRANSCRIPT_TAIL_BYTES);
+    const handle = await open(transcriptPath, "r");
+    try {
+      const length = info.size - start;
+      const buffer = Buffer.alloc(length);
+      await handle.read(buffer, 0, length, start);
+      tail = buffer.toString("utf8");
+    } finally {
+      await handle.close();
+    }
+  } catch {
+    return payload;
+  }
+
+  const lines = tail.split("\n");
+  // A mid-file start offset can leave a partial first line; JSON.parse below
+  // rejects it naturally, so no special-casing is needed.
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i].trim();
+    if (!line) continue;
+    let entry: Record<string, unknown>;
+    try {
+      entry = JSON.parse(line) as Record<string, unknown>;
+    } catch {
+      continue;
+    }
+    if (entry.source !== "USER_EXPLICIT" || entry.type !== "USER_INPUT") continue;
+    const content = asString(entry.content);
+    if (!content) continue;
+    const request = /<USER_REQUEST>\s*([\s\S]*?)\s*<\/USER_REQUEST>/.exec(content);
+    const message = (request?.[1] ?? content).trim();
+    if (!message) continue;
+    return { ...payload, last_user_message: message.slice(0, LAST_USER_MESSAGE_MAX) };
+  }
+  return payload;
 }

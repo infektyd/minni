@@ -27,13 +27,25 @@ import {
   adaptAgyPayload,
   adaptPreToolUseOutput,
   agyApprove,
+  enrichAgyStopPayload,
 } from "./gemini-adapter.js";
 import { createHookHandlers } from "./hook-handlers.js";
 import type { AgentHookConfig } from "./hook-handlers.js";
 import { VALID_EVENTS, asString, emit, readStdin } from "./hook-utils.js";
 import { PRE_TOOL_USE_EVENT } from "./recall-guard.js";
-import type { PreToolUseDecisionOutput } from "./recall-guard.js";
+import type { PreToolUseDecisionOutput, RecallGuardMode } from "./recall-guard.js";
 import { recordAudit } from "./vault.js";
+
+// Codex review (PR #134): the shared guard's default "soft" mode deliberately
+// ignores Bash — but on agy EVERY shell/search call is run_command, which the
+// adapter maps to Bash, so soft mode would guard nothing on this surface.
+// Default to "strict" (read/search commands only; mutations always pass) while
+// still honoring an explicit MINNI_RECALL_GUARD_MODE override.
+const GEMINI_GUARD_MODE: RecallGuardMode = (() => {
+  const raw = (process.env.MINNI_RECALL_GUARD_MODE ?? "").trim().toLowerCase();
+  if (raw === "off" || raw === "soft" || raw === "strict") return raw;
+  return "strict";
+})();
 
 const CONFIG: AgentHookConfig = {
   agentId: GEMINI_AGENT_ID,
@@ -49,6 +61,7 @@ const CONFIG: AgentHookConfig = {
   // durable handoff file.
   // Like grok/kilocode, an empty Stop outcome skips the inbox write entirely.
   alwaysWriteStopInbox: false,
+  recallGuardMode: GEMINI_GUARD_MODE,
 };
 
 async function main(): Promise<void> {
@@ -70,7 +83,12 @@ async function main(): Promise<void> {
     return;
   }
 
-  const payload = adaptAgyPayload(raw);
+  let payload = adaptAgyPayload(raw);
+  if (event === "Stop") {
+    // Best-effort: pull the real last user message from agy's transcript so
+    // Stop drafts candidates about the actual task, not the conversation id.
+    payload = await enrichAgyStopPayload(payload).catch(() => payload);
+  }
   try {
     const handlers = createHookHandlers(CONFIG);
     const output = await handlers.dispatch(event, payload);

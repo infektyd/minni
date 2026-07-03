@@ -34,12 +34,20 @@ adapter (`src/gemini-adapter.ts`).
 What actually fires on agy 1.0.15 (verified live):
 
 - **`Stop`** — drafts candidate learnings into `~/.minni/gemini-vault/inbox/`
-  (the same governed propose→approve loop as every other platform).
+  (the same governed propose→approve loop as every other platform). The agy
+  payload carries no task text, so the hook reads the last explicit user
+  message out of agy's own transcript (`transcript_full.jsonl`) so drafts are
+  about the actual task; when the transcript is unreadable it degrades to the
+  shared fallback chain.
 - **`PreToolUse`** — carries the s6 recall guard through agy's deny-capable
-  decision protocol. Inert for now: agy has no `UserPromptSubmit` event, so no
-  recall-state exists for the guard to act on. Every invocation answers with
-  an explicit `{"decision": "approve"}` — agy 1.0.15's permission manager
-  errors on empty decisions.
+  decision protocol. On this surface the guard defaults to **strict** mode
+  (override with `MINNI_RECALL_GUARD_MODE`): agy funnels every shell/search
+  through `run_command`, which maps to Bash — and the shared default "soft"
+  mode deliberately ignores Bash, so it would guard nothing here. Inert for
+  now regardless: agy has no `UserPromptSubmit` event, so no recall-state
+  exists for the guard to act on. Every invocation answers with an explicit
+  `{"decision": "approve"}` — agy 1.0.15's permission manager errors on empty
+  decisions.
 - `SessionStart` / `UserPromptSubmit` / `PreCompact` are **pre-declared** in
   the manifest but agy 1.0.15 does not dispatch them — no boot injection and
   no per-prompt recall pointer on this surface yet. They activate without a

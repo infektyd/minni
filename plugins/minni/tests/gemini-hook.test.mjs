@@ -22,6 +22,7 @@ import {
   adaptAgyPayload,
   adaptPreToolUseOutput,
   agyApprove,
+  enrichAgyStopPayload,
 } from "../dist/gemini-adapter.js";
 
 const execFileAsync = promisify(execFile);
@@ -205,6 +206,95 @@ test("PreToolUse denies-to-surface through agy's decision vocabulary and flips c
       { MINNI_RECALL_GUARD_MODE: "strict" },
     );
     assert.deepEqual(rerun, { decision: "approve" });
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("enrichAgyStopPayload pulls the LAST explicit user message from the transcript", async () => {
+  const fixture = await makeFixture();
+  try {
+    const transcript = path.join(fixture.root, "transcript_full.jsonl");
+    await writeFile(
+      transcript,
+      [
+        JSON.stringify({
+          source: "USER_EXPLICIT",
+          type: "USER_INPUT",
+          content: "<USER_REQUEST>\nfirst prompt\n</USER_REQUEST>\n<ADDITIONAL_METADATA>time</ADDITIONAL_METADATA>",
+        }),
+        JSON.stringify({ source: "SYSTEM", type: "EPHEMERAL_MESSAGE", content: "reminder noise" }),
+        "{ not valid json",
+        JSON.stringify({
+          source: "USER_EXPLICIT",
+          type: "USER_INPUT",
+          content: "<USER_REQUEST>\nfix the gemini hooks per issue 133\n</USER_REQUEST>",
+        }),
+        JSON.stringify({ source: "MODEL", type: "PLANNER_RESPONSE", content: "ok" }),
+      ].join("\n"),
+    );
+    const enriched = await enrichAgyStopPayload({ transcriptPath: transcript });
+    assert.equal(enriched.last_user_message, "fix the gemini hooks per issue 133");
+
+    // Missing file and pre-existing task text both leave the payload untouched.
+    const missing = await enrichAgyStopPayload({ transcriptPath: path.join(fixture.root, "nope.jsonl") });
+    assert.equal(missing.last_user_message, undefined);
+    const preset = await enrichAgyStopPayload({ transcriptPath: transcript, summary: "already set" });
+    assert.equal(preset.last_user_message, undefined);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("guard defaults to strict on agy: read/search run_command is denied without an env override", async () => {
+  const fixture = await makeFixture();
+  try {
+    const runtimeDir = path.join(fixture.vault, ".runtime");
+    await mkdir(runtimeDir, { recursive: true });
+    await writeFile(
+      path.join(runtimeDir, "recall-state.json"),
+      JSON.stringify({
+        task_signature: "t-default-mode",
+        intent: "status",
+        top_hits: [{ title: "Prior fix", wikilink: "[[prior-fix]]", score: 0.91 }],
+        top_score: 0.91,
+        consumed: false,
+        ts: new Date().toISOString(),
+      }),
+    );
+    // Empty string behaves as unset for the gemini default (and shields the
+    // test from any MINNI_RECALL_GUARD_MODE in the runner's environment).
+    const output = await runGeminiHook(
+      "PreToolUse",
+      fixture,
+      agyPreToolUsePayload({
+        toolCall: { name: "run_command", args: { CommandLine: "grep foo bar.txt" } },
+      }),
+      { MINNI_RECALL_GUARD_MODE: "" },
+    );
+    assert.equal(output.decision, "block");
+
+    // An explicit soft override is honored: Bash stays unguarded there.
+    await writeFile(
+      path.join(runtimeDir, "recall-state.json"),
+      JSON.stringify({
+        task_signature: "t-soft-mode",
+        intent: "status",
+        top_hits: [{ title: "Prior fix", wikilink: "[[prior-fix]]", score: 0.91 }],
+        top_score: 0.91,
+        consumed: false,
+        ts: new Date().toISOString(),
+      }),
+    );
+    const soft = await runGeminiHook(
+      "PreToolUse",
+      fixture,
+      agyPreToolUsePayload({
+        toolCall: { name: "run_command", args: { CommandLine: "grep foo bar.txt" } },
+      }),
+      { MINNI_RECALL_GUARD_MODE: "soft" },
+    );
+    assert.deepEqual(soft, { decision: "approve" });
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }
