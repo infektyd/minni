@@ -93,7 +93,7 @@ The daemon is the shared memory; the plugin is how an agent reaches it. From you
 .venv/bin/python plugins/minni/skills/minni-install/scripts/propagate.py update-plugin --platform claude-code
 ```
 
-Swap `--platform` for `codex`, `gemini`, `antigravity`, `grok`, `kilocode`, `generic`, or `all` (note: `all` covers codex, claude-code, kilocode, gemini, and grok — antigravity is wired individually). This registers the MCP server, the per-agent vault path, and that host's hook entrypoint; the agent-driven `minni-install` skill handles first-time identity and vault seeding. Per-runtime pages: [Claude Code](docs/runtimes/claude-code.md) · [Codex](docs/runtimes/codex.md) · [Gemini / Antigravity](docs/runtimes/gemini.md) · [Grok](docs/runtimes/grok.md). An OpenClaw bridge lives in [`openclaw-extension/`](openclaw-extension/).
+Swap `--platform` for `codex`, `gemini`, `antigravity`, `grok`, `kilocode`, `generic`, or `all` (note: `all` covers codex, claude-code, kilocode, gemini, and grok — antigravity is wired individually). This registers the MCP server, the per-agent vault path, and that host's hook entrypoint; the agent-driven `minni-install` skill handles first-time identity and vault seeding. Per-runtime pages: [Claude Code](docs/runtimes/claude-code.md) · [Codex](docs/runtimes/codex.md) · [Gemini / Antigravity](docs/runtimes/gemini.md) · [Grok](docs/runtimes/grok.md).
 
 ## Architecture at a glance
 
