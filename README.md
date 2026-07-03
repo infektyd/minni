@@ -57,8 +57,8 @@ You need `git`, `make`, and Node >= 20. You do **not** need Python 3.14 preinsta
 ```bash
 git clone https://github.com/infektyd/minni.git && cd minni
 make setup          # venv + deps + plugin install (a few minutes on first run)
-engine/.venv/bin/minni up       # start the daemon in the background
-engine/.venv/bin/minni doctor   # verify the install end to end
+.venv/bin/minni up       # start the daemon in the background
+.venv/bin/minni doctor   # verify the install end to end
 ```
 
 `doctor` runs the same probes CI uses on every push — daemon status shape, a recall round-trip, socket permissions, model cache — and reports in plain language. `minni down` stops the daemon; `make daemon` runs it in the foreground instead.
@@ -66,7 +66,7 @@ engine/.venv/bin/minni doctor   # verify the install end to end
 Then run a search against it:
 
 ```bash
-engine/.venv/bin/python engine/minnid_client.py --socket ~/.minni/run/minnid.sock search "memory handoff"
+.venv/bin/python -m minni.minnid_client --socket ~/.minni/run/minnid.sock search "memory handoff"
 ```
 
 Output is ranked, cited snippets from your own vaults — the same evidence an agent sees when it recalls. Illustrative shape (your content will differ):
@@ -90,7 +90,7 @@ Prefer a container? The eval image runs the daemon with zero local setup: `docke
 The daemon is the shared memory; the plugin is how an agent reaches it. From your checkout:
 
 ```bash
-engine/.venv/bin/python plugins/minni/skills/minni-install/scripts/propagate.py update-plugin --platform claude-code
+.venv/bin/python plugins/minni/skills/minni-install/scripts/propagate.py update-plugin --platform claude-code
 ```
 
 Swap `--platform` for `codex`, `gemini`, `antigravity`, `grok`, `kilocode`, `generic`, or `all` (note: `all` covers codex, claude-code, kilocode, gemini, and grok — antigravity is wired individually). This registers the MCP server, the per-agent vault path, and that host's hook entrypoint; the agent-driven `minni-install` skill handles first-time identity and vault seeding. Per-runtime pages: [Claude Code](docs/runtimes/claude-code.md) · [Codex](docs/runtimes/codex.md) · [Gemini / Antigravity](docs/runtimes/gemini.md) · [Grok](docs/runtimes/grok.md). An OpenClaw bridge lives in [`openclaw-extension/`](openclaw-extension/).

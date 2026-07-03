@@ -436,7 +436,7 @@ MINNI_PROJECT=~/Projects/Minni
 ls -d ~/Projects/Minni && echo "Directory exists" || echo "Directory missing"
 
 # Check if config.py exists
-test -f ~/Projects/Minni/engine/config.py && echo "Module found" || echo "Module missing"
+test -f ~/Projects/Minni/src/minni/config.py && echo "Module found" || echo "Module missing"
 
 # Check environment override
 echo "$MINNI_PROJECT"
@@ -453,7 +453,7 @@ make setup
 **Option 2 — Set custom path (if project is elsewhere):**
 ```bash
 export MINNI_PROJECT=/path/to/Minni
-PYTHONPATH="$MINNI_PROJECT/engine" "$MINNI_PROJECT/engine/.venv/bin/python" ~/.hermes/scripts/sovereign-consolidate.py --limit 5
+"$MINNI_PROJECT/.venv/bin/python" ~/.hermes/scripts/sovereign-consolidate.py --limit 5
 ```
 
 **Option 3 — Assess health without write-back (temporary diagnostics):**

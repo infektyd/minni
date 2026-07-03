@@ -2,7 +2,7 @@
 
 Minni can run in three layers:
 
-1. **Python engine**: the code under `engine/`, responsible for SQLite, FAISS,
+1. **Python engine**: the code under `src/minni/`, responsible for SQLite, FAISS,
    retrieval, learnings, episodic events, daemon JSON-RPC, and graph export.
 2. **Multi-host plugin**: the TypeScript bridge under `plugins/minni/`,
    responsible for connecting Codex, Claude, Gemini, Kilo, Grok, and related
@@ -53,7 +53,7 @@ provider behavior with:
 The daemon entrypoint is:
 
 ```bash
-engine/.venv/bin/python engine/minnid.py --socket ~/.minni/run/minnid.sock
+.venv/bin/python -m minni.minnid --socket ~/.minni/run/minnid.sock
 ```
 
 This keeps extraction code usable while leaving model binaries, adapters,
@@ -62,7 +62,7 @@ training data, and launchd configuration outside the repository.
 Runtime AFM calls now use an explicit provider boundary rather than assuming
 only the localhost bridge. Supported modes are `off`, `bridge`, `native`, and
 `auto`. The native path talks JSON over stdin/stdout to an executable helper,
-with `engine/native_afm_helper` providing a compile-safe Apple Foundation Models
+with `src/minni/native_afm_helper` providing a compile-safe Apple Foundation Models
 implementation where the framework is available. The bridge path remains for
 compatibility.
 

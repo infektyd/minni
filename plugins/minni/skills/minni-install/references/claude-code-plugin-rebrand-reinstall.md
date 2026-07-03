@@ -127,7 +127,7 @@ until then so you have a rollback copy.
 | --- | --- |
 | Daemon launchd label | `com.minni.minnid` |
 | LaunchAgent plist | `~/Library/LaunchAgents/com.minni.minnid.plist` |
-| Daemon process | `engine/minnid.py` |
+| Daemon process | `python -m minni.minnid` |
 | Socket | `~/.minni/run/minnid.sock` |
 | DB | `~/.minni/minni.db` |
 | Vault root | `~/.minni/codex-vault` (per-agent: `~/.minni/<agent>-vault`) |

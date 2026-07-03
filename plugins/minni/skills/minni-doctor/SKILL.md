@@ -78,7 +78,7 @@ Every platform registers its OWN compiled hook (`hook.js`, `codex-hook.js`,
 ## Layer 5 — Identity (Layer 1 delivery)
 
 - `documents.agent = identity:<agent_id>` with `whole_document = 1` must exist.
-- `python engine/agent_api.py <agent_id> --identity` shows it; daemon `read`
+- `.venv/bin/python -m minni.agent_api <agent_id> --identity` shows it; daemon `read`
   must deliver it BEFORE other context. Identity present in the DB but absent
   from `read` is a daemon delivery gap — do not paper over it with vault pages.
 - Hosted agents get an envelope/map (subordinate to the host runtime), never a
@@ -123,13 +123,13 @@ Healthy inboxes drain. PR #69 semantics:
 On a source checkout, these are the ground truth (counts as of 2026-06-11):
 
 ```bash
-cd engine && PYTHONPATH=. pytest -q          # expect 538 passed, 5 skipped
+.venv/bin/python -m pytest -q tests/          # expect 538 passed, 5 skipped
 cd plugins/minni && npm run build && npm test # expect 327 passed
 bash scripts/repro-smoke.sh                   # hermetic daemon smoke
 ```
 
 The VectorBackend conformance suite
-(`engine/test_vector_backend_conformance.py`) certifies any vector backend —
+(`tests/test_pr3_storage_abstraction.py`) certifies any vector backend —
 FAISS today; any future Lance/Qdrant adapter must pass the same file.
 
 ## Reporting discipline

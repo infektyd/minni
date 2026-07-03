@@ -16,7 +16,7 @@ Minni is pre-v1. The workflow below is what the repo actually enforces today
 make setup
 ```
 
-This builds `engine/.venv` and installs engine dependencies, runs `npm ci` in
+This builds `.venv` and installs engine dependencies, runs `npm ci` in
 `plugins/minni/`, and sets `git config core.hooksPath .githooks` so the local
 hooks are active for this clone. See `.githooks/README.md` for what the hooks
 do and the `MINNI_SKIP_HOOKS` escape hatch.
@@ -61,9 +61,9 @@ Changes that touch memory storage, retrieval, scoring, or governance need a
 maintainer discussion **before** you write code. Open an issue describing the
 problem and proposed approach first. That surface spans both languages:
 
-- **Engine (`engine/`)** — anything that affects how memories are written,
-  ranked, retrieved, or authorized: `engine/db.py`, `engine/retrieval.py`,
-  `engine/principal.py`, the AFM passes, the candidate/learning lifecycle.
+- **Engine (`src/minni/`)** — anything that affects how memories are written,
+  ranked, retrieved, or authorized: `src/minni/db.py`, `src/minni/retrieval.py`,
+  `src/minni/principal.py`, the AFM passes, the candidate/learning lifecycle.
 - **Plugin security paths (`plugins/minni/src/`)** — the recall/privacy and
   model-facing-context gates enforced plugin-side: privacy gating and evidence
   fencing of vault content (e.g. the SEC-006/SEC-010 gates in `task.ts`),

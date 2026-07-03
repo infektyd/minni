@@ -2,16 +2,16 @@
 
 ## Implemented Surfaces
 
-- `engine/afm_provider.py` owns shared AFM mode resolution, native helper
+- `src/minni/afm_provider.py` owns shared AFM mode resolution, native helper
   invocation, bridge fallback, status reporting, and path/error sanitization.
-- `engine/query_expand.py` uses native provider operations for query expansion
+- `src/minni/query_expand.py` uses native provider operations for query expansion
   and neighborhood summaries, with bridge compatibility and off-mode downgrade.
-- `engine/hyde.py` uses native provider operations for HyDE probes, with bridge
+- `src/minni/hyde.py` uses native provider operations for HyDE probes, with bridge
   compatibility and native-unavailable downgrade.
-- `engine/afm_passes/session_distillation.py` can request structured native
+- `src/minni/afm_passes/session_distillation.py` can request structured native
   compile proposals and normalizes them into review-only drafts with exact
   source citations.
-- `engine/native_afm_helper.swift` implements the Foundation Models helper when
+- `src/minni/native_afm_helper.swift` implements the Foundation Models helper when
   available and returns structured JSON. The wrapper script compiles and caches
   the helper locally.
 - `plugins/minni/src/afm.ts` and task preparation paths expose the

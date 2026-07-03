@@ -7,9 +7,10 @@
   placeholders below, then load it with launchctl.
 
   Substitutions:
-    /path/to/engine/.venv/bin/python
-                              absolute path to the engine venv interpreter
-    /path/to/engine/minnid.py   absolute path to engine/minnid.py in this repo
+    /path/to/repo/.venv/bin/python
+                              absolute path to the repo venv interpreter
+    /path/to/repo             absolute path to the Minni repo root
+                              (WorkingDirectory)
     /path/to/sock              absolute path to the Unix socket
                                (default: ~/.minni/run/minnid.sock
                                with mode 0600)
@@ -44,11 +45,15 @@
 
     <key>ProgramArguments</key>
     <array>
-        <string>/path/to/engine/.venv/bin/python</string>
-        <string>/path/to/engine/minnid.py</string>
+        <string>/path/to/repo/.venv/bin/python</string>
+        <string>-m</string>
+        <string>minni.minnid</string>
         <string>--socket</string>
         <string>/path/to/sock</string>
     </array>
+
+    <key>WorkingDirectory</key>
+    <string>/path/to/repo</string>
 
     <key>EnvironmentVariables</key>
     <dict>

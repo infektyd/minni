@@ -25,12 +25,12 @@ audit writes do not cross this boundary; see
 
 | Component | Responsibility |
 |---|---|
-| `engine/minnid.py` | JSON-RPC daemon, dispatch, policy, storage, status |
-| `engine/principal.py` | Identity resolution, vault roots, capabilities, read authorization |
-| `engine/retrieval.py` | FTS/FAISS/RRF/rerank retrieval path, personal/shared leg merge |
-| `engine/db.py` | Shared SQLite schema and migrations |
-| `engine/afm_passes/` | Background curation passes (see [concepts](concepts.md#the-afm-pass-pipeline)) |
-| `engine/minni_cli.py` | Newcomer lifecycle CLI: `up` / `down` / `status` / `doctor` |
+| `src/minni/minnid.py` | JSON-RPC daemon, dispatch, policy, storage, status |
+| `src/minni/principal.py` | Identity resolution, vault roots, capabilities, read authorization |
+| `src/minni/retrieval.py` | FTS/FAISS/RRF/rerank retrieval path, personal/shared leg merge |
+| `src/minni/db.py` | Shared SQLite schema and migrations |
+| `src/minni/afm_passes/` | Background curation passes (see [concepts](concepts.md#the-afm-pass-pipeline)) |
+| `src/minni/minni_cli.py` | Newcomer lifecycle CLI: `up` / `down` / `status` / `doctor` |
 | `plugins/minni/src/server.ts` | MCP tool registration and request shaping |
 | `plugins/minni/src/hook-handlers.ts` | Shared hook semantics for runtimes that support hooks |
 | `plugins/minni/src/plan.ts` | Durable plan artifacts and state transitions |

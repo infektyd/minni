@@ -67,7 +67,7 @@ prompt.
 
 Set `MINNI_AFM_NATIVE_HELPER` to an executable JSON helper to let native
 prepare-task/outcome distillation call a local Foundation Models backend. The
-repo ships a compile-safe helper at `engine/native_afm_helper`; callers can
+repo ships a compile-safe helper at `src/minni/native_afm_helper`; callers can
 point the plugin at it or at a platform-specific helper with the same JSON
 contract. Adapter configuration is indicated with `MINNI_AFM_ADAPTER_PATH` or
 `MINNI_AFM_ADAPTER_ID`; status reports only `adapterConfigured`, never the

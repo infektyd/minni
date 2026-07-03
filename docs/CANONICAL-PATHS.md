@@ -6,7 +6,7 @@ This folder is the canonical home for Minni on this machine:
 
 It is also the canonical Git working tree for
 `https://github.com/infektyd/minni`. The live layout is intentional:
-runtime integrations use `engine/`, `openclaw-extension/`, and
+runtime integrations use `src/minni/`, `openclaw-extension/`, and
 `plugins/minni/` directly.
 
 Use this page to avoid guessing between older root-level, OpenClaw, Hermes, and
@@ -17,7 +17,7 @@ names. Treat those as legacy references, not active roots.
 
 ## Active Core
 
-- `engine/` - Minni Python engine.
+- `src/minni/` - Minni Python package.
 - `openclaw-extension/` - OpenClaw extension bridge.
 - `plugins/minni/` - `minni-multi-plugin` multi-host plugin package (Codex, Claude Code, Gemini, KiloCode surfaces sharing one MCP server and daemon).
 - `session-extracts/` - extracted handoff/session notes.
@@ -66,7 +66,7 @@ symlinks where the owning app expects stable paths.
 ## Sync-Root Avoidance
 
 Minni's "local-first" guarantee assumes the vault and database are
-not under any third-party sync root. The daemon (`engine/minnid.py`,
+not under any third-party sync root. The daemon (`src/minni/minnid.py`,
 `_warn_if_sync_root`) emits a startup warning — non-fatal, best-effort —
 when any daemon-managed path resolves under one of these prefixes:
 
