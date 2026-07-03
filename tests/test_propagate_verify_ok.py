@@ -365,3 +365,14 @@ Preserve this voice.
     assert rc == 0
     assert "Preserve this voice." in rendered
     assert "old generated quirk" not in rendered
+
+
+def test_engine_is_package_distinguishes_layouts(tmp_path):
+    pkg = tmp_path / "src" / "minni"
+    pkg.mkdir(parents=True)
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    legacy = tmp_path / "engine"
+    legacy.mkdir()
+
+    assert propagate.engine_is_package(pkg) is True
+    assert propagate.engine_is_package(legacy) is False

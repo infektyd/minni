@@ -141,6 +141,13 @@ def canonical_platform(platform: str) -> str:
 _ENGINE_SUBDIRS = (Path("src") / "minni", Path("engine"))
 
 
+def engine_is_package(engine: Path) -> bool:
+    """True when repo_engine() resolved the v0.2 package layout (src/minni):
+    its modules import as `minni.*`, so subprocess/sys.path consumers must use
+    the package PARENT (src/) as the import root, not the directory itself."""
+    return engine.name == "minni" and (engine / "__init__.py").exists()
+
+
 def _engine_under(root: Path) -> Path:
     for sub in _ENGINE_SUBDIRS:
         candidate = root / sub
@@ -1145,8 +1152,15 @@ def seed_hosted(args: argparse.Namespace) -> int:
     source_path.write_text(content, encoding="utf-8")
 
     engine = repo_engine(workspace)
-    sys.path.insert(0, str(engine))
-    from seed_identity import get_embedding  # type: ignore
+    # Codex review (PR #135): the v0.2 package layout imports as minni.*, so
+    # the import root is the package PARENT; legacy flat checkouts keep the
+    # old direct-module import.
+    if engine_is_package(engine):
+        sys.path.insert(0, str(engine.parent))
+        from minni.seed_identity import get_embedding  # type: ignore
+    else:
+        sys.path.insert(0, str(engine))
+        from seed_identity import get_embedding  # type: ignore
 
     now = time.time()
     embedding = get_embedding(content)
@@ -1255,8 +1269,16 @@ def verify(args: argparse.Namespace) -> int:
     socket_path = Path(args.socket).expanduser()
     checks: dict[str, object] = {}
 
-    cmd = [sys.executable, str(engine / "agent_api.py"), agent, "--identity"]
-    proc = subprocess.run(cmd, cwd=str(engine), text=True, capture_output=True, check=False)
+    # Codex review (PR #135): under the v0.2 package layout agent_api imports
+    # minni.*, which is only resolvable from the package PARENT — run it as a
+    # module from there. Legacy flat checkouts keep the script-path invocation.
+    if engine_is_package(engine):
+        cmd = [sys.executable, "-m", "minni.agent_api", agent, "--identity"]
+        run_cwd = engine.parent
+    else:
+        cmd = [sys.executable, str(engine / "agent_api.py"), agent, "--identity"]
+        run_cwd = engine
+    proc = subprocess.run(cmd, cwd=str(run_cwd), text=True, capture_output=True, check=False)
     checks["agent_api_returncode"] = proc.returncode
     checks["agent_api_has_identity"] = f"## Agent Identity: {agent.title()}" in proc.stdout
     checks["agent_api_has_map_rule"] = "hosted agents a map" in proc.stdout
