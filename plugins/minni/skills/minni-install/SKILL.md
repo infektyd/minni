@@ -120,7 +120,7 @@ system/developer instructions, safety policy, and active user request.
      default-denies any **named** agent that has no matching operator-owned
      `~/.minni/principals/<agent-id>.json` — gated tools and handoffs return a
      `recovery_required` route until it exists. Author the shipped agents'
-     files with `engine/.venv/bin/python engine/tools/author_principals.py
+     files with `.venv/bin/python -m minni.tools.author_principals
      --apply` (dry-run without `--apply`), or hand-author the JSON with the
      needed capabilities and `chmod 600` it, then SIGHUP/restart the daemon so
      identity caches reload. Claiming the reserved ids `main`/`operator` on
@@ -157,7 +157,7 @@ system/developer instructions, safety policy, and active user request.
      idempotently.
 
 5. **Verify delivery**
-   - `python engine/agent_api.py <agent_id> --identity` must show Layer 1.
+   - `.venv/bin/python -m minni.agent_api <agent_id> --identity` must show Layer 1.
    - Daemon `read` should include Layer 1 before prior context. If it does not,
      report a daemon delivery gap; do not pretend Layer 1 is fully live.
    - Vault search/prepare should find the recallable pages.
@@ -188,13 +188,13 @@ Known platform update commands (run from your Minni checkout; the script ships
 with this skill at `plugins/minni/skills/minni-install/scripts/propagate.py`):
 
 ```bash
-engine/.venv/bin/python plugins/minni/skills/minni-install/scripts/propagate.py update-plugin --platform codex
-engine/.venv/bin/python plugins/minni/skills/minni-install/scripts/propagate.py update-plugin --platform claude-code
-engine/.venv/bin/python plugins/minni/skills/minni-install/scripts/propagate.py update-plugin --platform kilocode
-engine/.venv/bin/python plugins/minni/skills/minni-install/scripts/propagate.py update-plugin --platform gemini
-engine/.venv/bin/python plugins/minni/skills/minni-install/scripts/propagate.py update-plugin --platform antigravity
-engine/.venv/bin/python plugins/minni/skills/minni-install/scripts/propagate.py update-plugin --platform grok
-engine/.venv/bin/python plugins/minni/skills/minni-install/scripts/propagate.py update-plugin --platform all
+.venv/bin/python plugins/minni/skills/minni-install/scripts/propagate.py update-plugin --platform codex
+.venv/bin/python plugins/minni/skills/minni-install/scripts/propagate.py update-plugin --platform claude-code
+.venv/bin/python plugins/minni/skills/minni-install/scripts/propagate.py update-plugin --platform kilocode
+.venv/bin/python plugins/minni/skills/minni-install/scripts/propagate.py update-plugin --platform gemini
+.venv/bin/python plugins/minni/skills/minni-install/scripts/propagate.py update-plugin --platform antigravity
+.venv/bin/python plugins/minni/skills/minni-install/scripts/propagate.py update-plugin --platform grok
+.venv/bin/python plugins/minni/skills/minni-install/scripts/propagate.py update-plugin --platform all
 ```
 
 ### Rebranding / reinstalling a Claude Code plugin identity

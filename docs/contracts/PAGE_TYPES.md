@@ -62,7 +62,7 @@ across requests, and maintains per-agent recall context.
 - **Socket:** `~/.minni/run/minnid.sock` (configurable via `--socket`)
 - **Protocol:** JSON-RPC 2.0, line-delimited (newline-separated messages)
 - **Engine:** FAISS + FTS5 dual retrieval, cross-encoder re-ranking, RRF fusion
-- **Source:** `engine/sovrd.py`
+- **Source:** `src/minni/minnid.py`
 
 ## Related
 
@@ -202,31 +202,27 @@ to the shared recall pool.
 
 ## Prerequisites
 
-- Daemon is running: `python engine/sovrd.py`
+- Daemon is running: `.venv/bin/python -m minni.minnid` (or `.venv/bin/minni up`)
 - Vault directory exists and contains markdown files
 
 ## Steps
 
 1. **Ensure vault structure** is correct:
    ```bash
-   python -c "
-   import sys; sys.path.insert(0, 'engine')
-   from db import SovereignDB
-   "
+   .venv/bin/python -c "from minni.db import SovereignDB"
    ```
 
 2. **Run the indexer** against the vault:
    ```bash
-   engine/.venv/bin/python engine/index_all.py --vault-path ~/.minni/claudecode-vault \
+   .venv/bin/python -m minni.index_all --vault-path ~/.minni/claudecode-vault \
        --agent claude-code
    ```
 
 3. **Rebuild the FAISS index** to include new vectors:
    ```bash
-   python -c "
-   import sys; sys.path.insert(0, 'engine')
-   from faiss_index import FAISSIndex
-   from config import DEFAULT_CONFIG
+   .venv/bin/python -c "
+   from minni.faiss_index import FAISSIndex
+   from minni.config import DEFAULT_CONFIG
    idx = FAISSIndex(DEFAULT_CONFIG)
    idx.rebuild_from_db()
    "
@@ -234,7 +230,7 @@ to the shared recall pool.
 
 4. **Verify** results appear in search:
    ```bash
-   python engine/sovrd_client.py search "test query from new vault"
+   .venv/bin/python -m minni.minnid_client search "test query from new vault"
    ```
 
 ## Rollback
@@ -312,7 +308,7 @@ expires: null
 superseded_by: null
 sources:
   - "[[wiki/entities/sovereign-memory-daemon]]"
-  - "engine/sovrd.py"
+  - "src/minni/minnid.py"
 tags: [artifact, schema, json-rpc, api-reference]
 trace_id: t6f7a8b9
 ---
@@ -410,7 +406,7 @@ human sessions.
 
 ## Pending work
 
-- [ ] Implement JWT signing in `engine/auth.py` (not yet created)
+- [ ] Implement JWT signing in `src/minni/auth.py` (not yet created)
 - [ ] Add `agent_id` + JWT validation to `sovrd.py` request handler
 - [ ] Write the signing key rotation procedure
 
@@ -427,7 +423,7 @@ human sessions.
 
 ## Files touched in my session
 
-- `engine/sovrd.py` — reviewed; no changes yet
+- `src/minni/minnid.py` — reviewed; no changes yet
 - `docs/plans/SOVEREIGN-MEMORY-CORE-UPGRADES-SCALE-AGNOSTIC.md` — referenced
 ```
 

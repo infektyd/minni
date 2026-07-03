@@ -237,3 +237,24 @@ npm publishing deliberately absent (§6.1/§6.6).
   regenerate at leisure.
 - The engine venv on the primary dev machine predates the 3.14 floor (3.13.14);
   the next `make setup` will rebuild it (multi-GB model/dep download).
+
+---
+
+## 9. v0.2 outcome record (2026-07-03)
+
+The §6.1-approved rename shipped as the src-layout restructure (PR #135,
+plan `plan-f6de4d8c58189d44`): `engine/` → `src/minni/` (git mv, history
+preserved), tests to `tests/`, packaging configs to repo root, 1091 internal
+imports package-qualified by a stdlib-ast codemod, console scripts
+`minni` + `minnid`, venv at root `.venv` with `pip install -e .` replacing
+every PYTHONPATH splice. Wheel gate passed: a clean venv + isolated $HOME
+installs `minni-0.2.0-py3-none-any.whl`, boots the daemon via
+`-m minni.minnid`, and passes `minni doctor` end to end.
+
+Release channel: `release.yml` gained PyPI **trusted publishing** (OIDC,
+zero stored tokens) — tag pushes publish to PyPI (environment `pypi`),
+`workflow_dispatch` dry-runs to TestPyPI (environment `testpypi`). The
+PyPI names were reserved 2026-07-03 with 0.0.1 placeholders (§6.6 note:
+npm stays unpublished). Docs swept to the new layout; a migration guide
+for v0.1 checkouts (venv rebuild, propagate re-stamp, launchd plist paths)
+lives in docs/install.md.

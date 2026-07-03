@@ -59,8 +59,13 @@ function nativeHelperAvailable(path: string | undefined): boolean {
 
 export function defaultNativeHelperPath(): string | undefined {
   const here = path.dirname(fileURLToPath(import.meta.url));
-  const repoHelper = path.resolve(here, "..", "..", "..", "engine", "native_afm_helper");
-  return existsSync(repoHelper) ? repoHelper : undefined;
+  // v0.2 rename: the engine package lives at src/minni/; keep the legacy
+  // engine/ location as a fallback for un-migrated checkouts.
+  for (const segments of [["src", "minni"], ["engine"]]) {
+    const repoHelper = path.resolve(here, "..", "..", "..", ...segments, "native_afm_helper");
+    if (existsSync(repoHelper)) return repoHelper;
+  }
+  return undefined;
 }
 
 export function resolvedNativeHelperPath(options: AfmProviderOptions = {}): string | undefined {

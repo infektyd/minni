@@ -4,7 +4,7 @@
 **Last updated:** 2026-06-15
 
 This document lists every JSON-RPC method exposed by the Sovereign Memory daemon
-(`engine/minnid.py`; the authoritative dispatch table is `_METHODS`). Methods not
+(`src/minni/minnid.py`; the authoritative dispatch table is `_METHODS`). Methods not
 yet implemented are marked `[PLANNED: PR-N]`.
 
 ---

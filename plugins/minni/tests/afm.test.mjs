@@ -29,7 +29,7 @@ test("TS native helper default mirrors the repo engine helper when env is unset"
   const previous = process.env.MINNI_AFM_NATIVE_HELPER;
   delete process.env.MINNI_AFM_NATIVE_HELPER;
   try {
-    assert.match(defaultNativeHelperPath() ?? "", /engine\/native_afm_helper$/);
+    assert.match(defaultNativeHelperPath() ?? "", /(src\/minni|engine)\/native_afm_helper$/);
     assert.equal(resolvedNativeHelperPath(), defaultNativeHelperPath());
   } finally {
     if (previous === undefined) delete process.env.MINNI_AFM_NATIVE_HELPER;

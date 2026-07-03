@@ -3,8 +3,8 @@
 Wire Claude Code to a running Minni daemon from your checkout:
 
 ```bash
-engine/.venv/bin/minni up   # if the daemon isn't already running
-engine/.venv/bin/python plugins/minni/skills/minni-install/scripts/propagate.py update-plugin --platform claude-code
+.venv/bin/minni up   # if the daemon isn't already running
+.venv/bin/python plugins/minni/skills/minni-install/scripts/propagate.py update-plugin --platform claude-code
 ```
 
 This registers the MCP server (`plugins/minni/.claude-plugin/`), pins the

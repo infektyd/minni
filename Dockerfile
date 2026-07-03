@@ -22,13 +22,15 @@ WORKDIR /app
 
 # Engine only: the Node plugin surface is for wiring real agent runtimes on a
 # host, which is out of scope for the eval container.
-COPY engine/requirements* ./engine/
+COPY requirements.txt requirements.lock ./
 RUN pip install --no-cache-dir -r \
-    "$( [ -f engine/requirements.lock ] && echo engine/requirements.lock || echo engine/requirements.txt )"
+    "$( [ -f requirements.lock ] && echo requirements.lock || echo requirements.txt )"
 
-COPY engine/ ./engine/
+COPY pyproject.toml ./
+COPY src/ ./src/
 COPY scripts/ ./scripts/
 COPY LICENSE README.md ./
+RUN pip install --no-cache-dir --no-deps .
 
 RUN mkdir -p /home/minni/.minni/run && \
     chown -R minni:minni /home/minni/.minni /app
@@ -40,6 +42,6 @@ ENV HOME=/home/minni
 VOLUME /home/minni
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=30s \
-  CMD python engine/minnid_client.py --socket /home/minni/.minni/run/minnid.sock ping || exit 1
+  CMD python -m minni.minnid_client --socket /home/minni/.minni/run/minnid.sock ping || exit 1
 
-CMD ["python", "-u", "engine/minnid.py", "--socket", "/home/minni/.minni/run/minnid.sock"]
+CMD ["python", "-u", "-m", "minni.minnid", "--socket", "/home/minni/.minni/run/minnid.sock"]

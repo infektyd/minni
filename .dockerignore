@@ -7,8 +7,7 @@
 node_modules
 **/node_modules
 **/dist
-engine/.venv
-engine/venv
+.venv
 **/__pycache__
 **/.pytest_cache
 **/.ruff_cache

@@ -7,9 +7,9 @@ downgrade.
 
 ## Completed Scope
 
-- Added `engine/afm_provider.py` as the Python provider boundary.
+- Added `src/minni/afm_provider.py` as the Python provider boundary.
 - Added provider modes: `off`, `bridge`, `native`, and `auto`.
-- Added `engine/native_afm_helper` plus `engine/native_afm_helper.swift`, a
+- Added `src/minni/native_afm_helper` plus `src/minni/native_afm_helper.swift`, a
   JSON stdin/stdout helper for Apple Foundation Models when the Foundation
   Models framework is available.
 - Wired Python retrieval helpers for query expansion, neighborhood summaries,

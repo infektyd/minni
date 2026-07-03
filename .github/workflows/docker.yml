@@ -10,7 +10,10 @@ on:
     paths:
       - 'Dockerfile'
       - '.dockerignore'
-      - 'engine/**'
+      - 'src/minni/**'
+      - 'pyproject.toml'
+      - 'requirements.txt'
+      - 'requirements.lock'
       - '.github/workflows/docker.yml'
   push:
     tags: ['v*']
@@ -35,7 +38,7 @@ jobs:
         run: |
           docker run -d --name minni-smoke minni-eval:ci
           for i in $(seq 1 20); do
-            if docker exec minni-smoke python engine/minnid_client.py \
+            if docker exec minni-smoke python -m minni.minnid_client \
                  --socket /home/minni/.minni/run/minnid.sock ping; then
               echo "daemon answered"; break
             fi

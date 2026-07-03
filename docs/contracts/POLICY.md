@@ -85,12 +85,12 @@ avoid fingerprinting the local installation.
 ### 2.4 `blocked` privacy level
 
 Any document with `privacy_level=blocked` is excluded from all recall results
-unconditionally. This exclusion is applied in `engine/retrieval.py` before any
+unconditionally. This exclusion is applied in `src/minni/retrieval.py` before any
 result is returned, and is not overridable by any flag or config.
 
 ### 2.5 Enforcement
 
-Redaction is the responsibility of the daemon (`engine/minnid.py`). Agents that
+Redaction is the responsibility of the daemon (`src/minni/minnid.py`). Agents that
 receive recalled content MUST NOT strip or bypass redaction markers. An agent
 that receives `[REDACTED]` in a result MUST treat the redacted field as absent.
 
@@ -101,7 +101,7 @@ that receives `[REDACTED]` in a result MUST treat the redacted field as absent.
 ### 3.1 Episodic events
 
 Episodic events written via `log_event` have a **7-day TTL** by default.
-After 7 days, the decay pass (`engine/decay.py`) marks them as `expired` and
+After 7 days, the decay pass (`src/minni/decay.py`) marks them as `expired` and
 they are excluded from future recall unless `include_drafts=True` is set.
 
 Episodic events are never hard-deleted from the database; they remain as
@@ -131,7 +131,7 @@ The `expires` field is optional. Omitting it means the page persists forever.
 ### 3.4 Score distribution table
 
 The `score_distribution` table (used for confidence calibration in
-`engine/scoring.py`) accumulates raw scores indefinitely. An operator may
+`src/minni/scoring.py`) accumulates raw scores indefinitely. An operator may
 truncate it if it grows excessively. Rows older than 90 days are not used in
 calibration (the engine weights recent scores more heavily).
 

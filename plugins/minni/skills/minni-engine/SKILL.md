@@ -11,8 +11,11 @@ tags: [openclaw, memory, llm, faiss, sqlite]
 ```
 ~/Projects/Minni/
 ├── Makefile               # Root setup/check/test/daemon entrypoint
-├── engine/
-│   ├── .venv/             # Python 3.14 venv with all deps
+├── .venv/                 # Python 3.14 venv with all deps (pip install -e .)
+├── pyproject.toml         # Package metadata and console scripts (minni, minnid)
+├── requirements.txt       # Engine dependencies
+├── tests/                 # pytest suite
+├── src/minni/             # Minni Python package
 │   ├── config.py          # Centralized config (dataclass, MINNI_* overrides)
 │   ├── db.py              # SQLite + FTS5 schema
 │   ├── minnid.py          # JSON-RPC daemon over Unix socket
@@ -20,8 +23,7 @@ tags: [openclaw, memory, llm, faiss, sqlite]
 │   ├── writeback.py       # Write-back memory and learning lifecycle
 │   ├── faiss_index.py     # FAISS index manager
 │   ├── episodic.py        # Episodic event logging
-│   ├── indexer.py         # Vault indexing pipeline
-│   └── requirements.txt
+│   └── indexer.py         # Vault indexing pipeline
 └── plugins/minni/         # Multi-host TypeScript plugin
 ```
 
@@ -99,16 +101,16 @@ cd ~/Projects/Minni
 make setup
 
 # Syntax check
-engine/.venv/bin/python -c "import py_compile; py_compile.compile('engine/minnid.py', doraise=True)"
+.venv/bin/python -c "import py_compile; py_compile.compile('src/minni/minnid.py', doraise=True)"
 
 # Import check (verify no broken deps)
-(cd engine && .venv/bin/python -c "from retrieval import RetrievalEngine; from config import DEFAULT_CONFIG; print('OK')")
+.venv/bin/python -c "from minni.retrieval import RetrievalEngine; from minni.config import DEFAULT_CONFIG; print('OK')"
 
 # Start the daemon
 make daemon
 
 # Check daemon readiness
-engine/.venv/bin/python engine/minnid_client.py --socket ~/.minni/run/minnid.sock status
+.venv/bin/python -m minni.minnid_client --socket ~/.minni/run/minnid.sock status
 ```
 
 ## Related Skills

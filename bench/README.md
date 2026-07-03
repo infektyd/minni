@@ -4,8 +4,8 @@ Scrutiny-proof benchmark for the Minni local-first agent-memory system. The
 authoritative methodology is the design spec:
 `docs/superpowers/specs/2026-06-15-membench-design.md`.
 
-`bench/` is **isolated** from `engine/` and `plugins/` (fairness §7.5): nothing
-here imports a private `engine.*` / `plugins.*` module. The `minni` adapter
+`bench/` is **isolated** from `src/minni/` and `plugins/` (fairness §7.5): nothing
+here imports a private `minni.*` / `plugins.*` module. The `minni` adapter
 talks to Minni only through the **public Unix-socket JSON-RPC protocol**, the
 same interface any external client uses.
 
@@ -36,7 +36,7 @@ Use the repo's engine venv (built by `make setup` with Python 3.14) rather than 
 bare `python3`, so faiss/embedding imports resolve against the pinned dependencies:
 
 ```sh
-cd ~/Projects/Minni && engine/.venv/bin/python -m pytest -q bench
+cd ~/Projects/Minni && .venv/bin/python -m pytest -q bench
 ```
 
-`tiktoken` (the canonical tokenizer) must be installed in `engine/.venv`.
+`tiktoken` (the canonical tokenizer) must be installed in `.venv`.

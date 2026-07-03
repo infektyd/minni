@@ -1,15 +1,21 @@
 # Release: on a v* tag, gate on the same hermetic smoke CI runs, build the
 # distributable artifacts, and attach them to a GitHub Release.
 #
-# Secrets: none beyond the built-in GITHUB_TOKEN. PyPI and npm publishing are
-# intentionally absent — both are gated on maintainer decisions recorded in
-# PACKAGING_PLAN.md §6 (PyPI: v0.2 package-layout rename; npm: name is taken,
-# publication deferred). When those unblock, add trusted publishing here.
+# Secrets: none. The pypi job authenticates with an OIDC id-token; the
+# trusted publisher must be registered once on pypi.org (project `minni` →
+# Publishing → add GitHub publisher: owner infektyd, repo minni, workflow
+# release.yml, environment pypi). A workflow_dispatch run publishes to
+# TestPyPI instead — register the same publisher on test.pypi.org with
+# environment testpypi for the dry-run path. npm publishing stays absent
+# (name taken; PACKAGING_PLAN.md §6.6).
 name: Release
 
 on:
   push:
     tags: ['v*']
+  workflow_dispatch:
+    # Manual runs build the same artifacts but publish to TestPyPI only —
+    # the dry-run required by the v0.2 packaging plan (s4) before a real tag.
 
 permissions:
   contents: write
@@ -41,11 +47,10 @@ jobs:
       - name: Release gate — fast check
         run: make check
 
-      - name: Build Python sdist
-        working-directory: engine
+      - name: Build Python sdist + wheel
         run: |
           .venv/bin/python -m pip install build
-          .venv/bin/python -m build --sdist --outdir ../release-artifacts
+          .venv/bin/python -m build --outdir release-artifacts
 
       - name: Build npm package tarball
         working-directory: plugins/minni
@@ -54,14 +59,26 @@ jobs:
           npm pack --pack-destination ../../release-artifacts
 
       - name: Check tag matches package versions
+        if: github.event_name == 'push'
         run: |
           TAG="${GITHUB_REF_NAME#v}"
-          PY_V="$(engine/.venv/bin/python -c "import tomllib;print(tomllib.load(open('engine/pyproject.toml','rb'))['project']['version'])")"
+          PY_V="$(.venv/bin/python -c "import tomllib;print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")"
           NPM_V="$(node -p "require('./plugins/minni/package.json').version")"
           test "$TAG" = "$PY_V" || { echo "tag $TAG != engine version $PY_V"; exit 1; }
           test "$TAG" = "$NPM_V" || { echo "tag $TAG != plugin version $NPM_V"; exit 1; }
 
+      - name: Upload Python dist for the publish job
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-dist
+          # Only the Python artifacts go to (Test)PyPI; the npm tarball ships
+          # on the GitHub Release alone.
+          path: |
+            release-artifacts/*.whl
+            release-artifacts/*.tar.gz
+
       - name: Create GitHub Release
+        if: github.event_name == 'push'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -69,3 +86,41 @@ jobs:
             --title "Minni $GITHUB_REF_NAME" \
             --generate-notes \
             release-artifacts/*
+
+  # Trusted publishing (PyPI OIDC): no API tokens anywhere. Tag pushes publish
+  # to PyPI (environment `pypi`); manual workflow_dispatch runs publish to
+  # TestPyPI (environment `testpypi`) as the dry-run.
+  publish-pypi:
+    name: Publish to PyPI (trusted publishing)
+    needs: release
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: python-dist
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+
+  publish-testpypi:
+    name: Publish to TestPyPI (dry-run)
+    needs: release
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    environment: testpypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: python-dist
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+          repository-url: https://test.pypi.org/legacy/

@@ -3,15 +3,15 @@
 Wire Gemini to a running Minni daemon from your checkout:
 
 ```bash
-engine/.venv/bin/minni up   # if the daemon isn't already running
-engine/.venv/bin/python plugins/minni/skills/minni-install/scripts/propagate.py update-plugin --platform gemini
+.venv/bin/minni up   # if the daemon isn't already running
+.venv/bin/python plugins/minni/skills/minni-install/scripts/propagate.py update-plugin --platform gemini
 ```
 
 Antigravity rides the same `~/.gemini` surface (shared agent identity
 `gemini`, vault `~/.minni/gemini-vault`) but is wired **individually**:
 
 ```bash
-engine/.venv/bin/python plugins/minni/skills/minni-install/scripts/propagate.py update-plugin --platform antigravity
+.venv/bin/python plugins/minni/skills/minni-install/scripts/propagate.py update-plugin --platform antigravity
 ```
 
 Note: `--platform all` covers codex, claude-code, kilocode, gemini, and grok —

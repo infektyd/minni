@@ -41,7 +41,7 @@ jobs:
       - name: Install project deps
         run: |
           make setup
-          engine/.venv/bin/python -m pip install pyyaml
+          .venv/bin/python -m pip install pyyaml
 
       - name: Public boundary guard
         run: |
@@ -50,7 +50,7 @@ jobs:
 
       - name: Engine tests
         run: |
-          PYTHONPATH=engine engine/.venv/bin/python -m pytest engine/ -q --tb=short
+          .venv/bin/python -m pytest tests/ -q --tb=short
 
       - name: Plugin tests
         working-directory: plugins/minni
@@ -71,8 +71,8 @@ jobs:
           mkdir -p "$TD/home"
           export HOME="$TD/home" MINNI_HOME="$TD"
           SOCK="$TD/run/minnid.sock"
-          engine/.venv/bin/python -u engine/minnid.py --socket "$SOCK" > "$TD/daemon.log" 2>&1 &
+          .venv/bin/python -u -m minni.minnid --socket "$SOCK" > "$TD/daemon.log" 2>&1 &
           DPID=$!
           trap 'kill "$DPID" 2>/dev/null || true; rm -rf "$TD"' EXIT
           sleep 3
-          engine/.venv/bin/python engine/minni_cli.py --socket "$SOCK" doctor || { cat "$TD/daemon.log"; exit 1; }
+          .venv/bin/minni --socket "$SOCK" doctor || { cat "$TD/daemon.log"; exit 1; }

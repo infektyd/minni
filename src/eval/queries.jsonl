@@ -1,0 +1,10 @@
+{"query": "test query", "expected_doc_ids": [100, 200], "notes": "unit-test"}
+{"query": "query 0", "expected_doc_ids": [0], "notes": ""}
+{"query": "query 1", "expected_doc_ids": [1], "notes": ""}
+{"query": "query 2", "expected_doc_ids": [2], "notes": ""}
+{"query": "q", "expected_doc_ids": [], "notes": "no-match"}
+{"query": "test query", "expected_doc_ids": [100, 200], "notes": "unit-test"}
+{"query": "query 0", "expected_doc_ids": [0], "notes": ""}
+{"query": "query 1", "expected_doc_ids": [1], "notes": ""}
+{"query": "query 2", "expected_doc_ids": [2], "notes": ""}
+{"query": "q", "expected_doc_ids": [], "notes": "no-match"}

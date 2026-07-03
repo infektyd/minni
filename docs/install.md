@@ -12,7 +12,7 @@ git clone https://github.com/infektyd/minni.git && cd minni
 make setup
 ```
 
-`make setup` builds `engine/.venv` (from the pinned `engine/requirements.lock`),
+`make setup` builds `.venv` (from the pinned `requirements.lock`),
 installs the `minni` CLI into the venv, runs `npm ci` for the plugin, and
 enables the repo's git hooks. First daemon use downloads ~320 MB of embedding
 models into your HuggingFace cache — this is announced, happens once, and is
@@ -21,10 +21,10 @@ the main reason the first run takes a few minutes.
 ## Daemon lifecycle
 
 ```bash
-engine/.venv/bin/minni up        # start in the background (PID + logs under ~/.minni)
-engine/.venv/bin/minni status    # plain-language daemon + engine health
-engine/.venv/bin/minni doctor    # verify the install end to end
-engine/.venv/bin/minni down      # stop
+.venv/bin/minni up        # start in the background (PID + logs under ~/.minni)
+.venv/bin/minni status    # plain-language daemon + engine health
+.venv/bin/minni doctor    # verify the install end to end
+.venv/bin/minni down      # stop
 ```
 
 Equivalents: `make daemon` runs the daemon in the foreground; `make doctor`
@@ -40,7 +40,7 @@ the background AFM consolidation pass
 history), so doctor stays green regardless of that path's health.
 
 For a login-persistent daemon on macOS, a launchd template ships at
-`engine/launchd/com.minni.minnid.plist.example` (restart with
+`src/minni/launchd/com.minni.minnid.plist.example` (restart with
 `launchctl kickstart -k gui/$UID/com.minni.minnid`, stop with
 `launchctl bootout gui/$UID/com.minni.minnid`).
 
@@ -57,8 +57,8 @@ gated tools and handoffs work. Without it, gated calls return a structured
 Author the shipped agents' files from the repo root:
 
 ```bash
-engine/.venv/bin/python engine/tools/author_principals.py            # dry-run (default)
-engine/.venv/bin/python engine/tools/author_principals.py --apply    # write principals/*.json (0600)
+.venv/bin/python -m minni.tools.author_principals            # dry-run (default)
+.venv/bin/python -m minni.tools.author_principals --apply    # write principals/*.json (0600)
 ```
 
 For an unlisted agent, hand-author `~/.minni/principals/<agent>.json` (for
@@ -91,11 +91,11 @@ editors and agent runtimes.
 ## Manual vault indexing
 
 Personal vault indexes are built by the `vault_ingest` pass, and can be
-(re)built manually from `engine/`:
+(re)built manually from the repo root:
 
 ```bash
-engine/.venv/bin/python engine/index_all.py --vault-ingest-all            # from the repo root
-engine/.venv/bin/python engine/index_all.py --vault-ingest-all --dry-run
+.venv/bin/python -m minni.index_all --vault-ingest-all            # from the repo root
+.venv/bin/python -m minni.index_all --vault-ingest-all --dry-run
 ```
 
 ## Development checks
@@ -109,6 +109,25 @@ make smoke    # hermetic daemon smoke in a throwaway MINNI_HOME
 Both the smoke and the engine pytest suite force a throwaway `MINNI_HOME`, so
 they cannot create or mutate your live `~/.minni`. See
 [CONTRIBUTING.md](../CONTRIBUTING.md) for the full workflow.
+
+## Migrating a v0.1 checkout
+
+If you installed Minni before the v0.2 package restructure (flat `engine/`
+layout), bring your checkout current:
+
+1. Pull the latest changes.
+2. Run `make setup` (rebuilds the venv at root `.venv`).
+3. Re-run `propagate.py update-plugin --platform <yours>` to re-stamp configs:
+   ```bash
+   .venv/bin/python plugins/minni/skills/minni-install/scripts/propagate.py update-plugin --platform <yours>
+   ```
+4. For launchd users: update the plist's three paths — python interpreter →
+   `/path/to/repo/.venv/bin/python`, script args → `-m minni.minnid`,
+   `WorkingDirectory` → repo root — then run:
+   ```bash
+   launchctl bootout gui/$UID/com.minni.minnid && launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.minni.minnid.plist
+   ```
+5. The old `engine/.venv` can be deleted afterwards.
 
 ## Troubleshooting
 
