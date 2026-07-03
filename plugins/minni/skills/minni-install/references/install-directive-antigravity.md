@@ -7,7 +7,7 @@ All MCP config views point at the **legacy `sovereign-memory`** server → dead 
 
 ## Mechanism (official)
 - MCP (all 3 Antigravity surfaces): single shared `~/.gemini/config/mcp_config.json` (symlinked to `~/.agents/mcp-servers/views/.gemini__config__mcp_config.json.json`); `antigravity-cli/mcp/` + `antigravity-ide/mcp/` are *generated* from it. Stdio entry = `command`+`args`+`env`; IDE entries carry `"$typeName":"exa.cascade_plugins_pb.CascadePluginCommandTemplate"` (preserve on hand-edit). Remote key is `serverUrl` (n/a for Minni). gemini-cli (standalone) uses a DIFFERENT file: `~/.gemini/settings.json` → `mcpServers` (with `"trust": true`).
-- Context/memory: `GEMINI.md` (hierarchical) is the Layer-1 substitute — **static text, no per-prompt hook** equivalent to Claude Code on these surfaces.
+- Context/memory: `GEMINI.md` (hierarchical) is the Layer-1 substitute — **static text, no per-prompt hook** equivalent to Claude Code on these surfaces. (#133 update: the **agy CLI** additionally loads a hook plugin from `~/.gemini/config/plugins/minni/` — registered by `propagate.py update-plugin --platform gemini|antigravity` via `agy plugin install` — but agy 1.0.15 only dispatches `PreToolUse`/`PostToolUse`/`Stop`, so there is still no per-prompt injection; `Stop` candidate drafting and the (currently inert) `PreToolUse` recall guard are what fire. See `docs/runtimes/gemini.md`.)
 - Memory-first: GEMINI.md directive + auto-grant tools (`~/.gemini/config/config.json globalPermissionGrants.allow` and `~/.gemini/antigravity-cli/settings.json permissions.allow`).
 - Auth: OAuth is per-surface (IDE and `agy` auth separately; token at `~/.gemini/antigravity-cli/credentials.enc`). Minni itself needs no OAuth (local stdio).
 

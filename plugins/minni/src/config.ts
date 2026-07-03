@@ -1,4 +1,4 @@
-import { readFileSync, realpathSync, statSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, realpathSync, statSync } from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { fileURLToPath } from "node:url";
@@ -321,4 +321,51 @@ export const GROK_HOOKS_ENABLED =
 export const GROK_CONTEXT_WINDOW = (() => {
   const raw = Number(process.env.GROK_CONTEXT_WINDOW ?? process.env.MINNI_GROK_CONTEXT_WINDOW);
   return Number.isFinite(raw) && raw > 0 ? raw : 256_000;
+})();
+
+// --- Gemini / Antigravity agent defaults ---
+// One agent identity ("gemini") across the Antigravity family: the agy CLI,
+// Antigravity 2.0, and the Antigravity IDE all share the ~/.gemini tree and
+// the same vault. The hook entrypoint (gemini-hook.ts) currently only fires
+// on the agy CLI, whose plugin system dispatches PreToolUse/PostToolUse/Stop.
+
+export const GEMINI_AGENT_ID =
+  process.env.MINNI_GEMINI_AGENT_ID ?? "gemini";
+
+export const GEMINI_WORKSPACE_ID =
+  normalizeWorkspaceId(
+    process.env.MINNI_GEMINI_WORKSPACE_ID ??
+      `workspace-${path.basename(process.cwd())}`
+  );
+
+// Codex review (PR #134): mirror propagate.vault_for("gemini")'s legacy
+// fallback. Older installs may hold memory only at ~/.gemini/minni-vault;
+// propagation keeps using that vault so prior memory is not stranded, and the
+// agy hook (launched from hooks.json OUTSIDE the MCP env, so no stamped
+// MINNI_GEMINI_VAULT_PATH) must land on the same vault — not a fresh empty
+// canonical one. Legacy wins only when the canonical vault is missing AND the
+// legacy one exists with content, exactly like propagate.py.
+function geminiVaultDefault(): string {
+  const canonical = path.join(os.homedir(), ".minni", "gemini-vault");
+  const legacy = path.join(os.homedir(), ".gemini", "minni-vault");
+  try {
+    if (!existsSync(canonical) && existsSync(legacy) && readdirSync(legacy).length > 0) {
+      return legacy;
+    }
+  } catch {
+    // unreadable legacy path -> canonical
+  }
+  return canonical;
+}
+
+export const GEMINI_VAULT_PATH = expandTilde(
+  process.env.MINNI_GEMINI_VAULT_PATH ?? geminiVaultDefault(),
+);
+
+export const GEMINI_HOOKS_ENABLED =
+  (process.env.MINNI_GEMINI_HOOKS ?? "on").toLowerCase() !== "off";
+
+export const GEMINI_CONTEXT_WINDOW = (() => {
+  const raw = Number(process.env.GEMINI_CONTEXT_WINDOW ?? process.env.MINNI_GEMINI_CONTEXT_WINDOW);
+  return Number.isFinite(raw) && raw > 0 ? raw : 1_000_000;
 })();

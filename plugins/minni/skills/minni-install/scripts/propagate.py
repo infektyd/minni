@@ -17,6 +17,7 @@ import socket
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import time
 import tomllib
 from pathlib import Path
@@ -641,6 +642,99 @@ def update_antigravity_config(
     return {"views_written": written, "grants_updated": granted}
 
 
+AGY_PLUGIN_NAME = "minni"
+AGY_PLUGINS_DIR = "~/.gemini/config/plugins"
+AGY_DIST_TOKEN = "__MINNI_GEMINI_DIST__"
+
+
+def update_agy_plugin_hooks(install_root: Path) -> dict[str, object]:
+    """Register the Minni hook plugin with the agy (Antigravity CLI) plugin system.
+
+    agy loads Claude Code-style hooks.json manifests from
+    ~/.gemini/config/plugins/<name>/hooks.json, with three quirks verified live
+    against agy 1.0.15 (#133):
+      - ${CLAUDE_PLUGIN_ROOT} is NOT expanded, so commands must carry absolute
+        paths; the AGY_DIST_TOKEN in hooks-gemini.json is stamped with this
+        install root's dist path.
+      - Plugins must be registered through `agy plugin install <staging>`; a
+        hand-dropped, unregistered hooks.json wedges agy at startup behind an
+        invisible consent prompt. NEVER install from the destination directory:
+        agy copies source onto itself and truncates every file to zero bytes.
+      - `agy plugin enable` exits non-zero when the plugin is already enabled;
+        that outcome is tolerated.
+
+    Real files only, no symlinks: the staged plugin is a physical plugin.json +
+    hooks.json whose stamped commands point at dist/gemini-hook.js under this
+    install root.
+    """
+    template = install_root / "hooks" / "hooks-gemini.json"
+    if not template.exists():
+        return {"installed": False, "reason": f"missing hooks template: {template}"}
+    agy = shutil.which("agy")
+    if not agy:
+        return {
+            "installed": False,
+            "reason": "agy CLI not found on PATH; hook registration skipped (re-run after installing agy)",
+        }
+
+    hooks_data = json.loads(template.read_text(encoding="utf-8"))
+    hooks_data.pop("_comment", None)
+    stamped = json.dumps(hooks_data, indent=2).replace(AGY_DIST_TOKEN, str(install_root / "dist"))
+
+    staging_root = Path(tempfile.mkdtemp(prefix="minni-agy-plugin-"))
+    enable_note = ""
+    try:
+        staging = staging_root / AGY_PLUGIN_NAME
+        staging.mkdir()
+        (staging / "plugin.json").write_text(
+            json.dumps({"name": AGY_PLUGIN_NAME}) + "\n", encoding="utf-8"
+        )
+        (staging / "hooks.json").write_text(stamped + "\n", encoding="utf-8")
+        try:
+            subprocess.run(
+                [agy, "plugin", "install", str(staging)],
+                check=True, capture_output=True, text=True, timeout=60,
+            )
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+            detail = getattr(exc, "stderr", "") or getattr(exc, "stdout", "") or str(exc)
+            return {"installed": False, "reason": f"agy plugin install failed: {str(detail).strip()}"}
+        enable = subprocess.run(
+            [agy, "plugin", "enable", AGY_PLUGIN_NAME],
+            capture_output=True, text=True, timeout=60,
+        )
+        if enable.returncode != 0:
+            enable_note = (enable.stderr.strip() or enable.stdout.strip())
+            # Only the known already-enabled response is benign. Any other
+            # enable failure means the plugin may be left disabled — agy would
+            # then never dispatch Stop/PreToolUse — so report an honest failure
+            # instead of installed:true with a buried note.
+            if "already enabled" not in enable_note.lower():
+                return {
+                    "installed": False,
+                    "reason": f"agy plugin enable failed: {enable_note or 'unknown error'}",
+                }
+    finally:
+        shutil.rmtree(staging_root, ignore_errors=True)
+
+    installed_hooks = Path(AGY_PLUGINS_DIR).expanduser() / AGY_PLUGIN_NAME / "hooks.json"
+    ok = (
+        installed_hooks.exists()
+        and str(install_root / "dist") in installed_hooks.read_text(encoding="utf-8")
+    )
+    result: dict[str, object] = {
+        "installed": ok,
+        "hooks_path": str(installed_hooks),
+        "hook_entry": str(install_root / "dist" / "gemini-hook.js"),
+    }
+    if not ok:
+        result["reason"] = (
+            "agy plugin install completed but the stamped hooks.json was not found at the expected path"
+        )
+    if enable_note:
+        result["enable_note"] = enable_note
+    return result
+
+
 def _toml_basic_str(value: object) -> str:
     # Escape a value for embedding in a TOML basic (double-quoted) string.
     # Critically: backslashes must be doubled first, else Windows paths like
@@ -676,16 +770,20 @@ def update_toml_mcp_config(path: Path, server_path: Path, agent: str, vault: Pat
     )
 
 
-# PreToolUse parity (Claude-only-by-capability):
+# PreToolUse parity (capability-gated per platform):
 # The s6 recall GUARD relies on a PreToolUse hook that can DENY a tool call
-# before it runs. Among the supported surfaces, only Claude Code exposes a
-# deny-capable pre-tool hook (registered in plugins/minni/hooks/hooks.json).
-# codex / grok / kilocode / gemini wire Minni through MCP servers + CLI and do
-# NOT expose an equivalent deny-capable pre-tool event, so the guard is
-# intentionally NOT wired into their manifests — this is a platform capability
-# gap, not a Minni omission. The lifecycle nudge + UserPromptSubmit recall
-# pointer still reach those surfaces; only the deny-to-surface backstop is
-# Claude-only. See docs/contracts/AGENT.md §8.
+# before it runs. Claude Code exposes one (registered in
+# plugins/minni/hooks/hooks.json), and the agy (Antigravity CLI) plugin system
+# exposes a deny-capable pre-tool decision too (#133) — its guard is wired via
+# hooks-gemini.json, though inert until agy dispatches UserPromptSubmit (no
+# prompt event means no recall-state for the guard to act on). codex / grok /
+# kilocode wire Minni through MCP servers + CLI and do NOT expose an
+# equivalent deny-capable pre-tool event, so the guard is intentionally NOT
+# wired into their manifests — a platform capability gap, not a Minni
+# omission. The lifecycle nudge + UserPromptSubmit recall pointer reach the
+# codex/grok/kilocode surfaces; on agy 1.0.15 only PreToolUse/PostToolUse/Stop
+# exist, so gemini receives NO lifecycle injection yet. See
+# docs/contracts/AGENT.md §8.
 def platform_spec(platform: str, repo_root: Path, install_root: str | None = None) -> dict[str, object]:
     platform = canonical_platform(platform)
     home = Path.home()
@@ -799,6 +897,12 @@ def update_one_plugin(platform: str, args: argparse.Namespace) -> dict[str, obje
             install_root, agent, vault, Path(args.socket).expanduser(), stamp_workspace, afm_env
         )
 
+    # #133: both gemini-family kinds share the ~/.gemini tree, so both wire the
+    # agy CLI hook plugin (skipped with a reason when agy is not installed).
+    agy_hooks: dict[str, object] | None = None
+    if config_kind in ("gemini-manifest", "antigravity"):
+        agy_hooks = update_agy_plugin_hooks(install_root)
+
     base: dict[str, object] = {
         "platform": canonical_platform(platform),
         "agent": agent,
@@ -810,6 +914,8 @@ def update_one_plugin(platform: str, args: argparse.Namespace) -> dict[str, obje
     }
     if config_kind == "antigravity":
         base["antigravity"] = antigravity_result
+    if agy_hooks is not None:
+        base["agy_hooks"] = agy_hooks
     return base
 
 

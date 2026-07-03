@@ -326,19 +326,32 @@ storage-backed queue instead. If a reviewer cannot tell whether a file is a
 derived artifact or a communication channel, the feature needs a design note
 before it merges.
 
-## 8. Hook capability parity (PreToolUse is Claude-only)
+## 8. Hook capability parity (per-platform, capability-gated)
 
 The s6 recall **guard** is a `PreToolUse` hook that can **deny** a tool call
 before it runs (deny-to-surface: the agent re-issues the call after consulting
-recall). Among the supported surfaces, **only Claude Code exposes a deny-capable
-pre-tool hook**, so the guard is registered only in Claude's
-`plugins/minni/hooks/hooks.json`.
+recall). Two surfaces expose a deny-capable pre-tool hook:
 
-`codex`, `grok`, `kilocode`, and `gemini` integrate Minni through MCP servers and
-CLI entrypoints and do **not** expose an equivalent deny-capable pre-tool event.
-The guard is therefore intentionally **not** wired into their manifests — this is
-a platform capability gap, **not** a Minni omission. Those surfaces still receive
-the lifecycle nudge and the `UserPromptSubmit` recall pointer; only the
-deny-to-surface backstop is Claude-only. If a non-Claude surface later exposes a
-deny-capable pre-tool hook, wire it in `propagate.py` (see the note above
-`platform_spec`).
+- **Claude Code** — the guard is registered in `plugins/minni/hooks/hooks.json`
+  and fully live (its `UserPromptSubmit` hook writes the recall-state the guard
+  acts on).
+- **Gemini/Antigravity via the agy CLI** (#133) — agy's plugin hook system
+  dispatches `PreToolUse` with a deny-capable decision string, and the guard is
+  wired in `plugins/minni/hooks/hooks-gemini.json` through the agy payload
+  adapter (`gemini-adapter.ts`). It is **inert in practice** on agy 1.0.15:
+  agy dispatches only `PreToolUse`/`PostToolUse`/`Stop`, and without a
+  `UserPromptSubmit` event no recall-state is ever written, so the guard always
+  approves. It lights up automatically once agy adds prompt-level hooks.
+
+`codex`, `grok`, and `kilocode` integrate Minni through MCP servers and CLI
+entrypoints and do **not** expose an equivalent deny-capable pre-tool event.
+The guard is therefore intentionally **not** wired into their manifests — this
+is a platform capability gap, **not** a Minni omission. Those three surfaces
+receive the lifecycle nudge and the `UserPromptSubmit` recall pointer.
+**Gemini receives neither today**: on agy 1.0.15 the only lifecycle hook that
+fires with effect is `Stop` (candidate drafting into the gemini vault inbox);
+there is no boot injection and no per-prompt recall pointer until agy grows
+`SessionStart`/`UserPromptSubmit` events (they are pre-declared in
+`hooks-gemini.json` so they activate without a reinstall). If another surface
+later exposes a deny-capable pre-tool hook, wire it in `propagate.py` (see the
+note above `platform_spec`).
