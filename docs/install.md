@@ -1,6 +1,20 @@
 # Install & troubleshooting
 
-## Supported install (source checkout)
+## PyPI install (daemon + CLI)
+
+Since v0.2 the daemon and CLI install from PyPI — no checkout, no Node:
+
+```bash
+pipx install minni     # or: uv tool install minni
+minni up
+minni doctor
+```
+
+This gives you the `minni` and `minnid` commands and the full engine. Wiring
+agent runtimes (the MCP plugin + per-platform installer) still needs the
+source checkout below.
+
+## Source install (contributors + agent wiring)
 
 Requirements: `git`, `make`, Node >= 20 (`.nvmrc`). Python 3.14 is required by
 the engine (`.python-version`) but you do not have to install it yourself: if
