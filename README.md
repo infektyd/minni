@@ -21,7 +21,7 @@ Four verbs cover the lifecycle:
 
 - **Recall** — cited, provenance-tagged retrieval (lexical + vector + rank fusion + rerank) across the personal and shared legs.
 - **Learn** — propose, don't write: `learn` stages a **candidate**, not a memory.
-- **Approve** — a governance gate (`resolve_candidate`) accepts, rejects, redacts, merges, or supersedes the candidate. Only accepted candidates become durable memory. Human-gated by default; the operator can [delegate approval](docs/concepts.md#delegating-approval) to a trusted agent (a background auto-consolidation path is designed but not yet functional — [#119](https://github.com/infektyd/minni/issues/119)).
+- **Approve** — a governance gate (`resolve_candidate`) accepts, rejects, redacts, merges, or supersedes the candidate. Only accepted candidates become durable memory. Human-gated by default; the operator can [delegate approval](docs/concepts.md#delegating-approval) to a trusted agent, including the background AFM auto-consolidation pass (functional since [#119](https://github.com/infektyd/minni/issues/119) closed) — every path lands in the same audited gate.
 - **Handoff** — explicit cross-agent transfers with leases, so work and context move between runtimes deliberately.
 
 All of it is local-first: no hosted dependency, no cloud tier, and vaults you can open in any editor.
