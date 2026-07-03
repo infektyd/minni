@@ -1,4 +1,4 @@
-import { readFileSync, realpathSync, statSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, realpathSync, statSync } from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { fileURLToPath } from "node:url";
@@ -338,9 +338,28 @@ export const GEMINI_WORKSPACE_ID =
       `workspace-${path.basename(process.cwd())}`
   );
 
+// Codex review (PR #134): mirror propagate.vault_for("gemini")'s legacy
+// fallback. Older installs may hold memory only at ~/.gemini/minni-vault;
+// propagation keeps using that vault so prior memory is not stranded, and the
+// agy hook (launched from hooks.json OUTSIDE the MCP env, so no stamped
+// MINNI_GEMINI_VAULT_PATH) must land on the same vault — not a fresh empty
+// canonical one. Legacy wins only when the canonical vault is missing AND the
+// legacy one exists with content, exactly like propagate.py.
+function geminiVaultDefault(): string {
+  const canonical = path.join(os.homedir(), ".minni", "gemini-vault");
+  const legacy = path.join(os.homedir(), ".gemini", "minni-vault");
+  try {
+    if (!existsSync(canonical) && existsSync(legacy) && readdirSync(legacy).length > 0) {
+      return legacy;
+    }
+  } catch {
+    // unreadable legacy path -> canonical
+  }
+  return canonical;
+}
+
 export const GEMINI_VAULT_PATH = expandTilde(
-  process.env.MINNI_GEMINI_VAULT_PATH ??
-    path.join(os.homedir(), ".minni", "gemini-vault"),
+  process.env.MINNI_GEMINI_VAULT_PATH ?? geminiVaultDefault(),
 );
 
 export const GEMINI_HOOKS_ENABLED =

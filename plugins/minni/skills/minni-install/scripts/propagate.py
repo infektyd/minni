@@ -704,6 +704,15 @@ def update_agy_plugin_hooks(install_root: Path) -> dict[str, object]:
         )
         if enable.returncode != 0:
             enable_note = (enable.stderr.strip() or enable.stdout.strip())
+            # Only the known already-enabled response is benign. Any other
+            # enable failure means the plugin may be left disabled — agy would
+            # then never dispatch Stop/PreToolUse — so report an honest failure
+            # instead of installed:true with a buried note.
+            if "already enabled" not in enable_note.lower():
+                return {
+                    "installed": False,
+                    "reason": f"agy plugin enable failed: {enable_note or 'unknown error'}",
+                }
     finally:
         shutil.rmtree(staging_root, ignore_errors=True)
 

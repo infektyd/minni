@@ -48,10 +48,13 @@ def make_install_root(tmp_path: Path) -> Path:
     return install_root
 
 
-def make_fake_agy(tmp_path: Path, plugins_dir: Path, *, enable_rc: int = 0) -> Path:
+def make_fake_agy(
+    tmp_path: Path, plugins_dir: Path, *, enable_rc: int = 0, enable_stderr: str = ""
+) -> Path:
     """A fake agy CLI: `plugin install <src>` copies src into plugins_dir under
-    its plugin.json name (mirroring real agy), `plugin enable` exits enable_rc.
-    It records every argv line for install-source assertions."""
+    its plugin.json name (mirroring real agy), `plugin enable` exits enable_rc
+    after printing enable_stderr. It records every argv line for
+    install-source assertions."""
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir(exist_ok=True)
     log = tmp_path / "agy-calls.log"
@@ -67,6 +70,7 @@ def make_fake_agy(tmp_path: Path, plugins_dir: Path, *, enable_rc: int = 0) -> P
         "  exit 0\n"
         "fi\n"
         "if [ \"$1\" = plugin ] && [ \"$2\" = enable ]; then\n"
+        f"  [ -n \"{enable_stderr}\" ] && echo \"{enable_stderr}\" >&2\n"
         f"  exit {enable_rc}\n"
         "fi\n"
         "exit 0\n",
@@ -138,7 +142,10 @@ def test_enable_already_enabled_is_tolerated(tmp_path, monkeypatch):
     install_root = make_install_root(tmp_path)
     plugins_dir = tmp_path / "gemini-config-plugins"
     plugins_dir.mkdir()
-    make_fake_agy(tmp_path, plugins_dir, enable_rc=1)
+    make_fake_agy(
+        tmp_path, plugins_dir, enable_rc=1,
+        enable_stderr='Error: plugin minni is already enabled',
+    )
     monkeypatch.setattr(
         propagate.shutil, "which",
         lambda name: str(tmp_path / "bin" / "agy") if name == "agy" else None,
@@ -147,8 +154,31 @@ def test_enable_already_enabled_is_tolerated(tmp_path, monkeypatch):
 
     result = propagate.update_agy_plugin_hooks(install_root)
 
-    # Non-zero enable (already enabled) must not fail the install.
+    # The known already-enabled response must not fail the install.
     assert result["installed"] is True
+
+
+def test_other_enable_failures_surface_as_unsuccessful(tmp_path, monkeypatch):
+    install_root = make_install_root(tmp_path)
+    plugins_dir = tmp_path / "gemini-config-plugins"
+    plugins_dir.mkdir()
+    make_fake_agy(
+        tmp_path, plugins_dir, enable_rc=1,
+        enable_stderr='Error: plugin minni is suspended',
+    )
+    monkeypatch.setattr(
+        propagate.shutil, "which",
+        lambda name: str(tmp_path / "bin" / "agy") if name == "agy" else None,
+    )
+    monkeypatch.setattr(propagate, "AGY_PLUGINS_DIR", str(plugins_dir))
+
+    result = propagate.update_agy_plugin_hooks(install_root)
+
+    # A genuinely failed enable means agy may never dispatch hook events; the
+    # function must not report success just because hooks.json landed on disk.
+    assert result["installed"] is False
+    assert "enable failed" in str(result["reason"])
+    assert "suspended" in str(result["reason"])
 
 
 def test_failed_install_surfaces_reason_not_success(tmp_path, monkeypatch):

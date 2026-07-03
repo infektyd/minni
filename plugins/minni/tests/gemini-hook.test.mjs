@@ -300,6 +300,41 @@ test("guard defaults to strict on agy: read/search run_command is denied without
   }
 });
 
+test("vault default mirrors propagate's legacy fallback when only ~/.gemini/minni-vault has data", async () => {
+  const fixture = await makeFixture();
+  try {
+    const legacyVault = path.join(fixture.root, ".gemini", "minni-vault");
+    await mkdir(legacyVault, { recursive: true });
+    await writeFile(path.join(legacyVault, "log.md"), "# legacy memory\n");
+    // HOME points into the fixture and MINNI_GEMINI_VAULT_PATH is cleared, so
+    // the hook resolves its default: canonical (~/.minni/gemini-vault) is
+    // missing, legacy exists with content -> the hook must use the legacy
+    // vault, exactly like propagate.vault_for("gemini").
+    const env = {
+      ...process.env,
+      HOME: fixture.root,
+      MINNI_HOME: fixture.root,
+      MINNI_GEMINI_VAULT_PATH: "",
+      MINNI_SOCKET_PATH: path.join(fixture.root, "missing.sock"),
+      MINNI_AFM_HEALTH_URL: "http://127.0.0.1:1/health",
+      MINNI_BYPASS_AUDIT_LIMIT: "true",
+    };
+    delete env.MINNI_GEMINI_VAULT_PATH;
+    const child = execFileAsync(process.execPath, [GEMINI_HOOK_JS, "Stop"], { env, timeout: 30_000 });
+    child.child.stdin.end(JSON.stringify(agyPreToolUsePayload({ toolCall: null })));
+    const { stdout } = await child;
+    const output = JSON.parse(stdout.trim().split("\n").at(-1));
+    assert.equal(output.continue, true);
+    const legacyLog = await readFile(path.join(legacyVault, "log.md"), "utf8");
+    assert.ok(legacyLog.includes("hook_gemini"), "hook must write to the legacy vault, not a fresh canonical one");
+    const canonical = path.join(fixture.root, ".minni", "gemini-vault");
+    const canonicalEntries = await readdir(canonical).catch(() => null);
+    assert.equal(canonicalEntries, null, "no fresh canonical vault may be created on a legacy install");
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
 test("Stop drafts candidates under gemini's own identity stamps", async () => {
   const fixture = await makeFixture();
   try {
