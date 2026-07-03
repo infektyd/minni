@@ -2,20 +2,18 @@
 # distributable artifacts, and attach them to a GitHub Release.
 #
 # Secrets: none. The pypi job authenticates with an OIDC id-token; the
-# trusted publisher must be registered once on pypi.org (project `minni` →
-# Publishing → add GitHub publisher: owner infektyd, repo minni, workflow
-# release.yml, environment pypi). A workflow_dispatch run publishes to
-# TestPyPI instead — register the same publisher on test.pypi.org with
-# environment testpypi for the dry-run path. npm publishing stays absent
-# (name taken; PACKAGING_PLAN.md §6.6).
+# trusted publisher is registered on pypi.org (project `minni` → Publishing:
+# owner infektyd, repo minni — lowercase, matching GitHub's canonical OIDC
+# claim — workflow release.yml, environment pypi). A TestPyPI dry-run lane
+# existed briefly but was removed 2026-07-03: no test.pypi.org registration,
+# and the v0.2.0 tag publish is proven green end to end. Restore it from git
+# history if a rehearsal lane is ever wanted (environment `testpypi`). npm
+# publishing stays absent (name taken; PACKAGING_PLAN.md §6.6).
 name: Release
 
 on:
   push:
     tags: ['v*']
-  workflow_dispatch:
-    # Manual runs build the same artifacts but publish to TestPyPI only —
-    # the dry-run required by the v0.2 packaging plan (s4) before a real tag.
 
 permissions:
   contents: write
@@ -59,7 +57,6 @@ jobs:
           npm pack --pack-destination ../../release-artifacts
 
       - name: Check tag matches package versions
-        if: github.event_name == 'push'
         run: |
           TAG="${GITHUB_REF_NAME#v}"
           PY_V="$(.venv/bin/python -c "import tomllib;print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")"
@@ -78,7 +75,6 @@ jobs:
             release-artifacts/*.tar.gz
 
       - name: Create GitHub Release
-        if: github.event_name == 'push'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -93,7 +89,6 @@ jobs:
   publish-pypi:
     name: Publish to PyPI (trusted publishing)
     needs: release
-    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
@@ -106,21 +101,3 @@ jobs:
       - uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist
-
-  publish-testpypi:
-    name: Publish to TestPyPI (dry-run)
-    needs: release
-    if: github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
-    environment: testpypi
-    permissions:
-      id-token: write
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          name: python-dist
-          path: dist
-      - uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          packages-dir: dist
-          repository-url: https://test.pypi.org/legacy/
