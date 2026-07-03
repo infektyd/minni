@@ -148,6 +148,7 @@ PR_DESCRIPTION.md
 *.scratch.*
 *.tmp.*
 *.bak
+*.bak-*
 *~
 # OS junk — .DS_Store is already covered above by **/.DS_Store
 Thumbs.db
