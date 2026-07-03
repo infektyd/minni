@@ -6,7 +6,7 @@ This folder is the canonical home for Minni on this machine:
 
 It is also the canonical Git working tree for
 `https://github.com/infektyd/minni`. The live layout is intentional:
-runtime integrations use `src/minni/`, `openclaw-extension/`, and
+runtime integrations use `src/minni/` and
 `plugins/minni/` directly.
 
 Use this page to avoid guessing between older root-level, OpenClaw, Hermes, and
@@ -18,7 +18,6 @@ names. Treat those as legacy references, not active roots.
 ## Active Core
 
 - `src/minni/` - Minni Python package.
-- `openclaw-extension/` - OpenClaw extension bridge.
 - `plugins/minni/` - `minni-multi-plugin` multi-host plugin package (Codex, Claude Code, Gemini, KiloCode surfaces sharing one MCP server and daemon).
 - `session-extracts/` - extracted handoff/session notes.
 

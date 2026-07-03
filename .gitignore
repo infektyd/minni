@@ -87,13 +87,6 @@ plugins/*/.playwright-cli/
 plugins/.DS_Store
 **/.DS_Store
 
-# Private OpenClaw bridge runtime files
-openclaw-extension/node_modules/
-openclaw-extension/dist/
-openclaw-extension/.import-manifest.json
-openclaw-extension/*.bak
-openclaw-extension/*.day5.*
-openclaw-extension/__pycache__/
 
 # Python/runtime caches
 engine/venv/

@@ -35,7 +35,6 @@ audit writes do not cross this boundary; see
 | `plugins/minni/src/hook-handlers.ts` | Shared hook semantics for runtimes that support hooks |
 | `plugins/minni/src/plan.ts` | Durable plan artifacts and state transitions |
 | `plugins/minni/src/vault.ts` | Vault writes, inbox/outbox, compile surfaces |
-| `openclaw-extension/` | OpenClaw bridge (separate adapter with its own package) |
 
 ## Data model
 
