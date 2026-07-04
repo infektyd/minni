@@ -152,7 +152,9 @@ export function routeMemoryIntent(task: string): MemoryIntent {
  */
 const SECRET_PREFIX_RE = new RegExp(
   [
-    "\\bpypi-[A-Za-z0-9_-]{16,}",
+    // pypi- must look token-shaped (mixed case + digit): kebab-case slugs
+    // like `pypi-trusted-publisher-lowercase-claim` are vocabulary, not tokens.
+    "\\bpypi-(?=[A-Za-z0-9_-]*[A-Z])(?=[A-Za-z0-9_-]*[0-9])[A-Za-z0-9_-]{16,}",
     "\\bghp_[A-Za-z0-9]{20,}",
     "\\bgithub_pat_[A-Za-z0-9_]{20,}",
     "\\bgh[ousr]_[A-Za-z0-9]{20,}",
@@ -214,12 +216,19 @@ export function detectSecretMaterial(content: string): string | null {
   // out; base64-ish secret material almost always carries all three. Public
   // SRI checksums (`sha512-…`) are stripped first — high-entropy, not secret.
   const scannable = content.replace(SRI_CHECKSUM_RE, " ");
-  for (const span of scannable.match(/[A-Za-z0-9+/_=-]{24,}/g) ?? []) {
-    const hasLower = /[a-z]/.test(span);
-    const hasUpper = /[A-Z]/.test(span);
-    const hasDigit = /[0-9]/.test(span);
-    if (hasLower && hasUpper && hasDigit && shannonEntropyPerChar(span) >= 3.8) {
-      return "a high-entropy opaque string";
+  for (const rawSpan of scannable.match(/[A-Za-z0-9+/_=-]{24,}/g) ?? []) {
+    // Evaluate "/"-separated segments, not the whole span: paths and URLs
+    // (`/Users/Hans/Projects/v2/…`, `github.com/Org/Repo/runs/123…`)
+    // decompose into short low-entropy segments, while a base64 secret that
+    // happens to contain a slash still yields a long high-entropy segment.
+    for (const span of rawSpan.split("/")) {
+      if (span.length < 24) continue;
+      const hasLower = /[a-z]/.test(span);
+      const hasUpper = /[A-Z]/.test(span);
+      const hasDigit = /[0-9]/.test(span);
+      if (hasLower && hasUpper && hasDigit && shannonEntropyPerChar(span) >= 3.8) {
+        return "a high-entropy opaque string";
+      }
     }
   }
   return null;

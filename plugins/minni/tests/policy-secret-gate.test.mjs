@@ -92,6 +92,11 @@ test("high-entropy opaque strings block; SHAs, digests, paths, URLs do not", () 
     // Codex P2 round 3 (PR #146): npm/pnpm SRI integrity checksums are
     // public metadata, not secrets.
     "lockfile pin: integrity sha512-3O4nQW8g5yFfV9m2pLcR7aK1dT6sX0bE9hJ2uI5oP8A=",
+    // Codex P2 round 5 (PR #146): mixed-case paths/URLs with digits.
+    "path /Users/Hans/Projects/Minni/v2/plugins/minni/dist/server.js",
+    "run github.com/Infektyd/Minni/actions/runs/28714837391",
+    // Codex P2 round 5 (PR #146): pypi- kebab slugs are vocabulary, not tokens.
+    "see pypi-trusted-publisher-lowercase-claim and pypi-token-rotation-runbook-entry",
   ];
   for (const content of benign) {
     assert.equal(detectSecretMaterial(content), null, content.slice(0, 50));
