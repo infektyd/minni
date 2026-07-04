@@ -45,7 +45,7 @@ jobs:
       - name: Release gate — fast check
         run: make check
 
-      - name: Stage plugin payload (v0.3+: the wheel ships the agent wiring)
+      - name: "Stage plugin payload (v0.3+: the wheel ships the agent wiring)"
         run: make stage-payload
 
       - name: Build Python sdist + wheel (payload-gated)
