@@ -48,11 +48,11 @@ This is a memory-poisoning defense, enforced in the engine rather than asserted 
 
 **TL;DR:** Minni is the local-first **and** multi-agent **and** governed corner of the space. mem0 is the mature hosted layer optimizing single-agent recall benchmarks; MemOS is a heavier research memory-OS; basic-memory shares the Markdown-first DNA but is one personal knowledge graph without a governing daemon on top.
 
-Honest caveats: Minni is **early (v0.2)**, with tiny adoption, no published benchmarks, and no hosted or multi-device option. The daemon installs with one `pipx install minni`, but the runtime footprint is still heavier than SDK-style tools (a running daemon, FAISS/embedding models, and — for wiring agents — a repo checkout with Node). "Multi-agent" means multiple agent runtimes sharing one local daemon on one host, not agents distributed across machines.
+Honest caveats: Minni is **early (v0.2)**, with tiny adoption, no published benchmarks, and no hosted or multi-device option. The daemon installs with one `pipx install minni`, but the runtime footprint is still heavier than SDK-style tools (a running daemon, FAISS/embedding models, and Node >= 20 on the machine for the MCP plugin). "Multi-agent" means multiple agent runtimes sharing one local daemon on one host, not agents distributed across machines.
 
 ## Quickstart
 
-Minni is two pieces, and today they install two different ways: the **daemon + CLI** come from PyPI, while the **agent wiring** (the MCP plugin and per-runtime hooks) still comes from a repo checkout. Step 1 gives you a working, verifiable memory daemon; step 2 is what actually connects your agents to it. (Collapsing step 2 into the package — `minni wire` — is the v0.3 flagship: [#142](https://github.com/infektyd/minni/issues/142).)
+Minni is two pieces: the **daemon + CLI** (PyPI) and the **agent wiring** (the MCP plugin and per-runtime hooks), which `minni wire <platform>` installs. Step 1 gives you a working, verifiable memory daemon; step 2 is what actually connects your agents to it. Wheels from **v0.3** ship the plugin payload inside the package, so both steps are `pipx install minni` and nothing else; on the current v0.2 wheel, step 2 still needs a repo checkout (via `minni wire --from-repo`).
 
 ### 1. Install the daemon + CLI (PyPI)
 
@@ -66,17 +66,25 @@ minni doctor   # verify the install end to end
 
 `doctor` runs the same probes CI uses on every push — daemon status shape, a recall round-trip, socket permissions, model cache — and reports in plain language. `minni down` stops the daemon.
 
-### 2. Clone the repo and wire your agents
+### 2. Wire your agents
 
-A daemon with nothing wired to it is just a very polite database — agents reach it through the MCP plugin, and the plugin (a Node package) plus the installer live in the repo. You need `git`, `make`, and Node >= 20; `make setup` provisions everything, including a Python 3.14 venv via [uv](https://docs.astral.sh/uv/) if your system `python3` is older. (This same checkout is also the contributor / from-source path.)
+A daemon with nothing wired to it is just a very polite database — agents reach it through the MCP plugin, a Node package that `minni wire` installs to `~/.minni/plugin/<version>/` and registers with your agent runtime. You need Node >= 20 on the machine (the preflight tells you if it's missing).
+
+From a **v0.3+ wheel**, the payload is bundled — no checkout:
+
+```bash
+minni wire claude-code
+```
+
+On **v0.2** (or for contributors working from source), wire from a checkout instead — `--from-repo` builds the payload with Node and installs it through the exact same gate:
 
 ```bash
 git clone https://github.com/infektyd/minni.git && cd minni
 make setup          # venv + deps + plugin build (a few minutes on first run)
-.venv/bin/python plugins/minni/skills/minni-install/scripts/propagate.py update-plugin --platform claude-code
+.venv/bin/minni wire claude-code --from-repo .
 ```
 
-Swap `--platform` for `codex`, `gemini`, `antigravity`, `grok`, `kilocode`, `generic`, or `all` (note: `all` covers codex, claude-code, kilocode, gemini, and grok — antigravity is wired individually). This registers the MCP server, the per-agent vault path, and that host's hook entrypoint; the agent-driven `minni-install` skill handles first-time identity and vault seeding. Per-runtime pages: [Claude Code](docs/runtimes/claude-code.md) · [Codex](docs/runtimes/codex.md) · [Gemini / Antigravity](docs/runtimes/gemini.md) · [Grok](docs/runtimes/grok.md).
+Swap the platform for `codex`, `kilocode`, `grok`, `generic`, or `all` (`all` covers codex, claude-code, kilocode, and grok; gemini wiring is provisional and skipped with a warning, and antigravity/`generic` are always wired individually — for Gemini today, use the repo's `propagate.py update-plugin --platform gemini`). Every wire ends with verification probes — an MCP handshake against the installed server, a hook dry-run, and a config readback — and the same checks live on in `minni doctor`. Old payload versions are garbage-collected only when no agent's config still references them; `--use-version` re-wires a platform to a previous install for rollback. This registers the MCP server, the per-agent vault path, and that host's hook entrypoint; the agent-driven `minni-install` skill handles first-time identity and vault seeding. Per-runtime pages: [Claude Code](docs/runtimes/claude-code.md) · [Codex](docs/runtimes/codex.md) · [Gemini / Antigravity](docs/runtimes/gemini.md) · [Grok](docs/runtimes/grok.md).
 
 ### Poke at it
 
@@ -143,7 +151,7 @@ Request flow: agent → MCP plugin → Unix socket → daemon → identity gate 
 
 ## Status
 
-Minni is at **v0.2**, live on [PyPI](https://pypi.org/project/minni/): the daemon and CLI install with one `pipx install minni`, releases publish via OIDC trusted publishing from tagged builds, and hook support covers Claude Code, Codex, Gemini / Antigravity, Grok, and Kilo Code. Agent wiring still requires a repo checkout — packaging that away ([`minni wire`](https://github.com/infektyd/minni/issues/142)) is the headline for v0.3. Interfaces can still change before 1.0, adoption is small, and the public contract is intentionally smaller than the implementation.
+Minni is at **v0.2**, live on [PyPI](https://pypi.org/project/minni/): the daemon and CLI install with one `pipx install minni`, releases publish via OIDC trusted publishing from tagged builds, and hook support covers Claude Code, Codex, Gemini / Antigravity, Grok, and Kilo Code. The v0.3 headline — [`minni wire <platform>`](https://github.com/infektyd/minni/issues/142), agents wiring themselves from a wheel-shipped plugin payload with no repo checkout — has landed on `main` (versioned installs under `~/.minni/plugin/`, post-wire verification probes, reference-aware GC, rollback via `--use-version`); the payload ships inside wheels starting with the v0.3 release, and until then wheel installs wire via `--from-repo`. Interfaces can still change before 1.0, adoption is small, and the public contract is intentionally smaller than the implementation.
 
 What "works" is not asserted, it is *executed in public*: CI stands the daemon up from nothing on a clean Linux runner and proves status, recall, and home-directory isolation on every push — the same check `minni doctor` gives you locally. A benchmark harness (`bench/membench`, byte-reproducible scorecards) exists, but no headline numbers are published until real-model runs are: when in doubt, this project under-claims. In that spirit: the core multi-agent loop — multiple approved agents sharing one governed daemon — is dogfooded daily (Minni is developed using Minni), while the temporary-team orchestration surface (`minni_team_*`) has unit tests but no real-world mileage yet.
 

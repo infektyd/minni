@@ -4,8 +4,12 @@ Wire Claude Code to a running Minni daemon from your checkout:
 
 ```bash
 .venv/bin/minni up   # if the daemon isn't already running
-.venv/bin/python plugins/minni/skills/minni-install/scripts/propagate.py update-plugin --platform claude-code
+minni wire claude-code                                   # v0.3+ wheel (bundled payload)
+.venv/bin/minni wire claude-code --from-repo .           # v0.2 wheel / source checkout
 ```
+
+(`propagate.py update-plugin --platform claude-code` from the checkout still works as
+the legacy path.)
 
 This registers the MCP server (`plugins/minni/.claude-plugin/`), pins the
 agent identity (`MINNI_AGENT_ID=claude-code`), the per-agent vault

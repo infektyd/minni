@@ -4,8 +4,12 @@ Wire Codex to a running Minni daemon from your checkout:
 
 ```bash
 .venv/bin/minni up   # if the daemon isn't already running
-.venv/bin/python plugins/minni/skills/minni-install/scripts/propagate.py update-plugin --platform codex
+minni wire codex                                   # v0.3+ wheel (bundled payload)
+.venv/bin/minni wire codex --from-repo .           # v0.2 wheel / source checkout
 ```
+
+(`propagate.py update-plugin --platform codex` from the checkout still works as
+the legacy path.)
 
 This installs the Codex adapter (`plugins/minni/.codex-plugin/` — plugin
 manifest, hooks, and MCP config) with agent identity `codex` and vault

@@ -28,14 +28,20 @@ def _run(cmd: list[str], cwd: Path) -> None:
 
 
 def build_from_repo(repo_root: Path) -> tuple[Path, PayloadManifest]:
+    # Resolve first: a relative --from-repo (e.g. ".") would otherwise produce
+    # relative script paths that node resolves against the plugin cwd.
+    repo_root = repo_root.expanduser().resolve()
     plugin_dir = repo_root / "plugins" / "minni"
     if not plugin_dir.is_dir():
         raise ValueError(f"no plugins/minni under {repo_root}")
 
-    _run(["npm", "run", "build:server"], cwd=plugin_dir)
-    bundle_script = plugin_dir / "scripts" / "bundle_server.mjs"
-    if bundle_script.exists():
-        _run(["node", str(bundle_script)], cwd=plugin_dir)
+    try:
+        _run(["npm", "run", "build:server"], cwd=plugin_dir)
+        bundle_script = plugin_dir / "scripts" / "bundle_server.mjs"
+        if bundle_script.exists():
+            _run(["node", str(bundle_script)], cwd=plugin_dir)
+    except (subprocess.CalledProcessError, FileNotFoundError) as exc:
+        raise ValueError(f"--from-repo build failed in {plugin_dir}: {exc}") from exc
 
     version = dev_version(repo_root)
     tmp = Path(tempfile.mkdtemp(prefix="minni-from-repo-"))
