@@ -169,10 +169,11 @@ const SECRET_PREFIX_RE = new RegExp(
 // GitHub Actions' `id-token: write`) deliberately do not match. Two value
 // shapes count: a QUOTED value of 8+ chars (any charset — covers passwords
 // with punctuation/spaces like `password: "aB3!dE5@gH7#jK9%"`), or an
-// unquoted 12+ char run that carries at least one digit (so a prose word
-// after a colon — "token: authentication" — stays clean).
+// unquoted 8+ char run carrying a digit or password-style symbol
+// (`password=P@ssw0rd!`, `password=Hunter22`) — hyphenated prose after a
+// colon ("token: authentication-related") has neither and stays clean.
 const SECRET_ASSIGNMENT_RE =
-  /(secret|passwd|password|token|api[_ -]?key|private[_ -]?key|credential)s?["']?\s*[:=]\s*(?:["'][^"'\n]{8,}["']|(?=[^\s"']*[0-9])[^\s"']{12,})/i;
+  /(secret|passwd|password|token|api[_ -]?key|private[_ -]?key|credential)s?["']?\s*[:=]\s*(?:["'][^"'\n]{8,}["']|(?=[^\s"']*[0-9!@#$%^&*?~+=])[^\s"']{8,})/i;
 
 function shannonEntropyPerChar(s: string): number {
   const counts = new Map<string, number>();

@@ -61,6 +61,9 @@ test("credential keyword assigned an opaque literal blocks; bare mention does no
   assert.notEqual(detectSecretMaterial('password: "aB3!dE5@gH7#jK9%"'), null);
   assert.notEqual(detectSecretMaterial('secret = "horse battery staple correct"'), null);
   assert.notEqual(detectSecretMaterial('"api_key": "h8f3kd92mfp1qz7w"'), null);
+  // Codex P1 round 2 (PR #146): short unquoted plaintext assignments.
+  assert.notEqual(detectSecretMaterial("password=P@ssw0rd!"), null);
+  assert.notEqual(detectSecretMaterial("password=Hunter22"), null);
   // GitHub Actions permission syntax — keyword + colon but no opaque literal.
   assert.equal(detectSecretMaterial("permissions:\n  id-token: write"), null);
   assert.equal(detectSecretMaterial("the token was revoked yesterday"), null);
