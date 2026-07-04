@@ -518,3 +518,22 @@ def test_wire_generic_preserves_existing_mcp_entries(wire_env, monkeypatch):
     assert doc["topLevelSetting"] is True
     assert doc["mcpServers"]["other"]["command"] == "other-server"
     assert "minni" in doc["mcpServers"]
+
+
+def test_wire_from_repo_relative_path_resolved(wire_env, monkeypatch):
+    """Codex review (PR #145): a relative --from-repo must be resolved before
+    config stamping — native_afm_env(repo_root) otherwise stamps a relative
+    MINNI_AFM_NATIVE_HELPER that breaks when the host launches the server
+    from its own cwd."""
+    _patch_payload(wire_env, monkeypatch)
+    home = wire_env[0]
+    captured = {}
+
+    def fake_afm_env(repo_root):
+        captured["repo_root"] = repo_root
+        return {}
+
+    monkeypatch.setattr("minni.wire.flow.native_afm_env", fake_afm_env)
+    rc = run_wire(_args("claude-code", home, from_repo="."))
+    assert rc == 0
+    assert captured["repo_root"].is_absolute()
