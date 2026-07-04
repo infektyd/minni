@@ -11,7 +11,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "minni"
-version = "0.2.0"
+version = "0.3.0"
 description = "Minni (ᛗ): local-first, multi-agent memory daemon — recall is evidence, not instruction."
 readme = { text = "Minni is a local-first, multi-agent memory daemon. Full documentation: https://github.com/infektyd/minni", content-type = "text/markdown" }
 requires-python = ">=3.14"
@@ -77,6 +77,11 @@ minni = [
     "native_afm_helper.swift",
     "openclaw-tool.sh",
     "plugin_payload/*",
+    # setuptools' `*` does not match a leading dot — dotFILES need explicit
+    # entries or they silently drop from the wheel (caught by the release
+    # workflow's wheel-verification step, 2026-07-04).
+    "plugin_payload/.mcp.json",
+    "plugin_payload/.kilocode-plugin/.mcp.json",
     "plugin_payload/dist/*",
     "plugin_payload/hooks/*",
     "plugin_payload/.claude-plugin/*",

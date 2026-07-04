@@ -232,3 +232,12 @@ def test_wired_upsert_concurrent_writers_no_lost_update(home):
     platforms = {w["platform"] for w in data["wires"]}
     assert platforms == {f"platform-{i}" for i in range(n)}
     assert data["generation"] == n
+
+
+def test_load_json_empty_file_is_empty_doc(tmp_path):
+    """A zero-byte config must read as {}, not raise 'Expecting value'."""
+    from minni.wire.writers import load_json
+
+    empty = tmp_path / "config.json"
+    empty.touch()
+    assert load_json(empty) == {}

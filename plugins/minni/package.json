@@ -1,6 +1,6 @@
 {
   "name": "minni-multi-plugin",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Local multi-target plugin bridge for Minni (Codex, Claude Code, Gemini, KiloCode).",
   "license": "MIT",
   "repository": {

@@ -45,10 +45,37 @@ jobs:
       - name: Release gate — fast check
         run: make check
 
-      - name: Build Python sdist + wheel
+      - name: Stage plugin payload (v0.3+: the wheel ships the agent wiring)
+        run: make stage-payload
+
+      - name: Build Python sdist + wheel (payload-gated)
         run: |
           .venv/bin/python -m pip install build
+          # Fail hard if staging didn't produce a manifest matching pyproject —
+          # no wheel ever ships stale or missing payload (hardened-design §4.3).
+          test -f src/minni/plugin_payload/payload-manifest.json || {
+            echo "missing payload-manifest.json — stage-payload did not run"; exit 1; }
+          PY_V="$(.venv/bin/python -c "import tomllib;print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")"
+          M_V="$(.venv/bin/python -c "import json;print(json.load(open('src/minni/plugin_payload/payload-manifest.json'))['version'])")"
+          test "$PY_V" = "$M_V" || { echo "payload manifest $M_V != pyproject $PY_V"; exit 1; }
           .venv/bin/python -m build --outdir release-artifacts
+
+      - name: Verify wheel carries the full payload
+        run: |
+          .venv/bin/python - <<'EOF'
+          import json, sys, zipfile
+          from pathlib import Path
+          wheel = next(Path("release-artifacts").glob("minni-*.whl"))
+          names = set(zipfile.ZipFile(wheel).namelist())
+          manifest = json.load(open("src/minni/plugin_payload/payload-manifest.json"))
+          missing = [
+              rel for rel in manifest["files"]
+              if f"minni/plugin_payload/{rel}" not in names
+          ]
+          if missing:
+              sys.exit(f"wheel is missing {len(missing)} payload file(s), e.g. {missing[:5]}")
+          print(f"wheel carries all {len(manifest['files'])} payload files")
+          EOF
 
       - name: Build npm package tarball
         working-directory: plugins/minni
