@@ -57,9 +57,15 @@ test("well-known secret prefixes block", () => {
 test("credential keyword assigned an opaque literal blocks; bare mention does not", () => {
   assert.notEqual(detectSecretMaterial("api_key = h8f3kd92mfp1qz7w"), null);
   assert.notEqual(detectSecretMaterial('password: "correcthorsebatterystaple"'), null);
+  // Codex P1 (PR #146): punctuation-bearing and quoted-with-spaces values.
+  assert.notEqual(detectSecretMaterial('password: "aB3!dE5@gH7#jK9%"'), null);
+  assert.notEqual(detectSecretMaterial('secret = "horse battery staple correct"'), null);
+  assert.notEqual(detectSecretMaterial('"api_key": "h8f3kd92mfp1qz7w"'), null);
   // GitHub Actions permission syntax — keyword + colon but no opaque literal.
   assert.equal(detectSecretMaterial("permissions:\n  id-token: write"), null);
   assert.equal(detectSecretMaterial("the token was revoked yesterday"), null);
+  // Unquoted prose word after a colon must not match (no digit).
+  assert.equal(detectSecretMaterial("token: authentication-related notes"), null);
 });
 
 test("high-entropy opaque strings block; SHAs, digests, paths, URLs do not", () => {

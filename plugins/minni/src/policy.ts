@@ -166,10 +166,13 @@ const SECRET_PREFIX_RE = new RegExp(
 
 // A credential keyword directly assigned an opaque literal (`api_key = h8f…`).
 // Keyword mentions WITHOUT an assigned literal ("the token was revoked",
-// GitHub Actions' `id-token: write`) deliberately do not match: the assigned
-// value must be 12+ opaque chars.
+// GitHub Actions' `id-token: write`) deliberately do not match. Two value
+// shapes count: a QUOTED value of 8+ chars (any charset — covers passwords
+// with punctuation/spaces like `password: "aB3!dE5@gH7#jK9%"`), or an
+// unquoted 12+ char run that carries at least one digit (so a prose word
+// after a colon — "token: authentication" — stays clean).
 const SECRET_ASSIGNMENT_RE =
-  /(secret|passwd|password|token|api[_ -]?key|private[_ -]?key|credential)s?["']?\s*[:=]\s*["']?[A-Za-z0-9+/_.=-]{12,}/i;
+  /(secret|passwd|password|token|api[_ -]?key|private[_ -]?key|credential)s?["']?\s*[:=]\s*(?:["'][^"'\n]{8,}["']|(?=[^\s"']*[0-9])[^\s"']{12,})/i;
 
 function shannonEntropyPerChar(s: string): number {
   const counts = new Map<string, number>();
