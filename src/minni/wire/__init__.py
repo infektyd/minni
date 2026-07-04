@@ -1,0 +1,1 @@
+"""Wheel-shipped plugin wiring for `minni wire <platform>` (issue #142)."""

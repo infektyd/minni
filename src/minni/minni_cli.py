@@ -7,6 +7,7 @@ Unix socket is.
     minni up        start the daemon in the background
     minni status    show daemon and engine health in plain language
     minni doctor    verify the install end to end (same probes as CI's smoke)
+    minni wire      wire the plugin payload to an agent platform
     minni down      stop the daemon
 
 Packaging-only surface (PACKAGING_PLAN.md §3): this module is stdlib-only and
@@ -250,6 +251,11 @@ def _check(label: str, ok: bool, detail: str) -> bool:
     return ok
 
 
+def cmd_wire(args: argparse.Namespace) -> int:
+    from minni.wire.flow import run_wire
+    return run_wire(args)
+
+
 def cmd_doctor(args: argparse.Namespace) -> int:
     sock = Path(args.socket)
     print("minni doctor — verifying the install")
@@ -334,12 +340,44 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("doctor",
                    help="verify the install (same probes as CI's smoke test)")
 
+    wire = sub.add_parser("wire", help="wire plugin payload to an agent platform")
+    wire.add_argument("platform", help="codex, claude-code, kilocode, grok, gemini, "
+                      "antigravity, generic, or all")
+    wire.add_argument("--agent", help="agent id (required for generic)")
+    wire.add_argument("--workspace", help="workspace path for MINNI_WORKSPACE_ID")
+    wire.add_argument("--install-root", help="override install/config root (required for generic)")
+    wire.add_argument("--dry-run", action="store_true",
+                      help="show actions without writing")
+    wire.add_argument("--verify-payload", action="store_true",
+                      help="verify payload file hashes")
+    wire.add_argument("--prune", action="store_true",
+                      help="prune old version dirs without prompting")
+    wire.add_argument("--no-prune", action="store_true",
+                      help="skip GC entirely")
+    wire.add_argument("--force-reinstall", action="store_true",
+                      help="quarantine hash-mismatched version dir and reinstall")
+    wire.add_argument("--from-repo", metavar="PATH",
+                      help="build payload from repo checkout (dev escape hatch)")
+    wire.add_argument("--use-version", metavar="VER",
+                      help="re-wire configs against an already-installed version dir")
+
     args = parser.parse_args(argv)
     if not args.command:
         parser.print_help()
         return 0
+
+    if args.command == "wire":
+        if getattr(args, "from_repo", None) and getattr(args, "use_version", None):
+            print("minni wire: --from-repo and --use-version are mutually exclusive",
+                  file=sys.stderr)
+            return 2
+        if getattr(args, "prune", False) and getattr(args, "no_prune", False):
+            print("minni wire: --prune and --no-prune are mutually exclusive",
+                  file=sys.stderr)
+            return 2
+
     dispatch = {"up": cmd_up, "down": cmd_down,
-                "status": cmd_status, "doctor": cmd_doctor}
+                "status": cmd_status, "doctor": cmd_doctor, "wire": cmd_wire}
     return dispatch[args.command](args)
 
 

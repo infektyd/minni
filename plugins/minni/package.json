@@ -32,6 +32,7 @@
   "scripts": {
     "build": "tsc && vite build",
     "build:server": "tsc",
+    "build:server:bundle": "node scripts/bundle_server.mjs",
     "build:frontend": "vite build",
     "dev:frontend": "vite --host 127.0.0.1",
     "typecheck": "tsc --noEmit",
@@ -60,6 +61,7 @@
     "@types/react": "^19.2.15",
     "@types/react-dom": "^19.2.3",
     "@vitejs/plugin-react": "^6.0.3",
+    "esbuild": "^0.28.1",
     "eslint": "^10.6.0",
     "eslint-plugin-react-hooks": "^7.1.1",
     "globals": "^17.7.0",
