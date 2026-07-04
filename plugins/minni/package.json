@@ -32,6 +32,7 @@
   "scripts": {
     "build": "tsc && vite build",
     "build:server": "tsc",
+    "build:server:bundle": "node scripts/bundle_server.mjs",
     "build:frontend": "vite build",
     "dev:frontend": "vite --host 127.0.0.1",
     "typecheck": "tsc --noEmit",
@@ -65,6 +66,7 @@
     "globals": "^17.7.0",
     "typescript": "^6.0.3",
     "typescript-eslint": "^8.62.1",
+    "esbuild": "^0.25.0",
     "vite": "^8.1.2"
   }
 }

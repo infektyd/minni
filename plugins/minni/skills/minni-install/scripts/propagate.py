@@ -47,10 +47,47 @@ def normalize_workspace_id(value: str | None) -> str:
 
 DEFAULT_DB = Path("~/.minni/minni.db").expanduser()
 DEFAULT_SOCKET = Path("~/.minni/run/minnid.sock").expanduser()
-DEFAULT_PLUGIN_CLI = Path(
-    "~/.codex/plugins/cache/minni/minni/0.1.0/dist/cli.js"
-).expanduser()
 DEFAULT_IDENTITY_ROOT = Path("~/.minni/identities").expanduser()
+
+
+def plugin_version_segment() -> str:
+    """Resolve the wired plugin version without hardcoded path literals.
+
+    The `current` symlink is authoritative: the wired version and the installed
+    pip package version legitimately diverge (--use-version rollback, --from-repo
+    dev builds), so the package version is only a fallback for hosts where
+    nothing has been wired yet.
+    """
+    current = Path("~/.minni/plugin/current").expanduser()
+    try:
+        if current.is_symlink():
+            return Path(os.readlink(current)).name
+        if current.exists():
+            return current.name
+    except OSError:
+        pass
+    try:
+        import importlib.metadata
+        return importlib.metadata.version("minni")
+    except Exception:
+        pass
+    raise SystemExit(
+        "Cannot determine plugin version; install minni or run minni wire first"
+    )
+
+
+def default_plugin_cli() -> Path:
+    """CLI entrypoint path derived from the wired install root."""
+    version = plugin_version_segment()
+    wired = Path(f"~/.minni/plugin/{version}/dist/cli.js").expanduser()
+    if wired.exists():
+        return wired
+    codex = Path(
+        f"~/.codex/plugins/cache/minni/minni/{version}/dist/cli.js"
+    ).expanduser()
+    if codex.exists():
+        return codex
+    return Path("~/.minni/plugin/current/dist/cli.js").expanduser()
 DEFAULT_REPO_ROOT = Path.home() / "Projects" / "minni"
 
 # Antigravity (CLI `agy` + IDE + antigravity) share the ~/.gemini tree and use
@@ -461,12 +498,13 @@ def update_kilo_config(server_path: Path, agent: str, vault: Path, socket_path: 
     write_json(path, data)
 
 
-def update_gemini_manifest(install_root: Path, agent: str, vault: Path, socket_path: Path, workspace: Path, afm_env: dict[str, str] | None = None) -> None:
+def update_gemini_manifest(install_root: Path, agent: str, vault: Path, socket_path: Path, workspace: Path, afm_env: dict[str, str] | None = None, *, version: str | None = None) -> None:
+    stamped_version = version or plugin_version_segment()
     write_json(
         install_root / "gemini-extension.json",
         {
             "name": "minni",
-            "version": "0.1.0",
+            "version": stamped_version,
             "mcpServers": {
                 "minni": {
                     "command": "node",
@@ -810,16 +848,30 @@ def update_toml_mcp_config(path: Path, server_path: Path, agent: str, vault: Pat
 def platform_spec(platform: str, repo_root: Path, install_root: str | None = None) -> dict[str, object]:
     platform = canonical_platform(platform)
     home = Path.home()
+    try:
+        version_seg = plugin_version_segment()
+    except SystemExit:
+        version_seg = None
+    codex_install = (
+        home / ".codex/plugins/cache/minni/minni" / version_seg
+        if version_seg
+        else home / ".codex/plugins/cache/minni/minni" / "current"
+    )
+    claude_install = (
+        home / ".claude/plugins/cache/minni/minni" / version_seg
+        if version_seg
+        else home / ".claude/plugins/cache/minni/minni" / "current"
+    )
     specs: dict[str, dict[str, object]] = {
         "codex": {
             "agent": "codex",
-            "install": home / ".codex/plugins/cache/minni/minni/0.1.0",
+            "install": codex_install,
             "config": home / ".codex/config.toml",
             "config_kind": "toml",
         },
         "claude-code": {
             "agent": "claude-code",
-            "install": home / ".claude/plugins/cache/minni/minni/0.1.0",
+            "install": claude_install,
             "config": home / ".claude.json",
             "config_kind": "claude-json",
         },
@@ -1218,6 +1270,10 @@ def status(args: argparse.Namespace) -> int:
     db_path = Path(args.db).expanduser()
     socket_path = Path(args.socket).expanduser()
     vault = vault_for(agent)
+    try:
+        plugin_cli = default_plugin_cli()
+    except SystemExit:
+        plugin_cli = None
     info: dict[str, object] = {
         "agent": agent,
         "db": str(db_path),
@@ -1229,8 +1285,8 @@ def status(args: argparse.Namespace) -> int:
         "vault_exists": vault.exists(),
         "vault_is_symlink": vault.is_symlink(),
         "vault_is_actual_directory": vault.exists() and vault.is_dir() and not vault.is_symlink(),
-        "plugin_cli": str(DEFAULT_PLUGIN_CLI),
-        "plugin_cli_exists": DEFAULT_PLUGIN_CLI.exists(),
+        "plugin_cli": str(plugin_cli) if plugin_cli else None,
+        "plugin_cli_exists": plugin_cli.exists() if plugin_cli else False,
     }
     if db_path.exists():
         with sqlite3.connect(db_path) as conn:

@@ -79,6 +79,9 @@ faiss/
 archives/downloads/
 archives/legacy-vaults/
 
+# Wheel-staged plugin payload (release-time only; §4.2)
+src/minni/plugin_payload/
+
 # Local plugin build/runtime state
 plugins/*/node_modules/
 plugins/*/dist/

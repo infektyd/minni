@@ -135,3 +135,50 @@ def test_status_unreachable_exits_nonzero(tmp_path, capsys):
 def test_no_command_prints_help(capsys):
     assert minni_cli.main([]) == 0
     assert "doctor" in capsys.readouterr().out
+
+
+def test_wire_from_repo_use_version_mutually_exclusive(capsys):
+    rc = minni_cli.main([
+        "wire", "claude-code",
+        "--from-repo", "/tmp/x",
+        "--use-version", "1.2.3",
+    ])
+    assert rc == 2
+    assert (
+        capsys.readouterr().err.strip()
+        == "minni wire: --from-repo and --use-version are mutually exclusive"
+    )
+
+
+def test_wire_prune_no_prune_mutually_exclusive(capsys):
+    rc = minni_cli.main(["wire", "claude-code", "--prune", "--no-prune"])
+    assert rc == 2
+    assert (
+        capsys.readouterr().err.strip()
+        == "minni wire: --prune and --no-prune are mutually exclusive"
+    )
+
+
+def test_wire_cli_happy_path(monkeypatch, capsys):
+    captured: dict[str, object] = {}
+
+    def fake_run_wire(args):
+        captured["platform"] = args.platform
+        captured["dry_run"] = args.dry_run
+        captured["verify_payload"] = args.verify_payload
+        print(json.dumps({
+            "schema": 1,
+            "status": "dry-run",
+            "payload_version": None,
+            "install_root": None,
+            "results": [],
+            "gc": {},
+        }))
+        return 0
+
+    monkeypatch.setattr("minni.wire.flow.run_wire", fake_run_wire)
+    rc = minni_cli.main(["wire", "claude-code", "--dry-run", "--verify-payload"])
+    assert rc == 0
+    assert captured["platform"] == "claude-code"
+    assert captured["dry_run"] is True
+    assert captured["verify_payload"] is True

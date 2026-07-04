@@ -1,6 +1,6 @@
 {
   "name": "minni",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Local-first Minni spine for KiloCode: automatic recall, vault-first learning, agent-to-agent handoff, and continuity across sessions.",
   "author": {
     "name": "Infektyd",

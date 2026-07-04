@@ -192,3 +192,23 @@ bench-repro:
 .PHONY: bench-test
 bench-test:
 	$(PYTHON) -m pytest -q $(BENCH_DIR)
+
+# ── Wheel payload staging (issue #142) ─────────────────────────────────────
+.PHONY: stage-payload release-wheel check-versions
+stage-payload:
+	cd $(PLUGIN_DIR) && npm ci && npm run build:server && npm run build:server:bundle
+	$(VENV_PY) scripts/stage_payload.py
+
+release-wheel: stage-payload
+	@test -f src/minni/plugin_payload/payload-manifest.json || \
+	  (echo "release-wheel: missing payload-manifest.json — run make stage-payload first" >&2; exit 1)
+	@$(VENV_PY) -c "import json,re,sys; \
+	  v=re.search(r'^version\\s*=\\s*[\"\\']([^\"\\']+)[\"\\']', \
+	  open('pyproject.toml').read(), re.M).group(1); \
+	  m=json.load(open('src/minni/plugin_payload/payload-manifest.json')); \
+	  sys.exit(0 if m.get('version')==v else \
+	  (_ for _ in ()).throw(SystemExit(f'release-wheel: manifest version {m.get(\"version\")!r} != pyproject {v!r}')))"
+	$(VENV_PY) -m build
+
+check-versions:
+	$(VENV_PY) scripts/check_versions.py
