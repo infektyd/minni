@@ -38,15 +38,22 @@ GEMINI_PROVISIONAL_REASON = (
     "gemini extension-manifest wiring is not yet implemented (open question 8)"
 )
 
-# Ordered config-root candidates for preflight probes (§6.4).
-CONFIG_ROOT_CANDIDATES: dict[str, tuple[Path, ...]] = {
-    "codex": (Path("~/.codex").expanduser(),),
-    "claude-code": (Path("~/.claude.json").expanduser().parent,),
-    "kilocode": (Path("~/.config/kilo").expanduser(),),
-    "grok": (Path("~/.grok").expanduser(),),
-    "gemini": (Path("~/.gemini").expanduser(),),
-    "antigravity": (Path("~/.gemini").expanduser(),),
-}
+def config_root_candidates() -> dict[str, tuple[Path, ...]]:
+    """Ordered config-root candidates for preflight probes (§6.4).
+
+    Computed per call from the current HOME — never at import time — so a
+    caller (or sandboxed test) that sets HOME after import probes the right
+    home, matching platform_spec()'s late binding.
+    """
+    home = Path(os.environ.get("HOME") or Path.home())
+    return {
+        "codex": (home / ".codex",),
+        "claude-code": (home,),
+        "kilocode": (home / ".config/kilo",),
+        "grok": (home / ".grok",),
+        "gemini": (home / ".gemini",),
+        "antigravity": (home / ".gemini",),
+    }
 
 HOOK_ENTRYPOINTS: dict[str, str] = {
     "claude-code": "dist/hook.js",
@@ -157,7 +164,7 @@ def default_config_scan_paths() -> dict[str, Path]:
 
 
 def config_root_exists(platform: str) -> tuple[bool, list[str]]:
-    candidates = CONFIG_ROOT_CANDIDATES.get(canonical_platform(platform), ())
+    candidates = config_root_candidates().get(canonical_platform(platform), ())
     probed = [str(p) for p in candidates]
     ok = any(p.exists() for p in candidates) if candidates else True
     return ok, probed

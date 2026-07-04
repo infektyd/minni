@@ -489,3 +489,32 @@ def test_wire_from_repo_integration():
 @pytest.mark.skip(reason="CI-only, needs isolated environment without Node")
 def test_bundle_smoke_no_node_modules():
     """§9.2: staging bundle smoke in empty temp dir."""
+
+def test_wire_dry_run_leaves_no_plugin_state(wire_env, monkeypatch):
+    """Codex review (PR #144): --dry-run must not create ~/.minni/plugin or locks."""
+    _patch_payload(wire_env, monkeypatch)
+    home = wire_env[0]
+    rc = run_wire(_args("claude-code", home, dry_run=True))
+    assert rc == 0
+    assert not (home / ".minni" / "plugin").exists()
+
+
+def test_wire_generic_preserves_existing_mcp_entries(wire_env, monkeypatch):
+    """Codex review (PR #144): wiring must merge into .mcp.json, not replace it."""
+    _patch_payload(wire_env, monkeypatch)
+    home = wire_env[0]
+    root = home / "custom"
+    root.mkdir()
+    (root / ".mcp.json").write_text(
+        json.dumps({
+            "mcpServers": {"other": {"command": "other-server", "args": []}},
+            "topLevelSetting": True,
+        }),
+        encoding="utf-8",
+    )
+    rc = run_wire(_args("generic", home, agent="testagent", install_root=str(root)))
+    assert rc == 0
+    doc = json.loads((root / ".mcp.json").read_text(encoding="utf-8"))
+    assert doc["topLevelSetting"] is True
+    assert doc["mcpServers"]["other"]["command"] == "other-server"
+    assert "minni" in doc["mcpServers"]

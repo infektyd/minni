@@ -60,8 +60,24 @@ def _install_locked(
 ) -> InstallResult:
     src_root = payload_src
     base = plugin_base()
-    base.mkdir(parents=True, exist_ok=True)
     target = base / version
+
+    if dry_run:
+        # Read-only probe: a dry run must leave no state behind — no base dir,
+        # no lock file. Mirrors the locked branches below without writing.
+        if target.exists():
+            mismatched = hash_mismatches(manifest, target)
+            if not mismatched:
+                return InstallResult(install_root=target, version=version, skipped=True)
+            if not force_reinstall:
+                raise HashMismatchError(version, mismatched)
+            return InstallResult(
+                install_root=target, version=version, skipped=False,
+                quarantined=str(quarantine_dir(version)),
+            )
+        return InstallResult(install_root=target, version=version, skipped=False)
+
+    base.mkdir(parents=True, exist_ok=True)
 
     lock_path = install_lock_path(version)
     lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
@@ -73,22 +89,11 @@ def _install_locked(
                 return InstallResult(install_root=target, version=version, skipped=True)
             if not force_reinstall:
                 raise HashMismatchError(version, mismatched)
-            if dry_run:
-                return InstallResult(
-                    install_root=target, version=version, skipped=False,
-                    quarantined=str(quarantine_dir(version)),
-                )
             qdir = quarantine_dir(version)
             target.rename(qdir)
             result_quarantine = str(qdir)
         else:
             result_quarantine = None
-
-        if dry_run:
-            return InstallResult(
-                install_root=target, version=version, skipped=False,
-                quarantined=result_quarantine,
-            )
 
         stage = staging_dir(version)
         try:

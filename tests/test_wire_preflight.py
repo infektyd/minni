@@ -48,7 +48,7 @@ def test_check_config_root_missing(tmp_path, monkeypatch):
     home = tmp_path / "home"
     home.mkdir()
     codex_root = home / ".codex"
-    monkeypatch.setitem(wire_platform.CONFIG_ROOT_CANDIDATES, "codex", (codex_root,))
+    monkeypatch.setenv("HOME", str(home))
     ok, msg = check_config_root("codex")
     assert ok is False
     assert "no config root found for codex" in msg
@@ -58,8 +58,7 @@ def test_check_config_root_missing(tmp_path, monkeypatch):
 def test_preflight_platform_config_root_missing(tmp_path, monkeypatch):
     home = tmp_path / "home"
     home.mkdir()
-    kilo_root = home / ".config" / "kilo"
-    monkeypatch.setitem(wire_platform.CONFIG_ROOT_CANDIDATES, "kilocode", (kilo_root,))
+    monkeypatch.setenv("HOME", str(home))
     monkeypatch.setattr(
         "minni.wire.preflight.check_node", lambda min_version=20: (True, "v22.0.0"),
     )
@@ -73,7 +72,20 @@ def test_check_config_root_present(tmp_path, monkeypatch):
     home.mkdir()
     codex_root = home / ".codex"
     codex_root.mkdir()
-    monkeypatch.setitem(wire_platform.CONFIG_ROOT_CANDIDATES, "codex", (codex_root,))
+    monkeypatch.setenv("HOME", str(home))
     ok, msg = check_config_root("codex")
     assert ok is True
     assert msg == ""
+
+
+def test_config_root_candidates_follow_current_home(tmp_path, monkeypatch):
+    # Regression: candidates must be computed per call, not at import time —
+    # CI sandboxes set HOME long after the module is imported.
+    home_a = tmp_path / "a"
+    home_b = tmp_path / "b"
+    for home in (home_a, home_b):
+        (home / ".codex").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home_a))
+    assert wire_platform.config_root_candidates()["codex"] == (home_a / ".codex",)
+    monkeypatch.setenv("HOME", str(home_b))
+    assert wire_platform.config_root_candidates()["codex"] == (home_b / ".codex",)

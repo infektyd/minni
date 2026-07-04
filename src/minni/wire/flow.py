@@ -151,24 +151,35 @@ def _wire_platform(
     extras: dict[str, object] = {}
 
     mcp_target = (mcp_root or install_root) / ".mcp.json"
+    pre_doc: dict = {}
     pre_mcp_env: dict = {}
     if mcp_target.exists():
         try:
-            pre = load_json(mcp_target)
-            pre_mcp_env = pre.get("mcpServers", {}).get("minni", {}).get("env", {}) or {}
+            pre_doc = load_json(mcp_target)
+            pre_mcp_env = (
+                pre_doc.get("mcpServers", {}).get("minni", {}).get("env", {}) or {}
+            )
         except Exception:
+            pre_doc = {}
             pre_mcp_env = {}
 
     if not dry_run:
-        write_json(
-            mcp_target,
-            mcp_json(
-                server_path, agent, vault, socket, stamp_workspace,
-                pre_existing_env=pre_mcp_env,
-                explicit_workspace=explicit_workspace,
-                afm_env=afm_env,
-            ),
+        generated = mcp_json(
+            server_path, agent, vault, socket, stamp_workspace,
+            pre_existing_env=pre_mcp_env,
+            explicit_workspace=explicit_workspace,
+            afm_env=afm_env,
         )
+        # Merge into the existing document: only the minni entry is ours;
+        # unrelated MCP servers and top-level keys must survive a wire.
+        merged = dict(pre_doc) if isinstance(pre_doc, dict) else {}
+        servers = merged.get("mcpServers")
+        if not isinstance(servers, dict):
+            servers = {}
+        servers = dict(servers)
+        servers["minni"] = generated["mcpServers"]["minni"]
+        merged["mcpServers"] = servers
+        write_json(mcp_target, merged)
 
     config_path: Path | None = spec.config_path
     kind = spec.config_kind
