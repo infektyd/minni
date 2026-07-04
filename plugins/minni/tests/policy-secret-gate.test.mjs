@@ -83,6 +83,12 @@ test("high-entropy opaque strings block; SHAs, digests, paths, URLs do not", () 
     detectSecretMaterial("value zK9mQ2xVb7Rf4Wc8Ln3Jp6Ht1Dg5Ys0A found inline"),
     null,
   );
+  // Codex P2 round 6 (PR #146): one mid-string slash must not split a
+  // secret under the 24-char floor; only path-shaped spans (2+ slashes) split.
+  assert.notEqual(
+    detectSecretMaterial("pasted zK9mQ2xVb7Rf4W/c8Ln3Jp6Ht1Dg5Ys0A opaque"),
+    null,
+  );
   const benign = [
     // git SHA + sha256 digest: hex has no uppercase, must not match.
     "fixed in commit f398473b2c334af66d9e88a1b0c7e989c7e989bd",

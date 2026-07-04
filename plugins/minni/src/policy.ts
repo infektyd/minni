@@ -176,6 +176,14 @@ const SECRET_PREFIX_RE = new RegExp(
 // (`password: correcthorsebatterystaple`, `private key: abcdef…`). These
 // words followed by an assigned value are essentially never benign prose.
 //
+// KNOWN LIMITATION (accepted, tracked upstream of PR #146): an UNQUOTED
+// multi-word passphrase (`password: correct horse battery staple`) is
+// structurally indistinguishable from prose (`password: use a manager`) —
+// only its first word is consumed, and 7-char words pass. Quoted
+// passphrases block; catching unquoted ones requires semantics, and the
+// pre-#138 gate "caught" them only by blocking every sentence containing
+// these words, which is the exact false-positive trade #138 rejected.
+//
 // LOWER-RISK (token/api-key/credential): these appear constantly in benign
 // YAML/prose (`id-token: write`, "token: authentication-related"), so the
 // `:` branch additionally requires a digit or password-style symbol in the
@@ -217,11 +225,14 @@ export function detectSecretMaterial(content: string): string | null {
   // SRI checksums (`sha512-…`) are stripped first — high-entropy, not secret.
   const scannable = content.replace(SRI_CHECKSUM_RE, " ");
   for (const rawSpan of scannable.match(/[A-Za-z0-9+/_=-]{24,}/g) ?? []) {
-    // Evaluate "/"-separated segments, not the whole span: paths and URLs
-    // (`/Users/Hans/Projects/v2/…`, `github.com/Org/Repo/runs/123…`)
-    // decompose into short low-entropy segments, while a base64 secret that
-    // happens to contain a slash still yields a long high-entropy segment.
-    for (const span of rawSpan.split("/")) {
+    // Path-SHAPED spans (2+ slashes: `/Users/Hans/Projects/v2/…`,
+    // `github.com/Org/Repo/runs/123…`) are evaluated per "/"-segment, so
+    // they decompose into short low-entropy pieces. A span with 0-1 slashes
+    // is evaluated WHOLE — a single mid-string slash in a base64 secret
+    // must not split it under the 24-char floor and slip through.
+    const slashes = (rawSpan.match(/\//g) ?? []).length;
+    const spans = slashes >= 2 ? rawSpan.split("/") : [rawSpan];
+    for (const span of spans) {
       if (span.length < 24) continue;
       const hasLower = /[a-z]/.test(span);
       const hasUpper = /[A-Z]/.test(span);
