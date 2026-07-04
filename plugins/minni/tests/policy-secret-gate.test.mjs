@@ -64,6 +64,9 @@ test("credential keyword assigned an opaque literal blocks; bare mention does no
   // Codex P1 round 2 (PR #146): short unquoted plaintext assignments.
   assert.notEqual(detectSecretMaterial("password=P@ssw0rd!"), null);
   assert.notEqual(detectSecretMaterial("password=Hunter22"), null);
+  // Codex P1 round 3 (PR #146): alphabetic values under `=` config syntax.
+  assert.notEqual(detectSecretMaterial("password=correcthorsebatterystaple"), null);
+  assert.notEqual(detectSecretMaterial("api_key=abcdefghijklmnopqrstuvwx"), null);
   // GitHub Actions permission syntax — keyword + colon but no opaque literal.
   assert.equal(detectSecretMaterial("permissions:\n  id-token: write"), null);
   assert.equal(detectSecretMaterial("the token was revoked yesterday"), null);
@@ -82,6 +85,9 @@ test("high-entropy opaque strings block; SHAs, digests, paths, URLs do not", () 
     "wheel sha256=284d14881fdf1a58a70bebfb0dd92f5140f2253acb10524fc259b43065c023d1",
     "path /Users/hansaxelsson/Projects/Minni/plugins/minni/dist/server.js",
     "see https://github.com/infektyd/minni/actions/runs/28714837391",
+    // Codex P2 round 3 (PR #146): npm/pnpm SRI integrity checksums are
+    // public metadata, not secrets.
+    "lockfile pin: integrity sha512-3O4nQW8g5yFfV9m2pLcR7aK1dT6sX0bE9hJ2uI5oP8A=",
   ];
   for (const content of benign) {
     assert.equal(detectSecretMaterial(content), null, content.slice(0, 50));

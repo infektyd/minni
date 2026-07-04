@@ -166,14 +166,24 @@ const SECRET_PREFIX_RE = new RegExp(
 
 // A credential keyword directly assigned an opaque literal (`api_key = h8f…`).
 // Keyword mentions WITHOUT an assigned literal ("the token was revoked",
-// GitHub Actions' `id-token: write`) deliberately do not match. Two value
-// shapes count: a QUOTED value of 8+ chars (any charset — covers passwords
-// with punctuation/spaces like `password: "aB3!dE5@gH7#jK9%"`), or an
-// unquoted 8+ char run carrying a digit or password-style symbol
-// (`password=P@ssw0rd!`, `password=Hunter22`) — hyphenated prose after a
-// colon ("token: authentication-related") has neither and stays clean.
+// GitHub Actions' `id-token: write`) deliberately do not match. Value shapes
+// that count:
+// - QUOTED value of 8+ chars, any charset, either separator — covers
+//   passwords with punctuation/spaces (`password: "aB3!dE5@gH7#jK9%"`).
+// - `=`-assigned unquoted value of 8+ chars, ANY charset — `=` is config
+//   syntax, not prose, so `password=correcthorsebatterystaple` and
+//   `api_key=abcdefghijklmnopqrstuvwx` block without needing digits.
+// - `:`-assigned unquoted value of 8+ chars carrying a digit or
+//   password-style symbol — the colon appears in prose and YAML
+//   (`id-token: write`, "token: authentication-related"), so plain words
+//   after a colon stay clean while `password: Hunter22` blocks.
 const SECRET_ASSIGNMENT_RE =
-  /(secret|passwd|password|token|api[_ -]?key|private[_ -]?key|credential)s?["']?\s*[:=]\s*(?:["'][^"'\n]{8,}["']|(?=[^\s"']*[0-9!@#$%^&*?~+=])[^\s"']{8,})/i;
+  /(secret|passwd|password|token|api[_ -]?key|private[_ -]?key|credential)s?["']?\s*(?:=\s*(?:["'][^"'\n]{8,}["']|[^\s"']{8,})|:\s*(?:["'][^"'\n]{8,}["']|(?=[^\s"']*[0-9!@#$%^&*?~+=])[^\s"']{8,}))/i;
+
+// Public integrity checksums (npm/pnpm SRI: `sha512-…=`) are high-entropy but
+// not secrets; strip them before the entropy fallback so lockfile-debugging
+// notes aren't hard-blocked.
+const SRI_CHECKSUM_RE = /\bsha\d+-[A-Za-z0-9+/=]{16,}/g;
 
 function shannonEntropyPerChar(s: string): number {
   const counts = new Map<string, number>();
@@ -196,8 +206,10 @@ export function detectSecretMaterial(content: string): string | null {
   }
   // High-entropy opaque spans. Requiring lower+upper+digit together keeps
   // git SHAs / sha256 digests (hex: no uppercase) and prose/paths (no digits)
-  // out; base64-ish secret material almost always carries all three.
-  for (const span of content.match(/[A-Za-z0-9+/_=-]{24,}/g) ?? []) {
+  // out; base64-ish secret material almost always carries all three. Public
+  // SRI checksums (`sha512-…`) are stripped first — high-entropy, not secret.
+  const scannable = content.replace(SRI_CHECKSUM_RE, " ");
+  for (const span of scannable.match(/[A-Za-z0-9+/_=-]{24,}/g) ?? []) {
     const hasLower = /[a-z]/.test(span);
     const hasUpper = /[A-Z]/.test(span);
     const hasDigit = /[0-9]/.test(span);
