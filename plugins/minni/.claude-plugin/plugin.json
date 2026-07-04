@@ -1,6 +1,6 @@
 {
   "name": "minni",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Local-first Minni spine for Claude Code: automatic recall, vault-first learning, agent-to-agent handoff, and continuity across compaction.",
   "author": {
     "name": "Infektyd",
@@ -21,7 +21,9 @@
   "mcpServers": {
     "minni": {
       "command": "node",
-      "args": ["${CLAUDE_PLUGIN_ROOT}/dist/server.js"],
+      "args": [
+        "${CLAUDE_PLUGIN_ROOT}/dist/server.js"
+      ],
       "cwd": "${CLAUDE_PLUGIN_ROOT}",
       "env": {
         "MINNI_AGENT_ID": "claude-code",

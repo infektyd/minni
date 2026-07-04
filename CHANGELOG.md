@@ -8,6 +8,8 @@ pre-1.0: minor versions may contain breaking changes until v1.0.0.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-04
+
 ### Added
 
 - **`minni wire <platform>`** ([#142](https://github.com/infektyd/minni/issues/142),
@@ -20,13 +22,23 @@ pre-1.0: minor versions may contain breaking changes until v1.0.0.
   (`<version>+git.<sha>[.dirty]`), `--use-version` rollback, and a JSON
   stdout / exit-code contract. `all` expands to codex, claude-code, kilocode,
   grok; gemini wiring stays provisional. The payload ships inside wheels
-  starting with the v0.3 release (`make stage-payload` + `make release-wheel`).
+  from this release (`make stage-payload` + `make release-wheel`, wired into
+  the release workflow).
 - `make check-versions` CI lint: pyproject, plugin package.json, and the four
   platform manifests must agree; version-pinned path literals in propagate.py
   fail the build.
 
 ### Fixed
 
+- **Learn quality gate flags credential material, not vocabulary**
+  ([#138](https://github.com/infektyd/minni/issues/138),
+  [#146](https://github.com/infektyd/minni/pull/146)): notes about `id-token`
+  permissions, tokenizers, or key-hygiene procedures are learnable again,
+  while well-known secret prefixes, keyword-assigned literals (tiered
+  high-risk/lower-risk rules), and high-entropy pastes hard-block. Hardened
+  through six automated review rounds; the one regex-unreachable case
+  (unquoted multi-word passphrases) is tracked in
+  [#147](https://github.com/infektyd/minni/issues/147).
 - propagate.py stale `0.1.0` path/version literals now resolve dynamically
   (the `current` symlink is authoritative over the installed package version).
 - TOML config writers escape control characters, preventing corruption of

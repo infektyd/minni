@@ -121,7 +121,12 @@ def _validate_preserved_identity(ex_env: dict, agent: str) -> dict:
 def load_json(path: Path) -> dict:
     if not path.exists():
         return {}
-    return json.loads(path.read_text(encoding="utf-8"))
+    text = path.read_text(encoding="utf-8")
+    # A zero-byte config (touch'd placeholder, truncated write) is an empty
+    # doc, not a parse error — wire must not fail with "Expecting value".
+    if not text.strip():
+        return {}
+    return json.loads(text)
 
 
 def write_json(path: Path, data: dict) -> None:
