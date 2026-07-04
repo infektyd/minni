@@ -4,8 +4,12 @@ Wire Grok to a running Minni daemon from your checkout:
 
 ```bash
 .venv/bin/minni up   # if the daemon isn't already running
-.venv/bin/python plugins/minni/skills/minni-install/scripts/propagate.py update-plugin --platform grok
+minni wire grok                                   # v0.3+ wheel (bundled payload)
+.venv/bin/minni wire grok --from-repo .           # v0.2 wheel / source checkout
 ```
+
+(`propagate.py update-plugin --platform grok` from the checkout still works as
+the legacy path.)
 
 Grok uses the standard `minni@minni` plugin install: the plugin lands under
 `~/.agents/plugins/minni@minni`, is wired via `~/.grok/config.toml`, and gets

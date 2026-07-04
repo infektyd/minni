@@ -91,7 +91,10 @@ def payload_tree(
         return
 
     if from_repo is not None:
-        tmp, manifest = build_from_repo(from_repo)
+        try:
+            tmp, manifest = build_from_repo(from_repo)
+        except ValueError as exc:
+            raise WireError(str(exc), exit_code=2) from exc
         try:
             self_check_manifest(manifest)
             if not is_safe_version_segment(manifest.version):

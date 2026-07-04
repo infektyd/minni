@@ -8,6 +8,47 @@ pre-1.0: minor versions may contain breaking changes until v1.0.0.
 
 ## [Unreleased]
 
+### Added
+
+- **`minni wire <platform>`** ([#142](https://github.com/infektyd/minni/issues/142),
+  [#144](https://github.com/infektyd/minni/pull/144)): agents wire themselves
+  from the wheel-shipped plugin payload — no repo checkout, no Node at
+  wheel-build time. Versioned installs under `~/.minni/plugin/<version>/`
+  with locked atomic install, post-wire verification probes (MCP handshake,
+  hook dry-run, config readback), `wired.json` wire records, reference-aware
+  PEP 440 garbage collection, `--from-repo` dev builds
+  (`<version>+git.<sha>[.dirty]`), `--use-version` rollback, and a JSON
+  stdout / exit-code contract. `all` expands to codex, claude-code, kilocode,
+  grok; gemini wiring stays provisional. The payload ships inside wheels
+  starting with the v0.3 release (`make stage-payload` + `make release-wheel`).
+- `make check-versions` CI lint: pyproject, plugin package.json, and the four
+  platform manifests must agree; version-pinned path literals in propagate.py
+  fail the build.
+
+### Fixed
+
+- propagate.py stale `0.1.0` path/version literals now resolve dynamically
+  (the `current` symlink is authoritative over the installed package version).
+- TOML config writers escape control characters, preventing corruption of
+  `~/.codex/config.toml` / `~/.grok/config.toml` from hostile or unusual
+  workspace/socket values.
+
+## [0.2.0] - 2026-07-03
+
+### Changed
+
+- **Packaging restructure**: the flat `engine/` tree became the `src/minni/`
+  package ([#135](https://github.com/infektyd/minni/pull/135)) — Minni is now
+  a real wheel, installable with `pipx install minni` (daemon + CLI, no
+  checkout), publishing to [PyPI](https://pypi.org/project/minni/) via OIDC
+  trusted publishing from tagged builds.
+- Docs sweep for the pipx era; Docker eval-image CI fix.
+
+### Added
+
+- Gemini / Antigravity `agy` CLI hook support
+  ([#133](https://github.com/infektyd/minni/issues/133)).
+
 ## [0.1.0] - 2026-07-02
 
 First tagged release. Minni has been developed in the open since April 2026;

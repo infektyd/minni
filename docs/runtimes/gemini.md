@@ -7,15 +7,24 @@ Wire Gemini to a running Minni daemon from your checkout:
 .venv/bin/python plugins/minni/skills/minni-install/scripts/propagate.py update-plugin --platform gemini
 ```
 
+Standalone Gemini wiring is **provisional** in `minni wire` (the
+`${extensionPath}` extension-manifest mechanism is still being verified —
+issue #142's open question 8), so `minni wire gemini` reports a provisional
+failure and `minni wire all` skips gemini with a warning; use the propagate.py
+command above from a checkout for now.
+
 Antigravity rides the same `~/.gemini` surface (shared agent identity
-`gemini`, vault `~/.minni/gemini-vault`) but is wired **individually**:
+`gemini`, vault `~/.minni/gemini-vault`) but is wired **individually**, and
+its surface-view + agy-hook wiring is supported by `minni wire`:
 
 ```bash
-.venv/bin/python plugins/minni/skills/minni-install/scripts/propagate.py update-plugin --platform antigravity
+minni wire antigravity                                 # v0.3+ wheel
+.venv/bin/minni wire antigravity --from-repo .         # v0.2 wheel / checkout
 ```
 
-Note: `--platform all` covers codex, claude-code, kilocode, gemini, and grok —
-**it does not include antigravity**; run the antigravity target explicitly.
+Note: neither propagate.py's `--platform all` nor `minni wire all` includes
+antigravity (`minni wire all` = codex, claude-code, kilocode, grok); run the
+antigravity target explicitly.
 
 The adapter (`plugins/minni/.gemini-plugin/gemini-extension.json`) launches
 the MCP server via the extension path; Antigravity surfaces get their MCP

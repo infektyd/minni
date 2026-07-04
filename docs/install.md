@@ -10,11 +10,44 @@ minni up
 minni doctor
 ```
 
-This gives you the `minni` and `minnid` commands and the full engine. Wiring
-agent runtimes (the MCP plugin + per-platform installer) still needs the
-source checkout below.
+This gives you the `minni` and `minnid` commands and the full engine.
 
-## Source install (contributors + agent wiring)
+## Wire agent runtimes (`minni wire`)
+
+Agents reach the daemon through the MCP plugin, which `minni wire <platform>`
+installs to a versioned dir under `~/.minni/plugin/` and registers with the
+runtime's own config (MCP server entry, per-agent vault path, hook
+entrypoints). Node >= 20 must be on PATH — the preflight checks and tells you
+if it isn't.
+
+```bash
+minni wire claude-code        # or: codex, kilocode, grok, generic, all
+```
+
+- Wheels from **v0.3** bundle the plugin payload, so this works straight from
+  `pipx install minni`. On a v0.2 wheel (or an editable install) there is no
+  bundled payload; wire from a source checkout instead:
+  `minni wire <platform> --from-repo /path/to/minni` (builds with Node, then
+  runs the identical install + verify path, versioned as
+  `<version>+git.<sha>`).
+- `all` wires codex, claude-code, kilocode, and grok. Gemini wiring is
+  provisional (skipped with a warning; use the checkout's
+  `propagate.py update-plugin --platform gemini` for now), and
+  antigravity/`generic` are always explicit single-platform wires. `generic`
+  requires `--agent` and `--install-root`.
+- Every wire ends with verification probes (MCP handshake, hook dry-run,
+  config readback); the same probes run in `minni doctor`. Output is a single
+  JSON document on stdout with per-platform results; exit code 0 = all
+  attempted platforms wired, 1 = at least one failed, 2 = preflight/usage
+  error before any change.
+- Old version dirs are pruned only when no runtime's config references them
+  (`--prune` / `--no-prune`; prompts are skipped when stdin isn't a TTY).
+  `--use-version <ver>` re-stamps a platform's config against an
+  already-installed version — rollback without touching the Python package.
+- The agent-driven `minni-install` skill handles first-time identity and
+  vault seeding after the wire.
+
+## Source install (contributors + `--from-repo` wiring)
 
 Requirements: `git`, `make`, Node >= 20 (`.nvmrc`). Python 3.14 is required by
 the engine (`.python-version`) but you do not have to install it yourself: if
@@ -131,10 +164,12 @@ layout), bring your checkout current:
 
 1. Pull the latest changes.
 2. Run `make setup` (rebuilds the venv at root `.venv`).
-3. Re-run `propagate.py update-plugin --platform <yours>` to re-stamp configs:
+3. Re-wire your platforms to re-stamp configs:
    ```bash
-   .venv/bin/python plugins/minni/skills/minni-install/scripts/propagate.py update-plugin --platform <yours>
+   .venv/bin/minni wire <yours> --from-repo .
    ```
+   (`propagate.py update-plugin --platform <yours>` still works and remains
+   the path for gemini while its wiring is provisional.)
 4. For launchd users: update the plist's three paths — python interpreter →
    `/path/to/repo/.venv/bin/python`, script args → `-m minni.minnid`,
    `WorkingDirectory` → repo root — then run:
