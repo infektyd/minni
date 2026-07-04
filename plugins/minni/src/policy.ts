@@ -144,6 +144,66 @@ export function routeMemoryIntent(task: string): MemoryIntent {
   };
 }
 
+/**
+ * Secret-material detection (#138). The gate flags credential MATERIAL, not
+ * credential VOCABULARY: notes about `id-token` permissions, tokenizers, or
+ * api-key hygiene are exactly the durable learnings worth keeping, while a
+ * pasted `ghp_…` or a keyword assigned an opaque literal is what must block.
+ */
+const SECRET_PREFIX_RE = new RegExp(
+  [
+    "\\bpypi-[A-Za-z0-9_-]{16,}",
+    "\\bghp_[A-Za-z0-9]{20,}",
+    "\\bgithub_pat_[A-Za-z0-9_]{20,}",
+    "\\bgh[ousr]_[A-Za-z0-9]{20,}",
+    "\\bsk-[A-Za-z0-9_-]{20,}",
+    "\\bxox[baprs]-[A-Za-z0-9-]{10,}",
+    "\\bA(?:KIA|SIA)[0-9A-Z]{16}\\b",
+    "-----BEGIN [A-Z ]*PRIVATE KEY-----",
+    "\\beyJ[A-Za-z0-9_-]{16,}\\.[A-Za-z0-9_-]{8,}", // JWT header.payload
+  ].join("|"),
+);
+
+// A credential keyword directly assigned an opaque literal (`api_key = h8f…`).
+// Keyword mentions WITHOUT an assigned literal ("the token was revoked",
+// GitHub Actions' `id-token: write`) deliberately do not match: the assigned
+// value must be 12+ opaque chars.
+const SECRET_ASSIGNMENT_RE =
+  /(secret|passwd|password|token|api[_ -]?key|private[_ -]?key|credential)s?["']?\s*[:=]\s*["']?[A-Za-z0-9+/_.=-]{12,}/i;
+
+function shannonEntropyPerChar(s: string): number {
+  const counts = new Map<string, number>();
+  for (const ch of s) counts.set(ch, (counts.get(ch) ?? 0) + 1);
+  let bits = 0;
+  for (const n of counts.values()) {
+    const p = n / s.length;
+    bits -= p * Math.log2(p);
+  }
+  return bits;
+}
+
+export function detectSecretMaterial(content: string): string | null {
+  if (SECRET_PREFIX_RE.test(content)) {
+    return "a string with a well-known secret prefix";
+  }
+  const assigned = content.match(SECRET_ASSIGNMENT_RE);
+  if (assigned) {
+    return `a credential keyword ("${assigned[1]}") assigned an opaque literal`;
+  }
+  // High-entropy opaque spans. Requiring lower+upper+digit together keeps
+  // git SHAs / sha256 digests (hex: no uppercase) and prose/paths (no digits)
+  // out; base64-ish secret material almost always carries all three.
+  for (const span of content.match(/[A-Za-z0-9+/_=-]{24,}/g) ?? []) {
+    const hasLower = /[a-z]/.test(span);
+    const hasUpper = /[A-Z]/.test(span);
+    const hasDigit = /[0-9]/.test(span);
+    if (hasLower && hasUpper && hasDigit && shannonEntropyPerChar(span) >= 3.8) {
+      return "a high-entropy opaque string";
+    }
+  }
+  return null;
+}
+
 export function assessLearningQuality(input: {
   title: string;
   content: string;
@@ -172,9 +232,13 @@ export function assessLearningQuality(input: {
     warnings.push("Content has vague wording; prefer specific facts and decisions.");
   }
 
-  if (/secret|password|token|api[_ -]?key|private key/i.test(content)) {
+  const secretMaterial = detectSecretMaterial(content);
+  if (secretMaterial) {
     score -= 0.3;
-    warnings.push("Content may contain sensitive material; avoid storing secrets in memory.");
+    warnings.push(
+      `Content appears to contain sensitive material (${secretMaterial}); ` +
+        "never store secrets in memory.",
+    );
   }
 
   const normalized = clampScore(score);
