@@ -265,7 +265,11 @@ def run_wire(args) -> int:
         return _exit2(node_msg)
 
     use_version = args.use_version
-    from_repo = Path(args.from_repo).expanduser() if args.from_repo else None
+    # Resolve here, not just inside build_from_repo: repo_root flows into
+    # native_afm_env(), and a relative --from-repo (".") would stamp a relative
+    # MINNI_AFM_NATIVE_HELPER into configs — broken the moment the host
+    # launches the installed server from its own cwd.
+    from_repo = Path(args.from_repo).expanduser().resolve() if args.from_repo else None
     repo_root = from_repo or Path.cwd()
 
     try:

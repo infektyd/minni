@@ -144,6 +144,107 @@ export function routeMemoryIntent(task: string): MemoryIntent {
   };
 }
 
+/**
+ * Secret-material detection (#138). The gate flags credential MATERIAL, not
+ * credential VOCABULARY: notes about `id-token` permissions, tokenizers, or
+ * api-key hygiene are exactly the durable learnings worth keeping, while a
+ * pasted `ghp_…` or a keyword assigned an opaque literal is what must block.
+ */
+const SECRET_PREFIX_RE = new RegExp(
+  [
+    // pypi- must look token-shaped (mixed case + digit): kebab-case slugs
+    // like `pypi-trusted-publisher-lowercase-claim` are vocabulary, not tokens.
+    "\\bpypi-(?=[A-Za-z0-9_-]*[A-Z])(?=[A-Za-z0-9_-]*[0-9])[A-Za-z0-9_-]{16,}",
+    "\\bghp_[A-Za-z0-9]{20,}",
+    "\\bgithub_pat_[A-Za-z0-9_]{20,}",
+    "\\bgh[ousr]_[A-Za-z0-9]{20,}",
+    "\\bsk-[A-Za-z0-9_-]{20,}",
+    "\\bxox[baprs]-[A-Za-z0-9-]{10,}",
+    "\\bA(?:KIA|SIA)[0-9A-Z]{16}\\b",
+    "-----BEGIN [A-Z ]*PRIVATE KEY-----",
+    "\\beyJ[A-Za-z0-9_-]{16,}\\.[A-Za-z0-9_-]{8,}", // JWT header.payload
+  ].join("|"),
+);
+
+// A credential keyword directly assigned an opaque literal (`api_key = h8f…`).
+// Keyword mentions WITHOUT an assigned literal ("the token was revoked",
+// GitHub Actions' `id-token: write`) deliberately do not match. Keywords are
+// tiered by how often they appear benignly with a colon:
+//
+// HIGH-RISK (password/passwd/secret/private key): a following `:` or `=`
+// with ANY 8+ char value — quoted or not, any charset — blocks
+// (`password: correcthorsebatterystaple`, `private key: abcdef…`). These
+// words followed by an assigned value are essentially never benign prose.
+//
+// KNOWN LIMITATION (accepted, tracked upstream of PR #146): an UNQUOTED
+// multi-word passphrase (`password: correct horse battery staple`) is
+// structurally indistinguishable from prose (`password: use a manager`) —
+// only its first word is consumed, and 7-char words pass. Quoted
+// passphrases block; catching unquoted ones requires semantics, and the
+// pre-#138 gate "caught" them only by blocking every sentence containing
+// these words, which is the exact false-positive trade #138 rejected.
+//
+// LOWER-RISK (token/api-key/credential): these appear constantly in benign
+// YAML/prose (`id-token: write`, "token: authentication-related"), so the
+// `:` branch additionally requires a digit or password-style symbol in the
+// value; the `=` branch (config syntax, not prose) takes any 8+ char value.
+// Quoted values of 8+ chars block for both separators.
+const HIGH_RISK_ASSIGNMENT_RE =
+  /(secret|passwd|password|private[_ -]?key)s?["']?\s*[:=]\s*(?:["'][^"'\n]{8,}["']|[^\s"']{8,})/i;
+const LOWER_RISK_ASSIGNMENT_RE =
+  /(token|api[_ -]?key|credential)s?["']?\s*(?:=\s*(?:["'][^"'\n]{8,}["']|[^\s"']{8,})|:\s*(?:["'][^"'\n]{8,}["']|(?=[^\s"']*[0-9!@#$%^&*?~+=])[^\s"']{8,}))/i;
+
+// Public integrity checksums (npm/pnpm SRI: `sha512-…=`) are high-entropy but
+// not secrets; strip them before the entropy fallback so lockfile-debugging
+// notes aren't hard-blocked.
+const SRI_CHECKSUM_RE = /\bsha\d+-[A-Za-z0-9+/=]{16,}/g;
+
+function shannonEntropyPerChar(s: string): number {
+  const counts = new Map<string, number>();
+  for (const ch of s) counts.set(ch, (counts.get(ch) ?? 0) + 1);
+  let bits = 0;
+  for (const n of counts.values()) {
+    const p = n / s.length;
+    bits -= p * Math.log2(p);
+  }
+  return bits;
+}
+
+export function detectSecretMaterial(content: string): string | null {
+  if (SECRET_PREFIX_RE.test(content)) {
+    return "a string with a well-known secret prefix";
+  }
+  const assigned =
+    content.match(HIGH_RISK_ASSIGNMENT_RE) ?? content.match(LOWER_RISK_ASSIGNMENT_RE);
+  if (assigned) {
+    return `a credential keyword ("${assigned[1]}") assigned an opaque literal`;
+  }
+  // High-entropy opaque spans. Requiring lower+upper+digit together keeps
+  // git SHAs / sha256 digests (hex: no uppercase) and prose/paths (no digits)
+  // out; base64-ish secret material almost always carries all three. Public
+  // SRI checksums (`sha512-…`) are stripped first — high-entropy, not secret.
+  const scannable = content.replace(SRI_CHECKSUM_RE, " ");
+  for (const rawSpan of scannable.match(/[A-Za-z0-9+/_=-]{24,}/g) ?? []) {
+    // Path-SHAPED spans (2+ slashes: `/Users/Hans/Projects/v2/…`,
+    // `github.com/Org/Repo/runs/123…`) are evaluated per "/"-segment, so
+    // they decompose into short low-entropy pieces. A span with 0-1 slashes
+    // is evaluated WHOLE — a single mid-string slash in a base64 secret
+    // must not split it under the 24-char floor and slip through.
+    const slashes = (rawSpan.match(/\//g) ?? []).length;
+    const spans = slashes >= 2 ? rawSpan.split("/") : [rawSpan];
+    for (const span of spans) {
+      if (span.length < 24) continue;
+      const hasLower = /[a-z]/.test(span);
+      const hasUpper = /[A-Z]/.test(span);
+      const hasDigit = /[0-9]/.test(span);
+      if (hasLower && hasUpper && hasDigit && shannonEntropyPerChar(span) >= 3.8) {
+        return "a high-entropy opaque string";
+      }
+    }
+  }
+  return null;
+}
+
 export function assessLearningQuality(input: {
   title: string;
   content: string;
@@ -172,9 +273,13 @@ export function assessLearningQuality(input: {
     warnings.push("Content has vague wording; prefer specific facts and decisions.");
   }
 
-  if (/secret|password|token|api[_ -]?key|private key/i.test(content)) {
+  const secretMaterial = detectSecretMaterial(content);
+  if (secretMaterial) {
     score -= 0.3;
-    warnings.push("Content may contain sensitive material; avoid storing secrets in memory.");
+    warnings.push(
+      `Content appears to contain sensitive material (${secretMaterial}); ` +
+        "never store secrets in memory.",
+    );
   }
 
   const normalized = clampScore(score);
