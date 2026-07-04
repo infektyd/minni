@@ -67,6 +67,10 @@ test("credential keyword assigned an opaque literal blocks; bare mention does no
   // Codex P1 round 3 (PR #146): alphabetic values under `=` config syntax.
   assert.notEqual(detectSecretMaterial("password=correcthorsebatterystaple"), null);
   assert.notEqual(detectSecretMaterial("api_key=abcdefghijklmnopqrstuvwx"), null);
+  // Codex P1 round 4 (PR #146): high-risk keywords block colon-assigned
+  // alphabetic values too; lower-risk keywords (token) keep the colon guard.
+  assert.notEqual(detectSecretMaterial("password: correcthorsebatterystaple"), null);
+  assert.notEqual(detectSecretMaterial("private key: abcdefghijklmnopqrstuvwxyz"), null);
   // GitHub Actions permission syntax — keyword + colon but no opaque literal.
   assert.equal(detectSecretMaterial("permissions:\n  id-token: write"), null);
   assert.equal(detectSecretMaterial("the token was revoked yesterday"), null);
@@ -99,8 +103,12 @@ test("secret material is a hard gate regardless of an otherwise strong score", (
     title: "A perfectly titled durable procedure note",
     category: "procedures",
     source: "session",
-    content:
-      "This otherwise excellent and complete note accidentally embeds ghp_AbCdEf0123456789AbCdEf0123456789AbCd from a paste and must be blocked.",
+    content: [
+      "This otherwise excellent and complete note accidentally embeds ",
+      "ghp_",
+      "AbCdEf0123456789AbCdEf0123456789AbCd",
+      " from a paste and must be blocked.",
+    ].join(""),
   });
   assert.equal(report.ok, false);
 });

@@ -166,19 +166,23 @@ const SECRET_PREFIX_RE = new RegExp(
 
 // A credential keyword directly assigned an opaque literal (`api_key = h8f…`).
 // Keyword mentions WITHOUT an assigned literal ("the token was revoked",
-// GitHub Actions' `id-token: write`) deliberately do not match. Value shapes
-// that count:
-// - QUOTED value of 8+ chars, any charset, either separator — covers
-//   passwords with punctuation/spaces (`password: "aB3!dE5@gH7#jK9%"`).
-// - `=`-assigned unquoted value of 8+ chars, ANY charset — `=` is config
-//   syntax, not prose, so `password=correcthorsebatterystaple` and
-//   `api_key=abcdefghijklmnopqrstuvwx` block without needing digits.
-// - `:`-assigned unquoted value of 8+ chars carrying a digit or
-//   password-style symbol — the colon appears in prose and YAML
-//   (`id-token: write`, "token: authentication-related"), so plain words
-//   after a colon stay clean while `password: Hunter22` blocks.
-const SECRET_ASSIGNMENT_RE =
-  /(secret|passwd|password|token|api[_ -]?key|private[_ -]?key|credential)s?["']?\s*(?:=\s*(?:["'][^"'\n]{8,}["']|[^\s"']{8,})|:\s*(?:["'][^"'\n]{8,}["']|(?=[^\s"']*[0-9!@#$%^&*?~+=])[^\s"']{8,}))/i;
+// GitHub Actions' `id-token: write`) deliberately do not match. Keywords are
+// tiered by how often they appear benignly with a colon:
+//
+// HIGH-RISK (password/passwd/secret/private key): a following `:` or `=`
+// with ANY 8+ char value — quoted or not, any charset — blocks
+// (`password: correcthorsebatterystaple`, `private key: abcdef…`). These
+// words followed by an assigned value are essentially never benign prose.
+//
+// LOWER-RISK (token/api-key/credential): these appear constantly in benign
+// YAML/prose (`id-token: write`, "token: authentication-related"), so the
+// `:` branch additionally requires a digit or password-style symbol in the
+// value; the `=` branch (config syntax, not prose) takes any 8+ char value.
+// Quoted values of 8+ chars block for both separators.
+const HIGH_RISK_ASSIGNMENT_RE =
+  /(secret|passwd|password|private[_ -]?key)s?["']?\s*[:=]\s*(?:["'][^"'\n]{8,}["']|[^\s"']{8,})/i;
+const LOWER_RISK_ASSIGNMENT_RE =
+  /(token|api[_ -]?key|credential)s?["']?\s*(?:=\s*(?:["'][^"'\n]{8,}["']|[^\s"']{8,})|:\s*(?:["'][^"'\n]{8,}["']|(?=[^\s"']*[0-9!@#$%^&*?~+=])[^\s"']{8,}))/i;
 
 // Public integrity checksums (npm/pnpm SRI: `sha512-…=`) are high-entropy but
 // not secrets; strip them before the entropy fallback so lockfile-debugging
@@ -200,7 +204,8 @@ export function detectSecretMaterial(content: string): string | null {
   if (SECRET_PREFIX_RE.test(content)) {
     return "a string with a well-known secret prefix";
   }
-  const assigned = content.match(SECRET_ASSIGNMENT_RE);
+  const assigned =
+    content.match(HIGH_RISK_ASSIGNMENT_RE) ?? content.match(LOWER_RISK_ASSIGNMENT_RE);
   if (assigned) {
     return `a credential keyword ("${assigned[1]}") assigned an opaque literal`;
   }
