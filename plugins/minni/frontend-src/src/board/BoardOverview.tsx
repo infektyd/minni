@@ -12,6 +12,7 @@ import {
   type ZoneDef,
   type ZoneId,
 } from "./boardData";
+import { type StagedLearningsState } from "./boardDataHook";
 import {
   computeLinks,
   OVERVIEW_LAYOUT,
@@ -356,6 +357,7 @@ export function BoardOverview({
   ambientFlows,
   flowFeed,
   onFlowEvent,
+  stagedState,
 }: {
   zones: Record<ZoneId, ZoneDef>;
   scale: number;
@@ -368,10 +370,12 @@ export function BoardOverview({
   ambientFlows: boolean;
   flowFeed: { seq: number; flow: BoardFlow }[];
   onFlowEvent: (e: FlowEvent) => void;
+  stagedState?: StagedLearningsState;
 }) {
   const agentIds = useMemo(() => SAMPLE_AGENTS.map((a) => a.id), []);
   const links = useMemo(() => computeLinks(zones, agentIds), [zones, agentIds]);
-  const top4 = SAMPLE_LEARNINGS.slice(0, 4);
+  const learnings = stagedState?.learnings || SAMPLE_LEARNINGS;
+  const top4 = learnings.slice(0, 4);
   const L = OVERVIEW_LAYOUT;
 
   return (
@@ -436,14 +440,14 @@ export function BoardOverview({
               klass="learn"
               klassLabel="LEARN"
               tag={l.tag}
-              score={l.score.toFixed(2)}
+              score={typeof l.score === 'number' ? l.score.toFixed(2) : String(l.score)}
               title={l.title}
               meta={l.id + " · " + l.agent + " · AFM-safe"}
             />
           );
         })}
         <div className="more-chip" style={{ left: L.staged.moreChip.x, top: L.staged.moreChip.y }}>
-          + {SAMPLE_LEARNINGS.length - top4.length} more · click zone to expand
+          + {learnings.length - top4.length} more · click zone to expand
         </div>
       </ZoneBox>
 

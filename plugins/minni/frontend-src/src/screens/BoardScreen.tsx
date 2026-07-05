@@ -13,6 +13,7 @@ import {
   type HealthReport,
   type StatusReport,
 } from "../api";
+import { useStagedLearnings } from "../board/boardDataHook";
 import { BoardOverview } from "../board/BoardOverview";
 import { ZoneDetail } from "../board/BoardDetails";
 import {
@@ -72,12 +73,14 @@ export function BoardScreen({
   health,
   audit,
   onOpenConsole,
+  tokenRefreshTrigger,
 }: {
   status: StatusReport | null;
   health: HealthReport | null;
   audit: AuditTailResult | null;
   /** Switch back to the v1 console shell. */
   onOpenConsole?: () => void;
+  tokenRefreshTrigger?: number;
 }) {
   const [stageRef, vp] = useElementSize();
   const reducedMotion = usePrefersReducedMotion();
@@ -96,13 +99,27 @@ export function BoardScreen({
   const [instant, setInstant] = useState(false);
 
   // ── live zone rects = defaults + dragged offsets ──
+  // Hook for staged learnings state (live vs sample)
+  const stagedState = useStagedLearnings(tokenRefreshTrigger);
+  
   const zones = useMemo(() => {
     const z = {} as Record<ZoneId, ZoneDef>;
     BOARD_ORDER.forEach((id) => {
       z[id] = { ...BOARD_ZONES[id], ...(zpos[id] || {}) };
+      
+      // Override staged zone labels based on live state
+      if (id === "staged") {
+        z[id] = {
+          ...z[id],
+          label: stagedState.isLive
+            ? `STAGED · LEARN CANDIDATES · ${stagedState.learnings.length}`
+            : `SAMPLE · STAGED · LEARN CANDIDATES · ${stagedState.learnings.length}`,
+          title: stagedState.isLive ? "Staged learnings" : "Staged learnings · sample",
+        };
+      }
     });
     return z;
-  }, [zpos]);
+  }, [zpos, stagedState.isLive, stagedState.learnings.length]);
 
   const moveZone = useCallback(
     (id: ZoneId, x: number, y: number) => {
@@ -331,6 +348,7 @@ export function BoardScreen({
           ambientFlows={auditLive === false}
           flowFeed={flowFeed}
           onFlowEvent={setEvt}
+          stagedState={stagedState}
         />
       </div>
 
@@ -347,7 +365,9 @@ export function BoardScreen({
           <span className="dot" />
           {daemon.online ? "DAEMON ONLINE" : "DAEMON OFFLINE"}
         </span>
-        <span className="bd-chip warn">SAMPLE · {SAMPLE_LEARNINGS.length} STAGED</span>
+        <span className={"bd-chip " + (stagedState.isLive ? "" : "warn")}>
+          {stagedState.isLive ? `${stagedState.learnings.length} STAGED` : `SAMPLE · ${stagedState.learnings.length} STAGED`}
+        </span>
         {hasLayout ? (
           <button className="fchip" onClick={() => setZpos({})} type="button">
             reset layout
@@ -394,17 +414,17 @@ export function BoardScreen({
                   <button className="bd-btn quiet" onClick={() => setFocus(null)} type="button">
                     ← Board <kbd>ESC</kbd>
                   </button>
-                  <span className="zo-title">{BOARD_ZONES[id].title}</span>
+                  <span className="zo-title">{zones[id].title}</span>
                   <div className="zo-pills">
                     {BOARD_ORDER.filter((o) => o !== id).map((o) => (
                       <button key={o} className="fchip" onClick={() => setFocus(o)} type="button">
-                        {BOARD_ZONES[o].title}
+                        {zones[o].title}
                       </button>
                     ))}
                   </div>
                 </div>
                 <div className="zo-body">
-                  <ZoneDetail id={id} ctx={{ daemon, recentAudit: auditSummaries }} />
+                  <ZoneDetail id={id} ctx={{ daemon, recentAudit: auditSummaries }} stagedState={stagedState} />
                 </div>
               </>
             ) : (

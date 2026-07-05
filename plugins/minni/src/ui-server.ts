@@ -586,6 +586,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
           const rpc = await jsonRpcSocketRequestWithFallback("list_candidates", {
             limit: Math.min(limit, 200),
             status,
+            agent_id: DEFAULT_AGENT_ID,
           });
           sendJson(res, 200, redactLocalValue(rpc));
         } catch (e) {

@@ -29,6 +29,10 @@ import {
   ZOOM_MIN_FACTOR,
 } from "../frontend-src/src/board/boardLogic.ts";
 
+import {
+  unwrapCandidatesResponse,
+} from "../frontend-src/src/api.ts";
+
 const LEARNINGS = [
   { id: "a", agent: "codex", score: 0.4, order: 2 },
   { id: "b", agent: "claude-code", score: 0.9, order: 0 },
@@ -470,4 +474,201 @@ test("stagedSlot overflow grid never overlaps designer slots or itself", () => {
     assert.equal(seen.has(key), false, `overflow ${i} collided with an earlier card at ${key}`);
     seen.add(key);
   }
+});
+
+// ── Staged learnings data mapping (sample/live split) ──────────────────────
+
+import {
+  humanizeAge,
+  mapCandidateToBoardLearning,
+  mapCandidates,
+} from "../frontend-src/src/board/boardData.ts";
+
+test("humanizeAge formats relative age correctly", () => {
+  const now = new Date();
+  
+  // Test minutes
+  const fiveMinsAgo = new Date(now.getTime() - 5 * 60 * 1000).toISOString();
+  assert.equal(humanizeAge(fiveMinsAgo), "5m");
+  
+  // Test hours
+  const threeHoursAgo = new Date(now.getTime() - 3 * 60 * 60 * 1000).toISOString();
+  assert.equal(humanizeAge(threeHoursAgo), "3h");
+  
+  // Test days
+  const twoDaysAgo = new Date(now.getTime() - 2 * 24 * 60 * 60 * 1000).toISOString();
+  assert.equal(humanizeAge(twoDaysAgo), "2d");
+});
+
+test("humanizeAge returns '—' for invalid dates", () => {
+  assert.equal(humanizeAge("invalid-date"), "—");
+  assert.equal(humanizeAge(""), "—");
+});
+
+test("mapCandidateToBoardLearning correctly maps candidate fields", () => {
+  const mockCandidate = {
+    candidate_id: "learn-101",
+    principal: "llm-agent",
+    content: "This is the first line of content\nThis is the second line",
+    proposed_at: new Date().toISOString(),
+    evidence_refs: ["docs/CONTRACT.md"],
+  };
+  
+  const mapped = mapCandidateToBoardLearning(mockCandidate, 0);
+  
+  assert.equal(mapped.id, "C-learn-101");
+  assert.equal(mapped.agent, "llm-agent");
+  assert.equal(mapped.title, "This is the first line of content");
+  assert.equal(mapped.src, "docs/CONTRACT.md");
+  assert.equal(mapped.score, "—");
+  assert.equal(mapped.order, 0);
+});
+
+test("mapCandidateToBoardLearning falls back to derived_from when evidence_refs missing", () => {
+  const mockCandidate = {
+    candidate_id: "learn-102",
+    principal: "helper-agent",
+    content: "Single line text",
+    proposed_at: new Date().toISOString(),
+    derived_from: "handoff://some-source",
+  };
+  
+  const mapped = mapCandidateToBoardLearning(mockCandidate, 1);
+  
+  assert.equal(mapped.src, "handoff://some-source");
+  assert.equal(mapped.score, "—");
+});
+
+test("mapCandidateToBoardLearning renders missing fields as '—'", () => {
+  const mockCandidate = {
+    candidate_id: "learn-103",
+    principal: "agent",
+    content: "",
+    proposed_at: new Date().toISOString(),
+  };
+  
+  const mapped = mapCandidateToBoardLearning(mockCandidate, 2);
+  
+  assert.equal(mapped.title, "—");
+  assert.equal(mapped.src, "—");
+  assert.equal(mapped.score, "—");
+});
+
+test("mapCandidates sorts candidates DESC by proposed_at", () => {
+  const mockCandidates = [
+    {
+      candidate_id: "old",
+      principal: "agent",
+      content: "Old content",
+      proposed_at: "2026-07-05T07:00:00.000Z",
+    },
+    {
+      candidate_id: "new",
+      principal: "agent",
+      content: "New content",
+      proposed_at: "2026-07-05T08:00:00.000Z",
+    },
+  ];
+
+  const mapped = mapCandidates(mockCandidates);
+  
+  assert.equal(mapped[0].id, "C-new");
+  assert.equal(mapped[0].order, 0);
+  assert.equal(mapped[1].id, "C-old");
+  assert.equal(mapped[1].order, 1);
+});
+
+test("mapCandidates never mutates its input", () => {
+  const mockCandidates = [
+    {
+      candidate_id: "a",
+      principal: "agent",
+      content: "Content A",
+      proposed_at: "2026-07-05T08:00:00.000Z",
+    },
+    {
+      candidate_id: "b",
+      principal: "agent",
+      content: "Content B",
+      proposed_at: "2026-07-05T07:00:00.000Z",
+    },
+  ];
+
+  const before = mockCandidates.map((c) => c.candidate_id);
+  mapCandidates(mockCandidates);
+  assert.deepEqual(mockCandidates.map((c) => c.candidate_id), before);
+});
+
+// ── Defect fixes: envelope unwrap, numeric timestamps, decision mapping ──
+
+test("unwrapCandidatesResponse handles JsonResult envelope with ok:true,data", () => {
+  const response = {
+    ok: true,
+    data: {
+      candidates: [
+        { candidate_id: 101, principal: "agent", content: "test", proposed_at: 1688000000 }
+      ],
+      count: 1
+    }
+  };
+  const result = unwrapCandidatesResponse(response);
+  assert.equal(result.candidates.length, 1);
+  assert.equal(result.count, 1);
+});
+
+test("unwrapCandidatesResponse throws on ok:false", () => {
+  const response = { ok: false, error: "daemon down" };
+  assert.throws(() => unwrapCandidatesResponse(response), /daemon down/);
+});
+
+test("unwrapCandidatesResponse throws on flat error field (route catch)", () => {
+  const response = { candidates: [], error: "socket failed" };
+  assert.throws(() => unwrapCandidatesResponse(response), /socket failed/);
+});
+
+test("humanizeAge handles numeric unix SECONDS (DEFECT 2)", () => {
+  const now = Math.floor(Date.now() / 1000); // Current unix seconds
+  
+  // 5 minutes ago
+  const fiveMinsAgo = now - 300;
+  assert.match(humanizeAge(fiveMinsAgo), /[0-5]m/); // 5m or close
+  
+  // 3 hours ago
+  const threeHoursAgo = now - 3 * 3600;
+  assert.equal(humanizeAge(threeHoursAgo), "3h");
+  
+  // 2 days ago
+  const twoDaysAgo = now - 2 * 86400;
+  assert.equal(humanizeAge(twoDaysAgo), "2d");
+});
+
+test("humanizeAge handles ISO string format", () => {
+  const now = new Date();
+  const threeHoursAgo = new Date(now.getTime() - 3 * 60 * 60 * 1000).toISOString();
+  assert.equal(humanizeAge(threeHoursAgo), "3h");
+});
+
+test("mapCandidates correctly sorts DESC by proposed_at (numeric seconds)", () => {
+  const now = Math.floor(Date.now() / 1000);
+  const mockCandidates = [
+    {
+      candidate_id: "old",
+      principal: "agent",
+      content: "Old content",
+      proposed_at: now - 3600  // 1h ago
+    },
+    {
+      candidate_id: "new",
+      principal: "agent",
+      content: "New content",
+      proposed_at: now  // now
+    }
+  ];
+
+  const mapped = mapCandidates(mockCandidates);
+  
+  assert.equal(mapped[0].id, "C-new");
+  assert.equal(mapped[0].order, 0);
+  assert.equal(mapped[1].id, "C-old");
+  assert.equal(mapped[1].order, 1);
 });

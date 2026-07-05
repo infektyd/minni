@@ -92,3 +92,14 @@ export function usePrefersReducedMotion(): boolean {
   }, []);
   return reduced;
 }
+
+/** Tracks whether a component is mounted (useful for async setState safety). */
+export function useMountedRef(): React.MutableRefObject<boolean> {
+  const ref = useRef(true);
+  useEffect(() => {
+    return () => {
+      ref.current = false;
+    };
+  }, []);
+  return ref;
+}

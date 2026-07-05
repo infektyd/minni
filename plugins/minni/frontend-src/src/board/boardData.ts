@@ -73,7 +73,7 @@ export interface BoardAgent {
 export interface BoardLearning {
   id: string;
   agent: string;
-  score: number;
+  score?: number | string;
   title: string;
   src: string;
   age: string;
@@ -115,6 +115,127 @@ export interface BoardRecallResult {
 }
 
 /** True while the non-daemon panels render synthetic data (see header). */
+
+// ── Staged learnings data seam (sample/live split) ──────────────────────────
+
+export interface CandidateRow {
+  candidate_id: string | number;
+  principal: string;
+  content: string;
+  proposed_at: number | string;
+  evidence_refs?: string[] | string;
+  derived_from?: Record<string, unknown> | string;
+  status?: string;
+}
+
+/**
+ * Humanizes age from proposed_at timestamp (e.g. "4h", "2d")
+ */
+export function humanizeAge(proposedAt: number | string): string {
+  try {
+    // Handle unix SECONDS (daemon) vs ISO string
+    // DEFECT 2: proposed_at is unix seconds, needs ×1000 for Date ms
+    let ms: number;
+    if (typeof proposedAt === 'number') {
+      // Assume seconds; convert to ms
+      ms = proposedAt * 1000;
+    } else if (typeof proposedAt === 'string') {
+      // Try ISO string first, then seconds
+      const date = new Date(proposedAt);
+      if (!isNaN(date.getTime())) {
+        ms = date.getTime();
+      } else {
+        // Try parsing as seconds
+        const secs = parseFloat(proposedAt);
+        if (!isNaN(secs) && secs > 0) {
+          ms = secs * 1000;
+        } else {
+          return "—";
+        }
+      }
+    } else {
+      return "—";
+    }
+    
+    const now = Date.now();
+    const diffMs = now - ms;
+    
+    if (isNaN(diffMs) || diffMs < 0) {
+      return "—";
+    }
+    
+    const diffMins = Math.floor(diffMs / 60000);
+    if (diffMins < 60) {
+      return `${Math.max(1, diffMins)}m`;
+    }
+    
+    const diffHours = Math.floor(diffMins / 60);
+    if (diffHours < 24) {
+      return `${diffHours}h`;
+    }
+    
+    const diffDays = Math.floor(diffHours / 24);
+    return `${diffDays}d`;
+  } catch {
+    return "—";
+  }
+}
+
+/**
+ * Maps a single daemon row to the BoardLearning representation
+ */
+export function mapCandidateToBoardLearning(
+  row: CandidateRow,
+  index: number,
+): BoardLearning {
+  const content = row.content || "";
+  const firstLine = content.split(/\r?\n/)[0] || "";
+  const title = firstLine.trim();
+
+  // Extract first evidence_ref string if available
+  let src = "—";
+  if (row.evidence_refs) {
+    if (Array.isArray(row.evidence_refs)) {
+      src = row.evidence_refs[0] || "—";
+    } else if (typeof row.evidence_refs === "string") {
+      src = row.evidence_refs;
+    }
+  }
+  if (src === "—" && row.derived_from) {
+    if (typeof row.derived_from === "string") {
+      src = row.derived_from;
+    } else if (typeof row.derived_from === "object" && row.derived_from !== null) {
+      // Handle object form: {source, inbox_file, candidate_index, ...}
+      const obj = row.derived_from as any;
+      src = obj.inbox_file || obj.source || Object.values(obj).find(v => typeof v === "string") || "—";
+    }
+  }
+
+  return {
+    id: "C-" + row.candidate_id,
+    agent: row.principal || "—",
+    score: "—",
+    title: title || "—",
+    src,
+    age: humanizeAge(row.proposed_at),
+    order: index,
+  };
+}
+
+/**
+ * Sorts candidates DESC by proposed_at and maps them
+ */
+export function mapCandidates(rows: CandidateRow[]): BoardLearning[] {
+  const sorted = [...rows].sort((a, b) => {
+    const timeA = new Date(a.proposed_at).getTime();
+    const timeB = new Date(b.proposed_at).getTime();
+    return timeB - timeA;
+  });
+  
+  return sorted.map((row, index) => mapCandidateToBoardLearning(row, index));
+}
+
+
 export const BOARD_SAMPLE = true;
 
 export const SAMPLE_AGENTS: BoardAgent[] = [

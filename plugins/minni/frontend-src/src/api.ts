@@ -541,3 +541,118 @@ export function refreshResearchStatus(req: DeepResearchStatusRequest): Promise<R
     body: JSON.stringify(req),
   });
 }
+
+// ---- Staged learnings candidates (console approval pipeline) ----
+
+export interface CandidateRow {
+  candidate_id: string | number;
+  principal: string;
+  content: string;
+  proposed_at: number | string;
+  evidence_refs?: string[] | string;
+  derived_from?: Record<string, unknown> | string;
+  status?: string;
+}
+
+export interface ListCandidatesResponse {
+  candidates: CandidateRow[];
+  principal?: string;
+  count?: number;
+}
+
+/**
+ * Unwrap JsonResult envelope from daemon RPC.
+ * Handles three response shapes:
+ * - {ok: true, data: {candidates, principal, count}} → returns data
+ * - {ok: false, error: "msg"} → throws error
+ * - {candidates: [], error: "msg"} (route catch) → throws error
+ */
+export function unwrapCandidatesResponse(response: unknown): { candidates: CandidateRow[]; principal?: string; count?: number } {
+  const r = response as any;
+  
+  // JsonResult envelope: check ok field
+  if (typeof r.ok === 'boolean') {
+    if (!r.ok) {
+      throw new Error(r.error || 'Daemon error');
+    }
+    if (r.data && typeof r.data === 'object') {
+      return r.data as { candidates: CandidateRow[]; principal?: string; count?: number };
+    }
+    throw new Error('Invalid daemon response: missing data field');
+  }
+  
+  // Flat response from route catch: check error field
+  if (r.error) {
+    throw new Error(r.error);
+  }
+  
+  // No error, assume it's the unwrapped data shape
+  if (Array.isArray(r.candidates)) {
+    return r;
+  }
+  
+  throw new Error('Invalid candidates response shape');
+}
+
+/**
+ * Fetch proposed learning candidates from the daemon.
+ * GET /api/candidates?limit=&status=
+ */
+export function listCandidates(limit?: number, status?: string): Promise<ListCandidatesResponse> {
+  const params = new URLSearchParams();
+  if (limit !== undefined) {
+    params.append("limit", String(limit));
+  }
+  if (status !== undefined) {
+    params.append("status", status);
+  }
+  
+  const queryString = params.toString() ? `?${params.toString()}` : "";
+  const url = `/api/candidates${queryString}`;
+  return jsonFetch<any>(url).then(response => unwrapCandidatesResponse(response));
+}
+
+export interface ResolveCandidateRequest {
+  candidate_id: string | number;
+  decision: "accept" | "reject";
+  reason?: string;
+}
+
+export interface ResolveCandidateResponse {
+  ok?: boolean;
+  status?: string;
+  success?: boolean;
+  error?: string;
+}
+
+/**
+ * Resolves a candidate (accept or reject).
+ * POST /api/resolve-candidate
+ * Note: sends 'accept'/'reject' per daemon vocabulary (not 'accepted'/'rejected')
+ */
+export function resolveCandidate(
+  candidateId: string | number,
+  decision: "accept" | "reject",
+  reason?: string,
+): Promise<ResolveCandidateResponse> {
+  const url = "/api/resolve-candidate";
+  return jsonFetch<any>(url, {
+    method: "POST",
+    body: JSON.stringify({
+      candidate_id: candidateId,
+      decision,
+      reason,
+    }),
+  }).then(response => {
+    // Check for failure indicators in response body (DEFECT 3)
+    if (response && typeof response === 'object') {
+      if (response.ok === false) {
+        throw new Error(response.error || 'Resolution failed');
+      }
+      if (response.status === 'error') {
+        throw new Error(response.error || 'Resolution failed');
+      }
+    }
+    return response as ResolveCandidateResponse;
+  });
+}

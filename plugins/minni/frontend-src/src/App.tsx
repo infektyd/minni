@@ -72,6 +72,7 @@ export function App() {
   const [statusLoading, setStatusLoading] = useState(true);
   const [statusError, setStatusError] = useState<string | null>(null);
   const [authRequired, setAuthRequired] = useState(false);
+  const [tokenRefreshTrigger, setTokenRefreshTrigger] = useState(0);
 
   const [railW, setRailW] = useLayoutSize("railW", 248);
   const [inspW, setInspW] = useLayoutSize("inspW", 384);
@@ -197,7 +198,10 @@ export function App() {
   if (authRequired) {
     return (
       <div className="app board-app" data-screen="token-gate" data-theme-layout="default">
-        <TokenGate onSubmit={() => void refreshStatus(() => true)} />
+        <TokenGate onSubmit={() => {
+        void refreshStatus(() => true);
+        setTokenRefreshTrigger(prev => prev + 1);
+      }} />
       </div>
     );
   }
@@ -216,6 +220,7 @@ export function App() {
           health={health}
           audit={audit}
           onOpenConsole={() => setActive("recall")}
+          tokenRefreshTrigger={tokenRefreshTrigger}
         />
       </div>
     );

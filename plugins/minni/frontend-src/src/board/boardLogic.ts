@@ -242,7 +242,11 @@ export function sortLearnings(
   sort: "score" | "age",
 ): BoardLearning[] {
   const out = [...list];
-  if (sort === "score") out.sort((a, b) => b.score - a.score);
+  if (sort === "score") out.sort((a, b) => {
+    const bScore = typeof b.score === 'number' ? b.score : 0;
+    const aScore = typeof a.score === 'number' ? a.score : 0;
+    return bScore - aScore;
+  });
   else out.sort((a, b) => a.order - b.order);
   return out;
 }

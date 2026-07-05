@@ -10,6 +10,7 @@ import {
   type DaemonInfo,
   type ZoneId,
 } from "./boardData";
+import { type StagedLearningsState } from "./boardDataHook";
 import { applyVerdict, pendingCount, sortLearnings, type Verdict } from "./boardLogic";
 
 export interface BoardDetailContext {
@@ -26,36 +27,79 @@ function Meter({ v }: { v: number }) {
 }
 
 // ── STAGED — filterable, sortable wall of learnings ─────────────────────────
-function StagedDetail() {
+function StagedDetail({ stagedState }: { stagedState?: StagedLearningsState }) {
   const [filter, setFilter] = useState<string>("all");
   const [sort, setSort] = useState<"score" | "age">("score");
   const [sel, setSel] = useState<string | null>(null);
   const [verdicts, setVerdicts] = useState<Record<string, Verdict>>({});
+  const [resError, setResError] = useState<string | null>(null);
+  const [resolvingId, setResolvingId] = useState<string | null>(null);
+
+  const learnings = stagedState?.learnings || SAMPLE_LEARNINGS;
+  const isLive = stagedState?.isLive ?? false;
+  const resolve = stagedState?.resolve;
+
+  // DEFECT 6: Clear verdicts for resolved rows when learnings shrink after refetch
+  useMemo(() => {
+    if (isLive) {
+      const liveIds = new Set(learnings.map(l => l.id));
+      setVerdicts(prev => {
+        const cleaned = { ...prev };
+        let changed = false;
+        for (const id of Object.keys(cleaned)) {
+          if (!liveIds.has(id)) {
+            delete cleaned[id];
+            changed = true;
+          }
+        }
+        return changed ? cleaned : prev;
+      });
+    }
+  }, [learnings, isLive]);
 
   const agents = useMemo(() => {
     const m: Record<string, number> = {};
-    SAMPLE_LEARNINGS.forEach((l) => {
+    learnings.forEach((l) => {
       m[l.agent] = (m[l.agent] || 0) + 1;
     });
     return m;
-  }, []);
+  }, [learnings]);
 
   const list = useMemo(() => {
     const base =
       filter === "all"
-        ? SAMPLE_LEARNINGS
-        : SAMPLE_LEARNINGS.filter((l) => l.agent === filter);
+        ? learnings
+        : learnings.filter((l) => l.agent === filter);
     // "recency" is a real sort on the chronological `order` (0 = newest), not a
     // no-op relying on array order — see sortLearnings in boardLogic.
     return sortLearnings(base, sort);
-  }, [filter, sort]);
+  }, [filter, sort, learnings]);
 
-  const pending = pendingCount(SAMPLE_LEARNINGS.length, verdicts);
+  const pending = pendingCount(learnings.length, verdicts);
 
   // Toggling a verdict off DELETES the key (not `undefined`) so PENDING
   // recovers — see applyVerdict in boardLogic.
-  const verdict = (id: string, v: Verdict) =>
-    setVerdicts((prev) => applyVerdict(prev, id, v));
+  const verdict = async (id: string, v: Verdict) => {
+    // DEFECT 7: Guard against double-click / in-flight race
+    if (resolvingId === id) return;
+    
+    if (isLive && resolve) {
+      // Call API resolution when live
+      setResError(null);
+      setResolvingId(id);
+      try {
+        const decision = v === "ok" ? "accepted" : "rejected";
+        await resolve(id, decision);
+      } catch (err: any) {
+        setResError(err?.message || "Resolution failed");
+      } finally {
+        setResolvingId(null);
+      }
+    } else {
+      // Local verdict tracking in sample mode
+      setVerdicts((prev) => applyVerdict(prev, id, v));
+    }
+  };
 
   return (
     <div className="dz">
@@ -105,8 +149,8 @@ function StagedDetail() {
               <div className="lc-top">
                 <span className="dot" style={{ background: agentColor(l.agent) }} />
                 <span className="lc-agent">{l.agent}</span>
-                <Meter v={l.score} />
-                <span className="lc-score">{l.score.toFixed(2)}</span>
+                {typeof l.score === 'number' ? <Meter v={l.score} /> : <span className="meter-placeholder">—</span>}
+                <span className="lc-score">{typeof l.score === 'number' ? l.score.toFixed(2) : l.score}</span>
               </div>
               <div className="lc-title">{l.title}</div>
               <div className="lc-meta">
@@ -127,6 +171,7 @@ function StagedDetail() {
                   <Fragment>
                     <button
                       className="bd-btn primary sm"
+                      disabled={resolvingId === l.id}
                       onClick={(e) => {
                         e.stopPropagation();
                         verdict(l.id, "ok");
@@ -136,6 +181,7 @@ function StagedDetail() {
                     </button>
                     <button
                       className="bd-btn quiet sm"
+                      disabled={resolvingId === l.id}
                       onClick={(e) => {
                         e.stopPropagation();
                         verdict(l.id, "no");
@@ -162,7 +208,9 @@ function StagedDetail() {
         })}
       </div>
       <div className="dz-foot">
-        Sample candidates only. Nothing is stored from this board pass.
+        {isLive
+          ? "Decisions submitted to daemon via /api/resolve-candidate"
+          : "Sample candidates only. Nothing is stored from this board pass."}
       </div>
     </div>
   );
@@ -416,10 +464,10 @@ function RecallDetail() {
   );
 }
 
-export function ZoneDetail({ id, ctx }: { id: ZoneId; ctx: BoardDetailContext }) {
+export function ZoneDetail({ id, ctx, stagedState }: { id: ZoneId; ctx: BoardDetailContext; stagedState?: StagedLearningsState }) {
   switch (id) {
     case "staged":
-      return <StagedDetail />;
+      return <StagedDetail stagedState={stagedState} />;
     case "agents":
       return <AgentsDetail />;
     case "hub":
