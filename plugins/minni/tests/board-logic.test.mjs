@@ -1,8 +1,8 @@
 // Unit coverage for the Memory Board's pure logic — the two explicitly-required
 // prototype-defect fixes (verdict-undo, "recency" sort) and the overview
-// slot-grid collision guard. These import the framework-free boardLogic.ts
-// directly (Node strips the types), so a regression that reintroduces either
-// bug fails here even though typecheck/lint/build:frontend would not catch it.
+// slot-grid collision guard. Imports the compiled board modules (see
+// `build:board-test` / scripts/build_board_test.mjs) so the suite
+// stays runnable with plain `node --test` on Node 20 CI (no .ts loader).
 import assert from "node:assert/strict";
 import test from "node:test";
 
@@ -27,11 +27,11 @@ import {
   WHEEL_ZOOM_DELTA,
   ZOOM_MAX,
   ZOOM_MIN_FACTOR,
-} from "../frontend-src/src/board/boardLogic.ts";
-
-import {
+  humanizeAge,
+  mapCandidateToBoardLearning,
+  mapCandidates,
   unwrapCandidatesResponse,
-} from "../frontend-src/src/api.ts";
+} from "./.compiled/board-test.mjs";
 
 const LEARNINGS = [
   { id: "a", agent: "codex", score: 0.4, order: 2 },
@@ -477,12 +477,6 @@ test("stagedSlot overflow grid never overlaps designer slots or itself", () => {
 });
 
 // ── Staged learnings data mapping (sample/live split) ──────────────────────
-
-import {
-  humanizeAge,
-  mapCandidateToBoardLearning,
-  mapCandidates,
-} from "../frontend-src/src/board/boardData.ts";
 
 test("humanizeAge formats relative age correctly", () => {
   const now = new Date();
