@@ -110,7 +110,7 @@ export function PacketScreen({ packet, evidence, selected }: Props) {
       <div className="work-grid">
         <div className="panel">
           <PanelHeader
-            title="<sovereign:context> envelope"
+            title="<minni:context> envelope"
             sub={packet.contextMarkdown ? "markdown · read-only" : "json preview"}
             actions={
               <>

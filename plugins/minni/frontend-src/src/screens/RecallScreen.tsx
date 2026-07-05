@@ -131,7 +131,7 @@ export function RecallScreen({
             <div className="recall-search">
               <div className="recall-search-prefix">
                 <span style={{ width: 8, height: 8, background: "var(--verdigris)" }} />
-                sovereign_recall
+                minni_recall
               </div>
               <input
                 value={query}

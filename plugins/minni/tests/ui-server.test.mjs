@@ -187,7 +187,7 @@ test("UI server exposes local status, prepare, outcome, audit, and static assets
     assert.equal(deepPlan.id, "v1_plan");
 
     const indexHtml = await fetch(`${server.baseUrl}/`, { headers: authHeaders() }).then((response) => response.text());
-    assert.match(indexHtml, /Sovereign Memory Console/);
+    assert.match(indexHtml, /Minni Memory Console/);
 
     assert.deepEqual(server.calls.map(([name]) => name), ["prepareTask", "prepareOutcome", "deepPlan"]);
   } finally {
@@ -323,14 +323,14 @@ test("frontend bundle calls the local bridge endpoints", async () => {
   assert.match(js, /\/api\/health/);
 });
 
-test("frontend ships the sovereign command center design and stays local-only", async () => {
+test("frontend ships the Minni command center design and stays local-only", async () => {
   const [html, js, css] = await Promise.all([
     readFile(path.join(process.cwd(), "frontend", "index.html"), "utf8"),
     readFile(path.join(process.cwd(), "frontend", "app.js"), "utf8"),
     readFile(path.join(process.cwd(), "frontend", "styles.css"), "utf8"),
   ]);
 
-  assert.match(html, /Sovereign Memory Console/);
+  assert.match(html, /Minni Memory Console/);
   assert.match(html, /command-center-shell/);
   assert.doesNotMatch(html, /unpkg\.com|fonts\.googleapis\.com|text\/babel/);
 
@@ -338,6 +338,7 @@ test("frontend ships the sovereign command center design and stays local-only", 
   assert.match(js, /Recall/);
   assert.match(js, /Prepare Packet/);
   assert.match(js, /Dry-run Review/);
+  assert.match(js, /Memory Board/);
   assert.match(js, /Audit Trail/);
   assert.match(js, /Settings/);
   // No write / learn endpoints exposed to the browser
@@ -347,6 +348,9 @@ test("frontend ships the sovereign command center design and stays local-only", 
   assert.match(css, /--graphite/);
   assert.match(css, /--verdigris/);
   assert.match(css, /--persimmon/);
+  // Memory Board design tokens must survive the build:frontend embedding.
+  assert.match(css, /--bd-gold/);
+  assert.match(css, /--bd-ac-claude/);
   // Minifier drops quotes around static attribute values, so accept either form.
   assert.match(css, /data-theme=("?)phosphor\1/);
 });
@@ -401,6 +405,34 @@ test("PR91-4: /api/prepare-task returns 403 on missing or invalid bearer token",
       body: JSON.stringify({ task: "x", summary: "y", changedFiles: [], verification: [] }),
     });
     assert.equal(wrongLen.status, 403, "wrong-length token => 403");
+  } finally {
+    await server.close();
+  }
+});
+
+// ── Static shell is public; the data plane stays locked ─────────────────────
+// The browser must be able to load index.html/app.js WITHOUT a token so it can
+// reach the in-app token gate; every /api route except /api/health still 403s.
+test("static shell serves without auth while /api stays locked", async () => {
+  const server = await startTestServer();
+  try {
+    const index = await fetch(`${server.baseUrl}/`);
+    assert.equal(index.status, 200, "index.html => 200 without token");
+    const html = await index.text();
+    assert.match(html, /<div id="root">/, "serves the app shell");
+
+    const js = await fetch(`${server.baseUrl}/app.js`);
+    assert.equal(js.status, 200, "app.js => 200 without token");
+
+    const health = await fetch(`${server.baseUrl}/api/health`);
+    assert.equal(health.status, 200, "/api/health stays open");
+
+    const status = await fetch(`${server.baseUrl}/api/status`);
+    assert.equal(status.status, 403, "/api/status still locked without token");
+
+    // Traversal out of staticRoot is still refused even unauthenticated.
+    const escape = await fetch(`${server.baseUrl}/..%2f..%2fpackage.json`);
+    assert.notEqual(escape.status, 200, "path traversal refused");
   } finally {
     await server.close();
   }

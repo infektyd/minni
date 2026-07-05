@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import {
+  AuthRequiredError,
   getAuditTail,
   getHealth,
   getStatus,
@@ -15,6 +16,7 @@ import { Inspector } from "./components/Inspector";
 import { Rail } from "./components/Rail";
 import { ResizeHandle } from "./components/ResizeHandle";
 import { StatusBand, deriveStatusStats } from "./components/StatusBand";
+import { TokenGate } from "./components/TokenGate";
 import {
   ActivityStream,
   TelemetryRail,
@@ -28,6 +30,7 @@ import {
 import { useLayoutSize, resetAllLayout } from "./hooks/useLayoutSize";
 import { useTweaks } from "./hooks/useTweaks";
 import { AuditScreen } from "./screens/AuditScreen";
+import { BoardScreen } from "./screens/BoardScreen";
 import { DryrunScreen } from "./screens/DryrunScreen";
 import { PacketScreen } from "./screens/PacketScreen";
 import { RecallScreen } from "./screens/RecallScreen";
@@ -42,6 +45,7 @@ type ScreenId =
   | "recall"
   | "packet"
   | "dryrun"
+  | "board"
   | "handoffs"
   | "vaults"
   | "audit"
@@ -50,7 +54,10 @@ type ScreenId =
 
 export function App() {
   const [tweaks, setTweak] = useTweaks();
-  const [active, setActive] = useState<ScreenId>("recall");
+  // The Memory Board is the frontend: it is the landing view. The v1 console
+  // shell stays intact underneath — reachable via the board's "console v1"
+  // chip, and the rail's Board entry leads back here.
+  const [active, setActive] = useState<ScreenId>("board");
   const [query, setQuery] = useState("");
   const [profile, setProfile] = useState<TaskProfile>("standard");
   const [packet, setPacket] = useState<PreparedTaskPacket | null>(null);
@@ -64,36 +71,44 @@ export function App() {
   const [audit, setAudit] = useState<AuditTailResult | null>(null);
   const [statusLoading, setStatusLoading] = useState(true);
   const [statusError, setStatusError] = useState<string | null>(null);
+  const [authRequired, setAuthRequired] = useState(false);
 
   const [railW, setRailW] = useLayoutSize("railW", 248);
   const [inspW, setInspW] = useLayoutSize("inspW", 384);
   const [activityW, setActivityW] = useLayoutSize("activityW", 320);
 
-  const refreshStatus = async () => {
+  const refreshStatus = async (mounted: () => boolean) => {
+    if (!mounted()) return;
     setStatusLoading(true);
     setStatusError(null);
-    try {
-      const [s, h, a] = await Promise.all([
-        getStatus().catch((err) => {
-          throw err;
-        }),
-        getHealth().catch(() => null),
-        getAuditTail(20).catch(() => null),
-      ]);
-      setStatus(s);
-      setHealth(h);
-      setAudit(a);
-    } catch (err) {
-      setStatusError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setStatusLoading(false);
+    const [s, h, a] = await Promise.allSettled([
+      getStatus(),
+      getHealth(),
+      getAuditTail(20),
+    ]);
+    if (!mounted()) return;
+    if (s.status === "fulfilled") {
+      setStatus(s.value);
+      setAuthRequired(false);
+    } else {
+      setStatus(null);
+      setStatusError(s.reason instanceof Error ? s.reason.message : String(s.reason));
+      if (s.reason instanceof AuthRequiredError) setAuthRequired(true);
     }
+    setHealth(h.status === "fulfilled" ? h.value : null);
+    setAudit(a.status === "fulfilled" ? a.value : null);
+    setStatusLoading(false);
   };
 
   useEffect(() => {
-    void refreshStatus();
-    const id = window.setInterval(() => void refreshStatus(), 30_000);
-    return () => window.clearInterval(id);
+    let alive = true;
+    const mounted = () => alive;
+    void refreshStatus(mounted);
+    const id = window.setInterval(() => void refreshStatus(mounted), 30_000);
+    return () => {
+      alive = false;
+      window.clearInterval(id);
+    };
   }, []);
 
   const focusSource = useMemo(
@@ -104,6 +119,7 @@ export function App() {
   const effectiveInspector =
     tweaks.theme === "phosphor" ? "overlay" : tweaks.inspector;
   const showInspector = active === "recall";
+  const isPhosphor = tweaks.theme === "phosphor";
 
   const counts: Record<string, string> = {
     recall: evidence.length ? String(evidence.length) : "",
@@ -166,7 +182,9 @@ export function App() {
             health={health}
             loading={statusLoading}
             error={statusError}
-            onRefresh={() => void refreshStatus()}
+            theme={tweaks.theme}
+            onThemeChange={(theme) => setTweak("theme", theme)}
+            onRefresh={() => void refreshStatus(() => true)}
           />
         );
       default:
@@ -174,7 +192,35 @@ export function App() {
     }
   };
 
-  const isPhosphor = tweaks.theme === "phosphor";
+  // Auth gate: the static shell loads without a token, but the API is locked.
+  // Nothing meaningful renders until a valid token is stored.
+  if (authRequired) {
+    return (
+      <div className="app board-app" data-screen="token-gate" data-theme-layout="default">
+        <TokenGate onSubmit={() => void refreshStatus(() => true)} />
+      </div>
+    );
+  }
+
+  // Board mode: full-viewport, no rail/band chrome — the board IS the UI.
+  if (active === "board") {
+    return (
+      <div
+        className="app board-app"
+        data-screen="board"
+        data-density={tweaks.density}
+        data-theme-layout={isPhosphor ? "operator" : "default"}
+      >
+        <BoardScreen
+          status={status}
+          health={health}
+          audit={audit}
+          onOpenConsole={() => setActive("recall")}
+        />
+      </div>
+    );
+  }
+
   const gridStyle: React.CSSProperties = {
     "--rail-w": railW + "px",
     "--insp-w": inspW + "px",
@@ -187,6 +233,7 @@ export function App() {
       data-inspector={effectiveInspector}
       data-band={tweaks.band}
       data-theme-layout={isPhosphor ? "operator" : "default"}
+      data-screen={active}
       style={gridStyle}
     >
       <Rail active={active} onSelect={(id) => setActive(id as ScreenId)} counts={counts} />
@@ -198,7 +245,7 @@ export function App() {
             <button
               className="btn btn-secondary btn-sm"
               type="button"
-              onClick={() => void refreshStatus()}
+              onClick={() => void refreshStatus(() => true)}
               disabled={statusLoading}
             >
               {statusLoading ? "…" : "Refresh"}

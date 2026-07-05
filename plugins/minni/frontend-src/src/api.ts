@@ -89,11 +89,71 @@ export interface JsonResult<T = unknown> {
   error?: string;
 }
 
+export interface DaemonRuntimeStatus {
+  version?: string;
+  uptime_seconds?: number;
+  requests_served?: number;
+  socket_path?: string;
+}
+
+export interface EngineStats {
+  documents?: number;
+  chunks?: number;
+  learnings?: number;
+  events?: number;
+}
+
+export interface EngineStatus {
+  db_ok?: boolean;
+  db_path?: string;
+  faiss_ok?: boolean;
+  faiss_path?: string;
+  stats?: EngineStats;
+  audit_volume?: number;
+}
+
+export interface AfmRuntimeStatus {
+  ok?: boolean;
+  mode?: string;
+  status?: string;
+  native_health?: string;
+  native_available?: boolean;
+  backend?: string;
+  availability?: string;
+  generation_verified?: boolean;
+  reachable?: boolean;
+}
+
+export interface SocketStatusData {
+  daemon?: DaemonRuntimeStatus;
+  engine?: EngineStatus;
+  afm?: AfmRuntimeStatus;
+}
+
+export interface AfmProviderStatus {
+  mode?: string;
+  provider?: string;
+  status?: string;
+  available?: boolean;
+  adapterConfigured?: boolean;
+  reason?: string;
+}
+
+export interface ExtractorStatus {
+  provider?: string;
+  tier?: string;
+  generationVerified?: boolean;
+  probeAgeMs?: number;
+}
+
 export interface StatusReport {
   vault: { path: string; exists: boolean };
-  socket: JsonResult;
-  afm: JsonResult;
-  audit: { entries: number; latest?: string };
+  socket: JsonResult<SocketStatusData>;
+  /** afm.ok means verified generation health, not mere bridge reachability. */
+  afm: JsonResult<Record<string, unknown>>;
+  afmProvider?: AfmProviderStatus;
+  extractor?: ExtractorStatus;
+  audit: { entries: number; latest?: string; volume?: number };
 }
 
 export interface AuditTailResult {
@@ -288,19 +348,76 @@ export function evidenceFromSource(
   };
 }
 
-// ---- Fetch wrappers (same-origin; ui-server enforces auth) ----
+// ---- Console auth token ----
+// The static shell loads without auth, but every /api route requires
+// Authorization: Bearer <token>. The token arrives either as a ?token= URL
+// param (printed by the ui-server on startup) — captured once, persisted, and
+// stripped from the address bar — or typed into the in-app token gate.
+
+const TOKEN_STORAGE_KEY = "minni-console-token";
+
+export class AuthRequiredError extends Error {
+  constructor() {
+    super("console token required");
+    this.name = "AuthRequiredError";
+  }
+}
+
+function bootstrapTokenFromUrl(): void {
+  if (typeof window === "undefined") return;
+  const url = new URL(window.location.href);
+  const token = url.searchParams.get("token");
+  if (!token) return;
+  try {
+    window.localStorage.setItem(TOKEN_STORAGE_KEY, token);
+  } catch {
+    // storage unavailable (private mode) — token still works for this load via memory
+    memoryToken = token;
+  }
+  url.searchParams.delete("token");
+  window.history.replaceState(null, "", url.pathname + url.search + url.hash);
+}
+
+let memoryToken: string | null = null;
+bootstrapTokenFromUrl();
+
+export function getConsoleToken(): string | null {
+  if (memoryToken) return memoryToken;
+  if (typeof window === "undefined") return null;
+  try {
+    return window.localStorage.getItem(TOKEN_STORAGE_KEY);
+  } catch {
+    return null;
+  }
+}
+
+export function setConsoleToken(token: string): void {
+  memoryToken = token;
+  try {
+    window.localStorage.setItem(TOKEN_STORAGE_KEY, token);
+  } catch {
+    // memoryToken carries it for this session
+  }
+}
+
+// ---- Fetch wrappers (same-origin; ui-server enforces auth on /api) ----
 
 async function jsonFetch<T>(url: string, init?: RequestInit): Promise<T> {
+  const token = getConsoleToken();
   const res = await fetch(url, {
     ...init,
     headers: {
       Accept: "application/json",
       ...(init?.body ? { "Content-Type": "application/json" } : {}),
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
       ...(init?.headers || {}),
     },
   });
   if (!res.ok) {
     const text = await res.text().catch(() => "");
+    if (res.status === 403 && text.includes("console_auth_required")) {
+      throw new AuthRequiredError();
+    }
     throw new Error(`${res.status} ${res.statusText}${text ? ` — ${text}` : ""}`);
   }
   return (await res.json()) as T;

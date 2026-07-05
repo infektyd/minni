@@ -1,4 +1,4 @@
-/* Sovereign Memory Console — system tokens from DESIGN.md */
+/* Minni Memory Console — system tokens from DESIGN.md */
 :root {
   /* paper + ink */
   --primary: #181613;
@@ -1106,4 +1106,39 @@ input, textarea, select { font: inherit; color: inherit; }
   .state-banner.is-loading::before { animation: none; }
   .activity-head-dot,
   .telemetry-trace-step.is-active { animation: none; }
+}
+
+/* ── Token gate — shown until the console token authorizes the API ── */
+.token-gate {
+  position: fixed;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  background: var(--paper, #f4f1ea);
+}
+.token-gate-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  width: min(420px, calc(100vw - 48px));
+  padding: 24px;
+  border: 1px solid var(--line, #d8d2c4);
+  background: var(--panel, #fffdf8);
+}
+.token-gate-title {
+  font-weight: 600;
+  letter-spacing: 0.04em;
+}
+.token-gate-hint {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--ink-dim, #6b6557);
+}
+.token-gate-panel input {
+  padding: 8px 10px;
+  border: 1px solid var(--line, #d8d2c4);
+  background: transparent;
+  color: inherit;
+  font: inherit;
 }

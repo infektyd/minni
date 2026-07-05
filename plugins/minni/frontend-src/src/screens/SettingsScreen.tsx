@@ -11,6 +11,8 @@ interface Props {
   health: HealthReport | null;
   loading: boolean;
   error: string | null;
+  theme: "paper" | "phosphor";
+  onThemeChange: (theme: "paper" | "phosphor") => void;
   onRefresh: () => void;
 }
 
@@ -28,7 +30,15 @@ function dot(ok: boolean | undefined) {
   );
 }
 
-export function SettingsScreen({ status, health, loading, error, onRefresh }: Props) {
+export function SettingsScreen({
+  status,
+  health,
+  loading,
+  error,
+  theme,
+  onThemeChange,
+  onRefresh,
+}: Props) {
   return (
     <>
       <ArchivalBand
@@ -136,6 +146,26 @@ export function SettingsScreen({ status, health, loading, error, onRefresh }: Pr
                   ))
                 )}
               </div>
+            </div>
+          </div>
+        </div>
+
+        <div className="panel">
+          <PanelHeader title="Theme" sub="local console tweaks" />
+          <div className="panel-body" style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+            <Row label="Current" value={theme} />
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+              {(["paper", "phosphor"] as const).map((value) => (
+                <button
+                  key={value}
+                  type="button"
+                  className={"btn btn-secondary btn-sm" + (theme === value ? " active" : "")}
+                  aria-pressed={theme === value}
+                  onClick={() => onThemeChange(value)}
+                >
+                  {value === "paper" ? "Paper theme" : "Phosphor theme"}
+                </button>
+              ))}
             </div>
           </div>
         </div>

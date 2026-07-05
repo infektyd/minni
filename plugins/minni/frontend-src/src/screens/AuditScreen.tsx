@@ -32,7 +32,7 @@ function parseEntry(raw: string): ParsedEntry {
     return {
       raw,
       time: ts.includes("T") ? ts.slice(11, 19) : ts,
-      actor: tool.startsWith("sovereign_") ? "sovrd" : tool || "—",
+      actor: tool.startsWith("minni_") || tool.startsWith("sovereign_") ? "minnid" : tool || "—",
       op: tool || "—",
       target: summary || "—",
       result: "",
