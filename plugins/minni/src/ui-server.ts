@@ -172,6 +172,23 @@ function parseAuditLimit(value: string | null): number {
   return Math.max(1, Math.min(Math.trunc(parsed), 100));
 }
 
+function parseCandidatesLimit(value: string | null): number {
+  const parsed = Number(value ?? 50);
+  if (!Number.isFinite(parsed)) return 50;
+  return Math.max(1, Math.min(Math.trunc(parsed), 200));
+}
+
+// Daemon agent ids are lowercase slugs; anything else is rejected rather than
+// forwarded as a principal claim.
+const AGENT_ID_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/;
+
+// The env fallback sentinel resolves to a default-deny principal daemon-side,
+// which would render the staged wall permanently (and silently) empty.
+function candidatesAgentId(param: string | null): string | undefined {
+  if (param && AGENT_ID_RE.test(param)) return param;
+  return DEFAULT_AGENT_ID === "unknown-agent" ? undefined : DEFAULT_AGENT_ID;
+}
+
 function contentTypeFor(filePath: string): string {
   if (filePath.endsWith(".html")) return "text/html; charset=utf-8";
   if (filePath.endsWith(".css")) return "text/css; charset=utf-8";
@@ -581,12 +598,14 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       if (req.method === "GET" && url.pathname === "/api/candidates") {
         try {
           const { jsonRpcSocketRequestWithFallback } = await import("./sovereign.js");
-          const limit = parseInt(url.searchParams.get("limit") || "50", 10);
+          const limit = parseCandidatesLimit(url.searchParams.get("limit"));
           const status = url.searchParams.get("status") || undefined;
+          const agentId = candidatesAgentId(url.searchParams.get("agent_id"));
           const rpc = await jsonRpcSocketRequestWithFallback("list_candidates", {
-            limit: Math.min(limit, 200),
+            limit,
             status,
-            agent_id: DEFAULT_AGENT_ID,
+            // Omitted → the daemon stamps the local operator principal.
+            ...(agentId ? { agent_id: agentId } : {}),
           });
           sendJson(res, 200, redactLocalValue(rpc));
         } catch (e) {
@@ -602,11 +621,12 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         const body = await readJsonBody(req);
         try {
           const { jsonRpcSocketRequestWithFallback } = await import("./sovereign.js");
+          const resolveAgentId = candidatesAgentId(null);
           const rpc = await jsonRpcSocketRequestWithFallback("resolve_candidate", {
             candidate_id: body.candidate_id,
             decision: body.decision,
             reason: body.reason || body.resolution_reason || "",
-            agent_id: DEFAULT_AGENT_ID,
+            ...(resolveAgentId ? { agent_id: resolveAgentId } : {}),
           });
           sendJson(res, 200, redactLocalValue(rpc));
         } catch (e) {

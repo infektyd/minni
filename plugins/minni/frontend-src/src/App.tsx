@@ -92,12 +92,16 @@ export function App() {
       setStatus(s.value);
       setAuthRequired(false);
     } else {
-      setStatus(null);
+      // Keep the last-known-good status: a transient poll failure must not
+      // blank the board to its offline state between 30s ticks.
       setStatusError(s.reason instanceof Error ? s.reason.message : String(s.reason));
-      if (s.reason instanceof AuthRequiredError) setAuthRequired(true);
+      if (s.reason instanceof AuthRequiredError) {
+        setStatus(null);
+        setAuthRequired(true);
+      }
     }
-    setHealth(h.status === "fulfilled" ? h.value : null);
-    setAudit(a.status === "fulfilled" ? a.value : null);
+    if (h.status === "fulfilled") setHealth(h.value);
+    if (a.status === "fulfilled") setAudit(a.value);
     setStatusLoading(false);
   };
 
@@ -220,6 +224,7 @@ export function App() {
           health={health}
           audit={audit}
           onOpenConsole={() => setActive("recall")}
+          onAuthRequired={() => setAuthRequired(true)}
           tokenRefreshTrigger={tokenRefreshTrigger}
         />
       </div>

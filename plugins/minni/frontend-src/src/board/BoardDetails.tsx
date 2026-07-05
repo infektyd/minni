@@ -109,7 +109,7 @@ function StagedDetail({ stagedState }: { stagedState?: StagedLearningsState }) {
             className={"fchip" + (filter === "all" ? " on" : "")}
             onClick={() => setFilter("all")}
           >
-            All · {SAMPLE_LEARNINGS.length}
+            All · {learnings.length}
           </button>
           {Object.keys(agents).map((a) => (
             <button

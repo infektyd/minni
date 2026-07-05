@@ -353,6 +353,11 @@ export function evidenceFromSource(
 // Authorization: Bearer <token>. The token arrives either as a ?token= URL
 // param (printed by the ui-server on startup) — captured once, persisted, and
 // stripped from the address bar — or typed into the in-app token gate.
+//
+// sessionStorage, not localStorage: web origins are scheme+host+port, so a
+// localStorage token would be readable forever by any future app served on
+// the same localhost port. Tab-scoped lifetime is the acceptable trade — the
+// startup URL re-auths a fresh tab in one click.
 
 const TOKEN_STORAGE_KEY = "minni-console-token";
 
@@ -363,17 +368,27 @@ export class AuthRequiredError extends Error {
   }
 }
 
-function bootstrapTokenFromUrl(): void {
-  if (typeof window === "undefined") return;
-  const url = new URL(window.location.href);
-  const token = url.searchParams.get("token");
-  if (!token) return;
+function storeToken(token: string): void {
   try {
-    window.localStorage.setItem(TOKEN_STORAGE_KEY, token);
+    window.sessionStorage.setItem(TOKEN_STORAGE_KEY, token);
   } catch {
     // storage unavailable (private mode) — token still works for this load via memory
     memoryToken = token;
   }
+}
+
+function bootstrapTokenFromUrl(): void {
+  if (typeof window === "undefined") return;
+  // One-time migration: purge tokens persisted by earlier builds.
+  try {
+    window.localStorage.removeItem(TOKEN_STORAGE_KEY);
+  } catch {
+    // ignore
+  }
+  const url = new URL(window.location.href);
+  const token = url.searchParams.get("token");
+  if (!token) return;
+  storeToken(token);
   url.searchParams.delete("token");
   window.history.replaceState(null, "", url.pathname + url.search + url.hash);
 }
@@ -385,7 +400,7 @@ export function getConsoleToken(): string | null {
   if (memoryToken) return memoryToken;
   if (typeof window === "undefined") return null;
   try {
-    return window.localStorage.getItem(TOKEN_STORAGE_KEY);
+    return window.sessionStorage.getItem(TOKEN_STORAGE_KEY);
   } catch {
     return null;
   }
@@ -393,11 +408,7 @@ export function getConsoleToken(): string | null {
 
 export function setConsoleToken(token: string): void {
   memoryToken = token;
-  try {
-    window.localStorage.setItem(TOKEN_STORAGE_KEY, token);
-  } catch {
-    // memoryToken carries it for this session
-  }
+  storeToken(token);
 }
 
 // ---- Fetch wrappers (same-origin; ui-server enforces auth on /api) ----

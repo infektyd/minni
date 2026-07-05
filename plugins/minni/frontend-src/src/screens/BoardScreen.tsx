@@ -8,6 +8,7 @@ import {
   type CSSProperties,
 } from "react";
 import {
+  AuthRequiredError,
   getAuditTail,
   type AuditTailResult,
   type HealthReport,
@@ -73,6 +74,7 @@ export function BoardScreen({
   health,
   audit,
   onOpenConsole,
+  onAuthRequired,
   tokenRefreshTrigger,
 }: {
   status: StatusReport | null;
@@ -80,6 +82,8 @@ export function BoardScreen({
   audit: AuditTailResult | null;
   /** Switch back to the v1 console shell. */
   onOpenConsole?: () => void;
+  /** The console token was rejected — raise the token gate now. */
+  onAuthRequired?: () => void;
   tokenRefreshTrigger?: number;
 }) {
   const [stageRef, vp] = useElementSize();
@@ -238,11 +242,11 @@ export function BoardScreen({
         (target.tagName === "INPUT" ||
           target.tagName === "TEXTAREA" ||
           target.isContentEditable);
+      if (typing) return;
       if (e.key === "Escape") {
         setFocus(null);
         return;
       }
-      if (typing) return;
       if (e.key !== "ArrowRight" && e.key !== "ArrowLeft") return;
       if (!focus) {
         setFocus(BOARD_ORDER[0]);
@@ -307,8 +311,11 @@ export function BoardScreen({
         setFlowFeed((f) =>
           [...f, ...fresh.map((e) => ({ seq: ++seqRef.current, flow: flowForAuditEntry(e) }))].slice(-24),
         );
-      } catch {
-        if (!stopped) setAuditLive(false);
+      } catch (err) {
+        if (stopped) return;
+        setAuditLive(false);
+        // An expired token must raise the gate, not degrade to fake ambience.
+        if (err instanceof AuthRequiredError) onAuthRequired?.();
       }
     };
     void poll();
