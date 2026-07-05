@@ -12,6 +12,7 @@ export const NAV: NavItem[] = [
   { id: "recall", label: "Recall", glyph: "square" },
   { id: "packet", label: "Prepare Packet", glyph: "bar" },
   { id: "dryrun", label: "Dry-run Review", glyph: "diamond" },
+  { id: "board", label: "Memory Board", glyph: "diamond" },
   { section: "AGENTS" },
   { id: "handoffs", label: "Handoffs", glyph: "cross" },
   { id: "vaults", label: "Vaults", glyph: "dot" },
@@ -35,7 +36,7 @@ export function Rail({
       <div className="rail-brand">
         <div className="rail-brand-mark" />
         <div className="rail-brand-text">
-          <div className="rail-brand-title">SOVEREIGN</div>
+          <div className="rail-brand-title">MINNI</div>
           <div className="rail-brand-sub">memory · v4.2</div>
         </div>
       </div>

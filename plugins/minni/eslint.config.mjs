@@ -14,6 +14,7 @@ export default tseslint.config(
   {
     ignores: [
       "dist/**",
+      "tests/.compiled/**",
       // frontend/** is the built Vite bundle (minified app.js etc.), a
       // generated artifact — linting it is meaningless. The real frontend
       // SOURCE under frontend-src/** IS linted (see the config block below).

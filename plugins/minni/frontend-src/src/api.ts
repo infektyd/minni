@@ -89,11 +89,71 @@ export interface JsonResult<T = unknown> {
   error?: string;
 }
 
+export interface DaemonRuntimeStatus {
+  version?: string;
+  uptime_seconds?: number;
+  requests_served?: number;
+  socket_path?: string;
+}
+
+export interface EngineStats {
+  documents?: number;
+  chunks?: number;
+  learnings?: number;
+  events?: number;
+}
+
+export interface EngineStatus {
+  db_ok?: boolean;
+  db_path?: string;
+  faiss_ok?: boolean;
+  faiss_path?: string;
+  stats?: EngineStats;
+  audit_volume?: number;
+}
+
+export interface AfmRuntimeStatus {
+  ok?: boolean;
+  mode?: string;
+  status?: string;
+  native_health?: string;
+  native_available?: boolean;
+  backend?: string;
+  availability?: string;
+  generation_verified?: boolean;
+  reachable?: boolean;
+}
+
+export interface SocketStatusData {
+  daemon?: DaemonRuntimeStatus;
+  engine?: EngineStatus;
+  afm?: AfmRuntimeStatus;
+}
+
+export interface AfmProviderStatus {
+  mode?: string;
+  provider?: string;
+  status?: string;
+  available?: boolean;
+  adapterConfigured?: boolean;
+  reason?: string;
+}
+
+export interface ExtractorStatus {
+  provider?: string;
+  tier?: string;
+  generationVerified?: boolean;
+  probeAgeMs?: number;
+}
+
 export interface StatusReport {
   vault: { path: string; exists: boolean };
-  socket: JsonResult;
-  afm: JsonResult;
-  audit: { entries: number; latest?: string };
+  socket: JsonResult<SocketStatusData>;
+  /** afm.ok means verified generation health, not mere bridge reachability. */
+  afm: JsonResult<Record<string, unknown>>;
+  afmProvider?: AfmProviderStatus;
+  extractor?: ExtractorStatus;
+  audit: { entries: number; latest?: string; volume?: number };
 }
 
 export interface AuditTailResult {
@@ -288,19 +348,87 @@ export function evidenceFromSource(
   };
 }
 
-// ---- Fetch wrappers (same-origin; ui-server enforces auth) ----
+// ---- Console auth token ----
+// The static shell loads without auth, but every /api route requires
+// Authorization: Bearer <token>. The token arrives either as a ?token= URL
+// param (printed by the ui-server on startup) — captured once, persisted, and
+// stripped from the address bar — or typed into the in-app token gate.
+//
+// sessionStorage, not localStorage: web origins are scheme+host+port, so a
+// localStorage token would be readable forever by any future app served on
+// the same localhost port. Tab-scoped lifetime is the acceptable trade — the
+// startup URL re-auths a fresh tab in one click.
+
+const TOKEN_STORAGE_KEY = "minni-console-token";
+
+export class AuthRequiredError extends Error {
+  constructor() {
+    super("console token required");
+    this.name = "AuthRequiredError";
+  }
+}
+
+function storeToken(token: string): void {
+  try {
+    window.sessionStorage.setItem(TOKEN_STORAGE_KEY, token);
+  } catch {
+    // storage unavailable (private mode) — token still works for this load via memory
+    memoryToken = token;
+  }
+}
+
+function bootstrapTokenFromUrl(): void {
+  if (typeof window === "undefined") return;
+  // One-time migration: purge tokens persisted by earlier builds.
+  try {
+    window.localStorage.removeItem(TOKEN_STORAGE_KEY);
+  } catch {
+    // ignore
+  }
+  const url = new URL(window.location.href);
+  const token = url.searchParams.get("token");
+  if (!token) return;
+  storeToken(token);
+  url.searchParams.delete("token");
+  window.history.replaceState(null, "", url.pathname + url.search + url.hash);
+}
+
+let memoryToken: string | null = null;
+bootstrapTokenFromUrl();
+
+export function getConsoleToken(): string | null {
+  if (memoryToken) return memoryToken;
+  if (typeof window === "undefined") return null;
+  try {
+    return window.sessionStorage.getItem(TOKEN_STORAGE_KEY);
+  } catch {
+    return null;
+  }
+}
+
+export function setConsoleToken(token: string): void {
+  memoryToken = token;
+  storeToken(token);
+}
+
+// ---- Fetch wrappers (same-origin; ui-server enforces auth on /api) ----
 
 async function jsonFetch<T>(url: string, init?: RequestInit): Promise<T> {
+  const token = getConsoleToken();
   const res = await fetch(url, {
     ...init,
     headers: {
       Accept: "application/json",
       ...(init?.body ? { "Content-Type": "application/json" } : {}),
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
       ...(init?.headers || {}),
     },
   });
   if (!res.ok) {
     const text = await res.text().catch(() => "");
+    if (res.status === 403 && text.includes("console_auth_required")) {
+      throw new AuthRequiredError();
+    }
     throw new Error(`${res.status} ${res.statusText}${text ? ` — ${text}` : ""}`);
   }
   return (await res.json()) as T;
@@ -422,5 +550,120 @@ export function refreshResearchStatus(req: DeepResearchStatusRequest): Promise<R
   return jsonFetch<Record<string, unknown>>("/api/deep-research/status", {
     method: "POST",
     body: JSON.stringify(req),
+  });
+}
+
+// ---- Staged learnings candidates (console approval pipeline) ----
+
+export interface CandidateRow {
+  candidate_id: string | number;
+  principal: string;
+  content: string;
+  proposed_at: number | string;
+  evidence_refs?: string[] | string;
+  derived_from?: Record<string, unknown> | string;
+  status?: string;
+}
+
+export interface ListCandidatesResponse {
+  candidates: CandidateRow[];
+  principal?: string;
+  count?: number;
+}
+
+/**
+ * Unwrap JsonResult envelope from daemon RPC.
+ * Handles three response shapes:
+ * - {ok: true, data: {candidates, principal, count}} → returns data
+ * - {ok: false, error: "msg"} → throws error
+ * - {candidates: [], error: "msg"} (route catch) → throws error
+ */
+export function unwrapCandidatesResponse(response: unknown): { candidates: CandidateRow[]; principal?: string; count?: number } {
+  const r = response as any;
+  
+  // JsonResult envelope: check ok field
+  if (typeof r.ok === 'boolean') {
+    if (!r.ok) {
+      throw new Error(r.error || 'Daemon error');
+    }
+    if (r.data && typeof r.data === 'object') {
+      return r.data as { candidates: CandidateRow[]; principal?: string; count?: number };
+    }
+    throw new Error('Invalid daemon response: missing data field');
+  }
+  
+  // Flat response from route catch: check error field
+  if (r.error) {
+    throw new Error(r.error);
+  }
+  
+  // No error, assume it's the unwrapped data shape
+  if (Array.isArray(r.candidates)) {
+    return r;
+  }
+  
+  throw new Error('Invalid candidates response shape');
+}
+
+/**
+ * Fetch proposed learning candidates from the daemon.
+ * GET /api/candidates?limit=&status=
+ */
+export function listCandidates(limit?: number, status?: string): Promise<ListCandidatesResponse> {
+  const params = new URLSearchParams();
+  if (limit !== undefined) {
+    params.append("limit", String(limit));
+  }
+  if (status !== undefined) {
+    params.append("status", status);
+  }
+  
+  const queryString = params.toString() ? `?${params.toString()}` : "";
+  const url = `/api/candidates${queryString}`;
+  return jsonFetch<any>(url).then(response => unwrapCandidatesResponse(response));
+}
+
+export interface ResolveCandidateRequest {
+  candidate_id: string | number;
+  decision: "accept" | "reject";
+  reason?: string;
+}
+
+export interface ResolveCandidateResponse {
+  ok?: boolean;
+  status?: string;
+  success?: boolean;
+  error?: string;
+}
+
+/**
+ * Resolves a candidate (accept or reject).
+ * POST /api/resolve-candidate
+ * Note: sends 'accept'/'reject' per daemon vocabulary (not 'accepted'/'rejected')
+ */
+export function resolveCandidate(
+  candidateId: string | number,
+  decision: "accept" | "reject",
+  reason?: string,
+): Promise<ResolveCandidateResponse> {
+  const url = "/api/resolve-candidate";
+  return jsonFetch<any>(url, {
+    method: "POST",
+    body: JSON.stringify({
+      candidate_id: candidateId,
+      decision,
+      reason,
+    }),
+  }).then(response => {
+    // Check for failure indicators in response body (DEFECT 3)
+    if (response && typeof response === 'object') {
+      if (response.ok === false) {
+        throw new Error(response.error || 'Resolution failed');
+      }
+      if (response.status === 'error') {
+        throw new Error(response.error || 'Resolution failed');
+      }
+    }
+    return response as ResolveCandidateResponse;
   });
 }

@@ -85,6 +85,7 @@ src/minni/plugin_payload/
 # Local plugin build/runtime state
 plugins/*/node_modules/
 plugins/*/dist/
+plugins/minni/tests/.compiled/
 plugins/*/.env
 plugins/*/.playwright-cli/
 plugins/.DS_Store
