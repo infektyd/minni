@@ -77,11 +77,11 @@ test("applyVerdict switching verdict keeps a single decided key", () => {
   assert.equal(pendingCount(22, v), 21);
 });
 
-test("stagedSlot returns the four hand-tuned designer slots for i < 4", () => {
-  assert.deepEqual(stagedSlot(0), { x: 24, y: 52 });
-  assert.deepEqual(stagedSlot(1), { x: 310, y: 86 });
-  assert.deepEqual(stagedSlot(2), { x: 48, y: 194 });
-  assert.deepEqual(stagedSlot(3), { x: 332, y: 242 });
+test("stagedSlot lays cards on a uniform two-column grid", () => {
+  assert.deepEqual(stagedSlot(0), { x: 24, y: 52, w: 276 });
+  assert.deepEqual(stagedSlot(1), { x: 320, y: 52, w: 276 });
+  assert.deepEqual(stagedSlot(2), { x: 24, y: 202, w: 276 });
+  assert.deepEqual(stagedSlot(3), { x: 320, y: 202, w: 276 });
 });
 
 // ── camera math (README "exact formula" acceptance criteria) ────────────────

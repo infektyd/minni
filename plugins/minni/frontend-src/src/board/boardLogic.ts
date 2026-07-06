@@ -283,31 +283,19 @@ export interface CardSlot {
   w?: number;
 }
 
-/** Hand-tuned designer slots for the first four staged overview cards. */
-const STAGED_SLOTS: CardSlot[] = [
-  { x: 24, y: 52 },
-  { x: 310, y: 86 },
-  { x: 48, y: 194 },
-  { x: 332, y: 242 },
-];
-const STAGED_CARD_W = 252;
-const STAGED_COL_X = [24, 310];
-const STAGED_ROW_H = 108;
-// Overflow grid starts one full row below the lowest designer slot so extra
-// cards can never overlap the hand-tuned four.
-const STAGED_ROW_Y0 = 350;
+const STAGED_CARD_W = 276;
+const STAGED_COL_X = [24, 320];
+const STAGED_ROW_H = 150;
+const STAGED_ROW_Y0 = 52;
 
 /**
- * Position for the i-th staged overview card. Returns the hand-tuned slot when
- * present, otherwise a two-column grid stepped by full card height — so extra
- * cards stack cleanly instead of colliding with the designer slots or with
- * each other, satisfying "variable data cannot silently overlap".
+ * Position for the i-th staged overview card: a uniform two-column grid
+ * stepped by full row height. Card text is line-clamped in CSS so a card can
+ * never outgrow its row — variable data cannot silently overlap.
  */
 export function stagedSlot(i: number): CardSlot {
-  if (i < STAGED_SLOTS.length) return STAGED_SLOTS[i];
-  const over = i - STAGED_SLOTS.length;
-  const col = over % 2;
-  const row = Math.floor(over / 2);
+  const col = i % 2;
+  const row = Math.floor(i / 2);
   return { x: STAGED_COL_X[col], y: STAGED_ROW_Y0 + row * STAGED_ROW_H, w: STAGED_CARD_W };
 }
 

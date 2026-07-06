@@ -163,7 +163,7 @@ export function SettingsScreen({
                   aria-pressed={theme === value}
                   onClick={() => onThemeChange(value)}
                 >
-                  {value === "paper" ? "Paper theme" : "Phosphor theme"}
+                  {value === "paper" ? "Paper theme" : "Nocturne theme"}
                 </button>
               ))}
             </div>
