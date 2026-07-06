@@ -76,6 +76,8 @@ export function BoardScreen({
   onOpenConsole,
   onAuthRequired,
   tokenRefreshTrigger,
+  theme,
+  onThemeChange,
 }: {
   status: StatusReport | null;
   health: HealthReport | null;
@@ -85,6 +87,9 @@ export function BoardScreen({
   /** The console token was rejected — raise the token gate now. */
   onAuthRequired?: () => void;
   tokenRefreshTrigger?: number;
+  /** Active console theme; enables the dark/light chrome toggle when set. */
+  theme?: "paper" | "phosphor";
+  onThemeChange?: (theme: "paper" | "phosphor") => void;
 }) {
   const [stageRef, vp] = useElementSize();
   const reducedMotion = usePrefersReducedMotion();
@@ -383,6 +388,16 @@ export function BoardScreen({
         {cam && !focus ? (
           <button className="fchip" onClick={() => setCam(null)} type="button">
             fit view
+          </button>
+        ) : null}
+        {theme && onThemeChange ? (
+          <button
+            className="fchip"
+            onClick={() => onThemeChange(theme === "phosphor" ? "paper" : "phosphor")}
+            type="button"
+            aria-label={theme === "phosphor" ? "Switch to light theme" : "Switch to dark theme"}
+          >
+            {theme === "phosphor" ? "☀ light" : "☾ dark"}
           </button>
         ) : null}
         {onOpenConsole ? (

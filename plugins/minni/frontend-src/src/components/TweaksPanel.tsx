@@ -8,7 +8,7 @@ const PANEL_STYLE = `
   border:1px solid var(--border-strong);border-radius:6px;
   box-shadow:0 12px 40px rgba(0,0,0,.18);
   font:11.5px/1.4 var(--font-ui);overflow:hidden}
-html[data-theme="phosphor"] .twk-panel{box-shadow:0 0 0 1px rgba(107,227,162,0.18),0 12px 40px rgba(0,0,0,.5)}
+html[data-theme="phosphor"] .twk-panel{box-shadow:0 0 0 1px rgba(196,168,74,0.18),0 12px 40px rgba(0,0,0,.5)}
 .twk-hd{display:flex;align-items:center;justify-content:space-between;
   padding:10px 8px 10px 14px;cursor:default;user-select:none;
   border-bottom:1px solid var(--border)}
@@ -45,7 +45,7 @@ html[data-theme="phosphor"] .twk-seg button[aria-checked="true"]{background:var(
   box-shadow:0 4px 12px rgba(0,0,0,.12)}
 .twk-toggle-button:hover{background:var(--hover)}
 html[data-theme="phosphor"] .twk-toggle-button{color:var(--verdigris);
-  box-shadow:0 0 12px rgba(107,227,162,0.2)}
+  box-shadow:0 0 12px rgba(196,168,74,0.2)}
 `;
 
 export function TweaksPanel({

@@ -24,13 +24,13 @@ export const OVERVIEW_LAYOUT = {
     nodeX: 22,
     nodeY0: 30,
     nodeGap: 120,
-    threadTag: { x: 110, y: 126 },
+    threadTag: { x: 84, y: 126 },
   },
   hub: {
     card: { x: 24, y: 38 },
   },
   staged: {
-    moreChip: { x: 138, y: 356 },
+    moreChip: { x: 24, y: 366 },
   },
   logs: {
     card: { x: 24, y: 32, w: 380 } as CardSlot,
@@ -40,12 +40,12 @@ export const OVERVIEW_LAYOUT = {
     card: { x: 24, y: 32, w: 266 } as CardSlot,
   },
   recall: {
-    svgPaths: ["M 170 130 C 110 180, 90 200, 62 226", "M 320 170 C 330 220, 338 230, 344 250"],
+    svgPaths: ["M 170 150 C 135 170, 115 178, 100 190", "M 330 152 C 340 175, 345 192, 348 212"],
     qcard: { x: 110, y: 40 },
     cards: [
-      { x: 20, y: 226, w: 270 } as CardSlot,
-      { x: 206, y: 318, w: 258 } as CardSlot,
-      { x: 300, y: 250, w: 170 } as CardSlot,
+      { x: 24, y: 190, w: 205 } as CardSlot,
+      { x: 245, y: 212, w: 205 } as CardSlot,
+      { x: 24, y: 306, w: 205 } as CardSlot,
     ],
   },
 } as const;

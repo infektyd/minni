@@ -226,6 +226,8 @@ export function App() {
           onOpenConsole={() => setActive("recall")}
           onAuthRequired={() => setAuthRequired(true)}
           tokenRefreshTrigger={tokenRefreshTrigger}
+          theme={tweaks.theme}
+          onThemeChange={(t) => setTweak("theme", t)}
         />
       </div>
     );
@@ -343,7 +345,7 @@ export function App() {
             value={tweaks.theme}
             options={[
               { value: "paper", label: "Paper" },
-              { value: "phosphor", label: "Phosphor" },
+              { value: "phosphor", label: "Nocturne" },
             ]}
             onChange={(v) => setTweak("theme", v)}
           />
