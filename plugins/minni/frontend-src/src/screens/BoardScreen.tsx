@@ -36,13 +36,17 @@ import {
 import {
   type Cam,
   classifyWheel,
-  clampZonePosition,
+  clampZoneWH,
+  clampZoneXY,
   deriveDaemonInfo,
   dragPan,
   flowForAuditEntry,
   panByWheel,
+  sanitizeZoneModes,
   sanitizeZonePositions,
   zoomToward,
+  type ZoneMode,
+  type ZoneModes,
   type ZonePositions,
 } from "../board/boardLogic";
 
@@ -51,6 +55,9 @@ type ZonePos = ZonePositions;
 const K_FOCUS = "minni-board-focus";
 const K_CAM = "minni-board-cam";
 const K_ZPOS = "minni-board-zonepos";
+const K_ZMODE = "minni-board-zonemode";
+// Obsolete freeform-text store from the previous design revision.
+const K_ZCUSTOM_LEGACY = "minni-board-zonecustom";
 
 function isZoneId(v: unknown): v is ZoneId {
   return typeof v === "string" && Object.prototype.hasOwnProperty.call(BOARD_ZONES, v);
@@ -104,8 +111,20 @@ export function BoardScreen({
   const [zpos, setZpos] = usePersistentJSON<ZonePos>(K_ZPOS, {}, (v) =>
     sanitizeZonePositions(v, BOARD_ZONES, WORLD) || {},
   );
+  const [zmode, setZmode] = usePersistentJSON<ZoneModes>(K_ZMODE, {}, (v) =>
+    sanitizeZoneModes(v, BOARD_ZONES) || {},
+  );
   const [evt, setEvt] = useState<FlowEvent | null>(null);
   const [instant, setInstant] = useState(false);
+
+  // The freeform-text store from the previous revision is gone for good.
+  useEffect(() => {
+    try {
+      localStorage.removeItem(K_ZCUSTOM_LEGACY);
+    } catch {
+      /* private mode */
+    }
+  }, []);
 
   // ── live zone rects = defaults + dragged offsets ──
   // Hook for staged learnings state (live vs sample)
@@ -130,15 +149,42 @@ export function BoardScreen({
     return z;
   }, [zpos, stagedState.isLive, stagedState.learnings.length]);
 
+  // Any drag or resize flips the box to custom (free) layout.
   const moveZone = useCallback(
     (id: ZoneId, x: number, y: number) => {
-      const next = clampZonePosition(id, x, y, BOARD_ZONES, WORLD);
-      setZpos((p) => ({
-        ...p,
-        [id]: next,
-      }));
+      setZmode((m) => (m[id] === "custom" ? m : { ...m, [id]: "custom" }));
+      setZpos((p) => {
+        const cur = { ...BOARD_ZONES[id], ...(p[id] || {}) };
+        return { ...p, [id]: { ...cur, ...clampZoneXY(cur.w, cur.h, x, y, WORLD) } };
+      });
     },
-    [setZpos],
+    [setZpos, setZmode],
+  );
+
+  const resizeZone = useCallback(
+    (id: ZoneId, w: number, h: number) => {
+      setZmode((m) => (m[id] === "custom" ? m : { ...m, [id]: "custom" }));
+      setZpos((p) => {
+        const cur = { ...BOARD_ZONES[id], ...(p[id] || {}) };
+        return { ...p, [id]: { ...cur, ...clampZoneWH(w, h, WORLD) } };
+      });
+    },
+    [setZpos, setZmode],
+  );
+
+  // auto = automatic layout (clears this box's override); custom = free layout.
+  const setZoneMode = useCallback(
+    (id: ZoneId, mode: ZoneMode) => {
+      setZmode((p) => ({ ...p, [id]: mode }));
+      if (mode === "auto")
+        setZpos((p) => {
+          if (!(id in p)) return p;
+          const n = { ...p };
+          delete n[id];
+          return n;
+        });
+    },
+    [setZpos, setZmode],
   );
 
   // ── base fit + effective camera ──
@@ -331,7 +377,7 @@ export function BoardScreen({
     };
   }, []);
 
-  const hasLayout = Object.keys(zpos).length > 0;
+  const hasLayout = Object.keys(zpos).length > 0 || Object.keys(zmode).length > 0;
 
   return (
     <div
@@ -354,6 +400,9 @@ export function BoardScreen({
           daemon={daemon}
           onFocus={setFocus}
           onMove={moveZone}
+          onResize={resizeZone}
+          zmode={zmode}
+          onModeChange={setZoneMode}
           zonesFocusable={!focus}
           flowsRunning={!focus}
           reducedMotion={reducedMotion}
@@ -381,7 +430,14 @@ export function BoardScreen({
           {stagedState.isLive ? `${stagedState.learnings.length} STAGED` : `SAMPLE · ${stagedState.learnings.length} STAGED`}
         </span>
         {hasLayout ? (
-          <button className="fchip" onClick={() => setZpos({})} type="button">
+          <button
+            className="fchip"
+            onClick={() => {
+              setZpos({});
+              setZmode({});
+            }}
+            type="button"
+          >
             reset layout
           </button>
         ) : null}
@@ -407,7 +463,7 @@ export function BoardScreen({
         ) : null}
         {!focus ? (
           <span className="hint">
-            drag zones · click to zoom · scroll to zoom · drag canvas to pan · ←/→ tour
+            drag/resize zones · click to zoom · scroll to zoom · drag canvas to pan · ←/→ tour
           </span>
         ) : null}
       </div>

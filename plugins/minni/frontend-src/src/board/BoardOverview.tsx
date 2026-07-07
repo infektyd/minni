@@ -19,7 +19,7 @@ import {
   stagedSlot,
   type Link,
 } from "./boardLayout";
-import { isDrag } from "./boardLogic";
+import { isDrag, type ZoneMode, type ZoneModes } from "./boardLogic";
 
 // ── flow pulse layer ────────────────────────────────────────────────────────
 interface Pulse {
@@ -207,31 +207,40 @@ function ZoneBox({
   id,
   z,
   scale,
+  mode,
   focusable,
   onFocus,
   onMove,
+  onResize,
+  onModeChange,
   children,
 }: {
   id: ZoneId;
   z: ZoneDef;
   scale: number;
+  mode?: ZoneMode;
   focusable: boolean;
   onFocus: (id: ZoneId) => void;
   onMove: (id: ZoneId, x: number, y: number) => void;
+  onResize: (id: ZoneId, w: number, h: number) => void;
+  onModeChange: (id: ZoneId, mode: ZoneMode) => void;
   children: React.ReactNode;
 }) {
   const drag = useRef<DragState | null>(null);
+  const rdrag = useRef<{ sx: number; sy: number; w: number; h: number } | null>(null);
   const raf = useRef<number | undefined>(undefined);
-  const pending = useRef<{ x: number; y: number } | null>(null);
+  const pending = useRef<{ kind: "move" | "resize"; a: number; b: number } | null>(null);
+  const isCustom = mode === "custom";
 
-  const scheduleMove = (x: number, y: number) => {
-    pending.current = { x, y };
+  const schedule = (kind: "move" | "resize", a: number, b: number) => {
+    pending.current = { kind, a, b };
     if (raf.current !== undefined) return;
     raf.current = requestAnimationFrame(() => {
       raf.current = undefined;
       const p = pending.current;
       if (!p) return;
-      onMove(id, p.x, p.y);
+      if (p.kind === "move") onMove(id, p.a, p.b);
+      else onResize(id, p.a, p.b);
     });
   };
 
@@ -267,7 +276,7 @@ function ZoneBox({
         const screenDx = e.clientX - d.sx;
         const screenDy = e.clientY - d.sy;
         if (!d.moved && isDrag(screenDx, screenDy)) d.moved = true;
-        if (d.moved) scheduleMove(d.x + screenDx / scale, d.y + screenDy / scale);
+        if (d.moved) schedule("move", d.x + screenDx / scale, d.y + screenDy / scale);
       }}
       onPointerUp={(e) => {
         const d = drag.current;
@@ -295,8 +304,73 @@ function ZoneBox({
       }}
     >
       <span className="zl">{z.label}</span>
+      <div className="zmode" onPointerDown={(e) => e.stopPropagation()}>
+        <button
+          type="button"
+          className={!isCustom ? "on" : ""}
+          onClick={(e) => {
+            e.stopPropagation();
+            onModeChange(id, "auto");
+          }}
+          aria-label="Automatic layout — snap this box back to its default place and size"
+          title="Automatic layout"
+        >
+          auto
+        </button>
+        <button
+          type="button"
+          className={isCustom ? "on" : ""}
+          onClick={(e) => {
+            e.stopPropagation();
+            onModeChange(id, "custom");
+          }}
+          aria-label="Custom layout — drag and resize this box freely"
+          title="Custom layout: drag & resize freely"
+        >
+          custom
+        </button>
+      </div>
       <span className="zoom-hint">⤢</span>
       <div className="zc">{children}</div>
+      <div
+        className="zresize"
+        aria-hidden="true"
+        onPointerDown={(e) => {
+          e.stopPropagation();
+          e.currentTarget.setPointerCapture(e.pointerId);
+          rdrag.current = { sx: e.clientX, sy: e.clientY, w: z.w, h: z.h };
+        }}
+        onPointerMove={(e) => {
+          const r = rdrag.current;
+          if (!r) return;
+          schedule(
+            "resize",
+            r.w + (e.clientX - r.sx) / scale,
+            r.h + (e.clientY - r.sy) / scale,
+          );
+        }}
+        onPointerUp={(e) => {
+          const r = rdrag.current;
+          rdrag.current = null;
+          if (raf.current !== undefined) {
+            cancelAnimationFrame(raf.current);
+            raf.current = undefined;
+          }
+          pending.current = null;
+          try {
+            e.currentTarget.releasePointerCapture(e.pointerId);
+          } catch {
+            /* already released */
+          }
+          if (r) {
+            onResize(id, r.w + (e.clientX - r.sx) / scale, r.h + (e.clientY - r.sy) / scale);
+          }
+        }}
+        onPointerCancel={() => {
+          rdrag.current = null;
+          pending.current = null;
+        }}
+      />
     </div>
   );
 }
@@ -351,6 +425,9 @@ export function BoardOverview({
   daemon,
   onFocus,
   onMove,
+  onResize,
+  zmode,
+  onModeChange,
   zonesFocusable,
   flowsRunning,
   reducedMotion,
@@ -364,6 +441,9 @@ export function BoardOverview({
   daemon: DaemonInfo;
   onFocus: (id: ZoneId) => void;
   onMove: (id: ZoneId, x: number, y: number) => void;
+  onResize: (id: ZoneId, w: number, h: number) => void;
+  zmode: ZoneModes;
+  onModeChange: (id: ZoneId, mode: ZoneMode) => void;
   zonesFocusable: boolean;
   flowsRunning: boolean;
   reducedMotion: boolean;
@@ -389,7 +469,7 @@ export function BoardOverview({
         onEvent={onFlowEvent}
       />
 
-      <ZoneBox id="agents" z={zones.agents} scale={scale} focusable={zonesFocusable} onFocus={onFocus} onMove={onMove}>
+      <ZoneBox id="agents" z={zones.agents} scale={scale} mode={zmode.agents} onResize={onResize} onModeChange={onModeChange} focusable={zonesFocusable} onFocus={onFocus} onMove={onMove}>
         {SAMPLE_AGENTS.map((a, i) => (
           <div
             key={a.id}
@@ -415,7 +495,7 @@ export function BoardOverview({
         </div>
       </ZoneBox>
 
-      <ZoneBox id="hub" z={zones.hub} scale={scale} focusable={zonesFocusable} onFocus={onFocus} onMove={onMove}>
+      <ZoneBox id="hub" z={zones.hub} scale={scale} mode={zmode.hub} onResize={onResize} onModeChange={onModeChange} focusable={zonesFocusable} onFocus={onFocus} onMove={onMove}>
         <div className="hub" style={{ left: L.hub.card.x, top: L.hub.card.y }}>
           <div className="hn">⬢ minnid</div>
           <div className="hv">
@@ -428,7 +508,7 @@ export function BoardOverview({
         </div>
       </ZoneBox>
 
-      <ZoneBox id="staged" z={zones.staged} scale={scale} focusable={zonesFocusable} onFocus={onFocus} onMove={onMove}>
+      <ZoneBox id="staged" z={zones.staged} scale={scale} mode={zmode.staged} onResize={onResize} onModeChange={onModeChange} focusable={zonesFocusable} onFocus={onFocus} onMove={onMove}>
         {top4.map((l, i) => {
           const slot = stagedSlot(i);
           return (
@@ -451,7 +531,7 @@ export function BoardOverview({
         </div>
       </ZoneBox>
 
-      <ZoneBox id="logs" z={zones.logs} scale={scale} focusable={zonesFocusable} onFocus={onFocus} onMove={onMove}>
+      <ZoneBox id="logs" z={zones.logs} scale={scale} mode={zmode.logs} onResize={onResize} onModeChange={onModeChange} focusable={zonesFocusable} onFocus={onFocus} onMove={onMove}>
         <OvCard
           x={L.logs.card.x}
           y={L.logs.card.y}
@@ -469,7 +549,7 @@ export function BoardOverview({
         </div>
       </ZoneBox>
 
-      <ZoneBox id="quarantine" z={zones.quarantine} scale={scale} focusable={zonesFocusable} onFocus={onFocus} onMove={onMove}>
+      <ZoneBox id="quarantine" z={zones.quarantine} scale={scale} mode={zmode.quarantine} onResize={onResize} onModeChange={onModeChange} focusable={zonesFocusable} onFocus={onFocus} onMove={onMove}>
         <OvCard
           x={L.quarantine.card.x}
           y={L.quarantine.card.y}
@@ -485,7 +565,7 @@ export function BoardOverview({
         />
       </ZoneBox>
 
-      <ZoneBox id="recall" z={zones.recall} scale={scale} focusable={zonesFocusable} onFocus={onFocus} onMove={onMove}>
+      <ZoneBox id="recall" z={zones.recall} scale={scale} mode={zmode.recall} onResize={onResize} onModeChange={onModeChange} focusable={zonesFocusable} onFocus={onFocus} onMove={onMove}>
         <svg className="bd-svg" aria-hidden="true">
           {L.recall.svgPaths.map((d) => (
             <path key={d} d={d} />

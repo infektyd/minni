@@ -200,7 +200,54 @@ export function deriveDaemonInfo(
   };
 }
 
-export type ZonePositions = Record<string, { x: number; y: number }>;
+// ── free-layout bounds ──────────────────────────────────────────────────────
+//
+// Boxes may roam ROAM world-multiples past the base world on every side so the
+// draggable area grows with zoom-out (design revision July 2026). Resize is
+// clamped to [ZONE_MIN_W×ZONE_MIN_H, one world-size].
+
+export const ROAM = 3;
+export const ZONE_MIN_W = 220;
+export const ZONE_MIN_H = 160;
+
+/** A stored per-zone layout override: position, optionally size. */
+export interface ZoneOverride {
+  x: number;
+  y: number;
+  w?: number;
+  h?: number;
+}
+
+export type ZonePositions = Record<string, ZoneOverride>;
+
+export type ZoneMode = "auto" | "custom";
+export type ZoneModes = Record<string, ZoneMode>;
+
+/** Clamp a zone's top-left so the box stays within ±ROAM world-sizes. */
+export function clampZoneXY(
+  w: number,
+  h: number,
+  x: number,
+  y: number,
+  world: { w: number; h: number },
+): { x: number; y: number } {
+  return {
+    x: Math.round(Math.max(-world.w * ROAM, Math.min(world.w * (ROAM + 1) - w, x))),
+    y: Math.round(Math.max(-world.h * ROAM, Math.min(world.h * (ROAM + 1) - h, y))),
+  };
+}
+
+/** Clamp a zone's size to [ZONE_MIN, one world-size]. */
+export function clampZoneWH(
+  w: number,
+  h: number,
+  world: { w: number; h: number },
+): { w: number; h: number } {
+  return {
+    w: Math.round(Math.max(ZONE_MIN_W, Math.min(world.w, w))),
+    h: Math.round(Math.max(ZONE_MIN_H, Math.min(world.h, h))),
+  };
+}
 
 export function clampZonePosition(
   id: ZoneId,
@@ -210,10 +257,7 @@ export function clampZonePosition(
   world: { w: number; h: number },
 ): { x: number; y: number } {
   const z = zones[id];
-  return {
-    x: Math.round(Math.max(0, Math.min(world.w - z.w, x))),
-    y: Math.round(Math.max(0, Math.min(world.h - z.h, y))),
-  };
+  return clampZoneXY(z.w, z.h, x, y, world);
 }
 
 export function sanitizeZonePositions(
@@ -225,10 +269,34 @@ export function sanitizeZonePositions(
   const out: ZonePositions = {};
   for (const [id, pos] of Object.entries(value as Record<string, unknown>)) {
     if (!(id in zones) || !pos || typeof pos !== "object") continue;
-    const raw = pos as { x?: unknown; y?: unknown };
+    const raw = pos as { x?: unknown; y?: unknown; w?: unknown; h?: unknown };
     if (typeof raw.x !== "number" || typeof raw.y !== "number") continue;
     if (!Number.isFinite(raw.x) || !Number.isFinite(raw.y)) continue;
-    out[id] = clampZonePosition(id as ZoneId, raw.x, raw.y, zones, world);
+    const def = zones[id as ZoneId];
+    const size =
+      typeof raw.w === "number" &&
+      typeof raw.h === "number" &&
+      Number.isFinite(raw.w) &&
+      Number.isFinite(raw.h)
+        ? clampZoneWH(raw.w, raw.h, world)
+        : { w: def.w, h: def.h };
+    const xy = clampZoneXY(size.w, size.h, raw.x, raw.y, world);
+    out[id] =
+      size.w === def.w && size.h === def.h ? xy : { ...xy, ...size };
+  }
+  return out;
+}
+
+/** Keep only known zones with a valid layout mode. */
+export function sanitizeZoneModes(
+  value: unknown,
+  zones: Record<ZoneId, ZoneDef>,
+): ZoneModes | null {
+  if (!value || typeof value !== "object") return null;
+  const out: ZoneModes = {};
+  for (const [id, mode] of Object.entries(value as Record<string, unknown>)) {
+    if (!(id in zones)) continue;
+    if (mode === "auto" || mode === "custom") out[id] = mode;
   }
   return out;
 }

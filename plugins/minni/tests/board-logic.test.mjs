@@ -9,6 +9,8 @@ import test from "node:test";
 import {
   agentFromAuditText,
   applyVerdict,
+  clampZoneWH,
+  clampZoneXY,
   classifyWheel,
   computeLinks,
   deriveDaemonInfo,
@@ -20,10 +22,14 @@ import {
   orderedAgentLinks,
   panByWheel,
   pendingCount,
+  sanitizeZoneModes,
   sanitizeZonePositions,
   sortLearnings,
   stagedSlot,
   zoomToward,
+  ROAM,
+  ZONE_MIN_H,
+  ZONE_MIN_W,
   WHEEL_ZOOM_DELTA,
   ZOOM_MAX,
   ZOOM_MIN_FACTOR,
@@ -439,21 +445,67 @@ test("orderedAgentLinks maps agent ids to their link ids in order", () => {
   assert.deepEqual(orderedAgentLinks([]), []);
 });
 
-test("sanitizeZonePositions drops corrupt entries and clamps offscreen stored positions", () => {
+test("sanitizeZonePositions drops corrupt entries and clamps to the roam bounds", () => {
+  const world = { w: 1880, h: 1092 };
   const out = sanitizeZonePositions(
     {
-      hub: { x: -20, y: 99999 },
-      staged: { x: 9000, y: 9000 },
+      hub: { x: -20, y: 999999 },
+      staged: { x: -900000, y: 900000 },
       logs: { x: Number.NaN, y: 1 },
       nope: { x: 1, y: 2 },
     },
     TEST_ZONES,
-    { w: 1880, h: 1092 },
+    world,
   );
-  assert.deepEqual(out.hub, { x: 0, y: 1092 - TEST_ZONES.hub.h });
-  assert.deepEqual(out.staged, { x: 1880 - TEST_ZONES.staged.w, y: 1092 - TEST_ZONES.staged.h });
+  // Boxes may roam ±ROAM world-sizes: x ∈ [−ROAM·W, (ROAM+1)·W − w].
+  assert.deepEqual(out.hub, { x: -20, y: world.h * (ROAM + 1) - TEST_ZONES.hub.h });
+  assert.deepEqual(out.staged, {
+    x: -world.w * ROAM,
+    y: world.h * (ROAM + 1) - TEST_ZONES.staged.h,
+  });
   assert.equal("logs" in out, false);
   assert.equal("nope" in out, false);
+});
+
+test("sanitizeZonePositions keeps a valid stored size and clamps an invalid one", () => {
+  const world = { w: 1880, h: 1092 };
+  const out = sanitizeZonePositions(
+    {
+      hub: { x: 10, y: 10, w: 300, h: 260 },
+      staged: { x: 10, y: 10, w: 5, h: 999999 },
+    },
+    TEST_ZONES,
+    world,
+  );
+  assert.deepEqual(out.hub, { x: 10, y: 10, w: 300, h: 260 });
+  assert.deepEqual(out.staged, { x: 10, y: 10, w: ZONE_MIN_W, h: world.h });
+});
+
+test("clampZoneXY allows roaming past the world but not past ±ROAM world-sizes", () => {
+  const world = { w: 1000, h: 500 };
+  // inside the roam range: untouched (rounded)
+  assert.deepEqual(clampZoneXY(200, 100, -1500.4, 900.6, world), { x: -1500, y: 901 });
+  // beyond the roam range: clamped
+  assert.deepEqual(clampZoneXY(200, 100, -999999, 999999, world), {
+    x: -world.w * ROAM,
+    y: world.h * (ROAM + 1) - 100,
+  });
+});
+
+test("clampZoneWH clamps size to [min, one world-size]", () => {
+  const world = { w: 1000, h: 500 };
+  assert.deepEqual(clampZoneWH(1, 1, world), { w: ZONE_MIN_W, h: ZONE_MIN_H });
+  assert.deepEqual(clampZoneWH(99999, 99999, world), { w: 1000, h: 500 });
+  assert.deepEqual(clampZoneWH(400.4, 300.6, world), { w: 400, h: 301 });
+});
+
+test("sanitizeZoneModes keeps only known zones with valid modes", () => {
+  const out = sanitizeZoneModes(
+    { hub: "custom", staged: "auto", logs: "banana", nope: "custom" },
+    TEST_ZONES,
+  );
+  assert.deepEqual(out, { hub: "custom", staged: "auto" });
+  assert.equal(sanitizeZoneModes("junk", TEST_ZONES), null);
 });
 
 test("stagedSlot overflow grid never overlaps designer slots or itself", () => {
