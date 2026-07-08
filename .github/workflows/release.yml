@@ -92,7 +92,7 @@ jobs:
           test "$TAG" = "$NPM_V" || { echo "tag $TAG != plugin version $NPM_V"; exit 1; }
 
       - name: Upload Python dist for the publish job
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: python-dist
           # Only the Python artifacts go to (Test)PyPI; the npm tarball ships
