@@ -55,6 +55,7 @@ import {
   listPendingHandoffs,
   readAgentContext,
   recallMemory,
+  shouldOfflineVaultPrescan,
   stashPrecompactReassert,
   subscribeContradictions,
 } from "./sovereign.js";
@@ -351,16 +352,17 @@ async function handleUserPromptSubmit(payload: Record<string, unknown>): Promise
     return lifecycleOnlyOutput(signature, lifecycleFields);
   }
   const threshold = recallPointerThreshold();
-  const [vaultResultsRaw, recall] = await Promise.all([
-    searchVaultNotes(CLAUDECODE_VAULT_PATH, prompt, 6),
-    recallMemory({
-      query: prompt,
-      limit: 6,
-      agentId: CLAUDECODE_AGENT_ID,
-      workspaceId: CLAUDECODE_WORKSPACE_ID,
-    }),
-  ]);
-  const vaultResults = filterSafeVaultResults(vaultResultsRaw);
+  // Daemon-first: local searchVaultNotes is workspace-unscoped and must not
+  // run in parallel with (or alongside) a successful/auth-denied daemon recall.
+  const recall = await recallMemory({
+    query: prompt,
+    limit: 6,
+    agentId: CLAUDECODE_AGENT_ID,
+    workspaceId: CLAUDECODE_WORKSPACE_ID,
+  });
+  const vaultResults = shouldOfflineVaultPrescan(recall)
+    ? filterSafeVaultResults(await searchVaultNotes(CLAUDECODE_VAULT_PATH, prompt, 6))
+    : [];
 
   // s5 strength gate: emit the light pointer + recall-state file ONLY when the
   // top recall strength clears the threshold; otherwise inject nothing and clear

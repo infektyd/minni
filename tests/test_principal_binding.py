@@ -181,6 +181,72 @@ def test_resolve_strict_platform_agent_empty_caps_is_honoured(tmp_path: Path):
     assert not p.can("search")
 
 
+def test_platform_agent_does_not_inherit_operator_vault_roots(tmp_path: Path):
+    """Platform ids must not copy operator allowed_vault_roots (empty = unrestricted)."""
+    principals = tmp_path / "principals"
+    principals.mkdir()
+    operator_vault = tmp_path / "operator-vault"
+    operator_vault.mkdir()
+    f = principals / "local.json"
+    f.write_text(
+        json.dumps(
+            {
+                "agent_id": "main",
+                "capabilities": ["*"],
+                "allowed_vault_roots": [str(operator_vault)],
+                "platform_agent_ids": ["codex"],
+                "platform_agent_capabilities": {
+                    "codex": ["search", "read", "learn"],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    os.chmod(f, 0o600)
+
+    p = resolve_effective_principal(
+        supplied_agent_id="codex", transport="uds", principals_dir=principals
+    )
+    assert p.agent_id == "codex"
+    assert p.allowed_vault_roots == []
+    assert not p.allows_vault_root(operator_vault / "wiki" / "note.md")
+
+
+def test_platform_agent_vault_roots_map_grants_only_listed_roots(tmp_path: Path):
+    principals = tmp_path / "principals"
+    principals.mkdir()
+    operator_vault = tmp_path / "operator-vault"
+    codex_root = tmp_path / "codex-vault"
+    operator_vault.mkdir()
+    codex_root.mkdir()
+    f = principals / "local.json"
+    f.write_text(
+        json.dumps(
+            {
+                "agent_id": "main",
+                "capabilities": ["*"],
+                "allowed_vault_roots": [str(operator_vault)],
+                "platform_agent_ids": ["codex"],
+                "platform_agent_capabilities": {
+                    "codex": ["search", "read", "learn"],
+                },
+                "platform_agent_vault_roots": {
+                    "codex": [str(codex_root)],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    os.chmod(f, 0o600)
+
+    p = resolve_effective_principal(
+        supplied_agent_id="codex", transport="uds", principals_dir=principals
+    )
+    assert p.allowed_vault_roots == [str(codex_root.resolve())]
+    assert p.allows_vault_root(codex_root / "wiki" / "note.md")
+    assert not p.allows_vault_root(operator_vault / "wiki" / "note.md")
+
+
 def test_resolve_matching_per_agent_principal_file_wins(tmp_path: Path):
     principals = tmp_path / "principals"
     principals.mkdir()

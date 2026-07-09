@@ -18,13 +18,12 @@ import {
   gateSharedOperation,
   isSharedGateUnavailable,
   handoffMemory,
-  identityDenialFrom,
   learnMemory,
   listPendingHandoffs,
   recallMemory,
   recallResponseText,
   recoveryRouteFrom,
-  shouldPrescanVault,
+  shouldOfflineVaultPrescan,
   statusAndAudit,
   subscribeContradictions,
 } from "./sovereign.js";
@@ -515,15 +514,11 @@ server.registerTool(
       workspaceId: workspaceId ?? DEFAULT_WORKSPACE_ID,
       agentId: DEFAULT_AGENT_ID, // G11: server-side default only (model no longer supplies agentId)
     });
-    const daemonOk = result.ok && !!result.data;
     // An identity denial is not a daemon outage: whether it carries a recovery
     // route (#132 P1) or is a routeless -32004 like reserved_agent_id (#132 P2),
     // the daemon ANSWERED — skip the unscoped offline pre-scan and surface the
     // diagnostic instead of the "Daemon unavailable" framing.
-    const identityDenied =
-      recoveryRouteFrom(result.data) !== undefined ||
-      identityDenialFrom(result.data) !== undefined;
-    const vaultResults = !identityDenied && shouldPrescanVault(daemonOk, includeVault !== false)
+    const vaultResults = shouldOfflineVaultPrescan(result, includeVault !== false)
       ? filterSafeVaultResults(
           await searchVaultNotes(
             effectiveVaultPath,

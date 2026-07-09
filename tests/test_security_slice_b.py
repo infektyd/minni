@@ -116,6 +116,17 @@ def test_fetch_linked_context_rejects_like_wildcard(tmp_path):
     assert contexts == [], contexts
 
 
+def test_fetch_linked_context_fails_closed_without_principal(tmp_path):
+    """R4 residual: principal=None must not return linked chunk text."""
+    engine, db_obj, cfg = _make_engine(tmp_path)
+    _seed_doc(db_obj, "wiki/my-note.md", "codex", "should not leak without principal", privacy="safe")
+
+    contexts = engine._fetch_linked_context(
+        ["wiki/my-note"], principal=None, workspace="default"
+    )
+    assert contexts == [], contexts
+
+
 # ── M3: expand_result must surface real privacy/status ──────────────────────
 
 

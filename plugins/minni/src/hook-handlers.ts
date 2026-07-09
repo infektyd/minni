@@ -56,6 +56,7 @@ import {
   formatRecall,
   readAgentContext,
   recallMemory,
+  shouldOfflineVaultPrescan,
   stashPrecompactReassert,
   subscribeContradictions,
 } from "./sovereign.js";
@@ -370,15 +371,17 @@ export function createHookHandlers(
     }
 
     const threshold = recallPointerThreshold();
-    const [vaultResults, recall] = await Promise.all([
-      searchVaultNotes(config.vaultPath, prompt, 6),
-      recallMemory({
-        query: prompt,
-        limit: 6,
-        agentId: config.agentId,
-        workspaceId,
-      }),
-    ]);
+    // Daemon-first: local searchVaultNotes is workspace-unscoped and must not
+    // run in parallel with (or alongside) a successful/auth-denied daemon recall.
+    const recall = await recallMemory({
+      query: prompt,
+      limit: 6,
+      agentId: config.agentId,
+      workspaceId,
+    });
+    const vaultResults = shouldOfflineVaultPrescan(recall)
+      ? filterSafeVaultResults(await searchVaultNotes(config.vaultPath, prompt, 6))
+      : [];
     // s5 strength gate: emit the light pointer + recall-state file ONLY when the
     // top recall strength clears the threshold; otherwise inject nothing and
     // clear any stale state left by a previous strong turn.

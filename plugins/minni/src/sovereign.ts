@@ -655,6 +655,22 @@ export function shouldPrescanVault(daemonOk: boolean, includeVault: boolean): bo
 }
 
 /**
+ * Hook + MCP shared gate: local vault pre-scan only when the daemon is truly
+ * unreachable. Auth/identity denials are live answers — never fall back to
+ * unscoped disk search alongside them.
+ */
+export function shouldOfflineVaultPrescan(
+  result: { ok: boolean; data?: unknown },
+  includeVault = true,
+): boolean {
+  const daemonOk = result.ok && !!result.data;
+  const identityDenied =
+    recoveryRouteFrom(result.data) !== undefined ||
+    identityDenialFrom(result.data) !== undefined;
+  return !identityDenied && shouldPrescanVault(daemonOk, includeVault);
+}
+
+/**
  * Decide the minni_recall response text for a daemon recall result (#132 P1).
  * An identity-recovery denial is neither a recall miss nor a daemon outage:
  * it must surface the remediation route verbatim — never "No recall results"

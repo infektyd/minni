@@ -1916,21 +1916,20 @@ class RetrievalEngine:
                         break
                 if row is not None:
                     # R4: neighborhood summaries are a read surface — gate every
-                    # linked doc through can_read_document so restricted/foreign/
-                    # blocked memory never leaks via the wikilink graph. When no
-                    # principal is supplied (legacy back-compat), fall through
-                    # ungated as before.
-                    if principal is not None:
-                        raw = {
-                            "doc_id": row["doc_id"],
-                            "path": row["path"],
-                            "agent": row["agent"],
-                            "privacy_level": row["privacy_level"],
-                            "page_type": row["page_type"],
-                            "page_status": row["page_status"],
-                        }
-                        if not can_read_document(principal, ws, raw):
-                            continue
+                    # linked doc through can_read_document. No principal means
+                    # fail closed (empty neighborhood), never ungated legacy leak.
+                    if principal is None:
+                        continue
+                    raw = {
+                        "doc_id": row["doc_id"],
+                        "path": row["path"],
+                        "agent": row["agent"],
+                        "privacy_level": row["privacy_level"],
+                        "page_type": row["page_type"],
+                        "page_status": row["page_status"],
+                    }
+                    if not can_read_document(principal, ws, raw):
+                        continue
                     contexts.append({
                         "link": link,
                         "doc_id": row["doc_id"],

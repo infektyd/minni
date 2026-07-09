@@ -89,6 +89,10 @@ class EffectivePrincipal:
     transport: str = "uds"
     capabilities: List[str] = field(default_factory=lambda: ["*"])
     allowed_vault_roots: List[str] = field(default_factory=list)
+    # When True, an empty allowed_vault_roots means deny-all (platform agents).
+    # When False (default), empty roots remain the historical "unrestricted"
+    # meaning for capable operator/local principals.
+    vault_roots_bound: bool = False
     # Why the resolver default-denied this stamp (None for capable principals):
     # "unknown_identity"  — supplied non-reserved id with no principals/<id>.json
     # "reserved_agent_id" — wire claim of an operator-reserved id ("main"/"operator")
@@ -103,7 +107,7 @@ class EffectivePrincipal:
     def allows_vault_root(self, path: str | Path) -> bool:
         """Return True if path is under one of the allowed vault roots (or no restriction)."""
         if not self.allowed_vault_roots:
-            if not self.capabilities:
+            if self.vault_roots_bound or not self.capabilities:
                 return False
             return True
         try:
@@ -520,6 +524,27 @@ def resolve_effective_principal(
                 resolved_caps = platform_caps_map[supplied]
             else:
                 resolved_caps = []
+            # Same fail-closed rule for vault roots: never copy the operator's
+            # allowed_vault_roots (empty list = unrestricted for capable
+            # principals). Optional platform_agent_vault_roots map grants roots
+            # per platform id; missing entry → [].
+            platform_roots_raw = raw.get("platform_agent_vault_roots") or {}
+            platform_roots_map = (
+                platform_roots_raw if isinstance(platform_roots_raw, dict) else {}
+            )
+            if supplied in platform_roots_map:
+                raw_platform_roots = platform_roots_map[supplied] or []
+                if not isinstance(raw_platform_roots, list):
+                    raw_platform_roots = []
+                resolved_roots: list[str] = []
+                for x in raw_platform_roots:
+                    p = str(x)
+                    try:
+                        resolved_roots.append(str(Path(p).resolve()))
+                    except Exception:
+                        resolved_roots.append(p)
+            else:
+                resolved_roots = []
             raw_ws = raw.get("workspace_id")
             resolved_ws = raw_ws if raw_ws is not None else stamped.workspace_id
             return EffectivePrincipal(
@@ -528,7 +553,8 @@ def resolve_effective_principal(
                 session_id=raw.get("session_id"),
                 transport=transport,
                 capabilities=list(resolved_caps),
-                allowed_vault_roots=stamped.allowed_vault_roots,
+                allowed_vault_roots=resolved_roots,
+                vault_roots_bound=True,
             )
 
     # Check legacy aliases declared across ALL principal files that exist (union).

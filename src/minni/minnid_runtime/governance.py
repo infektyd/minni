@@ -555,6 +555,14 @@ def stage_candidate(params: dict, request_id: Any, context: GovernanceContext) -
     ev = json.dumps(params.get("evidence_refs") or params.get("evidence_doc_ids") or [])
     df = json.dumps(params.get("derived_from") or {})
     instr = 1 if (params.get("instruction_like") or is_instruction_like(stored_content)) else 0
+    # Caller privacy_level is untrusted for non-operator/govern principals: AFM
+    # consolidation auto-promotes safe/public/low, so a learn-only stager must
+    # not be able to self-label a candidate into the promote path. Trusted
+    # operator/govern (and server-side ingest that bypasses this handler) may
+    # still stamp an explicit privacy level.
+    privacy_level = (
+        params.get("privacy_level") if is_operator_principal(principal) else None
+    )
 
     try:
         db = context.lazy_writeback().db
@@ -570,7 +578,7 @@ def stage_candidate(params: dict, request_id: Any, context: GovernanceContext) -
                     principal.agent_id,
                     ws,
                     params.get("layer"),
-                    params.get("privacy_level"),
+                    privacy_level,
                     stored_content,
                     ev,
                     df,

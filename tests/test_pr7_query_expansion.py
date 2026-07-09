@@ -200,6 +200,7 @@ def test_minnid_search_forwards_expand_and_summarize(monkeypatch):
 
 def test_neighborhood_summary_degrades_when_afm_unavailable(monkeypatch, tmp_path):
     import minni.retrieval as retrieval
+    from minni.principal import EffectivePrincipal
 
     engine, db_obj, _ = _make_db(tmp_path)
     doc_id, _ = _insert_doc(
@@ -207,16 +208,19 @@ def test_neighborhood_summary_degrades_when_afm_unavailable(monkeypatch, tmp_pat
         path="/wiki/entity.md",
         text="Entity page links to [[wiki/concepts/linked]].",
         page_type="entity",
+        agent="codex",
     )
     _insert_doc(
         db_obj,
         path="/wiki/concepts/linked.md",
         text="Linked page context.",
         page_type="concept",
+        agent="codex",
     )
     monkeypatch.setattr(retrieval, "summarize_with_afm", lambda *args, **kwargs: None)
     monkeypatch.setattr(engine, "_semantic_search", lambda query, limit: [])
 
+    principal = EffectivePrincipal(agent_id="codex", capabilities=["read", "search"])
     results = engine.retrieve(
         "Entity",
         limit=1,
@@ -224,6 +228,7 @@ def test_neighborhood_summary_degrades_when_afm_unavailable(monkeypatch, tmp_pat
         summarize_neighborhood=True,
         depth="chunk",
         budget_tokens=False,
+        principal=principal,
     )
 
     assert results[0]["doc_id"] == doc_id
@@ -233,6 +238,7 @@ def test_neighborhood_summary_degrades_when_afm_unavailable(monkeypatch, tmp_pat
 
 def test_neighborhood_summary_uses_afm_when_available(monkeypatch, tmp_path):
     import minni.retrieval as retrieval
+    from minni.principal import EffectivePrincipal
 
     engine, db_obj, _ = _make_db(tmp_path)
     _insert_doc(
@@ -240,16 +246,19 @@ def test_neighborhood_summary_uses_afm_when_available(monkeypatch, tmp_path):
         path="/wiki/entity.md",
         text="Entity page links to [[wiki/concepts/linked]].",
         page_type="entity",
+        agent="codex",
     )
     _insert_doc(
         db_obj,
         path="/wiki/concepts/linked.md",
         text="Linked page context.",
         page_type="concept",
+        agent="codex",
     )
     monkeypatch.setattr(retrieval, "summarize_with_afm", lambda prompt: "Linked context summary.")
     monkeypatch.setattr(engine, "_semantic_search", lambda query, limit: [])
 
+    principal = EffectivePrincipal(agent_id="codex", capabilities=["read", "search"])
     results = engine.retrieve(
         "Entity",
         limit=1,
@@ -257,6 +266,7 @@ def test_neighborhood_summary_uses_afm_when_available(monkeypatch, tmp_path):
         summarize_neighborhood=True,
         depth="chunk",
         budget_tokens=False,
+        principal=principal,
     )
 
     assert results[0]["neighborhood_summary"]["status"] == "ok"
