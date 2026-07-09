@@ -14,8 +14,9 @@ export function HandoffsScreen() {
         ]}
       />
       <StateBanner state="empty">
-        Handoffs is unwired in this alpha. The bridge has no <code>/api/handoffs</code> endpoint yet — the
-        screen will activate when one ships.
+        Handoffs is unwired in this alpha. The bridge has no <code>/api/handoffs</code> endpoint yet.
+        Pending leases stay on MCP: <code>minni_list_pending_handoffs</code>,{" "}
+        <code>minni_ack_handoff</code>, <code>minni_await_handoff</code>.
       </StateBanner>
     </>
   );
@@ -35,8 +36,9 @@ export function VaultsScreen() {
         ]}
       />
       <StateBanner state="empty">
-        Vaults is unwired in this alpha. The bridge does not expose a vault catalogue endpoint yet —
-        Settings shows the active vault path read from <code>/api/status</code>.
+        Vaults is unwired in this alpha — no multi-agent catalogue API. Settings shows this
+        console&apos;s active vault from <code>/api/status</code> (
+        <code>MINNI_VAULT_PATH</code>).
       </StateBanner>
     </>
   );
@@ -56,8 +58,9 @@ export function PolicyScreen() {
         ]}
       />
       <StateBanner state="empty">
-        Policy & AFM is unwired in this alpha. The bridge does not expose a policy read endpoint yet
-        — see <code>plugins/minni/src/policy.ts</code> for the active rule set.
+        Policy & AFM is unwired in this alpha — no policy read HTTP route. Hook/policy heuristics live
+        in <code>plugins/minni/src/policy.ts</code>; AFM posture is on Settings via{" "}
+        <code>/api/status</code>.
       </StateBanner>
     </>
   );

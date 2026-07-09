@@ -16,6 +16,7 @@ from typing import Any
 AGENT_VAULT_DIRS: dict[str, str] = {
     "claude-code": "claudecode-vault",
     "codex": "codex-vault",
+    "cursor": "cursor-vault",
     "gemini": "gemini-vault",
     "grok-build": "grok-build-vault",
     "kilocode": "kilocode-vault",

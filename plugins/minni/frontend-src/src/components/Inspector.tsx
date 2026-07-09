@@ -134,24 +134,15 @@ export function Inspector({ source, mode, onClose }: Props) {
       )}
 
       <div className="insp-section" style={{ borderBottom: 0 }}>
-        <h3 className="insp-section-title">Actions</h3>
-        <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-          <button className="btn btn-primary btn-sm" type="button" disabled>
-            Include in packet
-          </button>
-          <button className="btn btn-secondary btn-sm" type="button" disabled>
-            Open in vault
-          </button>
-        </div>
         <div
           className="muted"
           style={{
             fontSize: 11.5,
-            marginTop: 10,
             fontFamily: "var(--font-mono)",
           }}
         >
-          Inspecting a source does not store, learn, export, or publish.
+          Inspecting a source does not store, learn, export, or publish. Use Include /
+          Exclude on the Recall ledger to shape the packet.
         </div>
       </div>
     </aside>

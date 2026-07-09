@@ -5,7 +5,7 @@ import { createServer as createNetServer } from "node:net";
 import path from "node:path";
 import test from "node:test";
 
-import { createUiServer } from "../dist/ui-server.js";
+import { consolePrincipalReport, createUiServer, daemonRpcHttpStatus } from "../dist/ui-server.js";
 
 const CONSOLE_AUTH = {
   Authorization: `Bearer ${process.env.MINNI_CONSOLE_TOKEN}`,
@@ -433,6 +433,108 @@ test("static shell serves without auth while /api stays locked", async () => {
     // Traversal out of staticRoot is still refused even unauthenticated.
     const escape = await fetch(`${server.baseUrl}/..%2f..%2fpackage.json`);
     assert.notEqual(escape.status, 200, "path traversal refused");
+  } finally {
+    await server.close();
+  }
+});
+
+// ── Fail-loud RPC status mapping + honest principal stamp ───────────────────
+test("daemonRpcHttpStatus maps governance denials honestly", () => {
+  assert.equal(daemonRpcHttpStatus("already_resolved: candidate #3 is 'accepted'"), 409);
+  assert.equal(
+    daemonRpcHttpStatus("operator_only: accepting candidate #1 into a durable learning requires an operator/govern principal"),
+    403,
+  );
+  assert.equal(
+    daemonRpcHttpStatus("accept_flagged_required: candidate is instruction_like; accepting it requires literal 'accept_flagged' capability"),
+    403,
+  );
+  assert.equal(daemonRpcHttpStatus("principal_mismatch: agent cannot resolve"), 403);
+  assert.equal(daemonRpcHttpStatus("candidate_not_found: 99999"), 404);
+  assert.equal(daemonRpcHttpStatus("unknown candidate"), 404);
+  // Must NOT treat JSON-RPC "Method not found" as a missing candidate.
+  assert.equal(daemonRpcHttpStatus("Method not found: resolve_candidate"), 501);
+  // Message-only paths (sovereign forwards error.message, not the numeric code).
+  assert.equal(daemonRpcHttpStatus("decision must be one of ['accept','reject']"), 400);
+  assert.equal(daemonRpcHttpStatus("candidate_id must be integer"), 400);
+  assert.equal(daemonRpcHttpStatus("candidate_id is required"), 400);
+  assert.equal(
+    daemonRpcHttpStatus("invalid agent_id 'Bad': must match ^[a-z0-9][a-z0-9._-]{0,63}$"),
+    400,
+  );
+  assert.equal(daemonRpcHttpStatus("agent_id must be a non-empty string, got ''"), 400);
+  // Broad "must be" without a known validation shape stays 502 (not a fake client error).
+  assert.equal(daemonRpcHttpStatus("internal: widget must be flipped"), 502);
+  assert.equal(daemonRpcHttpStatus("socket ECONNREFUSED"), 502);
+});
+
+test("consolePrincipalReport does not invent capabilities", () => {
+  const report = consolePrincipalReport();
+  assert.equal(typeof report.agentId, "string");
+  assert.equal(typeof report.unknownAgent, "boolean");
+  assert.equal(typeof report.resolveOperatorsEnv, "boolean");
+  assert.ok(!("capabilities" in report), "capabilities must not be fabricated on the bridge");
+});
+
+test("/api/status includes principal without capabilities", async () => {
+  const server = await startTestServer();
+  try {
+    const res = await fetch(`${server.baseUrl}/api/status`, { headers: authHeaders() });
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.ok(body.principal, "principal stamp present");
+    assert.equal(typeof body.principal.agentId, "string");
+    assert.ok(!("capabilities" in body.principal), "no fabricated capabilities on /api/status");
+  } finally {
+    await server.close();
+  }
+});
+
+test("/api/candidates and /api/resolve-candidate use daemonRpcHttpStatus at the route seam", async () => {
+  const server = await startTestServer({
+    daemonRpc: async (method) => {
+      if (method === "list_candidates") {
+        return { ok: false, error: "operator_only: list denied for test" };
+      }
+      if (method === "resolve_candidate") {
+        return { ok: false, error: "already_resolved: candidate #9 is 'rejected'" };
+      }
+      return { ok: false, error: `unexpected method ${method}` };
+    },
+  });
+  try {
+    const candidates = await fetch(`${server.baseUrl}/api/candidates?status=proposed`, { headers: authHeaders() });
+    assert.equal(candidates.status, 403, "operator_only via JsonResult must be 403 at the route");
+    const candBody = await candidates.json();
+    assert.equal(candBody.ok, false);
+    assert.match(candBody.error, /operator_only/);
+
+    const resolve = await fetch(`${server.baseUrl}/api/resolve-candidate`, {
+      method: "POST",
+      headers: authHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify({ candidate_id: 9, decision: "accept" }),
+    });
+    assert.equal(resolve.status, 409, "already_resolved via JsonResult must be 409 at the route");
+    const resolveBody = await resolve.json();
+    assert.equal(resolveBody.ok, false);
+    assert.match(resolveBody.error, /already_resolved/);
+  } finally {
+    await server.close();
+  }
+});
+
+test("/api/candidates catch branch maps thrown daemon errors via daemonRpcHttpStatus", async () => {
+  const server = await startTestServer({
+    daemonRpc: async () => {
+      throw new Error("accept_flagged_required: candidate is instruction_like");
+    },
+  });
+  try {
+    const candidates = await fetch(`${server.baseUrl}/api/candidates`, { headers: authHeaders() });
+    assert.equal(candidates.status, 403, "thrown accept_flagged_required must be 403 via catch");
+    const body = await candidates.json();
+    assert.equal(body.ok, false);
+    assert.match(body.error, /accept_flagged_required/);
   } finally {
     await server.close();
   }

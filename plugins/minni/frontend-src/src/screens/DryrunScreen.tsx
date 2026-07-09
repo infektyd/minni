@@ -216,9 +216,9 @@ export function DryrunScreen({ layout, outcome, setOutcome, defaultTask }: Props
       >
         <Chip kind="afm">AFM-SAFE · DRY-RUN</Chip>
         <span style={{ fontSize: 13, flex: 1, minWidth: 220 }}>
-          The AFM loop produced these drafts as <b>review surfaces</b>. Nothing is in the
-          vault, the SQLite truth, or any FAISS shard until you approve. Rejection is
-          reversible.
+          Drafts are <b>review marks only</b> in this console — Approve/Defer/Reject do not
+          call the daemon. Nothing is staged or written until a future{" "}
+          <code>stage_candidate</code> → <code>resolve_candidate</code> path ships.
         </span>
       </div>
 

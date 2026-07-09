@@ -208,9 +208,13 @@ function StagedDetail({ stagedState }: { stagedState?: StagedLearningsState }) {
         })}
       </div>
       <div className="dz-foot">
-        {isLive
-          ? "Decisions submitted to daemon via /api/resolve-candidate"
-          : "Sample candidates only. Nothing is stored from this board pass."}
+        {stagedState?.error
+          ? `Staged fetch error: ${stagedState.error}`
+          : isLive
+            ? learnings.length === 0
+              ? "Live empty for this console principal — no proposed candidates owned by the stamped agent."
+              : "Reject/redact via /api/resolve-candidate as the stamped owner. Accept into durable memory needs operator/govern (or MINNI_RESOLVE_OPERATORS) — not granted to this console principal."
+            : "Sample candidates only. Nothing is stored from this board pass."}
       </div>
     </div>
   );
@@ -254,13 +258,13 @@ function AgentsDetail() {
             once
           </div>
           <div className="ac-caps">
-            <button className="bd-btn quiet sm">Revoke</button>
-            <button className="bd-btn quiet sm">Nudge codex</button>
+            <span className="bd-chip warn">SAMPLE · no lease API in console</span>
           </div>
         </div>
       </div>
       <div className="dz-foot">
-        Sample runtime fixture. Capabilities shown here are not live grants.
+        Sample runtime fixture. Capabilities shown here are not live grants. Lease
+        revoke/nudge stay MCP-only until <code>/api/handoffs</code> ships.
       </div>
     </div>
   );
@@ -356,9 +360,11 @@ function LogsDetail() {
           </div>
           <Meter v={l.score} />
           <span className="lc-score">{l.score.toFixed(2)}</span>
-          <button className="bd-btn quiet sm">Forget</button>
         </div>
       ))}
+      <div className="dz-foot">
+        Sample log-only entries. Forget is not available in the console bridge.
+      </div>
     </div>
   );
 }
@@ -397,10 +403,10 @@ function QuarantineDetail() {
           <span className="label">INSTRUCTION-LIKE · DEFUSED</span>
           {SAMPLE_DENY.risk}
         </div>
-        <div className="q-actions">
-          <button className="bd-btn danger">✕ Confirm do-not-store</button>
-          <button className="bd-btn quiet">Redact &amp; re-stage</button>
-          <button className="bd-btn quiet">View raw note</button>
+        <div className="dz-foot" style={{ marginTop: 12 }}>
+          Sample quarantine fixture. Confirm / redact / view-raw are not wired in
+          the console — use MCP <code>minni_resolve_candidate</code> with a real
+          candidate id when governing live rows.
         </div>
       </div>
     </div>
@@ -408,18 +414,35 @@ function QuarantineDetail() {
 }
 
 // ── RECALL ──────────────────────────────────────────────────────────────────
-function RecallDetail() {
+function RecallDetail({
+  onOpenRecall,
+}: {
+  onOpenRecall?: (query?: string) => void;
+}) {
   const [sel, setSel] = useState(0);
+  const [query, setQuery] = useState("handoff leases");
   const active = SAMPLE_RECALL[sel];
   return (
     <div className="dz recall-dz">
       <div className="rcol">
         <div className="rsearch">
-          <input className="bd-input" defaultValue="handoff leases" aria-label="Recall query" />
-          <button className="bd-btn primary">Recall</button>
+          <input
+            className="bd-input"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            aria-label="Recall query"
+          />
+          <button
+            className="bd-btn primary"
+            type="button"
+            onClick={() => onOpenRecall?.(query.trim() || undefined)}
+            disabled={!onOpenRecall}
+          >
+            Open in console Recall
+          </button>
         </div>
         <div className="r-meta">
-          Sample query · 5 results · both legs · rank-fusion · 212 ms ·{" "}
+          Sample preview only · use console Recall for live <code>/api/prepare-task</code> ·{" "}
           <span className="bd-chip info">CITED, NEVER OBEYED</span>
         </div>
         {SAMPLE_RECALL.map((r, i) => (
@@ -427,6 +450,7 @@ function RecallDetail() {
             key={r.path}
             className={"rrow" + (sel === i ? " sel" : "")}
             onClick={() => setSel(i)}
+            type="button"
           >
             <Meter v={r.score} />
             <span className="lc-score">{r.score.toFixed(2)}</span>
@@ -464,7 +488,17 @@ function RecallDetail() {
   );
 }
 
-export function ZoneDetail({ id, ctx, stagedState }: { id: ZoneId; ctx: BoardDetailContext; stagedState?: StagedLearningsState }) {
+export function ZoneDetail({
+  id,
+  ctx,
+  stagedState,
+  onOpenRecall,
+}: {
+  id: ZoneId;
+  ctx: BoardDetailContext;
+  stagedState?: StagedLearningsState;
+  onOpenRecall?: (query?: string) => void;
+}) {
   switch (id) {
     case "staged":
       return <StagedDetail stagedState={stagedState} />;
@@ -477,7 +511,7 @@ export function ZoneDetail({ id, ctx, stagedState }: { id: ZoneId; ctx: BoardDet
     case "quarantine":
       return <QuarantineDetail />;
     case "recall":
-      return <RecallDetail />;
+      return <RecallDetail onOpenRecall={onOpenRecall} />;
     default:
       return null;
   }

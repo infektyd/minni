@@ -81,6 +81,7 @@ export function BoardScreen({
   health,
   audit,
   onOpenConsole,
+  onOpenRecall,
   onAuthRequired,
   tokenRefreshTrigger,
   theme,
@@ -91,6 +92,8 @@ export function BoardScreen({
   audit: AuditTailResult | null;
   /** Switch back to the v1 console shell. */
   onOpenConsole?: () => void;
+  /** Deep-link into console Recall with an optional query (board Recall zone). */
+  onOpenRecall?: (query?: string) => void;
   /** The console token was rejected — raise the token gate now. */
   onAuthRequired?: () => void;
   tokenRefreshTrigger?: number;
@@ -502,7 +505,12 @@ export function BoardScreen({
                   </div>
                 </div>
                 <div className="zo-body">
-                  <ZoneDetail id={id} ctx={{ daemon, recentAudit: auditSummaries }} stagedState={stagedState} />
+                  <ZoneDetail
+                    id={id}
+                    ctx={{ daemon, recentAudit: auditSummaries }}
+                    stagedState={stagedState}
+                    onOpenRecall={onOpenRecall}
+                  />
                 </div>
               </>
             ) : (

@@ -146,6 +146,14 @@ export interface ExtractorStatus {
   probeAgeMs?: number;
 }
 
+export interface ConsolePrincipalStatus {
+  agentId: string;
+  stampedForCandidates: string | null;
+  unknownAgent: boolean;
+  /** True when MINNI_RESOLVE_OPERATORS is set (env allow-list for accept). Caps stay daemon-side. */
+  resolveOperatorsEnv: boolean;
+}
+
 export interface StatusReport {
   vault: { path: string; exists: boolean };
   socket: JsonResult<SocketStatusData>;
@@ -154,6 +162,8 @@ export interface StatusReport {
   afmProvider?: AfmProviderStatus;
   extractor?: ExtractorStatus;
   audit: { entries: number; latest?: string; volume?: number };
+  /** Who this console process stamps on candidates/resolve (from MINNI_AGENT_ID). */
+  principal?: ConsolePrincipalStatus;
 }
 
 export interface AuditTailResult {

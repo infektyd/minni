@@ -224,6 +224,10 @@ export function App() {
           health={health}
           audit={audit}
           onOpenConsole={() => setActive("recall")}
+          onOpenRecall={(q) => {
+            if (q) setQuery(q);
+            setActive("recall");
+          }}
           onAuthRequired={() => setAuthRequired(true)}
           tokenRefreshTrigger={tokenRefreshTrigger}
           theme={tweaks.theme}
