@@ -12,6 +12,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import shutil
 import socket
 import sqlite3
@@ -76,6 +77,17 @@ def plugin_version_segment() -> str:
     )
 
 
+def plugin_source_version(repo_root: Path) -> str:
+    package = plugin_source(repo_root) / "package.json"
+    try:
+        version = str(load_json(package).get("version", "")).strip()
+    except Exception as exc:
+        raise SystemExit(f"Cannot read plugin source version from {package}: {exc}") from exc
+    if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?", version):
+        raise SystemExit(f"Invalid plugin source version in {package}: {version!r}")
+    return version
+
+
 def default_plugin_cli() -> Path:
     """CLI entrypoint path derived from the wired install root."""
     version = plugin_version_segment()
@@ -91,10 +103,9 @@ def default_plugin_cli() -> Path:
 DEFAULT_REPO_ROOT = Path.home() / "Projects" / "minni"
 
 # Antigravity (CLI `agy` + IDE + antigravity) share the ~/.gemini tree and use
-# agent id `gemini`. Surface MCP configs are symlinks into ~/.agents/mcp-servers/views/.
-# The mcp-env-run wrapper is the canonical launcher every Gemini-surface server uses,
-# and IDE view entries carry this protobuf type tag which must be preserved on hand-edit.
-GEMINI_MCP_ENV_RUN = Path("~/.agents/bin/mcp-env-run").expanduser()
+# agent id `gemini`. Managed MCP configs are independent regular files so one
+# surface cannot silently rewrite another through a shared symlink target.
+# IDE view entries carry this protobuf type tag which must be preserved on hand-edit.
 GEMINI_IDE_TYPE_NAME = "exa.cascade_plugins_pb.CascadePluginCommandTemplate"
 GEMINI_SURFACE_CONFIGS = (
     "~/.gemini/config/mcp_config.json",
@@ -480,14 +491,73 @@ def update_claude_config(server_path: Path, agent: str, vault: Path, socket_path
     write_json(path, data)
 
 
-def update_kilo_config(server_path: Path, agent: str, vault: Path, socket_path: Path, workspace: Path, afm_env: dict[str, str] | None = None) -> None:
+def claude_refresh_plan(user_marketplaces: dict[str, object], installed: list[dict], repo_root: Path) -> list[list[str]]:
+    """Native CLI commands needed to point Claude at this canonical source."""
+    desired = repo_root.expanduser().resolve()
+    minni_market = user_marketplaces.get("minni")
+    commands: list[list[str]] = []
+    source = minni_market.get("source", {}) if isinstance(minni_market, dict) else {}
+    current_path = Path(str(source.get("path", ""))).expanduser() if isinstance(source, dict) else Path()
+    if isinstance(minni_market, dict) and current_path.exists() and current_path.resolve() == desired:
+        commands.append(["claude", "plugin", "marketplace", "update", "minni"])
+        action = "update" if any(
+            p.get("id") == "minni@minni" and p.get("scope", "user") == "user"
+            for p in installed
+        ) else "install"
+    else:
+        if isinstance(minni_market, dict):
+            commands.append(["claude", "plugin", "marketplace", "remove", "minni", "--scope", "user"])
+        commands.append(["claude", "plugin", "marketplace", "add", str(desired), "--scope", "user"])
+        # Removing a marketplace also removes its install identity. Reinstall
+        # even when the pre-swap snapshot reported Minni as installed.
+        action = "install"
+    if action == "update":
+        commands.append(["claude", "plugin", "update", "minni@minni", "--scope", "user"])
+    else:
+        commands.append(["claude", "plugin", "install", "minni@minni", "--scope", "user"])
+    user_entry = next((
+        p for p in installed
+        if p.get("id") == "minni@minni" and p.get("scope", "user") == "user"
+    ), None)
+    if user_entry and user_entry.get("enabled") is False:
+        commands.append(["claude", "plugin", "enable", "minni@minni", "--scope", "user"])
+    return commands
+
+
+def refresh_claude_plugin(repo_root: Path) -> None:
+    """Use Claude's supported CLI so registry, marketplace and enablement stay coupled."""
+    if not shutil.which("claude"):
+        raise SystemExit("Claude Code CLI not found; cannot activate the installed Minni plugin")
+    try:
+        settings = load_json(Path.home() / ".claude/settings.json")
+        marketplaces = settings.get("extraKnownMarketplaces", {})
+        if not isinstance(marketplaces, dict):
+            marketplaces = {}
+        installed = json.loads(subprocess.check_output(
+            ["claude", "plugin", "list", "--json"], text=True, timeout=30,
+        ))
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, json.JSONDecodeError) as exc:
+        raise SystemExit(f"Cannot inspect Claude plugin state: {exc}") from exc
+    for command in claude_refresh_plan(marketplaces, installed, repo_root):
+        try:
+            subprocess.run(command, check=True, timeout=120)
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+            raise SystemExit(f"Claude plugin refresh failed at {' '.join(command)}: {exc}") from exc
+
+
+def update_kilo_config(server_path: Path, agent: str, vault: Path, socket_path: Path, workspace: Path,
+                       afm_env: dict[str, str] | None = None, *, remove_legacy: bool = False) -> None:
     path = Path("~/.config/kilo/kilo.json").expanduser()
     data = load_json(path)
+    # Exact legacy ownership only: running both servers creates split-brain
+    # memory reads/writes. Unrelated MCP servers remain untouched.
+    if remove_legacy:
+        data.setdefault("mcp", {}).pop("sovereign-memory", None)
     data.setdefault("mcp", {})["minni"] = {
         "type": "local",
         "command": ["node", str(server_path)],
         "enabled": True,
-        "env": {
+        "environment": {
             "MINNI_AGENT_ID": agent,
             "MINNI_VAULT_PATH": str(vault),
             "MINNI_SOCKET_PATH": str(socket_path),
@@ -496,6 +566,174 @@ def update_kilo_config(server_path: Path, agent: str, vault: Path, socket_path: 
         },
     }
     write_json(path, data)
+
+
+def render_kilo_plugin(install_root: Path, agent: str, vault: Path, socket_path: Path,
+                       workspace: Path | str) -> str:
+    template = (install_root / "kilo/minni-plugin.js").read_text(encoding="utf-8")
+    values = {
+        "MINNI_KILOCODE_AGENT_ID": agent,
+        "MINNI_KILOCODE_VAULT_PATH": str(vault),
+        "MINNI_KILOCODE_WORKSPACE_ID": normalize_workspace_id(str(workspace)) or "workspace-unknown",
+        "MINNI_SOCKET_PATH": str(socket_path),
+    }
+    return template.replace(
+        "__MINNI_KILO_HOOK_SCRIPT__", json.dumps(str(install_root / "dist/kilocode-hook.js")),
+    ).replace("__MINNI_KILO_HOOK_ENV__", json.dumps(values, sort_keys=True))
+
+
+def update_kilo_plugin(install_root: Path, agent: str, vault: Path, socket_path: Path,
+                       workspace: Path | str, *, home: Path | None = None) -> Path:
+    target = (home or Path.home()) / ".config/kilo/plugin/minni.js"
+    source = render_kilo_plugin(install_root, agent, vault, socket_path, workspace)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(source, encoding="utf-8")
+    # Syntax is a cheap activation precondition before legacy MCP cleanup.
+    subprocess.run(["node", "--check", str(target)], check=True, timeout=30)
+    return target
+
+
+CURSOR_HOOK_EVENTS = ("sessionStart", "beforeSubmitPrompt", "preCompact", "stop", "preToolUse")
+GROK_HOOK_EVENTS = ("SessionStart", "UserPromptSubmit", "PreCompact", "Stop")
+
+
+def cursor_hook_entry(install_root: Path, event: str, agent: str = "cursor",
+                      vault: Path | None = None, socket_path: Path = DEFAULT_SOCKET,
+                      workspace: Path | str = "workspace-unknown") -> dict[str, object]:
+    hook_vault = vault or vault_for(agent)
+    workspace_id = normalize_workspace_id(str(workspace)) or "workspace-unknown"
+    env = " ".join((
+        f"MINNI_CURSOR_AGENT_ID={shlex.quote(agent)}",
+        f"MINNI_CURSOR_VAULT_PATH={shlex.quote(str(hook_vault))}",
+        f"MINNI_SOCKET_PATH={shlex.quote(str(socket_path))}",
+        f"MINNI_CURSOR_WORKSPACE_ID={shlex.quote(workspace_id)}",
+    ))
+    entry: dict[str, object] = {
+        "command": f"{env} node {shlex.quote(str(install_root / 'dist' / 'cursor-hook.js'))} {event}",
+        "timeout": 10 if event == "preToolUse" else (30 if event in {"sessionStart", "beforeSubmitPrompt"} else 20),
+    }
+    if event == "preToolUse":
+        entry["matcher"] = "Read|Grep|Glob|Shell"
+    return entry
+
+
+def is_owned_cursor_hook(entry: object, install_root: Path) -> bool:
+    if not isinstance(entry, dict):
+        return False
+    command = str(entry.get("command", ""))
+    known_roots = (
+        str(install_root / "dist" / "hook.js"),
+        str(install_root / "dist" / "cursor-hook.js"),
+        "~/.cursor/plugins/minni@minni/dist/hook.js",
+        "~/.cursor/plugins/minni@minni/dist/cursor-hook.js",
+        "/.cursor/plugins/minni@minni/dist/hook.js",
+        "/.cursor/plugins/minni@minni/dist/cursor-hook.js",
+        "${CURSOR_PLUGIN_ROOT}/dist/cursor-hook.js",
+    )
+    return any(root in command for root in known_roots)
+
+
+def update_cursor_config(install_root: Path, server_path: Path, agent: str, vault: Path,
+                         socket_path: Path, workspace: Path,
+                         afm_env: dict[str, str] | None = None, *, home: Path | None = None,
+                         explicit_workspace: bool = False) -> None:
+    """Merge native Cursor wiring without replacing unrelated user hooks/MCPs."""
+    cursor_home = (home or Path.home()) / ".cursor"
+    mcp_path = cursor_home / "mcp.json"
+    mcp = load_json(mcp_path)
+    existing_env = mcp.get("mcpServers", {}).get("minni", {}).get("env", {}) or {}
+    mcp_entry = mcp_json(
+        server_path, agent, vault, socket_path, workspace, explicit_workspace=explicit_workspace,
+        pre_existing_env=existing_env, afm_env=afm_env
+    )["mcpServers"]["minni"]
+    mcp.setdefault("mcpServers", {})["minni"] = mcp_entry
+    write_json(mcp_path, mcp)
+    effective_workspace = Path(mcp_entry["env"]["MINNI_WORKSPACE_ID"])
+
+    # The Cursor plugin manifest is the single registration authority. Stamp
+    # its installed hook file with this installation's identity values.
+    plugin_hooks = {
+        "version": 1,
+        "hooks": {
+            event: [cursor_hook_entry(
+                install_root, event, agent, vault, socket_path, effective_workspace,
+            )]
+            for event in CURSOR_HOOK_EVENTS
+        },
+    }
+    write_json(install_root / "hooks" / "hooks-cursor.json", plugin_hooks)
+
+    # Remove recognized legacy Minni user hooks so Cursor does not merge and
+    # execute a second copy. Preserve every unrelated entry and event.
+    hooks_path = cursor_home / "hooks.json"
+    hooks = load_json(hooks_path)
+    groups = hooks.get("hooks", {})
+    if not isinstance(groups, dict):
+        groups = {}
+    for event in CURSOR_HOOK_EVENTS:
+        existing = groups.get(event, [])
+        if not isinstance(existing, list):
+            existing = []
+        groups[event] = [entry for entry in existing if not is_owned_cursor_hook(entry, install_root)]
+    if hooks_path.exists():
+        hooks["hooks"] = groups
+        write_json(hooks_path, hooks)
+
+    migrate_legacy_cursor_install(cursor_home, install_root)
+
+
+def migrate_legacy_cursor_install(cursor_home: Path, install_root: Path) -> Path | None:
+    """Move only the recognized pre-native Minni install out of Cursor's scan tree."""
+    legacy = cursor_home / "plugins/minni@minni"
+    if legacy == install_root or not legacy.exists() or legacy.is_symlink() or not legacy.is_dir():
+        return None
+    package = legacy / "package.json"
+    try:
+        name = str(load_json(package).get("name", ""))
+    except Exception:
+        return None
+    if name != "minni-multi-plugin":
+        return None
+    archive_dir = cursor_home / "legacy-plugins"
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    target = archive_dir / "minni@minni-pre-native"
+    suffix = 1
+    while target.exists():
+        target = archive_dir / f"minni@minni-pre-native-{suffix}"
+        suffix += 1
+    shutil.move(str(legacy), str(target))
+    return target
+
+
+def grok_hook_command(install_root: Path, event: str, agent: str, vault: Path,
+                      socket_path: Path, workspace: Path | str) -> str:
+    values = {
+        "MINNI_GROK_AGENT_ID": agent,
+        "MINNI_GROK_VAULT_PATH": str(vault),
+        "MINNI_GROK_WORKSPACE_ID": normalize_workspace_id(str(workspace)) or "workspace-unknown",
+        "MINNI_SOCKET_PATH": str(socket_path),
+    }
+    env = " ".join(f"{key}={shlex.quote(value)}" for key, value in values.items())
+    script = shlex.quote(str(install_root / "dist" / "grok-hook.js"))
+    return f"env {env} node {script} {event}"
+
+
+def update_grok_hooks(install_root: Path, agent: str, vault: Path, socket_path: Path,
+                      workspace: Path | str, *, home: Path | None = None) -> None:
+    """Write Grok's Minni-owned hook file; unrelated hook files are untouched."""
+    timeouts = {"SessionStart": 30, "UserPromptSubmit": 30, "PreCompact": 20, "Stop": 20}
+    hooks = {
+        "_comment": "Managed by minni-install. Grok-native hooks; do not replace with Claude hook.js.",
+        "hooks": {
+            event: [{"hooks": [{
+                "type": "command",
+                "command": grok_hook_command(install_root, event, agent, vault, socket_path, workspace),
+                "timeout": timeouts[event],
+            }]}]
+            for event in GROK_HOOK_EVENTS
+        },
+    }
+    write_json((home or Path.home()) / ".grok/hooks/minni.json", hooks)
 
 
 def update_gemini_manifest(install_root: Path, agent: str, vault: Path, socket_path: Path, workspace: Path, afm_env: dict[str, str] | None = None, *, version: str | None = None) -> None:
@@ -534,15 +772,15 @@ def gemini_minni_entry(
 ) -> dict:
     """Canonical `minni` server entry for a Gemini/Antigravity MCP view.
 
-    Uses an absolute server path (cwd-independent) plus the mcp-env-run wrapper,
-    matching every other server entry on the Gemini surfaces. When `type_name`
+    Uses the standard Node executable plus an absolute server path
+    (cwd-independent). When `type_name`
     is given (IDE views), it is emitted first to match the live shape.
     """
     entry: dict = {}
     if type_name:
         entry["$typeName"] = type_name
-    entry["command"] = str(GEMINI_MCP_ENV_RUN)
-    entry["args"] = ["node", str(server_path)]
+    entry["command"] = "node"
+    entry["args"] = [str(server_path)]
     entry["cwd"] = str(Path(server_path).parent.parent)
     entry["env"] = {
         "MINNI_AGENT_ID": agent,
@@ -592,6 +830,17 @@ def write_view_entry(
     servers.pop("sovereign-memory", None)
     servers["minni"] = new_entry
     write_json(view_path, data)
+    return True
+
+
+def materialize_json_config(path: Path) -> bool:
+    """Replace a managed JSON symlink with an independent regular file."""
+    if not path.is_symlink():
+        return path.exists()
+    target = path.resolve(strict=False)
+    data = load_json(target) if target.exists() else {}
+    path.unlink()
+    write_json(path, data if isinstance(data, dict) else {})
     return True
 
 
@@ -688,10 +937,9 @@ def update_antigravity_config(
     written: list[str] = []
     for surface in GEMINI_SURFACE_CONFIGS:
         surface_path = Path(surface).expanduser()
-        # Follow the symlink to the actual view file; skip broken/missing surfaces.
-        target = surface_path.resolve() if surface_path.exists() else surface_path
-        if write_view_entry(target, server_path, agent, vault, socket_path, workspace, afm_env):
-            written.append(str(target))
+        materialize_json_config(surface_path)
+        if write_view_entry(surface_path, server_path, agent, vault, socket_path, workspace, afm_env):
+            written.append(str(surface_path))
     grants = {
         "~/.gemini/config/config.json": ["globalPermissionGrants", "allow"],
         "~/.gemini/antigravity-cli/settings.json": ["permissions", "allow"],
@@ -708,7 +956,36 @@ AGY_PLUGINS_DIR = "~/.gemini/config/plugins"
 AGY_DIST_TOKEN = "__MINNI_GEMINI_DIST__"
 
 
-def update_agy_plugin_hooks(install_root: Path) -> dict[str, object]:
+def stamp_agy_hook_env(hooks_data: dict, agent: str, vault: Path, socket_path: Path,
+                       workspace: Path | str) -> dict:
+    values = {
+        "MINNI_GEMINI_AGENT_ID": agent,
+        "MINNI_GEMINI_VAULT_PATH": str(vault),
+        "MINNI_GEMINI_WORKSPACE_ID": normalize_workspace_id(str(workspace)) or "workspace-unknown",
+        "MINNI_SOCKET_PATH": str(socket_path),
+    }
+    env = " ".join(f"{key}={shlex.quote(value)}" for key, value in values.items())
+    for groups in hooks_data.get("hooks", {}).values():
+        for group in groups:
+            for hook in group.get("hooks", []):
+                hook["command"] = f"env {env} {hook['command']}"
+    return hooks_data
+
+
+def render_agy_hooks(hooks_data: dict, install_root: Path, agent: str, vault: Path,
+                     socket_path: Path, workspace: Path | str) -> str:
+    rendered = stamp_agy_hook_env(hooks_data, agent, vault, socket_path, workspace)
+    quoted_dist = shlex.quote(str(install_root / "dist"))
+    for groups in rendered.get("hooks", {}).values():
+        for group in groups:
+            for hook in group.get("hooks", []):
+                hook["command"] = hook["command"].replace(AGY_DIST_TOKEN, quoted_dist)
+    return json.dumps(rendered, indent=2)
+
+
+def update_agy_plugin_hooks(install_root: Path, agent: str = "gemini", vault: Path | None = None,
+                            socket_path: Path | None = None,
+                            workspace: Path | str = "workspace-unknown") -> dict[str, object]:
     """Register the Minni hook plugin with the agy (Antigravity CLI) plugin system.
 
     agy loads Claude Code-style hooks.json manifests from
@@ -728,6 +1005,8 @@ def update_agy_plugin_hooks(install_root: Path) -> dict[str, object]:
     hooks.json whose stamped commands point at dist/gemini-hook.js under this
     install root.
     """
+    vault = vault or Path("~/.minni/gemini-vault").expanduser()
+    socket_path = socket_path or Path("~/.minni/run/minnid.sock").expanduser()
     template = install_root / "hooks" / "hooks-gemini.json"
     if not template.exists():
         return {"installed": False, "reason": f"missing hooks template: {template}"}
@@ -740,7 +1019,7 @@ def update_agy_plugin_hooks(install_root: Path) -> dict[str, object]:
 
     hooks_data = json.loads(template.read_text(encoding="utf-8"))
     hooks_data.pop("_comment", None)
-    stamped = json.dumps(hooks_data, indent=2).replace(AGY_DIST_TOKEN, str(install_root / "dist"))
+    stamped = render_agy_hooks(hooks_data, install_root, agent, vault, socket_path, workspace)
 
     staging_root = Path(tempfile.mkdtemp(prefix="minni-agy-plugin-"))
     enable_note = ""
@@ -842,16 +1121,13 @@ def update_toml_mcp_config(path: Path, server_path: Path, agent: str, vault: Pat
 # equivalent deny-capable pre-tool event, so the guard is intentionally NOT
 # wired into their manifests — a platform capability gap, not a Minni
 # omission. The lifecycle nudge + UserPromptSubmit recall pointer reach the
-# codex/grok/kilocode surfaces; on agy 1.0.15 only PreToolUse/PostToolUse/Stop
-# exist, so gemini receives NO lifecycle injection yet. See
+# codex/grok/kilocode surfaces; current agy dispatches SessionStart plus
+# PreToolUse/Stop, but still lacks UserPromptSubmit and PreCompact. See
 # docs/contracts/AGENT.md §8.
 def platform_spec(platform: str, repo_root: Path, install_root: str | None = None) -> dict[str, object]:
     platform = canonical_platform(platform)
     home = Path.home()
-    try:
-        version_seg = plugin_version_segment()
-    except SystemExit:
-        version_seg = None
+    version_seg = plugin_source_version(repo_root)
     codex_install = (
         home / ".codex/plugins/cache/minni/minni" / version_seg
         if version_seg
@@ -868,6 +1144,11 @@ def platform_spec(platform: str, repo_root: Path, install_root: str | None = Non
             "install": codex_install,
             "config": home / ".codex/config.toml",
             "config_kind": "toml",
+        },
+        "cursor": {
+            "agent": "cursor",
+            "install": home / ".cursor/plugins/local/minni",
+            "config_kind": "cursor-json",
         },
         "claude-code": {
             "agent": "claude-code",
@@ -913,7 +1194,7 @@ def platform_spec(platform: str, repo_root: Path, install_root: str | None = Non
             "config_kind": "mcp-json-only",
         }
     if platform not in specs:
-        raise SystemExit(f"Unknown platform {platform!r}. Use codex, claude-code, kilocode, gemini, antigravity, grok, generic, or all.")
+        raise SystemExit(f"Unknown platform {platform!r}. Use codex, cursor, claude-code, kilocode, gemini, antigravity, grok, generic, or all.")
     return specs[platform]
 
 
@@ -953,30 +1234,64 @@ def update_one_plugin(platform: str, args: argparse.Namespace) -> dict[str, obje
 
     copy_tree(source, install_root)
     server_path = install_root / "dist" / "server.js"
-    write_json(mcp_target, mcp_json(server_path, agent, vault, Path(args.socket).expanduser(), stamp_workspace, target_path=None, explicit_workspace=explicit_workspace, pre_existing_env=pre_mcp_env, afm_env=afm_env))
+    platform_name = canonical_platform(platform)
+    portable_surfaces = {"cursor", "grok", "kilocode", "gemini", "antigravity"}
+    preserved_workspace = str(pre_mcp_env.get("MINNI_WORKSPACE_ID", "")).strip()
+    effective_stamp_workspace = (
+        Path(preserved_workspace or "workspace-unknown")
+        if platform_name in portable_surfaces and not explicit_workspace
+        else stamp_workspace
+    )
+    mcp_payload = mcp_json(
+        server_path, agent, vault, Path(args.socket).expanduser(), effective_stamp_workspace,
+        target_path=None, explicit_workspace=explicit_workspace,
+        pre_existing_env=pre_mcp_env, afm_env=afm_env,
+    )
+    write_json(mcp_target, mcp_payload)
 
     config_kind = str(spec["config_kind"])
     if config_kind == "toml":
-        update_toml_mcp_config(Path(spec["config"]).expanduser(), server_path, agent, vault, Path(args.socket).expanduser(), stamp_workspace, explicit_workspace=explicit_workspace, afm_env=afm_env)
+        update_toml_mcp_config(Path(spec["config"]).expanduser(), server_path, agent, vault, Path(args.socket).expanduser(), effective_stamp_workspace, explicit_workspace=explicit_workspace, afm_env=afm_env)
     elif config_kind == "claude-json":
         update_claude_config(server_path, agent, vault, Path(args.socket).expanduser(), stamp_workspace, afm_env)
+        refresh_claude_plugin(repo_root)
     elif config_kind == "kilo-json":
-        update_kilo_config(server_path, agent, vault, Path(args.socket).expanduser(), stamp_workspace, afm_env)
+        kilo_workspace = effective_stamp_workspace
+        update_kilo_plugin(install_root, agent, vault, Path(args.socket).expanduser(), kilo_workspace)
+        update_kilo_config(
+            server_path, agent, vault, Path(args.socket).expanduser(), effective_stamp_workspace,
+            afm_env, remove_legacy=True,
+        )
+    elif config_kind == "cursor-json":
+        cursor_workspace = stamp_workspace if explicit_workspace else Path("workspace-unknown")
+        update_cursor_config(
+            install_root, server_path, agent, vault, Path(args.socket).expanduser(),
+            cursor_workspace, afm_env, explicit_workspace=explicit_workspace,
+        )
     elif config_kind == "gemini-manifest":
-        update_gemini_manifest(install_root, agent, vault, Path(args.socket).expanduser(), stamp_workspace, afm_env)
+        update_gemini_manifest(install_root, agent, vault, Path(args.socket).expanduser(), effective_stamp_workspace, afm_env, version=plugin_source_version(repo_root))
     elif config_kind == "antigravity":
         # Keep the gemini-cli extension manifest correct, then wire the
         # Antigravity CLI/IDE/antigravity surface views + permission grants.
-        update_gemini_manifest(install_root, agent, vault, Path(args.socket).expanduser(), stamp_workspace, afm_env)
+        update_gemini_manifest(install_root, agent, vault, Path(args.socket).expanduser(), effective_stamp_workspace, afm_env, version=plugin_source_version(repo_root))
         antigravity_result = update_antigravity_config(
-            install_root, agent, vault, Path(args.socket).expanduser(), stamp_workspace, afm_env
+            install_root, agent, vault, Path(args.socket).expanduser(), effective_stamp_workspace, afm_env
+        )
+
+    if canonical_platform(platform) == "grok":
+        grok_workspace = Path(mcp_payload["mcpServers"]["minni"]["env"]["MINNI_WORKSPACE_ID"])
+        update_grok_hooks(
+            install_root, agent, vault, Path(args.socket).expanduser(), grok_workspace,
         )
 
     # #133: both gemini-family kinds share the ~/.gemini tree, so both wire the
     # agy CLI hook plugin (skipped with a reason when agy is not installed).
     agy_hooks: dict[str, object] | None = None
     if config_kind in ("gemini-manifest", "antigravity"):
-        agy_hooks = update_agy_plugin_hooks(install_root)
+        gemini_workspace = effective_stamp_workspace
+        agy_hooks = update_agy_plugin_hooks(
+            install_root, agent, vault, Path(args.socket).expanduser(), gemini_workspace,
+        )
 
     base: dict[str, object] = {
         "platform": canonical_platform(platform),
@@ -995,7 +1310,7 @@ def update_one_plugin(platform: str, args: argparse.Namespace) -> dict[str, obje
 
 
 def update_plugin(args: argparse.Namespace) -> int:
-    platforms = ["codex", "claude-code", "kilocode", "gemini", "grok"] if args.platform == "all" else [args.platform]
+    platforms = ["codex", "cursor", "claude-code", "kilocode", "gemini", "grok"] if args.platform == "all" else [args.platform]
     restore_no_build = args.no_build
     if len(platforms) > 1 and not args.no_build:
         run(["npm", "run", "build"], cwd=plugin_source(Path(args.repo).expanduser()))
@@ -1396,7 +1711,7 @@ def main() -> int:
     p_verify.set_defaults(func=verify)
 
     p_update = sub.add_parser("update-plugin", help="Build/copy the canonical plugin and stamp platform-specific agent/vault/socket config.")
-    p_update.add_argument("--platform", required=True, help="codex, claude-code, kilocode, gemini, antigravity, grok, generic, or all")
+    p_update.add_argument("--platform", required=True, help="codex, cursor, claude-code, kilocode, gemini, antigravity, grok, generic, or all")
     p_update.add_argument("--agent", type=valid_agent_id, help="Override agent id; required for generic platforms")
     p_update.add_argument("--install-root", help="Required for --platform generic; optional override for known platforms")
     p_update.add_argument("--workspace", help="Explicit MINNI_WORKSPACE_ID (and surface env) to stamp. If omitted (flagless), and the target config already has surface env keys (MINNI_AGENT_ID/VAULT_PATH/SOCKET_PATH/WORKSPACE_ID), those are preserved (belt-and-suspenders); only the plugin server pointer (command/args/cwd) is refreshed. Falls back to --repo for fresh targets. Explicit --workspace forces the value.")

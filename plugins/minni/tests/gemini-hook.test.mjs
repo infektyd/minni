@@ -100,9 +100,9 @@ test("adaptAgyPayload never clobbers canonical fields and passes unknown tools t
   assert.equal(native.workspace_id, "/w/second");
 });
 
-test("adaptPreToolUseOutput: allow collapses to explicit approve, deny carries the reason", () => {
-  assert.deepEqual(adaptPreToolUseOutput({ continue: true }), { decision: "approve" });
-  assert.deepEqual(agyApprove(), { decision: "approve" });
+test("adaptPreToolUseOutput: allow uses current agy vocabulary, deny carries the reason", () => {
+  assert.deepEqual(adaptPreToolUseOutput({ continue: true }), { decision: "allow" });
+  assert.deepEqual(agyApprove(), { decision: "allow" });
   const deny = adaptPreToolUseOutput({
     continue: true,
     hookSpecificOutput: {
@@ -111,19 +111,20 @@ test("adaptPreToolUseOutput: allow collapses to explicit approve, deny carries t
       permissionDecisionReason: "consult recall first",
     },
   });
-  assert.deepEqual(deny, { decision: "block", reason: "consult recall first" });
+  assert.deepEqual(deny, { decision: "deny", reason: "consult recall first" });
 });
 
 test("hooks-gemini.json template: matcher-free, token-stamped, no CLAUDE_PLUGIN_ROOT", async () => {
   const template = JSON.parse(await readFile(HOOKS_GEMINI_JSON, "utf8"));
   const events = Object.keys(template.hooks);
-  assert.ok(events.includes("PreToolUse") && events.includes("Stop"));
+  assert.deepEqual(events.sort(), ["PreToolUse", "SessionStart", "Stop"].sort());
   for (const [event, groups] of Object.entries(template.hooks)) {
     for (const group of groups) {
       // agy's loader drops matcher-bearing entries ("0 total handlers").
       assert.equal(group.matcher, undefined, `${event} entry must be matcher-free`);
       for (const hook of group.hooks) {
         assert.equal(hook.type, "command");
+        assert.ok(hook.timeout > 0 && hook.timeout <= 30, `${event} timeout must be bounded`);
         assert.ok(
           hook.command.includes("__MINNI_GEMINI_DIST__/gemini-hook.js"),
           `${event} command must run gemini-hook.js via the dist token`,
@@ -138,11 +139,11 @@ test("hooks-gemini.json template: matcher-free, token-stamped, no CLAUDE_PLUGIN_
   }
 });
 
-test("PreToolUse with no recall state prints exactly the explicit approve", async () => {
+test("PreToolUse with no recall state prints exactly the explicit allow", async () => {
   const fixture = await makeFixture();
   try {
     const output = await runGeminiHook("PreToolUse", fixture, agyPreToolUsePayload());
-    assert.deepEqual(output, { decision: "approve" });
+    assert.deepEqual(output, { decision: "allow" });
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }
@@ -154,7 +155,7 @@ test("PreToolUse never emits an empty decision, even when hooks are disabled or 
     const disabled = await runGeminiHook("PreToolUse", fixture, agyPreToolUsePayload(), {
       MINNI_GEMINI_HOOKS: "off",
     });
-    assert.deepEqual(disabled, { decision: "approve" });
+    assert.deepEqual(disabled, { decision: "allow" });
     const unknownEvent = await runGeminiHook("PostToolUse", fixture, agyPreToolUsePayload());
     // Non-PreToolUse unknown events keep the plain continue shape.
     assert.deepEqual(unknownEvent, { continue: true });
@@ -190,7 +191,7 @@ test("PreToolUse denies-to-surface through agy's decision vocabulary and flips c
       }),
       { MINNI_RECALL_GUARD_MODE: "strict" },
     );
-    assert.equal(output.decision, "block");
+    assert.equal(output.decision, "deny");
     assert.match(output.reason, /recall guard/i);
     assert.match(output.reason, /prior-fix/);
     const state = JSON.parse(await readFile(statePath, "utf8"));
@@ -205,7 +206,7 @@ test("PreToolUse denies-to-surface through agy's decision vocabulary and flips c
       }),
       { MINNI_RECALL_GUARD_MODE: "strict" },
     );
-    assert.deepEqual(rerun, { decision: "approve" });
+    assert.deepEqual(rerun, { decision: "allow" });
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }
@@ -272,7 +273,7 @@ test("guard defaults to strict on agy: read/search run_command is denied without
       }),
       { MINNI_RECALL_GUARD_MODE: "" },
     );
-    assert.equal(output.decision, "block");
+    assert.equal(output.decision, "deny");
 
     // An explicit soft override is honored: Bash stays unguarded there.
     await writeFile(
@@ -294,7 +295,7 @@ test("guard defaults to strict on agy: read/search run_command is denied without
       }),
       { MINNI_RECALL_GUARD_MODE: "soft" },
     );
-    assert.deepEqual(soft, { decision: "approve" });
+    assert.deepEqual(soft, { decision: "allow" });
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }

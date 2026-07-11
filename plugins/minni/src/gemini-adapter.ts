@@ -4,21 +4,17 @@
 //
 // The agy CLI (Antigravity CLI) loads Claude Code-style hooks.json manifests
 // from ~/.gemini/config/plugins/<name>/hooks.json, but its hook PROTOCOL is
-// not Claude Code's (all of this verified live against agy 1.0.15 on
-// 2026-07-03; payload capture in the #133 investigation):
-//   - Only PreToolUse, PostToolUse and Stop events exist. SessionStart,
-//     UserPromptSubmit and PreCompact are not in the binary's event set.
+// not Claude Code's (payload captured on 1.0.15 and re-verified on 1.1.1):
+//   - PreToolUse and Stop are native; 1.1.1's compatibility layer also
+//     dispatches SessionStart. UserPromptSubmit and PreCompact remain absent.
 //   - The stdin payload has agy's own field names: conversationId (not
 //     session_id), toolCall {name, args} (not tool_name/tool_input),
 //     workspacePaths (not cwd), plus stepIdx/modelName/transcriptPath/
 //     artifactDirectoryPath.
 //   - Tool names are agy-native (e.g. "run_command", args {CommandLine, Cwd}),
 //     not Claude Code's ("Bash", args {command}).
-//   - PreToolUse hooks must print a NON-EMPTY decision: agy 1.0.15's
-//     permission manager errors on empty decision strings (fixed upstream
-//     after 1.0.15, per the agy changelog). The accepted allow value is
-//     "approve" (verified live); "block" is the deny value from the same
-//     legacy Claude Code decision vocabulary agy borrows from.
+//   - Current agy (1.1.x) documents allow/deny/ask/force_ask. The legacy
+//     approve/block vocabulary from 1.0.15 is rejected by current releases.
 import { open, stat } from "node:fs/promises";
 
 import type { PreToolUseDecisionOutput } from "./recall-guard.js";
@@ -83,31 +79,30 @@ export function adaptAgyPayload(
 }
 
 /**
- * agy's PreToolUse decision shape. Minimal on purpose: "approve" is the only
- * live-verified allow value on 1.0.15, and extra fields risk tripping a parser
- * that already errors on empty decisions.
+ * agy's current PreToolUse decision shape. Minimal on purpose: "allow" and
+ * "deny" are the only values Minni needs from the documented vocabulary.
  */
 export interface AgyPreToolDecision {
-  decision: "approve" | "block";
+  decision: "allow" | "deny";
   reason?: string;
 }
 
 /** The always-safe allow. PreToolUse must NEVER emit an empty/absent decision. */
 export function agyApprove(): AgyPreToolDecision {
-  return { decision: "approve" };
+  return { decision: "allow" };
 }
 
 /**
  * Translate the shared recall guard's Claude Code permissionDecision output
  * into agy's decision vocabulary. The deny reason carries the recall pointer
- * (deny-to-surface); everything else collapses to the explicit approve.
+ * (deny-to-surface); everything else collapses to the explicit allow.
  */
 export function adaptPreToolUseOutput(
   output: PreToolUseDecisionOutput,
 ): AgyPreToolDecision {
   if (output.hookSpecificOutput?.permissionDecision === "deny") {
     return {
-      decision: "block",
+      decision: "deny",
       reason: output.hookSpecificOutput.permissionDecisionReason,
     };
   }

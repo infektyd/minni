@@ -138,7 +138,7 @@ accident. After Minni verifies GO, quarantine it under the install backup:
 ```bash
 mv ~/.codex/plugins/cache/sovereign-memory \
   ~/.codex/plugin-install-backups/<run>/sovereign-memory-cache.quarantined-active-copy
-pkill -f '/Users/hansaxelsson/.codex/plugins/cache/sovereign-memory/sovereign-memory/0.1.0/dist/server.js'
+pkill -f "$HOME/.codex/plugins/cache/sovereign-memory/sovereign-memory/.*/dist/server.js"
 ```
 
 The 2026-05-31 run used:

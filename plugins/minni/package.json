@@ -1,7 +1,7 @@
 {
   "name": "minni-multi-plugin",
   "version": "0.3.0",
-  "description": "Local multi-target plugin bridge for Minni (Codex, Claude Code, Gemini, KiloCode).",
+  "description": "Local multi-target plugin bridge for Minni (Codex, Cursor, Claude Code, Gemini, KiloCode).",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -18,11 +18,13 @@
     "dist",
     ".claude-plugin",
     ".codex-plugin",
+    ".cursor-plugin",
     ".gemini-plugin",
     ".kilocode-plugin",
     ".mcp.json",
     "commands",
     "hooks",
+    "kilo",
     "skills",
     "README.md"
   ],
@@ -48,6 +50,7 @@
     "smoke:status": "npm run build && node dist/cli.js status",
     "smoke:hook": "npm run build && node dist/hook.js SessionStart < /dev/null",
     "smoke:codex-hook": "npm run build && node dist/codex-hook.js SessionStart < /dev/null",
+    "smoke:cursor-hook": "npm run build && node dist/cursor-hook.js sessionStart < /dev/null",
     "smoke:kilocode-hook": "npm run build && node dist/kilocode-hook.js SessionStart < /dev/null",
     "typecheck:frontend": "tsc --project frontend-src/tsconfig.json --noEmit"
   },
