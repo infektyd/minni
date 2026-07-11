@@ -44,9 +44,19 @@ logger = logging.getLogger("minnid")
 
 ARCHIVE_DIRNAME = ".archive"
 
-# Every candidate_packets status except 'proposed' (the schema CHECK set).
+# Every candidate_packets status except 'proposed' (the schema CHECK set,
+# including the do_not_store/log_only statuses added by migration 015).
 TERMINAL_STATUSES = frozenset(
-    {"accepted", "rejected", "redacted", "expired", "merged", "superseded"}
+    {
+        "accepted",
+        "rejected",
+        "redacted",
+        "expired",
+        "merged",
+        "superseded",
+        "do_not_store",
+        "log_only",
+    }
 )
 
 
