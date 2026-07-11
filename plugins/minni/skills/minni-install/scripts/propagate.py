@@ -12,6 +12,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import shutil
 import socket
 import sqlite3
@@ -498,6 +499,81 @@ def update_kilo_config(server_path: Path, agent: str, vault: Path, socket_path: 
     write_json(path, data)
 
 
+CURSOR_HOOK_EVENTS = ("sessionStart", "beforeSubmitPrompt", "preCompact", "stop", "preToolUse")
+
+
+def cursor_hook_entry(install_root: Path, event: str, agent: str = "cursor",
+                      vault: Path | None = None, workspace: Path | str = "workspace-unknown") -> dict[str, object]:
+    hook_vault = vault or vault_for(agent)
+    workspace_id = normalize_workspace_id(str(workspace)) or "workspace-unknown"
+    env = " ".join((
+        f"MINNI_CURSOR_AGENT_ID={shlex.quote(agent)}",
+        f"MINNI_CURSOR_VAULT_PATH={shlex.quote(str(hook_vault))}",
+        f"MINNI_CURSOR_WORKSPACE_ID={shlex.quote(workspace_id)}",
+    ))
+    entry: dict[str, object] = {
+        "command": f"{env} node {shlex.quote(str(install_root / 'dist' / 'cursor-hook.js'))} {event}",
+        "timeout": 10 if event == "preToolUse" else (30 if event in {"sessionStart", "beforeSubmitPrompt"} else 20),
+    }
+    if event == "preToolUse":
+        entry["matcher"] = "Read|Grep|Glob|Shell"
+    return entry
+
+
+def is_owned_cursor_hook(entry: object, install_root: Path) -> bool:
+    if not isinstance(entry, dict):
+        return False
+    command = str(entry.get("command", ""))
+    known_roots = (
+        str(install_root / "dist" / "hook.js"),
+        str(install_root / "dist" / "cursor-hook.js"),
+        "~/.cursor/plugins/minni@minni/dist/hook.js",
+        "~/.cursor/plugins/minni@minni/dist/cursor-hook.js",
+        "${CURSOR_PLUGIN_ROOT}/dist/cursor-hook.js",
+    )
+    return any(root in command for root in known_roots)
+
+
+def update_cursor_config(install_root: Path, server_path: Path, agent: str, vault: Path,
+                         socket_path: Path, workspace: Path,
+                         afm_env: dict[str, str] | None = None, *, home: Path | None = None) -> None:
+    """Merge native Cursor wiring without replacing unrelated user hooks/MCPs."""
+    cursor_home = (home or Path.home()) / ".cursor"
+    mcp_path = cursor_home / "mcp.json"
+    mcp = load_json(mcp_path)
+    mcp.setdefault("mcpServers", {})["minni"] = mcp_json(
+        server_path, agent, vault, socket_path, workspace, afm_env=afm_env
+    )["mcpServers"]["minni"]
+    write_json(mcp_path, mcp)
+
+    # The Cursor plugin manifest is the single registration authority. Stamp
+    # its installed hook file with this installation's identity values.
+    plugin_hooks = {
+        "version": 1,
+        "hooks": {
+            event: [cursor_hook_entry(install_root, event, agent, vault, workspace)]
+            for event in CURSOR_HOOK_EVENTS
+        },
+    }
+    write_json(install_root / "hooks" / "hooks-cursor.json", plugin_hooks)
+
+    # Remove recognized legacy Minni user hooks so Cursor does not merge and
+    # execute a second copy. Preserve every unrelated entry and event.
+    hooks_path = cursor_home / "hooks.json"
+    hooks = load_json(hooks_path)
+    groups = hooks.get("hooks", {})
+    if not isinstance(groups, dict):
+        groups = {}
+    for event in CURSOR_HOOK_EVENTS:
+        existing = groups.get(event, [])
+        if not isinstance(existing, list):
+            existing = []
+        groups[event] = [entry for entry in existing if not is_owned_cursor_hook(entry, install_root)]
+    if hooks_path.exists():
+        hooks["hooks"] = groups
+        write_json(hooks_path, hooks)
+
+
 def update_gemini_manifest(install_root: Path, agent: str, vault: Path, socket_path: Path, workspace: Path, afm_env: dict[str, str] | None = None, *, version: str | None = None) -> None:
     stamped_version = version or plugin_version_segment()
     write_json(
@@ -869,6 +945,11 @@ def platform_spec(platform: str, repo_root: Path, install_root: str | None = Non
             "config": home / ".codex/config.toml",
             "config_kind": "toml",
         },
+        "cursor": {
+            "agent": "cursor",
+            "install": home / ".cursor/plugins/minni@minni",
+            "config_kind": "cursor-json",
+        },
         "claude-code": {
             "agent": "claude-code",
             "install": claude_install,
@@ -913,7 +994,7 @@ def platform_spec(platform: str, repo_root: Path, install_root: str | None = Non
             "config_kind": "mcp-json-only",
         }
     if platform not in specs:
-        raise SystemExit(f"Unknown platform {platform!r}. Use codex, claude-code, kilocode, gemini, antigravity, grok, generic, or all.")
+        raise SystemExit(f"Unknown platform {platform!r}. Use codex, cursor, claude-code, kilocode, gemini, antigravity, grok, generic, or all.")
     return specs[platform]
 
 
@@ -962,6 +1043,8 @@ def update_one_plugin(platform: str, args: argparse.Namespace) -> dict[str, obje
         update_claude_config(server_path, agent, vault, Path(args.socket).expanduser(), stamp_workspace, afm_env)
     elif config_kind == "kilo-json":
         update_kilo_config(server_path, agent, vault, Path(args.socket).expanduser(), stamp_workspace, afm_env)
+    elif config_kind == "cursor-json":
+        update_cursor_config(install_root, server_path, agent, vault, Path(args.socket).expanduser(), stamp_workspace, afm_env)
     elif config_kind == "gemini-manifest":
         update_gemini_manifest(install_root, agent, vault, Path(args.socket).expanduser(), stamp_workspace, afm_env)
     elif config_kind == "antigravity":
@@ -995,7 +1078,7 @@ def update_one_plugin(platform: str, args: argparse.Namespace) -> dict[str, obje
 
 
 def update_plugin(args: argparse.Namespace) -> int:
-    platforms = ["codex", "claude-code", "kilocode", "gemini", "grok"] if args.platform == "all" else [args.platform]
+    platforms = ["codex", "cursor", "claude-code", "kilocode", "gemini", "grok"] if args.platform == "all" else [args.platform]
     restore_no_build = args.no_build
     if len(platforms) > 1 and not args.no_build:
         run(["npm", "run", "build"], cwd=plugin_source(Path(args.repo).expanduser()))
@@ -1396,7 +1479,7 @@ def main() -> int:
     p_verify.set_defaults(func=verify)
 
     p_update = sub.add_parser("update-plugin", help="Build/copy the canonical plugin and stamp platform-specific agent/vault/socket config.")
-    p_update.add_argument("--platform", required=True, help="codex, claude-code, kilocode, gemini, antigravity, grok, generic, or all")
+    p_update.add_argument("--platform", required=True, help="codex, cursor, claude-code, kilocode, gemini, antigravity, grok, generic, or all")
     p_update.add_argument("--agent", type=valid_agent_id, help="Override agent id; required for generic platforms")
     p_update.add_argument("--install-root", help="Required for --platform generic; optional override for known platforms")
     p_update.add_argument("--workspace", help="Explicit MINNI_WORKSPACE_ID (and surface env) to stamp. If omitted (flagless), and the target config already has surface env keys (MINNI_AGENT_ID/VAULT_PATH/SOCKET_PATH/WORKSPACE_ID), those are preserved (belt-and-suspenders); only the plugin server pointer (command/args/cwd) is refreshed. Falls back to --repo for fresh targets. Explicit --workspace forces the value.")

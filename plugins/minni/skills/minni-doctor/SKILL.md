@@ -65,12 +65,22 @@ the first failing layer; everything below it will look broken too.
 ## Layer 4 — Hooks (per platform, shared semantics)
 
 Every platform registers its OWN compiled hook (`hook.js`, `codex-hook.js`,
-`grok-hook.js`, `kilocode-hook.js`); Minni semantics live in one shared factory.
+`cursor-hook.js`, `grok-hook.js`, `kilocode-hook.js`); Minni semantics live in
+one shared factory. Cursor's native protocol is not Claude Code's: its healthy
+SessionStart output uses `additional_context`, and its PreToolUse result uses
+`permission`. Any Cursor command invoking `dist/hook.js` or carrying
+`MINNI_CLAUDECODE_*` is an identity-boundary failure.
+
+For Cursor, inspect paths relative to the current user's home (never a
+developer-specific absolute path): `~/.cursor/hooks.json`,
+`~/.cursor/mcp.json`, and the installed plugin root reported by Cursor. The
+installer may merge Minni entries into those JSON files, but must preserve
+unrelated hooks and MCP servers and remain idempotent.
 
 | Check | Healthy | Finding |
 |---|---|---|
 | SessionStart envelope | `<minni:context event="SessionStart">` with identity, audit tail, pending_learnings | Hook not registered in THIS platform's native config |
-| Per-turn recall | UserPromptSubmit envelope with ranked results | Recall channel dead; check daemon first, then hook registration |
+| Per-turn recall | UserPromptSubmit envelope with ranked results; on Cursor, prompt recall state is prepared but cannot currently be injected by `beforeSubmitPrompt` | Recall channel dead; check daemon first, then hook registration |
 | Stop drafts | Candidate learnings appear in vault `inbox/` after sessions | Stop hook missing or writing kind-less files (pre-factory bug class) |
 | Correction re-assert | Post-compaction and SessionStart re-inject stored corrections; `stale_beliefs` fires when a prompt contradicts a stored correction | If `stale_beliefs` is silently empty while a relevant correction exists, that is the C1 failure class — report it loudly |
 | Cross-platform honesty | Each platform has its own hook | One platform borrowing another's hooks (e.g. via compat scanning) is drift |
