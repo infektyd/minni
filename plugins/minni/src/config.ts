@@ -258,7 +258,7 @@ export const CODEX_AGENT_ID =
 export const CODEX_WORKSPACE_ID =
   normalizeWorkspaceId(
     process.env.MINNI_CODEX_WORKSPACE_ID ??
-      `workspace-${path.basename(process.cwd())}`
+      "workspace-unknown"
   );
 
 export const CODEX_VAULT_PATH = expandTilde(

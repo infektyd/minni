@@ -79,6 +79,7 @@ test("no env falls back to unknown deny identity, not codex vault", async () => 
       config.CODEX_VAULT_PATH,
       path.join(os.homedir(), ".minni", "codex-vault"),
     );
+    assert.equal(config.CODEX_WORKSPACE_ID, "workspace-unknown");
   });
 });
 

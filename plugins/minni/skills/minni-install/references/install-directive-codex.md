@@ -178,7 +178,10 @@ node "$(find ~/.codex/plugins/cache/minni/minni -path '*/dist/codex-hook.js' | s
 Codex lifecycle hooks are separate host processes and intentionally use the
 `MINNI_CODEX_*` namespace. The MCP server and `cli.js` use the generic
 `MINNI_AGENT_ID` / `MINNI_VAULT_PATH` / `MINNI_WORKSPACE_ID` namespace shown
-in the preceding status command.
+in the preceding status command. When the host payload and
+`MINNI_CODEX_WORKSPACE_ID` both omit a workspace, hooks fail closed to
+`workspace-unknown`; they never derive project identity from the plugin-cache
+working directory.
 
 Expected GO criteria:
 
