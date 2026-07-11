@@ -321,6 +321,13 @@ test("frontend bundle calls the local bridge endpoints", async () => {
   assert.match(js, /\/api\/audit-tail/);
   assert.match(js, /\/api\/status/);
   assert.match(js, /\/api\/health/);
+  // Real-data board zone routes (no sample fallbacks)
+  assert.match(js, /\/api\/agents/);
+  assert.match(js, /\/api\/log-only/);
+  assert.match(js, /\/api\/quarantine/);
+  assert.match(js, /\/api\/recall-state/);
+  assert.match(js, /\/api\/handoffs/);
+  assert.match(js, /\/api\/policy/);
 });
 
 test("frontend ships the Minni command center design and stays local-only", async () => {
@@ -343,6 +350,11 @@ test("frontend ships the Minni command center design and stays local-only", asyn
   assert.match(js, /Settings/);
   // No write / learn endpoints exposed to the browser
   assert.doesNotMatch(js, /\/api\/learn|sovereign_learn/);
+  // Fail-loud real-data console: no unwired alpha stubs / SAMPLE board labels
+  assert.doesNotMatch(js, /unwired in this alpha/i);
+  assert.doesNotMatch(js, /SAMPLE · /);
+  assert.doesNotMatch(js, /BOARD_SAMPLE/);
+  assert.doesNotMatch(js, /policy\.handoff\.team@v4\.2|POLICY VER.*v4\.2/i);
 
   // Design tokens from the paper + phosphor themes
   assert.match(css, /--graphite/);
@@ -538,4 +550,420 @@ test("/api/candidates catch branch maps thrown daemon errors via daemonRpcHttpSt
   } finally {
     await server.close();
   }
+});
+
+// ── New board zone routes: agents, log-only, quarantine, recall-state, handoffs, policy ──
+
+function mockCandidatesRpc(status) {
+  return async (method, params) => {
+    if (method === "list_candidates") {
+      assert.equal(params.status, status);
+      return {
+        candidates: [
+          {
+            candidate_id: 77,
+            principal: "main",
+            content: `row for ${status}`,
+            proposed_at: Math.floor(Date.now() / 1000),
+            status,
+          },
+        ],
+        principal: "main",
+        count: 1,
+      };
+    }
+    throw new Error(`unexpected method ${method}`);
+  };
+}
+
+test("/api/log-only returns list_candidates status=log_only when daemon is up", async () => {
+  const server = await startTestServer({ daemonRpc: mockCandidatesRpc("log_only") });
+  try {
+    const res = await fetch(`${server.baseUrl}/api/log-only`, { headers: authHeaders() });
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.candidates.length, 1);
+    assert.equal(body.candidates[0].status, "log_only");
+  } finally {
+    await server.close();
+  }
+});
+
+test("/api/log-only returns 502 when daemon socket fails", async () => {
+  const server = await startTestServer({
+    daemonRpc: async () => {
+      throw new Error("socket ECONNREFUSED");
+    },
+  });
+  try {
+    const res = await fetch(`${server.baseUrl}/api/log-only`, { headers: authHeaders() });
+    assert.equal(res.status, 502);
+    const body = await res.json();
+    assert.equal(body.ok, false);
+    assert.match(body.error, /ECONNREFUSED/);
+  } finally {
+    await server.close();
+  }
+});
+
+test("/api/log-only requires auth (403 unauthed)", async () => {
+  const server = await startTestServer({ daemonRpc: mockCandidatesRpc("log_only") });
+  try {
+    const res = await fetch(`${server.baseUrl}/api/log-only`);
+    assert.equal(res.status, 403);
+  } finally {
+    await server.close();
+  }
+});
+
+test("/api/quarantine returns list_candidates status=do_not_store when daemon is up", async () => {
+  const server = await startTestServer({ daemonRpc: mockCandidatesRpc("do_not_store") });
+  try {
+    const res = await fetch(`${server.baseUrl}/api/quarantine`, { headers: authHeaders() });
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.candidates[0].status, "do_not_store");
+  } finally {
+    await server.close();
+  }
+});
+
+test("/api/quarantine returns 502 when daemon is down", async () => {
+  const server = await startTestServer({
+    daemonRpc: async () => {
+      throw new Error("socket ECONNREFUSED");
+    },
+  });
+  try {
+    const res = await fetch(`${server.baseUrl}/api/quarantine`, { headers: authHeaders() });
+    assert.equal(res.status, 502);
+    const body = await res.json();
+    assert.equal(body.ok, false);
+    assert.match(body.error, /ECONNREFUSED/);
+    assert.deepEqual(body.candidates, []);
+  } finally {
+    await server.close();
+  }
+});
+
+test("/api/quarantine requires auth (403 unauthed)", async () => {
+  const server = await startTestServer();
+  try {
+    const res = await fetch(`${server.baseUrl}/api/quarantine`);
+    assert.equal(res.status, 403);
+  } finally {
+    await server.close();
+  }
+});
+
+test("/api/recall-state returns present=false when no state file (not an error)", async () => {
+  const server = await startTestServer({
+    readRecallState: async () => null,
+  });
+  try {
+    const res = await fetch(`${server.baseUrl}/api/recall-state`, { headers: authHeaders() });
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.present, false);
+    assert.equal(body.state, null);
+    assert.match(body.message, /no recent recall/i);
+  } finally {
+    await server.close();
+  }
+});
+
+test("/api/recall-state returns state when present", async () => {
+  const server = await startTestServer({
+    readRecallState: async () => ({
+      task_signature: "sig",
+      intent: "handoff leases",
+      top_hits: [{ title: "Leases", wikilink: "[[wiki/leases]]", score: 0.9 }],
+      top_score: 0.9,
+      consumed: false,
+      ts: new Date().toISOString(),
+    }),
+  });
+  try {
+    const res = await fetch(`${server.baseUrl}/api/recall-state`, { headers: authHeaders() });
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.present, true);
+    assert.equal(body.state.intent, "handoff leases");
+    assert.equal(body.state.top_hits.length, 1);
+  } finally {
+    await server.close();
+  }
+});
+
+test("/api/recall-state requires auth (403 unauthed)", async () => {
+  const server = await startTestServer({ readRecallState: async () => null });
+  try {
+    const res = await fetch(`${server.baseUrl}/api/recall-state`);
+    assert.equal(res.status, 403);
+  } finally {
+    await server.close();
+  }
+});
+
+test("/api/agents returns catalogue when listAgents is live", async () => {
+  const server = await startTestServer({
+    listAgents: async () => ({
+      agents: [
+        {
+          id: "codex",
+          vault: "~/.minni/codex-vault",
+          seen: "2m",
+          on: true,
+          caps: { R: 1, L: 1, H: 1 },
+          staged: 3,
+        },
+      ],
+      count: 1,
+    }),
+  });
+  try {
+    const res = await fetch(`${server.baseUrl}/api/agents`, { headers: authHeaders() });
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.count, 1);
+    assert.equal(body.agents[0].id, "codex");
+  } finally {
+    await server.close();
+  }
+});
+
+test("/api/agents returns 502 when catalogue builder fails", async () => {
+  const server = await startTestServer({
+    listAgents: async () => {
+      throw new Error("socket ECONNREFUSED scanning agents");
+    },
+  });
+  try {
+    const res = await fetch(`${server.baseUrl}/api/agents`, { headers: authHeaders() });
+    assert.equal(res.status, 502);
+    const body = await res.json();
+    assert.equal(body.ok, false);
+    assert.deepEqual(body.agents, []);
+  } finally {
+    await server.close();
+  }
+});
+
+test("/api/agents requires auth (403 unauthed)", async () => {
+  const server = await startTestServer({ listAgents: async () => ({ agents: [], count: 0 }) });
+  try {
+    const res = await fetch(`${server.baseUrl}/api/agents`);
+    assert.equal(res.status, 403);
+  } finally {
+    await server.close();
+  }
+});
+
+test("/api/handoffs returns pending leases when daemon is up", async () => {
+  const server = await startTestServer({
+    daemonRpc: async (method) => {
+      if (method === "minni_list_pending_handoffs") {
+        return {
+          ok: true,
+          data: {
+            agent_id: "main",
+            handoffs: [
+              {
+                lease_id: "LS-1",
+                from_agent: "codex",
+                to_agent: "main",
+                task: "port scorecard",
+                expires_at: null,
+                path: "/tmp/inbox/x.json",
+              },
+            ],
+          },
+        };
+      }
+      throw new Error(`unexpected ${method}`);
+    },
+  });
+  try {
+    const res = await fetch(`${server.baseUrl}/api/handoffs`, { headers: authHeaders() });
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.handoffs.length, 1);
+    assert.equal(body.handoffs[0].lease_id, "LS-1");
+  } finally {
+    await server.close();
+  }
+});
+
+test("/api/handoffs returns 502 when daemon is down", async () => {
+  const server = await startTestServer({
+    daemonRpc: async () => {
+      throw new Error("socket ECONNREFUSED");
+    },
+  });
+  try {
+    const res = await fetch(`${server.baseUrl}/api/handoffs`, { headers: authHeaders() });
+    assert.equal(res.status, 502);
+    const body = await res.json();
+    assert.equal(body.ok, false);
+    assert.deepEqual(body.handoffs, []);
+  } finally {
+    await server.close();
+  }
+});
+
+test("/api/handoffs requires auth (403 unauthed)", async () => {
+  const server = await startTestServer();
+  try {
+    const res = await fetch(`${server.baseUrl}/api/handoffs`);
+    assert.equal(res.status, 403);
+  } finally {
+    await server.close();
+  }
+});
+
+test("/api/policy returns real policy report (no hardcoded v4.2)", async () => {
+  const server = await startTestServer({
+    policyReport: async () => ({
+      agentId: "main",
+      stampedForCandidates: "main",
+      caps: { R: 1, L: 1, H: 1 },
+      automaticLearning: false,
+      source: "principals + policy.ts",
+      intentRouting: { action: "recall", confidence: 0.74 },
+    }),
+  });
+  try {
+    const res = await fetch(`${server.baseUrl}/api/policy`, { headers: authHeaders() });
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.agentId, "main");
+    assert.equal(body.automaticLearning, false);
+    assert.ok(!JSON.stringify(body).includes("v4.2"));
+  } finally {
+    await server.close();
+  }
+});
+
+test("/api/policy requires auth (403 unauthed)", async () => {
+  const server = await startTestServer({ policyReport: async () => ({ agentId: "x" }) });
+  try {
+    const res = await fetch(`${server.baseUrl}/api/policy`);
+    assert.equal(res.status, 403);
+  } finally {
+    await server.close();
+  }
+});
+
+test("/api/policy returns 502 when policyReport throws", async () => {
+  const server = await startTestServer({
+    policyReport: async () => {
+      throw new Error("policy read failed");
+    },
+  });
+  try {
+    const res = await fetch(`${server.baseUrl}/api/policy`, { headers: authHeaders() });
+    assert.equal(res.status, 502);
+    const body = await res.json();
+    assert.equal(body.ok, false);
+    assert.match(body.error, /policy read failed/);
+    assert.equal(body.agentId, undefined);
+    assert.equal(body.caps, undefined);
+  } finally {
+    await server.close();
+  }
+});
+
+test("/api/recall-state returns 502 when reader throws", async () => {
+  const server = await startTestServer({
+    readRecallState: async () => {
+      throw new Error("EACCES recall-state");
+    },
+  });
+  try {
+    const res = await fetch(`${server.baseUrl}/api/recall-state`, { headers: authHeaders() });
+    assert.equal(res.status, 502);
+    const body = await res.json();
+    assert.equal(body.ok, false);
+    assert.equal(body.present, false);
+    assert.equal(body.state, null);
+    assert.match(body.error, /EACCES/);
+  } finally {
+    await server.close();
+  }
+});
+
+test("agentIdFromVaultDir maps claudecode-vault → claude-code", async () => {
+  const { agentIdFromVaultDir } = await import("../dist/ui-server.js");
+  assert.equal(agentIdFromVaultDir("claudecode-vault"), "claude-code");
+  assert.equal(agentIdFromVaultDir("codex-vault"), "codex");
+  assert.equal(agentIdFromVaultDir("grok-build-vault"), "grok-build");
+});
+
+test("buildPolicyReport pulls caps + intent routing without inventing automaticLearning", async () => {
+  const { buildPolicyReport } = await import("../dist/ui-server.js");
+  const { mkdtempSync, mkdirSync, writeFileSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const pathMod = await import("node:path");
+  const home = mkdtempSync(pathMod.join(tmpdir(), "minni-policy-"));
+  mkdirSync(pathMod.join(home, "principals"), { recursive: true });
+  writeFileSync(
+    pathMod.join(home, "principals", "main.json"),
+    JSON.stringify({
+      agent_id: "main",
+      capabilities: ["search", "read", "learn", "handoff"],
+    }),
+  );
+  const report = await buildPolicyReport({
+    homePath: home,
+    vaultPath: pathMod.join(home, "unknown-vault"),
+    status: async () => ({
+      afm: { ok: true, data: { status: "ok" } },
+      // no automaticLearning field → omit from report
+    }),
+  });
+  assert.equal(typeof report.agentId, "string");
+  assert.ok(report.caps);
+  assert.equal(report.caps.R, 1);
+  assert.equal(report.caps.L, 1);
+  assert.equal(report.caps.H, 1);
+  assert.ok(report.intentRouting);
+  assert.equal(report.automaticLearning, undefined);
+  assert.ok(!JSON.stringify(report).includes("v4.2"));
+});
+
+test("buildAgentsCatalogue is fail-loud on staged RPC and skips symlink vaults", async () => {
+  const { buildAgentsCatalogue, readOnlyAuditTail } = await import("../dist/ui-server.js");
+  const { mkdtempSync, mkdirSync, writeFileSync, symlinkSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const pathMod = await import("node:path");
+  const home = mkdtempSync(pathMod.join(tmpdir(), "minni-agents-cat-"));
+  mkdirSync(pathMod.join(home, "codex-vault", "logs"), { recursive: true });
+  writeFileSync(
+    pathMod.join(home, "codex-vault", "logs", new Date().toISOString().slice(0, 10) + ".md"),
+    `## [${new Date().toISOString()}] learn | note\n`,
+  );
+  // Symlink poison vault outside home — must be skipped
+  const outside = mkdtempSync(pathMod.join(tmpdir(), "minni-outside-"));
+  try {
+    symlinkSync(outside, pathMod.join(home, "poison-vault"));
+  } catch {
+    // platform without symlink support
+  }
+
+  const catalogue = await buildAgentsCatalogue({
+    homePath: home,
+    daemonRpc: async (method, params) => {
+      if (method === "list_candidates" && params.agent_id === "codex") {
+        throw new Error("socket ECONNREFUSED");
+      }
+      return { candidates: [], count: 0 };
+    },
+    auditTailFn: readOnlyAuditTail,
+  });
+  assert.ok(catalogue.agents.every((a) => a.id !== "poison"));
+  const codex = catalogue.agents.find((a) => a.id === "codex");
+  assert.ok(codex, "codex vault should be listed");
+  assert.equal(codex.staged, null);
+  assert.equal(codex.stagedUnknown, true);
+  assert.ok(!("vaultPath" in codex) || codex.vaultPath === undefined);
 });

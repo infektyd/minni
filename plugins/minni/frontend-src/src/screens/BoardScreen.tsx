@@ -14,19 +14,26 @@ import {
   type HealthReport,
   type StatusReport,
 } from "../api";
-import { useStagedLearnings } from "../board/boardDataHook";
+import {
+  useAgents,
+  useLogOnly,
+  useQuarantine,
+  useRecallState,
+  useStagedLearnings,
+} from "../board/boardDataHook";
 import { BoardOverview } from "../board/BoardOverview";
 import { ZoneDetail } from "../board/BoardDetails";
 import {
   BOARD_ORDER,
   BOARD_ZONES,
-  SAMPLE_LEARNINGS,
   WORLD,
+  zoneLabel,
   type BoardFlow,
   type DaemonInfo,
   type FlowEvent,
   type ZoneDef,
   type ZoneId,
+  type ZoneStatus,
 } from "../board/boardData";
 import {
   useElementSize,
@@ -129,28 +136,133 @@ export function BoardScreen({
     }
   }, []);
 
-  // ── live zone rects = defaults + dragged offsets ──
-  // Hook for staged learnings state (live vs sample)
-  const stagedState = useStagedLearnings(tokenRefreshTrigger);
-  
+  // ── live zone data (fail-loud; no sample fallbacks) ──
+  // AuthRequiredError from any zone raises TokenGate via onAuthRequired.
+  const stagedState = useStagedLearnings(tokenRefreshTrigger, onAuthRequired);
+  const agentsState = useAgents(tokenRefreshTrigger, onAuthRequired);
+  const logState = useLogOnly(tokenRefreshTrigger, onAuthRequired);
+  const quarantineState = useQuarantine(tokenRefreshTrigger, onAuthRequired);
+  const recallState = useRecallState(tokenRefreshTrigger, onAuthRequired);
+
   const zones = useMemo(() => {
     const z = {} as Record<ZoneId, ZoneDef>;
+    // Danger only when truly offline (not initial loading).
+    const offlineStatus = (
+      live: boolean,
+      loading: boolean,
+      error: string | null,
+    ): ZoneStatus | undefined => {
+      if (live) return undefined;
+      if (loading && !error) return undefined;
+      return "danger";
+    };
+    const titleFor = (base: string, live: boolean, loading: boolean, error: string | null) => {
+      if (live) return base;
+      if (loading && !error) return `${base} · loading`;
+      return `${base} · offline`;
+    };
+
     BOARD_ORDER.forEach((id) => {
       z[id] = { ...BOARD_ZONES[id], ...(zpos[id] || {}) };
-      
-      // Override staged zone labels based on live state
-      if (id === "staged") {
-        z[id] = {
-          ...z[id],
-          label: stagedState.isLive
-            ? `STAGED · LEARN CANDIDATES · ${stagedState.learnings.length}`
-            : `SAMPLE · STAGED · LEARN CANDIDATES · ${stagedState.learnings.length}`,
-          title: stagedState.isLive ? "Staged learnings" : "Staged learnings · sample",
-        };
-      }
     });
+
+    z.agents = {
+      ...z.agents,
+      label: zoneLabel("RUNTIMES", {
+        isLive: agentsState.isLive,
+        count: agentsState.data.length,
+        loading: agentsState.loading,
+        error: agentsState.error,
+      }),
+      title: titleFor("Runtimes", agentsState.isLive, agentsState.loading, agentsState.error),
+      status:
+        offlineStatus(agentsState.isLive, agentsState.loading, agentsState.error) ??
+        z.agents.status,
+    };
+    z.staged = {
+      ...z.staged,
+      label: zoneLabel("STAGED · LEARN CANDIDATES", {
+        isLive: stagedState.isLive,
+        count: stagedState.learnings.length,
+        loading: stagedState.loading,
+        error: stagedState.error,
+      }),
+      title: titleFor(
+        "Staged learnings",
+        stagedState.isLive,
+        stagedState.loading,
+        stagedState.error,
+      ),
+      status:
+        offlineStatus(stagedState.isLive, stagedState.loading, stagedState.error) ??
+        z.staged.status,
+    };
+    z.logs = {
+      ...z.logs,
+      label: zoneLabel("LOG-ONLY · PERSONAL", {
+        isLive: logState.isLive,
+        count: logState.data.length,
+        loading: logState.loading,
+        error: logState.error,
+      }),
+      title: titleFor("Log-only", logState.isLive, logState.loading, logState.error),
+      status: offlineStatus(logState.isLive, logState.loading, logState.error) ?? z.logs.status,
+    };
+    z.quarantine = {
+      ...z.quarantine,
+      label: zoneLabel("QUARANTINE · DO-NOT-STORE", {
+        isLive: quarantineState.isLive,
+        count: quarantineState.data.length,
+        loading: quarantineState.loading,
+        error: quarantineState.error,
+      }),
+      title: titleFor(
+        "Quarantine",
+        quarantineState.isLive,
+        quarantineState.loading,
+        quarantineState.error,
+      ),
+      // Quarantine zone is always danger-colored for the frame; content still fail-loud.
+      status: "danger",
+    };
+    z.recall = {
+      ...z.recall,
+      label: zoneLabel("RECALL · LAST QUERY", {
+        isLive: recallState.isLive,
+        count: recallState.data.results.length,
+        loading: recallState.loading,
+        error: recallState.error,
+      }),
+      title: titleFor("Recall", recallState.isLive, recallState.loading, recallState.error),
+      status:
+        offlineStatus(recallState.isLive, recallState.loading, recallState.error) ??
+        z.recall.status,
+    };
+
     return z;
-  }, [zpos, stagedState.isLive, stagedState.learnings.length]);
+  }, [
+    zpos,
+    agentsState.isLive,
+    agentsState.loading,
+    agentsState.error,
+    agentsState.data.length,
+    stagedState.isLive,
+    stagedState.loading,
+    stagedState.error,
+    stagedState.learnings.length,
+    logState.isLive,
+    logState.loading,
+    logState.error,
+    logState.data.length,
+    quarantineState.isLive,
+    quarantineState.loading,
+    quarantineState.error,
+    quarantineState.data.length,
+    recallState.isLive,
+    recallState.loading,
+    recallState.error,
+    recallState.data.results.length,
+  ]);
 
   // Any drag or resize flips the box to custom (free) layout.
   const moveZone = useCallback(
@@ -337,9 +449,7 @@ export function BoardScreen({
   }, [auditSummaries]);
 
   // ── live traffic: poll the audit tail and turn NEW entries into pulses ──
-  // The pulses on the links are real events (an agent pinging/recalling/
-  // learning shows up as a dot travelling its line). Sample ambience only
-  // runs as a fallback while the audit tail is unreachable.
+  // No synthetic ambient flows — quiet board when audit is empty/unreachable.
   const [flowFeed, setFlowFeed] = useState<{ seq: number; flow: BoardFlow }[]>([]);
   const [auditLive, setAuditLive] = useState<boolean | null>(null);
   const seenRef = useRef<Set<string> | null>(null);
@@ -363,12 +473,13 @@ export function BoardScreen({
         fresh.forEach((e) => seen.add(e));
         if (seen.size > 400) seenRef.current = new Set(entries);
         setFlowFeed((f) =>
-          [...f, ...fresh.map((e) => ({ seq: ++seqRef.current, flow: flowForAuditEntry(e) }))].slice(-24),
+          [...f, ...fresh.map((e) => ({ seq: ++seqRef.current, flow: flowForAuditEntry(e) }))].slice(
+            -24,
+          ),
         );
       } catch (err) {
         if (stopped) return;
         setAuditLive(false);
-        // An expired token must raise the gate, not degrade to fake ambience.
         if (err instanceof AuthRequiredError) onAuthRequired?.();
       }
     };
@@ -378,7 +489,7 @@ export function BoardScreen({
       stopped = true;
       window.clearInterval(id);
     };
-  }, []);
+  }, [onAuthRequired]);
 
   const hasLayout = Object.keys(zpos).length > 0 || Object.keys(zmode).length > 0;
 
@@ -409,10 +520,13 @@ export function BoardScreen({
           zonesFocusable={!focus}
           flowsRunning={!focus}
           reducedMotion={reducedMotion}
-          ambientFlows={auditLive === false}
           flowFeed={flowFeed}
           onFlowEvent={setEvt}
           stagedState={stagedState}
+          agentsState={agentsState}
+          logState={logState}
+          quarantineState={quarantineState}
+          recallState={recallState}
         />
       </div>
 
@@ -422,15 +536,32 @@ export function BoardScreen({
           <span className="rune">⬢</span>
           <span className="bn">minni</span>
           <span className="bm">
-            {auditLive ? "memory board · live" : "memory board · dry-run"}
+            {auditLive === false
+              ? "memory board · audit offline"
+              : auditLive
+                ? "memory board · live"
+                : "memory board · connecting"}
           </span>
         </button>
         <span className={"bd-chip " + (daemon.online ? "safe" : "danger")}>
           <span className="dot" />
           {daemon.online ? "DAEMON ONLINE" : "DAEMON OFFLINE"}
         </span>
-        <span className={"bd-chip " + (stagedState.isLive ? "" : "warn")}>
-          {stagedState.isLive ? `${stagedState.learnings.length} STAGED` : `SAMPLE · ${stagedState.learnings.length} STAGED`}
+        <span
+          className={
+            "bd-chip " +
+            (stagedState.isLive
+              ? ""
+              : stagedState.loading && !stagedState.error
+                ? "warn"
+                : "danger")
+          }
+        >
+          {stagedState.isLive
+            ? `${stagedState.learnings.length} STAGED`
+            : stagedState.loading && !stagedState.error
+              ? "STAGED · …"
+              : "STAGED · OFFLINE"}
         </span>
         {hasLayout ? (
           <button
@@ -509,6 +640,10 @@ export function BoardScreen({
                     id={id}
                     ctx={{ daemon, recentAudit: auditSummaries }}
                     stagedState={stagedState}
+                    agentsState={agentsState}
+                    logState={logState}
+                    quarantineState={quarantineState}
+                    recallState={recallState}
                     onOpenRecall={onOpenRecall}
                   />
                 </div>

@@ -35,11 +35,9 @@ import { DryrunScreen } from "./screens/DryrunScreen";
 import { PacketScreen } from "./screens/PacketScreen";
 import { RecallScreen } from "./screens/RecallScreen";
 import { SettingsScreen } from "./screens/SettingsScreen";
-import {
-  HandoffsScreen,
-  PolicyScreen,
-  VaultsScreen,
-} from "./screens/UnwiredScreens";
+import { HandoffsScreen } from "./screens/HandoffsScreen";
+import { PolicyScreen } from "./screens/PolicyScreen";
+import { VaultsScreen } from "./screens/VaultsScreen";
 
 type ScreenId =
   | "recall"
@@ -173,13 +171,28 @@ export function App() {
           />
         );
       case "handoffs":
-        return <HandoffsScreen />;
+        return (
+          <HandoffsScreen
+            tokenRefreshTrigger={tokenRefreshTrigger}
+            onAuthRequired={() => setAuthRequired(true)}
+          />
+        );
       case "vaults":
-        return <VaultsScreen />;
+        return (
+          <VaultsScreen
+            tokenRefreshTrigger={tokenRefreshTrigger}
+            onAuthRequired={() => setAuthRequired(true)}
+          />
+        );
       case "audit":
         return <AuditScreen />;
       case "policy":
-        return <PolicyScreen />;
+        return (
+          <PolicyScreen
+            tokenRefreshTrigger={tokenRefreshTrigger}
+            onAuthRequired={() => setAuthRequired(true)}
+          />
+        );
       case "settings":
         return (
           <SettingsScreen

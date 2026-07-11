@@ -743,8 +743,11 @@ def resolve_candidate(params: dict, request_id: Any, context: GovernanceContext)
         "learn": "accepted",
         "reject": "rejected",
         "redact": "redacted",
-        "do_not_store": "rejected",
-        "log_only": "rejected",
+        # Distinct statuses so quarantine / log-only zones can list them
+        # (list_candidates filters by status string). Pre-change rows stay
+        # "rejected" — no migration; zones populate going forward.
+        "do_not_store": "do_not_store",
+        "log_only": "log_only",
         "merge": "merged",
         "supersede": "superseded",
     }

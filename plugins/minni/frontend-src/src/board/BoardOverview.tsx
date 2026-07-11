@@ -1,18 +1,21 @@
 // Minni Memory Board — overview layer: draggable zones, live links, flow pulses.
-import { useEffect, useMemo, useRef } from "react";
+import { useEffect, useMemo, useRef, type ReactNode } from "react";
 import {
-  BOARD_FLOWS,
-  SAMPLE_AGENTS,
-  SAMPLE_DENY,
-  SAMPLE_LEARNINGS,
-  SAMPLE_LOGS,
+  type BoardAgent,
+  type BoardDeny,
   type BoardFlow,
+  type BoardLog,
+  type BoardRecallResult,
   type DaemonInfo,
   type FlowEvent,
   type ZoneDef,
   type ZoneId,
 } from "./boardData";
-import { type StagedLearningsState } from "./boardDataHook";
+import {
+  type StagedLearningsState,
+  type ZoneDataState,
+  type RecallZoneData,
+} from "./boardDataHook";
 import {
   computeLinks,
   OVERVIEW_LAYOUT,
@@ -23,7 +26,7 @@ import { isDrag, type ZoneMode, type ZoneModes } from "./boardLogic";
 
 // ── flow pulse layer ────────────────────────────────────────────────────────
 interface Pulse {
-  flow: (typeof BOARD_FLOWS)[number];
+  flow: BoardFlow;
   el: SVGCircleElement;
   step: number;
   start: number;
@@ -34,16 +37,13 @@ function FlowLayer({
   links,
   running,
   reduced,
-  ambient,
   feed,
   onEvent,
 }: {
   links: Link[];
   running: boolean;
   reduced: boolean;
-  /** True only while the audit tail is unreachable — sample ambience fallback. */
-  ambient: boolean;
-  /** Real traffic: audit-tail entries mapped to flows, monotonically keyed. */
+  /** Real traffic only: audit-tail entries mapped to flows. No synthetic ambient. */
   feed: { seq: number; flow: BoardFlow }[];
   onEvent: (e: FlowEvent) => void;
 }) {
@@ -58,9 +58,7 @@ function FlowLayer({
     const paths = pathRefs.current;
     const pulses: Pulse[] = [];
     const liveRef = new Map<SVGPathElement, number>();
-    let timer: number | undefined;
     let raf = 0;
-    let n = 0;
 
     const enterSegment = (path: SVGPathElement, color: string) => {
       const next = (liveRef.get(path) || 0) + 1;
@@ -95,13 +93,6 @@ function FlowLayer({
       pulses.push({ flow, el, step: 0, start: performance.now(), pathEl: null });
     };
     spawnRef.current = spawnFlow;
-
-    const spawn = () => {
-      const flow = BOARD_FLOWS[Math.floor(Math.random() * BOARD_FLOWS.length)];
-      spawnFlow(flow);
-      onEvent({ n: ++n, label: flow.label, color: flow.color });
-      timer = window.setTimeout(spawn, 1500 + Math.random() * 2300);
-    };
 
     const tick = (now: number) => {
       for (let i = pulses.length - 1; i >= 0; i--) {
@@ -142,11 +133,9 @@ function FlowLayer({
       raf = requestAnimationFrame(tick);
     };
 
-    if (ambient) timer = window.setTimeout(spawn, 500);
     raf = requestAnimationFrame(tick);
     return () => {
       spawnRef.current = null;
-      window.clearTimeout(timer);
       cancelAnimationFrame(raf);
       pulses.forEach((p) => {
         if (p.pathEl) leaveSegment(p.pathEl);
@@ -162,7 +151,7 @@ function FlowLayer({
         }
       });
     };
-  }, [running, reduced, ambient, onEvent]);
+  }, [running, reduced, onEvent]);
 
   // Real traffic: each new audit-derived flow rides the board once and hits
   // the ticker. Ticker updates even under reduced motion (no pulse, still news).
@@ -431,10 +420,13 @@ export function BoardOverview({
   zonesFocusable,
   flowsRunning,
   reducedMotion,
-  ambientFlows,
   flowFeed,
   onFlowEvent,
   stagedState,
+  agentsState,
+  logState,
+  quarantineState,
+  recallState,
 }: {
   zones: Record<ZoneId, ZoneDef>;
   scale: number;
@@ -447,16 +439,46 @@ export function BoardOverview({
   zonesFocusable: boolean;
   flowsRunning: boolean;
   reducedMotion: boolean;
-  ambientFlows: boolean;
   flowFeed: { seq: number; flow: BoardFlow }[];
   onFlowEvent: (e: FlowEvent) => void;
   stagedState?: StagedLearningsState;
+  agentsState?: ZoneDataState<BoardAgent[]>;
+  logState?: ZoneDataState<BoardLog[]>;
+  quarantineState?: ZoneDataState<BoardDeny[]>;
+  recallState?: ZoneDataState<RecallZoneData>;
 }) {
-  const agentIds = useMemo(() => SAMPLE_AGENTS.map((a) => a.id), []);
+  const agents = agentsState?.data || [];
+  // Empty catalogue → empty links (no invented "main" runtime for geometry).
+  const agentIds = useMemo(() => agents.map((a) => a.id), [agents]);
   const links = useMemo(() => computeLinks(zones, agentIds), [zones, agentIds]);
-  const learnings = stagedState?.learnings || SAMPLE_LEARNINGS;
+  const learnings = stagedState?.learnings || [];
   const top4 = learnings.slice(0, 4);
+  const logs = logState?.data || [];
+  const denies = quarantineState?.data || [];
+  const recallHits: BoardRecallResult[] = recallState?.data?.results || [];
   const L = OVERVIEW_LAYOUT;
+
+  const offlineChip = (label: string) => (
+    <div className="more-chip" style={{ left: 12, top: 40 }}>
+      {label}
+    </div>
+  );
+  /** Overview chip aligned with detail zoneGate: loading ≠ offline. */
+  const zoneChip = (
+    state: { isLive: boolean; loading: boolean; error: string | null } | undefined,
+    offlineLabel: string,
+    loadingLabel: string,
+    emptyLabel: string,
+    empty: boolean,
+    liveBody: ReactNode,
+  ) => {
+    if (state && !state.isLive) {
+      if (state.loading && !state.error) return offlineChip(loadingLabel);
+      return offlineChip(offlineLabel);
+    }
+    if (empty) return offlineChip(emptyLabel);
+    return liveBody;
+  };
 
   return (
     <div className="ov-root">
@@ -464,35 +486,41 @@ export function BoardOverview({
         links={links}
         running={flowsRunning}
         reduced={reducedMotion}
-        ambient={ambientFlows}
         feed={flowFeed}
         onEvent={onFlowEvent}
       />
 
       <ZoneBox id="agents" z={zones.agents} scale={scale} mode={zmode.agents} onResize={onResize} onModeChange={onModeChange} focusable={zonesFocusable} onFocus={onFocus} onMove={onMove}>
-        {SAMPLE_AGENTS.map((a, i) => (
-          <div
-            key={a.id}
-            className="node"
-            style={{ left: L.agents.nodeX, top: L.agents.nodeY0 + i * L.agents.nodeGap }}
-          >
-            <div className="nn">
-              <span className="dot" style={{ background: a.on ? "var(--verdigris)" : "var(--disabled)" }} />
-              {a.id}
-            </div>
-            <div className="nv">
-              {a.vault} · {a.seen}
-            </div>
-            <div className="ncaps">
-              <span className={"bd-chip " + (a.caps.R ? "ok" : "no")}>R</span>
-              <span className={"bd-chip " + (a.caps.L ? "ok" : "no")}>L</span>
-              <span className={"bd-chip " + (a.caps.H ? "ok" : "no")}>H</span>
-            </div>
-          </div>
-        ))}
-        <div className="thread-tag" style={{ left: L.agents.threadTag.x, top: L.agents.threadTag.y }}>
-          LS-2231 · lease → codex · 42m
-        </div>
+        {zoneChip(
+          agentsState,
+          "RUNTIMES · OFFLINE",
+          "RUNTIMES · …",
+          "no vaults",
+          agents.length === 0,
+          agents.slice(0, 6).map((a, i) => (
+                <div
+                  key={a.id}
+                  className="node"
+                  style={{ left: L.agents.nodeX, top: L.agents.nodeY0 + i * L.agents.nodeGap }}
+                >
+                  <div className="nn">
+                    <span
+                      className="dot"
+                      style={{ background: a.on ? "var(--verdigris)" : "var(--disabled)" }}
+                    />
+                    {a.id}
+                  </div>
+                  <div className="nv">
+                    {a.vault} · {a.seen}
+                  </div>
+                  <div className="ncaps">
+                    <span className={"bd-chip " + (a.caps.R ? "ok" : "no")}>R</span>
+                    <span className={"bd-chip " + (a.caps.L ? "ok" : "no")}>L</span>
+                    <span className={"bd-chip " + (a.caps.H ? "ok" : "no")}>H</span>
+                  </div>
+                </div>
+              )),
+        )}
       </ZoneBox>
 
       <ZoneBox id="hub" z={zones.hub} scale={scale} mode={zmode.hub} onResize={onResize} onModeChange={onModeChange} focusable={zonesFocusable} onFocus={onFocus} onMove={onMove}>
@@ -509,60 +537,95 @@ export function BoardOverview({
       </ZoneBox>
 
       <ZoneBox id="staged" z={zones.staged} scale={scale} mode={zmode.staged} onResize={onResize} onModeChange={onModeChange} focusable={zonesFocusable} onFocus={onFocus} onMove={onMove}>
-        {top4.map((l, i) => {
-          const slot = stagedSlot(i);
-          return (
-            <OvCard
-              key={l.id}
-              x={slot.x}
-              y={slot.y}
-              w={slot.w}
-              klass="learn"
-              klassLabel="LEARN"
-              tag={l.tag}
-              score={typeof l.score === 'number' ? l.score.toFixed(2) : String(l.score)}
-              title={l.title}
-              meta={l.id + " · " + l.agent + " · AFM-safe"}
-            />
-          );
-        })}
-        <div className="more-chip" style={{ left: L.staged.moreChip.x, top: L.staged.moreChip.y }}>
-          + {learnings.length - top4.length} more · click zone to expand
-        </div>
+        {zoneChip(
+          stagedState,
+          "STAGED · OFFLINE",
+          "STAGED · …",
+          "none staged",
+          top4.length === 0,
+          <>
+            {top4.map((l, i) => {
+              const slot = stagedSlot(i);
+              return (
+                <OvCard
+                  key={l.id}
+                  x={slot.x}
+                  y={slot.y}
+                  w={slot.w}
+                  klass="learn"
+                  klassLabel="LEARN"
+                  tag={l.tag}
+                  score={typeof l.score === "number" ? l.score.toFixed(2) : String(l.score)}
+                  title={l.title}
+                  meta={l.id + " · " + l.agent}
+                />
+              );
+            })}
+            {stagedState?.isLive && learnings.length > 4 ? (
+              <div
+                className="more-chip"
+                style={{ left: L.staged.moreChip.x, top: L.staged.moreChip.y }}
+              >
+                + {learnings.length - top4.length} more · click zone to expand
+              </div>
+            ) : null}
+          </>,
+        )}
       </ZoneBox>
 
       <ZoneBox id="logs" z={zones.logs} scale={scale} mode={zmode.logs} onResize={onResize} onModeChange={onModeChange} focusable={zonesFocusable} onFocus={onFocus} onMove={onMove}>
-        <OvCard
-          x={L.logs.card.x}
-          y={L.logs.card.y}
-          w={L.logs.card.w}
-          klass="log"
-          klassLabel="LOG"
-          tag="PRIVATE"
-          tagCls="danger"
-          score={SAMPLE_LOGS[0].score.toFixed(2)}
-          title={SAMPLE_LOGS[0].title}
-          meta={SAMPLE_LOGS[0].id + " · " + SAMPLE_LOGS[0].agent + " · stays in personal leg"}
-        />
-        <div className="more-chip" style={{ left: L.logs.moreChip.x, top: L.logs.moreChip.y }}>
-          + {SAMPLE_LOGS.length - 1} more
-        </div>
+        {zoneChip(
+          logState,
+          "LOG-ONLY · OFFLINE",
+          "LOG-ONLY · …",
+          "no log-only",
+          logs.length === 0,
+          <>
+            <OvCard
+              x={L.logs.card.x}
+              y={L.logs.card.y}
+              w={L.logs.card.w}
+              klass="log"
+              klassLabel="LOG"
+              tag="PRIVATE"
+              tagCls="danger"
+              score={logs[0].score > 0 ? logs[0].score.toFixed(2) : "—"}
+              title={logs[0].title}
+              meta={logs[0].id + " · " + logs[0].agent + " · personal leg"}
+            />
+            {logs.length > 1 ? (
+              <div
+                className="more-chip"
+                style={{ left: L.logs.moreChip.x, top: L.logs.moreChip.y }}
+              >
+                + {logs.length - 1} more
+              </div>
+            ) : null}
+          </>,
+        )}
       </ZoneBox>
 
       <ZoneBox id="quarantine" z={zones.quarantine} scale={scale} mode={zmode.quarantine} onResize={onResize} onModeChange={onModeChange} focusable={zonesFocusable} onFocus={onFocus} onMove={onMove}>
-        <OvCard
-          x={L.quarantine.card.x}
-          y={L.quarantine.card.y}
-          w={L.quarantine.card.w}
-          deny
-          klass="deny"
-          klassLabel="DENY"
-          tag="AFM: DEFUSED"
-          tagCls="warn"
-          score={SAMPLE_DENY.score.toFixed(2)}
-          title={SAMPLE_DENY.title}
-          meta={SAMPLE_DENY.id + " · grok · instruction-like, defused"}
-        />
+        {zoneChip(
+          quarantineState,
+          "QUARANTINE · OFFLINE",
+          "QUARANTINE · …",
+          "quarantine clear",
+          denies.length === 0,
+          <OvCard
+            x={L.quarantine.card.x}
+            y={L.quarantine.card.y}
+            w={L.quarantine.card.w}
+            deny
+            klass="deny"
+            klassLabel="DENY"
+            tag="DO-NOT-STORE"
+            tagCls="warn"
+            score={denies[0].score > 0 ? denies[0].score.toFixed(2) : "—"}
+            title={denies[0].title}
+            meta={denies[0].id + " · " + denies[0].agent}
+          />,
+        )}
       </ZoneBox>
 
       <ZoneBox id="recall" z={zones.recall} scale={scale} mode={zmode.recall} onResize={onResize} onModeChange={onModeChange} focusable={zonesFocusable} onFocus={onFocus} onMove={onMove}>
@@ -571,14 +634,36 @@ export function BoardOverview({
             <path key={d} d={d} />
           ))}
         </svg>
-        <div className="qcard" style={{ left: L.recall.qcard.x, top: L.recall.qcard.y }}>
-          <div className="ql">RECALL · BOTH LEGS · CITED, NEVER OBEYED</div>
-          <div className="qq">▸ handoff leases</div>
-          <div className="qn">5 results · rank-fusion · 212 ms</div>
-        </div>
-        <OvCard {...L.recall.cards[0]} tag="WIKI · SAFE" tagCls="safe" score="0.84" title="Handoff leases" meta="wiki/handoff-leases.md · team · 3d" />
-        <OvCard {...L.recall.cards[1]} tag="LEARNING" tagCls="" score="0.71" title="Handoff is default-deny" meta="shared/learnings/L-0121 · system · 8d" />
-        <OvCard {...L.recall.cards[2]} tag="LOG" tagCls="" score="0.67" title="Correction re-assert" meta="private · 20d" />
+        {zoneChip(
+          recallState,
+          "RECALL · OFFLINE",
+          "RECALL · …",
+          "",
+          false,
+          <>
+            <div className="qcard" style={{ left: L.recall.qcard.x, top: L.recall.qcard.y }}>
+              <div className="ql">RECALL · LAST QUERY · CITED, NEVER OBEYED</div>
+              <div className="qq">
+                ▸ {recallState?.data?.query || recallState?.data?.message || "no recent recall"}
+              </div>
+              <div className="qn">
+                {recallHits.length} result{recallHits.length === 1 ? "" : "s"}
+                {recallState?.data?.present ? " · strong" : ""}
+              </div>
+            </div>
+            {recallHits.slice(0, 3).map((r, i) => (
+              <OvCard
+                key={r.path + i}
+                {...(L.recall.cards[i] || L.recall.cards[0])}
+                tag={r.cls}
+                tagCls={r.afm === "SAFE" ? "safe" : ""}
+                score={r.score.toFixed(2)}
+                title={r.sub}
+                meta={r.path + " · " + r.age}
+              />
+            ))}
+          </>,
+        )}
       </ZoneBox>
     </div>
   );

@@ -1,15 +1,18 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { execFile } from "node:child_process";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
+import { lstatSync, realpathSync } from "node:fs";
 import { access, readdir, readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
-import { DEFAULT_AGENT_ID, DEFAULT_VAULT_PATH, PLUGIN_ROOT } from "./config.js";
+import { DEFAULT_AGENT_ID, DEFAULT_VAULT_PATH, PLUGIN_ROOT, minniHome } from "./config.js";
 import { buildStatusReport } from "./sovereign.js";
 import { prepareOutcome, prepareTask, type PrepareOutcomeInput, type PrepareTaskInput } from "./task.js";
 import { auditTail } from "./vault.js";
+import { readRecallState } from "./recall-state.js";
+import { routeMemoryIntent } from "./policy.js";
 
 const MAX_JSON_BYTES = 256 * 1024;
 const DEFAULT_UI_HOST = process.env.MINNI_UI_HOST ?? "127.0.0.1";
@@ -72,6 +75,8 @@ export interface UiServerOptions {
   port?: number;
   staticRoot?: string;
   vaultPath?: string;
+  /** Override MINNI_HOME for vault catalogue scans (tests). */
+  minniHomePath?: string;
   prepareTask?: (input: PrepareTaskInput) => Promise<unknown>;
   prepareOutcome?: (input: PrepareOutcomeInput) => Promise<unknown>;
   status?: () => Promise<unknown>;
@@ -79,6 +84,12 @@ export interface UiServerOptions {
   deepResearch?: DeepResearchBridge;
   /** Test seam: override daemon JSON-RPC for candidates/resolve without a live socket. */
   daemonRpc?: (method: string, params: Record<string, unknown>) => Promise<unknown>;
+  /** Test seam: override recall-state reader. */
+  readRecallState?: (vaultPath: string) => Promise<unknown>;
+  /** Test seam: override agents catalogue builder. */
+  listAgents?: () => Promise<unknown>;
+  /** Test seam: override policy report builder. */
+  policyReport?: () => Promise<unknown>;
 }
 
 export interface UiServerHandle {
@@ -216,6 +227,294 @@ export function consolePrincipalReport(): {
   };
 }
 
+// ── agents catalogue helpers ────────────────────────────────────────────────
+
+/** Map vault directory basename (e.g. claudecode-vault) → agent id. */
+export function agentIdFromVaultDir(dirName: string): string {
+  const base = dirName.replace(/-vault$/i, "");
+  if (base === "claudecode" || base === "claude") return "claude-code";
+  return base;
+}
+
+function homeDisplayPath(absPath: string): string {
+  const home = os.homedir();
+  if (absPath === home || absPath.startsWith(home + path.sep)) {
+    return "~" + absPath.slice(home.length);
+  }
+  // Also rewrite MINNI_HOME-relative paths when home is overridden in tests.
+  return absPath;
+}
+
+/**
+ * Read-only audit tail for catalogue last-seen. Never calls ensureVault
+ * (which would materialize vault skeletons / follow symlinks for write).
+ */
+export async function readOnlyAuditTail(
+  vaultPath: string,
+  limit = 5,
+): Promise<{ entries: string[]; text: string }> {
+  const today = new Date().toISOString().slice(0, 10);
+  const todayPath = path.join(vaultPath, "logs", `${today}.md`);
+  const fallbackPath = path.join(vaultPath, "log.md");
+  let text = "";
+  try {
+    text = await readFile(todayPath, "utf8");
+  } catch {
+    try {
+      text = await readFile(fallbackPath, "utf8");
+    } catch {
+      return { entries: [], text: "" };
+    }
+  }
+  const entries = text
+    .split(/^## /m)
+    .filter((entry) => entry.trim().length > 0 && !entry.startsWith("#"))
+    .map((entry) => `## ${entry.trim()}`)
+    .slice(-limit);
+  return { entries, text: entries.join("\n\n") };
+}
+
+/** True when vaultAbs is a real directory under realpath(homePath), not a symlink escape. */
+export function vaultPathContained(vaultAbs: string, homePath: string): boolean {
+  try {
+    const st = lstatSync(vaultAbs);
+    if (st.isSymbolicLink()) return false;
+    if (!st.isDirectory()) return false;
+    const realHome = realpathSync(homePath);
+    const realVault = realpathSync(vaultAbs);
+    return realVault === realHome || realVault.startsWith(realHome + path.sep);
+  } catch {
+    return false;
+  }
+}
+
+function capsFromCapabilityList(caps: unknown): { R: 0 | 1; L: 0 | 1; H: 0 | 1 } {
+  if (!Array.isArray(caps)) return { R: 0, L: 0, H: 0 };
+  const set = new Set(caps.map((c) => String(c).toLowerCase()));
+  if (set.has("*")) return { R: 1, L: 1, H: 1 };
+  const r = set.has("search") || set.has("read") || set.has("recall") ? 1 : 0;
+  const l = set.has("learn") || set.has("write") ? 1 : 0;
+  const h = set.has("handoff") || set.has("cross_agent") || set.has("govern") ? 1 : 0;
+  return { R: r as 0 | 1, L: l as 0 | 1, H: h as 0 | 1 };
+}
+
+/** Load R/L/H caps from principals/*.json (+ platform_agent_capabilities). */
+export async function loadAgentCapsMap(homePath: string): Promise<Map<string, { R: 0 | 1; L: 0 | 1; H: 0 | 1 }>> {
+  const out = new Map<string, { R: 0 | 1; L: 0 | 1; H: 0 | 1 }>();
+  const principalsDir = path.join(homePath, "principals");
+  let files: string[] = [];
+  try {
+    files = await readdir(principalsDir);
+  } catch {
+    return out;
+  }
+  for (const file of files) {
+    if (!file.endsWith(".json") || file.includes(".bak")) continue;
+    try {
+      const raw = JSON.parse(await readFile(path.join(principalsDir, file), "utf8")) as Record<string, unknown>;
+      const agentId = typeof raw.agent_id === "string" ? raw.agent_id : file.replace(/\.json$/, "");
+      out.set(agentId, capsFromCapabilityList(raw.capabilities));
+      const platform = raw.platform_agent_capabilities;
+      if (platform && typeof platform === "object" && !Array.isArray(platform)) {
+        for (const [pid, pcaps] of Object.entries(platform as Record<string, unknown>)) {
+          out.set(pid, capsFromCapabilityList(pcaps));
+        }
+      }
+    } catch {
+      // skip malformed principal files
+    }
+  }
+  return out;
+}
+
+function parseAuditTimestampMs(entry: string): number | null {
+  const first = entry.split(/\r?\n/, 1)[0] || entry;
+  const m = /^##\s+\[([^\]]+)\]/.exec(first);
+  if (!m) return null;
+  const ts = m[1].trim();
+  // ISO-ish first
+  const iso = Date.parse(ts.includes("T") ? ts : ts.replace(" ", "T"));
+  if (Number.isFinite(iso)) return iso;
+  return null;
+}
+
+function humanizeSeen(ms: number | null, now = Date.now()): string {
+  if (ms == null || !Number.isFinite(ms)) return "—";
+  const diffMs = now - ms;
+  if (diffMs < 0) return "—";
+  const mins = Math.floor(diffMs / 60000);
+  if (mins < 60) return `${Math.max(1, mins)}m`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `${hours}h`;
+  const days = Math.floor(hours / 24);
+  return `${days}d`;
+}
+
+/**
+ * Compose the multi-agent vault catalogue for RUNTIMES / VaultsScreen.
+ * Scans MINNI_HOME/*-vault, last-seen via read-only audit tail (never ensureVault),
+ * staged count via list_candidates(status=proposed) per agent, caps from principals.
+ *
+ * Fail-loud staged counts: RPC failure → staged: null + stagedUnknown: true (not 0).
+ * Symlink / path-escape vault entries are skipped.
+ */
+export async function buildAgentsCatalogue(options: {
+  homePath: string;
+  daemonRpc: (method: string, params: Record<string, unknown>) => Promise<unknown>;
+  auditTailFn?: (vaultPath: string, limit: number) => Promise<{ entries?: string[] }>;
+}): Promise<{ agents: Array<Record<string, unknown>>; count: number }> {
+  const homePath = options.homePath;
+  const capsMap = await loadAgentCapsMap(homePath);
+  const tailFn = options.auditTailFn ?? readOnlyAuditTail;
+
+  let dirs: string[] = [];
+  try {
+    dirs = await readdir(homePath);
+  } catch {
+    return { agents: [], count: 0 };
+  }
+
+  const vaultDirs = dirs.filter((d) => d.endsWith("-vault"));
+  const agents: Array<Record<string, unknown>> = [];
+  const now = Date.now();
+
+  for (const dir of vaultDirs.sort()) {
+    const vaultAbs = path.join(homePath, dir);
+    if (!vaultPathContained(vaultAbs, homePath)) continue;
+
+    const id = agentIdFromVaultDir(dir);
+    // Skip vault basenames that would not be valid daemon agent ids.
+    if (!AGENT_ID_RE.test(id)) continue;
+
+    let lastSeenMs: number | null = null;
+    try {
+      const tail = await tailFn(vaultAbs, 5);
+      for (const entry of [...(tail.entries || [])].reverse()) {
+        const ms = parseAuditTimestampMs(entry);
+        if (ms != null) {
+          lastSeenMs = ms;
+          break;
+        }
+      }
+    } catch {
+      // audit unavailable — honest "—" for seen
+    }
+
+    let staged: number | null = null;
+    let stagedUnknown = false;
+    try {
+      const rpc = await options.daemonRpc("list_candidates", {
+        limit: 200,
+        status: "proposed",
+        agent_id: id,
+      });
+      const unwrapped = unwrapDaemonCandidates(rpc);
+      staged = unwrapped.candidates.length;
+    } catch {
+      // Fail-loud: do not invent 0 when the RPC failed.
+      staged = null;
+      stagedUnknown = true;
+    }
+
+    const caps = capsMap.get(id) ?? { R: 0 as const, L: 0 as const, H: 0 as const };
+    const seen = humanizeSeen(lastSeenMs, now);
+    const on = lastSeenMs != null && now - lastSeenMs < 60 * 60 * 1000;
+
+    agents.push({
+      id,
+      vault: homeDisplayPath(vaultAbs),
+      // Display path only — no absolute vaultPath on the wire (path leak).
+      seen,
+      lastSeenAt: lastSeenMs,
+      on,
+      caps,
+      staged,
+      stagedUnknown,
+    });
+  }
+
+  return { agents, count: agents.length };
+}
+
+/** Normalize list_candidates daemon responses (JsonResult or flat). */
+export function unwrapDaemonCandidates(rpc: unknown): { candidates: unknown[]; principal?: string; count?: number } {
+  const r = rpc as Record<string, unknown> | null;
+  if (!r || typeof r !== "object") return { candidates: [] };
+  if (typeof r.ok === "boolean") {
+    if (!r.ok) {
+      throw new Error(String(r.error || "list_candidates failed"));
+    }
+    const data = (r.data && typeof r.data === "object" ? r.data : r) as Record<string, unknown>;
+    const candidates = Array.isArray(data.candidates) ? data.candidates : [];
+    return {
+      candidates,
+      principal: typeof data.principal === "string" ? data.principal : undefined,
+      count: typeof data.count === "number" ? data.count : candidates.length,
+    };
+  }
+  if (r.error) throw new Error(String(r.error));
+  const candidates = Array.isArray(r.candidates) ? r.candidates : [];
+  return {
+    candidates,
+    principal: typeof r.principal === "string" ? r.principal : undefined,
+    count: typeof r.count === "number" ? r.count : candidates.length,
+  };
+}
+
+/** Build a real policy/caps snapshot for PolicyScreen (no hardcoded version strings). */
+export async function buildPolicyReport(options: {
+  homePath: string;
+  vaultPath: string;
+  status?: () => Promise<unknown>;
+}): Promise<Record<string, unknown>> {
+  const capsMap = await loadAgentCapsMap(options.homePath);
+  const agentId = DEFAULT_AGENT_ID;
+  const stamped = candidatesAgentId(null) ?? null;
+  const myCaps = capsMap.get(agentId) ?? capsMap.get("main") ?? { R: 0, L: 0, H: 0 };
+
+  // Intent routing sample — live policy.ts heuristic, not a version brand.
+  const sampleIntent = routeMemoryIntent("what did we decide about handoffs?");
+
+  let afm: Record<string, unknown> = {};
+  let automaticLearning: boolean | undefined;
+  try {
+    const report = (options.status
+      ? await options.status()
+      : await buildStatusReport({ vaultPath: options.vaultPath })) as unknown as Record<
+      string,
+      unknown
+    >;
+    const afmField = report.afm;
+    if (afmField && typeof afmField === "object") afm = afmField as Record<string, unknown>;
+    // Prefer explicit status field when present; otherwise omit (do not invent false).
+    if (typeof (report as { automaticLearning?: unknown }).automaticLearning === "boolean") {
+      automaticLearning = (report as { automaticLearning: boolean }).automaticLearning;
+    }
+  } catch {
+    afm = { ok: false, error: "status unavailable" };
+  }
+
+  return {
+    agentId,
+    stampedForCandidates: stamped,
+    unknownAgent: agentId === "unknown-agent",
+    resolveOperatorsEnv: Boolean((process.env.MINNI_RESOLVE_OPERATORS ?? "").trim()),
+    caps: myCaps,
+    principalsKnown: [...capsMap.keys()].sort(),
+    ...(automaticLearning === undefined ? {} : { automaticLearning }),
+    intentRouting: {
+      sampleTask: "what did we decide about handoffs?",
+      action: sampleIntent.action,
+      confidence: sampleIntent.confidence,
+      automaticAllowed: sampleIntent.automaticAllowed,
+      reason: sampleIntent.reason,
+    },
+    afm,
+    policyModule: "plugins/minni/src/policy.ts",
+    source: "principals/*.json + routeMemoryIntent + /api/status AFM",
+  };
+}
+
 /** Map daemon / JSON-RPC error text to an honest HTTP status for console routes. */
 export function daemonRpcHttpStatus(err: unknown): number {
   const msg = err instanceof Error ? err.message : String(err);
@@ -309,9 +608,12 @@ function appendListArgs(args: string[], flag: string, values: string[] | undefin
 
 function redactLocalValue(value: unknown): unknown {
   if (typeof value === "string") {
+    const home = os.homedir().replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     return value
       .replace(/\/Users\/[^\s"',)]+/g, "[local-path]")
+      .replace(/\/home\/[^\s"',)]+/g, "[local-path]")
       .replace(/\/Volumes\/[^\s"',)]+/g, "[local-path]")
+      .replace(new RegExp(home + "[^\\s\"',)]*", "g"), "[local-path]")
       .replace(/\/tmp\/sov(?:ereign|rd)\.sock\b/g, "[local-path]")
       .replace(/[^\s"',)]+\.fmadapter\b/g, "[local-path]");
   }
@@ -578,6 +880,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
   }
   const staticRoot = options.staticRoot ?? path.join(PLUGIN_ROOT, "frontend");
   const vaultPath = options.vaultPath ?? DEFAULT_VAULT_PATH;
+  const homePath = options.minniHomePath ?? minniHome();
   const status = options.status ?? (() => buildStatusReport({ vaultPath }));
   const tail = options.auditTail ?? ((limit: number) => auditTail(vaultPath, limit));
   const taskPrep = options.prepareTask ?? ((input: PrepareTaskInput) => prepareTask(input));
@@ -589,6 +892,55 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       const { jsonRpcSocketRequestWithFallback } = await import("./sovereign.js");
       return jsonRpcSocketRequestWithFallback(method, params);
     });
+  const recallStateReader =
+    options.readRecallState ?? ((vp: string) => readRecallState(vp));
+  const listAgents =
+    options.listAgents ??
+    (() =>
+      buildAgentsCatalogue({
+        homePath,
+        daemonRpc,
+      }));
+  const policyReport =
+    options.policyReport ??
+    (() =>
+      buildPolicyReport({
+        homePath,
+        vaultPath,
+        status,
+      }));
+
+  /** Shared list_candidates route body for proposed / log_only / do_not_store. */
+  async function candidatesByStatus(
+    res: ServerResponse,
+    statusFilter: string | undefined,
+    limit: number,
+    agentId: string | undefined,
+  ): Promise<void> {
+    try {
+      const rpc = await daemonRpc("list_candidates", {
+        limit,
+        status: statusFilter,
+        ...(agentId ? { agent_id: agentId } : {}),
+      });
+      if (rpc && typeof rpc === "object" && (rpc as { ok?: boolean }).ok === false) {
+        const err = String((rpc as { error?: string }).error || "list_candidates failed");
+        sendJson(res, daemonRpcHttpStatus(err), {
+          ok: false,
+          error: err,
+          candidates: [],
+        });
+        return;
+      }
+      sendJson(res, 200, redactLocalValue(rpc));
+    } catch (e) {
+      sendJson(res, daemonRpcHttpStatus(e), {
+        ok: false,
+        error: e instanceof Error ? e.message : String(e),
+        candidates: [],
+      });
+    }
+  }
 
   const server = createServer(async (req, res) => {
     try {
@@ -625,6 +977,12 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
             "minni_audit_tail",
             "minni_candidates",
             "minni_resolve_candidate",
+            "minni_agents",
+            "minni_log_only",
+            "minni_quarantine",
+            "minni_recall_state",
+            "minni_handoffs",
+            "minni_policy",
             "deep_research_plan",
             "deep_research_run",
             "deep_research_status",
@@ -670,33 +1028,104 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
       }
       // G17: Candidates console API (minimal wiring for P1 approval pipeline)
       if (req.method === "GET" && url.pathname === "/api/candidates") {
+        const limit = parseCandidatesLimit(url.searchParams.get("limit"));
+        const candStatus = url.searchParams.get("status") || undefined;
+        const agentId = candidatesAgentId(url.searchParams.get("agent_id"));
+        await candidatesByStatus(res, candStatus, limit, agentId);
+        return;
+      }
+      if (req.method === "GET" && url.pathname === "/api/log-only") {
+        const limit = parseCandidatesLimit(url.searchParams.get("limit"));
+        const agentId = candidatesAgentId(url.searchParams.get("agent_id"));
+        await candidatesByStatus(res, "log_only", limit, agentId);
+        return;
+      }
+      if (req.method === "GET" && url.pathname === "/api/quarantine") {
+        const limit = parseCandidatesLimit(url.searchParams.get("limit"));
+        const agentId = candidatesAgentId(url.searchParams.get("agent_id"));
+        await candidatesByStatus(res, "do_not_store", limit, agentId);
+        return;
+      }
+      if (req.method === "GET" && url.pathname === "/api/recall-state") {
         try {
-          const limit = parseCandidatesLimit(url.searchParams.get("limit"));
-          const candStatus = url.searchParams.get("status") || undefined;
+          const state = await recallStateReader(vaultPath);
+          if (!state) {
+            sendJson(res, 200, {
+              present: false,
+              state: null,
+              message: "no recent recall",
+              vaultPath: homeDisplayPath(vaultPath),
+            });
+            return;
+          }
+          sendJson(res, 200, redactLocalValue({
+            present: true,
+            state,
+            message: null,
+            vaultPath: homeDisplayPath(vaultPath),
+          }));
+        } catch (e) {
+          sendJson(res, 502, {
+            ok: false,
+            error: e instanceof Error ? e.message : String(e),
+            present: false,
+            state: null,
+          });
+        }
+        return;
+      }
+      if (req.method === "GET" && url.pathname === "/api/agents") {
+        try {
+          const catalogue = await listAgents();
+          sendJson(res, 200, redactLocalValue(catalogue));
+        } catch (e) {
+          sendJson(res, daemonRpcHttpStatus(e), {
+            ok: false,
+            error: e instanceof Error ? e.message : String(e),
+            agents: [],
+            count: 0,
+          });
+        }
+        return;
+      }
+      if (req.method === "GET" && url.pathname === "/api/handoffs") {
+        try {
           const agentId = candidatesAgentId(url.searchParams.get("agent_id"));
-          const rpc = await daemonRpc("list_candidates", {
-            limit,
-            status: candStatus,
-            // Omitted → the daemon stamps the local operator principal.
+          const rpc = await daemonRpc("minni_list_pending_handoffs", {
             ...(agentId ? { agent_id: agentId } : {}),
           });
-          // JsonResult { ok:false } must not look like a successful empty list.
           if (rpc && typeof rpc === "object" && (rpc as { ok?: boolean }).ok === false) {
-            const err = String((rpc as { error?: string }).error || "list_candidates failed");
+            const err = String((rpc as { error?: string }).error || "minni_list_pending_handoffs failed");
             sendJson(res, daemonRpcHttpStatus(err), {
               ok: false,
               error: err,
-              candidates: [],
+              handoffs: [],
             });
+            return;
+          }
+          // JsonResult envelope: { ok, data: { agent_id, handoffs } } or flat.
+          const r = rpc as Record<string, unknown>;
+          if (r && typeof r === "object" && r.ok === true && r.data && typeof r.data === "object") {
+            sendJson(res, 200, redactLocalValue(r.data));
             return;
           }
           sendJson(res, 200, redactLocalValue(rpc));
         } catch (e) {
-          // Fail loud: empty+200 hid principal denials as "live empty".
           sendJson(res, daemonRpcHttpStatus(e), {
             ok: false,
             error: e instanceof Error ? e.message : String(e),
-            candidates: [],
+            handoffs: [],
+          });
+        }
+        return;
+      }
+      if (req.method === "GET" && url.pathname === "/api/policy") {
+        try {
+          sendJson(res, 200, redactLocalValue(await policyReport()));
+        } catch (e) {
+          sendJson(res, 502, {
+            ok: false,
+            error: e instanceof Error ? e.message : String(e),
           });
         }
         return;

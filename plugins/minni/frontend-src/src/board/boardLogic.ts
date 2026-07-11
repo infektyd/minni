@@ -431,17 +431,28 @@ export function orderedAgentLinks(agentIds: string[]): string[] {
 // board: which agent link it leaves from, which daemon leg it lands on, and
 // the ticker label/color. Pure so node:test can pin the classification.
 
-/** Agents that have a link on the board (matches SAMPLE_AGENTS ids). */
-export const FLOW_AGENTS = ["claude-code", "codex", "gemini", "antigravity", "grok"] as const;
+/** Known agent ids used for audit-entry attribution on flow edges. */
+export const FLOW_AGENTS = [
+  "claude-code",
+  "claudecode",
+  "codex",
+  "gemini",
+  "antigravity",
+  "grok",
+  "grok-build",
+  "kilocode",
+  "cursor",
+  "main",
+] as const;
 
-/** Best-effort agent attribution from the entry text; the local vault's own
- * traffic carries no explicit agent marker, so claude-code is the default. */
+/** Best-effort agent attribution from the entry text. Unattributed traffic
+ * maps to "unknown" (neutral edge), not a fabricated runtime id. */
 export function agentFromAuditText(text: string): string {
   const t = text.toLowerCase();
   for (const a of FLOW_AGENTS) {
-    if (a !== "claude-code" && t.includes(a)) return a;
+    if (t.includes(a)) return a === "claudecode" ? "claude-code" : a;
   }
-  return "claude-code";
+  return "unknown";
 }
 
 /** Map one audit entry to the flow its pulse should travel. Order matters:

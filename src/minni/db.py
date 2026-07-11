@@ -399,13 +399,16 @@ class SovereignDB:
                         conn.execute("CREATE INDEX IF NOT EXISTS idx_doc_layer ON documents(layer)")
                         conn.execute("CREATE INDEX IF NOT EXISTS idx_chunk_layer ON chunk_embeddings(layer)")
                         conn.commit()
+                        # Only mark migrated after success so a failed 015 (etc.)
+                        # is retried on the next open of this path.
+                        _migrations_run = True
+                        _migrated_paths.add(abs_db_path)
                     except Exception as e:
                         import logging
                         logging.getLogger("sovereign.db").warning(
                             "Migrations runner failed (non-fatal): %s", e
                         )
-                    _migrations_run = True
-                    _migrated_paths.add(abs_db_path)
+                        # Do NOT set _migrations_run / _migrated_paths on failure.
 
     def close(self):
         """Close thread-local connection."""
