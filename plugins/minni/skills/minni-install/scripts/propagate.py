@@ -500,6 +500,7 @@ def update_kilo_config(server_path: Path, agent: str, vault: Path, socket_path: 
 
 
 CURSOR_HOOK_EVENTS = ("sessionStart", "beforeSubmitPrompt", "preCompact", "stop", "preToolUse")
+GROK_HOOK_EVENTS = ("SessionStart", "UserPromptSubmit", "PreCompact", "Stop")
 
 
 def cursor_hook_entry(install_root: Path, event: str, agent: str = "cursor",
@@ -536,22 +537,27 @@ def is_owned_cursor_hook(entry: object, install_root: Path) -> bool:
 
 def update_cursor_config(install_root: Path, server_path: Path, agent: str, vault: Path,
                          socket_path: Path, workspace: Path,
-                         afm_env: dict[str, str] | None = None, *, home: Path | None = None) -> None:
+                         afm_env: dict[str, str] | None = None, *, home: Path | None = None,
+                         explicit_workspace: bool = False) -> None:
     """Merge native Cursor wiring without replacing unrelated user hooks/MCPs."""
     cursor_home = (home or Path.home()) / ".cursor"
     mcp_path = cursor_home / "mcp.json"
     mcp = load_json(mcp_path)
-    mcp.setdefault("mcpServers", {})["minni"] = mcp_json(
-        server_path, agent, vault, socket_path, workspace, afm_env=afm_env
+    existing_env = mcp.get("mcpServers", {}).get("minni", {}).get("env", {}) or {}
+    mcp_entry = mcp_json(
+        server_path, agent, vault, socket_path, workspace, explicit_workspace=explicit_workspace,
+        pre_existing_env=existing_env, afm_env=afm_env
     )["mcpServers"]["minni"]
+    mcp.setdefault("mcpServers", {})["minni"] = mcp_entry
     write_json(mcp_path, mcp)
+    effective_workspace = Path(mcp_entry["env"]["MINNI_WORKSPACE_ID"])
 
     # The Cursor plugin manifest is the single registration authority. Stamp
     # its installed hook file with this installation's identity values.
     plugin_hooks = {
         "version": 1,
         "hooks": {
-            event: [cursor_hook_entry(install_root, event, agent, vault, workspace)]
+            event: [cursor_hook_entry(install_root, event, agent, vault, effective_workspace)]
             for event in CURSOR_HOOK_EVENTS
         },
     }
@@ -572,6 +578,62 @@ def update_cursor_config(install_root: Path, server_path: Path, agent: str, vaul
     if hooks_path.exists():
         hooks["hooks"] = groups
         write_json(hooks_path, hooks)
+
+    migrate_legacy_cursor_install(cursor_home, install_root)
+
+
+def migrate_legacy_cursor_install(cursor_home: Path, install_root: Path) -> Path | None:
+    """Move only the recognized pre-native Minni install out of Cursor's scan tree."""
+    legacy = cursor_home / "plugins/minni@minni"
+    if legacy == install_root or not legacy.exists() or legacy.is_symlink() or not legacy.is_dir():
+        return None
+    package = legacy / "package.json"
+    try:
+        name = str(load_json(package).get("name", ""))
+    except Exception:
+        return None
+    if name != "minni-multi-plugin":
+        return None
+    archive_dir = cursor_home / "legacy-plugins"
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    target = archive_dir / "minni@minni-pre-native"
+    suffix = 1
+    while target.exists():
+        target = archive_dir / f"minni@minni-pre-native-{suffix}"
+        suffix += 1
+    shutil.move(str(legacy), str(target))
+    return target
+
+
+def grok_hook_command(install_root: Path, event: str, agent: str, vault: Path,
+                      socket_path: Path, workspace: Path | str) -> str:
+    values = {
+        "MINNI_GROK_AGENT_ID": agent,
+        "MINNI_GROK_VAULT_PATH": str(vault),
+        "MINNI_GROK_WORKSPACE_ID": normalize_workspace_id(str(workspace)) or "workspace-unknown",
+        "MINNI_SOCKET_PATH": str(socket_path),
+    }
+    env = " ".join(f"{key}={shlex.quote(value)}" for key, value in values.items())
+    script = shlex.quote(str(install_root / "dist" / "grok-hook.js"))
+    return f"env {env} node {script} {event}"
+
+
+def update_grok_hooks(install_root: Path, agent: str, vault: Path, socket_path: Path,
+                      workspace: Path | str, *, home: Path | None = None) -> None:
+    """Write Grok's Minni-owned hook file; unrelated hook files are untouched."""
+    timeouts = {"SessionStart": 30, "UserPromptSubmit": 30, "PreCompact": 20, "Stop": 20}
+    hooks = {
+        "_comment": "Managed by minni-install. Grok-native hooks; do not replace with Claude hook.js.",
+        "hooks": {
+            event: [{"hooks": [{
+                "type": "command",
+                "command": grok_hook_command(install_root, event, agent, vault, socket_path, workspace),
+                "timeout": timeouts[event],
+            }]}]
+            for event in GROK_HOOK_EVENTS
+        },
+    }
+    write_json((home or Path.home()) / ".grok/hooks/minni.json", hooks)
 
 
 def update_gemini_manifest(install_root: Path, agent: str, vault: Path, socket_path: Path, workspace: Path, afm_env: dict[str, str] | None = None, *, version: str | None = None) -> None:
@@ -947,7 +1009,7 @@ def platform_spec(platform: str, repo_root: Path, install_root: str | None = Non
         },
         "cursor": {
             "agent": "cursor",
-            "install": home / ".cursor/plugins/minni@minni",
+            "install": home / ".cursor/plugins/local/minni",
             "config_kind": "cursor-json",
         },
         "claude-code": {
@@ -1034,17 +1096,32 @@ def update_one_plugin(platform: str, args: argparse.Namespace) -> dict[str, obje
 
     copy_tree(source, install_root)
     server_path = install_root / "dist" / "server.js"
-    write_json(mcp_target, mcp_json(server_path, agent, vault, Path(args.socket).expanduser(), stamp_workspace, target_path=None, explicit_workspace=explicit_workspace, pre_existing_env=pre_mcp_env, afm_env=afm_env))
+    platform_name = canonical_platform(platform)
+    effective_stamp_workspace = (
+        Path("workspace-unknown")
+        if platform_name in {"cursor", "grok"} and not explicit_workspace
+        else stamp_workspace
+    )
+    mcp_payload = mcp_json(
+        server_path, agent, vault, Path(args.socket).expanduser(), effective_stamp_workspace,
+        target_path=None, explicit_workspace=explicit_workspace,
+        pre_existing_env=pre_mcp_env, afm_env=afm_env,
+    )
+    write_json(mcp_target, mcp_payload)
 
     config_kind = str(spec["config_kind"])
     if config_kind == "toml":
-        update_toml_mcp_config(Path(spec["config"]).expanduser(), server_path, agent, vault, Path(args.socket).expanduser(), stamp_workspace, explicit_workspace=explicit_workspace, afm_env=afm_env)
+        update_toml_mcp_config(Path(spec["config"]).expanduser(), server_path, agent, vault, Path(args.socket).expanduser(), effective_stamp_workspace, explicit_workspace=explicit_workspace, afm_env=afm_env)
     elif config_kind == "claude-json":
         update_claude_config(server_path, agent, vault, Path(args.socket).expanduser(), stamp_workspace, afm_env)
     elif config_kind == "kilo-json":
         update_kilo_config(server_path, agent, vault, Path(args.socket).expanduser(), stamp_workspace, afm_env)
     elif config_kind == "cursor-json":
-        update_cursor_config(install_root, server_path, agent, vault, Path(args.socket).expanduser(), stamp_workspace, afm_env)
+        cursor_workspace = stamp_workspace if explicit_workspace else Path("workspace-unknown")
+        update_cursor_config(
+            install_root, server_path, agent, vault, Path(args.socket).expanduser(),
+            cursor_workspace, afm_env, explicit_workspace=explicit_workspace,
+        )
     elif config_kind == "gemini-manifest":
         update_gemini_manifest(install_root, agent, vault, Path(args.socket).expanduser(), stamp_workspace, afm_env)
     elif config_kind == "antigravity":
@@ -1053,6 +1130,12 @@ def update_one_plugin(platform: str, args: argparse.Namespace) -> dict[str, obje
         update_gemini_manifest(install_root, agent, vault, Path(args.socket).expanduser(), stamp_workspace, afm_env)
         antigravity_result = update_antigravity_config(
             install_root, agent, vault, Path(args.socket).expanduser(), stamp_workspace, afm_env
+        )
+
+    if canonical_platform(platform) == "grok":
+        grok_workspace = Path(mcp_payload["mcpServers"]["minni"]["env"]["MINNI_WORKSPACE_ID"])
+        update_grok_hooks(
+            install_root, agent, vault, Path(args.socket).expanduser(), grok_workspace,
         )
 
     # #133: both gemini-family kinds share the ~/.gemini tree, so both wire the

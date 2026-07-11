@@ -22,11 +22,12 @@ def test_cursor_config_is_portable_and_preserves_unrelated_entries(tmp_path):
             ]
         },
     }))
-    install = cursor / "plugins" / "minni@minni"
+    install = cursor / "plugins" / "local" / "minni"
     server = install / "dist" / "server.js"
     propagate.update_cursor_config(
         install, server, "cursor", tmp_path / ".minni/cursor-vault",
         tmp_path / ".minni/run/minnid.sock", tmp_path / "workspace", home=tmp_path,
+        explicit_workspace=True,
     )
     mcp = json.loads((cursor / "mcp.json").read_text())
     assert mcp["mcpServers"]["other"] == {"command": "other"}
@@ -50,7 +51,7 @@ def test_cursor_config_is_portable_and_preserves_unrelated_entries(tmp_path):
 
 
 def test_cursor_update_is_idempotent(tmp_path):
-    install = tmp_path / ".cursor/plugins/minni@minni"
+    install = tmp_path / ".cursor/plugins/local/minni"
     args = (install, install / "dist/server.js", "cursor", tmp_path / ".minni/cursor-vault",
             tmp_path / ".minni/run/minnid.sock", tmp_path / "workspace")
     propagate.update_cursor_config(*args, home=tmp_path)
@@ -73,3 +74,51 @@ def test_cursor_hook_command_stamps_installer_overrides(tmp_path):
     assert "MINNI_CURSOR_AGENT_ID=cursor-alt" in command
     assert "MINNI_CURSOR_VAULT_PATH=" in command and "alt vault" in command
     assert "MINNI_CURSOR_WORKSPACE_ID=workspace-repo" in command
+
+
+def test_cursor_flagless_update_preserves_existing_workspace_and_fresh_fails_closed(tmp_path):
+    cursor = tmp_path / ".cursor"
+    cursor.mkdir()
+    install = cursor / "plugins/local/minni"
+    server = install / "dist/server.js"
+    mcp = {"mcpServers": {"minni": {"env": {"MINNI_WORKSPACE_ID": "workspace-existing"}}}}
+    (cursor / "mcp.json").write_text(json.dumps(mcp))
+    propagate.update_cursor_config(
+        install, server, "cursor", tmp_path / ".minni/cursor-vault",
+        tmp_path / ".minni/run/minnid.sock", Path("workspace-unknown"), home=tmp_path,
+    )
+    updated = json.loads((cursor / "mcp.json").read_text())
+    assert updated["mcpServers"]["minni"]["env"]["MINNI_WORKSPACE_ID"] == "workspace-existing"
+    command = json.loads((install / "hooks/hooks-cursor.json").read_text())["hooks"]["sessionStart"][0]["command"]
+    assert "MINNI_CURSOR_WORKSPACE_ID=workspace-existing" in command
+
+    fresh = tmp_path / "fresh"
+    propagate.update_cursor_config(
+        fresh / ".cursor/plugins/local/minni", fresh / ".cursor/plugins/local/minni/dist/server.js",
+        "cursor", fresh / ".minni/cursor-vault", fresh / ".minni/run/minnid.sock",
+        Path("workspace-unknown"), home=fresh,
+    )
+    fresh_mcp = json.loads((fresh / ".cursor/mcp.json").read_text())
+    assert fresh_mcp["mcpServers"]["minni"]["env"]["MINNI_WORKSPACE_ID"] == "workspace-unknown"
+
+
+def test_cursor_migrates_only_recognized_legacy_install(tmp_path):
+    cursor = tmp_path / ".cursor"
+    legacy = cursor / "plugins/minni@minni"
+    legacy.mkdir(parents=True)
+    (legacy / "package.json").write_text(json.dumps({"name": "minni-multi-plugin"}))
+    install = cursor / "plugins/local/minni"
+    propagate.update_cursor_config(
+        install, install / "dist/server.js", "cursor", tmp_path / "vault", tmp_path / "socket",
+        Path("workspace-unknown"), home=tmp_path,
+    )
+    assert not legacy.exists()
+    archived = list((cursor / "legacy-plugins").glob("minni@minni-pre-native*"))
+    assert len(archived) == 1
+    assert not archived[0].is_symlink()
+
+    unrelated = cursor / "plugins/minni@minni"
+    unrelated.mkdir(parents=True)
+    (unrelated / "package.json").write_text(json.dumps({"name": "not-minni"}))
+    assert propagate.migrate_legacy_cursor_install(cursor, install) is None
+    assert unrelated.exists()

@@ -77,6 +77,12 @@ developer-specific absolute path): `~/.cursor/hooks.json`,
 installer may merge Minni entries into those JSON files, but must preserve
 unrelated hooks and MCP servers and remain idempotent.
 
+For Grok, `~/.grok/hooks/minni.json` must invoke the installed
+`dist/grok-hook.js` and stamp `MINNI_GROK_AGENT_ID`,
+`MINNI_GROK_VAULT_PATH`, and `MINNI_GROK_WORKSPACE_ID`. A Grok hook command
+containing `dist/hook.js` or `MINNI_CLAUDECODE_*` is confirmed foreign-adapter
+drift and must be routed to `minni-install --platform grok`.
+
 | Check | Healthy | Finding |
 |---|---|---|
 | SessionStart envelope | `<minni:context event="SessionStart">` with identity, audit tail, pending_learnings | Hook not registered in THIS platform's native config |
