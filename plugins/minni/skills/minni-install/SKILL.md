@@ -92,7 +92,7 @@ system/developer instructions, safety policy, and active user request.
    - Prefer Minni MCP tools.
    - If MCP transport is stale or fails on a non-canonical socket, use the
      installed plugin CLI with the canonical socket:
-     `MINNI_SOCKET_PATH=~/.minni/run/minnid.sock node ~/.codex/plugins/cache/minni/minni/0.1.0/dist/cli.js status`
+     `minni status`
    - Verify the daemon sees the active Minni DB before changing
      paths. A healthy baseline typically shows several hundred documents, hundreds
      of chunks, and over a thousand learnings with FAISS healthy.

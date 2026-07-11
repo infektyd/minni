@@ -28,6 +28,13 @@ _migrations_run = False
 # process-wide flag was already set by an earlier test's db.
 _migrated_paths: set = set()
 _migrations_lock = threading.Lock()
+# Schema creation includes DROP/CREATE trigger pairs and FTS5 virtual-table
+# initialization.  Different SovereignDB instances can be constructed by the
+# daemon's background loops at the same time, so an instance-local lock is not
+# sufficient: their schema transactions can interleave and leave one
+# connection unable to construct vault_fts.  Serialize schema initialization
+# process-wide while retaining the per-instance fast path below.
+_schema_init_lock = threading.RLock()
 
 
 class SovereignDB:
@@ -46,21 +53,25 @@ class SovereignDB:
     def _get_conn(self) -> sqlite3.Connection:
         """Get thread-local connection (one connection per thread)."""
         if not hasattr(self._local, "conn") or self._local.conn is None:
-            conn = sqlite3.connect(
-                self.config.db_path,
-                timeout=30,
-                check_same_thread=False
-            )
-            # WAL mode: concurrent readers, non-blocking writes
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA synchronous=NORMAL")
-            conn.execute("PRAGMA cache_size=-64000")  # 64MB cache
-            conn.execute("PRAGMA foreign_keys=ON")
-            conn.row_factory = sqlite3.Row
-            self._local.conn = conn
+            # journal_mode is a persistent database write.  Serialize first
+            # connection setup with schema creation so fresh daemon workers do
+            # not race WAL activation against virtual-table/trigger creation.
+            with _schema_init_lock:
+                conn = sqlite3.connect(
+                    self.config.db_path,
+                    timeout=30,
+                    check_same_thread=False
+                )
+                # WAL mode: concurrent readers, non-blocking writes
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("PRAGMA synchronous=NORMAL")
+                conn.execute("PRAGMA cache_size=-64000")  # 64MB cache
+                conn.execute("PRAGMA foreign_keys=ON")
+                conn.row_factory = sqlite3.Row
+                self._local.conn = conn
 
         if not self._schema_initialized:
-            with self._lock:
+            with _schema_init_lock, self._lock:
                 if not self._schema_initialized:
                     self._init_schema(self._local.conn)
                     self._schema_initialized = True
