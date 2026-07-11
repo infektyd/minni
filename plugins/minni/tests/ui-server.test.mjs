@@ -672,6 +672,42 @@ test("/api/recall-state returns present=false when no state file (not an error)"
   }
 });
 
+// A vault outside $HOME must not leak its raw absolute path on the present:false
+// or error branches — only the present:true branch was redacted before this fix.
+test("/api/recall-state redacts a non-$HOME vault path on the present:false branch", async () => {
+  const server = await startTestServer({
+    vaultPath: "/Users/notme/external-secret-project/vault",
+    readRecallState: async () => null,
+  });
+  try {
+    const res = await fetch(`${server.baseUrl}/api/recall-state`, { headers: authHeaders() });
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.present, false);
+    assert.doesNotMatch(JSON.stringify(body), /\/Users\/notme/);
+  } finally {
+    await server.close();
+  }
+});
+
+test("/api/recall-state redacts a non-$HOME vault path on the error branch", async () => {
+  const server = await startTestServer({
+    vaultPath: "/Users/notme/external-secret-project/vault",
+    readRecallState: async () => {
+      throw new Error("EACCES reading /Users/notme/external-secret-project/vault/recall-state.json");
+    },
+  });
+  try {
+    const res = await fetch(`${server.baseUrl}/api/recall-state`, { headers: authHeaders() });
+    assert.equal(res.status, 502);
+    const body = await res.json();
+    assert.equal(body.present, false);
+    assert.doesNotMatch(JSON.stringify(body), /\/Users\/notme/);
+  } finally {
+    await server.close();
+  }
+});
+
 test("/api/recall-state returns state when present", async () => {
   const server = await startTestServer({
     readRecallState: async () => ({
@@ -892,24 +928,48 @@ test("/api/recall-state returns 502 when reader throws", async () => {
   }
 });
 
-test("agentIdFromVaultDir maps claudecode-vault → claude-code", async () => {
+test("agentIdFromVaultDir maps claudecode-vault → claude-code (reuses vault.ts getAgentIdFromVaultPath)", async () => {
   const { agentIdFromVaultDir } = await import("../dist/ui-server.js");
-  assert.equal(agentIdFromVaultDir("claudecode-vault"), "claude-code");
-  assert.equal(agentIdFromVaultDir("codex-vault"), "codex");
-  assert.equal(agentIdFromVaultDir("grok-build-vault"), "grok-build");
+  const { getAgentIdFromVaultPath } = await import("../dist/vault.js");
+  assert.equal(agentIdFromVaultDir, getAgentIdFromVaultPath, "ui-server must re-export the vault.ts helper, not reimplement it");
+
+  const pathMod = await import("node:path");
+  const { mkdtempSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const home = mkdtempSync(pathMod.join(tmpdir(), "minni-agentid-"));
+
+  // "claudecode-vault" only maps to "claude-code" via the hardcoded ~/.minni
+  // path or a MINNI_CLAUDECODE_VAULT_PATH override — exercise the override so
+  // this test does not depend on the real $HOME layout.
+  const claudecodeVault = pathMod.join(home, "claudecode-vault");
+  const original = process.env.MINNI_CLAUDECODE_VAULT_PATH;
+  process.env.MINNI_CLAUDECODE_VAULT_PATH = claudecodeVault;
+  try {
+    assert.equal(agentIdFromVaultDir(claudecodeVault), "claude-code");
+  } finally {
+    if (original === undefined) delete process.env.MINNI_CLAUDECODE_VAULT_PATH;
+    else process.env.MINNI_CLAUDECODE_VAULT_PATH = original;
+  }
+
+  // Unmapped basenames fall back to stripping the "-vault" suffix.
+  assert.equal(agentIdFromVaultDir(pathMod.join(home, "codex-vault")), "codex");
+  assert.equal(agentIdFromVaultDir(pathMod.join(home, "grok-build-vault")), "grok-build");
 });
 
 test("buildPolicyReport pulls caps + intent routing without inventing automaticLearning", async () => {
   const { buildPolicyReport } = await import("../dist/ui-server.js");
+  const { DEFAULT_AGENT_ID } = await import("../dist/config.js");
   const { mkdtempSync, mkdirSync, writeFileSync } = await import("node:fs");
   const { tmpdir } = await import("node:os");
   const pathMod = await import("node:path");
   const home = mkdtempSync(pathMod.join(tmpdir(), "minni-policy-"));
   mkdirSync(pathMod.join(home, "principals"), { recursive: true });
+  // Own-principal file keyed to the console agent's own id (not "main") — caps
+  // must come from the agent's own file, never the operator's "main" fallback.
   writeFileSync(
-    pathMod.join(home, "principals", "main.json"),
+    pathMod.join(home, "principals", `${DEFAULT_AGENT_ID}.json`),
     JSON.stringify({
-      agent_id: "main",
+      agent_id: DEFAULT_AGENT_ID,
       capabilities: ["search", "read", "learn", "handoff"],
     }),
   );
@@ -928,7 +988,31 @@ test("buildPolicyReport pulls caps + intent routing without inventing automaticL
   assert.equal(report.caps.H, 1);
   assert.ok(report.intentRouting);
   assert.equal(report.automaticLearning, undefined);
+  assert.equal(report.capsSource, "own_principal");
   assert.ok(!JSON.stringify(report).includes("v4.2"));
+});
+
+test("buildPolicyReport default-denies when the agent has no own principal file (no 'main' fallback)", async () => {
+  const { buildPolicyReport } = await import("../dist/ui-server.js");
+  const { mkdtempSync, mkdirSync, writeFileSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const pathMod = await import("node:path");
+  const home = mkdtempSync(pathMod.join(tmpdir(), "minni-policy-nofallback-"));
+  mkdirSync(pathMod.join(home, "principals"), { recursive: true });
+  // Only the operator's "main" principal exists — the console agent (DEFAULT_AGENT_ID,
+  // "unknown-agent" by default in test env) has no principals/<agentId>.json.
+  writeFileSync(
+    pathMod.join(home, "principals", "main.json"),
+    JSON.stringify({ agent_id: "main", capabilities: ["*"] }),
+  );
+  const report = await buildPolicyReport({
+    homePath: home,
+    vaultPath: pathMod.join(home, "unknown-vault"),
+    status: async () => ({ afm: { ok: true, data: { status: "ok" } } }),
+  });
+  assert.deepEqual(report.caps, { R: 0, L: 0, H: 0 }, "must not inherit main's caps");
+  assert.equal(report.capsSource, "default_deny");
+  assert.ok(report.principalsKnown.includes("main"), "main is still visible in the known-principals list");
 });
 
 test("buildAgentsCatalogue is fail-loud on staged RPC and skips symlink vaults", async () => {
@@ -966,4 +1050,50 @@ test("buildAgentsCatalogue is fail-loud on staged RPC and skips symlink vaults",
   assert.equal(codex.staged, null);
   assert.equal(codex.stagedUnknown, true);
   assert.ok(!("vaultPath" in codex) || codex.vaultPath === undefined);
+});
+
+test("buildAgentsCatalogue flags stagedAtLimit when the RPC returns a full page, and preserves order under concurrency", async () => {
+  const { buildAgentsCatalogue } = await import("../dist/ui-server.js");
+  const { mkdtempSync, mkdirSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const pathMod = await import("node:path");
+  const home = mkdtempSync(pathMod.join(tmpdir(), "minni-agents-limit-"));
+  // Three vaults, deliberately created so a naive concurrent scan without
+  // ordering care could interleave; agents.map(a => a.id) must still come
+  // back alphabetically sorted (alpha, bravo, codex) like the old sequential loop.
+  for (const name of ["codex-vault", "bravo-vault", "alpha-vault"]) {
+    mkdirSync(pathMod.join(home, name), { recursive: true });
+  }
+
+  const callOrder = [];
+  const catalogue = await buildAgentsCatalogue({
+    homePath: home,
+    auditTailFn: async (vaultPath) => {
+      // codex resolves slowest, to prove ordering doesn't depend on completion time.
+      const delayMs = vaultPath.includes("codex") ? 15 : 1;
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+      return { entries: [] };
+    },
+    daemonRpc: async (method, params) => {
+      callOrder.push(params.agent_id);
+      if (params.agent_id === "codex") {
+        // Full page: count is a floor, not the true total.
+        return { candidates: Array.from({ length: 200 }, (_, i) => ({ candidate_id: i })), count: 200 };
+      }
+      return { candidates: [], count: 0 };
+    },
+  });
+
+  assert.deepEqual(catalogue.agents.map((a) => a.id), ["alpha", "bravo", "codex"], "output order matches sorted vault dirs");
+  // The RPCs themselves ran concurrently (not sequentially in sorted order).
+  assert.ok(callOrder.length === 3);
+
+  const codex = catalogue.agents.find((a) => a.id === "codex");
+  assert.equal(codex.staged, 200);
+  assert.equal(codex.stagedAtLimit, true);
+  assert.equal(codex.stagedUnknown, false);
+
+  const alpha = catalogue.agents.find((a) => a.id === "alpha");
+  assert.equal(alpha.staged, 0);
+  assert.equal(alpha.stagedAtLimit, false);
 });

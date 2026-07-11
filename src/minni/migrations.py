@@ -283,6 +283,10 @@ def _apply_migration_015_candidate_status_expand(conn: sqlite3.Connection) -> No
     Must run with foreign_keys OFF **outside** a transaction: SQLite treats
     PRAGMA foreign_keys=OFF as a no-op inside BEGIN, and DROP would fail when
     contradiction_log.resolution_id references candidate_packets.
+
+    The final RENAME uses PRAGMA legacy_alter_table=ON so SQLite does not
+    re-parse unrelated triggers (e.g. dangling learnings_fts triggers on
+    partial test schemas missing the virtual table).
     """
     if _candidate_status_check_allows_dns_log_only(conn):
         logger.info("Migration 015: candidate_packets CHECK already expanded — no-op")
@@ -337,7 +341,11 @@ def _apply_migration_015_candidate_status_expand(conn: sqlite3.Connection) -> No
             """
         )
         conn.execute("DROP TABLE candidate_packets")
-        conn.execute("ALTER TABLE candidate_packets_015 RENAME TO candidate_packets")
+        conn.execute("PRAGMA legacy_alter_table=ON")
+        try:
+            conn.execute("ALTER TABLE candidate_packets_015 RENAME TO candidate_packets")
+        finally:
+            conn.execute("PRAGMA legacy_alter_table=OFF")
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_candidate_principal_status_time "
             "ON candidate_packets (principal, status, proposed_at DESC)"

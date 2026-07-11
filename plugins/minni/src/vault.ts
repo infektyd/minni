@@ -548,7 +548,7 @@ function escapeAuditDetailsBlock(raw: string): string {
   return block;
 }
 
-function getAgentIdFromVaultPath(vaultPath: string): string {
+export function getAgentIdFromVaultPath(vaultPath: string): string {
   const absPath = path.resolve(vaultPath.replace(/^~(?=$|\/)/, os.homedir()));
 
   const mappingRaw = process.env.MINNI_AGENT_VAULTS;

@@ -7,6 +7,8 @@
 // and distinct from error (hooks surface error → OFFLINE zone UI).
 // ============================================================================
 
+import type { AgentApiRow, HandoffRow, PolicyReport, RecallStateResponse } from "../api";
+
 export type ZoneId = "agents" | "hub" | "staged" | "logs" | "quarantine" | "recall";
 export type ZoneStatus = "online" | "pending" | "private" | "danger";
 
@@ -64,6 +66,8 @@ export interface BoardAgent {
   /** null when staged count is unknown (daemon RPC failed) — UI shows "—". */
   staged: number | null;
   stagedUnknown?: boolean;
+  /** true when staged is a floor (server query hit its limit). */
+  stagedAtLimit?: boolean;
   note?: string;
 }
 
@@ -126,19 +130,7 @@ export interface CandidateRow {
   reason?: string;
 }
 
-export interface AgentRow {
-  id: string;
-  vault?: string;
-  vaultPath?: string;
-  seen?: string;
-  lastSeenAt?: number | null;
-  on?: boolean;
-  caps?: AgentCaps | { R?: number; L?: number; H?: number };
-  /** null when daemon list_candidates failed (fail-loud; not 0). */
-  staged?: number | null;
-  stagedUnknown?: boolean;
-  note?: string;
-}
+export type AgentRow = AgentApiRow;
 
 export interface RecallStateHit {
   title?: string;
@@ -146,50 +138,7 @@ export interface RecallStateHit {
   score?: number;
 }
 
-export interface RecallStatePayload {
-  present: boolean;
-  state: {
-    task_signature?: string;
-    intent?: string;
-    top_hits?: RecallStateHit[];
-    top_score?: number;
-    consumed?: boolean;
-    ts?: string;
-  } | null;
-  message?: string | null;
-  vaultPath?: string;
-}
-
-export interface HandoffRow {
-  lease_id?: string;
-  from_agent?: string;
-  to_agent?: string;
-  task?: string;
-  expires_at?: string | null;
-  path?: string;
-}
-
-export interface PolicyReport {
-  agentId?: string;
-  stampedForCandidates?: string | null;
-  unknownAgent?: boolean;
-  resolveOperatorsEnv?: boolean;
-  caps?: AgentCaps;
-  principalsKnown?: string[];
-  automaticLearning?: boolean;
-  intentRouting?: {
-    sampleTask?: string;
-    action?: string;
-    confidence?: number;
-    automaticAllowed?: boolean;
-    reason?: string;
-  };
-  afm?: Record<string, unknown>;
-  policyModule?: string;
-  source?: string;
-  ok?: boolean;
-  error?: string;
-}
+export type RecallStatePayload = RecallStateResponse;
 
 /**
  * Humanizes age from proposed_at timestamp (e.g. "4h", "2d")
@@ -398,6 +347,7 @@ export function mapAgentRow(row: AgentRow): BoardAgent {
     },
     staged: stagedUnknown ? null : (row.staged as number),
     stagedUnknown,
+    stagedAtLimit: row.stagedAtLimit === true,
     note: stagedUnknown
       ? row.note
         ? `${row.note}; staged unknown`

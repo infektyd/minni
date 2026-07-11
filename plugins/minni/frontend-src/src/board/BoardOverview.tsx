@@ -100,8 +100,20 @@ function FlowLayer({
         const step = p.flow.steps[p.step];
         const path = paths[step.l];
         if (!path) {
-          p.el.remove();
-          pulses.splice(i, 1);
+          // No rendered link for this leg (e.g. an "ag-unknown" agent edge, or a
+          // named agent absent from the live catalogue). Skip just this leg and
+          // advance — the real hub legs must still animate, so we must not drop
+          // the whole multi-leg pulse.
+          if (p.pathEl) {
+            leaveSegment(p.pathEl);
+            p.pathEl = null;
+          }
+          p.step++;
+          p.start = now;
+          if (p.step >= p.flow.steps.length) {
+            p.el.remove();
+            pulses.splice(i, 1);
+          }
           continue;
         }
         const len = path.getTotalLength();
@@ -463,21 +475,23 @@ export function BoardOverview({
       {label}
     </div>
   );
-  /** Overview chip aligned with detail zoneGate: loading ≠ offline. */
+  /** Overview chip aligned with detail zoneGate: loading ≠ offline. `liveBody`
+   * is lazy so an offline/empty zone never evaluates it — the live branches
+   * dereference index 0, which would throw on the empty default-install state. */
   const zoneChip = (
     state: { isLive: boolean; loading: boolean; error: string | null } | undefined,
     offlineLabel: string,
     loadingLabel: string,
     emptyLabel: string,
     empty: boolean,
-    liveBody: ReactNode,
+    liveBody: () => ReactNode,
   ) => {
     if (state && !state.isLive) {
       if (state.loading && !state.error) return offlineChip(loadingLabel);
       return offlineChip(offlineLabel);
     }
     if (empty) return offlineChip(emptyLabel);
-    return liveBody;
+    return liveBody();
   };
 
   return (
@@ -497,7 +511,9 @@ export function BoardOverview({
           "RUNTIMES · …",
           "no vaults",
           agents.length === 0,
-          agents.slice(0, 6).map((a, i) => (
+          () => (
+            <>
+              {agents.slice(0, 6).map((a, i) => (
                 <div
                   key={a.id}
                   className="node"
@@ -519,7 +535,17 @@ export function BoardOverview({
                     <span className={"bd-chip " + (a.caps.H ? "ok" : "no")}>H</span>
                   </div>
                 </div>
-              )),
+              ))}
+              {agentsState?.isLive && agents.length > 6 ? (
+                <div
+                  className="more-chip"
+                  style={{ left: L.agents.nodeX, top: L.agents.nodeY0 + 6 * L.agents.nodeGap }}
+                >
+                  + {agents.length - 6} more · click zone to expand
+                </div>
+              ) : null}
+            </>
+          ),
         )}
       </ZoneBox>
 
@@ -543,6 +569,7 @@ export function BoardOverview({
           "STAGED · …",
           "none staged",
           top4.length === 0,
+          () => (
           <>
             {top4.map((l, i) => {
               const slot = stagedSlot(i);
@@ -569,7 +596,8 @@ export function BoardOverview({
                 + {learnings.length - top4.length} more · click zone to expand
               </div>
             ) : null}
-          </>,
+          </>
+          ),
         )}
       </ZoneBox>
 
@@ -580,6 +608,7 @@ export function BoardOverview({
           "LOG-ONLY · …",
           "no log-only",
           logs.length === 0,
+          () => (
           <>
             <OvCard
               x={L.logs.card.x}
@@ -601,7 +630,8 @@ export function BoardOverview({
                 + {logs.length - 1} more
               </div>
             ) : null}
-          </>,
+          </>
+          ),
         )}
       </ZoneBox>
 
@@ -612,19 +642,21 @@ export function BoardOverview({
           "QUARANTINE · …",
           "quarantine clear",
           denies.length === 0,
-          <OvCard
-            x={L.quarantine.card.x}
-            y={L.quarantine.card.y}
-            w={L.quarantine.card.w}
-            deny
-            klass="deny"
-            klassLabel="DENY"
-            tag="DO-NOT-STORE"
-            tagCls="warn"
-            score={denies[0].score > 0 ? denies[0].score.toFixed(2) : "—"}
-            title={denies[0].title}
-            meta={denies[0].id + " · " + denies[0].agent}
-          />,
+          () => (
+            <OvCard
+              x={L.quarantine.card.x}
+              y={L.quarantine.card.y}
+              w={L.quarantine.card.w}
+              deny
+              klass="deny"
+              klassLabel="DENY"
+              tag="DO-NOT-STORE"
+              tagCls="warn"
+              score={denies[0].score > 0 ? denies[0].score.toFixed(2) : "—"}
+              title={denies[0].title}
+              meta={denies[0].id + " · " + denies[0].agent}
+            />
+          ),
         )}
       </ZoneBox>
 
@@ -640,6 +672,7 @@ export function BoardOverview({
           "RECALL · …",
           "",
           false,
+          () => (
           <>
             <div className="qcard" style={{ left: L.recall.qcard.x, top: L.recall.qcard.y }}>
               <div className="ql">RECALL · LAST QUERY · CITED, NEVER OBEYED</div>
@@ -662,7 +695,8 @@ export function BoardOverview({
                 meta={r.path + " · " + r.age}
               />
             ))}
-          </>,
+          </>
+          ),
         )}
       </ZoneBox>
     </div>

@@ -10,7 +10,7 @@ import { promisify } from "node:util";
 import { DEFAULT_AGENT_ID, DEFAULT_VAULT_PATH, PLUGIN_ROOT, minniHome } from "./config.js";
 import { buildStatusReport } from "./sovereign.js";
 import { prepareOutcome, prepareTask, type PrepareOutcomeInput, type PrepareTaskInput } from "./task.js";
-import { auditTail } from "./vault.js";
+import { auditTail, getAgentIdFromVaultPath } from "./vault.js";
 import { readRecallState } from "./recall-state.js";
 import { routeMemoryIntent } from "./policy.js";
 
@@ -229,12 +229,13 @@ export function consolePrincipalReport(): {
 
 // ── agents catalogue helpers ────────────────────────────────────────────────
 
-/** Map vault directory basename (e.g. claudecode-vault) → agent id. */
-export function agentIdFromVaultDir(dirName: string): string {
-  const base = dirName.replace(/-vault$/i, "");
-  if (base === "claudecode" || base === "claude") return "claude-code";
-  return base;
-}
+/**
+ * Map a vault directory path → agent id. Delegates to vault.ts's
+ * getAgentIdFromVaultPath, which additionally honors the MINNI_AGENT_VAULTS
+ * principals mapping and MINNI_*_VAULT_PATH env overrides — the local
+ * reimplementation this replaced only matched hardcoded basenames.
+ */
+export const agentIdFromVaultDir = getAgentIdFromVaultPath;
 
 function homeDisplayPath(absPath: string): string {
   const home = os.homedir();
@@ -374,64 +375,76 @@ export async function buildAgentsCatalogue(options: {
     return { agents: [], count: 0 };
   }
 
-  const vaultDirs = dirs.filter((d) => d.endsWith("-vault"));
-  const agents: Array<Record<string, unknown>> = [];
+  const STAGED_QUERY_LIMIT = 200;
   const now = Date.now();
 
-  for (const dir of vaultDirs.sort()) {
-    const vaultAbs = path.join(homePath, dir);
-    if (!vaultPathContained(vaultAbs, homePath)) continue;
+  // Resolve (dir, vaultAbs, id) up front, sorted, so Promise.all below preserves
+  // the same output ordering the old sequential loop produced — the per-vault
+  // audit-tail read and list_candidates RPC then run concurrently rather than
+  // blocking one vault's scan on the previous vault's daemon round-trip.
+  const vaultDirs = dirs.filter((d) => d.endsWith("-vault")).sort();
+  const targets = vaultDirs
+    .map((dir) => {
+      const vaultAbs = path.join(homePath, dir);
+      const id = agentIdFromVaultDir(vaultAbs);
+      return { dir, vaultAbs, id };
+    })
+    .filter(({ vaultAbs, id }) => vaultPathContained(vaultAbs, homePath) && AGENT_ID_RE.test(id));
 
-    const id = agentIdFromVaultDir(dir);
-    // Skip vault basenames that would not be valid daemon agent ids.
-    if (!AGENT_ID_RE.test(id)) continue;
-
-    let lastSeenMs: number | null = null;
-    try {
-      const tail = await tailFn(vaultAbs, 5);
-      for (const entry of [...(tail.entries || [])].reverse()) {
-        const ms = parseAuditTimestampMs(entry);
-        if (ms != null) {
-          lastSeenMs = ms;
-          break;
+  const agents = await Promise.all(
+    targets.map(async ({ vaultAbs, id }) => {
+      let lastSeenMs: number | null = null;
+      try {
+        const tail = await tailFn(vaultAbs, 5);
+        for (const entry of [...(tail.entries || [])].reverse()) {
+          const ms = parseAuditTimestampMs(entry);
+          if (ms != null) {
+            lastSeenMs = ms;
+            break;
+          }
         }
+      } catch {
+        // audit unavailable — honest "—" for seen
       }
-    } catch {
-      // audit unavailable — honest "—" for seen
-    }
 
-    let staged: number | null = null;
-    let stagedUnknown = false;
-    try {
-      const rpc = await options.daemonRpc("list_candidates", {
-        limit: 200,
-        status: "proposed",
-        agent_id: id,
-      });
-      const unwrapped = unwrapDaemonCandidates(rpc);
-      staged = unwrapped.candidates.length;
-    } catch {
-      // Fail-loud: do not invent 0 when the RPC failed.
-      staged = null;
-      stagedUnknown = true;
-    }
+      let staged: number | null = null;
+      let stagedUnknown = false;
+      let stagedAtLimit = false;
+      try {
+        const rpc = await options.daemonRpc("list_candidates", {
+          limit: STAGED_QUERY_LIMIT,
+          status: "proposed",
+          agent_id: id,
+        });
+        const unwrapped = unwrapDaemonCandidates(rpc);
+        staged = unwrapped.candidates.length;
+        // A full page means there may be more rows beyond the query limit —
+        // report the count as a floor rather than silently capping it.
+        stagedAtLimit = staged === STAGED_QUERY_LIMIT;
+      } catch {
+        // Fail-loud: do not invent 0 when the RPC failed.
+        staged = null;
+        stagedUnknown = true;
+      }
 
-    const caps = capsMap.get(id) ?? { R: 0 as const, L: 0 as const, H: 0 as const };
-    const seen = humanizeSeen(lastSeenMs, now);
-    const on = lastSeenMs != null && now - lastSeenMs < 60 * 60 * 1000;
+      const caps = capsMap.get(id) ?? { R: 0 as const, L: 0 as const, H: 0 as const };
+      const seen = humanizeSeen(lastSeenMs, now);
+      const on = lastSeenMs != null && now - lastSeenMs < 60 * 60 * 1000;
 
-    agents.push({
-      id,
-      vault: homeDisplayPath(vaultAbs),
-      // Display path only — no absolute vaultPath on the wire (path leak).
-      seen,
-      lastSeenAt: lastSeenMs,
-      on,
-      caps,
-      staged,
-      stagedUnknown,
-    });
-  }
+      return {
+        id,
+        vault: homeDisplayPath(vaultAbs),
+        // Display path only — no absolute vaultPath on the wire (path leak).
+        seen,
+        lastSeenAt: lastSeenMs,
+        on,
+        caps,
+        staged,
+        stagedUnknown,
+        stagedAtLimit,
+      };
+    }),
+  );
 
   return { agents, count: agents.length };
 }
@@ -470,7 +483,12 @@ export async function buildPolicyReport(options: {
   const capsMap = await loadAgentCapsMap(options.homePath);
   const agentId = DEFAULT_AGENT_ID;
   const stamped = candidatesAgentId(null) ?? null;
-  const myCaps = capsMap.get(agentId) ?? capsMap.get("main") ?? { R: 0, L: 0, H: 0 };
+  // No fallback to the operator's "main" principal: a console agent without its
+  // own principals/<agentId>.json file is default-deny, matching daemon-side
+  // resolution for this caller class — not silently granted the operator's caps.
+  const ownCaps = capsMap.get(agentId);
+  const myCaps = ownCaps ?? { R: 0, L: 0, H: 0 };
+  const capsSource = ownCaps ? "own_principal" : "default_deny";
 
   // Intent routing sample — live policy.ts heuristic, not a version brand.
   const sampleIntent = routeMemoryIntent("what did we decide about handoffs?");
@@ -500,6 +518,7 @@ export async function buildPolicyReport(options: {
     unknownAgent: agentId === "unknown-agent",
     resolveOperatorsEnv: Boolean((process.env.MINNI_RESOLVE_OPERATORS ?? "").trim()),
     caps: myCaps,
+    capsSource,
     principalsKnown: [...capsMap.keys()].sort(),
     ...(automaticLearning === undefined ? {} : { automaticLearning }),
     intentRouting: {
@@ -1050,12 +1069,12 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         try {
           const state = await recallStateReader(vaultPath);
           if (!state) {
-            sendJson(res, 200, {
+            sendJson(res, 200, redactLocalValue({
               present: false,
               state: null,
               message: "no recent recall",
               vaultPath: homeDisplayPath(vaultPath),
-            });
+            }));
             return;
           }
           sendJson(res, 200, redactLocalValue({
@@ -1065,12 +1084,12 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
             vaultPath: homeDisplayPath(vaultPath),
           }));
         } catch (e) {
-          sendJson(res, 502, {
+          sendJson(res, 502, redactLocalValue({
             ok: false,
             error: e instanceof Error ? e.message : String(e),
             present: false,
             state: null,
-          });
+          }));
         }
         return;
       }

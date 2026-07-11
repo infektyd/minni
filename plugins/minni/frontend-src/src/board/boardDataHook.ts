@@ -20,6 +20,7 @@ import {
   type CandidateRow,
   type HandoffRow,
   type PolicyReport,
+  type RecallStateResponse,
 } from "../api";
 import {
   type BoardLearning,
@@ -28,7 +29,6 @@ import {
   type BoardAgent,
   type BoardRecallResult,
   type AgentRow,
-  type RecallStatePayload,
   mapCandidates,
   mapLogOnlyCandidates,
   mapQuarantineCandidates,
@@ -212,7 +212,7 @@ export function useAgents(
 ): ZoneDataState<BoardAgent[]> {
   const fetcher = useCallback(async () => {
     const res = await getAgents();
-    return mapAgents((res.agents || []) as AgentRow[]);
+    return mapAgents(res.agents || []);
   }, []);
   return useZoneFetch<BoardAgent[]>([], fetcher, refreshTrigger, 8000, onAuthRequired);
 }
@@ -263,7 +263,7 @@ export function useRecallState(
     message: "no recent recall",
   };
   const fetcher = useCallback(async () => {
-    const res = (await getRecallState()) as RecallStatePayload;
+    const res = await getRecallState();
     return mapRecallState(res);
   }, []);
   return useZoneFetch<RecallZoneData>(empty, fetcher, refreshTrigger, undefined, onAuthRequired);
@@ -277,7 +277,7 @@ export function useHandoffs(
 ): ZoneDataState<HandoffRow[]> {
   const fetcher = useCallback(async () => {
     const res = await getHandoffs();
-    return (res.handoffs || []) as HandoffRow[];
+    return res.handoffs || [];
   }, []);
   return useZoneFetch<HandoffRow[]>([], fetcher, refreshTrigger, 8000, onAuthRequired);
 }
@@ -289,7 +289,7 @@ export function usePolicy(
   onAuthRequired?: () => void,
 ): ZoneDataState<PolicyReport | null> {
   const fetcher = useCallback(async () => {
-    return (await getPolicy()) as PolicyReport;
+    return await getPolicy();
   }, []);
   return useZoneFetch<PolicyReport | null>(null, fetcher, refreshTrigger, undefined, onAuthRequired);
 }

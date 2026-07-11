@@ -27,7 +27,9 @@ export function VaultsScreen({
               if (!isLive) return "—";
               // Fail-loud: any unknown staged count → header "—" (not sum-as-0).
               if (agents.some((a) => a.staged == null || a.stagedUnknown)) return "—";
-              return String(agents.reduce((n, a) => n + (a.staged as number), 0));
+              const sum = agents.reduce((n, a) => n + (a.staged as number), 0);
+              // Any at-limit count makes the sum a floor, not an exact total.
+              return agents.some((a) => a.stagedAtLimit) ? `${sum}+` : String(sum);
             })(),
           },
           { k: "SOURCE", v: "/api/agents" },
@@ -70,7 +72,7 @@ export function VaultsScreen({
                       seen {a.seen}
                     </span>
                     <span className="bd-chip info" style={{ marginLeft: "auto" }}>
-                      {a.staged == null ? "— staged" : `${a.staged} staged`}
+                      {a.staged == null ? "— staged" : `${a.staged}${a.stagedAtLimit ? "+" : ""} staged`}
                     </span>
                   </div>
                   <div className="mono" style={{ fontSize: 12, marginBottom: 8 }}>

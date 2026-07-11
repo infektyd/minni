@@ -312,6 +312,160 @@ def test_migration_015_survives_contradiction_log_fk(tmp_path):
     conn.close()
 
 
+def _rebuild_candidate_packets_pre_015(db_path):
+    """Shrink candidate_packets back to the pre-015 CHECK (no do_not_store/log_only).
+
+    Models a daemon serving a DB whose migration-015 rebuild never took —
+    db.py treats a failed migrations run as non-fatal (warns, keeps serving),
+    so the CHECK can still be the seven pre-015 statuses at runtime.
+    """
+    conn = sqlite3.connect(db_path)
+    conn.execute("PRAGMA foreign_keys=OFF")
+    conn.execute(
+        """
+        CREATE TABLE candidate_packets_old (
+            candidate_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            principal TEXT NOT NULL,
+            workspace_id TEXT NOT NULL DEFAULT 'default',
+            layer TEXT,
+            privacy_level TEXT,
+            content TEXT NOT NULL,
+            evidence_refs TEXT,
+            derived_from TEXT,
+            instruction_like INTEGER DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'proposed'
+                CHECK (status IN ('proposed','accepted','rejected','redacted','expired','merged','superseded')),
+            proposed_at REAL NOT NULL,
+            resolved_at REAL,
+            resolved_by TEXT,
+            resolution_reason TEXT
+        )
+        """
+    )
+    conn.execute("INSERT INTO candidate_packets_old SELECT * FROM candidate_packets")
+    conn.execute("DROP TABLE candidate_packets")
+    conn.execute("ALTER TABLE candidate_packets_old RENAME TO candidate_packets")
+    conn.commit()
+    conn.close()
+
+
+def test_resolve_degrades_dns_log_only_on_pre_015_schema(tmp_path, monkeypatch):
+    """On an unmigrated (pre-015) schema, do_not_store/log_only must not raise.
+
+    db.py keeps serving a DB whose 015 rebuild failed, so the candidate_packets
+    CHECK can still reject do_not_store/log_only. resolve_candidate must degrade
+    to the legacy 'rejected' status (never strand the candidate in 'proposed')
+    while recording the operator's true intent in resolution_reason.
+    """
+    import minni.minnid as minnid
+    import minni.db as db_mod
+    from minni.migrations import _candidate_status_check_allows_dns_log_only
+
+    db_path = _fresh_db(tmp_path)
+    _rebuild_candidate_packets_pre_015(db_path)
+
+    # Sanity: the runtime schema genuinely rejects the new statuses now.
+    conn = sqlite3.connect(db_path)
+    assert not _candidate_status_check_allows_dns_log_only(conn)
+    conn.close()
+
+    import minni.config as cfg_mod
+    old_db = cfg_mod.DEFAULT_CONFIG.db_path
+    cfg_mod.DEFAULT_CONFIG.db_path = db_path
+    monkeypatch.setattr(minnid, "_writeback", None)
+    # Mark the path already-migrated so SovereignDB does not re-run migrations
+    # and silently re-expand the CHECK — the daemon is serving as-is.
+    db_mod._migrations_run = True
+    db_mod._migrated_paths.add(os.path.abspath(db_path))
+    try:
+        dns = _stage_candidate(
+            {"content": "Poisoned instruction-like candidate", "workspace_id": "default"}, 60
+        )
+        log = _stage_candidate(
+            {"content": "Personal preference log-only note", "workspace_id": "default"}, 61
+        )
+        dns_id = dns["result"]["candidate_id"]
+        log_id = log["result"]["candidate_id"]
+
+        r_dns = _resolve_candidate(
+            {"candidate_id": dns_id, "decision": "do_not_store", "reason": "instruction-like"}, 62
+        )
+        # No exception propagated, and it landed on the legacy status.
+        assert r_dns.get("error") is None, r_dns
+        assert r_dns.get("result", {}).get("new_status") == "rejected", r_dns
+
+        r_log = _resolve_candidate(
+            {"candidate_id": log_id, "decision": "log_only", "reason": "personal"}, 63
+        )
+        assert r_log.get("error") is None, r_log
+        assert r_log.get("result", {}).get("new_status") == "rejected", r_log
+
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        dns_row = conn.execute(
+            "SELECT status, resolution_reason FROM candidate_packets WHERE candidate_id=?",
+            (dns_id,),
+        ).fetchone()
+        log_row = conn.execute(
+            "SELECT status, resolution_reason FROM candidate_packets WHERE candidate_id=?",
+            (log_id,),
+        ).fetchone()
+        conn.close()
+
+        # Status degraded to 'rejected'; the operator's intent is preserved.
+        assert dns_row["status"] == "rejected"
+        assert "intended_status=do_not_store" in dns_row["resolution_reason"]
+        assert "schema pre-015" in dns_row["resolution_reason"]
+        assert "instruction-like" in dns_row["resolution_reason"]
+        assert log_row["status"] == "rejected"
+        assert "intended_status=log_only" in log_row["resolution_reason"]
+        assert "schema pre-015" in log_row["resolution_reason"]
+    finally:
+        cfg_mod.DEFAULT_CONFIG.db_path = old_db
+
+
+def test_resolve_dns_log_only_verbatim_on_migrated_schema(tmp_path, monkeypatch):
+    """On a fully-migrated (015) schema the guard is inert: statuses land verbatim
+    and resolution_reason carries no degrade annotation."""
+    import minni.minnid as minnid
+
+    db_path = _fresh_db(tmp_path)
+    import minni.config as cfg_mod
+    old_db = cfg_mod.DEFAULT_CONFIG.db_path
+    cfg_mod.DEFAULT_CONFIG.db_path = db_path
+    monkeypatch.setattr(minnid, "_writeback", None)
+    try:
+        dns = _stage_candidate(
+            {"content": "Migrated do_not_store candidate", "workspace_id": "default"}, 70
+        )
+        log = _stage_candidate(
+            {"content": "Migrated log_only candidate", "workspace_id": "default"}, 71
+        )
+        dns_id = dns["result"]["candidate_id"]
+        log_id = log["result"]["candidate_id"]
+
+        r_dns = _resolve_candidate(
+            {"candidate_id": dns_id, "decision": "do_not_store", "reason": "keep"}, 72
+        )
+        r_log = _resolve_candidate(
+            {"candidate_id": log_id, "decision": "log_only", "reason": "note"}, 73
+        )
+        assert r_dns.get("result", {}).get("new_status") == "do_not_store", r_dns
+        assert r_log.get("result", {}).get("new_status") == "log_only", r_log
+
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        dns_row = conn.execute(
+            "SELECT status, resolution_reason FROM candidate_packets WHERE candidate_id=?",
+            (dns_id,),
+        ).fetchone()
+        conn.close()
+        assert dns_row["status"] == "do_not_store"
+        assert "intended_status" not in (dns_row["resolution_reason"] or "")
+    finally:
+        cfg_mod.DEFAULT_CONFIG.db_path = old_db
+
+
 def test_stage_candidate_recomputes_instruction_like_from_content(tmp_path, monkeypatch):
     """Staging must not trust callers to set the poison/instruction hint."""
     import minni.minnid as minnid

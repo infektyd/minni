@@ -445,12 +445,19 @@ export const FLOW_AGENTS = [
   "main",
 ] as const;
 
+// Match an agent id only on token boundaries — a token is a run of [a-z0-9-] —
+// and test the longest ids first. Bare substring matching mis-attributed
+// "domain"/"maintain" to "main" and swallowed "grok-build" into "grok".
+const FLOW_AGENT_MATCHERS: { id: string; re: RegExp }[] = [...FLOW_AGENTS]
+  .sort((a, b) => b.length - a.length)
+  .map((id) => ({ id, re: new RegExp(`(?<![a-z0-9-])${id}(?![a-z0-9-])`) }));
+
 /** Best-effort agent attribution from the entry text. Unattributed traffic
  * maps to "unknown" (neutral edge), not a fabricated runtime id. */
 export function agentFromAuditText(text: string): string {
   const t = text.toLowerCase();
-  for (const a of FLOW_AGENTS) {
-    if (t.includes(a)) return a === "claudecode" ? "claude-code" : a;
+  for (const { id, re } of FLOW_AGENT_MATCHERS) {
+    if (re.test(t)) return id === "claudecode" ? "claude-code" : id;
   }
   return "unknown";
 }

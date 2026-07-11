@@ -362,6 +362,28 @@ test("agentFromAuditText: attributes named agents, defaults to unknown", () => {
   assert.equal(agentFromAuditText("## [ts] minni_status | plain"), "unknown");
 });
 
+test("agentFromAuditText: matches only on token boundaries (no substring false positives)", () => {
+  // "main" must not be found inside "domain" / "maintain".
+  assert.equal(agentFromAuditText("## [ts] minni_learn | domain model notes"), "unknown");
+  assert.equal(agentFromAuditText("## [ts] minni_learn | maintain the invariant"), "unknown");
+  // ...but a standalone "main" token still attributes.
+  assert.equal(agentFromAuditText("## [ts] minni_status | main runtime booted"), "main");
+});
+
+test("agentFromAuditText: longer ids win over their prefixes (grok-build vs grok)", () => {
+  assert.equal(agentFromAuditText("## [ts] minni_learn | grok-build shipped a fix"), "grok-build");
+  assert.equal(agentFromAuditText("## [ts] minni_learn | grok staged a note"), "grok");
+});
+
+test("flowForAuditEntry: an unattributed learn still carries the hub leg for the pulse to ride", () => {
+  // Local console entries carry no agent marker → "unknown". No "ag-unknown"
+  // link is ever rendered, so the pulse depends on the hub leg surviving:
+  // FlowLayer skips the missing agent leg rather than dropping the whole pulse.
+  const f = flowForAuditEntry("## [ts] minni_learn | consolidation batch committed");
+  assert.deepEqual(f.steps.map((s) => s.l), ["ag-unknown", "hub-staged"]);
+  assert.ok(f.steps.some((s) => s.l === "hub-staged"), "hub leg present so the pulse still animates");
+});
+
 test("flowForAuditEntry: agent attribution flows into the link ids", () => {
   const f = flowForAuditEntry("## [ts] minni_learn | gemini learned batch limit");
   assert.deepEqual(f.steps.map((s) => s.l), ["ag-gemini", "hub-staged"]);

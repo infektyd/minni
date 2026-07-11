@@ -694,7 +694,10 @@ export interface AgentApiRow {
   lastSeenAt?: number | null;
   on?: boolean;
   caps?: AgentCapsRow;
-  staged?: number;
+  staged?: number | null;
+  stagedUnknown?: boolean;
+  /** true when staged equals the server's query limit, i.e. the count is a floor. */
+  stagedAtLimit?: boolean;
   note?: string;
 }
 
