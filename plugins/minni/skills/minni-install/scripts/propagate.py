@@ -103,10 +103,9 @@ def default_plugin_cli() -> Path:
 DEFAULT_REPO_ROOT = Path.home() / "Projects" / "minni"
 
 # Antigravity (CLI `agy` + IDE + antigravity) share the ~/.gemini tree and use
-# agent id `gemini`. Surface MCP configs are symlinks into ~/.agents/mcp-servers/views/.
-# The mcp-env-run wrapper is the canonical launcher every Gemini-surface server uses,
-# and IDE view entries carry this protobuf type tag which must be preserved on hand-edit.
-GEMINI_MCP_ENV_RUN = Path("~/.agents/bin/mcp-env-run").expanduser()
+# agent id `gemini`. Managed MCP configs are independent regular files so one
+# surface cannot silently rewrite another through a shared symlink target.
+# IDE view entries carry this protobuf type tag which must be preserved on hand-edit.
 GEMINI_IDE_TYPE_NAME = "exa.cascade_plugins_pb.CascadePluginCommandTemplate"
 GEMINI_SURFACE_CONFIGS = (
     "~/.gemini/config/mcp_config.json",
@@ -546,14 +545,19 @@ def refresh_claude_plugin(repo_root: Path) -> None:
             raise SystemExit(f"Claude plugin refresh failed at {' '.join(command)}: {exc}") from exc
 
 
-def update_kilo_config(server_path: Path, agent: str, vault: Path, socket_path: Path, workspace: Path, afm_env: dict[str, str] | None = None) -> None:
+def update_kilo_config(server_path: Path, agent: str, vault: Path, socket_path: Path, workspace: Path,
+                       afm_env: dict[str, str] | None = None, *, remove_legacy: bool = False) -> None:
     path = Path("~/.config/kilo/kilo.json").expanduser()
     data = load_json(path)
+    # Exact legacy ownership only: running both servers creates split-brain
+    # memory reads/writes. Unrelated MCP servers remain untouched.
+    if remove_legacy:
+        data.setdefault("mcp", {}).pop("sovereign-memory", None)
     data.setdefault("mcp", {})["minni"] = {
         "type": "local",
         "command": ["node", str(server_path)],
         "enabled": True,
-        "env": {
+        "environment": {
             "MINNI_AGENT_ID": agent,
             "MINNI_VAULT_PATH": str(vault),
             "MINNI_SOCKET_PATH": str(socket_path),
@@ -562,6 +566,31 @@ def update_kilo_config(server_path: Path, agent: str, vault: Path, socket_path: 
         },
     }
     write_json(path, data)
+
+
+def render_kilo_plugin(install_root: Path, agent: str, vault: Path, socket_path: Path,
+                       workspace: Path | str) -> str:
+    template = (install_root / "kilo/minni-plugin.js").read_text(encoding="utf-8")
+    values = {
+        "MINNI_KILOCODE_AGENT_ID": agent,
+        "MINNI_KILOCODE_VAULT_PATH": str(vault),
+        "MINNI_KILOCODE_WORKSPACE_ID": normalize_workspace_id(str(workspace)) or "workspace-unknown",
+        "MINNI_SOCKET_PATH": str(socket_path),
+    }
+    return template.replace(
+        "__MINNI_KILO_HOOK_SCRIPT__", json.dumps(str(install_root / "dist/kilocode-hook.js")),
+    ).replace("__MINNI_KILO_HOOK_ENV__", json.dumps(values, sort_keys=True))
+
+
+def update_kilo_plugin(install_root: Path, agent: str, vault: Path, socket_path: Path,
+                       workspace: Path | str, *, home: Path | None = None) -> Path:
+    target = (home or Path.home()) / ".config/kilo/plugin/minni.js"
+    source = render_kilo_plugin(install_root, agent, vault, socket_path, workspace)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(source, encoding="utf-8")
+    # Syntax is a cheap activation precondition before legacy MCP cleanup.
+    subprocess.run(["node", "--check", str(target)], check=True, timeout=30)
+    return target
 
 
 CURSOR_HOOK_EVENTS = ("sessionStart", "beforeSubmitPrompt", "preCompact", "stop", "preToolUse")
@@ -595,6 +624,8 @@ def is_owned_cursor_hook(entry: object, install_root: Path) -> bool:
         str(install_root / "dist" / "cursor-hook.js"),
         "~/.cursor/plugins/minni@minni/dist/hook.js",
         "~/.cursor/plugins/minni@minni/dist/cursor-hook.js",
+        "/.cursor/plugins/minni@minni/dist/hook.js",
+        "/.cursor/plugins/minni@minni/dist/cursor-hook.js",
         "${CURSOR_PLUGIN_ROOT}/dist/cursor-hook.js",
     )
     return any(root in command for root in known_roots)
@@ -737,15 +768,15 @@ def gemini_minni_entry(
 ) -> dict:
     """Canonical `minni` server entry for a Gemini/Antigravity MCP view.
 
-    Uses an absolute server path (cwd-independent) plus the mcp-env-run wrapper,
-    matching every other server entry on the Gemini surfaces. When `type_name`
+    Uses the standard Node executable plus an absolute server path
+    (cwd-independent). When `type_name`
     is given (IDE views), it is emitted first to match the live shape.
     """
     entry: dict = {}
     if type_name:
         entry["$typeName"] = type_name
-    entry["command"] = str(GEMINI_MCP_ENV_RUN)
-    entry["args"] = ["node", str(server_path)]
+    entry["command"] = "node"
+    entry["args"] = [str(server_path)]
     entry["cwd"] = str(Path(server_path).parent.parent)
     entry["env"] = {
         "MINNI_AGENT_ID": agent,
@@ -795,6 +826,17 @@ def write_view_entry(
     servers.pop("sovereign-memory", None)
     servers["minni"] = new_entry
     write_json(view_path, data)
+    return True
+
+
+def materialize_json_config(path: Path) -> bool:
+    """Replace a managed JSON symlink with an independent regular file."""
+    if not path.is_symlink():
+        return path.exists()
+    target = path.resolve(strict=False)
+    data = load_json(target) if target.exists() else {}
+    path.unlink()
+    write_json(path, data if isinstance(data, dict) else {})
     return True
 
 
@@ -891,10 +933,9 @@ def update_antigravity_config(
     written: list[str] = []
     for surface in GEMINI_SURFACE_CONFIGS:
         surface_path = Path(surface).expanduser()
-        # Follow the symlink to the actual view file; skip broken/missing surfaces.
-        target = surface_path.resolve() if surface_path.exists() else surface_path
-        if write_view_entry(target, server_path, agent, vault, socket_path, workspace, afm_env):
-            written.append(str(target))
+        materialize_json_config(surface_path)
+        if write_view_entry(surface_path, server_path, agent, vault, socket_path, workspace, afm_env):
+            written.append(str(surface_path))
     grants = {
         "~/.gemini/config/config.json": ["globalPermissionGrants", "allow"],
         "~/.gemini/antigravity-cli/settings.json": ["permissions", "allow"],
@@ -911,7 +952,35 @@ AGY_PLUGINS_DIR = "~/.gemini/config/plugins"
 AGY_DIST_TOKEN = "__MINNI_GEMINI_DIST__"
 
 
-def update_agy_plugin_hooks(install_root: Path) -> dict[str, object]:
+def stamp_agy_hook_env(hooks_data: dict, agent: str, vault: Path, socket_path: Path,
+                       workspace: Path | str) -> dict:
+    values = {
+        "MINNI_GEMINI_AGENT_ID": agent,
+        "MINNI_GEMINI_VAULT_PATH": str(vault),
+        "MINNI_GEMINI_WORKSPACE_ID": normalize_workspace_id(str(workspace)) or "workspace-unknown",
+        "MINNI_SOCKET_PATH": str(socket_path),
+    }
+    env = " ".join(f"{key}={shlex.quote(value)}" for key, value in values.items())
+    for groups in hooks_data.get("hooks", {}).values():
+        for group in groups:
+            for hook in group.get("hooks", []):
+                hook["command"] = f"env {env} {hook['command']}"
+    return hooks_data
+
+
+def render_agy_hooks(hooks_data: dict, install_root: Path, agent: str, vault: Path,
+                     socket_path: Path, workspace: Path | str) -> str:
+    rendered = stamp_agy_hook_env(hooks_data, agent, vault, socket_path, workspace)
+    quoted_dist = shlex.quote(str(install_root / "dist"))
+    for groups in rendered.get("hooks", {}).values():
+        for group in groups:
+            for hook in group.get("hooks", []):
+                hook["command"] = hook["command"].replace(AGY_DIST_TOKEN, quoted_dist)
+    return json.dumps(rendered, indent=2)
+
+
+def update_agy_plugin_hooks(install_root: Path, agent: str, vault: Path,
+                            socket_path: Path, workspace: Path | str) -> dict[str, object]:
     """Register the Minni hook plugin with the agy (Antigravity CLI) plugin system.
 
     agy loads Claude Code-style hooks.json manifests from
@@ -943,7 +1012,7 @@ def update_agy_plugin_hooks(install_root: Path) -> dict[str, object]:
 
     hooks_data = json.loads(template.read_text(encoding="utf-8"))
     hooks_data.pop("_comment", None)
-    stamped = json.dumps(hooks_data, indent=2).replace(AGY_DIST_TOKEN, str(install_root / "dist"))
+    stamped = render_agy_hooks(hooks_data, install_root, agent, vault, socket_path, workspace)
 
     staging_root = Path(tempfile.mkdtemp(prefix="minni-agy-plugin-"))
     enable_note = ""
@@ -1045,8 +1114,8 @@ def update_toml_mcp_config(path: Path, server_path: Path, agent: str, vault: Pat
 # equivalent deny-capable pre-tool event, so the guard is intentionally NOT
 # wired into their manifests — a platform capability gap, not a Minni
 # omission. The lifecycle nudge + UserPromptSubmit recall pointer reach the
-# codex/grok/kilocode surfaces; on agy 1.0.15 only PreToolUse/PostToolUse/Stop
-# exist, so gemini receives NO lifecycle injection yet. See
+# codex/grok/kilocode surfaces; current agy dispatches SessionStart plus
+# PreToolUse/Stop, but still lacks UserPromptSubmit and PreCompact. See
 # docs/contracts/AGENT.md §8.
 def platform_spec(platform: str, repo_root: Path, install_root: str | None = None) -> dict[str, object]:
     platform = canonical_platform(platform)
@@ -1159,9 +1228,11 @@ def update_one_plugin(platform: str, args: argparse.Namespace) -> dict[str, obje
     copy_tree(source, install_root)
     server_path = install_root / "dist" / "server.js"
     platform_name = canonical_platform(platform)
+    portable_surfaces = {"cursor", "grok", "kilocode", "gemini", "antigravity"}
+    preserved_workspace = str(pre_mcp_env.get("MINNI_WORKSPACE_ID", "")).strip()
     effective_stamp_workspace = (
-        Path("workspace-unknown")
-        if platform_name in {"cursor", "grok"} and not explicit_workspace
+        Path(preserved_workspace or "workspace-unknown")
+        if platform_name in portable_surfaces and not explicit_workspace
         else stamp_workspace
     )
     mcp_payload = mcp_json(
@@ -1178,7 +1249,12 @@ def update_one_plugin(platform: str, args: argparse.Namespace) -> dict[str, obje
         update_claude_config(server_path, agent, vault, Path(args.socket).expanduser(), stamp_workspace, afm_env)
         refresh_claude_plugin(repo_root)
     elif config_kind == "kilo-json":
-        update_kilo_config(server_path, agent, vault, Path(args.socket).expanduser(), stamp_workspace, afm_env)
+        kilo_workspace = effective_stamp_workspace
+        update_kilo_plugin(install_root, agent, vault, Path(args.socket).expanduser(), kilo_workspace)
+        update_kilo_config(
+            server_path, agent, vault, Path(args.socket).expanduser(), effective_stamp_workspace,
+            afm_env, remove_legacy=True,
+        )
     elif config_kind == "cursor-json":
         cursor_workspace = stamp_workspace if explicit_workspace else Path("workspace-unknown")
         update_cursor_config(
@@ -1186,13 +1262,13 @@ def update_one_plugin(platform: str, args: argparse.Namespace) -> dict[str, obje
             cursor_workspace, afm_env, explicit_workspace=explicit_workspace,
         )
     elif config_kind == "gemini-manifest":
-        update_gemini_manifest(install_root, agent, vault, Path(args.socket).expanduser(), stamp_workspace, afm_env)
+        update_gemini_manifest(install_root, agent, vault, Path(args.socket).expanduser(), effective_stamp_workspace, afm_env, version=plugin_source_version(repo_root))
     elif config_kind == "antigravity":
         # Keep the gemini-cli extension manifest correct, then wire the
         # Antigravity CLI/IDE/antigravity surface views + permission grants.
-        update_gemini_manifest(install_root, agent, vault, Path(args.socket).expanduser(), stamp_workspace, afm_env)
+        update_gemini_manifest(install_root, agent, vault, Path(args.socket).expanduser(), effective_stamp_workspace, afm_env, version=plugin_source_version(repo_root))
         antigravity_result = update_antigravity_config(
-            install_root, agent, vault, Path(args.socket).expanduser(), stamp_workspace, afm_env
+            install_root, agent, vault, Path(args.socket).expanduser(), effective_stamp_workspace, afm_env
         )
 
     if canonical_platform(platform) == "grok":
@@ -1205,7 +1281,10 @@ def update_one_plugin(platform: str, args: argparse.Namespace) -> dict[str, obje
     # agy CLI hook plugin (skipped with a reason when agy is not installed).
     agy_hooks: dict[str, object] | None = None
     if config_kind in ("gemini-manifest", "antigravity"):
-        agy_hooks = update_agy_plugin_hooks(install_root)
+        gemini_workspace = effective_stamp_workspace
+        agy_hooks = update_agy_plugin_hooks(
+            install_root, agent, vault, Path(args.socket).expanduser(), gemini_workspace,
+        )
 
     base: dict[str, object] = {
         "platform": canonical_platform(platform),

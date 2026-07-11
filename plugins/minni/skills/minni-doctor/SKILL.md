@@ -87,6 +87,12 @@ For Grok, `~/.grok/hooks/minni.json` must invoke the installed
 containing `dist/hook.js` or `MINNI_CLAUDECODE_*` is confirmed foreign-adapter
 drift and must be routed to `minni-install --platform grok`.
 
+For KiloCode, `~/.config/kilo/kilo.json` must not have both `minni` and the
+legacy `sovereign-memory` MCP enabled. Current Kilo CLI loads the native plugin
+at `~/.config/kilo/plugin/minni.js`; a `.kilocode-plugin/hooks.json` file is
+not activation evidence. Verify the native plugin references the installed
+`kilocode-hook.js`, then require fresh Kilo event/audit evidence.
+
 | Check | Healthy | Finding |
 |---|---|---|
 | SessionStart envelope | `<minni:context event="SessionStart">` with identity, audit tail, pending_learnings | Hook not registered in THIS platform's native config |

@@ -19,6 +19,7 @@ def test_cursor_config_is_portable_and_preserves_unrelated_entries(tmp_path):
                 {"command": "node /opt/other/start.js"},
                 {"command": "node /work/minni-tools/unrelated.js"},
                 {"command": "node ~/.cursor/plugins/minni@minni/dist/hook.js SessionStart"},
+                {"command": f"node {tmp_path}/.cursor/plugins/minni@minni/dist/cursor-hook.js sessionStart"},
             ]
         },
     }))

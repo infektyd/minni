@@ -4,17 +4,14 @@
 // which speak Claude Code's hook protocol natively — wraps dispatch in the
 // agy payload/output adapters (gemini-adapter.ts).
 //
-// It cannot reuse runHookMain: agy 1.0.15's permission manager errors on an
-// empty PreToolUse decision (fixed upstream after 1.0.15), so EVERY exit path
-// of a PreToolUse invocation — hooks disabled, unknown event, handler error —
-// must emit an explicit {"decision":"approve"} instead of runHookMain's bare
+// It cannot reuse runHookMain: PreToolUse requires an explicit decision, so
+// EVERY exit path — hooks disabled, unknown event, handler error — must emit
+// {"decision":"allow"} instead of runHookMain's bare
 // {continue:true}. See gemini-adapter.ts for the verified protocol notes.
 //
-// agy 1.0.15 only dispatches PreToolUse, PostToolUse and Stop. SessionStart /
-// UserPromptSubmit / PreCompact are wired in hooks-gemini.json anyway so they
-// light up without a reinstall once agy adds them; until then the recall
-// guard is inert (no UserPromptSubmit means no recall-state file, so
-// PreToolUse always approves).
+// agy 1.1.1 dispatches native PreToolUse/Stop and its compatibility loader
+// dispatches SessionStart. It does not dispatch UserPromptSubmit/PreCompact,
+// so per-turn recall state and compaction hooks remain an honest host gap.
 import type { EnvelopeEvent } from "./agent_envelope.js";
 import {
   GEMINI_AGENT_ID,

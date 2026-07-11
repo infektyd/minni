@@ -1,12 +1,13 @@
 {
-  "_comment": "Template for the agy (Antigravity CLI) plugin hooks manifest. agy does NOT expand ${CLAUDE_PLUGIN_ROOT} (verified live, agy 1.0.15), so minni-install/propagate.py stamps __MINNI_GEMINI_DIST__ with the absolute dist path of the gemini extension install before registering the plugin via `agy plugin install`. Entries are matcher-free on purpose: agy's hooks.json loader drops entries that carry a matcher (loads them as '0 total handlers'); the recall guard re-checks tool scope in code instead. agy 1.0.15 only dispatches PreToolUse, PostToolUse and Stop; SessionStart/UserPromptSubmit/PreCompact are declared so they light up without a reinstall once agy adds them.",
+  "_comment": "Template for agy. minni-install stamps the absolute native Gemini entrypoint and MINNI_GEMINI_* identity. agy 1.1.1 loads SessionStart through its compatibility layer plus native PreToolUse and Stop. UserPromptSubmit and PreCompact are absent because this host does not dispatch them.",
   "hooks": {
     "PreToolUse": [
       {
         "hooks": [
           {
             "type": "command",
-            "command": "node __MINNI_GEMINI_DIST__/gemini-hook.js PreToolUse"
+            "command": "node __MINNI_GEMINI_DIST__/gemini-hook.js PreToolUse",
+            "timeout": 10
           }
         ]
       }
@@ -16,7 +17,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node __MINNI_GEMINI_DIST__/gemini-hook.js Stop"
+            "command": "node __MINNI_GEMINI_DIST__/gemini-hook.js Stop",
+            "timeout": 20
           }
         ]
       }
@@ -26,27 +28,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node __MINNI_GEMINI_DIST__/gemini-hook.js SessionStart"
-          }
-        ]
-      }
-    ],
-    "UserPromptSubmit": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "node __MINNI_GEMINI_DIST__/gemini-hook.js UserPromptSubmit"
-          }
-        ]
-      }
-    ],
-    "PreCompact": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "node __MINNI_GEMINI_DIST__/gemini-hook.js PreCompact"
+            "command": "node __MINNI_GEMINI_DIST__/gemini-hook.js SessionStart",
+            "timeout": 30
           }
         ]
       }

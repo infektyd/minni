@@ -18,6 +18,53 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import propagate  # noqa: E402
 
 
+def test_materialize_json_config_replaces_symlink_with_regular_copy(tmp_path):
+    shared = tmp_path / "shared.json"
+    shared.write_text(json.dumps({"mcpServers": {"other": {"command": "x"}}}))
+    surface = tmp_path / "surface.json"
+    surface.symlink_to(shared)
+    assert propagate.materialize_json_config(surface)
+    assert surface.exists() and not surface.is_symlink()
+    assert json.loads(surface.read_text()) == json.loads(shared.read_text())
+
+
+def test_stamp_agy_hook_env_is_platform_specific_and_shell_safe(tmp_path):
+    hooks = {"hooks": {"PreToolUse": [{"hooks": [{
+        "type": "command", "command": "node '/Plugin Path/gemini-hook.js' PreToolUse", "timeout": 10,
+    }]}]}}
+    stamped = propagate.stamp_agy_hook_env(
+        hooks, "gemini", tmp_path / "Gemini Vault", tmp_path / "run/minnid.sock",
+        tmp_path / "Repo With Spaces",
+    )
+    command = stamped["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+    assert "MINNI_GEMINI_AGENT_ID=gemini" in command
+    assert "MINNI_GEMINI_VAULT_PATH=" in command and "Gemini Vault" in command
+    assert "MINNI_GEMINI_WORKSPACE_ID='workspace-repo with spaces'" in command
+    assert "MINNI_SOCKET_PATH=" in command
+    assert "MINNI_CLAUDECODE_" not in command
+
+
+def test_render_agy_hooks_quotes_dist_with_spaces_and_apostrophe(tmp_path):
+    install = tmp_path / "Agent's Plugins" / "minni"
+    hooks = {"hooks": {"PreToolUse": [{"hooks": [{
+        "type": "command",
+        "command": "node __MINNI_GEMINI_DIST__/gemini-hook.js PreToolUse",
+        "timeout": 10,
+    }]}]}}
+    rendered = json.loads(propagate.render_agy_hooks(
+        hooks, install, "gemini", tmp_path / "vault", tmp_path / "socket",
+        Path("workspace-unknown"),
+    ))
+    command = rendered["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+    assert propagate.AGY_DIST_TOKEN not in command
+    assert "Agent" in command and "Plugins" in command
+    # shlex can parse the final command back into an intact script path.
+    import shlex
+    argv = shlex.split(command)
+    node_index = argv.index("node")
+    assert argv[node_index + 1] == str(install / "dist/gemini-hook.js")
+
+
 def _server(tmp: Path) -> Path:
     return tmp / ".gemini" / "extensions" / "minni" / "dist" / "server.js"
 
@@ -25,7 +72,8 @@ def _server(tmp: Path) -> Path:
 def test_minni_entry_shape(tmp_path):
     sp = _server(tmp_path)
     e = propagate.gemini_minni_entry(sp, "gemini", Path("/v"), Path("/s"), Path("/w"))
-    assert e["args"] == ["node", str(sp)]
+    assert e["command"] == "node"
+    assert e["args"] == [str(sp)]
     assert e["cwd"] == str(sp.parent.parent)
     assert e["env"]["MINNI_AGENT_ID"] == "gemini"
     assert e["env"]["MINNI_VAULT_PATH"] == "/v"
