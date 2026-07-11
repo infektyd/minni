@@ -120,6 +120,9 @@ def _migration_present_in_schema(conn: sqlite3.Connection, version: int) -> bool
         return _table_exists(conn, "contradiction_log")
     if version == 14:
         return _table_exists(conn, "consolidation_actions")
+    if version == 15:
+        # Applied only when CHECK already admits do_not_store/log_only.
+        return _candidate_status_check_allows_dns_log_only(conn)
     return True
 
 
@@ -181,21 +184,49 @@ def run_migrations(conn: sqlite3.Connection) -> None:
     now = int(_time.time())
 
     try:
-        conn.execute("BEGIN IMMEDIATE")
+        # Migrations normally share one IMMEDIATE transaction. Version 015 must
+        # rebuild candidate_packets with foreign_keys OFF *outside* a transaction
+        # (SQLite ignores PRAGMA foreign_keys=OFF inside BEGIN). We therefore
+        # apply migrations in groups, committing before 015 and resuming after.
+        batch: list[tuple[int, str]] = []
+
+        def _flush_batch(items: list[tuple[int, str]]) -> None:
+            if not items:
+                return
+            conn.execute("BEGIN IMMEDIATE")
+            for version, filepath in items:
+                logger.info("  Applying migration %03d: %s", version, os.path.basename(filepath))
+                with open(filepath, "r", encoding="utf-8") as fh:
+                    sql = fh.read()
+                for statement in _split_statements(sql):
+                    if statement.strip():
+                        _execute_tolerant(conn, statement)
+                if version == 13:
+                    _apply_migration_013_legacy_main_rewrite(conn)
+                conn.execute(
+                    "INSERT OR REPLACE INTO schema_migrations(version, name, applied_at) VALUES (?, ?, ?)",
+                    (version, os.path.basename(filepath), now),
+                )
+            conn.commit()
 
         for version, filepath in pending:
-            logger.info("  Applying migration %03d: %s", version, os.path.basename(filepath))
-            with open(filepath, "r", encoding="utf-8") as fh:
-                sql = fh.read()
-            for statement in _split_statements(sql):
-                if statement.strip():
-                    _execute_tolerant(conn, statement)
-            if version == 13:
-                _apply_migration_013_legacy_main_rewrite(conn)
-            conn.execute(
-                "INSERT OR REPLACE INTO schema_migrations(version, name, applied_at) VALUES (?, ?, ?)",
-                (version, os.path.basename(filepath), now),
-            )
+            if version == 15:
+                _flush_batch(batch)
+                batch = []
+                # Commit any leftover implicit txn so FK pragma is honored.
+                if conn.in_transaction:
+                    conn.commit()
+                logger.info("  Applying migration %03d: %s (Python rebuild)", version, os.path.basename(filepath))
+                _apply_migration_015_candidate_status_expand(conn)
+                conn.execute(
+                    "INSERT OR REPLACE INTO schema_migrations(version, name, applied_at) VALUES (?, ?, ?)",
+                    (version, os.path.basename(filepath), now),
+                )
+                conn.commit()
+                continue
+            batch.append((version, filepath))
+
+        _flush_batch(batch)
 
         # Bump user_version to highest known — PRAGMA cannot be parameterized
         target_version = int(target_version)
@@ -204,7 +235,8 @@ def run_migrations(conn: sqlite3.Connection) -> None:
         logger.info("Migrations complete. user_version=%d", target_version)
 
     except Exception:
-        conn.rollback()
+        if conn.in_transaction:
+            conn.rollback()
         logger.exception("Migration failed — rolled back. State unchanged.")
         raise
 
@@ -227,6 +259,108 @@ def _legacy_main_is_claude_code() -> bool:
     return (os.environ.get(_LEGACY_MAIN_ALIAS_ENV) or "").strip().lower() in {
         "1", "true", "yes", "on",
     }
+
+
+def _candidate_status_check_allows_dns_log_only(conn: sqlite3.Connection) -> bool:
+    """True when candidate_packets CHECK already includes do_not_store + log_only."""
+    if not _table_exists(conn, "candidate_packets"):
+        return False
+    try:
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='candidate_packets'"
+        ).fetchone()
+        if not row or not row[0]:
+            return False
+        sql = str(row[0]).lower()
+        return "do_not_store" in sql and "log_only" in sql
+    except sqlite3.Error:
+        return False
+
+
+def _apply_migration_015_candidate_status_expand(conn: sqlite3.Connection) -> None:
+    """Rebuild candidate_packets with CHECK that allows do_not_store / log_only.
+
+    Must run with foreign_keys OFF **outside** a transaction: SQLite treats
+    PRAGMA foreign_keys=OFF as a no-op inside BEGIN, and DROP would fail when
+    contradiction_log.resolution_id references candidate_packets.
+
+    The final RENAME uses PRAGMA legacy_alter_table=ON so SQLite does not
+    re-parse unrelated triggers (e.g. dangling learnings_fts triggers on
+    partial test schemas missing the virtual table).
+    """
+    if _candidate_status_check_allows_dns_log_only(conn):
+        logger.info("Migration 015: candidate_packets CHECK already expanded — no-op")
+        return
+    if not _table_exists(conn, "candidate_packets"):
+        logger.warning("Migration 015: candidate_packets missing — skipping rebuild")
+        return
+
+    if conn.in_transaction:
+        conn.commit()
+
+    # Toggle FK outside any transaction so DROP is not blocked by child FKs.
+    conn.execute("PRAGMA foreign_keys=OFF")
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            """
+            CREATE TABLE candidate_packets_015 (
+                candidate_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                principal TEXT NOT NULL,
+                workspace_id TEXT NOT NULL DEFAULT 'default',
+                layer TEXT,
+                privacy_level TEXT,
+                content TEXT NOT NULL,
+                evidence_refs TEXT,
+                derived_from TEXT,
+                instruction_like INTEGER DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'proposed'
+                    CHECK (status IN (
+                        'proposed', 'accepted', 'rejected', 'redacted', 'expired',
+                        'merged', 'superseded', 'do_not_store', 'log_only'
+                    )),
+                proposed_at REAL NOT NULL,
+                resolved_at REAL,
+                resolved_by TEXT,
+                resolution_reason TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO candidate_packets_015 (
+                candidate_id, principal, workspace_id, layer, privacy_level, content,
+                evidence_refs, derived_from, instruction_like, status, proposed_at,
+                resolved_at, resolved_by, resolution_reason
+            )
+            SELECT
+                candidate_id, principal, workspace_id, layer, privacy_level, content,
+                evidence_refs, derived_from, instruction_like, status, proposed_at,
+                resolved_at, resolved_by, resolution_reason
+            FROM candidate_packets
+            """
+        )
+        conn.execute("DROP TABLE candidate_packets")
+        conn.execute("PRAGMA legacy_alter_table=ON")
+        try:
+            conn.execute("ALTER TABLE candidate_packets_015 RENAME TO candidate_packets")
+        finally:
+            conn.execute("PRAGMA legacy_alter_table=OFF")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_candidate_principal_status_time "
+            "ON candidate_packets (principal, status, proposed_at DESC)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_candidate_status ON candidate_packets (status)"
+        )
+        conn.commit()
+        logger.info("Migration 015: candidate_packets CHECK expanded (do_not_store, log_only)")
+    except Exception:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
+    finally:
+        conn.execute("PRAGMA foreign_keys=ON")
 
 
 def _apply_migration_013_legacy_main_rewrite(conn: sqlite3.Connection) -> None:

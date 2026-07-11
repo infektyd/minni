@@ -367,6 +367,72 @@ html[data-theme="phosphor"] .board {
   color: var(--persimmon-dark);
 }
 
+/* layout mode toggle: auto (default position/size) vs. custom (free layout) */
+.board .zone .zmode {
+  position: absolute;
+  left: 14px;
+  top: 8px;
+  z-index: 5;
+  display: flex;
+  gap: 1px;
+  background: var(--bone);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 2px;
+  opacity: 0.55;
+  transition: opacity 0.15s;
+}
+.board .zone:hover .zmode,
+.board .zone .zmode:focus-within {
+  opacity: 1;
+}
+.board .zone .zmode button {
+  border: none;
+  background: none;
+  padding: 3px 8px;
+  border-radius: 999px;
+  cursor: pointer;
+  font-family: var(--font-mono);
+  font-size: 8.5px;
+  font-weight: 650;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--on-muted);
+}
+.board .zone .zmode button.on {
+  background: var(--zone-c, var(--bd-gold));
+  color: var(--bone);
+}
+
+/* resize handle: drag to expand/contract the box */
+.board .zone .zresize {
+  position: absolute;
+  right: -2px;
+  bottom: -2px;
+  width: 20px;
+  height: 20px;
+  z-index: 6;
+  cursor: nwse-resize;
+  touch-action: none;
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+.board .zone:hover .zresize,
+.board .zone:focus-within .zresize {
+  opacity: 1;
+}
+.board .zone .zresize::before {
+  content: '';
+  position: absolute;
+  right: 4px;
+  bottom: 4px;
+  width: 11px;
+  height: 11px;
+  border-right: 3px solid var(--zone-c, var(--border-strong));
+  border-bottom: 3px solid var(--zone-c, var(--border-strong));
+  border-radius: 0 0 4px 0;
+}
+
 .board .card {
   position: absolute;
   width: 252px;
@@ -545,6 +611,8 @@ html[data-theme="phosphor"] .board {
   width: 100%;
   height: 100%;
   pointer-events: none;
+  /* links must stay attached to boxes dragged past the world edge */
+  overflow: visible;
 }
 .board .bd-svg path {
   fill: none;

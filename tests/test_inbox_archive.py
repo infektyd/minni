@@ -488,3 +488,27 @@ def test_consolidation_dedup_reject_archives_inbox_source(tmp_path, monkeypatch)
     assert minnid._reject_candidate_dedup(cid) is True
     assert not (inbox / "dedup.json").exists(), "file must leave the live inbox"
     assert (inbox / ".archive" / "dedup.json").is_file()
+
+
+def test_do_not_store_and_log_only_archive_source_file(tmp_path, monkeypatch):
+    """The migration-015 terminal statuses drain the inbox like the legacy
+    ones: a do_not_store / log_only resolution must not leave the source file
+    resurfacing through the inbox hooks."""
+    from minni.afm_passes.inbox_archive import maybe_archive_for_candidate
+    from minni.afm_passes.inbox_ingest import ingest
+
+    for status in ("do_not_store", "log_only"):
+        home = tmp_path / status
+        home.mkdir()
+        db_obj, cfg = _make_db(home)
+        monkeypatch.setattr(cfg, "CANONICAL_SOVEREIGN_HOME", str(home), raising=False)
+        inbox = home / "codex-vault" / "inbox"
+        _write_inbox_file(inbox, "a.json", _stop_doc([f"lesson resolved as {status}"]))
+
+        assert ingest(db_obj, cfg, inboxes=[inbox], dry_run=False)["inserted"] == 1
+        (cid,) = _candidate_ids(db_obj)
+
+        _set_status(db_obj, status)
+        assert maybe_archive_for_candidate(db_obj, cfg, cid) is not None
+        assert not (inbox / "a.json").exists(), f"{status}: file must leave the live inbox"
+        assert (inbox / ".archive" / "a.json").is_file()

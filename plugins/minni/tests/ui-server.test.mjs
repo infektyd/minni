@@ -5,7 +5,7 @@ import { createServer as createNetServer } from "node:net";
 import path from "node:path";
 import test from "node:test";
 
-import { createUiServer } from "../dist/ui-server.js";
+import { consolePrincipalReport, createUiServer, daemonRpcHttpStatus } from "../dist/ui-server.js";
 
 const CONSOLE_AUTH = {
   Authorization: `Bearer ${process.env.MINNI_CONSOLE_TOKEN}`,
@@ -321,6 +321,13 @@ test("frontend bundle calls the local bridge endpoints", async () => {
   assert.match(js, /\/api\/audit-tail/);
   assert.match(js, /\/api\/status/);
   assert.match(js, /\/api\/health/);
+  // Real-data board zone routes (no sample fallbacks)
+  assert.match(js, /\/api\/agents/);
+  assert.match(js, /\/api\/log-only/);
+  assert.match(js, /\/api\/quarantine/);
+  assert.match(js, /\/api\/recall-state/);
+  assert.match(js, /\/api\/handoffs/);
+  assert.match(js, /\/api\/policy/);
 });
 
 test("frontend ships the Minni command center design and stays local-only", async () => {
@@ -343,6 +350,11 @@ test("frontend ships the Minni command center design and stays local-only", asyn
   assert.match(js, /Settings/);
   // No write / learn endpoints exposed to the browser
   assert.doesNotMatch(js, /\/api\/learn|sovereign_learn/);
+  // Fail-loud real-data console: no unwired alpha stubs / SAMPLE board labels
+  assert.doesNotMatch(js, /unwired in this alpha/i);
+  assert.doesNotMatch(js, /SAMPLE · /);
+  assert.doesNotMatch(js, /BOARD_SAMPLE/);
+  assert.doesNotMatch(js, /policy\.handoff\.team@v4\.2|POLICY VER.*v4\.2/i);
 
   // Design tokens from the paper + phosphor themes
   assert.match(css, /--graphite/);
@@ -436,4 +448,658 @@ test("static shell serves without auth while /api stays locked", async () => {
   } finally {
     await server.close();
   }
+});
+
+// ── Fail-loud RPC status mapping + honest principal stamp ───────────────────
+test("daemonRpcHttpStatus maps governance denials honestly", () => {
+  assert.equal(daemonRpcHttpStatus("already_resolved: candidate #3 is 'accepted'"), 409);
+  assert.equal(
+    daemonRpcHttpStatus("operator_only: accepting candidate #1 into a durable learning requires an operator/govern principal"),
+    403,
+  );
+  assert.equal(
+    daemonRpcHttpStatus("accept_flagged_required: candidate is instruction_like; accepting it requires literal 'accept_flagged' capability"),
+    403,
+  );
+  assert.equal(daemonRpcHttpStatus("principal_mismatch: agent cannot resolve"), 403);
+  assert.equal(daemonRpcHttpStatus("candidate_not_found: 99999"), 404);
+  assert.equal(daemonRpcHttpStatus("unknown candidate"), 404);
+  // Must NOT treat JSON-RPC "Method not found" as a missing candidate.
+  assert.equal(daemonRpcHttpStatus("Method not found: resolve_candidate"), 501);
+  // Message-only paths (sovereign forwards error.message, not the numeric code).
+  assert.equal(daemonRpcHttpStatus("decision must be one of ['accept','reject']"), 400);
+  assert.equal(daemonRpcHttpStatus("candidate_id must be integer"), 400);
+  assert.equal(daemonRpcHttpStatus("candidate_id is required"), 400);
+  assert.equal(
+    daemonRpcHttpStatus("invalid agent_id 'Bad': must match ^[a-z0-9][a-z0-9._-]{0,63}$"),
+    400,
+  );
+  assert.equal(daemonRpcHttpStatus("agent_id must be a non-empty string, got ''"), 400);
+  // Broad "must be" without a known validation shape stays 502 (not a fake client error).
+  assert.equal(daemonRpcHttpStatus("internal: widget must be flipped"), 502);
+  assert.equal(daemonRpcHttpStatus("socket ECONNREFUSED"), 502);
+});
+
+test("consolePrincipalReport does not invent capabilities", () => {
+  const report = consolePrincipalReport();
+  assert.equal(typeof report.agentId, "string");
+  assert.equal(typeof report.unknownAgent, "boolean");
+  assert.equal(typeof report.resolveOperatorsEnv, "boolean");
+  assert.ok(!("capabilities" in report), "capabilities must not be fabricated on the bridge");
+});
+
+test("/api/status includes principal without capabilities", async () => {
+  const server = await startTestServer();
+  try {
+    const res = await fetch(`${server.baseUrl}/api/status`, { headers: authHeaders() });
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.ok(body.principal, "principal stamp present");
+    assert.equal(typeof body.principal.agentId, "string");
+    assert.ok(!("capabilities" in body.principal), "no fabricated capabilities on /api/status");
+  } finally {
+    await server.close();
+  }
+});
+
+test("/api/candidates and /api/resolve-candidate use daemonRpcHttpStatus at the route seam", async () => {
+  const server = await startTestServer({
+    daemonRpc: async (method) => {
+      if (method === "list_candidates") {
+        return { ok: false, error: "operator_only: list denied for test" };
+      }
+      if (method === "resolve_candidate") {
+        return { ok: false, error: "already_resolved: candidate #9 is 'rejected'" };
+      }
+      return { ok: false, error: `unexpected method ${method}` };
+    },
+  });
+  try {
+    const candidates = await fetch(`${server.baseUrl}/api/candidates?status=proposed`, { headers: authHeaders() });
+    assert.equal(candidates.status, 403, "operator_only via JsonResult must be 403 at the route");
+    const candBody = await candidates.json();
+    assert.equal(candBody.ok, false);
+    assert.match(candBody.error, /operator_only/);
+
+    const resolve = await fetch(`${server.baseUrl}/api/resolve-candidate`, {
+      method: "POST",
+      headers: authHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify({ candidate_id: 9, decision: "accept" }),
+    });
+    assert.equal(resolve.status, 409, "already_resolved via JsonResult must be 409 at the route");
+    const resolveBody = await resolve.json();
+    assert.equal(resolveBody.ok, false);
+    assert.match(resolveBody.error, /already_resolved/);
+  } finally {
+    await server.close();
+  }
+});
+
+test("/api/candidates catch branch maps thrown daemon errors via daemonRpcHttpStatus", async () => {
+  const server = await startTestServer({
+    daemonRpc: async () => {
+      throw new Error("accept_flagged_required: candidate is instruction_like");
+    },
+  });
+  try {
+    const candidates = await fetch(`${server.baseUrl}/api/candidates`, { headers: authHeaders() });
+    assert.equal(candidates.status, 403, "thrown accept_flagged_required must be 403 via catch");
+    const body = await candidates.json();
+    assert.equal(body.ok, false);
+    assert.match(body.error, /accept_flagged_required/);
+  } finally {
+    await server.close();
+  }
+});
+
+// ── New board zone routes: agents, log-only, quarantine, recall-state, handoffs, policy ──
+
+function mockCandidatesRpc(status) {
+  return async (method, params) => {
+    if (method === "list_candidates") {
+      assert.equal(params.status, status);
+      return {
+        candidates: [
+          {
+            candidate_id: 77,
+            principal: "main",
+            content: `row for ${status}`,
+            proposed_at: Math.floor(Date.now() / 1000),
+            status,
+          },
+        ],
+        principal: "main",
+        count: 1,
+      };
+    }
+    throw new Error(`unexpected method ${method}`);
+  };
+}
+
+test("/api/log-only returns list_candidates status=log_only when daemon is up", async () => {
+  const server = await startTestServer({ daemonRpc: mockCandidatesRpc("log_only") });
+  try {
+    const res = await fetch(`${server.baseUrl}/api/log-only`, { headers: authHeaders() });
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.candidates.length, 1);
+    assert.equal(body.candidates[0].status, "log_only");
+  } finally {
+    await server.close();
+  }
+});
+
+test("/api/log-only returns 502 when daemon socket fails", async () => {
+  const server = await startTestServer({
+    daemonRpc: async () => {
+      throw new Error("socket ECONNREFUSED");
+    },
+  });
+  try {
+    const res = await fetch(`${server.baseUrl}/api/log-only`, { headers: authHeaders() });
+    assert.equal(res.status, 502);
+    const body = await res.json();
+    assert.equal(body.ok, false);
+    assert.match(body.error, /ECONNREFUSED/);
+  } finally {
+    await server.close();
+  }
+});
+
+test("/api/log-only requires auth (403 unauthed)", async () => {
+  const server = await startTestServer({ daemonRpc: mockCandidatesRpc("log_only") });
+  try {
+    const res = await fetch(`${server.baseUrl}/api/log-only`);
+    assert.equal(res.status, 403);
+  } finally {
+    await server.close();
+  }
+});
+
+test("/api/quarantine returns list_candidates status=do_not_store when daemon is up", async () => {
+  const server = await startTestServer({ daemonRpc: mockCandidatesRpc("do_not_store") });
+  try {
+    const res = await fetch(`${server.baseUrl}/api/quarantine`, { headers: authHeaders() });
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.candidates[0].status, "do_not_store");
+  } finally {
+    await server.close();
+  }
+});
+
+test("/api/quarantine returns 502 when daemon is down", async () => {
+  const server = await startTestServer({
+    daemonRpc: async () => {
+      throw new Error("socket ECONNREFUSED");
+    },
+  });
+  try {
+    const res = await fetch(`${server.baseUrl}/api/quarantine`, { headers: authHeaders() });
+    assert.equal(res.status, 502);
+    const body = await res.json();
+    assert.equal(body.ok, false);
+    assert.match(body.error, /ECONNREFUSED/);
+    assert.deepEqual(body.candidates, []);
+  } finally {
+    await server.close();
+  }
+});
+
+test("/api/quarantine requires auth (403 unauthed)", async () => {
+  const server = await startTestServer();
+  try {
+    const res = await fetch(`${server.baseUrl}/api/quarantine`);
+    assert.equal(res.status, 403);
+  } finally {
+    await server.close();
+  }
+});
+
+test("/api/recall-state returns present=false when no state file (not an error)", async () => {
+  const server = await startTestServer({
+    readRecallState: async () => null,
+  });
+  try {
+    const res = await fetch(`${server.baseUrl}/api/recall-state`, { headers: authHeaders() });
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.present, false);
+    assert.equal(body.state, null);
+    assert.match(body.message, /no recent recall/i);
+  } finally {
+    await server.close();
+  }
+});
+
+// A vault outside $HOME must not leak its raw absolute path on the present:false
+// or error branches — only the present:true branch was redacted before this fix.
+test("/api/recall-state redacts a non-$HOME vault path on the present:false branch", async () => {
+  const server = await startTestServer({
+    vaultPath: "/Users/notme/external-secret-project/vault",
+    readRecallState: async () => null,
+  });
+  try {
+    const res = await fetch(`${server.baseUrl}/api/recall-state`, { headers: authHeaders() });
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.present, false);
+    assert.doesNotMatch(JSON.stringify(body), /\/Users\/notme/);
+  } finally {
+    await server.close();
+  }
+});
+
+test("/api/recall-state redacts a non-$HOME vault path on the error branch", async () => {
+  const server = await startTestServer({
+    vaultPath: "/Users/notme/external-secret-project/vault",
+    readRecallState: async () => {
+      throw new Error("EACCES reading /Users/notme/external-secret-project/vault/recall-state.json");
+    },
+  });
+  try {
+    const res = await fetch(`${server.baseUrl}/api/recall-state`, { headers: authHeaders() });
+    assert.equal(res.status, 502);
+    const body = await res.json();
+    assert.equal(body.present, false);
+    assert.doesNotMatch(JSON.stringify(body), /\/Users\/notme/);
+  } finally {
+    await server.close();
+  }
+});
+
+test("/api/recall-state returns state when present", async () => {
+  const server = await startTestServer({
+    readRecallState: async () => ({
+      task_signature: "sig",
+      intent: "handoff leases",
+      top_hits: [{ title: "Leases", wikilink: "[[wiki/leases]]", score: 0.9 }],
+      top_score: 0.9,
+      consumed: false,
+      ts: new Date().toISOString(),
+    }),
+  });
+  try {
+    const res = await fetch(`${server.baseUrl}/api/recall-state`, { headers: authHeaders() });
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.present, true);
+    assert.equal(body.state.intent, "handoff leases");
+    assert.equal(body.state.top_hits.length, 1);
+  } finally {
+    await server.close();
+  }
+});
+
+test("/api/recall-state requires auth (403 unauthed)", async () => {
+  const server = await startTestServer({ readRecallState: async () => null });
+  try {
+    const res = await fetch(`${server.baseUrl}/api/recall-state`);
+    assert.equal(res.status, 403);
+  } finally {
+    await server.close();
+  }
+});
+
+test("/api/agents returns catalogue when listAgents is live", async () => {
+  const server = await startTestServer({
+    listAgents: async () => ({
+      agents: [
+        {
+          id: "codex",
+          vault: "~/.minni/codex-vault",
+          seen: "2m",
+          on: true,
+          caps: { R: 1, L: 1, H: 1 },
+          staged: 3,
+        },
+      ],
+      count: 1,
+    }),
+  });
+  try {
+    const res = await fetch(`${server.baseUrl}/api/agents`, { headers: authHeaders() });
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.count, 1);
+    assert.equal(body.agents[0].id, "codex");
+  } finally {
+    await server.close();
+  }
+});
+
+test("/api/agents returns 502 when catalogue builder fails", async () => {
+  const server = await startTestServer({
+    listAgents: async () => {
+      throw new Error("socket ECONNREFUSED scanning agents");
+    },
+  });
+  try {
+    const res = await fetch(`${server.baseUrl}/api/agents`, { headers: authHeaders() });
+    assert.equal(res.status, 502);
+    const body = await res.json();
+    assert.equal(body.ok, false);
+    assert.deepEqual(body.agents, []);
+  } finally {
+    await server.close();
+  }
+});
+
+test("/api/agents requires auth (403 unauthed)", async () => {
+  const server = await startTestServer({ listAgents: async () => ({ agents: [], count: 0 }) });
+  try {
+    const res = await fetch(`${server.baseUrl}/api/agents`);
+    assert.equal(res.status, 403);
+  } finally {
+    await server.close();
+  }
+});
+
+test("/api/handoffs returns pending leases when daemon is up", async () => {
+  const server = await startTestServer({
+    daemonRpc: async (method) => {
+      if (method === "minni_list_pending_handoffs") {
+        return {
+          ok: true,
+          data: {
+            agent_id: "main",
+            handoffs: [
+              {
+                lease_id: "LS-1",
+                from_agent: "codex",
+                to_agent: "main",
+                task: "port scorecard",
+                expires_at: null,
+                path: "/tmp/inbox/x.json",
+              },
+            ],
+          },
+        };
+      }
+      throw new Error(`unexpected ${method}`);
+    },
+  });
+  try {
+    const res = await fetch(`${server.baseUrl}/api/handoffs`, { headers: authHeaders() });
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.handoffs.length, 1);
+    assert.equal(body.handoffs[0].lease_id, "LS-1");
+  } finally {
+    await server.close();
+  }
+});
+
+test("/api/handoffs returns 502 when daemon is down", async () => {
+  const server = await startTestServer({
+    daemonRpc: async () => {
+      throw new Error("socket ECONNREFUSED");
+    },
+  });
+  try {
+    const res = await fetch(`${server.baseUrl}/api/handoffs`, { headers: authHeaders() });
+    assert.equal(res.status, 502);
+    const body = await res.json();
+    assert.equal(body.ok, false);
+    assert.deepEqual(body.handoffs, []);
+  } finally {
+    await server.close();
+  }
+});
+
+test("/api/handoffs requires auth (403 unauthed)", async () => {
+  const server = await startTestServer();
+  try {
+    const res = await fetch(`${server.baseUrl}/api/handoffs`);
+    assert.equal(res.status, 403);
+  } finally {
+    await server.close();
+  }
+});
+
+test("/api/policy returns real policy report (no hardcoded v4.2)", async () => {
+  const server = await startTestServer({
+    policyReport: async () => ({
+      agentId: "main",
+      stampedForCandidates: "main",
+      caps: { R: 1, L: 1, H: 1 },
+      automaticLearning: false,
+      source: "principals + policy.ts",
+      intentRouting: { action: "recall", confidence: 0.74 },
+    }),
+  });
+  try {
+    const res = await fetch(`${server.baseUrl}/api/policy`, { headers: authHeaders() });
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.agentId, "main");
+    assert.equal(body.automaticLearning, false);
+    assert.ok(!JSON.stringify(body).includes("v4.2"));
+  } finally {
+    await server.close();
+  }
+});
+
+test("/api/policy requires auth (403 unauthed)", async () => {
+  const server = await startTestServer({ policyReport: async () => ({ agentId: "x" }) });
+  try {
+    const res = await fetch(`${server.baseUrl}/api/policy`);
+    assert.equal(res.status, 403);
+  } finally {
+    await server.close();
+  }
+});
+
+test("/api/policy returns 502 when policyReport throws", async () => {
+  const server = await startTestServer({
+    policyReport: async () => {
+      throw new Error("policy read failed");
+    },
+  });
+  try {
+    const res = await fetch(`${server.baseUrl}/api/policy`, { headers: authHeaders() });
+    assert.equal(res.status, 502);
+    const body = await res.json();
+    assert.equal(body.ok, false);
+    assert.match(body.error, /policy read failed/);
+    assert.equal(body.agentId, undefined);
+    assert.equal(body.caps, undefined);
+  } finally {
+    await server.close();
+  }
+});
+
+test("/api/recall-state returns 502 when reader throws", async () => {
+  const server = await startTestServer({
+    readRecallState: async () => {
+      throw new Error("EACCES recall-state");
+    },
+  });
+  try {
+    const res = await fetch(`${server.baseUrl}/api/recall-state`, { headers: authHeaders() });
+    assert.equal(res.status, 502);
+    const body = await res.json();
+    assert.equal(body.ok, false);
+    assert.equal(body.present, false);
+    assert.equal(body.state, null);
+    assert.match(body.error, /EACCES/);
+  } finally {
+    await server.close();
+  }
+});
+
+test("agentIdFromVaultDir maps claudecode-vault → claude-code (reuses vault.ts getAgentIdFromVaultPath)", async () => {
+  const { agentIdFromVaultDir } = await import("../dist/ui-server.js");
+  const { getAgentIdFromVaultPath } = await import("../dist/vault.js");
+  assert.equal(agentIdFromVaultDir, getAgentIdFromVaultPath, "ui-server must re-export the vault.ts helper, not reimplement it");
+
+  const pathMod = await import("node:path");
+  const { mkdtempSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const home = mkdtempSync(pathMod.join(tmpdir(), "minni-agentid-"));
+
+  // "claudecode-vault" only maps to "claude-code" via the hardcoded ~/.minni
+  // path or a MINNI_CLAUDECODE_VAULT_PATH override — exercise the override so
+  // this test does not depend on the real $HOME layout.
+  const claudecodeVault = pathMod.join(home, "claudecode-vault");
+  const original = process.env.MINNI_CLAUDECODE_VAULT_PATH;
+  process.env.MINNI_CLAUDECODE_VAULT_PATH = claudecodeVault;
+  try {
+    assert.equal(agentIdFromVaultDir(claudecodeVault), "claude-code");
+  } finally {
+    if (original === undefined) delete process.env.MINNI_CLAUDECODE_VAULT_PATH;
+    else process.env.MINNI_CLAUDECODE_VAULT_PATH = original;
+  }
+
+  // Unmapped basenames fall back to stripping the "-vault" suffix.
+  assert.equal(agentIdFromVaultDir(pathMod.join(home, "codex-vault")), "codex");
+  assert.equal(agentIdFromVaultDir(pathMod.join(home, "grok-build-vault")), "grok-build");
+
+  // Known aliases normalize even under a non-default home with no env
+  // override: claudecode-vault must map to the claude-code principal,
+  // never a capability-less "claudecode".
+  assert.equal(agentIdFromVaultDir(pathMod.join(home, "other", "claudecode-vault")), "claude-code");
+  assert.equal(agentIdFromVaultDir(pathMod.join(home, "other", "claude-vault")), "claude-code");
+});
+
+test("buildPolicyReport pulls caps + intent routing without inventing automaticLearning", async () => {
+  const { buildPolicyReport } = await import("../dist/ui-server.js");
+  const { DEFAULT_AGENT_ID } = await import("../dist/config.js");
+  const { mkdtempSync, mkdirSync, writeFileSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const pathMod = await import("node:path");
+  const home = mkdtempSync(pathMod.join(tmpdir(), "minni-policy-"));
+  mkdirSync(pathMod.join(home, "principals"), { recursive: true });
+  // Own-principal file keyed to the console agent's own id (not "main") — caps
+  // must come from the agent's own file, never the operator's "main" fallback.
+  writeFileSync(
+    pathMod.join(home, "principals", `${DEFAULT_AGENT_ID}.json`),
+    JSON.stringify({
+      agent_id: DEFAULT_AGENT_ID,
+      capabilities: ["search", "read", "learn", "handoff"],
+    }),
+  );
+  const report = await buildPolicyReport({
+    homePath: home,
+    vaultPath: pathMod.join(home, "unknown-vault"),
+    status: async () => ({
+      afm: { ok: true, data: { status: "ok" } },
+      // no automaticLearning field → omit from report
+    }),
+  });
+  assert.equal(typeof report.agentId, "string");
+  assert.ok(report.caps);
+  assert.equal(report.caps.R, 1);
+  assert.equal(report.caps.L, 1);
+  assert.equal(report.caps.H, 1);
+  assert.ok(report.intentRouting);
+  assert.equal(report.automaticLearning, undefined);
+  assert.equal(report.capsSource, "own_principal");
+  assert.ok(!JSON.stringify(report).includes("v4.2"));
+});
+
+test("buildPolicyReport default-denies when the agent has no own principal file (no 'main' fallback)", async () => {
+  const { buildPolicyReport } = await import("../dist/ui-server.js");
+  const { mkdtempSync, mkdirSync, writeFileSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const pathMod = await import("node:path");
+  const home = mkdtempSync(pathMod.join(tmpdir(), "minni-policy-nofallback-"));
+  mkdirSync(pathMod.join(home, "principals"), { recursive: true });
+  // Only the operator's "main" principal exists — the console agent (DEFAULT_AGENT_ID,
+  // "unknown-agent" by default in test env) has no principals/<agentId>.json.
+  writeFileSync(
+    pathMod.join(home, "principals", "main.json"),
+    JSON.stringify({ agent_id: "main", capabilities: ["*"] }),
+  );
+  const report = await buildPolicyReport({
+    homePath: home,
+    vaultPath: pathMod.join(home, "unknown-vault"),
+    status: async () => ({ afm: { ok: true, data: { status: "ok" } } }),
+  });
+  assert.deepEqual(report.caps, { R: 0, L: 0, H: 0 }, "must not inherit main's caps");
+  assert.equal(report.capsSource, "default_deny");
+  assert.ok(report.principalsKnown.includes("main"), "main is still visible in the known-principals list");
+});
+
+test("buildAgentsCatalogue is fail-loud on staged RPC and skips symlink vaults", async () => {
+  const { buildAgentsCatalogue, readOnlyAuditTail } = await import("../dist/ui-server.js");
+  const { mkdtempSync, mkdirSync, writeFileSync, symlinkSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const pathMod = await import("node:path");
+  const home = mkdtempSync(pathMod.join(tmpdir(), "minni-agents-cat-"));
+  mkdirSync(pathMod.join(home, "codex-vault", "logs"), { recursive: true });
+  writeFileSync(
+    pathMod.join(home, "codex-vault", "logs", new Date().toISOString().slice(0, 10) + ".md"),
+    `## [${new Date().toISOString()}] learn | note\n`,
+  );
+  // Symlink poison vault outside home — must be skipped
+  const outside = mkdtempSync(pathMod.join(tmpdir(), "minni-outside-"));
+  try {
+    symlinkSync(outside, pathMod.join(home, "poison-vault"));
+  } catch {
+    // platform without symlink support
+  }
+
+  const catalogue = await buildAgentsCatalogue({
+    homePath: home,
+    daemonRpc: async (method, params) => {
+      if (method === "list_candidates" && params.agent_id === "codex") {
+        throw new Error("socket ECONNREFUSED");
+      }
+      return { candidates: [], count: 0 };
+    },
+    auditTailFn: readOnlyAuditTail,
+  });
+  assert.ok(catalogue.agents.every((a) => a.id !== "poison"));
+  const codex = catalogue.agents.find((a) => a.id === "codex");
+  assert.ok(codex, "codex vault should be listed");
+  assert.equal(codex.staged, null);
+  assert.equal(codex.stagedUnknown, true);
+  assert.ok(!("vaultPath" in codex) || codex.vaultPath === undefined);
+});
+
+test("buildAgentsCatalogue flags stagedAtLimit when the RPC returns a full page, and preserves order under concurrency", async () => {
+  const { buildAgentsCatalogue } = await import("../dist/ui-server.js");
+  const { mkdtempSync, mkdirSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const pathMod = await import("node:path");
+  const home = mkdtempSync(pathMod.join(tmpdir(), "minni-agents-limit-"));
+  // Three vaults, deliberately created so a naive concurrent scan without
+  // ordering care could interleave; agents.map(a => a.id) must still come
+  // back alphabetically sorted (alpha, bravo, codex) like the old sequential loop.
+  for (const name of ["codex-vault", "bravo-vault", "alpha-vault"]) {
+    mkdirSync(pathMod.join(home, name), { recursive: true });
+  }
+
+  const callOrder = [];
+  const catalogue = await buildAgentsCatalogue({
+    homePath: home,
+    auditTailFn: async (vaultPath) => {
+      // codex resolves slowest, to prove ordering doesn't depend on completion time.
+      const delayMs = vaultPath.includes("codex") ? 15 : 1;
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+      return { entries: [] };
+    },
+    daemonRpc: async (method, params) => {
+      callOrder.push(params.agent_id);
+      if (params.agent_id === "codex") {
+        // Full page: count is a floor, not the true total.
+        return { candidates: Array.from({ length: 200 }, (_, i) => ({ candidate_id: i })), count: 200 };
+      }
+      return { candidates: [], count: 0 };
+    },
+  });
+
+  assert.deepEqual(catalogue.agents.map((a) => a.id), ["alpha", "bravo", "codex"], "output order matches sorted vault dirs");
+  // The RPCs themselves ran concurrently (not sequentially in sorted order).
+  assert.ok(callOrder.length === 3);
+
+  const codex = catalogue.agents.find((a) => a.id === "codex");
+  assert.equal(codex.staged, 200);
+  assert.equal(codex.stagedAtLimit, true);
+  assert.equal(codex.stagedUnknown, false);
+
+  const alpha = catalogue.agents.find((a) => a.id === "alpha");
+  assert.equal(alpha.staged, 0);
+  assert.equal(alpha.stagedAtLimit, false);
 });

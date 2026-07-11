@@ -548,7 +548,7 @@ function escapeAuditDetailsBlock(raw: string): string {
   return block;
 }
 
-function getAgentIdFromVaultPath(vaultPath: string): string {
+export function getAgentIdFromVaultPath(vaultPath: string): string {
   const absPath = path.resolve(vaultPath.replace(/^~(?=$|\/)/, os.homedir()));
 
   const mappingRaw = process.env.MINNI_AGENT_VAULTS;
@@ -586,7 +586,14 @@ function getAgentIdFromVaultPath(vaultPath: string): string {
   if (absPath === path.join(homedir, ".minni", "openclaw-vault")) return "openclaw";
 
   const base = path.basename(absPath);
-  if (base.endsWith("-vault")) return base.substring(0, base.length - 6);
+  if (base.endsWith("-vault")) {
+    const stripped = base.substring(0, base.length - 6);
+    // Known basename aliases must normalize regardless of parent dir, so a
+    // claudecode-vault under a non-default MINNI_HOME still maps to the
+    // claude-code principal instead of a capability-less "claudecode".
+    if (stripped === "claudecode" || stripped === "claude") return "claude-code";
+    return stripped;
+  }
   return base || "agent";
 }
 

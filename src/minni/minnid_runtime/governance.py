@@ -8,8 +8,18 @@ from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
 from minni.db import SovereignDB
+from minni.migrations import _candidate_status_check_allows_dns_log_only
 from minni.principal import EffectivePrincipal, is_operator_principal, validate_agent_id
 from minni.safety import is_instruction_like
+
+# Migration-015 probe. db.py treats a failed migrations run as non-fatal
+# (warns and keeps serving), so a live daemon can run against a DB whose
+# candidate_packets CHECK still predates 015 and rejects the do_not_store /
+# log_only statuses. Probe the CHECK lazily — only when those statuses are
+# requested. No memo: resolve_candidate opens a fresh connection per call,
+# so a per-connection cache never hits and only retains closed connections.
+def _check_allows_dns_log_only(conn: Any) -> bool:
+    return _candidate_status_check_allows_dns_log_only(conn)
 
 
 logger = logging.getLogger("minnid")
@@ -743,8 +753,11 @@ def resolve_candidate(params: dict, request_id: Any, context: GovernanceContext)
         "learn": "accepted",
         "reject": "rejected",
         "redact": "redacted",
-        "do_not_store": "rejected",
-        "log_only": "rejected",
+        # Distinct statuses so quarantine / log-only zones can list them
+        # (list_candidates filters by status string). Pre-change rows stay
+        # "rejected" — no migration; zones populate going forward.
+        "do_not_store": "do_not_store",
+        "log_only": "log_only",
         "merge": "merged",
         "supersede": "superseded",
     }
@@ -837,13 +850,31 @@ def resolve_candidate(params: dict, request_id: Any, context: GovernanceContext)
                 )
                 lid = c.lastrowid
 
+            # Migration-015 guard: on a pre-015 schema the candidate_packets
+            # CHECK does not admit do_not_store / log_only, so the UPDATE would
+            # raise IntegrityError and strand the candidate in 'proposed'.
+            # Degrade to the legacy 'rejected' status (pre-015 behavior collapsed
+            # both decisions to 'rejected') while recording the operator's true
+            # intent in resolution_reason.
+            resolution_reason = reason
+            if new_status in ("do_not_store", "log_only") and not _check_allows_dns_log_only(
+                c.connection
+            ):
+                context.logger.warning(
+                    "RESOLVE_CANDIDATE candidate=%s intended_status=%s not admitted by "
+                    "pre-015 candidate_packets CHECK; writing 'rejected' instead (G15 audit)",
+                    cid, new_status,
+                )
+                resolution_reason = f"{reason} [intended_status={new_status}; schema pre-015]"
+                new_status = "rejected"
+
             c.execute(
                 """
                 UPDATE candidate_packets
                 SET status=?, resolved_at=?, resolved_by=?, resolution_reason=?
                 WHERE candidate_id=?
                 """,
-                (new_status, now, principal.agent_id, reason, cid),
+                (new_status, now, principal.agent_id, resolution_reason, cid),
             )
 
         if lid is not None:

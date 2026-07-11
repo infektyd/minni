@@ -240,8 +240,12 @@ export async function writeRecallState(
 
 /** Read the recall-state file, or null when absent/malformed. */
 export async function readRecallState(vaultPath: string): Promise<RecallState | null> {
+  const filePath = recallStatePath(vaultPath);
   try {
-    const raw = await readFile(recallStatePath(vaultPath), "utf8");
+    // Mirror write policy: refuse to follow a symlinked state file or
+    // .runtime parent that escapes the vault (Issue: path disclosure via GET).
+    assertWriteTargetUnder(filePath, vaultPath);
+    const raw = await readFile(filePath, "utf8");
     const parsed = JSON.parse(raw) as RecallState;
     if (
       parsed &&
@@ -252,6 +256,13 @@ export async function readRecallState(vaultPath: string): Promise<RecallState | 
       return parsed;
     }
   } catch (error) {
+    // Containment failures (symlink escape) → treat as absent, not disclosure.
+    if (
+      error instanceof Error &&
+      /symlink|escapes root|containment/i.test(error.message)
+    ) {
+      return null;
+    }
     if (!shouldIgnoreStateReadError(error)) {
       throw error;
     }

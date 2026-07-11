@@ -1,17 +1,24 @@
 // Minni Memory Board — zone detail views (what each zone morphs into).
-import { Fragment, useMemo, useState } from "react";
+import { Fragment, useEffect, useMemo, useState } from "react";
 import {
   agentColor,
-  SAMPLE_AGENTS,
-  SAMPLE_DENY,
-  SAMPLE_LEARNINGS,
-  SAMPLE_LOGS,
-  SAMPLE_RECALL,
+  zoneGate,
+  type BoardAgent,
+  type BoardDeny,
+  type BoardLog,
+  type BoardRecallResult,
   type DaemonInfo,
   type ZoneId,
 } from "./boardData";
-import { type StagedLearningsState } from "./boardDataHook";
-import { applyVerdict, pendingCount, sortLearnings, type Verdict } from "./boardLogic";
+import {
+  type StagedLearningsState,
+  type ZoneDataState,
+  type RecallZoneData,
+} from "./boardDataHook";
+import { pendingCount, sortLearnings, type Verdict } from "./boardLogic";
+
+// Re-export for callers that imported zoneGate from BoardDetails.
+export { zoneGate };
 
 export interface BoardDetailContext {
   daemon: DaemonInfo;
@@ -26,8 +33,45 @@ function Meter({ v }: { v: number }) {
   );
 }
 
+/** Shared fail-loud offline banner for zone detail views. */
+export function ZoneOffline({
+  error,
+  onRetry,
+  emptyHint,
+}: {
+  error: string | null;
+  onRetry?: () => void;
+  emptyHint?: string;
+}) {
+  return (
+    <div className="dz">
+      <div className="callout-band risk" role="alert">
+        <span className="label">OFFLINE</span>
+        {error || "Zone data unavailable"}
+      </div>
+      {onRetry ? (
+        <div className="dz-foot" style={{ marginTop: 12 }}>
+          <button className="bd-btn primary sm" type="button" onClick={() => void onRetry()}>
+            Retry
+          </button>
+        </div>
+      ) : null}
+      {emptyHint ? <div className="dz-foot">{emptyHint}</div> : null}
+    </div>
+  );
+}
+
+function ZoneLoading({ label }: { label: string }) {
+  return (
+    <div className="dz">
+      <div className="callout-band">Loading {label}…</div>
+    </div>
+  );
+}
+
 // ── STAGED — filterable, sortable wall of learnings ─────────────────────────
 function StagedDetail({ stagedState }: { stagedState?: StagedLearningsState }) {
+  // All hooks must run unconditionally (before any early return).
   const [filter, setFilter] = useState<string>("all");
   const [sort, setSort] = useState<"score" | "age">("score");
   const [sel, setSel] = useState<string | null>(null);
@@ -35,26 +79,26 @@ function StagedDetail({ stagedState }: { stagedState?: StagedLearningsState }) {
   const [resError, setResError] = useState<string | null>(null);
   const [resolvingId, setResolvingId] = useState<string | null>(null);
 
-  const learnings = stagedState?.learnings || SAMPLE_LEARNINGS;
+  const learnings = stagedState?.learnings || [];
   const isLive = stagedState?.isLive ?? false;
   const resolve = stagedState?.resolve;
+  const gate = zoneGate(stagedState, "staged");
 
-  // DEFECT 6: Clear verdicts for resolved rows when learnings shrink after refetch
-  useMemo(() => {
-    if (isLive) {
-      const liveIds = new Set(learnings.map(l => l.id));
-      setVerdicts(prev => {
-        const cleaned = { ...prev };
-        let changed = false;
-        for (const id of Object.keys(cleaned)) {
-          if (!liveIds.has(id)) {
-            delete cleaned[id];
-            changed = true;
-          }
+  // Clear verdicts for resolved rows when learnings shrink after refetch
+  useEffect(() => {
+    if (!isLive) return;
+    const liveIds = new Set(learnings.map((l) => l.id));
+    setVerdicts((prev) => {
+      const cleaned = { ...prev };
+      let changed = false;
+      for (const id of Object.keys(cleaned)) {
+        if (!liveIds.has(id)) {
+          delete cleaned[id];
+          changed = true;
         }
-        return changed ? cleaned : prev;
-      });
-    }
+      }
+      return changed ? cleaned : prev;
+    });
   }, [learnings, isLive]);
 
   const agents = useMemo(() => {
@@ -66,38 +110,39 @@ function StagedDetail({ stagedState }: { stagedState?: StagedLearningsState }) {
   }, [learnings]);
 
   const list = useMemo(() => {
-    const base =
-      filter === "all"
-        ? learnings
-        : learnings.filter((l) => l.agent === filter);
-    // "recency" is a real sort on the chronological `order` (0 = newest), not a
-    // no-op relying on array order — see sortLearnings in boardLogic.
+    const base = filter === "all" ? learnings : learnings.filter((l) => l.agent === filter);
     return sortLearnings(base, sort);
   }, [filter, sort, learnings]);
 
   const pending = pendingCount(learnings.length, verdicts);
 
-  // Toggling a verdict off DELETES the key (not `undefined`) so PENDING
-  // recovers — see applyVerdict in boardLogic.
+  if (gate === "loading") return <ZoneLoading label="staged" />;
+  if (gate === "offline") {
+    return (
+      <ZoneOffline
+        error={stagedState?.error ?? "Staged zone offline"}
+        onRetry={stagedState?.refresh}
+        emptyHint="Staged zone is offline — no sample fallback."
+      />
+    );
+  }
+
   const verdict = async (id: string, v: Verdict) => {
-    // DEFECT 7: Guard against double-click / in-flight race
     if (resolvingId === id) return;
-    
-    if (isLive && resolve) {
-      // Call API resolution when live
-      setResError(null);
-      setResolvingId(id);
-      try {
-        const decision = v === "ok" ? "accepted" : "rejected";
-        await resolve(id, decision);
-      } catch (err: any) {
-        setResError(err?.message || "Resolution failed");
-      } finally {
-        setResolvingId(null);
-      }
-    } else {
-      // Local verdict tracking in sample mode
-      setVerdicts((prev) => applyVerdict(prev, id, v));
+    // Actions only when live — no local sample-mode applyVerdict path.
+    if (!isLive || !resolve) {
+      setResError("Cannot resolve while staged zone is offline");
+      return;
+    }
+    setResError(null);
+    setResolvingId(id);
+    try {
+      const decision = v === "ok" ? "accepted" : "rejected";
+      await resolve(id, decision);
+    } catch (err: unknown) {
+      setResError(err instanceof Error ? err.message : "Resolution failed");
+    } finally {
+      setResolvingId(null);
     }
   };
 
@@ -132,135 +177,143 @@ function StagedDetail({ stagedState }: { stagedState?: StagedLearningsState }) {
           </button>
         </div>
       </div>
-      <div className="lgrid">
-        {list.map((l) => {
-          const v = verdicts[l.id];
-          return (
-            <div
-              key={l.id}
-              className={
-                "lcard" +
-                (sel === l.id ? " sel" : "") +
-                (v === "ok" ? " ok" : "") +
-                (v === "no" ? " no" : "")
-              }
-              onClick={() => setSel(sel === l.id ? null : l.id)}
-            >
-              <div className="lc-top">
-                <span className="dot" style={{ background: agentColor(l.agent) }} />
-                <span className="lc-agent">{l.agent}</span>
-                {typeof l.score === 'number' ? <Meter v={l.score} /> : <span className="meter-placeholder">—</span>}
-                <span className="lc-score">{typeof l.score === 'number' ? l.score.toFixed(2) : l.score}</span>
-              </div>
-              <div className="lc-title">{l.title}</div>
-              <div className="lc-meta">
-                {l.id} · {l.src} · {l.age}
-                {l.tag ? " · " : ""}
-                {l.tag ? (
-                  <span className="bd-chip info" style={{ fontSize: "8.5px" }}>
-                    {l.tag}
+      {learnings.length === 0 ? (
+        <div className="callout-band">none staged</div>
+      ) : (
+        <div className="lgrid">
+          {list.map((l) => {
+            const v = verdicts[l.id];
+            return (
+              <div
+                key={l.id}
+                className={
+                  "lcard" +
+                  (sel === l.id ? " sel" : "") +
+                  (v === "ok" ? " ok" : "") +
+                  (v === "no" ? " no" : "")
+                }
+                onClick={() => setSel(sel === l.id ? null : l.id)}
+              >
+                <div className="lc-top">
+                  <span className="dot" style={{ background: agentColor(l.agent) }} />
+                  <span className="lc-agent">{l.agent}</span>
+                  {typeof l.score === "number" ? (
+                    <Meter v={l.score} />
+                  ) : (
+                    <span className="meter-placeholder">—</span>
+                  )}
+                  <span className="lc-score">
+                    {typeof l.score === "number" ? l.score.toFixed(2) : l.score}
                   </span>
-                ) : null}
+                </div>
+                <div className="lc-title">{l.title}</div>
+                <div className="lc-meta">
+                  {l.id} · {l.src} · {l.age}
+                  {l.tag ? " · " : ""}
+                  {l.tag ? (
+                    <span className="bd-chip info" style={{ fontSize: "8.5px" }}>
+                      {l.tag}
+                    </span>
+                  ) : null}
+                </div>
+                <div className="lc-actions">
+                  {v === "ok" ? (
+                    <span className="bd-chip safe">✓ APPROVED</span>
+                  ) : v === "no" ? (
+                    <span className="bd-chip danger">✕ REJECTED</span>
+                  ) : (
+                    <Fragment>
+                      <button
+                        className="bd-btn primary sm"
+                        disabled={!isLive || !resolve || resolvingId === l.id}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          void verdict(l.id, "ok");
+                        }}
+                      >
+                        ✓ Approve
+                      </button>
+                      <button
+                        className="bd-btn quiet sm"
+                        disabled={!isLive || !resolve || resolvingId === l.id}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          void verdict(l.id, "no");
+                        }}
+                      >
+                        ✕ Reject
+                      </button>
+                    </Fragment>
+                  )}
+                </div>
               </div>
-              <div className="lc-actions">
-                {v === "ok" ? (
-                  <span className="bd-chip safe">✓ APPROVED</span>
-                ) : v === "no" ? (
-                  <span className="bd-chip danger">✕ REJECTED</span>
-                ) : (
-                  <Fragment>
-                    <button
-                      className="bd-btn primary sm"
-                      disabled={resolvingId === l.id}
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        verdict(l.id, "ok");
-                      }}
-                    >
-                      ✓ Approve
-                    </button>
-                    <button
-                      className="bd-btn quiet sm"
-                      disabled={resolvingId === l.id}
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        verdict(l.id, "no");
-                      }}
-                    >
-                      ✕ Reject
-                    </button>
-                  </Fragment>
-                )}
-                {v ? (
-                  <button
-                    className="bd-btn quiet sm"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      verdict(l.id, v);
-                    }}
-                  >
-                    Undo
-                  </button>
-                ) : null}
-              </div>
-            </div>
-          );
-        })}
-      </div>
+            );
+          })}
+        </div>
+      )}
       <div className="dz-foot">
-        {isLive
-          ? "Decisions submitted to daemon via /api/resolve-candidate"
-          : "Sample candidates only. Nothing is stored from this board pass."}
+        {resError
+          ? `Resolve error: ${resError}`
+          : stagedState?.error
+            ? `Staged fetch error: ${stagedState.error}`
+            : isLive
+              ? learnings.length === 0
+                ? "Live empty for this console principal — no proposed candidates owned by the stamped agent."
+                : "Reject/redact via /api/resolve-candidate as the stamped owner. Accept into durable memory needs operator/govern (or MINNI_RESOLVE_OPERATORS) — not granted to this console principal."
+              : "Staged zone offline."}
       </div>
     </div>
   );
 }
 
 // ── RUNTIMES ────────────────────────────────────────────────────────────────
-function AgentsDetail() {
+function AgentsDetail({ agentsState }: { agentsState?: ZoneDataState<BoardAgent[]> }) {
+  const gate = zoneGate(agentsState, "runtimes");
+  if (gate === "loading") return <ZoneLoading label="runtimes" />;
+  if (gate === "offline") {
+    return <ZoneOffline error={agentsState?.error ?? "Runtimes offline"} onRetry={agentsState?.refresh} />;
+  }
+  const agents = agentsState?.data || [];
   return (
     <div className="dz">
-      <div className="agrid">
-        {SAMPLE_AGENTS.map((a) => (
-          <div key={a.id} className="acard">
-            <div className="ac-hd">
-              <span className="dot lg" style={{ background: a.on ? "var(--verdigris)" : "var(--disabled)" }} />
-              <span className="ac-name">{a.id}</span>
-              <span className="ac-seen">seen {a.seen} ago</span>
+      {agents.length === 0 ? (
+        <div className="callout-band">no agent vaults under ~/.minni/*-vault</div>
+      ) : (
+        <div className="agrid">
+          {agents.map((a) => (
+            <div key={a.id} className="acard">
+              <div className="ac-hd">
+                <span
+                  className="dot lg"
+                  style={{ background: a.on ? "var(--verdigris)" : "var(--disabled)" }}
+                />
+                <span className="ac-name">{a.id}</span>
+                <span className="ac-seen">seen {a.seen}</span>
+              </div>
+              <div className="ac-vault">{a.vault}</div>
+              <div className="ac-caps">
+                <span className={"bd-chip " + (a.caps.R ? "safe" : "danger")}>
+                  RECALL{a.caps.R ? "" : " ✕"}
+                </span>
+                <span className={"bd-chip " + (a.caps.L ? "safe" : "danger")}>
+                  LEARN{a.caps.L ? "" : " ✕"}
+                </span>
+                <span className={"bd-chip " + (a.caps.H ? "safe" : "danger")}>
+                  HANDOFF{a.caps.H ? "" : " ✕"}
+                </span>
+              </div>
+              <div className="ac-stats">
+                <span>
+                  <b>{a.staged == null ? "—" : a.staged}</b> staged
+                </span>
+                {a.note ? <span className="ac-note">⚠ {a.note}</span> : null}
+              </div>
             </div>
-            <div className="ac-vault">{a.vault}</div>
-            <div className="ac-caps">
-              <span className={"bd-chip " + (a.caps.R ? "safe" : "danger")}>RECALL{a.caps.R ? "" : " ✕"}</span>
-              <span className={"bd-chip " + (a.caps.L ? "safe" : "danger")}>LEARN{a.caps.L ? "" : " ✕"}</span>
-              <span className={"bd-chip " + (a.caps.H ? "safe" : "danger")}>HANDOFF{a.caps.H ? "" : " ✕"}</span>
-            </div>
-            <div className="ac-stats">
-              <span>
-                <b>{a.staged}</b> staged this week
-              </span>
-              {a.note ? <span className="ac-note">⚠ {a.note}</span> : null}
-            </div>
-          </div>
-        ))}
-        <div className="acard lease-card">
-          <div className="ac-hd">
-            <span className="bd-chip warn">AWAITING-ACK</span>
-            <span className="ac-name" style={{ fontSize: "14px" }}>
-              Open lease
-            </span>
-          </div>
-          <div className="ac-vault">
-            LS-2231 · claude-code → codex · “Port membench scorecard diff to CI” · 42m · TTL 15m, renewable
-            once
-          </div>
-          <div className="ac-caps">
-            <button className="bd-btn quiet sm">Revoke</button>
-            <button className="bd-btn quiet sm">Nudge codex</button>
-          </div>
+          ))}
         </div>
-      </div>
+      )}
       <div className="dz-foot">
-        Sample runtime fixture. Capabilities shown here are not live grants.
+        Live runtime catalogue from /api/agents (vault scan + principals caps + staged counts).
       </div>
     </div>
   );
@@ -294,9 +347,7 @@ function HubDetail({ ctx }: { ctx: BoardDetailContext }) {
           </div>
           <div className="kv">
             <span>AFM</span>
-            <b>
-              {daemon.afmHealth}
-            </b>
+            <b>{daemon.afmHealth}</b>
           </div>
         </div>
         <div className="dcard">
@@ -315,7 +366,11 @@ function HubDetail({ ctx }: { ctx: BoardDetailContext }) {
           </div>
           <div className="kv">
             <span>audit</span>
-            <b>{daemon.auditEntries === "—" ? "—" : `${daemon.auditEntries} entries recorded`}</b>
+            <b>
+              {daemon.auditEntries === "—"
+                ? "—"
+                : `${daemon.auditEntries} entries recorded`}
+            </b>
           </div>
         </div>
       </div>
@@ -338,146 +393,276 @@ function HubDetail({ ctx }: { ctx: BoardDetailContext }) {
 }
 
 // ── LOG-ONLY ────────────────────────────────────────────────────────────────
-function LogsDetail() {
+function LogsDetail({ logState }: { logState?: ZoneDataState<BoardLog[]> }) {
+  const gate = zoneGate(logState, "log-only");
+  if (gate === "loading") return <ZoneLoading label="log-only" />;
+  if (gate === "offline") {
+    return <ZoneOffline error={logState?.error ?? "Log-only offline"} onRetry={logState?.refresh} />;
+  }
+  const logs = logState?.data || [];
   return (
     <div className="dz">
-      <div className="callout-band">
-        Sample log-only entries. These are not live personal-leg records.
-      </div>
-      {SAMPLE_LOGS.map((l) => (
-        <div key={l.id} className="logrow">
-          <span className="klass log">LOG</span>
-          <span className="bd-chip danger">PRIVATE</span>
-          <div className="lr-body">
-            <div className="lr-t">{l.title}</div>
-            <div className="lr-m">
-              {l.id} · {l.agent} · {l.age}
+      {logs.length === 0 ? (
+        <div className="callout-band">no log-only candidates</div>
+      ) : (
+        logs.map((l) => (
+          <div key={l.id} className="logrow">
+            <span className="klass log">LOG</span>
+            <span className="bd-chip danger">PRIVATE</span>
+            <div className="lr-body">
+              <div className="lr-t">{l.title}</div>
+              <div className="lr-m">
+                {l.id} · {l.agent} · {l.age}
+              </div>
             </div>
+            {l.score > 0 ? (
+              <>
+                <Meter v={l.score} />
+                <span className="lc-score">{l.score.toFixed(2)}</span>
+              </>
+            ) : (
+              <span className="lc-score">—</span>
+            )}
           </div>
-          <Meter v={l.score} />
-          <span className="lc-score">{l.score.toFixed(2)}</span>
-          <button className="bd-btn quiet sm">Forget</button>
-        </div>
-      ))}
+        ))
+      )}
+      <div className="dz-foot">
+        Live log-only candidates from /api/log-only (status=log_only).
+      </div>
     </div>
   );
 }
 
 // ── QUARANTINE ──────────────────────────────────────────────────────────────
-function QuarantineDetail() {
+function QuarantineDetail({
+  quarantineState,
+}: {
+  quarantineState?: ZoneDataState<BoardDeny[]>;
+}) {
+  const gate = zoneGate(quarantineState, "quarantine");
+  if (gate === "loading") return <ZoneLoading label="quarantine" />;
+  if (gate === "offline") {
+    return (
+      <ZoneOffline
+        error={quarantineState?.error ?? "Quarantine offline"}
+        onRetry={quarantineState?.refresh}
+      />
+    );
+  }
+  const items = quarantineState?.data || [];
+  if (items.length === 0) {
+    return (
+      <div className="dz q-dz">
+        <div className="callout-band">quarantine clear</div>
+        <div className="dz-foot">
+          Live do_not_store candidates from /api/quarantine. Nothing quarantined for this principal.
+        </div>
+      </div>
+    );
+  }
   return (
     <div className="dz q-dz">
-      <div className="dcard">
-        <div className="fid">
-          {SAMPLE_DENY.id} <span className="klass deny">DO-NOT-STORE</span>{" "}
-          <span className="bd-chip info">SAMPLE</span>{" "}
-          <span className="bd-chip warn">AFM: DEFUSED</span>{" "}
-          <span className="lc-score" style={{ marginLeft: "auto" }}>
-            {SAMPLE_DENY.score.toFixed(2)}
-          </span>
+      {items.map((deny) => (
+        <div key={deny.id} className="dcard" style={{ marginBottom: 12 }}>
+          <div className="fid">
+            {deny.id} <span className="klass deny">DO-NOT-STORE</span>{" "}
+            <span className="bd-chip warn">QUARANTINE</span>{" "}
+            {deny.score > 0 ? (
+              <span className="lc-score" style={{ marginLeft: "auto" }}>
+                {deny.score.toFixed(2)}
+              </span>
+            ) : null}
+          </div>
+          <div className="q-title">{deny.title}</div>
+          <div className="codeblk">{deny.body}</div>
+          <div className="dc-t" style={{ marginTop: "14px" }}>
+            Provenance
+          </div>
+          <div className="kv">
+            <span>source</span>
+            <b>{deny.src}</b>
+          </div>
+          <div className="kv">
+            <span>agent</span>
+            <b>{deny.agent}</b>
+          </div>
+          <div className="kv">
+            <span>age</span>
+            <b>{deny.ingested}</b>
+          </div>
+          <div className="callout risk">
+            <span className="label">DO-NOT-STORE</span>
+            {deny.risk}
+          </div>
         </div>
-        <div className="q-title">{SAMPLE_DENY.title}</div>
-        <div className="codeblk">{SAMPLE_DENY.body}</div>
-        <div className="dc-t" style={{ marginTop: "14px" }}>
-          Provenance
-        </div>
-        <div className="kv">
-          <span>source</span>
-          <b>{SAMPLE_DENY.src}</b>
-        </div>
-        <div className="kv">
-          <span>ingested</span>
-          <b>{SAMPLE_DENY.ingested}</b>
-        </div>
-        <div className="kv">
-          <span>hash</span>
-          <b>{SAMPLE_DENY.hash}</b>
-        </div>
-        <div className="callout risk">
-          <span className="label">INSTRUCTION-LIKE · DEFUSED</span>
-          {SAMPLE_DENY.risk}
-        </div>
-        <div className="q-actions">
-          <button className="bd-btn danger">✕ Confirm do-not-store</button>
-          <button className="bd-btn quiet">Redact &amp; re-stage</button>
-          <button className="bd-btn quiet">View raw note</button>
-        </div>
+      ))}
+      <div className="dz-foot">
+        Live quarantine from /api/quarantine. Resolve via MCP minni_resolve_candidate when governing.
       </div>
     </div>
   );
 }
 
 // ── RECALL ──────────────────────────────────────────────────────────────────
-function RecallDetail() {
+function RecallDetail({
+  recallState,
+  onOpenRecall,
+}: {
+  recallState?: ZoneDataState<RecallZoneData>;
+  onOpenRecall?: (query?: string) => void;
+}) {
+  // Hooks must run unconditionally (before any early return).
   const [sel, setSel] = useState(0);
-  const active = SAMPLE_RECALL[sel];
+  const [query, setQuery] = useState("");
+  const [queryDirty, setQueryDirty] = useState(false);
+
+  const data = recallState?.data;
+  const results: BoardRecallResult[] = data?.results || [];
+  const gate = zoneGate(recallState, "recall");
+
+  // Sync input from live recall-state when the user has not edited it.
+  useEffect(() => {
+    if (queryDirty) return;
+    const next = data?.query || "";
+    setQuery(next);
+  }, [data?.query, queryDirty]);
+
+  if (gate === "loading") return <ZoneLoading label="recall" />;
+  if (gate === "offline") {
+    return (
+      <ZoneOffline
+        error={recallState?.error ?? "Recall offline"}
+        onRetry={recallState?.refresh}
+      />
+    );
+  }
+
+  const active = results[sel];
+
   return (
     <div className="dz recall-dz">
       <div className="rcol">
         <div className="rsearch">
-          <input className="bd-input" defaultValue="handoff leases" aria-label="Recall query" />
-          <button className="bd-btn primary">Recall</button>
+          <input
+            className="bd-input"
+            value={query}
+            onChange={(e) => {
+              setQueryDirty(true);
+              setQuery(e.target.value);
+            }}
+            aria-label="Recall query"
+            placeholder={data?.query || "query…"}
+          />
+          <button
+            className="bd-btn primary"
+            type="button"
+            onClick={() => onOpenRecall?.(query.trim() || undefined)}
+            disabled={!onOpenRecall}
+          >
+            Open in console Recall
+          </button>
         </div>
         <div className="r-meta">
-          Sample query · 5 results · both legs · rank-fusion · 212 ms ·{" "}
-          <span className="bd-chip info">CITED, NEVER OBEYED</span>
+          {data?.present
+            ? `Last strong recall · ${results.length} hit${results.length === 1 ? "" : "s"}`
+            : data?.message || "no recent recall"}{" "}
+          · <span className="bd-chip info">CITED, NEVER OBEYED</span>
         </div>
-        {SAMPLE_RECALL.map((r, i) => (
-          <button
-            key={r.path}
-            className={"rrow" + (sel === i ? " sel" : "")}
-            onClick={() => setSel(i)}
-          >
-            <Meter v={r.score} />
-            <span className="lc-score">{r.score.toFixed(2)}</span>
-            <div className="lr-body">
-              <div className="lr-t mono-t">{r.path}</div>
-              <div className="lr-m">
-                {r.sub} · {r.cls} · {r.priv} · {r.age}
+        {results.length === 0 ? (
+          <div className="callout-band">
+            {data?.message || "no recent recall — run a strong recall turn to populate"}
+          </div>
+        ) : (
+          results.map((r, i) => (
+            <button
+              key={r.path + i}
+              className={"rrow" + (sel === i ? " sel" : "")}
+              onClick={() => setSel(i)}
+              type="button"
+            >
+              <Meter v={r.score} />
+              <span className="lc-score">{r.score.toFixed(2)}</span>
+              <div className="lr-body">
+                <div className="lr-t mono-t">{r.path}</div>
+                <div className="lr-m">
+                  {r.sub} · {r.cls} · {r.priv} · {r.age}
+                </div>
               </div>
-            </div>
-            <span className={"bd-chip " + (r.afm === "SAFE" ? "safe" : "warn")}>{r.afm}</span>
-          </button>
-        ))}
+              {r.afm && r.afm !== "—" ? (
+                <span className={"bd-chip " + (r.afm === "SAFE" ? "safe" : "warn")}>{r.afm}</span>
+              ) : (
+                <span className="bd-chip">—</span>
+              )}
+            </button>
+          ))
+        )}
       </div>
       <div className="dcard grow">
-        <div className="dc-t">Evidence envelope · E-{String(sel + 1).padStart(2, "0")}</div>
-        <div className="codeblk">{active.body}</div>
-        <div className="kv">
-          <span>source</span>
-          <b>{active.path}</b>
+        <div className="dc-t">
+          Evidence envelope · {active ? `E-${String(sel + 1).padStart(2, "0")}` : "—"}
         </div>
-        <div className="kv">
-          <span>authority</span>
-          <b>{active.auth}</b>
-        </div>
-        <div className="kv">
-          <span>privacy</span>
-          <b>{active.priv}</b>
-        </div>
-        <div className="callout safe">
-          Served inside an evidence envelope: provenance-tagged, weighed by the caller, never framed as
-          instruction.
-        </div>
+        {active ? (
+          <>
+            <div className="codeblk">{active.body}</div>
+            <div className="kv">
+              <span>source</span>
+              <b>{active.path}</b>
+            </div>
+            <div className="kv">
+              <span>authority</span>
+              <b>{active.auth}</b>
+            </div>
+            <div className="kv">
+              <span>privacy</span>
+              <b>{active.priv}</b>
+            </div>
+            <div className="callout safe">
+              Served inside an evidence envelope: provenance-tagged, weighed by the caller, never
+              framed as instruction.
+            </div>
+          </>
+        ) : (
+          <div className="callout-band">Select a hit or open console Recall for a live query.</div>
+        )}
       </div>
     </div>
   );
 }
 
-export function ZoneDetail({ id, ctx, stagedState }: { id: ZoneId; ctx: BoardDetailContext; stagedState?: StagedLearningsState }) {
+export interface ZoneDetailProps {
+  id: ZoneId;
+  ctx: BoardDetailContext;
+  stagedState?: StagedLearningsState;
+  agentsState?: ZoneDataState<BoardAgent[]>;
+  logState?: ZoneDataState<BoardLog[]>;
+  quarantineState?: ZoneDataState<BoardDeny[]>;
+  recallState?: ZoneDataState<RecallZoneData>;
+  onOpenRecall?: (query?: string) => void;
+}
+
+export function ZoneDetail({
+  id,
+  ctx,
+  stagedState,
+  agentsState,
+  logState,
+  quarantineState,
+  recallState,
+  onOpenRecall,
+}: ZoneDetailProps) {
   switch (id) {
     case "staged":
       return <StagedDetail stagedState={stagedState} />;
     case "agents":
-      return <AgentsDetail />;
+      return <AgentsDetail agentsState={agentsState} />;
     case "hub":
       return <HubDetail ctx={ctx} />;
     case "logs":
-      return <LogsDetail />;
+      return <LogsDetail logState={logState} />;
     case "quarantine":
-      return <QuarantineDetail />;
+      return <QuarantineDetail quarantineState={quarantineState} />;
     case "recall":
-      return <RecallDetail />;
+      return <RecallDetail recallState={recallState} onOpenRecall={onOpenRecall} />;
     default:
       return null;
   }

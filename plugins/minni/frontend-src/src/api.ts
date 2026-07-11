@@ -146,6 +146,14 @@ export interface ExtractorStatus {
   probeAgeMs?: number;
 }
 
+export interface ConsolePrincipalStatus {
+  agentId: string;
+  stampedForCandidates: string | null;
+  unknownAgent: boolean;
+  /** True when MINNI_RESOLVE_OPERATORS is set (env allow-list for accept). Caps stay daemon-side. */
+  resolveOperatorsEnv: boolean;
+}
+
 export interface StatusReport {
   vault: { path: string; exists: boolean };
   socket: JsonResult<SocketStatusData>;
@@ -154,6 +162,8 @@ export interface StatusReport {
   afmProvider?: AfmProviderStatus;
   extractor?: ExtractorStatus;
   audit: { entries: number; latest?: string; volume?: number };
+  /** Who this console process stamps on candidates/resolve (from MINNI_AGENT_ID). */
+  principal?: ConsolePrincipalStatus;
 }
 
 export interface AuditTailResult {
@@ -665,5 +675,145 @@ export function resolveCandidate(
       }
     }
     return response as ResolveCandidateResponse;
+  });
+}
+
+// ── Board zone APIs (fail-loud; never synthesize rows client-side) ───────────
+
+export interface AgentCapsRow {
+  R: 0 | 1;
+  L: 0 | 1;
+  H: 0 | 1;
+}
+
+export interface AgentApiRow {
+  id: string;
+  vault?: string;
+  vaultPath?: string;
+  seen?: string;
+  lastSeenAt?: number | null;
+  on?: boolean;
+  caps?: AgentCapsRow;
+  staged?: number | null;
+  stagedUnknown?: boolean;
+  /** true when staged equals the server's query limit, i.e. the count is a floor. */
+  stagedAtLimit?: boolean;
+  note?: string;
+}
+
+export interface AgentsResponse {
+  agents: AgentApiRow[];
+  count?: number;
+  ok?: boolean;
+  error?: string;
+}
+
+export function getAgents(): Promise<AgentsResponse> {
+  return jsonFetch<AgentsResponse>("/api/agents").then((r) => {
+    if (r && typeof r === "object" && (r as AgentsResponse).ok === false) {
+      throw new Error((r as AgentsResponse).error || "agents unavailable");
+    }
+    return r;
+  });
+}
+
+export function getLogOnly(limit = 200): Promise<ListCandidatesResponse> {
+  const params = new URLSearchParams();
+  params.append("limit", String(limit));
+  return jsonFetch<any>(`/api/log-only?${params.toString()}`).then((response) =>
+    unwrapCandidatesResponse(response),
+  );
+}
+
+export function getQuarantine(limit = 200): Promise<ListCandidatesResponse> {
+  const params = new URLSearchParams();
+  params.append("limit", String(limit));
+  return jsonFetch<any>(`/api/quarantine?${params.toString()}`).then((response) =>
+    unwrapCandidatesResponse(response),
+  );
+}
+
+export interface RecallStateResponse {
+  present: boolean;
+  state: {
+    task_signature?: string;
+    intent?: string;
+    top_hits?: Array<{ title?: string; wikilink?: string; score?: number }>;
+    top_score?: number;
+    consumed?: boolean;
+    ts?: string;
+  } | null;
+  message?: string | null;
+  vaultPath?: string;
+  ok?: boolean;
+  error?: string;
+}
+
+export function getRecallState(): Promise<RecallStateResponse> {
+  return jsonFetch<RecallStateResponse>("/api/recall-state").then((r) => {
+    if (r && typeof r === "object" && r.ok === false) {
+      throw new Error(r.error || "recall-state unavailable");
+    }
+    return r;
+  });
+}
+
+export interface HandoffRow {
+  lease_id?: string;
+  from_agent?: string;
+  to_agent?: string;
+  task?: string;
+  expires_at?: string | null;
+  path?: string;
+}
+
+export interface HandoffsResponse {
+  agent_id?: string;
+  handoffs: HandoffRow[];
+  ok?: boolean;
+  error?: string;
+}
+
+export function getHandoffs(): Promise<HandoffsResponse> {
+  return jsonFetch<HandoffsResponse>("/api/handoffs").then((r) => {
+    if (r && typeof r === "object" && r.ok === false) {
+      throw new Error(r.error || "handoffs unavailable");
+    }
+    // Ensure handoffs array exists
+    return {
+      ...r,
+      handoffs: Array.isArray(r.handoffs) ? r.handoffs : [],
+    };
+  });
+}
+
+export interface PolicyReport {
+  agentId?: string;
+  stampedForCandidates?: string | null;
+  unknownAgent?: boolean;
+  resolveOperatorsEnv?: boolean;
+  caps?: AgentCapsRow;
+  principalsKnown?: string[];
+  automaticLearning?: boolean;
+  intentRouting?: {
+    sampleTask?: string;
+    action?: string;
+    confidence?: number;
+    automaticAllowed?: boolean;
+    reason?: string;
+  };
+  afm?: Record<string, unknown>;
+  policyModule?: string;
+  source?: string;
+  ok?: boolean;
+  error?: string;
+}
+
+export function getPolicy(): Promise<PolicyReport> {
+  return jsonFetch<PolicyReport>("/api/policy").then((r) => {
+    if (r && typeof r === "object" && r.ok === false) {
+      throw new Error(r.error || "policy unavailable");
+    }
+    return r;
   });
 }
