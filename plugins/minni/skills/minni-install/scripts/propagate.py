@@ -598,12 +598,14 @@ GROK_HOOK_EVENTS = ("SessionStart", "UserPromptSubmit", "PreCompact", "Stop")
 
 
 def cursor_hook_entry(install_root: Path, event: str, agent: str = "cursor",
-                      vault: Path | None = None, workspace: Path | str = "workspace-unknown") -> dict[str, object]:
+                      vault: Path | None = None, socket_path: Path = DEFAULT_SOCKET,
+                      workspace: Path | str = "workspace-unknown") -> dict[str, object]:
     hook_vault = vault or vault_for(agent)
     workspace_id = normalize_workspace_id(str(workspace)) or "workspace-unknown"
     env = " ".join((
         f"MINNI_CURSOR_AGENT_ID={shlex.quote(agent)}",
         f"MINNI_CURSOR_VAULT_PATH={shlex.quote(str(hook_vault))}",
+        f"MINNI_SOCKET_PATH={shlex.quote(str(socket_path))}",
         f"MINNI_CURSOR_WORKSPACE_ID={shlex.quote(workspace_id)}",
     ))
     entry: dict[str, object] = {
@@ -653,7 +655,9 @@ def update_cursor_config(install_root: Path, server_path: Path, agent: str, vaul
     plugin_hooks = {
         "version": 1,
         "hooks": {
-            event: [cursor_hook_entry(install_root, event, agent, vault, effective_workspace)]
+            event: [cursor_hook_entry(
+                install_root, event, agent, vault, socket_path, effective_workspace,
+            )]
             for event in CURSOR_HOOK_EVENTS
         },
     }

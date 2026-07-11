@@ -48,6 +48,7 @@ def test_cursor_config_is_portable_and_preserves_unrelated_entries(tmp_path):
         assert "dist/hook.js" not in command
         assert "MINNI_CURSOR_AGENT_ID=cursor" in command
         assert "MINNI_CURSOR_VAULT_PATH=" in command
+        assert f"MINNI_SOCKET_PATH={tmp_path}/.minni/run/minnid.sock" in command
         assert "MINNI_CURSOR_WORKSPACE_ID=workspace-workspace" in command
 
 
@@ -69,11 +70,13 @@ def test_cursor_hook_command_quotes_install_paths_with_spaces(tmp_path):
 
 def test_cursor_hook_command_stamps_installer_overrides(tmp_path):
     entry = propagate.cursor_hook_entry(
-        tmp_path / "plugin", "stop", "cursor-alt", tmp_path / "alt vault", tmp_path / "Repo",
+        tmp_path / "plugin", "stop", "cursor-alt", tmp_path / "alt vault",
+        tmp_path / "custom socket.sock", tmp_path / "Repo",
     )
     command = entry["command"]
     assert "MINNI_CURSOR_AGENT_ID=cursor-alt" in command
     assert "MINNI_CURSOR_VAULT_PATH=" in command and "alt vault" in command
+    assert "MINNI_SOCKET_PATH=" in command and "custom socket.sock" in command
     assert "MINNI_CURSOR_WORKSPACE_ID=workspace-repo" in command
 
 
