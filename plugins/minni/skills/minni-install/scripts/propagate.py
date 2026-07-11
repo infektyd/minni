@@ -77,6 +77,17 @@ def plugin_version_segment() -> str:
     )
 
 
+def plugin_source_version(repo_root: Path) -> str:
+    package = plugin_source(repo_root) / "package.json"
+    try:
+        version = str(load_json(package).get("version", "")).strip()
+    except Exception as exc:
+        raise SystemExit(f"Cannot read plugin source version from {package}: {exc}") from exc
+    if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?", version):
+        raise SystemExit(f"Invalid plugin source version in {package}: {version!r}")
+    return version
+
+
 def default_plugin_cli() -> Path:
     """CLI entrypoint path derived from the wired install root."""
     version = plugin_version_segment()
@@ -479,6 +490,60 @@ def update_claude_config(server_path: Path, agent: str, vault: Path, socket_path
         },
     }
     write_json(path, data)
+
+
+def claude_refresh_plan(user_marketplaces: dict[str, object], installed: list[dict], repo_root: Path) -> list[list[str]]:
+    """Native CLI commands needed to point Claude at this canonical source."""
+    desired = repo_root.expanduser().resolve()
+    minni_market = user_marketplaces.get("minni")
+    commands: list[list[str]] = []
+    source = minni_market.get("source", {}) if isinstance(minni_market, dict) else {}
+    current_path = Path(str(source.get("path", ""))).expanduser() if isinstance(source, dict) else Path()
+    if isinstance(minni_market, dict) and current_path.exists() and current_path.resolve() == desired:
+        commands.append(["claude", "plugin", "marketplace", "update", "minni"])
+        action = "update" if any(
+            p.get("id") == "minni@minni" and p.get("scope", "user") == "user"
+            for p in installed
+        ) else "install"
+    else:
+        if isinstance(minni_market, dict):
+            commands.append(["claude", "plugin", "marketplace", "remove", "minni", "--scope", "user"])
+        commands.append(["claude", "plugin", "marketplace", "add", str(desired), "--scope", "user"])
+        # Removing a marketplace also removes its install identity. Reinstall
+        # even when the pre-swap snapshot reported Minni as installed.
+        action = "install"
+    if action == "update":
+        commands.append(["claude", "plugin", "update", "minni@minni", "--scope", "user"])
+    else:
+        commands.append(["claude", "plugin", "install", "minni@minni", "--scope", "user"])
+    user_entry = next((
+        p for p in installed
+        if p.get("id") == "minni@minni" and p.get("scope", "user") == "user"
+    ), None)
+    if user_entry and user_entry.get("enabled") is False:
+        commands.append(["claude", "plugin", "enable", "minni@minni", "--scope", "user"])
+    return commands
+
+
+def refresh_claude_plugin(repo_root: Path) -> None:
+    """Use Claude's supported CLI so registry, marketplace and enablement stay coupled."""
+    if not shutil.which("claude"):
+        raise SystemExit("Claude Code CLI not found; cannot activate the installed Minni plugin")
+    try:
+        settings = load_json(Path.home() / ".claude/settings.json")
+        marketplaces = settings.get("extraKnownMarketplaces", {})
+        if not isinstance(marketplaces, dict):
+            marketplaces = {}
+        installed = json.loads(subprocess.check_output(
+            ["claude", "plugin", "list", "--json"], text=True, timeout=30,
+        ))
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, json.JSONDecodeError) as exc:
+        raise SystemExit(f"Cannot inspect Claude plugin state: {exc}") from exc
+    for command in claude_refresh_plan(marketplaces, installed, repo_root):
+        try:
+            subprocess.run(command, check=True, timeout=120)
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+            raise SystemExit(f"Claude plugin refresh failed at {' '.join(command)}: {exc}") from exc
 
 
 def update_kilo_config(server_path: Path, agent: str, vault: Path, socket_path: Path, workspace: Path, afm_env: dict[str, str] | None = None) -> None:
@@ -986,10 +1051,7 @@ def update_toml_mcp_config(path: Path, server_path: Path, agent: str, vault: Pat
 def platform_spec(platform: str, repo_root: Path, install_root: str | None = None) -> dict[str, object]:
     platform = canonical_platform(platform)
     home = Path.home()
-    try:
-        version_seg = plugin_version_segment()
-    except SystemExit:
-        version_seg = None
+    version_seg = plugin_source_version(repo_root)
     codex_install = (
         home / ".codex/plugins/cache/minni/minni" / version_seg
         if version_seg
@@ -1114,6 +1176,7 @@ def update_one_plugin(platform: str, args: argparse.Namespace) -> dict[str, obje
         update_toml_mcp_config(Path(spec["config"]).expanduser(), server_path, agent, vault, Path(args.socket).expanduser(), effective_stamp_workspace, explicit_workspace=explicit_workspace, afm_env=afm_env)
     elif config_kind == "claude-json":
         update_claude_config(server_path, agent, vault, Path(args.socket).expanduser(), stamp_workspace, afm_env)
+        refresh_claude_plugin(repo_root)
     elif config_kind == "kilo-json":
         update_kilo_config(server_path, agent, vault, Path(args.socket).expanduser(), stamp_workspace, afm_env)
     elif config_kind == "cursor-json":

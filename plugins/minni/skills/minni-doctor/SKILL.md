@@ -61,6 +61,10 @@ the first failing layer; everything below it will look broken too.
 - Tool count sanity: a current server registers **37 `minni_*` tools**
   (including the 11 `minni_plan_*` tools). Far fewer visible = stale plugin
   build or cache.
+- Claude Code: compare `~/.claude/plugins/installed_plugins.json` against the
+  active cache's manifest and package versions. Registry `version` or
+  `installPath` disagreement means the freshly copied cache is inactive;
+  repair through `minni-install --platform claude-code`.
 
 ## Layer 4 — Hooks (per platform, shared semantics)
 
