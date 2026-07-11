@@ -74,7 +74,31 @@ test("no env falls back to unknown deny identity, not codex vault", async () => 
       config.DEFAULT_VAULT_PATH,
       path.join(os.homedir(), ".minni", "unknown-vault"),
     );
+    assert.equal(config.CODEX_AGENT_ID, "codex");
+    assert.equal(
+      config.CODEX_VAULT_PATH,
+      path.join(os.homedir(), ".minni", "codex-vault"),
+    );
   });
+});
+
+test("Codex hook identity is independent from generic MCP identity", async () => {
+  await withConfigEnv(
+    {
+      MINNI_AGENT_ID: "unknown-agent",
+      MINNI_VAULT_PATH: "/tmp/unknown-vault",
+      MINNI_CODEX_AGENT_ID: "codex",
+      MINNI_CODEX_VAULT_PATH: "/tmp/codex-vault",
+      MINNI_CODEX_WORKSPACE_ID: "/tmp/codex-workspace",
+    },
+    (config) => {
+      assert.equal(config.DEFAULT_AGENT_ID, "unknown-agent");
+      assert.equal(config.DEFAULT_VAULT_PATH, "/tmp/unknown-vault");
+      assert.equal(config.CODEX_AGENT_ID, "codex");
+      assert.equal(config.CODEX_VAULT_PATH, "/tmp/codex-vault");
+      assert.equal(config.CODEX_WORKSPACE_ID, "workspace-codex-workspace");
+    },
+  );
 });
 
 test("Codex MCP manifest pins codex env explicitly", () => {
@@ -83,4 +107,22 @@ test("Codex MCP manifest pins codex env explicitly", () => {
   assert.equal(env?.MINNI_AGENT_ID, "codex");
   assert.equal(env?.MINNI_VAULT_PATH, "~/.minni/codex-vault");
   assert.equal(env?.MINNI_SOCKET_PATH, "~/.minni/run/minnid.sock");
+});
+
+test("Codex hook manifest uses only the native adapter with realistic timeouts", () => {
+  const manifest = JSON.parse(
+    readFileSync(new URL("../hooks/hooks-codex.json", import.meta.url), "utf8"),
+  );
+  const expected = {
+    SessionStart: 30,
+    UserPromptSubmit: 30,
+    PreCompact: 20,
+    Stop: 20,
+  };
+  for (const [event, timeout] of Object.entries(expected)) {
+    const hook = manifest.hooks?.[event]?.[0]?.hooks?.[0];
+    assert.equal(hook?.command, `node \${PLUGIN_ROOT}/dist/codex-hook.js ${event}`);
+    assert.equal(hook?.timeout, timeout);
+    assert.doesNotMatch(hook?.command ?? "", /\/dist\/hook\.js\s/);
+  }
 });

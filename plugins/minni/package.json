@@ -47,6 +47,7 @@
     "test:live:prepare": "npm run build && node tests/live-prepare-task.mjs",
     "smoke:status": "npm run build && node dist/cli.js status",
     "smoke:hook": "npm run build && node dist/hook.js SessionStart < /dev/null",
+    "smoke:codex-hook": "npm run build && node dist/codex-hook.js SessionStart < /dev/null",
     "smoke:kilocode-hook": "npm run build && node dist/kilocode-hook.js SessionStart < /dev/null",
     "typecheck:frontend": "tsc --project frontend-src/tsconfig.json --noEmit"
   },

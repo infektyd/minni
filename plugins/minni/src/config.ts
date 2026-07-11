@@ -245,6 +245,27 @@ export const DEFAULT_WORKSPACE_ID =
       "workspace-unknown"
   );
 
+// --- Codex hook adapter defaults -------------------------------------------
+//
+// The MCP server intentionally uses the generic DEFAULT_* values above and
+// fails closed as unknown-agent when its manifest did not stamp an identity.
+// Codex lifecycle hooks are separate host processes: Codex does not inherit
+// the MCP server's env block when it launches hooks.  Keep their platform
+// identity self-contained, exactly like the Grok/KiloCode/Gemini adapters.
+export const CODEX_AGENT_ID =
+  process.env.MINNI_CODEX_AGENT_ID ?? "codex";
+
+export const CODEX_WORKSPACE_ID =
+  normalizeWorkspaceId(
+    process.env.MINNI_CODEX_WORKSPACE_ID ??
+      `workspace-${path.basename(process.cwd())}`
+  );
+
+export const CODEX_VAULT_PATH = expandTilde(
+  process.env.MINNI_CODEX_VAULT_PATH ??
+    path.join(os.homedir(), ".minni", "codex-vault"),
+);
+
 export const CODEX_HOOKS_ENABLED =
   (process.env.MINNI_CODEX_HOOKS ?? "on").toLowerCase() !== "off";
 

@@ -127,9 +127,9 @@ export interface AgentHookConfig {
   stopCommitHint?: string;
   /**
    * When true, Stop writes the inbox file + audit entry even with zero
-   * candidates (codex's historical behavior); when false, an empty outcome
-   * early-returns before any write so the inbox is never littered with empty
-   * files (grok's and kilocode's behavior).
+   * candidates as a legacy factory compatibility mode. All maintained
+   * platform adapters use false, so an empty outcome early-returns before any
+   * write and never litters the inbox with an empty file.
    */
   alwaysWriteStopInbox: boolean;
   /**
