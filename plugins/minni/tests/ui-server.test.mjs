@@ -954,6 +954,12 @@ test("agentIdFromVaultDir maps claudecode-vault → claude-code (reuses vault.ts
   // Unmapped basenames fall back to stripping the "-vault" suffix.
   assert.equal(agentIdFromVaultDir(pathMod.join(home, "codex-vault")), "codex");
   assert.equal(agentIdFromVaultDir(pathMod.join(home, "grok-build-vault")), "grok-build");
+
+  // Known aliases normalize even under a non-default home with no env
+  // override: claudecode-vault must map to the claude-code principal,
+  // never a capability-less "claudecode".
+  assert.equal(agentIdFromVaultDir(pathMod.join(home, "other", "claudecode-vault")), "claude-code");
+  assert.equal(agentIdFromVaultDir(pathMod.join(home, "other", "claude-vault")), "claude-code");
 });
 
 test("buildPolicyReport pulls caps + intent routing without inventing automaticLearning", async () => {
