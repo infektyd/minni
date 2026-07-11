@@ -305,7 +305,11 @@ function ZoneBox({
       }}
     >
       <span className="zl">{z.label}</span>
-      <div className="zmode" onPointerDown={(e) => e.stopPropagation()}>
+      <div
+        className="zmode"
+        onPointerDown={(e) => e.stopPropagation()}
+        onKeyDown={(e) => e.stopPropagation()}
+      >
         <button
           type="button"
           className={!isCustom ? "on" : ""}

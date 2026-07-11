@@ -281,7 +281,10 @@ export function BoardScreen({
       setZmode((m) => (m[id] === "custom" ? m : { ...m, [id]: "custom" }));
       setZpos((p) => {
         const cur = { ...BOARD_ZONES[id], ...(p[id] || {}) };
-        return { ...p, [id]: { ...cur, ...clampZoneWH(w, h, WORLD) } };
+        const size = clampZoneWH(w, h, WORLD);
+        // Growing a zone at the roam edge must not push x+w past the bound.
+        const xy = clampZoneXY(size.w, size.h, cur.x, cur.y, WORLD);
+        return { ...p, [id]: { ...cur, ...size, ...xy } };
       });
     },
     [setZpos, setZmode],
