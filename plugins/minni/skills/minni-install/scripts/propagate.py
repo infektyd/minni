@@ -979,8 +979,9 @@ def render_agy_hooks(hooks_data: dict, install_root: Path, agent: str, vault: Pa
     return json.dumps(rendered, indent=2)
 
 
-def update_agy_plugin_hooks(install_root: Path, agent: str, vault: Path,
-                            socket_path: Path, workspace: Path | str) -> dict[str, object]:
+def update_agy_plugin_hooks(install_root: Path, agent: str = "gemini", vault: Path | None = None,
+                            socket_path: Path | None = None,
+                            workspace: Path | str = "workspace-unknown") -> dict[str, object]:
     """Register the Minni hook plugin with the agy (Antigravity CLI) plugin system.
 
     agy loads Claude Code-style hooks.json manifests from
@@ -1000,6 +1001,8 @@ def update_agy_plugin_hooks(install_root: Path, agent: str, vault: Path,
     hooks.json whose stamped commands point at dist/gemini-hook.js under this
     install root.
     """
+    vault = vault or Path("~/.minni/gemini-vault").expanduser()
+    socket_path = socket_path or Path("~/.minni/run/minnid.sock").expanduser()
     template = install_root / "hooks" / "hooks-gemini.json"
     if not template.exists():
         return {"installed": False, "reason": f"missing hooks template: {template}"}
