@@ -291,9 +291,17 @@ export function BoardScreen({
   );
 
   // auto = automatic layout (clears this box's override); custom = free layout.
+  // Auto is the default, so returning to it deletes the key instead of storing
+  // "auto" — otherwise hasLayout stays truthy and the reset chip never clears.
   const setZoneMode = useCallback(
     (id: ZoneId, mode: ZoneMode) => {
-      setZmode((p) => ({ ...p, [id]: mode }));
+      setZmode((p) => {
+        if (mode !== "auto") return { ...p, [id]: mode };
+        if (!(id in p)) return p;
+        const n = { ...p };
+        delete n[id];
+        return n;
+      });
       if (mode === "auto")
         setZpos((p) => {
           if (!(id in p)) return p;
