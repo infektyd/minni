@@ -127,5 +127,9 @@ test("Codex hook remains Codex-native instead of reusing Claude hook entrypoint"
   const codexHook = await readFile(new URL("../src/codex-hook.ts", import.meta.url), "utf8");
   assert.match(codexHook, /runtime:\s*"codex"/);
   assert.match(codexHook, /hookScript:\s*"codex-hook\.js"/);
+  assert.match(codexHook, /agentId:\s*CODEX_AGENT_ID/);
+  assert.match(codexHook, /vaultPath:\s*CODEX_VAULT_PATH/);
+  assert.match(codexHook, /alwaysWriteStopInbox:\s*false/);
+  assert.doesNotMatch(codexHook, /DEFAULT_AGENT_ID|DEFAULT_VAULT_PATH|DEFAULT_WORKSPACE_ID/);
   assert.doesNotMatch(codexHook, /CLAUDECODE_AGENT_ID|CLAUDECODE_VAULT_PATH|hookScript:\s*"hook\.js"/);
 });

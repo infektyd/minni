@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { access, readFile } from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
@@ -12,24 +12,20 @@ async function readJson(relativePath) {
   return JSON.parse(await readFile(path.join(kiloRoot, relativePath), "utf8"));
 }
 
-test("KiloCode package points at shared parent dist build", async () => {
+test("KiloCode legacy package does not claim hook or MCP authority", async () => {
   const plugin = await readJson("plugin.json");
-  const mcp = await readJson(".mcp.json");
-
-  for (const manifest of [plugin, mcp]) {
-    const server = manifest.mcpServers["minni"];
-    assert.deepEqual(server.args, ["${KILO_PLUGIN_ROOT}/../dist/server.js"]);
-    assert.equal(server.cwd, "${KILO_PLUGIN_ROOT}/..");
-  }
+  assert.equal(plugin.hooks, undefined);
+  assert.equal(plugin.mcpServers, undefined);
+  await assert.rejects(access(path.join(kiloRoot, ".mcp.json")));
+  await assert.rejects(access(path.join(kiloRoot, "hooks/hooks.json")));
 });
 
-test("KiloCode hooks invoke kilocode-specific hook entrypoint", async () => {
-  const hooks = await readJson("hooks/hooks.json");
-
-  for (const [event, entries] of Object.entries(hooks)) {
-    const command = entries[0].hooks[0].command;
-    assert.match(command, /dist\/kilocode-hook\.js/);
-    assert.doesNotMatch(command, /dist\/hook\.js/);
-    assert.match(command, new RegExp(`${event}$`));
-  }
+test("KiloCode ships the native global plugin template", async () => {
+  const source = await readFile(path.join(pluginRoot, "kilo/minni-plugin.js"), "utf8");
+  assert.match(source, /export default MinniPlugin/);
+  assert.match(source, /"chat\.message"/);
+  assert.match(source, /"tool\.execute\.before"/);
+  assert.match(source, /"experimental\.session\.compacting"/);
+  assert.match(source, /session\.idle/);
+  assert.match(source, /dist\/kilocode-hook\.js|__MINNI_KILO_HOOK_SCRIPT__/);
 });

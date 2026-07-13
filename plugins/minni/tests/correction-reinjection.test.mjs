@@ -644,8 +644,8 @@ const HOOK_MATRIX = [
     bin: "codex-hook.js",
     agentId: "codex",
     env: (vault) => ({
-      MINNI_VAULT_PATH: vault,
-      MINNI_AGENT_ID: "codex",
+      MINNI_CODEX_VAULT_PATH: vault,
+      MINNI_CODEX_AGENT_ID: "codex",
     }),
   },
   {

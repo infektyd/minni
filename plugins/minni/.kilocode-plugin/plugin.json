@@ -18,17 +18,7 @@
     "mcp",
     "spine"
   ],
-  "mcpServers": {
-    "minni": {
-      "command": "node",
-      "args": [
-        "${KILO_PLUGIN_ROOT}/../dist/server.js"
-      ],
-      "cwd": "${KILO_PLUGIN_ROOT}/.."
-    }
-  },
   "skills": "./skills/",
-  "hooks": "./hooks/hooks.json",
   "interface": {
     "displayName": "Minni",
     "shortDescription": "Local recall and KiloCode-owned Obsidian memory",

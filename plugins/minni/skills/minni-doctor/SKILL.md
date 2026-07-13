@@ -61,16 +61,42 @@ the first failing layer; everything below it will look broken too.
 - Tool count sanity: a current server registers **37 `minni_*` tools**
   (including the 11 `minni_plan_*` tools). Far fewer visible = stale plugin
   build or cache.
+- Claude Code: compare `~/.claude/plugins/installed_plugins.json` against the
+  active cache's manifest and package versions. Registry `version` or
+  `installPath` disagreement means the freshly copied cache is inactive;
+  repair through `minni-install --platform claude-code`.
 
 ## Layer 4 — Hooks (per platform, shared semantics)
 
 Every platform registers its OWN compiled hook (`hook.js`, `codex-hook.js`,
-`grok-hook.js`, `kilocode-hook.js`); Minni semantics live in one shared factory.
+`cursor-hook.js`, `grok-hook.js`, `kilocode-hook.js`); Minni semantics live in
+one shared factory. Cursor's native protocol is not Claude Code's: its healthy
+SessionStart output uses `additional_context`, and its PreToolUse result uses
+`permission`. Any Cursor command invoking `dist/hook.js` or carrying
+`MINNI_CLAUDECODE_*` is an identity-boundary failure.
+
+For Cursor, inspect paths relative to the current user's home (never a
+developer-specific absolute path): `~/.cursor/hooks.json`,
+`~/.cursor/mcp.json`, and the installed plugin root reported by Cursor. The
+installer may merge Minni entries into those JSON files, but must preserve
+unrelated hooks and MCP servers and remain idempotent.
+
+For Grok, `~/.grok/hooks/minni.json` must invoke the installed
+`dist/grok-hook.js` and stamp `MINNI_GROK_AGENT_ID`,
+`MINNI_GROK_VAULT_PATH`, and `MINNI_GROK_WORKSPACE_ID`. A Grok hook command
+containing `dist/hook.js` or `MINNI_CLAUDECODE_*` is confirmed foreign-adapter
+drift and must be routed to `minni-install --platform grok`.
+
+For KiloCode, `~/.config/kilo/kilo.json` must not have both `minni` and the
+legacy `sovereign-memory` MCP enabled. Current Kilo CLI loads the native plugin
+at `~/.config/kilo/plugin/minni.js`; a `.kilocode-plugin/hooks.json` file is
+not activation evidence. Verify the native plugin references the installed
+`kilocode-hook.js`, then require fresh Kilo event/audit evidence.
 
 | Check | Healthy | Finding |
 |---|---|---|
 | SessionStart envelope | `<minni:context event="SessionStart">` with identity, audit tail, pending_learnings | Hook not registered in THIS platform's native config |
-| Per-turn recall | UserPromptSubmit envelope with ranked results | Recall channel dead; check daemon first, then hook registration |
+| Per-turn recall | UserPromptSubmit envelope with ranked results; on Cursor, prompt recall state is prepared but cannot currently be injected by `beforeSubmitPrompt` | Recall channel dead; check daemon first, then hook registration |
 | Stop drafts | Candidate learnings appear in vault `inbox/` after sessions | Stop hook missing or writing kind-less files (pre-factory bug class) |
 | Correction re-assert | Post-compaction and SessionStart re-inject stored corrections; `stale_beliefs` fires when a prompt contradicts a stored correction | If `stale_beliefs` is silently empty while a relevant correction exists, that is the C1 failure class — report it loudly |
 | Cross-platform honesty | Each platform has its own hook | One platform borrowing another's hooks (e.g. via compat scanning) is drift |

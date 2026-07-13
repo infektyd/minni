@@ -6,7 +6,7 @@
           {
             "type": "command",
             "command": "node ${PLUGIN_ROOT}/dist/codex-hook.js SessionStart",
-            "timeout": 5
+            "timeout": 30
           }
         ]
       }
@@ -17,7 +17,7 @@
           {
             "type": "command",
             "command": "node ${PLUGIN_ROOT}/dist/codex-hook.js UserPromptSubmit",
-            "timeout": 5
+            "timeout": 30
           }
         ]
       }
@@ -28,7 +28,7 @@
           {
             "type": "command",
             "command": "node ${PLUGIN_ROOT}/dist/codex-hook.js PreCompact",
-            "timeout": 5
+            "timeout": 20
           }
         ]
       }
@@ -39,7 +39,7 @@
           {
             "type": "command",
             "command": "node ${PLUGIN_ROOT}/dist/codex-hook.js Stop",
-            "timeout": 5
+            "timeout": 20
           }
         ]
       }

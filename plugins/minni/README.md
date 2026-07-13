@@ -215,23 +215,25 @@ config/runtime ownership rather than in model-provided paths.
 
 ## KiloCode Plugin
 
-Install in KiloCode (local plugin dir):
+Install or repair the native KiloCode surface:
 
 ```bash
-kilo plugin install --plugin-dir /path/to/minni/plugins/minni/.kilocode-plugin
+python3 plugins/minni/skills/minni-install/scripts/propagate.py \
+  --repo . update-plugin --platform kilocode
 ```
 
 The KiloCode surface adds:
 
-- **Vault**: `~/.minni/kilocode-vault` (override: `MINNI_KILOCODE_VAULT_PATH`). The manifest pins `MINNI_AGENT_ID=kilocode`, `MINNI_VAULT_PATH=~/.minni/kilocode-vault`, and `MINNI_SOCKET_PATH=~/.minni/run/minnid.sock`.
+- **Vault**: `~/.minni/kilocode-vault` (override: `MINNI_KILOCODE_VAULT_PATH`). The installer stamps the agent, vault, socket, and workspace into both the native hook plugin and MCP entry.
 - **Agent identity**: `kilocode` (override: `MINNI_KILOCODE_AGENT_ID`).
-- **Hooks** (`hooks/hooks.json`):
-  - `SessionStart` — boots identity, audit tail, pending-inbox learnings.
-  - `UserPromptSubmit` — auto-recalls before each turn, injects ranked vault + daemon results.
-  - `PreCompact` — captures scar tissue (failed paths, dead ends) so post-compaction KiloCode doesn't repeat them.
-  - `Stop` — drafts candidate learnings to vault inbox; never auto-writes.
+- **Native hooks** (`~/.config/kilo/plugin/minni.js`):
+  - `chat.message` — runs SessionStart once per session, then prompt recall.
+  - `experimental.chat.system.transform` — injects queued Minni context.
+  - `tool.execute.before` — enforces only explicit recall-guard denials and otherwise fails open.
+  - `experimental.session.compacting` — captures scar tissue before compaction.
+  - `session.idle` — drafts candidate learnings to the vault inbox; never auto-writes.
 - **Slash commands** (namespaced as `/minni:*`): `recall`, `learn`, `status`, `audit`, `prepare-task`, `prepare-outcome`.
-- **Agent-first envelope**: hook output is wrapped as `<sovereign:context version="1" event="..." agent="kilocode" tokens="...">` containing deterministic JSON for prompt-cache stability.
+- **Agent-first envelope**: hook output is wrapped as `<minni:context version="1" event="..." agent="kilocode" tokens="...">` containing deterministic JSON for prompt-cache stability.
 
 Disable hooks without uninstalling: `export MINNI_KILOCODE_HOOKS=off`.
 

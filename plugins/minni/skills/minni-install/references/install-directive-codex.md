@@ -1,6 +1,6 @@
 # Minni install directive — Codex platform
 
-Last verified: 2026-05-31.
+Last verified: 2026-07-11.
 
 ## Goal
 
@@ -8,7 +8,8 @@ Install **Minni** into Codex as a new plugin, not as a `sovereign-memory`
 rename-in-place. The source of truth is:
 
 - Repo source: `/Users/hansaxelsson/Projects/Minni/plugins/minni`
-- Codex cache: `/Users/hansaxelsson/.codex/plugins/cache/minni/minni/0.1.0`
+- Codex cache: versioned directory under
+  `/Users/hansaxelsson/.codex/plugins/cache/minni/minni/`
 - Agent id: `codex`
 - Vault: `/Users/hansaxelsson/.minni/codex-vault`
 - Socket: `/Users/hansaxelsson/.minni/run/minnid.sock`
@@ -124,10 +125,10 @@ python3 plugins/minni/skills/minni-install/scripts/propagate.py \
 ```
 
 Also check `/Users/hansaxelsson/.minni/identities/codex/CODEX_LAYER1_SHELF.md`.
-It previously pointed future agents at the old
-`~/.codex/plugins/cache/sovereign-memory/.../cli.js` path. Update shelf commands
-to `~/.codex/plugins/cache/minni/minni/0.1.0/dist/cli.js` and reindex the
-whole-document identity row if the daemon read still returns old shelf text.
+It previously pointed future agents at a hardcoded retired cache version. Keep
+its health command on the stable `minni status` CLI and dynamically resolve the
+latest installed plugin only when a direct Node CLI probe is required. Reindex
+the whole-document identity row if daemon reads still return old shelf text.
 
 ## Legacy Cache Handling
 
@@ -137,7 +138,7 @@ accident. After Minni verifies GO, quarantine it under the install backup:
 ```bash
 mv ~/.codex/plugins/cache/sovereign-memory \
   ~/.codex/plugin-install-backups/<run>/sovereign-memory-cache.quarantined-active-copy
-pkill -f '/Users/hansaxelsson/.codex/plugins/cache/sovereign-memory/sovereign-memory/0.1.0/dist/server.js'
+pkill -f "$HOME/.codex/plugins/cache/sovereign-memory/sovereign-memory/.*/dist/server.js"
 ```
 
 The 2026-05-31 run used:
@@ -161,18 +162,26 @@ python3 plugins/minni/skills/minni-install/scripts/propagate.py \
 MINNI_AGENT_ID=codex MINNI_VAULT_PATH=~/.minni/codex-vault \
 MINNI_SOCKET_PATH=~/.minni/run/minnid.sock \
 MINNI_WORKSPACE_ID=$(pwd) \
-node ~/.codex/plugins/cache/minni/minni/0.1.0/dist/cli.js status
+node "$(find ~/.codex/plugins/cache/minni/minni -path '*/dist/cli.js' | sort -V | tail -1)" status
 ```
 
 Hook smoke:
 
 ```bash
-MINNI_AGENT_ID=codex MINNI_VAULT_PATH=~/.minni/codex-vault \
+MINNI_CODEX_AGENT_ID=codex MINNI_CODEX_VAULT_PATH=~/.minni/codex-vault \
 MINNI_SOCKET_PATH=~/.minni/run/minnid.sock \
-MINNI_WORKSPACE_ID=$(pwd) \
-PLUGIN_ROOT=~/.codex/plugins/cache/minni/minni/0.1.0 \
-node ~/.codex/plugins/cache/minni/minni/0.1.0/dist/codex-hook.js SessionStart < /dev/null
+MINNI_CODEX_WORKSPACE_ID=$(pwd) \
+node "$(find ~/.codex/plugins/cache/minni/minni -path '*/dist/codex-hook.js' | sort -V | tail -1)" \
+  SessionStart < /dev/null
 ```
+
+Codex lifecycle hooks are separate host processes and intentionally use the
+`MINNI_CODEX_*` namespace. The MCP server and `cli.js` use the generic
+`MINNI_AGENT_ID` / `MINNI_VAULT_PATH` / `MINNI_WORKSPACE_ID` namespace shown
+in the preceding status command. When the host payload and
+`MINNI_CODEX_WORKSPACE_ID` both omit a workspace, hooks fail closed to
+`workspace-unknown`; they never derive project identity from the plugin-cache
+working directory.
 
 Expected GO criteria:
 

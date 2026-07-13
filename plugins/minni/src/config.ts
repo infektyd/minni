@@ -245,11 +245,54 @@ export const DEFAULT_WORKSPACE_ID =
       "workspace-unknown"
   );
 
+// --- Codex hook adapter defaults -------------------------------------------
+//
+// The MCP server intentionally uses the generic DEFAULT_* values above and
+// fails closed as unknown-agent when its manifest did not stamp an identity.
+// Codex lifecycle hooks are separate host processes: Codex does not inherit
+// the MCP server's env block when it launches hooks.  Keep their platform
+// identity self-contained, exactly like the Grok/KiloCode/Gemini adapters.
+export const CODEX_AGENT_ID =
+  process.env.MINNI_CODEX_AGENT_ID ?? "codex";
+
+export const CODEX_WORKSPACE_ID =
+  normalizeWorkspaceId(
+    process.env.MINNI_CODEX_WORKSPACE_ID ??
+      "workspace-unknown"
+  );
+
+export const CODEX_VAULT_PATH = expandTilde(
+  process.env.MINNI_CODEX_VAULT_PATH ??
+    path.join(os.homedir(), ".minni", "codex-vault"),
+);
+
 export const CODEX_HOOKS_ENABLED =
   (process.env.MINNI_CODEX_HOOKS ?? "on").toLowerCase() !== "off";
 
 export const CODEX_CONTEXT_WINDOW = (() => {
   const raw = Number(process.env.CODEX_CONTEXT_WINDOW ?? process.env.MINNI_CODEX_CONTEXT_WINDOW);
+  return Number.isFinite(raw) && raw > 0 ? raw : 200_000;
+})();
+
+// --- Cursor hook adapter defaults -----------------------------------------
+// Cursor launches user/plugin hooks outside the MCP server environment. Keep
+// this identity independent from both generic MCP variables and Claude Code.
+export const CURSOR_AGENT_ID =
+  process.env.MINNI_CURSOR_AGENT_ID ?? "cursor";
+
+export const CURSOR_WORKSPACE_ID =
+  normalizeWorkspaceId(process.env.MINNI_CURSOR_WORKSPACE_ID ?? "workspace-unknown");
+
+export const CURSOR_VAULT_PATH = expandTilde(
+  process.env.MINNI_CURSOR_VAULT_PATH ??
+    path.join(os.homedir(), ".minni", "cursor-vault"),
+);
+
+export const CURSOR_HOOKS_ENABLED =
+  (process.env.MINNI_CURSOR_HOOKS ?? "on").toLowerCase() !== "off";
+
+export const CURSOR_CONTEXT_WINDOW = (() => {
+  const raw = Number(process.env.CURSOR_CONTEXT_WINDOW ?? process.env.MINNI_CURSOR_CONTEXT_WINDOW);
   return Number.isFinite(raw) && raw > 0 ? raw : 200_000;
 })();
 

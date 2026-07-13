@@ -5,7 +5,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node ${CLAUDE_PLUGIN_ROOT}/dist/hook.js SessionStart"
+            "command": "node ${CLAUDE_PLUGIN_ROOT}/dist/hook.js SessionStart",
+            "timeout": 30
           }
         ]
       }
@@ -15,7 +16,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node ${CLAUDE_PLUGIN_ROOT}/dist/hook.js UserPromptSubmit"
+            "command": "node ${CLAUDE_PLUGIN_ROOT}/dist/hook.js UserPromptSubmit",
+            "timeout": 30
           }
         ]
       }
@@ -25,7 +27,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node ${CLAUDE_PLUGIN_ROOT}/dist/hook.js PreToolUse"
+            "command": "node ${CLAUDE_PLUGIN_ROOT}/dist/hook.js PreToolUse",
+            "timeout": 10
           }
         ]
       }
@@ -35,7 +38,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node ${CLAUDE_PLUGIN_ROOT}/dist/hook.js PreCompact"
+            "command": "node ${CLAUDE_PLUGIN_ROOT}/dist/hook.js PreCompact",
+            "timeout": 20
           }
         ]
       }
@@ -45,7 +49,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node ${CLAUDE_PLUGIN_ROOT}/dist/hook.js Stop"
+            "command": "node ${CLAUDE_PLUGIN_ROOT}/dist/hook.js Stop",
+            "timeout": 20
           }
         ]
       }

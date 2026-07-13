@@ -170,7 +170,7 @@ const STOP_AGENTS = [
     name: "codex",
     hookJs: "codex-hook.js",
     agentId: "codex",
-    env: (vault) => ({ MINNI_AGENT_ID: "codex", MINNI_VAULT_PATH: vault, MINNI_CODEX_HOOKS: "on" }),
+    env: (vault) => ({ MINNI_CODEX_VAULT_PATH: vault, MINNI_CODEX_HOOKS: "on" }),
   },
   {
     name: "kilocode",
@@ -227,7 +227,7 @@ function emptyOutcomeStub() {
 
 function stopConfig(vaultPath, alwaysWriteStopInbox) {
   return {
-    agentId: alwaysWriteStopInbox ? "codex" : "grok-build",
+    agentId: "factory-test-agent",
     vaultPath,
     defaultWorkspaceId: "fixture-workspace",
     contextWindow: 200_000,
@@ -244,38 +244,38 @@ test("Stop divergence: empty candidates skip the inbox write unless alwaysWriteS
   process.env.MINNI_HOME = path.join(root, "home");
   process.env.MINNI_BYPASS_AUDIT_LIMIT = "true";
   try {
-    // grok/kilocode behavior (alwaysWriteStopInbox: false): an empty outcome
-    // never litters the inbox with a zero-candidate file.
-    const grokVault = path.join(root, "grok-vault");
-    const grokHandlers = createHookHandlers(stopConfig(grokVault, false), {
+    // Every maintained production adapter uses false: an empty outcome never
+    // litters the inbox with a zero-candidate file.
+    const cleanVault = path.join(root, "clean-vault");
+    const cleanHandlers = createHookHandlers(stopConfig(cleanVault, false), {
       prepareOutcome: emptyOutcomeStub(),
     });
-    const grokOut = await grokHandlers.handleStop({ session_id: "empty-stop" });
-    assert.equal(grokOut.continue, true);
-    assert.equal(grokOut.systemMessage, undefined);
-    const grokNames = (await readdir(path.join(grokVault, "inbox"))).filter((n) =>
+    const cleanOut = await cleanHandlers.handleStop({ session_id: "empty-stop" });
+    assert.equal(cleanOut.continue, true);
+    assert.equal(cleanOut.systemMessage, undefined);
+    const cleanNames = (await readdir(path.join(cleanVault, "inbox"))).filter((n) =>
       n.endsWith(".json"),
     );
-    assert.deepEqual(grokNames, [], "empty outcome must not write an inbox file");
+    assert.deepEqual(cleanNames, [], "empty outcome must not write an inbox file");
 
-    // codex historical behavior (alwaysWriteStopInbox: true): the file IS
-    // written — and still carries the canonical kind + identity stamps.
-    const codexVault = path.join(root, "codex-vault");
-    const codexHandlers = createHookHandlers(stopConfig(codexVault, true), {
+    // Keep the true branch covered as a factory compatibility seam. No current
+    // production adapter enables it.
+    const legacyVault = path.join(root, "legacy-vault");
+    const legacyHandlers = createHookHandlers(stopConfig(legacyVault, true), {
       prepareOutcome: emptyOutcomeStub(),
     });
-    const codexOut = await codexHandlers.handleStop({ session_id: "empty-stop" });
-    assert.equal(codexOut.continue, true);
-    assert.equal(codexOut.systemMessage, undefined, "no candidates => no call-to-action");
-    const codexNames = (await readdir(path.join(codexVault, "inbox"))).filter((n) =>
+    const legacyOut = await legacyHandlers.handleStop({ session_id: "empty-stop" });
+    assert.equal(legacyOut.continue, true);
+    assert.equal(legacyOut.systemMessage, undefined, "no candidates => no call-to-action");
+    const legacyNames = (await readdir(path.join(legacyVault, "inbox"))).filter((n) =>
       n.endsWith(".json"),
     );
-    assert.equal(codexNames.length, 1);
+    assert.equal(legacyNames.length, 1);
     const body = JSON.parse(
-      await readFile(path.join(codexVault, "inbox", codexNames[0]), "utf8"),
+      await readFile(path.join(legacyVault, "inbox", legacyNames[0]), "utf8"),
     );
     assert.equal(body.kind, "stop_candidates");
-    assert.equal(body.agent_id, "codex");
+    assert.equal(body.agent_id, "factory-test-agent");
     assert.equal(body.workspace_id, "fixture-workspace");
     assert.deepEqual(body.candidates, []);
   } finally {
