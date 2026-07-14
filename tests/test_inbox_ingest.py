@@ -321,11 +321,11 @@ def _make_consolidation_actions_table(db_obj):
         )
 
 
-def test_inbox_candidate_with_null_privacy_is_not_auto_promoted(tmp_path):
-    """I1/I2: inbox_ingest inserts candidate_packets with privacy_level=None
-    (inbox_ingest.py never learns a privacy level from stop-candidate files).
-    Consolidation must NOT treat unset/NULL privacy as safe — it must route
-    these to review, not auto-promote them straight to durable learnings."""
+def test_inbox_candidate_without_explicit_privacy_is_stamped_safe(tmp_path):
+    """I1/I2 follow-up: inbox_ingest makes its source-policy decision at the
+    writer, so a missing file-level privacy marker becomes explicitly safe and
+    is eligible for consolidation. The consolidation gate itself remains strict
+    for legacy/other-path NULL rows (covered in test_afm_privacy_stamping.py)."""
     from minni.afm_passes.inbox_ingest import ingest
     from minni.afm_passes.consolidation import run as consolidation_run
 
@@ -339,11 +339,11 @@ def test_inbox_candidate_with_null_privacy_is_not_auto_promoted(tmp_path):
     with db_obj.cursor() as c:
         c.execute("SELECT privacy_level FROM candidate_packets WHERE principal='codex'")
         row = dict(c.fetchone())
-    assert row["privacy_level"] is None, "inbox ingest must stamp NULL privacy (precondition)"
+    assert row["privacy_level"] == "safe"
 
     result = consolidation_run(db_obj, cfg, vault_path=cfg.vault_path, dry_run=True)
-    assert result["summary"]["to_promote"] == 0, result
-    assert result["summary"]["to_review"] == 1, result
+    assert result["summary"]["to_promote"] == 1, result
+    assert result["summary"]["to_review"] == 0, result
 
 
 def test_explicitly_safe_privacy_candidate_still_promotes(tmp_path):

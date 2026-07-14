@@ -566,6 +566,40 @@ def stage_candidate(params: dict, request_id: Any, context: GovernanceContext) -
     df = json.dumps(params.get("derived_from") or {})
     instr = 1 if (params.get("instruction_like") or is_instruction_like(stored_content)) else 0
 
+    # The governed proposal writer makes privacy explicit. Preserve a caller's
+    # explicit privacy_level; otherwise reuse the M-3 frontmatter bridge used by
+    # durable-document indexing (which conservatively defaults to safe when no
+    # frontmatter is present). The separate Finding 1 clamp below remains in
+    # force: learn-only callers are not trusted to create auto-promotable rows.
+    if "privacy_level" in params:
+        requested_privacy = params["privacy_level"]
+    else:
+        try:
+            from minni.indexer import VaultIndexer
+
+            requested_privacy = VaultIndexer._extract_frontmatter(
+                stored_content
+            )["privacy_level"]
+        except Exception:
+            requested_privacy = "safe"
+
+    # Never persist SQL NULL / blank: that reopens the permanent-park bug.
+    if requested_privacy is None or (
+        isinstance(requested_privacy, str) and not str(requested_privacy).strip()
+    ):
+        requested_privacy = "safe"
+    else:
+        requested_privacy = str(requested_privacy).strip()
+
+    # Only an *explicit* govern / resolve_candidate grant may keep the writer's
+    # privacy decision. Do NOT use is_operator_principal here — that treats
+    # main/operator + any nonempty caps as operator, letting learn-only main
+    # bypass the clamp.
+    if explicitly_allowed_operator(principal):
+        stored_privacy = requested_privacy
+    else:
+        stored_privacy = "review"
+
     try:
         db = context.lazy_writeback().db
         with db.cursor() as c:
@@ -580,7 +614,7 @@ def stage_candidate(params: dict, request_id: Any, context: GovernanceContext) -
                     principal.agent_id,
                     ws,
                     params.get("layer"),
-                    params.get("privacy_level"),
+                    stored_privacy,
                     stored_content,
                     ev,
                     df,
@@ -590,8 +624,8 @@ def stage_candidate(params: dict, request_id: Any, context: GovernanceContext) -
             )
             cid = c.lastrowid
         context.logger.info(
-            "G16 stage_candidate #%d principal=%s (proposal-first, no durable learn yet)",
-            cid, principal.agent_id
+            "G16 stage_candidate #%d principal=%s privacy=%s (proposal-first, no durable learn yet)",
+            cid, principal.agent_id, stored_privacy,
         )
         return context.make_response(
             {
@@ -599,6 +633,7 @@ def stage_candidate(params: dict, request_id: Any, context: GovernanceContext) -
                 "candidate_id": cid,
                 "principal": principal.agent_id,
                 "workspace_id": ws,
+                "privacy_level": stored_privacy,
             },
             request_id,
         )

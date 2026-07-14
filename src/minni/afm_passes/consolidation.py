@@ -34,10 +34,10 @@ from minni.safety import is_instruction_like
 
 logger = logging.getLogger("sovereign.afm.consolidation")
 
-# NOTE: "" (unset/NULL privacy) is deliberately excluded. Inbox-sourced
-# candidates (afm_passes.inbox_ingest) are inserted with privacy_level=None —
-# unknown privacy is NOT the same as "known safe" and must never auto-promote
-# to durable learnings without a review pass (I1/I2 security fix).
+# NOTE: "" (unset/NULL privacy) is deliberately excluded. Current writers stamp
+# explicit privacy, but legacy/other paths can still produce NULL. Unknown
+# privacy is NOT the same as "known safe" and must never auto-promote to durable
+# learnings without a review pass (I1/I2 security fix).
 _SAFE_PRIVACY = {"safe", "public", "low"}
 _MIN_CONTENT_LEN = 12
 _DEFAULT_MAX_PER_RUN = 50
@@ -124,6 +124,7 @@ def _proposed_candidates(db, limit: int) -> List[Dict[str, Any]]:
                   SELECT 1 FROM consolidation_actions ca
                   WHERE ca.action_type = 'afm_review'
                     AND ca.claim = CAST(cp.candidate_id AS TEXT)
+                    AND COALESCE(ca.status, '') != 'superseded'
               )
             ORDER BY cp.proposed_at ASC
             LIMIT ?

@@ -45,6 +45,13 @@ Safety / contract
 * ``derived_from.kind`` records what the source file actually declared
   (``null`` for the kind-less Claude Code shape) — Minni logic never stamps
   one agent's label onto another agent's rows.
+* PRIVACY IS EXPLICIT AT THIS WRITER. Commit 53da3bd fixed I1/I2 by making
+  unset/NULL privacy unsafe at consolidation. Stop-candidate inbox files are
+  agent-drafted summaries of the agent's own session and still pass the
+  downstream instruction-like, length, dedup, and quality gates, so this
+  writer stamps missing file-level privacy as ``safe``. A file's explicit
+  ``privacy_level`` is propagated verbatim and is never upgraded here. This is
+  a source policy decision, not a gate default from NULL to safe.
 * NEVER deletes inbox files or candidate rows. Disposal is handled separately
   by ``afm_passes.inbox_archive`` (archive-on-resolution; rename into
   ``inbox/.archive/``, never unlink).
@@ -236,6 +243,16 @@ def _scan_inbox(
         log_only_set = _as_str_set(doc.get("log_only"))
         dns_set = _as_str_set(doc.get("do_not_store"))
         ws = doc.get("workspace_id") or "default"
+        # Explicit non-empty privacy is preserved. Missing, null, or blank
+        # values are treated as "writer decision: safe" — never re-introduce
+        # SQL NULL (that is what permanently parked the backlog after 53da3bd).
+        raw_privacy = doc.get("privacy_level", "safe")
+        if raw_privacy is None or (
+            isinstance(raw_privacy, str) and not raw_privacy.strip()
+        ):
+            privacy_level = "safe"
+        else:
+            privacy_level = str(raw_privacy).strip()
         file_agent = str(doc.get("agent_id") or "").strip()
         if file_agent and file_agent != inbox_principal:
             skipped_by_kind["_agent_mismatch"] = skipped_by_kind.get("_agent_mismatch", 0) + 1
@@ -257,6 +274,7 @@ def _scan_inbox(
                 {
                     "principal": principal,
                     "workspace_id": ws,
+                    "privacy_level": privacy_level,
                     "content": content,
                     "inbox_file": path.name,
                     "candidate_index": idx,
@@ -325,7 +343,7 @@ def ingest(db, config, inboxes: Optional[List[Path]] = None,
                         r["principal"],
                         r["workspace_id"],
                         None,
-                        None,
+                        r["privacy_level"],
                         r["content"],
                         json.dumps([]),
                         derived_from,

@@ -265,3 +265,164 @@ def test_afm_loop_tick_routes_unsafe_privacy_to_review_not_promote(tmp_path, mon
             (str(cid),),
         )
         assert c.fetchone() is not None
+
+
+# ── Finding 1: learn-only stage_candidate cannot stamp auto-promotable privacy ─
+
+
+def test_learn_only_stage_candidate_clamps_safe_privacy_to_review(monkeypatch, tmp_path):
+    """A learn-capable non-operator that requests privacy_level=safe must store
+    'review' so AFM consolidation cannot auto-promote past resolve_candidate."""
+    import types
+
+    import minni.minnid as minnid
+    import minni.minnid_runtime.provenance as provenance
+    from minni.principal import EffectivePrincipal
+
+    db_obj, _cfg = _make_db(tmp_path)
+    monkeypatch.setattr(minnid, "_lazy_writeback", lambda: types.SimpleNamespace(db=db_obj))
+    monkeypatch.setattr(
+        provenance,
+        "resolve_effective_principal",
+        lambda **_kw: EffectivePrincipal(agent_id="codex", capabilities=["learn"]),
+    )
+
+    resp = minnid._dispatch_sync(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "stage_candidate",
+            "params": {
+                "agent_id": "codex",
+                "content": "Lesson that a learn-only agent must not auto-promote.",
+                "privacy_level": "safe",
+            },
+        }
+    )
+    assert "result" in resp, resp
+    assert resp["result"]["privacy_level"] == "review"
+    cid = resp["result"]["candidate_id"]
+    with db_obj.cursor() as c:
+        c.execute(
+            "SELECT privacy_level FROM candidate_packets WHERE candidate_id=?",
+            (cid,),
+        )
+        assert dict(c.fetchone())["privacy_level"] == "review"
+
+
+def test_govern_stage_candidate_keeps_safe_privacy(monkeypatch, tmp_path):
+    """Operator/govern staging may still stamp safe for trusted AFM-loop promotion."""
+    import types
+
+    import minni.minnid as minnid
+    import minni.minnid_runtime.provenance as provenance
+    from minni.principal import EffectivePrincipal
+
+    db_obj, _cfg = _make_db(tmp_path)
+    monkeypatch.setattr(minnid, "_lazy_writeback", lambda: types.SimpleNamespace(db=db_obj))
+    monkeypatch.setattr(
+        provenance,
+        "resolve_effective_principal",
+        lambda **_kw: EffectivePrincipal(
+            agent_id="main", capabilities=["learn", "govern"]
+        ),
+    )
+
+    resp = minnid._dispatch_sync(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "stage_candidate",
+            "params": {
+                "agent_id": "main",
+                "content": "Operator-endorsed lesson eligible for AFM promotion.",
+                "privacy_level": "safe",
+            },
+        }
+    )
+    assert "result" in resp, resp
+    assert resp["result"]["privacy_level"] == "safe"
+    cid = resp["result"]["candidate_id"]
+    with db_obj.cursor() as c:
+        c.execute(
+            "SELECT privacy_level FROM candidate_packets WHERE candidate_id=?",
+            (cid,),
+        )
+        assert dict(c.fetchone())["privacy_level"] == "safe"
+
+
+def test_main_learn_only_stage_candidate_clamps_safe_privacy(monkeypatch, tmp_path):
+    """Finding 1: main + learn (no govern) must not keep caller privacy=safe."""
+    import types
+
+    import minni.minnid as minnid
+    import minni.minnid_runtime.provenance as provenance
+    from minni.principal import EffectivePrincipal
+
+    db_obj, _cfg = _make_db(tmp_path)
+    monkeypatch.setattr(minnid, "_lazy_writeback", lambda: types.SimpleNamespace(db=db_obj))
+    monkeypatch.setattr(
+        provenance,
+        "resolve_effective_principal",
+        lambda **_kw: EffectivePrincipal(agent_id="main", capabilities=["learn"]),
+    )
+
+    resp = minnid._dispatch_sync(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "stage_candidate",
+            "params": {
+                "agent_id": "main",
+                "content": "main learn-only must not auto-promote.",
+                "privacy_level": "safe",
+            },
+        }
+    )
+    assert "result" in resp, resp
+    assert resp["result"]["privacy_level"] == "review"
+
+
+def test_afm_loop_does_not_promote_learn_only_clamped_candidate(tmp_path, monkeypatch):
+    """End-to-end: learn-only stage with privacy=safe → review clamp → loop holds."""
+    import types
+
+    import minni.minnid as minnid
+    import minni.minnid_runtime.provenance as provenance
+    from minni.minnid_runtime.afm import afm_loop_runner
+    from minni.principal import EffectivePrincipal
+
+    monkeypatch.setenv("MINNI_AFM_LOOP", "on")
+    monkeypatch.delenv("MINNI_AFM_MODE", raising=False)
+    monkeypatch.delenv("MINNI_AFM_PROVIDER_MODE", raising=False)
+
+    db_obj, cfg = _make_db(tmp_path)
+    monkeypatch.setattr(minnid, "_lazy_writeback", lambda: types.SimpleNamespace(db=db_obj))
+    monkeypatch.setattr(
+        provenance,
+        "resolve_effective_principal",
+        lambda **_kw: EffectivePrincipal(agent_id="codex", capabilities=["learn"]),
+    )
+    resp = minnid._dispatch_sync(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "stage_candidate",
+            "params": {
+                "agent_id": "codex",
+                "content": "Should stay in review despite caller privacy=safe.",
+                "privacy_level": "safe",
+            },
+        }
+    )
+    cid = resp["result"]["candidate_id"]
+    ctx, _ = _loop_context(db_obj, cfg, ticks=1)
+    asyncio.run(afm_loop_runner(ctx))
+
+    with db_obj.cursor() as c:
+        c.execute("SELECT status, privacy_level FROM candidate_packets WHERE candidate_id=?", (cid,))
+        row = dict(c.fetchone())
+        assert row["privacy_level"] == "review"
+        assert row["status"] == "proposed"
+        c.execute("SELECT COUNT(*) AS n FROM learnings")
+        assert c.fetchone()["n"] == 0
