@@ -245,6 +245,23 @@ export const DEFAULT_WORKSPACE_ID =
       "workspace-unknown"
   );
 
+// --- Codex agent defaults (hook-native identity) ---
+// The Codex hook must never inherit the generic MCP identity (DEFAULT_*):
+// those fall back to unknown-deny and, worse, share env with other runtimes.
+// Codex hooks also often launch with cwd = plugin cache, so the workspace
+// stamp fails closed to "workspace-unknown" instead of deriving from cwd.
+
+export const CODEX_AGENT_ID = process.env.MINNI_CODEX_AGENT_ID ?? "codex";
+
+export const CODEX_WORKSPACE_ID = normalizeWorkspaceId(
+  process.env.MINNI_CODEX_WORKSPACE_ID ?? "workspace-unknown",
+);
+
+export const CODEX_VAULT_PATH = expandTilde(
+  process.env.MINNI_CODEX_VAULT_PATH ??
+    path.join(os.homedir(), ".minni", "codex-vault"),
+);
+
 export const CODEX_HOOKS_ENABLED =
   (process.env.MINNI_CODEX_HOOKS ?? "on").toLowerCase() !== "off";
 
