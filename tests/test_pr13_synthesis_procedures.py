@@ -58,7 +58,7 @@ def _write_page(vault, rel, title, body, *, page_type="concept", status="accepte
     return path
 
 
-def _seed_repeated_events(db_obj):
+def _seed_repeated_events(db_obj, agent_id: str = "codex"):
     now = time.time()
     pattern = "agent exported the vault, then checked the index, then wrote the audit note"
     with db_obj.cursor() as c:
@@ -71,7 +71,7 @@ def _seed_repeated_events(db_obj):
                 VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    "codex",
+                    agent_id,
                     "session",
                     f"In run {idx}, {pattern}.",
                     f"task-{idx}",
@@ -121,11 +121,19 @@ def test_procedure_extraction_dry_run_returns_repeated_pattern_draft(tmp_path):
     db_obj, cfg = _make_db(tmp_path)
     event_ids = _seed_repeated_events(db_obj)
 
-    result = run(db_obj, cfg, vault_path=cfg.vault_path, dry_run=True, trace_id="trace-proc")
+    result = run(
+        db_obj,
+        cfg,
+        vault_path=cfg.vault_path,
+        dry_run=True,
+        trace_id="trace-proc",
+        agent_id="codex",
+    )
 
     assert result["status"] == "ok"
     assert result["pass_name"] == "procedure_extraction"
     assert result["prompt_version"]
+    assert result["inputs"]["bound_agent"] == "codex"
     assert result["drafts"]
     draft = result["drafts"][0]
     assert draft["kind"] == "procedure"
@@ -137,10 +145,81 @@ def test_procedure_extraction_dry_run_returns_repeated_pattern_draft(tmp_path):
     assert "exported the vault" in draft["body"]
 
 
+def test_procedure_extraction_does_not_scan_other_agents(tmp_path):
+    from minni.afm_passes.procedure_extraction import run
+
+    db_obj, cfg = _make_db(tmp_path)
+    _seed_repeated_events(db_obj)  # all agent_id=codex
+    result = run(
+        db_obj,
+        cfg,
+        vault_path=cfg.vault_path,
+        dry_run=True,
+        trace_id="trace-bound",
+        agent_id="other-agent",
+    )
+    assert result["inputs"]["bound_agent"] == "other-agent"
+    assert result["inputs"]["episodic_event_count"] == 0
+    assert result["drafts"] == []
+
+
+def test_procedure_extraction_skips_foreign_vault_session_pages(tmp_path):
+    """Finding 9: vault session pages for another agent must not enter drafts."""
+    from minni.afm_passes.procedure_extraction import _session_page_events
+
+    vault = tmp_path / "vault"
+    sessions = vault / "wiki" / "sessions"
+    sessions.mkdir(parents=True)
+    (sessions / "foreign.md").write_text(
+        "---\n"
+        "title: Foreign Session\n"
+        "type: session\n"
+        "status: accepted\n"
+        "privacy: safe\n"
+        "agent: victim\n"
+        "---\n\n"
+        "agent did secret then checked the vault then wrote the note.\n",
+        encoding="utf-8",
+    )
+    (sessions / "own.md").write_text(
+        "---\n"
+        "title: Own Session\n"
+        "type: session\n"
+        "status: accepted\n"
+        "privacy: safe\n"
+        "agent: attacker\n"
+        "---\n\n"
+        "agent exported the vault then checked the index then wrote the audit note.\n",
+        encoding="utf-8",
+    )
+    (sessions / "unattributed.md").write_text(
+        "---\n"
+        "title: Unattributed\n"
+        "type: session\n"
+        "status: accepted\n"
+        "privacy: safe\n"
+        "---\n\n"
+        "agent did orphan then checked logs then wrote output.\n",
+        encoding="utf-8",
+    )
+
+    events = _session_page_events(str(vault), agent_id="attacker")
+    assert len(events) == 1
+    assert events[0]["agent_id"] == "attacker"
+    assert "secret" not in (events[0].get("content") or "")
+    bodies = " ".join(e.get("content") or "" for e in events)
+    assert "orphan" not in bodies
+
+
 def test_daemon_compile_reaches_pr13_passes_and_wet_run_keeps_drafts_pending(tmp_path, monkeypatch):
     import minni.minnid as minnid
 
     db_obj, cfg = _make_db(tmp_path)
+    # Unstamped local dispatch resolves the operator-reserved "main" principal,
+    # which is not a data owner — the pass falls through to config binding
+    # (same convention as test_pr12_afm_loop). Bind the config to the agent the
+    # events are seeded under.
+    cfg.agent_id = "codex"
     vault = tmp_path / "vault"
     for idx in range(3):
         _write_page(

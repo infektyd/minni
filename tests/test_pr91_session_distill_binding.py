@@ -66,3 +66,84 @@ def test_cli_compile_propagates_agent_to_env(monkeypatch):
     monkeypatch.setattr(sovereign_memory.DEFAULT_CONFIG, "afm_loop_schedule", {}, raising=False)
     sovereign_memory.cmd_compile(["--pass", "session_distillation", "--agent", "codex", "--dry-run"])
     assert os.environ.get("MINNI_AGENT_ID") == "codex"
+
+
+def test_agent_id_kwarg_binds_ahead_of_env(monkeypatch):
+    monkeypatch.setenv("MINNI_AGENT_ID", "env-agent")
+    seen = _capture_agent(monkeypatch)
+    cfg = types.SimpleNamespace(afm_loop_schedule={})
+    sd.run(db=object(), config=cfg, dry_run=True, trace_id="t", agent_id="stamped-agent")
+    assert seen["events_agent"] == "stamped-agent"
+    assert seen["docs_agent"] == "stamped-agent"
+
+
+def test_session_distill_inputs_redact_event_content(tmp_path, monkeypatch):
+    """Finding 9: MCP/model-visible inputs must not include episodic event bodies."""
+    import minni.db as db_mod
+    from minni.config import SovereignConfig
+
+    monkeypatch.delenv("MINNI_AGENT_ID", raising=False)
+    cfg = SovereignConfig(db_path=str(tmp_path / "sd.db"), afm_loop_schedule={})
+    old_flag = db_mod._migrations_run
+    db_mod._migrations_run = False
+    try:
+        db_obj = db_mod.SovereignDB(cfg)
+        db_obj._get_conn()
+    finally:
+        db_mod._migrations_run = old_flag
+    now = __import__("time").time()
+    with db_obj.cursor() as c:
+        c.execute(
+            """
+            INSERT INTO episodic_events
+            (agent_id, event_type, content, created_at)
+            VALUES ('codex', 'session', 'SECRET session payload must not leak', ?)
+            """,
+            (now,),
+        )
+    result = sd.run(
+        db_obj, cfg, dry_run=True, trace_id="redact", agent_id="codex"
+    )
+    events = result["inputs"]["events"]
+    assert events, events
+    assert "content" not in events[0]
+    assert events[0]["content_redacted"] is True
+    assert events[0]["content_chars"] > 0
+    dumped = __import__("json").dumps(result["inputs"])
+    assert "SECRET session payload" not in dumped
+
+
+def test_recent_raw_docs_does_not_return_foreign_agent_raw_paths(tmp_path):
+    """Finding 9: bound raw-doc query must not OR-match other agents' rows."""
+    import minni.db as db_mod
+    from minni.config import SovereignConfig
+
+    cfg = SovereignConfig(db_path=str(tmp_path / "raw.db"))
+    old_flag = db_mod._migrations_run
+    db_mod._migrations_run = False
+    try:
+        db_obj = db_mod.SovereignDB(cfg)
+        db_obj._get_conn()
+    finally:
+        db_mod._migrations_run = old_flag
+    now = __import__("time").time()
+    with db_obj.cursor() as c:
+        c.execute(
+            """
+            INSERT INTO documents
+            (path, agent, sigil, last_modified, indexed_at, page_status, privacy_level)
+            VALUES (?, 'victim', '?', ?, ?, 'accepted', 'safe')
+            """,
+            ("victim-vault/raw/secret-project-name.md", now, now),
+        )
+        c.execute(
+            """
+            INSERT INTO documents
+            (path, agent, sigil, last_modified, indexed_at, page_status, privacy_level)
+            VALUES (?, 'attacker', '?', ?, ?, 'accepted', 'safe')
+            """,
+            ("attacker-vault/raw/own-note.md", now, now),
+        )
+    rows = sd._recent_raw_docs(db_obj, lookback_hours=24, agent_id="attacker")
+    paths = [r["path"] for r in rows]
+    assert paths == ["attacker-vault/raw/own-note.md"]

@@ -79,11 +79,15 @@ def _recent_raw_docs(db, lookback_hours: int, agent_id: Optional[str] = None) ->
     cutoff = time.time() - (lookback_hours * 3600)
     with db.cursor() as c:
         if agent_id:
+            # Finding 9: ownership AND raw classification — never OR agent=?
+            # alone (that pulled every document owned by the agent, and worse
+            # the old OR path also returned other agents' raw/* rows).
             c.execute(
                 """
                 SELECT doc_id, path, agent, page_type, page_status, privacy_level, indexed_at, last_modified
                 FROM documents
-                WHERE (path LIKE '%/raw/%' OR path LIKE 'raw/%' OR agent = 'raw' OR agent = ?)
+                WHERE agent = ?
+                  AND (path LIKE '%/raw/%' OR path LIKE 'raw/%')
                   AND COALESCE(indexed_at, last_modified, 0) >= ?
                   AND COALESCE(privacy_level, 'safe') = 'safe'
                 ORDER BY COALESCE(indexed_at, last_modified, 0) DESC
@@ -589,7 +593,14 @@ def _native_contradiction_signal(
     }
 
 
-def run(db, config, vault_path: Optional[str] = None, dry_run: bool = True, trace_id: Optional[str] = None) -> Dict[str, Any]:
+def run(
+    db,
+    config,
+    vault_path: Optional[str] = None,
+    dry_run: bool = True,
+    trace_id: Optional[str] = None,
+    agent_id: Optional[str] = None,
+) -> Dict[str, Any]:
     schedule = getattr(config, "afm_loop_schedule", {}) or {}
     pass_cfg = (schedule.get("passes") or {}).get("session_distillation", {})
     lookback_hours = int(pass_cfg.get("lookback_hours", 24))
@@ -598,23 +609,30 @@ def run(db, config, vault_path: Optional[str] = None, dry_run: bool = True, trac
     # PR91-2: never query GLOBALLY when unbound — a None agent_id would pull
     # EVERY agent's session events/docs into one agent's distillation. Fall back
     # to the "unknown" sentinel (matches only unattributed rows) so an unbound
-    # run fails closed instead of leaking cross-agent context. The CLI
-    # consolidation entrypoint propagates --agent/MINNI_AGENT_ID so real runs are
-    # properly scoped.
-    bound_agent = os.environ.get("MINNI_AGENT_ID") or getattr(config, "agent_id", None)
+    # run fails closed instead of leaking cross-agent context. Prefer the
+    # stamped compile principal (agent_id kwarg) over env/config.
+    bound_agent = (
+        agent_id
+        or os.environ.get("MINNI_AGENT_ID")
+        or getattr(config, "agent_id", None)
+    )
     bound_agent = str(bound_agent).strip() if bound_agent and str(bound_agent).strip() else "unknown"
     events = _recent_events(db, lookback_hours, agent_id=bound_agent)
     raw_docs = _recent_raw_docs(db, lookback_hours, agent_id=bound_agent)
     pass_input = {
         "lookback_hours": lookback_hours,
+        "bound_agent": bound_agent,
         "event_count": len(events),
         "raw_doc_count": len(raw_docs),
+        # Finding 9: never return raw event bodies in MCP/model-visible inputs.
+        # Keep ids/metadata for review; content stays in draft generation only.
         "events": [
             {
                 "event_id": row["event_id"],
                 "agent_id": row["agent_id"],
                 "event_type": row["event_type"],
-                "content": (row.get("content") or "")[:500],
+                "content_redacted": True,
+                "content_chars": len(row.get("content") or ""),
                 "created_at": row["created_at"],
             }
             for row in events[:20]

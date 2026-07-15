@@ -27,6 +27,8 @@ class VaultPage:
     body: str = ""
     updated_ts: float = 0.0
     instruction_like: bool = False
+    # Frontmatter agent: — required for session-page ownership scoping.
+    agent: str = ""
 
     @property
     def slug(self) -> str:
@@ -108,6 +110,7 @@ def load_vault_pages(vault_path: str) -> List[VaultPage]:
                 # Read here so downstream synthesis passes can propagate rather than
                 # silently re-launder the flag away.
                 instruction_like=str(frontmatter.get("instruction_like") or "").strip().lower() in {"true", "1", "yes"},
+                agent=str(frontmatter.get("agent") or "").strip(),
             )
         )
     return pages
