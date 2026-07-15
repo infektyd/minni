@@ -308,7 +308,8 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
                 # The trace is durable — scrub secrets from the persisted
                 # query snippet just like the ephemeral trace path does.
                 safe_query, _ = redact_text(query[:120])
-                context.lazy_episodic().add_event(
+                episodic = context.lazy_episodic()
+                episodic.add_event(
                     agent_id=agent_id,
                     event_type="recall",
                     content=(f'recall "{safe_query}" — {len(results)} hits, '
@@ -327,6 +328,9 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
                         "scope": document_scope,
                     },
                 )
+                # Keep the trace's own footprint honest to its 7d TTL —
+                # nothing schedules the global episodic cleanup today.
+                episodic.trim_recall_traces()
             except Exception as exc:
                 context.logger.debug("search: recall trace failed: %s", exc)
 

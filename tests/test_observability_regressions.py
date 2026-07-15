@@ -413,6 +413,110 @@ def test_since_window_not_capped_by_backlog(tmp_path, monkeypatch, capsys):
     assert len([e for e in out if e["source"] == "daemon"]) == 25
 
 
+def test_poller_drains_past_batch_limit_in_one_poll(tmp_path):
+    """A single poll() must drain everything pending (in batches), so a burst
+    or the final Ctrl-C drain never silently truncates at the batch size."""
+    from minni.watch import EpisodicPoller
+
+    db = tmp_path / "minni.db"
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE episodic_events (event_id INTEGER PRIMARY KEY,"
+                 " agent_id TEXT, event_type TEXT, content TEXT, created_at REAL)")
+    now = time.time()
+    conn.executemany(
+        "INSERT INTO episodic_events (agent_id, event_type, content,"
+        " created_at) VALUES (?,?,?,?)",
+        [("codex", "recall", f"r{i}", now + i * 0.001) for i in range(450)])
+    conn.commit()
+
+    poller = EpisodicPoller(db)
+    events = poller.poll()
+    assert len(events) == 450
+    assert poller.poll() == []
+
+
+def test_poller_seed_cursor_is_snapshot_consistent(tmp_path):
+    """seed() must set the cursor from the same snapshot as the rows it
+    returns; rows landing after the snapshot belong to the next poll()."""
+    from minni.watch import EpisodicPoller
+
+    db = tmp_path / "minni.db"
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE episodic_events (event_id INTEGER PRIMARY KEY,"
+                 " agent_id TEXT, event_type TEXT, content TEXT, created_at REAL)")
+    now = time.time()
+    conn.executemany(
+        "INSERT INTO episodic_events (agent_id, event_type, content,"
+        " created_at) VALUES (?,?,?,?)",
+        [("codex", "recall", f"r{i}", now) for i in range(30)])
+    conn.commit()
+
+    poller = EpisodicPoller(db)
+    # A --since window in the future returns nothing, but the cursor must sit
+    # exactly at the snapshot max so the next real row is not skipped.
+    seeded = poller.seed(10, since_epoch=now + 3600)
+    assert seeded == []
+    assert poller.last_event_id == 30
+    conn.execute("INSERT INTO episodic_events (agent_id, event_type, content,"
+                 " created_at) VALUES (?,?,?,?)", ("codex", "recall", "new", now))
+    conn.commit()
+    assert [e.summary for e in poller.poll()] == ["new"]
+
+
+def test_recall_traces_are_reaped_after_ttl(tmp_path):
+    """The trace is advertised as TTL'd — expired recall rows must actually
+    be removed, not just carry a nominal ttl_seconds value."""
+    import contextlib as _ctx
+
+    from minni.episodic import EpisodicMemory
+
+    class _DB:
+        def __init__(self, path):
+            self._conn = sqlite3.connect(path)
+            self._conn.row_factory = sqlite3.Row
+            self._conn.execute(
+                "CREATE TABLE episodic_events (event_id INTEGER PRIMARY KEY,"
+                " agent_id TEXT, event_type TEXT, content TEXT, task_id TEXT,"
+                " thread_id TEXT, metadata TEXT, compressed_raw BLOB,"
+                " created_at REAL)")
+            self._conn.execute(
+                "CREATE TABLE episodic_fts (event_id, content)")
+
+        @_ctx.contextmanager
+        def cursor(self):
+            cur = self._conn.cursor()
+            try:
+                yield cur
+                self._conn.commit()
+            finally:
+                cur.close()
+
+    memory = EpisodicMemory.__new__(EpisodicMemory)
+    memory.db = _DB(tmp_path / "e.db")
+    now = time.time()
+    with memory.db.cursor() as c:
+        c.execute("INSERT INTO episodic_events (agent_id, event_type, content,"
+                  " created_at) VALUES (?,?,?,?)",
+                  ("codex", "recall", "ancient trace", now - 8 * 86400))
+        c.execute("INSERT INTO episodic_events (agent_id, event_type, content,"
+                  " created_at) VALUES (?,?,?,?)",
+                  ("codex", "recall", "fresh trace", now))
+        c.execute("INSERT INTO episodic_events (agent_id, event_type, content,"
+                  " created_at) VALUES (?,?,?,?)",
+                  ("codex", "message", "old real event", now - 8 * 86400))
+
+    removed = memory.trim_recall_traces()
+    assert removed == 1
+    with memory.db.cursor() as c:
+        rows = c.execute("SELECT event_type, content FROM episodic_events"
+                         " ORDER BY event_id").fetchall()
+    contents = [(r["event_type"], r["content"]) for r in rows]
+    assert ("recall", "ancient trace") not in contents
+    assert ("recall", "fresh trace") in contents
+    # Non-trace events are NOT this reaper's business.
+    assert ("message", "old real event") in contents
+
+
 def test_watch_rejects_non_positive_interval(tmp_path, monkeypatch, capsys):
     from minni import minni_cli
 

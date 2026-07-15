@@ -298,6 +298,26 @@ class EpisodicMemory:
 
     # ── Cleanup ────────────────────────────────────────────────
 
+    def trim_recall_traces(self, max_age_seconds: int = 604800) -> int:
+        """Reap expired recall-trace rows (event_type='recall') only. The
+        trace path calls this on write so its own footprint honors the
+        advertised TTL without depending on a global cleanup pass (which
+        nothing schedules today); other event types are untouched."""
+        cutoff = time.time() - max_age_seconds
+        with self.db.cursor() as c:
+            c.execute("""
+                DELETE FROM episodic_fts
+                WHERE event_id IN (
+                    SELECT event_id FROM episodic_events
+                    WHERE event_type = 'recall' AND created_at < ?
+                )
+            """, (cutoff,))
+            c.execute(
+                "DELETE FROM episodic_events"
+                " WHERE event_type = 'recall' AND created_at < ?",
+                (cutoff,))
+            return c.rowcount
+
     def cleanup_expired(self, max_age_seconds: int = 604800) -> int:
         """Remove episodic events older than max_age (default 7 days)."""
         cutoff = time.time() - max_age_seconds

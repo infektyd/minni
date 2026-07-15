@@ -271,62 +271,58 @@ class EpisodicPoller:
         if conn is None:
             return []
         try:
+            # Snapshot ceiling FIRST, on the same connection, then bound the
+            # window query by it — a row landing between two separate queries
+            # could otherwise sit above the returned batch yet below a
+            # later-computed cursor, skipped forever.
+            max_id = conn.execute(
+                "SELECT MAX(event_id) AS m FROM episodic_events"
+            ).fetchone()["m"] or 0
             if since_epoch is not None:
                 rows = conn.execute(
                     "SELECT event_id, agent_id, event_type, content,"
                     " created_at FROM episodic_events"
-                    " WHERE created_at >= ? ORDER BY event_id ASC",
-                    (since_epoch,)).fetchall()
+                    " WHERE created_at >= ? AND event_id <= ?"
+                    " ORDER BY event_id ASC",
+                    (since_epoch, max_id)).fetchall()
             else:
                 rows = list(reversed(conn.execute(
                     "SELECT event_id, agent_id, event_type, content,"
-                    " created_at FROM episodic_events"
+                    " created_at FROM episodic_events WHERE event_id <= ?"
                     " ORDER BY event_id DESC LIMIT ?",
-                    (backlog,)).fetchall()))
+                    (max_id, backlog)).fetchall()))
         except sqlite3.Error:
             return []
         finally:
             conn.close()
-        # The cursor still advances past everything, window or not, so the
-        # follow loop never re-emits seeded rows.
-        if rows:
-            self.last_event_id = max(self.last_event_id,
-                                     rows[-1]["event_id"])
-        max_id = self._max_event_id()
-        if max_id is not None:
-            self.last_event_id = max(self.last_event_id, max_id)
+        # The cursor advances to the snapshot ceiling, window or not, so the
+        # follow loop never re-emits seeded rows and never skips later ones.
+        self.last_event_id = max(self.last_event_id, max_id)
         return [self._to_event(row) for row in rows]
-
-    def _max_event_id(self) -> int | None:
-        conn = self._connect()
-        if conn is None:
-            return None
-        try:
-            row = conn.execute(
-                "SELECT MAX(event_id) AS m FROM episodic_events").fetchone()
-            return row["m"]
-        except sqlite3.Error:
-            return None
-        finally:
-            conn.close()
 
     def poll(self) -> list[WatchEvent]:
-        conn = self._connect()
-        if conn is None:
-            return []
-        try:
-            rows = conn.execute(
-                "SELECT event_id, agent_id, event_type, content, created_at"
-                " FROM episodic_events WHERE event_id > ?"
-                " ORDER BY event_id ASC LIMIT 200",
-                (self.last_event_id,)).fetchall()
-        except sqlite3.Error:
-            return []
-        finally:
-            conn.close()
-        if rows:
-            self.last_event_id = rows[-1]["event_id"]
-        return [self._to_event(row) for row in rows]
+        """Drain everything pending, in bounded batches — a burst larger than
+        one batch (or the final Ctrl-C drain) must not truncate."""
+        events: list[WatchEvent] = []
+        while True:
+            conn = self._connect()
+            if conn is None:
+                return events
+            try:
+                rows = conn.execute(
+                    "SELECT event_id, agent_id, event_type, content,"
+                    " created_at FROM episodic_events WHERE event_id > ?"
+                    " ORDER BY event_id ASC LIMIT 200",
+                    (self.last_event_id,)).fetchall()
+            except sqlite3.Error:
+                return events
+            finally:
+                conn.close()
+            if rows:
+                self.last_event_id = rows[-1]["event_id"]
+                events.extend(self._to_event(row) for row in rows)
+            if len(rows) < 200:
+                return events
 
     @staticmethod
     def _to_event(row: sqlite3.Row) -> WatchEvent:
