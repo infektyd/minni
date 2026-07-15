@@ -556,6 +556,9 @@ server.registerTool(
         includeVault: includeVault !== false,
         vaultMatches: vaultResults.map((match) => match.relativePath),
         error: result.error,
+        // Same id the daemon trace receives, so MCP recalls attribute in
+        // audit-based session receipts too.
+        session_id: MCP_PROCESS_SESSION_ID,
       },
     });
     return textResult(responseText);

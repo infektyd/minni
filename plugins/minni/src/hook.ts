@@ -547,7 +547,8 @@ async function handleStop(payload: Record<string, unknown>): Promise<HookOutput>
   // that never labeled any turn with a real session_id still gets a
   // best-effort receipt merged onto the synthetic "session" bucket rather
   // than no receipt at all.
-  const sessionId = asString(payload.session_id) || asString(payload.sessionId) || "session";
+  const rawStopSessionId = asString(payload.session_id) || asString(payload.sessionId);
+  const sessionId = rawStopSessionId || "session";
   const lastTask = asString(payload.last_user_message) || asString(payload.summary) || sessionId;
   const tail = await auditTail(CLAUDECODE_VAULT_PATH, 30);
   const outcome = await prepareOutcome({
@@ -568,7 +569,11 @@ async function handleStop(payload: Record<string, unknown>): Promise<HookOutput>
   // Tally the session BEFORE writing the stop entry so the receipt embeds in its
   // own audit details (candidates_drafted then reflects prior stops, not this
   // one — the candidate sentence below reports the current draft count).
-  const receipt = await sessionReceipt(CLAUDECODE_VAULT_PATH, sessionId).catch(() => undefined);
+  // On the synthetic fallback, count turns that stamped a real session_id
+  // inside this window, else the receipt reports zeros despite activity.
+  const receipt = await sessionReceipt(CLAUDECODE_VAULT_PATH, sessionId, 500, {
+    includeStamped: !rawStopSessionId,
+  }).catch(() => undefined);
   await recordAudit(CLAUDECODE_VAULT_PATH, {
     tool: "hook_stop",
     summary: `stop ${sessionId}`,

@@ -411,6 +411,40 @@ test("sessionReceipt window closes at the next session's boot when stop is missi
   }
 });
 
+test("sessionReceipt synthetic fallback counts stamped in-window turns when opted in", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-receipt-synth-"));
+  try {
+    await ensureVault(root);
+    // Runtime stamped real ids on turns but omitted session_id at Stop:
+    // the Stop handler falls back to "session" and must opt into counting
+    // stamped rows inside its window, else the receipt lies with zeros.
+    await recordAudit(root, {
+      tool: "hook_codex_session_start",
+      summary: "boot session",
+      details: { daemon_ok: true },
+    });
+    await recordAudit(root, {
+      tool: "hook_codex_user_prompt_submit",
+      summary: "real turn",
+      details: { recall_strong: true, session_id: "real-id-1" },
+    });
+    await recordAudit(root, {
+      tool: "hook_codex_stop",
+      summary: "stop session",
+      details: { candidates: 0 },
+    });
+
+    const strict = await sessionReceipt(root, "session");
+    assert.equal(strict.recalls_strong, 0, "strict mode excludes foreign stamps");
+    const merged = await sessionReceipt(root, "session", 500, {
+      includeStamped: true,
+    });
+    assert.equal(merged.recalls_strong, 1, "opt-in counts stamped in-window turns");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("sessionReceipt reads the rolling log so a boot outside today's daily file is found", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "sm-receipt-midnight-"));
   try {

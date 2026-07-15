@@ -629,7 +629,12 @@ export function createHookHandlers(
     // runtime that never labeled any turn with a real session_id still gets a
     // best-effort receipt merged onto the synthetic "session" bucket rather
     // than no receipt at all.
-    const sessionId = asString(payload.session_id) || asString(payload.sessionId) || "session";
+    const rawSessionId = asString(payload.session_id) || asString(payload.sessionId);
+    const sessionId = rawSessionId || "session";
+    // On the synthetic fallback, turns that DID stamp a real session_id must
+    // still count inside this window — otherwise the receipt reports zeros
+    // despite real activity.
+    const receiptOptions = { includeStamped: !rawSessionId };
     const workspaceId = workspaceFor(payload);
     const lastTask = asString(payload.last_user_message) || asString(payload.summary) || sessionId;
     const tail = await auditTail(config.vaultPath, 30);
@@ -641,13 +646,25 @@ export function createHookHandlers(
     });
 
     const candidates = outcome.outcomeDraft.learnCandidates;
-    // Nothing worth persisting: skip the inbox write and audit entry so we
-    // don't litter the inbox with empty files or pad the audit log with noise
-    // (unless this agent's config keeps the historical always-write behavior).
+    // Nothing worth persisting: skip the inbox write so we don't litter the
+    // inbox with empty files (unless this agent's config keeps the historical
+    // always-write behavior).
     if (!config.alwaysWriteStopInbox && candidates.length === 0) {
-      // No inbox write, no stop audit-entry (unchanged) — but STILL surface the
-      // receipt: proof the session did no memory work is itself information.
-      const receipt = await sessionReceipt(config.vaultPath, sessionId).catch(() => undefined);
+      // Still surface the receipt (proof of no memory work is information)
+      // AND still record the stop MARKER: it closes the sessionReceipt
+      // boot->stop window, so a later session's activity can never be
+      // tallied into this one.
+      const receipt = await sessionReceipt(
+        config.vaultPath, sessionId, 500, receiptOptions).catch(() => undefined);
+      await recordAudit(config.vaultPath, {
+        tool: `${config.auditPrefix}_stop`,
+        summary: `stop ${sessionId}`,
+        details: {
+          candidates: 0,
+          workspace: workspaceId,
+          ...(receipt ? { receipt } : {}),
+        },
+      }).catch(() => {});
       return {
         continue: true,
         ...(receipt ? { systemMessage: formatSessionReceiptLine(receipt) } : {}),
@@ -668,7 +685,8 @@ export function createHookHandlers(
     // Tally the session BEFORE writing the stop entry so the receipt embeds in
     // its own audit details (candidates_drafted then reflects prior stops, not
     // this one — the candidate sentence below reports the current draft count).
-    const receipt = await sessionReceipt(config.vaultPath, sessionId).catch(() => undefined);
+    const receipt = await sessionReceipt(
+      config.vaultPath, sessionId, 500, receiptOptions).catch(() => undefined);
     await recordAudit(config.vaultPath, {
       tool: `${config.auditPrefix}_stop`,
       summary: `stop ${sessionId}`,

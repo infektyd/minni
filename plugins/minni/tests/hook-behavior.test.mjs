@@ -260,6 +260,14 @@ test("Stop divergence: empty candidates skip the inbox write unless alwaysWriteS
       n.endsWith(".json"),
     );
     assert.deepEqual(grokNames, [], "empty outcome must not write an inbox file");
+    // The stop MARKER must still land even without an inbox write: it closes
+    // the sessionReceipt boot->stop window, so a later session's activity can
+    // never be tallied into this one.
+    const grokTail = await auditTail(grokVault, 10);
+    assert.ok(
+      grokTail.entries.some((entry) => entry.includes("| stop empty-stop")),
+      "zero-candidate Stop must record the stop audit marker",
+    );
 
     // codex historical behavior (alwaysWriteStopInbox: true): the file IS
     // written — and still carries the canonical kind + identity stamps.

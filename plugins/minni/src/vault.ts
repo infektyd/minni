@@ -963,6 +963,7 @@ export async function sessionReceipt(
   vaultPath: string,
   sessionId: string,
   limit = 500,
+  options: { includeStamped?: boolean } = {},
 ): Promise<SessionReceipt> {
   // Read the ROLLING log, not the daily file auditTail prefers: a session
   // that crosses midnight has its boot marker in yesterday's daily file, but
@@ -1061,7 +1062,11 @@ export async function sessionReceipt(
         : undefined;
     // An entry stamped for a DIFFERENT session never counts, even when it
     // falls inside our boot→stop window (interleaved multi-session vaults).
-    if (stampedSession !== undefined && stampedSession !== sessionId) return;
+    // Exception (includeStamped): a Stop that fell back to the synthetic id
+    // opts into counting stamped in-window turns, else its receipt reports
+    // zeros despite real activity.
+    if (!options.includeStamped
+        && stampedSession !== undefined && stampedSession !== sessionId) return;
     const byStamp = stampedSession === sessionId;
     const bySummary =
       item.summary === bootSummary ||
