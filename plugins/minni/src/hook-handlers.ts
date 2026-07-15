@@ -71,6 +71,8 @@ import {
   recordAudit,
   resolveInboxHandoffContext,
   searchVaultNotes,
+  sessionReceipt,
+  formatSessionReceiptLine,
   settleReassertedInboxEntries,
   writeInbox,
 } from "./vault.js";
@@ -192,6 +194,7 @@ export function createHookHandlers(
         limit: 8,
         agentId: config.agentId,
         workspaceId,
+        sessionId,
       }),
       // hooks-PL-1/PL-2: corrections to beliefs this agent read must
       // re-surface at boot (stale_beliefs), on every platform.
@@ -354,6 +357,7 @@ export function createHookHandlers(
     }
 
     const workspaceId = workspaceFor(payload);
+    const sessionId = asString(payload.session_id) || asString(payload.sessionId) || "session";
     const signature = hashTaskSignature(prompt);
 
     const intent = routeMemoryIntent(prompt);
@@ -377,6 +381,7 @@ export function createHookHandlers(
         limit: 6,
         agentId: config.agentId,
         workspaceId,
+        sessionId,
       }),
     ]);
     // s5 strength gate: emit the light pointer + recall-state file ONLY when the
@@ -427,6 +432,7 @@ export function createHookHandlers(
           task_signature: signature,
           workspace: workspaceId,
           recall_strong: false,
+          session_id: sessionId,
         },
       });
       return { continue: true };
@@ -470,6 +476,7 @@ export function createHookHandlers(
         task_signature: signature,
         workspace: workspaceId,
         recall_strong: Boolean(strong),
+        session_id: sessionId,
       },
     });
 
@@ -504,6 +511,10 @@ export function createHookHandlers(
     // again). On a persistence failure we FAIL OPEN and allow, trading a missed
     // nudge for availability.
     const consumed = await markRecallConsumed(config.vaultPath).catch(() => false);
+    // The PreToolUse payload may carry a session_id; stamp it so the Stop
+    // receipt can attribute this guard nudge. Only add it when actually present
+    // — never invent a "session" placeholder on this path.
+    const guardSessionId = asString(payload.session_id);
     await recordAudit(config.vaultPath, {
       tool: `${config.auditPrefix}_pretooluse_guard`,
       summary: `recall guard ${consumed ? "denied" : "allowed (consume write failed)"} ${toolName} (mode=${mode})`,
@@ -514,6 +525,7 @@ export function createHookHandlers(
         top_score: state!.top_score,
         hits: state!.top_hits.length,
         task_signature: state!.task_signature,
+        ...(guardSessionId ? { session_id: guardSessionId } : {}),
       },
     }).catch(() => {});
     if (!consumed) return preToolUseAllow();
@@ -615,7 +627,13 @@ export function createHookHandlers(
     // don't litter the inbox with empty files or pad the audit log with noise
     // (unless this agent's config keeps the historical always-write behavior).
     if (!config.alwaysWriteStopInbox && candidates.length === 0) {
-      return { continue: true };
+      // No inbox write, no stop audit-entry (unchanged) — but STILL surface the
+      // receipt: proof the session did no memory work is itself information.
+      const receipt = await sessionReceipt(config.vaultPath, sessionId).catch(() => undefined);
+      return {
+        continue: true,
+        ...(receipt ? { systemMessage: formatSessionReceiptLine(receipt) } : {}),
+      };
     }
 
     const inbox = await writeInbox(config.vaultPath, sessionId, {
@@ -629,6 +647,10 @@ export function createHookHandlers(
       last_task: lastTask.slice(0, 200),
     });
 
+    // Tally the session BEFORE writing the stop entry so the receipt embeds in
+    // its own audit details (candidates_drafted then reflects prior stops, not
+    // this one — the candidate sentence below reports the current draft count).
+    const receipt = await sessionReceipt(config.vaultPath, sessionId).catch(() => undefined);
     await recordAudit(config.vaultPath, {
       tool: `${config.auditPrefix}_stop`,
       summary: `stop ${sessionId}`,
@@ -636,11 +658,17 @@ export function createHookHandlers(
         candidates: candidates.length,
         workspace: workspaceId,
         inbox_path: inbox.filePath,
+        ...(receipt ? { receipt } : {}),
       },
     });
 
+    const receiptLine = receipt ? ` ${formatSessionReceiptLine(receipt)}` : "";
+
     if (candidates.length === 0) {
-      return { continue: true };
+      return {
+        continue: true,
+        ...(receipt ? { systemMessage: formatSessionReceiptLine(receipt) } : {}),
+      };
     }
 
     return {
@@ -649,7 +677,7 @@ export function createHookHandlers(
         candidates.length === 1 ? "" : "s"
       } drafted to inbox (${inbox.filePath}). ${
         config.stopCommitHint ?? "Use minni_prepare_outcome/minni_learn to review and commit."
-      }`,
+      }${receiptLine}`,
     };
   }
 

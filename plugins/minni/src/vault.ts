@@ -941,6 +941,154 @@ export async function auditReport(
   return report;
 }
 
+/**
+ * Per-session proof-of-use tally, emitted at Stop. Every field counts audit
+ * entries this session actually produced — the zero case is meaningful (proof
+ * the memory path was NOT exercised), so callers surface the receipt even when
+ * every count is 0.
+ */
+export interface SessionReceipt {
+  session_id: string;
+  entries: number;
+  recalls_strong: number;
+  recalls_weak: number;
+  guard_denied: number;
+  guard_allowed: number;
+  learns: number;
+  vault_writes: number;
+  candidates_drafted: number;
+}
+
+export async function sessionReceipt(
+  vaultPath: string,
+  sessionId: string,
+  limit = 500,
+): Promise<SessionReceipt> {
+  const tail = await auditTail(vaultPath, limit);
+  const receipt: SessionReceipt = {
+    session_id: sessionId,
+    entries: 0,
+    recalls_strong: 0,
+    recalls_weak: 0,
+    guard_denied: 0,
+    guard_allowed: 0,
+    learns: 0,
+    vault_writes: 0,
+    candidates_drafted: 0,
+  };
+
+  // Boot/stop/pre-compact summaries are the only self-identifying markers that
+  // predate session_id-stamped details, so use them to (a) attribute pre-stamp
+  // entries and (b) define a boot→stop window that catches everything in
+  // between. The window opens at the LAST `boot <sessionId>` (a resumed session
+  // reboots) and closes at the next `stop <sessionId>` (or the tail end).
+  const bootSummary = `boot ${sessionId}`;
+  const stopSummary = `stop ${sessionId}`;
+  const preCompactSummary = `pre-compact ${sessionId}`;
+
+  interface ParsedEntry {
+    tool: string;
+    summary: string;
+    details: Record<string, unknown> | undefined;
+  }
+  const parsed: ParsedEntry[] = [];
+  for (const entry of tail.entries) {
+    const header = entry.match(/^## \[[^\]]+\]\s+([^|]+)\|\s+(.+)$/m);
+    if (!header) continue;
+    const tool = header[1].trim();
+    const summary = header[2].trim();
+    let details: Record<string, unknown> | undefined;
+    const detailMatch = entry.match(/```json\n([\s\S]*?)\n```/);
+    if (detailMatch) {
+      try {
+        const value = JSON.parse(detailMatch[1]);
+        if (value && typeof value === "object" && !Array.isArray(value)) {
+          details = value as Record<string, unknown>;
+        }
+      } catch {
+        // Lenient: a truncated/escaped block that no longer parses just carries
+        // no attributable details — it still counts via the boot→stop window.
+      }
+    }
+    parsed.push({ tool, summary, details });
+  }
+
+  // Window bounds by index into `parsed`: from the last boot to the following
+  // stop (exclusive of neither bound's own inclusion decision below).
+  let windowStart = -1;
+  for (let i = 0; i < parsed.length; i += 1) {
+    if (parsed[i].summary === bootSummary) windowStart = i;
+  }
+  let windowEnd = parsed.length;
+  if (windowStart >= 0) {
+    for (let i = windowStart + 1; i < parsed.length; i += 1) {
+      if (parsed[i].summary === stopSummary) {
+        windowEnd = i;
+        break;
+      }
+    }
+  }
+
+  parsed.forEach((item, index) => {
+    const stampedSession =
+      item.details && typeof item.details.session_id === "string"
+        ? (item.details.session_id as string)
+        : undefined;
+    const byStamp = stampedSession === sessionId;
+    const bySummary =
+      item.summary === bootSummary ||
+      item.summary === stopSummary ||
+      item.summary === preCompactSummary;
+    const byWindow =
+      windowStart >= 0 && index >= windowStart && index < windowEnd;
+    if (!byStamp && !bySummary && !byWindow) return;
+
+    receipt.entries += 1;
+
+    if (item.tool.endsWith("_user_prompt_submit")) {
+      if (item.details && item.details.recall_strong === true) {
+        receipt.recalls_strong += 1;
+      } else if (item.details && item.details.recall_strong === false) {
+        receipt.recalls_weak += 1;
+      }
+    }
+    if (item.tool.endsWith("_pretooluse_guard")) {
+      if (item.summary.startsWith("recall guard denied")) {
+        receipt.guard_denied += 1;
+      } else {
+        receipt.guard_allowed += 1;
+      }
+    }
+    if (item.tool === "minni_learn") receipt.learns += 1;
+    if (item.tool === "minni_vault_write" || item.tool === "vault_write") {
+      receipt.vault_writes += 1;
+    }
+    if (item.tool.endsWith("_stop")) {
+      const candidates = item.details ? item.details.candidates : undefined;
+      if (typeof candidates === "number" && Number.isFinite(candidates)) {
+        receipt.candidates_drafted += candidates;
+      }
+    }
+  });
+
+  return receipt;
+}
+
+/**
+ * Compact one-line proof-of-use string for the Stop systemMessage. Always names
+ * the recall/guard/learn counts even when zero — a clean receipt (no recalls,
+ * no guards) is itself the signal that memory was not exercised this session.
+ */
+export function formatSessionReceiptLine(receipt: SessionReceipt): string {
+  const recalls = receipt.recalls_strong + receipt.recalls_weak;
+  const parts = [
+    `${recalls} recall${recalls === 1 ? "" : "s"} (${receipt.recalls_strong} strong)`,
+    `${receipt.guard_denied} guard nudge${receipt.guard_denied === 1 ? "" : "s"}`,
+    `${receipt.candidates_drafted} learn${receipt.candidates_drafted === 1 ? "" : "s"} staged`,
+  ];
+  return `Minni session receipt: ${parts.join(", ")}.`;
+}
+
 export async function searchVaultNotes(
   vaultPath: string,
   query: string,

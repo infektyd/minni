@@ -8,9 +8,11 @@ import {
   auditTail,
   auditReport,
   ensureVault,
+  formatSessionReceiptLine,
   recordAudit,
   resolveInboxHandoffContext,
   searchVaultNotes,
+  sessionReceipt,
   vaultFirstLearn,
   writeVaultPage,
 } from "../dist/vault.js";
@@ -20,6 +22,12 @@ import { symlink } from "node:fs/promises"; // for RCM-005 escape test
 // MINNI_HOME (falling back to ~/.minni) — point it at a temp dir so the
 // suite never touches the real home (CI smoke asserts zero ~ pollution).
 process.env.MINNI_HOME = await mkdtemp(path.join(tmpdir(), "sm-test-home-"));
+
+// Session-receipt tests write `hook_*` audit entries in quick succession;
+// recordAudit throttles those within 5s of each other, so bypass the limit to
+// keep every crafted entry (the existing tests use non-hook tools and are
+// unaffected by this flag).
+process.env.MINNI_BYPASS_AUDIT_LIMIT = "true";
 
 test("ensureVault creates the Codex LLM wiki structure and schema", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "sm-vault-"));
@@ -226,6 +234,132 @@ test("searchVaultNotes ranks Codex wiki learnings for recall context", async () 
       /\[\[wiki\/sessions\/\d{8}-codex-plugin-full-suite-marker\]\]/,
     );
     assert.match(results[0].snippet, /SM_SEARCH_MARKER/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("sessionReceipt tallies per-session memory activity from the audit log", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-receipt-"));
+  try {
+    await ensureVault(root);
+    const sid = "sess-A";
+
+    // Boot marker (predates session_id-stamped details; window opens here).
+    await recordAudit(root, {
+      tool: "hook_codex_session_start",
+      summary: `boot ${sid}`,
+      details: { daemon_ok: true },
+    });
+    // Strong + weak recalls, both stamped with the session id.
+    await recordAudit(root, {
+      tool: "hook_codex_user_prompt_submit",
+      summary: "first task",
+      details: { recall_strong: true, session_id: sid },
+    });
+    await recordAudit(root, {
+      tool: "hook_codex_user_prompt_submit",
+      summary: "second task",
+      details: { recall_strong: false, session_id: sid },
+    });
+    // Guard nudge (denied) + an unstamped learn/vault write caught by the window.
+    await recordAudit(root, {
+      tool: "hook_codex_pretooluse_guard",
+      summary: `recall guard denied Edit (mode=strict)`,
+      details: { consumed: true, session_id: sid },
+    });
+    await recordAudit(root, {
+      tool: "minni_learn",
+      summary: "committed a learning",
+      details: { ok: true },
+    });
+    await recordAudit(root, {
+      tool: "vault_write",
+      summary: "wrote a page",
+      details: { ok: true },
+    });
+    // Stop marker with a candidates count (window closes here).
+    await recordAudit(root, {
+      tool: "hook_codex_stop",
+      summary: `stop ${sid}`,
+      details: { candidates: 2 },
+    });
+
+    // A different session's activity AFTER the stop must not leak in.
+    await recordAudit(root, {
+      tool: "hook_codex_user_prompt_submit",
+      summary: "other-session task",
+      details: { recall_strong: true, session_id: "sess-B" },
+    });
+
+    const receipt = await sessionReceipt(root, sid);
+    assert.equal(receipt.session_id, sid);
+    assert.equal(receipt.entries, 7);
+    assert.equal(receipt.recalls_strong, 1);
+    assert.equal(receipt.recalls_weak, 1);
+    assert.equal(receipt.guard_denied, 1);
+    assert.equal(receipt.guard_allowed, 0);
+    assert.equal(receipt.learns, 1);
+    assert.equal(receipt.vault_writes, 1);
+    assert.equal(receipt.candidates_drafted, 2);
+
+    assert.equal(
+      formatSessionReceiptLine(receipt),
+      "Minni session receipt: 2 recalls (1 strong), 1 guard nudge, 2 learns staged.",
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("sessionReceipt returns an all-zero receipt when the session did no memory work", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-receipt-zero-"));
+  try {
+    await ensureVault(root);
+    // Only another session's entries exist; the queried session is a no-op.
+    await recordAudit(root, {
+      tool: "hook_codex_user_prompt_submit",
+      summary: "unrelated",
+      details: { recall_strong: true, session_id: "sess-other" },
+    });
+
+    const receipt = await sessionReceipt(root, "sess-empty");
+    assert.equal(receipt.entries, 0);
+    assert.equal(receipt.recalls_strong, 0);
+    assert.equal(receipt.recalls_weak, 0);
+    assert.equal(receipt.guard_denied, 0);
+    assert.equal(receipt.candidates_drafted, 0);
+    assert.equal(
+      formatSessionReceiptLine(receipt),
+      "Minni session receipt: 0 recalls (0 strong), 0 guard nudges, 0 learns staged.",
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("sessionReceipt counts allowed guard nudges and stamped entries out of window", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-receipt-guard-"));
+  try {
+    await ensureVault(root);
+    const sid = "sess-C";
+    // No boot marker: attribution here rests purely on stamped session_id.
+    await recordAudit(root, {
+      tool: "hook_codex_pretooluse_guard",
+      summary: `recall guard allowed (consume write failed) Read (mode=strict)`,
+      details: { consumed: false, session_id: sid },
+    });
+    await recordAudit(root, {
+      tool: "hook_codex_user_prompt_submit",
+      summary: "task",
+      details: { recall_strong: true, session_id: sid },
+    });
+
+    const receipt = await sessionReceipt(root, sid);
+    assert.equal(receipt.entries, 2);
+    assert.equal(receipt.guard_denied, 0);
+    assert.equal(receipt.guard_allowed, 1);
+    assert.equal(receipt.recalls_strong, 1);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

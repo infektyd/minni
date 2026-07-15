@@ -69,6 +69,8 @@ import {
   recordAudit,
   resolveInboxHandoffContext,
   searchVaultNotes,
+  sessionReceipt,
+  formatSessionReceiptLine,
   settleReassertedInboxEntries,
   writeInbox,
 } from "./vault.js";
@@ -95,6 +97,7 @@ async function handleSessionStart(payload: Record<string, unknown>): Promise<Hoo
     limit: 8,
     agentId: CLAUDECODE_AGENT_ID,
     workspaceId: CLAUDECODE_WORKSPACE_ID,
+    sessionId,
   });
   // hooks-PL-2 leg (a): the 'read' RPC is the recency-ordered learning surface
   // AND the daemon path that records learning_reads — without it, corrections
@@ -312,6 +315,7 @@ async function handleUserPromptSubmit(payload: Record<string, unknown>): Promise
   if (!prompt.trim()) {
     return { continue: true };
   }
+  const sessionId = asString(payload.session_id) || asString(payload.sessionId) || "session";
   const signature = hashTaskSignature(prompt);
 
   // c4/c5: compute the lifecycle representation once for this turn, BEFORE the
@@ -358,6 +362,7 @@ async function handleUserPromptSubmit(payload: Record<string, unknown>): Promise
       limit: 6,
       agentId: CLAUDECODE_AGENT_ID,
       workspaceId: CLAUDECODE_WORKSPACE_ID,
+      sessionId,
     }),
   ]);
   const vaultResults = filterSafeVaultResults(vaultResultsRaw);
@@ -414,6 +419,7 @@ async function handleUserPromptSubmit(payload: Record<string, unknown>): Promise
         daemon_ok: recall.ok,
         task_signature: signature,
         recall_strong: false,
+        session_id: sessionId,
       },
     });
     // c3: even with nothing salient (no strong recall, no active plan) the
@@ -464,6 +470,7 @@ async function handleUserPromptSubmit(payload: Record<string, unknown>): Promise
       task_signature: signature,
       recall_strong: Boolean(strong),
       top_score: strong?.topScore,
+      session_id: sessionId,
     },
   });
 
@@ -539,24 +546,35 @@ async function handleStop(payload: Record<string, unknown>): Promise<HookOutput>
     last_task: lastTask.slice(0, 200),
   });
 
+  // Tally the session BEFORE writing the stop entry so the receipt embeds in its
+  // own audit details (candidates_drafted then reflects prior stops, not this
+  // one — the candidate sentence below reports the current draft count).
+  const receipt = await sessionReceipt(CLAUDECODE_VAULT_PATH, sessionId).catch(() => undefined);
   await recordAudit(CLAUDECODE_VAULT_PATH, {
     tool: "hook_stop",
     summary: `stop ${sessionId}`,
     details: {
       candidates: outcome.outcomeDraft.learnCandidates.length,
       inbox_path: inbox.filePath,
+      ...(receipt ? { receipt } : {}),
     },
   });
 
+  // Emit the receipt even with zero candidates: proof that no memory work
+  // happened this session is itself information.
   if (outcome.outcomeDraft.learnCandidates.length === 0) {
-    return { continue: true };
+    return {
+      continue: true,
+      ...(receipt ? { systemMessage: formatSessionReceiptLine(receipt) } : {}),
+    };
   }
 
+  const receiptLine = receipt ? ` ${formatSessionReceiptLine(receipt)}` : "";
   return {
     continue: true,
     systemMessage: `Minni: ${outcome.outcomeDraft.learnCandidates.length} candidate learning${
       outcome.outcomeDraft.learnCandidates.length === 1 ? "" : "s"
-    } drafted to inbox (${inbox.filePath}). Use /minni:learn to commit.`,
+    } drafted to inbox (${inbox.filePath}). Use /minni:learn to commit.${receiptLine}`,
   };
 }
 
@@ -588,6 +606,10 @@ async function handlePreToolUse(
   // a persistence failure we FAIL OPEN and allow, trading a missed nudge for
   // availability.
   const consumed = await markRecallConsumed(CLAUDECODE_VAULT_PATH).catch(() => false);
+  // The PreToolUse payload may carry a session_id; stamp it so the Stop receipt
+  // can attribute this guard nudge. Only add it when present — never invent a
+  // "session" placeholder on this path.
+  const guardSessionId = asString(payload.session_id);
   await recordAudit(CLAUDECODE_VAULT_PATH, {
     tool: "hook_pretooluse_guard",
     summary: `recall guard ${consumed ? "denied" : "allowed (consume write failed)"} ${toolName} (mode=${mode})`,
@@ -598,6 +620,7 @@ async function handlePreToolUse(
       top_score: state!.top_score,
       hits: state!.top_hits.length,
       task_signature: state!.task_signature,
+      ...(guardSessionId ? { session_id: guardSessionId } : {}),
     },
   }).catch(() => {});
   if (!consumed) return preToolUseAllow();

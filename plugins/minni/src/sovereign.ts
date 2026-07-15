@@ -167,6 +167,7 @@ export async function recallMemory(input: {
   scope?: "personal" | "combined" | "both";
   crossAgent?: boolean;
   cross_agent?: boolean;
+  sessionId?: string;
 }, requester: JsonRpcRequester = jsonRpcSocketRequest): Promise<JsonResult<RecallResponse>> {
   // Daemon is JSON-RPC only; surface its real result/error (e.g. identity_mismatch)
   // directly instead of masking it behind a dead HTTP-over-socket fallback.
@@ -182,6 +183,10 @@ export async function recallMemory(input: {
     scope: input.scope,
     cross_agent: input.crossAgent ?? input.cross_agent,
     depth: "snippet",
+    // Session receipts: the daemon records a durable episodic recall-trace event
+    // (thread_id=session_id) when this is present. Omit it entirely when the
+    // caller has no session context so the daemon param stays absent, not null.
+    ...(input.sessionId !== undefined ? { session_id: input.sessionId } : {}),
   }, requester) as Promise<JsonResult<RecallResponse>>;
 }
 

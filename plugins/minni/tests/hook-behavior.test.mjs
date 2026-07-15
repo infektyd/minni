@@ -252,7 +252,9 @@ test("Stop divergence: empty candidates skip the inbox write unless alwaysWriteS
     });
     const grokOut = await grokHandlers.handleStop({ session_id: "empty-stop" });
     assert.equal(grokOut.continue, true);
-    assert.equal(grokOut.systemMessage, undefined);
+    // Session receipts: even a no-candidate Stop surfaces the proof-of-use line
+    // (a clean receipt is itself the signal that memory was not exercised).
+    assert.match(grokOut.systemMessage, /^Minni session receipt: /);
     const grokNames = (await readdir(path.join(grokVault, "inbox"))).filter((n) =>
       n.endsWith(".json"),
     );
@@ -266,7 +268,9 @@ test("Stop divergence: empty candidates skip the inbox write unless alwaysWriteS
     });
     const codexOut = await codexHandlers.handleStop({ session_id: "empty-stop" });
     assert.equal(codexOut.continue, true);
-    assert.equal(codexOut.systemMessage, undefined, "no candidates => no call-to-action");
+    // No candidate call-to-action, but the receipt line still rides the Stop.
+    assert.match(codexOut.systemMessage, /^Minni session receipt: /);
+    assert.doesNotMatch(codexOut.systemMessage, /candidate learning/);
     const codexNames = (await readdir(path.join(codexVault, "inbox"))).filter((n) =>
       n.endsWith(".json"),
     );
