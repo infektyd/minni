@@ -1114,10 +1114,13 @@ export async function sessionReceipt(
  */
 export function formatSessionReceiptLine(receipt: SessionReceipt): string {
   const recalls = receipt.recalls_strong + receipt.recalls_weak;
+  // `learns` (committed minni_learn rows) and `candidates_drafted` are
+  // distinct tallies — naming only one hid the other from the proof line.
   const parts = [
     `${recalls} recall${recalls === 1 ? "" : "s"} (${receipt.recalls_strong} strong)`,
     `${receipt.guard_denied} guard nudge${receipt.guard_denied === 1 ? "" : "s"}`,
-    `${receipt.candidates_drafted} learn${receipt.candidates_drafted === 1 ? "" : "s"} staged`,
+    `${receipt.learns} learn${receipt.learns === 1 ? "" : "s"} committed`,
+    `${receipt.candidates_drafted} candidate${receipt.candidates_drafted === 1 ? "" : "s"} staged`,
   ];
   return `Minni session receipt: ${parts.join(", ")}.`;
 }

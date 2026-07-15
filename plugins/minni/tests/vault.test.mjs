@@ -305,7 +305,7 @@ test("sessionReceipt tallies per-session memory activity from the audit log", as
 
     assert.equal(
       formatSessionReceiptLine(receipt),
-      "Minni session receipt: 2 recalls (1 strong), 1 guard nudge, 2 learns staged.",
+      "Minni session receipt: 2 recalls (1 strong), 1 guard nudge, 1 learn committed, 2 candidates staged.",
     );
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -331,7 +331,7 @@ test("sessionReceipt returns an all-zero receipt when the session did no memory 
     assert.equal(receipt.candidates_drafted, 0);
     assert.equal(
       formatSessionReceiptLine(receipt),
-      "Minni session receipt: 0 recalls (0 strong), 0 guard nudges, 0 learns staged.",
+      "Minni session receipt: 0 recalls (0 strong), 0 guard nudges, 0 learns committed, 0 candidates staged.",
     );
   } finally {
     await rm(root, { recursive: true, force: true });
