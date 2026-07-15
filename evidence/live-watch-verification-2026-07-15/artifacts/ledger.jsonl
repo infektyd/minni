@@ -1,0 +1,322 @@
+{"seq": 1, "t": 1784133724.896522, "op": "search", "args": {"query": "T01 prior incidents: printer offline after firmware update", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 2, "t": 1784133726.7616951, "op": "search", "args": {"query": "T02 prior incidents: vpn drops every 20 minutes", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 3, "t": 1784133728.480163, "op": "search", "args": {"query": "T03 prior incidents: sso login loop on staging", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 4, "t": 1784133728.4815934, "op": "log_event", "args": {"content": "T03 triaged: sso login loop on staging -> tier2"}, "response": {"event_id": 5, "error": null}}
+{"seq": 5, "t": 1784133731.7873573, "op": "search", "args": {"query": "T04 prior incidents: database connection pool exhausted", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 6, "t": 1784133736.258995, "op": "search", "args": {"query": "T05 prior incidents: email bounce dmarc failure", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 7, "t": 1784133738.4159253, "op": "search", "args": {"query": "T06 prior incidents: kubernetes pod oomkilled on deploy", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 8, "t": 1784133738.4176621, "op": "log_event", "args": {"content": "T06 triaged: kubernetes pod oomkilled on deploy -> tier2"}, "response": {"event_id": 9, "error": null}}
+{"seq": 9, "t": 1784133738.4192936, "op": "learn", "args": {"content": "T06: for 'kubernetes pod oomkilled on deploy', escalate to tier2 after two failed remote resets"}, "response": {"status": "proposed", "candidate_id": 2, "error": null}}
+{"seq": 10, "t": 1784133742.3086255, "op": "search", "args": {"query": "T07 prior incidents: ssl certificate expired on api gateway", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 11, "t": 1784133744.5358849, "op": "search", "args": {"query": "T08 prior incidents: backup job silently failing", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 12, "t": 1784133746.144473, "op": "search", "args": {"query": "T09 prior incidents: two-factor reset request", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 13, "t": 1784133746.1457639, "op": "log_event", "args": {"content": "T09 triaged: two-factor reset request -> tier2"}, "response": {"event_id": 13, "error": null}}
+{"seq": 14, "t": 1784133748.0473304, "op": "search", "args": {"query": "T10 prior incidents: slow query on orders table", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 15, "t": 1784133751.468285, "op": "search", "args": {"query": "T11 prior incidents: webhook retries flooding endpoint", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 16, "t": 1784133755.5049813, "op": "search", "args": {"query": "T12 prior incidents: disk full on ci runner", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 17, "t": 1784133755.5062687, "op": "log_event", "args": {"content": "T12 triaged: disk full on ci runner -> tier2"}, "response": {"event_id": 17, "error": null}}
+{"seq": 18, "t": 1784133755.5074186, "op": "learn", "args": {"content": "T12: for 'disk full on ci runner', escalate to tier2 after two failed remote resets"}, "response": {"status": "proposed", "candidate_id": 3, "error": null}}
+{"seq": 19, "t": 1784133757.4515038, "op": "search", "args": {"query": "T13 prior incidents: printer offline after firmware update", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 20, "t": 1784133761.5086713, "op": "search", "args": {"query": "T14 prior incidents: vpn drops every 20 minutes", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 21, "t": 1784133764.836286, "op": "search", "args": {"query": "T15 prior incidents: sso login loop on staging", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 22, "t": 1784133764.8375201, "op": "log_event", "args": {"content": "T15 triaged: sso login loop on staging -> tier2"}, "response": {"event_id": 21, "error": null}}
+{"seq": 23, "t": 1784133768.1759963, "op": "search", "args": {"query": "T16 prior incidents: database connection pool exhausted", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 24, "t": 1784133771.7537968, "op": "search", "args": {"query": "T17 prior incidents: email bounce dmarc failure", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 25, "t": 1784133773.9914742, "op": "search", "args": {"query": "T18 prior incidents: kubernetes pod oomkilled on deploy", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 26, "t": 1784133773.9928153, "op": "log_event", "args": {"content": "T18 triaged: kubernetes pod oomkilled on deploy -> tier2"}, "response": {"event_id": 25, "error": null}}
+{"seq": 27, "t": 1784133773.9941196, "op": "learn", "args": {"content": "T18: for 'kubernetes pod oomkilled on deploy', escalate to tier2 after two failed remote resets"}, "response": {"status": "proposed", "candidate_id": 4, "error": null}}
+{"seq": 28, "t": 1784133776.7358797, "op": "search", "args": {"query": "T19 prior incidents: ssl certificate expired on api gateway", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 29, "t": 1784133779.2263086, "op": "search", "args": {"query": "T20 prior incidents: backup job silently failing", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 30, "t": 1784133779.2291517, "op": "search", "args": {"query": "B001 burst probe: vpn drops every 20 minutes", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 31, "t": 1784133779.2313373, "op": "search", "args": {"query": "B002 burst probe: sso login loop on staging", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 32, "t": 1784133779.2338123, "op": "search", "args": {"query": "B003 burst probe: database connection pool exhausted", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 33, "t": 1784133779.2358863, "op": "search", "args": {"query": "B004 burst probe: email bounce dmarc failure", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 34, "t": 1784133779.2381032, "op": "search", "args": {"query": "B005 burst probe: kubernetes pod oomkilled on deploy", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 35, "t": 1784133779.240201, "op": "search", "args": {"query": "B006 burst probe: ssl certificate expired on api gateway", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 36, "t": 1784133779.2422726, "op": "search", "args": {"query": "B007 burst probe: backup job silently failing", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 37, "t": 1784133779.2442582, "op": "search", "args": {"query": "B008 burst probe: two-factor reset request", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 38, "t": 1784133779.2463562, "op": "search", "args": {"query": "B009 burst probe: slow query on orders table", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 39, "t": 1784133779.2484305, "op": "search", "args": {"query": "B010 burst probe: webhook retries flooding endpoint", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 40, "t": 1784133779.2503977, "op": "search", "args": {"query": "B011 burst probe: disk full on ci runner", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 41, "t": 1784133779.252413, "op": "search", "args": {"query": "B012 burst probe: printer offline after firmware update", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 42, "t": 1784133779.254469, "op": "search", "args": {"query": "B013 burst probe: vpn drops every 20 minutes", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 43, "t": 1784133779.2564807, "op": "search", "args": {"query": "B014 burst probe: sso login loop on staging", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 44, "t": 1784133779.2589786, "op": "search", "args": {"query": "B015 burst probe: database connection pool exhausted", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 45, "t": 1784133779.2609906, "op": "search", "args": {"query": "B016 burst probe: email bounce dmarc failure", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 46, "t": 1784133779.2632983, "op": "search", "args": {"query": "B017 burst probe: kubernetes pod oomkilled on deploy", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 47, "t": 1784133779.2653315, "op": "search", "args": {"query": "B018 burst probe: ssl certificate expired on api gateway", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 48, "t": 1784133779.2674594, "op": "search", "args": {"query": "B019 burst probe: backup job silently failing", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 49, "t": 1784133779.2694485, "op": "search", "args": {"query": "B020 burst probe: two-factor reset request", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 50, "t": 1784133779.2713797, "op": "search", "args": {"query": "B021 burst probe: slow query on orders table", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 51, "t": 1784133779.2735317, "op": "search", "args": {"query": "B022 burst probe: webhook retries flooding endpoint", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 52, "t": 1784133779.2756598, "op": "search", "args": {"query": "B023 burst probe: disk full on ci runner", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 53, "t": 1784133779.277661, "op": "search", "args": {"query": "B024 burst probe: printer offline after firmware update", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 54, "t": 1784133779.2798185, "op": "search", "args": {"query": "B025 burst probe: vpn drops every 20 minutes", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 55, "t": 1784133779.281904, "op": "search", "args": {"query": "B026 burst probe: sso login loop on staging", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 56, "t": 1784133779.284308, "op": "search", "args": {"query": "B027 burst probe: database connection pool exhausted", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 57, "t": 1784133779.2864072, "op": "search", "args": {"query": "B028 burst probe: email bounce dmarc failure", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 58, "t": 1784133779.2884643, "op": "search", "args": {"query": "B029 burst probe: kubernetes pod oomkilled on deploy", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 59, "t": 1784133779.290794, "op": "search", "args": {"query": "B030 burst probe: ssl certificate expired on api gateway", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 60, "t": 1784133779.2929764, "op": "search", "args": {"query": "B031 burst probe: backup job silently failing", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 61, "t": 1784133779.2954023, "op": "search", "args": {"query": "B032 burst probe: two-factor reset request", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 62, "t": 1784133779.2976341, "op": "search", "args": {"query": "B033 burst probe: slow query on orders table", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 63, "t": 1784133779.299738, "op": "search", "args": {"query": "B034 burst probe: webhook retries flooding endpoint", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 64, "t": 1784133779.3025384, "op": "search", "args": {"query": "B035 burst probe: disk full on ci runner", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 65, "t": 1784133779.3045497, "op": "search", "args": {"query": "B036 burst probe: printer offline after firmware update", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 66, "t": 1784133779.3066096, "op": "search", "args": {"query": "B037 burst probe: vpn drops every 20 minutes", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 67, "t": 1784133779.3085794, "op": "search", "args": {"query": "B038 burst probe: sso login loop on staging", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 68, "t": 1784133779.3109903, "op": "search", "args": {"query": "B039 burst probe: database connection pool exhausted", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 69, "t": 1784133779.3129911, "op": "search", "args": {"query": "B040 burst probe: email bounce dmarc failure", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 70, "t": 1784133779.3149798, "op": "search", "args": {"query": "B041 burst probe: kubernetes pod oomkilled on deploy", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 71, "t": 1784133779.317016, "op": "search", "args": {"query": "B042 burst probe: ssl certificate expired on api gateway", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 72, "t": 1784133779.3190145, "op": "search", "args": {"query": "B043 burst probe: backup job silently failing", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 73, "t": 1784133779.321033, "op": "search", "args": {"query": "B044 burst probe: two-factor reset request", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 74, "t": 1784133779.3232346, "op": "search", "args": {"query": "B045 burst probe: slow query on orders table", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 75, "t": 1784133779.32524, "op": "search", "args": {"query": "B046 burst probe: webhook retries flooding endpoint", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 76, "t": 1784133779.3272965, "op": "search", "args": {"query": "B047 burst probe: disk full on ci runner", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 77, "t": 1784133779.3295238, "op": "search", "args": {"query": "B048 burst probe: printer offline after firmware update", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 78, "t": 1784133779.3481355, "op": "search", "args": {"query": "B049 burst probe: vpn drops every 20 minutes", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 79, "t": 1784133779.3511705, "op": "search", "args": {"query": "B050 burst probe: sso login loop on staging", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 80, "t": 1784133779.3535488, "op": "search", "args": {"query": "B051 burst probe: database connection pool exhausted", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 81, "t": 1784133779.3554792, "op": "search", "args": {"query": "B052 burst probe: email bounce dmarc failure", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 82, "t": 1784133779.3574653, "op": "search", "args": {"query": "B053 burst probe: kubernetes pod oomkilled on deploy", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 83, "t": 1784133779.359415, "op": "search", "args": {"query": "B054 burst probe: ssl certificate expired on api gateway", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 84, "t": 1784133779.361549, "op": "search", "args": {"query": "B055 burst probe: backup job silently failing", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 85, "t": 1784133779.3633997, "op": "search", "args": {"query": "B056 burst probe: two-factor reset request", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 86, "t": 1784133779.3655071, "op": "search", "args": {"query": "B057 burst probe: slow query on orders table", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 87, "t": 1784133779.3674245, "op": "search", "args": {"query": "B058 burst probe: webhook retries flooding endpoint", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 88, "t": 1784133779.3694417, "op": "search", "args": {"query": "B059 burst probe: disk full on ci runner", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 89, "t": 1784133779.3716872, "op": "search", "args": {"query": "B060 burst probe: printer offline after firmware update", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 90, "t": 1784133779.373683, "op": "search", "args": {"query": "B061 burst probe: vpn drops every 20 minutes", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 91, "t": 1784133779.3755724, "op": "search", "args": {"query": "B062 burst probe: sso login loop on staging", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 92, "t": 1784133779.3778796, "op": "search", "args": {"query": "B063 burst probe: database connection pool exhausted", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 93, "t": 1784133779.3798487, "op": "search", "args": {"query": "B064 burst probe: email bounce dmarc failure", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 94, "t": 1784133779.3820703, "op": "search", "args": {"query": "B065 burst probe: kubernetes pod oomkilled on deploy", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 95, "t": 1784133779.3840601, "op": "search", "args": {"query": "B066 burst probe: ssl certificate expired on api gateway", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 96, "t": 1784133779.3863733, "op": "search", "args": {"query": "B067 burst probe: backup job silently failing", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 97, "t": 1784133779.3885205, "op": "search", "args": {"query": "B068 burst probe: two-factor reset request", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 98, "t": 1784133779.3906927, "op": "search", "args": {"query": "B069 burst probe: slow query on orders table", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 99, "t": 1784133779.3926384, "op": "search", "args": {"query": "B070 burst probe: webhook retries flooding endpoint", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 100, "t": 1784133779.394575, "op": "search", "args": {"query": "B071 burst probe: disk full on ci runner", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 101, "t": 1784133779.396597, "op": "search", "args": {"query": "B072 burst probe: printer offline after firmware update", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 102, "t": 1784133779.3985412, "op": "search", "args": {"query": "B073 burst probe: vpn drops every 20 minutes", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 103, "t": 1784133779.400487, "op": "search", "args": {"query": "B074 burst probe: sso login loop on staging", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 104, "t": 1784133779.402859, "op": "search", "args": {"query": "B075 burst probe: database connection pool exhausted", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 105, "t": 1784133779.4047253, "op": "search", "args": {"query": "B076 burst probe: email bounce dmarc failure", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 106, "t": 1784133779.406912, "op": "search", "args": {"query": "B077 burst probe: kubernetes pod oomkilled on deploy", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 107, "t": 1784133779.4091768, "op": "search", "args": {"query": "B078 burst probe: ssl certificate expired on api gateway", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 108, "t": 1784133779.4114213, "op": "search", "args": {"query": "B079 burst probe: backup job silently failing", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 109, "t": 1784133779.4134874, "op": "search", "args": {"query": "B080 burst probe: two-factor reset request", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 110, "t": 1784133779.4153936, "op": "search", "args": {"query": "B081 burst probe: slow query on orders table", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 111, "t": 1784133779.4173071, "op": "search", "args": {"query": "B082 burst probe: webhook retries flooding endpoint", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 112, "t": 1784133779.4192889, "op": "search", "args": {"query": "B083 burst probe: disk full on ci runner", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 113, "t": 1784133779.4212823, "op": "search", "args": {"query": "B084 burst probe: printer offline after firmware update", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 114, "t": 1784133779.423553, "op": "search", "args": {"query": "B085 burst probe: vpn drops every 20 minutes", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 115, "t": 1784133779.4257977, "op": "search", "args": {"query": "B086 burst probe: sso login loop on staging", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 116, "t": 1784133779.4282231, "op": "search", "args": {"query": "B087 burst probe: database connection pool exhausted", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 117, "t": 1784133779.4304087, "op": "search", "args": {"query": "B088 burst probe: email bounce dmarc failure", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 118, "t": 1784133779.4323564, "op": "search", "args": {"query": "B089 burst probe: kubernetes pod oomkilled on deploy", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 119, "t": 1784133779.4343662, "op": "search", "args": {"query": "B090 burst probe: ssl certificate expired on api gateway", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 120, "t": 1784133779.4363966, "op": "search", "args": {"query": "B091 burst probe: backup job silently failing", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 121, "t": 1784133779.4385858, "op": "search", "args": {"query": "B092 burst probe: two-factor reset request", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 122, "t": 1784133779.4410276, "op": "search", "args": {"query": "B093 burst probe: slow query on orders table", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 123, "t": 1784133779.4431953, "op": "search", "args": {"query": "B094 burst probe: webhook retries flooding endpoint", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 124, "t": 1784133779.4454389, "op": "search", "args": {"query": "B095 burst probe: disk full on ci runner", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 125, "t": 1784133779.447563, "op": "search", "args": {"query": "B096 burst probe: printer offline after firmware update", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 126, "t": 1784133779.449545, "op": "search", "args": {"query": "B097 burst probe: vpn drops every 20 minutes", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 127, "t": 1784133779.451551, "op": "search", "args": {"query": "B098 burst probe: sso login loop on staging", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 128, "t": 1784133779.4538, "op": "search", "args": {"query": "B099 burst probe: database connection pool exhausted", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 129, "t": 1784133779.4557488, "op": "search", "args": {"query": "B100 burst probe: email bounce dmarc failure", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 130, "t": 1784133779.4579363, "op": "search", "args": {"query": "B101 burst probe: kubernetes pod oomkilled on deploy", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 131, "t": 1784133779.4599442, "op": "search", "args": {"query": "B102 burst probe: ssl certificate expired on api gateway", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 132, "t": 1784133779.4620628, "op": "search", "args": {"query": "B103 burst probe: backup job silently failing", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 133, "t": 1784133779.4640784, "op": "search", "args": {"query": "B104 burst probe: two-factor reset request", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 134, "t": 1784133779.4664655, "op": "search", "args": {"query": "B105 burst probe: slow query on orders table", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 135, "t": 1784133779.468547, "op": "search", "args": {"query": "B106 burst probe: webhook retries flooding endpoint", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 136, "t": 1784133779.4705272, "op": "search", "args": {"query": "B107 burst probe: disk full on ci runner", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 137, "t": 1784133779.4726386, "op": "search", "args": {"query": "B108 burst probe: printer offline after firmware update", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 138, "t": 1784133779.4747033, "op": "search", "args": {"query": "B109 burst probe: vpn drops every 20 minutes", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 139, "t": 1784133779.476627, "op": "search", "args": {"query": "B110 burst probe: sso login loop on staging", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 140, "t": 1784133779.4788642, "op": "search", "args": {"query": "B111 burst probe: database connection pool exhausted", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 141, "t": 1784133779.4809093, "op": "search", "args": {"query": "B112 burst probe: email bounce dmarc failure", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 142, "t": 1784133779.4830406, "op": "search", "args": {"query": "B113 burst probe: kubernetes pod oomkilled on deploy", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 143, "t": 1784133779.4850373, "op": "search", "args": {"query": "B114 burst probe: ssl certificate expired on api gateway", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 144, "t": 1784133779.487174, "op": "search", "args": {"query": "B115 burst probe: backup job silently failing", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 145, "t": 1784133779.4893622, "op": "search", "args": {"query": "B116 burst probe: two-factor reset request", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 146, "t": 1784133779.4915638, "op": "search", "args": {"query": "B117 burst probe: slow query on orders table", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 147, "t": 1784133779.4935572, "op": "search", "args": {"query": "B118 burst probe: webhook retries flooding endpoint", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 148, "t": 1784133779.4955726, "op": "search", "args": {"query": "B119 burst probe: disk full on ci runner", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 149, "t": 1784133779.4977129, "op": "search", "args": {"query": "B120 burst probe: printer offline after firmware update", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 150, "t": 1784133779.499677, "op": "search", "args": {"query": "B121 burst probe: vpn drops every 20 minutes", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 151, "t": 1784133779.5018327, "op": "search", "args": {"query": "B122 burst probe: sso login loop on staging", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 152, "t": 1784133779.504122, "op": "search", "args": {"query": "B123 burst probe: database connection pool exhausted", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 153, "t": 1784133779.506301, "op": "search", "args": {"query": "B124 burst probe: email bounce dmarc failure", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 154, "t": 1784133779.5084152, "op": "search", "args": {"query": "B125 burst probe: kubernetes pod oomkilled on deploy", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 155, "t": 1784133779.5105546, "op": "search", "args": {"query": "B126 burst probe: ssl certificate expired on api gateway", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 156, "t": 1784133779.51262, "op": "search", "args": {"query": "B127 burst probe: backup job silently failing", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 157, "t": 1784133779.5146322, "op": "search", "args": {"query": "B128 burst probe: two-factor reset request", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 158, "t": 1784133779.516654, "op": "search", "args": {"query": "B129 burst probe: slow query on orders table", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 159, "t": 1784133779.5186915, "op": "search", "args": {"query": "B130 burst probe: webhook retries flooding endpoint", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 160, "t": 1784133779.5207105, "op": "search", "args": {"query": "B131 burst probe: disk full on ci runner", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 161, "t": 1784133779.5380995, "op": "search", "args": {"query": "B132 burst probe: printer offline after firmware update", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 162, "t": 1784133779.5410593, "op": "search", "args": {"query": "B133 burst probe: vpn drops every 20 minutes", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 163, "t": 1784133779.543126, "op": "search", "args": {"query": "B134 burst probe: sso login loop on staging", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 164, "t": 1784133779.5453932, "op": "search", "args": {"query": "B135 burst probe: database connection pool exhausted", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 165, "t": 1784133779.5473905, "op": "search", "args": {"query": "B136 burst probe: email bounce dmarc failure", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 166, "t": 1784133779.5494769, "op": "search", "args": {"query": "B137 burst probe: kubernetes pod oomkilled on deploy", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 167, "t": 1784133779.5514185, "op": "search", "args": {"query": "B138 burst probe: ssl certificate expired on api gateway", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 168, "t": 1784133779.553382, "op": "search", "args": {"query": "B139 burst probe: backup job silently failing", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 169, "t": 1784133779.555441, "op": "search", "args": {"query": "B140 burst probe: two-factor reset request", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 170, "t": 1784133779.557404, "op": "search", "args": {"query": "B141 burst probe: slow query on orders table", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 171, "t": 1784133779.5595105, "op": "search", "args": {"query": "B142 burst probe: webhook retries flooding endpoint", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 172, "t": 1784133779.5615134, "op": "search", "args": {"query": "B143 burst probe: disk full on ci runner", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 173, "t": 1784133779.563544, "op": "search", "args": {"query": "B144 burst probe: printer offline after firmware update", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 174, "t": 1784133779.565542, "op": "search", "args": {"query": "B145 burst probe: vpn drops every 20 minutes", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 175, "t": 1784133779.5675344, "op": "search", "args": {"query": "B146 burst probe: sso login loop on staging", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 176, "t": 1784133779.5698974, "op": "search", "args": {"query": "B147 burst probe: database connection pool exhausted", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 177, "t": 1784133779.5721436, "op": "search", "args": {"query": "B148 burst probe: email bounce dmarc failure", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 178, "t": 1784133779.5742269, "op": "search", "args": {"query": "B149 burst probe: kubernetes pod oomkilled on deploy", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 179, "t": 1784133779.5764573, "op": "search", "args": {"query": "B150 burst probe: ssl certificate expired on api gateway", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 180, "t": 1784133779.578583, "op": "search", "args": {"query": "B151 burst probe: backup job silently failing", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 181, "t": 1784133779.5806804, "op": "search", "args": {"query": "B152 burst probe: two-factor reset request", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 182, "t": 1784133779.5829747, "op": "search", "args": {"query": "B153 burst probe: slow query on orders table", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 183, "t": 1784133779.58504, "op": "search", "args": {"query": "B154 burst probe: webhook retries flooding endpoint", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 184, "t": 1784133779.5871444, "op": "search", "args": {"query": "B155 burst probe: disk full on ci runner", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 185, "t": 1784133779.589326, "op": "search", "args": {"query": "B156 burst probe: printer offline after firmware update", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 186, "t": 1784133779.5916867, "op": "search", "args": {"query": "B157 burst probe: vpn drops every 20 minutes", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 187, "t": 1784133779.5938685, "op": "search", "args": {"query": "B158 burst probe: sso login loop on staging", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 188, "t": 1784133779.5961819, "op": "search", "args": {"query": "B159 burst probe: database connection pool exhausted", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 189, "t": 1784133779.598418, "op": "search", "args": {"query": "B160 burst probe: email bounce dmarc failure", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 190, "t": 1784133779.6007, "op": "search", "args": {"query": "B161 burst probe: kubernetes pod oomkilled on deploy", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 191, "t": 1784133779.6029224, "op": "search", "args": {"query": "B162 burst probe: ssl certificate expired on api gateway", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 192, "t": 1784133779.6049328, "op": "search", "args": {"query": "B163 burst probe: backup job silently failing", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 193, "t": 1784133779.6069415, "op": "search", "args": {"query": "B164 burst probe: two-factor reset request", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 194, "t": 1784133779.6094828, "op": "search", "args": {"query": "B165 burst probe: slow query on orders table", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 195, "t": 1784133779.6115983, "op": "search", "args": {"query": "B166 burst probe: webhook retries flooding endpoint", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 196, "t": 1784133779.613667, "op": "search", "args": {"query": "B167 burst probe: disk full on ci runner", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 197, "t": 1784133779.615681, "op": "search", "args": {"query": "B168 burst probe: printer offline after firmware update", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 198, "t": 1784133779.6176696, "op": "search", "args": {"query": "B169 burst probe: vpn drops every 20 minutes", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 199, "t": 1784133779.6196635, "op": "search", "args": {"query": "B170 burst probe: sso login loop on staging", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 200, "t": 1784133779.6221232, "op": "search", "args": {"query": "B171 burst probe: database connection pool exhausted", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 201, "t": 1784133779.6240354, "op": "search", "args": {"query": "B172 burst probe: email bounce dmarc failure", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 202, "t": 1784133779.6261253, "op": "search", "args": {"query": "B173 burst probe: kubernetes pod oomkilled on deploy", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 203, "t": 1784133779.6283412, "op": "search", "args": {"query": "B174 burst probe: ssl certificate expired on api gateway", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 204, "t": 1784133779.6303778, "op": "search", "args": {"query": "B175 burst probe: backup job silently failing", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 205, "t": 1784133779.6323376, "op": "search", "args": {"query": "B176 burst probe: two-factor reset request", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 206, "t": 1784133779.634359, "op": "search", "args": {"query": "B177 burst probe: slow query on orders table", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 207, "t": 1784133779.6363459, "op": "search", "args": {"query": "B178 burst probe: webhook retries flooding endpoint", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 208, "t": 1784133779.6384153, "op": "search", "args": {"query": "B179 burst probe: disk full on ci runner", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 209, "t": 1784133779.6403787, "op": "search", "args": {"query": "B180 burst probe: printer offline after firmware update", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 210, "t": 1784133779.6425245, "op": "search", "args": {"query": "B181 burst probe: vpn drops every 20 minutes", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 211, "t": 1784133779.6444561, "op": "search", "args": {"query": "B182 burst probe: sso login loop on staging", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 212, "t": 1784133779.6467268, "op": "search", "args": {"query": "B183 burst probe: database connection pool exhausted", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 213, "t": 1784133779.648629, "op": "search", "args": {"query": "B184 burst probe: email bounce dmarc failure", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 214, "t": 1784133779.6507192, "op": "search", "args": {"query": "B185 burst probe: kubernetes pod oomkilled on deploy", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 215, "t": 1784133779.6527169, "op": "search", "args": {"query": "B186 burst probe: ssl certificate expired on api gateway", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 216, "t": 1784133779.6547222, "op": "search", "args": {"query": "B187 burst probe: backup job silently failing", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 217, "t": 1784133779.656681, "op": "search", "args": {"query": "B188 burst probe: two-factor reset request", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 218, "t": 1784133779.6586583, "op": "search", "args": {"query": "B189 burst probe: slow query on orders table", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 219, "t": 1784133779.6605911, "op": "search", "args": {"query": "B190 burst probe: webhook retries flooding endpoint", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 220, "t": 1784133779.6626174, "op": "search", "args": {"query": "B191 burst probe: disk full on ci runner", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 221, "t": 1784133779.664887, "op": "search", "args": {"query": "B192 burst probe: printer offline after firmware update", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 222, "t": 1784133779.6669927, "op": "search", "args": {"query": "B193 burst probe: vpn drops every 20 minutes", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 223, "t": 1784133779.668922, "op": "search", "args": {"query": "B194 burst probe: sso login loop on staging", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 224, "t": 1784133779.671411, "op": "search", "args": {"query": "B195 burst probe: database connection pool exhausted", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 225, "t": 1784133779.673864, "op": "search", "args": {"query": "B196 burst probe: email bounce dmarc failure", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 226, "t": 1784133779.6763349, "op": "search", "args": {"query": "B197 burst probe: kubernetes pod oomkilled on deploy", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 227, "t": 1784133779.6785305, "op": "search", "args": {"query": "B198 burst probe: ssl certificate expired on api gateway", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 228, "t": 1784133779.6805036, "op": "search", "args": {"query": "B199 burst probe: backup job silently failing", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 229, "t": 1784133779.6827223, "op": "search", "args": {"query": "B200 burst probe: two-factor reset request", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 230, "t": 1784133779.6846702, "op": "search", "args": {"query": "B201 burst probe: slow query on orders table", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 231, "t": 1784133779.68674, "op": "search", "args": {"query": "B202 burst probe: webhook retries flooding endpoint", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 232, "t": 1784133779.6888106, "op": "search", "args": {"query": "B203 burst probe: disk full on ci runner", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 233, "t": 1784133779.6910906, "op": "search", "args": {"query": "B204 burst probe: printer offline after firmware update", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 234, "t": 1784133779.6932404, "op": "search", "args": {"query": "B205 burst probe: vpn drops every 20 minutes", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 235, "t": 1784133779.6959395, "op": "search", "args": {"query": "B206 burst probe: sso login loop on staging", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 236, "t": 1784133779.6993608, "op": "search", "args": {"query": "B207 burst probe: database connection pool exhausted", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 237, "t": 1784133779.7020183, "op": "search", "args": {"query": "B208 burst probe: email bounce dmarc failure", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 238, "t": 1784133779.704638, "op": "search", "args": {"query": "B209 burst probe: kubernetes pod oomkilled on deploy", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 239, "t": 1784133779.7067053, "op": "search", "args": {"query": "B210 burst probe: ssl certificate expired on api gateway", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 240, "t": 1784133779.7088895, "op": "search", "args": {"query": "B211 burst probe: backup job silently failing", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 241, "t": 1784133779.7111032, "op": "search", "args": {"query": "B212 burst probe: two-factor reset request", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 242, "t": 1784133779.7132015, "op": "search", "args": {"query": "B213 burst probe: slow query on orders table", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 243, "t": 1784133779.7151546, "op": "search", "args": {"query": "B214 burst probe: webhook retries flooding endpoint", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 244, "t": 1784133779.7171776, "op": "search", "args": {"query": "B215 burst probe: disk full on ci runner", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 245, "t": 1784133779.719504, "op": "search", "args": {"query": "B216 burst probe: printer offline after firmware update", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 246, "t": 1784133779.7219334, "op": "search", "args": {"query": "B217 burst probe: vpn drops every 20 minutes", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 247, "t": 1784133779.739065, "op": "search", "args": {"query": "B218 burst probe: sso login loop on staging", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 248, "t": 1784133779.742842, "op": "search", "args": {"query": "B219 burst probe: database connection pool exhausted", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 249, "t": 1784133779.744944, "op": "search", "args": {"query": "B220 burst probe: email bounce dmarc failure", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 250, "t": 1784133779.7470045, "op": "search", "args": {"query": "B221 burst probe: kubernetes pod oomkilled on deploy", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 251, "t": 1784133779.7490902, "op": "search", "args": {"query": "B222 burst probe: ssl certificate expired on api gateway", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 252, "t": 1784133779.7510507, "op": "search", "args": {"query": "B223 burst probe: backup job silently failing", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 253, "t": 1784133779.7531478, "op": "search", "args": {"query": "B224 burst probe: two-factor reset request", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 254, "t": 1784133779.7551599, "op": "search", "args": {"query": "B225 burst probe: slow query on orders table", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 255, "t": 1784133779.7572317, "op": "search", "args": {"query": "B226 burst probe: webhook retries flooding endpoint", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 256, "t": 1784133779.7591777, "op": "search", "args": {"query": "B227 burst probe: disk full on ci runner", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 257, "t": 1784133779.7612307, "op": "search", "args": {"query": "B228 burst probe: printer offline after firmware update", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 258, "t": 1784133779.7632694, "op": "search", "args": {"query": "B229 burst probe: vpn drops every 20 minutes", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 259, "t": 1784133779.7652862, "op": "search", "args": {"query": "B230 burst probe: sso login loop on staging", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 260, "t": 1784133779.7675462, "op": "search", "args": {"query": "B231 burst probe: database connection pool exhausted", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 261, "t": 1784133779.7698352, "op": "search", "args": {"query": "B232 burst probe: email bounce dmarc failure", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 262, "t": 1784133779.7722993, "op": "search", "args": {"query": "B233 burst probe: kubernetes pod oomkilled on deploy", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 263, "t": 1784133779.774517, "op": "search", "args": {"query": "B234 burst probe: ssl certificate expired on api gateway", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 264, "t": 1784133779.7764494, "op": "search", "args": {"query": "B235 burst probe: backup job silently failing", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 265, "t": 1784133779.778472, "op": "search", "args": {"query": "B236 burst probe: two-factor reset request", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 266, "t": 1784133779.78056, "op": "search", "args": {"query": "B237 burst probe: slow query on orders table", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 267, "t": 1784133779.7830682, "op": "search", "args": {"query": "B238 burst probe: webhook retries flooding endpoint", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 268, "t": 1784133779.7851548, "op": "search", "args": {"query": "B239 burst probe: disk full on ci runner", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 269, "t": 1784133779.7872434, "op": "search", "args": {"query": "B240 burst probe: printer offline after firmware update", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 270, "t": 1784133779.7895272, "op": "search", "args": {"query": "B241 burst probe: vpn drops every 20 minutes", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 271, "t": 1784133779.791746, "op": "search", "args": {"query": "B242 burst probe: sso login loop on staging", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 272, "t": 1784133779.7942343, "op": "search", "args": {"query": "B243 burst probe: database connection pool exhausted", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 273, "t": 1784133779.7963576, "op": "search", "args": {"query": "B244 burst probe: email bounce dmarc failure", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 274, "t": 1784133779.7983923, "op": "search", "args": {"query": "B245 burst probe: kubernetes pod oomkilled on deploy", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 275, "t": 1784133779.8003478, "op": "search", "args": {"query": "B246 burst probe: ssl certificate expired on api gateway", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 276, "t": 1784133779.8024676, "op": "search", "args": {"query": "B247 burst probe: backup job silently failing", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 277, "t": 1784133779.8047705, "op": "search", "args": {"query": "B248 burst probe: two-factor reset request", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 278, "t": 1784133779.8068528, "op": "search", "args": {"query": "B249 burst probe: slow query on orders table", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 279, "t": 1784133779.8090684, "op": "search", "args": {"query": "B250 burst probe: webhook retries flooding endpoint", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 280, "t": 1784133782.1861186, "op": "search", "args": {"query": "T21 prior incidents: two-factor reset request", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 281, "t": 1784133782.1873462, "op": "log_event", "args": {"content": "T21 triaged: two-factor reset request -> tier2"}, "response": {"event_id": 279, "error": null}}
+{"seq": 282, "t": 1784133785.8347657, "op": "search", "args": {"query": "T22 prior incidents: slow query on orders table", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 283, "t": 1784133790.3027823, "op": "search", "args": {"query": "T23 prior incidents: webhook retries flooding endpoint", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 284, "t": 1784133792.4511635, "op": "search", "args": {"query": "T24 prior incidents: disk full on ci runner", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 285, "t": 1784133792.4523768, "op": "log_event", "args": {"content": "T24 triaged: disk full on ci runner -> tier2"}, "response": {"event_id": 283, "error": null}}
+{"seq": 286, "t": 1784133792.4537654, "op": "learn", "args": {"content": "T24: for 'disk full on ci runner', escalate to tier2 after two failed remote resets"}, "response": {"status": "proposed", "candidate_id": 5, "error": null}}
+{"seq": 287, "t": 1784133795.5630133, "op": "search", "args": {"query": "T25 prior incidents: printer offline after firmware update", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 288, "t": 1784133799.9842901, "op": "search", "args": {"query": "T26 prior incidents: vpn drops every 20 minutes", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 289, "t": 1784133801.9568143, "op": "search", "args": {"query": "T27 prior incidents: sso login loop on staging", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 290, "t": 1784133801.9581826, "op": "log_event", "args": {"content": "T27 triaged: sso login loop on staging -> tier2"}, "response": {"event_id": 287, "error": null}}
+{"seq": 291, "t": 1784133806.3551612, "op": "search", "args": {"query": "T28 prior incidents: database connection pool exhausted", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 292, "t": 1784133807.9211266, "op": "search", "args": {"query": "T29 prior incidents: email bounce dmarc failure", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 293, "t": 1784133809.8838315, "op": "search", "args": {"query": "T30 prior incidents: kubernetes pod oomkilled on deploy", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 294, "t": 1784133809.885159, "op": "log_event", "args": {"content": "T30 triaged: kubernetes pod oomkilled on deploy -> tier2"}, "response": {"event_id": 291, "error": null}}
+{"seq": 295, "t": 1784133809.8866704, "op": "learn", "args": {"content": "T30: for 'kubernetes pod oomkilled on deploy', escalate to tier2 after two failed remote resets"}, "response": {"status": "proposed", "candidate_id": 6, "error": null}}
+{"seq": 296, "t": 1784133814.0763037, "op": "search", "args": {"query": "T31 prior incidents: ssl certificate expired on api gateway", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 297, "t": 1784133816.071954, "op": "search", "args": {"query": "T32 prior incidents: backup job silently failing", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 298, "t": 1784133820.1345313, "op": "search", "args": {"query": "T33 prior incidents: two-factor reset request", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 299, "t": 1784133820.1355226, "op": "log_event", "args": {"content": "T33 triaged: two-factor reset request -> tier2"}, "response": {"event_id": 295, "error": null}}
+{"seq": 300, "t": 1784133823.0733948, "op": "search", "args": {"query": "T34 prior incidents: slow query on orders table", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 301, "t": 1784133824.741753, "op": "search", "args": {"query": "T35 prior incidents: webhook retries flooding endpoint", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 302, "t": 1784133828.579266, "op": "search", "args": {"query": "T36 prior incidents: disk full on ci runner", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 303, "t": 1784133828.5806587, "op": "log_event", "args": {"content": "T36 triaged: disk full on ci runner -> tier2"}, "response": {"event_id": 299, "error": null}}
+{"seq": 304, "t": 1784133828.58264, "op": "learn", "args": {"content": "T36: for 'disk full on ci runner', escalate to tier2 after two failed remote resets"}, "response": {"status": "proposed", "candidate_id": 7, "error": null}}
+{"seq": 305, "t": 1784133830.3284242, "op": "search", "args": {"query": "T37 prior incidents: printer offline after firmware update", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 306, "t": 1784133832.9560695, "op": "search", "args": {"query": "T38 prior incidents: vpn drops every 20 minutes", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 307, "t": 1784133834.7324636, "op": "search", "args": {"query": "T39 prior incidents: sso login loop on staging", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 308, "t": 1784133834.7341988, "op": "log_event", "args": {"content": "T39 triaged: sso login loop on staging -> tier2"}, "response": {"event_id": 303, "error": null}}
+{"seq": 309, "t": 1784133838.090003, "op": "search", "args": {"query": "T40 prior incidents: database connection pool exhausted", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 310, "t": 1784133841.7732742, "op": "search", "args": {"query": "T41 prior incidents: email bounce dmarc failure", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 311, "t": 1784133844.2455294, "op": "search", "args": {"query": "T42 prior incidents: kubernetes pod oomkilled on deploy", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 312, "t": 1784133844.247298, "op": "log_event", "args": {"content": "T42 triaged: kubernetes pod oomkilled on deploy -> tier2"}, "response": {"event_id": 307, "error": null}}
+{"seq": 313, "t": 1784133844.248672, "op": "learn", "args": {"content": "T42: for 'kubernetes pod oomkilled on deploy', escalate to tier2 after two failed remote resets"}, "response": {"status": "proposed", "candidate_id": 8, "error": null}}
+{"seq": 314, "t": 1784133847.4846945, "op": "search", "args": {"query": "T43 prior incidents: ssl certificate expired on api gateway", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 315, "t": 1784133849.8171344, "op": "search", "args": {"query": "T44 prior incidents: backup job silently failing", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 316, "t": 1784133851.496282, "op": "search", "args": {"query": "T45 prior incidents: two-factor reset request", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 317, "t": 1784133851.497303, "op": "log_event", "args": {"content": "T45 triaged: two-factor reset request -> tier2"}, "response": {"event_id": 311, "error": null}}
+{"seq": 318, "t": 1784133854.5982347, "op": "search", "args": {"query": "T46 prior incidents: slow query on orders table", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 319, "t": 1784133857.6823175, "op": "search", "args": {"query": "T47 prior incidents: webhook retries flooding endpoint", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 320, "t": 1784133861.8605733, "op": "search", "args": {"query": "T48 prior incidents: disk full on ci runner", "session_id": "sess-live-A"}, "response": {"hits": 0, "error": null}}
+{"seq": 321, "t": 1784133861.8617237, "op": "log_event", "args": {"content": "T48 triaged: disk full on ci runner -> tier2"}, "response": {"event_id": 315, "error": null}}
+{"seq": 322, "t": 1784133861.863043, "op": "learn", "args": {"content": "T48: for 'disk full on ci runner', escalate to tier2 after two failed remote resets"}, "response": {"status": "proposed", "candidate_id": 9, "error": null}}

@@ -680,12 +680,18 @@ export function createHookHandlers(
       },
     });
 
-    const receiptLine = receipt ? ` ${formatSessionReceiptLine(receipt)}` : "";
+    // The displayed line merges THIS stop's drafts (the tally above predates
+    // the stop row), so the receipt can never contradict the candidate
+    // sentence beside it.
+    const displayReceipt = receipt
+      ? { ...receipt, candidates_drafted: receipt.candidates_drafted + candidates.length }
+      : undefined;
+    const receiptLine = displayReceipt ? ` ${formatSessionReceiptLine(displayReceipt)}` : "";
 
     if (candidates.length === 0) {
       return {
         continue: true,
-        ...(receipt ? { systemMessage: formatSessionReceiptLine(receipt) } : {}),
+        ...(displayReceipt ? { systemMessage: formatSessionReceiptLine(displayReceipt) } : {}),
       };
     }
 

@@ -579,16 +579,26 @@ async function handleStop(payload: Record<string, unknown>): Promise<HookOutput>
     },
   });
 
+  // The displayed line merges THIS stop's drafts (the tally above predates the
+  // stop row), so the receipt can never contradict the candidate sentence.
+  const displayReceipt = receipt
+    ? {
+        ...receipt,
+        candidates_drafted:
+          receipt.candidates_drafted + outcome.outcomeDraft.learnCandidates.length,
+      }
+    : undefined;
+
   // Emit the receipt even with zero candidates: proof that no memory work
   // happened this session is itself information.
   if (outcome.outcomeDraft.learnCandidates.length === 0) {
     return {
       continue: true,
-      ...(receipt ? { systemMessage: formatSessionReceiptLine(receipt) } : {}),
+      ...(displayReceipt ? { systemMessage: formatSessionReceiptLine(displayReceipt) } : {}),
     };
   }
 
-  const receiptLine = receipt ? ` ${formatSessionReceiptLine(receipt)}` : "";
+  const receiptLine = displayReceipt ? ` ${formatSessionReceiptLine(displayReceipt)}` : "";
   return {
     continue: true,
     systemMessage: `Minni: ${outcome.outcomeDraft.learnCandidates.length} candidate learning${

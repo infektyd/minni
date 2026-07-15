@@ -263,23 +263,52 @@ class EpisodicPoller:
         except sqlite3.Error:
             return None
 
-    def seed(self, backlog: int) -> list[WatchEvent]:
+    def seed(self, backlog: int,
+             since_epoch: float | None = None) -> list[WatchEvent]:
+        """Backlog for startup. With since_epoch, return the whole requested
+        window (not just the last `backlog` rows) so --since is honest."""
         conn = self._connect()
         if conn is None:
             return []
         try:
-            rows = conn.execute(
-                "SELECT event_id, agent_id, event_type, content, created_at"
-                " FROM episodic_events ORDER BY event_id DESC LIMIT ?",
-                (backlog,)).fetchall()
+            if since_epoch is not None:
+                rows = conn.execute(
+                    "SELECT event_id, agent_id, event_type, content,"
+                    " created_at FROM episodic_events"
+                    " WHERE created_at >= ? ORDER BY event_id ASC",
+                    (since_epoch,)).fetchall()
+            else:
+                rows = list(reversed(conn.execute(
+                    "SELECT event_id, agent_id, event_type, content,"
+                    " created_at FROM episodic_events"
+                    " ORDER BY event_id DESC LIMIT ?",
+                    (backlog,)).fetchall()))
         except sqlite3.Error:
             return []
         finally:
             conn.close()
-        rows = list(reversed(rows))
+        # The cursor still advances past everything, window or not, so the
+        # follow loop never re-emits seeded rows.
         if rows:
-            self.last_event_id = rows[-1]["event_id"]
+            self.last_event_id = max(self.last_event_id,
+                                     rows[-1]["event_id"])
+        max_id = self._max_event_id()
+        if max_id is not None:
+            self.last_event_id = max(self.last_event_id, max_id)
         return [self._to_event(row) for row in rows]
+
+    def _max_event_id(self) -> int | None:
+        conn = self._connect()
+        if conn is None:
+            return None
+        try:
+            row = conn.execute(
+                "SELECT MAX(event_id) AS m FROM episodic_events").fetchone()
+            return row["m"]
+        except sqlite3.Error:
+            return None
+        finally:
+            conn.close()
 
     def poll(self) -> list[WatchEvent]:
         conn = self._connect()
@@ -392,10 +421,15 @@ def run_watch(args) -> int:
               file=sys.stderr)
         return 1
 
+    # With --since the seed is the whole requested window (the _emit filter
+    # trims by timestamp); without it, cap to a short recent backlog.
+    since_epoch = args.since.timestamp() if args.since else None
     backlog: list[WatchEvent] = []
     for tailer in tailers:
-        backlog.extend(tailer.seed()[-BACKLOG_ENTRIES:])
-    backlog.extend(poller.seed(BACKLOG_ENTRIES))
+        seeded = tailer.seed()
+        backlog.extend(seeded if since_epoch is not None
+                       else seeded[-BACKLOG_ENTRIES:])
+    backlog.extend(poller.seed(BACKLOG_ENTRIES, since_epoch=since_epoch))
     backlog.sort(key=event_sort_key)
     _emit(backlog, args)
 

@@ -1,0 +1,11 @@
+{
+  "session_id": "sess-live-A",
+  "entries": 15,
+  "recalls_strong": 6,
+  "recalls_weak": 3,
+  "guard_denied": 2,
+  "guard_allowed": 0,
+  "learns": 1,
+  "vault_writes": 0,
+  "candidates_drafted": 2
+}

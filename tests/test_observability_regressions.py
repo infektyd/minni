@@ -378,6 +378,41 @@ def test_refresh_tailers_picks_up_vaults_created_after_start(tmp_path):
     assert next(iter(tailers.values())).offset > 0
 
 
+def test_since_window_not_capped_by_backlog(tmp_path, monkeypatch, capsys):
+    """--since must surface everything in the requested window, not just the
+    last 10 backlog entries per source."""
+    from minni import minni_cli
+
+    vault = tmp_path / "codex-vault"
+    vault.mkdir()
+    lines = ["# Log\n\n"]
+    for i in range(25):
+        lines.append(_entry(f"2026-07-15T10:{i:02d}:00.000Z", "t", f"e{i}"))
+    (vault / "log.md").write_text("".join(lines))
+
+    import sqlite3 as _sq
+    conn = _sq.connect(tmp_path / "minni.db")
+    conn.execute("CREATE TABLE episodic_events (event_id INTEGER PRIMARY KEY,"
+                 " agent_id TEXT, event_type TEXT, content TEXT, created_at REAL)")
+    import time as _time
+    now = _time.time()
+    for i in range(25):
+        conn.execute("INSERT INTO episodic_events (agent_id, event_type,"
+                     " content, created_at) VALUES (?,?,?,?)",
+                     ("codex", "recall", f"d{i}", now - 60 + i))
+    conn.commit()
+
+    monkeypatch.setenv("MINNI_HOME", str(tmp_path))
+    monkeypatch.delenv("MINNI_DB_PATH", raising=False)
+    monkeypatch.delenv("MINNI_AGENT_VAULTS", raising=False)
+    assert minni_cli.main(["watch", "--once", "--json",
+                           "--since", "2026-07-14T00:00:00+00:00"]) == 0
+    out = [json.loads(line) for line in
+           capsys.readouterr().out.strip().splitlines()]
+    assert len([e for e in out if e["source"] == "plugin"]) == 25
+    assert len([e for e in out if e["source"] == "daemon"]) == 25
+
+
 def test_watch_rejects_non_positive_interval(tmp_path, monkeypatch, capsys):
     from minni import minni_cli
 
