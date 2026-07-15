@@ -32,6 +32,7 @@ class RecallContext:
     trace_ring: Callable[[], Any]
     record_latency: Callable[[str, float], None]
     increment_request_count: Callable[[], None] | None = None
+    lazy_episodic: Callable[[], Any] | None = None
     sovereign_db: Callable[..., Any] = SovereignDB
     default_config: Any = field(default_factory=lambda: DEFAULT_CONFIG)
     can_read_document: Callable[[Any, str, Any], bool] = can_read_document
@@ -291,6 +292,37 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
             )
         except Exception as exc:
             context.logger.warning("search: learnings surfacing/tracking failed: %s", exc)
+
+        # Durable recall trace (observability, config.recall_trace): a TTL'd
+        # episodic event per search so `minni watch` can show raw-RPC recalls
+        # too, not just plugin-mediated ones. Best-effort — a trace failure
+        # must never fail the search itself.
+        if (
+            principal is not None
+            and context.lazy_episodic is not None
+            and getattr(context.default_config, "recall_trace", False)
+        ):
+            try:
+                top_score = float(results[0].get("score") or 0.0) if results else 0.0
+                session_id = params.get("session_id")
+                context.lazy_episodic().add_event(
+                    agent_id=agent_id,
+                    event_type="recall",
+                    content=(f'recall "{query[:120]}" — {len(results)} hits, '
+                             f"top {top_score:.2f}"),
+                    thread_id=str(session_id) if session_id else None,
+                    metadata={
+                        "query_sha256_12": hashlib.sha256(
+                            query.encode("utf-8")).hexdigest()[:12],
+                        "hits": len(results),
+                        "learnings": len(learnings),
+                        "top_score": top_score,
+                        "depth": depth,
+                        "scope": document_scope,
+                    },
+                )
+            except Exception as exc:
+                context.logger.debug("search: recall trace failed: %s", exc)
 
         return context.make_response({
             "query": query,

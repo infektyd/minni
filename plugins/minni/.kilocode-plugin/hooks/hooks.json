@@ -19,6 +19,16 @@
       ]
     }
   ],
+  "PreToolUse": [
+    {
+      "hooks": [
+        {
+          "type": "command",
+          "command": "node ${KILO_PLUGIN_ROOT}/../dist/kilocode-hook.js PreToolUse"
+        }
+      ]
+    }
+  ],
   "PreCompact": [
     {
       "hooks": [

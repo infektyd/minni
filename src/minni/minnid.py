@@ -744,6 +744,7 @@ def _recall_context() -> RecallContext:
         trace_ring=_trace_ring,
         record_latency=_record_latency,
         increment_request_count=_increment_recall_request_count,
+        lazy_episodic=_lazy_episodic,
         sovereign_db=SovereignDB,
         logger=logger,
     )

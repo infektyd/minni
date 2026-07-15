@@ -1,0 +1,305 @@
+#!/usr/bin/env python3
+"""minni watch — live, read-only tail of memory activity.
+
+Answers the operator question "is my agent actually using minni?" by
+streaming, in one pane, every observable memory event:
+
+- the per-vault Markdown audit trail (``<MINNI_HOME>/<agent>-vault/log.md``),
+  which the plugin appends for every hook firing and MCP tool call, and
+- the daemon's ``episodic_events`` table (``<MINNI_HOME>/minni.db``), which
+  carries daemon-native events, including the durable recall trace.
+
+Packaging-only surface (PACKAGING_PLAN.md §3): stdlib-only, never imports
+engine internals, and strictly read-only — the audit files are tailed by
+size/offset and the database is opened with SQLite's read-only URI mode, so
+watching can never change how memory is stored, recalled, scored, or
+governed.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import sqlite3
+import sys
+import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+
+# Mirrors plugins/minni/src/vault.ts recordAudit: one entry per
+# `## [<ISO-8601>] <tool> | <summary>` header (fields are injection-escaped
+# to stay single-line at write time), optionally followed by a ```json block.
+AUDIT_HEADER = re.compile(r"^## \[([^\]]+)\]\s+([^|]+)\|\s?(.*)$")
+
+POLL_INTERVAL_SECONDS = 1.0
+BACKLOG_ENTRIES = 10
+# Detail keys worth a one-line summary, in display order (the audit `details`
+# blocks are free-form JSON; these are the high-signal fields the hooks and
+# MCP tools actually record).
+DETAIL_KEYS = ("query", "hits", "top_score", "recall_strong", "denied",
+               "tool", "candidates", "session_id", "task_signature")
+
+
+def minni_home() -> Path:
+    return Path(os.environ.get("MINNI_HOME", Path.home() / ".minni"))
+
+
+def agent_id_for_vault(vault_dir: Path) -> str:
+    """Vault dir basename -> agent id (mirrors vault.ts
+    getAgentIdFromVaultPath basename fallback, including the claude aliases)."""
+    base = vault_dir.name
+    if base.endswith("-vault"):
+        base = base[: -len("-vault")]
+        if base in ("claudecode", "claude"):
+            return "claude-code"
+    return base or "agent"
+
+
+def discover_vault_logs(home: Path) -> dict[Path, str]:
+    """Map each vault's rolling audit log to its agent id."""
+    logs: dict[Path, str] = {}
+    try:
+        entries = sorted(home.iterdir())
+    except OSError:
+        return logs
+    for entry in entries:
+        if entry.is_dir() and entry.name.endswith("-vault"):
+            logs[entry / "log.md"] = agent_id_for_vault(entry)
+    return logs
+
+
+@dataclass
+class WatchEvent:
+    ts: str            # ISO-8601 as recorded
+    agent: str
+    tool: str
+    summary: str
+    source: str        # "plugin" (vault audit) or "daemon" (episodic_events)
+    details: dict | None = None
+
+
+def parse_audit_entries(text: str, agent: str) -> list[WatchEvent]:
+    """Parse audit-log markdown into events. Tolerates a leading partial
+    entry (text may start mid-file after an offset seek)."""
+    events: list[WatchEvent] = []
+    current: WatchEvent | None = None
+    detail_lines: list[str] = []
+    in_details = False
+
+    def flush() -> None:
+        nonlocal current, detail_lines, in_details
+        if current is not None and detail_lines:
+            try:
+                current.details = json.loads("\n".join(detail_lines))
+            except ValueError:
+                current.details = None
+        if current is not None:
+            events.append(current)
+        current, detail_lines, in_details = None, [], False
+
+    for line in text.splitlines():
+        header = AUDIT_HEADER.match(line)
+        if header:
+            flush()
+            current = WatchEvent(ts=header.group(1),
+                                 agent=agent,
+                                 tool=header.group(2).strip(),
+                                 summary=header.group(3).strip(),
+                                 source="plugin")
+        elif current is not None:
+            if line.startswith("```json"):
+                in_details = True
+            elif line.startswith("```"):
+                in_details = False
+            elif in_details:
+                detail_lines.append(line)
+    flush()
+    return events
+
+
+class AuditTailer:
+    """Offset-based tailer for one vault's rolling log.md. Rotation (the
+    plugin truncates log.md back to its header at 5 MB) shows up as the file
+    shrinking; we then restart from offset 0."""
+
+    def __init__(self, path: Path, agent: str):
+        self.path = path
+        self.agent = agent
+        self.offset = 0
+
+    def seed(self) -> list[WatchEvent]:
+        """Read the whole current file once (for backlog) and set the
+        offset to its end."""
+        text = self._read_from(0)
+        return parse_audit_entries(text, self.agent)
+
+    def poll(self) -> list[WatchEvent]:
+        try:
+            size = self.path.stat().st_size
+        except OSError:
+            return []
+        if size < self.offset:  # rotated
+            self.offset = 0
+        if size == self.offset:
+            return []
+        text = self._read_from(self.offset)
+        return parse_audit_entries(text, self.agent)
+
+    def _read_from(self, start: int) -> str:
+        try:
+            with open(self.path, "rb") as fh:
+                fh.seek(start)
+                data = fh.read()
+        except OSError:
+            return ""
+        self.offset = start + len(data)
+        return data.decode("utf-8", errors="replace")
+
+
+class EpisodicPoller:
+    """Read-only poller of the daemon's episodic_events table. Opens the
+    SQLite file in read-only URI mode so a watcher can never write."""
+
+    def __init__(self, db_path: Path):
+        self.db_path = db_path
+        self.last_event_id = 0
+
+    def _connect(self) -> sqlite3.Connection | None:
+        if not self.db_path.exists():
+            return None
+        try:
+            conn = sqlite3.connect(
+                f"file:{self.db_path}?mode=ro", uri=True, timeout=1.0)
+            conn.row_factory = sqlite3.Row
+            return conn
+        except sqlite3.Error:
+            return None
+
+    def seed(self, backlog: int) -> list[WatchEvent]:
+        conn = self._connect()
+        if conn is None:
+            return []
+        try:
+            rows = conn.execute(
+                "SELECT event_id, agent_id, event_type, content, created_at"
+                " FROM episodic_events ORDER BY event_id DESC LIMIT ?",
+                (backlog,)).fetchall()
+        except sqlite3.Error:
+            return []
+        finally:
+            conn.close()
+        rows = list(reversed(rows))
+        if rows:
+            self.last_event_id = rows[-1]["event_id"]
+        return [self._to_event(row) for row in rows]
+
+    def poll(self) -> list[WatchEvent]:
+        conn = self._connect()
+        if conn is None:
+            return []
+        try:
+            rows = conn.execute(
+                "SELECT event_id, agent_id, event_type, content, created_at"
+                " FROM episodic_events WHERE event_id > ?"
+                " ORDER BY event_id ASC LIMIT 200",
+                (self.last_event_id,)).fetchall()
+        except sqlite3.Error:
+            return []
+        finally:
+            conn.close()
+        if rows:
+            self.last_event_id = rows[-1]["event_id"]
+        return [self._to_event(row) for row in rows]
+
+    @staticmethod
+    def _to_event(row: sqlite3.Row) -> WatchEvent:
+        ts = datetime.fromtimestamp(
+            row["created_at"], tz=timezone.utc).isoformat()
+        return WatchEvent(ts=ts,
+                          agent=row["agent_id"] or "?",
+                          tool=row["event_type"] or "event",
+                          summary=(row["content"] or "").strip(),
+                          source="daemon")
+
+
+def _parse_ts(ts: str) -> datetime | None:
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def format_event(event: WatchEvent) -> str:
+    parsed = _parse_ts(event.ts)
+    clock = parsed.astimezone().strftime("%H:%M:%S") if parsed else event.ts
+    line = (f"{clock}  {event.agent:<12} {event.tool:<32} "
+            f"{event.summary}").rstrip()
+    if event.details:
+        extras = [f"{key}={event.details[key]}" for key in DETAIL_KEYS
+                  if key in event.details]
+        if extras:
+            line += f"  ({', '.join(extras)})"
+    return line
+
+
+def event_to_json(event: WatchEvent) -> str:
+    payload = {"ts": event.ts, "agent": event.agent, "tool": event.tool,
+               "summary": event.summary, "source": event.source}
+    if event.details:
+        payload["details"] = event.details
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def _emit(events: list[WatchEvent], args) -> None:
+    for event in events:
+        if args.agent and event.agent != args.agent:
+            continue
+        if args.since:
+            parsed = _parse_ts(event.ts)
+            if parsed is not None and parsed < args.since:
+                continue
+        print(event_to_json(event) if args.json else format_event(event),
+              flush=True)
+
+
+def run_watch(args) -> int:
+    """Entry point for `minni watch`. args carries: agent (str|None),
+    since (aware datetime|None), json (bool), once (bool), interval (float)."""
+    home = minni_home()
+    tailers = [AuditTailer(path, agent)
+               for path, agent in discover_vault_logs(home).items()]
+    poller = EpisodicPoller(home / "minni.db")
+
+    if not tailers and not poller.db_path.exists():
+        print(f"Nothing to watch under {home} — no *-vault directories and "
+              "no minni.db. Is anything wired? Try: minni wire <platform>",
+              file=sys.stderr)
+        return 1
+
+    backlog: list[WatchEvent] = []
+    for tailer in tailers:
+        backlog.extend(tailer.seed()[-BACKLOG_ENTRIES:])
+    backlog.extend(poller.seed(BACKLOG_ENTRIES))
+    backlog.sort(key=lambda ev: ev.ts)
+    _emit(backlog, args)
+
+    if args.once:
+        return 0
+
+    if not args.json:
+        watched = ", ".join(sorted({t.agent for t in tailers})) or "none"
+        print(f"-- watching {len(tailers)} vault log(s) [{watched}] + "
+              f"daemon events; Ctrl-C stops --", flush=True)
+    try:
+        while True:
+            time.sleep(args.interval)
+            fresh: list[WatchEvent] = []
+            for tailer in tailers:
+                fresh.extend(tailer.poll())
+            fresh.extend(poller.poll())
+            fresh.sort(key=lambda ev: ev.ts)
+            _emit(fresh, args)
+    except KeyboardInterrupt:
+        return 0
