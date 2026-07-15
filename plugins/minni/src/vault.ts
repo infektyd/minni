@@ -654,12 +654,18 @@ export async function recordAudit(
   return withAuditLock(vaultPath, async () => {
   const timestamp = entry.timestamp ?? new Date();
 
-  // --- 1. Per-agent rate-limiting ---
+  // --- 1. Per-agent, per-tool rate-limiting ---
+  // Keyed by agent AND hook tool: one turn's distinct lifecycle stages
+  // (user_prompt_submit, then a pretooluse_guard seconds later) must all
+  // land — session receipts tally over this log, and a per-agent-only key
+  // silently dropped the later stage. Repeats of the SAME tool within the
+  // window still throttle, keeping the anti-spam intent.
   const agentId = getAgentIdFromVaultPath(vaultPath);
   const homeDir = process.env.MINNI_HOME ?? path.join(os.homedir(), ".minni");
   const rateLimitDir = path.join(homeDir, ".hook-audit-ts");
   await mkdir(rateLimitDir, { recursive: true });
-  const tsPath = path.join(rateLimitDir, `${agentId}.ts`);
+  const toolKey = (entry.tool ?? "").replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 80);
+  const tsPath = path.join(rateLimitDir, `${agentId}.${toolKey}.ts`);
 
   let lastTime: number | undefined;
   try {

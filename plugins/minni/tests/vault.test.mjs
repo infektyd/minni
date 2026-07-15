@@ -445,6 +445,49 @@ test("sessionReceipt synthetic fallback counts stamped in-window turns when opte
   }
 });
 
+test("hook-audit throttle is per tool: one turn's lifecycle entries all land", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-throttle-"));
+  const savedBypass = process.env.MINNI_BYPASS_AUDIT_LIMIT;
+  const savedHome = process.env.MINNI_HOME;
+  delete process.env.MINNI_BYPASS_AUDIT_LIMIT;
+  process.env.MINNI_HOME = path.join(root, "home");
+  try {
+    const vault = path.join(root, "codex-vault");
+    await ensureVault(vault);
+    // Same turn, seconds apart: prompt-submit then guard denial. Distinct
+    // hook tools must BOTH be recorded (else receipts undercount guards),
+    // while a repeat of the SAME tool within 5s still throttles.
+    await recordAudit(vault, {
+      tool: "hook_codex_user_prompt_submit",
+      summary: "turn",
+      details: { recall_strong: true },
+    });
+    await recordAudit(vault, {
+      tool: "hook_codex_pretooluse_guard",
+      summary: "recall guard denied Grep (mode=soft)",
+      details: { consumed: true },
+    });
+    await recordAudit(vault, {
+      tool: "hook_codex_pretooluse_guard",
+      summary: "recall guard denied Read (mode=soft) repeat",
+      details: { consumed: true },
+    });
+
+    const tail = await auditTail(vault, 10);
+    const text = tail.entries.join("\n");
+    assert.ok(text.includes("hook_codex_user_prompt_submit"));
+    assert.ok(text.includes("recall guard denied Grep"),
+      "a distinct hook tool within 5s must not be throttled");
+    assert.ok(!text.includes("repeat"),
+      "a same-tool repeat within 5s must still throttle");
+  } finally {
+    if (savedBypass !== undefined) process.env.MINNI_BYPASS_AUDIT_LIMIT = savedBypass;
+    if (savedHome !== undefined) process.env.MINNI_HOME = savedHome;
+    else delete process.env.MINNI_HOME;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("sessionReceipt counts only the LATEST cycle when a session id is reused", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "sm-receipt-cycle-"));
   try {
