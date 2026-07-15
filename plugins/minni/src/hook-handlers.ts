@@ -169,7 +169,13 @@ export function createHookHandlers(
   const prepareOutcomeFn = deps.prepareOutcome ?? prepareOutcome;
 
   async function handleSessionStart(payload: Record<string, unknown>): Promise<HookOutput> {
-    const sessionId = asString(payload.session_id) || asString(payload.sessionId) || "session";
+    // rawSessionId is the payload's own id, possibly empty — never the
+    // "session" synthetic fallback. It is what gets threaded into the daemon
+    // recall-trace (recallMemory's sessionId) so unlabeled runtimes never
+    // conflate into one synthetic thread_id. sessionId keeps the historical
+    // defaulted value for envelope identity / inbox filenames / markers.
+    const rawSessionId = asString(payload.session_id) || asString(payload.sessionId);
+    const sessionId = rawSessionId || "session";
     const workspaceId = workspaceFor(payload);
     await ensureVault(config.vaultPath);
 
@@ -194,7 +200,7 @@ export function createHookHandlers(
         limit: 8,
         agentId: config.agentId,
         workspaceId,
-        sessionId,
+        ...(rawSessionId ? { sessionId: rawSessionId } : {}),
       }),
       // hooks-PL-1/PL-2: corrections to beliefs this agent read must
       // re-surface at boot (stale_beliefs), on every platform.
@@ -357,7 +363,11 @@ export function createHookHandlers(
     }
 
     const workspaceId = workspaceFor(payload);
-    const sessionId = asString(payload.session_id) || asString(payload.sessionId) || "session";
+    // rawSessionId (possibly empty) is the audit/recall-trace correlation id;
+    // sessionId keeps the "session" fallback for envelope identity only — see
+    // handleSessionStart's comment for why the two must not be conflated.
+    const rawSessionId = asString(payload.session_id) || asString(payload.sessionId);
+    const sessionId = rawSessionId || "session";
     const signature = hashTaskSignature(prompt);
 
     const intent = routeMemoryIntent(prompt);
@@ -381,7 +391,7 @@ export function createHookHandlers(
         limit: 6,
         agentId: config.agentId,
         workspaceId,
-        sessionId,
+        ...(rawSessionId ? { sessionId: rawSessionId } : {}),
       }),
     ]);
     // s5 strength gate: emit the light pointer + recall-state file ONLY when the
@@ -432,7 +442,9 @@ export function createHookHandlers(
           task_signature: signature,
           workspace: workspaceId,
           recall_strong: false,
-          session_id: sessionId,
+          // RAW id only — omit rather than stamp the synthetic "session"
+          // fallback, so unlabeled turns don't conflate into one audit thread.
+          ...(rawSessionId ? { session_id: rawSessionId } : {}),
         },
       });
       return { continue: true };
@@ -476,7 +488,8 @@ export function createHookHandlers(
         task_signature: signature,
         workspace: workspaceId,
         recall_strong: Boolean(strong),
-        session_id: sessionId,
+        // RAW id only — see the weak-path comment above.
+        ...(rawSessionId ? { session_id: rawSessionId } : {}),
       },
     });
 
@@ -611,6 +624,11 @@ export function createHookHandlers(
 
   async function handleStop(payload: Record<string, unknown>): Promise<HookOutput> {
     await ensureVault(config.vaultPath);
+    // Stop keeps the defaulted "session" fallback (inbox filename, marker
+    // text, sessionReceipt) unchanged: unlike recall/audit correlation, a
+    // runtime that never labeled any turn with a real session_id still gets a
+    // best-effort receipt merged onto the synthetic "session" bucket rather
+    // than no receipt at all.
     const sessionId = asString(payload.session_id) || asString(payload.sessionId) || "session";
     const workspaceId = workspaceFor(payload);
     const lastTask = asString(payload.last_user_message) || asString(payload.summary) || sessionId;

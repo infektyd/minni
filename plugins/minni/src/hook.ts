@@ -76,7 +76,13 @@ import {
 } from "./vault.js";
 
 async function handleSessionStart(payload: Record<string, unknown>): Promise<HookOutput> {
-  const sessionId = asString(payload.session_id) || asString(payload.sessionId) || "session";
+  // rawSessionId is the payload's own id, possibly empty — never the
+  // "session" synthetic fallback. It is what gets threaded into the daemon
+  // recall-trace (recallMemory's sessionId) so unlabeled runtimes never
+  // conflate into one synthetic thread_id. sessionId keeps the historical
+  // defaulted value for envelope identity / inbox filenames / markers.
+  const rawSessionId = asString(payload.session_id) || asString(payload.sessionId);
+  const sessionId = rawSessionId || "session";
   await ensureVault(CLAUDECODE_VAULT_PATH);
   // c4: reset the once-per-session lifecycle emphasis on a fresh session, so the
   // situational focus can fire again this session.
@@ -97,7 +103,7 @@ async function handleSessionStart(payload: Record<string, unknown>): Promise<Hoo
     limit: 8,
     agentId: CLAUDECODE_AGENT_ID,
     workspaceId: CLAUDECODE_WORKSPACE_ID,
-    sessionId,
+    ...(rawSessionId ? { sessionId: rawSessionId } : {}),
   });
   // hooks-PL-2 leg (a): the 'read' RPC is the recency-ordered learning surface
   // AND the daemon path that records learning_reads — without it, corrections
@@ -315,7 +321,12 @@ async function handleUserPromptSubmit(payload: Record<string, unknown>): Promise
   if (!prompt.trim()) {
     return { continue: true };
   }
-  const sessionId = asString(payload.session_id) || asString(payload.sessionId) || "session";
+  // rawSessionId (possibly empty) is the audit/recall-trace correlation id;
+  // sessionId keeps the "session" fallback for envelope identity / lifecycle
+  // state only — see handleSessionStart's comment for why the two must not
+  // be conflated.
+  const rawSessionId = asString(payload.session_id) || asString(payload.sessionId);
+  const sessionId = rawSessionId || "session";
   const signature = hashTaskSignature(prompt);
 
   // c4/c5: compute the lifecycle representation once for this turn, BEFORE the
@@ -362,7 +373,7 @@ async function handleUserPromptSubmit(payload: Record<string, unknown>): Promise
       limit: 6,
       agentId: CLAUDECODE_AGENT_ID,
       workspaceId: CLAUDECODE_WORKSPACE_ID,
-      sessionId,
+      ...(rawSessionId ? { sessionId: rawSessionId } : {}),
     }),
   ]);
   const vaultResults = filterSafeVaultResults(vaultResultsRaw);
@@ -419,7 +430,9 @@ async function handleUserPromptSubmit(payload: Record<string, unknown>): Promise
         daemon_ok: recall.ok,
         task_signature: signature,
         recall_strong: false,
-        session_id: sessionId,
+        // RAW id only — omit rather than stamp the synthetic "session"
+        // fallback, so unlabeled turns don't conflate into one audit thread.
+        ...(rawSessionId ? { session_id: rawSessionId } : {}),
       },
     });
     // c3: even with nothing salient (no strong recall, no active plan) the
@@ -470,7 +483,8 @@ async function handleUserPromptSubmit(payload: Record<string, unknown>): Promise
       task_signature: signature,
       recall_strong: Boolean(strong),
       top_score: strong?.topScore,
-      session_id: sessionId,
+      // RAW id only — see the weak-path comment above.
+      ...(rawSessionId ? { session_id: rawSessionId } : {}),
     },
   });
 
@@ -528,6 +542,11 @@ async function handlePreCompact(payload: Record<string, unknown>): Promise<HookO
 
 async function handleStop(payload: Record<string, unknown>): Promise<HookOutput> {
   await ensureVault(CLAUDECODE_VAULT_PATH);
+  // Stop keeps the defaulted "session" fallback (inbox filename, marker text,
+  // sessionReceipt) unchanged: unlike recall/audit correlation, a runtime
+  // that never labeled any turn with a real session_id still gets a
+  // best-effort receipt merged onto the synthetic "session" bucket rather
+  // than no receipt at all.
   const sessionId = asString(payload.session_id) || asString(payload.sessionId) || "session";
   const lastTask = asString(payload.last_user_message) || asString(payload.summary) || sessionId;
   const tail = await auditTail(CLAUDECODE_VAULT_PATH, 30);
