@@ -514,7 +514,7 @@ export function createHookHandlers(
     // The PreToolUse payload may carry a session_id; stamp it so the Stop
     // receipt can attribute this guard nudge. Only add it when actually present
     // — never invent a "session" placeholder on this path.
-    const guardSessionId = asString(payload.session_id);
+    const guardSessionId = asString(payload.session_id) || asString(payload.sessionId);
     await recordAudit(config.vaultPath, {
       tool: `${config.auditPrefix}_pretooluse_guard`,
       summary: `recall guard ${consumed ? "denied" : "allowed (consume write failed)"} ${toolName} (mode=${mode})`,

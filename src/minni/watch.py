@@ -52,6 +52,19 @@ def _term_safe(text: str) -> str:
     return _CONTROL_CHARS.sub("", text)
 
 
+def _term_safe_value(value):
+    """Recursively strip control chars from strings in a details payload.
+    json.dumps escapes C0 (< 0x20) but passes raw C1 bytes (0x7f–0x9f)
+    through with ensure_ascii=False, so --json output needs this too."""
+    if isinstance(value, str):
+        return _term_safe(value)
+    if isinstance(value, dict):
+        return {_term_safe(str(k)): _term_safe_value(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_term_safe_value(v) for v in value]
+    return value
+
+
 def minni_home() -> Path:
     return Path(os.environ.get("MINNI_HOME", Path.home() / ".minni"))
 
@@ -95,12 +108,15 @@ def discover_vault_logs(home: Path) -> dict[Path, str]:
         # Containment (mirrors path_safety.path_within_root): a symlinked
         # *-vault must not redirect the tailer outside MINNI_HOME. Operator-
         # authored MINNI_AGENT_VAULTS mappings below may point anywhere.
+        # Keys are canonicalized so the same on-disk vault reachable via two
+        # spellings never yields two tailers (duplicate events).
         try:
-            if not entry.resolve().is_relative_to(home_real):
+            resolved = entry.resolve()
+            if not resolved.is_relative_to(home_real):
                 continue
         except OSError:
             continue
-        logs[entry / "log.md"] = agent_id_for_vault(entry)
+        logs[resolved / "log.md"] = agent_id_for_vault(entry)
 
     mapping_raw = os.environ.get("MINNI_AGENT_VAULTS")
     if mapping_raw:
@@ -111,7 +127,11 @@ def discover_vault_logs(home: Path) -> dict[Path, str]:
         if isinstance(mapping, dict):
             for agent_id, vault_path in mapping.items():
                 if isinstance(vault_path, str) and vault_path:
-                    logs[Path(vault_path).expanduser() / "log.md"] = str(agent_id)
+                    try:
+                        resolved = Path(vault_path).expanduser().resolve()
+                    except OSError:
+                        continue
+                    logs[resolved / "log.md"] = str(agent_id)
     return logs
 
 
@@ -323,10 +343,11 @@ def format_event(event: WatchEvent) -> str:
 
 
 def event_to_json(event: WatchEvent) -> str:
-    payload = {"ts": event.ts, "agent": event.agent, "tool": event.tool,
-               "summary": event.summary, "source": event.source}
+    payload = {"ts": event.ts, "agent": _term_safe(event.agent),
+               "tool": _term_safe(event.tool),
+               "summary": _term_safe(event.summary), "source": event.source}
     if event.details:
-        payload["details"] = event.details
+        payload["details"] = _term_safe_value(event.details)
     return json.dumps(payload, ensure_ascii=False)
 
 

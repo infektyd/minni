@@ -609,7 +609,7 @@ async function handlePreToolUse(
   // The PreToolUse payload may carry a session_id; stamp it so the Stop receipt
   // can attribute this guard nudge. Only add it when present — never invent a
   // "session" placeholder on this path.
-  const guardSessionId = asString(payload.session_id);
+  const guardSessionId = asString(payload.session_id) || asString(payload.sessionId);
   await recordAudit(CLAUDECODE_VAULT_PATH, {
     tool: "hook_pretooluse_guard",
     summary: `recall guard ${consumed ? "denied" : "allowed (consume write failed)"} ${toolName} (mode=${mode})`,

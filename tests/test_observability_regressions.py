@@ -326,6 +326,35 @@ def test_event_sort_key_orders_mixed_timestamp_formats():
     assert earlier.ts > later.ts
 
 
+def test_event_to_json_strips_raw_control_chars():
+    """json.dumps escapes C0 (< 0x20) but passes C1 bytes (0x7f–0x9f) raw
+    with ensure_ascii=False — --json output piped to a terminal must not
+    carry either."""
+    from minni.watch import WatchEvent, event_to_json
+
+    event = WatchEvent(ts="2026-07-15T10:00:00.000Z", agent="codex",
+                       tool="minni_recall", summary="evil\x9b31m summary",
+                       source="plugin", details={"query": "\x9b0mq"})
+    out = event_to_json(event)
+    assert "\x9b" not in out and "\x1b" not in out
+    assert "evil" in out
+
+
+def test_discover_vault_logs_canonicalizes_duplicate_paths(tmp_path, monkeypatch):
+    """The same on-disk vault reachable via two spellings (basename discovery
+    + a MINNI_AGENT_VAULTS mapping) must yield exactly one tailer entry."""
+    (tmp_path / "codex-vault").mkdir()
+    (tmp_path / "sub").mkdir()
+    monkeypatch.setenv("MINNI_AGENT_VAULTS", json.dumps({
+        "codex": str(tmp_path / "sub" / ".." / "codex-vault"),
+    }))
+    logs = discover_vault_logs(tmp_path)
+    matching = [p for p in logs
+                if p.resolve() == (tmp_path / "codex-vault" / "log.md").resolve()]
+    assert len(matching) == 1
+    assert logs[matching[0]] == "codex"
+
+
 def test_watch_rejects_non_positive_interval(tmp_path, monkeypatch, capsys):
     from minni import minni_cli
 
