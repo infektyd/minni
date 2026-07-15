@@ -365,6 +365,86 @@ test("sessionReceipt counts allowed guard nudges and stamped entries out of wind
   }
 });
 
+test("sessionReceipt window closes at the next session's boot when stop is missing", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-receipt-nostop-"));
+  try {
+    await ensureVault(root);
+    // Session A boots, does one unstamped learn, then crashes (no stop).
+    await recordAudit(root, {
+      tool: "hook_codex_session_start",
+      summary: "boot sess-A",
+      details: { daemon_ok: true },
+    });
+    await recordAudit(root, {
+      tool: "minni_learn",
+      summary: "session A learning",
+      details: { ok: true },
+    });
+    // An entry stamped for another session inside A's window must never count.
+    await recordAudit(root, {
+      tool: "hook_codex_user_prompt_submit",
+      summary: "interleaved foreign turn",
+      details: { recall_strong: true, session_id: "sess-Z" },
+    });
+    // Session B boots — this closes A's window even without a `stop sess-A`.
+    await recordAudit(root, {
+      tool: "hook_codex_session_start",
+      summary: "boot sess-B",
+      details: { daemon_ok: true },
+    });
+    await recordAudit(root, {
+      tool: "minni_learn",
+      summary: "session B learning",
+      details: { ok: true },
+    });
+    await recordAudit(root, {
+      tool: "hook_codex_user_prompt_submit",
+      summary: "session B turn",
+      details: { recall_strong: true, session_id: "sess-B" },
+    });
+
+    const receipt = await sessionReceipt(root, "sess-A");
+    assert.equal(receipt.learns, 1, "must not absorb session B's learn");
+    assert.equal(receipt.recalls_strong, 0, "foreign-stamped turns never count");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("sessionReceipt reads the rolling log so a boot outside today's daily file is found", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-receipt-midnight-"));
+  try {
+    await ensureVault(root);
+    // Session A's boot/learn/stop happened "yesterday": present in the rolling
+    // log.md but absent from today's daily file (which recordAudit would have
+    // dual-written yesterday, into yesterday's date file).
+    const yesterday = [
+      "## [2026-07-14T23:50:00.000Z] hook_codex_session_start | boot sess-mid\n\n",
+      "## [2026-07-14T23:55:00.000Z] minni_learn | pre-midnight learning\n\n",
+    ].join("");
+    const { appendFile } = await import("node:fs/promises");
+    await appendFile(path.join(root, "log.md"), yesterday, "utf8");
+    // Today's activity for the same session (dual-written normally).
+    await recordAudit(root, {
+      tool: "hook_codex_user_prompt_submit",
+      summary: "post-midnight turn",
+      details: { recall_strong: true, session_id: "sess-mid" },
+    });
+    await recordAudit(root, {
+      tool: "hook_codex_stop",
+      summary: "stop sess-mid",
+      details: { candidates: 1 },
+    });
+
+    const receipt = await sessionReceipt(root, "sess-mid");
+    assert.equal(receipt.learns, 1, "pre-midnight learn must be attributed");
+    assert.equal(receipt.recalls_strong, 1);
+    assert.equal(receipt.candidates_drafted, 1);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 // RCM-005: concrete escape test (symlink to outside root must be rejected)
 test("resolveInboxHandoffContext and search reject symlink escape from vault (RCM-005)", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "sm-escape-"));

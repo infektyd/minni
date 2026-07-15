@@ -964,7 +964,24 @@ export async function sessionReceipt(
   sessionId: string,
   limit = 500,
 ): Promise<SessionReceipt> {
-  const tail = await auditTail(vaultPath, limit);
+  // Read the ROLLING log, not the daily file auditTail prefers: a session
+  // that crosses midnight has its boot marker in yesterday's daily file, but
+  // log.md carries both days (up to the 5 MB rotation, the receipt's honest
+  // horizon).
+  await ensureVault(vaultPath);
+  let text = "";
+  try {
+    text = await readFile(path.join(vaultPath, "log.md"), "utf8");
+  } catch {
+    // fall through to an empty tail — the receipt reports zeros.
+  }
+  const tail = {
+    entries: text
+      .split(/^## /m)
+      .filter((entry) => entry.trim().length > 0 && !entry.startsWith("#"))
+      .map((entry) => `## ${entry.trim()}`)
+      .slice(-limit),
+  };
   const receipt: SessionReceipt = {
     session_id: sessionId,
     entries: 0,
@@ -1019,10 +1036,18 @@ export async function sessionReceipt(
   for (let i = 0; i < parsed.length; i += 1) {
     if (parsed[i].summary === bootSummary) windowStart = i;
   }
+  // The window closes at our own stop — or at ANY other session's boot/stop
+  // marker: a session that died without a `stop <id>` row must not absorb
+  // its successors' activity.
   let windowEnd = parsed.length;
   if (windowStart >= 0) {
     for (let i = windowStart + 1; i < parsed.length; i += 1) {
-      if (parsed[i].summary === stopSummary) {
+      const summary = parsed[i].summary;
+      if (
+        summary === stopSummary ||
+        (summary.startsWith("boot ") && summary !== bootSummary) ||
+        (summary.startsWith("stop ") && summary !== stopSummary)
+      ) {
         windowEnd = i;
         break;
       }
@@ -1034,6 +1059,9 @@ export async function sessionReceipt(
       item.details && typeof item.details.session_id === "string"
         ? (item.details.session_id as string)
         : undefined;
+    // An entry stamped for a DIFFERENT session never counts, even when it
+    // falls inside our boot→stop window (interleaved multi-session vaults).
+    if (stampedSession !== undefined && stampedSession !== sessionId) return;
     const byStamp = stampedSession === sessionId;
     const bySummary =
       item.summary === bootSummary ||
