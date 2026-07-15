@@ -363,6 +363,21 @@ def _emit(events: list[WatchEvent], args) -> None:
               flush=True)
 
 
+def refresh_tailers(tailers: dict, home: Path) -> list[AuditTailer]:
+    """Reconcile the tailer map against current vault discovery, returning
+    tailers created this call. Vaults can appear while watch runs (a hook's
+    ensureVault on first audit); one-shot discovery would miss them forever.
+    A newly discovered vault is tailed from offset 0 — its whole content is
+    new to this watcher."""
+    fresh: list[AuditTailer] = []
+    for path, agent in discover_vault_logs(home).items():
+        if path not in tailers:
+            tailer = AuditTailer(path, agent)
+            tailers[path] = tailer
+            fresh.append(tailer)
+    return fresh
+
+
 def run_watch(args) -> int:
     """Entry point for `minni watch`. args carries: agent (str|None),
     since (aware datetime|None), json (bool), once (bool), interval (float)."""
@@ -391,14 +406,26 @@ def run_watch(args) -> int:
         watched = ", ".join(sorted({t.agent for t in tailers})) or "none"
         print(f"-- watching {len(tailers)} vault log(s) [{watched}] + "
               f"daemon events; Ctrl-C stops --", flush=True)
+
+    tailer_map = {tailer.path: tailer for tailer in tailers}
+
+    def poll_round() -> None:
+        # Vaults can appear while we run (a hook's first ensureVault);
+        # re-discover each round so late vaults are tailed, not lost.
+        refresh_tailers(tailer_map, home)
+        fresh: list[WatchEvent] = []
+        for tailer in tailer_map.values():
+            fresh.extend(tailer.poll())
+        fresh.extend(poller.poll())
+        fresh.sort(key=event_sort_key)
+        _emit(fresh, args)
+
     try:
         while True:
             time.sleep(args.interval)
-            fresh: list[WatchEvent] = []
-            for tailer in tailers:
-                fresh.extend(tailer.poll())
-            fresh.extend(poller.poll())
-            fresh.sort(key=event_sort_key)
-            _emit(fresh, args)
+            poll_round()
     except KeyboardInterrupt:
+        # Ctrl-C usually lands mid-sleep: drain once so operations from the
+        # final interval are shown, not silently dropped.
+        poll_round()
         return 0

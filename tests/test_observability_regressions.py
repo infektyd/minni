@@ -355,6 +355,29 @@ def test_discover_vault_logs_canonicalizes_duplicate_paths(tmp_path, monkeypatch
     assert logs[matching[0]] == "codex"
 
 
+def test_refresh_tailers_picks_up_vaults_created_after_start(tmp_path):
+    """A vault created while watch is running must start being tailed —
+    discovery cannot be a one-shot at startup."""
+    from minni.watch import AuditTailer, refresh_tailers
+
+    tailers: dict = {}
+    refresh_tailers(tailers, tmp_path)
+    assert tailers == {}
+    (tmp_path / "late-vault").mkdir()
+    log = tmp_path / "late-vault" / "log.md"
+    log.write_text("# Log\n\n" + _entry("2026-07-15T10:00:00.000Z", "a", "one"))
+    fresh = refresh_tailers(tailers, tmp_path)
+    assert len(tailers) == 1 and len(fresh) == 1
+    tailer = next(iter(tailers.values()))
+    assert isinstance(tailer, AuditTailer) and tailer.agent == "late"
+    # A late vault's existing content is NEW to the watcher: poll from 0.
+    assert [e.summary for e in tailer.poll()] == ["one"]
+    # Idempotent: nothing new on the next refresh, offsets preserved.
+    refresh_tailers(tailers, tmp_path)
+    assert len(tailers) == 1
+    assert next(iter(tailers.values())).offset > 0
+
+
 def test_watch_rejects_non_positive_interval(tmp_path, monkeypatch, capsys):
     from minni import minni_cli
 
