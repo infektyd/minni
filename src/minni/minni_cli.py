@@ -265,6 +265,11 @@ def cmd_watch(args: argparse.Namespace) -> int:
 
     from minni.watch import run_watch
 
+    if args.interval <= 0:
+        print("minni watch: --interval must be a positive number of seconds",
+              file=sys.stderr)
+        return 2
+
     since = None
     if args.since:
         raw = args.since.strip()

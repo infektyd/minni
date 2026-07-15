@@ -41,6 +41,16 @@ BACKLOG_ENTRIES = 10
 DETAIL_KEYS = ("query", "hits", "top_score", "recall_strong", "denied",
                "tool", "candidates", "session_id", "task_signature")
 
+# Audit summaries and episodic content derive from prompts and vault text —
+# attacker-influenceable. Write-time escaping protects the markdown structure,
+# not the operator's terminal: strip C0/C1 control characters (ESC, BEL, CSI…)
+# before printing so recalled content cannot inject terminal escapes.
+_CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+
+
+def _term_safe(text: str) -> str:
+    return _CONTROL_CHARS.sub("", text)
+
 
 def minni_home() -> Path:
     return Path(os.environ.get("MINNI_HOME", Path.home() / ".minni"))
@@ -75,9 +85,22 @@ def discover_vault_logs(home: Path) -> dict[Path, str]:
         entries = sorted(home.iterdir())
     except OSError:
         entries = []
+    try:
+        home_real = home.resolve()
+    except OSError:
+        home_real = home
     for entry in entries:
-        if entry.is_dir() and entry.name.endswith("-vault"):
-            logs[entry / "log.md"] = agent_id_for_vault(entry)
+        if not (entry.is_dir() and entry.name.endswith("-vault")):
+            continue
+        # Containment (mirrors path_safety.path_within_root): a symlinked
+        # *-vault must not redirect the tailer outside MINNI_HOME. Operator-
+        # authored MINNI_AGENT_VAULTS mappings below may point anywhere.
+        try:
+            if not entry.resolve().is_relative_to(home_real):
+                continue
+        except OSError:
+            continue
+        logs[entry / "log.md"] = agent_id_for_vault(entry)
 
     mapping_raw = os.environ.get("MINNI_AGENT_VAULTS")
     if mapping_raw:
@@ -274,6 +297,18 @@ def _parse_ts(ts: str) -> datetime | None:
         return None
 
 
+def event_sort_key(event: WatchEvent) -> tuple:
+    """Chronological sort key. Plugin timestamps are millisecond 'Z'-suffixed,
+    daemon ones microsecond '+00:00' — lexicographic comparison inverts them,
+    so sort on the parsed instant (unparseable timestamps sort last)."""
+    parsed = _parse_ts(event.ts)
+    if parsed is None:
+        return (1, datetime.max.replace(tzinfo=timezone.utc), event.ts)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return (0, parsed, event.ts)
+
+
 def format_event(event: WatchEvent) -> str:
     parsed = _parse_ts(event.ts)
     clock = parsed.astimezone().strftime("%H:%M:%S") if parsed else event.ts
@@ -284,7 +319,7 @@ def format_event(event: WatchEvent) -> str:
                   if key in event.details]
         if extras:
             line += f"  ({', '.join(extras)})"
-    return line
+    return _term_safe(line)
 
 
 def event_to_json(event: WatchEvent) -> str:
@@ -325,7 +360,7 @@ def run_watch(args) -> int:
     for tailer in tailers:
         backlog.extend(tailer.seed()[-BACKLOG_ENTRIES:])
     backlog.extend(poller.seed(BACKLOG_ENTRIES))
-    backlog.sort(key=lambda ev: ev.ts)
+    backlog.sort(key=event_sort_key)
     _emit(backlog, args)
 
     if args.once:
@@ -342,7 +377,7 @@ def run_watch(args) -> int:
             for tailer in tailers:
                 fresh.extend(tailer.poll())
             fresh.extend(poller.poll())
-            fresh.sort(key=lambda ev: ev.ts)
+            fresh.sort(key=event_sort_key)
             _emit(fresh, args)
     except KeyboardInterrupt:
         return 0

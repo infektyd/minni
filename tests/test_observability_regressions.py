@@ -220,3 +220,116 @@ def test_recent_events_excludes_recall_traces(tmp_path):
         types = {row["event_type"] for row in events}
         assert "recall" not in types
         assert "message" in types
+
+
+# ── round 2: adversarial-review findings ──────────────────────────────────
+
+
+def test_recall_trace_content_is_redacted():
+    """The durable trace persists query text; secrets must be scrubbed the
+    same way the ephemeral trace-ring path scrubs its responses."""
+    from minni.minnid_runtime import recall as recall_mod
+
+    recorded = {}
+
+    class _FakeEpisodic:
+        def add_event(self, **kwargs):
+            recorded.update(kwargs)
+            return 1
+
+    class _FakePrincipal:
+        agent_id = "codex"
+        workspace_id = "default"
+
+    class _FakeEngine:
+        last_trace_id = None
+
+        def retrieve(self, **_kwargs):
+            return []
+
+        def search_learnings(self, *_a, **_k):
+            return []
+
+    class _Cfg:
+        recall_trace = True
+        vector_backends = ["faiss-disk"]
+
+    context = recall_mod.RecallContext(
+        make_error=lambda code, msg, rid: {"error": {"code": code}},
+        make_response=lambda result, rid: {"result": result},
+        handler_principal=lambda params, rid: (_FakePrincipal(), None),
+        lazy_retrieval=lambda: _FakeEngine(),
+        agent_vault_retrieval=lambda agent_id: None,
+        all_vault_retrievals=lambda: [],
+        trace_ring=lambda: None,
+        record_latency=lambda name, seconds: None,
+        lazy_episodic=lambda: _FakeEpisodic(),
+        default_config=_Cfg(),
+    )
+    recall_mod.handle_search(
+        {"query": "find the api_key=sk-supersecret123 config"}, 1, context)
+    assert "sk-supersecret123" not in recorded["content"]
+    assert "[REDACTED]" in recorded["content"]
+
+
+def test_handle_read_recent_activity_excludes_recall_traces():
+    """handle_read's Recent Activity (LIMIT 5) must not be crowded out by
+    recall-trace rows. Pinned at the SQL level: the episodic_events query in
+    handle_read must filter event_type != 'recall'."""
+    import inspect
+
+    from minni.minnid_runtime import recall as recall_mod
+
+    source = inspect.getsource(recall_mod.handle_read)
+    start = source.index("FROM episodic_events")
+    window = source[start:start + 200]
+    assert "event_type != 'recall'" in window
+
+
+def test_format_event_strips_terminal_control_chars():
+    from minni.watch import WatchEvent, format_event
+
+    event = WatchEvent(ts="2026-07-15T10:00:00.000Z", agent="codex",
+                       tool="minni_recall",
+                       summary="\x1b[2J\x1b[31mevil\x07\x9b1m summary",
+                       source="plugin",
+                       details={"query": "\x1b]0;owned\x07q"})
+    line = format_event(event)
+    assert "\x1b" not in line and "\x07" not in line and "\x9b" not in line
+    assert "evil" in line
+
+
+def test_discover_vault_logs_skips_symlink_escape(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (home / "evil-vault").symlink_to(outside)
+    (home / "codex-vault").mkdir()
+    logs = discover_vault_logs(home)
+    assert home / "evil-vault" / "log.md" not in logs
+    assert home / "codex-vault" / "log.md" in logs
+
+
+def test_event_sort_key_orders_mixed_timestamp_formats():
+    """Plugin timestamps are millisecond 'Z'-suffixed; daemon timestamps are
+    microsecond '+00:00'. Lexicographic ordering inverts them; the sort key
+    must parse."""
+    from minni.watch import WatchEvent, event_sort_key
+
+    earlier = WatchEvent(ts="2026-07-15T10:00:00.400Z", agent="a", tool="t",
+                         summary="plugin first", source="plugin")
+    later = WatchEvent(ts="2026-07-15T10:00:00.400500+00:00", agent="a",
+                       tool="t", summary="daemon second", source="daemon")
+    assert event_sort_key(earlier) < event_sort_key(later)
+    # Lexicographic comparison would order these the other way around.
+    assert earlier.ts > later.ts
+
+
+def test_watch_rejects_non_positive_interval(tmp_path, monkeypatch, capsys):
+    from minni import minni_cli
+
+    monkeypatch.setenv("MINNI_HOME", str(tmp_path))
+    assert minni_cli.main(["watch", "--interval", "0"]) == 2
+    assert minni_cli.main(["watch", "--interval", "-1"]) == 2
+    assert "interval" in capsys.readouterr().err

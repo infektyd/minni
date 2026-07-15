@@ -15,7 +15,7 @@ from minni.principal import (
     make_capability_denied_error,
 )
 
-from .redaction import redact_value
+from .redaction import redact_text, redact_value
 
 
 logger = logging.getLogger("minnid")
@@ -305,10 +305,13 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
             try:
                 top_score = float(results[0].get("score") or 0.0) if results else 0.0
                 session_id = params.get("session_id")
+                # The trace is durable — scrub secrets from the persisted
+                # query snippet just like the ephemeral trace path does.
+                safe_query, _ = redact_text(query[:120])
                 context.lazy_episodic().add_event(
                     agent_id=agent_id,
                     event_type="recall",
-                    content=(f'recall "{query[:120]}" — {len(results)} hits, '
+                    content=(f'recall "{safe_query}" — {len(results)} hits, '
                              f"top {top_score:.2f}"),
                     thread_id=str(session_id) if session_id else None,
                     # Observability only: never thread-bind (that mutates
@@ -1065,6 +1068,7 @@ def handle_read(params: dict, request_id: Any, context: RecallContext) -> dict:
                 SELECT event_type, content, created_at
                 FROM episodic_events
                 WHERE agent_id = ?
+                  AND event_type != 'recall'
                 ORDER BY created_at DESC
                 LIMIT 5
             """, (agent_id,))
