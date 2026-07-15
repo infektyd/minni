@@ -48,6 +48,7 @@ class EpisodicMemory:
         thread_id: Optional[str] = None,
         metadata: Optional[Dict] = None,
         raw_blob: Optional[bytes] = None,
+        bind_thread: bool = True,
     ) -> int:
         """
         Log an episodic event.
@@ -84,8 +85,11 @@ class EpisodicMemory:
             ))
             event_id = c.lastrowid
 
-        # Auto-bind thread to docs if thread_id is provided
-        if thread_id and content:
+        # Auto-bind thread to docs if thread_id is provided. bind_thread=False
+        # is for observability writes (e.g. the recall trace): they carry a
+        # thread_id as a join key but must stay inert — no thread_doc_links
+        # mutation, no semantic search on the hot path.
+        if bind_thread and thread_id and content:
             self._semantic_thread_bind(thread_id, content)
 
         return event_id

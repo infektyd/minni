@@ -311,6 +311,9 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
                     content=(f'recall "{query[:120]}" — {len(results)} hits, '
                              f"top {top_score:.2f}"),
                     thread_id=str(session_id) if session_id else None,
+                    # Observability only: never thread-bind (that mutates
+                    # thread_doc_links and runs a semantic search).
+                    bind_thread=False,
                     metadata={
                         "query_sha256_12": hashlib.sha256(
                             query.encode("utf-8")).hexdigest()[:12],

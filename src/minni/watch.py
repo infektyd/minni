@@ -46,6 +46,13 @@ def minni_home() -> Path:
     return Path(os.environ.get("MINNI_HOME", Path.home() / ".minni"))
 
 
+def episodic_db_path(home: Path) -> Path:
+    """The daemon honors MINNI_DB_PATH (config.py db_path); watch must tail
+    the same database or daemon-side events silently vanish from the view."""
+    override = os.environ.get("MINNI_DB_PATH")
+    return Path(override) if override else home / "minni.db"
+
+
 def agent_id_for_vault(vault_dir: Path) -> str:
     """Vault dir basename -> agent id (mirrors vault.ts
     getAgentIdFromVaultPath basename fallback, including the claude aliases)."""
@@ -58,15 +65,30 @@ def agent_id_for_vault(vault_dir: Path) -> str:
 
 
 def discover_vault_logs(home: Path) -> dict[Path, str]:
-    """Map each vault's rolling audit log to its agent id."""
+    """Map each vault's rolling audit log to its agent id.
+
+    MINNI_AGENT_VAULTS (a JSON object of agent id -> vault path, the same
+    override the plugin's getAgentIdFromVaultPath honors) wins over basename
+    inference, so `--agent` filtering matches the plugin's own attribution."""
     logs: dict[Path, str] = {}
     try:
         entries = sorted(home.iterdir())
     except OSError:
-        return logs
+        entries = []
     for entry in entries:
         if entry.is_dir() and entry.name.endswith("-vault"):
             logs[entry / "log.md"] = agent_id_for_vault(entry)
+
+    mapping_raw = os.environ.get("MINNI_AGENT_VAULTS")
+    if mapping_raw:
+        try:
+            mapping = json.loads(mapping_raw)
+        except ValueError:
+            mapping = None
+        if isinstance(mapping, dict):
+            for agent_id, vault_path in mapping.items():
+                if isinstance(vault_path, str) and vault_path:
+                    logs[Path(vault_path).expanduser() / "log.md"] = str(agent_id)
     return logs
 
 
@@ -128,6 +150,7 @@ class AuditTailer:
         self.path = path
         self.agent = agent
         self.offset = 0
+        self._ino: int | None = None
 
     def seed(self) -> list[WatchEvent]:
         """Read the whole current file once (for backlog) and set the
@@ -137,24 +160,44 @@ class AuditTailer:
 
     def poll(self) -> list[WatchEvent]:
         try:
-            size = self.path.stat().st_size
+            st = self.path.stat()
         except OSError:
             return []
-        if size < self.offset:  # rotated
+        events: list[WatchEvent] = []
+        # Rotation is a rename (log.md -> log.1.md, then a fresh log.md), so
+        # the reliable signal is the inode changing — the new file can be
+        # larger than our old offset, which defeats a size-only check.
+        # size < offset stays as a fallback for in-place truncation.
+        rotated = (self._ino is not None and st.st_ino != self._ino)
+        if rotated:
+            # Entries appended between our last poll and the rotation live at
+            # the tail of the rotated file — drain them before restarting.
+            try:
+                with open(self.path.with_name("log.1.md"), "rb") as fh:
+                    fh.seek(self.offset)
+                    tail = fh.read().decode("utf-8", errors="replace")
+                events.extend(parse_audit_entries(tail, self.agent))
+            except OSError:
+                pass
             self.offset = 0
-        if size == self.offset:
-            return []
-        text = self._read_from(self.offset)
-        return parse_audit_entries(text, self.agent)
+        elif st.st_size < self.offset:
+            self.offset = 0
+        self._ino = st.st_ino
+        if st.st_size != self.offset:
+            text = self._read_from(self.offset)
+            events.extend(parse_audit_entries(text, self.agent))
+        return events
 
     def _read_from(self, start: int) -> str:
         try:
             with open(self.path, "rb") as fh:
+                data_ino = os.fstat(fh.fileno()).st_ino
                 fh.seek(start)
                 data = fh.read()
         except OSError:
             return ""
         self.offset = start + len(data)
+        self._ino = data_ino
         return data.decode("utf-8", errors="replace")
 
 
@@ -270,7 +313,7 @@ def run_watch(args) -> int:
     home = minni_home()
     tailers = [AuditTailer(path, agent)
                for path, agent in discover_vault_logs(home).items()]
-    poller = EpisodicPoller(home / "minni.db")
+    poller = EpisodicPoller(episodic_db_path(home))
 
     if not tailers and not poller.db_path.exists():
         print(f"Nothing to watch under {home} — no *-vault directories and "
