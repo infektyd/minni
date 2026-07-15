@@ -378,6 +378,30 @@ def test_refresh_tailers_picks_up_vaults_created_after_start(tmp_path):
     assert next(iter(tailers.values())).offset > 0
 
 
+def test_refresh_tailers_syncs_agent_relabels(tmp_path, monkeypatch):
+    """If discovery relabels an already-tailed path (e.g. a MINNI_AGENT_VAULTS
+    mapping), the existing tailer must adopt the new agent id — offsets kept."""
+    from minni.watch import refresh_tailers
+
+    vault = tmp_path / "weird-vault"
+    vault.mkdir()
+    (vault / "log.md").write_text(
+        "# Log\n\n" + _entry("2026-07-15T10:00:00.000Z", "t", "one"))
+    tailers: dict = {}
+    refresh_tailers(tailers, tmp_path)
+    tailer = tailers[vault / "log.md"]
+    assert tailer.agent == "weird"
+    tailer.seed()
+    offset_before = tailer.offset
+
+    monkeypatch.setenv("MINNI_AGENT_VAULTS",
+                       json.dumps({"renamed-bot": str(vault)}))
+    fresh = refresh_tailers(tailers, tmp_path)
+    assert fresh == [], "a relabel must not create a duplicate tailer"
+    assert tailers[vault / "log.md"].agent == "renamed-bot"
+    assert tailers[vault / "log.md"].offset == offset_before
+
+
 def test_since_window_not_capped_by_backlog(tmp_path, monkeypatch, capsys):
     """--since must surface everything in the requested window, not just the
     last 10 backlog entries per source."""

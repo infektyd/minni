@@ -396,10 +396,15 @@ def refresh_tailers(tailers: dict, home: Path) -> list[AuditTailer]:
     new to this watcher."""
     fresh: list[AuditTailer] = []
     for path, agent in discover_vault_logs(home).items():
-        if path not in tailers:
+        existing = tailers.get(path)
+        if existing is None:
             tailer = AuditTailer(path, agent)
             tailers[path] = tailer
             fresh.append(tailer)
+        elif existing.agent != agent:
+            # Discovery relabeled the path (mapping override): adopt the new
+            # id in place so --agent filtering stays accurate, offsets kept.
+            existing.agent = agent
     return fresh
 
 
