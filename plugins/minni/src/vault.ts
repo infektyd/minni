@@ -1031,24 +1031,41 @@ export async function sessionReceipt(
     parsed.push({ tool, summary, details });
   }
 
-  // Window bounds by index into `parsed`: from the last boot to the following
-  // stop (exclusive of neither bound's own inclusion decision below).
+  // Attribution model (one rule, not three): the LAST boot marker opens the
+  // window — the session's current cycle. Prefer the exact `boot <sessionId>`;
+  // on the synthetic fallback (includeStamped) the last boot of ANY id opens
+  // it, because SessionStart may have stamped the real id that Stop's payload
+  // later omitted. Inside the window, stamps act as a filter (own id, the
+  // window's boot id, or anything when includeStamped). Nothing outside the
+  // window ever counts — an earlier cycle reusing the same session id must
+  // not inflate this one. Only when NO window exists at all does attribution
+  // fall back to exact stamps.
   let windowStart = -1;
+  let anyBootStart = -1;
   for (let i = 0; i < parsed.length; i += 1) {
     if (parsed[i].summary === bootSummary) windowStart = i;
+    if (parsed[i].summary.startsWith("boot ")) anyBootStart = i;
   }
-  // The window closes at our own stop — or at ANY other session's boot/stop
+  let windowSessionId = sessionId;
+  if (windowStart === -1 && options.includeStamped && anyBootStart >= 0) {
+    windowStart = anyBootStart;
+    windowSessionId =
+      parsed[anyBootStart].summary.slice("boot ".length).trim() || sessionId;
+  }
+  const windowStopSummary = `stop ${windowSessionId}`;
+  // The window closes INCLUSIVE of our own stop row (its candidates tally
+  // belongs to this session) — or EXCLUSIVE at any other session's boot/stop
   // marker: a session that died without a `stop <id>` row must not absorb
   // its successors' activity.
   let windowEnd = parsed.length;
   if (windowStart >= 0) {
     for (let i = windowStart + 1; i < parsed.length; i += 1) {
       const summary = parsed[i].summary;
-      if (
-        summary === stopSummary ||
-        (summary.startsWith("boot ") && summary !== bootSummary) ||
-        (summary.startsWith("stop ") && summary !== stopSummary)
-      ) {
+      if (summary === stopSummary || summary === windowStopSummary) {
+        windowEnd = i + 1;
+        break;
+      }
+      if (summary.startsWith("boot ") || summary.startsWith("stop ")) {
         windowEnd = i;
         break;
       }
@@ -1060,21 +1077,17 @@ export async function sessionReceipt(
       item.details && typeof item.details.session_id === "string"
         ? (item.details.session_id as string)
         : undefined;
-    // An entry stamped for a DIFFERENT session never counts, even when it
-    // falls inside our boot→stop window (interleaved multi-session vaults).
-    // Exception (includeStamped): a Stop that fell back to the synthetic id
-    // opts into counting stamped in-window turns, else its receipt reports
-    // zeros despite real activity.
-    if (!options.includeStamped
-        && stampedSession !== undefined && stampedSession !== sessionId) return;
-    const byStamp = stampedSession === sessionId;
-    const bySummary =
-      item.summary === bootSummary ||
-      item.summary === stopSummary ||
-      item.summary === preCompactSummary;
-    const byWindow =
-      windowStart >= 0 && index >= windowStart && index < windowEnd;
-    if (!byStamp && !bySummary && !byWindow) return;
+    if (windowStart >= 0) {
+      if (index < windowStart || index >= windowEnd) return;
+      if (
+        stampedSession !== undefined &&
+        stampedSession !== sessionId &&
+        stampedSession !== windowSessionId &&
+        !options.includeStamped
+      ) return;
+    } else if (stampedSession !== sessionId) {
+      return;
+    }
 
     receipt.entries += 1;
 

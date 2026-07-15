@@ -445,6 +445,81 @@ test("sessionReceipt synthetic fallback counts stamped in-window turns when opte
   }
 });
 
+test("sessionReceipt counts only the LATEST cycle when a session id is reused", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-receipt-cycle-"));
+  try {
+    await ensureVault(root);
+    // Cycle 1 (finished): must not leak into cycle 2's receipt even though
+    // the session id and stamps are identical.
+    await recordAudit(root, {
+      tool: "hook_codex_session_start",
+      summary: "boot sess-R",
+      details: { daemon_ok: true },
+    });
+    await recordAudit(root, {
+      tool: "hook_codex_user_prompt_submit",
+      summary: "cycle one turn",
+      details: { recall_strong: true, session_id: "sess-R" },
+    });
+    await recordAudit(root, {
+      tool: "hook_codex_stop",
+      summary: "stop sess-R",
+      details: { candidates: 3 },
+    });
+    // Cycle 2 (current): one strong turn, no stop yet (receipt runs at Stop).
+    await recordAudit(root, {
+      tool: "hook_codex_session_start",
+      summary: "boot sess-R",
+      details: { daemon_ok: true },
+    });
+    await recordAudit(root, {
+      tool: "hook_codex_user_prompt_submit",
+      summary: "cycle two turn",
+      details: { recall_strong: true, session_id: "sess-R" },
+    });
+
+    const receipt = await sessionReceipt(root, "sess-R");
+    assert.equal(receipt.recalls_strong, 1, "must not count cycle one's turn");
+    assert.equal(receipt.candidates_drafted, 0,
+      "must not count cycle one's stop candidates");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("sessionReceipt synthetic fallback opens the window at the real boot marker", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-receipt-realboot-"));
+  try {
+    await ensureVault(root);
+    // SessionStart had the real id (boot marker says so); Stop's payload
+    // omitted it, so the receipt runs with the synthetic id + includeStamped.
+    await recordAudit(root, {
+      tool: "hook_codex_session_start",
+      summary: "boot real-id-9",
+      details: { daemon_ok: true },
+    });
+    await recordAudit(root, {
+      tool: "hook_codex_user_prompt_submit",
+      summary: "stamped turn",
+      details: { recall_strong: true, session_id: "real-id-9" },
+    });
+    await recordAudit(root, {
+      tool: "minni_learn",
+      summary: "unstamped learn",
+      details: { ok: true },
+    });
+
+    const receipt = await sessionReceipt(root, "session", 500, {
+      includeStamped: true,
+    });
+    assert.equal(receipt.recalls_strong, 1,
+      "the window must open at the real boot marker, not 'boot session'");
+    assert.equal(receipt.learns, 1);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("sessionReceipt reads the rolling log so a boot outside today's daily file is found", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "sm-receipt-midnight-"));
   try {
