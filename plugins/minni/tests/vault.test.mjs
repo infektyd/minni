@@ -932,6 +932,76 @@ test("listSessions tallies agree with sessionReceipt for the same completed sess
   }
 });
 
+test("listSessions counts stamped rows inside a synthetic boot window (Stop parity)", async () => {
+  // Runtimes whose Stop payload lacks a session id write synthetic
+  // `boot session` / `stop session` markers while turn rows carry the real
+  // runtime id in details.session_id. The Stop hook tallies those with
+  // includeStamped: true — the Sessions catalogue must agree, not show zeros.
+  const root = await mkdtemp(path.join(tmpdir(), "sm-list-synth-"));
+  try {
+    await ensureVault(root);
+    await recordAudit(root, {
+      tool: "hook_grok_session_start",
+      summary: "boot session",
+      details: { daemon_ok: true },
+    });
+    await recordAudit(root, {
+      tool: "hook_grok_user_prompt_submit",
+      summary: "turn",
+      details: { recall_strong: true, session_id: "real-runtime-id" },
+    });
+    await recordAudit(root, {
+      tool: "hook_grok_pretooluse_guard",
+      summary: "recall guard denied Grep",
+      details: { session_id: "real-runtime-id" },
+    });
+    await recordAudit(root, {
+      tool: "hook_grok_stop",
+      summary: "stop session",
+      details: { candidates: 1 },
+    });
+
+    const rows = await listSessions(root);
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].session_id, "session");
+    assert.equal(rows[0].receipt.recalls_strong, 1);
+    assert.equal(rows[0].receipt.guard_denied, 1);
+    assert.equal(rows[0].receipt.candidates_drafted, 1);
+
+    // Parity with what the Stop hook computed for this window.
+    const stopReceipt = await sessionReceipt(root, "session", 500, {
+      includeStamped: true,
+    });
+    assert.deepEqual(
+      { ...rows[0].receipt, session_id: "session" },
+      { ...stopReceipt, session_id: "session" },
+    );
+
+    // A real-id boot window keeps strict stamp filtering: foreign stamps drop.
+    await recordAudit(root, {
+      tool: "hook_codex_session_start",
+      summary: "boot real-2",
+      details: { daemon_ok: true },
+    });
+    await recordAudit(root, {
+      tool: "hook_codex_user_prompt_submit",
+      summary: "turn2",
+      details: { recall_strong: true, session_id: "someone-else" },
+    });
+    await recordAudit(root, {
+      tool: "hook_codex_stop",
+      summary: "stop real-2",
+      details: { candidates: 0 },
+    });
+    const rows2 = await listSessions(root);
+    const real2 = rows2.find((r) => r.session_id === "real-2");
+    assert.ok(real2);
+    assert.equal(real2.receipt.recalls_strong, 0);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("listSessions caps rows at limit and honors the parseLimit horizon", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "sm-list-limit-"));
   try {

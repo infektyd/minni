@@ -1248,8 +1248,13 @@ export async function listSessions(
     const windowSessionId = parsed[i].summary.slice("boot ".length).trim();
     if (!windowSessionId) continue;
     // Each window knows its id from its boot marker, so the stamp filter counts
-    // that id (or unstamped rows) and drops other ids — no includeStamped
-    // relaxation here.
+    // that id (or unstamped rows) and drops other ids. The one exception is the
+    // synthetic "session" fallback id: those markers come from runtimes whose
+    // lifecycle payload lacked a session id, while their turn rows carry the
+    // real runtime id in details.session_id. The Stop hook tallies exactly that
+    // shape with includeStamped — the catalogue must agree or it shows zeros
+    // where the Stop receipt showed activity.
+    const synthetic = windowSessionId === "session";
     const { end, stopIndex } = closeWindow(parsed, i, [`stop ${windowSessionId}`]);
     const receipt = tallyWindow(
       parsed,
@@ -1257,7 +1262,7 @@ export async function listSessions(
       i,
       end,
       windowSessionId,
-      false,
+      synthetic,
     );
     summaries.push({
       session_id: windowSessionId,
