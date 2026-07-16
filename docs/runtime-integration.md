@@ -83,7 +83,13 @@ Two views answer "did the model actually use minni?":
 
 The console's data paths are read-only: vault logs are read without
 materializing vault skeletons, and `list_events` is capability-gated under
-`read` and performs a single parameterized SELECT.
+`read` and performs a single parameterized SELECT. Cross-agent event
+listing follows the same gate as cross-agent recall: a plain principal is
+scoped to its own stamped agent id, so in a strict-identity home (any
+`principals/*.json` present) the daemon lane needs an operator grant —
+author `principals/main.json` with at least `"capabilities": ["read"]`
+(add `"govern"` for the fleet-wide view), exactly as the candidate routes
+already require `learn`.
 
 ## Local AFM and Extraction
 
