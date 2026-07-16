@@ -382,8 +382,17 @@ def _emit(events: list[WatchEvent], args) -> None:
             continue
         if args.since:
             parsed = _parse_ts(event.ts)
-            if parsed is not None and parsed < args.since:
-                continue
+            # Normalize to aware UTC before comparing: audit headers are written
+            # as ISO-8601 UTC ('Z'), but a naive parse (no offset) must still be
+            # treated as UTC rather than raising TypeError against the aware
+            # --since cutoff. Unparseable timestamps (parsed is None) FAIL OPEN —
+            # the row is emitted rather than silently dropped, so nothing
+            # disappears just because its header couldn't be dated.
+            if parsed is not None:
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                if parsed < args.since:
+                    continue
         print(event_to_json(event) if args.json else format_event(event),
               flush=True)
 

@@ -185,8 +185,18 @@ export function AuditScreen() {
   // Last applied agent filter, so a limit-only change can be told apart from an
   // agent change and leave the daemon cursor/events untouched.
   const prevAgentRef = useRef<string | null>(null);
+  // Per-lane in-flight locks. The generation guards only protect against scope
+  // CHANGES; these prevent overlapping SAME-scope loads (a slow older response
+  // overwriting fresher rows, or two daemon drains reading the same cursor
+  // before either advances). A tick skips a lane whose previous load hasn't
+  // finished — at the 5s cadence this naturally backs off under slow responses.
+  // The finally blocks always release the lock.
+  const vaultBusyRef = useRef(false);
+  const daemonBusyRef = useRef(false);
 
   const loadVault = async (n: number, agent: string, gen: number) => {
+    if (vaultBusyRef.current) return; // previous vault load still running
+    vaultBusyRef.current = true;
     setLoading(true);
     try {
       if (agent) {
@@ -210,11 +220,14 @@ export function AuditScreen() {
       setError(err instanceof Error ? err.message : String(err));
       setStale(true);
     } finally {
+      vaultBusyRef.current = false;
       if (vaultGenRef.current === gen) setLoading(false);
     }
   };
 
   const loadDaemon = async (agent: string, gen: number) => {
+    if (daemonBusyRef.current) return; // previous daemon drain still running
+    daemonBusyRef.current = true;
     try {
       // Drain the backlog: page through DAEMON_PAGE rows at a time while a page
       // comes back full, advancing the cursor per page, capped at
@@ -256,6 +269,8 @@ export function AuditScreen() {
       } else {
         setDaemonError(err instanceof Error ? err.message : String(err));
       }
+    } finally {
+      daemonBusyRef.current = false;
     }
   };
 

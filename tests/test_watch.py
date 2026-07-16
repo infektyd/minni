@@ -309,3 +309,42 @@ def test_format_event_plain_text_includes_summary_and_detail_keys():
     assert "query=q" in line
     assert "hits=2" in line
     assert "irrelevant" not in line
+
+
+# ---------------------------------------------------------------------------
+# _emit --since filtering (Bugbot r17-A): naive-vs-aware comparison must not
+# raise, and unparseable timestamps must fail open (still emitted).
+# ---------------------------------------------------------------------------
+
+from datetime import datetime, timezone
+from types import SimpleNamespace
+
+
+def _emit_args(since=None, agent=None, json_mode=False):
+    return SimpleNamespace(since=since, agent=agent, json=json_mode)
+
+
+def test_emit_since_naive_header_vs_aware_cutoff_does_not_raise_and_filters(capsys):
+    # Audit headers are ISO-8601 with a 'Z'; _parse_ts yields an AWARE dt for
+    # those. Exercise the robustness path with a NAIVE header (no offset): the
+    # comparison against an aware --since cutoff must not raise TypeError and
+    # must treat the naive stamp as UTC.
+    before = watch.WatchEvent(ts="2026-07-15T09:00:00", agent="a", tool="t",
+                              summary="old", source="plugin")
+    after = watch.WatchEvent(ts="2026-07-15T11:00:00", agent="a", tool="t",
+                             summary="new", source="plugin")
+    cutoff = datetime(2026, 7, 15, 10, 0, 0, tzinfo=timezone.utc)
+
+    watch._emit([before, after], _emit_args(since=cutoff))
+    out = capsys.readouterr().out
+    assert "old" not in out, "pre-cutoff naive-timestamp row filtered out"
+    assert "new" in out, "post-cutoff naive-timestamp row kept"
+
+
+def test_emit_since_unparseable_timestamp_is_failopen_emitted(capsys):
+    weird = watch.WatchEvent(ts="not-a-timestamp", agent="a", tool="t",
+                             summary="keepme", source="plugin")
+    cutoff = datetime(2026, 7, 15, 10, 0, 0, tzinfo=timezone.utc)
+    watch._emit([weird], _emit_args(since=cutoff))
+    out = capsys.readouterr().out
+    assert "keepme" in out, "unparseable-timestamp row must fail open under --since"
