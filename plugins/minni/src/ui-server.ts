@@ -10,7 +10,7 @@ import { promisify } from "node:util";
 import { DEFAULT_AGENT_ID, DEFAULT_VAULT_PATH, PLUGIN_ROOT, minniHome } from "./config.js";
 import { buildStatusReport } from "./sovereign.js";
 import { prepareOutcome, prepareTask, type PrepareOutcomeInput, type PrepareTaskInput } from "./task.js";
-import { auditTail, getAgentIdFromVaultPath } from "./vault.js";
+import { auditTail, getAgentIdFromVaultPath, listSessions, type SessionSummary } from "./vault.js";
 import { readRecallState } from "./recall-state.js";
 import { routeMemoryIntent } from "./policy.js";
 
@@ -88,6 +88,8 @@ export interface UiServerOptions {
   readRecallState?: (vaultPath: string) => Promise<unknown>;
   /** Test seam: override agents catalogue builder. */
   listAgents?: () => Promise<unknown>;
+  /** Test seam: override sessions catalogue builder. */
+  listSessionsCatalogue?: (opts: { agent?: string; limit: number }) => Promise<unknown>;
   /** Test seam: override policy report builder. */
   policyReport?: () => Promise<unknown>;
 }
@@ -196,9 +198,19 @@ function parseCandidatesLimit(value: string | null): number {
   return Math.max(1, Math.min(Math.trunc(parsed), 200));
 }
 
+function parseSessionsLimit(value: string | null): number {
+  const parsed = Number(value ?? 20);
+  if (!Number.isFinite(parsed)) return 20;
+  return Math.max(1, Math.min(Math.trunc(parsed), 50));
+}
+
 // Daemon agent ids are lowercase slugs; anything else is rejected rather than
 // forwarded as a principal claim.
 const AGENT_ID_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/;
+
+// Event types are lowercase snake tokens; anything else is rejected before it
+// reaches the daemon rather than forwarded as an unbounded filter.
+const EVENT_TYPE_RE = /^[a-z_]{1,64}$/;
 
 // The env fallback sentinel resolves to a default-deny principal daemon-side,
 // which would render the staged wall permanently (and silently) empty.
@@ -447,6 +459,62 @@ export async function buildAgentsCatalogue(options: {
   );
 
   return { agents, count: agents.length };
+}
+
+/**
+ * Compose the multi-agent session catalogue for the sessions view. Scans
+ * MINNI_HOME/*-vault with the same symlink/containment guard + agent-id
+ * validation buildAgentsCatalogue uses, reads each vault's recent session
+ * cycles via listSessions (strictly read-only — never ensureVault), stamps each
+ * row with its agent id, and merges across vaults newest-first by boot_at (rows
+ * with a null boot_at sort last). No absolute vault path is put on the wire.
+ */
+export async function buildSessionsCatalogue(options: {
+  homePath: string;
+  perVaultLimit?: number;
+  agent?: string;
+  listSessionsFn?: (vaultPath: string, limit?: number) => Promise<SessionSummary[]>;
+}): Promise<{ sessions: Array<Record<string, unknown>>; count: number }> {
+  const homePath = options.homePath;
+  const perVaultLimit = options.perVaultLimit ?? 10;
+  const listFn = options.listSessionsFn ?? listSessions;
+
+  let dirs: string[] = [];
+  try {
+    dirs = await readdir(homePath);
+  } catch {
+    return { sessions: [], count: 0 };
+  }
+
+  const vaultDirs = dirs.filter((d) => d.endsWith("-vault")).sort();
+  const targets = vaultDirs
+    .map((dir) => {
+      const vaultAbs = path.join(homePath, dir);
+      const id = agentIdFromVaultDir(vaultAbs);
+      return { vaultAbs, id };
+    })
+    .filter(({ vaultAbs, id }) => vaultPathContained(vaultAbs, homePath) && AGENT_ID_RE.test(id))
+    .filter(({ id }) => !options.agent || id === options.agent);
+
+  const perVault = await Promise.all(
+    targets.map(async ({ vaultAbs, id }) => {
+      const sessions = await listFn(vaultAbs, perVaultLimit);
+      // Stamp the agent id; carry only the SessionSummary fields (no vault path).
+      return sessions.map((s) => ({ agent: id, ...s }));
+    }),
+  );
+
+  const merged = perVault.flat().sort((a, b) => {
+    const ab = a.boot_at as string | null;
+    const bb = b.boot_at as string | null;
+    // Null boot_at sorts last; otherwise newest ISO stamp first.
+    if (ab === bb) return 0;
+    if (ab == null) return 1;
+    if (bb == null) return -1;
+    return ab < bb ? 1 : -1;
+  });
+
+  return { sessions: merged, count: merged.length };
 }
 
 /** Normalize list_candidates daemon responses (JsonResult or flat). */
@@ -928,6 +996,14 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         vaultPath,
         status,
       }));
+  const listSessionsCatalogue =
+    options.listSessionsCatalogue ??
+    ((opts: { agent?: string; limit: number }) =>
+      buildSessionsCatalogue({
+        homePath,
+        perVaultLimit: opts.limit,
+        agent: opts.agent,
+      }));
 
   /** Shared list_candidates route body for proposed / log_only / do_not_store. */
   async function candidatesByStatus(
@@ -1024,7 +1100,25 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         return;
       }
       if (req.method === "GET" && url.pathname === "/api/audit-tail") {
-        sendJson(res, 200, redactLocalValue(await tail(parseAuditLimit(url.searchParams.get("limit")))));
+        const auditLimit = parseAuditLimit(url.searchParams.get("limit"));
+        const auditAgent = url.searchParams.get("agent");
+        if (auditAgent !== null) {
+          // Per-agent audit tail: resolve <homePath>/<agent>-vault under the same
+          // symlink/containment guard, serve READ-ONLY (never ensureVault, never
+          // the injected auditTail seam which materializes vault skeletons).
+          if (!AGENT_ID_RE.test(auditAgent)) {
+            sendJson(res, 400, { ok: false, error: "invalid agent" });
+            return;
+          }
+          const agentVault = path.join(homePath, `${auditAgent}-vault`);
+          if (!vaultPathContained(agentVault, homePath)) {
+            sendJson(res, 404, { ok: false, error: "unknown agent" });
+            return;
+          }
+          sendJson(res, 200, redactLocalValue(await readOnlyAuditTail(agentVault, auditLimit)));
+          return;
+        }
+        sendJson(res, 200, redactLocalValue(await tail(auditLimit)));
         return;
       }
       if (req.method === "POST" && url.pathname === "/api/prepare-task") {
@@ -1103,6 +1197,86 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
             error: e instanceof Error ? e.message : String(e),
             agents: [],
             count: 0,
+          });
+        }
+        return;
+      }
+      if (req.method === "GET" && url.pathname === "/api/sessions") {
+        const sessAgent = url.searchParams.get("agent");
+        if (sessAgent !== null && !AGENT_ID_RE.test(sessAgent)) {
+          sendJson(res, 400, { ok: false, error: "invalid agent" });
+          return;
+        }
+        const sessLimit = parseSessionsLimit(url.searchParams.get("limit"));
+        try {
+          const catalogue = (await listSessionsCatalogue({
+            agent: sessAgent ?? undefined,
+            limit: sessLimit,
+          })) as { sessions?: unknown };
+          const rows = Array.isArray(catalogue?.sessions) ? catalogue.sessions.slice(0, sessLimit) : [];
+          sendJson(res, 200, redactLocalValue({ sessions: rows, count: rows.length }));
+        } catch (e) {
+          sendJson(res, 500, {
+            ok: false,
+            error: e instanceof Error ? e.message : String(e),
+            sessions: [],
+          });
+        }
+        return;
+      }
+      if (req.method === "GET" && url.pathname === "/api/events") {
+        const eventParams: Record<string, unknown> = {};
+        const sinceRaw = url.searchParams.get("since_id");
+        if (sinceRaw !== null) {
+          const n = Number(sinceRaw);
+          if (!Number.isInteger(n) || n < 0) {
+            sendJson(res, 400, { ok: false, error: "invalid since_id" });
+            return;
+          }
+          eventParams.since_id = n;
+        }
+        const limitRaw = url.searchParams.get("limit");
+        if (limitRaw !== null) {
+          const n = Number(limitRaw);
+          if (!Number.isInteger(n) || n < 0) {
+            sendJson(res, 400, { ok: false, error: "invalid limit" });
+            return;
+          }
+          eventParams.limit = Math.min(n, 200);
+        }
+        const eventAgent = url.searchParams.get("agent");
+        if (eventAgent !== null) {
+          if (!AGENT_ID_RE.test(eventAgent)) {
+            sendJson(res, 400, { ok: false, error: "invalid agent" });
+            return;
+          }
+          eventParams.agent_id = eventAgent;
+        }
+        const eventType = url.searchParams.get("event_type");
+        if (eventType !== null) {
+          if (!EVENT_TYPE_RE.test(eventType)) {
+            sendJson(res, 400, { ok: false, error: "invalid event_type" });
+            return;
+          }
+          eventParams.event_type = eventType;
+        }
+        try {
+          const rpc = await daemonRpc("list_events", eventParams);
+          if (rpc && typeof rpc === "object" && (rpc as { ok?: boolean }).ok === false) {
+            const err = String((rpc as { error?: string }).error || "list_events failed");
+            sendJson(res, daemonRpcHttpStatus(err), {
+              ok: false,
+              error: err,
+              events: [],
+            });
+            return;
+          }
+          sendJson(res, 200, redactLocalValue(rpc));
+        } catch (e) {
+          sendJson(res, daemonRpcHttpStatus(e), {
+            ok: false,
+            error: e instanceof Error ? e.message : String(e),
+            events: [],
           });
         }
         return;

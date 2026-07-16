@@ -1021,6 +1021,287 @@ test("buildPolicyReport default-denies when the agent has no own principal file 
   assert.ok(report.principalsKnown.includes("main"), "main is still visible in the known-principals list");
 });
 
+// ── Phase C: /api/sessions, /api/events, /api/audit-tail?agent= ─────────────
+
+function sessionRow(agent, session_id, boot_at, extra = {}) {
+  return {
+    agent,
+    session_id,
+    boot_at,
+    stop_at: null,
+    open: true,
+    receipt: {
+      session_id,
+      entries: 0,
+      recalls_strong: 0,
+      recalls_weak: 0,
+      guard_denied: 0,
+      guard_allowed: 0,
+      learns: 0,
+      vault_writes: 0,
+      candidates_drafted: 0,
+    },
+    receipt_line: "Minni session receipt: 0 recalls (0 strong), 0 guard nudges, 0 learns committed, 0 candidates staged.",
+    ...extra,
+  };
+}
+
+test("/api/sessions requires auth (403 unauthed)", async () => {
+  const server = await startTestServer({ listSessionsCatalogue: async () => ({ sessions: [], count: 0 }) });
+  try {
+    const res = await fetch(`${server.baseUrl}/api/sessions`);
+    assert.equal(res.status, 403);
+  } finally {
+    await server.close();
+  }
+});
+
+test("/api/sessions merges rows newest-first across vaults via the catalogue seam", async () => {
+  const server = await startTestServer({
+    listSessionsCatalogue: async () => ({
+      sessions: [
+        sessionRow("codex", "s3", "2026-05-03T00:00:00Z"),
+        sessionRow("main", "s2", "2026-05-02T00:00:00Z"),
+        sessionRow("codex", "s1", "2026-05-01T00:00:00Z"),
+      ],
+      count: 3,
+    }),
+  });
+  try {
+    const res = await fetch(`${server.baseUrl}/api/sessions`, { headers: authHeaders() });
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.deepEqual(body.sessions.map((s) => s.session_id), ["s3", "s2", "s1"]);
+    assert.deepEqual(body.sessions.map((s) => s.agent), ["codex", "main", "codex"]);
+    assert.equal(body.count, 3);
+  } finally {
+    await server.close();
+  }
+});
+
+test("/api/sessions clamps limit (0 -> 1, 999 -> 50)", async () => {
+  let seenLimit;
+  const many = Array.from({ length: 60 }, (_, i) =>
+    sessionRow("codex", `s${i}`, `2026-05-01T00:00:${String(i).padStart(2, "0")}Z`),
+  );
+  const server = await startTestServer({
+    listSessionsCatalogue: async (opts) => {
+      seenLimit = opts.limit;
+      return { sessions: many, count: many.length };
+    },
+  });
+  try {
+    const big = await fetch(`${server.baseUrl}/api/sessions?limit=999`, { headers: authHeaders() }).then((r) => r.json());
+    assert.equal(big.sessions.length, 50);
+    assert.equal(seenLimit, 50);
+
+    const zero = await fetch(`${server.baseUrl}/api/sessions?limit=0`, { headers: authHeaders() }).then((r) => r.json());
+    assert.equal(zero.sessions.length, 1);
+    assert.equal(seenLimit, 1);
+  } finally {
+    await server.close();
+  }
+});
+
+test("/api/sessions rejects an invalid agent param with 400", async () => {
+  const server = await startTestServer({ listSessionsCatalogue: async () => ({ sessions: [], count: 0 }) });
+  try {
+    const res = await fetch(`${server.baseUrl}/api/sessions?agent=Bad%20Agent`, { headers: authHeaders() });
+    assert.equal(res.status, 400);
+    const body = await res.json();
+    assert.equal(body.ok, false);
+    assert.equal(body.error, "invalid agent");
+  } finally {
+    await server.close();
+  }
+});
+
+test("/api/sessions redacts local paths in the payload", async () => {
+  const server = await startTestServer({
+    listSessionsCatalogue: async () => ({
+      sessions: [
+        sessionRow("codex", "s1", "2026-05-01T00:00:00Z", { receipt_line: "wrote /home/user/secret/vault/log.md" }),
+      ],
+      count: 1,
+    }),
+  });
+  try {
+    const body = await fetch(`${server.baseUrl}/api/sessions`, { headers: authHeaders() }).then((r) => r.json());
+    assert.doesNotMatch(JSON.stringify(body), /\/home\/user/);
+    assert.match(body.sessions[0].receipt_line, /\[local-path\]/);
+  } finally {
+    await server.close();
+  }
+});
+
+test("/api/sessions returns 500 fail-loud shape when the catalogue throws", async () => {
+  const server = await startTestServer({
+    listSessionsCatalogue: async () => {
+      throw new Error("scan blew up");
+    },
+  });
+  try {
+    const res = await fetch(`${server.baseUrl}/api/sessions`, { headers: authHeaders() });
+    assert.equal(res.status, 500);
+    const body = await res.json();
+    assert.equal(body.ok, false);
+    assert.match(body.error, /scan blew up/);
+    assert.deepEqual(body.sessions, []);
+  } finally {
+    await server.close();
+  }
+});
+
+test("buildSessionsCatalogue merges vault sessions newest-first and skips symlinked vaults", async () => {
+  const { buildSessionsCatalogue } = await import("../dist/ui-server.js");
+  const { mkdtempSync, mkdirSync, writeFileSync, symlinkSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const pathMod = await import("node:path");
+  const home = mkdtempSync(pathMod.join(tmpdir(), "minni-sessions-cat-"));
+  mkdirSync(pathMod.join(home, "codex-vault"), { recursive: true });
+  mkdirSync(pathMod.join(home, "main-vault"), { recursive: true });
+  writeFileSync(
+    pathMod.join(home, "codex-vault", "log.md"),
+    "## [2026-05-01T00:00:00Z] boot | boot sess-codex\n\n## [2026-05-01T00:05:00Z] stop | stop sess-codex\n",
+  );
+  writeFileSync(
+    pathMod.join(home, "main-vault", "log.md"),
+    "## [2026-05-03T00:00:00Z] boot | boot sess-main\n",
+  );
+  const outside = mkdtempSync(pathMod.join(tmpdir(), "minni-outside-sess-"));
+  writeFileSync(pathMod.join(outside, "log.md"), "## [2026-05-09T00:00:00Z] boot | boot sess-poison\n");
+  try {
+    symlinkSync(outside, pathMod.join(home, "poison-vault"));
+  } catch {
+    // platform without symlink support
+  }
+
+  const catalogue = await buildSessionsCatalogue({ homePath: home });
+  const ids = catalogue.sessions.map((s) => s.session_id);
+  assert.deepEqual(ids, ["sess-main", "sess-codex"], "newest boot_at leads");
+  assert.ok(catalogue.sessions.every((s) => s.session_id !== "sess-poison"), "symlinked vault skipped");
+  const codex = catalogue.sessions.find((s) => s.session_id === "sess-codex");
+  assert.equal(codex.agent, "codex");
+  assert.equal(codex.open, false);
+  const main = catalogue.sessions.find((s) => s.session_id === "sess-main");
+  assert.equal(main.agent, "main");
+  assert.equal(main.open, true);
+  assert.ok(!catalogue.sessions.some((s) => JSON.stringify(s).includes(home)), "no absolute home path on the wire");
+});
+
+test("/api/events proxies list_events with correctly mapped params", async () => {
+  let seen;
+  const server = await startTestServer({
+    daemonRpc: async (method, params) => {
+      seen = { method, params };
+      return {
+        events: [
+          { event_id: 5, agent_id: "codex", event_type: "recall", content: "x", created_at: "t", thread_id: "th" },
+        ],
+        last_id: 5,
+      };
+    },
+  });
+  try {
+    const res = await fetch(`${server.baseUrl}/api/events?since_id=3&limit=10&agent=codex&event_type=recall`, {
+      headers: authHeaders(),
+    });
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(seen.method, "list_events");
+    assert.equal(seen.params.since_id, 3);
+    assert.equal(seen.params.limit, 10);
+    assert.equal(seen.params.agent_id, "codex");
+    assert.equal(seen.params.event_type, "recall");
+    assert.equal(body.last_id, 5);
+    assert.equal(body.events.length, 1);
+  } finally {
+    await server.close();
+  }
+});
+
+test("/api/events returns 502 when daemonRpc rejects", async () => {
+  const server = await startTestServer({
+    daemonRpc: async () => {
+      throw new Error("socket ECONNREFUSED");
+    },
+  });
+  try {
+    const res = await fetch(`${server.baseUrl}/api/events`, { headers: authHeaders() });
+    assert.equal(res.status, 502);
+    const body = await res.json();
+    assert.equal(body.ok, false);
+    assert.match(body.error, /ECONNREFUSED/);
+    assert.deepEqual(body.events, []);
+  } finally {
+    await server.close();
+  }
+});
+
+test("/api/events rejects bad since_id, limit, event_type, and agent with 400", async () => {
+  const server = await startTestServer({ daemonRpc: async () => ({ events: [], last_id: 0 }) });
+  try {
+    for (const q of ["since_id=-1", "since_id=abc", "limit=-5", "limit=1.5", "event_type=Bad!", "agent=NOPE!"]) {
+      const res = await fetch(`${server.baseUrl}/api/events?${q}`, { headers: authHeaders() });
+      assert.equal(res.status, 400, `expected 400 for ${q}`);
+      const body = await res.json();
+      assert.equal(body.ok, false);
+    }
+  } finally {
+    await server.close();
+  }
+});
+
+test("/api/events requires auth (403 unauthed)", async () => {
+  const server = await startTestServer({ daemonRpc: async () => ({ events: [], last_id: 0 }) });
+  try {
+    const res = await fetch(`${server.baseUrl}/api/events`);
+    assert.equal(res.status, 403);
+  } finally {
+    await server.close();
+  }
+});
+
+test("/api/audit-tail?agent= serves a second vault read-only, 404s unknown agents, 400s malformed", async () => {
+  const { mkdtempSync, mkdirSync, writeFileSync, existsSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const pathMod = await import("node:path");
+  const home = mkdtempSync(pathMod.join(tmpdir(), "minni-audit-agent-"));
+  mkdirSync(pathMod.join(home, "codex-vault", "logs"), { recursive: true });
+  const today = new Date().toISOString().slice(0, 10);
+  writeFileSync(
+    pathMod.join(home, "codex-vault", "logs", `${today}.md`),
+    `## [${today}T00:00:00Z] learn | codex vault entry\n`,
+  );
+  const server = await startTestServer({
+    minniHomePath: home,
+    auditTail: async () => {
+      throw new Error("default seam must not be used for the agent path");
+    },
+  });
+  try {
+    const res = await fetch(`${server.baseUrl}/api/audit-tail?agent=codex`, { headers: authHeaders() });
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.entries.length, 1);
+    assert.match(body.entries[0], /codex vault entry/);
+
+    // Unknown agent (no vault dir) → 404 and no skeleton materialized.
+    const ghost = await fetch(`${server.baseUrl}/api/audit-tail?agent=ghost`, { headers: authHeaders() });
+    assert.equal(ghost.status, 404);
+    const ghostBody = await ghost.json();
+    assert.equal(ghostBody.ok, false);
+    assert.equal(ghostBody.error, "unknown agent");
+    assert.equal(existsSync(pathMod.join(home, "ghost-vault")), false, "must not materialize a vault skeleton");
+
+    // Malformed agent → 400.
+    const bad = await fetch(`${server.baseUrl}/api/audit-tail?agent=Bad%20One`, { headers: authHeaders() });
+    assert.equal(bad.status, 400);
+  } finally {
+    await server.close();
+  }
+});
+
 test("buildAgentsCatalogue is fail-loud on staged RPC and skips symlink vaults", async () => {
   const { buildAgentsCatalogue, readOnlyAuditTail } = await import("../dist/ui-server.js");
   const { mkdtempSync, mkdirSync, writeFileSync, symlinkSync } = await import("node:fs");
