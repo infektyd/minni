@@ -107,13 +107,22 @@ function displayTime(ts: string | number): string {
   return s.includes("T") ? s.slice(11, 19) : s;
 }
 
+function eventTimestampMs(createdAt: string | number): number {
+  // The route normalizes epoch floats to ISO, but stay robust to a raw
+  // epoch-seconds number (Python time.time()) reaching the client.
+  if (typeof createdAt === "number" && Number.isFinite(createdAt)) {
+    return createdAt * 1000;
+  }
+  return Date.parse(String(createdAt));
+}
+
 function eventToRow(e: EventRow): MergedRow {
-  const parsedTs = Date.parse(String(e.created_at));
+  const parsedTs = eventTimestampMs(e.created_at);
   return {
     key: `d-${e.event_id}`,
     lane: "daemon",
     tsSort: Number.isNaN(parsedTs) ? e.event_id : parsedTs,
-    time: displayTime(e.created_at),
+    time: displayTime(typeof e.created_at === "number" && Number.isFinite(e.created_at) ? new Date(e.created_at * 1000).toISOString() : e.created_at),
     actor: e.agent_id || "—",
     op: e.event_type || "—",
     target: e.content || "—",

@@ -1220,6 +1220,31 @@ test("/api/events proxies list_events with correctly mapped params", async () =>
   }
 });
 
+test("/api/events normalizes epoch created_at to ISO strings", async () => {
+  // episodic_events.created_at is a Unix epoch float in seconds (time.time());
+  // the route must convert it so Date.parse works in the merged Audit sort.
+  const server = await startTestServer({
+    daemonRpc: async () => ({
+      events: [
+        { event_id: 7, agent_id: "codex", event_type: "recall", content: "x", created_at: 1737000000.5, thread_id: null },
+        { event_id: 8, agent_id: "codex", event_type: "recall", content: "y", created_at: "2026-07-16T12:00:00.000Z", thread_id: null },
+      ],
+      last_id: 8,
+    }),
+  });
+  try {
+    const res = await fetch(`${server.baseUrl}/api/events`, { headers: authHeaders() });
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.events[0].created_at, new Date(1737000000.5 * 1000).toISOString());
+    assert.ok(Number.isFinite(Date.parse(body.events[0].created_at)));
+    // Already-ISO strings pass through unchanged.
+    assert.equal(body.events[1].created_at, "2026-07-16T12:00:00.000Z");
+  } finally {
+    await server.close();
+  }
+});
+
 test("/api/events returns 502 when daemonRpc rejects", async () => {
   const server = await startTestServer({
     daemonRpc: async () => {

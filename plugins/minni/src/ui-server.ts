@@ -1364,6 +1364,16 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
             });
             return;
           }
+          // episodic_events.created_at is a Unix epoch float in SECONDS
+          // (Python time.time()); normalize to ISO so Date.parse works in
+          // the merged Audit sort instead of NaN-sinking the daemon lane.
+          if (rpc && typeof rpc === "object" && Array.isArray((rpc as { events?: unknown[] }).events)) {
+            for (const ev of (rpc as { events: Array<{ created_at?: unknown }> }).events) {
+              if (typeof ev?.created_at === "number" && Number.isFinite(ev.created_at)) {
+                ev.created_at = new Date(ev.created_at * 1000).toISOString();
+              }
+            }
+          }
           sendJson(res, 200, redactLocalValue(rpc));
         } catch (e) {
           sendJson(res, daemonRpcHttpStatus(e), {
