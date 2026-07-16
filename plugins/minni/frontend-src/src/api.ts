@@ -171,6 +171,86 @@ export interface AuditTailResult {
   text: string;
 }
 
+// ---- Sessions (rolling per-session receipts, cross-vault) ------------------
+
+export interface SessionReceiptData {
+  session_id: string;
+  entries: number;
+  recalls_strong: number;
+  recalls_weak: number;
+  guard_denied: number;
+  guard_allowed: number;
+  learns: number;
+  vault_writes: number;
+  candidates_drafted: number;
+}
+
+export interface SessionRow {
+  agent: string;
+  session_id: string;
+  boot_at: string | null;
+  stop_at: string | null;
+  open: boolean;
+  receipt: SessionReceiptData;
+  receipt_line: string;
+}
+
+export interface SessionsResponse {
+  sessions: SessionRow[];
+  count: number;
+  ok?: boolean;
+  error?: string;
+}
+
+export function getSessions(limit = 20, agent?: string): Promise<SessionsResponse> {
+  const params = new URLSearchParams();
+  params.set("limit", String(limit));
+  if (agent) params.set("agent", agent);
+  return jsonFetch<SessionsResponse>(`/api/sessions?${params.toString()}`).then((r) => {
+    if (r && typeof r === "object" && r.ok === false) {
+      throw new Error(r.error || "sessions unavailable");
+    }
+    return {
+      ...r,
+      sessions: Array.isArray(r.sessions) ? r.sessions : [],
+    };
+  });
+}
+
+// ---- Events (live daemon event stream, cursor-paged) -----------------------
+
+export interface EventRow {
+  event_id: number;
+  agent_id: string;
+  event_type: string;
+  content: string;
+  created_at: string | number;
+  thread_id: string | null;
+}
+
+export interface EventsResponse {
+  events: EventRow[];
+  last_id: number;
+  ok?: boolean;
+  error?: string;
+}
+
+export function getEvents(sinceId?: number, agent?: string): Promise<EventsResponse> {
+  const params = new URLSearchParams();
+  if (sinceId !== undefined) params.set("since_id", String(sinceId));
+  if (agent) params.set("agent", agent);
+  const qs = params.toString();
+  return jsonFetch<EventsResponse>(`/api/events${qs ? `?${qs}` : ""}`).then((r) => {
+    if (r && typeof r === "object" && r.ok === false) {
+      throw new Error(r.error || "events unavailable");
+    }
+    return {
+      ...r,
+      events: Array.isArray(r.events) ? r.events : [],
+    };
+  });
+}
+
 export interface HealthReport {
   ok: boolean;
   host?: string;
@@ -452,9 +532,12 @@ export function getStatus(): Promise<StatusReport> {
   return jsonFetch<StatusReport>("/api/status");
 }
 
-export function getAuditTail(limit = 20): Promise<AuditTailResult> {
+export function getAuditTail(limit = 20, agent?: string): Promise<AuditTailResult> {
   const safeLimit = Math.max(1, Math.min(100, Math.floor(limit) || 20));
-  return jsonFetch<AuditTailResult>(`/api/audit-tail?limit=${safeLimit}`);
+  const params = new URLSearchParams();
+  params.set("limit", String(safeLimit));
+  if (agent) params.set("agent", agent);
+  return jsonFetch<AuditTailResult>(`/api/audit-tail?${params.toString()}`);
 }
 
 export interface PrepareTaskRequest {

@@ -250,7 +250,8 @@ html[data-theme="phosphor"] .draft-card-quote {
 
 /* table head muted */
 html[data-theme="phosphor"] .ledger-head > *,
-html[data-theme="phosphor"] .audit-table > .head > * {
+html[data-theme="phosphor"] .audit-table > .head > *,
+html[data-theme="phosphor"] .sessions-table > .head > * {
   background: #322C22;
   color: var(--on-muted);
 }
