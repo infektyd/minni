@@ -9,6 +9,7 @@ import {
   auditReport,
   ensureVault,
   formatSessionReceiptLine,
+  listSessions,
   recordAudit,
   resolveInboxHandoffContext,
   searchVaultNotes,
@@ -654,6 +655,317 @@ test("searchVaultNotes filters superseded notes with CRLF line endings", async (
     const found = await searchVaultNotes(root, "SM_CRLF_MARKER stale belief", 5);
     assert.equal(found.length, 1);
     assert.match(found[0].relativePath, /crlf-live\.md$/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// listSessions: read-only, per-boot-cycle rollup over the rolling log.md.
+// ---------------------------------------------------------------------------
+
+test("listSessions returns completed sessions newest-first with per-window tallies", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-list-two-"));
+  try {
+    await ensureVault(root);
+    // Session 1: one strong recall + one learn, stop with 2 candidates.
+    await recordAudit(root, {
+      tool: "hook_codex_session_start",
+      summary: "boot sess-1",
+      details: { daemon_ok: true },
+    });
+    await recordAudit(root, {
+      tool: "hook_codex_user_prompt_submit",
+      summary: "s1 turn",
+      details: { recall_strong: true, session_id: "sess-1" },
+    });
+    await recordAudit(root, {
+      tool: "minni_learn",
+      summary: "s1 learn",
+      details: { ok: true },
+    });
+    await recordAudit(root, {
+      tool: "hook_codex_stop",
+      summary: "stop sess-1",
+      details: { candidates: 2 },
+    });
+    // Session 2: one weak recall, one vault write, stop with 5 candidates.
+    await recordAudit(root, {
+      tool: "hook_codex_session_start",
+      summary: "boot sess-2",
+      details: { daemon_ok: true },
+    });
+    await recordAudit(root, {
+      tool: "hook_codex_user_prompt_submit",
+      summary: "s2 turn",
+      details: { recall_strong: false, session_id: "sess-2" },
+    });
+    await recordAudit(root, {
+      tool: "vault_write",
+      summary: "s2 write",
+      details: { ok: true },
+    });
+    await recordAudit(root, {
+      tool: "hook_codex_stop",
+      summary: "stop sess-2",
+      details: { candidates: 5 },
+    });
+
+    const sessions = await listSessions(root);
+    assert.equal(sessions.length, 2);
+
+    // Newest first: sess-2 leads.
+    assert.equal(sessions[0].session_id, "sess-2");
+    assert.equal(sessions[0].open, false);
+    assert.ok(sessions[0].boot_at, "boot_at is the marker ISO timestamp");
+    assert.ok(sessions[0].stop_at, "stop_at is the marker ISO timestamp");
+    assert.equal(sessions[0].receipt.recalls_weak, 1);
+    assert.equal(sessions[0].receipt.recalls_strong, 0);
+    assert.equal(sessions[0].receipt.vault_writes, 1);
+    assert.equal(sessions[0].receipt.candidates_drafted, 5);
+    assert.equal(sessions[0].receipt.session_id, "sess-2");
+    assert.equal(
+      sessions[0].receipt_line,
+      formatSessionReceiptLine(sessions[0].receipt),
+    );
+
+    assert.equal(sessions[1].session_id, "sess-1");
+    assert.equal(sessions[1].open, false);
+    assert.equal(sessions[1].receipt.recalls_strong, 1);
+    assert.equal(sessions[1].receipt.learns, 1);
+    assert.equal(sessions[1].receipt.candidates_drafted, 2);
+    // Cross-window isolation: sess-1 must not absorb sess-2 activity.
+    assert.equal(sessions[1].receipt.vault_writes, 0);
+    assert.equal(sessions[1].receipt.recalls_weak, 0);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("listSessions marks an unstopped session open with a null stop_at", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-list-open-"));
+  try {
+    await ensureVault(root);
+    await recordAudit(root, {
+      tool: "hook_codex_session_start",
+      summary: "boot sess-live",
+      details: { daemon_ok: true },
+    });
+    await recordAudit(root, {
+      tool: "hook_codex_user_prompt_submit",
+      summary: "live turn",
+      details: { recall_strong: true, session_id: "sess-live" },
+    });
+    await recordAudit(root, {
+      tool: "minni_learn",
+      summary: "live learn",
+      details: { ok: true },
+    });
+
+    const sessions = await listSessions(root);
+    assert.equal(sessions.length, 1);
+    assert.equal(sessions[0].session_id, "sess-live");
+    assert.equal(sessions[0].open, true);
+    assert.equal(sessions[0].stop_at, null);
+    assert.ok(sessions[0].boot_at);
+    // Activity up to the tail end is counted.
+    assert.equal(sessions[0].receipt.recalls_strong, 1);
+    assert.equal(sessions[0].receipt.learns, 1);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("listSessions closes an orphaned window at the next boot, excluding its successor", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-list-orphan-"));
+  try {
+    await ensureVault(root);
+    // Session A boots, learns, then dies without a stop marker.
+    await recordAudit(root, {
+      tool: "hook_codex_session_start",
+      summary: "boot sess-A",
+      details: { daemon_ok: true },
+    });
+    await recordAudit(root, {
+      tool: "minni_learn",
+      summary: "A learn",
+      details: { ok: true },
+    });
+    // Session B boots (closes A's window) and does its own work + stop.
+    await recordAudit(root, {
+      tool: "hook_codex_session_start",
+      summary: "boot sess-B",
+      details: { daemon_ok: true },
+    });
+    await recordAudit(root, {
+      tool: "hook_codex_user_prompt_submit",
+      summary: "B turn",
+      details: { recall_strong: true, session_id: "sess-B" },
+    });
+    await recordAudit(root, {
+      tool: "hook_codex_stop",
+      summary: "stop sess-B",
+      details: { candidates: 1 },
+    });
+
+    const sessions = await listSessions(root);
+    assert.equal(sessions.length, 2);
+    // Newest first: B leads.
+    const byId = Object.fromEntries(sessions.map((s) => [s.session_id, s]));
+    assert.equal(byId["sess-A"].receipt.learns, 1, "A keeps its own learn");
+    assert.equal(
+      byId["sess-A"].receipt.recalls_strong,
+      0,
+      "A's orphaned window must exclude B's recall",
+    );
+    assert.equal(byId["sess-A"].open, true, "A never stopped, so it is open");
+    assert.equal(byId["sess-A"].stop_at, null);
+    assert.equal(byId["sess-B"].receipt.recalls_strong, 1);
+    assert.equal(byId["sess-B"].open, false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("listSessions yields one row per boot cycle for a reused session id", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-list-reuse-"));
+  try {
+    await ensureVault(root);
+    // Cycle 1: 3 candidates staged at stop.
+    await recordAudit(root, {
+      tool: "hook_codex_session_start",
+      summary: "boot sess-R",
+      details: { daemon_ok: true },
+    });
+    await recordAudit(root, {
+      tool: "hook_codex_user_prompt_submit",
+      summary: "cycle 1 turn",
+      details: { recall_strong: true, session_id: "sess-R" },
+    });
+    await recordAudit(root, {
+      tool: "hook_codex_stop",
+      summary: "stop sess-R",
+      details: { candidates: 3 },
+    });
+    // Cycle 2: same id, different work, still open.
+    await recordAudit(root, {
+      tool: "hook_codex_session_start",
+      summary: "boot sess-R",
+      details: { daemon_ok: true },
+    });
+    await recordAudit(root, {
+      tool: "minni_learn",
+      summary: "cycle 2 learn",
+      details: { ok: true },
+    });
+
+    const sessions = await listSessions(root);
+    assert.equal(sessions.length, 2, "two boot cycles yield two rows");
+    assert.equal(sessions[0].session_id, "sess-R");
+    assert.equal(sessions[1].session_id, "sess-R");
+    // Newest first: cycle 2 (open, one learn, no candidates).
+    assert.equal(sessions[0].open, true);
+    assert.equal(sessions[0].receipt.learns, 1);
+    assert.equal(sessions[0].receipt.candidates_drafted, 0);
+    assert.equal(sessions[0].receipt.recalls_strong, 0);
+    // Cycle 1 (completed, one recall, 3 candidates).
+    assert.equal(sessions[1].open, false);
+    assert.equal(sessions[1].receipt.learns, 0);
+    assert.equal(sessions[1].receipt.candidates_drafted, 3);
+    assert.equal(sessions[1].receipt.recalls_strong, 1);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("listSessions is read-only: a nonexistent vault yields [] and creates nothing", async () => {
+  const parent = await mkdtemp(path.join(tmpdir(), "sm-list-readonly-"));
+  const missing = path.join(parent, "no-such-vault");
+  try {
+    const sessions = await listSessions(missing);
+    assert.deepEqual(sessions, []);
+    // Nothing was created — the path must still not exist.
+    const { stat } = await import("node:fs/promises");
+    await assert.rejects(stat(missing), "listSessions must not create the vault");
+  } finally {
+    await rm(parent, { recursive: true, force: true });
+  }
+});
+
+test("listSessions tallies agree with sessionReceipt for the same completed session", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-list-agree-"));
+  try {
+    await ensureVault(root);
+    await recordAudit(root, {
+      tool: "hook_codex_session_start",
+      summary: "boot sess-X",
+      details: { daemon_ok: true },
+    });
+    await recordAudit(root, {
+      tool: "hook_codex_user_prompt_submit",
+      summary: "x turn",
+      details: { recall_strong: true, session_id: "sess-X" },
+    });
+    await recordAudit(root, {
+      tool: "hook_codex_pretooluse_guard",
+      summary: "recall guard denied Edit (mode=strict)",
+      details: { consumed: true, session_id: "sess-X" },
+    });
+    await recordAudit(root, {
+      tool: "minni_learn",
+      summary: "x learn",
+      details: { ok: true },
+    });
+    await recordAudit(root, {
+      tool: "hook_codex_stop",
+      summary: "stop sess-X",
+      details: { candidates: 4 },
+    });
+
+    const direct = await sessionReceipt(root, "sess-X");
+    const sessions = await listSessions(root);
+    assert.equal(sessions.length, 1);
+    assert.deepEqual(sessions[0].receipt, direct);
+    assert.equal(sessions[0].receipt_line, formatSessionReceiptLine(direct));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("listSessions caps rows at limit and honors the parseLimit horizon", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-list-limit-"));
+  try {
+    await ensureVault(root);
+    // Three complete sessions, three entries each (boot, turn, stop) = 9 rows.
+    for (const n of [1, 2, 3]) {
+      await recordAudit(root, {
+        tool: "hook_codex_session_start",
+        summary: `boot sess-${n}`,
+        details: { daemon_ok: true },
+      });
+      await recordAudit(root, {
+        tool: "hook_codex_user_prompt_submit",
+        summary: `turn ${n}`,
+        details: { recall_strong: true, session_id: `sess-${n}` },
+      });
+      await recordAudit(root, {
+        tool: "hook_codex_stop",
+        summary: `stop sess-${n}`,
+        details: { candidates: n },
+      });
+    }
+
+    // limit caps the newest N rows.
+    const capped = await listSessions(root, 2);
+    assert.equal(capped.length, 2);
+    assert.equal(capped[0].session_id, "sess-3");
+    assert.equal(capped[1].session_id, "sess-2");
+
+    // parseLimit slices the entry tail: the last 3 entries are sess-3's cycle
+    // only, so only its boot marker survives the horizon.
+    const horizoned = await listSessions(root, 10, 3);
+    assert.equal(horizoned.length, 1);
+    assert.equal(horizoned[0].session_id, "sess-3");
   } finally {
     await rm(root, { recursive: true, force: true });
   }

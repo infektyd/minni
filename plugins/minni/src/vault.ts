@@ -965,62 +965,40 @@ export interface SessionReceipt {
   candidates_drafted: number;
 }
 
-export async function sessionReceipt(
-  vaultPath: string,
-  sessionId: string,
-  limit = 500,
-  options: { includeStamped?: boolean } = {},
-): Promise<SessionReceipt> {
-  // Read the ROLLING log, not the daily file auditTail prefers: a session
-  // that crosses midnight has its boot marker in yesterday's daily file, but
-  // log.md carries both days (up to the 5 MB rotation, the receipt's honest
-  // horizon).
-  await ensureVault(vaultPath);
-  let text = "";
-  try {
-    text = await readFile(path.join(vaultPath, "log.md"), "utf8");
-  } catch {
-    // fall through to an empty tail — the receipt reports zeros.
-  }
-  const tail = {
-    entries: text
-      .split(/^## /m)
-      .filter((entry) => entry.trim().length > 0 && !entry.startsWith("#"))
-      .map((entry) => `## ${entry.trim()}`)
-      .slice(-limit),
-  };
-  const receipt: SessionReceipt = {
-    session_id: sessionId,
-    entries: 0,
-    recalls_strong: 0,
-    recalls_weak: 0,
-    guard_denied: 0,
-    guard_allowed: 0,
-    learns: 0,
-    vault_writes: 0,
-    candidates_drafted: 0,
-  };
+/**
+ * One parsed rolling-log entry: the `## [<ISO>] <tool> | <summary>` header plus
+ * an optional ```json details block. `timestamp` is the header's ISO stamp
+ * (null only when a hand-written entry omits it) — used to date session
+ * boot/stop markers.
+ */
+interface ParsedAuditEntry {
+  tool: string;
+  summary: string;
+  details: Record<string, unknown> | undefined;
+  timestamp: string | null;
+}
 
-  // Boot/stop/pre-compact summaries are the only self-identifying markers that
-  // predate session_id-stamped details, so use them to (a) attribute pre-stamp
-  // entries and (b) define a boot→stop window that catches everything in
-  // between. The window opens at the LAST `boot <sessionId>` (a resumed session
-  // reboots) and closes at the next `stop <sessionId>` (or the tail end).
-  const bootSummary = `boot ${sessionId}`;
-  const stopSummary = `stop ${sessionId}`;
-  const preCompactSummary = `pre-compact ${sessionId}`;
+/**
+ * Split raw log.md markdown into individual `## ...` entry blocks. Shared by
+ * every rolling-log reader so the split rule (drop the leading `#` title, keep
+ * `## ` entries) lives in one place.
+ */
+function splitAuditEntries(text: string): string[] {
+  return text
+    .split(/^## /m)
+    .filter((entry) => entry.trim().length > 0 && !entry.startsWith("#"))
+    .map((entry) => `## ${entry.trim()}`);
+}
 
-  interface ParsedEntry {
-    tool: string;
-    summary: string;
-    details: Record<string, unknown> | undefined;
-  }
-  const parsed: ParsedEntry[] = [];
-  for (const entry of tail.entries) {
-    const header = entry.match(/^## \[[^\]]+\]\s+([^|]+)\|\s+(.+)$/m);
+/** Parse entry headers + optional json details into structured records. */
+function parseAuditEntries(entries: string[]): ParsedAuditEntry[] {
+  const parsed: ParsedAuditEntry[] = [];
+  for (const entry of entries) {
+    const header = entry.match(/^## \[([^\]]+)\]\s+([^|]+)\|\s+(.+)$/m);
     if (!header) continue;
-    const tool = header[1].trim();
-    const summary = header[2].trim();
+    const timestamp = header[1].trim();
+    const tool = header[2].trim();
+    const summary = header[3].trim();
     let details: Record<string, unknown> | undefined;
     const detailMatch = entry.match(/```json\n([\s\S]*?)\n```/);
     if (detailMatch) {
@@ -1034,49 +1012,68 @@ export async function sessionReceipt(
         // no attributable details — it still counts via the boot→stop window.
       }
     }
-    parsed.push({ tool, summary, details });
+    parsed.push({ tool, summary, details, timestamp: timestamp || null });
   }
+  return parsed;
+}
 
-  // Attribution model (one rule, not three): the LAST boot marker opens the
-  // window — the session's current cycle. Prefer the exact `boot <sessionId>`;
-  // on the synthetic fallback (includeStamped) the last boot of ANY id opens
-  // it, because SessionStart may have stamped the real id that Stop's payload
-  // later omitted. Inside the window, stamps act as a filter (own id, the
-  // window's boot id, or anything when includeStamped). Nothing outside the
-  // window ever counts — an earlier cycle reusing the same session id must
-  // not inflate this one. Only when NO window exists at all does attribution
-  // fall back to exact stamps.
-  let windowStart = -1;
-  let anyBootStart = -1;
-  for (let i = 0; i < parsed.length; i += 1) {
-    if (parsed[i].summary === bootSummary) windowStart = i;
-    if (parsed[i].summary.startsWith("boot ")) anyBootStart = i;
-  }
-  let windowSessionId = sessionId;
-  if (windowStart === -1 && options.includeStamped && anyBootStart >= 0) {
-    windowStart = anyBootStart;
-    windowSessionId =
-      parsed[anyBootStart].summary.slice("boot ".length).trim() || sessionId;
-  }
-  const windowStopSummary = `stop ${windowSessionId}`;
-  // The window closes INCLUSIVE of our own stop row (its candidates tally
-  // belongs to this session) — or EXCLUSIVE at any other session's boot/stop
-  // marker: a session that died without a `stop <id>` row must not absorb
-  // its successors' activity.
-  let windowEnd = parsed.length;
-  if (windowStart >= 0) {
-    for (let i = windowStart + 1; i < parsed.length; i += 1) {
-      const summary = parsed[i].summary;
-      if (summary === stopSummary || summary === windowStopSummary) {
-        windowEnd = i + 1;
-        break;
-      }
-      if (summary.startsWith("boot ") || summary.startsWith("stop ")) {
-        windowEnd = i;
-        break;
-      }
+/**
+ * Close a boot→stop attribution window opened at `windowStart`. The window ends
+ * INCLUSIVE of the first row whose summary is one of `ownStopSummaries` (our own
+ * `stop <id>` — its candidates tally belongs to this session), or EXCLUSIVE at
+ * any OTHER session's boot/stop marker (a session that died without a stop row
+ * must not absorb its successors). `stopIndex` is the own-stop row index, or -1
+ * when the window ran to the tail end (or was cut short by a foreign marker) —
+ * i.e. an open, never-stopped session.
+ */
+function closeWindow(
+  parsed: ParsedAuditEntry[],
+  windowStart: number,
+  ownStopSummaries: string[],
+): { end: number; stopIndex: number } {
+  let end = parsed.length;
+  let stopIndex = -1;
+  for (let i = windowStart + 1; i < parsed.length; i += 1) {
+    const summary = parsed[i].summary;
+    if (ownStopSummaries.includes(summary)) {
+      end = i + 1;
+      stopIndex = i;
+      break;
+    }
+    if (summary.startsWith("boot ") || summary.startsWith("stop ")) {
+      end = i;
+      break;
     }
   }
+  return { end, stopIndex };
+}
+
+/**
+ * Tally a SessionReceipt over `parsed` entries. When a window exists
+ * (`windowStart >= 0`) only rows in `[windowStart, windowEnd)` count, and a row
+ * stamped for a DIFFERENT session_id is skipped unless `includeStamped` (the
+ * synthetic Stop fallback) relaxes it. With no window, attribution falls back to
+ * exact stamps (only rows stamped with `sessionId`).
+ */
+function tallyWindow(
+  parsed: ParsedAuditEntry[],
+  sessionId: string,
+  windowStart: number,
+  windowEnd: number,
+  windowSessionId: string,
+  includeStamped: boolean,
+): SessionReceipt {
+  const receipt: SessionReceipt = {
+    session_id: sessionId,
+    entries: 0,
+    recalls_strong: 0,
+    recalls_weak: 0,
+    guard_denied: 0,
+    guard_allowed: 0,
+    learns: 0,
+    vault_writes: 0,
+    candidates_drafted: 0,
+  };
 
   parsed.forEach((item, index) => {
     const stampedSession =
@@ -1089,7 +1086,7 @@ export async function sessionReceipt(
         stampedSession !== undefined &&
         stampedSession !== sessionId &&
         stampedSession !== windowSessionId &&
-        !options.includeStamped
+        !includeStamped
       ) return;
     } else if (stampedSession !== sessionId) {
       return;
@@ -1126,6 +1123,69 @@ export async function sessionReceipt(
   return receipt;
 }
 
+export async function sessionReceipt(
+  vaultPath: string,
+  sessionId: string,
+  limit = 500,
+  options: { includeStamped?: boolean } = {},
+): Promise<SessionReceipt> {
+  // Read the ROLLING log, not the daily file auditTail prefers: a session
+  // that crosses midnight has its boot marker in yesterday's daily file, but
+  // log.md carries both days (up to the 5 MB rotation, the receipt's honest
+  // horizon).
+  await ensureVault(vaultPath);
+  let text = "";
+  try {
+    text = await readFile(path.join(vaultPath, "log.md"), "utf8");
+  } catch {
+    // fall through to an empty tail — the receipt reports zeros.
+  }
+  const parsed = parseAuditEntries(splitAuditEntries(text).slice(-limit));
+
+  // Boot/stop summaries are the only self-identifying markers that predate
+  // session_id-stamped details, so use them to (a) attribute pre-stamp entries
+  // and (b) define a boot→stop window that catches everything in between. The
+  // window opens at the LAST `boot <sessionId>` (a resumed session reboots) and
+  // closes at the next `stop <sessionId>` (or the tail end).
+  //
+  // Attribution model (one rule, not three): the LAST boot marker opens the
+  // window — the session's current cycle. Prefer the exact `boot <sessionId>`;
+  // on the synthetic fallback (includeStamped) the last boot of ANY id opens
+  // it, because SessionStart may have stamped the real id that Stop's payload
+  // later omitted. Nothing outside the window ever counts — an earlier cycle
+  // reusing the same session id must not inflate this one. Only when NO window
+  // exists at all does attribution fall back to exact stamps.
+  const bootSummary = `boot ${sessionId}`;
+  let windowStart = -1;
+  let anyBootStart = -1;
+  for (let i = 0; i < parsed.length; i += 1) {
+    if (parsed[i].summary === bootSummary) windowStart = i;
+    if (parsed[i].summary.startsWith("boot ")) anyBootStart = i;
+  }
+  let windowSessionId = sessionId;
+  if (windowStart === -1 && options.includeStamped && anyBootStart >= 0) {
+    windowStart = anyBootStart;
+    windowSessionId =
+      parsed[anyBootStart].summary.slice("boot ".length).trim() || sessionId;
+  }
+  let windowEnd = parsed.length;
+  if (windowStart >= 0) {
+    windowEnd = closeWindow(parsed, windowStart, [
+      `stop ${sessionId}`,
+      `stop ${windowSessionId}`,
+    ]).end;
+  }
+
+  return tallyWindow(
+    parsed,
+    sessionId,
+    windowStart,
+    windowEnd,
+    windowSessionId,
+    options.includeStamped === true,
+  );
+}
+
 /**
  * Compact one-line proof-of-use string for the Stop systemMessage. Always names
  * the recall/guard/learn counts even when zero — a clean receipt (no recalls,
@@ -1142,6 +1202,74 @@ export function formatSessionReceiptLine(receipt: SessionReceipt): string {
     `${receipt.candidates_drafted} candidate${receipt.candidates_drafted === 1 ? "" : "s"} staged`,
   ];
   return `Minni session receipt: ${parts.join(", ")}.`;
+}
+
+/**
+ * One row per boot cycle in the rolling log: the session id, its boot/stop
+ * ISO timestamps (stop null when the session never stopped), whether it is
+ * still open, and the SessionReceipt tally sessionReceipt would produce for
+ * that window plus its formatted one-line proof.
+ */
+export interface SessionSummary {
+  session_id: string;
+  boot_at: string | null;
+  stop_at: string | null;
+  open: boolean;
+  receipt: SessionReceipt;
+  receipt_line: string;
+}
+
+/**
+ * Enumerate recent session boot cycles from the rolling log.md. Strictly
+ * read-only: never calls ensureVault, never creates files — a missing log.md
+ * yields []. Every `boot <id>` marker opens a window closed by the same rules
+ * sessionReceipt uses (own `stop <id>` inclusive; any other session's boot/stop
+ * exclusive; tail end → open). A reused session id booted twice yields two rows.
+ * Newest-first (latest boot leads), capped at `limit`.
+ */
+export async function listSessions(
+  vaultPath: string,
+  limit = 10,
+  parseLimit = 500,
+): Promise<SessionSummary[]> {
+  let text = "";
+  try {
+    text = await readFile(path.join(vaultPath, "log.md"), "utf8");
+  } catch {
+    // Missing (or unreadable) rolling log: no sessions to report, and we never
+    // create it — listSessions is a pure reader.
+    return [];
+  }
+  const parsed = parseAuditEntries(splitAuditEntries(text).slice(-parseLimit));
+
+  const summaries: SessionSummary[] = [];
+  for (let i = 0; i < parsed.length; i += 1) {
+    if (!parsed[i].summary.startsWith("boot ")) continue;
+    const windowSessionId = parsed[i].summary.slice("boot ".length).trim();
+    if (!windowSessionId) continue;
+    // Each window knows its id from its boot marker, so the stamp filter counts
+    // that id (or unstamped rows) and drops other ids — no includeStamped
+    // relaxation here.
+    const { end, stopIndex } = closeWindow(parsed, i, [`stop ${windowSessionId}`]);
+    const receipt = tallyWindow(
+      parsed,
+      windowSessionId,
+      i,
+      end,
+      windowSessionId,
+      false,
+    );
+    summaries.push({
+      session_id: windowSessionId,
+      boot_at: parsed[i].timestamp,
+      stop_at: stopIndex >= 0 ? parsed[stopIndex].timestamp : null,
+      open: stopIndex === -1,
+      receipt,
+      receipt_line: formatSessionReceiptLine(receipt),
+    });
+  }
+
+  return summaries.reverse().slice(0, limit);
 }
 
 export async function searchVaultNotes(
