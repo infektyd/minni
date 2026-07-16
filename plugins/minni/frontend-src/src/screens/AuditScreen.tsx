@@ -188,14 +188,30 @@ export function AuditScreen() {
   // Per-lane in-flight locks. The generation guards only protect against scope
   // CHANGES; these prevent overlapping SAME-scope loads (a slow older response
   // overwriting fresher rows, or two daemon drains reading the same cursor
-  // before either advances). A tick skips a lane whose previous load hasn't
-  // finished — at the 5s cadence this naturally backs off under slow responses.
-  // The finally blocks always release the lock.
+  // before either advances). A load that lands while its lane is busy is
+  // skipped and sets the lane's pending flag; the finally block then re-runs
+  // that lane immediately against the CURRENT scope/generation (read fresh from
+  // the refs below), so a scope change mid-poll is picked up as soon as the
+  // in-flight request finishes instead of waiting for the next 5s tick.
   const vaultBusyRef = useRef(false);
   const daemonBusyRef = useRef(false);
+  const vaultPendingRef = useRef(false);
+  const daemonPendingRef = useRef(false);
+  // Live mirrors of the current scope so a pending re-run reads the newest
+  // filter/limit rather than the stale values captured in the skipped call's
+  // closure.
+  const limitRef = useRef(limit);
+  limitRef.current = limit;
+  const agentFilterRef = useRef(agentFilter);
+  agentFilterRef.current = agentFilter;
 
   const loadVault = async (n: number, agent: string, gen: number) => {
-    if (vaultBusyRef.current) return; // previous vault load still running
+    if (vaultBusyRef.current) {
+      // Previous vault load still running — remember to re-run with the latest
+      // scope the moment it finishes.
+      vaultPendingRef.current = true;
+      return;
+    }
     vaultBusyRef.current = true;
     setLoading(true);
     try {
@@ -222,11 +238,22 @@ export function AuditScreen() {
     } finally {
       vaultBusyRef.current = false;
       if (vaultGenRef.current === gen) setLoading(false);
+      if (vaultPendingRef.current) {
+        // A scope change (or tick) arrived while busy — re-run now against the
+        // current scope/generation read fresh from the refs.
+        vaultPendingRef.current = false;
+        void loadVault(limitRef.current, agentFilterRef.current.trim(), vaultGenRef.current);
+      }
     }
   };
 
   const loadDaemon = async (agent: string, gen: number) => {
-    if (daemonBusyRef.current) return; // previous daemon drain still running
+    if (daemonBusyRef.current) {
+      // Previous daemon drain still running — re-run against the latest scope
+      // once it finishes.
+      daemonPendingRef.current = true;
+      return;
+    }
     daemonBusyRef.current = true;
     try {
       // Drain the backlog: page through DAEMON_PAGE rows at a time while a page
@@ -271,6 +298,12 @@ export function AuditScreen() {
       }
     } finally {
       daemonBusyRef.current = false;
+      if (daemonPendingRef.current) {
+        // Daemon scope is agentFilter only; re-run with the current filter and
+        // generation (the effect already reset the cursor/events on a change).
+        daemonPendingRef.current = false;
+        void loadDaemon(agentFilterRef.current.trim(), daemonGenRef.current);
+      }
     }
   };
 

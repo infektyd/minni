@@ -31,6 +31,10 @@ export function SessionsScreen({
         onAuthRequired?.();
       }
       setError(err instanceof Error ? err.message : String(err));
+      // Drop the previous scope's rows: the error banner replaces the table, so
+      // another agent's receipts must not linger beside it after a filter/auth
+      // change failed.
+      setSessions([]);
     } finally {
       setLoading(false);
     }
