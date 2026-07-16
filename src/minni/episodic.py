@@ -48,6 +48,7 @@ class EpisodicMemory:
         thread_id: Optional[str] = None,
         metadata: Optional[Dict] = None,
         raw_blob: Optional[bytes] = None,
+        bind_thread: bool = True,
     ) -> int:
         """
         Log an episodic event.
@@ -84,8 +85,11 @@ class EpisodicMemory:
             ))
             event_id = c.lastrowid
 
-        # Auto-bind thread to docs if thread_id is provided
-        if thread_id and content:
+        # Auto-bind thread to docs if thread_id is provided. bind_thread=False
+        # is for observability writes (e.g. the recall trace): they carry a
+        # thread_id as a join key but must stay inert — no thread_doc_links
+        # mutation, no semantic search on the hot path.
+        if bind_thread and thread_id and content:
             self._semantic_thread_bind(thread_id, content)
 
         return event_id
@@ -293,6 +297,26 @@ class EpisodicMemory:
         return thread_info
 
     # ── Cleanup ────────────────────────────────────────────────
+
+    def trim_recall_traces(self, max_age_seconds: int = 604800) -> int:
+        """Reap expired recall-trace rows (event_type='recall') only. The
+        trace path calls this on write so its own footprint honors the
+        advertised TTL without depending on a global cleanup pass (which
+        nothing schedules today); other event types are untouched."""
+        cutoff = time.time() - max_age_seconds
+        with self.db.cursor() as c:
+            c.execute("""
+                DELETE FROM episodic_fts
+                WHERE event_id IN (
+                    SELECT event_id FROM episodic_events
+                    WHERE event_type = 'recall' AND created_at < ?
+                )
+            """, (cutoff,))
+            c.execute(
+                "DELETE FROM episodic_events"
+                " WHERE event_type = 'recall' AND created_at < ?",
+                (cutoff,))
+            return c.rowcount
 
     def cleanup_expired(self, max_age_seconds: int = 604800) -> int:
         """Remove episodic events older than max_age (default 7 days)."""

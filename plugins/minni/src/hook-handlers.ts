@@ -71,6 +71,8 @@ import {
   recordAudit,
   resolveInboxHandoffContext,
   searchVaultNotes,
+  sessionReceipt,
+  formatSessionReceiptLine,
   settleReassertedInboxEntries,
   writeInbox,
 } from "./vault.js";
@@ -167,7 +169,13 @@ export function createHookHandlers(
   const prepareOutcomeFn = deps.prepareOutcome ?? prepareOutcome;
 
   async function handleSessionStart(payload: Record<string, unknown>): Promise<HookOutput> {
-    const sessionId = asString(payload.session_id) || asString(payload.sessionId) || "session";
+    // rawSessionId is the payload's own id, possibly empty — never the
+    // "session" synthetic fallback. It is what gets threaded into the daemon
+    // recall-trace (recallMemory's sessionId) so unlabeled runtimes never
+    // conflate into one synthetic thread_id. sessionId keeps the historical
+    // defaulted value for envelope identity / inbox filenames / markers.
+    const rawSessionId = asString(payload.session_id) || asString(payload.sessionId);
+    const sessionId = rawSessionId || "session";
     const workspaceId = workspaceFor(payload);
     await ensureVault(config.vaultPath);
 
@@ -192,6 +200,7 @@ export function createHookHandlers(
         limit: 8,
         agentId: config.agentId,
         workspaceId,
+        ...(rawSessionId ? { sessionId: rawSessionId } : {}),
       }),
       // hooks-PL-1/PL-2: corrections to beliefs this agent read must
       // re-surface at boot (stale_beliefs), on every platform.
@@ -354,6 +363,11 @@ export function createHookHandlers(
     }
 
     const workspaceId = workspaceFor(payload);
+    // rawSessionId (possibly empty) is the audit/recall-trace correlation id;
+    // sessionId keeps the "session" fallback for envelope identity only — see
+    // handleSessionStart's comment for why the two must not be conflated.
+    const rawSessionId = asString(payload.session_id) || asString(payload.sessionId);
+    const sessionId = rawSessionId || "session";
     const signature = hashTaskSignature(prompt);
 
     const intent = routeMemoryIntent(prompt);
@@ -377,6 +391,7 @@ export function createHookHandlers(
         limit: 6,
         agentId: config.agentId,
         workspaceId,
+        ...(rawSessionId ? { sessionId: rawSessionId } : {}),
       }),
     ]);
     // s5 strength gate: emit the light pointer + recall-state file ONLY when the
@@ -427,6 +442,9 @@ export function createHookHandlers(
           task_signature: signature,
           workspace: workspaceId,
           recall_strong: false,
+          // RAW id only — omit rather than stamp the synthetic "session"
+          // fallback, so unlabeled turns don't conflate into one audit thread.
+          ...(rawSessionId ? { session_id: rawSessionId } : {}),
         },
       });
       return { continue: true };
@@ -470,6 +488,8 @@ export function createHookHandlers(
         task_signature: signature,
         workspace: workspaceId,
         recall_strong: Boolean(strong),
+        // RAW id only — see the weak-path comment above.
+        ...(rawSessionId ? { session_id: rawSessionId } : {}),
       },
     });
 
@@ -504,6 +524,10 @@ export function createHookHandlers(
     // again). On a persistence failure we FAIL OPEN and allow, trading a missed
     // nudge for availability.
     const consumed = await markRecallConsumed(config.vaultPath).catch(() => false);
+    // The PreToolUse payload may carry a session_id; stamp it so the Stop
+    // receipt can attribute this guard nudge. Only add it when actually present
+    // — never invent a "session" placeholder on this path.
+    const guardSessionId = asString(payload.session_id) || asString(payload.sessionId);
     await recordAudit(config.vaultPath, {
       tool: `${config.auditPrefix}_pretooluse_guard`,
       summary: `recall guard ${consumed ? "denied" : "allowed (consume write failed)"} ${toolName} (mode=${mode})`,
@@ -514,6 +538,7 @@ export function createHookHandlers(
         top_score: state!.top_score,
         hits: state!.top_hits.length,
         task_signature: state!.task_signature,
+        ...(guardSessionId ? { session_id: guardSessionId } : {}),
       },
     }).catch(() => {});
     if (!consumed) return preToolUseAllow();
@@ -599,7 +624,17 @@ export function createHookHandlers(
 
   async function handleStop(payload: Record<string, unknown>): Promise<HookOutput> {
     await ensureVault(config.vaultPath);
-    const sessionId = asString(payload.session_id) || asString(payload.sessionId) || "session";
+    // Stop keeps the defaulted "session" fallback (inbox filename, marker
+    // text, sessionReceipt) unchanged: unlike recall/audit correlation, a
+    // runtime that never labeled any turn with a real session_id still gets a
+    // best-effort receipt merged onto the synthetic "session" bucket rather
+    // than no receipt at all.
+    const rawSessionId = asString(payload.session_id) || asString(payload.sessionId);
+    const sessionId = rawSessionId || "session";
+    // On the synthetic fallback, turns that DID stamp a real session_id must
+    // still count inside this window — otherwise the receipt reports zeros
+    // despite real activity.
+    const receiptOptions = { includeStamped: !rawSessionId };
     const workspaceId = workspaceFor(payload);
     const lastTask = asString(payload.last_user_message) || asString(payload.summary) || sessionId;
     const tail = await auditTail(config.vaultPath, 30);
@@ -611,11 +646,29 @@ export function createHookHandlers(
     });
 
     const candidates = outcome.outcomeDraft.learnCandidates;
-    // Nothing worth persisting: skip the inbox write and audit entry so we
-    // don't litter the inbox with empty files or pad the audit log with noise
-    // (unless this agent's config keeps the historical always-write behavior).
+    // Nothing worth persisting: skip the inbox write so we don't litter the
+    // inbox with empty files (unless this agent's config keeps the historical
+    // always-write behavior).
     if (!config.alwaysWriteStopInbox && candidates.length === 0) {
-      return { continue: true };
+      // Still surface the receipt (proof of no memory work is information)
+      // AND still record the stop MARKER: it closes the sessionReceipt
+      // boot->stop window, so a later session's activity can never be
+      // tallied into this one.
+      const receipt = await sessionReceipt(
+        config.vaultPath, sessionId, 500, receiptOptions).catch(() => undefined);
+      await recordAudit(config.vaultPath, {
+        tool: `${config.auditPrefix}_stop`,
+        summary: `stop ${sessionId}`,
+        details: {
+          candidates: 0,
+          workspace: workspaceId,
+          ...(receipt ? { receipt } : {}),
+        },
+      }).catch(() => {});
+      return {
+        continue: true,
+        ...(receipt ? { systemMessage: formatSessionReceiptLine(receipt) } : {}),
+      };
     }
 
     const inbox = await writeInbox(config.vaultPath, sessionId, {
@@ -629,6 +682,11 @@ export function createHookHandlers(
       last_task: lastTask.slice(0, 200),
     });
 
+    // Tally the session BEFORE writing the stop entry so the receipt embeds in
+    // its own audit details (candidates_drafted then reflects prior stops, not
+    // this one — the candidate sentence below reports the current draft count).
+    const receipt = await sessionReceipt(
+      config.vaultPath, sessionId, 500, receiptOptions).catch(() => undefined);
     await recordAudit(config.vaultPath, {
       tool: `${config.auditPrefix}_stop`,
       summary: `stop ${sessionId}`,
@@ -636,11 +694,23 @@ export function createHookHandlers(
         candidates: candidates.length,
         workspace: workspaceId,
         inbox_path: inbox.filePath,
+        ...(receipt ? { receipt } : {}),
       },
     });
 
+    // The displayed line merges THIS stop's drafts (the tally above predates
+    // the stop row), so the receipt can never contradict the candidate
+    // sentence beside it.
+    const displayReceipt = receipt
+      ? { ...receipt, candidates_drafted: receipt.candidates_drafted + candidates.length }
+      : undefined;
+    const receiptLine = displayReceipt ? ` ${formatSessionReceiptLine(displayReceipt)}` : "";
+
     if (candidates.length === 0) {
-      return { continue: true };
+      return {
+        continue: true,
+        ...(displayReceipt ? { systemMessage: formatSessionReceiptLine(displayReceipt) } : {}),
+      };
     }
 
     return {
@@ -649,7 +719,7 @@ export function createHookHandlers(
         candidates.length === 1 ? "" : "s"
       } drafted to inbox (${inbox.filePath}). ${
         config.stopCommitHint ?? "Use minni_prepare_outcome/minni_learn to review and commit."
-      }`,
+      }${receiptLine}`,
     };
   }
 

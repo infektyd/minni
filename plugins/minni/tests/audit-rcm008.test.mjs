@@ -27,23 +27,34 @@ test("RCM-008: hook rate-limiting drops duplicate hook audit entries without fai
       timestamp: now,
     });
 
+    // Contract update (receipt-integrity review): the throttle is keyed per
+    // agent AND tool. A DIFFERENT hook stage seconds later (one turn's
+    // lifecycle) must land — dropping it made receipts undercount guards —
+    // while a repeat of the SAME tool inside the window still drops.
     await recordAudit(root, {
       tool: "hook_user_prompt_submit",
-      summary: "Second audit too fast",
+      summary: "Different stage lands",
       timestamp: new Date(now.getTime() + 2000),
     });
 
+    await recordAudit(root, {
+      tool: "hook_user_prompt_submit",
+      summary: "Same tool too fast",
+      timestamp: new Date(now.getTime() + 3000),
+    });
+
     const okPath = await recordAudit(root, {
-      tool: "hook_pre_compact",
-      summary: "Third audit ok",
-      timestamp: new Date(now.getTime() + 5000),
+      tool: "hook_user_prompt_submit",
+      summary: "Same tool after window ok",
+      timestamp: new Date(now.getTime() + 8000),
     });
     assert.ok(okPath);
 
     const log = await readFile(path.join(root, "log.md"), "utf8");
     assert.match(log, /First audit/);
-    assert.doesNotMatch(log, /Second audit too fast/);
-    assert.match(log, /Third audit ok/);
+    assert.match(log, /Different stage lands/);
+    assert.doesNotMatch(log, /Same tool too fast/);
+    assert.match(log, /Same tool after window ok/);
   } finally {
     if (origBypass === undefined) delete process.env.MINNI_BYPASS_AUDIT_LIMIT;
     else process.env.MINNI_BYPASS_AUDIT_LIMIT = origBypass;
@@ -90,8 +101,10 @@ test("RCM-008: hook rate-limiting timestamp file has strict permissions", async 
     });
     assert.ok(okPath);
 
-    // Verify rate limit file has mode 0o600 (on UNIX platforms)
-    const agentTsFile = path.join(home, ".hook-audit-ts", "rate-limit.ts");
+    // Verify rate limit file has mode 0o600 (on UNIX platforms). The key is
+    // per agent+tool since the receipt-integrity review.
+    const agentTsFile = path.join(
+      home, ".hook-audit-ts", "rate-limit.hook_session_start.ts");
     const st = await stat(agentTsFile);
     if (process.platform !== "win32") {
       const mode = st.mode & 0o777;

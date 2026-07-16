@@ -856,7 +856,7 @@ input, textarea, select { font: inherit; color: inherit; }
 /* ---------- Audit tray ---------- */
 .audit-table {
   display: grid;
-  grid-template-columns: 110px 90px minmax(0, 1.4fr) minmax(0, 1.6fr) auto;
+  grid-template-columns: 64px 110px 90px minmax(0, 1.4fr) minmax(0, 1.6fr) auto;
   font-size: 12.5px;
 }
 .audit-table > .row > * {
@@ -879,6 +879,31 @@ input, textarea, select { font: inherit; color: inherit; }
 .audit-table .row { display: contents; }
 .audit-time { font-family: var(--font-mono); font-size: 11px; color: var(--on-muted); }
 .audit-actor { font-family: var(--font-mono); font-size: 11px; }
+
+/* ---------- Sessions tray ---------- */
+.sessions-table {
+  display: grid;
+  grid-template-columns: 110px minmax(0, 1.1fr) 150px 100px 70px 60px 60px auto;
+  font-size: 12.5px;
+}
+.sessions-table > .row > * {
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+  background: var(--panel);
+  display: flex; align-items: center;
+}
+.sessions-table .row:hover > * { background: var(--hover); }
+.sessions-table > .head > * {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--on-muted);
+  background: var(--panel-muted);
+  border-bottom: 1px solid var(--border-strong);
+}
+.sessions-table .row { display: contents; }
 
 /* ---------- Handoffs ---------- */
 .handoff-grid {

@@ -10,7 +10,7 @@ import { promisify } from "node:util";
 import { DEFAULT_AGENT_ID, DEFAULT_VAULT_PATH, PLUGIN_ROOT, minniHome } from "./config.js";
 import { buildStatusReport } from "./sovereign.js";
 import { prepareOutcome, prepareTask, type PrepareOutcomeInput, type PrepareTaskInput } from "./task.js";
-import { auditTail, getAgentIdFromVaultPath } from "./vault.js";
+import { auditTail, getAgentIdFromVaultPath, listSessions, type SessionSummary } from "./vault.js";
 import { readRecallState } from "./recall-state.js";
 import { routeMemoryIntent } from "./policy.js";
 
@@ -88,6 +88,8 @@ export interface UiServerOptions {
   readRecallState?: (vaultPath: string) => Promise<unknown>;
   /** Test seam: override agents catalogue builder. */
   listAgents?: () => Promise<unknown>;
+  /** Test seam: override sessions catalogue builder. */
+  listSessionsCatalogue?: (opts: { agent?: string; limit: number }) => Promise<unknown>;
   /** Test seam: override policy report builder. */
   policyReport?: () => Promise<unknown>;
 }
@@ -196,9 +198,19 @@ function parseCandidatesLimit(value: string | null): number {
   return Math.max(1, Math.min(Math.trunc(parsed), 200));
 }
 
+function parseSessionsLimit(value: string | null): number {
+  const parsed = Number(value ?? 20);
+  if (!Number.isFinite(parsed)) return 20;
+  return Math.max(1, Math.min(Math.trunc(parsed), 50));
+}
+
 // Daemon agent ids are lowercase slugs; anything else is rejected rather than
 // forwarded as a principal claim.
 const AGENT_ID_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/;
+
+// Event types are lowercase snake tokens; anything else is rejected before it
+// reaches the daemon rather than forwarded as an unbounded filter.
+const EVENT_TYPE_RE = /^[a-z_]{1,64}$/;
 
 // The env fallback sentinel resolves to a default-deny principal daemon-side,
 // which would render the staged wall permanently (and silently) empty.
@@ -447,6 +459,129 @@ export async function buildAgentsCatalogue(options: {
   );
 
   return { agents, count: agents.length };
+}
+
+/**
+ * Resolve the fleet of agent vaults the console should cover, mirroring the
+ * Python `minni watch` discovery contract (watch.py discover_vault_logs):
+ *
+ *  1. Scan MINNI_HOME/*-vault under the same symlink/containment guard and
+ *     agent-id validation buildAgentsCatalogue uses (scanned symlink escapes
+ *     are skipped — they must not redirect a reader outside MINNI_HOME).
+ *  2. Overlay operator-authored MINNI_AGENT_VAULTS (JSON agent_id → vault path).
+ *     Mapped vaults are trusted the same as MINNI_HOME and may live ANYWHERE on
+ *     disk; the containment guard is deliberately not applied to them. Keys are
+ *     validated against AGENT_ID_RE; values must be non-empty strings.
+ *
+ * Dedupe is by canonical (realpath) path so one on-disk vault reachable via two
+ * spellings appears exactly once — and, when both a scan and a mapping point at
+ * it, the mapped agent-id label wins (mapping overlays scan). Returns a map of
+ * agent id → the read path for that vault (strictly a read target; no caller
+ * ever writes through it).
+ */
+export async function resolveAgentVaults(homePath: string): Promise<Map<string, string>> {
+  // Intermediate keying is by canonical vault path so the same on-disk vault
+  // never yields two entries; the value carries the agent-id label + read path.
+  const byCanonical = new Map<string, { id: string; readPath: string }>();
+
+  let dirs: string[] = [];
+  try {
+    dirs = await readdir(homePath);
+  } catch {
+    dirs = [];
+  }
+  const vaultDirs = dirs.filter((d) => d.endsWith("-vault")).sort();
+  for (const dir of vaultDirs) {
+    const vaultAbs = path.join(homePath, dir);
+    // Scanned *-vault dirs keep the containment guard (no symlink escape).
+    if (!vaultPathContained(vaultAbs, homePath)) continue;
+    const id = agentIdFromVaultDir(vaultAbs);
+    if (!AGENT_ID_RE.test(id)) continue;
+    let canonical = vaultAbs;
+    try {
+      canonical = realpathSync(vaultAbs);
+    } catch {
+      // unresolvable → key on the join path (still unique per dir)
+    }
+    byCanonical.set(canonical, { id, readPath: canonical });
+  }
+
+  // Operator-authored remaps: trusted like MINNI_HOME, may live outside it.
+  const mappingRaw = process.env.MINNI_AGENT_VAULTS;
+  if (mappingRaw) {
+    try {
+      const mapping = JSON.parse(mappingRaw) as unknown;
+      if (mapping && typeof mapping === "object" && !Array.isArray(mapping)) {
+        for (const [agentId, mappedPath] of Object.entries(mapping as Record<string, unknown>)) {
+          if (!AGENT_ID_RE.test(agentId)) continue;
+          if (typeof mappedPath !== "string" || mappedPath.trim().length === 0) continue;
+          const absMapped = path.resolve(mappedPath.replace(/^~(?=$|\/)/, os.homedir()));
+          let canonical = absMapped;
+          try {
+            canonical = realpathSync(absMapped);
+          } catch {
+            // mapped target not on disk yet → key on the resolved path
+          }
+          // Mapping wins on conflict: overwrite any scanned entry for the same
+          // on-disk vault and prefer the mapped agent-id label.
+          byCanonical.set(canonical, { id: agentId, readPath: canonical });
+        }
+      }
+    } catch {
+      // Invalid MINNI_AGENT_VAULTS JSON is ignored gracefully — the scan still
+      // provides discovery, matching watch.py's tolerant parse.
+    }
+  }
+
+  const out = new Map<string, string>();
+  for (const { id, readPath } of byCanonical.values()) {
+    out.set(id, readPath);
+  }
+  return out;
+}
+
+/**
+ * Compose the multi-agent session catalogue for the sessions view. Discovery
+ * goes through resolveAgentVaults (MINNI_HOME/*-vault scan + MINNI_AGENT_VAULTS
+ * remaps, matching `minni watch`), reads each vault's recent session cycles via
+ * listSessions (strictly read-only — never ensureVault), stamps each row with
+ * its agent id, and merges across vaults newest-first by boot_at (rows with a
+ * null boot_at sort last). No absolute vault path is put on the wire.
+ */
+export async function buildSessionsCatalogue(options: {
+  homePath: string;
+  perVaultLimit?: number;
+  agent?: string;
+  listSessionsFn?: (vaultPath: string, limit?: number) => Promise<SessionSummary[]>;
+}): Promise<{ sessions: Array<Record<string, unknown>>; count: number }> {
+  const homePath = options.homePath;
+  const perVaultLimit = options.perVaultLimit ?? 10;
+  const listFn = options.listSessionsFn ?? listSessions;
+
+  const vaults = await resolveAgentVaults(homePath);
+  const targets = [...vaults.entries()]
+    .filter(([id]) => !options.agent || id === options.agent)
+    .map(([id, vaultAbs]) => ({ id, vaultAbs }));
+
+  const perVault = await Promise.all(
+    targets.map(async ({ vaultAbs, id }) => {
+      const sessions = await listFn(vaultAbs, perVaultLimit);
+      // Stamp the agent id; carry only the SessionSummary fields (no vault path).
+      return sessions.map((s) => ({ agent: id, ...s }));
+    }),
+  );
+
+  const merged = perVault.flat().sort((a, b) => {
+    const ab = a.boot_at as string | null;
+    const bb = b.boot_at as string | null;
+    // Null boot_at sorts last; otherwise newest ISO stamp first.
+    if (ab === bb) return 0;
+    if (ab == null) return 1;
+    if (bb == null) return -1;
+    return ab < bb ? 1 : -1;
+  });
+
+  return { sessions: merged, count: merged.length };
 }
 
 /** Normalize list_candidates daemon responses (JsonResult or flat). */
@@ -928,6 +1063,14 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         vaultPath,
         status,
       }));
+  const listSessionsCatalogue =
+    options.listSessionsCatalogue ??
+    ((opts: { agent?: string; limit: number }) =>
+      buildSessionsCatalogue({
+        homePath,
+        perVaultLimit: opts.limit,
+        agent: opts.agent,
+      }));
 
   /** Shared list_candidates route body for proposed / log_only / do_not_store. */
   async function candidatesByStatus(
@@ -1024,7 +1167,48 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         return;
       }
       if (req.method === "GET" && url.pathname === "/api/audit-tail") {
-        sendJson(res, 200, redactLocalValue(await tail(parseAuditLimit(url.searchParams.get("limit")))));
+        const auditLimit = parseAuditLimit(url.searchParams.get("limit"));
+        const auditAgent = url.searchParams.get("agent");
+        if (auditAgent !== null) {
+          // Fleet-wide lane (special-cased BEFORE AGENT_ID_RE): merge every
+          // resolved vault's read-only tail, tag each entry with its agent, sort
+          // newest-first by parsed header timestamp (unparseable → oldest), and
+          // cap at the clamped limit. Same auth as every /api route.
+          if (auditAgent === "*") {
+            const vaults = await resolveAgentVaults(homePath);
+            const tagged: Array<{ agent: string; text: string; ms: number }> = [];
+            await Promise.all(
+              [...vaults.entries()].map(async ([id, vaultAbs]) => {
+                const tail = await readOnlyAuditTail(vaultAbs, auditLimit);
+                for (const entry of tail.entries) {
+                  const ms = parseAuditTimestampMs(entry);
+                  tagged.push({ agent: id, text: entry, ms: ms ?? Number.NEGATIVE_INFINITY });
+                }
+              }),
+            );
+            tagged.sort((a, b) => b.ms - a.ms);
+            const entries = tagged.slice(0, auditLimit).map(({ agent, text }) => ({ agent, text }));
+            sendJson(res, 200, redactLocalValue({ merged: true, entries }));
+            return;
+          }
+          // Per-agent audit tail: resolve the agent's vault via the shared
+          // discovery (scan + MINNI_AGENT_VAULTS remaps), serve READ-ONLY (never
+          // ensureVault, never the injected auditTail seam which materializes
+          // vault skeletons). Unknown agent → 404.
+          if (!AGENT_ID_RE.test(auditAgent)) {
+            sendJson(res, 400, { ok: false, error: "invalid agent" });
+            return;
+          }
+          const vaults = await resolveAgentVaults(homePath);
+          const agentVault = vaults.get(auditAgent);
+          if (!agentVault) {
+            sendJson(res, 404, { ok: false, error: "unknown agent" });
+            return;
+          }
+          sendJson(res, 200, redactLocalValue(await readOnlyAuditTail(agentVault, auditLimit)));
+          return;
+        }
+        sendJson(res, 200, redactLocalValue(await tail(auditLimit)));
         return;
       }
       if (req.method === "POST" && url.pathname === "/api/prepare-task") {
@@ -1103,6 +1287,108 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
             error: e instanceof Error ? e.message : String(e),
             agents: [],
             count: 0,
+          });
+        }
+        return;
+      }
+      if (req.method === "GET" && url.pathname === "/api/sessions") {
+        const sessAgent = url.searchParams.get("agent");
+        if (sessAgent !== null && !AGENT_ID_RE.test(sessAgent)) {
+          sendJson(res, 400, { ok: false, error: "invalid agent" });
+          return;
+        }
+        const sessLimit = parseSessionsLimit(url.searchParams.get("limit"));
+        try {
+          const catalogue = (await listSessionsCatalogue({
+            agent: sessAgent ?? undefined,
+            limit: sessLimit,
+          })) as { sessions?: unknown };
+          const rows = Array.isArray(catalogue?.sessions) ? catalogue.sessions.slice(0, sessLimit) : [];
+          sendJson(res, 200, redactLocalValue({ sessions: rows, count: rows.length }));
+        } catch (e) {
+          sendJson(res, 500, {
+            ok: false,
+            error: e instanceof Error ? e.message : String(e),
+            sessions: [],
+          });
+        }
+        return;
+      }
+      if (req.method === "GET" && url.pathname === "/api/events") {
+        const eventParams: Record<string, unknown> = {};
+        const sinceRaw = url.searchParams.get("since_id");
+        if (sinceRaw !== null) {
+          const n = Number(sinceRaw);
+          if (!Number.isInteger(n) || n < 0) {
+            sendJson(res, 400, { ok: false, error: "invalid since_id" });
+            return;
+          }
+          eventParams.since_id = n;
+        }
+        const limitRaw = url.searchParams.get("limit");
+        if (limitRaw !== null) {
+          const n = Number(limitRaw);
+          if (!Number.isInteger(n) || n < 0) {
+            sendJson(res, 400, { ok: false, error: "invalid limit" });
+            return;
+          }
+          // The daemon rejects limits < 1 (-32602), so a validated-but-zero
+          // limit must clamp UP to 1 (bounded page) rather than break the
+          // daemon lane — same [1,200] clamp idiom as parseSessionsLimit.
+          eventParams.limit = Math.max(1, Math.min(n, 200));
+        }
+        const eventAgent = url.searchParams.get("agent");
+        if (eventAgent !== null) {
+          if (!AGENT_ID_RE.test(eventAgent)) {
+            sendJson(res, 400, { ok: false, error: "invalid agent" });
+            return;
+          }
+          eventParams.agent_id = eventAgent;
+        }
+        const eventType = url.searchParams.get("event_type");
+        if (eventType !== null) {
+          if (!EVENT_TYPE_RE.test(eventType)) {
+            sendJson(res, 400, { ok: false, error: "invalid event_type" });
+            return;
+          }
+          eventParams.event_type = eventType;
+        }
+        try {
+          const rpc = await daemonRpc("list_events", eventParams);
+          if (rpc && typeof rpc === "object" && (rpc as { ok?: boolean }).ok === false) {
+            const err = String((rpc as { error?: string }).error || "list_events failed");
+            sendJson(res, daemonRpcHttpStatus(err), {
+              ok: false,
+              error: err,
+              events: [],
+            });
+            return;
+          }
+          // JsonResult envelope: the real daemonRpc returns
+          // { ok: true, data: { events, last_id } } — flatten it so the
+          // client reads top-level events/last_id (mirrors /api/handoffs).
+          // Injected test seams may already return the flat shape.
+          let payload: unknown = rpc;
+          const envelope = rpc as Record<string, unknown>;
+          if (envelope && typeof envelope === "object" && envelope.ok === true && envelope.data && typeof envelope.data === "object") {
+            payload = envelope.data;
+          }
+          // episodic_events.created_at is a Unix epoch float in SECONDS
+          // (Python time.time()); normalize to ISO so Date.parse works in
+          // the merged Audit sort instead of NaN-sinking the daemon lane.
+          if (payload && typeof payload === "object" && Array.isArray((payload as { events?: unknown[] }).events)) {
+            for (const ev of (payload as { events: Array<{ created_at?: unknown }> }).events) {
+              if (typeof ev?.created_at === "number" && Number.isFinite(ev.created_at)) {
+                ev.created_at = new Date(ev.created_at * 1000).toISOString();
+              }
+            }
+          }
+          sendJson(res, 200, redactLocalValue(payload));
+        } catch (e) {
+          sendJson(res, daemonRpcHttpStatus(e), {
+            ok: false,
+            error: e instanceof Error ? e.message : String(e),
+            events: [],
           });
         }
         return;

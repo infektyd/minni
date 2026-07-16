@@ -15,7 +15,7 @@ from minni.principal import (
     make_capability_denied_error,
 )
 
-from .redaction import redact_value
+from .redaction import redact_text, redact_value
 
 
 logger = logging.getLogger("minnid")
@@ -32,6 +32,7 @@ class RecallContext:
     trace_ring: Callable[[], Any]
     record_latency: Callable[[str, float], None]
     increment_request_count: Callable[[], None] | None = None
+    lazy_episodic: Callable[[], Any] | None = None
     sovereign_db: Callable[..., Any] = SovereignDB
     default_config: Any = field(default_factory=lambda: DEFAULT_CONFIG)
     can_read_document: Callable[[Any, str, Any], bool] = can_read_document
@@ -291,6 +292,47 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
             )
         except Exception as exc:
             context.logger.warning("search: learnings surfacing/tracking failed: %s", exc)
+
+        # Durable recall trace (observability, config.recall_trace): a TTL'd
+        # episodic event per search so `minni watch` can show raw-RPC recalls
+        # too, not just plugin-mediated ones. Best-effort — a trace failure
+        # must never fail the search itself.
+        if (
+            principal is not None
+            and context.lazy_episodic is not None
+            and getattr(context.default_config, "recall_trace", False)
+        ):
+            try:
+                top_score = float(results[0].get("score") or 0.0) if results else 0.0
+                session_id = params.get("session_id")
+                # The trace is durable — scrub secrets from the persisted
+                # query snippet just like the ephemeral trace path does.
+                safe_query, _ = redact_text(query[:120])
+                episodic = context.lazy_episodic()
+                episodic.add_event(
+                    agent_id=agent_id,
+                    event_type="recall",
+                    content=(f'recall "{safe_query}" — {len(results)} hits, '
+                             f"top {top_score:.2f}"),
+                    thread_id=str(session_id) if session_id else None,
+                    # Observability only: never thread-bind (that mutates
+                    # thread_doc_links and runs a semantic search).
+                    bind_thread=False,
+                    metadata={
+                        "query_sha256_12": hashlib.sha256(
+                            query.encode("utf-8")).hexdigest()[:12],
+                        "hits": len(results),
+                        "learnings": len(learnings),
+                        "top_score": top_score,
+                        "depth": depth,
+                        "scope": document_scope,
+                    },
+                )
+                # Keep the trace's own footprint honest to its 7d TTL —
+                # nothing schedules the global episodic cleanup today.
+                episodic.trim_recall_traces()
+            except Exception as exc:
+                context.logger.debug("search: recall trace failed: %s", exc)
 
         return context.make_response({
             "query": query,
@@ -926,6 +968,106 @@ def handle_sm_export_pack(params: dict, request_id: Any, context: RecallContext)
         return context.make_error(-32000, f"Export pack error: {exc}", request_id)
 
 
+def handle_list_events(params: dict, request_id: Any, context: RecallContext) -> dict:
+    """Read-only cursor listing over episodic_events.
+
+    Plain parameterized SELECT — no INSERT/UPDATE/DELETE, no FTS, no side
+    effects. Params: since_id (default 0), limit (default 50, clamp 1-200),
+    agent_id (optional filter), event_type (optional filter). Result is
+    ordered by event_id ASC so a caller can page with
+    since_id=last_id from the previous response.
+    """
+    if context.increment_request_count is not None:
+        context.increment_request_count()
+    started_at = time.perf_counter()
+
+    principal, err = context.handler_principal(params, request_id)
+    if err:
+        return err
+
+    since_id_raw = params.get("since_id", 0)
+    if isinstance(since_id_raw, bool) or not isinstance(since_id_raw, int):
+        return context.make_error(-32602, "since_id must be an integer", request_id)
+    since_id = since_id_raw
+
+    limit_raw = params.get("limit", 50)
+    if isinstance(limit_raw, bool) or not isinstance(limit_raw, int):
+        return context.make_error(-32602, "limit must be an integer", request_id)
+    if limit_raw < 1:
+        return context.make_error(-32602, "limit must be >= 1", request_id)
+    limit = min(limit_raw, 200)
+
+    agent_id_filter = params.get("agent_id")
+    if agent_id_filter is not None and not isinstance(agent_id_filter, str):
+        return context.make_error(-32602, "agent_id must be a string", request_id)
+
+    event_type_filter = params.get("event_type")
+    if event_type_filter is not None and not isinstance(event_type_filter, str):
+        return context.make_error(-32602, "event_type must be a string", request_id)
+
+    # Cross-agent visibility follows the same gate as search.cross_agent:
+    # a plain read principal is scoped to its own stamped agent_id; only
+    # cross_agent/govern/operator principals may omit the filter or name
+    # another agent (the console's zero-config operator keeps its fleet view).
+    principal_agent = getattr(principal, "agent_id", None)
+    if principal is None or not allows_cross_agent_recall(principal):
+        if agent_id_filter is not None and agent_id_filter != principal_agent:
+            return make_capability_denied_error(
+                "cross_agent",
+                "list_events",
+                request_id,
+                principal_id=principal_agent,
+            )
+        agent_id_filter = principal_agent
+
+    db = None
+    try:
+        db = context.sovereign_db()
+        query = (
+            "SELECT event_id, agent_id, event_type, content, created_at, thread_id "
+            "FROM episodic_events WHERE event_id > :since_id"
+        )
+        bindings: dict = {"since_id": since_id, "limit": limit}
+        if agent_id_filter is not None:
+            query += " AND agent_id = :agent_id"
+            bindings["agent_id"] = agent_id_filter
+        if event_type_filter is not None:
+            query += " AND event_type = :event_type"
+            bindings["event_type"] = event_type_filter
+        query += " ORDER BY event_id ASC LIMIT :limit"
+
+        with db.cursor() as c:
+            c.execute(query, bindings)
+            rows = c.fetchall()
+
+        events = [
+            {
+                "event_id": row["event_id"],
+                "agent_id": row["agent_id"],
+                "event_type": row["event_type"],
+                "content": row["content"],
+                "created_at": row["created_at"],
+                "thread_id": row["thread_id"],
+            }
+            for row in rows
+        ]
+        last_id = events[-1]["event_id"] if events else since_id
+        return context.make_response({
+            "events": events,
+            "last_id": last_id,
+        }, request_id)
+    except Exception as exc:
+        context.logger.exception("list_events failed")
+        return context.make_error(-32000, f"list_events error: {exc}", request_id)
+    finally:
+        if db is not None and hasattr(db, "close"):
+            try:
+                db.close()
+            except Exception:
+                pass
+        context.record_latency("list_events", time.perf_counter() - started_at)
+
+
 def handle_read(params: dict, request_id: Any, context: RecallContext) -> dict:
     """Read agent startup context (identity + knowledge + learnings)."""
     if context.increment_request_count is not None:
@@ -1030,6 +1172,7 @@ def handle_read(params: dict, request_id: Any, context: RecallContext) -> dict:
                 SELECT event_type, content, created_at
                 FROM episodic_events
                 WHERE agent_id = ?
+                  AND event_type != 'recall'
                 ORDER BY created_at DESC
                 LIMIT 5
             """, (agent_id,))

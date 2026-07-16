@@ -149,6 +149,14 @@ const server = new McpServer({
   version: "0.1.0",
 });
 
+// Review finding (low): minni_recall previously called recallMemory without a
+// sessionId, so MCP-driven recalls never correlated to a session in the
+// daemon's recall-trace / session receipts. This MCP server process IS a
+// single runtime session for its whole lifetime, so one id generated once at
+// module scope (not per-call) is the right correlation unit — every recall
+// this process issues threads into the same trace.
+const MCP_PROCESS_SESSION_ID = `mcp-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+
 server.registerTool(
   "minni_prepare_task",
   {
@@ -514,6 +522,7 @@ server.registerTool(
       crossAgent: cross_agent,
       workspaceId: workspaceId ?? DEFAULT_WORKSPACE_ID,
       agentId: DEFAULT_AGENT_ID, // G11: server-side default only (model no longer supplies agentId)
+      sessionId: MCP_PROCESS_SESSION_ID,
     });
     const daemonOk = result.ok && !!result.data;
     // An identity denial is not a daemon outage: whether it carries a recovery
@@ -547,6 +556,9 @@ server.registerTool(
         includeVault: includeVault !== false,
         vaultMatches: vaultResults.map((match) => match.relativePath),
         error: result.error,
+        // Same id the daemon trace receives, so MCP recalls attribute in
+        // audit-based session receipts too.
+        session_id: MCP_PROCESS_SESSION_ID,
       },
     });
     return textResult(responseText);

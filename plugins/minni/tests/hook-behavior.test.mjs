@@ -18,6 +18,7 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
 import { createHookHandlers } from "../dist/hook-handlers.js";
+import { auditTail } from "../dist/vault.js";
 
 const execFileAsync = promisify(execFile);
 const PLUGIN_ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -252,11 +253,21 @@ test("Stop divergence: empty candidates skip the inbox write unless alwaysWriteS
     });
     const grokOut = await grokHandlers.handleStop({ session_id: "empty-stop" });
     assert.equal(grokOut.continue, true);
-    assert.equal(grokOut.systemMessage, undefined);
+    // Session receipts: even a no-candidate Stop surfaces the proof-of-use line
+    // (a clean receipt is itself the signal that memory was not exercised).
+    assert.match(grokOut.systemMessage, /^Minni session receipt: /);
     const grokNames = (await readdir(path.join(grokVault, "inbox"))).filter((n) =>
       n.endsWith(".json"),
     );
     assert.deepEqual(grokNames, [], "empty outcome must not write an inbox file");
+    // The stop MARKER must still land even without an inbox write: it closes
+    // the sessionReceipt boot->stop window, so a later session's activity can
+    // never be tallied into this one.
+    const grokTail = await auditTail(grokVault, 10);
+    assert.ok(
+      grokTail.entries.some((entry) => entry.includes("| stop empty-stop")),
+      "zero-candidate Stop must record the stop audit marker",
+    );
 
     // codex historical behavior (alwaysWriteStopInbox: true): the file IS
     // written — and still carries the canonical kind + identity stamps.
@@ -266,7 +277,9 @@ test("Stop divergence: empty candidates skip the inbox write unless alwaysWriteS
     });
     const codexOut = await codexHandlers.handleStop({ session_id: "empty-stop" });
     assert.equal(codexOut.continue, true);
-    assert.equal(codexOut.systemMessage, undefined, "no candidates => no call-to-action");
+    // No candidate call-to-action, but the receipt line still rides the Stop.
+    assert.match(codexOut.systemMessage, /^Minni session receipt: /);
+    assert.doesNotMatch(codexOut.systemMessage, /candidate learning/);
     const codexNames = (await readdir(path.join(codexVault, "inbox"))).filter((n) =>
       n.endsWith(".json"),
     );
@@ -316,4 +329,160 @@ test("SessionStart hook (kilocode): identity-recall envelope keeps recall + pend
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+// ── Review finding (medium): synthetic "session" id must never be stamped ───
+// into audit details.session_id or threaded into the daemon recall-trace.
+// UserPromptSubmit's weak (nothing-salient) and strong (recall_pointer) paths
+// both stamp details.session_id conditionally on the RAW payload id; the
+// "session" fallback stays reserved for envelope identity / inbox filenames.
+
+function upsConfig(vaultPath) {
+  return {
+    agentId: "claude-code",
+    vaultPath,
+    defaultWorkspaceId: "workspace-fixture",
+    contextWindow: 200_000,
+    hooksEnabled: true,
+    auditPrefix: "hook_test",
+    alwaysWriteStopInbox: false,
+  };
+}
+
+async function withRawSessionFixture(run) {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-raw-session-"));
+  const vault = path.join(root, "vault");
+  const home = path.join(root, "home");
+  const saved = {
+    home: process.env.MINNI_HOME,
+    socket: process.env.MINNI_SOCKET_PATH,
+    afm: process.env.MINNI_AFM_HEALTH_URL,
+    bypass: process.env.MINNI_BYPASS_AUDIT_LIMIT,
+  };
+  process.env.MINNI_HOME = home;
+  process.env.MINNI_SOCKET_PATH = path.join(home, "missing.sock");
+  process.env.MINNI_AFM_HEALTH_URL = "http://127.0.0.1:1/health";
+  process.env.MINNI_BYPASS_AUDIT_LIMIT = "true";
+  await mkdir(home, { recursive: true });
+  try {
+    await run({ vault, home });
+  } finally {
+    for (const [key, value] of [
+      ["MINNI_HOME", saved.home],
+      ["MINNI_SOCKET_PATH", saved.socket],
+      ["MINNI_AFM_HEALTH_URL", saved.afm],
+      ["MINNI_BYPASS_AUDIT_LIMIT", saved.bypass],
+    ]) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
+/** Finds the last audit entry for `tool` and returns its parsed details JSON. */
+async function lastAuditDetails(vaultPath, tool) {
+  const tail = await auditTail(vaultPath, 20);
+  for (let i = tail.entries.length - 1; i >= 0; i -= 1) {
+    const entry = tail.entries[i];
+    if (!entry.includes(`] ${tool} |`)) continue;
+    const match = entry.match(/```json\n([\s\S]*?)\n```/);
+    return match ? JSON.parse(match[1]) : undefined;
+  }
+  return undefined;
+}
+
+test("UserPromptSubmit audit (weak/nothing-salient path): no session_id in payload omits details.session_id", async () => {
+  await withRawSessionFixture(async ({ vault }) => {
+    const handlers = createHookHandlers(upsConfig(vault));
+    // No vault notes + missing daemon socket => weak recall; no active plan
+    // => the nothing-salient early return, which is the audit call under test.
+    const output = await handlers.handleUserPromptSubmit({
+      prompt: "an utterly novel question with zero prior memory zzzqqx",
+      workspace_id: "workspace-fixture",
+      // deliberately NO session_id / sessionId field
+    });
+    assert.equal(output.continue, true);
+
+    const details = await lastAuditDetails(vault, "hook_test_user_prompt_submit");
+    assert.ok(details, "UserPromptSubmit must record an audit entry");
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(details, "session_id"),
+      false,
+      "unlabeled payload must not stamp a synthetic session_id into audit details",
+    );
+  });
+});
+
+test("UserPromptSubmit audit (weak/nothing-salient path): a real session_id is stamped as before", async () => {
+  await withRawSessionFixture(async ({ vault }) => {
+    const handlers = createHookHandlers(upsConfig(vault));
+    const output = await handlers.handleUserPromptSubmit({
+      prompt: "another utterly novel question with zero prior memory wobblequux",
+      workspace_id: "workspace-fixture",
+      session_id: "real-session-42",
+    });
+    assert.equal(output.continue, true);
+
+    const details = await lastAuditDetails(vault, "hook_test_user_prompt_submit");
+    assert.ok(details);
+    assert.equal(details.session_id, "real-session-42");
+  });
+});
+
+test("UserPromptSubmit audit (strong/recall_pointer path): no session_id in payload omits details.session_id", async () => {
+  await withRawSessionFixture(async ({ vault }) => {
+    const prompt = "resume the raw-session-id review-finding investigation from prior context";
+    const wiki = path.join(vault, "wiki", "sessions");
+    await mkdir(wiki, { recursive: true });
+    await writeFile(
+      path.join(wiki, "20260617-raw-session-strong-hit.md"),
+      `# Strong hit note\n\nThe exact phrase: ${prompt}\nDocumented so the agent need not re-derive it.\n`,
+      "utf8",
+    );
+
+    const handlers = createHookHandlers(upsConfig(vault));
+    const output = await handlers.handleUserPromptSubmit({
+      prompt,
+      workspace_id: "workspace-fixture",
+      // deliberately NO session_id / sessionId field
+    });
+    assert.equal(output.continue, true);
+    assert.ok(output.hookSpecificOutput, "strong turn must inject an envelope");
+
+    const details = await lastAuditDetails(vault, "hook_test_user_prompt_submit");
+    assert.ok(details);
+    assert.equal(details.recall_strong, true, "precondition: this must be the strong-recall path");
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(details, "session_id"),
+      false,
+      "unlabeled payload must not stamp a synthetic session_id into audit details",
+    );
+  });
+});
+
+test("UserPromptSubmit audit (strong/recall_pointer path): a real session_id is stamped as before", async () => {
+  await withRawSessionFixture(async ({ vault }) => {
+    const prompt = "resume the raw-session-id stamped review-finding investigation from prior context";
+    const wiki = path.join(vault, "wiki", "sessions");
+    await mkdir(wiki, { recursive: true });
+    await writeFile(
+      path.join(wiki, "20260617-raw-session-strong-hit-2.md"),
+      `# Strong hit note\n\nThe exact phrase: ${prompt}\nDocumented so the agent need not re-derive it.\n`,
+      "utf8",
+    );
+
+    const handlers = createHookHandlers(upsConfig(vault));
+    const output = await handlers.handleUserPromptSubmit({
+      prompt,
+      workspace_id: "workspace-fixture",
+      session_id: "real-session-strong-7",
+    });
+    assert.equal(output.continue, true);
+
+    const details = await lastAuditDetails(vault, "hook_test_user_prompt_submit");
+    assert.ok(details);
+    assert.equal(details.recall_strong, true, "precondition: this must be the strong-recall path");
+    assert.equal(details.session_id, "real-session-strong-7");
+  });
 });
