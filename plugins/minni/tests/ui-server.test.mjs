@@ -1220,6 +1220,34 @@ test("/api/events proxies list_events with correctly mapped params", async () =>
   }
 });
 
+test("/api/events unwraps the JsonResult envelope and normalizes inside it", async () => {
+  // The REAL daemonRpc returns { ok: true, data: { events, last_id } } — the
+  // console client reads top-level events/last_id, and the epoch-normalization
+  // must apply inside the envelope too. Pinned after a live check showed the
+  // raw envelope (with float created_at) reaching the client.
+  const server = await startTestServer({
+    daemonRpc: async () => ({
+      ok: true,
+      data: {
+        events: [
+          { event_id: 3, agent_id: "loadgen", event_type: "recall", content: "x", created_at: 1784132707.73, thread_id: null },
+        ],
+        last_id: 3,
+      },
+    }),
+  });
+  try {
+    const res = await fetch(`${server.baseUrl}/api/events`, { headers: authHeaders() });
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.last_id, 3);
+    assert.equal(body.events.length, 1);
+    assert.equal(body.events[0].created_at, new Date(1784132707.73 * 1000).toISOString());
+  } finally {
+    await server.close();
+  }
+});
+
 test("/api/events normalizes epoch created_at to ISO strings", async () => {
   // episodic_events.created_at is a Unix epoch float in seconds (time.time());
   // the route must convert it so Date.parse works in the merged Audit sort.

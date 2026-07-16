@@ -1364,17 +1364,26 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
             });
             return;
           }
+          // JsonResult envelope: the real daemonRpc returns
+          // { ok: true, data: { events, last_id } } — flatten it so the
+          // client reads top-level events/last_id (mirrors /api/handoffs).
+          // Injected test seams may already return the flat shape.
+          let payload: unknown = rpc;
+          const envelope = rpc as Record<string, unknown>;
+          if (envelope && typeof envelope === "object" && envelope.ok === true && envelope.data && typeof envelope.data === "object") {
+            payload = envelope.data;
+          }
           // episodic_events.created_at is a Unix epoch float in SECONDS
           // (Python time.time()); normalize to ISO so Date.parse works in
           // the merged Audit sort instead of NaN-sinking the daemon lane.
-          if (rpc && typeof rpc === "object" && Array.isArray((rpc as { events?: unknown[] }).events)) {
-            for (const ev of (rpc as { events: Array<{ created_at?: unknown }> }).events) {
+          if (payload && typeof payload === "object" && Array.isArray((payload as { events?: unknown[] }).events)) {
+            for (const ev of (payload as { events: Array<{ created_at?: unknown }> }).events) {
               if (typeof ev?.created_at === "number" && Number.isFinite(ev.created_at)) {
                 ev.created_at = new Date(ev.created_at * 1000).toISOString();
               }
             }
           }
-          sendJson(res, 200, redactLocalValue(rpc));
+          sendJson(res, 200, redactLocalValue(payload));
         } catch (e) {
           sendJson(res, daemonRpcHttpStatus(e), {
             ok: false,
