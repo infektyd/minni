@@ -139,6 +139,12 @@ function vaultToRow(entry: ParsedEntry, idx: number, agent?: string): MergedRow 
 
 const POLL_MS = 5000;
 const MAX_DAEMON_EVENTS = 200;
+// Daemon lane drain (mirrors minni watch's poller): each tick pages through the
+// backlog `DAEMON_PAGE` rows at a time while a page comes back full, so a burst
+// of hundreds of events surfaces in one tick instead of one page per 5s tick.
+// MAX_DRAIN_PAGES caps the work per tick as a runaway guard.
+const DAEMON_PAGE = 200;
+const MAX_DRAIN_PAGES = 5;
 const isDaemonOffline = (err: unknown): boolean =>
   err instanceof Error && /^502\b/.test(err.message);
 
@@ -159,12 +165,17 @@ export function AuditScreen() {
   const liveRef = useRef(live);
   liveRef.current = live;
   const visibleRef = useRef(true);
-  // Request generation: bumped on every scope reset (filter/limit change). Each
-  // poll captures the generation it started under; a response whose generation
-  // no longer matches belongs to a stale scope and is dropped — it must not
-  // update state or advance the since_id cursor (which would append the wrong
-  // agent's rows and skip the new scope's events).
-  const genRef = useRef(0);
+  // Two independent race guards because the two lanes have different scopes.
+  // The VAULT lane's scope is (limit, agentFilter); the DAEMON lane's scope is
+  // agentFilter ONLY (limit configures the vault tail, not the event stream).
+  // Each poll captures its lane's generation; a response whose generation no
+  // longer matches belongs to a superseded scope and is dropped — no state
+  // update and, for the daemon lane, no since_id advance.
+  const vaultGenRef = useRef(0);
+  const daemonGenRef = useRef(0);
+  // Last applied agent filter, so a limit-only change can be told apart from an
+  // agent change and leave the daemon cursor/events untouched.
+  const prevAgentRef = useRef<string | null>(null);
 
   const loadVault = async (n: number, agent: string, gen: number) => {
     setLoading(true);
@@ -172,56 +183,64 @@ export function AuditScreen() {
       if (agent) {
         // Specific agent typed → single-vault tail (byte-identical to before).
         const result = await getAuditTail(n, agent);
-        if (genRef.current !== gen) return;
+        if (vaultGenRef.current !== gen) return;
         setData({ entries: result.entries.map((raw) => ({ raw })), text: result.text });
       } else {
         // No filter → fleet view: merge every vault, keep each entry's agent tag.
         const result = await getAuditTailFleet(n);
-        if (genRef.current !== gen) return;
+        if (vaultGenRef.current !== gen) return;
         const entries: VaultEntry[] = result.entries.map((e) => ({ raw: e.text, agent: e.agent }));
         setData({ entries, text: entries.map((e) => e.raw).join("\n\n") });
       }
       setError(null);
       setStale(false);
     } catch (err) {
-      if (genRef.current !== gen) return;
+      if (vaultGenRef.current !== gen) return;
       // Keep the last-known-good vault tail: a transient poll failure must
       // not blank the table between ticks.
       setError(err instanceof Error ? err.message : String(err));
       setStale(true);
     } finally {
-      if (genRef.current === gen) setLoading(false);
+      if (vaultGenRef.current === gen) setLoading(false);
     }
   };
 
   const loadDaemon = async (agent: string, gen: number) => {
     try {
-      const result = await getEvents(sinceIdRef.current, agent || undefined);
-      // Drop a response from a superseded scope: no state, no cursor advance.
-      if (genRef.current !== gen) return;
-      setDaemonOffline(false);
-      setDaemonError(null);
-      if (result.events.length > 0) {
-        setDaemonEvents((prev) => {
-          const merged = [...prev, ...result.events];
-          const seen = new Set<number>();
-          const deduped: EventRow[] = [];
-          // Walk newest-first so dedupe keeps the latest copy of a repeated id.
-          for (let i = merged.length - 1; i >= 0; i--) {
-            const e = merged[i];
-            if (seen.has(e.event_id)) continue;
-            seen.add(e.event_id);
-            deduped.push(e);
-          }
-          deduped.reverse();
-          return deduped.slice(-MAX_DAEMON_EVENTS);
-        });
-      }
-      if (typeof result.last_id === "number") {
-        sinceIdRef.current = Math.max(sinceIdRef.current, result.last_id);
+      // Drain the backlog: page through DAEMON_PAGE rows at a time while a page
+      // comes back full, advancing the cursor per page, capped at
+      // MAX_DRAIN_PAGES. Every page respects the generation guard so an agent
+      // change mid-drain drops the response and stops the loop (no cursor
+      // advance into the old scope).
+      for (let page = 0; page < MAX_DRAIN_PAGES; page++) {
+        const result = await getEvents(sinceIdRef.current, agent || undefined, DAEMON_PAGE);
+        if (daemonGenRef.current !== gen) return;
+        setDaemonOffline(false);
+        setDaemonError(null);
+        if (result.events.length > 0) {
+          setDaemonEvents((prev) => {
+            const merged = [...prev, ...result.events];
+            const seen = new Set<number>();
+            const deduped: EventRow[] = [];
+            // Walk newest-first so dedupe keeps the latest copy of a repeated id.
+            for (let i = merged.length - 1; i >= 0; i--) {
+              const e = merged[i];
+              if (seen.has(e.event_id)) continue;
+              seen.add(e.event_id);
+              deduped.push(e);
+            }
+            deduped.reverse();
+            return deduped.slice(-MAX_DAEMON_EVENTS);
+          });
+        }
+        if (typeof result.last_id === "number") {
+          sinceIdRef.current = Math.max(sinceIdRef.current, result.last_id);
+        }
+        // A short page means the backlog is drained; stop until the next tick.
+        if (result.events.length < DAEMON_PAGE) break;
       }
     } catch (err) {
-      if (genRef.current !== gen) return;
+      if (daemonGenRef.current !== gen) return;
       if (isDaemonOffline(err)) {
         setDaemonOffline(true);
         setDaemonError("daemon offline");
@@ -231,19 +250,32 @@ export function AuditScreen() {
     }
   };
 
-  const loadAll = async (n: number, agent: string, gen: number) => {
-    await Promise.allSettled([loadVault(n, agent, gen), loadDaemon(agent, gen)]);
+  const loadAll = async (n: number, agent: string, vGen: number, dGen: number) => {
+    await Promise.allSettled([loadVault(n, agent, vGen), loadDaemon(agent, dGen)]);
   };
 
-  // Reset the event cursor whenever the filter/limit combination changes so a
-  // fresh scope doesn't silently inherit a stale since_id. Bump the generation
-  // so any in-flight poll from the previous scope is discarded on arrival.
+  // Scope changes: a VAULT refetch always runs (limit and agent both scope it).
+  // The DAEMON lane resets (cursor zero + events clear + generation bump) ONLY
+  // when the agent actually changed — a limit-only change must not rewind the
+  // event cursor or drop accumulated episodic rows.
   useEffect(() => {
-    genRef.current += 1;
-    const gen = genRef.current;
-    sinceIdRef.current = 0;
-    setDaemonEvents([]);
-    void loadAll(limit, agentFilter.trim(), gen);
+    const agent = agentFilter.trim();
+    const agentChanged = prevAgentRef.current !== agent;
+    prevAgentRef.current = agent;
+
+    vaultGenRef.current += 1;
+    const vGen = vaultGenRef.current;
+
+    if (agentChanged) {
+      daemonGenRef.current += 1;
+      sinceIdRef.current = 0;
+      setDaemonEvents([]);
+      void loadAll(limit, agent, vGen, daemonGenRef.current);
+    } else {
+      // limit-only change: refetch the vault tail; leave the daemon lane to its
+      // own poll (its cursor and accumulated events stay intact).
+      void loadVault(limit, agent, vGen);
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [limit, agentFilter]);
 
@@ -259,7 +291,7 @@ export function AuditScreen() {
     const id = window.setInterval(() => {
       if (!liveRef.current) return;
       if (!visibleRef.current) return;
-      void loadAll(limit, agentFilter.trim(), genRef.current);
+      void loadAll(limit, agentFilter.trim(), vaultGenRef.current, daemonGenRef.current);
     }, POLL_MS);
     return () => window.clearInterval(id);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -323,7 +355,7 @@ export function AuditScreen() {
               <button
                 type="button"
                 className="btn btn-secondary btn-sm"
-                onClick={() => void loadAll(limit, agentFilter.trim(), genRef.current)}
+                onClick={() => void loadAll(limit, agentFilter.trim(), vaultGenRef.current, daemonGenRef.current)}
                 disabled={loading}
               >
                 {loading ? "…" : "Refresh"}

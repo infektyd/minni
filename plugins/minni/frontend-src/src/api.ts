@@ -235,10 +235,11 @@ export interface EventsResponse {
   error?: string;
 }
 
-export function getEvents(sinceId?: number, agent?: string): Promise<EventsResponse> {
+export function getEvents(sinceId?: number, agent?: string, limit?: number): Promise<EventsResponse> {
   const params = new URLSearchParams();
   if (sinceId !== undefined) params.set("since_id", String(sinceId));
   if (agent) params.set("agent", agent);
+  if (limit !== undefined) params.set("limit", String(limit));
   const qs = params.toString();
   return jsonFetch<EventsResponse>(`/api/events${qs ? `?${qs}` : ""}`).then((r) => {
     if (r && typeof r === "object" && r.ok === false) {
