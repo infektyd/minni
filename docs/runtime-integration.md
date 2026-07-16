@@ -58,6 +58,33 @@ Guard decisions are audited per agent (`hook_*_pretooluse_guard` entries in
 the vault's `log.md`); `minni watch` shows them live alongside recalls and
 learns.
 
+## Console observability
+
+The web console is the browser counterpart to `minni watch`. Start it from
+`plugins/minni` with `npm run console`; it binds to `127.0.0.1:8765` only and
+prints a one-time URL with a `?token=` query parameter on boot. Every
+`/api/*` route (except `/api/health`) requires that bearer token — set
+`MINNI_CONSOLE_TOKEN` to pin a stable token instead of the generated one.
+
+Two views answer "did the model actually use minni?":
+
+- **Sessions** — one row per boot/stop window found in each agent's
+  `log.md`, with the same receipt tally the Stop hook emits (recalls
+  strong/weak, guard denials, learns, candidates staged). An all-zero row is
+  itself the answer: the session ran without touching memory. Sessions older
+  than the rolling log's rotation horizon drop off the list; the durable
+  record remains in the vault's rotated logs.
+- **Audit (live)** — a polling activity feed with two lanes: the vault lane
+  (hook and MCP tool entries from `log.md`, what `minni watch` tails) and
+  the daemon lane (episodic events, including `recall` traces from raw
+  JSON-RPC `search` calls, fetched through the read-only `list_events` RPC).
+  Together the lanes cover both hook-wired runtimes and agents speaking
+  JSON-RPC directly, matching `minni watch`'s coverage.
+
+The console's data paths are read-only: vault logs are read without
+materializing vault skeletons, and `list_events` is capability-gated under
+`read` and performs a single parameterized SELECT.
+
 ## Local AFM and Extraction
 
 The engine includes local provider helpers for OpenAI-compatible model bridges.
