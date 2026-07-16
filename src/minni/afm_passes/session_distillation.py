@@ -75,25 +75,37 @@ def _recent_events(db, lookback_hours: int, agent_id: Optional[str] = None) -> L
         return [dict(row) for row in c.fetchall()]
 
 
-def _recent_raw_docs(db, lookback_hours: int, agent_id: Optional[str] = None) -> List[Dict[str, Any]]:
+def _recent_raw_docs(
+    db,
+    lookback_hours: int,
+    agent_id: Optional[str] = None,
+    vault_path: Optional[str] = None,
+) -> List[Dict[str, Any]]:
     cutoff = time.time() - (lookback_hours * 3600)
     with db.cursor() as c:
         if agent_id:
             # Finding 9: ownership AND raw classification — never OR agent=?
             # alone (that pulled every document owned by the agent, and worse
             # the old OR path also returned other agents' raw/* rows).
+            # Frontmatter-less raw notes are indexed with agent='unknown';
+            # those stay visible ONLY when they live under the bound agent's
+            # own vault path — vault containment substitutes for the missing
+            # ownership stamp without re-opening foreign raw/* rows.
+            vault_prefix = None
+            if vault_path:
+                vault_prefix = str(Path(vault_path).expanduser().resolve()) + "/%"
             c.execute(
                 """
                 SELECT doc_id, path, agent, page_type, page_status, privacy_level, indexed_at, last_modified
                 FROM documents
-                WHERE agent = ?
+                WHERE (agent = ? OR (agent = 'unknown' AND ? IS NOT NULL AND path LIKE ?))
                   AND (path LIKE '%/raw/%' OR path LIKE 'raw/%')
                   AND COALESCE(indexed_at, last_modified, 0) >= ?
                   AND COALESCE(privacy_level, 'safe') = 'safe'
                 ORDER BY COALESCE(indexed_at, last_modified, 0) DESC
                 LIMIT 50
                 """,
-                (agent_id, cutoff),
+                (agent_id, vault_prefix, vault_prefix or "", cutoff),
             )
         else:
             c.execute(
@@ -618,7 +630,12 @@ def run(
     )
     bound_agent = str(bound_agent).strip() if bound_agent and str(bound_agent).strip() else "unknown"
     events = _recent_events(db, lookback_hours, agent_id=bound_agent)
-    raw_docs = _recent_raw_docs(db, lookback_hours, agent_id=bound_agent)
+    raw_docs = _recent_raw_docs(
+        db,
+        lookback_hours,
+        agent_id=bound_agent,
+        vault_path=vault_path or getattr(config, "vault_path", None),
+    )
     pass_input = {
         "lookback_hours": lookback_hours,
         "bound_agent": bound_agent,

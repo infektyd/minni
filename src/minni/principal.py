@@ -521,10 +521,24 @@ def resolve_effective_principal(
             else:
                 resolved_caps = []
             # Finding 6 residual: never copy the operator stamp's vault roots onto a
-            # platform agent. Optional per-id map; missing / empty / malformed entry
+            # platform agent. Optional per-id map; a present-but-empty/malformed entry
             # → fail-closed sentinel (empty+caps would otherwise vacuous-allow every
             # path via allows_vault_root; a string value must not be iterated as chars).
+            # A MISSING entry is not a lockout: existing installs using only
+            # platform_agent_ids + platform_agent_capabilities predate the roots map,
+            # and their platform principals must keep pathed access to their own
+            # ~/.minni/<agent>-vault (both the literal id and the dashless alias the
+            # installer uses, e.g. claude-code → claudecode-vault). Never the
+            # operator's roots.
             _PLATFORM_NO_ROOTS = ["/.minni-platform-no-vault-roots"]
+
+            def _default_platform_roots(agent_id: str) -> list[str]:
+                minni_home = Path(
+                    os.environ.get("MINNI_HOME") or (Path.home() / ".minni")
+                ).expanduser()
+                names = {f"{agent_id}-vault", f"{agent_id.replace('-', '')}-vault"}
+                return [str((minni_home / n).resolve()) for n in sorted(names)]
+
             platform_roots = raw.get("platform_agent_vault_roots") or {}
             platform_roots_map = (
                 platform_roots if isinstance(platform_roots, dict) else {}
@@ -542,7 +556,7 @@ def resolve_effective_principal(
                     if not resolved_roots:
                         resolved_roots = list(_PLATFORM_NO_ROOTS)
             else:
-                resolved_roots = list(_PLATFORM_NO_ROOTS)
+                resolved_roots = _default_platform_roots(supplied)
             raw_ws = raw.get("workspace_id")
             resolved_ws = raw_ws if raw_ws is not None else stamped.workspace_id
             return EffectivePrincipal(

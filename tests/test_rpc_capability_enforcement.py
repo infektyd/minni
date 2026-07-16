@@ -295,3 +295,42 @@ def test_platform_agent_empty_or_malformed_vault_roots_fail_closed(tmp_path: Pat
         assert "/.minni-platform-no-vault-roots" in p.allowed_vault_roots or not p.allows_vault_root(
             "/"
         )
+
+
+def test_platform_agent_missing_roots_map_keeps_own_vault(tmp_path: Path, monkeypatch):
+    """PR167 review: strict installs predating platform_agent_vault_roots must
+    keep pathed access to the platform agent's OWN vault (never the
+    operator's). Both the literal id and the dashless installer alias count
+    (claude-code -> claudecode-vault)."""
+    principals = tmp_path / "principals"
+    principals.mkdir()
+    minni_home = tmp_path / "minni-home"
+    (minni_home / "claude-code-vault").mkdir(parents=True)
+    (minni_home / "claudecode-vault").mkdir(parents=True)
+    operator_root = tmp_path / "operator-vault"
+    operator_root.mkdir()
+    monkeypatch.setenv("MINNI_HOME", str(minni_home))
+
+    f = principals / "local.json"
+    f.write_text(
+        json.dumps(
+            {
+                "agent_id": "main",
+                "capabilities": ["*"],
+                "allowed_vault_roots": [str(operator_root)],
+                "platform_agent_ids": ["claude-code"],
+                "platform_agent_capabilities": {"claude-code": ["search", "read"]},
+            }
+        ),
+        encoding="utf-8",
+    )
+    os.chmod(f, 0o600)
+
+    from minni.principal import resolve_effective_principal
+
+    p = resolve_effective_principal(
+        supplied_agent_id="claude-code", transport="uds", principals_dir=principals
+    )
+    assert p.allows_vault_root(minni_home / "claude-code-vault")
+    assert p.allows_vault_root(minni_home / "claudecode-vault")
+    assert not p.allows_vault_root(operator_root)

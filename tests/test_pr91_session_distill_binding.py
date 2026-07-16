@@ -5,6 +5,7 @@ globally; the CLI consolidation entrypoint must propagate --agent/MINNI_AGENT_ID
 from __future__ import annotations
 
 import os
+import time
 import types
 
 import minni.afm_passes.session_distillation as sd
@@ -17,8 +18,9 @@ def _capture_agent(monkeypatch):
         seen["events_agent"] = agent_id
         return []
 
-    def _fake_docs(db, lookback_hours, agent_id=None):
+    def _fake_docs(db, lookback_hours, agent_id=None, vault_path=None):
         seen["docs_agent"] = agent_id
+        seen["docs_vault"] = vault_path
         return []
 
     monkeypatch.setattr(sd, "_recent_events", _fake_events)
@@ -147,3 +149,50 @@ def test_recent_raw_docs_does_not_return_foreign_agent_raw_paths(tmp_path):
     rows = sd._recent_raw_docs(db_obj, lookback_hours=24, agent_id="attacker")
     paths = [r["path"] for r in rows]
     assert paths == ["attacker-vault/raw/own-note.md"]
+
+
+def test_raw_docs_include_own_vault_unknown_but_not_foreign(tmp_path):
+    """PR167 review: frontmatter-less raw notes are indexed agent='unknown';
+    they must stay visible to their own vault's distillation (vault-path
+    containment) without re-opening other vaults' unattributed raw docs."""
+    import minni.db as db_mod
+    from minni.config import SovereignConfig
+
+    cfg = SovereignConfig(db_path=str(tmp_path / "raw.db"), afm_loop_schedule={})
+    old_flag = db_mod._migrations_run
+    db_mod._migrations_run = False
+    try:
+        db_obj = db_mod.SovereignDB(cfg)
+        db_obj._get_conn()
+    finally:
+        db_mod._migrations_run = old_flag
+
+    own_vault = tmp_path / "codex-vault"
+    foreign_vault = tmp_path / "other-vault"
+    now = time.time()
+    rows = [
+        (str(own_vault / "raw" / "own-unknown.md"), "unknown"),
+        (str(own_vault / "raw" / "own-stamped.md"), "codex"),
+        (str(foreign_vault / "raw" / "foreign-unknown.md"), "unknown"),
+        (str(foreign_vault / "raw" / "foreign-stamped.md"), "gemini"),
+    ]
+    with db_obj.cursor() as c:
+        for path, agent in rows:
+            c.execute(
+                "INSERT INTO documents (path, agent, indexed_at, last_modified) VALUES (?, ?, ?, ?)",
+                (path, agent, now, now),
+            )
+
+    docs = sd._recent_raw_docs(
+        db_obj, lookback_hours=24, agent_id="codex", vault_path=str(own_vault)
+    )
+    paths = {d["path"] for d in docs}
+    assert str(own_vault / "raw" / "own-unknown.md") in paths
+    assert str(own_vault / "raw" / "own-stamped.md") in paths
+    assert str(foreign_vault / "raw" / "foreign-unknown.md") not in paths
+    assert str(foreign_vault / "raw" / "foreign-stamped.md") not in paths
+
+    # Without a vault path, unknown raw docs stay excluded (fail closed).
+    docs_no_vault = sd._recent_raw_docs(db_obj, lookback_hours=24, agent_id="codex")
+    paths_no_vault = {d["path"] for d in docs_no_vault}
+    assert str(own_vault / "raw" / "own-unknown.md") not in paths_no_vault
