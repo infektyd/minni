@@ -209,6 +209,48 @@ def test_empty_result_returns_empty_list_and_last_id_equals_since_id(monkeypatch
     assert resp["result"]["last_id"] == 42
 
 
+def test_non_operator_without_filter_is_scoped_to_own_agent(monkeypatch, tmp_path):
+    """A plain read principal omitting agent_id must NOT see other agents' rows."""
+    db_obj = _patch_db(monkeypatch, tmp_path)
+    _stamp(monkeypatch, "codex", ["read"])
+    own_id = _insert_event(db_obj, agent_id="codex", event_type="note", content="mine")
+    _insert_event(db_obj, agent_id="other", event_type="recall", content="theirs")
+
+    resp = _rpc("list_events", {})
+    assert "error" not in resp, resp
+    events = resp["result"]["events"]
+    assert [e["event_id"] for e in events] == [own_id]
+    assert all(e["agent_id"] == "codex" for e in events)
+
+
+def test_non_operator_cross_agent_filter_is_denied(monkeypatch, tmp_path):
+    """A plain read principal naming another agent's id gets a -32004 denial."""
+    db_obj = _patch_db(monkeypatch, tmp_path)
+    _stamp(monkeypatch, "codex", ["read"])
+    _insert_event(db_obj, agent_id="other", event_type="recall", content="theirs")
+
+    resp = _rpc("list_events", {"agent_id": "other"})
+    err = resp.get("error", {})
+    assert err.get("code") == -32004, resp
+    assert "cross_agent" in err.get("message", ""), resp
+
+
+def test_operator_principal_sees_all_agents_and_may_filter(monkeypatch, tmp_path):
+    """Operator context (govern cap) keeps the cross-agent console view."""
+    db_obj = _patch_db(monkeypatch, tmp_path)
+    _stamp(monkeypatch, "main", ["read", "govern"])
+    id_codex = _insert_event(db_obj, agent_id="codex", event_type="note", content="a")
+    id_other = _insert_event(db_obj, agent_id="other", event_type="recall", content="b")
+
+    unfiltered = _rpc("list_events", {})
+    assert "error" not in unfiltered, unfiltered
+    assert [e["event_id"] for e in unfiltered["result"]["events"]] == [id_codex, id_other]
+
+    filtered = _rpc("list_events", {"agent_id": "other"})
+    assert "error" not in filtered, filtered
+    assert [e["event_id"] for e in filtered["result"]["events"]] == [id_other]
+
+
 def test_default_since_id_and_limit(monkeypatch, tmp_path):
     db_obj = _patch_db(monkeypatch, tmp_path)
     _stamp(monkeypatch, "codex", ["read"])

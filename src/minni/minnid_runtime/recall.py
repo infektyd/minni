@@ -1005,6 +1005,21 @@ def handle_list_events(params: dict, request_id: Any, context: RecallContext) ->
     if event_type_filter is not None and not isinstance(event_type_filter, str):
         return context.make_error(-32602, "event_type must be a string", request_id)
 
+    # Cross-agent visibility follows the same gate as search.cross_agent:
+    # a plain read principal is scoped to its own stamped agent_id; only
+    # cross_agent/govern/operator principals may omit the filter or name
+    # another agent (the console's zero-config operator keeps its fleet view).
+    principal_agent = getattr(principal, "agent_id", None)
+    if principal is None or not allows_cross_agent_recall(principal):
+        if agent_id_filter is not None and agent_id_filter != principal_agent:
+            return make_capability_denied_error(
+                "cross_agent",
+                "list_events",
+                request_id,
+                principal_id=principal_agent,
+            )
+        agent_id_filter = principal_agent
+
     db = None
     try:
         db = context.sovereign_db()
