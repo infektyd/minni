@@ -1337,15 +1337,29 @@ def verify(args: argparse.Namespace) -> int:
     proc = subprocess.run(cmd, cwd=str(run_cwd), text=True, capture_output=True, check=False)
     checks["agent_api_returncode"] = proc.returncode
     checks["agent_api_has_identity"] = f"## Agent Identity: {agent.title()}" in proc.stdout
-    checks["agent_api_has_map_rule"] = "hosted agents a map" in proc.stdout
-    checks["agent_api_no_personality"] = "does not define" in proc.stdout
+    identity_text = proc.stdout.lower()
+    checks["agent_api_has_map_rule"] = (
+        "map" in identity_text
+        and "hosted_agent_envelope" in identity_text
+    )
+    # Hosted agents may have an explicitly agent-authored persona slot.  The
+    # boundary being verified is that Minni does not supply a replacement soul
+    # or override the host runtime, not that the word "personality" is absent.
+    checks["agent_api_no_personality"] = (
+        ("not a soul" in identity_text or "does not define personality" in identity_text)
+        and ("subordinate" in identity_text or "host runtime" in identity_text)
+    )
 
     if socket_path.exists():
         try:
             resp = socket_rpc(socket_path, "read", {"agent_id": agent, "limit": 3})
             context = resp.get("result", {}).get("context", "")
             checks["daemon_read_has_identity"] = f"## Agent Identity: {agent.title()}" in context
-            checks["daemon_read_has_map_rule"] = "hosted agents a map" in context
+            context_lower = context.lower()
+            checks["daemon_read_has_map_rule"] = (
+                "map" in context_lower
+                and "hosted_agent_envelope" in context_lower
+            )
         except Exception as exc:  # noqa: BLE001
             checks["daemon_read_error"] = str(exc)
     else:

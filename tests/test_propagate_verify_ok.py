@@ -133,9 +133,30 @@ import sqlite3  # noqa: E402
 def _identity_text(agent: str) -> str:
     return (
         f"## Agent Identity: {agent.title()}\n"
-        "Minni gives hosted agents a map of prior work.\n"
-        "It does not define personality.\n"
+        "Minni gives hosted agents a map plus an agent-authored persona slot.\n"
+        "minni_layer_mode: hosted_agent_envelope\n"
+        "This is not a soul and remains subordinate to the host runtime.\n"
     )
+
+
+def test_current_hosted_envelope_contract_is_not_a_personality_false_positive(
+    tmp_path, capsys, monkeypatch
+):
+    """The current persona-slot template is still a hosted map, not a soul."""
+    sock = tmp_path / "minnid.sock"
+    sock.write_text("")
+    _fake_agent_api(monkeypatch, "codex")
+    monkeypatch.setattr(
+        propagate,
+        "socket_rpc",
+        lambda *_a, **_k: {"result": {"context": _identity_text("codex")}},
+    )
+
+    args = argparse.Namespace(agent="codex", workspace=str(tmp_path), socket=str(sock))
+    assert propagate.verify(args) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["checks"]["agent_api_has_map_rule"] is True
+    assert report["checks"]["agent_api_no_personality"] is True
 
 
 def _fake_agent_api(monkeypatch, agent: str, returncode: int = 0):
