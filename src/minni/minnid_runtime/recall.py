@@ -968,6 +968,91 @@ def handle_sm_export_pack(params: dict, request_id: Any, context: RecallContext)
         return context.make_error(-32000, f"Export pack error: {exc}", request_id)
 
 
+def handle_list_events(params: dict, request_id: Any, context: RecallContext) -> dict:
+    """Read-only cursor listing over episodic_events.
+
+    Plain parameterized SELECT — no INSERT/UPDATE/DELETE, no FTS, no side
+    effects. Params: since_id (default 0), limit (default 50, clamp 1-200),
+    agent_id (optional filter), event_type (optional filter). Result is
+    ordered by event_id ASC so a caller can page with
+    since_id=last_id from the previous response.
+    """
+    if context.increment_request_count is not None:
+        context.increment_request_count()
+    started_at = time.perf_counter()
+
+    principal, err = context.handler_principal(params, request_id)
+    if err:
+        return err
+
+    since_id_raw = params.get("since_id", 0)
+    if isinstance(since_id_raw, bool) or not isinstance(since_id_raw, int):
+        return context.make_error(-32602, "since_id must be an integer", request_id)
+    since_id = since_id_raw
+
+    limit_raw = params.get("limit", 50)
+    if isinstance(limit_raw, bool) or not isinstance(limit_raw, int):
+        return context.make_error(-32602, "limit must be an integer", request_id)
+    if limit_raw < 1:
+        return context.make_error(-32602, "limit must be >= 1", request_id)
+    limit = min(limit_raw, 200)
+
+    agent_id_filter = params.get("agent_id")
+    if agent_id_filter is not None and not isinstance(agent_id_filter, str):
+        return context.make_error(-32602, "agent_id must be a string", request_id)
+
+    event_type_filter = params.get("event_type")
+    if event_type_filter is not None and not isinstance(event_type_filter, str):
+        return context.make_error(-32602, "event_type must be a string", request_id)
+
+    db = None
+    try:
+        db = context.sovereign_db()
+        query = (
+            "SELECT event_id, agent_id, event_type, content, created_at, thread_id "
+            "FROM episodic_events WHERE event_id > :since_id"
+        )
+        bindings: dict = {"since_id": since_id, "limit": limit}
+        if agent_id_filter is not None:
+            query += " AND agent_id = :agent_id"
+            bindings["agent_id"] = agent_id_filter
+        if event_type_filter is not None:
+            query += " AND event_type = :event_type"
+            bindings["event_type"] = event_type_filter
+        query += " ORDER BY event_id ASC LIMIT :limit"
+
+        with db.cursor() as c:
+            c.execute(query, bindings)
+            rows = c.fetchall()
+
+        events = [
+            {
+                "event_id": row["event_id"],
+                "agent_id": row["agent_id"],
+                "event_type": row["event_type"],
+                "content": row["content"],
+                "created_at": row["created_at"],
+                "thread_id": row["thread_id"],
+            }
+            for row in rows
+        ]
+        last_id = events[-1]["event_id"] if events else since_id
+        return context.make_response({
+            "events": events,
+            "last_id": last_id,
+        }, request_id)
+    except Exception as exc:
+        context.logger.exception("list_events failed")
+        return context.make_error(-32000, f"list_events error: {exc}", request_id)
+    finally:
+        if db is not None and hasattr(db, "close"):
+            try:
+                db.close()
+            except Exception:
+                pass
+        context.record_latency("list_events", time.perf_counter() - started_at)
+
+
 def handle_read(params: dict, request_id: Any, context: RecallContext) -> dict:
     """Read agent startup context (identity + knowledge + learnings)."""
     if context.increment_request_count is not None:

@@ -177,6 +177,7 @@ from minni.minnid_runtime.recall import (  # noqa: E402
     RecallContext,
     handle_expand as _runtime_handle_expand,
     handle_feedback as _runtime_handle_feedback,
+    handle_list_events as _runtime_handle_list_events,
     handle_read as _runtime_handle_read,
     handle_search as _runtime_handle_search,
     handle_sm_drill as _runtime_handle_sm_drill,
@@ -778,6 +779,10 @@ def _handle_read(params: dict, request_id: Any) -> dict:
     return _runtime_handle_read(params, request_id, _recall_context())
 
 
+def _handle_list_events(params: dict, request_id: Any) -> dict:
+    return _runtime_handle_list_events(params, request_id, _recall_context())
+
+
 def _increment_governance_request_count() -> None:
     global _request_count
     _request_count += 1
@@ -989,6 +994,7 @@ _METHODS: Dict[str, callable] = {
     "sm_drill":               _handle_sm_drill,
     "sm_export_pack":         _handle_sm_export_pack,
     "read":                   _handle_read,
+    "list_events":            _handle_list_events,
     "learn":                  _handle_learn,
     "resolve_contradiction":  _handle_resolve_contradiction,
     "minni_subscribe_contradictions": _handle_subscribe_contradictions,
