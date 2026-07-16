@@ -1915,22 +1915,25 @@ class RetrievalEngine:
                     if row is not None:
                         break
                 if row is not None:
-                    # R4: neighborhood summaries are a read surface — gate every
-                    # linked doc through can_read_document so restricted/foreign/
-                    # blocked memory never leaks via the wikilink graph. When no
-                    # principal is supplied (legacy back-compat), fall through
-                    # ungated as before.
-                    if principal is not None:
-                        raw = {
-                            "doc_id": row["doc_id"],
-                            "path": row["path"],
-                            "agent": row["agent"],
-                            "privacy_level": row["privacy_level"],
-                            "page_type": row["page_type"],
-                            "page_status": row["page_status"],
-                        }
-                        if not can_read_document(principal, ws, raw):
-                            continue
+                    # R4 / Finding 10: neighborhood summaries are a read surface —
+                    # require a principal (fail closed) and gate every linked doc
+                    # through can_read_document + the same lifecycle exclusions
+                    # retrieve uses (draft/rejected/superseded/expired).
+                    if principal is None:
+                        continue
+                    raw = {
+                        "doc_id": row["doc_id"],
+                        "path": row["path"],
+                        "agent": row["agent"],
+                        "privacy_level": row["privacy_level"],
+                        "page_type": row["page_type"],
+                        "page_status": row["page_status"],
+                    }
+                    status = (row["page_status"] or "candidate").lower()
+                    if status in {"draft", "rejected", "superseded", "expired"}:
+                        continue
+                    if not can_read_document(principal, ws, raw):
+                        continue
                     contexts.append({
                         "link": link,
                         "doc_id": row["doc_id"],

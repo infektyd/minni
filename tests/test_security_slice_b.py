@@ -116,6 +116,65 @@ def test_fetch_linked_context_rejects_like_wildcard(tmp_path):
     assert contexts == [], contexts
 
 
+def test_fetch_linked_context_skips_lifecycle_excluded_docs(tmp_path):
+    """Finding 10: draft/rejected/superseded/expired neighbors must not surface."""
+    engine, db_obj, cfg = _make_engine(tmp_path)
+    _seed_doc(
+        db_obj,
+        "wiki/draft-note.md",
+        "codex",
+        "draft body that must stay hidden",
+        privacy="safe",
+        status="draft",
+    )
+    principal = EffectivePrincipal(agent_id="codex", capabilities=["read", "search"])
+    contexts = engine._fetch_linked_context(
+        ["wiki/draft-note"], principal=principal, workspace="default"
+    )
+    assert contexts == [], contexts
+
+
+def test_fetch_linked_context_fails_closed_without_principal(tmp_path):
+    """Finding 10: mediated neighborhood path must not fall through ungated."""
+    engine, db_obj, cfg = _make_engine(tmp_path)
+    _seed_doc(db_obj, "wiki/my-note.md", "codex", "safe body", privacy="safe")
+    contexts = engine._fetch_linked_context(
+        ["wiki/my-note"], principal=None, workspace="default"
+    )
+    assert contexts == [], contexts
+
+
+def test_fetch_linked_context_denies_foreign_safe_session(tmp_path):
+    """Finding 10: accepted/safe session pages must not cross-agent via wikilinks."""
+    engine, db_obj, cfg = _make_engine(tmp_path)
+    _seed_doc(
+        db_obj,
+        "wiki/sessions/other.md",
+        "other-agent",
+        "FOREIGN SESSION SECRET",
+        privacy="safe",
+        status="accepted",
+        page_type="session",
+    )
+    # Also the legacy wiki:session stamp shape.
+    _seed_doc(
+        db_obj,
+        "wiki/sessions/legacy.md",
+        "wiki:session",
+        "LEGACY SESSION SECRET",
+        privacy="safe",
+        status="accepted",
+        page_type="session",
+    )
+    principal = EffectivePrincipal(agent_id="codex", capabilities=["read", "search"])
+    contexts = engine._fetch_linked_context(
+        ["wiki/sessions/other", "wiki/sessions/legacy"],
+        principal=principal,
+        workspace="default",
+    )
+    assert contexts == [], contexts
+
+
 # ── M3: expand_result must surface real privacy/status ──────────────────────
 
 

@@ -520,6 +520,29 @@ def resolve_effective_principal(
                 resolved_caps = platform_caps_map[supplied]
             else:
                 resolved_caps = []
+            # Finding 6 residual: never copy the operator stamp's vault roots onto a
+            # platform agent. Optional per-id map; missing / empty / malformed entry
+            # → fail-closed sentinel (empty+caps would otherwise vacuous-allow every
+            # path via allows_vault_root; a string value must not be iterated as chars).
+            _PLATFORM_NO_ROOTS = ["/.minni-platform-no-vault-roots"]
+            platform_roots = raw.get("platform_agent_vault_roots") or {}
+            platform_roots_map = (
+                platform_roots if isinstance(platform_roots, dict) else {}
+            )
+            if supplied in platform_roots_map:
+                raw_roots = platform_roots_map[supplied]
+                if not isinstance(raw_roots, list) or not raw_roots:
+                    resolved_roots = list(_PLATFORM_NO_ROOTS)
+                else:
+                    resolved_roots = [
+                        str(Path(r).expanduser().resolve())
+                        for r in raw_roots
+                        if isinstance(r, str) and r.strip()
+                    ]
+                    if not resolved_roots:
+                        resolved_roots = list(_PLATFORM_NO_ROOTS)
+            else:
+                resolved_roots = list(_PLATFORM_NO_ROOTS)
             raw_ws = raw.get("workspace_id")
             resolved_ws = raw_ws if raw_ws is not None else stamped.workspace_id
             return EffectivePrincipal(
@@ -528,7 +551,7 @@ def resolve_effective_principal(
                 session_id=raw.get("session_id"),
                 transport=transport,
                 capabilities=list(resolved_caps),
-                allowed_vault_roots=stamped.allowed_vault_roots,
+                allowed_vault_roots=resolved_roots,
             )
 
     # Check legacy aliases declared across ALL principal files that exist (union).
@@ -671,14 +694,36 @@ def can_read_document(
     agent = str(
         doc_metadata.get("agent") or doc_metadata.get("sigil") or "unknown"
     ).strip()
+    agent_l = agent.lower()
+    page_type = str(doc_metadata.get("page_type") or "").lower()
 
-    # Same-agent → visible (if vault/privacy passed).
-    if agent == principal.agent_id:
+    # Same-agent → visible (if vault/privacy passed). Exception: the legacy
+    # "unknown" sentinel must not count as a real owner for session pages — a
+    # principal literally named "unknown" must not inherit every unattributed
+    # session via the same-agent shortcut.
+    if agent == principal.agent_id and not (
+        page_type == "session" and agent_l == "unknown"
+    ):
         return True
+
+    # Finding 10: session notes are agent-scoped. Deny foreign sessions BEFORE
+    # the legacy agent="unknown" grant — otherwise unattributed sessions with
+    # missing agent metadata become cross-agent readable.
+    if (
+        page_type == "session"
+        or agent_l == "wiki:session"
+        or agent_l.startswith("session:")
+    ):
+        # Operators may still audit (governance) below.
+        if not is_operator_principal(principal):
+            return False
+
     # Legacy "unknown"-attributed docs are visible to any *capable* principal,
     # but never to a default-deny stamp (no capabilities AND no vault roots = an
     # unknown/unauthorized identity). allows_vault_root already gates pathed docs
     # for default-deny; this also closes pathless agent="unknown" docs. (B2.)
+    # Session pages already handled above — unknown+session never reaches here
+    # for non-operators.
     if agent == "unknown" and (principal.capabilities or principal.allowed_vault_roots):
         return True
 
@@ -693,12 +738,12 @@ def can_read_document(
 
     # Shared wiki / handoff / synthesis / decision pages are intentionally cross-visible
     # when the principal's vault roots allow the path and the page is not private.
-    page_type = str(doc_metadata.get("page_type") or "").lower()
+    # (session deliberately excluded — see above.)
     if (
-        page_type in {"wiki", "handoff", "synthesis", "decision", "session"}
-        or agent.lower().startswith(("wiki:", "handoff"))
-        or "wiki" in agent.lower()
-        or "handoff" in agent.lower()
+        page_type in {"wiki", "handoff", "synthesis", "decision"}
+        or agent_l.startswith(("wiki:", "handoff"))
+        or "wiki" in agent_l
+        or "handoff" in agent_l
     ):
         return True
 
