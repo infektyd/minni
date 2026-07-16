@@ -144,7 +144,7 @@ def test_antigravity_platform_spec_uses_gemini_agent():
     spec = propagate.platform_spec("antigravity", Path.home() / "Projects" / "minni")
     assert spec["agent"] == "gemini"
     assert spec["config_kind"] == "antigravity"
-    assert str(spec["install"]).endswith(".gemini/extensions/minni")
+    assert str(spec["install"]).endswith(".agents/plugins/minni@minni")
 
 
 def test_antigravity_aliases_resolve():

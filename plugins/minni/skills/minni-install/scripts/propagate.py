@@ -883,13 +883,13 @@ def platform_spec(platform: str, repo_root: Path, install_root: str | None = Non
         },
         "gemini": {
             "agent": "gemini",
-            "install": home / ".gemini/extensions/minni",
+            "install": home / ".agents/plugins/minni@minni",
             "config_kind": "gemini-manifest",
         },
         "antigravity": {
             # CLI `agy` + IDE + antigravity, all agent id `gemini`, shared ~/.gemini tree.
             "agent": "gemini",
-            "install": home / ".gemini/extensions/minni",
+            "install": home / ".agents/plugins/minni@minni",
             "config_kind": "antigravity",
         },
         "grok": {
