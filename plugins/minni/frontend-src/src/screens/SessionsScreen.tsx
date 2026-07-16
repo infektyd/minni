@@ -35,10 +35,17 @@ export function SessionsScreen({
     }
   };
 
+  // Reload whenever the agent filter changes (debounced ~300ms) so the table
+  // and the header SCOPE meta always describe the same query — matching the
+  // Audit screen, which refetches on filter change. Also covers the initial
+  // mount load.
   useEffect(() => {
-    void load();
+    const t = window.setTimeout(() => {
+      void load();
+    }, 300);
+    return () => window.clearTimeout(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [agentFilter]);
 
   return (
     <>

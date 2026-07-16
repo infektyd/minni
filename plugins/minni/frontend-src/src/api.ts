@@ -540,6 +540,26 @@ export function getAuditTail(limit = 20, agent?: string): Promise<AuditTailResul
   return jsonFetch<AuditTailResult>(`/api/audit-tail?${params.toString()}`);
 }
 
+// Fleet-wide vault tail: `agent=*` merges every resolved vault's audit tail,
+// each entry pre-tagged with its owning agent id, newest-first, capped at limit.
+export interface FleetAuditEntry {
+  agent: string;
+  text: string;
+}
+
+export interface FleetAuditResult {
+  merged: true;
+  entries: FleetAuditEntry[];
+}
+
+export function getAuditTailFleet(limit = 20): Promise<FleetAuditResult> {
+  const safeLimit = Math.max(1, Math.min(100, Math.floor(limit) || 20));
+  const params = new URLSearchParams();
+  params.set("limit", String(safeLimit));
+  params.set("agent", "*");
+  return jsonFetch<FleetAuditResult>(`/api/audit-tail?${params.toString()}`);
+}
+
 export interface PrepareTaskRequest {
   task: string;
   profile?: TaskProfile;

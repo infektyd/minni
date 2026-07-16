@@ -1252,6 +1252,24 @@ test("/api/events rejects bad since_id, limit, event_type, and agent with 400", 
   }
 });
 
+test("/api/events clamps limit=0 up to 1 before forwarding to the daemon", async () => {
+  let seen;
+  const server = await startTestServer({
+    daemonRpc: async (method, params) => {
+      seen = { method, params };
+      return { events: [], last_id: 0 };
+    },
+  });
+  try {
+    const res = await fetch(`${server.baseUrl}/api/events?limit=0`, { headers: authHeaders() });
+    assert.equal(res.status, 200, "limit=0 is a valid (bounded) page, not a 400");
+    assert.equal(seen.method, "list_events");
+    assert.equal(seen.params.limit, 1, "0 clamps to the daemon's minimum of 1, never forwarded as 0");
+  } finally {
+    await server.close();
+  }
+});
+
 test("/api/events requires auth (403 unauthed)", async () => {
   const server = await startTestServer({ daemonRpc: async () => ({ events: [], last_id: 0 }) });
   try {
@@ -1297,6 +1315,173 @@ test("/api/audit-tail?agent= serves a second vault read-only, 404s unknown agent
     // Malformed agent → 400.
     const bad = await fetch(`${server.baseUrl}/api/audit-tail?agent=Bad%20One`, { headers: authHeaders() });
     assert.equal(bad.status, 400);
+  } finally {
+    await server.close();
+  }
+});
+
+// ── Finding 1: console honors MINNI_AGENT_VAULTS remaps ─────────────────────
+
+async function withAgentVaults(mappingJson, fn) {
+  const original = process.env.MINNI_AGENT_VAULTS;
+  if (mappingJson === undefined) delete process.env.MINNI_AGENT_VAULTS;
+  else process.env.MINNI_AGENT_VAULTS = mappingJson;
+  try {
+    return await fn();
+  } finally {
+    if (original === undefined) delete process.env.MINNI_AGENT_VAULTS;
+    else process.env.MINNI_AGENT_VAULTS = original;
+  }
+}
+
+test("buildSessionsCatalogue includes a MINNI_AGENT_VAULTS-mapped vault outside home, labeled with the mapped id", async () => {
+  const { buildSessionsCatalogue } = await import("../dist/ui-server.js");
+  const { mkdtempSync, mkdirSync, writeFileSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const pathMod = await import("node:path");
+  const home = mkdtempSync(pathMod.join(tmpdir(), "minni-remap-home-"));
+  mkdirSync(pathMod.join(home, "codex-vault"), { recursive: true });
+  writeFileSync(
+    pathMod.join(home, "codex-vault", "log.md"),
+    "## [2026-05-01T00:00:00Z] boot | boot sess-codex\n",
+  );
+  // A vault that lives OUTSIDE home, reached only via the operator mapping.
+  const outside = mkdtempSync(pathMod.join(tmpdir(), "minni-remap-outside-"));
+  writeFileSync(pathMod.join(outside, "log.md"), "## [2026-05-05T00:00:00Z] boot | boot sess-loadgen\n");
+
+  await withAgentVaults(JSON.stringify({ loadgen: outside }), async () => {
+    const catalogue = await buildSessionsCatalogue({ homePath: home });
+    const ids = catalogue.sessions.map((s) => s.session_id);
+    assert.deepEqual(ids, ["sess-loadgen", "sess-codex"], "mapped outside vault included, newest-first");
+    const loadgen = catalogue.sessions.find((s) => s.session_id === "sess-loadgen");
+    assert.equal(loadgen.agent, "loadgen", "labeled with the mapped agent id");
+  });
+});
+
+test("/api/audit-tail?agent=<mapped> serves a MINNI_AGENT_VAULTS vault outside home", async () => {
+  const { mkdtempSync, mkdirSync, writeFileSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const pathMod = await import("node:path");
+  const home = mkdtempSync(pathMod.join(tmpdir(), "minni-remap-audit-home-"));
+  const outside = mkdtempSync(pathMod.join(tmpdir(), "minni-remap-audit-out-"));
+  mkdirSync(pathMod.join(outside, "logs"), { recursive: true });
+  const today = new Date().toISOString().slice(0, 10);
+  writeFileSync(
+    pathMod.join(outside, "logs", `${today}.md`),
+    `## [${today}T00:00:00Z] learn | loadgen mapped entry\n`,
+  );
+  await withAgentVaults(JSON.stringify({ loadgen: outside }), async () => {
+    const server = await startTestServer({
+      minniHomePath: home,
+      auditTail: async () => {
+        throw new Error("default seam must not be used for the mapped agent path");
+      },
+    });
+    try {
+      const res = await fetch(`${server.baseUrl}/api/audit-tail?agent=loadgen`, { headers: authHeaders() });
+      assert.equal(res.status, 200);
+      const body = await res.json();
+      assert.equal(body.entries.length, 1);
+      assert.match(body.entries[0], /loadgen mapped entry/);
+    } finally {
+      await server.close();
+    }
+  });
+});
+
+test("resolveAgentVaults dedupes a vault reachable by both scan and mapping under the mapped id", async () => {
+  const { buildSessionsCatalogue } = await import("../dist/ui-server.js");
+  const { mkdtempSync, mkdirSync, writeFileSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const pathMod = await import("node:path");
+  const home = mkdtempSync(pathMod.join(tmpdir(), "minni-remap-dedup-"));
+  mkdirSync(pathMod.join(home, "codex-vault"), { recursive: true });
+  writeFileSync(
+    pathMod.join(home, "codex-vault", "log.md"),
+    "## [2026-05-01T00:00:00Z] boot | boot sess-once\n",
+  );
+  // Map a DIFFERENT id at the very same on-disk vault the scan already sees.
+  await withAgentVaults(JSON.stringify({ loadgen: pathMod.join(home, "codex-vault") }), async () => {
+    const catalogue = await buildSessionsCatalogue({ homePath: home });
+    const rows = catalogue.sessions.filter((s) => s.session_id === "sess-once");
+    assert.equal(rows.length, 1, "one on-disk vault appears exactly once");
+    assert.equal(rows[0].agent, "loadgen", "mapped id wins over scanned label");
+  });
+});
+
+test("buildSessionsCatalogue ignores invalid MINNI_AGENT_VAULTS JSON (scan still works)", async () => {
+  const { buildSessionsCatalogue } = await import("../dist/ui-server.js");
+  const { mkdtempSync, mkdirSync, writeFileSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const pathMod = await import("node:path");
+  const home = mkdtempSync(pathMod.join(tmpdir(), "minni-remap-badjson-"));
+  mkdirSync(pathMod.join(home, "codex-vault"), { recursive: true });
+  writeFileSync(
+    pathMod.join(home, "codex-vault", "log.md"),
+    "## [2026-05-01T00:00:00Z] boot | boot sess-codex\n",
+  );
+  await withAgentVaults("{not valid json", async () => {
+    const catalogue = await buildSessionsCatalogue({ homePath: home });
+    assert.deepEqual(catalogue.sessions.map((s) => s.session_id), ["sess-codex"]);
+    assert.equal(catalogue.sessions[0].agent, "codex");
+  });
+});
+
+// ── Finding 2: fleet-wide vault lane (agent=*) ──────────────────────────────
+
+test("/api/audit-tail?agent=* merges all vaults desc by timestamp, tags each entry, caps at limit", async () => {
+  const { mkdtempSync, mkdirSync, writeFileSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const pathMod = await import("node:path");
+  const home = mkdtempSync(pathMod.join(tmpdir(), "minni-fleet-home-"));
+  const today = new Date().toISOString().slice(0, 10);
+  mkdirSync(pathMod.join(home, "codex-vault", "logs"), { recursive: true });
+  mkdirSync(pathMod.join(home, "loadgen-vault", "logs"), { recursive: true });
+  // Interleaved timestamps across the two vaults.
+  writeFileSync(
+    pathMod.join(home, "codex-vault", "logs", `${today}.md`),
+    `## [${today}T00:00:01Z] learn | codex a\n\n## [${today}T00:00:03Z] learn | codex b\n`,
+  );
+  writeFileSync(
+    pathMod.join(home, "loadgen-vault", "logs", `${today}.md`),
+    `## [${today}T00:00:02Z] learn | loadgen a\n\n## [${today}T00:00:04Z] learn | loadgen b\n`,
+  );
+  const server = await startTestServer({
+    minniHomePath: home,
+    auditTail: async () => {
+      throw new Error("default seam must not be used for the fleet path");
+    },
+  });
+  try {
+    const res = await fetch(`${server.baseUrl}/api/audit-tail?agent=*`, { headers: authHeaders() });
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.merged, true);
+    assert.equal(body.entries.length, 4);
+    // Newest first: loadgen b (04), codex b (03), loadgen a (02), codex a (01).
+    assert.deepEqual(
+      body.entries.map((e) => e.agent),
+      ["loadgen", "codex", "loadgen", "codex"],
+    );
+    assert.match(body.entries[0].text, /loadgen b/);
+    assert.match(body.entries[3].text, /codex a/);
+
+    // Limit cap.
+    const capped = await fetch(`${server.baseUrl}/api/audit-tail?agent=*&limit=2`, { headers: authHeaders() });
+    const cappedBody = await capped.json();
+    assert.equal(cappedBody.entries.length, 2);
+    assert.match(cappedBody.entries[0].text, /loadgen b/);
+    assert.match(cappedBody.entries[1].text, /codex b/);
+  } finally {
+    await server.close();
+  }
+});
+
+test("/api/audit-tail?agent=* requires auth (403 unauthed)", async () => {
+  const server = await startTestServer();
+  try {
+    const res = await fetch(`${server.baseUrl}/api/audit-tail?agent=*`);
+    assert.equal(res.status, 403);
   } finally {
     await server.close();
   }

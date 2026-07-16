@@ -1,8 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import {
   getAuditTail,
+  getAuditTailFleet,
   getEvents,
-  type AuditTailResult,
   type EventRow,
 } from "../api";
 import {
@@ -76,6 +76,8 @@ function parseEntry(raw: string): ParsedEntry {
 interface MergedRow {
   key: string;
   lane: "vault" | "daemon";
+  /** In the fleet view, the owning agent for a vault row (badge shows `vault·<agent>`). */
+  laneAgent?: string;
   tsSort: number;
   time: string;
   actor: string;
@@ -83,6 +85,17 @@ interface MergedRow {
   target: string;
   result: string;
   raw: string;
+}
+
+/** Vault tail normalized so each entry can carry its owning agent (fleet view). */
+interface VaultEntry {
+  raw: string;
+  agent?: string;
+}
+
+interface VaultTailState {
+  entries: VaultEntry[];
+  text: string;
 }
 
 function displayTime(ts: string | number): string {
@@ -109,10 +122,11 @@ function eventToRow(e: EventRow): MergedRow {
   };
 }
 
-function vaultToRow(entry: ParsedEntry, idx: number): MergedRow {
+function vaultToRow(entry: ParsedEntry, idx: number, agent?: string): MergedRow {
   return {
     key: `v-${idx}-${entry.tsSort}`,
     lane: "vault",
+    laneAgent: agent,
     tsSort: entry.tsSort,
     time: entry.time,
     actor: entry.actor,
@@ -129,7 +143,7 @@ const isDaemonOffline = (err: unknown): boolean =>
   err instanceof Error && /^502\b/.test(err.message);
 
 export function AuditScreen() {
-  const [data, setData] = useState<AuditTailResult | null>(null);
+  const [data, setData] = useState<VaultTailState | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [stale, setStale] = useState(false);
@@ -145,27 +159,46 @@ export function AuditScreen() {
   const liveRef = useRef(live);
   liveRef.current = live;
   const visibleRef = useRef(true);
+  // Request generation: bumped on every scope reset (filter/limit change). Each
+  // poll captures the generation it started under; a response whose generation
+  // no longer matches belongs to a stale scope and is dropped — it must not
+  // update state or advance the since_id cursor (which would append the wrong
+  // agent's rows and skip the new scope's events).
+  const genRef = useRef(0);
 
-  const loadVault = async (n: number, agent: string) => {
+  const loadVault = async (n: number, agent: string, gen: number) => {
     setLoading(true);
     try {
-      const result = await getAuditTail(n, agent || undefined);
-      setData(result);
+      if (agent) {
+        // Specific agent typed → single-vault tail (byte-identical to before).
+        const result = await getAuditTail(n, agent);
+        if (genRef.current !== gen) return;
+        setData({ entries: result.entries.map((raw) => ({ raw })), text: result.text });
+      } else {
+        // No filter → fleet view: merge every vault, keep each entry's agent tag.
+        const result = await getAuditTailFleet(n);
+        if (genRef.current !== gen) return;
+        const entries: VaultEntry[] = result.entries.map((e) => ({ raw: e.text, agent: e.agent }));
+        setData({ entries, text: entries.map((e) => e.raw).join("\n\n") });
+      }
       setError(null);
       setStale(false);
     } catch (err) {
+      if (genRef.current !== gen) return;
       // Keep the last-known-good vault tail: a transient poll failure must
       // not blank the table between ticks.
       setError(err instanceof Error ? err.message : String(err));
       setStale(true);
     } finally {
-      setLoading(false);
+      if (genRef.current === gen) setLoading(false);
     }
   };
 
-  const loadDaemon = async (agent: string) => {
+  const loadDaemon = async (agent: string, gen: number) => {
     try {
       const result = await getEvents(sinceIdRef.current, agent || undefined);
+      // Drop a response from a superseded scope: no state, no cursor advance.
+      if (genRef.current !== gen) return;
       setDaemonOffline(false);
       setDaemonError(null);
       if (result.events.length > 0) {
@@ -188,6 +221,7 @@ export function AuditScreen() {
         sinceIdRef.current = Math.max(sinceIdRef.current, result.last_id);
       }
     } catch (err) {
+      if (genRef.current !== gen) return;
       if (isDaemonOffline(err)) {
         setDaemonOffline(true);
         setDaemonError("daemon offline");
@@ -197,16 +231,19 @@ export function AuditScreen() {
     }
   };
 
-  const loadAll = async (n: number, agent: string) => {
-    await Promise.allSettled([loadVault(n, agent), loadDaemon(agent)]);
+  const loadAll = async (n: number, agent: string, gen: number) => {
+    await Promise.allSettled([loadVault(n, agent, gen), loadDaemon(agent, gen)]);
   };
 
   // Reset the event cursor whenever the filter/limit combination changes so a
-  // fresh scope doesn't silently inherit a stale since_id.
+  // fresh scope doesn't silently inherit a stale since_id. Bump the generation
+  // so any in-flight poll from the previous scope is discarded on arrival.
   useEffect(() => {
+    genRef.current += 1;
+    const gen = genRef.current;
     sinceIdRef.current = 0;
     setDaemonEvents([]);
-    void loadAll(limit, agentFilter.trim());
+    void loadAll(limit, agentFilter.trim(), gen);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [limit, agentFilter]);
 
@@ -222,15 +259,15 @@ export function AuditScreen() {
     const id = window.setInterval(() => {
       if (!liveRef.current) return;
       if (!visibleRef.current) return;
-      void loadAll(limit, agentFilter.trim());
+      void loadAll(limit, agentFilter.trim(), genRef.current);
     }, POLL_MS);
     return () => window.clearInterval(id);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [limit, agentFilter]);
 
-  const vaultEntries: ParsedEntry[] = (data?.entries || []).map(parseEntry);
+  const vaultEntries = (data?.entries || []).map((e) => ({ parsed: parseEntry(e.raw), agent: e.agent }));
   const merged: MergedRow[] = [
-    ...vaultEntries.map(vaultToRow),
+    ...vaultEntries.map(({ parsed, agent }, idx) => vaultToRow(parsed, idx, agent)),
     ...daemonEvents.map(eventToRow),
   ].sort((a, b) => b.tsSort - a.tsSort);
 
@@ -286,7 +323,7 @@ export function AuditScreen() {
               <button
                 type="button"
                 className="btn btn-secondary btn-sm"
-                onClick={() => void loadAll(limit, agentFilter.trim())}
+                onClick={() => void loadAll(limit, agentFilter.trim(), genRef.current)}
                 disabled={loading}
               >
                 {loading ? "…" : "Refresh"}
@@ -328,7 +365,11 @@ export function AuditScreen() {
                 <div className="row" key={a.key} title={a.raw}>
                   <div>
                     <Chip kind={a.lane === "vault" ? "info" : "system"}>
-                      {a.lane === "vault" ? "vault" : "daemon"}
+                      {a.lane === "vault"
+                        ? a.laneAgent
+                          ? `vault·${a.laneAgent}`
+                          : "vault"
+                        : "daemon"}
                     </Chip>
                   </div>
                   <div className="audit-time">{a.time || "—"}</div>
