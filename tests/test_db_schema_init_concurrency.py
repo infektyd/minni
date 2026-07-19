@@ -150,6 +150,69 @@ def test_schema_ready_path_not_recorded_when_init_fails(tmp_path, monkeypatch):
     assert abs_path in db_mod._schema_ready_paths
 
 
+def test_migration_failure_does_not_poison_schema_ready_gate(tmp_path, monkeypatch):
+    """A migrations-only failure caught INSIDE _init_schema must not mark the
+    path schema-ready — otherwise the process-wide _schema_ready_paths gate
+    silently disables the migration retry contract for the life of the process.
+
+    _init_schema runs the migrations block in a try/except that swallows a
+    transient failure as non-fatal (e.g. 'database is locked' from a competing
+    first-contact process) and deliberately leaves _migrated_paths unset so the
+    run is retried on the next open of this path. _init_schema then returns
+    normally. If _schema_ready_paths were keyed off 'did _init_schema return'
+    rather than 'did migrations succeed', that swallowed failure would poison
+    the gate: every later SovereignDB the daemon/AFM loop constructs would skip
+    _init_schema entirely and migrations would NEVER be retried this process
+    ('no such table'-class errors). This is the exact path
+    ``test_schema_ready_path_not_recorded_when_init_fails`` does NOT cover — it
+    exercises _init_schema itself raising, not a migrations-only internal catch.
+    """
+    import minni.migrations as migrations_mod
+
+    cfg = _make_cfg(tmp_path)
+    abs_path = os.path.abspath(cfg.db_path)
+    db_mod._schema_ready_paths.discard(abs_path)
+    db_mod._migrated_paths.discard(abs_path)
+    monkeypatch.setattr(db_mod, "_migrations_run", False, raising=False)
+
+    real_run_migrations = migrations_mod.run_migrations
+    calls = {"n": 0}
+
+    def flaky_run_migrations(conn):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            # Simulate a transient first-contact failure (competing process).
+            raise sqlite3.OperationalError("database is locked")
+        return real_run_migrations(conn)
+
+    monkeypatch.setattr(migrations_mod, "run_migrations", flaky_run_migrations)
+
+    # First instance: migrations raise, _init_schema swallows it non-fatally and
+    # returns. The gate must NOT record the path (migrations did not succeed).
+    first = db_mod.SovereignDB(cfg)
+    first._get_conn()
+    assert calls["n"] == 1, "run_migrations must have been attempted exactly once"
+    assert abs_path not in db_mod._migrated_paths, (
+        "a swallowed migration failure must not record _migrated_paths"
+    )
+    assert abs_path not in db_mod._schema_ready_paths, (
+        "the process-wide schema-ready gate must NOT be poisoned by a swallowed "
+        "migration failure — otherwise migrations are never retried this process"
+    )
+
+    # Second instance on the same path: must re-enter _init_schema and RETRY
+    # migrations (now succeeding), then mark the path ready. Before the fix the
+    # gate skipped _init_schema here and calls["n"] stayed at 1.
+    second = db_mod.SovereignDB(cfg)
+    second._get_conn()
+    assert calls["n"] == 2, (
+        "the second SovereignDB instance must retry migrations; the gate wrongly "
+        "skipped _init_schema if run_migrations was not attempted again"
+    )
+    assert abs_path in db_mod._migrated_paths
+    assert abs_path in db_mod._schema_ready_paths
+
+
 # ---------------------------------------------------------------------------
 # Punch-list §2 fix (b): trigger DDL is idempotent (CREATE IF NOT EXISTS),
 # not DROP + CREATE which bumps the schema cookie on every init.

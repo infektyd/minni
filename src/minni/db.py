@@ -91,12 +91,31 @@ class SovereignDB:
                     # A second SovereignDB instance opened on the same file — the
                     # daemon + AFM passes construct many — must skip _init_schema
                     # on its FIRST call too, not re-run the trigger DDL and bump
-                    # the schema cookie under concurrent vault_fts readers. Add
-                    # to the set only AFTER success, mirroring _migrated_paths, so
-                    # a failed init is retried on the next open of this path.
+                    # the schema cookie under concurrent vault_fts readers.
                     if abs_db_path not in _schema_ready_paths:
                         self._init_schema(self._local.conn)
-                        _schema_ready_paths.add(abs_db_path)
+                        # Mark the path schema-ready only once its migrations have
+                        # ALSO succeeded — not merely because _init_schema
+                        # returned. The migrations sub-step inside _init_schema
+                        # swallows a transient failure ("database is locked" from a
+                        # competing first-contact process, a momentary SQLITE_BUSY)
+                        # as non-fatal and deliberately leaves _migrated_paths
+                        # unset so the run is retried on the next open of this path
+                        # (see the migrations block in _init_schema). If we added
+                        # to _schema_ready_paths unconditionally, that swallowed
+                        # failure would still poison the gate: every later
+                        # SovereignDB the daemon/AFM loop constructs would skip
+                        # _init_schema entirely and migrations would NEVER be
+                        # retried for the life of the process. Keying this gate off
+                        # _migrated_paths preserves the retry-on-failure contract:
+                        # a migration-only failure leaves the path un-ready, so the
+                        # next instance re-enters _init_schema and retries it. The
+                        # trigger/FTS DDL re-run in that retry is a no-op — every
+                        # statement is CREATE ... IF NOT EXISTS — so it does not
+                        # re-introduce the schema-cookie churn this gate exists to
+                        # stop.
+                        if abs_db_path in _migrated_paths:
+                            _schema_ready_paths.add(abs_db_path)
                     self._schema_initialized = True
 
         return self._local.conn

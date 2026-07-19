@@ -10,6 +10,7 @@ import {
   buildTeamPromotionPacket,
   buildTeamRuntime,
 } from "../dist/team.js";
+import { DEFAULT_AGENT_ID } from "../dist/config.js";
 
 function fakePreparedTask(input) {
   return {
@@ -84,11 +85,14 @@ test("buildTeamRuntime creates temporary agent profiles, task ledger, and hydrat
   assert.deepEqual(packet.repeatedAgentSuggestions, []);
 });
 
-test("buildTeamRuntime delegates the daemon recall leg to the coordinator's principal while keeping hydration packets labeled by the temp agent's own id", async () => {
+test("buildTeamRuntime pins the daemon recall leg to the server principal, never the caller-supplied coordinatorAgentId, while keeping hydration packets labeled by the temp agent's own id", async () => {
   const prepareCalls = [];
   const packet = await buildTeamRuntime(
     {
       task: "Investigate keystone recall blackout",
+      // A caller passes another platform's provisioned name here. This must NOT
+      // become the daemon recall principal — doing so would let a session read
+      // that platform's vault-scoped content (cross-agent read-boundary bypass).
       coordinatorAgentId: "codex",
       workspaceId: "/repo",
       vaultPath: "/tmp/vault",
@@ -109,9 +113,18 @@ test("buildTeamRuntime delegates the daemon recall leg to the coordinator's prin
   // Display/audit identity stays the temp agent's own id (unchanged convention).
   assert.equal(prepareCalls[0].agentId, "keystone-praxis");
   assert.equal(packet.hydrationPackets[0].agentId, "keystone-praxis");
-  // The daemon recall leg is delegated to the coordinator's provisioned principal —
-  // this is the fix: a never-provisioned temp id must not drive the daemon call.
-  assert.equal(prepareCalls[0].recallAgentId, "codex");
+  // The daemon recall leg is pinned server-side to DEFAULT_AGENT_ID (G11), the
+  // identity of the process that opened the daemon socket — not the temp id and
+  // not the caller-supplied coordinator name.
+  assert.equal(prepareCalls[0].recallAgentId, DEFAULT_AGENT_ID);
+  assert.notEqual(prepareCalls[0].recallAgentId, "codex");
+  // The honest-labeling instruction must reference the real recall principal.
+  assert.ok(
+    packet.hydrationPackets[0].instructions.some((line) =>
+      line.includes(`server-provisioned principal (${DEFAULT_AGENT_ID})`),
+    ),
+    "hydration instructions must disclose the server-provisioned recall principal",
+  );
 });
 
 test("buildTeamRuntime attaches repeatedAgentSuggestions from findRepeated and renders them", async () => {

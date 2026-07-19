@@ -296,7 +296,12 @@ server.registerTool(
     inputSchema: {
       task: z.string().min(1),
       agents: z.array(teamAgentSchema).optional(),
-      coordinatorAgentId: z.string().optional(),
+      // G11: coordinatorAgentId removed from the model-facing schema (model no
+      // longer supplies the coordinator identity). A caller-supplied name would
+      // otherwise drive every temp agent's daemon recall (team.ts) as the wire
+      // agent_id on the daemon search RPC and resolve to another platform's
+      // provisioned principal — a cross-agent read bypass. The server stamps
+      // DEFAULT_AGENT_ID below, matching minni_recall / minni_prepare_task.
       workspaceId: z.string().optional(),
       profile: z.enum(["compact", "standard", "deep"]).optional(),
       limit: z.number().int().min(1).max(12).optional(),
@@ -307,7 +312,6 @@ server.registerTool(
   async ({
     task,
     agents,
-    coordinatorAgentId,
     workspaceId,
     profile,
     limit,
@@ -316,13 +320,13 @@ server.registerTool(
   }) => {
     const gated = await requireSharedGate("team.runtime", {
       agents: agents?.length ?? 0,
-      coordinatorAgentId,
+      coordinatorAgentId: DEFAULT_AGENT_ID,
     });
     if (gated) return gated;
     const packet = await buildTeamRuntime({
       task,
       agents,
-      coordinatorAgentId,
+      coordinatorAgentId: DEFAULT_AGENT_ID, // G11: server-side default only (model no longer supplies coordinator identity)
       workspaceId,
       vaultPath: DEFAULT_VAULT_PATH,
       profile,
