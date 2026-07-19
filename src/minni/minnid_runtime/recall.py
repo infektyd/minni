@@ -194,6 +194,11 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
     try:
         engine = context.lazy_retrieval()
 
+        # P0-A contract (2026-07-19 blackout): an auth gate that filtered a
+        # non-empty candidate set to zero must be visible in the response —
+        # a scope blackout and "nothing matched" are different answers.
+        auth_suppressions: list = []
+
         def retrieve_from(
             retrieval_engine,
             *,
@@ -221,6 +226,9 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
                     else "default"
                 ),
             )
+            suppression = getattr(retrieval_engine, "last_auth_suppression", None)
+            if suppression:
+                auth_suppressions.append({"src": src, **suppression})
             return tag_document_results(rows, src=src)
 
         def retrieve_shared() -> list:
@@ -292,7 +300,7 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
         except Exception as exc:
             context.logger.warning("search: learnings surfacing/tracking failed: %s", exc)
 
-        return context.make_response({
+        response_payload = {
             "query": query,
             "agent_id": agent_id,
             "depth": depth,
@@ -305,7 +313,10 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
             ),
             "results": results,
             "learnings": learnings,
-        }, request_id)
+        }
+        if not results and auth_suppressions:
+            response_payload["auth_suppression"] = auth_suppressions
+        return context.make_response(response_payload, request_id)
     except Exception as exc:
         context.logger.exception("search failed")
         return context.make_error(-32000, f"Search error: {exc}", request_id)

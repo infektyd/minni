@@ -781,6 +781,10 @@ server.registerTool(
       const indexResult = await jsonRpcSocketRequestWithFallback("vault_index_doc", {
         content: fullContent,
         path: note.relativePath,
+        // agent_id is the field the daemon's provenance_claim() reads; without
+        // it the request resolves to the default principal and the ownership
+        // check degrades indexing (P0-D, 2026-07-19 recall blackout).
+        agent_id: DEFAULT_AGENT_ID,
         agent: DEFAULT_AGENT_ID,
         sigil: "📄",
         privacy_level: "safe",

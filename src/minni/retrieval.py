@@ -272,6 +272,15 @@ class RetrievalEngine:
         self._feedback_cache = {}
         self._feedback_cache_loaded_at = 0.0
         self.last_trace_id: Optional[str] = None
+        # P0-B (2026-07-19 blackout): the semantic leg must never die silently.
+        # Set when _semantic_search finds no embedding model; cleared when the
+        # model comes back. Surfaced by status/recall so an FTS-only session is
+        # visible instead of masquerading as healthy.
+        self.vector_model_down: bool = False
+        # P0-A contract: when the read-authorization gate suppresses a
+        # non-empty candidate set to zero, the reason is recorded here so the
+        # caller can return a diagnostic envelope instead of a bare [].
+        self.last_auth_suppression: Optional[Dict] = None
         # recall-F3: the correction-class type set is config-invariant — compute
         # it once here instead of once per scored doc in _score_merged_doc.
         self._correction_types = _correction_class_page_types(config)
@@ -408,25 +417,42 @@ class RetrievalEngine:
 
         with self.db.cursor() as c:
             agent_clause = ""
-            params: list = [safe_query]
+            scope_params: list = []
             if agent_scope:
                 agent_clause = f" AND d.agent IN ({','.join('?' * len(agent_scope))})"
-                params.extend(agent_scope)
-            params.append(limit * 3)
-            c.execute(f"""
-                SELECT f.doc_id, d.path, d.agent, d.sigil,
-                       rank AS bm25_rank, d.decay_score,
-                       d.page_status, d.privacy_level, d.page_type,
-                       d.evidence_refs, d.indexed_at, d.layer
-                FROM vault_fts f
-                JOIN documents d ON d.doc_id = f.doc_id
-                WHERE vault_fts MATCH ?
-                {agent_clause}
-                ORDER BY rank
-                LIMIT ?
-            """, params)
+                scope_params.extend(agent_scope)
 
-            for row in c.fetchall():
+            def _match(match_expr: str):
+                c.execute(f"""
+                    SELECT f.doc_id, d.path, d.agent, d.sigil,
+                           rank AS bm25_rank, d.decay_score,
+                           d.page_status, d.privacy_level, d.page_type,
+                           d.evidence_refs, d.indexed_at, d.layer
+                    FROM vault_fts f
+                    JOIN documents d ON d.doc_id = f.doc_id
+                    WHERE vault_fts MATCH ?
+                    {agent_clause}
+                    ORDER BY rank
+                    LIMIT ?
+                """, [match_expr, *scope_params, limit * 3])
+                return c.fetchall()
+
+            # Strict pass first: FTS5 space-joined terms are implicit AND —
+            # precise when every term appears in the document. A dated/specific
+            # query ("checkpoint 2026-07-18 plan-…") almost never has ALL its
+            # tokens in the stored content, so a zero-hit AND query degrades to
+            # OR semantics: bm25 still ranks the document matching the most /
+            # rarest terms first, restoring recall without diluting queries the
+            # strict pass already answers (same contract as learnings_fts).
+            rows = _match(safe_query)
+            terms = safe_query.split()
+            if not rows and len(terms) > 1:
+                # Lowercase the operands: FTS5 matching is case-insensitive,
+                # but a literal uppercase "OR"/"AND"/"NOT" token from the query
+                # would be parsed as an operator and corrupt the expression.
+                rows = _match(" OR ".join(t.lower() for t in terms))
+
+            for row in rows:
                 results.append({
                     "doc_id": row["doc_id"],
                     "path": row["path"],
@@ -455,6 +481,33 @@ class RetrievalEngine:
             return ""
         return " ".join(words)
 
+    @staticmethod
+    def apply_read_gate(principal, workspace: str, merged: List[Dict]):
+        """G19 read gate with the H2 silent-empty contract (P0-A, 2026-07-19).
+
+        Filters ``merged`` through :func:`can_read_document`. When a NON-empty
+        candidate set is filtered to zero, returns a machine-readable
+        diagnostic instead of leaving the caller with a bare empty list —
+        an authorization blackout must be distinguishable from "nothing
+        matched".
+
+        Returns ``(filtered, suppression)`` where ``suppression`` is ``None``
+        unless every candidate was suppressed by scope.
+        """
+        filtered = [r for r in merged if can_read_document(principal, workspace, r)]
+        suppression = None
+        if merged and not filtered:
+            suppression = {
+                "pre_gate": len(merged),
+                "suppressed": len(merged),
+                "reason": (
+                    f"{len(merged)} candidates suppressed by scope: "
+                    f"principal={getattr(principal, 'agent_id', 'n/a')} "
+                    f"ws={workspace}"
+                ),
+            }
+        return filtered, suppression
+
     # ── FAISS Semantic Search ─────────────────────────────────
 
     def _semantic_search(
@@ -468,7 +521,17 @@ class RetrievalEngine:
         Returns best-chunk-per-doc with chunk text and heading context.
         """
         if not self.model:
+            # P0-B: fail loud. A missing encoder degrades every recall to
+            # lexical-only; logging once per outage (not per query) keeps the
+            # signal visible without flooding.
+            if not self.vector_model_down:
+                logger.warning(
+                    "semantic leg DOWN: embedding model unavailable — recall "
+                    "degraded to lexical (FTS) only until the encoder loads"
+                )
+            self.vector_model_down = True
             return []
+        self.vector_model_down = False
 
         query_emb = self.model.encode(query).astype(np.float32)
 
@@ -2388,8 +2451,10 @@ class RetrievalEngine:
         # G19/G20: ws always defined (hoisted) so G22 envelope loop and legacy principal=None
         # paths never hit UnboundLocalError. Gate only when principal supplied.
         ws = workspace or getattr(principal, "workspace_id", "default") if principal is not None else (workspace or "default")
+        self.last_auth_suppression = None
         if principal is not None:
-            merged = [r for r in merged if can_read_document(principal, ws, r)]
+            merged, suppression = self.apply_read_gate(principal, ws, merged)
+            self.last_auth_suppression = suppression
 
         # G22: attach evidence-only envelope + instruction_like + provenance/reasoning to every result
         # Model-facing content is always wrapped; raw executable instructions never treated as policy.

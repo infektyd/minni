@@ -673,18 +673,39 @@ def can_read_document(
     if not isinstance(doc_metadata, dict):
         return False
 
-    # Workspace scoping (doc or call can use '*' for shared cross-ws)
-    doc_ws = str(
+    # Ownership is computed up front because the workspace and path gates
+    # below both need it: legacy indexer rows (empty workspace_id, relative
+    # path) are owner-readable but stay fail-closed for everyone else.
+    _agent_early = str(
+        doc_metadata.get("agent") or doc_metadata.get("sigil") or "unknown"
+    ).strip()
+    _page_type_early = str(doc_metadata.get("page_type") or "").lower()
+    same_agent = _agent_early == principal.agent_id and not (
+        _page_type_early == "session" and _agent_early.lower() == "unknown"
+    )
+
+    # Workspace scoping (doc or call can use '*' for shared cross-ws).
+    # An EMPTY/missing doc workspace is a legacy unstamped row — treat it as
+    # owner-wildcard: the writing agent can still recall it from any named
+    # workspace, but it is NOT '*' for foreign readers.
+    doc_ws_raw = (
         doc_metadata.get("workspace_id")
         or doc_metadata.get("workspace")
         or doc_metadata.get("ws")
-        or "default"
     )
+    doc_ws = str(doc_ws_raw or "default")
     call_ws = str(workspace or "default")
     if doc_ws != "*" and call_ws != "*" and doc_ws != call_ws:
-        return False
+        if not (same_agent and not doc_ws_raw):
+            return False
 
-    # Vault root containment (realpath, symlink-aware, via G12)
+    # Vault root containment (realpath, symlink-aware, via G12).
+    # Absolute paths are root-checked as before (same-agent escape via an
+    # absolute path outside the allowed roots stays denied). Relative paths
+    # cannot be meaningfully resolved here (they would resolve against the
+    # daemon cwd): a same-agent relative path is trusted as within the agent's
+    # own vault (the path was stamped by the indexer, not the caller); a
+    # foreign relative path is denied fail-closed.
     path = (
         doc_metadata.get("path")
         or doc_metadata.get("source")
@@ -692,7 +713,16 @@ def can_read_document(
     )
     if path:
         try:
-            if not principal.allows_vault_root(path):
+            if Path(path).expanduser().is_absolute():
+                if not principal.allows_vault_root(path):
+                    return False
+            elif not principal.allowed_vault_roots:
+                # Mirror allows_vault_root's unrestricted-principal semantics:
+                # empty roots + capabilities = no path restriction; empty roots
+                # + no capabilities = fail-closed.
+                if not principal.capabilities:
+                    return False
+            elif not same_agent:
                 return False
         except Exception:
             return False

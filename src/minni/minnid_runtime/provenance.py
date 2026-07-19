@@ -185,6 +185,14 @@ def provenance_claim(method_name: str, params: dict) -> Optional[str]:
         claim = params.get("from_agent")
     else:
         claim = params.get("agent_id")
+        if claim is None and method_name == "vault_index_doc":
+            # P0-D (2026-07-19 blackout): legacy plugins sent the identity as
+            # `agent`. A vanished claim resolved to the local default principal
+            # ('main') and every vault_write checkpoint indexed 'degraded' on
+            # the ownership mismatch. Widening the claim SOURCE is not an auth
+            # bypass: resolve_effective_principal still verifies the claim
+            # against the stamped identity.
+            claim = params.get("agent")
     if claim is None:
         return None
     claim = str(claim).strip()

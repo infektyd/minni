@@ -50,6 +50,9 @@ class HealthContext:
     sovereign_db: Callable[..., Any] = SovereignDB
     default_config: Any = field(default_factory=lambda: DEFAULT_CONFIG)
     logger: logging.Logger = logger
+    # P0-B (2026-07-19 blackout): lets status surface the live engine's
+    # vector_model_down flag. Optional so tests/legacy wiring keep working.
+    retrieval_engine: Callable[[], Any] | None = None
 
 
 def faiss_cache_status(config=DEFAULT_CONFIG) -> tuple[Path, bool]:
@@ -136,6 +139,20 @@ def handle_status(params: dict, request_id: Any, context: HealthContext) -> dict
                 pass
 
     _, faiss_ok = faiss_cache_status(context.default_config)
+    # P0-B: faiss_ok only proves the index FILE exists. The query encoder can
+    # still be down (recall silently FTS-only for 14.8h in the 2026-07-18
+    # session) — surface the engine's flag so the two states are separable.
+    # "ok" here means "no failed encode attempt yet", not a live probe (a
+    # probe would force a multi-second model load inside status).
+    vector_model = "unknown"
+    if context.retrieval_engine is not None:
+        try:
+            _eng = context.retrieval_engine()
+            vector_model = (
+                "DOWN" if getattr(_eng, "vector_model_down", False) else "ok"
+            )
+        except Exception:
+            vector_model = "unknown"
     try:
         from minni.afm_provider import afm_runtime_status
 
@@ -164,6 +181,7 @@ def handle_status(params: dict, request_id: Any, context: HealthContext) -> dict
             "db_ok": db_ok,
             "db_path": "[redacted]",
             "faiss_ok": faiss_ok,
+            "vector_model": vector_model,
             "faiss_path": "[redacted]",
             "stats": db_stats,
             "audit_volume": audit_vol,

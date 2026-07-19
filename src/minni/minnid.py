@@ -842,6 +842,7 @@ def _health_context() -> HealthContext:
         sovereign_db=SovereignDB,
         default_config=DEFAULT_CONFIG,
         logger=logger,
+        retrieval_engine=_lazy_retrieval,
     )
 
 
