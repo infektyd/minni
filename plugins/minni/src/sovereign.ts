@@ -7,7 +7,9 @@ import path from "node:path";
 import { URL } from "node:url";
 import { AFM_HEALTH_URL, AFM_PROVIDER_MODE, DEFAULT_AGENT_ID, DEFAULT_VAULT_PATH, DEFAULT_WORKSPACE_ID, SOCKET_PATH } from "./config.js";
 import {
+  daemonAfmToProviderHealth,
   getAfmProviderHealth,
+  GENERATION_PROBE_TTL_MS,
   resolveAfmProvider,
   resolvedNativeHelperPath,
   sanitizeAfmHealth,
@@ -45,6 +47,8 @@ export interface ExtractorStatus {
   tier: "local" | "cloud";
   generationVerified: boolean;
   probeAgeMs: number;
+  /** Which leg produced this verdict — see StatusReport.afm's doc comment. */
+  source: "daemon" | "plugin-probe";
 }
 
 export interface StatusReport {
@@ -53,7 +57,16 @@ export interface StatusReport {
     exists: boolean;
   };
   socket: JsonResult;
-  /** afm.ok is generationVerified (honest health), not mere /health reachability. */
+  /**
+   * afm.ok is generationVerified (honest health), not mere /health
+   * reachability. Single-authority (punch-list §3): when the daemon socket
+   * carries a fresh, matching-mode probe (socket.data.afm), this field is
+   * DERIVED from that same daemon data rather than an independent plugin
+   * probe, so it can never disagree with socket.data.afm in content — only
+   * fall back to the plugin's own probe when the daemon leg is unreachable,
+   * stale, mode-mismatched, or malformed. afm.data.source records which leg
+   * produced the verdict ("daemon" | "plugin-probe").
+   */
   afm: JsonResult;
   afmProvider: AfmProviderResolution;
   extractor: ExtractorStatus;
@@ -761,6 +774,15 @@ export async function buildStatusReport(input?: {
   const vaultPath = input?.vaultPath ?? DEFAULT_VAULT_PATH;
   await ensureVault(vaultPath);
   const tail = await auditTail(vaultPath, 1);
+
+  // Fetch the daemon socket status BEFORE computing our own AFM verdict: when
+  // the daemon is reachable it has ALREADY run afm_runtime_status() with its
+  // own real (matching) probe budget (afm_provider.py:376-421, embedded here
+  // as socket.data.afm by health.py:156-189). Reordered so the reuse check
+  // below (daemonAfmToProviderHealth) can skip a second, independently-timed
+  // generation probe entirely when that fresh result is usable.
+  const socket = input?.socket ?? (await socketHealth());
+
   const rawAfm = input?.afm ?? (await afmHealth());
 
   let volume = 0;
@@ -786,9 +808,30 @@ export async function buildStatusReport(input?: {
     nativeHelperPath: resolvedNativeHelperPath(),
     health: rawAfm,
   });
-  const generation =
-    input?.afmGeneration ??
-    (await getAfmProviderHealth({
+
+  // Single-authority AFM verdict (punch-list §3): reuse the daemon's own
+  // fresh, matching-mode probe when it's usable instead of spawning a second,
+  // independently-timed generation probe (no cold native-helper subprocess,
+  // no redundant bridge chat-completion call). daemonAfmToProviderHealth
+  // returns undefined — falling through to the plugin's own probe below —
+  // whenever the socket is unreachable, the daemon payload has no `afm`
+  // block at all (back-compat: identical to "socket unreachable"), the
+  // payload shape doesn't match (untrusted input), the provider mode doesn't
+  // match this process's resolved provider, or the probe is stale.
+  const ttlMs = input?.afmGenerationTtlMs ?? GENERATION_PROBE_TTL_MS;
+  const daemonAfmData = socket.ok ? (socket.data as Record<string, unknown> | undefined)?.afm : undefined;
+  const daemonGeneration = daemonAfmToProviderHealth(daemonAfmData, afmProvider.provider, ttlMs, Date.now);
+
+  let generation: ProviderHealth;
+  let source: "daemon" | "plugin-probe";
+  if (input?.afmGeneration) {
+    generation = input.afmGeneration;
+    source = "plugin-probe";
+  } else if (daemonGeneration) {
+    generation = daemonGeneration;
+    source = "daemon";
+  } else {
+    generation = await getAfmProviderHealth({
       mode: afmProvider.provider,
       // The HTTP /health result gates the generation probe only for the bridge
       // provider; in native mode a dead bridge must not veto the probe — the
@@ -797,7 +840,9 @@ export async function buildStatusReport(input?: {
       transport: input?.afmGenerationTransport,
       ttlMs: input?.afmGenerationTtlMs,
       nativeHelperPath: resolvedNativeHelperPath(),
-    }));
+    });
+    source = "plugin-probe";
+  }
   const sanitizedAfm = sanitizeAfmHealth(rawAfm);
   const generationError =
     generation.generationVerified
@@ -811,6 +856,11 @@ export async function buildStatusReport(input?: {
       ...sanitizedAfm.data,
       reachable: generation.reachable,
       generationVerified: generation.generationVerified,
+      // Authority tag (punch-list §3c): which leg produced this verdict, so a
+      // consumer never has to diff socket.data.afm against this field to spot
+      // a contradiction — when source is "daemon" the two are, by construction,
+      // the same probe.
+      source,
     },
     error: generationError,
   };
@@ -820,12 +870,13 @@ export async function buildStatusReport(input?: {
       path: vaultPath,
       exists: await vaultExists(vaultPath),
     },
-    socket: input?.socket ?? (await socketHealth()),
+    socket,
     afm,
     afmProvider,
     extractor: {
       provider: afmProvider.provider,
       tier: "local",
+      source,
       generationVerified: generation.generationVerified,
       probeAgeMs: generation.probeAgeMs,
     },

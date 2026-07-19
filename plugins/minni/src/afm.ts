@@ -457,8 +457,26 @@ interface GenerationProbeEntry {
   probedAt: number;
 }
 
-const GENERATION_PROBE_TTL_MS = 5 * 60 * 1000;
-const GENERATION_PROBE_TIMEOUT_MS = 1500;
+export const GENERATION_PROBE_TTL_MS = 5 * 60 * 1000;
+
+/**
+ * Mirror of afm_provider._generation_probe_timeout_seconds
+ * (src/minni/afm_provider.py:99-106): read MINNI_AFM_PROBE_TIMEOUT at CALL
+ * TIME, not bound once at module load. Native mode spawns a fresh helper that
+ * cold-loads FoundationModels on the first call (~2-3s measured; warm calls
+ * ~0.5s); the previous hardcoded 1500ms plugin-side budget (a quarter of the
+ * daemon's matching 10s default) clipped that cold start and produced
+ * structurally guaranteed false negatives even while the daemon's own probe,
+ * run with its real budget, verified generation fine (punch-list §3).
+ * Default 10.0s; unset/invalid/non-positive values fall back to 10.0s.
+ */
+export function generationProbeTimeoutMs(): number {
+  const raw = process.env.MINNI_AFM_PROBE_TIMEOUT ?? "10.0";
+  const seconds = Number(raw);
+  const resolved = Number.isFinite(seconds) && seconds > 0 ? seconds : 10.0;
+  return resolved * 1000;
+}
+
 const generationProbeCache = new Map<string, GenerationProbeEntry>();
 const generationProbeInFlight = new Map<string, Promise<GenerationProbeEntry>>();
 
@@ -659,7 +677,7 @@ async function runGenerationProbe(options: AfmGenerationProbeOptions, now: () =>
   const result = await callAfmJson(chatUrl, payload, {
     mode,
     operation: "chat_completion",
-    timeoutMs: options.timeoutMs ?? GENERATION_PROBE_TIMEOUT_MS,
+    timeoutMs: options.timeoutMs ?? generationProbeTimeoutMs(),
     transport: options.transport,
     ...helperOptions,
   });
@@ -686,6 +704,63 @@ function toProviderHealth(entry: GenerationProbeEntry, now: () => number): Provi
     generationVerified: entry.generationVerified,
     probeAgeMs: Math.max(0, now() - entry.probedAt),
     detail: entry.detail,
+  };
+}
+
+/**
+ * Convert a daemon-sourced `data.afm` block (the "status" RPC's embedded
+ * afm_runtime_status() result — src/minni/afm_provider.py:376-421, wired in
+ * via minnid_runtime/health.py:156-189) into a ProviderHealth the plugin can
+ * reuse directly, instead of spawning a second, independently-timed probe
+ * (Health Endpoint Aggregation: a downstream aggregator consumes the
+ * dependency's own fresh health summary rather than re-probing it
+ * transitively). This is what closes punch-list §3: the daemon already ran
+ * afm_runtime_status() with its real (matching) probe budget, so the plugin
+ * no longer needs its own cold, budget-mismatched subprocess spawn to answer
+ * the same question the daemon just answered.
+ *
+ * The daemon RPC payload is UNTRUSTED input (same posture as sanitizeAfmHealth
+ * / safeError applied elsewhere to raw AFM bodies): every field is validated
+ * with strict `typeof` narrowing, never a truthy cast, so a malformed or
+ * corrupted daemon response degrades to "no reuse" rather than being coerced
+ * into a false verdict. Returns undefined (falls back to the plugin's own
+ * probe) when:
+ *   - `data` isn't a well-shaped afm_runtime_status object (also covers
+ *     "afm field ABSENT in socket.data", which back-compat requires behave
+ *     identically to "socket unreachable" — see afm-health.test.mjs);
+ *   - `data.mode` doesn't match the plugin's own resolved provider (avoid
+ *     adopting a native verdict when the plugin resolved bridge, or vice
+ *     versa — the daemon and the plugin process can have different env/
+ *     helper availability);
+ *   - the daemon's probe is stale (probe_age_ms >= ttlMs). probe_age_ms is
+ *     computed against the daemon's own clock; on a single local-machine
+ *     daemon (today's deployment) that's directly comparable to the plugin's
+ *     clock with no correction. A future networked-daemon change must not
+ *     reuse this function unmodified without adding clock-skew handling.
+ */
+export function daemonAfmToProviderHealth(
+  data: unknown,
+  expectedProvider: AfmProvider,
+  ttlMs: number,
+  now: () => number,
+): ProviderHealth | undefined {
+  if (!data || typeof data !== "object") return undefined;
+  const record = data as Record<string, unknown>;
+  if (record.mode !== expectedProvider) return undefined;
+  const generationVerified = record.generation_verified;
+  const reachable = record.reachable;
+  const probeAgeMs = record.probe_age_ms;
+  if (typeof generationVerified !== "boolean") return undefined;
+  if (typeof reachable !== "boolean") return undefined;
+  if (typeof probeAgeMs !== "number" || !Number.isFinite(probeAgeMs) || probeAgeMs < 0) return undefined;
+  if (probeAgeMs >= ttlMs) return undefined;
+  void now; // reserved for a future clock-skew correction; not needed for a local daemon.
+  return {
+    ok: generationVerified,
+    reachable,
+    generationVerified,
+    probeAgeMs,
+    detail: typeof record.error === "string" ? record.error : undefined,
   };
 }
 
