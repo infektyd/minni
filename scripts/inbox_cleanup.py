@@ -133,15 +133,39 @@ _VAULT_SLUG_TO_AGENT_ID: Dict[str, str] = {
 }
 
 
-def _principal_for_inbox_dir(vault_dir_name: str) -> str:
-    """Owning agent for a `<agent>-vault` dir name, mirroring
-    afm_passes.inbox_ingest._principal_for_inbox. Falls back to the raw slug
-    (never a global default here — this script has no fallback_principal
-    concept) when the alias table has no entry."""
+# Last-resort attribution for the daemon's OWN bare `<home>/vault/inbox`
+# (no `-vault` suffix). inbox_ingest._principal_for_inbox and the live
+# afm_passes.inbox_quarantine.quarantine_stale_agent_mismatch pass attribute
+# that dir to `config.inbox_fallback_principal`, which defaults to "unknown"
+# (config.py) and is passed as `fallback_principal="unknown"` from the AFM loop
+# (minnid_runtime/afm.py:518,559). Mirror that default here so this script does
+# not diverge from the daemon on the daemon's own inbox.
+DEFAULT_FALLBACK_PRINCIPAL = "unknown"
+
+
+def _principal_for_inbox_dir(
+    vault_dir_name: str, fallback_principal: str = DEFAULT_FALLBACK_PRINCIPAL
+) -> str:
+    """Owning agent for a vault dir name, mirroring
+    afm_passes.inbox_ingest._principal_for_inbox EXACTLY — fallback included.
+
+    For a ``<agent>-vault`` dir the alias table maps the slug to its canonical
+    agent id (defaulting to the raw slug). For the daemon's OWN bare
+    ``vault/inbox`` (no ``-vault`` suffix — which ``discover_vault_inboxes()``
+    explicitly includes and which is ``config.vault_path`` itself) this returns
+    ``fallback_principal`` ("unknown" by default, matching
+    ``config.inbox_fallback_principal`` and the live
+    ``quarantine_stale_agent_mismatch(fallback_principal="unknown")`` call),
+    NOT the literal dir name "vault". Returning "vault" here would misclassify a
+    healthy stop-candidate whose ``agent_id`` equals the daemon's fallback
+    principal ("unknown") — which the live AFM loop treats as a MATCH, never an
+    ``_agent_mismatch`` — as ``agent_mismatch_quarantine``, moving correctly
+    attributed content out of the daemon's own live inbox that the daemon would
+    never touch."""
     if vault_dir_name.endswith("-vault"):
         slug = vault_dir_name[: -len("-vault")]
-        return _VAULT_SLUG_TO_AGENT_ID.get(slug, slug) or slug
-    return vault_dir_name
+        return _VAULT_SLUG_TO_AGENT_ID.get(slug, slug) or fallback_principal
+    return fallback_principal
 
 
 # Both inbox filename formats:
