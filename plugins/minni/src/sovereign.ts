@@ -33,6 +33,10 @@ export interface RecallResponse {
   workspace_id?: string;
   backend?: string;
   backend_badge?: string;
+  /** W5: the daemon's own hit count (recall.py response_payload, always paired
+   *  with `results`) — the preferred, wire-shape signal for "answered but
+   *  empty", ahead of inspecting `results` itself. */
+  count?: number;
 }
 
 export interface ReadContextResponse {
@@ -654,17 +658,49 @@ export function formatRecall(query: string, response: RecallResponse, vaultResul
 }
 
 /**
- * X5: decide whether to run the local `searchVaultNotes` pre-scan for a recall.
+ * X5 / W5: decide whether to run the local `searchVaultNotes` pre-scan for a
+ * recall.
  *
  * The local pre-scan reads Markdown straight off disk and is NOT subject to the
  * daemon's workspace scoping / read-privacy policy. When the daemon recall
- * succeeds, its (properly scoped) results are authoritative and the unscoped
- * local snippets must not be injected alongside them. The pre-scan therefore
- * runs only as an OFFLINE FALLBACK: daemon unreachable AND the caller did not
- * opt out via includeVault=false.
+ * succeeds WITH HITS, its (properly scoped) results are authoritative and the
+ * unscoped local snippets must not be injected alongside them.
+ *
+ * W5 (punch-list #1, recall vs prepare_task asymmetry): the daemon's `search`
+ * RPC returns JSON-RPC SUCCESS even when it has zero hits (results: [],
+ * count: 0) — that is a live, scoped, empty answer, not an outage. The
+ * original 2-arg gate (`includeVault && !daemonOk`) suppressed the pre-scan on
+ * that daemon-empty case exactly like it does on a genuine outage, which made
+ * minni_recall blinder than prepare_task's markdown/AFM path (which has no
+ * such gate at all). `daemonEmpty` widens the trigger to cover "daemon
+ * answered but empty" alongside "daemon unreachable" — the pre-scan is still
+ * an OFFLINE/DEGRADED fallback, never injected alongside a nonempty daemon
+ * answer, and the accepted tradeoff (unscoped local snippets can now surface
+ * on a workspace-scoped-empty query, not only on a hard outage) is the punch
+ * list's explicit ask. This must NOT be OR'd with an identity denial — a
+ * denial is a refusal, not an empty, and callers must keep gating this
+ * function on `!identityDenied` (see recallResponseText / server.ts's
+ * minni_recall handler; recovery-denial.test.mjs's reserved_agent_id case
+ * pins that invariant).
  */
-export function shouldPrescanVault(daemonOk: boolean, includeVault: boolean): boolean {
-  return includeVault && !daemonOk;
+export function shouldPrescanVault(daemonOk: boolean, includeVault: boolean, daemonEmpty: boolean = false): boolean {
+  return includeVault && (!daemonOk || daemonEmpty);
+}
+
+/**
+ * W5: detect "the daemon answered but has nothing" from the wire shape, not
+ * from English prose. Prefers `count` (recall.py response_payload always
+ * pairs it with `results`) over inspecting `results` itself; falls back to
+ * array length, then to a known empty-results sentinel string for the rare
+ * caller-synthesized RecallResponse that has neither `count` nor an array.
+ */
+export function isDaemonResultEmpty(response: RecallResponse | undefined): boolean {
+  if (!response) return true;
+  if (typeof response.count === "number") return response.count === 0;
+  const { results } = response;
+  if (Array.isArray(results)) return results.length === 0;
+  if (typeof results === "string") return results.trim().length === 0 || results.trim() === "No recall results.";
+  return results === undefined;
 }
 
 /**
@@ -679,7 +715,12 @@ export function recallResponseText(
   result: JsonResult<RecallResponse>,
   vaultResults: VaultSearchResult[],
 ): string {
-  if (result.ok && result.data) return formatRecall(query, result.data, []);
+  // W5: pass vaultResults through — a daemon-empty answer is still `result.ok`,
+  // and shouldPrescanVault (server.ts) may now have populated vaultResults for
+  // exactly that case (punch-list #1). Discarding them here would silently
+  // defeat the daemon-empty pre-scan fix by rendering "No Codex vault wiki
+  // matches." even when the local scan found something.
+  if (result.ok && result.data) return formatRecall(query, result.data, vaultResults);
   const recovery = recoveryRouteFrom(result.data);
   if (recovery) {
     return [
@@ -692,6 +733,16 @@ export function recallResponseText(
   // "Daemon unavailable" offline framing or the unscoped local fallback.
   const denial = identityDenialFrom(result.data);
   if (denial) {
+    // W5 (punch-list #4): cross_agent's default-deny (principal.py:798-803,
+    // allows_cross_agent_recall) is correct-by-design policy, not an identity
+    // misconfiguration — say so, name the capability, give the remedy. Every
+    // OTHER -32004 (reserved_agent_id, other capability_denied methods) keeps
+    // the original "misconfiguration, not an outage" framing: those really
+    // are unprovisioned/misrouted identities (recovery-denial.test.mjs's
+    // reserved_agent_id case pins this — do not regress).
+    if (isCrossAgentCapabilityDenial(denial)) {
+      return crossAgentDenialText(denial);
+    }
     return `Recall denied by the daemon (identity/authz misconfiguration, not an outage): ${denial}`;
   }
   if (vaultResults.length) {
@@ -702,6 +753,109 @@ export function recallResponseText(
     );
   }
   return `Recall failed: ${result.error}`;
+}
+
+/**
+ * W5 (punch-list #4): match ONLY the exact cross_agent capability_denied
+ * message shape emitted by principal.py:806-822 (`make_capability_denied_error`,
+ * called from recall.py:165 for `cross_agent` specifically). The SAME helper
+ * stamps -32004s for other capabilities (provenance.py:117,
+ * enforce_method_capability) and for reserved_agent_id/unknown_identity
+ * (provenance.py:98-116) with a similarly-shaped message — this regex must
+ * leave those on the existing "not-an-outage, no-fallback" path untouched.
+ *
+ * Known coupling risk: this keys off Python-owned prose (principal.py:814).
+ * If that message wording changes, this silently stops matching and
+ * cross_agent denials fall back to the generic (still-correct, just less
+ * ergonomic) framing above — fails safe, no crash. FOLLOW-UP (out of scope
+ * for this package): stamp `error.data = {capability, method}` server-side
+ * (JSON-RPC 2.0's `data` field is exactly for this, and the identity-recovery
+ * path already does it — see recoveryRouteFrom) so the TS side can switch to
+ * a structural check instead of parsing English.
+ */
+export function isCrossAgentCapabilityDenial(denialMessage: string): boolean {
+  return /^capability_denied: 'cross_agent'/.test(denialMessage);
+}
+
+/** W5: the reworded cross_agent denial text — names the capability and the
+ *  remedy, and deliberately never says "misconfiguration" (that word implies
+ *  something is broken; a default-deny capability gate is working as designed). */
+export function crossAgentDenialText(denial: string): string {
+  return (
+    "Cross-agent search denied by the daemon: this is a default-deny policy " +
+    "(capability 'cross_agent' is off by default for this principal) — grant it " +
+    "via the operator principal config, or omit cross_agent to search personal " +
+    `scope. (${denial})`
+  );
+}
+
+/**
+ * W5 (punch-list #4c): pure formatter for the cross_agent graceful-degrade
+ * path. Mirrors formatRecall's shape (so it reads identically to a normal
+ * recall) but leads with an explicit note that cross-agent was denied and
+ * these are personal-scope results instead — per graceful-degradation best
+ * practice, the substitution must be visible, never silent. Independently
+ * unit-testable without a fake daemon: callers pass the ALREADY-RESOLVED
+ * personal-scope RecallResponse (the retry itself is an async RPC call and
+ * lives in recallCrossAgentDegrade, keeping this function pure).
+ */
+export function formatCrossAgentDegrade(
+  query: string,
+  personalResponse: RecallResponse,
+  vaultResults: VaultSearchResult[] = [],
+): string {
+  const note =
+    "Note: cross-agent search was denied by design default (capability 'cross_agent' " +
+    "is off for this principal) — showing personal-scope results instead.";
+  return [note, "", formatRecall(query, personalResponse, vaultResults)].join("\n");
+}
+
+/**
+ * W5 (punch-list #4c): on a cross_agent capability denial, gracefully degrade
+ * IN-BAND to a personal-scope retry of the same query rather than returning
+ * only an error. The retry is strictly narrower/safer than the denied
+ * cross_agent call (personal scope is a subset), so it cannot fail for a NEW
+ * reason the original call didn't already risk.
+ *
+ * Guarded two ways (belt-and-suspenders against a misfiring classifier or an
+ * already-personal-scope call retrying itself into a loop):
+ *  1. `denial` must match isCrossAgentCapabilityDenial exactly.
+ *  2. `crossAgentRequested` must be the ORIGINAL request's own cross_agent
+ *     flag (=== true), not inferred from the denial text alone.
+ *
+ * Returns undefined when the degrade path does not apply, or when the
+ * personal-scope retry itself fails/comes back empty — callers should then
+ * fall back to recallResponseText's plain (reworded) denial text.
+ */
+export async function recallCrossAgentDegrade(
+  input: {
+    query: string;
+    layer?: string;
+    limit?: number;
+    workspaceId?: string;
+    agentId?: string;
+  },
+  crossAgentRequested: boolean,
+  denial: string | undefined,
+  requester: JsonRpcRequester = jsonRpcSocketRequest,
+): Promise<string | undefined> {
+  if (!denial || !isCrossAgentCapabilityDenial(denial) || crossAgentRequested !== true) {
+    return undefined;
+  }
+  const personalRetry = await recallMemory(
+    {
+      query: input.query,
+      layer: input.layer,
+      limit: input.limit,
+      workspaceId: input.workspaceId,
+      agentId: input.agentId,
+      scope: "personal",
+      crossAgent: false,
+    },
+    requester,
+  );
+  if (!personalRetry.ok || !personalRetry.data) return undefined;
+  return formatCrossAgentDegrade(input.query, personalRetry.data, []);
 }
 
 /**

@@ -19,8 +19,10 @@ import {
   isSharedGateUnavailable,
   handoffMemory,
   identityDenialFrom,
+  isDaemonResultEmpty,
   learnMemory,
   listPendingHandoffs,
+  recallCrossAgentDegrade,
   recallMemory,
   recallResponseText,
   recoveryRouteFrom,
@@ -516,14 +518,19 @@ server.registerTool(
       agentId: DEFAULT_AGENT_ID, // G11: server-side default only (model no longer supplies agentId)
     });
     const daemonOk = result.ok && !!result.data;
+    // W5 (punch-list #1): a daemon that ANSWERED with zero hits is still
+    // daemonOk (JSON-RPC success) — detect that case separately from a true
+    // outage so shouldPrescanVault can widen its offline-fallback trigger to
+    // cover it too, keeping minni_recall no blinder than prepare_task.
+    const daemonEmpty = daemonOk && isDaemonResultEmpty(result.data);
     // An identity denial is not a daemon outage: whether it carries a recovery
     // route (#132 P1) or is a routeless -32004 like reserved_agent_id (#132 P2),
     // the daemon ANSWERED — skip the unscoped offline pre-scan and surface the
-    // diagnostic instead of the "Daemon unavailable" framing.
-    const identityDenied =
-      recoveryRouteFrom(result.data) !== undefined ||
-      identityDenialFrom(result.data) !== undefined;
-    const vaultResults = !identityDenied && shouldPrescanVault(daemonOk, includeVault !== false)
+    // diagnostic instead of the "Daemon unavailable" framing. A denial is a
+    // REFUSAL, not an empty, so it must never be OR'd into daemonEmpty above.
+    const denial = identityDenialFrom(result.data);
+    const identityDenied = recoveryRouteFrom(result.data) !== undefined || denial !== undefined;
+    const vaultResults = !identityDenied && shouldPrescanVault(daemonOk, includeVault !== false, daemonEmpty)
       ? filterSafeVaultResults(
           await searchVaultNotes(
             effectiveVaultPath,
@@ -532,7 +539,17 @@ server.registerTool(
           ),
         )
       : [];
-    const responseText = recallResponseText(query, result, vaultResults);
+    // W5 (punch-list #4c): on a cross_agent capability denial specifically —
+    // and only when the ORIGINAL request itself asked for cross_agent — retry
+    // in-band at personal scope instead of returning a bare error. Falls
+    // through to the normal (reworded, #4b) denial text when the degrade
+    // path doesn't apply or the retry itself comes up empty/failed.
+    const degradeText = await recallCrossAgentDegrade(
+      { query, layer, limit, workspaceId: workspaceId ?? DEFAULT_WORKSPACE_ID, agentId: DEFAULT_AGENT_ID },
+      cross_agent === true,
+      denial,
+    );
+    const responseText = degradeText ?? recallResponseText(query, result, vaultResults);
     await recordAudit(effectiveVaultPath, {
       tool: "minni_recall",
       summary: query,
@@ -547,6 +564,7 @@ server.registerTool(
         includeVault: includeVault !== false,
         vaultMatches: vaultResults.map((match) => match.relativePath),
         error: result.error,
+        crossAgentDegraded: degradeText !== undefined,
       },
     });
     return textResult(responseText);
