@@ -251,3 +251,102 @@ def test_reload_runtime_config_clears_agent_scope_cache(tmp_path: Path):
         "old-codex",
         "new-codex",
     ]
+
+
+def test_cache_reload_rpc_requires_govern_and_clears_agent_scope_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """W2 (d): cache_reload is the in-band equivalent of the SIGHUP flush.
+
+    It requires the 'govern' capability (same tier as daemon.endorse) and is NOT
+    a recovery-allowed method — a non-govern caller is denied loudly, and a
+    govern caller triggers the same _reload_runtime_config() cache clear.
+    """
+    principals = tmp_path / "principals"
+    principals.mkdir()
+    local = principals / "local.json"
+    local.write_text(
+        json.dumps(
+            {
+                "agent_id": "main",
+                "capabilities": ["*"],
+                "platform_agent_ids": ["codex"],
+                "legacy_agent_ids": ["old-codex"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    os.chmod(local, 0o600)
+
+    # (a) A merely-identified, non-govern principal is denied loudly (-32004).
+    monkeypatch.setattr(
+        minnid,
+        "resolve_effective_principal",
+        lambda **_kwargs: EffectivePrincipal(
+            agent_id="codex",
+            workspace_id="default",
+            capabilities=["read"],
+            allowed_vault_roots=[],
+        ),
+    )
+    denied = minnid._dispatch_sync(
+        {
+            "jsonrpc": "2.0",
+            "id": "reload-deny",
+            "method": "cache_reload",
+            "params": {"agent_id": "codex"},
+        }
+    )
+    assert "result" not in denied
+    assert denied["error"]["code"] == -32004
+    assert "capability_denied" in denied["error"]["message"]
+
+    # (b) A govern principal succeeds and the RPC actually clears the cache.
+    first = principal.agent_scope_for("codex", principals_dir=principals)
+    assert first == ["codex", "old-codex"]
+    local.write_text(
+        json.dumps(
+            {
+                "agent_id": "main",
+                "capabilities": ["*"],
+                "platform_agent_ids": ["codex"],
+                "legacy_agent_ids": ["old-codex", "new-codex"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    os.chmod(local, 0o600)
+    # Still stale until the cache is cleared.
+    assert principal.agent_scope_for("codex", principals_dir=principals) == first
+
+    monkeypatch.setattr(
+        minnid,
+        "resolve_effective_principal",
+        lambda **_kwargs: EffectivePrincipal(
+            agent_id="main",
+            workspace_id="default",
+            capabilities=["*"],
+            allowed_vault_roots=[],
+        ),
+    )
+    ok = minnid._dispatch_sync(
+        {
+            "jsonrpc": "2.0",
+            "id": "reload-ok",
+            "method": "cache_reload",
+            "params": {"agent_id": "main"},
+        }
+    )
+    assert "error" not in ok
+    assert "agent_scope_for" in ok["result"]["cleared"]
+    assert principal.agent_scope_for("codex", principals_dir=principals) == [
+        "codex",
+        "old-codex",
+        "new-codex",
+    ]
+
+
+def test_cache_reload_not_in_recovery_allowed_methods():
+    """W2 (d): a mutating admin op must never be reachable pre-identity."""
+    assert "cache_reload" not in provenance.RECOVERY_ALLOWED_METHODS
+    assert provenance.RPC_CAPABILITY_REQUIREMENTS.get("cache_reload") == "govern"

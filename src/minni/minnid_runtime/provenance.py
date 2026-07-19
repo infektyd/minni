@@ -64,6 +64,9 @@ RPC_CAPABILITY_REQUIREMENTS: Dict[str, str] = {
     "vault_index_doc": "learn",
     "daemon.compile": "read",
     "daemon.endorse": "govern",
+    # W2: in-band cache flush is a mutating admin op — same 'govern' tier as
+    # daemon.endorse, and deliberately NOT in RECOVERY_ALLOWED_METHODS.
+    "cache_reload": "govern",
 }
 
 

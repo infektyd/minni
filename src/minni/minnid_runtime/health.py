@@ -1,6 +1,8 @@
 import logging
+import os
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -13,7 +15,14 @@ logger = logging.getLogger("minnid")
 # NEW-01: health_report is reachable pre-identity (in RECOVERY_ALLOWED_METHODS),
 # so its per-record fields — document paths and learning contents — must be
 # withheld from an unstamped recovery-mode caller. Liveness/aggregate signals stay.
-_HEALTH_REPORT_SENSITIVE_KEYS = ("stale_docs", "never_recalled", "contradicting_learnings")
+# W2: recent_errors (exception messages) joins the list — a traceback message can
+# embed paths/payloads, so it rides the identical operator-gate/redaction path.
+_HEALTH_REPORT_SENSITIVE_KEYS = (
+    "stale_docs",
+    "never_recalled",
+    "contradicting_learnings",
+    "recent_errors",
+)
 
 
 def redact_health_report_for_recovery(report: dict) -> dict:
@@ -43,6 +52,12 @@ class HealthContext:
     latency_snapshot: Callable[[], dict]
     metrics_snapshot: Callable[[], dict]
     afm_loop_enabled: Callable[[Any], bool]
+    # W2 (health opacity): delta-aware counters + derived flags + the exception
+    # ring buffer. Defaulted so tests/legacy wiring that construct a HealthContext
+    # without them keep working (status just omits the self-diagnosing extras).
+    metrics_delta_snapshot: Callable[[], dict] = lambda: {}
+    health_flags: Callable[[dict], list] = lambda deltas: []
+    recent_errors: Callable[[], list] = lambda: []
     increment_request_count: Callable[[], None] | None = None
     request_count: Callable[[], int] = lambda: 0
     start_time: Callable[[], float] = lambda: time.time()
@@ -167,15 +182,26 @@ def handle_status(params: dict, request_id: Any, context: HealthContext) -> dict
 
     uptime = time.time() - context.start_time()
     metrics = context.metrics_snapshot()
+    # W2: delta-aware view (compute once so the baseline advances exactly once)
+    # + derived flags, so status is self-diagnosing instead of a bare int.
+    deltas = context.metrics_delta_snapshot()
+    flags = context.health_flags(deltas)
+    started_at = datetime.fromtimestamp(
+        context.start_time(), tz=timezone.utc
+    ).isoformat()
     return context.make_response({
         "daemon": {
             "version": context.version,
+            "pid": os.getpid(),
+            "started_at": started_at,
             "uptime_seconds": round(uptime, 1),
             "requests_served": context.request_count(),
             "socket_path": "[redacted]",
             "latencies": context.latency_snapshot(),
             "errors": metrics.get("errors", 0),
             "counters": metrics,
+            "counter_deltas": deltas,
+            "health_flags": flags,
         },
         "engine": {
             "db_ok": db_ok,
@@ -199,6 +225,10 @@ def handle_health_report(params: dict, request_id: Any, context: HealthContext) 
         "never_recalled": [],
         "contradicting_learnings": [],
         "vector_backend_lag": [],
+        # W2: last-N dispatch exceptions so a climbing errors.<method> counter is
+        # attributable. Sensitive (messages can embed paths/payloads) — redacted
+        # to a count for any non-operator caller via _HEALTH_REPORT_SENSITIVE_KEYS.
+        "recent_errors": context.recent_errors(),
         "faiss_cache_age_seconds": faiss_cache_age_seconds(context.default_config),
         "afm_loop": {
             "last_run_per_pass": {},
