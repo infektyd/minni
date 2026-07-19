@@ -7,6 +7,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
+import minni.obs as obs
 from minni.config import DEFAULT_CONFIG
 from minni.db import SovereignDB
 from minni.principal import (
@@ -499,6 +500,11 @@ async def afm_loop_runner(context: AFMContext):
                     # log_only/do_not_store, never deletes. Failure here must NOT
                     # block consolidation of the existing queue.
                     if (cfg or {}).get("ingest_inbox", True):
+                        # Defined ahead of the try so a failure inside it (e.g.
+                        # the ingest call itself raising) leaves this an empty
+                        # dict rather than undefined — the quarantine check
+                        # right below reads it unconditionally.
+                        _skips: dict = {}
                         try:
                             from minni.afm_passes.inbox_ingest import ingest as _ingest_inbox
                             # Reuse the daemon's shared handle: SovereignDB
@@ -534,6 +540,44 @@ async def afm_loop_runner(context: AFMContext):
                                 "AFM loop: inbox ingest raised (skipped; "
                                 "consolidation continues)"
                             )
+                        # W3 (audit §4 / consolidation inbox residue): an
+                        # _agent_mismatch skip is PERMANENT — the same file
+                        # produces the identical skip on every future tick, so
+                        # left alone it just piles up invisibly forever (the
+                        # 59-file unknown-vault/inbox cohort). Quarantine it
+                        # once stale instead. Scoped to _agent_mismatch ONLY;
+                        # _malformed_kind/_unrecognized are different bugs and
+                        # are not drained here. Failure here must NOT block
+                        # consolidation of the existing queue.
+                        if (cfg or {}).get("ingest_inbox", True) and _skips.get("_agent_mismatch"):
+                            try:
+                                from minni.afm_passes.inbox_quarantine import (
+                                    quarantine_stale_agent_mismatch,
+                                )
+                                _q = quarantine_stale_agent_mismatch(
+                                    context.default_config,
+                                    fallback_principal=str((cfg or {}).get(
+                                        "inbox_fallback_principal", "unknown")),
+                                    ttl_days=(cfg or {}).get("inbox_quarantine_ttl_days"),
+                                )
+                                if _q.get("quarantined"):
+                                    # Fail-LOUD: a climbing global counter
+                                    # (surfaced on status.daemon.counters,
+                                    # obs.py's existing metrics-snapshot path)
+                                    # plus a WARNING log line, so stale residue
+                                    # is visible on every status call instead
+                                    # of silently accumulating.
+                                    obs.incr("inbox_quarantined_total", _q["quarantined"])
+                                    context.logger.warning(
+                                        "AFM loop: quarantined %d stale "
+                                        "_agent_mismatch inbox file(s): %s",
+                                        _q["quarantined"], _q["quarantined_files"],
+                                    )
+                            except Exception:
+                                context.logger.exception(
+                                    "AFM loop: inbox quarantine raised (skipped; "
+                                    "consolidation continues)"
+                                )
                     max_batches = int((cfg or {}).get("max_batches_per_tick", 40))
                     batches = total_examined = 0
                     last_summ = None

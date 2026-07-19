@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import time
@@ -30,7 +31,8 @@ def redact_health_report_for_recovery(report: dict) -> dict:
 
     Per-record detail is replaced with a count so an unauthenticated caller
     cannot enumerate filesystem paths or learning text; non-sensitive liveness
-    fields (afm_loop, faiss_cache_age_seconds, vector_backend_lag) are retained.
+    fields (afm_loop, faiss_cache_age_seconds, vector_backend_lag,
+    inbox_quarantine — aggregate counts only, no file paths) are retained.
     Returns a new dict; the input is not mutated.
     """
     redacted = dict(report)
@@ -225,6 +227,12 @@ def handle_health_report(params: dict, request_id: Any, context: HealthContext) 
         "never_recalled": [],
         "contradicting_learnings": [],
         "vector_backend_lag": [],
+        # W3 (audit §4 / consolidation inbox residue): operator-visible
+        # recovery surface for files parked in <inbox>/quarantine/ (see
+        # afm_passes.inbox_quarantine). Aggregate-only (count + reason
+        # breakdown + oldest timestamp) — no file paths, so this stays
+        # outside _HEALTH_REPORT_SENSITIVE_KEYS like vector_backend_lag.
+        "inbox_quarantine": {"count": 0, "oldest_quarantined_at": None, "by_reason": {}},
         # W2: last-N dispatch exceptions so a climbing errors.<method> counter is
         # attributable. Sensitive (messages can embed paths/payloads) — redacted
         # to a count for any non-operator caller via _HEALTH_REPORT_SENSITIVE_KEYS.
@@ -331,6 +339,39 @@ def handle_health_report(params: dict, request_id: Any, context: HealthContext) 
                         })
             except Exception as exc:
                 report["vector_backend_lag"].append({"status": "unknown", "error": str(exc)})
+
+        try:
+            # Filesystem-native like the rest of this subsystem (no DB round
+            # trip needed — quarantined files by definition never got a
+            # candidate_packets row). Own try/except so a scan failure cannot
+            # take down the rest of the report.
+            from minni.afm_passes.inbox_ingest import discover_inboxes
+
+            q_count = 0
+            oldest: Optional[str] = None
+            by_reason: dict[str, int] = {}
+            for inbox in discover_inboxes(context.default_config):
+                q_dir = inbox / "quarantine"
+                if not q_dir.is_dir():
+                    continue
+                for reason_path in q_dir.glob("*.reason.json"):
+                    q_count += 1
+                    try:
+                        payload = json.loads(reason_path.read_text(encoding="utf-8"))
+                    except Exception:
+                        payload = {}
+                    reason = str(payload.get("reason") or "unknown")
+                    by_reason[reason] = by_reason.get(reason, 0) + 1
+                    qat = payload.get("quarantined_at")
+                    if isinstance(qat, str) and (oldest is None or qat < oldest):
+                        oldest = qat
+            report["inbox_quarantine"] = {
+                "count": q_count,
+                "oldest_quarantined_at": oldest,
+                "by_reason": by_reason,
+            }
+        except Exception as exc:
+            report["inbox_quarantine"] = {"status": "unknown", "error": str(exc)}
     except Exception as exc:
         context.logger.warning("health_report degraded: %s", exc)
         report["error"] = str(exc)
