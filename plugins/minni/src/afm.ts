@@ -746,7 +746,22 @@ export function daemonAfmToProviderHealth(
 ): ProviderHealth | undefined {
   if (!data || typeof data !== "object") return undefined;
   const record = data as Record<string, unknown>;
-  if (record.mode !== expectedProvider) return undefined;
+  // Review r1 (P2): afm_runtime_status() reports the RESOLVED MODE, which in
+  // auto installs is the literal string "auto" — never "native"/"bridge".
+  // Strict equality against the plugin's resolved provider would reject every
+  // fresh auto-mode daemon verdict and reintroduce the redundant cold probe.
+  // Derive the daemon's effective provider: explicit native/bridge modes map
+  // to themselves; auto maps via `status` ("native_available" → native,
+  // "bridge"/"fallback_used" → bridge). Anything else stays unmatched (fail
+  // to "no reuse", the untrusted-input posture).
+  let daemonEffective: AfmProvider | undefined;
+  if (record.mode === "native" || record.mode === "bridge" || record.mode === "off") {
+    daemonEffective = record.mode;
+  } else if (record.mode === "auto") {
+    if (record.status === "native_available") daemonEffective = "native";
+    else if (record.status === "bridge" || record.status === "fallback_used") daemonEffective = "bridge";
+  }
+  if (daemonEffective !== expectedProvider) return undefined;
   const generationVerified = record.generation_verified;
   const reachable = record.reachable;
   const probeAgeMs = record.probe_age_ms;

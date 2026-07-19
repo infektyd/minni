@@ -2149,6 +2149,12 @@ class RetrievalEngine:
         if len(query_variants) > 1:
             total_t0 = time.perf_counter()
             per_variant = []
+            # Review r1 (P2): each recursive single-variant call below rewrites
+            # self.last_auth_suppression, so without accumulation the P0-A
+            # diagnostic only survives when the SUPPRESSING variant happens to
+            # run last. Collect per-variant suppressions and re-aggregate after
+            # the merge.
+            variant_suppressions: List[Dict] = []
             for variant in query_variants:
                 per_variant.append(self.retrieve(
                     query=variant,
@@ -2174,7 +2180,26 @@ class RetrievalEngine:
                     principal=principal,
                     workspace=workspace,
                 ))
+                if self.last_auth_suppression:
+                    variant_suppressions.append(
+                        {**self.last_auth_suppression, "variant": variant}
+                    )
             results = self._merge_expanded_results(per_variant, query_variants, limit)
+            # Aggregate: any variant whose non-empty candidate set was gated to
+            # zero keeps the blackout visible, regardless of variant order.
+            # (recall.py only surfaces it when the merged result is empty.)
+            if variant_suppressions:
+                total_pre = sum(s.get("pre_gate", 0) for s in variant_suppressions)
+                self.last_auth_suppression = {
+                    "pre_gate": total_pre,
+                    "suppressed": total_pre,
+                    "reason": "; ".join(
+                        str(s.get("reason", "")) for s in variant_suppressions
+                    ),
+                    "variants": [s.get("variant") for s in variant_suppressions],
+                }
+            else:
+                self.last_auth_suppression = None
             if summarize_neighborhood:
                 results = self._add_neighborhood_summaries(
                     results, principal=principal, workspace=workspace

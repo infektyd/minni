@@ -425,7 +425,7 @@ def replace_toml_sections(path: Path, sections: dict[str, str], *, preserve_surf
                 expected_agent = fresh_env.get("MINNI_AGENT_ID")
                 if expected_agent:
                     ex_env = _validate_preserved_identity(ex_env, expected_agent)
-                preserved_lines = []
+                resolved_env: dict = {}
                 for k in (
                     "MINNI_AGENT_ID",
                     "MINNI_VAULT_PATH",
@@ -435,12 +435,19 @@ def replace_toml_sections(path: Path, sections: dict[str, str], *, preserve_surf
                     "MINNI_AFM_NATIVE_HELPER",
                 ):
                     if k in ex_env:
-                        val = ex_env[k]
+                        resolved_env[k] = ex_env[k]
                     elif k in fresh_env:
-                        val = fresh_env[k]
-                    else:
-                        continue
-                    preserved_lines.append(f'{k} = "{_toml_basic_str(val)}"')
+                        resolved_env[k] = fresh_env[k]
+                # Codex hook mirror survives flagless upgrades: the fresh
+                # section carries MINNI_CODEX_* only for the codex surface, so
+                # its presence is the surface signal. Re-derive from the
+                # RESOLVED generic identity (never carried raw from ex_env —
+                # X2) so hooks track whatever vault survived preservation.
+                if any(k.startswith("MINNI_CODEX_") for k in fresh_env):
+                    _mirror_codex_hook_env(resolved_env, "codex")
+                preserved_lines = [
+                    f'{k} = "{_toml_basic_str(v)}"' for k, v in resolved_env.items()
+                ]
                 if preserved_lines:
                     sections["mcp_servers.minni.env"] = "[mcp_servers.minni.env]\n" + "\n".join(preserved_lines)
         except Exception:

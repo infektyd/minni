@@ -537,7 +537,18 @@ def resolve_effective_principal(
                     os.environ.get("MINNI_HOME") or (Path.home() / ".minni")
                 ).expanduser()
                 names = {f"{agent_id}-vault", f"{agent_id.replace('-', '')}-vault"}
-                return [str((minni_home / n).resolve()) for n in sorted(names)]
+                roots = [str((minni_home / n).resolve()) for n in sorted(names)]
+                if agent_id == "gemini":
+                    # The installer's vault_for("gemini") deliberately falls
+                    # back to the legacy ~/.gemini/minni-vault when it has data
+                    # and the canonical vault is missing (propagate.py). A
+                    # strict install upgraded without platform_agent_vault_roots
+                    # would otherwise stamp MCP with the legacy path while the
+                    # daemon principal rejects it via allows_vault_root.
+                    roots.append(
+                        str(Path("~/.gemini/minni-vault").expanduser().resolve())
+                    )
+                return roots
 
             platform_roots = raw.get("platform_agent_vault_roots") or {}
             platform_roots_map = (

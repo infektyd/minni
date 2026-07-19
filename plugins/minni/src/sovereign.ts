@@ -37,6 +37,13 @@ export interface RecallResponse {
    *  with `results`) — the preferred, wire-shape signal for "answered but
    *  empty", ahead of inspecting `results` itself. */
   count?: number;
+  /** P0-A diagnostic: present (non-empty) when the daemon's read gate
+   *  filtered a non-empty candidate set to zero — a scoped ANSWER, not a
+   *  miss. isDaemonResultEmpty must treat it as non-empty. */
+  auth_suppression?: unknown[];
+  /** Learnings surface separately from document `results`/`count`; a
+   *  learnings-only reply is still a live scoped answer. */
+  learnings?: unknown[];
 }
 
 export interface ReadContextResponse {
@@ -696,6 +703,13 @@ export function shouldPrescanVault(daemonOk: boolean, includeVault: boolean, dae
  */
 export function isDaemonResultEmpty(response: RecallResponse | undefined): boolean {
   if (!response) return true;
+  // Review r1 (P1): `count` covers document results only. A reply whose
+  // documents were removed by the auth_suppression read gate, or that matched
+  // only the separate `learnings` array, is a live SCOPED answer — treating
+  // it as empty would trigger the workspace-unscoped vault pre-scan and bury
+  // the suppression diagnostic under local markdown snippets.
+  if (Array.isArray(response.auth_suppression) && response.auth_suppression.length > 0) return false;
+  if (Array.isArray(response.learnings) && response.learnings.length > 0) return false;
   if (typeof response.count === "number") return response.count === 0;
   const { results } = response;
   if (Array.isArray(results)) return results.length === 0;
