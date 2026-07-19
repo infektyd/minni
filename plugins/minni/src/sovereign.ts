@@ -956,8 +956,6 @@ export async function buildStatusReport(input?: {
   // generation probe entirely when that fresh result is usable.
   const socket = input?.socket ?? (await socketHealth());
 
-  const rawAfm = input?.afm ?? (await afmHealth());
-
   let volume = 0;
   const logFiles = ["log.md", "log.1.md", "log.2.md", "log.3.md"];
   for (const name of logFiles) {
@@ -977,7 +975,20 @@ export async function buildStatusReport(input?: {
     }
   } catch {}
 
-  const afmProvider = resolveAfmProvider(input?.afmProviderMode ?? AFM_PROVIDER_MODE, {
+  // Review r3 (P2): decide daemon-verdict reuse BEFORE paying the local
+  // afmHealth() call — in native/auto installs with the bridge health endpoint
+  // down or slow, that probe costs its full timeout on every
+  // Status/SessionStart even when the daemon has already supplied the
+  // authoritative AFM verdict. The reuse decision does not need bridge
+  // /health: in explicit modes resolveAfmProvider's provider IS the mode
+  // (health only refines status/availability detail), and in auto mode
+  // daemonAfmToProviderHealth treats the daemon as the authority regardless of
+  // the local guess. So resolve provisionally without health, and only await
+  // afmHealth() when the daemon verdict is unusable (the fallback plugin probe
+  // and auto-resolution genuinely need it).
+  const configuredAfmMode = input?.afmProviderMode ?? AFM_PROVIDER_MODE;
+  let rawAfm = input?.afm;
+  let afmProvider = resolveAfmProvider(configuredAfmMode, {
     nativeHelperPath: resolvedNativeHelperPath(),
     health: rawAfm,
   });
@@ -1005,6 +1016,23 @@ export async function buildStatusReport(input?: {
     afmProvider.mode,
   );
 
+  // Local /health probe (r3): skipped entirely when the daemon verdict is
+  // being reused — the report's afm block then carries the daemon-sourced
+  // reachable/generationVerified plus source:"daemon", and the bridge-health
+  // string fields are simply absent. When we DO need it (no usable daemon
+  // verdict, or a test seam supplied input.afm), re-resolve the provider with
+  // health so the fallback path behaves exactly as before.
+  const reusingDaemonVerdict = !input?.afmGeneration && daemonGeneration !== undefined;
+  if (rawAfm === undefined && !reusingDaemonVerdict) {
+    rawAfm = await afmHealth();
+    afmProvider = resolveAfmProvider(configuredAfmMode, {
+      nativeHelperPath: resolvedNativeHelperPath(),
+      health: rawAfm,
+    });
+  }
+  const resolvedRawAfm: JsonResult =
+    rawAfm ?? { ok: false, data: undefined, error: undefined };
+
   let generation: ProviderHealth;
   let source: "daemon" | "plugin-probe";
   if (input?.afmGeneration) {
@@ -1019,14 +1047,14 @@ export async function buildStatusReport(input?: {
       // The HTTP /health result gates the generation probe only for the bridge
       // provider; in native mode a dead bridge must not veto the probe — the
       // native helper is exercised directly (mirror of afm_runtime_status).
-      health: afmProvider.provider === "bridge" ? rawAfm : undefined,
+      health: afmProvider.provider === "bridge" ? resolvedRawAfm : undefined,
       transport: input?.afmGenerationTransport,
       ttlMs: input?.afmGenerationTtlMs,
       nativeHelperPath: resolvedNativeHelperPath(),
     });
     source = "plugin-probe";
   }
-  const sanitizedAfm = sanitizeAfmHealth(rawAfm);
+  const sanitizedAfm = sanitizeAfmHealth(resolvedRawAfm);
   const generationError =
     generation.generationVerified
       ? undefined

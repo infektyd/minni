@@ -76,14 +76,19 @@ _FTS_TRANSIENT_MARKERS = ("vtable constructor failed", "schema has changed")
 
 
 def _fts_execute_with_retry(cursor, sql, params, *, attempts: int = _FTS_RETRY_ATTEMPTS):
-    """Execute a vault_fts MATCH select on ``cursor`` with bounded retry on the
-    transient schema-cookie / vtable-reconnect race. Re-raises the last
-    OperationalError after the budget is exhausted (fail-loud contract)."""
+    """Execute a vault_fts MATCH select on ``cursor`` AND fetch its rows, with
+    bounded retry on the transient schema-cookie / vtable-reconnect race.
+    Returns the fetched rows. The fetch lives INSIDE the retry window (review
+    r3, P2): SQLite can raise "database schema has changed" / "vtable
+    constructor failed" while STEPPING the SELECT, i.e. during fetchall() after
+    a successful execute(), so retrying execute alone still let the race
+    surface at the call sites' fetch. Re-raises the last OperationalError after
+    the budget is exhausted (fail-loud contract)."""
     last_exc: Optional[sqlite3.OperationalError] = None
     for attempt in range(attempts):
         try:
             cursor.execute(sql, params)
-            return
+            return cursor.fetchall()
         except sqlite3.OperationalError as exc:
             if not any(m in str(exc).lower() for m in _FTS_TRANSIENT_MARKERS):
                 raise
@@ -458,7 +463,9 @@ class RetrievalEngine:
                 scope_params.extend(agent_scope)
 
             def _match(match_expr: str):
-                _fts_execute_with_retry(c, f"""
+                # Fetch happens inside the retry helper (review r3): the
+                # vtable race can also fire while stepping the SELECT.
+                return _fts_execute_with_retry(c, f"""
                     SELECT f.doc_id, d.path, d.agent, d.sigil,
                            rank AS bm25_rank, d.decay_score,
                            d.page_status, d.privacy_level, d.page_type,
@@ -470,7 +477,6 @@ class RetrievalEngine:
                     ORDER BY rank
                     LIMIT ?
                 """, [match_expr, *scope_params, limit * 3])
-                return c.fetchall()
 
             # Strict pass first: FTS5 space-joined terms are implicit AND —
             # precise when every term appears in the document. A dated/specific
@@ -1844,7 +1850,9 @@ class RetrievalEngine:
 
         with self.db.cursor() as c:
             def _match(match_expr: str):
-                _fts_execute_with_retry(c, f"""
+                # Fetch happens inside the retry helper (review r3): the
+                # vtable race can also fire while stepping the SELECT.
+                return _fts_execute_with_retry(c, f"""
                     SELECT ce.chunk_id, ce.doc_id, ce.chunk_text, ce.heading_context,
                            d.path, d.agent, d.sigil, d.decay_score,
                            d.page_status, d.privacy_level, d.page_type,
@@ -1858,7 +1866,6 @@ class RetrievalEngine:
                     ORDER BY created_at ASC, ce.chunk_id ASC
                     LIMIT ?
                 """, [match_expr, *filter_params, limit])
-                return c.fetchall()
 
             # P0-C parity (review r2): dated/specific chronological recalls hit
             # this path instead of _fts_search, so they need the SAME zero-hit

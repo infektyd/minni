@@ -246,18 +246,28 @@ def test_trigger_ddl_is_idempotent_at_runtime(tmp_path):
 
 class _CountingCursor:
     """Minimal cursor stub that raises ``error`` on the first ``fail_times``
-    execute() calls, then succeeds — for exercising the retry helper directly."""
+    execute() calls (and optionally the first ``fetch_fail_times`` fetchall()
+    calls), then succeeds — for exercising the retry helper directly."""
 
-    def __init__(self, fail_times, error):
+    def __init__(self, fail_times, error, fetch_fail_times=0, rows=()):
         self.calls = 0
+        self.fetch_calls = 0
         self._fail_times = fail_times
+        self._fetch_fail_times = fetch_fail_times
         self._error = error
+        self._rows = list(rows)
 
     def execute(self, sql, params=None):
         self.calls += 1
         if self.calls <= self._fail_times:
             raise self._error
         return self
+
+    def fetchall(self):
+        self.fetch_calls += 1
+        if self.fetch_calls <= self._fetch_fail_times:
+            raise self._error
+        return list(self._rows)
 
 
 def test_fts_retry_recovers_from_transient_vtable_error(monkeypatch):
@@ -268,8 +278,27 @@ def test_fts_retry_recovers_from_transient_vtable_error(monkeypatch):
         fail_times=1,
         error=sqlite3.OperationalError("vtable constructor failed: vault_fts"),
     )
-    r._fts_execute_with_retry(cur, "SELECT 1 WHERE vault_fts MATCH ?", ["x"])
+    rows = r._fts_execute_with_retry(cur, "SELECT 1 WHERE vault_fts MATCH ?", ["x"])
     assert cur.calls == 2  # failed once, retried, succeeded
+    assert rows == []  # helper returns the fetched rows (review r3)
+
+
+def test_fts_retry_recovers_from_fetch_time_vtable_error(monkeypatch):
+    """Review r3 (P2): the schema-cookie race can also surface while STEPPING
+    the SELECT — i.e. during fetchall() after a successful execute() — so the
+    fetch must live inside the retry window too."""
+    from minni import retrieval as r
+
+    monkeypatch.setattr(r.time, "sleep", lambda *_a, **_k: None)
+    cur = _CountingCursor(
+        fail_times=0,
+        fetch_fail_times=1,
+        error=sqlite3.OperationalError("database schema has changed"),
+        rows=[("doc-1",)],
+    )
+    rows = r._fts_execute_with_retry(cur, "SELECT 1 WHERE vault_fts MATCH ?", ["x"])
+    assert cur.fetch_calls == 2  # fetch failed once, whole read retried
+    assert rows == [("doc-1",)]
 
 
 def test_fts_retry_recovers_from_schema_changed(monkeypatch):

@@ -186,16 +186,30 @@ def handle_status(params: dict, request_id: Any, context: HealthContext) -> dict
     metrics = context.metrics_snapshot()
     # W2: delta-aware view (compute once so the baseline advances exactly once)
     # + derived flags, so status is self-diagnosing instead of a bare int.
-    # Review r2 (P2): only an IDENTIFIED caller's status advances the delta
-    # baseline. `status` is recovery-allowed, so pre-identity/background polls
-    # would otherwise consume a burst of errors.search and suppress
-    # errors_search_rising before an operator ever looks. `_recovery` is the
-    # dispatch-stamped trusted flag (False = stamped principal); a direct/legacy
-    # call without it is treated as recovery (peek). Legacy zero-arg context
-    # wiring keeps the old always-consume behavior via the TypeError fallback.
-    identified = params.get("_recovery") is False
+    # Review r2 (P2) + r3 (P2): consuming the single global delta baseline is
+    # EXPLICIT-OPT-IN, not implicit in identity. The shipped SessionStart/hook
+    # path calls status over the local UDS as a stamped (non-recovery, often
+    # operator) principal, so "identified ⇒ consume" still let routine
+    # background polls swallow an errors.search burst and clear
+    # errors_search_rising before a human ever looked. Now a caller must (a) be
+    # dispatch-stamped non-recovery (`_recovery` is False — trusted flag, not
+    # spoofable), (b) be an operator/govern principal (same bar as the
+    # un-redacted health_report), and (c) explicitly ask via
+    # `consume_deltas: true`. Everything else — hooks, recovery, pre-identity,
+    # plain status — peeks, so deltas read "since last explicit operator
+    # consume" (or since daemon start). Legacy zero-arg context wiring keeps
+    # the old always-consume behavior via the TypeError fallback.
+    from minni.principal import EffectivePrincipal, is_operator_principal
+
+    stamped_principal = params.get("_principal")
+    consume = (
+        params.get("_recovery") is False
+        and params.get("consume_deltas") is True
+        and isinstance(stamped_principal, EffectivePrincipal)
+        and is_operator_principal(stamped_principal)
+    )
     try:
-        deltas = context.metrics_delta_snapshot(consume=identified)
+        deltas = context.metrics_delta_snapshot(consume=consume)
     except TypeError:
         deltas = context.metrics_delta_snapshot()
     flags = context.health_flags(deltas)
@@ -382,7 +396,15 @@ def handle_health_report(params: dict, request_id: Any, context: HealthContext) 
                 "by_reason": by_reason,
             }
         except Exception as exc:
-            report["inbox_quarantine"] = {"status": "unknown", "error": str(exc)}
+            # Review r3 (P2): exception class only — OSError messages embed the
+            # quarantine/sidecar filesystem path, and this block deliberately
+            # sits OUTSIDE _HEALTH_REPORT_SENSITIVE_KEYS (aggregate-only
+            # contract), so a raw str(exc) would survive recovery/non-operator
+            # redaction and leak local paths.
+            report["inbox_quarantine"] = {
+                "status": "unknown",
+                "error": type(exc).__name__,
+            }
     except Exception as exc:
         context.logger.warning("health_report degraded: %s", exc)
         report["error"] = str(exc)
