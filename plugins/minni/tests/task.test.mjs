@@ -67,6 +67,51 @@ test("prepareTask builds a compact deterministic Codex task packet", async () =>
   assert.equal(audits[0].tool, "minni_prepare_task");
 });
 
+test("prepareTask delegates the daemon recall leg to recallAgentId when provided, independent of the vault-search/display agentId", async () => {
+  const recallCalls = [];
+  await prepareTask(
+    {
+      task: "temp agent recall delegation",
+      agentId: "keystone-praxis",
+      recallAgentId: "codex",
+      vaultPath: "/tmp/vault",
+    },
+    {
+      searchVault: async () => [vaultMatch],
+      recall: async (input) => {
+        recallCalls.push(input);
+        return { ok: true, data: { results: "### daemon.md\nDelegated recall.", agent_id: "codex" } };
+      },
+      audit: async () => "/tmp/vault/logs/today.md",
+    },
+  );
+
+  assert.equal(recallCalls.length, 1);
+  assert.equal(recallCalls[0].agentId, "codex");
+});
+
+test("prepareTask defaults the daemon recall leg to agentId when recallAgentId is omitted (back-compat)", async () => {
+  const recallCalls = [];
+  await prepareTask(
+    {
+      task: "no delegation requested",
+      agentId: "codex",
+      vaultPath: "/tmp/vault",
+    },
+    {
+      searchVault: async () => [vaultMatch],
+      recall: async (input) => {
+        recallCalls.push(input);
+        return { ok: true, data: { results: "### daemon.md\nNo delegation.", agent_id: "codex" } };
+      },
+      audit: async () => "/tmp/vault/logs/today.md",
+    },
+  );
+
+  assert.equal(recallCalls.length, 1);
+  assert.equal(recallCalls[0].agentId, "codex");
+});
+
 test("prepareTask ranks fresh handoff notes above older sessions and explains why", async () => {
   // Use a dynamically-recent date so the "fresh" (<=30d) assertion does not rot over time.
   const fresh = new Date(Date.now() - 5 * 86_400_000);

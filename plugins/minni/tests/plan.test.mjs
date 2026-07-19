@@ -16,7 +16,8 @@ import {
   getActivePlan,
   resolveActivePlanView,
   addScar,
-  compactPlanView
+  compactPlanView,
+  shelfDrift
 } from "../dist/plan.js";
 import { ensureVault } from "../dist/vault.js";
 
@@ -681,6 +682,58 @@ test("H7: rehydratePlan upgrades a pre-H7 (v1-digest) plan instead of hard-faili
     const after = await readFile(notePath, "utf8");
     assert.match(after, new RegExp(`^plan_digest: ${v2}$`, "m"), "note must be re-persisted with the v2 digest");
     assert.doesNotMatch(after, new RegExp(`^plan_digest: ${v1}$`, "m"), "legacy digest must be replaced");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("createPlan with shelf_ref configures shelfDrift (punch-list §4b: MCP layer must actually thread shelf_ref through)", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-plan-shelf-"));
+  try {
+    await ensureVault(root);
+    const shelfContent = "# Identity shelf\nAgent: codex\nRole: worker";
+    const { plan } = await createPlan(
+      {
+        goal: "Wire shelf_ref through minni_plan_create",
+        vaultPath: root,
+        shelf_ref: {
+          agent: "codex",
+          wikilink: "[[wiki/identity/codex]]",
+          pull_hint: "pull before each session",
+          shelf_content: shelfContent,
+        },
+      },
+      { vaultPath: root },
+    );
+
+    assert.ok(plan.shelf_ref, "plan.shelf_ref must be set when shelf_ref is passed to createPlan");
+    assert.equal(plan.shelf_ref.agent, "codex");
+    assert.equal(plan.shelf_ref.wikilink, "[[wiki/identity/codex]]");
+    assert.ok(plan.shelf_ref.shelf_hash, "shelf_hash must be derived from shelf_content");
+
+    // Matching live content: drift check reports configured + not drifted.
+    const matched = shelfDrift(plan, shelfContent);
+    assert.equal(matched.configured, true);
+    assert.equal(matched.drifted, false);
+
+    // Divergent live content: still configured, now flags drift.
+    const drifted = shelfDrift(plan, `${shelfContent}\nRole: reviewer`);
+    assert.equal(drifted.configured, true);
+    assert.equal(drifted.drifted, true);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("createPlan without shelf_ref leaves shelfDrift unconfigured (regression guard for the punch-list symptom)", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-plan-noshelf-"));
+  try {
+    await ensureVault(root);
+    const { plan } = await createPlan({ goal: "No shelf attached", vaultPath: root }, { vaultPath: root });
+    assert.equal(plan.shelf_ref, undefined);
+    const drift = shelfDrift(plan, "anything");
+    assert.equal(drift.configured, false);
+    assert.equal(drift.note, "no shelf attached");
   } finally {
     await rm(root, { recursive: true, force: true });
   }

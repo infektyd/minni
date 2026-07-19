@@ -84,6 +84,36 @@ test("buildTeamRuntime creates temporary agent profiles, task ledger, and hydrat
   assert.deepEqual(packet.repeatedAgentSuggestions, []);
 });
 
+test("buildTeamRuntime delegates the daemon recall leg to the coordinator's principal while keeping hydration packets labeled by the temp agent's own id", async () => {
+  const prepareCalls = [];
+  const packet = await buildTeamRuntime(
+    {
+      task: "Investigate keystone recall blackout",
+      coordinatorAgentId: "codex",
+      workspaceId: "/repo",
+      vaultPath: "/tmp/vault",
+      agents: [
+        { agentId: "keystone-praxis", role: "explorer", focus: "Map the blackout." },
+      ],
+    },
+    {
+      prepare: async (input) => {
+        prepareCalls.push(input);
+        return fakePreparedTask(input);
+      },
+      audit: async () => undefined,
+      findRepeated: async () => [],
+    },
+  );
+
+  // Display/audit identity stays the temp agent's own id (unchanged convention).
+  assert.equal(prepareCalls[0].agentId, "keystone-praxis");
+  assert.equal(packet.hydrationPackets[0].agentId, "keystone-praxis");
+  // The daemon recall leg is delegated to the coordinator's provisioned principal —
+  // this is the fix: a never-provisioned temp id must not drive the daemon call.
+  assert.equal(prepareCalls[0].recallAgentId, "codex");
+});
+
 test("buildTeamRuntime attaches repeatedAgentSuggestions from findRepeated and renders them", async () => {
   const stubSuggestions = [
     {

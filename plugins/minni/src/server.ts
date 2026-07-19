@@ -1184,6 +1184,19 @@ const planSliceInputSchema = z.object({
   evidence: z.string().optional(),
 });
 
+// Punch-list §4b: shelf_ref was accepted end-to-end by createPlan/normalizeShelfRef
+// already, but never exposed on the MCP schema, so shelfDrift() (minni_plan_status)
+// always reported configured:false. Additive/optional nested object (no union) —
+// existing callers that omit shelf_ref are unaffected.
+const planShelfRefInputSchema = z.object({
+  agent: z.string().optional(),
+  wikilink: z.string().optional(),
+  pull_hint: z.string().optional(),
+  approx_tokens: z.number().optional(),
+  shelf_hash: z.string().optional(),
+  shelf_content: z.string().optional(),
+});
+
 server.registerTool(
   "minni_plan_create",
   {
@@ -1196,9 +1209,10 @@ server.registerTool(
       slices: z.array(planSliceInputSchema).optional(),
       open_questions: z.array(z.string()).optional(),
       seed_scar_from_audit: z.boolean().optional(),
+      shelf_ref: planShelfRefInputSchema.optional(),
     },
   },
-  async ({ goal, constraints, slices, open_questions, seed_scar_from_audit }) => {
+  async ({ goal, constraints, slices, open_questions, seed_scar_from_audit, shelf_ref }) => {
     const gated = await requireSharedGate("plan.create", { slices: slices?.length ?? 0 });
     if (gated) return gated;
     const effectiveVaultPath = DEFAULT_VAULT_PATH;
@@ -1208,7 +1222,7 @@ server.registerTool(
       scar_tissue = extractScarTissue(tail.entries);
     }
     const { plan, write, displaced_active } = await createPlan(
-      { goal, constraints, slices, open_questions, scar_tissue, vaultPath: effectiveVaultPath },
+      { goal, constraints, slices, open_questions, scar_tissue, shelf_ref, vaultPath: effectiveVaultPath },
       { vaultPath: effectiveVaultPath },
     );
     return textResult(
