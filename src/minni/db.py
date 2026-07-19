@@ -35,6 +35,16 @@ _migrations_lock = threading.Lock()
 # connection unable to construct vault_fts.  Serialize schema initialization
 # process-wide while retaining the per-instance fast path below.
 _schema_init_lock = threading.RLock()
+# Per-path tracking of which db files have had their non-migration schema DDL
+# (FTS5 vtable init + trigger creation) run this process. Mirrors the
+# _migrated_paths idiom above. Without it, _init_schema was gated only by the
+# per-instance ``self._schema_initialized`` flag, so every fresh SovereignDB the
+# daemon/AFM passes construct re-ran the trigger DDL against the shared on-disk
+# file — each re-run bumping the SQLite schema cookie under concurrent vault_fts
+# readers and surfacing "vtable constructor failed: vault_fts". Gating the DDL
+# to once per db-path per process removes that steady-state churn. Reset per
+# test by the conftest autouse fixture, exactly like _migrated_paths.
+_schema_ready_paths: set = set()
 
 
 class SovereignDB:
@@ -71,9 +81,22 @@ class SovereignDB:
                 self._local.conn = conn
 
         if not self._schema_initialized:
+            # Normalize the key exactly as the migrations block does below, so a
+            # single file reached via different path spellings maps to one entry.
+            abs_db_path = os.path.abspath(self.config.db_path)
             with _schema_init_lock, self._lock:
                 if not self._schema_initialized:
-                    self._init_schema(self._local.conn)
+                    # Process-wide gate: schema DDL (FTS5 vtable init + trigger
+                    # creation) only needs to run once per db-path per process.
+                    # A second SovereignDB instance opened on the same file — the
+                    # daemon + AFM passes construct many — must skip _init_schema
+                    # on its FIRST call too, not re-run the trigger DDL and bump
+                    # the schema cookie under concurrent vault_fts readers. Add
+                    # to the set only AFTER success, mirroring _migrated_paths, so
+                    # a failed init is retried on the next open of this path.
+                    if abs_db_path not in _schema_ready_paths:
+                        self._init_schema(self._local.conn)
+                        _schema_ready_paths.add(abs_db_path)
                     self._schema_initialized = True
 
         return self._local.conn
@@ -322,9 +345,17 @@ class SovereignDB:
         c.execute("CREATE INDEX IF NOT EXISTS idx_ax_created ON ax_snapshots(created_at)")
 
         # === Triggers ===
-        c.execute("DROP TRIGGER IF EXISTS trg_thread_msg_count")
+        # CREATE TRIGGER IF NOT EXISTS, never DROP + CREATE: these five trigger
+        # bodies are pure INSERT/UPDATE/DELETE FTS mirrors that never change
+        # between migrations, so dropping and recreating them on every init only
+        # churned the SQLite schema cookie (invalidating concurrent vault_fts
+        # readers). If a trigger body must change in a future migration, that
+        # change belongs in the migrations block below — not this unconditional
+        # init body. (Fix (a) makes this run once per path/process anyway; the
+        # idempotent form is the backstop for two processes racing first
+        # contact on the same db file.)
         c.execute("""
-            CREATE TRIGGER trg_thread_msg_count
+            CREATE TRIGGER IF NOT EXISTS trg_thread_msg_count
             AFTER INSERT ON episodic_events
             WHEN NEW.thread_id IS NOT NULL
             BEGIN
@@ -335,9 +366,8 @@ class SovereignDB:
             END
         """)
 
-        c.execute("DROP TRIGGER IF EXISTS trg_episodic_fts_insert")
         c.execute("""
-            CREATE TRIGGER trg_episodic_fts_insert
+            CREATE TRIGGER IF NOT EXISTS trg_episodic_fts_insert
             AFTER INSERT ON episodic_events
             WHEN NEW.content IS NOT NULL
             BEGIN
@@ -347,9 +377,8 @@ class SovereignDB:
         """)
 
         # Auto-index learnings into FTS
-        c.execute("DROP TRIGGER IF EXISTS trg_learnings_fts_insert")
         c.execute("""
-            CREATE TRIGGER trg_learnings_fts_insert
+            CREATE TRIGGER IF NOT EXISTS trg_learnings_fts_insert
             AFTER INSERT ON learnings
             BEGIN
                 INSERT INTO learnings_fts(learning_id, agent_id, category, content)
@@ -357,9 +386,8 @@ class SovereignDB:
             END
         """)
 
-        c.execute("DROP TRIGGER IF EXISTS trg_learnings_fts_update")
         c.execute("""
-            CREATE TRIGGER trg_learnings_fts_update
+            CREATE TRIGGER IF NOT EXISTS trg_learnings_fts_update
             AFTER UPDATE OF agent_id, category, content ON learnings
             BEGIN
                 UPDATE learnings_fts
@@ -370,9 +398,8 @@ class SovereignDB:
             END
         """)
 
-        c.execute("DROP TRIGGER IF EXISTS trg_learnings_fts_delete")
         c.execute("""
-            CREATE TRIGGER trg_learnings_fts_delete
+            CREATE TRIGGER IF NOT EXISTS trg_learnings_fts_delete
             AFTER DELETE ON learnings
             BEGIN
                 DELETE FROM learnings_fts WHERE learning_id = OLD.learning_id;

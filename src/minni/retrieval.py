@@ -23,6 +23,7 @@ import logging
 import hashlib
 import importlib.util
 import re
+import sqlite3
 import sys
 from pathlib import Path
 from typing import Any, List, Dict, Literal, Optional, Sequence, Tuple
@@ -58,6 +59,40 @@ _TYPE_TO_AUTHORITY = {
     "entity": "vault",
     "synthesis": "concept",
 }
+
+
+# --- vault_fts vtable DDL race (punch-list §2, fix (c)) --------------------
+# The vault_fts virtual table is reconstructed via its FTS5 xConnect callback
+# whenever a concurrent schema-cookie bump (another SovereignDB instance/process
+# running schema init) moves the schema version mid-flight. A read racing that
+# reconstruction can surface a transient "vtable constructor failed: vault_fts"
+# (or "database schema has changed"). Retry the read a bounded number of times
+# with a short backoff, then re-raise so genuine failures still fail loud. Only
+# the two known transient message families are retried; every other
+# OperationalError (e.g. a real SQL/syntax error) propagates immediately.
+_FTS_RETRY_ATTEMPTS = 3
+_FTS_RETRY_BACKOFFS = (0.05, 0.1, 0.2)
+_FTS_TRANSIENT_MARKERS = ("vtable constructor failed", "schema has changed")
+
+
+def _fts_execute_with_retry(cursor, sql, params, *, attempts: int = _FTS_RETRY_ATTEMPTS):
+    """Execute a vault_fts MATCH select on ``cursor`` with bounded retry on the
+    transient schema-cookie / vtable-reconnect race. Re-raises the last
+    OperationalError after the budget is exhausted (fail-loud contract)."""
+    last_exc: Optional[sqlite3.OperationalError] = None
+    for attempt in range(attempts):
+        try:
+            cursor.execute(sql, params)
+            return
+        except sqlite3.OperationalError as exc:
+            if not any(m in str(exc).lower() for m in _FTS_TRANSIENT_MARKERS):
+                raise
+            last_exc = exc
+            if attempt + 1 >= attempts:
+                break
+            time.sleep(_FTS_RETRY_BACKOFFS[min(attempt, len(_FTS_RETRY_BACKOFFS) - 1)])
+    assert last_exc is not None  # only reachable after catching a transient error
+    raise last_exc
 
 
 def _query_class(query: str) -> str:
@@ -423,7 +458,7 @@ class RetrievalEngine:
                 scope_params.extend(agent_scope)
 
             def _match(match_expr: str):
-                c.execute(f"""
+                _fts_execute_with_retry(c, f"""
                     SELECT f.doc_id, d.path, d.agent, d.sigil,
                            rank AS bm25_rank, d.decay_score,
                            d.page_status, d.privacy_level, d.page_type,
@@ -1809,7 +1844,7 @@ class RetrievalEngine:
         params.append(limit)
 
         with self.db.cursor() as c:
-            c.execute(f"""
+            _fts_execute_with_retry(c, f"""
                 SELECT ce.chunk_id, ce.doc_id, ce.chunk_text, ce.heading_context,
                        d.path, d.agent, d.sigil, d.decay_score,
                        d.page_status, d.privacy_level, d.page_type,
