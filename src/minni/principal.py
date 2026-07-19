@@ -72,6 +72,12 @@ PRINCIPALS_DIR: Path = Path(CANONICAL_SOVEREIGN_HOME) / "principals"
 # uniformly (no synthesis override, aliases respected, etc.).
 CANONICAL_PRINCIPAL_NAMES: tuple[str, ...] = ("local", "default", "operator", "main")
 OPERATOR_RESERVED_AGENT_IDS: tuple[str, ...] = ("operator", "main")
+# Fail-closed vault-roots sentinel for platform agents whose
+# platform_agent_vault_roots entry is present but empty/malformed: a non-empty
+# roots list that can never contain a real document (empty roots + caps would
+# otherwise vacuous-allow every path via allows_vault_root). can_read_document
+# must treat a roots list made ONLY of this sentinel as "no valid roots".
+PLATFORM_NO_ROOTS_SENTINEL = "/.minni-platform-no-vault-roots"
 
 
 def _has_any_principal_files(d: Path) -> bool:
@@ -530,7 +536,7 @@ def resolve_effective_principal(
             # ~/.minni/<agent>-vault (both the literal id and the dashless alias the
             # installer uses, e.g. claude-code → claudecode-vault). Never the
             # operator's roots.
-            _PLATFORM_NO_ROOTS = ["/.minni-platform-no-vault-roots"]
+            _PLATFORM_NO_ROOTS = [PLATFORM_NO_ROOTS_SENTINEL]
 
             def _default_platform_roots(agent_id: str) -> list[str]:
                 minni_home = Path(
@@ -734,6 +740,16 @@ def can_read_document(
                 if not principal.capabilities:
                     return False
             elif not same_agent:
+                return False
+            elif all(
+                r == PLATFORM_NO_ROOTS_SENTINEL
+                for r in principal.allowed_vault_roots
+            ):
+                # Review r2 (P2): a roots list holding ONLY the fail-closed
+                # sentinel means the operator explicitly zeroed this platform
+                # agent's vault roots — the same-agent shortcut for legacy
+                # relative-path rows must not bypass that; deny like the
+                # no-valid-roots state it represents.
                 return False
         except Exception:
             return False

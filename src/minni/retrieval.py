@@ -1829,36 +1829,48 @@ class RetrievalEngine:
         layer_set = self._normalize_layers(layers)
         start_ts = self._parse_iso_date(start_date)
         end_ts = self._parse_iso_date(end_date, end_of_day=True)
-        params = [safe_query]
+        filter_params: list = []
         clauses = ["vault_fts MATCH ?"]
         if layer_set:
             placeholders = ",".join("?" * len(layer_set))
             clauses.append(f"COALESCE(ce.layer, d.layer, 'knowledge') IN ({placeholders})")
-            params.extend(sorted(layer_set))
+            filter_params.extend(sorted(layer_set))
         if start_ts is not None:
             clauses.append("COALESCE(d.indexed_at, d.last_modified, ce.computed_at, 0) >= ?")
-            params.append(start_ts)
+            filter_params.append(start_ts)
         if end_ts is not None:
             clauses.append("COALESCE(d.indexed_at, d.last_modified, ce.computed_at, 0) <= ?")
-            params.append(end_ts)
-        params.append(limit)
+            filter_params.append(end_ts)
 
         with self.db.cursor() as c:
-            _fts_execute_with_retry(c, f"""
-                SELECT ce.chunk_id, ce.doc_id, ce.chunk_text, ce.heading_context,
-                       d.path, d.agent, d.sigil, d.decay_score,
-                       d.page_status, d.privacy_level, d.page_type,
-                       d.evidence_refs, d.indexed_at,
-                       COALESCE(ce.layer, d.layer, 'knowledge') AS layer,
-                       COALESCE(d.indexed_at, d.last_modified, ce.computed_at, 0) AS created_at
-                FROM vault_fts f
-                JOIN documents d ON d.doc_id = f.doc_id
-                JOIN chunk_embeddings ce ON ce.doc_id = d.doc_id
-                WHERE {" AND ".join(clauses)}
-                ORDER BY created_at ASC, ce.chunk_id ASC
-                LIMIT ?
-            """, params)
-            rows = c.fetchall()
+            def _match(match_expr: str):
+                _fts_execute_with_retry(c, f"""
+                    SELECT ce.chunk_id, ce.doc_id, ce.chunk_text, ce.heading_context,
+                           d.path, d.agent, d.sigil, d.decay_score,
+                           d.page_status, d.privacy_level, d.page_type,
+                           d.evidence_refs, d.indexed_at,
+                           COALESCE(ce.layer, d.layer, 'knowledge') AS layer,
+                           COALESCE(d.indexed_at, d.last_modified, ce.computed_at, 0) AS created_at
+                    FROM vault_fts f
+                    JOIN documents d ON d.doc_id = f.doc_id
+                    JOIN chunk_embeddings ce ON ce.doc_id = d.doc_id
+                    WHERE {" AND ".join(clauses)}
+                    ORDER BY created_at ASC, ce.chunk_id ASC
+                    LIMIT ?
+                """, [match_expr, *filter_params, limit])
+                return c.fetchall()
+
+            # P0-C parity (review r2): dated/specific chronological recalls hit
+            # this path instead of _fts_search, so they need the SAME zero-hit
+            # AND→OR degradation — space-joined FTS5 terms are implicit AND and
+            # a query like "checkpoint 2026-07-18 plan-…" rarely has ALL its
+            # tokens in one chunk. Operands lowercased for the same reason as
+            # _fts_search: a literal "OR"/"AND"/"NOT" token must not be parsed
+            # as an FTS5 operator.
+            rows = _match(safe_query)
+            terms = safe_query.split()
+            if not rows and len(terms) > 1:
+                rows = _match(" OR ".join(t.lower() for t in terms))
 
         return [
             {

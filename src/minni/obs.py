@@ -149,19 +149,25 @@ class Counters:
         with self._lock:
             return dict(self._counts)
 
-    def delta_snapshot(self) -> Dict[str, Dict[str, int]]:
+    def delta_snapshot(self, consume: bool = True) -> Dict[str, Dict[str, int]]:
         """Return ``{name: {"total": n, "delta": n - previous}}`` and advance
         the baseline. ``delta`` is "since the previous ``delta_snapshot`` call"
         — a caller-driven polling interval, NOT a per-second rate. Read and
         baseline-swap happen under one lock so two concurrent status RPCs cannot
         each read a stale ``previous`` and double-count the same delta.
+
+        ``consume=False`` returns the same view WITHOUT advancing the baseline
+        (review r2 / W2): recovery/pre-identity status polls must not be able
+        to zero out ``counter_deltas`` and suppress ``errors_search_rising``
+        before an operator looks.
         """
         with self._lock:
             result = {
                 name: {"total": total, "delta": total - self._previous.get(name, 0)}
                 for name, total in self._counts.items()
             }
-            self._previous = dict(self._counts)
+            if consume:
+                self._previous = dict(self._counts)
             return result
 
     def reset(self) -> None:
@@ -243,9 +249,12 @@ def metrics_snapshot() -> Dict[str, int]:
     return METRICS.snapshot()
 
 
-def metrics_delta_snapshot() -> Dict[str, Dict[str, int]]:
-    """Return the global counters' change since the previous snapshot."""
-    return METRICS.delta_snapshot()
+def metrics_delta_snapshot(consume: bool = True) -> Dict[str, Dict[str, int]]:
+    """Return the global counters' change since the previous snapshot.
+
+    ``consume=False`` peeks without advancing the baseline (recovery polls).
+    """
+    return METRICS.delta_snapshot(consume=consume)
 
 
 def record_error(method: str, exc: BaseException) -> None:

@@ -743,6 +743,7 @@ export function daemonAfmToProviderHealth(
   expectedProvider: AfmProvider,
   ttlMs: number,
   now: () => number,
+  configuredMode?: AfmProviderMode,
 ): ProviderHealth | undefined {
   if (!data || typeof data !== "object") return undefined;
   const record = data as Record<string, unknown>;
@@ -761,7 +762,18 @@ export function daemonAfmToProviderHealth(
     if (record.status === "native_available") daemonEffective = "native";
     else if (record.status === "bridge" || record.status === "fallback_used") daemonEffective = "bridge";
   }
-  if (daemonEffective !== expectedProvider) return undefined;
+  // Review r2 (P2): in configured auto mode the DAEMON is the authority on the
+  // effective provider — the plugin's local resolveAfmProvider() can guess
+  // "native" from helper presence alone while the daemon has already verified
+  // that FoundationModels is unavailable and fallen back to bridge
+  // (mode:"auto", status:"fallback_used"). Rejecting that fresh verdict on a
+  // strict provider match would re-run the redundant cold native probe every
+  // status/SessionStart. So: when this process's configured mode is "auto",
+  // any well-derived daemon effective provider is acceptable; explicit modes
+  // still require an exact match (never adopt a bridge verdict when the
+  // operator pinned native, or vice versa).
+  if (daemonEffective === undefined) return undefined;
+  if (configuredMode !== "auto" && daemonEffective !== expectedProvider) return undefined;
   const generationVerified = record.generation_verified;
   const reachable = record.reachable;
   const probeAgeMs = record.probe_age_ms;

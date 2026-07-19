@@ -186,7 +186,18 @@ def handle_status(params: dict, request_id: Any, context: HealthContext) -> dict
     metrics = context.metrics_snapshot()
     # W2: delta-aware view (compute once so the baseline advances exactly once)
     # + derived flags, so status is self-diagnosing instead of a bare int.
-    deltas = context.metrics_delta_snapshot()
+    # Review r2 (P2): only an IDENTIFIED caller's status advances the delta
+    # baseline. `status` is recovery-allowed, so pre-identity/background polls
+    # would otherwise consume a burst of errors.search and suppress
+    # errors_search_rising before an operator ever looks. `_recovery` is the
+    # dispatch-stamped trusted flag (False = stamped principal); a direct/legacy
+    # call without it is treated as recovery (peek). Legacy zero-arg context
+    # wiring keeps the old always-consume behavior via the TypeError fallback.
+    identified = params.get("_recovery") is False
+    try:
+        deltas = context.metrics_delta_snapshot(consume=identified)
+    except TypeError:
+        deltas = context.metrics_delta_snapshot()
     flags = context.health_flags(deltas)
     started_at = datetime.fromtimestamp(
         context.start_time(), tz=timezone.utc

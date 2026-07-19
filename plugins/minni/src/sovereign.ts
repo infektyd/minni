@@ -869,6 +869,11 @@ export async function recallCrossAgentDegrade(
     requester,
   );
   if (!personalRetry.ok || !personalRetry.data) return undefined;
+  // Review r2 (P2): an EMPTY personal retry must fall through exactly like a
+  // failed one — formatting the degrade here would report crossAgentDegraded
+  // ("showing personal results instead") with nothing to show, hiding the
+  // denial/remedy text the docstring promises for empty retries.
+  if (isDaemonResultEmpty(personalRetry.data)) return undefined;
   return formatCrossAgentDegrade(input.query, personalRetry.data, []);
 }
 
@@ -988,7 +993,17 @@ export async function buildStatusReport(input?: {
   // match this process's resolved provider, or the probe is stale.
   const ttlMs = input?.afmGenerationTtlMs ?? GENERATION_PROBE_TTL_MS;
   const daemonAfmData = socket.ok ? (socket.data as Record<string, unknown> | undefined)?.afm : undefined;
-  const daemonGeneration = daemonAfmToProviderHealth(daemonAfmData, afmProvider.provider, ttlMs, Date.now);
+  // Review r2 (P2): pass the CONFIGURED mode too — in auto mode the daemon's
+  // effective-provider verdict wins over the plugin's local guess (helper
+  // presence alone can resolve "native" here while the daemon already fell
+  // back to bridge after a real FoundationModels check).
+  const daemonGeneration = daemonAfmToProviderHealth(
+    daemonAfmData,
+    afmProvider.provider,
+    ttlMs,
+    Date.now,
+    afmProvider.mode,
+  );
 
   let generation: ProviderHealth;
   let source: "daemon" | "plugin-probe";
