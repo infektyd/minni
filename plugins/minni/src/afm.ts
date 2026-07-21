@@ -732,6 +732,12 @@ function toProviderHealth(entry: GenerationProbeEntry, now: () => number): Provi
  *     adopting a native verdict when the plugin resolved bridge, or vice
  *     versa — the daemon and the plugin process can have different env/
  *     helper availability);
+ *   - the verdict is bridge-effective but the daemon's declared probe target
+ *     (`probe_url`/`probe_model`) is absent or differs from this plugin's own
+ *     configured AFM_PREPARE_TASK_URL/MODEL — the daemon verified a chat-
+ *     completions endpoint this process would not actually call, so its
+ *     afm.ok says nothing about the target the plugin uses (not comparable →
+ *     fall back to the plugin's own probe);
  *   - the daemon's probe is stale (probe_age_ms >= ttlMs). probe_age_ms is
  *     computed against the daemon's own clock; on a single local-machine
  *     daemon (today's deployment) that's directly comparable to the plugin's
@@ -744,6 +750,8 @@ export function daemonAfmToProviderHealth(
   ttlMs: number,
   now: () => number,
   configuredMode?: AfmProviderMode,
+  expectedProbeUrl: string = AFM_PREPARE_TASK_URL,
+  expectedProbeModel: string = AFM_PREPARE_TASK_MODEL,
 ): ProviderHealth | undefined {
   if (!data || typeof data !== "object") return undefined;
   const record = data as Record<string, unknown>;
@@ -774,6 +782,20 @@ export function daemonAfmToProviderHealth(
   // operator pinned native, or vice versa).
   if (daemonEffective === undefined) return undefined;
   if (configuredMode !== "auto" && daemonEffective !== expectedProvider) return undefined;
+  // Review r4 (P2): reusing the daemon's verdict is only sound when the daemon
+  // probed the SAME target this plugin will actually call. For a bridge-
+  // effective verdict that target is an HTTP chat-completions endpoint the
+  // operator can repoint via MINNI_AFM_PREPARE_TASK_URL / _MODEL; a daemon that
+  // verified a DIFFERENT url/model says nothing about the endpoint this plugin
+  // uses, so adopting its afm.ok would report a target this process cannot
+  // reach as healthy. Require the daemon to declare its probe target and match
+  // it exactly, else fall back to the plugin's own probe (native has no
+  // configurable HTTP target, so this gate is bridge-only). A daemon that omits
+  // the target (older build) is "not comparable" → also fall back.
+  if (daemonEffective === "bridge") {
+    if (typeof record.probe_url !== "string" || record.probe_url !== expectedProbeUrl) return undefined;
+    if (typeof record.probe_model !== "string" || record.probe_model !== expectedProbeModel) return undefined;
+  }
   const generationVerified = record.generation_verified;
   const reachable = record.reachable;
   const probeAgeMs = record.probe_age_ms;

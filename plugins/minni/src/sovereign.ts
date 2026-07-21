@@ -856,6 +856,20 @@ export async function recallCrossAgentDegrade(
   if (!denial || !isCrossAgentCapabilityDenial(denial) || crossAgentRequested !== true) {
     return undefined;
   }
+  // Review r4 (P2): the personal-scope retry runs through recallMemory, which
+  // does not (and, for an authenticated principal, cannot) rescope the daemon
+  // search to a caller-requested workspace — daemon `search` scopes documents
+  // from the STAMPED principal's workspace (recall.py:880 uses
+  // principal.workspace_id, ignoring any per-request workspace_id), while
+  // recallMemory never even serializes workspaceId onto the wire. So when a
+  // NON-DEFAULT workspace was explicitly requested, the retry would surface
+  // stamped/default-workspace personal hits while the degrade note claims
+  // "personal-scope results", hiding the requested workspace's real denial/
+  // empty answer. Skip the degrade when the workspace cannot be honored; the
+  // caller then falls through to recallResponseText's denial/remedy text.
+  if (input.workspaceId !== undefined && input.workspaceId !== DEFAULT_WORKSPACE_ID) {
+    return undefined;
+  }
   const personalRetry = await recallMemory(
     {
       query: input.query,

@@ -25,6 +25,7 @@ import importlib.util
 import re
 import sqlite3
 import sys
+import threading
 from pathlib import Path
 from typing import Any, List, Dict, Literal, Optional, Sequence, Tuple
 
@@ -318,12 +319,41 @@ class RetrievalEngine:
         # visible instead of masquerading as healthy.
         self.vector_model_down: bool = False
         # P0-A contract: when the read-authorization gate suppresses a
-        # non-empty candidate set to zero, the reason is recorded here so the
-        # caller can return a diagnostic envelope instead of a bare [].
-        self.last_auth_suppression: Optional[Dict] = None
+        # non-empty candidate set to zero, the reason is recorded so the caller
+        # can return a diagnostic envelope instead of a bare [].
+        # Review r4 (P2): dispatch runs each `search` RPC in its own worker
+        # thread while `_lazy_retrieval()` hands every request the SAME process-
+        # wide RetrievalEngine. A plain instance attribute is therefore shared
+        # mutable state — a concurrent request's retrieve() could overwrite or
+        # clear this in the window between another request's retrieve() returning
+        # and its handler reading it, so an auth-suppressed caller could get a
+        # bare zero-hit answer (or another caller's diagnostic). Back it with
+        # thread-local storage: within one request the set-in-retrieve()/read-in-
+        # handler pair runs on a single thread, so each request sees only its own
+        # suppression regardless of what concurrent requests do on other threads.
+        self._auth_suppression_local = threading.local()
         # recall-F3: the correction-class type set is config-invariant — compute
         # it once here instead of once per scored doc in _score_merged_doc.
         self._correction_types = _correction_class_page_types(config)
+
+    @property
+    def last_auth_suppression(self) -> Optional[Dict]:
+        """Per-thread P0-A read-gate suppression from the last retrieve() on
+        THIS thread. Thread-local so concurrent `search` RPCs sharing this
+        process-wide engine never read each other's (or a cleared) diagnostic.
+        Defaults to None on a thread that has not run a gated retrieve() yet."""
+        local = getattr(self, "_auth_suppression_local", None)
+        return getattr(local, "value", None) if local is not None else None
+
+    @last_auth_suppression.setter
+    def last_auth_suppression(self, value: Optional[Dict]) -> None:
+        # Lazy-init the backing store so instances built via object.__new__
+        # (test fakes that bypass __init__) still get a working thread-local.
+        local = getattr(self, "_auth_suppression_local", None)
+        if local is None:
+            local = threading.local()
+            self._auth_suppression_local = local
+        local.value = value
 
     @property
     def model(self):

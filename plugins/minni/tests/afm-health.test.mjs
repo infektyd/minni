@@ -37,6 +37,12 @@ const DAEMON_AFM_FRESH_BRIDGE = {
   native_available: false,
   native_helper_configured: false,
   adapter_configured: false,
+  // Review r4 (P2): a bridge-effective daemon verdict must declare the probe
+  // target so the plugin can confirm it probed the endpoint the plugin will
+  // actually call. Defaults here match the plugin's own default
+  // AFM_PREPARE_TASK_URL / AFM_PREPARE_TASK_MODEL.
+  probe_url: "http://127.0.0.1:11437/v1/chat/completions",
+  probe_model: "apple-foundation-models",
 };
 
 function transportStub(result) {
@@ -747,6 +753,92 @@ test("buildStatusReport falls back to its own probe when the daemon's afm probe 
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("buildStatusReport falls back to its own probe when the daemon's bridge probe targeted a DIFFERENT url than this plugin will call", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-honest-health-"));
+  try {
+    const transport = transportStub(GENERATION_ALIVE);
+    // Daemon verified a bridge endpoint on a different port; this plugin's
+    // configured AFM_PREPARE_TASK_URL is the default (:11437). The daemon's
+    // afm.ok says nothing about the endpoint THIS process uses, so the verdict
+    // must not be reused — the plugin re-probes its own target.
+    const otherTarget = { ...DAEMON_AFM_FRESH_BRIDGE, probe_url: "http://127.0.0.1:9999/v1/chat/completions" };
+    const report = await buildStatusReport({
+      vaultPath: root,
+      afmProviderMode: "bridge",
+      socket: { ok: true, data: { status: "ok", afm: otherTarget } },
+      afm: HEALTH_UP,
+      afmGenerationTransport: transport,
+    });
+    assert.equal(transport.calls.length, 1, "a target-url mismatch must not be trusted; the plugin probe must run");
+    assert.equal(report.afm.data.source, "plugin-probe");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("buildStatusReport falls back to its own probe when a bridge daemon verdict omits its probe target (not comparable)", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-honest-health-"));
+  try {
+    const transport = transportStub(GENERATION_ALIVE);
+    // Older daemon build: a bridge verdict with no probe_url/probe_model. The
+    // plugin cannot confirm the targets match, so it falls back rather than
+    // adopting an unverifiable verdict.
+    const { probe_url, probe_model, ...noTarget } = DAEMON_AFM_FRESH_BRIDGE;
+    void probe_url;
+    void probe_model;
+    const report = await buildStatusReport({
+      vaultPath: root,
+      afmProviderMode: "bridge",
+      socket: { ok: true, data: { status: "ok", afm: noTarget } },
+      afm: HEALTH_UP,
+      afmGenerationTransport: transport,
+    });
+    assert.equal(transport.calls.length, 1, "an unstated target is not comparable; the plugin probe must run");
+    assert.equal(report.afm.data.source, "plugin-probe");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("daemonAfmToProviderHealth gates a bridge verdict on the probe target (explicit expected url/model)", () => {
+  const now = () => 2_000_000;
+  const ttlMs = 300_000;
+  const base = {
+    mode: "bridge",
+    status: "bridge",
+    generation_verified: true,
+    reachable: true,
+    probe_age_ms: 100,
+    probe_url: "http://127.0.0.1:11437/v1/chat/completions",
+    probe_model: "apple-foundation-models",
+  };
+  const url = "http://127.0.0.1:11437/v1/chat/completions";
+  const model = "apple-foundation-models";
+  // Matching target → reused.
+  assert.ok(
+    daemonAfmToProviderHealth(base, "bridge", ttlMs, now, undefined, url, model),
+    "matching probe target must be reused",
+  );
+  // Mismatched url → undefined (fall back).
+  assert.equal(
+    daemonAfmToProviderHealth({ ...base, probe_url: "http://127.0.0.1:9999/v1/chat/completions" }, "bridge", ttlMs, now, undefined, url, model),
+    undefined,
+    "a different probe_url must not be reused",
+  );
+  // Mismatched model → undefined (fall back).
+  assert.equal(
+    daemonAfmToProviderHealth({ ...base, probe_model: "some-other-model" }, "bridge", ttlMs, now, undefined, url, model),
+    undefined,
+    "a different probe_model must not be reused",
+  );
+  // Absent target → undefined (not comparable).
+  assert.equal(
+    daemonAfmToProviderHealth({ ...base, probe_url: undefined, probe_model: undefined }, "bridge", ttlMs, now, undefined, url, model),
+    undefined,
+    "an absent probe target is not comparable and must not be reused",
+  );
 });
 
 test("buildStatusReport never reports contradicting socket.data.afm and top-level afm (the punch-list §3 scenario)", async () => {

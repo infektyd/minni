@@ -327,3 +327,19 @@ test("cross_agent degrade is a no-op for non-cross_agent denials even if somehow
   );
   assert.equal(result, undefined);
 });
+
+test("cross_agent degrade is skipped when a non-default workspace was requested (personal retry cannot honor it)", async () => {
+  // Review r4 (P2): the personal-scope retry runs through recallMemory, which
+  // does not rescope the daemon search to a caller-requested workspace (daemon
+  // search scopes documents from the stamped principal's workspace). Degrading
+  // a non-default workspace request would surface stamped/default-workspace
+  // hits under a note that claims "personal-scope results", hiding the
+  // requested workspace's real denial. Skip so the denial/remedy text surfaces.
+  // The guard short-circuits before any daemon call, so no fake daemon needed.
+  const result = await recallCrossAgentDegrade(
+    { query: "team status", workspaceId: "project-x" },
+    true,
+    CROSS_AGENT_DENIED_MESSAGE,
+  );
+  assert.equal(result, undefined);
+});

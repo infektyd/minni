@@ -709,6 +709,14 @@ def test_golden_afm_runtime_status_core_fields(monkeypatch):
     assert bridge["native_available"] is False
     assert bridge["ok"] is True
     assert bridge["generation_verified"] is True
+    # Review r4 (P2): a bridge-effective verdict declares the probe target so a
+    # consumer can require it to match before reusing the verdict.
+    from minni.afm_provider import DEFAULT_AFM_CHAT_COMPLETIONS_URL, AFM_PROBE_MODEL
+
+    assert bridge["probe_url"] == DEFAULT_AFM_CHAT_COMPLETIONS_URL
+    assert bridge["probe_model"] == AFM_PROBE_MODEL
+    # A non-generating verdict (off) carries no HTTP probe target.
+    assert "probe_url" not in off
 
 
 # --- native Swift helper wire goldens (host-gated; CI has no Swift toolchain) ---
