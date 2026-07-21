@@ -457,8 +457,26 @@ interface GenerationProbeEntry {
   probedAt: number;
 }
 
-const GENERATION_PROBE_TTL_MS = 5 * 60 * 1000;
-const GENERATION_PROBE_TIMEOUT_MS = 1500;
+export const GENERATION_PROBE_TTL_MS = 5 * 60 * 1000;
+
+/**
+ * Mirror of afm_provider._generation_probe_timeout_seconds
+ * (src/minni/afm_provider.py:99-106): read MINNI_AFM_PROBE_TIMEOUT at CALL
+ * TIME, not bound once at module load. Native mode spawns a fresh helper that
+ * cold-loads FoundationModels on the first call (~2-3s measured; warm calls
+ * ~0.5s); the previous hardcoded 1500ms plugin-side budget (a quarter of the
+ * daemon's matching 10s default) clipped that cold start and produced
+ * structurally guaranteed false negatives even while the daemon's own probe,
+ * run with its real budget, verified generation fine (punch-list §3).
+ * Default 10.0s; unset/invalid/non-positive values fall back to 10.0s.
+ */
+export function generationProbeTimeoutMs(): number {
+  const raw = process.env.MINNI_AFM_PROBE_TIMEOUT ?? "10.0";
+  const seconds = Number(raw);
+  const resolved = Number.isFinite(seconds) && seconds > 0 ? seconds : 10.0;
+  return resolved * 1000;
+}
+
 const generationProbeCache = new Map<string, GenerationProbeEntry>();
 const generationProbeInFlight = new Map<string, Promise<GenerationProbeEntry>>();
 
@@ -659,7 +677,7 @@ async function runGenerationProbe(options: AfmGenerationProbeOptions, now: () =>
   const result = await callAfmJson(chatUrl, payload, {
     mode,
     operation: "chat_completion",
-    timeoutMs: options.timeoutMs ?? GENERATION_PROBE_TIMEOUT_MS,
+    timeoutMs: options.timeoutMs ?? generationProbeTimeoutMs(),
     transport: options.transport,
     ...helperOptions,
   });
@@ -686,6 +704,112 @@ function toProviderHealth(entry: GenerationProbeEntry, now: () => number): Provi
     generationVerified: entry.generationVerified,
     probeAgeMs: Math.max(0, now() - entry.probedAt),
     detail: entry.detail,
+  };
+}
+
+/**
+ * Convert a daemon-sourced `data.afm` block (the "status" RPC's embedded
+ * afm_runtime_status() result — src/minni/afm_provider.py:376-421, wired in
+ * via minnid_runtime/health.py:156-189) into a ProviderHealth the plugin can
+ * reuse directly, instead of spawning a second, independently-timed probe
+ * (Health Endpoint Aggregation: a downstream aggregator consumes the
+ * dependency's own fresh health summary rather than re-probing it
+ * transitively). This is what closes punch-list §3: the daemon already ran
+ * afm_runtime_status() with its real (matching) probe budget, so the plugin
+ * no longer needs its own cold, budget-mismatched subprocess spawn to answer
+ * the same question the daemon just answered.
+ *
+ * The daemon RPC payload is UNTRUSTED input (same posture as sanitizeAfmHealth
+ * / safeError applied elsewhere to raw AFM bodies): every field is validated
+ * with strict `typeof` narrowing, never a truthy cast, so a malformed or
+ * corrupted daemon response degrades to "no reuse" rather than being coerced
+ * into a false verdict. Returns undefined (falls back to the plugin's own
+ * probe) when:
+ *   - `data` isn't a well-shaped afm_runtime_status object (also covers
+ *     "afm field ABSENT in socket.data", which back-compat requires behave
+ *     identically to "socket unreachable" — see afm-health.test.mjs);
+ *   - `data.mode` doesn't match the plugin's own resolved provider (avoid
+ *     adopting a native verdict when the plugin resolved bridge, or vice
+ *     versa — the daemon and the plugin process can have different env/
+ *     helper availability);
+ *   - the verdict is bridge-effective but the daemon's declared probe target
+ *     (`probe_url`/`probe_model`) is absent or differs from this plugin's own
+ *     configured AFM_PREPARE_TASK_URL/MODEL — the daemon verified a chat-
+ *     completions endpoint this process would not actually call, so its
+ *     afm.ok says nothing about the target the plugin uses (not comparable →
+ *     fall back to the plugin's own probe);
+ *   - the daemon's probe is stale (probe_age_ms >= ttlMs). probe_age_ms is
+ *     computed against the daemon's own clock; on a single local-machine
+ *     daemon (today's deployment) that's directly comparable to the plugin's
+ *     clock with no correction. A future networked-daemon change must not
+ *     reuse this function unmodified without adding clock-skew handling.
+ */
+export function daemonAfmToProviderHealth(
+  data: unknown,
+  expectedProvider: AfmProvider,
+  ttlMs: number,
+  now: () => number,
+  configuredMode?: AfmProviderMode,
+  expectedProbeUrl: string = AFM_PREPARE_TASK_URL,
+  expectedProbeModel: string = AFM_PREPARE_TASK_MODEL,
+): ProviderHealth | undefined {
+  if (!data || typeof data !== "object") return undefined;
+  const record = data as Record<string, unknown>;
+  // Review r1 (P2): afm_runtime_status() reports the RESOLVED MODE, which in
+  // auto installs is the literal string "auto" — never "native"/"bridge".
+  // Strict equality against the plugin's resolved provider would reject every
+  // fresh auto-mode daemon verdict and reintroduce the redundant cold probe.
+  // Derive the daemon's effective provider: explicit native/bridge modes map
+  // to themselves; auto maps via `status` ("native_available" → native,
+  // "bridge"/"fallback_used" → bridge). Anything else stays unmatched (fail
+  // to "no reuse", the untrusted-input posture).
+  let daemonEffective: AfmProvider | undefined;
+  if (record.mode === "native" || record.mode === "bridge" || record.mode === "off") {
+    daemonEffective = record.mode;
+  } else if (record.mode === "auto") {
+    if (record.status === "native_available") daemonEffective = "native";
+    else if (record.status === "bridge" || record.status === "fallback_used") daemonEffective = "bridge";
+  }
+  // Review r2 (P2): in configured auto mode the DAEMON is the authority on the
+  // effective provider — the plugin's local resolveAfmProvider() can guess
+  // "native" from helper presence alone while the daemon has already verified
+  // that FoundationModels is unavailable and fallen back to bridge
+  // (mode:"auto", status:"fallback_used"). Rejecting that fresh verdict on a
+  // strict provider match would re-run the redundant cold native probe every
+  // status/SessionStart. So: when this process's configured mode is "auto",
+  // any well-derived daemon effective provider is acceptable; explicit modes
+  // still require an exact match (never adopt a bridge verdict when the
+  // operator pinned native, or vice versa).
+  if (daemonEffective === undefined) return undefined;
+  if (configuredMode !== "auto" && daemonEffective !== expectedProvider) return undefined;
+  // Review r4 (P2): reusing the daemon's verdict is only sound when the daemon
+  // probed the SAME target this plugin will actually call. For a bridge-
+  // effective verdict that target is an HTTP chat-completions endpoint the
+  // operator can repoint via MINNI_AFM_PREPARE_TASK_URL / _MODEL; a daemon that
+  // verified a DIFFERENT url/model says nothing about the endpoint this plugin
+  // uses, so adopting its afm.ok would report a target this process cannot
+  // reach as healthy. Require the daemon to declare its probe target and match
+  // it exactly, else fall back to the plugin's own probe (native has no
+  // configurable HTTP target, so this gate is bridge-only). A daemon that omits
+  // the target (older build) is "not comparable" → also fall back.
+  if (daemonEffective === "bridge") {
+    if (typeof record.probe_url !== "string" || record.probe_url !== expectedProbeUrl) return undefined;
+    if (typeof record.probe_model !== "string" || record.probe_model !== expectedProbeModel) return undefined;
+  }
+  const generationVerified = record.generation_verified;
+  const reachable = record.reachable;
+  const probeAgeMs = record.probe_age_ms;
+  if (typeof generationVerified !== "boolean") return undefined;
+  if (typeof reachable !== "boolean") return undefined;
+  if (typeof probeAgeMs !== "number" || !Number.isFinite(probeAgeMs) || probeAgeMs < 0) return undefined;
+  if (probeAgeMs >= ttlMs) return undefined;
+  void now; // reserved for a future clock-skew correction; not needed for a local daemon.
+  return {
+    ok: generationVerified,
+    reachable,
+    generationVerified,
+    probeAgeMs,
+    detail: typeof record.error === "string" ? record.error : undefined,
   };
 }
 

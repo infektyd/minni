@@ -1,0 +1,39 @@
+Cold-resume drill — sluice-minni-recall-blackout-p0-punchlist — Gate 11
+Run: 2026-07-19
+
+Method: this gate agent re-read /Users/hansaxelsson/projects/minni/next-agent-prompt.md
+and /Users/hansaxelsson/projects/minni/workflow-state.md as if arriving with zero prior
+chat history (no memory of the W1-W6/fix-r1/fix-r2 build/validate/judge turns), then
+answered the four required questions from the dock alone, with no out-of-band lookup.
+
+Q1. What is done, what is next?
+A1. Done: the P0 recall-blackout cluster (already-landed, commit ce13e52) plus six
+    follow-on punch-list packages W1-W6 covering the vault_fts DDL race, health
+    opacity, inbox quarantine, AFM dual-probe divergence, cross_agent deny ergonomics,
+    and team temp-identity/plan shelf_ref -- all on branch fix/recall-blackout-p0,
+    HEAD 3d0a28f, judge-approved GO. Next: an operator decision on whether to push
+    (not automatable, not my call), or -- if the operator instead wants more punch-list
+    coverage -- a NEW Sluice run scoped to workflow-state.md section 8's remainder
+    (vault_index_doc post-restart errors, platform-smoothing items, observatory doc
+    corrections). This is stated in workflow-state.md section 11 without needing
+    anything outside the two dock files.
+
+Q2. Which exact files must I open, and do they exist?
+A2. workflow-state.md section 9 names: workflow-state.md, next-agent-prompt.md,
+    /Users/hansaxelsson/projects/sluice/WORKFLOW.md, gates/12-package.md,
+    gates/02-intake.md, gates/03-plan.md, the punch-list source-of-truth doc, and the
+    minni repo root. All seven were verified present on disk in this same gate
+    (see the `for f in ...; [ -f "$f" ]` check run 2026-07-19) -- zero missing paths.
+
+Q3. What is the first action, and does it contradict repo reality?
+A3. next-agent-prompt.md Step 2 gives two explicit branches (Path A: operator-only
+    push, which I do not execute; Path B: scope a new run against section 8's
+    remainder). Both are consistent with git status/git log run directly against
+    the repo in this gate (HEAD 3d0a28f, only plugins/minni/frontend/app.js dirty,
+    no upstream configured -- nothing pushed). No contradiction found.
+
+Q4. Did I need to ask anything not in the repo/docs?
+A4. No. Hard rules (no push, commit-per-gate, append-only scar tissue, never touch
+    app.js or the live ~/.minni/daemon) are stated explicitly in both dock files.
+
+Verdict: PASS -- the dock is self-sufficient for a cold resume.

@@ -13,7 +13,10 @@ import test from "node:test";
 
 import {
   identityDenialFrom,
+  isCrossAgentCapabilityDenial,
   jsonRpcSocketRequest,
+  recallCrossAgentDegrade,
+  recallMemory,
   recallResponseText,
   recoveryRouteFrom,
 } from "../dist/sovereign.js";
@@ -219,4 +222,124 @@ test("a true transport failure still falls back to the offline vault scan", () =
   );
   assert.match(text, /Daemon unavailable — offline vault fallback/);
   assert.match(text, /socket-health/);
+});
+
+// ── W5 (punch-list #4): cross_agent deny ergonomics ─────────────────────────
+// allows_cross_agent_recall() (principal.py:798-803) is a correct-by-design
+// default-deny gate, not a misconfiguration. The plugin must (b) stop calling
+// it one, naming the capability + remedy instead, and (c) gracefully degrade
+// in-band to a personal-scope retry rather than returning a bare error — but
+// ONLY for this exact capability_denied shape, and only when the ORIGINAL
+// request actually asked for cross_agent (belt-and-suspenders against a
+// misfiring classifier or an already-personal-scope call retrying itself).
+
+const CROSS_AGENT_DENIED_MESSAGE =
+  "capability_denied: 'cross_agent' required for 'search' (principal='codex-main')";
+
+const GENERIC_CAPABILITY_DENIED_MESSAGE =
+  "capability_denied: 'govern' required for 'plan_activate' (principal='x')";
+
+test("identityDenialFrom + isCrossAgentCapabilityDenial classify the cross_agent capability_denied message", () => {
+  const envelope = {
+    jsonrpc: "2.0",
+    id: 1,
+    error: { code: -32004, message: CROSS_AGENT_DENIED_MESSAGE },
+  };
+  const denial = identityDenialFrom(envelope);
+  assert.equal(denial, CROSS_AGENT_DENIED_MESSAGE);
+  assert.equal(isCrossAgentCapabilityDenial(denial), true);
+});
+
+test("isCrossAgentCapabilityDenial ignores other capability_denied / reserved_agent_id messages", () => {
+  assert.equal(isCrossAgentCapabilityDenial(RESERVED_ID_MESSAGE), false);
+  assert.equal(isCrossAgentCapabilityDenial(GENERIC_CAPABILITY_DENIED_MESSAGE), false);
+});
+
+test("recallResponseText drops 'misconfiguration' wording for cross_agent denials and names the capability + remedy", () => {
+  const result = {
+    ok: false,
+    data: { error: { code: -32004, message: CROSS_AGENT_DENIED_MESSAGE } },
+    error: CROSS_AGENT_DENIED_MESSAGE,
+  };
+  const text = recallResponseText("team status", result, []);
+  assert.match(text, /default-deny/);
+  assert.match(text, /cross_agent/);
+  assert.doesNotMatch(text, /misconfiguration/);
+});
+
+test("recallResponseText keeps the 'misconfiguration' framing for non-cross_agent -32004s (reserved_agent_id)", () => {
+  const result = {
+    ok: false,
+    data: { error: { code: -32004, message: RESERVED_ID_MESSAGE } },
+    error: RESERVED_ID_MESSAGE,
+  };
+  const text = recallResponseText("socket health", result, []);
+  assert.match(text, /misconfiguration/);
+});
+
+test("cross_agent deny degrades in-band to personal scope with a note, not a bare error", async () => {
+  const text = await withFakeDaemon(
+    (request) =>
+      request.params && request.params.cross_agent === true
+        ? {
+            jsonrpc: "2.0",
+            id: request.id,
+            error: { code: -32004, message: CROSS_AGENT_DENIED_MESSAGE },
+          }
+        : {
+            jsonrpc: "2.0",
+            id: request.id,
+            result: {
+              results: [{ wikilink: "[[wiki/team-status]]", score: 42, snippet: "personal hit" }],
+              agent_id: "codex-main",
+              count: 1,
+            },
+          },
+    async (socketPath) => {
+      const requester = (_socketPath, method, params) => jsonRpcSocketRequest(socketPath, method, params);
+      const denied = await recallMemory({ query: "team status", crossAgent: true }, requester);
+      const denial = identityDenialFrom(denied.data);
+      assert.equal(isCrossAgentCapabilityDenial(denial), true);
+      return recallCrossAgentDegrade({ query: "team status" }, true, denial, requester);
+    },
+  );
+  assert.ok(text, "expected a degraded result, not undefined");
+  assert.match(text, /team-status/);
+  assert.match(text, /personal hit/);
+  assert.match(text, /cross-agent/i);
+  assert.doesNotMatch(text, /^Recall failed/);
+});
+
+test("cross_agent degrade is a no-op when the original request did not ask for cross_agent (belt-and-suspenders)", async () => {
+  const result = await recallCrossAgentDegrade(
+    { query: "team status" },
+    /* crossAgentRequested */ false,
+    CROSS_AGENT_DENIED_MESSAGE,
+  );
+  assert.equal(result, undefined);
+});
+
+test("cross_agent degrade is a no-op for non-cross_agent denials even if somehow invoked", async () => {
+  const result = await recallCrossAgentDegrade(
+    { query: "team status" },
+    true,
+    RESERVED_ID_MESSAGE,
+  );
+  assert.equal(result, undefined);
+});
+
+test("cross_agent degrade is skipped when a non-default workspace was requested (personal retry cannot honor it)", async () => {
+  // Review r4 (P2): the personal-scope retry runs through recallMemory, which
+  // does not rescope the daemon search to a caller-requested workspace (daemon
+  // search scopes documents from the stamped principal's workspace). Degrading
+  // a non-default workspace request would surface stamped/default-workspace
+  // hits under a note that claims "personal-scope results", hiding the
+  // requested workspace's real denial. Skip so the denial/remedy text surfaces.
+  // The guard short-circuits before any daemon call, so no fake daemon needed.
+  const result = await recallCrossAgentDegrade(
+    { query: "team status", workspaceId: "project-x" },
+    true,
+    CROSS_AGENT_DENIED_MESSAGE,
+  );
+  assert.equal(result, undefined);
 });

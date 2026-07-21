@@ -144,7 +144,7 @@ def test_antigravity_platform_spec_uses_gemini_agent():
     spec = propagate.platform_spec("antigravity", Path.home() / "Projects" / "minni")
     assert spec["agent"] == "gemini"
     assert spec["config_kind"] == "antigravity"
-    assert str(spec["install"]).endswith(".gemini/extensions/minni")
+    assert str(spec["install"]).endswith(".agents/plugins/minni@minni")
 
 
 def test_antigravity_aliases_resolve():
@@ -249,3 +249,48 @@ def test_x1_readonly_grant_set_excludes_write_tools():
     assert not (set(propagate.MINNI_READONLY_TOOLS) & forbidden)
     assert propagate.MINNI_WILDCARD_GRANT not in propagate.MINNI_READONLY_GRANTS
     assert all(g.startswith("mcp(minni/minni_") for g in propagate.MINNI_READONLY_GRANTS)
+
+
+def test_copy_tree_preserves_generated_gemini_manifest(tmp_path):
+    """PR167 review: gemini/antigravity and grok share one install root; a
+    later platform's copy_tree must not delete the generated manifest."""
+    source = tmp_path / "source"
+    (source / "dist").mkdir(parents=True)
+    (source / "dist" / "server.js").write_text("// server\n", encoding="utf-8")
+    dest = tmp_path / "install"
+    dest.mkdir()
+    manifest = dest / "gemini-extension.json"
+    manifest.write_text('{"name": "minni"}\n', encoding="utf-8")
+
+    propagate.copy_tree(source, dest)
+
+    assert manifest.exists(), "generated gemini-extension.json must survive copy_tree"
+    assert json.loads(manifest.read_text(encoding="utf-8"))["name"] == "minni"
+    assert (dest / "dist" / "server.js").exists()
+
+
+def test_mcp_json_mirrors_codex_hook_env(tmp_path):
+    """PR167 review: the Codex hook reads only MINNI_CODEX_*; a custom vault
+    stamped via MINNI_VAULT_PATH must be mirrored so hooks and MCP agree."""
+    env = propagate.mcp_json(
+        tmp_path / "dist" / "server.js",
+        "codex",
+        tmp_path / "custom-codex-vault",
+        tmp_path / "minnid.sock",
+        tmp_path / "workspace",
+    )["mcpServers"]["minni"]["env"]
+    assert env["MINNI_CODEX_VAULT_PATH"] == env["MINNI_VAULT_PATH"]
+    assert env["MINNI_CODEX_AGENT_ID"] == "codex"
+    assert env["MINNI_CODEX_WORKSPACE_ID"] == env["MINNI_WORKSPACE_ID"]
+
+
+def test_mcp_json_does_not_mirror_codex_env_for_other_agents(tmp_path):
+    env = propagate.mcp_json(
+        tmp_path / "dist" / "server.js",
+        "gemini",
+        tmp_path / "gemini-vault",
+        tmp_path / "minnid.sock",
+        tmp_path / "workspace",
+    )["mcpServers"]["minni"]["env"]
+    assert "MINNI_CODEX_VAULT_PATH" not in env
+    assert "MINNI_CODEX_AGENT_ID" not in env

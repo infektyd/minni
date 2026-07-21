@@ -30,15 +30,46 @@ deletes) files that no longer need to live in the hot inbox:
     its kind gate (``*_precompact_handoff``, ``failed_command``, ...), once
     older than the residue threshold. Without this the residue has no drain
     path at all.
+  * ``agent_mismatch_quarantine`` (audit §4 / W3) — a stop-candidate file
+    whose declared ``agent_id`` disagrees with the principal derived from its
+    vault dir name (mirrors ``inbox_ingest._scan_inbox``'s
+    ``skipped_by_kind["_agent_mismatch"]`` test). This is a PERMANENT skip —
+    the mismatch never self-resolves, so the file is never ingested and never
+    gets a candidate_packets row, meaning ``ingested``/``ingested_resolved``
+    above can never trigger for it either. Once older than the residue
+    threshold it is MOVED (not archived — the row-based reasons above ARCHIVE
+    because the DB carries the content onward; this file's content was NEVER
+    captured anywhere, so it is QUARANTINED with a reason sidecar instead) to
+    ``<inbox>/quarantine/`` via the same daemon-side helper this reason name
+    matches (``afm_passes.inbox_quarantine``); this script re-implements the
+    move+sidecar logic locally rather than importing it (see "Standalone
+    script" below).
 
 Everything else is left in place (not-yet-ingested stop candidates, fresh
 handoffs, live ack leases, fresh residue, unparseable files).
 
+Standalone script (no `minni` package import):
+  This script deliberately duplicates rather than imports
+  ``afm_passes.inbox_ingest`` / ``afm_passes.inbox_quarantine`` constants and
+  helpers (``STOP_KINDS``, ``CONTENT_CAP``, ``_content_sha1``,
+  ``eligible_candidates``, the vault-slug agent alias table, the
+  quarantine-move helper — all mirrored here, not imported). This is
+  deliberate, not an oversight: the usage contract above is bare
+  ``python3 scripts/inbox_cleanup.py`` with only ``scripts/`` on
+  ``sys.path`` (see the ``sys.path.insert`` a few lines down) — there is no
+  guarantee ``src/`` is importable or that `minni` is installed in whatever
+  interpreter runs this (verified: plain `python3 -c "import minni"` from
+  this repo resolves to an unrelated/broken namespace package, not the real
+  ``src/minni`` — the daemon's own dependency is only guaranteed inside the
+  project's ``.venv``). Importing the daemon package here would silently
+  break the standalone invocation this script exists for.
+
 Safety contract:
   * DRY-RUN BY DEFAULT. Pass ``--apply`` to actually move files.
-  * The ONLY file mutation is ``os.replace`` into ``<inbox>/.archive/`` with
-    the filename preserved (numeric suffix on collision). This script
-    contains no unlink/remove call by design — the tests assert that.
+  * The ONLY file mutations are ``os.replace`` into ``<inbox>/.archive/`` or
+    ``<inbox>/quarantine/``, both with the filename preserved (numeric suffix
+    on collision). This script contains no unlink/remove call by design — the
+    tests assert that.
   * The DB is opened read-only.
 
 Usage:
@@ -72,13 +103,70 @@ ARCHIVE_REASONS = (
     "acked_handoff",
     "nothing_ingestible",
     "unrecognized_kind",
+    "agent_mismatch_quarantine",
 )
+# Reasons in ARCHIVE_REASONS that MOVE to quarantine/ instead of .archive/ —
+# their content was never captured in the DB, unlike every other reason here.
+QUARANTINE_REASONS = frozenset({"agent_mismatch_quarantine"})
+QUARANTINE_DIRNAME = "quarantine"
+QUARANTINE_REASON_SUFFIX = ".reason.json"
 
 # Mirrors afm_passes.inbox_ingest.STOP_KINDS / afm_passes.inbox_archive.
 STOP_KINDS = frozenset({"stop_candidates", "codex_stop_candidates"})
 TERMINAL_STATUSES = frozenset(
     {"accepted", "rejected", "redacted", "expired", "merged", "superseded"}
 )
+
+# Mirrors afm_passes.inbox_ingest._VAULT_SLUG_TO_AGENT_ID / _principal_for_inbox
+# (triplicated per this script's standalone-import-independence contract —
+# see the module docstring's "Standalone script" section).
+_VAULT_SLUG_TO_AGENT_ID: Dict[str, str] = {
+    "claudecode": "claude-code",
+    "codex": "codex",
+    "gemini": "gemini",
+    "hermes": "hermes",
+    "kilocode": "kilocode",
+    "openclaw": "openclaw",
+    "grok-build": "grok-build",
+    "grok-beta": "grok-build",
+    "grok": "grok-build",
+}
+
+
+# Last-resort attribution for the daemon's OWN bare `<home>/vault/inbox`
+# (no `-vault` suffix). inbox_ingest._principal_for_inbox and the live
+# afm_passes.inbox_quarantine.quarantine_stale_agent_mismatch pass attribute
+# that dir to `config.inbox_fallback_principal`, which defaults to "unknown"
+# (config.py) and is passed as `fallback_principal="unknown"` from the AFM loop
+# (minnid_runtime/afm.py:518,559). Mirror that default here so this script does
+# not diverge from the daemon on the daemon's own inbox.
+DEFAULT_FALLBACK_PRINCIPAL = "unknown"
+
+
+def _principal_for_inbox_dir(
+    vault_dir_name: str, fallback_principal: str = DEFAULT_FALLBACK_PRINCIPAL
+) -> str:
+    """Owning agent for a vault dir name, mirroring
+    afm_passes.inbox_ingest._principal_for_inbox EXACTLY — fallback included.
+
+    For a ``<agent>-vault`` dir the alias table maps the slug to its canonical
+    agent id (defaulting to the raw slug). For the daemon's OWN bare
+    ``vault/inbox`` (no ``-vault`` suffix — which ``discover_vault_inboxes()``
+    explicitly includes and which is ``config.vault_path`` itself) this returns
+    ``fallback_principal`` ("unknown" by default, matching
+    ``config.inbox_fallback_principal`` and the live
+    ``quarantine_stale_agent_mismatch(fallback_principal="unknown")`` call),
+    NOT the literal dir name "vault". Returning "vault" here would misclassify a
+    healthy stop-candidate whose ``agent_id`` equals the daemon's fallback
+    principal ("unknown") — which the live AFM loop treats as a MATCH, never an
+    ``_agent_mismatch`` — as ``agent_mismatch_quarantine``, moving correctly
+    attributed content out of the daemon's own live inbox that the daemon would
+    never touch."""
+    if vault_dir_name.endswith("-vault"):
+        slug = vault_dir_name[: -len("-vault")]
+        return _VAULT_SLUG_TO_AGENT_ID.get(slug, slug) or fallback_principal
+    return fallback_principal
+
 
 # Both inbox filename formats:
 #   2026-06-09-<base36 ms>-slug.json   (plugin writeInbox)
@@ -288,6 +376,22 @@ def classify_file(
             age = _file_age_seconds(path, now)
             if age is not None and age > residue_ttl_days * 86400:
                 return "nothing_ingestible"
+        if eligible and not matched:
+            # Real, ingestible content, but ZERO DB rows correspond to THIS
+            # file at all (not merely partially-ingested — inbox_ingest never
+            # took anything from it). Two known causes: (1) genuinely fresh,
+            # not yet picked up by the loop — leave it; (2) a PERMANENT
+            # agent_id/vault-principal mismatch (audit §4 / W3) — the loop's
+            # kind gate skips it identically on every tick, forever, since the
+            # mismatch never self-resolves. Scoped to that confirmed cohort
+            # only: an agent-less or agent-matching file with zero rows is
+            # simply fresh, not broken, and stays 'keep'.
+            file_agent = str(doc.get("agent_id") or "").strip()
+            vault_principal = _principal_for_inbox_dir(path.parent.parent.name)
+            if file_agent and file_agent != vault_principal:
+                age = _file_age_seconds(path, now)
+                if age is not None and age > residue_ttl_days * 86400:
+                    return "agent_mismatch_quarantine"
         return "keep"  # not (fully) ingested yet — or fresh residue
 
     kind = doc.get("kind")
@@ -328,7 +432,7 @@ def classify_file(
 
 def archive_file(path: Path) -> str:
     """Rename `path` into its sibling .archive/ dir (name preserved; numeric
-    suffix on collision). The only file mutation in this script."""
+    suffix on collision). Renames only — never unlinks."""
     archive_dir = path.parent / ARCHIVE_DIRNAME
     archive_dir.mkdir(parents=True, exist_ok=True)
     target = archive_dir / path.name
@@ -337,6 +441,48 @@ def archive_file(path: Path) -> str:
         target = archive_dir / f"{path.stem}.{suffix}{path.suffix}"
         suffix += 1
     os.replace(path, target)
+    return str(target)
+
+
+def _agent_mismatch_reason_payload(
+    path: Path, now: float, residue_ttl_days: float
+) -> Dict[str, Any]:
+    """Sidecar payload for an ``agent_mismatch_quarantine`` move. Uses the
+    same ``reason`` value ("_agent_mismatch") as
+    ``afm_passes.inbox_quarantine`` writes from the live AFM loop, so a
+    health_report ``by_reason`` count is meaningful regardless of which of
+    the two quarantine sources (loop drain vs. this one-time migration)
+    produced it."""
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        doc = {}
+    file_agent = str(doc.get("agent_id") or "").strip()
+    vault_principal = _principal_for_inbox_dir(path.parent.parent.name)
+    return {
+        "reason": "_agent_mismatch",
+        "detected_agent_id": file_agent,
+        "resolved_vault_principal": vault_principal,
+        "quarantined_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
+        "ttl_days": residue_ttl_days,
+    }
+
+
+def quarantine_file(path: Path, reason_payload: Dict[str, Any]) -> str:
+    """Rename `path` into its sibling quarantine/ dir (name preserved;
+    numeric suffix on collision) and write a `<name>.reason.json` sidecar
+    alongside it. The only OTHER file mutation in this script besides
+    archive_file — still os.replace only, never unlink."""
+    q_dir = path.parent / QUARANTINE_DIRNAME
+    q_dir.mkdir(parents=True, exist_ok=True)
+    target = q_dir / path.name
+    suffix = 1
+    while target.exists():
+        target = q_dir / f"{path.stem}.{suffix}{path.suffix}"
+        suffix += 1
+    os.replace(path, target)
+    reason_path = target.parent / f"{target.name}{QUARANTINE_REASON_SUFFIX}"
+    reason_path.write_text(json.dumps(reason_payload, indent=2), encoding="utf-8")
     return str(target)
 
 
@@ -378,7 +524,11 @@ def run_cleanup(
                 continue
             entry = {"file": path.name, "reason": reason}
             if apply:
-                entry["archived_to"] = archive_file(path)
+                if reason in QUARANTINE_REASONS:
+                    payload = _agent_mismatch_reason_payload(path, now, residue_ttl_days)
+                    entry["archived_to"] = quarantine_file(path, payload)
+                else:
+                    entry["archived_to"] = archive_file(path)
             to_archive.append(entry)
         report["vaults"][vault_name] = {
             "inbox": str(inbox),

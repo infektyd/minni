@@ -97,6 +97,65 @@ def test_blocked_always_denied():
     assert can_read_document(p, "default", meta) is False
 
 
+def test_foreign_safe_session_denied_for_non_operator():
+    """Finding 10: session pages are agent-scoped even when privacy=safe."""
+    p = _p("codex", caps=["search", "read"])
+    meta = {
+        "agent": "other-agent",
+        "page_type": "session",
+        "privacy_level": "safe",
+        "path": "/tmp/test-vault/wiki/sessions/other.md",
+        "page_status": "accepted",
+    }
+    assert can_read_document(p, "default", meta) is False
+    meta_legacy = {
+        "agent": "wiki:session",
+        "page_type": "session",
+        "privacy_level": "safe",
+        "path": "/tmp/test-vault/wiki/sessions/legacy.md",
+        "page_status": "accepted",
+    }
+    assert can_read_document(p, "default", meta_legacy) is False
+    # Unattributed / unknown agent must not fall through the legacy unknown grant.
+    meta_unknown = {
+        "agent": "unknown",
+        "page_type": "session",
+        "privacy_level": "safe",
+        "path": "/tmp/test-vault/wiki/sessions/unattributed.md",
+        "page_status": "accepted",
+    }
+    assert can_read_document(p, "default", meta_unknown) is False
+    meta_missing_agent = {
+        "page_type": "session",
+        "privacy_level": "safe",
+        "path": "/tmp/test-vault/wiki/sessions/missing-agent.md",
+        "page_status": "accepted",
+    }
+    assert can_read_document(p, "default", meta_missing_agent) is False
+
+
+def test_principal_named_unknown_cannot_read_unattributed_sessions():
+    """Finding 10 residual: principal id 'unknown' must not same-agent-match
+    the legacy unknown sentinel on session pages."""
+    p = _p("unknown", caps=["search", "read"])
+    assert is_operator_principal(p) is False
+    meta = {
+        "agent": "unknown",
+        "page_type": "session",
+        "privacy_level": "safe",
+        "path": "/tmp/test-vault/wiki/sessions/unattributed.md",
+    }
+    assert can_read_document(p, "default", meta) is False
+    # Non-session unknown docs remain visible to a capable principal.
+    meta_note = {
+        "agent": "unknown",
+        "page_type": "concept",
+        "privacy_level": "safe",
+        "path": "/tmp/test-vault/wiki/concepts/shared.md",
+    }
+    assert can_read_document(p, "default", meta_note) is True
+
+
 def test_operator_can_read_foreign_within_vault():
     # Operator (govern cap or main) gets broader visibility for governance/audit within roots
     p = _p("operator", caps=["govern"])

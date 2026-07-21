@@ -9,6 +9,9 @@
 # and the v0.2.0 tag publish is proven green end to end. Restore it from git
 # history if a rehearsal lane is ever wanted (environment `testpypi`). npm
 # publishing stays absent (name taken; PACKAGING_PLAN.md §6.6).
+#
+# Finding 3: build/install runs under contents:read with persist-credentials
+# false; contents:write is isolated to the GitHub Release publish job.
 name: Release
 
 on:
@@ -16,15 +19,17 @@ on:
     tags: ['v*']
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  release:
-    name: Gate, build, publish GitHub Release
+  build:
+    name: Gate and build release artifacts
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@v6
@@ -91,7 +96,13 @@ jobs:
           test "$TAG" = "$PY_V" || { echo "tag $TAG != engine version $PY_V"; exit 1; }
           test "$TAG" = "$NPM_V" || { echo "tag $TAG != plugin version $NPM_V"; exit 1; }
 
-      - name: Upload Python dist for the publish job
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-artifacts
+          path: release-artifacts/*
+
+      - name: Upload Python dist for the PyPI publish job
         uses: actions/upload-artifact@v7
         with:
           name: python-dist
@@ -101,6 +112,20 @@ jobs:
             release-artifacts/*.whl
             release-artifacts/*.tar.gz
 
+  publish-github:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: release-artifacts
+          path: release-artifacts
+
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -108,6 +133,7 @@ jobs:
           gh release create "$GITHUB_REF_NAME" \
             --title "Minni $GITHUB_REF_NAME" \
             --generate-notes \
+            --repo "${{ github.repository }}" \
             release-artifacts/*
 
   # Trusted publishing (PyPI OIDC): no API tokens anywhere. Tag pushes publish
@@ -115,7 +141,7 @@ jobs:
   # TestPyPI (environment `testpypi`) as the dry-run.
   publish-pypi:
     name: Publish to PyPI (trusted publishing)
-    needs: release
+    needs: build
     runs-on: ubuntu-latest
     environment: pypi
     permissions:

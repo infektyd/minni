@@ -194,6 +194,16 @@ class SovereignConfig:
                 # dir identifies the author. Never an agent name: Minni logic
                 # is model-agnostic.
                 "inbox_fallback_principal": "unknown",
+                # W3 (audit §4 / consolidation inbox residue): a stop-candidate
+                # file whose declared agent_id disagrees with its vault-derived
+                # principal is skipped by ingest on EVERY tick forever (the
+                # mismatch never self-resolves) — permanent residue, not a
+                # transient gap. Once a file has sat past this TTL it is moved
+                # to <inbox>/quarantine/ with a reason sidecar instead of
+                # piling up invisibly. Mirrors scripts/inbox_cleanup.py's
+                # DEFAULT_RESIDUE_TTL_DAYS convention/default (14 days);
+                # operator-tunable, not hardcoded downstream.
+                "inbox_quarantine_ttl_days": 14.0,
             },
         },
     })

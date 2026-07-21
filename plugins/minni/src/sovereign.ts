@@ -7,7 +7,9 @@ import path from "node:path";
 import { URL } from "node:url";
 import { AFM_HEALTH_URL, AFM_PROVIDER_MODE, DEFAULT_AGENT_ID, DEFAULT_VAULT_PATH, DEFAULT_WORKSPACE_ID, SOCKET_PATH } from "./config.js";
 import {
+  daemonAfmToProviderHealth,
   getAfmProviderHealth,
+  GENERATION_PROBE_TTL_MS,
   resolveAfmProvider,
   resolvedNativeHelperPath,
   sanitizeAfmHealth,
@@ -31,6 +33,17 @@ export interface RecallResponse {
   workspace_id?: string;
   backend?: string;
   backend_badge?: string;
+  /** W5: the daemon's own hit count (recall.py response_payload, always paired
+   *  with `results`) — the preferred, wire-shape signal for "answered but
+   *  empty", ahead of inspecting `results` itself. */
+  count?: number;
+  /** P0-A diagnostic: present (non-empty) when the daemon's read gate
+   *  filtered a non-empty candidate set to zero — a scoped ANSWER, not a
+   *  miss. isDaemonResultEmpty must treat it as non-empty. */
+  auth_suppression?: unknown[];
+  /** Learnings surface separately from document `results`/`count`; a
+   *  learnings-only reply is still a live scoped answer. */
+  learnings?: unknown[];
 }
 
 export interface ReadContextResponse {
@@ -45,6 +58,8 @@ export interface ExtractorStatus {
   tier: "local" | "cloud";
   generationVerified: boolean;
   probeAgeMs: number;
+  /** Which leg produced this verdict — see StatusReport.afm's doc comment. */
+  source: "daemon" | "plugin-probe";
 }
 
 export interface StatusReport {
@@ -53,7 +68,16 @@ export interface StatusReport {
     exists: boolean;
   };
   socket: JsonResult;
-  /** afm.ok is generationVerified (honest health), not mere /health reachability. */
+  /**
+   * afm.ok is generationVerified (honest health), not mere /health
+   * reachability. Single-authority (punch-list §3): when the daemon socket
+   * carries a fresh, matching-mode probe (socket.data.afm), this field is
+   * DERIVED from that same daemon data rather than an independent plugin
+   * probe, so it can never disagree with socket.data.afm in content — only
+   * fall back to the plugin's own probe when the daemon leg is unreachable,
+   * stale, mode-mismatched, or malformed. afm.data.source records which leg
+   * produced the verdict ("daemon" | "plugin-probe").
+   */
   afm: JsonResult;
   afmProvider: AfmProviderResolution;
   extractor: ExtractorStatus;
@@ -641,17 +665,56 @@ export function formatRecall(query: string, response: RecallResponse, vaultResul
 }
 
 /**
- * X5: decide whether to run the local `searchVaultNotes` pre-scan for a recall.
+ * X5 / W5: decide whether to run the local `searchVaultNotes` pre-scan for a
+ * recall.
  *
  * The local pre-scan reads Markdown straight off disk and is NOT subject to the
  * daemon's workspace scoping / read-privacy policy. When the daemon recall
- * succeeds, its (properly scoped) results are authoritative and the unscoped
- * local snippets must not be injected alongside them. The pre-scan therefore
- * runs only as an OFFLINE FALLBACK: daemon unreachable AND the caller did not
- * opt out via includeVault=false.
+ * succeeds WITH HITS, its (properly scoped) results are authoritative and the
+ * unscoped local snippets must not be injected alongside them.
+ *
+ * W5 (punch-list #1, recall vs prepare_task asymmetry): the daemon's `search`
+ * RPC returns JSON-RPC SUCCESS even when it has zero hits (results: [],
+ * count: 0) — that is a live, scoped, empty answer, not an outage. The
+ * original 2-arg gate (`includeVault && !daemonOk`) suppressed the pre-scan on
+ * that daemon-empty case exactly like it does on a genuine outage, which made
+ * minni_recall blinder than prepare_task's markdown/AFM path (which has no
+ * such gate at all). `daemonEmpty` widens the trigger to cover "daemon
+ * answered but empty" alongside "daemon unreachable" — the pre-scan is still
+ * an OFFLINE/DEGRADED fallback, never injected alongside a nonempty daemon
+ * answer, and the accepted tradeoff (unscoped local snippets can now surface
+ * on a workspace-scoped-empty query, not only on a hard outage) is the punch
+ * list's explicit ask. This must NOT be OR'd with an identity denial — a
+ * denial is a refusal, not an empty, and callers must keep gating this
+ * function on `!identityDenied` (see recallResponseText / server.ts's
+ * minni_recall handler; recovery-denial.test.mjs's reserved_agent_id case
+ * pins that invariant).
  */
-export function shouldPrescanVault(daemonOk: boolean, includeVault: boolean): boolean {
-  return includeVault && !daemonOk;
+export function shouldPrescanVault(daemonOk: boolean, includeVault: boolean, daemonEmpty: boolean = false): boolean {
+  return includeVault && (!daemonOk || daemonEmpty);
+}
+
+/**
+ * W5: detect "the daemon answered but has nothing" from the wire shape, not
+ * from English prose. Prefers `count` (recall.py response_payload always
+ * pairs it with `results`) over inspecting `results` itself; falls back to
+ * array length, then to a known empty-results sentinel string for the rare
+ * caller-synthesized RecallResponse that has neither `count` nor an array.
+ */
+export function isDaemonResultEmpty(response: RecallResponse | undefined): boolean {
+  if (!response) return true;
+  // Review r1 (P1): `count` covers document results only. A reply whose
+  // documents were removed by the auth_suppression read gate, or that matched
+  // only the separate `learnings` array, is a live SCOPED answer — treating
+  // it as empty would trigger the workspace-unscoped vault pre-scan and bury
+  // the suppression diagnostic under local markdown snippets.
+  if (Array.isArray(response.auth_suppression) && response.auth_suppression.length > 0) return false;
+  if (Array.isArray(response.learnings) && response.learnings.length > 0) return false;
+  if (typeof response.count === "number") return response.count === 0;
+  const { results } = response;
+  if (Array.isArray(results)) return results.length === 0;
+  if (typeof results === "string") return results.trim().length === 0 || results.trim() === "No recall results.";
+  return results === undefined;
 }
 
 /**
@@ -666,7 +729,12 @@ export function recallResponseText(
   result: JsonResult<RecallResponse>,
   vaultResults: VaultSearchResult[],
 ): string {
-  if (result.ok && result.data) return formatRecall(query, result.data, []);
+  // W5: pass vaultResults through — a daemon-empty answer is still `result.ok`,
+  // and shouldPrescanVault (server.ts) may now have populated vaultResults for
+  // exactly that case (punch-list #1). Discarding them here would silently
+  // defeat the daemon-empty pre-scan fix by rendering "No Codex vault wiki
+  // matches." even when the local scan found something.
+  if (result.ok && result.data) return formatRecall(query, result.data, vaultResults);
   const recovery = recoveryRouteFrom(result.data);
   if (recovery) {
     return [
@@ -679,6 +747,16 @@ export function recallResponseText(
   // "Daemon unavailable" offline framing or the unscoped local fallback.
   const denial = identityDenialFrom(result.data);
   if (denial) {
+    // W5 (punch-list #4): cross_agent's default-deny (principal.py:798-803,
+    // allows_cross_agent_recall) is correct-by-design policy, not an identity
+    // misconfiguration — say so, name the capability, give the remedy. Every
+    // OTHER -32004 (reserved_agent_id, other capability_denied methods) keeps
+    // the original "misconfiguration, not an outage" framing: those really
+    // are unprovisioned/misrouted identities (recovery-denial.test.mjs's
+    // reserved_agent_id case pins this — do not regress).
+    if (isCrossAgentCapabilityDenial(denial)) {
+      return crossAgentDenialText(denial);
+    }
     return `Recall denied by the daemon (identity/authz misconfiguration, not an outage): ${denial}`;
   }
   if (vaultResults.length) {
@@ -689,6 +767,128 @@ export function recallResponseText(
     );
   }
   return `Recall failed: ${result.error}`;
+}
+
+/**
+ * W5 (punch-list #4): match ONLY the exact cross_agent capability_denied
+ * message shape emitted by principal.py:806-822 (`make_capability_denied_error`,
+ * called from recall.py:165 for `cross_agent` specifically). The SAME helper
+ * stamps -32004s for other capabilities (provenance.py:117,
+ * enforce_method_capability) and for reserved_agent_id/unknown_identity
+ * (provenance.py:98-116) with a similarly-shaped message — this regex must
+ * leave those on the existing "not-an-outage, no-fallback" path untouched.
+ *
+ * Known coupling risk: this keys off Python-owned prose (principal.py:814).
+ * If that message wording changes, this silently stops matching and
+ * cross_agent denials fall back to the generic (still-correct, just less
+ * ergonomic) framing above — fails safe, no crash. FOLLOW-UP (out of scope
+ * for this package): stamp `error.data = {capability, method}` server-side
+ * (JSON-RPC 2.0's `data` field is exactly for this, and the identity-recovery
+ * path already does it — see recoveryRouteFrom) so the TS side can switch to
+ * a structural check instead of parsing English.
+ */
+export function isCrossAgentCapabilityDenial(denialMessage: string): boolean {
+  return /^capability_denied: 'cross_agent'/.test(denialMessage);
+}
+
+/** W5: the reworded cross_agent denial text — names the capability and the
+ *  remedy, and deliberately never says "misconfiguration" (that word implies
+ *  something is broken; a default-deny capability gate is working as designed). */
+export function crossAgentDenialText(denial: string): string {
+  return (
+    "Cross-agent search denied by the daemon: this is a default-deny policy " +
+    "(capability 'cross_agent' is off by default for this principal) — grant it " +
+    "via the operator principal config, or omit cross_agent to search personal " +
+    `scope. (${denial})`
+  );
+}
+
+/**
+ * W5 (punch-list #4c): pure formatter for the cross_agent graceful-degrade
+ * path. Mirrors formatRecall's shape (so it reads identically to a normal
+ * recall) but leads with an explicit note that cross-agent was denied and
+ * these are personal-scope results instead — per graceful-degradation best
+ * practice, the substitution must be visible, never silent. Independently
+ * unit-testable without a fake daemon: callers pass the ALREADY-RESOLVED
+ * personal-scope RecallResponse (the retry itself is an async RPC call and
+ * lives in recallCrossAgentDegrade, keeping this function pure).
+ */
+export function formatCrossAgentDegrade(
+  query: string,
+  personalResponse: RecallResponse,
+  vaultResults: VaultSearchResult[] = [],
+): string {
+  const note =
+    "Note: cross-agent search was denied by design default (capability 'cross_agent' " +
+    "is off for this principal) — showing personal-scope results instead.";
+  return [note, "", formatRecall(query, personalResponse, vaultResults)].join("\n");
+}
+
+/**
+ * W5 (punch-list #4c): on a cross_agent capability denial, gracefully degrade
+ * IN-BAND to a personal-scope retry of the same query rather than returning
+ * only an error. The retry is strictly narrower/safer than the denied
+ * cross_agent call (personal scope is a subset), so it cannot fail for a NEW
+ * reason the original call didn't already risk.
+ *
+ * Guarded two ways (belt-and-suspenders against a misfiring classifier or an
+ * already-personal-scope call retrying itself into a loop):
+ *  1. `denial` must match isCrossAgentCapabilityDenial exactly.
+ *  2. `crossAgentRequested` must be the ORIGINAL request's own cross_agent
+ *     flag (=== true), not inferred from the denial text alone.
+ *
+ * Returns undefined when the degrade path does not apply, or when the
+ * personal-scope retry itself fails/comes back empty — callers should then
+ * fall back to recallResponseText's plain (reworded) denial text.
+ */
+export async function recallCrossAgentDegrade(
+  input: {
+    query: string;
+    layer?: string;
+    limit?: number;
+    workspaceId?: string;
+    agentId?: string;
+  },
+  crossAgentRequested: boolean,
+  denial: string | undefined,
+  requester: JsonRpcRequester = jsonRpcSocketRequest,
+): Promise<string | undefined> {
+  if (!denial || !isCrossAgentCapabilityDenial(denial) || crossAgentRequested !== true) {
+    return undefined;
+  }
+  // Review r4 (P2): the personal-scope retry runs through recallMemory, which
+  // does not (and, for an authenticated principal, cannot) rescope the daemon
+  // search to a caller-requested workspace — daemon `search` scopes documents
+  // from the STAMPED principal's workspace (recall.py:880 uses
+  // principal.workspace_id, ignoring any per-request workspace_id), while
+  // recallMemory never even serializes workspaceId onto the wire. So when a
+  // NON-DEFAULT workspace was explicitly requested, the retry would surface
+  // stamped/default-workspace personal hits while the degrade note claims
+  // "personal-scope results", hiding the requested workspace's real denial/
+  // empty answer. Skip the degrade when the workspace cannot be honored; the
+  // caller then falls through to recallResponseText's denial/remedy text.
+  if (input.workspaceId !== undefined && input.workspaceId !== DEFAULT_WORKSPACE_ID) {
+    return undefined;
+  }
+  const personalRetry = await recallMemory(
+    {
+      query: input.query,
+      layer: input.layer,
+      limit: input.limit,
+      workspaceId: input.workspaceId,
+      agentId: input.agentId,
+      scope: "personal",
+      crossAgent: false,
+    },
+    requester,
+  );
+  if (!personalRetry.ok || !personalRetry.data) return undefined;
+  // Review r2 (P2): an EMPTY personal retry must fall through exactly like a
+  // failed one — formatting the degrade here would report crossAgentDegraded
+  // ("showing personal results instead") with nothing to show, hiding the
+  // denial/remedy text the docstring promises for empty retries.
+  if (isDaemonResultEmpty(personalRetry.data)) return undefined;
+  return formatCrossAgentDegrade(input.query, personalRetry.data, []);
 }
 
 /**
@@ -761,7 +961,14 @@ export async function buildStatusReport(input?: {
   const vaultPath = input?.vaultPath ?? DEFAULT_VAULT_PATH;
   await ensureVault(vaultPath);
   const tail = await auditTail(vaultPath, 1);
-  const rawAfm = input?.afm ?? (await afmHealth());
+
+  // Fetch the daemon socket status BEFORE computing our own AFM verdict: when
+  // the daemon is reachable it has ALREADY run afm_runtime_status() with its
+  // own real (matching) probe budget (afm_provider.py:376-421, embedded here
+  // as socket.data.afm by health.py:156-189). Reordered so the reuse check
+  // below (daemonAfmToProviderHealth) can skip a second, independently-timed
+  // generation probe entirely when that fresh result is usable.
+  const socket = input?.socket ?? (await socketHealth());
 
   let volume = 0;
   const logFiles = ["log.md", "log.1.md", "log.2.md", "log.3.md"];
@@ -782,23 +989,86 @@ export async function buildStatusReport(input?: {
     }
   } catch {}
 
-  const afmProvider = resolveAfmProvider(input?.afmProviderMode ?? AFM_PROVIDER_MODE, {
+  // Review r3 (P2): decide daemon-verdict reuse BEFORE paying the local
+  // afmHealth() call — in native/auto installs with the bridge health endpoint
+  // down or slow, that probe costs its full timeout on every
+  // Status/SessionStart even when the daemon has already supplied the
+  // authoritative AFM verdict. The reuse decision does not need bridge
+  // /health: in explicit modes resolveAfmProvider's provider IS the mode
+  // (health only refines status/availability detail), and in auto mode
+  // daemonAfmToProviderHealth treats the daemon as the authority regardless of
+  // the local guess. So resolve provisionally without health, and only await
+  // afmHealth() when the daemon verdict is unusable (the fallback plugin probe
+  // and auto-resolution genuinely need it).
+  const configuredAfmMode = input?.afmProviderMode ?? AFM_PROVIDER_MODE;
+  let rawAfm = input?.afm;
+  let afmProvider = resolveAfmProvider(configuredAfmMode, {
     nativeHelperPath: resolvedNativeHelperPath(),
     health: rawAfm,
   });
-  const generation =
-    input?.afmGeneration ??
-    (await getAfmProviderHealth({
+
+  // Single-authority AFM verdict (punch-list §3): reuse the daemon's own
+  // fresh, matching-mode probe when it's usable instead of spawning a second,
+  // independently-timed generation probe (no cold native-helper subprocess,
+  // no redundant bridge chat-completion call). daemonAfmToProviderHealth
+  // returns undefined — falling through to the plugin's own probe below —
+  // whenever the socket is unreachable, the daemon payload has no `afm`
+  // block at all (back-compat: identical to "socket unreachable"), the
+  // payload shape doesn't match (untrusted input), the provider mode doesn't
+  // match this process's resolved provider, or the probe is stale.
+  const ttlMs = input?.afmGenerationTtlMs ?? GENERATION_PROBE_TTL_MS;
+  const daemonAfmData = socket.ok ? (socket.data as Record<string, unknown> | undefined)?.afm : undefined;
+  // Review r2 (P2): pass the CONFIGURED mode too — in auto mode the daemon's
+  // effective-provider verdict wins over the plugin's local guess (helper
+  // presence alone can resolve "native" here while the daemon already fell
+  // back to bridge after a real FoundationModels check).
+  const daemonGeneration = daemonAfmToProviderHealth(
+    daemonAfmData,
+    afmProvider.provider,
+    ttlMs,
+    Date.now,
+    afmProvider.mode,
+  );
+
+  // Local /health probe (r3): skipped entirely when the daemon verdict is
+  // being reused — the report's afm block then carries the daemon-sourced
+  // reachable/generationVerified plus source:"daemon", and the bridge-health
+  // string fields are simply absent. When we DO need it (no usable daemon
+  // verdict, or a test seam supplied input.afm), re-resolve the provider with
+  // health so the fallback path behaves exactly as before.
+  const reusingDaemonVerdict = !input?.afmGeneration && daemonGeneration !== undefined;
+  if (rawAfm === undefined && !reusingDaemonVerdict) {
+    rawAfm = await afmHealth();
+    afmProvider = resolveAfmProvider(configuredAfmMode, {
+      nativeHelperPath: resolvedNativeHelperPath(),
+      health: rawAfm,
+    });
+  }
+  const resolvedRawAfm: JsonResult =
+    rawAfm ?? { ok: false, data: undefined, error: undefined };
+
+  let generation: ProviderHealth;
+  let source: "daemon" | "plugin-probe";
+  if (input?.afmGeneration) {
+    generation = input.afmGeneration;
+    source = "plugin-probe";
+  } else if (daemonGeneration) {
+    generation = daemonGeneration;
+    source = "daemon";
+  } else {
+    generation = await getAfmProviderHealth({
       mode: afmProvider.provider,
       // The HTTP /health result gates the generation probe only for the bridge
       // provider; in native mode a dead bridge must not veto the probe — the
       // native helper is exercised directly (mirror of afm_runtime_status).
-      health: afmProvider.provider === "bridge" ? rawAfm : undefined,
+      health: afmProvider.provider === "bridge" ? resolvedRawAfm : undefined,
       transport: input?.afmGenerationTransport,
       ttlMs: input?.afmGenerationTtlMs,
       nativeHelperPath: resolvedNativeHelperPath(),
-    }));
-  const sanitizedAfm = sanitizeAfmHealth(rawAfm);
+    });
+    source = "plugin-probe";
+  }
+  const sanitizedAfm = sanitizeAfmHealth(resolvedRawAfm);
   const generationError =
     generation.generationVerified
       ? undefined
@@ -811,6 +1081,11 @@ export async function buildStatusReport(input?: {
       ...sanitizedAfm.data,
       reachable: generation.reachable,
       generationVerified: generation.generationVerified,
+      // Authority tag (punch-list §3c): which leg produced this verdict, so a
+      // consumer never has to diff socket.data.afm against this field to spot
+      // a contradiction — when source is "daemon" the two are, by construction,
+      // the same probe.
+      source,
     },
     error: generationError,
   };
@@ -820,12 +1095,13 @@ export async function buildStatusReport(input?: {
       path: vaultPath,
       exists: await vaultExists(vaultPath),
     },
-    socket: input?.socket ?? (await socketHealth()),
+    socket,
     afm,
     afmProvider,
     extractor: {
       provider: afmProvider.provider,
       tier: "local",
+      source,
       generationVerified: generation.generationVerified,
       probeAgeMs: generation.probeAgeMs,
     },

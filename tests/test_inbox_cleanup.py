@@ -164,6 +164,7 @@ def test_dry_run_reports_correct_archive_set_and_touches_nothing(tmp_path):
         "acked_handoff": 1,
         "nothing_ingestible": 1,
         "unrecognized_kind": 1,
+        "agent_mismatch_quarantine": 0,
     }, vault
     would = {e["file"]: e["reason"] for e in vault["would_archive"]}
     assert would == EXPECTED_ARCHIVE
@@ -463,6 +464,166 @@ def test_dry_run_and_apply_are_mutually_exclusive(tmp_path, capsys):
     assert out["dry_run"] is True
     assert sorted(p.name for p in inbox.glob("*.json")) == before
     assert not (inbox / ".archive").exists()
+
+
+def _mismatch_stop_doc(candidates, agent_id):
+    doc = _stop_doc(candidates)
+    doc["agent_id"] = agent_id
+    return doc
+
+
+def test_classify_stale_agent_mismatch_returns_quarantine_reason(tmp_path):
+    """W3 (audit §4): eligible, non-empty, ZERO matching DB rows, and the
+    declared agent_id disagrees with the vault-derived principal (x-vault ->
+    'x') — this is the confirmed permanently-unresolvable cohort, not merely
+    'not yet ingested'. Once past the residue TTL it gets a real drain reason
+    instead of falling through every branch to 'keep' forever."""
+    doc = _mismatch_stop_doc(["orphaned lesson"], agent_id="some-other-agent")
+    reason = _classify(
+        tmp_path, "2026-04-01-old-mismatch.json", doc, rows=[],
+    )
+    assert reason == "agent_mismatch_quarantine", reason
+
+
+def test_classify_fresh_agent_mismatch_keeps(tmp_path):
+    """Same mismatch, but the file is younger than the residue TTL — stays
+    'keep' (grace window)."""
+    doc = _mismatch_stop_doc(["orphaned lesson"], agent_id="some-other-agent")
+    reason = _classify(
+        tmp_path, "2026-06-09-fresh-mismatch.json", doc, rows=[],
+    )
+    assert reason == "keep", reason
+
+
+def test_classify_agent_matching_zero_rows_stays_keep(tmp_path):
+    """Scope guard: zero rows + eligible content but the agent_id MATCHES the
+    vault principal ('x-vault' -> 'x') is simply fresh/not-yet-ingested, not
+    the agent-mismatch cohort — must stay 'keep' even when old."""
+    doc = _mismatch_stop_doc(["fine content"], agent_id="x")
+    reason = _classify(
+        tmp_path, "2026-04-01-old-matching.json", doc, rows=[],
+    )
+    assert reason == "keep", reason
+
+
+def test_classify_agentless_zero_rows_stays_keep(tmp_path):
+    """Scope guard: no agent_id at all (kind-less Claude Code shape) is never
+    treated as an agent mismatch, regardless of age."""
+    doc = _stop_doc(["fine content"])
+    reason = _classify(
+        tmp_path, "2026-04-01-old-agentless.json", doc, rows=[],
+    )
+    assert reason == "keep", reason
+
+
+def test_principal_for_inbox_dir_mirrors_daemon_fallback():
+    """The script's principal-derivation must agree with the daemon's
+    inbox_ingest._principal_for_inbox for EVERY dir shape, fallback included.
+    A `<agent>-vault` dir resolves via the alias table (or the raw slug); the
+    daemon's OWN bare `vault` dir resolves to the fallback principal ("unknown"
+    by default), NEVER the literal string "vault"."""
+    assert inbox_cleanup._principal_for_inbox_dir("claudecode-vault") == "claude-code"
+    assert inbox_cleanup._principal_for_inbox_dir("codex-vault") == "codex"
+    assert inbox_cleanup._principal_for_inbox_dir("x-vault") == "x"  # raw slug
+    # The regression: the bare vault dir must fall back, not echo "vault".
+    assert inbox_cleanup._principal_for_inbox_dir("vault") == "unknown"
+    assert inbox_cleanup._principal_for_inbox_dir("vault", "custom") == "custom"
+
+
+def test_classify_bare_vault_inbox_fallback_match_stays_keep(tmp_path):
+    """Regression (review fix-r2): a stop-candidate in the daemon's OWN bare
+    `<home>/vault/inbox` whose agent_id equals the daemon's fallback principal
+    ("unknown") is a MATCH to the live AFM loop — NOT an _agent_mismatch — so it
+    is ingestible, not residue. classify_file must keep it, never sweep it to
+    agent_mismatch_quarantine, even once stale. The old code derived the
+    principal as the literal "vault", so "unknown" != "vault" misfired."""
+    inbox = tmp_path / "vault" / "inbox"
+    inbox.mkdir(parents=True)
+    doc = {**_stop_doc(["healthy lesson, correctly attributed"]), "agent_id": "unknown"}
+    path = inbox / "2026-04-01-fallback-match.json"  # well past the 14d residue TTL
+    path.write_text(json.dumps(doc), encoding="utf-8")
+    reason = inbox_cleanup.classify_file(path, {}, handoff_ttl_days=7.0, now=NOW)
+    assert reason == "keep", reason
+
+
+def test_classify_bare_vault_inbox_real_mismatch_still_quarantines(tmp_path):
+    """Companion to the above: in the same bare `vault/inbox`, a file whose
+    agent_id is a genuinely different agent (not the "unknown" fallback) is a
+    real, permanently-unresolvable _agent_mismatch and still quarantines once
+    stale — the fix narrows the cohort to true mismatches, it does not disable
+    the branch for the bare dir."""
+    inbox = tmp_path / "vault" / "inbox"
+    inbox.mkdir(parents=True)
+    doc = {**_stop_doc(["someone else's lesson"]), "agent_id": "codex"}
+    path = inbox / "2026-04-01-real-mismatch.json"
+    path.write_text(json.dumps(doc), encoding="utf-8")
+    reason = inbox_cleanup.classify_file(path, {}, handoff_ttl_days=7.0, now=NOW)
+    assert reason == "agent_mismatch_quarantine", reason
+
+
+def test_run_cleanup_bare_vault_fallback_match_not_quarantined(tmp_path):
+    """End-to-end via discover_vault_inboxes(): the daemon's own bare
+    `<home>/vault/inbox` is scanned, and a fallback-matching file is left in
+    place by --apply (parity with the live quarantine pass, which would never
+    move it)."""
+    inbox = tmp_path / "vault" / "inbox"
+    inbox.mkdir(parents=True)
+    doc = {**_stop_doc(["healthy lesson"]), "agent_id": "unknown"}
+    (inbox / "2026-04-01-fallback-match.json").write_text(json.dumps(doc), encoding="utf-8")
+    db_path = tmp_path / "empty.db"
+
+    applied = inbox_cleanup.run_cleanup(home=tmp_path, db_path=db_path, apply=True, now=NOW)
+    vault = applied["vaults"]["vault"]
+    assert vault["counts"]["agent_mismatch_quarantine"] == 0, vault
+    assert vault["counts"]["keep"] == 1, vault
+    assert vault["archived"] == []
+    assert (inbox / "2026-04-01-fallback-match.json").exists()
+    assert not (inbox / "quarantine").exists()
+
+
+def test_scripts_inbox_cleanup_classifies_and_quarantines_agent_mismatch_residue(tmp_path):
+    """End-to-end through run_cleanup: dry-run reports the reason but touches
+    nothing; --apply MOVES (never archives, never deletes) the file into
+    quarantine/ with a reason sidecar, mirroring afm_passes.inbox_quarantine's
+    payload shape closely enough for health_report's by_reason aggregation to
+    make sense across both sources."""
+    inbox = tmp_path / "unknown-vault" / "inbox"
+    inbox.mkdir(parents=True)
+    doc = _mismatch_stop_doc(["orphaned lesson, permanently unresolvable"], agent_id="unknown-agent")
+    (inbox / "2026-04-01-mismatch.json").write_text(json.dumps(doc), encoding="utf-8")
+    db_path = tmp_path / "empty.db"  # no candidate_packets rows anywhere
+
+    # Dry run: reason surfaces, nothing moves.
+    dry = inbox_cleanup.run_cleanup(home=tmp_path, db_path=db_path, apply=False, now=NOW)
+    vault = dry["vaults"]["unknown-vault"]
+    assert vault["counts"]["agent_mismatch_quarantine"] == 1, vault
+    would = {e["file"]: e["reason"] for e in vault["would_archive"]}
+    assert would == {"2026-04-01-mismatch.json": "agent_mismatch_quarantine"}
+    assert (inbox / "2026-04-01-mismatch.json").exists()
+    assert not (inbox / "quarantine").exists()
+    assert not (inbox / ".archive").exists()
+
+    # Apply: the file MOVES to quarantine/ (not .archive/) with a sidecar.
+    applied = inbox_cleanup.run_cleanup(home=tmp_path, db_path=db_path, apply=True, now=NOW)
+    vault2 = applied["vaults"]["unknown-vault"]
+    archived = {e["file"]: e["reason"] for e in vault2["archived"]}
+    assert archived == {"2026-04-01-mismatch.json": "agent_mismatch_quarantine"}
+    assert not (inbox / "2026-04-01-mismatch.json").exists()
+    assert not (inbox / ".archive").exists(), "must never land in .archive/ — content was never captured in the DB"
+    quarantined = inbox / "quarantine" / "2026-04-01-mismatch.json"
+    assert quarantined.is_file()
+    assert json.loads(quarantined.read_text(encoding="utf-8")) == doc
+
+    reason_sidecar = inbox / "quarantine" / "2026-04-01-mismatch.json.reason.json"
+    assert reason_sidecar.is_file()
+    reason_payload = json.loads(reason_sidecar.read_text(encoding="utf-8"))
+    assert reason_payload["reason"] == "_agent_mismatch"
+    assert reason_payload["detected_agent_id"] == "unknown-agent"
+    assert reason_payload["resolved_vault_principal"] == "unknown"
+
+    # Idempotent: a second --apply finds nothing left to quarantine.
+    again = inbox_cleanup.run_cleanup(home=tmp_path, db_path=db_path, apply=True, now=NOW)
+    assert again["vaults"]["unknown-vault"]["archived"] == []
 
 
 def test_parse_iso_epoch():

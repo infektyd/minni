@@ -50,6 +50,10 @@ def _isolated_engine_state(tmp_path, monkeypatch):
         import minni.db as _db
         monkeypatch.setattr(_db, "_migrations_run", False, raising=False)
         _db._migrated_paths.clear()
+        # Same per-test reset for the process-wide schema-DDL gate: a tmp db path
+        # reused across tests (deleted + recreated) would otherwise carry a stale
+        # "ready" entry and SKIP schema init, hitting "no such table: vault_fts".
+        _db._schema_ready_paths.clear()
     except Exception:
         pass
 

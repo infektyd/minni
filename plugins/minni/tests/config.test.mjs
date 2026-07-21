@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -74,7 +74,57 @@ test("no env falls back to unknown deny identity, not codex vault", async () => 
       config.DEFAULT_VAULT_PATH,
       path.join(os.homedir(), ".minni", "unknown-vault"),
     );
+    assert.equal(config.CODEX_AGENT_ID, "codex");
+    assert.equal(
+      config.CODEX_VAULT_PATH,
+      path.join(os.homedir(), ".minni", "codex-vault"),
+    );
+    assert.equal(config.CODEX_WORKSPACE_ID, "workspace-unknown");
   });
+});
+
+test("CODEX_WORKSPACE_ID ignores process.cwd when env and payload are unstamped", async () => {
+  // Codex hooks often launch with cwd = plugin cache. That must never become
+  // the workspace stamp; MCP fails closed to workspace-unknown the same way.
+  const previousCwd = process.cwd();
+  const fakeCache = path.join(
+    os.tmpdir(),
+    `minni-codex-cache-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+  );
+  mkdirSync(fakeCache, { recursive: true });
+  try {
+    process.chdir(fakeCache);
+    await withConfigEnv({}, (config) => {
+      assert.equal(config.CODEX_WORKSPACE_ID, "workspace-unknown");
+      assert.equal(config.DEFAULT_WORKSPACE_ID, "workspace-unknown");
+      assert.notEqual(
+        config.CODEX_WORKSPACE_ID,
+        `workspace-${path.basename(fakeCache).toLowerCase()}`,
+      );
+    });
+  } finally {
+    process.chdir(previousCwd);
+    rmSync(fakeCache, { recursive: true, force: true });
+  }
+});
+
+test("Codex hook identity is independent from generic MCP identity", async () => {
+  await withConfigEnv(
+    {
+      MINNI_AGENT_ID: "unknown-agent",
+      MINNI_VAULT_PATH: "/tmp/unknown-vault",
+      MINNI_CODEX_AGENT_ID: "codex",
+      MINNI_CODEX_VAULT_PATH: "/tmp/codex-vault",
+      MINNI_CODEX_WORKSPACE_ID: "/tmp/codex-workspace",
+    },
+    (config) => {
+      assert.equal(config.DEFAULT_AGENT_ID, "unknown-agent");
+      assert.equal(config.DEFAULT_VAULT_PATH, "/tmp/unknown-vault");
+      assert.equal(config.CODEX_AGENT_ID, "codex");
+      assert.equal(config.CODEX_VAULT_PATH, "/tmp/codex-vault");
+      assert.equal(config.CODEX_WORKSPACE_ID, "workspace-codex-workspace");
+    },
+  );
 });
 
 test("Codex MCP manifest pins codex env explicitly", () => {
@@ -83,4 +133,22 @@ test("Codex MCP manifest pins codex env explicitly", () => {
   assert.equal(env?.MINNI_AGENT_ID, "codex");
   assert.equal(env?.MINNI_VAULT_PATH, "~/.minni/codex-vault");
   assert.equal(env?.MINNI_SOCKET_PATH, "~/.minni/run/minnid.sock");
+});
+
+test("Codex hook manifest uses only the native adapter with realistic timeouts", () => {
+  const manifest = JSON.parse(
+    readFileSync(new URL("../hooks/hooks-codex.json", import.meta.url), "utf8"),
+  );
+  const expected = {
+    SessionStart: 30,
+    UserPromptSubmit: 30,
+    PreCompact: 20,
+    Stop: 20,
+  };
+  for (const [event, timeout] of Object.entries(expected)) {
+    const hook = manifest.hooks?.[event]?.[0]?.hooks?.[0];
+    assert.equal(hook?.command, `node \${PLUGIN_ROOT}/dist/codex-hook.js ${event}`);
+    assert.equal(hook?.timeout, timeout);
+    assert.doesNotMatch(hook?.command ?? "", /\/dist\/hook\.js\s/);
+  }
 });

@@ -22,6 +22,11 @@ AFMMode = Literal["off", "bridge", "native", "auto"]
 _VALID_MODES = {"off", "bridge", "native", "auto"}
 _DEFAULT_NATIVE_HELPER = Path(__file__).resolve().parent / "native_afm_helper"
 DEFAULT_AFM_CHAT_COMPLETIONS_URL = "http://127.0.0.1:11437/v1/chat/completions"
+# The model the daemon's own generation probe (below) asks for. Surfaced in
+# afm_runtime_status() so a consumer (the plugin) can confirm the daemon probed
+# the SAME target it will call before reusing the daemon's verdict — see the
+# probe_url/probe_model gate in daemonAfmToProviderHealth (afm.ts).
+AFM_PROBE_MODEL = "apple-foundation-models"
 
 
 @dataclass(frozen=True)
@@ -280,7 +285,7 @@ def _run_generation_probe(
     now: Callable[[], float],
 ) -> Dict[str, Any]:
     payload = {
-        "model": "apple-foundation-models",
+        "model": AFM_PROBE_MODEL,
         "temperature": 0,
         "max_tokens": 1,
         "messages": [{"role": "user", "content": "ok"}],
@@ -363,13 +368,27 @@ def verify_afm_generation(
     }
 
 
-def _with_generation_health(report: Dict[str, Any], health: Dict[str, Any]) -> Dict[str, Any]:
+def _with_generation_health(
+    report: Dict[str, Any],
+    health: Dict[str, Any],
+    *,
+    probe_url: Optional[str] = None,
+    probe_model: Optional[str] = None,
+) -> Dict[str, Any]:
     report["ok"] = health["generation_verified"]
     report["generation_verified"] = health["generation_verified"]
     report["probe_age_ms"] = health["probe_age_ms"]
     report["reachable"] = health["reachable"]
     if health["detail"] and "error" not in report:
         report["error"] = health["detail"]
+    # Review r4 (P2): when the verdict came from a bridge HTTP probe, surface
+    # the exact target so the plugin can require it to match its own configured
+    # AFM_PREPARE_TASK_URL/MODEL before reusing this verdict. Omitted for native
+    # probes (no configurable HTTP endpoint to disagree on) — the plugin only
+    # consults these fields for a bridge-effective verdict.
+    if probe_url is not None:
+        report["probe_url"] = probe_url
+        report["probe_model"] = probe_model or AFM_PROBE_MODEL
     return report
 
 
@@ -405,6 +424,8 @@ def afm_runtime_status(
                 "adapter_configured": adapter_configured,
             },
             verify(resolved, client=probe_client),
+            probe_url=DEFAULT_AFM_CHAT_COMPLETIONS_URL,
+            probe_model=AFM_PROBE_MODEL,
         )
     if not helper_available:
         report = {
@@ -416,8 +437,14 @@ def afm_runtime_status(
             "adapter_configured": adapter_configured,
         }
         if resolved == "auto":
-            # Auto mode can still verify generation through the bridge fallback.
-            return _with_generation_health(report, verify(resolved, client=probe_client))
+            # Auto mode can still verify generation through the bridge fallback —
+            # so the verdict describes the bridge HTTP target, surface it.
+            return _with_generation_health(
+                report,
+                verify(resolved, client=probe_client),
+                probe_url=DEFAULT_AFM_CHAT_COMPLETIONS_URL,
+                probe_model=AFM_PROBE_MODEL,
+            )
         report.update({"ok": False, "generation_verified": False, "probe_age_ms": 0})
         return report
 
@@ -442,7 +469,18 @@ def afm_runtime_status(
     safe_error = _safe_status_error(health.error)
     if safe_error:
         report["error"] = safe_error
-    return _with_generation_health(report, verify(resolved, client=probe_client))
+    # Only a "fallback_used" verdict (auto mode, FoundationModels unavailable)
+    # was produced by a bridge HTTP probe; native_available/native_unavailable
+    # exercised the native helper, which has no configurable HTTP target to
+    # match. Surface probe_url/model only for the bridge-effective case so the
+    # plugin's target gate does not fire against a native verdict.
+    bridge_probe = status == "fallback_used"
+    return _with_generation_health(
+        report,
+        verify(resolved, client=probe_client),
+        probe_url=DEFAULT_AFM_CHAT_COMPLETIONS_URL if bridge_probe else None,
+        probe_model=AFM_PROBE_MODEL if bridge_probe else None,
+    )
 
 
 def invoke_native_afm(operation: str, payload: Dict[str, Any], timeout: float = 2.0) -> AFMResult:

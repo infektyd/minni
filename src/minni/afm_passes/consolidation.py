@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import re
 import time
 from typing import Any, Dict, List, Optional
@@ -34,10 +35,10 @@ from minni.safety import is_instruction_like
 
 logger = logging.getLogger("sovereign.afm.consolidation")
 
-# NOTE: "" (unset/NULL privacy) is deliberately excluded. Inbox-sourced
-# candidates (afm_passes.inbox_ingest) are inserted with privacy_level=None —
-# unknown privacy is NOT the same as "known safe" and must never auto-promote
-# to durable learnings without a review pass (I1/I2 security fix).
+# NOTE: "" (unset/NULL privacy) is deliberately excluded. Current writers stamp
+# explicit privacy, but legacy/other paths can still produce NULL. Unknown
+# privacy is NOT the same as "known safe" and must never auto-promote to durable
+# learnings without a review pass (I1/I2 security fix).
 _SAFE_PRIVACY = {"safe", "public", "low"}
 _MIN_CONTENT_LEN = 12
 _DEFAULT_MAX_PER_RUN = 50
@@ -124,6 +125,7 @@ def _proposed_candidates(db, limit: int) -> List[Dict[str, Any]]:
                   SELECT 1 FROM consolidation_actions ca
                   WHERE ca.action_type = 'afm_review'
                     AND ca.claim = CAST(cp.candidate_id AS TEXT)
+                    AND COALESCE(ca.status, '') != 'superseded'
               )
             ORDER BY cp.proposed_at ASC
             LIMIT ?
@@ -234,7 +236,10 @@ def _triage_advisory(candidates: List[Dict[str, Any]],
         result = call_native_op_and_reduce(
             chain, "triage", {"candidate": content}, text_field="candidate",
             fold=_fold_triage_decisions,
-            timeout=4.0, trace_id=trace_id,
+            # Advisory generation needs longer than the 4s probe-style budget;
+            # on this hardware a real completion routinely exceeds 4s.
+            timeout=float(os.environ.get("MINNI_AFM_TRIAGE_TIMEOUT", "30.0")),
+            trace_id=trace_id,
         )
     except Exception:  # noqa: BLE001 - advisory must never break consolidation
         return None

@@ -123,9 +123,42 @@ test("minni_resolve_candidate no longer advertises the unenforced mark_* decisio
   }
 });
 
+test("minni_plan_create schema exposes shelf_ref so a passed shelf actually configures drift checking (punch-list §4b)", async () => {
+  const source = stripLineComments(
+    await readFile(new URL("../src/server.ts", import.meta.url), "utf8"),
+  );
+  const start = source.indexOf('"minni_plan_create"');
+  assert.notEqual(start, -1, "minni_plan_create tool registration not found");
+  const nextTool = source.indexOf("server.registerTool(", start + 1);
+  const block = source.slice(start, nextTool === -1 ? undefined : nextTool);
+
+  const schemaStart = block.indexOf("inputSchema:");
+  const handlerStart = block.indexOf("async");
+  const schema = block.slice(schemaStart, handlerStart);
+  assert.match(schema, /shelf_ref\s*:/, "minni_plan_create must expose shelf_ref in its inputSchema");
+  assert.match(schema, /shelf_ref[\s\S]*?\.optional\(\)/, "shelf_ref must be optional (additive, back-compat schema evolution)");
+
+  // The handler must actually thread shelf_ref through to createPlan, not just
+  // declare it — otherwise shelfDrift() keeps reporting configured:false.
+  const handlerBlock = block.slice(handlerStart);
+  assert.match(handlerBlock, /shelf_ref/, "handler must pass shelf_ref through to createPlan");
+});
+
 test("Codex hook remains Codex-native instead of reusing Claude hook entrypoint", async () => {
   const codexHook = await readFile(new URL("../src/codex-hook.ts", import.meta.url), "utf8");
   assert.match(codexHook, /runtime:\s*"codex"/);
   assert.match(codexHook, /hookScript:\s*"codex-hook\.js"/);
+  assert.match(codexHook, /agentId:\s*CODEX_AGENT_ID/);
+  assert.match(codexHook, /vaultPath:\s*CODEX_VAULT_PATH/);
+  assert.match(codexHook, /alwaysWriteStopInbox:\s*false/);
+  assert.doesNotMatch(codexHook, /DEFAULT_AGENT_ID|DEFAULT_VAULT_PATH|DEFAULT_WORKSPACE_ID/);
   assert.doesNotMatch(codexHook, /CLAUDECODE_AGENT_ID|CLAUDECODE_VAULT_PATH|hookScript:\s*"hook\.js"/);
+
+  const configSrc = await readFile(new URL("../src/config.ts", import.meta.url), "utf8");
+  const codexWorkspaceBlock = configSrc.match(
+    /export const CODEX_WORKSPACE_ID =[\s\S]*?;\n/,
+  )?.[0];
+  assert.ok(codexWorkspaceBlock, "CODEX_WORKSPACE_ID export must exist");
+  assert.match(codexWorkspaceBlock, /"workspace-unknown"/);
+  assert.doesNotMatch(codexWorkspaceBlock, /process\.cwd/);
 });

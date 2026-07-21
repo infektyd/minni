@@ -35,32 +35,46 @@ def _title_for_pattern(pattern: str) -> str:
     return f"Procedure: {first_step[:64].title()}"
 
 
-def _recent_events(db, lookback_days: int) -> List[Dict[str, Any]]:
+def _recent_events(
+    db, lookback_days: int, agent_id: Optional[str] = None
+) -> List[Dict[str, Any]]:
     cutoff = time.time() - (lookback_days * 86400)
+    bound = (str(agent_id).strip() if agent_id and str(agent_id).strip() else "unknown")
     with db.cursor() as c:
         c.execute(
             """
             SELECT event_id, agent_id, event_type, content, task_id, thread_id, metadata, created_at
             FROM episodic_events
             WHERE created_at >= ?
+              AND agent_id = ?
             ORDER BY created_at DESC
             LIMIT 500
             """,
-            (cutoff,),
+            (cutoff, bound),
         )
         return [dict(row) for row in c.fetchall()]
 
 
-def _session_page_events(vault_path: Optional[str]) -> List[Dict[str, Any]]:
+def _session_page_events(
+    vault_path: Optional[str], agent_id: Optional[str] = None
+) -> List[Dict[str, Any]]:
     if not vault_path:
         return []
+    bound = (str(agent_id).strip() if agent_id and str(agent_id).strip() else None)
     events: List[Dict[str, Any]] = []
     for page in accepted_pages(load_vault_pages(vault_path)):
         if page.page_type != "session":
             continue
+        page_agent = str(getattr(page, "agent", "") or "").strip()
+        # Finding 9: when bound, fail closed — only pages whose frontmatter
+        # agent: matches the bound principal are included. Unattributed or
+        # foreign session pages are skipped (never vacuous-include).
+        if bound:
+            if not page_agent or page_agent != bound:
+                continue
         events.append({
             "event_id": page.rel_path,
-            "agent_id": "vault",
+            "agent_id": page_agent or "vault",
             "event_type": "session_page",
             "content": page.body,
             "created_at": page.updated_ts,
@@ -125,15 +139,36 @@ def _build_drafts(events: List[Dict[str, Any]], trace_id: str) -> List[Dict[str,
     return drafts
 
 
-def run(db, config, vault_path: Optional[str] = None, dry_run: bool = True, trace_id: Optional[str] = None) -> Dict[str, Any]:
+def run(
+    db,
+    config,
+    vault_path: Optional[str] = None,
+    dry_run: bool = True,
+    trace_id: Optional[str] = None,
+    agent_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    import os
+
     schedule = getattr(config, "afm_loop_schedule", {}) or {}
     pass_cfg = (schedule.get("passes") or {}).get("procedure_extraction", {})
     lookback_days = int(pass_cfg.get("lookback_days", 90))
     trace_id = trace_id or f"afm-{int(time.time())}"
     resolved_vault = vault_path or getattr(config, "vault_path", None)
     prompt = _load_prompt()
-    db_events = _recent_events(db, lookback_days)
-    session_events = _session_page_events(str(resolved_vault) if resolved_vault else None)
+    # Finding 9 sibling: never scan all agents' episodic events. Prefer stamped
+    # compile principal, then env/config, else fail closed on "unknown".
+    bound_agent = (
+        agent_id
+        or os.environ.get("MINNI_AGENT_ID")
+        or getattr(config, "agent_id", None)
+    )
+    bound_agent = (
+        str(bound_agent).strip() if bound_agent and str(bound_agent).strip() else "unknown"
+    )
+    db_events = _recent_events(db, lookback_days, agent_id=bound_agent)
+    session_events = _session_page_events(
+        str(resolved_vault) if resolved_vault else None, agent_id=bound_agent
+    )
     all_events = db_events + session_events
     drafts = _build_drafts(all_events, trace_id)
     return {
@@ -146,6 +181,7 @@ def run(db, config, vault_path: Optional[str] = None, dry_run: bool = True, trac
         "prompt_version": PROMPT_VERSION,
         "inputs": {
             "lookback_days": lookback_days,
+            "bound_agent": bound_agent,
             "episodic_event_count": len(db_events),
             "session_page_count": len(session_events),
             "pattern_count": len(_pattern_sources(all_events)),

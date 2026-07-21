@@ -114,6 +114,15 @@ export interface PrepareTaskInput {
   limit?: number;
   workspaceId?: string;
   agentId?: string;
+  /**
+   * Punch-list §4a: the identity that DRIVES THE DAEMON RECALL CALL, kept
+   * independently overridable from `agentId` (which still labels vault-search
+   * results and the returned packet). Callers like team.ts's temporary agents
+   * pass their own never-provisioned `agentId` for display/audit but delegate
+   * the daemon leg to a provisioned principal (e.g. the coordinator) here.
+   * Defaults to `agentId` when omitted — fully back-compatible.
+   */
+  recallAgentId?: string;
   vaultPath?: string;
   includeVault?: boolean;
   afmPrepareUrl?: string;
@@ -933,7 +942,9 @@ export async function prepareTask(input: PrepareTaskInput, deps: PrepareTaskDeps
       layer: input.layer,
       limit,
       workspaceId,
-      agentId,
+      // Punch-list §4a: the daemon leg can be delegated independently of the
+      // display/vault-search agentId (see PrepareTaskInput.recallAgentId).
+      agentId: input.recallAgentId ?? agentId,
     }),
   ]);
 

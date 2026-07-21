@@ -201,3 +201,136 @@ def test_platform_agent_without_cap_map_does_not_inherit_operator_wildcard(tmp_p
     assert p.agent_id == "codex"
     assert p.capabilities == []
     assert not p.can("search")
+
+
+def test_platform_agent_does_not_inherit_operator_vault_roots(tmp_path: Path):
+    """Finding 6 residual: platform agents must not copy operator allowed_vault_roots."""
+    principals = tmp_path / "principals"
+    principals.mkdir()
+    operator_root = tmp_path / "operator-vault"
+    operator_root.mkdir()
+    f = principals / "local.json"
+    f.write_text(
+        json.dumps(
+            {
+                "agent_id": "main",
+                "capabilities": ["*"],
+                "allowed_vault_roots": [str(operator_root)],
+                "platform_agent_ids": ["codex"],
+                "platform_agent_capabilities": {"codex": ["search", "read"]},
+            }
+        ),
+        encoding="utf-8",
+    )
+    os.chmod(f, 0o600)
+
+    from minni.principal import resolve_effective_principal
+
+    p = resolve_effective_principal(
+        supplied_agent_id="codex", transport="uds", principals_dir=principals
+    )
+    assert p.agent_id == "codex"
+    assert p.capabilities == ["search", "read"]
+    assert str(operator_root.resolve()) not in p.allowed_vault_roots
+    assert not p.allows_vault_root(operator_root)
+
+
+def test_platform_agent_vault_roots_from_explicit_map(tmp_path: Path):
+    principals = tmp_path / "principals"
+    principals.mkdir()
+    operator_root = tmp_path / "operator-vault"
+    platform_root = tmp_path / "codex-vault"
+    operator_root.mkdir()
+    platform_root.mkdir()
+    f = principals / "local.json"
+    f.write_text(
+        json.dumps(
+            {
+                "agent_id": "main",
+                "capabilities": ["*"],
+                "allowed_vault_roots": [str(operator_root)],
+                "platform_agent_ids": ["codex"],
+                "platform_agent_capabilities": {"codex": ["search"]},
+                "platform_agent_vault_roots": {"codex": [str(platform_root)]},
+            }
+        ),
+        encoding="utf-8",
+    )
+    os.chmod(f, 0o600)
+
+    from minni.principal import resolve_effective_principal
+
+    p = resolve_effective_principal(
+        supplied_agent_id="codex", transport="uds", principals_dir=principals
+    )
+    assert p.allowed_vault_roots == [str(platform_root.resolve())]
+    assert p.allows_vault_root(platform_root)
+    assert not p.allows_vault_root(operator_root)
+
+
+def test_platform_agent_empty_or_malformed_vault_roots_fail_closed(tmp_path: Path):
+    """Finding 6: explicit [] or a string map value must not vacuous-allow."""
+    principals = tmp_path / "principals"
+    principals.mkdir()
+    target = tmp_path / "etc"
+    target.mkdir()
+
+    from minni.principal import resolve_effective_principal
+
+    for roots_value in ([], "/tmp/codex", [""], None):
+        f = principals / "local.json"
+        payload = {
+            "agent_id": "main",
+            "capabilities": ["*"],
+            "platform_agent_ids": ["codex"],
+            "platform_agent_capabilities": {"codex": ["search", "read"]},
+            "platform_agent_vault_roots": {"codex": roots_value},
+        }
+        f.write_text(json.dumps(payload), encoding="utf-8")
+        os.chmod(f, 0o600)
+        p = resolve_effective_principal(
+            supplied_agent_id="codex", transport="uds", principals_dir=principals
+        )
+        assert not p.allows_vault_root(target), roots_value
+        assert "/.minni-platform-no-vault-roots" in p.allowed_vault_roots or not p.allows_vault_root(
+            "/"
+        )
+
+
+def test_platform_agent_missing_roots_map_keeps_own_vault(tmp_path: Path, monkeypatch):
+    """PR167 review: strict installs predating platform_agent_vault_roots must
+    keep pathed access to the platform agent's OWN vault (never the
+    operator's). Both the literal id and the dashless installer alias count
+    (claude-code -> claudecode-vault)."""
+    principals = tmp_path / "principals"
+    principals.mkdir()
+    minni_home = tmp_path / "minni-home"
+    (minni_home / "claude-code-vault").mkdir(parents=True)
+    (minni_home / "claudecode-vault").mkdir(parents=True)
+    operator_root = tmp_path / "operator-vault"
+    operator_root.mkdir()
+    monkeypatch.setenv("MINNI_HOME", str(minni_home))
+
+    f = principals / "local.json"
+    f.write_text(
+        json.dumps(
+            {
+                "agent_id": "main",
+                "capabilities": ["*"],
+                "allowed_vault_roots": [str(operator_root)],
+                "platform_agent_ids": ["claude-code"],
+                "platform_agent_capabilities": {"claude-code": ["search", "read"]},
+            }
+        ),
+        encoding="utf-8",
+    )
+    os.chmod(f, 0o600)
+
+    from minni.principal import resolve_effective_principal
+
+    p = resolve_effective_principal(
+        supplied_agent_id="claude-code", transport="uds", principals_dir=principals
+    )
+    assert p.allows_vault_root(minni_home / "claude-code-vault")
+    assert p.allows_vault_root(minni_home / "claudecode-vault")
+    assert not p.allows_vault_root(operator_root)

@@ -1,6 +1,9 @@
+import json
 import logging
+import os
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -13,7 +16,14 @@ logger = logging.getLogger("minnid")
 # NEW-01: health_report is reachable pre-identity (in RECOVERY_ALLOWED_METHODS),
 # so its per-record fields — document paths and learning contents — must be
 # withheld from an unstamped recovery-mode caller. Liveness/aggregate signals stay.
-_HEALTH_REPORT_SENSITIVE_KEYS = ("stale_docs", "never_recalled", "contradicting_learnings")
+# W2: recent_errors (exception messages) joins the list — a traceback message can
+# embed paths/payloads, so it rides the identical operator-gate/redaction path.
+_HEALTH_REPORT_SENSITIVE_KEYS = (
+    "stale_docs",
+    "never_recalled",
+    "contradicting_learnings",
+    "recent_errors",
+)
 
 
 def redact_health_report_for_recovery(report: dict) -> dict:
@@ -21,7 +31,8 @@ def redact_health_report_for_recovery(report: dict) -> dict:
 
     Per-record detail is replaced with a count so an unauthenticated caller
     cannot enumerate filesystem paths or learning text; non-sensitive liveness
-    fields (afm_loop, faiss_cache_age_seconds, vector_backend_lag) are retained.
+    fields (afm_loop, faiss_cache_age_seconds, vector_backend_lag,
+    inbox_quarantine — aggregate counts only, no file paths) are retained.
     Returns a new dict; the input is not mutated.
     """
     redacted = dict(report)
@@ -43,6 +54,12 @@ class HealthContext:
     latency_snapshot: Callable[[], dict]
     metrics_snapshot: Callable[[], dict]
     afm_loop_enabled: Callable[[Any], bool]
+    # W2 (health opacity): delta-aware counters + derived flags + the exception
+    # ring buffer. Defaulted so tests/legacy wiring that construct a HealthContext
+    # without them keep working (status just omits the self-diagnosing extras).
+    metrics_delta_snapshot: Callable[[], dict] = lambda: {}
+    health_flags: Callable[[dict], list] = lambda deltas: []
+    recent_errors: Callable[[], list] = lambda: []
     increment_request_count: Callable[[], None] | None = None
     request_count: Callable[[], int] = lambda: 0
     start_time: Callable[[], float] = lambda: time.time()
@@ -50,6 +67,9 @@ class HealthContext:
     sovereign_db: Callable[..., Any] = SovereignDB
     default_config: Any = field(default_factory=lambda: DEFAULT_CONFIG)
     logger: logging.Logger = logger
+    # P0-B (2026-07-19 blackout): lets status surface the live engine's
+    # vector_model_down flag. Optional so tests/legacy wiring keep working.
+    retrieval_engine: Callable[[], Any] | None = None
 
 
 def faiss_cache_status(config=DEFAULT_CONFIG) -> tuple[Path, bool]:
@@ -136,6 +156,20 @@ def handle_status(params: dict, request_id: Any, context: HealthContext) -> dict
                 pass
 
     _, faiss_ok = faiss_cache_status(context.default_config)
+    # P0-B: faiss_ok only proves the index FILE exists. The query encoder can
+    # still be down (recall silently FTS-only for 14.8h in the 2026-07-18
+    # session) — surface the engine's flag so the two states are separable.
+    # "ok" here means "no failed encode attempt yet", not a live probe (a
+    # probe would force a multi-second model load inside status).
+    vector_model = "unknown"
+    if context.retrieval_engine is not None:
+        try:
+            _eng = context.retrieval_engine()
+            vector_model = (
+                "DOWN" if getattr(_eng, "vector_model_down", False) else "ok"
+            )
+        except Exception:
+            vector_model = "unknown"
     try:
         from minni.afm_provider import afm_runtime_status
 
@@ -150,20 +184,57 @@ def handle_status(params: dict, request_id: Any, context: HealthContext) -> dict
 
     uptime = time.time() - context.start_time()
     metrics = context.metrics_snapshot()
+    # W2: delta-aware view (compute once so the baseline advances exactly once)
+    # + derived flags, so status is self-diagnosing instead of a bare int.
+    # Review r2 (P2) + r3 (P2): consuming the single global delta baseline is
+    # EXPLICIT-OPT-IN, not implicit in identity. The shipped SessionStart/hook
+    # path calls status over the local UDS as a stamped (non-recovery, often
+    # operator) principal, so "identified ⇒ consume" still let routine
+    # background polls swallow an errors.search burst and clear
+    # errors_search_rising before a human ever looked. Now a caller must (a) be
+    # dispatch-stamped non-recovery (`_recovery` is False — trusted flag, not
+    # spoofable), (b) be an operator/govern principal (same bar as the
+    # un-redacted health_report), and (c) explicitly ask via
+    # `consume_deltas: true`. Everything else — hooks, recovery, pre-identity,
+    # plain status — peeks, so deltas read "since last explicit operator
+    # consume" (or since daemon start). Legacy zero-arg context wiring keeps
+    # the old always-consume behavior via the TypeError fallback.
+    from minni.principal import EffectivePrincipal, is_operator_principal
+
+    stamped_principal = params.get("_principal")
+    consume = (
+        params.get("_recovery") is False
+        and params.get("consume_deltas") is True
+        and isinstance(stamped_principal, EffectivePrincipal)
+        and is_operator_principal(stamped_principal)
+    )
+    try:
+        deltas = context.metrics_delta_snapshot(consume=consume)
+    except TypeError:
+        deltas = context.metrics_delta_snapshot()
+    flags = context.health_flags(deltas)
+    started_at = datetime.fromtimestamp(
+        context.start_time(), tz=timezone.utc
+    ).isoformat()
     return context.make_response({
         "daemon": {
             "version": context.version,
+            "pid": os.getpid(),
+            "started_at": started_at,
             "uptime_seconds": round(uptime, 1),
             "requests_served": context.request_count(),
             "socket_path": "[redacted]",
             "latencies": context.latency_snapshot(),
             "errors": metrics.get("errors", 0),
             "counters": metrics,
+            "counter_deltas": deltas,
+            "health_flags": flags,
         },
         "engine": {
             "db_ok": db_ok,
             "db_path": "[redacted]",
             "faiss_ok": faiss_ok,
+            "vector_model": vector_model,
             "faiss_path": "[redacted]",
             "stats": db_stats,
             "audit_volume": audit_vol,
@@ -181,6 +252,16 @@ def handle_health_report(params: dict, request_id: Any, context: HealthContext) 
         "never_recalled": [],
         "contradicting_learnings": [],
         "vector_backend_lag": [],
+        # W3 (audit §4 / consolidation inbox residue): operator-visible
+        # recovery surface for files parked in <inbox>/quarantine/ (see
+        # afm_passes.inbox_quarantine). Aggregate-only (count + reason
+        # breakdown + oldest timestamp) — no file paths, so this stays
+        # outside _HEALTH_REPORT_SENSITIVE_KEYS like vector_backend_lag.
+        "inbox_quarantine": {"count": 0, "oldest_quarantined_at": None, "by_reason": {}},
+        # W2: last-N dispatch exceptions so a climbing errors.<method> counter is
+        # attributable. Sensitive (messages can embed paths/payloads) — redacted
+        # to a count for any non-operator caller via _HEALTH_REPORT_SENSITIVE_KEYS.
+        "recent_errors": context.recent_errors(),
         "faiss_cache_age_seconds": faiss_cache_age_seconds(context.default_config),
         "afm_loop": {
             "last_run_per_pass": {},
@@ -283,6 +364,47 @@ def handle_health_report(params: dict, request_id: Any, context: HealthContext) 
                         })
             except Exception as exc:
                 report["vector_backend_lag"].append({"status": "unknown", "error": str(exc)})
+
+        try:
+            # Filesystem-native like the rest of this subsystem (no DB round
+            # trip needed — quarantined files by definition never got a
+            # candidate_packets row). Own try/except so a scan failure cannot
+            # take down the rest of the report.
+            from minni.afm_passes.inbox_ingest import discover_inboxes
+
+            q_count = 0
+            oldest: Optional[str] = None
+            by_reason: dict[str, int] = {}
+            for inbox in discover_inboxes(context.default_config):
+                q_dir = inbox / "quarantine"
+                if not q_dir.is_dir():
+                    continue
+                for reason_path in q_dir.glob("*.reason.json"):
+                    q_count += 1
+                    try:
+                        payload = json.loads(reason_path.read_text(encoding="utf-8"))
+                    except Exception:
+                        payload = {}
+                    reason = str(payload.get("reason") or "unknown")
+                    by_reason[reason] = by_reason.get(reason, 0) + 1
+                    qat = payload.get("quarantined_at")
+                    if isinstance(qat, str) and (oldest is None or qat < oldest):
+                        oldest = qat
+            report["inbox_quarantine"] = {
+                "count": q_count,
+                "oldest_quarantined_at": oldest,
+                "by_reason": by_reason,
+            }
+        except Exception as exc:
+            # Review r3 (P2): exception class only — OSError messages embed the
+            # quarantine/sidecar filesystem path, and this block deliberately
+            # sits OUTSIDE _HEALTH_REPORT_SENSITIVE_KEYS (aggregate-only
+            # contract), so a raw str(exc) would survive recovery/non-operator
+            # redaction and leak local paths.
+            report["inbox_quarantine"] = {
+                "status": "unknown",
+                "error": type(exc).__name__,
+            }
     except Exception as exc:
         context.logger.warning("health_report degraded: %s", exc)
         report["error"] = str(exc)

@@ -251,6 +251,7 @@ class WikiIndexer:
         target_map = self.parser.get_wikilink_targets(wiki_path)
 
         wiki_root_resolved = Path(wiki_path).resolve()
+        from minni.path_safety import path_within_root
 
         # Collect current files on disk
         disk_files: Dict[str, float] = {}
@@ -258,7 +259,6 @@ class WikiIndexer:
             for fname in files:
                 if fname.endswith(".md") and not fname.startswith('.'):
                     full = Path(root) / fname
-                    from minni.path_safety import path_within_root
                     if not path_within_root(full, wiki_root_resolved):
                         continue
                     full_resolved = str(full.resolve())
@@ -365,8 +365,17 @@ class WikiIndexer:
 
                     now = time.time()
 
-                    # Agent tag: 'wiki' for provenance, plus page type
-                    agent_tag = f"wiki:{page.frontmatter.page_type}" if not is_meta else "wiki:meta"
+                    # Agent tag: 'wiki:<type>' for provenance. Session pages carry
+                    # an owning agent: frontmatter field (PAGE_TYPES.md) — stamp
+                    # that identity so can_read_document can same-agent-match
+                    # instead of treating every session as shared wiki:session.
+                    if not is_meta and page.frontmatter.page_type == "session":
+                        owner = str(page.frontmatter.raw.get("agent") or "").strip()
+                        agent_tag = owner if owner else "wiki:session"
+                    elif not is_meta:
+                        agent_tag = f"wiki:{page.frontmatter.page_type}"
+                    else:
+                        agent_tag = "wiki:meta"
 
                     # PR-2: page_status and privacy_level from frontmatter
                     page_status = page.frontmatter.status if not is_meta else "accepted"
@@ -468,10 +477,25 @@ class WikiIndexer:
                         os.path.basename(source_path), link_count
                     )
 
-            # Phase 3: Remove wiki pages no longer on disk
-            c.execute("SELECT doc_id, path, agent FROM documents WHERE agent LIKE 'wiki:%'")
+            # Phase 3: Remove wiki pages no longer on disk.
+            # Include page_type='session' rows stamped with the owning agent
+            # (no longer agent LIKE 'wiki:%') so ownership stamping does not
+            # orphan deleted session pages in FTS/documents. Constrain to this
+            # wiki root so non-wiki session documents elsewhere are untouched.
+            c.execute(
+                """
+                SELECT doc_id, path, agent FROM documents
+                WHERE agent LIKE 'wiki:%' OR page_type = 'session'
+                """
+            )
             for row in c.fetchall():
-                if row["path"] not in disk_files:
+                try:
+                    row_resolved = Path(row["path"]).resolve()
+                except Exception:
+                    continue
+                if not path_within_root(row_resolved, wiki_root_resolved):
+                    continue
+                if str(row_resolved) not in disk_files and row["path"] not in disk_files:
                     c.execute("DELETE FROM documents WHERE doc_id = ?", (row["doc_id"],))
                     c.execute("DELETE FROM vault_fts WHERE doc_id = ?", (row["doc_id"],))
                     c.execute("DELETE FROM chunk_embeddings WHERE doc_id = ?", (row["doc_id"],))

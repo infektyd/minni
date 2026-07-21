@@ -29,7 +29,8 @@ import os
 import sys
 import threading
 import time
-from typing import Dict
+from collections import deque
+from typing import Dict, List
 
 LOGGER_NAME = "minnid"
 
@@ -131,6 +132,10 @@ class Counters:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._counts: Dict[str, int] = {}
+        # Baseline captured on the previous ``delta_snapshot`` call, so a status
+        # caller sees change-since-last-look rather than a bare cumulative int
+        # (a monotonic counter conflates "never happened" with "long ago").
+        self._previous: Dict[str, int] = {}
 
     def incr(self, name: str, amount: int = 1) -> None:
         with self._lock:
@@ -144,12 +149,94 @@ class Counters:
         with self._lock:
             return dict(self._counts)
 
+    def delta_snapshot(self, consume: bool = True) -> Dict[str, Dict[str, int]]:
+        """Return ``{name: {"total": n, "delta": n - previous}}`` and advance
+        the baseline. ``delta`` is "since the previous ``delta_snapshot`` call"
+        — a caller-driven polling interval, NOT a per-second rate. Read and
+        baseline-swap happen under one lock so two concurrent status RPCs cannot
+        each read a stale ``previous`` and double-count the same delta.
+
+        ``consume=False`` returns the same view WITHOUT advancing the baseline
+        (review r2 / W2): recovery/pre-identity status polls must not be able
+        to zero out ``counter_deltas`` and suppress ``errors_search_rising``
+        before an operator looks.
+        """
+        with self._lock:
+            result = {
+                name: {"total": total, "delta": total - self._previous.get(name, 0)}
+                for name, total in self._counts.items()
+            }
+            if consume:
+                self._previous = dict(self._counts)
+            return result
+
     def reset(self) -> None:
         with self._lock:
             self._counts.clear()
+            self._previous.clear()
+
+
+# Named health flags raised when a counter's delta since the previous snapshot
+# crosses its threshold. Semantics are "N more since you last looked" (interval
+# = your poll cadence), so a flag names a rising trend, not a rate.
+_HEALTH_FLAG_THRESHOLDS: Dict[str, tuple[int, str]] = {
+    "errors": (10, "errors_rising"),
+    "errors.search": (3, "errors_search_rising"),
+}
+
+
+def health_flags(deltas: Dict[str, Dict[str, int]]) -> List[str]:
+    """Derive named boolean health flags from a ``delta_snapshot`` mapping.
+
+    Pure over its input so a status handler can compute deltas once (advancing
+    the baseline exactly once) and pass them here without a second swap.
+    """
+    flags: List[str] = []
+    for name, (threshold, flag) in _HEALTH_FLAG_THRESHOLDS.items():
+        entry = deltas.get(name)
+        if entry and entry.get("delta", 0) >= threshold:
+            flags.append(flag)
+    return flags
+
+
+class ErrorRing:
+    """Bounded ring of the most recent dispatch exceptions.
+
+    Makes a climbing ``errors.<method>`` counter attributable to concrete
+    failures instead of an opaque number. Each entry is the exception class +
+    a truncated message + a timestamp. This is a SENSITIVE surface — an
+    exception message can embed a filesystem path or payload — so it is exposed
+    only to operator callers, gated by the same redaction path as the other
+    per-record health_report keys.
+    """
+
+    _MESSAGE_MAX = 500
+
+    def __init__(self, maxlen: int = 20) -> None:
+        self._lock = threading.Lock()
+        self._ring: deque = deque(maxlen=maxlen)
+
+    def record(self, method: str, exc: BaseException) -> None:
+        entry = {
+            "method": str(method),
+            "exc_class": type(exc).__name__,
+            "message": str(exc)[: self._MESSAGE_MAX],
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+        with self._lock:
+            self._ring.append(entry)
+
+    def snapshot(self) -> List[dict]:
+        with self._lock:
+            return list(self._ring)
+
+    def reset(self) -> None:
+        with self._lock:
+            self._ring.clear()
 
 
 METRICS = Counters()
+ERRORS = ErrorRing()
 
 
 def incr(name: str, amount: int = 1) -> None:
@@ -160,3 +247,21 @@ def incr(name: str, amount: int = 1) -> None:
 def metrics_snapshot() -> Dict[str, int]:
     """Return a copy of all global counters for status/diagnostics surfaces."""
     return METRICS.snapshot()
+
+
+def metrics_delta_snapshot(consume: bool = True) -> Dict[str, Dict[str, int]]:
+    """Return the global counters' change since the previous snapshot.
+
+    ``consume=False`` peeks without advancing the baseline (recovery polls).
+    """
+    return METRICS.delta_snapshot(consume=consume)
+
+
+def record_error(method: str, exc: BaseException) -> None:
+    """Record a dispatch exception into the global ring for attribution."""
+    ERRORS.record(method, exc)
+
+
+def recent_errors() -> List[dict]:
+    """Return the most-recent captured dispatch exceptions (operator-gated)."""
+    return ERRORS.snapshot()

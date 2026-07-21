@@ -325,22 +325,59 @@ def run(cmd: list[str], cwd: Path | None = None) -> None:
     subprocess.run(cmd, cwd=str(cwd) if cwd else None, check=True)
 
 
+# Root-level files GENERATED into a shared install root by per-platform config
+# steps (not present in the source tree). gemini/antigravity and grok all share
+# ~/.agents/plugins/minni@minni; a later platform's copy_tree must not delete
+# the manifest an earlier platform just wrote (e.g. `--platform all` runs
+# gemini then grok).
+GENERATED_INSTALL_FILES = ("gemini-extension.json",)
+
+
 def copy_tree(source: Path, dest: Path) -> None:
     if not source.exists():
         raise SystemExit(f"Missing plugin source: {source}")
     dest.parent.mkdir(parents=True, exist_ok=True)
     rsync = shutil.which("rsync")
     if rsync:
-        run([rsync, "-a", "--delete", "--exclude", "node_modules", f"{source}/", f"{dest}/"])
+        cmd = [rsync, "-a", "--delete", "--exclude", "node_modules"]
+        for name in GENERATED_INSTALL_FILES:
+            cmd += ["--exclude", name]
+        run(cmd + [f"{source}/", f"{dest}/"])
         return
+    preserved = {
+        name: (dest / name).read_bytes()
+        for name in GENERATED_INSTALL_FILES
+        if (dest / name).exists()
+    }
     if dest.exists():
         shutil.rmtree(dest)
     shutil.copytree(source, dest, ignore=shutil.ignore_patterns("node_modules", ".git"))
+    for name, blob in preserved.items():
+        (dest / name).write_bytes(blob)
 
 
 def write_json(path: Path, data: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+
+
+def _mirror_codex_hook_env(env: dict, agent: str) -> None:
+    """Mirror the resolved generic identity into MINNI_CODEX_* for codex.
+
+    The Codex hook entrypoint is Codex-native: it reads only MINNI_CODEX_*
+    (never the generic MINNI_* the MCP server uses). Without the mirror, an
+    install with a custom MINNI_VAULT_PATH would leave hooks writing audit/
+    inbox/handoff state under the default ~/.minni/codex-vault while the MCP
+    server points at the configured vault. Mirror AFTER surface preservation
+    so the hooks track whatever vault the install actually resolved.
+    """
+    if agent != "codex":
+        return
+    env.setdefault("MINNI_CODEX_AGENT_ID", env.get("MINNI_AGENT_ID", "codex"))
+    if "MINNI_VAULT_PATH" in env:
+        env.setdefault("MINNI_CODEX_VAULT_PATH", env["MINNI_VAULT_PATH"])
+    if "MINNI_WORKSPACE_ID" in env:
+        env.setdefault("MINNI_CODEX_WORKSPACE_ID", env["MINNI_WORKSPACE_ID"])
 
 
 def load_json(path: Path) -> dict:
@@ -388,7 +425,7 @@ def replace_toml_sections(path: Path, sections: dict[str, str], *, preserve_surf
                 expected_agent = fresh_env.get("MINNI_AGENT_ID")
                 if expected_agent:
                     ex_env = _validate_preserved_identity(ex_env, expected_agent)
-                preserved_lines = []
+                resolved_env: dict = {}
                 for k in (
                     "MINNI_AGENT_ID",
                     "MINNI_VAULT_PATH",
@@ -398,12 +435,19 @@ def replace_toml_sections(path: Path, sections: dict[str, str], *, preserve_surf
                     "MINNI_AFM_NATIVE_HELPER",
                 ):
                     if k in ex_env:
-                        val = ex_env[k]
+                        resolved_env[k] = ex_env[k]
                     elif k in fresh_env:
-                        val = fresh_env[k]
-                    else:
-                        continue
-                    preserved_lines.append(f'{k} = "{_toml_basic_str(val)}"')
+                        resolved_env[k] = fresh_env[k]
+                # Codex hook mirror survives flagless upgrades: the fresh
+                # section carries MINNI_CODEX_* only for the codex surface, so
+                # its presence is the surface signal. Re-derive from the
+                # RESOLVED generic identity (never carried raw from ex_env —
+                # X2) so hooks track whatever vault survived preservation.
+                if any(k.startswith("MINNI_CODEX_") for k in fresh_env):
+                    _mirror_codex_hook_env(resolved_env, "codex")
+                preserved_lines = [
+                    f'{k} = "{_toml_basic_str(v)}"' for k, v in resolved_env.items()
+                ]
                 if preserved_lines:
                     sections["mcp_servers.minni.env"] = "[mcp_servers.minni.env]\n" + "\n".join(preserved_lines)
         except Exception:
@@ -450,6 +494,7 @@ def mcp_json(server_path: Path, agent: str, vault: Path, socket_path: Path, work
                 env[k] = ex_env[k]
         if "MINNI_WORKSPACE_ID" in ex_env and not explicit_workspace:
             env["MINNI_WORKSPACE_ID"] = ex_env["MINNI_WORKSPACE_ID"]
+    _mirror_codex_hook_env(env, agent)
     return {
         "mcpServers": {
             "minni": {
@@ -824,6 +869,15 @@ def update_toml_mcp_config(path: Path, server_path: Path, agent: str, vault: Pat
                 f'MINNI_VAULT_PATH = "{_toml_basic_str(vault)}"\n'
                 f'MINNI_SOCKET_PATH = "{_toml_basic_str(socket_path)}"\n'
                 f'MINNI_WORKSPACE_ID = "{_toml_basic_str(normalize_workspace_id(str(workspace)))}"'
+                # The Codex hook entrypoint reads only MINNI_CODEX_* — mirror
+                # the configured identity so hooks and MCP share one vault.
+                + (
+                    f'\nMINNI_CODEX_AGENT_ID = "{_toml_basic_str(agent)}"\n'
+                    f'MINNI_CODEX_VAULT_PATH = "{_toml_basic_str(vault)}"\n'
+                    f'MINNI_CODEX_WORKSPACE_ID = "{_toml_basic_str(normalize_workspace_id(str(workspace)))}"'
+                    if agent == "codex"
+                    else ""
+                )
                 + "".join(f'\n{k} = "{_toml_basic_str(v)}"' for k, v in (afm_env or {}).items())
             ),
         },
@@ -883,13 +937,13 @@ def platform_spec(platform: str, repo_root: Path, install_root: str | None = Non
         },
         "gemini": {
             "agent": "gemini",
-            "install": home / ".gemini/extensions/minni",
+            "install": home / ".agents/plugins/minni@minni",
             "config_kind": "gemini-manifest",
         },
         "antigravity": {
             # CLI `agy` + IDE + antigravity, all agent id `gemini`, shared ~/.gemini tree.
             "agent": "gemini",
-            "install": home / ".gemini/extensions/minni",
+            "install": home / ".agents/plugins/minni@minni",
             "config_kind": "antigravity",
         },
         "grok": {

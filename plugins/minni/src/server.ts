@@ -19,8 +19,10 @@ import {
   isSharedGateUnavailable,
   handoffMemory,
   identityDenialFrom,
+  isDaemonResultEmpty,
   learnMemory,
   listPendingHandoffs,
+  recallCrossAgentDegrade,
   recallMemory,
   recallResponseText,
   recoveryRouteFrom,
@@ -294,7 +296,12 @@ server.registerTool(
     inputSchema: {
       task: z.string().min(1),
       agents: z.array(teamAgentSchema).optional(),
-      coordinatorAgentId: z.string().optional(),
+      // G11: coordinatorAgentId removed from the model-facing schema (model no
+      // longer supplies the coordinator identity). A caller-supplied name would
+      // otherwise drive every temp agent's daemon recall (team.ts) as the wire
+      // agent_id on the daemon search RPC and resolve to another platform's
+      // provisioned principal — a cross-agent read bypass. The server stamps
+      // DEFAULT_AGENT_ID below, matching minni_recall / minni_prepare_task.
       workspaceId: z.string().optional(),
       profile: z.enum(["compact", "standard", "deep"]).optional(),
       limit: z.number().int().min(1).max(12).optional(),
@@ -305,7 +312,6 @@ server.registerTool(
   async ({
     task,
     agents,
-    coordinatorAgentId,
     workspaceId,
     profile,
     limit,
@@ -314,13 +320,13 @@ server.registerTool(
   }) => {
     const gated = await requireSharedGate("team.runtime", {
       agents: agents?.length ?? 0,
-      coordinatorAgentId,
+      coordinatorAgentId: DEFAULT_AGENT_ID,
     });
     if (gated) return gated;
     const packet = await buildTeamRuntime({
       task,
       agents,
-      coordinatorAgentId,
+      coordinatorAgentId: DEFAULT_AGENT_ID, // G11: server-side default only (model no longer supplies coordinator identity)
       workspaceId,
       vaultPath: DEFAULT_VAULT_PATH,
       profile,
@@ -516,14 +522,19 @@ server.registerTool(
       agentId: DEFAULT_AGENT_ID, // G11: server-side default only (model no longer supplies agentId)
     });
     const daemonOk = result.ok && !!result.data;
+    // W5 (punch-list #1): a daemon that ANSWERED with zero hits is still
+    // daemonOk (JSON-RPC success) — detect that case separately from a true
+    // outage so shouldPrescanVault can widen its offline-fallback trigger to
+    // cover it too, keeping minni_recall no blinder than prepare_task.
+    const daemonEmpty = daemonOk && isDaemonResultEmpty(result.data);
     // An identity denial is not a daemon outage: whether it carries a recovery
     // route (#132 P1) or is a routeless -32004 like reserved_agent_id (#132 P2),
     // the daemon ANSWERED — skip the unscoped offline pre-scan and surface the
-    // diagnostic instead of the "Daemon unavailable" framing.
-    const identityDenied =
-      recoveryRouteFrom(result.data) !== undefined ||
-      identityDenialFrom(result.data) !== undefined;
-    const vaultResults = !identityDenied && shouldPrescanVault(daemonOk, includeVault !== false)
+    // diagnostic instead of the "Daemon unavailable" framing. A denial is a
+    // REFUSAL, not an empty, so it must never be OR'd into daemonEmpty above.
+    const denial = identityDenialFrom(result.data);
+    const identityDenied = recoveryRouteFrom(result.data) !== undefined || denial !== undefined;
+    const vaultResults = !identityDenied && shouldPrescanVault(daemonOk, includeVault !== false, daemonEmpty)
       ? filterSafeVaultResults(
           await searchVaultNotes(
             effectiveVaultPath,
@@ -532,7 +543,17 @@ server.registerTool(
           ),
         )
       : [];
-    const responseText = recallResponseText(query, result, vaultResults);
+    // W5 (punch-list #4c): on a cross_agent capability denial specifically —
+    // and only when the ORIGINAL request itself asked for cross_agent — retry
+    // in-band at personal scope instead of returning a bare error. Falls
+    // through to the normal (reworded, #4b) denial text when the degrade
+    // path doesn't apply or the retry itself comes up empty/failed.
+    const degradeText = await recallCrossAgentDegrade(
+      { query, layer, limit, workspaceId: workspaceId ?? DEFAULT_WORKSPACE_ID, agentId: DEFAULT_AGENT_ID },
+      cross_agent === true,
+      denial,
+    );
+    const responseText = degradeText ?? recallResponseText(query, result, vaultResults);
     await recordAudit(effectiveVaultPath, {
       tool: "minni_recall",
       summary: query,
@@ -547,6 +568,7 @@ server.registerTool(
         includeVault: includeVault !== false,
         vaultMatches: vaultResults.map((match) => match.relativePath),
         error: result.error,
+        crossAgentDegraded: degradeText !== undefined,
       },
     });
     return textResult(responseText);
@@ -781,6 +803,10 @@ server.registerTool(
       const indexResult = await jsonRpcSocketRequestWithFallback("vault_index_doc", {
         content: fullContent,
         path: note.relativePath,
+        // agent_id is the field the daemon's provenance_claim() reads; without
+        // it the request resolves to the default principal and the ownership
+        // check degrades indexing (P0-D, 2026-07-19 recall blackout).
+        agent_id: DEFAULT_AGENT_ID,
         agent: DEFAULT_AGENT_ID,
         sigil: "📄",
         privacy_level: "safe",
@@ -1162,6 +1188,19 @@ const planSliceInputSchema = z.object({
   evidence: z.string().optional(),
 });
 
+// Punch-list §4b: shelf_ref was accepted end-to-end by createPlan/normalizeShelfRef
+// already, but never exposed on the MCP schema, so shelfDrift() (minni_plan_status)
+// always reported configured:false. Additive/optional nested object (no union) —
+// existing callers that omit shelf_ref are unaffected.
+const planShelfRefInputSchema = z.object({
+  agent: z.string().optional(),
+  wikilink: z.string().optional(),
+  pull_hint: z.string().optional(),
+  approx_tokens: z.number().optional(),
+  shelf_hash: z.string().optional(),
+  shelf_content: z.string().optional(),
+});
+
 server.registerTool(
   "minni_plan_create",
   {
@@ -1174,9 +1213,10 @@ server.registerTool(
       slices: z.array(planSliceInputSchema).optional(),
       open_questions: z.array(z.string()).optional(),
       seed_scar_from_audit: z.boolean().optional(),
+      shelf_ref: planShelfRefInputSchema.optional(),
     },
   },
-  async ({ goal, constraints, slices, open_questions, seed_scar_from_audit }) => {
+  async ({ goal, constraints, slices, open_questions, seed_scar_from_audit, shelf_ref }) => {
     const gated = await requireSharedGate("plan.create", { slices: slices?.length ?? 0 });
     if (gated) return gated;
     const effectiveVaultPath = DEFAULT_VAULT_PATH;
@@ -1186,7 +1226,7 @@ server.registerTool(
       scar_tissue = extractScarTissue(tail.entries);
     }
     const { plan, write, displaced_active } = await createPlan(
-      { goal, constraints, slices, open_questions, scar_tissue, vaultPath: effectiveVaultPath },
+      { goal, constraints, slices, open_questions, scar_tissue, shelf_ref, vaultPath: effectiveVaultPath },
       { vaultPath: effectiveVaultPath },
     );
     return textResult(

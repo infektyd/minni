@@ -70,9 +70,14 @@ async def dispatch_request(request: dict, context: DispatchContext) -> dict:
             result = await handler(params, request_id)
         else:
             result = await asyncio.to_thread(handler, params, request_id)
-    except Exception:
+    except Exception as exc:
         context.obs.incr("errors")
         context.obs.incr(f"errors.{method_name}")
+        # Record the exception identity so a climbing errors.<method> counter is
+        # attributable. Guarded so a minimal obs stub (incr-only) still works.
+        record_error = getattr(context.obs, "record_error", None)
+        if record_error is not None:
+            record_error(method_name, exc)
         context.logger.exception("dispatch failed for method %s", method_name)
         raise
 

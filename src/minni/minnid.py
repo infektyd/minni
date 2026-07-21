@@ -56,6 +56,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import signal
 import sys
 import time
@@ -548,7 +549,35 @@ def _trace_ring():
 
 # ── JSON-RPC 2.0 server ──────────────────────────────────────────────────
 
-VERSION = "0.1.0"
+def _resolve_version() -> str:
+    """Resolve the daemon version dynamically; never raise.
+
+    pyproject.toml is authoritative. Prefer the installed distribution's
+    metadata (``importlib.metadata.version("minni")``, matches pyproject in the
+    repo's editable .venv); fall back to reading pyproject.toml relative to this
+    module (from-source / non-installed checkout, resolved off __file__ not cwd
+    since a daemon may run from anywhere); finally a non-crashing "unknown".
+    """
+    try:
+        import importlib.metadata as _im
+
+        return _im.version("minni")
+    except Exception:
+        pass
+    try:
+        pyproject = Path(__file__).resolve().parents[2] / "pyproject.toml"
+        text = pyproject.read_text(encoding="utf-8")
+        match = re.search(
+            r'(?m)^version\s*=\s*["\']([^"\']+)["\']', text
+        )
+        if match:
+            return match.group(1)
+    except Exception:
+        pass
+    return "unknown"
+
+
+VERSION = _resolve_version()
 _start_time = 0.0
 _request_count = 0
 _LATENCY_METHODS = ("search", "learn", "read", "embedding", "cross_encoder", "afm")
@@ -834,6 +863,9 @@ def _health_context() -> HealthContext:
         guard_vault_root=_guard_vault_root,
         latency_snapshot=_latency_snapshot,
         metrics_snapshot=obs.metrics_snapshot,
+        metrics_delta_snapshot=obs.metrics_delta_snapshot,
+        health_flags=obs.health_flags,
+        recent_errors=obs.recent_errors,
         afm_loop_enabled=_afm_loop_enabled,
         increment_request_count=_increment_ops_request_count,
         request_count=lambda: _request_count,
@@ -842,6 +874,7 @@ def _health_context() -> HealthContext:
         sovereign_db=SovereignDB,
         default_config=DEFAULT_CONFIG,
         logger=logger,
+        retrieval_engine=_lazy_retrieval,
     )
 
 
@@ -977,6 +1010,24 @@ def _handle_vault_index_doc(params: dict, request_id: Any) -> dict:
     return _runtime_handle_vault_index_doc(params, request_id, _vault_index_context())
 
 
+def _handle_cache_reload(params: dict, request_id: Any) -> dict:
+    """In-band, govern-gated equivalent of the SIGHUP cache flush (W2).
+
+    Agents previously had no in-band way to invalidate identity/runtime caches
+    after an operator edited a principals/*.json file — they shelled out to
+    launchctl kickstart, which does not even clear the right cache. This routes
+    through the SAME _reload_runtime_config() effect the SIGHUP handler uses, so
+    the RPC and signal paths can never drift. It requires the 'govern' capability
+    (see RPC_CAPABILITY_REQUIREMENTS) and is intentionally absent from
+    RECOVERY_ALLOWED_METHODS: a pre-identity caller must not be able to force
+    thundering-herd cache re-resolution.
+    """
+    _reload_runtime_config()
+    return _make_response(
+        {"cleared": ["agent_scope_for", "vault_retrieval"]}, request_id
+    )
+
+
 # Method registry
 _METHODS: Dict[str, callable] = {
     "ping":                   _handle_ping,
@@ -1010,6 +1061,8 @@ _METHODS: Dict[str, callable] = {
     "status":                 _handle_status,
     "health_report":          _handle_health_report,
     "hygiene_report":         _handle_hygiene_report,
+    # W2: in-band cache flush (govern-gated; NOT recovery-allowed).
+    "cache_reload":           _handle_cache_reload,
 }
 
 # ── Unix socket server ───────────────────────────────────────────────────

@@ -72,6 +72,12 @@ PRINCIPALS_DIR: Path = Path(CANONICAL_SOVEREIGN_HOME) / "principals"
 # uniformly (no synthesis override, aliases respected, etc.).
 CANONICAL_PRINCIPAL_NAMES: tuple[str, ...] = ("local", "default", "operator", "main")
 OPERATOR_RESERVED_AGENT_IDS: tuple[str, ...] = ("operator", "main")
+# Fail-closed vault-roots sentinel for platform agents whose
+# platform_agent_vault_roots entry is present but empty/malformed: a non-empty
+# roots list that can never contain a real document (empty roots + caps would
+# otherwise vacuous-allow every path via allows_vault_root). can_read_document
+# must treat a roots list made ONLY of this sentinel as "no valid roots".
+PLATFORM_NO_ROOTS_SENTINEL = "/.minni-platform-no-vault-roots"
 
 
 def _has_any_principal_files(d: Path) -> bool:
@@ -520,6 +526,54 @@ def resolve_effective_principal(
                 resolved_caps = platform_caps_map[supplied]
             else:
                 resolved_caps = []
+            # Finding 6 residual: never copy the operator stamp's vault roots onto a
+            # platform agent. Optional per-id map; a present-but-empty/malformed entry
+            # → fail-closed sentinel (empty+caps would otherwise vacuous-allow every
+            # path via allows_vault_root; a string value must not be iterated as chars).
+            # A MISSING entry is not a lockout: existing installs using only
+            # platform_agent_ids + platform_agent_capabilities predate the roots map,
+            # and their platform principals must keep pathed access to their own
+            # ~/.minni/<agent>-vault (both the literal id and the dashless alias the
+            # installer uses, e.g. claude-code → claudecode-vault). Never the
+            # operator's roots.
+            _PLATFORM_NO_ROOTS = [PLATFORM_NO_ROOTS_SENTINEL]
+
+            def _default_platform_roots(agent_id: str) -> list[str]:
+                minni_home = Path(
+                    os.environ.get("MINNI_HOME") or (Path.home() / ".minni")
+                ).expanduser()
+                names = {f"{agent_id}-vault", f"{agent_id.replace('-', '')}-vault"}
+                roots = [str((minni_home / n).resolve()) for n in sorted(names)]
+                if agent_id == "gemini":
+                    # The installer's vault_for("gemini") deliberately falls
+                    # back to the legacy ~/.gemini/minni-vault when it has data
+                    # and the canonical vault is missing (propagate.py). A
+                    # strict install upgraded without platform_agent_vault_roots
+                    # would otherwise stamp MCP with the legacy path while the
+                    # daemon principal rejects it via allows_vault_root.
+                    roots.append(
+                        str(Path("~/.gemini/minni-vault").expanduser().resolve())
+                    )
+                return roots
+
+            platform_roots = raw.get("platform_agent_vault_roots") or {}
+            platform_roots_map = (
+                platform_roots if isinstance(platform_roots, dict) else {}
+            )
+            if supplied in platform_roots_map:
+                raw_roots = platform_roots_map[supplied]
+                if not isinstance(raw_roots, list) or not raw_roots:
+                    resolved_roots = list(_PLATFORM_NO_ROOTS)
+                else:
+                    resolved_roots = [
+                        str(Path(r).expanduser().resolve())
+                        for r in raw_roots
+                        if isinstance(r, str) and r.strip()
+                    ]
+                    if not resolved_roots:
+                        resolved_roots = list(_PLATFORM_NO_ROOTS)
+            else:
+                resolved_roots = _default_platform_roots(supplied)
             raw_ws = raw.get("workspace_id")
             resolved_ws = raw_ws if raw_ws is not None else stamped.workspace_id
             return EffectivePrincipal(
@@ -528,7 +582,7 @@ def resolve_effective_principal(
                 session_id=raw.get("session_id"),
                 transport=transport,
                 capabilities=list(resolved_caps),
-                allowed_vault_roots=stamped.allowed_vault_roots,
+                allowed_vault_roots=resolved_roots,
             )
 
     # Check legacy aliases declared across ALL principal files that exist (union).
@@ -636,18 +690,39 @@ def can_read_document(
     if not isinstance(doc_metadata, dict):
         return False
 
-    # Workspace scoping (doc or call can use '*' for shared cross-ws)
-    doc_ws = str(
+    # Ownership is computed up front because the workspace and path gates
+    # below both need it: legacy indexer rows (empty workspace_id, relative
+    # path) are owner-readable but stay fail-closed for everyone else.
+    _agent_early = str(
+        doc_metadata.get("agent") or doc_metadata.get("sigil") or "unknown"
+    ).strip()
+    _page_type_early = str(doc_metadata.get("page_type") or "").lower()
+    same_agent = _agent_early == principal.agent_id and not (
+        _page_type_early == "session" and _agent_early.lower() == "unknown"
+    )
+
+    # Workspace scoping (doc or call can use '*' for shared cross-ws).
+    # An EMPTY/missing doc workspace is a legacy unstamped row — treat it as
+    # owner-wildcard: the writing agent can still recall it from any named
+    # workspace, but it is NOT '*' for foreign readers.
+    doc_ws_raw = (
         doc_metadata.get("workspace_id")
         or doc_metadata.get("workspace")
         or doc_metadata.get("ws")
-        or "default"
     )
+    doc_ws = str(doc_ws_raw or "default")
     call_ws = str(workspace or "default")
     if doc_ws != "*" and call_ws != "*" and doc_ws != call_ws:
-        return False
+        if not (same_agent and not doc_ws_raw):
+            return False
 
-    # Vault root containment (realpath, symlink-aware, via G12)
+    # Vault root containment (realpath, symlink-aware, via G12).
+    # Absolute paths are root-checked as before (same-agent escape via an
+    # absolute path outside the allowed roots stays denied). Relative paths
+    # cannot be meaningfully resolved here (they would resolve against the
+    # daemon cwd): a same-agent relative path is trusted as within the agent's
+    # own vault (the path was stamped by the indexer, not the caller); a
+    # foreign relative path is denied fail-closed.
     path = (
         doc_metadata.get("path")
         or doc_metadata.get("source")
@@ -655,7 +730,26 @@ def can_read_document(
     )
     if path:
         try:
-            if not principal.allows_vault_root(path):
+            if Path(path).expanduser().is_absolute():
+                if not principal.allows_vault_root(path):
+                    return False
+            elif not principal.allowed_vault_roots:
+                # Mirror allows_vault_root's unrestricted-principal semantics:
+                # empty roots + capabilities = no path restriction; empty roots
+                # + no capabilities = fail-closed.
+                if not principal.capabilities:
+                    return False
+            elif not same_agent:
+                return False
+            elif all(
+                r == PLATFORM_NO_ROOTS_SENTINEL
+                for r in principal.allowed_vault_roots
+            ):
+                # Review r2 (P2): a roots list holding ONLY the fail-closed
+                # sentinel means the operator explicitly zeroed this platform
+                # agent's vault roots — the same-agent shortcut for legacy
+                # relative-path rows must not bypass that; deny like the
+                # no-valid-roots state it represents.
                 return False
         except Exception:
             return False
@@ -671,14 +765,36 @@ def can_read_document(
     agent = str(
         doc_metadata.get("agent") or doc_metadata.get("sigil") or "unknown"
     ).strip()
+    agent_l = agent.lower()
+    page_type = str(doc_metadata.get("page_type") or "").lower()
 
-    # Same-agent → visible (if vault/privacy passed).
-    if agent == principal.agent_id:
+    # Same-agent → visible (if vault/privacy passed). Exception: the legacy
+    # "unknown" sentinel must not count as a real owner for session pages — a
+    # principal literally named "unknown" must not inherit every unattributed
+    # session via the same-agent shortcut.
+    if agent == principal.agent_id and not (
+        page_type == "session" and agent_l == "unknown"
+    ):
         return True
+
+    # Finding 10: session notes are agent-scoped. Deny foreign sessions BEFORE
+    # the legacy agent="unknown" grant — otherwise unattributed sessions with
+    # missing agent metadata become cross-agent readable.
+    if (
+        page_type == "session"
+        or agent_l == "wiki:session"
+        or agent_l.startswith("session:")
+    ):
+        # Operators may still audit (governance) below.
+        if not is_operator_principal(principal):
+            return False
+
     # Legacy "unknown"-attributed docs are visible to any *capable* principal,
     # but never to a default-deny stamp (no capabilities AND no vault roots = an
     # unknown/unauthorized identity). allows_vault_root already gates pathed docs
     # for default-deny; this also closes pathless agent="unknown" docs. (B2.)
+    # Session pages already handled above — unknown+session never reaches here
+    # for non-operators.
     if agent == "unknown" and (principal.capabilities or principal.allowed_vault_roots):
         return True
 
@@ -693,12 +809,12 @@ def can_read_document(
 
     # Shared wiki / handoff / synthesis / decision pages are intentionally cross-visible
     # when the principal's vault roots allow the path and the page is not private.
-    page_type = str(doc_metadata.get("page_type") or "").lower()
+    # (session deliberately excluded — see above.)
     if (
-        page_type in {"wiki", "handoff", "synthesis", "decision", "session"}
-        or agent.lower().startswith(("wiki:", "handoff"))
-        or "wiki" in agent.lower()
-        or "handoff" in agent.lower()
+        page_type in {"wiki", "handoff", "synthesis", "decision"}
+        or agent_l.startswith(("wiki:", "handoff"))
+        or "wiki" in agent_l
+        or "handoff" in agent_l
     ):
         return True
 

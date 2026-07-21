@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import logging
 import os
 import time
@@ -6,9 +7,15 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
+import minni.obs as obs
 from minni.config import DEFAULT_CONFIG
 from minni.db import SovereignDB
-from minni.principal import EffectivePrincipal, is_operator_principal, validate_agent_id
+from minni.principal import (
+    OPERATOR_RESERVED_AGENT_IDS,
+    EffectivePrincipal,
+    is_operator_principal,
+    validate_agent_id,
+)
 from minni.safety import is_instruction_like
 
 
@@ -102,7 +109,9 @@ def promote_candidate_durable(candidate_id: int, reason: str, context: AFMContex
                 (candidate_id,),
             )
             c.execute(
-                "SELECT 1 FROM consolidation_actions WHERE action_type='afm_review' AND claim=? LIMIT 1",
+                """SELECT 1 FROM consolidation_actions
+                   WHERE action_type='afm_review' AND claim=?
+                     AND COALESCE(status, '') != 'superseded' LIMIT 1""",
                 (str(candidate_id),),
             )
             if not c.fetchone():
@@ -232,7 +241,9 @@ def mark_candidate_review(candidate_id: int, reason: str, context: AFMContext) -
         if not row or row["status"] != "proposed":
             return False
         c.execute(
-            "SELECT 1 FROM consolidation_actions WHERE action_type='afm_review' AND claim=? LIMIT 1",
+            """SELECT 1 FROM consolidation_actions
+               WHERE action_type='afm_review' AND claim=?
+                 AND COALESCE(status, '') != 'superseded' LIMIT 1""",
             (str(candidate_id),),
         )
         if c.fetchone():
@@ -325,13 +336,13 @@ def handle_daemon_compile(params: dict, request_id: Any, context: AFMContext) ->
     db = None
     try:
         pass_runners = {
-            "session_distillation": "afm_passes.session_distillation",
-            "synthesis": "afm_passes.synthesis",
-            "procedure_extraction": "afm_passes.procedure_extraction",
-            "reorganization": "afm_passes.reorganization",
-            "pruning": "afm_passes.pruning",
-            "consolidation": "afm_passes.consolidation",
-            "vault_ingest": "afm_passes.vault_ingest",
+            "session_distillation": "minni.afm_passes.session_distillation",
+            "synthesis": "minni.afm_passes.synthesis",
+            "procedure_extraction": "minni.afm_passes.procedure_extraction",
+            "reorganization": "minni.afm_passes.reorganization",
+            "pruning": "minni.afm_passes.pruning",
+            "consolidation": "minni.afm_passes.consolidation",
+            "vault_ingest": "minni.afm_passes.vault_ingest",
         }
         if pass_name not in pass_runners:
             return context.make_error(-32602, f"unsupported pass_name: {pass_name}", request_id)
@@ -339,12 +350,47 @@ def handle_daemon_compile(params: dict, request_id: Any, context: AFMContext) ->
         db = context.sovereign_db(context.default_config)
         pass_module = __import__(pass_runners[pass_name], fromlist=["run"])
 
+        # Finding 9: bind AFM passes to the stamped caller principal when present
+        # (not only MINNI_AGENT_ID / config.agent_id), so dry-run compile cannot
+        # pull another agent's episodic events into model-visible inputs.
+        # Regression guard: the background loop stamps agent_id="afm-loop" for
+        # the wet-run operator gate, and unstamped local callers synthesize an
+        # operator-reserved id ("main"/"operator"). None of these identities is
+        # a data owner — binding a pass to them scopes it to zero events and the
+        # compile silently distills nothing. Fall through to env/config/unknown
+        # inside the pass for every non-owner identity; only real agent
+        # principals (codex, gemini, ...) bind the pass to themselves.
+        _NON_OWNER_BIND_IDS = frozenset(OPERATOR_RESERVED_AGENT_IDS) | {"afm-loop"}
+        stamped_for_bind = params.get("_principal")
+        compile_agent_id = None
+        if isinstance(stamped_for_bind, EffectivePrincipal):
+            if stamped_for_bind.agent_id not in _NON_OWNER_BIND_IDS:
+                compile_agent_id = stamped_for_bind.agent_id
+
+        run_kwargs = {
+            "vault_path": vault_path,
+            "dry_run": dry_run,
+            "trace_id": trace_id,
+        }
+        # Passes that accept agent_id get it. inspect can fail on exotic wrappers —
+        # log and leave unbound (pass falls back to env/config/unknown) rather
+        # than crashing the compile RPC.
+        try:
+            run_params = inspect.signature(pass_module.run).parameters
+        except (TypeError, ValueError):
+            context.logger.warning(
+                "daemon.compile: could not inspect %s.run for agent_id; "
+                "leaving unbound (pass falls back to env/config/unknown)",
+                pass_runners[pass_name],
+            )
+        else:
+            if "agent_id" in run_params:
+                run_kwargs["agent_id"] = compile_agent_id
+
         result = pass_module.run(
             db,
             context.default_config,
-            vault_path=vault_path,
-            dry_run=dry_run,
-            trace_id=trace_id,
+            **run_kwargs,
         )
         if not dry_run and result.get("drafts"):
             from minni.afm_writer import submit_drafts
@@ -454,6 +500,11 @@ async def afm_loop_runner(context: AFMContext):
                     # log_only/do_not_store, never deletes. Failure here must NOT
                     # block consolidation of the existing queue.
                     if (cfg or {}).get("ingest_inbox", True):
+                        # Defined ahead of the try so a failure inside it (e.g.
+                        # the ingest call itself raising) leaves this an empty
+                        # dict rather than undefined — the quarantine check
+                        # right below reads it unconditionally.
+                        _skips: dict = {}
                         try:
                             from minni.afm_passes.inbox_ingest import ingest as _ingest_inbox
                             # Reuse the daemon's shared handle: SovereignDB
@@ -489,6 +540,44 @@ async def afm_loop_runner(context: AFMContext):
                                 "AFM loop: inbox ingest raised (skipped; "
                                 "consolidation continues)"
                             )
+                        # W3 (audit §4 / consolidation inbox residue): an
+                        # _agent_mismatch skip is PERMANENT — the same file
+                        # produces the identical skip on every future tick, so
+                        # left alone it just piles up invisibly forever (the
+                        # 59-file unknown-vault/inbox cohort). Quarantine it
+                        # once stale instead. Scoped to _agent_mismatch ONLY;
+                        # _malformed_kind/_unrecognized are different bugs and
+                        # are not drained here. Failure here must NOT block
+                        # consolidation of the existing queue.
+                        if (cfg or {}).get("ingest_inbox", True) and _skips.get("_agent_mismatch"):
+                            try:
+                                from minni.afm_passes.inbox_quarantine import (
+                                    quarantine_stale_agent_mismatch,
+                                )
+                                _q = quarantine_stale_agent_mismatch(
+                                    context.default_config,
+                                    fallback_principal=str((cfg or {}).get(
+                                        "inbox_fallback_principal", "unknown")),
+                                    ttl_days=(cfg or {}).get("inbox_quarantine_ttl_days"),
+                                )
+                                if _q.get("quarantined"):
+                                    # Fail-LOUD: a climbing global counter
+                                    # (surfaced on status.daemon.counters,
+                                    # obs.py's existing metrics-snapshot path)
+                                    # plus a WARNING log line, so stale residue
+                                    # is visible on every status call instead
+                                    # of silently accumulating.
+                                    obs.incr("inbox_quarantined_total", _q["quarantined"])
+                                    context.logger.warning(
+                                        "AFM loop: quarantined %d stale "
+                                        "_agent_mismatch inbox file(s): %s",
+                                        _q["quarantined"], _q["quarantined_files"],
+                                    )
+                            except Exception:
+                                context.logger.exception(
+                                    "AFM loop: inbox quarantine raised (skipped; "
+                                    "consolidation continues)"
+                                )
                     max_batches = int((cfg or {}).get("max_batches_per_tick", 40))
                     batches = total_examined = 0
                     last_summ = None

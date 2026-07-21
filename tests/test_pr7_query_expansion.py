@@ -200,6 +200,7 @@ def test_minnid_search_forwards_expand_and_summarize(monkeypatch):
 
 def test_neighborhood_summary_degrades_when_afm_unavailable(monkeypatch, tmp_path):
     import minni.retrieval as retrieval
+    from minni.principal import EffectivePrincipal
 
     engine, db_obj, _ = _make_db(tmp_path)
     doc_id, _ = _insert_doc(
@@ -216,6 +217,7 @@ def test_neighborhood_summary_degrades_when_afm_unavailable(monkeypatch, tmp_pat
     )
     monkeypatch.setattr(retrieval, "summarize_with_afm", lambda *args, **kwargs: None)
     monkeypatch.setattr(engine, "_semantic_search", lambda query, limit: [])
+    principal = EffectivePrincipal(agent_id="unknown", capabilities=["search", "read"])
 
     results = engine.retrieve(
         "Entity",
@@ -224,6 +226,7 @@ def test_neighborhood_summary_degrades_when_afm_unavailable(monkeypatch, tmp_pat
         summarize_neighborhood=True,
         depth="chunk",
         budget_tokens=False,
+        principal=principal,
     )
 
     assert results[0]["doc_id"] == doc_id
@@ -233,6 +236,7 @@ def test_neighborhood_summary_degrades_when_afm_unavailable(monkeypatch, tmp_pat
 
 def test_neighborhood_summary_uses_afm_when_available(monkeypatch, tmp_path):
     import minni.retrieval as retrieval
+    from minni.principal import EffectivePrincipal
 
     engine, db_obj, _ = _make_db(tmp_path)
     _insert_doc(
@@ -249,6 +253,7 @@ def test_neighborhood_summary_uses_afm_when_available(monkeypatch, tmp_path):
     )
     monkeypatch.setattr(retrieval, "summarize_with_afm", lambda prompt: "Linked context summary.")
     monkeypatch.setattr(engine, "_semantic_search", lambda query, limit: [])
+    principal = EffectivePrincipal(agent_id="unknown", capabilities=["search", "read"])
 
     results = engine.retrieve(
         "Entity",
@@ -257,6 +262,7 @@ def test_neighborhood_summary_uses_afm_when_available(monkeypatch, tmp_path):
         summarize_neighborhood=True,
         depth="chunk",
         budget_tokens=False,
+        principal=principal,
     )
 
     assert results[0]["neighborhood_summary"]["status"] == "ok"

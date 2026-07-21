@@ -23,7 +23,9 @@ import logging
 import hashlib
 import importlib.util
 import re
+import sqlite3
 import sys
+import threading
 from pathlib import Path
 from typing import Any, List, Dict, Literal, Optional, Sequence, Tuple
 
@@ -58,6 +60,45 @@ _TYPE_TO_AUTHORITY = {
     "entity": "vault",
     "synthesis": "concept",
 }
+
+
+# --- vault_fts vtable DDL race (punch-list §2, fix (c)) --------------------
+# The vault_fts virtual table is reconstructed via its FTS5 xConnect callback
+# whenever a concurrent schema-cookie bump (another SovereignDB instance/process
+# running schema init) moves the schema version mid-flight. A read racing that
+# reconstruction can surface a transient "vtable constructor failed: vault_fts"
+# (or "database schema has changed"). Retry the read a bounded number of times
+# with a short backoff, then re-raise so genuine failures still fail loud. Only
+# the two known transient message families are retried; every other
+# OperationalError (e.g. a real SQL/syntax error) propagates immediately.
+_FTS_RETRY_ATTEMPTS = 3
+_FTS_RETRY_BACKOFFS = (0.05, 0.1, 0.2)
+_FTS_TRANSIENT_MARKERS = ("vtable constructor failed", "schema has changed")
+
+
+def _fts_execute_with_retry(cursor, sql, params, *, attempts: int = _FTS_RETRY_ATTEMPTS):
+    """Execute a vault_fts MATCH select on ``cursor`` AND fetch its rows, with
+    bounded retry on the transient schema-cookie / vtable-reconnect race.
+    Returns the fetched rows. The fetch lives INSIDE the retry window (review
+    r3, P2): SQLite can raise "database schema has changed" / "vtable
+    constructor failed" while STEPPING the SELECT, i.e. during fetchall() after
+    a successful execute(), so retrying execute alone still let the race
+    surface at the call sites' fetch. Re-raises the last OperationalError after
+    the budget is exhausted (fail-loud contract)."""
+    last_exc: Optional[sqlite3.OperationalError] = None
+    for attempt in range(attempts):
+        try:
+            cursor.execute(sql, params)
+            return cursor.fetchall()
+        except sqlite3.OperationalError as exc:
+            if not any(m in str(exc).lower() for m in _FTS_TRANSIENT_MARKERS):
+                raise
+            last_exc = exc
+            if attempt + 1 >= attempts:
+                break
+            time.sleep(_FTS_RETRY_BACKOFFS[min(attempt, len(_FTS_RETRY_BACKOFFS) - 1)])
+    assert last_exc is not None  # only reachable after catching a transient error
+    raise last_exc
 
 
 def _query_class(query: str) -> str:
@@ -272,9 +313,47 @@ class RetrievalEngine:
         self._feedback_cache = {}
         self._feedback_cache_loaded_at = 0.0
         self.last_trace_id: Optional[str] = None
+        # P0-B (2026-07-19 blackout): the semantic leg must never die silently.
+        # Set when _semantic_search finds no embedding model; cleared when the
+        # model comes back. Surfaced by status/recall so an FTS-only session is
+        # visible instead of masquerading as healthy.
+        self.vector_model_down: bool = False
+        # P0-A contract: when the read-authorization gate suppresses a
+        # non-empty candidate set to zero, the reason is recorded so the caller
+        # can return a diagnostic envelope instead of a bare [].
+        # Review r4 (P2): dispatch runs each `search` RPC in its own worker
+        # thread while `_lazy_retrieval()` hands every request the SAME process-
+        # wide RetrievalEngine. A plain instance attribute is therefore shared
+        # mutable state — a concurrent request's retrieve() could overwrite or
+        # clear this in the window between another request's retrieve() returning
+        # and its handler reading it, so an auth-suppressed caller could get a
+        # bare zero-hit answer (or another caller's diagnostic). Back it with
+        # thread-local storage: within one request the set-in-retrieve()/read-in-
+        # handler pair runs on a single thread, so each request sees only its own
+        # suppression regardless of what concurrent requests do on other threads.
+        self._auth_suppression_local = threading.local()
         # recall-F3: the correction-class type set is config-invariant — compute
         # it once here instead of once per scored doc in _score_merged_doc.
         self._correction_types = _correction_class_page_types(config)
+
+    @property
+    def last_auth_suppression(self) -> Optional[Dict]:
+        """Per-thread P0-A read-gate suppression from the last retrieve() on
+        THIS thread. Thread-local so concurrent `search` RPCs sharing this
+        process-wide engine never read each other's (or a cleared) diagnostic.
+        Defaults to None on a thread that has not run a gated retrieve() yet."""
+        local = getattr(self, "_auth_suppression_local", None)
+        return getattr(local, "value", None) if local is not None else None
+
+    @last_auth_suppression.setter
+    def last_auth_suppression(self, value: Optional[Dict]) -> None:
+        # Lazy-init the backing store so instances built via object.__new__
+        # (test fakes that bypass __init__) still get a working thread-local.
+        local = getattr(self, "_auth_suppression_local", None)
+        if local is None:
+            local = threading.local()
+            self._auth_suppression_local = local
+        local.value = value
 
     @property
     def model(self):
@@ -408,25 +487,43 @@ class RetrievalEngine:
 
         with self.db.cursor() as c:
             agent_clause = ""
-            params: list = [safe_query]
+            scope_params: list = []
             if agent_scope:
                 agent_clause = f" AND d.agent IN ({','.join('?' * len(agent_scope))})"
-                params.extend(agent_scope)
-            params.append(limit * 3)
-            c.execute(f"""
-                SELECT f.doc_id, d.path, d.agent, d.sigil,
-                       rank AS bm25_rank, d.decay_score,
-                       d.page_status, d.privacy_level, d.page_type,
-                       d.evidence_refs, d.indexed_at, d.layer
-                FROM vault_fts f
-                JOIN documents d ON d.doc_id = f.doc_id
-                WHERE vault_fts MATCH ?
-                {agent_clause}
-                ORDER BY rank
-                LIMIT ?
-            """, params)
+                scope_params.extend(agent_scope)
 
-            for row in c.fetchall():
+            def _match(match_expr: str):
+                # Fetch happens inside the retry helper (review r3): the
+                # vtable race can also fire while stepping the SELECT.
+                return _fts_execute_with_retry(c, f"""
+                    SELECT f.doc_id, d.path, d.agent, d.sigil,
+                           rank AS bm25_rank, d.decay_score,
+                           d.page_status, d.privacy_level, d.page_type,
+                           d.evidence_refs, d.indexed_at, d.layer
+                    FROM vault_fts f
+                    JOIN documents d ON d.doc_id = f.doc_id
+                    WHERE vault_fts MATCH ?
+                    {agent_clause}
+                    ORDER BY rank
+                    LIMIT ?
+                """, [match_expr, *scope_params, limit * 3])
+
+            # Strict pass first: FTS5 space-joined terms are implicit AND —
+            # precise when every term appears in the document. A dated/specific
+            # query ("checkpoint 2026-07-18 plan-…") almost never has ALL its
+            # tokens in the stored content, so a zero-hit AND query degrades to
+            # OR semantics: bm25 still ranks the document matching the most /
+            # rarest terms first, restoring recall without diluting queries the
+            # strict pass already answers (same contract as learnings_fts).
+            rows = _match(safe_query)
+            terms = safe_query.split()
+            if not rows and len(terms) > 1:
+                # Lowercase the operands: FTS5 matching is case-insensitive,
+                # but a literal uppercase "OR"/"AND"/"NOT" token from the query
+                # would be parsed as an operator and corrupt the expression.
+                rows = _match(" OR ".join(t.lower() for t in terms))
+
+            for row in rows:
                 results.append({
                     "doc_id": row["doc_id"],
                     "path": row["path"],
@@ -455,6 +552,33 @@ class RetrievalEngine:
             return ""
         return " ".join(words)
 
+    @staticmethod
+    def apply_read_gate(principal, workspace: str, merged: List[Dict]):
+        """G19 read gate with the H2 silent-empty contract (P0-A, 2026-07-19).
+
+        Filters ``merged`` through :func:`can_read_document`. When a NON-empty
+        candidate set is filtered to zero, returns a machine-readable
+        diagnostic instead of leaving the caller with a bare empty list —
+        an authorization blackout must be distinguishable from "nothing
+        matched".
+
+        Returns ``(filtered, suppression)`` where ``suppression`` is ``None``
+        unless every candidate was suppressed by scope.
+        """
+        filtered = [r for r in merged if can_read_document(principal, workspace, r)]
+        suppression = None
+        if merged and not filtered:
+            suppression = {
+                "pre_gate": len(merged),
+                "suppressed": len(merged),
+                "reason": (
+                    f"{len(merged)} candidates suppressed by scope: "
+                    f"principal={getattr(principal, 'agent_id', 'n/a')} "
+                    f"ws={workspace}"
+                ),
+            }
+        return filtered, suppression
+
     # ── FAISS Semantic Search ─────────────────────────────────
 
     def _semantic_search(
@@ -468,7 +592,17 @@ class RetrievalEngine:
         Returns best-chunk-per-doc with chunk text and heading context.
         """
         if not self.model:
+            # P0-B: fail loud. A missing encoder degrades every recall to
+            # lexical-only; logging once per outage (not per query) keeps the
+            # signal visible without flooding.
+            if not self.vector_model_down:
+                logger.warning(
+                    "semantic leg DOWN: embedding model unavailable — recall "
+                    "degraded to lexical (FTS) only until the encoder loads"
+                )
+            self.vector_model_down = True
             return []
+        self.vector_model_down = False
 
         query_emb = self.model.encode(query).astype(np.float32)
 
@@ -1731,36 +1865,49 @@ class RetrievalEngine:
         layer_set = self._normalize_layers(layers)
         start_ts = self._parse_iso_date(start_date)
         end_ts = self._parse_iso_date(end_date, end_of_day=True)
-        params = [safe_query]
+        filter_params: list = []
         clauses = ["vault_fts MATCH ?"]
         if layer_set:
             placeholders = ",".join("?" * len(layer_set))
             clauses.append(f"COALESCE(ce.layer, d.layer, 'knowledge') IN ({placeholders})")
-            params.extend(sorted(layer_set))
+            filter_params.extend(sorted(layer_set))
         if start_ts is not None:
             clauses.append("COALESCE(d.indexed_at, d.last_modified, ce.computed_at, 0) >= ?")
-            params.append(start_ts)
+            filter_params.append(start_ts)
         if end_ts is not None:
             clauses.append("COALESCE(d.indexed_at, d.last_modified, ce.computed_at, 0) <= ?")
-            params.append(end_ts)
-        params.append(limit)
+            filter_params.append(end_ts)
 
         with self.db.cursor() as c:
-            c.execute(f"""
-                SELECT ce.chunk_id, ce.doc_id, ce.chunk_text, ce.heading_context,
-                       d.path, d.agent, d.sigil, d.decay_score,
-                       d.page_status, d.privacy_level, d.page_type,
-                       d.evidence_refs, d.indexed_at,
-                       COALESCE(ce.layer, d.layer, 'knowledge') AS layer,
-                       COALESCE(d.indexed_at, d.last_modified, ce.computed_at, 0) AS created_at
-                FROM vault_fts f
-                JOIN documents d ON d.doc_id = f.doc_id
-                JOIN chunk_embeddings ce ON ce.doc_id = d.doc_id
-                WHERE {" AND ".join(clauses)}
-                ORDER BY created_at ASC, ce.chunk_id ASC
-                LIMIT ?
-            """, params)
-            rows = c.fetchall()
+            def _match(match_expr: str):
+                # Fetch happens inside the retry helper (review r3): the
+                # vtable race can also fire while stepping the SELECT.
+                return _fts_execute_with_retry(c, f"""
+                    SELECT ce.chunk_id, ce.doc_id, ce.chunk_text, ce.heading_context,
+                           d.path, d.agent, d.sigil, d.decay_score,
+                           d.page_status, d.privacy_level, d.page_type,
+                           d.evidence_refs, d.indexed_at,
+                           COALESCE(ce.layer, d.layer, 'knowledge') AS layer,
+                           COALESCE(d.indexed_at, d.last_modified, ce.computed_at, 0) AS created_at
+                    FROM vault_fts f
+                    JOIN documents d ON d.doc_id = f.doc_id
+                    JOIN chunk_embeddings ce ON ce.doc_id = d.doc_id
+                    WHERE {" AND ".join(clauses)}
+                    ORDER BY created_at ASC, ce.chunk_id ASC
+                    LIMIT ?
+                """, [match_expr, *filter_params, limit])
+
+            # P0-C parity (review r2): dated/specific chronological recalls hit
+            # this path instead of _fts_search, so they need the SAME zero-hit
+            # AND→OR degradation — space-joined FTS5 terms are implicit AND and
+            # a query like "checkpoint 2026-07-18 plan-…" rarely has ALL its
+            # tokens in one chunk. Operands lowercased for the same reason as
+            # _fts_search: a literal "OR"/"AND"/"NOT" token must not be parsed
+            # as an FTS5 operator.
+            rows = _match(safe_query)
+            terms = safe_query.split()
+            if not rows and len(terms) > 1:
+                rows = _match(" OR ".join(t.lower() for t in terms))
 
         return [
             {
@@ -1915,22 +2062,25 @@ class RetrievalEngine:
                     if row is not None:
                         break
                 if row is not None:
-                    # R4: neighborhood summaries are a read surface — gate every
-                    # linked doc through can_read_document so restricted/foreign/
-                    # blocked memory never leaks via the wikilink graph. When no
-                    # principal is supplied (legacy back-compat), fall through
-                    # ungated as before.
-                    if principal is not None:
-                        raw = {
-                            "doc_id": row["doc_id"],
-                            "path": row["path"],
-                            "agent": row["agent"],
-                            "privacy_level": row["privacy_level"],
-                            "page_type": row["page_type"],
-                            "page_status": row["page_status"],
-                        }
-                        if not can_read_document(principal, ws, raw):
-                            continue
+                    # R4 / Finding 10: neighborhood summaries are a read surface —
+                    # require a principal (fail closed) and gate every linked doc
+                    # through can_read_document + the same lifecycle exclusions
+                    # retrieve uses (draft/rejected/superseded/expired).
+                    if principal is None:
+                        continue
+                    raw = {
+                        "doc_id": row["doc_id"],
+                        "path": row["path"],
+                        "agent": row["agent"],
+                        "privacy_level": row["privacy_level"],
+                        "page_type": row["page_type"],
+                        "page_status": row["page_status"],
+                    }
+                    status = (row["page_status"] or "candidate").lower()
+                    if status in {"draft", "rejected", "superseded", "expired"}:
+                        continue
+                    if not can_read_document(principal, ws, raw):
+                        continue
                     contexts.append({
                         "link": link,
                         "doc_id": row["doc_id"],
@@ -2048,6 +2198,12 @@ class RetrievalEngine:
         if len(query_variants) > 1:
             total_t0 = time.perf_counter()
             per_variant = []
+            # Review r1 (P2): each recursive single-variant call below rewrites
+            # self.last_auth_suppression, so without accumulation the P0-A
+            # diagnostic only survives when the SUPPRESSING variant happens to
+            # run last. Collect per-variant suppressions and re-aggregate after
+            # the merge.
+            variant_suppressions: List[Dict] = []
             for variant in query_variants:
                 per_variant.append(self.retrieve(
                     query=variant,
@@ -2073,7 +2229,26 @@ class RetrievalEngine:
                     principal=principal,
                     workspace=workspace,
                 ))
+                if self.last_auth_suppression:
+                    variant_suppressions.append(
+                        {**self.last_auth_suppression, "variant": variant}
+                    )
             results = self._merge_expanded_results(per_variant, query_variants, limit)
+            # Aggregate: any variant whose non-empty candidate set was gated to
+            # zero keeps the blackout visible, regardless of variant order.
+            # (recall.py only surfaces it when the merged result is empty.)
+            if variant_suppressions:
+                total_pre = sum(s.get("pre_gate", 0) for s in variant_suppressions)
+                self.last_auth_suppression = {
+                    "pre_gate": total_pre,
+                    "suppressed": total_pre,
+                    "reason": "; ".join(
+                        str(s.get("reason", "")) for s in variant_suppressions
+                    ),
+                    "variants": [s.get("variant") for s in variant_suppressions],
+                }
+            else:
+                self.last_auth_suppression = None
             if summarize_neighborhood:
                 results = self._add_neighborhood_summaries(
                     results, principal=principal, workspace=workspace
@@ -2385,8 +2560,10 @@ class RetrievalEngine:
         # G19/G20: ws always defined (hoisted) so G22 envelope loop and legacy principal=None
         # paths never hit UnboundLocalError. Gate only when principal supplied.
         ws = workspace or getattr(principal, "workspace_id", "default") if principal is not None else (workspace or "default")
+        self.last_auth_suppression = None
         if principal is not None:
-            merged = [r for r in merged if can_read_document(principal, ws, r)]
+            merged, suppression = self.apply_read_gate(principal, ws, merged)
+            self.last_auth_suppression = suppression
 
         # G22: attach evidence-only envelope + instruction_like + provenance/reasoning to every result
         # Model-facing content is always wrapped; raw executable instructions never treated as policy.

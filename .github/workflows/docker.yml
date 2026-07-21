@@ -2,7 +2,9 @@
 # published to GHCR on version tags. Never built on a maintainer machine
 # (PACKAGING_PLAN.md §6.5 — local storage constraint).
 #
-# Secrets: none beyond the built-in GITHUB_TOKEN (GHCR login).
+# Secrets: none beyond the built-in GITHUB_TOKEN (GHCR login on the publish job).
+# Finding 2: PR builds use contents:read only; packages:write is publish-job only;
+# checkout never persists credentials into the build context.
 name: Docker
 
 on:
@@ -21,7 +23,6 @@ on:
 
 permissions:
   contents: read
-  packages: write
 
 jobs:
   build:
@@ -30,6 +31,8 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Build image
         run: docker build -t minni-eval:ci .
@@ -47,12 +50,41 @@ jobs:
           done
           docker rm -f minni-smoke
 
-      - name: Log in to GHCR
+      - name: Export image for publish job
         if: startsWith(github.ref, 'refs/tags/v')
+        run: docker save minni-eval:ci -o /tmp/minni-eval-ci.tar
+
+      - name: Upload image artifact
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-artifact@v4
+        with:
+          name: minni-eval-image
+          path: /tmp/minni-eval-ci.tar
+          retention-days: 1
+
+  publish:
+    name: Push eval image to GHCR
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Download image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: minni-eval-image
+          path: /tmp
+
+      - name: Load image
+        run: docker load -i /tmp/minni-eval-ci.tar
+
+      - name: Log in to GHCR
         run: echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
 
       - name: Push versioned + latest tags
-        if: startsWith(github.ref, 'refs/tags/v')
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           IMAGE="ghcr.io/${{ github.repository }}"

@@ -439,11 +439,11 @@ def cmd_compile(args):
         return
 
     pass_runners = {
-        "session_distillation": "afm_passes.session_distillation",
-        "synthesis": "afm_passes.synthesis",
-        "procedure_extraction": "afm_passes.procedure_extraction",
-        "reorganization": "afm_passes.reorganization",
-        "pruning": "afm_passes.pruning",
+        "session_distillation": "minni.afm_passes.session_distillation",
+        "synthesis": "minni.afm_passes.synthesis",
+        "procedure_extraction": "minni.afm_passes.procedure_extraction",
+        "reorganization": "minni.afm_passes.reorganization",
+        "pruning": "minni.afm_passes.pruning",
     }
     if pass_name not in pass_runners:
         print(json.dumps({"status": "error", "error": f"unsupported pass: {pass_name}"}, indent=2))
