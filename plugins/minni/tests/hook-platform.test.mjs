@@ -13,6 +13,7 @@ import {
   codexWire,
   grokBuildWire,
   kilocodeWire,
+  geminiWire,
   renderIntent,
   wireFor,
 } from "../dist/hook-platform.js";
@@ -118,4 +119,27 @@ test("a note on Grok Build is dropped, not silently discarded", () => {
   // Grok parses stdout only on the Stop gate; a note has no other channel.
   const { dropped } = renderIntent(grokBuildWire, noteIntent("hello"));
   assert.equal(dropped, undefined, "notes probe the Stop channel, which Grok parses");
+});
+
+test("agy: injectSteps is valid on SessionStart but NOT on Stop", () => {
+  // Verified live against agy 1.1.7: SessionStart accepted the injectSteps
+  // payload, while Stop rejected it -- its output is a different proto.
+  //     failed to unmarshal result from hook jsonhook__minni_Stop_0_0 via
+  //     protojson: ... unknown field "injectSteps"
+  const steps = (out) => out?.injectSteps?.[0]?.ephemeralMessage;
+
+  assert.equal(steps(geminiWire.inject("SessionStart", "memory")), "memory");
+  assert.equal(steps(geminiWire.inject("UserPromptSubmit", "memory")), "memory");
+  assert.equal(geminiWire.inject("Stop", "memory"), null);
+  assert.equal(geminiWire.note("Stop", "2 candidates"), null);
+
+  // agy has no `continue` field at all; its no-op is a bare {}.
+  assert.deepEqual(geminiWire.noop(), {});
+});
+
+test("agy: a Stop note is dropped and recorded, never emitted as a parse error", () => {
+  const { output, dropped } = renderIntent(geminiWire, noteIntent("2 candidates"));
+
+  assert.deepEqual(output, {}, "must emit agy's bare no-op, not injectSteps");
+  assert.ok(dropped, "the undeliverable note must be recorded");
 });

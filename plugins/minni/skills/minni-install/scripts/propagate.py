@@ -1599,7 +1599,7 @@ def main() -> int:
     p_verify.set_defaults(func=verify)
 
     p_update = sub.add_parser("update-plugin", help="Build/copy the canonical plugin and stamp platform-specific agent/vault/socket config.")
-    p_update.add_argument("--platform", required=True, help="codex, claude-code, kilocode, gemini, antigravity, grok, generic, or all")
+    p_update.add_argument("--platform", required=True, help="codex, claude-code, kilocode, gemini, antigravity, grok, cursor, generic, or all")
     p_update.add_argument("--agent", type=valid_agent_id, help="Override agent id; required for generic platforms")
     p_update.add_argument("--install-root", help="Required for --platform generic; optional override for known platforms")
     p_update.add_argument("--workspace", help="Explicit MINNI_WORKSPACE_ID (and surface env) to stamp. If omitted (flagless), and the target config already has surface env keys (MINNI_AGENT_ID/VAULT_PATH/SOCKET_PATH/WORKSPACE_ID), those are preserved (belt-and-suspenders); only the plugin server pointer (command/args/cwd) is refreshed. Falls back to --repo for fresh targets. Explicit --workspace forces the value.")

@@ -197,9 +197,15 @@ export const geminiWire: PlatformWire = {
   noop: () => ({}),
   inject: (event, text) =>
     AGY_INJECTABLE.has(event) ? { injectSteps: [{ ephemeralMessage: text }] } : null,
-  // agy has no systemMessage channel. An ephemeralMessage is the closest
-  // equivalent and is at least visible in-conversation.
-  note: (_event, text) => ({ injectSteps: [{ ephemeralMessage: text }] }),
+  // agy has no systemMessage channel, and `injectSteps` is NOT universal --
+  // its Stop output is a different proto (decision/reason) that rejects the
+  // field outright. Caught live on agy 1.1.7:
+  //     failed to unmarshal result from hook jsonhook__minni_Stop_0_0 via
+  //     protojson: ... unknown field "injectSteps"
+  // So a note only lands where injectSteps is actually valid; anywhere else it
+  // is dropped and recorded rather than emitted into a parse error.
+  note: (event, text) =>
+    AGY_INJECTABLE.has(event) ? { injectSteps: [{ ephemeralMessage: text }] } : null,
   lastTaskText: (payload) =>
     // agy's Stop payload carries no task text at all. gemini-adapter.ts
     // back-fills `last_user_message` from agy's own transcript_full.jsonl, so
