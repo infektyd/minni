@@ -122,7 +122,7 @@ test("renderIntent reports no drop when the platform can carry the intent", () =
 });
 
 test("renderIntent passes notes and no-ops through", () => {
-  const note = renderIntent(claudeCodeWire, noteIntent("2 candidates drafted"));
+  const note = renderIntent(claudeCodeWire, noteIntent("Stop", "2 candidates drafted"));
   assert.equal(note.output.systemMessage, "2 candidates drafted");
   assert.equal(note.dropped, undefined);
 
@@ -133,7 +133,7 @@ test("renderIntent passes notes and no-ops through", () => {
 
 test("a note on Grok Build is dropped, not silently discarded", () => {
   // Grok parses stdout only on the Stop gate; a note has no other channel.
-  const { dropped } = renderIntent(grokBuildWire, noteIntent("hello"));
+  const { dropped } = renderIntent(grokBuildWire, noteIntent("Stop", "hello"));
   assert.equal(dropped, undefined, "notes probe the Stop channel, which Grok parses");
 });
 
@@ -154,7 +154,7 @@ test("agy: injectSteps is valid on SessionStart but NOT on Stop", () => {
 });
 
 test("agy: a Stop note is dropped and recorded, never emitted as a parse error", () => {
-  const { output, dropped } = renderIntent(geminiWire, noteIntent("2 candidates"));
+  const { output, dropped } = renderIntent(geminiWire, noteIntent("Stop", "2 candidates"));
 
   assert.deepEqual(output, {}, "must emit agy's bare no-op, not injectSteps");
   assert.ok(dropped, "the undeliverable note must be recorded");
@@ -178,7 +178,7 @@ test("Cursor injects at sessionStart only, and notes ride followup_message", () 
 });
 
 test("Cursor: a Stop note is dropped, never sent as followup_message", () => {
-  const { output, dropped } = renderIntent(cursorWire, noteIntent("1 candidate drafted"));
+  const { output, dropped } = renderIntent(cursorWire, noteIntent("Stop", "1 candidate drafted"));
 
   assert.equal(
     output.followup_message,
@@ -231,4 +231,24 @@ test("every platform's audit prefix is distinct and namespaced", async () => {
     assert.ok(!seen.has(found), `${file}: duplicate audit prefix ${found}`);
     seen.add(found);
   }
+});
+
+test("a note is rendered against ITS OWN event, not a hard-coded Stop", () => {
+  // The note path used to probe wire.note("Stop", ...) whatever the real event
+  // was. That is correct only by accident -- notes happen to be raised in one
+  // place. Anywhere else it answered the wrong question, in both directions:
+  // dropping a note agy could carry at SessionStart, and reporting SUCCESS for
+  // one Grok Build silently discards (its passive-event stdout is ignored).
+
+  // agy CAN carry a note at SessionStart, so it must not be dropped.
+  const agySession = renderIntent(geminiWire, noteIntent("SessionStart", "hi"));
+  assert.equal(agySession.output.injectSteps?.[0]?.ephemeralMessage, "hi");
+  assert.equal(agySession.dropped, undefined);
+
+  // Grok CANNOT carry one at SessionStart -- stdout is discarded there. This
+  // must be recorded as a drop, not reported as delivered.
+  const grokSession = renderIntent(grokBuildWire, noteIntent("SessionStart", "hi"));
+  assert.deepEqual(grokSession.output, { continue: true });
+  assert.ok(grokSession.dropped, "a note Grok will discard must be recorded as dropped");
+  assert.equal(grokSession.dropped.event, "SessionStart");
 });

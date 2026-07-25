@@ -275,14 +275,16 @@ export function renderIntent(wire: PlatformWire, intent: HookIntent): RenderedIn
   if (intent.kind === "none") return { output: wire.noop() };
 
   if (intent.kind === "note") {
-    // Notes are addressed to the human; there is no event context to place
-    // them against, so probe the platform's most permissive channel.
-    const noted = wire.note("Stop", intent.text);
+    // Probe the note channel for the event actually being handled. This used to
+    // hard-code "Stop", which was right only because notes happen to be raised
+    // in one place; anywhere else it both dropped deliverable notes and, on Grok
+    // Build, reported success for output the platform silently discards.
+    const noted = wire.note(intent.event, intent.text);
     return noted
       ? { output: noted }
       : {
           output: wire.noop(),
-          dropped: { event: "note", reason: `${wire.id} has no human-facing note channel` },
+          dropped: { event: intent.event, reason: `${wire.id} has no note channel on ${intent.event}` },
         };
   }
 

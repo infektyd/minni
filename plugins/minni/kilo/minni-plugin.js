@@ -9,15 +9,14 @@ const pending = new Map();
 // its learn candidate on and fell back to the bare session id. The prompt is
 // already computed in chat.message -- stash it and carry it to Stop.
 const lastPrompt = new Map();
-// The per-session map is NOT reliable here: Kilo fires session.deleted while
-// the session is still live, which runs lastPrompt.delete() and empties the map
-// before session.idle arrives. Instrumented and confirmed -- at Stop the map
-// was empty while the prompt had definitely been stashed:
-//     stopKey=ses_06632e4d0ffe...  mapKeys=(empty)  any=Without reading any...
-// It was never a key mismatch. CLI sessions are serial, so a keyless fallback
-// is both correct and immune to the delete; the map is kept only as a
-// best-effort first choice if sessions ever interleave.
-let lastPromptAny = "";
+// Kilo fires session.deleted while the session is still live, which used to
+// clear this map before session.idle arrived, leaving Stop with no task text.
+// The first fix added an UNKEYED fallback -- but that leaks: with two sessions
+// interleaved, session A's Stop would pick up session B's prompt and write
+// another conversation's text into A's vault candidate. A per-session map that
+// simply does NOT honor the premature delete is correct and cannot cross
+// sessions. Bounded so a long-lived process cannot grow it without limit.
+const LAST_PROMPT_MAX = 64;
 
 function hookContext(result) {
   return result?.hookSpecificOutput?.additionalContext || result?.systemMessage || "";
@@ -90,8 +89,12 @@ const MinniPlugin = async ({ directory }) => ({
       .map((part) => part.text)
       .join("\n");
     if (prompt) {
+      // Re-inserting moves it to the end, so the eviction below is LRU-ish.
+      lastPrompt.delete(input.sessionID);
       lastPrompt.set(input.sessionID, prompt.slice(0, 400));
-      lastPromptAny = prompt.slice(0, 400);
+      while (lastPrompt.size > LAST_PROMPT_MAX) {
+        lastPrompt.delete(lastPrompt.keys().next().value);
+      }
     }
     const result = await runHookFailOpen("UserPromptSubmit", {
       session_id: input.sessionID,
@@ -130,12 +133,11 @@ const MinniPlugin = async ({ directory }) => ({
         session_id: sessionID,
         workspace_id: directory,
         // Synthesized by this bridge, not by Kilo -- see kilocodeWire.lastTaskText.
-        last_user_message: lastPrompt.get(sessionID) || lastPromptAny || "",
+        last_user_message: lastPrompt.get(sessionID) ?? "",
       });
     } else if (event?.type === "session.deleted") {
       booted.delete(sessionID);
       pending.delete(sessionID);
-      lastPrompt.delete(sessionID);
     }
   },
 });

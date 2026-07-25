@@ -786,16 +786,24 @@ def update_claude_desktop_config(
         return {"installed": False, "reason": "Claude Desktop not installed (no Application Support/Claude)"}
 
     data = load_json(path)
-    data.setdefault("mcpServers", {})["minni"] = {
-        "command": "node",
-        "args": [str(server_path)],
-        "env": {
+    servers = data.setdefault("mcpServers", {})
+    previous = servers.get("minni") or {}
+    # Keep any env the user added by hand (tokens, log flags); only the MINNI_*
+    # keys we own are re-stamped. Replacing the whole entry would erase theirs.
+    env: dict[str, str] = dict(previous.get("env") or {})
+    env.update(
+        {
             "MINNI_AGENT_ID": agent,
             "MINNI_VAULT_PATH": str(vault),
             "MINNI_SOCKET_PATH": str(socket_path),
             "MINNI_WORKSPACE_ID": normalize_workspace_id(str(workspace)),
             **(afm_env or {}),
-        },
+        }
+    )
+    servers["minni"] = {
+        "command": previous.get("command") or "node",
+        "args": [str(server_path)],
+        "env": env,
     }
     write_json(path, data)
     return {"installed": True, "path": str(path), "agent": agent}
@@ -893,17 +901,28 @@ def update_cursor_hooks(install_root: Path) -> dict[str, object]:
         )
     )
     target = Path("~/.cursor/hooks.json").expanduser()
-    existing = load_json(target)
-    merged: dict[str, object] = {"version": 1}
-    hooks: dict[str, list] = dict(existing.get("hooks", {}) or {})
+
+    # Preserve the file: only `hooks` is ours. Rebuilding from a template would
+    # silently discard any other top-level key Cursor writes now or later.
+    merged: dict[str, object] = dict(load_json(target))
+    merged.setdefault("version", 1)
+    hooks: dict[str, list] = dict(merged.get("hooks", {}) or {})
+
+    # Identify OUR entries by the exact command string we are about to write,
+    # not by substring-matching the install root anywhere in the JSON. A user
+    # whose own hook lives in a sibling path (/x/minni-other vs /x/minni) would
+    # otherwise match and be deleted.
+    def _commands(entries: list) -> set[str]:
+        return {e.get("command") for e in entries if isinstance(e, dict)}
 
     for event, entries in (stamped.get("hooks", {}) or {}).items():
-        others = [
+        ours = _commands(list(entries))
+        kept = [
             e
             for e in (hooks.get(event) or [])
-            if str(install_root) not in json.dumps(e)
+            if not (isinstance(e, dict) and e.get("command") in ours)
         ]
-        hooks[event] = others + list(entries)
+        hooks[event] = kept + list(entries)
 
     merged["hooks"] = hooks
     target.parent.mkdir(parents=True, exist_ok=True)

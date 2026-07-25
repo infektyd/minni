@@ -688,6 +688,7 @@ export function createHookHandlers(
 
     return render(
       noteIntent(
+        "Stop",
         `Minni: ${candidates.length} candidate learning${
           candidates.length === 1 ? "" : "s"
         } drafted to inbox (${inbox.filePath}). ${

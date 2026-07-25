@@ -11,7 +11,7 @@ export type HookIntent =
   /** Put `text` into the model's context. The point of the whole system. */
   | { kind: "inject"; event: EnvelopeEvent; text: string }
   /** Tell the human something. Not model-visible; never a memory carrier. */
-  | { kind: "note"; text: string }
+  | { kind: "note"; event: EnvelopeEvent; text: string }
   /** Ran fine, nothing to say. */
   | { kind: "none" };
 
@@ -21,6 +21,15 @@ export const injectIntent = (event: EnvelopeEvent, text: string): HookIntent => 
   text,
 });
 
-export const noteIntent = (text: string): HookIntent => ({ kind: "note", text });
+// The event matters: a note is only deliverable where that platform has a
+// human-facing channel for THAT event. Rendering every note against a
+// hard-coded "Stop" silently mis-answers the question on any other event --
+// dropping a note agy could have carried at SessionStart, and worse, reporting
+// SUCCESS for one Grok Build discards because passive-event stdout is ignored.
+export const noteIntent = (event: EnvelopeEvent, text: string): HookIntent => ({
+  kind: "note",
+  event,
+  text,
+});
 
 export const noIntent: HookIntent = { kind: "none" };

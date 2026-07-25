@@ -220,3 +220,76 @@ def test_claude_desktop_absent_is_reported_not_crashed(tmp_path, monkeypatch):
 
     assert result["installed"] is False
     assert "not installed" in str(result["reason"])
+
+
+# --- adversarial-review regressions -----------------------------------------
+
+
+def test_cursor_keeps_a_users_hook_in_a_SIBLING_path(tmp_path, monkeypatch):
+    """Regression: entries were matched by substring against the install root.
+
+    A user hook living at /x/minni-other contains the string /x/minni, so a
+    naive `str(install_root) in json.dumps(e)` deleted it. Ours are now
+    identified by the exact command we are about to write.
+    """
+    monkeypatch.setenv("HOME", str(tmp_path))
+    root = _install_root(tmp_path)  # .../install
+    sibling = f"node {root}-other/hook.js"  # contains str(root) as a prefix
+
+    cursor = tmp_path / ".cursor"
+    cursor.mkdir()
+    (cursor / "hooks.json").write_text(
+        json.dumps({"version": 1, "hooks": {"sessionStart": [{"command": sibling}]}})
+    )
+
+    propagate.update_cursor_hooks(root)
+
+    data = json.loads((cursor / "hooks.json").read_text())
+    assert any(
+        e.get("command") == sibling for e in data["hooks"]["sessionStart"]
+    ), "a hook in a sibling path was clobbered by substring matching"
+
+
+def test_cursor_preserves_unknown_top_level_keys(tmp_path, monkeypatch):
+    """The file is Cursor's, not ours -- only `hooks` may be rewritten."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    root = _install_root(tmp_path)
+    cursor = tmp_path / ".cursor"
+    cursor.mkdir()
+    (cursor / "hooks.json").write_text(
+        json.dumps({"version": 1, "hooks": {}, "someFutureCursorKey": {"a": 1}})
+    )
+
+    propagate.update_cursor_hooks(root)
+
+    data = json.loads((cursor / "hooks.json").read_text())
+    assert data.get("someFutureCursorKey") == {"a": 1}, "unknown top-level key discarded"
+
+
+def test_claude_desktop_keeps_user_added_env(tmp_path, monkeypatch):
+    """Only the MINNI_* keys are ours; a hand-added token must survive."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg = _desktop_cfg(tmp_path)
+    cfg.parent.mkdir(parents=True)
+    cfg.write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "minni": {
+                        "command": "/opt/homebrew/bin/node",
+                        "args": ["/old/server.js"],
+                        "env": {"MY_TOKEN": "secret", "MINNI_AGENT_ID": "stale"},
+                    }
+                }
+            }
+        )
+    )
+
+    propagate.update_claude_desktop_config(
+        tmp_path / "dist" / "server.js", "claude-code", Path("/v"), Path("/s"), Path("/w")
+    )
+
+    server = json.loads(cfg.read_text())["mcpServers"]["minni"]
+    assert server["env"]["MY_TOKEN"] == "secret", "user's own env var was erased"
+    assert server["env"]["MINNI_AGENT_ID"] == "claude-code", "our key must be re-stamped"
+    assert server["command"] == "/opt/homebrew/bin/node", "user's node path was replaced"
