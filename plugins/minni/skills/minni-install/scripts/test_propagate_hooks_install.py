@@ -151,3 +151,72 @@ def test_cursor_reinstall_is_idempotent(tmp_path, monkeypatch):
     data = json.loads((tmp_path / ".cursor/hooks.json").read_text())
     mine = [e for e in data["hooks"]["sessionStart"] if str(root) in json.dumps(e)]
     assert len(mine) == 1, f"expected one Minni sessionStart entry, got {len(mine)}"
+
+
+# --- Claude Desktop ---------------------------------------------------------
+
+
+def _desktop_cfg(tmp_path: Path) -> Path:
+    return tmp_path / "Library/Application Support/Claude/claude_desktop_config.json"
+
+
+def test_claude_desktop_registers_under_the_shared_identity(tmp_path, monkeypatch):
+    """Desktop and Code are one person on one machine: same agent, same vault.
+
+    Claude Desktop's config tree is fully disjoint from ~/.claude/, so this is a
+    separate write -- but the identity is deliberately shared, the way the three
+    Antigravity surfaces share one `gemini` identity and vault.
+    """
+    monkeypatch.setenv("HOME", str(tmp_path))
+    _desktop_cfg(tmp_path).parent.mkdir(parents=True)
+
+    result = propagate.update_claude_desktop_config(
+        server_path=tmp_path / "dist" / "server.js",
+        agent="claude-code",
+        vault=Path("/v"),
+        socket_path=Path("/s"),
+        workspace=Path("/w"),
+    )
+
+    assert result["installed"] is True
+    server = json.loads(_desktop_cfg(tmp_path).read_text())["mcpServers"]["minni"]
+    assert server["env"]["MINNI_AGENT_ID"] == "claude-code"
+    assert server["env"]["MINNI_VAULT_PATH"] == "/v"
+
+
+def test_claude_desktop_preserves_other_servers_and_keys(tmp_path, monkeypatch):
+    """The file also holds preferences and cowork paths -- never clobber them."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg = _desktop_cfg(tmp_path)
+    cfg.parent.mkdir(parents=True)
+    cfg.write_text(
+        json.dumps(
+            {
+                "mcpServers": {"other": {"command": "node", "args": ["/x.js"]}},
+                "preferences": {"theme": "dark"},
+                "coworkUserFilesPath": "/some/path",
+            }
+        )
+    )
+
+    propagate.update_claude_desktop_config(
+        tmp_path / "dist" / "server.js", "claude-code", Path("/v"), Path("/s"), Path("/w")
+    )
+
+    data = json.loads(cfg.read_text())
+    assert "other" in data["mcpServers"], "another MCP server was clobbered"
+    assert data["preferences"] == {"theme": "dark"}, "unrelated top-level key lost"
+    assert data["coworkUserFilesPath"] == "/some/path"
+    assert "minni" in data["mcpServers"]
+
+
+def test_claude_desktop_absent_is_reported_not_crashed(tmp_path, monkeypatch):
+    """A machine without Claude Desktop must not fail the whole install."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    result = propagate.update_claude_desktop_config(
+        tmp_path / "dist" / "server.js", "claude-code", Path("/v"), Path("/s"), Path("/w")
+    )
+
+    assert result["installed"] is False
+    assert "not installed" in str(result["reason"])

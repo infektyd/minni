@@ -758,6 +758,49 @@ AGY_DIST_TOKEN = "__MINNI_GEMINI_DIST__"
 
 
 
+def update_claude_desktop_config(
+    server_path: Path, agent: str, vault: Path, socket_path: Path, workspace: Path,
+    afm_env: dict[str, str] | None = None,
+) -> dict[str, object]:
+    """Register the Minni MCP server with Claude DESKTOP.
+
+    Claude Desktop is a separate product from Claude Code with a fully disjoint
+    config tree: ~/Library/Application Support/Claude/claude_desktop_config.json,
+    NOT ~/.claude/. Writing the latter reaches Desktop not at all. (Careful with
+    the near-miss: /Library/Application Support/ClaudeCode/ belongs to the CLI.)
+
+    Desktop has NO hook system -- the extension model is documented in place of
+    one -- so there is no boot hydration here and no lifecycle events. Memory
+    reaches the model only when it calls a tool. The MCP server's `instructions`
+    field is the closest thing to hydration this surface has.
+
+    Identity is deliberately `claude-code` sharing the claudecode vault: Desktop
+    and Code are the same person at the same machine, so they share one memory,
+    the way the three Antigravity surfaces share one `gemini` identity.
+
+    Merges rather than replaces -- the file also holds unrelated top-level keys
+    (preferences, cowork paths) and any other MCP servers the user installed.
+    """
+    path = Path("~/Library/Application Support/Claude/claude_desktop_config.json").expanduser()
+    if not path.parent.exists():
+        return {"installed": False, "reason": "Claude Desktop not installed (no Application Support/Claude)"}
+
+    data = load_json(path)
+    data.setdefault("mcpServers", {})["minni"] = {
+        "command": "node",
+        "args": [str(server_path)],
+        "env": {
+            "MINNI_AGENT_ID": agent,
+            "MINNI_VAULT_PATH": str(vault),
+            "MINNI_SOCKET_PATH": str(socket_path),
+            "MINNI_WORKSPACE_ID": normalize_workspace_id(str(workspace)),
+            **(afm_env or {}),
+        },
+    }
+    write_json(path, data)
+    return {"installed": True, "path": str(path), "agent": agent}
+
+
 def update_grok_hooks(install_root: Path) -> dict[str, object]:
     """Install the Grok Build hook manifest into ~/.grok/hooks/minni.json.
 
@@ -1175,6 +1218,14 @@ def update_one_plugin(platform: str, args: argparse.Namespace) -> dict[str, obje
     if canonical_platform(platform) == "cursor":
         cursor_hooks = update_cursor_hooks(install_root)
 
+    # Claude Desktop shares this agent identity and vault but NOT this config
+    # tree, so it needs its own write. Hooks do not exist there; MCP only.
+    claude_desktop: dict[str, object] | None = None
+    if canonical_platform(platform) == "claude-code":
+        claude_desktop = update_claude_desktop_config(
+            server_path, agent, vault, Path(args.socket).expanduser(), stamp_workspace, afm_env
+        )
+
     base: dict[str, object] = {
         "platform": canonical_platform(platform),
         "agent": agent,
@@ -1194,6 +1245,8 @@ def update_one_plugin(platform: str, args: argparse.Namespace) -> dict[str, obje
         base["grok_rules"] = grok_rules
     if cursor_hooks is not None:
         base["cursor_hooks"] = cursor_hooks
+    if claude_desktop is not None:
+        base["claude_desktop"] = claude_desktop
     return base
 
 

@@ -331,3 +331,43 @@ But mining an undocumented format is how the agy assumptions rotted. If it gets
 built: sniff the schema, verify on **each** surface separately, and fall back to
 the current degrade. Also handle `transcript_path: null` — a documented state
 whose triggering setting is itself undocumented.
+
+## Desktop apps: one shares config, one does not, neither has hooks
+
+| Surface | Hooks | Shares CLI config | Boot hydration |
+|---|---|---|---|
+| **Cursor.app** | ✅ — it is the PRIMARY hook surface | ✅ same `~/.cursor/hooks.json` | ❌ (the sessionStart bug) |
+| **Codex / ChatGPT desktop** | documented for the Codex host; desktop scope **implied, not stated** | ✅ *"share MCP configuration for the same Codex host"* | via MCP `instructions` |
+| **Claude Desktop** | ❌ none, by design | ❌ **fully disjoint tree** | ❌ tool-call on demand only |
+
+Claude Desktop reads `~/Library/Application Support/Claude/claude_desktop_config.json`.
+Writing `~/.claude/` reaches it not at all. Mind the near-miss:
+`/Library/Application Support/ClaudeCode/` belongs to Claude **Code**.
+
+Its identity is deliberately `claude-code` on the `claudecode-vault` — Desktop
+and Code are the same person at the same machine, so they share one memory, the
+way the three Antigravity surfaces share one `gemini` identity.
+
+**Unverified, deliberately:** whether Claude Cowork reads `~/.claude`, and
+whether `~/.codex/hooks.json` hooks fire in the Codex desktop app. Both are
+NOT DOCUMENTED. Resolve by observation before either goes in a support matrix.
+
+## The MCP `instructions` field is the hydration channel of last resort
+
+Returned at initialize as server-wide guidance alongside the tools. It needs no
+hooks, works on any host that honors it, and is silently dropped by hosts that
+do not — so it is the one mechanism that reaches **every** surface where hooks
+structurally cannot hydrate:
+
+- **Grok Build** — passive-event stdout is ignored
+- **Cursor** — `sessionStart` injection is a confirmed open vendor bug
+- **Claude Desktop** — no hook system exists
+
+Minni sets it in `server.ts` (`MINNI_INSTRUCTIONS`). Two constraints, both
+pinned by tests: keep the **first 512 characters self-contained** (Codex
+documents that budget), and keep the whole thing short — it is billed into
+every MCP session on every host.
+
+It also carries the evidence-not-instruction boundary, which matters more here
+than anywhere else: this text reaches hosts we do not control, so the server
+states plainly that recalled memory is data and has no authority over the agent.
