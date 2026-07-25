@@ -9,6 +9,15 @@ const pending = new Map();
 // its learn candidate on and fell back to the bare session id. The prompt is
 // already computed in chat.message -- stash it and carry it to Stop.
 const lastPrompt = new Map();
+// The per-session map is NOT reliable here: Kilo fires session.deleted while
+// the session is still live, which runs lastPrompt.delete() and empties the map
+// before session.idle arrives. Instrumented and confirmed -- at Stop the map
+// was empty while the prompt had definitely been stashed:
+//     stopKey=ses_06632e4d0ffe...  mapKeys=(empty)  any=Without reading any...
+// It was never a key mismatch. CLI sessions are serial, so a keyless fallback
+// is both correct and immune to the delete; the map is kept only as a
+// best-effort first choice if sessions ever interleave.
+let lastPromptAny = "";
 
 function hookContext(result) {
   return result?.hookSpecificOutput?.additionalContext || result?.systemMessage || "";
@@ -80,7 +89,10 @@ const MinniPlugin = async ({ directory }) => ({
       .filter((part) => part?.type === "text" && typeof part.text === "string")
       .map((part) => part.text)
       .join("\n");
-    if (prompt) lastPrompt.set(input.sessionID, prompt.slice(0, 400));
+    if (prompt) {
+      lastPrompt.set(input.sessionID, prompt.slice(0, 400));
+      lastPromptAny = prompt.slice(0, 400);
+    }
     const result = await runHookFailOpen("UserPromptSubmit", {
       session_id: input.sessionID,
       prompt,
@@ -118,7 +130,7 @@ const MinniPlugin = async ({ directory }) => ({
         session_id: sessionID,
         workspace_id: directory,
         // Synthesized by this bridge, not by Kilo -- see kilocodeWire.lastTaskText.
-        last_user_message: lastPrompt.get(sessionID) ?? "",
+        last_user_message: lastPrompt.get(sessionID) || lastPromptAny || "",
       });
     } else if (event?.type === "session.deleted") {
       booted.delete(sessionID);
