@@ -301,6 +301,7 @@ async function seedScoringVault(notes) {
   await mkdir(path.join(root, "wiki", "concepts"), { recursive: true });
   await mkdir(path.join(root, "wiki", "sessions"), { recursive: true });
   for (const [relative, body] of Object.entries(notes)) {
+    await mkdir(path.dirname(path.join(root, relative)), { recursive: true });
     await writeFile(
       path.join(root, relative),
       `---\nstatus: accepted\n---\n\n${body}`,
@@ -584,6 +585,10 @@ test("searchVaultNotes still answers stopword-only queries", async () => {
 // the full +50 bonus on notes with no relation to the query: on the real
 // claudecode vault (437 notes) `c#` and `c++` returned 93 each, `r?` 16, and
 // `-` and `/` returned 376 apiece.
+//
+// `c#`, `c++` and `r?` are excluded here by ABSENCE, not by a length rule: the
+// untrimmed form is now tried first and none of these fixtures contains it. The
+// note that does contain `C#` is the next test.
 const EMPTY_PHRASE_QUERIES = [
   ["c-sharp", "c#"],
   ["c-plus-plus", "c++"],
@@ -591,11 +596,12 @@ const EMPTY_PHRASE_QUERIES = [
   ["bare-hyphen", "-"],
   ["bare-underscore", "_"],
   ["bare-slash", "/"],
+  ["double-hyphen", "--"],
   // Alphanumeric under Unicode, so only the 2-character minimum excludes it —
-  // on the same ground as the ASCII "c", not because it is punctuation.
+  // on the same ground as the ASCII "c", not because it is punctuation. A lone
+  // ideograph is the one single-character exception; see the CJK test below.
   ["accented-letter", "é"],
   ["bare-letter", "c"],
-  ["lone-ideograph", "節"],
 ];
 
 for (const [name, query] of EMPTY_PHRASE_QUERIES) {
@@ -625,16 +631,123 @@ for (const [name, query] of EMPTY_PHRASE_QUERIES) {
 
 // The second half of the same defect, isolated: a term whose edge characters
 // are non-word at BOTH ends gets no boundary assertion at either edge, so the
-// pattern degrades to a substring search. "-a-" clears the phrase gate (three
-// characters, one of them alphanumeric), which leaves wordRegex as the only
-// thing standing between it and every "-a-" inside a longer token.
-test("searchVaultNotes refuses terms that cannot express a whole-word match", async () => {
+// pattern degrades to a substring search. For a term with no alphanumeric at
+// all that is ruinous — "--" is a substring of every long option and every
+// horizontal rule in the corpus — so those terms are refused outright.
+//
+// A term that carries an alphanumeric run is NOT refused, and the run is the
+// only specificity it can have: "-a-" therefore does match inside "x-a-y",
+// which the pre-round-4 rule excluded. That exclusion was not free — it applied
+// to "/api/" and "/users/hans/projects/" identically and deleted them — and
+// there is no assertion that separates the two cases, since both occurrences
+// sit between separators the term supplies itself.
+test("searchVaultNotes refuses terms with no alphanumeric content", async () => {
   const root = await seedScoringVault({
-    "wiki/concepts/embedded-note.md": "# Ids\n\nThe x-a-y identifier is used.\n",
+    "wiki/concepts/embedded-note.md":
+      "# Ids\n\nThe x-a-y identifier is used with --flag and a --- rule.\n",
   });
   try {
-    const results = await searchVaultNotes(root, "-a-", 5);
-    assert.equal(results.length, 0, "'-a-' must not match inside x-a-y");
+    for (const query of ["--", "---", "//"]) {
+      const results = await searchVaultNotes(root, query, 5);
+      assert.equal(results.length, 0, `'${query}' carries no lexical content`);
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+// Defect 1 (round 4). phraseForm trimmed `#`/`+`/`?` BEFORE matching, so `c#`
+// became a bare `c` — which is what produced the 93-note bleed the trim was
+// blamed for, and which the length gate then papered over by deleting the query
+// outright. The untrimmed form is tried first and is safe on its own: wordRegex
+// anchors only the leading edge, so it matches `C#` and nothing else.
+test("searchVaultNotes finds punctuation-suffixed terms in notes that contain them", async () => {
+  const root = await seedScoringVault({
+    "wiki/concepts/interop-note.md":
+      "# Interop\n\nWe use C# and C++ in the interop layer.\n",
+    // The decoy the trimmed form used to match: a bare standalone `c`.
+    "wiki/sessions/compiler-note.md":
+      "# Toolchain\n\nA C compiler ran; the R report followed.\n",
+  });
+  try {
+    for (const query of ["c#", "c++"]) {
+      const results = await searchVaultNotes(root, query, 5);
+      assert.equal(results.length, 1, `'${query}' must find the note saying it`);
+      assert.match(results[0].relativePath, /interop-note\.md$/);
+      assert.ok(
+        results[0].score >= 50,
+        `'${query}' must take the exact-phrase bonus (got ${results[0].score})`,
+      );
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+// Defect 2 (round 4). The 2-character phrase minimum is an assumption about
+// scripts that separate words. `節` is a whole word, and the whole-word matcher
+// already admits the surrounding kana as boundaries — the length rule was the
+// only thing rejecting it.
+test("searchVaultNotes admits a single-ideograph query", async () => {
+  const root = await seedScoringVault({
+    "wiki/concepts/cjk-config-note.md":
+      "# 設定\n\n設定ファイルは節ごとに分割する\n",
+    "wiki/concepts/other-note.md": "# Other\n\nUnrelated content.\n",
+  });
+  try {
+    for (const query of ["節", "設定", "分割する"]) {
+      const results = await searchVaultNotes(root, query, 5);
+      assert.equal(results.length, 1, `'${query}' is a whole word here`);
+      assert.match(results[0].relativePath, /cjk-config-note\.md$/);
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+// Defect 3 (round 4). queryTerms tokenises `/`, so a path arrives at wordRegex
+// with a separator at both edges. Refusing it dropped the only term the query
+// had, and a literal path returned nothing against a note quoting it verbatim.
+test("searchVaultNotes matches path-shaped query terms", async () => {
+  const root = await seedScoringVault({
+    "wiki/concepts/route-note.md":
+      "# Routes\n\nThe router mounts /api/ under /Users/hans/Projects/ during local dev.\n",
+    "wiki/concepts/other-note.md": "# Other\n\nUnrelated content.\n",
+  });
+  try {
+    for (const query of ["/api/", "/Users/hans/Projects/"]) {
+      const results = await searchVaultNotes(root, query, 5);
+      assert.equal(results.length, 1, `'${query}' occurs verbatim in the note`);
+      assert.match(results[0].relativePath, /route-note\.md$/);
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+// Defect 4 (round 4). The whole-word window is tier 1 and stays tier 1 (see the
+// `pro` test above). What was missing is tier 2: a note admitted on its PATH
+// whose prose only ever says a longer word has no whole-word hit anywhere, and
+// falling straight to offset 0 showed boilerplate instead of the sentence the
+// query is actually in.
+test("searchVaultNotes falls back to a substring window before offset 0", async () => {
+  const filler = "Boilerplate intro that says nothing useful at all. ".repeat(6);
+  const root = await seedScoringVault({
+    "wiki/auth/notes.md": `# Session notes\n\n${filler}The authentication flow uses a rotating token.\n`,
+  });
+  try {
+    const results = await searchVaultNotes(root, "auth", 5);
+    assert.equal(results.length, 1, "'auth' qualifies through the path");
+    assert.match(
+      results[0].snippet,
+      /authentication flow/,
+      "the window must show where the query text actually is",
+    );
+    assert.doesNotMatch(
+      results[0].snippet,
+      /^Boilerplate intro/,
+      "offset 0 is for notes whose prose never says the query at all",
+    );
   } finally {
     await rm(root, { recursive: true, force: true });
   }

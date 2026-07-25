@@ -523,6 +523,108 @@ test("prepareOutcome rejects contentless summaries post-redaction (round 3, defe
   assert.deepEqual(short.outcomeDraft.learnCandidates, ["note: Use WAL"]);
 });
 
+// Round-4 defect 1: round 3 admitted a quote/bullet prefix in front of the OPEN
+// root set, and `agent_`/`team_` are in that set — so a markdown definition list
+// ("- team_id | the tenant identifier"), the highest-traffic prose shape in this
+// repo's docs, was scrubbed as telemetry and the whole Stop was discarded. The
+// bare form now requires a tool name that actually emits audit lines. Both
+// directions are asserted together because the two prior rounds each fixed one
+// and broke the other.
+const AUDIT_TELEMETRY = {
+  headerHookStop: "## [2026-07-25T16:47:42.513Z] hook_stop | stop s1: no draftable signal",
+  bareCodexStop: "hook_codex_stop | stop abc",
+  bareRecall: "minni_recall | issue 173 stop learn candidates",
+  bareLearn: "minni_learn | committed",
+  bareAgentPing: "agent_ping | ping delivered",
+  quotedMultilinePaste: QUOTED_AUDIT_TAIL,
+};
+
+const AUDIT_PROSE = {
+  definitionListTeamId: "- team_id | the tenant identifier",
+  definitionListAgentId: "* agent_id | which agent produced the row",
+  indexedColumns: "agent_id | role | created_at are the three indexed columns.",
+  toolEnumeration: "minni_recall | minni_learn are the two tools agents call most.",
+  shellPipeline: "run: journalctl | grep hook_stop | tail -5",
+  shortLearning: "Use WAL",
+};
+
+test("prepareOutcome separates audit tails from bulleted prose (round 4, defect 1)", async () => {
+  for (const [name, summary] of Object.entries(AUDIT_TELEMETRY)) {
+    const packet = await prepareOutcome({
+      task: "fix",
+      summary,
+      profile: "compact",
+      vaultPath: "/tmp/vault",
+    });
+    assert.deepEqual(packet.outcomeDraft.learnCandidates, [], `${name}: must be scrubbed as audit telemetry`);
+  }
+
+  for (const [name, summary] of Object.entries(AUDIT_PROSE)) {
+    const bySummary = await prepareOutcome({
+      task: "note",
+      summary,
+      profile: "compact",
+      vaultPath: "/tmp/vault",
+    });
+    assert.equal(bySummary.outcomeDraft.learnCandidates.length, 1, `${name}: summary must survive the audit scrub`);
+
+    // via `task` — the Stop path, where `task` is the user's own prompt and a
+    // single scrubbed line zeroes the entire candidate list.
+    const byTask = await prepareOutcome({
+      task: `Schema notes\n${summary}\nThat is the whole table.`,
+      summary: "recorded the schema review",
+      profile: "compact",
+      vaultPath: "/tmp/vault",
+    });
+    assert.equal(byTask.outcomeDraft.learnCandidates.length, 1, `${name}: prompt must survive the audit scrub`);
+  }
+});
+
+// Round-4 defect 2: the substance gate tokenized on `[\p{L}\p{N}]+` runs, which
+// scores an unspaced CJK sentence as ONE token — so a real learning was dropped
+// while "done done" passed. Tokens are word-segmented now.
+const CJK_LEARNINGS = {
+  // "always use WAL mode rather than the default"
+  chineseWalMode: "总是使用WAL模式而不是默认模式",
+  japaneseOnly: "日本語のみ",
+};
+
+test("prepareOutcome keeps unspaced CJK learnings (round 4, defect 2)", async () => {
+  for (const [name, summary] of Object.entries(CJK_LEARNINGS)) {
+    const packet = await prepareOutcome({
+      task: "note",
+      summary,
+      profile: "compact",
+      vaultPath: "/tmp/vault",
+    });
+    assert.equal(packet.outcomeDraft.learnCandidates.length, 1, `${name}: real learning must not be dropped`);
+  }
+
+  // The round-3 green assertions still hold: two Latin tokens pass, one does not,
+  // and a path-only summary is emptied by redaction before the gate sees it.
+  const kept = await prepareOutcome({
+    task: "note",
+    summary: "Use WAL",
+    profile: "compact",
+    vaultPath: "/tmp/vault",
+  });
+  assert.deepEqual(kept.outcomeDraft.learnCandidates, ["note: Use WAL"]);
+
+  for (const [name, summary] of Object.entries({
+    ok: "ok",
+    singleLetter: "a",
+    pathOnly: "/Users/hansaxelsson/Projects/Minni/plugins/minni/src/x.ts",
+  })) {
+    const packet = await prepareOutcome({
+      task: "fix the bug",
+      summary,
+      profile: "compact",
+      vaultPath: "/tmp/vault",
+    });
+    assert.deepEqual(packet.outcomeDraft.learnCandidates, [], `${name}: must not manufacture a candidate`);
+  }
+});
+
 // Defect 3: the AFM merge re-normalized the draft but never re-applied the scrub,
 // so telemetry proposed by the model bypassed it entirely. The scrub now lives in
 // normalizeOutcomeDraft, which every path funnels through.
