@@ -19,7 +19,13 @@ void runHookMain({
   defaultWorkspaceId: KILOCODE_WORKSPACE_ID,
   contextWindow: KILOCODE_CONTEXT_WINDOW,
   hooksEnabled: KILOCODE_HOOKS_ENABLED,
-  auditPrefix: "hook",
+  // Namespaced like every other platform. It was a bare "hook", which made
+  // kilocode's audit entries byte-identical in shape to claude-code's
+  // (hook_session_start, hook_stop, ...). Separate vaults kept them from
+  // colliding, but it defeats any cross-vault query and it actively caused a
+  // misdiagnosis: grepping hook_kilocode_* found nothing and the integration
+  // looked dead when it was working fine.
+  auditPrefix: "hook_kilocode",
   bootIdentity: "identity-recall",
   stopCommitHint: "Use /minni:learn to commit.",
   // Review-panel fix (shared root cause of five findings): Stop previously

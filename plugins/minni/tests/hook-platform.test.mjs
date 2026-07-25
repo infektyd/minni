@@ -187,3 +187,33 @@ test("Cursor: an undeliverable prompt-submit injection is RECORDED", () => {
   assert.ok(dropped, "Cursor cannot inject at beforeSubmitPrompt -- that must be visible");
   assert.equal(dropped.event, "UserPromptSubmit");
 });
+
+test("every platform's audit prefix is distinct and namespaced", async () => {
+  // kilocode shipped `auditPrefix: "hook"`, so its entries were shaped exactly
+  // like claude-code's. Separate vaults hid the collision, but it defeats any
+  // cross-vault query and it cost a real misdiagnosis: a grep for
+  // hook_kilocode_* found nothing and the integration looked dead when it was
+  // in fact working.
+  const { readFile } = await import("node:fs/promises");
+  const path = await import("node:path");
+  const { fileURLToPath } = await import("node:url");
+  const SRC = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "src");
+
+  const entries = {
+    "codex-hook.ts": "hook_codex",
+    "grok-hook.ts": "hook_grok",
+    "cursor-hook.ts": "hook_cursor",
+    "gemini-hook.ts": "hook_gemini",
+    "kilocode-hook.ts": "hook_kilocode",
+  };
+
+  const seen = new Set();
+  for (const [file, expected] of Object.entries(entries)) {
+    const src = await readFile(path.join(SRC, file), "utf8");
+    const found = /auditPrefix:\s*"([^"]+)"/.exec(src)?.[1];
+    assert.equal(found, expected, `${file} audit prefix`);
+    assert.ok(found.startsWith("hook_"), `${file}: throttle keys off the hook_ prefix`);
+    assert.ok(!seen.has(found), `${file}: duplicate audit prefix ${found}`);
+    seen.add(found);
+  }
+});
