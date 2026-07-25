@@ -27,22 +27,35 @@ test("RCM-008: hook rate-limiting drops duplicate hook audit entries without fai
       timestamp: now,
     });
 
+    // Same event again, inside the window: a genuine duplicate -> dropped.
     await recordAudit(root, {
-      tool: "hook_user_prompt_submit",
+      tool: "hook_session_start",
       summary: "Second audit too fast",
       timestamp: new Date(now.getTime() + 2000),
     });
 
+    // A DIFFERENT event inside the window must survive. The throttle used to
+    // key on the agent alone, so a burst of distinct events collapsed into
+    // one record -- on agy, SessionStart and PreInvocation fire in the same
+    // second, so PreInvocation was never audited and looked like it had never
+    // dispatched at all. Distinct events are not duplicates.
+    await recordAudit(root, {
+      tool: "hook_user_prompt_submit",
+      summary: "Distinct event in window",
+      timestamp: new Date(now.getTime() + 2000),
+    });
+
     const okPath = await recordAudit(root, {
-      tool: "hook_pre_compact",
+      tool: "hook_session_start",
       summary: "Third audit ok",
-      timestamp: new Date(now.getTime() + 5000),
+      timestamp: new Date(now.getTime() + 8000),
     });
     assert.ok(okPath);
 
     const log = await readFile(path.join(root, "log.md"), "utf8");
     assert.match(log, /First audit/);
     assert.doesNotMatch(log, /Second audit too fast/);
+    assert.match(log, /Distinct event in window/);
     assert.match(log, /Third audit ok/);
   } finally {
     if (origBypass === undefined) delete process.env.MINNI_BYPASS_AUDIT_LIMIT;
@@ -90,8 +103,9 @@ test("RCM-008: hook rate-limiting timestamp file has strict permissions", async 
     });
     assert.ok(okPath);
 
-    // Verify rate limit file has mode 0o600 (on UNIX platforms)
-    const agentTsFile = path.join(home, ".hook-audit-ts", "rate-limit.ts");
+    // Verify rate limit file has mode 0o600 (on UNIX platforms).
+    // The throttle key is per (agent, event), so the filename carries both.
+    const agentTsFile = path.join(home, ".hook-audit-ts", "rate-limit__hook_session_start.ts");
     const st = await stat(agentTsFile);
     if (process.platform !== "win32") {
       const mode = st.mode & 0o777;

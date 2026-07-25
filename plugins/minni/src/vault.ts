@@ -659,7 +659,13 @@ export async function recordAudit(
   const homeDir = process.env.MINNI_HOME ?? path.join(os.homedir(), ".minni");
   const rateLimitDir = path.join(homeDir, ".hook-audit-ts");
   await mkdir(rateLimitDir, { recursive: true });
-  const tsPath = path.join(rateLimitDir, `${agentId}.ts`);
+  // Key the throttle per (agent, EVENT), not per agent. A single per-agent
+  // window meant a burst of DIFFERENT events collapsed into one record: agy
+  // fires SessionStart and PreInvocation in the same second, so PreInvocation
+  // was never audited at all and looked like it had never dispatched. That
+  // cost real debugging time. Duplicate suppression is still per event.
+  const throttleKey = `${agentId}__${entry.tool}`.replace(/[^A-Za-z0-9_-]/g, "_");
+  const tsPath = path.join(rateLimitDir, `${throttleKey}.ts`);
 
   let lastTime: number | undefined;
   try {

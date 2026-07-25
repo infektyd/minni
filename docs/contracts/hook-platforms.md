@@ -48,7 +48,7 @@ agy's shape is the trap: a literal `"hooks"` top-level key declares a hook
 
 | Intent | Claude Code | Codex | Grok Build | Cursor | agy | Kilocode |
 |---|---|---|---|---|---|---|
-| session start | `SessionStart` | `SessionStart` | `SessionStart` | `sessionStart` | `SessionStart` ⚠️undocumented | — |
+| session start | `SessionStart` | `SessionStart` | `SessionStart` | `sessionStart` | `SessionStart` ⚠️undocumented but WORKS | — |
 | prompt submit | `UserPromptSubmit` | `UserPromptSubmit` | `UserPromptSubmit` | `beforeSubmitPrompt` | `PreInvocation` | `chat.message` |
 | pre-tool | `PreToolUse` | `PreToolUse` ⚠️Bash only | `PreToolUse` | `preToolUse` | `PreToolUse` | `tool.execute.before` |
 | turn end | `Stop` | `Stop` | `Stop` | `stop` | `Stop` | `event`→`session.idle` |
@@ -67,7 +67,7 @@ This is the table that matters most, and the one the codebase got wrong.
 | Codex | ✅ `additionalContext` | ✅ | ❌ **block only** | ❌ cannot inject *or* block |
 | Grok Build | ❌ **stdout ignored** | ❌ **stdout ignored** | ✅ `additionalContext` | ❌ **stdout ignored** |
 | Cursor | ✅ `additional_context` ⚠️ | ❌ **not supported** | ❌ `followup_message` only | ❌ `user_message` only |
-| agy | ⚠️ via `injectSteps` | ✅ `injectSteps` (`PreInvocation`) | — | — |
+| agy | ✅ `injectSteps` (verified live) | ✅ `injectSteps` (`PreInvocation`) | ❌ rejects `injectSteps` | — |
 | Kilocode | `experimental.chat.system.transform` | same | — | `experimental.session.compacting` |
 
 Load-bearing details:
@@ -208,3 +208,24 @@ arrives one tool round-trip in rather than before the first token; and
 the machine including repos where Minni is irrelevant. Keep the file short —
 long rules files are followed less reliably. `grok inspect` lists loaded
 instruction files with token counts and is a free regression check.
+
+## agy: two traps that cost real debugging time
+
+**1. `injectSteps` is per-event, not universal.** It is honored on `SessionStart`
+and `PreInvocation` (both verified live with a marker probe: the model quoted the
+injected token back). `Stop` has a different output proto and rejects the field:
+
+```
+failed to unmarshal result from hook jsonhook__minni_Stop_0_0 via protojson:
+  unknown field "injectSteps"
+```
+
+**2. A changed manifest is loaded LAZILY, at first-prompt time.** The log shows
+`Loaded hooks.json ... 4 total handlers` arriving one second before
+`SessionStart` fires — after that first invocation's context was already
+assembled. So **the first agy session after any manifest change silently gets no
+injection**; every session after it is fine. Do not diagnose off that first run.
+
+Also note `ephemeralMessage` content IS persisted to `transcript_full.jsonl`, so
+grepping the transcript is a valid check — but only for sessions that started
+after the manifest was loaded.
