@@ -231,9 +231,19 @@ export const cursorWire: PlatformWire = {
   noop: () => ({ continue: true }),
   inject: (event, text) =>
     CURSOR_INJECTABLE.has(event) ? { additional_context: text } : null,
-  // `stop` accepts followup_message and drops `continue` entirely; Claude's
-  // `systemMessage` reaches nobody here.
-  note: (event, text) => (event === "Stop" ? { followup_message: text } : null),
+  // Cursor has NO safe human-facing note channel.
+  //
+  // `followup_message` is the only field `stop` accepts, and it is NOT
+  // informational -- it is Cursor's AUTO-FOLLOW-UP mechanism: it drives another
+  // agent turn, bounded by `loop_limit` (default 5). Using it to announce a
+  // drafted learn candidate is self-feeding: Stop drafts -> follow-up turn ->
+  // Stop drafts again. Observed live, 6 Stop hooks in 90 seconds from a single
+  // prompt, each drafting an inbox candidate built from the audit trail the
+  // previous one had just written.
+  //
+  // So notes are DROPPED here (and recorded as such). Announcing a candidate is
+  // never worth spending the user's tokens on an extra model turn.
+  note: () => null,
   // Cursor's stop payload carries status/loop_count/token counts and no message
   // text at all, so there is nothing to key the learn candidate on and it falls
   // back to the session id. Cursor does supply `transcript_path`; mining it the

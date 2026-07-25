@@ -154,8 +154,23 @@ test("Cursor injects at sessionStart only, and notes ride followup_message", () 
   assert.equal(cursorWire.inject("PreCompact", "memory"), null);
   assert.equal(cursorWire.inject("Stop", "memory"), null);
 
-  // Claude's `systemMessage` reaches nobody on Cursor; `continue` is dropped at stop.
-  assert.deepEqual(cursorWire.note("Stop", "2 candidates"), { followup_message: "2 candidates" });
+  // Cursor has no safe note channel: `followup_message` is auto-follow-up, not
+  // a message. Returning it from Stop drove a self-feeding loop -- 6 Stop hooks
+  // in 90s from one prompt, each drafting a candidate from the audit trail the
+  // last one wrote. Never reintroduce this.
+  assert.equal(cursorWire.note("Stop", "2 candidates"), null);
+  assert.equal(cursorWire.note("SessionStart", "2 candidates"), null);
+});
+
+test("Cursor: a Stop note is dropped, never sent as followup_message", () => {
+  const { output, dropped } = renderIntent(cursorWire, noteIntent("1 candidate drafted"));
+
+  assert.equal(
+    output.followup_message,
+    undefined,
+    "followup_message continues the agent -- announcing a candidate must never cost a turn",
+  );
+  assert.ok(dropped, "the undeliverable note must still be recorded");
 });
 
 test("Cursor resolves to its OWN wire, not the Claude fallback", () => {

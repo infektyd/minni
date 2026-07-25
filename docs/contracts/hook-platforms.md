@@ -245,3 +245,25 @@ wire layer exists to eliminate. A test now pins `wireFor("cursor").id === "curso
 If you add a platform: give it a profile, set `wire:` on its config, and let the
 adapter handle only what genuinely bypasses the wire (the `PreToolUse` guard
 output, which is not an `EnvelopeEvent`).
+
+## Cursor: `followup_message` is an action, not a message
+
+Cursor's `stop` accepts exactly one field, `followup_message`, and it is the
+**auto-follow-up** mechanism — returning it drives another agent turn, bounded
+by `loop_limit` (default 5). It is not a way to tell the user something.
+
+Using it to announce a drafted learn candidate is self-feeding, and this was
+observed live: **6 Stop hooks in 90 seconds from a single prompt**, each
+drafting an inbox candidate built from the audit trail the previous one had just
+written. The Cursor agent diagnosed it itself — *"the stop hook is feeding its
+own audit trail back into the inbox each turn"* — and spent five turns rejecting
+its own garbage.
+
+Cursor therefore has **no human-facing note channel**. Notes are dropped and
+recorded. Announcing a candidate is never worth spending a model turn.
+
+The general rule this is an instance of: **before rendering an intent into a
+platform field, check whether that field has side effects.** `systemMessage`
+(Claude), `followup_message` (Cursor) and `injectSteps` (agy) look
+interchangeable and are not — one is inert, one continues the agent, one is
+rejected outright at `Stop`.
