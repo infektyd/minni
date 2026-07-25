@@ -69,15 +69,41 @@ function expandTilde(dirPath: string): string {
 }
 
 /**
+ * Platforms whose default filesystem is case-INSENSITIVE, so `…/Projects` and
+ * `…/projects` name one directory and must produce one workspace label.
+ */
+const CASE_INSENSITIVE_PLATFORM = process.platform === "darwin" || process.platform === "win32";
+
+/**
  * Canonicalize an input path for the project-root walk: expand `~`, resolve to
  * absolute, then COLLAPSE SYMLINKS. path.resolve does not touch symlinks, so
  * without the realpath a directory reached two ways — `/w/link` where `link` ->
  * `/w/repo/src` — yields two different workspace labels and splits one
  * project's memory across two partitions. Paths not yet on disk make realpath
  * throw; they keep the plain resolution rather than failing outright.
+ *
+ * On darwin/win32 the JS realpath is NOT enough: it collapses symlinks but
+ * preserves whatever casing the caller typed, so on APFS one directory reached
+ * as `…/Projects/Minni` and as `…/projects/minni` still yielded two labels.
+ * `realpathSync.native` delegates to the OS, which returns the TRUE ON-DISK
+ * casing — the same answer for every spelling of the path.
+ *
+ * Chosen over the cheaper `.toLowerCase()`: the label is a memory PARTITION
+ * KEY, so it has to be stable, and correcting it a second time would orphan
+ * history twice. On-disk casing is a property of the filesystem, not of the
+ * caller, so it is the fixed point; a lowercased label would additionally have
+ * to be un-lowercased to be used as a path anywhere. The cost is one extra
+ * syscall path per hook process, which runs once per event.
  */
 function canonicalizeDir(dirPath: string): string {
   const resolved = path.resolve(dirPath);
+  if (CASE_INSENSITIVE_PLATFORM) {
+    try {
+      return fs.realpathSync.native(resolved);
+    } catch {
+      // fall through to the portable realpath, then to the plain resolution
+    }
+  }
   try {
     return fs.realpathSync(resolved);
   } catch {
@@ -166,6 +192,53 @@ export function workspaceFromPayload(
   // label that depends on where the hook process happened to be launched.
   if (rawCwd) return findProjectRoot(rawCwd) ?? fallback;
   return fallback;
+}
+
+/**
+ * Vault dir slug -> canonical agent id. A VERBATIM mirror of
+ * `_VAULT_SLUG_TO_AGENT_ID` in src/minni/afm_passes/inbox_ingest.py; the two
+ * tables must be edited together.
+ */
+const VAULT_SLUG_TO_AGENT_ID: Readonly<Record<string, string>> = {
+  claudecode: "claude-code",
+  codex: "codex",
+  gemini: "gemini",
+  hermes: "hermes",
+  kilocode: "kilocode",
+  openclaw: "openclaw",
+  "grok-build": "grok-build",
+  "grok-beta": "grok-build",
+  grok: "grok-build",
+};
+
+/**
+ * The agent id the INGEST will attribute a file in this vault's inbox to —
+ * i.e. `_principal_for_inbox` (src/minni/afm_passes/inbox_ingest.py) computed
+ * on this side, from the vault DIR NAME and nothing else.
+ *
+ * This exists because inbox_ingest cross-checks a file's `agent_id` against
+ * that principal and DROPS the file (`_agent_mismatch`) on any disagreement.
+ * A writer must therefore stamp the principal, not its own configured id: with
+ * `MINNI_CLAUDECODE_AGENT_ID=claudecode` the two differ ("claudecode" vs
+ * "claude-code") and every candidate is silently discarded. Deriving both
+ * sides from the same input makes them agree by construction.
+ *
+ * Deliberately NOT `getAgentIdFromVaultPath` (vault.ts): that one answers "who
+ * owns this vault" and consults MINNI_AGENT_VAULTS / MINNI_*_VAULT_PATH env
+ * mappings the Python side never sees, so it can return an id for a directory
+ * whose NAME implies a different principal.
+ *
+ * Returns undefined when the dir has no `-vault` suffix (e.g. the daemon's own
+ * `~/.minni/vault`): Python then falls back to a principal this side cannot
+ * know, so there is no honest stamp to write — and an ABSENT `agent_id` skips
+ * the cross-check entirely rather than failing it.
+ */
+export function inboxPrincipalForVaultPath(vaultPath: string): string | undefined {
+  const base = path.basename(path.resolve(expandTilde(vaultPath)));
+  if (!base.endsWith("-vault")) return undefined;
+  const slug = base.slice(0, -"-vault".length);
+  if (!slug) return undefined;
+  return VAULT_SLUG_TO_AGENT_ID[slug] ?? slug;
 }
 
 export function vaultRecallToBody(vault: VaultSearchResult[]): unknown {

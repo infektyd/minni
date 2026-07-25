@@ -76,7 +76,11 @@ async function runGeminiHook(event, fixture, payload, extraEnv = {}) {
 test("adaptAgyPayload maps agy fields to the factory's canonical names", () => {
   const adapted = adaptAgyPayload(agyPreToolUsePayload({ workspacePaths: ["/w/repo"] }));
   assert.equal(adapted.session_id, "cfcd2d03-9775-4ff2-8667-ba461998307f");
-  assert.equal(adapted.workspace_id, "/w/repo");
+  // workspacePaths is agy's CWD, not a workspace LABEL: it must feed `cwd` so
+  // the shared resolver applies the project-root walk + realpath every other
+  // entrypoint gets. Pre-empting `workspace_id` skipped both.
+  assert.equal(adapted.cwd, "/w/repo");
+  assert.equal(adapted.workspace_id, undefined);
   assert.equal(adapted.tool_name, "Bash");
   assert.deepEqual(adapted.tool_input, {
     command: "echo hello",
@@ -97,7 +101,7 @@ test("adaptAgyPayload never clobbers canonical fields and passes unknown tools t
   assert.equal(native.session_id, "native-session");
   assert.equal(native.tool_name, "browser_navigate");
   assert.deepEqual(native.tool_input, { Url: "https://x" });
-  assert.equal(native.workspace_id, "/w/second");
+  assert.equal(native.cwd, "/w/second");
 });
 
 test("adaptPreToolUseOutput: allow collapses to explicit approve, deny carries the reason", () => {

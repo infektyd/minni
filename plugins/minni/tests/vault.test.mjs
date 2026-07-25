@@ -460,14 +460,48 @@ for (const [name, query, body] of [
       const results = await searchVaultNotes(root, query, 5);
       assert.equal(results.length, 1, `'${query}' must reach '${name}'`);
       assert.ok(
-        results[0].score >= 50,
-        `the exact-phrase bonus must survive inflection (got ${results[0].score})`,
+        results[0].score > 0,
+        `an inflected hit is evidence (got ${results[0].score})`,
       );
     } finally {
       await rm(root, { recursive: true, force: true });
     }
   });
 }
+
+// The inflection is TERM evidence only. Letting it satisfy the exact-phrase
+// check handed the +50 bonus to notes that never contain the query, and they
+// then took the user-visible top slots: on claudecode-vault `land` had 4 of its
+// 5 top results carrying no literal "land", all of them via "landed".
+test("searchVaultNotes never awards the exact-phrase bonus for an inflection", async () => {
+  const root = await seedScoringVault({
+    "wiki/concepts/inflected-note.md":
+      "# Ladder\n\nStage 7 landed, then the promotion landed, and the gate landed.\n",
+    "wiki/concepts/literal-note.md": "# Survey\n\nWe surveyed the land once.\n",
+  });
+  try {
+    const results = await searchVaultNotes(root, "land", 5);
+    assert.equal(results.length, 2, "both notes carry evidence");
+
+    const literal = results.find((r) => /literal-note\.md$/.test(r.relativePath));
+    const inflected = results.find((r) =>
+      /inflected-note\.md$/.test(r.relativePath),
+    );
+    assert.ok(
+      literal.score >= 50,
+      `a literal occurrence still earns the bonus (got ${literal.score})`,
+    );
+    assert.ok(
+      inflected.score > 0 && inflected.score < 50,
+      `an inflection-only note must be admitted but unbonused (got ${inflected.score})`,
+    );
+    // The ranking is the user-visible defect: three "landed" hits outscored one
+    // literal "land" only because the bonus applied to both.
+    assert.match(results[0].relativePath, /literal-note\.md$/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 // `_` is a word-edge character (so `_private` still anchors) but NOT a word
 // boundary character (so identifier compounds count). Both halves matter and
@@ -539,6 +573,96 @@ test("searchVaultNotes still answers stopword-only queries", async () => {
     const results = await searchVaultNotes(root, "why?", 5);
     assert.equal(results.length, 1, "'why?' must not return nothing");
     assert.match(results[0].relativePath, /why-note\.md$/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+// A query that tokenises to nothing must not reach the scorer with a phrase
+// that has no substance. Each fixture below trimmed down to a single character
+// or to pure punctuation and was then matched as a whole "phrase", collecting
+// the full +50 bonus on notes with no relation to the query: on the real
+// claudecode vault (437 notes) `c#` and `c++` returned 93 each, `r?` 16, and
+// `-` and `/` returned 376 apiece.
+const EMPTY_PHRASE_QUERIES = [
+  ["c-sharp", "c#"],
+  ["c-plus-plus", "c++"],
+  ["r-question", "r?"],
+  ["bare-hyphen", "-"],
+  ["bare-underscore", "_"],
+  ["bare-slash", "/"],
+  // Alphanumeric under Unicode, so only the 2-character minimum excludes it —
+  // on the same ground as the ASCII "c", not because it is punctuation.
+  ["accented-letter", "é"],
+  ["bare-letter", "c"],
+  ["lone-ideograph", "節"],
+];
+
+for (const [name, query] of EMPTY_PHRASE_QUERIES) {
+  test(`searchVaultNotes returns nothing for the ${name} query`, async () => {
+    const root = await seedScoringVault({
+      // Every character the fixtures could latch onto, in prose that has
+      // nothing to do with any of them.
+      "wiki/concepts/hyphen-note.md":
+        "# Kit\n\nThe delegate-and-idle pattern uses c and r flags.\n",
+      "wiki/concepts/slash-note.md":
+        "# Paths\n\nSee scripts/build and docs/notes for x_private, a lone _ marker, é and 節.\n",
+      "wiki/sessions/session-note.md":
+        "# Log\n\nA C compiler ran; the R report followed.\n",
+    });
+    try {
+      const results = await searchVaultNotes(root, query, 5);
+      assert.equal(
+        results.length,
+        0,
+        `'${query}' has no searchable content (got ${results.length})`,
+      );
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+}
+
+// The second half of the same defect, isolated: a term whose edge characters
+// are non-word at BOTH ends gets no boundary assertion at either edge, so the
+// pattern degrades to a substring search. "-a-" clears the phrase gate (three
+// characters, one of them alphanumeric), which leaves wordRegex as the only
+// thing standing between it and every "-a-" inside a longer token.
+test("searchVaultNotes refuses terms that cannot express a whole-word match", async () => {
+  const root = await seedScoringVault({
+    "wiki/concepts/embedded-note.md": "# Ids\n\nThe x-a-y identifier is used.\n",
+  });
+  try {
+    const results = await searchVaultNotes(root, "-a-", 5);
+    assert.equal(results.length, 0, "'-a-' must not match inside x-a-y");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+// The snippet is the evidence the caller reads. Locating its window with a
+// substring search centred it on occurrences the scorer had explicitly
+// rejected — 44 of 458 top-5 snippets on the real vaults, with `pro` opening
+// windows on "proof", "PROVEN" and "promises".
+test("searchVaultNotes centres the snippet on a whole-word hit", async () => {
+  const filler = "Filler prose that carries no query evidence at all. ".repeat(8);
+  const root = await seedScoringVault({
+    "wiki/concepts/window-note.md":
+      `# Handbook\n\nThe project approach will reproduce the issue. ${filler}A pro tip about tooling closes it out.\n`,
+  });
+  try {
+    const results = await searchVaultNotes(root, "pro", 5);
+    assert.equal(results.length, 1, "'pro tip' is a genuine whole-word hit");
+    assert.match(
+      results[0].snippet,
+      /pro tip/,
+      "the snippet must show the hit the scorer counted",
+    );
+    assert.doesNotMatch(
+      results[0].snippet,
+      /project approach/,
+      "the window must not open on the rejected substring",
+    );
   } finally {
     await rm(root, { recursive: true, force: true });
   }

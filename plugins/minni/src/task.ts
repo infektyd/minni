@@ -667,6 +667,25 @@ function normalizeAfmResponse(data: unknown): Partial<PreparedTaskPacket> {
   return {};
 }
 
+// Redaction is shared with the deterministic composer so the substance gate can
+// judge the SAME text that will eventually be stored. See `outcomeDraft`.
+function redactDraftItem(item: string): string {
+  return item
+    .replace(/\/Users\/[^\s"',)]+/g, "[local-path]")
+    .replace(/\/Volumes\/[^\s"',)]+/g, "[local-path]")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+// Word tokens that carry content AFTER redaction. The `[local-path]` placeholder
+// is stripped first: a path-only summary redacts to nothing but the placeholder,
+// and counting its "local"/"path" as learning content is precisely the hole this
+// closes.
+function contentTokenCount(text: string): number {
+  const stripped = text.replace(/\[local-path\]/g, " ");
+  return (stripped.match(/[\p{L}\p{N}][\p{L}\p{N}'’-]*/gu) ?? []).length;
+}
+
 function normalizeOutcomeDraft(draft: Partial<OutcomeDraft> | undefined): OutcomeDraft {
   const source = draft ?? {};
   const raw: Record<keyof OutcomeDraft, string[]> = {
@@ -675,12 +694,7 @@ function normalizeOutcomeDraft(draft: Partial<OutcomeDraft> | undefined): Outcom
     expires: Array.isArray(source.expires) ? source.expires.filter((item) => typeof item === "string") : [],
     doNotStore: Array.isArray(source.doNotStore) ? source.doNotStore.filter((item) => typeof item === "string") : [],
   };
-  const redact = (item: string): string =>
-    item
-      .replace(/\/Users\/[^\s"',)]+/g, "[local-path]")
-      .replace(/\/Volumes\/[^\s"',)]+/g, "[local-path]")
-      .replace(/\s+/g, " ")
-      .trim();
+  const redact = redactDraftItem;
   const seen = new Set<string>();
   const pick = (items: string[]) => {
     const out: string[] = [];
@@ -1020,6 +1034,12 @@ const AUDIT_TOOL = String.raw`(?:hook|minni|sovereign|agent|afm|handoff|team)_[a
 // scrub, so a pasted log tail no longer begins at a line start.
 const AUDIT_HEADER_LINE = new RegExp(String.raw`##[ \t]+\[[^\]\n]{4,64}\][ \t]+${AUDIT_TOOL}[ \t]*\|`, "i");
 
+// Quoted/bulleted line starts. A pasted log tail is almost never pasted bare:
+// it arrives inside a blockquote (`> hook_stop | …`) or a bullet (`- minni_learn
+// | …`). A plain `^[ \t]*` anchor let that prefix carry the whole audit grammar
+// past the scrub, so the prefix is part of the anchor.
+const AUDIT_LINE_PREFIX = String.raw`[ \t]*(?:[>*\-+][ \t]*)*`;
+
 // Bare form: a header-less tail line, `<tool> | <summary>`. This one MUST be
 // anchored to a line start (multiline). A substring match here is what made the
 // old pattern reject legitimate user prose — "debug the hook_stop | grep
@@ -1027,10 +1047,33 @@ const AUDIT_HEADER_LINE = new RegExp(String.raw`##[ \t]+\[[^\]\n]{4,64}\][ \t]+$
 // telemetry, and since Stop derives `task` from the user's own message a
 // substring match silently zeroed the entire candidate list.
 //
+// The anchor alone is not enough, because a leading `<snake_case> |` is ALSO the
+// shape of ordinary prose and of markdown tables ("agent_id | role | created_at
+// are the three indexed columns.", "team_id | user_id form the composite primary
+// key"). The distinguishing signal is the TAIL, not the head:
+//
+//   * a real audit line has exactly ONE `|` — the tool/summary delimiter. A
+//     second `|` on the line means columns, i.e. a table or an enumeration of
+//     identifiers, never `recordAudit` output.
+//   * a real audit summary is prose about what happened ("stop s1: no draftable
+//     signal", "accepted handoff"); it does not OPEN with another snake_case
+//     identifier. Prose that lists tools does exactly that ("minni_recall |
+//     minni_learn are the two tools …").
+//
+// Both conditions are checked against the tail, so tightening one direction does
+// not loosen the other: the quote/bullet prefix closes the escape while the tail
+// shape closes the false positives.
+//
 // The anchor is why callers must test the RAW fields, not the composed
 // `"<task>: <summary>"` string — the composition would push a genuine bare tail
 // line off the line start. See `outcomeDraft`.
-const AUDIT_BARE_LINE = new RegExp(String.raw`^[ \t]*${AUDIT_TOOL}[ \t]*\|`, "im");
+const AUDIT_BARE_LINE = new RegExp(
+  // The lookahead swallows its own leading whitespace on purpose: hoisting the
+  // `[ \t]*` out in front of it would let the engine backtrack to zero spaces and
+  // satisfy the negative lookahead against the space itself.
+  String.raw`^${AUDIT_LINE_PREFIX}${AUDIT_TOOL}[ \t]*\|(?![ \t]*[a-z0-9]+_[a-z0-9]+)[^|\n]*$`,
+  "im",
+);
 
 export function isAuditTelemetryLine(text: string): boolean {
   return AUDIT_HEADER_LINE.test(text) || AUDIT_BARE_LINE.test(text);
@@ -1049,15 +1092,24 @@ function outcomeDraft(input: PrepareOutcomeInput): OutcomeDraft {
   const verification = input.verification ?? [];
   const changedFiles = input.changedFiles ?? [];
   const summary = input.summary ?? "";
-  // A candidate carries learning content only if the SUMMARY does. "Substance"
-  // means at least one letter or digit: a missing, whitespace-only, or
-  // punctuation-only summary ("", "   ", "  .  ") composes to `"<task>:"` —
-  // non-empty, so it survives normalization and the hook's zero-candidate guard,
-  // and an inbox file gets written whose candidate teaches nothing (worst case,
-  // with no `last_user_message`, the literal session id: "s2:"). `changedFiles`
+  // A candidate carries learning content only if the SUMMARY does. `changedFiles`
   // stay log-only enrichment on purpose — a file list is not a learning and must
   // never by itself manufacture a candidate.
-  const hasSubstance = /[\p{L}\p{N}]/u.test(summary);
+  //
+  // ORDERING (do not reorder): the gate runs on the REDACTED summary, because
+  // `normalizeOutcomeDraft` redacts AFTER this function composes. A "one letter
+  // or digit anywhere" test on the RAW summary passed a path-only summary
+  // ("/Users/…/src/x.ts"), which redaction then emptied to "[local-path]" — a
+  // candidate with zero content, written to the inbox. Redacting first is what
+  // makes the gate judge the text that actually gets stored.
+  //
+  // THRESHOLD: at least two content word tokens. One token is an
+  // acknowledgement, not a learning — "ok", "a", "done" compose to
+  // `"<task>: ok"` (worst case, with no `last_user_message`, "ok: ok") and teach
+  // nothing, while the shortest genuine learning we carry a green assertion for
+  // ("Use WAL") is two. Punctuation-only and whitespace-only summaries score
+  // zero, as does a summary that redaction empties.
+  const hasSubstance = contentTokenCount(redactDraftItem(summary)) >= 2;
   const telemetry = isAuditTelemetryLine(input.task) || isAuditTelemetryLine(summary);
   const rawCandidate = `${input.task}: ${summary}`.replace(/\s+/g, " ").slice(0, 500);
   const learnCandidates = hasSubstance && !telemetry ? [rawCandidate] : [];

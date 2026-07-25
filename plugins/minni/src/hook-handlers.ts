@@ -20,6 +20,7 @@ import {
   VALID_EVENTS,
   asString,
   emit,
+  inboxPrincipalForVaultPath,
   readStdin,
   stringArray,
   vaultRecallToBody,
@@ -194,7 +195,11 @@ export async function handleStopCore(
   // supplies genuine outcome material in the payload (today's real harnesses
   // never do). Absent that — or when the material scrubs to zero candidates
   // at the guard below — Stop records ONE log-only breadcrumb (so the session
-  // is not silently invisible) and writes no inbox file. This holds on EVERY
+  // is not silently invisible) and writes no inbox file. That breadcrumb is
+  // load-bearing, and it is only actually reaching log.md because vault.ts
+  // exempts `*_stop` from the hook_* audit throttle — before that exemption a
+  // same-second UserPromptSubmit swallowed it and the claim above was false.
+  // Keep the two in sync. This holds on EVERY
   // platform, claude-code included: there is no per-agent opt-out (see the
   // retired `alwaysWriteStopInbox` note on AgentHookConfig).
   // NOTE: this is a governance-posture change — it needs operator sign-off
@@ -246,9 +251,18 @@ export async function handleStopCore(
   // an unstamped file lands in the catch-all workspace no matter what cwd the
   // session ran in, and `agent_id` is cross-checked against the vault-derived
   // principal for provenance. `kind` names the FILE FORMAT, never the author.
+  //
+  // The `agent_id` stamp is the INGEST's principal (inboxPrincipalForVaultPath),
+  // NOT `config.agentId`. That cross-check is an equality test that DROPS the
+  // file on mismatch, and the configured id is operator-settable
+  // (MINNI_CLAUDECODE_AGENT_ID=claudecode) while the principal is derived from
+  // the vault dir name — so stamping the config id silently discarded every
+  // Claude Code candidate as `_agent_mismatch`. Undefined (a vault dir with no
+  // `-vault` suffix) writes NO stamp: an absent agent_id skips the cross-check,
+  // which is the pre-stamp behavior and strictly better than a wrong guess.
   const inbox = await writeInbox(config.vaultPath, sessionId, {
     kind: "stop_candidates",
-    agent_id: config.agentId,
+    agent_id: inboxPrincipalForVaultPath(config.vaultPath),
     workspace_id: workspaceId,
     candidates,
     log_only: outcome.outcomeDraft.logOnly,

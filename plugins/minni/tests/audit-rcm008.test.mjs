@@ -20,9 +20,13 @@ test("RCM-008: hook rate-limiting drops duplicate hook audit entries without fai
 
     await ensureVault(root);
 
+    // The limiter is keyed per (agent, TOOL) — a per-agent key let any hook_*
+    // line suppress an unrelated one, which silently ate the Stop governance
+    // breadcrumb. Flooding is still capped, so the duplicate here is the SAME
+    // tool firing three times inside/around one window.
     const now = new Date();
     await recordAudit(root, {
-      tool: "hook_session_start",
+      tool: "hook_user_prompt_submit",
       summary: "First audit",
       timestamp: now,
     });
@@ -34,7 +38,7 @@ test("RCM-008: hook rate-limiting drops duplicate hook audit entries without fai
     });
 
     const okPath = await recordAudit(root, {
-      tool: "hook_pre_compact",
+      tool: "hook_user_prompt_submit",
       summary: "Third audit ok",
       timestamp: new Date(now.getTime() + 5000),
     });
@@ -70,9 +74,13 @@ test("RCM-008: hook rate-limiting timestamp file has strict permissions", async 
 
     await ensureVault(root);
 
+    // The limiter is keyed per (agent, TOOL) — a per-agent key let any hook_*
+    // line suppress an unrelated one, which silently ate the Stop governance
+    // breadcrumb. Flooding is still capped, so the duplicate here is the SAME
+    // tool firing three times inside/around one window.
     const now = new Date();
     await recordAudit(root, {
-      tool: "hook_session_start",
+      tool: "hook_user_prompt_submit",
       summary: "First audit",
       timestamp: now,
     });
@@ -84,14 +92,14 @@ test("RCM-008: hook rate-limiting timestamp file has strict permissions", async 
     });
 
     const okPath = await recordAudit(root, {
-      tool: "hook_pre_compact",
+      tool: "hook_user_prompt_submit",
       summary: "Third audit ok",
       timestamp: new Date(now.getTime() + 5000),
     });
     assert.ok(okPath);
 
     // Verify rate limit file has mode 0o600 (on UNIX platforms)
-    const agentTsFile = path.join(home, ".hook-audit-ts", "rate-limit.ts");
+    const agentTsFile = path.join(home, ".hook-audit-ts", "rate-limit__hook_user_prompt_submit.ts");
     const st = await stat(agentTsFile);
     if (process.platform !== "win32") {
       const mode = st.mode & 0o777;

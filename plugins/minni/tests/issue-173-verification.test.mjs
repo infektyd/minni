@@ -1,9 +1,14 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { isAuditTelemetryLine } from "../dist/task.js";
-import { workspaceFromPayload, findProjectRoot } from "../dist/hook-utils.js";
+import {
+  workspaceFromPayload,
+  findProjectRoot,
+  inboxPrincipalForVaultPath,
+} from "../dist/hook-utils.js";
+import { adaptAgyPayload } from "../dist/gemini-adapter.js";
 import { searchVaultNotes, ensureVault, vaultFirstLearn } from "../dist/vault.js";
-import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -235,6 +240,96 @@ test("Issue #173: findProjectRoot never attributes a DESCENDANT to $HOME; $HOME 
   } finally {
     if (savedHome === undefined) delete process.env.HOME;
     else process.env.HOME = savedHome;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+// ── Red-team pass 3 ──────────────────────────────────────────────────────────
+
+test("Issue #173 D1: agy workspacePaths and a claude cwd label the SAME directory identically", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-agy-ws-"));
+  try {
+    const base = await realpath(root);
+    const repo = path.join(base, "repo");
+    const sub = path.join(repo, "sub");
+    await mkdir(path.join(repo, ".git"), { recursive: true });
+    await mkdir(sub, { recursive: true });
+
+    // agy hands the hook a workspacePaths array; claude-code hands it a cwd.
+    // Same physical directory => one workspace label, or the two surfaces
+    // partition the same project's memory into two shelves.
+    const gemini = workspaceFromPayload(adaptAgyPayload({ workspacePaths: [sub] }), "gemini-fallback");
+    const claude = workspaceFromPayload({ cwd: sub }, "claudecode-fallback");
+    assert.equal(gemini, repo, "agy payload must walk to the project root");
+    assert.equal(gemini, claude, "agy and claude-code must agree on the label");
+
+    // A symlinked agy workspace collapses onto the same root too.
+    const link = path.join(base, "link");
+    await symlink(sub, link, "dir");
+    assert.equal(
+      workspaceFromPayload(adaptAgyPayload({ workspacePaths: [link] }), "gemini-fallback"),
+      repo,
+    );
+
+    // ...but a genuinely explicit, caller-supplied workspace_id still wins:
+    // the short-circuit in workspaceFromPayload keeps its meaning.
+    assert.equal(
+      workspaceFromPayload(
+        adaptAgyPayload({ workspacePaths: [sub], workspace_id: "workspace-pinned" }),
+        "gemini-fallback",
+      ),
+      "workspace-pinned",
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Issue #173 D2: inbox agent_id is derived from the vault dir, matching _principal_for_inbox", () => {
+  // Mirrors src/minni/afm_passes/inbox_ingest.py::_principal_for_inbox — the
+  // consumer that drops rows as _agent_mismatch when the stamp disagrees.
+  assert.equal(inboxPrincipalForVaultPath("/x/.minni/claudecode-vault"), "claude-code");
+  assert.equal(inboxPrincipalForVaultPath("/x/.minni/codex-vault"), "codex");
+  assert.equal(inboxPrincipalForVaultPath("/x/.minni/grok-vault"), "grok-build");
+  assert.equal(inboxPrincipalForVaultPath("/x/.minni/grok-beta-vault"), "grok-build");
+  assert.equal(inboxPrincipalForVaultPath("/x/.minni/grok-build-vault"), "grok-build");
+  assert.equal(inboxPrincipalForVaultPath("/x/.minni/gemini-vault"), "gemini");
+  assert.equal(inboxPrincipalForVaultPath("/x/.minni/teamup-vault"), "teamup");
+  // The daemon's own bare vault has no `-vault` suffix: python falls back to a
+  // principal this side cannot know, so there is NO honest stamp to write.
+  assert.equal(inboxPrincipalForVaultPath("/x/.minni/vault"), undefined);
+});
+
+test("Issue #173 D4: one directory reached through two casings yields one workspace label", async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-case-ws-"));
+  try {
+    const base = await realpath(root);
+    const repo = path.join(base, "Repo");
+    const sub = path.join(repo, "Sub");
+    await mkdir(path.join(repo, ".git"), { recursive: true });
+    await mkdir(sub, { recursive: true });
+
+    // Only meaningful on a case-INSENSITIVE volume; skip elsewhere rather than
+    // assert a platform behavior that legitimately differs.
+    const lowered = path.join(base, "repo", "sub");
+    try {
+      await readdir(lowered);
+    } catch {
+      t.skip("case-sensitive filesystem");
+      return;
+    }
+
+    assert.equal(
+      workspaceFromPayload({ cwd: lowered }, "fallback"),
+      repo,
+      "the label must carry the true on-disk casing, not the caller's",
+    );
+    assert.equal(
+      workspaceFromPayload({ cwd: lowered }, "fallback"),
+      workspaceFromPayload({ cwd: sub }, "fallback"),
+      "two casings of one directory must not split the memory partition",
+    );
+  } finally {
     await rm(root, { recursive: true, force: true });
   }
 });

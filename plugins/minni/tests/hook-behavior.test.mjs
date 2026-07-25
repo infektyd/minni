@@ -184,7 +184,10 @@ const STOP_AGENTS = [
 for (const agent of STOP_AGENTS) {
   test(`Stop hook (${agent.name}): drafts ONE stop_candidates inbox file with identity stamps`, { timeout: 120_000 }, async () => {
     const root = await mkdtemp(path.join(tmpdir(), `sm-hook-stop-${agent.name}-`));
-    const fixture = { vault: path.join(root, "vault"), home: path.join(root, "home") };
+    // `<slug>-vault`, like a real install: the agent_id stamp is derived from
+    // the vault DIR NAME (inboxPrincipalForVaultPath), because that is what
+    // inbox_ingest.py's `_principal_for_inbox` cross-check compares against.
+    const fixture = { vault: path.join(root, `${agent.name}-vault`), home: path.join(root, "home") };
     try {
       await mkdir(fixture.home, { recursive: true });
       // Stop auto-draft is RETIRED; the only way Stop writes a file now is the
@@ -552,6 +555,118 @@ test("SessionStart hook (kilocode): identity-recall envelope keeps recall + pend
     assert.equal(body.fallback_commands, undefined);
     assert.equal(body.identity.runtime, undefined);
   } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+// ── Red-team pass 3: the governance breadcrumb must actually land ────────────
+
+test("Stop breadcrumb survives a same-second UserPromptSubmit (audit throttle is per-tool)", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-hook-throttle-"));
+  const savedHome = process.env.MINNI_HOME;
+  const savedBypass = process.env.MINNI_BYPASS_AUDIT_LIMIT;
+  process.env.MINNI_HOME = path.join(root, "home");
+  // NO bypass on purpose: this is the shipped rate-limiter path. With the
+  // limiter keyed per AGENT, the UserPromptSubmit stamp swallowed the Stop
+  // breadcrumb that is now the ONLY record of a zero-candidate turn.
+  delete process.env.MINNI_BYPASS_AUDIT_LIMIT;
+  try {
+    const vault = path.join(root, "grok-vault");
+    await mkdir(vault, { recursive: true });
+    const handlers = createHookHandlers(stopConfig(vault));
+    await handlers.handleUserPromptSubmit({ session_id: "z1", prompt: "how do I fix the sqlite lock" });
+    await handlers.handleStop({ session_id: "z1", last_user_message: "how do I fix the sqlite lock" });
+
+    const tail = await auditTail(vault, 20);
+    assert.match(tail.text, /hook_test_user_prompt_submit/, "prompt breadcrumb recorded");
+    assert.match(tail.text, /hook_test_stop/, "Stop breadcrumb must not be throttled away");
+
+    // Flood protection is NOT reopened: a second same-window UserPromptSubmit
+    // is still collapsed by its own per-tool stamp.
+    await handlers.handleUserPromptSubmit({ session_id: "z1", prompt: "and the wal mode question" });
+    const after = await auditTail(vault, 20);
+    assert.equal(
+      (after.text.match(/hook_test_user_prompt_submit/g) ?? []).length,
+      1,
+      "repeat prompts inside the 5s window stay collapsed",
+    );
+  } finally {
+    if (savedHome === undefined) delete process.env.MINNI_HOME;
+    else process.env.MINNI_HOME = savedHome;
+    if (savedBypass !== undefined) process.env.MINNI_BYPASS_AUDIT_LIMIT = savedBypass;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Two consecutive no-signal Stops both leave a breadcrumb", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-hook-stop-twice-"));
+  const savedHome = process.env.MINNI_HOME;
+  const savedBypass = process.env.MINNI_BYPASS_AUDIT_LIMIT;
+  process.env.MINNI_HOME = path.join(root, "home");
+  delete process.env.MINNI_BYPASS_AUDIT_LIMIT;
+  try {
+    const vault = path.join(root, "grok-vault");
+    await mkdir(vault, { recursive: true });
+    const handlers = createHookHandlers(stopConfig(vault));
+    await handlers.handleStop({ session_id: "s1", last_user_message: "first" });
+    await handlers.handleStop({ session_id: "s2", last_user_message: "second" });
+    const tail = await auditTail(vault, 20);
+    assert.equal(
+      (tail.text.match(/hook_test_stop/g) ?? []).length,
+      2,
+      "the Stop breadcrumb is exempt from the throttle — it is the only record",
+    );
+  } finally {
+    if (savedHome === undefined) delete process.env.MINNI_HOME;
+    else process.env.MINNI_HOME = savedHome;
+    if (savedBypass !== undefined) process.env.MINNI_BYPASS_AUDIT_LIMIT = savedBypass;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Stop stamps the vault-derived principal, not the configured agent id", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-hook-stamp-"));
+  const savedHome = process.env.MINNI_HOME;
+  const savedBypass = process.env.MINNI_BYPASS_AUDIT_LIMIT;
+  process.env.MINNI_HOME = path.join(root, "home");
+  process.env.MINNI_BYPASS_AUDIT_LIMIT = "true";
+  try {
+    // MINNI_CLAUDECODE_AGENT_ID=claudecode is a legal operator setting; the
+    // ingest compares the stamp against the vault-dir principal (claude-code),
+    // so stamping the raw config id dropped every row as _agent_mismatch.
+    const vault = path.join(root, "claudecode-vault");
+    await mkdir(vault, { recursive: true });
+    const handlers = createHookHandlers(stopConfig(vault, "claudecode"));
+    await handlers.handleStop({
+      session_id: "stamp-1",
+      summary: "shipped the retry fix and verified the suite passes",
+      changedFiles: ["src/retry.ts"],
+    });
+    const names = (await readdir(path.join(vault, "inbox"))).filter((n) => n.endsWith(".json"));
+    assert.equal(names.length, 1);
+    const body = JSON.parse(await readFile(path.join(vault, "inbox", names[0]), "utf8"));
+    assert.equal(body.agent_id, "claude-code", "stamp must match _principal_for_inbox");
+
+    // A vault dir with no `-vault` suffix has no derivable principal on this
+    // side (python falls back to a value we cannot know), so no stamp at all —
+    // an absent agent_id skips the cross-check instead of failing it.
+    const bare = path.join(root, "vault");
+    await mkdir(bare, { recursive: true });
+    const bareHandlers = createHookHandlers(stopConfig(bare, "claudecode"));
+    await bareHandlers.handleStop({
+      session_id: "stamp-2",
+      summary: "shipped the retry fix and verified the suite passes",
+      changedFiles: ["src/retry.ts"],
+    });
+    const bareNames = (await readdir(path.join(bare, "inbox"))).filter((n) => n.endsWith(".json"));
+    assert.equal(bareNames.length, 1);
+    const bareBody = JSON.parse(await readFile(path.join(bare, "inbox", bareNames[0]), "utf8"));
+    assert.equal(bareBody.agent_id, undefined, "no derivable principal => no stamp");
+  } finally {
+    if (savedHome === undefined) delete process.env.MINNI_HOME;
+    else process.env.MINNI_HOME = savedHome;
+    if (savedBypass === undefined) delete process.env.MINNI_BYPASS_AUDIT_LIMIT;
+    else process.env.MINNI_BYPASS_AUDIT_LIMIT = savedBypass;
     await rm(root, { recursive: true, force: true });
   }
 });
