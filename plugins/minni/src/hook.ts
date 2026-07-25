@@ -21,10 +21,11 @@ import {
   asString,
   emit,
   readStdin,
-  stringArray,
   VALID_EVENTS,
 } from "./hook-utils.js";
 import type { HookOutput } from "./hook-utils.js";
+import { handleStopCore } from "./hook-handlers.js";
+import type { StopCoreConfig } from "./hook-handlers.js";
 import { routeMemoryIntent } from "./policy.js";
 import {
   buildRecallPointer,
@@ -59,7 +60,7 @@ import {
   stashPrecompactReassert,
   subscribeContradictions,
 } from "./sovereign.js";
-import { classifyIntent, extractScarTissue, filterSafeVaultResults, prepareOutcome } from "./task.js";
+import { classifyIntent, extractScarTissue, filterSafeVaultResults } from "./task.js";
 import {
   auditTail,
   collectCorrectionsReassert,
@@ -71,7 +72,6 @@ import {
   resolveInboxHandoffContext,
   searchVaultNotes,
   settleReassertedInboxEntries,
-  writeInbox,
 } from "./vault.js";
 
 async function handleSessionStart(payload: Record<string, unknown>): Promise<HookOutput> {
@@ -520,70 +520,21 @@ async function handlePreCompact(payload: Record<string, unknown>): Promise<HookO
   return { continue: true };
 }
 
+// Stop is NOT a claude-code-specific handler. It routes to the shared
+// handleStopCore so the governance posture, the zero-candidate write guard and
+// the inbox ingest stamps (kind/agent_id/workspace_id) exist exactly once —
+// this file's private copy had drifted from the factory's on all three. Only
+// the audit prefix and the commit call-to-action are claude-code's own.
+const CLAUDECODE_STOP_CONFIG: StopCoreConfig = {
+  agentId: CLAUDECODE_AGENT_ID,
+  vaultPath: CLAUDECODE_VAULT_PATH,
+  defaultWorkspaceId: CLAUDECODE_WORKSPACE_ID,
+  auditPrefix: "hook",
+  stopCommitHint: "Use /minni:learn to commit.",
+};
+
 async function handleStop(payload: Record<string, unknown>): Promise<HookOutput> {
-  await ensureVault(CLAUDECODE_VAULT_PATH);
-  const sessionId = asString(payload.session_id) || asString(payload.sessionId) || "session";
-  const lastTask = asString(payload.last_user_message) || asString(payload.summary) || sessionId;
-
-  const changedFiles = stringArray(payload.changedFiles ?? payload.changed_files);
-  const outcomeSummary = asString(payload.summary).trim();
-  const hasDraftableSignal = changedFiles.length > 0 || outcomeSummary.length > 0;
-
-  if (!hasDraftableSignal) {
-    await recordAudit(CLAUDECODE_VAULT_PATH, {
-      tool: "hook_stop",
-      summary: `stop ${sessionId}: no draftable signal`,
-      details: { candidates: 0 },
-    });
-    return { continue: true };
-  }
-
-  const outcome = await prepareOutcome({
-    task: lastTask.slice(0, 200),
-    summary: outcomeSummary,
-    changedFiles,
-    profile: "compact",
-    vaultPath: CLAUDECODE_VAULT_PATH,
-  });
-
-  const candidates = outcome.outcomeDraft.learnCandidates;
-
-  // Draftable signal, but prepareOutcome's telemetry filter scrubbed it to
-  // nothing (see the shared factory's handleStop for the full rationale): the
-  // scrub must hold at the write layer, so record one breadcrumb and write no
-  // inbox file rather than littering the inbox with a zero-candidate draft.
-  if (candidates.length === 0) {
-    await recordAudit(CLAUDECODE_VAULT_PATH, {
-      tool: "hook_stop",
-      summary: `stop ${sessionId}: no candidates after scrub`,
-      details: { candidates: 0 },
-    });
-    return { continue: true };
-  }
-
-  const inbox = await writeInbox(CLAUDECODE_VAULT_PATH, sessionId, {
-    candidates,
-    log_only: outcome.outcomeDraft.logOnly,
-    expires: outcome.outcomeDraft.expires,
-    do_not_store: outcome.outcomeDraft.doNotStore,
-    last_task: lastTask.slice(0, 200),
-  });
-
-  await recordAudit(CLAUDECODE_VAULT_PATH, {
-    tool: "hook_stop",
-    summary: `stop ${sessionId}`,
-    details: {
-      candidates: candidates.length,
-      inbox_path: inbox.filePath,
-    },
-  });
-
-  return {
-    continue: true,
-    systemMessage: `Minni: ${candidates.length} candidate learning${
-      candidates.length === 1 ? "" : "s"
-    } drafted to inbox (${inbox.filePath}). Use /minni:learn to commit.`,
-  };
+  return handleStopCore(CLAUDECODE_STOP_CONFIG, payload);
 }
 
 // s6 PreToolUse recall guard (BACKSTOP). claude-code is NOT special: same logic

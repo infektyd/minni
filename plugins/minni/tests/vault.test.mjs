@@ -384,11 +384,11 @@ test("searchVaultNotes matches flag-shaped query terms without matching the bare
   }
 });
 
-// MIN_SEARCH_SCORE is a noise floor, not a recall cliff. A session note with a
-// single genuine term hit scores 1 (term) + 1 (wiki/sessions) = 2 and must
-// still be recalled; a note with the same single hit and no corroborating
-// signal scores 1 and is dropped.
-test("searchVaultNotes keeps single-hit session notes above the noise floor", async () => {
+// MIN_TERM_SCORE is a noise floor, not a recall cliff. One whole-word hit is
+// evidence; a floor of 2 discarded ~30% of the notes where main had a genuine
+// whole-word match, because whole-word matching had already removed the noise
+// the floor was aimed at.
+test("searchVaultNotes recalls a note with a single whole-word hit", async () => {
   const root = await seedScoringVault({
     "wiki/sessions/session-note.md":
       "# Daily log\n\nWe touched alpha today.\n",
@@ -396,9 +396,149 @@ test("searchVaultNotes keeps single-hit session notes above the noise floor", as
   });
   try {
     const results = await searchVaultNotes(root, "alpha beta", 5);
-    assert.equal(results.length, 1);
+    assert.equal(results.length, 2, "one body hit is enough to be recalled");
     assert.match(results[0].relativePath, /session-note\.md$/);
     assert.equal(results[0].score, 2, "1 term hit + 1 session bonus");
+    assert.equal(results[1].score, 1, "1 term hit, no bonus");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+// The floor gates term evidence, never the final score. Applied to the final
+// score it inverted correction salience: a correction note with one hit
+// finished at 1 * 1.25 = 1.25 and was cut while a plain session note with the
+// same evidence finished at 2 and survived — the boosted class was the deleted
+// class.
+test("searchVaultNotes does not let the noise floor delete boosted correction notes", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-score-"));
+  await ensureVault(root);
+  await mkdir(path.join(root, "wiki", "concepts"), { recursive: true });
+  try {
+    await writeFile(
+      path.join(root, "wiki", "concepts", "correction-note.md"),
+      "---\nstatus: accepted\ntype: correction\n---\n\n# Note\n\nWe corrected alpha.\n",
+      "utf8",
+    );
+    const results = await searchVaultNotes(root, "alpha beta", 5);
+    assert.equal(results.length, 1, "a correction-class note must survive");
+    assert.equal(results[0].score, 1.25, "1 term hit * (1 + 0.25) salience");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+// Morphological tolerance — the three exact regressions measured against main.
+// Vault prose does not agree with query wording on number, and strict
+// whole-word matching turned real notes into zero-score notes outright.
+for (const [name, query, body] of [
+  [
+    // plan-3a21c152c0d609b3.md: `learnings` x9, `learnings_fts` x10,
+    // `learning_id` x2, `search_learnings` x3, standalone `learning` x0.
+    "learning/learnings",
+    "learning",
+    "# Schema\n\nThe learnings table and learnings_fts index share a learning_id; search_learnings reads both.\n",
+  ],
+  [
+    // plan-98572c3eb1ea4394.md: `pipelines` only.
+    "pipeline/pipelines",
+    "pipeline",
+    "# Build\n\nBoth pipelines run nightly.\n",
+  ],
+  [
+    // minniplan-acceptance-spec-...md: `timeouts` only.
+    "timeout/timeouts",
+    "timeout",
+    "# Spec\n\nAll timeouts are bounded.\n",
+  ],
+]) {
+  test(`searchVaultNotes matches the ${name} inflection`, async () => {
+    const root = await seedScoringVault({
+      "wiki/concepts/inflected-note.md": body,
+    });
+    try {
+      const results = await searchVaultNotes(root, query, 5);
+      assert.equal(results.length, 1, `'${query}' must reach '${name}'`);
+      assert.ok(
+        results[0].score >= 50,
+        `the exact-phrase bonus must survive inflection (got ${results[0].score})`,
+      );
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+}
+
+// `_` is a word-edge character (so `_private` still anchors) but NOT a word
+// boundary character (so identifier compounds count). Both halves matter and
+// they pull in opposite directions.
+test("searchVaultNotes treats underscore as a boundary without unanchoring underscore terms", async () => {
+  const root = await seedScoringVault({
+    "wiki/concepts/compound-note.md":
+      "# Frontmatter\n\nA note carrying minni_learning: true.\n",
+    "wiki/concepts/private-note.md": "# Flags\n\nThe x_private column.\n",
+  });
+  try {
+    const compound = await searchVaultNotes(root, "learning", 5);
+    assert.equal(compound.length, 1, "minni_learning must count for 'learning'");
+    assert.match(compound[0].relativePath, /compound-note\.md$/);
+
+    const flagged = await searchVaultNotes(root, "_private", 5);
+    assert.equal(flagged.length, 0, "'_private' must not match inside x_private");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+// `\b` is ASCII-only, so it treated an accented letter as a word boundary and
+// let terms bleed inside accented words — the exact failure the whole-word
+// change exists to prevent. The mirror-image trap is Unicode-correct classes
+// blocking CJK, which is written without separators and where an embedded
+// ASCII word IS standalone.
+test("searchVaultNotes anchors on accented letters but not on ideographs", async () => {
+  const root = await seedScoringVault({
+    "wiki/concepts/accented-note.md": "# Files\n\nThe résumé file is here.\n",
+    "wiki/concepts/cjk-note.md": "# Notes\n\n日本語sum語 appears inline.\n",
+  });
+  try {
+    const results = await searchVaultNotes(root, "sum", 5);
+    assert.equal(results.length, 1, "'sum' must not match inside 'résumé'");
+    assert.match(results[0].relativePath, /cjk-note\.md$/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+// The 2-character token minimum admits real short terms ("ci", "db") but
+// without an alphanumeric requirement it also emits pure-punctuation tokens,
+// and "//" matched every URL in the vault.
+test("searchVaultNotes ignores pure-punctuation query tokens", async () => {
+  const root = await seedScoringVault({
+    "wiki/concepts/url-note.md":
+      "# Links\n\nSee https://example.com/a/b and https://example.com/c/d.\n",
+    "wiki/concepts/topic-note.md": "# Style\n\nWe use comments sparingly.\n",
+  });
+  try {
+    const results = await searchVaultNotes(root, "use // for comments", 5);
+    assert.equal(results.length, 1, "'//' must not admit unrelated URL notes");
+    assert.match(results[0].relativePath, /topic-note\.md$/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+// A query made entirely of stopwords must not tokenise to nothing: an empty
+// term list previously short-circuited the whole search and returned zero
+// results for a question the vault could answer.
+test("searchVaultNotes still answers stopword-only queries", async () => {
+  const root = await seedScoringVault({
+    "wiki/concepts/why-note.md": "# FAQ\n\nWhy the daemon restarts.\n",
+    "wiki/concepts/other-note.md": "# Other\n\nUnrelated content.\n",
+  });
+  try {
+    const results = await searchVaultNotes(root, "why?", 5);
+    assert.equal(results.length, 1, "'why?' must not return nothing");
+    assert.match(results[0].relativePath, /why-note\.md$/);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

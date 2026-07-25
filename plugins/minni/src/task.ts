@@ -697,7 +697,12 @@ function normalizeOutcomeDraft(draft: Partial<OutcomeDraft> | undefined): Outcom
   const doNotStore = pick(raw.doNotStore);
   const expires = pick(raw.expires);
   const logOnly = pick(raw.logOnly);
-  const learnCandidates = pick(raw.learnCandidates);
+  // The telemetry scrub lives HERE, not at the individual call sites: every path
+  // that can produce a draft — the deterministic composer, the AFM merge in
+  // `prepareOutcome`, and `mergeAfmPacket`'s partial-packet parse — funnels
+  // through this function, so a future caller cannot route around it. Only
+  // `learnCandidates` are scrubbed; `logOnly` is exactly where telemetry belongs.
+  const learnCandidates = pick(raw.learnCandidates).filter((item) => !isAuditTelemetryLine(item));
   return { learnCandidates, logOnly, expires, doNotStore };
 }
 
@@ -997,35 +1002,65 @@ export async function prepareTask(input: PrepareTaskInput, deps: PrepareTaskDeps
   return packet;
 }
 
+// The audit-line GRAMMAR, as emitted by `recordAudit` in vault.ts:
+//
+//     ## [<timestamp>] <tool> | <summary>
+//
+// `<tool>` is drawn from a closed namespace of snake_case roots — the MCP tools
+// (`minni_*`, legacy `sovereign_*`), the hook audit prefixes (`hook`,
+// `hook_codex`, `hook_gemini`, `hook_grok`, `hook_cursor`, `hook_kilocode`, …
+// combined with `_stop`, `_session_start`, `_pre_compact`, `_error`, …), and the
+// daemon-side emitters (`afm_loop`, `agent_ping`, `handoff_sent`,
+// `handoff_received`, `team_*`). Matching a ROOT PREFIX rather than an
+// enumeration keeps this stable as new tools/events are added.
+const AUDIT_TOOL = String.raw`(?:hook|minni|sovereign|agent|afm|handoff|team)_[a-z0-9_]+`;
+
+// Full form: `## [ts] <tool> |`. This shape is specific enough that it is safe to
+// match ANYWHERE in the blob — Stop collapses newlines into spaces before the
+// scrub, so a pasted log tail no longer begins at a line start.
+const AUDIT_HEADER_LINE = new RegExp(String.raw`##[ \t]+\[[^\]\n]{4,64}\][ \t]+${AUDIT_TOOL}[ \t]*\|`, "i");
+
+// Bare form: a header-less tail line, `<tool> | <summary>`. This one MUST be
+// anchored to a line start (multiline). A substring match here is what made the
+// old pattern reject legitimate user prose — "debug the hook_stop | grep
+// pipeline" and "journalctl | grep hook_stop | tail -5" are prompts, not
+// telemetry, and since Stop derives `task` from the user's own message a
+// substring match silently zeroed the entire candidate list.
+//
+// The anchor is why callers must test the RAW fields, not the composed
+// `"<task>: <summary>"` string — the composition would push a genuine bare tail
+// line off the line start. See `outcomeDraft`.
+const AUDIT_BARE_LINE = new RegExp(String.raw`^[ \t]*${AUDIT_TOOL}[ \t]*\|`, "im");
+
 export function isAuditTelemetryLine(text: string): boolean {
-  return (
-    /^## \[[^\]]+\]\s+hook_/i.test(text) ||
-    // Bare-line fallback: audit entries are rendered as `hook_<agent>_<event> | <summary>`
-    // (see the `## [timestamp] tool | summary` format in vault.ts and the
-    // `auditPrefix` values in {codex,gemini,grok,kilocode}-hook.ts — "hook",
-    // "hook_codex", "hook_gemini", "hook_grok" — combined with event suffixes
-    // like "_stop", "_session_start", "_pre_compact", "_error", etc). Rather than
-    // hardcode every prefix/suffix combination (an ever-growing list), key on the
-    // shared `hook_` prefix plus the ` | ` structural separator that audit lines
-    // always carry. A legitimate learning that merely mentions "hook" or "stop"
-    // in prose won't also have "hook_<word> |" immediately after it, so this
-    // stays precise without over-rejecting.
-    /\bhook_\w+\s*\|/i.test(text)
-  );
+  return AUDIT_HEADER_LINE.test(text) || AUDIT_BARE_LINE.test(text);
 }
 
 // The genuine outcome-drafting path (explicit minni_prepare_outcome): the
 // caller supplies a real distilled summary, so the candidate is built verbatim
 // — a short valid learning like "Use WAL" must pass through unfiltered.
 // Telemetry audit logs are rejected as defense-in-depth against corpus poisoning.
-// Both `task` and `summary` are checked (and the composed candidate string),
-// since telemetry can arrive via either field — checking `summary` alone let
-// telemetry smuggled through `task` pass through unfiltered.
+// `task` and `summary` are checked SEPARATELY, on the raw fields: telemetry can
+// arrive via either, and the bare-tail-line form of the audit grammar is anchored
+// to a line start, which composing `"<task>: <summary>"` would defeat.
+// `normalizeOutcomeDraft` re-scrubs whole candidates as the backstop that the AFM
+// path cannot route around.
 function outcomeDraft(input: PrepareOutcomeInput): OutcomeDraft {
   const verification = input.verification ?? [];
   const changedFiles = input.changedFiles ?? [];
-  const rawCandidate = `${input.task}: ${input.summary}`.replace(/\s+/g, " ").slice(0, 500);
-  const learnCandidates = isAuditTelemetryLine(rawCandidate) ? [] : [rawCandidate];
+  const summary = input.summary ?? "";
+  // A candidate carries learning content only if the SUMMARY does. "Substance"
+  // means at least one letter or digit: a missing, whitespace-only, or
+  // punctuation-only summary ("", "   ", "  .  ") composes to `"<task>:"` —
+  // non-empty, so it survives normalization and the hook's zero-candidate guard,
+  // and an inbox file gets written whose candidate teaches nothing (worst case,
+  // with no `last_user_message`, the literal session id: "s2:"). `changedFiles`
+  // stay log-only enrichment on purpose — a file list is not a learning and must
+  // never by itself manufacture a candidate.
+  const hasSubstance = /[\p{L}\p{N}]/u.test(summary);
+  const telemetry = isAuditTelemetryLine(input.task) || isAuditTelemetryLine(summary);
+  const rawCandidate = `${input.task}: ${summary}`.replace(/\s+/g, " ").slice(0, 500);
+  const learnCandidates = hasSubstance && !telemetry ? [rawCandidate] : [];
   const logOnly = [
     ...verification.map((item) => `Verification: ${item}`),
     changedFiles.length > 0 ? `Changed files: ${changedFiles.join(", ")}` : "",

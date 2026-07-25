@@ -335,6 +335,128 @@ test("prepareOutcome does not over-reject legitimate learnings mentioning hook/s
   }
 });
 
+// Defect 1: a Stop payload can carry `changedFiles` and no usable summary. The
+// composed `"<task>: <summary>"` is then non-empty ("fix the parser:") and slips
+// past both normalization and the hook's zero-candidate guard, writing an inbox
+// candidate with no learning content at all.
+test("prepareOutcome emits no candidate when the summary has no substance (Issue #173 defect 1)", async () => {
+  const contentless = ["", "   ", "  .  ", "--", "…"];
+  for (const summary of contentless) {
+    const packet = await prepareOutcome({
+      task: "fix the parser",
+      summary,
+      changedFiles: ["a.ts"],
+      profile: "compact",
+      vaultPath: "/tmp/vault",
+    });
+    assert.deepEqual(
+      packet.outcomeDraft.learnCandidates,
+      [],
+      `summary ${JSON.stringify(summary)} contributes nothing and must not manufacture a candidate`,
+    );
+    // changedFiles remain log-only enrichment; they never become a candidate.
+    assert.match(packet.outcomeDraft.logOnly.join("\n"), /Changed files: a\.ts/);
+  }
+
+  // A single alphanumeric character is substance — the guard must not swallow
+  // genuinely short learnings.
+  const kept = await prepareOutcome({
+    task: "note",
+    summary: "Use WAL",
+    profile: "compact",
+    vaultPath: "/tmp/vault",
+  });
+  assert.deepEqual(kept.outcomeDraft.learnCandidates, ["note: Use WAL"]);
+});
+
+// Defect 2a: the old pattern only recognised tools starting with `hook_`, so real
+// audit lines from `recordAudit` for every other tool in the namespace survived.
+test("prepareOutcome scrubs audit lines for the non-hook tool namespace (Issue #173 defect 2a)", async () => {
+  const telemetry = [
+    "## [2026-07-25T16:47:42.513Z] minni_recall | issue 173 stop learn candidates…",
+    "## [2026-07-25T16:47:42.513Z] minni_learn | committed a durable learning",
+    "## [2026-07-25T16:47:42.513Z] agent_ping | ping delivered",
+    "minni_prepare_task | built a packet",
+    "sovereign_vault_write | wrote a page",
+    "afm_loop | consolidation pass",
+    "handoff_received | accepted handoff",
+  ];
+  for (const summary of telemetry) {
+    const packet = await prepareOutcome({
+      task: "fix",
+      summary,
+      profile: "compact",
+      vaultPath: "/tmp/vault",
+    });
+    assert.deepEqual(
+      packet.outcomeDraft.learnCandidates,
+      [],
+      `expected "${summary}" to be scrubbed as audit telemetry`,
+    );
+  }
+});
+
+// Defect 2b: the old pattern substring-matched `hook_\w+\s*\|` anywhere in the
+// blob. Because Stop derives `task` from `last_user_message`, any prompt with a
+// shell pipeline over a hook name silently zeroed the whole candidate list.
+test("prepareOutcome keeps user prose that pipes a hook name (Issue #173 defect 2b)", async () => {
+  const legitimate = [
+    "debug the hook_stop | grep pipeline: we found the fix",
+    "run: journalctl | grep hook_stop | tail -5",
+    "the minni_recall | jq trick shows the ranked sources",
+  ];
+  for (const summary of legitimate) {
+    const packet = await prepareOutcome({
+      task: "note",
+      summary,
+      profile: "compact",
+      vaultPath: "/tmp/vault",
+    });
+    assert.equal(
+      packet.outcomeDraft.learnCandidates.length,
+      1,
+      `expected "${summary}" to pass through as a legitimate learning`,
+    );
+  }
+});
+
+// Defect 3: the AFM merge re-normalized the draft but never re-applied the scrub,
+// so telemetry proposed by the model bypassed it entirely. The scrub now lives in
+// normalizeOutcomeDraft, which every path funnels through.
+test("prepareOutcome scrubs telemetry returned by the AFM path (Issue #173 defect 3)", async () => {
+  const packet = await prepareOutcome(
+    {
+      task: "summarize backend hardening",
+      summary: "Prepared source ranking changes.",
+      profile: "compact",
+      useAfm: true,
+      vaultPath: "/tmp/vault",
+    },
+    {
+      afmPrepare: async () => ({
+        ok: true,
+        data: {
+          outcomeDraft: {
+            learnCandidates: [
+              "## [2026-07-25T16:47:42.513Z] minni_recall | issue 173 stop learn candidates",
+              "hook_codex_stop | stop abc",
+              "Profile-aware ranking is now the default.",
+            ],
+            logOnly: ["## [2026-07-25T16:47:42.513Z] hook_stop | stop session"],
+            expires: [],
+            doNotStore: [],
+          },
+        },
+      }),
+    },
+  );
+
+  assert.equal(packet.afm.used, true);
+  assert.deepEqual(packet.outcomeDraft.learnCandidates, ["Profile-aware ranking is now the default."]);
+  // logOnly is exactly where telemetry belongs — the scrub must not touch it.
+  assert.equal(packet.outcomeDraft.logOnly.length, 1);
+});
+
 test("prepareOutcome applies AFM outcome draft suggestions when requested", async () => {
   const packet = await prepareOutcome(
     {

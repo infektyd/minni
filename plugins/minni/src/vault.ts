@@ -255,9 +255,23 @@ function queryTerms(query: string): string[] {
     "who",
     "why",
   ]);
-  return [
+  // A token must carry at least one alphanumeric character. The 2-character
+  // minimum admits real short terms ("ci", "db"), but without this guard it
+  // also emits pure-punctuation tokens: "use // for comments" tokenised to
+  // ["use", "//", "comments"], and "//" matched every URL in the vault.
+  // Measured on claudecode-vault, that query returned 105 notes against 97 for
+  // "use comments" — 15 inflated by up to +5 from slashes alone and 8 admitted
+  // with no relation to the query at all. Main's 3-character minimum excluded
+  // these tokens by accident; this excludes them on purpose.
+  const tokens = [
     ...new Set(query.toLowerCase().match(/[a-z0-9_/-]{2,}/g) ?? []),
-  ].filter((term) => !stop.has(term));
+  ].filter((token) => /[a-z0-9]/.test(token));
+  const content = tokens.filter((token) => !stop.has(token));
+  // Stopword-only queries ("why?", "how do we do it?") must not tokenise to
+  // nothing: an empty term list makes searchVaultNotes return zero results for
+  // a query main answered. Fall back to the raw tokens — a weak signal beats
+  // no signal, and the phrase bonus still does the real ranking.
+  return content.length > 0 ? content : tokens;
 }
 
 const PRIVACY_LEVELS: ReadonlyArray<PrivacyLevel> = [
@@ -385,23 +399,29 @@ export const CORRECTION_CLASS_TYPES = new Set([
 ]);
 export const CORRECTION_SALIENCE_BOOST = 0.25;
 
-// Noise floor for vault search. Now that scoring matches whole words rather
-// than substrings, a score of 1 means exactly one whole-word hit of one query
-// term, outside the title, with no section or learning bonus — the residual
-// noise the word-boundary change did not already kill. Everything at 2 and
-// above carries corroboration: a second occurrence, a title hit (+3), or a
-// session/learning bonus.
+// Noise floor for vault search. It gates the TERM score — the raw match
+// evidence — never the final score; see the gate in scoreVaultNote for why.
 //
-// The threshold is 2 rather than 3 because 3 was measured to be a recall
-// cliff. Across 23 realistic recall queries run over four real vaults, raising
-// the floor from 1 to 3 removed 277/232/56/50 candidate notes (claudecode /
-// codex / grok-build / gemini) and starved queries below the default limit of
-// 5 results that had enough candidates to fill it: 0, 1, 2 and 5 queries
-// respectively. At 2 the same starvation counts are 0, 0, 1 and 1. The small
-// vaults are where it bites, and a session note with a single body hit lands
-// at exactly 2 (1 term hit + 1 wiki/sessions bonus) — a genuine hit that a
-// floor of 3 would have deleted.
-const MIN_SEARCH_SCORE = 2;
+// The value is 1: one whole-word occurrence of one query term is enough. An
+// earlier revision set it to 2 on the reasoning that a single body hit is
+// noise, but that was measured against the word-boundary scorer's own output
+// rather than against main, and it does not survive re-derivation. Over 36
+// recall queries across four real vaults, scored against main with
+// status-blocked notes and main's unconditional session/learning bonus removed,
+// a floor of 2 discards 34.2/31.3/24.0/28.7% of the notes where main had a
+// genuine WHOLE-WORD hit (claudecode / codex / grok-build / gemini) and starves
+// 0/2/12/13 queries below the default limit of 5. At 1 the same figures are
+// 0.98/1.45/0.41/2.72% and zero starved queries on every vault.
+//
+// The premise the 2 rested on — "a single-word query always scores >= 50,
+// because the phrase and term checks coincide" — is also false. phraseForm
+// keeps `.` and queryTerms does not tokenise it, so `node.js` and `socket.io`
+// diverge: on claudecode-vault `node.js` matched 54 notes of which 53 scored
+// below 50 and 3 scored exactly 1. Only pure `[a-z0-9_/-]` queries have the
+// coincidence property. The noise a floor of 2 was aimed at is already handled
+// by whole-word matching, which cut main's admitted-but-irrelevant notes from
+// 7429/2322/405/261 to 28/2/2/2 on the same query set.
+const MIN_TERM_SCORE = 1;
 
 function frontmatterField(markdown: string, key: string): string | undefined {
   const fm = markdown.match(/^---\r?\n([\s\S]*?)\r?\n---/);
@@ -414,26 +434,88 @@ function frontmatterField(markdown: string, key: string): string | undefined {
   return value || undefined;
 }
 
-// Whole-word matching anchors CONDITIONALLY, per edge. `\b` asserts a
-// word/non-word transition, so it is only meaningful where the term's own edge
-// character is a word character — the only case where the term could otherwise
-// match INSIDE a larger word (`pro` must never hit `project`/`approach`).
-// Where the edge character is NOT a word character it is already a boundary by
-// construction, and a `\b` there is not merely redundant but actively wrong:
-// `\b--verbose\b` can never match because the leading `\b` demands a word
-// character exactly where the `-` sits, and `\bpre-\b` would demand a non-word
+// Whole-word matching anchors CONDITIONALLY, per edge. A boundary assertion is
+// only meaningful where the term's own edge character is a word character —
+// the only case where the term could otherwise match INSIDE a larger word
+// (`pro` must never hit `project`/`approach`/`reproduce`). Where the edge
+// character is NOT a word character it is already a boundary by construction,
+// and anchoring there is not merely redundant but actively wrong: an anchored
+// `--verbose` can never match because the leading assertion demands a word
+// character exactly where the `-` sits, and `pre-` would demand a non-word
 // character after the hyphen, missing `pre-commit`. Measured against the real
 // vault, the unconditional form scored the phrase bonus on 17/20 phrases lifted
 // verbatim from notes but 0/20 once a trailing `?` was appended.
-const WORD_EDGE_CHAR = /[a-z0-9_]/i;
+const WORD_EDGE_CHAR = /[\p{L}\p{N}_]/u;
+
+// The assertion itself uses explicit Unicode lookarounds rather than `\b`,
+// which is ASCII-only and therefore treats an accented letter as a boundary:
+// `\bsum\b` matched inside "résumé" and `\bber\b` inside "über" — precisely the
+// substring bleed the whole change exists to prevent. No live occurrence in the
+// current vaults, but the defect is in the mechanism, not the corpus.
+//
+// `_` is deliberately IN WORD_EDGE_CHAR but OUT of the assertion class. The two
+// serve different questions. "Does this term need anchoring?" must say yes for
+// `_private`, or it would match inside `x_private`. "Is this position a word
+// boundary?" must say yes at an underscore, or `minni_learning` and
+// `search_learnings` would never count toward `learning` — identifier casing is
+// how this vault writes compound terms, and it accounted for a large share of
+// the notes the unified class silently deleted.
+//
+// Scripts written without word separators are the mirror-image trap. `\p{L}`
+// includes Han/Kana/Hangul, so a plain Unicode class blocks a match that ASCII
+// `\b` allowed: `term` inside `日本語term語` is a legitimate whole word with no
+// space around it, and treating the neighbouring ideographs as word characters
+// deletes it. They are therefore admitted as boundaries explicitly.
+const NO_SEPARATOR_SCRIPTS =
+  "\\p{sc=Han}\\p{sc=Hiragana}\\p{sc=Katakana}\\p{sc=Hangul}";
+const NOT_WORD_BEFORE = `(?:(?<![\\p{L}\\p{N}])|(?<=[${NO_SEPARATOR_SCRIPTS}]))`;
+const NOT_WORD_AFTER = `(?:(?![\\p{L}\\p{N}])|(?=[${NO_SEPARATOR_SCRIPTS}]))`;
+
+// Inflectional tolerance. Exact whole-word matching has zero morphological
+// give, and vault prose does not agree with query wording on number or tense:
+// the note that defines the learnings table contains `learnings` x9,
+// `learnings_fts` x10, `learning_id` x2 and ZERO standalone `learning`, so the
+// query `learning` scored 55 under substring matching and 0 under strict word
+// matching. Same shape for `pipeline`/`pipelines` and `timeout`/`timeouts`.
+// Allowing a regular English inflection on the trailing edge recovers those
+// without reopening substring bleed: a suffix can only extend the term, never
+// let it start mid-word, so `pro` still cannot reach `project`.
+//
+// Applied only to terms of 4+ characters ending in a letter. Below that the
+// inflected forms are more likely to be unrelated words than variants of the
+// term ("us" + "ed" would match every "used" in the vault).
+const MORPHOLOGICAL_SUFFIX = "(?:s|es|ing|ed)?";
+const MIN_MORPHOLOGICAL_LENGTH = 4;
+
+// The matcher is called once per (term, note) and the term set is tiny while
+// the note set is not, so the pattern is built once per term and reused. The
+// regex is only ever used with String.match under /g, which resets lastIndex,
+// so sharing the object across calls carries no state. Cap the cache: terms
+// come from user queries, and an unbounded map keyed by user input is a slow
+// leak in a long-lived daemon process.
+const WORD_REGEX_CACHE = new Map<string, RegExp>();
+const WORD_REGEX_CACHE_LIMIT = 512;
+
+function wordRegex(term: string): RegExp {
+  const cached = WORD_REGEX_CACHE.get(term);
+  if (cached) return cached;
+  const escaped = term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const last = term[term.length - 1];
+  const lead = WORD_EDGE_CHAR.test(term[0]) ? NOT_WORD_BEFORE : "";
+  const tail = WORD_EDGE_CHAR.test(last) ? NOT_WORD_AFTER : "";
+  const suffix =
+    term.length >= MIN_MORPHOLOGICAL_LENGTH && /\p{L}/u.test(last)
+      ? MORPHOLOGICAL_SUFFIX
+      : "";
+  const regex = new RegExp(`${lead}${escaped}${suffix}${tail}`, "giu");
+  if (WORD_REGEX_CACHE.size >= WORD_REGEX_CACHE_LIMIT) WORD_REGEX_CACHE.clear();
+  WORD_REGEX_CACHE.set(term, regex);
+  return regex;
+}
 
 function countWordOccurrences(text: string, term: string): number {
   if (!term) return 0;
-  const escaped = term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const lead = WORD_EDGE_CHAR.test(term[0]) ? "\\b" : "";
-  const tail = WORD_EDGE_CHAR.test(term[term.length - 1]) ? "\\b" : "";
-  const regex = new RegExp(`${lead}${escaped}${tail}`, "gi");
-  const matches = text.match(regex);
+  const matches = text.match(wordRegex(term));
   return matches ? matches.length : 0;
 }
 
@@ -483,7 +565,15 @@ function scoreVaultNote(
     if (count > 0) termScore += Math.min(count, 5);
     if (countWordOccurrences(titleLower, term) > 0) termScore += 3;
   }
-  if (termScore === 0) return 0;
+  // The floor gates TERM EVIDENCE, not the final score. Its stated purpose is
+  // "more than single-word noise", which is a question about how many times the
+  // query actually appears — the bonuses below exist to RANK notes that already
+  // qualify, and must not decide admission. Testing the final score inverted
+  // the correction-salience mechanism: a correction note with one body hit
+  // finished at 1 * 1.25 = 1.25 and was cut, while a plain session note with
+  // the same single hit finished at 1 + 1 = 2 and survived, so the class the
+  // engine deliberately boosts was the one being deleted.
+  if (termScore < MIN_TERM_SCORE) return 0;
 
   let score = termScore;
   if (relativePath.startsWith("wiki/sessions/")) score += 1;
@@ -1026,7 +1116,10 @@ export async function searchVaultNotes(
   await ensureVault(vaultPath);
   const wikiRoot = path.join(vaultPath, "wiki");
   const terms = queryTerms(query);
-  if (terms.length === 0) return [];
+  // Only bail when there is nothing to match on at all. Bailing on an empty
+  // term list alone threw away the exact-phrase bonus, which is the strongest
+  // signal in the scorer and needs no tokens.
+  if (terms.length === 0 && !phraseForm(query)) return [];
 
   let files: string[] = [];
   try {
@@ -1062,7 +1155,7 @@ export async function searchVaultNotes(
   return scored
     .filter(
       (result): result is VaultSearchResult =>
-        result !== undefined && result.score >= MIN_SEARCH_SCORE,
+        result !== undefined && result.score > 0,
     )
     .sort(
       (a, b) =>

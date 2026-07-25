@@ -42,7 +42,18 @@ export async function readStdin(): Promise<unknown> {
         return;
       }
       try {
-        resolve(JSON.parse(data));
+        const parsed: unknown = JSON.parse(data);
+        // A hook payload is a JSON OBJECT. `null`, arrays and bare scalars all
+        // PARSE successfully but are the wrong shape, and every caller casts the
+        // result to Record<string, unknown> and dereferences it OUTSIDE its try
+        // block — so a literal `null` on stdin crashed the hook with an uncaught
+        // TypeError instead of degrading. Narrow to the only shape the callers
+        // can use; anything else degrades to the same {} as unparseable input.
+        resolve(
+          parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)
+            ? parsed
+            : {},
+        );
       } catch {
         resolve({});
       }
@@ -51,27 +62,65 @@ export async function readStdin(): Promise<unknown> {
   });
 }
 
+/** Expand a leading `~` (alone or before a separator) to the user's home dir. */
+function expandTilde(dirPath: string): string {
+  const home = os.homedir();
+  return home ? dirPath.replace(/^~(?=$|[/\\])/, home) : dirPath;
+}
+
+/**
+ * Canonicalize an input path for the project-root walk: expand `~`, resolve to
+ * absolute, then COLLAPSE SYMLINKS. path.resolve does not touch symlinks, so
+ * without the realpath a directory reached two ways — `/w/link` where `link` ->
+ * `/w/repo/src` — yields two different workspace labels and splits one
+ * project's memory across two partitions. Paths not yet on disk make realpath
+ * throw; they keep the plain resolution rather than failing outright.
+ */
+function canonicalizeDir(dirPath: string): string {
+  const resolved = path.resolve(dirPath);
+  try {
+    return fs.realpathSync(resolved);
+  } catch {
+    return resolved;
+  }
+}
+
 // Resolves a sub-directory to the canonical project root: the nearest ancestor
 // holding a `.git` entry. Existence — not type — is tested on purpose: in git
 // worktrees and submodules `.git` is a FILE pointing at the real gitdir, and
 // those checkouts are project roots just as much as a classic `.git/` dir.
 //
-// The walk STOPS AT the user's home directory and never returns $HOME itself.
-// A dotfiles repo at $HOME is common, and without the stop every non-repo
-// directory under $HOME would resolve to $HOME — collapsing unrelated projects
-// into one workspace label and cross-contaminating their memory.
+// INPUT CONTRACT — the argument must be ABSOLUTE (a leading `~` is expanded
+// first). A relative path would be anchored to the HOOK PROCESS's cwd, which
+// the harness controls rather than the workspace does, so the same session
+// could label itself differently on two runs. There is no honest root for such
+// an input, so this returns undefined and the caller falls back to its
+// configured default (a stable label beats a cwd-dependent guess).
+//
+// The walk STOPS AT the user's home directory, so no DESCENDANT of $HOME is
+// ever attributed to $HOME. A dotfiles repo at $HOME is common, and without the
+// stop every non-repo directory under $HOME would resolve to $HOME — collapsing
+// unrelated projects into one workspace label and cross-contaminating their
+// memory. $HOME ITSELF still maps to itself: that is the identity result, not a
+// collapse (no other input can produce it), and for a session actually running
+// in a home-directory repo it is the only correct label.
 //
 // Deliberately SYNCHRONOUS: hook processes are single-shot and short-lived, so
 // this runs once per event and the async plumbing would cost readability
 // without buying any concurrency.
-export function findProjectRoot(dirPath: string): string {
+export function findProjectRoot(dirPath: string): string | undefined {
+  const expanded = expandTilde(dirPath);
+  if (!path.isAbsolute(expanded)) return undefined;
+  const base = canonicalizeDir(expanded);
   try {
-    let curr = path.resolve(dirPath);
+    let curr = base;
     const root = path.parse(curr).root;
     // Empty homedir (unset $HOME, no passwd entry) must NOT become path.resolve("")
     // — that is cwd, which would silently halt the walk at the process's own dir.
+    // The ceiling is canonicalized like the input: comparing a realpath'd walk
+    // against a symlinked $HOME would never match, and the walk would run past it.
     const rawHome = os.homedir();
-    const home = rawHome ? path.resolve(rawHome) : "";
+    const home = rawHome ? canonicalizeDir(rawHome) : "";
     while (curr && curr !== root && curr !== home) {
       if (fs.existsSync(path.join(curr, ".git"))) {
         return curr;
@@ -81,9 +130,9 @@ export function findProjectRoot(dirPath: string): string {
       curr = parent;
     }
   } catch {
-    // Return original path on any filesystem error
+    // Return the canonicalized input path on any filesystem error
   }
-  return path.resolve(dirPath);
+  return base;
 }
 
 // Accepts both the envelope HookOutput and the s6 PreToolUse permissionDecision
@@ -112,7 +161,10 @@ export function workspaceFromPayload(
   const explicit = asString(payload.workspace_id) || asString(payload.workspaceId);
   if (explicit) return explicit;
   const rawCwd = asString(payload.cwd) || asString(payload.working_directory);
-  if (rawCwd) return findProjectRoot(rawCwd);
+  // findProjectRoot returns undefined for a cwd it cannot anchor
+  // deterministically (see its INPUT CONTRACT) — fall back rather than mint a
+  // label that depends on where the hook process happened to be launched.
+  if (rawCwd) return findProjectRoot(rawCwd) ?? fallback;
   return fallback;
 }
 

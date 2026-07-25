@@ -10,7 +10,7 @@
 // refusal). The live ~/.minni is never read or written.
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -266,6 +266,112 @@ test("Stop hook (claude-code): no material writes no file; genuine material stil
     const body = JSON.parse(await readFile(path.join(realVault, "inbox", realNames[0]), "utf8"));
     assert.equal(body.candidates.length, 1);
     assert.match(body.candidates.join("\n"), /retry fix/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+// REGRESSION (red-team, defect 1): the claude-code Stop wrote the inbox file
+// WITHOUT kind/agent_id/workspace_id and never called workspaceFromPayload, so
+// `ws = doc.get("workspace_id") or "default"` in
+// src/minni/afm_passes/inbox_ingest.py filed EVERY Claude Code candidate under
+// workspace "default" no matter which repo the session ran in — the whole
+// findProjectRoot effort was inert on the flagship path. Stop now routes
+// through the shared handleStopCore, so the stamps and the repo-root-resolved
+// workspace are identical to every other platform's.
+test("Stop hook (claude-code): the inbox artifact carries kind/agent_id and the repo-resolved workspace", { timeout: 120_000 }, async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-hook-stop-cc-ws-"));
+  try {
+    const base = await realpath(root);
+    const vault = path.join(base, "claudecode-vault");
+    // A real fixture repo: the session's cwd is a SUB-directory of it, so a
+    // correct workspace label requires the .git walk — not the raw cwd.
+    const repoRoot = path.join(base, "fixture-repo");
+    const sessionCwd = path.join(repoRoot, "plugins", "minni", "src");
+    await mkdir(sessionCwd, { recursive: true });
+    await mkdir(path.join(repoRoot, ".git"), { recursive: true });
+    await mkdir(vault, { recursive: true });
+
+    const out = await runHook(
+      HOOK_JS, "Stop",
+      { vault, home: path.join(base, "home") },
+      {
+        MINNI_CLAUDECODE_VAULT_PATH: vault,
+        // A sentinel default: if the hook fell back to the configured workspace
+        // instead of deriving one from cwd, the assertion below names it.
+        MINNI_CLAUDECODE_WORKSPACE_ID: "workspace-must-not-be-used",
+      },
+      {
+        session_id: "cc-workspace",
+        cwd: sessionCwd,
+        last_user_message: "wrap up",
+        summary: "shipped the retry fix and verified the suite passes",
+        changedFiles: ["src/retry.ts"],
+      },
+    );
+    assert.match(out.systemMessage ?? "", /drafted to inbox/);
+    assert.match(out.systemMessage ?? "", /\/minni:learn/, "claude-code keeps its own commit hint");
+
+    const names = (await readdir(path.join(vault, "inbox"))).filter((n) => n.endsWith(".json"));
+    assert.equal(names.length, 1);
+    const body = JSON.parse(await readFile(path.join(vault, "inbox", names[0]), "utf8"));
+
+    assert.equal(body.kind, "stop_candidates", "the canonical ingest format tag must be stamped");
+    assert.equal(body.agent_id, "claude-code", "agent_id must match the claudecode-vault principal");
+    assert.notEqual(body.workspace_id, undefined, "workspace_id must be stamped, not left to ingest");
+    assert.notEqual(body.workspace_id, "default", "an unstamped workspace_id ingests as 'default'");
+    assert.notEqual(
+      body.workspace_id,
+      "workspace-must-not-be-used",
+      "the workspace must come from cwd, not from the configured default",
+    );
+    assert.equal(
+      body.workspace_id,
+      repoRoot,
+      "the workspace is the .git repo ROOT of the session cwd, not the cwd itself",
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+// REGRESSION (red-team, defect 4): readStdin JSON.parse'd the literal `null`
+// SUCCESSFULLY and returned it, and both entrypoints then dereference the
+// result as Record<string, unknown> OUTSIDE their try blocks — an uncaught
+// TypeError, a crashed hook, and no `continue` for the harness. Any non-object
+// parse result now degrades to {} like unparseable input does.
+test("Hook stdin: a non-object JSON payload degrades to {} instead of crashing the hook", { timeout: 120_000 }, async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-hook-stdin-"));
+  try {
+    const vault = path.join(root, "claudecode-vault");
+    await mkdir(vault, { recursive: true });
+    // `null` is the reported crash; arrays and bare scalars are the same
+    // wrong-shape class and must degrade identically.
+    for (const raw of ["null", "[]", '"a string"', "42", "true"]) {
+      const child = execFileAsync(process.execPath, [HOOK_JS, "Stop"], {
+        env: {
+          ...process.env,
+          MINNI_HOME: path.join(root, "home"),
+          MINNI_SOCKET_PATH: path.join(root, "home", "missing.sock"),
+          MINNI_AFM_HEALTH_URL: "http://127.0.0.1:1/health",
+          MINNI_BYPASS_AUDIT_LIMIT: "true",
+          MINNI_CLAUDECODE_VAULT_PATH: vault,
+        },
+        timeout: 30_000,
+      });
+      child.child.stdin.end(raw);
+      const { stdout } = await child;
+      const output = JSON.parse(stdout.trim().split("\n").pop());
+      assert.equal(output.continue, true, `stdin ${raw} must still emit continue:true`);
+      assert.equal(
+        output.systemMessage,
+        undefined,
+        `stdin ${raw} must be treated as an empty payload, not a degraded hook`,
+      );
+    }
+    const names = (await readdir(path.join(vault, "inbox")).catch(() => []))
+      .filter((n) => n.endsWith(".json"));
+    assert.deepEqual(names, [], "a shapeless payload has no outcome material to draft");
   } finally {
     await rm(root, { recursive: true, force: true });
   }
