@@ -131,7 +131,7 @@ test("renderIntent passes notes and no-ops through", () => {
   assert.equal(none.dropped, undefined);
 });
 
-test("a note on Grok Build is dropped, not silently discarded", () => {
+test("a note on Grok Build is DELIVERABLE: Stop is the one gate it parses", () => {
   // Grok parses stdout only on the Stop gate; a note has no other channel.
   const { dropped } = renderIntent(grokBuildWire, noteIntent("Stop", "hello"));
   assert.equal(dropped, undefined, "notes probe the Stop channel, which Grok parses");
@@ -160,7 +160,9 @@ test("agy: a Stop note is dropped and recorded, never emitted as a parse error",
   assert.ok(dropped, "the undeliverable note must be recorded");
 });
 
-test("Cursor injects at sessionStart only, and notes ride followup_message", () => {
+// The title used to say notes "ride followup_message". They must NOT: that
+// field is Cursor's auto-follow-up trigger and looped the agent 6x in 90s.
+test("Cursor injects at sessionStart only, and has no note channel at all", () => {
   // Verified against cursor.com/docs: sessionStart takes additional_context;
   // beforeSubmitPrompt takes continue + user_message ONLY; preCompact takes
   // user_message; stop takes followup_message.
@@ -224,7 +226,13 @@ test("every platform's audit prefix is distinct and namespaced", async () => {
 
   const seen = new Set();
   for (const [file, expected] of Object.entries(entries)) {
-    const src = await readFile(path.join(SRC, file), "utf8");
+    // Strip comments first. Matching raw text meant a comment mentioning
+    // `auditPrefix: "hook_kilocode"` above a real `auditPrefix: "hook"` kept
+    // this green while the runtime regressed to the bare prefix -- the exact
+    // collision this test was added to catch.
+    const src = (await readFile(path.join(SRC, file), "utf8"))
+      .replace(/\/\*[\s\S]*?\*\//g, "")
+      .replace(/^\s*\/\/.*$/gm, "");
     const found = /auditPrefix:\s*"([^"]+)"/.exec(src)?.[1];
     assert.equal(found, expected, `${file} audit prefix`);
     assert.ok(found.startsWith("hook_"), `${file}: throttle keys off the hook_ prefix`);
@@ -240,10 +248,16 @@ test("a note is rendered against ITS OWN event, not a hard-coded Stop", () => {
   // dropping a note agy could carry at SessionStart, and reporting SUCCESS for
   // one Grok Build silently discards (its passive-event stdout is ignored).
 
-  // agy CAN carry a note at SessionStart, so it must not be dropped.
+  // This half used to assert agy CARRIED a note at SessionStart via
+  // injectSteps. That was wrong, and adversarial review caught it: injectSteps
+  // is MODEL context, so rendering a note through it puts bookkeeping in front
+  // of the model dressed as recalled memory -- the precise contamination the
+  // inject/note split exists to prevent. agy has no human-only channel, so the
+  // honest answer at every event is drop-and-record.
   const agySession = renderIntent(geminiWire, noteIntent("SessionStart", "hi"));
-  assert.equal(agySession.output.injectSteps?.[0]?.ephemeralMessage, "hi");
-  assert.equal(agySession.dropped, undefined);
+  assert.deepEqual(agySession.output, {}, "must emit agy's bare no-op");
+  assert.ok(agySession.dropped, "agy has no note channel; the drop must be recorded");
+  assert.equal(agySession.dropped.event, "SessionStart");
 
   // Grok CANNOT carry one at SessionStart -- stdout is discarded there. This
   // must be recorded as a drop, not reported as delivered.
@@ -251,4 +265,28 @@ test("a note is rendered against ITS OWN event, not a hard-coded Stop", () => {
   assert.deepEqual(grokSession.output, { continue: true });
   assert.ok(grokSession.dropped, "a note Grok will discard must be recorded as dropped");
   assert.equal(grokSession.dropped.event, "SessionStart");
+});
+
+// --- Regressions from the Cursor adversarial review (2026-07-25) ------------
+
+test("a Kilo note at Stop is DROPPED: the bridge has no output channel there", () => {
+  // opencode's `session.idle` handler takes no `output` argument -- the bridge
+  // awaits the hook and discards the result. A wire that returned a
+  // systemMessage there reported success for a value nothing ever reads.
+  const { dropped } = renderIntent(kilocodeWire, noteIntent("Stop", "2 candidates"));
+  assert.ok(dropped, "Stop has no note channel on Kilo; the drop must be recorded");
+
+  // PreCompact and the boot events DO have one (output.context / output.system).
+  assert.equal(kilocodeWire.note("PreCompact", "note")?.systemMessage, "note");
+  assert.equal(kilocodeWire.note("SessionStart", "note")?.systemMessage, "note");
+});
+
+test("agy has no note channel on ANY event -- injectSteps is model-visible", () => {
+  // Rendering a note through injectSteps would push bookkeeping into the
+  // model's own context as though it were recalled memory, violating the
+  // intent contract's "not model-visible; never a memory carrier".
+  for (const event of ["SessionStart", "UserPromptSubmit", "Stop", "PreCompact"]) {
+    assert.equal(geminiWire.note(event, "2 candidates"), null, `agy note on ${event}`);
+    assert.ok(renderIntent(geminiWire, noteIntent(event, "x")).dropped, `${event} recorded`);
+  }
 });

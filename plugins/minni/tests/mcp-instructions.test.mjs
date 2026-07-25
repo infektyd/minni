@@ -15,15 +15,28 @@ import { fileURLToPath } from "node:url";
 
 const SRC = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "src", "server.ts");
 
+// Import the BUILT value rather than re-parsing string literals out of the
+// source. Reconstructing it with a regex measured a budget against text that
+// only resembled what ships.
+//
+// Import the LEAF module, never server.js: importing the server constructs it
+// as a side effect, and the test then hangs forever instead of failing.
 async function instructions() {
-  const src = await readFile(SRC, "utf8");
-  const block = /export const MINNI_INSTRUCTIONS = \[([\s\S]*?)\]\.join\("\\n"\)/.exec(src);
-  assert.ok(block, "MINNI_INSTRUCTIONS must exist");
-  return [...block[1].matchAll(/"((?:[^"\\]|\\.)*)"/g)].map((m) => m[1]).join("\n");
+  const { MINNI_INSTRUCTIONS } = await import("../dist/mcp-instructions.js");
+  assert.equal(typeof MINNI_INSTRUCTIONS, "string", "MINNI_INSTRUCTIONS must exist");
+  return MINNI_INSTRUCTIONS;
+}
+
+// Strip comments before matching. The un-stripped version passed on a
+// commented-out constructor, so it could not fail for the right reason: the
+// real `new McpServer({name, version})` could lose `instructions` entirely
+// while a comment above it kept the test green.
+function stripComments(src) {
+  return src.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
 }
 
 test("the server actually passes instructions to McpServer", async () => {
-  const src = await readFile(SRC, "utf8");
+  const src = stripComments(await readFile(SRC, "utf8"));
   assert.match(
     src,
     /new McpServer\([\s\S]{0,200}\{\s*instructions:\s*MINNI_INSTRUCTIONS\s*\}/,

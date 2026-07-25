@@ -166,8 +166,14 @@ export const kilocodeWire: PlatformWire = {
   noop: () => ({ continue: true }),
   inject: (event, text) =>
     KILOCODE_INJECTABLE.has(event) ? claudeShapedInject(event, text) : null,
-  // The bridge falls back to systemMessage when no additionalContext is present.
-  note: (_event, text) => ({ continue: true, systemMessage: text }),
+  // The bridge falls back to systemMessage when no additionalContext is
+  // present -- but ONLY on the events whose opencode handler has an output
+  // channel to push into. `session.idle` (our Stop) is a bare `event` handler:
+  // it awaits the hook and throws the result away, because opencode gives it
+  // no output argument at all. A wire that answered "deliverable" there was
+  // reporting success for a value nothing reads.
+  note: (event, text) =>
+    KILOCODE_INJECTABLE.has(event) ? { continue: true, systemMessage: text } : null,
   // Kilo's session.idle event carries no message text at all, so -- as with agy
   // -- the bridge synthesizes one, stashing the prompt at chat.message and
   // passing it at Stop. Without it every candidate was keyed on `ses_...`.
@@ -206,10 +212,13 @@ export const geminiWire: PlatformWire = {
   // field outright. Caught live on agy 1.1.7:
   //     failed to unmarshal result from hook jsonhook__minni_Stop_0_0 via
   //     protojson: ... unknown field "injectSteps"
-  // So a note only lands where injectSteps is actually valid; anywhere else it
-  // is dropped and recorded rather than emitted into a parse error.
-  note: (event, text) =>
-    AGY_INJECTABLE.has(event) ? { injectSteps: [{ ephemeralMessage: text }] } : null,
+  // agy therefore has NO note channel anywhere. `injectSteps` is the one thing
+  // it accepts, and that is model-visible context -- rendering a note through
+  // it would violate the intent contract ("not model-visible; never a memory
+  // carrier") by pushing bookkeeping like "2 candidates drafted" into the
+  // model's own context as though it were recalled memory. A note here is
+  // always dropped and recorded.
+  note: () => null,
   lastTaskText: (payload) =>
     // agy's Stop payload carries no task text at all. gemini-adapter.ts
     // back-fills `last_user_message` from agy's own transcript_full.jsonl, so

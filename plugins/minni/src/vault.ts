@@ -35,6 +35,18 @@ export interface AuditEntry {
   summary: string;
   details?: Record<string, unknown>;
   timestamp?: Date;
+  /**
+   * Overrides `tool` as the throttle bucket.
+   *
+   * The 5s window exists to collapse REPEATS of one event, and `tool` is
+   * normally a faithful stand-in for the event (`hook_stop`, `hook_session_start`).
+   * It is not for intent drops: every drop on a platform writes the SAME tool
+   * (`hook_<agent>_intent_dropped`) whatever event produced it, so a Stop drop
+   * landing within 5s of a UserPromptSubmit drop was silently swallowed -- and
+   * recordAudit returns a path either way, so the caller's catch never fires.
+   * That is the precise silent-failure class this module exists to end.
+   */
+  throttleKey?: string;
 }
 
 // PR-2: Status lifecycle for vault pages
@@ -664,7 +676,10 @@ export async function recordAudit(
   // fires SessionStart and PreInvocation in the same second, so PreInvocation
   // was never audited at all and looked like it had never dispatched. That
   // cost real debugging time. Duplicate suppression is still per event.
-  const throttleKey = `${agentId}__${entry.tool}`.replace(/[^A-Za-z0-9_-]/g, "_");
+  const throttleKey = `${agentId}__${entry.throttleKey ?? entry.tool}`.replace(
+    /[^A-Za-z0-9_-]/g,
+    "_",
+  );
   const tsPath = path.join(rateLimitDir, `${throttleKey}.ts`);
 
   let lastTime: number | undefined;

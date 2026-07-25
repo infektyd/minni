@@ -191,6 +191,11 @@ export function createHookHandlers(
         await recordAudit(config.vaultPath, {
           tool: `${config.auditPrefix}_intent_dropped`,
           summary: `${dropped.event}: ${dropped.reason}`,
+          // Bucket per EVENT. Every drop shares one tool name, so without this
+          // a Stop drop within 5s of a UserPromptSubmit drop is throttled away
+          // and reported as written -- losing the only record that memory
+          // failed to land.
+          throttleKey: `${config.auditPrefix}_intent_dropped__${dropped.event}`,
         });
       } catch {
         // Audit unavailable. The drop is still correct behavior; losing the

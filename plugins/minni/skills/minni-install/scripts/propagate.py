@@ -12,6 +12,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import shutil
 import socket
 import sqlite3
@@ -357,8 +358,25 @@ def copy_tree(source: Path, dest: Path) -> None:
 
 
 def write_json(path: Path, data: dict) -> None:
+    """Write JSON atomically.
+
+    These targets are live host-CLI configs in the user's home directory. A
+    plain write_text that is interrupted -- Ctrl-C, a full disk, a crash --
+    leaves truncated JSON behind, and the host CLI then fails to parse its own
+    config on next launch. Serialize first, then rename over the target: the
+    rename is atomic, so a reader sees either the old file or the new one.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    _atomic_write(path, json.dumps(data, indent=2) + "\n")
+
+
+def _atomic_write(path: Path, text: str) -> None:
+    tmp = path.with_name(f"{path.name}.minni-tmp-{os.getpid()}")
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def _mirror_codex_hook_env(env: dict, agent: str) -> None:
@@ -800,8 +818,17 @@ def update_claude_desktop_config(
             **(afm_env or {}),
         }
     )
+    # Preserving `command` while REPLACING `args` only makes sense when the
+    # command is a node interpreter -- the point is to keep a user's pinned
+    # node (nvm, asdf, a wrapper). Any other launcher takes its own arguments:
+    # a previous `npx -y @scope/pkg` entry would become `npx <server.js>`,
+    # which npx cannot run, so the install silently bricks the MCP server it
+    # was meant to configure. If the previous command is not node, replace both
+    # halves together and stay internally consistent.
+    previous_command = str(previous.get("command") or "")
+    keeps_node = Path(previous_command).name in {"node", "node.exe"}
     servers["minni"] = {
-        "command": previous.get("command") or "node",
+        "command": previous_command if keeps_node else "node",
         "args": [str(server_path)],
         "env": env,
     }
@@ -826,12 +853,27 @@ def update_grok_hooks(install_root: Path) -> dict[str, object]:
     if not template.exists():
         return {"installed": False, "reason": f"missing hooks template: {template}"}
 
-    stamped = template.read_text(encoding="utf-8").replace(
-        "${GROK_PLUGIN_ROOT}", str(install_root)
-    )
+    # Substitute INSIDE the parsed structure, not in the raw text. A textual
+    # replace splices the path straight into a JSON string literal, so an
+    # install root containing a quote or a backslash writes a file Grok cannot
+    # parse. The commands are also shell strings, so the path needs shell
+    # quoting or a root with spaces splits into separate argv entries and the
+    # hook silently never runs. json.dumps then re-escapes whatever quoting
+    # produced, correctly.
+    quoted_root = shlex.quote(str(install_root))
+
+    def _stamp(node: object) -> object:
+        if isinstance(node, str):
+            return node.replace("${GROK_PLUGIN_ROOT}", quoted_root)
+        if isinstance(node, list):
+            return [_stamp(item) for item in node]
+        if isinstance(node, dict):
+            return {key: _stamp(value) for key, value in node.items()}
+        return node
+
+    stamped = _stamp(json.loads(template.read_text(encoding="utf-8")))
     target = Path("~/.grok/hooks/minni.json").expanduser()
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(stamped, encoding="utf-8")
+    write_json(target, stamped)
     return {"installed": True, "path": str(target)}
 
 
@@ -915,13 +957,38 @@ def update_cursor_hooks(install_root: Path) -> dict[str, object]:
     def _commands(entries: list) -> set[str]:
         return {e.get("command") for e in entries if isinstance(e, dict)}
 
+    # Exact-match alone is not enough: reinstalling from a DIFFERENT
+    # --install-root writes a new command while the old stamped one survives,
+    # so both fire and every session hydrates twice. Also treat an entry as
+    # ours when its command ends with the same hook-script suffix (the tail
+    # after the install root). That tail is Minni's own script path, so no
+    # unrelated user hook can match it -- while a sibling path like
+    # /x/minni-other, the case exact-matching was introduced to protect, is
+    # a stale Minni install and SHOULD be replaced rather than duplicated.
+    def _script_suffixes(entries: list) -> set[str]:
+        tails: set[str] = set()
+        for e in entries:
+            if not isinstance(e, dict):
+                continue
+            command = str(e.get("command") or "")
+            marker = "/plugins/minni/"
+            index = command.find(marker)
+            if index != -1:
+                tails.add(command[index:])
+        return tails
+
+    def _is_ours(entry: object, commands: set[str], tails: set[str]) -> bool:
+        if not isinstance(entry, dict):
+            return False
+        command = str(entry.get("command") or "")
+        if command in commands:
+            return True
+        return any(command.endswith(tail) for tail in tails)
+
     for event, entries in (stamped.get("hooks", {}) or {}).items():
         ours = _commands(list(entries))
-        kept = [
-            e
-            for e in (hooks.get(event) or [])
-            if not (isinstance(e, dict) and e.get("command") in ours)
-        ]
+        tails = _script_suffixes(list(entries))
+        kept = [e for e in (hooks.get(event) or []) if not _is_ours(e, ours, tails)]
         hooks[event] = kept + list(entries)
 
     merged["hooks"] = hooks
