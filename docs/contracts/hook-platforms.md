@@ -267,3 +267,67 @@ platform field, check whether that field has side effects.** `systemMessage`
 (Claude), `followup_message` (Cursor) and `injectSteps` (agy) look
 interchangeable and are not — one is inert, one continues the agent, one is
 rejected outright at `Stop`.
+
+## Cursor: the editor and the CLI are ONE install, two capability sets
+
+`cursor.com/docs/hooks` describes the **editor** (plus a cloud-agent subset). The
+CLI is the *reduced* surface, and its hook behaviour is **not documented at all**
+— the CLI reference pages mention `cli-config.json` and say nothing about hooks.
+
+**They share config.** Both read `~/.cursor/hooks.json` (user) and
+`<project>/.cursor/hooks.json` (project). So the installer's user-level write
+covers Cursor.app as well as cursor-agent — one install, both surfaces. There is
+no per-user app config for hooks; `/Library/Application Support/Cursor/hooks.json`
+(system `/Library`, not `~/Library`) is the **enterprise MDM** path only.
+
+Cursor watches these files and reloads automatically; restarting is the
+documented remedy if it doesn't.
+
+Note the CWD differs by scope — user hooks run from `~/.cursor/`, project hooks
+from the project root. The installer stamps **absolute** command paths, which
+sidesteps this entirely. Keep it that way.
+
+### `sessionStart.additional_context` is a confirmed vendor bug — do not use it
+
+Cursor staff acknowledged it: *"This is a bug on our side"* — a timing issue
+between hook execution and composer-handle creation. Reported on 3.1.15 (Apr
+2026) and still open on 3.8.23 (Jun 2026): *"No ETA on a fix yet… there's no
+workaround right now."* The same `additional_context` plumbing gap is reported
+for `postToolUse`.
+
+So `cursorWire` declaring `SessionStart` injectable is **doc-correct and
+runtime-broken**. Memory reaches the model on Cursor via MCP tool calls, not
+hooks. Our own testing matches: the agent went to MCP both times.
+
+What *is* confirmed working is `sessionStart`'s **`env`** return — session-scoped
+vars passed to later hook executions. That is a hook-to-hook channel, not a
+model-visible one, so it does not help hydration.
+
+### CLI event parity is partial AND version-dependent
+
+Staff confirmed the CLI fires only a subset, expanding over time: shell hooks
+only (Jan 2026), plus `afterFileEdit`/`postToolUse`/`stop`/`sessionStart` (Apr
+2026), with gaps acknowledged again in Jun 2026.
+
+**But our live evidence supersedes that.** On CLI **2026.07.23**,
+`beforeSubmitPrompt` fires — we have the audit entries. The June report said it
+did not. Treat CLI parity as a moving target and re-probe per version rather
+than trusting any single report, including this paragraph.
+
+Editor-only by design: the Tab hooks (`beforeTabFileRead`, `afterTabFileEdit`).
+`workspaceOpen` is the one event documented to run in **both** app and CLI, and
+it omits `conversation_id`, `session_id` and `transcript_path`.
+
+### `transcript_path` is not documented — do not mine it blind
+
+Only the field's existence is documented: *"Path to the main conversation
+transcript file (null if transcripts disabled)"*. **No schema, no record shape,
+no location.** A CLI changelog (18 Feb 2026) implies JSONL, but gives no schema
+and does not claim the editor uses the same format.
+
+This is the obvious fix for Cursor's Stop candidates degrading to a bare session
+id — its `stop` payload carries only `status` and `loop_count`, no message text.
+But mining an undocumented format is how the agy assumptions rotted. If it gets
+built: sniff the schema, verify on **each** surface separately, and fall back to
+the current degrade. Also handle `transcript_path: null` — a documented state
+whose triggering setting is itself undocumented.
