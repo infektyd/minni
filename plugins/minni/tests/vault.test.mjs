@@ -292,3 +292,114 @@ test("searchVaultNotes filters superseded notes with CRLF line endings", async (
     await rm(root, { recursive: true, force: true });
   }
 });
+
+// Scoring fixtures live in wiki/concepts and wiki/sessions so the section
+// bonus is exercised deliberately rather than by accident.
+async function seedScoringVault(notes) {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-score-"));
+  await ensureVault(root);
+  await mkdir(path.join(root, "wiki", "concepts"), { recursive: true });
+  await mkdir(path.join(root, "wiki", "sessions"), { recursive: true });
+  for (const [relative, body] of Object.entries(notes)) {
+    await writeFile(
+      path.join(root, relative),
+      `---\nstatus: accepted\n---\n\n${body}`,
+      "utf8",
+    );
+  }
+  return root;
+}
+
+// Whole-word matching, negative direction: a query term must never score a note
+// that only contains it as a substring of a longer word.
+test("searchVaultNotes excludes substring-only matches but keeps standalone words", async () => {
+  const root = await seedScoringVault({
+    "wiki/concepts/substring-note.md":
+      "# Handbook of methods\n\nThe project approach will reproduce the issue.\n",
+    "wiki/concepts/standalone-note.md":
+      "# Tooling notes\n\nA pro tip about tooling.\n",
+  });
+  try {
+    const results = await searchVaultNotes(root, "pro", 5);
+    assert.equal(
+      results.length,
+      1,
+      "project/approach/reproduce must not match the term 'pro'",
+    );
+    assert.match(results[0].relativePath, /standalone-note\.md$/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+// Whole-word matching, positive direction: the +50 exact-phrase bonus is the
+// strongest ranking signal in the scorer, and recall queries are natural
+// language. A terminal "?" must not silently delete it — anchoring the raw
+// query with \b on both edges made the bonus unreachable for every question.
+test("searchVaultNotes keeps the exact-phrase bonus for punctuation-terminated queries", async () => {
+  const root = await seedScoringVault({
+    "wiki/concepts/phrase-note.md":
+      "# Runbook\n\nDocumented answer: how do i fix ci is covered below.\n",
+    "wiki/concepts/scatter-note.md":
+      "# Fix log\n\nThe ci job broke. We fix ci again. fix ci. fix ci. fix ci.\n",
+  });
+  try {
+    const asked = await searchVaultNotes(root, "how do i fix ci?", 5);
+    const bare = await searchVaultNotes(root, "how do i fix ci", 5);
+
+    assert.match(asked[0].relativePath, /phrase-note\.md$/);
+    assert.ok(
+      asked[0].score >= 50,
+      `phrase bonus must fire for a question (got ${asked[0].score})`,
+    );
+    // The scatter note has far more term hits, so it only loses because the
+    // phrase bonus applied — this is the ranking the question form regressed.
+    assert.match(asked[1].relativePath, /scatter-note\.md$/);
+    assert.equal(
+      asked[0].score,
+      bare[0].score,
+      "trailing punctuation must not change the score",
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+// queryTerms tokenises "-" and "/", so CLI flags arrive as terms like
+// "--verbose". A leading \b requires a word character where the "-" sits, which
+// made every flag-shaped token unmatchable.
+test("searchVaultNotes matches flag-shaped query terms without matching the bare word", async () => {
+  const root = await seedScoringVault({
+    "wiki/concepts/flag-note.md":
+      "# Suite options\n\nRun the suite with --verbose to see output.\n",
+    "wiki/concepts/bareword-note.md":
+      "# Logging\n\nThe verbose logging mode is on.\n",
+  });
+  try {
+    const results = await searchVaultNotes(root, "--verbose", 5);
+    assert.equal(results.length, 1, "'--verbose' must match, and only the flag");
+    assert.match(results[0].relativePath, /flag-note\.md$/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+// MIN_SEARCH_SCORE is a noise floor, not a recall cliff. A session note with a
+// single genuine term hit scores 1 (term) + 1 (wiki/sessions) = 2 and must
+// still be recalled; a note with the same single hit and no corroborating
+// signal scores 1 and is dropped.
+test("searchVaultNotes keeps single-hit session notes above the noise floor", async () => {
+  const root = await seedScoringVault({
+    "wiki/sessions/session-note.md":
+      "# Daily log\n\nWe touched alpha today.\n",
+    "wiki/concepts/weak-note.md": "# Concept\n\nAn alpha mention only.\n",
+  });
+  try {
+    const results = await searchVaultNotes(root, "alpha beta", 5);
+    assert.equal(results.length, 1);
+    assert.match(results[0].relativePath, /session-note\.md$/);
+    assert.equal(results[0].score, 2, "1 term hit + 1 session bonus");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});

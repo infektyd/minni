@@ -20,7 +20,4 @@ void runHookMain({
   hookScript: "grok-hook.js",
   auditPrefix: "hook_grok",
   precompactKind: "grok_precompact_handoff",
-  // Grok behavior (review-panel improvement): an empty outcome draft skips the
-  // inbox write entirely so the inbox is never littered with empty files.
-  alwaysWriteStopInbox: false,
 });

@@ -1000,7 +1000,17 @@ export async function prepareTask(input: PrepareTaskInput, deps: PrepareTaskDeps
 export function isAuditTelemetryLine(text: string): boolean {
   return (
     /^## \[[^\]]+\]\s+hook_/i.test(text) ||
-    /\bhook_(stop|session_start|user_prompt_submit|pretooluse_guard)\b/i.test(text)
+    // Bare-line fallback: audit entries are rendered as `hook_<agent>_<event> | <summary>`
+    // (see the `## [timestamp] tool | summary` format in vault.ts and the
+    // `auditPrefix` values in {codex,gemini,grok,kilocode}-hook.ts — "hook",
+    // "hook_codex", "hook_gemini", "hook_grok" — combined with event suffixes
+    // like "_stop", "_session_start", "_pre_compact", "_error", etc). Rather than
+    // hardcode every prefix/suffix combination (an ever-growing list), key on the
+    // shared `hook_` prefix plus the ` | ` structural separator that audit lines
+    // always carry. A legitimate learning that merely mentions "hook" or "stop"
+    // in prose won't also have "hook_<word> |" immediately after it, so this
+    // stays precise without over-rejecting.
+    /\bhook_\w+\s*\|/i.test(text)
   );
 }
 
@@ -1008,11 +1018,14 @@ export function isAuditTelemetryLine(text: string): boolean {
 // caller supplies a real distilled summary, so the candidate is built verbatim
 // — a short valid learning like "Use WAL" must pass through unfiltered.
 // Telemetry audit logs are rejected as defense-in-depth against corpus poisoning.
+// Both `task` and `summary` are checked (and the composed candidate string),
+// since telemetry can arrive via either field — checking `summary` alone let
+// telemetry smuggled through `task` pass through unfiltered.
 function outcomeDraft(input: PrepareOutcomeInput): OutcomeDraft {
   const verification = input.verification ?? [];
   const changedFiles = input.changedFiles ?? [];
   const rawCandidate = `${input.task}: ${input.summary}`.replace(/\s+/g, " ").slice(0, 500);
-  const learnCandidates = isAuditTelemetryLine(input.summary) ? [] : [rawCandidate];
+  const learnCandidates = isAuditTelemetryLine(rawCandidate) ? [] : [rawCandidate];
   const logOnly = [
     ...verification.map((item) => `Verification: ${item}`),
     changedFiles.length > 0 ? `Changed files: ${changedFiles.join(", ")}` : "",

@@ -126,13 +126,13 @@ export interface AgentHookConfig {
    * Defaults to the MCP-tool phrasing; kilocode points at /minni:learn.
    */
   stopCommitHint?: string;
-  /**
-   * When true, Stop writes the inbox file + audit entry even with zero
-   * candidates (codex's historical behavior); when false, an empty outcome
-   * early-returns before any write so the inbox is never littered with empty
-   * files (grok's and kilocode's behavior).
-   */
-  alwaysWriteStopInbox: boolean;
+  // RETIRED 2026-07-25: `alwaysWriteStopInbox`. It once let codex keep the
+  // historical "write the Stop inbox file even with zero candidates" behavior;
+  // e51ed45 flipped codex to false because always-write produced kind-less
+  // inbox noise the AFM ingest loop skips as _unrecognized, leaving every
+  // entrypoint on false. Under the governance posture below Stop never
+  // self-drafts on any platform, so a per-agent knob for littering the inbox
+  // has no legitimate setting — the zero-candidate skip is now unconditional.
   /**
    * s6 PreToolUse recall-guard mode override. When set, it wins over the
    * MINNI_RECALL_GUARD_MODE env default ("off" | "soft" | "strict"). Omit to
@@ -612,8 +612,11 @@ export function createHookHandlers(
     // Stop no longer self-drafts. The `changedFiles`/`summary` branch below is a
     // documented FORWARD-COMPAT hook: it fires only if a future Stop harness
     // supplies genuine outcome material in the payload (today's real harnesses
-    // never do). Absent that, Stop records ONE log-only breadcrumb (so the
-    // session is not silently invisible) and writes no inbox file.
+    // never do). Absent that — or when the material scrubs to zero candidates
+    // at the guard below — Stop records ONE log-only breadcrumb (so the session
+    // is not silently invisible) and writes no inbox file. This holds on EVERY
+    // platform: there is no per-agent opt-out (see the retired
+    // `alwaysWriteStopInbox` note on AgentHookConfig).
     // NOTE: this is a governance-posture change — it needs operator sign-off
     // before the plugin is re-propagated.
     const changedFiles = stringArray(payload.changedFiles ?? payload.changed_files);
@@ -639,6 +642,23 @@ export function createHookHandlers(
 
     const candidates = outcome.outcomeDraft.learnCandidates;
 
+    // The signal was draftable but prepareOutcome's telemetry filter
+    // (isAuditTelemetryLine) scrubbed it to nothing — e.g. a harness that
+    // hands Stop a slice of Minni's own audit log as `summary`. The scrub has
+    // to hold at the WRITE layer too: writing the file anyway reintroduces
+    // precisely the empty-inbox litter issue #173 removed, and the AFM ingest
+    // loop then skips it as unrecognized noise. One log-only breadcrumb (same
+    // shape as the no-draftable-signal branch above) keeps the session visible
+    // without costing an inbox file.
+    if (candidates.length === 0) {
+      await recordAudit(config.vaultPath, {
+        tool: `${config.auditPrefix}_stop`,
+        summary: `stop ${sessionId}: no candidates after scrub`,
+        details: { workspace: workspaceId, candidates: 0 },
+      });
+      return { continue: true };
+    }
+
     const inbox = await writeInbox(config.vaultPath, sessionId, {
       kind: "stop_candidates",
       agent_id: config.agentId,
@@ -659,10 +679,6 @@ export function createHookHandlers(
         inbox_path: inbox.filePath,
       },
     });
-
-    if (candidates.length === 0) {
-      return { continue: true };
-    }
 
     return {
       continue: true,

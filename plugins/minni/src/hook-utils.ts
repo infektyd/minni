@@ -3,6 +3,7 @@
 // this protocol boilerplate byte-for-byte. Per-hook differences are only the
 // config constants and the handler implementations — keep them there.
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import type { EnvelopeEvent } from "./agent_envelope.js";
 import type { VaultSearchResult } from "./vault.js";
@@ -32,6 +33,14 @@ export async function readStdin(): Promise<unknown> {
       data += chunk;
     });
     process.stdin.on("end", () => {
+      // Fast path for the empty-stdin case (hooks invoked with no payload):
+      // JSON.parse("") would reach the same {} via the catch below, but the
+      // explicit return states the intent instead of routing a normal, expected
+      // condition through exception handling.
+      if (!data.trim()) {
+        resolve({});
+        return;
+      }
       try {
         resolve(JSON.parse(data));
       } catch {
@@ -42,12 +51,28 @@ export async function readStdin(): Promise<unknown> {
   });
 }
 
-// Helper to resolve sub-directories to canonical project root directory
+// Resolves a sub-directory to the canonical project root: the nearest ancestor
+// holding a `.git` entry. Existence — not type — is tested on purpose: in git
+// worktrees and submodules `.git` is a FILE pointing at the real gitdir, and
+// those checkouts are project roots just as much as a classic `.git/` dir.
+//
+// The walk STOPS AT the user's home directory and never returns $HOME itself.
+// A dotfiles repo at $HOME is common, and without the stop every non-repo
+// directory under $HOME would resolve to $HOME — collapsing unrelated projects
+// into one workspace label and cross-contaminating their memory.
+//
+// Deliberately SYNCHRONOUS: hook processes are single-shot and short-lived, so
+// this runs once per event and the async plumbing would cost readability
+// without buying any concurrency.
 export function findProjectRoot(dirPath: string): string {
   try {
     let curr = path.resolve(dirPath);
     const root = path.parse(curr).root;
-    while (curr && curr !== root) {
+    // Empty homedir (unset $HOME, no passwd entry) must NOT become path.resolve("")
+    // — that is cwd, which would silently halt the walk at the process's own dir.
+    const rawHome = os.homedir();
+    const home = rawHome ? path.resolve(rawHome) : "";
+    while (curr && curr !== root && curr !== home) {
       if (fs.existsSync(path.join(curr, ".git"))) {
         return curr;
       }

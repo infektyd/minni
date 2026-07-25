@@ -59,8 +59,6 @@ const CONFIG: AgentHookConfig = {
   // No precompactKind: like kilocode, PreCompact (if agy ever dispatches it)
   // stashes stale-belief events as a precompact_reassert entry instead of a
   // durable handoff file.
-  // Like grok/kilocode, an empty Stop outcome skips the inbox write entirely.
-  alwaysWriteStopInbox: false,
   recallGuardMode: GEMINI_GUARD_MODE,
 };
 

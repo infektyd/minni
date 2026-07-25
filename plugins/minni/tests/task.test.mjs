@@ -279,6 +279,62 @@ test("prepareOutcome passes valid user summaries and scrubs audit log telemetry 
   assert.equal(telemetryPacket.outcomeDraft.learnCandidates.length, 0, "audit telemetry lines must be scrubbed from learnCandidates");
 });
 
+test("prepareOutcome scrubs audit telemetry smuggled through the task field (Issue #173 gap 1)", async () => {
+  const packet = await prepareOutcome({
+    task: "## [2026-07-23T10:00:00Z] hook_stop | stop session",
+    summary: "a perfectly ordinary summary",
+    profile: "compact",
+    vaultPath: "/tmp/vault",
+  });
+  assert.equal(
+    packet.outcomeDraft.learnCandidates.length,
+    0,
+    "telemetry arriving via `task` must be scrubbed even when `summary` is clean",
+  );
+});
+
+test("prepareOutcome scrubs bare audit lines from every agent's hook prefix (Issue #173 gap 2)", async () => {
+  const telemetryLines = [
+    "hook_codex_stop | stop abc",
+    "hook_gemini_session_start | started",
+    "hook_grok_pre_compact | compacting",
+  ];
+  for (const summary of telemetryLines) {
+    const packet = await prepareOutcome({
+      task: "fix",
+      summary,
+      profile: "compact",
+      vaultPath: "/tmp/vault",
+    });
+    assert.equal(
+      packet.outcomeDraft.learnCandidates.length,
+      0,
+      `expected "${summary}" to be scrubbed as audit telemetry`,
+    );
+  }
+});
+
+test("prepareOutcome does not over-reject legitimate learnings mentioning hook/stop/session (Issue #173 gap 2)", async () => {
+  const legitimateSummaries = [
+    "Use hook to open the door, then stop for a session review",
+    "Remember to hook up the stop-loss before session close",
+    "The pretooluse_guard hook stops runaway edits during a session",
+  ];
+  for (const summary of legitimateSummaries) {
+    const packet = await prepareOutcome({
+      task: "note",
+      summary,
+      profile: "compact",
+      vaultPath: "/tmp/vault",
+    });
+    assert.equal(
+      packet.outcomeDraft.learnCandidates.length,
+      1,
+      `expected "${summary}" to pass through as a legitimate learning`,
+    );
+  }
+});
+
 test("prepareOutcome applies AFM outcome draft suggestions when requested", async () => {
   const packet = await prepareOutcome(
     {

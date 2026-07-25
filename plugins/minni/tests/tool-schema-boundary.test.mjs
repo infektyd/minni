@@ -150,7 +150,10 @@ test("Codex hook remains Codex-native instead of reusing Claude hook entrypoint"
   assert.match(codexHook, /hookScript:\s*"codex-hook\.js"/);
   assert.match(codexHook, /agentId:\s*CODEX_AGENT_ID/);
   assert.match(codexHook, /vaultPath:\s*CODEX_VAULT_PATH/);
-  assert.match(codexHook, /alwaysWriteStopInbox:\s*false/);
+  // `alwaysWriteStopInbox` was retired: Stop's zero-candidate skip is now
+  // unconditional, so re-introducing a per-agent always-write knob here would
+  // silently restore the empty-inbox litter issue #173 removed.
+  assert.doesNotMatch(codexHook, /alwaysWriteStopInbox/);
   assert.doesNotMatch(codexHook, /DEFAULT_AGENT_ID|DEFAULT_VAULT_PATH|DEFAULT_WORKSPACE_ID/);
   assert.doesNotMatch(codexHook, /CLAUDECODE_AGENT_ID|CLAUDECODE_VAULT_PATH|hookScript:\s*"hook\.js"/);
 

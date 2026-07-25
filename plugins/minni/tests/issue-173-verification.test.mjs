@@ -3,7 +3,7 @@ import test from "node:test";
 import { isAuditTelemetryLine } from "../dist/task.js";
 import { workspaceFromPayload, findProjectRoot } from "../dist/hook-utils.js";
 import { searchVaultNotes, ensureVault, vaultFirstLearn } from "../dist/vault.js";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -57,9 +57,94 @@ test("Issue #173: word boundary term matching prevents substring false positives
   }
 });
 
-test("Issue #173: workspaceFromPayload resolves sub-directories to canonical project root", () => {
-  const topRepoRoot = findProjectRoot(process.cwd());
-  const subDir = path.join(topRepoRoot, "plugins", "minni", "src");
-  const resolved = workspaceFromPayload({ cwd: subDir }, "fallback");
-  assert.equal(resolved, topRepoRoot, "sub-directory path should resolve to canonical project root directory");
+// Fixture-driven, NOT self-referential: the expected roots are directories this
+// test creates, so a findProjectRoot that always returned "/" (or the input, or
+// $HOME) fails here. Deriving the expectation from findProjectRoot itself would
+// make the assertion vacuously true and couple it to the runner's cwd.
+test("Issue #173: workspaceFromPayload resolves sub-directories to the fixture project root", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-projroot-"));
+  try {
+    // realpath: macOS tmpdir is a /var -> /private/var symlink, and
+    // path.resolve does not collapse it — compare against the same form
+    // findProjectRoot returns for a resolved input.
+    const base = await realpath(root);
+    const repoRoot = path.join(base, "repo");
+    const nested = path.join(repoRoot, "plugins", "minni", "src");
+    await mkdir(nested, { recursive: true });
+    await mkdir(path.join(repoRoot, ".git"), { recursive: true });
+
+    assert.equal(
+      workspaceFromPayload({ cwd: nested }, "fallback"),
+      repoRoot,
+      "a nested sub-directory must resolve to the nearest .git ancestor",
+    );
+    assert.equal(
+      workspaceFromPayload({ working_directory: repoRoot }, "fallback"),
+      repoRoot,
+      "the repo root resolves to itself",
+    );
+
+    // A worktree/submodule checkout carries `.git` as a FILE, not a directory —
+    // it is still a project root.
+    const worktree = path.join(base, "worktree");
+    await mkdir(path.join(worktree, "src"), { recursive: true });
+    await writeFile(path.join(worktree, ".git"), "gitdir: /elsewhere/.git/worktrees/wt\n", "utf8");
+    assert.equal(
+      workspaceFromPayload({ cwd: path.join(worktree, "src") }, "fallback"),
+      worktree,
+      "a .git FILE marks a project root just as a .git directory does",
+    );
+
+    // (a) No .git anywhere up the chain => the resolved input path, unchanged.
+    const orphan = path.join(base, "orphan", "deep");
+    await mkdir(orphan, { recursive: true });
+    assert.equal(
+      workspaceFromPayload({ cwd: orphan }, "fallback"),
+      orphan,
+      "no repo root found => the resolved input path",
+    );
+
+    // (b) An explicit workspace_id always wins over cwd derivation.
+    assert.equal(
+      workspaceFromPayload({ workspace_id: "explicit-ws", cwd: nested }, "fallback"),
+      "explicit-ws",
+      "explicit workspace_id must win over cwd",
+    );
+    assert.equal(workspaceFromPayload({}, "fallback"), "fallback", "no cwd => the fallback");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+// (c) The $HOME stop. A dotfiles repo at $HOME is common; without the stop every
+// non-repo directory under $HOME would report $HOME as its workspace, merging
+// unrelated projects into one memory label.
+test("Issue #173: findProjectRoot never walks past — or returns — $HOME", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-projroot-home-"));
+  const savedHome = process.env.HOME;
+  try {
+    const base = await realpath(root);
+    const home = path.join(base, "home", "user");
+    const project = path.join(home, "code", "widget");
+    await mkdir(project, { recursive: true });
+    // The dotfiles repo that used to swallow every child directory.
+    await mkdir(path.join(home, ".git"), { recursive: true });
+    process.env.HOME = home;
+
+    assert.equal(
+      findProjectRoot(project),
+      project,
+      "a non-repo dir under a $HOME dotfiles repo keeps its own identity",
+    );
+    assert.equal(findProjectRoot(home), home, "$HOME itself falls back to the resolved input");
+
+    // A real repo BELOW $HOME still resolves normally — the stop is a ceiling,
+    // not a blanket opt-out.
+    await mkdir(path.join(project, ".git"), { recursive: true });
+    assert.equal(findProjectRoot(path.join(project, "src", "deep")), project);
+  } finally {
+    if (savedHome === undefined) delete process.env.HOME;
+    else process.env.HOME = savedHome;
+    await rm(root, { recursive: true, force: true });
+  }
 });

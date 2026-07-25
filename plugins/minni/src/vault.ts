@@ -385,6 +385,24 @@ export const CORRECTION_CLASS_TYPES = new Set([
 ]);
 export const CORRECTION_SALIENCE_BOOST = 0.25;
 
+// Noise floor for vault search. Now that scoring matches whole words rather
+// than substrings, a score of 1 means exactly one whole-word hit of one query
+// term, outside the title, with no section or learning bonus — the residual
+// noise the word-boundary change did not already kill. Everything at 2 and
+// above carries corroboration: a second occurrence, a title hit (+3), or a
+// session/learning bonus.
+//
+// The threshold is 2 rather than 3 because 3 was measured to be a recall
+// cliff. Across 23 realistic recall queries run over four real vaults, raising
+// the floor from 1 to 3 removed 277/232/56/50 candidate notes (claudecode /
+// codex / grok-build / gemini) and starved queries below the default limit of
+// 5 results that had enough candidates to fill it: 0, 1, 2 and 5 queries
+// respectively. At 2 the same starvation counts are 0, 0, 1 and 1. The small
+// vaults are where it bites, and a session note with a single body hit lands
+// at exactly 2 (1 term hit + 1 wiki/sessions bonus) — a genuine hit that a
+// floor of 3 would have deleted.
+const MIN_SEARCH_SCORE = 2;
+
 function frontmatterField(markdown: string, key: string): string | undefined {
   const fm = markdown.match(/^---\r?\n([\s\S]*?)\r?\n---/);
   if (!fm) return undefined;
@@ -396,11 +414,42 @@ function frontmatterField(markdown: string, key: string): string | undefined {
   return value || undefined;
 }
 
+// Whole-word matching anchors CONDITIONALLY, per edge. `\b` asserts a
+// word/non-word transition, so it is only meaningful where the term's own edge
+// character is a word character — the only case where the term could otherwise
+// match INSIDE a larger word (`pro` must never hit `project`/`approach`).
+// Where the edge character is NOT a word character it is already a boundary by
+// construction, and a `\b` there is not merely redundant but actively wrong:
+// `\b--verbose\b` can never match because the leading `\b` demands a word
+// character exactly where the `-` sits, and `\bpre-\b` would demand a non-word
+// character after the hyphen, missing `pre-commit`. Measured against the real
+// vault, the unconditional form scored the phrase bonus on 17/20 phrases lifted
+// verbatim from notes but 0/20 once a trailing `?` was appended.
+const WORD_EDGE_CHAR = /[a-z0-9_]/i;
+
 function countWordOccurrences(text: string, term: string): number {
+  if (!term) return 0;
   const escaped = term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const regex = new RegExp(`\\b${escaped}\\b`, "gi");
+  const lead = WORD_EDGE_CHAR.test(term[0]) ? "\\b" : "";
+  const tail = WORD_EDGE_CHAR.test(term[term.length - 1]) ? "\\b" : "";
+  const regex = new RegExp(`${lead}${escaped}${tail}`, "gi");
   const matches = text.match(regex);
   return matches ? matches.length : 0;
+}
+
+// Recall queries are natural language and routinely carry terminal punctuation
+// ("how do i fix ci?"). Strip the outer punctuation before the exact-phrase
+// check so the strongest ranking signal in the scorer survives the question
+// mark. What is stripped is exactly what queryTerms would not tokenise, so
+// `-`, `/` and `_` are KEPT: trimming them would turn the query `--verbose`
+// into the phrase `verbose` and let the +50 bonus match a note that never
+// mentions the flag. Interior punctuation is left alone — it is part of the
+// phrase being looked for.
+function phraseForm(query: string): string {
+  return query
+    .toLowerCase()
+    .trim()
+    .replace(/^[^\p{L}\p{N}_/-]+|[^\p{L}\p{N}_/-]+$/gu, "");
 }
 
 function scoreVaultNote(
@@ -426,7 +475,7 @@ function scoreVaultNote(
 
   const haystack = `${title}\n${relativePath}\n${markdown}`.toLowerCase();
   const titleLower = title.toLowerCase();
-  const queryLower = query.toLowerCase().trim();
+  const queryLower = phraseForm(query);
   let termScore = 0;
   if (queryLower && countWordOccurrences(haystack, queryLower) > 0) termScore += 50;
   for (const term of terms) {
@@ -1010,9 +1059,11 @@ export async function searchVaultNotes(
     }),
   );
 
-  const MIN_SEARCH_SCORE = 3;
   return scored
-    .filter((result): result is VaultSearchResult => result !== undefined && result.score >= MIN_SEARCH_SCORE)
+    .filter(
+      (result): result is VaultSearchResult =>
+        result !== undefined && result.score >= MIN_SEARCH_SCORE,
+    )
     .sort(
       (a, b) =>
         b.score - a.score || a.relativePath.localeCompare(b.relativePath),

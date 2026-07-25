@@ -546,8 +546,23 @@ async function handleStop(payload: Record<string, unknown>): Promise<HookOutput>
     vaultPath: CLAUDECODE_VAULT_PATH,
   });
 
+  const candidates = outcome.outcomeDraft.learnCandidates;
+
+  // Draftable signal, but prepareOutcome's telemetry filter scrubbed it to
+  // nothing (see the shared factory's handleStop for the full rationale): the
+  // scrub must hold at the write layer, so record one breadcrumb and write no
+  // inbox file rather than littering the inbox with a zero-candidate draft.
+  if (candidates.length === 0) {
+    await recordAudit(CLAUDECODE_VAULT_PATH, {
+      tool: "hook_stop",
+      summary: `stop ${sessionId}: no candidates after scrub`,
+      details: { candidates: 0 },
+    });
+    return { continue: true };
+  }
+
   const inbox = await writeInbox(CLAUDECODE_VAULT_PATH, sessionId, {
-    candidates: outcome.outcomeDraft.learnCandidates,
+    candidates,
     log_only: outcome.outcomeDraft.logOnly,
     expires: outcome.outcomeDraft.expires,
     do_not_store: outcome.outcomeDraft.doNotStore,
@@ -558,19 +573,15 @@ async function handleStop(payload: Record<string, unknown>): Promise<HookOutput>
     tool: "hook_stop",
     summary: `stop ${sessionId}`,
     details: {
-      candidates: outcome.outcomeDraft.learnCandidates.length,
+      candidates: candidates.length,
       inbox_path: inbox.filePath,
     },
   });
 
-  if (outcome.outcomeDraft.learnCandidates.length === 0) {
-    return { continue: true };
-  }
-
   return {
     continue: true,
-    systemMessage: `Minni: ${outcome.outcomeDraft.learnCandidates.length} candidate learning${
-      outcome.outcomeDraft.learnCandidates.length === 1 ? "" : "s"
+    systemMessage: `Minni: ${candidates.length} candidate learning${
+      candidates.length === 1 ? "" : "s"
     } drafted to inbox (${inbox.filePath}). Use /minni:learn to commit.`,
   };
 }

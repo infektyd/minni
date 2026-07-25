@@ -271,61 +271,75 @@ test("Stop hook (claude-code): no material writes no file; genuine material stil
   }
 });
 
-// The deterministic outcome draft always yields one candidate, so the
-// zero-candidate branch is driven through the factory's test seam: an
-// injected prepareOutcome returning an empty draft.
+// The deterministic outcome draft yields one candidate for genuine material, so
+// the post-scrub zero-candidate branch is driven through the factory's test
+// seam: an injected prepareOutcome returning an empty draft.
 function emptyOutcomeStub() {
   return async () => ({
     outcomeDraft: { learnCandidates: [], logOnly: [], expires: [], doNotStore: [] },
   });
 }
 
-function stopConfig(vaultPath, alwaysWriteStopInbox) {
+function stopConfig(vaultPath, agentId = "grok-build") {
   return {
-    agentId: alwaysWriteStopInbox ? "codex" : "grok-build",
+    agentId,
     vaultPath,
     defaultWorkspaceId: "fixture-workspace",
     contextWindow: 200_000,
     hooksEnabled: true,
     auditPrefix: "hook_test",
-    alwaysWriteStopInbox,
   };
 }
 
-test("Stop divergence: empty candidates skip the inbox write unless alwaysWriteStopInbox", async () => {
+// REGRESSION (issue #173 review): the no-draftable-signal early return is NOT
+// the only way to reach zero candidates. A payload can clear the signal gate
+// and still scrub to nothing — that path used to fall through to writeInbox and
+// litter the inbox with a `candidates: []` file, defeating the scrub at exactly
+// the layer that matters. The guard is unconditional now (no per-agent knob),
+// so both an arbitrary agentId and both drive-modes must skip the write.
+test("Stop scrub guard: a draftable signal scrubbing to zero candidates writes no inbox file", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "sm-hook-stop-empty-"));
   const savedHome = process.env.MINNI_HOME;
   const savedBypass = process.env.MINNI_BYPASS_AUDIT_LIMIT;
   process.env.MINNI_HOME = path.join(root, "home");
   process.env.MINNI_BYPASS_AUDIT_LIMIT = "true";
   try {
-    // grok/kilocode behavior (alwaysWriteStopInbox: false): an empty outcome
-    // never litters the inbox with a zero-candidate file.
-    const grokVault = path.join(root, "grok-vault");
-    const grokHandlers = createHookHandlers(stopConfig(grokVault, false), {
+    // Seam-driven: the payload HAS a summary (hasDraftableSignal === true), so
+    // the no-signal early return is bypassed and the scrub guard is the only
+    // thing standing between this call and an empty inbox file.
+    const seamVault = path.join(root, "seam-vault");
+    const seamHandlers = createHookHandlers(stopConfig(seamVault), {
       prepareOutcome: emptyOutcomeStub(),
     });
-    const grokOut = await grokHandlers.handleStop({ session_id: "empty-stop" });
-    assert.equal(grokOut.continue, true);
-    assert.equal(grokOut.systemMessage, undefined);
-    const grokNames = (await readdir(path.join(grokVault, "inbox"))).filter((n) =>
+    const seamOut = await seamHandlers.handleStop({
+      session_id: "scrubbed-stop",
+      summary: "a summary the drafter rejects wholesale",
+    });
+    assert.equal(seamOut.continue, true);
+    assert.equal(seamOut.systemMessage, undefined, "no candidates => no call-to-action");
+    const seamNames = (await readdir(path.join(seamVault, "inbox"))).filter((n) =>
       n.endsWith(".json"),
     );
-    assert.deepEqual(grokNames, [], "empty outcome must not write an inbox file");
+    assert.deepEqual(seamNames, [], "zero-candidate outcome must not write an inbox file");
+    const seamTail = await auditTail(seamVault, 10);
+    assert.match(seamTail.text, /no candidates after scrub/, "breadcrumb must be recorded");
 
-    // codex historical behavior update (Issue #173): even under alwaysWriteStopInbox: true,
-    // empty outcomes with no draftable signal (no summary / no changedFiles) write 0 inbox files.
-    const codexVault = path.join(root, "codex-vault");
-    const codexHandlers = createHookHandlers(stopConfig(codexVault, true), {
-      prepareOutcome: emptyOutcomeStub(),
+    // End-to-end against the REAL drafter: a telemetry-shaped summary (the
+    // shape issue #173 severed — Minni's own audit log fed back in) passes the
+    // signal gate, is scrubbed to [] by isAuditTelemetryLine, and still must
+    // produce zero files. This is the case the review reproduced as 1 file.
+    const realVault = path.join(root, "real-vault");
+    const realHandlers = createHookHandlers(stopConfig(realVault, "codex"));
+    const realOut = await realHandlers.handleStop({
+      session_id: "telemetry-stop",
+      summary: "## [2026-07-25 12:00:00] hook_stop | stop session-abc",
     });
-    const codexOut = await codexHandlers.handleStop({ session_id: "empty-stop" });
-    assert.equal(codexOut.continue, true);
-    assert.equal(codexOut.systemMessage, undefined, "no candidates => no call-to-action");
-    const codexNames = (await readdir(path.join(codexVault, "inbox"))).filter((n) =>
+    assert.equal(realOut.continue, true);
+    assert.equal(realOut.systemMessage, undefined, "scrubbed telemetry => no call-to-action");
+    const realNames = (await readdir(path.join(realVault, "inbox"))).filter((n) =>
       n.endsWith(".json"),
     );
-    assert.equal(codexNames.length, 0, "empty outcome without signal must not write inbox files");
+    assert.deepEqual(realNames, [], "scrubbed telemetry must not write an inbox file");
   } finally {
     if (savedHome === undefined) delete process.env.MINNI_HOME;
     else process.env.MINNI_HOME = savedHome;
@@ -351,7 +365,7 @@ test("Stop auto-draft retired: no outcome material writes no inbox file, only a 
   try {
     const vault = path.join(root, "grok-vault");
     await mkdir(vault, { recursive: true });
-    const handlers = createHookHandlers(stopConfig(vault, false));
+    const handlers = createHookHandlers(stopConfig(vault));
     // A bare last_user_message (the prompt) is NOT draftable outcome material.
     const out = await handlers.handleStop({
       session_id: "nosignal-stop",
@@ -383,7 +397,7 @@ test("Stop forward-compat hook: outcome material in the payload still drafts exa
   try {
     const vault = path.join(root, "grok-vault");
     await mkdir(vault, { recursive: true });
-    const handlers = createHookHandlers(stopConfig(vault, false));
+    const handlers = createHookHandlers(stopConfig(vault));
     const out = await handlers.handleStop({
       session_id: "material-stop",
       last_user_message: "wrap up",

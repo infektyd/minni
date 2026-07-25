@@ -22,8 +22,4 @@ void runHookMain({
   hookScript: "codex-hook.js",
   auditPrefix: "hook_codex",
   precompactKind: "codex_precompact_handoff",
-  // Empty outcome drafts no longer force an inbox write: the historical
-  // always-write behavior produced the kind-less draft-file noise the AFM
-  // ingest loop skips as _unrecognized.
-  alwaysWriteStopInbox: false,
 });
