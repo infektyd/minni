@@ -355,13 +355,29 @@ NOT DOCUMENTED. Resolve by observation before either goes in a support matrix.
 ## The MCP `instructions` field is the hydration channel of last resort
 
 Returned at initialize as server-wide guidance alongside the tools. It needs no
-hooks, works on any host that honors it, and is silently dropped by hosts that
-do not — so it is the one mechanism that reaches **every** surface where hooks
-structurally cannot hydrate:
+hooks and is silently dropped by hosts that ignore it.
 
-- **Grok Build** — passive-event stdout is ignored
-- **Cursor** — `sessionStart` injection is a confirmed open vendor bug
-- **Claude Desktop** — no hook system exists
+**It is NOT a universal answer.** Measured, not assumed:
+
+| Surface | `instructions` drives turn-1 hydration? |
+|---|---|
+| Claude Code | ✅ delivered and visible in-session |
+| Codex | documented as read; not yet re-tested |
+| **Cowork** | ❌ **no** — asked permission instead |
+| **Claude Desktop Chat** | ❌ **no** — asked permission instead |
+| Grok Build / Cursor | **untested** since it shipped |
+
+Both Claude desktop surfaces were tested on Opus — the strongest model, chosen
+so a null result could not be blamed on compliance — and both declined to act.
+Chat could *name* the tools, so the server was connected and the field's
+delivery is not the question; it simply does not drive behavior there. Cowork
+says outright that MCP tools are **"not yet loaded"** on turn one, which would
+make boot hydration structurally impossible regardless of what we ship.
+
+So `instructions` is worth having — it costs 509 characters and helps where it
+lands — but it does **not** replace a hook, and it did not rescue the
+no-hook surfaces it was adopted for. On Claude Desktop and Cowork, memory
+arrives only when the user asks for it.
 
 Minni sets it in `server.ts` (`MINNI_INSTRUCTIONS`). Two constraints, both
 pinned by tests: keep the **first 512 characters self-contained** (Codex
