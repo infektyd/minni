@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "hooks": {
+    "sessionStart": [{ "command": "node \"${CURSOR_PLUGIN_ROOT}/dist/cursor-hook.js\" sessionStart", "timeout": 30 }],
+    "beforeSubmitPrompt": [{ "command": "node \"${CURSOR_PLUGIN_ROOT}/dist/cursor-hook.js\" beforeSubmitPrompt", "timeout": 30 }],
+    "preCompact": [{ "command": "node \"${CURSOR_PLUGIN_ROOT}/dist/cursor-hook.js\" preCompact", "timeout": 20 }],
+    "stop": [{ "command": "node \"${CURSOR_PLUGIN_ROOT}/dist/cursor-hook.js\" stop", "timeout": 20 }],
+    "preToolUse": [{ "command": "node \"${CURSOR_PLUGIN_ROOT}/dist/cursor-hook.js\" preToolUse", "matcher": "Read|Grep|Glob|Shell", "timeout": 10 }]
+  }
+}

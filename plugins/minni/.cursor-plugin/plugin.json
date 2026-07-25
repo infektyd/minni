@@ -1,0 +1,19 @@
+{
+  "name": "minni",
+  "displayName": "Minni",
+  "version": "0.3.0",
+  "description": "Local-first Minni bridge for Cursor with a Cursor-owned vault.",
+  "author": {
+    "name": "Infektyd",
+    "email": "local@localhost"
+  },
+  "homepage": "https://github.com/infektyd/minni",
+  "repository": "https://github.com/infektyd/minni",
+  "license": "MIT",
+  "keywords": ["minni", "memory", "cursor", "local-first", "mcp"],
+  "category": "developer-tools",
+  "tags": ["memory", "local-first", "agents"],
+  "hooks": "./hooks/hooks-cursor.json",
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json"
+}
