@@ -72,16 +72,16 @@ test("Kilocode injects via the bridge, including at PreCompact", () => {
 test("every wire reads the ASSISTANT message, under its own spelling", () => {
   // `last_user_message` exists on no platform; reading it always yielded "".
   assert.equal(
-    claudeCodeWire.lastAssistantMessage({ last_assistant_message: "done" }),
+    claudeCodeWire.lastTaskText({ last_assistant_message: "done" }),
     "done",
   );
-  assert.equal(codexWire.lastAssistantMessage({ last_assistant_message: "done" }), "done");
+  assert.equal(codexWire.lastTaskText({ last_assistant_message: "done" }), "done");
   // Grok's envelope is camelCase throughout.
-  assert.equal(grokBuildWire.lastAssistantMessage({ lastAssistantMessage: "done" }), "done");
+  assert.equal(grokBuildWire.lastTaskText({ lastAssistantMessage: "done" }), "done");
 
   for (const wire of [claudeCodeWire, codexWire, grokBuildWire, kilocodeWire]) {
     assert.equal(
-      wire.lastAssistantMessage({ last_user_message: "nope" }),
+      wire.lastTaskText({ last_user_message: "nope" }),
       "",
       `${wire.id} must not resurrect the field that exists nowhere`,
     );

@@ -45,14 +45,24 @@ export interface PlatformWire {
    */
   note(event: EnvelopeEvent, text: string): object | null;
   /**
-   * The assistant's final message for the turn, from a Stop payload.
+   * Text describing what the turn was about, from a Stop payload. Used to key
+   * the Stop-time learn candidates.
    *
-   * NB: `last_user_message` exists on NO platform -- it was read here for a
-   * long time and always resolved to empty, degrading every Stop-time learn
-   * candidate to a bare session id. Every platform supplies the *assistant's*
-   * message instead, under three different spellings.
+   * NB: the codebase read `last_user_message` here for a long time. No VENDOR
+   * sends that field, so it always resolved to "" and every learn candidate
+   * degraded to a bare session id. Claude Code and Codex send
+   * `last_assistant_message`; Grok Build sends `lastAssistantMessage`. agy
+   * sends nothing at all, so we synthesize it from its transcript -- which is
+   * why that one profile legitimately reads `last_user_message`.
    */
-  lastAssistantMessage(payload: Record<string, unknown>): string;
+  lastTaskText(payload: Record<string, unknown>): string;
+  /**
+   * Per-platform gate: should this dispatch run at all?
+   *
+   * Some platforms fire an event more than once per logical occurrence. Default
+   * is "always run"; a profile overrides it to suppress the duplicates.
+   */
+  shouldHandle?(event: string, payload: Record<string, unknown>): boolean;
 }
 
 /** Claude Code's `hookSpecificOutput.additionalContext` envelope. */
@@ -82,7 +92,7 @@ export const claudeCodeWire: PlatformWire = {
   inject: (event, text) =>
     CLAUDE_INJECTABLE.has(event) ? claudeShapedInject(event, text) : null,
   note: (_event, text) => ({ continue: true, systemMessage: text }),
-  lastAssistantMessage: snakeAssistantMessage,
+  lastTaskText: snakeAssistantMessage,
 };
 
 // --- Codex -----------------------------------------------------------------
@@ -102,7 +112,7 @@ export const codexWire: PlatformWire = {
   inject: (event, text) =>
     CODEX_INJECTABLE.has(event) ? claudeShapedInject(event, text) : null,
   note: (_event, text) => ({ continue: true, systemMessage: text }),
-  lastAssistantMessage: snakeAssistantMessage,
+  lastTaskText: snakeAssistantMessage,
 };
 
 // --- Grok Build (xAI) ------------------------------------------------------
@@ -120,9 +130,18 @@ export const grokBuildWire: PlatformWire = {
   // Passive-event stdout is discarded, so a note only lands on the Stop gate.
   note: (event, text) =>
     GROK_INJECTABLE.has(event) ? { continue: true, systemMessage: text } : null,
-  lastAssistantMessage: (payload) =>
+  lastTaskText: (payload) =>
     // Grok's envelope is camelCase throughout.
     asString(payload.lastAssistantMessage) || snakeAssistantMessage(payload),
+  // Grok fires an EXTRA observe-only Stop at session end (reason
+  // "channel_closed" / "shutdown") on top of the real end-of-turn one, and its
+  // docs say to filter on end_turn. Without this every Grok session wrote a
+  // second stop_candidates inbox entry for the same turn.
+  shouldHandle: (event, payload) => {
+    if (event !== "Stop") return true;
+    const reason = asString(payload.reason);
+    return reason === "" || reason === "end_turn";
+  },
 };
 
 // --- Kilocode --------------------------------------------------------------
@@ -149,7 +168,43 @@ export const kilocodeWire: PlatformWire = {
     KILOCODE_INJECTABLE.has(event) ? claudeShapedInject(event, text) : null,
   // The bridge falls back to systemMessage when no additionalContext is present.
   note: (_event, text) => ({ continue: true, systemMessage: text }),
-  lastAssistantMessage: snakeAssistantMessage,
+  lastTaskText: snakeAssistantMessage,
+};
+
+// --- Gemini / Antigravity (agy CLI) ----------------------------------------
+// agy shares NOTHING with Claude Code's output shape. Context is injected with
+// `injectSteps`, documented at https://antigravity.google/docs/hooks:
+//     { "injectSteps": [ { "ephemeralMessage": "Remember to lint" } ] }
+//
+// Its events are its own too: there is no UserPromptSubmit and no PreCompact.
+// `PreInvocation` (fires before the model is called) is the real prompt-submit
+// analogue and the documented injection point; gemini-hook.ts maps agy's event
+// names onto Minni's internal ones.
+//
+// SessionStart is real on agy 1.1.7 -- it dispatches with a full payload -- but
+// is absent from every Google-published page, so injecting there is riding on
+// undocumented behavior. Kept, because losing boot hydration is the worse of
+// the two risks.
+const AGY_INJECTABLE: ReadonlySet<EnvelopeEvent> = new Set([
+  "SessionStart",
+  "UserPromptSubmit", // rendered onto agy's PreInvocation
+]);
+
+export const geminiWire: PlatformWire = {
+  id: "gemini",
+  // agy tolerates an empty object on passive events; PreToolUse is the one
+  // event that must never emit an empty decision (see gemini-adapter.ts).
+  noop: () => ({}),
+  inject: (event, text) =>
+    AGY_INJECTABLE.has(event) ? { injectSteps: [{ ephemeralMessage: text }] } : null,
+  // agy has no systemMessage channel. An ephemeralMessage is the closest
+  // equivalent and is at least visible in-conversation.
+  note: (_event, text) => ({ injectSteps: [{ ephemeralMessage: text }] }),
+  lastTaskText: (payload) =>
+    // agy's Stop payload carries no task text at all. gemini-adapter.ts
+    // back-fills `last_user_message` from agy's own transcript_full.jsonl, so
+    // here -- uniquely -- that field is real and synthesized by us.
+    asString(payload.last_user_message) || snakeAssistantMessage(payload),
 };
 
 export interface RenderedIntent {
@@ -199,6 +254,7 @@ const WIRES: ReadonlyArray<PlatformWire> = [
   codexWire,
   grokBuildWire,
   kilocodeWire,
+  geminiWire,
 ];
 
 /**

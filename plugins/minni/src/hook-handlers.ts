@@ -27,7 +27,7 @@ import {
   workspaceFromPayload,
 } from "./hook-utils.js";
 import type { HookOutput } from "./hook-utils.js";
-import { injectIntent, noteIntent } from "./hook-intent.js";
+import { injectIntent, noIntent, noteIntent } from "./hook-intent.js";
 import type { HookIntent } from "./hook-intent.js";
 import { renderIntent, wireFor } from "./hook-platform.js";
 import type { PlatformWire } from "./hook-platform.js";
@@ -386,7 +386,7 @@ export function createHookHandlers(
   async function handleUserPromptSubmit(payload: Record<string, unknown>): Promise<HookOutput> {
     const prompt = asString(payload.prompt) || asString(payload.user_prompt);
     if (!prompt.trim()) {
-      return { continue: true };
+      return render(noIntent);
     }
 
     const workspaceId = workspaceFor(payload);
@@ -402,7 +402,7 @@ export function createHookHandlers(
       // s6 guard deny an unrelated read/search here (parity with the weak-turn
       // path below, which also clears).
       await clearRecallState(config.vaultPath).catch(() => {});
-      return { continue: true };
+      return render(noIntent);
     }
 
     const threshold = recallPointerThreshold();
@@ -465,7 +465,7 @@ export function createHookHandlers(
           recall_strong: false,
         },
       });
-      return { continue: true };
+      return render(noIntent);
     }
 
     const envelopeBody: Record<string, unknown> = {
@@ -644,7 +644,7 @@ export function createHookHandlers(
     // `last_user_message` exists on no platform -- reading it always yielded
     // "" and degraded every learn candidate to a bare session id. Each platform
     // supplies the ASSISTANT's final message, under its own spelling.
-    const lastTask = wire.lastAssistantMessage(payload) || sessionId;
+    const lastTask = wire.lastTaskText(payload) || sessionId;
     const tail = await auditTail(config.vaultPath, 30);
     const outcome = await prepareOutcomeFn({
       task: lastTask.slice(0, 200),
@@ -658,7 +658,7 @@ export function createHookHandlers(
     // don't litter the inbox with empty files or pad the audit log with noise
     // (unless this agent's config keeps the historical always-write behavior).
     if (!config.alwaysWriteStopInbox && candidates.length === 0) {
-      return { continue: true };
+      return render(noIntent);
     }
 
     const inbox = await writeInbox(config.vaultPath, sessionId, {
@@ -683,7 +683,7 @@ export function createHookHandlers(
     });
 
     if (candidates.length === 0) {
-      return { continue: true };
+      return render(noIntent);
     }
 
     return render(
@@ -713,7 +713,7 @@ export function createHookHandlers(
       case "Stop":
         return handleStop(payload);
       default:
-        return { continue: true };
+        return render(noIntent);
     }
   }
 
@@ -741,6 +741,14 @@ export async function runHookMain(config: AgentHookConfig): Promise<void> {
   // the permissionDecision shape), so it is gated alongside VALID_EVENTS.
   if (event !== PRE_TOOL_USE_EVENT && !VALID_EVENTS.includes(event as EnvelopeEvent)) {
     emit({ continue: true });
+    return;
+  }
+
+  const wire = config.wire ?? wireFor(config.agentId);
+  if (wire.shouldHandle && !wire.shouldHandle(event, payload)) {
+    // A duplicate firing of an event the platform emits more than once per
+    // logical occurrence -- running it again would double-count the outcome.
+    emit(wire.noop());
     return;
   }
 

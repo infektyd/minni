@@ -21,7 +21,7 @@ import { promisify } from "node:util";
 import {
   adaptAgyPayload,
   adaptPreToolUseOutput,
-  agyApprove,
+  agyAllow,
   enrichAgyStopPayload,
 } from "../dist/gemini-adapter.js";
 
@@ -100,9 +100,11 @@ test("adaptAgyPayload never clobbers canonical fields and passes unknown tools t
   assert.equal(native.workspace_id, "/w/second");
 });
 
-test("adaptPreToolUseOutput: allow collapses to explicit approve, deny carries the reason", () => {
-  assert.deepEqual(adaptPreToolUseOutput({ continue: true }), { decision: "approve" });
-  assert.deepEqual(agyApprove(), { decision: "approve" });
+test("adaptPreToolUseOutput: allow collapses to explicit allow, deny carries the reason", () => {
+  // agy's enum is allow|deny|ask|force_ask. Claude's "approve"/"block" fail the
+  // step outright: unknown pre-tool hook decision "approve".
+  assert.deepEqual(adaptPreToolUseOutput({ continue: true }), { decision: "allow" });
+  assert.deepEqual(agyAllow(), { decision: "allow" });
   const deny = adaptPreToolUseOutput({
     continue: true,
     hookSpecificOutput: {
@@ -111,29 +113,54 @@ test("adaptPreToolUseOutput: allow collapses to explicit approve, deny carries t
       permissionDecisionReason: "consult recall first",
     },
   });
-  assert.deepEqual(deny, { decision: "block", reason: "consult recall first" });
+  assert.deepEqual(deny, { decision: "deny", reason: "consult recall first" });
 });
 
-test("hooks-gemini.json template: matcher-free, token-stamped, no CLAUDE_PLUGIN_ROOT", async () => {
+test("hooks-gemini.json template: agy's native shape, token-stamped", async () => {
   const template = JSON.parse(await readFile(HOOKS_GEMINI_JSON, "utf8"));
-  const events = Object.keys(template.hooks);
-  assert.ok(events.includes("PreToolUse") && events.includes("Stop"));
-  for (const [event, groups] of Object.entries(template.hooks)) {
-    for (const group of groups) {
-      // agy's loader drops matcher-bearing entries ("0 total handlers").
-      assert.equal(group.matcher, undefined, `${event} entry must be matcher-free`);
-      for (const hook of group.hooks) {
-        assert.equal(hook.type, "command");
-        assert.ok(
-          hook.command.includes("__MINNI_GEMINI_DIST__/gemini-hook.js"),
-          `${event} command must run gemini-hook.js via the dist token`,
-        );
-        assert.ok(
-          !hook.command.includes("CLAUDE_PLUGIN_ROOT"),
-          "agy does not expand ${CLAUDE_PLUGIN_ROOT}",
-        );
-        assert.ok(hook.command.endsWith(` ${event}`), "command must pass its event name");
-      }
+
+  // agy reads every TOP-LEVEL key as a hook NAME. A literal "hooks" wrapper
+  // declares a hook named "hooks" and agy rejects the ENTIRE file -- which is
+  // exactly what it was doing ("invalid hook \"hooks\": command hook must
+  // specify 'command'"), leaving Minni with zero hooks on every Antigravity
+  // surface. Any non-hook key here is the same hazard, so there must be
+  // exactly one and it must be the hook name.
+  assert.deepEqual(Object.keys(template), ["minni"]);
+
+  const events = template.minni;
+  // agy has no UserPromptSubmit and no PreCompact; PreInvocation is the
+  // prompt-submit analogue and the documented injection point.
+  assert.ok("PreInvocation" in events, "PreInvocation is agy's prompt-submit event");
+  assert.ok(!("UserPromptSubmit" in events), "UserPromptSubmit does not exist on agy");
+  assert.ok(!("PreCompact" in events), "PreCompact does not exist on agy");
+
+  for (const [event, entries] of Object.entries(events)) {
+    // Grouped vs flat is PER EVENT: only PreToolUse/PostToolUse take
+    // {matcher, hooks:[]}. Using the grouped form elsewhere is what produced
+    // the parse failure above.
+    const handlers =
+      event === "PreToolUse" || event === "PostToolUse"
+        ? entries.flatMap((group) => group.hooks)
+        : entries;
+
+    if (event === "PreToolUse") {
+      // Matchers ARE honored -- the old "agy drops matcher-bearing entries"
+      // note was the whole-file rejection, misdiagnosed.
+      assert.ok(entries[0].matcher, "PreToolUse must scope with a matcher");
+    }
+
+    for (const hook of handlers) {
+      assert.equal(hook.type, "command");
+      assert.ok(
+        hook.command.includes("__MINNI_GEMINI_DIST__/gemini-hook.js"),
+        `${event} command must run gemini-hook.js via the dist token`,
+      );
+      assert.ok(
+        !hook.command.includes("CLAUDE_PLUGIN_ROOT"),
+        "agy never DEFINES CLAUDE_PLUGIN_ROOT; it expands to empty under sh -c",
+      );
+      assert.ok(hook.command.endsWith(` ${event}`), "command must pass its event name");
+      assert.ok(hook.timeout > 0, `${event} must bound a hook that blocks agy's loop`);
     }
   }
 });
@@ -142,7 +169,7 @@ test("PreToolUse with no recall state prints exactly the explicit approve", asyn
   const fixture = await makeFixture();
   try {
     const output = await runGeminiHook("PreToolUse", fixture, agyPreToolUsePayload());
-    assert.deepEqual(output, { decision: "approve" });
+    assert.deepEqual(output, { decision: "allow" });
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }
@@ -154,7 +181,7 @@ test("PreToolUse never emits an empty decision, even when hooks are disabled or 
     const disabled = await runGeminiHook("PreToolUse", fixture, agyPreToolUsePayload(), {
       MINNI_GEMINI_HOOKS: "off",
     });
-    assert.deepEqual(disabled, { decision: "approve" });
+    assert.deepEqual(disabled, { decision: "allow" });
     const unknownEvent = await runGeminiHook("PostToolUse", fixture, agyPreToolUsePayload());
     // Non-PreToolUse unknown events keep the plain continue shape.
     assert.deepEqual(unknownEvent, { continue: true });
@@ -190,13 +217,13 @@ test("PreToolUse denies-to-surface through agy's decision vocabulary and flips c
       }),
       { MINNI_RECALL_GUARD_MODE: "strict" },
     );
-    assert.equal(output.decision, "block");
+    assert.equal(output.decision, "deny");
     assert.match(output.reason, /recall guard/i);
     assert.match(output.reason, /prior-fix/);
     const state = JSON.parse(await readFile(statePath, "utf8"));
     assert.equal(state.consumed, true);
 
-    // Idempotent re-issue: the same call now approves.
+    // Idempotent re-issue: the same call now allows.
     const rerun = await runGeminiHook(
       "PreToolUse",
       fixture,
@@ -205,7 +232,7 @@ test("PreToolUse denies-to-surface through agy's decision vocabulary and flips c
       }),
       { MINNI_RECALL_GUARD_MODE: "strict" },
     );
-    assert.deepEqual(rerun, { decision: "approve" });
+    assert.deepEqual(rerun, { decision: "allow" });
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }
@@ -272,7 +299,7 @@ test("guard defaults to strict on agy: read/search run_command is denied without
       }),
       { MINNI_RECALL_GUARD_MODE: "" },
     );
-    assert.equal(output.decision, "block");
+    assert.equal(output.decision, "deny");
 
     // An explicit soft override is honored: Bash stays unguarded there.
     await writeFile(
@@ -294,7 +321,7 @@ test("guard defaults to strict on agy: read/search run_command is denied without
       }),
       { MINNI_RECALL_GUARD_MODE: "soft" },
     );
-    assert.deepEqual(soft, { decision: "approve" });
+    assert.deepEqual(soft, { decision: "allow" });
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }
@@ -324,7 +351,9 @@ test("vault default mirrors propagate's legacy fallback when only ~/.gemini/minn
     child.child.stdin.end(JSON.stringify(agyPreToolUsePayload({ toolCall: null })));
     const { stdout } = await child;
     const output = JSON.parse(stdout.trim().split("\n").at(-1));
-    assert.equal(output.continue, true);
+    // agy's no-op is a bare {} -- it has no `continue` field. This test is
+    // about vault resolution; the assertion just pins that the hook ran.
+    assert.equal(output.continue, undefined);
     const legacyLog = await readFile(path.join(legacyVault, "log.md"), "utf8");
     assert.ok(legacyLog.includes("hook_gemini"), "hook must write to the legacy vault, not a fresh canonical one");
     const canonical = path.join(fixture.root, ".minni", "gemini-vault");
@@ -339,7 +368,13 @@ test("Stop drafts candidates under gemini's own identity stamps", async () => {
   const fixture = await makeFixture();
   try {
     const output = await runGeminiHook("Stop", fixture, agyPreToolUsePayload({ toolCall: null }));
-    assert.equal(output.continue, true);
+    // agy has no `continue` field -- its passive-event no-op is a bare {}, and
+    // anything it does surface travels as injectSteps. Asserting Claude's
+    // `continue: true` here is what the shared layer used to emit blindly.
+    assert.ok(
+      output.continue === undefined,
+      "agy output must not carry Claude Code's `continue` field",
+    );
     const inboxDir = path.join(fixture.vault, "inbox");
     const entries = await readdir(inboxDir).catch(() => []);
     // Candidate drafting is local (no daemon needed): if the compact outcome

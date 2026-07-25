@@ -35,8 +35,23 @@ export function adaptCursorOutput(event: string, output: Record<string, unknown>
     }
     return { permission: "allow" };
   }
-  // beforeSubmitPrompt only accepts continue/user_message; its current schema
-  // cannot inject prompt-specific recall. The handler still records the prompt
-  // and prepares recall state for the guard.
+  if (event === "Stop") {
+    // Cursor's stop validator accepts ONLY `followup_message`; `continue` is
+    // dropped. The shared handler's candidate announcement rides `systemMessage`
+    // (Claude Code's field), so translate it or it reaches nobody.
+    const message = asString(output.systemMessage);
+    return message ? { followup_message: message } : {};
+  }
+  if (event === "PreCompact") {
+    // preCompact accepts only `user_message`, and cannot block. PreCompact's
+    // real work here is the inbox handoff side effect, not its output.
+    return {};
+  }
+  // beforeSubmitPrompt CANNOT inject context: its documented output is
+  // `continue` + `user_message` only (https://cursor.com/docs/hooks), and there
+  // are open vendor feature requests to add `additional_context`. The bundle
+  // does validate the field, but relying on undocumented behavior here would be
+  // exactly the mistake this module exists to avoid. The handler still records
+  // the prompt and prepares recall state for the guard.
   return { continue: true };
 }

@@ -74,8 +74,8 @@ Load-bearing details:
 
 - **Grok Build ignores hook stdout on all passive events.** Officially: *"For
   passive events, stdout is ignored; exit 0 on success."* Only `PreToolUse` and
-  `Stop`/`SubagentStop` parse output. Session-start hydration on Grok must go
-  through skills/instructions/MCP — **hooks cannot do it**.
+  `Stop`/`SubagentStop` parse output. **Hooks cannot hydrate memory at boot on
+  Grok** — see "Boot hydration on Grok Build" below for what we do instead.
 - **`PreCompact` can inject on no platform except Kilocode**, whose bridge feeds
   opencode's `experimental.session.compacting`. Everywhere else its side effects
   (inbox handoff, stale-belief stash) are the only reason it exists.
@@ -181,3 +181,30 @@ One `gemini` agent identity spans the **IDE**, the **2.0 desktop app**, and the
 **`agy` CLI**. They share `~/.gemini/` but have separate app-data roots
 (`antigravity-ide/`, `antigravity/`, `antigravity-cli/`). A manifest that fails
 to parse fails on **all** of them — the loader is shared.
+
+## Boot hydration on Grok Build
+
+Grok is the one platform where hooks cannot deliver memory at session start, so
+it gets a different mechanism. Everything else was ruled out against xAI's own
+docs: **skills** activate on-demand only (*"Grok activates a skill only when it
+applies to your current task"*), **plugins** expose no context component at all,
+**MCP** has no eager-load equivalent of Claude Code's `alwaysLoad`, and no config
+key contributes a preamble.
+
+What does load unconditionally is `$GROK_HOME/rules/*.md` — documented as
+*"Always scanned; applies to all projects"*, read into the system prompt at
+session start, every `*.md` regardless of filename, and (unlike hooks and MCP)
+**not gated on folder trust**. So the installer writes `~/.grok/rules/minni.md`
+instructing the model to call `minni__minni_recall` on its first turn.
+
+The file is static; the context it produces is **live**, because the recall runs
+in-session against the daemon. That matters — no Grok mechanism delivers
+dynamically generated content into the boot context, so a pre-written envelope
+file could only ever be as fresh as the last write.
+
+Honest limitations: it is model **compliance, not harness enforcement**; context
+arrives one tool round-trip in rather than before the first token; and
+`~/.grok/rules/` is global, so it costs a few hundred tokens in every session on
+the machine including repos where Minni is irrelevant. Keep the file short —
+long rules files are followed less reliably. `grok inspect` lists loaded
+instruction files with token counts and is a free regression check.
