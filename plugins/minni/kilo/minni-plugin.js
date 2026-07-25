@@ -5,6 +5,10 @@ const HOOK_SCRIPT = __MINNI_KILO_HOOK_SCRIPT__;
 const HOOK_ENV = __MINNI_KILO_HOOK_ENV__;
 const booted = new Set();
 const pending = new Map();
+// Kilo's session.idle event carries no message text, so Stop had nothing to key
+// its learn candidate on and fell back to the bare session id. The prompt is
+// already computed in chat.message -- stash it and carry it to Stop.
+const lastPrompt = new Map();
 
 function hookContext(result) {
   return result?.hookSpecificOutput?.additionalContext || result?.systemMessage || "";
@@ -76,6 +80,7 @@ const MinniPlugin = async ({ directory }) => ({
       .filter((part) => part?.type === "text" && typeof part.text === "string")
       .map((part) => part.text)
       .join("\n");
+    if (prompt) lastPrompt.set(input.sessionID, prompt.slice(0, 400));
     const result = await runHookFailOpen("UserPromptSubmit", {
       session_id: input.sessionID,
       prompt,
@@ -109,10 +114,16 @@ const MinniPlugin = async ({ directory }) => ({
   event: async ({ event }) => {
     const sessionID = event.properties?.sessionID || event.properties?.info?.id || "kilo-session-unknown";
     if (event?.type === "session.idle") {
-      await runHookFailOpen("Stop", { session_id: sessionID, workspace_id: directory });
+      await runHookFailOpen("Stop", {
+        session_id: sessionID,
+        workspace_id: directory,
+        // Synthesized by this bridge, not by Kilo -- see kilocodeWire.lastTaskText.
+        last_user_message: lastPrompt.get(sessionID) ?? "",
+      });
     } else if (event?.type === "session.deleted") {
       booted.delete(sessionID);
       pending.delete(sessionID);
+      lastPrompt.delete(sessionID);
     }
   },
 });

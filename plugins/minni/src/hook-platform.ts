@@ -168,7 +168,11 @@ export const kilocodeWire: PlatformWire = {
     KILOCODE_INJECTABLE.has(event) ? claudeShapedInject(event, text) : null,
   // The bridge falls back to systemMessage when no additionalContext is present.
   note: (_event, text) => ({ continue: true, systemMessage: text }),
-  lastTaskText: snakeAssistantMessage,
+  // Kilo's session.idle event carries no message text at all, so -- as with agy
+  // -- the bridge synthesizes one, stashing the prompt at chat.message and
+  // passing it at Stop. Without it every candidate was keyed on `ses_...`.
+  lastTaskText: (payload) =>
+    asString(payload.last_user_message) || snakeAssistantMessage(payload),
 };
 
 // --- Gemini / Antigravity (agy CLI) ----------------------------------------

@@ -81,11 +81,26 @@ test("every wire reads the ASSISTANT message, under its own spelling", () => {
   // Grok's envelope is camelCase throughout.
   assert.equal(grokBuildWire.lastTaskText({ lastAssistantMessage: "done" }), "done");
 
-  for (const wire of [claudeCodeWire, codexWire, grokBuildWire, kilocodeWire]) {
+  // No VENDOR sends `last_user_message`, so a platform wire must never read it
+  // off the raw payload and call it task text.
+  for (const wire of [claudeCodeWire, codexWire, grokBuildWire, cursorWire]) {
     assert.equal(
       wire.lastTaskText({ last_user_message: "nope" }),
       "",
       `${wire.id} must not resurrect the field that exists nowhere`,
+    );
+  }
+
+  // The two exceptions are ours, not the vendors': agy's Stop payload has no
+  // task text and neither does Kilo's session.idle, so gemini-adapter mines
+  // agy's transcript and the kilo bridge stashes the prompt -- both writing
+  // last_user_message deliberately. Without it their candidates key on a bare
+  // conversation/session id.
+  for (const wire of [geminiWire, kilocodeWire]) {
+    assert.equal(
+      wire.lastTaskText({ last_user_message: "synthesized by us" }),
+      "synthesized by us",
+      `${wire.id} reads the field ITS OWN adapter/bridge synthesizes`,
     );
   }
 });
