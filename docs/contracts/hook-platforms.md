@@ -66,9 +66,9 @@ This is the table that matters most, and the one the codebase got wrong.
 | Claude Code | ✅ `additionalContext` | ✅ | ✅ | ❌ **not in the union** |
 | Codex | ✅ `additionalContext` | ✅ | ❌ **block only** | ❌ cannot inject *or* block |
 | Grok Build | ❌ **stdout ignored** | ❌ **stdout ignored** | ✅ `additionalContext` | ❌ **stdout ignored** |
-| Cursor | ✅ `additional_context` ⚠️ | ❌ **not supported** | ❌ note via `followup_message` | ❌ `user_message` only |
+| Cursor | ⚠️ **doc-true, runtime-broken** (vendor bug) | ❌ **not supported** | ❌ **no channel** — `followup_message` loops the agent | ❌ `user_message` only |
 | agy | ✅ `injectSteps` (verified live) | ✅ `injectSteps` (`PreInvocation`) | ❌ rejects `injectSteps` | — |
-| Kilocode | `experimental.chat.system.transform` | same | — | `experimental.session.compacting` |
+| Kilocode | ✅ via bridge → `system.transform` | ✅ same | — | ✅ **only platform that can** |
 
 Load-bearing details:
 
@@ -80,11 +80,13 @@ Load-bearing details:
   opencode's `experimental.session.compacting`. Everywhere else its side effects
   (inbox handoff, stale-belief stash) are the only reason it exists.
 - **Codex cannot inject at `Stop`**; Claude Code can. A shared Stop path must branch.
-- **Cursor `beforeSubmitPrompt` cannot inject** — documented output is `continue`
-  + `user_message`. The bundle validates `additional_context`, but it is
-  undocumented and there are open vendor feature requests to add it. Do not rely
-  on it. Cursor `sessionStart` injection also has an open bug report claiming it
-  is accepted but never applied — verify empirically per version before trusting.
+- **Cursor cannot inject at all, in practice.** `beforeSubmitPrompt` is
+  documented as `continue` + `user_message` only. And `sessionStart`'s
+  `additional_context` is a **staff-confirmed open bug** — *"This is a bug on our
+  side"*, a timing issue against composer-handle creation, unfixed 3.1.15 →
+  3.8.23, *"no workaround right now"*. Measured twice here: the agent went to MCP
+  both times. `cursorWire` still declares SessionStart injectable because that is
+  the documented contract; treat it as aspirational until the vendor ships a fix.
 
 ## Pre-tool deny — enums differ, and coverage differs more
 
@@ -136,7 +138,7 @@ memory rather than surfacing an error.
 | Grok Build | `~/.grok/hooks/*.json`; plugin `hooks/hooks.json` | also reads Claude/Cursor configs |
 | Cursor | `.cursor-plugin/plugin.json` `hooks` key, else `hooks/hooks.json` | `${CURSOR_PLUGIN_ROOT}` expands for **manifest-registered hooks only** |
 | agy | docs say `~/.gemini/antigravity-cli/plugins/<name>/`; CLI empirically also reads `~/.gemini/config/plugins/<name>/` | ⚠️ documented root and working root disagree |
-| Kilocode | config `plugin: []` key (blessed) or `~/.config/kilo/plugin/*.js` | MCP env key is `environment`, **not `env`** — `env` bricks the whole CLI |
+| Kilocode | `~/.config/kilo/plugin/*.js` auto-scan (verified live; no `plugin: []` key needed) | MCP env key is `environment`, **not `env`** — `env` bricks the whole CLI |
 
 ### Codex hook trust (operational landmine)
 
