@@ -18,6 +18,7 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
 import { createHookHandlers } from "../dist/hook-handlers.js";
+import { auditTail } from "../dist/vault.js";
 
 const execFileAsync = promisify(execFile);
 const PLUGIN_ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -186,6 +187,10 @@ for (const agent of STOP_AGENTS) {
     const fixture = { vault: path.join(root, "vault"), home: path.join(root, "home") };
     try {
       await mkdir(fixture.home, { recursive: true });
+      // Stop auto-draft is RETIRED; the only way Stop writes a file now is the
+      // forward-compat hook — a payload carrying genuine outcome material
+      // (changed files / explicit summary), NOT audit-tail mining. Supply real
+      // material so this identity-stamp proof draws a written file.
       const output = await runHook(
         path.join(PLUGIN_ROOT, "dist", agent.hookJs),
         "Stop",
@@ -195,6 +200,8 @@ for (const agent of STOP_AGENTS) {
           session_id: "stop-fixture",
           last_user_message: "fixture stop task",
           workspace_id: "fixture-workspace",
+          summary: "shipped the retry fix and verified the suite passes",
+          changedFiles: ["src/retry.ts"],
         },
       );
       assert.match(output.systemMessage ?? "", /drafted to inbox/);
@@ -215,6 +222,54 @@ for (const agent of STOP_AGENTS) {
     }
   });
 }
+
+// The Claude Code Stop path is a SEPARATE copy of handleStop in hook.ts
+// (dist/hook.js), not the shared factory — so it gets its own subprocess proof
+// of the noise filter: a pure-telemetry tail writes NO inbox file, a tail with
+// genuine work still drafts exactly one.
+test("Stop hook (claude-code): no material writes no file; genuine material still drafts", { timeout: 120_000 }, async () => {
+  // The Claude Code Stop path is a SEPARATE copy of handleStop in hook.ts
+  // (dist/hook.js), so it gets its own forwarder proof: a Stop carrying no
+  // outcome material (Claude Code's native Stop payload) writes NO inbox file,
+  // while one carrying a real summary/changed files drafts exactly one.
+  const root = await mkdtemp(path.join(tmpdir(), "sm-hook-stop-cc-"));
+  const noiseVault = path.join(root, "noise-vault");
+  const realVault = path.join(root, "real-vault");
+  try {
+    await mkdir(noiseVault, { recursive: true });
+    const noiseOut = await runHook(
+      HOOK_JS, "Stop",
+      { vault: noiseVault, home: path.join(root, "home") },
+      { MINNI_CLAUDECODE_VAULT_PATH: noiseVault },
+      { session_id: "cc-noise", last_user_message: "what's next" },
+    );
+    assert.equal(noiseOut.systemMessage, undefined, "no material => no draft");
+    const noiseNames = (await readdir(path.join(noiseVault, "inbox")).catch(() => []))
+      .filter((n) => n.endsWith(".json"));
+    assert.deepEqual(noiseNames, [], "no-material Claude Code Stop writes no inbox file");
+
+    await mkdir(realVault, { recursive: true });
+    const realOut = await runHook(
+      HOOK_JS, "Stop",
+      { vault: realVault, home: path.join(root, "home") },
+      { MINNI_CLAUDECODE_VAULT_PATH: realVault },
+      {
+        session_id: "cc-real",
+        last_user_message: "wrap up",
+        summary: "shipped the retry fix and verified the suite passes",
+        changedFiles: ["src/retry.ts"],
+      },
+    );
+    assert.match(realOut.systemMessage ?? "", /drafted to inbox/);
+    const realNames = (await readdir(path.join(realVault, "inbox"))).filter((n) => n.endsWith(".json"));
+    assert.equal(realNames.length, 1, "a Claude Code session with real work drafts one file");
+    const body = JSON.parse(await readFile(path.join(realVault, "inbox", realNames[0]), "utf8"));
+    assert.equal(body.candidates.length, 1);
+    assert.match(body.candidates.join("\n"), /retry fix/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 // The deterministic outcome draft always yields one candidate, so the
 // zero-candidate branch is driven through the factory's test seam: an
@@ -258,8 +313,8 @@ test("Stop divergence: empty candidates skip the inbox write unless alwaysWriteS
     );
     assert.deepEqual(grokNames, [], "empty outcome must not write an inbox file");
 
-    // codex historical behavior (alwaysWriteStopInbox: true): the file IS
-    // written — and still carries the canonical kind + identity stamps.
+    // codex historical behavior update (Issue #173): even under alwaysWriteStopInbox: true,
+    // empty outcomes with no draftable signal (no summary / no changedFiles) write 0 inbox files.
     const codexVault = path.join(root, "codex-vault");
     const codexHandlers = createHookHandlers(stopConfig(codexVault, true), {
       prepareOutcome: emptyOutcomeStub(),
@@ -270,14 +325,77 @@ test("Stop divergence: empty candidates skip the inbox write unless alwaysWriteS
     const codexNames = (await readdir(path.join(codexVault, "inbox"))).filter((n) =>
       n.endsWith(".json"),
     );
-    assert.equal(codexNames.length, 1);
-    const body = JSON.parse(
-      await readFile(path.join(codexVault, "inbox", codexNames[0]), "utf8"),
-    );
-    assert.equal(body.kind, "stop_candidates");
-    assert.equal(body.agent_id, "codex");
-    assert.equal(body.workspace_id, "fixture-workspace");
-    assert.deepEqual(body.candidates, []);
+    assert.equal(codexNames.length, 0, "empty outcome without signal must not write inbox files");
+  } finally {
+    if (savedHome === undefined) delete process.env.MINNI_HOME;
+    else process.env.MINNI_HOME = savedHome;
+    if (savedBypass === undefined) delete process.env.MINNI_BYPASS_AUDIT_LIMIT;
+    else process.env.MINNI_BYPASS_AUDIT_LIMIT = savedBypass;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+// ── Stop auto-draft RETIRED 2026-07-24 (investigation: 0 real learnings in 40 ──
+// drafts; the audit tail is Minni's own telemetry log). Capture is now
+// EXCLUSIVELY the explicit minni_prepare_outcome / minni_learn path. Stop no
+// longer self-drafts: with no outcome material it records one log-only
+// breadcrumb and writes nothing. The payload branch is a documented
+// forward-compat hook (real harnesses supply no material today).
+
+test("Stop auto-draft retired: no outcome material writes no inbox file, only a log breadcrumb", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-hook-stop-nosignal-"));
+  const savedHome = process.env.MINNI_HOME;
+  const savedBypass = process.env.MINNI_BYPASS_AUDIT_LIMIT;
+  process.env.MINNI_HOME = path.join(root, "home");
+  process.env.MINNI_BYPASS_AUDIT_LIMIT = "true";
+  try {
+    const vault = path.join(root, "grok-vault");
+    await mkdir(vault, { recursive: true });
+    const handlers = createHookHandlers(stopConfig(vault, false));
+    // A bare last_user_message (the prompt) is NOT draftable outcome material.
+    const out = await handlers.handleStop({
+      session_id: "nosignal-stop",
+      last_user_message: "what's next",
+    });
+    assert.equal(out.continue, true);
+    assert.equal(out.systemMessage, undefined, "no material => no draft, no CTA");
+    const names = (await readdir(path.join(vault, "inbox")).catch(() => []))
+      .filter((n) => n.endsWith(".json"));
+    assert.deepEqual(names, [], "no-signal Stop must not write an inbox file");
+    // ...but a single breadcrumb is recorded so the session isn't invisible.
+    const tail = await auditTail(vault, 10);
+    assert.match(tail.text, /no draftable signal/, "breadcrumb line must be recorded");
+  } finally {
+    if (savedHome === undefined) delete process.env.MINNI_HOME;
+    else process.env.MINNI_HOME = savedHome;
+    if (savedBypass === undefined) delete process.env.MINNI_BYPASS_AUDIT_LIMIT;
+    else process.env.MINNI_BYPASS_AUDIT_LIMIT = savedBypass;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Stop forward-compat hook: outcome material in the payload still drafts exactly one file", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-hook-stop-material-"));
+  const savedHome = process.env.MINNI_HOME;
+  const savedBypass = process.env.MINNI_BYPASS_AUDIT_LIMIT;
+  process.env.MINNI_HOME = path.join(root, "home");
+  process.env.MINNI_BYPASS_AUDIT_LIMIT = "true";
+  try {
+    const vault = path.join(root, "grok-vault");
+    await mkdir(vault, { recursive: true });
+    const handlers = createHookHandlers(stopConfig(vault, false));
+    const out = await handlers.handleStop({
+      session_id: "material-stop",
+      last_user_message: "wrap up",
+      summary: "shipped the retry fix and verified the suite passes",
+      changedFiles: ["src/retry.ts"],
+    });
+    assert.match(out.systemMessage ?? "", /candidate learning/);
+    const names = (await readdir(path.join(vault, "inbox"))).filter((n) => n.endsWith(".json"));
+    assert.equal(names.length, 1, "genuine outcome material drafts one file");
+    const body = JSON.parse(await readFile(path.join(vault, "inbox", names[0]), "utf8"));
+    assert.equal(body.candidates.length, 1);
+    assert.match(body.candidates.join("\n"), /retry fix/);
   } finally {
     if (savedHome === undefined) delete process.env.MINNI_HOME;
     else process.env.MINNI_HOME = savedHome;

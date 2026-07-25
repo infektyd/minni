@@ -226,19 +226,37 @@ function queryTerms(query: string): string[] {
     "an",
     "and",
     "are",
+    "as",
+    "at",
+    "be",
+    "by",
+    "do",
     "for",
+    "if",
     "in",
     "is",
     "it",
+    "no",
     "of",
     "on",
     "or",
+    "so",
     "the",
     "to",
+    "up",
+    "we",
     "with",
+    "you",
+    "can",
+    "how",
+    "what",
+    "where",
+    "which",
+    "who",
+    "why",
   ]);
   return [
-    ...new Set(query.toLowerCase().match(/[a-z0-9_/-]{3,}/g) ?? []),
+    ...new Set(query.toLowerCase().match(/[a-z0-9_/-]{2,}/g) ?? []),
   ].filter((term) => !stop.has(term));
 }
 
@@ -378,6 +396,13 @@ function frontmatterField(markdown: string, key: string): string | undefined {
   return value || undefined;
 }
 
+function countWordOccurrences(text: string, term: string): number {
+  const escaped = term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const regex = new RegExp(`\\b${escaped}\\b`, "gi");
+  const matches = text.match(regex);
+  return matches ? matches.length : 0;
+}
+
 function scoreVaultNote(
   query: string,
   terms: string[],
@@ -402,13 +427,16 @@ function scoreVaultNote(
   const haystack = `${title}\n${relativePath}\n${markdown}`.toLowerCase();
   const titleLower = title.toLowerCase();
   const queryLower = query.toLowerCase().trim();
-  let score = 0;
-  if (queryLower && haystack.includes(queryLower)) score += 50;
+  let termScore = 0;
+  if (queryLower && countWordOccurrences(haystack, queryLower) > 0) termScore += 50;
   for (const term of terms) {
-    const count = haystack.split(term).length - 1;
-    if (count > 0) score += Math.min(count, 5);
-    if (titleLower.includes(term)) score += 3;
+    const count = countWordOccurrences(haystack, term);
+    if (count > 0) termScore += Math.min(count, 5);
+    if (countWordOccurrences(titleLower, term) > 0) termScore += 3;
   }
+  if (termScore === 0) return 0;
+
+  let score = termScore;
   if (relativePath.startsWith("wiki/sessions/")) score += 1;
   if (/minni_learning:\s*true/i.test(markdown)) score += 2;
 
@@ -982,8 +1010,9 @@ export async function searchVaultNotes(
     }),
   );
 
+  const MIN_SEARCH_SCORE = 3;
   return scored
-    .filter((result): result is VaultSearchResult => result !== undefined && result.score > 0)
+    .filter((result): result is VaultSearchResult => result !== undefined && result.score >= MIN_SEARCH_SCORE)
     .sort(
       (a, b) =>
         b.score - a.score || a.relativePath.localeCompare(b.relativePath),

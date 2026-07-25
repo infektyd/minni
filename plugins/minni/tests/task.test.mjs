@@ -260,6 +260,25 @@ test("prepareOutcome returns a dry-run outcome packet without audit or learning 
   assert.match(packet.outcomeDraft.doNotStore.join("\n"), /raw logs/);
 });
 
+test("prepareOutcome passes valid user summaries and scrubs audit log telemetry lines (Issue #173)", async () => {
+  const shortPacket = await prepareOutcome({
+    task: "note",
+    summary: "Use WAL",
+    profile: "compact",
+    vaultPath: "/tmp/vault",
+  });
+  assert.deepEqual(shortPacket.outcomeDraft.learnCandidates, ["note: Use WAL"]);
+
+  const auditTelemetry = "## [2026-07-23T10:00:00Z] hook_stop | stop session";
+  const telemetryPacket = await prepareOutcome({
+    task: "fix",
+    summary: auditTelemetry,
+    profile: "compact",
+    vaultPath: "/tmp/vault",
+  });
+  assert.equal(telemetryPacket.outcomeDraft.learnCandidates.length, 0, "audit telemetry lines must be scrubbed from learnCandidates");
+});
+
 test("prepareOutcome applies AFM outcome draft suggestions when requested", async () => {
   const packet = await prepareOutcome(
     {

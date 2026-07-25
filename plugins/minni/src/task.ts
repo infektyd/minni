@@ -997,12 +997,22 @@ export async function prepareTask(input: PrepareTaskInput, deps: PrepareTaskDeps
   return packet;
 }
 
+export function isAuditTelemetryLine(text: string): boolean {
+  return (
+    /^## \[[^\]]+\]\s+hook_/i.test(text) ||
+    /\bhook_(stop|session_start|user_prompt_submit|pretooluse_guard)\b/i.test(text)
+  );
+}
+
+// The genuine outcome-drafting path (explicit minni_prepare_outcome): the
+// caller supplies a real distilled summary, so the candidate is built verbatim
+// — a short valid learning like "Use WAL" must pass through unfiltered.
+// Telemetry audit logs are rejected as defense-in-depth against corpus poisoning.
 function outcomeDraft(input: PrepareOutcomeInput): OutcomeDraft {
   const verification = input.verification ?? [];
   const changedFiles = input.changedFiles ?? [];
-  const learnCandidates = [
-    `${input.task}: ${input.summary}`.replace(/\s+/g, " ").slice(0, 500),
-  ];
+  const rawCandidate = `${input.task}: ${input.summary}`.replace(/\s+/g, " ").slice(0, 500);
+  const learnCandidates = isAuditTelemetryLine(input.summary) ? [] : [rawCandidate];
   const logOnly = [
     ...verification.map((item) => `Verification: ${item}`),
     changedFiles.length > 0 ? `Changed files: ${changedFiles.join(", ")}` : "",

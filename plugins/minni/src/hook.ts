@@ -21,6 +21,7 @@ import {
   asString,
   emit,
   readStdin,
+  stringArray,
   VALID_EVENTS,
 } from "./hook-utils.js";
 import type { HookOutput } from "./hook-utils.js";
@@ -523,10 +524,24 @@ async function handleStop(payload: Record<string, unknown>): Promise<HookOutput>
   await ensureVault(CLAUDECODE_VAULT_PATH);
   const sessionId = asString(payload.session_id) || asString(payload.sessionId) || "session";
   const lastTask = asString(payload.last_user_message) || asString(payload.summary) || sessionId;
-  const tail = await auditTail(CLAUDECODE_VAULT_PATH, 30);
+
+  const changedFiles = stringArray(payload.changedFiles ?? payload.changed_files);
+  const outcomeSummary = asString(payload.summary).trim();
+  const hasDraftableSignal = changedFiles.length > 0 || outcomeSummary.length > 0;
+
+  if (!hasDraftableSignal) {
+    await recordAudit(CLAUDECODE_VAULT_PATH, {
+      tool: "hook_stop",
+      summary: `stop ${sessionId}: no draftable signal`,
+      details: { candidates: 0 },
+    });
+    return { continue: true };
+  }
+
   const outcome = await prepareOutcome({
     task: lastTask.slice(0, 200),
-    summary: tail.entries.slice(-5).join("\n").slice(0, 600) || "session ended",
+    summary: outcomeSummary,
+    changedFiles,
     profile: "compact",
     vaultPath: CLAUDECODE_VAULT_PATH,
   });

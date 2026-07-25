@@ -694,7 +694,7 @@ def formatRecall(query: str, response: Dict[str, Any]) -> str:
     if not isinstance(results, str):
         results = json.dumps(results, indent=2)
     return "\n\n".join([
-        "# Sovereign Recall",
+        "# Minni Recall",
         f"Query: {query}{badge}",
         "## Daemon Results",
         results,

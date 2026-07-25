@@ -2,6 +2,8 @@
 // entrypoints (hook.ts, codex-hook.ts, grok-hook.ts, kilocode-hook.ts) share
 // this protocol boilerplate byte-for-byte. Per-hook differences are only the
 // config constants and the handler implementations — keep them there.
+import fs from "node:fs";
+import path from "node:path";
 import type { EnvelopeEvent } from "./agent_envelope.js";
 import type { VaultSearchResult } from "./vault.js";
 
@@ -30,10 +32,6 @@ export async function readStdin(): Promise<unknown> {
       data += chunk;
     });
     process.stdin.on("end", () => {
-      if (!data.trim()) {
-        resolve({});
-        return;
-      }
       try {
         resolve(JSON.parse(data));
       } catch {
@@ -42,6 +40,25 @@ export async function readStdin(): Promise<unknown> {
     });
     process.stdin.on("error", () => resolve({}));
   });
+}
+
+// Helper to resolve sub-directories to canonical project root directory
+export function findProjectRoot(dirPath: string): string {
+  try {
+    let curr = path.resolve(dirPath);
+    const root = path.parse(curr).root;
+    while (curr && curr !== root) {
+      if (fs.existsSync(path.join(curr, ".git"))) {
+        return curr;
+      }
+      const parent = path.dirname(curr);
+      if (parent === curr) break;
+      curr = parent;
+    }
+  } catch {
+    // Return original path on any filesystem error
+  }
+  return path.resolve(dirPath);
 }
 
 // Accepts both the envelope HookOutput and the s6 PreToolUse permissionDecision
@@ -56,17 +73,22 @@ export function asString(value: unknown, fallback = ""): string {
   return typeof value === "string" ? value : fallback;
 }
 
+/** Non-empty string entries of an array-valued payload field, else []. */
+export function stringArray(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === "string" && item.trim().length > 0)
+    : [];
+}
+
 export function workspaceFromPayload(
   payload: Record<string, unknown>,
   fallback: string,
 ): string {
-  return (
-    asString(payload.workspace_id) ||
-    asString(payload.workspaceId) ||
-    asString(payload.cwd) ||
-    asString(payload.working_directory) ||
-    fallback
-  );
+  const explicit = asString(payload.workspace_id) || asString(payload.workspaceId);
+  if (explicit) return explicit;
+  const rawCwd = asString(payload.cwd) || asString(payload.working_directory);
+  if (rawCwd) return findProjectRoot(rawCwd);
+  return fallback;
 }
 
 export function vaultRecallToBody(vault: VaultSearchResult[]): unknown {

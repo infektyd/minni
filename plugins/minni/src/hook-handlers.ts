@@ -19,6 +19,7 @@ import {
   asString,
   emit,
   readStdin,
+  stringArray,
   vaultRecallToBody,
   withHookContext,
   workspaceFromPayload,
@@ -602,21 +603,41 @@ export function createHookHandlers(
     const sessionId = asString(payload.session_id) || asString(payload.sessionId) || "session";
     const workspaceId = workspaceFor(payload);
     const lastTask = asString(payload.last_user_message) || asString(payload.summary) || sessionId;
-    const tail = await auditTail(config.vaultPath, 30);
+
+    // GOVERNANCE POSTURE — Stop auto-draft RETIRED 2026-07-24. The 2026-07-23
+    // inbox investigation found Stop's audit-tail distillation produced 0 real
+    // learnings across 40 drafts: the tail is Minni's OWN telemetry log, so the
+    // draft was noise by construction. The durable-capture path is now
+    // EXCLUSIVELY the agent's explicit minni_prepare_outcome / minni_learn call.
+    // Stop no longer self-drafts. The `changedFiles`/`summary` branch below is a
+    // documented FORWARD-COMPAT hook: it fires only if a future Stop harness
+    // supplies genuine outcome material in the payload (today's real harnesses
+    // never do). Absent that, Stop records ONE log-only breadcrumb (so the
+    // session is not silently invisible) and writes no inbox file.
+    // NOTE: this is a governance-posture change — it needs operator sign-off
+    // before the plugin is re-propagated.
+    const changedFiles = stringArray(payload.changedFiles ?? payload.changed_files);
+    const outcomeSummary = asString(payload.summary).trim();
+    const hasDraftableSignal = changedFiles.length > 0 || outcomeSummary.length > 0;
+
+    if (!hasDraftableSignal) {
+      await recordAudit(config.vaultPath, {
+        tool: `${config.auditPrefix}_stop`,
+        summary: `stop ${sessionId}: no draftable signal`,
+        details: { workspace: workspaceId, candidates: 0 },
+      });
+      return { continue: true };
+    }
+
     const outcome = await prepareOutcomeFn({
       task: lastTask.slice(0, 200),
-      summary: tail.entries.slice(-5).join("\n").slice(0, 600) || "session ended",
+      summary: outcomeSummary,
+      changedFiles,
       profile: "compact",
       vaultPath: config.vaultPath,
     });
 
     const candidates = outcome.outcomeDraft.learnCandidates;
-    // Nothing worth persisting: skip the inbox write and audit entry so we
-    // don't litter the inbox with empty files or pad the audit log with noise
-    // (unless this agent's config keeps the historical always-write behavior).
-    if (!config.alwaysWriteStopInbox && candidates.length === 0) {
-      return { continue: true };
-    }
 
     const inbox = await writeInbox(config.vaultPath, sessionId, {
       kind: "stop_candidates",
