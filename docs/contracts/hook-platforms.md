@@ -39,7 +39,7 @@ it), not return a shape the platform will discard in silence.
 | Grok Build | `{"hooks": {Event: [...]}}` | grouped | `${GROK_PLUGIN_ROOT}`, `${CLAUDE_PLUGIN_ROOT}` — **not bare `PLUGIN_ROOT`** |
 | Cursor | `{"version":1,"hooks":{event:[...]}}` | **flat** handler objects | `${CURSOR_PLUGIN_ROOT}` — **undocumented**, plugin-scoped only |
 | agy | `{"<hook-name>": {Event: [...]}}` — **key is a NAME** | PreToolUse/PostToolUse grouped; **all others flat** | none — stamp absolute paths |
-| Kilocode | no manifest — **in-process JS plugin** | n/a | n/a (`directory`/`worktree` on plugin input) |
+| Kilocode | no manifest — **in-process JS plugin**; Minni bridges via `kilo/minni-plugin.js` | n/a | n/a (`directory`/`worktree` on plugin input) |
 
 agy's shape is the trap: a literal `"hooks"` top-level key declares a hook
 *named* "hooks", and one invalid entry rejects **the entire file**.
@@ -76,8 +76,9 @@ Load-bearing details:
   passive events, stdout is ignored; exit 0 on success."* Only `PreToolUse` and
   `Stop`/`SubagentStop` parse output. Session-start hydration on Grok must go
   through skills/instructions/MCP — **hooks cannot do it**.
-- **`PreCompact` can inject on no platform.** Do not route context through it
-  anywhere. Its side effects (inbox handoff, audit) are the only reason it exists.
+- **`PreCompact` can inject on no platform except Kilocode**, whose bridge feeds
+  opencode's `experimental.session.compacting`. Everywhere else its side effects
+  (inbox handoff, stale-belief stash) are the only reason it exists.
 - **Codex cannot inject at `Stop`**; Claude Code can. A shared Stop path must branch.
 - **Cursor `beforeSubmitPrompt` cannot inject** — documented output is `continue`
   + `user_message`. The bundle validates `additional_context`, but it is

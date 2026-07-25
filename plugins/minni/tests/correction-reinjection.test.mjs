@@ -652,6 +652,10 @@ const HOOK_MATRIX = [
     name: "grok",
     bin: "grok-hook.js",
     agentId: "grok-build",
+    // xAI: "For passive events, stdout is ignored; exit 0 on success."
+    // Only PreToolUse and Stop parse hook output, so SessionStart cannot
+    // carry the envelope. See docs/contracts/hook-platforms.md.
+    injectsAtSessionStart: false,
     env: (vault) => ({
       MINNI_GROK_VAULT_PATH: vault,
       MINNI_GROK_AGENT_ID: "grok-build",
@@ -668,6 +672,29 @@ const HOOK_MATRIX = [
     }),
   },
 ];
+
+/**
+ * Read the boot envelope, enforcing the platform's real delivery contract.
+ *
+ * Returns the parsed envelope body on platforms that can inject at
+ * SessionStart, or null on those that structurally cannot. On the latter we
+ * assert the INVERSE: no envelope is emitted, because emitting one that the
+ * platform silently discards is precisely the bug this contract exists to
+ * prevent.
+ */
+function bootEnvelope(output, hook) {
+  assert.equal(output.continue, true);
+  if (hook.injectsAtSessionStart === false) {
+    assert.ok(
+      !output.hookSpecificOutput,
+      `${hook.name} cannot inject at SessionStart; emitting an envelope it will ` +
+        "discard would be a silent memory loss",
+    );
+    return null;
+  }
+  assert.ok(output.hookSpecificOutput, "boot must emit the envelope");
+  return envelopeJson(output.hookSpecificOutput.additionalContext);
+}
 
 function runHook(event, env, payload = {}, bin = "hook.js") {
   return new Promise((resolve, reject) => {
@@ -723,8 +750,8 @@ for (const hook of HOOK_MATRIX) {
     const { env, calls } = await bootFixture(t, hook);
 
     const output = await runHook("SessionStart", env, {}, hook.bin);
-    assert.equal(output.continue, true);
-    const body = envelopeJson(output.hookSpecificOutput.additionalContext);
+    const body = bootEnvelope(output, hook);
+    if (!body) return; // platform cannot deliver at SessionStart; contract asserted above
 
     // recall-F1: the boot search must request the widened layer set.
     const searchCall = calls.find((c) => c.method === "search");
@@ -787,9 +814,8 @@ for (const hook of HOOK_MATRIX) {
     };
 
     const output = await runHook("SessionStart", env, {}, hook.bin);
-    assert.equal(output.continue, true);
-    assert.ok(output.hookSpecificOutput, "degraded boot must still emit the envelope");
-    const body = envelopeJson(output.hookSpecificOutput.additionalContext);
+    const body = bootEnvelope(output, hook);
+    if (!body) return; // platform cannot deliver at SessionStart; contract asserted above
     assert.equal(body.stale_beliefs.ok, false);
     assert.equal(
       body.stale_beliefs.status,
@@ -854,7 +880,8 @@ for (const hook of HOOK_MATRIX) {
     // 2. Post-compaction SessionStart: the stashed events come back as
     //    corrections_reassert even before the daemon is consulted.
     const boot = await runHook("SessionStart", env, {}, hook.bin);
-    const body = envelopeJson(boot.hookSpecificOutput.additionalContext);
+    const body = bootEnvelope(boot, hook);
+    if (!body) return; // platform cannot deliver at SessionStart; contract asserted above
     assert.ok(Array.isArray(body.corrections_reassert), "boot must re-assert stashed corrections");
     assert.equal(body.corrections_reassert[0].superseded_learning_id, 7);
 
@@ -893,7 +920,8 @@ for (const hook of HOOK_MATRIX) {
     // handoff entry (codex/grok) must be cleared, NOT left to accumulate one
     // file per compaction cycle.
     const boot = await runHook("SessionStart", env, {}, hook.bin);
-    const body = envelopeJson(boot.hookSpecificOutput.additionalContext);
+    const body = bootEnvelope(boot, hook);
+    if (!body) return; // platform cannot deliver at SessionStart; contract asserted above
     assert.equal(body.corrections_reassert, undefined, "no events → no corrections_reassert");
     const afterBoot = (await readdir(inboxDir)).filter((f) => f.endsWith(".json"));
     assert.deepEqual(afterBoot, [], "empty-events inbox entries must be cleared at boot");
@@ -919,7 +947,8 @@ for (const hook of HOOK_MATRIX) {
     );
 
     const boot = await runHook("SessionStart", env, {}, hook.bin);
-    const body = envelopeJson(boot.hookSpecificOutput.additionalContext);
+    const body = bootEnvelope(boot, hook);
+    if (!body) return; // platform cannot deliver at SessionStart; contract asserted above
     assert.equal(
       body.corrections_reassert,
       undefined,
