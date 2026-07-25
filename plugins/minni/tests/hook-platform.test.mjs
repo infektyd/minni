@@ -14,6 +14,7 @@ import {
   grokBuildWire,
   kilocodeWire,
   geminiWire,
+  cursorWire,
   renderIntent,
   wireFor,
 } from "../dist/hook-platform.js";
@@ -142,4 +143,32 @@ test("agy: a Stop note is dropped and recorded, never emitted as a parse error",
 
   assert.deepEqual(output, {}, "must emit agy's bare no-op, not injectSteps");
   assert.ok(dropped, "the undeliverable note must be recorded");
+});
+
+test("Cursor injects at sessionStart only, and notes ride followup_message", () => {
+  // Verified against cursor.com/docs: sessionStart takes additional_context;
+  // beforeSubmitPrompt takes continue + user_message ONLY; preCompact takes
+  // user_message; stop takes followup_message.
+  assert.deepEqual(cursorWire.inject("SessionStart", "memory"), { additional_context: "memory" });
+  assert.equal(cursorWire.inject("UserPromptSubmit", "memory"), null);
+  assert.equal(cursorWire.inject("PreCompact", "memory"), null);
+  assert.equal(cursorWire.inject("Stop", "memory"), null);
+
+  // Claude's `systemMessage` reaches nobody on Cursor; `continue` is dropped at stop.
+  assert.deepEqual(cursorWire.note("Stop", "2 candidates"), { followup_message: "2 candidates" });
+});
+
+test("Cursor resolves to its OWN wire, not the Claude fallback", () => {
+  // Regression: cursor previously fell through wireFor() to claudeCodeWire, so
+  // handlers emitted Claude envelopes that the adapter then discarded with no
+  // record. The fallback must stay a safety net, never load-bearing.
+  assert.equal(wireFor("cursor").id, "cursor");
+});
+
+test("Cursor: an undeliverable prompt-submit injection is RECORDED", () => {
+  const { output, dropped } = renderIntent(cursorWire, injectIntent("UserPromptSubmit", "memory"));
+
+  assert.deepEqual(output, { continue: true });
+  assert.ok(dropped, "Cursor cannot inject at beforeSubmitPrompt -- that must be visible");
+  assert.equal(dropped.event, "UserPromptSubmit");
 });

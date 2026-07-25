@@ -83,18 +83,23 @@ test("native Cursor Shell read is denied once when strong recall is pending", as
 });
 
 test("Cursor output adapter uses native snake_case and permission schema", () => {
-  assert.deepEqual(adaptCursorOutput("SessionStart", {
-    continue: true,
-    hookSpecificOutput: { additionalContext: "memory" },
-  }), { additional_context: "memory" });
+  // PreToolUse still needs translating: it bypasses the wire.
   assert.deepEqual(adaptCursorOutput("PreToolUse", { continue: true }), { permission: "allow" });
   assert.deepEqual(adaptCursorOutput("PreToolUse", {
     continue: true,
     hookSpecificOutput: { permissionDecision: "deny", permissionDecisionReason: "recall first" },
   }), { permission: "deny", user_message: "recall first" });
-  assert.deepEqual(adaptCursorOutput("UserPromptSubmit", {
-    hookSpecificOutput: { additionalContext: "unsupported by Cursor" },
-  }), { continue: true });
+
+  // Envelope events arrive already-native from cursorWire, so the adapter is a
+  // pass-through. It must NOT re-translate or swallow them.
+  assert.deepEqual(
+    adaptCursorOutput("SessionStart", { additional_context: "memory" }),
+    { additional_context: "memory" },
+  );
+  assert.deepEqual(
+    adaptCursorOutput("Stop", { followup_message: "2 candidates" }),
+    { followup_message: "2 candidates" },
+  );
 });
 
 test("Cursor hook writes only the Cursor vault and stamps Cursor identity", async () => {

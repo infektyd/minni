@@ -7,6 +7,7 @@ import {
 } from "./config.js";
 import { adaptCursorOutput, adaptCursorPayload, CURSOR_EVENTS } from "./cursor-adapter.js";
 import { createHookHandlers } from "./hook-handlers.js";
+import { cursorWire } from "./hook-platform.js";
 import { asString, emit, readStdin } from "./hook-utils.js";
 import { recordAudit } from "./vault.js";
 import type { RecallGuardMode } from "./recall-guard.js";
@@ -29,6 +30,10 @@ const CONFIG = {
   precompactKind: "cursor_precompact_handoff",
   alwaysWriteStopInbox: false,
   recallGuardMode: CURSOR_GUARD_MODE,
+  // Without this, wireFor("cursor") fell through to the Claude profile and the
+  // handlers emitted Claude envelopes that adaptCursorOutput then quietly threw
+  // away -- a real drop with no record of it.
+  wire: cursorWire,
 } as const;
 
 async function main(): Promise<void> {

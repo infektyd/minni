@@ -66,7 +66,7 @@ This is the table that matters most, and the one the codebase got wrong.
 | Claude Code | ✅ `additionalContext` | ✅ | ✅ | ❌ **not in the union** |
 | Codex | ✅ `additionalContext` | ✅ | ❌ **block only** | ❌ cannot inject *or* block |
 | Grok Build | ❌ **stdout ignored** | ❌ **stdout ignored** | ✅ `additionalContext` | ❌ **stdout ignored** |
-| Cursor | ✅ `additional_context` ⚠️ | ❌ **not supported** | ❌ `followup_message` only | ❌ `user_message` only |
+| Cursor | ✅ `additional_context` ⚠️ | ❌ **not supported** | ❌ note via `followup_message` | ❌ `user_message` only |
 | agy | ✅ `injectSteps` (verified live) | ✅ `injectSteps` (`PreInvocation`) | ❌ rejects `injectSteps` | — |
 | Kilocode | `experimental.chat.system.transform` | same | — | `experimental.session.compacting` |
 
@@ -229,3 +229,19 @@ injection**; every session after it is fine. Do not diagnose off that first run.
 Also note `ephemeralMessage` content IS persisted to `transcript_full.jsonl`, so
 grepping the transcript is a valid check — but only for sessions that started
 after the manifest was loaded.
+
+## Every platform must own a wire
+
+`wireFor()` falls back to the Claude Code shape for an unknown id. That is a
+narrow safety net for a not-yet-profiled platform — it must never become
+load-bearing for a shipped one.
+
+It did, once: Cursor had no profile, so it resolved to `claudeCodeWire`, the
+handlers emitted Claude envelopes, and `adaptCursorOutput` translated them after
+the fact. Anything Cursor could not carry — the prompt-submit envelope — was
+dropped by the adapter **with no record**, which is precisely the silence the
+wire layer exists to eliminate. A test now pins `wireFor("cursor").id === "cursor"`.
+
+If you add a platform: give it a profile, set `wire:` on its config, and let the
+adapter handle only what genuinely bypasses the wire (the `PreToolUse` guard
+output, which is not an `EnvelopeEvent`).

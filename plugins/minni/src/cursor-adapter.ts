@@ -23,11 +23,9 @@ export function adaptCursorPayload(raw: Record<string, unknown>): Record<string,
 }
 
 export function adaptCursorOutput(event: string, output: Record<string, unknown>): Record<string, unknown> {
-  if (event === "SessionStart") {
-    const specific = output.hookSpecificOutput as Record<string, unknown> | undefined;
-    const context = asString(specific?.additionalContext);
-    return context ? { additional_context: context } : { continue: true };
-  }
+  // PreToolUse is NOT an EnvelopeEvent -- it bypasses the platform wire and
+  // arrives in the shared guard's Claude-shaped permissionDecision form, so it
+  // still needs translating here.
   if (event === "PreToolUse") {
     const specific = (output as unknown as PreToolUseDecisionOutput).hookSpecificOutput;
     if (specific?.permissionDecision === "deny") {
@@ -35,23 +33,9 @@ export function adaptCursorOutput(event: string, output: Record<string, unknown>
     }
     return { permission: "allow" };
   }
-  if (event === "Stop") {
-    // Cursor's stop validator accepts ONLY `followup_message`; `continue` is
-    // dropped. The shared handler's candidate announcement rides `systemMessage`
-    // (Claude Code's field), so translate it or it reaches nobody.
-    const message = asString(output.systemMessage);
-    return message ? { followup_message: message } : {};
-  }
-  if (event === "PreCompact") {
-    // preCompact accepts only `user_message`, and cannot block. PreCompact's
-    // real work here is the inbox handoff side effect, not its output.
-    return {};
-  }
-  // beforeSubmitPrompt CANNOT inject context: its documented output is
-  // `continue` + `user_message` only (https://cursor.com/docs/hooks), and there
-  // are open vendor feature requests to add `additional_context`. The bundle
-  // does validate the field, but relying on undocumented behavior here would be
-  // exactly the mistake this module exists to avoid. The handler still records
-  // the prompt and prepares recall state for the guard.
-  return { continue: true };
+  // Everything else is already native: cursorWire (hook-platform.ts) renders
+  // Cursor's own flat shape, so there is nothing left to convert. This used to
+  // translate Claude envelopes after the fact, which silently discarded any
+  // intent Cursor could not carry instead of recording the drop.
+  return output;
 }

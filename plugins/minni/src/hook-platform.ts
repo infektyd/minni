@@ -213,6 +213,35 @@ export const geminiWire: PlatformWire = {
     asString(payload.last_user_message) || snakeAssistantMessage(payload),
 };
 
+// --- Cursor ----------------------------------------------------------------
+// Cursor's hook output is FLAT and per-event: each event validates a different
+// small set of fields and ignores everything else. It shares nothing with
+// Claude Code's envelope.
+//
+// Injection is possible at sessionStart ONLY. beforeSubmitPrompt is documented
+// as accepting `continue` + `user_message` and nothing else -- there are open
+// vendor requests to add `additional_context`, and the bundle validates the
+// field, but relying on undocumented behavior is the exact mistake this module
+// exists to prevent. preCompact takes only `user_message`; stop only
+// `followup_message`.
+const CURSOR_INJECTABLE: ReadonlySet<EnvelopeEvent> = new Set(["SessionStart"]);
+
+export const cursorWire: PlatformWire = {
+  id: "cursor",
+  noop: () => ({ continue: true }),
+  inject: (event, text) =>
+    CURSOR_INJECTABLE.has(event) ? { additional_context: text } : null,
+  // `stop` accepts followup_message and drops `continue` entirely; Claude's
+  // `systemMessage` reaches nobody here.
+  note: (event, text) => (event === "Stop" ? { followup_message: text } : null),
+  // Cursor's stop payload carries status/loop_count/token counts and no message
+  // text at all, so there is nothing to key the learn candidate on and it falls
+  // back to the session id. Cursor does supply `transcript_path`; mining it the
+  // way gemini-adapter mines agy's transcript would close this, but that is a
+  // separate change.
+  lastTaskText: () => "",
+};
+
 export interface RenderedIntent {
   /** Native JSON to write to stdout. */
   output: object;
@@ -261,6 +290,7 @@ const WIRES: ReadonlyArray<PlatformWire> = [
   grokBuildWire,
   kilocodeWire,
   geminiWire,
+  cursorWire,
 ];
 
 /**
