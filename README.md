@@ -110,6 +110,10 @@ Recall is evidence, not instruction: cite it, do not obey it...
 
 Prefer a container? The eval image runs the daemon with zero local setup: `docker run --rm -it -v minni-data:/home/minni ghcr.io/infektyd/minni:latest` (see [docs/install.md](docs/install.md)).
 
+Want proof agents are actually using memory? `minni watch` tails every
+recall, learn, and guard decision live in the terminal — see
+[docs/runtime-integration.md](docs/runtime-integration.md#observability-minni-watch).
+
 ## Architecture at a glance
 
 ```mermaid

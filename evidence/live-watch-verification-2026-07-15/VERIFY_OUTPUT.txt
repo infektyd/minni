@@ -1,0 +1,41 @@
+== 0. workload health ==
+  [PASS] no ledger op errored: 0 errors, first: []
+  [PASS] workload volume sane: searches=298 learns=8
+== 1. recall bijection (ledger <-> watch <-> sqlite) ==
+  [PASS] count ledger==watch: ledger=298 watch=298
+  [PASS] burst exceeded one poll batch (drain proof)
+  [PASS] each search matched exactly once in watch: []
+  [PASS] count sqlite==ledger: db=298
+  [PASS] all traces stamped with session
+== 2. log_event bijection ==
+  [PASS] count ledger==watch: ledger=16 watch=16
+  [PASS] each log_event matched exactly once: []
+== 3. learns staged as candidates ==
+  [PASS] ledger learns == staged candidates (non-empty): db=8 ledger=8
+  [PASS] all candidates proposed: {'proposed'}
+  [PASS] ledger learn responses proposed with candidate ids
+== 4. plugin-lane bijection + mapped attribution ==
+  [PASS] loadgen count ledger==watch: ledger=15 watch=15
+  [PASS] teammate vault attributed to mapped-bot (MINNI_AGENT_VAULTS live): ledger=3 watch=3
+  [PASS] loadgen audit multiset equality (per-line, duplicates safe): only-in-ledger=[] only-in-watch=[]
+== 5. adversarial entry ==
+  [PASS] forged-header entry bijected as exactly one event: found 1
+  [PASS] no phantom fake_tool event
+  [PASS] no raw escapes in watch.jsonl
+  [PASS] no raw escapes in text-mode output
+  [PASS] adversarial summary visible sanitized
+== 6. no phantoms (per-line mapping, not just totals) ==
+  [PASS] every watch line maps to a ledger line and vice versa: phantoms=[] missing=[]
+== 7. ordering ==
+  [PASS] watch daemon-lane order pairs positionally with ledger seq
+  [PASS] cross-lane inversions bounded by poll interval (<2s): []
+== 8. --agent filter live ==
+  [PASS] --agent mapped-bot returns only mapped-bot: 3 rows
+== 9. session receipt vs audit ledger ==
+  [PASS] receipt.recalls_strong == 6: receipt=6
+  [PASS] receipt.recalls_weak == 3: receipt=3
+  [PASS] receipt.guard_denied == 2: receipt=2
+  [PASS] receipt.learns == 1: receipt=1
+  [PASS] receipt.candidates_drafted == 2: receipt=2
+
+VERDICT: PASS — watch recorded exactly the issued operations
