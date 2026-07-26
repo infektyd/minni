@@ -38,6 +38,16 @@ The plugin bridge uses environment-driven defaults:
 This keeps the public integration portable while allowing local installs to
 preserve compatibility with existing runtime layouts.
 
+## Recall Guard (verifiable memory use)
+
+Every wired runtime (claude-code, codex, grok, kilocode, gemini, cursor)
+registers a `PreToolUse` hook: when a turn has strong unconsumed recall and
+the agent reaches for a cold search tool instead, the guard denies that tool
+once and surfaces the recall. Tune with `MINNI_RECALL_GUARD_MODE`
+(`off` / `soft` / `strict`) and `MINNI_RECALL_POINTER_THRESHOLD` (default
+`0.55`). Guard decisions are audited per agent as `hook_*_pretooluse_guard`
+entries in the vault's `log.md`.
+
 ## Local AFM and Extraction
 
 The engine includes local provider helpers for OpenAI-compatible model bridges.
