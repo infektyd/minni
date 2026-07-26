@@ -183,7 +183,12 @@ export async function handleStopCore(
   await ensureVault(config.vaultPath);
   const sessionId = asString(payload.session_id) || asString(payload.sessionId) || "session";
   const workspaceId = workspaceFromPayload(payload, config.defaultWorkspaceId);
-  const lastTask = asString(payload.last_user_message) || asString(payload.summary) || sessionId;
+  // Task and summary must stay distinct. Falling back to `summary` for the
+  // task field made summary-only payloads compose `"<summary>: <summary>"` —
+  // one of the two forward-compat shapes always produced a duplicated candidate.
+  // Prefer the real prompt when present; otherwise the session id is enough
+  // context for the `"${task}: ${summary}"` form in prepareOutcome.
+  const lastTask = asString(payload.last_user_message) || sessionId;
 
   // GOVERNANCE POSTURE — Stop auto-draft RETIRED 2026-07-24. The 2026-07-23
   // inbox investigation found Stop's audit-tail distillation produced 0 real

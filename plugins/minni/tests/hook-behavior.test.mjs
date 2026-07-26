@@ -624,6 +624,36 @@ test("Two consecutive no-signal Stops both leave a breadcrumb", async () => {
   }
 });
 
+test("Stop summary-only payload does not duplicate summary as task", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-hook-sum-"));
+  const savedHome = process.env.MINNI_HOME;
+  const savedBypass = process.env.MINNI_BYPASS_AUDIT_LIMIT;
+  process.env.MINNI_HOME = path.join(root, "home");
+  process.env.MINNI_BYPASS_AUDIT_LIMIT = "true";
+  try {
+    const vault = path.join(root, "codex-vault");
+    await mkdir(vault, { recursive: true });
+    const handlers = createHookHandlers(stopConfig(vault, "codex"));
+    const summary = "shipped the retry fix and verified the suite passes";
+    await handlers.handleStop({
+      session_id: "sum-only-1",
+      summary,
+    });
+    const names = (await readdir(path.join(vault, "inbox"))).filter((n) => n.endsWith(".json"));
+    assert.equal(names.length, 1);
+    const body = JSON.parse(await readFile(path.join(vault, "inbox", names[0]), "utf8"));
+    assert.equal(body.candidates.length, 1);
+    assert.equal(body.candidates[0], `sum-only-1: ${summary}`);
+    assert.notEqual(body.candidates[0], `${summary}: ${summary}`);
+  } finally {
+    if (savedHome === undefined) delete process.env.MINNI_HOME;
+    else process.env.MINNI_HOME = savedHome;
+    if (savedBypass === undefined) delete process.env.MINNI_BYPASS_AUDIT_LIMIT;
+    else process.env.MINNI_BYPASS_AUDIT_LIMIT = savedBypass;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("Stop stamps the vault-derived principal, not the configured agent id", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "sm-hook-stamp-"));
   const savedHome = process.env.MINNI_HOME;
