@@ -13,7 +13,6 @@
   "keywords": ["minni", "memory", "cursor", "local-first", "mcp"],
   "category": "developer-tools",
   "tags": ["memory", "local-first", "agents"],
-  "hooks": "./hooks/hooks-cursor.json",
   "skills": "./skills/",
   "mcpServers": "./.mcp.json"
 }
