@@ -18,6 +18,7 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
 import { createHookHandlers } from "../dist/hook-handlers.js";
+import { writeRecallState } from "../dist/recall-state.js";
 import { auditTail } from "../dist/vault.js";
 
 const execFileAsync = promisify(execFile);
@@ -888,5 +889,59 @@ test("UserPromptSubmit audit (strong/recall_pointer path): a real session_id is 
     assert.ok(details);
     assert.equal(details.recall_strong, true, "precondition: this must be the strong-recall path");
     assert.equal(details.session_id, "real-session-strong-7");
+  });
+});
+// NEW (untested on the salvaged tip): the PreToolUse guard audit must follow
+// the same discipline — stamp session_id only when the payload actually
+// carries one, never invent the "session" placeholder used elsewhere for
+// envelope identity / filenames.
+test("PreToolUse guard audit stamps session_id only when the payload carries one", async () => {
+  await withRawSessionFixture(async ({ vault }) => {
+    const config = upsConfig(vault);
+    const handlers = createHookHandlers(config);
+
+    // Seed a strong, unconsumed recall-state directly so the guard fires
+    // regardless of daemon availability in this fixture.
+    await writeRecallState(vault, {
+      task_signature: "sig-guard-1",
+      intent: "recall",
+      top_hits: [{ title: "Guard hit", wikilink: "[[guard-hit]]", score: 0.9 }],
+      top_score: 0.9,
+    });
+
+    // No session_id / sessionId in the payload => details.session_id must be
+    // entirely absent, not stamped with a synthetic placeholder.
+    const denied = await handlers.handlePreToolUse({
+      tool_name: "Read",
+      tool_input: { file_path: "/tmp/example.txt" },
+    });
+    assert.equal(denied.hookSpecificOutput?.permissionDecision, "deny");
+
+    const details = await lastAuditDetails(vault, "hook_test_pretooluse_guard");
+    assert.ok(details, "PreToolUse guard must record an audit entry");
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(details, "session_id"),
+      false,
+      "unlabeled payload must not stamp a synthetic session_id into guard audit details",
+    );
+
+    // Re-seed a fresh unconsumed state and re-run with a real session_id: this
+    // time the guard audit must stamp the RAW id verbatim.
+    await writeRecallState(vault, {
+      task_signature: "sig-guard-2",
+      intent: "recall",
+      top_hits: [{ title: "Guard hit 2", wikilink: "[[guard-hit-2]]", score: 0.9 }],
+      top_score: 0.9,
+    });
+    const deniedWithSession = await handlers.handlePreToolUse({
+      tool_name: "Read",
+      tool_input: { file_path: "/tmp/example2.txt" },
+      session_id: "guard-session-9",
+    });
+    assert.equal(deniedWithSession.hookSpecificOutput?.permissionDecision, "deny");
+
+    const detailsWithSession = await lastAuditDetails(vault, "hook_test_pretooluse_guard");
+    assert.ok(detailsWithSession);
+    assert.equal(detailsWithSession.session_id, "guard-session-9");
   });
 });
