@@ -38,6 +38,19 @@ The plugin bridge uses environment-driven defaults:
 This keeps the public integration portable while allowing local installs to
 preserve compatibility with existing runtime layouts.
 
+## Observability (`minni watch`)
+
+`minni watch` is the engine/CLI live tail: it follows each agent vault's
+`log.md` audit trail and the daemon's episodic events (including durable
+`recall` traces from raw JSON-RPC `search` calls via the read-only
+`list_events` RPC). Use it to verify memory is actually being consulted.
+
+- `MINNI_RECALL_TRACE` — default on; set to `off`/`0`/`false`/`no` to disable
+  durable recall-trace inserts for perf-sensitive setups.
+- `list_events` is capability-gated under `read` and performs a single
+  parameterized SELECT. Cross-agent listing follows the same gate as
+  cross-agent recall.
+
 ## Console observability
 
 The web console is the browser counterpart to `minni watch`. Start it from
