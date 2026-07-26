@@ -1364,28 +1364,54 @@ function parseAuditEntries(entries: string[]): ParsedAuditEntry[] {
 }
 
 /**
+ * True when `summary` is a stop marker belonging to `sessionId`.
+ *
+ * handleStopCore now writes a bare `stop <id>` on every path (breadcrumb
+ * reasons live in details, not the summary), but the rolling log.md outlives
+ * the upgrade: vaults written by pre-receipts builds still carry
+ * `stop <id>: no draftable signal` and `stop <id>: no candidates after scrub`
+ * rows. Matching the bare form ALONE let those legacy variants fall through to
+ * the generic "some other session's stop" branch below, which closed the window
+ * EXCLUSIVELY and reported the session open forever, with every row after the
+ * marker dropped from the tally. So the id is matched with an explicit
+ * boundary — end-of-string or `:` — which also keeps session `abc` from
+ * claiming a `stop abcdef` row.
+ */
+function isStopMarkerFor(summary: string, sessionId: string): boolean {
+  if (!sessionId) return false;
+  const prefix = `stop ${sessionId}`;
+  if (!summary.startsWith(prefix)) return false;
+  const rest = summary.slice(prefix.length);
+  return rest.length === 0 || rest.startsWith(":");
+}
+
+/**
  * Close a boot→stop attribution window opened at `windowStart`. The window ends
- * INCLUSIVE of the first row whose summary is one of `ownStopSummaries` (our own
- * `stop <id>` — its candidates tally belongs to this session), or EXCLUSIVE at
- * any OTHER session's boot/stop marker (a session that died without a stop row
- * must not absorb its successors). `stopIndex` is the own-stop row index, or -1
- * when the window ran to the tail end (or was cut short by a foreign marker) —
- * i.e. an open, never-stopped session.
+ * INCLUSIVE of the first row that is a stop marker for one of `ownSessionIds`
+ * (our own `stop <id>`, bare or legacy-suffixed — its candidates tally belongs
+ * to this session), or EXCLUSIVE at any OTHER session's boot/stop marker (a
+ * session that died without a stop row must not absorb its successors).
+ * `stopIndex` is the own-stop row index, or -1 when the window ran to the tail
+ * end (or was cut short by a foreign marker) — i.e. an open, never-stopped
+ * session.
  */
 function closeWindow(
   parsed: ParsedAuditEntry[],
   windowStart: number,
-  ownStopSummaries: string[],
+  ownSessionIds: string[],
 ): { end: number; stopIndex: number } {
   let end = parsed.length;
   let stopIndex = -1;
   for (let i = windowStart + 1; i < parsed.length; i += 1) {
     const summary = parsed[i].summary;
-    if (ownStopSummaries.includes(summary)) {
+    if (ownSessionIds.some((id) => isStopMarkerFor(summary, id))) {
       end = i + 1;
       stopIndex = i;
       break;
     }
+    // Foreign marker: a boot (always plain `boot <id>` on this path) or a stop
+    // whose id did NOT match ours under the boundary rule above. Either way the
+    // window ends here, exclusively.
     if (summary.startsWith("boot ") || summary.startsWith("stop ")) {
       end = i;
       break;
@@ -1516,10 +1542,7 @@ export async function sessionReceipt(
   }
   let windowEnd = parsed.length;
   if (windowStart >= 0) {
-    windowEnd = closeWindow(parsed, windowStart, [
-      `stop ${sessionId}`,
-      `stop ${windowSessionId}`,
-    ]).end;
+    windowEnd = closeWindow(parsed, windowStart, [sessionId, windowSessionId]).end;
   }
 
   return tallyWindow(
@@ -1569,7 +1592,8 @@ export interface SessionSummary {
  * Enumerate recent session boot cycles from the rolling log.md. Strictly
  * read-only: never calls ensureVault, never creates files — a missing log.md
  * yields []. Every `boot <id>` marker opens a window closed by the same rules
- * sessionReceipt uses (own `stop <id>` inclusive; any other session's boot/stop
+ * sessionReceipt uses (own `stop <id>`, bare or legacy-suffixed, inclusive; any
+ * other session's boot/stop
  * exclusive; tail end → open). A reused session id booted twice yields two rows.
  * Newest-first (latest boot leads), capped at `limit`.
  */
@@ -1601,7 +1625,7 @@ export async function listSessions(
     // shape with includeStamped — the catalogue must agree or it shows zeros
     // where the Stop receipt showed activity.
     const synthetic = windowSessionId === "session";
-    const { end, stopIndex } = closeWindow(parsed, i, [`stop ${windowSessionId}`]);
+    const { end, stopIndex } = closeWindow(parsed, i, [windowSessionId]);
     const receipt = tallyWindow(
       parsed,
       windowSessionId,

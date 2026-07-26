@@ -1573,3 +1573,188 @@ test("listSessions caps rows at limit and honors the parseLimit horizon", async 
     await rm(root, { recursive: true, force: true });
   }
 });
+
+// ---------------------------------------------------------------------------
+// Stop-marker boundary: legacy/suffixed stop summaries.
+//
+// handleStopCore now writes a bare `stop <id>` on every path (breadcrumb
+// reasons live in details), but a rolling log.md outlives the upgrade: vaults
+// written by pre-receipts builds still carry `stop <id>: no draftable signal`
+// and `stop <id>: no candidates after scrub` rows. Those must still close
+// their own window, while a FOREIGN suffixed stop — or a stop whose id merely
+// shares our prefix — must not be mistaken for ours.
+// ---------------------------------------------------------------------------
+test("sessionReceipt window closes at a `no draftable signal` stop variant", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-receipt-stopvar1-"));
+  try {
+    await ensureVault(root);
+    const sid = "sess-nds";
+
+    await recordAudit(root, {
+      tool: "hook_codex_session_start",
+      summary: `boot ${sid}`,
+      details: { daemon_ok: true },
+    });
+    await recordAudit(root, {
+      tool: "hook_codex_user_prompt_submit",
+      summary: "a task",
+      details: { recall_strong: true, session_id: sid },
+    });
+    await recordAudit(root, {
+      tool: "hook_codex_stop",
+      summary: `stop ${sid}: no draftable signal`,
+      details: { candidates: 0 },
+    });
+    // Post-stop activity from another session must stay out of the window.
+    await recordAudit(root, {
+      tool: "hook_codex_user_prompt_submit",
+      summary: "later task",
+      details: { recall_strong: true, session_id: "sess-later" },
+    });
+
+    const receipt = await sessionReceipt(root, sid);
+    // boot + turn + stop, inclusive of the suffixed stop row.
+    assert.equal(receipt.entries, 3);
+    assert.equal(receipt.recalls_strong, 1);
+    assert.equal(receipt.candidates_drafted, 0);
+
+    const [row] = await listSessions(root, 10);
+    assert.equal(row.session_id, sid);
+    assert.equal(row.open, false, "suffixed stop must close the session");
+    assert.ok(row.stop_at, "suffixed stop must supply a stop_at timestamp");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("sessionReceipt window closes at a `no candidates after scrub` stop variant", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-receipt-stopvar2-"));
+  try {
+    await ensureVault(root);
+    const sid = "sess-scrub";
+
+    await recordAudit(root, {
+      tool: "hook_codex_session_start",
+      summary: `boot ${sid}`,
+      details: { daemon_ok: true },
+    });
+    await recordAudit(root, {
+      tool: "minni_learn",
+      summary: "committed a learning",
+      details: { ok: true },
+    });
+    await recordAudit(root, {
+      tool: "hook_codex_stop",
+      summary: `stop ${sid}: no candidates after scrub`,
+      details: { candidates: 0 },
+    });
+    await recordAudit(root, {
+      tool: "hook_codex_user_prompt_submit",
+      summary: "later task",
+      details: { recall_strong: true, session_id: "sess-later" },
+    });
+
+    const receipt = await sessionReceipt(root, sid);
+    assert.equal(receipt.entries, 3);
+    assert.equal(receipt.learns, 1);
+    assert.equal(receipt.recalls_strong, 0, "post-stop rows must not leak in");
+
+    const [row] = await listSessions(root, 10);
+    assert.equal(row.session_id, sid);
+    assert.equal(row.open, false);
+    assert.notEqual(row.stop_at, null);
+    assert.equal(row.receipt.entries, 3);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("sessionReceipt closes exclusively at a FOREIGN suffixed stop", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-receipt-foreign-stop-"));
+  try {
+    await ensureVault(root);
+    const sid = "sess-mine";
+
+    await recordAudit(root, {
+      tool: "hook_codex_session_start",
+      summary: `boot ${sid}`,
+      details: { daemon_ok: true },
+    });
+    await recordAudit(root, {
+      tool: "hook_codex_user_prompt_submit",
+      summary: "my task",
+      details: { recall_strong: true, session_id: sid },
+    });
+    // Another session's suffixed stop: closes our window EXCLUSIVELY and is
+    // never read as our own stop.
+    await recordAudit(root, {
+      tool: "hook_codex_stop",
+      summary: "stop sess-other: no draftable signal",
+      details: { candidates: 4 },
+    });
+    await recordAudit(root, {
+      tool: "hook_codex_user_prompt_submit",
+      summary: "other task",
+      details: { recall_strong: true, session_id: "sess-other" },
+    });
+
+    const receipt = await sessionReceipt(root, sid);
+    assert.equal(receipt.entries, 2, "boot + own turn only");
+    assert.equal(receipt.recalls_strong, 1);
+    assert.equal(
+      receipt.candidates_drafted,
+      0,
+      "a foreign stop's candidates must not be attributed to us",
+    );
+
+    const [row] = await listSessions(root, 10);
+    assert.equal(row.session_id, sid);
+    assert.equal(row.open, true, "a foreign stop must not stop our session");
+    assert.equal(row.stop_at, null);
+    assert.equal(row.receipt.entries, 2);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("sessionReceipt does not claim a stop row whose id merely shares a prefix", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-receipt-prefix-"));
+  try {
+    await ensureVault(root);
+
+    await recordAudit(root, {
+      tool: "hook_codex_session_start",
+      summary: "boot abc",
+      details: { daemon_ok: true },
+    });
+    await recordAudit(root, {
+      tool: "hook_codex_user_prompt_submit",
+      summary: "abc task",
+      details: { recall_strong: true, session_id: "abc" },
+    });
+    // `stop abcdef` belongs to session "abcdef", NOT to "abc".
+    await recordAudit(root, {
+      tool: "hook_codex_stop",
+      summary: "stop abcdef",
+      details: { candidates: 9 },
+    });
+    await recordAudit(root, {
+      tool: "hook_codex_user_prompt_submit",
+      summary: "abcdef task",
+      details: { recall_strong: true, session_id: "abcdef" },
+    });
+
+    const receipt = await sessionReceipt(root, "abc");
+    assert.equal(receipt.entries, 2, "prefix-sharing stop must not close us");
+    assert.equal(receipt.candidates_drafted, 0);
+
+    const rows = await listSessions(root, 10);
+    const abc = rows.find((row) => row.session_id === "abc");
+    assert.ok(abc);
+    assert.equal(abc.open, true);
+    assert.equal(abc.stop_at, null);
+    assert.equal(abc.receipt.entries, 2);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
