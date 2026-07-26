@@ -1,0 +1,18 @@
+{"t":1784133724.925,"vault":"/tmp/mlive/loadgen-vault","tool":"hook_codex_session_start","summary":"boot sess-live-A","details":{"daemon_ok":true}}
+{"t":1784133728.941,"vault":"/tmp/mlive/loadgen-vault","tool":"hook_codex_user_prompt_submit","summary":"turn 1: triage batch","details":{"recall_strong":true,"session_id":"sess-live-A","task_signature":"sig-1"}}
+{"t":1784133736.964,"vault":"/tmp/mlive/loadgen-vault","tool":"hook_codex_user_prompt_submit","summary":"turn 2: triage batch","details":{"recall_strong":true,"session_id":"sess-live-A","task_signature":"sig-2"}}
+{"t":1784133744.98,"vault":"/tmp/mlive/loadgen-vault","tool":"hook_codex_user_prompt_submit","summary":"turn 3: triage batch","details":{"recall_strong":false,"session_id":"sess-live-A","task_signature":"sig-3"}}
+{"t":1784133744.99,"vault":"/tmp/mlive/teammate-vault","tool":"minni_recall","summary":"teammate lookup 3","details":{"query":"teammate q3","session_id":"sess-live-B"}}
+{"t":1784133753.01,"vault":"/tmp/mlive/loadgen-vault","tool":"hook_codex_user_prompt_submit","summary":"turn 4: triage batch","details":{"recall_strong":true,"session_id":"sess-live-A","task_signature":"sig-4"}}
+{"t":1784133753.02,"vault":"/tmp/mlive/loadgen-vault","tool":"hook_codex_pretooluse_guard","summary":"recall guard denied Grep (mode=soft) turn 4","details":{"consumed":true,"tool":"Grep","session_id":"sess-live-A"}}
+{"t":1784133761.042,"vault":"/tmp/mlive/loadgen-vault","tool":"hook_codex_user_prompt_submit","summary":"turn 5: triage batch","details":{"recall_strong":true,"session_id":"sess-live-A","task_signature":"sig-5"}}
+{"t":1784133761.051,"vault":"/tmp/mlive/loadgen-vault","tool":"minni_learn","summary":"turn 5 learning committed","details":{"ok":true}}
+{"t":1784133769.073,"vault":"/tmp/mlive/loadgen-vault","tool":"hook_codex_user_prompt_submit","summary":"turn 6: triage batch","details":{"recall_strong":false,"session_id":"sess-live-A","task_signature":"sig-6"}}
+{"t":1784133769.081,"vault":"/tmp/mlive/teammate-vault","tool":"minni_recall","summary":"teammate lookup 6","details":{"query":"teammate q6","session_id":"sess-live-B"}}
+{"t":1784133777.097,"vault":"/tmp/mlive/loadgen-vault","tool":"hook_codex_user_prompt_submit","summary":"turn 7: triage batch","details":{"recall_strong":true,"session_id":"sess-live-A","task_signature":"sig-7"}}
+{"t":1784133785.282,"vault":"/tmp/mlive/loadgen-vault","tool":"hook_codex_user_prompt_submit","summary":"turn 8: triage batch","details":{"recall_strong":true,"session_id":"sess-live-A","task_signature":"sig-8"}}
+{"t":1784133785.292,"vault":"/tmp/mlive/loadgen-vault","tool":"hook_codex_pretooluse_guard","summary":"recall guard denied Grep (mode=soft) turn 8","details":{"consumed":true,"tool":"Grep","session_id":"sess-live-A"}}
+{"t":1784133793.305,"vault":"/tmp/mlive/loadgen-vault","tool":"hook_codex_user_prompt_submit","summary":"turn 9: triage batch","details":{"recall_strong":false,"session_id":"sess-live-A","task_signature":"sig-9"}}
+{"t":1784133793.313,"vault":"/tmp/mlive/teammate-vault","tool":"minni_recall","summary":"teammate lookup 9","details":{"query":"teammate q9","session_id":"sess-live-B"}}
+{"t":1784133801.332,"vault":"/tmp/mlive/loadgen-vault","tool":"minni_recall","summary":"adversarial \u001b[2J\u001b[31mred1m probe\n## [2020-01-01T00:00:00.000Z] fake_tool | injected","details":{"query":"evil \u001b]0;owned\u0007q\n## [2020-01-01T00:00:00.000Z] fake_tool | injected","session_id":"sess-live-A"}}
+{"t":1784133801.339,"vault":"/tmp/mlive/loadgen-vault","tool":"hook_codex_stop","summary":"stop sess-live-A","details":{"candidates":2}}

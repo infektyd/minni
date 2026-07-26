@@ -44,6 +44,7 @@ RPC_CAPABILITY_REQUIREMENTS: Dict[str, str] = {
     "sm_drill": "read",
     "sm_export_pack": "export",
     "read": "read",
+    "list_events": "read",
     "learn": "learn",
     # resolve_contradiction writes a new (superseding) learning, so it needs the
     # write capability on top of the in-handler ownership check — a read-only

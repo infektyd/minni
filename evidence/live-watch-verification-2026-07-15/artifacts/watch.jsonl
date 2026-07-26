@@ -1,0 +1,333 @@
+{"ts": "2026-07-15T16:25:07.733298+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"preflight probe\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:04.895273+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"T01 prior incidents: printer offline after firmware update\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:04.914Z", "agent": "loadgen", "tool": "hook_codex_session_start", "summary": "boot sess-live-A", "source": "plugin", "details": {"daemon_ok": true}}
+{"ts": "2026-07-15T16:42:06.760933+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"T02 prior incidents: vpn drops every 20 minutes\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:08.479584+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"T03 prior incidents: sso login loop on staging\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:08.481171+00:00", "agent": "loadgen", "tool": "ticket_triaged", "summary": "T03 triaged: sso login loop on staging -> tier2", "source": "daemon"}
+{"ts": "2026-07-15T16:42:08.933Z", "agent": "loadgen", "tool": "hook_codex_user_prompt_submit", "summary": "turn 1: triage batch", "source": "plugin", "details": {"recall_strong": true, "session_id": "sess-live-A", "task_signature": "sig-1"}}
+{"ts": "2026-07-15T16:42:11.786844+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"T04 prior incidents: database connection pool exhausted\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:16.258503+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"T05 prior incidents: email bounce dmarc failure\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:16.953Z", "agent": "loadgen", "tool": "hook_codex_user_prompt_submit", "summary": "turn 2: triage batch", "source": "plugin", "details": {"recall_strong": true, "session_id": "sess-live-A", "task_signature": "sig-2"}}
+{"ts": "2026-07-15T16:42:18.415223+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"T06 prior incidents: kubernetes pod oomkilled on deploy\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:18.416951+00:00", "agent": "loadgen", "tool": "ticket_triaged", "summary": "T06 triaged: kubernetes pod oomkilled on deploy -> tier2", "source": "daemon"}
+{"ts": "2026-07-15T16:42:22.308127+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"T07 prior incidents: ssl certificate expired on api gateway\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:24.535402+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"T08 prior incidents: backup job silently failing\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:24.971Z", "agent": "loadgen", "tool": "hook_codex_user_prompt_submit", "summary": "turn 3: triage batch", "source": "plugin", "details": {"recall_strong": false, "session_id": "sess-live-A", "task_signature": "sig-3"}}
+{"ts": "2026-07-15T16:42:24.983Z", "agent": "mapped-bot", "tool": "minni_recall", "summary": "teammate lookup 3", "source": "plugin", "details": {"query": "teammate q3", "session_id": "sess-live-B"}}
+{"ts": "2026-07-15T16:42:26.143964+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"T09 prior incidents: two-factor reset request\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:26.145285+00:00", "agent": "loadgen", "tool": "ticket_triaged", "summary": "T09 triaged: two-factor reset request -> tier2", "source": "daemon"}
+{"ts": "2026-07-15T16:42:28.046784+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"T10 prior incidents: slow query on orders table\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:31.467675+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"T11 prior incidents: webhook retries flooding endpoint\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:33.003Z", "agent": "loadgen", "tool": "hook_codex_user_prompt_submit", "summary": "turn 4: triage batch", "source": "plugin", "details": {"recall_strong": true, "session_id": "sess-live-A", "task_signature": "sig-4"}}
+{"ts": "2026-07-15T16:42:33.014Z", "agent": "loadgen", "tool": "hook_codex_pretooluse_guard", "summary": "recall guard denied Grep (mode=soft) turn 4", "source": "plugin", "details": {"consumed": true, "tool": "Grep", "session_id": "sess-live-A"}}
+{"ts": "2026-07-15T16:42:35.504325+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"T12 prior incidents: disk full on ci runner\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:35.505864+00:00", "agent": "loadgen", "tool": "ticket_triaged", "summary": "T12 triaged: disk full on ci runner -> tier2", "source": "daemon"}
+{"ts": "2026-07-15T16:42:37.450848+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"T13 prior incidents: printer offline after firmware update\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:41.032Z", "agent": "loadgen", "tool": "hook_codex_user_prompt_submit", "summary": "turn 5: triage batch", "source": "plugin", "details": {"recall_strong": true, "session_id": "sess-live-A", "task_signature": "sig-5"}}
+{"ts": "2026-07-15T16:42:41.045Z", "agent": "loadgen", "tool": "minni_learn", "summary": "turn 5 learning committed", "source": "plugin", "details": {"ok": true}}
+{"ts": "2026-07-15T16:42:41.508103+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"T14 prior incidents: vpn drops every 20 minutes\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:44.835705+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"T15 prior incidents: sso login loop on staging\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:44.837111+00:00", "agent": "loadgen", "tool": "ticket_triaged", "summary": "T15 triaged: sso login loop on staging -> tier2", "source": "daemon"}
+{"ts": "2026-07-15T16:42:48.175473+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"T16 prior incidents: database connection pool exhausted\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:49.063Z", "agent": "loadgen", "tool": "hook_codex_user_prompt_submit", "summary": "turn 6: triage batch", "source": "plugin", "details": {"recall_strong": false, "session_id": "sess-live-A", "task_signature": "sig-6"}}
+{"ts": "2026-07-15T16:42:49.076Z", "agent": "mapped-bot", "tool": "minni_recall", "summary": "teammate lookup 6", "source": "plugin", "details": {"query": "teammate q6", "session_id": "sess-live-B"}}
+{"ts": "2026-07-15T16:42:51.753153+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"T17 prior incidents: email bounce dmarc failure\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:53.990949+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"T18 prior incidents: kubernetes pod oomkilled on deploy\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:53.992311+00:00", "agent": "loadgen", "tool": "ticket_triaged", "summary": "T18 triaged: kubernetes pod oomkilled on deploy -> tier2", "source": "daemon"}
+{"ts": "2026-07-15T16:42:56.735289+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"T19 prior incidents: ssl certificate expired on api gateway\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:57.088Z", "agent": "loadgen", "tool": "hook_codex_user_prompt_submit", "summary": "turn 7: triage batch", "source": "plugin", "details": {"recall_strong": true, "session_id": "sess-live-A", "task_signature": "sig-7"}}
+{"ts": "2026-07-15T16:42:59.225782+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"T20 prior incidents: backup job silently failing\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.228681+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B001 burst probe: vpn drops every 20 minutes\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.230982+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B002 burst probe: sso login loop on staging\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.233339+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B003 burst probe: database connection pool exhausted\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.235387+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B004 burst probe: email bounce dmarc failure\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.237748+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B005 burst probe: kubernetes pod oomkilled on deploy\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.239786+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B006 burst probe: ssl certificate expired on api gateway\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.241933+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B007 burst probe: backup job silently failing\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.243927+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B008 burst probe: two-factor reset request\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.246005+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B009 burst probe: slow query on orders table\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.248097+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B010 burst probe: webhook retries flooding endpoint\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.250072+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B011 burst probe: disk full on ci runner\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.252091+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B012 burst probe: printer offline after firmware update\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.254103+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B013 burst probe: vpn drops every 20 minutes\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.256098+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B014 burst probe: sso login loop on staging\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.258610+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B015 burst probe: database connection pool exhausted\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.260670+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B016 burst probe: email bounce dmarc failure\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.262921+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B017 burst probe: kubernetes pod oomkilled on deploy\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.264952+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B018 burst probe: ssl certificate expired on api gateway\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.266989+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B019 burst probe: backup job silently failing\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.269054+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B020 burst probe: two-factor reset request\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.271029+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B021 burst probe: slow query on orders table\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.273132+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B022 burst probe: webhook retries flooding endpoint\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.275252+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B023 burst probe: disk full on ci runner\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.277221+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B024 burst probe: printer offline after firmware update\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.279350+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B025 burst probe: vpn drops every 20 minutes\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.281366+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B026 burst probe: sso login loop on staging\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.283943+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B027 burst probe: database connection pool exhausted\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.286039+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B028 burst probe: email bounce dmarc failure\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.288131+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B029 burst probe: kubernetes pod oomkilled on deploy\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.290334+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B030 burst probe: ssl certificate expired on api gateway\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.292549+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B031 burst probe: backup job silently failing\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.295008+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B032 burst probe: two-factor reset request\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.297200+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B033 burst probe: slow query on orders table\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.299235+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B034 burst probe: webhook retries flooding endpoint\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.302170+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B035 burst probe: disk full on ci runner\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.304172+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B036 burst probe: printer offline after firmware update\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.306192+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B037 burst probe: vpn drops every 20 minutes\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.308204+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B038 burst probe: sso login loop on staging\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.310620+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B039 burst probe: database connection pool exhausted\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.312674+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B040 burst probe: email bounce dmarc failure\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.314658+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B041 burst probe: kubernetes pod oomkilled on deploy\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.316665+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B042 burst probe: ssl certificate expired on api gateway\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.318666+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B043 burst probe: backup job silently failing\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.320676+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B044 burst probe: two-factor reset request\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.322764+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B045 burst probe: slow query on orders table\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.324836+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B046 burst probe: webhook retries flooding endpoint\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.326890+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B047 burst probe: disk full on ci runner\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.328977+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B048 burst probe: printer offline after firmware update\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.331164+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B049 burst probe: vpn drops every 20 minutes\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.350073+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B050 burst probe: sso login loop on staging\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.353137+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B051 burst probe: database connection pool exhausted\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.355162+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B052 burst probe: email bounce dmarc failure\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.357093+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B053 burst probe: kubernetes pod oomkilled on deploy\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.359034+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B054 burst probe: ssl certificate expired on api gateway\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.361173+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B055 burst probe: backup job silently failing\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.363091+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B056 burst probe: two-factor reset request\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.365090+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B057 burst probe: slow query on orders table\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.367064+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B058 burst probe: webhook retries flooding endpoint\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.369042+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B059 burst probe: disk full on ci runner\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.371266+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B060 burst probe: printer offline after firmware update\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.373276+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B061 burst probe: vpn drops every 20 minutes\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.375221+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B062 burst probe: sso login loop on staging\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.377533+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B063 burst probe: database connection pool exhausted\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.379404+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B064 burst probe: email bounce dmarc failure\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.381588+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B065 burst probe: kubernetes pod oomkilled on deploy\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.383733+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B066 burst probe: ssl certificate expired on api gateway\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.385967+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B067 burst probe: backup job silently failing\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.388105+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B068 burst probe: two-factor reset request\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.390322+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B069 burst probe: slow query on orders table\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.392265+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B070 burst probe: webhook retries flooding endpoint\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.394225+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B071 burst probe: disk full on ci runner\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.396208+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B072 burst probe: printer offline after firmware update\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.398252+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B073 burst probe: vpn drops every 20 minutes\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.400158+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B074 burst probe: sso login loop on staging\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.402408+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B075 burst probe: database connection pool exhausted\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.404378+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B076 burst probe: email bounce dmarc failure\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.406382+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B077 burst probe: kubernetes pod oomkilled on deploy\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.408807+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B078 burst probe: ssl certificate expired on api gateway\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.411001+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B079 burst probe: backup job silently failing\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.413015+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B080 burst probe: two-factor reset request\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.415093+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B081 burst probe: slow query on orders table\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.416991+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B082 burst probe: webhook retries flooding endpoint\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.418949+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B083 burst probe: disk full on ci runner\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.420930+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B084 burst probe: printer offline after firmware update\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.423104+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B085 burst probe: vpn drops every 20 minutes\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.425370+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B086 burst probe: sso login loop on staging\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.427883+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B087 burst probe: database connection pool exhausted\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.429978+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B088 burst probe: email bounce dmarc failure\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.432034+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B089 burst probe: kubernetes pod oomkilled on deploy\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.434043+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B090 burst probe: ssl certificate expired on api gateway\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.436044+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B091 burst probe: backup job silently failing\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.438227+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B092 burst probe: two-factor reset request\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.440663+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B093 burst probe: slow query on orders table\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.442874+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B094 burst probe: webhook retries flooding endpoint\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.444898+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B095 burst probe: disk full on ci runner\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.447190+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B096 burst probe: printer offline after firmware update\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.449123+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B097 burst probe: vpn drops every 20 minutes\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.451197+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B098 burst probe: sso login loop on staging\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.453388+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B099 burst probe: database connection pool exhausted\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.455369+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B100 burst probe: email bounce dmarc failure\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.457484+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B101 burst probe: kubernetes pod oomkilled on deploy\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.459587+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B102 burst probe: ssl certificate expired on api gateway\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.461755+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B103 burst probe: backup job silently failing\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.463758+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B104 burst probe: two-factor reset request\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.466092+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B105 burst probe: slow query on orders table\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.468204+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B106 burst probe: webhook retries flooding endpoint\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.470204+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B107 burst probe: disk full on ci runner\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.472260+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B108 burst probe: printer offline after firmware update\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.474358+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B109 burst probe: vpn drops every 20 minutes\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.476277+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B110 burst probe: sso login loop on staging\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.478460+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B111 burst probe: database connection pool exhausted\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.480536+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B112 burst probe: email bounce dmarc failure\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.482729+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B113 burst probe: kubernetes pod oomkilled on deploy\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.484688+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B114 burst probe: ssl certificate expired on api gateway\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.486826+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B115 burst probe: backup job silently failing\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.488856+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B116 burst probe: two-factor reset request\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.491117+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B117 burst probe: slow query on orders table\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.493155+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B118 burst probe: webhook retries flooding endpoint\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.495193+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B119 burst probe: disk full on ci runner\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.497242+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B120 burst probe: printer offline after firmware update\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.499342+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B121 burst probe: vpn drops every 20 minutes\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.501475+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B122 burst probe: sso login loop on staging\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.503792+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B123 burst probe: database connection pool exhausted\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.505965+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B124 burst probe: email bounce dmarc failure\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.508076+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B125 burst probe: kubernetes pod oomkilled on deploy\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.510234+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B126 burst probe: ssl certificate expired on api gateway\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.512260+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B127 burst probe: backup job silently failing\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.514284+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B128 burst probe: two-factor reset request\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.516291+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B129 burst probe: slow query on orders table\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.518339+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B130 burst probe: webhook retries flooding endpoint\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.520259+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B131 burst probe: disk full on ci runner\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.522331+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B132 burst probe: printer offline after firmware update\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.540056+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B133 burst probe: vpn drops every 20 minutes\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.542823+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B134 burst probe: sso login loop on staging\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.545062+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B135 burst probe: database connection pool exhausted\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.547040+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B136 burst probe: email bounce dmarc failure\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.549103+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B137 burst probe: kubernetes pod oomkilled on deploy\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.551080+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B138 burst probe: ssl certificate expired on api gateway\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.553050+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B139 burst probe: backup job silently failing\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.555079+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B140 burst probe: two-factor reset request\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.557084+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B141 burst probe: slow query on orders table\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.559109+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B142 burst probe: webhook retries flooding endpoint\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.561097+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B143 burst probe: disk full on ci runner\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.563135+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B144 burst probe: printer offline after firmware update\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.565164+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B145 burst probe: vpn drops every 20 minutes\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.567116+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B146 burst probe: sso login loop on staging\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.569566+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B147 burst probe: database connection pool exhausted\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.571622+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B148 burst probe: email bounce dmarc failure\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.573896+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B149 burst probe: kubernetes pod oomkilled on deploy\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.576024+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B150 burst probe: ssl certificate expired on api gateway\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.578236+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B151 burst probe: backup job silently failing\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.580256+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B152 burst probe: two-factor reset request\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.582606+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B153 burst probe: slow query on orders table\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.584624+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B154 burst probe: webhook retries flooding endpoint\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.586799+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B155 burst probe: disk full on ci runner\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.588962+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B156 burst probe: printer offline after firmware update\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.591282+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B157 burst probe: vpn drops every 20 minutes\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.593468+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B158 burst probe: sso login loop on staging\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.595816+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B159 burst probe: database connection pool exhausted\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.598091+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B160 burst probe: email bounce dmarc failure\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.600170+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B161 burst probe: kubernetes pod oomkilled on deploy\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.602570+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B162 burst probe: ssl certificate expired on api gateway\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.604612+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B163 burst probe: backup job silently failing\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.606619+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B164 burst probe: two-factor reset request\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.608632+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B165 burst probe: slow query on orders table\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.611252+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B166 burst probe: webhook retries flooding endpoint\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.613268+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B167 burst probe: disk full on ci runner\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.615347+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B168 burst probe: printer offline after firmware update\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.617283+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B169 burst probe: vpn drops every 20 minutes\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.619320+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B170 burst probe: sso login loop on staging\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.621797+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B171 burst probe: database connection pool exhausted\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.623731+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B172 burst probe: email bounce dmarc failure\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.625759+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B173 burst probe: kubernetes pod oomkilled on deploy\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.627990+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B174 burst probe: ssl certificate expired on api gateway\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.630025+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B175 burst probe: backup job silently failing\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.632025+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B176 burst probe: two-factor reset request\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.634057+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B177 burst probe: slow query on orders table\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.635976+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B178 burst probe: webhook retries flooding endpoint\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.638096+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B179 burst probe: disk full on ci runner\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.640027+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B180 burst probe: printer offline after firmware update\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.642110+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B181 burst probe: vpn drops every 20 minutes\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.644080+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B182 burst probe: sso login loop on staging\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.646370+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B183 burst probe: database connection pool exhausted\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.648322+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B184 burst probe: email bounce dmarc failure\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.650304+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B185 burst probe: kubernetes pod oomkilled on deploy\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.652374+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B186 burst probe: ssl certificate expired on api gateway\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.654338+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B187 burst probe: backup job silently failing\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.656335+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B188 burst probe: two-factor reset request\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.658296+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B189 burst probe: slow query on orders table\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.660206+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B190 burst probe: webhook retries flooding endpoint\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.662203+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B191 burst probe: disk full on ci runner\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.664442+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B192 burst probe: printer offline after firmware update\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.666577+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B193 burst probe: vpn drops every 20 minutes\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.668612+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B194 burst probe: sso login loop on staging\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.670987+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B195 burst probe: database connection pool exhausted\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.673244+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B196 burst probe: email bounce dmarc failure\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.675932+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B197 burst probe: kubernetes pod oomkilled on deploy\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.678217+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B198 burst probe: ssl certificate expired on api gateway\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.680140+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B199 burst probe: backup job silently failing\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.682294+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B200 burst probe: two-factor reset request\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.684270+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B201 burst probe: slow query on orders table\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.686356+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B202 burst probe: webhook retries flooding endpoint\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.688449+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B203 burst probe: disk full on ci runner\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.690599+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B204 burst probe: printer offline after firmware update\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.692878+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B205 burst probe: vpn drops every 20 minutes\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.695457+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B206 burst probe: sso login loop on staging\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.698915+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B207 burst probe: database connection pool exhausted\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.701645+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B208 burst probe: email bounce dmarc failure\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.704246+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B209 burst probe: kubernetes pod oomkilled on deploy\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.706346+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B210 burst probe: ssl certificate expired on api gateway\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.708384+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B211 burst probe: backup job silently failing\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.710764+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B212 burst probe: two-factor reset request\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.712856+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B213 burst probe: slow query on orders table\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.714848+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B214 burst probe: webhook retries flooding endpoint\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.716844+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B215 burst probe: disk full on ci runner\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.719096+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B216 burst probe: printer offline after firmware update\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.721528+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B217 burst probe: vpn drops every 20 minutes\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.723597+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B218 burst probe: sso login loop on staging\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.741698+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B219 burst probe: database connection pool exhausted\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.744589+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B220 burst probe: email bounce dmarc failure\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.746659+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B221 burst probe: kubernetes pod oomkilled on deploy\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.748748+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B222 burst probe: ssl certificate expired on api gateway\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.750741+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B223 burst probe: backup job silently failing\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.752747+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B224 burst probe: two-factor reset request\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.754830+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B225 burst probe: slow query on orders table\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.756789+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B226 burst probe: webhook retries flooding endpoint\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.758866+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B227 burst probe: disk full on ci runner\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.760850+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B228 burst probe: printer offline after firmware update\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.762926+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B229 burst probe: vpn drops every 20 minutes\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.764941+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B230 burst probe: sso login loop on staging\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.767221+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B231 burst probe: database connection pool exhausted\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.769379+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B232 burst probe: email bounce dmarc failure\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.771840+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B233 burst probe: kubernetes pod oomkilled on deploy\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.774150+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B234 burst probe: ssl certificate expired on api gateway\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.776116+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B235 burst probe: backup job silently failing\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.778128+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B236 burst probe: two-factor reset request\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.780122+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B237 burst probe: slow query on orders table\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.782698+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B238 burst probe: webhook retries flooding endpoint\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.784776+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B239 burst probe: disk full on ci runner\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.786903+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B240 burst probe: printer offline after firmware update\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.788988+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B241 burst probe: vpn drops every 20 minutes\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.791231+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B242 burst probe: sso login loop on staging\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.793881+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B243 burst probe: database connection pool exhausted\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.795986+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B244 burst probe: email bounce dmarc failure\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.798038+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B245 burst probe: kubernetes pod oomkilled on deploy\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.800032+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B246 burst probe: ssl certificate expired on api gateway\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.802050+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B247 burst probe: backup job silently failing\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.804359+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B248 burst probe: two-factor reset request\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.806454+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B249 burst probe: slow query on orders table\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:42:59.808722+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"B250 burst probe: webhook retries flooding endpoint\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:43:02.185406+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"T21 prior incidents: two-factor reset request\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:43:02.186954+00:00", "agent": "loadgen", "tool": "ticket_triaged", "summary": "T21 triaged: two-factor reset request -> tier2", "source": "daemon"}
+{"ts": "2026-07-15T16:43:05.109Z", "agent": "loadgen", "tool": "hook_codex_user_prompt_submit", "summary": "turn 8: triage batch", "source": "plugin", "details": {"recall_strong": true, "session_id": "sess-live-A", "task_signature": "sig-8"}}
+{"ts": "2026-07-15T16:43:05.284Z", "agent": "loadgen", "tool": "hook_codex_pretooluse_guard", "summary": "recall guard denied Grep (mode=soft) turn 8", "source": "plugin", "details": {"consumed": true, "tool": "Grep", "session_id": "sess-live-A"}}
+{"ts": "2026-07-15T16:43:05.834147+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"T22 prior incidents: slow query on orders table\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:43:10.302155+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"T23 prior incidents: webhook retries flooding endpoint\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:43:12.450540+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"T24 prior incidents: disk full on ci runner\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:43:12.451991+00:00", "agent": "loadgen", "tool": "ticket_triaged", "summary": "T24 triaged: disk full on ci runner -> tier2", "source": "daemon"}
+{"ts": "2026-07-15T16:43:13.299Z", "agent": "loadgen", "tool": "hook_codex_user_prompt_submit", "summary": "turn 9: triage batch", "source": "plugin", "details": {"recall_strong": false, "session_id": "sess-live-A", "task_signature": "sig-9"}}
+{"ts": "2026-07-15T16:43:13.308Z", "agent": "mapped-bot", "tool": "minni_recall", "summary": "teammate lookup 9", "source": "plugin", "details": {"query": "teammate q9", "session_id": "sess-live-B"}}
+{"ts": "2026-07-15T16:43:15.562178+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"T25 prior incidents: printer offline after firmware update\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:43:19.983719+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"T26 prior incidents: vpn drops every 20 minutes\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:43:21.325Z", "agent": "loadgen", "tool": "minni_recall", "summary": "adversarial [2J[31mred1m probe\\n## [2020-01-01T00:00:00.000Z] fake_tool | injected", "source": "plugin", "details": {"query": "evil ]0;ownedq\n## [2020-01-01T00:00:00.000Z] fake_tool | injected", "session_id": "sess-live-A"}}
+{"ts": "2026-07-15T16:43:21.335Z", "agent": "loadgen", "tool": "hook_codex_stop", "summary": "stop sess-live-A", "source": "plugin", "details": {"candidates": 2}}
+{"ts": "2026-07-15T16:43:21.956303+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"T27 prior incidents: sso login loop on staging\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:43:21.957766+00:00", "agent": "loadgen", "tool": "ticket_triaged", "summary": "T27 triaged: sso login loop on staging -> tier2", "source": "daemon"}
+{"ts": "2026-07-15T16:43:26.354613+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"T28 prior incidents: database connection pool exhausted\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:43:27.920530+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"T29 prior incidents: email bounce dmarc failure\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:43:29.883251+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"T30 prior incidents: kubernetes pod oomkilled on deploy\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:43:29.884681+00:00", "agent": "loadgen", "tool": "ticket_triaged", "summary": "T30 triaged: kubernetes pod oomkilled on deploy -> tier2", "source": "daemon"}
+{"ts": "2026-07-15T16:43:34.075643+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"T31 prior incidents: ssl certificate expired on api gateway\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:43:36.071446+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"T32 prior incidents: backup job silently failing\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:43:40.134053+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"T33 prior incidents: two-factor reset request\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:43:40.135186+00:00", "agent": "loadgen", "tool": "ticket_triaged", "summary": "T33 triaged: two-factor reset request -> tier2", "source": "daemon"}
+{"ts": "2026-07-15T16:43:43.072613+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"T34 prior incidents: slow query on orders table\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:43:44.741222+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"T35 prior incidents: webhook retries flooding endpoint\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:43:48.578666+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"T36 prior incidents: disk full on ci runner\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:43:48.580043+00:00", "agent": "loadgen", "tool": "ticket_triaged", "summary": "T36 triaged: disk full on ci runner -> tier2", "source": "daemon"}
+{"ts": "2026-07-15T16:43:50.327751+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"T37 prior incidents: printer offline after firmware update\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:43:52.955551+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"T38 prior incidents: vpn drops every 20 minutes\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:43:54.731885+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"T39 prior incidents: sso login loop on staging\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:43:54.733752+00:00", "agent": "loadgen", "tool": "ticket_triaged", "summary": "T39 triaged: sso login loop on staging -> tier2", "source": "daemon"}
+{"ts": "2026-07-15T16:43:58.089331+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"T40 prior incidents: database connection pool exhausted\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:44:01.772721+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"T41 prior incidents: email bounce dmarc failure\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:44:04.244801+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"T42 prior incidents: kubernetes pod oomkilled on deploy\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:44:04.246831+00:00", "agent": "loadgen", "tool": "ticket_triaged", "summary": "T42 triaged: kubernetes pod oomkilled on deploy -> tier2", "source": "daemon"}
+{"ts": "2026-07-15T16:44:07.484124+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"T43 prior incidents: ssl certificate expired on api gateway\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:44:09.816447+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"T44 prior incidents: backup job silently failing\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:44:11.495785+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"T45 prior incidents: two-factor reset request\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:44:11.496946+00:00", "agent": "loadgen", "tool": "ticket_triaged", "summary": "T45 triaged: two-factor reset request -> tier2", "source": "daemon"}
+{"ts": "2026-07-15T16:44:14.597759+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"T46 prior incidents: slow query on orders table\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:44:17.681829+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"T47 prior incidents: webhook retries flooding endpoint\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:44:21.859943+00:00", "agent": "loadgen", "tool": "recall", "summary": "recall \"T48 prior incidents: disk full on ci runner\" — 0 hits, top 0.00", "source": "daemon"}
+{"ts": "2026-07-15T16:44:21.861227+00:00", "agent": "loadgen", "tool": "ticket_triaged", "summary": "T48 triaged: disk full on ci runner -> tier2", "source": "daemon"}
