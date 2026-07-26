@@ -259,7 +259,9 @@ test("Stop hook (claude-code): no material writes no file; genuine material stil
       { MINNI_CLAUDECODE_VAULT_PATH: noiseVault },
       { session_id: "cc-noise", last_user_message: "what's next" },
     );
-    assert.equal(noiseOut.systemMessage, undefined, "no material => no draft");
+    // Session receipts: even a no-material Stop surfaces the proof-of-use line.
+    assert.match(noiseOut.systemMessage ?? "", /^Minni session receipt: /);
+    assert.doesNotMatch(noiseOut.systemMessage ?? "", /drafted to inbox/);
     const noiseNames = (await readdir(path.join(noiseVault, "inbox")).catch(() => []))
       .filter((n) => n.endsWith(".json"));
     assert.deepEqual(noiseNames, [], "no-material Claude Code Stop writes no inbox file");
@@ -277,6 +279,7 @@ test("Stop hook (claude-code): no material writes no file; genuine material stil
       },
     );
     assert.match(realOut.systemMessage ?? "", /drafted to inbox/);
+    assert.match(realOut.systemMessage ?? "", /Minni session receipt:/);
     const realNames = (await readdir(path.join(realVault, "inbox"))).filter((n) => n.endsWith(".json"));
     assert.equal(realNames.length, 1, "a Claude Code session with real work drafts one file");
     const body = JSON.parse(await readFile(path.join(realVault, "inbox", realNames[0]), "utf8"));
@@ -379,11 +382,16 @@ test("Hook stdin: a non-object JSON payload degrades to {} instead of crashing t
       const { stdout } = await child;
       const output = JSON.parse(stdout.trim().split("\n").pop());
       assert.equal(output.continue, true, `stdin ${raw} must still emit continue:true`);
-      assert.equal(
-        output.systemMessage,
-        undefined,
-        `stdin ${raw} must be treated as an empty payload, not a degraded hook`,
+      // Empty/shapeless payload = no draftable signal. Receipt may still ride
+      // the note channel; never a candidate CTA (that would mean draft ran).
+      assert.doesNotMatch(
+        output.systemMessage ?? "",
+        /drafted to inbox|candidate learning/,
+        `stdin ${raw} must be treated as an empty payload, not a draft path`,
       );
+      if (output.systemMessage !== undefined) {
+        assert.match(output.systemMessage, /^Minni session receipt: /);
+      }
     }
     const names = (await readdir(path.join(vault, "inbox")).catch(() => []))
       .filter((n) => n.endsWith(".json"));
@@ -438,13 +446,18 @@ test("Stop scrub guard: a draftable signal scrubbing to zero candidates writes n
       summary: "a summary the drafter rejects wholesale",
     });
     assert.equal(seamOut.continue, true);
-    assert.equal(seamOut.systemMessage, undefined, "no candidates => no call-to-action");
+    assert.match(seamOut.systemMessage ?? "", /^Minni session receipt: /);
+    assert.doesNotMatch(seamOut.systemMessage ?? "", /candidate learning/);
     const seamNames = (await readdir(path.join(seamVault, "inbox"))).filter((n) =>
       n.endsWith(".json"),
     );
     assert.deepEqual(seamNames, [], "zero-candidate outcome must not write an inbox file");
     const seamTail = await auditTail(seamVault, 10);
-    assert.match(seamTail.text, /no candidates after scrub/, "breadcrumb must be recorded");
+    assert.ok(
+      seamTail.entries.some((entry) => entry.includes("| stop scrubbed-stop")),
+      "scrubbed Stop must record the stop audit marker",
+    );
+    assert.match(seamTail.text, /no_candidates_after_scrub/, "breadcrumb reason must be recorded");
 
     // End-to-end against the REAL drafter: a telemetry-shaped summary (the
     // shape issue #173 severed — Minni's own audit log fed back in) passes the
@@ -457,7 +470,8 @@ test("Stop scrub guard: a draftable signal scrubbing to zero candidates writes n
       summary: "## [2026-07-25 12:00:00] hook_stop | stop session-abc",
     });
     assert.equal(realOut.continue, true);
-    assert.equal(realOut.systemMessage, undefined, "scrubbed telemetry => no call-to-action");
+    assert.match(realOut.systemMessage ?? "", /^Minni session receipt: /);
+    assert.doesNotMatch(realOut.systemMessage ?? "", /candidate learning/);
     const realNames = (await readdir(path.join(realVault, "inbox"))).filter((n) =>
       n.endsWith(".json"),
     );
@@ -494,13 +508,19 @@ test("Stop auto-draft retired: no outcome material writes no inbox file, only a 
       last_user_message: "what's next",
     });
     assert.equal(out.continue, true);
-    assert.equal(out.systemMessage, undefined, "no material => no draft, no CTA");
+    // Receipt rides the note channel; no candidate CTA.
+    assert.match(out.systemMessage ?? "", /^Minni session receipt: /);
+    assert.doesNotMatch(out.systemMessage ?? "", /candidate learning/);
     const names = (await readdir(path.join(vault, "inbox")).catch(() => []))
       .filter((n) => n.endsWith(".json"));
     assert.deepEqual(names, [], "no-signal Stop must not write an inbox file");
-    // ...but a single breadcrumb is recorded so the session isn't invisible.
+    // Stop marker closes the sessionReceipt window; reason lives in details.
     const tail = await auditTail(vault, 10);
-    assert.match(tail.text, /no draftable signal/, "breadcrumb line must be recorded");
+    assert.ok(
+      tail.entries.some((entry) => entry.includes("| stop nosignal-stop")),
+      "no-signal Stop must record the stop audit marker",
+    );
+    assert.match(tail.text, /no_draftable_signal/, "breadcrumb reason must be recorded");
   } finally {
     if (savedHome === undefined) delete process.env.MINNI_HOME;
     else process.env.MINNI_HOME = savedHome;
@@ -527,6 +547,7 @@ test("Stop forward-compat hook: outcome material in the payload still drafts exa
       changedFiles: ["src/retry.ts"],
     });
     assert.match(out.systemMessage ?? "", /candidate learning/);
+    assert.match(out.systemMessage ?? "", /Minni session receipt:/);
     const names = (await readdir(path.join(vault, "inbox"))).filter((n) => n.endsWith(".json"));
     assert.equal(names.length, 1, "genuine outcome material drafts one file");
     const body = JSON.parse(await readFile(path.join(vault, "inbox", names[0]), "utf8"));
@@ -712,4 +733,160 @@ test("Stop stamps the vault-derived principal, not the configured agent id", asy
     else process.env.MINNI_BYPASS_AUDIT_LIMIT = savedBypass;
     await rm(root, { recursive: true, force: true });
   }
+});
+
+// ── Review finding (medium): synthetic "session" id must never be stamped ───
+// into audit details.session_id or threaded into the daemon recall-trace.
+// UserPromptSubmit's weak (nothing-salient) and strong (recall_pointer) paths
+// both stamp details.session_id conditionally on the RAW payload id; the
+// "session" fallback stays reserved for envelope identity / inbox filenames.
+
+function upsConfig(vaultPath) {
+  return {
+    agentId: "claude-code",
+    vaultPath,
+    defaultWorkspaceId: "workspace-fixture",
+    contextWindow: 200_000,
+    hooksEnabled: true,
+    auditPrefix: "hook_test",
+    alwaysWriteStopInbox: false,
+  };
+}
+
+async function withRawSessionFixture(run) {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-raw-session-"));
+  const vault = path.join(root, "vault");
+  const home = path.join(root, "home");
+  const saved = {
+    home: process.env.MINNI_HOME,
+    socket: process.env.MINNI_SOCKET_PATH,
+    afm: process.env.MINNI_AFM_HEALTH_URL,
+    bypass: process.env.MINNI_BYPASS_AUDIT_LIMIT,
+  };
+  process.env.MINNI_HOME = home;
+  process.env.MINNI_SOCKET_PATH = path.join(home, "missing.sock");
+  process.env.MINNI_AFM_HEALTH_URL = "http://127.0.0.1:1/health";
+  process.env.MINNI_BYPASS_AUDIT_LIMIT = "true";
+  await mkdir(home, { recursive: true });
+  try {
+    await run({ vault, home });
+  } finally {
+    for (const [key, value] of [
+      ["MINNI_HOME", saved.home],
+      ["MINNI_SOCKET_PATH", saved.socket],
+      ["MINNI_AFM_HEALTH_URL", saved.afm],
+      ["MINNI_BYPASS_AUDIT_LIMIT", saved.bypass],
+    ]) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
+/** Finds the last audit entry for `tool` and returns its parsed details JSON. */
+async function lastAuditDetails(vaultPath, tool) {
+  const tail = await auditTail(vaultPath, 20);
+  for (let i = tail.entries.length - 1; i >= 0; i -= 1) {
+    const entry = tail.entries[i];
+    if (!entry.includes(`] ${tool} |`)) continue;
+    const match = entry.match(/```json\n([\s\S]*?)\n```/);
+    return match ? JSON.parse(match[1]) : undefined;
+  }
+  return undefined;
+}
+
+test("UserPromptSubmit audit (weak/nothing-salient path): no session_id in payload omits details.session_id", async () => {
+  await withRawSessionFixture(async ({ vault }) => {
+    const handlers = createHookHandlers(upsConfig(vault));
+    // No vault notes + missing daemon socket => weak recall; no active plan
+    // => the nothing-salient early return, which is the audit call under test.
+    const output = await handlers.handleUserPromptSubmit({
+      prompt: "an utterly novel question with zero prior memory zzzqqx",
+      workspace_id: "workspace-fixture",
+      // deliberately NO session_id / sessionId field
+    });
+    assert.equal(output.continue, true);
+
+    const details = await lastAuditDetails(vault, "hook_test_user_prompt_submit");
+    assert.ok(details, "UserPromptSubmit must record an audit entry");
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(details, "session_id"),
+      false,
+      "unlabeled payload must not stamp a synthetic session_id into audit details",
+    );
+  });
+});
+
+test("UserPromptSubmit audit (weak/nothing-salient path): a real session_id is stamped as before", async () => {
+  await withRawSessionFixture(async ({ vault }) => {
+    const handlers = createHookHandlers(upsConfig(vault));
+    const output = await handlers.handleUserPromptSubmit({
+      prompt: "another utterly novel question with zero prior memory wobblequux",
+      workspace_id: "workspace-fixture",
+      session_id: "real-session-42",
+    });
+    assert.equal(output.continue, true);
+
+    const details = await lastAuditDetails(vault, "hook_test_user_prompt_submit");
+    assert.ok(details);
+    assert.equal(details.session_id, "real-session-42");
+  });
+});
+
+test("UserPromptSubmit audit (strong/recall_pointer path): no session_id in payload omits details.session_id", async () => {
+  await withRawSessionFixture(async ({ vault }) => {
+    const prompt = "resume the raw-session-id review-finding investigation from prior context";
+    const wiki = path.join(vault, "wiki", "sessions");
+    await mkdir(wiki, { recursive: true });
+    await writeFile(
+      path.join(wiki, "20260617-raw-session-strong-hit.md"),
+      `# Strong hit note\n\nThe exact phrase: ${prompt}\nDocumented so the agent need not re-derive it.\n`,
+      "utf8",
+    );
+
+    const handlers = createHookHandlers(upsConfig(vault));
+    const output = await handlers.handleUserPromptSubmit({
+      prompt,
+      workspace_id: "workspace-fixture",
+      // deliberately NO session_id / sessionId field
+    });
+    assert.equal(output.continue, true);
+    assert.ok(output.hookSpecificOutput, "strong turn must inject an envelope");
+
+    const details = await lastAuditDetails(vault, "hook_test_user_prompt_submit");
+    assert.ok(details);
+    assert.equal(details.recall_strong, true, "precondition: this must be the strong-recall path");
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(details, "session_id"),
+      false,
+      "unlabeled payload must not stamp a synthetic session_id into audit details",
+    );
+  });
+});
+
+test("UserPromptSubmit audit (strong/recall_pointer path): a real session_id is stamped as before", async () => {
+  await withRawSessionFixture(async ({ vault }) => {
+    const prompt = "resume the raw-session-id stamped review-finding investigation from prior context";
+    const wiki = path.join(vault, "wiki", "sessions");
+    await mkdir(wiki, { recursive: true });
+    await writeFile(
+      path.join(wiki, "20260617-raw-session-strong-hit-2.md"),
+      `# Strong hit note\n\nThe exact phrase: ${prompt}\nDocumented so the agent need not re-derive it.\n`,
+      "utf8",
+    );
+
+    const handlers = createHookHandlers(upsConfig(vault));
+    const output = await handlers.handleUserPromptSubmit({
+      prompt,
+      workspace_id: "workspace-fixture",
+      session_id: "real-session-strong-7",
+    });
+    assert.equal(output.continue, true);
+
+    const details = await lastAuditDetails(vault, "hook_test_user_prompt_submit");
+    assert.ok(details);
+    assert.equal(details.recall_strong, true, "precondition: this must be the strong-recall path");
+    assert.equal(details.session_id, "real-session-strong-7");
+  });
 });

@@ -10,7 +10,7 @@ import { promisify } from "node:util";
 import { DEFAULT_AGENT_ID, DEFAULT_VAULT_PATH, PLUGIN_ROOT, minniHome } from "./config.js";
 import { buildStatusReport } from "./sovereign.js";
 import { prepareOutcome, prepareTask, type PrepareOutcomeInput, type PrepareTaskInput } from "./task.js";
-import { auditTail, getAgentIdFromVaultPath } from "./vault.js";
+import { auditTail, getAgentIdFromVaultPath, listSessions, type SessionSummary } from "./vault.js";
 import { readRecallState } from "./recall-state.js";
 import { routeMemoryIntent } from "./policy.js";
 
@@ -88,6 +88,8 @@ export interface UiServerOptions {
   readRecallState?: (vaultPath: string) => Promise<unknown>;
   /** Test seam: override agents catalogue builder. */
   listAgents?: () => Promise<unknown>;
+  /** Test seam: override sessions catalogue builder. */
+  listSessionsCatalogue?: (opts: { agent?: string; limit: number }) => Promise<unknown>;
   /** Test seam: override policy report builder. */
   policyReport?: () => Promise<unknown>;
 }
@@ -194,6 +196,12 @@ function parseCandidatesLimit(value: string | null): number {
   const parsed = Number(value ?? 50);
   if (!Number.isFinite(parsed)) return 50;
   return Math.max(1, Math.min(Math.trunc(parsed), 200));
+}
+
+function parseSessionsLimit(value: string | null): number {
+  const parsed = Number(value ?? 20);
+  if (!Number.isFinite(parsed)) return 20;
+  return Math.max(1, Math.min(Math.trunc(parsed), 50));
 }
 
 // Daemon agent ids are lowercase slugs; anything else is rejected rather than
@@ -447,6 +455,126 @@ export async function buildAgentsCatalogue(options: {
   );
 
   return { agents, count: agents.length };
+}
+
+/**
+ * Discover agent vaults for catalogue routes.
+ *  1. Scan MINNI_HOME/*-vault (containment-guarded; symlink escapes outside home
+ *     are skipped — they must not redirect a reader outside MINNI_HOME).
+ *  2. Overlay operator-authored MINNI_AGENT_VAULTS (JSON agent_id → vault path).
+ *     Mapped vaults are trusted the same as MINNI_HOME and may live ANYWHERE on
+ *     disk; the containment guard is deliberately not applied to them. Keys are
+ *     validated against AGENT_ID_RE; values must be non-empty strings.
+ *
+ * Dedupe is by canonical (realpath) path so one on-disk vault reachable via two
+ * spellings appears exactly once — and, when both a scan and a mapping point at
+ * it, the mapped agent-id label wins (mapping overlays scan). Returns a map of
+ * agent id → the read path for that vault (strictly a read target; no caller
+ * ever writes through it).
+ */
+export async function resolveAgentVaults(homePath: string): Promise<Map<string, string>> {
+  // Intermediate keying is by canonical vault path so the same on-disk vault
+  // never yields two entries; the value carries the agent-id label + read path.
+  const byCanonical = new Map<string, { id: string; readPath: string }>();
+
+  let dirs: string[] = [];
+  try {
+    dirs = await readdir(homePath);
+  } catch {
+    dirs = [];
+  }
+  const vaultDirs = dirs.filter((d) => d.endsWith("-vault")).sort();
+  for (const dir of vaultDirs) {
+    const vaultAbs = path.join(homePath, dir);
+    // Scanned *-vault dirs keep the containment guard (no symlink escape).
+    if (!vaultPathContained(vaultAbs, homePath)) continue;
+    const id = agentIdFromVaultDir(vaultAbs);
+    if (!AGENT_ID_RE.test(id)) continue;
+    let canonical = vaultAbs;
+    try {
+      canonical = realpathSync(vaultAbs);
+    } catch {
+      // unresolvable → key on the join path (still unique per dir)
+    }
+    byCanonical.set(canonical, { id, readPath: canonical });
+  }
+
+  // Operator-authored remaps: trusted like MINNI_HOME, may live outside it.
+  const mappingRaw = process.env.MINNI_AGENT_VAULTS;
+  if (mappingRaw) {
+    try {
+      const mapping = JSON.parse(mappingRaw) as unknown;
+      if (mapping && typeof mapping === "object" && !Array.isArray(mapping)) {
+        for (const [agentId, mappedPath] of Object.entries(mapping as Record<string, unknown>)) {
+          if (!AGENT_ID_RE.test(agentId)) continue;
+          if (typeof mappedPath !== "string" || mappedPath.trim().length === 0) continue;
+          const absMapped = path.resolve(mappedPath.replace(/^~(?=$|\/)/, os.homedir()));
+          let canonical = absMapped;
+          try {
+            canonical = realpathSync(absMapped);
+          } catch {
+            // mapped target not on disk yet → key on the resolved path
+          }
+          // Mapping wins on conflict: overwrite any scanned entry for the same
+          // on-disk vault and prefer the mapped agent-id label.
+          byCanonical.set(canonical, { id: agentId, readPath: canonical });
+        }
+      }
+    } catch {
+      // Invalid MINNI_AGENT_VAULTS JSON is ignored gracefully — the scan still
+      // provides discovery, matching watch.py's tolerant parse.
+    }
+  }
+
+  const out = new Map<string, string>();
+  for (const { id, readPath } of byCanonical.values()) {
+    out.set(id, readPath);
+  }
+  return out;
+}
+
+/**
+ * Compose the multi-agent session catalogue for the sessions view. Discovery
+ * goes through resolveAgentVaults (MINNI_HOME/*-vault scan + MINNI_AGENT_VAULTS
+ * remaps), reads each vault's recent session cycles via listSessions (strictly
+ * read-only — never ensureVault), stamps each row with its agent id, and merges
+ * across vaults newest-first by boot_at (rows with a null boot_at sort last).
+ * No absolute vault path is put on the wire.
+ */
+export async function buildSessionsCatalogue(options: {
+  homePath: string;
+  perVaultLimit?: number;
+  agent?: string;
+  listSessionsFn?: (vaultPath: string, limit?: number) => Promise<SessionSummary[]>;
+}): Promise<{ sessions: Array<Record<string, unknown>>; count: number }> {
+  const homePath = options.homePath;
+  const perVaultLimit = options.perVaultLimit ?? 10;
+  const listFn = options.listSessionsFn ?? listSessions;
+
+  const vaults = await resolveAgentVaults(homePath);
+  const targets = [...vaults.entries()]
+    .filter(([id]) => !options.agent || id === options.agent)
+    .map(([id, vaultAbs]) => ({ id, vaultAbs }));
+
+  const perVault = await Promise.all(
+    targets.map(async ({ vaultAbs, id }) => {
+      const sessions = await listFn(vaultAbs, perVaultLimit);
+      // Stamp the agent id; carry only the SessionSummary fields (no vault path).
+      return sessions.map((s) => ({ agent: id, ...s }));
+    }),
+  );
+
+  const merged = perVault.flat().sort((a, b) => {
+    const ab = a.boot_at as string | null;
+    const bb = b.boot_at as string | null;
+    // Null boot_at sorts last; otherwise newest ISO stamp first.
+    if (ab === bb) return 0;
+    if (ab == null) return 1;
+    if (bb == null) return -1;
+    return ab < bb ? 1 : -1;
+  });
+
+  return { sessions: merged, count: merged.length };
 }
 
 /** Normalize list_candidates daemon responses (JsonResult or flat). */
@@ -920,6 +1048,14 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         homePath,
         daemonRpc,
       }));
+  const listSessionsCatalogue =
+    options.listSessionsCatalogue ??
+    ((opts: { agent?: string; limit: number }) =>
+      buildSessionsCatalogue({
+        homePath,
+        perVaultLimit: opts.limit,
+        agent: opts.agent,
+      }));
   const policyReport =
     options.policyReport ??
     (() =>
@@ -997,6 +1133,7 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
             "minni_candidates",
             "minni_resolve_candidate",
             "minni_agents",
+            "minni_sessions",
             "minni_log_only",
             "minni_quarantine",
             "minni_recall_state",
@@ -1103,6 +1240,29 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
             error: e instanceof Error ? e.message : String(e),
             agents: [],
             count: 0,
+          });
+        }
+        return;
+      }
+      if (req.method === "GET" && url.pathname === "/api/sessions") {
+        const sessAgent = url.searchParams.get("agent");
+        if (sessAgent !== null && !AGENT_ID_RE.test(sessAgent)) {
+          sendJson(res, 400, { ok: false, error: "invalid agent" });
+          return;
+        }
+        const sessLimit = parseSessionsLimit(url.searchParams.get("limit"));
+        try {
+          const catalogue = (await listSessionsCatalogue({
+            agent: sessAgent ?? undefined,
+            limit: sessLimit,
+          })) as { sessions?: unknown };
+          const rows = Array.isArray(catalogue?.sessions) ? catalogue.sessions.slice(0, sessLimit) : [];
+          sendJson(res, 200, redactLocalValue({ sessions: rows, count: rows.length }));
+        } catch (e) {
+          sendJson(res, 500, {
+            ok: false,
+            error: e instanceof Error ? e.message : String(e),
+            sessions: [],
           });
         }
         return;

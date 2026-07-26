@@ -78,11 +78,13 @@ import {
   ensureVault,
   buildPendingLearningsSection,
   expireStaleInboxHandoffs,
+  formatSessionReceiptLine,
   readInboxStatus,
   readReassertPending,
   recordAudit,
   resolveInboxHandoffContext,
   searchVaultNotes,
+  sessionReceipt,
   settleReassertedInboxEntries,
   writeInbox,
 } from "./vault.js";
@@ -197,7 +199,16 @@ export async function handleStopCore(
   prepareOutcomeFn: typeof prepareOutcome = prepareOutcome,
 ): Promise<HookOutput> {
   await ensureVault(config.vaultPath);
-  const sessionId = asString(payload.session_id) || asString(payload.sessionId) || "session";
+  // Stop keeps the defaulted "session" fallback (inbox filename, marker text,
+  // sessionReceipt) unchanged: unlike recall/audit correlation, a runtime that
+  // never labeled any turn with a real session_id still gets a best-effort
+  // receipt merged onto the synthetic "session" bucket rather than no receipt.
+  const rawSessionId = asString(payload.session_id) || asString(payload.sessionId);
+  const sessionId = rawSessionId || "session";
+  // On the synthetic fallback, turns that DID stamp a real session_id must
+  // still count inside this window — otherwise the receipt reports zeros
+  // despite real activity.
+  const receiptOptions = { includeStamped: !rawSessionId };
   const workspaceId = workspaceFromPayload(payload, config.defaultWorkspaceId);
   // Task and summary must stay distinct. Falling back to `summary` for the
   // task field made summary-only payloads compose `"<summary>: <summary>"` —
@@ -230,17 +241,45 @@ export async function handleStopCore(
   // retired `alwaysWriteStopInbox` note on AgentHookConfig).
   // NOTE: this is a governance-posture change — it needs operator sign-off
   // before the plugin is re-propagated.
+  //
+  // Session receipts (PR #166 slice): every Stop path still emits a proof-of-use
+  // tally. The stop MARKER summary stays exactly `stop <id>` so sessionReceipt /
+  // listSessions can close the boot→stop window; breadcrumb reasons live in
+  // details, not the summary.
   const changedFiles = stringArray(payload.changedFiles ?? payload.changed_files);
   const outcomeSummary = asString(payload.summary).trim();
   const hasDraftableSignal = changedFiles.length > 0 || outcomeSummary.length > 0;
 
-  if (!hasDraftableSignal) {
+  async function emitStopBreadcrumb(reason: string): Promise<HookOutput> {
+    // Tally BEFORE writing the stop row so the receipt embeds in its own details
+    // without counting this marker's candidates (always 0 on breadcrumb paths).
+    const receipt = await sessionReceipt(
+      config.vaultPath,
+      sessionId,
+      500,
+      receiptOptions,
+    ).catch(() => undefined);
     await recordAudit(config.vaultPath, {
       tool: `${config.auditPrefix}_stop`,
-      summary: `stop ${sessionId}: no draftable signal`,
-      details: { workspace: workspaceId, candidates: 0 },
+      summary: `stop ${sessionId}`,
+      details: {
+        workspace: workspaceId,
+        candidates: 0,
+        reason,
+        ...(receipt ? { receipt } : {}),
+      },
     });
-    return { continue: true };
+    // Surface the receipt even with zero activity: proof that no memory work
+    // happened is itself the signal. Platforms without a note channel drop it
+    // via renderIntent; the audit marker still closes the session window.
+    return {
+      continue: true,
+      ...(receipt ? { systemMessage: formatSessionReceiptLine(receipt) } : {}),
+    };
+  }
+
+  if (!hasDraftableSignal) {
+    return emitStopBreadcrumb("no_draftable_signal");
   }
 
   const outcome = await prepareOutcomeFn({
@@ -264,12 +303,7 @@ export async function handleStopCore(
   // when the drafter itself yields nothing for `changedFiles` without a
   // `summary` — the write layer must not depend on the drafter's verdict.
   if (candidates.length === 0) {
-    await recordAudit(config.vaultPath, {
-      tool: `${config.auditPrefix}_stop`,
-      summary: `stop ${sessionId}: no candidates after scrub`,
-      details: { workspace: workspaceId, candidates: 0 },
-    });
-    return { continue: true };
+    return emitStopBreadcrumb("no_candidates_after_scrub");
   }
 
   // `kind`/`agent_id`/`workspace_id` are the INGEST CONTRACT, not decoration:
@@ -297,6 +331,16 @@ export async function handleStopCore(
     last_task: lastTask.slice(0, 200),
   });
 
+  // Tally BEFORE writing the stop entry so the receipt embeds in its own audit
+  // details (candidates_drafted then reflects prior stops, not this one — the
+  // display line below merges THIS stop's drafts so it never contradicts the
+  // candidate sentence beside it).
+  const receipt = await sessionReceipt(
+    config.vaultPath,
+    sessionId,
+    500,
+    receiptOptions,
+  ).catch(() => undefined);
   await recordAudit(config.vaultPath, {
     tool: `${config.auditPrefix}_stop`,
     summary: `stop ${sessionId}`,
@@ -304,8 +348,14 @@ export async function handleStopCore(
       candidates: candidates.length,
       workspace: workspaceId,
       inbox_path: inbox.filePath,
+      ...(receipt ? { receipt } : {}),
     },
   });
+
+  const displayReceipt = receipt
+    ? { ...receipt, candidates_drafted: receipt.candidates_drafted + candidates.length }
+    : undefined;
+  const receiptLine = displayReceipt ? ` ${formatSessionReceiptLine(displayReceipt)}` : "";
 
   return {
     continue: true,
@@ -313,7 +363,7 @@ export async function handleStopCore(
       candidates.length === 1 ? "" : "s"
     } drafted to inbox (${inbox.filePath}). ${
       config.stopCommitHint ?? "Use minni_prepare_outcome/minni_learn to review and commit."
-    }`,
+    }${receiptLine}`,
   };
 }
 
@@ -365,7 +415,13 @@ export function createHookHandlers(
   };
 
   async function handleSessionStart(payload: Record<string, unknown>): Promise<HookOutput> {
-    const sessionId = asString(payload.session_id) || asString(payload.sessionId) || "session";
+    // rawSessionId is the payload's own id, possibly empty — never the
+    // "session" synthetic fallback. It is what gets threaded into the daemon
+    // recall-trace (recallMemory's sessionId) so unlabeled runtimes never
+    // conflate into one synthetic thread_id. sessionId keeps the historical
+    // defaulted value for envelope identity / inbox filenames / markers.
+    const rawSessionId = asString(payload.session_id) || asString(payload.sessionId);
+    const sessionId = rawSessionId || "session";
     const workspaceId = workspaceFor(payload);
     await ensureVault(config.vaultPath);
 
@@ -390,6 +446,7 @@ export function createHookHandlers(
         limit: 8,
         agentId: config.agentId,
         workspaceId,
+        ...(rawSessionId ? { sessionId: rawSessionId } : {}),
       }),
       // hooks-PL-1/PL-2: corrections to beliefs this agent read must
       // re-surface at boot (stale_beliefs), on every platform.
@@ -554,6 +611,10 @@ export function createHookHandlers(
     }
 
     const workspaceId = workspaceFor(payload);
+    // rawSessionId (possibly empty) is the audit/recall-trace correlation id;
+    // sessionId keeps the "session" fallback for envelope identity only — see
+    // handleSessionStart's comment for why the two must not be conflated.
+    const rawSessionId = asString(payload.session_id) || asString(payload.sessionId);
     const signature = hashTaskSignature(prompt);
 
     const intent = routeMemoryIntent(prompt);
@@ -577,6 +638,7 @@ export function createHookHandlers(
         limit: 6,
         agentId: config.agentId,
         workspaceId,
+        ...(rawSessionId ? { sessionId: rawSessionId } : {}),
       }),
     ]);
     // s5 strength gate: emit the light pointer + recall-state file ONLY when the
@@ -627,6 +689,9 @@ export function createHookHandlers(
           task_signature: signature,
           workspace: workspaceId,
           recall_strong: false,
+          // RAW id only — omit rather than stamp the synthetic "session"
+          // fallback, so unlabeled turns don't conflate into one audit thread.
+          ...(rawSessionId ? { session_id: rawSessionId } : {}),
         },
       });
       return render(noIntent);
@@ -670,6 +735,8 @@ export function createHookHandlers(
         task_signature: signature,
         workspace: workspaceId,
         recall_strong: Boolean(strong),
+        // RAW id only — see the weak-path comment above.
+        ...(rawSessionId ? { session_id: rawSessionId } : {}),
       },
     });
 
@@ -704,6 +771,10 @@ export function createHookHandlers(
     // again). On a persistence failure we FAIL OPEN and allow, trading a missed
     // nudge for availability.
     const consumed = await markRecallConsumed(config.vaultPath).catch(() => false);
+    // The PreToolUse payload may carry a session_id; stamp it so the Stop
+    // receipt can attribute this guard nudge. Only add it when actually present
+    // — never invent a "session" placeholder on this path.
+    const guardSessionId = asString(payload.session_id) || asString(payload.sessionId);
     await recordAudit(config.vaultPath, {
       tool: `${config.auditPrefix}_pretooluse_guard`,
       summary: `recall guard ${consumed ? "denied" : "allowed (consume write failed)"} ${toolName} (mode=${mode})`,
@@ -714,6 +785,7 @@ export function createHookHandlers(
         top_score: state!.top_score,
         hits: state!.top_hits.length,
         task_signature: state!.task_signature,
+        ...(guardSessionId ? { session_id: guardSessionId } : {}),
       },
     }).catch(() => {});
     if (!consumed) return preToolUseAllow();
