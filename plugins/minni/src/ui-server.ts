@@ -208,6 +208,10 @@ function parseSessionsLimit(value: string | null): number {
 // forwarded as a principal claim.
 const AGENT_ID_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 
+// Event types are lowercase snake tokens; anything else is rejected before it
+// reaches the daemon rather than forwarded as an unbounded filter.
+const EVENT_TYPE_RE = /^[a-z_]{1,64}$/;
+
 // The env fallback sentinel resolves to a default-deny principal daemon-side,
 // which would render the staged wall permanently (and silently) empty.
 function candidatesAgentId(param: string | null): string | undefined {
@@ -1161,7 +1165,48 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
         return;
       }
       if (req.method === "GET" && url.pathname === "/api/audit-tail") {
-        sendJson(res, 200, redactLocalValue(await tail(parseAuditLimit(url.searchParams.get("limit")))));
+        const auditLimit = parseAuditLimit(url.searchParams.get("limit"));
+        const auditAgent = url.searchParams.get("agent");
+        if (auditAgent !== null) {
+          // Fleet-wide lane (special-cased BEFORE AGENT_ID_RE): merge every
+          // resolved vault's read-only tail, tag each entry with its agent, sort
+          // newest-first by parsed header timestamp (unparseable → oldest), and
+          // cap at the clamped limit. Same auth as every /api route.
+          if (auditAgent === "*") {
+            const vaults = await resolveAgentVaults(homePath);
+            const tagged: Array<{ agent: string; text: string; ms: number }> = [];
+            await Promise.all(
+              [...vaults.entries()].map(async ([id, vaultAbs]) => {
+                const agentTail = await readOnlyAuditTail(vaultAbs, auditLimit);
+                for (const entry of agentTail.entries) {
+                  const ms = parseAuditTimestampMs(entry);
+                  tagged.push({ agent: id, text: entry, ms: ms ?? Number.NEGATIVE_INFINITY });
+                }
+              }),
+            );
+            tagged.sort((a, b) => b.ms - a.ms);
+            const entries = tagged.slice(0, auditLimit).map(({ agent, text }) => ({ agent, text }));
+            sendJson(res, 200, redactLocalValue({ merged: true, entries }));
+            return;
+          }
+          // Per-agent audit tail: resolve the agent's vault via the shared
+          // discovery (scan + MINNI_AGENT_VAULTS remaps), serve READ-ONLY (never
+          // ensureVault, never the injected auditTail seam which materializes
+          // vault skeletons). Unknown agent → 404.
+          if (!AGENT_ID_RE.test(auditAgent)) {
+            sendJson(res, 400, { ok: false, error: "invalid agent" });
+            return;
+          }
+          const vaults = await resolveAgentVaults(homePath);
+          const agentVault = vaults.get(auditAgent);
+          if (!agentVault) {
+            sendJson(res, 404, { ok: false, error: "unknown agent" });
+            return;
+          }
+          sendJson(res, 200, redactLocalValue(await readOnlyAuditTail(agentVault, auditLimit)));
+          return;
+        }
+        sendJson(res, 200, redactLocalValue(await tail(auditLimit)));
         return;
       }
       if (req.method === "POST" && url.pathname === "/api/prepare-task") {
@@ -1294,6 +1339,91 @@ export function createUiServer(options: UiServerOptions = {}): UiServerHandle {
             ok: false,
             error: e instanceof Error ? e.message : String(e),
             handoffs: [],
+          });
+        }
+        return;
+      }
+      if (req.method === "GET" && url.pathname === "/api/events") {
+        const eventParams: Record<string, unknown> = {};
+        const sinceRaw = url.searchParams.get("since_id");
+        if (sinceRaw !== null) {
+          const n = Number(sinceRaw);
+          if (!Number.isInteger(n) || n < 0) {
+            sendJson(res, 400, { ok: false, error: "invalid since_id" });
+            return;
+          }
+          eventParams.since_id = n;
+        }
+        const limitRaw = url.searchParams.get("limit");
+        if (limitRaw !== null) {
+          const n = Number(limitRaw);
+          if (!Number.isInteger(n) || n < 0) {
+            sendJson(res, 400, { ok: false, error: "invalid limit" });
+            return;
+          }
+          // The daemon rejects limits < 1 (-32602), so a validated-but-zero
+          // limit must clamp UP to 1 (bounded page) rather than break the
+          // daemon lane — same [1,200] clamp idiom as parseSessionsLimit.
+          eventParams.limit = Math.max(1, Math.min(n, 200));
+        }
+        const eventAgent = url.searchParams.get("agent");
+        if (eventAgent !== null) {
+          if (!AGENT_ID_RE.test(eventAgent)) {
+            sendJson(res, 400, { ok: false, error: "invalid agent" });
+            return;
+          }
+          eventParams.agent_id = eventAgent;
+        }
+        const eventType = url.searchParams.get("event_type");
+        if (eventType !== null) {
+          if (!EVENT_TYPE_RE.test(eventType)) {
+            sendJson(res, 400, { ok: false, error: "invalid event_type" });
+            return;
+          }
+          eventParams.event_type = eventType;
+        }
+        try {
+          const rpc = await daemonRpc("list_events", eventParams);
+          if (rpc && typeof rpc === "object" && (rpc as { ok?: boolean }).ok === false) {
+            const err = String((rpc as { error?: string }).error || "list_events failed");
+            sendJson(res, daemonRpcHttpStatus(err), {
+              ok: false,
+              error: err,
+              events: [],
+            });
+            return;
+          }
+          // JsonResult envelope: the real daemonRpc returns
+          // { ok: true, data: { events, last_id } } — flatten it so the
+          // client reads top-level events/last_id (mirrors /api/handoffs).
+          // Injected test seams may already return the flat shape.
+          let payload: unknown = rpc;
+          const envelope = rpc as Record<string, unknown>;
+          if (
+            envelope &&
+            typeof envelope === "object" &&
+            envelope.ok === true &&
+            envelope.data &&
+            typeof envelope.data === "object"
+          ) {
+            payload = envelope.data;
+          }
+          // episodic_events.created_at is a Unix epoch float in SECONDS
+          // (Python time.time()); normalize to ISO so Date.parse works in
+          // the merged Audit sort instead of NaN-sinking the daemon lane.
+          if (payload && typeof payload === "object" && Array.isArray((payload as { events?: unknown[] }).events)) {
+            for (const ev of (payload as { events: Array<{ created_at?: unknown }> }).events) {
+              if (typeof ev?.created_at === "number" && Number.isFinite(ev.created_at)) {
+                ev.created_at = new Date(ev.created_at * 1000).toISOString();
+              }
+            }
+          }
+          sendJson(res, 200, redactLocalValue(payload));
+        } catch (e) {
+          sendJson(res, daemonRpcHttpStatus(e), {
+            ok: false,
+            error: e instanceof Error ? e.message : String(e),
+            events: [],
           });
         }
         return;

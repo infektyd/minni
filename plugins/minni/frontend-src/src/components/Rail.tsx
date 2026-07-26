@@ -17,6 +17,7 @@ export const NAV: NavItem[] = [
   { id: "handoffs", label: "Handoffs", glyph: "cross" },
   { id: "vaults", label: "Vaults", glyph: "dot" },
   { section: "OBSERVABILITY" },
+  { id: "sessions", label: "Sessions", glyph: "square" },
   { id: "audit", label: "Audit Trail", glyph: "bar" },
   { id: "policy", label: "Policy & AFM", glyph: "diamond" },
   { id: "settings", label: "Settings", glyph: "cross", kbd: "," },
