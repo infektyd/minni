@@ -1758,3 +1758,233 @@ test("sessionReceipt does not claim a stop row whose id merely shares a prefix",
     await rm(root, { recursive: true, force: true });
   }
 });
+
+// --- per-turn Stop hooks: one boot cycle owns MANY stop rows ---------------
+// Claude Code maps Stop to end-of-TURN, not end-of-session, so a single
+// `boot <id>` is followed by a `stop <id>` per turn. Closing the window at the
+// first own-stop froze every later receipt at turn one and reported a live
+// session as closed. These lock the last-own-stop rule in.
+
+test("sessionReceipt spans every turn when Stop fires per turn, not just the first", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-multistop-"));
+  try {
+    await ensureVault(root);
+    await recordAudit(root, {
+      tool: "hook_session_start",
+      summary: "boot sess-T",
+      details: { daemon_ok: true },
+    });
+    // Turn 1: recall + its end-of-turn stop.
+    await recordAudit(root, {
+      tool: "hook_user_prompt_submit",
+      summary: "turn one",
+      details: { recall_strong: true, session_id: "sess-T" },
+    });
+    await recordAudit(root, {
+      tool: "hook_stop",
+      summary: "stop sess-T",
+      details: { candidates: 1 },
+    });
+    // Turn 2: more work, then a SECOND stop for the same boot.
+    await recordAudit(root, {
+      tool: "hook_user_prompt_submit",
+      summary: "turn two",
+      details: { recall_strong: true, session_id: "sess-T" },
+    });
+    await recordAudit(root, {
+      tool: "minni_learn",
+      summary: "turn two learn",
+      details: { ok: true },
+    });
+    await recordAudit(root, {
+      tool: "hook_stop",
+      summary: "stop sess-T",
+      details: { candidates: 2 },
+    });
+
+    const receipt = await sessionReceipt(root, "sess-T");
+    assert.equal(
+      receipt.recalls_strong,
+      2,
+      "turn two's recall must count, not just turn one's",
+    );
+    assert.equal(receipt.learns, 1, "turn two's learn must count");
+    assert.equal(
+      receipt.candidates_drafted,
+      3,
+      "candidates from BOTH stop rows belong to this cycle",
+    );
+
+    const [row] = await listSessions(root, 10);
+    assert.equal(row.session_id, "sess-T");
+    assert.equal(row.open, false);
+    assert.equal(
+      row.stop_at,
+      (await auditTail(root, 1)).entries.at(-1)?.timestamp ?? row.stop_at,
+      "stop_at reports the LAST turn boundary",
+    );
+    assert.equal(row.receipt.recalls_strong, 2);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a cycle survives foreign boots interleaved between its own stop rows", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-interleave-"));
+  try {
+    await ensureVault(root);
+    await recordAudit(root, {
+      tool: "hook_session_start",
+      summary: "boot sess-M",
+      details: { daemon_ok: true },
+    });
+    await recordAudit(root, {
+      tool: "hook_stop",
+      summary: "stop sess-M",
+      details: { candidates: 0 },
+    });
+    // Subagent / sibling-session boots land in the SAME vault log mid-cycle.
+    await recordAudit(root, {
+      tool: "hook_session_start",
+      summary: "boot sub-1",
+      details: { daemon_ok: true },
+    });
+    await recordAudit(root, {
+      tool: "hook_session_start",
+      summary: "boot sub-2",
+      details: { daemon_ok: true },
+    });
+    // The parent keeps working and stops again — proof it outlived them.
+    await recordAudit(root, {
+      tool: "hook_user_prompt_submit",
+      summary: "post-subagent turn",
+      details: { recall_strong: true, session_id: "sess-M" },
+    });
+    await recordAudit(root, {
+      tool: "hook_stop",
+      summary: "stop sess-M",
+      details: { candidates: 4 },
+    });
+
+    const receipt = await sessionReceipt(root, "sess-M");
+    assert.equal(
+      receipt.recalls_strong,
+      1,
+      "work after an interleaved foreign boot still belongs to this cycle",
+    );
+    assert.equal(receipt.candidates_drafted, 4);
+
+    const rows = await listSessions(root, 10);
+    const parent = rows.find((r) => r.session_id === "sess-M");
+    assert.ok(parent);
+    assert.equal(parent.open, false, "the parent's last stop closes it");
+    assert.equal(parent.receipt.recalls_strong, 1);
+    // The subagent boots are still their own rows, and stay empty.
+    assert.equal(rows.find((r) => r.session_id === "sub-1")?.receipt.learns, 0);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a re-boot of the same id still splits cycles even when both cycles stop", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-reboot-split-"));
+  try {
+    await ensureVault(root);
+    // Cycle 1: one recall, one stop.
+    await recordAudit(root, {
+      tool: "hook_session_start",
+      summary: "boot sess-S",
+      details: { daemon_ok: true },
+    });
+    await recordAudit(root, {
+      tool: "hook_user_prompt_submit",
+      summary: "cycle one turn",
+      details: { recall_strong: true, session_id: "sess-S" },
+    });
+    await recordAudit(root, {
+      tool: "hook_stop",
+      summary: "stop sess-S",
+      details: { candidates: 1 },
+    });
+    // Cycle 2: SAME id re-booted, its own work and stop.
+    await recordAudit(root, {
+      tool: "hook_session_start",
+      summary: "boot sess-S",
+      details: { daemon_ok: true },
+    });
+    await recordAudit(root, {
+      tool: "minni_learn",
+      summary: "cycle two learn",
+      details: { ok: true },
+    });
+    await recordAudit(root, {
+      tool: "hook_stop",
+      summary: "stop sess-S",
+      details: { candidates: 9 },
+    });
+
+    const rows = await listSessions(root, 10);
+    assert.equal(rows.length, 2, "two boot cycles still yield two rows");
+    const [newest, oldest] = rows;
+    assert.equal(
+      oldest.receipt.candidates_drafted,
+      1,
+      "cycle one must NOT swallow cycle two's stop",
+    );
+    assert.equal(oldest.receipt.learns, 0, "cycle two's learn is not cycle one's");
+    assert.equal(newest.receipt.candidates_drafted, 9);
+    assert.equal(newest.receipt.learns, 1);
+
+    // sessionReceipt targets the LATEST cycle only.
+    const receipt = await sessionReceipt(root, "sess-S");
+    assert.equal(receipt.candidates_drafted, 9);
+    assert.equal(receipt.recalls_strong, 0, "cycle one's recall stays behind");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("an orphaned cycle is still cut at the foreign boot when it never stops", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-orphan-guard-"));
+  try {
+    await ensureVault(root);
+    // Session D boots and dies with no stop row of its own.
+    await recordAudit(root, {
+      tool: "hook_session_start",
+      summary: "boot sess-D",
+      details: { daemon_ok: true },
+    });
+    await recordAudit(root, {
+      tool: "minni_learn",
+      summary: "D learn",
+      details: { ok: true },
+    });
+    // Successor E boots, works, stops — none of it may leak backwards into D.
+    await recordAudit(root, {
+      tool: "hook_session_start",
+      summary: "boot sess-E",
+      details: { daemon_ok: true },
+    });
+    await recordAudit(root, {
+      tool: "hook_user_prompt_submit",
+      summary: "E turn",
+      details: { recall_strong: true, session_id: "sess-E" },
+    });
+    await recordAudit(root, {
+      tool: "hook_stop",
+      summary: "stop sess-E",
+      details: { candidates: 7 },
+    });
+
+    const rows = await listSessions(root, 10);
+    const d = rows.find((r) => r.session_id === "sess-D");
+    assert.ok(d);
+    assert.equal(d.open, true, "D never stopped, so it stays open");
+    assert.equal(d.stop_at, null);
+    assert.equal(d.receipt.learns, 1, "D keeps its own learn");
+    assert.equal(d.receipt.recalls_strong, 0, "D must not absorb E's recall");
+    assert.equal(d.receipt.candidates_drafted, 0, "D must not absorb E's stop");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});

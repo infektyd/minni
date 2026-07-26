@@ -1386,14 +1386,29 @@ function isStopMarkerFor(summary: string, sessionId: string): boolean {
 }
 
 /**
- * Close a boot→stop attribution window opened at `windowStart`. The window ends
- * INCLUSIVE of the first row that is a stop marker for one of `ownSessionIds`
- * (our own `stop <id>`, bare or legacy-suffixed — its candidates tally belongs
- * to this session), or EXCLUSIVE at any OTHER session's boot/stop marker (a
- * session that died without a stop row must not absorb its successors).
- * `stopIndex` is the own-stop row index, or -1 when the window ran to the tail
- * end (or was cut short by a foreign marker) — i.e. an open, never-stopped
- * session.
+ * Close a boot→stop attribution window opened at `windowStart`.
+ *
+ * A boot cycle owns MANY stop rows, not one. Claude Code (and every runtime
+ * that maps Stop to end-of-turn rather than end-of-session) fires the Stop hook
+ * on every assistant turn, so a single `boot <id>` is followed by a `stop <id>`
+ * per turn. Ending the window at the FIRST own-stop made every receipt after
+ * turn one re-report turn one, and marked a live session closed at its first
+ * turn boundary. So the window runs to the LAST own-stop instead.
+ *
+ * Three marker classes, deliberately not treated alike:
+ *  - own STOP → window extends INCLUSIVE of it, and scanning continues; the
+ *    last one wins, and `stopIndex` names it.
+ *  - own BOOT → hard end, EXCLUSIVE: a re-boot of the same id starts a new
+ *    cycle, and a reused session id must yield one row per cycle.
+ *  - foreign boot/stop → a SOFT cut. Subagent and sibling-session lifecycles
+ *    interleave into the same vault log, so a foreign marker alone must not
+ *    truncate a cycle that demonstrably continues past it. It only ends the
+ *    window when NO own-stop follows — preserving the original guarantee that
+ *    a session which died without a stop row cannot absorb its successors.
+ *
+ * `stopIndex` is the last own-stop row index, or -1 when the cycle never
+ * stopped (ran to the tail end, or was cut short by a foreign marker) — i.e.
+ * an open session.
  */
 function closeWindow(
   parsed: ParsedAuditEntry[],
@@ -1402,21 +1417,30 @@ function closeWindow(
 ): { end: number; stopIndex: number } {
   let end = parsed.length;
   let stopIndex = -1;
+  // First foreign marker seen since the last own-stop; only applied if the
+  // cycle never stops after it.
+  let foreignCut = -1;
   for (let i = windowStart + 1; i < parsed.length; i += 1) {
     const summary = parsed[i].summary;
     if (ownSessionIds.some((id) => isStopMarkerFor(summary, id))) {
       end = i + 1;
       stopIndex = i;
-      break;
+      // An own-stop past a foreign marker proves the cycle outlived it.
+      foreignCut = -1;
+      continue;
     }
-    // Foreign marker: a boot (always plain `boot <id>` on this path) or a stop
-    // whose id did NOT match ours under the boundary rule above. Either way the
-    // window ends here, exclusively.
-    if (summary.startsWith("boot ") || summary.startsWith("stop ")) {
-      end = i;
-      break;
+    if (ownSessionIds.some((id) => summary === `boot ${id}`)) {
+      // Same id booted again: this cycle is over, exclusively, and nothing
+      // after it belongs to us even if a later `stop <id>` shows up. With no
+      // own-stop at all, an earlier foreign marker still cuts first.
+      if (stopIndex === -1) end = foreignCut !== -1 ? foreignCut : i;
+      return { end, stopIndex };
+    }
+    if (foreignCut === -1 && (summary.startsWith("boot ") || summary.startsWith("stop "))) {
+      foreignCut = i;
     }
   }
+  if (stopIndex === -1 && foreignCut !== -1) end = foreignCut;
   return { end, stopIndex };
 }
 
@@ -1518,7 +1542,9 @@ export async function sessionReceipt(
   // session_id-stamped details, so use them to (a) attribute pre-stamp entries
   // and (b) define a boot→stop window that catches everything in between. The
   // window opens at the LAST `boot <sessionId>` (a resumed session reboots) and
-  // closes at the next `stop <sessionId>` (or the tail end).
+  // closes at the LAST `stop <sessionId>` of that cycle (or the tail end) —
+  // per-turn Stop hooks emit several, and stopping at the first would freeze
+  // the receipt at turn one. See closeWindow.
   //
   // Attribution model (one rule, not three): the LAST boot marker opens the
   // window — the session's current cycle. Prefer the exact `boot <sessionId>`;
@@ -1592,10 +1618,13 @@ export interface SessionSummary {
  * Enumerate recent session boot cycles from the rolling log.md. Strictly
  * read-only: never calls ensureVault, never creates files — a missing log.md
  * yields []. Every `boot <id>` marker opens a window closed by the same rules
- * sessionReceipt uses (own `stop <id>`, bare or legacy-suffixed, inclusive; any
- * other session's boot/stop
- * exclusive; tail end → open). A reused session id booted twice yields two rows.
- * Newest-first (latest boot leads), capped at `limit`.
+ * sessionReceipt uses (see closeWindow: the cycle's LAST own `stop <id>`, bare
+ * or legacy-suffixed, inclusive; a re-boot of the same id exclusive; a foreign
+ * boot/stop only when no own-stop follows it; tail end → open). `stop_at`
+ * therefore reports the most recent turn boundary, which on per-turn Stop
+ * runtimes is the freshest evidence the session was alive. A reused session id
+ * booted twice yields two rows. Newest-first (latest boot leads), capped at
+ * `limit`.
  */
 export async function listSessions(
   vaultPath: string,
