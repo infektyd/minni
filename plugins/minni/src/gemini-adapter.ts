@@ -2,23 +2,25 @@
 // no side effects — the gemini-hook.ts entrypoint composes these around the
 // shared createHookHandlers factory, and tests import them directly.
 //
-// The agy CLI (Antigravity CLI) loads Claude Code-style hooks.json manifests
-// from ~/.gemini/config/plugins/<name>/hooks.json, but its hook PROTOCOL is
-// not Claude Code's (all of this verified live against agy 1.0.15 on
-// 2026-07-03; payload capture in the #133 investigation):
-//   - Only PreToolUse, PostToolUse and Stop events exist. SessionStart,
-//     UserPromptSubmit and PreCompact are not in the binary's event set.
+// agy's hook protocol is NOT Claude Code's, and its manifest format is not
+// either -- see hooks-gemini.json and docs/contracts/hook-platforms.md.
+// Re-verified against agy 1.1.7 and https://antigravity.google/docs/hooks;
+// the previous "verified live, agy 1.0.15" notes here were stale and two of
+// them were affirmatively wrong.
+//   - Events are PreToolUse, PostToolUse, PreInvocation, PostInvocation, Stop
+//     and (undocumented but real) SessionStart. There is NO UserPromptSubmit
+//     and NO PreCompact; PreInvocation is the prompt-submit analogue.
 //   - The stdin payload has agy's own field names: conversationId (not
 //     session_id), toolCall {name, args} (not tool_name/tool_input),
 //     workspacePaths (not cwd), plus stepIdx/modelName/transcriptPath/
 //     artifactDirectoryPath.
 //   - Tool names are agy-native (e.g. "run_command", args {CommandLine, Cwd}),
 //     not Claude Code's ("Bash", args {command}).
-//   - PreToolUse hooks must print a NON-EMPTY decision: agy 1.0.15's
-//     permission manager errors on empty decision strings (fixed upstream
-//     after 1.0.15, per the agy changelog). The accepted allow value is
-//     "approve" (verified live); "block" is the deny value from the same
-//     legacy Claude Code decision vocabulary agy borrows from.
+//   - PreToolUse hooks must print a NON-EMPTY decision; an empty one is
+//     rejected and denies the call.
+//   - The decision enum is agy's own: "allow" | "deny" | "ask" | "force_ask".
+//     Claude Code's "approve"/"block" are NOT accepted -- agy fails the step
+//     outright with: unknown pre-tool hook decision "approve".
 import { open, stat } from "node:fs/promises";
 
 import type { PreToolUseDecisionOutput } from "./recall-guard.js";
@@ -92,18 +94,17 @@ export function adaptAgyPayload(
 }
 
 /**
- * agy's PreToolUse decision shape. Minimal on purpose: "approve" is the only
- * live-verified allow value on 1.0.15, and extra fields risk tripping a parser
- * that already errors on empty decisions.
+ * agy's PreToolUse decision shape. Minimal on purpose: extra fields risk
+ * tripping a parser that already errors on empty decisions.
  */
 export interface AgyPreToolDecision {
-  decision: "approve" | "block";
+  decision: "allow" | "deny" | "ask" | "force_ask";
   reason?: string;
 }
 
 /** The always-safe allow. PreToolUse must NEVER emit an empty/absent decision. */
-export function agyApprove(): AgyPreToolDecision {
-  return { decision: "approve" };
+export function agyAllow(): AgyPreToolDecision {
+  return { decision: "allow" };
 }
 
 /**
@@ -116,17 +117,63 @@ export function adaptPreToolUseOutput(
 ): AgyPreToolDecision {
   if (output.hookSpecificOutput?.permissionDecision === "deny") {
     return {
-      decision: "block",
+      decision: "deny",
       reason: output.hookSpecificOutput.permissionDecisionReason,
     };
   }
-  return agyApprove();
+  return agyAllow();
 }
 
 /** Never read more than this much transcript tail; sessions can grow unbounded. */
 const TRANSCRIPT_TAIL_BYTES = 4 * 1024 * 1024;
 /** handleStop truncates its task to 200 chars; a small margin keeps this cheap. */
 const LAST_USER_MESSAGE_MAX = 400;
+
+/**
+ * Mine the last explicit user message from an agy transcript_full.jsonl.
+ * Best-effort: any miss (no path, unreadable file, format drift) returns "".
+ */
+async function lastUserMessageFromTranscript(transcriptPath: string): Promise<string> {
+  let tail: string;
+  try {
+    const info = await stat(transcriptPath);
+    if (!info.isFile() || info.size === 0) return "";
+    const start = Math.max(0, info.size - TRANSCRIPT_TAIL_BYTES);
+    const handle = await open(transcriptPath, "r");
+    try {
+      const length = info.size - start;
+      const buffer = Buffer.alloc(length);
+      await handle.read(buffer, 0, length, start);
+      tail = buffer.toString("utf8");
+    } finally {
+      await handle.close();
+    }
+  } catch {
+    return "";
+  }
+
+  const lines = tail.split("\n");
+  // A mid-file start offset can leave a partial first line; JSON.parse below
+  // rejects it naturally, so no special-casing is needed.
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i].trim();
+    if (!line) continue;
+    let entry: Record<string, unknown>;
+    try {
+      entry = JSON.parse(line) as Record<string, unknown>;
+    } catch {
+      continue;
+    }
+    if (entry.source !== "USER_EXPLICIT" || entry.type !== "USER_INPUT") continue;
+    const content = asString(entry.content);
+    if (!content) continue;
+    const request = /<USER_REQUEST>\s*([\s\S]*?)\s*<\/USER_REQUEST>/.exec(content);
+    const message = (request?.[1] ?? content).trim();
+    if (!message) continue;
+    return message.slice(0, LAST_USER_MESSAGE_MAX);
+  }
+  return "";
+}
 
 /**
  * Codex review (PR #134): agy's Stop payload carries no task text, so the
@@ -148,44 +195,28 @@ export async function enrichAgyStopPayload(
   }
   const transcriptPath = asString(payload.transcriptPath);
   if (!transcriptPath) return payload;
+  const message = await lastUserMessageFromTranscript(transcriptPath);
+  if (!message) return payload;
+  return { ...payload, last_user_message: message };
+}
 
-  let tail: string;
-  try {
-    const info = await stat(transcriptPath);
-    if (!info.isFile() || info.size === 0) return payload;
-    const start = Math.max(0, info.size - TRANSCRIPT_TAIL_BYTES);
-    const handle = await open(transcriptPath, "r");
-    try {
-      const length = info.size - start;
-      const buffer = Buffer.alloc(length);
-      await handle.read(buffer, 0, length, start);
-      tail = buffer.toString("utf8");
-    } finally {
-      await handle.close();
-    }
-  } catch {
+/**
+ * PreInvocation is agy's prompt-submit analogue, but its stdin schema has no
+ * `prompt` field — only invocation counters plus common metadata (including
+ * transcriptPath). Without mining the transcript, handleUserPromptSubmit
+ * sees an empty prompt and returns noIntent on every real agy turn, so the
+ * per-turn recall pointer never writes. Surface the last user message as
+ * `prompt` (the field the shared handler reads).
+ */
+export async function enrichAgyPromptPayload(
+  payload: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
+  if (asString(payload.prompt) || asString(payload.user_prompt)) {
     return payload;
   }
-
-  const lines = tail.split("\n");
-  // A mid-file start offset can leave a partial first line; JSON.parse below
-  // rejects it naturally, so no special-casing is needed.
-  for (let i = lines.length - 1; i >= 0; i--) {
-    const line = lines[i].trim();
-    if (!line) continue;
-    let entry: Record<string, unknown>;
-    try {
-      entry = JSON.parse(line) as Record<string, unknown>;
-    } catch {
-      continue;
-    }
-    if (entry.source !== "USER_EXPLICIT" || entry.type !== "USER_INPUT") continue;
-    const content = asString(entry.content);
-    if (!content) continue;
-    const request = /<USER_REQUEST>\s*([\s\S]*?)\s*<\/USER_REQUEST>/.exec(content);
-    const message = (request?.[1] ?? content).trim();
-    if (!message) continue;
-    return { ...payload, last_user_message: message.slice(0, LAST_USER_MESSAGE_MAX) };
-  }
-  return payload;
+  const transcriptPath = asString(payload.transcriptPath);
+  if (!transcriptPath) return payload;
+  const message = await lastUserMessageFromTranscript(transcriptPath);
+  if (!message) return payload;
+  return { ...payload, prompt: message };
 }

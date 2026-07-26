@@ -212,3 +212,4 @@ scripts/run_harvest.py
 # Excalidraw scratch diagrams
 *.excalidraw
 .worktrees/
+.venv

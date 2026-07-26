@@ -35,6 +35,18 @@ export interface AuditEntry {
   summary: string;
   details?: Record<string, unknown>;
   timestamp?: Date;
+  /**
+   * Overrides `tool` as the throttle bucket.
+   *
+   * The 5s window exists to collapse REPEATS of one event, and `tool` is
+   * normally a faithful stand-in for the event (`hook_stop`, `hook_session_start`).
+   * It is not for intent drops: every drop on a platform writes the SAME tool
+   * (`hook_<agent>_intent_dropped`) whatever event produced it, so a Stop drop
+   * landing within 5s of a UserPromptSubmit drop was silently swallowed -- and
+   * recordAudit returns a path either way, so the caller's catch never fires.
+   * That is the precise silent-failure class this module exists to end.
+   */
+  throttleKey?: string;
 }
 
 // PR-2: Status lifecycle for vault pages
@@ -658,20 +670,6 @@ function shouldThrottleAudit(entry: AuditEntry): boolean {
   return entry.tool.startsWith("hook_") && !isExemptFromAuditThrottle(entry);
 }
 
-/**
- * Rate-limit stamp file name. Keyed per (agent, TOOL), not per agent: a single
- * per-agent stamp let ANY hook_* line suppress an unrelated one for 5s, and in
- * the normal turn shape (UserPromptSubmit then Stop in the same second) the
- * later, more important breadcrumb was the one that lost. Per-tool keying
- * keeps the cap exactly where the flooding came from — a high-frequency event
- * like `hook_*_pretooluse_guard`, which fires once per tool call, is still
- * collapsed to one line per 5s — while making the events independent.
- */
-function auditStampName(agentId: string, tool: string): string {
-  const safe = (value: string): string => value.replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 80);
-  return `${safe(agentId) || "agent"}__${safe(tool) || "tool"}.ts`;
-}
-
 export async function recordAudit(
   vaultPath: string,
   entry: AuditEntry,
@@ -680,12 +678,24 @@ export async function recordAudit(
   return withAuditLock(vaultPath, async () => {
   const timestamp = entry.timestamp ?? new Date();
 
-  // --- 1. Per-(agent, tool) rate-limiting ---
+  // --- 1. Per-(agent, event) rate-limiting ---
+  // Key the throttle per (agent, EVENT), not per agent. A single per-agent
+  // window meant a burst of DIFFERENT events collapsed into one record: agy
+  // fires SessionStart and PreInvocation in the same second, so PreInvocation
+  // was never audited at all and looked like it had never dispatched. That
+  // cost real debugging time. Duplicate suppression is still per event.
+  // `entry.throttleKey` lets intent_dropped audits bucket by event even when
+  // they share a tool name. Stop breadcrumbs remain exempt via
+  // isExemptFromAuditThrottle above.
   const agentId = getAgentIdFromVaultPath(vaultPath);
   const homeDir = process.env.MINNI_HOME ?? path.join(os.homedir(), ".minni");
   const rateLimitDir = path.join(homeDir, ".hook-audit-ts");
   await mkdir(rateLimitDir, { recursive: true });
-  const tsPath = path.join(rateLimitDir, auditStampName(agentId, entry.tool ?? ""));
+  const throttleKey = `${agentId}__${entry.throttleKey ?? entry.tool}`.replace(
+    /[^A-Za-z0-9_-]/g,
+    "_",
+  );
+  const tsPath = path.join(rateLimitDir, `${throttleKey}.ts`);
 
   let lastTime: number | undefined;
   try {

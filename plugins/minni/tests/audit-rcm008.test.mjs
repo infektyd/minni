@@ -20,33 +20,42 @@ test("RCM-008: hook rate-limiting drops duplicate hook audit entries without fai
 
     await ensureVault(root);
 
-    // The limiter is keyed per (agent, TOOL) — a per-agent key let any hook_*
-    // line suppress an unrelated one, which silently ate the Stop governance
-    // breadcrumb. Flooding is still capped, so the duplicate here is the SAME
-    // tool firing three times inside/around one window.
     const now = new Date();
     await recordAudit(root, {
-      tool: "hook_user_prompt_submit",
+      tool: "hook_session_start",
       summary: "First audit",
       timestamp: now,
     });
 
+    // Same event again, inside the window: a genuine duplicate -> dropped.
     await recordAudit(root, {
-      tool: "hook_user_prompt_submit",
+      tool: "hook_session_start",
       summary: "Second audit too fast",
       timestamp: new Date(now.getTime() + 2000),
     });
 
-    const okPath = await recordAudit(root, {
+    // A DIFFERENT event inside the window must survive. The throttle used to
+    // key on the agent alone, so a burst of distinct events collapsed into
+    // one record -- on agy, SessionStart and PreInvocation fire in the same
+    // second, so PreInvocation was never audited and looked like it had never
+    // dispatched at all. Distinct events are not duplicates.
+    await recordAudit(root, {
       tool: "hook_user_prompt_submit",
+      summary: "Distinct event in window",
+      timestamp: new Date(now.getTime() + 2000),
+    });
+
+    const okPath = await recordAudit(root, {
+      tool: "hook_session_start",
       summary: "Third audit ok",
-      timestamp: new Date(now.getTime() + 5000),
+      timestamp: new Date(now.getTime() + 8000),
     });
     assert.ok(okPath);
 
     const log = await readFile(path.join(root, "log.md"), "utf8");
     assert.match(log, /First audit/);
     assert.doesNotMatch(log, /Second audit too fast/);
+    assert.match(log, /Distinct event in window/);
     assert.match(log, /Third audit ok/);
   } finally {
     if (origBypass === undefined) delete process.env.MINNI_BYPASS_AUDIT_LIMIT;
@@ -74,13 +83,9 @@ test("RCM-008: hook rate-limiting timestamp file has strict permissions", async 
 
     await ensureVault(root);
 
-    // The limiter is keyed per (agent, TOOL) — a per-agent key let any hook_*
-    // line suppress an unrelated one, which silently ate the Stop governance
-    // breadcrumb. Flooding is still capped, so the duplicate here is the SAME
-    // tool firing three times inside/around one window.
     const now = new Date();
     await recordAudit(root, {
-      tool: "hook_user_prompt_submit",
+      tool: "hook_session_start",
       summary: "First audit",
       timestamp: now,
     });
@@ -92,14 +97,15 @@ test("RCM-008: hook rate-limiting timestamp file has strict permissions", async 
     });
 
     const okPath = await recordAudit(root, {
-      tool: "hook_user_prompt_submit",
+      tool: "hook_pre_compact",
       summary: "Third audit ok",
       timestamp: new Date(now.getTime() + 5000),
     });
     assert.ok(okPath);
 
-    // Verify rate limit file has mode 0o600 (on UNIX platforms)
-    const agentTsFile = path.join(home, ".hook-audit-ts", "rate-limit__hook_user_prompt_submit.ts");
+    // Verify rate limit file has mode 0o600 (on UNIX platforms).
+    // The throttle key is per (agent, event), so the filename carries both.
+    const agentTsFile = path.join(home, ".hook-audit-ts", "rate-limit__hook_session_start.ts");
     const st = await stat(agentTsFile);
     if (process.platform !== "win32") {
       const mode = st.mode & 0o777;
@@ -337,5 +343,56 @@ test("RCM-008/Status: buildStatusReport returns correct audit volume in bytes", 
     assert.equal(report.audit.volume, 1234);
   } finally {
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("two intent drops on DIFFERENT events both survive the 5s window", async () => {
+  // Found by adversarial review (2026-07-25). The throttle buckets on
+  // `entry.tool`, which is a fine stand-in for the event on normal hook audits
+  // (hook_stop, hook_session_start) but NOT for drops: every drop on a platform
+  // writes the same `hook_<agent>_intent_dropped` tool whatever event produced
+  // it. So a Stop drop landing within 5s of a UserPromptSubmit drop was
+  // swallowed -- and recordAudit returns a path either way, so the caller's
+  // try/catch never saw it. Losing the record that memory failed to land is the
+  // exact silent failure this whole module exists to end.
+  const root = await mkdtemp(path.join(tmpdir(), "drop-throttle-vault-"));
+  const home = await mkdtemp(path.join(tmpdir(), "sm-home-"));
+
+  const origBypass = process.env.MINNI_BYPASS_AUDIT_LIMIT;
+  const origHome = process.env.MINNI_HOME;
+
+  try {
+    process.env.MINNI_BYPASS_AUDIT_LIMIT = "false";
+    process.env.MINNI_HOME = home;
+    await ensureVault(root);
+
+    const now = new Date();
+    const drop = async (event, offsetMs) =>
+      recordAudit(root, {
+        tool: "hook_cursor_intent_dropped",
+        summary: `${event}: cursor cannot carry this`,
+        throttleKey: `hook_cursor_intent_dropped__${event}`,
+        timestamp: new Date(now.getTime() + offsetMs),
+      });
+
+    await drop("UserPromptSubmit", 0);
+    await drop("Stop", 1000);
+
+    const log = await readFile(path.join(root, "log.md"), "utf8");
+    assert.match(log, /UserPromptSubmit: cursor cannot carry this/);
+    assert.match(log, /Stop: cursor cannot carry this/, "the second drop must survive");
+
+    // A genuine repeat of the SAME event inside the window is still collapsed.
+    await drop("Stop", 2000);
+    const after = await readFile(path.join(root, "log.md"), "utf8");
+    const stops = [...after.matchAll(/Stop: cursor cannot carry this/g)];
+    assert.equal(stops.length, 1, "duplicate suppression must still work per event");
+  } finally {
+    if (origBypass === undefined) delete process.env.MINNI_BYPASS_AUDIT_LIMIT;
+    else process.env.MINNI_BYPASS_AUDIT_LIMIT = origBypass;
+    if (origHome === undefined) delete process.env.MINNI_HOME;
+    else process.env.MINNI_HOME = origHome;
+    await rm(root, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true });
   }
 });

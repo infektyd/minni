@@ -1,7 +1,10 @@
-// Shared hook plumbing (review panel, plan-parity follow-up): the four hook
-// entrypoints (hook.ts, codex-hook.ts, grok-hook.ts, kilocode-hook.ts) share
-// this protocol boilerplate byte-for-byte. Per-hook differences are only the
-// config constants and the handler implementations — keep them there.
+// Shared hook plumbing: stdin/stdout leaf helpers common to every entrypoint
+// (hook.ts, codex-hook.ts, grok-hook.ts, kilocode-hook.ts, cursor-hook.ts).
+//
+// Only genuinely platform-NEUTRAL helpers belong here. Anything describing what
+// a platform accepts on the wire goes in hook-platform.ts — this module used to
+// hold Claude Code's output shape and quietly made it everyone's. Per-hook
+// differences stay in the entrypoints and factory handlers.
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -249,12 +252,7 @@ export function vaultRecallToBody(vault: VaultSearchResult[]): unknown {
   }));
 }
 
-export function withHookContext(event: EnvelopeEvent, additionalContext: string): HookOutput {
-  return {
-    continue: true,
-    hookSpecificOutput: {
-      hookEventName: event,
-      additionalContext,
-    },
-  };
-}
+// `withHookContext` used to live here and hard-coded Claude Code's
+// `hookSpecificOutput` envelope for EVERY platform. That is what silently voided
+// Codex's PreCompact output and threw away Grok Build's memory entirely.
+// Building that envelope is now a per-platform decision: see hook-platform.ts.

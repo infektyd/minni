@@ -11,12 +11,13 @@ from pathlib import Path
 from minni.wire.manifest import PayloadManifest, dev_version, sha256_file, utc_now_iso
 
 PAYLOAD_ITEMS = (
-    "dist", ".claude-plugin", ".codex-plugin", ".gemini-plugin", ".kilocode-plugin",
-    ".mcp.json", "commands", "hooks", "skills", "README.md",
+    "dist", ".claude-plugin", ".codex-plugin", ".cursor-plugin", ".gemini-plugin",
+    ".kilocode-plugin", ".mcp.json", "commands", "hooks", "skills", "README.md",
 )
 MANIFEST_STAMP_PATHS = (
     ".claude-plugin/plugin.json",
     ".codex-plugin/plugin.json",
+    ".cursor-plugin/plugin.json",
     ".kilocode-plugin/plugin.json",
     ".gemini-plugin/gemini-extension.json",
 )

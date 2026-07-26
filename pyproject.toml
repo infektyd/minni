@@ -57,7 +57,12 @@ Issues = "https://github.com/infektyd/minni/issues"
 Security = "https://github.com/infektyd/minni/blob/main/SECURITY_PLAN.md"
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+# The installer's tests live next to the installer, not under tests/. They were
+# never collected, so the propagate.py suites -- including the ones pinning the
+# Kilo "environment" key that bricks the host CLI when wrong -- passed locally
+# and ran nowhere. Collect both roots; CI runs bare `pytest` so this list is the
+# single source of truth.
+testpaths = ["tests", "plugins/minni/skills/minni-install/scripts"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -86,6 +91,7 @@ minni = [
     "plugin_payload/hooks/*",
     "plugin_payload/.claude-plugin/*",
     "plugin_payload/.codex-plugin/*",
+    "plugin_payload/.cursor-plugin/*",
     "plugin_payload/.gemini-plugin/*",
     "plugin_payload/.gemini-plugin/skills/sovereign-memory/*",
     "plugin_payload/.kilocode-plugin/*",

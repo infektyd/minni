@@ -146,10 +146,18 @@ async function requireSharedGate(
   );
 }
 
-const server = new McpServer({
-  name: "minni",
-  version: "0.1.0",
-});
+// Defined in ./mcp-instructions.ts -- a leaf module with no side effects, so a
+// test can import the SHIPPED value without constructing this server.
+import { MINNI_INSTRUCTIONS } from "./mcp-instructions.js";
+export { MINNI_INSTRUCTIONS };
+
+const server = new McpServer(
+  {
+    name: "minni",
+    version: "0.1.0",
+  },
+  { instructions: MINNI_INSTRUCTIONS },
+);
 
 server.registerTool(
   "minni_prepare_task",

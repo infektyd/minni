@@ -340,6 +340,34 @@ export const GROK_CONTEXT_WINDOW = (() => {
   return Number.isFinite(raw) && raw > 0 ? raw : 256_000;
 })();
 
+// --- Cursor agent defaults ---
+// Cursor launches plugin hooks outside the MCP server environment, so this
+// identity stays independent of both the generic MCP variables and Claude Code.
+// Workspace is fail-closed ("workspace-unknown") rather than cwd-derived, to
+// match the Codex adapter: an unstamped hook process must not silently claim a
+// workspace it cannot prove.
+
+export const CURSOR_AGENT_ID =
+  process.env.MINNI_CURSOR_AGENT_ID ?? "cursor";
+
+export const CURSOR_WORKSPACE_ID =
+  normalizeWorkspaceId(
+    process.env.MINNI_CURSOR_WORKSPACE_ID ?? "workspace-unknown"
+  );
+
+export const CURSOR_VAULT_PATH = expandTilde(
+  process.env.MINNI_CURSOR_VAULT_PATH ??
+    path.join(os.homedir(), ".minni", "cursor-vault"),
+);
+
+export const CURSOR_HOOKS_ENABLED =
+  (process.env.MINNI_CURSOR_HOOKS ?? "on").toLowerCase() !== "off";
+
+export const CURSOR_CONTEXT_WINDOW = (() => {
+  const raw = Number(process.env.CURSOR_CONTEXT_WINDOW ?? process.env.MINNI_CURSOR_CONTEXT_WINDOW);
+  return Number.isFinite(raw) && raw > 0 ? raw : 200_000;
+})();
+
 // --- Gemini / Antigravity agent defaults ---
 // One agent identity ("gemini") across the Antigravity family: the agy CLI,
 // Antigravity 2.0, and the Antigravity IDE all share the ~/.gemini tree and

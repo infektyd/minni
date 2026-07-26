@@ -23,6 +23,7 @@ import {
   readStdin,
   VALID_EVENTS,
 } from "./hook-utils.js";
+import { claudeCodeWire } from "./hook-platform.js";
 import type { HookOutput } from "./hook-utils.js";
 import { handleStopCore } from "./hook-handlers.js";
 import type { StopCoreConfig } from "./hook-handlers.js";
@@ -531,6 +532,7 @@ const CLAUDECODE_STOP_CONFIG: StopCoreConfig = {
   defaultWorkspaceId: CLAUDECODE_WORKSPACE_ID,
   auditPrefix: "hook",
   stopCommitHint: "Use /minni:learn to commit.",
+  wire: claudeCodeWire,
 };
 
 async function handleStop(payload: Record<string, unknown>): Promise<HookOutput> {

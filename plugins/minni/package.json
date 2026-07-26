@@ -18,6 +18,7 @@
     "dist",
     ".claude-plugin",
     ".codex-plugin",
+    ".cursor-plugin",
     ".gemini-plugin",
     ".kilocode-plugin",
     ".mcp.json",
