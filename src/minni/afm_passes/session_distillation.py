@@ -56,6 +56,7 @@ def _recent_events(db, lookback_hours: int, agent_id: Optional[str] = None) -> L
                 SELECT event_id, agent_id, event_type, content, task_id, thread_id, metadata, created_at
                 FROM episodic_events
                 WHERE created_at >= ? AND agent_id = ?
+                  AND event_type != 'recall'
                 ORDER BY created_at DESC
                 LIMIT 100
                 """,
@@ -67,6 +68,7 @@ def _recent_events(db, lookback_hours: int, agent_id: Optional[str] = None) -> L
                 SELECT event_id, agent_id, event_type, content, task_id, thread_id, metadata, created_at
                 FROM episodic_events
                 WHERE created_at >= ?
+                  AND event_type != 'recall'
                 ORDER BY created_at DESC
                 LIMIT 100
                 """,

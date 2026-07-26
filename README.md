@@ -114,7 +114,9 @@ Want proof agents are actually using memory? `minni watch` tails every
 recall, learn, and guard decision live in the terminal, and the web console
 (`npm run console` in `plugins/minni`) adds per-session receipts and a live
 activity feed in the browser — see
-[docs/runtime-integration.md](docs/runtime-integration.md#console-observability).
+[docs/runtime-integration.md](docs/runtime-integration.md#console-observability)
+and
+[docs/runtime-integration.md](docs/runtime-integration.md#observability-minni-watch).
 
 ## Architecture at a glance
 
