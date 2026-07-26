@@ -8,6 +8,7 @@ Unix socket is.
     minni status    show daemon and engine health in plain language
     minni doctor    verify the install end to end (same probes as CI's smoke)
     minni wire      wire the plugin payload to an agent platform
+    minni watch     live tail of memory activity (audit trail + daemon events)
     minni down      stop the daemon
 
 Packaging-only surface (PACKAGING_PLAN.md §3): this module is stdlib-only and
@@ -22,6 +23,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import signal
 import socket
 import stat
@@ -256,6 +258,41 @@ def cmd_wire(args: argparse.Namespace) -> int:
     return run_wire(args)
 
 
+def cmd_watch(args: argparse.Namespace) -> int:
+    # watch.py is stdlib-only and strictly read-only, so the packaging
+    # contract of this module (no engine imports) is preserved.
+    from datetime import datetime, timedelta, timezone
+
+    from minni.watch import run_watch
+
+    if args.interval <= 0:
+        print("minni watch: --interval must be a positive number of seconds",
+              file=sys.stderr)
+        return 2
+
+    since = None
+    if args.since:
+        raw = args.since.strip()
+        match = re.fullmatch(r"(\d+)([smhd])", raw)
+        if match:
+            unit = {"s": "seconds", "m": "minutes",
+                    "h": "hours", "d": "days"}[match.group(2)]
+            since = (datetime.now(timezone.utc)
+                     - timedelta(**{unit: int(match.group(1))}))
+        else:
+            try:
+                since = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+                if since.tzinfo is None:
+                    since = since.replace(tzinfo=timezone.utc)
+            except ValueError:
+                print(f"minni watch: cannot parse --since {raw!r} "
+                      "(use e.g. 10m, 2h, or an ISO timestamp)",
+                      file=sys.stderr)
+                return 2
+    args.since = since
+    return run_watch(args)
+
+
 def cmd_doctor(args: argparse.Namespace) -> int:
     sock = Path(args.socket)
     print("minni doctor — verifying the install")
@@ -361,6 +398,20 @@ def main(argv: list[str] | None = None) -> int:
     wire.add_argument("--use-version", metavar="VER",
                       help="re-wire configs against an already-installed version dir")
 
+    watch = sub.add_parser(
+        "watch",
+        help="live tail of memory activity (audit trail + daemon events)")
+    watch.add_argument("--agent", help="only show events for this agent id")
+    watch.add_argument("--since", metavar="WHEN",
+                       help="only show events after WHEN (e.g. 10m, 2h, or "
+                       "an ISO timestamp)")
+    watch.add_argument("--json", action="store_true",
+                       help="emit one JSON object per event")
+    watch.add_argument("--once", action="store_true",
+                       help="print the current backlog and exit (no follow)")
+    watch.add_argument("--interval", type=float, default=1.0,
+                       help="poll interval in seconds (default: %(default)s)")
+
     args = parser.parse_args(argv)
     if not args.command:
         parser.print_help()
@@ -377,7 +428,8 @@ def main(argv: list[str] | None = None) -> int:
             return 2
 
     dispatch = {"up": cmd_up, "down": cmd_down,
-                "status": cmd_status, "doctor": cmd_doctor, "wire": cmd_wire}
+                "status": cmd_status, "doctor": cmd_doctor, "wire": cmd_wire,
+                "watch": cmd_watch}
     return dispatch[args.command](args)
 
 

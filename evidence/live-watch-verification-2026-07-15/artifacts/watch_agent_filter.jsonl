@@ -1,0 +1,3 @@
+{"ts": "2026-07-15T16:42:24.983Z", "agent": "mapped-bot", "tool": "minni_recall", "summary": "teammate lookup 3", "source": "plugin", "details": {"query": "teammate q3", "session_id": "sess-live-B"}}
+{"ts": "2026-07-15T16:42:49.076Z", "agent": "mapped-bot", "tool": "minni_recall", "summary": "teammate lookup 6", "source": "plugin", "details": {"query": "teammate q6", "session_id": "sess-live-B"}}
+{"ts": "2026-07-15T16:43:13.308Z", "agent": "mapped-bot", "tool": "minni_recall", "summary": "teammate lookup 9", "source": "plugin", "details": {"query": "teammate q9", "session_id": "sess-live-B"}}

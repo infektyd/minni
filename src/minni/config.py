@@ -138,6 +138,15 @@ class SovereignConfig:
     # Feedback demotion (PR-9)
     feedback_enabled: bool = True
 
+    # Durable recall trace: record every daemon `search` as a TTL'd episodic
+    # event (agent, truncated query, hit count, top score) so operators can
+    # verify memory use via `minni watch`. Default on; MINNI_RECALL_TRACE=off
+    # disables it for perf-sensitive setups.
+    recall_trace: bool = field(
+        default_factory=lambda: os.environ.get(
+            "MINNI_RECALL_TRACE", "on").lower() not in {"0", "false", "no", "off"}
+    )
+
     # Query expansion (PR-7)
     # "rule" is default-on; "afm" is opt-in per request until eval-gated.
     query_expand_default: str = "rule"
