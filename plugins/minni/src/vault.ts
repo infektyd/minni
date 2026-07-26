@@ -1293,6 +1293,389 @@ export async function auditReport(
   return report;
 }
 
+/**
+ * Per-session proof-of-use tally, emitted at Stop. Every field counts audit
+ * entries this session actually produced — the zero case is meaningful (proof
+ * the memory path was NOT exercised), so callers surface the receipt even when
+ * every count is 0.
+ */
+export interface SessionReceipt {
+  session_id: string;
+  entries: number;
+  recalls_strong: number;
+  recalls_weak: number;
+  guard_denied: number;
+  guard_allowed: number;
+  learns: number;
+  vault_writes: number;
+  candidates_drafted: number;
+}
+
+/**
+ * One parsed rolling-log entry: the `## [<ISO>] <tool> | <summary>` header plus
+ * an optional ```json details block. `timestamp` is the header's ISO stamp
+ * (null only when a hand-written entry omits it) — used to date session
+ * boot/stop markers.
+ */
+interface ParsedAuditEntry {
+  tool: string;
+  summary: string;
+  details: Record<string, unknown> | undefined;
+  timestamp: string | null;
+}
+
+/**
+ * Split raw log.md markdown into individual `## ...` entry blocks. Shared by
+ * every rolling-log reader so the split rule (drop the leading `#` title, keep
+ * `## ` entries) lives in one place.
+ */
+function splitAuditEntries(text: string): string[] {
+  return text
+    .split(/^## /m)
+    .filter((entry) => entry.trim().length > 0 && !entry.startsWith("#"))
+    .map((entry) => `## ${entry.trim()}`);
+}
+
+/** Parse entry headers + optional json details into structured records. */
+function parseAuditEntries(entries: string[]): ParsedAuditEntry[] {
+  const parsed: ParsedAuditEntry[] = [];
+  for (const entry of entries) {
+    const header = entry.match(/^## \[([^\]]+)\]\s+([^|]+)\|\s+(.+)$/m);
+    if (!header) continue;
+    const timestamp = header[1].trim();
+    const tool = header[2].trim();
+    const summary = header[3].trim();
+    let details: Record<string, unknown> | undefined;
+    const detailMatch = entry.match(/```json\n([\s\S]*?)\n```/);
+    if (detailMatch) {
+      try {
+        const value = JSON.parse(detailMatch[1]);
+        if (value && typeof value === "object" && !Array.isArray(value)) {
+          details = value as Record<string, unknown>;
+        }
+      } catch {
+        // Lenient: a truncated/escaped block that no longer parses just carries
+        // no attributable details — it still counts via the boot→stop window.
+      }
+    }
+    parsed.push({ tool, summary, details, timestamp: timestamp || null });
+  }
+  return parsed;
+}
+
+/**
+ * True when `summary` is a stop marker belonging to `sessionId`.
+ *
+ * handleStopCore now writes a bare `stop <id>` on every path (breadcrumb
+ * reasons live in details, not the summary), but the rolling log.md outlives
+ * the upgrade: vaults written by pre-receipts builds still carry
+ * `stop <id>: no draftable signal` and `stop <id>: no candidates after scrub`
+ * rows. Matching the bare form ALONE let those legacy variants fall through to
+ * the generic "some other session's stop" branch below, which closed the window
+ * EXCLUSIVELY and reported the session open forever, with every row after the
+ * marker dropped from the tally. So the id is matched with an explicit
+ * boundary — end-of-string or `:` — which also keeps session `abc` from
+ * claiming a `stop abcdef` row.
+ */
+function isStopMarkerFor(summary: string, sessionId: string): boolean {
+  if (!sessionId) return false;
+  const prefix = `stop ${sessionId}`;
+  if (!summary.startsWith(prefix)) return false;
+  const rest = summary.slice(prefix.length);
+  return rest.length === 0 || rest.startsWith(":");
+}
+
+/**
+ * Close a boot→stop attribution window opened at `windowStart`.
+ *
+ * A boot cycle owns MANY stop rows, not one. Claude Code (and every runtime
+ * that maps Stop to end-of-turn rather than end-of-session) fires the Stop hook
+ * on every assistant turn, so a single `boot <id>` is followed by a `stop <id>`
+ * per turn. Ending the window at the FIRST own-stop made every receipt after
+ * turn one re-report turn one, and marked a live session closed at its first
+ * turn boundary. So the window runs to the LAST own-stop instead.
+ *
+ * Three marker classes, deliberately not treated alike:
+ *  - own STOP → window extends INCLUSIVE of it, and scanning continues; the
+ *    last one wins, and `stopIndex` names it.
+ *  - own BOOT → hard end, EXCLUSIVE: a re-boot of the same id starts a new
+ *    cycle, and a reused session id must yield one row per cycle.
+ *  - foreign boot/stop → a SOFT cut. Subagent and sibling-session lifecycles
+ *    interleave into the same vault log, so a foreign marker alone must not
+ *    truncate a cycle that demonstrably continues past it. It only ends the
+ *    window when NO own-stop follows — preserving the original guarantee that
+ *    a session which died without a stop row cannot absorb its successors.
+ *
+ * `stopIndex` is the last own-stop row index, or -1 when the cycle never
+ * stopped (ran to the tail end, or was cut short by a foreign marker) — i.e.
+ * an open session.
+ */
+function closeWindow(
+  parsed: ParsedAuditEntry[],
+  windowStart: number,
+  ownSessionIds: string[],
+): { end: number; stopIndex: number } {
+  let end = parsed.length;
+  let stopIndex = -1;
+  // First foreign marker seen since the last own-stop; only applied if the
+  // cycle never stops after it.
+  let foreignCut = -1;
+  for (let i = windowStart + 1; i < parsed.length; i += 1) {
+    const summary = parsed[i].summary;
+    if (ownSessionIds.some((id) => isStopMarkerFor(summary, id))) {
+      end = i + 1;
+      stopIndex = i;
+      // An own-stop past a foreign marker proves the cycle outlived it.
+      foreignCut = -1;
+      continue;
+    }
+    if (ownSessionIds.some((id) => summary === `boot ${id}`)) {
+      // Same id booted again: this cycle is over, exclusively, and nothing
+      // after it belongs to us even if a later `stop <id>` shows up. With no
+      // own-stop at all, an earlier foreign marker still cuts first.
+      if (stopIndex === -1) end = foreignCut !== -1 ? foreignCut : i;
+      return { end, stopIndex };
+    }
+    if (foreignCut === -1 && (summary.startsWith("boot ") || summary.startsWith("stop "))) {
+      foreignCut = i;
+    }
+  }
+  if (stopIndex === -1 && foreignCut !== -1) end = foreignCut;
+  return { end, stopIndex };
+}
+
+/**
+ * Tally a SessionReceipt over `parsed` entries. When a window exists
+ * (`windowStart >= 0`) only rows in `[windowStart, windowEnd)` count, and a row
+ * stamped for a DIFFERENT session_id is skipped unless `includeStamped` (the
+ * synthetic Stop fallback) relaxes it. With no window, attribution falls back to
+ * exact stamps (only rows stamped with `sessionId`).
+ */
+function tallyWindow(
+  parsed: ParsedAuditEntry[],
+  sessionId: string,
+  windowStart: number,
+  windowEnd: number,
+  windowSessionId: string,
+  includeStamped: boolean,
+): SessionReceipt {
+  const receipt: SessionReceipt = {
+    session_id: sessionId,
+    entries: 0,
+    recalls_strong: 0,
+    recalls_weak: 0,
+    guard_denied: 0,
+    guard_allowed: 0,
+    learns: 0,
+    vault_writes: 0,
+    candidates_drafted: 0,
+  };
+
+  parsed.forEach((item, index) => {
+    const stampedSession =
+      item.details && typeof item.details.session_id === "string"
+        ? (item.details.session_id as string)
+        : undefined;
+    if (windowStart >= 0) {
+      if (index < windowStart || index >= windowEnd) return;
+      if (
+        stampedSession !== undefined &&
+        stampedSession !== sessionId &&
+        stampedSession !== windowSessionId &&
+        !includeStamped
+      ) return;
+    } else if (stampedSession !== sessionId) {
+      return;
+    }
+
+    receipt.entries += 1;
+
+    if (item.tool.endsWith("_user_prompt_submit")) {
+      if (item.details && item.details.recall_strong === true) {
+        receipt.recalls_strong += 1;
+      } else if (item.details && item.details.recall_strong === false) {
+        receipt.recalls_weak += 1;
+      }
+    }
+    if (item.tool.endsWith("_pretooluse_guard")) {
+      if (item.summary.startsWith("recall guard denied")) {
+        receipt.guard_denied += 1;
+      } else {
+        receipt.guard_allowed += 1;
+      }
+    }
+    if (item.tool === "minni_learn") receipt.learns += 1;
+    if (item.tool === "minni_vault_write" || item.tool === "vault_write") {
+      receipt.vault_writes += 1;
+    }
+    if (item.tool.endsWith("_stop")) {
+      const candidates = item.details ? item.details.candidates : undefined;
+      if (typeof candidates === "number" && Number.isFinite(candidates)) {
+        receipt.candidates_drafted += candidates;
+      }
+    }
+  });
+
+  return receipt;
+}
+
+export async function sessionReceipt(
+  vaultPath: string,
+  sessionId: string,
+  limit = 500,
+  options: { includeStamped?: boolean } = {},
+): Promise<SessionReceipt> {
+  // Read the ROLLING log, not the daily file auditTail prefers: a session
+  // that crosses midnight has its boot marker in yesterday's daily file, but
+  // log.md carries both days (up to the 5 MB rotation, the receipt's honest
+  // horizon).
+  await ensureVault(vaultPath);
+  let text = "";
+  try {
+    text = await readFile(path.join(vaultPath, "log.md"), "utf8");
+  } catch {
+    // fall through to an empty tail — the receipt reports zeros.
+  }
+  const parsed = parseAuditEntries(splitAuditEntries(text).slice(-limit));
+
+  // Boot/stop summaries are the only self-identifying markers that predate
+  // session_id-stamped details, so use them to (a) attribute pre-stamp entries
+  // and (b) define a boot→stop window that catches everything in between. The
+  // window opens at the LAST `boot <sessionId>` (a resumed session reboots) and
+  // closes at the LAST `stop <sessionId>` of that cycle (or the tail end) —
+  // per-turn Stop hooks emit several, and stopping at the first would freeze
+  // the receipt at turn one. See closeWindow.
+  //
+  // Attribution model (one rule, not three): the LAST boot marker opens the
+  // window — the session's current cycle. Prefer the exact `boot <sessionId>`;
+  // on the synthetic fallback (includeStamped) the last boot of ANY id opens
+  // it, because SessionStart may have stamped the real id that Stop's payload
+  // later omitted. Nothing outside the window ever counts — an earlier cycle
+  // reusing the same session id must not inflate this one. Only when NO window
+  // exists at all does attribution fall back to exact stamps.
+  const bootSummary = `boot ${sessionId}`;
+  let windowStart = -1;
+  let anyBootStart = -1;
+  for (let i = 0; i < parsed.length; i += 1) {
+    if (parsed[i].summary === bootSummary) windowStart = i;
+    if (parsed[i].summary.startsWith("boot ")) anyBootStart = i;
+  }
+  let windowSessionId = sessionId;
+  if (windowStart === -1 && options.includeStamped && anyBootStart >= 0) {
+    windowStart = anyBootStart;
+    windowSessionId =
+      parsed[anyBootStart].summary.slice("boot ".length).trim() || sessionId;
+  }
+  let windowEnd = parsed.length;
+  if (windowStart >= 0) {
+    windowEnd = closeWindow(parsed, windowStart, [sessionId, windowSessionId]).end;
+  }
+
+  return tallyWindow(
+    parsed,
+    sessionId,
+    windowStart,
+    windowEnd,
+    windowSessionId,
+    options.includeStamped === true,
+  );
+}
+
+/**
+ * Compact one-line proof-of-use string for the Stop systemMessage. Always names
+ * the recall/guard/learn counts even when zero — a clean receipt (no recalls,
+ * no guards) is itself the signal that memory was not exercised this session.
+ */
+export function formatSessionReceiptLine(receipt: SessionReceipt): string {
+  const recalls = receipt.recalls_strong + receipt.recalls_weak;
+  // `learns` (committed minni_learn rows) and `candidates_drafted` are
+  // distinct tallies — naming only one hid the other from the proof line.
+  const parts = [
+    `${recalls} recall${recalls === 1 ? "" : "s"} (${receipt.recalls_strong} strong)`,
+    `${receipt.guard_denied} guard nudge${receipt.guard_denied === 1 ? "" : "s"}`,
+    `${receipt.learns} learn${receipt.learns === 1 ? "" : "s"} committed`,
+    `${receipt.candidates_drafted} candidate${receipt.candidates_drafted === 1 ? "" : "s"} staged`,
+  ];
+  return `Minni session receipt: ${parts.join(", ")}.`;
+}
+
+/**
+ * One row per boot cycle in the rolling log: the session id, its boot/stop
+ * ISO timestamps (stop null when the session never stopped), whether it is
+ * still open, and the SessionReceipt tally sessionReceipt would produce for
+ * that window plus its formatted one-line proof.
+ */
+export interface SessionSummary {
+  session_id: string;
+  boot_at: string | null;
+  stop_at: string | null;
+  open: boolean;
+  receipt: SessionReceipt;
+  receipt_line: string;
+}
+
+/**
+ * Enumerate recent session boot cycles from the rolling log.md. Strictly
+ * read-only: never calls ensureVault, never creates files — a missing log.md
+ * yields []. Every `boot <id>` marker opens a window closed by the same rules
+ * sessionReceipt uses (see closeWindow: the cycle's LAST own `stop <id>`, bare
+ * or legacy-suffixed, inclusive; a re-boot of the same id exclusive; a foreign
+ * boot/stop only when no own-stop follows it; tail end → open). `stop_at`
+ * therefore reports the most recent turn boundary, which on per-turn Stop
+ * runtimes is the freshest evidence the session was alive. A reused session id
+ * booted twice yields two rows. Newest-first (latest boot leads), capped at
+ * `limit`.
+ */
+export async function listSessions(
+  vaultPath: string,
+  limit = 10,
+  parseLimit = 500,
+): Promise<SessionSummary[]> {
+  let text = "";
+  try {
+    text = await readFile(path.join(vaultPath, "log.md"), "utf8");
+  } catch {
+    // Missing (or unreadable) rolling log: no sessions to report, and we never
+    // create it — listSessions is a pure reader.
+    return [];
+  }
+  const parsed = parseAuditEntries(splitAuditEntries(text).slice(-parseLimit));
+
+  const summaries: SessionSummary[] = [];
+  for (let i = 0; i < parsed.length; i += 1) {
+    if (!parsed[i].summary.startsWith("boot ")) continue;
+    const windowSessionId = parsed[i].summary.slice("boot ".length).trim();
+    if (!windowSessionId) continue;
+    // Each window knows its id from its boot marker, so the stamp filter counts
+    // that id (or unstamped rows) and drops other ids. The one exception is the
+    // synthetic "session" fallback id: those markers come from runtimes whose
+    // lifecycle payload lacked a session id, while their turn rows carry the
+    // real runtime id in details.session_id. The Stop hook tallies exactly that
+    // shape with includeStamped — the catalogue must agree or it shows zeros
+    // where the Stop receipt showed activity.
+    const synthetic = windowSessionId === "session";
+    const { end, stopIndex } = closeWindow(parsed, i, [windowSessionId]);
+    const receipt = tallyWindow(
+      parsed,
+      windowSessionId,
+      i,
+      end,
+      windowSessionId,
+      synthetic,
+    );
+    summaries.push({
+      session_id: windowSessionId,
+      boot_at: parsed[i].timestamp,
+      stop_at: stopIndex >= 0 ? parsed[stopIndex].timestamp : null,
+      open: stopIndex === -1,
+      receipt,
+      receipt_line: formatSessionReceiptLine(receipt),
+    });
+  }
+
+  return summaries.reverse().slice(0, limit);
+}
+
 export async function searchVaultNotes(
   vaultPath: string,
   query: string,

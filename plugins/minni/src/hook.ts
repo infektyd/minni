@@ -76,7 +76,13 @@ import {
 } from "./vault.js";
 
 async function handleSessionStart(payload: Record<string, unknown>): Promise<HookOutput> {
-  const sessionId = asString(payload.session_id) || asString(payload.sessionId) || "session";
+  // rawSessionId is the payload's own id, possibly empty — never the
+  // "session" synthetic fallback. It is what gets threaded into the daemon
+  // recall-trace (recallMemory's sessionId) so unlabeled runtimes never
+  // conflate into one synthetic thread_id. sessionId keeps the historical
+  // defaulted value for envelope identity / inbox filenames / markers.
+  const rawSessionId = asString(payload.session_id) || asString(payload.sessionId);
+  const sessionId = rawSessionId || "session";
   await ensureVault(CLAUDECODE_VAULT_PATH);
   // c4: reset the once-per-session lifecycle emphasis on a fresh session, so the
   // situational focus can fire again this session.
@@ -97,6 +103,7 @@ async function handleSessionStart(payload: Record<string, unknown>): Promise<Hoo
     limit: 8,
     agentId: CLAUDECODE_AGENT_ID,
     workspaceId: CLAUDECODE_WORKSPACE_ID,
+    ...(rawSessionId ? { sessionId: rawSessionId } : {}),
   });
   // hooks-PL-2 leg (a): the 'read' RPC is the recency-ordered learning surface
   // AND the daemon path that records learning_reads — without it, corrections
@@ -314,6 +321,11 @@ async function handleUserPromptSubmit(payload: Record<string, unknown>): Promise
   if (!prompt.trim()) {
     return { continue: true };
   }
+  // rawSessionId (possibly empty) is the audit/recall-trace correlation id;
+  // sessionId keeps the "session" fallback for envelope identity / lifecycle
+  // state only — see handleSessionStart's comment for why the two must not
+  // be conflated.
+  const rawSessionId = asString(payload.session_id) || asString(payload.sessionId);
   const signature = hashTaskSignature(prompt);
 
   // c4/c5: compute the lifecycle representation once for this turn, BEFORE the
@@ -360,6 +372,7 @@ async function handleUserPromptSubmit(payload: Record<string, unknown>): Promise
       limit: 6,
       agentId: CLAUDECODE_AGENT_ID,
       workspaceId: CLAUDECODE_WORKSPACE_ID,
+      ...(rawSessionId ? { sessionId: rawSessionId } : {}),
     }),
   ]);
   const vaultResults = filterSafeVaultResults(vaultResultsRaw);
@@ -416,6 +429,9 @@ async function handleUserPromptSubmit(payload: Record<string, unknown>): Promise
         daemon_ok: recall.ok,
         task_signature: signature,
         recall_strong: false,
+        // RAW id only — omit rather than stamp the synthetic "session"
+        // fallback, so unlabeled turns don't conflate into one audit thread.
+        ...(rawSessionId ? { session_id: rawSessionId } : {}),
       },
     });
     // c3: even with nothing salient (no strong recall, no active plan) the
@@ -466,6 +482,8 @@ async function handleUserPromptSubmit(payload: Record<string, unknown>): Promise
       task_signature: signature,
       recall_strong: Boolean(strong),
       top_score: strong?.topScore,
+      // RAW id only — see the weak-path comment above.
+      ...(rawSessionId ? { session_id: rawSessionId } : {}),
     },
   });
 
@@ -567,6 +585,10 @@ async function handlePreToolUse(
   // a persistence failure we FAIL OPEN and allow, trading a missed nudge for
   // availability.
   const consumed = await markRecallConsumed(CLAUDECODE_VAULT_PATH).catch(() => false);
+  // The PreToolUse payload may carry a session_id; stamp it so the Stop receipt
+  // can attribute this guard nudge. Only add it when present — never invent a
+  // "session" placeholder on this path.
+  const guardSessionId = asString(payload.session_id) || asString(payload.sessionId);
   await recordAudit(CLAUDECODE_VAULT_PATH, {
     tool: "hook_pretooluse_guard",
     summary: `recall guard ${consumed ? "denied" : "allowed (consume write failed)"} ${toolName} (mode=${mode})`,
@@ -577,6 +599,7 @@ async function handlePreToolUse(
       top_score: state!.top_score,
       hits: state!.top_hits.length,
       task_signature: state!.task_signature,
+      ...(guardSessionId ? { session_id: guardSessionId } : {}),
     },
   }).catch(() => {});
   if (!consumed) return preToolUseAllow();

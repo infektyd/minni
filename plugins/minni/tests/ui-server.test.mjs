@@ -1103,3 +1103,172 @@ test("buildAgentsCatalogue flags stagedAtLimit when the RPC returns a full page,
   assert.equal(alpha.staged, 0);
   assert.equal(alpha.stagedAtLimit, false);
 });
+
+// ── Session receipts: /api/sessions (PR #166 slice; /api/events left for console) ──
+
+function sessionRow(agent, session_id, boot_at, extra = {}) {
+  return {
+    agent,
+    session_id,
+    boot_at,
+    stop_at: null,
+    open: true,
+    receipt: {
+      session_id,
+      entries: 0,
+      recalls_strong: 0,
+      recalls_weak: 0,
+      guard_denied: 0,
+      guard_allowed: 0,
+      learns: 0,
+      vault_writes: 0,
+      candidates_drafted: 0,
+    },
+    receipt_line: "Minni session receipt: 0 recalls (0 strong), 0 guard nudges, 0 learns committed, 0 candidates staged.",
+    ...extra,
+  };
+}
+
+test("/api/sessions requires auth (403 unauthed)", async () => {
+  const server = await startTestServer({ listSessionsCatalogue: async () => ({ sessions: [], count: 0 }) });
+  try {
+    const res = await fetch(`${server.baseUrl}/api/sessions`);
+    assert.equal(res.status, 403);
+  } finally {
+    await server.close();
+  }
+});
+
+test("/api/sessions merges rows newest-first across vaults via the catalogue seam", async () => {
+  const server = await startTestServer({
+    listSessionsCatalogue: async () => ({
+      sessions: [
+        sessionRow("codex", "s3", "2026-05-03T00:00:00Z"),
+        sessionRow("main", "s2", "2026-05-02T00:00:00Z"),
+        sessionRow("codex", "s1", "2026-05-01T00:00:00Z"),
+      ],
+      count: 3,
+    }),
+  });
+  try {
+    const res = await fetch(`${server.baseUrl}/api/sessions`, { headers: authHeaders() });
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.deepEqual(body.sessions.map((s) => s.session_id), ["s3", "s2", "s1"]);
+    assert.deepEqual(body.sessions.map((s) => s.agent), ["codex", "main", "codex"]);
+    assert.equal(body.count, 3);
+  } finally {
+    await server.close();
+  }
+});
+
+test("/api/sessions clamps limit (0 -> 1, 999 -> 50)", async () => {
+  let seenLimit;
+  const many = Array.from({ length: 60 }, (_, i) =>
+    sessionRow("codex", `s${i}`, `2026-05-01T00:00:${String(i).padStart(2, "0")}Z`),
+  );
+  const server = await startTestServer({
+    listSessionsCatalogue: async (opts) => {
+      seenLimit = opts.limit;
+      return { sessions: many, count: many.length };
+    },
+  });
+  try {
+    const big = await fetch(`${server.baseUrl}/api/sessions?limit=999`, { headers: authHeaders() }).then((r) => r.json());
+    assert.equal(big.sessions.length, 50);
+    assert.equal(seenLimit, 50);
+
+    const zero = await fetch(`${server.baseUrl}/api/sessions?limit=0`, { headers: authHeaders() }).then((r) => r.json());
+    assert.equal(zero.sessions.length, 1);
+    assert.equal(seenLimit, 1);
+  } finally {
+    await server.close();
+  }
+});
+
+test("/api/sessions rejects an invalid agent param with 400", async () => {
+  const server = await startTestServer({ listSessionsCatalogue: async () => ({ sessions: [], count: 0 }) });
+  try {
+    const res = await fetch(`${server.baseUrl}/api/sessions?agent=Bad%20Agent`, { headers: authHeaders() });
+    assert.equal(res.status, 400);
+    const body = await res.json();
+    assert.equal(body.ok, false);
+    assert.equal(body.error, "invalid agent");
+  } finally {
+    await server.close();
+  }
+});
+
+test("/api/sessions redacts local paths in the payload", async () => {
+  const server = await startTestServer({
+    listSessionsCatalogue: async () => ({
+      sessions: [
+        sessionRow("codex", "s1", "2026-05-01T00:00:00Z", { receipt_line: "wrote /home/user/secret/vault/log.md" }),
+      ],
+      count: 1,
+    }),
+  });
+  try {
+    const body = await fetch(`${server.baseUrl}/api/sessions`, { headers: authHeaders() }).then((r) => r.json());
+    assert.doesNotMatch(JSON.stringify(body), /\/home\/user/);
+    assert.match(body.sessions[0].receipt_line, /\[local-path\]/);
+  } finally {
+    await server.close();
+  }
+});
+
+test("/api/sessions returns 500 fail-loud shape when the catalogue throws", async () => {
+  const server = await startTestServer({
+    listSessionsCatalogue: async () => {
+      throw new Error("scan blew up");
+    },
+  });
+  try {
+    const res = await fetch(`${server.baseUrl}/api/sessions`, { headers: authHeaders() });
+    assert.equal(res.status, 500);
+    const body = await res.json();
+    assert.equal(body.ok, false);
+    assert.match(body.error, /scan blew up/);
+    assert.deepEqual(body.sessions, []);
+  } finally {
+    await server.close();
+  }
+});
+
+test("buildSessionsCatalogue merges vault sessions newest-first and skips symlinked vaults", async () => {
+  const { buildSessionsCatalogue } = await import("../dist/ui-server.js");
+  const { mkdtempSync, mkdirSync, writeFileSync, symlinkSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const pathMod = await import("node:path");
+  const home = mkdtempSync(pathMod.join(tmpdir(), "minni-sessions-cat-"));
+  mkdirSync(pathMod.join(home, "codex-vault"), { recursive: true });
+  mkdirSync(pathMod.join(home, "main-vault"), { recursive: true });
+  writeFileSync(
+    pathMod.join(home, "codex-vault", "log.md"),
+    "## [2026-05-01T00:00:00Z] boot | boot sess-codex\n\n## [2026-05-01T00:05:00Z] stop | stop sess-codex\n",
+  );
+  writeFileSync(
+    pathMod.join(home, "main-vault", "log.md"),
+    "## [2026-05-03T00:00:00Z] boot | boot sess-main\n",
+  );
+  const outside = mkdtempSync(pathMod.join(tmpdir(), "minni-outside-sess-"));
+  writeFileSync(pathMod.join(outside, "log.md"), "## [2026-05-09T00:00:00Z] boot | boot sess-poison\n");
+  try {
+    symlinkSync(outside, pathMod.join(home, "poison-vault"));
+  } catch {
+    // platform without symlink support
+  }
+
+  const catalogue = await buildSessionsCatalogue({ homePath: home });
+  const ids = catalogue.sessions.map((s) => s.session_id);
+  assert.deepEqual(ids, ["sess-main", "sess-codex"], "newest boot_at leads");
+  assert.ok(catalogue.sessions.every((s) => s.session_id !== "sess-poison"), "symlinked vault skipped");
+  const codex = catalogue.sessions.find((s) => s.session_id === "sess-codex");
+  assert.equal(codex.agent, "codex");
+  assert.equal(codex.open, false);
+  const main = catalogue.sessions.find((s) => s.session_id === "sess-main");
+  assert.equal(main.agent, "main");
+  assert.equal(main.open, true);
+  assert.ok(!catalogue.sessions.some((s) => JSON.stringify(s).includes(home)), "no absolute home path on the wire");
+});
+
