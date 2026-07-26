@@ -37,6 +37,7 @@ import { RecallScreen } from "./screens/RecallScreen";
 import { SettingsScreen } from "./screens/SettingsScreen";
 import { HandoffsScreen } from "./screens/HandoffsScreen";
 import { PolicyScreen } from "./screens/PolicyScreen";
+import { SessionsScreen } from "./screens/SessionsScreen";
 import { VaultsScreen } from "./screens/VaultsScreen";
 
 type ScreenId =
@@ -48,6 +49,7 @@ type ScreenId =
   | "vaults"
   | "audit"
   | "policy"
+  | "sessions"
   | "settings";
 
 export function App() {
@@ -186,6 +188,13 @@ export function App() {
         );
       case "audit":
         return <AuditScreen />;
+      case "sessions":
+        return (
+          <SessionsScreen
+            tokenRefreshTrigger={tokenRefreshTrigger}
+            onAuthRequired={() => setAuthRequired(true)}
+          />
+        );
       case "policy":
         return (
           <PolicyScreen
