@@ -70,5 +70,8 @@
     "typescript": "^6.0.3",
     "typescript-eslint": "^8.65.0",
     "vite": "^8.1.5"
+  },
+  "overrides": {
+    "@hono/node-server": "2.0.11"
   }
 }
