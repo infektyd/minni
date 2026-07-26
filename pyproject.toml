@@ -91,6 +91,7 @@ minni = [
     "plugin_payload/hooks/*",
     "plugin_payload/.claude-plugin/*",
     "plugin_payload/.codex-plugin/*",
+    "plugin_payload/.cursor-plugin/*",
     "plugin_payload/.gemini-plugin/*",
     "plugin_payload/.gemini-plugin/skills/sovereign-memory/*",
     "plugin_payload/.kilocode-plugin/*",

@@ -27,6 +27,7 @@ PAYLOAD_ITEMS = (
     "dist",
     ".claude-plugin",
     ".codex-plugin",
+    ".cursor-plugin",
     ".gemini-plugin",
     ".kilocode-plugin",
     ".mcp.json",
@@ -41,6 +42,7 @@ JUNK_NAMES = {".DS_Store", "__pycache__", ".pytest_cache"}
 MANIFEST_STAMP_PATHS = (
     ".claude-plugin/plugin.json",
     ".codex-plugin/plugin.json",
+    ".cursor-plugin/plugin.json",
     ".kilocode-plugin/plugin.json",
     ".gemini-plugin/gemini-extension.json",
 )
@@ -52,6 +54,7 @@ PACKAGE_DATA_GLOBS = [
     "plugin_payload/hooks/*",
     "plugin_payload/.claude-plugin/*",
     "plugin_payload/.codex-plugin/*",
+    "plugin_payload/.cursor-plugin/*",
     "plugin_payload/.gemini-plugin/*",
     "plugin_payload/.gemini-plugin/skills/sovereign-memory/*",
     "plugin_payload/.kilocode-plugin/*",

@@ -23,6 +23,7 @@ PROPAGATE = Path(
 MANIFEST_PATHS = (
     REPO_ROOT / "plugins" / "minni" / ".claude-plugin" / "plugin.json",
     REPO_ROOT / "plugins" / "minni" / ".codex-plugin" / "plugin.json",
+    REPO_ROOT / "plugins" / "minni" / ".cursor-plugin" / "plugin.json",
     REPO_ROOT / "plugins" / "minni" / ".kilocode-plugin" / "plugin.json",
     REPO_ROOT / "plugins" / "minni" / ".gemini-plugin" / "gemini-extension.json",
 )
