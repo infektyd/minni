@@ -5,8 +5,12 @@
 // the stateful handler logic, parameterized by a typed per-agent config, so
 // future changes (evidence envelope format, plan injection, inbox drain
 // logic) have ONE maintenance surface instead of four. hook.ts (claude-code)
-// diverges structurally (PreCompact cannot inject context) and keeps its own
-// handlers.
+// keeps its own handlers.
+//
+// Handlers here return INTENT, not wire shapes: what reaches the model is
+// decided per platform by hook-platform.ts. Emitting Claude Code's envelope
+// everywhere is what silently voided Codex's PreCompact output and discarded
+// Grok Build's memory outright.
 import {
   MEMORY_CONTRACT,
   envelopeBudgetFor,
@@ -20,10 +24,13 @@ import {
   emit,
   readStdin,
   vaultRecallToBody,
-  withHookContext,
   workspaceFromPayload,
 } from "./hook-utils.js";
 import type { HookOutput } from "./hook-utils.js";
+import { injectIntent, noIntent, noteIntent } from "./hook-intent.js";
+import type { HookIntent } from "./hook-intent.js";
+import { renderIntent, wireFor } from "./hook-platform.js";
+import type { PlatformWire } from "./hook-platform.js";
 import { compactPlanPointer, resolveActivePlanView } from "./plan.js";
 import { routeMemoryIntent } from "./policy.js";
 import {
@@ -138,6 +145,12 @@ export interface AgentHookConfig {
    * resolve from the environment (default "soft").
    */
   recallGuardMode?: RecallGuardMode;
+  /**
+   * Native wire contract for the platform actually running this hook. Defaults
+   * to `wireFor(agentId)`. Override in tests, or when an agent identity does
+   * not name its own platform.
+   */
+  wire?: PlatformWire;
 }
 
 /** Test seam: lets behavioral tests drive the zero-candidate Stop branch. */
@@ -165,6 +178,32 @@ export function createHookHandlers(
     workspaceFromPayload(payload, config.defaultWorkspaceId);
   const bootIdentity = config.bootIdentity ?? "agent-context";
   const prepareOutcomeFn = deps.prepareOutcome ?? prepareOutcome;
+  const wire = config.wire ?? wireFor(config.agentId);
+
+  // Handlers express intent; the platform wire decides what can actually be
+  // said. An injection the platform cannot carry is recorded, never silently
+  // swallowed -- that silence is exactly what hid Grok Build's and Kilocode's
+  // missing memory for so long.
+  const render = async (intent: HookIntent): Promise<HookOutput> => {
+    const { output, dropped } = renderIntent(wire, intent);
+    if (dropped) {
+      try {
+        await recordAudit(config.vaultPath, {
+          tool: `${config.auditPrefix}_intent_dropped`,
+          summary: `${dropped.event}: ${dropped.reason}`,
+          // Bucket per EVENT. Every drop shares one tool name, so without this
+          // a Stop drop within 5s of a UserPromptSubmit drop is throttled away
+          // and reported as written -- losing the only record that memory
+          // failed to land.
+          throttleKey: `${config.auditPrefix}_intent_dropped__${dropped.event}`,
+        });
+      } catch {
+        // Audit unavailable. The drop is still correct behavior; losing the
+        // record must not also lose the event.
+      }
+    }
+    return output as HookOutput;
+  };
 
   async function handleSessionStart(payload: Record<string, unknown>): Promise<HookOutput> {
     const sessionId = asString(payload.session_id) || asString(payload.sessionId) || "session";
@@ -344,13 +383,15 @@ export function createHookHandlers(
       bootIdentity === "agent-context" && identityRead.ok && identityRead.data?.context
         ? truncateToTokenCharBudget(identityRead.data.context.trim(), budget)
         : "";
-    return withHookContext("SessionStart", [nativeLayer1, envelope].filter(Boolean).join("\n\n"));
+    return render(
+      injectIntent("SessionStart", [nativeLayer1, envelope].filter(Boolean).join("\n\n")),
+    );
   }
 
   async function handleUserPromptSubmit(payload: Record<string, unknown>): Promise<HookOutput> {
     const prompt = asString(payload.prompt) || asString(payload.user_prompt);
     if (!prompt.trim()) {
-      return { continue: true };
+      return render(noIntent);
     }
 
     const workspaceId = workspaceFor(payload);
@@ -366,7 +407,7 @@ export function createHookHandlers(
       // s6 guard deny an unrelated read/search here (parity with the weak-turn
       // path below, which also clears).
       await clearRecallState(config.vaultPath).catch(() => {});
-      return { continue: true };
+      return render(noIntent);
     }
 
     const threshold = recallPointerThreshold();
@@ -429,7 +470,7 @@ export function createHookHandlers(
           recall_strong: false,
         },
       });
-      return { continue: true };
+      return render(noIntent);
     }
 
     const envelopeBody: Record<string, unknown> = {
@@ -473,7 +514,7 @@ export function createHookHandlers(
       },
     });
 
-    return withHookContext("UserPromptSubmit", envelope);
+    return render(injectIntent("UserPromptSubmit", envelope));
   }
 
   // s6 PreToolUse recall guard (BACKSTOP). Same logic as the claude-code hook's
@@ -594,14 +635,21 @@ export function createHookHandlers(
       },
     });
 
-    return withHookContext("PreCompact", envelope);
+    // PreCompact can inject on NO platform: Claude Code omits it from the
+    // hookSpecificOutput union, and Codex's schema is additionalProperties:false
+    // so the envelope voids the entire output. The handoff written above is the
+    // real payload; the wire records the drop rather than pretending it landed.
+    return render(injectIntent("PreCompact", envelope));
   }
 
   async function handleStop(payload: Record<string, unknown>): Promise<HookOutput> {
     await ensureVault(config.vaultPath);
     const sessionId = asString(payload.session_id) || asString(payload.sessionId) || "session";
     const workspaceId = workspaceFor(payload);
-    const lastTask = asString(payload.last_user_message) || asString(payload.summary) || sessionId;
+    // `last_user_message` exists on no platform -- reading it always yielded
+    // "" and degraded every learn candidate to a bare session id. Each platform
+    // supplies the ASSISTANT's final message, under its own spelling.
+    const lastTask = wire.lastTaskText(payload) || sessionId;
     const tail = await auditTail(config.vaultPath, 30);
     const outcome = await prepareOutcomeFn({
       task: lastTask.slice(0, 200),
@@ -615,7 +663,7 @@ export function createHookHandlers(
     // don't litter the inbox with empty files or pad the audit log with noise
     // (unless this agent's config keeps the historical always-write behavior).
     if (!config.alwaysWriteStopInbox && candidates.length === 0) {
-      return { continue: true };
+      return render(noIntent);
     }
 
     const inbox = await writeInbox(config.vaultPath, sessionId, {
@@ -640,17 +688,19 @@ export function createHookHandlers(
     });
 
     if (candidates.length === 0) {
-      return { continue: true };
+      return render(noIntent);
     }
 
-    return {
-      continue: true,
-      systemMessage: `Minni: ${candidates.length} candidate learning${
-        candidates.length === 1 ? "" : "s"
-      } drafted to inbox (${inbox.filePath}). ${
-        config.stopCommitHint ?? "Use minni_prepare_outcome/minni_learn to review and commit."
-      }`,
-    };
+    return render(
+      noteIntent(
+        "Stop",
+        `Minni: ${candidates.length} candidate learning${
+          candidates.length === 1 ? "" : "s"
+        } drafted to inbox (${inbox.filePath}). ${
+          config.stopCommitHint ?? "Use minni_prepare_outcome/minni_learn to review and commit."
+        }`,
+      ),
+    );
   }
 
   async function dispatch(
@@ -669,7 +719,7 @@ export function createHookHandlers(
       case "Stop":
         return handleStop(payload);
       default:
-        return { continue: true };
+        return render(noIntent);
     }
   }
 
@@ -697,6 +747,14 @@ export async function runHookMain(config: AgentHookConfig): Promise<void> {
   // the permissionDecision shape), so it is gated alongside VALID_EVENTS.
   if (event !== PRE_TOOL_USE_EVENT && !VALID_EVENTS.includes(event as EnvelopeEvent)) {
     emit({ continue: true });
+    return;
+  }
+
+  const wire = config.wire ?? wireFor(config.agentId);
+  if (wire.shouldHandle && !wire.shouldHandle(event, payload)) {
+    // A duplicate firing of an event the platform emits more than once per
+    // logical occurrence -- running it again would double-count the outcome.
+    emit(wire.noop());
     return;
   }
 

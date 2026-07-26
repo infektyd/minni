@@ -23,6 +23,7 @@ import {
   readStdin,
   VALID_EVENTS,
 } from "./hook-utils.js";
+import { claudeCodeWire } from "./hook-platform.js";
 import type { HookOutput } from "./hook-utils.js";
 import { routeMemoryIntent } from "./policy.js";
 import {
@@ -522,7 +523,11 @@ async function handlePreCompact(payload: Record<string, unknown>): Promise<HookO
 async function handleStop(payload: Record<string, unknown>): Promise<HookOutput> {
   await ensureVault(CLAUDECODE_VAULT_PATH);
   const sessionId = asString(payload.session_id) || asString(payload.sessionId) || "session";
-  const lastTask = asString(payload.last_user_message) || asString(payload.summary) || sessionId;
+  // `last_user_message` and `summary` exist on NO Claude Code payload, so this
+  // always fell through to the session UUID and every Stop-time learn candidate
+  // was keyed on a meaningless id. Claude Code sends `last_assistant_message`;
+  // the wire knows the spelling per platform.
+  const lastTask = claudeCodeWire.lastTaskText(payload) || sessionId;
   const tail = await auditTail(CLAUDECODE_VAULT_PATH, 30);
   const outcome = await prepareOutcome({
     task: lastTask.slice(0, 200),

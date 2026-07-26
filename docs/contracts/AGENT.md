@@ -343,13 +343,24 @@ recall). Two surfaces expose a deny-capable pre-tool hook:
   `UserPromptSubmit` event no recall-state is ever written, so the guard always
   approves. It lights up automatically once agy adds prompt-level hooks.
 
-`codex`, `grok`, and `kilocode` integrate Minni through MCP servers and CLI
-entrypoints and do **not** expose an equivalent deny-capable pre-tool event.
-The guard is therefore intentionally **not** wired into their manifests — this
-is a platform capability gap, **not** a Minni omission. Those three surfaces
-receive the lifecycle nudge and the `UserPromptSubmit` recall pointer.
-**Gemini receives neither today**: on agy 1.0.15 the only lifecycle hook that
-fires with effect is `Stop` (candidate drafting into the gemini vault inbox);
+The reason the guard is not wired on every surface differs per platform, and
+the previous blanket claim here ("no equivalent deny-capable pre-tool event")
+was wrong for two of the three. Verified against the shipped vendor docs — see
+`docs/contracts/hook-platforms.md`:
+
+| Surface | Deny-capable pre-tool event? | Why the guard is / is not wired |
+|---|---|---|
+| `codex` | Yes — but **Bash interception only** | The guard gates `Read`/`Grep`/`Glob`, which never fire `PreToolUse` on Codex. Not wireable **for these tools**. |
+| `grok-build` | Yes, broad tool coverage | Genuinely available; wiring it is open work, not a platform gap. |
+| `kilocode` | Yes — throw from `tool.execute.before` | Already wired through the bridge plugin. |
+
+Note also that `codex`, `grok-build` and `kilocode` do **not** all receive the
+`UserPromptSubmit` recall pointer: on Grok Build, hook stdout is ignored for
+passive events, so it is written and discarded.
+**Gemini's situation has changed**: agy 1.1.7 dispatches `SessionStart`,
+`PreInvocation`, `PostInvocation`, `PreToolUse`, `PostToolUse` and `Stop`, and
+injects context via `injectSteps`. The older note below described agy 1.0.15 and
+a manifest that agy was in fact rejecting outright;
 there is no boot injection and no per-prompt recall pointer until agy grows
 `SessionStart`/`UserPromptSubmit` events (they are pre-declared in
 `hooks-gemini.json` so they activate without a reinstall). If another surface

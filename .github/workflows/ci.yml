@@ -50,7 +50,7 @@ jobs:
 
       - name: Engine tests
         run: |
-          .venv/bin/python -m pytest tests/ -q --tb=short
+          .venv/bin/python -m pytest -q --tb=short
 
       - name: Plugin tests
         working-directory: plugins/minni

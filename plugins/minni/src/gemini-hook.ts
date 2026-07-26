@@ -4,17 +4,14 @@
 // which speak Claude Code's hook protocol natively — wraps dispatch in the
 // agy payload/output adapters (gemini-adapter.ts).
 //
-// It cannot reuse runHookMain: agy 1.0.15's permission manager errors on an
-// empty PreToolUse decision (fixed upstream after 1.0.15), so EVERY exit path
-// of a PreToolUse invocation — hooks disabled, unknown event, handler error —
-// must emit an explicit {"decision":"approve"} instead of runHookMain's bare
-// {continue:true}. See gemini-adapter.ts for the verified protocol notes.
+// It cannot reuse runHookMain: agy errors on an empty PreToolUse decision, so
+// EVERY exit path of a PreToolUse invocation — hooks disabled, unknown event,
+// handler error — must emit an explicit {"decision":"allow"} instead of
+// runHookMain's bare {continue:true}. See gemini-adapter.ts for the protocol.
 //
-// agy 1.0.15 only dispatches PreToolUse, PostToolUse and Stop. SessionStart /
-// UserPromptSubmit / PreCompact are wired in hooks-gemini.json anyway so they
-// light up without a reinstall once agy adds them; until then the recall
-// guard is inert (no UserPromptSubmit means no recall-state file, so
-// PreToolUse always approves).
+// The manifest declares agy's OWN event names; AGY_EVENTS maps them onto
+// Minni's internal ones. agy has no UserPromptSubmit — PreInvocation is the
+// analogue and the documented injection point — and no PreCompact at all.
 import type { EnvelopeEvent } from "./agent_envelope.js";
 import {
   GEMINI_AGENT_ID,
@@ -26,10 +23,12 @@ import {
 import {
   adaptAgyPayload,
   adaptPreToolUseOutput,
-  agyApprove,
+  agyAllow,
+  enrichAgyPromptPayload,
   enrichAgyStopPayload,
 } from "./gemini-adapter.js";
 import { createHookHandlers } from "./hook-handlers.js";
+import { geminiWire } from "./hook-platform.js";
 import type { AgentHookConfig } from "./hook-handlers.js";
 import { VALID_EVENTS, asString, emit, readStdin } from "./hook-utils.js";
 import { PRE_TOOL_USE_EVENT } from "./recall-guard.js";
@@ -62,13 +61,29 @@ const CONFIG: AgentHookConfig = {
   // Like grok/kilocode, an empty Stop outcome skips the inbox write entirely.
   alwaysWriteStopInbox: false,
   recallGuardMode: GEMINI_GUARD_MODE,
+  wire: geminiWire,
+};
+
+/**
+ * agy's native event names -> Minni's internal EnvelopeEvent names.
+ *
+ * Declaring Claude Code's names in an agy manifest is what made this
+ * integration dead config: `UserPromptSubmit` and `PreCompact` simply do not
+ * exist on agy, so those entries never fired and never would have.
+ */
+const AGY_EVENTS: Record<string, EnvelopeEvent> = {
+  SessionStart: "SessionStart",
+  PreInvocation: "UserPromptSubmit",
+  Stop: "Stop",
 };
 
 async function main(): Promise<void> {
-  const eventArg = (process.argv[2] ?? "").trim();
+  const rawEventArg = (process.argv[2] ?? "").trim();
+  const eventArg =
+    rawEventArg === PRE_TOOL_USE_EVENT ? rawEventArg : (AGY_EVENTS[rawEventArg] ?? rawEventArg);
   const isPreToolUse = eventArg === PRE_TOOL_USE_EVENT;
   const emitNoop = (): void => {
-    emit(isPreToolUse ? agyApprove() : { continue: true });
+    emit(isPreToolUse ? agyAllow() : { continue: true });
   };
 
   if (!CONFIG.hooksEnabled) {
@@ -84,6 +99,11 @@ async function main(): Promise<void> {
   }
 
   let payload = adaptAgyPayload(raw);
+  if (event === "UserPromptSubmit") {
+    // PreInvocation carries no prompt text; mine the transcript or the
+    // shared handler returns noIntent and the per-turn recall pointer dies.
+    payload = await enrichAgyPromptPayload(payload).catch(() => payload);
+  }
   if (event === "Stop") {
     // Best-effort: pull the real last user message from agy's transcript so
     // Stop drafts candidates about the actual task, not the conversation id.
@@ -108,13 +128,16 @@ async function main(): Promise<void> {
       // audit unavailable; the fallback output below still keeps agy unblocked
     }
     if (event === PRE_TOOL_USE_EVENT) {
-      emit(agyApprove());
+      emit(agyAllow());
     } else {
-      // hooks-PL-5: a degraded event must never look like a clean one — say so.
-      emit({
-        continue: true,
-        systemMessage: `Minni hook degraded (${event}): ${message} — memory injection skipped this event; see vault log.md.`,
-      });
+      // hooks-PL-5: a degraded event must never look like a clean one — say
+      // so, through agy's channel (it has no systemMessage).
+      emit(
+        geminiWire.note(
+          event as EnvelopeEvent,
+          `Minni hook degraded (${event}): ${message} — memory injection skipped this event; see vault log.md.`,
+        ) ?? geminiWire.noop(),
+      );
     }
   }
 }

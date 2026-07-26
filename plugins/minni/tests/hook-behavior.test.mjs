@@ -177,6 +177,13 @@ const STOP_AGENTS = [
     hookJs: "kilocode-hook.js",
     agentId: "kilocode",
     env: (vault) => ({ MINNI_KILOCODE_VAULT_PATH: vault, MINNI_KILOCODE_HOOKS: "on" }),
+    // Kilo alone has NO note channel at Stop. opencode's `session.idle` is a
+    // bare `event` handler with no output argument, so the bridge awaits the
+    // hook and discards whatever it returns. Emitting a systemMessage there
+    // was a false success -- it announced delivery to a reader that does not
+    // exist. The inbox write below is the real Stop contract on every agent;
+    // the note is only ever the human-facing extra.
+    notesAtStop: false,
   },
 ];
 
@@ -197,7 +204,13 @@ for (const agent of STOP_AGENTS) {
           workspace_id: "fixture-workspace",
         },
       );
-      assert.match(output.systemMessage ?? "", /drafted to inbox/);
+      if (agent.notesAtStop === false) {
+        // The note must be ABSENT, not merely unasserted: emitting one here
+        // would be the platform-shaped false success this branch exists to end.
+        assert.equal(output.systemMessage, undefined, `${agent.name} has no Stop note channel`);
+      } else {
+        assert.match(output.systemMessage ?? "", /drafted to inbox/);
+      }
 
       const names = (await readdir(path.join(fixture.vault, "inbox"))).filter((n) =>
         n.endsWith(".json"),
