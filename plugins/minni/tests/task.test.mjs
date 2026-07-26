@@ -260,6 +260,408 @@ test("prepareOutcome returns a dry-run outcome packet without audit or learning 
   assert.match(packet.outcomeDraft.doNotStore.join("\n"), /raw logs/);
 });
 
+test("prepareOutcome passes valid user summaries and scrubs audit log telemetry lines (Issue #173)", async () => {
+  const shortPacket = await prepareOutcome({
+    task: "note",
+    summary: "Use WAL",
+    profile: "compact",
+    vaultPath: "/tmp/vault",
+  });
+  assert.deepEqual(shortPacket.outcomeDraft.learnCandidates, ["note: Use WAL"]);
+
+  const auditTelemetry = "## [2026-07-23T10:00:00Z] hook_stop | stop session";
+  const telemetryPacket = await prepareOutcome({
+    task: "fix",
+    summary: auditTelemetry,
+    profile: "compact",
+    vaultPath: "/tmp/vault",
+  });
+  assert.equal(telemetryPacket.outcomeDraft.learnCandidates.length, 0, "audit telemetry lines must be scrubbed from learnCandidates");
+});
+
+test("prepareOutcome scrubs audit telemetry smuggled through the task field (Issue #173 gap 1)", async () => {
+  const packet = await prepareOutcome({
+    task: "## [2026-07-23T10:00:00Z] hook_stop | stop session",
+    summary: "a perfectly ordinary summary",
+    profile: "compact",
+    vaultPath: "/tmp/vault",
+  });
+  assert.equal(
+    packet.outcomeDraft.learnCandidates.length,
+    0,
+    "telemetry arriving via `task` must be scrubbed even when `summary` is clean",
+  );
+});
+
+test("prepareOutcome scrubs bare audit lines from every agent's hook prefix (Issue #173 gap 2)", async () => {
+  const telemetryLines = [
+    "hook_codex_stop | stop abc",
+    "hook_gemini_session_start | started",
+    "hook_grok_pre_compact | compacting",
+  ];
+  for (const summary of telemetryLines) {
+    const packet = await prepareOutcome({
+      task: "fix",
+      summary,
+      profile: "compact",
+      vaultPath: "/tmp/vault",
+    });
+    assert.equal(
+      packet.outcomeDraft.learnCandidates.length,
+      0,
+      `expected "${summary}" to be scrubbed as audit telemetry`,
+    );
+  }
+});
+
+test("prepareOutcome does not over-reject legitimate learnings mentioning hook/stop/session (Issue #173 gap 2)", async () => {
+  const legitimateSummaries = [
+    "Use hook to open the door, then stop for a session review",
+    "Remember to hook up the stop-loss before session close",
+    "The pretooluse_guard hook stops runaway edits during a session",
+  ];
+  for (const summary of legitimateSummaries) {
+    const packet = await prepareOutcome({
+      task: "note",
+      summary,
+      profile: "compact",
+      vaultPath: "/tmp/vault",
+    });
+    assert.equal(
+      packet.outcomeDraft.learnCandidates.length,
+      1,
+      `expected "${summary}" to pass through as a legitimate learning`,
+    );
+  }
+});
+
+// Defect 1: a Stop payload can carry `changedFiles` and no usable summary. The
+// composed `"<task>: <summary>"` is then non-empty ("fix the parser:") and slips
+// past both normalization and the hook's zero-candidate guard, writing an inbox
+// candidate with no learning content at all.
+test("prepareOutcome emits no candidate when the summary has no substance (Issue #173 defect 1)", async () => {
+  const contentless = ["", "   ", "  .  ", "--", "…"];
+  for (const summary of contentless) {
+    const packet = await prepareOutcome({
+      task: "fix the parser",
+      summary,
+      changedFiles: ["a.ts"],
+      profile: "compact",
+      vaultPath: "/tmp/vault",
+    });
+    assert.deepEqual(
+      packet.outcomeDraft.learnCandidates,
+      [],
+      `summary ${JSON.stringify(summary)} contributes nothing and must not manufacture a candidate`,
+    );
+    // changedFiles remain log-only enrichment; they never become a candidate.
+    assert.match(packet.outcomeDraft.logOnly.join("\n"), /Changed files: a\.ts/);
+  }
+
+  // A single alphanumeric character is substance — the guard must not swallow
+  // genuinely short learnings.
+  const kept = await prepareOutcome({
+    task: "note",
+    summary: "Use WAL",
+    profile: "compact",
+    vaultPath: "/tmp/vault",
+  });
+  assert.deepEqual(kept.outcomeDraft.learnCandidates, ["note: Use WAL"]);
+});
+
+// Defect 2a: the old pattern only recognised tools starting with `hook_`, so real
+// audit lines from `recordAudit` for every other tool in the namespace survived.
+test("prepareOutcome scrubs audit lines for the non-hook tool namespace (Issue #173 defect 2a)", async () => {
+  const telemetry = [
+    "## [2026-07-25T16:47:42.513Z] minni_recall | issue 173 stop learn candidates…",
+    "## [2026-07-25T16:47:42.513Z] minni_learn | committed a durable learning",
+    "## [2026-07-25T16:47:42.513Z] agent_ping | ping delivered",
+    "minni_prepare_task | built a packet",
+    "sovereign_vault_write | wrote a page",
+    "afm_loop | consolidation pass",
+    "handoff_received | accepted handoff",
+  ];
+  for (const summary of telemetry) {
+    const packet = await prepareOutcome({
+      task: "fix",
+      summary,
+      profile: "compact",
+      vaultPath: "/tmp/vault",
+    });
+    assert.deepEqual(
+      packet.outcomeDraft.learnCandidates,
+      [],
+      `expected "${summary}" to be scrubbed as audit telemetry`,
+    );
+  }
+});
+
+// Defect 2b: the old pattern substring-matched `hook_\w+\s*\|` anywhere in the
+// blob. Because Stop derives `task` from `last_user_message`, any prompt with a
+// shell pipeline over a hook name silently zeroed the whole candidate list.
+test("prepareOutcome keeps user prose that pipes a hook name (Issue #173 defect 2b)", async () => {
+  const legitimate = [
+    "debug the hook_stop | grep pipeline: we found the fix",
+    "run: journalctl | grep hook_stop | tail -5",
+    "the minni_recall | jq trick shows the ranked sources",
+  ];
+  for (const summary of legitimate) {
+    const packet = await prepareOutcome({
+      task: "note",
+      summary,
+      profile: "compact",
+      vaultPath: "/tmp/vault",
+    });
+    assert.equal(
+      packet.outcomeDraft.learnCandidates.length,
+      1,
+      `expected "${summary}" to pass through as a legitimate learning`,
+    );
+  }
+});
+
+// Round-3 defect A (false positives): the bare-line rule matched ANY line
+// starting `<root>_<snake> |`, so a single prose or markdown-table line inside a
+// multi-line user prompt zeroed the whole candidate list. Stop feeds the user's
+// own message in as `task`, so each of these silently dropped the entire Stop.
+const AUDIT_FALSE_POSITIVES = {
+  indexedColumns: "agent_id | role | created_at are the three indexed columns.",
+  toolEnumeration: "minni_recall | minni_learn are the two tools agents call most.",
+  compositeKey: "team_id | user_id form the composite primary key",
+  markdownTable: "minni_recall | ranked vault context | yes",
+};
+
+test("prepareOutcome keeps prose and tables whose first column is a tool identifier (round 3, defect A)", async () => {
+  for (const [name, line] of Object.entries(AUDIT_FALSE_POSITIVES)) {
+    // via `summary`
+    const bySummary = await prepareOutcome({
+      task: "note",
+      summary: line,
+      profile: "compact",
+      vaultPath: "/tmp/vault",
+    });
+    assert.equal(bySummary.outcomeDraft.learnCandidates.length, 1, `${name}: summary must survive the audit scrub`);
+
+    // via `task` — the Stop path, where `task` is the user's own prompt.
+    const byTask = await prepareOutcome({
+      task: `Design review notes\n${line}\nThat is the whole schema.`,
+      summary: "recorded the schema review",
+      profile: "compact",
+      vaultPath: "/tmp/vault",
+    });
+    assert.equal(byTask.outcomeDraft.learnCandidates.length, 1, `${name}: prompt must survive the audit scrub`);
+  }
+});
+
+// Round-3 defect A (false negative): blockquote and bullet prefixes defeated the
+// `^[ \t]*` anchor, so a pasted log tail was drafted into an ingestible candidate.
+const QUOTED_AUDIT_TAIL =
+  'Log showed:\n> hook_stop | stop s1: no draftable signal\n> minni_learn | committed';
+
+test("prepareOutcome scrubs quoted and bulleted audit tails (round 3, defect A)", async () => {
+  const quoted = await prepareOutcome({
+    task: "fix",
+    summary: QUOTED_AUDIT_TAIL,
+    profile: "compact",
+    vaultPath: "/tmp/vault",
+  });
+  assert.deepEqual(quoted.outcomeDraft.learnCandidates, [], "blockquoted audit tail must be scrubbed");
+
+  const bulleted = await prepareOutcome({
+    task: "fix",
+    summary: "Log showed:\n- hook_stop | stop s1: no draftable signal\n* minni_learn | committed",
+    profile: "compact",
+    vaultPath: "/tmp/vault",
+  });
+  assert.deepEqual(bulleted.outcomeDraft.learnCandidates, [], "bulleted audit tail must be scrubbed");
+
+  const viaTask = await prepareOutcome({
+    task: QUOTED_AUDIT_TAIL,
+    summary: "a perfectly ordinary summary",
+    profile: "compact",
+    vaultPath: "/tmp/vault",
+  });
+  assert.deepEqual(viaTask.outcomeDraft.learnCandidates, [], "quoted audit tail via `task` must be scrubbed");
+});
+
+// Round-3 defect B: the substance gate only required one letter or digit in the
+// RAW summary, so single-token acknowledgements and path-only summaries (emptied
+// by redaction, which runs AFTER the gate) still produced candidates.
+test("prepareOutcome rejects contentless summaries post-redaction (round 3, defect B)", async () => {
+  const contentless = {
+    ok: "ok",
+    singleLetter: "a",
+    pathOnly: "/Users/hansaxelsson/Projects/Minni/plugins/minni/src/x.ts",
+  };
+  for (const [name, summary] of Object.entries(contentless)) {
+    const packet = await prepareOutcome({
+      task: "fix the bug",
+      summary,
+      profile: "compact",
+      vaultPath: "/tmp/vault",
+    });
+    assert.deepEqual(packet.outcomeDraft.learnCandidates, [], `${name}: must not manufacture a candidate`);
+  }
+
+  // No `last_user_message`: the hook falls back to the session id as `task`, so
+  // the candidate would have been the contentless "ok: ok".
+  const sessionFallback = await prepareOutcome({
+    task: "ok",
+    summary: "ok",
+    profile: "compact",
+    vaultPath: "/tmp/vault",
+  });
+  assert.deepEqual(sessionFallback.outcomeDraft.learnCandidates, []);
+
+  // Genuine short learnings still pass — two content tokens is the floor.
+  const short = await prepareOutcome({
+    task: "note",
+    summary: "Use WAL",
+    profile: "compact",
+    vaultPath: "/tmp/vault",
+  });
+  assert.deepEqual(short.outcomeDraft.learnCandidates, ["note: Use WAL"]);
+});
+
+// Round-4 defect 1: round 3 admitted a quote/bullet prefix in front of the OPEN
+// root set, and `agent_`/`team_` are in that set — so a markdown definition list
+// ("- team_id | the tenant identifier"), the highest-traffic prose shape in this
+// repo's docs, was scrubbed as telemetry and the whole Stop was discarded. The
+// bare form now requires a tool name that actually emits audit lines. Both
+// directions are asserted together because the two prior rounds each fixed one
+// and broke the other.
+const AUDIT_TELEMETRY = {
+  headerHookStop: "## [2026-07-25T16:47:42.513Z] hook_stop | stop s1: no draftable signal",
+  bareCodexStop: "hook_codex_stop | stop abc",
+  bareRecall: "minni_recall | issue 173 stop learn candidates",
+  bareLearn: "minni_learn | committed",
+  bareAgentPing: "agent_ping | ping delivered",
+  quotedMultilinePaste: QUOTED_AUDIT_TAIL,
+};
+
+const AUDIT_PROSE = {
+  definitionListTeamId: "- team_id | the tenant identifier",
+  definitionListAgentId: "* agent_id | which agent produced the row",
+  indexedColumns: "agent_id | role | created_at are the three indexed columns.",
+  toolEnumeration: "minni_recall | minni_learn are the two tools agents call most.",
+  shellPipeline: "run: journalctl | grep hook_stop | tail -5",
+  shortLearning: "Use WAL",
+};
+
+test("prepareOutcome separates audit tails from bulleted prose (round 4, defect 1)", async () => {
+  for (const [name, summary] of Object.entries(AUDIT_TELEMETRY)) {
+    const packet = await prepareOutcome({
+      task: "fix",
+      summary,
+      profile: "compact",
+      vaultPath: "/tmp/vault",
+    });
+    assert.deepEqual(packet.outcomeDraft.learnCandidates, [], `${name}: must be scrubbed as audit telemetry`);
+  }
+
+  for (const [name, summary] of Object.entries(AUDIT_PROSE)) {
+    const bySummary = await prepareOutcome({
+      task: "note",
+      summary,
+      profile: "compact",
+      vaultPath: "/tmp/vault",
+    });
+    assert.equal(bySummary.outcomeDraft.learnCandidates.length, 1, `${name}: summary must survive the audit scrub`);
+
+    // via `task` — the Stop path, where `task` is the user's own prompt and a
+    // single scrubbed line zeroes the entire candidate list.
+    const byTask = await prepareOutcome({
+      task: `Schema notes\n${summary}\nThat is the whole table.`,
+      summary: "recorded the schema review",
+      profile: "compact",
+      vaultPath: "/tmp/vault",
+    });
+    assert.equal(byTask.outcomeDraft.learnCandidates.length, 1, `${name}: prompt must survive the audit scrub`);
+  }
+});
+
+// Round-4 defect 2: the substance gate tokenized on `[\p{L}\p{N}]+` runs, which
+// scores an unspaced CJK sentence as ONE token — so a real learning was dropped
+// while "done done" passed. Tokens are word-segmented now.
+const CJK_LEARNINGS = {
+  // "always use WAL mode rather than the default"
+  chineseWalMode: "总是使用WAL模式而不是默认模式",
+  japaneseOnly: "日本語のみ",
+};
+
+test("prepareOutcome keeps unspaced CJK learnings (round 4, defect 2)", async () => {
+  for (const [name, summary] of Object.entries(CJK_LEARNINGS)) {
+    const packet = await prepareOutcome({
+      task: "note",
+      summary,
+      profile: "compact",
+      vaultPath: "/tmp/vault",
+    });
+    assert.equal(packet.outcomeDraft.learnCandidates.length, 1, `${name}: real learning must not be dropped`);
+  }
+
+  // The round-3 green assertions still hold: two Latin tokens pass, one does not,
+  // and a path-only summary is emptied by redaction before the gate sees it.
+  const kept = await prepareOutcome({
+    task: "note",
+    summary: "Use WAL",
+    profile: "compact",
+    vaultPath: "/tmp/vault",
+  });
+  assert.deepEqual(kept.outcomeDraft.learnCandidates, ["note: Use WAL"]);
+
+  for (const [name, summary] of Object.entries({
+    ok: "ok",
+    singleLetter: "a",
+    pathOnly: "/Users/hansaxelsson/Projects/Minni/plugins/minni/src/x.ts",
+  })) {
+    const packet = await prepareOutcome({
+      task: "fix the bug",
+      summary,
+      profile: "compact",
+      vaultPath: "/tmp/vault",
+    });
+    assert.deepEqual(packet.outcomeDraft.learnCandidates, [], `${name}: must not manufacture a candidate`);
+  }
+});
+
+// Defect 3: the AFM merge re-normalized the draft but never re-applied the scrub,
+// so telemetry proposed by the model bypassed it entirely. The scrub now lives in
+// normalizeOutcomeDraft, which every path funnels through.
+test("prepareOutcome scrubs telemetry returned by the AFM path (Issue #173 defect 3)", async () => {
+  const packet = await prepareOutcome(
+    {
+      task: "summarize backend hardening",
+      summary: "Prepared source ranking changes.",
+      profile: "compact",
+      useAfm: true,
+      vaultPath: "/tmp/vault",
+    },
+    {
+      afmPrepare: async () => ({
+        ok: true,
+        data: {
+          outcomeDraft: {
+            learnCandidates: [
+              "## [2026-07-25T16:47:42.513Z] minni_recall | issue 173 stop learn candidates",
+              "hook_codex_stop | stop abc",
+              "Profile-aware ranking is now the default.",
+            ],
+            logOnly: ["## [2026-07-25T16:47:42.513Z] hook_stop | stop session"],
+            expires: [],
+            doNotStore: [],
+          },
+        },
+      }),
+    },
+  );
+
+  assert.equal(packet.afm.used, true);
+  assert.deepEqual(packet.outcomeDraft.learnCandidates, ["Profile-aware ranking is now the default."]);
+  // logOnly is exactly where telemetry belongs — the scrub must not touch it.
+  assert.equal(packet.outcomeDraft.logOnly.length, 1);
+});
+
 test("prepareOutcome applies AFM outcome draft suggestions when requested", async () => {
   const packet = await prepareOutcome(
     {

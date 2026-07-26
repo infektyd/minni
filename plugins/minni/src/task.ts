@@ -667,6 +667,57 @@ function normalizeAfmResponse(data: unknown): Partial<PreparedTaskPacket> {
   return {};
 }
 
+// Redaction is shared with the deterministic composer so the substance gate can
+// judge the SAME text that will eventually be stored. See `outcomeDraft`.
+function redactDraftItem(item: string): string {
+  return item
+    .replace(/\/Users\/[^\s"',)]+/g, "[local-path]")
+    .replace(/\/Volumes\/[^\s"',)]+/g, "[local-path]")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+// Word segmentation for the substance gate. A whitespace/regex tokenizer counts
+// an unspaced CJK sentence as ONE token, so "总是使用WAL模式而不是默认模式"
+// ("always use WAL mode, not the default" — a real learning) scored 1 and was
+// dropped, while "done done" scored 2 and passed. `Intl.Segmenter` uses ICU's
+// dictionary break iterator and segments those scripts properly; Node ships
+// full-icu by default well below this package's `engines: node >=20`, and it is
+// typed in the ES2022 lib this project targets. Verified on the interpreter that
+// runs the suite (v26.5.0):
+//
+//     "总是使用WAL模式而不是默认模式" → 7  ["总是","使用","WAL","模式","而不是","默认","模式"]
+//     "日本語のみ"                    → 2  ["日本語","のみ"]
+//     "Use WAL"                        → 2   "ok" → 1   "a" → 1   "  .  " → 0
+//
+// The guard is belt-and-braces for a small-icu build, where the constructor
+// exists but the fallback below is the honest answer anyway.
+const WORD_SEGMENTER: Intl.Segmenter | undefined =
+  typeof Intl.Segmenter === "function" ? new Intl.Segmenter("und", { granularity: "word" }) : undefined;
+
+const CJK_CHARS = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/gu;
+
+// Word tokens that carry content AFTER redaction. The `[local-path]` placeholder
+// is stripped first: a path-only summary redacts to nothing but the placeholder,
+// and counting its "local"/"path" as learning content is precisely the hole this
+// closes.
+function contentTokenCount(text: string): number {
+  const stripped = text.replace(/\[local-path\]/g, " ");
+  if (WORD_SEGMENTER) {
+    let count = 0;
+    for (const segment of WORD_SEGMENTER.segment(stripped)) {
+      if (segment.isWordLike) count += 1;
+    }
+    return count;
+  }
+  // Fallback: the old tokenizer, with each ideograph/kana/hangul character in a
+  // run counted separately instead of the run counting as one. It over-counts
+  // CJK slightly, which is the safe direction — dropping a real learning is
+  // worse than admitting a weak one.
+  const tokens = stripped.match(/[\p{L}\p{N}][\p{L}\p{N}'’-]*/gu) ?? [];
+  return tokens.reduce((count, token) => count + Math.max(1, (token.match(CJK_CHARS) ?? []).length), 0);
+}
+
 function normalizeOutcomeDraft(draft: Partial<OutcomeDraft> | undefined): OutcomeDraft {
   const source = draft ?? {};
   const raw: Record<keyof OutcomeDraft, string[]> = {
@@ -675,12 +726,7 @@ function normalizeOutcomeDraft(draft: Partial<OutcomeDraft> | undefined): Outcom
     expires: Array.isArray(source.expires) ? source.expires.filter((item) => typeof item === "string") : [],
     doNotStore: Array.isArray(source.doNotStore) ? source.doNotStore.filter((item) => typeof item === "string") : [],
   };
-  const redact = (item: string): string =>
-    item
-      .replace(/\/Users\/[^\s"',)]+/g, "[local-path]")
-      .replace(/\/Volumes\/[^\s"',)]+/g, "[local-path]")
-      .replace(/\s+/g, " ")
-      .trim();
+  const redact = redactDraftItem;
   const seen = new Set<string>();
   const pick = (items: string[]) => {
     const out: string[] = [];
@@ -697,7 +743,12 @@ function normalizeOutcomeDraft(draft: Partial<OutcomeDraft> | undefined): Outcom
   const doNotStore = pick(raw.doNotStore);
   const expires = pick(raw.expires);
   const logOnly = pick(raw.logOnly);
-  const learnCandidates = pick(raw.learnCandidates);
+  // The telemetry scrub lives HERE, not at the individual call sites: every path
+  // that can produce a draft — the deterministic composer, the AFM merge in
+  // `prepareOutcome`, and `mergeAfmPacket`'s partial-packet parse — funnels
+  // through this function, so a future caller cannot route around it. Only
+  // `learnCandidates` are scrubbed; `logOnly` is exactly where telemetry belongs.
+  const learnCandidates = pick(raw.learnCandidates).filter((item) => !isAuditTelemetryLine(item));
   return { learnCandidates, logOnly, expires, doNotStore };
 }
 
@@ -997,12 +1048,145 @@ export async function prepareTask(input: PrepareTaskInput, deps: PrepareTaskDeps
   return packet;
 }
 
+// The audit-line GRAMMAR, as emitted by `recordAudit` in vault.ts:
+//
+//     ## [<timestamp>] <tool> | <summary>
+//
+// `<tool>` is drawn from a closed namespace of snake_case roots — the MCP tools
+// (`minni_*`, legacy `sovereign_*`), the hook audit prefixes (`hook`,
+// `hook_codex`, `hook_gemini`, `hook_grok`, `hook_cursor`, `hook_kilocode`, …
+// combined with `_stop`, `_session_start`, `_pre_compact`, `_error`, …), and the
+// daemon-side emitters (`afm_loop`, `agent_ping`, `handoff_sent`,
+// `handoff_received`). Matching a ROOT PREFIX rather than an enumeration keeps
+// this stable as new tools/events are added.
+//
+// Two grades of tool token, because the two line forms carry different amounts
+// of corroborating evidence:
+//
+//   * `AUDIT_TOOL` — root prefixes. Only used by the header form, which is
+//     already pinned by `## [<timestamp>]`; the timestamp is the strong signal
+//     there, so the tool token may stay open-ended.
+//   * `AUDIT_TOOL_KNOWN` — the bare/quoted form has no timestamp, so its tool
+//     token IS the whole signal and must come from the real tool space.
+//     `hook_`/`minni_`/`sovereign_` stay open-ended: they are tool namespaces,
+//     not English identifier prefixes. `agent_` and `team_` are NOT — `agent_id`
+//     and `team_id` are the two most common column names in this repo's own
+//     schema prose — so those namespaces are enumerated by exact emitter name.
+//
+// Derived by reading every audit header on this machine
+// (`grep -ho '^## \[[^]]*\] [a-z0-9_]*' ~/.minni/*/log.md | sort -u`, 2026-07-25):
+// the observed roots are `hook_*`, `minni_*`, `sovereign_*`, plus exactly
+// `afm_loop`, `handoff_sent`, `handoff_received`. `agent_ping` is the
+// daemon-side emitter named in the grammar above; it has no sample in these
+// logs, so it is carried on the enumeration rather than inferred.
+const AUDIT_TOOL_NAMESPACE = String.raw`(?:hook|minni|sovereign)_[a-z0-9_]+`;
+const AUDIT_TOOL_EXACT = String.raw`(?:afm_loop|agent_ping|handoff_sent|handoff_received)`;
+const AUDIT_TOOL = String.raw`(?:hook|minni|sovereign|agent|afm|handoff|team)_[a-z0-9_]+`;
+const AUDIT_TOOL_KNOWN = String.raw`(?:${AUDIT_TOOL_NAMESPACE}|${AUDIT_TOOL_EXACT})`;
+
+// Full form: `## [ts] <tool> |`. This shape is specific enough that it is safe to
+// match ANYWHERE in the blob — Stop collapses newlines into spaces before the
+// scrub, so a pasted log tail no longer begins at a line start.
+const AUDIT_HEADER_LINE = new RegExp(String.raw`##[ \t]+\[[^\]\n]{4,64}\][ \t]+${AUDIT_TOOL}[ \t]*\|`, "i");
+
+// Quoted/bulleted line starts. A pasted log tail is almost never pasted bare:
+// it arrives inside a blockquote (`> hook_stop | …`) or a bullet (`- minni_learn
+// | …`). A plain `^[ \t]*` anchor let that prefix carry the whole audit grammar
+// past the scrub, so the prefix is part of the anchor.
+//
+// Admitting the prefix with the OPEN root set was itself a regression: a
+// markdown definition list is the highest-traffic prose shape in this repo's
+// docs, and `- team_id | the tenant identifier` matched. The prefix is safe only
+// because the bare form now demands `AUDIT_TOOL_KNOWN` — bulleted or not, a line
+// whose first column is `team_id`/`agent_id` names no tool that exists.
+const AUDIT_LINE_PREFIX = String.raw`[ \t]*(?:[>*\-+][ \t]*)*`;
+
+// Bare form: a header-less tail line, `<tool> | <summary>`. This one MUST be
+// anchored to a line start (multiline). A substring match here is what made the
+// old pattern reject legitimate user prose — "debug the hook_stop | grep
+// pipeline" and "journalctl | grep hook_stop | tail -5" are prompts, not
+// telemetry, and since Stop derives `task` from the user's own message a
+// substring match silently zeroed the entire candidate list.
+//
+// The anchor alone is not enough, because a leading `<snake_case> |` is ALSO the
+// shape of ordinary prose and of markdown tables ("agent_id | role | created_at
+// are the three indexed columns.", "team_id | user_id form the composite primary
+// key"). Two independent signals separate the two, one on each side of the `|`:
+//
+//   * the HEAD must name a tool that actually emits audit lines
+//     (`AUDIT_TOOL_KNOWN`), which is what keeps `team_id |`/`agent_id |` out
+//     while `minni_recall |` and `hook_codex_stop |` stay in.
+//   * the TAIL must look like an audit summary rather than more columns:
+//     a real audit line has exactly ONE `|` — the tool/summary delimiter, so a
+//     second `|` means a table or an enumeration of identifiers, never
+//     `recordAudit` output — and its summary is prose about what happened ("stop
+//     s1: no draftable signal", "accepted handoff") rather than another
+//     snake_case identifier, which is exactly how prose that LISTS tools opens
+//     ("minni_recall | minni_learn are the two tools …").
+//
+// The signals are independent and sit on opposite sides of the delimiter, so
+// tightening one does not loosen the other: the quote/bullet prefix closes the
+// pasted-log escape, the known-tool head closes the definition-list false
+// positive, and the tail shape closes the table/enumeration false positives.
+//
+// The anchor is why callers must test the RAW fields, not the composed
+// `"<task>: <summary>"` string — the composition would push a genuine bare tail
+// line off the line start. See `outcomeDraft`.
+const AUDIT_BARE_LINE = new RegExp(
+  // The lookahead swallows its own leading whitespace on purpose: hoisting the
+  // `[ \t]*` out in front of it would let the engine backtrack to zero spaces and
+  // satisfy the negative lookahead against the space itself.
+  String.raw`^${AUDIT_LINE_PREFIX}${AUDIT_TOOL_KNOWN}[ \t]*\|(?![ \t]*[a-z0-9]+_[a-z0-9]+)[^|\n]*$`,
+  "im",
+);
+
+export function isAuditTelemetryLine(text: string): boolean {
+  return AUDIT_HEADER_LINE.test(text) || AUDIT_BARE_LINE.test(text);
+}
+
+// The genuine outcome-drafting path (explicit minni_prepare_outcome): the
+// caller supplies a real distilled summary, so the candidate is built verbatim
+// — a short valid learning like "Use WAL" must pass through unfiltered.
+// Telemetry audit logs are rejected as defense-in-depth against corpus poisoning.
+// `task` and `summary` are checked SEPARATELY, on the raw fields: telemetry can
+// arrive via either, and the bare-tail-line form of the audit grammar is anchored
+// to a line start, which composing `"<task>: <summary>"` would defeat.
+// `normalizeOutcomeDraft` re-scrubs whole candidates as the backstop that the AFM
+// path cannot route around.
 function outcomeDraft(input: PrepareOutcomeInput): OutcomeDraft {
   const verification = input.verification ?? [];
   const changedFiles = input.changedFiles ?? [];
-  const learnCandidates = [
-    `${input.task}: ${input.summary}`.replace(/\s+/g, " ").slice(0, 500),
-  ];
+  const summary = input.summary ?? "";
+  // A candidate carries learning content only if the SUMMARY does. `changedFiles`
+  // stay log-only enrichment on purpose — a file list is not a learning and must
+  // never by itself manufacture a candidate.
+  //
+  // ORDERING (do not reorder): the gate runs on the REDACTED summary, because
+  // `normalizeOutcomeDraft` redacts AFTER this function composes. A "one letter
+  // or digit anywhere" test on the RAW summary passed a path-only summary
+  // ("/Users/…/src/x.ts"), which redaction then emptied to "[local-path]" — a
+  // candidate with zero content, written to the inbox. Redacting first is what
+  // makes the gate judge the text that actually gets stored.
+  //
+  // THRESHOLD: at least two content word tokens. One token is an
+  // acknowledgement, not a learning — "ok", "a", "done" compose to
+  // `"<task>: ok"` (worst case, with no `last_user_message`, "ok: ok") and teach
+  // nothing, while the shortest genuine learning we carry a green assertion for
+  // ("Use WAL") is two. Punctuation-only and whitespace-only summaries score
+  // zero, as does a summary that redaction empties. Tokens are word-segmented,
+  // not whitespace-split, so an unspaced CJK learning is scored by its words
+  // rather than as a single token (see `contentTokenCount`).
+  //
+  // The threshold is deliberately NOT a stopword filter. A stopword-only summary
+  // ("done done") is arguably contentless and does pass, but every stopword list
+  // that rejects it also rejects "Use WAL" — "use" is a stopword in all of them
+  // — and a real learning silently discarded is strictly worse than a weak one
+  // admitted: the weak candidate still faces `minni_learning_quality` and the
+  // human resolving the inbox, while the discarded one is gone with no trace.
+  const hasSubstance = contentTokenCount(redactDraftItem(summary)) >= 2;
+  const telemetry = isAuditTelemetryLine(input.task) || isAuditTelemetryLine(summary);
+  const rawCandidate = `${input.task}: ${summary}`.replace(/\s+/g, " ").slice(0, 500);
+  const learnCandidates = hasSubstance && !telemetry ? [rawCandidate] : [];
   const logOnly = [
     ...verification.map((item) => `Verification: ${item}`),
     changedFiles.length > 0 ? `Changed files: ${changedFiles.join(", ")}` : "",

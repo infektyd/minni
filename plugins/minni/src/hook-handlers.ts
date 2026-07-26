@@ -5,7 +5,10 @@
 // the stateful handler logic, parameterized by a typed per-agent config, so
 // future changes (evidence envelope format, plan injection, inbox drain
 // logic) have ONE maintenance surface instead of four. hook.ts (claude-code)
-// keeps its own handlers.
+// diverges structurally (PreCompact cannot inject context) and keeps its own
+// handler set — but NOT its own Stop: that one is `handleStopCore` below, which
+// hook.ts imports, because the Stop governance posture must be identical on
+// every platform and the two copies had already drifted.
 //
 // Handlers here return INTENT, not wire shapes: what reaches the model is
 // decided per platform by hook-platform.ts. Emitting Claude Code's envelope
@@ -22,7 +25,9 @@ import {
   VALID_EVENTS,
   asString,
   emit,
+  inboxPrincipalForVaultPath,
   readStdin,
+  stringArray,
   vaultRecallToBody,
   workspaceFromPayload,
 } from "./hook-utils.js";
@@ -132,13 +137,13 @@ export interface AgentHookConfig {
    * Defaults to the MCP-tool phrasing; kilocode points at /minni:learn.
    */
   stopCommitHint?: string;
-  /**
-   * When true, Stop writes the inbox file + audit entry even with zero
-   * candidates (codex's historical behavior); when false, an empty outcome
-   * early-returns before any write so the inbox is never littered with empty
-   * files (grok's and kilocode's behavior).
-   */
-  alwaysWriteStopInbox: boolean;
+  // RETIRED 2026-07-25: `alwaysWriteStopInbox`. It once let codex keep the
+  // historical "write the Stop inbox file even with zero candidates" behavior;
+  // e51ed45 flipped codex to false because always-write produced kind-less
+  // inbox noise the AFM ingest loop skips as _unrecognized, leaving every
+  // entrypoint on false. Under the governance posture below Stop never
+  // self-drafts on any platform, so a per-agent knob for littering the inbox
+  // has no legitimate setting — the zero-candidate skip is now unconditional.
   /**
    * s6 PreToolUse recall-guard mode override. When set, it wins over the
    * MINNI_RECALL_GUARD_MODE env default ("off" | "soft" | "strict"). Omit to
@@ -156,6 +161,160 @@ export interface AgentHookConfig {
 /** Test seam: lets behavioral tests drive the zero-candidate Stop branch. */
 export interface AgentHookDeps {
   prepareOutcome?: typeof prepareOutcome;
+}
+
+/**
+ * Per-platform inputs to `handleStopCore`. `AgentHookConfig` is a structural
+ * superset, so the factory passes its own config straight through; hook.ts
+ * builds one from its CLAUDECODE_* constants.
+ */
+export interface StopCoreConfig {
+  agentId: string;
+  vaultPath: string;
+  defaultWorkspaceId: string;
+  auditPrefix: string;
+  stopCommitHint?: string;
+  /** Platform wire for last-task text; optional so tests can omit it. */
+  wire?: PlatformWire;
+}
+
+/**
+ * The ONE Stop implementation, shared by the factory and by hook.ts.
+ *
+ * hook.ts keeps its own entrypoint because Claude Code's PreCompact cannot
+ * inject context, so its handler SET diverges — but its Stop GOVERNANCE is not
+ * allowed to diverge, and it did: the claude-code copy dropped
+ * `kind`/`agent_id`/`workspace_id` from the inbox write (so
+ * inbox_ingest.py filed every Claude Code candidate under workspace "default"
+ * regardless of cwd) and omitted `workspace` from its audit breadcrumb, and the
+ * zero-candidate guard had to be patched separately in both copies. Nothing
+ * about Stop legitimately differs per platform; everything that varies is a
+ * field of StopCoreConfig.
+ */
+export async function handleStopCore(
+  config: StopCoreConfig,
+  payload: Record<string, unknown>,
+  prepareOutcomeFn: typeof prepareOutcome = prepareOutcome,
+): Promise<HookOutput> {
+  await ensureVault(config.vaultPath);
+  const sessionId = asString(payload.session_id) || asString(payload.sessionId) || "session";
+  const workspaceId = workspaceFromPayload(payload, config.defaultWorkspaceId);
+  // Task and summary must stay distinct. Falling back to `summary` for the
+  // task field made summary-only payloads compose `"<summary>: <summary>"` —
+  // one of the two forward-compat shapes always produced a duplicated candidate.
+  // Prefer the platform wire's Stop task text (assistant final message, etc.),
+  // then a real user prompt when present; otherwise the session id is enough
+  // context for the `"${task}: ${summary}"` form in prepareOutcome. Never fall
+  // back to `summary`.
+  const lastTask =
+    (config.wire?.lastTaskText(payload) || "").trim() ||
+    asString(payload.last_user_message) ||
+    sessionId;
+
+  // GOVERNANCE POSTURE — Stop auto-draft RETIRED 2026-07-24. The 2026-07-23
+  // inbox investigation found Stop's audit-tail distillation produced 0 real
+  // learnings across 40 drafts: the tail is Minni's OWN telemetry log, so the
+  // draft was noise by construction. The durable-capture path is now
+  // EXCLUSIVELY the agent's explicit minni_prepare_outcome / minni_learn call.
+  // Stop no longer self-drafts. The `changedFiles`/`summary` branch below is a
+  // documented FORWARD-COMPAT hook: it fires only if a future Stop harness
+  // supplies genuine outcome material in the payload (today's real harnesses
+  // never do). Absent that — or when the material scrubs to zero candidates
+  // at the guard below — Stop records ONE log-only breadcrumb (so the session
+  // is not silently invisible) and writes no inbox file. That breadcrumb is
+  // load-bearing, and it is only actually reaching log.md because vault.ts
+  // exempts `*_stop` from the hook_* audit throttle — before that exemption a
+  // same-second UserPromptSubmit swallowed it and the claim above was false.
+  // Keep the two in sync. This holds on EVERY
+  // platform, claude-code included: there is no per-agent opt-out (see the
+  // retired `alwaysWriteStopInbox` note on AgentHookConfig).
+  // NOTE: this is a governance-posture change — it needs operator sign-off
+  // before the plugin is re-propagated.
+  const changedFiles = stringArray(payload.changedFiles ?? payload.changed_files);
+  const outcomeSummary = asString(payload.summary).trim();
+  const hasDraftableSignal = changedFiles.length > 0 || outcomeSummary.length > 0;
+
+  if (!hasDraftableSignal) {
+    await recordAudit(config.vaultPath, {
+      tool: `${config.auditPrefix}_stop`,
+      summary: `stop ${sessionId}: no draftable signal`,
+      details: { workspace: workspaceId, candidates: 0 },
+    });
+    return { continue: true };
+  }
+
+  const outcome = await prepareOutcomeFn({
+    task: lastTask.slice(0, 200),
+    summary: outcomeSummary,
+    changedFiles,
+    profile: "compact",
+    vaultPath: config.vaultPath,
+  });
+
+  const candidates = outcome.outcomeDraft.learnCandidates;
+
+  // The signal was draftable but prepareOutcome's telemetry filter
+  // (isAuditTelemetryLine) scrubbed it to nothing — e.g. a harness that
+  // hands Stop a slice of Minni's own audit log as `summary`. The scrub has
+  // to hold at the WRITE layer too: writing the file anyway reintroduces
+  // precisely the empty-inbox litter issue #173 removed, and the AFM ingest
+  // loop then skips it as unrecognized noise. One log-only breadcrumb (same
+  // shape as the no-draftable-signal branch above) keeps the session visible
+  // without costing an inbox file. This is also the guard that keeps holding
+  // when the drafter itself yields nothing for `changedFiles` without a
+  // `summary` — the write layer must not depend on the drafter's verdict.
+  if (candidates.length === 0) {
+    await recordAudit(config.vaultPath, {
+      tool: `${config.auditPrefix}_stop`,
+      summary: `stop ${sessionId}: no candidates after scrub`,
+      details: { workspace: workspaceId, candidates: 0 },
+    });
+    return { continue: true };
+  }
+
+  // `kind`/`agent_id`/`workspace_id` are the INGEST CONTRACT, not decoration:
+  // src/minni/afm_passes/inbox_ingest.py reads `workspace_id or "default"`, so
+  // an unstamped file lands in the catch-all workspace no matter what cwd the
+  // session ran in, and `agent_id` is cross-checked against the vault-derived
+  // principal for provenance. `kind` names the FILE FORMAT, never the author.
+  //
+  // The `agent_id` stamp is the INGEST's principal (inboxPrincipalForVaultPath),
+  // NOT `config.agentId`. That cross-check is an equality test that DROPS the
+  // file on mismatch, and the configured id is operator-settable
+  // (MINNI_CLAUDECODE_AGENT_ID=claudecode) while the principal is derived from
+  // the vault dir name — so stamping the config id silently discarded every
+  // Claude Code candidate as `_agent_mismatch`. Undefined (a vault dir with no
+  // `-vault` suffix) writes NO stamp: an absent agent_id skips the cross-check,
+  // which is the pre-stamp behavior and strictly better than a wrong guess.
+  const inbox = await writeInbox(config.vaultPath, sessionId, {
+    kind: "stop_candidates",
+    agent_id: inboxPrincipalForVaultPath(config.vaultPath),
+    workspace_id: workspaceId,
+    candidates,
+    log_only: outcome.outcomeDraft.logOnly,
+    expires: outcome.outcomeDraft.expires,
+    do_not_store: outcome.outcomeDraft.doNotStore,
+    last_task: lastTask.slice(0, 200),
+  });
+
+  await recordAudit(config.vaultPath, {
+    tool: `${config.auditPrefix}_stop`,
+    summary: `stop ${sessionId}`,
+    details: {
+      candidates: candidates.length,
+      workspace: workspaceId,
+      inbox_path: inbox.filePath,
+    },
+  });
+
+  return {
+    continue: true,
+    systemMessage: `Minni: ${candidates.length} candidate learning${
+      candidates.length === 1 ? "" : "s"
+    } drafted to inbox (${inbox.filePath}). ${
+      config.stopCommitHint ?? "Use minni_prepare_outcome/minni_learn to review and commit."
+    }`,
+  };
 }
 
 export interface AgentHookHandlers {
@@ -642,65 +801,15 @@ export function createHookHandlers(
     return render(injectIntent("PreCompact", envelope));
   }
 
+  // Stop lives in the shared handleStopCore (above) so the governance posture
+  // has exactly one implementation across all five entrypoints — see its
+  // doc comment for why hook.ts routes here too.
   async function handleStop(payload: Record<string, unknown>): Promise<HookOutput> {
-    await ensureVault(config.vaultPath);
-    const sessionId = asString(payload.session_id) || asString(payload.sessionId) || "session";
-    const workspaceId = workspaceFor(payload);
-    // `last_user_message` exists on no platform -- reading it always yielded
-    // "" and degraded every learn candidate to a bare session id. Each platform
-    // supplies the ASSISTANT's final message, under its own spelling.
-    const lastTask = wire.lastTaskText(payload) || sessionId;
-    const tail = await auditTail(config.vaultPath, 30);
-    const outcome = await prepareOutcomeFn({
-      task: lastTask.slice(0, 200),
-      summary: tail.entries.slice(-5).join("\n").slice(0, 600) || "session ended",
-      profile: "compact",
-      vaultPath: config.vaultPath,
-    });
-
-    const candidates = outcome.outcomeDraft.learnCandidates;
-    // Nothing worth persisting: skip the inbox write and audit entry so we
-    // don't litter the inbox with empty files or pad the audit log with noise
-    // (unless this agent's config keeps the historical always-write behavior).
-    if (!config.alwaysWriteStopInbox && candidates.length === 0) {
-      return render(noIntent);
+    const result = await handleStopCore(config, payload, prepareOutcomeFn);
+    if (result.systemMessage) {
+      return render(noteIntent("Stop", result.systemMessage));
     }
-
-    const inbox = await writeInbox(config.vaultPath, sessionId, {
-      kind: "stop_candidates",
-      agent_id: config.agentId,
-      workspace_id: workspaceId,
-      candidates,
-      log_only: outcome.outcomeDraft.logOnly,
-      expires: outcome.outcomeDraft.expires,
-      do_not_store: outcome.outcomeDraft.doNotStore,
-      last_task: lastTask.slice(0, 200),
-    });
-
-    await recordAudit(config.vaultPath, {
-      tool: `${config.auditPrefix}_stop`,
-      summary: `stop ${sessionId}`,
-      details: {
-        candidates: candidates.length,
-        workspace: workspaceId,
-        inbox_path: inbox.filePath,
-      },
-    });
-
-    if (candidates.length === 0) {
-      return render(noIntent);
-    }
-
-    return render(
-      noteIntent(
-        "Stop",
-        `Minni: ${candidates.length} candidate learning${
-          candidates.length === 1 ? "" : "s"
-        } drafted to inbox (${inbox.filePath}). ${
-          config.stopCommitHint ?? "Use minni_prepare_outcome/minni_learn to review and commit."
-        }`,
-      ),
-    );
+    return render(noIntent);
   }
 
   async function dispatch(

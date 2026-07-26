@@ -52,11 +52,20 @@ export function adaptAgyPayload(
     out.session_id = conversationId;
   }
 
-  if (!asString(out.workspace_id) && Array.isArray(raw.workspacePaths)) {
+  // workspacePaths is agy's CWD, not a workspace LABEL. Filling `workspace_id`
+  // from it short-circuited workspaceFromPayload's explicit-id branch, so the
+  // agy surface skipped both the project-root walk and the realpath that every
+  // other entrypoint applies: a session started in `<repo>/sub` (or through a
+  // symlink) labelled itself `<repo>/sub` where claude-code labelled the same
+  // physical directory `<repo>`, splitting one project's memory in two.
+  // Populate `cwd` instead and let the shared resolver do its job — an
+  // explicit, caller-supplied `workspace_id` still wins, which is what that
+  // short-circuit is actually for.
+  if (!asString(out.cwd) && Array.isArray(raw.workspacePaths)) {
     const workspace = raw.workspacePaths.find(
       (entry): entry is string => typeof entry === "string" && entry.trim() !== "",
     );
-    if (workspace) out.workspace_id = workspace;
+    if (workspace) out.cwd = workspace;
   }
 
   const toolCall = raw.toolCall;

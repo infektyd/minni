@@ -40,7 +40,6 @@ function turnConfig(vaultPath, overrides = {}) {
     contextWindow: 200_000,
     hooksEnabled: true,
     auditPrefix: "hook_test",
-    alwaysWriteStopInbox: false,
     ...overrides,
   };
 }

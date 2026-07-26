@@ -77,7 +77,11 @@ async function runGeminiHook(event, fixture, payload, extraEnv = {}) {
 test("adaptAgyPayload maps agy fields to the factory's canonical names", () => {
   const adapted = adaptAgyPayload(agyPreToolUsePayload({ workspacePaths: ["/w/repo"] }));
   assert.equal(adapted.session_id, "cfcd2d03-9775-4ff2-8667-ba461998307f");
-  assert.equal(adapted.workspace_id, "/w/repo");
+  // workspacePaths is agy's CWD, not a workspace LABEL: it must feed `cwd` so
+  // the shared resolver applies the project-root walk + realpath every other
+  // entrypoint gets. Pre-empting `workspace_id` skipped both.
+  assert.equal(adapted.cwd, "/w/repo");
+  assert.equal(adapted.workspace_id, undefined);
   assert.equal(adapted.tool_name, "Bash");
   assert.deepEqual(adapted.tool_input, {
     command: "echo hello",
@@ -98,7 +102,7 @@ test("adaptAgyPayload never clobbers canonical fields and passes unknown tools t
   assert.equal(native.session_id, "native-session");
   assert.equal(native.tool_name, "browser_navigate");
   assert.deepEqual(native.tool_input, { Url: "https://x" });
-  assert.equal(native.workspace_id, "/w/second");
+  assert.equal(native.cwd, "/w/second");
 });
 
 test("adaptPreToolUseOutput: allow collapses to explicit allow, deny carries the reason", () => {
@@ -392,7 +396,7 @@ test("vault default mirrors propagate's legacy fallback when only ~/.gemini/minn
   }
 });
 
-test("Stop drafts candidates under gemini's own identity stamps", async () => {
+test("Stop under gemini identity: no inbox without outcome summary; stamps hold if drafted", async () => {
   const fixture = await makeFixture();
   try {
     const output = await runGeminiHook("Stop", fixture, agyPreToolUsePayload({ toolCall: null }));
@@ -405,21 +409,12 @@ test("Stop drafts candidates under gemini's own identity stamps", async () => {
     );
     const inboxDir = path.join(fixture.vault, "inbox");
     const entries = await readdir(inboxDir).catch(() => []);
-    // Candidate drafting is local (no daemon needed): if the compact outcome
-    // produced candidates, the draft must carry gemini's canonical stamps —
-    // never another agent's identity — and audit under the gemini prefix.
-    for (const entry of entries) {
-      const draft = JSON.parse(await readFile(path.join(inboxDir, entry), "utf8"));
-      assert.equal(draft.kind, "stop_candidates");
-      assert.equal(draft.agent_id, "gemini");
-      // The agy conversationId must have become the session id in the filename.
-      assert.match(entry, /cfcd2d03/);
-    }
-    if (entries.length > 0) {
-      const log = await readFile(path.join(fixture.vault, "log.md"), "utf8");
-      assert.ok(log.includes("hook_gemini_stop"), "Stop must audit under the hook_gemini prefix");
-      assert.ok(!log.includes("hook_codex"), "gemini hook must not audit under another agent's prefix");
-    }
+    // Live agy Stop only enriches last_user_message — that is not draftable
+    // under the retired auto-draft posture, so the inbox must stay empty.
+    assert.equal(entries.length, 0, "agy Stop without summary must not draft candidates");
+    const log = await readFile(path.join(fixture.vault, "log.md"), "utf8");
+    assert.ok(log.includes("hook_gemini_stop"), "Stop must audit under the hook_gemini prefix");
+    assert.ok(!log.includes("hook_codex"), "gemini hook must not audit under another agent's prefix");
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }

@@ -58,8 +58,6 @@ const CONFIG: AgentHookConfig = {
   // No precompactKind: like kilocode, PreCompact (if agy ever dispatches it)
   // stashes stale-belief events as a precompact_reassert entry instead of a
   // durable handoff file.
-  // Like grok/kilocode, an empty Stop outcome skips the inbox write entirely.
-  alwaysWriteStopInbox: false,
   recallGuardMode: GEMINI_GUARD_MODE,
   wire: geminiWire,
 };
@@ -106,7 +104,10 @@ async function main(): Promise<void> {
   }
   if (event === "Stop") {
     // Best-effort: pull the real last user message from agy's transcript so
-    // Stop drafts candidates about the actual task, not the conversation id.
+    // the Stop breadcrumb (and any future summary-bearing payload) names the
+    // actual task rather than the conversation id. Bare last_user_message is
+    // NOT draftable outcome material under the retired Stop auto-draft posture
+    // — only an explicit payload `summary` / `changedFiles` would draft.
     payload = await enrichAgyStopPayload(payload).catch(() => payload);
   }
   try {

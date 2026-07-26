@@ -32,9 +32,7 @@ void runHookMain({
   // Review-panel fix (shared root cause of five findings): Stop previously
   // wrote an inbox file UNCONDITIONALLY (zero-candidate litter) and without
   // the canonical stop_candidates kind or agent_id/workspace_id stamps. The
-  // factory's guarded write supplies all three; like grok, an empty outcome
-  // skips the write entirely.
-  alwaysWriteStopInbox: false,
+  // factory's guarded write supplies all three.
   // Wire is the platform contract, not the memory principal. Agent id is
   // user-overridable (MINNI_KILOCODE_AGENT_ID); deriving the wire from it
   // would fall through to claudeCodeWire and drop PreCompact injection.

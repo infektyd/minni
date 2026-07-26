@@ -23,10 +23,6 @@ void runHookMain({
   hookScript: "codex-hook.js",
   auditPrefix: "hook_codex",
   precompactKind: "codex_precompact_handoff",
-  // Empty outcome drafts no longer force an inbox write: the historical
-  // always-write behavior produced the kind-less draft-file noise the AFM
-  // ingest loop skips as _unrecognized.
-  alwaysWriteStopInbox: false,
   // Wire is the platform contract, not the memory principal. Agent id is
   // user-overridable; deriving the wire from it would fall through to the
   // Claude shape under a custom MINNI_CODEX_AGENT_ID.

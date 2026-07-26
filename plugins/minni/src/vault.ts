@@ -238,20 +238,52 @@ function queryTerms(query: string): string[] {
     "an",
     "and",
     "are",
+    "as",
+    "at",
+    "be",
+    "by",
+    "do",
     "for",
+    "if",
     "in",
     "is",
     "it",
+    "no",
     "of",
     "on",
     "or",
+    "so",
     "the",
     "to",
+    "up",
+    "we",
     "with",
+    "you",
+    "can",
+    "how",
+    "what",
+    "where",
+    "which",
+    "who",
+    "why",
   ]);
-  return [
-    ...new Set(query.toLowerCase().match(/[a-z0-9_/-]{3,}/g) ?? []),
-  ].filter((term) => !stop.has(term));
+  // A token must carry at least one alphanumeric character. The 2-character
+  // minimum admits real short terms ("ci", "db"), but without this guard it
+  // also emits pure-punctuation tokens: "use // for comments" tokenised to
+  // ["use", "//", "comments"], and "//" matched every URL in the vault.
+  // Measured on claudecode-vault, that query returned 105 notes against 97 for
+  // "use comments" — 15 inflated by up to +5 from slashes alone and 8 admitted
+  // with no relation to the query at all. Main's 3-character minimum excluded
+  // these tokens by accident; this excludes them on purpose.
+  const tokens = [
+    ...new Set(query.toLowerCase().match(/[a-z0-9_/-]{2,}/g) ?? []),
+  ].filter((token) => /[a-z0-9]/.test(token));
+  const content = tokens.filter((token) => !stop.has(token));
+  // Stopword-only queries ("why?", "how do we do it?") must not tokenise to
+  // nothing: an empty term list makes searchVaultNotes return zero results for
+  // a query main answered. Fall back to the raw tokens — a weak signal beats
+  // no signal, and the phrase bonus still does the real ranking.
+  return content.length > 0 ? content : tokens;
 }
 
 const PRIVACY_LEVELS: ReadonlyArray<PrivacyLevel> = [
@@ -319,6 +351,43 @@ function titleFromMarkdown(relativePath: string, markdown: string): string {
   return path.basename(relativePath, ".md");
 }
 
+/** First WHOLE-WORD occurrence of `term` in `text`, or -1. */
+function firstWordIndex(text: string, term: string): number {
+  const regex = wordRegex(term, true);
+  if (!regex) return -1;
+  regex.lastIndex = 0; // shared cached /g regex
+  return regex.exec(text)?.index ?? -1;
+}
+
+// The window is located in two tiers, and the ORDER is the whole point.
+//
+// Tier 1 is the whole-word index, because the window should be centred on
+// evidence the SCORER accepted. Locating it with indexOf alone centred it on
+// substrings the scorer had explicitly rejected — the query `pro` returned
+// windows opening on "proof", "PROVEN" and "promises", the exact bleed the
+// whole-word matcher exists to exclude, re-introduced in the one place the user
+// actually reads. Keeping whole-word FIRST keeps every one of those windows on
+// the whole-word hit.
+//
+// Tier 2 is a plain case-insensitive indexOf, reached only when NO term occurs
+// as a whole word anywhere in the body. Making that case fall straight to
+// offset 0 was a regression: a note admitted on its PATH (`auth` scoring 51 via
+// `wiki/auth/notes.md`) whose prose says "authentication" has no whole-word hit
+// — the morphological suffix covers `-s/-es/-ing/-ed`, not `-entication` — and
+// showed its boilerplate opening instead of the sentence the user searched for.
+//
+// Tier 2 is unverified by the scorer, exactly as offset 0 is, and it is not
+// free: over 60 queries x 4 real vaults it fired on 4 of 908 top-5 slots, three
+// landing on a longer form of the query ("scorecard", "reranker", "notepath")
+// and one on a coincidence ("ping" inside "jumping"). The trade is deliberate —
+// the alternative for all four was the head of the note, which contains the
+// query nowhere at all — and the ordering is what keeps the cost this small:
+// every window that has a whole-word hit still gets it.
+//
+// Offset 0 survives for the notes where the query appears nowhere in the prose
+// at all — qualifying on the path or on a frontmatter field (`type: correction`
+// for the query `correction`) — where the head of the note is genuinely the
+// best available preview.
 function snippetFor(
   markdown: string,
   terms: string[],
@@ -329,13 +398,15 @@ function snippetFor(
     .replace(/^#+\s+/gm, "")
     .replace(/\s+/g, " ")
     .trim();
-  const lower = plain.toLowerCase();
-  const firstHit =
-    terms
-      .map((term) => lower.indexOf(term))
-      .filter((index) => index >= 0)
-      .sort((a, b) => a - b)[0] ?? 0;
-  const start = Math.max(0, firstHit - 80);
+  const earliest = (indexes: number[]): number =>
+    indexes.filter((index) => index >= 0).sort((a, b) => a - b)[0] ?? -1;
+  let firstHit = earliest(terms.map((term) => firstWordIndex(plain, term)));
+  if (firstHit < 0) {
+    // terms are lowercased by queryTerms; the whole-word regexes carry /i.
+    const lower = plain.toLowerCase();
+    firstHit = earliest(terms.map((term) => lower.indexOf(term)));
+  }
+  const start = Math.max(0, Math.max(firstHit, 0) - 80);
   const end = Math.min(plain.length, start + maxLength);
   const prefix = start > 0 ? "..." : "";
   const suffix = end < plain.length ? "..." : "";
@@ -379,6 +450,40 @@ export const CORRECTION_CLASS_TYPES = new Set([
 ]);
 export const CORRECTION_SALIENCE_BOOST = 0.25;
 
+// Noise floor for vault search. It gates the TERM score — the raw match
+// evidence — never the final score; see the gate in scoreVaultNote for why.
+//
+// The value is 1: one whole-word occurrence of one query term is enough.
+//
+// Two different gates of "2" have been proposed and they must not be conflated,
+// because the numbers usually quoted for this constant belong to the one that
+// was NEVER shipped. Measured over 60 queries (40 single-term + 20
+// natural-language) x 4 real vaults, against this scorer, as a fraction of the
+// notes admitted at the current floor (claudecode / codex / grok-build /
+// gemini):
+//
+//   termScore >= 2  — the candidate rejected here — drops 19.0/14.0/11.5/15.2%
+//   finalScore >= 2 — the PREDECESSOR this replaced  — drops  1.8/2.3/4.4/7.7%
+//
+// So the honest delta against what actually shipped before is the second row,
+// not the first: roughly two to eight percent of admitted notes, and 13 of 998
+// user-visible top-5 slots (2 queries un-starved below the default limit of 5).
+// That is a small, real improvement, not a large one. The reason to prefer it
+// is categorical rather than volumetric: the predecessor gated the FINAL score,
+// which inverted correction salience (see the gate in scoreVaultNote), and one
+// of those 13 recovered slots is a correction-class note that the multiplicative
+// boost had pushed below the predecessor's own cut.
+//
+// The premise the 2 rested on — "a single-word query always scores >= 50,
+// because the phrase and term checks coincide" — is also false. phraseForm
+// keeps `.` and queryTerms does not tokenise it, so `node.js` and `socket.io`
+// diverge: on claudecode-vault `node.js` matched 54 notes of which 53 scored
+// below 50 and 3 scored exactly 1. Only pure `[a-z0-9_/-]` queries have the
+// coincidence property. The noise a floor of 2 was aimed at is already handled
+// by whole-word matching, which cut main's admitted-but-irrelevant notes from
+// 7429/2322/405/261 to 28/2/2/2 on the same query set.
+const MIN_TERM_SCORE = 1;
+
 function frontmatterField(markdown: string, key: string): string | undefined {
   const fm = markdown.match(/^---\r?\n([\s\S]*?)\r?\n---/);
   if (!fm) return undefined;
@@ -388,6 +493,200 @@ function frontmatterField(markdown: string, key: string): string | undefined {
   const line = fm[1].match(new RegExp(`^${safeKey}:[ \\t]*(.+)$`, "m"));
   const value = line?.[1]?.trim().replace(/^["']|["']$/g, "");
   return value || undefined;
+}
+
+// Whole-word matching anchors CONDITIONALLY, per edge. A boundary assertion is
+// only meaningful where the term's own edge character is a word character —
+// the only case where the term could otherwise match INSIDE a larger word
+// (`pro` must never hit `project`/`approach`/`reproduce`). Where the edge
+// character is NOT a word character it is already a boundary by construction,
+// and anchoring there is not merely redundant but actively wrong: an anchored
+// `--verbose` can never match because the leading assertion demands a word
+// character exactly where the `-` sits, and `pre-` would demand a non-word
+// character after the hyphen, missing `pre-commit`. Measured against the real
+// vault, the unconditional form scored the phrase bonus on 17/20 phrases lifted
+// verbatim from notes but 0/20 once a trailing `?` was appended.
+const WORD_EDGE_CHAR = /[\p{L}\p{N}_]/u;
+
+// The assertion itself uses explicit Unicode lookarounds rather than `\b`,
+// which is ASCII-only and therefore treats an accented letter as a boundary:
+// `\bsum\b` matched inside "résumé" and `\bber\b` inside "über" — precisely the
+// substring bleed the whole change exists to prevent. No live occurrence in the
+// current vaults, but the defect is in the mechanism, not the corpus.
+//
+// `_` is deliberately IN WORD_EDGE_CHAR but OUT of the assertion class. The two
+// serve different questions. "Does this term need anchoring?" must say yes for
+// `_private`, or it would match inside `x_private`. "Is this position a word
+// boundary?" must say yes at an underscore, or `minni_learning` and
+// `search_learnings` would never count toward `learning` — identifier casing is
+// how this vault writes compound terms, and it accounted for a large share of
+// the notes the unified class silently deleted.
+//
+// Scripts written without word separators are the mirror-image trap. `\p{L}`
+// includes Han/Kana/Hangul, so a plain Unicode class blocks a match that ASCII
+// `\b` allowed: `term` inside `日本語term語` is a legitimate whole word with no
+// space around it, and treating the neighbouring ideographs as word characters
+// deletes it. They are therefore admitted as boundaries explicitly.
+const NO_SEPARATOR_SCRIPTS =
+  "\\p{sc=Han}\\p{sc=Hiragana}\\p{sc=Katakana}\\p{sc=Hangul}";
+const NOT_WORD_BEFORE = `(?:(?<![\\p{L}\\p{N}])|(?<=[${NO_SEPARATOR_SCRIPTS}]))`;
+const NOT_WORD_AFTER = `(?:(?![\\p{L}\\p{N}])|(?=[${NO_SEPARATOR_SCRIPTS}]))`;
+
+// Inflectional tolerance. Exact whole-word matching has zero morphological
+// give, and vault prose does not agree with query wording on number or tense:
+// the note that defines the learnings table contains `learnings` x9,
+// `learnings_fts` x10, `learning_id` x2 and ZERO standalone `learning`, so the
+// query `learning` scored 55 under substring matching and 0 under strict word
+// matching. Same shape for `pipeline`/`pipelines` and `timeout`/`timeouts`.
+// Allowing a regular English inflection on the trailing edge recovers those
+// without reopening substring bleed: a suffix can only extend the term, never
+// let it start mid-word, so `pro` still cannot reach `project`.
+//
+// Applied only to terms of 4+ characters ending in a letter. Below that the
+// inflected forms are more likely to be unrelated words than variants of the
+// term ("us" + "ed" would match every "used" in the vault).
+//
+// Applied to TERMS ONLY, never to the exact-phrase form. An inflected hit is
+// evidence that the note is about the term, but it is by definition not an
+// exact phrase, and letting it collect the +50 bonus put inflection-only notes
+// in the user-visible top 5 ahead of literal matches: on claudecode-vault
+// `train`, `land` and `cover` each had 4 of their top 5 slots taken by notes
+// containing no literal occurrence of the query, `land` entirely via "landed".
+// Gating the suffix off for the phrase keeps the recall (the term score still
+// counts the inflected hit) while the bonus stays exact.
+//
+// Volume, measured over 40 independent single-term queries x 4 vaults by
+// diffing the admitted set against a build with the suffix disabled: notes
+// admitted SOLELY by an inflected match are 298/3773 (7.90%) claudecode,
+// 78/1380 (5.65%) codex, 24/357 (6.72%) grok-build, 25/238 (10.50%) gemini.
+// This is the recall the suffix buys — an earlier claim of "+4 notes across
+// four vaults" understated it by two orders of magnitude.
+//
+// The admissions themselves hold up. Every one of the 54 distinct query→form
+// pairs behind those numbers is same-lemma (`work`→`works`/`working`/`worked`
+// 92, `reject`→`rejected`/`rejects` 66, `hook`→`hooks` 32); no semantically
+// unrelated match appears. It is the phrase coupling above, not the suffix,
+// that was the defect.
+const MORPHOLOGICAL_SUFFIX = "(?:s|es|ing|ed)?";
+const MIN_MORPHOLOGICAL_LENGTH = 4;
+
+// The matcher is called once per (term, note) and the term set is tiny while
+// the note set is not, so the pattern is built once per term and reused. The
+// regex is only ever used with String.match under /g, which resets lastIndex,
+// so sharing the object across calls carries no state. Cap the cache: terms
+// come from user queries, and an unbounded map keyed by user input is a slow
+// leak in a long-lived daemon process.
+const WORD_REGEX_CACHE = new Map<string, RegExp>();
+const WORD_REGEX_CACHE_LIMIT = 512;
+
+// Returns undefined for a term that CANNOT express a match worth having: one
+// with non-word characters at BOTH edges AND no alphanumeric anywhere. Both
+// halves are needed, and conflating them was a recall bug.
+//
+// The half that matters: conditional anchoring drops the assertion at a
+// non-word edge, so a term non-word at both ends carries no assertion at all
+// and degrades to a plain substring search. For `-` and `/` that is ruinous —
+// they matched every hyphen and every slash in the corpus (376 of 437
+// claudecode notes each), collecting the +50 phrase bonus on notes with no
+// relation to the query. Same for `//` and `--`.
+//
+// But "no bindable anchor" is not the same as "no lexical content", and
+// rejecting on the edges alone silently DELETED every path-shaped term.
+// queryTerms tokenises `/` (`[a-z0-9_/-]{2,}`), so `/api/` and
+// `/users/hans/projects/` arrive here as ordinary terms with both edges `/`;
+// they were dropped, and a query for a literal path returned nothing even
+// against a note containing it verbatim. Anchoring cannot help them — every
+// position adjacent to their alphanumeric runs is a separator they carry
+// themselves, so an assertion there is trivially true — but they do not need
+// it: an unanchored search for `/api/` is already as specific as the term is.
+// The alphanumeric run IS the anchor. What must stay rejected is the term that
+// has no such run.
+function wordRegex(term: string, inflect: boolean): RegExp | undefined {
+  const last = term[term.length - 1];
+  const lead = WORD_EDGE_CHAR.test(term[0]) ? NOT_WORD_BEFORE : "";
+  const tail = WORD_EDGE_CHAR.test(last) ? NOT_WORD_AFTER : "";
+  if (!lead && !tail && !/[\p{L}\p{N}]/u.test(term)) return undefined;
+  const key = `${inflect ? "i" : "x"} ${term}`;
+  const cached = WORD_REGEX_CACHE.get(key);
+  if (cached) return cached;
+  const escaped = term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const suffix =
+    inflect && term.length >= MIN_MORPHOLOGICAL_LENGTH && /\p{L}/u.test(last)
+      ? MORPHOLOGICAL_SUFFIX
+      : "";
+  const regex = new RegExp(`${lead}${escaped}${suffix}${tail}`, "giu");
+  if (WORD_REGEX_CACHE.size >= WORD_REGEX_CACHE_LIMIT) WORD_REGEX_CACHE.clear();
+  WORD_REGEX_CACHE.set(key, regex);
+  return regex;
+}
+
+function countWordOccurrences(
+  text: string,
+  term: string,
+  inflect = true,
+): number {
+  if (!term) return 0;
+  const regex = wordRegex(term, inflect);
+  if (!regex) return 0;
+  const matches = text.match(regex);
+  return matches ? matches.length : 0;
+}
+
+// Recall queries are natural language and routinely carry terminal punctuation
+// ("how do i fix ci?"). Strip the outer punctuation before the exact-phrase
+// check so the strongest ranking signal in the scorer survives the question
+// mark. What is stripped is exactly what queryTerms would not tokenise, so
+// `-`, `/` and `_` are KEPT: trimming them would turn the query `--verbose`
+// into the phrase `verbose` and let the +50 bonus match a note that never
+// mentions the flag. Interior punctuation is left alone — it is part of the
+// phrase being looked for.
+//
+// The trim is therefore a FALLBACK, not a rewrite. When the punctuation IS the
+// term the untrimmed form is the one the user meant: `c#` and `c++` trim to a
+// bare `c`, which is then matched as a whole word and returned 93 claudecode
+// notes at score 53, none of them containing `c#` — while the notes that do say
+// "We use C# and C++" were reachable only through the form that was thrown
+// away. Both forms are tried, untrimmed first, and the first that matches takes
+// the bonus. The untrimmed form needs no special handling to be safe: wordRegex
+// anchors conditionally, so `c#` becomes a lead-anchored `(?<![\p{L}\p{N}])c\#`
+// that can only match a literal `c#`.
+//
+// A form must still be a phrase of SUBSTANCE, or the +50 bonus is awarded on
+// nothing:
+//
+//   at least one alphanumeric — `-`, `_`, `/` and `--` carry no lexical content
+//   at all, and `-` and `/` each matched 376 of 437 claudecode notes. wordRegex
+//   refuses these too, so this is the second of two independent gates.
+//
+//   at least MIN_PHRASE_LENGTH characters, unless the single character belongs
+//   to a script written WITHOUT word separators. A lone `é` or `c` is a
+//   fragment of a word; a lone `節` is a word (`設定ファイルは節ごとに分割する`),
+//   and the whole-word matcher already treats the neighbouring kana as
+//   boundaries. The length rule buys no precision over such a character
+//   anyway — the substring bleed it would guard against (`節` inside `季節`) is
+//   admitted at length 2 regardless, since `設定` matches inside any longer
+//   compound — so applying it there is pure recall loss.
+const MIN_PHRASE_LENGTH = 2;
+const SINGLE_NO_SEPARATOR_CHAR = new RegExp(
+  `^[${NO_SEPARATOR_SCRIPTS}]$`,
+  "u",
+);
+
+function isPhrase(candidate: string): boolean {
+  if (!/[\p{L}\p{N}]/u.test(candidate)) return false;
+  return (
+    candidate.length >= MIN_PHRASE_LENGTH ||
+    SINGLE_NO_SEPARATOR_CHAR.test(candidate)
+  );
+}
+
+/** Exact-phrase candidates for `query`, most literal first. */
+function phraseForms(query: string): string[] {
+  const raw = query.toLowerCase().trim();
+  const trimmed = raw.replace(/^[^\p{L}\p{N}_/-]+|[^\p{L}\p{N}_/-]+$/gu, "");
+  return [raw, trimmed].filter(
+    (form, index, all) => isPhrase(form) && all.indexOf(form) === index,
+  );
 }
 
 function scoreVaultNote(
@@ -413,14 +712,31 @@ function scoreVaultNote(
 
   const haystack = `${title}\n${relativePath}\n${markdown}`.toLowerCase();
   const titleLower = title.toLowerCase();
-  const queryLower = query.toLowerCase().trim();
-  let score = 0;
-  if (queryLower && haystack.includes(queryLower)) score += 50;
-  for (const term of terms) {
-    const count = haystack.split(term).length - 1;
-    if (count > 0) score += Math.min(count, 5);
-    if (titleLower.includes(term)) score += 3;
+  let termScore = 0;
+  // At most one bonus, awarded to the most literal form that matches; see
+  // phraseForms. `false`: the bonus is exact. See MORPHOLOGICAL_SUFFIX.
+  for (const phrase of phraseForms(query)) {
+    if (countWordOccurrences(haystack, phrase, false) > 0) {
+      termScore += 50;
+      break;
+    }
   }
+  for (const term of terms) {
+    const count = countWordOccurrences(haystack, term);
+    if (count > 0) termScore += Math.min(count, 5);
+    if (countWordOccurrences(titleLower, term) > 0) termScore += 3;
+  }
+  // The floor gates TERM EVIDENCE, not the final score. Its stated purpose is
+  // "more than single-word noise", which is a question about how many times the
+  // query actually appears — the bonuses below exist to RANK notes that already
+  // qualify, and must not decide admission. Testing the final score inverted
+  // the correction-salience mechanism: a correction note with one body hit
+  // finished at 1 * 1.25 = 1.25 and was cut, while a plain session note with
+  // the same single hit finished at 1 + 1 = 2 and survived, so the class the
+  // engine deliberately boosts was the one being deleted.
+  if (termScore < MIN_TERM_SCORE) return 0;
+
+  let score = termScore;
   if (relativePath.startsWith("wiki/sessions/")) score += 1;
   if (/minni_learning:\s*true/i.test(markdown)) score += 2;
 
@@ -654,8 +970,20 @@ async function withAuditLock<T>(vaultPath: string, fn: () => Promise<T>): Promis
   }
 }
 
+/**
+ * The Stop breadcrumb is EXEMPT. Under the governance posture in
+ * hook-handlers.ts a zero-candidate Stop writes no inbox file, so this one
+ * audit line is the ONLY record that the session ended — throttling it away
+ * makes the turn invisible, which is precisely what the posture promises not
+ * to do. Exempting it cannot flood: Stop fires once per turn end, so its
+ * frequency ceiling is set by the harness, not by the agent's tool loop.
+ */
+function isExemptFromAuditThrottle(entry: AuditEntry): boolean {
+  return entry.tool.endsWith("_stop");
+}
+
 function shouldThrottleAudit(entry: AuditEntry): boolean {
-  return entry.tool.startsWith("hook_");
+  return entry.tool.startsWith("hook_") && !isExemptFromAuditThrottle(entry);
 }
 
 export async function recordAudit(
@@ -666,16 +994,19 @@ export async function recordAudit(
   return withAuditLock(vaultPath, async () => {
   const timestamp = entry.timestamp ?? new Date();
 
-  // --- 1. Per-agent rate-limiting ---
-  const agentId = getAgentIdFromVaultPath(vaultPath);
-  const homeDir = process.env.MINNI_HOME ?? path.join(os.homedir(), ".minni");
-  const rateLimitDir = path.join(homeDir, ".hook-audit-ts");
-  await mkdir(rateLimitDir, { recursive: true });
+  // --- 1. Per-(agent, event) rate-limiting ---
   // Key the throttle per (agent, EVENT), not per agent. A single per-agent
   // window meant a burst of DIFFERENT events collapsed into one record: agy
   // fires SessionStart and PreInvocation in the same second, so PreInvocation
   // was never audited at all and looked like it had never dispatched. That
   // cost real debugging time. Duplicate suppression is still per event.
+  // `entry.throttleKey` lets intent_dropped audits bucket by event even when
+  // they share a tool name. Stop breadcrumbs remain exempt via
+  // isExemptFromAuditThrottle above.
+  const agentId = getAgentIdFromVaultPath(vaultPath);
+  const homeDir = process.env.MINNI_HOME ?? path.join(os.homedir(), ".minni");
+  const rateLimitDir = path.join(homeDir, ".hook-audit-ts");
+  await mkdir(rateLimitDir, { recursive: true });
   const throttleKey = `${agentId}__${entry.throttleKey ?? entry.tool}`.replace(
     /[^A-Za-z0-9_-]/g,
     "_",
@@ -970,7 +1301,12 @@ export async function searchVaultNotes(
   await ensureVault(vaultPath);
   const wikiRoot = path.join(vaultPath, "wiki");
   const terms = queryTerms(query);
-  if (terms.length === 0) return [];
+  // Only bail when there is nothing to match on at all. Bailing on an empty
+  // term list alone threw away the exact-phrase bonus, which is the strongest
+  // signal in the scorer and needs no tokens — but phraseForms yields nothing
+  // for a query with no phrase of substance, so `-` or `--` (no tokens, no
+  // usable phrase) stops here instead of reaching the scorer with terms = [].
+  if (terms.length === 0 && phraseForms(query).length === 0) return [];
 
   let files: string[] = [];
   try {
@@ -1004,7 +1340,10 @@ export async function searchVaultNotes(
   );
 
   return scored
-    .filter((result): result is VaultSearchResult => result !== undefined && result.score > 0)
+    .filter(
+      (result): result is VaultSearchResult =>
+        result !== undefined && result.score > 0,
+    )
     .sort(
       (a, b) =>
         b.score - a.score || a.relativePath.localeCompare(b.relativePath),

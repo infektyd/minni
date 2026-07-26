@@ -28,7 +28,6 @@ const CONFIG = {
   hookScript: "cursor-hook.js",
   auditPrefix: "hook_cursor",
   precompactKind: "cursor_precompact_handoff",
-  alwaysWriteStopInbox: false,
   recallGuardMode: CURSOR_GUARD_MODE,
   // Without this, wireFor("cursor") fell through to the Claude profile and the
   // handlers emitted Claude envelopes that adaptCursorOutput then quietly threw

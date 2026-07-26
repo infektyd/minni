@@ -652,7 +652,7 @@ export function formatRecall(query: string, response: RecallResponse, vaultResul
     .join(", ");
   const daemonLead = firstLine(compactDaemonResults(response.results));
   const sections = [
-    "# Sovereign Recall",
+    "# Minni Recall",
     `Query: ${query}${backendBadge ? ` [${backendBadge}]` : ""}`,
     provenance ? `Provenance: ${provenance}` : undefined,
     "## AI Context Pack",

@@ -25,6 +25,8 @@ import {
 } from "./hook-utils.js";
 import { claudeCodeWire } from "./hook-platform.js";
 import type { HookOutput } from "./hook-utils.js";
+import { handleStopCore } from "./hook-handlers.js";
+import type { StopCoreConfig } from "./hook-handlers.js";
 import { routeMemoryIntent } from "./policy.js";
 import {
   buildRecallPointer,
@@ -59,7 +61,7 @@ import {
   stashPrecompactReassert,
   subscribeContradictions,
 } from "./sovereign.js";
-import { classifyIntent, extractScarTissue, filterSafeVaultResults, prepareOutcome } from "./task.js";
+import { classifyIntent, extractScarTissue, filterSafeVaultResults } from "./task.js";
 import {
   auditTail,
   collectCorrectionsReassert,
@@ -71,7 +73,6 @@ import {
   resolveInboxHandoffContext,
   searchVaultNotes,
   settleReassertedInboxEntries,
-  writeInbox,
 } from "./vault.js";
 
 async function handleSessionStart(payload: Record<string, unknown>): Promise<HookOutput> {
@@ -520,49 +521,22 @@ async function handlePreCompact(payload: Record<string, unknown>): Promise<HookO
   return { continue: true };
 }
 
+// Stop is NOT a claude-code-specific handler. It routes to the shared
+// handleStopCore so the governance posture, the zero-candidate write guard and
+// the inbox ingest stamps (kind/agent_id/workspace_id) exist exactly once —
+// this file's private copy had drifted from the factory's on all three. Only
+// the audit prefix and the commit call-to-action are claude-code's own.
+const CLAUDECODE_STOP_CONFIG: StopCoreConfig = {
+  agentId: CLAUDECODE_AGENT_ID,
+  vaultPath: CLAUDECODE_VAULT_PATH,
+  defaultWorkspaceId: CLAUDECODE_WORKSPACE_ID,
+  auditPrefix: "hook",
+  stopCommitHint: "Use /minni:learn to commit.",
+  wire: claudeCodeWire,
+};
+
 async function handleStop(payload: Record<string, unknown>): Promise<HookOutput> {
-  await ensureVault(CLAUDECODE_VAULT_PATH);
-  const sessionId = asString(payload.session_id) || asString(payload.sessionId) || "session";
-  // `last_user_message` and `summary` exist on NO Claude Code payload, so this
-  // always fell through to the session UUID and every Stop-time learn candidate
-  // was keyed on a meaningless id. Claude Code sends `last_assistant_message`;
-  // the wire knows the spelling per platform.
-  const lastTask = claudeCodeWire.lastTaskText(payload) || sessionId;
-  const tail = await auditTail(CLAUDECODE_VAULT_PATH, 30);
-  const outcome = await prepareOutcome({
-    task: lastTask.slice(0, 200),
-    summary: tail.entries.slice(-5).join("\n").slice(0, 600) || "session ended",
-    profile: "compact",
-    vaultPath: CLAUDECODE_VAULT_PATH,
-  });
-
-  const inbox = await writeInbox(CLAUDECODE_VAULT_PATH, sessionId, {
-    candidates: outcome.outcomeDraft.learnCandidates,
-    log_only: outcome.outcomeDraft.logOnly,
-    expires: outcome.outcomeDraft.expires,
-    do_not_store: outcome.outcomeDraft.doNotStore,
-    last_task: lastTask.slice(0, 200),
-  });
-
-  await recordAudit(CLAUDECODE_VAULT_PATH, {
-    tool: "hook_stop",
-    summary: `stop ${sessionId}`,
-    details: {
-      candidates: outcome.outcomeDraft.learnCandidates.length,
-      inbox_path: inbox.filePath,
-    },
-  });
-
-  if (outcome.outcomeDraft.learnCandidates.length === 0) {
-    return { continue: true };
-  }
-
-  return {
-    continue: true,
-    systemMessage: `Minni: ${outcome.outcomeDraft.learnCandidates.length} candidate learning${
-      outcome.outcomeDraft.learnCandidates.length === 1 ? "" : "s"
-    } drafted to inbox (${inbox.filePath}). Use /minni:learn to commit.`,
-  };
+  return handleStopCore(CLAUDECODE_STOP_CONFIG, payload);
 }
 
 // s6 PreToolUse recall guard (BACKSTOP). claude-code is NOT special: same logic
