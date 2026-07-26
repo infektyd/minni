@@ -153,6 +153,50 @@ def test_cursor_reinstall_is_idempotent(tmp_path, monkeypatch):
     assert len(mine) == 1, f"expected one Minni sessionStart entry, got {len(mine)}"
 
 
+def test_cursor_reinstall_from_agents_root_replaces_stale(tmp_path, monkeypatch):
+    """Normal Cursor root is ~/.agents/plugins/minni@minni — no /plugins/minni/.
+
+    The old suffix matcher keyed on that marker, so a reinstall from a different
+    root left both entries and every session hydrated twice.
+    """
+    monkeypatch.setenv("HOME", str(tmp_path))
+    # Use disjoint basenames so neither path is a string-prefix of the other.
+    old_root = tmp_path / "agents" / "plugins" / "minni@old"
+    new_root = tmp_path / "agents" / "plugins" / "minni@new"
+    for root in (old_root, new_root):
+        (root / "hooks").mkdir(parents=True)
+        for name in ("hooks-grok.json", "hooks-cursor.json"):
+            (root / "hooks" / name).write_text((REPO_HOOKS / name).read_text())
+
+    propagate.update_cursor_hooks(old_root)
+    propagate.update_cursor_hooks(new_root)
+
+    data = json.loads((tmp_path / ".cursor/hooks.json").read_text())
+    session = data["hooks"]["sessionStart"]
+    mine = [e for e in session if "cursor-hook.js" in str(e.get("command", ""))]
+    assert len(mine) == 1, f"expected one Minni sessionStart, got {len(mine)}: {mine}"
+    assert str(new_root) in mine[0]["command"]
+    assert str(old_root) not in mine[0]["command"]
+
+
+def test_atomic_write_preserves_existing_mode(tmp_path):
+    """Host configs often carry MCP env at 0600; atomic replace must keep that."""
+    target = tmp_path / "secret.json"
+    target.write_text('{"old": true}\n')
+    target.chmod(0o600)
+
+    propagate.write_json(target, {"new": True})
+
+    assert oct(target.stat().st_mode & 0o777) == "0o600"
+    assert target.read_text() == '{\n  "new": true\n}\n'
+
+
+def test_atomic_write_defaults_new_files_to_0600(tmp_path):
+    target = tmp_path / "fresh.json"
+    propagate.write_json(target, {"ok": True})
+    assert oct(target.stat().st_mode & 0o777) == "0o600"
+
+
 # --- Claude Desktop ---------------------------------------------------------
 
 

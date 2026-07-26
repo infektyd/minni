@@ -11,6 +11,7 @@ import {
   CODEX_WORKSPACE_ID,
 } from "./config.js";
 import { runHookMain } from "./hook-handlers.js";
+import { codexWire } from "./hook-platform.js";
 
 void runHookMain({
   agentId: CODEX_AGENT_ID,
@@ -26,4 +27,8 @@ void runHookMain({
   // always-write behavior produced the kind-less draft-file noise the AFM
   // ingest loop skips as _unrecognized.
   alwaysWriteStopInbox: false,
+  // Wire is the platform contract, not the memory principal. Agent id is
+  // user-overridable; deriving the wire from it would fall through to the
+  // Claude shape under a custom MINNI_CODEX_AGENT_ID.
+  wire: codexWire,
 });

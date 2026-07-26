@@ -24,6 +24,7 @@ import {
   adaptAgyPayload,
   adaptPreToolUseOutput,
   agyAllow,
+  enrichAgyPromptPayload,
   enrichAgyStopPayload,
 } from "./gemini-adapter.js";
 import { createHookHandlers } from "./hook-handlers.js";
@@ -98,6 +99,11 @@ async function main(): Promise<void> {
   }
 
   let payload = adaptAgyPayload(raw);
+  if (event === "UserPromptSubmit") {
+    // PreInvocation carries no prompt text; mine the transcript or the
+    // shared handler returns noIntent and the per-turn recall pointer dies.
+    payload = await enrichAgyPromptPayload(payload).catch(() => payload);
+  }
   if (event === "Stop") {
     // Best-effort: pull the real last user message from agy's transcript so
     // Stop drafts candidates about the actual task, not the conversation id.

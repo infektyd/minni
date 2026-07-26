@@ -121,30 +121,14 @@ const TRANSCRIPT_TAIL_BYTES = 4 * 1024 * 1024;
 const LAST_USER_MESSAGE_MAX = 400;
 
 /**
- * Codex review (PR #134): agy's Stop payload carries no task text, so the
- * shared handleStop would fall back to the conversation id and could draft
- * "session ended"-grade candidates. agy DOES point at its transcript
- * (transcript_full.jsonl: one JSON object per line; explicit user prompts are
- * source USER_EXPLICIT / type USER_INPUT with the prompt wrapped in
- * <USER_REQUEST> tags — format live-verified on agy 1.0.15). Pull the LAST
- * explicit user message out of the transcript tail and surface it as
- * last_user_message. Best-effort on purpose: any miss (no path, unreadable
- * file, format drift) leaves the payload untouched, and handleStop's existing
- * fallback chain applies.
+ * Mine the last explicit user message from an agy transcript_full.jsonl.
+ * Best-effort: any miss (no path, unreadable file, format drift) returns "".
  */
-export async function enrichAgyStopPayload(
-  payload: Record<string, unknown>,
-): Promise<Record<string, unknown>> {
-  if (asString(payload.last_user_message) || asString(payload.summary)) {
-    return payload;
-  }
-  const transcriptPath = asString(payload.transcriptPath);
-  if (!transcriptPath) return payload;
-
+async function lastUserMessageFromTranscript(transcriptPath: string): Promise<string> {
   let tail: string;
   try {
     const info = await stat(transcriptPath);
-    if (!info.isFile() || info.size === 0) return payload;
+    if (!info.isFile() || info.size === 0) return "";
     const start = Math.max(0, info.size - TRANSCRIPT_TAIL_BYTES);
     const handle = await open(transcriptPath, "r");
     try {
@@ -156,7 +140,7 @@ export async function enrichAgyStopPayload(
       await handle.close();
     }
   } catch {
-    return payload;
+    return "";
   }
 
   const lines = tail.split("\n");
@@ -177,7 +161,53 @@ export async function enrichAgyStopPayload(
     const request = /<USER_REQUEST>\s*([\s\S]*?)\s*<\/USER_REQUEST>/.exec(content);
     const message = (request?.[1] ?? content).trim();
     if (!message) continue;
-    return { ...payload, last_user_message: message.slice(0, LAST_USER_MESSAGE_MAX) };
+    return message.slice(0, LAST_USER_MESSAGE_MAX);
   }
-  return payload;
+  return "";
+}
+
+/**
+ * Codex review (PR #134): agy's Stop payload carries no task text, so the
+ * shared handleStop would fall back to the conversation id and could draft
+ * "session ended"-grade candidates. agy DOES point at its transcript
+ * (transcript_full.jsonl: one JSON object per line; explicit user prompts are
+ * source USER_EXPLICIT / type USER_INPUT with the prompt wrapped in
+ * <USER_REQUEST> tags — format live-verified on agy 1.0.15). Pull the LAST
+ * explicit user message out of the transcript tail and surface it as
+ * last_user_message. Best-effort on purpose: any miss (no path, unreadable
+ * file, format drift) leaves the payload untouched, and handleStop's existing
+ * fallback chain applies.
+ */
+export async function enrichAgyStopPayload(
+  payload: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
+  if (asString(payload.last_user_message) || asString(payload.summary)) {
+    return payload;
+  }
+  const transcriptPath = asString(payload.transcriptPath);
+  if (!transcriptPath) return payload;
+  const message = await lastUserMessageFromTranscript(transcriptPath);
+  if (!message) return payload;
+  return { ...payload, last_user_message: message };
+}
+
+/**
+ * PreInvocation is agy's prompt-submit analogue, but its stdin schema has no
+ * `prompt` field — only invocation counters plus common metadata (including
+ * transcriptPath). Without mining the transcript, handleUserPromptSubmit
+ * sees an empty prompt and returns noIntent on every real agy turn, so the
+ * per-turn recall pointer never writes. Surface the last user message as
+ * `prompt` (the field the shared handler reads).
+ */
+export async function enrichAgyPromptPayload(
+  payload: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
+  if (asString(payload.prompt) || asString(payload.user_prompt)) {
+    return payload;
+  }
+  const transcriptPath = asString(payload.transcriptPath);
+  if (!transcriptPath) return payload;
+  const message = await lastUserMessageFromTranscript(transcriptPath);
+  if (!message) return payload;
+  return { ...payload, prompt: message };
 }

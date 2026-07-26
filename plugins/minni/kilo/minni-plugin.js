@@ -1,8 +1,35 @@
 /* global __MINNI_KILO_HOOK_SCRIPT__, __MINNI_KILO_HOOK_ENV__, process, setTimeout, clearTimeout, console */
 import { spawn } from "node:child_process";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
-const HOOK_SCRIPT = __MINNI_KILO_HOOK_SCRIPT__;
-const HOOK_ENV = __MINNI_KILO_HOOK_ENV__;
+// Stamped installs replace the __MINNI_KILO_* identifiers with string/object
+// literals (see the live ~/.config/kilo/plugin/minni.js). Unstamped loads —
+// including anyone who drops this file in place before the deferred kilo
+// install path lands — must still evaluate: typeof on an unbound global is
+// safe, and we fall back to dist/ relative to this file plus process.env.
+const _HERE = dirname(fileURLToPath(import.meta.url));
+const _DEFAULT_HOOK_SCRIPT = join(_HERE, "..", "dist", "kilocode-hook.js");
+const _DEFAULT_HOOK_ENV = {
+  MINNI_KILOCODE_AGENT_ID: process.env.MINNI_KILOCODE_AGENT_ID || "kilocode",
+  ...(process.env.MINNI_KILOCODE_VAULT_PATH
+    ? { MINNI_KILOCODE_VAULT_PATH: process.env.MINNI_KILOCODE_VAULT_PATH }
+    : {}),
+  ...(process.env.MINNI_KILOCODE_WORKSPACE_ID
+    ? { MINNI_KILOCODE_WORKSPACE_ID: process.env.MINNI_KILOCODE_WORKSPACE_ID }
+    : {}),
+  ...(process.env.MINNI_SOCKET_PATH
+    ? { MINNI_SOCKET_PATH: process.env.MINNI_SOCKET_PATH }
+    : {}),
+};
+const HOOK_SCRIPT =
+  typeof __MINNI_KILO_HOOK_SCRIPT__ !== "undefined"
+    ? __MINNI_KILO_HOOK_SCRIPT__
+    : _DEFAULT_HOOK_SCRIPT;
+const HOOK_ENV =
+  typeof __MINNI_KILO_HOOK_ENV__ !== "undefined"
+    ? __MINNI_KILO_HOOK_ENV__
+    : _DEFAULT_HOOK_ENV;
 const booted = new Set();
 const pending = new Map();
 // Kilo's session.idle event carries no message text, so Stop had nothing to key

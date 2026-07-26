@@ -205,6 +205,32 @@ test("Cursor: an undeliverable prompt-submit injection is RECORDED", () => {
   assert.equal(dropped.event, "UserPromptSubmit");
 });
 
+test("factory-driven entrypoints pin their platform wire, not agentId lookup", async () => {
+  // Agent id is user-overridable (MINNI_KILOCODE_AGENT_ID, MINNI_GROK_AGENT_ID,
+  // …). Deriving the wire from it falls through to claudeCodeWire under a
+  // custom identity and silently drops platform-specific behavior (Kilo
+  // PreCompact, Grok Stop duplicate filter).
+  const { readFile } = await import("node:fs/promises");
+  const path = await import("node:path");
+  const { fileURLToPath } = await import("node:url");
+  const SRC = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "src");
+
+  const entries = {
+    "codex-hook.ts": "codexWire",
+    "grok-hook.ts": "grokBuildWire",
+    "kilocode-hook.ts": "kilocodeWire",
+    "cursor-hook.ts": "cursorWire",
+    "gemini-hook.ts": "geminiWire",
+  };
+
+  for (const [file, wire] of Object.entries(entries)) {
+    const src = (await readFile(path.join(SRC, file), "utf8"))
+      .replace(/\/\*[\s\S]*?\*\//g, "")
+      .replace(/^\s*\/\/.*$/gm, "");
+    assert.match(src, new RegExp(`wire:\\s*${wire}\\b`), `${file} must pin ${wire}`);
+  }
+});
+
 test("every platform's audit prefix is distinct and namespaced", async () => {
   // kilocode shipped `auditPrefix: "hook"`, so its entries were shaped exactly
   // like claude-code's. Separate vaults hid the collision, but it defeats any

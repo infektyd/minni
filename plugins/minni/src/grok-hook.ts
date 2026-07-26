@@ -9,6 +9,7 @@ import {
   GROK_WORKSPACE_ID,
 } from "./config.js";
 import { runHookMain } from "./hook-handlers.js";
+import { grokBuildWire } from "./hook-platform.js";
 
 void runHookMain({
   agentId: GROK_AGENT_ID,
@@ -23,4 +24,8 @@ void runHookMain({
   // Grok behavior (review-panel improvement): an empty outcome draft skips the
   // inbox write entirely so the inbox is never littered with empty files.
   alwaysWriteStopInbox: false,
+  // Wire is the platform contract, not the memory principal. Agent id is
+  // user-overridable (MINNI_GROK_AGENT_ID); deriving the wire from it would
+  // disable Grok's Stop duplicate filter and drop-accounting.
+  wire: grokBuildWire,
 });

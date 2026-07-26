@@ -16,6 +16,7 @@ import shlex
 import shutil
 import socket
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
@@ -370,10 +371,23 @@ def write_json(path: Path, data: dict) -> None:
     _atomic_write(path, json.dumps(data, indent=2) + "\n")
 
 
-def _atomic_write(path: Path, text: str) -> None:
+def _atomic_write(path: Path, text: str, *, mode: int | None = None) -> None:
+    """Atomic replace that preserves (or clamps) file permissions.
+
+    A plain temp write + os.replace creates a new inode with the process umask
+    (typically 0644). Host configs under $HOME often carry MCP env tokens at
+    0600; without copying that mode across, an ordinary propagate run would
+    silently make those values world-readable. New files default to 0600.
+    """
     tmp = path.with_name(f"{path.name}.minni-tmp-{os.getpid()}")
     try:
         tmp.write_text(text, encoding="utf-8")
+        if mode is None:
+            if path.exists():
+                mode = stat.S_IMODE(path.stat().st_mode)
+            else:
+                mode = 0o600
+        os.chmod(tmp, mode)
         os.replace(tmp, path)
     finally:
         tmp.unlink(missing_ok=True)
@@ -959,36 +973,25 @@ def update_cursor_hooks(install_root: Path) -> dict[str, object]:
 
     # Exact-match alone is not enough: reinstalling from a DIFFERENT
     # --install-root writes a new command while the old stamped one survives,
-    # so both fire and every session hydrates twice. Also treat an entry as
-    # ours when its command ends with the same hook-script suffix (the tail
-    # after the install root). That tail is Minni's own script path, so no
-    # unrelated user hook can match it -- while a sibling path like
-    # /x/minni-other, the case exact-matching was introduced to protect, is
-    # a stale Minni install and SHOULD be replaced rather than duplicated.
-    def _script_suffixes(entries: list) -> set[str]:
-        tails: set[str] = set()
-        for e in entries:
-            if not isinstance(e, dict):
-                continue
-            command = str(e.get("command") or "")
-            marker = "/plugins/minni/"
-            index = command.find(marker)
-            if index != -1:
-                tails.add(command[index:])
-        return tails
+    # so both fire and every session hydrates twice. Identify ours by the
+    # stable script basename (`/dist/cursor-hook.js`) rather than a
+    # `/plugins/minni/` path marker — the normal Cursor install root is
+    # `~/.agents/plugins/minni@minni`, which does not contain that marker, and
+    # an explicit `--install-root` need not either. The basename is Minni's own
+    # entrypoint, so a user's unrelated hook cannot match it by accident.
+    CURSOR_HOOK_SCRIPT = "/dist/cursor-hook.js"
 
-    def _is_ours(entry: object, commands: set[str], tails: set[str]) -> bool:
+    def _is_ours(entry: object, commands: set[str]) -> bool:
         if not isinstance(entry, dict):
             return False
         command = str(entry.get("command") or "")
         if command in commands:
             return True
-        return any(command.endswith(tail) for tail in tails)
+        return CURSOR_HOOK_SCRIPT in command
 
     for event, entries in (stamped.get("hooks", {}) or {}).items():
         ours = _commands(list(entries))
-        tails = _script_suffixes(list(entries))
-        kept = [e for e in (hooks.get(event) or []) if not _is_ours(e, ours, tails)]
+        kept = [e for e in (hooks.get(event) or []) if not _is_ours(e, ours)]
         hooks[event] = kept + list(entries)
 
     merged["hooks"] = hooks

@@ -22,6 +22,7 @@ import {
   adaptAgyPayload,
   adaptPreToolUseOutput,
   agyAllow,
+  enrichAgyPromptPayload,
   enrichAgyStopPayload,
 } from "../dist/gemini-adapter.js";
 
@@ -268,6 +269,33 @@ test("enrichAgyStopPayload pulls the LAST explicit user message from the transcr
     assert.equal(missing.last_user_message, undefined);
     const preset = await enrichAgyStopPayload({ transcriptPath: transcript, summary: "already set" });
     assert.equal(preset.last_user_message, undefined);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("enrichAgyPromptPayload surfaces transcript text as prompt for PreInvocation", async () => {
+  // PreInvocation has no prompt field; without this, handleUserPromptSubmit
+  // returns noIntent on every real agy turn.
+  const fixture = await makeFixture();
+  try {
+    const transcript = path.join(fixture.root, "transcript_full.jsonl");
+    await writeFile(
+      transcript,
+      JSON.stringify({
+        source: "USER_EXPLICIT",
+        type: "USER_INPUT",
+        content: "<USER_REQUEST>\nwhat is my active plan\n</USER_REQUEST>",
+      }) + "\n",
+    );
+    const enriched = await enrichAgyPromptPayload({ transcriptPath: transcript });
+    assert.equal(enriched.prompt, "what is my active plan");
+
+    const preset = await enrichAgyPromptPayload({
+      transcriptPath: transcript,
+      prompt: "already set",
+    });
+    assert.equal(preset.prompt, "already set");
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }
