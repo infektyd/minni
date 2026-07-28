@@ -175,9 +175,16 @@ def _is_stop_candidate_shape(doc: Dict[str, Any]) -> bool:
 # Maps vault slug (dir name without -vault suffix) -> canonical agent_id
 # Derived from _default_agent_vault aliases in minnid.py (source of truth).
 # claude-code is preferred over claudecode because it is the canonical id.
+#
+# Every agent in tools/author_principals.py AGENT_VAULT_DIRS must appear here.
+# The two maps drifted once: `cursor` was declared there and omitted here, and
+# because a missing slug makes vault_ingest skip the vault entirely rather than
+# fail, cursor-vault silently accumulated 141 wiki pages that recall could never
+# see. A skip is quiet; keep the maps in sync.
 _VAULT_SLUG_TO_AGENT_ID: dict[str, str] = {
     "claudecode": "claude-code",
     "codex": "codex",
+    "cursor": "cursor",
     "gemini": "gemini",
     "hermes": "hermes",
     "kilocode": "kilocode",
