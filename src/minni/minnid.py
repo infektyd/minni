@@ -952,6 +952,88 @@ async def _afm_loop_runner():
     return await _runtime_afm_loop_runner(_afm_context())
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Vault watch: keep the per-agent vault indexes current.
+#
+# Recall gates on a per-vault index (`<vault>/.index/vault.db`, see
+# _vault_engine below). Nothing on the write path builds it: vault_write and
+# learn drop .md files into a vault and return, and indexer.start_watcher() has
+# no caller inside the daemon. The result is that a vault can accumulate
+# hundreds of notes that recall can never see -- observed in the field as every
+# per-agent vault sitting at zero indexed documents while the vaults held
+# ~2100 markdown files.
+#
+# A periodic incremental sweep is used rather than a filesystem watcher:
+# vault_ingest already does its own change detection (it reports
+# skipped_unchanged), it covers every discovered vault instead of the single
+# configured vault_path, and it needs no watchdog dependency in the daemon.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _vault_watch_enabled() -> bool:
+    return (os.environ.get("MINNI_VAULT_WATCH", "on") or "on").strip().lower() != "off"
+
+
+def _vault_watch_interval() -> int:
+    try:
+        raw = int(os.environ.get("MINNI_VAULT_WATCH_INTERVAL", "300"))
+    except (TypeError, ValueError):
+        return 300
+    # Below a minute the sweep costs more than the staleness it removes.
+    return max(60, raw)
+
+
+def _vault_watch_sweep_once() -> dict:
+    """Blocking incremental ingest of every discovered vault. Runs off-loop."""
+    from minni.index_all import index_agent_vaults
+
+    return index_agent_vaults(DEFAULT_CONFIG, dry_run=False, verbose=False)
+
+
+async def _vault_watch_runner():
+    interval = _vault_watch_interval()
+    logger.info("Vault watch enabled: incremental ingest every %ss", interval)
+    # Deliberately NOT `while _running`: that global is still False at module
+    # scope and only flips inside _serve_unix_socket, so a task created here in
+    # main() can reach the loop first and exit silently before ever sweeping.
+    # Shutdown cancels this task explicitly, which is the reliable signal.
+    while True:
+        try:
+            stats = await asyncio.to_thread(_vault_watch_sweep_once)
+            # Only speak when something actually changed; an idle sweep is noise.
+            changed = False
+            for vault, s in (stats or {}).items():
+                if not isinstance(s, dict):
+                    continue
+                indexed = s.get("indexed") or 0
+                pruned = s.get("pruned") or 0
+                errors = s.get("errors") or 0
+                if indexed or pruned:
+                    changed = True
+                if indexed or pruned or errors:
+                    logger.info(
+                        "Vault watch: %s indexed=%s pruned=%s errors=%s",
+                        vault, indexed, pruned, errors,
+                    )
+            if changed:
+                # Indexing the file on disk is not enough. _agent_vault_retrieval
+                # memoizes a RetrievalEngine per vault, so a live daemon keeps
+                # answering from the engine it built at startup and newly indexed
+                # notes stay invisible until restart -- verified: a note that
+                # recall could not find became FTS rank 1 immediately after a
+                # daemon restart, with no change to the index itself.
+                _vault_retrieval_cache.clear()
+                logger.info("Vault watch: cleared per-vault retrieval cache")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # A failed sweep must never take the daemon down; try again next tick.
+            logger.exception("Vault watch sweep failed")
+        try:
+            await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            raise
+
+
 def _handle_daemon_endorse(params: dict, request_id: Any) -> dict:
     return _runtime_handle_daemon_endorse(params, request_id, _afm_context())
 
@@ -1386,6 +1468,13 @@ def main():
     if _afm_loop_enabled(DEFAULT_CONFIG):
         afm_task = loop.create_task(_afm_loop_runner())
 
+    # Vault watch runner. On by default (MINNI_VAULT_WATCH=off to disable):
+    # unlike the AFM loop this is not an enhancement, it is what keeps recall
+    # able to see anything written since the last manual index.
+    vault_watch_task = None
+    if _vault_watch_enabled():
+        vault_watch_task = loop.create_task(_vault_watch_runner())
+
     def _shutdown(signum, frame):
         nonlocal _running
         sig_name = signal.Signals(signum).name
@@ -1398,6 +1487,8 @@ def main():
             http_task.cancel()
         if afm_task is not None:
             afm_task.cancel()
+        if vault_watch_task is not None:
+            vault_watch_task.cancel()
 
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGINT, _shutdown)
