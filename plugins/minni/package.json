@@ -31,8 +31,8 @@
     "node": ">=20"
   },
   "scripts": {
-    "build": "tsc && vite build",
-    "build:server": "tsc",
+    "build": "tsc && vite build && node scripts/emit_build_manifest.mjs",
+    "build:server": "tsc && node scripts/emit_build_manifest.mjs",
     "build:server:bundle": "node scripts/bundle_server.mjs",
     "build:frontend": "vite build",
     "build:board-test": "node scripts/build_board_test.mjs",
