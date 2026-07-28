@@ -194,7 +194,12 @@ bench-test:
 	$(PYTHON) -m pytest -q $(BENCH_DIR)
 
 # ── Wheel payload staging (issue #142) ─────────────────────────────────────
-.PHONY: stage-payload release-wheel check-versions
+.PHONY: stage-payload release-wheel check-versions check-deployments
+# Report which deployed plugin builds have drifted behind source. A copied
+# dist carries no record of its origin, so drift is silent; this makes it loud.
+check-deployments:
+	$(VENV_PY) scripts/check_deployments.py --strict
+
 stage-payload:
 	cd $(PLUGIN_DIR) && npm ci && npm run build:server && npm run build:server:bundle
 	$(VENV_PY) scripts/stage_payload.py

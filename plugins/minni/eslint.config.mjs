@@ -82,6 +82,17 @@ export default tseslint.config(
     },
   },
   {
+    // Build scripts are Node programs and legitimately use console/process.
+    // They had no block here at all, so the globals were simply undefined for
+    // them; bundle_server.mjs passed only because it happens never to log.
+    files: ["scripts/**/*.mjs"],
+    languageOptions: {
+      ecmaVersion: 2022,
+      sourceType: "module",
+      globals: { ...globals.node },
+    },
+  },
+  {
     // Global downgrades for pre-existing patterns across the codebase.
     // These keep `npm run lint` green (warnings only) without a sweeping
     // refactor: empty catch blocks, intentional useless-assignment guards,

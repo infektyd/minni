@@ -372,3 +372,41 @@ def test_daemon_compile_registers_vault_ingest_dry_run(tmp_path, monkeypatch):
     assert resp["result"]["status"] == "ok"
     assert resp["result"]["dry_run"] is True
     assert resp["result"]["would_index"] == 1
+
+
+def test_vault_slug_map_covers_every_authored_agent_vault():
+    """Every agent with an authored vault must have an ingest slug.
+
+    A slug missing from _VAULT_SLUG_TO_AGENT_ID does not raise -- vault_ingest
+    logs a warning and returns status="skipped". That silence is the hazard:
+    `cursor` was declared in AGENT_VAULT_DIRS but omitted from the slug map, so
+    cursor-vault accumulated 141 wiki pages that recall could never return, and
+    nothing failed to signal it.
+    """
+    from minni.afm_passes.inbox_ingest import _VAULT_SLUG_TO_AGENT_ID
+    from minni.tools.author_principals import AGENT_VAULT_DIRS
+
+    missing = {}
+    for agent_id, vault_dir in AGENT_VAULT_DIRS.items():
+        slug = vault_dir[: -len("-vault")] if vault_dir.endswith("-vault") else vault_dir
+        if slug not in _VAULT_SLUG_TO_AGENT_ID:
+            missing[slug] = agent_id
+    assert not missing, (
+        "vault slugs missing from _VAULT_SLUG_TO_AGENT_ID (their vaults will be "
+        f"silently skipped by vault_ingest): {missing}"
+    )
+
+
+def test_vault_slug_map_resolves_to_the_authored_agent_id():
+    """A present-but-wrong mapping would index a vault under a foreign agent,
+    where the same-agent read gate then hides it from its real owner."""
+    from minni.afm_passes.inbox_ingest import _VAULT_SLUG_TO_AGENT_ID
+    from minni.tools.author_principals import AGENT_VAULT_DIRS
+
+    mismatched = {}
+    for agent_id, vault_dir in AGENT_VAULT_DIRS.items():
+        slug = vault_dir[: -len("-vault")] if vault_dir.endswith("-vault") else vault_dir
+        mapped = _VAULT_SLUG_TO_AGENT_ID.get(slug)
+        if mapped is not None and mapped != agent_id:
+            mismatched[slug] = (mapped, agent_id)
+    assert not mismatched, f"slug -> agent_id disagrees with AGENT_VAULT_DIRS: {mismatched}"
