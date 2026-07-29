@@ -60,6 +60,31 @@ class SovereignDB:
         self._schema_initialized = False
         self._lock = threading.Lock()
 
+    # Per-path shared instances. Connections are cached per (instance, thread),
+    # so when several long-lived subsystems each construct their own SovereignDB
+    # on the same file — the daemon's retrieval/writeback/episodic singletons all
+    # do — every executor thread ends up holding one connection PER INSTANCE to
+    # the same database. Under a loaded thread pool that multiplies to
+    # instances × threads × (db + wal) open fds and starves accept() with EMFILE.
+    # shared() collapses that to one instance per database file.
+    _shared_instances: dict = {}
+    _shared_lock = threading.Lock()
+
+    @classmethod
+    def shared(cls, config: SovereignConfig = DEFAULT_CONFIG) -> "SovereignDB":
+        """Return the process-wide instance for ``config.db_path``.
+
+        Safe because SovereignDB reads nothing from config beyond db_path
+        (and ensure_dirs at construction); callers keep their own configs.
+        """
+        key = os.path.abspath(config.db_path)
+        with cls._shared_lock:
+            inst = cls._shared_instances.get(key)
+            if inst is None:
+                inst = cls(config)
+                cls._shared_instances[key] = inst
+            return inst
+
     def _get_conn(self) -> sqlite3.Connection:
         """Get thread-local connection (one connection per thread)."""
         if not hasattr(self._local, "conn") or self._local.conn is None:

@@ -53,6 +53,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import concurrent.futures
 import json
 import logging
 import os
@@ -242,7 +243,7 @@ def _lazy_retrieval():
     global _retrieval
     if _retrieval is None:
         from minni.retrieval import RetrievalEngine
-        _retrieval = RetrievalEngine(SovereignDB(DEFAULT_CONFIG), DEFAULT_CONFIG)
+        _retrieval = RetrievalEngine(SovereignDB.shared(DEFAULT_CONFIG), DEFAULT_CONFIG)
     return _retrieval
 
 
@@ -290,7 +291,7 @@ def _lazy_vault_retrieval(vault_path: Path):
     from minni.vault_index import build_vault_index_config
 
     cfg = build_vault_index_config(vault, base_config=DEFAULT_CONFIG)
-    db = SovereignDB(cfg)
+    db = SovereignDB.shared(cfg)
     engine = RetrievalEngine(db, cfg, faiss_index=FAISSIndex(cfg))
     cached = (engine, agent_id, cfg.db_path)
     _vault_retrieval_cache[key] = cached
@@ -322,7 +323,7 @@ def _lazy_writeback():
     global _writeback
     if _writeback is None:
         from minni.writeback import WriteBackMemory
-        _writeback = WriteBackMemory(SovereignDB(), DEFAULT_CONFIG)
+        _writeback = WriteBackMemory(SovereignDB.shared(DEFAULT_CONFIG), DEFAULT_CONFIG)
     return _writeback
 
 
@@ -530,7 +531,7 @@ def _lazy_episodic():
     global _episodic
     if _episodic is None:
         from minni.episodic import EpisodicMemory
-        _episodic = EpisodicMemory(SovereignDB(), DEFAULT_CONFIG)
+        _episodic = EpisodicMemory(SovereignDB.shared(DEFAULT_CONFIG), DEFAULT_CONFIG)
     return _episodic
 
 
@@ -1362,6 +1363,32 @@ SYNC_ROOTS = (
 )
 
 
+def _raise_fd_ceiling(target: int = 16384) -> int:
+    """Raise RLIMIT_NOFILE's soft limit toward ``target`` (capped at the hard
+    limit). Returns the resulting soft limit.
+
+    Each pooled worker thread holds SQLite handles (db + wal) per database
+    file, so the daemon's fd footprint scales with executor width × database
+    count. launchd's default soft limit is low enough that sustained
+    multi-agent load exhausts it — accept() then fails with EMFILE, every
+    client sees EPIPE, and the job still reports 'running'. Non-fatal on
+    failure: the executor bound in main() is the other half of the defense.
+    """
+    try:
+        import resource
+
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        ceiling = target if hard == resource.RLIM_INFINITY else min(target, hard)
+        if soft < ceiling:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (ceiling, hard))
+            logger.info("RLIMIT_NOFILE soft limit raised %d -> %d", soft, ceiling)
+            return ceiling
+        return soft
+    except Exception:
+        logger.exception("could not raise RLIMIT_NOFILE (non-fatal)")
+        return -1
+
+
 def _warn_if_sync_root(label: str, path: Path) -> None:
     """Emit a warning if ``path`` is under a known cloud-sync root inside $HOME.
 
@@ -1450,13 +1477,28 @@ def main():
     # Eagerly initialize/migrate database on startup (RCM-028 Phase 0 exit)
     try:
         from minni.db import SovereignDB
-        db = SovereignDB(DEFAULT_CONFIG)
+        db = SovereignDB.shared(DEFAULT_CONFIG)
         db._get_conn()
         logger.info("Database initialized/migrated on startup.")
     except Exception:
         logger.exception("Eager database initialization failed")
 
+    _raise_fd_ceiling()
+
     loop = asyncio.new_event_loop()
+    # Bound the pool that asyncio.to_thread dispatches sync RPC handlers onto.
+    # Every pooled thread accretes one SQLite connection (db + wal fds) per
+    # database file it touches and never releases it, so the executor width is
+    # the direct multiplier on the daemon's steady-state fd footprint. The
+    # stdlib default (min(32, cpus + 4)) is wide enough to breach the default
+    # soft fd limit under sustained multi-agent load; requests beyond the bound
+    # queue instead of stacking new fd-holding threads.
+    workers = max(1, int(os.environ.get("MINNI_RPC_WORKERS", "8")))
+    loop.set_default_executor(
+        concurrent.futures.ThreadPoolExecutor(
+            max_workers=workers, thread_name_prefix="minnid-rpc"
+        )
+    )
     main_task = loop.create_task(_serve_unix_socket(_unix_socket_path))
 
     http_task = None
