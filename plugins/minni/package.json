@@ -52,7 +52,7 @@
     "typecheck:frontend": "tsc --project frontend-src/tsconfig.json --noEmit"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@modelcontextprotocol/sdk": "^1.30.0",
     "react": "^19.2.6",
     "react-dom": "^19.2.8",
     "zod": "^4.4.3"
