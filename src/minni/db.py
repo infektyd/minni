@@ -60,6 +60,40 @@ class SovereignDB:
         self._schema_initialized = False
         self._lock = threading.Lock()
 
+    # Per-path shared instances. Connections are cached per (instance, thread),
+    # so when several long-lived subsystems each construct their own SovereignDB
+    # on the same file — the daemon's retrieval/writeback/episodic singletons all
+    # do — every executor thread ends up holding one connection PER INSTANCE to
+    # the same database. Under a loaded thread pool that multiplies to
+    # instances × threads × (db + wal) open fds and starves accept() with EMFILE.
+    # shared() collapses that to one instance per database file.
+    _shared_instances: dict = {}
+    _shared_lock = threading.Lock()
+
+    @classmethod
+    def shared(cls, config: SovereignConfig = DEFAULT_CONFIG) -> "SovereignDB":
+        """Return the process-wide instance for ``config.db_path``.
+
+        Safe because SovereignDB reads nothing from config beyond db_path
+        (and ensure_dirs at construction); callers keep their own configs.
+        """
+        key = os.path.abspath(config.db_path)
+        with cls._shared_lock:
+            inst = cls._shared_instances.get(key)
+            if inst is None:
+                if config.db_path != key:
+                    # Pin the cached instance to the absolute path. The registry
+                    # key is normalized at lookup time, but connections open
+                    # config.db_path as given — a relative spelling would
+                    # resolve against whatever the cwd is when a thread first
+                    # connects, silently targeting a different file.
+                    from dataclasses import replace
+
+                    config = replace(config, db_path=key)
+                inst = cls(config)
+                cls._shared_instances[key] = inst
+            return inst
+
     def _get_conn(self) -> sqlite3.Connection:
         """Get thread-local connection (one connection per thread)."""
         if not hasattr(self._local, "conn") or self._local.conn is None:
@@ -116,7 +150,14 @@ class SovereignDB:
                         # stop.
                         if abs_db_path in _migrated_paths:
                             _schema_ready_paths.add(abs_db_path)
-                    self._schema_initialized = True
+                    # Mirror the process-wide gate rather than setting the
+                    # instance flag unconditionally: a swallowed migration
+                    # failure leaves the path un-ready, and a long-lived
+                    # instance (shared() keeps them for the process lifetime)
+                    # must re-enter this block on its next call to retry —
+                    # otherwise the retry-on-next-open contract above died
+                    # with the throwaway instances that used to carry it.
+                    self._schema_initialized = abs_db_path in _schema_ready_paths
 
         return self._local.conn
 

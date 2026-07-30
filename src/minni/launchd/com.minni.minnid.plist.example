@@ -35,6 +35,16 @@
     before first load:
       mkdir -p ~/Library/Logs/minni
       chmod 0700 ~/Library/Logs/minni
+
+    SoftResourceLimits/NumberOfFiles: launchd's default soft fd limit is
+    256, which sustained multi-agent load exhausts in minutes (each pooled
+    RPC thread holds SQLite handles per database file). At the ceiling,
+    accept() fails with EMFILE, clients see EPIPE, AFM helper spawns fail —
+    while the job still reports "running". The daemon also raises its own
+    rlimit at startup (minnid._raise_fd_ceiling), but the plist floor keeps
+    older daemon builds and the window before startup safe. If you already
+    have a live plist WITHOUT this key, add it and do a full
+    bootout + bootstrap (kickstart alone does not re-read the plist).
 -->
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -80,5 +90,11 @@
 
     <key>ProcessType</key>
     <string>Background</string>
+
+    <key>SoftResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>8192</integer>
+    </dict>
 </dict>
 </plist>

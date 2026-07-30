@@ -54,6 +54,10 @@ def _isolated_engine_state(tmp_path, monkeypatch):
         # reused across tests (deleted + recreated) would otherwise carry a stale
         # "ready" entry and SKIP schema init, hitting "no such table: vault_fts".
         _db._schema_ready_paths.clear()
+        # Same reasoning for the per-path shared-instance registry: a tmp db
+        # path reused across tests would hand a later test the earlier test's
+        # instance (and its already-open connections to the deleted file).
+        _db.SovereignDB._shared_instances.clear()
     except Exception:
         pass
 
