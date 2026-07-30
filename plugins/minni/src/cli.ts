@@ -1,5 +1,5 @@
 import { DEFAULT_VAULT_PATH } from "./config.js";
-import { assessLearningQuality, routeMemoryIntent } from "./policy.js";
+import { assessLearningQualityAsync, routeMemoryIntent } from "./policy.js";
 import { readAgentContext, statusAndAudit } from "./sovereign.js";
 import { prepareOutcome, prepareTask } from "./task.js";
 import { buildTeamEvidencePacket, buildTeamPromotionPacket, buildTeamRuntime } from "./team.js";
@@ -225,7 +225,9 @@ async function main() {
   if (command === "quality") {
     const [title, ...contentParts] = args;
     if (!title || contentParts.length === 0) throw new Error("quality requires title and content");
-    console.log(JSON.stringify(assessLearningQuality({ title, content: contentParts.join(" ") }), null, 2));
+    console.log(
+      JSON.stringify(await assessLearningQualityAsync({ title, content: contentParts.join(" ") }), null, 2),
+    );
     return;
   }
 

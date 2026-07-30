@@ -176,13 +176,14 @@ const SECRET_PREFIX_RE = new RegExp(
 // (`password: correcthorsebatterystaple`, `private key: abcdef…`). These
 // words followed by an assigned value are essentially never benign prose.
 //
-// KNOWN LIMITATION (accepted, tracked upstream of PR #146): an UNQUOTED
-// multi-word passphrase (`password: correct horse battery staple`) is
-// structurally indistinguishable from prose (`password: use a manager`) —
-// only its first word is consumed, and 7-char words pass. Quoted
-// passphrases block; catching unquoted ones requires semantics, and the
-// pre-#138 gate "caught" them only by blocking every sentence containing
-// these words, which is the exact false-positive trade #138 rejected.
+// UNQUOTED multi-word tails after a high-risk keyword (`password: correct
+// horse battery staple` vs `password: use a manager`) are structurally
+// indistinguishable to regex — only the first token is consumed, and short
+// words pass. Quoted passphrases still block here. Issue #147 adds an AFM
+// semantic tier (`assessLearningQualityAsync`) that runs ONLY when
+// `findInconclusiveHighRiskAssignments` finds such a span; the pre-#138 gate
+// "caught" them only by blocking every sentence containing these words,
+// which is the exact false-positive trade #138 rejected.
 //
 // LOWER-RISK (token/api-key/credential): these appear constantly in benign
 // YAML/prose (`id-token: write`, "token: authentication-related"), so the
@@ -193,6 +194,117 @@ const HIGH_RISK_ASSIGNMENT_RE =
   /(secret|passwd|password|private[_ -]?key)s?["']?\s*[:=]\s*(?:["'][^"'\n]{8,}["']|[^\s"']{8,})/i;
 const LOWER_RISK_ASSIGNMENT_RE =
   /(token|api[_ -]?key|credential)s?["']?\s*(?:=\s*(?:["'][^"'\n]{8,}["']|[^\s"']{8,})|:\s*(?:["'][^"'\n]{8,}["']|(?=[^\s"']*[0-9!@#$%^&*?~+=])[^\s"']{8,}))/i;
+
+/** High-risk keyword + unquoted multi-word value that the regex tier cannot judge. */
+export interface InconclusiveHighRiskAssignment {
+  keyword: string;
+  /** Tail after `:`/`=` — never echoed into warnings (may be a passphrase). */
+  tail: string;
+}
+
+/**
+ * Collect credential-shaped value candidates from a high-risk assignment
+ * region. Multiple candidates are intentional: decoy quotes + real tails
+ * (`"my dog" after correct horse…`) and quoted secrets + prose asides
+ * (`"don'tusethispass" is stored…`) must BOTH reach AFM — the classifier
+ * blocks if ANY span is credential material.
+ */
+function candidateAssignmentTails(clipped: string): string[] {
+  const out: string[] = [];
+  const add = (raw: string) => {
+    let region = raw.trim();
+    while (region.startsWith("\\")) region = region.slice(1).trim();
+    region = region.replace(/^["']+|["']+$/g, "").trim();
+    if (!region) return;
+    // Em/en dash separates clauses — emit BOTH sides so
+    // `use a manager — correct horse…` still surfaces the passphrase, while
+    // `secret — documented pad` still surfaces the secret on the left.
+    for (const part of region.split(/\s+[—–]\s+/)) {
+      const tokens = part.trim().split(/\s+/).filter(Boolean).slice(0, 8);
+      if (tokens.length >= 2 || (tokens.length === 1 && (tokens[0]?.length ?? 0) >= 8)) {
+        out.push(tokens.join(" "));
+      }
+    }
+  };
+
+  add(clipped);
+
+  // Closed quote segments + everything after each closed quote.
+  const quoteRe = /["']([^"'\n]*)["']/g;
+  let match: RegExpExecArray | null;
+  while ((match = quoteRe.exec(clipped)) !== null) {
+    add(match[1] ?? "");
+    add(clipped.slice(match.index + match[0].length));
+  }
+
+  // Unclosed leading quote / triple-quote leftovers.
+  const leading = clipped.trim();
+  if (leading.startsWith('"') || leading.startsWith("'")) {
+    add(leading.slice(1));
+  }
+  // Strip leading quote runs then add ("""foo""" → foo).
+  add(leading.replace(/^["']+/, "").replace(/["']+$/, ""));
+
+  return [...new Set(out)];
+}
+
+/**
+ * Spans the regex assignment tier leaves inconclusive (#147): a high-risk
+ * credential keyword assigned a value the opaque-literal regex cannot own.
+ * Callers run this only when `detectSecretMaterial` returned null.
+ *
+ * Each assignment is bounded to the same line and stops before the next
+ * high-risk `keyword[:=]`. Multiple tails per assignment are emitted so
+ * decoy quotes cannot hide a later passphrase from AFM.
+ */
+export function findInconclusiveHighRiskAssignments(
+  content: string,
+): InconclusiveHighRiskAssignment[] {
+  const found: InconclusiveHighRiskAssignment[] = [];
+  const re =
+    /(secret|passwd|password|private[_ -]?key)s?["']?\s*[:=]\s*/gi;
+  const nextAssignRe =
+    /\b(?:secret|passwd|password|private[_ -]?key)s?["']?\s*[:=]/i;
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(content)) !== null) {
+    const keyword = match[1] ?? "password";
+    const valueStart = match.index + match[0].length;
+    const lineEndMatch = content.slice(valueStart).match(/\r?\n/);
+    const lineEnd =
+      lineEndMatch && lineEndMatch.index !== undefined
+        ? valueStart + lineEndMatch.index
+        : -1;
+    const restOfLine = content.slice(valueStart, lineEnd === -1 ? undefined : lineEnd);
+    const nextIdx = restOfLine.search(nextAssignRe);
+    const clipped = (nextIdx === -1 ? restOfLine : restOfLine.slice(0, nextIdx)).trim();
+    // True regex ownership on the live string.
+    if (HIGH_RISK_ASSIGNMENT_RE.test(`${match[0]}${clipped}`)) continue;
+    for (const tail of candidateAssignmentTails(clipped)) {
+      found.push({ keyword, tail });
+    }
+    // One following line: `password: use a manager\ncorrect horse…` must not
+    // leave the passphrase on line 2 invisible to AFM.
+    if (lineEnd !== -1) {
+      const afterNl = content.slice(lineEnd).replace(/^\r?\n/, "");
+      const nextLineEndMatch = afterNl.match(/\r?\n/);
+      const nextLine = afterNl
+        .slice(0, nextLineEndMatch?.index ?? undefined)
+        .trim();
+      if (nextLine && !nextAssignRe.test(nextLine)) {
+        for (const tail of candidateAssignmentTails(nextLine)) {
+          found.push({ keyword, tail });
+        }
+      }
+    }
+  }
+  return found;
+}
+
+export type InconclusiveCredentialVerdict = "credential" | "prose" | "unavailable";
+
+export type InconclusiveCredentialClassifier = (
+  spans: InconclusiveHighRiskAssignment[],
+) => Promise<InconclusiveCredentialVerdict>;
 
 // Public integrity checksums (npm/pnpm SRI: `sha512-…=`) are high-entropy but
 // not secrets; strip them before the entropy fallback so lockfile-debugging
@@ -251,6 +363,8 @@ export function assessLearningQuality(input: {
   category?: string;
   source?: string;
 }): LearningQualityReport {
+  // Regex-only fast path. Learn / quality MCP + CLI use
+  // `assessLearningQualityAsync` so the #147 AFM inconclusive tier runs.
   const warnings: string[] = [];
   let score = 0.35;
   const content = input.content.trim();
@@ -288,5 +402,65 @@ export function assessLearningQuality(input: {
     score: normalized,
     warnings,
     summary: warnings.length === 0 ? "Learning looks durable and specific." : warnings.join(" "),
+  };
+}
+
+/**
+ * Learn-quality gate with the #147 AFM inconclusive tier.
+ *
+ * Fast path: identical to `assessLearningQuality` (regex material detector).
+ * Slow path: when regex is clear BUT a high-risk keyword has an unquoted
+ * multi-word tail, run `classifyInconclusive` (default: local AFM). A
+ * `credential` verdict hard-blocks; `prose` / `unavailable` leave the
+ * regex result unchanged (fail-open — AFM enhances, it does not replace).
+ */
+export async function assessLearningQualityAsync(
+  input: {
+    title: string;
+    content: string;
+    category?: string;
+    source?: string;
+  },
+  options: {
+    classifyInconclusive?: InconclusiveCredentialClassifier;
+  } = {},
+): Promise<LearningQualityReport> {
+  const base = assessLearningQuality(input);
+  if (!base.ok && base.warnings.some((w) => w.includes("sensitive material"))) {
+    return base;
+  }
+
+  const spans = findInconclusiveHighRiskAssignments(input.content.trim());
+  if (spans.length === 0) return base;
+
+  // Lazy default import keeps the sync path free of AFM for unit tests /
+  // callers that only need regex. Injection overrides for deterministic tests.
+  const classify =
+    options.classifyInconclusive ??
+    (await import("./policy-secret-afm.js")).classifyInconclusiveWithAfm;
+
+  let verdict: InconclusiveCredentialVerdict;
+  try {
+    verdict = await classify(spans);
+  } catch {
+    verdict = "unavailable";
+  }
+
+  if (verdict !== "credential") return base;
+
+  const keywords = [...new Set(spans.map((s) => s.keyword))];
+  const keywordLabel = keywords.length === 1 ? keywords[0] : keywords.join("/");
+  const warnings = [
+    ...base.warnings,
+    "Content appears to contain sensitive material " +
+      `(a credential keyword ("${keywordLabel ?? "password"}") assigned an ` +
+      "unquoted multi-word value classified as a secret); never store secrets in memory.",
+  ];
+  const score = clampScore(base.score - 0.3);
+  return {
+    ok: false,
+    score,
+    warnings,
+    summary: warnings.join(" "),
   };
 }

@@ -8,7 +8,7 @@ import {
   DEFAULT_VAULT_PATH,
   DEFAULT_WORKSPACE_ID,
 } from "./config.js";
-import { assessLearningQuality, routeMemoryIntent } from "./policy.js";
+import { assessLearningQualityAsync, routeMemoryIntent } from "./policy.js";
 import {
   ackHandoff,
   awaitHandoff,
@@ -659,7 +659,8 @@ server.registerTool(
     },
   },
   async ({ title, content, category, source, workspaceId, requireQuality }) => {
-    const quality = assessLearningQuality({ title, content, category, source });
+    // Async path includes the #147 AFM inconclusive tier (regex remains fast path).
+    const quality = await assessLearningQualityAsync({ title, content, category, source });
     if (requireQuality !== false && !quality.ok) {
       await recordAudit(DEFAULT_VAULT_PATH, {
         tool: "minni_learn",
@@ -770,7 +771,7 @@ server.registerTool(
   async ({ title, content, category, source }) => {
     const gated = await requireSharedGate("audit.learning_quality", { tool: "minni_learning_quality" });
     if (gated) return gated;
-    const quality = assessLearningQuality({ title, content, category, source });
+    const quality = await assessLearningQualityAsync({ title, content, category, source });
     await recordAudit(DEFAULT_VAULT_PATH, {
       tool: "minni_learning_quality",
       summary: title,

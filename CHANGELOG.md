@@ -8,6 +8,18 @@ pre-1.0: minor versions may contain breaking changes until v1.0.0.
 
 ## [Unreleased]
 
+### Added
+
+- **Learn gate AFM enhancement for unquoted multi-word passphrases**
+  ([#147](https://github.com/infektyd/minni/issues/147)): when the regex
+  material detector is inconclusive on a high-risk keyword assigned an
+  unquoted multi-word value (`password: correct horse battery staple` vs
+  `password: use a manager`), `minni_learn` / `minni_learning_quality` /
+  `cli quality` run a local AFM semantic classification. A `credential`
+  verdict hard-blocks; `prose` and AFM-unavailable/off fail open (regex
+  remains the fast path — the gap remains when AFM cannot classify).
+  Passphrase text is never echoed into quality warnings.
+
 ## [0.3.0] - 2026-07-04
 
 ### Added
@@ -38,7 +50,8 @@ pre-1.0: minor versions may contain breaking changes until v1.0.0.
   high-risk/lower-risk rules), and high-entropy pastes hard-block. Hardened
   through six automated review rounds; the one regex-unreachable case
   (unquoted multi-word passphrases) is tracked in
-  [#147](https://github.com/infektyd/minni/issues/147).
+  [#147](https://github.com/infektyd/minni/issues/147) (AFM enhancement
+  tier landed in Unreleased — fail-open when AFM cannot classify).
 - propagate.py stale `0.1.0` path/version literals now resolve dynamically
   (the `current` symlink is authoritative over the installed package version).
 - TOML config writers escape control characters, preventing corruption of
