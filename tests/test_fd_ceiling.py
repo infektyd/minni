@@ -94,3 +94,68 @@ def test_raise_fd_ceiling_caps_at_target():
         assert _raise_fd_ceiling(target=target) in (target, soft_before)
     finally:
         resource.setrlimit(resource.RLIMIT_NOFILE, (soft_before, hard_before))
+
+
+# --- PR #190 review follow-ups (Codex P2s) ---
+
+
+def test_shared_pins_relative_db_path_to_absolute(tmp_path, monkeypatch):
+    # A relative first spelling must not leave the cached instance opening
+    # cwd-relative paths after the process later chdirs elsewhere.
+    monkeypatch.chdir(tmp_path)
+    from dataclasses import replace
+
+    inst = SovereignDB.shared(replace(_cfg(tmp_path, "a.db"), db_path="a.db"))
+    assert os.path.isabs(inst.config.db_path)
+    other = tmp_path / "elsewhere"
+    other.mkdir()
+    monkeypatch.chdir(other)
+    inst._get_conn().execute("SELECT 1")
+    assert (tmp_path / "a.db").exists()
+    assert not (other / "a.db").exists()
+
+
+def test_failed_migration_is_retried_on_next_use(tmp_path, monkeypatch):
+    # The swallowed-migration-failure retry contract must survive instance
+    # reuse: shared() keeps instances for the process lifetime, so the
+    # instance flag may not latch True while the path is un-ready.
+    import minni.db as db_mod
+    import minni.migrations as migrations_mod
+
+    def boom(conn):
+        raise sqlite_error_stub
+
+    sqlite_error_stub = RuntimeError("transient: database is locked")
+    monkeypatch.setattr(migrations_mod, "run_migrations", boom)
+
+    cfg = _cfg(tmp_path, "a.db")
+    inst = SovereignDB.shared(cfg)
+    inst._get_conn()
+    key = os.path.abspath(cfg.db_path)
+    assert key not in db_mod._migrated_paths
+    assert inst._schema_initialized is False
+
+    monkeypatch.undo()
+    monkeypatch.setattr(db_mod, "_migrations_run", False, raising=False)
+    assert inst is SovereignDB.shared(cfg)
+    inst._get_conn()
+    assert key in db_mod._migrated_paths
+    assert inst._schema_initialized is True
+
+
+def test_rpc_worker_count_defends_against_malformed_env(monkeypatch):
+    from minni.minnid import _rpc_worker_count
+
+    for raw, expected in [
+        ("", 8),
+        ("   ", 8),
+        ("not-a-number", 8),
+        ("12.5", 8),
+        ("0", 1),
+        ("-3", 1),
+        ("4", 4),
+    ]:
+        monkeypatch.setenv("MINNI_RPC_WORKERS", raw)
+        assert _rpc_worker_count() == expected, f"raw={raw!r}"
+    monkeypatch.delenv("MINNI_RPC_WORKERS")
+    assert _rpc_worker_count() == 8

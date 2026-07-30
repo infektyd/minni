@@ -81,6 +81,15 @@ class SovereignDB:
         with cls._shared_lock:
             inst = cls._shared_instances.get(key)
             if inst is None:
+                if config.db_path != key:
+                    # Pin the cached instance to the absolute path. The registry
+                    # key is normalized at lookup time, but connections open
+                    # config.db_path as given — a relative spelling would
+                    # resolve against whatever the cwd is when a thread first
+                    # connects, silently targeting a different file.
+                    from dataclasses import replace
+
+                    config = replace(config, db_path=key)
                 inst = cls(config)
                 cls._shared_instances[key] = inst
             return inst
@@ -141,7 +150,14 @@ class SovereignDB:
                         # stop.
                         if abs_db_path in _migrated_paths:
                             _schema_ready_paths.add(abs_db_path)
-                    self._schema_initialized = True
+                    # Mirror the process-wide gate rather than setting the
+                    # instance flag unconditionally: a swallowed migration
+                    # failure leaves the path un-ready, and a long-lived
+                    # instance (shared() keeps them for the process lifetime)
+                    # must re-enter this block on its next call to retry —
+                    # otherwise the retry-on-next-open contract above died
+                    # with the throwaway instances that used to carry it.
+                    self._schema_initialized = abs_db_path in _schema_ready_paths
 
         return self._local.conn
 

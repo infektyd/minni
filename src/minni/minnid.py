@@ -1363,6 +1363,26 @@ SYNC_ROOTS = (
 )
 
 
+def _rpc_worker_count(default: int = 8) -> int:
+    """Parse MINNI_RPC_WORKERS defensively.
+
+    An optional tuning knob must never kill the daemon at startup: empty or
+    non-numeric values (a launchd plist typo) fall back to the default, and
+    non-positive numbers clamp to 1.
+    """
+    raw = os.environ.get("MINNI_RPC_WORKERS", "").strip()
+    if not raw:
+        return default
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        logger.warning(
+            "MINNI_RPC_WORKERS=%r is not an integer; using default %d",
+            raw, default,
+        )
+        return default
+
+
 def _raise_fd_ceiling(target: int = 16384) -> int:
     """Raise RLIMIT_NOFILE's soft limit toward ``target`` (capped at the hard
     limit). Returns the resulting soft limit.
@@ -1493,7 +1513,7 @@ def main():
     # stdlib default (min(32, cpus + 4)) is wide enough to breach the default
     # soft fd limit under sustained multi-agent load; requests beyond the bound
     # queue instead of stacking new fd-holding threads.
-    workers = max(1, int(os.environ.get("MINNI_RPC_WORKERS", "8")))
+    workers = _rpc_worker_count()
     loop.set_default_executor(
         concurrent.futures.ThreadPoolExecutor(
             max_workers=workers, thread_name_prefix="minnid-rpc"
