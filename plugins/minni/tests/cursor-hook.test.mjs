@@ -120,16 +120,18 @@ test("Cursor hook writes only the Cursor vault and stamps Cursor identity", asyn
   }
 });
 
-test("Cursor manifest invokes only the native adapter with bounded timeouts", async () => {
+test("Cursor manifest invokes only the User wrapper with bounded timeouts", async () => {
   const manifest = JSON.parse(await readFile(path.join(ROOT, "hooks", "hooks-cursor.json"), "utf8"));
   assert.equal(manifest.version, 1);
   assert.deepEqual(Object.keys(manifest.hooks).sort(),
     ["beforeSubmitPrompt", "preCompact", "preToolUse", "sessionStart", "stop"].sort());
   for (const entries of Object.values(manifest.hooks)) {
     for (const hook of entries) {
-      assert.match(hook.command, /\$\{CURSOR_PLUGIN_ROOT\}\/dist\/cursor-hook\.js/);
-      assert.doesNotMatch(hook.command, /dist\/hook\.js|CLAUDE/);
+      assert.match(hook.command, /\.\/hooks\/minni-cursor\.sh/);
+      assert.doesNotMatch(hook.command, /CURSOR_PLUGIN_ROOT|dist\/cursor-hook\.js|dist\/hook\.js|CLAUDE/);
       assert.ok(hook.timeout > 0 && hook.timeout <= 30);
     }
   }
+  const plugin = JSON.parse(await readFile(path.join(ROOT, ".cursor-plugin", "plugin.json"), "utf8"));
+  assert.equal(plugin.hooks, undefined, "plugin must not register hooks; User wrapper is sole fire path");
 });

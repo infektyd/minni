@@ -936,26 +936,73 @@ def write_grok_rules() -> dict[str, object]:
     return {"installed": True, "path": str(target)}
 
 
+# Cursor User hooks run with cwd ~/.cursor. The wrapper is the sole Minni fire
+# path (plugin-manifest hooks are intentionally not registered — live Cursor
+# only executes User hooks for Minni). The wrapper stamps identity env and
+# execs the Cursor-local dist binary.
+CURSOR_WRAPPER_NAME = "minni-cursor.sh"
+CURSOR_WRAPPER_REL = f"./hooks/{CURSOR_WRAPPER_NAME}"
+CURSOR_WRAPPER_BODY = """#!/bin/bash
+set -euo pipefail
+export MINNI_CURSOR_AGENT_ID=cursor
+export MINNI_CURSOR_VAULT_PATH="$HOME/.minni/cursor-vault"
+export MINNI_CURSOR_WORKSPACE_ID=workspace-hansaxelsson
+exec node "$HOME/.cursor/plugins/local/minni/dist/cursor-hook.js" "$1"
+"""
+
+
+def _cursor_wrapper_path() -> Path:
+    return Path("~/.cursor/hooks").expanduser() / CURSOR_WRAPPER_NAME
+
+
+def deploy_cursor_wrapper() -> Path:
+    """Write ~/.cursor/hooks/minni-cursor.sh and chmod +x. Idempotent."""
+    wrapper = _cursor_wrapper_path()
+    wrapper.parent.mkdir(parents=True, exist_ok=True)
+    wrapper.write_text(CURSOR_WRAPPER_BODY, encoding="utf-8")
+    wrapper.chmod(0o755)
+    return wrapper
+
+
+def _is_minni_cursor_user_hook(entry: object) -> bool:
+    """True for any Minni Cursor User hook we own (wrapper or legacy node paths)."""
+    if not isinstance(entry, dict):
+        return False
+    command = str(entry.get("command") or "")
+    markers = (
+        CURSOR_WRAPPER_NAME,
+        "/dist/cursor-hook.js",
+        ".agents/plugins/minni",
+        "plugins/local/minni",
+    )
+    return any(marker in command for marker in markers)
+
+
 def update_cursor_hooks(install_root: Path) -> dict[str, object]:
-    """Install Minni's hooks into ~/.cursor/hooks.json, preserving other entries.
+    """Install Minni's hooks into ~/.cursor/hooks.json via the User wrapper.
 
-    Cursor's blessed plugin path is a .cursor-plugin/plugin.json manifest, but
-    ${CURSOR_PLUGIN_ROOT} expansion is (a) undocumented by Cursor and (b) applied
-    only to plugin-sourced hooks. The user-level ~/.cursor/hooks.json is the
-    documented, unambiguous root, so absolute paths are stamped in.
+    Sole fire path: User hooks → ./hooks/minni-cursor.sh → local dist/cursor-hook.js.
+    Plugin-manifest hooks are not registered (see .cursor-plugin/plugin.json).
 
-    Merge, don't replace: a user's own hooks in this file must survive. Only
-    entries pointing at THIS install root are rewritten.
+    Deploy the wrapper every run. Strip ALL prior Minni User entries (legacy
+    .agents / local absolute node paths and the wrapper itself), then write
+    only the wrapper command set — never append beside survivors.
+    Non-Minni user hooks are preserved.
     """
     template = install_root / "hooks" / "hooks-cursor.json"
     if not template.exists():
         return {"installed": False, "reason": f"missing hooks template: {template}"}
 
-    stamped = json.loads(
-        template.read_text(encoding="utf-8").replace(
-            "${CURSOR_PLUGIN_ROOT}", str(install_root)
-        )
-    )
+    wrapper = deploy_cursor_wrapper()
+    stamped = json.loads(template.read_text(encoding="utf-8"))
+    # Template must already use the wrapper; refuse stale CURSOR_PLUGIN_ROOT stamps.
+    raw_template = json.dumps(stamped)
+    if "${CURSOR_PLUGIN_ROOT}" in raw_template or "/dist/cursor-hook.js" in raw_template:
+        return {
+            "installed": False,
+            "reason": "hooks-cursor.json must use ./hooks/minni-cursor.sh (User wrapper), not CURSOR_PLUGIN_ROOT/cursor-hook.js",
+        }
+
     target = Path("~/.cursor/hooks.json").expanduser()
 
     # Preserve the file: only `hooks` is ours. Rebuilding from a template would
@@ -964,40 +1011,29 @@ def update_cursor_hooks(install_root: Path) -> dict[str, object]:
     merged.setdefault("version", 1)
     hooks: dict[str, list] = dict(merged.get("hooks", {}) or {})
 
-    # Identify OUR entries by the exact command string we are about to write,
-    # not by substring-matching the install root anywhere in the JSON. A user
-    # whose own hook lives in a sibling path (/x/minni-other vs /x/minni) would
-    # otherwise match and be deleted.
-    def _commands(entries: list) -> set[str]:
-        return {e.get("command") for e in entries if isinstance(e, dict)}
-
-    # Exact-match alone is not enough: reinstalling from a DIFFERENT
-    # --install-root writes a new command while the old stamped one survives,
-    # so both fire and every session hydrates twice. Identify ours by the
-    # stable script basename (`/dist/cursor-hook.js`) rather than a
-    # `/plugins/minni/` path marker — the normal Cursor install root is
-    # `~/.agents/plugins/minni@minni`, which does not contain that marker, and
-    # an explicit `--install-root` need not either. The basename is Minni's own
-    # entrypoint, so a user's unrelated hook cannot match it by accident.
-    CURSOR_HOOK_SCRIPT = "/dist/cursor-hook.js"
-
-    def _is_ours(entry: object, commands: set[str]) -> bool:
-        if not isinstance(entry, dict):
-            return False
-        command = str(entry.get("command") or "")
-        if command in commands:
-            return True
-        return CURSOR_HOOK_SCRIPT in command
-
     for event, entries in (stamped.get("hooks", {}) or {}).items():
-        ours = _commands(list(entries))
-        kept = [e for e in (hooks.get(event) or []) if not _is_ours(e, ours)]
+        kept = [e for e in (hooks.get(event) or []) if not _is_minni_cursor_user_hook(e)]
         hooks[event] = kept + list(entries)
+
+    # Also strip Minni leftovers on events we no longer stamp (defensive).
+    for event, existing in list(hooks.items()):
+        if event in (stamped.get("hooks") or {}):
+            continue
+        cleaned = [e for e in (existing or []) if not _is_minni_cursor_user_hook(e)]
+        if cleaned:
+            hooks[event] = cleaned
+        else:
+            hooks.pop(event, None)
 
     merged["hooks"] = hooks
     target.parent.mkdir(parents=True, exist_ok=True)
     write_json(target, merged)
-    return {"installed": True, "path": str(target)}
+    return {
+        "installed": True,
+        "path": str(target),
+        "wrapper": str(wrapper),
+        "install_root": str(install_root),
+    }
 
 
 def update_agy_plugin_hooks(install_root: Path) -> dict[str, object]:
@@ -1202,11 +1238,11 @@ def platform_spec(platform: str, repo_root: Path, install_root: str | None = Non
             "config_kind": "antigravity",
         },
         "cursor": {
-            # Cursor: standard plugin install, plus ~/.cursor/hooks.json for the
-            # lifecycle hooks (see update_cursor_hooks for why the user-level
-            # file rather than ${CURSOR_PLUGIN_ROOT} in the plugin manifest).
+            # Cursor: install under ~/.cursor/plugins/local/minni. Lifecycle hooks
+            # are User-only via ~/.cursor/hooks/minni-cursor.sh (see update_cursor_hooks);
+            # the plugin manifest does not register hooks.
             "agent": "cursor",
-            "install": home / ".agents/plugins/minni@minni",
+            "install": home / ".cursor/plugins/local/minni",
             "config_kind": "mcp-json-only",
         },
         "grok": {

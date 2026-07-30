@@ -53,6 +53,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import concurrent.futures
 import json
 import logging
 import os
@@ -242,7 +243,7 @@ def _lazy_retrieval():
     global _retrieval
     if _retrieval is None:
         from minni.retrieval import RetrievalEngine
-        _retrieval = RetrievalEngine(SovereignDB(DEFAULT_CONFIG), DEFAULT_CONFIG)
+        _retrieval = RetrievalEngine(SovereignDB.shared(DEFAULT_CONFIG), DEFAULT_CONFIG)
     return _retrieval
 
 
@@ -290,7 +291,7 @@ def _lazy_vault_retrieval(vault_path: Path):
     from minni.vault_index import build_vault_index_config
 
     cfg = build_vault_index_config(vault, base_config=DEFAULT_CONFIG)
-    db = SovereignDB(cfg)
+    db = SovereignDB.shared(cfg)
     engine = RetrievalEngine(db, cfg, faiss_index=FAISSIndex(cfg))
     cached = (engine, agent_id, cfg.db_path)
     _vault_retrieval_cache[key] = cached
@@ -322,7 +323,7 @@ def _lazy_writeback():
     global _writeback
     if _writeback is None:
         from minni.writeback import WriteBackMemory
-        _writeback = WriteBackMemory(SovereignDB(), DEFAULT_CONFIG)
+        _writeback = WriteBackMemory(SovereignDB.shared(DEFAULT_CONFIG), DEFAULT_CONFIG)
     return _writeback
 
 
@@ -530,7 +531,7 @@ def _lazy_episodic():
     global _episodic
     if _episodic is None:
         from minni.episodic import EpisodicMemory
-        _episodic = EpisodicMemory(SovereignDB(), DEFAULT_CONFIG)
+        _episodic = EpisodicMemory(SovereignDB.shared(DEFAULT_CONFIG), DEFAULT_CONFIG)
     return _episodic
 
 
@@ -952,6 +953,88 @@ async def _afm_loop_runner():
     return await _runtime_afm_loop_runner(_afm_context())
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Vault watch: keep the per-agent vault indexes current.
+#
+# Recall gates on a per-vault index (`<vault>/.index/vault.db`, see
+# _vault_engine below). Nothing on the write path builds it: vault_write and
+# learn drop .md files into a vault and return, and indexer.start_watcher() has
+# no caller inside the daemon. The result is that a vault can accumulate
+# hundreds of notes that recall can never see -- observed in the field as every
+# per-agent vault sitting at zero indexed documents while the vaults held
+# ~2100 markdown files.
+#
+# A periodic incremental sweep is used rather than a filesystem watcher:
+# vault_ingest already does its own change detection (it reports
+# skipped_unchanged), it covers every discovered vault instead of the single
+# configured vault_path, and it needs no watchdog dependency in the daemon.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _vault_watch_enabled() -> bool:
+    return (os.environ.get("MINNI_VAULT_WATCH", "on") or "on").strip().lower() != "off"
+
+
+def _vault_watch_interval() -> int:
+    try:
+        raw = int(os.environ.get("MINNI_VAULT_WATCH_INTERVAL", "300"))
+    except (TypeError, ValueError):
+        return 300
+    # Below a minute the sweep costs more than the staleness it removes.
+    return max(60, raw)
+
+
+def _vault_watch_sweep_once() -> dict:
+    """Blocking incremental ingest of every discovered vault. Runs off-loop."""
+    from minni.index_all import index_agent_vaults
+
+    return index_agent_vaults(DEFAULT_CONFIG, dry_run=False, verbose=False)
+
+
+async def _vault_watch_runner():
+    interval = _vault_watch_interval()
+    logger.info("Vault watch enabled: incremental ingest every %ss", interval)
+    # Deliberately NOT `while _running`: that global is still False at module
+    # scope and only flips inside _serve_unix_socket, so a task created here in
+    # main() can reach the loop first and exit silently before ever sweeping.
+    # Shutdown cancels this task explicitly, which is the reliable signal.
+    while True:
+        try:
+            stats = await asyncio.to_thread(_vault_watch_sweep_once)
+            # Only speak when something actually changed; an idle sweep is noise.
+            changed = False
+            for vault, s in (stats or {}).items():
+                if not isinstance(s, dict):
+                    continue
+                indexed = s.get("indexed") or 0
+                pruned = s.get("pruned") or 0
+                errors = s.get("errors") or 0
+                if indexed or pruned:
+                    changed = True
+                if indexed or pruned or errors:
+                    logger.info(
+                        "Vault watch: %s indexed=%s pruned=%s errors=%s",
+                        vault, indexed, pruned, errors,
+                    )
+            if changed:
+                # Indexing the file on disk is not enough. _agent_vault_retrieval
+                # memoizes a RetrievalEngine per vault, so a live daemon keeps
+                # answering from the engine it built at startup and newly indexed
+                # notes stay invisible until restart -- verified: a note that
+                # recall could not find became FTS rank 1 immediately after a
+                # daemon restart, with no change to the index itself.
+                _vault_retrieval_cache.clear()
+                logger.info("Vault watch: cleared per-vault retrieval cache")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # A failed sweep must never take the daemon down; try again next tick.
+            logger.exception("Vault watch sweep failed")
+        try:
+            await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            raise
+
+
 def _handle_daemon_endorse(params: dict, request_id: Any) -> dict:
     return _runtime_handle_daemon_endorse(params, request_id, _afm_context())
 
@@ -1280,6 +1363,52 @@ SYNC_ROOTS = (
 )
 
 
+def _rpc_worker_count(default: int = 8) -> int:
+    """Parse MINNI_RPC_WORKERS defensively.
+
+    An optional tuning knob must never kill the daemon at startup: empty or
+    non-numeric values (a launchd plist typo) fall back to the default, and
+    non-positive numbers clamp to 1.
+    """
+    raw = os.environ.get("MINNI_RPC_WORKERS", "").strip()
+    if not raw:
+        return default
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        logger.warning(
+            "MINNI_RPC_WORKERS=%r is not an integer; using default %d",
+            raw, default,
+        )
+        return default
+
+
+def _raise_fd_ceiling(target: int = 16384) -> int:
+    """Raise RLIMIT_NOFILE's soft limit toward ``target`` (capped at the hard
+    limit). Returns the resulting soft limit.
+
+    Each pooled worker thread holds SQLite handles (db + wal) per database
+    file, so the daemon's fd footprint scales with executor width × database
+    count. launchd's default soft limit is low enough that sustained
+    multi-agent load exhausts it — accept() then fails with EMFILE, every
+    client sees EPIPE, and the job still reports 'running'. Non-fatal on
+    failure: the executor bound in main() is the other half of the defense.
+    """
+    try:
+        import resource
+
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        ceiling = target if hard == resource.RLIM_INFINITY else min(target, hard)
+        if soft < ceiling:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (ceiling, hard))
+            logger.info("RLIMIT_NOFILE soft limit raised %d -> %d", soft, ceiling)
+            return ceiling
+        return soft
+    except Exception:
+        logger.exception("could not raise RLIMIT_NOFILE (non-fatal)")
+        return -1
+
+
 def _warn_if_sync_root(label: str, path: Path) -> None:
     """Emit a warning if ``path`` is under a known cloud-sync root inside $HOME.
 
@@ -1368,13 +1497,28 @@ def main():
     # Eagerly initialize/migrate database on startup (RCM-028 Phase 0 exit)
     try:
         from minni.db import SovereignDB
-        db = SovereignDB(DEFAULT_CONFIG)
+        db = SovereignDB.shared(DEFAULT_CONFIG)
         db._get_conn()
         logger.info("Database initialized/migrated on startup.")
     except Exception:
         logger.exception("Eager database initialization failed")
 
+    _raise_fd_ceiling()
+
     loop = asyncio.new_event_loop()
+    # Bound the pool that asyncio.to_thread dispatches sync RPC handlers onto.
+    # Every pooled thread accretes one SQLite connection (db + wal fds) per
+    # database file it touches and never releases it, so the executor width is
+    # the direct multiplier on the daemon's steady-state fd footprint. The
+    # stdlib default (min(32, cpus + 4)) is wide enough to breach the default
+    # soft fd limit under sustained multi-agent load; requests beyond the bound
+    # queue instead of stacking new fd-holding threads.
+    workers = _rpc_worker_count()
+    loop.set_default_executor(
+        concurrent.futures.ThreadPoolExecutor(
+            max_workers=workers, thread_name_prefix="minnid-rpc"
+        )
+    )
     main_task = loop.create_task(_serve_unix_socket(_unix_socket_path))
 
     http_task = None
@@ -1385,6 +1529,13 @@ def main():
     afm_task = None
     if _afm_loop_enabled(DEFAULT_CONFIG):
         afm_task = loop.create_task(_afm_loop_runner())
+
+    # Vault watch runner. On by default (MINNI_VAULT_WATCH=off to disable):
+    # unlike the AFM loop this is not an enhancement, it is what keeps recall
+    # able to see anything written since the last manual index.
+    vault_watch_task = None
+    if _vault_watch_enabled():
+        vault_watch_task = loop.create_task(_vault_watch_runner())
 
     def _shutdown(signum, frame):
         nonlocal _running
@@ -1398,6 +1549,8 @@ def main():
             http_task.cancel()
         if afm_task is not None:
             afm_task.cancel()
+        if vault_watch_task is not None:
+            vault_watch_task.cancel()
 
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGINT, _shutdown)

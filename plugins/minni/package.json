@@ -31,8 +31,8 @@
     "node": ">=20"
   },
   "scripts": {
-    "build": "tsc && vite build",
-    "build:server": "tsc",
+    "build": "tsc && vite build && node scripts/emit_build_manifest.mjs",
+    "build:server": "tsc && node scripts/emit_build_manifest.mjs",
     "build:server:bundle": "node scripts/bundle_server.mjs",
     "build:frontend": "vite build",
     "build:board-test": "node scripts/build_board_test.mjs",
@@ -52,22 +52,22 @@
     "typecheck:frontend": "tsc --project frontend-src/tsconfig.json --noEmit"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@modelcontextprotocol/sdk": "^1.30.0",
     "react": "^19.2.6",
     "react-dom": "^19.2.8",
     "zod": "^4.4.3"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
-    "@google/design.md": "^0.3.0",
+    "@google/design.md": "^0.4.0",
     "@types/node": "^26.1.1",
     "@types/react": "^19.2.15",
     "@types/react-dom": "^19.2.3",
     "@vitejs/plugin-react": "^6.0.3",
     "esbuild": "^0.28.1",
-    "eslint": "^10.7.0",
+    "eslint": "^10.8.0",
     "eslint-plugin-react-hooks": "^7.1.1",
-    "globals": "^17.7.0",
+    "globals": "^17.8.0",
     "typescript": "^6.0.3",
     "typescript-eslint": "^8.65.0",
     "vite": "^8.1.5"

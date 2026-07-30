@@ -6,10 +6,10 @@ on any machine were hand-written outside version control and would not survive a
 clean install; on Cursor `grep -ci cursor` over propagate.py returned two hits,
 both `conn.cursor()` from sqlite.
 
-The placeholder assertions are the load-bearing ones. Neither
-`${GROK_PLUGIN_ROOT}` nor `${CURSOR_PLUGIN_ROOT}` expands in the user-level
-config roots these functions write to -- an unstamped placeholder means the hook
-command resolves to a bare `node /dist/...` and silently never runs.
+Cursor User hooks are the sole Minni fire path: propagate deploys
+`~/.cursor/hooks/minni-cursor.sh` and stamps `./hooks/minni-cursor.sh <event>`
+into `~/.cursor/hooks.json`. Legacy absolute `node …/dist/cursor-hook.js`
+entries must be stripped so they cannot double-fire beside the wrapper.
 """
 
 from __future__ import annotations
@@ -93,23 +93,31 @@ def test_grok_rules_file_carries_boot_hydration(tmp_path, monkeypatch):
 # --- Cursor ----------------------------------------------------------------
 
 
-def test_cursor_hooks_installed_with_absolute_paths(tmp_path, monkeypatch):
+def test_cursor_hooks_install_wrapper_only(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
     root = _install_root(tmp_path)
 
     result = propagate.update_cursor_hooks(root)
 
     assert result["installed"] is True
+    wrapper = tmp_path / ".cursor/hooks/minni-cursor.sh"
+    assert wrapper.is_file()
+    assert wrapper.stat().st_mode & 0o111, "wrapper must be executable"
+    body = wrapper.read_text()
+    assert "workspace-hansaxelsson" in body
+    assert "plugins/local/minni/dist/cursor-hook.js" in body
+
     raw = (tmp_path / ".cursor/hooks.json").read_text()
-    assert "${CURSOR_PLUGIN_ROOT}" not in raw, (
-        "CURSOR_PLUGIN_ROOT expansion is undocumented AND plugin-scoped; it does "
-        "not apply to the user-level hooks.json"
-    )
-    assert str(root) in raw
+    assert "${CURSOR_PLUGIN_ROOT}" not in raw
+    assert "cursor-hook.js" not in raw
+    assert "./hooks/minni-cursor.sh" in raw
 
     data = json.loads(raw)
     assert data["version"] == 1
     assert "sessionStart" in data["hooks"]
+    assert data["hooks"]["sessionStart"] == [
+        {"command": "./hooks/minni-cursor.sh sessionStart", "timeout": 30}
+    ]
 
 
 def test_cursor_install_preserves_the_users_own_hooks(tmp_path, monkeypatch):
@@ -137,7 +145,10 @@ def test_cursor_install_preserves_the_users_own_hooks(tmp_path, monkeypatch):
     commands = json.dumps(data)
     assert "/usr/local/bin/my-own-hook" in commands, "user's own hook was clobbered"
     assert "afterFileEdit" in data["hooks"], "unrelated event was dropped"
-    assert any(str(root) in json.dumps(e) for e in data["hooks"]["sessionStart"])
+    assert any(
+        e.get("command") == "./hooks/minni-cursor.sh sessionStart"
+        for e in data["hooks"]["sessionStart"]
+    )
 
 
 def test_cursor_reinstall_is_idempotent(tmp_path, monkeypatch):
@@ -149,34 +160,45 @@ def test_cursor_reinstall_is_idempotent(tmp_path, monkeypatch):
     propagate.update_cursor_hooks(root)
 
     data = json.loads((tmp_path / ".cursor/hooks.json").read_text())
-    mine = [e for e in data["hooks"]["sessionStart"] if str(root) in json.dumps(e)]
+    mine = [
+        e
+        for e in data["hooks"]["sessionStart"]
+        if "minni-cursor.sh" in str(e.get("command", ""))
+    ]
     assert len(mine) == 1, f"expected one Minni sessionStart entry, got {len(mine)}"
 
 
-def test_cursor_reinstall_from_agents_root_replaces_stale(tmp_path, monkeypatch):
-    """Normal Cursor root is ~/.agents/plugins/minni@minni — no /plugins/minni/.
-
-    The old suffix matcher keyed on that marker, so a reinstall from a different
-    root left both entries and every session hydrated twice.
-    """
+def test_cursor_reinstall_strips_legacy_agents_and_local_node(tmp_path, monkeypatch):
+    """Legacy absolute node paths must not survive beside the wrapper."""
     monkeypatch.setenv("HOME", str(tmp_path))
-    # Use disjoint basenames so neither path is a string-prefix of the other.
-    old_root = tmp_path / "agents" / "plugins" / "minni@old"
-    new_root = tmp_path / "agents" / "plugins" / "minni@new"
-    for root in (old_root, new_root):
-        (root / "hooks").mkdir(parents=True)
-        for name in ("hooks-grok.json", "hooks-cursor.json"):
-            (root / "hooks" / name).write_text((REPO_HOOKS / name).read_text())
+    root = _install_root(tmp_path)
+    cursor = tmp_path / ".cursor"
+    cursor.mkdir()
+    (cursor / "hooks.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "hooks": {
+                    "sessionStart": [
+                        {
+                            "command": 'node "/Users/x/.agents/plugins/minni@minni/dist/cursor-hook.js" sessionStart'
+                        },
+                        {
+                            "command": 'node "/Users/x/.cursor/plugins/local/minni/dist/cursor-hook.js" sessionStart'
+                        },
+                        {"command": "./hooks/minni-cursor.sh sessionStart"},
+                    ]
+                },
+            }
+        )
+    )
 
-    propagate.update_cursor_hooks(old_root)
-    propagate.update_cursor_hooks(new_root)
+    propagate.update_cursor_hooks(root)
 
-    data = json.loads((tmp_path / ".cursor/hooks.json").read_text())
+    data = json.loads((cursor / "hooks.json").read_text())
     session = data["hooks"]["sessionStart"]
-    mine = [e for e in session if "cursor-hook.js" in str(e.get("command", ""))]
-    assert len(mine) == 1, f"expected one Minni sessionStart, got {len(mine)}: {mine}"
-    assert str(new_root) in mine[0]["command"]
-    assert str(old_root) not in mine[0]["command"]
+    assert len(session) == 1, f"expected one entry, got {session}"
+    assert session[0]["command"] == "./hooks/minni-cursor.sh sessionStart"
 
 
 def test_atomic_write_preserves_existing_mode(tmp_path):
@@ -274,7 +296,7 @@ def test_cursor_keeps_a_users_hook_in_a_SIBLING_path(tmp_path, monkeypatch):
 
     A user hook living at /x/minni-other contains the string /x/minni, so a
     naive `str(install_root) in json.dumps(e)` deleted it. Ours are now
-    identified by the exact command we are about to write.
+    identified by Minni markers (wrapper / cursor-hook.js / install path markers).
     """
     monkeypatch.setenv("HOME", str(tmp_path))
     root = _install_root(tmp_path)  # .../install
