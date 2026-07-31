@@ -1,6 +1,6 @@
 # Docker eval image: built and smoke-tested in CI on changes to its inputs,
 # published to GHCR on version tags. Never built on a maintainer machine
-# (PACKAGING_PLAN.md §6.5 — local storage constraint).
+# (docs/archive/PACKAGING_PLAN.md §6.5 — local storage constraint).
 #
 # Secrets: none beyond the built-in GITHUB_TOKEN (GHCR login on the publish job).
 # Finding 2: PR builds use contents:read only; packages:write is publish-job only;

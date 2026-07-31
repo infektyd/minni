@@ -1,4 +1,4 @@
-# Packaging metadata for Minni (PACKAGING_PLAN.md §3; v0.2 restructure §6.1).
+# Packaging metadata for Minni (docs/archive/PACKAGING_PLAN.md §3; v0.2 restructure §6.1).
 #
 # v0.2 scope: the engine is a real package now — src/minni/ (src layout), all
 # internal imports package-qualified via the codemod, tests at tests/. A wheel
@@ -54,7 +54,7 @@ minnid = "minni.minnid:main"
 Homepage = "https://github.com/infektyd/minni"
 Repository = "https://github.com/infektyd/minni"
 Issues = "https://github.com/infektyd/minni/issues"
-Security = "https://github.com/infektyd/minni/blob/main/SECURITY_PLAN.md"
+Security = "https://github.com/infektyd/minni/blob/main/docs/archive/SECURITY_PLAN.md"
 
 [tool.pytest.ini_options]
 # The installer's tests live next to the installer, not under tests/. They were

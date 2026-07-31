@@ -32,7 +32,7 @@ For an LLM, dreaming must NOT be free generation into memory (that's confabulati
 gate. Minni already enforces this (learn is proposal-first), so it's the right substrate.
 
 ## The `/dream` cycle (orchestrate EXISTING organs)
-Minni already has the passes in `engine/afm_passes/` — `/dream` chains them with frontier-agent reasoning:
+Minni already has the passes in `src/minni/afm_passes/` — `/dream` chains them with frontier-agent reasoning:
 1. **Consolidate** — dedup/merge (AFM already does this; agent verifies).
 2. **Reflect** (`synthesis`) — cluster recent learnings → meta-lessons (e.g. "verify on disk, never
    trust agent self-report" recurs across sessions → one durable synthesis doc, not 6 scattered notes).

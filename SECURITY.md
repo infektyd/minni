@@ -18,6 +18,7 @@ released versions to backport fixes to.
 
 This file is intentionally short. The actual threat model — assets, trust
 boundaries, adversaries in and out of scope, and the tracked findings
-(`SEC-001` through `SEC-022`) — lives in [`SECURITY_PLAN.md`](SECURITY_PLAN.md)
-at the repo root. Read that document for what "secure" means for this
+(`SEC-001` through `SEC-022`) — lives in
+[`SECURITY_PLAN.md`](docs/archive/SECURITY_PLAN.md), archived as a
+point-in-time record. Read that document for what "secure" means for this
 project and what's already known and tracked.

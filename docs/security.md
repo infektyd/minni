@@ -1,7 +1,8 @@
 # Security model
 
-The authoritative documents are [`SECURITY_PLAN.md`](../SECURITY_PLAN.md)
-(the tracked findings, SEC-001…SEC-022, with their fixes) and
+The authoritative documents are [`SECURITY_PLAN.md`](archive/SECURITY_PLAN.md)
+(the tracked findings, SEC-001…SEC-022, with their fixes, archived as a
+point-in-time record) and
 [`contracts/THREAT_MODEL.md`](contracts/THREAT_MODEL.md) (trust layers, assets,
 adversaries, residual stories, and criticality calibration) and
 [`contracts/THREAT_MODEL_SCANNER.md`](contracts/THREAT_MODEL_SCANNER.md)

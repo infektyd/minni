@@ -109,7 +109,7 @@ Our version: Minni has stronger raw material here than the PDF describes. The re
 
 Existing evidence in Minni:
 
-- `SECURITY_PLAN.md`
+- `docs/archive/SECURITY_PLAN.md`
 - `docs/contracts/AGENT.md`, `POLICY.md`, `WORKFLOWS.md`
 - eval seeds for policy/privacy expectations
 - plugin and engine tests

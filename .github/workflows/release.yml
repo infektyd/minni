@@ -8,7 +8,7 @@
 # existed briefly but was removed 2026-07-03: no test.pypi.org registration,
 # and the v0.2.0 tag publish is proven green end to end. Restore it from git
 # history if a rehearsal lane is ever wanted (environment `testpypi`). npm
-# publishing stays absent (name taken; PACKAGING_PLAN.md §6.6).
+# publishing stays absent (name taken; docs/archive/PACKAGING_PLAN.md §6.6).
 #
 # Finding 3: build/install runs under contents:read with persist-credentials
 # false; contents:write is isolated to the GitHub Release publish job.

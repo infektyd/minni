@@ -15,7 +15,7 @@ accepted pile), polluting recall.
 `test_pr12_afm_loop.py` correctly uses `tmp_path`; `test_candidate_lifecycle.py` (and possibly
 others) apparently do not.
 **Fix:**
-- Audit `engine/test_*.py` for any that open the real DB/vault path; force all onto a `tmp_path`
+- Audit `tests/test_*.py` for any that open the real DB/vault path; force all onto a `tmp_path`
   fixture (or a `MINNI_DB_PATH` override per-test).
 - Clean existing pollution: identify fixture-shaped rows in `learnings` + `candidate_packets`
   and prune them (verify against content before deleting — preserve any real learning).
@@ -40,13 +40,13 @@ proves a terminal capture is GC'd while a pending handoff is preserved.
 
 ## 3. Honor `durability: temporary` in the writer (wire up the done prompt change)
 **Context:** commit `f92288a` added a substance test + a `durability: durable|temporary` field to
-`engine/afm_prompts/session_distillation.md`, so the AFM now CLASSIFIES ephemeral state (live
+`src/minni/afm_prompts/session_distillation.md`, so the AFM now CLASSIFIES ephemeral state (live
 session IDs, PIDs, "currently running") as temporary. But the field is currently **inert** —
 the promote path doesn't act on it.
 **Evidence of the gap:** a live Grok session ID ("Current live Grok Build TUI session ID
 f6d63707…") was promoted as a **durable** learning — exactly what the new field is meant to catch.
-**Fix:** in the promote path (`engine/afm_writer.py::_write_one` / the durable-promote in
-`engine/minnid.py`), branch on `draft.durability` and give `temporary` drafts a real TTL/expiry
+**Fix:** in the promote path (`src/minni/afm_writer.py::_write_one` / the durable-promote in
+`src/minni/minnid.py`), branch on `draft.durability` and give `temporary` drafts a real TTL/expiry
 treatment instead of `INSERT learnings`. Note: the old `mark_temporary` resolve decision was an
 unenforced no-op (identical to accept) and has been removed from `resolve_candidate` — see
 issue #123; implementing genuine TTL semantics (schema + retrieval filter) is the prerequisite

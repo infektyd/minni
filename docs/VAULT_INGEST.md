@@ -73,27 +73,27 @@ documents/semantic leg.
 
 ## Manual Run
 
-From `engine/`:
+From the repo root:
 
 ```bash
-python index_all.py --vault-ingest-all
+.venv/bin/python -m minni.index_all --vault-ingest-all
 ```
 
 Useful variants:
 
 ```bash
-python index_all.py --vault-ingest-all --dry-run
-python index_all.py --vault-ingest-all --verbose
-python index_all.py --vault-ingest-all --minni-home /tmp/minni-home
+.venv/bin/python -m minni.index_all --vault-ingest-all --dry-run
+.venv/bin/python -m minni.index_all --vault-ingest-all --verbose
+.venv/bin/python -m minni.index_all --vault-ingest-all --minni-home /tmp/minni-home
 ```
 
 The command enumerates `~/.minni/*-vault` directories and runs `vault_ingest`
 once per vault. Existing legacy modes remain available:
 
 ```bash
-python index_all.py
-python index_all.py --vault-only
-python index_all.py --wiki-only
+.venv/bin/python -m minni.index_all
+.venv/bin/python -m minni.index_all --vault-only
+.venv/bin/python -m minni.index_all --wiki-only
 ```
 
 ## Shared DB Boundary

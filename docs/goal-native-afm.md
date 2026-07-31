@@ -41,7 +41,20 @@ call sites consume normalized data after the provider boundary.
 ## Safety Rules
 
 - AFM behavior remains opt-in or explicitly configured.
-- `bridge` is the default compatibility mode.
+- The code-level default (`resolve_afm_mode` / `resolveAfmMode` when no
+  provider-mode env var is set) is `bridge`. In practice the daemon's launchd
+  plist sets `MINNI_AFM_PROVIDER_MODE=native` in its `EnvironmentVariables`,
+  so a deployed daemon runs native mode; the OpenAI-compatible bridge at
+  `http://127.0.0.1:11437` is the fallback/compatibility path, exercised in
+  `auto` mode or when an operator pins `bridge` explicitly.
+- Hook, MCP, and shell processes do not inherit the daemon's launchd
+  environment, so they never see `MINNI_AFM_PROVIDER_MODE` themselves. Since
+  PR #200, when such a process has no explicitly configured mode, it defers
+  to the daemon's own AFM verdict (`daemonAfmToProviderHealth` in
+  `plugins/minni/src/sovereign.ts`) instead of defaulting to a cold `bridge`
+  probe that would falsely report `afm_ok:false` next to a daemon reporting
+  `native_available`. An explicitly pinned mode still requires an exact
+  match against the daemon's verdict.
 - `native` never silently falls back; it reports unavailable if the helper or
   Foundation Models backend is unavailable.
 - `auto` prefers native when available and falls back to the bridge.

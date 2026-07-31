@@ -111,3 +111,19 @@ The plugin test suite should include a Unix-socket JSON-RPC test that proves the
 client writes a newline-delimited JSON-RPC request and parses the daemon result.
 This prevents a future HTTP-over-socket fallback from becoming the primary path
 again.
+
+## Daemon hits the file-descriptor ceiling under sustained load
+
+Each pooled RPC worker thread holds SQLite handles (db + wal) per database
+file, so the daemon's fd footprint scales with executor width times database
+count. launchd's default soft `RLIMIT_NOFILE` (256) is low enough that
+sustained multi-agent load exhausts it: `accept()` starts failing with
+`EMFILE`, every client sees `EPIPE`, and `launchctl print` still reports the
+job as "running". The daemon raises its own soft limit at startup
+(`_raise_fd_ceiling` in `src/minni/minnid.py`, default ceiling 16384), and the
+launchd plist template sets `SoftResourceLimits`/`NumberOfFiles` as a floor
+for the window before that runs and for older daemon builds — see
+`src/minni/launchd/com.minni.minnid.plist.example`. If an existing live plist
+lacks that key, add it and reload with a full `launchctl bootout` +
+`bootstrap`; `launchctl kickstart -k` restarts the job but does not re-read
+plist changes.

@@ -1,4 +1,4 @@
-# Minni evaluation image (PACKAGING_PLAN.md §1, decision §6.5).
+# Minni evaluation image (docs/archive/PACKAGING_PLAN.md §1, decision §6.5).
 #
 # Purpose: let a stranger evaluate the daemon with one command and zero local
 # Python/Node setup:
