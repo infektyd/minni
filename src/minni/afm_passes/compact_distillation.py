@@ -4,11 +4,28 @@ The platform hooks harvest each compaction summary RAW into
 ``<vault>/inbox/*.json`` files with ``kind: 'compact_summary'`` (see
 plugins/minni/src/compact-harvest.ts). This pass is the daemon-side consumer:
 on the same consolidation tick that ingests stop-candidate learnings, it
-splits each summary into sections, asks AFM's guided ``session_distill`` op to
-distill each section into a durable learning statement (deterministic
-section-flatten fallback when AFM is off/unavailable), and proposes the
-results as governance-gated ``candidate_packets`` rows. Nothing here writes a
-learning — the operator resolves.
+splits each summary into sections, routes each section to an AUDIENCE, asks
+AFM's guided ``session_distill`` op to distill the shared-audience ones into a
+durable learning statement (deterministic section-flatten fallback when AFM is
+off/unavailable), and proposes those as governance-gated ``candidate_packets``
+rows. Nothing here writes a learning — the operator resolves.
+
+Audience routing
+----------------
+A compaction summary mixes two very different things: transferable technical
+knowledge ("launchctl error 5 right after bootout is a teardown race") and
+session-personal narration ("the codebase is in a clean state", "the user asked
+me to push"). Proposing ALL of it put session-personal content into the SHARED
+learnings pool, where the consolidation loop auto-accepted it.
+
+So each section is classified by title: ``_SHARED_SECTION_TITLES`` sections
+become candidates, everything else is personal and produces no candidate row at
+all. The one exception is the unsectioned whole-body fallback, which is
+personal unless AFM actually distilled it into a crisp assertion.
+
+Personal content is not discarded — every processed file is written as a
+session note into the SOURCE vault's ``wiki/sessions/``, where the vault-watch
+sweep indexes it for that agent alone.
 
 Contract (mirrors afm_passes.inbox_ingest):
 
@@ -20,6 +37,9 @@ Contract (mirrors afm_passes.inbox_ingest):
   new code. ``derived_from.channel`` distinguishes this pass's rows.
 * A file whose declared ``agent_id`` mismatches the vault-derived principal is
   skipped (counted) — same provenance rule as ingest.
+* A file that yields NO shared candidate has no candidate rows to key
+  idempotency on, so it is archived immediately (never deleted) once its
+  session note is written; otherwise it would be rescanned every tick forever.
 * Candidate content passes a local path/secret scrub BEFORE insert: summaries
   quote session content verbatim, and the deterministic fallback would
   otherwise carry raw machine-local paths into the proposal queue.
@@ -34,9 +54,12 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import yaml
+
 from minni.afm_provider import resolve_afm_mode
 from minni.model_provider import default_provider_chain
 from minni.safety import is_instruction_like
+from minni.afm_passes.inbox_archive import archive_inbox_file
 from minni.afm_passes.inbox_ingest import (
     CONTENT_CAP,
     _content_sha1,
@@ -65,7 +88,20 @@ _SKIP_SECTION_TITLES = re.compile(
     re.IGNORECASE,
 )
 
+#: Sections whose content is transferable knowledge, not session narration.
+#: ONLY these reach the shared candidate queue (see module docstring).
+_SHARED_SECTION_TITLES = re.compile(
+    r"^(key technical concepts|errors and fixes|problem solving|key learnings|learnings|decisions)$",
+    re.IGNORECASE,
+)
+
 _SECTION_HEADING = re.compile(r"^\s*\d+\.\s+([^\n:]{3,80}):?\s*$", re.MULTILINE)
+
+#: Synthetic title of the whole-body fallback for unsectioned summaries.
+UNSECTIONED_TITLE = "Session summary"
+
+#: Vault-relative directory the personal session notes are written to.
+SESSION_NOTE_DIR = ("wiki", "sessions")
 
 
 def _redact(text: str) -> str:
@@ -89,7 +125,7 @@ def _split_sections(body: str) -> List[Tuple[str, str]]:
     matches = list(_SECTION_HEADING.finditer(body))
     if len(matches) < 2:
         body = body.strip()
-        return [("Session summary", body)] if body else []
+        return [(UNSECTIONED_TITLE, body)] if body else []
     sections: List[Tuple[str, str]] = []
     for i, match in enumerate(matches):
         start = match.end()
@@ -127,14 +163,34 @@ def _fallback_candidate(title: str, content: str) -> str:
     return flattened[:FALLBACK_CANDIDATE_MAX_CHARS]
 
 
-def _distill_file(doc: Dict[str, Any], afm_chain) -> List[Tuple[str, bool]]:
-    """[(candidate_text, afm_distilled)] for one compact_summary document."""
+def _distill_file(doc: Dict[str, Any], afm_chain) -> Tuple[List[Tuple[str, bool]], int]:
+    """``([(candidate_text, afm_distilled)], personal_section_count)`` for one
+    compact_summary document. Only shared-audience sections yield candidates;
+    personal ones are merely counted (their content reaches the agent's own
+    vault via the session note, never the shared proposal queue)."""
     body = str(doc.get("summary_text") or "")
+    sections = _split_sections(body)
+    unsectioned = len(sections) == 1 and sections[0][0] == UNSECTIONED_TITLE
     candidates: List[Tuple[str, bool]] = []
-    for title, content in _split_sections(body):
+    personal = 0
+    for title, content in sections:
         if _SKIP_SECTION_TITLES.match(title):
             continue
-        distilled = _afm_distill_section(afm_chain, title, content) if afm_chain else None
+        shared = bool(_SHARED_SECTION_TITLES.match(title))
+        # AFM is spent only where it can change the outcome: on shared sections,
+        # and on the unsectioned body whose upgrade to shared depends on it.
+        distilled = (
+            _afm_distill_section(afm_chain, title, content)
+            if afm_chain and (shared or unsectioned)
+            else None
+        )
+        if not shared:
+            # The whole-body fallback earns the shared pool only when AFM turned
+            # it into a crisp assertion; with AFM off or missing, and for every
+            # named narration section, the content stays personal.
+            if not (unsectioned and distilled is not None):
+                personal += 1
+                continue
         afm_used = distilled is not None
         candidate = distilled if afm_used else _fallback_candidate(title, content)
         candidate = _redact(candidate).strip()
@@ -145,7 +201,86 @@ def _distill_file(doc: Dict[str, Any], afm_chain) -> List[Tuple[str, bool]]:
         candidates.append((candidate[:CONTENT_CAP], afm_used))
         if len(candidates) >= MAX_CANDIDATES_PER_FILE:
             break
-    return candidates
+    return candidates, personal
+
+
+_ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}")
+
+
+def _doc_timestamp(doc: Dict[str, Any]) -> Tuple[str, str]:
+    """``(YYYYMMDD, ISO8601)`` taken from the document's OWN timestamp. Wall
+    clock is used only when the document carries none — the note filename must
+    stay stable across re-runs, and ``now()`` would remint it every tick."""
+    for key in ("createdAt", "summary_timestamp"):
+        raw = doc.get(key)
+        if isinstance(raw, str) and _ISO_DATE.match(raw.strip()):
+            iso = raw.strip()
+            return iso[:10].replace("-", ""), iso
+        if isinstance(raw, (int, float)) and not isinstance(raw, bool) and raw > 0:
+            epoch = float(raw) / 1000.0 if float(raw) > 1e11 else float(raw)
+            stamp = time.gmtime(epoch)
+            return time.strftime("%Y%m%d", stamp), time.strftime("%Y-%m-%dT%H:%M:%SZ", stamp)
+    now = time.gmtime()
+    return time.strftime("%Y%m%d", now), time.strftime("%Y-%m-%dT%H:%M:%SZ", now)
+
+
+def _slug_fragment(value: Any, fallback: str) -> str:
+    """First 8 filename-safe chars of ``value`` (session ids and hashes are
+    document-controlled, so nothing but ``[a-z0-9-]`` survives)."""
+    slug = re.sub(r"[^a-z0-9]+", "-", str(value or "").strip().lower()).strip("-")
+    return slug[:8].strip("-") or fallback
+
+
+def _session_note_text(doc: Dict[str, Any], principal: str, inbox_file: str, iso: str) -> str:
+    """Frontmatter + full redacted summary body, in the wiki/sessions format."""
+    platform = str(doc.get("platform") or "").strip()
+    title = f"Compact session summary — {platform or principal} {iso[:10]}"
+    fm = {
+        "title": title,
+        "type": "session",
+        "status": "candidate",
+        "privacy": str(doc.get("privacy_level") or "safe").strip() or "safe",
+        "source": f"compact_distillation:{inbox_file}",
+        "created": iso,
+        "section": "sessions",
+        "agent": principal,
+        "category": "session-context",
+        "audience": "personal",
+        "minni_learning": False,
+        "platform": platform,
+        "session_id": str(doc.get("session_id") or ""),
+        "summary_sha1": str(doc.get("summary_sha1") or ""),
+        "harvested": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    body = _redact(str(doc.get("summary_text") or "")).strip()
+    # A bare '---' line in the summary would re-forge this note's frontmatter
+    # (same hazard afm_writer._contains_forged_frontmatter guards against).
+    body = re.sub(r"(?m)^\s*---\s*$", "***", body)
+    header = yaml.safe_dump(fm, sort_keys=False, default_flow_style=False, allow_unicode=True)
+    return f"---\n{header}---\n\n# {title}\n\n{body}\n"
+
+
+def _write_session_note(vault: Path, doc: Dict[str, Any], inbox_file: str,
+                        principal: str) -> Optional[Path]:
+    """Personal leg: the full summary as a ``wiki/sessions`` note in the SOURCE
+    vault, where the vault-watch sweep indexes it for this agent alone.
+
+    Returns the path when a NEW note was written; ``None`` when one already
+    existed (idempotent) or the write failed."""
+    date, iso = _doc_timestamp(doc)
+    sid = _slug_fragment(doc.get("session_id"), "session")
+    sha = _slug_fragment(doc.get("summary_sha1"), "") or _content_sha1(
+        str(doc.get("summary_text") or ""))[:8]
+    path = vault.joinpath(*SESSION_NOTE_DIR) / f"{date}-compact-{sid}-{sha}.md"
+    if path.exists():
+        return None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(_session_note_text(doc, principal, inbox_file, iso), encoding="utf-8")
+    except OSError:
+        logger.exception("compact distill: session note write failed for %s", path)
+        return None
+    return path
 
 
 def distill(db, config, inboxes: Optional[List[Path]] = None,
@@ -166,6 +301,9 @@ def distill(db, config, inboxes: Optional[List[Path]] = None,
     to_insert: List[Dict[str, Any]] = []
     already = 0
     afm_sections = 0
+    personal_sections = 0
+    notes_written = 0
+    archived_zero_shared = 0
 
     for inbox in inboxes:
         principal = _principal_for_inbox(inbox, fallback_principal)
@@ -192,10 +330,23 @@ def distill(db, config, inboxes: Optional[List[Path]] = None,
             if (path.name, 0) in existing:
                 already += 1
                 continue
-            candidates = _distill_file(doc, afm_chain)
+            candidates, personal = _distill_file(doc, afm_chain)
             afm_sections += sum(1 for _, used in candidates if used)
+            personal_sections += personal
+            if not dry_run:
+                # Personal leg runs for EVERY processed file, whatever the
+                # audience mix — the vault note is the only place the full
+                # session context is kept.
+                if _write_session_note(inbox.parent, doc, path.name, principal):
+                    notes_written += 1
             if not candidates:
                 skipped["_no_candidates"] = skipped.get("_no_candidates", 0) + 1
+                # No candidate rows means no idempotency key, so this file would
+                # be rescanned on every tick forever. Its content is now in the
+                # vault note, so retire it through the archive lifecycle (moved,
+                # never deleted).
+                if not dry_run and archive_inbox_file(path):
+                    archived_zero_shared += 1
                 continue
             raw_privacy = doc.get("privacy_level", "safe")
             privacy = str(raw_privacy).strip() if raw_privacy and str(raw_privacy).strip() else "safe"
@@ -227,6 +378,7 @@ def distill(db, config, inboxes: Optional[List[Path]] = None,
                     "inbox_file": r["inbox_file"],
                     "candidate_index": r["candidate_index"],
                     "kind": COMPACT_SUMMARY_KIND,
+                    "audience": "shared",
                     "summary_id": r["summary_id"],
                     "platform": r["platform"],
                     "afm_distilled": r["afm_distilled"],
@@ -261,6 +413,10 @@ def distill(db, config, inboxes: Optional[List[Path]] = None,
         "inserted": inserted,
         "afm_mode": mode,
         "afm_sections": afm_sections,
+        "shared_candidates": len(to_insert),
+        "personal_sections": personal_sections,
+        "vault_notes_written": notes_written,
+        "archived_zero_shared": archived_zero_shared,
         "skipped": skipped,
         "dry_run": dry_run,
     }
