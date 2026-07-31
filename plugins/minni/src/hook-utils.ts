@@ -24,6 +24,12 @@ export const VALID_EVENTS: ReadonlyArray<EnvelopeEvent> = [
   "SessionStart",
   "UserPromptSubmit",
   "PreCompact",
+  // Claude Code's native post-compaction event — delivers the finished
+  // summary as `compact_summary` (primary harvest path).
+  "PostCompact",
+  // Post-compaction summary delivery from platforms whose bridge reads the
+  // summary back itself (Kilo SDK read-back through the native plugin).
+  "CompactSummary",
   "Stop",
 ];
 

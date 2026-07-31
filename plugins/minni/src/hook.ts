@@ -22,7 +22,9 @@ import {
   emit,
   readStdin,
   VALID_EVENTS,
+  workspaceFromPayload,
 } from "./hook-utils.js";
+import { harvestCompactSummary, harvestSummaryText } from "./compact-harvest.js";
 import { claudeCodeWire } from "./hook-platform.js";
 import type { HookOutput } from "./hook-utils.js";
 import { handleStopCore } from "./hook-handlers.js";
@@ -84,6 +86,31 @@ async function handleSessionStart(payload: Record<string, unknown>): Promise<Hoo
   const rawSessionId = asString(payload.session_id) || asString(payload.sessionId);
   const sessionId = rawSessionId || "session";
   await ensureVault(CLAUDECODE_VAULT_PATH);
+  // Compaction-summary harvest BACKSTOP (plan-3e5a410b9ab6f715). The primary
+  // delivery is the PostCompact hook below, which receives the summary
+  // directly (`compact_summary`). This transcript tail-read exists for what
+  // PostCompact can miss — hook not yet registered when the compaction ran,
+  // older CLI, crash between compaction and hook — and is safe to run on
+  // every compact/resume boot because dedup is keyed on the summary CONTENT
+  // hash shared with the PostCompact path. transcript_path is documented to
+  // lag the in-memory conversation, so a summary missing here is expected
+  // sometimes; it self-heals on the next boot. Fail-open, raw-only, no AFM —
+  // the AFM-loop timer's compact_distillation pass organizes it daemon-side.
+  const bootSource = asString(payload.source);
+  if (bootSource === "compact" || bootSource === "resume") {
+    await harvestCompactSummary(
+      {
+        vaultPath: CLAUDECODE_VAULT_PATH,
+        workspaceId: workspaceFromPayload(payload, CLAUDECODE_WORKSPACE_ID),
+        auditPrefix: "hook",
+        platform: "claude-code",
+      },
+      {
+        transcriptPath: asString(payload.transcript_path) || asString(payload.transcriptPath),
+        sessionId,
+      },
+    );
+  }
   // c4: reset the once-per-session lifecycle emphasis on a fresh session, so the
   // situational focus can fire again this session.
   await writeLifecycleState(CLAUDECODE_VAULT_PATH, {
@@ -539,6 +566,30 @@ async function handlePreCompact(payload: Record<string, unknown>): Promise<HookO
   return { continue: true };
 }
 
+// PRIMARY compaction-summary delivery (plan-3e5a410b9ab6f715). PostCompact
+// hands the finished summary to the hook directly as `compact_summary`
+// (documented 2026-07-29) — no transcript read, no flush race. The
+// SessionStart tail-read above stays as the backstop; the shared content-hash
+// dedup keeps the two paths from double-harvesting. Raw storage only; the
+// daemon's compact_distillation pass does the AFM review on its own timer.
+async function handlePostCompact(payload: Record<string, unknown>): Promise<HookOutput> {
+  await ensureVault(CLAUDECODE_VAULT_PATH);
+  const sessionId = asString(payload.session_id) || asString(payload.sessionId) || "session";
+  await harvestSummaryText(
+    {
+      vaultPath: CLAUDECODE_VAULT_PATH,
+      workspaceId: workspaceFromPayload(payload, CLAUDECODE_WORKSPACE_ID),
+      auditPrefix: "hook",
+      platform: "claude-code",
+    },
+    {
+      summaryText: asString(payload.compact_summary),
+      sessionId,
+    },
+  );
+  return { continue: true };
+}
+
 // Stop is NOT a claude-code-specific handler. It routes to the shared
 // handleStopCore so the governance posture, the zero-candidate write guard and
 // the inbox ingest stamps (kind/agent_id/workspace_id) exist exactly once —
@@ -617,6 +668,8 @@ async function dispatch(
       return handleUserPromptSubmit(payload);
     case "PreCompact":
       return handlePreCompact(payload);
+    case "PostCompact":
+      return handlePostCompact(payload);
     case "Stop":
       return handleStop(payload);
     case PRE_TOOL_USE_EVENT:

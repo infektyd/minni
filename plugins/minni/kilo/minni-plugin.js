@@ -99,7 +99,44 @@ function queueContext(sessionID, result) {
   pending.set(sessionID, contexts);
 }
 
-const MinniPlugin = async ({ directory }) => ({
+// Post-compaction summary read-back (plan-3e5a410b9ab6f715). Kilo's
+// experimental.session.compacting hook fires BEFORE the summary exists and its
+// input is {sessionID} only (verified against the installed 7.1.0 bundle — the
+// docs describe a richer shape that is not present locally). The summary is
+// instead fetched AFTER the session.compacted bus event via the SDK client the
+// plugin factory receives: the summary message is the newest one flagged
+// info.summary === true with info.mode === "compaction"; an aborted compaction
+// carries the same flags plus an error and zero text parts, and is skipped.
+// Fail-open throughout — a failed read-back must never break the session.
+async function harvestCompactedSummary(client, sessionID, directory) {
+  try {
+    const res = await client.session.messages({ path: { id: sessionID } });
+    const messages = Array.isArray(res) ? res : Array.isArray(res?.data) ? res.data : [];
+    for (let i = messages.length - 1; i >= 0; i -= 1) {
+      const info = messages[i]?.info;
+      if (!info || info.summary !== true || info.mode !== "compaction" || info.error) continue;
+      const text = (messages[i].parts || [])
+        .filter((part) => part?.type === "text" && typeof part.text === "string")
+        .map((part) => part.text)
+        .join("\n");
+      if (!text) continue;
+      await runHookFailOpen("CompactSummary", {
+        session_id: sessionID,
+        workspace_id: directory,
+        summary_text: text,
+        summary_id: info.id,
+        ...(info.time?.created
+          ? { summary_timestamp: new Date(info.time.created).toISOString() }
+          : {}),
+      });
+      return;
+    }
+  } catch {
+    // runHookFailOpen already swallows hook errors; this guards the SDK call.
+  }
+}
+
+const MinniPlugin = async ({ directory, client }) => ({
   "chat.message": async (input, output) => {
     if (!booted.has(input.sessionID)) {
       const boot = await runHookFailOpen("SessionStart", {
@@ -162,6 +199,8 @@ const MinniPlugin = async ({ directory }) => ({
         // Synthesized by this bridge, not by Kilo -- see kilocodeWire.lastTaskText.
         last_user_message: lastPrompt.get(sessionID) ?? "",
       });
+    } else if (event?.type === "session.compacted") {
+      await harvestCompactedSummary(client, sessionID, directory);
     } else if (event?.type === "session.deleted") {
       booted.delete(sessionID);
       pending.delete(sessionID);
