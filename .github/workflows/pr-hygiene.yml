@@ -122,12 +122,12 @@ jobs:
           # this public workflow source. Unset on forks/CI without the var —
           # the step must skip, not hard-fail, so external contributors are
           # unaffected.
-          FORBIDDEN_CONTENT_PATTERN: ${{ vars.FORBIDDEN_CONTENT_PATTERN }}
+          FORBIDDEN_CONTENT_PATTERN: ${{ secrets.FORBIDDEN_CONTENT_PATTERN }}
         run: |
           set -euo pipefail
 
           if [ -z "${FORBIDDEN_CONTENT_PATTERN:-}" ]; then
-            echo "::notice::FORBIDDEN_CONTENT_PATTERN repo variable is not set — skipping content gate."
+            echo "::notice::FORBIDDEN_CONTENT_PATTERN repo secret is not set — skipping content gate."
             exit 0
           fi
 
