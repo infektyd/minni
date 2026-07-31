@@ -257,6 +257,24 @@ The script may create/update local identity source files and DB identity rows.
 It should not write public git files unless explicitly pointed at a tracked
 workspace artifact.
 
+### Distill ritual seeding
+
+`bootstrap-vault` (also run implicitly by `update-plugin`) seeds
+`<vault>/distill/` with `mode`, `gauges.md`, and `ritual.md` from
+`templates/distill/`, parameterized by agent id. Without them the Minni Distill
+Ritual V1 runs blind: the agent is told to read `distill/gauges.md` first at any
+wind-down signal and to take its toggle from `distill/mode`.
+
+Seeding is idempotent — `mode` and `gauges.md` are operator/agent-owned living
+state and `ritual.md` accumulates traces, so an existing file is never
+overwritten. To backfill a vault installed before this existed, just re-run:
+
+```bash
+python3 plugins/minni/skills/minni-install/scripts/propagate.py bootstrap-vault --agent claude-code
+```
+
+The JSON output reports `distill.created` / `distill.kept`.
+
 ## Common Mistakes
 
 - Confusing `wiki/*` recall pages with Layer 1 whole-document delivery.
