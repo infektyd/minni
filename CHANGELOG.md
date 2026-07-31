@@ -8,8 +8,43 @@ pre-1.0: minor versions may contain breaking changes until v1.0.0.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-07-30
+
 ### Added
 
+- **Compaction-summary harvest**
+  ([#194](https://github.com/infektyd/minni/pull/194),
+  [#196](https://github.com/infektyd/minni/pull/196)): platform compaction
+  summaries are harvested raw at the hook (Claude Code: PostCompact primary
+  delivery with a transcript-tail backstop on SessionStart resume/compact;
+  KiloCode: `session.compacted` SDK read-back), stored to the agent's vault
+  inbox as `kind: compact_summary` with content-sha1 dedup, and distilled on
+  the daemon's AFM consolidation timer (`compact_distillation` pass, flag
+  `distill_compact_summaries`). Audience routing keeps session-specific
+  context out of the shared pool: shared-knowledge sections (Key Technical
+  Concepts, Errors and fixes, Problem Solving, Learnings, Decisions) become
+  governance candidates stamped `audience: shared`; everything else is
+  written only to a personal vault session note (`audience: personal`,
+  never a shared learning). AFM distillation is spent on shared sections
+  only.
+- **Memory Board console**: the frontend is now an infinite-canvas Memory
+  Board with live daemon data, auto/custom free-layout zones, a live Staged
+  learnings zone, real traffic pulses, console auth flow, and candidate
+  status expansion (`log_only`, `do_not_store`)
+  ([#150](https://github.com/infektyd/minni/pull/150),
+  [#151](https://github.com/infektyd/minni/pull/151),
+  [#152](https://github.com/infektyd/minni/pull/152)).
+- **Console observability**: `/api/events` with fleet audit-tail plus
+  Sessions and live Audit screens
+  ([#181](https://github.com/infektyd/minni/pull/181)); session receipts
+  and `/api/sessions` ([#179](https://github.com/infektyd/minni/pull/179));
+  engine watch/list_events/recall_trace slice
+  ([#177](https://github.com/infektyd/minni/pull/177)).
+- **PreToolUse on all platforms**: Codex, Grok, and KiloCode hook manifests
+  now wire PreToolUse ([#178](https://github.com/infektyd/minni/pull/178)).
+- **Deployment vintage**: deployed plugin builds declare their source
+  commit, and `scripts/check_deployments.py` reports drift loudly instead
+  of silently serving stale code.
 - **Learn gate AFM enhancement for unquoted multi-word passphrases**
   ([#147](https://github.com/infektyd/minni/issues/147)): when the regex
   material detector is inconclusive on a high-risk keyword assigned an
@@ -19,6 +54,45 @@ pre-1.0: minor versions may contain breaking changes until v1.0.0.
   verdict hard-blocks; `prose` and AFM-unavailable/off fail open (regex
   remains the fast path — the gap remains when AFM cannot classify).
   Passphrase text is never echoed into quality warnings.
+  ([#147](https://github.com/infektyd/minni/issues/147),
+  [#182](https://github.com/infektyd/minni/pull/182))
+
+### Fixed
+
+- **P0 recall blackout** ([#168](https://github.com/infektyd/minni/pull/168)):
+  recall could return nothing on a populated DB — fixed scope-out, dead
+  encoder detection, strict-AND FTS fallback, and vault_write identity.
+  Follow-on hardening series: process-wide `vault_fts` schema gate ending
+  the vtable DDL race, honest daemon health (`status` pid/started_at,
+  dynamic VERSION, counter deltas + health_flags), quarantine drain with a
+  one-time migration for unresolvable inbox residue, plugin AFM probe
+  matching the daemon's budget (ending the false-negative `afm.ok`
+  contradiction), and temp-agent daemon recall delegated to the
+  coordinator's principal.
+- **minnid fd exhaustion under multi-agent load**
+  ([#190](https://github.com/infektyd/minni/pull/190)): shared database
+  connections and RPC thread hygiene stop the daemon exhausting file
+  descriptors; the launchd template raises the fd floor to 8192.
+- **Workspace identity**: workspace id derives from the git repo root
+  instead of a static default
+  ([#184](https://github.com/infektyd/minni/pull/184)); stop-time telemetry
+  self-feeding severed and workspace identity hardened
+  ([#174](https://github.com/infektyd/minni/pull/174)); hooks apply per
+  PLATFORM contract, not per agent
+  ([#175](https://github.com/infektyd/minni/pull/175)); Cursor hooks
+  sole-fire via a User wrapper
+  ([#183](https://github.com/infektyd/minni/pull/183)).
+- **Security slice**: session pages are agent-scoped with fail-closed
+  platform vault roots, AFM passes bind to the caller principal and fail
+  closed for non-owners, writers stamp explicit privacy (with NULL-backlog
+  unparking), the Codex hook gets its own native identity (`CODEX_*`
+  env), and workflow tokens run least-privilege
+  ([#167](https://github.com/infektyd/minni/pull/167) follow-ups).
+- **Daemon robustness**: concurrent daemon initialization race fixed;
+  schema race on first boot fixed
+  ([#158](https://github.com/infektyd/minni/pull/158)); vault indexes stay
+  current from inside minnid; the cursor vault slug maps correctly with the
+  two slug maps locked together.
 
 ## [0.3.0] - 2026-07-04
 
