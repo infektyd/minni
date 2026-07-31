@@ -224,6 +224,54 @@ test("regex tier still misses unquoted multi-word passphrases (AFM owns this cas
   assert.equal(sync.ok, true, "sync regex path must stay inconclusive");
 });
 
+test("word-boundary: keyword must not match as a substring of a longer word (#191)", () => {
+  // `apassword:` / `notasecret:` embed the keyword but are not the keyword —
+  // the discovery regex must require a boundary, same as its nextAssignRe
+  // sibling.
+  assert.deepEqual(
+    findInconclusiveHighRiskAssignments("apassword: correct horse battery staple"),
+    [],
+  );
+  assert.deepEqual(
+    findInconclusiveHighRiskAssignments("notasecret: correct horse battery staple"),
+    [],
+  );
+  // A real, boundary-delimited keyword still surfaces as inconclusive.
+  assertHasTail(
+    findInconclusiveHighRiskAssignments("password: correct horse battery staple"),
+    "correct horse battery staple",
+  );
+  assertHasTail(
+    findInconclusiveHighRiskAssignments("my secret: correct horse battery staple"),
+    "correct horse battery staple",
+  );
+});
+
+test("smart/curly-quoted decoys split like ASCII decoys, not one glued blob (#191)", () => {
+  const asciiSpans = findInconclusiveHighRiskAssignments(
+    'password: "my dog" correct horse battery staple',
+  );
+  const doubleCurlySpans = findInconclusiveHighRiskAssignments(
+    "password: “my dog” correct horse battery staple",
+  );
+  const singleCurlySpans = findInconclusiveHighRiskAssignments(
+    "password: ‘my dog’ correct horse battery staple",
+  );
+  for (const spans of [asciiSpans, doubleCurlySpans, singleCurlySpans]) {
+    // Real passphrase must be its own candidate, not only reachable inside a
+    // glued "decoy + passphrase" blob.
+    assert.ok(
+      spans.some((s) => s.tail === "correct horse battery staple"),
+      JSON.stringify(spans),
+    );
+    // Decoy quote content must also surface as its own candidate.
+    assert.ok(
+      spans.some((s) => s.tail === "my dog"),
+      JSON.stringify(spans),
+    );
+  }
+});
+
 test("#138 vocabulary notes are not inconclusive spans", () => {
   const notes = [
     "PyPI trusted publishing requires the GitHub Actions permission id-token: write, and the publisher registration must match the lowercase OIDC repository claim.",

@@ -202,6 +202,19 @@ export interface InconclusiveHighRiskAssignment {
   tail: string;
 }
 
+// Straight ASCII quotes plus their smart/curly counterparts (“ ” ‘ ’) — a
+// short curly-quoted decoy preceding a real passphrase
+// (`password: "my dog" correct horse battery staple`) must split into
+// candidates the same way the ASCII form does, not reach AFM as one glued
+// blob.
+const QUOTE_CHARS = "\"'“”‘’";
+const QUOTE_CLASS = `[${QUOTE_CHARS}]`;
+const LEADING_QUOTE_RE = new RegExp(`^${QUOTE_CLASS}`);
+const TRIM_QUOTES_RE = new RegExp(`^${QUOTE_CLASS}+|${QUOTE_CLASS}+$`, "g");
+const LEADING_QUOTES_RE = new RegExp(`^${QUOTE_CLASS}+`);
+const TRAILING_QUOTES_RE = new RegExp(`${QUOTE_CLASS}+$`);
+const QUOTE_SEGMENT_RE = new RegExp(`${QUOTE_CLASS}([^"'“”‘’\n]*)${QUOTE_CLASS}`, "g");
+
 /**
  * Collect credential-shaped value candidates from a high-risk assignment
  * region. Multiple candidates are intentional: decoy quotes + real tails
@@ -214,7 +227,7 @@ function candidateAssignmentTails(clipped: string): string[] {
   const add = (raw: string) => {
     let region = raw.trim();
     while (region.startsWith("\\")) region = region.slice(1).trim();
-    region = region.replace(/^["']+|["']+$/g, "").trim();
+    region = region.replace(TRIM_QUOTES_RE, "").trim();
     if (!region) return;
     // Em/en dash separates clauses — emit BOTH sides so
     // `use a manager — correct horse…` still surfaces the passphrase, while
@@ -230,7 +243,7 @@ function candidateAssignmentTails(clipped: string): string[] {
   add(clipped);
 
   // Closed quote segments + everything after each closed quote.
-  const quoteRe = /["']([^"'\n]*)["']/g;
+  const quoteRe = new RegExp(QUOTE_SEGMENT_RE);
   let match: RegExpExecArray | null;
   while ((match = quoteRe.exec(clipped)) !== null) {
     add(match[1] ?? "");
@@ -239,11 +252,11 @@ function candidateAssignmentTails(clipped: string): string[] {
 
   // Unclosed leading quote / triple-quote leftovers.
   const leading = clipped.trim();
-  if (leading.startsWith('"') || leading.startsWith("'")) {
+  if (LEADING_QUOTE_RE.test(leading)) {
     add(leading.slice(1));
   }
   // Strip leading quote runs then add ("""foo""" → foo).
-  add(leading.replace(/^["']+/, "").replace(/["']+$/, ""));
+  add(leading.replace(LEADING_QUOTES_RE, "").replace(TRAILING_QUOTES_RE, ""));
 
   return [...new Set(out)];
 }
@@ -262,7 +275,7 @@ export function findInconclusiveHighRiskAssignments(
 ): InconclusiveHighRiskAssignment[] {
   const found: InconclusiveHighRiskAssignment[] = [];
   const re =
-    /(secret|passwd|password|private[_ -]?key)s?["']?\s*[:=]\s*/gi;
+    /\b(secret|passwd|password|private[_ -]?key)s?["']?\s*[:=]\s*/gi;
   const nextAssignRe =
     /\b(?:secret|passwd|password|private[_ -]?key)s?["']?\s*[:=]/i;
   let match: RegExpExecArray | null;
