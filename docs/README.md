@@ -9,7 +9,7 @@ the reference.
 |---|---|
 | [Concepts](concepts.md) | The four verbs (recall → learn → approve → handoff), two-tier storage, the governance gate, evidence enveloping, the AFM pass pipeline |
 | [Install & troubleshooting](install.md) | Supported install paths, `minni doctor`, the Docker eval image, daemon lifecycle, common failures |
-| [Runtimes](runtimes/) | Per-runtime wiring: [Claude Code](runtimes/claude-code.md), [Codex](runtimes/codex.md), [Gemini / Antigravity](runtimes/gemini.md), [Grok](runtimes/grok.md) |
+| [Runtimes](runtimes/) | Per-runtime wiring: [Claude Code](runtimes/claude-code.md), [Codex](runtimes/codex.md), [Gemini / Antigravity](runtimes/gemini.md), [Grok](runtimes/grok.md), [Kilo Code](runtimes/kilocode.md), [Cursor](runtimes/cursor.md) |
 | [Architecture](architecture.md) | Request flow, components, data model, core invariants, the literal MCP tool list |
 | [Security model](security.md) | Local-first boundaries and how the threat model is enforced |
 | [Contracts](contracts/) | The agent, capability, vault, workflow, and threat-model contracts |
