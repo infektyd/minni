@@ -708,6 +708,26 @@ function toProviderHealth(entry: GenerationProbeEntry, now: () => number): Provi
 }
 
 /**
+ * The provider a daemon-sourced `data.afm` block is EFFECTIVELY running.
+ *
+ * Review r1 (P2): afm_runtime_status() reports the RESOLVED MODE, which in auto
+ * installs is the literal string "auto" — never "native"/"bridge". Explicit
+ * native/bridge/off modes map to themselves; auto maps via `status`
+ * ("native_available" → native, "bridge"/"fallback_used" → bridge). Anything
+ * else is undefined (untrusted-input posture: unmatched → no reuse).
+ */
+export function daemonEffectiveAfmProvider(data: unknown): AfmProvider | undefined {
+  if (!data || typeof data !== "object") return undefined;
+  const record = data as Record<string, unknown>;
+  if (record.mode === "native" || record.mode === "bridge" || record.mode === "off") return record.mode;
+  if (record.mode === "auto") {
+    if (record.status === "native_available") return "native";
+    if (record.status === "bridge" || record.status === "fallback_used") return "bridge";
+  }
+  return undefined;
+}
+
+/**
  * Convert a daemon-sourced `data.afm` block (the "status" RPC's embedded
  * afm_runtime_status() result — src/minni/afm_provider.py:376-421, wired in
  * via minnid_runtime/health.py:156-189) into a ProviderHealth the plugin can
@@ -728,10 +748,11 @@ function toProviderHealth(entry: GenerationProbeEntry, now: () => number): Provi
  *   - `data` isn't a well-shaped afm_runtime_status object (also covers
  *     "afm field ABSENT in socket.data", which back-compat requires behave
  *     identically to "socket unreachable" — see afm-health.test.mjs);
- *   - `data.mode` doesn't match the plugin's own resolved provider (avoid
- *     adopting a native verdict when the plugin resolved bridge, or vice
- *     versa — the daemon and the plugin process can have different env/
- *     helper availability);
+ *   - `data.mode` doesn't match the plugin's own resolved provider AND this
+ *     process has an explicitly configured, non-auto mode (avoid adopting a
+ *     native verdict when the operator pinned bridge here, or vice versa). A
+ *     process with no configured mode defers to the daemon instead — see the
+ *     #195 note at the gate;
  *   - the verdict is bridge-effective but the daemon's declared probe target
  *     (`probe_url`/`probe_model`) is absent or differs from this plugin's own
  *     configured AFM_PREPARE_TASK_URL/MODEL — the daemon verified a chat-
@@ -755,21 +776,10 @@ export function daemonAfmToProviderHealth(
 ): ProviderHealth | undefined {
   if (!data || typeof data !== "object") return undefined;
   const record = data as Record<string, unknown>;
-  // Review r1 (P2): afm_runtime_status() reports the RESOLVED MODE, which in
-  // auto installs is the literal string "auto" — never "native"/"bridge".
   // Strict equality against the plugin's resolved provider would reject every
-  // fresh auto-mode daemon verdict and reintroduce the redundant cold probe.
-  // Derive the daemon's effective provider: explicit native/bridge modes map
-  // to themselves; auto maps via `status` ("native_available" → native,
-  // "bridge"/"fallback_used" → bridge). Anything else stays unmatched (fail
-  // to "no reuse", the untrusted-input posture).
-  let daemonEffective: AfmProvider | undefined;
-  if (record.mode === "native" || record.mode === "bridge" || record.mode === "off") {
-    daemonEffective = record.mode;
-  } else if (record.mode === "auto") {
-    if (record.status === "native_available") daemonEffective = "native";
-    else if (record.status === "bridge" || record.status === "fallback_used") daemonEffective = "bridge";
-  }
+  // fresh auto-mode daemon verdict and reintroduce the redundant cold probe, so
+  // the daemon's EFFECTIVE provider is derived first (see helper above).
+  const daemonEffective = daemonEffectiveAfmProvider(record);
   // Review r2 (P2): in configured auto mode the DAEMON is the authority on the
   // effective provider — the plugin's local resolveAfmProvider() can guess
   // "native" from helper presence alone while the daemon has already verified
@@ -780,8 +790,18 @@ export function daemonAfmToProviderHealth(
   // any well-derived daemon effective provider is acceptable; explicit modes
   // still require an exact match (never adopt a bridge verdict when the
   // operator pinned native, or vice versa).
+  //
+  // #195 (env-context split): the same reasoning covers configuredMode
+  // UNDEFINED, i.e. "this process never had MINNI_AFM_PROVIDER_MODE set and
+  // only fell through to the bridge DEFAULT". The daemon carries that env var
+  // in its launchd plist; hook / MCP / shell processes do not inherit it, so
+  // their "bridge" is not an operator decision and must not out-vote the
+  // daemon's verified verdict — otherwise every envelope reports afm_ok:false
+  // on a machine whose AFM is verified healthy. An explicitly configured mode
+  // still requires an exact match.
   if (daemonEffective === undefined) return undefined;
-  if (configuredMode !== "auto" && daemonEffective !== expectedProvider) return undefined;
+  const localModeIsAuthoritative = configuredMode !== undefined && configuredMode !== "auto";
+  if (localModeIsAuthoritative && daemonEffective !== expectedProvider) return undefined;
   // Review r4 (P2): reusing the daemon's verdict is only sound when the daemon
   // probed the SAME target this plugin will actually call. For a bridge-
   // effective verdict that target is an HTTP chat-completions endpoint the
