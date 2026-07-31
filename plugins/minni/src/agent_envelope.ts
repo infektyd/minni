@@ -84,6 +84,7 @@ export type EnvelopeEvent =
   | "SessionStart"
   | "UserPromptSubmit"
   | "PreCompact"
+  | "PostCompact"
   | "CompactSummary"
   | "Stop"
   | "Handoff";

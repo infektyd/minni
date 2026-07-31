@@ -22,14 +22,19 @@
 //      candidates. Harvest proposes; the operator resolves. Nothing here
 //      auto-writes a learning.
 //
-// Dedup is keyed on the platform's id for the summary (transcript uuid on
-// Claude Code, message id on Kilo), persisted under
-// `<vault>/.runtime/compact-harvest-state.json`. That makes the trigger
-// condition forgiving by design: Claude Code attempts the harvest on ANY boot
-// that carries a transcript_path (compact resumes, plain resumes), because a
-// summary that was not yet flushed when SessionStart(source=compact) fired is
-// simply picked up by the next boot — the race self-heals instead of needing
-// a timing guarantee the platform does not document.
+// Dedup is keyed on a CONTENT HASH of the frame-stripped summary, persisted
+// under `<vault>/.runtime/compact-harvest-state.json`. A content key (rather
+// than the platform's summary id) is what lets two delivery paths coexist
+// without double-harvesting: Claude Code's primary path is the PostCompact
+// hook (docs 2026-07-29: PostCompact receives the summary directly as
+// `compact_summary` — no transcript read, no flush race), and the SessionStart
+// transcript tail-read remains as a BACKSTOP for summaries that PostCompact
+// missed (hook not yet registered, older CLI, crash between compaction and the
+// hook). PostCompact has no summary uuid, the transcript entry has no
+// guarantee of being flushed (documented: transcript_path "may lag the
+// in-memory conversation") — the hash is the one identity both paths share.
+// Platform ids ride along as provenance only.
+import { createHash } from "node:crypto";
 import path from "node:path";
 import { mkdir, open, readFile, rename, stat, writeFile } from "node:fs/promises";
 
@@ -250,8 +255,12 @@ async function writeHarvestState(vaultPath: string, state: HarvestState): Promis
 export interface RawSummaryInput {
   /** The summary text, frame and all — this function strips/caps it. */
   summaryText: string;
-  /** Platform-stable id for this summary (transcript uuid, message id). */
-  summaryId: string;
+  /**
+   * Platform id for this summary (transcript uuid, Kilo message id) —
+   * PROVENANCE only; dedup runs on the content hash. Optional because
+   * PostCompact delivers the summary with no id at all.
+   */
+  summaryId?: string;
   sessionId: string;
   /** ISO timestamp of the summary, when the platform provides one. */
   timestamp?: string;
@@ -269,27 +278,29 @@ export async function harvestSummaryText(
   input: RawSummaryInput,
 ): Promise<CompactHarvestResult> {
   try {
-    const summaryId = asString(input.summaryId);
-    if (!summaryId) return { harvested: false, reason: "no_summary_found" };
-
-    const state = await readHarvestState(config.vaultPath);
-    if (state.harvested[summaryId]) {
-      return { harvested: false, reason: "already_harvested", summaryId };
-    }
-
+    const summaryId = asString(input.summaryId) || undefined;
     const text = stripContinuationFrame(asString(input.summaryText)).slice(
       0,
       SUMMARY_TEXT_MAX_CHARS,
     );
+    if (!text) return { harvested: false, reason: "no_summary_found" };
+    // The dedup identity both delivery paths share — see the module header.
+    const contentKey = createHash("sha1").update(text).digest("hex");
+
+    const state = await readHarvestState(config.vaultPath);
+    if (state.harvested[contentKey]) {
+      return { harvested: false, reason: "already_harvested", summaryId };
+    }
+
     if (text.length < SUMMARY_TEXT_MIN_CHARS) {
-      // Aborted/placeholder compactions stay empty forever — mark the id so
-      // it is not re-scanned every boot, but write no inbox file.
-      state.harvested[summaryId] = new Date().toISOString();
+      // Aborted/placeholder compactions stay empty forever — mark the key so
+      // the text is not re-scanned every boot, but write no inbox file.
+      state.harvested[contentKey] = new Date().toISOString();
       await writeHarvestState(config.vaultPath, state);
       await recordAudit(config.vaultPath, {
         tool: `${config.auditPrefix}_compact_harvest`,
         summary: `compact-harvest ${input.sessionId}`,
-        details: { reason: "empty_summary", summary_id: summaryId },
+        details: { reason: "empty_summary", ...(summaryId ? { summary_id: summaryId } : {}) },
       });
       return { harvested: false, reason: "empty_summary", summaryId };
     }
@@ -304,20 +315,22 @@ export async function harvestSummaryText(
       agent_id: inboxPrincipalForVaultPath(config.vaultPath),
       workspace_id: config.workspaceId,
       summary_text: text,
-      summary_id: summaryId,
+      summary_sha1: contentKey,
+      ...(summaryId ? { summary_id: summaryId } : {}),
       platform: config.platform,
       session_id: input.sessionId,
       ...(input.timestamp ? { summary_timestamp: input.timestamp } : {}),
     });
 
-    state.harvested[summaryId] = new Date().toISOString();
+    state.harvested[contentKey] = new Date().toISOString();
     await writeHarvestState(config.vaultPath, state);
 
     await recordAudit(config.vaultPath, {
       tool: `${config.auditPrefix}_compact_harvest`,
       summary: `compact-harvest ${input.sessionId}`,
       details: {
-        summary_id: summaryId,
+        ...(summaryId ? { summary_id: summaryId } : {}),
+        summary_sha1: contentKey,
         summary_chars: text.length,
         workspace: config.workspaceId,
         inbox_path: inbox.filePath,

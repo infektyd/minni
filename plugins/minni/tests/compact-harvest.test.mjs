@@ -192,7 +192,7 @@ test("harvest dedups by summary id across boots", async () => {
   const inbox = (await readdir(path.join(vault, "inbox"))).filter((name) => name.endsWith(".json"));
   assert.equal(inbox.length, 1);
   const state = JSON.parse(await readFile(path.join(vault, COMPACT_HARVEST_STATE_RELPATH), "utf8"));
-  assert.ok(state.harvested["uuid-d1"]);
+  assert.equal(Object.keys(state.harvested).length, 1);
 });
 
 test("empty/aborted summaries write no inbox file but mark state", async () => {
@@ -207,7 +207,32 @@ test("empty/aborted summaries write no inbox file but mark state", async () => {
   const inbox = (await readdir(path.join(vault, "inbox"))).filter((name) => name.endsWith(".json"));
   assert.equal(inbox.length, 0);
   const state = JSON.parse(await readFile(path.join(vault, COMPACT_HARVEST_STATE_RELPATH), "utf8"));
-  assert.ok(state.harvested["uuid-z1"], "empty summary id must still be marked to stop rescans");
+  assert.equal(Object.keys(state.harvested).length, 1, "empty summary must still be marked to stop rescans");
+});
+
+test("PostCompact-style delivery (no summary id) dedups against the transcript backstop", async () => {
+  const vault = await tmpVault();
+  // Primary path: PostCompact hands the text directly, no platform id.
+  const primary = await harvestSummaryText(HARVEST_CONFIG(vault), {
+    summaryText: SUMMARY_TEXT,
+    sessionId: "sess-pc",
+  });
+  assert.equal(primary.harvested, true);
+  assert.equal(primary.summaryId, undefined);
+  // Backstop path: next boot tail-reads the SAME summary from the transcript
+  // (different identity — a uuid). Content-hash dedup must catch it.
+  const file = await tmpTranscript([transcriptLine(summaryEntry("uuid-bs", SUMMARY_TEXT))]);
+  const backstop = await harvestCompactSummary(HARVEST_CONFIG(vault), {
+    transcriptPath: file,
+    sessionId: "sess-pc",
+  });
+  assert.equal(backstop.harvested, false);
+  assert.equal(backstop.reason, "already_harvested");
+  const inbox = (await readdir(path.join(vault, "inbox"))).filter((name) => name.endsWith(".json"));
+  assert.equal(inbox.length, 1);
+  const doc = JSON.parse(await readFile(path.join(vault, "inbox", inbox[0]), "utf8"));
+  assert.equal(doc.summary_id, undefined);
+  assert.ok(doc.summary_sha1);
 });
 
 test("harvest is fail-open on missing inputs", async () => {
@@ -221,8 +246,9 @@ test("harvest is fail-open on missing inputs", async () => {
     (await harvestCompactSummary(HARVEST_CONFIG(vault), { transcriptPath: empty, sessionId: "s" })).reason,
     "no_summary_found",
   );
+  // A blank text (whitespace strips to nothing) has no identity to mark.
   assert.equal(
-    (await harvestSummaryText(HARVEST_CONFIG(vault), { summaryText: "x", summaryId: "", sessionId: "s" })).reason,
+    (await harvestSummaryText(HARVEST_CONFIG(vault), { summaryText: "   ", sessionId: "s" })).reason,
     "no_summary_found",
   );
 });
