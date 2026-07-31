@@ -164,6 +164,7 @@ Background curation runs as discrete passes under `engine/afm_passes/`:
 |---|---|
 | `vault_ingest` | Builds each agent's personal `.index` from its wiki |
 | `inbox_ingest` | Ingests hook-written inbox files into `candidate_packets` |
+| `compact_distillation` | Distills harvested `compact_summary` inbox files into shared candidates + personal session notes (see [Compaction-summary harvest](#compaction-summary-harvest)) |
 | `consolidation` | Promote / dedupe / mark-for-review triage of staged candidates |
 | `synthesis` | Sourced synthesis pages in the vault wiki |
 | `session_distillation` | Distills session transcripts into candidate material |
@@ -175,6 +176,64 @@ inbox files into `candidate_packets`; **`consolidation`** then proposes
 promote/dedupe/review decisions that the daemon applies according to the
 configured gates. Raw transcripts, status packets, hook envelopes, test junk,
 and unverified claims route to review or rejection, not active memory.
+
+## Compaction-summary harvest
+
+When a platform compacts its context it distills the session into a
+structured summary — the highest-signal outcome document a session produces.
+Minni harvests it in two stages, split across the boot/daemon boundary
+([#194](https://github.com/infektyd/minni/pull/194),
+[#196](https://github.com/infektyd/minni/pull/196)):
+
+1. **Hook-side harvest (fast, fail-open).** On Claude Code, the `PostCompact`
+   hook is the primary delivery path — it receives the summary directly, no
+   transcript read. A `SessionStart` transcript tail-read is the backstop for
+   summaries `PostCompact` missed (hook not yet registered, older CLI, a crash
+   between compaction and the hook firing) — see
+   `extractLatestCompactSummary` in
+   `plugins/minni/src/compact-harvest.ts`. On Kilo Code, the SDK read-back
+   fires after the native `session.compacted` bus event (`experimental.session.compacting`
+   fires too early — before the summary exists — so the plugin fetches it
+   afterward via the SDK client; see `plugins/minni/kilo/minni-plugin.js`).
+   Both paths converge on `harvestSummaryText`: the continuation-frame
+   boilerplate is stripped, the text is capped, and it is written verbatim to
+   the agent's vault `inbox/` as one file with `kind: "compact_summary"`.
+   Dedup is keyed on a **content sha1** of the frame-stripped summary (not the
+   platform's summary id), persisted under
+   `<vault>/.runtime/compact-harvest-state.json` — a content key is what lets
+   two delivery paths coexist on Claude Code without double-harvesting.
+2. **Daemon-side distillation (`compact_distillation` AFM pass).** The same
+   consolidation timer that ingests stop-candidate learnings picks up
+   `compact_summary` inbox files (`src/minni/afm_passes/compact_distillation.py`).
+   It splits the summary into numbered sections (whole-body fallback for
+   unsectioned summaries) and routes each section by **audience**:
+   sections matching `_SHARED_SECTION_TITLES` (Key Technical Concepts, Errors
+   and Fixes, Problem Solving, Key Learnings/Learnings, Decisions) are
+   transferable knowledge and go to the shared `candidate_packets` queue,
+   AFM-distilled via the native `session_distill` op when available
+   (deterministic section-flatten fallback otherwise). Everything else is
+   session-personal narration and never reaches the shared pool — it is
+   written only to a personal vault note,
+   `wiki/sessions/<date>-compact-<session>-<hash>.md`, in the *source* vault,
+   where the vault-watch sweep indexes it for that agent alone. The one
+   exception: the unsectioned whole-body fallback can still earn the shared
+   pool, but only if AFM actually distilled it into a crisp assertion — with
+   AFM off, unsectioned summaries stay personal. Candidate content passes a
+   local-path/secret scrub before insert, since summaries quote session
+   content verbatim.
+
+**Archive-on-insert lifecycle.** `compact_distillation` reuses the
+`inbox_ingest` idempotency contract: it keys derived rows on
+`(inbox_file, candidate_index)` with `derived_from.source == "inbox"`, which is
+exactly what `inbox_archive` looks for — so once a summary's candidates all
+reach a terminal state, the existing archive pass retires the inbox file with
+no new code (moved, never deleted). A file that yields **no** shared candidate
+has no candidate row to key idempotency on, so once its personal session note
+is written, `compact_distillation` archives it immediately itself — otherwise
+it would be rescanned every consolidation tick forever.
+
+The harvest only proposes; nothing here writes a learning directly — shared
+candidates still go through the normal propose→approve gate above.
 
 ## Core invariants
 
