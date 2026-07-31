@@ -39,6 +39,15 @@ Safety / contract
   (defensive; current files carry these as advisory string LISTS).
 * A CANDIDATE string is skipped if it appears verbatim in that file's
   ``log_only`` or ``do_not_store`` list.
+* A CANDIDATE string is skipped if it is an AUDIT ECHO — Minni's own audit log
+  fed back in as a "learning" (issue #193). The Stop hook on current main no
+  longer drafts from the audit tail and scrubs telemetry client-side
+  (``isAuditTelemetryLine`` in plugins/minni/src/task.ts), but hook binaries are
+  deployed per-agent and go stale independently, so pre-fix builds keep writing
+  audit-echo candidate files into vault inboxes. This writer is the ONE shared
+  choke point every inbox file passes through, so the same grammar is enforced
+  here as defense in depth. Echoes are tallied as ``_audit_echo`` in
+  ``skipped_by_kind`` so the drop is observable rather than silent.
 * IDEMPOTENT: each row carries ``derived_from`` with the source inbox file +
   candidate index; existing rows (ANY status) are detected and never
   re-inserted. Re-running is a no-op even after the loop resolves a row.
@@ -63,6 +72,7 @@ import glob
 import hashlib
 import json
 import os
+import re
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -77,6 +87,52 @@ STOP_KIND = "stop_candidates"
 LEGACY_STOP_KIND = "codex_stop_candidates"
 STOP_KINDS = frozenset({STOP_KIND, LEGACY_STOP_KIND})
 CONTENT_CAP = 200000  # matches minnid.py canonical insert bound
+
+# --- Audit-echo grammar (issue #193) ------------------------------------------
+# A verbatim port of `isAuditTelemetryLine` in plugins/minni/src/task.ts. Keep
+# the two in sync: this is the daemon-side backstop for the SAME shape, and a
+# grammar that drifts here silently re-opens the feedback loop for every agent
+# whose hook binary is older than the client-side fix.
+#
+# Two forms, matching how `recordAudit` renders a line and how a tail gets
+# pasted back in:
+#   * FULL header — `## [<ts>] <tool> |`. Specific enough to match ANYWHERE in
+#     the blob, because the Stop drafter collapses newlines into spaces before
+#     the scrub, so a pasted tail no longer begins at a line start.
+#   * BARE tail line — `<tool> | <summary>`, which MUST be anchored to a line
+#     start (with an optional quote/bullet prefix, since a pasted tail usually
+#     arrives inside one). Two independent signals keep ordinary prose and
+#     markdown tables out: the head must name a namespace that actually emits
+#     audit lines, and the tail must hold exactly one `|` and not open with
+#     another snake_case identifier ("agent_id | role | created_at ...").
+_AUDIT_TOOL = r"(?:hook|minni|sovereign|agent|afm|handoff|team)_[a-z0-9_]+"
+_AUDIT_TOOL_KNOWN = (
+    r"(?:(?:hook|minni|sovereign)_[a-z0-9_]+"
+    r"|afm_loop|agent_ping|handoff_sent|handoff_received)"
+)
+_AUDIT_LINE_PREFIX = r"[ \t]*(?:[>*\-+][ \t]*)*"
+
+_AUDIT_HEADER_LINE = re.compile(
+    r"##[ \t]+\[[^\]\n]{4,64}\][ \t]+" + _AUDIT_TOOL + r"[ \t]*\|",
+    re.IGNORECASE,
+)
+_AUDIT_BARE_LINE = re.compile(
+    r"^"
+    + _AUDIT_LINE_PREFIX
+    + _AUDIT_TOOL_KNOWN
+    + r"[ \t]*\|(?![ \t]*[a-z0-9]+_[a-z0-9]+)[^|\n]*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def is_audit_echo(text: str) -> bool:
+    """True when ``text`` is Minni's own audit telemetry rather than a learning.
+
+    Mirrors `isAuditTelemetryLine` (plugins/minni/src/task.ts).
+    """
+    if not isinstance(text, str):
+        return False
+    return bool(_AUDIT_HEADER_LINE.search(text) or _AUDIT_BARE_LINE.search(text))
 
 
 def _content_sha1(text: str) -> str:
@@ -215,7 +271,8 @@ def _scan_inbox(
     dropped because they carry a non-stop ``kind`` (handoff, failed_command,
     ``*_precompact_handoff``, ...) are tallied per kind instead of vanishing
     silently; kind-less files that fail the stop-candidate shape check are
-    tallied under ``_unrecognized``."""
+    tallied under ``_unrecognized``; individual audit-echo candidates (issue
+    #193) under ``_audit_echo``."""
     out: List[Dict[str, Any]] = []
     skipped_by_kind: Dict[str, int] = {}
     inbox_principal = _principal_for_inbox(inbox, fallback_principal)
@@ -275,6 +332,14 @@ def _scan_inbox(
             if not isinstance(cand, str) or not cand.strip():
                 continue
             if cand in log_only_set or cand in dns_set:
+                continue
+            # Issue #193: a stale hook build drafting from the audit tail turns
+            # every session stop into a proposal quoting Minni's own bookkeeping.
+            # Drop it here — counted, never inserted — so a bookkeeping-only
+            # session yields zero candidate_packets no matter which binary wrote
+            # the file.
+            if is_audit_echo(cand):
+                skipped_by_kind["_audit_echo"] = skipped_by_kind.get("_audit_echo", 0) + 1
                 continue
             content = cand.strip()[:CONTENT_CAP]
             out.append(

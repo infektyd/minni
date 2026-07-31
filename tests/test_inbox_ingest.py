@@ -437,3 +437,103 @@ def test_unhashable_kind_does_not_abort_the_whole_ingest_pass(tmp_path):
     res = ingest(db_obj, cfg, inboxes=[inbox], dry_run=False)
     assert res["inserted"] == 1, res
     assert _count_proposed(db_obj) == 1
+
+
+# ── Issue #193: Stop-hook audit-echo junk candidates (feedback loop) ──────────
+# A stale hook binary drafts its candidate from the vault's own audit tail, so
+# every session stop mints one proposal quoting hook bookkeeping, which the next
+# stop re-drafts. The hook layer scrubs this client-side, but hook binaries are
+# deployed per agent and go stale independently; this writer is the one shared
+# choke point every inbox file passes through, so the drop is enforced here too.
+
+# Verbatim candidate text from a live junk file
+# (~/.minni/claudecode-vault/inbox/2026-07-31-ms9ig002-*.json), trimmed.
+_AUDIT_ECHO_CANDIDATE = (
+    "6a5ba70f-70b3-44e5-8a78-2e21d774cd71: "
+    '## [2026-07-31T02:40:35.186Z] hook_pre_compact | pre-compact 1d3bb2eb '
+    '```json { "scar_count": 0, "trigger": "manual" } ``` '
+    "## [2026-07-31T02:42:04.296Z] hook_session_start | boot 1d3bb2eb "
+    '```json { "daemon_ok": true, "pending_inbox": 8 } ```'
+)
+
+
+def test_issue_193_bookkeeping_only_session_ingests_zero_candidates(tmp_path):
+    """The regression criterion from #193: a session whose only audit entries
+    are hook bookkeeping must produce ZERO candidates."""
+    from minni.afm_passes.inbox_ingest import ingest
+
+    db_obj, cfg = _make_db(tmp_path)
+    inbox = tmp_path / "claudecode-vault" / "inbox"
+    # The stale hook writes the kind-less Claude Code shape.
+    _write_inbox_file(inbox, "junk.json", {
+        "slug": "6a5ba70f",
+        "createdAt": "2026-07-31T22:24:50.690Z",
+        "candidates": [_AUDIT_ECHO_CANDIDATE],
+        "log_only": [],
+        "expires": [],
+        "do_not_store": [],
+        "last_task": "6a5ba70f",
+    })
+
+    res = ingest(db_obj, cfg, inboxes=[inbox], dry_run=False)
+    assert res["eligible"] == 0, res
+    assert res["inserted"] == 0, res
+    assert res["skipped_by_kind"] == {"_audit_echo": 1}, res
+    assert _count_proposed(db_obj, principal="claude-code") == 0
+
+
+def test_issue_193_audit_echo_forms_are_all_rejected():
+    """Every bookkeeping event type named in the issue, in both the rendered
+    header form and the bare tail form (bulleted or quoted, as a pasted tail
+    arrives)."""
+    from minni.afm_passes.inbox_ingest import is_audit_echo
+
+    for text in [
+        "## [2026-07-25 12:00:00] hook_stop | stop session-abc",
+        "## [2026-07-31T02:42:04.296Z] hook_session_start | boot 1d3bb2eb",
+        "## [2026-07-31T02:40:35.186Z] hook_pre_compact | pre-compact 1d3bb2eb",
+        "## [2026-07-31T22:31:51.910Z] hook_user_prompt_submit | yes, fix it",
+        "## [2026-07-30T10:00:00.000Z] minni_vault_write | wrote wiki/x.md",
+        "hook_session_start | session started",
+        "> hook_stop | stop session-abc",
+        "- minni_learn | committed a learning",
+        _AUDIT_ECHO_CANDIDATE,
+    ]:
+        assert is_audit_echo(text) is True, text
+
+
+def test_issue_193_real_candidates_still_ingest(tmp_path):
+    """The filter must not break legitimate drafting — this path feeds the whole
+    governance inbox. Prose that merely MENTIONS the hook tools stays eligible."""
+    from minni.afm_passes.inbox_ingest import ingest, is_audit_echo
+
+    for text in [
+        "Use WAL mode for SQLite performance",
+        "debug the hook_stop | grep pipeline before trusting the tail",
+        "agent_id | role | created_at are the three indexed columns",
+        "minni_recall | minni_learn are the two tools the daemon exposes",
+    ]:
+        assert is_audit_echo(text) is False, text
+
+    db_obj, cfg = _make_db(tmp_path)
+    inbox = tmp_path / "claudecode-vault" / "inbox"
+    _write_inbox_file(inbox, "real.json", {
+        "slug": "s",
+        "createdAt": "2026-07-31T22:24:50.690Z",
+        "candidates": [
+            "Use WAL mode for SQLite performance",
+            _AUDIT_ECHO_CANDIDATE,
+        ],
+        "log_only": [],
+        "expires": [],
+        "do_not_store": [],
+        "last_task": "t",
+    })
+
+    res = ingest(db_obj, cfg, inboxes=[inbox], dry_run=False)
+    assert res["inserted"] == 1, res
+    assert res["skipped_by_kind"] == {"_audit_echo": 1}, res
+    with db_obj.cursor() as c:
+        c.execute("SELECT content FROM candidate_packets WHERE principal='claude-code'")
+        rows = [dict(r)["content"] for r in c.fetchall()]
+    assert rows == ["Use WAL mode for SQLite performance"], rows

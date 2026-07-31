@@ -486,6 +486,70 @@ test("Stop scrub guard: a draftable signal scrubbing to zero candidates writes n
   }
 });
 
+// REGRESSION (issue #193): the live junk was never a SINGLE audit line — it was
+// a multi-entry tail, several bookkeeping events with their JSON detail blocks,
+// newline-collapsed into one string. The #173 assertion above covers the
+// one-line shape only, so the exact production shape gets its own green: a
+// session whose only audit entries are hook bookkeeping must produce ZERO
+// candidates and write no inbox file, and the same Stop with genuine outcome
+// material must still draft (this path feeds the whole governance inbox).
+test("Stop #193: a bookkeeping-only audit tail as Stop material drafts zero candidates", async () => {
+  // Verbatim from a live junk inbox file, trimmed and path-redacted.
+  const bookkeepingTail = [
+    '## [2026-07-31T02:40:35.186Z] hook_pre_compact | pre-compact 1d3bb2eb ```json { "scar_count": 0, "trigger": "manual" } ```',
+    '## [2026-07-31T02:42:04.296Z] hook_session_start | boot 1d3bb2eb ```json { "daemon_ok": true, "pending_inbox": 8 } ```',
+    '## [2026-07-31T22:29:30.513Z] hook_stop | stop 6a5ba70f ```json { "candidates": 1, "inbox_path": "[local-path]" } ```',
+    '## [2026-07-31T22:31:51.910Z] hook_user_prompt_submit | yes, fix the archive gap ```json { "intent": "none" } ```',
+  ].join("\n");
+
+  const root = await mkdtemp(path.join(tmpdir(), "sm-hook-stop-193-"));
+  const savedHome = process.env.MINNI_HOME;
+  const savedBypass = process.env.MINNI_BYPASS_AUDIT_LIMIT;
+  process.env.MINNI_HOME = path.join(root, "home");
+  process.env.MINNI_BYPASS_AUDIT_LIMIT = "true";
+  try {
+    const junkVault = path.join(root, "junk-vault");
+    const junkHandlers = createHookHandlers(stopConfig(junkVault, "claude-code"));
+    const junkOut = await junkHandlers.handleStop({
+      session_id: "6a5ba70f",
+      summary: bookkeepingTail,
+    });
+    assert.equal(junkOut.continue, true);
+    assert.doesNotMatch(junkOut.systemMessage ?? "", /candidate learning/);
+    const junkNames = (await readdir(path.join(junkVault, "inbox"))).filter((n) =>
+      n.endsWith(".json"),
+    );
+    assert.deepEqual(junkNames, [], "bookkeeping-only session must write no inbox file");
+    const junkTail = await auditTail(junkVault, 10);
+    assert.match(junkTail.text, /no_candidates_after_scrub/);
+
+    // Same handler, real material: drafting must still work.
+    const realVault = path.join(root, "real-vault");
+    const realHandlers = createHookHandlers(stopConfig(realVault, "claude-code"));
+    const realOut = await realHandlers.handleStop({
+      session_id: "real-session",
+      summary: "Use WAL mode for SQLite so concurrent readers stop blocking the writer",
+    });
+    assert.equal(realOut.continue, true);
+    assert.match(realOut.systemMessage ?? "", /candidate learning/);
+    const realNames = (await readdir(path.join(realVault, "inbox"))).filter((n) =>
+      n.endsWith(".json"),
+    );
+    assert.equal(realNames.length, 1, "genuine outcome material must still draft");
+    const drafted = JSON.parse(
+      await readFile(path.join(realVault, "inbox", realNames[0]), "utf8"),
+    );
+    assert.equal(drafted.candidates.length, 1);
+    assert.match(drafted.candidates[0], /WAL mode/);
+  } finally {
+    if (savedHome === undefined) delete process.env.MINNI_HOME;
+    else process.env.MINNI_HOME = savedHome;
+    if (savedBypass === undefined) delete process.env.MINNI_BYPASS_AUDIT_LIMIT;
+    else process.env.MINNI_BYPASS_AUDIT_LIMIT = savedBypass;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 // ── Stop auto-draft RETIRED 2026-07-24 (investigation: 0 real learnings in 40 ──
 // drafts; the audit tail is Minni's own telemetry log). Capture is now
 // EXCLUSIVELY the explicit minni_prepare_outcome / minni_learn path. Stop no
