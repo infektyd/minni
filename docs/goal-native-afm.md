@@ -48,12 +48,18 @@ call sites consume normalized data after the provider boundary.
   `http://127.0.0.1:11437` is the fallback/compatibility path, exercised in
   `auto` mode or when an operator pins `bridge` explicitly.
 - Hook, MCP, and shell processes do not inherit the daemon's launchd
-  environment, so they never see `MINNI_AFM_PROVIDER_MODE` themselves. Since
-  PR #200, when such a process has no explicitly configured mode, it defers
-  to the daemon's own AFM verdict (`daemonAfmToProviderHealth` in
-  `plugins/minni/src/sovereign.ts`) instead of defaulting to a cold `bridge`
-  probe that would falsely report `afm_ok:false` next to a daemon reporting
-  `native_available`. An explicitly pinned mode still requires an exact
+  environment directly, but `MINNI_AFM_PROVIDER_MODE`/`MINNI_AFM_NATIVE_HELPER`
+  still reach them one of two ways: the daemon's own plist, or an
+  installer-written MCP env block (`native_afm_env()` in
+  `plugins/minni/skills/minni-install/scripts/propagate.py`, which `minni
+  wire` injects into `claude.json`, the KiloCode/Gemini manifests, and TOML
+  configs whenever the native helper is built). Only when a process has
+  neither — no explicitly configured mode at all — does it defer to the
+  daemon's own AFM verdict (`daemonAfmToProviderHealth`, defined in
+  `plugins/minni/src/afm.ts` and called from `plugins/minni/src/sovereign.ts`,
+  since PR #200) instead of defaulting to a cold `bridge` probe that would
+  falsely report `afm_ok:false` next to a daemon reporting `native_available`.
+  An explicitly pinned mode — from either source — still requires an exact
   match against the daemon's verdict.
 - `native` never silently falls back; it reports unavailable if the helper or
   Foundation Models backend is unavailable.

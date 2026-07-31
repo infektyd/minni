@@ -31,12 +31,17 @@
 (`resolve_afm_mode` in `src/minni/afm_provider.py`, `resolveAfmMode` in
 `plugins/minni/src/afm.ts`) default to `bridge` — but the daemon's launchd
 plist (`src/minni/launchd/com.minni.minnid.plist.example`) sets
-`MINNI_AFM_PROVIDER_MODE=native` in its `EnvironmentVariables`, so a
-deployed daemon runs native mode day to day and the bridge is the
-fallback/compat path. Hook, MCP, and shell processes spawned outside that
-launchd environment do not inherit the variable; since PR #200, an
-unconfigured caller defers to the daemon's own AFM verdict instead of
-defaulting to a cold bridge probe (see `plugins/minni/src/sovereign.ts`).
+`MINNI_AFM_PROVIDER_MODE=native` (plus `MINNI_AFM_NATIVE_HELPER`) in its
+`EnvironmentVariables`, so a deployed daemon runs native mode day to day and
+the bridge is the fallback/compat path. Hook, MCP, and shell processes reach
+the same variables through an installer-written MCP env block instead
+(`native_afm_env()` in
+`plugins/minni/skills/minni-install/scripts/propagate.py`, wired by `minni
+wire`); only a process with neither source configured defers to the
+daemon's own AFM verdict, since PR #200
+(`daemonAfmToProviderHealth` in `plugins/minni/src/afm.ts`, called from
+`plugins/minni/src/sovereign.ts`) instead of defaulting to a cold bridge
+probe.
 
 ## Normalized Contracts
 

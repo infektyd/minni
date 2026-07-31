@@ -1029,11 +1029,13 @@ export async function buildStatusReport(input?: {
   // presence alone can resolve "native" here while the daemon already fell
   // back to bridge after a real FoundationModels check).
   // #195 (env-context split): only pass a configured mode when THIS process
-  // actually has one. Hook / MCP / shell contexts inherit no
-  // MINNI_AFM_PROVIDER_MODE (it lives in the daemon's launchd plist), so their
-  // "bridge" is a default, not an operator decision, and must not out-vote the
-  // daemon's verified verdict. Passing undefined makes the daemon the single
-  // source of truth for those contexts.
+  // actually has one. MINNI_AFM_PROVIDER_MODE reaches a process via the
+  // daemon's launchd plist or an installer-written MCP env block
+  // (native_afm_env() in plugins/minni/skills/minni-install/scripts/
+  // propagate.py); a hook/MCP/shell context with neither source falls
+  // through to "bridge" as a default, not an operator decision, and must
+  // not out-vote the daemon's verified verdict. Passing undefined makes the
+  // daemon the single source of truth for those unconfigured contexts.
   const afmModeIsConfigured = input?.afmProviderMode !== undefined || afmProviderModeConfigured();
   const daemonGeneration = daemonAfmToProviderHealth(
     daemonAfmData,

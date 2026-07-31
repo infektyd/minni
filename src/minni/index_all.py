@@ -5,12 +5,12 @@ Runs all source indexers (vault + wiki) in sequence, then rebuilds
 the shared FAISS index from all accumulated embeddings.
 
 Usage:
-    python index_all.py              # Index everything (vault + wiki)
-    python index_all.py --vault-only # Index only the Obsidian vault
-    python index_all.py --wiki-only  # Index only wiki directories
-    python index_all.py --vault-ingest-all
-                                      # Index all ~/.minni/*-vault wiki trees
-    python index_all.py --verbose    # Show per-file progress
+    python -m minni.index_all              # Index everything (vault + wiki)
+    python -m minni.index_all --vault-only # Index only the Obsidian vault
+    python -m minni.index_all --wiki-only  # Index only wiki directories
+    python -m minni.index_all --vault-ingest-all
+                                            # Index all ~/.minni/*-vault wiki trees
+    python -m minni.index_all --verbose    # Show per-file progress
 """
 
 import argparse

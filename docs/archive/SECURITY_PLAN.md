@@ -117,7 +117,7 @@ Each finding gets: severity, affected files, what/why, fix sketch.
 
 ### SEC-001 — World-writable OpenClaw socket exposes file-read and memory-write (HIGH)
 
-Files: [openclaw-extension/sovrd.py:323,410,467,508](openclaw-extension/sovrd.py).
+Files: `openclaw-extension/sovrd.py:323,410,467,508`.
 
 The legacy OpenClaw daemon chmods its Unix socket to `0o666`, exposes `/read` for absolute paths, and exposes `/learn` with no runtime auth.
 
@@ -125,7 +125,7 @@ Fix: move the socket into `~/.minni/run/` mode `0700`, set the socket itself to 
 
 ### SEC-002 — Caller-supplied agent identity (HIGH)
 
-Files: [engine/sovrd.py:382,564,741,853,1025,1111](engine/sovrd.py); [plugins/minni/src/server.ts:172,221,374](plugins/minni/src/server.ts).
+Files: `engine/sovrd.py:382,564,741,853,1025,1111`; `plugins/minni/src/server.ts:172,221,374`.
 
 `agent_id`/`agentId`/`fromAgent` flow in from caller input and drive recall, learn, handoff, and audit logging. Any caller can claim another identity.
 
@@ -133,7 +133,7 @@ Fix: introduce `EffectivePrincipal` resolved from process/session config or loca
 
 ### SEC-003 — Caller-controlled vaultPath (HIGH)
 
-Files: [plugins/minni/src/server.ts:37,88,115,132,153,178,223,286,310,332,348,368](plugins/minni/src/server.ts); [plugins/minni/src/vault.ts:309,362,472](plugins/minni/src/vault.ts).
+Files: `plugins/minni/src/server.ts:37,88,115,132,153,178,223,286,310,332,348,368`; `plugins/minni/src/vault.ts:309,362,472`.
 
 Many MCP tools accept optional `vaultPath`. Vault helpers create directories, write notes, append audit logs, and search markdown under whatever path is supplied.
 
@@ -141,7 +141,7 @@ Fix: map each principal to a configured vault root. Resolve via `realpath`. Reje
 
 ### SEC-004 — Caller-controlled AFM prepare URL (HIGH)
 
-Files: [plugins/minni/src/server.ts:39,88](plugins/minni/src/server.ts); [plugins/minni/src/task.ts:575,583,656,842](plugins/minni/src/task.ts).
+Files: `plugins/minni/src/server.ts:39,88`; `plugins/minni/src/task.ts:575,583,656,842`.
 
 Task and outcome preparation accept `afmPrepareUrl` from the caller and POST task/recall/outcome context to that URL.
 
@@ -149,7 +149,7 @@ Fix: remove `afmPrepareUrl` from model-facing schemas. Use a configured endpoint
 
 ### SEC-005 — Read policy is not centralized; expand can bypass it (HIGH)
 
-Files: [engine/retrieval.py:1570,1772](engine/retrieval.py); [engine/test_pr2_envelope.py:565](engine/test_pr2_envelope.py).
+Files: `engine/retrieval.py:1570,1772`; `engine/test_pr2_envelope.py:565`.
 
 Privacy/status filtering exists in some paths but not all. `expand_result` fetches by id with no policy check. Drift-prone.
 
@@ -157,7 +157,7 @@ Fix: implement `can_read_document(principal, workspace, doc_metadata)` once. Cal
 
 ### SEC-006 — Vault context packs ignore privacy/status frontmatter (MED→HIGH for marketing)
 
-Files: [plugins/minni/src/vault.ts:472](plugins/minni/src/vault.ts); [plugins/minni/src/task.ts:246](plugins/minni/src/task.ts); [plugins/minni/src/sovereign.ts:278](plugins/minni/src/sovereign.ts).
+Files: `plugins/minni/src/vault.ts:472`; `plugins/minni/src/task.ts:246`; `plugins/minni/src/sovereign.ts:278`.
 
 Vault search returns markdown snippets without parsing frontmatter; sensitivity inferred from string heuristics. Defeats a marketed feature.
 
@@ -165,7 +165,7 @@ Fix: parse YAML frontmatter; attach metadata to `VaultSearchResult`; gate via th
 
 ### SEC-010 — No prompt-injection fence between recalled memory and model context (HIGH)
 
-Files: [plugins/minni/src/task.ts:355,375,382](plugins/minni/src/task.ts); [plugins/minni/src/sovereign.ts:272](plugins/minni/src/sovereign.ts); [engine/sovrd.py:347-374](engine/sovrd.py).
+Files: `plugins/minni/src/task.ts:355,375,382`; `plugins/minni/src/sovereign.ts:272`; `engine/sovrd.py:347-374`.
 
 Snippets and wikilinks are interpolated raw into the model context. No fencing, no provenance markers, no escaping of `##` or backticks.
 
@@ -173,7 +173,7 @@ Fix: wrap each recalled snippet in an "EVIDENCE-ONLY" fenced envelope with `sour
 
 ### SEC-011 — Frontmatter regex matches the whole document (HIGH)
 
-File: [engine/indexer.py:50-85](engine/indexer.py).
+File: `engine/indexer.py:50-85`.
 
 `_extract_frontmatter` does `re.search(r"agent:\s*(\S+)", content)` against the entire document. Body text like `agent: hermes\nprivacy: safe` reattributes the doc.
 
@@ -181,7 +181,7 @@ Fix: extract only the leading `---\n…\n---` block. Parse it as YAML. Apply per
 
 ### SEC-012 — Handoff wikilink path traversal (HIGH)
 
-Files: [plugins/minni/src/vault.ts:570-599](plugins/minni/src/vault.ts); [plugins/minni/src/hook.ts:102](plugins/minni/src/hook.ts).
+Files: `plugins/minni/src/vault.ts:570-599`; `plugins/minni/src/hook.ts:102`.
 
 `normalizeWikilinkRef` strips `[[`, `]]`, `.md`, leading `/` — but not `..`. A handoff envelope with `wikilink_refs: ["../../../etc/passwd"]` reads arbitrary files into recipient context.
 
@@ -189,7 +189,7 @@ Fix: after resolving, `realpath` the candidate and verify containment within `pa
 
 ### SEC-018 — Writeback content can forge its own frontmatter (MED→HIGH paired with SEC-011)
 
-File: [engine/writeback.py:383-413](engine/writeback.py).
+File: `engine/writeback.py:383-413`.
 
 `_write_to_disk` interpolates `content` after the frontmatter block. A `learn` payload with `\n---\nagent: trusted\n---` creates a new frontmatter block that the indexer (SEC-011) reads as truth.
 
@@ -197,7 +197,7 @@ Fix: reject `---` or YAML-frontmatter-shaped lines in learn content, or write co
 
 ### SEC-014 — Audit log injection (MED, must-fix for "auditable handoffs" claim)
 
-Files: [plugins/minni/src/vault.ts:336-348](plugins/minni/src/vault.ts); [engine/sovrd.py:297-305](engine/sovrd.py).
+Files: `plugins/minni/src/vault.ts:336-348`; `engine/sovrd.py:297-305`.
 
 Audit entries are formatted as `## [ts] tool | summary`. A `summary` containing `\n## […]` injects forged entries.
 
@@ -205,7 +205,7 @@ Fix: in `recordAudit`, replace `\n` with `\\n` and prefix-escape leading `#` in 
 
 ### SEC-015 — No socket body cap; embedding DoS (MED)
 
-File: [engine/sovrd.py:1488-1517,825-930](engine/sovrd.py).
+File: `engine/sovrd.py:1488-1517,825-930`.
 
 `reader.readuntil(b"\n")` has no `limit`. `_handle_learn` runs the embedder on caller-controlled content of arbitrary size.
 

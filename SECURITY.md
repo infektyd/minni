@@ -16,9 +16,11 @@ released versions to backport fixes to.
 
 ## Threat model and known findings
 
-This file is intentionally short. The actual threat model — assets, trust
-boundaries, adversaries in and out of scope, and the tracked findings
-(`SEC-001` through `SEC-022`) — lives in
+This file is intentionally short. The current threat model — assets, trust
+boundaries, adversaries in and out of scope, and residual stories — lives in
+[`docs/contracts/THREAT_MODEL.md`](docs/contracts/THREAT_MODEL.md). The
+tracked findings from the v0.2 hardening pass (`SEC-001` through `SEC-022`,
+with their fixes) are the findings ledger in
 [`SECURITY_PLAN.md`](docs/archive/SECURITY_PLAN.md), archived as a
-point-in-time record. Read that document for what "secure" means for this
-project and what's already known and tracked.
+point-in-time record. Read both for what "secure" means for this project and
+what's already known and tracked.

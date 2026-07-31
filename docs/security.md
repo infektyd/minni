@@ -1,14 +1,14 @@
 # Security model
 
-The authoritative documents are [`SECURITY_PLAN.md`](archive/SECURITY_PLAN.md)
-(the tracked findings, SEC-001…SEC-022, with their fixes, archived as a
-point-in-time record) and
+The current threat model is
 [`contracts/THREAT_MODEL.md`](contracts/THREAT_MODEL.md) (trust layers, assets,
-adversaries, residual stories, and criticality calibration) and
-[`contracts/THREAT_MODEL_SCANNER.md`](contracts/THREAT_MODEL_SCANNER.md)
-(dense four-section skeleton for PR / cloud security agents). Report
-vulnerabilities per [`SECURITY.md`](../SECURITY.md) — privately, via GitHub
-Security Advisories.
+adversaries, residual stories, and criticality calibration), with
+[`contracts/THREAT_MODEL_SCANNER.md`](contracts/THREAT_MODEL_SCANNER.md) as its
+dense four-section skeleton for PR / cloud security agents.
+[`SECURITY_PLAN.md`](archive/SECURITY_PLAN.md) is the findings ledger from the
+v0.2 hardening pass (SEC-001…SEC-022, with their fixes) — archived as a
+point-in-time record, not current guidance. Report vulnerabilities per
+[`SECURITY.md`](../SECURITY.md) — privately, via GitHub Security Advisories.
 
 This page is the orientation layer: what the local-first boundary actually
 means in code. For the full multi-layer threat model (same-uid FS vs socket vs
