@@ -31,15 +31,29 @@ Contract (mirrors afm_passes.inbox_ingest):
 
 * Idempotent via ``derived_from`` ``(inbox_file, candidate_index)`` keys —
   re-runs are no-ops even after candidates resolve. Never deletes files.
-* ``derived_from.source`` is ``'inbox'`` ON PURPOSE: that is what
-  ``inbox_archive`` keys on, so a compact_summary file whose candidates all
-  reach a terminal state is archived by the existing lifecycle pass with no
-  new code. ``derived_from.channel`` distinguishes this pass's rows.
+* ``derived_from.source`` is ``'inbox'`` ON PURPOSE: it makes the row
+  recognizable to ``inbox_archive._derived_inbox_file`` (a shared naming
+  contract), though the resolve-time drain lifecycle in that module does NOT
+  actually archive these files itself — it only understands the
+  stop-candidate file shape. ``derived_from.channel`` distinguishes this
+  pass's rows from that channel's.
 * A file whose declared ``agent_id`` mismatches the vault-derived principal is
   skipped (counted) — same provenance rule as ingest.
-* A file that yields NO shared candidate has no candidate rows to key
-  idempotency on, so it is archived immediately (never deleted) once its
-  session note is written; otherwise it would be rescanned every tick forever.
+* A file is archived immediately (never deleted) by THIS pass, once its
+  candidate rows are durably inserted (or, for the zero-shared case, once its
+  session note is written) — idempotency lives entirely on the candidate
+  rows' ``derived_from`` keys, so the file itself is never read again
+  regardless of outcome. A file whose candidates were already inserted by a
+  prior run (the file-level idempotency short-circuit below) but never got
+  archived — e.g. one processed before this archive-on-insert behavior
+  shipped — is swept the same way on its next scan.
+  Without this, files that DO yield shared candidates would sit in the inbox
+  forever: their idempotency key already prevents reprocessing, so they are
+  rescanned-and-skipped on every tick and inflate pending-inbox counts (see
+  the compact-inbox-archive-gap fix) with no lifecycle event ever draining
+  them, since consolidation auto-accepts these candidates without going
+  through the resolve-time drain-on-resolution path that only understands the
+  stop-candidate file shape.
 * Candidate content passes a local path/secret scrub BEFORE insert: summaries
   quote session content verbatim, and the deterministic fallback would
   otherwise carry raw machine-local paths into the proposal queue.
@@ -304,6 +318,8 @@ def distill(db, config, inboxes: Optional[List[Path]] = None,
     personal_sections = 0
     notes_written = 0
     archived_zero_shared = 0
+    archived_with_shared = 0
+    to_archive_with_shared: List[Path] = []
 
     for inbox in inboxes:
         principal = _principal_for_inbox(inbox, fallback_principal)
@@ -329,6 +345,14 @@ def distill(db, config, inboxes: Optional[List[Path]] = None,
             # different AFM availability must not append a second variant set.
             if (path.name, 0) in existing:
                 already += 1
+                # Legacy sweep: a file processed by a pre-fix daemon build has
+                # its candidate rows sitting in the DB already but was never
+                # archived (this pass's own historical bug). Its content is
+                # fully captured by those rows regardless of their resolution
+                # status, so it is safe — and necessary — to archive it here
+                # too, or it would keep being rescanned-and-skipped forever.
+                if not dry_run and archive_inbox_file(path):
+                    archived_with_shared += 1
                 continue
             candidates, personal = _distill_file(doc, afm_chain)
             afm_sections += sum(1 for _, used in candidates if used)
@@ -348,6 +372,13 @@ def distill(db, config, inboxes: Optional[List[Path]] = None,
                 if not dry_run and archive_inbox_file(path):
                     archived_zero_shared += 1
                 continue
+            # This file's content now lives entirely in inserted candidate rows
+            # (plus the session note above) — idempotency is keyed on those
+            # rows' derived_from, not on the file, so it can be archived as
+            # soon as they are durably inserted. Deferred until after the
+            # insert transaction below succeeds (never archive-before-insert).
+            if not dry_run:
+                to_archive_with_shared.append(path)
             raw_privacy = doc.get("privacy_level", "safe")
             privacy = str(raw_privacy).strip() if raw_privacy and str(raw_privacy).strip() else "safe"
             workspace = doc.get("workspace_id") or "default"
@@ -405,6 +436,14 @@ def distill(db, config, inboxes: Optional[List[Path]] = None,
                 )
                 inserted += 1
 
+    # Archive only after the insert transaction above has committed — the
+    # rows are the durable record now, so a crash between insert and archive
+    # just leaves the file to be (harmlessly, idempotently) re-skipped next
+    # tick, never lost.
+    for path in to_archive_with_shared:
+        if archive_inbox_file(path):
+            archived_with_shared += 1
+
     return {
         "inboxes": [str(p) for p in inboxes],
         "files_scanned": scanned_files,
@@ -417,6 +456,7 @@ def distill(db, config, inboxes: Optional[List[Path]] = None,
         "personal_sections": personal_sections,
         "vault_notes_written": notes_written,
         "archived_zero_shared": archived_zero_shared,
+        "archived_with_shared": archived_with_shared,
         "skipped": skipped,
         "dry_run": dry_run,
     }

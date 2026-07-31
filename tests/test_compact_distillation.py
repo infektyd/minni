@@ -172,9 +172,13 @@ def test_idempotent_across_runs(tmp_path, monkeypatch):
     second = distill(db_obj, cfg, inboxes=[inbox], dry_run=False)
     assert first["inserted"] == 2
     assert first["vault_notes_written"] == 1
+    assert first["archived_with_shared"] == 1
     assert second["inserted"] == 0
     assert second["vault_notes_written"] == 0
-    assert second["files_already_done"] == 1
+    # The file was archived once its candidates were inserted, so the second
+    # run finds nothing to scan at all (not a same-file "already done" skip).
+    assert second["files_scanned"] == 0
+    assert second["files_already_done"] == 0
     assert len(_proposed_rows(db_obj)) == 2
     assert len(_session_notes(tmp_path)) == 1
 
@@ -264,13 +268,16 @@ def test_unsectioned_summary_upgraded_to_shared_when_afm_distills(tmp_path, monk
     assert res["inserted"] == 1
     assert res["personal_sections"] == 0
     assert res["archived_zero_shared"] == 0
+    assert res["archived_with_shared"] == 1
     (row,) = _proposed_rows(db_obj)
     assert row["content"] == (
         "Migration findings: Run the schema migration before restarting the daemon"
     )
     assert json.loads(row["derived_from"])["audience"] == "shared"
-    # Candidates exist, so the existing resolve-time lifecycle owns the file.
-    assert (inbox / "flat.json").is_file()
+    # Candidate rows now carry the idempotency key, so the file is archived
+    # immediately rather than waiting on the resolve-time drain lifecycle.
+    assert not (inbox / "flat.json").exists()
+    assert (inbox / ".archive" / "flat.json").is_file()
 
 
 def test_afm_path_uses_session_distill_with_fallback(tmp_path, monkeypatch):
@@ -403,3 +410,84 @@ def test_zero_shared_file_is_archived_not_deleted(tmp_path, monkeypatch):
     assert second["files_scanned"] == 0
     assert second["vault_notes_written"] == 0
     assert second["archived_zero_shared"] == 0
+
+
+def test_file_with_shared_candidates_is_archived_after_insert(tmp_path, monkeypatch):
+    """The gap this fix closes: a file that DOES yield shared candidates must
+    be archived once those candidates are durably inserted, exactly like the
+    zero-shared path — otherwise it sits in the inbox forever, re-scanned and
+    skipped every tick by the (path.name, 0) idempotency key with no lifecycle
+    event ever draining it (consolidation auto-accepts these candidates
+    without going through the resolve-time drain-on-resolution path)."""
+    from minni.afm_passes.compact_distillation import distill
+    import minni.afm_passes.compact_distillation as mod
+
+    monkeypatch.setattr(mod, "resolve_afm_mode", lambda: "off")
+    db_obj, cfg = _make_db(tmp_path)
+    inbox = tmp_path / "codex-vault" / "inbox"
+    _write_inbox_file(inbox, "shared.json", _summary_doc())
+
+    res = distill(db_obj, cfg, inboxes=[inbox], dry_run=False)
+    assert res["inserted"] == 2
+    assert res["shared_candidates"] == 2
+    assert res["archived_zero_shared"] == 0
+    assert res["archived_with_shared"] == 1
+    assert not (inbox / "shared.json").exists()
+    assert (inbox / ".archive" / "shared.json").is_file()
+
+    # Candidate rows persist across the archive; idempotency stays keyed on
+    # them, not on file presence — a re-run inserts nothing new and finds
+    # nothing left to scan.
+    second = distill(db_obj, cfg, inboxes=[inbox], dry_run=False)
+    assert second["files_scanned"] == 0
+    assert second["inserted"] == 0
+    assert second["archived_with_shared"] == 0
+    assert len(_proposed_rows(db_obj)) == 2
+
+
+def test_legacy_stuck_file_is_swept_on_next_tick(tmp_path, monkeypatch):
+    """Regression coverage for the live gap: a file processed by a pre-fix
+    daemon build already has its candidate_index=0 row in the DB (so it hits
+    the file-level idempotency branch, not the fresh insert-then-archive
+    path) but was never archived. The very next tick after this fix ships
+    must sweep it — this is how the two already-stuck live inbox files drain
+    without any hand-edit to the vault."""
+    from minni.afm_passes.compact_distillation import distill
+    import minni.afm_passes.compact_distillation as mod
+
+    monkeypatch.setattr(mod, "resolve_afm_mode", lambda: "off")
+    db_obj, cfg = _make_db(tmp_path)
+    inbox = tmp_path / "codex-vault" / "inbox"
+    _write_inbox_file(inbox, "stuck.json", _summary_doc())
+
+    # Simulate the pre-fix daemon: candidates land, file is never archived.
+    first = distill(db_obj, cfg, inboxes=[inbox], dry_run=False)
+    assert first["inserted"] == 2
+    # Undo this fix's own archival to reproduce the pre-fix stuck state.
+    (inbox / ".archive" / "stuck.json").rename(inbox / "stuck.json")
+    assert (inbox / "stuck.json").is_file()
+
+    swept = distill(db_obj, cfg, inboxes=[inbox], dry_run=False)
+    assert swept["files_already_done"] == 1
+    assert swept["inserted"] == 0
+    assert swept["archived_with_shared"] == 1
+    assert not (inbox / "stuck.json").exists()
+    assert (inbox / ".archive" / "stuck.json").is_file()
+    # No duplicate rows were ever inserted.
+    assert len(_proposed_rows(db_obj)) == 2
+
+
+def test_dry_run_does_not_archive_file_with_shared_candidates(tmp_path, monkeypatch):
+    from minni.afm_passes.compact_distillation import distill
+    import minni.afm_passes.compact_distillation as mod
+
+    monkeypatch.setattr(mod, "resolve_afm_mode", lambda: "off")
+    db_obj, cfg = _make_db(tmp_path)
+    inbox = tmp_path / "codex-vault" / "inbox"
+    _write_inbox_file(inbox, "shared.json", _summary_doc())
+
+    res = distill(db_obj, cfg, inboxes=[inbox], dry_run=True)
+    assert res["would_insert"] == 2
+    assert res["archived_with_shared"] == 0
+    assert (inbox / "shared.json").is_file()
+    assert not (inbox / ".archive").exists()
