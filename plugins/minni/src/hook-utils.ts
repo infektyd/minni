@@ -24,6 +24,10 @@ export const VALID_EVENTS: ReadonlyArray<EnvelopeEvent> = [
   "SessionStart",
   "UserPromptSubmit",
   "PreCompact",
+  // Post-compaction summary delivery from platforms whose bridge reads the
+  // summary back itself (Kilo SDK read-back). Claude Code never sends this —
+  // its hook extracts from the transcript at SessionStart instead.
+  "CompactSummary",
   "Stop",
 ];
 

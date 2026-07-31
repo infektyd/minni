@@ -32,6 +32,7 @@ import {
   workspaceFromPayload,
 } from "./hook-utils.js";
 import type { HookOutput } from "./hook-utils.js";
+import { harvestSummaryText } from "./compact-harvest.js";
 import { injectIntent, noIntent, noteIntent } from "./hook-intent.js";
 import type { HookIntent } from "./hook-intent.js";
 import { renderIntent, wireFor } from "./hook-platform.js";
@@ -372,6 +373,7 @@ export interface AgentHookHandlers {
   handleUserPromptSubmit(payload: Record<string, unknown>): Promise<HookOutput>;
   handlePreToolUse(payload: Record<string, unknown>): Promise<PreToolUseDecisionOutput>;
   handlePreCompact(payload: Record<string, unknown>): Promise<HookOutput>;
+  handleCompactSummary(payload: Record<string, unknown>): Promise<HookOutput>;
   handleStop(payload: Record<string, unknown>): Promise<HookOutput>;
   dispatch(
     event: string,
@@ -873,6 +875,32 @@ export function createHookHandlers(
     return render(injectIntent("PreCompact", envelope));
   }
 
+  // Post-compaction summary delivery (plan-3e5a410b9ab6f715). Platforms whose
+  // bridge can read the finished summary back (Kilo: session.compacted event +
+  // SDK read-back in the native plugin) deliver it here; the hook stores the
+  // RAW text as a compact_summary inbox file and the daemon's AFM-loop
+  // compact_distillation pass reviews/organizes it into governance-gated
+  // candidates. Injects nothing — there is no model turn to inject into.
+  async function handleCompactSummary(payload: Record<string, unknown>): Promise<HookOutput> {
+    await ensureVault(config.vaultPath);
+    const sessionId = asString(payload.session_id) || asString(payload.sessionId) || "session";
+    await harvestSummaryText(
+      {
+        vaultPath: config.vaultPath,
+        workspaceId: workspaceFor(payload),
+        auditPrefix: config.auditPrefix,
+        platform: config.agentId,
+      },
+      {
+        summaryText: asString(payload.summary_text),
+        summaryId: asString(payload.summary_id),
+        sessionId,
+        timestamp: asString(payload.summary_timestamp) || undefined,
+      },
+    );
+    return { continue: true };
+  }
+
   // Stop lives in the shared handleStopCore (above) so the governance posture
   // has exactly one implementation across all five entrypoints — see its
   // doc comment for why hook.ts routes here too.
@@ -897,6 +925,8 @@ export function createHookHandlers(
         return handlePreToolUse(payload);
       case "PreCompact":
         return handlePreCompact(payload);
+      case "CompactSummary":
+        return handleCompactSummary(payload);
       case "Stop":
         return handleStop(payload);
       default:
@@ -908,6 +938,7 @@ export function createHookHandlers(
     handleSessionStart,
     handleUserPromptSubmit,
     handlePreCompact,
+    handleCompactSummary,
     handleStop,
     handlePreToolUse,
     dispatch,

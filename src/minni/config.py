@@ -213,6 +213,14 @@ class SovereignConfig:
                 # DEFAULT_RESIDUE_TTL_DAYS convention/default (14 days);
                 # operator-tunable, not hardcoded downstream.
                 "inbox_quarantine_ttl_days": 14.0,
+                # Distill harvested raw compaction summaries (<vault>/inbox
+                # kind 'compact_summary', written by the platform hooks'
+                # compact harvest) into proposed candidates on the same tick.
+                # AFM session_distill per section when available; deterministic
+                # section flatten otherwise. Idempotent; never deletes — the
+                # inbox_archive lifecycle reclaims files once their candidates
+                # all resolve.
+                "distill_compact_summaries": True,
             },
         },
     })

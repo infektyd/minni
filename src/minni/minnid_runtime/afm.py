@@ -578,6 +578,41 @@ async def afm_loop_runner(context: AFMContext):
                                     "AFM loop: inbox quarantine raised (skipped; "
                                     "consolidation continues)"
                                 )
+                    # Distill harvested raw compaction summaries (inbox kind
+                    # 'compact_summary', written by the platform hooks'
+                    # compact harvest) into proposed candidates on the same
+                    # tick, so they are triaged alongside the stop-candidate
+                    # channel. AFM session_distill per section when available,
+                    # deterministic section flatten otherwise. Failure here
+                    # must NOT block consolidation of the existing queue.
+                    if (cfg or {}).get("distill_compact_summaries", True):
+                        try:
+                            from minni.afm_passes.compact_distillation import (
+                                distill as _distill_compact,
+                            )
+                            _dc = _distill_compact(
+                                context.lazy_writeback().db,
+                                context.default_config,
+                                fallback_principal=str((cfg or {}).get(
+                                    "inbox_fallback_principal", "unknown")),
+                                dry_run=False,
+                            )
+                            if _dc.get("inserted"):
+                                context.logger.info(
+                                    "AFM loop: compact distillation -> %d new "
+                                    "candidate(s) (files=%d already_done=%d "
+                                    "afm_mode=%s afm_sections=%d)",
+                                    _dc["inserted"],
+                                    _dc["files_scanned"],
+                                    _dc["files_already_done"],
+                                    _dc["afm_mode"],
+                                    _dc["afm_sections"],
+                                )
+                        except Exception:
+                            context.logger.exception(
+                                "AFM loop: compact distillation raised "
+                                "(skipped; consolidation continues)"
+                            )
                     max_batches = int((cfg or {}).get("max_batches_per_tick", 40))
                     batches = total_examined = 0
                     last_summ = None

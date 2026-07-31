@@ -22,7 +22,9 @@ import {
   emit,
   readStdin,
   VALID_EVENTS,
+  workspaceFromPayload,
 } from "./hook-utils.js";
+import { harvestCompactSummary } from "./compact-harvest.js";
 import { claudeCodeWire } from "./hook-platform.js";
 import type { HookOutput } from "./hook-utils.js";
 import { handleStopCore } from "./hook-handlers.js";
@@ -84,6 +86,30 @@ async function handleSessionStart(payload: Record<string, unknown>): Promise<Hoo
   const rawSessionId = asString(payload.session_id) || asString(payload.sessionId);
   const sessionId = rawSessionId || "session";
   await ensureVault(CLAUDECODE_VAULT_PATH);
+  // Compaction-summary harvest (plan-3e5a410b9ab6f715): the summary Claude
+  // Code writes at /compact is the session's best outcome document — PreCompact
+  // fires before it exists, so the POST-compaction boot is the harvest point.
+  // "resume" is included deliberately: a summary not yet flushed when
+  // SessionStart(source=compact) fired self-heals on the next boot, and the
+  // uuid dedup in the harvest state prevents doubles. The hook stores the RAW
+  // summary only, fail-open — no AFM call may block a session boot; the
+  // AFM-loop timer's compact_distillation pass reviews and organizes it
+  // daemon-side into governance-gated candidates.
+  const bootSource = asString(payload.source);
+  if (bootSource === "compact" || bootSource === "resume") {
+    await harvestCompactSummary(
+      {
+        vaultPath: CLAUDECODE_VAULT_PATH,
+        workspaceId: workspaceFromPayload(payload, CLAUDECODE_WORKSPACE_ID),
+        auditPrefix: "hook",
+        platform: "claude-code",
+      },
+      {
+        transcriptPath: asString(payload.transcript_path) || asString(payload.transcriptPath),
+        sessionId,
+      },
+    );
+  }
   // c4: reset the once-per-session lifecycle emphasis on a fresh session, so the
   // situational focus can fire again this session.
   await writeLifecycleState(CLAUDECODE_VAULT_PATH, {
