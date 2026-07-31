@@ -45,6 +45,16 @@
     older daemon builds and the window before startup safe. If you already
     have a live plist WITHOUT this key, add it and do a full
     bootout + bootstrap (kickstart alone does not re-read the plist).
+
+    MINNI_AFM_PROVIDER_MODE / MINNI_AFM_NATIVE_HELPER: the daemon runs native
+    Apple Foundation Models by default here, mirroring the pair `minni wire`
+    writes into installer-managed MCP env blocks (`native_afm_env()` in
+    plugins/minni/skills/minni-install/scripts/propagate.py). Hook/MCP/shell
+    processes started outside this plist or an installer-written env block
+    never see MINNI_AFM_PROVIDER_MODE and fall through to the "bridge"
+    default; they defer to the daemon's own AFM verdict in that case (#200).
+    Drop both keys (or set MINNI_AFM_PROVIDER_MODE to "bridge"/"auto"/"off")
+    to change the daemon's own provider behavior.
 -->
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -71,6 +81,10 @@
         <string>minni</string>
         <key>MINNI_VAULT_PATH</key>
         <string>/Users/REPLACE_WITH_YOUR_USERNAME/.minni/vault</string>
+        <key>MINNI_AFM_PROVIDER_MODE</key>
+        <string>native</string>
+        <key>MINNI_AFM_NATIVE_HELPER</key>
+        <string>/path/to/repo/src/minni/native_afm_helper</string>
     </dict>
 
     <key>RunAtLoad</key>

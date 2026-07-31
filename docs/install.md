@@ -91,6 +91,17 @@ For a login-persistent daemon on macOS, a launchd template ships at
 `launchctl kickstart -k gui/$UID/com.minni.minnid`, stop with
 `launchctl bootout gui/$UID/com.minni.minnid`).
 
+The daemon raises its own file-descriptor soft limit at startup
+(`_raise_fd_ceiling` in `src/minni/minnid.py`), but launchd's default soft
+limit (256) is low enough to starve the window before that runs, so the
+plist template also sets `SoftResourceLimits`/`NumberOfFiles`. If you have a
+live plist without that key, add it and reload with a full
+`launchctl bootout` + `bootstrap` — `kickstart` alone does not re-read plist
+changes. See the comments in
+`src/minni/launchd/com.minni.minnid.plist.example` for details, and
+[TROUBLESHOOTING.md](TROUBLESHOOTING.md#daemon-hits-the-file-descriptor-ceiling-under-sustained-load)
+if you're chasing `EMFILE`/`EPIPE` symptoms.
+
 Logging knobs: `MINNI_LOG_LEVEL` (`DEBUG`/`INFO`/…) and `MINNI_LOG_FORMAT`
 (`text` default, `json` for structured output).
 

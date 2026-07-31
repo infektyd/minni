@@ -71,7 +71,7 @@ problem and proposed approach first. That surface spans both languages:
   Touching what reaches a model or bypasses a privacy gate is firewall
   territory even though it lives in TypeScript.
 
-This surface is covered by `SECURITY_PLAN.md` and has correctness/security
+This surface is covered by `docs/archive/SECURITY_PLAN.md` and has correctness/security
 properties that are easy to break silently; a PR that changes this behavior
 without prior discussion is likely to be asked to start over as an issue.
 

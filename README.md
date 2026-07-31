@@ -172,7 +172,7 @@ What "works" is not asserted, it is *executed in public*: CI stands the daemon u
 | Install & troubleshooting (incl. Docker eval image) | [docs/install.md](docs/install.md) |
 | Per-runtime setup | [docs/runtimes/](docs/runtimes/) |
 | Architecture — components, data model, MCP tools | [docs/architecture.md](docs/architecture.md) |
-| Security model | [docs/security.md](docs/security.md) · [SECURITY_PLAN.md](SECURITY_PLAN.md) |
+| Security model | [docs/security.md](docs/security.md) · [SECURITY_PLAN.md](docs/archive/SECURITY_PLAN.md) |
 | Contracts (agent, capabilities, vault, workflows, threat model) | [docs/contracts/](docs/contracts/) |
 | Contributing & development workflow | [CONTRIBUTING.md](CONTRIBUTING.md) |
 | Changelog | [CHANGELOG.md](CHANGELOG.md) |

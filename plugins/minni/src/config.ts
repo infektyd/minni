@@ -273,12 +273,15 @@ export const AFM_PROVIDER_MODE =
  * Whether the AFM provider mode of THIS process was actually chosen by the
  * operator, as opposed to falling through to the "bridge" default (#195).
  *
- * The daemon carries MINNI_AFM_PROVIDER_MODE in its launchd plist; hook, MCP
- * and shell processes spawn from the host platform's env and never inherit it,
- * so their "bridge" is a default, not a decision. Callers that compare their
- * own mode against the daemon's use this to tell the two apart. Read at call
- * time (like generationProbeTimeoutMs) so it stays testable and follows a
- * mid-process env change; an unrecognized value is not a decision either.
+ * The daemon carries MINNI_AFM_PROVIDER_MODE in its launchd plist, and
+ * native_afm_env() in
+ * plugins/minni/skills/minni-install/scripts/propagate.py injects the same
+ * variable into installer-written MCP env blocks; a hook, MCP, or shell
+ * process with neither source falls through to "bridge" as a default, not a
+ * decision. Callers that compare their own mode against the daemon's use
+ * this to tell the two apart. Read at call time (like
+ * generationProbeTimeoutMs) so it stays testable and follows a mid-process
+ * env change; an unrecognized value is not a decision either.
  */
 export function afmProviderModeConfigured(): boolean {
   const raw = process.env.MINNI_AFM_PROVIDER_MODE ?? process.env.MINNI_AFM_MODE;

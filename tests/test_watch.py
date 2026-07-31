@@ -1,5 +1,5 @@
 """Tests for `minni.watch` — the stdlib-only, read-only audit/episodic tailer
-that backs `minni watch` (PACKAGING_PLAN.md §3: no engine imports, offset/URI
+that backs `minni watch` (docs/archive/PACKAGING_PLAN.md §3: no engine imports, offset/URI
 read-only access only).
 
 Covers:

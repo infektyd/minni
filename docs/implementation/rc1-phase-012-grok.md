@@ -2,7 +2,7 @@
 
 **Worktree:** `~/Projects/sovereignMemory/grok/worktrees/rc1-phase-012` (branch `rc1-phase-012`)
 **Date:** 2026-05-19
-**Source of truth:** `docs/RC_PLAN.md` (full read), `SECURITY_PLAN.md`, `docs/contracts/AGENT.md`, `grok/package/PHASE_012_IMPLEMENT_PROMPT.md`
+**Source of truth:** `docs/RC_PLAN.md` (full read), `docs/archive/SECURITY_PLAN.md`, `docs/contracts/AGENT.md`, `grok/package/PHASE_012_IMPLEMENT_PROMPT.md`
 
 All changes isolated to this worktree. Never edited main tree.
 

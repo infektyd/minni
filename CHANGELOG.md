@@ -177,7 +177,7 @@ commit.
   per-runtime adapters for Claude Code, Codex, Gemini/Antigravity, and
   KiloCode, plus lifecycle hooks and skills; OpenClaw bridge under
   `openclaw-extension/`.
-- **Security hardening** per `SECURITY_PLAN.md` (SEC-001…SEC-022), including
+- **Security hardening** per `docs/archive/SECURITY_PLAN.md` (SEC-001…SEC-022), including
   socket permissions, path safety, injection detection/perturbation for
   instruction-like content, and redacted health reporting.
 - **membench** (`bench/`): deterministic, offline benchmark harness with a
