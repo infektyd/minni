@@ -610,7 +610,7 @@ async def afm_loop_runner(context: AFMContext):
                                     _dc["afm_sections"],
                                     _dc["personal_sections"],
                                     _dc["vault_notes_written"],
-                                    _dc["archived_zero_shared"],
+                                    _dc["archived_zero_shared"] + _dc["archived_with_shared"],
                                 )
                         except Exception:
                             context.logger.exception(
