@@ -160,6 +160,12 @@ Thumbs.db
 /notes.*
 /TODO.*
 /scratch.*
+# Agent handoff/session scratch that has landed on main repeatedly (leak
+# remediation, fix/operator-path-guard): these are per-run agent state, not
+# durable repo content.
+/workflow-state.md
+/next-agent-prompt.md
+/artifacts/
 # Secrets — .env / .env.* / !.env.example are already covered above (lines 110-112).
 # Extend the allowlist with the additional tracked templates we use:
 !.env.sample

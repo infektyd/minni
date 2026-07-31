@@ -112,3 +112,61 @@ jobs:
           fi
 
           echo "✓ No forbidden files in PR diff."
+
+      - name: Scan PR added lines for forbidden content pattern
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          # Set out-of-band as a repo VARIABLE (not a secret, not literal text
+          # in this file) so the operator's home-path regex never appears in
+          # this public workflow source. Unset on forks/CI without the var —
+          # the step must skip, not hard-fail, so external contributors are
+          # unaffected.
+          FORBIDDEN_CONTENT_PATTERN: ${{ vars.FORBIDDEN_CONTENT_PATTERN }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${FORBIDDEN_CONTENT_PATTERN:-}" ]; then
+            echo "::notice::FORBIDDEN_CONTENT_PATTERN repo variable is not set — skipping content gate."
+            exit 0
+          fi
+
+          MERGE_BASE=$(git merge-base "$BASE_SHA" "$HEAD_SHA")
+
+          # Walk the unified, zero-context diff ourselves (rather than
+          # `grep -n` on `git diff`) so we can report only `file:line` on a
+          # hit. This is a PUBLIC repo with PUBLIC Actions logs: the matching
+          # line content, and the pattern itself, must never be printed.
+          HITS=""
+          current_file=""
+          current_line=""
+          while IFS= read -r diff_line; do
+            case "$diff_line" in
+              "+++ "*)
+                current_file="${diff_line#+++ b/}"
+                ;;
+              "@@ "*)
+                # Hunk header: "@@ -a,b +c,d @@ ...". c is the first new-file
+                # line number; strip down to it to track line numbers as we
+                # walk subsequent "+" lines.
+                new_range="${diff_line#*+}"
+                new_range="${new_range%% *}"
+                current_line="${new_range%%,*}"
+                ;;
+              "+"*)
+                if printf '%s' "${diff_line#+}" | grep -E -q "$FORBIDDEN_CONTENT_PATTERN"; then
+                  HITS="${HITS}  ${current_file}:${current_line}"$'\n'
+                fi
+                current_line=$((current_line + 1))
+                ;;
+            esac
+          done < <(git diff -U0 "$MERGE_BASE" "$HEAD_SHA")
+
+          if [ -n "$HITS" ]; then
+            echo "::error::PR hygiene content gate failed — forbidden pattern matched added lines."
+            echo "Matches (file:line only — matching content is withheld from public logs):"
+            printf '%s' "$HITS"
+            exit 1
+          fi
+
+          echo "✓ No forbidden content pattern in added lines."

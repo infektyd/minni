@@ -41,7 +41,7 @@ function normalizeWorkspaceId(value: string | undefined): string {
  *
  * A bare `path.basename(process.cwd())` is not safe on its own. Hooks and MCP
  * servers are frequently launched with cwd set to the home directory or to a
- * plugin cache, which stamps meaningless ids like `workspace-hansaxelsson` or
+ * plugin cache, which stamps meaningless ids like `workspace-operator` or
  * `workspace-0.3.0` onto every row written for that session. Once written they
  * are indistinguishable from real project scopes.
  *

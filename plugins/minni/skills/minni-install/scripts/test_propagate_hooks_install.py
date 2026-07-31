@@ -104,7 +104,7 @@ def test_cursor_hooks_install_wrapper_only(tmp_path, monkeypatch):
     assert wrapper.is_file()
     assert wrapper.stat().st_mode & 0o111, "wrapper must be executable"
     body = wrapper.read_text()
-    assert "workspace-hansaxelsson" in body
+    assert "workspace-unknown" in body
     assert "plugins/local/minni/dist/cursor-hook.js" in body
 
     raw = (tmp_path / ".cursor/hooks.json").read_text()

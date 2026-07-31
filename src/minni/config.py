@@ -467,7 +467,7 @@ def resolve_canonical_path(kind: str) -> str:
 
 # --- Workspace ID normalization (G14) ----------------------------------------
 # Canonical convention: 'workspace-<lowercased basename of workspace path>'
-# Examples: /Users/hansaxelsson/Projects/Minni -> 'workspace-minni'
+# Examples: ~/Projects/Minni -> 'workspace-minni'
 #          /path/to/PROJECT -> 'workspace-project'
 #          'workspace-minni' -> 'workspace-minni' (idempotent)
 #          empty/None -> '' (passthrough)

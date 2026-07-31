@@ -7,11 +7,11 @@ Last verified: 2026-05-31.
 Install **Minni** into Codex as a new plugin, not as a `sovereign-memory`
 rename-in-place. The source of truth is:
 
-- Repo source: `/Users/hansaxelsson/Projects/Minni/plugins/minni`
-- Codex cache: `/Users/hansaxelsson/.codex/plugins/cache/minni/minni/0.1.0`
+- Repo source: `~/Projects/Minni/plugins/minni`
+- Codex cache: `~/.codex/plugins/cache/minni/minni/0.1.0`
 - Agent id: `codex`
-- Vault: `/Users/hansaxelsson/.minni/codex-vault`
-- Socket: `/Users/hansaxelsson/.minni/run/minnid.sock`
+- Vault: `~/.minni/codex-vault`
+- Socket: `~/.minni/run/minnid.sock`
 
 ## Codex Platform State
 
@@ -97,7 +97,7 @@ If `minni read codex` fails with:
 identity_mismatch: supplied agent_id 'codex' does not match server-stamped EffectivePrincipal 'main'
 ```
 
-check `/Users/hansaxelsson/.minni/principals/local.json`. On 2026-05-31 it
+check `~/.minni/principals/local.json`. On 2026-05-31 it
 already had:
 
 ```json
@@ -123,7 +123,7 @@ python3 plugins/minni/skills/minni-install/scripts/propagate.py \
   seed-hosted --agent codex --workspace .
 ```
 
-Also check `/Users/hansaxelsson/.minni/identities/codex/CODEX_LAYER1_SHELF.md`.
+Also check `~/.minni/identities/codex/CODEX_LAYER1_SHELF.md`.
 It previously pointed future agents at the old
 `~/.codex/plugins/cache/sovereign-memory/.../cli.js` path. Update shelf commands
 to `~/.codex/plugins/cache/minni/minni/0.1.0/dist/cli.js` and reindex the
@@ -137,13 +137,13 @@ accident. After Minni verifies GO, quarantine it under the install backup:
 ```bash
 mv ~/.codex/plugins/cache/sovereign-memory \
   ~/.codex/plugin-install-backups/<run>/sovereign-memory-cache.quarantined-active-copy
-pkill -f '/Users/hansaxelsson/.codex/plugins/cache/sovereign-memory/sovereign-memory/0.1.0/dist/server.js'
+pkill -f '~/.codex/plugins/cache/sovereign-memory/sovereign-memory/0.1.0/dist/server.js'
 ```
 
 The 2026-05-31 run used:
 
 ```text
-/Users/hansaxelsson/.codex/plugin-install-backups/minni-20260531T230040Z
+~/.codex/plugin-install-backups/minni-20260531T230040Z
 ```
 
 ## Verification
