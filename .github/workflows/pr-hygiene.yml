@@ -117,11 +117,11 @@ jobs:
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          # Set out-of-band as a repo VARIABLE (not a secret, not literal text
-          # in this file) so the operator's home-path regex never appears in
-          # this public workflow source. Unset on forks/CI without the var —
-          # the step must skip, not hard-fail, so external contributors are
-          # unaffected.
+          # Set out-of-band as a repo SECRET (not literal text in this file,
+          # and not an Actions variable: the runner echoes env values into the
+          # public run log, and only secrets are auto-masked there). Unset on
+          # forks/CI without the secret — the step must skip, not hard-fail,
+          # so external contributors are unaffected.
           FORBIDDEN_CONTENT_PATTERN: ${{ secrets.FORBIDDEN_CONTENT_PATTERN }}
         run: |
           set -euo pipefail
