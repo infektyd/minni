@@ -31,16 +31,22 @@ Contract (mirrors afm_passes.inbox_ingest):
 
 * Idempotent via ``derived_from`` ``(inbox_file, candidate_index)`` keys —
   re-runs are no-ops even after candidates resolve. Never deletes files.
-* ``derived_from.source`` is ``'inbox'`` ON PURPOSE: that is what
-  ``inbox_archive`` keys on, so a compact_summary file whose candidates all
-  reach a terminal state is archived by the existing lifecycle pass with no
-  new code. ``derived_from.channel`` distinguishes this pass's rows.
+* ``derived_from.source`` is ``'inbox'`` ON PURPOSE: it makes the row
+  recognizable to ``inbox_archive._derived_inbox_file`` (a shared naming
+  contract), though the resolve-time drain lifecycle in that module does NOT
+  actually archive these files itself — it only understands the
+  stop-candidate file shape. ``derived_from.channel`` distinguishes this
+  pass's rows from that channel's.
 * A file whose declared ``agent_id`` mismatches the vault-derived principal is
   skipped (counted) — same provenance rule as ingest.
-* A file is archived immediately (never deleted), once its candidate rows are
-  durably inserted (or, for the zero-shared case, once its session note is
-  written) — idempotency lives entirely on the candidate rows' ``derived_from``
-  keys, so the file itself is never read again regardless of outcome.
+* A file is archived immediately (never deleted) by THIS pass, once its
+  candidate rows are durably inserted (or, for the zero-shared case, once its
+  session note is written) — idempotency lives entirely on the candidate
+  rows' ``derived_from`` keys, so the file itself is never read again
+  regardless of outcome. A file whose candidates were already inserted by a
+  prior run (the file-level idempotency short-circuit below) but never got
+  archived — e.g. one processed before this archive-on-insert behavior
+  shipped — is swept the same way on its next scan.
   Without this, files that DO yield shared candidates would sit in the inbox
   forever: their idempotency key already prevents reprocessing, so they are
   rescanned-and-skipped on every tick and inflate pending-inbox counts (see
@@ -339,6 +345,14 @@ def distill(db, config, inboxes: Optional[List[Path]] = None,
             # different AFM availability must not append a second variant set.
             if (path.name, 0) in existing:
                 already += 1
+                # Legacy sweep: a file processed by a pre-fix daemon build has
+                # its candidate rows sitting in the DB already but was never
+                # archived (this pass's own historical bug). Its content is
+                # fully captured by those rows regardless of their resolution
+                # status, so it is safe — and necessary — to archive it here
+                # too, or it would keep being rescanned-and-skipped forever.
+                if not dry_run and archive_inbox_file(path):
+                    archived_with_shared += 1
                 continue
             candidates, personal = _distill_file(doc, afm_chain)
             afm_sections += sum(1 for _, used in candidates if used)

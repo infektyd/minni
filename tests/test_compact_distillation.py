@@ -445,6 +445,38 @@ def test_file_with_shared_candidates_is_archived_after_insert(tmp_path, monkeypa
     assert len(_proposed_rows(db_obj)) == 2
 
 
+def test_legacy_stuck_file_is_swept_on_next_tick(tmp_path, monkeypatch):
+    """Regression coverage for the live gap: a file processed by a pre-fix
+    daemon build already has its candidate_index=0 row in the DB (so it hits
+    the file-level idempotency branch, not the fresh insert-then-archive
+    path) but was never archived. The very next tick after this fix ships
+    must sweep it — this is how the two already-stuck live inbox files drain
+    without any hand-edit to the vault."""
+    from minni.afm_passes.compact_distillation import distill
+    import minni.afm_passes.compact_distillation as mod
+
+    monkeypatch.setattr(mod, "resolve_afm_mode", lambda: "off")
+    db_obj, cfg = _make_db(tmp_path)
+    inbox = tmp_path / "codex-vault" / "inbox"
+    _write_inbox_file(inbox, "stuck.json", _summary_doc())
+
+    # Simulate the pre-fix daemon: candidates land, file is never archived.
+    first = distill(db_obj, cfg, inboxes=[inbox], dry_run=False)
+    assert first["inserted"] == 2
+    # Undo this fix's own archival to reproduce the pre-fix stuck state.
+    (inbox / ".archive" / "stuck.json").rename(inbox / "stuck.json")
+    assert (inbox / "stuck.json").is_file()
+
+    swept = distill(db_obj, cfg, inboxes=[inbox], dry_run=False)
+    assert swept["files_already_done"] == 1
+    assert swept["inserted"] == 0
+    assert swept["archived_with_shared"] == 1
+    assert not (inbox / "stuck.json").exists()
+    assert (inbox / ".archive" / "stuck.json").is_file()
+    # No duplicate rows were ever inserted.
+    assert len(_proposed_rows(db_obj)) == 2
+
+
 def test_dry_run_does_not_archive_file_with_shared_candidates(tmp_path, monkeypatch):
     from minni.afm_passes.compact_distillation import distill
     import minni.afm_passes.compact_distillation as mod
