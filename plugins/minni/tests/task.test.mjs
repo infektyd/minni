@@ -491,7 +491,7 @@ test("prepareOutcome rejects contentless summaries post-redaction (round 3, defe
   const contentless = {
     ok: "ok",
     singleLetter: "a",
-    pathOnly: "/Users/hansaxelsson/Projects/Minni/plugins/minni/src/x.ts",
+    pathOnly: "/Users/someuser/Projects/Minni/plugins/minni/src/x.ts",
   };
   for (const [name, summary] of Object.entries(contentless)) {
     const packet = await prepareOutcome({
@@ -613,7 +613,7 @@ test("prepareOutcome keeps unspaced CJK learnings (round 4, defect 2)", async ()
   for (const [name, summary] of Object.entries({
     ok: "ok",
     singleLetter: "a",
-    pathOnly: "/Users/hansaxelsson/Projects/Minni/plugins/minni/src/x.ts",
+    pathOnly: "/Users/someuser/Projects/Minni/plugins/minni/src/x.ts",
   })) {
     const packet = await prepareOutcome({
       task: "fix the bug",

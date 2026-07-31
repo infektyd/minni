@@ -93,7 +93,7 @@ Verify the live lineup any time with: `grok models`.
 The Grok Build CLI discovers the installed Minni plugin because this machine's
 `~/.claude/settings.json` registers it as a Claude-compat marketplace —
 `extraKnownMarketplaces: { minni: { source: { source: "directory", path:
-"/Users/hansaxelsson/Projects/Minni" } } }` with `enabledPlugins:
+"~/Projects/Minni" } } }` with `enabledPlugins:
 { "minni@minni": true }`. Grok reads `~/.claude/settings.json` for
 `extraKnownMarketplaces` and surfaces the plugin's SKILLS and COMMANDS (commands/,
 skills/, including `plan`) directly from that SOURCE directory. The MCP SERVER
@@ -106,7 +106,7 @@ vars (`MINNI_VAULT_PATH` = grok-build-vault, etc.). The source plugin's own
 So vault pinning is NOT automatic from the source plugin registration; it lives
 exclusively in the separately maintained `config.toml` override. `grok inspect
 --json` confirms the plugin loads from
-`/Users/hansaxelsson/Projects/Minni/plugins/minni` (scope user, enabled); its
+`~/Projects/Minni/plugins/minni` (scope user, enabled); its
 `provides` block reports `{ skills: 7, agents: 0, hooks: true, mcpServers: 1 }`
 (there is NO `commands` count field — commands from `commands/*.md` instead surface
 in the GLOBAL skills list, where `plan` appears among the minni-sourced items), and
@@ -350,7 +350,7 @@ trusting the builder's self-report.
 
 ### 3a. Builder vault artifact paths — [SRC]
 Grok Build's MCP server is env-pinned (`~/.grok/config.toml`,
-`MINNI_VAULT_PATH = /Users/hansaxelsson/.minni/grok-build-vault`). So
+`MINNI_VAULT_PATH = ~/.minni/grok-build-vault`). So
 `DEFAULT_VAULT_PATH` at runtime = `~/.minni/grok-build-vault`, and all plan
 artifacts land under:
 
@@ -518,7 +518,7 @@ skill adds discipline around it and invents nothing. — [SRC]
 
 ### 6a. File added (one file)
 ```
-/Users/hansaxelsson/Projects/Minni/plugins/minni/commands/handoff.md
+~/Projects/Minni/plugins/minni/commands/handoff.md
 ```
 This is the single source-of-truth file. It is plain markdown — command `.md`
 files are **copied as-is, not compiled** (they do not go through the TypeScript
@@ -527,14 +527,14 @@ build / `dist/`). No `plan.ts` / `server.ts` change; no new MCP tool.
 ### 6b. How it reaches each platform — [SRC: propagate.py]
 Propagation uses the existing `minni-install` script:
 ```
-/Users/hansaxelsson/Projects/Minni/plugins/minni/skills/minni-install/scripts/propagate.py
+~/Projects/Minni/plugins/minni/skills/minni-install/scripts/propagate.py
 ```
 The `update-plugin` subcommand "Build/copy the canonical plugin and stamp
 platform-specific agent/vault/socket config." It `copytree`s the whole plugin
 package (commands/ included, ignoring `node_modules`/`.git`) into each platform's
 install/cache location, preserving each surface's per-agent env.
 
-Run from `/Users/hansaxelsson/Projects/Minni`:
+Run from `~/Projects/Minni`:
 ```bash
 # 1. write the file (done in 6a)
 # 2. rebuild dist (server.js is currently ~2h stale vs repo — propagate it too)
@@ -548,14 +548,14 @@ python3 plugins/minni/skills/minni-install/scripts/propagate.py update-plugin --
 ### 6c. Where each platform reads `handoff.md`
 | Platform | command read from | propagation needed for the command? |
 |----------|-------------------|-------------------------------------|
-| Grok Build | the SOURCE repo: `/Users/hansaxelsson/Projects/Minni/plugins/minni/commands/handoff.md` (via `extraKnownMarketplaces` in `~/.claude/settings.json`) | NO — visible to grok the moment the file exists in the source repo |
-| Claude Code | `/Users/hansaxelsson/.claude/plugins/cache/minni/minni/0.1.0/commands/handoff.md` | yes |
-| Codex | `/Users/hansaxelsson/.codex/plugins/cache/minni/minni/0.1.0/commands/handoff.md` | yes |
-| Antigravity (gemini surface) | `/Users/hansaxelsson/.gemini/extensions/minni/commands/handoff.md` | yes |
+| Grok Build | the SOURCE repo: `~/Projects/Minni/plugins/minni/commands/handoff.md` (via `extraKnownMarketplaces` in `~/.claude/settings.json`) | NO — visible to grok the moment the file exists in the source repo |
+| Claude Code | `~/.claude/plugins/cache/minni/minni/0.1.0/commands/handoff.md` | yes |
+| Codex | `~/.codex/plugins/cache/minni/minni/0.1.0/commands/handoff.md` | yes |
+| Antigravity (gemini surface) | `~/.gemini/extensions/minni/commands/handoff.md` | yes |
 
 Note — [SRC]: For Grok Build, commands and skills are read from the SOURCE repo
 (`grok inspect --json` shows the plugin loading from
-`/Users/hansaxelsson/Projects/Minni/plugins/minni`, registered via the Claude-compat
+`~/Projects/Minni/plugins/minni`, registered via the Claude-compat
 marketplace entry in `~/.claude/settings.json`). So `/minni:handoff` is available to
 grok as soon as `handoff.md` exists in `plugins/minni/commands/` — BEFORE any
 propagation. Propagation to `~/.agents/plugins/Minni@Minni/commands/` does NOT make

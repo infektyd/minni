@@ -19,11 +19,11 @@ wired through the gate.
 
 ## Source documents read
 
-- Plan artifact: `/Users/hansaxelsson/.minni/claudecode-vault/wiki/artifacts/plan-fdf220b75b172595.md:23`
-- Ground-and-resolve gate: `/Users/hansaxelsson/.minni/claudecode-vault/wiki/artifacts/plan-fdf220b75b172595.md:39`
-- Design doc gate location/fail-loud model: `/Users/hansaxelsson/.minni/claudecode-vault/wiki/sessions/20260615-design-seed-2026-06-15-minni-provenance-gate-fail-loud-two-zone-router-at-dispatch-kills-the-fall-back-to-copy-claude-asymmetry.md:24`
-- Design doc authoritative binary split: `/Users/hansaxelsson/.minni/claudecode-vault/wiki/sessions/20260615-design-seed-2026-06-15-minni-provenance-gate-fail-loud-two-zone-router-at-dispatch-kills-the-fall-back-to-copy-claude-asymmetry.md:60`
-- Design doc measured scatter count: `/Users/hansaxelsson/.minni/claudecode-vault/wiki/sessions/20260615-design-seed-2026-06-15-minni-provenance-gate-fail-loud-two-zone-router-at-dispatch-kills-the-fall-back-to-copy-claude-asymmetry.md:107`
+- Plan artifact: `~/.minni/claudecode-vault/wiki/artifacts/plan-fdf220b75b172595.md:23`
+- Ground-and-resolve gate: `~/.minni/claudecode-vault/wiki/artifacts/plan-fdf220b75b172595.md:39`
+- Design doc gate location/fail-loud model: `~/.minni/claudecode-vault/wiki/sessions/20260615-design-seed-2026-06-15-minni-provenance-gate-fail-loud-two-zone-router-at-dispatch-kills-the-fall-back-to-copy-claude-asymmetry.md:24`
+- Design doc authoritative binary split: `~/.minni/claudecode-vault/wiki/sessions/20260615-design-seed-2026-06-15-minni-provenance-gate-fail-loud-two-zone-router-at-dispatch-kills-the-fall-back-to-copy-claude-asymmetry.md:60`
+- Design doc measured scatter count: `~/.minni/claudecode-vault/wiki/sessions/20260615-design-seed-2026-06-15-minni-provenance-gate-fail-loud-two-zone-router-at-dispatch-kills-the-fall-back-to-copy-claude-asymmetry.md:107`
 
 ## Seam completeness
 
@@ -265,7 +265,7 @@ Live daemon check:
 read(agent_id="codex") -> result.agent_id == "codex"
 ```
 
-Live resolver check with current `/Users/hansaxelsson/.minni/principals/local.json`:
+Live resolver check with current `~/.minni/principals/local.json`:
 
 ```text
 None -> main
@@ -357,9 +357,9 @@ ids resolve to their own id in current code.
 ```text
 git status --short --branch
 git switch -c feat/minni-provenance-gate main
-rg --files /Users/hansaxelsson/.minni/codex-vault /Users/hansaxelsson/.minni/claudecode-vault | rg 'plan-fdf220b75b172595|20260615-design-seed'
-nl -ba /Users/hansaxelsson/.minni/claudecode-vault/wiki/artifacts/plan-fdf220b75b172595.md
-nl -ba /Users/hansaxelsson/.minni/claudecode-vault/wiki/sessions/20260615-design-seed-2026-06-15-minni-provenance-gate-fail-loud-two-zone-router-at-dispatch-kills-the-fall-back-to-copy-claude-asymmetry.md
+rg --files ~/.minni/codex-vault ~/.minni/claudecode-vault | rg 'plan-fdf220b75b172595|20260615-design-seed'
+nl -ba ~/.minni/claudecode-vault/wiki/artifacts/plan-fdf220b75b172595.md
+nl -ba ~/.minni/claudecode-vault/wiki/sessions/20260615-design-seed-2026-06-15-minni-provenance-gate-fail-loud-two-zone-router-at-dispatch-kills-the-fall-back-to-copy-claude-asymmetry.md
 rg -n "resolve_effective_principal\\(" engine/*.py engine/afm_passes/*.py engine/tools/*.py
 rg -n "DEFAULT_AGENT_ID|DEFAULT_VAULT_PATH" plugins/minni/src/server.ts plugins/minni/src/config.ts plugins/minni/src/task.ts plugins/minni/src/agent_ping.ts plugins/minni/src/plan.ts plugins/minni/src/codex-hook.ts plugins/minni/src/hook-handlers.ts
 rg -n "platform_agent_ids|legacy_agent_ids|aliases|agent_scope_for|from_local_transport|_default_deny_principal|OPERATOR_RESERVED_AGENT_IDS|CANONICAL_PRINCIPAL_NAMES|lru_cache|cache_clear|SIGHUP|reload" engine/principal.py engine/minnid.py engine/test_principal_binding.py

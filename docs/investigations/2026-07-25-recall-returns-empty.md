@@ -121,7 +121,7 @@ regression risk and sample the inbox after the merge.
 ## 3. Hypothesis to kill first — workspace scoping
 
 **The hypothesis:** agents were launched from `~/`, so `workspaceFromPayload` stamped
-`workspace-hansaxelsson` while the corpus lives under `workspace-minni`, and recall
+`workspace-operator` while the corpus lives under `workspace-minni`, and recall
 found nothing because it was scoped to the wrong workspace.
 
 **Verdict: this explains Grok, and does not explain claudecode. Discard it as the
@@ -135,8 +135,8 @@ its workspace identity. The claudecode audit log contains all three shapes:
 
 ```
 5  "workspace": "workspace-minni"
-2  "workspace": "/Users/hansaxelsson/Projects/minni"
-1  "workspace": "workspace-hansaxelsson"
+2  "workspace": "~/Projects/minni"
+1  "workspace": "workspace-operator"
 ```
 
 That is a real defect and worth its own fix. But it cannot be the explanation for the

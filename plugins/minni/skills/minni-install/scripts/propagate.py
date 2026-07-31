@@ -946,7 +946,7 @@ CURSOR_WRAPPER_BODY = """#!/bin/bash
 set -euo pipefail
 export MINNI_CURSOR_AGENT_ID=cursor
 export MINNI_CURSOR_VAULT_PATH="$HOME/.minni/cursor-vault"
-export MINNI_CURSOR_WORKSPACE_ID=workspace-hansaxelsson
+export MINNI_CURSOR_WORKSPACE_ID=workspace-unknown
 exec node "$HOME/.cursor/plugins/local/minni/dist/cursor-hook.js" "$1"
 """
 

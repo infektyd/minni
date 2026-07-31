@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import os from "node:os";
 import test from "node:test";
 
 import { assessLearningQuality, detectSecretMaterial } from "../dist/policy.js";
@@ -93,7 +94,9 @@ test("high-entropy opaque strings block; SHAs, digests, paths, URLs do not", () 
     // git SHA + sha256 digest: hex has no uppercase, must not match.
     "fixed in commit f398473b2c334af66d9e88a1b0c7e989c7e989bd",
     "wheel sha256=284d14881fdf1a58a70bebfb0dd92f5140f2253acb10524fc259b43065c023d1",
-    "path /Users/hansaxelsson/Projects/Minni/plugins/minni/dist/server.js",
+    // Derived from the local operator's home dir — this asserts a plain
+    // filesystem path is benign, not the literal value of any home dir.
+    `path ${os.homedir()}/Projects/Minni/plugins/minni/dist/server.js`,
     "see https://github.com/infektyd/minni/actions/runs/28714837391",
     // Codex P2 round 3 (PR #146): npm/pnpm SRI integrity checksums are
     // public metadata, not secrets.
