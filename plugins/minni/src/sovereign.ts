@@ -5,9 +5,10 @@ import { stat, readdir } from "node:fs/promises";
 import net from "node:net";
 import path from "node:path";
 import { URL } from "node:url";
-import { AFM_HEALTH_URL, AFM_PROVIDER_MODE, DEFAULT_AGENT_ID, DEFAULT_VAULT_PATH, DEFAULT_WORKSPACE_ID, SOCKET_PATH } from "./config.js";
+import { AFM_HEALTH_URL, AFM_PROVIDER_MODE, afmProviderModeConfigured, DEFAULT_AGENT_ID, DEFAULT_VAULT_PATH, DEFAULT_WORKSPACE_ID, SOCKET_PATH } from "./config.js";
 import {
   daemonAfmToProviderHealth,
+  daemonEffectiveAfmProvider,
   getAfmProviderHealth,
   GENERATION_PROBE_TTL_MS,
   resolveAfmProvider,
@@ -1027,12 +1028,19 @@ export async function buildStatusReport(input?: {
   // effective-provider verdict wins over the plugin's local guess (helper
   // presence alone can resolve "native" here while the daemon already fell
   // back to bridge after a real FoundationModels check).
+  // #195 (env-context split): only pass a configured mode when THIS process
+  // actually has one. Hook / MCP / shell contexts inherit no
+  // MINNI_AFM_PROVIDER_MODE (it lives in the daemon's launchd plist), so their
+  // "bridge" is a default, not an operator decision, and must not out-vote the
+  // daemon's verified verdict. Passing undefined makes the daemon the single
+  // source of truth for those contexts.
+  const afmModeIsConfigured = input?.afmProviderMode !== undefined || afmProviderModeConfigured();
   const daemonGeneration = daemonAfmToProviderHealth(
     daemonAfmData,
     afmProvider.provider,
     ttlMs,
     Date.now,
-    afmProvider.mode,
+    afmModeIsConfigured ? afmProvider.mode : undefined,
   );
 
   // Local /health probe (r3): skipped entirely when the daemon verdict is
@@ -1060,6 +1068,28 @@ export async function buildStatusReport(input?: {
   } else if (daemonGeneration) {
     generation = daemonGeneration;
     source = "daemon";
+    // #195: when an unconfigured process adopts the daemon's verdict, the
+    // report's provider block must be re-stated from the daemon too. Leaving
+    // the local guess ("bridge", available:false, "ECONNREFUSED 11437") next to
+    // afm.ok:true would just relocate the contradiction this fix removes.
+    const daemonProvider = daemonEffectiveAfmProvider(daemonAfmData);
+    if (daemonProvider && daemonProvider !== afmProvider.provider) {
+      afmProvider = {
+        mode: afmProvider.mode,
+        provider: daemonProvider,
+        status:
+          daemonProvider === "off"
+            ? "off"
+            : daemonProvider === "bridge"
+              ? "bridge"
+              : generation.generationVerified
+                ? "native_available"
+                : "native_unavailable",
+        available: generation.generationVerified,
+        adapterConfigured: afmProvider.adapterConfigured,
+        reason: "provider reported by the daemon (this process has no configured AFM mode)",
+      };
+    }
   } else {
     generation = await getAfmProviderHealth({
       mode: afmProvider.provider,

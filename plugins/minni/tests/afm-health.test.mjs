@@ -45,6 +45,42 @@ const DAEMON_AFM_FRESH_BRIDGE = {
   probe_model: "apple-foundation-models",
 };
 
+// #195 (env-context split): the real payload a natively-configured daemon emits.
+// The daemon carries MINNI_AFM_PROVIDER_MODE=native in its launchd plist; hook /
+// MCP processes spawn from the host platform's env and never see it.
+const DAEMON_AFM_FRESH_NATIVE = {
+  mode: "native",
+  status: "native_available",
+  native_health: "available",
+  native_available: true,
+  native_helper_configured: true,
+  adapter_configured: false,
+  backend: "apple-foundation-models",
+  availability: "available",
+  ok: true,
+  generation_verified: true,
+  probe_age_ms: 1,
+  reachable: true,
+};
+
+/** Run `fn` with MINNI_AFM_PROVIDER_MODE / MINNI_AFM_MODE unset (the hook/MCP context). */
+async function withoutAfmModeEnv(fn) {
+  const saved = {
+    MINNI_AFM_PROVIDER_MODE: process.env.MINNI_AFM_PROVIDER_MODE,
+    MINNI_AFM_MODE: process.env.MINNI_AFM_MODE,
+  };
+  delete process.env.MINNI_AFM_PROVIDER_MODE;
+  delete process.env.MINNI_AFM_MODE;
+  try {
+    return await fn();
+  } finally {
+    for (const [key, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+}
+
 function transportStub(result) {
   const calls = [];
   const fn = async (url, payload) => {
@@ -855,6 +891,77 @@ test("buildStatusReport never reports contradicting socket.data.afm and top-leve
     });
     assert.equal(report.afm.ok, true, "the daemon's fresh verdict must win; both legs can no longer disagree");
     assert.equal(transport.calls.length, 0, "no independent, budget-mismatched probe may run when a fresh daemon verdict exists");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+// --- #195: env-context split (hook/MCP have no MINNI_AFM_PROVIDER_MODE) -------
+
+test("daemonAfmToProviderHealth adopts the daemon's provider when this process has no configured mode (#195)", () => {
+  const now = () => 2_000_000;
+  const ttlMs = 300_000;
+  // configuredMode undefined == "this process never had MINNI_AFM_PROVIDER_MODE
+  // set, it only fell back to the bridge DEFAULT" — that default is not an
+  // operator decision and must not out-vote the daemon's verified verdict.
+  const health = daemonAfmToProviderHealth(DAEMON_AFM_FRESH_NATIVE, "bridge", ttlMs, now, undefined);
+  assert.ok(health, "an unconfigured process must defer to the daemon's effective provider");
+  assert.equal(health.ok, true);
+  assert.equal(health.generationVerified, true);
+});
+
+test("daemonAfmToProviderHealth still rejects a provider mismatch when the mode IS explicitly configured (#195)", () => {
+  const now = () => 2_000_000;
+  const ttlMs = 300_000;
+  assert.equal(
+    daemonAfmToProviderHealth(DAEMON_AFM_FRESH_NATIVE, "bridge", ttlMs, now, "bridge"),
+    undefined,
+    "an operator who pinned bridge here must never inherit a native verdict",
+  );
+});
+
+test("buildStatusReport reports the daemon's verified AFM when the hook process has no MINNI_AFM_PROVIDER_MODE (#195)", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-honest-health-"));
+  try {
+    await withoutAfmModeEnv(async () => {
+      const transport = async () => {
+        assert.fail("must not probe — the daemon already answered this question");
+      };
+      const report = await buildStatusReport({
+        vaultPath: root,
+        // No afmProviderMode: exactly the hook/MCP context, which defaults to
+        // "bridge" and probes a bridge server that is not running.
+        socket: { ok: true, data: { status: "ok", afm: DAEMON_AFM_FRESH_NATIVE } },
+        afm: { ok: false, error: "connect ECONNREFUSED 127.0.0.1:11437" },
+        afmGenerationTransport: transport,
+      });
+      assert.equal(report.afm.ok, true, "afm_ok must agree with the daemon, not with a dead bridge default");
+      assert.equal(report.afm.data.source, "daemon");
+      assert.equal(report.afm.data.generationVerified, true);
+      assert.equal(report.afmProvider.provider, "native", "the reported provider must not contradict the verdict");
+      assert.equal(report.afmProvider.available, true);
+      assert.equal(report.extractor.provider, "native");
+    });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("buildStatusReport still reports AFM down when the daemon is unreachable (#195 must not lie)", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-honest-health-"));
+  try {
+    await withoutAfmModeEnv(async () => {
+      const transport = transportStub(GENERATION_DEAD);
+      const report = await buildStatusReport({
+        vaultPath: root,
+        socket: { ok: false, error: "ENOENT" },
+        afm: { ok: false, error: "connect ECONNREFUSED 127.0.0.1:11437" },
+        afmGenerationTransport: transport,
+      });
+      assert.equal(report.afm.ok, false, "with no daemon to defer to, the local probe stays authoritative");
+      assert.equal(report.afm.data.source, "plugin-probe");
+      assert.equal(report.afmProvider.provider, "bridge");
+    });
   } finally {
     await rm(root, { recursive: true, force: true });
   }

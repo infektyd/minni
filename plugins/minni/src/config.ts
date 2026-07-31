@@ -269,6 +269,24 @@ function parseAfmProviderMode(value: string | undefined): AFM_PROVIDER_MODE {
 export const AFM_PROVIDER_MODE =
   parseAfmProviderMode(process.env.MINNI_AFM_PROVIDER_MODE);
 
+/**
+ * Whether the AFM provider mode of THIS process was actually chosen by the
+ * operator, as opposed to falling through to the "bridge" default (#195).
+ *
+ * The daemon carries MINNI_AFM_PROVIDER_MODE in its launchd plist; hook, MCP
+ * and shell processes spawn from the host platform's env and never inherit it,
+ * so their "bridge" is a default, not a decision. Callers that compare their
+ * own mode against the daemon's use this to tell the two apart. Read at call
+ * time (like generationProbeTimeoutMs) so it stays testable and follows a
+ * mid-process env change; an unrecognized value is not a decision either.
+ */
+export function afmProviderModeConfigured(): boolean {
+  const raw = process.env.MINNI_AFM_PROVIDER_MODE ?? process.env.MINNI_AFM_MODE;
+  if (!raw) return false;
+  const value = raw.trim().toLowerCase();
+  return value === "auto" || value === "bridge" || value === "native" || value === "off";
+}
+
 export const DEFAULT_AGENT_ID =
   process.env.MINNI_AGENT_ID ??
   process.env.MINNI_CODEX_AGENT_ID ??
