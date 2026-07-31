@@ -1,6 +1,8 @@
 """Tests for afm_passes.compact_distillation — distilling raw compaction
 summaries (inbox kind 'compact_summary', harvested by the platform hooks)
-into proposed candidate_packets on the AFM-loop consolidation tick.
+into proposed candidate_packets on the AFM-loop consolidation tick, with
+audience routing: only knowledge-bearing sections become SHARED candidates,
+everything else stays personal in the agent's own vault session note.
 
 Follows the test_inbox_ingest.py harness pattern (isolated tmp DB + config).
 """
@@ -67,9 +69,15 @@ def _summary_doc(**overrides):
         "summary_id": "uuid-1",
         "platform": "codex",
         "session_id": "sess-1",
+        "summary_sha1": "abcdef1234567890",
     }
     doc.update(overrides)
     return doc
+
+
+def _session_notes(tmp_path, vault="codex-vault"):
+    d = tmp_path / vault / "wiki" / "sessions"
+    return sorted(d.glob("*.md")) if d.is_dir() else []
 
 
 def _proposed_rows(db_obj, principal="codex"):
@@ -81,7 +89,7 @@ def _proposed_rows(db_obj, principal="codex"):
         return [dict(r) if hasattr(r, "keys") else {"content": r[0], "derived_from": r[1], "status": r[2]} for r in c.fetchall()]
 
 
-def test_deterministic_distill_proposes_sectioned_candidates(tmp_path, monkeypatch):
+def test_deterministic_distill_proposes_shared_sections_only(tmp_path, monkeypatch):
     from minni.afm_passes.compact_distillation import distill
     import minni.afm_passes.compact_distillation as mod
 
@@ -91,12 +99,17 @@ def test_deterministic_distill_proposes_sectioned_candidates(tmp_path, monkeypat
     _write_inbox_file(inbox, "2026-07-30-abc-sess-1.json", _summary_doc())
 
     res = distill(db_obj, cfg, inboxes=[inbox], dry_run=False)
-    assert res["inserted"] == 3  # mechanics sections (user messages, pending) excluded
+    # Shared: Key Technical Concepts + Errors and fixes. Personal: Primary
+    # Request and Intent. Excluded from both: all user messages, pending tasks.
+    assert res["inserted"] == 2
+    assert res["shared_candidates"] == 2
+    assert res["personal_sections"] == 1
     assert res["afm_sections"] == 0
     rows = _proposed_rows(db_obj)
-    assert len(rows) == 3
+    assert len(rows) == 2
     joined = "\n".join(r["content"] for r in rows)
     assert "teardown race" in joined
+    assert "SovereignDB caches one sqlite connection" in joined
     assert "All user messages" not in joined
     assert "Pending Tasks" not in joined
     # Raw local paths never reach the proposal queue.
@@ -108,8 +121,42 @@ def test_deterministic_distill_proposes_sectioned_candidates(tmp_path, monkeypat
         assert df["source"] == "inbox"
         assert df["channel"] == "compact_distillation"
         assert df["kind"] == "compact_summary"
+        assert df["audience"] == "shared"
         assert df["inbox_file"] == "2026-07-30-abc-sess-1.json"
         assert df["afm_distilled"] is False
+
+
+def test_personal_sections_never_reach_candidate_packets(tmp_path, monkeypatch):
+    """The live regression this routing fixes: session-personal narration was
+    landing in the shared pool and getting auto-accepted."""
+    from minni.afm_passes.compact_distillation import distill
+    import minni.afm_passes.compact_distillation as mod
+
+    monkeypatch.setattr(mod, "resolve_afm_mode", lambda: "off")
+    db_obj, cfg = _make_db(tmp_path)
+    inbox = tmp_path / "codex-vault" / "inbox"
+    _write_inbox_file(inbox, "f.json", _summary_doc(summary_text=(
+        "1. Primary Request and Intent:\n"
+        "   User asked to fix the daemon fd leak and deploy the fix everywhere.\n"
+        "2. Files and Code Sections:\n"
+        "   The codebase is in a clean state; account switching is per repo.\n"
+        "3. Errors and fixes:\n"
+        "   launchctl bootstrap error 5 right after bootout is a teardown race.\n"
+    )))
+
+    res = distill(db_obj, cfg, inboxes=[inbox], dry_run=False)
+    assert res["inserted"] == 1
+    assert res["personal_sections"] == 2
+    joined = "\n".join(r["content"] for r in _proposed_rows(db_obj))
+    assert "teardown race" in joined
+    assert "clean state" not in joined
+    assert "account switching" not in joined
+    assert "User asked to fix" not in joined
+    # …but the personal content is preserved for this agent alone.
+    (note,) = _session_notes(tmp_path)
+    body = note.read_text(encoding="utf-8")
+    assert "clean state" in body
+    assert "account switching" in body
 
 
 def test_idempotent_across_runs(tmp_path, monkeypatch):
@@ -123,10 +170,13 @@ def test_idempotent_across_runs(tmp_path, monkeypatch):
 
     first = distill(db_obj, cfg, inboxes=[inbox], dry_run=False)
     second = distill(db_obj, cfg, inboxes=[inbox], dry_run=False)
-    assert first["inserted"] == 3
+    assert first["inserted"] == 2
+    assert first["vault_notes_written"] == 1
     assert second["inserted"] == 0
+    assert second["vault_notes_written"] == 0
     assert second["files_already_done"] == 1
-    assert len(_proposed_rows(db_obj)) == 3
+    assert len(_proposed_rows(db_obj)) == 2
+    assert len(_session_notes(tmp_path)) == 1
 
 
 def test_dry_run_writes_nothing(tmp_path, monkeypatch):
@@ -139,11 +189,13 @@ def test_dry_run_writes_nothing(tmp_path, monkeypatch):
     _write_inbox_file(inbox, "f.json", _summary_doc())
 
     res = distill(db_obj, cfg, inboxes=[inbox], dry_run=True)
-    assert res["would_insert"] == 3
+    assert res["would_insert"] == 2
     assert res["inserted"] == 0
+    assert res["vault_notes_written"] == 0
     assert _proposed_rows(db_obj) == []
+    assert _session_notes(tmp_path) == []
     # And the wet run afterwards still inserts.
-    assert distill(db_obj, cfg, inboxes=[inbox], dry_run=False)["inserted"] == 3
+    assert distill(db_obj, cfg, inboxes=[inbox], dry_run=False)["inserted"] == 2
 
 
 def test_skips_agent_mismatch_and_empty_and_foreign_kinds(tmp_path, monkeypatch):
@@ -163,22 +215,62 @@ def test_skips_agent_mismatch_and_empty_and_foreign_kinds(tmp_path, monkeypatch)
     assert res["files_scanned"] == 2  # foreign kinds are not compact files at all
 
 
-def test_unsectioned_summary_falls_back_to_single_candidate(tmp_path, monkeypatch):
+FLAT_SUMMARY = "One paragraph of genuinely useful session findings about the migration."
+
+
+def test_unsectioned_summary_without_afm_stays_personal(tmp_path, monkeypatch):
+    """No AFM means no crisp assertion, so the whole-body fallback is personal:
+    vault note only, and the file is archived because nothing keys idempotency."""
     from minni.afm_passes.compact_distillation import distill
     import minni.afm_passes.compact_distillation as mod
 
     monkeypatch.setattr(mod, "resolve_afm_mode", lambda: "off")
     db_obj, cfg = _make_db(tmp_path)
     inbox = tmp_path / "codex-vault" / "inbox"
-    _write_inbox_file(
-        inbox, "flat.json",
-        _summary_doc(summary_text="One paragraph of genuinely useful session findings about the migration."),
-    )
+    _write_inbox_file(inbox, "flat.json", _summary_doc(summary_text=FLAT_SUMMARY))
+
+    res = distill(db_obj, cfg, inboxes=[inbox], dry_run=False)
+    assert res["inserted"] == 0
+    assert res["personal_sections"] == 1
+    assert res["vault_notes_written"] == 1
+    assert _proposed_rows(db_obj) == []
+    (note,) = _session_notes(tmp_path)
+    assert FLAT_SUMMARY in note.read_text(encoding="utf-8")
+
+
+def test_unsectioned_summary_upgraded_to_shared_when_afm_distills(tmp_path, monkeypatch):
+    from minni.afm_passes.compact_distillation import distill
+    import minni.afm_passes.compact_distillation as mod
+
+    class FakeResult:
+        def __init__(self, ok, data):
+            self.ok = ok
+            self.data = data
+
+    class FakeChain:
+        def native_op(self, operation, payload, timeout=2.0):
+            return FakeResult(True, {
+                "title": "Migration findings",
+                "assertion": "Run the schema migration before restarting the daemon",
+            })
+
+    monkeypatch.setattr(mod, "resolve_afm_mode", lambda: "native")
+    monkeypatch.setattr(mod, "default_provider_chain", FakeChain)
+    db_obj, cfg = _make_db(tmp_path)
+    inbox = tmp_path / "codex-vault" / "inbox"
+    _write_inbox_file(inbox, "flat.json", _summary_doc(summary_text=FLAT_SUMMARY))
 
     res = distill(db_obj, cfg, inboxes=[inbox], dry_run=False)
     assert res["inserted"] == 1
+    assert res["personal_sections"] == 0
+    assert res["archived_zero_shared"] == 0
     (row,) = _proposed_rows(db_obj)
-    assert row["content"].startswith("Compaction summary — Session summary:")
+    assert row["content"] == (
+        "Migration findings: Run the schema migration before restarting the daemon"
+    )
+    assert json.loads(row["derived_from"])["audience"] == "shared"
+    # Candidates exist, so the existing resolve-time lifecycle owns the file.
+    assert (inbox / "flat.json").is_file()
 
 
 def test_afm_path_uses_session_distill_with_fallback(tmp_path, monkeypatch):
@@ -196,8 +288,8 @@ def test_afm_path_uses_session_distill_with_fallback(tmp_path, monkeypatch):
 
         def native_op(self, operation, payload, timeout=2.0):
             self.calls.append((operation, payload["text"][:40]))
-            # Distill only the first section; miss the rest → fallback.
-            if "Primary Request" in payload["text"]:
+            # Distill only the first shared section; miss the rest → fallback.
+            if "Key Technical Concepts" in payload["text"]:
                 return FakeResult(True, {
                     "title": "FD leak fix",
                     "assertion": "Cap RPC workers and share DB instances per path",
@@ -216,6 +308,8 @@ def test_afm_path_uses_session_distill_with_fallback(tmp_path, monkeypatch):
     assert res["afm_mode"] == "native"
     assert res["afm_sections"] == 1
     assert all(op == "session_distill" for op, _ in chain.calls)
+    # AFM is never spent on personal sections.
+    assert not any("Primary Request" in text for _, text in chain.calls)
     rows = _proposed_rows(db_obj)
     afm_rows = [r for r in rows if json.loads(r["derived_from"])["afm_distilled"]]
     assert len(afm_rows) == 1
@@ -223,8 +317,8 @@ def test_afm_path_uses_session_distill_with_fallback(tmp_path, monkeypatch):
         "FD leak fix: Cap RPC workers and share DB instances per path "
         "(applies when: daemon under multi-agent load)"
     )
-    # Missed sections still arrive via the deterministic fallback.
-    assert len(rows) == 3
+    # Missed shared sections still arrive via the deterministic fallback.
+    assert len(rows) == 2
 
 
 def test_derived_from_matches_inbox_archive_lifecycle_key(tmp_path, monkeypatch):
@@ -242,3 +336,70 @@ def test_derived_from_matches_inbox_archive_lifecycle_key(tmp_path, monkeypatch)
 
     for row in _proposed_rows(db_obj):
         assert _derived_inbox_file(row["derived_from"]) == "arch.json"
+
+
+def test_session_note_location_content_and_idempotency(tmp_path, monkeypatch):
+    from minni.afm_passes.compact_distillation import distill
+    import minni.afm_passes.compact_distillation as mod
+
+    monkeypatch.setattr(mod, "resolve_afm_mode", lambda: "off")
+    db_obj, cfg = _make_db(tmp_path)
+    inbox = tmp_path / "codex-vault" / "inbox"
+    _write_inbox_file(inbox, "note.json", _summary_doc())
+
+    distill(db_obj, cfg, inboxes=[inbox], dry_run=False)
+    (note,) = _session_notes(tmp_path)
+    # Name is derived from the document's own timestamp/ids, never wall clock.
+    assert note.name == "20260730-compact-sess-1-abcdef12.md"
+    assert note.parent == tmp_path / "codex-vault" / "wiki" / "sessions"
+    body = note.read_text(encoding="utf-8")
+    assert body.startswith("---\n")
+    assert "type: session" in body
+    assert "platform: codex" in body
+    assert "session_id: sess-1" in body
+    assert "summary_sha1: abcdef1234567890" in body
+    assert "audience: personal" in body
+    assert "source: compact_distillation:note.json" in body
+    assert "created: '2026-07-30T12:00:00.000Z'" in body
+    # FULL body, including the sections that never became candidates…
+    assert "User asked to fix the daemon fd leak" in body
+    assert "push the work" in body
+    assert "teardown race" in body
+    # …still redacted.
+    assert "/Users/someone" not in body
+    assert "[local-path]" in body
+
+    mtime = note.stat().st_mtime_ns
+    again = distill(db_obj, cfg, inboxes=[inbox], dry_run=False)
+    assert again["vault_notes_written"] == 0
+    assert len(_session_notes(tmp_path)) == 1
+    assert note.stat().st_mtime_ns == mtime
+
+
+def test_zero_shared_file_is_archived_not_deleted(tmp_path, monkeypatch):
+    from minni.afm_passes.compact_distillation import distill
+    import minni.afm_passes.compact_distillation as mod
+
+    monkeypatch.setattr(mod, "resolve_afm_mode", lambda: "off")
+    db_obj, cfg = _make_db(tmp_path)
+    inbox = tmp_path / "codex-vault" / "inbox"
+    _write_inbox_file(inbox, "personal.json", _summary_doc(summary_text=(
+        "1. Primary Request and Intent:\n"
+        "   User asked me to keep working through the backlog.\n"
+        "2. Current Work:\n"
+        "   Halfway through the third item.\n"
+    )))
+
+    res = distill(db_obj, cfg, inboxes=[inbox], dry_run=False)
+    assert res["inserted"] == 0
+    assert res["vault_notes_written"] == 1
+    assert res["archived_zero_shared"] == 1
+    assert res["skipped"] == {"_no_candidates": 1}
+    assert not (inbox / "personal.json").exists()
+    assert (inbox / ".archive" / "personal.json").is_file()
+
+    # Nothing left to rescan on the next tick.
+    second = distill(db_obj, cfg, inboxes=[inbox], dry_run=False)
+    assert second["files_scanned"] == 0
+    assert second["vault_notes_written"] == 0
+    assert second["archived_zero_shared"] == 0

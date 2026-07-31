@@ -597,16 +597,20 @@ async def afm_loop_runner(context: AFMContext):
                                     "inbox_fallback_principal", "unknown")),
                                 dry_run=False,
                             )
-                            if _dc.get("inserted"):
+                            if _dc.get("inserted") or _dc.get("vault_notes_written"):
                                 context.logger.info(
                                     "AFM loop: compact distillation -> %d new "
-                                    "candidate(s) (files=%d already_done=%d "
-                                    "afm_mode=%s afm_sections=%d)",
+                                    "shared candidate(s) (files=%d already_done=%d "
+                                    "afm_mode=%s afm_sections=%d personal=%d "
+                                    "notes=%d archived=%d)",
                                     _dc["inserted"],
                                     _dc["files_scanned"],
                                     _dc["files_already_done"],
                                     _dc["afm_mode"],
                                     _dc["afm_sections"],
+                                    _dc["personal_sections"],
+                                    _dc["vault_notes_written"],
+                                    _dc["archived_zero_shared"],
                                 )
                         except Exception:
                             context.logger.exception(
