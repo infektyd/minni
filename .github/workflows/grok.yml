@@ -86,6 +86,19 @@ jobs:
           printf '%s' "$GROK_CI_AUTH_JSON" | base64 -d > "$HOME/.grok/auth.json"
           chmod 600 "$HOME/.grok/auth.json"
 
+      - name: Configure the sandbox profile
+        run: |
+          # See grok-review.yml for the measurement behind this: `read_file`
+          # alone reads auth.json under --always-approve, so the kernel
+          # sandbox is the only real boundary. Written to $HOME, never to
+          # .grok/sandbox.toml in the checkout (a PR could edit that).
+          cat > "$HOME/.grok/sandbox.toml" <<EOF
+          [profiles.ci]
+          extends = "workspace"
+          restrict_network = true
+          deny = ["$HOME/.grok/auth.json"]
+          EOF
+
       - name: Build prompt
         id: prompt
         env:
@@ -125,19 +138,25 @@ jobs:
 
       - name: Run Grok
         run: |
-          # Deny rules are the hard boundary behind --always-approve (see
-          # grok-review.yml's note; adopted from Grok's own review of #216).
+          # The sandbox is the boundary (see the profile step). Shell stays
+          # available here — an @grok request often needs it — but the kernel
+          # denies the credential path and child-process network either way.
           grok --prompt-file /tmp/grok-prompt.md \
             --always-approve \
             --no-subagents \
             --max-turns 30 \
-            --deny "Read($HOME/.grok/**)" \
-            --deny 'Bash(curl *)' \
-            --deny 'Bash(wget *)' \
+            --sandbox ci \
             --disable-web-search \
             --output-format plain > /tmp/grok-reply.md
           # Never post an empty comment.
           [ -s /tmp/grok-reply.md ] || echo "_Grok returned no output (see workflow logs)._" > /tmp/grok-reply.md
+
+      - name: Fail closed on credential-shaped output
+        run: |
+          if grep -qE '(eyJ[A-Za-z0-9_-]{20,}|refresh_token|"key"[[:space:]]*:|principal_id)' /tmp/grok-reply.md; then
+            echo "::error::Reply contains credential-shaped content — refusing to post."
+            exit 1
+          fi
 
       - name: Post reply
         env:

@@ -52,6 +52,25 @@ jobs:
           printf '%s' "$GROK_CI_AUTH_JSON" | base64 -d > "$HOME/.grok/auth.json"
           chmod 600 "$HOME/.grok/auth.json"
 
+      - name: Configure the sandbox profile
+        run: |
+          # MEASURED, not assumed: with --always-approve, the built-in
+          # `read_file` tool reads $HOME/.grok/auth.json outright — no shell
+          # needed. A tool allowlist does not stop it and neither does
+          # --deny "Read(...)". The kernel sandbox (Landlock on Linux) is the
+          # only mechanical control, and it is applied once at startup and is
+          # irreversible, so the model cannot talk its way out of it.
+          #
+          # This file is written to $HOME, NEVER to .grok/sandbox.toml in the
+          # checkout: a per-project profile would be editable by the very PR
+          # under review.
+          cat > "$HOME/.grok/sandbox.toml" <<EOF
+          [profiles.ci]
+          extends = "read-only"
+          restrict_network = true
+          deny = ["$HOME/.grok/auth.json"]
+          EOF
+
       - name: Build review prompt
         env:
           GH_TOKEN: ${{ github.token }}
@@ -89,21 +108,30 @@ jobs:
 
       - name: Run Grok review
         run: |
-          # --always-approve keeps the tool loop unstarved (dontAsk cancels on
-          # the first approval-needing tool); the deny rules are the HARD
-          # boundary Grok's own review of #216 called for - prompt prose alone
-          # does not survive determined tool use. No debug instrumentation
-          # here: Actions logs are durable and public on this repo.
+          # --always-approve keeps the tool loop unstarved (dontAsk cancels the
+          # whole prompt on the first approval-needing tool). The boundary that
+          # actually holds is --sandbox ci (kernel-enforced, irreversible);
+          # the tool allowlist below is defense in depth, and the reply is
+          # scanned for credential material before anything is posted.
+          # No debug instrumentation: Actions logs are public on this repo.
           grok --prompt-file /tmp/grok-prompt.md \
             --always-approve \
             --no-subagents \
             --max-turns 30 \
-            --deny "Read($HOME/.grok/**)" \
-            --deny 'Bash(curl *)' \
-            --deny 'Bash(wget *)' \
+            --sandbox ci \
+            --tools "read_file,grep,list_dir" \
             --disable-web-search \
             --output-format plain > /tmp/grok-reply.md
           [ -s /tmp/grok-reply.md ] || echo "_Grok returned no output (see workflow logs)._" > /tmp/grok-reply.md
+
+      - name: Fail closed on credential-shaped output
+        run: |
+          # Independent of the sandbox: never post a reply that looks like it
+          # carries token material, whatever the cause.
+          if grep -qE '(eyJ[A-Za-z0-9_-]{20,}|refresh_token|"key"[[:space:]]*:|principal_id)' /tmp/grok-reply.md; then
+            echo "::error::Reply contains credential-shaped content — refusing to post."
+            exit 1
+          fi
 
       - name: Post review comment
         env:
