@@ -197,9 +197,16 @@ policy allows only the default branch. It does not work here. Since November
 `refs/pull/<n>/merge`, not the head or base branch name. A default-branch-only
 policy therefore blocks our own PR-triggered jobs:
 
-* `grok-review` runs only on `pull_request` — it would lose the App token
-  entirely and silently degrade to `gh pr comment`: no formal reviews, no
-  eligibility stamps, feature dead.
+* `grok-review`'s automatic triggers are all `pull_request` — those would lose
+  the App token entirely and silently degrade to `gh pr comment`: no formal
+  reviews, no eligibility stamps.
+
+  Note the one exception, which matters for option 1 below: the `/grok-review`
+  command runs on `issue_comment`, and **`issue_comment` workflows run from the
+  default branch**, so that path WOULD satisfy a default-branch-only policy. An
+  architecture where the only review path is the explicit command is therefore
+  compatible with environment scoping — at the cost of no automatic review on
+  PR open.
 * the gate would keep only its `check_suite` / `workflow_run` triggers (those do
   run from the default branch) and lose `pull_request` + `pull_request_review`,
   taking the post-green veto with them.
@@ -325,10 +332,20 @@ human attention on gate/workflow changes.
 
 - **Eligibility is bound to the reviewed commit.** The marker only counts if
   the stamping review's `commit_id` is the current head. Pushing invalidates it,
-  and Grok does not re-review on `synchronize` (metered). To re-arm after a
-  push: mark ready-for-review, or close/reopen, to re-run Grok on the new SHA.
-  This is deliberate — without it, "approve clean code, then push a bad commit"
-  mints merge trust for code the reviewer never saw.
+  and Grok does not re-review on `synchronize` (metered). This is deliberate —
+  without it, "approve clean code, then push a bad commit" mints merge trust for
+  code the reviewer never saw.
+- **To re-arm after a push, comment `/grok-review` on the PR.** That is the
+  supported re-review path: one deliberate metered review, run against the
+  CURRENT head, which re-stamps eligibility on the new SHA and feeds the gate
+  correctly. Collaborators only (`OWNER`/`MEMBER`/`COLLABORATOR`) — this is a
+  public repo and each run bills the operator's Grok subscription. The command
+  must be the entire comment; prose mentioning it does nothing. A repeat command
+  on an already-reviewed SHA is skipped with a reply rather than double-billed,
+  and you get an :eyes: reaction when one is accepted.
+- **Dismissing a review is not a substitute for re-earning one.** Dismiss only
+  a review that a later re-review has made obsolete. Dismissing to clear a block
+  without a fresh review throws away the signal the gate depends on.
 - **Only the newest App review counts.** A later App `COMMENTED` review with no
   marker revokes eligibility; the gate does not fall through to an older
   stamped review.

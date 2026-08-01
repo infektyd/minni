@@ -139,3 +139,93 @@ def test_app_tokens_are_minted_least_privilege(gate, review):
     assert "permission-checks" not in review_step["with"], (
         "the reviewer must not be able to post the mechanical check"
     )
+
+
+# --- /grok-review comment re-trigger ---------------------------------------
+# Eligibility is bound to the head SHA, so after agents push fixes the previous
+# stamp is worthless. This command is how a review gets re-earned without
+# close/reopen or dismissing a review that was never superseded.
+
+
+def _resolve_step(review: dict) -> dict:
+    return next(
+        s for s in review["jobs"]["grok-review"]["steps"] if s.get("id") == "resolve"
+    )
+
+
+def test_comment_command_is_a_trigger(review):
+    assert _triggers(review)["issue_comment"]["types"] == ["created"]
+
+
+def test_command_is_restricted_to_collaborators(review):
+    """This is a public repo and each review burns metered subscription time,
+    so a drive-by commenter must not be able to spend it."""
+    cond = review["jobs"]["grok-review"]["if"]
+    assert "author_association" in cond
+    for role in ("OWNER", "MEMBER", "COLLABORATOR"):
+        assert role in cond
+    assert "github.event.issue.pull_request" in cond, "must be a PR comment"
+
+
+def test_command_match_is_exact_not_substring(review):
+    """Prose merely mentioning the command must not spend a metered review."""
+    run = _resolve_step(review)["run"]
+    assert '"$BODY" != "/grok-review"' in run, "needs an exact trimmed comparison"
+
+
+def test_review_runs_against_the_current_head_sha(review):
+    """issue_comment carries no PR head. Reviewing a stale SHA would stamp
+    eligibility the gate then rejects for being bound to the wrong commit."""
+    assert ".head.sha" in _resolve_step(review)["run"]
+    checkout = next(
+        s for s in review["jobs"]["grok-review"]["steps"]
+        if str(s.get("uses", "")).startswith("actions/checkout")
+    )
+    assert checkout["with"]["ref"] == "${{ steps.resolve.outputs.sha }}"
+
+
+def test_repeat_command_is_deduped_by_head_sha(review):
+    """Without this a repeated command double-bills for an identical diff."""
+    run = _resolve_step(review)["run"]
+    assert 'infektydgrokreviewer[bot]' in run
+    assert '"$LAST" = "$SHA"' in run
+
+
+def test_draft_and_fork_prs_are_skipped(review):
+    run = _resolve_step(review)["run"]
+    assert "is a draft" in run
+    assert "fork PRs are out of scope" in run
+
+
+def test_the_command_is_acknowledged(review):
+    """A command that silently does nothing is indistinguishable from a broken
+    workflow — the requester must learn it was accepted or skipped."""
+    ack = next(
+        s for s in review["jobs"]["grok-review"]["steps"]
+        if s.get("name") == "Acknowledge the command"
+    )
+    run = ack["run"]
+    # Accepted -> a reaction on the command comment.
+    assert "/reactions" in run and "content=eyes" in run
+    # Rejected -> an explicit reply carrying the reason.
+    assert "skipped" in run and "steps.resolve.outputs.reason" in run
+    # Must report either way, including when Resolve itself failed.
+    assert ack["if"].startswith("always()")
+
+
+def test_app_token_mint_is_gated_on_the_resolver(review):
+    """Otherwise a skipped command still mints an installation token."""
+    step = next(
+        s for s in review["jobs"]["grok-review"]["steps"]
+        if str(s.get("uses", "")).startswith("actions/create-github-app-token")
+    )
+    assert "steps.resolve.outputs.skip" in step["if"]
+    assert "vars.GROK_APP_ID" in step["if"]
+
+
+def test_metered_steps_never_run_on_a_skip(review):
+    """The whole point of the guards is that a rejected command costs nothing."""
+    steps = review["jobs"]["grok-review"]["steps"]
+    for name in ("Run Grok review", "Post review", "Build review prompt"):
+        step = next(s for s in steps if s.get("name") == name)
+        assert step["if"] == "steps.resolve.outputs.skip == 'false'", name
