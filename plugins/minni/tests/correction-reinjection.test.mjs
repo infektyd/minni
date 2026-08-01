@@ -881,7 +881,37 @@ for (const hook of HOOK_MATRIX) {
     //    corrections_reassert even before the daemon is consulted.
     const boot = await runHook("SessionStart", env, {}, hook.bin);
     const body = bootEnvelope(boot, hook);
-    if (!body) return; // platform cannot deliver at SessionStart; contract asserted above
+    if (!body) {
+      // The platform cannot inject at SessionStart, so the correction reached
+      // nobody. Returning here used to end the test — which is what hid the
+      // real failure: the boot emitted a noop, the noop flushed fine, and the
+      // stash was archived anyway. Nothing delivered means nothing consumed, so
+      // the entry must still be on disk and re-deliverable.
+      // Nothing was delivered, so nothing may be CONSUMED. `.archive/` means
+      // consumed, and this correction reached no one.
+      const archived = await readdir(path.join(inboxDir, ".archive")).catch(() => []);
+      assert.deepEqual(
+        archived.filter((f) => f.endsWith(".json")),
+        [],
+        "a dropped envelope must archive nothing",
+      );
+      // It survives — but on a wire that can NEVER inject at SessionStart the
+      // drop is structural, so it is parked out of the retry window instead of
+      // being retried forever (one file per compaction, each holding a slot).
+      // Either location proves the point the early `return` used to skip: the
+      // entry still exists.
+      const stillPending = (await readdir(inboxDir)).filter((f) => f.endsWith(".json"));
+      const parked = (await readdir(path.join(inboxDir, ".undeliverable")).catch(() => [])).filter(
+        (f) => f.endsWith(".json"),
+      );
+      assert.equal(
+        stillPending.length + parked.length,
+        inboxFiles.length,
+        `${hook.name} cannot carry the envelope at SessionStart, so the stashed ` +
+          "correction must survive rather than be consumed by an undelivered boot",
+      );
+      return;
+    }
     assert.ok(Array.isArray(body.corrections_reassert), "boot must re-assert stashed corrections");
     assert.equal(body.corrections_reassert[0].superseded_learning_id, 7);
 

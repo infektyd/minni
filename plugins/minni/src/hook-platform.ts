@@ -280,6 +280,22 @@ export interface RenderedIntent {
  * platform structurally unable to carry memory should be legible in the audit
  * log, not indistinguishable from a healthy run.
  */
+/**
+ * Can this wire EVER inject context on this event?
+ *
+ * The injectable set is a static property of the platform, so a `null` here is
+ * a STRUCTURAL "never", not a transient failure — which is the distinction a
+ * caller needs before deciding whether retrying is worth anything. Grok Build
+ * declares only Stop injectable, so a correction re-asserted at its SessionStart
+ * can never reach the model no matter how many boots it survives.
+ *
+ * Probes with empty text on purpose: `inject` answers from the event alone, and
+ * an empty probe cannot be mistaken for real content if a wire ever logs it.
+ */
+export function canInject(wire: PlatformWire, event: EnvelopeEvent): boolean {
+  return wire.inject(event, "") !== null;
+}
+
 export function renderIntent(wire: PlatformWire, intent: HookIntent): RenderedIntent {
   if (intent.kind === "none") return { output: wire.noop() };
 

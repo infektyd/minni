@@ -34,10 +34,18 @@ import {
   workspaceFromPayload,
 } from "./hook-utils.js";
 import type { HookOutput } from "./hook-utils.js";
+import {
+  deferUntilDelivered,
+  discardDeliveryCommits,
+  emitAndCommit,
+  exitAfterDelivery,
+  failAndExit,
+  markOutputDropped,
+} from "./hook-delivery.js";
 import { harvestSummaryText } from "./compact-harvest.js";
 import { injectIntent, noIntent, noteIntent } from "./hook-intent.js";
 import type { HookIntent } from "./hook-intent.js";
-import { renderIntent, wireFor } from "./hook-platform.js";
+import { canInject, renderIntent, wireFor } from "./hook-platform.js";
 import type { PlatformWire } from "./hook-platform.js";
 import { compactPlanPointer, resolveActivePlanView } from "./plan.js";
 import { routeMemoryIntent } from "./policy.js";
@@ -84,8 +92,10 @@ import {
   ensureVault,
   buildPendingLearningsSection,
   expireStaleInboxHandoffs,
+  expiredHandoffsBody,
   formatSessionReceiptLine,
   readInboxStatus,
+  parkUndeliverableInboxEntries,
   readReassertPending,
   recordAudit,
   resolveInboxHandoffContext,
@@ -176,6 +186,18 @@ export interface AgentHookConfig {
    * Omit for a platform with no declared timeout (kilocode has none at all).
    */
   promptHookTimeoutMs?: number;
+  /**
+   * This platform's manifest timeout (ms) for SESSION START, as an OUTER bound
+   * on the boot budget — same contract as `promptHookTimeoutMs`, and the same
+   * obligation to be edited together with `hooks/hooks-<platform>.json`.
+   *
+   * Boot needs its own bound because the deadlines differ: gemini declares
+   * **10s** for SessionStart (hooks-gemini.json) while codex, grok and cursor
+   * declare 30s. Without it a cold daemon runs the boot RPCs past gemini's kill
+   * and the whole envelope — identity, corrections, active plan — is discarded.
+   * `sessionstart-delivery.test.mjs` pins each value to its manifest.
+   */
+  sessionStartHookTimeoutMs?: number;
 }
 
 /** Test seam: lets behavioral tests drive the zero-candidate Stop branch. */
@@ -415,6 +437,10 @@ export function createHookHandlers(
   const render = async (intent: HookIntent): Promise<HookOutput> => {
     const { output, dropped } = renderIntent(wire, intent);
     if (dropped) {
+      // The payload never went on the wire, so nothing it was carrying may be
+      // consumed — see markOutputDropped. The write below still SUCCEEDS (it is
+      // a noop), which is exactly why the flush alone cannot be trusted.
+      markOutputDropped();
       try {
         await recordAudit(config.vaultPath, {
           tool: `${config.auditPrefix}_intent_dropped`,
@@ -442,38 +468,95 @@ export function createHookHandlers(
     const rawSessionId = asString(payload.session_id) || asString(payload.sessionId);
     const sessionId = rawSessionId || "session";
     const workspaceId = workspaceFor(payload);
+    // BOOT BUDGET: platforms kill SessionStart and DISCARD its output — gemini
+    // at 10s (hooks-gemini.json). A boot that overruns loses the whole envelope,
+    // so we own a shorter deadline and deliver whatever landed inside it. The
+    // deadline is ABSOLUTE and shared: each read gets only what is left, and
+    // once it is spent the rest resolve instantly with their degraded value so
+    // the envelope — and, critically, the corrections below — still ship.
+    //
+    // The clock starts at handler ENTRY: the harness deadline runs from process
+    // start, so any setup done first (vault creation, and on claude-code the
+    // compaction harvest) is time already spent against it.
+    const budgetMs = effectiveHookBudgetMs(config.sessionStartHookTimeoutMs);
+    const deadline = Date.now() + budgetMs;
+    const remainingMs = (): number => Math.max(0, deadline - Date.now());
+    const rpcTimedOut = { ok: false as const, error: JSON_RPC_TIMEOUT_ERROR };
     await ensureVault(config.vaultPath);
 
     // TTL-reap stale file handoffs BEFORE the honest read so they neither occupy
     // the capped slice nor inflate totals; they surface once below as 'expired'.
+    //
+    // DELIBERATELY UNBUDGETED. The reaper ARCHIVES as it walks, and withBudget
+    // races rather than cancels — so a budget-cut reaper would keep archiving in
+    // the background while this boot reported an empty `expired` list. Archived
+    // entries are invisible to readInboxStatus, so they would then be reported
+    // ZERO times, breaking the surfaces-exactly-once contract. A budget may skip
+    // a READ; it must not half-report a WRITE.
     const expiredHandoffs = await expireStaleInboxHandoffs(config.vaultPath);
     const [status, tail, identityRead, recall, contradictions, inboxStatus] = await Promise.all([
-      buildStatusReport({ vaultPath: config.vaultPath }),
-      auditTail(config.vaultPath, 5),
+      withBudget(
+        // timeoutMs, not just the withBudget race: the race ABANDONS the status
+        // RPC, and an abandoned socket handle keeps this process alive past the
+        // harness kill — which discards output we had already written.
+        buildStatusReport({ vaultPath: config.vaultPath, timeoutMs: remainingMs() }),
+        remainingMs(),
+        undefined,
+      ),
+      withBudget(auditTail(config.vaultPath, 5), remainingMs(), undefined),
       // hooks-PL-2 leg (a): BOTH boot modes issue the daemon 'read' — it is
       // the recency-ordered learning surface AND the path that records
       // learning_reads, which stale_beliefs matches on. agent-context boots
       // inject it whole as native layer 1; identity-recall boots trim it to
       // recent_learnings below.
-      readAgentContext({ agentId: config.agentId, limit: 8 }),
+      withBudget(
+        readAgentContext({ agentId: config.agentId, limit: 8, timeoutMs: remainingMs() }),
+        remainingMs(),
+        rpcTimedOut,
+      ),
       // recall-F1: boot recall must include the correction-bearing layers, not
       // just the identity shelf (the widened search is what lets knowledge-
       // layer corrections rank in). See BOOT_RECALL_LAYERS for the policy.
-      recallMemory({
-        query: `boot identity for ${workspaceId}`,
-        layers: BOOT_RECALL_LAYERS,
-        limit: 8,
-        agentId: config.agentId,
-        workspaceId,
-        ...(rawSessionId ? { sessionId: rawSessionId } : {}),
-      }),
+      withBudget(
+        recallMemory({
+          query: `boot identity for ${workspaceId}`,
+          layers: BOOT_RECALL_LAYERS,
+          limit: 8,
+          agentId: config.agentId,
+          workspaceId,
+          // The load-bearing deadline: it destroys the socket, which is what
+          // lets the hook PROCESS exit. Racing a promise alone cannot do that.
+          timeoutMs: remainingMs(),
+          ...(rawSessionId ? { sessionId: rawSessionId } : {}),
+        }),
+        remainingMs(),
+        rpcTimedOut,
+      ),
       // hooks-PL-1/PL-2: corrections to beliefs this agent read must
       // re-surface at boot (stale_beliefs), on every platform.
-      subscribeContradictions({ agentId: config.agentId }),
-      readInboxStatus(config.vaultPath, 3),
+      withBudget(
+        subscribeContradictions({ agentId: config.agentId, timeoutMs: remainingMs() }),
+        remainingMs(),
+        rpcTimedOut,
+      ),
+      withBudget(readInboxStatus(config.vaultPath, 3), remainingMs(), undefined),
     ]);
-    const pending = inboxStatus.entries;
-    const handoffContext = await resolveInboxHandoffContext(config.vaultPath, pending);
+    const pending = inboxStatus?.entries ?? [];
+    // The `ok` flag distinguishes "the budget cut this read" from its natural
+    // empty result — an [] fallback alone is indistinguishable from "no handoff
+    // refs", which is the false all-clear this whole section exists to avoid.
+    const handoffRead = await withBudget<{
+      ok: boolean;
+      snippets: Awaited<ReturnType<typeof resolveInboxHandoffContext>>;
+    }>(
+      resolveInboxHandoffContext(config.vaultPath, pending).then((snippets) => ({
+        ok: true,
+        snippets,
+      })),
+      remainingMs(),
+      { ok: false, snippets: [] },
+    );
+    const handoffContext = handoffRead.snippets;
     // hooks-PL-3: re-assert corrections stashed by PreCompact, so the
     // post-compaction boot re-injects them even if the daemon is down now.
     // Consumed entries are settled (exactly-once re-injection, no unbounded
@@ -481,26 +564,132 @@ export function createHookHandlers(
     // the next boot, and all-malformed entries survive for inspection.
     // I5: use the reassert-specific window so recent all-malformed files cannot
     // crowd valid corrections out of the newest-N slots.
+    //
+    // Deliberately UNBUDGETED: this is cheap local FS, and it is the one read
+    // whose absence loses data rather than context.
     const reassertPending = await readReassertPending(config.vaultPath, 3);
-    const { events: correctionsReassert, consumedPaths: reassertConsumed, deferredTails: reassertDeferred } =
+    const { events: correctionsReassert, consumedPaths: reassertConsumed, contributingPaths: reassertContributing, deferredTails: reassertDeferred } =
       collectCorrectionsReassert(reassertPending);
-    await settleReassertedInboxEntries(config.vaultPath, {
-      consumedPaths: reassertConsumed,
-      deferredTails: reassertDeferred,
-    });
+    // R2: settle AFTER the envelope reaches the host, never before. Archiving
+    // here would consume the correction inside the window where the boot can
+    // still be killed, losing it for good — see hook-delivery.ts.
+    //
+    // The deferral is conditional on this envelope actually CARRYING something.
+    // When nothing was injected, the consumed paths are empty stashes (codex and
+    // grok stash unconditionally at PreCompact) — those carry no correction, so
+    // clearing them does not depend on delivery, and making it depend would let
+    // one file per compaction cycle pile up forever on a platform whose wire can
+    // never inject at SessionStart.
+    // Settled in TWO parts, because the two halves have different preconditions.
+    // Empty stashes carry no correction, so clearing them cannot depend on
+    // delivery — and must not, or a platform that can never inject would keep
+    // them forever. Entries that CONTRIBUTED events (and partially-injected
+    // tails) may only settle once the envelope carrying them lands. Deferring
+    // both together held the empties hostage whenever one window contained a
+    // real correction AND an empty stash.
+    //
+    // The three outcomes are counted separately for the audit below: settling
+    // eagerly, waiting on delivery, and parked as undeliverable are different
+    // facts, and one "pending" number covering all three would misreport two of
+    // them. In a change about audit honesty that matters.
+    const emptyPaths = reassertConsumed.filter(
+      (filePath) => !reassertContributing.includes(filePath),
+    );
+    let reassertClearedEager = 0;
+    let reassertPendingClear = 0;
+    let reassertParked = 0;
+    // Counted from the branch that REGISTERS the rewrite, not derived from
+    // reassertPendingClear: a single file carrying MAX+N valid events defers a
+    // tail while contributing no consumed path, so a count gated on
+    // "contributing > 0" reported zero deferred tails while one was pending.
+    let reassertTailsPendingDefer = 0;
+    if (emptyPaths.length > 0) {
+      reassertClearedEager = emptyPaths.length;
+      await settleReassertedInboxEntries(config.vaultPath, {
+        consumedPaths: emptyPaths,
+        deferredTails: [],
+      });
+    }
+    if (reassertContributing.length > 0 || reassertDeferred.length > 0) {
+      if (canInject(wire, "SessionStart")) {
+        reassertPendingClear = reassertContributing.length;
+        reassertTailsPendingDefer = reassertDeferred.length;
+        deferUntilDelivered(() =>
+          settleReassertedInboxEntries(config.vaultPath, {
+            consumedPaths: reassertContributing,
+            deferredTails: reassertDeferred,
+          }),
+        );
+      } else {
+        // STRUCTURAL drop, not a transient one: this wire declares SessionStart
+        // un-injectable, so "keep it and retry next boot" never terminates —
+        // one durable file per correction-bearing compaction, each permanently
+        // occupying a slot in the newest-N reassert window. Park them instead:
+        // out of the window, still on disk, and audited, so the backlog is
+        // countable rather than either silently destroyed or infinite.
+        //
+        // Parking is the BOUND, not the delivery fix. Routing these to Stop —
+        // the only injectable event on such a wire — is tracked in issue #253
+        // and deliberately not attempted here; the two must not drift apart.
+        const parkPaths = [
+          ...reassertContributing,
+          ...reassertDeferred.map((tail) => tail.filePath),
+        ];
+        const parked = await parkUndeliverableInboxEntries(parkPaths);
+        reassertParked = parked.length;
+        await recordAudit(config.vaultPath, {
+          tool: `${config.auditPrefix}_undeliverable_on_wire`,
+          summary: `SessionStart: ${wire.id} cannot inject at SessionStart; parked ${parked.length} correction entr${
+            parked.length === 1 ? "y" : "ies"
+          } to inbox/.undeliverable (see issue #253 for delivery)`,
+          details: {
+            wire: wire.id,
+            parked: parked.length,
+            events: correctionsReassert.length,
+          },
+        }).catch(() => {});
+      }
+    }
 
     // Plan parity (audit C5): SessionStart injects the FULL active-plan view for
     // boot/rehydration, exactly like the claude-code hook.
-    let activePlan: Awaited<ReturnType<typeof resolveActivePlanView>>;
-    try {
-      activePlan = await resolveActivePlanView(config.vaultPath);
-    } catch (error) {
-      // hooks-PL-5: a failed plan resolution must not silently boot plan-less.
-      await recordAudit(config.vaultPath, {
-        tool: `${config.auditPrefix}_active_plan_error`,
-        summary: `SessionStart: ${error instanceof Error ? error.message : String(error)}`,
-      }).catch(() => {});
-    }
+    // `undefined` from resolveActivePlanView MEANS "no active plan", so it cannot
+    // double as the budget-cut fallback — the two must stay distinguishable.
+    let planRead: { ok: boolean; view: Awaited<ReturnType<typeof resolveActivePlanView>> } = {
+      ok: true,
+      view: undefined,
+    };
+    // No try/catch: it would be DEAD CODE, and a catch that implies an audit
+    // row which can never be written is exactly the health-signal overstatement
+    // this work is removing elsewhere. Neither call can reject —
+    // resolveActivePlanView swallows its own failures and returns undefined,
+    // and withBudget turns any rejection into its fallback. A budget cut still
+    // surfaces, via planRead.ok === false -> degraded.sections.
+    //
+    // Note the honest limit that leaves: a plan FS failure is indistinguishable
+    // from 'no active plan', because resolveActivePlanView conflates them at
+    // source. Pre-existing and out of scope here — fixing it belongs in plan.ts.
+    planRead = await withBudget(
+      resolveActivePlanView(config.vaultPath).then((view) => ({ ok: true, view })),
+      remainingMs(),
+      { ok: false, view: undefined },
+    );
+    const activePlan = planRead.view;
+
+    // Sections the budget cut. Named so a degraded boot is legible as degraded
+    // rather than as an agent with nothing in its memory (hooks-PL-5). Computed
+    // AFTER every budgeted read, so a read that runs late can still report itself.
+    const degradedSections = [
+      status === undefined ? "status" : undefined,
+      tail === undefined ? "audit_tail" : undefined,
+      inboxStatus === undefined ? "pending_learnings" : undefined,
+      // Also degraded when the PARENT read was cut: handoffContext is resolved
+      // from inboxStatus.entries, so a cut inbox read makes it vacuously empty.
+      // ok:true over an empty set the hook never actually had inputs for is the
+      // same false all-clear this section exists to prevent.
+      handoffRead.ok && inboxStatus !== undefined ? undefined : "handoff_context",
+      planRead.ok ? undefined : "active_thread",
+    ].filter((section): section is string => section !== undefined);
 
     const envelopeBody: Record<string, unknown> = {
       contract: MEMORY_CONTRACT,
@@ -509,11 +698,26 @@ export function createHookHandlers(
         workspace: workspaceId,
         vault: config.vaultPath,
         session_id: sessionId,
-        daemon_ok: status.socket.ok,
-        afm_ok: status.afm.ok,
+        // Unknown reads as not-ok, never as ok: `degraded.sections` below says
+        // which of these the budget cut, so "false" is not read as "checked".
+        daemon_ok: status?.socket.ok ?? false,
+        afm_ok: status?.afm.ok ?? false,
         ...(config.runtime !== undefined ? { runtime: config.runtime } : {}),
       },
-      pending_learnings: buildPendingLearningsSection(inboxStatus, expiredHandoffs),
+      // Omitted rather than zero-filled when the budget cut the inbox read: a
+      // "0 pending" the hook never counted is a false all-clear.
+      ...(inboxStatus !== undefined
+        ? { pending_learnings: buildPendingLearningsSection(inboxStatus, expiredHandoffs) }
+        : {}),
+      // The reaper is UNBUDGETED and already archived these, so this boot is
+      // their only chance to be reported — but they normally ride inside
+      // pending_learnings, which the line above drops when the budgeted inbox
+      // read degraded. That combination reported them ZERO times, the exact
+      // failure the reaper is unbudgeted to avoid. Ship them on their own
+      // whenever their usual carrier is missing.
+      ...(inboxStatus === undefined && expiredHandoffs.length > 0
+        ? { expired_handoffs: expiredHandoffsBody(expiredHandoffs) }
+        : {}),
       handoff_context: handoffContext.map((snippet) => ({
         ref: snippet.ref,
         path: snippet.relativePath,
@@ -536,11 +740,23 @@ export function createHookHandlers(
               layers: BOOT_RECALL_LAYERS,
             }
           : { ok: false, error: recall.error },
-      audit_tail: tail.entries.slice(-5).map((entry) => entry.split("\n")[0]),
+      ...(tail !== undefined
+        ? { audit_tail: tail.entries.slice(-5).map((entry) => entry.split("\n")[0]) }
+        : {}),
     };
 
     if (correctionsReassert.length > 0) {
       envelopeBody.corrections_reassert = correctionsReassert;
+    }
+
+    if (degradedSections.length > 0) {
+      // Say so IN the envelope: a boot the budget truncated must never be
+      // indistinguishable from a boot that found nothing (hooks-PL-5).
+      envelopeBody.degraded = {
+        sections: degradedSections,
+        budget_ms: budgetMs,
+        note: "Boot exceeded the SessionStart budget (likely a cold daemon). The listed sections were NOT read — treat them as unknown, not empty, and call minni_recall explicitly if they matter.",
+      };
     }
 
     if (bootIdentity === "agent-context") {
@@ -602,15 +818,24 @@ export function createHookHandlers(
       tool: `${config.auditPrefix}_session_start`,
       summary: `boot ${sessionId}`,
       details: {
-        daemon_ok: status.socket.ok,
-        afm_ok: status.afm.ok,
-        pending_inbox: inboxStatus.totalPending,
+        daemon_ok: status?.socket.ok ?? false,
+        afm_ok: status?.afm.ok ?? false,
+        pending_inbox: inboxStatus?.totalPending ?? null,
         expired_handoffs: expiredHandoffs.length,
         handoff_context: handoffContext.length,
         workspace: workspaceId,
         corrections_reassert: correctionsReassert.length,
-        reassert_entries_cleared: reassertConsumed.length,
-        reassert_tails_deferred: reassertDeferred.length,
+        budget_ms: budgetMs,
+        ...(degradedSections.length > 0 ? { degraded_sections: degradedSections } : {}),
+        // The three settle outcomes, reported separately. "pending" counts ONLY
+        // what is still registered with deferUntilDelivered — empties already
+        // cleared and entries parked as undeliverable are not waiting on
+        // anything, and folding them in here claimed archives that were never
+        // going to happen.
+        reassert_entries_cleared_eager: reassertClearedEager,
+        reassert_entries_pending_clear: reassertPendingClear,
+        reassert_entries_parked: reassertParked,
+        reassert_tails_pending_defer: reassertTailsPendingDefer,
       },
     });
 
@@ -1033,8 +1258,18 @@ export async function runHookMain(config: AgentHookConfig): Promise<void> {
   try {
     const handlers = createHookHandlers(config);
     const output = await handlers.dispatch(event, payload);
-    emit(output);
+    // emitAndCommit, not emit: work the handler deferred (archiving a consumed
+    // correction) runs only once this output has actually reached the host.
+    await emitAndCommit(output, {
+      vaultPath: config.vaultPath,
+      auditPrefix: config.auditPrefix,
+      event,
+    });
+    // Delivery is settled; nothing left to wait for. See exitAfterDelivery.
+    exitAfterDelivery();
   } catch (error) {
+    // Nothing was delivered, so nothing the handler deferred may be committed.
+    discardDeliveryCommits();
     const message = error instanceof Error ? error.message : String(error);
     try {
       await recordAudit(config.vaultPath, {
@@ -1045,7 +1280,9 @@ export async function runHookMain(config: AgentHookConfig): Promise<void> {
       // audit unavailable; the systemMessage below still surfaces the failure
     }
     // hooks-PL-5: a degraded boot must never look like a clean one — say so.
-    emit({
+    // failAndExit, not emit: the degraded signal has to be FLUSHED before an
+    // abandoned RPC handle can keep this process alive into the harness kill.
+    await failAndExit({
       continue: true,
       systemMessage: `Minni hook degraded (${event}): ${message} — memory injection skipped this event; see vault log.md.`,
     });

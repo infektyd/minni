@@ -174,8 +174,75 @@ export function findProjectRoot(dirPath: string): string | undefined {
 // shape (a structurally different object); both are plain JSON-serializable, so
 // the param is the broad `object` rather than a union that would couple this
 // protocol leaf to the guard module.
+/**
+ * Absorb stdout `error` events for the life of the process, so a host that
+ * closed its read end cannot kill this hook mid-flight.
+ *
+ * PERMANENT AND IDEMPOTENT ON PURPOSE. Node reports a failed write to the write
+ * CALLBACK first and emits the stream's `error` event on a LATER TICK, so a
+ * listener attached per-write and removed when that callback settles is already
+ * gone when the event lands — and an unhandled stream `error` THROWS. That is
+ * how an EPIPE took the process down before the non-delivery could be recorded,
+ * and it is also why the absorber has to outlive the write: the dangerous
+ * window extends through the post-delivery commits.
+ *
+ * Absorbing is right for a hook: once stdout is gone there is no channel left to
+ * report on, the failure is already surfaced through `emitDelivered`'s return
+ * value and the audit log, and crashing would only add a stack trace to the
+ * user's terminal.
+ */
+let stdoutErrorsAbsorbed = false;
+export function absorbStdoutErrors(): void {
+  if (stdoutErrorsAbsorbed) return;
+  stdoutErrorsAbsorbed = true;
+  process.stdout.on("error", () => {});
+}
+
 export function emit(output: object): void {
+  absorbStdoutErrors();
   process.stdout.write(`${JSON.stringify(output)}\n`);
+}
+
+/**
+ * `emit`, but resolving to whether the bytes actually REACHED the host.
+ *
+ * `emit` returns as soon as the payload is queued: for a piped stdout (which is
+ * how every host runs a hook) the write is asynchronous, so a successful `emit`
+ * proves only that the process intended to speak. Anything that must not happen
+ * until the host has the output — consuming a correction, say — needs the
+ * stronger signal, which is the write callback (fired once the chunk is flushed
+ * to the OS) rather than the call returning.
+ *
+ * Resolves FALSE when the output was never delivered. A host that has gone away
+ * closes its read end and the write fails with EPIPE; `absorbStdoutErrors` keeps
+ * the matching stream event from throwing, so a failed delivery is a value the
+ * caller can branch on rather than a crash.
+ *
+ * NOT an end-to-end acknowledgement, and callers should not read it as one: for
+ * a pipe the callback means the bytes reached the OS buffer, so a host that dies
+ * before READING them still loses the output. The hook protocol offers no ack
+ * channel, so that residual window cannot be closed here — it is narrowed from
+ * "the whole boot" to "one buffered write", which is the difference between
+ * losing a correction routinely and losing one only if the host dies in that
+ * instant.
+ */
+export function emitDelivered(output: object): Promise<boolean> {
+  absorbStdoutErrors();
+  return new Promise<boolean>((resolve) => {
+    let settled = false;
+    const settle = (delivered: boolean): void => {
+      if (settled) return;
+      settled = true;
+      resolve(delivered);
+    };
+    try {
+      process.stdout.write(`${JSON.stringify(output)}\n`, (error) => settle(!error));
+    } catch {
+      // A synchronously-throwing stdout (already destroyed) is a non-delivery
+      // like any other, not an exception for the caller to handle.
+      settle(false);
+    }
+  });
 }
 
 /**
@@ -251,7 +318,15 @@ export function effectiveHookBudgetMs(
  * the vault search, say), where nothing else would give up.
  */
 export function withBudget<T>(work: Promise<T>, ms: number, fallback: T): Promise<T> {
-  if (ms <= 0) return Promise.resolve(fallback);
+  if (ms <= 0) {
+    // `work` was already STARTED by the caller (the argument is an in-flight
+    // promise, not a thunk), so returning without attaching a handler leaves any
+    // rejection unhandled — which terminates the process. An exhausted budget is
+    // the common case for every read after the first, so this branch is reached
+    // routinely, not exceptionally.
+    work.catch(() => {});
+    return Promise.resolve(fallback);
+  }
   return new Promise<T>((resolve) => {
     // unref so this timer alone never holds the process open: if `work` settles
     // and the loop is otherwise drained, the hook must exit immediately.
