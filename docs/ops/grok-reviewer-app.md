@@ -96,18 +96,23 @@ Prefer **Only select repositories** (`minni` ± canary). If install is
 To stop needing `--admin` for solo merges, make the mechanical check + real CI
 required, and drop the approving-review count that bots cannot satisfy:
 
+Use `checks` with an `app_id` per context — **never** the bare `contexts` array.
+A name-only requirement is mintable by any same-repo workflow; see the next
+section for why that is a self-merge primitive.
+
 ```bash
-# PROPOSE to the operator; confirm strict=true (forces up-to-date) before running.
+# PROPOSE to the operator; do not silent-apply. Prerequisite: the Grok App must
+# already have `checks: write`, or the gate can only ever post red (by design).
 gh api -X PUT repos/infektyd/minni/branches/main/protection \
   --input - <<'JSON'
 {
   "required_status_checks": {
     "strict": true,
-    "contexts": [
-      "Forbidden Files",
-      "Free public cloud smoke",
-      "claude-review",
-      "grok-mechanical-approve"
+    "checks": [
+      { "context": "Forbidden Files",         "app_id": 15368 },
+      { "context": "Free public cloud smoke", "app_id": 15368 },
+      { "context": "claude-review",           "app_id": 15368 },
+      { "context": "grok-mechanical-approve", "app_id": 4456296 }
     ]
   },
   "enforce_admins": false,
@@ -139,18 +144,42 @@ Two operator steps are required before this gate means anything:
    the installation). The gate mints an installation token and posts the check
    under the App; without that token it now refuses to post `success` at all
    and reports `no app token`.
-2. **Bind the required context to the App's `app_id`**, not a bare name:
+2. **Bind the required context to the App's `app_id`**, not a bare name.
+
+Classic branch protection already supports this and this repo already uses it:
+`Forbidden Files` is bound to `app_id 15368` (GitHub Actions). A ruleset is not
+required. `checks` REPLACES the whole list, so send every context in one call:
 
 ```bash
-APP_ID=$(gh api /repos/infektyd/minni/commits/main/check-runs \
-  --jq '[.check_runs[] | select(.name=="grok-mechanical-approve") | .app.id][0]')
+# 15368  = GitHub Actions (ordinary CI checks)
+# 4456296 = infektydgrokreviewer App — equals vars.GROK_APP_ID; confirm with:
+#   gh api repos/infektyd/minni/actions/variables/GROK_APP_ID --jq .value
 gh api -X PATCH repos/infektyd/minni/branches/main/protection/required_status_checks \
-  -F strict=true \
-  -f 'checks[][context]=grok-mechanical-approve' -F "checks[][app_id]=$APP_ID"
+  --input - <<'JSON'
+{
+  "strict": true,
+  "checks": [
+    { "context": "Forbidden Files",         "app_id": 15368 },
+    { "context": "Free public cloud smoke", "app_id": 15368 },
+    { "context": "claude-review",           "app_id": 15368 },
+    { "context": "grok-mechanical-approve", "app_id": 4456296 }
+  ]
+}
+JSON
 ```
 
-A `GITHUB_TOKEN`-minted check of the same name carries the GitHub Actions
-`app_id` and will not satisfy an App-bound context.
+A `GITHUB_TOKEN`-minted check of the same name carries `app_id 15368` and will
+not satisfy the App-bound context.
+
+Do **not** derive the app id from an existing `grok-mechanical-approve` check
+run: none exists under the App until after step 1 lands, so that lookup returns
+the GitHub Actions id and would bind the context to precisely the integration
+you are trying to exclude.
+
+`strict: true` is load-bearing and is **not** the current setting (`strict` is
+`false` on `main` today). At `required_approving_review_count: 0` it is the only
+thing forcing re-evaluation after the base branch moves; without it a check
+evaluated against an older `main` still authorises the merge.
 
 **Do not add `boundary` to this list.** Grok Boundary Test only runs on PRs
 touching `.github/workflows/grok*.yml` or `check-no-credential-leak.py`. On an
