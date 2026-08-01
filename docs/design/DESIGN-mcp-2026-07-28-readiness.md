@@ -97,10 +97,18 @@ The SDK is imported at exactly two lines in the entire source tree, both in
 - `server.ts:7` — `@modelcontextprotocol/sdk/server/stdio.js` (`StdioServerTransport`)
 
 The server is constructed at `server.ts:158` with a name, a version, and an
-`instructions` string. It registers 39 tools via `server.registerTool`, plus 11
-backward-compatible aliases through the `DEPRECATED_TOOL_ALIASES` loop at
-`server.ts:1685-1709` — 50 live tools. It registers **no** resources and **no**
-prompts. Transport is established at `server.ts:1712-1713` and nowhere else.
+`instructions` string. It registers 37 canonical tools via
+`server.registerTool`, plus 11 backward-compatible aliases through the
+`DEPRECATED_TOOL_ALIASES` loop at `server.ts:1685-1709` — 48 live tools. It
+registers **no** resources and **no** prompts.
+
+(A bare `grep -c 'server.registerTool' src/server.ts` reports 39 and is wrong
+twice over: one hit is a comment at `server.ts:1677`, and one is the alias
+loop's single call site at `server.ts:1700`. The authoritative pin is
+`plugins/minni/tests/tool-schema-boundary.test.mjs`, which asserts 38 schemas —
+37 canonical plus the one literal the alias loop reuses for all 11 aliases.)
+
+Transport is established at `server.ts:1712-1713` and nowhere else.
 
 A search across `plugins/minni/src/*.ts` for every feature this revision
 changes returns nothing:
@@ -150,7 +158,7 @@ Ordered by whether Minni must do anything at all.
 | `subscriptions/listen` replaces HTTP GET + `resources/subscribe` | No subscriptions, no resources | Not applicable | None |
 | Resource-not-found error code `-32002` → `-32602`; error range repartitioned | Minni registers no resources and mints no MCP error codes in the reserved range | None | None |
 | `inputSchema`/`outputSchema` loosened to full JSON Schema 2020-12 | Zod-derived schemas, already a subset | None. Strictly widening | None |
-| Deterministic `tools/list` order (SHOULD) | Already satisfied: registration is static, top-to-bottom, in one module | None. Worth locking — see Q3 | None |
+| Deterministic `tools/list` order (SHOULD) | Already satisfied: registration is static, top-to-bottom, in one module | None. Nothing currently asserts the ordering; an optional follow-up if we ever want it pinned | None |
 
 The pattern is worth stating plainly: of nineteen changes, Minni must act on
 **zero** to remain correct. Everything in the "required change" column is either
@@ -178,7 +186,7 @@ migration is allegedly free. Rejected, for three reasons.
    on the target.
 
 3. **`2.0.0` is one day old.** Published 2026-07-27T23:55Z, following five betas
-   through July. A major version this fresh, adopted into a 50-tool surface with
+   through July. A major version this fresh, adopted into a 48-tool surface with
    no protocol-level need, is speculative work. The brief for this task was
    readiness, and readiness is not the same as being early.
 
@@ -216,7 +224,7 @@ instead of silently changing what Minni speaks on the wire.
 
 That is worth more than a speculative migration, because the failure mode this
 guards against — a transitive or inattentive SDK change quietly altering the
-negotiated protocol under 50 tools — is both plausible and currently invisible.
+negotiated protocol under 48 tools — is both plausible and currently invisible.
 
 ## Opportunities
 
@@ -249,7 +257,7 @@ schedule. MRTR is a layer to add on top afterwards, not a substitute.
 
 ### 2. `cacheHints` on the tool list
 
-Minni advertises 50 tools with full Zod-derived schemas — a large, near-static
+Minni advertises 48 tools with full Zod-derived schemas — a large, near-static
 `tools/list` payload re-sent on every client connection. `2026-07-28` makes
 `ttlMs`/`cacheScope` required, and SDK v2's defaults (`ttlMs: 0`,
 `cacheScope: 'private'`) are deliberately conservative: valid, but they disable
@@ -287,11 +295,16 @@ requires no deprecation-driven work on any timeline.
 ## Sequencing
 
 1. **Now** — this document; the protocol-version tripwire. No behaviour change.
-2. **On host support** (Claude Code negotiating `2026-07-28`, detectable by the
-   tripwire failing or by re-running the bundle check in this document) —
+2. **On host support** — Claude Code negotiating `2026-07-28`, established by
+   re-running the bundle check in this document (or an equivalent probe of the
+   host). **The tripwire does not detect this and must not be waited on for
+   it:** it reads the installed SDK's constants and greps `server.ts`, and never
+   inspects the host binary. A tripwire failure means "the SDK or the server
+   binding moved — re-read this plan", which is a different event that can occur
+   before, after, or without host support. Then
    migrate `server.ts:6-7` and `server.ts:1712-1713` to
    `@modelcontextprotocol/server`'s `serveStdio`. Two imports and one call.
-   Verify all 50 tools still list and dispatch.
+   Verify all 48 tools still list and dispatch.
 3. **After the migration is stable** — `cacheHints` on the tool list
    (opportunity 2, smallest and highest-certainty payoff).
 4. **Then** — MRTR gating on writes (opportunity 1), *after* #251's scanner fix

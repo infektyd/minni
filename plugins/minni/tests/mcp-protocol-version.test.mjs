@@ -9,7 +9,7 @@
 // That is the trap this file guards. Because the migration is a package swap
 // rather than a version bump, the wire protocol Minni speaks can change without
 // any obvious signal in package.json — a transitive resolution, an inattentive
-// dependency edit, or an unexpected v1 release. Under 50 registered tools, that
+// dependency edit, or an unexpected v1 release. Under 48 registered tools, that
 // change would otherwise be invisible until something failed in the field.
 //
 // These assertions therefore lock a CURRENT-STATE FACT rather than correcting a
@@ -102,10 +102,15 @@ test("Minni uses no capability deprecated by 2026-07-28", async () => {
   // exposure is nil. This asserts that stays true: adding one now would take on
   // a migration obligation with a deadline, for a capability already on the way
   // out.
+  // Match the MCP-qualified forms only: the wire method string, or the call
+  // made through a server/client object. A bare `createMessage(` would also
+  // match an unrelated local helper of that name and report it as "uses
+  // Sampling" — a wrong diagnosis is worse than a missed one here, because this
+  // test's whole value is that a failure means exactly what it says.
   for (const [capability, pattern] of [
-    ["Sampling", /sampling\/createMessage|createMessage\s*\(/],
-    ["Roots", /roots\/list|listRoots\s*\(/],
-    ["Logging", /logging\/setLevel|sendLoggingMessage\s*\(/],
+    ["Sampling", /["']sampling\/createMessage["']|\.\s*createMessage\s*\(/],
+    ["Roots", /["']roots\/list["']|\.\s*listRoots\s*\(/],
+    ["Logging", /["']logging\/setLevel["']|\.\s*(?:sendLoggingMessage|setLoggingLevel)\s*\(/],
   ]) {
     assert.ok(
       !pattern.test(source),
