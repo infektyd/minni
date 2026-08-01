@@ -15,6 +15,8 @@ import pytest
 from minni.wire.claude_plugin import (
     ClaudePluginError,
     adopt_claude_code,
+    claude_adopt_pending,
+    follow_claude_desktop,
     installed_plugins_path,
     known_marketplaces_path,
     legacy_cache_root,
@@ -211,20 +213,29 @@ def test_retire_marketplace_is_idempotent(home):
     assert retire_claude_marketplace()["changed"] is False
 
 
-def test_repoint_desktop_moves_only_args_zero(home):
+def _legacy_server(version: str = "0.3.0") -> str:
+    return str(legacy_cache_root() / "minni" / version / "dist" / "server.js")
+
+
+def _write_desktop(home: Path, minni_entry: dict) -> Path:
     cfg = home / "Library/Application Support/Claude/claude_desktop_config.json"
-    cfg.parent.mkdir(parents=True)
+    cfg.parent.mkdir(parents=True, exist_ok=True)
     cfg.write_text(json.dumps({
         "mcpServers": {
-            "minni": {
-                "command": "node",
-                "args": ["/old/cache/dist/server.js"],
-                "env": {"MINNI_WORKSPACE_ID": "workspace-minni"},
-            },
+            "minni": minni_entry,
             "other": {"command": "node", "args": ["/x.js"]},
         },
         "preferences": {"theme": "dark"},
     }), encoding="utf-8")
+    return cfg
+
+
+def test_repoint_desktop_moves_the_cache_arg(home):
+    cfg = _write_desktop(home, {
+        "command": "node",
+        "args": [_legacy_server()],
+        "env": {"MINNI_WORKSPACE_ID": "workspace-minni"},
+    })
     root = _install_tree(home, "0.4.0")
 
     result = repoint_claude_desktop(root)
@@ -236,6 +247,102 @@ def test_repoint_desktop_moves_only_args_zero(home):
     assert data["mcpServers"]["other"]["args"] == ["/x.js"]
     assert data["preferences"] == {"theme": "dark"}
     assert repoint_claude_desktop(root)["changed"] is False
+
+
+def test_repoint_desktop_preserves_flags_before_the_path(home):
+    """The rewrite targets the arg that points into the cache, not args[0].
+
+    Replacing args[0] blindly destroys the flag *and* keeps the doomed cache
+    path as an argument, which the cache deletion would then invalidate.
+    """
+    cfg = _write_desktop(home, {
+        "command": "node",
+        "args": ["--inspect", _legacy_server()],
+    })
+    root = _install_tree(home, "0.4.0")
+
+    result = repoint_claude_desktop(root)
+
+    assert result["changed"] is True
+    assert result["replaced"] == [_legacy_server()]
+    args = json.loads(cfg.read_text(encoding="utf-8"))["mcpServers"]["minni"]["args"]
+    assert args == ["--inspect", str(root / "dist" / "server.js")]
+
+
+def test_repoint_desktop_leaves_unrelated_paths_alone(home):
+    cfg = _write_desktop(home, {"command": "node", "args": ["/elsewhere/server.js"]})
+    root = _install_tree(home, "0.4.0")
+
+    result = repoint_claude_desktop(root)
+
+    assert result["changed"] is False
+    args = json.loads(cfg.read_text(encoding="utf-8"))["mcpServers"]["minni"]["args"]
+    assert args == ["/elsewhere/server.js"]
+
+
+def test_follow_desktop_moves_an_adopted_entry_to_the_new_version(home):
+    """A later wire must not strand Desktop on a version GC will prune."""
+    old = _install_tree(home, "0.4.0")
+    cfg = _write_desktop(home, {
+        "command": "node", "args": [str(old / "dist" / "server.js")],
+    })
+    new = _install_tree(home, "0.4.1")
+
+    result = follow_claude_desktop(new)
+
+    assert result["changed"] is True
+    args = json.loads(cfg.read_text(encoding="utf-8"))["mcpServers"]["minni"]["args"]
+    assert args == [str(new / "dist" / "server.js")]
+    assert follow_claude_desktop(new)["changed"] is False
+
+
+def test_follow_desktop_is_a_noop_before_adoption(home):
+    """Un-adopted machines still point into the cache; wiring must not touch it."""
+    cfg = _write_desktop(home, {"command": "node", "args": [_legacy_server()]})
+    root = _install_tree(home, "0.4.0")
+
+    assert follow_claude_desktop(root)["changed"] is False
+    args = json.loads(cfg.read_text(encoding="utf-8"))["mcpServers"]["minni"]["args"]
+    assert args == [_legacy_server()]
+
+
+def test_gc_retains_a_version_only_claude_desktop_references(home):
+    """Desktop's config is a real reference; GC pruning it would break Desktop."""
+    root = _install_tree(home, "0.2.0")
+    for stale in ("0.3.0", "0.4.0"):
+        _install_tree(home, stale)
+    _write_desktop(home, {"command": "node", "args": [str(root / "dist" / "server.js")]})
+
+    result = run_gc(prune=True, stdin_is_tty=False)
+
+    assert root.is_dir(), "GC collected the tree Claude Desktop launches from"
+    assert str(root) not in result.pruned
+
+
+def test_adopt_pending_tracks_the_marketplace_and_cache(home):
+    assert claude_adopt_pending() is False
+
+    path = known_marketplaces_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"minni": {"installLocation": "/stale"}}), encoding="utf-8")
+    assert claude_adopt_pending() is True
+
+    path.write_text(json.dumps({}), encoding="utf-8")
+    assert claude_adopt_pending() is False
+
+    (legacy_cache_root() / "minni" / "0.3.0").mkdir(parents=True)
+    assert claude_adopt_pending() is True
+
+
+def test_repoint_desktop_refuses_a_command_inside_the_cache(home):
+    _write_desktop(home, {
+        "command": str(legacy_cache_root() / "minni" / "0.3.0" / "bin" / "launcher"),
+        "args": [],
+    })
+    root = _install_tree(home, "0.4.0")
+
+    with pytest.raises(ClaudePluginError, match="points into"):
+        repoint_claude_desktop(root)
 
 
 def test_repoint_desktop_noop_when_not_installed(home):
@@ -261,6 +368,77 @@ def test_remove_legacy_cache_reports_versions(home):
     assert result["changed"] is True
     assert result["removed_versions"] == [str(legacy_cache_root() / "minni" / "0.3.0")]
     assert not legacy_cache_root().exists()
+
+
+def test_remove_legacy_cache_refuses_a_project_scope_referrer(home):
+    """A non-user-scope entry still pointing into the cache blocks the delete.
+
+    Adopt only rewrites the user-scope entry; deleting the tree out from under
+    any other scope leaves that registration dangling.
+    """
+    (legacy_cache_root() / "minni" / "0.3.0").mkdir(parents=True)
+    root = _install_tree(home, "0.4.0")
+    stale = str(legacy_cache_root() / "minni" / "0.3.0")
+    path = installed_plugins_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({
+        "version": 2,
+        "plugins": {"minni@minni": [{"scope": "project", "installPath": stale}]},
+    }), encoding="utf-8")
+
+    with pytest.raises(ClaudePluginError, match="still referenced by"):
+        remove_legacy_cache(root)
+    assert (legacy_cache_root() / "minni" / "0.3.0").is_dir()
+
+
+@pytest.mark.parametrize("relative", [".claude.json", ".claude/settings.json"])
+def test_remove_legacy_cache_refuses_referrers_in_other_configs(home, relative):
+    (legacy_cache_root() / "minni" / "0.3.0").mkdir(parents=True)
+    root = _install_tree(home, "0.4.0")
+    cfg = home / relative
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    cfg.write_text(
+        json.dumps({"anything": {"nested": [str(legacy_cache_root() / "minni")]}}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ClaudePluginError, match="still referenced by"):
+        remove_legacy_cache(root)
+
+
+def test_remove_legacy_cache_refuses_a_desktop_referrer(home):
+    (legacy_cache_root() / "minni" / "0.3.0").mkdir(parents=True)
+    root = _install_tree(home, "0.4.0")
+    _write_desktop(home, {"command": "node", "args": ["--inspect", _legacy_server()]})
+
+    with pytest.raises(ClaudePluginError, match="still referenced by"):
+        remove_legacy_cache(root)
+
+
+def test_remove_legacy_cache_spares_a_sibling_plugin(home):
+    """Deletion is scoped to cache/minni/minni, not the whole marketplace dir."""
+    (legacy_cache_root() / "minni" / "0.3.0").mkdir(parents=True)
+    sibling = legacy_cache_root() / "otherplugin" / "1.0.0"
+    sibling.mkdir(parents=True)
+    root = _install_tree(home, "0.4.0")
+
+    result = remove_legacy_cache(root)
+
+    assert result["changed"] is True
+    assert sibling.is_dir()
+    assert result["siblings_kept"] == [str(legacy_cache_root() / "otherplugin")]
+    assert not (legacy_cache_root() / "minni").exists()
+
+
+def test_remove_legacy_cache_refuses_an_unreadable_config(home):
+    (legacy_cache_root() / "minni" / "0.3.0").mkdir(parents=True)
+    root = _install_tree(home, "0.4.0")
+    path = installed_plugins_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("{not json", encoding="utf-8")
+
+    with pytest.raises(ClaudePluginError, match="cannot verify"):
+        remove_legacy_cache(root)
 
 
 # --- adopt ------------------------------------------------------------------
@@ -330,6 +508,63 @@ def test_adopt_is_idempotent(home):
     assert second["steps"]["register"]["changed"] is False
     assert second["steps"]["marketplace"]["changed"] is False
     assert second["steps"]["legacy_cache"]["changed"] is False
+
+
+def test_adopt_dry_run_tolerates_the_registration_it_will_rewrite(home):
+    """The pre-adopt user-scope entry points into the cache; that is not a blocker.
+
+    Scanning the on-disk file would refuse on every un-adopted machine, so the
+    dry run must scan the documents adopt is about to write.
+    """
+    root = _install_tree(home, "0.4.0")
+    _write_wired(home, root, "0.4.0")
+    stale = str(legacy_cache_root() / "minni" / "0.3.0")
+    (legacy_cache_root() / "minni" / "0.3.0").mkdir(parents=True)
+    path = installed_plugins_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({
+        "version": 2,
+        "plugins": {"minni@minni": [{"scope": "user", "installPath": stale}]},
+    }), encoding="utf-8")
+
+    result = adopt_claude_code()
+
+    assert result["steps"]["legacy_cache"]["changed"] is True
+    assert (legacy_cache_root() / "minni" / "0.3.0").is_dir()
+    assert adopt_claude_code(apply=True)["applied"] is True
+    assert not (legacy_cache_root() / "minni").exists()
+
+
+def test_adopt_refuses_when_a_foreign_scope_still_points_into_the_cache(home):
+    root = _install_tree(home, "0.4.0")
+    _write_wired(home, root, "0.4.0")
+    stale = str(legacy_cache_root() / "minni" / "0.3.0")
+    (legacy_cache_root() / "minni" / "0.3.0").mkdir(parents=True)
+    path = installed_plugins_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({
+        "version": 2,
+        "plugins": {"minni@minni": [{"scope": "project", "installPath": stale}]},
+    }), encoding="utf-8")
+
+    with pytest.raises(ClaudePluginError, match="still referenced by"):
+        adopt_claude_code()
+
+
+def test_register_preserves_entries_it_does_not_understand(home):
+    root = _install_tree(home, "0.4.0")
+    path = installed_plugins_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({
+        "version": 2,
+        "plugins": {"minni@minni": ["a-string-entry", {"scope": "project", "installPath": "/p"}]},
+    }), encoding="utf-8")
+
+    register_claude_plugin(root, "0.4.0")
+
+    entries = _registry(home)["plugins"]["minni@minni"]
+    assert "a-string-entry" in entries
+    assert {"scope": "project", "installPath": "/p"} in entries
 
 
 # --- wired.json reader ------------------------------------------------------

@@ -26,7 +26,7 @@ import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 
-from minni.wire.paths import user_home
+from minni.wire.paths import plugin_base, user_home
 from minni.wire.wired import wired_record
 
 PLUGIN_KEY = "minni@minni"
@@ -112,6 +112,7 @@ def register_claude_plugin(
     *,
     git_sha: str | None = None,
     dry_run: bool = False,
+    pending: dict[str, dict] | None = None,
 ) -> dict[str, object]:
     """Idempotently point Claude Code's `minni@minni` plugin at `install_root`.
 
@@ -131,10 +132,15 @@ def register_claude_plugin(
     plugins = dict(plugins)
 
     raw_entries = plugins.get(PLUGIN_KEY)
-    entries = [e for e in raw_entries if isinstance(e, dict)] if isinstance(raw_entries, list) else []
+    # Entries we do not understand are carried through untouched rather than
+    # dropped: only the user-scope dict is ours to rewrite.
+    entries = list(raw_entries) if isinstance(raw_entries, list) else []
 
     index = next(
-        (i for i, e in enumerate(entries) if e.get("scope", USER_SCOPE) == USER_SCOPE),
+        (
+            i for i, e in enumerate(entries)
+            if isinstance(e, dict) and e.get("scope", USER_SCOPE) == USER_SCOPE
+        ),
         None,
     )
     existing = entries[index] if index is not None else None
@@ -155,6 +161,10 @@ def register_claude_plugin(
         return {k: v for k, v in entry.items() if k != "lastUpdated"}
 
     if existing is not None and _identity(existing) == _identity(merged):
+        plugins[PLUGIN_KEY] = entries
+        doc["plugins"] = plugins
+        if pending is not None:
+            pending[str(path)] = doc
         return {
             "path": str(path),
             "install_path": install_path,
@@ -173,6 +183,8 @@ def register_claude_plugin(
 
     if not dry_run:
         _atomic_write_json(path, doc)
+    if pending is not None:
+        pending[str(path)] = doc
 
     return {
         "path": str(path),
@@ -206,15 +218,63 @@ def retire_claude_marketplace(*, dry_run: bool = False) -> dict[str, object]:
 
 
 def repoint_claude_desktop(
-    install_root: Path, *, dry_run: bool = False,
+    install_root: Path, *, dry_run: bool = False, pending: dict[str, dict] | None = None,
 ) -> dict[str, object]:
     """Move Claude Desktop's minni server onto the wire tree.
 
     Desktop is a separate product with a disjoint config tree, but its
     mcpServers.minni entry was written pointing into the marketplace cache that
-    the cutover deletes. Only args[0] moves; env (workspace id, AFM settings),
-    other servers and unrelated top-level keys are preserved.
+    the cutover deletes.
+
+    The rewrite targets *the argument that actually points into the legacy
+    cache*, not args[0]: an entry like ["--inspect", ".../cache/.../server.js"]
+    keeps its flag and moves the path. env (workspace id, AFM settings), other
+    servers and unrelated top-level keys are preserved. When no argument points
+    into the cache this is a no-op — Desktop is pointed at something that is not
+    ours to move, and remove_legacy_cache's scan is what decides whether the
+    deletion is still safe.
     """
+    return _move_desktop_arg(
+        install_root,
+        legacy_cache_root(),
+        "legacy cache",
+        dry_run=dry_run,
+        pending=pending,
+        refuse_command=True,
+    )
+
+
+def follow_claude_desktop(
+    install_root: Path, *, dry_run: bool = False, pending: dict[str, dict] | None = None,
+) -> dict[str, object]:
+    """Keep an already-adopted Claude Desktop on the current wire tree.
+
+    Desktop records a *versioned* path, so a wire that installs a new version
+    strands it on the old one — which GC then prunes out from under it. This
+    moves any argument already inside ~/.minni/plugin onto the freshly wired
+    root, and is a no-op on machines that have not run the adoption cutover:
+    only a path under the wire tree is ever rewritten.
+    """
+    return _move_desktop_arg(
+        install_root,
+        plugin_base(),
+        "wire tree",
+        dry_run=dry_run,
+        pending=pending,
+        refuse_command=False,
+    )
+
+
+def _move_desktop_arg(
+    install_root: Path,
+    under: Path,
+    what: str,
+    *,
+    dry_run: bool,
+    pending: dict[str, dict] | None,
+    refuse_command: bool,
+) -> dict[str, object]:
+    """Point Desktop's minni server at `install_root`, moving args under `under`."""
     path = claude_desktop_config_path()
     if not path.parent.exists():
         return {"path": str(path), "changed": False, "reason": "Claude Desktop not installed"}
@@ -225,18 +285,142 @@ def repoint_claude_desktop(
 
     entry = dict(servers["minni"])
     server_js = str(install_root / "dist" / "server.js")
-    args = entry.get("args")
-    args = [str(a) for a in args] if isinstance(args, list) else []
-    if args[:1] == [server_js]:
+
+    command = entry.get("command")
+    if refuse_command and isinstance(command, str) and _is_under(command, under):
+        # A launcher living inside the tree we are about to delete. Guessing a
+        # replacement command is how you silently break someone's Desktop.
+        raise ClaudePluginError(
+            f"{path}: mcpServers.minni.command points into {under} ({command}); "
+            "repoint it by hand before adopting",
+        )
+
+    raw_args = entry.get("args")
+    args = [str(a) for a in raw_args] if isinstance(raw_args, list) else []
+    if server_js in args:
         return {"path": str(path), "changed": False, "reason": "already on the wire tree"}
 
-    entry["args"] = [server_js, *args[1:]]
+    targets = [i for i, a in enumerate(args) if _is_under(a, under)]
+    if not targets:
+        return {
+            "path": str(path), "changed": False,
+            "reason": f"no argument points into the {what}",
+        }
+
+    new_args = list(args)
+    for i in targets:
+        new_args[i] = server_js
+    entry["args"] = new_args
     servers = dict(servers)
     servers["minni"] = entry
     doc["mcpServers"] = servers
     if not dry_run:
         _atomic_write_json(path, doc)
-    return {"path": str(path), "changed": True, "server": server_js}
+    if pending is not None:
+        pending[str(path)] = doc
+    return {
+        "path": str(path), "changed": True, "server": server_js,
+        "replaced": [args[i] for i in targets],
+    }
+
+
+def claude_adopt_pending() -> bool:
+    """True while the retired marketplace or its cache tree is still present.
+
+    Registration alone does not disarm `/plugin update`: as long as the `minni`
+    marketplace entry survives, an update reinstalls into the cache and rewrites
+    installPath off the wire tree.
+    """
+    try:
+        marketplaces = _load_json_doc(known_marketplaces_path(), {})
+    except ClaudePluginError:
+        # Unreadable is not "clean"; surfacing the nudge is the safe direction.
+        return True
+    return MARKETPLACE_NAME in marketplaces or (legacy_cache_root() / MARKETPLACE_NAME).is_dir()
+
+
+def legacy_scan_paths() -> list[Path]:
+    """Configs that may name a path inside the legacy cache.
+
+    known_marketplaces.json is deliberately absent: its `minni` entry is the one
+    reference the cutover retires itself, one step earlier.
+    """
+    home = user_home()
+    return [
+        installed_plugins_path(),
+        home / ".claude.json",
+        home / ".claude" / "settings.json",
+        home / ".claude" / "settings.local.json",
+        claude_desktop_config_path(),
+    ]
+
+
+def _is_under(value: str, root: Path) -> bool:
+    """True when `value` is an absolute path at or below `root`.
+
+    Compared component-wise via relative_to, so `.../cache/minnix` does not
+    match `.../cache/minni`. Non-paths ("--inspect", "node") fall out as
+    non-absolute.
+    """
+    if not value:
+        return False
+    try:
+        candidate = Path(value)
+    except (TypeError, ValueError):
+        return False
+    if not candidate.is_absolute():
+        return False
+    for base in {root, root.resolve()}:
+        try:
+            candidate.relative_to(base)
+        except ValueError:
+            continue
+        return True
+    return False
+
+
+def _iter_json_strings(node: object, trail: str = "") -> object:
+    """Every string leaf in a JSON document, with a dotted path to it.
+
+    Walking the whole document rather than known keys is the point: the cache
+    path turns up in installPath, in argv, in env values and in fields no
+    version of this code has seen yet.
+    """
+    if isinstance(node, dict):
+        for key, value in node.items():
+            yield from _iter_json_strings(value, f"{trail}.{key}" if trail else str(key))
+    elif isinstance(node, list):
+        for i, value in enumerate(node):
+            yield from _iter_json_strings(value, f"{trail}[{i}]")
+    elif isinstance(node, str):
+        yield trail, node
+
+
+def legacy_cache_referrers(*, overrides: dict[str, dict] | None = None) -> list[str]:
+    """Every live reference into the legacy cache, as "<file>: <field> -> <path>".
+
+    A config that cannot be parsed is itself reported: an unreadable file is not
+    evidence that nothing points into the tree, and this list gates an rmtree.
+    """
+    root = legacy_cache_root()
+    overrides = overrides or {}
+    found: list[str] = []
+    for path in legacy_scan_paths():
+        key = str(path)
+        if key in overrides:
+            doc: object = overrides[key]
+        elif not path.exists():
+            continue
+        else:
+            try:
+                doc = _load_json_doc(path, {})
+            except ClaudePluginError as exc:
+                found.append(f"{path}: unreadable, cannot verify ({exc})")
+                continue
+        for trail, value in _iter_json_strings(doc):
+            if _is_under(value, root):
+                found.append(f"{path}: {trail} -> {value}")
+    return found
 
 
 def legacy_cache_dirs() -> list[Path]:
@@ -248,9 +432,29 @@ def legacy_cache_dirs() -> list[Path]:
 
 
 def remove_legacy_cache(
-    install_root: Path, *, dry_run: bool = False,
+    install_root: Path,
+    *,
+    dry_run: bool = False,
+    overrides: dict[str, dict] | None = None,
 ) -> dict[str, object]:
-    """Delete ~/.claude/plugins/cache/minni once nothing points into it."""
+    """Delete the retired plugin cache once nothing points into it.
+
+    Two properties this guarantees, both of which the earlier version did not:
+
+    * **It refuses while anything still references the tree.** Every config in
+      `legacy_scan_paths()` is scanned for a path under `legacy_cache_root()` —
+      all plugins and all scopes in installed_plugins.json, ~/.claude.json,
+      settings.json and Claude Desktop's config. A single live reference aborts
+      the deletion and names the offender, rather than leaving it dangling.
+    * **It deletes only what it enumerates.** The target is the plugin dir
+      `<cache>/minni/minni`, not the whole marketplace dir. A sibling plugin
+      cached under the same marketplace survives and is reported in
+      `siblings_kept`; the marketplace dir is removed only once it is empty.
+
+    `overrides` lets a caller scan the documents that *will* be on disk rather
+    than the ones currently there, so a dry run answers the same question the
+    apply run does instead of tripping over registrations adopt itself rewrites.
+    """
     root = legacy_cache_root()
     if not root.exists():
         return {"path": str(root), "changed": False, "reason": "already absent"}
@@ -263,10 +467,34 @@ def remove_legacy_cache(
         raise ClaudePluginError(
             f"refusing to remove {root}: the wired install root {install_root} is inside it",
         )
+
+    referrers = legacy_cache_referrers(overrides=overrides)
+    if referrers:
+        listed = "\n  ".join(referrers)
+        raise ClaudePluginError(
+            f"refusing to remove {root}: still referenced by\n  {listed}\n"
+            "repoint or remove these before adopting "
+            "(or re-run with --keep-legacy-cache)",
+        )
+
+    target = root / MARKETPLACE_NAME
+    if target.is_symlink():
+        raise ClaudePluginError(f"{target} is a symlink; refusing to remove it")
     removed = [str(p) for p in legacy_cache_dirs()]
+    siblings = sorted(str(p) for p in root.iterdir() if p != target)
+
     if not dry_run:
-        shutil.rmtree(root)
-    return {"path": str(root), "changed": True, "removed_versions": removed}
+        if target.exists():
+            shutil.rmtree(target)
+        if not any(root.iterdir()):
+            root.rmdir()
+
+    return {
+        "path": str(target),
+        "changed": True,
+        "removed_versions": removed,
+        "siblings_kept": siblings,
+    }
 
 
 def adopt_claude_code(
@@ -300,20 +528,29 @@ def adopt_claude_code(
             raise ClaudePluginError(f"cannot read {manifest_path}: {exc}") from exc
 
     dry_run = not apply
+    # The cache scan must see the configs as they will be *after* the steps
+    # below, or a dry run would refuse over the very registrations adopt is
+    # rewriting — and would disagree with what `--apply` actually does.
+    overrides: dict[str, dict] = {}
     steps: dict[str, object] = {
         "register": register_claude_plugin(
-            install_root, version, git_sha=git_sha, dry_run=dry_run,
+            install_root, version, git_sha=git_sha, dry_run=dry_run, pending=overrides,
         ),
-        "claude_desktop": repoint_claude_desktop(install_root, dry_run=dry_run),
+        "claude_desktop": repoint_claude_desktop(
+            install_root, dry_run=dry_run, pending=overrides,
+        ),
         "marketplace": retire_claude_marketplace(dry_run=dry_run),
     }
+
     if keep_legacy_cache:
         steps["legacy_cache"] = {
             "changed": False, "reason": "kept (--keep-legacy-cache)",
             "dirs": [str(p) for p in legacy_cache_dirs()],
         }
     else:
-        steps["legacy_cache"] = remove_legacy_cache(install_root, dry_run=dry_run)
+        steps["legacy_cache"] = remove_legacy_cache(
+            install_root, dry_run=dry_run, overrides=overrides,
+        )
 
     return {
         "schema": 1,

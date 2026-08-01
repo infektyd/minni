@@ -9,7 +9,12 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 
-from minni.wire.claude_plugin import ClaudePluginError, register_claude_plugin
+from minni.wire.claude_plugin import (
+    ClaudePluginError,
+    claude_adopt_pending,
+    follow_claude_desktop,
+    register_claude_plugin,
+)
 from minni.wire.from_repo import build_from_repo, self_check_manifest
 from minni.wire.gc import run_gc
 from minni.wire.install import (
@@ -424,6 +429,29 @@ def run_wire(args) -> int:
                             install_root, version,
                             git_sha=manifest.git_sha, dry_run=dry_run,
                         )
+                        # Desktop records a *versioned* path, so a wire that
+                        # moves the tree strands it on a version GC will later
+                        # prune. Adopt is what first moves Desktop onto the wire
+                        # tree; keeping it there is ordinary wiring's job. This
+                        # is a no-op until adoption has happened, since only a
+                        # path under the wire tree is ever rewritten.
+                        extras["claude_desktop"] = follow_claude_desktop(
+                            install_root, dry_run=dry_run,
+                        )
+                        # Wiring alone leaves a half-migrated machine: the stale
+                        # marketplace is still there, so `/plugin update` will
+                        # reinstall into the cache and rewrite installPath off
+                        # the tree we just registered — the exact silent
+                        # reversion this registration exists to stop.
+                        if claude_adopt_pending():
+                            extras["claude_adopt_pending"] = True
+                            print(
+                                "[wire] claude-code: the retired minni marketplace/cache "
+                                "install is still present. Run `minni wire-adopt "
+                                "claude-code` (then `--apply`) or `/plugin update` can "
+                                "revert the plugin surface off the wire tree.",
+                                file=sys.stderr,
+                            )
                     except ClaudePluginError as exc:
                         out.results.append(PlatformResult(
                             platform, "failed",

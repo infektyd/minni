@@ -133,15 +133,43 @@ not ride along with ordinary wiring.
    currently launches `mcpServers.minni` from the 0.3.0 cache. Step 4 deletes
    that dir, so the repoint is not optional — skipping it would knowingly break
    a live surface. Merge-only: other servers and unrelated top-level keys are
-   preserved.
+   preserved. The rewrite targets *the argument that points into the legacy
+   cache*, not `args[0]`, so an entry like `["--inspect", "<cache>/server.js"]`
+   keeps its flag; when no argument points into the cache the step is a no-op
+   and step 4's scan decides whether deletion is still safe. A `command` living
+   inside the cache aborts the cutover rather than being guessed at.
 3. **Retire the stale marketplace entry** (`minni` →
    `~/Projects/minni-worktrees/cursor-hooks`) from `known_marketplaces.json`.
-4. **Remove the legacy cache tree** `~/.claude/plugins/cache/minni/minni/*`
+4. **Remove the legacy cache tree** `~/.claude/plugins/cache/minni/minni`
    (skippable with `--keep-legacy-cache`).
 
 Each step reports `changed: true|false` and is individually idempotent, so a
 re-run after a partial failure completes the remainder rather than compounding.
 **This PR ships the code; it is not executed against the live machine.**
+
+#### What step 4 guarantees
+
+The deletion is an `rmtree` on a live machine, so it carries two explicit
+properties rather than relying on the earlier steps having done their job:
+
+- **It refuses while anything still points into the tree.** Before deleting,
+  every string in `installed_plugins.json` (all plugins, all scopes),
+  `~/.claude.json`, `~/.claude/settings{,.local}.json` and the Claude Desktop
+  config is checked for a path under `~/.claude/plugins/cache/minni`. Any hit
+  aborts the cutover and names the offending file and field. A config that
+  cannot be parsed counts as a hit: an unreadable file is not evidence that
+  nothing references the tree. `known_marketplaces.json` is deliberately not
+  scanned — its `minni` entry is the one reference step 3 retires itself.
+- **It deletes only what it enumerates.** The target is the plugin dir
+  `<cache>/minni/minni`, not the whole `<cache>/minni` marketplace dir. A
+  sibling plugin cached under the same marketplace survives and is listed in
+  `siblings_kept`; the marketplace dir is removed only once it is empty.
+
+Because step 1 and step 2 rewrite registrations that themselves point into the
+cache, the scan runs against the documents those steps are *about to write*, not
+the ones currently on disk. A dry run therefore answers exactly the question
+`--apply` will answer, instead of refusing on every machine that has not adopted
+yet.
 
 ### Cutover runbook (operator, after merge)
 
