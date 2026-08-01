@@ -92,7 +92,18 @@ IGNORED_SUFFIXES = {".pyc", ".pyo"}
 # report the same drift twice and, worse, drown real content drift in a manifest
 # diff that is expected on any wire-installed tree (which stamps its own
 # PEP440-local version).
-VERSION_NORMALIZED_SUFFIXES = (".json",)
+#
+# Scoped to the five plugin-manifest files check_versions.py actually reads --
+# NOT every ".json" under the compared subtrees. hooks/hooks-cursor.json also
+# has a top-level "version" field, but it is Cursor's *hooks schema* version,
+# not plugin semver, and check_versions.py never reads it. Stripping it here
+# too would re-blind exactly the file this whole slice exists to stop
+# under-reporting: a schema-version-only change would digest identically and
+# report no drift, with no other check catching it either.
+VERSION_NORMALIZED_RELPATHS = {
+    "plugin.json",
+    "gemini-extension.json",
+}
 
 
 def source_sha() -> str:
@@ -137,10 +148,16 @@ def _ignored(rel: Path) -> bool:
     return rel.suffix in IGNORED_SUFFIXES
 
 
-def _digest(path: Path) -> str:
-    """Content hash, with the version field normalized out of JSON manifests."""
+def _digest(path: Path, rel: Path) -> str:
+    """Content hash, with the version field normalized out of plugin manifests.
+
+    ``rel`` is the path within the compared subtree (e.g. ``plugin.json`` for
+    ``.claude-plugin/plugin.json``), which is what scopes the strip to the
+    manifest files by name -- not to every ``.json`` under the subtree, which
+    would also strip hooks/hooks-cursor.json's unrelated schema-version field.
+    """
     data = path.read_bytes()
-    if path.suffix in VERSION_NORMALIZED_SUFFIXES:
+    if rel.parent == Path(".") and rel.name in VERSION_NORMALIZED_RELPATHS:
         try:
             parsed = json.loads(data.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError):
@@ -165,20 +182,35 @@ def _hash_tree(root: Path) -> tuple[dict[str, str], list[str]]:
         if not path.is_file():
             continue
         try:
-            digests[str(rel)] = _digest(path)
+            digests[str(rel)] = _digest(path, rel)
         except OSError as exc:
             unreadable.append(f"{rel} ({type(exc).__name__})")
     return digests, unreadable
 
 
-def compare_content(deployment_root: Path) -> tuple[list[str], list[str]]:
-    """(drifted 'subtree/relpath' entries, unreadable entries)."""
+def hash_source() -> dict[str, tuple[dict[str, str], list[str]]]:
+    """Hash every compared subtree under source once, shared across deployments."""
+    return {sub: _hash_tree(SOURCE_ROOT / sub) for sub in COMPARED_SUBTREES}
+
+
+def compare_content(
+    deployment_root: Path, source: dict[str, tuple[dict[str, str], list[str]]]
+) -> tuple[list[str], list[str]]:
+    """(drifted 'subtree/relpath' entries, unreadable entries).
+
+    Only files unreadable *on the deployment side* count against the
+    deployment: a source file this tool cannot read is a defect in the tool or
+    the checkout it is running from, not evidence that the deployment itself
+    has drifted, and charging it to every deployment in the same run would
+    make an unrelated deployment fail for a fault that is not its own. Source
+    unreadability is surfaced once, separately, by the caller.
+    """
     drifted: list[str] = []
     unreadable: list[str] = []
     for sub in COMPARED_SUBTREES:
-        src, src_bad = _hash_tree(SOURCE_ROOT / sub)
+        src, _src_bad = source[sub]
         dep, dep_bad = _hash_tree(deployment_root / sub)
-        unreadable.extend(f"{sub}/{e}" for e in src_bad + dep_bad)
+        unreadable.extend(f"{sub}/{e}" for e in dep_bad)
         if not src and not dep:
             continue
         for rel in sorted(set(src) | set(dep)):
@@ -203,7 +235,22 @@ def main(argv: list[str] | None = None) -> int:
     print(f"content compared: {', '.join(COMPARED_SUBTREES)}")
     for name, why in NOT_COMPARED.items():
         print(f"not compared: {name} — {why}")
+    print(
+        "version field normalized out of: "
+        + ", ".join(sorted(VERSION_NORMALIZED_RELPATHS))
+        + " — owned by scripts/check_versions.py"
+    )
     print()
+
+    source = hash_source()
+    source_bad = [
+        f"{sub}/{e}" for sub, (_digests, bad) in source.items() for e in bad
+    ]
+    if source_bad:
+        print("SOURCE UNREADABLE (tool/checkout defect, not a deployment fault):")
+        for e in source_bad:
+            print(f"      {e}")
+        print()
 
     home = _home()
     rows: list[tuple[str, str, str]] = []
@@ -232,7 +279,7 @@ def main(argv: list[str] | None = None) -> int:
                     rows.append(("STALE", f"dist {sha[:8]}{dirty} built {built}", label))
                     stale += 1
 
-        drift, bad = compare_content(root)
+        drift, bad = compare_content(root, source)
         if bad:
             unreadable_count += 1
             rows.append(("UNREADABLE", f"{len(bad)} file(s) unreadable", label))
@@ -265,7 +312,7 @@ def main(argv: list[str] | None = None) -> int:
             f"{roots} deployment(s): {stale} stale dist, {drifted_count} with content drift, "
             f"{unknown} unknown vintage, {unreadable_count} partly unreadable."
         )
-    failed = stale or unknown or drifted_count or unreadable_count
+    failed = stale or unknown or drifted_count or unreadable_count or source_bad
     if failed:
         print("\nRefresh with: make stage-payload  (payload)  /  npm run build  (source dist)")
         print("Content drift is a propagation problem, not a build one: re-run the installer")

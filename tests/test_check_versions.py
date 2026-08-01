@@ -106,7 +106,18 @@ def test_deployed_layer_passes_when_the_deployment_agrees(tmp_path):
         re.M,
     ).group(1)
     home = _fake_home_with_deployment(tmp_path, canonical)
-    proc = _run(env_extra={"MINNI_CHECK_VERSIONS_HOME": str(home)})
+    # Only the deployed layer is under test here. The installed layer reads
+    # whatever `minni` version happens to be on this interpreter's sys.path,
+    # which this repo's own dev install may or may not match at any given
+    # moment -- a real disagreement there must fail the *installed*-layer test,
+    # not this one, so it is stubbed out rather than left to the ambient
+    # environment.
+    proc = _run(
+        env_extra={
+            "MINNI_CHECK_VERSIONS_HOME": str(home),
+            "_MINNI_CHECK_VERSIONS_SKIP_INSTALLED": "1",
+        }
+    )
     assert proc.returncode == 0, proc.stderr or proc.stdout
     assert "(agrees)" in proc.stdout
 
@@ -135,6 +146,14 @@ def test_unparseable_deployed_manifest_is_uninspectable(tmp_path):
 def test_no_deployments_is_reported_but_not_a_failure(tmp_path):
     home = tmp_path / "empty-home"
     home.mkdir()
-    proc = _run(env_extra={"MINNI_CHECK_VERSIONS_HOME": str(home)})
+    # Same reasoning as test_deployed_layer_passes_when_the_deployment_agrees:
+    # this test is about the deployed layer being empty, not about whatever
+    # `minni` version is installed in the interpreter running the suite.
+    proc = _run(
+        env_extra={
+            "MINNI_CHECK_VERSIONS_HOME": str(home),
+            "_MINNI_CHECK_VERSIONS_SKIP_INSTALLED": "1",
+        }
+    )
     assert proc.returncode == 0, proc.stderr or proc.stdout
     assert "no deployments discovered" in proc.stdout

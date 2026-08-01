@@ -57,6 +57,20 @@ def _parse_iso_utc(value: str) -> Optional[float]:
         return None
 
 
+def _extract_frontmatter(text: str) -> str:
+    """The leading `---`-fenced YAML block, or the whole text if none is found.
+
+    Falling back to the whole text keeps this permissive for malformed pages
+    (they still get scanned) rather than silently treating them as having no
+    ``created`` field; the parse-then-validate step in the caller is what
+    actually rejects unusable values.
+    """
+    if not text.startswith("---"):
+        return text
+    end = text.find("\n---", 3)
+    return text if end == -1 else text[:end]
+
+
 def derive_loop_status(
     state: dict,
     schedule: Optional[dict] = None,
@@ -471,12 +485,23 @@ def writer_status(
                 continue
             if "status: draft" in text and "agent: afm-loop" in text:
                 pending += 1
+                # Search only the frontmatter block (between the leading `---`
+                # fences), not the whole file: a draft's body is free-form prose
+                # and may itself contain the substring "created:", which must
+                # not be read as the draft's own creation date.
+                frontmatter = _extract_frontmatter(text)
                 # The value is yaml.safe_dump'd, so it arrives quoted:
                 # `created: '2026-06-20T00:07:39Z'`. The unquoted-only pattern
                 # matched nothing, which is why drafts_pending_oldest was null
                 # on a vault of 1,210 drafts and the age threshold never fired.
-                created = re.search(r"created:\s*['\"]?([0-9T:Z-]+)", text)
-                if created:
+                created = re.search(r"^created:\s*['\"]?([0-9T:.Z-]+)", frontmatter, re.MULTILINE)
+                # A match that does not parse as a UTC timestamp (e.g. a
+                # millisecond-precision value) is not usable as `oldest` either:
+                # stuffing an unparseable string in there would neither read as
+                # dated (age/TTL logic silently no-ops on it) nor as undated
+                # (the "age unknown" reason would not fire). Count it as undated
+                # instead so the gap is visible rather than swallowed.
+                if created and _parse_iso_utc(created.group(1)) is not None:
                     value = created.group(1)
                     oldest = value if oldest is None else min(oldest, value)
                 else:

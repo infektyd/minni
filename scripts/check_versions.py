@@ -256,7 +256,19 @@ def main(argv: list[str] | None = None) -> int:
     if args.repo_only:
         notes.append("installed/deployed layers skipped (--repo-only)")
     else:
-        for found, extra in (check_installed(canonical), check_deployed(canonical)):
+        # Test-only escape hatch, not a CLI flag: it exists so tests targeting
+        # the *deployed* layer's pass/fail behavior are not coupled to whatever
+        # `minni` version happens to be installed in the interpreter running
+        # the suite. A real mismatch there must fail the installed-layer tests,
+        # not an unrelated deployed-layer test picked at random by dev-install
+        # drift. Never set in normal use -- the real CLI always inspects all
+        # three layers.
+        if os.environ.get("_MINNI_CHECK_VERSIONS_SKIP_INSTALLED"):
+            installed_found, installed_notes = [], ["installed: skipped (test isolation)"]
+        else:
+            installed_found, installed_notes = check_installed(canonical)
+        deployed_found, deployed_notes = check_deployed(canonical)
+        for found, extra in ((installed_found, installed_notes), (deployed_found, deployed_notes)):
             mismatches.extend(found)
             notes.extend(extra)
 

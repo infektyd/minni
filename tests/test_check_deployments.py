@@ -121,6 +121,24 @@ def test_manifest_version_alone_is_not_content_drift(tmp_path):
     assert "DRIFT" not in proc.stdout
 
 
+def test_hooks_schema_version_is_not_normalized_away(tmp_path):
+    """hooks-cursor.json's top-level "version" is Cursor's hooks-schema
+    version, not plugin semver -- check_versions.py never reads it. Stripping
+    it the same way plugin-manifest versions are stripped would re-blind a
+    real content difference, exactly the failure this slice exists to end."""
+    home = tmp_path / "home"
+    home.mkdir()
+    root = _deployment(home, link_dist_to=SOURCE / "dist")
+    manifest = root / "hooks" / "hooks-cursor.json"
+    data = json.loads(manifest.read_text(encoding="utf-8"))
+    data["version"] = data.get("version", 1) + 1
+    manifest.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+    proc = _run("--strict", home=home, repo_root=_isolated_repo_root(tmp_path))
+    assert proc.returncode == 1, proc.stdout
+    assert "hooks/hooks-cursor.json" in proc.stdout
+
+
 def test_manifest_content_drift_is_still_caught(tmp_path):
     home = tmp_path / "home"
     home.mkdir()
@@ -179,6 +197,37 @@ def test_editor_droppings_are_not_drift(tmp_path):
 
     proc = _run("--strict", home=home, repo_root=_isolated_repo_root(tmp_path))
     assert proc.returncode == 0, proc.stdout
+
+
+def test_source_unreadable_is_not_charged_to_the_deployment(tmp_path):
+    """A file this tool cannot read on the *source* side is a tool/checkout
+    defect, not evidence the deployment drifted. It must still fail the run
+    loudly (never silently treated as clean) but must not be attributed to a
+    deployment whose own copy is perfectly readable."""
+    if os.geteuid() == 0:  # pragma: no cover - root ignores mode bits
+        import pytest
+
+        pytest.skip("root can read anything")
+    home = tmp_path / "home"
+    home.mkdir()
+    root = _deployment(home, link_dist_to=SOURCE / "dist")
+    repo_root = _isolated_repo_root(tmp_path)
+    source_file = repo_root / "plugins" / "minni" / "hooks" / "hooks.json"
+    # The isolated repo root symlinks plugins/ back to the real tree, so make
+    # the source file unreadable on the real tree and restore it afterward.
+    real_source_file = SOURCE / "hooks" / "hooks.json"
+    real_source_file.chmod(0o000)
+    try:
+        proc = _run("--strict", home=home, repo_root=repo_root)
+    finally:
+        real_source_file.chmod(0o644)
+    assert proc.returncode == 1, proc.stdout
+    assert "SOURCE UNREADABLE" in proc.stdout
+    # The deployment's own copy is fine and must not be reported UNREADABLE.
+    label = str(root).replace(str(home), "~")
+    for line in proc.stdout.splitlines():
+        if label in line:
+            assert "UNREADABLE" not in line, proc.stdout
 
 
 def test_deployment_globs_cover_the_known_trees():

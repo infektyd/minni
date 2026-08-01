@@ -214,6 +214,48 @@ def test_quoted_created_dates_are_read(tmp_path, monkeypatch):
     assert status["status"] == "backlogged"
 
 
+def test_body_text_containing_created_is_not_read_as_the_date(tmp_path, monkeypatch):
+    """A draft's free-form body may itself contain the substring "created:"
+    (e.g. quoting another page's frontmatter). Only the draft's own frontmatter
+    block may be read for its date."""
+    import minni.afm_writer as afm_writer
+
+    monkeypatch.setattr(afm_writer, "_LAST_RUN_PER_PASS", {}, raising=False)
+    monkeypatch.setattr(afm_writer, "_LAST_ATTEMPT_PER_PASS", {}, raising=False)
+    page = tmp_path / "wiki" / "sessions" / "d.md"
+    page.parent.mkdir(parents=True)
+    page.write_text(
+        "---\nstatus: draft\nagent: afm-loop\ncreated: '2026-07-30T00:00:00Z'\n---\n"
+        "See the other page's frontmatter: created: '2020-01-01T00:00:00Z'\n",
+        encoding="utf-8",
+    )
+
+    status = afm_writer.writer_status(str(tmp_path), schedule=SCHEDULE)
+    assert status["drafts_pending_oldest"] == "2026-07-30T00:00:00Z"
+
+
+def test_unparseable_created_value_counts_as_undated(tmp_path, monkeypatch):
+    """A millisecond-precision timestamp (or any value _parse_iso_utc rejects)
+    must not be stuffed into drafts_pending_oldest: it would neither trigger
+    the age/TTL logic (which needs a parseable value) nor the "age unknown"
+    reason (which only fires when the field is None)."""
+    import minni.afm_writer as afm_writer
+
+    monkeypatch.setattr(afm_writer, "_LAST_RUN_PER_PASS", {}, raising=False)
+    monkeypatch.setattr(afm_writer, "_LAST_ATTEMPT_PER_PASS", {}, raising=False)
+    page = tmp_path / "wiki" / "sessions" / "d.md"
+    page.parent.mkdir(parents=True)
+    page.write_text(
+        "---\nstatus: draft\nagent: afm-loop\ncreated: '2026-07-30T00:00:00.000Z'\n---\n",
+        encoding="utf-8",
+    )
+
+    status = afm_writer.writer_status(str(tmp_path), schedule=SCHEDULE)
+    assert status["drafts_pending_oldest"] is None
+    assert status["drafts_pending_undated"] == 1
+    assert any("age unknown" in r for r in status["status_reasons"]), status["status_reasons"]
+
+
 def test_record_pass_attempt_moves_the_needle(monkeypatch):
     import minni.afm_writer as afm_writer
 
