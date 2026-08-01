@@ -12,7 +12,7 @@ import {
   DEFAULT_VAULT_PATH,
   DEFAULT_WORKSPACE_ID,
 } from "./config.js";
-import { assessLearningQualityAsync, routeMemoryIntent } from "./policy.js";
+import { assessLearningQualityAsync, auditSafeTitle, routeMemoryIntent } from "./policy.js";
 import {
   ackHandoff,
   awaitHandoff,
@@ -668,7 +668,8 @@ server.registerTool(
     if (requireQuality !== false && !quality.ok) {
       await recordAudit(DEFAULT_VAULT_PATH, {
         tool: "minni_learn",
-        summary: `quality-blocked: ${title}`,
+        // The title itself may be the credential the gate just blocked.
+        summary: `quality-blocked: ${auditSafeTitle(title, quality)}`,
         details: { quality },
       });
       return textResult(
@@ -778,7 +779,7 @@ server.registerTool(
     const quality = await assessLearningQualityAsync({ title, content, category, source });
     await recordAudit(DEFAULT_VAULT_PATH, {
       tool: "minni_learning_quality",
-      summary: title,
+      summary: auditSafeTitle(title, quality),
       details: { quality },
     });
     return textResult(JSON.stringify(quality, null, 2));
