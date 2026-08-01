@@ -46,6 +46,17 @@ ELIGIBILITY_MARKER = "<!-- grok-mechanical-eligibility: APPROVE -->"
 # would let the PR stamp its own eligibility.
 APP_BOT_LOGINS = ("infektydgrokreviewer[bot]",)
 
+# Who submits the mechanical APPROVE. NOT the App: measured 2026-08-01 on #243,
+# the App posted APPROVED as the newest, non-dismissed review on the final head
+# 2b0bdac and reviewDecision STAYED REVIEW_REQUIRED. GitHub counts approvals
+# only from USERS with write access, and a GitHub App installation is not one
+# (author_association is NONE for bots). infektydrelay-bit is a real user with
+# push access, so its approval does count.
+#
+# Same exact-login discipline as APP_BOT_LOGINS: equality, case-insensitive,
+# never a suffix test.
+APPROVAL_LOGINS = ("infektydrelay-bit",)
+
 # Every API call is bounded: an unbounded urlopen leaves the window between the
 # final observation and the POST limited only by the job timeout.
 API_TIMEOUT_S = 15
@@ -347,6 +358,18 @@ def _is_app_bot(login: str | None) -> bool:
     return login.lower() in {known.lower() for known in APP_BOT_LOGINS}
 
 
+def _is_approver(login: str | None) -> bool:
+    """The identity that submits the mechanical APPROVE.
+
+    Deliberately disjoint from _is_app_bot: the approver's reviews must never
+    be read as App eligibility, or the approve/dismiss oscillation returns
+    through the new identity.
+    """
+    if not login:
+        return False
+    return login.lower() in {known.lower() for known in APPROVAL_LOGINS}
+
+
 def _has_marker(body: str | None) -> bool:
     """Marker must be a line of its own, not a substring of quoted text.
 
@@ -531,18 +554,19 @@ def build_approval_body(head_sha: str, required: tuple[str, ...]) -> str:
     return body
 
 
-def fetch_app_reviews(
+def fetch_approver_reviews(
     owner: str, repo: str, pr: int, token: str
 ) -> list[dict[str, Any]]:
+    """Reviews written by the APPROVING identity — not the App's."""
     reviews = _paginate(
         f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr}/reviews?per_page=100",
         token,
     )
-    return [r for r in reviews if _is_app_bot((r.get("user") or {}).get("login"))]
+    return [r for r in reviews if _is_approver((r.get("user") or {}).get("login"))]
 
 
 def already_approved(reviews: list[dict[str, Any]], head_sha: str) -> bool:
-    """True if the App's newest live review on this SHA is already an APPROVE.
+    """True if the approver's newest live review on this SHA is an APPROVE.
 
     Without this, every re-run of the gate posts another approval.
     """
@@ -565,8 +589,8 @@ def submit_mechanical_approval(
     token: str,
     required: tuple[str, ...],
 ) -> str:
-    """Submit the APPROVE. Returns a short status for the job log."""
-    reviews = fetch_app_reviews(owner, repo, pr, token)
+    """Submit the APPROVE as the relay user. Returns a status for the job log."""
+    reviews = fetch_approver_reviews(owner, repo, pr, token)
     if already_approved(reviews, head_sha):
         return "approval already present"
 
@@ -576,6 +600,16 @@ def submit_mechanical_approval(
     pr_data = _api("GET", f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr}", token)
     if ((pr_data.get("head") or {}).get("sha") or "") != head_sha:
         return "head moved; approval withheld"
+
+    # GitHub rejects an approval from the PR's own author. Name it instead of
+    # letting a 422 surface as a stack trace: the standing rule is that agent
+    # PRs are opened as infektyd, never as the approving identity.
+    author = ((pr_data.get("user") or {}).get("login")) or ""
+    if _is_approver(author):
+        return (
+            f"PR authored by the approving identity ({author}) - needs a "
+            "different opener; GitHub forbids self-approval"
+        )
 
     _api(
         "POST",
@@ -593,18 +627,19 @@ def submit_mechanical_approval(
 def dismiss_stale_approvals(
     *, owner: str, repo: str, pr: int, head_sha: str, token: str, reason: str
 ) -> int:
-    """Dismiss the App's OWN live APPROVE reviews that no longer hold.
+    """Dismiss the approver's OWN live APPROVE reviews that no longer hold.
 
-    Scoped hard to this App's approvals. It must never touch anyone else's
-    review, and never a CHANGES_REQUESTED — that is the veto the gate exists to
-    respect, and dismissing it would be the worst thing this token could do.
+    Scoped hard to the approving identity's approvals. It must never touch the
+    App's reviews, never a human's, and never a CHANGES_REQUESTED — that is the
+    veto the gate exists to respect, and dismissing it would be the worst thing
+    this token could do.
     """
     dismissed = 0
-    for rev in fetch_app_reviews(owner, repo, pr, token):
+    for rev in fetch_approver_reviews(owner, repo, pr, token):
         if (rev.get("state") or "").upper() != "APPROVED":
             continue
-        if not _is_app_bot((rev.get("user") or {}).get("login")):
-            continue  # belt and braces; fetch_app_reviews already filtered
+        if not _is_approver((rev.get("user") or {}).get("login")):
+            continue  # belt and braces; fetch_approver_reviews already filtered
         rid = rev.get("id")
         if not rid:
             continue
@@ -680,6 +715,7 @@ def run_gate(
     token: str,
     base_branch: str,
     post_token: str = "",
+    approve_token: str = "",
 ) -> GateDecision:
     # Checked FIRST: the App token is what reads protection and posts the
     # check, so without it every later call is wasted and the failure would
@@ -727,17 +763,27 @@ def run_gate(
     # Express the SAME decision as a Reviews API APPROVE so a
     # `required_approving_review_count: 1` rule can be satisfied mechanically.
     # Only on success: the failure and pending paths never touch the Reviews API.
+    # Submitted as the RELAY USER, not the App: a GitHub App's approval does not
+    # satisfy required_approving_review_count (measured on #243). Degrade with a
+    # named line rather than failing — the check run is the merge gate and has
+    # already been posted; only the review-count half is missing.
+    if not approve_token:
+        print(
+            "::warning::approval skipped: RELAY_APPROVE_TOKEN unset. The check "
+            "run posted, but nothing satisfies required_approving_review_count."
+        )
+        return decision
     try:
         if decision.conclusion == "success":
             required, _ = fetch_protection(owner, repo, base_branch, post_token)
             note = submit_mechanical_approval(
                 owner=owner, repo=repo, pr=pr, head_sha=head_sha,
-                token=post_token, required=required,
+                token=approve_token, required=required,
             )
         else:
             n = dismiss_stale_approvals(
                 owner=owner, repo=repo, pr=pr, head_sha=head_sha,
-                token=post_token, reason=decision.title,
+                token=approve_token, reason=decision.title,
             )
             note = f"dismissed {n} stale approval(s)" if n else "no approval to dismiss"
         print(f"approval: {note}")
@@ -759,6 +805,13 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--base-branch", default="")
     p.add_argument("--token-env", default="GH_TOKEN")
     p.add_argument(
+        "--approve-token-env",
+        default="RELAY_APPROVE_TOKEN",
+        help="Env var holding the relay USER token that submits the mechanical "
+        "APPROVE. Unset means the check still posts, but nothing satisfies the "
+        "approving-review requirement.",
+    )
+    p.add_argument(
         "--post-token-env",
         default="APP_TOKEN",
         help="Env var holding the Grok App installation token used to POST the "
@@ -767,6 +820,7 @@ def main(argv: list[str] | None = None) -> int:
     args = p.parse_args(argv)
     token = os.environ.get(args.token_env, "")
     post_token = os.environ.get(args.post_token_env, "")
+    approve_token = os.environ.get(args.approve_token_env, "")
     if not token:
         print(f"::error::{args.token_env} unset", file=sys.stderr)
         return 2
@@ -794,6 +848,7 @@ def main(argv: list[str] | None = None) -> int:
             token=token,
             base_branch=base,
             post_token=post_token,
+            approve_token=approve_token,
         )
     except MissingAppToken as e:
         print(f"::error::{e}", file=sys.stderr)
