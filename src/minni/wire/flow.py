@@ -468,7 +468,12 @@ def run_wire(args) -> int:
                         extras["claude_desktop"] = follow_claude_desktop(
                             install_root, dry_run=dry_run,
                         )
-                    except ClaudePluginError as exc:
+                    except (ClaudePluginError, OSError) as exc:
+                        # OSError too: the config dir can be unwritable or the
+                        # file mid-write, and _atomic_write_json surfaces that
+                        # raw. Letting it escape would abort the whole run with
+                        # a traceback and no JSON at all — strictly worse than
+                        # the `failed` result this block exists to avoid.
                         extras["claude_desktop"] = {
                             "changed": False, "reason": f"skipped: {exc}",
                         }

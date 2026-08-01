@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import tempfile
 from datetime import UTC, datetime
@@ -419,15 +420,33 @@ def legacy_cache_referrers(*, overrides: dict[str, dict] | None = None) -> list[
     # Structured matching alone is not enough to authorise an rmtree. Claude
     # Code's hook entries are *shell command strings* ("node <path>/hook.js
     # SessionStart"), not argv arrays, so the cache path routinely appears
-    # embedded in a larger string that Path() cannot classify -- as do "~"-
-    # relative spellings, file:// URLs and .. segments. A dumb substring gate
+    # embedded in a larger string that Path() cannot classify. A substring gate
     # catches those; it is the same belt-and-braces approach gc.py already uses,
-    # and erring toward a refusal is the only safe direction here.
-    needles = {
-        str(root).lower(),
-        str(root.resolve()).lower(),
-        f"~/.claude/plugins/cache/{MARKETPLACE_NAME}",
-    }
+    # and erring toward a refusal is the safe direction here.
+    #
+    # Two things this gate must get right or it is worse than useless:
+    #
+    # ensure_ascii=False, because the default escapes any non-ASCII character in
+    # the path to \uXXXX. On a HOME like /Users/Håkan the blob would contain
+    # "håkan" and the needle "håkan", so the gate would silently match
+    # nothing at all -- a safety check that is off and reports nothing.
+    #
+    # A trailing boundary, because a bare substring re-introduces the exact bug
+    # _is_under exists to avoid: ".../cache/minni" is a prefix of
+    # ".../cache/minni-tools", so an unrelated marketplace would block the
+    # cutover with a refusal the operator cannot act on.
+    #
+    # Deliberately NOT included: the literal "~/.claude/plugins/cache/minni".
+    # ~/.claude.json persists per-project prompt history, and this repo's own
+    # docs and --help text contain that string, so any session that discussed
+    # the migration would poison the file permanently and leave
+    # --keep-legacy-cache as the only exit -- i.e. the cutover could never
+    # complete. A tilde-spelled path is also not something Claude Code expands
+    # in these configs, so the on-disk risk it covers is not real.
+    needles = {str(root).lower(), str(root.resolve()).lower()}
+    boundary = re.compile(
+        "|".join(re.escape(n) + r"(?![\w.\-])" for n in sorted(needles)),
+    )
     found: list[str] = []
     for path in legacy_scan_paths():
         key = str(path)
@@ -449,9 +468,14 @@ def legacy_cache_referrers(*, overrides: dict[str, dict] | None = None) -> list[
         if precise:
             found.extend(precise)
             continue
-        blob = json.dumps(doc).lower()
-        if any(n in blob for n in needles):
-            found.append(f"{path}: mentions {root} inside a larger string")
+        blob = json.dumps(doc, ensure_ascii=False).lower()
+        hit = boundary.search(blob)
+        if hit:
+            # A refusal you cannot debug is a refusal you learn to bypass, and
+            # ~/.claude.json is far too large to eyeball. Quote the neighbourhood.
+            start = max(0, hit.start() - 60)
+            snippet = blob[start:hit.end() + 60].replace("\n", " ")
+            found.append(f"{path}: mentions {root} inside a larger string: ...{snippet}...")
     return found
 
 

@@ -161,16 +161,36 @@ properties rather than relying on the earlier steps having done their job:
   nothing references the tree. `known_marketplaces.json` is deliberately not
   scanned — its `minni` entry is the one reference step 3 retires itself.
 
-  The check is two-layer, and the second layer is the load-bearing one.
-  Structured matching (`Path.relative_to`) produces the precise "file: field ->
-  path" message, but it only recognises a string that *is* a lexically-normal
-  absolute path. Claude Code's hook entries are shell command strings —
-  `"node <path>/dist/hook.js SessionStart"` — so the cache path routinely
-  appears embedded in a larger string, as do `~`-relative spellings and `..`
-  segments. A case-insensitive substring gate over the serialized document
-  catches those. It can over-refuse (a doc URL mentioning the path would trip
-  it); that is the correct direction for something gating an `rmtree`, and the
-  operator can pass `--keep-legacy-cache`.
+  The check is two-layer. Structured matching (`Path.relative_to`) produces the
+  precise "file: field -> path" message, but it only recognises a string that
+  *is* a lexically-normal absolute path. Claude Code's hook entries are shell
+  command strings — `"node <path>/dist/hook.js SessionStart"` — so the cache
+  path routinely appears embedded in a larger string. A case-insensitive
+  substring gate over the serialized document backs it up, quoting the
+  surrounding text so a refusal in a megabyte of `~/.claude.json` is actionable.
+
+  Three details that gate got wrong before review and that are worth stating,
+  because each one turned it into either a no-op or a permanent blocker:
+
+  - It serializes with `ensure_ascii=False`. The default escapes non-ASCII to
+    `\uXXXX`, so on a `HOME` containing any accented character the blob and the
+    needle could never match — the check would be silently off.
+  - The needle is anchored with a trailing boundary. A bare substring
+    reintroduces exactly the bug `_is_under` avoids: `.../cache/minni` is a
+    prefix of `.../cache/minni-tools`, so an unrelated marketplace would block
+    the cutover.
+  - The literal `~/.claude/plugins/cache/minni` is *not* a needle.
+    `~/.claude.json` persists prompt history, and this repo's own docs and
+    `--help` text contain that string, so any session discussing the migration
+    would poison the file permanently and leave `--keep-legacy-cache` as the
+    only exit — the cutover could never complete. Claude Code does not expand
+    `~` in these configs, so the on-disk risk it would cover is not real.
+
+  Residual heuristic gaps are accepted: `$HOME`-style indirection, `..` before
+  the prefix, doubled slashes inside a command string, and a path split across
+  two fields all evade the substring layer. The structured scan still catches
+  every lexically-normal absolute path, which is the shape these configs
+  actually take.
 
 - **It reports everything it deletes.** The target is the plugin dir
   `<cache>/minni/minni`, not the whole `<cache>/minni` marketplace dir. A

@@ -474,21 +474,72 @@ def test_remove_legacy_cache_refuses_a_hook_command_string(home):
     assert (legacy_cache_root() / "minni" / "0.3.0").is_dir()
 
 
-@pytest.mark.parametrize("spelling", [
-    "~/.claude/plugins/cache/minni/minni/0.3.0/dist/server.js",
-    "file:///tmp/x",  # control: must NOT trip the gate
-])
-def test_remove_legacy_cache_catches_tilde_spellings(home, spelling):
+def test_remove_legacy_cache_gate_survives_a_non_ascii_home(tmp_path, monkeypatch):
+    """json.dumps escapes non-ASCII by default, which would silently kill the gate.
+
+    On a HOME like /Users/Hakan the blob would hold "\\u00e5" while the needle
+    holds the literal character, so the substring layer would match nothing at
+    all — a safety check that is off and says nothing.
+    """
+    fake_home = tmp_path / "hemkatalog-aao-åäö"
+    fake_home.mkdir()
+    monkeypatch.setenv("HOME", str(fake_home))
+    (legacy_cache_root() / "minni" / "0.3.0").mkdir(parents=True)
+    root = _install_tree(fake_home, "0.4.0")
+    hook = legacy_cache_root() / "minni" / "0.3.0" / "dist" / "hook.js"
+    cfg = fake_home / ".claude.json"
+    cfg.write_text(json.dumps({"h": f"node {hook} SessionStart"}), encoding="utf-8")
+
+    with pytest.raises(ClaudePluginError, match="still referenced by"):
+        remove_legacy_cache(root)
+
+
+def test_remove_legacy_cache_gate_respects_path_boundaries(home):
+    """A bare substring would reintroduce the .../cache/minnix bug.
+
+    An unrelated marketplace sharing the prefix must not block the cutover.
+    """
+    (legacy_cache_root() / "minni" / "0.3.0").mkdir(parents=True)
+    root = _install_tree(home, "0.4.0")
+    unrelated = home / ".claude" / "plugins" / "cache" / "minni-tools" / "acme" / "1.0"
+    path = installed_plugins_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({
+        "version": 2,
+        "plugins": {"acme@minni-tools": [{"scope": "user", "installPath": str(unrelated)}]},
+    }), encoding="utf-8")
+
+    assert remove_legacy_cache(root)["changed"] is True
+
+
+def test_remove_legacy_cache_gate_ignores_tilde_prose(home):
+    """~/.claude.json holds prompt history; the repo's own docs name this path.
+
+    Treating a tilde spelling as a referrer would poison that file permanently
+    and leave --keep-legacy-cache as the only exit, i.e. the cutover could never
+    complete. The absolute-path needle covers the real on-disk case.
+    """
     (legacy_cache_root() / "minni" / "0.3.0").mkdir(parents=True)
     root = _install_tree(home, "0.4.0")
     cfg = home / ".claude.json"
-    cfg.write_text(json.dumps({"whatever": spelling}), encoding="utf-8")
+    cfg.write_text(json.dumps({
+        "history": ["we should delete ~/.claude/plugins/cache/minni after the cutover"],
+    }), encoding="utf-8")
 
-    if spelling.startswith("~"):
-        with pytest.raises(ClaudePluginError, match="still referenced by"):
-            remove_legacy_cache(root)
-    else:
-        assert remove_legacy_cache(root)["changed"] is True
+    assert remove_legacy_cache(root)["changed"] is True
+
+
+def test_remove_legacy_cache_refusal_quotes_the_offending_text(home):
+    (legacy_cache_root() / "minni" / "0.3.0").mkdir(parents=True)
+    root = _install_tree(home, "0.4.0")
+    hook = legacy_cache_root() / "minni" / "0.3.0" / "dist" / "hook.js"
+    cfg = home / ".claude" / "settings.json"
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    cfg.write_text(json.dumps({"h": f"node {hook} SessionStart"}), encoding="utf-8")
+
+    with pytest.raises(ClaudePluginError) as exc:
+        remove_legacy_cache(root)
+    assert "hook.js" in str(exc.value), "refusal must show what to fix"
 
 
 def test_remove_legacy_cache_reports_strays_it_deletes(home):
