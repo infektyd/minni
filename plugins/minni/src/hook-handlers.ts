@@ -586,10 +586,19 @@ export function createHookHandlers(
     // tails) may only settle once the envelope carrying them lands. Deferring
     // both together held the empties hostage whenever one window contained a
     // real correction AND an empty stash.
+    //
+    // The three outcomes are counted separately for the audit below: settling
+    // eagerly, waiting on delivery, and parked as undeliverable are different
+    // facts, and one "pending" number covering all three would misreport two of
+    // them. In a change about audit honesty that matters.
     const emptyPaths = reassertConsumed.filter(
       (filePath) => !reassertContributing.includes(filePath),
     );
+    let reassertClearedEager = 0;
+    let reassertPendingClear = 0;
+    let reassertParked = 0;
     if (emptyPaths.length > 0) {
+      reassertClearedEager = emptyPaths.length;
       await settleReassertedInboxEntries(config.vaultPath, {
         consumedPaths: emptyPaths,
         deferredTails: [],
@@ -597,6 +606,7 @@ export function createHookHandlers(
     }
     if (reassertContributing.length > 0 || reassertDeferred.length > 0) {
       if (canInject(wire, "SessionStart")) {
+        reassertPendingClear = reassertContributing.length;
         deferUntilDelivered(() =>
           settleReassertedInboxEntries(config.vaultPath, {
             consumedPaths: reassertContributing,
@@ -619,6 +629,7 @@ export function createHookHandlers(
           ...reassertDeferred.map((tail) => tail.filePath),
         ];
         const parked = await parkUndeliverableInboxEntries(parkPaths);
+        reassertParked = parked.length;
         await recordAudit(config.vaultPath, {
           tool: `${config.auditPrefix}_undeliverable_on_wire`,
           summary: `SessionStart: ${wire.id} cannot inject at SessionStart; parked ${parked.length} correction entr${
@@ -641,19 +652,21 @@ export function createHookHandlers(
       ok: true,
       view: undefined,
     };
-    try {
-      planRead = await withBudget(
-        resolveActivePlanView(config.vaultPath).then((view) => ({ ok: true, view })),
-        remainingMs(),
-        { ok: false, view: undefined },
-      );
-    } catch (error) {
-      // hooks-PL-5: a failed plan resolution must not silently boot plan-less.
-      await recordAudit(config.vaultPath, {
-        tool: `${config.auditPrefix}_active_plan_error`,
-        summary: `SessionStart: ${error instanceof Error ? error.message : String(error)}`,
-      }).catch(() => {});
-    }
+    // No try/catch: it would be DEAD CODE, and a catch that implies an audit
+    // row which can never be written is exactly the health-signal overstatement
+    // this work is removing elsewhere. Neither call can reject —
+    // resolveActivePlanView swallows its own failures and returns undefined,
+    // and withBudget turns any rejection into its fallback. A budget cut still
+    // surfaces, via planRead.ok === false -> degraded.sections.
+    //
+    // Note the honest limit that leaves: a plan FS failure is indistinguishable
+    // from 'no active plan', because resolveActivePlanView conflates them at
+    // source. Pre-existing and out of scope here — fixing it belongs in plan.ts.
+    planRead = await withBudget(
+      resolveActivePlanView(config.vaultPath).then((view) => ({ ok: true, view })),
+      remainingMs(),
+      { ok: false, view: undefined },
+    );
     const activePlan = planRead.view;
 
     // Sections the budget cut. Named so a degraded boot is legible as degraded
@@ -803,11 +816,15 @@ export function createHookHandlers(
         corrections_reassert: correctionsReassert.length,
         budget_ms: budgetMs,
         ...(degradedSections.length > 0 ? { degraded_sections: degradedSections } : {}),
-        // PENDING at audit time: the archive itself is deferred until the
-        // envelope reaches the host, so these are what WILL settle on delivery,
-        // not what already has.
-        reassert_entries_pending_clear: reassertConsumed.length,
-        reassert_tails_pending_defer: reassertDeferred.length,
+        // The three settle outcomes, reported separately. "pending" counts ONLY
+        // what is still registered with deferUntilDelivered — empties already
+        // cleared and entries parked as undeliverable are not waiting on
+        // anything, and folding them in here claimed archives that were never
+        // going to happen.
+        reassert_entries_cleared_eager: reassertClearedEager,
+        reassert_entries_pending_clear: reassertPendingClear,
+        reassert_entries_parked: reassertParked,
+        reassert_tails_pending_defer: reassertPendingClear > 0 ? reassertDeferred.length : 0,
       },
     });
 

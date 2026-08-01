@@ -98,12 +98,17 @@ import {
  * together, since a manifest tightened below the budget would resurrect the
  * bug this bounds (killed mid-boot, output discarded).
  *
- * 600s is Claude Code's DOCUMENTED default for a `command` hook, which
- * SessionStart does not override (only UserPromptSubmit at 30s, MessageDisplay
- * at 10s and SessionEnd's shared 1.5s budget do). The manifest states it
- * explicitly rather than inheriting it, so the value this constant mirrors is
- * visible in the file the platform reads — writing a SMALLER number here would
- * be a real tightening of the boot deadline, not documentation of it.
+ * 600s is Claude Code's DOCUMENTED PLATFORM default for a `command` hook.
+ * SessionStart does not lower it (the events that do are UserPromptSubmit at
+ * 30s, MessageDisplay at 10s and SessionEnd's shared 1.5s budget) — so 600 is
+ * what this entry inherits when the manifest is silent. Those are the
+ * platform's numbers, not ours: `hooks.json` separately sets UserPromptSubmit
+ * to 60, which is OUR choice and unrelated to this constant.
+ *
+ * The manifest states 600 explicitly rather than inheriting it, so the value
+ * this constant mirrors is visible in the file the platform reads — writing a
+ * SMALLER number here would be a real tightening of the boot deadline, not
+ * documentation of it.
  */
 const CLAUDECODE_SESSION_START_TIMEOUT_MS = 600_000;
 
@@ -282,19 +287,21 @@ async function handleSessionStart(payload: Record<string, unknown>): Promise<Hoo
     ok: boolean;
     view: Awaited<ReturnType<typeof resolveActivePlanView>>;
   } = { ok: true, view: undefined };
-  try {
-    planRead = await withBudget(
-      resolveActivePlanView(CLAUDECODE_VAULT_PATH).then((view) => ({ ok: true, view })),
-      remainingMs(),
-      { ok: false, view: undefined },
-    );
-  } catch (error) {
-    // hooks-PL-5: a failed plan resolution must not silently boot plan-less.
-    await recordAudit(CLAUDECODE_VAULT_PATH, {
-      tool: "hook_active_plan_error",
-      summary: `SessionStart: ${error instanceof Error ? error.message : String(error)}`,
-    }).catch(() => {});
-  }
+  // No try/catch: it would be DEAD CODE, and a catch that implies an audit
+  // row which can never be written is exactly the health-signal overstatement
+  // this work is removing elsewhere. Neither call can reject —
+  // resolveActivePlanView swallows its own failures and returns undefined,
+  // and withBudget turns any rejection into its fallback. A budget cut still
+  // surfaces, via planRead.ok === false -> degraded.sections.
+  //
+  // Note the honest limit that leaves: a plan FS failure is indistinguishable
+  // from 'no active plan', because resolveActivePlanView conflates them at
+  // source. Pre-existing and out of scope here — fixing it belongs in plan.ts.
+  planRead = await withBudget(
+    resolveActivePlanView(CLAUDECODE_VAULT_PATH).then((view) => ({ ok: true, view })),
+    remainingMs(),
+    { ok: false, view: undefined },
+  );
   const activePlan = planRead.view;
 
   // Sections the budget cut. Named so a degraded boot is legible as degraded
@@ -347,6 +354,9 @@ async function handleSessionStart(payload: Record<string, unknown>): Promise<Hoo
   // tails) may only settle once the envelope carrying them lands. Deferring
   // both together held the empties hostage whenever one window contained a
   // real correction AND an empty stash.
+  // Counted separately for the audit below: settling eagerly and waiting on
+  // delivery are different facts, and one "pending" number covering both
+  // misreports the empties as archives that have not happened yet.
   const emptyPaths = reassertConsumed.filter(
     (filePath) => !reassertContributing.includes(filePath),
   );
@@ -483,10 +493,13 @@ async function handleSessionStart(payload: Record<string, unknown>): Promise<Hoo
       corrections_reassert: correctionsReassert.length,
       budget_ms: budgetMs,
       ...(degradedSections.length > 0 ? { degraded_sections: degradedSections } : {}),
-      // PENDING at audit time: the archive itself is deferred until the
-      // envelope reaches the host, so these are what WILL settle on delivery,
-      // not what already has.
-      reassert_entries_pending_clear: reassertConsumed.length,
+      // Settle outcomes reported separately. "pending" counts ONLY what is
+      // still registered with deferUntilDelivered; empties already cleared are
+      // not waiting on anything, and folding them in claimed archives that had
+      // in fact already happened. (claude-code's wire can always inject at
+      // SessionStart, so there is no parked outcome on this path.)
+      reassert_entries_cleared_eager: emptyPaths.length,
+      reassert_entries_pending_clear: reassertContributing.length,
       reassert_tails_pending_defer: reassertDeferred.length,
     },
   });

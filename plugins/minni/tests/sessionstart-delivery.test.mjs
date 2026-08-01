@@ -653,6 +653,55 @@ test(
   },
 );
 
+test(
+  "the settle audit distinguishes eager, pending and parked instead of one number",
+  { timeout: 120_000 },
+  async (t) => {
+    // Mixed window on a DELIVERABLE wire: one empty stash settles immediately,
+    // one real correction waits on delivery. A single count covering both
+    // claimed two archives were pending when only one ever was — an operator
+    // grepping "how many will settle on delivery" got a wrong answer.
+    const fixture = await makeFixture();
+    const base = Date.now() - 43_200_000;
+    await writeFile(
+      path.join(fixture.inbox, inboxName(base, "empty-reassert")),
+      JSON.stringify({
+        slug: "empty-reassert",
+        kind: "precompact_reassert",
+        agent_id: "claude-code",
+        createdAt: new Date(base).toISOString(),
+        stale_belief_events: [],
+      }),
+      "utf8",
+    );
+    t.after(() => rm(fixture.root, { recursive: true, force: true }));
+
+    const body = await runSessionStart(fixture);
+    assert.deepEqual(body.corrections_reassert, [CORRECTION]);
+
+    // The audit writes details as pretty-printed JSON, so match the whole log
+    // rather than a single line.
+    const audit = await auditText(fixture);
+    assert.match(
+      audit,
+      /"reassert_entries_cleared_eager":\s*1/,
+      "the empty stash settled before the audit and must be counted as such",
+    );
+    assert.match(
+      audit,
+      /"reassert_entries_pending_clear":\s*1/,
+      "only the correction-bearing entry is still waiting on delivery",
+    );
+    // The old single count would have reported 2 here — both consumed paths,
+    // one of which had already settled.
+    assert.doesNotMatch(
+      audit,
+      /"reassert_entries_pending_clear":\s*2/,
+      "an already-settled empty must not be counted as an archive still pending",
+    );
+  },
+);
+
 test("an exhausted budget does not orphan the rejection of the work it abandons", async () => {
   const { withBudget } = await import("../dist/hook-utils.js");
   // withBudget's argument is an ALREADY-RUNNING promise, so the zero-budget
