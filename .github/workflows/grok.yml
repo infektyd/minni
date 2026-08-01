@@ -108,8 +108,9 @@ jobs:
           # See grok-review.yml for the measurements behind this profile:
           # `read_file` reads auth.json under --always-approve, and denying
           # that path breaks Grok's own startup — so containment is about
-          # exits (child network + a fail-closed scan of the reply), not
-          # about hiding the file. `read-only` is deliberate even though an
+          # exits (child-process egress, verified on Linux down to raw-IP
+          # connects, plus a fail-closed scan of the reply), not about
+          # hiding the file. `read-only` is deliberate even though an
           # @grok request may want to write: a request that needs writes
           # should fail visibly rather than widen the profile for every run.
           # Written to $HOME, never to .grok/sandbox.toml in the checkout.

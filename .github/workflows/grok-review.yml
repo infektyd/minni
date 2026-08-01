@@ -79,13 +79,17 @@ jobs:
           # ALSO MEASURED: adding `deny = [auth.json]` here does NOT work —
           # the sandbox applies before Grok loads its own credential, so the
           # run dies with "Not signed in". The credential is therefore
-          # READABLE to the agent by necessity, and containment has to be
-          # about EXITS instead:
-          #   1. restrict_network cuts child-process network (seccomp, Linux).
+          # READABLE to the agent by necessity (confirmed on Linux via
+          # read_file, cat, base64, od, xxd, python3 and node), and
+          # containment is about EXITS instead:
+          #   1. restrict_network cuts child-process egress.
           #   2. The reply is scanned and the job fails closed before posting.
-          # Exit (2) is the control that is verified on every run; (1) is
-          # asserted by .github/workflows/grok-boundary-test.yml, which runs
-          # on any change to these files.
+          # (1) is VERIFIED on the Linux runner, not assumed: named-host
+          # egress fails DNS, and — the probe that actually matters — raw-IP
+          # egress fails to CONNECT (curl 7, python "Operation not
+          # permitted"), so this is seccomp denying sockets rather than
+          # merely broken name resolution. Re-proven by
+          # .github/workflows/grok-boundary-test.yml on any change here.
           #
           # Written to $HOME, NEVER to .grok/sandbox.toml in the checkout: a
           # per-project profile would be editable by the very PR under review.
