@@ -577,3 +577,254 @@ def test_deleting_the_gate_tripwires_is_path_denied(mod, path):
     """These pin every invariant above and do not live under .github/, so
     without an explicit deny a PR could remove them and still go green."""
     assert mod.path_denied(path) is True
+
+
+# --- mechanical APPROVE -----------------------------------------------------
+
+
+def _app_review(state, sha, rid=1):
+    return {
+        "id": rid,
+        "user": {"login": "infektydgrokreviewer[bot]"},
+        "state": state,
+        "commit_id": sha,
+    }
+
+
+def test_approval_body_never_carries_the_eligibility_marker(mod):
+    """The gate reads App review bodies to decide eligibility. A marker here
+    would let the gate's own approval feed its next eligibility check."""
+    body = mod.build_approval_body("abc123def456", ("Forbidden Files",))
+    assert not mod._has_marker(body)
+    assert mod.ELIGIBILITY_MARKER not in body
+    assert "Mechanical approval" in body
+
+
+def test_approval_is_idempotent_on_the_same_sha(mod):
+    reviews = [_app_review("APPROVED", "sha1")]
+    assert mod.already_approved(reviews, "sha1") is True
+    # A newer non-approve on the same SHA means the approval no longer stands.
+    reviews.append(_app_review("CHANGES_REQUESTED", "sha1", rid=2))
+    assert mod.already_approved(reviews, "sha1") is False
+
+
+def test_submitter_skips_when_an_approval_already_stands(mod, monkeypatch):
+    """Not just that already_approved() is correct — that the submitter
+    actually consults it. Otherwise every gate re-run posts another approval."""
+    calls = []
+    monkeypatch.setattr(
+        mod, "fetch_app_reviews", lambda *a, **k: [_app_review("APPROVED", "sha1")]
+    )
+    monkeypatch.setattr(
+        mod, "_api",
+        lambda method, url, token, body=None: (
+            calls.append(method) or {"head": {"sha": "sha1"}}
+        ),
+    )
+    note = mod.submit_mechanical_approval(
+        owner="o", repo="r", pr=1, head_sha="sha1", token="app", required=()
+    )
+    assert "already present" in note
+    assert calls == [], "must not re-post, or even re-read, when already approved"
+
+
+def test_approval_on_an_older_sha_does_not_count_as_present(mod):
+    """Otherwise a push would leave the PR unapproved and the gate would think
+    it had already done its job."""
+    assert mod.already_approved([_app_review("APPROVED", "old")], "new") is False
+
+
+def test_dismissed_approval_does_not_count_as_present(mod):
+    assert mod.already_approved([_app_review("DISMISSED", "sha1")], "sha1") is False
+
+
+def test_approval_is_submitted_sha_bound_and_only_when_head_is_unmoved(mod, monkeypatch):
+    calls = []
+    monkeypatch.setattr(mod, "fetch_app_reviews", lambda *a, **k: [])
+    monkeypatch.setattr(
+        mod, "_api",
+        lambda method, url, token, body=None: (
+            calls.append((method, url, body)) or {"head": {"sha": "sha1"}}
+        ),
+    )
+    note = mod.submit_mechanical_approval(
+        owner="o", repo="r", pr=1, head_sha="sha1", token="app", required=("CI",)
+    )
+    post = [c for c in calls if c[0] == "POST"]
+    assert len(post) == 1
+    assert post[0][1].endswith("/pulls/1/reviews")
+    assert post[0][2]["commit_id"] == "sha1"
+    assert post[0][2]["event"] == "APPROVE"
+    assert "sha1" in note
+
+
+def test_approval_withheld_when_head_moved_mid_flight(mod, monkeypatch):
+    calls = []
+    monkeypatch.setattr(mod, "fetch_app_reviews", lambda *a, **k: [])
+    monkeypatch.setattr(
+        mod, "_api",
+        lambda method, url, token, body=None: (
+            calls.append(method) or {"head": {"sha": "sha2"}}
+        ),
+    )
+    note = mod.submit_mechanical_approval(
+        owner="o", repo="r", pr=1, head_sha="sha1", token="app", required=()
+    )
+    assert "withheld" in note
+    assert "POST" not in calls, "must not approve a SHA it did not evaluate"
+
+
+def test_dismissal_touches_only_this_apps_own_approvals(mod, monkeypatch):
+    """Dismissing someone else's review — above all a CHANGES_REQUESTED — is the
+    worst thing this token could do."""
+    reviews = [
+        _app_review("APPROVED", "sha1", rid=10),
+        _app_review("CHANGES_REQUESTED", "sha1", rid=11),
+        {"id": 12, "user": {"login": "a-human"}, "state": "APPROVED", "commit_id": "sha1"},
+        {"id": 13, "user": {"login": "a-human"}, "state": "CHANGES_REQUESTED",
+         "commit_id": "sha1"},
+    ]
+    # fetch_app_reviews filters to the App; feed it raw to prove the filter.
+    monkeypatch.setattr(
+        mod, "fetch_app_reviews",
+        lambda *a, **k: [r for r in reviews
+                         if mod._is_app_bot((r.get("user") or {}).get("login"))],
+    )
+    seen = []
+    monkeypatch.setattr(
+        mod, "_api",
+        lambda method, url, token, body=None: seen.append(url) or {},
+    )
+    n = mod.dismiss_stale_approvals(
+        owner="o", repo="r", pr=1, head_sha="sha1", token="app", reason="CI went red"
+    )
+    assert n == 1
+    assert len(seen) == 1
+    assert "/reviews/10/dismissals" in seen[0]
+    for rid in (11, 12, 13):
+        assert f"/reviews/{rid}/" not in seen[0]
+
+
+def test_failure_paths_never_touch_the_reviews_api(mod, monkeypatch):
+    """Only a success may approve. A red or pending gate must not submit
+    anything to the Reviews API."""
+    submitted = []
+    monkeypatch.setattr(mod, "_preflight", lambda *a, **k: None)
+    monkeypatch.setattr(
+        mod, "_gather_and_decide",
+        lambda *a, **k: mod.GateDecision("failure", "required check red", "nope"),
+    )
+    monkeypatch.setattr(mod, "post_check_run", lambda *a, **k: None)
+    monkeypatch.setattr(
+        mod, "submit_mechanical_approval",
+        lambda **k: submitted.append("approve"),
+    )
+    monkeypatch.setattr(mod, "dismiss_stale_approvals", lambda **k: 0)
+    d = mod.run_gate(owner="o", repo="r", pr=1, head_sha="abc", token="t",
+                     base_branch="main", post_token="app")
+    assert d.conclusion == "failure"
+    assert submitted == []
+
+
+def test_a_flipped_decision_dismisses_the_stale_approval(mod, monkeypatch):
+    dismissed = []
+    monkeypatch.setattr(mod, "_preflight", lambda *a, **k: None)
+    monkeypatch.setattr(
+        mod, "_gather_and_decide",
+        lambda *a, **k: mod.GateDecision("failure", "REQUEST_CHANGES outstanding", "x"),
+    )
+    monkeypatch.setattr(mod, "post_check_run", lambda *a, **k: None)
+    monkeypatch.setattr(
+        mod, "dismiss_stale_approvals",
+        lambda **k: dismissed.append(k["reason"]) or 1,
+    )
+    mod.run_gate(owner="o", repo="r", pr=1, head_sha="abc", token="t",
+                 base_branch="main", post_token="app")
+    assert dismissed == ["REQUEST_CHANGES outstanding"]
+
+
+def test_approval_failure_never_masks_the_posted_decision(mod, monkeypatch):
+    """The check run is the merge gate; the approval rides on top. A broken
+    approval channel must not turn a decided gate into a crashed job."""
+    monkeypatch.setattr(mod, "_preflight", lambda *a, **k: None)
+    monkeypatch.setattr(
+        mod, "_gather_and_decide",
+        lambda *a, **k: mod.GateDecision("success", "ok", "green"),
+    )
+    monkeypatch.setattr(mod, "post_check_run", lambda *a, **k: None)
+    monkeypatch.setattr(mod, "fetch_protection", lambda *a, **k: ((), {}))
+
+    def boom(**k):
+        raise RuntimeError("GitHub API POST ... -> 403: not granted")
+
+    monkeypatch.setattr(mod, "submit_mechanical_approval", boom)
+    d = mod.run_gate(owner="o", repo="r", pr=1, head_sha="abc", token="t",
+                     base_branch="main", post_token="app")
+    assert d.conclusion == "success"
+
+
+def test_the_gates_own_approval_does_not_destroy_eligibility(mod):
+    """The mechanical APPROVE is deliberately marker-free. If analyze_reviews
+    stopped at it, the gate would read "newest App review, no marker" -> not
+    eligible -> go red -> dismiss its own approval -> next run sees the marker
+    again -> green -> re-approve, forever. Self-sustaining, because the
+    pull_request_review trigger fires on both submit and dismiss and App-token
+    actions do trigger workflows."""
+    marker_review = {
+        "user": {"login": "infektydgrokreviewer[bot]"},
+        "state": "COMMENTED",
+        "commit_id": HEAD_SHA,
+        "body": f"looks fine\n{mod.ELIGIBILITY_MARKER}\n",
+    }
+    approval = {
+        "user": {"login": "infektydgrokreviewer[bot]"},
+        "state": "APPROVED",
+        "commit_id": HEAD_SHA,
+        "body": mod.build_approval_body(HEAD_SHA, ("CI",)),
+    }
+    assert mod.analyze_reviews([marker_review], HEAD_SHA)[0] is True
+    # Newest review is now the gate's own approval — eligibility must survive.
+    assert mod.analyze_reviews([marker_review, approval], HEAD_SHA)[0] is True
+
+
+def test_gate_state_is_a_fixed_point_not_a_loop(mod):
+    """Six consecutive evaluations must converge, not oscillate."""
+    reviews = [{
+        "user": {"login": "infektydgrokreviewer[bot]"},
+        "state": "COMMENTED",
+        "commit_id": HEAD_SHA,
+        "body": f"ok\n{mod.ELIGIBILITY_MARKER}\n",
+    }]
+    conclusions = []
+    for _ in range(6):
+        eligible, blocked = mod.analyze_reviews(reviews, HEAD_SHA)
+        d = mod.decide(
+            mod.GateInput(HEAD_SHA, ("CI",), {"CI": "success"}, eligible, blocked, False)
+        )
+        conclusions.append(d.conclusion)
+        if d.conclusion == "success" and not mod.already_approved(reviews, HEAD_SHA):
+            reviews.append({
+                "user": {"login": "infektydgrokreviewer[bot]"},
+                "state": "APPROVED",
+                "commit_id": HEAD_SHA,
+                "body": mod.build_approval_body(HEAD_SHA, ("CI",)),
+            })
+    assert conclusions == ["success"] * 6, f"oscillated: {conclusions}"
+
+
+def test_a_real_veto_still_wins_over_the_gates_own_approval(mod):
+    """The APPROVED skip must not make the gate blind to a later veto."""
+    reviews = [
+        {"user": {"login": "infektydgrokreviewer[bot]"}, "state": "COMMENTED",
+         "commit_id": HEAD_SHA, "body": f"ok\n{mod.ELIGIBILITY_MARKER}\n"},
+        {"user": {"login": "infektydgrokreviewer[bot]"}, "state": "APPROVED",
+         "commit_id": HEAD_SHA, "body": "mechanical"},
+        {"user": {"login": "infektydgrokreviewer[bot]"}, "state": "CHANGES_REQUESTED",
+         "commit_id": HEAD_SHA, "body": "actually no"},
+    ]
+    eligible, blocked = mod.analyze_reviews(reviews, HEAD_SHA)
+    assert blocked is True
+    assert eligible is False, "a newer CHANGES_REQUESTED must still clear eligibility"
+    assert mod.decide(
+        mod.GateInput(HEAD_SHA, ("CI",), {"CI": "success"}, eligible, blocked, False)
+    ).conclusion == "failure"
