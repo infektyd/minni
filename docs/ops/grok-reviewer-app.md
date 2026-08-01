@@ -1,108 +1,110 @@
-# Grok Reviewer GitHub App (v1)
+# Grok Reviewer GitHub App + mechanical check gate (v2)
 
-User-owned GitHub App that posts **formal** PR reviews from
-`.github/workflows/grok-review.yml`. Comments from `GITHUB_TOKEN` never satisfy
-`required_approving_review_count`; an App installation token can post Reviews
-API events.
+User-owned GitHub App posts **formal** PR reviews (`REQUEST_CHANGES` /
+`COMMENT`) from `.github/workflows/grok-review.yml`.
 
-## v1 policy (non-negotiable)
+**Merge trust is not Reviews API APPROVE.** Measured 2026-08-01 on PR #222:
+`infektydgrokreviewer[bot]` (and Cursor bot) can post `APPROVE`, but
+`reviewDecision` stays `REVIEW_REQUIRED` (`authorAssociation=NONE`) on this
+user-owned repo. v2 therefore uses a **required check run**
+`grok-mechanical-approve` from `.github/workflows/grok-approve-gate.yml`.
 
-| Model line | Reviews API `event` |
-|---|---|
-| `VERDICT: REQUEST_CHANGES` | `REQUEST_CHANGES` |
-| `VERDICT: COMMENT` | `COMMENT` |
-| `VERDICT: APPROVE` | **downgraded to `COMMENT`** |
-| missing / garbage | `COMMENT` |
+## v2 policy
 
-LLM output must not mint merge trust. A human or Cursor Approval Agent still
-supplies the approving review that clears the merge box.
+| Model line | Reviews API | Mechanical check |
+|---|---|---|
+| `VERDICT: REQUEST_CHANGES` | `REQUEST_CHANGES` | stays **failure** (blocks) |
+| `VERDICT: COMMENT` | `COMMENT` | **failure** until eligibility |
+| `VERDICT: APPROVE` | `COMMENT` + eligibility marker | **success** only if every *other* required status is `success` |
+| missing / garbage | `COMMENT` | **failure** |
 
-Parser: `.github/scripts/parse_grok_verdict.py` — only the **last non-empty
-line** of the model reply is parsed (loaded from the **default branch** when
-present; PR-head fallback only while landing, and head fallback cannot mint
-`REQUEST_CHANGES`).
+Eligibility marker stamped into the App review body:
+
+```html
+<!-- grok-mechanical-eligibility: APPROVE -->
+```
+
+Invariants (enforced in `.github/scripts/grok_approve_gate.py`):
+
+1. Red or pending required checks → never success.
+2. Empty required-context list → fail closed.
+3. Head SHA re-read before post; abort if moved.
+4. Gate script loaded from **default branch** only.
+5. Required contexts read from branch protection API (not hardcoded).
+6. PRs touching gate/trust paths stay red (path filter).
+
+Parser: `.github/scripts/parse_grok_verdict.py` — default path never emits
+Reviews `APPROVE`; `--allow-approve` is for gate/eligibility readers only.
 
 ## Create the App
 
 1. GitHub → **Settings → Developer settings → GitHub Apps → New GitHub App**.
 2. Name something like `infektyd-grok-reviewer` (must be globally unique).
 3. Homepage URL: your choice (repo or `https://github.com/infektyd`).
-4. **Webhook:** uncheck Active (Actions mints tokens; no webhook needed for v1).
+4. **Webhook:** uncheck Active (Actions mints tokens; no webhook needed).
 5. **Permissions → Repository:**
    - Pull requests: **Read & write**
    - Metadata: **Read-only**
-   - Nothing else.
-6. **Where can this GitHub App be installed?** → Only on this account
-   (`infektyd`).
+   - Nothing else (check runs use `GITHUB_TOKEN` in the gate workflow).
+6. **Where can this GitHub App be installed?** → Only on this account.
 7. Create App → note **App ID**.
-8. **Generate a private key** → download the `.pem`. Store offline; do not
-   commit it.
+8. **Generate a private key** → download the `.pem`. Do not commit it.
 
 ## Install (allowlist)
 
-1. Install App → **Only select repositories**.
-2. Canary first: one private throwaway or low-stakes repo with the same
-   workflow secrets pattern.
-3. Then add `infektyd/minni`.
-4. Do **not** install on all ~40–60 repos until canary proves REQUEST_CHANGES /
-   COMMENT appear as the App bot, and APPROVE never appears from it.
+Prefer **Only select repositories** (`minni` ± canary). If install is
+`all`, tighten it.
 
-## Secrets & variables (per repo or via reusable caller)
+## Secrets & variables
 
 | Name | Kind | Value |
 |---|---|---|
 | `GROK_APP_ID` | Repository **variable** | numeric App ID |
 | `GROK_APP_PRIVATE_KEY` | Repository **secret** | full PEM text |
-| `GROK_CI_AUTH_JSON` | Repository **secret** | already required for Grok CLI (see `.github/workflows/grok.yml`) |
+| `GROK_CI_AUTH_JSON` | Repository **secret** | Grok CLI auth (see `.github/workflows/grok.yml`) |
+
+## Branch protection (operator — propose, don't silent-apply)
+
+To stop needing `--admin` for solo merges, make the mechanical check + real CI
+required, and drop the approving-review count that bots cannot satisfy:
 
 ```bash
-# From a machine that has the PEM (never commit the file):
-gh variable set GROK_APP_ID --repo infektyd/minni --body '<APP_ID>'
-gh secret set GROK_APP_PRIVATE_KEY --repo infektyd/minni < /path/to/app.pem
+# PROPOSE to the operator; confirm strict=true (forces up-to-date) before running.
+gh api -X PUT repos/infektyd/minni/branches/main/protection \
+  --input - <<'JSON'
+{
+  "required_status_checks": {
+    "strict": true,
+    "contexts": [
+      "Forbidden Files",
+      "Free public cloud smoke",
+      "boundary",
+      "claude-review",
+      "grok-mechanical-approve"
+    ]
+  },
+  "enforce_admins": false,
+  "required_pull_request_reviews": {
+    "required_approving_review_count": 0,
+    "dismiss_stale_reviews": true
+  },
+  "restrictions": null
+}
+JSON
 ```
 
-If `GROK_APP_ID` is unset, the workflow **degrades** to `gh pr comment` via
-`GITHUB_TOKEN` (no formal review event). If the ID is set but the PEM is
-missing/wrong, mint fails **closed** — fix the secret; do not treat that as
-a silent comment fallback.
+Keep `required_approving_review_count: 1` only if you still want a **human**
+review in addition to the mechanical check (bots still will not count).
 
-## Prove it
+## Residual risk
 
-1. Open a same-repo non-draft PR (or re-open after `ready_for_review`).
-2. Confirm the Actions run posts a **Review** from the App identity, not only
-   an issue comment.
-3. Force a REQUEST_CHANGES path (or temporarily stub the reply in a fork of
-   the workflow on a canary) and confirm the merge box stays blocked until a
-   human/Cursor APPROVE.
-4. Confirm a reply ending in `VERDICT: APPROVE` still posts as **Comment**
-   review (parser note in the body).
+A green mechanical check means “eligible Grok verdict + required CI green” —
+**not** correctness. Agent-authored PRs can still ship bad-but-green code.
+Keep `enforce_admins: false` as a manual escape hatch. Path filter forces
+human attention on gate/workflow changes.
 
-## Multi-repo
+## Recovery
 
-v1 keeps one workflow in each repo (or copy from Minni). Prefer setting the
-same variable + secret on each allowlisted install over org secrets (owner is
-a user account). Extract a `workflow_call` reusable later if copy drift hurts —
-not a v1 blocker.
-
-## Recovery after `REQUEST_CHANGES`
-
-v1 does **not** re-review on every push (`synchronize` omitted to limit
-subscription burn). GitHub keeps an App `CHANGES_REQUESTED` opinion until that
-**same** review is dismissed or the App submits `APPROVE` (forbidden in v1). A
-later `COMMENT` review from the App does **not** clear it; a human/Cursor
-`APPROVE` is a different reviewer and also does not auto-dismiss the App.
-
-1. **Dismiss** the App's review (required to clear `CHANGES_REQUESTED` in v1).
-2. Optionally re-fire a review via draft → Ready for review, or close → reopen
-   (informational / fresh findings only — does **not** unblock merge by itself).
-
-`@grok` / the mention workflow only posts an issue comment — it does **not**
-submit a Reviews API event and will not clear `CHANGES_REQUESTED`.
-
-## Out of scope (v1)
-
-- LLM `APPROVE` via the App
-- Machine-user PAT as the review identity
-- Fork PRs (job already skips them; secrets unavailable)
-- `synchronize` re-review (subscription burn; use dismiss above)
-- Auto-dismiss of prior App `REQUEST_CHANGES` when a later COMMENT posts
+- `REQUEST_CHANGES` from the App clears eligibility until a later review
+  stamps the marker again (re-open / ready_for_review to re-run Grok).
+- Push → new SHA → gate re-runs on `synchronize` / check completion (L4).

@@ -1,0 +1,113 @@
+name: Grok Mechanical Approve Gate
+
+# v2 merge trust: required check run `grok-mechanical-approve`, NOT Reviews API
+# APPROVE. Measured 2026-08-01 (#222): bot APPROVE does not clear
+# reviewDecision on this user-owned repo.
+#
+# Triggers on CI completion and after Grok Code Review so dismiss-stale /
+# new-SHA / late eligibility all re-evaluate without a metered model call.
+# Loads grok_approve_gate.py from the default branch (trust anchor).
+
+on:
+  check_suite:
+    types: [completed]
+  workflow_run:
+    workflows: ["Grok Code Review"]
+    types: [completed]
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  checks: write
+  statuses: read
+  pull-requests: read
+
+concurrency:
+  group: grok-approve-gate-${{ github.event.pull_request.number || github.event.workflow_run.pull_requests[0].number || github.event.check_suite.head_sha || github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    if: |
+      github.event_name != 'pull_request' ||
+      (github.event.pull_request.head.repo.full_name == github.repository &&
+       github.event.pull_request.draft == false)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Resolve PR + head SHA
+        id: meta
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          OWNER_REPO="${{ github.repository }}"
+          DEFAULT_BRANCH="${{ github.event.repository.default_branch }}"
+          SHA=""
+          PR=""
+          case "${{ github.event_name }}" in
+            pull_request)
+              SHA="${{ github.event.pull_request.head.sha }}"
+              PR="${{ github.event.pull_request.number }}"
+              ;;
+            workflow_run)
+              SHA="${{ github.event.workflow_run.head_sha }}"
+              PR="$(gh api "repos/${OWNER_REPO}/commits/${SHA}/pulls" \
+                -H "Accept: application/vnd.github.groot-preview+json" \
+                --jq '[.[] | select(.state=="open")][0].number // empty')"
+              ;;
+            check_suite)
+              # Ignore suites that only contain our own check (loop guard).
+              SHA="${{ github.event.check_suite.head_sha }}"
+              NAMES="$(gh api "repos/${OWNER_REPO}/commits/${SHA}/check-runs?per_page=100" \
+                --jq '[.check_runs[].name] | unique | .[]' || true)"
+              if [ -n "$NAMES" ] && [ "$(printf '%s\n' "$NAMES" | grep -cv '^grok-mechanical-approve$' || true)" = "0" ]; then
+                echo "Only self check-runs on suite; skipping."
+                echo "skip=true" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+              PR="$(gh api "repos/${OWNER_REPO}/commits/${SHA}/pulls" \
+                -H "Accept: application/vnd.github.groot-preview+json" \
+                --jq '[.[] | select(.state=="open")][0].number // empty')"
+              ;;
+          esac
+          if [ -z "${SHA}" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "No head SHA; skipping."
+            exit 0
+          fi
+          if [ -z "${PR}" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "No open PR for ${SHA}; skipping."
+            exit 0
+          fi
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+          echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
+          echo "pr=${PR}" >> "$GITHUB_OUTPUT"
+          echo "default_branch=${DEFAULT_BRANCH}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout default branch (trust scripts only)
+        if: steps.meta.outputs.skip != 'true'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.meta.outputs.default_branch }}
+          fetch-depth: 1
+
+      - name: Run mechanical gate
+        if: steps.meta.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TRUST_REF="${{ steps.meta.outputs.default_branch }}"
+          # Prefer the checked-out default branch copy; fail closed if missing.
+          if [ ! -f .github/scripts/grok_approve_gate.py ]; then
+            echo "::error::grok_approve_gate.py missing on ${TRUST_REF}"
+            exit 1
+          fi
+          python3 .github/scripts/grok_approve_gate.py \
+            --repo "${{ github.repository }}" \
+            --pr "${{ steps.meta.outputs.pr }}" \
+            --head-sha "${{ steps.meta.outputs.sha }}" \
+            --base-branch "${TRUST_REF}"
