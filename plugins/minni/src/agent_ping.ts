@@ -104,6 +104,8 @@ function defaultAgentVault(agentId: string): string {
     kilocode: "kilocode",
     // Preserve hyphenated canonical slugs (the strip-punctuation fallback would
     // write grok-build -> grokbuild-vault, which the Grok overlay never polls).
+    // Keep in sync with `default_agent_vault` in src/minni/minnid_runtime/handoff.py.
+    "claude-science": "claude-science",
     "grok-build": "grok-build",
     "grok-beta": "grok-beta",
     grok: "grok",

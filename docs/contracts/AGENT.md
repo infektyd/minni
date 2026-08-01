@@ -25,6 +25,7 @@ It scopes reads, writes, episodic events, and learnings. Well-known values:
 | `gemini`       | Gemini / Antigravity (IDE, desktop, and `agy` CLI share one identity) |
 | `grok-build`   | Grok Build (xAI CLI)               |
 | `kilocode`     | Kilo Code                          |
+| `claude-science` | Claude Science (research workbench; vault-only, no hook surface) |
 | `hermes`       | Hermes orchestration agent         |
 | `openclaw`     | OpenClaw tool harness              |
 | `main`         | Default / anonymous agent          |

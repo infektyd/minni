@@ -410,3 +410,131 @@ def test_vault_slug_map_resolves_to_the_authored_agent_id():
         if mapped is not None and mapped != agent_id:
             mismatched[slug] = (mapped, agent_id)
     assert not mismatched, f"slug -> agent_id disagrees with AGENT_VAULT_DIRS: {mismatched}"
+
+
+def _parse_python_slug_map(path: Path) -> dict:
+    """Read a module-level `_VAULT_SLUG_TO_AGENT_ID` literal without importing.
+
+    `scripts/inbox_cleanup.py` is a standalone script by contract, so it must be
+    read rather than imported.
+    """
+    import ast
+
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    for node in tree.body:
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+            continue
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        for target in targets:
+            if isinstance(target, ast.Name) and target.id == "_VAULT_SLUG_TO_AGENT_ID":
+                return ast.literal_eval(node.value)
+    raise AssertionError(f"no _VAULT_SLUG_TO_AGENT_ID literal found in {path}")
+
+
+def _parse_ts_slug_map(path: Path) -> dict:
+    """Read the `VAULT_SLUG_TO_AGENT_ID` object literal out of the TS mirror."""
+    import re
+
+    source = path.read_text(encoding="utf-8")
+    match = re.search(
+        r"VAULT_SLUG_TO_AGENT_ID[^=]*=\s*\{(.*?)\n\};", source, re.DOTALL
+    )
+    assert match, f"no VAULT_SLUG_TO_AGENT_ID object literal found in {path}"
+    pairs = re.findall(
+        r'(?:"([^"]+)"|([A-Za-z_][\w-]*))\s*:\s*"([^"]+)"', match.group(1)
+    )
+    return {quoted or bare: value for quoted, bare, value in pairs}
+
+
+def test_all_three_vault_slug_maps_agree():
+    """The canonical slug map and BOTH mirrors must carry identical entries.
+
+    `inbox_ingest._VAULT_SLUG_TO_AGENT_ID` is duplicated into a TypeScript
+    mirror (hook-utils.ts) and a standalone-script mirror (inbox_cleanup.py).
+    The other slug tests import only the canonical map, so a mirror that falls
+    behind is invisible to them.
+
+    Both mirrors fall back to the slug itself (`?? slug` in TS, `.get(slug,
+    slug)` in Python), so a missing entry is harmless for an IDENTITY mapping
+    and silently wrong for a non-identity one -- `claudecode` -> `claude-code`
+    and `grok` -> `grok-build` would be stamped with the bare dir name. The
+    canonical map has no such fallback: `vault_ingest` skips an unknown slug
+    outright, which is how cursor-vault accumulated 141 unreachable wiki pages
+    before `cursor` was added there. The mirrors then kept lacking `cursor`
+    long after -- benign in that instance only because the mapping is identity.
+
+    Compared as dicts, so ordering and formatting differences are fine and only
+    a real content difference fails.
+
+    All three are parsed from source rather than imported: `minni` is installed
+    editable, so an import resolves to whatever checkout the install points at
+    -- which is NOT this one when the tests run from a git worktree. Reading the
+    files under this test's own repo root keeps the comparison hermetic.
+    """
+    root = Path(__file__).resolve().parents[1]
+    canonical = _parse_python_slug_map(
+        root / "src" / "minni" / "afm_passes" / "inbox_ingest.py"
+    )
+    mirrors = {
+        "scripts/inbox_cleanup.py": _parse_python_slug_map(
+            root / "scripts" / "inbox_cleanup.py"
+        ),
+        "plugins/minni/src/hook-utils.ts": _parse_ts_slug_map(
+            root / "plugins" / "minni" / "src" / "hook-utils.ts"
+        ),
+    }
+
+    drifted = {}
+    for name, mirror in mirrors.items():
+        missing = {k: v for k, v in canonical.items() if mirror.get(k) != v}
+        extra = {k: v for k, v in mirror.items() if k not in canonical}
+        if missing or extra:
+            drifted[name] = {"missing_or_wrong": missing, "extra": extra}
+
+    assert not drifted, (
+        "vault slug map mirrors have drifted from "
+        f"inbox_ingest._VAULT_SLUG_TO_AGENT_ID: {drifted}"
+    )
+
+
+def test_default_agent_vault_matches_agent_vault_dirs():
+    """agent_id -> vault PATH must agree with the declared vault dir.
+
+    The slug maps cover vault dir -> agent_id. `default_agent_vault` is the
+    INVERSE, and it is what personal recall and handoff resolution use. It
+    slugifies unknown ids by stripping non-alphanumerics, so a hyphenated id
+    that is not in its alias table resolves to a vault that does not exist --
+    `claude-science` silently became `claudescience-vault` while ingest, which
+    is path-based, indexed the real directory. The failure is quiet on both
+    sides: ingest works, recall just never finds anything.
+    """
+    import subprocess
+
+    # Run against THIS tree's src: `minni` is installed editable, so a plain
+    # import resolves to whatever checkout the install points at -- the main
+    # one, not this worktree. Same hazard as the slug-agreement test above.
+    root = Path(__file__).resolve().parents[1]
+    probe = (
+        "import json;"
+        "from minni.minnid_runtime.handoff import default_agent_vault;"
+        "from minni.tools.author_principals import AGENT_VAULT_DIRS;"
+        "print(json.dumps({a: [d, default_agent_vault(a).name]"
+        " for a, d in AGENT_VAULT_DIRS.items()}))"
+    )
+    env = {**os.environ, "PYTHONPATH": str(root / "src")}
+    out = subprocess.run(
+        [sys.executable, "-c", probe],
+        capture_output=True, text=True, env=env, cwd=str(root), check=True,
+    ).stdout
+    resolved_by_agent = json.loads(out)
+
+    mismatched = {
+        agent_id: {"expected": declared, "resolved": resolved}
+        for agent_id, (declared, resolved) in resolved_by_agent.items()
+        if declared != resolved
+    }
+
+    assert not mismatched, (
+        "default_agent_vault disagrees with AGENT_VAULT_DIRS -- personal recall "
+        f"and handoffs will miss these vaults: {mismatched}"
+    )

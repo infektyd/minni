@@ -237,8 +237,14 @@ def _is_stop_candidate_shape(doc: Dict[str, Any]) -> bool:
 # because a missing slug makes vault_ingest skip the vault entirely rather than
 # fail, cursor-vault silently accumulated 141 wiki pages that recall could never
 # see. A skip is quiet; keep the maps in sync.
+#
+# This table is mirrored VERBATIM in plugins/minni/src/hook-utils.ts and
+# scripts/inbox_cleanup.py. Both mirrors then drifted the same way -- they kept
+# missing `cursor` long after it landed here. test_all_three_vault_slug_maps_agree
+# (tests/test_vault_ingest.py) now compares all three; edit them together.
 _VAULT_SLUG_TO_AGENT_ID: dict[str, str] = {
     "claudecode": "claude-code",
+    "claude-science": "claude-science",
     "codex": "codex",
     "cursor": "cursor",
     "gemini": "gemini",
