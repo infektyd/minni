@@ -132,6 +132,11 @@ def register_claude_plugin(
     plugins = dict(plugins)
 
     raw_entries = plugins.get(PLUGIN_KEY)
+    if raw_entries is not None and not isinstance(raw_entries, list):
+        # Same policy as 'plugins' above: a shape we do not understand holds
+        # somebody's registration, and quietly replacing it with a list of our
+        # own is not a trade this code gets to make.
+        raise ClaudePluginError(f"{path}: plugins['{PLUGIN_KEY}'] is not a list")
     # Entries we do not understand are carried through untouched rather than
     # dropped: only the user-scope dict is ours to rewrite.
     entries = list(raw_entries) if isinstance(raw_entries, list) else []
@@ -411,6 +416,18 @@ def legacy_cache_referrers(*, overrides: dict[str, dict] | None = None) -> list[
     """
     root = legacy_cache_root()
     overrides = overrides or {}
+    # Structured matching alone is not enough to authorise an rmtree. Claude
+    # Code's hook entries are *shell command strings* ("node <path>/hook.js
+    # SessionStart"), not argv arrays, so the cache path routinely appears
+    # embedded in a larger string that Path() cannot classify -- as do "~"-
+    # relative spellings, file:// URLs and .. segments. A dumb substring gate
+    # catches those; it is the same belt-and-braces approach gc.py already uses,
+    # and erring toward a refusal is the only safe direction here.
+    needles = {
+        str(root).lower(),
+        str(root.resolve()).lower(),
+        f"~/.claude/plugins/cache/{MARKETPLACE_NAME}",
+    }
     found: list[str] = []
     for path in legacy_scan_paths():
         key = str(path)
@@ -424,9 +441,17 @@ def legacy_cache_referrers(*, overrides: dict[str, dict] | None = None) -> list[
             except ClaudePluginError as exc:
                 found.append(f"{path}: unreadable, cannot verify ({exc})")
                 continue
-        for trail, value in _iter_json_strings(doc):
-            if _is_under(value, root):
-                found.append(f"{path}: {trail} -> {value}")
+        precise = [
+            f"{path}: {trail} -> {value}"
+            for trail, value in _iter_json_strings(doc)
+            if _is_under(value, root)
+        ]
+        if precise:
+            found.extend(precise)
+            continue
+        blob = json.dumps(doc).lower()
+        if any(n in blob for n in needles):
+            found.append(f"{path}: mentions {root} inside a larger string")
     return found
 
 
@@ -487,7 +512,10 @@ def remove_legacy_cache(
     target = root / MARKETPLACE_NAME
     if target.is_symlink():
         raise ClaudePluginError(f"{target} is a symlink; refusing to remove it")
-    removed = [str(p) for p in legacy_cache_dirs()]
+    # Everything inside the target, not just the version dirs: rmtree takes
+    # stray files and symlinks too, and a report that omits them is exactly the
+    # under-reporting this function was fixed to stop doing for siblings.
+    removed = sorted(str(p) for p in target.iterdir()) if target.is_dir() else []
     siblings = sorted(str(p) for p in root.iterdir() if p != target)
 
     if not dry_run:

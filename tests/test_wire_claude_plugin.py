@@ -452,6 +452,75 @@ def test_remove_legacy_cache_spares_a_sibling_plugin(home):
     assert not (legacy_cache_root() / "minni").exists()
 
 
+def test_remove_legacy_cache_refuses_a_hook_command_string(home):
+    """Claude Code hooks are shell command strings, not argv arrays.
+
+    The cache path is embedded in a larger string there, so structured
+    path-matching alone would clear the deletion and orphan the hook.
+    """
+    (legacy_cache_root() / "minni" / "0.3.0").mkdir(parents=True)
+    root = _install_tree(home, "0.4.0")
+    hook = legacy_cache_root() / "minni" / "0.3.0" / "dist" / "hook.js"
+    settings = home / ".claude" / "settings.json"
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    settings.write_text(json.dumps({
+        "hooks": {"SessionStart": [
+            {"hooks": [{"type": "command", "command": f"node {hook} SessionStart"}]},
+        ]},
+    }), encoding="utf-8")
+
+    with pytest.raises(ClaudePluginError, match="still referenced by"):
+        remove_legacy_cache(root)
+    assert (legacy_cache_root() / "minni" / "0.3.0").is_dir()
+
+
+@pytest.mark.parametrize("spelling", [
+    "~/.claude/plugins/cache/minni/minni/0.3.0/dist/server.js",
+    "file:///tmp/x",  # control: must NOT trip the gate
+])
+def test_remove_legacy_cache_catches_tilde_spellings(home, spelling):
+    (legacy_cache_root() / "minni" / "0.3.0").mkdir(parents=True)
+    root = _install_tree(home, "0.4.0")
+    cfg = home / ".claude.json"
+    cfg.write_text(json.dumps({"whatever": spelling}), encoding="utf-8")
+
+    if spelling.startswith("~"):
+        with pytest.raises(ClaudePluginError, match="still referenced by"):
+            remove_legacy_cache(root)
+    else:
+        assert remove_legacy_cache(root)["changed"] is True
+
+
+def test_remove_legacy_cache_reports_strays_it_deletes(home):
+    """rmtree takes loose files too; the report must not omit them."""
+    target = legacy_cache_root() / "minni"
+    (target / "0.3.0").mkdir(parents=True)
+    (target / "stray.tar.gz").write_text("x", encoding="utf-8")
+    root = _install_tree(home, "0.4.0")
+
+    result = remove_legacy_cache(root)
+
+    assert str(target / "stray.tar.gz") in result["removed_versions"]
+    assert str(target / "0.3.0") in result["removed_versions"]
+    assert not target.exists()
+
+
+def test_register_refuses_a_non_list_entry_container(home):
+    path = installed_plugins_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({
+        "version": 2,
+        "plugins": {"minni@minni": {"scope": "user", "installPath": "/old"}},
+    }), encoding="utf-8")
+    root = _install_tree(home, "0.4.0")
+
+    with pytest.raises(ClaudePluginError, match="is not a list"):
+        register_claude_plugin(root, "0.4.0")
+    assert json.loads(path.read_text(encoding="utf-8"))["plugins"]["minni@minni"] == {
+        "scope": "user", "installPath": "/old",
+    }
+
+
 def test_remove_legacy_cache_refuses_an_unreadable_config(home):
     (legacy_cache_root() / "minni" / "0.3.0").mkdir(parents=True)
     root = _install_tree(home, "0.4.0")

@@ -160,10 +160,24 @@ properties rather than relying on the earlier steps having done their job:
   cannot be parsed counts as a hit: an unreadable file is not evidence that
   nothing references the tree. `known_marketplaces.json` is deliberately not
   scanned — its `minni` entry is the one reference step 3 retires itself.
-- **It deletes only what it enumerates.** The target is the plugin dir
+
+  The check is two-layer, and the second layer is the load-bearing one.
+  Structured matching (`Path.relative_to`) produces the precise "file: field ->
+  path" message, but it only recognises a string that *is* a lexically-normal
+  absolute path. Claude Code's hook entries are shell command strings —
+  `"node <path>/dist/hook.js SessionStart"` — so the cache path routinely
+  appears embedded in a larger string, as do `~`-relative spellings and `..`
+  segments. A case-insensitive substring gate over the serialized document
+  catches those. It can over-refuse (a doc URL mentioning the path would trip
+  it); that is the correct direction for something gating an `rmtree`, and the
+  operator can pass `--keep-legacy-cache`.
+
+- **It reports everything it deletes.** The target is the plugin dir
   `<cache>/minni/minni`, not the whole `<cache>/minni` marketplace dir. A
   sibling plugin cached under the same marketplace survives and is listed in
   `siblings_kept`; the marketplace dir is removed only once it is empty.
+  `removed_versions` lists every direct child of the target, not just
+  version-shaped dirs, because `rmtree` takes loose files and symlinks too.
 
 Because step 1 and step 2 rewrite registrations that themselves point into the
 cache, the scan runs against the documents those steps are *about to write*, not

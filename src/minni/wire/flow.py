@@ -429,29 +429,6 @@ def run_wire(args) -> int:
                             install_root, version,
                             git_sha=manifest.git_sha, dry_run=dry_run,
                         )
-                        # Desktop records a *versioned* path, so a wire that
-                        # moves the tree strands it on a version GC will later
-                        # prune. Adopt is what first moves Desktop onto the wire
-                        # tree; keeping it there is ordinary wiring's job. This
-                        # is a no-op until adoption has happened, since only a
-                        # path under the wire tree is ever rewritten.
-                        extras["claude_desktop"] = follow_claude_desktop(
-                            install_root, dry_run=dry_run,
-                        )
-                        # Wiring alone leaves a half-migrated machine: the stale
-                        # marketplace is still there, so `/plugin update` will
-                        # reinstall into the cache and rewrite installPath off
-                        # the tree we just registered — the exact silent
-                        # reversion this registration exists to stop.
-                        if claude_adopt_pending():
-                            extras["claude_adopt_pending"] = True
-                            print(
-                                "[wire] claude-code: the retired minni marketplace/cache "
-                                "install is still present. Run `minni wire-adopt "
-                                "claude-code` (then `--apply`) or `/plugin update` can "
-                                "revert the plugin surface off the wire tree.",
-                                file=sys.stderr,
-                            )
                     except ClaudePluginError as exc:
                         # The MCP config and wired.json already moved above, so
                         # `failed` alone would tell an operator (or automation
@@ -473,6 +450,47 @@ def run_wire(args) -> int:
                             extra=extras,
                         ))
                         continue
+
+                    # Desktop records a *versioned* path, so a wire that moves
+                    # the tree strands it on a version GC will later prune.
+                    # Adopt is what first moves Desktop onto the wire tree;
+                    # keeping it there is ordinary wiring's job, and a no-op
+                    # until adoption has happened.
+                    #
+                    # Best-effort on purpose. Claude Desktop is a separate
+                    # product wire does not own, and its config being corrupt,
+                    # unreadable or mid-write must not fail a claude-code wire
+                    # that otherwise succeeded — that would flip the whole run
+                    # to `failed` and skip GC over a file we only touch as a
+                    # courtesy. `wire-adopt`, where the operator asked for the
+                    # Desktop move explicitly, stays strict.
+                    try:
+                        extras["claude_desktop"] = follow_claude_desktop(
+                            install_root, dry_run=dry_run,
+                        )
+                    except ClaudePluginError as exc:
+                        extras["claude_desktop"] = {
+                            "changed": False, "reason": f"skipped: {exc}",
+                        }
+                        print(
+                            f"[wire] claude-code: left Claude Desktop alone ({exc})",
+                            file=sys.stderr,
+                        )
+
+                    # Wiring alone leaves a half-migrated machine: the stale
+                    # marketplace is still there, so `/plugin update` will
+                    # reinstall into the cache and rewrite installPath off the
+                    # tree we just registered — the exact silent reversion this
+                    # registration exists to stop.
+                    if claude_adopt_pending():
+                        extras["claude_adopt_pending"] = True
+                        print(
+                            "[wire] claude-code: the retired minni marketplace/cache "
+                            "install is still present. Run `minni wire-adopt "
+                            "claude-code` (then `--apply`) or `/plugin update` can "
+                            "revert the plugin surface off the wire tree.",
+                            file=sys.stderr,
+                        )
 
                 out.results.append(PlatformResult(
                     platform, "wired" if not dry_run else "wired",
