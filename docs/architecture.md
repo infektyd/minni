@@ -28,7 +28,7 @@ flowchart TD
     Retrieval["recall / search<br/>personal · combined · both"]
     Governance["learn → candidate_packets → resolve"]
     Handoff["handoff leases"]
-    Plans["plan surface — minni_plan_*"]
+    Plans["thread surface — minni_thread_*"]
     Team["team surface — minni_team_*"]
 
     Vaults["Per-agent Markdown vaults<br/>raw / wiki / logs / schema / inbox / outbox"]

@@ -124,8 +124,8 @@ Want proof agents are actually using memory? `minni watch` tails every recall, l
 
 ```mermaid
 %% Budget: 18 nodes / 16 edges. Dashed = host-fired; solid = someone calls.
-%% Tool names re-verified 2026-08-01: the plan surface ships as minni_plan_*.
-%% A rename to a threads_* prefix is proposed but unmerged — re-check next audit.
+%% Tool names re-verified 2026-08-01: the thread surface ships as minni_thread_*;
+%% the pre-rename minni_plan_* names remain as deprecated aliases until the release after next.
 flowchart TD
     Agents["Agent runtimes<br/>Claude Code · Codex · Gemini/Antigravity · Grok · Cursor · Kilo Code<br/>+ any MCP client"]
     Hooks["Host hooks<br/>session start · prompt submit · compaction · stop"]
@@ -136,7 +136,7 @@ flowchart TD
     Retrieval["Recall — scope: personal · combined · both"]
     Governance["Learn → candidate → approve"]
     Handoff["Handoff leases"]
-    Plans["Plan surface — minni_plan_*"]
+    Plans["Thread surface — minni_thread_*"]
     Vaults["Per-agent Markdown vaults<br/>raw / wiki / logs / schema / inbox / outbox"]
     Personal[("Personal index<br/>&lt;agent&gt;-vault/.index/")]
     Shared[("Shared ~/.minni/minni.db + FAISS<br/>learnings · candidates · leases · pooled docs")]
