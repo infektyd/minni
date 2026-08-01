@@ -243,11 +243,18 @@ export async function learnMemory(input: {
 export async function readAgentContext(input: {
   agentId?: string;
   limit?: number;
+  /** Boot-budget deadline: destroys the socket, which is what lets a hook
+   * process EXIT (see the SessionStart budget in hook-handlers.ts). */
+  timeoutMs?: number;
 } = {}): Promise<JsonResult<ReadContextResponse>> {
-  return jsonRpcSocketRequestWithFallback("read", {
-    agent_id: input.agentId ?? DEFAULT_AGENT_ID,
-    limit: input.limit ?? 8,
-  }) as Promise<JsonResult<ReadContextResponse>>;
+  return jsonRpcSocketRequestWithFallback(
+    "read",
+    {
+      agent_id: input.agentId ?? DEFAULT_AGENT_ID,
+      limit: input.limit ?? 8,
+    },
+    input.timeoutMs !== undefined ? { timeoutMs: input.timeoutMs } : {},
+  ) as Promise<JsonResult<ReadContextResponse>>;
 }
 
 /**
@@ -552,6 +559,9 @@ export async function ackHandoff(
      * mirroring listPendingHandoffs.
      */
     agentId?: string;
+    /** Boot-budget deadline: this is one RPC PER LEASE, so it is the boot's
+     * most unbounded call and the one most able to blow the deadline. */
+    timeoutMs?: number;
   },
   requester: JsonRpcRequester = jsonRpcSocketRequest,
 ): Promise<JsonResult> {
@@ -560,16 +570,16 @@ export async function ackHandoff(
     status: input.status,
     contradicts_id: input.contradictsId,
     agent_id: input.agentId,
-  }, requester);
+  }, requester, input.timeoutMs !== undefined ? { timeoutMs: input.timeoutMs } : {});
 }
 
 export async function listPendingHandoffs(
-  input: { agentId: string },
+  input: { agentId: string; timeoutMs?: number },
   requester: JsonRpcRequester = jsonRpcSocketRequest,
 ): Promise<JsonResult> {
   return jsonRpcSocketRequestWithFallbackRequester("minni_list_pending_handoffs", {
     agent_id: input.agentId,
-  }, requester);
+  }, requester, input.timeoutMs !== undefined ? { timeoutMs: input.timeoutMs } : {});
 }
 
 export async function awaitHandoff(
@@ -583,13 +593,13 @@ export async function awaitHandoff(
 }
 
 export async function subscribeContradictions(
-  input: { agentId: string; sinceTs?: number },
+  input: { agentId: string; sinceTs?: number; timeoutMs?: number },
   requester: JsonRpcRequester = jsonRpcSocketRequest,
 ): Promise<JsonResult> {
   return jsonRpcSocketRequestWithFallbackRequester("minni_subscribe_contradictions", {
     agent_id: input.agentId,
     since_ts: input.sinceTs,
-  }, requester);
+  }, requester, input.timeoutMs !== undefined ? { timeoutMs: input.timeoutMs } : {});
 }
 
 /**

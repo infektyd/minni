@@ -22,6 +22,8 @@ void runHookMain({
   auditPrefix: "hook_grok",
   // Mirrors hooks/hooks-grok.json UserPromptSubmit "timeout": 30 — edit both.
   promptHookTimeoutMs: 30_000,
+  // Mirrors hooks/hooks-grok.json SessionStart "timeout": 30 — edit both.
+  sessionStartHookTimeoutMs: 30_000,
   precompactKind: "grok_precompact_handoff",
   // Wire is the platform contract, not the memory principal. Agent id is
   // user-overridable (MINNI_GROK_AGENT_ID); deriving the wire from it would

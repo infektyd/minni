@@ -179,6 +179,44 @@ export function emit(output: object): void {
 }
 
 /**
+ * `emit`, but resolving to whether the bytes actually REACHED the host.
+ *
+ * `emit` returns as soon as the payload is queued: for a piped stdout (which is
+ * how every host runs a hook) the write is asynchronous, so a successful `emit`
+ * proves only that the process intended to speak. Anything that must not happen
+ * until the host has the output — consuming a correction, say — needs the
+ * stronger signal, which is the write callback (fired once the chunk is flushed
+ * to the OS) rather than the call returning.
+ *
+ * Resolves FALSE when the output was never delivered. A host that has gone away
+ * closes its read end, and the write then fails with EPIPE — which node surfaces
+ * as an `error` EVENT on the stream as well as to the callback, and an unhandled
+ * one would tear the process down before the caller could account for the loss.
+ * Hence the listener: a failed delivery has to be a value the caller can branch
+ * on, not a crash.
+ */
+export function emitDelivered(output: object): Promise<boolean> {
+  return new Promise<boolean>((resolve) => {
+    let settled = false;
+    const settle = (delivered: boolean): void => {
+      if (settled) return;
+      settled = true;
+      process.stdout.removeListener("error", onError);
+      resolve(delivered);
+    };
+    const onError = (): void => settle(false);
+    process.stdout.once("error", onError);
+    try {
+      process.stdout.write(`${JSON.stringify(output)}\n`, (error) => settle(!error));
+    } catch {
+      // A synchronously-throwing stdout (already destroyed) is a non-delivery
+      // like any other, not an exception for the caller to handle.
+      settle(false);
+    }
+  });
+}
+
+/**
  * Default internal time budget for a prompt-time hook, in ms.
  *
  * This exists because the HARNESS deadline is not ours to negotiate: Claude Code

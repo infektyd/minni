@@ -9,6 +9,7 @@ import { adaptCursorOutput, adaptCursorPayload, CURSOR_EVENTS } from "./cursor-a
 import { createHookHandlers } from "./hook-handlers.js";
 import { cursorWire } from "./hook-platform.js";
 import { asString, emit, readStdin } from "./hook-utils.js";
+import { discardDeliveryCommits, emitAndCommit } from "./hook-delivery.js";
 import { recordAudit } from "./vault.js";
 import type { RecallGuardMode } from "./recall-guard.js";
 
@@ -29,6 +30,8 @@ const CONFIG = {
   auditPrefix: "hook_cursor",
   // Mirrors hooks/hooks-cursor.json beforeSubmitPrompt "timeout": 30 — edit both.
   promptHookTimeoutMs: 30_000,
+  // Mirrors hooks/hooks-cursor.json sessionStart "timeout": 30 — edit both.
+  sessionStartHookTimeoutMs: 30_000,
   precompactKind: "cursor_precompact_handoff",
   recallGuardMode: CURSOR_GUARD_MODE,
   // Without this, wireFor("cursor") fell through to the Claude profile and the
@@ -47,8 +50,16 @@ async function main(): Promise<void> {
   }
   try {
     const output = await createHookHandlers(CONFIG).dispatch(event, adaptCursorPayload(raw));
-    emit(adaptCursorOutput(event, output as Record<string, unknown>));
+    // emitAndCommit, not emit: work the handler deferred (archiving a consumed
+    // correction) runs only once this output has actually reached Cursor.
+    await emitAndCommit(adaptCursorOutput(event, output as Record<string, unknown>), {
+      vaultPath: CONFIG.vaultPath,
+      auditPrefix: CONFIG.auditPrefix,
+      event,
+    });
   } catch (error) {
+    // Nothing was delivered, so nothing the handler deferred may be committed.
+    discardDeliveryCommits();
     const message = error instanceof Error ? error.message : String(error);
     await recordAudit(CONFIG.vaultPath, {
       tool: "hook_cursor_error",

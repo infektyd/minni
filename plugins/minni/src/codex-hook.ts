@@ -24,6 +24,8 @@ void runHookMain({
   auditPrefix: "hook_codex",
   // Mirrors hooks/hooks-codex.json UserPromptSubmit "timeout": 30 — edit both.
   promptHookTimeoutMs: 30_000,
+  // Mirrors hooks/hooks-codex.json SessionStart "timeout": 30 — edit both.
+  sessionStartHookTimeoutMs: 30_000,
   precompactKind: "codex_precompact_handoff",
   // Wire is the platform contract, not the memory principal. Agent id is
   // user-overridable; deriving the wire from it would fall through to the

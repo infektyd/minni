@@ -34,6 +34,7 @@ import {
   workspaceFromPayload,
 } from "./hook-utils.js";
 import type { HookOutput } from "./hook-utils.js";
+import { deferUntilDelivered, discardDeliveryCommits, emitAndCommit } from "./hook-delivery.js";
 import { harvestSummaryText } from "./compact-harvest.js";
 import { injectIntent, noIntent, noteIntent } from "./hook-intent.js";
 import type { HookIntent } from "./hook-intent.js";
@@ -176,6 +177,18 @@ export interface AgentHookConfig {
    * Omit for a platform with no declared timeout (kilocode has none at all).
    */
   promptHookTimeoutMs?: number;
+  /**
+   * This platform's manifest timeout (ms) for SESSION START, as an OUTER bound
+   * on the boot budget — same contract as `promptHookTimeoutMs`, and the same
+   * obligation to be edited together with `hooks/hooks-<platform>.json`.
+   *
+   * Boot needs its own bound because the deadlines differ: gemini declares
+   * **10s** for SessionStart (hooks-gemini.json) while codex, grok and cursor
+   * declare 30s. Without it a cold daemon runs the boot RPCs past gemini's kill
+   * and the whole envelope — identity, corrections, active plan — is discarded.
+   * `sessionstart-delivery.test.mjs` pins each value to its manifest.
+   */
+  sessionStartHookTimeoutMs?: number;
 }
 
 /** Test seam: lets behavioral tests drive the zero-candidate Stop branch. */
@@ -444,36 +457,75 @@ export function createHookHandlers(
     const workspaceId = workspaceFor(payload);
     await ensureVault(config.vaultPath);
 
+    // BOOT BUDGET: platforms kill SessionStart and DISCARD its output — gemini
+    // at 10s (hooks-gemini.json). A boot that overruns loses the whole envelope,
+    // so we own a shorter deadline and deliver whatever landed inside it. The
+    // deadline is ABSOLUTE and shared: each read gets only what is left, and
+    // once it is spent the rest resolve instantly with their degraded value so
+    // the envelope — and, critically, the corrections below — still ship.
+    const budgetMs = effectiveHookBudgetMs(config.sessionStartHookTimeoutMs);
+    const deadline = Date.now() + budgetMs;
+    const remainingMs = (): number => Math.max(0, deadline - Date.now());
+    const rpcTimedOut = { ok: false as const, error: JSON_RPC_TIMEOUT_ERROR };
+
     // TTL-reap stale file handoffs BEFORE the honest read so they neither occupy
     // the capped slice nor inflate totals; they surface once below as 'expired'.
-    const expiredHandoffs = await expireStaleInboxHandoffs(config.vaultPath);
+    const expiredHandoffs =
+      (await withBudget(expireStaleInboxHandoffs(config.vaultPath), remainingMs(), undefined)) ?? [];
     const [status, tail, identityRead, recall, contradictions, inboxStatus] = await Promise.all([
-      buildStatusReport({ vaultPath: config.vaultPath }),
-      auditTail(config.vaultPath, 5),
+      withBudget(buildStatusReport({ vaultPath: config.vaultPath }), remainingMs(), undefined),
+      withBudget(auditTail(config.vaultPath, 5), remainingMs(), undefined),
       // hooks-PL-2 leg (a): BOTH boot modes issue the daemon 'read' — it is
       // the recency-ordered learning surface AND the path that records
       // learning_reads, which stale_beliefs matches on. agent-context boots
       // inject it whole as native layer 1; identity-recall boots trim it to
       // recent_learnings below.
-      readAgentContext({ agentId: config.agentId, limit: 8 }),
+      withBudget(
+        readAgentContext({ agentId: config.agentId, limit: 8, timeoutMs: remainingMs() }),
+        remainingMs(),
+        rpcTimedOut,
+      ),
       // recall-F1: boot recall must include the correction-bearing layers, not
       // just the identity shelf (the widened search is what lets knowledge-
       // layer corrections rank in). See BOOT_RECALL_LAYERS for the policy.
-      recallMemory({
-        query: `boot identity for ${workspaceId}`,
-        layers: BOOT_RECALL_LAYERS,
-        limit: 8,
-        agentId: config.agentId,
-        workspaceId,
-        ...(rawSessionId ? { sessionId: rawSessionId } : {}),
-      }),
+      withBudget(
+        recallMemory({
+          query: `boot identity for ${workspaceId}`,
+          layers: BOOT_RECALL_LAYERS,
+          limit: 8,
+          agentId: config.agentId,
+          workspaceId,
+          // The load-bearing deadline: it destroys the socket, which is what
+          // lets the hook PROCESS exit. Racing a promise alone cannot do that.
+          timeoutMs: remainingMs(),
+          ...(rawSessionId ? { sessionId: rawSessionId } : {}),
+        }),
+        remainingMs(),
+        rpcTimedOut,
+      ),
       // hooks-PL-1/PL-2: corrections to beliefs this agent read must
       // re-surface at boot (stale_beliefs), on every platform.
-      subscribeContradictions({ agentId: config.agentId }),
-      readInboxStatus(config.vaultPath, 3),
+      withBudget(
+        subscribeContradictions({ agentId: config.agentId, timeoutMs: remainingMs() }),
+        remainingMs(),
+        rpcTimedOut,
+      ),
+      withBudget(readInboxStatus(config.vaultPath, 3), remainingMs(), undefined),
     ]);
-    const pending = inboxStatus.entries;
-    const handoffContext = await resolveInboxHandoffContext(config.vaultPath, pending);
+    // Sections the budget cut. Named so a degraded boot is legible as degraded
+    // rather than as an agent with nothing in its memory (hooks-PL-5).
+    const degradedSections = [
+      status === undefined ? "status" : undefined,
+      tail === undefined ? "audit_tail" : undefined,
+      inboxStatus === undefined ? "pending_learnings" : undefined,
+    ].filter((section): section is string => section !== undefined);
+    const pending = inboxStatus?.entries ?? [];
+    const handoffContext =
+      (await withBudget(
+        resolveInboxHandoffContext(config.vaultPath, pending),
+        remainingMs(),
+        undefined,
+      )) ?? [];
     // hooks-PL-3: re-assert corrections stashed by PreCompact, so the
     // post-compaction boot re-injects them even if the daemon is down now.
     // Consumed entries are settled (exactly-once re-injection, no unbounded
@@ -481,19 +533,31 @@ export function createHookHandlers(
     // the next boot, and all-malformed entries survive for inspection.
     // I5: use the reassert-specific window so recent all-malformed files cannot
     // crowd valid corrections out of the newest-N slots.
+    //
+    // Deliberately UNBUDGETED: this is cheap local FS, and it is the one read
+    // whose absence loses data rather than context.
     const reassertPending = await readReassertPending(config.vaultPath, 3);
     const { events: correctionsReassert, consumedPaths: reassertConsumed, deferredTails: reassertDeferred } =
       collectCorrectionsReassert(reassertPending);
-    await settleReassertedInboxEntries(config.vaultPath, {
-      consumedPaths: reassertConsumed,
-      deferredTails: reassertDeferred,
-    });
+    // R2: settle AFTER the envelope reaches the host, never before. Archiving
+    // here would consume the correction inside the window where the boot can
+    // still be killed, losing it for good — see hook-delivery.ts.
+    deferUntilDelivered(() =>
+      settleReassertedInboxEntries(config.vaultPath, {
+        consumedPaths: reassertConsumed,
+        deferredTails: reassertDeferred,
+      }),
+    );
 
     // Plan parity (audit C5): SessionStart injects the FULL active-plan view for
     // boot/rehydration, exactly like the claude-code hook.
     let activePlan: Awaited<ReturnType<typeof resolveActivePlanView>>;
     try {
-      activePlan = await resolveActivePlanView(config.vaultPath);
+      activePlan = await withBudget(
+        resolveActivePlanView(config.vaultPath),
+        remainingMs(),
+        undefined,
+      );
     } catch (error) {
       // hooks-PL-5: a failed plan resolution must not silently boot plan-less.
       await recordAudit(config.vaultPath, {
@@ -509,11 +573,17 @@ export function createHookHandlers(
         workspace: workspaceId,
         vault: config.vaultPath,
         session_id: sessionId,
-        daemon_ok: status.socket.ok,
-        afm_ok: status.afm.ok,
+        // Unknown reads as not-ok, never as ok: `degraded.sections` below says
+        // which of these the budget cut, so "false" is not read as "checked".
+        daemon_ok: status?.socket.ok ?? false,
+        afm_ok: status?.afm.ok ?? false,
         ...(config.runtime !== undefined ? { runtime: config.runtime } : {}),
       },
-      pending_learnings: buildPendingLearningsSection(inboxStatus, expiredHandoffs),
+      // Omitted rather than zero-filled when the budget cut the inbox read: a
+      // "0 pending" the hook never counted is a false all-clear.
+      ...(inboxStatus !== undefined
+        ? { pending_learnings: buildPendingLearningsSection(inboxStatus, expiredHandoffs) }
+        : {}),
       handoff_context: handoffContext.map((snippet) => ({
         ref: snippet.ref,
         path: snippet.relativePath,
@@ -536,11 +606,23 @@ export function createHookHandlers(
               layers: BOOT_RECALL_LAYERS,
             }
           : { ok: false, error: recall.error },
-      audit_tail: tail.entries.slice(-5).map((entry) => entry.split("\n")[0]),
+      ...(tail !== undefined
+        ? { audit_tail: tail.entries.slice(-5).map((entry) => entry.split("\n")[0]) }
+        : {}),
     };
 
     if (correctionsReassert.length > 0) {
       envelopeBody.corrections_reassert = correctionsReassert;
+    }
+
+    if (degradedSections.length > 0) {
+      // Say so IN the envelope: a boot the budget truncated must never be
+      // indistinguishable from a boot that found nothing (hooks-PL-5).
+      envelopeBody.degraded = {
+        sections: degradedSections,
+        budget_ms: budgetMs,
+        note: "Boot exceeded the SessionStart budget (likely a cold daemon). The listed sections were NOT read — treat them as unknown, not empty, and call minni_recall explicitly if they matter.",
+      };
     }
 
     if (bootIdentity === "agent-context") {
@@ -602,15 +684,20 @@ export function createHookHandlers(
       tool: `${config.auditPrefix}_session_start`,
       summary: `boot ${sessionId}`,
       details: {
-        daemon_ok: status.socket.ok,
-        afm_ok: status.afm.ok,
-        pending_inbox: inboxStatus.totalPending,
+        daemon_ok: status?.socket.ok ?? false,
+        afm_ok: status?.afm.ok ?? false,
+        pending_inbox: inboxStatus?.totalPending ?? null,
         expired_handoffs: expiredHandoffs.length,
         handoff_context: handoffContext.length,
         workspace: workspaceId,
         corrections_reassert: correctionsReassert.length,
-        reassert_entries_cleared: reassertConsumed.length,
-        reassert_tails_deferred: reassertDeferred.length,
+        budget_ms: budgetMs,
+        ...(degradedSections.length > 0 ? { degraded_sections: degradedSections } : {}),
+        // PENDING at audit time: the archive itself is deferred until the
+        // envelope reaches the host, so these are what WILL settle on delivery,
+        // not what already has.
+        reassert_entries_pending_clear: reassertConsumed.length,
+        reassert_tails_pending_defer: reassertDeferred.length,
       },
     });
 
@@ -1033,8 +1120,16 @@ export async function runHookMain(config: AgentHookConfig): Promise<void> {
   try {
     const handlers = createHookHandlers(config);
     const output = await handlers.dispatch(event, payload);
-    emit(output);
+    // emitAndCommit, not emit: work the handler deferred (archiving a consumed
+    // correction) runs only once this output has actually reached the host.
+    await emitAndCommit(output, {
+      vaultPath: config.vaultPath,
+      auditPrefix: config.auditPrefix,
+      event,
+    });
   } catch (error) {
+    // Nothing was delivered, so nothing the handler deferred may be committed.
+    discardDeliveryCommits();
     const message = error instanceof Error ? error.message : String(error);
     try {
       await recordAudit(config.vaultPath, {

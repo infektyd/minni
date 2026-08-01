@@ -31,6 +31,7 @@ import { createHookHandlers } from "./hook-handlers.js";
 import { geminiWire } from "./hook-platform.js";
 import type { AgentHookConfig } from "./hook-handlers.js";
 import { VALID_EVENTS, asString, emit, readStdin } from "./hook-utils.js";
+import { discardDeliveryCommits, emitAndCommit } from "./hook-delivery.js";
 import { PRE_TOOL_USE_EVENT } from "./recall-guard.js";
 import type { PreToolUseDecisionOutput, RecallGuardMode } from "./recall-guard.js";
 import { recordAudit } from "./vault.js";
@@ -59,6 +60,10 @@ const CONFIG: AgentHookConfig = {
   // This is the TIGHTEST prompt-time bound of any platform, so it, not the
   // MINNI_HOOK_BUDGET_MS default, is what sets gemini's effective budget (6s).
   promptHookTimeoutMs: 10_000,
+  // Mirrors hooks/hooks-gemini.json SessionStart "timeout": 10 — edit both.
+  // agy kills BOOT at 10s too, the tightest SessionStart deadline of any
+  // platform, so this is what bounds gemini's boot budget (6s).
+  sessionStartHookTimeoutMs: 10_000,
   // No precompactKind: like kilocode, PreCompact (if agy ever dispatches it)
   // stashes stale-belief events as a precompact_reassert entry instead of a
   // durable handoff file.
@@ -117,12 +122,17 @@ async function main(): Promise<void> {
   try {
     const handlers = createHookHandlers(CONFIG);
     const output = await handlers.dispatch(event, payload);
-    if (event === PRE_TOOL_USE_EVENT) {
-      emit(adaptPreToolUseOutput(output as PreToolUseDecisionOutput));
-    } else {
-      emit(output);
-    }
+    // emitAndCommit, not emit: work the handler deferred (archiving a consumed
+    // correction) runs only once this output has actually reached agy.
+    await emitAndCommit(
+      event === PRE_TOOL_USE_EVENT
+        ? adaptPreToolUseOutput(output as PreToolUseDecisionOutput)
+        : output,
+      { vaultPath: CONFIG.vaultPath, auditPrefix: CONFIG.auditPrefix, event },
+    );
   } catch (error) {
+    // Nothing was delivered, so nothing the handler deferred may be committed.
+    discardDeliveryCommits();
     const message = error instanceof Error ? error.message : String(error);
     try {
       await recordAudit(CONFIG.vaultPath, {
