@@ -3,7 +3,8 @@
 
 Measured 2026-08-01 on infektyd/minni (#222): App/bot APPROVE posts but does
 not clear reviewDecision (authorAssociation=NONE). Merge trust for v2 is the
-required status check named CHECK_NAME, posted with GITHUB_TOKEN.
+required status check named CHECK_NAME, posted under the Grok App
+installation identity (never GITHUB_TOKEN - see MissingAppToken).
 
 Eligibility comes from the NEWEST Grok App review whose body carries
 ELIGIBILITY_MARKER on a line of its own (stamped when the model emitted
@@ -45,10 +46,25 @@ ELIGIBILITY_MARKER = "<!-- grok-mechanical-eligibility: APPROVE -->"
 # would let the PR stamp its own eligibility.
 APP_BOT_LOGINS = ("infektydgrokreviewer[bot]",)
 
+# Every API call is bounded: an unbounded urlopen leaves the window between the
+# final observation and the POST limited only by the job timeout.
+API_TIMEOUT_S = 15
+
 # Paths that must never get a green mechanical check from eligibility alone.
 # All of .github/ is denied, not just the four gate files: any workflow under
 # it can weaken a required check the gate trusts, or post as github-actions[bot].
-PATH_DENY_PREFIXES = (".github/",)
+PATH_DENY_PREFIXES = (
+    ".github/",
+    # The gate's own tripwires. Not under .github/, so without these a PR could
+    # delete the tests that pin every invariant above and still go green.
+    "tests/test_grok_approve_gate.py",
+    "tests/test_grok_approve_gate_workflow.py",
+    "tests/test_parse_grok_verdict.py",
+)
+
+
+class MissingAppToken(RuntimeError):
+    """No Grok App installation token: the check has no trustworthy identity."""
 
 
 @dataclass(frozen=True)
@@ -147,7 +163,7 @@ def _api(
         },
     )
     try:
-        with urllib.request.urlopen(req) as resp:
+        with urllib.request.urlopen(req, timeout=API_TIMEOUT_S) as resp:
             raw = resp.read()
             return json.loads(raw.decode()) if raw else None
     except urllib.error.HTTPError as e:
@@ -168,7 +184,7 @@ def _paginate(url: str, token: str) -> list[Any]:
                 "User-Agent": "minni-grok-approve-gate",
             },
         )
-        with urllib.request.urlopen(req) as resp:
+        with urllib.request.urlopen(req, timeout=API_TIMEOUT_S) as resp:
             chunk = json.loads(resp.read().decode())
             if isinstance(chunk, list):
                 out.extend(chunk)
@@ -200,6 +216,35 @@ def fetch_required_contexts(owner: str, repo: str, branch: str, token: str) -> t
     return tuple(c for c in contexts if c != CHECK_NAME)
 
 
+def fetch_required_app_ids(
+    owner: str, repo: str, branch: str, token: str
+) -> dict[str, int]:
+    """context -> app_id, for contexts branch protection binds to an integration.
+
+    Protection can pin a context to an app_id ("-1" means any app). Without
+    reading that back, the gate is app-blind about its OWN prerequisites: a
+    same-repo workflow can mint `claude-review` success under the GitHub
+    Actions app and satisfy the gate, even where protection would reject it.
+    """
+    url = (
+        f"https://api.github.com/repos/{owner}/{repo}/branches/{branch}"
+        "/protection/required_status_checks"
+    )
+    try:
+        data = _api("GET", url, token)
+    except RuntimeError as e:
+        if "404" in str(e):
+            return {}
+        raise
+    out: dict[str, int] = {}
+    for check in data.get("checks") or []:
+        ctx, app_id = check.get("context"), check.get("app_id")
+        # -1 is GitHub's "any app is allowed" sentinel; not a binding.
+        if ctx and ctx != CHECK_NAME and isinstance(app_id, int) and app_id > 0:
+            out[ctx] = app_id
+    return out
+
+
 # Worst-wins ordering. Merging observations for one context must never let a
 # `success` mask a pending or failed one — that is a direct false-green.
 _STATE_RANK = {"success": 0, "expected": 1, "pending": 1, "failure": 2, "error": 2}
@@ -221,7 +266,11 @@ def _check_run_state(run: dict[str, Any]) -> str:
 
 
 def fetch_combined_statuses(
-    owner: str, repo: str, sha: str, token: str
+    owner: str,
+    repo: str,
+    sha: str,
+    token: str,
+    required_app_ids: dict[str, int] | None = None,
 ) -> dict[str, str]:
     """Map context → state (success/pending/failure/error), worst wins.
 
@@ -229,7 +278,12 @@ def fetch_combined_statuses(
     fill in contexts that have no check run. Within either source, repeated
     observations of one name collapse to the WORST, so an in-flight re-run or a
     stale success can never read as green.
+
+    `required_app_ids` binds a context to an integration. An observation from
+    the wrong app does not count as success for that context — protection would
+    reject it, and the gate must not be more permissive than protection.
     """
+    bindings = required_app_ids or {}
     states: dict[str, str] = {}
     url = f"https://api.github.com/repos/{owner}/{repo}/commits/{sha}/status"
     data = _api("GET", url, token)
@@ -238,6 +292,10 @@ def fetch_combined_statuses(
         if not ctx or ctx == CHECK_NAME:
             continue
         state = st.get("state") or "error"
+        # A commit status carries no app_id we can trust here; if protection
+        # binds this context to an app, a plain status cannot satisfy it.
+        if ctx in bindings:
+            state = _worse(state, "pending")
         states[ctx] = state if ctx not in states else _worse(states[ctx], state)
 
     # filter=latest is the API default, but pin it: without it a re-run's older
@@ -253,6 +311,11 @@ def fetch_combined_statuses(
             if not name or name == CHECK_NAME:
                 continue
             state = _check_run_state(run)
+            bound = bindings.get(name)
+            if bound is not None and (run.get("app") or {}).get("id") != bound:
+                # Right name, wrong integration — a spoof, or simply a check
+                # protection will not accept. Never let it read as success.
+                state = _worse(state, "pending")
             run_states[name] = (
                 state if name not in run_states else _worse(run_states[name], state)
             )
@@ -377,7 +440,7 @@ def resolve_pr_for_sha(owner: str, repo: str, sha: str, token: str) -> int | Non
         },
     )
     try:
-        with urllib.request.urlopen(req) as resp:
+        with urllib.request.urlopen(req, timeout=API_TIMEOUT_S) as resp:
             prs = json.loads(resp.read().decode())
     except urllib.error.HTTPError:
         return None
@@ -419,7 +482,8 @@ def _gather_and_decide(
     owner: str, repo: str, pr: int, head_sha: str, token: str, base_branch: str
 ) -> GateDecision:
     required = fetch_required_contexts(owner, repo, base_branch, token)
-    states = fetch_combined_statuses(owner, repo, head_sha, token)
+    app_ids = fetch_required_app_ids(owner, repo, base_branch, token)
+    states = fetch_combined_statuses(owner, repo, head_sha, token, app_ids)
     reviews = _paginate(
         f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr}/reviews?per_page=100",
         token,
@@ -464,17 +528,27 @@ def run_gate(
     # The check-run channel is only a trust root when the check is posted by the
     # Grok App: a bare name posted with GITHUB_TOKEN can be minted by ANY
     # same-repo Actions workflow, so protection must bind the context to the
-    # App's app_id and we must post under that identity. Without the App token
-    # we may still post red, never green.
-    if decision.conclusion == "success" and not post_token:
-        decision = GateDecision(
-            "failure",
-            "no app token",
-            "Refusing to mint success with GITHUB_TOKEN: any same-repo workflow "
-            "could post this check name. Configure the Grok App (checks: write) "
-            "and bind the required context to its app_id.",
+    # App's app_id and we must post under that identity.
+    #
+    # Falling back to GITHUB_TOKEN is worse than not posting: an app-bound
+    # context ignores that check, so it can neither grant nor REVOKE, and the
+    # check's identity would silently depend on whether a secret was set.
+    if not post_token:
+        raise MissingAppToken(
+            "APP_TOKEN is empty - refusing to post the mechanical check under "
+            "GITHUB_TOKEN. Set vars.GROK_APP_ID + secrets.GROK_APP_PRIVATE_KEY "
+            "and grant the App `checks: write`."
         )
-    post_check_run(owner, repo, post_token or token, head_sha, decision)
+    post_check_run(owner, repo, post_token, head_sha, decision)
+
+    # Nothing stops state changing between the last observation and the POST.
+    # If we just published green, look once more and take it back rather than
+    # leave a stale success standing until some other event happens to fire.
+    if decision.conclusion == "success":
+        after = _gather_and_decide(owner, repo, pr, head_sha, token, base_branch)
+        if after.conclusion != "success":
+            post_check_run(owner, repo, post_token, head_sha, after)
+            return after
     return decision
 
 
@@ -512,15 +586,19 @@ def main(argv: list[str] | None = None) -> int:
             print("::warning::No open PR for SHA; skipping check run.")
             return 0
         pr = found
-    decision = run_gate(
-        owner=owner,
-        repo=repo,
-        pr=pr,
-        head_sha=args.head_sha,
-        token=token,
-        base_branch=base,
-        post_token=post_token,
-    )
+    try:
+        decision = run_gate(
+            owner=owner,
+            repo=repo,
+            pr=pr,
+            head_sha=args.head_sha,
+            token=token,
+            base_branch=base,
+            post_token=post_token,
+        )
+    except MissingAppToken as e:
+        print(f"::error::{e}", file=sys.stderr)
+        return 2
     print(f"{decision.conclusion}\t{decision.title}\t{decision.summary}")
     # Job stays green even when the *check run* is failure — the required
     # check context is what blocks merge.

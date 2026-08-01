@@ -321,33 +321,47 @@ def test_check_run_state_mapping(mod, run, expected):
     assert mod._check_run_state(run) == expected
 
 
-def test_success_is_never_posted_without_an_app_token(mod, monkeypatch):
-    """A required context is matched by NAME, and any same-repo Actions workflow
-    can mint that name with GITHUB_TOKEN. Only a check posted under the Grok App
-    can be bound to an app_id, so GITHUB_TOKEN must never post green."""
-    posted = {}
-
+def test_missing_app_token_is_a_hard_failure_not_a_github_token_post(mod, monkeypatch):
+    """Falling back to GITHUB_TOKEN is worse than not posting: an app-bound
+    context ignores that check, so it can neither grant nor revoke, and the
+    check's identity would depend on whether a secret happened to be set."""
+    posted = []
     monkeypatch.setattr(mod, "_preflight", lambda *a, **k: None)
     monkeypatch.setattr(
         mod, "_gather_and_decide",
         lambda *a, **k: mod.GateDecision("success", "ok", "all green"),
     )
-    monkeypatch.setattr(
-        mod, "post_check_run",
-        lambda o, r, tok, sha, d: posted.update(token=tok, conclusion=d.conclusion,
-                                                title=d.title),
-    )
+    monkeypatch.setattr(mod, "post_check_run", lambda *a, **k: posted.append(a[2]))
 
-    d = mod.run_gate(owner="o", repo="r", pr=1, head_sha="abc", token="ghs_actions",
+    with pytest.raises(mod.MissingAppToken):
+        mod.run_gate(owner="o", repo="r", pr=1, head_sha="abc", token="ghs_actions",
                      base_branch="main", post_token="")
-    assert d.conclusion == "failure"
-    assert d.title == "no app token"
-    assert posted["conclusion"] == "failure"
+    assert posted == [], "nothing may be posted without the App token"
 
-    d = mod.run_gate(owner="o", repo="r", pr=1, head_sha="abc", token="ghs_actions",
-                     base_branch="main", post_token="app_tok")
-    assert d.conclusion == "success"
-    assert posted["token"] == "app_tok"
+    mod.run_gate(owner="o", repo="r", pr=1, head_sha="abc", token="ghs_actions",
+                 base_branch="main", post_token="app_tok")
+    assert posted == ["app_tok"], "must post under the App token only"
+
+
+def test_success_is_revoked_if_state_changed_after_posting(mod, monkeypatch):
+    """No compare-and-swap exists between the last observation and the POST, so
+    a green published into a state that has since changed must be taken back
+    rather than left standing until some other event fires."""
+    seen = iter([
+        mod.GateDecision("success", "ok", "green"),
+        mod.GateDecision("success", "ok", "green"),
+        mod.GateDecision("failure", "REQUEST_CHANGES outstanding", "vetoed"),
+    ])
+    posted = []
+    monkeypatch.setattr(mod, "_preflight", lambda *a, **k: None)
+    monkeypatch.setattr(mod, "_gather_and_decide", lambda *a, **k: next(seen))
+    monkeypatch.setattr(
+        mod, "post_check_run", lambda o, r, t, s_, d: posted.append(d.conclusion)
+    )
+    d = mod.run_gate(owner="o", repo="r", pr=1, head_sha="abc", token="t",
+                     base_branch="main", post_token="app")
+    assert d.conclusion == "failure"
+    assert posted == ["success", "failure"], "the stale green must be revoked"
 
 
 def test_a_veto_landing_mid_gather_wins_over_a_stale_success(mod, monkeypatch):
@@ -409,3 +423,84 @@ def test_dismissed_request_changes_does_not_block(mod):
     eligible, blocked = mod.analyze_reviews(reviews, HEAD_SHA)
     assert eligible is True
     assert blocked is False
+
+
+def _runs_payload(name: str, app_id: int, conclusion: str = "success") -> dict:
+    return {
+        "check_runs": [
+            {
+                "name": name,
+                "status": "completed",
+                "conclusion": conclusion,
+                "app": {"id": app_id},
+            }
+        ]
+    }
+
+
+def test_bound_context_rejects_a_check_from_the_wrong_integration(mod, monkeypatch):
+    """A same-repo workflow can mint `claude-review` success under the GitHub
+    Actions app. Where protection binds that context to an integration, the
+    gate must not be more permissive than protection is."""
+    monkeypatch.setattr(mod, "_api", lambda *a, **k: {"statuses": []})
+    monkeypatch.setattr(
+        mod, "_paginate", lambda *a, **k: [_runs_payload("claude-review", 15368)]
+    )
+    # Unbound: the Actions-minted run counts.
+    assert mod.fetch_combined_statuses("o", "r", "sha", "t") == {
+        "claude-review": "success"
+    }
+    # Bound to a different app: must not read as success.
+    bound = mod.fetch_combined_statuses(
+        "o", "r", "sha", "t", {"claude-review": 4456296}
+    )
+    assert bound["claude-review"] != "success"
+
+
+def test_bound_context_accepts_the_right_integration(mod, monkeypatch):
+    monkeypatch.setattr(mod, "_api", lambda *a, **k: {"statuses": []})
+    monkeypatch.setattr(
+        mod, "_paginate", lambda *a, **k: [_runs_payload("claude-review", 4456296)]
+    )
+    states = mod.fetch_combined_statuses(
+        "o", "r", "sha", "t", {"claude-review": 4456296}
+    )
+    assert states["claude-review"] == "success"
+
+
+def test_plain_commit_status_cannot_satisfy_a_bound_context(mod, monkeypatch):
+    monkeypatch.setattr(
+        mod, "_api",
+        lambda *a, **k: {"statuses": [{"context": "smoke", "state": "success"}]},
+    )
+    monkeypatch.setattr(mod, "_paginate", lambda *a, **k: [{"check_runs": []}])
+    assert mod.fetch_combined_statuses("o", "r", "sha", "t")["smoke"] == "success"
+    assert (
+        mod.fetch_combined_statuses("o", "r", "sha", "t", {"smoke": 4456296})["smoke"]
+        != "success"
+    )
+
+
+def test_any_app_sentinel_is_not_treated_as_a_binding(mod, monkeypatch):
+    """GitHub uses app_id -1 for 'explicitly allow any app'; treating that as a
+    binding would make every context permanently unsatisfiable."""
+    monkeypatch.setattr(
+        mod, "_api",
+        lambda *a, **k: {"checks": [{"context": "smoke", "app_id": -1},
+                                    {"context": "bound", "app_id": 4456296}]},
+    )
+    assert mod.fetch_required_app_ids("o", "r", "main", "t") == {"bound": 4456296}
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "tests/test_grok_approve_gate.py",
+        "tests/test_grok_approve_gate_workflow.py",
+        "tests/test_parse_grok_verdict.py",
+    ],
+)
+def test_deleting_the_gate_tripwires_is_path_denied(mod, path):
+    """These pin every invariant above and do not live under .github/, so
+    without an explicit deny a PR could remove them and still go green."""
+    assert mod.path_denied(path) is True

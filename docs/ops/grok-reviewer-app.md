@@ -59,7 +59,21 @@ Invariants (enforced in `.github/scripts/grok_approve_gate.py`):
     must agree on `success`; concurrency is keyed on head SHA for all events,
     so a stale snapshot cannot publish green over a veto that already landed.
 13. Every non-skip path posts a terminal conclusion, so a superseded run cannot
-    leave an earlier `success` standing on the SHA.
+    leave an earlier `success` standing on the SHA. After publishing a green the
+    gate re-reads once and revokes it if state moved.
+14. The gate honours protection's own `app_id` bindings when judging its
+    prerequisites: a check run of the right name from the wrong integration does
+    not count, and a plain commit status cannot satisfy an app-bound context.
+    **Residual:** contexts that protection leaves name-only (no `app_id`, or the
+    `-1` any-app sentinel) are still satisfiable by any same-repo workflow. Bind
+    every required context, not just `grok-mechanical-approve`.
+15. Deleting the gate's tests is path-denied. `tests/test_grok_approve_gate*.py`
+    and `tests/test_parse_grok_verdict.py` pin these invariants and do not live
+    under `.github/`, so they are named explicitly in `PATH_DENY_PREFIXES`.
+16. A missing App installation token is a hard job failure, not a red check.
+    Posting under `GITHUB_TOKEN` would be ignored by the app-bound context, so
+    it could neither grant nor revoke — and it would make the check's identity
+    depend on whether a secret happened to be set.
 
 Parser: `.github/scripts/parse_grok_verdict.py` — default path never emits
 Reviews `APPROVE`; `--allow-approve` is for gate/eligibility readers only.
@@ -120,13 +134,81 @@ gh api -X PUT repos/infektyd/minni/branches/main/protection \
     "required_approving_review_count": 0,
     "dismiss_stale_reviews": true
   },
+  "required_conversation_resolution": true,
   "restrictions": null
 }
 JSON
 ```
 
+**PUT is a full replace — every omitted property resets to its default.**
+`required_conversation_resolution` is `true` on `main` today and defaults to
+`false`, so leaving it out of the body silently turns it off. It is listed
+above for exactly that reason. Diff before and after:
+
+```bash
+gh api repos/infektyd/minni/branches/main/protection > /tmp/prot-before.json
+# ...apply...
+gh api repos/infektyd/minni/branches/main/protection > /tmp/prot-after.json
+diff <(jq -S . /tmp/prot-before.json) <(jq -S . /tmp/prot-after.json)
+```
+
+**Use PUT, not PATCH, for this change.** `PATCH .../protection/required_status_checks`
+only edits the status-check block: it leaves `required_approving_review_count`
+at its current value, which is `1` — so merges would still need `--admin` and
+the whole exercise fails to achieve its goal. Only the full `PUT` above sets the
+count to `0`. Reach for the PATCH form solely when adding or re-binding a
+context and you intend everything else to stay as-is.
+
 Keep `required_approving_review_count: 1` only if you still want a **human**
 review in addition to the mechanical check (bots still will not count).
+
+### The App private key is the real trust root — and push access reaches it
+
+`GROK_APP_PRIVATE_KEY` is a plain **repository** secret. Repository secrets are
+available to any workflow run triggered by a push to **any branch** of this
+repo. So anyone with push access can add `.github/workflows/x.yml` on a throwaway
+branch that mints an App installation token and posts `grok-mechanical-approve`
+success directly, under `app_id 4456296`. `decide()` never runs. The `.github/`
+path filter never sees it, because the malicious workflow is not in any PR being
+reviewed.
+
+**This defeats the app_id binding completely.** State the threat model plainly:
+the gate contains what a *pull request* can do through the review-and-merge
+flow. It does **not** contain an actor who can push a branch. On this repo the
+agents doing the work have push access, so they are inside that boundary.
+
+**Environment scoping does not fix it — verified, do not attempt it.** The
+obvious move is to put the key in a GitHub Environment whose deployment-branch
+policy allows only the default branch. It does not work here. Since November
+2025, environment branch policies for the `pull_request` family evaluate against
+`refs/pull/<n>/merge`, not the head or base branch name. A default-branch-only
+policy therefore blocks our own PR-triggered jobs:
+
+* `grok-review` runs only on `pull_request` — it would lose the App token
+  entirely and silently degrade to `gh pr comment`: no formal reviews, no
+  eligibility stamps, feature dead.
+* the gate would keep only its `check_suite` / `workflow_run` triggers (those do
+  run from the default branch) and lose `pull_request` + `pull_request_review`,
+  taking the post-green veto with them.
+
+Adding a `refs/pull/*/merge` policy to compensate re-opens the hole for every
+PR, which is strictly worse than where we started.
+
+Two architectures actually close it. Both are operator decisions:
+
+1. **Split the identity.** Two Apps: a *reviewer* App (`pull_requests: write`,
+   key reachable from PR runs) and a separate *gate* App (`checks: write` only)
+   whose key lives in a default-branch-only Environment and is used solely by
+   the gate — which then runs on `check_suite` / `workflow_run` only. The
+   trust-root key becomes unreachable from PR-triggered workflows. Cost: the
+   `pull_request_review` veto trigger goes away, so a REQUEST_CHANGES submitted
+   after the check went green no longer revokes it until CI next runs.
+2. **Remove push access from the agent class.** Agents open PRs from forks;
+   fork PRs get no secrets. Then repository secrets are only reachable by the
+   humans the gate is not trying to contain.
+
+Until one of these lands, treat a green `grok-mechanical-approve` as evidence
+about the PR's *content*, not as containment of the actor who opened it.
 
 ### The name-only required context is NOT a trust root
 

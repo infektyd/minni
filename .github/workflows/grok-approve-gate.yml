@@ -66,6 +66,13 @@ jobs:
               ;;
             check_suite)
               # Ignore suites that only contain our own check (loop guard).
+              #
+              # Both `|| true` below are fail-OPEN by design: on API error the
+              # guard lets the run proceed rather than skip. The cost is a
+              # redundant gate run, never a green — decide() re-derives from
+              # scratch every time. Anyone who can create a check run can also
+              # trigger extra gate runs this way; that is a re-run primitive,
+              # not a trust bypass, so it is accepted rather than tightened.
               SHA="${{ github.event.check_suite.head_sha }}"
               NAMES="$(gh api "repos/${OWNER_REPO}/commits/${SHA}/check-runs?per_page=100" \
                 --jq '[.check_runs[].name] | unique | .[]' || true)"
@@ -115,6 +122,10 @@ jobs:
           private-key: ${{ secrets.GROK_APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
           repositories: ${{ github.event.repository.name }}
+          # Least privilege: this token exists only to POST one check run.
+          # create-github-app-token with no permission-* inputs mints a token
+          # carrying EVERY installation permission.
+          permission-checks: write
 
       - name: Run mechanical gate
         if: steps.meta.outputs.skip != 'true'

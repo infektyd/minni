@@ -101,3 +101,26 @@ def test_review_workflow_defangs_the_marker_before_embedding_the_reply(review):
     defang = run.index("sed -i 's/grok-mechanical-eligibility")
     stamp = run.index('echo "<!-- grok-mechanical-eligibility: APPROVE -->"')
     assert defang < stamp, "defang must run before the workflow stamps its own marker"
+
+
+def test_app_tokens_are_minted_least_privilege(gate, review):
+    """create-github-app-token with no permission-* input mints a token
+    carrying EVERY installation permission — including checks:write for the
+    reviewer, which is the trust root this whole design rests on."""
+    gate_step = next(
+        s for s in gate["jobs"]["gate"]["steps"]
+        if str(s.get("uses", "")).startswith("actions/create-github-app-token")
+    )
+    assert gate_step["with"].get("permission-checks") == "write"
+    assert "permission-pull-requests" not in gate_step["with"], (
+        "the gate only posts a check run; it must not carry PR write"
+    )
+
+    review_step = next(
+        s for s in review["jobs"]["grok-review"]["steps"]
+        if str(s.get("uses", "")).startswith("actions/create-github-app-token")
+    )
+    assert review_step["with"].get("permission-pull-requests") == "write"
+    assert "permission-checks" not in review_step["with"], (
+        "the reviewer must not be able to post the mechanical check"
+    )

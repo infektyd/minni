@@ -217,6 +217,10 @@ jobs:
           private-key: ${{ secrets.GROK_APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
           repositories: ${{ github.event.repository.name }}
+          # Least privilege: this token only submits a PR review. Without a
+          # permission-* input the minted token carries every installation
+          # permission, including checks:write.
+          permission-pull-requests: write
 
       - name: Post review
         env:
