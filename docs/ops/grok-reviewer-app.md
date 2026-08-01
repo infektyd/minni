@@ -370,28 +370,48 @@ The gate dismisses its own stale approvals when the decision flips. It is scoped
 in code to this App's `APPROVED` reviews only: it must never dismiss a human's
 review, and never a `CHANGES_REQUESTED`.
 
-### UNPROVEN: does an App approval satisfy `required_approving_review_count`?
+### SETTLED: an App approval does NOT satisfy the review requirement
 
-**Test this before relying on it.** The `#222` claim that "App/bot APPROVE does
-not clear reviewDecision" is **not supported by the record** — I re-read it:
+Measured 2026-08-01 on canary **#243**, and this time unconfounded:
 
-| PR | Evidence | Why it proves nothing |
+| | |
+|---|---|
+| review | `infektydgrokreviewer[bot]` (type `Bot`), state `APPROVED` |
+| commit | `2b0bdac` — **the final head** |
+| position | **newest** review, nothing after it |
+| dismissed | no |
+| `reviewDecision` | **`REVIEW_REQUIRED`** |
+
+Every confounder from the earlier readings is absent: not superseded by a later
+review from the same author, not stale against a moved head, not dismissed. The
+approval simply does not count.
+
+The rule is that GitHub counts approvals only from **users with write access**.
+A GitHub App installation is not a user — hence `author_association: NONE` on
+every App review. (For completeness: the earlier #222 and #216 readings really
+were confounded, by supersession and staleness respectively, so they never
+established this; #243 does.)
+
+**Therefore the mechanical APPROVE is submitted by `infektydrelay-bit`**, a real
+user with push access on this repo, using a fine-grained PAT. The App keeps
+reviewing and the gate keeps deciding; only the identity that signs the approval
+changed.
+
+| Identity | Role | Token |
 |---|---|---|
-| #222 | App posted `APPROVED` 15:15:22, then `COMMENTED` 15:15:42, then `CHANGES_REQUESTED` 15:16:05 — all on `030fb8d` | GitHub takes the newest review per author. The App superseded its own approval within 43s, so the final `REVIEW_REQUIRED` is expected either way |
-| #216 | `cursor[bot]` approved three times, each dismissed ~12s later by `dismiss_stale_reviews` on the next push | No approval ever covered the final head `5d0a509` |
+| `infektyd` | opens PRs | — |
+| `infektydgrokreviewer[bot]` | reviews, stamps eligibility | App installation token |
+| the gate | decides, posts the check | App token (`checks: write`, `administration: read`) |
+| `infektydrelay-bit` | submits the mechanical APPROVE | `RELAY_APPROVE_TOKEN` |
 
-So there is **no measurement** on this repo of a live bot approval on the
-current head. Both prior readings were confounded — by supersession and by
-staleness, not (as once assumed) by the parser downgrading `APPROVE`: an actual
-`APPROVED` review record exists on #222.
+**Standing rule: agent PRs are opened as `infektyd`, never as
+`infektydrelay-bit`.** GitHub rejects an approval from the PR's own author, so a
+relay-authored PR can never be approved mechanically. The gate detects this and
+logs `PR authored by the approving identity - needs a different opener` rather
+than failing on a 422.
 
-The hypothesis is therefore untested, not disproven, and it is plausible:
-`author_association: NONE` is normal for bots and is a different concept from
-write access, and App approvals are how bots like renovate-approve work.
-
-**The live test:** after this lands, let the gate pass on a canary PR and check
-that `reviewDecision` flips `REVIEW_REQUIRED` → `APPROVED` while the approval is
-the App's newest review on the current head. Record the result here either way.
+If `RELAY_APPROVE_TOKEN` is unset the gate degrades: the check run still posts,
+the approval is skipped with a named warning, and merges need a human review.
 
 ### Phase 1 (now): manual merges, no `--admin`
 
@@ -445,16 +465,37 @@ Granting the gate `pull-requests: write` widens what a **key holder** can do.
 The code scopes dismissal to the App's own approvals; the *token* does not. Be
 explicit about what the key is now worth:
 
+There are now TWO keys, with different reach. Both are repository secrets, so
+both are reachable by anyone who can push a branch (see the private-key section
+above) — that reachability is unchanged, but the split matters for what each
+buys.
+
+**Relay PAT (`RELAY_APPROVE_TOKEN`)** — fine-grained, `minni` only, Pull
+requests RW. It buys exactly one thing: **reviews on this repo as
+`infektydrelay-bit`**, i.e. submit an approval and dismiss its own. It cannot
+post the mechanical check, cannot read or change protection, and cannot merge.
+
+**App key** — after this change the App no longer needs `pull-requests: write`
+for the gate at all; the gate's token is `checks: write` + `administration:
+read`. (The *reviewer* workflow still mints `pull-requests: write` to post its
+reviews — that is a separate token and unchanged.)
+
 | With the App key you CAN | You CANNOT |
 |---|---|
 | post `grok-mechanical-approve` (the required check) | **merge** — that needs `contents: write` |
 | satisfy `required_approving_review_count` | **change branch protection** — needs `administration: write`; the gate holds only `read` |
-| **dismiss a human's `CHANGES_REQUESTED`** — clearing a veto | satisfy `require_code_owner_reviews` |
-| update/close PRs, manage reviewers | |
+| — | satisfy `require_code_owner_reviews` |
+| — | **dismiss a human's `CHANGES_REQUESTED`** — that moved to the relay PAT |
 
-So after this change the key is worth: **the required check + the review count +
-the ability to clear a human veto.** Those were three separate factors before;
-they now share one root. Anyone with push access can reach that key (see the
+So the App key is worth **the required check**, and the relay PAT is worth **the
+review count plus the ability to clear a human veto** (PR write implies
+dismissing others' reviews — the code scopes dismissal to the relay's own
+approvals, the token does not).
+
+Splitting them back apart is a real improvement over #244, where one key held
+all three. An attacker now needs BOTH secrets to forge a full merge-ready state
+— though on this repo both are reachable the same way, so treat that as defence
+in depth rather than a boundary. Anyone with push access can reach that key (see the
 private-key section above), so the honest summary is that the mechanical gate
 does not contain a push-capable actor — it contains a pull request.
 

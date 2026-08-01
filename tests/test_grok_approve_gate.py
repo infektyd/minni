@@ -335,11 +335,11 @@ def test_missing_app_token_is_a_hard_failure_not_a_github_token_post(mod, monkey
 
     with pytest.raises(mod.MissingAppToken):
         mod.run_gate(owner="o", repo="r", pr=1, head_sha="abc", token="ghs_actions",
-                     base_branch="main", post_token="")
+                     base_branch="main", post_token="", approve_token="relay")
     assert posted == [], "nothing may be posted without the App token"
 
     mod.run_gate(owner="o", repo="r", pr=1, head_sha="abc", token="ghs_actions",
-                 base_branch="main", post_token="app_tok")
+                 base_branch="main", post_token="app_tok", approve_token="relay")
     assert posted == ["app_tok"], "must post under the App token only"
 
 
@@ -359,7 +359,7 @@ def test_green_is_never_published_then_retracted(mod, monkeypatch):
         mod, "post_check_run", lambda o, r, t, s_, d: posted.append(d.conclusion)
     )
     d = mod.run_gate(owner="o", repo="r", pr=1, head_sha="abc", token="t",
-                     base_branch="main", post_token="app")
+                     base_branch="main", post_token="app", approve_token="relay")
     assert d.conclusion == "failure"
     assert posted == ["failure"], "a green must never be published at all here"
 
@@ -379,7 +379,7 @@ def test_unreadable_protection_posts_a_reason_not_a_stack_trace(mod, monkeypatch
         mod, "post_check_run", lambda o, r, t, s_, d: posted.append((d.conclusion, d.title))
     )
     d = mod.run_gate(owner="o", repo="r", pr=1, head_sha="abc", token="t",
-                     base_branch="main", post_token="app")
+                     base_branch="main", post_token="app", approve_token="relay")
     assert d.conclusion == "failure"
     assert d.title == "cannot read protection"
     assert posted == [("failure", "cannot read protection")]
@@ -441,7 +441,7 @@ def test_a_veto_landing_mid_gather_wins_over_a_stale_success(mod, monkeypatch):
         lambda o, r, t, s, d: posted.update(conclusion=d.conclusion),
     )
     d = mod.run_gate(owner="o", repo="r", pr=1, head_sha="abc", token="t",
-                     base_branch="main", post_token="app")
+                     base_branch="main", post_token="app", approve_token="relay")
     assert d.conclusion == "failure"
     assert posted["conclusion"] == "failure"
 
@@ -463,7 +463,7 @@ def test_early_exits_still_post_a_terminal_conclusion(mod, monkeypatch, early):
         lambda o, r, t, s, d: posted.update(conclusion=d.conclusion, title=d.title),
     )
     d = mod.run_gate(owner="o", repo="r", pr=1, head_sha="abc", token="t",
-                     base_branch="main", post_token="app")
+                     base_branch="main", post_token="app", approve_token="relay")
     assert d.conclusion == "failure"
     assert posted["title"] == early[0]
 
@@ -582,10 +582,14 @@ def test_deleting_the_gate_tripwires_is_path_denied(mod, path):
 # --- mechanical APPROVE -----------------------------------------------------
 
 
+RELAY_LOGIN = "infektydrelay-bit"
+
+
 def _app_review(state, sha, rid=1):
+    """A review by the APPROVING identity (the relay user), not the App."""
     return {
         "id": rid,
-        "user": {"login": "infektydgrokreviewer[bot]"},
+        "user": {"login": RELAY_LOGIN},
         "state": state,
         "commit_id": sha,
     }
@@ -613,7 +617,7 @@ def test_submitter_skips_when_an_approval_already_stands(mod, monkeypatch):
     actually consults it. Otherwise every gate re-run posts another approval."""
     calls = []
     monkeypatch.setattr(
-        mod, "fetch_app_reviews", lambda *a, **k: [_app_review("APPROVED", "sha1")]
+        mod, "fetch_approver_reviews", lambda *a, **k: [_app_review("APPROVED", "sha1")]
     )
     monkeypatch.setattr(
         mod, "_api",
@@ -640,7 +644,7 @@ def test_dismissed_approval_does_not_count_as_present(mod):
 
 def test_approval_is_submitted_sha_bound_and_only_when_head_is_unmoved(mod, monkeypatch):
     calls = []
-    monkeypatch.setattr(mod, "fetch_app_reviews", lambda *a, **k: [])
+    monkeypatch.setattr(mod, "fetch_approver_reviews", lambda *a, **k: [])
     monkeypatch.setattr(
         mod, "_api",
         lambda method, url, token, body=None: (
@@ -660,7 +664,7 @@ def test_approval_is_submitted_sha_bound_and_only_when_head_is_unmoved(mod, monk
 
 def test_approval_withheld_when_head_moved_mid_flight(mod, monkeypatch):
     calls = []
-    monkeypatch.setattr(mod, "fetch_app_reviews", lambda *a, **k: [])
+    monkeypatch.setattr(mod, "fetch_approver_reviews", lambda *a, **k: [])
     monkeypatch.setattr(
         mod, "_api",
         lambda method, url, token, body=None: (
@@ -683,12 +687,14 @@ def test_dismissal_touches_only_this_apps_own_approvals(mod, monkeypatch):
         {"id": 12, "user": {"login": "a-human"}, "state": "APPROVED", "commit_id": "sha1"},
         {"id": 13, "user": {"login": "a-human"}, "state": "CHANGES_REQUESTED",
          "commit_id": "sha1"},
+        {"id": 14, "user": {"login": "infektydgrokreviewer[bot]"}, "state": "APPROVED",
+         "commit_id": "sha1"},
     ]
-    # fetch_app_reviews filters to the App; feed it raw to prove the filter.
+    # Feed raw to prove the filter really scopes to the approving identity.
     monkeypatch.setattr(
-        mod, "fetch_app_reviews",
+        mod, "fetch_approver_reviews",
         lambda *a, **k: [r for r in reviews
-                         if mod._is_app_bot((r.get("user") or {}).get("login"))],
+                         if mod._is_approver((r.get("user") or {}).get("login"))],
     )
     seen = []
     monkeypatch.setattr(
@@ -701,7 +707,7 @@ def test_dismissal_touches_only_this_apps_own_approvals(mod, monkeypatch):
     assert n == 1
     assert len(seen) == 1
     assert "/reviews/10/dismissals" in seen[0]
-    for rid in (11, 12, 13):
+    for rid in (11, 12, 13, 14):
         assert f"/reviews/{rid}/" not in seen[0]
 
 
@@ -721,7 +727,7 @@ def test_failure_paths_never_touch_the_reviews_api(mod, monkeypatch):
     )
     monkeypatch.setattr(mod, "dismiss_stale_approvals", lambda **k: 0)
     d = mod.run_gate(owner="o", repo="r", pr=1, head_sha="abc", token="t",
-                     base_branch="main", post_token="app")
+                     base_branch="main", post_token="app", approve_token="relay")
     assert d.conclusion == "failure"
     assert submitted == []
 
@@ -739,7 +745,7 @@ def test_a_flipped_decision_dismisses_the_stale_approval(mod, monkeypatch):
         lambda **k: dismissed.append(k["reason"]) or 1,
     )
     mod.run_gate(owner="o", repo="r", pr=1, head_sha="abc", token="t",
-                 base_branch="main", post_token="app")
+                 base_branch="main", post_token="app", approve_token="relay")
     assert dismissed == ["REQUEST_CHANGES outstanding"]
 
 
@@ -759,7 +765,7 @@ def test_approval_failure_never_masks_the_posted_decision(mod, monkeypatch):
 
     monkeypatch.setattr(mod, "submit_mechanical_approval", boom)
     d = mod.run_gate(owner="o", repo="r", pr=1, head_sha="abc", token="t",
-                     base_branch="main", post_token="app")
+                     base_branch="main", post_token="app", approve_token="relay")
     assert d.conclusion == "success"
 
 
@@ -828,3 +834,139 @@ def test_a_real_veto_still_wins_over_the_gates_own_approval(mod):
     assert mod.decide(
         mod.GateInput(HEAD_SHA, ("CI",), {"CI": "success"}, eligible, blocked, False)
     ).conclusion == "failure"
+
+
+# --- relay-user approval identity -------------------------------------------
+
+
+def test_approver_and_app_identities_are_disjoint(mod):
+    """If these ever overlap, the approve/dismiss oscillation returns through
+    the approving identity: its APPROVE would be read as App eligibility."""
+    app = {x.lower() for x in mod.APP_BOT_LOGINS}
+    approver = {x.lower() for x in mod.APPROVAL_LOGINS}
+    assert app.isdisjoint(approver)
+    assert mod._is_approver(RELAY_LOGIN) is True
+    assert mod._is_app_bot(RELAY_LOGIN) is False
+    assert mod._is_approver("infektydgrokreviewer[bot]") is False
+
+
+@pytest.mark.parametrize(
+    "login", ["infektydrelay-bit-evil", "notinfektydrelay-bit", "relay-bit", ""]
+)
+def test_approver_pin_is_exact_not_a_suffix_test(mod, login):
+    assert mod._is_approver(login) is False
+
+
+def test_approver_pin_is_case_insensitive(mod):
+    """GitHub logins are case-insensitive for uniqueness, so nobody else can
+    hold another casing of this name."""
+    assert mod._is_approver("InfektydRelay-Bit") is True
+
+
+def test_relay_approval_never_affects_app_eligibility(mod):
+    """The oscillation fixed in #244 must not return through the new identity.
+    A relay APPROVED review is a different author, so analyze_reviews should
+    skip it entirely and eligibility must survive."""
+    marker = {
+        "user": {"login": "infektydgrokreviewer[bot]"},
+        "state": "COMMENTED",
+        "commit_id": HEAD_SHA,
+        "body": f"ok\n{mod.ELIGIBILITY_MARKER}\n",
+    }
+    relay_approval = {
+        "user": {"login": RELAY_LOGIN},
+        "state": "APPROVED",
+        "commit_id": HEAD_SHA,
+        "body": mod.build_approval_body(HEAD_SHA, ("CI",)),
+    }
+    assert mod.analyze_reviews([marker], HEAD_SHA)[0] is True
+    assert mod.analyze_reviews([marker, relay_approval], HEAD_SHA)[0] is True
+
+
+def test_convergence_holds_with_the_relay_identity(mod):
+    """Six evaluations with the relay approval in play must not oscillate."""
+    reviews = [{
+        "user": {"login": "infektydgrokreviewer[bot]"},
+        "state": "COMMENTED",
+        "commit_id": HEAD_SHA,
+        "body": f"ok\n{mod.ELIGIBILITY_MARKER}\n",
+    }]
+    conclusions = []
+    for _ in range(6):
+        eligible, blocked = mod.analyze_reviews(reviews, HEAD_SHA)
+        d = mod.decide(
+            mod.GateInput(HEAD_SHA, ("CI",), {"CI": "success"}, eligible, blocked, False)
+        )
+        conclusions.append(d.conclusion)
+        relay = [r for r in reviews if mod._is_approver(r["user"]["login"])]
+        if d.conclusion == "success" and not mod.already_approved(relay, HEAD_SHA):
+            reviews.append({
+                "user": {"login": RELAY_LOGIN}, "state": "APPROVED",
+                "commit_id": HEAD_SHA, "body": "mechanical",
+            })
+    assert conclusions == ["success"] * 6, f"oscillated: {conclusions}"
+
+
+def test_self_approval_is_named_not_a_stack_trace(mod, monkeypatch):
+    """GitHub rejects an approval from the PR's own author. Name it, so the
+    standing rule (agent PRs are opened as infektyd) is legible in the log."""
+    calls = []
+    monkeypatch.setattr(mod, "fetch_approver_reviews", lambda *a, **k: [])
+    monkeypatch.setattr(
+        mod, "_api",
+        lambda method, url, token, body=None: (
+            calls.append(method)
+            or {"head": {"sha": "sha1"}, "user": {"login": RELAY_LOGIN}}
+        ),
+    )
+    note = mod.submit_mechanical_approval(
+        owner="o", repo="r", pr=1, head_sha="sha1", token="relay", required=()
+    )
+    assert "authored by the approving identity" in note
+    assert "POST" not in calls, "must not attempt an approval GitHub will reject"
+
+
+def test_dismissal_guard_holds_even_if_the_fetch_filter_regresses(mod, monkeypatch):
+    """Defence in depth: the in-loop identity check must still protect other
+    people's reviews if fetch_approver_reviews ever stops filtering. Feeding it
+    unfiltered reviews is the only way to exercise that guard."""
+    reviews = [
+        _app_review("APPROVED", "sha1", rid=10),
+        {"id": 11, "user": {"login": "infektydgrokreviewer[bot]"}, "state": "APPROVED",
+         "commit_id": "sha1"},
+        {"id": 12, "user": {"login": "a-human"}, "state": "APPROVED", "commit_id": "sha1"},
+    ]
+    monkeypatch.setattr(mod, "fetch_approver_reviews", lambda *a, **k: reviews)
+    seen = []
+    monkeypatch.setattr(
+        mod, "_api", lambda method, url, token, body=None: seen.append(url) or {}
+    )
+    n = mod.dismiss_stale_approvals(
+        owner="o", repo="r", pr=1, head_sha="sha1", token="relay", reason="red"
+    )
+    assert n == 1
+    assert len(seen) == 1 and "/reviews/10/dismissals" in seen[0]
+
+
+def test_missing_relay_token_skips_approval_but_keeps_the_check(mod, monkeypatch):
+    """Degrade with a named line: the check run is the merge gate and has
+    already posted; only the review-count half is missing."""
+    submitted = []
+    monkeypatch.setattr(mod, "_preflight", lambda *a, **k: None)
+    monkeypatch.setattr(
+        mod, "_gather_and_decide",
+        lambda *a, **k: mod.GateDecision("success", "ok", "green"),
+    )
+    posted = []
+    monkeypatch.setattr(mod, "post_check_run", lambda *a, **k: posted.append(a[4].conclusion))
+    # Must be patched, or removing the token guard fails on a real API call and
+    # the except-handler hides it — making this test pass for the wrong reason.
+    monkeypatch.setattr(mod, "fetch_protection", lambda *a, **k: (("CI",), {}))
+    monkeypatch.setattr(
+        mod, "submit_mechanical_approval", lambda **k: submitted.append("x")
+    )
+    d = mod.run_gate(owner="o", repo="r", pr=1, head_sha="abc", token="t",
+                     base_branch="main", post_token="app", approve_token="")
+    assert d.conclusion == "success"
+    assert posted == ["success"], "the check must still post"
+    assert submitted == [], "no approval without the relay token"

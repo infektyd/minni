@@ -130,16 +130,21 @@ jobs:
           # GITHUB_TOKEN cannot be granted this at all, which is why the
           # protection read goes through the App token.
           permission-administration: read
-          # Submits the mechanical APPROVE on success, and dismisses the App's
-          # OWN stale approvals. Scoped in code to this App's approvals only —
-          # it must never dismiss a human review or a CHANGES_REQUESTED.
-          permission-pull-requests: write
+          # NO permission-pull-requests: the mechanical APPROVE moved to the
+          # relay USER token, because a GitHub App's approval does not satisfy
+          # required_approving_review_count (measured on #243). The App token
+          # now only posts the check and reads protection.
 
       - name: Run mechanical gate
         if: steps.meta.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           APP_TOKEN: ${{ steps.app-token.outputs.token }}
+          # Fine-grained PAT on the relay USER (minni-only, Pull requests RW).
+          # A user with write access is the ONLY identity whose approval counts
+          # toward required_approving_review_count. Unset degrades gracefully:
+          # the check still posts, the approval is skipped with a named line.
+          RELAY_APPROVE_TOKEN: ${{ secrets.RELAY_APPROVE_TOKEN }}
         run: |
           set -euo pipefail
           TRUST_REF="${{ steps.meta.outputs.default_branch }}"
