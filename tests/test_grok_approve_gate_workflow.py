@@ -311,22 +311,37 @@ def test_dedup_counts_dismissed_reviews_too(review):
     assert "select(.commit_id==$sha)" in run
 
 
-def test_gate_token_can_submit_reviews_but_reviewer_token_cannot_post_checks(gate, review):
-    """The gate now approves as well as posting the check, so its token needs PR
-    write. The reviewer's must NOT gain checks:write in exchange — keeping those
-    two capabilities in separate tokens is the point."""
+def test_gate_app_token_no_longer_carries_pr_write(gate, review):
+    """The mechanical APPROVE moved to the relay USER token, because an App's
+    approval does not satisfy required_approving_review_count (measured on
+    #243). So the App token drops PR write entirely: it posts the check and
+    reads protection, nothing else. The reviewer keeps PR write and still must
+    not gain checks:write — separate capabilities, separate tokens."""
     gate_step = next(
         s for s in gate["jobs"]["gate"]["steps"]
         if str(s.get("uses", "")).startswith("actions/create-github-app-token")
     )
-    assert gate_step["with"].get("permission-pull-requests") == "write"
     assert gate_step["with"].get("permission-checks") == "write"
+    assert gate_step["with"].get("permission-administration") == "read"
+    assert "permission-pull-requests" not in gate_step["with"]
 
     review_step = next(
         s for s in review["jobs"]["grok-review"]["steps"]
         if str(s.get("uses", "")).startswith("actions/create-github-app-token")
     )
+    assert review_step["with"].get("permission-pull-requests") == "write"
     assert "permission-checks" not in review_step["with"]
+
+
+def test_relay_approve_token_is_passed_to_the_gate(gate):
+    """A user with write access is the only identity whose approval counts."""
+    runner = next(
+        s for s in gate["jobs"]["gate"]["steps"]
+        if s.get("name") == "Run mechanical gate"
+    )
+    assert runner["env"]["RELAY_APPROVE_TOKEN"] == "${{ secrets.RELAY_APPROVE_TOKEN }}"
+    # It must be a distinct secret, not reused from the App token.
+    assert runner["env"]["RELAY_APPROVE_TOKEN"] != runner["env"]["APP_TOKEN"]
 
 
 def test_workflow_github_token_stays_read_only_on_prs(gate):
