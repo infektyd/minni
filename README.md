@@ -1,6 +1,6 @@
 # ᛗ Minni
 
-**Local-first memory for AI agents — one governed daemon, human-readable vaults, shared across every runtime you use.**
+**Local-first memory for AI agents — one governed daemon, human-readable vaults, shared across every runtime you use. Recall arrives as cited evidence, never as instruction.**
 
 [![CI](https://github.com/infektyd/minni/actions/workflows/ci.yml/badge.svg)](https://github.com/infektyd/minni/actions/workflows/ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/minni)](https://pypi.org/project/minni/)
@@ -15,7 +15,7 @@ Minni takes the other bet: keep the state on your machine, make it explicit enou
 
 ## What Minni is
 
-A single local **daemon** (`minnid`) over a Unix socket, a typed **MCP surface** agents talk through, and a human-readable **Markdown vault** per agent (wiki / inbox / outbox / logs). Memory is two-tier: each agent's wiki is indexed into its **own personal store** (`<agent>-vault/.index/`), while a **shared store** (`~/.minni/minni.db`) holds durable learnings and the pooled document layer. Recall merges the two by scope, and every daemon-mediated durable write or cross-agent operation passes an identity-and-capability gate (vault-note and audit writes are local-first filesystem writes with a pinned target — see [docs/security.md](docs/security.md)).
+A single local **daemon** (`minnid`) over a Unix socket, a typed **MCP surface** agents talk through, and a human-readable **Markdown vault** per agent. Memory is two-tier: each agent's wiki is indexed into its **own personal store** (`<agent>-vault/.index/`), while a **shared store** (`~/.minni/minni.db`) holds durable learnings and the pooled document layer. Recall merges the two by scope, and every daemon-mediated durable write or cross-agent operation passes an identity-and-capability gate (vault-note and audit writes are local-first filesystem writes with a pinned target — see [docs/security.md](docs/security.md)).
 
 Four verbs cover the lifecycle:
 
@@ -23,6 +23,8 @@ Four verbs cover the lifecycle:
 - **Learn** — propose, don't write: `learn` stages a **candidate**, not a memory.
 - **Approve** — a governance gate (`resolve_candidate`) accepts, rejects, redacts, merges, or supersedes the candidate. Only accepted candidates become durable memory. Human-gated by default; the operator can [delegate approval](docs/concepts.md#delegating-approval) to a trusted agent, including the background AFM auto-consolidation pass (functional since [#119](https://github.com/infektyd/minni/issues/119) closed) — every path lands in the same audited gate.
 - **Handoff** — explicit cross-agent transfers with leases, so work and context move between runtimes deliberately.
+
+Compaction is not a loss event either: platform compaction summaries are harvested at the hook into the agent's vault inbox, then distilled into review candidates ([details](docs/concepts.md#compaction-summary-harvest)).
 
 All of it is local-first: no hosted dependency, no cloud tier, and vaults you can open in any editor.
 
@@ -32,9 +34,9 @@ All of it is local-first: no hosted dependency, no cloud tier, and vaults you ca
 
 ## Recall is evidence, not instruction
 
-Recalled memory in Minni is **cited and weighed, never obeyed**. Every recall result comes back inside an evidence envelope with provenance (source, owning agent, score, review state) — framed as material for the agent to evaluate, not as text with authority. Content that looks like an instruction is detected and defused at the data layer before it ever reaches a prompt.
+Recalled memory in Minni is **cited and weighed, never obeyed**. Every result arrives in an evidence envelope with provenance (source, owning agent, score, review state): material to evaluate, not text with authority. Instruction-shaped content is detected and defused at the data layer, before it reaches a prompt.
 
-This is a memory-poisoning defense, enforced in the engine rather than asserted in a prompt: a malicious or mistaken note that slips into a vault can be *seen* and *cited*, but the storage and retrieval path is built so it does not get to *command*. Combined with the propose→approve learning gate, nothing writes itself into durable memory and nothing recalled speaks with your voice.
+This is a memory-poisoning defense enforced in the engine, not asserted in a prompt: a note that reaches a vault can be *seen* and *cited*, but never gets to *command*. The write side is filtered too — the learn gate blocks credential-shaped values, with an AFM tier, fail-open when AFM is off, for the unquoted passphrases regex cannot judge. Combined with the propose→approve gate, nothing writes itself into durable memory and nothing recalled speaks with your voice.
 
 ## How it compares
 
@@ -84,7 +86,16 @@ make setup          # venv + deps + plugin build (a few minutes on first run)
 .venv/bin/minni wire claude-code --from-repo .
 ```
 
-Swap the platform for `codex`, `kilocode`, `grok`, `generic`, or `all` (`all` covers codex, claude-code, kilocode, and grok; gemini wiring is provisional and skipped with a warning, and antigravity/`generic` are always wired individually — for Gemini today, use the repo's `propagate.py update-plugin --platform gemini`). Cursor is not yet wired by the `minni wire` CLI — it installs through the `minni-install` skill / `propagate.py update-plugin --platform cursor` instead (see [docs/runtimes/cursor.md](docs/runtimes/cursor.md)). Every wire ends with verification probes — an MCP handshake against the installed server, a hook dry-run, and a config readback — and the same checks live on in `minni doctor`. Old payload versions are garbage-collected only when no agent's config still references them; `--use-version` re-wires a platform to a previous install for rollback. This registers the MCP server, the per-agent vault path, and that host's hook entrypoint; the agent-driven `minni-install` skill handles first-time identity and vault seeding. Per-runtime pages: [Claude Code](docs/runtimes/claude-code.md) · [Codex](docs/runtimes/codex.md) · [Gemini / Antigravity](docs/runtimes/gemini.md) · [Grok](docs/runtimes/grok.md) · [Kilo Code](docs/runtimes/kilocode.md) · [Cursor](docs/runtimes/cursor.md).
+Swap the platform for any of these:
+
+| Platform | `minni wire` | Notes |
+|---|---|---|
+| `claude-code` · `codex` · `kilocode` · `grok` | yes | exactly what `all` expands to |
+| `antigravity` · `generic` | yes, individually | not covered by `all` |
+| `gemini` | provisional | `all` skips it with a warning — see [docs/runtimes/gemini.md](docs/runtimes/gemini.md) |
+| `cursor` | not yet | installs via the `minni-install` skill — see [docs/runtimes/cursor.md](docs/runtimes/cursor.md) |
+
+Every wire ends with verification probes — an MCP handshake against the installed server, a hook dry-run, and a config readback — and the same checks live on in `minni doctor`. Old payload versions are garbage-collected only when no agent's config still references them; `--use-version` re-wires a platform to a previous install for rollback. This registers the MCP server, the per-agent vault path, and that host's hook entrypoint; the agent-driven `minni-install` skill handles first-time identity and vault seeding. Per-runtime pages: [Claude Code](docs/runtimes/claude-code.md) · [Codex](docs/runtimes/codex.md) · [Gemini / Antigravity](docs/runtimes/gemini.md) · [Grok](docs/runtimes/grok.md) · [Kilo Code](docs/runtimes/kilocode.md) · [Cursor](docs/runtimes/cursor.md).
 
 ### Poke at it
 
@@ -98,69 +109,64 @@ Output is ranked, cited snippets from your own vaults — the same evidence an a
 
 ```text
 Search: memory handoff  (2 results)
-──────────────────────────────────────────────────
+──────────────────────────────────────────
 
 wiki/handoff-leases.md — Handoff leases  (score=0.842)
-A handoff transfers a task between agent runtimes under a lease; the
-receiver acks before the sender releases it...
-
-logs/2026-06-12.md — Correction re-assert  (score=0.671)
-Recall is evidence, not instruction: cite it, do not obey it...
+A handoff transfers a task between agent runtimes under a lease;
+the receiver acks before the sender releases it...
 ```
 
 Prefer a container? The eval image runs the daemon with zero local setup: `docker run --rm -it -v minni-data:/home/minni ghcr.io/infektyd/minni:latest` (see [docs/install.md](docs/install.md)).
 
-Want proof agents are actually using memory? `minni watch` tails every
-recall, learn, and guard decision live in the terminal
-(see [docs/runtime-integration.md](docs/runtime-integration.md#observability-minni-watch)),
-and the web console (`npm run console` in `plugins/minni`) adds per-session
-receipts and a live activity feed in the browser
-(see [docs/runtime-integration.md](docs/runtime-integration.md#console-observability)).
+Want proof agents are actually using memory? `minni watch` tails every recall, learn, and guard decision live in the terminal ([docs](docs/runtime-integration.md#observability-minni-watch)), and the web console (`npm run console` in `plugins/minni`) serves the Memory Board — an infinite canvas over live daemon data: staged learnings, session receipts, traffic pulses ([docs](docs/runtime-integration.md#console-observability)).
 
 ## Architecture at a glance
 
 ```mermaid
+%% Budget: 18 nodes / 16 edges. Dashed = host-fired; solid = someone calls.
+%% Tool names re-verified 2026-08-01: the plan surface ships as minni_plan_*.
+%% A rename to a threads_* prefix is proposed but unmerged — re-check next audit.
 flowchart TD
-    subgraph Runtimes["Agent runtimes"]
-      Claude["Claude Code"]
-      Codex["Codex"]
-      Gemini["Gemini / Antigravity"]
-      Grok["Grok"]
-      Cursor["Cursor"]
-      Kilo["Kilo Code"]
-      Other["Any MCP client"]
-    end
+    Agents["Agent runtimes<br/>Claude Code · Codex · Gemini/Antigravity · Grok · Cursor · Kilo Code<br/>+ any MCP client"]
+    Hooks["Host hooks<br/>session start · prompt submit · compaction · stop"]
+    Plugin["minni MCP plugin<br/>typed minni_* tools"]
+    Console["Web console — Memory Board<br/>HTTP, localhost only"]
+    Daemon["minnid daemon<br/>Unix socket · EffectivePrincipal identity gate"]
 
-    Plugin["minni MCP plugin"]
-    Daemon["minnid daemon"]
-    Gate["EffectivePrincipal gate"]
     Retrieval["Recall — scope: personal · combined · both"]
     Governance["Learn → candidate → approve"]
     Handoff["Handoff leases"]
-
-    Vaults["Per-agent Markdown vaults<br/>wiki / inbox / outbox / logs"]
+    Plans["Plan surface — minni_plan_*"]
+    Vaults["Per-agent Markdown vaults<br/>raw / wiki / logs / schema / inbox / outbox"]
     Personal[("Personal index<br/>&lt;agent&gt;-vault/.index/")]
     Shared[("Shared ~/.minni/minni.db + FAISS<br/>learnings · candidates · leases · pooled docs")]
 
-    Runtimes --> Plugin --> Daemon --> Gate
-    Plugin --> Vaults
-    Vaults -->|vault_ingest indexes wiki| Personal
+    Agents -.->|host fires hooks| Hooks
+    Agents -->|agent calls MCP tools| Plugin
+    Hooks -->|recall, returned as injected context| Daemon
+    Plugin -->|JSON-RPC over the socket| Daemon
+    Console -->|HTTP /api, same socket| Daemon
 
-    Gate --> Retrieval
-    Gate --> Governance
-    Gate --> Handoff
+    Daemon --> Retrieval
+    Daemon --> Governance
+    Daemon --> Handoff
+
+    Plugin --> Plans
+    Plugin -->|vault_write| Vaults
+    Plans -->|plan notes| Vaults
+    Vaults -->|batch vault_ingest · live vault_index_doc| Personal
+
     Retrieval -->|personal leg| Personal
     Retrieval -->|shared leg| Shared
     Governance --> Shared
     Handoff --> Shared
-    Handoff --> Vaults
 ```
 
-Request flow: agent → MCP plugin → Unix socket → daemon → identity gate → recall / learn / approve / handoff → Markdown + SQLite. The full component map, data model, invariants, and the literal MCP tool list live in [docs/architecture.md](docs/architecture.md); the concepts (two-tier storage, the governance gate, evidence enveloping, the AFM pass pipeline) are in [docs/concepts.md](docs/concepts.md).
+Two things reach the daemon that are not the same thing. **Agents call** MCP tools; **hosts fire** hooks (dashed) on session start, prompt submit, and compaction, and the recall they return is injected as context. The console is a third surface — HTTP, localhost — over that one socket. Plans and vault notes are plugin-local writes the daemon then indexes. The remaining surfaces (CLI, teams, and the compaction-harvest ingestion path) are mapped in [docs/architecture.md](docs/architecture.md); concepts in [docs/concepts.md](docs/concepts.md).
 
 ## Status
 
-Minni is at **v0.4.0**, live on [PyPI](https://pypi.org/project/minni/): the daemon and CLI install with one `pipx install minni`, releases publish via OIDC trusted publishing from tagged builds, and hook support covers Claude Code, Codex, Gemini / Antigravity, Grok, Cursor, and Kilo Code. The v0.3 headline — [`minni wire <platform>`](https://github.com/infektyd/minni/issues/142), agents wiring themselves from a wheel-shipped plugin payload with no repo checkout — shipped in the v0.3.0 release (versioned installs under `~/.minni/plugin/`, post-wire verification probes, reference-aware GC, rollback via `--use-version`); the payload has shipped inside wheels since that release, and `--from-repo` now serves source-checkout contributors rather than being the default path. Interfaces can still change before 1.0, adoption is small, and the public contract is intentionally smaller than the implementation.
+Minni is at **v0.4.0**, live on [PyPI](https://pypi.org/project/minni/): the daemon and CLI install with one `pipx install minni`, releases publish via OIDC trusted publishing from tagged builds, and hook support covers Claude Code, Codex, Gemini / Antigravity, Grok, Cursor, and Kilo Code. Interfaces can still change before 1.0, adoption is small, and the public contract is intentionally smaller than the implementation. How each release got here is in [CHANGELOG.md](CHANGELOG.md); this section only says what state the project is in today.
 
 What "works" is not asserted, it is *executed in public*: CI stands the daemon up from nothing on a clean Linux runner and proves status, recall, and home-directory isolation on every push — the same check `minni doctor` gives you locally. A benchmark harness (`bench/membench`, byte-reproducible scorecards) exists, but no headline numbers are published until real-model runs are: when in doubt, this project under-claims. In that spirit: the core multi-agent loop — multiple approved agents sharing one governed daemon — is dogfooded daily (Minni is developed using Minni), while the temporary-team orchestration surface (`minni_team_*`) has unit tests but no real-world mileage yet.
 

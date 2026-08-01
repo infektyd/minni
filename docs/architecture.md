@@ -1,18 +1,72 @@
 # Architecture
 
-## Request flow
+## Surfaces and request flow
+
+The README's [architecture diagram](../README.md#architecture-at-a-glance) is
+the control plane in summary — the three ingresses, the gate, the four verbs,
+the two stores. This one is the full surface map: the same control plane plus
+the operator surfaces and the ingestion paths that feed it. Dashed edges are
+**host-mediated** — the platform fires the hook and consumes what it returns;
+solid edges are somebody **calling**.
 
 ```mermaid
-flowchart LR
-    Agent["Agent runtime"] --> Plugin["minni MCP plugin<br/>(Node/TS, per runtime)"]
-    Plugin -->|JSON-RPC 2.0 over Unix socket| Daemon["minnid daemon<br/>(Python asyncio)"]
-    Daemon --> Gate["EffectivePrincipal gate<br/>identity + capabilities"]
-    Gate --> Recall["recall / search"]
-    Gate --> Learn["learn → candidate → resolve"]
-    Gate --> Handoff["handoff leases"]
-    Recall --> Stores[("Markdown vaults · personal .index ·<br/>shared minni.db + FAISS")]
-    Learn --> Stores
-    Handoff --> Stores
+flowchart TD
+    subgraph Clients["Client surfaces"]
+      Host["Agent runtime host"]
+      Hooks["Hook entrypoint — dist/hook.js<br/>SessionStart · UserPromptSubmit · PreToolUse<br/>PreCompact · PostCompact · Stop"]
+      Plugin["MCP server — dist/server.js<br/>typed minni_* tools"]
+      Console["Web console — ui-server.ts<br/>Memory Board, HTTP on 127.0.0.1"]
+      CLI["minni CLI<br/>up · down · doctor · watch · wire"]
+    end
+
+    subgraph Core["Daemon"]
+      Daemon["minnid — JSON-RPC over Unix socket"]
+      Gate["EffectivePrincipal gate<br/>identity + capabilities"]
+      AFM["AFM pass loop<br/>compact_distillation · consolidation · vault_ingest"]
+    end
+
+    Retrieval["recall / search<br/>personal · combined · both"]
+    Governance["learn → candidate_packets → resolve"]
+    Handoff["handoff leases"]
+    Plans["plan surface — minni_plan_*"]
+    Team["team surface — minni_team_*"]
+
+    Vaults["Per-agent Markdown vaults<br/>raw / wiki / logs / schema / inbox / outbox"]
+    Inbox["vault inbox/<br/>compact_summary packets"]
+    Personal[("Personal index<br/>&lt;agent&gt;-vault/.index/")]
+    Shared[("Shared ~/.minni/minni.db + FAISS")]
+
+    Host -.->|host fires hooks| Hooks
+    Host -->|agent calls tools| Plugin
+    Hooks -->|search RPC| Daemon
+    Hooks -.->|injected context| Host
+    Hooks -->|PostCompact summary, deduped| Inbox
+    Plugin --> Daemon
+    Plugin --> Plans
+    Plugin --> Team
+    Plugin -->|vault_write| Vaults
+    Console -->|/api/* → daemon RPC| Daemon
+    Console -->|audit tail, sessions| Vaults
+    CLI --> Daemon
+    Team -->|gate.shared, prepare_task| Daemon
+    Plans -->|plan notes, _active_plan.json| Vaults
+    Hooks -->|reads the active plan| Vaults
+
+    Daemon --> Gate
+    Gate --> Retrieval
+    Gate --> Governance
+    Gate --> Handoff
+    Daemon -->|idle timer| AFM
+    Inbox --> AFM
+    AFM -->|shared sections → candidates| Governance
+    AFM -->|personal sections → wiki/sessions note| Vaults
+
+    Vaults -->|batch vault_ingest pass| Personal
+    Vaults -->|live vault_index_doc RPC| Personal
+    Retrieval -->|personal leg| Personal
+    Retrieval -->|shared leg| Shared
+    Governance --> Shared
+    Handoff --> Shared
 ```
 
 One daemon per host; one plugin process per agent runtime; for daemon-mediated
@@ -43,7 +97,7 @@ audit writes do not cross this boundary; see
 | Shared `~/.minni/minni.db` (SQLite, FTS5, WAL) | learnings, episodic/contradiction events, candidates, handoff leases, migrations, runtime metadata — plus the pooled `documents` + `chunk_embeddings` (the shared retrieval leg) |
 | Shared FAISS | vector index for the shared document leg |
 | Per-agent `<agent>-vault/.index/` | `vault.db` (chunk text, embeddings, resolved `[[wikilink]]` edges) + `vault.faiss` + `vault.manifest.json`, built by `vault_ingest` from that agent's `wiki/**/*.md` |
-| Vault wiki / inbox / outbox / logs | the human-readable surfaces: synthesis pages and notes; candidate drafts and hook packets; outgoing handoffs; append-oriented audit trail |
+| Vault `raw` / `wiki` / `logs` / `schema` / `inbox` / `outbox` (`wire/writers.py:576`) | the human-readable surfaces: synthesis pages and notes; candidate drafts and hook packets; outgoing handoffs; append-oriented audit trail |
 
 Recall scope semantics and provenance are covered in
 [concepts — two-tier storage](concepts.md#two-tier-storage).
