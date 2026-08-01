@@ -30,7 +30,12 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 SOURCE_DIST = REPO_ROOT / "plugins" / "minni" / "dist"
 
 # Deployment roots, as globs relative to $HOME. Each should resolve to a dist/.
+# ~/.minni/plugin/*/dist is the wire-managed tree. It is what Claude Code now
+# loads hooks, skills and commands from (installed_plugins.json points at it), so
+# leaving it out would make the one deployment this check exists to watch the
+# only one it could not see.
 DEPLOYMENT_GLOBS = [
+    ".minni/plugin/*/dist",
     ".claude/plugins/cache/minni/minni/*/dist",
     ".codex/plugins/cache/minni/minni/*/dist",
     ".config/kilo/plugins/minni/dist",

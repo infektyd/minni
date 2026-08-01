@@ -8,6 +8,7 @@ Unix socket is.
     minni status    show daemon and engine health in plain language
     minni doctor    verify the install end to end (same probes as CI's smoke)
     minni wire      wire the plugin payload to an agent platform
+    minni wire-adopt cut a platform's plugin surface over to the wire tree
     minni watch     live tail of memory activity (audit trail + daemon events)
     minni down      stop the daemon
 
@@ -258,6 +259,35 @@ def cmd_wire(args: argparse.Namespace) -> int:
     return run_wire(args)
 
 
+def cmd_wire_adopt(args: argparse.Namespace) -> int:
+    """One-time cutover of Claude Code's plugin surface onto the wire tree."""
+    import json as _json
+
+    from minni.wire.claude_plugin import ClaudePluginError, adopt_claude_code
+
+    if args.platform != "claude-code":
+        print(
+            f"minni wire-adopt: unsupported platform {args.platform!r}; "
+            "only claude-code needs adoption",
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        result = adopt_claude_code(
+            apply=args.apply, keep_legacy_cache=args.keep_legacy_cache,
+        )
+    except ClaudePluginError as exc:
+        print(f"minni wire-adopt: {exc}", file=sys.stderr)
+        return 1
+    print(_json.dumps(result, indent=2))
+    if not args.apply:
+        print(
+            "\n[wire-adopt] dry run — nothing was written. Re-run with --apply.",
+            file=sys.stderr,
+        )
+    return 0
+
+
 def cmd_watch(args: argparse.Namespace) -> int:
     # watch.py is stdlib-only and strictly read-only, so the packaging
     # contract of this module (no engine imports) is preserved.
@@ -398,6 +428,15 @@ def main(argv: list[str] | None = None) -> int:
     wire.add_argument("--use-version", metavar="VER",
                       help="re-wire configs against an already-installed version dir")
 
+    adopt = sub.add_parser(
+        "wire-adopt",
+        help="one-time cutover of a platform's plugin surface onto the wire tree")
+    adopt.add_argument("platform", help="claude-code (the only platform needing adoption)")
+    adopt.add_argument("--apply", action="store_true",
+                       help="perform the cutover (default: dry run, writes nothing)")
+    adopt.add_argument("--keep-legacy-cache", action="store_true",
+                       help="leave ~/.claude/plugins/cache/minni in place")
+
     watch = sub.add_parser(
         "watch",
         help="live tail of memory activity (audit trail + daemon events)")
@@ -429,7 +468,7 @@ def main(argv: list[str] | None = None) -> int:
 
     dispatch = {"up": cmd_up, "down": cmd_down,
                 "status": cmd_status, "doctor": cmd_doctor, "wire": cmd_wire,
-                "watch": cmd_watch}
+                "wire-adopt": cmd_wire_adopt, "watch": cmd_watch}
     return dispatch[args.command](args)
 
 

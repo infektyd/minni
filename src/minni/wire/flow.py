@@ -9,6 +9,12 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 
+from minni.wire.claude_plugin import (
+    ClaudePluginError,
+    claude_adopt_pending,
+    follow_claude_desktop,
+    register_claude_plugin,
+)
 from minni.wire.from_repo import build_from_repo, self_check_manifest
 from minni.wire.gc import run_gc
 from minni.wire.install import (
@@ -410,6 +416,86 @@ def run_wire(args) -> int:
                         str(workspace) if workspace else None,
                     )
                     upsert_wire(record, dry_run=False)
+
+                # Claude Code reads hooks/skills/commands from the installPath in
+                # its plugin registry, so wiring the MCP server alone leaves that
+                # surface pointing wherever it last pointed. Registered only after
+                # verification passed and wired.json already protects the tree —
+                # never on a path that would leave a live registration behind for
+                # a payload we could not verify.
+                if spec.platform == "claude-code":
+                    try:
+                        extras["claude_plugin"] = register_claude_plugin(
+                            install_root, version,
+                            git_sha=manifest.git_sha, dry_run=dry_run,
+                        )
+                    except ClaudePluginError as exc:
+                        # The MCP config and wired.json already moved above, so
+                        # `failed` alone would tell an operator (or automation
+                        # keying on it) that nothing changed. Say which half
+                        # landed.
+                        extras["wired_but_plugin_unregistered"] = not dry_run
+                        out.results.append(PlatformResult(
+                            platform, "failed",
+                            config_path=str(config_path) if config_path else None,
+                            server_path=server_path,
+                            agent=spec.agent,
+                            workspace=str(workspace) if workspace else None,
+                            verify=verify,
+                            reason=(
+                                f"plugin registration failed: {exc} "
+                                "(the MCP server and wired.json were already updated; "
+                                "re-run `minni wire claude-code` once resolved)"
+                            ),
+                            extra=extras,
+                        ))
+                        continue
+
+                    # Desktop records a *versioned* path, so a wire that moves
+                    # the tree strands it on a version GC will later prune.
+                    # Adopt is what first moves Desktop onto the wire tree;
+                    # keeping it there is ordinary wiring's job, and a no-op
+                    # until adoption has happened.
+                    #
+                    # Best-effort on purpose. Claude Desktop is a separate
+                    # product wire does not own, and its config being corrupt,
+                    # unreadable or mid-write must not fail a claude-code wire
+                    # that otherwise succeeded — that would flip the whole run
+                    # to `failed` and skip GC over a file we only touch as a
+                    # courtesy. `wire-adopt`, where the operator asked for the
+                    # Desktop move explicitly, stays strict.
+                    try:
+                        extras["claude_desktop"] = follow_claude_desktop(
+                            install_root, dry_run=dry_run,
+                        )
+                    except (ClaudePluginError, OSError) as exc:
+                        # OSError too: the config dir can be unwritable or the
+                        # file mid-write, and _atomic_write_json surfaces that
+                        # raw. Letting it escape would abort the whole run with
+                        # a traceback and no JSON at all — strictly worse than
+                        # the `failed` result this block exists to avoid.
+                        extras["claude_desktop"] = {
+                            "changed": False, "reason": f"skipped: {exc}",
+                        }
+                        print(
+                            f"[wire] claude-code: left Claude Desktop alone ({exc})",
+                            file=sys.stderr,
+                        )
+
+                    # Wiring alone leaves a half-migrated machine: the stale
+                    # marketplace is still there, so `/plugin update` will
+                    # reinstall into the cache and rewrite installPath off the
+                    # tree we just registered — the exact silent reversion this
+                    # registration exists to stop.
+                    if claude_adopt_pending():
+                        extras["claude_adopt_pending"] = True
+                        print(
+                            "[wire] claude-code: the retired minni marketplace/cache "
+                            "install is still present. Run `minni wire-adopt "
+                            "claude-code` (then `--apply`) or `/plugin update` can "
+                            "revert the plugin surface off the wire tree.",
+                            file=sys.stderr,
+                        )
 
                 out.results.append(PlatformResult(
                     platform, "wired" if not dry_run else "wired",
