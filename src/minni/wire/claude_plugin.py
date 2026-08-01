@@ -412,7 +412,11 @@ def _iter_json_strings(node: object, trail: str = "") -> object:
     """
     if isinstance(node, dict):
         for key, value in node.items():
-            yield from _iter_json_strings(value, f"{trail}.{key}" if trail else str(key))
+            sub = f"{trail}.{key}" if trail else str(key)
+            # Keys are candidates too, not just labels: ~/.claude.json keys its
+            # `projects` map by directory, so a path can appear only as a key.
+            yield sub, str(key)
+            yield from _iter_json_strings(value, sub)
     elif isinstance(node, list):
         for i, value in enumerate(node):
             yield from _iter_json_strings(value, f"{trail}[{i}]")
@@ -466,8 +470,15 @@ def legacy_cache_referrers(*, overrides: dict[str, dict] | None = None) -> list[
                 found.append(f"{path}: unreadable, cannot verify ({exc})")
                 continue
         for trail, value in _iter_json_strings(doc):
+            # Echo the value only when it is a bare path. Path() validates
+            # nothing -- spaces and newlines are ordinary path characters -- so
+            # "<cache>/hook.js --token=..." passes _is_under whole, and printing
+            # it would leak exactly what the branch below is careful not to.
             if _is_under(value, root):
-                found.append(f"{path}: {trail} -> {value}")
+                if value.split() == [value]:
+                    found.append(f"{path}: {trail} -> {value}")
+                else:
+                    found.append(f"{path}: {trail} mentions {root}")
             elif boundary.search(_nfc(value).lower()):
                 # Report the field, never the text. This branch fires precisely
                 # when the path is embedded in a shell command string, which is

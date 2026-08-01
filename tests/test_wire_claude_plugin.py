@@ -555,6 +555,39 @@ def test_remove_legacy_cache_refusal_names_the_field_but_leaks_no_secrets(home):
     assert "CANARY-4f9a2b7c" not in message, "refusal echoed the surrounding text"
 
 
+def test_remove_legacy_cache_refusal_never_echoes_an_argument_string(home):
+    """Path() accepts spaces, so a command string passes _is_under whole.
+
+    Echoing the "path" would leak through the branch that looks safe.
+    """
+    (legacy_cache_root() / "minni" / "0.3.0").mkdir(parents=True)
+    root = _install_tree(home, "0.4.0")
+    hook = legacy_cache_root() / "minni" / "0.3.0" / "dist" / "hook.js"
+    cfg = home / ".claude.json"
+    cfg.write_text(
+        json.dumps({"cmd": f"{hook} --auth CANARY-9d3f1a"}), encoding="utf-8",
+    )
+
+    with pytest.raises(ClaudePluginError) as exc:
+        remove_legacy_cache(root)
+    assert "CANARY-9d3f1a" not in str(exc.value), "refusal echoed an argument string"
+
+
+def test_remove_legacy_cache_scans_dict_keys(home):
+    """~/.claude.json keys its projects map by directory, so a path can be a key."""
+    (legacy_cache_root() / "minni" / "0.3.0").mkdir(parents=True)
+    root = _install_tree(home, "0.4.0")
+    stale = str(legacy_cache_root() / "minni" / "0.3.0")
+    cfg = home / ".claude.json"
+    cfg.write_text(
+        json.dumps({"projects": {stale: {"hasTrustDialogAccepted": True}}}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ClaudePluginError, match="still referenced by"):
+        remove_legacy_cache(root)
+
+
 def test_remove_legacy_cache_catches_an_nfd_spelled_reference(tmp_path, monkeypatch):
     """macOS treats NFC and NFD as the same file; string comparison does not."""
     fake_home = tmp_path / unicodedata.normalize("NFC", "hem-åäö")
