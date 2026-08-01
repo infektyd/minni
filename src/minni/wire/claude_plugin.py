@@ -300,11 +300,18 @@ def _move_desktop_arg(
     if server_js in args:
         return {"path": str(path), "changed": False, "reason": "already on the wire tree"}
 
-    targets = [i for i, a in enumerate(args) if _is_under(a, under)]
+    # Only the server entrypoint moves. An argument that merely *lives* under
+    # the same tree (a --config path, say) is not a second server pointer, and
+    # rewriting it to server.js would be silent corruption. Anything else left
+    # inside the legacy cache is caught by remove_legacy_cache's scan, loudly.
+    targets = [
+        i for i, a in enumerate(args)
+        if _is_under(a, under) and Path(a).name == "server.js"
+    ]
     if not targets:
         return {
             "path": str(path), "changed": False,
-            "reason": f"no argument points into the {what}",
+            "reason": f"no server.js argument points into the {what}",
         }
 
     new_args = list(args)

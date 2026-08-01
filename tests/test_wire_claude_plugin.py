@@ -269,6 +269,28 @@ def test_repoint_desktop_preserves_flags_before_the_path(home):
     assert args == ["--inspect", str(root / "dist" / "server.js")]
 
 
+def test_repoint_desktop_moves_only_the_server_argument(home):
+    """A sibling path under the same tree is not a second server pointer."""
+    (legacy_cache_root() / "minni" / "0.3.0").mkdir(parents=True)
+    cfg = _write_desktop(home, {
+        "command": "node",
+        "args": [_legacy_server(), "--config", str(
+            legacy_cache_root() / "minni" / "0.3.0" / "cfg.json",
+        )],
+    })
+    root = _install_tree(home, "0.4.0")
+
+    result = repoint_claude_desktop(root)
+
+    assert result["replaced"] == [_legacy_server()]
+    args = json.loads(cfg.read_text(encoding="utf-8"))["mcpServers"]["minni"]["args"]
+    assert args[1] == "--config"
+    assert args[2].endswith("cfg.json"), "a non-server path was rewritten to server.js"
+    # ...and the leftover cache path must still block the deletion.
+    with pytest.raises(ClaudePluginError, match="still referenced by"):
+        remove_legacy_cache(root)
+
+
 def test_repoint_desktop_leaves_unrelated_paths_alone(home):
     cfg = _write_desktop(home, {"command": "node", "args": ["/elsewhere/server.js"]})
     root = _install_tree(home, "0.4.0")
