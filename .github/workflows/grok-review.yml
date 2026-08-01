@@ -1,0 +1,101 @@
+name: Grok Code Review
+
+# Auto-review on PRs — mirrors .github/workflows/claude-code-review.yml but
+# runs xAI's Grok Build CLI headless on the runner, burning the operator's
+# Grok subscription (device-auth OAuth secret GROK_CI_AUTH_JSON — minting and
+# rotation notes in .github/workflows/grok.yml).
+#
+# Scope guards:
+# * Same-repo PRs only — `pull_request` from forks gets no secrets from
+#   GitHub anyway, and the job's if-gate skips them outright.
+# * Skips draft PRs; re-runs on synchronize are serialized per-PR with
+#   cancel-in-progress so only the latest push is reviewed.
+
+on:
+  pull_request:
+    types: [opened, ready_for_review]
+    # Deliberately NOT on `synchronize`: one subscription-metered review per
+    # PR at open time. Add it back if per-push re-review is worth the burn.
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: grok-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  grok-review:
+    if: |
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout PR head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+          fetch-depth: 0
+
+      - name: Install Grok Build CLI
+        run: |
+          curl -fsSL https://x.ai/cli/install.sh | bash
+          echo "$HOME/.grok/bin" >> "$GITHUB_PATH"
+
+      - name: Restore Grok subscription auth
+        env:
+          GROK_CI_AUTH_JSON: ${{ secrets.GROK_CI_AUTH_JSON }}
+        run: |
+          mkdir -p "$HOME/.grok"
+          printf '%s' "$GROK_CI_AUTH_JSON" | base64 -d > "$HOME/.grok/auth.json"
+          chmod 600 "$HOME/.grok/auth.json"
+
+      - name: Build review prompt
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          NUM="${{ github.event.pull_request.number }}"
+          {
+            echo "You are Grok performing an adversarial code review of a pull request"
+            echo "on ${{ github.repository }}. The PR head is checked out in the current"
+            echo "directory. Review the diff below against the actual code in the checkout."
+            echo
+            echo "## PR #$NUM"
+            gh pr view "$NUM" --json title,body --jq '"Title: \(.title)\n\n\(.body)"'
+            echo
+            echo "## Diff"
+            gh pr diff "$NUM" | head -6000
+            echo
+            echo "Report format:"
+            echo "1. Verdict line: APPROVE-worthy / needs changes / blocking defects."
+            echo "2. Findings ranked by severity, each with file:line, the failure"
+            echo "   scenario (concrete inputs -> wrong behavior), and a suggested fix."
+            echo "3. Skip style nits unless they hide a defect. If the diff is clean,"
+            echo "   say so plainly instead of inventing findings."
+          } > /tmp/grok-prompt.md
+
+      - name: Run Grok review
+        run: |
+          grok --prompt-file /tmp/grok-prompt.md \
+            --permission-mode dontAsk \
+            --no-subagents \
+            --max-turns 30 \
+            --output-format plain > /tmp/grok-reply.md
+          [ -s /tmp/grok-reply.md ] || echo "_Grok returned no output (see workflow logs)._" > /tmp/grok-reply.md
+
+      - name: Post review comment
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          {
+            echo "## Grok review"
+            echo
+            cat /tmp/grok-reply.md
+            echo
+            echo "---"
+            echo "_Grok Build (headless) auto-review · [workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})_"
+          } > /tmp/grok-comment.md
+          gh pr comment "${{ github.event.pull_request.number }}" \
+            --repo "${{ github.repository }}" --body-file /tmp/grok-comment.md

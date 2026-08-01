@@ -1,0 +1,137 @@
+name: Grok
+
+# @grok mention handler — mirrors .github/workflows/claude.yml but runs xAI's
+# Grok Build CLI headless on the runner, authenticated with a dedicated
+# subscription OAuth token (device-auth flow) stored as GROK_CI_AUTH_JSON.
+#
+# Auth notes:
+# * The secret is the base64 of an auth.json minted via
+#   `grok login --device-auth` in an ISOLATED home (never the operator's live
+#   ~/.grok, so day-to-day local use cannot rotate the CI token stale).
+# * When the token eventually expires/rotates server-side, re-mint the same
+#   way and update the secret:
+#     mkdir -p /tmp/grok-ci && HOME=/tmp/grok-ci grok login --device-auth
+#     base64 -i /tmp/grok-ci/.grok/auth.json | gh secret set GROK_CI_AUTH_JSON
+#
+# Trigger gating: only comments/issues authored by the repo owner or a
+# collaborator run the job — @grok in a drive-by comment does nothing. The
+# job never checks out or executes fork code with the secret in scope: for PR
+# comments it checks out the PR head only when the PR is same-repo.
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+  issues:
+    types: [opened]
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+concurrency:
+  group: grok-${{ github.event.issue.number || github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  grok:
+    if: |
+      contains(github.event.comment.body || github.event.issue.body, '@grok') &&
+      contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'),
+               github.event.comment.author_association || github.event.issue.author_association)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Resolve target ref
+        id: target
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # PR comments run against the PR head (same-repo PRs only, so the
+          # OAuth secret never coexists with fork-controlled code); everything
+          # else runs against the default branch.
+          REF="${{ github.event.repository.default_branch }}"
+          if [ -n "${{ github.event.issue.pull_request.url || github.event.pull_request.number }}" ]; then
+            NUM="${{ github.event.issue.number || github.event.pull_request.number }}"
+            META=$(gh api "repos/${{ github.repository }}/pulls/$NUM" \
+              --jq '{ref: .head.ref, same_repo: (.head.repo.full_name == .base.repo.full_name)}')
+            if [ "$(echo "$META" | jq -r .same_repo)" = "true" ]; then
+              REF=$(echo "$META" | jq -r .ref)
+            fi
+            echo "pr=$NUM" >> "$GITHUB_OUTPUT"
+          fi
+          echo "ref=$REF" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.target.outputs.ref }}
+          fetch-depth: 0
+
+      - name: Install Grok Build CLI
+        run: |
+          curl -fsSL https://x.ai/cli/install.sh | bash
+          echo "$HOME/.grok/bin" >> "$GITHUB_PATH"
+
+      - name: Restore Grok subscription auth
+        env:
+          GROK_CI_AUTH_JSON: ${{ secrets.GROK_CI_AUTH_JSON }}
+        run: |
+          mkdir -p "$HOME/.grok"
+          printf '%s' "$GROK_CI_AUTH_JSON" | base64 -d > "$HOME/.grok/auth.json"
+          chmod 600 "$HOME/.grok/auth.json"
+
+      - name: Build prompt
+        id: prompt
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMMENT_BODY: ${{ github.event.comment.body || github.event.issue.body }}
+        run: |
+          NUM="${{ github.event.issue.number || github.event.pull_request.number }}"
+          {
+            echo "You are Grok, responding to a GitHub mention on ${{ github.repository }}."
+            echo "The repository is checked out in the current directory."
+            echo
+            if [ -n "${{ steps.target.outputs.pr }}" ]; then
+              echo "## Pull request #$NUM"
+              gh pr view "$NUM" --json title,body --jq '"Title: \(.title)\n\n\(.body)"'
+              echo
+              echo "## Diff"
+              gh pr diff "$NUM" | head -4000
+              echo
+            else
+              echo "## Issue #$NUM"
+              gh issue view "$NUM" --json title,body --jq '"Title: \(.title)\n\n\(.body)"'
+              echo
+            fi
+            echo "## Request (the @grok comment)"
+            printf '%s\n' "$COMMENT_BODY"
+            echo
+            echo "Respond with your analysis/answer in GitHub-flavored markdown."
+            echo "Be concrete and cite files/lines from the checkout where relevant."
+          } > /tmp/grok-prompt.md
+
+      - name: Run Grok
+        run: |
+          grok --prompt-file /tmp/grok-prompt.md \
+            --permission-mode dontAsk \
+            --no-subagents \
+            --max-turns 30 \
+            --output-format plain > /tmp/grok-reply.md
+          # Never post an empty comment.
+          [ -s /tmp/grok-reply.md ] || echo "_Grok returned no output (see workflow logs)._" > /tmp/grok-reply.md
+
+      - name: Post reply
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          NUM="${{ github.event.issue.number || github.event.pull_request.number }}"
+          {
+            cat /tmp/grok-reply.md
+            echo
+            echo "---"
+            echo "_Grok Build (headless) via \`grok --single\` · [workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})_"
+          } > /tmp/grok-comment.md
+          gh issue comment "$NUM" --repo "${{ github.repository }}" --body-file /tmp/grok-comment.md
