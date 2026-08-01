@@ -1393,6 +1393,58 @@ def update_plugin(args: argparse.Namespace) -> int:
 DISTILL_TEMPLATE_DIR = Path(__file__).resolve().parent.parent / "templates" / "distill"
 DISTILL_FILES = ("mode", "gauges.md", "ritual.md")
 
+LAYER1_TEMPLATE_DIR = Path(__file__).resolve().parent.parent / "templates" / "layer1"
+LAYER1_FILES = ("core.md", "budget.md")
+
+
+def seed_layer1(vault: Path, agent: str, workspace: str | None = None) -> dict[str, object]:
+    """Seed `<vault>/layer1/` with the agent's durable identity workspace.
+
+    The Layer 1 contract (see this SKILL, "Seed Layer 1 whole-document
+    delivery") says every agent vault carries `layer1/core.md` +
+    `layer1/budget.md`: a small, agent-curated, read-first-on-wake workspace
+    under a strict <4096 token budget. Nothing created them, so only
+    hand-seeded vaults had one.
+
+    Idempotent by contract: these files are agent-owned living state that the
+    agent edits every distill, so an existing file is never overwritten -- only
+    missing ones are written.
+    """
+    layer1 = vault / "layer1"
+    result: dict[str, object] = {"path": str(layer1)}
+    if not LAYER1_TEMPLATE_DIR.is_dir():
+        # Non-fatal: a stripped install tree must not break vault bootstrap.
+        result["status"] = "skipped"
+        result["reason"] = f"template dir missing: {LAYER1_TEMPLATE_DIR}"
+        return result
+
+    layer1.mkdir(exist_ok=True)
+    values = {
+        "agent": agent,
+        "vault": str(vault),
+        "workspace": workspace or os.environ.get("MINNI_WORKSPACE_ID")
+        or "(not set -- record this agent's primary workspace here)",
+        "socket": str(DEFAULT_SOCKET),
+        "timestamp": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+
+    created: list[str] = []
+    kept: list[str] = []
+    for name in LAYER1_FILES:
+        target = layer1 / name
+        if target.exists():
+            kept.append(name)
+            continue
+        body = (LAYER1_TEMPLATE_DIR / name).read_text(encoding="utf-8")
+        for key, value in values.items():
+            body = body.replace("{{" + key + "}}", value)
+        target.write_text(body, encoding="utf-8")
+        created.append(name)
+    result["status"] = "ok"
+    result["created"] = created
+    result["kept"] = kept
+    return result
+
 
 def seed_distill(vault: Path, agent: str) -> dict[str, object]:
     """Seed `<vault>/distill/` with the Distill Ritual V1 artifacts.
@@ -1478,8 +1530,11 @@ def bootstrap_vault(args: argparse.Namespace) -> int:
     log = vault / "log.md"
     if not log.exists():
         log.write_text(f"# {agent} Vault Log\n\n", encoding="utf-8")
+    # Layer 1 first: seed_distill reports whether layer1/core.md exists, and the
+    # gauges must read "present" on a freshly bootstrapped vault.
+    layer1 = seed_layer1(vault, agent, getattr(args, "workspace", None))
     distill = seed_distill(vault, agent)
-    print(json.dumps({"status": "ok", "agent": agent, "vault": str(vault), "symlink": vault.is_symlink(), "distill": distill}, indent=2))
+    print(json.dumps({"status": "ok", "agent": agent, "vault": str(vault), "symlink": vault.is_symlink(), "layer1": layer1, "distill": distill}, indent=2))
     return 0
 
 
@@ -1829,6 +1884,7 @@ def main() -> int:
 
     p_bootstrap = sub.add_parser("bootstrap-vault", help="Create an actual per-agent vault directory without copying another agent.")
     p_bootstrap.add_argument("--agent", required=True, type=valid_agent_id)
+    p_bootstrap.add_argument("--workspace", default=None, help="Primary workspace recorded in the seeded layer1/core.md (defaults to $MINNI_WORKSPACE_ID).")
     p_bootstrap.set_defaults(func=bootstrap_vault)
 
     p_seed = sub.add_parser("seed-hosted", help="Create/update hosted-agent Layer 1 envelope.")

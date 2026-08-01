@@ -57,6 +57,18 @@ pre-1.0: minor versions may contain breaking changes until v1.0.0.
 
 ### Fixed
 
+- **Layer 1 identity workspace is now seeded**: `bootstrap-vault` creates
+  `<vault>/layer1/` with `core.md` and `budget.md` from in-repo templates
+  parameterized by agent id, vault path, workspace, and socket path. The Layer 1
+  contract assumes every vault carries an agent-curated durable workspace — read
+  first on wake, kept under a strict 4096-token budget — but nothing ever created
+  it, so only the two hand-seeded vaults had one and the doctrine pointed at
+  files that did not exist. Seeding is idempotent: these files are agent-owned
+  living state the agent rewrites during every distill, so existing files are
+  never overwritten. Layer 1 is seeded before `distill/`, so a fresh vault's
+  gauges report the identity workspace as present. Re-run `bootstrap-vault
+  --agent <id>` to backfill an older vault; `--workspace` records the agent's
+  primary workspace.
 - **Distill ritual artifacts are now seeded**: `bootstrap-vault` (and therefore
   `update-plugin`) creates `<vault>/distill/` with `mode` (default `explicit`),
   `gauges.md`, and `ritual.md` from in-repo templates parameterized by agent id.
