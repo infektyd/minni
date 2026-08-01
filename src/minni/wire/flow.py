@@ -453,6 +453,11 @@ def run_wire(args) -> int:
                                 file=sys.stderr,
                             )
                     except ClaudePluginError as exc:
+                        # The MCP config and wired.json already moved above, so
+                        # `failed` alone would tell an operator (or automation
+                        # keying on it) that nothing changed. Say which half
+                        # landed.
+                        extras["wired_but_plugin_unregistered"] = not dry_run
                         out.results.append(PlatformResult(
                             platform, "failed",
                             config_path=str(config_path) if config_path else None,
@@ -460,7 +465,11 @@ def run_wire(args) -> int:
                             agent=spec.agent,
                             workspace=str(workspace) if workspace else None,
                             verify=verify,
-                            reason=f"plugin registration failed: {exc}",
+                            reason=(
+                                f"plugin registration failed: {exc} "
+                                "(the MCP server and wired.json were already updated; "
+                                "re-run `minni wire claude-code` once resolved)"
+                            ),
                             extra=extras,
                         ))
                         continue

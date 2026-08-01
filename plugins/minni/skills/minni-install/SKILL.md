@@ -187,9 +187,19 @@ functionality and configuration:
 Known platform update commands (run from your Minni checkout; the script ships
 with this skill at `plugins/minni/skills/minni-install/scripts/propagate.py`):
 
+**Claude Code is no longer one of them.** Its plugin surface is served from the
+wire-managed tree, so `update-plugin --platform claude-code` (and `--platform
+all`, which no longer includes it) exits with a pointer to wire instead of
+writing to a directory nothing reads. Use:
+
+```bash
+minni wire claude-code
+minni wire-adopt claude-code            # one-time cutover; dry-run by default
+minni wire-adopt claude-code --apply
+```
+
 ```bash
 .venv/bin/python plugins/minni/skills/minni-install/scripts/propagate.py update-plugin --platform codex
-.venv/bin/python plugins/minni/skills/minni-install/scripts/propagate.py update-plugin --platform claude-code
 .venv/bin/python plugins/minni/skills/minni-install/scripts/propagate.py update-plugin --platform kilocode
 .venv/bin/python plugins/minni/skills/minni-install/scripts/propagate.py update-plugin --platform gemini
 .venv/bin/python plugins/minni/skills/minni-install/scripts/propagate.py update-plugin --platform antigravity
@@ -198,6 +208,14 @@ with this skill at `plugins/minni/skills/minni-install/scripts/propagate.py`):
 ```
 
 ### Rebranding / reinstalling a Claude Code plugin identity
+
+> **Historical.** This runbook drives the native `claude plugin` CLI, which
+> installs into `~/.claude/plugins/cache/` and writes a marketplace entry — the
+> exact arrangement `minni wire-adopt claude-code` retires, and one that
+> `/plugin update` can use to revert the plugin surface off the wire tree. On a
+> wire-managed host the identity lives in `installed_plugins.json` and wire owns
+> it; re-run `minni wire claude-code` instead. Kept for hosts that still install
+> Minni from a public marketplace.
 
 The `propagate.py update-plugin` flow refreshes an *existing* install in place.
 When the plugin's marketplace/plugin **name** changes (e.g. the
