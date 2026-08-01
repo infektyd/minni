@@ -1653,7 +1653,8 @@ const threadDeactivateTool = server.registerTool(
 );
 
 // ── Deprecation shim: minni_plan_* → minni_thread_* ────────────────────────
-// One-release alias window for the minni:plan → minni:threads rename. Each old
+// Alias window for the minni:plan → minni:threads rename, closing in the release
+// after next (see CHANGELOG). Each old
 // name re-registers the CANONICAL tool's own handler and schema, so behaviour
 // is byte-identical — only the description differs, leading with "DEPRECATED"
 // so the model reads the migration notice on every turn.
@@ -1685,8 +1686,8 @@ for (const [oldName, newName, canonical] of DEPRECATED_TOOL_ALIASES) {
   server.registerTool(
     oldName,
     {
-      title: canonical.title,
-      description: `DEPRECATED — renamed to ${newName}. This alias is removed in the next release; call the new name. ${canonical.description ?? ""}`,
+      title: canonical.title ? `${canonical.title} (deprecated)` : undefined,
+      description: `DEPRECATED — renamed to ${newName}. This alias is removed in the release after next; call the new name. ${canonical.description ?? ""}`,
       inputSchema: canonical.inputSchema as unknown as Record<string, z.ZodTypeAny>,
     },
     canonical.handler as ToolCallback<Record<string, z.ZodTypeAny>>,

@@ -62,6 +62,32 @@ test("c1: classifyIntent labels are exactly the ones the mapping handles", () =>
   }
 });
 
+// Regression guard for the minni:plan -> minni:threads rename. Adding a bare
+// `thread` alternative to classifyIntent's plan regex looks harmless but is not:
+// "thread" is an overloaded English word that appears far more often in
+// CONCURRENCY prompts than in planning ones, so it silently relabels
+// implement/debug/work turns as "plan" and fires the wrong lifecycle emphasis.
+// The rename needs no such alternative — the "plan" intent already reaches the
+// renamed "thread" SURFACE through lifecycleSurfaceForIntent.
+test("classifyIntent does not treat concurrency work as planning (threads-rename guard)", () => {
+  for (const concurrency of [
+    "make the cache thread-safe",
+    "the thread pool is sized wrong",
+    "convert this to a threaded worker",
+    "multithreaded access to the queue",
+    "summarize this email thread",
+  ]) {
+    assert.notEqual(
+      classifyIntent(concurrency),
+      "plan",
+      `"${concurrency}" is concurrency/prose work, not planning`,
+    );
+  }
+  // ...while genuine planning prompts still classify as planning
+  assert.equal(classifyIntent("plan the architecture"), "plan");
+  assert.equal(classifyIntent("design the migration"), "plan");
+});
+
 test("c1: emphasis is a soft one-line signpost per surface", () => {
   for (const surface of ["prepare_task", "prepare_outcome", "thread", "learn"]) {
     const line = buildLifecycleEmphasis(surface);

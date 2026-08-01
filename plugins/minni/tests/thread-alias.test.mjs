@@ -140,6 +140,14 @@ test("every renamed thread tool is registered, and its old plan name still resol
         alias.description.includes(`minni_thread_${verb}`),
         `minni_plan_${verb} must name its replacement`,
       );
+      // titles must differ too, or tools/list renders 11 duplicate title pairs
+      // and a client picking by title cannot tell alias from canonical
+      assert.notEqual(
+        alias.title,
+        canonical.title,
+        `minni_plan_${verb} must not reuse the canonical title verbatim`,
+      );
+      assert.match(alias.title, /\(deprecated\)$/, `minni_plan_${verb} title must be marked`);
       // The alias replays the canonical schema, so the model cannot be handed a
       // narrower or emptier contract under the old name.
       assert.deepEqual(
