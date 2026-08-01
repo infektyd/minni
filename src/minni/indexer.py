@@ -23,6 +23,7 @@ from minni.config import SovereignConfig, DEFAULT_CONFIG
 from minni.db import SovereignDB
 from minni.chunker import MarkdownChunker
 from minni.faiss_index import FAISSIndex
+from minni.timestamps import parse_epoch_or_report
 
 logger = logging.getLogger("sovereign.indexer")
 
@@ -194,7 +195,22 @@ class VaultIndexer:
                     )
                     row = c.fetchone()
 
-                    if row and row["last_modified"] >= mtime:
+                    # Audit R0 (grok-review): last_modified is a REAL-affinity
+                    # column an out-of-tree writer could poison with TEXT, same
+                    # class as indexed_at. `>= mtime` on a TEXT value raises
+                    # TypeError, which the broad except below turned into a
+                    # permanent stats["errors"] — the row never got rewritten,
+                    # so it stayed stuck. Parse-or-treat-as-stale: an
+                    # unparseable value defaults to 0.0, which is always less
+                    # than mtime, so the row is reindexed (and thereby
+                    # repaired) instead of stuck.
+                    last_modified = (
+                        parse_epoch_or_report(
+                            row["last_modified"], field="last_modified",
+                            source="indexer.index_vault", doc_id=row["doc_id"],
+                        ) or 0.0
+                    ) if row else 0.0
+                    if row and last_modified >= mtime:
                         stats["skipped"] += 1
                         continue
 

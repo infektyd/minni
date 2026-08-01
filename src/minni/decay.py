@@ -15,6 +15,7 @@ from typing import Dict
 
 from minni.config import SovereignConfig, DEFAULT_CONFIG, correction_class_page_types
 from minni.db import SovereignDB
+from minni.timestamps import parse_epoch_or_report
 
 logger = logging.getLogger("sovereign.decay")
 
@@ -47,7 +48,18 @@ class MemoryDecay:
         # duck-typed configs.
         grace_sec = float(self.config.correction_decay_grace_days) * 86400
         correction_floor = float(self.config.correction_decay_floor)
-        stats = {"updated": 0, "reinforced": 0}
+        # grok-review (PR #242, rounds 2-4): a bad last_accessed or a bad
+        # indexed_at each still get decayed (falling back to indexed_at, then
+        # to `now`, exactly like their respective NULL cases) — no row is
+        # ever left undecayed by this loop, `now` is always an available
+        # last-resort anchor. Each degrade gets its own counter rather than a
+        # single "skipped" stat that would misreport a row that was, in fact,
+        # processed (round 4: a stat that can never be nonzero is worse than
+        # no stat — it implies a hard-skip path that no longer exists).
+        stats = {
+            "updated": 0, "reinforced": 0,
+            "bad_indexed_at": 0, "bad_last_accessed": 0,
+        }
 
         with self.db.transaction() as c:
             c.execute("""
@@ -58,8 +70,42 @@ class MemoryDecay:
 
             for row in c.fetchall():
                 doc_id = row["doc_id"]
-                indexed_at = row["indexed_at"] or now
-                last_accessed = row["last_accessed"]
+                # Audit R0: indexed_at / last_accessed are REAL-affinity columns,
+                # which SQLite happily fills with a non-numeric TEXT value. The
+                # arithmetic below then raises TypeError inside this transaction
+                # and aborts the ENTIRE decay pass over every document. Parse
+                # each field defensively; a bad value degrades to the same
+                # fallback its NULL counterpart already uses, and is counted
+                # (not silently absorbed) rather than aborting the row.
+                indexed_at = parse_epoch_or_report(
+                    row["indexed_at"], field="indexed_at",
+                    source="decay.run_decay", doc_id=doc_id,
+                )
+                last_accessed = parse_epoch_or_report(
+                    row["last_accessed"], field="last_accessed",
+                    source="decay.run_decay", doc_id=doc_id,
+                )
+                # grok-review round 3: a bad (non-NULL, unparseable) indexed_at
+                # used to `continue` past the whole document, even though a
+                # valid last_accessed could still anchor decay, and even a
+                # missing last_accessed just falls to `now` below — the same
+                # fallback the NULL-indexed_at case already gets. Degrade
+                # instead of skipping; parse_epoch_or_report already
+                # counted/logged the bad value in the malformed-timestamp
+                # report, so this counter is about "not decayed to plan", not
+                # visibility of the poison itself.
+                if row["indexed_at"] is not None and indexed_at is None:
+                    stats["bad_indexed_at"] += 1
+                if indexed_at is None:
+                    indexed_at = now
+                # grok-review round 1: a poisoned last_accessed used to
+                # `continue` past the whole document, even though the normal
+                # NULL-last_accessed path already falls back to indexed_at.
+                # It just becomes "no last_accessed", same as NULL — the
+                # document is still decayed below, so it is NOT a skip
+                # (grok-review round 2: the old code counted it as one).
+                if row["last_accessed"] is not None and last_accessed is None:
+                    stats["bad_last_accessed"] += 1
                 access_count = row["access_count"] or 0
 
                 reference_time = last_accessed if last_accessed else indexed_at
@@ -93,9 +139,26 @@ class MemoryDecay:
                     if access_boost > 0:
                         stats["reinforced"] += 1
 
+        if stats["bad_indexed_at"]:
+            logger.warning(
+                "Decay pass decayed %d document(s) using a fallback anchor "
+                "(last_accessed or now): the stored indexed_at was non-numeric. "
+                "Run migration 016 to normalize them.",
+                stats["bad_indexed_at"],
+            )
+        if stats["bad_last_accessed"]:
+            logger.warning(
+                "Decay pass decayed %d document(s) from indexed_at instead of "
+                "last_accessed: the stored last_accessed was non-numeric. "
+                "Run migration 016 to normalize them.",
+                stats["bad_last_accessed"],
+            )
         logger.info(
-            "Decay pass complete: %d updated, %d reinforced",
+            "Decay pass complete: %d updated, %d reinforced, %d decayed via "
+            "fallback anchor (bad indexed_at), %d decayed via indexed_at "
+            "fallback (bad last_accessed)",
             stats["updated"], stats["reinforced"],
+            stats["bad_indexed_at"], stats["bad_last_accessed"],
         )
         return stats
 

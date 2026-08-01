@@ -9,6 +9,11 @@ from typing import Any, Callable, Optional
 
 from minni.config import DEFAULT_CONFIG
 from minni.db import SovereignDB
+from minni.timestamps import (
+    malformed_timestamp_report,
+    parse_epoch_or_report,
+    stored_malformed_timestamp_count,
+)
 
 
 logger = logging.getLogger("minnid")
@@ -40,6 +45,16 @@ def redact_health_report_for_recovery(report: dict) -> dict:
         items = report.get(key) or []
         redacted[f"{key}_count"] = len(items)
         redacted[key] = []
+    # grok-review (PR #242): malformed_timestamps.examples carries per-doc
+    # doc_id + value repr. It is a nested dict, not a flat list, so the
+    # _HEALTH_REPORT_SENSITIVE_KEYS loop above (which counts list length)
+    # cannot cover it — do it explicitly. Aggregate fields (stored_rows,
+    # read_skips, by_field, remediation) are counts/labels only and stay.
+    malformed = report.get("malformed_timestamps")
+    if isinstance(malformed, dict) and malformed.get("examples"):
+        redacted_malformed = dict(malformed)
+        redacted_malformed["examples"] = {}
+        redacted["malformed_timestamps"] = redacted_malformed
     redacted["redacted"] = (
         "pre-identity diagnostic: per-record detail withheld until a principal is stamped"
     )
@@ -252,6 +267,13 @@ def handle_health_report(params: dict, request_id: Any, context: HealthContext) 
         "never_recalled": [],
         "contradicting_learnings": [],
         "vector_backend_lag": [],
+        # Audit R0: non-numeric values sitting in the REAL-affinity timestamp
+        # columns. The readers are defensive now, but a skipped row must stay
+        # VISIBLE here rather than being silently tolerated.
+        "malformed_timestamps": {
+            "stored_rows": 0, "read_skips": 0, "by_field": {},
+            "examples": {}, "remediation": None,
+        },
         # W3 (audit §4 / consolidation inbox residue): operator-visible
         # recovery surface for files parked in <inbox>/quarantine/ (see
         # afm_passes.inbox_quarantine). Aggregate-only (count + reason
@@ -297,12 +319,60 @@ def handle_health_report(params: dict, request_id: Any, context: HealthContext) 
                 (stale_cutoff,),
             )
             for row in c.fetchall():
-                ts = row["indexed_at"] or row["last_modified"] or 0
+                # Audit R0: parse-or-report. A TEXT timestamp here used to
+                # TypeError on the subtraction and take the whole health report
+                # down with it.
+                #
+                # grok-review (PR #242): `row["indexed_at"] or row["last_modified"]
+                # or 0` picks indexed_at whenever it is truthy — including a
+                # non-numeric TEXT value, which is truthy too — so a poisoned
+                # indexed_at shadowed a perfectly good last_modified and this
+                # row's age_days went to None instead of a real number. Parse
+                # indexed_at first and only fall back to last_modified if that
+                # parse fails, matching how decay.py treats the same two columns.
+                ts = parse_epoch_or_report(
+                    row["indexed_at"], field="indexed_at",
+                    source="health.stale_docs", doc_id=row["doc_id"],
+                )
+                if ts is None:
+                    ts = parse_epoch_or_report(
+                        row["last_modified"], field="last_modified",
+                        source="health.stale_docs", doc_id=row["doc_id"],
+                    )
                 report["stale_docs"].append({
                     "doc_id": row["doc_id"],
                     "path": row["path"],
-                    "age_days": round((now - ts) / 86400, 1) if ts else None,
+                    # grok-review (PR #242): `if ts` treats the migration's own
+                    # 0.0 sentinel (a deliberate "needs attention" marker for
+                    # unparseable rows) as "no timestamp", since 0.0 is falsy —
+                    # so a repaired-to-sentinel row's very large, very visible
+                    # age gets hidden as None instead of shown. `is not None`
+                    # keeps 0.0 visible.
+                    "age_days": round((now - ts) / 86400, 1) if ts is not None else None,
                 })
+
+            # Audit R0 visibility: a poisoned timestamp must be *reported*, not
+            # merely tolerated by the defensive readers above. Count the rows
+            # SQLite still holds as non-numeric in a REAL-affinity column, and
+            # fold in whatever this process has already had to skip at read time.
+            stored_bad = stored_malformed_timestamp_count(c)
+            skips = malformed_timestamp_report()
+            report["malformed_timestamps"] = {
+                "stored_rows": stored_bad,
+                "read_skips": skips["total"],
+                "by_field": skips["by_field"],
+                "examples": skips["examples"],
+                "remediation": (
+                    "migration 016 normalizes stored timestamps"
+                    if stored_bad else None
+                ),
+            }
+            if stored_bad or skips["total"]:
+                logger.warning(
+                    "Health: %d document row(s) hold a non-numeric timestamp and "
+                    "%d read(s) were skipped this process. Run migration 016.",
+                    stored_bad, skips["total"],
+                )
 
             c.execute(
                 """
