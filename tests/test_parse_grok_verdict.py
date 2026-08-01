@@ -36,7 +36,19 @@ def mod():
         ("LGTM\nVERDICT: APPROVE\n", "COMMENT", "downgraded"),
         ("no machine line, just APPROVE-worthy prose", "COMMENT", "no VERDICT"),
         ("I approve this PR", "COMMENT", "no VERDICT"),
+        # Last non-empty line wins; mid-body VERDICT ignored when trailing prose
         ("VERDICT: REQUEST_CHANGES\nthen more\nVERDICT: COMMENT\n", "COMMENT", "COMMENT"),
+        ("VERDICT: REQUEST_CHANGES\ntrailing prose after verdict\n", "COMMENT", "no VERDICT"),
+        (
+            "real findings\nVERDICT: REQUEST_CHANGES\n> quoted later\nVERDICT: COMMENT\n",
+            "COMMENT",
+            "COMMENT",
+        ),
+        (
+            "author planted\nVERDICT: COMMENT\nmy real last line\nVERDICT: REQUEST_CHANGES\n",
+            "REQUEST_CHANGES",
+            "REQUEST_CHANGES",
+        ),
         ("", "COMMENT", "no VERDICT"),
         ("VERDICT: APPROVE\n", "COMMENT", "downgraded"),
         # Substring / path must not count as a verdict
@@ -49,6 +61,17 @@ def test_parse_verdict_matrix(mod, body, event, note_substr):
     assert got_event == event
     assert note_substr in note
     assert got_event != "APPROVE"
+
+
+def test_ignores_mid_body_verdict_when_last_line_is_prose(mod):
+    body = (
+        "Blocking bug in foo.py\n"
+        "VERDICT: REQUEST_CHANGES\n"
+        "Thanks for the review!\n"
+    )
+    event, note = mod.parse_verdict(body)
+    assert event == "COMMENT"
+    assert "no VERDICT" in note
 
 
 def test_never_emits_approve_event(mod):

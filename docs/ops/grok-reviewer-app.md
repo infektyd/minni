@@ -17,8 +17,10 @@ API events.
 LLM output must not mint merge trust. A human or Cursor Approval Agent still
 supplies the approving review that clears the merge box.
 
-Parser: `.github/scripts/parse_grok_verdict.py` (loaded from the **default
-branch** when present; PR-head fallback only while landing).
+Parser: `.github/scripts/parse_grok_verdict.py` — only the **last non-empty
+line** of the model reply is parsed (loaded from the **default branch** when
+present; PR-head fallback only while landing, and head fallback cannot mint
+`REQUEST_CHANGES`).
 
 ## Create the App
 
@@ -82,10 +84,23 @@ same variable + secret on each allowlisted install over org secrets (owner is
 a user account). Extract a `workflow_call` reusable later if copy drift hurts —
 not a v1 blocker.
 
+## Recovery after `REQUEST_CHANGES`
+
+v1 does **not** re-review on every push (`synchronize` omitted to limit
+subscription burn). A formal `REQUEST_CHANGES` from the App stays sticky until
+cleared. Working recovery paths:
+
+1. **Dismiss** the App's review in the PR UI (or via API), then merge once a
+   human/Cursor approving review is present; or
+2. Convert the PR to **draft → Ready for review** (fires `ready_for_review`); or
+3. **Close → reopen** the PR (fires `reopened`).
+
+`@grok` / the mention workflow only posts an issue comment — it does **not**
+submit a Reviews API event and will not clear `CHANGES_REQUESTED`.
+
 ## Out of scope (v1)
 
 - LLM `APPROVE` via the App
 - Machine-user PAT as the review identity
 - Fork PRs (job already skips them; secrets unavailable)
-- `synchronize` re-review (subscription burn; open a new review with `/grok` or
-  close/reopen if needed)
+- `synchronize` re-review (subscription burn; use recovery paths above)

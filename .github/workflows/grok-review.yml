@@ -12,14 +12,15 @@ name: Grok Code Review
 # Scope guards:
 # * Same-repo PRs only — `pull_request` from forks gets no secrets from
 #   GitHub anyway, and the job's if-gate skips them outright.
-# * Skips draft PRs; re-runs on synchronize are serialized per-PR with
-#   cancel-in-progress so only the latest push is reviewed.
+# * Skips draft PRs. Concurrency group cancels in-progress runs if a second
+#   trigger fires for the same PR (e.g. ready_for_review while opened runs).
 
 on:
   pull_request:
-    types: [opened, ready_for_review]
+    types: [opened, ready_for_review, reopened]
     # Deliberately NOT on `synchronize`: one subscription-metered review per
-    # PR at open time. Add it back if per-push re-review is worth the burn.
+    # open/ready/reopen, not per push. Recovery after REQUEST_CHANGES: dismiss
+    # the App review, or draft → ready_for_review / close → reopen (reopened).
 
 permissions:
   contents: read
@@ -218,23 +219,29 @@ jobs:
         run: |
           NUM="${{ github.event.pull_request.number }}"
           # Same trust model as the leak gate: prefer DEFAULT branch so a PR
-          # cannot neuter the VERDICT→event mapping (e.g. force COMMENT).
-          # Fall back to the checked-out head only while the script is still
-          # landing (first PR that introduces it — origin/$TRUST_REF lacks it).
-          git fetch --depth=1 origin "$TRUST_REF" || true
+          # cannot neuter the VERDICT→event mapping. Fall back to head only
+          # while the script is still landing; head-sourced parsers must not
+          # mint REQUEST_CHANGES (grief → sticky block with no synchronize).
+          git fetch --depth=1 origin "$TRUST_REF"
+          PARSER_TRUST=default
           if git cat-file -e "origin/$TRUST_REF:.github/scripts/parse_grok_verdict.py" 2>/dev/null; then
             git show "origin/$TRUST_REF:.github/scripts/parse_grok_verdict.py" \
               > /tmp/parse_grok_verdict.py
             PARSER=/tmp/parse_grok_verdict.py
           elif [ -f .github/scripts/parse_grok_verdict.py ]; then
-            echo "::warning::parse_grok_verdict.py not on origin/$TRUST_REF yet; using PR head copy"
+            echo "::warning::parse_grok_verdict.py not on origin/$TRUST_REF yet; using PR head copy (COMMENT-only)"
             PARSER=.github/scripts/parse_grok_verdict.py
+            PARSER_TRUST=head
           else
             echo "::error::parse_grok_verdict.py missing on head and origin/$TRUST_REF"
             exit 1
           fi
           EVENT=$(python3 "$PARSER" --event-only /tmp/grok-reply.md)
           NOTE=$(python3 "$PARSER" /tmp/grok-reply.md | cut -f2-)
+          if [ "$PARSER_TRUST" = head ] && [ "$EVENT" = REQUEST_CHANGES ]; then
+            EVENT=COMMENT
+            NOTE="head-parser fallback: REQUEST_CHANGES downgraded to COMMENT"
+          fi
           {
             echo "## Grok review"
             echo
