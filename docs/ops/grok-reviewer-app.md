@@ -328,10 +328,19 @@ mechanical check can never go green — the exact opposite of the goal. Only
 require checks that run on every PR.
 
 
-## Autonomous merge (operator — propose, don't silent-apply)
+## Merge without `--admin` (operator — propose, don't silent-apply)
 
-Target state: mechanically-gated PRs merge without the operator, who then only
-reviews the trust surface.
+The operator is the merge choke point and the repo stalls while they are at
+work. Two phases, deliberately separated:
+
+| | What changes | Gated on |
+|---|---|---|
+| **Phase 1 — now** | Merges stay manual and on the main account, but stop needing `--admin` | the App's mechanical APPROVE satisfying the review requirement |
+| **Phase 2 — pre-wired, OFF** | Gated PRs merge themselves | one operator setting, `allow_auto_merge` |
+
+Phase 2 is wired now so that turning it on is a setting and nothing else. The
+target state is that mechanically-gated PRs merge without the operator, who
+then only reviews the trust surface.
 
 ### The mechanical APPROVE
 
@@ -368,20 +377,57 @@ write access, and App approvals are how bots like renovate-approve work.
 that `reviewDecision` flips `REVIEW_REQUIRED` → `APPROVED` while the approval is
 the App's newest review on the current head. Record the result here either way.
 
-### If it works, the remaining operator settings
+### Phase 1 (now): manual merges, no `--admin`
+
+The near-term win is small and concrete: merges stay on the main account and
+stay manual, but they stop needing a bypass. Once the App's mechanical APPROVE
+satisfies `required_approving_review_count`, this is enough:
 
 ```bash
-# 1. Allow auto-merge, so agents can queue a merge that fires when checks pass.
-gh api -X PATCH repos/infektyd/minni -F allow_auto_merge=true
-
-# 2. Agents then queue, rather than merge:
-#    gh pr merge --auto --squash <n>
+gh pr merge --squash <n>      # no --admin
 ```
+
+That is the whole phase-1 goal. If `--admin` is still required after the gate
+has approved, the hypothesis above has failed — record that and stop, rather
+than reaching for the bypass out of habit.
+
+### Phase 2 (pre-wired, OFF): auto-merge
+
+Auto-merge is wired up now so that enabling it is a **single operator setting
+and nothing else** — no second round of tooling changes.
+
+**Standard practice from now on:** whoever opens a PR queues the merge at open
+time, rather than merging at the end.
+
+```bash
+gh pr merge --auto --squash <n> \
+  || echo "auto-merge not enabled; will merge manually when green"
+```
+
+While the repo setting is off this command **fails**, which is why it is written
+with the fallback — treat that message as normal, not as an error to chase. The
+moment the operator flips the setting, the identical command starts arming PRs
+to merge themselves once the gate approves and required checks pass. Nothing
+else changes.
+
+The operator's one-time flip:
+
+```bash
+gh api -X PATCH repos/infektyd/minni -F allow_auto_merge=true
+```
+
+Use `-F`, not `-f`: `-f` sends the string `"true"`, while `-F` sends a real
+boolean, which is what this field expects.
+
+Do not enable it until phase 1 has actually been observed working — auto-merge
+on top of an unproven approval path just means PRs sit queued forever, or worse,
+merge on a signal nobody has verified.
 
 ### CODEOWNERS — the human-required trust surface
 
-Auto-merge plus a mechanical approval means nothing human-gated remains unless
-you say so. Require code-owner review for the trust surface:
+Once phase 2 is on, auto-merge plus a mechanical approval means nothing
+human-gated remains unless you say so. Set this up **before** flipping
+`allow_auto_merge`, not after. Require code-owner review for the trust surface:
 
 ```
 # .github/CODEOWNERS
