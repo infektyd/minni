@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import calendar
 import json
 import logging
 import queue
@@ -23,7 +24,135 @@ _WORKER_LOCK = threading.Lock()
 _PAGE_LOCKS: dict[str, threading.Lock] = {}
 _PAGE_LOCKS_LOCK = threading.Lock()
 _LATENCIES: List[float] = []
+# Set only when a pass actually WROTE drafts (see _write_batch). A healthy pass
+# with nothing to distill never lands here, which is why it cannot be the sole
+# input to the loop's health verdict.
 _LAST_RUN_PER_PASS: dict[str, float] = {}
+# Set when a pass completed a wet run at all, drafts or not. This is the
+# liveness signal; _LAST_RUN_PER_PASS is the productivity signal.
+_LAST_ATTEMPT_PER_PASS: dict[str, float] = {}
+
+# A pass is stale once it has been silent for this multiple of its configured
+# interval. 2x, not 1x: a tick that lands a few seconds late is not a fault, and
+# a threshold that fires on ordinary jitter gets ignored, which is the failure
+# mode this whole change exists to end.
+STALE_INTERVAL_MULTIPLE = 2.0
+# Pending drafts nobody has endorsed. The loop keeps producing regardless, so
+# depth is the only thing that reveals a review queue that has stopped draining.
+DRAFTS_PENDING_BACKLOG = 200
+
+
+def record_pass_attempt(pass_name: str, now: Optional[float] = None) -> None:
+    """Record that ``pass_name`` completed a wet run (drafts or not)."""
+    _LAST_ATTEMPT_PER_PASS[str(pass_name or "unknown")] = (
+        time.time() if now is None else now
+    )
+
+
+def _parse_iso_utc(value: str) -> Optional[float]:
+    """Parse a trailing-Z timestamp as UTC (calendar.timegm, not time.mktime)."""
+    try:
+        return calendar.timegm(time.strptime(value, "%Y-%m-%dT%H:%M:%SZ"))
+    except (ValueError, TypeError):
+        return None
+
+
+def _extract_frontmatter(text: str) -> str:
+    """The leading `---`-fenced YAML block, or the whole text if none is found.
+
+    Falling back to the whole text keeps this permissive for malformed pages
+    (they still get scanned) rather than silently treating them as having no
+    ``created`` field; the parse-then-validate step in the caller is what
+    actually rejects unusable values.
+    """
+    if not text.startswith("---"):
+        return text
+    end = text.find("\n---", 3)
+    return text if end == -1 else text[:end]
+
+
+def derive_loop_status(
+    state: dict,
+    schedule: Optional[dict] = None,
+    now: Optional[float] = None,
+) -> tuple[str, List[str]]:
+    """Derive an honest ``status`` from the loop's observable state.
+
+    Returns ``(status, reasons)``. Every condition found lands in ``reasons``;
+    ``status`` is the worst of them, ordered
+
+        stale > backlogged > unknown > ok
+
+    ``unknown`` is deliberately not ``ok``. Where the loop cannot be inspected
+    -- a pass with no recorded run at all, drafts whose age cannot be read --
+    that is reported as such rather than passed over. The caller layers
+    ``disabled`` and ``degraded`` on top (see minnid_runtime.health).
+    """
+    now = time.time() if now is None else now
+    if schedule is None:
+        try:
+            from minni.config import DEFAULT_CONFIG
+
+            schedule = getattr(DEFAULT_CONFIG, "afm_loop_schedule", {}) or {}
+        except Exception:
+            schedule = {}
+    passes_cfg = (schedule or {}).get("passes") or {}
+    ttl_days = int((schedule or {}).get("draft_ttl_days", 14))
+
+    last_run = state.get("last_run_per_pass") or {}
+    last_attempt = state.get("last_attempt_per_pass") or {}
+
+    reasons: List[str] = []
+    stale: List[str] = []
+    silent: List[str] = []
+    for name, cfg in passes_cfg.items():
+        interval = float((cfg or {}).get("interval_seconds", 24 * 60 * 60))
+        seen = max(
+            float(last_run.get(name, 0.0) or 0.0),
+            float(last_attempt.get(name, 0.0) or 0.0),
+        )
+        if seen <= 0.0:
+            silent.append(name)
+            continue
+        age = now - seen
+        if age > interval * STALE_INTERVAL_MULTIPLE:
+            stale.append(f"{name} (last ran {round(age / 3600.0, 1)}h ago, interval {round(interval / 3600.0, 1)}h)")
+    if stale:
+        reasons.append("passes past their interval: " + ", ".join(sorted(stale)))
+    if silent:
+        reasons.append(
+            "no run on record this process for: " + ", ".join(sorted(silent))
+            + " (in-memory counters reset on daemon restart; treat as unverified, not healthy)"
+        )
+
+    pending = int(state.get("drafts_pending", 0) or 0)
+    if pending >= DRAFTS_PENDING_BACKLOG:
+        reasons.append(f"{pending} draft(s) pending endorsement (backlog threshold {DRAFTS_PENDING_BACKLOG})")
+    oldest = state.get("drafts_pending_oldest")
+    oldest_ts = _parse_iso_utc(oldest) if isinstance(oldest, str) else None
+    if oldest_ts is not None:
+        age_days = (now - oldest_ts) / 86400.0
+        if age_days > ttl_days:
+            reasons.append(
+                f"oldest pending draft is {round(age_days, 1)}d old, past the {ttl_days}d TTL "
+                "(expiry is not running)"
+            )
+    undated = int(state.get("drafts_pending_undated", 0) or 0)
+    if pending and oldest is None:
+        reasons.append(f"{pending} draft(s) pending but none carries a readable created date; age unknown")
+    elif undated:
+        reasons.append(f"{undated} pending draft(s) carry no readable created date; oldest may be understated")
+    unreadable = int(state.get("drafts_unreadable", 0) or 0)
+    if unreadable:
+        reasons.append(f"{unreadable} vault page(s) could not be read; draft count is a lower bound")
+
+    if stale:
+        return "stale", reasons
+    if pending >= DRAFTS_PENDING_BACKLOG or (oldest_ts is not None and (now - oldest_ts) / 86400.0 > ttl_days):
+        return "backlogged", reasons
+    if reasons:
+        return "unknown", reasons
+    return "ok", reasons
 
 
 def _slugify(text: str) -> str:
@@ -224,6 +353,13 @@ def _write_one(vault: Path, draft: dict, writeback: Any = None) -> dict:
 
 
 def _expire_stale_drafts(vault: Path) -> int:
+    # KNOWN DEFECT, deliberately not fixed here (audit R1 is health-truth only):
+    # the expires_at pattern below has the same unquoted-only bug that
+    # writer_status just had, and yaml.safe_dump quotes the value -- so on the
+    # live vault this expires nothing and 1,210 drafts sit months past their
+    # TTL. Fixing it rewrites vault files in bulk, which is a remediation
+    # change, not a reporting one. writer_status now REPORTS the backlog and
+    # its age, so the condition is visible while it waits its turn.
     expired = 0
     now = time.time()
     for path in (vault / "wiki").glob("**/*.md"):
@@ -317,7 +453,18 @@ def submit_drafts(job: dict, wait: bool = True, timeout: Optional[float] = 30.0)
     return out["result"]
 
 
-def writer_status(vault_path: Optional[str] = None) -> dict:
+def writer_status(
+    vault_path: Optional[str] = None,
+    schedule: Optional[dict] = None,
+    now: Optional[float] = None,
+) -> dict:
+    """Report the loop's observable state AND a status derived from it.
+
+    ``status`` used to be the literal ``"ok"``. It is now computed by
+    :func:`derive_loop_status` from the same numbers the caller can see, so a
+    loop whose passes have all been silent for days can no longer read ``ok``
+    next to an empty ``last_run_per_pass``.
+    """
     p95 = 0.0
     if _LATENCIES:
         ordered = sorted(_LATENCIES)
@@ -325,27 +472,54 @@ def writer_status(vault_path: Optional[str] = None) -> dict:
         p95 = round(ordered[idx] * 1000, 3)
     pending = 0
     oldest = None
+    undated = 0
+    unreadable = 0
     if vault_path:
         vault = Path(vault_path).expanduser()
         for path in (vault / "wiki").glob("**/*.md"):
             try:
                 text = path.read_text(encoding="utf-8")
             except Exception:
+                # A draft we cannot read is not a draft we know to be fine.
+                unreadable += 1
                 continue
             if "status: draft" in text and "agent: afm-loop" in text:
                 pending += 1
-                created = re.search(r"created:\s*([0-9T:Z-]+)", text)
-                if created:
+                # Search only the frontmatter block (between the leading `---`
+                # fences), not the whole file: a draft's body is free-form prose
+                # and may itself contain the substring "created:", which must
+                # not be read as the draft's own creation date.
+                frontmatter = _extract_frontmatter(text)
+                # The value is yaml.safe_dump'd, so it arrives quoted:
+                # `created: '2026-06-20T00:07:39Z'`. The unquoted-only pattern
+                # matched nothing, which is why drafts_pending_oldest was null
+                # on a vault of 1,210 drafts and the age threshold never fired.
+                created = re.search(r"^created:\s*['\"]?([0-9T:.Z-]+)", frontmatter, re.MULTILINE)
+                # A match that does not parse as a UTC timestamp (e.g. a
+                # millisecond-precision value) is not usable as `oldest` either:
+                # stuffing an unparseable string in there would neither read as
+                # dated (age/TTL logic silently no-ops on it) nor as undated
+                # (the "age unknown" reason would not fire). Count it as undated
+                # instead so the gap is visible rather than swallowed.
+                if created and _parse_iso_utc(created.group(1)) is not None:
                     value = created.group(1)
                     oldest = value if oldest is None else min(oldest, value)
-    return {
+                else:
+                    undated += 1
+    state = {
         "last_run_per_pass": dict(_LAST_RUN_PER_PASS),
+        "last_attempt_per_pass": dict(_LAST_ATTEMPT_PER_PASS),
         "drafts_pending": pending,
         "drafts_pending_oldest": oldest,
+        "drafts_pending_undated": undated,
+        "drafts_unreadable": unreadable,
         "afm_latency_p95": p95,
-        "status": "ok",
         "queue_depth": _WORK_QUEUE.qsize(),
     }
+    status, reasons = derive_loop_status(state, schedule=schedule, now=now)
+    state["status"] = status
+    state["status_reasons"] = reasons
+    return state
 
 
 def endorse_draft(vault_path: str, page_id: str, decision: str) -> dict:

@@ -285,12 +285,18 @@ def handle_health_report(params: dict, request_id: Any, context: HealthContext) 
         # to a count for any non-operator caller via _HEALTH_REPORT_SENSITIVE_KEYS.
         "recent_errors": context.recent_errors(),
         "faiss_cache_age_seconds": faiss_cache_age_seconds(context.default_config),
+        # Placeholder only: overwritten below by afm_writer.writer_status(), which
+        # derives `status` from the loop's own numbers. Until then the honest
+        # value for an enabled loop is "unknown", not "ok" — nothing has been
+        # inspected yet at this point.
         "afm_loop": {
             "last_run_per_pass": {},
+            "last_attempt_per_pass": {},
             "drafts_pending": 0,
             "drafts_pending_oldest": None,
             "afm_latency_p95": 0.0,
-            "status": "disabled" if not context.afm_loop_enabled(context.default_config) else "ok",
+            "status": "disabled" if not context.afm_loop_enabled(context.default_config) else "unknown",
+            "status_reasons": [],
         },
     }
 
@@ -299,7 +305,12 @@ def handle_health_report(params: dict, request_id: Any, context: HealthContext) 
         try:
             from minni.afm_writer import writer_status
 
-            report["afm_loop"] = writer_status(context.default_config.vault_path)
+            report["afm_loop"] = writer_status(
+                context.default_config.vault_path,
+                # The intervals status is judged against live in config, not in
+                # the writer; pass them rather than letting the writer guess.
+                schedule=getattr(context.default_config, "afm_loop_schedule", {}) or {},
+            )
             if not context.afm_loop_enabled(context.default_config):
                 report["afm_loop"]["status"] = "disabled"
         except Exception as exc:
