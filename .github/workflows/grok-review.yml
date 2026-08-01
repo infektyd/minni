@@ -247,7 +247,10 @@ jobs:
           # with --allow-approve solely to stamp eligibility for the check-run gate.
           EVENT=$(python3 "$PARSER" --event-only /tmp/grok-reply.md)
           NOTE=$(python3 "$PARSER" /tmp/grok-reply.md | cut -f2-)
-          RAW=$(python3 "$PARSER" --event-only --allow-approve /tmp/grok-reply.md)
+          # A default-branch parser predating this flag exits 2; treat that as
+          # "no eligibility" rather than failing the job. Withholding the stamp
+          # only ever keeps the mechanical gate red.
+          RAW=$(python3 "$PARSER" --event-only --allow-approve /tmp/grok-reply.md 2>/dev/null) || RAW=COMMENT
           if [ "$PARSER_TRUST" = head ] && [ "$EVENT" = REQUEST_CHANGES ]; then
             EVENT=COMMENT
             NOTE="head-parser fallback: REQUEST_CHANGES downgraded to COMMENT"
@@ -258,6 +261,11 @@ jobs:
             RAW=COMMENT
             NOTE="${NOTE}; head-parser: APPROVE eligibility suppressed"
           fi
+          # Defang any eligibility marker the model echoed out of the diff: the
+          # reply is pasted verbatim below, and only THIS script may stamp
+          # eligibility. Left visible so a planted marker is obvious to a human.
+          sed -i 's/grok-mechanical-eligibility/grok-mechanical-eligibility(quoted)/g' \
+            /tmp/grok-reply.md
           {
             echo "## Grok review"
             echo

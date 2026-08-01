@@ -30,8 +30,17 @@ Invariants (enforced in `.github/scripts/grok_approve_gate.py`):
 2. Empty required-context list → fail closed.
 3. Head SHA re-read before post; abort if moved.
 4. Gate script loaded from **default branch** only.
-5. Required contexts read from branch protection API (not hardcoded).
-6. PRs touching gate/trust paths stay red (path filter).
+5. Required contexts read from branch protection API (not hardcoded), with
+   `grok-mechanical-approve` itself excluded so the check is never its own
+   prerequisite.
+6. PRs touching **any** `.github/` path stay red (path filter) — a workflow
+   there can weaken a required check the gate trusts.
+7. Only `infektydgrokreviewer[bot]` may carry the eligibility marker
+   (`APP_BOT_LOGINS`). A `[bot]`-suffix test would be forgeable: any same-repo
+   PR can post a review as `github-actions[bot]` with `GITHUB_TOKEN`.
+8. The marker must be a line of its own. The review body embeds the model's
+   reply verbatim, so `grok-review.yml` also defangs any marker the model
+   echoed out of the diff before posting.
 
 Parser: `.github/scripts/parse_grok_verdict.py` — default path never emits
 Reviews `APPROVE`; `--allow-approve` is for gate/eligibility readers only.

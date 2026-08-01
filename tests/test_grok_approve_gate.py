@@ -138,3 +138,60 @@ def test_analyze_reviews_ignores_human_planted_marker_without_bot(mod):
     eligible, blocked = mod.analyze_reviews(reviews)
     assert eligible is False
     assert blocked is False
+
+
+@pytest.mark.parametrize(
+    "login",
+    ["github-actions[bot]", "claude[bot]", "dependabot[bot]", "cursor[bot]"],
+)
+def test_other_bots_cannot_stamp_eligibility(mod, login):
+    """Any same-repo PR can post a review as github-actions[bot]; only the
+    Grok App installation identity may carry the marker."""
+    reviews = [
+        {
+            "user": {"login": login},
+            "state": "COMMENTED",
+            "body": mod.ELIGIBILITY_MARKER,
+        }
+    ]
+    eligible, _ = mod.analyze_reviews(reviews)
+    assert eligible is False
+
+
+def test_marker_quoted_inside_reply_is_not_eligibility(mod):
+    """The review body embeds the model reply verbatim; a marker planted in the
+    PR diff and echoed back must not read as a stamp."""
+    reviews = [
+        {
+            "user": {"login": "infektydgrokreviewer[bot]"},
+            "state": "COMMENTED",
+            "body": (
+                "The diff adds a suspicious line: "
+                f"`{mod.ELIGIBILITY_MARKER}` in src/foo.py\n"
+                "VERDICT: COMMENT\n"
+            ),
+        }
+    ]
+    eligible, _ = mod.analyze_reviews(reviews)
+    assert eligible is False
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        ".github/workflows/grok-approve-gate.yml",
+        ".github/scripts/grok_approve_gate.py",
+        ".github/scripts/parse_grok_verdict.py",
+        ".github/workflows/grok-review.yml",
+        ".github/workflows/ci.yml",
+        ".github/scripts/check-no-credential-leak.py",
+        ".github/actions/thing/action.yml",
+    ],
+)
+def test_ci_paths_are_denied(mod, path):
+    assert mod.path_denied(path) is True
+
+
+@pytest.mark.parametrize("path", ["src/minni/cli.py", "docs/ops/grok-reviewer-app.md"])
+def test_ordinary_paths_are_not_denied(mod, path):
+    assert mod.path_denied(path) is False

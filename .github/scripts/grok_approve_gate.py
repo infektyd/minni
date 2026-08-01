@@ -33,15 +33,18 @@ from typing import Any
 
 CHECK_NAME = "grok-mechanical-approve"
 ELIGIBILITY_MARKER = "<!-- grok-mechanical-eligibility: APPROVE -->"
-APP_BOT_SUFFIX = "[bot]"
+
+# Exact logins whose reviews may carry eligibility. This is the Grok reviewer
+# App installation identity and nothing else. A suffix test like
+# login.endswith("[bot]") is NOT sufficient: any same-repo PR may add a
+# workflow that posts a review as github-actions[bot] with GITHUB_TOKEN, which
+# would let the PR stamp its own eligibility.
+APP_BOT_LOGINS = ("infektydgrokreviewer[bot]",)
 
 # Paths that must never get a green mechanical check from eligibility alone.
-PATH_DENY_PREFIXES = (
-    ".github/workflows/grok-approve-gate.yml",
-    ".github/scripts/grok_approve_gate.py",
-    ".github/scripts/parse_grok_verdict.py",
-    ".github/workflows/grok-review.yml",
-)
+# All of .github/ is denied, not just the four gate files: any workflow under
+# it can weaken a required check the gate trusts, or post as github-actions[bot].
+PATH_DENY_PREFIXES = (".github/",)
 
 
 @dataclass(frozen=True)
@@ -235,7 +238,17 @@ def fetch_combined_statuses(
 def _is_app_bot(login: str | None) -> bool:
     if not login:
         return False
-    return login.endswith(APP_BOT_SUFFIX) or "grokreviewer" in login.lower()
+    return login.lower() in {known.lower() for known in APP_BOT_LOGINS}
+
+
+def _has_marker(body: str | None) -> bool:
+    """Marker must be a line of its own, not a substring of quoted text.
+
+    The review body embeds the model's reply verbatim, so a plain `in` test
+    would let a PR that plants the marker string in its own diff get it echoed
+    back by the reviewer and read as eligibility.
+    """
+    return any(line.strip() == ELIGIBILITY_MARKER for line in (body or "").splitlines())
 
 
 def analyze_reviews(reviews: list[dict[str, Any]]) -> tuple[bool, bool]:
@@ -264,8 +277,7 @@ def analyze_reviews(reviews: list[dict[str, Any]]) -> tuple[bool, bool]:
         if state == "CHANGES_REQUESTED":
             eligible = False
             break
-        body = rev.get("body") or ""
-        if ELIGIBILITY_MARKER in body:
+        if _has_marker(rev.get("body")):
             eligible = True
             break
     return eligible, blocked
@@ -274,14 +286,17 @@ def analyze_reviews(reviews: list[dict[str, Any]]) -> tuple[bool, bool]:
 def fetch_pr_files_denied(owner: str, repo: str, pr: int, token: str) -> bool:
     url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr}/files?per_page=100"
     files = _paginate(url, token)
-    for f in files:
-        path = f.get("filename") or ""
-        for prefix in PATH_DENY_PREFIXES:
-            if path == prefix or path.startswith(prefix.rstrip("/") + "/"):
+    return any(path_denied(f.get("filename") or "") for f in files)
+
+
+def path_denied(path: str) -> bool:
+    """True if `path` is a gate/trust path (exact file or directory prefix)."""
+    for prefix in PATH_DENY_PREFIXES:
+        if prefix.endswith("/"):
+            if path.startswith(prefix):
                 return True
-            # exact file match already covered by ==
-            if path == prefix:
-                return True
+        elif path == prefix:
+            return True
     return False
 
 
