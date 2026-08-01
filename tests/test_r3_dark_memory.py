@@ -285,3 +285,203 @@ def test_expiry_ignores_expires_at_written_in_the_body(tmp_path):
 
     assert _expire_stale_drafts(vault, now=now) == 0
     assert "status: draft" in (vault / written["path"]).read_text(encoding="utf-8")
+
+
+# ── Round 2: findings from the Grok review of #256 ─────────────────────────
+
+
+def test_unendorsed_pages_are_indexed_but_not_embedded(tmp_path, monkeypatch):
+    """Grok #2. retrieve() drops draft/expired only AFTER FAISS has filled a
+    fixed limit*5 candidate window, so embedding a vault that is ~95% drafts
+    lets them evict accepted pages and shrink recall. Drafts must stay indexed
+    and lexically findable, but must not consume vector slots."""
+    from minni.afm_writer import _write_one
+    from minni.index_all import index_shared_vault
+
+    _install_fake_embedder(monkeypatch)
+    cfg = _make_cfg(tmp_path)
+    vault = Path(cfg.vault_path)
+
+    draft_page = vault / _write_one(vault, _draft(page_id="page-draft0"))["path"]
+    accepted = vault / "wiki" / "concepts" / "accepted.md"
+    accepted.parent.mkdir(parents=True, exist_ok=True)
+    accepted.write_text(
+        "---\ntitle: Accepted\nstatus: accepted\nagent: afm-loop\nprivacy: safe\n---\n\n"
+        + "accepted body text " * 40,
+        encoding="utf-8",
+    )
+
+    index_shared_vault(cfg)
+
+    conn = sqlite3.connect(cfg.db_path)
+    try:
+        def chunks_for(p):
+            return conn.execute(
+                "SELECT COUNT(*) FROM chunk_embeddings ce JOIN documents d"
+                " ON d.doc_id = ce.doc_id WHERE d.path = ?",
+                (str(Path(p).resolve()),),
+            ).fetchone()[0]
+
+        indexed = _indexed_paths(cfg.db_path)
+        # Indexed (coverage gate still met) ...
+        assert str(draft_page.resolve()) in indexed
+        assert str(accepted.resolve()) in indexed
+        # ... but only the accepted page consumes vector slots.
+        assert chunks_for(draft_page) == 0
+        assert chunks_for(accepted) > 0
+    finally:
+        conn.close()
+
+
+def test_endorsing_a_draft_makes_it_embeddable_on_the_next_sweep(tmp_path, monkeypatch):
+    """The skip must be self-healing, not a permanent exclusion."""
+    from minni.afm_writer import _write_one
+    from minni.index_all import index_shared_vault
+
+    _install_fake_embedder(monkeypatch)
+    cfg = _make_cfg(tmp_path)
+    vault = Path(cfg.vault_path)
+    page = vault / _write_one(vault, _draft())["path"]
+    index_shared_vault(cfg)
+
+    conn = sqlite3.connect(cfg.db_path)
+    try:
+        def chunks():
+            return conn.execute(
+                "SELECT COUNT(*) FROM chunk_embeddings ce JOIN documents d"
+                " ON d.doc_id = ce.doc_id WHERE d.path = ?",
+                (str(page.resolve()),),
+            ).fetchone()[0]
+
+        assert chunks() == 0
+        page.write_text(
+            page.read_text(encoding="utf-8").replace("status: draft", "status: accepted", 1),
+            encoding="utf-8",
+        )
+        os.utime(page, (time.time() + 10, time.time() + 10))
+        index_shared_vault(cfg)
+        assert chunks() > 0
+    finally:
+        conn.close()
+
+
+def test_sweep_invalidates_the_live_engine_faiss(tmp_path, monkeypatch):
+    """Grok #1. index_shared_vault writes through its own throwaway DB+indexer,
+    so its FAISS rebuild lands on a throwaway instance. A warm daemon engine
+    short-circuits _ensure_faiss_loaded while count > 0 and would keep serving
+    a stale index until restart."""
+    import minni.minnid as minnid
+    from minni.afm_writer import _write_one
+
+    _install_fake_embedder(monkeypatch)
+    cfg = _make_cfg(tmp_path)
+    monkeypatch.setattr(minnid, "DEFAULT_CONFIG", cfg)
+
+    class _WarmEngine:
+        def __init__(self):
+            self.faiss_index = self
+
+        count = 5
+        invalidated = False
+
+        def invalidate(self):
+            type(self).invalidated = True
+
+    engine = _WarmEngine()
+    monkeypatch.setattr(minnid, "_retrieval", engine)
+
+    _write_one(Path(cfg.vault_path), _draft())
+    minnid._vault_watch_sweep_once()
+
+    assert _WarmEngine.invalidated, "live engine FAISS was never invalidated"
+
+
+def test_sweep_does_not_construct_a_retrieval_engine_when_cold(tmp_path, monkeypatch):
+    """Invalidation must not drag model loading onto the sweep thread."""
+    import minni.minnid as minnid
+    from minni.afm_writer import _write_one
+
+    _install_fake_embedder(monkeypatch)
+    cfg = _make_cfg(tmp_path)
+    monkeypatch.setattr(minnid, "DEFAULT_CONFIG", cfg)
+    monkeypatch.setattr(minnid, "_retrieval", None)
+
+    def _boom():
+        raise AssertionError("_lazy_retrieval() must not be called by the sweep")
+
+    monkeypatch.setattr(minnid, "_lazy_retrieval", _boom)
+
+    _write_one(Path(cfg.vault_path), _draft())
+    minnid._vault_watch_sweep_once()  # must not raise
+
+
+def test_sweep_expires_drafts_on_a_schedule(tmp_path, monkeypatch):
+    """Grok #3. Expiry otherwise runs only inside _write_batch, which the AFM
+    loop invokes only when a pass produced drafts — so a healthy but quiet loop
+    never expires anything. The clock, not new work, must drive it."""
+    import minni.minnid as minnid
+    from minni.afm_writer import DRAFT_TTL_SECONDS, _write_one
+
+    _install_fake_embedder(monkeypatch)
+    cfg = _make_cfg(tmp_path)
+    monkeypatch.setattr(minnid, "DEFAULT_CONFIG", cfg)
+
+    vault = Path(cfg.vault_path)
+    page = vault / _write_one(
+        vault, _draft(), now=time.time() - DRAFT_TTL_SECONDS - 86400
+    )["path"]
+    assert "status: draft" in page.read_text(encoding="utf-8")
+
+    minnid._vault_watch_sweep_once()
+
+    assert "status: expired" in page.read_text(encoding="utf-8")
+
+
+def test_body_prose_cannot_drag_a_page_into_the_expiry_path(tmp_path):
+    """Grok #4. The expires_at read was frontmatter-scoped but the status/agent
+    entry gate was not, so a non-AFM page whose BODY quoted both lines entered
+    the expiry path — and the rewrite then edited that body text."""
+    from minni.afm_writer import _expire_stale_drafts
+
+    vault = tmp_path / "vault"
+    page = vault / "wiki" / "notes" / "quoting.md"
+    page.parent.mkdir(parents=True, exist_ok=True)
+    # An ACCEPTED, human-authored page. Its own expires_at is long past, so the
+    # only thing standing between it and a rewrite is the status/agent gate --
+    # which the body satisfies by quoting the AFM format. Under the whole-file
+    # gate this page entered the expiry path and the substitution landed on the
+    # quoted body line, silently corrupting the documentation it contains.
+    original = (
+        "---\n"
+        "title: Notes on the AFM frontmatter format\n"
+        "status: accepted\n"
+        "agent: human\n"
+        "expires_at: '2020-01-01T00:00:00Z'\n"
+        "---\n\n"
+        "AFM drafts look like this:\n\n"
+        "status: draft\n"
+        "agent: afm-loop\n"
+    )
+    page.write_text(original, encoding="utf-8")
+
+    assert _expire_stale_drafts(vault, now=time.time()) == 0
+    assert page.read_text(encoding="utf-8") == original
+
+
+def test_expiry_rewrite_lands_in_frontmatter_not_body(tmp_path):
+    """A real expiring draft whose body also contains the status line: only the
+    frontmatter occurrence may be rewritten."""
+    from minni.afm_writer import DRAFT_TTL_SECONDS, _expire_stale_drafts, _write_one
+
+    vault = tmp_path / "vault"
+    now = time.time()
+    draft = _draft()
+    draft["body"] = "Some prose that mentions status: draft in passing.\n"
+    page = vault / _write_one(vault, draft, now=now - DRAFT_TTL_SECONDS - 86400)["path"]
+
+    assert _expire_stale_drafts(vault, now=now) == 1
+    text = page.read_text(encoding="utf-8")
+    from minni.afm_writer import _extract_frontmatter
+
+    assert "status: expired" in _extract_frontmatter(text)
+    assert "mentions status: draft in passing" in text

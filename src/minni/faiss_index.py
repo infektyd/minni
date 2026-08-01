@@ -309,6 +309,21 @@ class FAISSIndex:
                 self._reverse_map = {}
                 self._index = None
 
+    def invalidate(self) -> None:
+        """Drop the in-memory index so the next search reloads it from the DB.
+
+        Not a delete: ``chunk_embeddings`` is untouched. Clearing the in-memory
+        state takes ``count`` to 0, which is the condition
+        ``RetrievalEngine._ensure_faiss_loaded`` uses to decide to rebuild — so
+        an out-of-process writer that added chunk rows can make a warm engine
+        pick them up without a restart.
+        """
+        self._chunk_ids = []
+        self._vectors = []
+        self._id_map = {}
+        self._reverse_map = {}
+        self._index = None
+
     def get_stats(self) -> Dict:
         """Return index statistics."""
         return {

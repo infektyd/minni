@@ -1018,17 +1018,9 @@ class RetrievalEngine:
                 "so next search reloads from DB", exc,
             )
             # Force a cold reload on the next search so the new DB rows are
-            # picked up even if the in-place add path failed. Clearing the
-            # in-memory state drops count to 0, which makes the next search's
-            # _ensure_faiss_loaded rebuild the full set from chunk_embeddings
-            # (now including these rows).
+            # picked up even if the in-place add path failed.
             try:
-                fi = self.faiss_index
-                fi._chunk_ids = []
-                fi._vectors = []
-                fi._id_map = {}
-                fi._reverse_map = {}
-                fi._index = None
+                self.faiss_index.invalidate()
             except Exception:
                 pass
 

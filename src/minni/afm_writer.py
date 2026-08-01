@@ -44,6 +44,11 @@ DRAFTS_PENDING_BACKLOG = 200
 # `draft_ttl_days` default derive_loop_status judges backlog age against.
 DRAFT_TTL_SECONDS = 14 * 86400
 
+# Frontmatter-anchored gates for the expiry sweep. Line-anchored so only a
+# page's own YAML keys can satisfy them, never body prose quoting the same text.
+_FM_DRAFT_STATUS = re.compile(r"^status:\s*['\"]?draft['\"]?\s*$", re.MULTILINE)
+_FM_AFM_AGENT = re.compile(r"^agent:\s*['\"]?afm-loop['\"]?\s*$", re.MULTILINE)
+
 
 def record_pass_attempt(pass_name: str, now: Optional[float] = None) -> None:
     """Record that ``pass_name`` completed a wet run (drafts or not)."""
@@ -373,17 +378,23 @@ def _expire_stale_drafts(vault: Path, now: Optional[float] = None) -> int:
             text = path.read_text(encoding="utf-8")
         except Exception:
             continue
-        if "status: draft" not in text or "agent: afm-loop" not in text:
+        # EVERY decision below reads the frontmatter block only. Body prose is
+        # free-form and can contain any of these lines verbatim (a page quoting
+        # another page's frontmatter is the ordinary case); letting it satisfy
+        # the entry gate would drag non-AFM pages into the expiry path, and the
+        # rewrite below would then edit that prose instead of the real status.
+        frontmatter = _extract_frontmatter(text)
+        if not _FM_DRAFT_STATUS.search(frontmatter):
             continue
-        # Read expires_at out of the frontmatter block only, and tolerate the
-        # quotes yaml.safe_dump puts on it (`expires_at: '2026-06-22T…Z'`). The
-        # old unquoted-only pattern matched nothing a writer had ever produced,
-        # so on the live vault this expired zero of 1,213 drafts, the oldest of
-        # them months past TTL. Anchored per-line so body prose quoting the
-        # field name cannot stand in for the page's own value.
+        if not _FM_AFM_AGENT.search(frontmatter):
+            continue
+        # Tolerate the quotes yaml.safe_dump puts on the value
+        # (`expires_at: '2026-06-22T…Z'`). The old unquoted-only pattern matched
+        # nothing a writer had ever produced, so on the live vault this expired
+        # zero of 1,213 drafts, the oldest of them months past TTL.
         match = re.search(
             r"^expires_at:\s*['\"]?([0-9T:.Z-]+)",
-            _extract_frontmatter(text),
+            frontmatter,
             re.MULTILINE,
         )
         if not match:
@@ -395,7 +406,11 @@ def _expire_stale_drafts(vault: Path, now: Optional[float] = None) -> int:
         if expires is None:
             continue
         if expires < now:
-            path.write_text(text.replace("status: draft", "status: expired", 1), encoding="utf-8")
+            # Rewrite inside the frontmatter slice and splice it back, so the
+            # substitution can never land on body text that merely looks like
+            # frontmatter.
+            rewritten = _FM_DRAFT_STATUS.sub("status: expired", frontmatter, count=1)
+            path.write_text(rewritten + text[len(frontmatter):], encoding="utf-8")
             expired += 1
     return expired
 

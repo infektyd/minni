@@ -1032,6 +1032,43 @@ def _vault_watch_interval() -> int:
     return max(60, raw)
 
 
+def _expire_shared_vault_drafts() -> int:
+    """Expire drafts past their TTL in the shared vault. Returns the count.
+
+    Expiry otherwise runs ONLY inside afm_writer._write_batch, and the AFM loop
+    submits a batch only when a pass actually produced drafts — so a loop that
+    is healthy but quiet never expires anything, and a backlog can sit past TTL
+    indefinitely. Driving it from the sweep makes expiry depend on the clock
+    rather than on new work arriving.
+    """
+    from minni.afm_writer import _expire_stale_drafts
+
+    return _expire_stale_drafts(Path(DEFAULT_CONFIG.vault_path).expanduser())
+
+
+def _invalidate_shared_faiss() -> None:
+    """Make chunks the sweep just wrote visible to the live engine's semantic leg.
+
+    index_shared_vault writes through its OWN short-lived SovereignDB and
+    VaultIndexer, so its FAISS rebuild lands on a throwaway instance. The
+    daemon's process-wide RetrievalEngine keeps the in-memory index it built at
+    startup, and _ensure_faiss_loaded returns early while count > 0 — so new
+    chunks stayed invisible to semantic recall until restart even though FTS
+    could see them. Invalidating forces the next search to rebuild from the DB.
+
+    Deliberately does NOT call _lazy_retrieval(): if the engine has not been
+    constructed yet there is nothing stale to fix, and constructing one here
+    would drag model loading onto the sweep thread.
+    """
+    if _retrieval is None:
+        return
+    try:
+        _retrieval.faiss_index.invalidate()
+        logger.info("Vault watch: invalidated live FAISS; next search rebuilds from DB")
+    except Exception:
+        logger.exception("Vault watch: FAISS invalidation failed")
+
+
 def _vault_watch_sweep_once() -> dict:
     """Blocking incremental ingest of every discovered vault. Runs off-loop."""
     from minni.index_all import index_agent_vaults, index_shared_vault
@@ -1041,8 +1078,23 @@ def _vault_watch_sweep_once() -> dict:
     # the per-agent vaults (see discover_agent_vaults), so without this it was
     # indexed by nothing on a running daemon. Isolated: a failure here must not
     # cost the agent-vault results already in hand.
+    #
+    # Expire BEFORE indexing so a page that crosses its TTL this tick is indexed
+    # with the status it now has, instead of going in as a draft and waiting a
+    # whole interval to be corrected.
     try:
-        stats.update(index_shared_vault(DEFAULT_CONFIG))
+        expired = _expire_shared_vault_drafts()
+        if expired:
+            logger.info("Vault watch: expired %s draft(s) past TTL", expired)
+    except Exception:
+        logger.exception("Vault watch: draft expiry failed")
+    try:
+        shared = index_shared_vault(DEFAULT_CONFIG)
+        stats.update(shared)
+        for s in shared.values():
+            if isinstance(s, dict) and ((s.get("indexed") or 0) or (s.get("pruned") or 0)):
+                _invalidate_shared_faiss()
+                break
     except Exception:
         logger.exception("Vault watch: shared vault sweep failed")
     return stats

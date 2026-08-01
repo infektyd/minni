@@ -27,6 +27,11 @@ from minni.timestamps import parse_epoch_or_report
 
 logger = logging.getLogger("sovereign.indexer")
 
+# Lifecycle states that are indexed and lexically searchable but deliberately
+# NOT embedded — retrieve() filters them out downstream of the FAISS window, so
+# embedding them costs accepted pages their candidate slots. See index_vault.
+UNEMBEDDED_STATUSES = frozenset({"draft", "expired"})
+
 
 class VaultIndexer:
     """Index Obsidian vault with markdown-aware chunking and FAISS indexing."""
@@ -275,8 +280,20 @@ class VaultIndexer:
                         (doc_id, path, content, meta["agent"], meta["sigil"]),
                     )
 
-                    # Markdown-aware chunk embeddings
-                    if self.model:
+                    # Markdown-aware chunk embeddings.
+                    #
+                    # Unendorsed pages get a document row and an FTS row but NO
+                    # embedding. _semantic_search asks FAISS for a fixed
+                    # limit*5 window and retrieve() drops draft/expired only
+                    # AFTER that window is filled, so embedding a vault that is
+                    # ~95% unendorsed drafts lets them evict accepted pages
+                    # from the candidate set and silently shrink recall. They
+                    # stay lexically findable, and endorsing one rewrites the
+                    # page — the next sweep sees the new mtime and embeds it.
+                    unendorsed = (
+                        meta.get("page_status", "candidate") in UNEMBEDDED_STATUSES
+                    )
+                    if self.model and not unendorsed:
                         chunks = self.chunker.chunk_document(content)
                         for chunk in chunks:
                             emb = self.model.encode(chunk.text)
