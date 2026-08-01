@@ -489,3 +489,46 @@ def test_all_three_vault_slug_maps_agree():
         "vault slug map mirrors have drifted from "
         f"inbox_ingest._VAULT_SLUG_TO_AGENT_ID: {drifted}"
     )
+
+
+def test_default_agent_vault_matches_agent_vault_dirs():
+    """agent_id -> vault PATH must agree with the declared vault dir.
+
+    The slug maps cover vault dir -> agent_id. `default_agent_vault` is the
+    INVERSE, and it is what personal recall and handoff resolution use. It
+    slugifies unknown ids by stripping non-alphanumerics, so a hyphenated id
+    that is not in its alias table resolves to a vault that does not exist --
+    `claude-science` silently became `claudescience-vault` while ingest, which
+    is path-based, indexed the real directory. The failure is quiet on both
+    sides: ingest works, recall just never finds anything.
+    """
+    import subprocess
+
+    # Run against THIS tree's src: `minni` is installed editable, so a plain
+    # import resolves to whatever checkout the install points at -- the main
+    # one, not this worktree. Same hazard as the slug-agreement test above.
+    root = Path(__file__).resolve().parents[1]
+    probe = (
+        "import json;"
+        "from minni.minnid_runtime.handoff import default_agent_vault;"
+        "from minni.tools.author_principals import AGENT_VAULT_DIRS;"
+        "print(json.dumps({a: [d, default_agent_vault(a).name]"
+        " for a, d in AGENT_VAULT_DIRS.items()}))"
+    )
+    env = {**os.environ, "PYTHONPATH": str(root / "src")}
+    out = subprocess.run(
+        [sys.executable, "-c", probe],
+        capture_output=True, text=True, env=env, cwd=str(root), check=True,
+    ).stdout
+    resolved_by_agent = json.loads(out)
+
+    mismatched = {
+        agent_id: {"expected": declared, "resolved": resolved}
+        for agent_id, (declared, resolved) in resolved_by_agent.items()
+        if declared != resolved
+    }
+
+    assert not mismatched, (
+        "default_agent_vault disagrees with AGENT_VAULT_DIRS -- personal recall "
+        f"and handoffs will miss these vaults: {mismatched}"
+    )
