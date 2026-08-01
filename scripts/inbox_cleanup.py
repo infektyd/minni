@@ -122,7 +122,9 @@ TERMINAL_STATUSES = frozenset(
 # see the module docstring's "Standalone script" section).
 _VAULT_SLUG_TO_AGENT_ID: Dict[str, str] = {
     "claudecode": "claude-code",
+    "claude-science": "claude-science",
     "codex": "codex",
+    "cursor": "cursor",
     "gemini": "gemini",
     "hermes": "hermes",
     "kilocode": "kilocode",
