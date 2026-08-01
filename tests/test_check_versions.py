@@ -97,29 +97,49 @@ def test_deployed_layer_fails_on_a_stale_deployment(tmp_path):
     assert "0.3.0" in (proc.stdout + proc.stderr)
 
 
-def test_deployed_layer_passes_when_the_deployment_agrees(tmp_path):
+def _canonical() -> str:
     import re
 
-    canonical = re.search(
+    return re.search(
         r'^version\s*=\s*["\']([^"\']+)["\']',
         (REPO / "pyproject.toml").read_text(encoding="utf-8"),
         re.M,
     ).group(1)
+
+
+def test_deployed_layer_passes_when_the_deployment_agrees(tmp_path):
+    canonical = _canonical()
     home = _fake_home_with_deployment(tmp_path, canonical)
     # Only the deployed layer is under test here. The installed layer reads
     # whatever `minni` version happens to be on this interpreter's sys.path,
     # which this repo's own dev install may or may not match at any given
-    # moment -- a real disagreement there must fail the *installed*-layer test,
-    # not this one, so it is stubbed out rather than left to the ambient
-    # environment.
+    # moment -- a real disagreement there must fail the *installed*-layer test
+    # (see test_installed_layer_fails_on_a_mismatch below), not this one. The
+    # override holds the installed layer at a known-agreeing value rather than
+    # skipping its inspection, so this run still genuinely checks all three
+    # layers -- it is just no longer at the mercy of the ambient environment.
     proc = _run(
         env_extra={
             "MINNI_CHECK_VERSIONS_HOME": str(home),
-            "_MINNI_CHECK_VERSIONS_SKIP_INSTALLED": "1",
+            "MINNI_CHECK_VERSIONS_INSTALLED_OVERRIDE": canonical,
         }
     )
     assert proc.returncode == 0, proc.stderr or proc.stdout
     assert "(agrees)" in proc.stdout
+
+
+def test_installed_layer_fails_on_a_mismatch(tmp_path):
+    canonical = _canonical()
+    home = _fake_home_with_deployment(tmp_path, canonical)
+    proc = _run(
+        env_extra={
+            "MINNI_CHECK_VERSIONS_HOME": str(home),
+            "MINNI_CHECK_VERSIONS_INSTALLED_OVERRIDE": "0.2.0",
+        }
+    )
+    assert proc.returncode == 1, proc.stdout
+    assert "installed:" in (proc.stdout + proc.stderr)
+    assert "0.2.0" in (proc.stdout + proc.stderr)
 
 
 def test_manifestless_deployment_is_uninspectable_not_clean(tmp_path):
@@ -148,11 +168,13 @@ def test_no_deployments_is_reported_but_not_a_failure(tmp_path):
     home.mkdir()
     # Same reasoning as test_deployed_layer_passes_when_the_deployment_agrees:
     # this test is about the deployed layer being empty, not about whatever
-    # `minni` version is installed in the interpreter running the suite.
+    # `minni` version is installed in the interpreter running the suite, so
+    # the installed layer is held at a known-agreeing value rather than left
+    # to the ambient environment.
     proc = _run(
         env_extra={
             "MINNI_CHECK_VERSIONS_HOME": str(home),
-            "_MINNI_CHECK_VERSIONS_SKIP_INSTALLED": "1",
+            "MINNI_CHECK_VERSIONS_INSTALLED_OVERRIDE": _canonical(),
         }
     )
     assert proc.returncode == 0, proc.stderr or proc.stdout

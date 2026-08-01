@@ -177,12 +177,31 @@ def check_repo(canonical: str) -> list[str]:
     return mismatches
 
 
+def _installed_version() -> str:
+    """The 'minni' distribution's pip-reported version.
+
+    Test-only override: MINNI_CHECK_VERSIONS_INSTALLED_OVERRIDE stands in for
+    the real pip metadata lookup, the same way MARKETPLACE/PROPAGATE are
+    overridable. This exists so tests exercising the *deployed* layer's
+    pass/fail behavior can hold the installed layer at a known value instead
+    of being coupled to whatever `minni` version happens to be on the test
+    interpreter's sys.path -- and so the installed layer's own mismatch/agree
+    logic has direct test coverage rather than none at all.
+    """
+    override = os.environ.get("MINNI_CHECK_VERSIONS_INSTALLED_OVERRIDE")
+    if override is not None:
+        return override
+    import importlib.metadata as md
+
+    return md.version("minni")
+
+
 def check_installed(canonical: str) -> tuple[list[str], list[str]]:
     """(mismatches, notes). An unreadable distribution is a mismatch, not a note."""
     import importlib.metadata as md
 
     try:
-        installed = md.version("minni")
+        installed = _installed_version()
     except md.PackageNotFoundError:
         return [], ["installed: minni is not installed in this interpreter (nothing to drift)"]
     except Exception as exc:
@@ -256,19 +275,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.repo_only:
         notes.append("installed/deployed layers skipped (--repo-only)")
     else:
-        # Test-only escape hatch, not a CLI flag: it exists so tests targeting
-        # the *deployed* layer's pass/fail behavior are not coupled to whatever
-        # `minni` version happens to be installed in the interpreter running
-        # the suite. A real mismatch there must fail the installed-layer tests,
-        # not an unrelated deployed-layer test picked at random by dev-install
-        # drift. Never set in normal use -- the real CLI always inspects all
-        # three layers.
-        if os.environ.get("_MINNI_CHECK_VERSIONS_SKIP_INSTALLED"):
-            installed_found, installed_notes = [], ["installed: skipped (test isolation)"]
-        else:
-            installed_found, installed_notes = check_installed(canonical)
-        deployed_found, deployed_notes = check_deployed(canonical)
-        for found, extra in ((installed_found, installed_notes), (deployed_found, deployed_notes)):
+        for found, extra in (check_installed(canonical), check_deployed(canonical)):
             mismatches.extend(found)
             notes.extend(extra)
 
