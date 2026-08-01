@@ -197,14 +197,59 @@ easier, as the SDK's modern path accumulates field use.
 
 ## Q2 — Is there any compatible change to land today?
 
-**Decision: no dependency change. There is nothing to bump.**
+**Decision: no. There is no safe forward-compatible change available, and in
+particular there is nothing to bump.**
 
-Worth recording explicitly, because "bump the SDK" is the reflexive answer and it
-is wrong here: `@modelcontextprotocol/sdk@1.30.0` **is** the latest v1, and
-`2.0.0` is a different package family, not a newer version of the same one.
-`npm update` will not find it and should not. There is no intermediate release
-that adds `2026-07-28` to the v1 line, and given the package split, there will
-not be one.
+This section is written to be self-contained. A future session should be able to
+read it alone, confirm the conclusion still holds in about two minutes, and not
+re-derive any of it from scratch. The conclusion rests on three independent
+pillars, each of which would have to change before the answer changes.
+
+**Pillar 1 — the host cannot speak the protocol.** Claude Code `2.1.220` (binary
+dated 2026-07-24, four days before the spec) contains exactly five MCP
+protocol-version literals:
+
+```
+2024-10-07  2024-11-05  2025-03-26  2025-06-18  2025-11-25
+```
+
+`2026-07-28` is absent. Reproduce with:
+
+```sh
+grep -aoE '"20(2[4-9])-[0-9]{2}-[0-9]{2}"' \
+  ~/.local/share/claude/versions/<version> | sort -u
+```
+
+Ignore `2026-03-05` and `2026-07-25` if they appear — neither is an MCP spec
+revision; no revision bears either date.
+
+**Pillar 2 — Minni is already on the newest v1.** `package.json` pins
+`@modelcontextprotocol/sdk@^1.30.0`; the lockfile resolves `1.30.0`; `npm view
+@modelcontextprotocol/sdk dist-tags` reports `latest: 1.30.0` with no `next` or
+`beta` channel. The installed package declares `LATEST_PROTOCOL_VERSION =
+'2025-11-25'` and contains the string `2026-07-28` in no file. There is no
+higher v1 to move to.
+
+**Pillar 3 — support is a package migration, not a version bump.** This is the
+pillar most likely to be forgotten, because "bump the SDK" is the reflexive
+answer and it is wrong here. `2026-07-28` support lives in a *different package
+family* — `@modelcontextprotocol/{core,server,client}@2.0.0` — published
+2026-07-27T23:55Z. `npm update` will not find it and should not. There is no
+intermediate v1 release that adds `2026-07-28`, and given the package split
+there will not be one.
+
+**What this rules out.** Not just the dependency bump: any change that would
+only pay off under `2026-07-28` (cache hints, MRTR gating, `server/discover`
+handling) is unreachable code today, because no client on this machine can
+exercise it. The one spec-aligned property that *is* satisfiable today —
+deterministic `tools/list` ordering — is already satisfied by static
+single-module registration and needs no change.
+
+**What would change the answer.** Any one of: the host bundle gaining a
+`2026-07-28` literal (pillar 1), the v1 line gaining `2026-07-28` in
+`SUPPORTED_PROTOCOL_VERSIONS` (pillar 2 — the tripwire watches this), or a
+decision to accept SDK v2's legacy shim for its own sake (pillar 3 — rejected in
+Q1, and the reasoning there should be re-read rather than re-litigated).
 
 ## Q3 — What *does* land in this change?
 
@@ -264,13 +309,39 @@ Minni advertises 48 tools with full Zod-derived schemas — a large, near-static
 `cacheScope: 'private'`) are deliberately conservative: valid, but they disable
 caching entirely.
 
-Minni's tool list changes only when the plugin binary changes, which makes a
-generous `ttlMs` safe and genuinely useful. `cacheScope` should stay `'private'`:
-the list is identical across users, but Minni's server is per-agent and
-locally-scoped, and there is no shared intermediary in a stdio deployment that
-`'public'` would benefit. The spec also notes deterministic tool ordering
-improves LLM prompt-cache hit rates — Minni already orders deterministically, so
-that benefit is available for free.
+**What bounds the number.** Under stdio the tool list *cannot* change during a
+connection: Minni emits no `listChanged`, and the set is fixed at module load.
+So the naive answer is "cache forever". The reason not to is the upgrade path —
+a client that cached the list for a day and then saw the plugin upgraded
+underneath it would dispatch against a stale surface, and the failure would look
+like a missing or phantom tool rather than a stale cache. The right `ttlMs` is
+therefore not "as long as possible" but "comfortably longer than a session,
+comfortably shorter than the gap between deploys".
+
+**Concrete recommendation, per list surface.** Declare these when the migration
+lands (values in milliseconds):
+
+| Surface | `ttlMs` | `cacheScope` | Reasoning |
+| --- | --- | --- | --- |
+| `tools/list` | `3_600_000` (1h) | `private` | The only surface Minni actually serves — 48 tools with full Zod schemas, fixed for the process lifetime. One hour eliminates virtually all in-session re-fetches while bounding post-upgrade staleness to something a restart clears. |
+| `prompts/list` | `0` | `private` | Minni registers no prompts. Keep the conservative default rather than declaring a TTL for an empty surface; revisit only if prompts are ever added. |
+| `resources/list` | `0` | `private` | Minni registers no resources. Same reasoning. |
+| `resources/templates/list` | `0` | `private` | Same. |
+| `resources/read` | `0` | `private` | Not served today. If resources are ever added they will be vault-backed and mutable, where a non-zero TTL would serve stale memory — the one place caching is actively wrong for Minni. |
+
+**Why `private` everywhere, including `tools/list`.** The tool list is byte-identical
+across users, which superficially argues for `'public'`. It should still be
+`'private'`: `'public'` only buys anything when a shared intermediary sits in the
+request path, and a stdio deployment has none — the client speaks to a
+subprocess it launched. `'public'` would add cache-sharing semantics with no
+beneficiary, and would become actively wrong the moment any Minni surface is
+served over HTTP with per-agent vault scoping.
+
+**Free adjacent win.** The spec notes deterministic `tools/list` ordering
+improves LLM prompt-cache hit rates. Minni already orders deterministically
+(static top-to-bottom registration in one module), so this benefit arrives with
+the migration at no cost — provided nothing refactors registration into a
+`Map`/glob iteration in the meantime.
 
 ### 3. Tasks extension for AFM and handoff
 
@@ -313,6 +384,70 @@ requires no deprecation-driven work on any timeline.
 5. **Unscheduled** — tasks extension (opportunity 3), pending the extension
    settling post-redesign.
 
+## Execution trigger — when to actually do step 2
+
+Being ready is only useful if the READY state is actionable. This section is the
+executable form of step 2: the observable signal that fires it, and the shape of
+the diff it produces.
+
+### The signal
+
+**Primary (necessary and sufficient): the host negotiates `2026-07-28`.** Check
+by re-running the pillar-1 command from Q2 against the *current* Claude Code
+build:
+
+```sh
+grep -aoE '"20(2[4-9])-[0-9]{2}-[0-9]{2}"' \
+  ~/.local/share/claude/versions/<version> | sort -u
+```
+
+Migrate when `2026-07-28` appears in that output. Until it does, migrating buys
+nothing that any client can reach.
+
+**Secondary (necessary, not sufficient): an SDK that implements it.** Already
+true — `@modelcontextprotocol/server@2.0.0` is published. Re-confirm it is still
+the intended path rather than a superseded beta line before starting.
+
+**Explicitly NOT the signal: the tripwire failing.** Stated again here because
+it is the easiest mistake to make from this document. The tripwire reads the
+installed SDK's constants and greps `server.ts`; it never inspects the host. It
+will stay green through a host upgrade that adds `2026-07-28`, and it will go
+red on an SDK change while the host is still on `2025-11-25`. It is a
+change-detector for *our* dependencies, not a readiness detector for the
+ecosystem.
+
+### The diff shape
+
+Small and almost entirely mechanical. Estimated at four edits:
+
+1. **Two import lines** — `server.ts:6-7`, from
+   `@modelcontextprotocol/sdk/server/{mcp,stdio}.js` to
+   `@modelcontextprotocol/server`.
+2. **One entry point** — `server.ts:1712-1713`, replacing
+   `server.connect(new StdioServerTransport())` with
+   `serveStdio(() => buildServer())`. This requires wrapping the current
+   module-scope `server` construction (`server.ts:158`) in a factory, which is
+   the only structural change in the migration and the only part that is not a
+   find-and-replace.
+3. **`cacheHints`** — per the table in opportunity 2. Optional at migration
+   time; without it the SDK's `ttlMs: 0` defaults apply and behaviour is correct
+   but uncached.
+4. **The tripwire** — `plugins/minni/tests/mcp-protocol-version.test.mjs`, rewritten
+   to lock the *new* protocol facts. Update it; do not delete it. Its four
+   assertions are the record of what Minni deliberately speaks.
+
+`package.json` also swaps one dependency for one to three (`@modelcontextprotocol/server`,
+plus `core`/`client` only if directly imported).
+
+### Acceptance check
+
+The migration is done when all 48 tools (37 canonical + 11 aliases) still appear
+in `tools/list` and dispatch correctly, `npm run test` is green, and the tripwire
+asserts the new protocol version rather than `2025-11-25`. Because Minni
+registers no resources, prompts, sampling, roots, or logging, there is no other
+protocol surface to re-verify — which is the practical payoff of the narrow
+architecture this document documents.
+
 ## Out of scope
 
 The duplicate MCP registration carried forward from PR #221 —
@@ -320,4 +455,51 @@ The duplicate MCP registration carried forward from PR #221 —
 appears both in the host's top-level `mcpServers` and in
 `plugins/minni/.claude-plugin/plugin.json` — is host *configuration*, not server
 code, and is unaffected by this revision. It is noted here only so a future
-reader does not mistake it for a protocol problem. It stays with #221.
+reader does not mistake it for a protocol problem. It stays with #221. See the
+appendix for why the obvious cleanup does not hold.
+
+## Appendix — duplicate MCP registration (operator note)
+
+Recorded here because it surfaced during this audit and is easy to misdiagnose,
+**not** because this revision changes it.
+
+**Symptom.** Every Minni tool is registered twice in Claude Code, once as
+`mcp__minni__*` and once as `mcp__plugin_minni_minni__*`. Two independent
+registrations of the same stdio server: one from the host's top-level
+`mcpServers` block in `~/.claude.json`, one from the plugin manifest at
+`plugins/minni/.claude-plugin/plugin.json`. Confirmed live during this audit.
+
+**The obvious operator step, and why it does not hold.** The intuitive fix is to
+delete the `minni` key from the top-level `mcpServers` object in
+`~/.claude.json` and restart the host, leaving the plugin-provided registration
+as the single source. That does work — until the next wire run.
+
+`update_claude_config` in `src/minni/wire/writers.py:195` does:
+
+```python
+data.setdefault("mcpServers", {})["minni"] = { ... }
+```
+
+unconditionally, against `~/.claude.json`. So the top-level entry is **generated
+configuration, not hand-written state**, and `minni wire claude-code`
+re-creates it every time. A manual deletion is undone by the next wire, which
+means an operator who "fixes" this will see it silently return and reasonably
+conclude the fix did not work.
+
+**Recommended handling.**
+
+- *Immediate relief (operator, reversible):* remove the `minni` key from
+  top-level `mcpServers` in `~/.claude.json` and restart Claude Code. Valid for
+  verifying the duplication is the cause of something, and for a clean session
+  now. Expect it to come back after any `minni wire claude-code`.
+- *Durable fix (code, belongs to #221):* decide which registration is
+  authoritative and stop emitting the other. Since the plugin manifest travels
+  with the versioned plugin payload and the wire pipeline already owns the
+  plugin surface, the plugin registration is the better survivor, and
+  `update_claude_config` should stop writing `mcpServers.minni` when the plugin
+  provides it — with a wire-level test asserting only one registration results.
+
+This is deliberately *not* proposed as work for this branch. It is a
+configuration-generation defect with its own issue, and the only reason it
+appears in an MCP-protocol document is to keep the next person from filing it as
+a protocol bug or from trusting the one-line cleanup.
