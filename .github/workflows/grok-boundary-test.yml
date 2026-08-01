@@ -40,7 +40,14 @@ jobs:
           # image by default. Measured the hard way: without this, the whole
           # run dies before the agent does anything.
           sudo apt-get update -qq && sudo apt-get install -y -qq bubblewrap
-          bwrap --version
+          # Ubuntu 24.04 runners block unprivileged user namespaces via
+          # AppArmor, so bwrap fails with "setting up uid map: Permission
+          # denied" even once installed. Lifting that restriction is what
+          # lets bubblewrap build the namespace at all.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          # Prove bwrap can actually construct a namespace here, rather than
+          # discovering it later as a silent no-sandbox fallback.
+          bwrap --ro-bind / / --dev /dev true && echo "bwrap namespace OK"
 
       - name: Install Grok Build CLI
         run: |
