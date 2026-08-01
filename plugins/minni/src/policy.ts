@@ -370,12 +370,32 @@ export function detectSecretMaterial(content: string): string | null {
   return null;
 }
 
-export function assessLearningQuality(input: {
+export interface LearningInput {
   title: string;
   content: string;
   category?: string;
   source?: string;
-}): LearningQualityReport {
+}
+
+/**
+ * Every channel `minni_learn` persists into the vault note, in the order the
+ * note carries them. The gate scanned `content` alone while all four are
+ * written to disk, so a `ghp_…` pasted into a title or a source attribution
+ * was stored unscanned. Detection must cover what is persisted, not just the
+ * field most likely to hold prose.
+ */
+function persistedChannels(input: LearningInput): Array<{ field: string; text: string }> {
+  return (
+    [
+      { field: "title", text: input.title },
+      { field: "content", text: input.content },
+      { field: "category", text: input.category },
+      { field: "source", text: input.source },
+    ] as Array<{ field: string; text?: string }>
+  ).flatMap(({ field, text }) => (text?.trim() ? [{ field, text }] : []));
+}
+
+export function assessLearningQuality(input: LearningInput): LearningQualityReport {
   // Regex-only fast path. Learn / quality MCP + CLI use
   // `assessLearningQualityAsync` so the #147 AFM inconclusive tier runs.
   const warnings: string[] = [];
@@ -400,12 +420,14 @@ export function assessLearningQuality(input: {
     warnings.push("Content has vague wording; prefer specific facts and decisions.");
   }
 
-  const secretMaterial = detectSecretMaterial(content);
-  if (secretMaterial) {
+  for (const channel of persistedChannels(input)) {
+    const secretMaterial = detectSecretMaterial(channel.text);
+    if (!secretMaterial) continue;
     score -= 0.3;
+    // The field is named but the offending value is never echoed back.
     warnings.push(
-      `Content appears to contain sensitive material (${secretMaterial}); ` +
-        "never store secrets in memory.",
+      `The "${channel.field}" field appears to contain sensitive material ` +
+        `(${secretMaterial}); never store secrets in memory.`,
     );
   }
 
@@ -428,12 +450,7 @@ export function assessLearningQuality(input: {
  * regex result unchanged (fail-open — AFM enhances, it does not replace).
  */
 export async function assessLearningQualityAsync(
-  input: {
-    title: string;
-    content: string;
-    category?: string;
-    source?: string;
-  },
+  input: LearningInput,
   options: {
     classifyInconclusive?: InconclusiveCredentialClassifier;
   } = {},
@@ -443,7 +460,12 @@ export async function assessLearningQualityAsync(
     return base;
   }
 
-  const spans = findInconclusiveHighRiskAssignments(input.content.trim());
+  // Each persisted channel is scanned separately rather than concatenated:
+  // the span finder is line-bounded, and joining fields would let one field's
+  // tail run into the next field's text.
+  const spans = persistedChannels(input).flatMap((channel) =>
+    findInconclusiveHighRiskAssignments(channel.text.trim()),
+  );
   if (spans.length === 0) return base;
 
   // Lazy default import keeps the sync path free of AFM for unit tests /
@@ -465,7 +487,7 @@ export async function assessLearningQualityAsync(
   const keywordLabel = keywords.length === 1 ? keywords[0] : keywords.join("/");
   const warnings = [
     ...base.warnings,
-    "Content appears to contain sensitive material " +
+    "A persisted field appears to contain sensitive material " +
       `(a credential keyword ("${keywordLabel ?? "password"}") assigned an ` +
       "unquoted multi-word value classified as a secret); never store secrets in memory.",
   ];
