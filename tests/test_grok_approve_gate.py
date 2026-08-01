@@ -251,6 +251,71 @@ def test_outstanding_request_changes_survives_a_later_marker(mod):
                            blocked_by_request_changes=blocked)).conclusion == "failure"
 
 
+def _rev(mod, state="COMMENTED", marker=True, sha="abc123",
+         login="infektydgrokreviewer[bot]"):
+    return {
+        "user": {"login": login},
+        "state": state,
+        "commit_id": sha,
+        "body": f"text\n{mod.ELIGIBILITY_MARKER}\n" if marker else "text only",
+    }
+
+
+def test_newer_unmarked_app_review_revokes_an_older_marker(mod):
+    """Newest App review wins. Falling through to an older stamped review makes
+    a later 'I no longer approve' COMMENT a no-op."""
+    reviews = [_rev(mod, marker=True), _rev(mod, marker=False)]
+    eligible, blocked = mod.analyze_reviews(reviews, "abc123")
+    assert eligible is False
+    assert blocked is False
+
+
+def test_eligibility_does_not_survive_a_push(mod):
+    """Approve clean code at sha1, push bad code as sha2: the stamp from sha1
+    must not grant merge trust for sha2."""
+    reviews = [_rev(mod, marker=True, sha="sha1aaa")]
+    assert mod.analyze_reviews(reviews, "sha1aaa")[0] is True
+    assert mod.analyze_reviews(reviews, "sha2bbb")[0] is False
+
+
+def test_marker_without_commit_id_is_not_eligible(mod):
+    reviews = [{
+        "user": {"login": "infektydgrokreviewer[bot]"},
+        "state": "COMMENTED",
+        "body": mod.ELIGIBILITY_MARKER,
+    }]
+    assert mod.analyze_reviews(reviews, "abc123")[0] is False
+
+
+def test_pending_rerun_never_masked_by_an_older_success(mod):
+    """A completed success plus an in-flight re-run of the same name is pending,
+    not green — otherwise the gate greens a check that is still running."""
+    assert mod._worse("success", "pending") == "pending"
+    assert mod._worse("pending", "success") == "pending"
+    assert mod._worse("success", "failure") == "failure"
+    assert mod._worse("pending", "failure") == "failure"
+    assert mod._worse("success", "success") == "success"
+
+
+@pytest.mark.parametrize(
+    "run,expected",
+    [
+        ({"status": "in_progress"}, "pending"),
+        ({"status": "queued"}, "pending"),
+        ({"status": "completed", "conclusion": "success"}, "success"),
+        ({"status": "completed", "conclusion": "failure"}, "failure"),
+        ({"status": "completed", "conclusion": "timed_out"}, "failure"),
+        ({"status": "completed", "conclusion": "cancelled"}, "failure"),
+        ({"status": "completed", "conclusion": "action_required"}, "failure"),
+        ({"status": "completed", "conclusion": "neutral"}, "failure"),
+        ({"status": "completed", "conclusion": "skipped"}, "failure"),
+        ({"status": "completed", "conclusion": None}, "failure"),
+    ],
+)
+def test_check_run_state_mapping(mod, run, expected):
+    assert mod._check_run_state(run) == expected
+
+
 def test_dismissed_request_changes_does_not_block(mod):
     reviews = [
         {

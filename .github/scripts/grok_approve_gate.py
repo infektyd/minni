@@ -5,11 +5,15 @@ Measured 2026-08-01 on infektyd/minni (#222): App/bot APPROVE posts but does
 not clear reviewDecision (authorAssociation=NONE). Merge trust for v2 is the
 required status check named CHECK_NAME, posted with GITHUB_TOKEN.
 
-Eligibility comes from a prior Grok App review body containing
-ELIGIBILITY_MARKER (stamped when the model emitted VERDICT: APPROVE). The
-model retains a veto (no marker / later REQUEST_CHANGES) but cannot alone
-turn the check green — every required branch-protection context (except this
-check) must be success, and the head SHA must not move mid-flight.
+Eligibility comes from the NEWEST Grok App review whose body carries
+ELIGIBILITY_MARKER on a line of its own (stamped when the model emitted
+VERDICT: APPROVE) AND whose commit_id is the current head. The model retains a
+veto (no marker / later REQUEST_CHANGES) but cannot alone turn the check green
+— every required branch-protection context (except this check) must be
+success, and the head SHA must not move mid-flight.
+
+Eligibility does not survive a push: a stamp for an older SHA is worthless, so
+"approve clean code, then add a bad commit" cannot mint merge trust.
 
 Usage (Actions):
   python3 grok_approve_gate.py \\
@@ -196,42 +200,63 @@ def fetch_required_contexts(owner: str, repo: str, branch: str, token: str) -> t
     return tuple(c for c in contexts if c != CHECK_NAME)
 
 
+# Worst-wins ordering. Merging observations for one context must never let a
+# `success` mask a pending or failed one — that is a direct false-green.
+_STATE_RANK = {"success": 0, "expected": 1, "pending": 1, "failure": 2, "error": 2}
+
+
+def _worse(a: str, b: str) -> str:
+    return a if _STATE_RANK.get(a, 2) >= _STATE_RANK.get(b, 2) else b
+
+
+def _check_run_state(run: dict[str, Any]) -> str:
+    if run.get("status") != "completed":
+        return "pending"
+    conclusion = run.get("conclusion")
+    if conclusion == "success":
+        return "success"
+    # Everything else — failure, timed_out, cancelled, action_required, and
+    # neutral/skipped — does not satisfy a required check.
+    return "failure"
+
+
 def fetch_combined_statuses(
     owner: str, repo: str, sha: str, token: str
 ) -> dict[str, str]:
-    """Map context → latest state (success/pending/failure/error)."""
+    """Map context → state (success/pending/failure/error), worst wins.
+
+    Check runs are authoritative for names they cover; commit statuses only
+    fill in contexts that have no check run. Within either source, repeated
+    observations of one name collapse to the WORST, so an in-flight re-run or a
+    stale success can never read as green.
+    """
+    states: dict[str, str] = {}
     url = f"https://api.github.com/repos/{owner}/{repo}/commits/{sha}/status"
     data = _api("GET", url, token)
-    states: dict[str, str] = {}
     for st in data.get("statuses") or []:
         ctx = st.get("context")
-        if not ctx:
+        if not ctx or ctx == CHECK_NAME:
             continue
-        # API returns newest first in statuses array for combined; keep first seen.
-        if ctx not in states:
-            states[ctx] = st.get("state") or "error"
-    # Check runs (Actions) often appear only here:
+        state = st.get("state") or "error"
+        states[ctx] = state if ctx not in states else _worse(states[ctx], state)
+
+    # filter=latest is the API default, but pin it: without it a re-run's older
+    # `success` can arrive after the newer `failure` for the same name.
     runs_url = (
-        f"https://api.github.com/repos/{owner}/{repo}/commits/{sha}/check-runs?per_page=100"
+        f"https://api.github.com/repos/{owner}/{repo}/commits/{sha}"
+        "/check-runs?per_page=100&filter=latest"
     )
-    runs = _api("GET", runs_url, token)
-    for run in runs.get("check_runs") or []:
-        name = run.get("name")
-        if not name or name == CHECK_NAME:
-            continue
-        status = run.get("status")
-        conclusion = run.get("conclusion")
-        if status != "completed":
-            states.setdefault(name, "pending")
-        elif conclusion == "success":
-            states[name] = "success"
-        elif conclusion in ("failure", "timed_out", "cancelled", "action_required"):
-            states[name] = "failure"
-        elif conclusion == "neutral" or conclusion == "skipped":
-            # Skipped/neutral do not satisfy required checks.
-            states.setdefault(name, "failure")
-        else:
-            states.setdefault(name, "failure")
+    run_states: dict[str, str] = {}
+    for chunk in _paginate(runs_url, token):
+        for run in chunk.get("check_runs") or []:
+            name = run.get("name")
+            if not name or name == CHECK_NAME:
+                continue
+            state = _check_run_state(run)
+            run_states[name] = (
+                state if name not in run_states else _worse(run_states[name], state)
+            )
+    states.update(run_states)
     return states
 
 
@@ -251,12 +276,24 @@ def _has_marker(body: str | None) -> bool:
     return any(line.strip() == ELIGIBILITY_MARKER for line in (body or "").splitlines())
 
 
-def analyze_reviews(reviews: list[dict[str, Any]]) -> tuple[bool, bool]:
+def analyze_reviews(
+    reviews: list[dict[str, Any]], head_sha: str = ""
+) -> tuple[bool, bool]:
     """Return (eligible, blocked_by_request_changes).
 
     Any non-dismissed CHANGES_REQUESTED (any author) blocks.
-    Eligibility: newest App-bot review body contains ELIGIBILITY_MARKER,
-    and no later App-bot CHANGES_REQUESTED supersedes it.
+
+    Eligibility is decided by the NEWEST non-dismissed App-bot review only, and
+    that review must have been written against `head_sha`. Both halves matter:
+
+    * Newest-only — otherwise a later App review saying "I no longer approve"
+      is skipped and an older stamped review still grants eligibility.
+    * SHA-bound — otherwise eligibility survives a push. Approve clean code,
+      then force in a bad commit: the gate re-runs on `synchronize`, finds the
+      old marker, sees green CI on the NEW sha, and mints success for code the
+      reviewer never saw.
+
+    Passing head_sha="" disables the binding and is for tests only.
     """
     blocked = False
     for rev in reviews:
@@ -274,12 +311,11 @@ def analyze_reviews(reviews: list[dict[str, Any]]) -> tuple[bool, bool]:
             continue
         if not _is_app_bot(user):
             continue
-        if state == "CHANGES_REQUESTED":
-            eligible = False
-            break
-        if _has_marker(rev.get("body")):
-            eligible = True
-            break
+        if state != "CHANGES_REQUESTED" and _has_marker(rev.get("body")):
+            eligible = not head_sha or (rev.get("commit_id") or "") == head_sha
+        # First App-bot review seen wins, marker or not. Do not fall through to
+        # older reviews.
+        break
     return eligible, blocked
 
 
@@ -385,7 +421,7 @@ def run_gate(
         f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr}/reviews?per_page=100",
         token,
     )
-    eligible, blocked = analyze_reviews(reviews)
+    eligible, blocked = analyze_reviews(reviews, head_sha)
     path_denied = fetch_pr_files_denied(owner, repo, pr, token)
 
     decision = decide(

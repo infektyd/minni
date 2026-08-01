@@ -41,6 +41,11 @@ Invariants (enforced in `.github/scripts/grok_approve_gate.py`):
 8. The marker must be a line of its own. The review body embeds the model's
    reply verbatim, so `grok-review.yml` also defangs any marker the model
    echoed out of the diff before posting.
+9. Eligibility is bound to the reviewed commit (`review.commit_id == head`) and
+   read from the **newest** App review only. A stamp does not survive a push,
+   and a later unmarked App review revokes it.
+10. Per-context state is worst-wins: an in-flight re-run or a stale `success`
+    can never mask a pending or failed observation of the same check.
 
 Parser: `.github/scripts/parse_grok_verdict.py` — default path never emits
 Reviews `APPROVE`; `--allow-approve` is for gate/eligibility readers only.
@@ -87,7 +92,6 @@ gh api -X PUT repos/infektyd/minni/branches/main/protection \
     "contexts": [
       "Forbidden Files",
       "Free public cloud smoke",
-      "boundary",
       "claude-review",
       "grok-mechanical-approve"
     ]
@@ -105,6 +109,12 @@ JSON
 Keep `required_approving_review_count: 1` only if you still want a **human**
 review in addition to the mechanical check (bots still will not count).
 
+**Do not add `boundary` to this list.** Grok Boundary Test only runs on PRs
+touching `.github/workflows/grok*.yml` or `check-no-credential-leak.py`. On an
+ordinary PR the context never reports, the gate reads it as `missing`, and the
+mechanical check can never go green — the exact opposite of the goal. Only
+require checks that run on every PR.
+
 ## Residual risk
 
 A green mechanical check means “eligible Grok verdict + required CI green” —
@@ -114,8 +124,15 @@ human attention on gate/workflow changes.
 
 ## Recovery
 
-- `REQUEST_CHANGES` from the App clears eligibility until a later review
-  stamps the marker again (re-open / ready_for_review to re-run Grok).
+- **Eligibility is bound to the reviewed commit.** The marker only counts if
+  the stamping review's `commit_id` is the current head. Pushing invalidates it,
+  and Grok does not re-review on `synchronize` (metered). To re-arm after a
+  push: mark ready-for-review, or close/reopen, to re-run Grok on the new SHA.
+  This is deliberate — without it, "approve clean code, then push a bad commit"
+  mints merge trust for code the reviewer never saw.
+- **Only the newest App review counts.** A later App `COMMENTED` review with no
+  marker revokes eligibility; the gate does not fall through to an older
+  stamped review.
 - **A `CHANGES_REQUESTED` review keeps the check red until it is DISMISSED**,
   even after a later review stamps the marker. The gate reads every review, not
   just the newest per author, so a stale block does not silently expire. Dismiss
