@@ -67,7 +67,10 @@ import time
 from pathlib import Path
 
 REPO_DEFAULT = "infektyd/minni"
-MENTION = "@grok"
+# Defaults to @grok-local, matching the launchd template: the GitHub workflow
+# already answers @grok, and pointing both at the same trigger means every
+# mention gets two replies.
+MENTION = "@grok-local"
 ALLOWED_ASSOCIATIONS = {"OWNER", "MEMBER", "COLLABORATOR"}
 STATE_DEFAULT = Path.home() / ".grok-local" / "watch-state.json"
 # Isolated home: keeps the agent away from ~/.grok, your personal login.
@@ -115,6 +118,21 @@ def find_mentions(repo: str, since: str | None, mention: str = MENTION) -> list[
             continue
         out.append(c)
     return list(reversed(out))  # oldest first
+
+
+def is_pull_request(repo: str, number: int) -> bool:
+    """Ask GitHub, rather than string-matching html_url.
+
+    A comment on a PR conversation carries an /issues/ URL, so matching on
+    "/pull/" reported False for real PRs — the agent then answered against the
+    default branch while the prompt described a PR. The issues API states it
+    outright via the `pull_request` field.
+    """
+    try:
+        data = gh_json(["api", f"repos/{repo}/issues/{number}"])
+    except RuntimeError:
+        return False
+    return isinstance(data, dict) and data.get("pull_request") is not None
 
 
 def issue_number(comment: dict) -> int | None:
@@ -198,7 +216,7 @@ def handle(comment: dict, repo: str, grok_home: Path, timeout: int,
     if number is None:
         return False
     request = comment.get("body") or ""
-    is_pr = "/pull/" in (comment.get("html_url") or "")
+    is_pr = is_pull_request(repo, number)
     print(f"→ #{number} ({'PR' if is_pr else 'issue'}) "
           f"by {comment.get('user', {}).get('login')}: {request.strip()[:80]}")
     if dry_run:
@@ -263,10 +281,19 @@ def handle(comment: dict, repo: str, grok_home: Path, timeout: int,
 
 def sweep(repo: str, state_path: Path, grok_home: Path, timeout: int,
           dry_run: bool, print_only: bool = False,
-          mention: str = MENTION) -> None:
+          mention: str = MENTION, backfill: bool = False) -> None:
     state = load_state(state_path)
     handled = set(state.get("handled", []))
     since = state.get("since")
+    if since is None and not backfill:
+        # First run with empty state would otherwise answer up to 50 historical
+        # mentions at once — and double-reply alongside the workflow. Start
+        # from now; --backfill is the explicit opt-in to reach backwards.
+        since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        state["since"] = since
+        save_state(state_path, state)
+        print(f"first run: watching for new mentions from {since} "
+              f"(use --backfill to answer existing ones)")
     try:
         comments = find_mentions(repo, since, mention)
     except RuntimeError as exc:
@@ -275,13 +302,22 @@ def sweep(repo: str, state_path: Path, grok_home: Path, timeout: int,
     fresh = [c for c in comments if c["id"] not in handled]
     if not fresh:
         return
+    failed_any = False
+    newest_ok: str | None = None
     for comment in fresh:
         if handle(comment, repo, grok_home, timeout, dry_run, print_only):
             handled.add(comment["id"])
+            if not failed_any:
+                newest_ok = comment["created_at"]
+        else:
+            # Stop advancing the watermark here. Advancing past a comment that
+            # failed (timeout, leak gate, post error) would hide it forever:
+            # the next poll's `since` filter would drop it server-side and it
+            # is not in `handled`, so nothing would ever retry it.
+            failed_any = True
     state["handled"] = list(handled)
-    # `since` is advanced conservatively: the newest comment we actually saw.
-    if comments:
-        state["since"] = comments[-1]["created_at"]
+    if newest_ok:
+        state["since"] = newest_ok
     if not dry_run and not print_only:
         save_state(state_path, state)
 
@@ -305,6 +341,9 @@ def main() -> int:
                     help="per-request Grok timeout in seconds")
     ap.add_argument("--dry-run", action="store_true",
                     help="list what would be answered; run nothing, post nothing")
+    ap.add_argument("--backfill", action="store_true",
+                    help="on first run, also answer mentions that already "
+                         "exist (default: start from now)")
     ap.add_argument("--print-only", action="store_true",
                     help="really run Grok, but print the reply instead of "
                          "posting it (and do not record it as handled)")
@@ -327,13 +366,13 @@ def main() -> int:
 
     if args.once:
         sweep(args.repo, args.state, args.grok_home, args.timeout, args.dry_run,
-              args.print_only, args.mention)
+              args.print_only, args.mention, args.backfill)
         return 0
 
     print(f"watching {args.repo} for {args.mention} every {args.interval}s (ctrl-c to stop)")
     while True:
         sweep(args.repo, args.state, args.grok_home, args.timeout, args.dry_run,
-              args.print_only, args.mention)
+              args.print_only, args.mention, args.backfill)
         time.sleep(args.interval)
 
 

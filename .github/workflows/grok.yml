@@ -159,9 +159,13 @@ jobs:
 
       - name: Run Grok
         run: |
-          # The sandbox is the boundary (see the profile step). Shell stays
-          # available here — an @grok request often needs it — but the kernel
-          # denies the credential path and child-process network either way.
+          # Shell stays available here — an @grok request often needs it.
+          # To be precise about what protects what: the credential path is
+          # READABLE by design (denying it breaks Grok's own startup); what
+          # the kernel blocks is child-process EGRESS, and the reply is
+          # scanned before it is posted. Do not restate this as "the kernel
+          # denies the credential path" — that wording is what produced the
+          # earlier deny-rule mistakes.
           grok --prompt-file /tmp/grok-prompt.md \
             --always-approve \
             --no-subagents \

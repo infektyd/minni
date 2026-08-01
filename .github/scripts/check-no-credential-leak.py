@@ -11,18 +11,30 @@ itself, where those words are the subject matter. A gate that fires on every
 security review is a gate that gets deleted, so this compares against the
 ACTUAL secret values instead of the vocabulary around them.
 
-Two checks:
-  1. VALUE MATCH — every sufficiently long string inside auth.json, plus
-     sliding windows of it, is searched for verbatim in the reply. This
-     catches whole tokens and partial quotes alike.
-  2. SHAPE MATCH — a long JWT body (`eyJ...` with a dot) is credential-shaped
+CHECKS
+------
+  1. VALUE MATCH — every sufficiently long string in auth.json, searched in
+     the reply whole and as EVERY sliding window (step 1). An earlier version
+     stepped by 8 and stopped at `len - WINDOW`, so it missed both unaligned
+     quotes and — the common case for a JWT signature — the token's own tail.
+  2. ENCODED MATCH — the same values re-encoded as base64 and hex, and the
+     reply re-checked with whitespace removed, since "paste it base64'd" and
+     "space it out" are the first things a determined injection tries.
+  3. SHAPE MATCH — a long JWT body (`eyJ...` with a dot) is credential-shaped
      regardless of provenance, and prose has no reason to contain one.
+
+RESIDUAL RISK, STATED PLAINLY: this cannot be complete. A model asked to
+rot13, reverse, chunk, or describe a token in words will defeat any substring
+matcher. This gate is the last line, not the boundary — the boundary is that
+child-process egress is blocked (verified on Linux) and the blast radius is
+small (short-lived token, collaborator-only triggers, ephemeral runner).
 
 Nothing secret is ever printed: findings are reported as a redacted prefix.
 """
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
@@ -31,9 +43,8 @@ import sys
 # Shorter than this and a "secret" is not distinctive enough to match on
 # without false positives (short config values, ids that also appear in prose).
 MIN_SECRET_LEN = 20
-# Window for partial quotes: long enough to be unmistakably token material.
+# Any window this long is unmistakably token material rather than prose.
 WINDOW = 24
-WINDOW_STEP = 8
 
 
 def secret_values(auth: object) -> list[str]:
@@ -54,17 +65,62 @@ def secret_values(auth: object) -> list[str]:
     return found
 
 
+def encoded_forms(value: str) -> list[tuple[str, str]]:
+    """(label, needle) pairs for common re-encodings of a secret."""
+    raw = value.encode("utf-8", "replace")
+    forms = [
+        ("base64", base64.b64encode(raw).decode("ascii")),
+        ("base64url", base64.urlsafe_b64encode(raw).decode("ascii")),
+        ("hex", raw.hex()),
+    ]
+    # Only forms long enough to be distinctive are worth searching.
+    return [(label, needle) for label, needle in forms if len(needle) >= WINDOW]
+
+
+def contains(haystacks: dict[str, str], needle: str) -> str | None:
+    """Name of the first reply variant containing `needle`, if any."""
+    for variant, text in haystacks.items():
+        if needle in text:
+            return variant
+    return None
+
+
+def windows_hit(haystacks: dict[str, str], value: str) -> str | None:
+    """First reply variant containing ANY window of `value`.
+
+    Step 1 and an inclusive upper bound: a quote of the token's last 24
+    characters, or one starting at an odd offset, must not slip through.
+    """
+    for start in range(0, len(value) - WINDOW + 1):
+        variant = contains(haystacks, value[start:start + WINDOW])
+        if variant:
+            return variant
+    return None
+
+
 def main() -> int:
+    if len(sys.argv) < 2:
+        print("::error::usage: check-no-credential-leak.py <reply> [auth.json]")
+        return 2
+
     reply_path = sys.argv[1]
     auth_path = sys.argv[2] if len(sys.argv) > 2 else os.path.expanduser(
         "~/.grok/auth.json"
     )
 
     try:
-        reply = open(reply_path, encoding="utf-8", errors="replace").read()
+        with open(reply_path, encoding="utf-8", errors="replace") as handle:
+            reply = handle.read()
     except OSError as exc:
         print(f"::error::Cannot read reply file {reply_path}: {exc}")
         return 1
+
+    # Variants defeat the cheapest obfuscations: spacing a token out, or
+    # wrapping it across lines.
+    haystacks = {
+        "reply": reply,
+        "reply(no-whitespace)": re.sub(r"\s+", "", reply),
+    }
 
     hits: list[str] = []
 
@@ -80,12 +136,18 @@ def main() -> int:
     if auth is not None:
         for value in secret_values(auth):
             redacted = f"{value[:6]}…({len(value)} chars)"
-            if value in reply:
-                hits.append(f"full value {redacted}")
+            variant = contains(haystacks, value)
+            if variant:
+                hits.append(f"full value {redacted} in {variant}")
                 continue
-            for start in range(0, max(1, len(value) - WINDOW), WINDOW_STEP):
-                if value[start:start + WINDOW] in reply:
-                    hits.append(f"partial value {redacted}")
+            variant = windows_hit(haystacks, value)
+            if variant:
+                hits.append(f"partial value {redacted} in {variant}")
+                continue
+            for label, needle in encoded_forms(value):
+                variant = contains(haystacks, needle)
+                if variant:
+                    hits.append(f"{label}-encoded value {redacted} in {variant}")
                     break
 
     # Credential SHAPE, independent of the local auth file: a long JWT body.
@@ -98,7 +160,7 @@ def main() -> int:
             print(f"::error::  {hit}")
         return 1
 
-    print("No credential material in reply (value + shape checks passed).")
+    print("No credential material in reply (value + encoding + shape checks passed).")
     return 0
 
 
