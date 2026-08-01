@@ -55,6 +55,10 @@ const CONFIG: AgentHookConfig = {
   runtime: "gemini",
   hookScript: "gemini-hook.js",
   auditPrefix: "hook_gemini",
+  // Mirrors hooks/hooks-gemini.json PreInvocation "timeout": 10 — edit both.
+  // This is the TIGHTEST prompt-time bound of any platform, so it, not the
+  // MINNI_HOOK_BUDGET_MS default, is what sets gemini's effective budget (6s).
+  promptHookTimeoutMs: 10_000,
   // No precompactKind: like kilocode, PreCompact (if agy ever dispatches it)
   // stashes stale-belief events as a precompact_reassert entry instead of a
   // durable handoff file.

@@ -206,6 +206,41 @@ export function hookBudgetMs(env: NodeJS.ProcessEnv = process.env): number {
 }
 
 /**
+ * Fraction of a platform's HARNESS timeout the internal budget may occupy.
+ *
+ * The budget has to finish AND leave room for what follows it: building the
+ * envelope, writing recall-state, and the audit append. 0.6 keeps ~40% of the
+ * manifest timeout as that tail. This matters most where the manifest is tight
+ * — Gemini's `PreInvocation` is 10s, so the flat 8s default would leave only 2s
+ * and the hook could still be killed after paying its whole budget.
+ */
+export const HOOK_BUDGET_HARNESS_FRACTION = 0.6;
+
+/**
+ * The internal budget for a hook whose harness kills it at `harnessTimeoutMs`.
+ *
+ * Takes the TIGHTER of the configured budget and the harness-derived ceiling, so
+ * MINNI_HOOK_BUDGET_MS can always shrink the budget but can never push it past
+ * the deadline it exists to stay inside. Omit `harnessTimeoutMs` (platform with
+ * no declared bound) to get the configured budget unchanged.
+ */
+export function effectiveHookBudgetMs(
+  harnessTimeoutMs?: number,
+  env: NodeJS.ProcessEnv = process.env,
+): number {
+  const configured = hookBudgetMs(env);
+  if (
+    harnessTimeoutMs === undefined ||
+    !Number.isFinite(harnessTimeoutMs) ||
+    harnessTimeoutMs <= 0
+  ) {
+    return configured;
+  }
+  const ceiling = Math.floor(harnessTimeoutMs * HOOK_BUDGET_HARNESS_FRACTION);
+  return Math.max(1, Math.min(configured, ceiling));
+}
+
+/**
  * Resolve `work` with `fallback` if it has not settled within `ms`.
  *
  * BELT-AND-BRACES ONLY. Racing a promise does not make a node process exit — an
