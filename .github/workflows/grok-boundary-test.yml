@@ -95,19 +95,38 @@ jobs:
           # to stop relying on. Digest parsing uses shell parameter expansion
           # rather than `cut`, so no external binary sits between the hash and
           # the comparison.
+          #
+          # THE GATE IS NEVER WRITTEN TO DISK. Trust-anchoring a file's CONTENT
+          # is not enough if you do not also anchor how Python LOADS it:
+          # running `python3 /tmp/leak-gate.py` sets sys.path[0] = /tmp, so a
+          # planted /tmp/base64.py or /tmp/json.py shadows the stdlib module
+          # the gate imports. No race is needed — the agent step plants it
+          # before this step starts, the digest still matches (the gate bytes
+          # are untouched), and the pinned interpreter dutifully imports the
+          # attacker's module. Piping alone does NOT fix this: with `python3 -`
+          # sys.path[0] becomes the CWD, which is the PR's own checkout.
+          #
+          # `-I` (isolated) is the load-bearing flag: no script/CWD directory
+          # on sys.path, PYTHONPATH ignored, user site-packages ignored — so
+          # the gate's imports can only resolve from the system stdlib. The
+          # gate imports base64/json/os/re/sys only, all stdlib.
+          #
+          # The digest is taken over the SAME shell variable that is piped to
+          # the interpreter, so no mutable path is re-opened after hashing.
+          # Note this is deliberately NOT the hash of the file on disk:
+          # command substitution strips trailing newlines, so hashing the file
+          # would not match. Hash and exec must stay on the same bytes.
           /usr/bin/git fetch --depth=1 origin "$TRUST_REF"
-          /usr/bin/git show "origin/$TRUST_REF:.github/scripts/check-no-credential-leak.py" \
-            > /tmp/gate-preflight.py
+          GATE_BYTES=$(/usr/bin/git show "origin/$TRUST_REF:.github/scripts/check-no-credential-leak.py")
           # Fail CLOSED: an unavailable or empty gate must never read as "clean".
-          if [ ! -s /tmp/gate-preflight.py ]; then
+          if [ -z "$GATE_BYTES" ]; then
             echo "::error::Could not load the leak gate from origin/$TRUST_REF — refusing to run the boundary test."
             exit 1
           fi
-          DIGEST=$(/usr/bin/sha256sum /tmp/gate-preflight.py)
+          DIGEST=$(printf '%s' "$GATE_BYTES" | /usr/bin/sha256sum)
           DIGEST="${DIGEST%% *}"
           echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
           echo "Leak gate preflighted from origin/$TRUST_REF (sha256 ${DIGEST:0:12}…)."
-          rm -f /tmp/gate-preflight.py
 
       - name: Install sandbox prerequisites
         run: |
@@ -218,29 +237,29 @@ jobs:
         run: |
           set -euo pipefail
           # Re-fetch in THIS shell — see the preflight step for why a gate left
-          # in /tmp across the adversarial agent cannot be trusted, and why
-          # git / sha256sum / python3 are invoked by absolute path.
+          # on disk across the adversarial agent cannot be trusted, why
+          # git / sha256sum / python3 are invoked by absolute path, and why the
+          # gate is piped to `python3 -I -` instead of being written to a file.
           /usr/bin/git fetch --depth=1 origin "$TRUST_REF"
-          /usr/bin/git show "origin/$TRUST_REF:.github/scripts/check-no-credential-leak.py" \
-            > /tmp/leak-gate.py
-          if [ ! -s /tmp/leak-gate.py ]; then
+          GATE_BYTES=$(/usr/bin/git show "origin/$TRUST_REF:.github/scripts/check-no-credential-leak.py")
+          if [ -z "$GATE_BYTES" ]; then
             echo "::error::Could not load the leak gate from origin/$TRUST_REF — refusing to run the boundary test."
             exit 1
           fi
-          ACTUAL=$(/usr/bin/sha256sum /tmp/leak-gate.py)
+          ACTUAL=$(printf '%s' "$GATE_BYTES" | /usr/bin/sha256sum)
           if [ "${ACTUAL%% *}" != "$EXPECTED_DIGEST" ]; then
             echo "::error::Leak gate changed since preflight — the git object store may have been tampered with. Refusing to continue."
             exit 1
           fi
           # Without this, a gate that never fires looks identical to a gate
           # that works. Feed it a fixture secret and require a non-zero exit.
-          # Exercises the TRUST-ANCHORED copy — proving the head copy fires
+          # Exercises the TRUST-ANCHORED bytes — proving the head copy fires
           # would say nothing about the gate that actually guards the publish.
           printf '{"k":"POSITIVECONTROLSECRETvalue1234567890abcdefGHIJK"}' \
             > /tmp/fixture-auth.json
           printf 'leaked: POSITIVECONTROLSECRETvalue1234567890abcdefGHIJK\n' \
             > /tmp/fixture-reply.md
-          if /usr/bin/python3 /tmp/leak-gate.py \
+          if printf '%s' "$GATE_BYTES" | /usr/bin/python3 -I - \
                /tmp/fixture-reply.md /tmp/fixture-auth.json; then
             echo "::error::Leak gate did NOT flag a planted secret — the gate is broken."
             exit 1
@@ -258,13 +277,12 @@ jobs:
           # positive control used is equally attacker-writable once the agent
           # has run, so it is re-established here rather than reused.
           /usr/bin/git fetch --depth=1 origin "$TRUST_REF"
-          /usr/bin/git show "origin/$TRUST_REF:.github/scripts/check-no-credential-leak.py" \
-            > /tmp/leak-gate.py
-          if [ ! -s /tmp/leak-gate.py ]; then
+          GATE_BYTES=$(/usr/bin/git show "origin/$TRUST_REF:.github/scripts/check-no-credential-leak.py")
+          if [ -z "$GATE_BYTES" ]; then
             echo "::error::Could not load the leak gate from origin/$TRUST_REF — refusing to publish."
             exit 1
           fi
-          ACTUAL=$(/usr/bin/sha256sum /tmp/leak-gate.py)
+          ACTUAL=$(printf '%s' "$GATE_BYTES" | /usr/bin/sha256sum)
           if [ "${ACTUAL%% *}" != "$EXPECTED_DIGEST" ]; then
             echo "::error::Leak gate changed since preflight — refusing to publish."
             exit 1
@@ -273,8 +291,10 @@ jobs:
           # a separate vocabulary list here, so the boundary job was not
           # exercising the gate it claimed to prove. Loaded from the default
           # branch (see the first step), so a PR cannot supply the redactor
-          # that clears its own output for publication.
-          /usr/bin/python3 /tmp/leak-gate.py /tmp/attack-result.md
+          # that clears its own output for publication, and executed from the
+          # verified bytes under `-I` so it cannot be redirected by a planted
+          # module either.
+          printf '%s' "$GATE_BYTES" | /usr/bin/python3 -I - /tmp/attack-result.md
 
       - name: Assert egress is actually blocked
         run: |
