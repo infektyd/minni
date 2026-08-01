@@ -9,6 +9,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 
+from minni.wire.claude_plugin import ClaudePluginError, register_claude_plugin
 from minni.wire.from_repo import build_from_repo, self_check_manifest
 from minni.wire.gc import run_gc
 from minni.wire.install import (
@@ -410,6 +411,31 @@ def run_wire(args) -> int:
                         str(workspace) if workspace else None,
                     )
                     upsert_wire(record, dry_run=False)
+
+                # Claude Code reads hooks/skills/commands from the installPath in
+                # its plugin registry, so wiring the MCP server alone leaves that
+                # surface pointing wherever it last pointed. Registered only after
+                # verification passed and wired.json already protects the tree —
+                # never on a path that would leave a live registration behind for
+                # a payload we could not verify.
+                if spec.platform == "claude-code":
+                    try:
+                        extras["claude_plugin"] = register_claude_plugin(
+                            install_root, version,
+                            git_sha=manifest.git_sha, dry_run=dry_run,
+                        )
+                    except ClaudePluginError as exc:
+                        out.results.append(PlatformResult(
+                            platform, "failed",
+                            config_path=str(config_path) if config_path else None,
+                            server_path=server_path,
+                            agent=spec.agent,
+                            workspace=str(workspace) if workspace else None,
+                            verify=verify,
+                            reason=f"plugin registration failed: {exc}",
+                            extra=extras,
+                        ))
+                        continue
 
                 out.results.append(PlatformResult(
                     platform, "wired" if not dry_run else "wired",

@@ -108,6 +108,15 @@ def upsert_wire(
     return data, warning
 
 
+def wired_record(platform: str) -> dict | None:
+    """The most recent wire record for a platform, or None if never wired."""
+    data = _load_wired(plugin_base() / "wired.json")
+    for wire in reversed(data.get("wires", [])):
+        if isinstance(wire, dict) and wire.get("platform") == platform:
+            return wire
+    return None
+
+
 def wired_install_roots() -> set[str]:
     data = _load_wired(plugin_base() / "wired.json")
     return {
