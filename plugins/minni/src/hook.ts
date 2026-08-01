@@ -20,8 +20,10 @@ import type { EnvelopeEvent, LifecycleSurface } from "./agent_envelope.js";
 import {
   asString,
   emit,
+  hookBudgetMs,
   readStdin,
   VALID_EVENTS,
+  withBudget,
   workspaceFromPayload,
 } from "./hook-utils.js";
 import { harvestCompactSummary, harvestSummaryText } from "./compact-harvest.js";
@@ -32,12 +34,14 @@ import type { StopCoreConfig } from "./hook-handlers.js";
 import { routeMemoryIntent } from "./policy.js";
 import {
   buildRecallPointer,
+  buildStaleRecallPointer,
   clearRecallState,
   extractStrongRecall,
   markRecallConsumed,
   readLifecycleState,
   readRecallState,
   recallPointerThreshold,
+  recallStatePath,
   writeLifecycleState,
   writeRecallState,
 } from "./recall-state.js";
@@ -57,6 +61,7 @@ import {
   extractLearningsSection,
   truncateToTokenCharBudget,
   fetchStaleBeliefEvents,
+  JSON_RPC_TIMEOUT_ERROR,
   listPendingHandoffs,
   readAgentContext,
   recallMemory,
@@ -392,17 +397,36 @@ async function handleUserPromptSubmit(payload: Record<string, unknown>): Promise
     return lifecycleOnlyOutput(signature, lifecycleFields);
   }
   const threshold = recallPointerThreshold();
+  // BUDGET (see hookBudgetMs): Claude Code kills this hook at 30s and DISCARDS
+  // its output, losing the whole turn's injection silently. We own a shorter
+  // deadline so a cold/slow daemon costs us the daemon recall only, not the
+  // turn. The deadline is ABSOLUTE and shared: the daemon recall gets whatever
+  // is left, and the local vault search (fast, no socket) races the same clock
+  // independently so it still lands when only the daemon is stalled.
+  const deadline = Date.now() + hookBudgetMs();
+  const remainingMs = (): number => Math.max(0, deadline - Date.now());
   const [vaultResultsRaw, recall] = await Promise.all([
-    searchVaultNotes(CLAUDECODE_VAULT_PATH, prompt, 6),
-    recallMemory({
-      query: prompt,
-      limit: 6,
-      agentId: CLAUDECODE_AGENT_ID,
-      workspaceId: CLAUDECODE_WORKSPACE_ID,
-      ...(rawSessionId ? { sessionId: rawSessionId } : {}),
-    }),
+    withBudget(searchVaultNotes(CLAUDECODE_VAULT_PATH, prompt, 6), remainingMs(), []),
+    withBudget(
+      recallMemory({
+        query: prompt,
+        limit: 6,
+        agentId: CLAUDECODE_AGENT_ID,
+        workspaceId: CLAUDECODE_WORKSPACE_ID,
+        // The load-bearing deadline: this destroys the socket, which is what
+        // actually lets the hook process EXIT. The race below cannot do that.
+        timeoutMs: remainingMs(),
+        ...(rawSessionId ? { sessionId: rawSessionId } : {}),
+      }),
+      remainingMs(),
+      { ok: false as const, error: JSON_RPC_TIMEOUT_ERROR },
+    ),
   ]);
   const vaultResults = filterSafeVaultResults(vaultResultsRaw);
+  // "The daemon ran out of time" is NOT "the daemon said there is nothing".
+  // Only a genuine answer (or a structured refusal) may drive the weak-turn
+  // path below, which CLEARS recall-state.
+  const daemonTimedOut = !recall.ok && recall.error === JSON_RPC_TIMEOUT_ERROR;
 
   // s5 strength gate: emit the light pointer + recall-state file ONLY when the
   // top recall strength clears the threshold; otherwise inject nothing and clear
@@ -413,6 +437,7 @@ async function handleUserPromptSubmit(payload: Record<string, unknown>): Promise
     threshold,
   );
   let recallStateFile: string | undefined;
+  let stalePointer: string | undefined;
   if (strong) {
     try {
       recallStateFile = await writeRecallState(CLAUDECODE_VAULT_PATH, {
@@ -424,6 +449,14 @@ async function handleUserPromptSubmit(payload: Record<string, unknown>): Promise
     } catch {
       // best-effort: a state-write failure must not break the hook
     }
+  } else if (daemonTimedOut) {
+    // DEGRADED, not weak. Preserve the existing state file — clearing it would
+    // destroy the s6 guard's only pointer on exactly the turns where the daemon
+    // can't rebuild it — and surface it, clearly flagged, so this turn injects
+    // something honest rather than nothing.
+    stalePointer = buildStaleRecallPointer(
+      await readRecallState(CLAUDECODE_VAULT_PATH).catch(() => null),
+    );
   } else {
     await clearRecallState(CLAUDECODE_VAULT_PATH).catch(() => {});
   }
@@ -445,8 +478,9 @@ async function handleUserPromptSubmit(payload: Record<string, unknown>): Promise
     active_plan_ref = compactPlanPointer(activePlan);
   }
 
-  // Nothing salient to inject this turn: no strong recall AND no active plan.
-  if (!strong && active_plan_ref === undefined) {
+  // Nothing salient to inject this turn: no strong recall, no stale fallback
+  // pointer AND no active plan.
+  if (!strong && stalePointer === undefined && active_plan_ref === undefined) {
     await recordAudit(CLAUDECODE_VAULT_PATH, {
       tool: "hook_user_prompt_submit",
       summary: prompt.slice(0, 120),
@@ -454,6 +488,7 @@ async function handleUserPromptSubmit(payload: Record<string, unknown>): Promise
         intent: intent.action,
         vault_matches: vaultResults.map((result) => result.relativePath),
         daemon_ok: recall.ok,
+        daemon_timed_out: daemonTimedOut,
         task_signature: signature,
         recall_strong: false,
         // RAW id only — omit rather than stamp the synthetic "session"
@@ -480,6 +515,20 @@ async function handleUserPromptSubmit(payload: Record<string, unknown>): Promise
     // recall-state file (read by the s6 guard); the prompt only gets a signpost.
     envelopeBody.recall_pointer = buildRecallPointer(strong);
     envelopeBody.recall_state = recallStateFile;
+  } else if (stalePointer !== undefined) {
+    envelopeBody.recall_pointer = stalePointer;
+    envelopeBody.recall_stale = true;
+    envelopeBody.recall_state = recallStatePath(CLAUDECODE_VAULT_PATH);
+  }
+  if (daemonTimedOut) {
+    // Say so IN the envelope: a degraded turn must never be indistinguishable
+    // from a clean one (hooks-PL-5). The agent should treat absent recall as
+    // "not looked up", not as "nothing to find".
+    envelopeBody.degraded = {
+      daemon_recall: "timed_out",
+      budget_ms: hookBudgetMs(),
+      note: "Daemon recall exceeded the hook budget (likely a cold daemon loading models). Memory was NOT consulted this turn — call minni_recall explicitly if it matters.",
+    };
   }
 
   // Option C: inject a compact plan POINTER per turn, not the full plan. The
@@ -506,6 +555,8 @@ async function handleUserPromptSubmit(payload: Record<string, unknown>): Promise
       intent: intent.action,
       vault_matches: vaultResults.map((result) => result.relativePath),
       daemon_ok: recall.ok,
+      daemon_timed_out: daemonTimedOut,
+      recall_stale: stalePointer !== undefined,
       task_signature: signature,
       recall_strong: Boolean(strong),
       top_score: strong?.topScore,

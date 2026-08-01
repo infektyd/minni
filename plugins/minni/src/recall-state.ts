@@ -335,6 +335,36 @@ export function buildRecallPointer(state: StrongRecall): string {
   );
 }
 
+/**
+ * The degraded-turn pointer: the hook's budget expired before the daemon
+ * answered, so we surface the PREVIOUS turn's recall-state instead of injecting
+ * nothing. Explicitly marked stale, with its age, because a pointer the agent
+ * cannot tell is stale is worse than none — it would read last turn's hits as
+ * evidence about this turn's question. The agent is told to re-run recall.
+ *
+ * Fails closed to undefined on an empty/missing state: there is nothing honest
+ * to point at, and an empty "stale" banner is pure noise.
+ */
+export function buildStaleRecallPointer(
+  state: RecallState | null,
+  now: Date = new Date(),
+): string | undefined {
+  const top = state?.top_hits?.[0];
+  if (!state || !top) return undefined;
+  const title = sanitizeRecallField(top.title);
+  const ageMs = now.getTime() - Date.parse(state.ts);
+  const age = Number.isFinite(ageMs) && ageMs >= 0
+    ? `${Math.round(ageMs / 1000)}s old`
+    : "age unknown";
+  const n = state.top_hits.length;
+  return (
+    `⚠️ STALE recall pointer (${age}) — the memory daemon did not answer within ` +
+    `this turn's budget, so these are the PREVIOUS turn's ${n} ` +
+    `${n === 1 ? "hit" : "hits"} (top: "${title}"), NOT a match for the current ` +
+    `prompt. Re-run minni_recall before relying on them.`
+  );
+}
+
 // ---- Lifecycle nudge state (slice c4/c5) --------------------------------------
 //
 // Kept SEPARATE from the recall-state file (which is rewritten on strong turns

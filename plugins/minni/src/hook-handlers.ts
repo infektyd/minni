@@ -24,11 +24,13 @@ import type { EnvelopeEvent } from "./agent_envelope.js";
 import {
   VALID_EVENTS,
   asString,
+  effectiveHookBudgetMs,
   emit,
   inboxPrincipalForVaultPath,
   readStdin,
   stringArray,
   vaultRecallToBody,
+  withBudget,
   workspaceFromPayload,
 } from "./hook-utils.js";
 import type { HookOutput } from "./hook-utils.js";
@@ -41,11 +43,13 @@ import { compactPlanPointer, resolveActivePlanView } from "./plan.js";
 import { routeMemoryIntent } from "./policy.js";
 import {
   buildRecallPointer,
+  buildStaleRecallPointer,
   clearRecallState,
   extractStrongRecall,
   markRecallConsumed,
   readRecallState,
   recallPointerThreshold,
+  recallStatePath,
   writeRecallState,
 } from "./recall-state.js";
 import {
@@ -68,6 +72,7 @@ import {
   fetchStaleBeliefEvents,
   formatRecall,
   readAgentContext,
+  JSON_RPC_TIMEOUT_ERROR,
   recallMemory,
   stashPrecompactReassert,
   subscribeContradictions,
@@ -159,6 +164,18 @@ export interface AgentHookConfig {
    * not name its own platform.
    */
   wire?: PlatformWire;
+  /**
+   * This platform's manifest timeout (ms) for the PROMPT-SUBMIT event, as an
+   * OUTER bound on the internal budget — see `effectiveHookBudgetMs`. Mirror
+   * the `timeout` in `hooks/hooks-<platform>.json`; the two must be edited
+   * together, since a manifest tightened below the budget would resurrect the
+   * exact bug this bounds (killed mid-work, output discarded).
+   *
+   * Current values: codex/grok `UserPromptSubmit` 30s, cursor
+   * `beforeSubmitPrompt` 30s, gemini `PreInvocation` **10s** (the tightest).
+   * Omit for a platform with no declared timeout (kilocode has none at all).
+   */
+  promptHookTimeoutMs?: number;
 }
 
 /** Test seam: lets behavioral tests drive the zero-candidate Stop branch. */
@@ -633,16 +650,34 @@ export function createHookHandlers(
     }
 
     const threshold = recallPointerThreshold();
+    // BUDGET (parity with the claude-code hook): every host kills a prompt-time
+    // hook and DISCARDS its output, so an overrun costs the whole turn's
+    // injection silently. The budget is clamped to this platform's manifest
+    // timeout (`promptHookTimeoutMs`) so it always finishes inside the deadline
+    // that will actually kill it — gemini's 10s PreInvocation is the tightest.
+    const budgetMs = effectiveHookBudgetMs(config.promptHookTimeoutMs);
+    const deadline = Date.now() + budgetMs;
+    const remainingMs = (): number => Math.max(0, deadline - Date.now());
     const [vaultResults, recall] = await Promise.all([
-      searchVaultNotes(config.vaultPath, prompt, 6),
-      recallMemory({
-        query: prompt,
-        limit: 6,
-        agentId: config.agentId,
-        workspaceId,
-        ...(rawSessionId ? { sessionId: rawSessionId } : {}),
-      }),
+      withBudget(searchVaultNotes(config.vaultPath, prompt, 6), remainingMs(), []),
+      withBudget(
+        recallMemory({
+          query: prompt,
+          limit: 6,
+          agentId: config.agentId,
+          workspaceId,
+          // The load-bearing deadline: it destroys the socket, which is what
+          // lets the hook PROCESS exit. Racing a promise alone cannot do that.
+          timeoutMs: remainingMs(),
+          ...(rawSessionId ? { sessionId: rawSessionId } : {}),
+        }),
+        remainingMs(),
+        { ok: false as const, error: JSON_RPC_TIMEOUT_ERROR },
+      ),
     ]);
+    // "Ran out of time" is NOT "there is nothing" — only a real answer may drive
+    // the weak-turn path below, which CLEARS recall-state.
+    const daemonTimedOut = !recall.ok && recall.error === JSON_RPC_TIMEOUT_ERROR;
     // s5 strength gate: emit the light pointer + recall-state file ONLY when the
     // top recall strength clears the threshold; otherwise inject nothing and
     // clear any stale state left by a previous strong turn.
@@ -652,6 +687,7 @@ export function createHookHandlers(
       threshold,
     );
     let recallStateFile: string | undefined;
+    let stalePointer: string | undefined;
     if (strong) {
       try {
         recallStateFile = await writeRecallState(config.vaultPath, {
@@ -663,6 +699,13 @@ export function createHookHandlers(
       } catch {
         // best-effort: a state-write failure must not break the hook
       }
+    } else if (daemonTimedOut) {
+      // DEGRADED, not weak. Keep the existing state file — clearing it would
+      // destroy the s6 guard's only pointer on exactly the turns the daemon
+      // cannot rebuild it — and surface it clearly flagged.
+      stalePointer = buildStaleRecallPointer(
+        await readRecallState(config.vaultPath).catch(() => null),
+      );
     } else {
       await clearRecallState(config.vaultPath).catch(() => {});
     }
@@ -679,8 +722,9 @@ export function createHookHandlers(
 
     const planRef = activePlan !== undefined ? compactPlanPointer(activePlan) : undefined;
 
-    // Nothing salient to inject this turn: no strong recall AND no active plan.
-    if (!strong && planRef === undefined) {
+    // Nothing salient to inject this turn: no strong recall, no stale fallback
+    // pointer AND no active plan.
+    if (!strong && stalePointer === undefined && planRef === undefined) {
       await recordAudit(config.vaultPath, {
         tool: `${config.auditPrefix}_user_prompt_submit`,
         summary: prompt.slice(0, 120),
@@ -688,6 +732,7 @@ export function createHookHandlers(
           intent: intent.action,
           vault_matches: vaultResults.map((result) => result.relativePath),
           daemon_ok: recall.ok,
+          daemon_timed_out: daemonTimedOut,
           task_signature: signature,
           workspace: workspaceId,
           recall_strong: false,
@@ -711,6 +756,19 @@ export function createHookHandlers(
       // recall-state file (read by the s6 guard); the prompt only gets a signpost.
       envelopeBody.recall_pointer = buildRecallPointer(strong);
       envelopeBody.recall_state = recallStateFile;
+    } else if (stalePointer !== undefined) {
+      envelopeBody.recall_pointer = stalePointer;
+      envelopeBody.recall_stale = true;
+      envelopeBody.recall_state = recallStatePath(config.vaultPath);
+    }
+    if (daemonTimedOut) {
+      // A degraded turn must never be indistinguishable from a clean one: the
+      // agent should read absent recall as "not looked up", not "nothing found".
+      envelopeBody.degraded = {
+        daemon_recall: "timed_out",
+        budget_ms: budgetMs,
+        note: "Daemon recall exceeded the hook budget (likely a cold daemon loading models). Memory was NOT consulted this turn — call minni_recall explicitly if it matters.",
+      };
     }
 
     // Plan parity (audit C5): per-turn injection is a compact plan POINTER, not
@@ -734,6 +792,8 @@ export function createHookHandlers(
         intent: intent.action,
         vault_matches: vaultResults.map((result) => result.relativePath),
         daemon_ok: recall.ok,
+        daemon_timed_out: daemonTimedOut,
+        recall_stale: stalePointer !== undefined,
         task_signature: signature,
         workspace: workspaceId,
         recall_strong: Boolean(strong),

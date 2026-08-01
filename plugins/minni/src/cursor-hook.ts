@@ -27,6 +27,8 @@ const CONFIG = {
   runtime: "cursor",
   hookScript: "cursor-hook.js",
   auditPrefix: "hook_cursor",
+  // Mirrors hooks/hooks-cursor.json beforeSubmitPrompt "timeout": 30 — edit both.
+  promptHookTimeoutMs: 30_000,
   precompactKind: "cursor_precompact_handoff",
   recallGuardMode: CURSOR_GUARD_MODE,
   // Without this, wireFor("cursor") fell through to the Claude profile and the

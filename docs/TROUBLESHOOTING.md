@@ -127,3 +127,42 @@ for the window before that runs and for older daemon builds — see
 lacks that key, add it and reload with a full `launchctl bootout` +
 `bootstrap`; `launchctl kickstart -k` restarts the job but does not re-read
 plist changes.
+
+## `UserPromptSubmit hook timed out after 30s — output discarded`
+
+Claude Code kills a `UserPromptSubmit` hook at 30s and throws away everything it
+had produced, so the turn silently loses its recall injection, corrections
+matching and active-plan pointer. Nothing is logged as an error — the turn just
+quietly has no memory.
+
+The usual trigger is a **cold daemon**. Retrieval models are first-call cached
+singletons (`get_embedder` / `get_cross_encoder` in `src/minni/models.py`) and
+the FAISS index loads on demand, so the first search after a `minnid` restart
+paid the whole cold cost inside the caller. That load also makes live
+huggingface.co calls to revalidate the cache, so it is not bounded by local disk
+speed. Restart the daemon a few times in one session and prompt-time hooks start
+overrunning.
+
+Two guards now make this fail open rather than fail silent:
+
+- **Hook budget.** The hook owns an internal deadline (`MINNI_HOOK_BUDGET_MS`,
+  default 8000). When the daemon overruns it, the hook emits what it already has
+  — the active-plan pointer, plus the previous turn's recall pointer clearly
+  marked stale — and the envelope carries a `degraded` block saying memory was
+  not consulted. Do not raise this above ~20s: the point is to finish well
+  inside the harness kill, not to outlast it.
+- **Daemon warmup.** `minnid` preloads the embedder, reranker and retrieval
+  engine in a background thread right after it binds its socket
+  (`MINNI_WARMUP=off` to disable), so nobody waits on the cold path. It logs
+  `warmup complete in N.Ns`; grep `~/Library/Logs/minni/minnid.err.log` for it
+  after a restart.
+
+`hooks/hooks.json` also sets `"timeout": 60` on `UserPromptSubmit` as a safety
+margin. That is deliberately *secondary* — it only stops a hook that is already
+inside its own budget from being killed mid-write. Raising the harness timeout
+alone would not have fixed this, because the hook had no deadline of its own to
+finish within.
+
+If you still see the timeout: check `daemon_timed_out` in the vault audit log
+(`hook_user_prompt_submit` entries) to confirm it is the daemon rather than the
+vault search, then check whether the daemon is repeatedly restarting.

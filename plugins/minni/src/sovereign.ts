@@ -193,6 +193,13 @@ export async function recallMemory(input: {
   crossAgent?: boolean;
   cross_agent?: boolean;
   sessionId?: string;
+  /**
+   * TOTAL deadline for the recall RPC. Prompt-time hooks pass their remaining
+   * budget so a cold daemon (lazy embedder/cross-encoder/FAISS load) degrades to
+   * a fail-open turn instead of being killed by the harness with its output
+   * discarded. Omitted elsewhere → the 30s default.
+   */
+  timeoutMs?: number;
 }, requester: JsonRpcRequester = jsonRpcSocketRequest): Promise<JsonResult<RecallResponse>> {
   // Daemon is JSON-RPC only; surface its real result/error (e.g. identity_mismatch)
   // directly instead of masking it behind a dead HTTP-over-socket fallback.
@@ -212,7 +219,9 @@ export async function recallMemory(input: {
     // (thread_id=session_id) when this is present. Omit it entirely when the
     // caller has no session context so the daemon param stays absent, not null.
     ...(input.sessionId !== undefined ? { session_id: input.sessionId } : {}),
-  }, requester) as Promise<JsonResult<RecallResponse>>;
+  }, requester, input.timeoutMs !== undefined ? { timeoutMs: input.timeoutMs } : {}) as Promise<
+    JsonResult<RecallResponse>
+  >;
 }
 
 export async function learnMemory(input: {
@@ -300,7 +309,29 @@ export function truncateToTokenCharBudget(text: string, tokenBudget: number): st
   return text.length <= maxChars ? text : text.slice(0, maxChars);
 }
 
-export type JsonRpcRequester = (socketPath: string, method: string, params: Record<string, unknown>) => Promise<JsonResult>;
+/** Default JSON-RPC deadline for non-hook callers (MCP tools, CLI). */
+export const DEFAULT_JSON_RPC_TIMEOUT_MS = 30000;
+
+/** The exact error text callers match on to detect a transport deadline. */
+export const JSON_RPC_TIMEOUT_ERROR = "JSON-RPC request timed out";
+
+export interface JsonRpcRequestOptions {
+  /**
+   * TOTAL deadline for the call in ms — across every socket candidate, not per
+   * candidate. The candidate loop is sequential, so a per-candidate deadline
+   * multiplies: with the old fixed 30s-per-candidate and no total, a prompt-time
+   * hook could block for N×30s while Claude Code's own 30s limit killed it and
+   * discarded the output. Callers under a harness deadline MUST pass this.
+   */
+  timeoutMs?: number;
+}
+
+export type JsonRpcRequester = (
+  socketPath: string,
+  method: string,
+  params: Record<string, unknown>,
+  options?: JsonRpcRequestOptions,
+) => Promise<JsonResult>;
 
 function jsonRpcSocketCandidates(): string[] {
   return [SOCKET_PATH];
@@ -369,22 +400,39 @@ function jsonRpcResultToJsonResult(result: unknown): JsonResult {
   return { ok: true, data: result };
 }
 
-export function jsonRpcSocketRequest(socketPath: string, method: string, params: Record<string, unknown>): Promise<JsonResult> {
+export function jsonRpcSocketRequest(
+  socketPath: string,
+  method: string,
+  params: Record<string, unknown>,
+  options: JsonRpcRequestOptions = {},
+): Promise<JsonResult> {
   return new Promise((resolve) => {
     if (!existsSync(socketPath)) {
       resolve({ ok: false, error: `Socket not found: ${socketPath}` });
       return;
     }
+    const timeoutMs = options.timeoutMs ?? DEFAULT_JSON_RPC_TIMEOUT_MS;
+    if (timeoutMs <= 0) {
+      resolve({ ok: false, error: JSON_RPC_TIMEOUT_ERROR });
+      return;
+    }
     const client = net.createConnection(socketPath);
     let data = "";
     let settled = false;
-    const finish = (result: JsonResult) => {
+    // HARD deadline, not socket.setTimeout. setTimeout is an IDLE timer: it
+    // resets on every byte, so a daemon that dribbles output — or one still
+    // loading models while the connection sits accepted — can hold the caller
+    // indefinitely without ever tripping it. A hook whose own budget has expired
+    // needs the handle GONE (finish() destroys it) or the node process will not
+    // exit even once the caller has stopped awaiting this promise.
+    const deadline = setTimeout(() => finish({ ok: false, error: JSON_RPC_TIMEOUT_ERROR }), timeoutMs);
+    function finish(result: JsonResult): void {
       if (settled) return;
       settled = true;
+      clearTimeout(deadline);
       client.destroy();
       resolve(result);
-    };
-    client.setTimeout(30000, () => finish({ ok: false, error: "JSON-RPC request timed out" }));
+    }
     client.on("connect", () => {
       client.write(`${JSON.stringify({ jsonrpc: "2.0", id: Date.now(), method, params })}\n`);
     });
@@ -586,18 +634,33 @@ export async function stashPrecompactReassert(input: {
   return entry.filePath;
 }
 
-export async function jsonRpcSocketRequestWithFallback(method: string, params: Record<string, unknown>): Promise<JsonResult> {
-  return jsonRpcSocketRequestWithFallbackRequester(method, params, jsonRpcSocketRequest);
+export async function jsonRpcSocketRequestWithFallback(
+  method: string,
+  params: Record<string, unknown>,
+  options: JsonRpcRequestOptions = {},
+): Promise<JsonResult> {
+  return jsonRpcSocketRequestWithFallbackRequester(method, params, jsonRpcSocketRequest, options);
 }
 
 async function jsonRpcSocketRequestWithFallbackRequester(
   method: string,
   params: Record<string, unknown>,
   requester: JsonRpcRequester,
+  options: JsonRpcRequestOptions = {},
 ): Promise<JsonResult> {
   let last: JsonResult = { ok: false, error: "No socket attempted" };
+  // An ABSOLUTE deadline shared by every candidate: the budget belongs to the
+  // whole call, so N candidates cannot each spend it in turn.
+  const deadline =
+    options.timeoutMs !== undefined ? Date.now() + options.timeoutMs : undefined;
   for (const socketPath of jsonRpcSocketCandidates()) {
-    last = await requester(socketPath, method, params);
+    if (deadline !== undefined) {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) return { ok: false, error: JSON_RPC_TIMEOUT_ERROR };
+      last = await requester(socketPath, method, params, { timeoutMs: remaining });
+    } else {
+      last = await requester(socketPath, method, params);
+    }
     if (last.ok) return last;
   }
   return last;
