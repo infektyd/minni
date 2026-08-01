@@ -19,6 +19,7 @@ import {
 import type { EnvelopeEvent, LifecycleSurface } from "./agent_envelope.js";
 import {
   asString,
+  effectiveHookBudgetMs,
   emit,
   hookBudgetMs,
   readStdin,
@@ -26,6 +27,13 @@ import {
   withBudget,
   workspaceFromPayload,
 } from "./hook-utils.js";
+import {
+  deferUntilDelivered,
+  discardDeliveryCommits,
+  emitAndCommit,
+  exitAfterDelivery,
+  failAndExit,
+} from "./hook-delivery.js";
 import { harvestCompactSummary, harvestSummaryText } from "./compact-harvest.js";
 import { claudeCodeWire } from "./hook-platform.js";
 import type { HookOutput } from "./hook-utils.js";
@@ -75,12 +83,35 @@ import {
   ensureVault,
   buildPendingLearningsSection,
   expireStaleInboxHandoffs,
+  expiredHandoffsBody,
   readInboxStatus,
+  readReassertPending,
   recordAudit,
   resolveInboxHandoffContext,
   searchVaultNotes,
   settleReassertedInboxEntries,
 } from "./vault.js";
+
+/**
+ * Claude Code's SessionStart deadline, as an OUTER bound on the boot budget —
+ * same contract as the factory's `sessionStartHookTimeoutMs`. Mirrors
+ * `hooks/hooks.json` SessionStart `"timeout": 600`; the two must be edited
+ * together, since a manifest tightened below the budget would resurrect the
+ * bug this bounds (killed mid-boot, output discarded).
+ *
+ * 600s is Claude Code's DOCUMENTED PLATFORM default for a `command` hook.
+ * SessionStart does not lower it (the events that do are UserPromptSubmit at
+ * 30s, MessageDisplay at 10s and SessionEnd's shared 1.5s budget) — so 600 is
+ * what this entry inherits when the manifest is silent. Those are the
+ * platform's numbers, not ours: `hooks.json` separately sets UserPromptSubmit
+ * to 60, which is OUR choice and unrelated to this constant.
+ *
+ * The manifest states 600 explicitly rather than inheriting it, so the value
+ * this constant mirrors is visible in the file the platform reads — writing a
+ * SMALLER number here would be a real tightening of the boot deadline, not
+ * documentation of it.
+ */
+const CLAUDECODE_SESSION_START_TIMEOUT_MS = 600_000;
 
 async function handleSessionStart(payload: Record<string, unknown>): Promise<HookOutput> {
   // rawSessionId is the payload's own id, possibly empty — never the
@@ -90,6 +121,22 @@ async function handleSessionStart(payload: Record<string, unknown>): Promise<Hoo
   // defaulted value for envelope identity / inbox filenames / markers.
   const rawSessionId = asString(payload.session_id) || asString(payload.sessionId);
   const sessionId = rawSessionId || "session";
+  // BOOT BUDGET (parity with the shared factory): a boot that overruns the
+  // host's SessionStart deadline is killed and its output DISCARDED, losing
+  // identity, corrections and the active plan in one go. We own a shorter,
+  // ABSOLUTE deadline and ship whatever landed inside it. These reads were also
+  // strictly sequential, so a single cold RPC used to push every later one past
+  // the deadline; the independent ones now share the clock concurrently.
+  //
+  // The clock starts HERE, at handler entry, not after the compaction harvest
+  // below. The harness deadline runs from process start, so a budget that began
+  // after an expensive harvest would be measuring the wrong interval and could
+  // still overrun — on `compact`/`resume` boots, which is exactly when there is
+  // a correction waiting to be re-asserted.
+  const budgetMs = effectiveHookBudgetMs(CLAUDECODE_SESSION_START_TIMEOUT_MS);
+  const deadline = Date.now() + budgetMs;
+  const remainingMs = (): number => Math.max(0, deadline - Date.now());
+  const rpcTimedOut = { ok: false as const, error: JSON_RPC_TIMEOUT_ERROR };
   await ensureVault(CLAUDECODE_VAULT_PATH);
   // Compaction-summary harvest BACKSTOP (plan-3e5a410b9ab6f715). The primary
   // delivery is the PostCompact hook below, which receives the summary
@@ -122,66 +169,216 @@ async function handleSessionStart(payload: Record<string, unknown>): Promise<Hoo
     session_id: sessionId,
     emphasized: [],
   }).catch(() => {});
-  const status = await buildStatusReport({ vaultPath: CLAUDECODE_VAULT_PATH });
-  const tail = await auditTail(CLAUDECODE_VAULT_PATH, 5);
-  // recall-F1: boot recall previously whitelisted layers=['identity'], which
-  // dropped knowledge-layer corrections before rerank. Widen to the
-  // correction-bearing layers (single query; the engine's correction salience
-  // floor ranks fresh corrections above saturated habitual hits) instead of a
-  // second corrections-only round-trip. See BOOT_RECALL_LAYERS for the policy.
-  const recall = await recallMemory({
-    query: `boot identity for ${CLAUDECODE_WORKSPACE_ID}`,
-    layers: BOOT_RECALL_LAYERS,
-    limit: 8,
-    agentId: CLAUDECODE_AGENT_ID,
-    workspaceId: CLAUDECODE_WORKSPACE_ID,
-    ...(rawSessionId ? { sessionId: rawSessionId } : {}),
-  });
-  // hooks-PL-2 leg (a): the 'read' RPC is the recency-ordered learning surface
-  // AND the daemon path that records learning_reads — without it, corrections
-  // to beliefs this agent saw can never match in stale_beliefs.
-  const recentLearnings = await readAgentContext({ agentId: CLAUDECODE_AGENT_ID, limit: 8 });
   // TTL-reap stale file handoffs BEFORE the honest read so they neither occupy
   // the capped slice nor inflate totals; they surface once below as 'expired'.
+  // SEQUENTIAL on purpose: readInboxStatus below counts what is on disk, so
+  // racing the reaper against it would report reaped files as still pending.
+  //
+  // DELIBERATELY UNBUDGETED. The reaper ARCHIVES as it walks, and withBudget
+  // races rather than cancels — so a budget-cut reaper would keep archiving in
+  // the background while this boot reported an empty `expired` list. Archived
+  // entries are invisible to readInboxStatus, so they would then be reported
+  // ZERO times, breaking the surfaces-exactly-once contract. A budget may skip
+  // a READ; it must not half-report a WRITE.
   const expiredHandoffs = await expireStaleInboxHandoffs(CLAUDECODE_VAULT_PATH);
-  const inboxStatus = await readInboxStatus(CLAUDECODE_VAULT_PATH, 3);
-  const pending = inboxStatus.entries;
-  const handoffContext = await resolveInboxHandoffContext(CLAUDECODE_VAULT_PATH, pending);
-  const pendingHandoffs = await listPendingHandoffs({ agentId: CLAUDECODE_AGENT_ID });
+  const [status, tail, recall, recentLearnings, inboxStatus] =
+    await Promise.all([
+      withBudget(
+        // timeoutMs, not just the withBudget race: the race ABANDONS the status
+        // RPC, and an abandoned socket handle keeps this process alive past the
+        // harness kill — which discards output we had already written.
+        buildStatusReport({ vaultPath: CLAUDECODE_VAULT_PATH, timeoutMs: remainingMs() }),
+        remainingMs(),
+        undefined,
+      ),
+      withBudget(auditTail(CLAUDECODE_VAULT_PATH, 5), remainingMs(), undefined),
+      // recall-F1: boot recall previously whitelisted layers=['identity'], which
+      // dropped knowledge-layer corrections before rerank. Widen to the
+      // correction-bearing layers (single query; the engine's correction salience
+      // floor ranks fresh corrections above saturated habitual hits) instead of a
+      // second corrections-only round-trip. See BOOT_RECALL_LAYERS for the policy.
+      withBudget(
+        recallMemory({
+          query: `boot identity for ${CLAUDECODE_WORKSPACE_ID}`,
+          layers: BOOT_RECALL_LAYERS,
+          limit: 8,
+          agentId: CLAUDECODE_AGENT_ID,
+          workspaceId: CLAUDECODE_WORKSPACE_ID,
+          // The load-bearing deadline: it destroys the socket, which is what
+          // lets the hook PROCESS exit. Racing a promise alone cannot do that.
+          timeoutMs: remainingMs(),
+          ...(rawSessionId ? { sessionId: rawSessionId } : {}),
+        }),
+        remainingMs(),
+        rpcTimedOut,
+      ),
+      // hooks-PL-2 leg (a): the 'read' RPC is the recency-ordered learning surface
+      // AND the daemon path that records learning_reads — without it, corrections
+      // to beliefs this agent saw can never match in stale_beliefs.
+      withBudget(
+        readAgentContext({
+          agentId: CLAUDECODE_AGENT_ID,
+          limit: 8,
+          timeoutMs: remainingMs(),
+        }),
+        remainingMs(),
+        rpcTimedOut,
+      ),
+      withBudget(readInboxStatus(CLAUDECODE_VAULT_PATH, 3), remainingMs(), undefined),
+    ]);
+  const pending = inboxStatus?.entries ?? [];
+  // The `ok` flag distinguishes "the budget cut this read" from its natural
+  // empty result — an [] fallback alone is indistinguishable from "no handoff
+  // refs", which is the false all-clear this whole section exists to avoid.
+  const handoffRead = await withBudget<{
+    ok: boolean;
+    snippets: Awaited<ReturnType<typeof resolveInboxHandoffContext>>;
+  }>(
+    resolveInboxHandoffContext(CLAUDECODE_VAULT_PATH, pending).then((snippets) => ({
+      ok: true,
+      snippets,
+    })),
+    remainingMs(),
+    { ok: false, snippets: [] },
+  );
+  const handoffContext = handoffRead.snippets;
+  const pendingHandoffs = await withBudget(
+    listPendingHandoffs({ agentId: CLAUDECODE_AGENT_ID, timeoutMs: remainingMs() }),
+    remainingMs(),
+    rpcTimedOut,
+  );
   const pendingHandoffData = pendingHandoffs.ok && pendingHandoffs.data
     ? pendingHandoffs.data as { handoffs?: Array<{ lease_id?: string; leaseId?: string }> }
     : { handoffs: [] };
   const ackedLeases: string[] = [];
+  let unackedLeases = 0;
   for (const handoff of pendingHandoffData.handoffs ?? []) {
     const leaseId = handoff.lease_id ?? handoff.leaseId;
     if (!leaseId) continue;
-    const ack = await ackHandoff({ leaseId, status: "accepted", agentId: CLAUDECODE_AGENT_ID });
+    // One RPC PER LEASE: unbounded in the number of pending handoffs, so it is
+    // the loop most able to blow the deadline. Stop acking when the budget is
+    // gone — an unacked lease is still pending next boot; a killed hook is not.
+    if (remainingMs() <= 0) {
+      unackedLeases += 1;
+      continue;
+    }
+    const ack = await withBudget(
+      ackHandoff({
+        leaseId,
+        status: "accepted",
+        agentId: CLAUDECODE_AGENT_ID,
+        timeoutMs: remainingMs(),
+      }),
+      remainingMs(),
+      rpcTimedOut,
+    );
+    // A FAILED ack is an unacked lease too — counting only the budget-skip path
+    // reported a timed-out or refused ack as a clean boot.
     if (ack.ok) ackedLeases.push(leaseId);
+    else unackedLeases += 1;
   }
-  const contradictions = await subscribeContradictions({ agentId: CLAUDECODE_AGENT_ID });
+  const contradictions = await withBudget(
+    subscribeContradictions({ agentId: CLAUDECODE_AGENT_ID, timeoutMs: remainingMs() }),
+    remainingMs(),
+    rpcTimedOut,
+  );
+  // `undefined` from resolveActivePlanView MEANS "no active plan", so it cannot
+  // double as the budget-cut fallback — the two must stay distinguishable.
+  let planRead: {
+    ok: boolean;
+    view: Awaited<ReturnType<typeof resolveActivePlanView>>;
+  } = { ok: true, view: undefined };
+  // No try/catch: it would be DEAD CODE, and a catch that implies an audit
+  // row which can never be written is exactly the health-signal overstatement
+  // this work is removing elsewhere. Neither call can reject —
+  // resolveActivePlanView swallows its own failures and returns undefined,
+  // and withBudget turns any rejection into its fallback. A budget cut still
+  // surfaces, via planRead.ok === false -> degraded.sections.
+  //
+  // Note the honest limit that leaves: a plan FS failure is indistinguishable
+  // from 'no active plan', because resolveActivePlanView conflates them at
+  // source. Pre-existing and out of scope here — fixing it belongs in plan.ts.
+  planRead = await withBudget(
+    resolveActivePlanView(CLAUDECODE_VAULT_PATH).then((view) => ({ ok: true, view })),
+    remainingMs(),
+    { ok: false, view: undefined },
+  );
+  const activePlan = planRead.view;
 
-  let activePlan: any = undefined;
-  try {
-    activePlan = await resolveActivePlanView(CLAUDECODE_VAULT_PATH);
-  } catch (error) {
-    // hooks-PL-5: a failed plan resolution must not silently boot plan-less.
-    await recordAudit(CLAUDECODE_VAULT_PATH, {
-      tool: "hook_active_plan_error",
-      summary: `SessionStart: ${error instanceof Error ? error.message : String(error)}`,
-    }).catch(() => {});
-  }
+  // Sections the budget cut. Named so a degraded boot is legible as degraded
+  // rather than as an agent with nothing in its memory (hooks-PL-5). Computed
+  // AFTER every budgeted read, so a read that runs late can still report itself.
+  const degradedSections = [
+    status === undefined ? "status" : undefined,
+    tail === undefined ? "audit_tail" : undefined,
+    inboxStatus === undefined ? "pending_learnings" : undefined,
+    unackedLeases > 0 ? "handoff_acks" : undefined,
+    // Also degraded when the PARENT read was cut: handoffContext is resolved
+    // from inboxStatus.entries, so a cut inbox read makes it vacuously empty.
+    // ok:true over an empty set the hook never actually had inputs for is the
+    // same false all-clear this section exists to prevent.
+    handoffRead.ok && inboxStatus !== undefined ? undefined : "handoff_context",
+    planRead.ok ? undefined : "active_thread",
+    // A failed LIST is not "no pending handoffs": it degraded to an empty set,
+    // and reporting handoff_acks:[] without saying so is a false all-clear.
+    pendingHandoffs.ok ? undefined : "handoff_leases",
+  ].filter((section): section is string => section !== undefined);
 
   // hooks-PL-3: re-assert corrections stashed by PreCompact, so the
   // post-compaction boot re-injects them even if the daemon is down now.
   // Only fully-consumed entries are cleared (exactly-once re-injection, no
   // unbounded inbox growth); cap-overflowed tails are rewritten for the next
   // boot, and all-malformed entries survive for inspection.
-  const { events: correctionsReassert, consumedPaths: reassertConsumed, deferredTails: reassertDeferred } =
-    collectCorrectionsReassert(pending);
-  await settleReassertedInboxEntries(CLAUDECODE_VAULT_PATH, {
-    consumedPaths: reassertConsumed,
-    deferredTails: reassertDeferred,
-  });
+  //
+  // Its OWN read, deliberately UNBUDGETED — it must not ride the budgeted
+  // `readInboxStatus` above. That read degrades to undefined when the budget is
+  // spent, and reassert would then see an empty `pending` and silently inject
+  // nothing: the post-compaction boot, the one this whole path exists for,
+  // would come up with no corrections. This is cheap local FS and it is the one
+  // read whose absence loses data rather than context.
+  //
+  // readReassertPending (not readInboxStatus) is also the I5 window: it filters
+  // to entries that actually carry stale-belief events before taking newest-N,
+  // so unrelated inbox files cannot crowd a valid correction out of the slots.
+  const reassertPending = await readReassertPending(CLAUDECODE_VAULT_PATH, 3);
+  const { events: correctionsReassert, consumedPaths: reassertConsumed, contributingPaths: reassertContributing, deferredTails: reassertDeferred } =
+    collectCorrectionsReassert(reassertPending);
+  // R2: settle AFTER the envelope reaches the host, never before. Archiving
+  // here would consume the correction inside the window where the boot can
+  // still be killed, losing it for good — see hook-delivery.ts.
+  //
+  // Conditional on this envelope actually CARRYING something: when nothing was
+  // injected, the consumed paths are empty stashes, which carry no correction,
+  // so clearing them does not depend on delivery. (Parity with the factory —
+  // claude-code can always inject at SessionStart, so its envelope is never
+  // wire-dropped, but the rule belongs on both paths rather than in one.)
+  // Settled in TWO parts, because the two halves have different preconditions.
+  // Empty stashes carry no correction, so clearing them cannot depend on
+  // delivery — and must not, or a platform that can never inject would keep
+  // them forever. Entries that CONTRIBUTED events (and partially-injected
+  // tails) may only settle once the envelope carrying them lands. Deferring
+  // both together held the empties hostage whenever one window contained a
+  // real correction AND an empty stash.
+  // Counted separately for the audit below: settling eagerly and waiting on
+  // delivery are different facts, and one "pending" number covering both
+  // misreports the empties as archives that have not happened yet.
+  const emptyPaths = reassertConsumed.filter(
+    (filePath) => !reassertContributing.includes(filePath),
+  );
+  if (emptyPaths.length > 0) {
+    await settleReassertedInboxEntries(CLAUDECODE_VAULT_PATH, {
+      consumedPaths: emptyPaths,
+      deferredTails: [],
+    });
+  }
+  if (reassertContributing.length > 0 || reassertDeferred.length > 0) {
+    deferUntilDelivered(() =>
+      settleReassertedInboxEntries(CLAUDECODE_VAULT_PATH, {
+        consumedPaths: reassertContributing,
+        deferredTails: reassertDeferred,
+      }),
+    );
+  }
 
   const envelopeBody: any = {
     contract: MEMORY_CONTRACT,
@@ -190,10 +387,25 @@ async function handleSessionStart(payload: Record<string, unknown>): Promise<Hoo
       workspace: CLAUDECODE_WORKSPACE_ID,
       vault: CLAUDECODE_VAULT_PATH,
       session_id: sessionId,
-      daemon_ok: status.socket.ok,
-      afm_ok: status.afm.ok,
+      // Unknown reads as not-ok, never as ok: `degraded.sections` below says
+      // which of these the budget cut, so "false" is not read as "checked".
+      daemon_ok: status?.socket.ok ?? false,
+      afm_ok: status?.afm.ok ?? false,
     },
-    pending_learnings: buildPendingLearningsSection(inboxStatus, expiredHandoffs),
+    // Omitted rather than zero-filled when the budget cut the inbox read: a
+    // "0 pending" the hook never counted is a false all-clear.
+    ...(inboxStatus !== undefined
+      ? { pending_learnings: buildPendingLearningsSection(inboxStatus, expiredHandoffs) }
+      : {}),
+    // The reaper is UNBUDGETED and already archived these, so this boot is
+    // their only chance to be reported — but they normally ride inside
+    // pending_learnings, which the line above drops when the budgeted inbox
+    // read degraded. That combination reported them ZERO times, the exact
+    // failure the reaper is unbudgeted to avoid. Ship them on their own
+    // whenever their usual carrier is missing.
+    ...(inboxStatus === undefined && expiredHandoffs.length > 0
+      ? { expired_handoffs: expiredHandoffsBody(expiredHandoffs) }
+      : {}),
     handoff_context: handoffContext.map((snippet) => ({
       ref: snippet.ref,
       path: snippet.relativePath,
@@ -226,8 +438,20 @@ async function handleSessionStart(payload: Record<string, unknown>): Promise<Hoo
               "No recent learnings.",
           }
         : { ok: false, error: recentLearnings.error },
-    audit_tail: tail.entries.slice(-5).map((entry) => entry.split("\n")[0]),
+    ...(tail !== undefined
+      ? { audit_tail: tail.entries.slice(-5).map((entry) => entry.split("\n")[0]) }
+      : {}),
   };
+
+  if (degradedSections.length > 0) {
+    // Say so IN the envelope: a boot the budget truncated must never be
+    // indistinguishable from a boot that found nothing (hooks-PL-5).
+    envelopeBody.degraded = {
+      sections: degradedSections,
+      budget_ms: budgetMs,
+      note: "Boot exceeded the SessionStart budget (likely a cold daemon). The listed sections were NOT read — treat them as unknown, not empty, and call minni_recall explicitly if they matter.",
+    };
+  }
 
   // c2/c5 (claude-code only): the standing 4-surface lifecycle line at boot so the
   // agent sees the spine from session start (unless the feature is off).
@@ -266,14 +490,22 @@ async function handleSessionStart(payload: Record<string, unknown>): Promise<Hoo
     tool: "hook_session_start",
     summary: `boot ${sessionId}`,
     details: {
-      daemon_ok: status.socket.ok,
-      afm_ok: status.afm.ok,
-      pending_inbox: inboxStatus.totalPending,
+      daemon_ok: status?.socket.ok ?? false,
+      afm_ok: status?.afm.ok ?? false,
+      pending_inbox: inboxStatus?.totalPending ?? null,
       expired_handoffs: expiredHandoffs.length,
       handoff_context: handoffContext.length,
       corrections_reassert: correctionsReassert.length,
-      reassert_entries_cleared: reassertConsumed.length,
-      reassert_tails_deferred: reassertDeferred.length,
+      budget_ms: budgetMs,
+      ...(degradedSections.length > 0 ? { degraded_sections: degradedSections } : {}),
+      // Settle outcomes reported separately. "pending" counts ONLY what is
+      // still registered with deferUntilDelivered; empties already cleared are
+      // not waiting on anything, and folding them in claimed archives that had
+      // in fact already happened. (claude-code's wire can always inject at
+      // SessionStart, so there is no parked outcome on this path.)
+      reassert_entries_cleared_eager: emptyPaths.length,
+      reassert_entries_pending_clear: reassertContributing.length,
+      reassert_tails_pending_defer: reassertDeferred.length,
     },
   });
 
@@ -747,8 +979,18 @@ async function main(): Promise<void> {
   }
   try {
     const output = await dispatch(event, payload);
-    emit(output);
+    // emitAndCommit, not emit: work the handler deferred (archiving a consumed
+    // correction) runs only once this output has actually reached the host.
+    await emitAndCommit(output, {
+      vaultPath: CLAUDECODE_VAULT_PATH,
+      auditPrefix: "hook",
+      event,
+    });
+    // Delivery is settled; nothing left to wait for. See exitAfterDelivery.
+    exitAfterDelivery();
   } catch (error) {
+    // Nothing was delivered, so nothing the handler deferred may be committed.
+    discardDeliveryCommits();
     const message = error instanceof Error ? error.message : String(error);
     try {
       await recordAudit(CLAUDECODE_VAULT_PATH, {
@@ -759,7 +1001,9 @@ async function main(): Promise<void> {
       // audit unavailable; the systemMessage below still surfaces the failure
     }
     // hooks-PL-5: a degraded boot must never look like a clean one — say so.
-    emit({
+    // failAndExit, not emit: the degraded signal has to be FLUSHED before an
+    // abandoned RPC handle can keep this process alive into the harness kill.
+    await failAndExit({
       continue: true,
       systemMessage: `Minni hook degraded (${event}): ${message} — memory injection skipped this event; see vault log.md.`,
     });

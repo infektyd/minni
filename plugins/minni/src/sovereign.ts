@@ -162,10 +162,20 @@ export async function afmHealth(url = AFM_HEALTH_URL): Promise<JsonResult> {
   });
 }
 
-export async function socketHealth(): Promise<JsonResult> {
+export async function socketHealth(timeoutMs?: number): Promise<JsonResult> {
   // Daemon speaks JSON-RPC only; return its real result (including structured
   // errors) rather than masking them behind a dead HTTP-over-socket fallback.
-  return jsonRpcSocketRequestWithFallback("status", {});
+  //
+  // `timeoutMs` is the load-bearing deadline for a budgeted caller: it DESTROYS
+  // the socket. Racing this promise instead (withBudget) only abandons it — the
+  // in-flight handle keeps the event loop alive for the full 30s default, long
+  // past a hook budget, and a host that kills the hook discards its output even
+  // though it was already written.
+  return jsonRpcSocketRequestWithFallback(
+    "status",
+    {},
+    timeoutMs !== undefined ? { timeoutMs } : {},
+  );
 }
 
 /**
@@ -243,11 +253,18 @@ export async function learnMemory(input: {
 export async function readAgentContext(input: {
   agentId?: string;
   limit?: number;
+  /** Boot-budget deadline: destroys the socket, which is what lets a hook
+   * process EXIT (see the SessionStart budget in hook-handlers.ts). */
+  timeoutMs?: number;
 } = {}): Promise<JsonResult<ReadContextResponse>> {
-  return jsonRpcSocketRequestWithFallback("read", {
-    agent_id: input.agentId ?? DEFAULT_AGENT_ID,
-    limit: input.limit ?? 8,
-  }) as Promise<JsonResult<ReadContextResponse>>;
+  return jsonRpcSocketRequestWithFallback(
+    "read",
+    {
+      agent_id: input.agentId ?? DEFAULT_AGENT_ID,
+      limit: input.limit ?? 8,
+    },
+    input.timeoutMs !== undefined ? { timeoutMs: input.timeoutMs } : {},
+  ) as Promise<JsonResult<ReadContextResponse>>;
 }
 
 /**
@@ -552,6 +569,9 @@ export async function ackHandoff(
      * mirroring listPendingHandoffs.
      */
     agentId?: string;
+    /** Boot-budget deadline: this is one RPC PER LEASE, so it is the boot's
+     * most unbounded call and the one most able to blow the deadline. */
+    timeoutMs?: number;
   },
   requester: JsonRpcRequester = jsonRpcSocketRequest,
 ): Promise<JsonResult> {
@@ -560,16 +580,16 @@ export async function ackHandoff(
     status: input.status,
     contradicts_id: input.contradictsId,
     agent_id: input.agentId,
-  }, requester);
+  }, requester, input.timeoutMs !== undefined ? { timeoutMs: input.timeoutMs } : {});
 }
 
 export async function listPendingHandoffs(
-  input: { agentId: string },
+  input: { agentId: string; timeoutMs?: number },
   requester: JsonRpcRequester = jsonRpcSocketRequest,
 ): Promise<JsonResult> {
   return jsonRpcSocketRequestWithFallbackRequester("minni_list_pending_handoffs", {
     agent_id: input.agentId,
-  }, requester);
+  }, requester, input.timeoutMs !== undefined ? { timeoutMs: input.timeoutMs } : {});
 }
 
 export async function awaitHandoff(
@@ -583,13 +603,13 @@ export async function awaitHandoff(
 }
 
 export async function subscribeContradictions(
-  input: { agentId: string; sinceTs?: number },
+  input: { agentId: string; sinceTs?: number; timeoutMs?: number },
   requester: JsonRpcRequester = jsonRpcSocketRequest,
 ): Promise<JsonResult> {
   return jsonRpcSocketRequestWithFallbackRequester("minni_subscribe_contradictions", {
     agent_id: input.agentId,
     since_ts: input.sinceTs,
-  }, requester);
+  }, requester, input.timeoutMs !== undefined ? { timeoutMs: input.timeoutMs } : {});
 }
 
 /**
@@ -1026,7 +1046,25 @@ export async function buildStatusReport(input?: {
   /** Test seam: transport for the 1-token generation probe. */
   afmGenerationTransport?: (url: string, payload: Record<string, unknown>) => Promise<JsonResult>;
   afmGenerationTtlMs?: number;
+  /**
+   * Total time (ms) this report may spend on the network, for callers under a
+   * hook budget. Threaded into the daemon socket call and the AFM probe so they
+   * DESTROY their handles rather than merely being abandoned — an abandoned
+   * handle outlives the budget and keeps the process alive past the harness
+   * kill.
+   *
+   * It is a budget for the WHOLE report, not per leg. The legs run in sequence
+   * (socket status, then the AFM probe), so handing each the same figure would
+   * let the wall time reach ~2x it — and the caller's own outer race would then
+   * abandon a report that a shared deadline would have completed in time.
+   */
+  timeoutMs?: number;
 }): Promise<StatusReport> {
+  // One absolute deadline, shared by every network leg below.
+  const networkDeadline =
+    input?.timeoutMs !== undefined ? Date.now() + input.timeoutMs : undefined;
+  const networkRemainingMs = (): number | undefined =>
+    networkDeadline === undefined ? undefined : Math.max(0, networkDeadline - Date.now());
   const vaultPath = input?.vaultPath ?? DEFAULT_VAULT_PATH;
   await ensureVault(vaultPath);
   const tail = await auditTail(vaultPath, 1);
@@ -1037,7 +1075,7 @@ export async function buildStatusReport(input?: {
   // as socket.data.afm by health.py:156-189). Reordered so the reuse check
   // below (daemonAfmToProviderHealth) can skip a second, independently-timed
   // generation probe entirely when that fresh result is usable.
-  const socket = input?.socket ?? (await socketHealth());
+  const socket = input?.socket ?? (await socketHealth(networkRemainingMs()));
 
   let volume = 0;
   const logFiles = ["log.md", "log.1.md", "log.2.md", "log.3.md"];
@@ -1165,6 +1203,12 @@ export async function buildStatusReport(input?: {
       transport: input?.afmGenerationTransport,
       ttlMs: input?.afmGenerationTtlMs,
       nativeHelperPath: resolvedNativeHelperPath(),
+      // Budgeted callers cap the probe too: its 10s bridge / 45s native-helper
+      // defaults both outlive a hook budget, and the in-flight handle would
+      // keep the process alive past the deadline that kills it. What is left of
+      // the SHARED deadline, not a fresh copy of it — the socket leg above has
+      // already spent part of it.
+      ...(networkRemainingMs() !== undefined ? { timeoutMs: networkRemainingMs() } : {}),
     });
     source = "plugin-probe";
   }
