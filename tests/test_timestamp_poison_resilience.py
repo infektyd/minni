@@ -329,6 +329,28 @@ def test_filter_candidates_keeps_bad_row_when_no_date_filter_applies():
     assert [r["doc_id"] for r in out] == [590]
 
 
+def test_filter_candidates_falls_back_to_indexed_at_when_created_at_is_bad():
+    """grok-review round 3: `r.get("created_at") or r.get("indexed_at") or 0`
+    picked created_at whenever truthy, including non-numeric TEXT — shadowing
+    a usable indexed_at on the same candidate and dropping the row under a
+    date filter it would otherwise have passed."""
+    from minni.retrieval import RetrievalEngine
+
+    engine = RetrievalEngine.__new__(RetrievalEngine)
+    good_indexed_at = time.time() - 86400 * 5
+    out = engine._filter_candidates(
+        [{
+            "doc_id": 590, "layer": "knowledge",
+            "created_at": POISON_GARBAGE, "indexed_at": good_indexed_at,
+        }],
+        None, "2020-01-01", None,
+    )
+    assert [r["doc_id"] for r in out] == [590], (
+        "must fall back to the valid indexed_at instead of dropping the row "
+        "because created_at was garbage"
+    )
+
+
 def test_decay_pass_survives_a_text_indexed_at(tmp_path):
     """Slice R7 schedules decay; it must not abort its transaction on contact
     with the row already sitting in the live DB."""
@@ -353,7 +375,15 @@ def test_decay_pass_survives_a_text_indexed_at(tmp_path):
     assert stats["updated"] >= 1
 
 
-def test_decay_pass_skips_and_reports_an_unparseable_row(tmp_path):
+def test_decay_pass_degrades_instead_of_skipping_a_bad_indexed_at(tmp_path):
+    """grok-review round 3: a bad (non-NULL, unparseable) indexed_at used to
+    `continue` past the whole document — a true skip — even when nothing else
+    made that necessary: with no last_accessed at all, the NULL-indexed_at
+    path already falls back to `now`, so the bad-indexed_at path should too,
+    rather than leaving the row out of the pass entirely. The row is now
+    processed (using the `now` fallback, since no last_accessed exists
+    either) and counted into `bad_indexed_at`, not `skipped_bad_timestamp`.
+    """
     from minni.decay import MemoryDecay
     from minni.timestamps import (
         malformed_timestamp_report,
@@ -376,8 +406,12 @@ def test_decay_pass_skips_and_reports_an_unparseable_row(tmp_path):
     reset_malformed_timestamps()
     stats = MemoryDecay(db_obj, cfg).run_decay()
 
-    assert stats["skipped_bad_timestamp"] == 1, (
-        "the skipped row must be reported in the pass stats"
+    assert stats["bad_indexed_at"] == 1, (
+        "the bad-indexed_at row must be counted, but as degraded, not skipped"
+    )
+    assert stats["skipped_bad_timestamp"] == 0, (
+        "no row is left entirely undecayed by this loop — `now` is always "
+        "an available fallback anchor"
     )
     assert stats["updated"] >= 1, "the healthy row must still have been decayed"
     assert malformed_timestamp_report()["total"] >= 1
@@ -388,7 +422,45 @@ def test_decay_pass_skips_and_reports_an_unparseable_row(tmp_path):
             for r in c.execute("SELECT path, decay_score FROM documents")
         }
     assert rows["ok://doc"] < 1.0, "healthy doc decayed"
-    assert rows["poison://garbage"] == 1.0, "poisoned doc left alone, not guessed at"
+    # Falls back to `now` (no last_accessed to anchor on either), so its
+    # apparent age is ~0 and its score stays at the ceiling — computed via
+    # the fallback, not "left alone because it was skipped".
+    assert rows["poison://garbage"] == 1.0
+    reset_malformed_timestamps()
+
+
+def test_decay_uses_valid_last_accessed_when_indexed_at_is_bad(tmp_path):
+    """grok-review round 3's actually-reachable scenario: indexed_at is
+    unparseable TEXT but last_accessed is a valid, old REAL — the document
+    should decay using last_accessed as its anchor rather than being skipped
+    outright (the old `continue` would have thrown this real, usable signal
+    away)."""
+    from minni.decay import MemoryDecay
+    from minni.timestamps import reset_malformed_timestamps
+
+    db_obj, cfg = _make_db(tmp_path)
+    now = time.time()
+    old_last_accessed = now - 86400 * 60
+    _poison_bypassing_triggers(
+        cfg, "poison://bad-indexed-at",
+        indexed_at=POISON_GARBAGE, last_accessed=old_last_accessed,
+        access_count=0, decay_score=1.0,
+    )
+
+    reset_malformed_timestamps()
+    stats = MemoryDecay(db_obj, cfg).run_decay()
+
+    assert stats["bad_indexed_at"] == 1
+    assert stats["skipped_bad_timestamp"] == 0
+    assert stats["updated"] == 1, (
+        "must have decayed using last_accessed as the anchor, not skipped"
+    )
+
+    with db_obj.cursor() as c:
+        score = c.execute(
+            "SELECT decay_score FROM documents WHERE path = 'poison://bad-indexed-at'"
+        ).fetchone()["decay_score"]
+    assert score < 1.0, "a 60-day-old last_accessed anchor must show real decay"
     reset_malformed_timestamps()
 
 

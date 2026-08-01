@@ -48,14 +48,19 @@ class MemoryDecay:
         # duck-typed configs.
         grace_sec = float(self.config.correction_decay_grace_days) * 86400
         correction_floor = float(self.config.correction_decay_floor)
-        # grok-review (PR #242): skipped_bad_timestamp must mean what it says
-        # — a document that was NOT decayed. A bad last_accessed alone still
-        # gets decayed (falls back to indexed_at, same as the NULL case), so
-        # it earns its own counter rather than inflating "skipped" for a row
-        # that was, in fact, processed.
+        # grok-review (PR #242, rounds 2 and 3): skipped_bad_timestamp must
+        # mean what it says — a document that was NOT decayed. A bad
+        # last_accessed or a bad indexed_at each still get decayed (falling
+        # back to indexed_at, then to `now`, exactly like their respective
+        # NULL cases), so each earns its own counter rather than inflating
+        # "skipped" for a row that was, in fact, processed. No row is ever
+        # truly left undecayed by this loop anymore — `now` is always an
+        # available last-resort anchor — so skipped_bad_timestamp stays at 0
+        # today; it is kept for forward compatibility should a future change
+        # reintroduce a genuine hard-skip path.
         stats = {
-            "updated": 0, "reinforced": 0,
-            "skipped_bad_timestamp": 0, "bad_last_accessed": 0,
+            "updated": 0, "reinforced": 0, "skipped_bad_timestamp": 0,
+            "bad_indexed_at": 0, "bad_last_accessed": 0,
         }
 
         with self.db.transaction() as c:
@@ -70,9 +75,10 @@ class MemoryDecay:
                 # Audit R0: indexed_at / last_accessed are REAL-affinity columns,
                 # which SQLite happily fills with a non-numeric TEXT value. The
                 # arithmetic below then raises TypeError inside this transaction
-                # and aborts the ENTIRE decay pass over every document. Parse or
-                # skip the one row — and count the skip so it stays visible in
-                # the returned stats and the log, not silently absorbed.
+                # and aborts the ENTIRE decay pass over every document. Parse
+                # each field defensively; a bad value degrades to the same
+                # fallback its NULL counterpart already uses, and is counted
+                # (not silently absorbed) rather than aborting the row.
                 indexed_at = parse_epoch_or_report(
                     row["indexed_at"], field="indexed_at",
                     source="decay.run_decay", doc_id=doc_id,
@@ -81,17 +87,23 @@ class MemoryDecay:
                     row["last_accessed"], field="last_accessed",
                     source="decay.run_decay", doc_id=doc_id,
                 )
+                # grok-review round 3: a bad (non-NULL, unparseable) indexed_at
+                # used to `continue` past the whole document, even though a
+                # valid last_accessed could still anchor decay, and even a
+                # missing last_accessed just falls to `now` below — the same
+                # fallback the NULL-indexed_at case already gets. Degrade
+                # instead of skipping; parse_epoch_or_report already
+                # counted/logged the bad value in the malformed-timestamp
+                # report, so this counter is about "not decayed to plan", not
+                # visibility of the poison itself.
                 if row["indexed_at"] is not None and indexed_at is None:
-                    stats["skipped_bad_timestamp"] += 1
-                    continue
+                    stats["bad_indexed_at"] += 1
                 if indexed_at is None:
                     indexed_at = now
-                # Audit R0 (grok-review round 1): a poisoned last_accessed
-                # used to `continue` past the whole document, even though the
-                # normal NULL-last_accessed path already falls back to
-                # indexed_at. parse_epoch_or_report already counted/logged
-                # the bad value in the malformed-timestamp report; here it
-                # just becomes "no last_accessed", same as NULL — the
+                # grok-review round 1: a poisoned last_accessed used to
+                # `continue` past the whole document, even though the normal
+                # NULL-last_accessed path already falls back to indexed_at.
+                # It just becomes "no last_accessed", same as NULL — the
                 # document is still decayed below, so it is NOT a skip
                 # (grok-review round 2: the old code counted it as one).
                 if row["last_accessed"] is not None and last_accessed is None:
@@ -135,6 +147,13 @@ class MemoryDecay:
                 "with no usable fallback. Run migration 016 to normalize them.",
                 stats["skipped_bad_timestamp"],
             )
+        if stats["bad_indexed_at"]:
+            logger.warning(
+                "Decay pass decayed %d document(s) using a fallback anchor "
+                "(last_accessed or now): the stored indexed_at was non-numeric. "
+                "Run migration 016 to normalize them.",
+                stats["bad_indexed_at"],
+            )
         if stats["bad_last_accessed"]:
             logger.warning(
                 "Decay pass decayed %d document(s) from indexed_at instead of "
@@ -144,9 +163,10 @@ class MemoryDecay:
             )
         logger.info(
             "Decay pass complete: %d updated, %d reinforced, %d left undecayed "
-            "(bad timestamp), %d decayed via indexed_at fallback (bad last_accessed)",
-            stats["updated"], stats["reinforced"],
-            stats["skipped_bad_timestamp"], stats["bad_last_accessed"],
+            "(bad timestamp), %d decayed via fallback anchor (bad indexed_at), "
+            "%d decayed via indexed_at fallback (bad last_accessed)",
+            stats["updated"], stats["reinforced"], stats["skipped_bad_timestamp"],
+            stats["bad_indexed_at"], stats["bad_last_accessed"],
         )
         return stats
 

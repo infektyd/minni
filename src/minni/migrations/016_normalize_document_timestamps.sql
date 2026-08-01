@@ -37,7 +37,12 @@
 --          too, landing on the visible 0.0 sentinel — matching
 --          parse_epoch('1700000000.5.9') -> None).
 --
---   2. ISO-8601 (naive or offset-qualified, trailing 'Z' or '+HH:MM'/'-HH:MM').
+--   2. ISO-8601 (naive or offset-qualified, trailing 'Z' or '+HH:MM'/'-HH:MM'),
+--      optionally whitespace-padded (TRIMmed before strftime, same reasoning
+--      as step 1 — round 3 of grok-review caught this: a leading/trailing
+--      space made strftime('%s', ...) return NULL even though
+--      minni.timestamps.parse_epoch recovers the value via strip(), so the
+--      row fell to the 0.0 sentinel instead of its real, recoverable epoch).
 --      strftime('%s', ...) on this SQLite build (3.53+) resolves the offset
 --      before converting, matching minni.timestamps.parse_epoch's
 --      datetime.fromisoformat + timestamp() path. The trailing 'Z' is
@@ -103,17 +108,17 @@ UPDATE documents
 
 -- Step 2: everything still TEXT is either ISO-8601 or genuine garbage.
 UPDATE documents
-   SET indexed_at = COALESCE(CAST(strftime('%s', replace(replace(indexed_at, 'Z', ''), 'T', ' ')) AS REAL), 0.0)
+   SET indexed_at = COALESCE(CAST(strftime('%s', replace(replace(TRIM(indexed_at), 'Z', ''), 'T', ' ')) AS REAL), 0.0)
  WHERE indexed_at IS NOT NULL
    AND typeof(indexed_at) NOT IN ('integer', 'real');
 
 UPDATE documents
-   SET last_modified = COALESCE(CAST(strftime('%s', replace(replace(last_modified, 'Z', ''), 'T', ' ')) AS REAL), 0.0)
+   SET last_modified = COALESCE(CAST(strftime('%s', replace(replace(TRIM(last_modified), 'Z', ''), 'T', ' ')) AS REAL), 0.0)
  WHERE last_modified IS NOT NULL
    AND typeof(last_modified) NOT IN ('integer', 'real');
 
 UPDATE documents
-   SET last_accessed = COALESCE(CAST(strftime('%s', replace(replace(last_accessed, 'Z', ''), 'T', ' ')) AS REAL), 0.0)
+   SET last_accessed = COALESCE(CAST(strftime('%s', replace(replace(TRIM(last_accessed), 'Z', ''), 'T', ' ')) AS REAL), 0.0)
  WHERE last_accessed IS NOT NULL
    AND typeof(last_accessed) NOT IN ('integer', 'real');
 
@@ -157,19 +162,19 @@ BEGIN
        );
 
     UPDATE documents
-       SET indexed_at = COALESCE(CAST(strftime('%s', replace(replace(indexed_at, 'Z', ''), 'T', ' ')) AS REAL), 0.0)
+       SET indexed_at = COALESCE(CAST(strftime('%s', replace(replace(TRIM(indexed_at), 'Z', ''), 'T', ' ')) AS REAL), 0.0)
      WHERE doc_id = NEW.doc_id
        AND indexed_at IS NOT NULL
        AND typeof(indexed_at) NOT IN ('integer', 'real');
 
     UPDATE documents
-       SET last_modified = COALESCE(CAST(strftime('%s', replace(replace(last_modified, 'Z', ''), 'T', ' ')) AS REAL), 0.0)
+       SET last_modified = COALESCE(CAST(strftime('%s', replace(replace(TRIM(last_modified), 'Z', ''), 'T', ' ')) AS REAL), 0.0)
      WHERE doc_id = NEW.doc_id
        AND last_modified IS NOT NULL
        AND typeof(last_modified) NOT IN ('integer', 'real');
 
     UPDATE documents
-       SET last_accessed = COALESCE(CAST(strftime('%s', replace(replace(last_accessed, 'Z', ''), 'T', ' ')) AS REAL), 0.0)
+       SET last_accessed = COALESCE(CAST(strftime('%s', replace(replace(TRIM(last_accessed), 'Z', ''), 'T', ' ')) AS REAL), 0.0)
      WHERE doc_id = NEW.doc_id
        AND last_accessed IS NOT NULL
        AND typeof(last_accessed) NOT IN ('integer', 'real');
@@ -215,19 +220,19 @@ BEGIN
        );
 
     UPDATE documents
-       SET indexed_at = COALESCE(CAST(strftime('%s', replace(replace(indexed_at, 'Z', ''), 'T', ' ')) AS REAL), 0.0)
+       SET indexed_at = COALESCE(CAST(strftime('%s', replace(replace(TRIM(indexed_at), 'Z', ''), 'T', ' ')) AS REAL), 0.0)
      WHERE doc_id = NEW.doc_id
        AND indexed_at IS NOT NULL
        AND typeof(indexed_at) NOT IN ('integer', 'real');
 
     UPDATE documents
-       SET last_modified = COALESCE(CAST(strftime('%s', replace(replace(last_modified, 'Z', ''), 'T', ' ')) AS REAL), 0.0)
+       SET last_modified = COALESCE(CAST(strftime('%s', replace(replace(TRIM(last_modified), 'Z', ''), 'T', ' ')) AS REAL), 0.0)
      WHERE doc_id = NEW.doc_id
        AND last_modified IS NOT NULL
        AND typeof(last_modified) NOT IN ('integer', 'real');
 
     UPDATE documents
-       SET last_accessed = COALESCE(CAST(strftime('%s', replace(replace(last_accessed, 'Z', ''), 'T', ' ')) AS REAL), 0.0)
+       SET last_accessed = COALESCE(CAST(strftime('%s', replace(replace(TRIM(last_accessed), 'Z', ''), 'T', ' ')) AS REAL), 0.0)
      WHERE doc_id = NEW.doc_id
        AND last_accessed IS NOT NULL
        AND typeof(last_accessed) NOT IN ('integer', 'real');

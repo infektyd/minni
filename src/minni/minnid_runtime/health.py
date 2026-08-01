@@ -342,7 +342,13 @@ def handle_health_report(params: dict, request_id: Any, context: HealthContext) 
                 report["stale_docs"].append({
                     "doc_id": row["doc_id"],
                     "path": row["path"],
-                    "age_days": round((now - ts) / 86400, 1) if ts else None,
+                    # grok-review (PR #242): `if ts` treats the migration's own
+                    # 0.0 sentinel (a deliberate "needs attention" marker for
+                    # unparseable rows) as "no timestamp", since 0.0 is falsy —
+                    # so a repaired-to-sentinel row's very large, very visible
+                    # age gets hidden as None instead of shown. `is not None`
+                    # keeps 0.0 visible.
+                    "age_days": round((now - ts) / 86400, 1) if ts is not None else None,
                 })
 
             # Audit R0 visibility: a poisoned timestamp must be *reported*, not
