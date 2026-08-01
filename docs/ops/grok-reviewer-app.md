@@ -423,6 +423,30 @@ Do not enable it until phase 1 has actually been observed working — auto-merge
 on top of an unproven approval path just means PRs sit queued forever, or worse,
 merge on a signal nobody has verified.
 
+### Blast radius of the App key after this change
+
+Granting the gate `pull-requests: write` widens what a **key holder** can do.
+The code scopes dismissal to the App's own approvals; the *token* does not. Be
+explicit about what the key is now worth:
+
+| With the App key you CAN | You CANNOT |
+|---|---|
+| post `grok-mechanical-approve` (the required check) | **merge** — that needs `contents: write` |
+| satisfy `required_approving_review_count` | **change branch protection** — needs `administration: write`; the gate holds only `read` |
+| **dismiss a human's `CHANGES_REQUESTED`** — clearing a veto | satisfy `require_code_owner_reviews` |
+| update/close PRs, manage reviewers | |
+
+So after this change the key is worth: **the required check + the review count +
+the ability to clear a human veto.** Those were three separate factors before;
+they now share one root. Anyone with push access can reach that key (see the
+private-key section above), so the honest summary is that the mechanical gate
+does not contain a push-capable actor — it contains a pull request.
+
+**CODEOWNERS is the one layer the key cannot forge.** App approvals do NOT
+satisfy `require_code_owner_reviews`: code owners must be individuals or teams
+with write access, and a GitHub App installation is neither. That is precisely
+why it is worth configuring, and why it must own itself.
+
 ### CODEOWNERS — the human-required trust surface
 
 Once phase 2 is on, auto-merge plus a mechanical approval means nothing

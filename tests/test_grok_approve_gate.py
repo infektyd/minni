@@ -761,3 +761,70 @@ def test_approval_failure_never_masks_the_posted_decision(mod, monkeypatch):
     d = mod.run_gate(owner="o", repo="r", pr=1, head_sha="abc", token="t",
                      base_branch="main", post_token="app")
     assert d.conclusion == "success"
+
+
+def test_the_gates_own_approval_does_not_destroy_eligibility(mod):
+    """The mechanical APPROVE is deliberately marker-free. If analyze_reviews
+    stopped at it, the gate would read "newest App review, no marker" -> not
+    eligible -> go red -> dismiss its own approval -> next run sees the marker
+    again -> green -> re-approve, forever. Self-sustaining, because the
+    pull_request_review trigger fires on both submit and dismiss and App-token
+    actions do trigger workflows."""
+    marker_review = {
+        "user": {"login": "infektydgrokreviewer[bot]"},
+        "state": "COMMENTED",
+        "commit_id": HEAD_SHA,
+        "body": f"looks fine\n{mod.ELIGIBILITY_MARKER}\n",
+    }
+    approval = {
+        "user": {"login": "infektydgrokreviewer[bot]"},
+        "state": "APPROVED",
+        "commit_id": HEAD_SHA,
+        "body": mod.build_approval_body(HEAD_SHA, ("CI",)),
+    }
+    assert mod.analyze_reviews([marker_review], HEAD_SHA)[0] is True
+    # Newest review is now the gate's own approval — eligibility must survive.
+    assert mod.analyze_reviews([marker_review, approval], HEAD_SHA)[0] is True
+
+
+def test_gate_state_is_a_fixed_point_not_a_loop(mod):
+    """Six consecutive evaluations must converge, not oscillate."""
+    reviews = [{
+        "user": {"login": "infektydgrokreviewer[bot]"},
+        "state": "COMMENTED",
+        "commit_id": HEAD_SHA,
+        "body": f"ok\n{mod.ELIGIBILITY_MARKER}\n",
+    }]
+    conclusions = []
+    for _ in range(6):
+        eligible, blocked = mod.analyze_reviews(reviews, HEAD_SHA)
+        d = mod.decide(
+            mod.GateInput(HEAD_SHA, ("CI",), {"CI": "success"}, eligible, blocked, False)
+        )
+        conclusions.append(d.conclusion)
+        if d.conclusion == "success" and not mod.already_approved(reviews, HEAD_SHA):
+            reviews.append({
+                "user": {"login": "infektydgrokreviewer[bot]"},
+                "state": "APPROVED",
+                "commit_id": HEAD_SHA,
+                "body": mod.build_approval_body(HEAD_SHA, ("CI",)),
+            })
+    assert conclusions == ["success"] * 6, f"oscillated: {conclusions}"
+
+
+def test_a_real_veto_still_wins_over_the_gates_own_approval(mod):
+    """The APPROVED skip must not make the gate blind to a later veto."""
+    reviews = [
+        {"user": {"login": "infektydgrokreviewer[bot]"}, "state": "COMMENTED",
+         "commit_id": HEAD_SHA, "body": f"ok\n{mod.ELIGIBILITY_MARKER}\n"},
+        {"user": {"login": "infektydgrokreviewer[bot]"}, "state": "APPROVED",
+         "commit_id": HEAD_SHA, "body": "mechanical"},
+        {"user": {"login": "infektydgrokreviewer[bot]"}, "state": "CHANGES_REQUESTED",
+         "commit_id": HEAD_SHA, "body": "actually no"},
+    ]
+    eligible, blocked = mod.analyze_reviews(reviews, HEAD_SHA)
+    assert blocked is True
+    assert eligible is False, "a newer CHANGES_REQUESTED must still clear eligibility"
+    assert mod.decide(
+        mod.GateInput(HEAD_SHA, ("CI",), {"CI": "success"}, eligible, blocked, False)
+    ).conclusion == "failure"

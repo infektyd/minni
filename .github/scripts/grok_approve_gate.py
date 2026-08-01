@@ -396,6 +396,21 @@ def analyze_reviews(
             continue
         if not _is_app_bot(user):
             continue
+        # The gate's OWN mechanical APPROVE is not an eligibility signal, and
+        # must not end this search. It is deliberately marker-free, so without
+        # this skip it reads as "newest App review, no marker" -> not eligible
+        # -> the gate goes red and dismisses its own approval -> the next run
+        # sees the marker review again -> green -> re-approve. Forever, and
+        # self-sustaining: the pull_request_review trigger fires on both submit
+        # and dismiss, and App-token actions DO trigger workflows (unlike
+        # GITHUB_TOKEN, which has anti-recursion).
+        #
+        # LOAD-BEARING PRECONDITION: grok-review.yml submits only
+        # REQUEST_CHANGES or COMMENT, never APPROVE, so an APPROVED App review
+        # can only be ours. If the reviewer is ever changed to post APPROVE,
+        # this skip will silently swallow it and eligibility will never be seen.
+        if state == "APPROVED":
+            continue
         if state != "CHANGES_REQUESTED" and _has_marker(rev.get("body")):
             eligible = (rev.get("commit_id") or "") == head_sha
         # First App-bot review seen wins, marker or not. Do not fall through to
