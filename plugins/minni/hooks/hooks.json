@@ -6,7 +6,7 @@
           {
             "type": "command",
             "command": "node ${CLAUDE_PLUGIN_ROOT}/dist/hook.js SessionStart",
-            "timeout": 60
+            "timeout": 600
           }
         ]
       }

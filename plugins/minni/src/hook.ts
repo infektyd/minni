@@ -91,11 +91,18 @@ import {
 /**
  * Claude Code's SessionStart deadline, as an OUTER bound on the boot budget —
  * same contract as the factory's `sessionStartHookTimeoutMs`. Mirrors
- * `hooks/hooks.json` SessionStart `"timeout": 60`; the two must be edited
+ * `hooks/hooks.json` SessionStart `"timeout": 600`; the two must be edited
  * together, since a manifest tightened below the budget would resurrect the
  * bug this bounds (killed mid-boot, output discarded).
+ *
+ * 600s is Claude Code's DOCUMENTED default for a `command` hook, which
+ * SessionStart does not override (only UserPromptSubmit at 30s, MessageDisplay
+ * at 10s and SessionEnd's shared 1.5s budget do). The manifest states it
+ * explicitly rather than inheriting it, so the value this constant mirrors is
+ * visible in the file the platform reads — writing a SMALLER number here would
+ * be a real tightening of the boot deadline, not documentation of it.
  */
-const CLAUDECODE_SESSION_START_TIMEOUT_MS = 60_000;
+const CLAUDECODE_SESSION_START_TIMEOUT_MS = 600_000;
 
 async function handleSessionStart(payload: Record<string, unknown>): Promise<HookOutput> {
   // rawSessionId is the payload's own id, possibly empty — never the
@@ -152,9 +159,14 @@ async function handleSessionStart(payload: Record<string, unknown>): Promise<Hoo
   // the capped slice nor inflate totals; they surface once below as 'expired'.
   // SEQUENTIAL on purpose: readInboxStatus below counts what is on disk, so
   // racing the reaper against it would report reaped files as still pending.
-  const expiredHandoffs =
-    (await withBudget(expireStaleInboxHandoffs(CLAUDECODE_VAULT_PATH), remainingMs(), undefined)) ??
-    [];
+  //
+  // DELIBERATELY UNBUDGETED. The reaper ARCHIVES as it walks, and withBudget
+  // races rather than cancels — so a budget-cut reaper would keep archiving in
+  // the background while this boot reported an empty `expired` list. Archived
+  // entries are invisible to readInboxStatus, so they would then be reported
+  // ZERO times, breaking the surfaces-exactly-once contract. A budget may skip
+  // a READ; it must not half-report a WRITE.
+  const expiredHandoffs = await expireStaleInboxHandoffs(CLAUDECODE_VAULT_PATH);
   const [status, tail, recall, recentLearnings, inboxStatus] =
     await Promise.all([
       withBudget(buildStatusReport({ vaultPath: CLAUDECODE_VAULT_PATH }), remainingMs(), undefined),
@@ -194,12 +206,21 @@ async function handleSessionStart(payload: Record<string, unknown>): Promise<Hoo
       withBudget(readInboxStatus(CLAUDECODE_VAULT_PATH, 3), remainingMs(), undefined),
     ]);
   const pending = inboxStatus?.entries ?? [];
-  const handoffContext =
-    (await withBudget(
-      resolveInboxHandoffContext(CLAUDECODE_VAULT_PATH, pending),
-      remainingMs(),
-      undefined,
-    )) ?? [];
+  // The `ok` flag distinguishes "the budget cut this read" from its natural
+  // empty result — an [] fallback alone is indistinguishable from "no handoff
+  // refs", which is the false all-clear this whole section exists to avoid.
+  const handoffRead = await withBudget<{
+    ok: boolean;
+    snippets: Awaited<ReturnType<typeof resolveInboxHandoffContext>>;
+  }>(
+    resolveInboxHandoffContext(CLAUDECODE_VAULT_PATH, pending).then((snippets) => ({
+      ok: true,
+      snippets,
+    })),
+    remainingMs(),
+    { ok: false, snippets: [] },
+  );
+  const handoffContext = handoffRead.snippets;
   const pendingHandoffs = await withBudget(
     listPendingHandoffs({ agentId: CLAUDECODE_AGENT_ID, timeoutMs: remainingMs() }),
     remainingMs(),
@@ -237,21 +258,17 @@ async function handleSessionStart(payload: Record<string, unknown>): Promise<Hoo
     remainingMs(),
     rpcTimedOut,
   );
-  // Sections the budget cut. Named so a degraded boot is legible as degraded
-  // rather than as an agent with nothing in its memory (hooks-PL-5).
-  const degradedSections = [
-    status === undefined ? "status" : undefined,
-    tail === undefined ? "audit_tail" : undefined,
-    inboxStatus === undefined ? "pending_learnings" : undefined,
-    unackedLeases > 0 ? "handoff_acks" : undefined,
-  ].filter((section): section is string => section !== undefined);
-
-  let activePlan: any = undefined;
+  // `undefined` from resolveActivePlanView MEANS "no active plan", so it cannot
+  // double as the budget-cut fallback — the two must stay distinguishable.
+  let planRead: {
+    ok: boolean;
+    view: Awaited<ReturnType<typeof resolveActivePlanView>>;
+  } = { ok: true, view: undefined };
   try {
-    activePlan = await withBudget(
-      resolveActivePlanView(CLAUDECODE_VAULT_PATH),
+    planRead = await withBudget(
+      resolveActivePlanView(CLAUDECODE_VAULT_PATH).then((view) => ({ ok: true, view })),
       remainingMs(),
-      undefined,
+      { ok: false, view: undefined },
     );
   } catch (error) {
     // hooks-PL-5: a failed plan resolution must not silently boot plan-less.
@@ -260,6 +277,19 @@ async function handleSessionStart(payload: Record<string, unknown>): Promise<Hoo
       summary: `SessionStart: ${error instanceof Error ? error.message : String(error)}`,
     }).catch(() => {});
   }
+  const activePlan = planRead.view;
+
+  // Sections the budget cut. Named so a degraded boot is legible as degraded
+  // rather than as an agent with nothing in its memory (hooks-PL-5). Computed
+  // AFTER every budgeted read, so a read that runs late can still report itself.
+  const degradedSections = [
+    status === undefined ? "status" : undefined,
+    tail === undefined ? "audit_tail" : undefined,
+    inboxStatus === undefined ? "pending_learnings" : undefined,
+    unackedLeases > 0 ? "handoff_acks" : undefined,
+    handoffRead.ok ? undefined : "handoff_context",
+    planRead.ok ? undefined : "active_thread",
+  ].filter((section): section is string => section !== undefined);
 
   // hooks-PL-3: re-assert corrections stashed by PreCompact, so the
   // post-compaction boot re-injects them even if the daemon is down now.

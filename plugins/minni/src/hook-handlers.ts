@@ -470,8 +470,14 @@ export function createHookHandlers(
 
     // TTL-reap stale file handoffs BEFORE the honest read so they neither occupy
     // the capped slice nor inflate totals; they surface once below as 'expired'.
-    const expiredHandoffs =
-      (await withBudget(expireStaleInboxHandoffs(config.vaultPath), remainingMs(), undefined)) ?? [];
+    //
+    // DELIBERATELY UNBUDGETED. The reaper ARCHIVES as it walks, and withBudget
+    // races rather than cancels — so a budget-cut reaper would keep archiving in
+    // the background while this boot reported an empty `expired` list. Archived
+    // entries are invisible to readInboxStatus, so they would then be reported
+    // ZERO times, breaking the surfaces-exactly-once contract. A budget may skip
+    // a READ; it must not half-report a WRITE.
+    const expiredHandoffs = await expireStaleInboxHandoffs(config.vaultPath);
     const [status, tail, identityRead, recall, contradictions, inboxStatus] = await Promise.all([
       withBudget(buildStatusReport({ vaultPath: config.vaultPath }), remainingMs(), undefined),
       withBudget(auditTail(config.vaultPath, 5), remainingMs(), undefined),
@@ -512,20 +518,22 @@ export function createHookHandlers(
       ),
       withBudget(readInboxStatus(config.vaultPath, 3), remainingMs(), undefined),
     ]);
-    // Sections the budget cut. Named so a degraded boot is legible as degraded
-    // rather than as an agent with nothing in its memory (hooks-PL-5).
-    const degradedSections = [
-      status === undefined ? "status" : undefined,
-      tail === undefined ? "audit_tail" : undefined,
-      inboxStatus === undefined ? "pending_learnings" : undefined,
-    ].filter((section): section is string => section !== undefined);
     const pending = inboxStatus?.entries ?? [];
-    const handoffContext =
-      (await withBudget(
-        resolveInboxHandoffContext(config.vaultPath, pending),
-        remainingMs(),
-        undefined,
-      )) ?? [];
+    // The `ok` flag distinguishes "the budget cut this read" from its natural
+    // empty result — an [] fallback alone is indistinguishable from "no handoff
+    // refs", which is the false all-clear this whole section exists to avoid.
+    const handoffRead = await withBudget<{
+      ok: boolean;
+      snippets: Awaited<ReturnType<typeof resolveInboxHandoffContext>>;
+    }>(
+      resolveInboxHandoffContext(config.vaultPath, pending).then((snippets) => ({
+        ok: true,
+        snippets,
+      })),
+      remainingMs(),
+      { ok: false, snippets: [] },
+    );
+    const handoffContext = handoffRead.snippets;
     // hooks-PL-3: re-assert corrections stashed by PreCompact, so the
     // post-compaction boot re-injects them even if the daemon is down now.
     // Consumed entries are settled (exactly-once re-injection, no unbounded
@@ -551,12 +559,17 @@ export function createHookHandlers(
 
     // Plan parity (audit C5): SessionStart injects the FULL active-plan view for
     // boot/rehydration, exactly like the claude-code hook.
-    let activePlan: Awaited<ReturnType<typeof resolveActivePlanView>>;
+    // `undefined` from resolveActivePlanView MEANS "no active plan", so it cannot
+    // double as the budget-cut fallback — the two must stay distinguishable.
+    let planRead: { ok: boolean; view: Awaited<ReturnType<typeof resolveActivePlanView>> } = {
+      ok: true,
+      view: undefined,
+    };
     try {
-      activePlan = await withBudget(
-        resolveActivePlanView(config.vaultPath),
+      planRead = await withBudget(
+        resolveActivePlanView(config.vaultPath).then((view) => ({ ok: true, view })),
         remainingMs(),
-        undefined,
+        { ok: false, view: undefined },
       );
     } catch (error) {
       // hooks-PL-5: a failed plan resolution must not silently boot plan-less.
@@ -565,6 +578,18 @@ export function createHookHandlers(
         summary: `SessionStart: ${error instanceof Error ? error.message : String(error)}`,
       }).catch(() => {});
     }
+    const activePlan = planRead.view;
+
+    // Sections the budget cut. Named so a degraded boot is legible as degraded
+    // rather than as an agent with nothing in its memory (hooks-PL-5). Computed
+    // AFTER every budgeted read, so a read that runs late can still report itself.
+    const degradedSections = [
+      status === undefined ? "status" : undefined,
+      tail === undefined ? "audit_tail" : undefined,
+      inboxStatus === undefined ? "pending_learnings" : undefined,
+      handoffRead.ok ? undefined : "handoff_context",
+      planRead.ok ? undefined : "active_thread",
+    ].filter((section): section is string => section !== undefined);
 
     const envelopeBody: Record<string, unknown> = {
       contract: MEMORY_CONTRACT,

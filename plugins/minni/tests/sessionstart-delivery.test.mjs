@@ -128,7 +128,7 @@ function runSessionStart(fixture) {
 /**
  * A SessionStart run whose output never reaches the host: the parent destroys
  * its read end before the child writes, so the envelope write fails with EPIPE.
- * Resolves once the child has exited.
+ * Resolves with the exit code and stderr once the child has exited.
  */
 function runSessionStartUndelivered(fixture) {
   return new Promise((resolve, reject) => {
@@ -136,15 +136,30 @@ function runSessionStartUndelivered(fixture) {
       env: hookEnv(fixture),
       stdio: ["pipe", "pipe", "pipe"],
     });
-    // Drain stderr so a warning cannot block the child on a full pipe.
-    child.stderr.resume();
+    let stderr = "";
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk;
+    });
     child.on("error", reject);
-    child.on("close", () => resolve());
+    child.on("close", (code) => resolve({ code, stderr }));
     child.stdin.end(JSON.stringify({ session_id: "delivery-fixture" }));
     // Close the delivery channel immediately — long before the child, which
     // must boot node and read the vault first, reaches its write.
     child.stdout.destroy();
   });
+}
+
+/** Whole audit log text (daily file plus the legacy log.md). */
+async function auditText(fixture) {
+  const day = new Date().toISOString().slice(0, 10);
+  const parts = await Promise.all(
+    [
+      path.join(fixture.vault, "log.md"),
+      path.join(fixture.vault, "logs", `${day}.md`),
+    ].map((file) => readFile(file, "utf8").catch(() => "")),
+  );
+  return parts.join("\n");
 }
 
 test(
@@ -157,7 +172,27 @@ test(
     assert.equal((await pendingEntries(fixture)).length, 1, "fixture starts with one correction");
 
     // The undeliverable boot: the host never receives the envelope.
-    await runSessionStartUndelivered(fixture);
+    const undelivered = await runSessionStartUndelivered(fixture);
+
+    // The correction must survive by DESIGN — the rollback path running — not
+    // because the process happened to crash before reaching the archive. An
+    // unhandled EPIPE would leave the entry intact too, and would have made
+    // this test pass against a hook that never rolled anything back.
+    assert.equal(
+      undelivered.code,
+      0,
+      `an undeliverable boot must exit cleanly, not crash: ${undelivered.stderr.slice(0, 400)}`,
+    );
+    assert.doesNotMatch(
+      undelivered.stderr,
+      /Unhandled 'error' event|EPIPE/,
+      "a closed host pipe must not surface a raw node stack trace",
+    );
+    assert.match(
+      await auditText(fixture),
+      /hook_undelivered/,
+      "a boot whose memory never reached the host must be visible as such in the audit",
+    );
 
     // THE GATE. Archiving before delivery consumes the correction without
     // delivering it, and nothing ever re-delivers it.
@@ -272,6 +307,41 @@ test("a throwing commit does not block the commits after it", async (t) => {
   assert.deepEqual(ran, ["after"], "a failed cleanup must not lose the rest");
 });
 
+test("an exhausted budget does not orphan the rejection of the work it abandons", async () => {
+  const { withBudget } = await import("../dist/hook-utils.js");
+  // withBudget's argument is an ALREADY-RUNNING promise, so the zero-budget
+  // branch must still attach a handler — an unhandled rejection terminates the
+  // process, and a spent budget is the ordinary case for every read after the
+  // first, not an exceptional one.
+  const rejected = Promise.reject(new Error("wedged filesystem"));
+  assert.equal(await withBudget(rejected, 0, "fallback"), "fallback");
+
+  let unhandled;
+  const onUnhandled = (error) => {
+    unhandled = error;
+  };
+  process.on("unhandledRejection", onUnhandled);
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  process.off("unhandledRejection", onUnhandled);
+  assert.equal(unhandled, undefined, "the abandoned work's rejection must be absorbed");
+});
+
+test("the TTL reaper is never raced by a budget: it archives as it walks", async () => {
+  // expireStaleInboxHandoffs ARCHIVES while it walks, and withBudget races
+  // rather than cancels. Budgeting it lets it keep archiving in the background
+  // while the boot reports an empty `expired` list — and archived entries are
+  // invisible to readInboxStatus, so those handoffs would be reported ZERO
+  // times, breaking the surfaces-exactly-once contract.
+  for (const file of ["hook.ts", "hook-handlers.ts"]) {
+    const source = await readFile(path.join(PLUGIN_ROOT, "src", file), "utf8");
+    assert.doesNotMatch(
+      source,
+      /withBudget\(\s*expireStaleInboxHandoffs/,
+      `${file}: the reaper is a destructive walk — a budget may skip a READ, never half-report a WRITE`,
+    );
+  }
+});
+
 // ---------------------------------------------------------------------------
 // Time budget: declared in code AND in the manifest, and the two must agree.
 // ---------------------------------------------------------------------------
@@ -336,6 +406,32 @@ test("each entrypoint's sessionStartHookTimeoutMs mirrors its manifest", async (
       `${entry}: sessionStartHookTimeoutMs (${declaredMs}) must mirror ${file} (${manifestMs})`,
     );
   }
+});
+
+test("claude-code's SessionStart constant mirrors hooks.json too", async () => {
+  // hook.ts names its constant differently from the factory's config field, so
+  // the loop above cannot cover it — and it is the entrypoint whose own comment
+  // demands the two be edited together.
+  const source = await readFile(path.join(PLUGIN_ROOT, "src", "hook.ts"), "utf8");
+  const match = source.match(/CLAUDECODE_SESSION_START_TIMEOUT_MS\s*=\s*([\d_]+)/);
+  assert.ok(match, "hook.ts must declare CLAUDECODE_SESSION_START_TIMEOUT_MS");
+  const declaredMs = Number(match[1].replace(/_/g, ""));
+  const manifestMs =
+    (await manifestSessionStartTimeout("hooks.json", (m) => m.hooks.SessionStart[0].hooks[0].timeout)) *
+    1000;
+  assert.equal(
+    declaredMs,
+    manifestMs,
+    `CLAUDECODE_SESSION_START_TIMEOUT_MS (${declaredMs}) must mirror hooks.json (${manifestMs})`,
+  );
+  // 600s is Claude Code's documented `command`-hook default, which SessionStart
+  // does not override. Declaring anything smaller would TIGHTEN the real boot
+  // deadline rather than document it — a regression disguised as a mirror.
+  assert.equal(
+    declaredMs,
+    600_000,
+    "claude-code's SessionStart deadline must stay at the platform default, not be tightened",
+  );
 });
 
 test("the SessionStart budget stays inside gemini's 10s kill with room to write", async () => {
