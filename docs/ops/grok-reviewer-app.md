@@ -207,9 +207,9 @@ policy therefore blocks our own PR-triggered jobs:
   architecture where the only review path is the explicit command is therefore
   compatible with environment scoping — at the cost of no automatic review on
   PR open.
-* the gate would keep only its `check_suite` / `workflow_run` triggers (those do
-  run from the default branch) and lose `pull_request` + `pull_request_review`,
-  taking the post-green veto with them.
+* the gate would keep only its `workflow_run` triggers (those do run from the
+  default branch) and lose `pull_request` + `pull_request_review`, taking the
+  post-green veto with them — but see the relay in option 1, which gets it back.
 
 Adding a `refs/pull/*/merge` policy to compensate re-opens the hole for every
 PR, which is strictly worse than where we started.
@@ -219,10 +219,16 @@ Two architectures actually close it. Both are operator decisions:
 1. **Split the identity.** Two Apps: a *reviewer* App (`pull_requests: write`,
    key reachable from PR runs) and a separate *gate* App (`checks: write` only)
    whose key lives in a default-branch-only Environment and is used solely by
-   the gate — which then runs on `check_suite` / `workflow_run` only. The
-   trust-root key becomes unreachable from PR-triggered workflows. Cost: the
-   `pull_request_review` veto trigger goes away, so a REQUEST_CHANGES submitted
-   after the check went green no longer revokes it until CI next runs.
+   the gate — which then runs on `workflow_run` only. The trust-root key becomes
+   unreachable from PR-triggered workflows.
+
+   The `pull_request_review` veto survives this, via a relay. A tiny
+   *unprivileged* workflow triggers on `pull_request_review`, holds no secrets
+   and does nothing but exist; the gate lists it in its own `workflow_run`
+   `workflows:`. The gate then runs from the default branch — satisfying the
+   Environment policy — while still waking on every review submission. Chain
+   depth is 2, which GitHub allows. So option 1's real cost is one extra
+   workflow file and a few seconds of latency, not the loss of the veto.
 2. **Remove push access from the agent class.** Agents open PRs from forks;
    fork PRs get no secrets. Then repository secrets are only reachable by the
    humans the gate is not trying to contain.

@@ -108,8 +108,8 @@ jobs:
           [ "$SAME" = "${{ github.repository }}" ] || skip "fork PRs are out of scope"
           [ "$DRAFT" != "true" ] || skip "PR is a draft"
 
-          # Dedup: the newest non-dismissed App review already covering this
-          # SHA means a repeat command would double-bill for the same diff.
+          # Dedup: an App review already covering this SHA means a repeat
+          # command would double-bill for the same diff.
           # Deliberately counts DISMISSED reviews too. Agents can dismiss, so
           # keying on non-dismissed reviews would let dismiss + /grok-review
           # re-roll the model on identical code until it happens to say yes.
