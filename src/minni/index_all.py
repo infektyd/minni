@@ -92,7 +92,19 @@ def index_all(
 
 
 def discover_agent_vaults(minni_home: str | Path | None = None) -> list[Path]:
-    """Return ~/.minni/*-vault dirs, excluding the legacy bare ~/.minni/vault."""
+    """Return ~/.minni/*-vault dirs, excluding the bare ~/.minni/vault.
+
+    The exclusion is correct and stays: this list feeds ``vault_ingest``, which
+    indexes a vault into its OWN per-agent sidecar store and derives the owning
+    agent from the ``<slug>-vault`` directory name. The bare ``vault`` has no
+    slug, so ``vault_ingest`` refuses it as ``unknown_vault_slug`` regardless --
+    and it is not per-agent anyway. It belongs to :class:`VaultIndexer` and the
+    shared DB, which is what :func:`index_shared_vault` runs.
+
+    Calling it "legacy" was the misleading part: it is the AFM writer's live
+    output directory, and because nothing scheduled ran the shared indexer over
+    it, every page the loop wrote sat unindexed. See index_shared_vault.
+    """
     home = Path(minni_home or CANONICAL_SOVEREIGN_HOME).expanduser()
     if not home.is_dir():
         return []
@@ -101,6 +113,31 @@ def discover_agent_vaults(minni_home: str | Path | None = None) -> list[Path]:
         for path in home.glob("*-vault")
         if path.is_dir() and path.name != "vault"
     )
+
+
+def index_shared_vault(config: SovereignConfig = None) -> Dict[str, Dict]:
+    """Incrementally index the shared vault (``config.vault_path``) into the shared DB.
+
+    ``discover_agent_vaults`` cannot cover this one (see its docstring), and
+    ``index_all`` only ever ran by hand, so on a long-lived daemon the AFM
+    loop's own output vault accumulated pages that no retrieval path could see.
+    This is the scheduled counterpart -- same incremental VaultIndexer pass the
+    CLI runs, callable from the daemon's vault-watch sweep.
+
+    Keyed by vault path so the result merges with ``index_agent_vaults``. The
+    ``deleted`` count is mirrored to ``pruned`` because that is the key the
+    sweep's change detection (and its retrieval-cache invalidation) reads.
+    """
+    config = config or DEFAULT_CONFIG
+    vault = str(config.vault_path)
+    db = SovereignDB(config)
+    try:
+        stats = VaultIndexer(db, config).index_vault(verbose=False)
+    finally:
+        db.close()
+    if "deleted" in stats:
+        stats = {**stats, "pruned": stats["deleted"]}
+    return {vault: stats}
 
 
 def index_agent_vaults(

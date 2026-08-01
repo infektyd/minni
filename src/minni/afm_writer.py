@@ -40,6 +40,9 @@ STALE_INTERVAL_MULTIPLE = 2.0
 # Pending drafts nobody has endorsed. The loop keeps producing regardless, so
 # depth is the only thing that reveals a review queue that has stopped draining.
 DRAFTS_PENDING_BACKLOG = 200
+# How far ahead a freshly written draft's `expires_at` is stamped. Matches the
+# `draft_ttl_days` default derive_loop_status judges backlog age against.
+DRAFT_TTL_SECONDS = 14 * 86400
 
 
 def record_pass_attempt(pass_name: str, now: Optional[float] = None) -> None:
@@ -266,10 +269,19 @@ def _frontmatter(draft: dict, created: str, expires_at: str, gate_status: str, i
     return "---\n" + header + "---\n\n"
 
 
-def _write_one(vault: Path, draft: dict, writeback: Any = None) -> dict:
+def _write_one(
+    vault: Path,
+    draft: dict,
+    writeback: Any = None,
+    now: Optional[float] = None,
+) -> dict:
     """Write one AFM draft (or refuse for forged). Return shape:
     - normal/quality-blocked: path/wikilink/status present, written implied by file
     - forged-frontmatter: path=None, wikilink=None, status="blocked", written=False (RCM-010 security)
+
+    ``now`` overrides the wall clock stamped into ``created``/``expires_at`` so
+    the writer and :func:`_expire_stale_drafts` can be round-tripped over a
+    real TTL boundary without patching the time module.
     """
     blockers = _quality_blockers(draft)
     forged = _contains_forged_frontmatter(draft.get("body", ""))
@@ -297,12 +309,13 @@ def _write_one(vault: Path, draft: dict, writeback: Any = None) -> dict:
             draft.get("title"), draft.get("page_id"),
         )
 
+    stamp = time.time() if now is None else now
+    created = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(stamp))
     section = draft.get("section") or f"{draft.get('kind', 'concept')}s"
-    rel = Path("wiki") / section / f"{_utc()[:10].replace('-', '')}-{_slugify(draft['title'])}-{draft['page_id'][-6:]}.md"
+    rel = Path("wiki") / section / f"{created[:10].replace('-', '')}-{_slugify(draft['title'])}-{draft['page_id'][-6:]}.md"
     path = vault / rel
     path.parent.mkdir(parents=True, exist_ok=True)
-    created = _utc()
-    expires_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 14 * 86400))
+    expires_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(stamp + DRAFT_TTL_SECONDS))
     with _page_lock(draft["page_id"]):
         # Title in markdown heading: minimal hygiene sanitize (newlines/# could mangle ATX; not a YAML key injection
         # vector — that is fully protected by safe_dump in _frontmatter per RCM-011). Out of RCM-010/011 YAML scope.
@@ -352,16 +365,9 @@ def _write_one(vault: Path, draft: dict, writeback: Any = None) -> dict:
     }
 
 
-def _expire_stale_drafts(vault: Path) -> int:
-    # KNOWN DEFECT, deliberately not fixed here (audit R1 is health-truth only):
-    # the expires_at pattern below has the same unquoted-only bug that
-    # writer_status just had, and yaml.safe_dump quotes the value -- so on the
-    # live vault this expires nothing and 1,210 drafts sit months past their
-    # TTL. Fixing it rewrites vault files in bulk, which is a remediation
-    # change, not a reporting one. writer_status now REPORTS the backlog and
-    # its age, so the condition is visible while it waits its turn.
+def _expire_stale_drafts(vault: Path, now: Optional[float] = None) -> int:
     expired = 0
-    now = time.time()
+    now = time.time() if now is None else now
     for path in (vault / "wiki").glob("**/*.md"):
         try:
             text = path.read_text(encoding="utf-8")
@@ -369,12 +375,24 @@ def _expire_stale_drafts(vault: Path) -> int:
             continue
         if "status: draft" not in text or "agent: afm-loop" not in text:
             continue
-        match = re.search(r"expires_at:\s*([0-9T:Z-]+)", text)
+        # Read expires_at out of the frontmatter block only, and tolerate the
+        # quotes yaml.safe_dump puts on it (`expires_at: '2026-06-22T…Z'`). The
+        # old unquoted-only pattern matched nothing a writer had ever produced,
+        # so on the live vault this expired zero of 1,213 drafts, the oldest of
+        # them months past TTL. Anchored per-line so body prose quoting the
+        # field name cannot stand in for the page's own value.
+        match = re.search(
+            r"^expires_at:\s*['\"]?([0-9T:.Z-]+)",
+            _extract_frontmatter(text),
+            re.MULTILINE,
+        )
         if not match:
             continue
-        try:
-            expires = time.mktime(time.strptime(match.group(1), "%Y-%m-%dT%H:%M:%SZ"))
-        except ValueError:
+        # calendar.timegm, not time.mktime: the value is UTC (trailing Z) and
+        # mktime reads a struct_time as LOCAL time, which shifted every
+        # comparison by the machine's UTC offset.
+        expires = _parse_iso_utc(match.group(1))
+        if expires is None:
             continue
         if expires < now:
             path.write_text(text.replace("status: draft", "status: expired", 1), encoding="utf-8")

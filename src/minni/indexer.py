@@ -307,15 +307,40 @@ class VaultIndexer:
                     if verbose:
                         logger.error("  ✗ %s: %s", path, e)
 
-            # Phase 2: Remove docs no longer on disk
+            # Phase 2: Remove docs no longer on disk.
+            #
+            # Two exemptions, both load-bearing. The SELECT is over the WHOLE
+            # documents table while `disk_files` only ever holds this vault's
+            # walk, so a naive "not on disk -> delete" prunes rows this indexer
+            # does not own:
+            #
+            #  * Outside vault_root: wiki_paths and every other indexed source
+            #    live in the same table. Running index_all masked this (the wiki
+            #    indexer re-added its rows right after), but running the vault
+            #    indexer ALONE — which the daemon's vault-watch sweep now does,
+            #    on an interval — deleted them for real.
+            #  * vault/_durable/: those rows are deliberately virtual. The
+            #    daemon indexes a promoted learning at a synthetic path and
+            #    never writes the markdown (see minnid._durable_doc_path), so
+            #    "no file on disk" is their normal state, not staleness.
+            #    Measured on the live install: 89 durable learnings sat under
+            #    that prefix with no file behind any of them.
+            from minni.path_safety import path_within_root
+            durable_root = vault_root / "_durable"
             c.execute("SELECT doc_id, path FROM documents")
             to_delete = []
             for row in c.fetchall():
-                if row["path"] not in disk_files:
-                    to_delete.append((row["doc_id"],))
-                    stats["deleted"] += 1
-                    if verbose:
-                        logger.info("  🗑 Removed: %s", row["path"])
+                path = row["path"]
+                if path in disk_files:
+                    continue
+                if not path_within_root(path, vault_root):
+                    continue
+                if path_within_root(path, durable_root):
+                    continue
+                to_delete.append((row["doc_id"],))
+                stats["deleted"] += 1
+                if verbose:
+                    logger.info("  🗑 Removed: %s", path)
 
             if to_delete:
                 doc_ids = [doc_id for (doc_id,) in to_delete]

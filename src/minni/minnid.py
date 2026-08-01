@@ -1034,9 +1034,18 @@ def _vault_watch_interval() -> int:
 
 def _vault_watch_sweep_once() -> dict:
     """Blocking incremental ingest of every discovered vault. Runs off-loop."""
-    from minni.index_all import index_agent_vaults
+    from minni.index_all import index_agent_vaults, index_shared_vault
 
-    return index_agent_vaults(DEFAULT_CONFIG, dry_run=False, verbose=False)
+    stats = index_agent_vaults(DEFAULT_CONFIG, dry_run=False, verbose=False)
+    # The shared vault is the AFM loop's own output directory and is NOT one of
+    # the per-agent vaults (see discover_agent_vaults), so without this it was
+    # indexed by nothing on a running daemon. Isolated: a failure here must not
+    # cost the agent-vault results already in hand.
+    try:
+        stats.update(index_shared_vault(DEFAULT_CONFIG))
+    except Exception:
+        logger.exception("Vault watch: shared vault sweep failed")
+    return stats
 
 
 async def _vault_watch_runner():
