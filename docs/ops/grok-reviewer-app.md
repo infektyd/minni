@@ -121,3 +121,6 @@ human attention on gate/workflow changes.
   just the newest per author, so a stale block does not silently expire. Dismiss
   it (`gh pr review --dismiss`) or push a new SHA and let Grok re-review.
 - Push → new SHA → gate re-runs on `synchronize` / check completion (L4).
+- The gate also re-runs on `pull_request_review`, so a `REQUEST_CHANGES`
+  submitted *after* the check went green revokes it. Without that trigger the
+  veto would be advisory only: bot reviews do not move `reviewDecision` here.

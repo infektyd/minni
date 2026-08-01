@@ -16,6 +16,10 @@ on:
     types: [completed]
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
+  # Without this, a REQUEST_CHANGES submitted AFTER the check went green never
+  # re-evaluates it — the documented veto would not actually revoke merge trust.
+  pull_request_review:
+    types: [submitted, dismissed, edited]
 
 permissions:
   contents: read
@@ -47,7 +51,7 @@ jobs:
           SHA=""
           PR=""
           case "${{ github.event_name }}" in
-            pull_request)
+            pull_request|pull_request_review)
               SHA="${{ github.event.pull_request.head.sha }}"
               PR="${{ github.event.pull_request.number }}"
               ;;
