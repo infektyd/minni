@@ -31,6 +31,7 @@ import {
   deferUntilDelivered,
   discardDeliveryCommits,
   emitAndCommit,
+  exitAfterDelivery,
 } from "./hook-delivery.js";
 import { harvestCompactSummary, harvestSummaryText } from "./compact-harvest.js";
 import { claudeCodeWire } from "./hook-platform.js";
@@ -175,7 +176,14 @@ async function handleSessionStart(payload: Record<string, unknown>): Promise<Hoo
   const expiredHandoffs = await expireStaleInboxHandoffs(CLAUDECODE_VAULT_PATH);
   const [status, tail, recall, recentLearnings, inboxStatus] =
     await Promise.all([
-      withBudget(buildStatusReport({ vaultPath: CLAUDECODE_VAULT_PATH }), remainingMs(), undefined),
+      withBudget(
+        // timeoutMs, not just the withBudget race: the race ABANDONS the status
+        // RPC, and an abandoned socket handle keeps this process alive past the
+        // harness kill — which discards output we had already written.
+        buildStatusReport({ vaultPath: CLAUDECODE_VAULT_PATH, timeoutMs: remainingMs() }),
+        remainingMs(),
+        undefined,
+      ),
       withBudget(auditTail(CLAUDECODE_VAULT_PATH, 5), remainingMs(), undefined),
       // recall-F1: boot recall previously whitelisted layers=['identity'], which
       // dropped knowledge-layer corrections before rerank. Widen to the
@@ -257,7 +265,10 @@ async function handleSessionStart(payload: Record<string, unknown>): Promise<Hoo
       remainingMs(),
       rpcTimedOut,
     );
+    // A FAILED ack is an unacked lease too — counting only the budget-skip path
+    // reported a timed-out or refused ack as a clean boot.
     if (ack.ok) ackedLeases.push(leaseId);
+    else unackedLeases += 1;
   }
   const contradictions = await withBudget(
     subscribeContradictions({ agentId: CLAUDECODE_AGENT_ID, timeoutMs: remainingMs() }),
@@ -295,6 +306,9 @@ async function handleSessionStart(payload: Record<string, unknown>): Promise<Hoo
     unackedLeases > 0 ? "handoff_acks" : undefined,
     handoffRead.ok ? undefined : "handoff_context",
     planRead.ok ? undefined : "active_thread",
+    // A failed LIST is not "no pending handoffs": it degraded to an empty set,
+    // and reporting handoff_acks:[] without saying so is a false all-clear.
+    pendingHandoffs.ok ? undefined : "handoff_leases",
   ].filter((section): section is string => section !== undefined);
 
   // hooks-PL-3: re-assert corrections stashed by PreCompact, so the
@@ -314,7 +328,7 @@ async function handleSessionStart(payload: Record<string, unknown>): Promise<Hoo
   // to entries that actually carry stale-belief events before taking newest-N,
   // so unrelated inbox files cannot crowd a valid correction out of the slots.
   const reassertPending = await readReassertPending(CLAUDECODE_VAULT_PATH, 3);
-  const { events: correctionsReassert, consumedPaths: reassertConsumed, deferredTails: reassertDeferred } =
+  const { events: correctionsReassert, consumedPaths: reassertConsumed, contributingPaths: reassertContributing, deferredTails: reassertDeferred } =
     collectCorrectionsReassert(reassertPending);
   // R2: settle AFTER the envelope reaches the host, never before. Archiving
   // here would consume the correction inside the window where the boot can
@@ -325,15 +339,29 @@ async function handleSessionStart(payload: Record<string, unknown>): Promise<Hoo
   // so clearing them does not depend on delivery. (Parity with the factory —
   // claude-code can always inject at SessionStart, so its envelope is never
   // wire-dropped, but the rule belongs on both paths rather than in one.)
-  const settleReassert = (): Promise<void> =>
-    settleReassertedInboxEntries(CLAUDECODE_VAULT_PATH, {
-      consumedPaths: reassertConsumed,
-      deferredTails: reassertDeferred,
+  // Settled in TWO parts, because the two halves have different preconditions.
+  // Empty stashes carry no correction, so clearing them cannot depend on
+  // delivery — and must not, or a platform that can never inject would keep
+  // them forever. Entries that CONTRIBUTED events (and partially-injected
+  // tails) may only settle once the envelope carrying them lands. Deferring
+  // both together held the empties hostage whenever one window contained a
+  // real correction AND an empty stash.
+  const emptyPaths = reassertConsumed.filter(
+    (filePath) => !reassertContributing.includes(filePath),
+  );
+  if (emptyPaths.length > 0) {
+    await settleReassertedInboxEntries(CLAUDECODE_VAULT_PATH, {
+      consumedPaths: emptyPaths,
+      deferredTails: [],
     });
-  if (correctionsReassert.length > 0) {
-    deferUntilDelivered(settleReassert);
-  } else {
-    await settleReassert();
+  }
+  if (reassertContributing.length > 0 || reassertDeferred.length > 0) {
+    deferUntilDelivered(() =>
+      settleReassertedInboxEntries(CLAUDECODE_VAULT_PATH, {
+        consumedPaths: reassertContributing,
+        deferredTails: reassertDeferred,
+      }),
+    );
   }
 
   const envelopeBody: any = {
@@ -930,6 +958,8 @@ async function main(): Promise<void> {
       auditPrefix: "hook",
       event,
     });
+    // Delivery is settled; nothing left to wait for. See exitAfterDelivery.
+    exitAfterDelivery();
   } catch (error) {
     // Nothing was delivered, so nothing the handler deferred may be committed.
     discardDeliveryCommits();

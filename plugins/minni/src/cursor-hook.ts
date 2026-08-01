@@ -9,7 +9,7 @@ import { adaptCursorOutput, adaptCursorPayload, CURSOR_EVENTS } from "./cursor-a
 import { createHookHandlers } from "./hook-handlers.js";
 import { cursorWire } from "./hook-platform.js";
 import { asString, emit, readStdin } from "./hook-utils.js";
-import { discardDeliveryCommits, emitAndCommit } from "./hook-delivery.js";
+import { discardDeliveryCommits, emitAndCommit, exitAfterDelivery } from "./hook-delivery.js";
 import { recordAudit } from "./vault.js";
 import type { RecallGuardMode } from "./recall-guard.js";
 
@@ -57,6 +57,8 @@ async function main(): Promise<void> {
       auditPrefix: CONFIG.auditPrefix,
       event,
     });
+    // Delivery is settled; nothing left to wait for. See exitAfterDelivery.
+    exitAfterDelivery();
   } catch (error) {
     // Nothing was delivered, so nothing the handler deferred may be committed.
     discardDeliveryCommits();

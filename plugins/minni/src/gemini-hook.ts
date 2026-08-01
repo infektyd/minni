@@ -31,7 +31,7 @@ import { createHookHandlers } from "./hook-handlers.js";
 import { geminiWire } from "./hook-platform.js";
 import type { AgentHookConfig } from "./hook-handlers.js";
 import { VALID_EVENTS, asString, emit, readStdin } from "./hook-utils.js";
-import { discardDeliveryCommits, emitAndCommit } from "./hook-delivery.js";
+import { discardDeliveryCommits, emitAndCommit, exitAfterDelivery } from "./hook-delivery.js";
 import { PRE_TOOL_USE_EVENT } from "./recall-guard.js";
 import type { PreToolUseDecisionOutput, RecallGuardMode } from "./recall-guard.js";
 import { recordAudit } from "./vault.js";
@@ -130,6 +130,8 @@ async function main(): Promise<void> {
         : output,
       { vaultPath: CONFIG.vaultPath, auditPrefix: CONFIG.auditPrefix, event },
     );
+    // Delivery is settled; nothing left to wait for. See exitAfterDelivery.
+    exitAfterDelivery();
   } catch (error) {
     // Nothing was delivered, so nothing the handler deferred may be committed.
     discardDeliveryCommits();

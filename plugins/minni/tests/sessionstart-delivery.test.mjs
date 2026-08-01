@@ -25,6 +25,7 @@
 // the AFM health URL is a closed loopback port. Live ~/.minni is never touched.
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { createServer } from "node:net";
 import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -329,6 +330,13 @@ test(
       Array.isArray(body.degraded?.sections) && body.degraded.sections.length > 0,
       "a boot this degraded must say so rather than look clean",
     );
+    // The handoff LIST failed (no daemon), so handoff_acks is an empty set the
+    // hook never actually computed. Reporting [] without saying so is a false
+    // all-clear — the same shape of lie as a zero-filled pending_learnings.
+    assert.ok(
+      body.degraded.sections.includes("handoff_leases"),
+      `a failed handoff list must be named as degraded, not silently empty (got ${JSON.stringify(body.degraded.sections)})`,
+    );
     // Still exactly-once: delivered, so archived.
     assert.equal((await archivedEntries(fixture)).length, 1);
   },
@@ -463,6 +471,71 @@ test(
   },
 );
 
+test(
+  "a MIXED window settles the empty stash even though the real correction is held back",
+  { timeout: 120_000 },
+  async (t) => {
+    const root = await mkdtemp(path.join(tmpdir(), "sm-grok-mixed-"));
+    const fixture = {
+      root,
+      vault: path.join(root, "grok-build-vault"),
+      home: path.join(root, "home"),
+    };
+    fixture.inbox = path.join(fixture.vault, "inbox");
+    await mkdir(fixture.inbox, { recursive: true });
+    await mkdir(fixture.home, { recursive: true });
+    const base = Date.now() - 86_400_000;
+    // One empty stash and one real correction in the SAME reassert window. A
+    // single deferred settlement covering both would hold the empty one hostage
+    // to the correction's delivery — and on a platform that can never inject,
+    // that is the unbounded growth the empty-only case was supposed to rule out.
+    await writeFile(
+      path.join(fixture.inbox, inboxName(base, "grok-empty-handoff")),
+      JSON.stringify({
+        slug: "grok-empty-handoff",
+        kind: "grok_precompact_handoff",
+        agent_id: "grok-build",
+        createdAt: new Date(base).toISOString(),
+        stale_belief_events: [],
+      }),
+      "utf8",
+    );
+    await writeFile(
+      path.join(fixture.inbox, inboxName(base + 1000, "grok-correction-handoff")),
+      JSON.stringify({
+        slug: "grok-correction-handoff",
+        kind: "grok_precompact_handoff",
+        agent_id: "grok-build",
+        createdAt: new Date(base + 1000).toISOString(),
+        stale_belief_events: [CORRECTION],
+      }),
+      "utf8",
+    );
+    t.after(() => rm(root, { recursive: true, force: true }));
+
+    await runGrokSessionStart(fixture);
+
+    const pending = await pendingEntries(fixture);
+    const archived = await archivedEntries(fixture);
+    assert.deepEqual(
+      pending.map((n) => n.replace(/^.*?-/, "").replace(/\.json$/, "")).filter((n) =>
+        n.includes("correction"),
+      ).length,
+      1,
+      "the real correction must survive a boot that could not deliver it",
+    );
+    assert.equal(
+      archived.length,
+      1,
+      "the empty stash must still clear — it carried nothing to deliver",
+    );
+    assert.ok(
+      archived[0].includes("empty"),
+      `the archived entry must be the EMPTY one, not the correction (got ${archived[0]})`,
+    );
+  },
+);
+
 test("an exhausted budget does not orphan the rejection of the work it abandons", async () => {
   const { withBudget } = await import("../dist/hook-utils.js");
   // withBudget's argument is an ALREADY-RUNNING promise, so the zero-budget
@@ -497,6 +570,80 @@ test("the TTL reaper is never raced by a budget: it archives as it walks", async
     );
   }
 });
+
+test(
+  "a wedged daemon cannot pin the boot past its budget",
+  { timeout: 120_000 },
+  async (t) => {
+    const fixture = await makeFixture();
+    // A socket that ACCEPTS and never answers is the case a raced promise
+    // cannot handle: withBudget abandons the RPC but the live handle keeps the
+    // event loop alive for the full 30s JSON-RPC default, so the hook is still
+    // running when the harness deadline expires — and a killed hook's output is
+    // discarded even though the bytes were already flushed and, worse, the
+    // correction already archived. The deadline has to reach the socket.
+    const socketPath = path.join(fixture.home, "wedged.sock");
+    const server = createServer(() => {
+      /* accept, then never respond */
+    });
+    await new Promise((resolve) => server.listen(socketPath, resolve));
+    t.after(async () => {
+      server.close();
+      await rm(fixture.root, { recursive: true, force: true });
+    });
+
+    const started = Date.now();
+    const { code } = await new Promise((resolve, reject) => {
+      const child = spawn(process.execPath, [HOOK_JS, "SessionStart"], {
+        env: { ...hookEnv(fixture), MINNI_SOCKET_PATH: socketPath, MINNI_HOOK_BUDGET_MS: "1500" },
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+      child.stdout.resume();
+      child.stderr.resume();
+      child.on("error", reject);
+      child.on("close", (c) => resolve({ code: c }));
+      child.stdin.end(JSON.stringify({ session_id: "wedged" }));
+    });
+    const elapsed = Date.now() - started;
+
+    assert.equal(code, 0, "the boot must exit cleanly rather than be killed");
+    assert.ok(
+      elapsed < 20_000,
+      `boot must not outlive its budget waiting on a wedged daemon (took ${elapsed}ms; the ` +
+        "un-threaded JSON-RPC default alone is 30000ms)",
+    );
+  },
+);
+
+test(
+  "an undelivered boot is audited even when it had no correction to roll back",
+  { timeout: 120_000 },
+  async (t) => {
+    // No inbox entry at all: nothing is deferred, so there is no rollback to
+    // report — but an envelope carrying identity, recall and the active plan
+    // still reached nobody, and a boot that degraded that far must not look
+    // clean in the log.
+    const root = await mkdtemp(path.join(tmpdir(), "sm-silent-undelivered-"));
+    const fixture = {
+      root,
+      vault: path.join(root, "claudecode-vault"),
+      home: path.join(root, "home"),
+    };
+    fixture.inbox = path.join(fixture.vault, "inbox");
+    await mkdir(fixture.inbox, { recursive: true });
+    await mkdir(fixture.home, { recursive: true });
+    t.after(() => rm(root, { recursive: true, force: true }));
+
+    const { code } = await runSessionStartUndelivered(fixture);
+
+    assert.equal(code, 0, "a closed host pipe must not crash the hook");
+    assert.match(
+      await auditText(fixture),
+      /hook_undelivered/,
+      "an undelivered envelope must be audited even with zero deferred commits",
+    );
+  },
+);
 
 // ---------------------------------------------------------------------------
 // Time budget: declared in code AND in the manifest, and the two must agree.

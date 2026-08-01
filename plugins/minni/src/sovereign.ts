@@ -162,10 +162,20 @@ export async function afmHealth(url = AFM_HEALTH_URL): Promise<JsonResult> {
   });
 }
 
-export async function socketHealth(): Promise<JsonResult> {
+export async function socketHealth(timeoutMs?: number): Promise<JsonResult> {
   // Daemon speaks JSON-RPC only; return its real result (including structured
   // errors) rather than masking them behind a dead HTTP-over-socket fallback.
-  return jsonRpcSocketRequestWithFallback("status", {});
+  //
+  // `timeoutMs` is the load-bearing deadline for a budgeted caller: it DESTROYS
+  // the socket. Racing this promise instead (withBudget) only abandons it — the
+  // in-flight handle keeps the event loop alive for the full 30s default, long
+  // past a hook budget, and a host that kills the hook discards its output even
+  // though it was already written.
+  return jsonRpcSocketRequestWithFallback(
+    "status",
+    {},
+    timeoutMs !== undefined ? { timeoutMs } : {},
+  );
 }
 
 /**
@@ -1036,6 +1046,13 @@ export async function buildStatusReport(input?: {
   /** Test seam: transport for the 1-token generation probe. */
   afmGenerationTransport?: (url: string, payload: Record<string, unknown>) => Promise<JsonResult>;
   afmGenerationTtlMs?: number;
+  /**
+   * Deadline (ms) for the network legs, for callers under a hook budget.
+   * Threaded into the daemon socket call and the AFM probes so they DESTROY
+   * their handles rather than merely being abandoned — an abandoned handle
+   * outlives the budget and keeps the process alive past the harness kill.
+   */
+  timeoutMs?: number;
 }): Promise<StatusReport> {
   const vaultPath = input?.vaultPath ?? DEFAULT_VAULT_PATH;
   await ensureVault(vaultPath);
@@ -1047,7 +1064,7 @@ export async function buildStatusReport(input?: {
   // as socket.data.afm by health.py:156-189). Reordered so the reuse check
   // below (daemonAfmToProviderHealth) can skip a second, independently-timed
   // generation probe entirely when that fresh result is usable.
-  const socket = input?.socket ?? (await socketHealth());
+  const socket = input?.socket ?? (await socketHealth(input?.timeoutMs));
 
   let volume = 0;
   const logFiles = ["log.md", "log.1.md", "log.2.md", "log.3.md"];
@@ -1175,6 +1192,10 @@ export async function buildStatusReport(input?: {
       transport: input?.afmGenerationTransport,
       ttlMs: input?.afmGenerationTtlMs,
       nativeHelperPath: resolvedNativeHelperPath(),
+      // Budgeted callers cap the probe too: its 10s bridge / 45s native-helper
+      // defaults both outlive a hook budget, and the in-flight handle would
+      // keep the process alive past the deadline that kills it.
+      ...(input?.timeoutMs !== undefined ? { timeoutMs: input.timeoutMs } : {}),
     });
     source = "plugin-probe";
   }

@@ -2001,6 +2001,17 @@ export interface CorrectionsReassertResult {
   /** Inbox file paths whose stashed events were fully consumed (or were
    * empty); only these may be cleared after the boot envelope is built. */
   consumedPaths: string[];
+  /**
+   * The subset of `consumedPaths` that actually CONTRIBUTED injected events.
+   *
+   * Clearing these depends on the envelope being delivered — they carry the
+   * correction. The rest of `consumedPaths` are empty stashes (codex and grok
+   * stash unconditionally at PreCompact), which carry nothing, so their
+   * clearing must NOT be made conditional: an undeliverable platform would then
+   * never clear them and accumulate one file per compaction cycle forever.
+   * The two settle separately for exactly that reason.
+   */
+  contributingPaths: string[];
   /** Entries whose valid events only partially fit under the cap: the
    * payload carries the un-injected valid tail and replaces the file so the
    * remainder re-injects on the next boot. */
@@ -2012,6 +2023,7 @@ export function collectCorrectionsReassert(
 ): CorrectionsReassertResult {
   const events: unknown[] = [];
   const consumedPaths: string[] = [];
+  const contributingPaths: string[] = [];
   const deferredTails: CorrectionsReassertResult["deferredTails"] = [];
   let dropped = 0;
   for (const entry of pending) {
@@ -2042,8 +2054,12 @@ export function collectCorrectionsReassert(
       collected += 1;
     }
     if (collected > 0 && tail.length === 0) {
-      // Every valid event injected → safe to clear the entry.
-      if (entry.filePath) consumedPaths.push(entry.filePath);
+      // Every valid event injected → safe to clear the entry, but only once the
+      // envelope carrying those events has actually been delivered.
+      if (entry.filePath) {
+        consumedPaths.push(entry.filePath);
+        contributingPaths.push(entry.filePath);
+      }
     } else if (collected > 0) {
       // Partially injected: never consume the entry, or the un-injected tail
       // would be permanently lost. Rewrite it with just the tail so the
@@ -2083,7 +2099,7 @@ export function collectCorrectionsReassert(
       `minni: dropped ${dropped} malformed stale_belief_events from inbox (schema gate)`,
     );
   }
-  return { events, consumedPaths, deferredTails };
+  return { events, consumedPaths, contributingPaths, deferredTails };
 }
 
 /**

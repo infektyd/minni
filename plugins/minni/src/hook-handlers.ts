@@ -38,6 +38,7 @@ import {
   deferUntilDelivered,
   discardDeliveryCommits,
   emitAndCommit,
+  exitAfterDelivery,
   markOutputDropped,
 } from "./hook-delivery.js";
 import { harvestSummaryText } from "./compact-harvest.js";
@@ -491,7 +492,14 @@ export function createHookHandlers(
     // a READ; it must not half-report a WRITE.
     const expiredHandoffs = await expireStaleInboxHandoffs(config.vaultPath);
     const [status, tail, identityRead, recall, contradictions, inboxStatus] = await Promise.all([
-      withBudget(buildStatusReport({ vaultPath: config.vaultPath }), remainingMs(), undefined),
+      withBudget(
+        // timeoutMs, not just the withBudget race: the race ABANDONS the status
+        // RPC, and an abandoned socket handle keeps this process alive past the
+        // harness kill — which discards output we had already written.
+        buildStatusReport({ vaultPath: config.vaultPath, timeoutMs: remainingMs() }),
+        remainingMs(),
+        undefined,
+      ),
       withBudget(auditTail(config.vaultPath, 5), remainingMs(), undefined),
       // hooks-PL-2 leg (a): BOTH boot modes issue the daemon 'read' — it is
       // the recency-ordered learning surface AND the path that records
@@ -557,7 +565,7 @@ export function createHookHandlers(
     // Deliberately UNBUDGETED: this is cheap local FS, and it is the one read
     // whose absence loses data rather than context.
     const reassertPending = await readReassertPending(config.vaultPath, 3);
-    const { events: correctionsReassert, consumedPaths: reassertConsumed, deferredTails: reassertDeferred } =
+    const { events: correctionsReassert, consumedPaths: reassertConsumed, contributingPaths: reassertContributing, deferredTails: reassertDeferred } =
       collectCorrectionsReassert(reassertPending);
     // R2: settle AFTER the envelope reaches the host, never before. Archiving
     // here would consume the correction inside the window where the boot can
@@ -569,15 +577,29 @@ export function createHookHandlers(
     // clearing them does not depend on delivery, and making it depend would let
     // one file per compaction cycle pile up forever on a platform whose wire can
     // never inject at SessionStart.
-    const settleReassert = (): Promise<void> =>
-      settleReassertedInboxEntries(config.vaultPath, {
-        consumedPaths: reassertConsumed,
-        deferredTails: reassertDeferred,
+    // Settled in TWO parts, because the two halves have different preconditions.
+    // Empty stashes carry no correction, so clearing them cannot depend on
+    // delivery — and must not, or a platform that can never inject would keep
+    // them forever. Entries that CONTRIBUTED events (and partially-injected
+    // tails) may only settle once the envelope carrying them lands. Deferring
+    // both together held the empties hostage whenever one window contained a
+    // real correction AND an empty stash.
+    const emptyPaths = reassertConsumed.filter(
+      (filePath) => !reassertContributing.includes(filePath),
+    );
+    if (emptyPaths.length > 0) {
+      await settleReassertedInboxEntries(config.vaultPath, {
+        consumedPaths: emptyPaths,
+        deferredTails: [],
       });
-    if (correctionsReassert.length > 0) {
-      deferUntilDelivered(settleReassert);
-    } else {
-      await settleReassert();
+    }
+    if (reassertContributing.length > 0 || reassertDeferred.length > 0) {
+      deferUntilDelivered(() =>
+        settleReassertedInboxEntries(config.vaultPath, {
+          consumedPaths: reassertContributing,
+          deferredTails: reassertDeferred,
+        }),
+      );
     }
 
     // Plan parity (audit C5): SessionStart injects the FULL active-plan view for
@@ -1175,6 +1197,8 @@ export async function runHookMain(config: AgentHookConfig): Promise<void> {
       auditPrefix: config.auditPrefix,
       event,
     });
+    // Delivery is settled; nothing left to wait for. See exitAfterDelivery.
+    exitAfterDelivery();
   } catch (error) {
     // Nothing was delivered, so nothing the handler deferred may be committed.
     discardDeliveryCommits();

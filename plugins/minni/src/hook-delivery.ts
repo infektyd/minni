@@ -78,6 +78,27 @@ export async function runDeliveryCommits(): Promise<void> {
   }
 }
 
+/**
+ * End the hook process now that delivery is fully settled.
+ *
+ * Threading `timeoutMs` into each RPC bounds the calls we know about, but it
+ * cannot bound the ones we do not: `withBudget` RACES a promise, it does not
+ * cancel it, so any abandoned handle — a socket mid-read, an AFM probe, a
+ * wedged filesystem call — keeps the event loop alive after the envelope has
+ * been written. A hook still running when its harness deadline expires is
+ * KILLED, and a killed hook's output is discarded even though the bytes were
+ * already flushed — which, with commits already run, is the correction consumed
+ * for an envelope the host threw away. Exiting closes that class of failure
+ * whole, rather than one handle at a time.
+ *
+ * Safe precisely HERE and nowhere earlier: `emitAndCommit` has awaited the
+ * stdout flush, run or discarded every deferred commit, and awaited its audit
+ * write, so there is no outstanding work whose loss would matter.
+ */
+export function exitAfterDelivery(): never {
+  process.exit(0);
+}
+
 export interface DeliveryContext {
   vaultPath: string;
   /** Audit tool-name prefix, e.g. "hook" -> hook_undelivered. */
@@ -107,13 +128,19 @@ export async function emitAndCommit(
   }
   const abandoned = pendingDeliveryCommitCount();
   discardDeliveryCommits();
-  if (abandoned === 0) return false;
+  // A non-delivery is audited even when nothing was rolled back: an envelope
+  // carrying identity, recall and the active plan reaching nobody is exactly
+  // the "degraded boot that looks clean" hooks-PL-5 forbids, and it has no
+  // deferred commits to signal it. The one case that needs no row here is a
+  // WIRE DROP with nothing pending — `_intent_dropped` already recorded it, and
+  // a second row would just double-count the same event.
+  if (dropped && abandoned === 0) return false;
   try {
     await recordAudit(context.vaultPath, {
       tool: `${context.auditPrefix}_undelivered`,
       summary: dropped
         ? `${context.event}: platform cannot carry this output; ${abandoned} deferred commit(s) rolled back (stays re-deliverable)`
-        : `${context.event}: output never reached the host; ${abandoned} deferred commit(s) rolled back (re-delivers next boot)`,
+        : `${context.event}: output never reached the host (${abandoned} deferred commit(s) rolled back)`,
     });
   } catch {
     // stdout may already be gone; an unavailable audit must not throw on top.
