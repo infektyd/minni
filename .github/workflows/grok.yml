@@ -177,13 +177,28 @@ jobs:
           [ -s /tmp/grok-reply.md ] || echo "_Grok returned no output (see workflow logs)._" > /tmp/grok-reply.md
 
       - name: Fail closed on credential leakage
+        env:
+          BASE_REF: ${{ github.base_ref || github.event.repository.default_branch }}
         run: |
-          # Compares the reply against the ACTUAL secret values (plus a JWT
-          # shape check) rather than against scary words. The earlier
-          # word-matching version blocked a legitimate review OF this very
-          # PR, because a credential-handling review necessarily says
-          # "refresh_token". See the script header.
-          python3 .github/scripts/check-no-credential-leak.py /tmp/grok-reply.md
+          # Load the gate from the BASE branch, never from the PR's checkout.
+          # TWO reasons, one of which is a real hole:
+          #  1. SECURITY — the checked-out tree is the PR's content. Running
+          #     the gate from there lets a PR neuter its own leak check by
+          #     editing the script in its head commit.
+          #  2. CORRECTNESS — for `pull_request`, the workflow YAML comes from
+          #     the merge ref while these jobs deliberately check out the PR
+          #     HEAD. Any branch cut before the script existed (e.g. a release
+          #     branch) therefore had the workflow calling a file its tree did
+          #     not contain: "can't open file ... check-no-credential-leak.py".
+          git fetch --depth=1 origin "$BASE_REF"
+          git show "origin/$BASE_REF:.github/scripts/check-no-credential-leak.py" \
+            > /tmp/leak-gate.py
+          # Fail CLOSED: an unavailable or empty gate must never read as "clean".
+          if [ ! -s /tmp/leak-gate.py ]; then
+            echo "::error::Could not load the leak gate from origin/$BASE_REF — refusing to post."
+            exit 1
+          fi
+          python3 /tmp/leak-gate.py /tmp/grok-reply.md
 
       - name: Post reply
         env:
