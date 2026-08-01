@@ -83,11 +83,19 @@ jobs:
 
       - name: Run Grok review
         run: |
+          echo "::group::grok environment"
+          grok version || true
+          grok models 2>&1 | head -15 || true
+          echo "::endgroup::"
           grok --prompt-file /tmp/grok-prompt.md \
             --permission-mode dontAsk \
             --no-subagents \
             --max-turns 30 \
+            --debug --debug-file /tmp/grok-debug.log \
             --output-format plain > /tmp/grok-reply.md
+          echo "::group::grok debug tail"
+          tail -c 6000 /tmp/grok-debug.log || true
+          echo "::endgroup::"
           [ -s /tmp/grok-reply.md ] || echo "_Grok returned no output (see workflow logs)._" > /tmp/grok-reply.md
 
       - name: Post review comment
