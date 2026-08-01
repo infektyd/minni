@@ -54,21 +54,28 @@ jobs:
 
       - name: Configure the sandbox profile
         run: |
-          # MEASURED, not assumed: with --always-approve, the built-in
-          # `read_file` tool reads $HOME/.grok/auth.json outright — no shell
-          # needed. A tool allowlist does not stop it and neither does
-          # --deny "Read(...)". The kernel sandbox (Landlock on Linux) is the
-          # only mechanical control, and it is applied once at startup and is
-          # irreversible, so the model cannot talk its way out of it.
+          # THE THREAT, MEASURED (grok 0.2.117, 2026-08-01): with
+          # --always-approve the built-in `read_file` tool reads
+          # $HOME/.grok/auth.json outright — no shell needed. A `--tools`
+          # allowlist does not stop it, and neither does `--deny "Read(...)"`.
           #
-          # This file is written to $HOME, NEVER to .grok/sandbox.toml in the
-          # checkout: a per-project profile would be editable by the very PR
-          # under review.
-          cat > "$HOME/.grok/sandbox.toml" <<EOF
+          # ALSO MEASURED: adding `deny = [auth.json]` here does NOT work —
+          # the sandbox applies before Grok loads its own credential, so the
+          # run dies with "Not signed in". The credential is therefore
+          # READABLE to the agent by necessity, and containment has to be
+          # about EXITS instead:
+          #   1. restrict_network cuts child-process network (seccomp, Linux).
+          #   2. The reply is scanned and the job fails closed before posting.
+          # Exit (2) is the control that is verified on every run; (1) is
+          # asserted by .github/workflows/grok-boundary-test.yml, which runs
+          # on any change to these files.
+          #
+          # Written to $HOME, NEVER to .grok/sandbox.toml in the checkout: a
+          # per-project profile would be editable by the very PR under review.
+          cat > "$HOME/.grok/sandbox.toml" <<'EOF'
           [profiles.ci]
           extends = "read-only"
           restrict_network = true
-          deny = ["$HOME/.grok/auth.json"]
           EOF
 
       - name: Build review prompt

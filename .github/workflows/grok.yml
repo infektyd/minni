@@ -88,15 +88,18 @@ jobs:
 
       - name: Configure the sandbox profile
         run: |
-          # See grok-review.yml for the measurement behind this: `read_file`
-          # alone reads auth.json under --always-approve, so the kernel
-          # sandbox is the only real boundary. Written to $HOME, never to
-          # .grok/sandbox.toml in the checkout (a PR could edit that).
-          cat > "$HOME/.grok/sandbox.toml" <<EOF
+          # See grok-review.yml for the measurements behind this profile:
+          # `read_file` reads auth.json under --always-approve, and denying
+          # that path breaks Grok's own startup — so containment is about
+          # exits (child network + a fail-closed scan of the reply), not
+          # about hiding the file. `read-only` is deliberate even though an
+          # @grok request may want to write: a request that needs writes
+          # should fail visibly rather than widen the profile for every run.
+          # Written to $HOME, never to .grok/sandbox.toml in the checkout.
+          cat > "$HOME/.grok/sandbox.toml" <<'EOF'
           [profiles.ci]
-          extends = "workspace"
+          extends = "read-only"
           restrict_network = true
-          deny = ["$HOME/.grok/auth.json"]
           EOF
 
       - name: Build prompt
