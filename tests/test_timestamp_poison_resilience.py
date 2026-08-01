@@ -371,7 +371,6 @@ def test_decay_pass_survives_a_text_indexed_at(tmp_path):
 
     stats = MemoryDecay(db_obj, cfg).run_decay()
 
-    assert stats["skipped_bad_timestamp"] == 0, "recoverable value is parsed, not skipped"
     assert stats["updated"] >= 1
 
 
@@ -382,7 +381,7 @@ def test_decay_pass_degrades_instead_of_skipping_a_bad_indexed_at(tmp_path):
     path already falls back to `now`, so the bad-indexed_at path should too,
     rather than leaving the row out of the pass entirely. The row is now
     processed (using the `now` fallback, since no last_accessed exists
-    either) and counted into `bad_indexed_at`, not `skipped_bad_timestamp`.
+    either) and counted into `bad_indexed_at`.
     """
     from minni.decay import MemoryDecay
     from minni.timestamps import (
@@ -408,10 +407,6 @@ def test_decay_pass_degrades_instead_of_skipping_a_bad_indexed_at(tmp_path):
 
     assert stats["bad_indexed_at"] == 1, (
         "the bad-indexed_at row must be counted, but as degraded, not skipped"
-    )
-    assert stats["skipped_bad_timestamp"] == 0, (
-        "no row is left entirely undecayed by this loop — `now` is always "
-        "an available fallback anchor"
     )
     assert stats["updated"] >= 1, "the healthy row must still have been decayed"
     assert malformed_timestamp_report()["total"] >= 1
@@ -451,7 +446,6 @@ def test_decay_uses_valid_last_accessed_when_indexed_at_is_bad(tmp_path):
     stats = MemoryDecay(db_obj, cfg).run_decay()
 
     assert stats["bad_indexed_at"] == 1
-    assert stats["skipped_bad_timestamp"] == 0
     assert stats["updated"] == 1, (
         "must have decayed using last_accessed as the anchor, not skipped"
     )
@@ -471,11 +465,12 @@ def test_decay_falls_back_to_indexed_at_on_bad_last_accessed(tmp_path):
     last_accessed must degrade to that same fallback, not skip the document
     outright.
 
-    grok-review, Low (round 2): the fallback used to land in the same
-    `skipped_bad_timestamp` counter as a true skip, so the stats/log claimed
+    grok-review, Low (round 2): the fallback used to land in a shared
+    "skipped" counter alongside a true skip, so the stats/log claimed
     "skipped" for a document that was in fact still decayed. It now has its
-    own counter (`bad_last_accessed`) and `skipped_bad_timestamp` must stay 0
-    for a document that was actually processed.
+    own counter (`bad_last_accessed`), never conflated with a real skip
+    (round 4: the shared counter was later removed entirely, since no row is
+    ever left truly undecayed by this loop anymore).
     """
     from minni.decay import MemoryDecay
     from minni.timestamps import (
@@ -501,10 +496,6 @@ def test_decay_falls_back_to_indexed_at_on_bad_last_accessed(tmp_path):
     stats = MemoryDecay(db_obj, cfg).run_decay()
 
     assert stats["bad_last_accessed"] == 1, "bad last_accessed counted separately"
-    assert stats["skipped_bad_timestamp"] == 0, (
-        "the document was decayed via fallback, not skipped — must not double "
-        "as a 'skipped' count"
-    )
     assert malformed_timestamp_report()["total"] >= 1
 
     with db_obj.cursor() as c:

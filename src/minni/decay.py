@@ -48,18 +48,16 @@ class MemoryDecay:
         # duck-typed configs.
         grace_sec = float(self.config.correction_decay_grace_days) * 86400
         correction_floor = float(self.config.correction_decay_floor)
-        # grok-review (PR #242, rounds 2 and 3): skipped_bad_timestamp must
-        # mean what it says — a document that was NOT decayed. A bad
-        # last_accessed or a bad indexed_at each still get decayed (falling
-        # back to indexed_at, then to `now`, exactly like their respective
-        # NULL cases), so each earns its own counter rather than inflating
-        # "skipped" for a row that was, in fact, processed. No row is ever
-        # truly left undecayed by this loop anymore — `now` is always an
-        # available last-resort anchor — so skipped_bad_timestamp stays at 0
-        # today; it is kept for forward compatibility should a future change
-        # reintroduce a genuine hard-skip path.
+        # grok-review (PR #242, rounds 2-4): a bad last_accessed or a bad
+        # indexed_at each still get decayed (falling back to indexed_at, then
+        # to `now`, exactly like their respective NULL cases) — no row is
+        # ever left undecayed by this loop, `now` is always an available
+        # last-resort anchor. Each degrade gets its own counter rather than a
+        # single "skipped" stat that would misreport a row that was, in fact,
+        # processed (round 4: a stat that can never be nonzero is worse than
+        # no stat — it implies a hard-skip path that no longer exists).
         stats = {
-            "updated": 0, "reinforced": 0, "skipped_bad_timestamp": 0,
+            "updated": 0, "reinforced": 0,
             "bad_indexed_at": 0, "bad_last_accessed": 0,
         }
 
@@ -141,12 +139,6 @@ class MemoryDecay:
                     if access_boost > 0:
                         stats["reinforced"] += 1
 
-        if stats["skipped_bad_timestamp"]:
-            logger.warning(
-                "Decay pass left %d document(s) undecayed: non-numeric indexed_at "
-                "with no usable fallback. Run migration 016 to normalize them.",
-                stats["skipped_bad_timestamp"],
-            )
         if stats["bad_indexed_at"]:
             logger.warning(
                 "Decay pass decayed %d document(s) using a fallback anchor "
@@ -162,10 +154,10 @@ class MemoryDecay:
                 stats["bad_last_accessed"],
             )
         logger.info(
-            "Decay pass complete: %d updated, %d reinforced, %d left undecayed "
-            "(bad timestamp), %d decayed via fallback anchor (bad indexed_at), "
-            "%d decayed via indexed_at fallback (bad last_accessed)",
-            stats["updated"], stats["reinforced"], stats["skipped_bad_timestamp"],
+            "Decay pass complete: %d updated, %d reinforced, %d decayed via "
+            "fallback anchor (bad indexed_at), %d decayed via indexed_at "
+            "fallback (bad last_accessed)",
+            stats["updated"], stats["reinforced"],
             stats["bad_indexed_at"], stats["bad_last_accessed"],
         )
         return stats
