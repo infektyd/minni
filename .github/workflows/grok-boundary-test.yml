@@ -35,6 +35,45 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Load the leak gate from the default branch
+        env:
+          # The DEFAULT branch, never github.base_ref: the base of a PR is
+          # chosen by its author, so anchoring trust there lets someone push a
+          # branch carrying a neutered gate and open a PR into it. The default
+          # branch is the one ref the PR author does not get to pick.
+          # Same anchor grok-review.yml uses (#218).
+          TRUST_REF: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          # THIS JOB IS THE ONE THAT PRINTS ATTACK OUTPUT TO A PUBLIC LOG
+          # (final step). The leak gate is the only thing standing between a
+          # captured credential and that log. Running the gate from the
+          # checked-out tree means the PR supplies its own redactor: a PR that
+          # weakens check-no-credential-leak.py neuters the check that would
+          # have caught its own output, and the run still goes green while
+          # publishing the material. The paths filter above re-triggers this
+          # job on such a PR, but re-running a gate the PR controls proves
+          # nothing.
+          #
+          # Loaded BEFORE the attack runs so a fail-closed happens while
+          # /tmp/attack-result.md does not yet exist.
+          #
+          # REMAINING SCOPE, stated plainly: for `pull_request` the workflow
+          # DEFINITION still comes from the merge ref, so a same-repo PR can
+          # still edit or delete these steps outright. Closing that needs a
+          # required check defined on the default branch, not a change here.
+          git fetch --depth=1 origin "$TRUST_REF"
+          git show "origin/$TRUST_REF:.github/scripts/check-no-credential-leak.py" \
+            > /tmp/leak-gate.py
+          # Fail CLOSED: an unavailable or empty gate must never read as
+          # "clean". Every later step invokes /tmp/leak-gate.py, so if this
+          # step does not produce one the job cannot reach the publish step.
+          if [ ! -s /tmp/leak-gate.py ]; then
+            echo "::error::Could not load the leak gate from origin/$TRUST_REF — refusing to run the boundary test."
+            exit 1
+          fi
+          echo "Leak gate loaded from origin/$TRUST_REF ($(wc -c < /tmp/leak-gate.py) bytes)."
+
       - name: Install sandbox prerequisites
         run: |
           # The Grok sandbox enforces its deny set via a mount namespace and
@@ -141,11 +180,13 @@ jobs:
         run: |
           # Without this, a gate that never fires looks identical to a gate
           # that works. Feed it a fixture secret and require a non-zero exit.
+          # Exercises the TRUST-ANCHORED copy — proving the head copy fires
+          # would say nothing about the gate that actually guards the publish.
           printf '{"k":"POSITIVECONTROLSECRETvalue1234567890abcdefGHIJK"}' \
             > /tmp/fixture-auth.json
           printf 'leaked: POSITIVECONTROLSECRETvalue1234567890abcdefGHIJK\n' \
             > /tmp/fixture-reply.md
-          if python3 .github/scripts/check-no-credential-leak.py \
+          if python3 /tmp/leak-gate.py \
                /tmp/fixture-reply.md /tmp/fixture-auth.json; then
             echo "::error::Leak gate did NOT flag a planted secret — the gate is broken."
             exit 1
@@ -156,8 +197,10 @@ jobs:
         run: |
           # Runs the SAME script production runs — an earlier version grepped
           # a separate vocabulary list here, so the boundary job was not
-          # exercising the gate it claimed to prove.
-          python3 .github/scripts/check-no-credential-leak.py /tmp/attack-result.md
+          # exercising the gate it claimed to prove. Loaded from the default
+          # branch (see the first step), so a PR cannot supply the redactor
+          # that clears its own output for publication.
+          python3 /tmp/leak-gate.py /tmp/attack-result.md
 
       - name: Assert egress is actually blocked
         run: |
