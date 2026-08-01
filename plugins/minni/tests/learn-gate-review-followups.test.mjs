@@ -101,3 +101,101 @@ test("the CLI learn command refuses to persist a credential", async () => {
     await rm(root, { recursive: true, force: true });
   }
 });
+
+// `requireQuality:false` is documented as a WEAK-NOTE opt-out, not a secret
+// allowlist. Before this fix an agent-settable boolean re-opened the exact
+// hole the channel scan closes, on the primary model-facing path.
+test("requireQuality:false cannot opt out of a credential block", async (t) => {
+  const { spawn } = await import("node:child_process");
+  const net = await import("node:net");
+  const { mkdir } = await import("node:fs/promises");
+  const root = await mkdtemp(path.join(tmpdir(), "sm-optout-"));
+  const home = path.join(root, "home");
+  const socketPath = path.join(home, "minnid.sock");
+  await mkdir(home, { recursive: true });
+  const fakeDaemon = net.createServer((socket) => {
+    let buffer = "";
+    socket.on("data", (chunk) => {
+      buffer += chunk.toString("utf8");
+      if (!buffer.includes("\n")) return;
+      const request = JSON.parse(buffer.split("\n")[0]);
+      socket.write(`${JSON.stringify({ jsonrpc: "2.0", id: request.id, result: { ok: true } })}\n`);
+    });
+  });
+  await new Promise((resolve) => fakeDaemon.listen(socketPath, resolve));
+  t.after(() => fakeDaemon.close());
+  const child = spawn(process.execPath, [new URL("../dist/server.js", import.meta.url).pathname], {
+    env: {
+      ...process.env,
+      MINNI_HOME: home,
+      MINNI_SOCKET_PATH: socketPath,
+      MINNI_VAULT_PATH: root,
+      MINNI_CLAUDECODE_VAULT_PATH: root,
+    },
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  try {
+    const responses = new Map();
+    const waiters = new Map();
+    let buffered = "";
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      buffered += chunk;
+      let nl;
+      while ((nl = buffered.indexOf("\n")) >= 0) {
+        const line = buffered.slice(0, nl).trim();
+        buffered = buffered.slice(nl + 1);
+        if (!line) continue;
+        try {
+          const msg = JSON.parse(line);
+          if (msg.id !== undefined) { responses.set(msg.id, msg); waiters.get(msg.id)?.(msg); }
+        } catch { /* protocol noise surfaces via timeout */ }
+      }
+    });
+    const send = (msg) => child.stdin.write(`${JSON.stringify(msg)}\n`);
+    const awaitResponse = (id, ms = 15000) =>
+      responses.get(id) ??
+      new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error(`timeout ${id}`)), ms);
+        waiters.set(id, (msg) => { clearTimeout(timer); resolve(msg); });
+      });
+
+    send({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "optout-test", version: "0.0.0" } } });
+    await awaitResponse(1);
+    send({ jsonrpc: "2.0", method: "notifications/initialized" });
+
+    send({
+      jsonrpc: "2.0", id: 2, method: "tools/call",
+      params: {
+        name: "minni_learn",
+        arguments: {
+          title: `Rotation note ${FAKE_PAT}`,
+          content: CLEAN_CONTENT,
+          category: "procedures",
+          source: "session",
+          requireQuality: false,
+        },
+      },
+    });
+    const reply = await awaitResponse(2);
+    const out = JSON.parse(reply.result.content[0].text);
+    assert.equal(out.status, "quality-blocked", `requireQuality:false must NOT bypass a credential block: ${JSON.stringify(out)}`);
+
+    // And nothing under the vault may carry the token.
+    const walk = async (dir) => {
+      const entries = await readdir(dir, { withFileTypes: true }).catch(() => []);
+      for (const entry of entries) {
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) await walk(full);
+        else {
+          const body = await readFile(full, "utf8").catch(() => "");
+          assert.ok(!body.includes(FAKE_PAT), `credential reached ${full}`);
+        }
+      }
+    };
+    await walk(root);
+  } finally {
+    child.kill("SIGKILL");
+    await rm(root, { recursive: true, force: true });
+  }
+});
