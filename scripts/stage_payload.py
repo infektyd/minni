@@ -72,6 +72,7 @@ PACKAGE_DATA_GLOBS = [
     "plugin_payload/skills/minni-install/*",
     "plugin_payload/skills/minni-install/references/*",
     "plugin_payload/skills/minni-install/scripts/*",
+    "plugin_payload/skills/minni-install/templates/distill/*",
 ]
 
 
