@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import itertools
 import sys
 from pathlib import Path
 
@@ -195,6 +196,37 @@ def test_ci_paths_are_denied(mod, path):
 @pytest.mark.parametrize("path", ["src/minni/cli.py", "docs/ops/grok-reviewer-app.md"])
 def test_ordinary_paths_are_not_denied(mod, path):
     assert mod.path_denied(path) is False
+
+
+def test_decide_is_exactly_the_intended_predicate(mod):
+    """Exhaustive: success iff eligible AND unblocked AND not path-denied AND a
+    non-empty required list whose every context is success. Any other input
+    combination — including states this file does not enumerate elsewhere —
+    must be failure. This is the whole security property of the gate."""
+    states = ["success", "pending", "failure", "error", "missing", "expected", "neutral"]
+    mismatches = []
+    checked = 0
+    for ctxs in [(), ("a",), ("a", "b")]:
+        combos = itertools.product(states, repeat=len(ctxs)) if ctxs else [()]
+        for combo in combos:
+            # "missing" is modelled as absent from the map, as the API returns.
+            check_states = {c: s for c, s in zip(ctxs, combo) if s != "missing"}
+            for eligible, blocked, denied in itertools.product([True, False], repeat=3):
+                checked += 1
+                got = mod.decide(
+                    mod.GateInput("abc123", ctxs, check_states, eligible, blocked, denied)
+                ).conclusion
+                want_success = (
+                    eligible
+                    and not blocked
+                    and not denied
+                    and bool(ctxs)
+                    and all(check_states.get(c) == "success" for c in ctxs)
+                )
+                if (got == "success") != want_success:
+                    mismatches.append((ctxs, combo, eligible, blocked, denied, got))
+    assert checked == 456
+    assert mismatches == []
 
 
 def test_outstanding_request_changes_survives_a_later_marker(mod):
