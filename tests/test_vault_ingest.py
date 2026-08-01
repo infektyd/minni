@@ -452,10 +452,16 @@ def test_all_three_vault_slug_maps_agree():
     `inbox_ingest._VAULT_SLUG_TO_AGENT_ID` is duplicated into a TypeScript
     mirror (hook-utils.ts) and a standalone-script mirror (inbox_cleanup.py).
     The other slug tests import only the canonical map, so a mirror that falls
-    behind is invisible to them -- and a mirror missing a slug attributes that
-    vault's inbox to the wrong principal. This drift is not hypothetical:
-    `cursor` was added to the canonical map after cursor-vault silently
-    accumulated 141 unreachable wiki pages, and both mirrors still lacked it.
+    behind is invisible to them.
+
+    Both mirrors fall back to the slug itself (`?? slug` in TS, `.get(slug,
+    slug)` in Python), so a missing entry is harmless for an IDENTITY mapping
+    and silently wrong for a non-identity one -- `claudecode` -> `claude-code`
+    and `grok` -> `grok-build` would be stamped with the bare dir name. The
+    canonical map has no such fallback: `vault_ingest` skips an unknown slug
+    outright, which is how cursor-vault accumulated 141 unreachable wiki pages
+    before `cursor` was added there. The mirrors then kept lacking `cursor`
+    long after -- benign in that instance only because the mapping is identity.
 
     Compared as dicts, so ordering and formatting differences are fine and only
     a real content difference fails.
