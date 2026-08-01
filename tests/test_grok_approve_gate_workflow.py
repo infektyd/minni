@@ -43,12 +43,27 @@ def test_concurrency_group_is_keyed_on_head_sha_for_every_trigger(gate):
     assert "pull_request.number" not in group, (
         "PR-number keying reintroduces the split-group race"
     )
-    for expr in (
-        "pull_request.head.sha",
-        "workflow_run.head_sha",
-        "check_suite.head_sha",
-    ):
+    for expr in ("pull_request.head.sha", "workflow_run.head_sha"):
         assert expr in group, f"{expr} missing from concurrency group: {group}"
+
+
+def test_ci_completion_uses_workflow_run_not_check_suite(gate):
+    """check_suite does NOT trigger a workflow when the suite was created by
+    GitHub Actions, and every CI suite here is Actions-created. Measured on this
+    branch: 40 runs, 0 check_suite. A check_suite trigger is dead code that
+    reads like a working re-evaluation path."""
+    triggers = _triggers(gate)
+    assert "check_suite" not in triggers
+    listed = set(triggers["workflow_run"]["workflows"])
+    # Every workflow producing a required context must re-trigger the gate.
+    assert {"Public CI", "PR Hygiene", "Claude Code Review"} <= listed
+    assert "Grok Code Review" in listed
+
+
+def test_gate_timeout_covers_the_api_budget(gate):
+    """Three observation rounds of ~8 calls at a 15s API timeout is ~360s; at
+    timeout-minutes: 5 the job could be killed mid-decision."""
+    assert gate["jobs"]["gate"]["timeout-minutes"] >= 10
 
 
 def test_gate_reevaluates_on_review_submission(gate):

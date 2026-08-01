@@ -4,15 +4,27 @@ name: Grok Mechanical Approve Gate
 # APPROVE. Measured 2026-08-01 (#222): bot APPROVE does not clear
 # reviewDecision on this user-owned repo.
 #
-# Triggers on CI completion and after Grok Code Review so dismiss-stale /
-# new-SHA / late eligibility all re-evaluate without a metered model call.
-# Loads grok_approve_gate.py from the default branch (trust anchor).
+# Re-evaluates on CI completion, on push, and after a review lands, so
+# new-SHA / late eligibility / late veto all converge without a metered model
+# call. Loads grok_approve_gate.py from the default branch (trust anchor).
+#
+# CI completion is `workflow_run`, NOT `check_suite`. check_suite does not
+# trigger a workflow when the suite was created by GitHub Actions, and every CI
+# suite here is Actions-created — so a check_suite trigger would be dead code
+# that reads like a working re-evaluation path. Measured on this branch: 40
+# runs, 0 of them check_suite. workflow_run does fire, runs from the default
+# branch, and is the reason `Resolve PR + head SHA` still handles that event.
 
 on:
-  check_suite:
-    types: [completed]
   workflow_run:
-    workflows: ["Grok Code Review"]
+    # Every workflow that produces a required context, plus the reviewer.
+    # Adding a required context without adding its workflow here means the
+    # gate stops re-evaluating when that check finishes.
+    workflows:
+      - "Grok Code Review"
+      - "Public CI"
+      - "PR Hygiene"
+      - "Claude Code Review"
     types: [completed]
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
@@ -27,11 +39,11 @@ permissions:
   statuses: read
   pull-requests: read
 
-# Key on head SHA for EVERY event. Keying pull_request on PR number and
-# check_suite on SHA put concurrent runs in different groups, so a stale
-# snapshot could publish success over a veto that had already landed.
+# Key on head SHA for EVERY event. Keying pull_request on PR number while
+# other triggers keyed on SHA put concurrent runs in different groups, so a
+# stale snapshot could publish success over a veto that had already landed.
 concurrency:
-  group: grok-approve-gate-${{ github.event.pull_request.head.sha || github.event.workflow_run.head_sha || github.event.check_suite.head_sha || github.sha }}
+  group: grok-approve-gate-${{ github.event.pull_request.head.sha || github.event.workflow_run.head_sha || github.sha }}
   cancel-in-progress: true
 
 jobs:
@@ -41,7 +53,9 @@ jobs:
       (github.event.pull_request.head.repo.full_name == github.repository &&
        github.event.pull_request.draft == false)
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    # Worst case is ~24 API calls x API_TIMEOUT_S(15s) = ~360s across three
+    # observation rounds. At 5 minutes the job could be killed mid-decision.
+    timeout-minutes: 15
     steps:
       - name: Resolve PR + head SHA
         id: meta
@@ -60,27 +74,6 @@ jobs:
               ;;
             workflow_run)
               SHA="${{ github.event.workflow_run.head_sha }}"
-              PR="$(gh api "repos/${OWNER_REPO}/commits/${SHA}/pulls" \
-                -H "Accept: application/vnd.github.groot-preview+json" \
-                --jq '[.[] | select(.state=="open")][0].number // empty')"
-              ;;
-            check_suite)
-              # Ignore suites that only contain our own check (loop guard).
-              #
-              # Both `|| true` below are fail-OPEN by design: on API error the
-              # guard lets the run proceed rather than skip. The cost is a
-              # redundant gate run, never a green — decide() re-derives from
-              # scratch every time. Anyone who can create a check run can also
-              # trigger extra gate runs this way; that is a re-run primitive,
-              # not a trust bypass, so it is accepted rather than tightened.
-              SHA="${{ github.event.check_suite.head_sha }}"
-              NAMES="$(gh api "repos/${OWNER_REPO}/commits/${SHA}/check-runs?per_page=100" \
-                --jq '[.check_runs[].name] | unique | .[]' || true)"
-              if [ -n "$NAMES" ] && [ "$(printf '%s\n' "$NAMES" | grep -cv '^grok-mechanical-approve$' || true)" = "0" ]; then
-                echo "Only self check-runs on suite; skipping."
-                echo "skip=true" >> "$GITHUB_OUTPUT"
-                exit 0
-              fi
               PR="$(gh api "repos/${OWNER_REPO}/commits/${SHA}/pulls" \
                 -H "Accept: application/vnd.github.groot-preview+json" \
                 --jq '[.[] | select(.state=="open")][0].number // empty')"
@@ -122,10 +115,13 @@ jobs:
           private-key: ${{ secrets.GROK_APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
           repositories: ${{ github.event.repository.name }}
-          # Least privilege: this token exists only to POST one check run.
-          # create-github-app-token with no permission-* inputs mints a token
-          # carrying EVERY installation permission.
+          # Least privilege: this token POSTs the check run and READS branch
+          # protection, nothing else. With no permission-* inputs the minted
+          # token would carry EVERY installation permission.
           permission-checks: write
+          # GITHUB_TOKEN cannot be granted this at all, which is why the
+          # protection read goes through the App token.
+          permission-administration: read
 
       - name: Run mechanical gate
         if: steps.meta.outputs.skip != 'true'

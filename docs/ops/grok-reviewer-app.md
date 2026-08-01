@@ -70,7 +70,20 @@ Invariants (enforced in `.github/scripts/grok_approve_gate.py`):
 15. Deleting the gate's tests is path-denied. `tests/test_grok_approve_gate*.py`
     and `tests/test_parse_grok_verdict.py` pin these invariants and do not live
     under `.github/`, so they are named explicitly in `PATH_DENY_PREFIXES`.
-16. A missing App installation token is a hard job failure, not a red check.
+16. Success is published only after `GATHER_ROUNDS` independent observations
+    all agree. The gate never publishes a green and retracts it afterwards: if
+    the retraction call failed or the job were killed first, the green would
+    stand and the merge channel would never learn otherwise.
+17. Re-evaluation on CI completion is `workflow_run`, never `check_suite`.
+    check_suite does not trigger a workflow when the suite was created by
+    GitHub Actions, and every CI suite here is Actions-created — measured on
+    this branch: 40 runs, 0 of them check_suite. **Adding a required context
+    means adding its workflow to that `workflows:` list**, or the gate stops
+    re-evaluating when that check finishes.
+18. Renames cannot walk a tripwire out of the deny list: the PR files listing
+    is checked on `previous_filename` as well as `filename`, and a listing at
+    the 3000-file API cap is itself treated as denied.
+19. A missing App installation token is a hard job failure, not a red check.
     Posting under `GITHUB_TOKEN` would be ignored by the app-bound context, so
     it could neither grant nor revoke — and it would make the check's identity
     depend on whether a secret happened to be set.
@@ -221,11 +234,43 @@ filter does not help: it only forces the *legitimate* gate red.
 
 Two operator steps are required before this gate means anything:
 
-1. **Grant the Grok App `checks: write`** (App settings → Permissions →
-   Repository → Checks: Read and write, then accept the permission request on
-   the installation). The gate mints an installation token and posts the check
-   under the App; without that token it now refuses to post `success` at all
-   and reports `no app token`.
+1. **Grant the Grok App `checks: write` AND `administration: read`** (App
+   settings → Permissions → Repository, then accept the permission request on
+   the installation). The gate mints an installation token, posts the check
+   under the App, and — critically — uses that same token to READ branch
+   protection. Without a token it refuses to run at all rather than post under
+   `GITHUB_TOKEN`.
+
+   `administration: read` is not optional. `GET /branches/{b}/protection/required_status_checks`
+   requires it, and `GITHUB_TOKEN` cannot be granted it at all. If that read
+   403s the gate posts a `cannot read protection` failure — deliberately, since
+   an unreadable required-set is UNKNOWN, not empty.
+
+   **Pre-flight this before binding anything.** If the context is already
+   required and the read path is broken, every PR wedges permanently with no
+   way to merge. Prove the read works first with a throwaway workflow:
+
+```yaml
+# .github/workflows/protection-preflight.yml — delete after use
+name: Protection preflight
+on: workflow_dispatch
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/create-github-app-token@v2
+        id: t
+        with:
+          app-id: ${{ vars.GROK_APP_ID }}
+          private-key: ${{ secrets.GROK_APP_PRIVATE_KEY }}
+          permission-administration: read
+      - env:
+          GH_TOKEN: ${{ steps.t.outputs.token }}
+        run: gh api repos/${{ github.repository }}/branches/main/protection/required_status_checks
+```
+
+   Bind nothing until that prints the JSON. A 403 means the permission grant
+   has not been accepted on the installation yet.
 2. **Bind the required context to the App's `app_id`**, not a bare name.
 
 Classic branch protection already supports this and this repo already uses it:

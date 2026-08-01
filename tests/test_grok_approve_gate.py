@@ -343,10 +343,10 @@ def test_missing_app_token_is_a_hard_failure_not_a_github_token_post(mod, monkey
     assert posted == ["app_tok"], "must post under the App token only"
 
 
-def test_success_is_revoked_if_state_changed_after_posting(mod, monkeypatch):
-    """No compare-and-swap exists between the last observation and the POST, so
-    a green published into a state that has since changed must be taken back
-    rather than left standing until some other event fires."""
+def test_green_is_never_published_then_retracted(mod, monkeypatch):
+    """Publish-then-retract is inherently racy: if the retraction POST fails or
+    the job is killed first, the green stands and the merge channel never learns
+    otherwise. Success must only be posted after every observation agrees."""
     seen = iter([
         mod.GateDecision("success", "ok", "green"),
         mod.GateDecision("success", "ok", "green"),
@@ -361,7 +361,69 @@ def test_success_is_revoked_if_state_changed_after_posting(mod, monkeypatch):
     d = mod.run_gate(owner="o", repo="r", pr=1, head_sha="abc", token="t",
                      base_branch="main", post_token="app")
     assert d.conclusion == "failure"
-    assert posted == ["success", "failure"], "the stale green must be revoked"
+    assert posted == ["failure"], "a green must never be published at all here"
+
+
+def test_unreadable_protection_posts_a_reason_not_a_stack_trace(mod, monkeypatch):
+    """Reading protection needs Administration:read. If that 403s and the job
+    just dies, nothing is posted — and once the context is required, every PR
+    wedges with no visible explanation."""
+    posted = []
+    monkeypatch.setattr(mod, "_preflight", lambda *a, **k: None)
+
+    def boom(*a, **k):
+        raise mod.ProtectionUnreadable("needs Administration:read")
+
+    monkeypatch.setattr(mod, "_gather_and_decide", boom)
+    monkeypatch.setattr(
+        mod, "post_check_run", lambda o, r, t, s_, d: posted.append((d.conclusion, d.title))
+    )
+    d = mod.run_gate(owner="o", repo="r", pr=1, head_sha="abc", token="t",
+                     base_branch="main", post_token="app")
+    assert d.conclusion == "failure"
+    assert d.title == "cannot read protection"
+    assert posted == [("failure", "cannot read protection")]
+
+
+def test_protection_403_is_not_read_as_no_requirements(mod, monkeypatch):
+    """A 403 means the required set is UNKNOWN. Treating it like a 404 (empty)
+    is the difference between fail-closed and vacuously green."""
+    def api(method, url, token, body=None):
+        raise RuntimeError(f"GitHub API GET {url} -> 403: Resource not accessible")
+    monkeypatch.setattr(mod, "_api", api)
+    with pytest.raises(mod.ProtectionUnreadable):
+        mod.fetch_protection("o", "r", "main", "t")
+
+
+def test_protection_404_means_no_protection_configured(mod, monkeypatch):
+    def api(method, url, token, body=None):
+        raise RuntimeError(f"GitHub API GET {url} -> 404: Branch not protected")
+    monkeypatch.setattr(mod, "_api", api)
+    assert mod.fetch_protection("o", "r", "main", "t") == ((), {})
+
+
+def test_renaming_a_tripwire_out_from_under_the_deny_is_caught(mod, monkeypatch):
+    """A rename reports the NEW path in `filename`; the OLD path appears only in
+    `previous_filename`. Checking filename alone lets a PR move a tripwire to an
+    allowed path, then edit it freely in a follow-up PR."""
+    monkeypatch.setattr(
+        mod, "_paginate",
+        lambda *a, **k: [{
+            "filename": "tests/renamed_harmlessly.py",
+            "previous_filename": "tests/test_grok_approve_gate_workflow.py",
+            "status": "renamed",
+        }],
+    )
+    assert mod.fetch_pr_files_denied("o", "r", 1, "t") is True
+
+
+def test_truncated_file_listing_fails_closed(mod, monkeypatch):
+    """The files listing caps at 3000; a PR past the cap could hide a denied
+    path in the part we never see."""
+    monkeypatch.setattr(
+        mod, "_paginate", lambda *a, **k: [{"filename": "src/a.py"}] * 3000
+    )
+    assert mod.fetch_pr_files_denied("o", "r", 1, "t") is True
 
 
 def test_a_veto_landing_mid_gather_wins_over_a_stale_success(mod, monkeypatch):
@@ -489,7 +551,9 @@ def test_any_app_sentinel_is_not_treated_as_a_binding(mod, monkeypatch):
         lambda *a, **k: {"checks": [{"context": "smoke", "app_id": -1},
                                     {"context": "bound", "app_id": 4456296}]},
     )
-    assert mod.fetch_required_app_ids("o", "r", "main", "t") == {"bound": 4456296}
+    contexts, app_ids = mod.fetch_protection("o", "r", "main", "t")
+    assert app_ids == {"bound": 4456296}
+    assert set(contexts) == {"smoke", "bound"}
 
 
 @pytest.mark.parametrize(
@@ -498,6 +562,8 @@ def test_any_app_sentinel_is_not_treated_as_a_binding(mod, monkeypatch):
         "tests/test_grok_approve_gate.py",
         "tests/test_grok_approve_gate_workflow.py",
         "tests/test_parse_grok_verdict.py",
+        "pyproject.toml",
+        "tests/conftest.py",
     ],
 )
 def test_deleting_the_gate_tripwires_is_path_denied(mod, path):

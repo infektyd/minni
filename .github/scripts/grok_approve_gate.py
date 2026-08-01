@@ -50,6 +50,9 @@ APP_BOT_LOGINS = ("infektydgrokreviewer[bot]",)
 # final observation and the POST limited only by the job timeout.
 API_TIMEOUT_S = 15
 
+# How many independent observations must agree before success is published.
+GATHER_ROUNDS = 3
+
 # Paths that must never get a green mechanical check from eligibility alone.
 # All of .github/ is denied, not just the four gate files: any workflow under
 # it can weaken a required check the gate trusts, or post as github-actions[bot].
@@ -60,11 +63,20 @@ PATH_DENY_PREFIXES = (
     "tests/test_grok_approve_gate.py",
     "tests/test_grok_approve_gate_workflow.py",
     "tests/test_parse_grok_verdict.py",
+    # Collection config can disable every tripwire above without touching a
+    # single test file: pyproject `addopts = "--ignore=..."` or dropping
+    # `testpaths`, or conftest `collect_ignore_glob`.
+    "pyproject.toml",
+    "tests/conftest.py",
 )
 
 
 class MissingAppToken(RuntimeError):
     """No Grok App installation token: the check has no trustworthy identity."""
+
+
+class ProtectionUnreadable(RuntimeError):
+    """Branch protection could not be read; the required set is UNKNOWN."""
 
 
 @dataclass(frozen=True)
@@ -199,32 +211,15 @@ def _paginate(url: str, token: str) -> list[Any]:
     return out
 
 
-def fetch_required_contexts(owner: str, repo: str, branch: str, token: str) -> tuple[str, ...]:
-    url = f"https://api.github.com/repos/{owner}/{repo}/branches/{branch}/protection/required_status_checks"
-    try:
-        data = _api("GET", url, token)
-    except RuntimeError as e:
-        if "404" in str(e):
-            return ()
-        raise
-    contexts = list(data.get("contexts") or [])
-    for check in data.get("checks") or []:
-        ctx = check.get("context")
-        if ctx and ctx not in contexts:
-            contexts.append(ctx)
-    # Never treat our own check as a prerequisite for itself.
-    return tuple(c for c in contexts if c != CHECK_NAME)
-
-
-def fetch_required_app_ids(
+def fetch_protection(
     owner: str, repo: str, branch: str, token: str
-) -> dict[str, int]:
-    """context -> app_id, for contexts branch protection binds to an integration.
+) -> tuple[tuple[str, ...], dict[str, int]]:
+    """Return (required_contexts, context -> bound app_id) in ONE API call.
 
-    Protection can pin a context to an app_id ("-1" means any app). Without
-    reading that back, the gate is app-blind about its OWN prerequisites: a
-    same-repo workflow can mint `claude-review` success under the GitHub
-    Actions app and satisfy the gate, even where protection would reject it.
+    Reading this endpoint needs Administration:read, which GITHUB_TOKEN cannot
+    be granted — pass the App installation token. A 403 here is a misconfigured
+    App, not an absent ruleset, and must not read as "no requirements": that is
+    the difference between "fail closed" and "vacuously green".
     """
     url = (
         f"https://api.github.com/repos/{owner}/{repo}/branches/{branch}"
@@ -233,16 +228,29 @@ def fetch_required_app_ids(
     try:
         data = _api("GET", url, token)
     except RuntimeError as e:
-        if "404" in str(e):
-            return {}
+        msg = str(e)
+        if "404" in msg:
+            # No protection configured at all; decide() rejects an empty set.
+            return (), {}
+        if "403" in msg or "401" in msg:
+            raise ProtectionUnreadable(
+                "Cannot read branch protection (HTTP 403/401). The token needs "
+                "Administration:read — grant it to the Grok App and make sure "
+                "APP_TOKEN is what reads protection."
+            ) from e
         raise
-    out: dict[str, int] = {}
+
+    contexts = list(data.get("contexts") or [])
+    app_ids: dict[str, int] = {}
     for check in data.get("checks") or []:
         ctx, app_id = check.get("context"), check.get("app_id")
-        # -1 is GitHub's "any app is allowed" sentinel; not a binding.
+        if ctx and ctx not in contexts:
+            contexts.append(ctx)
+        # -1 is GitHub's "explicitly allow any app" sentinel, not a binding.
         if ctx and ctx != CHECK_NAME and isinstance(app_id, int) and app_id > 0:
-            out[ctx] = app_id
-    return out
+            app_ids[ctx] = app_id
+    # Never treat our own check as a prerequisite for itself.
+    return tuple(c for c in contexts if c != CHECK_NAME), app_ids
 
 
 # Worst-wins ordering. Merging observations for one context must never let a
@@ -389,7 +397,19 @@ def analyze_reviews(
 def fetch_pr_files_denied(owner: str, repo: str, pr: int, token: str) -> bool:
     url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr}/files?per_page=100"
     files = _paginate(url, token)
-    return any(path_denied(f.get("filename") or "") for f in files)
+    # GitHub caps this listing at 3000 files. A PR big enough to truncate could
+    # hide a denied path past the cap, so treat truncation itself as denied.
+    if len(files) >= 3000:
+        return True
+    for f in files:
+        # A rename reports the NEW path in `filename` and the OLD one only in
+        # `previous_filename`. Checking `filename` alone lets a PR rename a
+        # tripwire out from under the deny list, then edit it in a second PR.
+        if path_denied(f.get("filename") or ""):
+            return True
+        if path_denied(f.get("previous_filename") or ""):
+            return True
+    return False
 
 
 def path_denied(path: str) -> bool:
@@ -479,10 +499,15 @@ def _preflight(
 
 
 def _gather_and_decide(
-    owner: str, repo: str, pr: int, head_sha: str, token: str, base_branch: str
+    owner: str,
+    repo: str,
+    pr: int,
+    head_sha: str,
+    token: str,
+    base_branch: str,
+    protection_token: str = "",
 ) -> GateDecision:
-    required = fetch_required_contexts(owner, repo, base_branch, token)
-    app_ids = fetch_required_app_ids(owner, repo, base_branch, token)
+    required, app_ids = fetch_protection(owner, repo, base_branch, protection_token)
     states = fetch_combined_statuses(owner, repo, head_sha, token, app_ids)
     reviews = _paginate(
         f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr}/reviews?per_page=100",
@@ -512,43 +537,48 @@ def run_gate(
     base_branch: str,
     post_token: str = "",
 ) -> GateDecision:
-    decision = _preflight(owner, repo, pr, head_sha, token)
-    if decision is None:
-        first = _gather_and_decide(owner, repo, pr, head_sha, token, base_branch)
-        # Re-read EVERYTHING immediately before posting, not just the SHA. A
-        # concurrent gate run (or a REQUEST_CHANGES landing mid-gather) must not
-        # be overwritten by this run's stale snapshot: success needs two
-        # agreeing observations, anything else wins immediately.
-        second = _gather_and_decide(owner, repo, pr, head_sha, token, base_branch)
-        decision = second if second.conclusion != "success" else first
-        moved = _preflight(owner, repo, pr, head_sha, token)
-        if moved is not None:
-            decision = moved
-
+    # Checked FIRST: the App token is what reads protection and posts the
+    # check, so without it every later call is wasted and the failure would
+    # surface as a confusing 401 instead of the real cause.
+    #
     # The check-run channel is only a trust root when the check is posted by the
     # Grok App: a bare name posted with GITHUB_TOKEN can be minted by ANY
-    # same-repo Actions workflow, so protection must bind the context to the
-    # App's app_id and we must post under that identity.
-    #
-    # Falling back to GITHUB_TOKEN is worse than not posting: an app-bound
-    # context ignores that check, so it can neither grant nor REVOKE, and the
-    # check's identity would silently depend on whether a secret was set.
+    # same-repo Actions workflow. Falling back to GITHUB_TOKEN is worse than not
+    # posting, because an app-bound context ignores that check entirely — it
+    # could neither grant nor REVOKE.
     if not post_token:
         raise MissingAppToken(
             "APP_TOKEN is empty - refusing to post the mechanical check under "
             "GITHUB_TOKEN. Set vars.GROK_APP_ID + secrets.GROK_APP_PRIVATE_KEY "
-            "and grant the App `checks: write`."
+            "and grant the App `checks: write` + `administration: read`."
         )
-    post_check_run(owner, repo, post_token, head_sha, decision)
+    decision = _preflight(owner, repo, pr, head_sha, token)
+    if decision is None:
+        # Observe repeatedly and publish success only if EVERY observation
+        # agrees. Publishing a green and retracting it afterwards is inherently
+        # racy: if the retraction call fails or the job is killed first, the
+        # green stands and the merge channel never learns otherwise. Any
+        # non-success wins immediately and is what gets posted.
+        decision = None
+        try:
+            for _ in range(GATHER_ROUNDS):
+                obs = _gather_and_decide(
+                    owner, repo, pr, head_sha, token, base_branch, post_token
+                )
+                if obs.conclusion != "success":
+                    decision = obs
+                    break
+                decision = obs
+        except ProtectionUnreadable as e:
+            # Post the reason rather than dying with a stack trace: if the
+            # context is already required, a job that posts nothing wedges
+            # every PR with no visible explanation.
+            decision = GateDecision("failure", "cannot read protection", str(e))
+        moved = _preflight(owner, repo, pr, head_sha, token)
+        if moved is not None:
+            decision = moved
 
-    # Nothing stops state changing between the last observation and the POST.
-    # If we just published green, look once more and take it back rather than
-    # leave a stale success standing until some other event happens to fire.
-    if decision.conclusion == "success":
-        after = _gather_and_decide(owner, repo, pr, head_sha, token, base_branch)
-        if after.conclusion != "success":
-            post_check_run(owner, repo, post_token, head_sha, after)
-            return after
+    post_check_run(owner, repo, post_token, head_sha, decision)
     return decision
 
 
