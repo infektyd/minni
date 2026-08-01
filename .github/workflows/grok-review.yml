@@ -19,8 +19,9 @@ on:
   pull_request:
     types: [opened, ready_for_review, reopened]
     # Deliberately NOT on `synchronize`: one subscription-metered review per
-    # open/ready/reopen, not per push. Recovery after REQUEST_CHANGES: dismiss
-    # the App review, or draft → ready_for_review / close → reopen (reopened).
+    # open/ready/reopen, not per push. A formal App REQUEST_CHANGES stays sticky
+    # until dismissed (v1 App never APPROVEs; a later COMMENT does not clear it).
+    # draft→ready / close→reopen only re-fire the job for fresh findings.
 
 permissions:
   contents: read

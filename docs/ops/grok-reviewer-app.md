@@ -87,13 +87,14 @@ not a v1 blocker.
 ## Recovery after `REQUEST_CHANGES`
 
 v1 does **not** re-review on every push (`synchronize` omitted to limit
-subscription burn). A formal `REQUEST_CHANGES` from the App stays sticky until
-cleared. Working recovery paths:
+subscription burn). GitHub keeps an App `CHANGES_REQUESTED` opinion until that
+**same** review is dismissed or the App submits `APPROVE` (forbidden in v1). A
+later `COMMENT` review from the App does **not** clear it; a human/Cursor
+`APPROVE` is a different reviewer and also does not auto-dismiss the App.
 
-1. **Dismiss** the App's review in the PR UI (or via API), then merge once a
-   human/Cursor approving review is present; or
-2. Convert the PR to **draft → Ready for review** (fires `ready_for_review`); or
-3. **Close → reopen** the PR (fires `reopened`).
+1. **Dismiss** the App's review (required to clear `CHANGES_REQUESTED` in v1).
+2. Optionally re-fire a review via draft → Ready for review, or close → reopen
+   (informational / fresh findings only — does **not** unblock merge by itself).
 
 `@grok` / the mention workflow only posts an issue comment — it does **not**
 submit a Reviews API event and will not clear `CHANGES_REQUESTED`.
@@ -103,4 +104,5 @@ submit a Reviews API event and will not clear `CHANGES_REQUESTED`.
 - LLM `APPROVE` via the App
 - Machine-user PAT as the review identity
 - Fork PRs (job already skips them; secrets unavailable)
-- `synchronize` re-review (subscription burn; use recovery paths above)
+- `synchronize` re-review (subscription burn; use dismiss above)
+- Auto-dismiss of prior App `REQUEST_CHANGES` when a later COMMENT posts
