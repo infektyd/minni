@@ -1,0 +1,12 @@
+explicit
+# LINE 1 ONLY: the exact value (explicit | auto | disabled) with NOTHING else on line 1.
+# Subsequent lines are comments/docs only. Parsers skip leading blanks and # lines.
+# Minni Distill mode for {{agent}}.
+# Valid: explicit | auto | disabled
+# This file controls the ritual toggle. Presence + value = enabled in that mode.
+# Default: explicit (agent surfaces a short yes/no gate before distilling).
+# To switch to auto: replace line 1 with "auto" (agent decides from gauges and
+#   acts autonomously, writing a human-auditable trace).
+# To disable: replace line 1 with "disabled" (or delete/rename this file).
+# Operator-owned: minni-install seeds this file once and never overwrites it.
+# Edit in Obsidian or any editor; changes take effect on the next session.

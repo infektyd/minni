@@ -9,6 +9,7 @@ agent_api + daemon read delivery.
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import json
 import os
 import re
@@ -1389,6 +1390,69 @@ def update_plugin(args: argparse.Namespace) -> int:
     return 0
 
 
+DISTILL_TEMPLATE_DIR = Path(__file__).resolve().parent.parent / "templates" / "distill"
+DISTILL_FILES = ("mode", "gauges.md", "ritual.md")
+
+
+def seed_distill(vault: Path, agent: str) -> dict[str, object]:
+    """Seed `<vault>/distill/` with the Distill Ritual V1 artifacts.
+
+    The ritual (see the `minni` SKILL, "Minni Distill Ritual V1") requires the
+    agent to read `distill/gauges.md` FIRST at any wind-down signal and to take
+    its explicit|auto|disabled toggle from `distill/mode`. Nothing used to
+    create those files, so every vault ran the ritual blind.
+
+    Idempotent by contract: `mode` and `gauges.md` are operator/agent-owned
+    living state, and `ritual.md` accumulates traces, so an existing file is
+    never overwritten -- only missing ones are written.
+    """
+    distill = vault / "distill"
+    result: dict[str, object] = {"path": str(distill)}
+    if not DISTILL_TEMPLATE_DIR.is_dir():
+        # Non-fatal: a stripped install tree must not break vault bootstrap.
+        result["status"] = "skipped"
+        result["reason"] = f"template dir missing: {DISTILL_TEMPLATE_DIR}"
+        return result
+
+    distill.mkdir(exist_ok=True)
+    layer1_core = vault / "layer1" / "core.md"
+    if layer1_core.exists():
+        identity_present = f'"{layer1_core.relative_to(vault)} present"'
+        summary = (
+            f"Layer 1 workspace present at layer1/ (core.md + budget.md, strict "
+            f"<4096 token budget). Protect it during every distill."
+        )
+    else:
+        identity_present = '"not seeded"'
+        summary = (
+            "No layer1/core.md in this vault yet -- seed Layer 1 via minni-install "
+            "before relying on identity protection during a distill."
+        )
+    values = {
+        "agent": agent,
+        "timestamp": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "layer1_identity_present": identity_present,
+        "layer1_summary": summary,
+    }
+
+    created: list[str] = []
+    kept: list[str] = []
+    for name in DISTILL_FILES:
+        target = distill / name
+        if target.exists():
+            kept.append(name)
+            continue
+        body = (DISTILL_TEMPLATE_DIR / name).read_text(encoding="utf-8")
+        for key, value in values.items():
+            body = body.replace("{{" + key + "}}", value)
+        target.write_text(body, encoding="utf-8")
+        created.append(name)
+    result["status"] = "ok"
+    result["created"] = created
+    result["kept"] = kept
+    return result
+
+
 def bootstrap_vault(args: argparse.Namespace) -> int:
     agent = args.agent
     vault = vault_for(agent)
@@ -1414,7 +1478,8 @@ def bootstrap_vault(args: argparse.Namespace) -> int:
     log = vault / "log.md"
     if not log.exists():
         log.write_text(f"# {agent} Vault Log\n\n", encoding="utf-8")
-    print(json.dumps({"status": "ok", "agent": agent, "vault": str(vault), "symlink": vault.is_symlink()}, indent=2))
+    distill = seed_distill(vault, agent)
+    print(json.dumps({"status": "ok", "agent": agent, "vault": str(vault), "symlink": vault.is_symlink(), "distill": distill}, indent=2))
     return 0
 
 

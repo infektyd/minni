@@ -8,6 +8,18 @@ pre-1.0: minor versions may contain breaking changes until v1.0.0.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Distill ritual artifacts are now seeded**: `bootstrap-vault` (and therefore
+  `update-plugin`) creates `<vault>/distill/` with `mode` (default `explicit`),
+  `gauges.md`, and `ritual.md` from in-repo templates parameterized by agent id.
+  The Minni Distill Ritual V1 tells the agent to read `distill/gauges.md` first
+  at any wind-down signal, but nothing ever created those files, so every vault
+  ran the ritual blind against a missing meter. Seeding is idempotent: `mode`
+  and `gauges.md` are operator-owned living state and `ritual.md` accumulates
+  traces, so existing files are never overwritten. Re-run `bootstrap-vault
+  --agent <id>` to backfill an older vault.
+
 ## [0.4.0] - 2026-07-30
 
 ### Added

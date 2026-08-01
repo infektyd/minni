@@ -85,7 +85,9 @@ This is the "live context meter". It contains:
 - Recent Burst description + key artifacts from the sprint
 - Decision Aids (pressure_level: low|medium|high, recommended: "...", future_route_signals)
 
-The agent is trained to **read the gauges first** at any wind-down signal (end of plan, after major milestone, before deciding on compaction). The gauges remove all the hard modeling work. Full schema and example in `~/.agents/artifacts/minni-distill-ritual-v1/gauges/`.
+The agent is trained to **read the gauges first** at any wind-down signal (end of plan, after major milestone, before deciding on compaction). The gauges remove all the hard modeling work. The canonical schema is the seed template shipped in the repo: `plugins/minni/skills/minni-install/templates/distill/gauges.md`.
+
+`distill/mode`, `distill/gauges.md`, and `distill/ritual.md` are seeded into every vault by `minni-install` (`bootstrap-vault`, also run by `update-plugin`). If your vault has no `distill/` directory, re-run `bootstrap-vault --agent <id>` rather than distilling blind; seeding never overwrites existing files.
 
 ### Two Operating Modes (Controlled by `distill/mode` in your vault)
 - **Explicit mode** (default): When gauges indicate rising pressure, surface a short, clear yes/no gate to the user. On yes → execute the quick workflow. On no → log lightly.
@@ -127,7 +129,7 @@ Once the ritual section is in your SKILL and any platform hooks support the inje
 
 After this, the ritual, gauges, and workflow are part of how you operate. The single statement + SKILL training + platform delivery lock it in.
 
-See the full details, schema, and examples in the reference package: `~/.agents/artifacts/minni-distill-ritual-v1/` (DESIGN, gauges/SCHEMA.md, notes/agnostic-vs-grok-specific.md for the portable boundary).
+The seed templates that define the on-disk shape live in the repo at `plugins/minni/skills/minni-install/templates/distill/` (`mode`, `gauges.md`, `ritual.md`). The historical reference package `~/.agents/artifacts/minni-distill-ritual-v1/` (DESIGN, gauges/SCHEMA.md, notes/agnostic-vs-grok-specific.md) is machine-local and may be absent; this SKILL plus the in-repo templates are the source of truth.
 
 ## Layer 1 Contract (general)
 
