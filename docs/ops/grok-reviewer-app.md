@@ -46,6 +46,14 @@ Invariants (enforced in `.github/scripts/grok_approve_gate.py`):
    and a later unmarked App review revokes it.
 10. Per-context state is worst-wins: an in-flight re-run or a stale `success`
     can never mask a pending or failed observation of the same check.
+11. `success` is posted only under the Grok App installation token. With only
+    `GITHUB_TOKEN` the gate reports `no app token` and stays red, because a
+    name-only check is mintable by any same-repo workflow (see below).
+12. Every input is re-read immediately before posting and both observations
+    must agree on `success`; concurrency is keyed on head SHA for all events,
+    so a stale snapshot cannot publish green over a veto that already landed.
+13. Every non-skip path posts a terminal conclusion, so a superseded run cannot
+    leave an earlier `success` standing on the SHA.
 
 Parser: `.github/scripts/parse_grok_verdict.py` — default path never emits
 Reviews `APPROVE`; `--allow-approve` is for gate/eligibility readers only.
@@ -108,6 +116,35 @@ JSON
 
 Keep `required_approving_review_count: 1` only if you still want a **human**
 review in addition to the mechanical check (bots still will not count).
+
+### The name-only required context is NOT a trust root
+
+Branch protection matches a required status check **by name**. Any same-repo
+workflow with `permissions: checks: write` can create a check run called
+`grok-mechanical-approve` with `conclusion: success` using the default
+`GITHUB_TOKEN` — and it appears under the same GitHub Actions app as the real
+gate. A PR can therefore mint its own required check. The `.github/` path
+filter does not help: it only forces the *legitimate* gate red.
+
+Two operator steps are required before this gate means anything:
+
+1. **Grant the Grok App `checks: write`** (App settings → Permissions →
+   Repository → Checks: Read and write, then accept the permission request on
+   the installation). The gate mints an installation token and posts the check
+   under the App; without that token it now refuses to post `success` at all
+   and reports `no app token`.
+2. **Bind the required context to the App's `app_id`**, not a bare name:
+
+```bash
+APP_ID=$(gh api /repos/infektyd/minni/commits/main/check-runs \
+  --jq '[.check_runs[] | select(.name=="grok-mechanical-approve") | .app.id][0]')
+gh api -X PATCH repos/infektyd/minni/branches/main/protection/required_status_checks \
+  -F strict=true \
+  -f 'checks[][context]=grok-mechanical-approve' -F "checks[][app_id]=$APP_ID"
+```
+
+A `GITHUB_TOKEN`-minted check of the same name carries the GitHub Actions
+`app_id` and will not satisfy an App-bound context.
 
 **Do not add `boundary` to this list.** Grok Boundary Test only runs on PRs
 touching `.github/workflows/grok*.yml` or `check-no-credential-leak.py`. On an

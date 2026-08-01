@@ -316,6 +316,77 @@ def test_check_run_state_mapping(mod, run, expected):
     assert mod._check_run_state(run) == expected
 
 
+def test_success_is_never_posted_without_an_app_token(mod, monkeypatch):
+    """A required context is matched by NAME, and any same-repo Actions workflow
+    can mint that name with GITHUB_TOKEN. Only a check posted under the Grok App
+    can be bound to an app_id, so GITHUB_TOKEN must never post green."""
+    posted = {}
+
+    monkeypatch.setattr(mod, "_preflight", lambda *a, **k: None)
+    monkeypatch.setattr(
+        mod, "_gather_and_decide",
+        lambda *a, **k: mod.GateDecision("success", "ok", "all green"),
+    )
+    monkeypatch.setattr(
+        mod, "post_check_run",
+        lambda o, r, tok, sha, d: posted.update(token=tok, conclusion=d.conclusion,
+                                                title=d.title),
+    )
+
+    d = mod.run_gate(owner="o", repo="r", pr=1, head_sha="abc", token="ghs_actions",
+                     base_branch="main", post_token="")
+    assert d.conclusion == "failure"
+    assert d.title == "no app token"
+    assert posted["conclusion"] == "failure"
+
+    d = mod.run_gate(owner="o", repo="r", pr=1, head_sha="abc", token="ghs_actions",
+                     base_branch="main", post_token="app_tok")
+    assert d.conclusion == "success"
+    assert posted["token"] == "app_tok"
+
+
+def test_a_veto_landing_mid_gather_wins_over_a_stale_success(mod, monkeypatch):
+    """Two concurrent gate runs: the second observation must win when it is not
+    success, so a REQUEST_CHANGES cannot be overwritten by a stale snapshot."""
+    seen = iter([
+        mod.GateDecision("success", "ok", "all green"),
+        mod.GateDecision("failure", "REQUEST_CHANGES outstanding", "vetoed"),
+    ])
+    posted = {}
+    monkeypatch.setattr(mod, "_preflight", lambda *a, **k: None)
+    monkeypatch.setattr(mod, "_gather_and_decide", lambda *a, **k: next(seen))
+    monkeypatch.setattr(
+        mod, "post_check_run",
+        lambda o, r, t, s, d: posted.update(conclusion=d.conclusion),
+    )
+    d = mod.run_gate(owner="o", repo="r", pr=1, head_sha="abc", token="t",
+                     base_branch="main", post_token="app")
+    assert d.conclusion == "failure"
+    assert posted["conclusion"] == "failure"
+
+
+@pytest.mark.parametrize(
+    "early",
+    [("head moved", "Abort"), ("draft", "Draft"), ("fork", "Fork")],
+)
+def test_early_exits_still_post_a_terminal_conclusion(mod, monkeypatch, early):
+    """An early return that posts nothing leaves a previous run's green in
+    place on that SHA."""
+    posted = {}
+    monkeypatch.setattr(
+        mod, "_preflight",
+        lambda *a, **k: mod.GateDecision("failure", early[0], early[1]),
+    )
+    monkeypatch.setattr(
+        mod, "post_check_run",
+        lambda o, r, t, s, d: posted.update(conclusion=d.conclusion, title=d.title),
+    )
+    d = mod.run_gate(owner="o", repo="r", pr=1, head_sha="abc", token="t",
+                     base_branch="main", post_token="app")
+    assert d.conclusion == "failure"
+    assert posted["title"] == early[0]
+
+
 def test_dismissed_request_changes_does_not_block(mod):
     reviews = [
         {

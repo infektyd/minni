@@ -27,8 +27,11 @@ permissions:
   statuses: read
   pull-requests: read
 
+# Key on head SHA for EVERY event. Keying pull_request on PR number and
+# check_suite on SHA put concurrent runs in different groups, so a stale
+# snapshot could publish success over a veto that had already landed.
 concurrency:
-  group: grok-approve-gate-${{ github.event.pull_request.number || github.event.workflow_run.pull_requests[0].number || github.event.check_suite.head_sha || github.sha }}
+  group: grok-approve-gate-${{ github.event.pull_request.head.sha || github.event.workflow_run.head_sha || github.event.check_suite.head_sha || github.sha }}
   cancel-in-progress: true
 
 jobs:
@@ -98,10 +101,26 @@ jobs:
           ref: ${{ steps.meta.outputs.default_branch }}
           fetch-depth: 1
 
+      # The check run must be posted by the Grok App, not GITHUB_TOKEN: branch
+      # protection matches a required context by NAME, and any same-repo
+      # workflow with `checks: write` can mint that name under the GitHub
+      # Actions app. Posting under the App lets protection bind the context to
+      # its app_id, which a GITHUB_TOKEN check cannot satisfy.
+      - name: Mint GitHub App installation token
+        id: app-token
+        if: steps.meta.outputs.skip != 'true' && vars.GROK_APP_ID != ''
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.GROK_APP_ID }}
+          private-key: ${{ secrets.GROK_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+
       - name: Run mechanical gate
         if: steps.meta.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
+          APP_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           set -euo pipefail
           TRUST_REF="${{ steps.meta.outputs.default_branch }}"

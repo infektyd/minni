@@ -388,16 +388,10 @@ def resolve_pr_for_sha(owner: str, repo: str, sha: str, token: str) -> int | Non
     return None
 
 
-def run_gate(
-    *,
-    owner: str,
-    repo: str,
-    pr: int,
-    head_sha: str,
-    token: str,
-    base_branch: str,
-) -> GateDecision:
-    # SHA binding: re-read PR head before deciding.
+def _preflight(
+    owner: str, repo: str, pr: int, head_sha: str, token: str
+) -> GateDecision | None:
+    """Cheap disqualifiers. None means "keep going"."""
     pr_data = _api("GET", f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr}", token)
     live_sha = (pr_data.get("head") or {}).get("sha") or ""
     if live_sha != head_sha:
@@ -414,7 +408,12 @@ def run_gate(
     head_repo = (pr_data.get("head") or {}).get("repo") or {}
     if (head_repo.get("full_name") or "") != f"{owner}/{repo}":
         return GateDecision("failure", "fork", "Fork PRs are out of scope.")
+    return None
 
+
+def _gather_and_decide(
+    owner: str, repo: str, pr: int, head_sha: str, token: str, base_branch: str
+) -> GateDecision:
     required = fetch_required_contexts(owner, repo, base_branch, token)
     states = fetch_combined_statuses(owner, repo, head_sha, token)
     reviews = _paginate(
@@ -422,28 +421,56 @@ def run_gate(
         token,
     )
     eligible, blocked = analyze_reviews(reviews, head_sha)
-    path_denied = fetch_pr_files_denied(owner, repo, pr, token)
-
-    decision = decide(
+    denied = fetch_pr_files_denied(owner, repo, pr, token)
+    return decide(
         GateInput(
             head_sha=head_sha,
             required_contexts=required,
             check_states=states,
             eligible=eligible,
             blocked_by_request_changes=blocked,
-            path_denied=path_denied,
+            path_denied=denied,
         )
     )
-    # Re-check SHA immediately before posting.
-    pr_data2 = _api("GET", f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr}", token)
-    live2 = (pr_data2.get("head") or {}).get("sha") or ""
-    if live2 != head_sha:
+
+
+def run_gate(
+    *,
+    owner: str,
+    repo: str,
+    pr: int,
+    head_sha: str,
+    token: str,
+    base_branch: str,
+    post_token: str = "",
+) -> GateDecision:
+    decision = _preflight(owner, repo, pr, head_sha, token)
+    if decision is None:
+        first = _gather_and_decide(owner, repo, pr, head_sha, token, base_branch)
+        # Re-read EVERYTHING immediately before posting, not just the SHA. A
+        # concurrent gate run (or a REQUEST_CHANGES landing mid-gather) must not
+        # be overwritten by this run's stale snapshot: success needs two
+        # agreeing observations, anything else wins immediately.
+        second = _gather_and_decide(owner, repo, pr, head_sha, token, base_branch)
+        decision = second if second.conclusion != "success" else first
+        moved = _preflight(owner, repo, pr, head_sha, token)
+        if moved is not None:
+            decision = moved
+
+    # The check-run channel is only a trust root when the check is posted by the
+    # Grok App: a bare name posted with GITHUB_TOKEN can be minted by ANY
+    # same-repo Actions workflow, so protection must bind the context to the
+    # App's app_id and we must post under that identity. Without the App token
+    # we may still post red, never green.
+    if decision.conclusion == "success" and not post_token:
         decision = GateDecision(
             "failure",
-            "head moved",
-            f"Abort before post: head is now {live2[:12]}.",
+            "no app token",
+            "Refusing to mint success with GITHUB_TOKEN: any same-repo workflow "
+            "could post this check name. Configure the Grok App (checks: write) "
+            "and bind the required context to its app_id.",
         )
-    post_check_run(owner, repo, token, head_sha, decision)
+    post_check_run(owner, repo, post_token or token, head_sha, decision)
     return decision
 
 
@@ -454,8 +481,15 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--head-sha", required=True)
     p.add_argument("--base-branch", default="")
     p.add_argument("--token-env", default="GH_TOKEN")
+    p.add_argument(
+        "--post-token-env",
+        default="APP_TOKEN",
+        help="Env var holding the Grok App installation token used to POST the "
+        "check run. Without it the gate can only post failure.",
+    )
     args = p.parse_args(argv)
     token = os.environ.get(args.token_env, "")
+    post_token = os.environ.get(args.post_token_env, "")
     if not token:
         print(f"::error::{args.token_env} unset", file=sys.stderr)
         return 2
@@ -481,6 +515,7 @@ def main(argv: list[str] | None = None) -> int:
         head_sha=args.head_sha,
         token=token,
         base_branch=base,
+        post_token=post_token,
     )
     print(f"{decision.conclusion}\t{decision.title}\t{decision.summary}")
     # Job stays green even when the *check run* is failure — the required
