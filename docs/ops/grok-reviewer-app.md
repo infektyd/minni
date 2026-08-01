@@ -289,14 +289,17 @@ jobs:
    that exist on the **default branch** — dispatching this file from a topic
    branch returns 404. Either land the throwaway on main (and delete it after
    use, as above), or skip the throwaway entirely: a gate run on a real PR
-   exercises the same mint + protection read and reports the same failure
-   modes (`APP_TOKEN is empty` as a hard job failure when the App token is
-   missing or the mint step is skipped/fails — no check is posted in that
-   case; check title `cannot read protection` for a 403), so one canary PR
-   is an equivalent probe of mint + protection read. The canary must clear
-   the path filter for that equivalence to hold: a PR touching `.github/`
-   (or any denied path) goes red on path-deny before the protection read
-   is ever reached — use a docs-only change.
+   exercises the same mint + protection read, so one canary PR is an
+   equivalent probe. The failure modes it reports, by case: skipped or
+   empty mint (`GROK_APP_ID` unset) → hard job failure logging
+   `APP_TOKEN is empty`, no check posted; mint **action** failure (bad
+   key, permission not granted) → red mint step, no check posted and no
+   gate log line at all; token OK but `administration: read` missing →
+   check titled `cannot read protection`. Path-deny does not
+   short-circuit the probe: protection is read during gathering, before
+   the path filter is applied, and a 403 still posts
+   `cannot read protection`. Prefer a docs-only canary anyway, so a
+   successful probe is not masked by a `path filter` failure title.
 2. **Bind the required context to the App's `app_id`**, not a bare name.
 
 Classic branch protection already supports this and this repo already uses it:
