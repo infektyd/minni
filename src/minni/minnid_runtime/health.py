@@ -322,12 +322,23 @@ def handle_health_report(params: dict, request_id: Any, context: HealthContext) 
                 # Audit R0: parse-or-report. A TEXT timestamp here used to
                 # TypeError on the subtraction and take the whole health report
                 # down with it.
+                #
+                # grok-review (PR #242): `row["indexed_at"] or row["last_modified"]
+                # or 0` picks indexed_at whenever it is truthy — including a
+                # non-numeric TEXT value, which is truthy too — so a poisoned
+                # indexed_at shadowed a perfectly good last_modified and this
+                # row's age_days went to None instead of a real number. Parse
+                # indexed_at first and only fall back to last_modified if that
+                # parse fails, matching how decay.py treats the same two columns.
                 ts = parse_epoch_or_report(
-                    row["indexed_at"] or row["last_modified"] or 0,
-                    field="indexed_at",
-                    source="health.stale_docs",
-                    doc_id=row["doc_id"],
+                    row["indexed_at"], field="indexed_at",
+                    source="health.stale_docs", doc_id=row["doc_id"],
                 )
+                if ts is None:
+                    ts = parse_epoch_or_report(
+                        row["last_modified"], field="last_modified",
+                        source="health.stale_docs", doc_id=row["doc_id"],
+                    )
                 report["stale_docs"].append({
                     "doc_id": row["doc_id"],
                     "path": row["path"],

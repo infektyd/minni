@@ -22,6 +22,8 @@ import sqlite3
 import sys
 import time
 
+import pytest
+
 sys.path.insert(0, os.path.dirname(__file__))
 
 # The exact value found in the live shared DB (doc_id 590).
@@ -177,6 +179,69 @@ def test_migration_016_triggers_recover_an_offset_iso_epoch(tmp_path):
     assert row["indexed_at"] == POISON_ISO_OFFSET_EPOCH_SECONDS
 
 
+def test_migration_016_rejects_multi_dot_numeric_garbage(tmp_path):
+    """grok-review round 2, Medium: a loose numeric-TEXT guard let
+    '1700000000.5.9' / '12..3' through — CAST(... AS REAL) takes the longest
+    leading numeric prefix and stores a plausible-looking but WRONG epoch,
+    exactly the "quietly inventing a plausible date" failure the 0.0 sentinel
+    exists to prevent. parse_epoch('1700000000.5.9') is None (float() raises),
+    so the migration must land on 0.0 too, not a prefix-parsed REAL."""
+    from minni.migrations import run_migrations
+    from minni.timestamps import parse_epoch
+
+    multi_dot = "1700000000.5.9"
+    assert parse_epoch(multi_dot) is None
+
+    db_path = tmp_path / "legacy_multidot.db"
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        "CREATE TABLE documents ("
+        " doc_id INTEGER PRIMARY KEY AUTOINCREMENT, path TEXT UNIQUE NOT NULL,"
+        " last_modified REAL, indexed_at REAL, last_accessed REAL)"
+    )
+    conn.execute(
+        "INSERT INTO documents (path, indexed_at) VALUES (?, ?)",
+        ("legacy://multidot", multi_dot),
+    )
+    conn.commit()
+
+    run_migrations(conn)
+
+    stored = conn.execute(
+        "SELECT indexed_at FROM documents WHERE path = 'legacy://multidot'"
+    ).fetchone()[0]
+    assert stored == 0.0, (
+        "multi-dot garbage must fall to the visible sentinel, not a plausible "
+        "invented epoch derived from a numeric prefix"
+    )
+    conn.close()
+
+
+def test_migration_016_triggers_recover_whitespace_padded_numeric_text(tmp_path):
+    """grok-review round 2, Low: a leading/trailing-space numeric epoch
+    (e.g. ' 1700000000.5') is recoverable by parse_epoch (strip() then
+    float()) but failed the un-trimmed SQL GLOB guard and fell to the 0.0
+    sentinel instead."""
+    from minni.timestamps import parse_epoch
+
+    padded = " 1700000000.5"
+    assert parse_epoch(padded) == 1700000000.5
+
+    db_obj, _ = _make_db(tmp_path)
+    with db_obj.transaction() as c:
+        c.execute(
+            "INSERT INTO documents (path, indexed_at) VALUES (?, ?)",
+            ("poison://padded-numeric", padded),
+        )
+    with db_obj.cursor() as c:
+        row = c.execute(
+            "SELECT typeof(indexed_at) t, indexed_at FROM documents "
+            "WHERE path = 'poison://padded-numeric'"
+        ).fetchone()
+    assert row["t"] == "real"
+    assert row["indexed_at"] == 1700000000.5
+
+
 def test_migration_016_numeric_text_matches_python_parse_epoch(tmp_path):
     from minni.migrations import run_migrations
     from minni.timestamps import parse_epoch
@@ -328,10 +393,18 @@ def test_decay_pass_skips_and_reports_an_unparseable_row(tmp_path):
 
 
 def test_decay_falls_back_to_indexed_at_on_bad_last_accessed(tmp_path):
-    """grok-review, Low: a poisoned last_accessed alone used to `continue` past
-    the whole document, even though the ordinary NULL-last_accessed path
-    already falls back to indexed_at. A bad last_accessed must degrade to that
-    same fallback, not skip the document outright."""
+    """grok-review, Low (round 1): a poisoned last_accessed alone used to
+    `continue` past the whole document, even though the ordinary
+    NULL-last_accessed path already falls back to indexed_at. A bad
+    last_accessed must degrade to that same fallback, not skip the document
+    outright.
+
+    grok-review, Low (round 2): the fallback used to land in the same
+    `skipped_bad_timestamp` counter as a true skip, so the stats/log claimed
+    "skipped" for a document that was in fact still decayed. It now has its
+    own counter (`bad_last_accessed`) and `skipped_bad_timestamp` must stay 0
+    for a document that was actually processed.
+    """
     from minni.decay import MemoryDecay
     from minni.timestamps import (
         malformed_timestamp_report,
@@ -355,7 +428,11 @@ def test_decay_falls_back_to_indexed_at_on_bad_last_accessed(tmp_path):
     reset_malformed_timestamps()
     stats = MemoryDecay(db_obj, cfg).run_decay()
 
-    assert stats["skipped_bad_timestamp"] == 1, "bad last_accessed still counted"
+    assert stats["bad_last_accessed"] == 1, "bad last_accessed counted separately"
+    assert stats["skipped_bad_timestamp"] == 0, (
+        "the document was decayed via fallback, not skipped — must not double "
+        "as a 'skipped' count"
+    )
     assert malformed_timestamp_report()["total"] >= 1
 
     with db_obj.cursor() as c:
@@ -366,6 +443,104 @@ def test_decay_falls_back_to_indexed_at_on_bad_last_accessed(tmp_path):
     assert rows["poison://bad-last-accessed"] != 1.0, (
         "must decay from indexed_at instead of being skipped entirely"
     )
+    reset_malformed_timestamps()
+
+
+def test_health_stale_docs_falls_back_to_last_modified_when_indexed_at_is_bad(tmp_path):
+    """grok-review round 2, Low: `row["indexed_at"] or row["last_modified"] or 0`
+    picked indexed_at whenever it was truthy — including a non-numeric TEXT
+    value, which is truthy too — so a poisoned indexed_at would shadow a
+    perfectly good last_modified and age_days would go to None even though a
+    real age was computable. Must parse indexed_at first and only fall back
+    to last_modified if that parse fails.
+
+    Reachability note: SQLite orders TEXT values after INTEGER/REAL in a
+    COALESCE comparison regardless of magnitude, so `WHERE COALESCE(indexed_at,
+    last_modified, 0) < ?` can never actually select a row whose indexed_at is
+    still poisoned TEXT — confirmed directly against this SQLite build. The
+    stale_docs query's own WHERE clause is therefore a (separate, out-of-scope)
+    blind spot: such rows never reach the loop this fix lives in. The
+    preference-order bug in the loop body is still real defensive-correctness
+    (and now matches decay.py's indexed_at/last_accessed handling), so it is
+    fixed and exercised here directly against handle_health_report's loop via
+    a stubbed cursor, bypassing the WHERE clause that would otherwise hide it.
+    """
+    from minni.minnid_runtime.health import HealthContext, handle_health_report
+    from minni.principal import EffectivePrincipal
+
+    now = time.time()
+    good_last_modified = now - 86400 * 40
+
+    class _StaleDocsCursor:
+        """Returns the poisoned row only for the stale_docs SELECT; every
+        other query in handle_health_report gets empty/zeroed results so the
+        rest of the report assembles without touching a real DB."""
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def execute(self, sql, params=()):
+            self._sql = sql
+            return self
+
+        def fetchall(self):
+            if "FROM documents" in self._sql and "COALESCE(indexed_at" in self._sql:
+                return [{
+                    "doc_id": 1,
+                    "path": "poison://stale-fallback",
+                    "indexed_at": POISON_GARBAGE,
+                    "last_modified": good_last_modified,
+                }]
+            return []
+
+        def fetchone(self):
+            return {"n": 0, "max_rowid": 0}
+
+    class _StaleDocsDB:
+        def __init__(self, *a, **k):
+            pass
+
+        def cursor(self):
+            return _StaleDocsCursor()
+
+        def close(self):
+            pass
+
+    from minni.config import SovereignConfig
+    from minni.timestamps import reset_malformed_timestamps
+
+    reset_malformed_timestamps()
+    # Hermetic: point vault_path at an empty tmp dir so the inbox_quarantine
+    # scan (which reads context.default_config.vault_path) never touches a
+    # real machine vault.
+    hermetic_cfg = SovereignConfig(
+        db_path=str(tmp_path / "unused.db"), vault_path=str(tmp_path),
+    )
+    context = HealthContext(
+        make_error=lambda code, msg, rid: {"error": {"code": code, "message": msg}},
+        make_response=lambda result, rid: {"result": result},
+        guard_vault_root=lambda *a, **k: None,
+        latency_snapshot=lambda: {},
+        metrics_snapshot=lambda: {},
+        afm_loop_enabled=lambda cfg: False,
+        sovereign_db=lambda cfg: _StaleDocsDB(),
+        default_config=hermetic_cfg,
+    )
+    op = EffectivePrincipal(agent_id="main", capabilities=["*"])
+    resp = handle_health_report({"_recovery": False, "_principal": op}, 1, context)
+    rep = resp["result"]
+
+    entry = next(
+        d for d in rep["stale_docs"] if d["path"] == "poison://stale-fallback"
+    )
+    assert entry["age_days"] is not None, (
+        "must fall back to the valid last_modified instead of giving up "
+        "because indexed_at was garbage"
+    )
+    assert entry["age_days"] == pytest.approx(40.0, abs=0.1)
     reset_malformed_timestamps()
 
 

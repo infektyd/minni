@@ -48,7 +48,15 @@ class MemoryDecay:
         # duck-typed configs.
         grace_sec = float(self.config.correction_decay_grace_days) * 86400
         correction_floor = float(self.config.correction_decay_floor)
-        stats = {"updated": 0, "reinforced": 0, "skipped_bad_timestamp": 0}
+        # grok-review (PR #242): skipped_bad_timestamp must mean what it says
+        # — a document that was NOT decayed. A bad last_accessed alone still
+        # gets decayed (falls back to indexed_at, same as the NULL case), so
+        # it earns its own counter rather than inflating "skipped" for a row
+        # that was, in fact, processed.
+        stats = {
+            "updated": 0, "reinforced": 0,
+            "skipped_bad_timestamp": 0, "bad_last_accessed": 0,
+        }
 
         with self.db.transaction() as c:
             c.execute("""
@@ -78,13 +86,16 @@ class MemoryDecay:
                     continue
                 if indexed_at is None:
                     indexed_at = now
-                # Audit R0 (grok-review): a poisoned last_accessed used to
-                # `continue` past the whole document, even though the normal
-                # NULL-last_accessed path already falls back to indexed_at.
-                # parse_epoch_or_report already counted/logged the bad value;
-                # here it just becomes "no last_accessed", same as NULL.
+                # Audit R0 (grok-review round 1): a poisoned last_accessed
+                # used to `continue` past the whole document, even though the
+                # normal NULL-last_accessed path already falls back to
+                # indexed_at. parse_epoch_or_report already counted/logged
+                # the bad value in the malformed-timestamp report; here it
+                # just becomes "no last_accessed", same as NULL — the
+                # document is still decayed below, so it is NOT a skip
+                # (grok-review round 2: the old code counted it as one).
                 if row["last_accessed"] is not None and last_accessed is None:
-                    stats["skipped_bad_timestamp"] += 1
+                    stats["bad_last_accessed"] += 1
                 access_count = row["access_count"] or 0
 
                 reference_time = last_accessed if last_accessed else indexed_at
@@ -120,13 +131,22 @@ class MemoryDecay:
 
         if stats["skipped_bad_timestamp"]:
             logger.warning(
-                "Decay pass skipped %d document(s) with a non-numeric timestamp. "
-                "Run migration 016 to normalize them.",
+                "Decay pass left %d document(s) undecayed: non-numeric indexed_at "
+                "with no usable fallback. Run migration 016 to normalize them.",
                 stats["skipped_bad_timestamp"],
             )
+        if stats["bad_last_accessed"]:
+            logger.warning(
+                "Decay pass decayed %d document(s) from indexed_at instead of "
+                "last_accessed: the stored last_accessed was non-numeric. "
+                "Run migration 016 to normalize them.",
+                stats["bad_last_accessed"],
+            )
         logger.info(
-            "Decay pass complete: %d updated, %d reinforced, %d skipped (bad timestamp)",
-            stats["updated"], stats["reinforced"], stats["skipped_bad_timestamp"],
+            "Decay pass complete: %d updated, %d reinforced, %d left undecayed "
+            "(bad timestamp), %d decayed via indexed_at fallback (bad last_accessed)",
+            stats["updated"], stats["reinforced"],
+            stats["skipped_bad_timestamp"], stats["bad_last_accessed"],
         )
         return stats
 
