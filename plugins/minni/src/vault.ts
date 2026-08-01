@@ -606,7 +606,7 @@ function wordRegex(term: string, inflect: boolean): RegExp | undefined {
   const lead = WORD_EDGE_CHAR.test(term[0]) ? NOT_WORD_BEFORE : "";
   const tail = WORD_EDGE_CHAR.test(last) ? NOT_WORD_AFTER : "";
   if (!lead && !tail && !/[\p{L}\p{N}]/u.test(term)) return undefined;
-  const key = `${inflect ? "i" : "x"} ${term}`;
+  const key = `${inflect ? "i" : "x"}\0${term}`;
   const cached = WORD_REGEX_CACHE.get(key);
   if (cached) return cached;
   const escaped = term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");

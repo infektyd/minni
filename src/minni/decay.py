@@ -15,6 +15,7 @@ from typing import Dict
 
 from minni.config import SovereignConfig, DEFAULT_CONFIG, correction_class_page_types
 from minni.db import SovereignDB
+from minni.timestamps import parse_epoch_or_report
 
 logger = logging.getLogger("sovereign.decay")
 
@@ -47,7 +48,7 @@ class MemoryDecay:
         # duck-typed configs.
         grace_sec = float(self.config.correction_decay_grace_days) * 86400
         correction_floor = float(self.config.correction_decay_floor)
-        stats = {"updated": 0, "reinforced": 0}
+        stats = {"updated": 0, "reinforced": 0, "skipped_bad_timestamp": 0}
 
         with self.db.transaction() as c:
             c.execute("""
@@ -58,8 +59,28 @@ class MemoryDecay:
 
             for row in c.fetchall():
                 doc_id = row["doc_id"]
-                indexed_at = row["indexed_at"] or now
-                last_accessed = row["last_accessed"]
+                # Audit R0: indexed_at / last_accessed are REAL-affinity columns,
+                # which SQLite happily fills with a non-numeric TEXT value. The
+                # arithmetic below then raises TypeError inside this transaction
+                # and aborts the ENTIRE decay pass over every document. Parse or
+                # skip the one row — and count the skip so it stays visible in
+                # the returned stats and the log, not silently absorbed.
+                indexed_at = parse_epoch_or_report(
+                    row["indexed_at"], field="indexed_at",
+                    source="decay.run_decay", doc_id=doc_id,
+                )
+                last_accessed = parse_epoch_or_report(
+                    row["last_accessed"], field="last_accessed",
+                    source="decay.run_decay", doc_id=doc_id,
+                )
+                if row["indexed_at"] is not None and indexed_at is None:
+                    stats["skipped_bad_timestamp"] += 1
+                    continue
+                if row["last_accessed"] is not None and last_accessed is None:
+                    stats["skipped_bad_timestamp"] += 1
+                    continue
+                if indexed_at is None:
+                    indexed_at = now
                 access_count = row["access_count"] or 0
 
                 reference_time = last_accessed if last_accessed else indexed_at
@@ -93,9 +114,15 @@ class MemoryDecay:
                     if access_boost > 0:
                         stats["reinforced"] += 1
 
+        if stats["skipped_bad_timestamp"]:
+            logger.warning(
+                "Decay pass skipped %d document(s) with a non-numeric timestamp. "
+                "Run migration 016 to normalize them.",
+                stats["skipped_bad_timestamp"],
+            )
         logger.info(
-            "Decay pass complete: %d updated, %d reinforced",
-            stats["updated"], stats["reinforced"],
+            "Decay pass complete: %d updated, %d reinforced, %d skipped (bad timestamp)",
+            stats["updated"], stats["reinforced"], stats["skipped_bad_timestamp"],
         )
         return stats
 

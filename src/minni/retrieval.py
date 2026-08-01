@@ -40,6 +40,7 @@ from minni.query_expand import summarize_with_afm
 # G19/G20/G22: read gate + evidence envelopes
 from minni.principal import EffectivePrincipal, agent_scope_for, can_read_document  # type: ignore
 from minni.safety import is_instruction_like
+from minni.timestamps import parse_epoch_or_report
 
 logger = logging.getLogger("sovereign.retrieval")
 
@@ -1843,10 +1844,24 @@ class RetrievalEngine:
         for r in candidates:
             if layer_set and (r.get("layer") or "knowledge") not in layer_set:
                 continue
-            created_at = r.get("created_at") or r.get("indexed_at") or 0
-            if start_ts is not None and float(created_at or 0) < start_ts:
+            if start_ts is None and end_ts is None:
+                filtered.append(r)
                 continue
-            if end_ts is not None and float(created_at or 0) > end_ts:
+            # Audit R0: a single row whose indexed_at was stored as TEXT used to
+            # raise ValueError out of float() here, propagate through
+            # handle_search, and abort the ENTIRE recall with -32000. Parse or
+            # skip that one row instead — reported, never silently swallowed.
+            created_at = parse_epoch_or_report(
+                r.get("created_at") or r.get("indexed_at") or 0,
+                field="created_at",
+                source="retrieval._filter_candidates",
+                doc_id=r.get("doc_id"),
+            )
+            if created_at is None:
+                continue
+            if start_ts is not None and created_at < start_ts:
+                continue
+            if end_ts is not None and created_at > end_ts:
                 continue
             filtered.append(r)
         return filtered
@@ -2651,11 +2666,18 @@ class RetrievalEngine:
                 4,
             )
 
-            # Compute age_days from indexed_at
-            indexed_at = r.get("indexed_at")
+            # Compute age_days from indexed_at. Audit R0: parse-or-report, so a
+            # TEXT indexed_at costs this one row its age instead of raising
+            # ValueError and killing the whole formatted result set.
+            indexed_at = parse_epoch_or_report(
+                r.get("indexed_at"),
+                field="indexed_at",
+                source="retrieval._format_results",
+                doc_id=r.get("doc_id"),
+            )
             age_days: Optional[float] = None
             if indexed_at:
-                age_days = round((time.time() - float(indexed_at)) / 86400.0, 1)
+                age_days = round((time.time() - indexed_at) / 86400.0, 1)
 
             # Compute confidence
             try:

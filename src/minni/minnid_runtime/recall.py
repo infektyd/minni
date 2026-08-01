@@ -9,6 +9,7 @@ from typing import Any, Callable, Optional
 
 from minni.config import DEFAULT_CONFIG
 from minni.db import SovereignDB
+from minni.timestamps import parse_epoch_or_report
 from minni.principal import (
     allows_cross_agent_recall,
     can_read_document,
@@ -557,8 +558,13 @@ def indexed_at_for_result(retrieval_engine, result: dict) -> Optional[float]:
             row = c.fetchone()
         if row is None:
             return None
-        value = row["indexed_at"]
-        return float(value) if value is not None else None
+        # Audit R0: was float() inside a bare except, so a TEXT indexed_at
+        # vanished as a silent None. Parse-or-report keeps the None but makes
+        # the bad row countable in the health surface.
+        return parse_epoch_or_report(
+            row["indexed_at"], field="indexed_at",
+            source="recall.indexed_at_for_result", doc_id=doc_id,
+        )
     except Exception:
         return None
 

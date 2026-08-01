@@ -9,6 +9,11 @@ from typing import Any, Callable, Optional
 
 from minni.config import DEFAULT_CONFIG
 from minni.db import SovereignDB
+from minni.timestamps import (
+    malformed_timestamp_report,
+    parse_epoch_or_report,
+    stored_malformed_timestamp_count,
+)
 
 
 logger = logging.getLogger("minnid")
@@ -252,6 +257,13 @@ def handle_health_report(params: dict, request_id: Any, context: HealthContext) 
         "never_recalled": [],
         "contradicting_learnings": [],
         "vector_backend_lag": [],
+        # Audit R0: non-numeric values sitting in the REAL-affinity timestamp
+        # columns. The readers are defensive now, but a skipped row must stay
+        # VISIBLE here rather than being silently tolerated.
+        "malformed_timestamps": {
+            "stored_rows": 0, "read_skips": 0, "by_field": {},
+            "examples": {}, "remediation": None,
+        },
         # W3 (audit §4 / consolidation inbox residue): operator-visible
         # recovery surface for files parked in <inbox>/quarantine/ (see
         # afm_passes.inbox_quarantine). Aggregate-only (count + reason
@@ -297,12 +309,43 @@ def handle_health_report(params: dict, request_id: Any, context: HealthContext) 
                 (stale_cutoff,),
             )
             for row in c.fetchall():
-                ts = row["indexed_at"] or row["last_modified"] or 0
+                # Audit R0: parse-or-report. A TEXT timestamp here used to
+                # TypeError on the subtraction and take the whole health report
+                # down with it.
+                ts = parse_epoch_or_report(
+                    row["indexed_at"] or row["last_modified"] or 0,
+                    field="indexed_at",
+                    source="health.stale_docs",
+                    doc_id=row["doc_id"],
+                )
                 report["stale_docs"].append({
                     "doc_id": row["doc_id"],
                     "path": row["path"],
                     "age_days": round((now - ts) / 86400, 1) if ts else None,
                 })
+
+            # Audit R0 visibility: a poisoned timestamp must be *reported*, not
+            # merely tolerated by the defensive readers above. Count the rows
+            # SQLite still holds as non-numeric in a REAL-affinity column, and
+            # fold in whatever this process has already had to skip at read time.
+            stored_bad = stored_malformed_timestamp_count(c)
+            skips = malformed_timestamp_report()
+            report["malformed_timestamps"] = {
+                "stored_rows": stored_bad,
+                "read_skips": skips["total"],
+                "by_field": skips["by_field"],
+                "examples": skips["examples"],
+                "remediation": (
+                    "migration 016 normalizes stored timestamps"
+                    if stored_bad else None
+                ),
+            }
+            if stored_bad or skips["total"]:
+                logger.warning(
+                    "Health: %d document row(s) hold a non-numeric timestamp and "
+                    "%d read(s) were skipped this process. Run migration 016.",
+                    stored_bad, skips["total"],
+                )
 
             c.execute(
                 """

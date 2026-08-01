@@ -17,6 +17,7 @@ import numpy as np
 
 from minni.afm_passes.inbox_ingest import _VAULT_SLUG_TO_AGENT_ID
 from minni.principal import validate_agent_id
+from minni.timestamps import parse_epoch_or_report
 from minni.vault_index import open_vault_index, vault_index_paths
 from minni.wiki_indexer import WikiIndexer
 
@@ -86,13 +87,27 @@ def _read_index_state(db_path: Path) -> Dict[str, sqlite3.Row]:
         return {}
 
 
+def _row_doc_id(row) -> Optional[int]:
+    """doc_id for reporting only — callers pass partial rows (and tests pass
+    hand-built ones) that may not carry the column."""
+    try:
+        return row["doc_id"]
+    except (IndexError, KeyError, TypeError):
+        return None
+
+
 def _count_plan(disk_files: Dict[str, float], existing: Dict[str, sqlite3.Row]) -> tuple[int, int, int]:
     would_index = 0
     skipped = 0
     for path, mtime in disk_files.items():
         row = existing.get(path)
         if row is not None:
-            indexed_at = float(row["indexed_at"] or 0)
+            # Audit R0: parse-or-report — a TEXT indexed_at must cost this one
+            # doc its skip check, not raise ValueError and abort the whole plan.
+            indexed_at = parse_epoch_or_report(
+                row["indexed_at"], field="indexed_at",
+                source="vault_ingest._count_plan", doc_id=_row_doc_id(row),
+            ) or 0.0
             if mtime <= indexed_at:
                 skipped += 1
                 continue
@@ -189,7 +204,12 @@ def _index_changed_pages(
         for path, mtime in sorted(disk_files.items()):
             try:
                 row = _fetch_existing_doc(c, path)
-                indexed_at = float(row["indexed_at"] or 0) if row else 0.0
+                indexed_at = (
+                    parse_epoch_or_report(
+                        row["indexed_at"], field="indexed_at",
+                        source="vault_ingest.run", doc_id=_row_doc_id(row),
+                    ) or 0.0
+                ) if row else 0.0
                 if row and mtime <= indexed_at:
                     stats["skipped_unchanged"] += 1
                     continue

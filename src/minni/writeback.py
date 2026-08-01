@@ -26,6 +26,7 @@ from datetime import datetime
 
 from minni.config import SovereignConfig, DEFAULT_CONFIG
 from minni.db import SovereignDB
+from minni.timestamps import coerce_epoch
 
 logger = logging.getLogger("sovereign.writeback")
 
@@ -181,7 +182,15 @@ class WriteBackMemory:
         if not evidence_doc_ids:
             return None
 
-        now = created_at or time.time()
+        # Audit R0: this is the only documents writer whose timestamp is
+        # caller-supplied rather than a local time.time(), so it is the only one
+        # that can hand a non-numeric value to the REAL-affinity indexed_at /
+        # last_modified columns. Coerce (and log) before it reaches SQLite —
+        # migration 016's triggers are the backstop for out-of-tree writers.
+        now = coerce_epoch(
+            created_at, field="indexed_at",
+            default=None, context="writeback.add_derived_from_edges",
+        ) or time.time()
         valid_ids = []
         seen = set()
         for raw_id in evidence_doc_ids:
