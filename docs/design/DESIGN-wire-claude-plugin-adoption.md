@@ -224,10 +224,30 @@ itself. Post-adoption it must not write to a tree nobody reads.
   `MINNI_WORKSPACE_ID`. `claude-code` is removed from the `--platform all`
   expansion (with a loud notice) so the remaining platforms keep working rather
   than the whole run aborting. No parallel fix path is built.
-- **Claude Desktop moves to the cutover.** Its only writer was reachable solely
-  via the claude-code platform. The unreachable call site is removed;
-  `update_claude_desktop_config` stays (still directly tested) and Desktop is
-  repointed by `minni wire-adopt` instead.
+- **Claude Desktop moves to the cutover, then rides ordinary wiring.** Its only
+  writer was reachable solely via the claude-code platform. The unreachable call
+  site is removed; `update_claude_desktop_config` stays (still directly tested)
+  and `minni wire-adopt` is what first moves Desktop onto the wire tree.
+
+  Adopt alone would not have been enough. Desktop records a *versioned* path, so
+  the next `minni wire` that installs a new version strands it on the old one,
+  which GC then prunes out from under it — a one-shot writer for a path that
+  changes every wire. So `minni wire claude-code` also runs
+  `follow_claude_desktop`, which moves an argument already inside
+  `~/.minni/plugin` onto the freshly wired root and does nothing otherwise (a
+  no-op before adoption, and on hosts with no Desktop). Only the `server.js`
+  entrypoint moves: a sibling path under the same tree is not a second server
+  pointer, and rewriting it would be silent corruption.
+
+  Belt and braces, `default_config_scan_paths()` gains the Desktop config, so GC
+  treats it as a reference like any other. `test_gc_retains_a_version_only_
+  claude_desktop_references` fails without that line, which is the point — the
+  scan is load-bearing, not decorative.
+
+  Deliberately *not* adopted: `update_claude_desktop_config`'s env stamping
+  (workspace/AFM). Desktop is a separate product wire does not otherwise own,
+  and widening this from "keep the server path valid" to "own Desktop's
+  environment" is a bigger claim than this change needs.
 - **codex resolves from what exists.** `plugin_version_segment()` no longer falls
   through to pip metadata as its primary answer on machines without `current` —
   it prefers `current`, then takes the **PEP440-maximum over version dirs that
