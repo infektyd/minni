@@ -5,6 +5,12 @@ User-owned GitHub App that posts **formal** PR reviews from
 `required_approving_review_count`; an App installation token can post Reviews
 API events.
 
+**CI is the only supported path.** There is no machine-side option: the local
+poller that answered `@grok-local` from the operator's Mac is retired. See
+[grok-local-path-retired.md](grok-local-path-retired.md) for why it existed, the
+measured macOS egress finding that ended it, and the safety posture it
+implemented.
+
 ## v1 policy (non-negotiable)
 
 | Model line | Reviews API `event` |
