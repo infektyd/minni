@@ -72,8 +72,9 @@ future v1 minor. It is a new set of packages, published 2026-07-27T23:55Z:
 
 Adopting the revision is therefore a **package migration**, not a version bump:
 off `@modelcontextprotocol/sdk` and onto `@modelcontextprotocol/server`, with a
-different entry point. The upstream migration guide
-(`docs/migration/support-2026-07-28.md`) replaces
+different entry point. The upstream migration guide — `docs/migration/support-2026-07-28.md`
+in the **typescript-sdk** repository, not this one
+(<https://github.com/modelcontextprotocol/typescript-sdk/blob/main/docs/migration/support-2026-07-28.md>) — replaces
 
 ```ts
 await server.connect(new StdioServerTransport());   // today, server.ts:1712-1713
@@ -160,7 +161,7 @@ Ordered by whether Minni must do anything at all.
 | `inputSchema`/`outputSchema` loosened to full JSON Schema 2020-12 | Zod-derived schemas, already a subset | None. Strictly widening | None |
 | Deterministic `tools/list` order (SHOULD) | Already satisfied: registration is static, top-to-bottom, in one module | None. Nothing currently asserts the ordering; an optional follow-up if we ever want it pinned | None |
 
-The pattern is worth stating plainly: of nineteen changes, Minni must act on
+The pattern is worth stating plainly: of the sixteen changes catalogued above, Minni must act on
 **zero** to remain correct. Everything in the "required change" column is either
 SDK-supplied or optional upside.
 
