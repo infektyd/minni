@@ -82,6 +82,7 @@ import {
   ensureVault,
   buildPendingLearningsSection,
   expireStaleInboxHandoffs,
+  expiredHandoffsBody,
   readInboxStatus,
   readReassertPending,
   recordAudit,
@@ -380,6 +381,15 @@ async function handleSessionStart(payload: Record<string, unknown>): Promise<Hoo
     // "0 pending" the hook never counted is a false all-clear.
     ...(inboxStatus !== undefined
       ? { pending_learnings: buildPendingLearningsSection(inboxStatus, expiredHandoffs) }
+      : {}),
+    // The reaper is UNBUDGETED and already archived these, so this boot is
+    // their only chance to be reported — but they normally ride inside
+    // pending_learnings, which the line above drops when the budgeted inbox
+    // read degraded. That combination reported them ZERO times, the exact
+    // failure the reaper is unbudgeted to avoid. Ship them on their own
+    // whenever their usual carrier is missing.
+    ...(inboxStatus === undefined && expiredHandoffs.length > 0
+      ? { expired_handoffs: expiredHandoffsBody(expiredHandoffs) }
       : {}),
     handoff_context: handoffContext.map((snippet) => ({
       ref: snippet.ref,

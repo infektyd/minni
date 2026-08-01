@@ -1047,13 +1047,24 @@ export async function buildStatusReport(input?: {
   afmGenerationTransport?: (url: string, payload: Record<string, unknown>) => Promise<JsonResult>;
   afmGenerationTtlMs?: number;
   /**
-   * Deadline (ms) for the network legs, for callers under a hook budget.
-   * Threaded into the daemon socket call and the AFM probes so they DESTROY
-   * their handles rather than merely being abandoned — an abandoned handle
-   * outlives the budget and keeps the process alive past the harness kill.
+   * Total time (ms) this report may spend on the network, for callers under a
+   * hook budget. Threaded into the daemon socket call and the AFM probe so they
+   * DESTROY their handles rather than merely being abandoned — an abandoned
+   * handle outlives the budget and keeps the process alive past the harness
+   * kill.
+   *
+   * It is a budget for the WHOLE report, not per leg. The legs run in sequence
+   * (socket status, then the AFM probe), so handing each the same figure would
+   * let the wall time reach ~2x it — and the caller's own outer race would then
+   * abandon a report that a shared deadline would have completed in time.
    */
   timeoutMs?: number;
 }): Promise<StatusReport> {
+  // One absolute deadline, shared by every network leg below.
+  const networkDeadline =
+    input?.timeoutMs !== undefined ? Date.now() + input.timeoutMs : undefined;
+  const networkRemainingMs = (): number | undefined =>
+    networkDeadline === undefined ? undefined : Math.max(0, networkDeadline - Date.now());
   const vaultPath = input?.vaultPath ?? DEFAULT_VAULT_PATH;
   await ensureVault(vaultPath);
   const tail = await auditTail(vaultPath, 1);
@@ -1064,7 +1075,7 @@ export async function buildStatusReport(input?: {
   // as socket.data.afm by health.py:156-189). Reordered so the reuse check
   // below (daemonAfmToProviderHealth) can skip a second, independently-timed
   // generation probe entirely when that fresh result is usable.
-  const socket = input?.socket ?? (await socketHealth(input?.timeoutMs));
+  const socket = input?.socket ?? (await socketHealth(networkRemainingMs()));
 
   let volume = 0;
   const logFiles = ["log.md", "log.1.md", "log.2.md", "log.3.md"];
@@ -1194,8 +1205,10 @@ export async function buildStatusReport(input?: {
       nativeHelperPath: resolvedNativeHelperPath(),
       // Budgeted callers cap the probe too: its 10s bridge / 45s native-helper
       // defaults both outlive a hook budget, and the in-flight handle would
-      // keep the process alive past the deadline that kills it.
-      ...(input?.timeoutMs !== undefined ? { timeoutMs: input.timeoutMs } : {}),
+      // keep the process alive past the deadline that kills it. What is left of
+      // the SHARED deadline, not a fresh copy of it — the socket leg above has
+      // already spent part of it.
+      ...(networkRemainingMs() !== undefined ? { timeoutMs: networkRemainingMs() } : {}),
     });
     source = "plugin-probe";
   }

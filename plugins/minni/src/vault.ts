@@ -2406,6 +2406,69 @@ export async function expireStaleInboxHandoffs(
  * All four hooks (claude-code, codex, grok, kilocode) MUST build the section
  * through this function so the shape cannot drift per hook.
  */
+/**
+ * Park inbox entries whose correction this platform can NEVER deliver on this
+ * event, moving them to `inbox/.undeliverable/`.
+ *
+ * The bound on a structural wire drop. Refusing to archive an undelivered
+ * correction is right — it was never injected — but on a platform whose wire
+ * cannot inject at SessionStart at all, "retry next boot" never terminates: one
+ * durable file per correction-bearing compaction, forever, each one permanently
+ * occupying a slot in the newest-N reassert window and crowding out corrections
+ * that COULD be delivered.
+ *
+ * Parking is deliberately not archiving. `.archive/` means consumed; these were
+ * not. `.undeliverable/` means "kept, not delivered, and not retryable on this
+ * wire" — invisible to readInboxStatus and the reassert window (both read the
+ * inbox's top level only), so the window stays clear, while the correction
+ * itself survives on disk for the Stop-routing delivery path tracked in
+ * issue #253. Bounded and audited beats both silent loss and infinite retention.
+ *
+ * Returns the paths that were parked.
+ */
+export async function parkUndeliverableInboxEntries(
+  filePaths: string[],
+): Promise<string[]> {
+  const parked: string[] = [];
+  for (const filePath of filePaths) {
+    const parkDir = path.join(path.dirname(filePath), ".undeliverable");
+    const base = path.basename(filePath);
+    let target = path.join(parkDir, base);
+    try {
+      await mkdir(parkDir, { recursive: true });
+      if (await exists(target)) {
+        target = path.join(parkDir, `${Date.now().toString(36)}-${base}`);
+      }
+      await rename(filePath, target);
+      parked.push(target);
+    } catch {
+      // Best effort: an entry that cannot be parked simply stays in the inbox
+      // and is re-considered next boot. Failing to tidy must not lose it.
+    }
+  }
+  return parked;
+}
+
+/**
+ * The `expired_handoffs` list, as the boot envelope carries it.
+ *
+ * Extracted so a boot whose inbox read was cut by the budget can still ship the
+ * reaper's one-shot result: the reaper is unbudgeted precisely because it
+ * ARCHIVES as it walks, and an archived entry is invisible to every later read
+ * — so a boot that reaps but does not report is the entry's only chance, spent.
+ */
+export function expiredHandoffsBody(
+  expiredHandoffs: ExpiredInboxHandoff[],
+): Array<Record<string, unknown>> {
+  return expiredHandoffs.map((entry) => ({
+    slug: entry.slug,
+    status: entry.status,
+    age_days: entry.ageDays,
+    created: entry.createdAt,
+    archived_to: entry.archivedPath,
+  }));
+}
+
 export function buildPendingLearningsSection(
   inboxStatus: InboxStatus,
   expiredHandoffs: ExpiredInboxHandoff[],
@@ -2422,13 +2485,7 @@ export function buildPendingLearningsSection(
       kind: entry.payload.kind,
       task: entry.payload.task,
     })),
-    expired_handoffs: expiredHandoffs.map((entry) => ({
-      slug: entry.slug,
-      status: entry.status,
-      age_days: entry.ageDays,
-      created: entry.createdAt,
-      archived_to: entry.archivedPath,
-    })),
+    expired_handoffs: expiredHandoffsBody(expiredHandoffs),
   };
 }
 

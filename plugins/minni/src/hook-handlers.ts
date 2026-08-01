@@ -44,7 +44,7 @@ import {
 import { harvestSummaryText } from "./compact-harvest.js";
 import { injectIntent, noIntent, noteIntent } from "./hook-intent.js";
 import type { HookIntent } from "./hook-intent.js";
-import { renderIntent, wireFor } from "./hook-platform.js";
+import { canInject, renderIntent, wireFor } from "./hook-platform.js";
 import type { PlatformWire } from "./hook-platform.js";
 import { compactPlanPointer, resolveActivePlanView } from "./plan.js";
 import { routeMemoryIntent } from "./policy.js";
@@ -91,8 +91,10 @@ import {
   ensureVault,
   buildPendingLearningsSection,
   expireStaleInboxHandoffs,
+  expiredHandoffsBody,
   formatSessionReceiptLine,
   readInboxStatus,
+  parkUndeliverableInboxEntries,
   readReassertPending,
   recordAudit,
   resolveInboxHandoffContext,
@@ -594,12 +596,41 @@ export function createHookHandlers(
       });
     }
     if (reassertContributing.length > 0 || reassertDeferred.length > 0) {
-      deferUntilDelivered(() =>
-        settleReassertedInboxEntries(config.vaultPath, {
-          consumedPaths: reassertContributing,
-          deferredTails: reassertDeferred,
-        }),
-      );
+      if (canInject(wire, "SessionStart")) {
+        deferUntilDelivered(() =>
+          settleReassertedInboxEntries(config.vaultPath, {
+            consumedPaths: reassertContributing,
+            deferredTails: reassertDeferred,
+          }),
+        );
+      } else {
+        // STRUCTURAL drop, not a transient one: this wire declares SessionStart
+        // un-injectable, so "keep it and retry next boot" never terminates —
+        // one durable file per correction-bearing compaction, each permanently
+        // occupying a slot in the newest-N reassert window. Park them instead:
+        // out of the window, still on disk, and audited, so the backlog is
+        // countable rather than either silently destroyed or infinite.
+        //
+        // Parking is the BOUND, not the delivery fix. Routing these to Stop —
+        // the only injectable event on such a wire — is tracked in issue #253
+        // and deliberately not attempted here; the two must not drift apart.
+        const parkPaths = [
+          ...reassertContributing,
+          ...reassertDeferred.map((tail) => tail.filePath),
+        ];
+        const parked = await parkUndeliverableInboxEntries(parkPaths);
+        await recordAudit(config.vaultPath, {
+          tool: `${config.auditPrefix}_undeliverable_on_wire`,
+          summary: `SessionStart: ${wire.id} cannot inject at SessionStart; parked ${parked.length} correction entr${
+            parked.length === 1 ? "y" : "ies"
+          } to inbox/.undeliverable (see issue #253 for delivery)`,
+          details: {
+            wire: wire.id,
+            parked: parked.length,
+            events: correctionsReassert.length,
+          },
+        }).catch(() => {});
+      }
     }
 
     // Plan parity (audit C5): SessionStart injects the FULL active-plan view for
@@ -653,6 +684,15 @@ export function createHookHandlers(
       // "0 pending" the hook never counted is a false all-clear.
       ...(inboxStatus !== undefined
         ? { pending_learnings: buildPendingLearningsSection(inboxStatus, expiredHandoffs) }
+        : {}),
+      // The reaper is UNBUDGETED and already archived these, so this boot is
+      // their only chance to be reported — but they normally ride inside
+      // pending_learnings, which the line above drops when the budgeted inbox
+      // read degraded. That combination reported them ZERO times, the exact
+      // failure the reaper is unbudgeted to avoid. Ship them on their own
+      // whenever their usual carrier is missing.
+      ...(inboxStatus === undefined && expiredHandoffs.length > 0
+        ? { expired_handoffs: expiredHandoffsBody(expiredHandoffs) }
         : {}),
       handoff_context: handoffContext.map((snippet) => ({
         ref: snippet.ref,

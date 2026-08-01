@@ -416,15 +416,21 @@ test(
     // THE GATE. The noop was written to stdout successfully — but the CORRECTION
     // never went anywhere. Treating that as delivery archives the only durable
     // copy of the correction in exchange for output the host ignores.
+    // THE GATE. The noop was written to stdout successfully — but the CORRECTION
+    // never went anywhere. Treating that as delivery would archive the only
+    // durable copy in exchange for output the host ignores.
     assert.deepEqual(
       await archivedEntries(fixture),
       [],
-      "a dropped envelope delivered nothing — the correction it carried must not be consumed",
+      "a dropped envelope delivered nothing — the correction it carried must not be CONSUMED",
     );
+    // It survives; on this wire the drop is structural, so it is parked out of
+    // the retry window rather than retried forever (see the parking test).
+    const parked = await readdir(path.join(fixture.inbox, ".undeliverable")).catch(() => []);
     assert.equal(
-      (await pendingEntries(fixture)).length,
+      (await pendingEntries(fixture)).length + parked.filter((f) => f.endsWith(".json")).length,
       1,
-      "the correction must stay re-deliverable when the platform cannot carry it",
+      "the correction must still exist somewhere on disk — undelivered is not consumed",
     );
   },
 );
@@ -515,14 +521,9 @@ test(
 
     await runGrokSessionStart(fixture);
 
-    const pending = await pendingEntries(fixture);
     const archived = await archivedEntries(fixture);
-    assert.deepEqual(
-      pending.map((n) => n.replace(/^.*?-/, "").replace(/\.json$/, "")).filter((n) =>
-        n.includes("correction"),
-      ).length,
-      1,
-      "the real correction must survive a boot that could not deliver it",
+    const parked = (await readdir(path.join(fixture.inbox, ".undeliverable")).catch(() => [])).filter(
+      (f) => f.endsWith(".json"),
     );
     assert.equal(
       archived.length,
@@ -533,6 +534,122 @@ test(
       archived[0].includes("empty"),
       `the archived entry must be the EMPTY one, not the correction (got ${archived[0]})`,
     );
+    // The real correction is NOT consumed: it survives, parked out of the retry
+    // window because this wire's drop is structural.
+    assert.equal(parked.length, 1, "the real correction must survive the undeliverable boot");
+    assert.ok(
+      parked[0].includes("correction"),
+      `the preserved entry must be the CORRECTION, not the empty stash (got ${parked[0]})`,
+    );
+  },
+);
+
+test(
+  "a structurally undeliverable correction is PARKED, not retained forever",
+  { timeout: 120_000 },
+  async (t) => {
+    const root = await mkdtemp(path.join(tmpdir(), "sm-grok-park-"));
+    const fixture = {
+      root,
+      vault: path.join(root, "grok-build-vault"),
+      home: path.join(root, "home"),
+    };
+    fixture.inbox = path.join(fixture.vault, "inbox");
+    await mkdir(fixture.inbox, { recursive: true });
+    await mkdir(fixture.home, { recursive: true });
+    const stamp = Date.now() - 86_400_000;
+    await writeFile(
+      path.join(fixture.inbox, inboxName(stamp, "grok-precompact-handoff")),
+      JSON.stringify({
+        slug: "grok-precompact-handoff",
+        kind: "grok_precompact_handoff",
+        agent_id: "grok-build",
+        createdAt: new Date(stamp).toISOString(),
+        stale_belief_events: [CORRECTION],
+      }),
+      "utf8",
+    );
+    t.after(() => rm(root, { recursive: true, force: true }));
+
+    await runGrokSessionStart(fixture);
+
+    // Grok's wire can NEVER inject at SessionStart, so "keep it and retry next
+    // boot" never terminates: one durable file per correction-bearing
+    // compaction, each permanently occupying a reassert-window slot.
+    assert.deepEqual(
+      await pendingEntries(fixture),
+      [],
+      "a structural drop must not leave the entry in the live window to retry forever",
+    );
+    assert.deepEqual(
+      await archivedEntries(fixture),
+      [],
+      "parking is not archiving — .archive means consumed, and this was never delivered",
+    );
+    const parked = await readdir(path.join(fixture.inbox, ".undeliverable")).catch(() => []);
+    assert.equal(
+      parked.filter((f) => f.endsWith(".json")).length,
+      1,
+      "the correction must be preserved on disk for the issue #253 delivery path",
+    );
+    assert.match(
+      await auditText(fixture),
+      /undeliverable_on_wire/,
+      "parking must be audited, so the undelivered backlog is countable",
+    );
+
+    // And the window is genuinely clear: a second boot re-reads nothing.
+    await runGrokSessionStart(fixture);
+    assert.deepEqual(await pendingEntries(fixture), []);
+  },
+);
+
+test(
+  "a reaped handoff is still reported when the budget cut the inbox read",
+  { timeout: 120_000 },
+  async (t) => {
+    const root = await mkdtemp(path.join(tmpdir(), "sm-expired-degraded-"));
+    const fixture = {
+      root,
+      vault: path.join(root, "claudecode-vault"),
+      home: path.join(root, "home"),
+    };
+    fixture.inbox = path.join(fixture.vault, "inbox");
+    await mkdir(fixture.inbox, { recursive: true });
+    await mkdir(fixture.home, { recursive: true });
+    // An aged handoff the TTL reaper will archive on this boot. The reaper is
+    // unbudgeted precisely because it archives as it walks — so this boot is the
+    // entry's ONLY chance to be reported. Riding inside pending_learnings meant
+    // a budget-cut inbox read dropped it and it surfaced zero times.
+    const aged = Date.now() - 40 * 86_400_000;
+    // The reaper pre-filters on the COMPACT handoff filename (YYYYMMDDTHHMMSSZ-),
+    // not the dashed inbox form — an aged file under the wrong name is simply
+    // never a handoff to it.
+    const compactName = `${new Date(aged).toISOString().slice(0, 19).replace(/[-:]/g, "")}Z-stale-handoff.json`;
+    await writeFile(
+      path.join(fixture.inbox, compactName),
+      JSON.stringify({
+        slug: "stale-handoff",
+        kind: "handoff",
+        agent_id: "claude-code",
+        createdAt: new Date(aged).toISOString(),
+        ref: "wiki/notes/whatever",
+      }),
+      "utf8",
+    );
+    t.after(() => rm(root, { recursive: true, force: true }));
+
+    const body = await runSessionStart(fixture, { MINNI_HOOK_BUDGET_MS: "1" });
+
+    assert.ok(
+      body.degraded?.sections?.includes("pending_learnings"),
+      "fixture precondition: the budget must have cut the inbox read",
+    );
+    assert.ok(
+      Array.isArray(body.expired_handoffs) && body.expired_handoffs.length === 1,
+      `a reaped handoff must still be reported when its usual carrier is missing (got ${JSON.stringify(body.expired_handoffs)})`,
+    );
+    assert.equal(body.expired_handoffs[0].slug, "stale-handoff");
   },
 );
 
