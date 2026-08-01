@@ -32,6 +32,7 @@ import {
   discardDeliveryCommits,
   emitAndCommit,
   exitAfterDelivery,
+  failAndExit,
 } from "./hook-delivery.js";
 import { harvestCompactSummary, harvestSummaryText } from "./compact-harvest.js";
 import { claudeCodeWire } from "./hook-platform.js";
@@ -312,7 +313,11 @@ async function handleSessionStart(payload: Record<string, unknown>): Promise<Hoo
     tail === undefined ? "audit_tail" : undefined,
     inboxStatus === undefined ? "pending_learnings" : undefined,
     unackedLeases > 0 ? "handoff_acks" : undefined,
-    handoffRead.ok ? undefined : "handoff_context",
+    // Also degraded when the PARENT read was cut: handoffContext is resolved
+    // from inboxStatus.entries, so a cut inbox read makes it vacuously empty.
+    // ok:true over an empty set the hook never actually had inputs for is the
+    // same false all-clear this section exists to prevent.
+    handoffRead.ok && inboxStatus !== undefined ? undefined : "handoff_context",
     planRead.ok ? undefined : "active_thread",
     // A failed LIST is not "no pending handoffs": it degraded to an empty set,
     // and reporting handoff_acks:[] without saying so is a false all-clear.
@@ -996,7 +1001,9 @@ async function main(): Promise<void> {
       // audit unavailable; the systemMessage below still surfaces the failure
     }
     // hooks-PL-5: a degraded boot must never look like a clean one — say so.
-    emit({
+    // failAndExit, not emit: the degraded signal has to be FLUSHED before an
+    // abandoned RPC handle can keep this process alive into the harness kill.
+    await failAndExit({
       continue: true,
       systemMessage: `Minni hook degraded (${event}): ${message} — memory injection skipped this event; see vault log.md.`,
     });

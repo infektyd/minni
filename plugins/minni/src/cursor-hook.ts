@@ -9,7 +9,12 @@ import { adaptCursorOutput, adaptCursorPayload, CURSOR_EVENTS } from "./cursor-a
 import { createHookHandlers } from "./hook-handlers.js";
 import { cursorWire } from "./hook-platform.js";
 import { asString, emit, readStdin } from "./hook-utils.js";
-import { discardDeliveryCommits, emitAndCommit, exitAfterDelivery } from "./hook-delivery.js";
+import {
+  discardDeliveryCommits,
+  emitAndCommit,
+  exitAfterDelivery,
+  failAndExit,
+} from "./hook-delivery.js";
 import { recordAudit } from "./vault.js";
 import type { RecallGuardMode } from "./recall-guard.js";
 
@@ -67,7 +72,9 @@ async function main(): Promise<void> {
       tool: "hook_cursor_error",
       summary: `${event}: ${message}`,
     }).catch(() => undefined);
-    emit(cursorEvent === "preToolUse"
+    // failAndExit, not emit: the degraded signal has to be FLUSHED before an
+    // abandoned RPC handle can keep this process alive into the harness kill.
+    await failAndExit(cursorEvent === "preToolUse"
       ? { permission: "allow" }
       : { continue: true, user_message: `Minni hook degraded (${event}): ${message}` });
   }

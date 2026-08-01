@@ -39,6 +39,7 @@ import {
   discardDeliveryCommits,
   emitAndCommit,
   exitAfterDelivery,
+  failAndExit,
   markOutputDropped,
 } from "./hook-delivery.js";
 import { harvestSummaryText } from "./compact-harvest.js";
@@ -597,6 +598,11 @@ export function createHookHandlers(
     let reassertClearedEager = 0;
     let reassertPendingClear = 0;
     let reassertParked = 0;
+    // Counted from the branch that REGISTERS the rewrite, not derived from
+    // reassertPendingClear: a single file carrying MAX+N valid events defers a
+    // tail while contributing no consumed path, so a count gated on
+    // "contributing > 0" reported zero deferred tails while one was pending.
+    let reassertTailsPendingDefer = 0;
     if (emptyPaths.length > 0) {
       reassertClearedEager = emptyPaths.length;
       await settleReassertedInboxEntries(config.vaultPath, {
@@ -607,6 +613,7 @@ export function createHookHandlers(
     if (reassertContributing.length > 0 || reassertDeferred.length > 0) {
       if (canInject(wire, "SessionStart")) {
         reassertPendingClear = reassertContributing.length;
+        reassertTailsPendingDefer = reassertDeferred.length;
         deferUntilDelivered(() =>
           settleReassertedInboxEntries(config.vaultPath, {
             consumedPaths: reassertContributing,
@@ -676,7 +683,11 @@ export function createHookHandlers(
       status === undefined ? "status" : undefined,
       tail === undefined ? "audit_tail" : undefined,
       inboxStatus === undefined ? "pending_learnings" : undefined,
-      handoffRead.ok ? undefined : "handoff_context",
+      // Also degraded when the PARENT read was cut: handoffContext is resolved
+      // from inboxStatus.entries, so a cut inbox read makes it vacuously empty.
+      // ok:true over an empty set the hook never actually had inputs for is the
+      // same false all-clear this section exists to prevent.
+      handoffRead.ok && inboxStatus !== undefined ? undefined : "handoff_context",
       planRead.ok ? undefined : "active_thread",
     ].filter((section): section is string => section !== undefined);
 
@@ -824,7 +835,7 @@ export function createHookHandlers(
         reassert_entries_cleared_eager: reassertClearedEager,
         reassert_entries_pending_clear: reassertPendingClear,
         reassert_entries_parked: reassertParked,
-        reassert_tails_pending_defer: reassertPendingClear > 0 ? reassertDeferred.length : 0,
+        reassert_tails_pending_defer: reassertTailsPendingDefer,
       },
     });
 
@@ -1269,7 +1280,9 @@ export async function runHookMain(config: AgentHookConfig): Promise<void> {
       // audit unavailable; the systemMessage below still surfaces the failure
     }
     // hooks-PL-5: a degraded boot must never look like a clean one — say so.
-    emit({
+    // failAndExit, not emit: the degraded signal has to be FLUSHED before an
+    // abandoned RPC handle can keep this process alive into the harness kill.
+    await failAndExit({
       continue: true,
       systemMessage: `Minni hook degraded (${event}): ${message} — memory injection skipped this event; see vault log.md.`,
     });

@@ -337,6 +337,13 @@ test(
       body.degraded.sections.includes("handoff_leases"),
       `a failed handoff list must be named as degraded, not silently empty (got ${JSON.stringify(body.degraded.sections)})`,
     );
+    // handoff_context is resolved FROM the inbox entries, so a cut inbox read
+    // makes it vacuously empty. Shipping ok:true over inputs the hook never
+    // had is the same false all-clear, one level down.
+    assert.ok(
+      body.degraded.sections.includes("handoff_context"),
+      `a handoff_context built from a cut inbox read must be named as degraded (got ${JSON.stringify(body.degraded.sections)})`,
+    );
     // Still exactly-once: delivered, so archived.
     assert.equal((await archivedEntries(fixture)).length, 1);
   },
@@ -698,6 +705,138 @@ test(
       audit,
       /"reassert_entries_pending_clear":\s*2/,
       "an already-settled empty must not be counted as an archive still pending",
+    );
+  },
+);
+
+test(
+  "a FAILED boot still flushes its degraded signal and exits cleanly",
+  { timeout: 120_000 },
+  async (t) => {
+    const fixture = await makeFixture();
+    t.after(() => rm(fixture.root, { recursive: true, force: true }));
+
+    // Force the handler to throw: a vault path whose parent is a FILE makes
+    // ensureVault fail. The failure path must still complete the protocol —
+    // flush the degraded envelope and exit — because "this boot degraded" is
+    // exactly the signal a fire-and-forget write loses when the host kills a
+    // process that never exited.
+    const blocker = path.join(fixture.root, "not-a-dir");
+    await writeFile(blocker, "x", "utf8");
+
+    const started = Date.now();
+    const { code, stdout } = await new Promise((resolve, reject) => {
+      const child = spawn(process.execPath, [HOOK_JS, "SessionStart"], {
+        env: { ...hookEnv(fixture), MINNI_CLAUDECODE_VAULT_PATH: path.join(blocker, "vault") },
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+      let out = "";
+      child.stdout.setEncoding("utf8");
+      child.stdout.on("data", (chunk) => {
+        out += chunk;
+      });
+      child.stderr.resume();
+      child.on("error", reject);
+      child.on("close", (c) => resolve({ code: c, stdout: out }));
+      child.stdin.end(JSON.stringify({ session_id: "failing" }));
+    });
+    const elapsed = Date.now() - started;
+
+    assert.equal(code, 0, "a degraded boot must still exit cleanly");
+    const output = JSON.parse(stdout.trim().split("\n").pop());
+    assert.equal(output.continue, true);
+    assert.match(
+      output.systemMessage ?? "",
+      /degraded/,
+      "the degraded signal must actually reach the host, not just be queued",
+    );
+    assert.ok(elapsed < 20_000, `the failure path must not linger (took ${elapsed}ms)`);
+  },
+);
+
+const CODEX_HOOK_JS = path.join(PLUGIN_ROOT, "dist", "codex-hook.js");
+
+/** Codex SessionStart — a FACTORY platform whose wire CAN inject at boot. */
+function runCodexSessionStart(fixture) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [CODEX_HOOK_JS, "SessionStart"], {
+      env: {
+        ...process.env,
+        MINNI_HOME: fixture.home,
+        MINNI_SOCKET_PATH: path.join(fixture.home, "missing.sock"),
+        MINNI_AFM_HEALTH_URL: "http://127.0.0.1:1/health",
+        MINNI_BYPASS_AUDIT_LIMIT: "true",
+        MINNI_CODEX_AGENT_ID: "codex",
+        MINNI_CODEX_VAULT_PATH: fixture.vault,
+        MINNI_CODEX_HOOKS: "on",
+      },
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    let stdout = "";
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk;
+    });
+    child.stderr.resume();
+    child.on("error", reject);
+    child.on("close", () => resolve(JSON.parse(stdout.trim().split("\n").pop())));
+    child.stdin.end(JSON.stringify({ session_id: "codex-fixture" }));
+  });
+}
+
+test(
+  "a cap-overflowed tail is reported as pending even when nothing was consumed",
+  { timeout: 120_000 },
+  async (t) => {
+    // Drives the FACTORY (codex), not claude-code: the undercount lives in
+    // hook-handlers.ts, and hook.ts already counted tails unconditionally. A
+    // test on the wrong binary would have passed either way.
+    const root = await mkdtemp(path.join(tmpdir(), "sm-tail-count-"));
+    const fixture = {
+      root,
+      vault: path.join(root, "codex-vault"),
+      home: path.join(root, "home"),
+    };
+    fixture.inbox = path.join(fixture.vault, "inbox");
+    await mkdir(fixture.inbox, { recursive: true });
+    await mkdir(fixture.home, { recursive: true });
+    // ONE file carrying more than the cap: its head is injected, its tail is
+    // rewritten for the next boot — so a tail rewrite is registered while NO
+    // path is consumed. A tail count derived from the consumed-path count
+    // reported zero here while a rewrite was genuinely pending.
+    const stamp = Date.now() - 3600_000;
+    const many = Array.from({ length: 14 }, (_, i) => ({
+      event_id: 900 + i,
+      superseded_learning_id: 1,
+      new_learning_id: 2,
+    }));
+    await writeFile(
+      path.join(fixture.inbox, inboxName(stamp, "overflow-reassert")),
+      JSON.stringify({
+        slug: "overflow-reassert",
+        kind: "codex_precompact_handoff",
+        agent_id: "codex",
+        createdAt: new Date(stamp).toISOString(),
+        stale_belief_events: many,
+      }),
+      "utf8",
+    );
+    t.after(() => rm(root, { recursive: true, force: true }));
+
+    const output = await runCodexSessionStart(fixture);
+    const context = output.hookSpecificOutput?.additionalContext ?? "";
+    const envelope = context.match(/<minni:context [^>]*>\n([\s\S]*?)\n<\/minni:context>/)?.[1];
+    assert.ok(envelope, "codex SessionStart must emit an envelope");
+    const body = JSON.parse(envelope);
+    assert.equal(
+      body.corrections_reassert.length,
+      10,
+      "fixture precondition: the cap must have truncated this stash",
+    );
+    assert.match(
+      await auditText(fixture),
+      /"reassert_tails_pending_defer":\s*1/,
+      "a registered tail rewrite must be counted even though no path was consumed",
     );
   },
 );

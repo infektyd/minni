@@ -31,7 +31,12 @@ import { createHookHandlers } from "./hook-handlers.js";
 import { geminiWire } from "./hook-platform.js";
 import type { AgentHookConfig } from "./hook-handlers.js";
 import { VALID_EVENTS, asString, emit, readStdin } from "./hook-utils.js";
-import { discardDeliveryCommits, emitAndCommit, exitAfterDelivery } from "./hook-delivery.js";
+import {
+  discardDeliveryCommits,
+  emitAndCommit,
+  exitAfterDelivery,
+  failAndExit,
+} from "./hook-delivery.js";
 import { PRE_TOOL_USE_EVENT } from "./recall-guard.js";
 import type { PreToolUseDecisionOutput, RecallGuardMode } from "./recall-guard.js";
 import { recordAudit } from "./vault.js";
@@ -144,18 +149,18 @@ async function main(): Promise<void> {
     } catch {
       // audit unavailable; the fallback output below still keeps agy unblocked
     }
-    if (event === PRE_TOOL_USE_EVENT) {
-      emit(agyAllow());
-    } else {
-      // hooks-PL-5: a degraded event must never look like a clean one — say
-      // so, through agy's channel (it has no systemMessage).
-      emit(
-        geminiWire.note(
-          event as EnvelopeEvent,
-          `Minni hook degraded (${event}): ${message} — memory injection skipped this event; see vault log.md.`,
-        ) ?? geminiWire.noop(),
-      );
-    }
+    // failAndExit, not emit: agy kills at 10s, and a fire-and-forget write can
+    // still be unbuffered when that lands — losing the degraded signal itself.
+    await failAndExit(
+      event === PRE_TOOL_USE_EVENT
+        ? agyAllow()
+        : // hooks-PL-5: a degraded event must never look like a clean one — say
+          // so, through agy's channel (it has no systemMessage).
+          (geminiWire.note(
+            event as EnvelopeEvent,
+            `Minni hook degraded (${event}): ${message} — memory injection skipped this event; see vault log.md.`,
+          ) ?? geminiWire.noop()),
+    );
   }
 }
 

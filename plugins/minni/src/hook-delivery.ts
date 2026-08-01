@@ -99,6 +99,29 @@ export function exitAfterDelivery(): never {
   process.exit(0);
 }
 
+/**
+ * Close out a FAILED event: discard every deferred commit, flush the degraded
+ * output, and exit.
+ *
+ * The failure path needs the same protocol as the success path, and had neither
+ * half. It emitted fire-and-forget and returned: nothing awaited the flush, so a
+ * host that kills the hook on a deadline could SIGKILL it with the degraded
+ * envelope still sitting in the buffer; and nothing exited, so the abandoned
+ * handles from budgeted RPCs kept the loop alive until that kill arrived. The
+ * corrections were safe — the commits are discarded first — but the "this boot
+ * degraded" signal, which exists precisely so a bad boot cannot pass for a clean
+ * one, was the thing most likely to be lost.
+ *
+ * Discarding is repeated here rather than assumed: callers already discard
+ * before auditing, and making this function responsible for the whole protocol
+ * means a future caller cannot get the order wrong.
+ */
+export async function failAndExit(output: object): Promise<never> {
+  discardDeliveryCommits();
+  await emitDelivered(output);
+  exitAfterDelivery();
+}
+
 export interface DeliveryContext {
   vaultPath: string;
   /** Audit tool-name prefix, e.g. "hook" -> hook_undelivered. */
