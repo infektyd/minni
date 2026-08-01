@@ -970,3 +970,75 @@ def test_missing_relay_token_skips_approval_but_keeps_the_check(mod, monkeypatch
     assert d.conclusion == "success"
     assert posted == ["success"], "the check must still post"
     assert submitted == [], "no approval without the relay token"
+
+
+# --- token/identity seams ---------------------------------------------------
+# These assert WHICH token and WHICH identity reach the approval path. Without
+# them the call sites merely pass approve_token without anything checking it
+# arrives, so a silent revert to the App token — the behaviour #243 disproved —
+# looks identical to a correct build.
+
+
+def test_success_path_approves_with_the_relay_token_not_the_app_token(mod, monkeypatch):
+    seen = {}
+    monkeypatch.setattr(mod, "_preflight", lambda *a, **k: None)
+    monkeypatch.setattr(
+        mod, "_gather_and_decide",
+        lambda *a, **k: mod.GateDecision("success", "ok", "green"),
+    )
+    monkeypatch.setattr(mod, "post_check_run", lambda *a, **k: None)
+    monkeypatch.setattr(mod, "fetch_protection", lambda *a, **k: (("CI",), {}))
+    monkeypatch.setattr(
+        mod, "submit_mechanical_approval",
+        lambda **k: seen.update(token=k["token"]) or "approved",
+    )
+    mod.run_gate(owner="o", repo="r", pr=1, head_sha="abc", token="gh",
+                 base_branch="main", post_token="APPTOKEN",
+                 approve_token="RELAYTOKEN")
+    assert seen["token"] == "RELAYTOKEN", (
+        "an App-token approval does not satisfy the review requirement (#243)"
+    )
+
+
+def test_failure_path_dismisses_with_the_relay_token_not_the_app_token(mod, monkeypatch):
+    """The App token cannot dismiss the relay's approval — it would 403, get
+    swallowed as a warning, and leave a stale green approval standing after the
+    decision flipped red."""
+    seen = {}
+    monkeypatch.setattr(mod, "_preflight", lambda *a, **k: None)
+    monkeypatch.setattr(
+        mod, "_gather_and_decide",
+        lambda *a, **k: mod.GateDecision("failure", "required check red", "nope"),
+    )
+    monkeypatch.setattr(mod, "post_check_run", lambda *a, **k: None)
+    monkeypatch.setattr(
+        mod, "dismiss_stale_approvals",
+        lambda **k: seen.update(token=k["token"]) or 1,
+    )
+    mod.run_gate(owner="o", repo="r", pr=1, head_sha="abc", token="gh",
+                 base_branch="main", post_token="APPTOKEN",
+                 approve_token="RELAYTOKEN")
+    assert seen["token"] == "RELAYTOKEN"
+
+
+def test_fetch_approver_reviews_filters_on_the_approver_not_the_app(mod, monkeypatch):
+    """If this filtered on the App instead, already_approved() would never match
+    a relay approval, so a NEW approval would be submitted on every run — each
+    one firing pull_request_review and re-triggering the gate. That is the #244
+    oscillation returning through the idempotency path, and no other test in
+    this file would notice."""
+    mixed = [
+        {"id": 1, "user": {"login": "infektydgrokreviewer[bot]"},
+         "state": "COMMENTED", "commit_id": "sha1"},
+        {"id": 2, "user": {"login": RELAY_LOGIN},
+         "state": "APPROVED", "commit_id": "sha1"},
+        {"id": 3, "user": {"login": "a-human"},
+         "state": "APPROVED", "commit_id": "sha1"},
+        {"id": 4, "user": {"login": "infektydgrokreviewer[bot]"},
+         "state": "APPROVED", "commit_id": "sha1"},
+    ]
+    monkeypatch.setattr(mod, "_paginate", lambda *a, **k: mixed)
+    got = mod.fetch_approver_reviews("o", "r", 1, "relay")
+    assert [r["id"] for r in got] == [2], "must return the relay's reviews only"
+    # And the consequence that actually bites: idempotency still works.
+    assert mod.already_approved(got, "sha1") is True

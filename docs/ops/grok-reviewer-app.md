@@ -471,9 +471,17 @@ above) — that reachability is unchanged, but the split matters for what each
 buys.
 
 **Relay PAT (`RELAY_APPROVE_TOKEN`)** — fine-grained, `minni` only, Pull
-requests RW. It buys exactly one thing: **reviews on this repo as
-`infektydrelay-bit`**, i.e. submit an approval and dismiss its own. It cannot
-post the mechanical check, cannot read or change protection, and cannot merge.
+requests RW. It buys **write access to pull requests as `infektydrelay-bit`**.
+That is more than "submit an approval": Pull requests RW also allows
+`PATCH /pulls/{n}` — which can **change a PR's base branch** — and close or
+reopen PRs, edit titles and bodies, and dismiss *anyone's* review. The code
+only ever uses approve-and-dismiss-its-own; the token is not so limited.
+
+Changing the base branch is the one worth naming: it re-points a reviewed diff
+at a different target, so what was approved and what would merge are no longer
+the same thing.
+
+It still cannot post the mechanical check, read or change protection, or merge.
 
 **App key** — after this change the App no longer needs `pull-requests: write`
 for the gate at all; the gate's token is `checks: write` + `administration:
@@ -503,6 +511,16 @@ does not contain a push-capable actor — it contains a pull request.
 satisfy `require_code_owner_reviews`: code owners must be individuals or teams
 with write access, and a GitHub App installation is neither. That is precisely
 why it is worth configuring, and why it must own itself.
+
+### Never review manually from the relay account
+
+The gate cannot tell its own mechanical approval from one a human typed while
+signed in as `infektydrelay-bit` — both are simply `APPROVED` reviews from that
+login. So on the next non-success decision it will **dismiss a hand-made relay
+approval** as a stale mechanical one.
+
+Review as `infektyd`, or as yourself. If you want a human approval to stick,
+it must come from an identity the gate does not manage.
 
 ### CODEOWNERS — the human-required trust surface
 
