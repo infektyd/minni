@@ -73,6 +73,16 @@ jobs:
           ref: ${{ steps.target.outputs.ref }}
           fetch-depth: 0
 
+      - name: Install sandbox prerequisites
+        run: |
+          # The Grok sandbox enforces its deny set via a mount namespace and
+          # REFUSES TO START without bubblewrap ("Refusing to start with
+          # denied paths unprotected"), which is not on the GitHub runner
+          # image by default. Measured the hard way: without this, the whole
+          # run dies before the agent does anything.
+          sudo apt-get update -qq && sudo apt-get install -y -qq bubblewrap
+          bwrap --version
+
       - name: Install Grok Build CLI
         run: |
           curl -fsSL https://x.ai/cli/install.sh | bash
