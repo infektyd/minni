@@ -389,7 +389,12 @@ def _is_under(value: str, root: Path) -> bool:
     if not value:
         return False
     try:
-        candidate = Path(_nfc(value))
+        # normpath first: a detour above the root
+        # (".../plugins/../plugins/cache/minni/...") is a live reference the
+        # kernel resolves straight back into the tree, but relative_to compares
+        # components literally and would call it unrelated. Collapsing can only
+        # add matches, so the failure direction stays conservative.
+        candidate = Path(os.path.normpath(_nfc(value)))
     except (TypeError, ValueError):
         return False
     if not candidate.is_absolute():
@@ -470,22 +475,14 @@ def legacy_cache_referrers(*, overrides: dict[str, dict] | None = None) -> list[
                 found.append(f"{path}: unreadable, cannot verify ({exc})")
                 continue
         for trail, value in _iter_json_strings(doc):
-            # Echo the value only when it is a bare path. Path() validates
-            # nothing -- spaces and newlines are ordinary path characters -- so
-            # "<cache>/hook.js --token=..." passes _is_under whole, and printing
-            # it would leak exactly what the branch below is careful not to.
-            if _is_under(value, root):
-                if value.split() == [value]:
-                    found.append(f"{path}: {trail} -> {value}")
-                else:
-                    found.append(f"{path}: {trail} mentions {root}")
-            elif boundary.search(_nfc(value).lower()):
-                # Report the field, never the text. This branch fires precisely
-                # when the path is embedded in a shell command string, which is
-                # exactly where people inline `FOO_TOKEN=...`; and over
-                # ~/.claude.json the surrounding text is verbatim prompt
-                # history. A dotted trail points at the offending field without
-                # copying secrets into stderr, CI logs and bug reports.
+            # Report the field, never the text. Path() validates nothing, so a
+            # value that satisfies _is_under can still carry arguments after
+            # the path -- and this scan fires precisely where people inline
+            # `FOO_TOKEN=...`, while over ~/.claude.json the surrounding text
+            # is verbatim prompt history. The dotted trail is the actionable
+            # part anyway, and emitting only it collapses the whole leak class
+            # instead of chasing separators.
+            if _is_under(value, root) or boundary.search(_nfc(value).lower()):
                 found.append(f"{path}: {trail} mentions {root}")
     return found
 

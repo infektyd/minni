@@ -573,6 +573,39 @@ def test_remove_legacy_cache_refusal_never_echoes_an_argument_string(home):
     assert "CANARY-9d3f1a" not in str(exc.value), "refusal echoed an argument string"
 
 
+def test_remove_legacy_cache_catches_a_dotdot_detour_above_the_root(home):
+    """The kernel resolves this straight back into the cache; relative_to does not."""
+    (legacy_cache_root() / "minni" / "0.3.0").mkdir(parents=True)
+    root = _install_tree(home, "0.4.0")
+    detour = (
+        home / ".claude" / "plugins" / ".." / "plugins" / "cache"
+        / "minni" / "minni" / "0.3.0"
+    )
+    cfg = home / ".claude.json"
+    cfg.write_text(json.dumps({"x": {"installPath": str(detour)}}), encoding="utf-8")
+
+    with pytest.raises(ClaudePluginError, match="still referenced by"):
+        remove_legacy_cache(root)
+
+
+def test_remove_legacy_cache_never_echoes_config_values(home):
+    """No separator trick should get config text into the message."""
+    (legacy_cache_root() / "minni" / "0.3.0").mkdir(parents=True)
+    root = _install_tree(home, "0.4.0")
+    hook = legacy_cache_root() / "minni" / "0.3.0" / "dist" / "hook.js"
+    cfg = home / ".claude.json"
+    cfg.write_text(json.dumps({
+        "a": f"{hook}?auth=CANARY-NOSPACE",
+        "b": f"{hook};export=CANARY-SEMI",
+        "c": f"{hook} --auth CANARY-SPACE",
+    }), encoding="utf-8")
+
+    with pytest.raises(ClaudePluginError) as exc:
+        remove_legacy_cache(root)
+    assert "CANARY" not in str(exc.value), "refusal echoed config text"
+    assert "a mentions" in str(exc.value), "must still name the field"
+
+
 def test_remove_legacy_cache_scans_dict_keys(home):
     """~/.claude.json keys its projects map by directory, so a path can be a key."""
     (legacy_cache_root() / "minni" / "0.3.0").mkdir(parents=True)

@@ -171,12 +171,20 @@ properties rather than relying on the earlier steps having done their job:
   Four details that gate got wrong before review, each of which turned it into a
   no-op, a permanent blocker, or a leak:
 
-  - **Report the field, never the text.** The embedded-string branch fires
-    exactly where people inline `FOO_TOKEN=...`, and over `~/.claude.json` the
-    surrounding text is verbatim prompt history. An earlier version quoted 120
-    characters of context into an error printed to stderr. It emits the dotted
-    trail (`hooks.SessionStart[0].hooks[0].command`) instead, which is both
+  - **Report the field, never the value.** This scan fires exactly where people
+    inline `FOO_TOKEN=...`, and over `~/.claude.json` the surrounding text is
+    verbatim prompt history. Earlier versions quoted 120 characters of context,
+    then echoed the matched value — which `Path()` happily accepts with
+    arguments glued on. Neither is emitted now: the message is the dotted trail
+    (`hooks.SessionStart[0].hooks[0].command mentions <root>`), which is both
     leak-free and a better pointer than an excerpt of a multi-megabyte file.
+  - **Scan keys, not just values.** `~/.claude.json` keys its `projects` map by
+    directory, so a path can appear only as a key.
+  - **`normpath` before comparing.** A detour above the root
+    (`.../plugins/../plugins/cache/minni/...`) is a live reference the kernel
+    resolves back into the tree, but `relative_to` compares components
+    literally and would call it unrelated. Collapsing can only add matches, so
+    the failure direction stays conservative.
   - **Anchor the needle.** A bare substring reintroduces exactly the bug
     `_is_under` avoids: `.../cache/minni` is a prefix of
     `.../cache/minni-tools`, so an unrelated marketplace would block the
@@ -194,11 +202,14 @@ properties rather than relying on the earlier steps having done their job:
     for. Claude Code does not expand `~` in these configs, so the on-disk risk
     it would cover is not real.
 
-  Residual heuristic gaps are accepted: a tilde-spelled path, `$HOME`-style
-  indirection, `..` before the prefix, doubled slashes inside a command string,
-  and a path split across two fields all evade the substring layer. The
-  structured scan still catches every lexically-normal absolute path, which is
-  the shape these configs actually take.
+  Residual gaps are accepted and bounded: a tilde-spelled path, `$HOME`-style
+  indirection, a reference reached through some unrelated symlink alias, a `..`
+  detour *inside a command string* (the structured layer normalizes, the
+  substring layer cannot), and a path split across two fields. The structured
+  scan catches every lexically-normal absolute path, which is the shape these
+  configs actually take, and the worst case for a miss is a dangling pointer
+  into a cache the operator was retiring — recoverable, and avoidable up front
+  with `--keep-legacy-cache`.
 
 - **It reports everything it deletes.** The target is the plugin dir
   `<cache>/minni/minni`, not the whole `<cache>/minni` marketplace dir. A
