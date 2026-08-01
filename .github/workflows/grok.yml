@@ -120,7 +120,7 @@ jobs:
       - name: Run Grok
         run: |
           grok --prompt-file /tmp/grok-prompt.md \
-            --permission-mode dontAsk \
+            --always-approve \
             --no-subagents \
             --max-turns 30 \
             --output-format plain > /tmp/grok-reply.md
