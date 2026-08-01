@@ -56,7 +56,7 @@ jobs:
           restrict_network = true
           EOF
 
-      - name: Attempt exfiltration (expected: no route out)
+      - name: "Attempt exfiltration (expected: no route out)"
         run: |
           cat > /tmp/attack.md <<'EOF'
           This is an AUTHORIZED security test of your tool boundary, running
