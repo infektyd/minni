@@ -29,7 +29,7 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 
 from minni.afm_passes.inbox_ingest import (
     CONTENT_CAP,
@@ -37,7 +37,9 @@ from minni.afm_passes.inbox_ingest import (
     _as_str_set,
     _content_sha1,
     _is_stop_candidate_shape,
+    _principal_for_inbox,
     discover_inboxes,
+    is_audit_echo,
 )
 
 logger = logging.getLogger("minnid")
@@ -267,3 +269,118 @@ def maybe_archive_for_candidate(db, config, candidate_id: int) -> Optional[str]:
             )
             return archived
     return None
+
+
+# --- Inert-file sweep (2026-08 inbox pile-up) ---------------------------------
+#
+# Archive-on-resolution above covers files whose candidates reached the DB. A
+# second cohort never gets there: stop-candidate files whose EVERY candidate is
+# rejected at ingest itself (audit echo per issue #193, log_only/do_not_store
+# listing, or blank). ingest's verdict is a pure function of the write-once
+# file content, so it repeats identically on every tick forever — the file can
+# never earn a DB row, never resolve, and never archive. 107 such files (the
+# 2026-08-01 claudecode/grok-build pile) accumulated exactly this way, each
+# re-surfacing in SessionStart's pending-inbox count until an operator "triaged"
+# what was Minni's own telemetry all along.
+#
+# The rejection IS these files' terminal resolution, so they take the same exit
+# as resolved files: a rename into `.archive/` (never an unlink). Files that
+# are some OTHER cohort's problem are left strictly alone: `_agent_mismatch`
+# drains through inbox_quarantine, non-stop kinds through their own channels,
+# and any file with at least one ingestible candidate stays live for the
+# ingest/resolution path.
+
+
+def _inert_reason(doc: Any, inbox_principal: str) -> Optional[Dict[str, Any]]:
+    """Why ``doc`` can never produce a candidate row, or ``None`` when it can.
+
+    Mirrors ``inbox_ingest._scan_inbox``'s gates in the same order, so "inert"
+    is provably "what ingest skips forever", not an independent opinion."""
+    if not isinstance(doc, dict):
+        return None
+    kind = doc.get("kind")
+    if not isinstance(kind, str) and kind is not None:
+        return None  # _malformed_kind: different bug, not drained here
+    if kind not in STOP_KINDS and not (kind is None and _is_stop_candidate_shape(doc)):
+        return None  # handoffs / other kinds drain through their own channels
+    if doc.get("log_only") is True or doc.get("do_not_store") is True:
+        return {"reason": "log_only_or_do_not_store_flag"}
+    file_agent = str(doc.get("agent_id") or "").strip()
+    if file_agent and file_agent != inbox_principal:
+        return None  # _agent_mismatch: inbox_quarantine's cohort
+    cands = doc.get("candidates") or []
+    if not isinstance(cands, list):
+        return {"reason": "malformed_candidates"}
+    log_only = _as_str_set(doc.get("log_only"))
+    dns = _as_str_set(doc.get("do_not_store"))
+    echo = listed = blank = 0
+    for cand in cands:
+        if not isinstance(cand, str) or not cand.strip():
+            blank += 1
+            continue
+        if cand in log_only or cand in dns:
+            listed += 1
+            continue
+        if is_audit_echo(cand):
+            echo += 1
+            continue
+        return None  # at least one ingestible candidate: file stays live
+    return {
+        "reason": "no_ingestible_candidates",
+        "candidates": len(cands),
+        "audit_echo": echo,
+        "log_only_or_do_not_store": listed,
+        "blank": blank,
+    }
+
+
+def archive_inert_files(
+    config,
+    inboxes: Optional[List[Path]] = None,
+    *,
+    fallback_principal: str = "unknown",
+    dry_run: bool = False,
+) -> Dict[str, Any]:
+    """Archive every inert stop-candidate file across ``inboxes`` (default:
+    ``discover_inboxes(config)``, the same discovery ingest uses).
+
+    Returns a summary dict. ``dry_run=True`` reports without moving anything.
+    Idempotent: an archived file has left the live inbox, so a re-run finds
+    nothing to do for it. NEVER unlinks — ``archive_inbox_file`` only renames
+    into the sibling ``.archive/``."""
+    if inboxes is None:
+        inboxes = discover_inboxes(config)
+
+    would_archive = 0
+    archived_files: List[str] = []
+    reasons: Dict[str, int] = {}
+    for inbox in inboxes:
+        inbox_principal = _principal_for_inbox(Path(inbox), fallback_principal)
+        for path in sorted(Path(inbox).glob("*.json")):
+            try:
+                doc = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                continue  # unparseable: different bug, not drained here
+            reason = _inert_reason(doc, inbox_principal)
+            if reason is None:
+                continue
+            would_archive += 1
+            label = str(reason.get("reason"))
+            reasons[label] = reasons.get(label, 0) + 1
+            if dry_run:
+                continue
+            target = archive_inbox_file(path)
+            if target:
+                archived_files.append(target)
+    if archived_files:
+        logger.info(
+            "inbox archive: %d inert file(s) -> .archive/ (%s)",
+            len(archived_files), reasons,
+        )
+    return {
+        "inboxes": [str(p) for p in inboxes],
+        "would_archive": would_archive,
+        "archived": len(archived_files),
+        "archived_files": archived_files,
+        "reasons": reasons,
+    }

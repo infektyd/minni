@@ -8,6 +8,23 @@ pre-1.0: minor versions may contain breaking changes until v1.0.0.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Inert inbox files now self-archive** — the AFM consolidation tick sweeps
+  stop-candidate files whose every candidate ingest rejects (audit echo /
+  `log_only` / `do_not_store` / blank) into `<inbox>/.archive/`
+  (`archive_inert_files` in `afm_passes/inbox_archive.py`; rename only, never
+  an unlink). Such files could never earn a `candidate_packets` row, so the
+  archive-on-resolution lifecycle could never reclaim them: 107 echo-only
+  files written by pre-#201 hook builds accumulated across claudecode/grok-build
+  vaults, re-surfacing in every SessionStart pending-inbox count as apparent
+  "triage" work that was Minni's own telemetry all along. No TTL: the verdict
+  is a pure function of the write-once file content. Kill switch:
+  `afm_loop_schedule.passes.consolidation.archive_inert_inbox` (default on);
+  observable via the `inbox_inert_archived_total` counter and an INFO log line
+  per sweep. `_agent_mismatch` files still drain through `inbox_quarantine`,
+  non-stop kinds and unparseable files are untouched.
+
 ### Added
 
 - **`readme-audit` skill** (`plugins/minni/skills/readme-audit/`): a repo skill

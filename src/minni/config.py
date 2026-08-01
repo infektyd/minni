@@ -213,6 +213,17 @@ class SovereignConfig:
                 # DEFAULT_RESIDUE_TTL_DAYS convention/default (14 days);
                 # operator-tunable, not hardcoded downstream.
                 "inbox_quarantine_ttl_days": 14.0,
+                # Inert-file sweep: a stop-candidate file whose EVERY candidate
+                # ingest rejects (audit echo / log_only / do_not_store / blank)
+                # can never earn a candidate_packets row, so the
+                # archive-on-resolution lifecycle can never reclaim it — it
+                # re-surfaces in every SessionStart pending-inbox count until
+                # someone hand-triages Minni's own telemetry. The verdict is a
+                # pure function of the write-once file content (no TTL: an
+                # upstream hook fix changes future files, never existing ones),
+                # so each consolidation tick moves such files straight to
+                # <inbox>/.archive/ (rename only, never an unlink).
+                "archive_inert_inbox": True,
                 # Distill harvested raw compaction summaries (<vault>/inbox
                 # kind 'compact_summary', written by the platform hooks'
                 # compact harvest) into proposed candidates on the same tick.

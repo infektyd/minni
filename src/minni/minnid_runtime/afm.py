@@ -578,6 +578,42 @@ async def afm_loop_runner(context: AFMContext):
                                     "AFM loop: inbox quarantine raised (skipped; "
                                     "consolidation continues)"
                                 )
+                        # Inert-file sweep (2026-08 pile-up): a stop-candidate
+                        # file whose EVERY candidate ingest rejects (audit
+                        # echo / log_only / do_not_store / blank) can never
+                        # earn a DB row, so archive-on-resolution can never
+                        # reclaim it — the same permanent-residue shape as
+                        # _agent_mismatch, drained to `.archive/` instead of
+                        # quarantine because ingest's rejection IS its terminal
+                        # resolution (nothing for an operator to remediate).
+                        # Runs every tick: the scan costs what ingest's own
+                        # scan already costs. Failure must NOT block
+                        # consolidation of the existing queue.
+                        if (cfg or {}).get("archive_inert_inbox", True):
+                            try:
+                                from minni.afm_passes.inbox_archive import (
+                                    archive_inert_files,
+                                )
+                                _ia = archive_inert_files(
+                                    context.default_config,
+                                    fallback_principal=str((cfg or {}).get(
+                                        "inbox_fallback_principal", "unknown")),
+                                )
+                                if _ia.get("archived"):
+                                    obs.incr(
+                                        "inbox_inert_archived_total",
+                                        _ia["archived"],
+                                    )
+                                    context.logger.info(
+                                        "AFM loop: archived %d inert inbox "
+                                        "file(s) (%s)",
+                                        _ia["archived"], _ia.get("reasons"),
+                                    )
+                            except Exception:
+                                context.logger.exception(
+                                    "AFM loop: inert inbox archive raised "
+                                    "(skipped; consolidation continues)"
+                                )
                     # Distill harvested raw compaction summaries (inbox kind
                     # 'compact_summary', written by the platform hooks'
                     # compact harvest) into proposed candidates on the same
