@@ -8,6 +8,15 @@
 #
 # Enable once per clone:  git config core.hooksPath .githooks
 # Escape hatch:  MINNI_SKIP_HOOKS=1 git push ...
+
+# Chain the operator's machine-global git-guard first, if one exists
+# (fail-open: contributors without ~/.config/git/hooks are unaffected).
+# Repos that set core.hooksPath otherwise shadow global hooks entirely —
+# that shadowing let content leaks bypass the guard (see PR #204 history).
+if [ -x "$HOME/.config/git/hooks/pre-push" ]; then
+  "$HOME/.config/git/hooks/pre-push" "$@" || exit 1
+fi
+
 set -euo pipefail
 
 if [ "${MINNI_SKIP_HOOKS:-0}" = "1" ]; then
