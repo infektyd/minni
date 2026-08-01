@@ -8,22 +8,7 @@ pre-1.0: minor versions may contain breaking changes until v1.0.0.
 
 ## [Unreleased]
 
-### Fixed
-
-- **Inert inbox files now self-archive** — the AFM consolidation tick sweeps
-  stop-candidate files whose every candidate ingest rejects (audit echo /
-  `log_only` / `do_not_store` / blank) into `<inbox>/.archive/`
-  (`archive_inert_files` in `afm_passes/inbox_archive.py`; rename only, never
-  an unlink). Such files could never earn a `candidate_packets` row, so the
-  archive-on-resolution lifecycle could never reclaim them: 107 echo-only
-  files written by pre-#201 hook builds accumulated across claudecode/grok-build
-  vaults, re-surfacing in every SessionStart pending-inbox count as apparent
-  "triage" work that was Minni's own telemetry all along. No TTL: the verdict
-  is a pure function of the write-once file content. Kill switch:
-  `afm_loop_schedule.passes.consolidation.archive_inert_inbox` (default on);
-  observable via the `inbox_inert_archived_total` counter and an INFO log line
-  per sweep. `_agent_mismatch` files still drain through `inbox_quarantine`,
-  non-stop kinds and unparseable files are untouched.
+## [0.4.1] - 2026-08-01
 
 ### Added
 
@@ -74,6 +59,20 @@ pre-1.0: minor versions may contain breaking changes until v1.0.0.
 
 ### Fixed
 
+- **Inert inbox files now self-archive** — the AFM consolidation tick sweeps
+  stop-candidate files whose every candidate ingest rejects (audit echo /
+  `log_only` / `do_not_store` / blank) into `<inbox>/.archive/`
+  (`archive_inert_files` in `afm_passes/inbox_archive.py`; rename only, never
+  an unlink). Such files could never earn a `candidate_packets` row, so the
+  archive-on-resolution lifecycle could never reclaim them: 107 echo-only
+  files written by pre-#201 hook builds accumulated across claudecode/grok-build
+  vaults, re-surfacing in every SessionStart pending-inbox count as apparent
+  "triage" work that was Minni's own telemetry all along. No TTL: the verdict
+  is a pure function of the write-once file content. Kill switch:
+  `afm_loop_schedule.passes.consolidation.archive_inert_inbox` (default on);
+  observable via the `inbox_inert_archived_total` counter and an INFO log line
+  per sweep. `_agent_mismatch` files still drain through `inbox_quarantine`,
+  non-stop kinds and unparseable files are untouched.
 - **Layer 1 identity workspace is now seeded**: `bootstrap-vault` creates
   `<vault>/layer1/` with `core.md` and `budget.md` from in-repo templates
   parameterized by agent id, vault path, workspace, and socket path. The Layer 1
@@ -94,7 +93,9 @@ pre-1.0: minor versions may contain breaking changes until v1.0.0.
   ran the ritual blind against a missing meter. Seeding is idempotent: `mode`
   and `gauges.md` are operator-owned living state and `ritual.md` accumulates
   traces, so existing files are never overwritten. Re-run `bootstrap-vault
-  --agent <id>` to backfill an older vault.
+  --agent <id>` to backfill an older vault. Wheel `package-data` and
+  `stage_payload` globs now include the distill templates so pip installs ship
+  them.
 
 ## [0.4.0] - 2026-07-30
 
@@ -280,5 +281,6 @@ commit.
   model-download notices, contributor/security hygiene files, and a rewritten
   README with a `docs/` tree.
 
-[Unreleased]: https://github.com/infektyd/minni/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/infektyd/minni/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/infektyd/minni/releases/tag/v0.4.1
 [0.1.0]: https://github.com/infektyd/minni/releases/tag/v0.1.0
