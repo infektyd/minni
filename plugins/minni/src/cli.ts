@@ -1,5 +1,5 @@
 import { DEFAULT_VAULT_PATH } from "./config.js";
-import { assessLearningQualityAsync, routeMemoryIntent } from "./policy.js";
+import { assessLearningQualityAsync, flagsSensitiveMaterial, routeMemoryIntent } from "./policy.js";
 import { readAgentContext, statusAndAudit } from "./sovereign.js";
 import { prepareOutcome, prepareTask } from "./task.js";
 import { buildTeamEvidencePacket, buildTeamPromotionPacket, buildTeamRuntime } from "./team.js";
@@ -234,12 +234,24 @@ async function main() {
   if (command === "learn") {
     const [title, ...contentParts] = args;
     if (!title || contentParts.length === 0) throw new Error("learn requires title and content");
+    const content = contentParts.join(" ");
+    // This path wrote straight to the vault with no gate at all, so the
+    // credential scan that guards minni_learn did not guard `minni learn`.
+    // Only a credential-material block is enforced here: the CLI is an
+    // operator tool, so weak-but-clean notes still write, matching the
+    // requireQuality:false opt-out the MCP tool offers.
+    const quality = await assessLearningQualityAsync({ title, content });
+    if (flagsSensitiveMaterial(quality)) {
+      console.log(JSON.stringify({ status: "quality-blocked", quality }, null, 2));
+      process.exitCode = 1;
+      return;
+    }
     console.log(
       JSON.stringify(
         await vaultFirstLearn({
           vaultPath: DEFAULT_VAULT_PATH,
           title,
-          content: contentParts.join(" "),
+          content,
         }),
         null,
         2,
