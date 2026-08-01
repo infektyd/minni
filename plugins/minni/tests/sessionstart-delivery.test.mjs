@@ -334,6 +334,135 @@ test(
   },
 );
 
+// ---------------------------------------------------------------------------
+// A PLATFORM DROP is a non-delivery too. Writing a noop the host ignores is not
+// delivering the correction that noop was supposed to carry.
+// ---------------------------------------------------------------------------
+
+const GROK_HOOK_JS = path.join(PLUGIN_ROOT, "dist", "grok-hook.js");
+
+/** Grok SessionStart: the wire cannot inject there, so the envelope is dropped. */
+function runGrokSessionStart(fixture) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [GROK_HOOK_JS, "SessionStart"], {
+      env: {
+        ...process.env,
+        MINNI_HOME: fixture.home,
+        MINNI_SOCKET_PATH: path.join(fixture.home, "missing.sock"),
+        MINNI_AFM_HEALTH_URL: "http://127.0.0.1:1/health",
+        MINNI_BYPASS_AUDIT_LIMIT: "true",
+        MINNI_GROK_VAULT_PATH: fixture.vault,
+        MINNI_GROK_HOOKS: "on",
+      },
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    let stdout = "";
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk;
+    });
+    child.stderr.resume();
+    child.on("error", reject);
+    child.on("close", (code) => resolve({ code, output: JSON.parse(stdout.trim().split("\n").pop()) }));
+    child.stdin.end(JSON.stringify({ session_id: "grok-fixture" }));
+  });
+}
+
+test(
+  "a platform that cannot inject at SessionStart must not have its correction archived",
+  { timeout: 120_000 },
+  async (t) => {
+    const root = await mkdtemp(path.join(tmpdir(), "sm-grok-drop-"));
+    const fixture = {
+      root,
+      vault: path.join(root, "grok-build-vault"),
+      home: path.join(root, "home"),
+    };
+    fixture.inbox = path.join(fixture.vault, "inbox");
+    await mkdir(fixture.inbox, { recursive: true });
+    await mkdir(fixture.home, { recursive: true });
+    const stamp = Date.now() - 86_400_000;
+    await writeFile(
+      path.join(fixture.inbox, inboxName(stamp, "grok-precompact-handoff")),
+      JSON.stringify({
+        slug: "grok-precompact-handoff",
+        kind: "grok_precompact_handoff",
+        agent_id: "grok-build",
+        createdAt: new Date(stamp).toISOString(),
+        stale_belief_events: [CORRECTION],
+      }),
+      "utf8",
+    );
+    t.after(() => rm(root, { recursive: true, force: true }));
+
+    const { output } = await runGrokSessionStart(fixture);
+
+    // Grok's wire declares SessionStart un-injectable (only Stop parses hook
+    // output), so this boot emits a bare noop carrying nothing.
+    assert.equal(
+      output.hookSpecificOutput,
+      undefined,
+      "fixture precondition: grok SessionStart must be a dropped injection",
+    );
+
+    // THE GATE. The noop was written to stdout successfully — but the CORRECTION
+    // never went anywhere. Treating that as delivery archives the only durable
+    // copy of the correction in exchange for output the host ignores.
+    assert.deepEqual(
+      await archivedEntries(fixture),
+      [],
+      "a dropped envelope delivered nothing — the correction it carried must not be consumed",
+    );
+    assert.equal(
+      (await pendingEntries(fixture)).length,
+      1,
+      "the correction must stay re-deliverable when the platform cannot carry it",
+    );
+  },
+);
+
+test(
+  "an EMPTY stash is still cleared on a drop-only platform (no unbounded growth)",
+  { timeout: 120_000 },
+  async (t) => {
+    const root = await mkdtemp(path.join(tmpdir(), "sm-grok-empty-"));
+    const fixture = {
+      root,
+      vault: path.join(root, "grok-build-vault"),
+      home: path.join(root, "home"),
+    };
+    fixture.inbox = path.join(fixture.vault, "inbox");
+    await mkdir(fixture.inbox, { recursive: true });
+    await mkdir(fixture.home, { recursive: true });
+    const stamp = Date.now() - 86_400_000;
+    // codex and grok stash at PreCompact unconditionally, so most of these are
+    // empty. They carry no correction, so clearing them cannot depend on
+    // delivery — if it did, a platform whose wire never injects at SessionStart
+    // would accumulate one file per compaction cycle forever.
+    await writeFile(
+      path.join(fixture.inbox, inboxName(stamp, "grok-precompact-handoff")),
+      JSON.stringify({
+        slug: "grok-precompact-handoff",
+        kind: "grok_precompact_handoff",
+        agent_id: "grok-build",
+        createdAt: new Date(stamp).toISOString(),
+        stale_belief_events: [],
+      }),
+      "utf8",
+    );
+    t.after(() => rm(root, { recursive: true, force: true }));
+
+    await runGrokSessionStart(fixture);
+
+    assert.equal(
+      (await archivedEntries(fixture)).length,
+      1,
+      "an empty stash carries nothing, so a dropped envelope must not keep it alive",
+    );
+    assert.equal((await pendingEntries(fixture)).length, 0);
+  },
+);
+
 test("an exhausted budget does not orphan the rejection of the work it abandons", async () => {
   const { withBudget } = await import("../dist/hook-utils.js");
   // withBudget's argument is an ALREADY-RUNNING promise, so the zero-budget

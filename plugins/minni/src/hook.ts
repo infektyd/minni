@@ -319,12 +319,22 @@ async function handleSessionStart(payload: Record<string, unknown>): Promise<Hoo
   // R2: settle AFTER the envelope reaches the host, never before. Archiving
   // here would consume the correction inside the window where the boot can
   // still be killed, losing it for good — see hook-delivery.ts.
-  deferUntilDelivered(() =>
+  //
+  // Conditional on this envelope actually CARRYING something: when nothing was
+  // injected, the consumed paths are empty stashes, which carry no correction,
+  // so clearing them does not depend on delivery. (Parity with the factory —
+  // claude-code can always inject at SessionStart, so its envelope is never
+  // wire-dropped, but the rule belongs on both paths rather than in one.)
+  const settleReassert = (): Promise<void> =>
     settleReassertedInboxEntries(CLAUDECODE_VAULT_PATH, {
       consumedPaths: reassertConsumed,
       deferredTails: reassertDeferred,
-    }),
-  );
+    });
+  if (correctionsReassert.length > 0) {
+    deferUntilDelivered(settleReassert);
+  } else {
+    await settleReassert();
+  }
 
   const envelopeBody: any = {
     contract: MEMORY_CONTRACT,

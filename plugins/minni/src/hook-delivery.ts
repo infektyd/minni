@@ -24,6 +24,25 @@ import { recordAudit } from "./vault.js";
 export type DeliveryCommit = () => Promise<void>;
 
 const pendingCommits: DeliveryCommit[] = [];
+let outputDropped = false;
+
+/**
+ * Record that the platform wire could not carry this output — the payload never
+ * went on the wire, and what will be written instead is a noop the host ignores.
+ *
+ * This is a SECOND way to fail to deliver, and the one that is easy to miss: the
+ * stdout write SUCCEEDS, so a flush-only definition of "delivered" reports it as
+ * a success and consumes whatever the payload was carrying. Grok is the live
+ * case — its wire declares SessionStart un-injectable, so a boot envelope full
+ * of corrections renders as `{continue:true}` and the corrections reach nobody.
+ * Archiving them on the strength of that write destroys the only durable copy.
+ *
+ * Delivery therefore means BOTH: the envelope went on the wire, and the bytes
+ * reached the host.
+ */
+export function markOutputDropped(): void {
+  outputDropped = true;
+}
 
 /**
  * Register work that must not run until this hook's output reaches the host.
@@ -42,11 +61,13 @@ export function pendingDeliveryCommitCount(): number {
 /** Drop every deferred commit unrun (the output never landed). */
 export function discardDeliveryCommits(): void {
   pendingCommits.length = 0;
+  outputDropped = false;
 }
 
 /** Run and clear every deferred commit, in registration order. */
 export async function runDeliveryCommits(): Promise<void> {
   const commits = pendingCommits.splice(0);
+  outputDropped = false;
   for (const commit of commits) {
     try {
       await commit();
@@ -76,20 +97,26 @@ export async function emitAndCommit(
   output: object,
   context: DeliveryContext,
 ): Promise<boolean> {
-  const delivered = await emitDelivered(output);
-  if (delivered) {
+  const dropped = outputDropped;
+  const flushed = await emitDelivered(output);
+  // BOTH conditions, not either: a dropped envelope still flushes (as a noop),
+  // and a flushed noop delivered nothing.
+  if (flushed && !dropped) {
     await runDeliveryCommits();
     return true;
   }
   const abandoned = pendingDeliveryCommitCount();
   discardDeliveryCommits();
+  if (abandoned === 0) return false;
   try {
     await recordAudit(context.vaultPath, {
       tool: `${context.auditPrefix}_undelivered`,
-      summary: `${context.event}: output never reached the host; ${abandoned} deferred commit(s) rolled back (re-delivers next boot)`,
+      summary: dropped
+        ? `${context.event}: platform cannot carry this output; ${abandoned} deferred commit(s) rolled back (stays re-deliverable)`
+        : `${context.event}: output never reached the host; ${abandoned} deferred commit(s) rolled back (re-delivers next boot)`,
     });
   } catch {
-    // stdout is already gone; an unavailable audit must not throw on top of it.
+    // stdout may already be gone; an unavailable audit must not throw on top.
   }
   return false;
 }

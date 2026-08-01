@@ -881,7 +881,27 @@ for (const hook of HOOK_MATRIX) {
     //    corrections_reassert even before the daemon is consulted.
     const boot = await runHook("SessionStart", env, {}, hook.bin);
     const body = bootEnvelope(boot, hook);
-    if (!body) return; // platform cannot deliver at SessionStart; contract asserted above
+    if (!body) {
+      // The platform cannot inject at SessionStart, so the correction reached
+      // nobody. Returning here used to end the test — which is what hid the
+      // real failure: the boot emitted a noop, the noop flushed fine, and the
+      // stash was archived anyway. Nothing delivered means nothing consumed, so
+      // the entry must still be on disk and re-deliverable.
+      const afterDrop = (await readdir(inboxDir)).filter((f) => f.endsWith(".json"));
+      assert.deepEqual(
+        afterDrop,
+        inboxFiles,
+        `${hook.name} cannot carry the envelope at SessionStart, so the stashed ` +
+          "correction must survive rather than be consumed by an undelivered boot",
+      );
+      const archived = await readdir(path.join(inboxDir, ".archive")).catch(() => []);
+      assert.deepEqual(
+        archived.filter((f) => f.endsWith(".json")),
+        [],
+        "a dropped envelope must archive nothing",
+      );
+      return;
+    }
     assert.ok(Array.isArray(body.corrections_reassert), "boot must re-assert stashed corrections");
     assert.equal(body.corrections_reassert[0].superseded_learning_id, 7);
 

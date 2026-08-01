@@ -34,7 +34,12 @@ import {
   workspaceFromPayload,
 } from "./hook-utils.js";
 import type { HookOutput } from "./hook-utils.js";
-import { deferUntilDelivered, discardDeliveryCommits, emitAndCommit } from "./hook-delivery.js";
+import {
+  deferUntilDelivered,
+  discardDeliveryCommits,
+  emitAndCommit,
+  markOutputDropped,
+} from "./hook-delivery.js";
 import { harvestSummaryText } from "./compact-harvest.js";
 import { injectIntent, noIntent, noteIntent } from "./hook-intent.js";
 import type { HookIntent } from "./hook-intent.js";
@@ -428,6 +433,10 @@ export function createHookHandlers(
   const render = async (intent: HookIntent): Promise<HookOutput> => {
     const { output, dropped } = renderIntent(wire, intent);
     if (dropped) {
+      // The payload never went on the wire, so nothing it was carrying may be
+      // consumed — see markOutputDropped. The write below still SUCCEEDS (it is
+      // a noop), which is exactly why the flush alone cannot be trusted.
+      markOutputDropped();
       try {
         await recordAudit(config.vaultPath, {
           tool: `${config.auditPrefix}_intent_dropped`,
@@ -553,12 +562,23 @@ export function createHookHandlers(
     // R2: settle AFTER the envelope reaches the host, never before. Archiving
     // here would consume the correction inside the window where the boot can
     // still be killed, losing it for good — see hook-delivery.ts.
-    deferUntilDelivered(() =>
+    //
+    // The deferral is conditional on this envelope actually CARRYING something.
+    // When nothing was injected, the consumed paths are empty stashes (codex and
+    // grok stash unconditionally at PreCompact) — those carry no correction, so
+    // clearing them does not depend on delivery, and making it depend would let
+    // one file per compaction cycle pile up forever on a platform whose wire can
+    // never inject at SessionStart.
+    const settleReassert = (): Promise<void> =>
       settleReassertedInboxEntries(config.vaultPath, {
         consumedPaths: reassertConsumed,
         deferredTails: reassertDeferred,
-      }),
-    );
+      });
+    if (correctionsReassert.length > 0) {
+      deferUntilDelivered(settleReassert);
+    } else {
+      await settleReassert();
+    }
 
     // Plan parity (audit C5): SessionStart injects the FULL active-plan view for
     // boot/rehydration, exactly like the claude-code hook.
