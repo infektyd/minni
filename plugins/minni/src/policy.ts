@@ -370,12 +370,54 @@ export function detectSecretMaterial(content: string): string | null {
   return null;
 }
 
-export function assessLearningQuality(input: {
+/** The marker that makes a warning a hard block rather than a quality nudge. */
+const SENSITIVE_MATERIAL_MARKER = "sensitive material";
+
+function isSensitiveMaterialWarning(warning: string): boolean {
+  return warning.includes(SENSITIVE_MATERIAL_MARKER);
+}
+
+/** True when the gate flagged credential material in any persisted channel. */
+export function flagsSensitiveMaterial(report: LearningQualityReport): boolean {
+  return report.warnings.some(isSensitiveMaterialWarning);
+}
+
+/**
+ * A blocked learning's TITLE can itself be the credential — that is precisely
+ * the hole this gate closes — so callers must not echo it into the audit log
+ * or any other record. Blocking the vault write while logging the secret
+ * verbatim would move the leak rather than close it.
+ */
+export function auditSafeTitle(title: string, report: LearningQualityReport): string {
+  return flagsSensitiveMaterial(report) ? "[title withheld: flagged sensitive material]" : title;
+}
+
+export interface LearningInput {
   title: string;
   content: string;
   category?: string;
   source?: string;
-}): LearningQualityReport {
+}
+
+/**
+ * Every channel `minni_learn` persists into the vault note, in the order the
+ * note carries them. The gate scanned `content` alone while all four are
+ * written to disk, so a `ghp_…` pasted into a title or a source attribution
+ * was stored unscanned. Detection must cover what is persisted, not just the
+ * field most likely to hold prose.
+ */
+function persistedChannels(input: LearningInput): Array<{ field: string; text: string }> {
+  return (
+    [
+      { field: "title", text: input.title },
+      { field: "content", text: input.content },
+      { field: "category", text: input.category },
+      { field: "source", text: input.source },
+    ] as Array<{ field: string; text?: string }>
+  ).flatMap(({ field, text }) => (text?.trim() ? [{ field, text }] : []));
+}
+
+export function assessLearningQuality(input: LearningInput): LearningQualityReport {
   // Regex-only fast path. Learn / quality MCP + CLI use
   // `assessLearningQualityAsync` so the #147 AFM inconclusive tier runs.
   const warnings: string[] = [];
@@ -400,18 +442,20 @@ export function assessLearningQuality(input: {
     warnings.push("Content has vague wording; prefer specific facts and decisions.");
   }
 
-  const secretMaterial = detectSecretMaterial(content);
-  if (secretMaterial) {
+  for (const channel of persistedChannels(input)) {
+    const secretMaterial = detectSecretMaterial(channel.text);
+    if (!secretMaterial) continue;
     score -= 0.3;
+    // The field is named but the offending value is never echoed back.
     warnings.push(
-      `Content appears to contain sensitive material (${secretMaterial}); ` +
-        "never store secrets in memory.",
+      `The "${channel.field}" field appears to contain sensitive material ` +
+        `(${secretMaterial}); never store secrets in memory.`,
     );
   }
 
   const normalized = clampScore(score);
   return {
-    ok: normalized >= 0.6 && !warnings.some((warning) => warning.includes("sensitive material")),
+    ok: normalized >= 0.6 && !warnings.some(isSensitiveMaterialWarning),
     score: normalized,
     warnings,
     summary: warnings.length === 0 ? "Learning looks durable and specific." : warnings.join(" "),
@@ -428,22 +472,27 @@ export function assessLearningQuality(input: {
  * regex result unchanged (fail-open — AFM enhances, it does not replace).
  */
 export async function assessLearningQualityAsync(
-  input: {
-    title: string;
-    content: string;
-    category?: string;
-    source?: string;
-  },
+  input: LearningInput,
   options: {
     classifyInconclusive?: InconclusiveCredentialClassifier;
   } = {},
 ): Promise<LearningQualityReport> {
   const base = assessLearningQuality(input);
-  if (!base.ok && base.warnings.some((w) => w.includes("sensitive material"))) {
+  if (!base.ok && flagsSensitiveMaterial(base)) {
     return base;
   }
 
-  const spans = findInconclusiveHighRiskAssignments(input.content.trim());
+  // Each persisted channel is scanned separately rather than concatenated:
+  // the span finder is line-bounded, and joining fields would let one field's
+  // tail run into the next field's text. The field is kept alongside its spans
+  // so a block can name where the material was found.
+  const flagged = persistedChannels(input)
+    .map((channel) => ({
+      field: channel.field,
+      spans: findInconclusiveHighRiskAssignments(channel.text.trim()),
+    }))
+    .filter((channel) => channel.spans.length > 0);
+  const spans = flagged.flatMap((channel) => channel.spans);
   if (spans.length === 0) return base;
 
   // Lazy default import keeps the sync path free of AFM for unit tests /
@@ -463,9 +512,13 @@ export async function assessLearningQualityAsync(
 
   const keywords = [...new Set(spans.map((s) => s.keyword))];
   const keywordLabel = keywords.length === 1 ? keywords[0] : keywords.join("/");
+  // The classifier returns ONE verdict over the whole span set, so it cannot
+  // attribute the material to a single channel. Every field that contributed a
+  // span is named — narrowing further would be a guess.
+  const fieldLabel = flagged.map((channel) => `"${channel.field}"`).join(", ");
   const warnings = [
     ...base.warnings,
-    "Content appears to contain sensitive material " +
+    `The ${fieldLabel} field appears to contain sensitive material ` +
       `(a credential keyword ("${keywordLabel ?? "password"}") assigned an ` +
       "unquoted multi-word value classified as a secret); never store secrets in memory.",
   ];

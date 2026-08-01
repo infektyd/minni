@@ -12,7 +12,7 @@ import {
   DEFAULT_VAULT_PATH,
   DEFAULT_WORKSPACE_ID,
 } from "./config.js";
-import { assessLearningQualityAsync, routeMemoryIntent } from "./policy.js";
+import { assessLearningQualityAsync, auditSafeTitle, flagsSensitiveMaterial, routeMemoryIntent } from "./policy.js";
 import {
   ackHandoff,
   awaitHandoff,
@@ -665,10 +665,24 @@ server.registerTool(
   async ({ title, content, category, source, workspaceId, requireQuality }) => {
     // Async path includes the #147 AFM inconclusive tier (regex remains fast path).
     const quality = await assessLearningQualityAsync({ title, content, category, source });
+    // `requireQuality:false` opts out of the QUALITY FLOOR — a weak-but-clean
+    // note still writes. It is not a secret allowlist, and the docs never
+    // offered it as one. Credential material is unconditional, matching the
+    // CLI path; otherwise an agent-settable boolean re-opens the exact hole
+    // the channel scan closes.
+    if (requireQuality === false && flagsSensitiveMaterial(quality)) {
+      await recordAudit(DEFAULT_VAULT_PATH, {
+        tool: "minni_learn",
+        summary: `quality-blocked (credential material, not opt-outable): ${auditSafeTitle(title, quality)}`,
+        details: { quality },
+      });
+      return textResult(JSON.stringify({ status: "quality-blocked", quality }, null, 2));
+    }
     if (requireQuality !== false && !quality.ok) {
       await recordAudit(DEFAULT_VAULT_PATH, {
         tool: "minni_learn",
-        summary: `quality-blocked: ${title}`,
+        // The title itself may be the credential the gate just blocked.
+        summary: `quality-blocked: ${auditSafeTitle(title, quality)}`,
         details: { quality },
       });
       return textResult(
@@ -778,7 +792,7 @@ server.registerTool(
     const quality = await assessLearningQualityAsync({ title, content, category, source });
     await recordAudit(DEFAULT_VAULT_PATH, {
       tool: "minni_learning_quality",
-      summary: title,
+      summary: auditSafeTitle(title, quality),
       details: { quality },
     });
     return textResult(JSON.stringify(quality, null, 2));
