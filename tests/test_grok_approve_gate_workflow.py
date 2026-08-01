@@ -60,6 +60,19 @@ def test_ci_completion_uses_workflow_run_not_check_suite(gate):
     assert "Grok Code Review" in listed
 
 
+def test_gate_does_not_wake_for_ci_completing_on_main(gate):
+    """workflow_run branch filters match the TRIGGERING run's head branch. CI
+    completing on main starts a gate run that resolves main's SHA, finds no open
+    PR and skips — pure waste, and it got worse when the workflows list was
+    widened. PR-branch CI must still fire, since that is the only case that can
+    produce a decision."""
+    wr = _triggers(gate)["workflow_run"]
+    assert wr.get("branches-ignore") == ["main"]
+    # A `branches` allowlist would be the wrong shape here: it would silently
+    # drop every future PR branch that does not match the pattern.
+    assert "branches" not in wr
+
+
 def test_gate_timeout_covers_the_api_budget(gate):
     """Three observation rounds of ~8 calls at a 15s API timeout is ~360s; at
     timeout-minutes: 5 the job could be killed mid-decision."""

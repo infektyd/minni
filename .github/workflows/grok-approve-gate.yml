@@ -26,6 +26,12 @@ on:
       - "PR Hygiene"
       - "Claude Code Review"
     types: [completed]
+    # Branch filters here match the TRIGGERING run's head branch. CI completing
+    # on main starts a gate run that resolves main's SHA, finds no open PR and
+    # skips — seven such no-ops in one twelve-minute window, once the workflow
+    # list above was widened. PR-branch CI still fires, which is the only case
+    # that can ever produce a decision.
+    branches-ignore: [main]
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
   # Without this, a REQUEST_CHANGES submitted AFTER the check went green never
