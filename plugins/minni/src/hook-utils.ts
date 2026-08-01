@@ -178,6 +178,63 @@ export function emit(output: object): void {
   process.stdout.write(`${JSON.stringify(output)}\n`);
 }
 
+/**
+ * Default internal time budget for a prompt-time hook, in ms.
+ *
+ * This exists because the HARNESS deadline is not ours to negotiate: Claude Code
+ * kills a UserPromptSubmit hook at 30s and DISCARDS its output entirely ("hook
+ * timed out after 30s — output discarded"), so an overrun costs the whole turn's
+ * recall injection, corrections matching and active-plan pointer — silently.
+ * A hook that is merely slow is worse than a hook that gives up: the slow one
+ * loses everything, the quitter still emits the pointers it already has.
+ *
+ * 8s is chosen well under the 30s kill so there is room left to write the
+ * envelope and audit after the budget trips, and above the warm-daemon search
+ * p95 (~4s observed) so a healthy daemon is never cut off. The pathological case
+ * this bounds is a COLD daemon: the first search after a restart lazily loads
+ * the embedder, cross-encoder and FAISS index — a path that also makes live
+ * HuggingFace HTTP calls — and can exceed 30s on its own.
+ *
+ * Override with MINNI_HOOK_BUDGET_MS.
+ */
+export const DEFAULT_HOOK_BUDGET_MS = 8000;
+
+/** The internal hook time budget in ms (MINNI_HOOK_BUDGET_MS, else the default). */
+export function hookBudgetMs(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = Number(env.MINNI_HOOK_BUDGET_MS);
+  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_HOOK_BUDGET_MS;
+}
+
+/**
+ * Resolve `work` with `fallback` if it has not settled within `ms`.
+ *
+ * BELT-AND-BRACES ONLY. Racing a promise does not make a node process exit — an
+ * in-flight socket handle keeps the event loop alive long after the winner
+ * resolves — so the load-bearing deadline is the one threaded down into the
+ * JSON-RPC call itself (`timeoutMs`), which destroys the socket. This wrapper
+ * covers the stalls that are NOT the daemon socket (a wedged filesystem under
+ * the vault search, say), where nothing else would give up.
+ */
+export function withBudget<T>(work: Promise<T>, ms: number, fallback: T): Promise<T> {
+  if (ms <= 0) return Promise.resolve(fallback);
+  return new Promise<T>((resolve) => {
+    // unref so this timer alone never holds the process open: if `work` settles
+    // and the loop is otherwise drained, the hook must exit immediately.
+    const timer = setTimeout(() => resolve(fallback), ms);
+    timer.unref?.();
+    work.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      () => {
+        clearTimeout(timer);
+        resolve(fallback);
+      },
+    );
+  });
+}
+
 export function asString(value: unknown, fallback = ""): string {
   return typeof value === "string" ? value : fallback;
 }

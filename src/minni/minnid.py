@@ -974,6 +974,55 @@ def _vault_watch_enabled() -> bool:
     return (os.environ.get("MINNI_VAULT_WATCH", "on") or "on").strip().lower() != "off"
 
 
+def _warmup_enabled() -> bool:
+    """Preload retrieval models at daemon start (MINNI_WARMUP=off to disable)."""
+    return (os.environ.get("MINNI_WARMUP", "on") or "on").strip().lower() != "off"
+
+
+def _warmup_models() -> None:
+    """
+    Load the retrieval models the first search would otherwise load lazily.
+
+    Why this exists: every model is a first-call ``functools.cache`` singleton
+    (``minni.models.get_embedder`` / ``get_cross_encoder``), and the FAISS index
+    is loaded on demand too. That means the FIRST search after a daemon restart
+    pays the whole cold cost inside the caller's request — and that caller is
+    often a prompt-time hook on a harness deadline it cannot extend (Claude Code
+    discards a UserPromptSubmit hook's output at 30s). The load also issues live
+    HuggingFace HTTP calls to revalidate the cache, so it is not even bounded by
+    local disk speed.
+
+    Moving that cost to daemon start makes it invisible: nobody is waiting.
+
+    Best-effort by contract — a warmup failure must never stop the daemon from
+    serving. The lazy path is still there and still correct; warmup only decides
+    WHO waits for it.
+    """
+    start = time.monotonic()
+    try:
+        from minni.models import get_cross_encoder, get_embedder
+
+        get_embedder()
+        if DEFAULT_CONFIG.reranker_enabled:
+            get_cross_encoder()
+        _lazy_retrieval()
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("warmup failed after %.1fs: %s", time.monotonic() - start, exc)
+        return
+    logger.info("warmup complete in %.1fs (embedder, reranker, retrieval engine)", time.monotonic() - start)
+
+
+async def _warmup_runner() -> None:
+    """
+    Run the warmup OFF the event loop, in a worker thread.
+
+    The loads are synchronous and CPU/network-bound for seconds; doing them
+    inline would block the accept loop and turn "slow first search" into
+    "daemon unreachable", which is strictly worse than the bug being fixed.
+    """
+    await asyncio.to_thread(_warmup_models)
+
+
 def _vault_watch_interval() -> int:
     try:
         raw = int(os.environ.get("MINNI_VAULT_WATCH_INTERVAL", "300"))
@@ -1537,6 +1586,13 @@ def main():
     if _vault_watch_enabled():
         vault_watch_task = loop.create_task(_vault_watch_runner())
 
+    # Model warmup. Scheduled AFTER the socket is being served, so the daemon is
+    # answerable during the load: an early caller still gets the lazy path, it
+    # just no longer has to be the one that pays for it.
+    warmup_task = None
+    if _warmup_enabled():
+        warmup_task = loop.create_task(_warmup_runner())
+
     def _shutdown(signum, frame):
         nonlocal _running
         sig_name = signal.Signals(signum).name
@@ -1551,6 +1607,8 @@ def main():
             afm_task.cancel()
         if vault_watch_task is not None:
             vault_watch_task.cancel()
+        if warmup_task is not None:
+            warmup_task.cancel()
 
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGINT, _shutdown)
