@@ -290,8 +290,13 @@ jobs:
    branch returns 404. Either land the throwaway on main (and delete it after
    use, as above), or skip the throwaway entirely: a gate run on a real PR
    exercises the same mint + protection read and reports the same failure
-   modes by name (`no app token` at the mint step, `cannot read protection`
-   for a 403), so one canary PR is an equivalent probe.
+   modes (`APP_TOKEN is empty` as a hard job failure when the App token is
+   missing or the mint step is skipped/fails — no check is posted in that
+   case; check title `cannot read protection` for a 403), so one canary PR
+   is an equivalent probe of mint + protection read. The canary must clear
+   the path filter for that equivalence to hold: a PR touching `.github/`
+   (or any denied path) goes red on path-deny before the protection read
+   is ever reached — use a docs-only change.
 2. **Bind the required context to the App's `app_id`**, not a bare name.
 
 Classic branch protection already supports this and this repo already uses it:
