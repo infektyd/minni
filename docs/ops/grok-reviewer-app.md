@@ -284,6 +284,22 @@ jobs:
 
    Bind nothing until that prints the JSON. A 403 means the permission grant
    has not been accepted on the installation yet.
+
+   Caveat, proven by execution: `workflow_dispatch` only registers workflows
+   that exist on the **default branch** — dispatching this file from a topic
+   branch returns 404. Either land the throwaway on main (and delete it after
+   use, as above), or skip the throwaway entirely: a gate run on a real PR
+   exercises the same mint + protection read, so one canary PR is an
+   equivalent probe. The failure modes it reports, by case: skipped or
+   empty mint (`GROK_APP_ID` unset) → hard job failure logging
+   `APP_TOKEN is empty`, no check posted; mint **action** failure (bad
+   key, permission not granted) → red mint step, no check posted and no
+   gate log line at all; token OK but `administration: read` missing →
+   check titled `cannot read protection`. Path-deny does not
+   short-circuit the probe: protection is read during gathering, before
+   the path filter is applied, and a 403 still posts
+   `cannot read protection`. Prefer a docs-only canary anyway, so a
+   successful probe is not masked by a `path filter` failure title.
 2. **Bind the required context to the App's `app_id`**, not a bare name.
 
 Classic branch protection already supports this and this repo already uses it:
