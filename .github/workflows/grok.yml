@@ -125,10 +125,16 @@ jobs:
 
       - name: Run Grok
         run: |
+          # Deny rules are the hard boundary behind --always-approve (see
+          # grok-review.yml's note; adopted from Grok's own review of #216).
           grok --prompt-file /tmp/grok-prompt.md \
             --always-approve \
             --no-subagents \
             --max-turns 30 \
+            --deny "Read($HOME/.grok/**)" \
+            --deny 'Bash(curl *)' \
+            --deny 'Bash(wget *)' \
+            --disable-web-search \
             --output-format plain > /tmp/grok-reply.md
           # Never post an empty comment.
           [ -s /tmp/grok-reply.md ] || echo "_Grok returned no output (see workflow logs)._" > /tmp/grok-reply.md

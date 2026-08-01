@@ -89,19 +89,20 @@ jobs:
 
       - name: Run Grok review
         run: |
-          echo "::group::grok environment"
-          grok version || true
-          grok models 2>&1 | head -15 || true
-          echo "::endgroup::"
+          # --always-approve keeps the tool loop unstarved (dontAsk cancels on
+          # the first approval-needing tool); the deny rules are the HARD
+          # boundary Grok's own review of #216 called for - prompt prose alone
+          # does not survive determined tool use. No debug instrumentation
+          # here: Actions logs are durable and public on this repo.
           grok --prompt-file /tmp/grok-prompt.md \
             --always-approve \
             --no-subagents \
             --max-turns 30 \
-            --debug --debug-file /tmp/grok-debug.log \
+            --deny "Read($HOME/.grok/**)" \
+            --deny 'Bash(curl *)' \
+            --deny 'Bash(wget *)' \
+            --disable-web-search \
             --output-format plain > /tmp/grok-reply.md
-          echo "::group::grok debug tail"
-          tail -c 6000 /tmp/grok-debug.log || true
-          echo "::endgroup::"
           [ -s /tmp/grok-reply.md ] || echo "_Grok returned no output (see workflow logs)._" > /tmp/grok-reply.md
 
       - name: Post review comment
