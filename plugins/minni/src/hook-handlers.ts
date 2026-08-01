@@ -455,18 +455,21 @@ export function createHookHandlers(
     const rawSessionId = asString(payload.session_id) || asString(payload.sessionId);
     const sessionId = rawSessionId || "session";
     const workspaceId = workspaceFor(payload);
-    await ensureVault(config.vaultPath);
-
     // BOOT BUDGET: platforms kill SessionStart and DISCARD its output — gemini
     // at 10s (hooks-gemini.json). A boot that overruns loses the whole envelope,
     // so we own a shorter deadline and deliver whatever landed inside it. The
     // deadline is ABSOLUTE and shared: each read gets only what is left, and
     // once it is spent the rest resolve instantly with their degraded value so
     // the envelope — and, critically, the corrections below — still ship.
+    //
+    // The clock starts at handler ENTRY: the harness deadline runs from process
+    // start, so any setup done first (vault creation, and on claude-code the
+    // compaction harvest) is time already spent against it.
     const budgetMs = effectiveHookBudgetMs(config.sessionStartHookTimeoutMs);
     const deadline = Date.now() + budgetMs;
     const remainingMs = (): number => Math.max(0, deadline - Date.now());
     const rpcTimedOut = { ok: false as const, error: JSON_RPC_TIMEOUT_ERROR };
+    await ensureVault(config.vaultPath);
 
     // TTL-reap stale file handoffs BEFORE the honest read so they neither occupy
     // the capped slice nor inflate totals; they surface once below as 'expired'.

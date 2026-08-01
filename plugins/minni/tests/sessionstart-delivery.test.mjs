@@ -101,10 +101,10 @@ async function archivedEntries(fixture) {
 }
 
 /** A normal SessionStart run: returns the parsed envelope body. */
-function runSessionStart(fixture) {
+function runSessionStart(fixture, extraEnv = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [HOOK_JS, "SessionStart"], {
-      env: hookEnv(fixture),
+      env: { ...hookEnv(fixture), ...extraEnv },
       stdio: ["pipe", "pipe", "pipe"],
     });
     let stdout = "";
@@ -306,6 +306,33 @@ test("a throwing commit does not block the commits after it", async (t) => {
   await runDeliveryCommits();
   assert.deepEqual(ran, ["after"], "a failed cleanup must not lose the rest");
 });
+
+test(
+  "corrections still re-inject when the budget is fully spent — reassert never rides a budgeted read",
+  { timeout: 120_000 },
+  async (t) => {
+    const fixture = await makeFixture();
+    t.after(() => rm(fixture.root, { recursive: true, force: true }));
+
+    // A 1ms budget: every budgeted read degrades. The correction must NOT — a
+    // post-compaction boot with a spent budget is precisely the boot this whole
+    // path exists to serve, and reading corrections off the budgeted inbox read
+    // would silently inject nothing here.
+    const body = await runSessionStart(fixture, { MINNI_HOOK_BUDGET_MS: "1" });
+
+    assert.deepEqual(
+      body.corrections_reassert,
+      [CORRECTION],
+      "a spent budget may drop CONTEXT, never a stashed correction",
+    );
+    assert.ok(
+      Array.isArray(body.degraded?.sections) && body.degraded.sections.length > 0,
+      "a boot this degraded must say so rather than look clean",
+    );
+    // Still exactly-once: delivered, so archived.
+    assert.equal((await archivedEntries(fixture)).length, 1);
+  },
+);
 
 test("an exhausted budget does not orphan the rejection of the work it abandons", async () => {
   const { withBudget } = await import("../dist/hook-utils.js");

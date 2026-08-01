@@ -82,6 +82,7 @@ import {
   buildPendingLearningsSection,
   expireStaleInboxHandoffs,
   readInboxStatus,
+  readReassertPending,
   recordAudit,
   resolveInboxHandoffContext,
   searchVaultNotes,
@@ -112,6 +113,22 @@ async function handleSessionStart(payload: Record<string, unknown>): Promise<Hoo
   // defaulted value for envelope identity / inbox filenames / markers.
   const rawSessionId = asString(payload.session_id) || asString(payload.sessionId);
   const sessionId = rawSessionId || "session";
+  // BOOT BUDGET (parity with the shared factory): a boot that overruns the
+  // host's SessionStart deadline is killed and its output DISCARDED, losing
+  // identity, corrections and the active plan in one go. We own a shorter,
+  // ABSOLUTE deadline and ship whatever landed inside it. These reads were also
+  // strictly sequential, so a single cold RPC used to push every later one past
+  // the deadline; the independent ones now share the clock concurrently.
+  //
+  // The clock starts HERE, at handler entry, not after the compaction harvest
+  // below. The harness deadline runs from process start, so a budget that began
+  // after an expensive harvest would be measuring the wrong interval and could
+  // still overrun — on `compact`/`resume` boots, which is exactly when there is
+  // a correction waiting to be re-asserted.
+  const budgetMs = effectiveHookBudgetMs(CLAUDECODE_SESSION_START_TIMEOUT_MS);
+  const deadline = Date.now() + budgetMs;
+  const remainingMs = (): number => Math.max(0, deadline - Date.now());
+  const rpcTimedOut = { ok: false as const, error: JSON_RPC_TIMEOUT_ERROR };
   await ensureVault(CLAUDECODE_VAULT_PATH);
   // Compaction-summary harvest BACKSTOP (plan-3e5a410b9ab6f715). The primary
   // delivery is the PostCompact hook below, which receives the summary
@@ -144,17 +161,6 @@ async function handleSessionStart(payload: Record<string, unknown>): Promise<Hoo
     session_id: sessionId,
     emphasized: [],
   }).catch(() => {});
-  // BOOT BUDGET (parity with the shared factory): a boot that overruns the
-  // host's SessionStart deadline is killed and its output DISCARDED, losing
-  // identity, corrections and the active plan in one go. We own a shorter,
-  // ABSOLUTE deadline and ship whatever landed inside it. These reads were also
-  // strictly sequential, so a single cold RPC used to push every later one past
-  // the deadline; the independent ones now share the clock concurrently.
-  const budgetMs = effectiveHookBudgetMs(CLAUDECODE_SESSION_START_TIMEOUT_MS);
-  const deadline = Date.now() + budgetMs;
-  const remainingMs = (): number => Math.max(0, deadline - Date.now());
-  const rpcTimedOut = { ok: false as const, error: JSON_RPC_TIMEOUT_ERROR };
-
   // TTL-reap stale file handoffs BEFORE the honest read so they neither occupy
   // the capped slice nor inflate totals; they surface once below as 'expired'.
   // SEQUENTIAL on purpose: readInboxStatus below counts what is on disk, so
@@ -296,8 +302,20 @@ async function handleSessionStart(payload: Record<string, unknown>): Promise<Hoo
   // Only fully-consumed entries are cleared (exactly-once re-injection, no
   // unbounded inbox growth); cap-overflowed tails are rewritten for the next
   // boot, and all-malformed entries survive for inspection.
+  //
+  // Its OWN read, deliberately UNBUDGETED — it must not ride the budgeted
+  // `readInboxStatus` above. That read degrades to undefined when the budget is
+  // spent, and reassert would then see an empty `pending` and silently inject
+  // nothing: the post-compaction boot, the one this whole path exists for,
+  // would come up with no corrections. This is cheap local FS and it is the one
+  // read whose absence loses data rather than context.
+  //
+  // readReassertPending (not readInboxStatus) is also the I5 window: it filters
+  // to entries that actually carry stale-belief events before taking newest-N,
+  // so unrelated inbox files cannot crowd a valid correction out of the slots.
+  const reassertPending = await readReassertPending(CLAUDECODE_VAULT_PATH, 3);
   const { events: correctionsReassert, consumedPaths: reassertConsumed, deferredTails: reassertDeferred } =
-    collectCorrectionsReassert(pending);
+    collectCorrectionsReassert(reassertPending);
   // R2: settle AFTER the envelope reaches the host, never before. Archiving
   // here would consume the correction inside the window where the boot can
   // still be killed, losing it for good — see hook-delivery.ts.
