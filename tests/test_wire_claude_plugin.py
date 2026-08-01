@@ -8,6 +8,7 @@ refuses to delete a tree anything still points into.
 from __future__ import annotations
 
 import json
+import unicodedata
 from pathlib import Path
 
 import pytest
@@ -529,17 +530,44 @@ def test_remove_legacy_cache_gate_ignores_tilde_prose(home):
     assert remove_legacy_cache(root)["changed"] is True
 
 
-def test_remove_legacy_cache_refusal_quotes_the_offending_text(home):
+def test_remove_legacy_cache_refusal_names_the_field_but_leaks_no_secrets(home):
+    """The embedded-string branch fires exactly where people inline tokens.
+
+    It must point at the offending field without copying the surrounding text
+    into stderr, CI logs and bug reports.
+    """
     (legacy_cache_root() / "minni" / "0.3.0").mkdir(parents=True)
     root = _install_tree(home, "0.4.0")
     hook = legacy_cache_root() / "minni" / "0.3.0" / "dist" / "hook.js"
     cfg = home / ".claude" / "settings.json"
     cfg.parent.mkdir(parents=True, exist_ok=True)
-    cfg.write_text(json.dumps({"h": f"node {hook} SessionStart"}), encoding="utf-8")
+    cfg.write_text(json.dumps({
+        "hooks": {"SessionStart": [{"hooks": [
+            # Stands in for the credential people really do inline here.
+            {"command": f"--auth CANARY-4f9a2b7c node {hook} SessionStart"},
+        ]}]},
+    }), encoding="utf-8")
 
     with pytest.raises(ClaudePluginError) as exc:
         remove_legacy_cache(root)
-    assert "hook.js" in str(exc.value), "refusal must show what to fix"
+    message = str(exc.value)
+    assert "hooks.SessionStart[0].hooks[0].command" in message, "must name the field"
+    assert "CANARY-4f9a2b7c" not in message, "refusal echoed the surrounding text"
+
+
+def test_remove_legacy_cache_catches_an_nfd_spelled_reference(tmp_path, monkeypatch):
+    """macOS treats NFC and NFD as the same file; string comparison does not."""
+    fake_home = tmp_path / unicodedata.normalize("NFC", "hem-åäö")
+    fake_home.mkdir()
+    monkeypatch.setenv("HOME", str(fake_home))
+    (legacy_cache_root() / "minni" / "0.3.0").mkdir(parents=True)
+    root = _install_tree(fake_home, "0.4.0")
+    nfd = unicodedata.normalize("NFD", str(legacy_cache_root() / "minni" / "0.3.0"))
+    cfg = fake_home / ".claude.json"
+    cfg.write_text(json.dumps({"x": {"installPath": nfd}}), encoding="utf-8")
+
+    with pytest.raises(ClaudePluginError, match="still referenced by"):
+        remove_legacy_cache(root)
 
 
 def test_remove_legacy_cache_reports_strays_it_deletes(home):

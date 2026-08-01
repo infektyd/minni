@@ -161,36 +161,44 @@ properties rather than relying on the earlier steps having done their job:
   nothing references the tree. `known_marketplaces.json` is deliberately not
   scanned — its `minni` entry is the one reference step 3 retires itself.
 
-  The check is two-layer. Structured matching (`Path.relative_to`) produces the
-  precise "file: field -> path" message, but it only recognises a string that
-  *is* a lexically-normal absolute path. Claude Code's hook entries are shell
-  command strings — `"node <path>/dist/hook.js SessionStart"` — so the cache
-  path routinely appears embedded in a larger string. A case-insensitive
-  substring gate over the serialized document backs it up, quoting the
-  surrounding text so a refusal in a megabyte of `~/.claude.json` is actionable.
+  The check is two-layer, applied to each string leaf. Structured matching
+  (`Path.relative_to`) recognises a string that *is* a lexically-normal absolute
+  path and reports `field -> path`. Claude Code's hook entries are shell command
+  strings, though — `"node <path>/dist/hook.js SessionStart"` — so the cache
+  path routinely appears embedded in a larger string, and a boundary-anchored
+  substring match over the same leaf catches those.
 
-  Three details that gate got wrong before review and that are worth stating,
-  because each one turned it into either a no-op or a permanent blocker:
+  Four details that gate got wrong before review, each of which turned it into a
+  no-op, a permanent blocker, or a leak:
 
-  - It serializes with `ensure_ascii=False`. The default escapes non-ASCII to
-    `\uXXXX`, so on a `HOME` containing any accented character the blob and the
-    needle could never match — the check would be silently off.
-  - The needle is anchored with a trailing boundary. A bare substring
-    reintroduces exactly the bug `_is_under` avoids: `.../cache/minni` is a
-    prefix of `.../cache/minni-tools`, so an unrelated marketplace would block
-    the cutover.
-  - The literal `~/.claude/plugins/cache/minni` is *not* a needle.
+  - **Report the field, never the text.** The embedded-string branch fires
+    exactly where people inline `FOO_TOKEN=...`, and over `~/.claude.json` the
+    surrounding text is verbatim prompt history. An earlier version quoted 120
+    characters of context into an error printed to stderr. It emits the dotted
+    trail (`hooks.SessionStart[0].hooks[0].command`) instead, which is both
+    leak-free and a better pointer than an excerpt of a multi-megabyte file.
+  - **Anchor the needle.** A bare substring reintroduces exactly the bug
+    `_is_under` avoids: `.../cache/minni` is a prefix of
+    `.../cache/minni-tools`, so an unrelated marketplace would block the
+    cutover. Only `[A-Za-z0-9_.-]` suppresses a match, and a genuine reference
+    is always followed by `/` or a string terminator.
+  - **Normalize to NFC.** macOS treats NFC and NFD spellings of an accented
+    path as the same file; Python string comparison does not. Without this a
+    config written from a differently-normalized source reads as "not a
+    reference" and clears the deletion.
+  - **The literal `~/.claude/plugins/cache/minni` is not a needle.**
     `~/.claude.json` persists prompt history, and this repo's own docs and
     `--help` text contain that string, so any session discussing the migration
     would poison the file permanently and leave `--keep-legacy-cache` as the
-    only exit — the cutover could never complete. Claude Code does not expand
-    `~` in these configs, so the on-disk risk it would cover is not real.
+    only exit — the cutover could never complete on the machine it was written
+    for. Claude Code does not expand `~` in these configs, so the on-disk risk
+    it would cover is not real.
 
-  Residual heuristic gaps are accepted: `$HOME`-style indirection, `..` before
-  the prefix, doubled slashes inside a command string, and a path split across
-  two fields all evade the substring layer. The structured scan still catches
-  every lexically-normal absolute path, which is the shape these configs
-  actually take.
+  Residual heuristic gaps are accepted: a tilde-spelled path, `$HOME`-style
+  indirection, `..` before the prefix, doubled slashes inside a command string,
+  and a path split across two fields all evade the substring layer. The
+  structured scan still catches every lexically-normal absolute path, which is
+  the shape these configs actually take.
 
 - **It reports everything it deletes.** The target is the plugin dir
   `<cache>/minni/minni`, not the whole `<cache>/minni` marketplace dir. A

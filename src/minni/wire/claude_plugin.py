@@ -24,6 +24,7 @@ import os
 import re
 import shutil
 import tempfile
+import unicodedata
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -368,6 +369,16 @@ def legacy_scan_paths() -> list[Path]:
     ]
 
 
+def _nfc(value: str) -> str:
+    """NFC-normalize, so an NFD spelling of an accented path still compares equal.
+
+    macOS filesystems treat the two as the same file, but Python string
+    comparison does not, and a config written from a differently-normalized
+    source would otherwise read as "not a reference" and clear a deletion.
+    """
+    return unicodedata.normalize("NFC", value)
+
+
 def _is_under(value: str, root: Path) -> bool:
     """True when `value` is an absolute path at or below `root`.
 
@@ -378,14 +389,14 @@ def _is_under(value: str, root: Path) -> bool:
     if not value:
         return False
     try:
-        candidate = Path(value)
+        candidate = Path(_nfc(value))
     except (TypeError, ValueError):
         return False
     if not candidate.is_absolute():
         return False
     for base in {root, root.resolve()}:
         try:
-            candidate.relative_to(base)
+            candidate.relative_to(Path(_nfc(str(base))))
         except ValueError:
             continue
         return True
@@ -420,30 +431,24 @@ def legacy_cache_referrers(*, overrides: dict[str, dict] | None = None) -> list[
     # Structured matching alone is not enough to authorise an rmtree. Claude
     # Code's hook entries are *shell command strings* ("node <path>/hook.js
     # SessionStart"), not argv arrays, so the cache path routinely appears
-    # embedded in a larger string that Path() cannot classify. A substring gate
-    # catches those; it is the same belt-and-braces approach gc.py already uses,
-    # and erring toward a refusal is the safe direction here.
+    # embedded in a larger string that Path() cannot classify. A substring pass
+    # over the same string leaves catches those.
     #
-    # Two things this gate must get right or it is worse than useless:
+    # The needle carries a trailing boundary, because a bare substring
+    # re-introduces the exact bug _is_under exists to avoid: ".../cache/minni"
+    # is a prefix of ".../cache/minni-tools", so an unrelated marketplace would
+    # block the cutover with a refusal the operator cannot act on. Only
+    # [A-Za-z0-9_.-] suppresses a match, and a genuine reference is always
+    # followed by "/" or a string terminator.
     #
-    # ensure_ascii=False, because the default escapes any non-ASCII character in
-    # the path to \uXXXX. On a HOME like /Users/Håkan the blob would contain
-    # "håkan" and the needle "håkan", so the gate would silently match
-    # nothing at all -- a safety check that is off and reports nothing.
-    #
-    # A trailing boundary, because a bare substring re-introduces the exact bug
-    # _is_under exists to avoid: ".../cache/minni" is a prefix of
-    # ".../cache/minni-tools", so an unrelated marketplace would block the
-    # cutover with a refusal the operator cannot act on.
-    #
-    # Deliberately NOT included: the literal "~/.claude/plugins/cache/minni".
+    # Deliberately NOT a needle: the literal "~/.claude/plugins/cache/minni".
     # ~/.claude.json persists per-project prompt history, and this repo's own
     # docs and --help text contain that string, so any session that discussed
     # the migration would poison the file permanently and leave
     # --keep-legacy-cache as the only exit -- i.e. the cutover could never
-    # complete. A tilde-spelled path is also not something Claude Code expands
-    # in these configs, so the on-disk risk it covers is not real.
-    needles = {str(root).lower(), str(root.resolve()).lower()}
+    # complete. Claude Code does not expand "~" in these configs either, so the
+    # on-disk risk it would cover is not real.
+    needles = {_nfc(str(root)).lower(), _nfc(str(root.resolve())).lower()}
     boundary = re.compile(
         "|".join(re.escape(n) + r"(?![\w.\-])" for n in sorted(needles)),
     )
@@ -460,22 +465,17 @@ def legacy_cache_referrers(*, overrides: dict[str, dict] | None = None) -> list[
             except ClaudePluginError as exc:
                 found.append(f"{path}: unreadable, cannot verify ({exc})")
                 continue
-        precise = [
-            f"{path}: {trail} -> {value}"
-            for trail, value in _iter_json_strings(doc)
-            if _is_under(value, root)
-        ]
-        if precise:
-            found.extend(precise)
-            continue
-        blob = json.dumps(doc, ensure_ascii=False).lower()
-        hit = boundary.search(blob)
-        if hit:
-            # A refusal you cannot debug is a refusal you learn to bypass, and
-            # ~/.claude.json is far too large to eyeball. Quote the neighbourhood.
-            start = max(0, hit.start() - 60)
-            snippet = blob[start:hit.end() + 60].replace("\n", " ")
-            found.append(f"{path}: mentions {root} inside a larger string: ...{snippet}...")
+        for trail, value in _iter_json_strings(doc):
+            if _is_under(value, root):
+                found.append(f"{path}: {trail} -> {value}")
+            elif boundary.search(_nfc(value).lower()):
+                # Report the field, never the text. This branch fires precisely
+                # when the path is embedded in a shell command string, which is
+                # exactly where people inline `FOO_TOKEN=...`; and over
+                # ~/.claude.json the surrounding text is verbatim prompt
+                # history. A dotted trail points at the offending field without
+                # copying secrets into stderr, CI logs and bug reports.
+                found.append(f"{path}: {trail} mentions {root}")
     return found
 
 
