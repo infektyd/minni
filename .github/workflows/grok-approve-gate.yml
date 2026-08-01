@@ -26,6 +26,12 @@ on:
       - "PR Hygiene"
       - "Claude Code Review"
     types: [completed]
+    # Branch filters here match the TRIGGERING run's head branch. CI completing
+    # on main starts a gate run that resolves main's SHA, finds no open PR and
+    # skips — seven such no-ops in one twelve-minute window, once the workflow
+    # list above was widened. PR-branch CI still fires, which is the only case
+    # that can ever produce a decision.
+    branches-ignore: [main]
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
   # Without this, a REQUEST_CHANGES submitted AFTER the check went green never
@@ -37,6 +43,8 @@ permissions:
   contents: read
   checks: write
   statuses: read
+  # The GITHUB_TOKEN stays read-only on PRs; the mechanical approval is
+  # submitted with the App token, never this one.
   pull-requests: read
 
 # Key on head SHA for EVERY event. Keying pull_request on PR number while
@@ -122,6 +130,10 @@ jobs:
           # GITHUB_TOKEN cannot be granted this at all, which is why the
           # protection read goes through the App token.
           permission-administration: read
+          # Submits the mechanical APPROVE on success, and dismisses the App's
+          # OWN stale approvals. Scoped in code to this App's approvals only —
+          # it must never dismiss a human review or a CHANGES_REQUESTED.
+          permission-pull-requests: write
 
       - name: Run mechanical gate
         if: steps.meta.outputs.skip != 'true'
