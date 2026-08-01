@@ -343,6 +343,10 @@ human attention on gate/workflow changes.
   must be the entire comment; prose mentioning it does nothing. A repeat command
   on an already-reviewed SHA is skipped with a reply rather than double-billed,
   and you get an :eyes: reaction when one is accepted.
+- **The command only works once this is on `main`.** `issue_comment` workflows
+  always run the file from the default branch, so `/grok-review` is inert on the
+  PR that introduces it — same bootstrap shape as the gate script. Nothing to
+  fix; just do not expect it to answer before the merge.
 - **Dismissing a review is not a substitute for re-earning one.** Dismiss only
   a review that a later re-review has made obsolete. Dismissing to clear a block
   without a fresh review throws away the signal the gate depends on.

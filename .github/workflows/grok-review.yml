@@ -27,6 +27,12 @@ name: Grok Code Review
 # agents push fixes, the previous review's stamp is worthless and the only ways
 # to re-earn it used to be close/reopen or dismissing the review without
 # re-earning anything. Both are worse than asking for a review explicitly.
+#
+# BOOTSTRAP: `issue_comment` is not a PR event — GitHub runs the workflow file
+# from the DEFAULT branch, so the command does nothing until this lands on
+# main. It cannot be exercised on the PR that introduces it. That default-branch
+# execution is also the trust-anchor property we want, and it is why the
+# resolver reads the head SHA from the API instead of a payload.
 on:
   pull_request:
     types: [opened, ready_for_review, reopened]
