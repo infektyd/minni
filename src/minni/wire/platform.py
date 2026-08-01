@@ -154,10 +154,28 @@ def platform_spec(
 
 
 def default_config_scan_paths() -> dict[str, Path]:
-    """Known per-platform default config locations for GC belt-and-braces scan."""
+    """Known per-platform default config locations for GC belt-and-braces scan.
+
+    `claude-code-plugins` is the plugin registry, not an MCP config: it is what
+    Claude Code reads hooks/skills/commands from. It must be scanned or GC can
+    collect the tree a live registration points at — wired.json alone would miss
+    a registration written out of band, or one left behind by a wire run that
+    failed verification before it recorded anything.
+
+    `claude-desktop` is a separate product with its own config tree, and wire
+    never writes it outside the one-time adoption cutover. It is scanned for the
+    same reason: it holds a literal versioned path into the tree wire manages,
+    and GC retaining that version is what keeps Desktop launchable.
+    """
     return {
         "codex": Path("~/.codex/config.toml").expanduser(),
         "claude-code": Path("~/.claude.json").expanduser(),
+        "claude-code-plugins": Path(
+            "~/.claude/plugins/installed_plugins.json",
+        ).expanduser(),
+        "claude-desktop": Path(
+            "~/Library/Application Support/Claude/claude_desktop_config.json",
+        ).expanduser(),
         "kilocode": Path("~/.config/kilo/kilo.json").expanduser(),
         "grok": Path("~/.grok/config.toml").expanduser(),
     }

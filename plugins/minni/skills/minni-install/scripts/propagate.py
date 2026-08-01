@@ -53,13 +53,46 @@ DEFAULT_SOCKET = Path("~/.minni/run/minnid.sock").expanduser()
 DEFAULT_IDENTITY_ROOT = Path("~/.minni/identities").expanduser()
 
 
-def plugin_version_segment() -> str:
-    """Resolve the wired plugin version without hardcoded path literals.
+_VERSION_DIR_START = re.compile(r"^\d")
 
-    The `current` symlink is authoritative: the wired version and the installed
-    pip package version legitimately diverge (--use-version rollback, --from-repo
-    dev builds), so the package version is only a fallback for hosts where
-    nothing has been wired yet.
+
+def _version_sort_key(name: str) -> tuple[tuple[int, ...], int, str]:
+    """PEP440-shaped ordering key: release numbers, then local segments last."""
+    public, _, local = name.partition("+")
+    release: list[int] = []
+    for chunk in public.split("."):
+        digits = re.match(r"\d+", chunk)
+        release.append(int(digits.group()) if digits else 0)
+    return (tuple(release), 1 if local else 0, local)
+
+
+def max_present_version(base: Path) -> str | None:
+    """Highest-numbered version dir that actually exists under `base`, or None.
+
+    Two properties matter. It only ever names a directory that is really there,
+    and it compares numerically rather than lexically -- a lexical sort puts a
+    two-digit minor behind a one-digit one, and taking the first element of an
+    ascending sort would hand back the oldest install instead of the newest.
+    """
+    try:
+        names = [
+            p.name for p in base.iterdir()
+            if p.is_dir() and _VERSION_DIR_START.match(p.name)
+        ]
+    except OSError:
+        return None
+    return max(names, key=_version_sort_key) if names else None
+
+
+def plugin_version_segment() -> str:
+    """Resolve the wire-managed plugin version, preferring what exists on disk.
+
+    The `current` symlink is authoritative when present, but wire maintains it
+    only for released versions -- on a --from-repo machine it never exists.
+    Falling straight through to the pip metadata version there named a directory
+    that need not exist at all, because the installed wheel and the wired payload
+    legitimately diverge (--use-version rollback, dev builds). So the on-disk
+    maximum is consulted before the package version.
     """
     current = Path("~/.minni/plugin/current").expanduser()
     try:
@@ -69,6 +102,9 @@ def plugin_version_segment() -> str:
             return current.name
     except OSError:
         pass
+    present = max_present_version(Path("~/.minni/plugin").expanduser())
+    if present:
+        return present
     try:
         import importlib.metadata
         return importlib.metadata.version("minni")
@@ -77,6 +113,32 @@ def plugin_version_segment() -> str:
     raise SystemExit(
         "Cannot determine plugin version; install minni or run minni wire first"
     )
+
+
+def codex_install_root() -> Path:
+    """Codex's plugin dir, resolved from the versions that actually exist there.
+
+    Codex keeps its own cache tree, so inheriting the wire tree's version segment
+    can name a directory Codex never had. Resolve against Codex's own dirs, and
+    never substitute a literal `current` segment: no such directory exists under
+    the codex cache, so writing there built a second dead tree rather than
+    updating the live one.
+    """
+    base = Path("~/.codex/plugins/cache/minni/minni").expanduser()
+    present = max_present_version(base)
+    return base / (present or plugin_version_segment())
+
+
+CLAUDE_CODE_IS_WIRE_MANAGED = (
+    "claude-code is wired by `minni wire claude-code`, not by propagate.\n"
+    "Its plugin surface (hooks, skills, commands, dist) is served from\n"
+    "~/.minni/plugin/<version>, and Claude Code's installed_plugins.json points\n"
+    "there. Writing the old ~/.claude/plugins/cache tree would update a directory\n"
+    "nothing reads.\n"
+    "  minni wire claude-code              # normal wiring, every time\n"
+    "  minni wire-adopt claude-code --apply  # once, if this host is not cut over\n"
+    "Claude Desktop is repointed by wire-adopt as part of that cutover."
+)
 
 
 def default_plugin_cli() -> Path:
@@ -797,6 +859,11 @@ def update_claude_desktop_config(
 ) -> dict[str, object]:
     """Register the Minni MCP server with Claude DESKTOP.
 
+    No longer called from update_one_plugin: its only route in was the claude-code
+    platform, which is now wire-managed. Desktop is repointed at the wire tree by
+    `minni wire-adopt claude-code`. Kept (and directly tested) because it remains
+    the reference for how this surface differs from Claude Code's.
+
     Claude Desktop is a separate product from Claude Code with a fully disjoint
     config tree: ~/Library/Application Support/Claude/claude_desktop_config.json,
     NOT ~/.claude/. Writing the latter reaches Desktop not at all. (Careful with
@@ -1194,32 +1261,14 @@ def update_toml_mcp_config(path: Path, server_path: Path, agent: str, vault: Pat
 def platform_spec(platform: str, repo_root: Path, install_root: str | None = None) -> dict[str, object]:
     platform = canonical_platform(platform)
     home = Path.home()
-    try:
-        version_seg = plugin_version_segment()
-    except SystemExit:
-        version_seg = None
-    codex_install = (
-        home / ".codex/plugins/cache/minni/minni" / version_seg
-        if version_seg
-        else home / ".codex/plugins/cache/minni/minni" / "current"
-    )
-    claude_install = (
-        home / ".claude/plugins/cache/minni/minni" / version_seg
-        if version_seg
-        else home / ".claude/plugins/cache/minni/minni" / "current"
-    )
+    if platform == "claude-code":
+        raise SystemExit(CLAUDE_CODE_IS_WIRE_MANAGED)
     specs: dict[str, dict[str, object]] = {
         "codex": {
             "agent": "codex",
-            "install": codex_install,
+            "install": codex_install_root(),
             "config": home / ".codex/config.toml",
             "config_kind": "toml",
-        },
-        "claude-code": {
-            "agent": "claude-code",
-            "install": claude_install,
-            "config": home / ".claude.json",
-            "config_kind": "claude-json",
         },
         "kilocode": {
             "agent": "kilocode",
@@ -1267,7 +1316,7 @@ def platform_spec(platform: str, repo_root: Path, install_root: str | None = Non
             "config_kind": "mcp-json-only",
         }
     if platform not in specs:
-        raise SystemExit(f"Unknown platform {platform!r}. Use codex, claude-code, kilocode, gemini, antigravity, grok, generic, or all.")
+        raise SystemExit(f"Unknown platform {platform!r}. Use codex, kilocode, gemini, antigravity, grok, cursor, generic, or all. (claude-code: see `minni wire claude-code`.)")
     return specs[platform]
 
 
@@ -1312,8 +1361,10 @@ def update_one_plugin(platform: str, args: argparse.Namespace) -> dict[str, obje
     config_kind = str(spec["config_kind"])
     if config_kind == "toml":
         update_toml_mcp_config(Path(spec["config"]).expanduser(), server_path, agent, vault, Path(args.socket).expanduser(), stamp_workspace, explicit_workspace=explicit_workspace, afm_env=afm_env)
-    elif config_kind == "claude-json":
-        update_claude_config(server_path, agent, vault, Path(args.socket).expanduser(), stamp_workspace, afm_env)
+    # No "claude-json" branch: no platform spec produces that kind any more, and
+    # re-adding one here would silently restore the wholesale ~/.claude.json
+    # rewrite that wire now owns. update_claude_config survives only as the
+    # parity reference in tests/test_wire_parity.py.
     elif config_kind == "kilo-json":
         update_kilo_config(server_path, agent, vault, Path(args.socket).expanduser(), stamp_workspace, afm_env)
     elif config_kind == "gemini-manifest":
@@ -1344,14 +1395,6 @@ def update_one_plugin(platform: str, args: argparse.Namespace) -> dict[str, obje
     if canonical_platform(platform) == "cursor":
         cursor_hooks = update_cursor_hooks(install_root)
 
-    # Claude Desktop shares this agent identity and vault but NOT this config
-    # tree, so it needs its own write. Hooks do not exist there; MCP only.
-    claude_desktop: dict[str, object] | None = None
-    if canonical_platform(platform) == "claude-code":
-        claude_desktop = update_claude_desktop_config(
-            server_path, agent, vault, Path(args.socket).expanduser(), stamp_workspace, afm_env
-        )
-
     base: dict[str, object] = {
         "platform": canonical_platform(platform),
         "agent": agent,
@@ -1371,13 +1414,25 @@ def update_one_plugin(platform: str, args: argparse.Namespace) -> dict[str, obje
         base["grok_rules"] = grok_rules
     if cursor_hooks is not None:
         base["cursor_hooks"] = cursor_hooks
-    if claude_desktop is not None:
-        base["claude_desktop"] = claude_desktop
     return base
 
 
+# claude-code is deliberately absent: its plugin surface is wire-managed (see
+# platform_spec). Keeping it here would abort every `all` run on a platform
+# propagate no longer owns; dropping it silently would be worse, hence the notice.
+# Note this list and wire's own ALL_EXPANSION_V03 still disagree in both
+# directions -- reconciling them is tracked separately.
+ALL_PLATFORMS = ("codex", "kilocode", "gemini", "grok", "cursor")
+
+
 def update_plugin(args: argparse.Namespace) -> int:
-    platforms = ["codex", "claude-code", "kilocode", "gemini", "grok", "cursor"] if args.platform == "all" else [args.platform]
+    if args.platform == "all":
+        print(
+            "[propagate] claude-code is excluded from `all`: it is wired by "
+            "`minni wire claude-code`.",
+            file=sys.stderr,
+        )
+    platforms = list(ALL_PLATFORMS) if args.platform == "all" else [args.platform]
     restore_no_build = args.no_build
     if len(platforms) > 1 and not args.no_build:
         run(["npm", "run", "build"], cwd=plugin_source(Path(args.repo).expanduser()))

@@ -9,6 +9,12 @@ User-owned GitHub App posts **formal** PR reviews (`REQUEST_CHANGES` /
 user-owned repo. v2 therefore uses a **required check run**
 `grok-mechanical-approve` from `.github/workflows/grok-approve-gate.yml`.
 
+**CI is the only supported path.** There is no machine-side option: the local
+poller that answered `@grok-local` from the operator's Mac is retired. See
+[grok-local-path-retired.md](grok-local-path-retired.md) for why it existed, the
+measured macOS egress finding that ended it, and the safety posture it
+implemented.
+
 ## v2 policy
 
 | Model line | Reviews API | Mechanical check |

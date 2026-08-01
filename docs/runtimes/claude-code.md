@@ -8,8 +8,22 @@ minni wire claude-code                                   # v0.3+ wheel (bundled 
 .venv/bin/minni wire claude-code --from-repo .           # v0.2 wheel / source checkout
 ```
 
-(`propagate.py update-plugin --platform claude-code` from the checkout still works as
-the legacy path.)
+On a machine that still has the retired marketplace/cache install, run the
+one-time cutover once after wiring — dry-run first, it writes nothing without
+`--apply`:
+
+```bash
+minni wire-adopt claude-code            # shows what it would change
+minni wire-adopt claude-code --apply
+```
+
+(`propagate.py update-plugin --platform claude-code` is gone: it now exits with
+a pointer to `minni wire`.)
+
+Hooks, skills and commands are served from the wire-managed tree
+(`~/.minni/plugin/<version>`), which wire records in Claude Code's plugin
+registry at `~/.claude/plugins/installed_plugins.json`. See
+`docs/design/DESIGN-wire-claude-plugin-adoption.md`.
 
 This registers the MCP server (`plugins/minni/.claude-plugin/`), pins the
 agent identity (`MINNI_AGENT_ID=claude-code`), the per-agent vault
