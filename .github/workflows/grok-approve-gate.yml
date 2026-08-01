@@ -37,6 +37,8 @@ permissions:
   contents: read
   checks: write
   statuses: read
+  # The GITHUB_TOKEN stays read-only on PRs; the mechanical approval is
+  # submitted with the App token, never this one.
   pull-requests: read
 
 # Key on head SHA for EVERY event. Keying pull_request on PR number while
@@ -122,6 +124,10 @@ jobs:
           # GITHUB_TOKEN cannot be granted this at all, which is why the
           # protection read goes through the App token.
           permission-administration: read
+          # Submits the mechanical APPROVE on success, and dismisses the App's
+          # OWN stale approvals. Scoped in code to this App's approvals only —
+          # it must never dismiss a human review or a CHANGES_REQUESTED.
+          permission-pull-requests: write
 
       - name: Run mechanical gate
         if: steps.meta.outputs.skip != 'true'

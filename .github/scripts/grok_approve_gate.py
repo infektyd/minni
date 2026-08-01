@@ -485,6 +485,125 @@ def resolve_pr_for_sha(owner: str, repo: str, sha: str, token: str) -> int | Non
     return None
 
 
+
+# --- Mechanical APPROVE -----------------------------------------------------
+# When decide() returns success, the same decision is ALSO expressed as a real
+# Reviews API APPROVE from the App, so a `required_approving_review_count: 1`
+# rule can be satisfied without a human. This is not the model approving: it is
+# the gate's mechanical decision on a second channel, minted only when every
+# invariant in decide() held.
+
+
+def build_approval_body(head_sha: str, required: tuple[str, ...]) -> str:
+    """Body for the mechanical approval.
+
+    MUST NOT contain ELIGIBILITY_MARKER: the gate reads App review bodies to
+    decide eligibility, so a marker here would let the gate's own approval feed
+    its next eligibility check — a self-licking loop.
+    """
+    contexts = ", ".join(required) if required else "(none)"
+    body = (
+        "Mechanical approval - not a judgment about whether this code is good.\n\n"
+        f"`{CHECK_NAME}` evaluated `{head_sha[:12]}` and every condition held:\n"
+        f"- all required contexts success: {contexts}\n"
+        f"- Grok App eligibility stamped on `{head_sha[:12]}`\n"
+        "- no outstanding CHANGES_REQUESTED\n"
+        "- no gate/CI trust path touched\n\n"
+        "Approval is bound to this commit. Any push invalidates it and the gate "
+        "re-evaluates from scratch."
+    )
+    assert not _has_marker(body), "approval body must never carry the marker"
+    return body
+
+
+def fetch_app_reviews(
+    owner: str, repo: str, pr: int, token: str
+) -> list[dict[str, Any]]:
+    reviews = _paginate(
+        f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr}/reviews?per_page=100",
+        token,
+    )
+    return [r for r in reviews if _is_app_bot((r.get("user") or {}).get("login"))]
+
+
+def already_approved(reviews: list[dict[str, Any]], head_sha: str) -> bool:
+    """True if the App's newest live review on this SHA is already an APPROVE.
+
+    Without this, every re-run of the gate posts another approval.
+    """
+    for rev in reversed(reviews):
+        state = (rev.get("state") or "").upper()
+        if state == "DISMISSED":
+            continue
+        if (rev.get("commit_id") or "") != head_sha:
+            continue
+        return state == "APPROVED"
+    return False
+
+
+def submit_mechanical_approval(
+    *,
+    owner: str,
+    repo: str,
+    pr: int,
+    head_sha: str,
+    token: str,
+    required: tuple[str, ...],
+) -> str:
+    """Submit the APPROVE. Returns a short status for the job log."""
+    reviews = fetch_app_reviews(owner, repo, pr, token)
+    if already_approved(reviews, head_sha):
+        return "approval already present"
+
+    # Same belt-and-braces as the check post: the Reviews API binds to the most
+    # recent commit unless commit_id is given, so re-read and abort if the head
+    # moved rather than approve code that was never evaluated.
+    pr_data = _api("GET", f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr}", token)
+    if ((pr_data.get("head") or {}).get("sha") or "") != head_sha:
+        return "head moved; approval withheld"
+
+    _api(
+        "POST",
+        f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr}/reviews",
+        token,
+        {
+            "commit_id": head_sha,
+            "event": "APPROVE",
+            "body": build_approval_body(head_sha, required),
+        },
+    )
+    return f"approved {head_sha[:12]}"
+
+
+def dismiss_stale_approvals(
+    *, owner: str, repo: str, pr: int, head_sha: str, token: str, reason: str
+) -> int:
+    """Dismiss the App's OWN live APPROVE reviews that no longer hold.
+
+    Scoped hard to this App's approvals. It must never touch anyone else's
+    review, and never a CHANGES_REQUESTED — that is the veto the gate exists to
+    respect, and dismissing it would be the worst thing this token could do.
+    """
+    dismissed = 0
+    for rev in fetch_app_reviews(owner, repo, pr, token):
+        if (rev.get("state") or "").upper() != "APPROVED":
+            continue
+        if not _is_app_bot((rev.get("user") or {}).get("login")):
+            continue  # belt and braces; fetch_app_reviews already filtered
+        rid = rev.get("id")
+        if not rid:
+            continue
+        _api(
+            "PUT",
+            f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr}"
+            f"/reviews/{rid}/dismissals",
+            token,
+            {"message": f"Mechanical approval superseded: {reason}", "event": "DISMISS"},
+        )
+        dismissed += 1
+    return dismissed
+
+
 def _preflight(
     owner: str, repo: str, pr: int, head_sha: str, token: str
 ) -> GateDecision | None:
@@ -589,6 +708,31 @@ def run_gate(
             decision = moved
 
     post_check_run(owner, repo, post_token, head_sha, decision)
+
+    # Express the SAME decision as a Reviews API APPROVE so a
+    # `required_approving_review_count: 1` rule can be satisfied mechanically.
+    # Only on success: the failure and pending paths never touch the Reviews API.
+    try:
+        if decision.conclusion == "success":
+            required, _ = fetch_protection(owner, repo, base_branch, post_token)
+            note = submit_mechanical_approval(
+                owner=owner, repo=repo, pr=pr, head_sha=head_sha,
+                token=post_token, required=required,
+            )
+        else:
+            n = dismiss_stale_approvals(
+                owner=owner, repo=repo, pr=pr, head_sha=head_sha,
+                token=post_token, reason=decision.title,
+            )
+            note = f"dismissed {n} stale approval(s)" if n else "no approval to dismiss"
+        print(f"approval: {note}")
+    except (RuntimeError, urllib.error.URLError) as e:
+        # The check run is the merge gate; the approval is a convenience on top.
+        # Never let an approval failure mask the decision that was already
+        # posted — but say so loudly, because a stuck approval means a human
+        # still has to merge.
+        print(f"::warning::approval channel failed: {e}")
+
     return decision
 
 

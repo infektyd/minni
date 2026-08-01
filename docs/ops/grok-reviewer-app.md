@@ -327,6 +327,78 @@ ordinary PR the context never reports, the gate reads it as `missing`, and the
 mechanical check can never go green — the exact opposite of the goal. Only
 require checks that run on every PR.
 
+
+## Autonomous merge (operator — propose, don't silent-apply)
+
+Target state: mechanically-gated PRs merge without the operator, who then only
+reviews the trust surface.
+
+### The mechanical APPROVE
+
+When `decide()` returns success the gate ALSO submits a real Reviews API
+`APPROVE` from the App, bound to the evaluated commit. This is not the model
+approving — it is the same mechanical decision on a second channel, minted only
+when every invariant held. The body deliberately carries no eligibility marker,
+so the gate's own approval cannot feed its next eligibility check.
+
+The gate dismisses its own stale approvals when the decision flips. It is scoped
+in code to this App's `APPROVED` reviews only: it must never dismiss a human's
+review, and never a `CHANGES_REQUESTED`.
+
+### UNPROVEN: does an App approval satisfy `required_approving_review_count`?
+
+**Test this before relying on it.** The `#222` claim that "App/bot APPROVE does
+not clear reviewDecision" is **not supported by the record** — I re-read it:
+
+| PR | Evidence | Why it proves nothing |
+|---|---|---|
+| #222 | App posted `APPROVED` 15:15:22, then `COMMENTED` 15:15:42, then `CHANGES_REQUESTED` 15:16:05 — all on `030fb8d` | GitHub takes the newest review per author. The App superseded its own approval within 43s, so the final `REVIEW_REQUIRED` is expected either way |
+| #216 | `cursor[bot]` approved three times, each dismissed ~12s later by `dismiss_stale_reviews` on the next push | No approval ever covered the final head `5d0a509` |
+
+So there is **no measurement** on this repo of a live bot approval on the
+current head. Both prior readings were confounded — by supersession and by
+staleness, not (as once assumed) by the parser downgrading `APPROVE`: an actual
+`APPROVED` review record exists on #222.
+
+The hypothesis is therefore untested, not disproven, and it is plausible:
+`author_association: NONE` is normal for bots and is a different concept from
+write access, and App approvals are how bots like renovate-approve work.
+
+**The live test:** after this lands, let the gate pass on a canary PR and check
+that `reviewDecision` flips `REVIEW_REQUIRED` → `APPROVED` while the approval is
+the App's newest review on the current head. Record the result here either way.
+
+### If it works, the remaining operator settings
+
+```bash
+# 1. Allow auto-merge, so agents can queue a merge that fires when checks pass.
+gh api -X PATCH repos/infektyd/minni -F allow_auto_merge=true
+
+# 2. Agents then queue, rather than merge:
+#    gh pr merge --auto --squash <n>
+```
+
+### CODEOWNERS — the human-required trust surface
+
+Auto-merge plus a mechanical approval means nothing human-gated remains unless
+you say so. Require code-owner review for the trust surface:
+
+```
+# .github/CODEOWNERS
+/.github/                @infektyd
+/.github/CODEOWNERS      @infektyd
+/scripts/check*          @infektyd
+/docs/ops/grok-reviewer-app.md  @infektyd
+```
+
+Then set `"require_code_owner_reviews": true` in the protection payload.
+
+**CODEOWNERS must own itself** — the second line above is not redundant. Without
+it, a PR can edit CODEOWNERS to remove the owner gate and then auto-merge
+everything else. Note this overlaps the gate's `.github/` path deny, which
+already forces those PRs red; CODEOWNERS is the independent second layer, and
+the one that still applies if the gate is ever bypassed.
+
 ## Residual risk
 
 A green mechanical check means “eligible Grok verdict + required CI green” —

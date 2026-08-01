@@ -127,9 +127,14 @@ def test_app_tokens_are_minted_least_privilege(gate, review):
         if str(s.get("uses", "")).startswith("actions/create-github-app-token")
     )
     assert gate_step["with"].get("permission-checks") == "write"
-    assert "permission-pull-requests" not in gate_step["with"], (
-        "the gate only posts a check run; it must not carry PR write"
-    )
+    assert gate_step["with"].get("permission-administration") == "read"
+    # PR write is now required — the gate also submits the mechanical APPROVE
+    # and dismisses its own stale ones. Everything else stays unrequested.
+    assert set(gate_step["with"]) <= {
+        "app-id", "private-key", "owner", "repositories",
+        "permission-checks", "permission-administration",
+        "permission-pull-requests",
+    }, "the gate token must not quietly grow new scopes"
 
     review_step = next(
         s for s in review["jobs"]["grok-review"]["steps"]
@@ -291,3 +296,26 @@ def test_dedup_counts_dismissed_reviews_too(review):
     run = _code(_resolve_step(review)["run"])
     assert 'select(.state!="DISMISSED")' not in run
     assert "select(.commit_id==$sha)" in run
+
+
+def test_gate_token_can_submit_reviews_but_reviewer_token_cannot_post_checks(gate, review):
+    """The gate now approves as well as posting the check, so its token needs PR
+    write. The reviewer's must NOT gain checks:write in exchange — keeping those
+    two capabilities in separate tokens is the point."""
+    gate_step = next(
+        s for s in gate["jobs"]["gate"]["steps"]
+        if str(s.get("uses", "")).startswith("actions/create-github-app-token")
+    )
+    assert gate_step["with"].get("permission-pull-requests") == "write"
+    assert gate_step["with"].get("permission-checks") == "write"
+
+    review_step = next(
+        s for s in review["jobs"]["grok-review"]["steps"]
+        if str(s.get("uses", "")).startswith("actions/create-github-app-token")
+    )
+    assert "permission-checks" not in review_step["with"]
+
+
+def test_workflow_github_token_stays_read_only_on_prs(gate):
+    """The mechanical approval must come from the App, never GITHUB_TOKEN."""
+    assert gate["permissions"]["pull-requests"] == "read"
