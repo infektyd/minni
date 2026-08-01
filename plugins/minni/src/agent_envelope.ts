@@ -13,14 +13,14 @@ export const MEMORY_CONTRACT =
  * that, you should use Minni passively without me having to tell you").
  *
  * This is a REPRESENTATION only — it changes nothing about the commands/tools it
- * names. `plan` names only its few plan-adjacent options (minni_plan, handoff),
+ * names. `thread` names only its few thread-adjacent options (minni_thread_*, handoff),
  * NOT a gateway to all of Minni's ~47 affordances. The other three are leaves
  * onto their single existing flow. (claude-code only; not in the shared factory.)
  */
 export const MINNI_LIFECYCLE_LINE =
-  "🧭 Minni lifecycle (reach for these): prepare_task = orient before ambitious work · prepare_outcome = distill before flush · plan = track & coordinate (minni_plan, handoff) · learn = commit a durable finding.";
+  "🧭 Minni lifecycle (reach for these): prepare_task = orient before ambitious work · prepare_outcome = distill before flush · thread = track & coordinate (minni_thread_*, handoff) · learn = commit a durable finding.";
 
-export type LifecycleSurface = "prepare_task" | "prepare_outcome" | "plan" | "learn";
+export type LifecycleSurface = "prepare_task" | "prepare_outcome" | "thread" | "learn";
 
 /**
  * Map an ambition intent (task.ts `classifyIntent`: plan/implement/debug/review/
@@ -32,7 +32,7 @@ export type LifecycleSurface = "prepare_task" | "prepare_outcome" | "plan" | "le
  * mapped here.
  */
 export function lifecycleSurfaceForIntent(intent: string): LifecycleSurface | null {
-  if (intent === "plan") return "plan";
+  if (intent === "plan") return "thread";
   if (
     intent === "implement" ||
     intent === "debug" ||
@@ -46,15 +46,15 @@ export function lifecycleSurfaceForIntent(intent: string): LifecycleSurface | nu
 
 /**
  * The situational one-line emphasis layered on top of the persistent line. Soft
- * signpost only — never a permission decision. Names ≤2 plan-adjacent options for
- * `plan`, never the full surface.
+ * signpost only — never a permission decision. Names ≤2 thread-adjacent options for
+ * `thread`, never the full surface.
  */
 export function buildLifecycleEmphasis(surface: LifecycleSurface): string {
   switch (surface) {
     case "prepare_task":
       return "↳ Ambitious task — reach for `minni_prepare_task` to ground in prior decisions before diving in.";
-    case "plan":
-      return "↳ Planning/coordination — `minni_plan` to track it; `handoff` to coordinate across agents.";
+    case "thread":
+      return "↳ Planning/coordination — `minni_thread_*` to track it; `handoff` to coordinate across agents.";
     case "prepare_outcome":
       return "↳ Winding down — `minni_prepare_outcome` to dry-run what's worth keeping before a flush.";
     case "learn":
@@ -95,7 +95,7 @@ export interface EnvelopeBody {
   lifecycle_focus?: string;
   identity?: unknown;
   identity_body?: unknown;
-  active_plan?: unknown;
+  active_thread?: unknown;
   recall?: unknown;
   vault?: unknown;
   audit_tail?: unknown;
@@ -142,7 +142,8 @@ export function wrapEnvelope(options: EnvelopeOptions): string {
     "lifecycle_focus",
     "identity",
     "identity_body",
-    "active_plan",
+    "active_thread",
+    "active_thread_ref",
     "pending_learnings",
     "scar_tissue",
     "recall",

@@ -1,5 +1,12 @@
 # Minni provenance gate: ground-and-resolve findings
 
+> **Superseded 2026-07-31:** the `minni_plan_*` tools and the `plugins/minni/commands/plan.md`
+> command file cited below were renamed to `minni_thread_*` and `plugins/minni/commands/threads.md`.
+> On-disk artifact naming (`plan_id`, the `plan-<hex>` id prefix, `plan_*` frontmatter,
+> `_active_plan.json`, the `plan.*` gate keys) is unchanged. This document is a historical
+> record with already-stale line citations, not current guidance.
+
+
 Plan: `plan-fdf220b75b172595`
 Slice: `ground-and-resolve`
 Branch: `feat/minni-provenance-gate`

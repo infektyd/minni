@@ -11,7 +11,8 @@ proposed mode is purely additive.
 
 Minni today is a governed local memory daemon (`minnid`, line-delimited JSON-RPC
 2.0 over a 0600 Unix socket, ~30 methods) plus a Node MCP plugin
-(`plugins/minni/src/server.ts`, 37 tools) that external agent runtimes connect to
+(`plugins/minni/src/server.ts`, 37 tools; 48 registrations during the
+minni:threads deprecation-alias window) that external agent runtimes connect to
 via `minni wire <platform>`. The proposed evolution: launch `minni` itself,
 converse with an agent in a streaming REPL, and have that agent be Claude Code /
 Codex / Grok / Gemini running under the operator's own subscription login — with

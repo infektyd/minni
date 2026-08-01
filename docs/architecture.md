@@ -28,7 +28,7 @@ flowchart TD
     Retrieval["recall / search<br/>personal · combined · both"]
     Governance["learn → candidate_packets → resolve"]
     Handoff["handoff leases"]
-    Plans["plan surface — minni_plan_*"]
+    Plans["thread surface — minni_thread_*"]
     Team["team surface — minni_team_*"]
 
     Vaults["Per-agent Markdown vaults<br/>raw / wiki / logs / schema / inbox / outbox"]
@@ -113,7 +113,7 @@ them exactly as written (there is no family/action dispatch layer):
 | Recall | `minni_recall`, `minni_drill`, `minni_route`, `minni_export_pack` |
 | Learning | `minni_learn`, `minni_learning_quality`, `minni_resolve_candidate` |
 | Vault | `minni_vault_write`, `minni_compile_vault` |
-| Plans | `minni_plan_create`, `minni_plan_update`, `minni_plan_status`, `minni_plan_activate`, `minni_plan_deactivate`, `minni_plan_replan`, `minni_plan_history`, `minni_plan_revision`, `minni_plan_diff`, `minni_plan_restore`, `minni_plan_scar` |
+| Threads | `minni_thread_create`, `minni_thread_update`, `minni_thread_status`, `minni_thread_activate`, `minni_thread_deactivate`, `minni_thread_replan`, `minni_thread_history`, `minni_thread_revision`, `minni_thread_diff`, `minni_thread_restore`, `minni_thread_scar` (the pre-rename `minni_plan_*` names remain registered as deprecated aliases until the release after next) |
 | Handoff | `minni_negotiate_handoff`, `minni_ack_handoff`, `minni_list_pending_handoffs`, `minni_await_handoff` |
 | Agent ping | `minni_ping_agent_request`, `minni_ping_agent_inbox`, `minni_ping_agent_decide`, `minni_ping_agent_status` |
 | Team mode | `minni_team_runtime`, `minni_team_evidence`, `minni_team_promotion` |

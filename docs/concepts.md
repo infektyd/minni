@@ -114,7 +114,7 @@ Alongside the four verbs, sessions carry a lifecycle spine —
 `prepare_task → prepare_outcome → plan → learn` — injected via the
 `<minni:context>` envelope so agents orient before ambitious work and distill
 before context is flushed. Durable, evidence-gated plans
-(`minni_plan_*`) survive sessions and compaction.
+(`minni_thread_*`) survive sessions and compaction.
 
 ## Recall is evidence, not instruction
 

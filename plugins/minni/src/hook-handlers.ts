@@ -577,7 +577,7 @@ export function createHookHandlers(
     }
 
     if (activePlan !== undefined) {
-      envelopeBody.active_plan = activePlan;
+      envelopeBody.active_thread = activePlan;
     }
 
     const budget = envelopeBudgetFor(config.contextWindow);
@@ -776,7 +776,7 @@ export function createHookHandlers(
     // (planRef !== undefined iff activePlan !== undefined; guard on activePlan so
     // the compiler narrows it for compactPlanPointer.)
     if (activePlan !== undefined) {
-      envelopeBody.active_plan_ref = compactPlanPointer(activePlan);
+      envelopeBody.active_thread_ref = compactPlanPointer(activePlan);
     }
 
     const envelope = wrapEnvelope({

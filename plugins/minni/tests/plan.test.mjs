@@ -482,21 +482,21 @@ test("resolvePlanIdOrActive returns a clear error when nothing is active", async
     const result = await resolvePlanIdOrActive(root, undefined);
     assert.ok("error" in result);
     assert.match(result.error, /no active plan/);
-    assert.match(result.error, /minni_plan_activate/);
+    assert.match(result.error, /minni_thread_activate/);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
 });
 
-test("minni_plan_status/_update/_history accept an OPTIONAL plan_id (C5 schema pin)", async () => {
+test("minni_thread_status/_update/_history accept an OPTIONAL plan_id (C5 schema pin)", async () => {
   // The acceptance spec requires the id-less form VERBATIM on these three
   // tools; pin the schemas so a refactor cannot quietly re-require plan_id.
   const source = await readFile(new URL("../src/server.ts", import.meta.url), "utf8");
-  // minni_plan_replan and minni_plan_scar are beyond the verbatim spec but
+  // minni_thread_replan and minni_thread_scar are beyond the verbatim spec but
   // pinned too (review panel): a hookless agent must be able to replan or
   // record a dead-end against "the active plan" without round-tripping the id
-  // through minni_plan_status.
-  for (const tool of ["minni_plan_status", "minni_plan_update", "minni_plan_history", "minni_plan_replan", "minni_plan_scar"]) {
+  // through minni_thread_status.
+  for (const tool of ["minni_thread_status", "minni_thread_update", "minni_thread_history", "minni_thread_replan", "minni_thread_scar"]) {
     const start = source.indexOf(`"${tool}"`);
     assert.ok(start >= 0, `${tool} must be registered`);
     const block = source.slice(start, source.indexOf("server.registerTool", start + 1));
@@ -611,11 +611,11 @@ test("every id-less plan tool returns the no-active-plan error end-to-end throug
     // Each tool called WITHOUT plan_id (other required args supplied so zod
     // validation passes and the handler's resolvePlanIdOrActive path runs).
     const calls = [
-      ["minni_plan_status", {}],
-      ["minni_plan_update", { slice_id: "slice-1", status: "in_progress" }],
-      ["minni_plan_history", {}],
-      ["minni_plan_replan", { new_slices: [] }],
-      ["minni_plan_scar", { kind: "dead_end", signal: "tried the obvious thing" }],
+      ["minni_thread_status", {}],
+      ["minni_thread_update", { slice_id: "slice-1", status: "in_progress" }],
+      ["minni_thread_history", {}],
+      ["minni_thread_replan", { new_slices: [] }],
+      ["minni_thread_scar", { kind: "dead_end", signal: "tried the obvious thing" }],
     ];
     let id = 2;
     for (const [name, args] of calls) {
@@ -630,7 +630,7 @@ test("every id-less plan tool returns the no-active-plan error end-to-end throug
       const body = JSON.parse(reply.result.content[0].text);
       assert.ok(body.error, `${name}: ${JSON.stringify(body)}`);
       assert.match(body.error, /no plan_id provided and no active plan/, name);
-      assert.match(body.error, /minni_plan_activate/, name);
+      assert.match(body.error, /minni_thread_activate/, name);
       id += 1;
     }
   } finally {
@@ -694,7 +694,7 @@ test("createPlan with shelf_ref configures shelfDrift (punch-list §4b: MCP laye
     const shelfContent = "# Identity shelf\nAgent: codex\nRole: worker";
     const { plan } = await createPlan(
       {
-        goal: "Wire shelf_ref through minni_plan_create",
+        goal: "Wire shelf_ref through minni_thread_create",
         vaultPath: root,
         shelf_ref: {
           agent: "codex",
@@ -734,6 +734,55 @@ test("createPlan without shelf_ref leaves shelfDrift unconfigured (regression gu
     const drift = shelfDrift(plan, "anything");
     assert.equal(drift.configured, false);
     assert.equal(drift.note, "no shelf attached");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+// ── minni:threads rename — artifact-format freeze guard ────────────────────
+//
+// The minni:plan → minni:threads rename is a TOOL/COMMAND layer rename only.
+// The `plan-` id prefix is DELIBERATELY frozen and must not be "finished" into
+// `thread-` later: the prefix is baked into durable, recall-visible artifacts a
+// code change cannot rewrite — the note filename wiki/artifacts/plan-<hex>.md,
+// the `[[plan-<hex>]]` wikilink indexed by the vault and cited from hand-written
+// notes, the `plan-<hex>.log.md` journal, its history sibling, and every
+// historical audit line. Changing it would split the vault into two id
+// conventions and orphan every inbound wikilink.
+//
+// Frozen alongside it, for the same reason: the `plan_id` parameter name, the
+// `plan.*` shared-gate operation strings, the `minni_plan: true` / `plan_*`
+// frontmatter keys, and the `_active_plan.json` pointer filename.
+//
+// If a `thread-` prefix is ever genuinely wanted it needs a real migration
+// (notes + journals + history + pointer + every inbound wikilink), not an edit
+// to plan.ts. THIS TEST FAILING MEANS SOMEONE SKIPPED THAT MIGRATION.
+test("freeze guard: createPlan still mints plan- prefixed ids after the threads rename", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "sm-plan-idfreeze-"));
+  try {
+    await ensureVault(root);
+    const { plan, write } = await createPlan(
+      { goal: "id prefix must survive the minni:threads rename", vaultPath: root },
+      { vaultPath: root },
+    );
+    assert.match(plan.plan_id, /^plan-[0-9a-f]{16}$/, "id prefix is frozen at 'plan-'");
+    // the prefix must reach the durable surfaces, not just the in-memory object
+    assert.match(path.basename(write.notePath), /^plan-[0-9a-f]{16}\.md$/, "note filename is frozen");
+    assert.match(write.wikilink, /\[\[.*plan-[0-9a-f]{16}\]\]/, "wikilink is frozen");
+
+    // and lookup still resolves by the frozen frontmatter key, not the filename
+    const { findPlanNote } = await import("../dist/plan.js");
+    assert.equal(await findPlanNote(root, plan.plan_id), write.notePath);
+    const note = await readFile(write.notePath, "utf8");
+    assert.match(note, /minni_plan:\s*true/, "legacy frontmatter marker is frozen");
+    assert.ok(note.includes(`plan_id: ${plan.plan_id}`) || note.includes(`plan_id: "${plan.plan_id}"`),
+      "plan_id frontmatter key is frozen");
+
+    // the active pointer file keeps its pre-rename name so an in-flight active
+    // plan is not orphaned on upgrade
+    await setActivePlan(root, plan.plan_id, write.notePath);
+    const pointer = await readFile(path.join(root, "wiki", "artifacts", "_active_plan.json"), "utf8");
+    assert.equal(JSON.parse(pointer).plan_id, plan.plan_id);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

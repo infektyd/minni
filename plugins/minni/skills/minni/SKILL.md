@@ -255,7 +255,7 @@ Use Sovereign Team Mode for this. Hydrate from Layer 1 and Layer 2, create tempo
 - `minni_team_runtime`: Build a temporary team packet with agent profiles, task ledger, hydration packets, gates, and non-goals. It does not spawn agents, write durable memory, or promote profiles.
 - `minni_team_evidence`: Summarize temporary agent evidence reports and promotion candidates. Promotion and durable learning remain explicit human decisions.
 - `minni_team_promotion`: Draft a permanent agent profile from a temporary team profile only after explicit approval. This is still dry-run and does not write durable memory.
-- `minni_plan_*` (11 tools — create/update/status/activate/deactivate/replan/diff/history/revision/restore/scar): Durable, evidence-gated plans that survive sessions and compaction. Slices cannot be marked done without substantive evidence; scope changes go through replan (history preserved); dead-ends are recorded as scars. The active plan auto-injects into hooks on all platforms.
+- `minni_thread_*` (11 tools — create/update/status/activate/deactivate/replan/diff/history/revision/restore/scar): Durable, evidence-gated work threads that survive sessions and compaction. Slices cannot be marked done without substantive evidence; scope changes go through replan (history preserved); dead-ends are recorded as scars. The active thread auto-injects into hooks on all platforms. The pre-rename `minni_plan_*` names remain registered as deprecated aliases until the release after next — call the new names. On-disk artifact naming (`plan_id`, the `plan-<hex>` id prefix, `plan_*` frontmatter, `_active_plan.json`) is deliberately FROZEN at the old names.
 
 ## Slash Commands (Claude Code)
 
@@ -269,7 +269,7 @@ Use Sovereign Team Mode for this. Hydrate from Layer 1 and Layer 2, create tempo
 - `/minni:team-runtime <task>` — temporary helper-agent coordination packet.
 - `/minni:team-evidence` — dry-run evidence and promotion review.
 - `/minni:team-promotion` — approved promotion draft, still no durable write.
-- `/minni:plan` — proposal-first durable plans: create, gate slices with evidence, replan without losing history.
+- `/minni:threads` — proposal-first durable work threads: create, gate slices with evidence, replan without losing history. (Renamed from `/minni:plan`.)
 
 ## Vault Rules
 

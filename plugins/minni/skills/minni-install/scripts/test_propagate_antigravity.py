@@ -245,6 +245,8 @@ def test_x1_readonly_grant_set_excludes_write_tools():
         "minni_prepare_outcome",
         "minni_plan_update",
         "minni_plan_create",
+        "minni_thread_update",
+        "minni_thread_create",
     }
     assert not (set(propagate.MINNI_READONLY_TOOLS) & forbidden)
     assert propagate.MINNI_WILDCARD_GRANT not in propagate.MINNI_READONLY_GRANTS

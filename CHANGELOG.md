@@ -26,6 +26,35 @@ pre-1.0: minor versions may contain breaking changes until v1.0.0.
   `references/example-audit-2026-08-01.md` is a real run against this repo's
   README (67 items checked; 3 stale, 4 unverifiable).
 
+### Changed
+
+- **`minni:plan` is now `minni:threads`**: the 11 plan tools are renamed
+  `minni_plan_*` → `minni_thread_*` (create, update, scar, status, replan,
+  history, revision, diff, restore, activate, deactivate), and the slash
+  command `/minni:plan` becomes `/minni:threads`. The envelope keys injected
+  into agent context are renamed outright — `active_plan` → `active_thread`
+  and `active_plan_ref` → `active_thread_ref` — with no dual key: nothing
+  parses them (they are read by the model as prose) and duplicating the
+  pointer would spend up to ~12% of the small-context envelope budget for no
+  consumer benefit. The key regenerates from on-disk state on the next hook
+  fire, so the migration is self-healing.
+
+  **Deprecation window:** all 11 old `minni_plan_*` names stay registered as
+  aliases bound to the canonical handler, each with a description leading
+  `DEPRECATED — renamed to <new>`. They will be removed in the release after
+  next; a server registers 48 tools while the aliases are live (37 canonical
+  + 11 aliases), returning to 37 afterwards.
+
+  **Frozen on purpose — the rename is tool/command-layer only.** The `plan-`
+  artifact id prefix, the `plan_id` parameter name, the `plan.*` shared-gate
+  operation strings, the `minni_plan: true` / `plan_*` frontmatter keys, the
+  `_active_plan.json` pointer filename and the `hook_active_plan_error` audit
+  tool name are all unchanged. Those strings are baked into existing vault
+  filenames, `[[plan-<hex>]]` wikilinks, journals and audit history; renaming
+  them would split the vault's id space and orphan every inbound wikilink.
+  A regression test (`freeze guard` in `tests/plan.test.mjs`) fails loudly if
+  someone later "finishes" the rename.
+
 ### Fixed
 
 - **Distill ritual artifacts are now seeded**: `bootstrap-vault` (and therefore

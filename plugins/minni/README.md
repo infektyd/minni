@@ -112,7 +112,7 @@ rejected outright and disables the cloud provider.
 - `minni_ack_handoff`
 - `minni_list_pending_handoffs`
 - `minni_await_handoff`
-- `minni_plan_create` / `minni_plan_update` / `minni_plan_status` / `minni_plan_activate` / `minni_plan_deactivate` / `minni_plan_replan` / `minni_plan_history` / `minni_plan_diff` / `minni_plan_restore` / `minni_plan_scar`
+- `minni_thread_create` / `minni_thread_update` / `minni_thread_status` / `minni_thread_activate` / `minni_thread_deactivate` / `minni_thread_replan` / `minni_thread_history` / `minni_thread_revision` / `minni_thread_diff` / `minni_thread_restore` / `minni_thread_scar` (11 tools; the pre-rename `minni_plan_*` names stay registered as deprecated aliases until the release after next)
 - `minni_team_runtime` — temporary team packet with agent profiles, task ledger, hydration packets, gates, and non-goals
 - `minni_team_evidence` — dry-run evidence report plus promotion candidates; never promotes or learns automatically
 - `minni_team_promotion` — dry-run permanent-profile draft gated by explicit approval; never writes durable memory
