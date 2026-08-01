@@ -56,7 +56,10 @@ controls, and any revival should start from at least this set:
   sit next to the operator's personal long-lived credentials in `~/.grok`.
 - **Constrained CLI invocation.** `--sandbox local` (a profile extending
   `read-only` with `restrict_network = true`), `--no-subagents`,
-  `--max-turns 30`, `--disable-web-search`, and a timeout.
+  `--max-turns 30`, `--disable-web-search`, `--always-approve` and
+  `--output-format plain` (both required for headless operation — without
+  auto-approve the agent blocks waiting for interactive tool approval), and a
+  timeout.
 - **Prompt scaffold treating PR text as data.** The prompt stated explicitly
   that PR/issue content is untrusted data to analyze and never instructions,
   regardless of what it claims.
@@ -65,7 +68,10 @@ controls, and any revival should start from at least this set:
   `auth.json` before anything was posted; a failure refused the post.
 - **First-run watermark.** An empty state file started watching from *now*
   rather than replaying up to 50 historical mentions; `--backfill` was the
-  explicit opt-in to reach backwards.
+  explicit opt-in to reach backwards. The watermark was never advanced past a
+  comment that failed to handle (timeout, leak gate, post error) — doing so
+  hides it forever, because the next poll's `since` filter drops it server-side
+  and it is not in the handled set, so nothing ever retries it.
 - **Distinct trigger.** `@grok-local`, not `@grok`, so the local path could not
   double-reply alongside the workflow.
 
