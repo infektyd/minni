@@ -195,3 +195,43 @@ def test_ci_paths_are_denied(mod, path):
 @pytest.mark.parametrize("path", ["src/minni/cli.py", "docs/ops/grok-reviewer-app.md"])
 def test_ordinary_paths_are_not_denied(mod, path):
     assert mod.path_denied(path) is False
+
+
+def test_outstanding_request_changes_survives_a_later_marker(mod):
+    """Documented semantics: a CHANGES_REQUESTED review blocks until DISMISSED,
+    even if a newer review stamps eligibility."""
+    reviews = [
+        {
+            "user": {"login": "infektydgrokreviewer[bot]"},
+            "state": "CHANGES_REQUESTED",
+            "body": "nope",
+        },
+        {
+            "user": {"login": "infektydgrokreviewer[bot]"},
+            "state": "COMMENTED",
+            "body": f"fixed now\n{mod.ELIGIBILITY_MARKER}\n",
+        },
+    ]
+    eligible, blocked = mod.analyze_reviews(reviews)
+    assert eligible is True
+    assert blocked is True
+    assert mod.decide(_inp(mod, eligible=eligible,
+                           blocked_by_request_changes=blocked)).conclusion == "failure"
+
+
+def test_dismissed_request_changes_does_not_block(mod):
+    reviews = [
+        {
+            "user": {"login": "infektydgrokreviewer[bot]"},
+            "state": "DISMISSED",
+            "body": "was blocking",
+        },
+        {
+            "user": {"login": "infektydgrokreviewer[bot]"},
+            "state": "COMMENTED",
+            "body": f"ok\n{mod.ELIGIBILITY_MARKER}\n",
+        },
+    ]
+    eligible, blocked = mod.analyze_reviews(reviews)
+    assert eligible is True
+    assert blocked is False

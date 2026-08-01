@@ -116,4 +116,8 @@ human attention on gate/workflow changes.
 
 - `REQUEST_CHANGES` from the App clears eligibility until a later review
   stamps the marker again (re-open / ready_for_review to re-run Grok).
+- **A `CHANGES_REQUESTED` review keeps the check red until it is DISMISSED**,
+  even after a later review stamps the marker. The gate reads every review, not
+  just the newest per author, so a stale block does not silently expire. Dismiss
+  it (`gh pr review --dismiss`) or push a new SHA and let Grok re-review.
 - Push → new SHA → gate re-runs on `synchronize` / check completion (L4).

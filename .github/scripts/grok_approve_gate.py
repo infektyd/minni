@@ -372,10 +372,11 @@ def run_gate(
         )
     if pr_data.get("draft"):
         return GateDecision("failure", "draft", "Draft PRs stay red.")
-    if (pr_data.get("head") or {}).get("repo") and (
-        (pr_data["head"]["repo"].get("full_name") or "")
-        != f"{owner}/{repo}"
-    ):
+    # head.repo is null when the source repo was deleted; treat unknown as fork.
+    # The workflow's same-repo `if` only covers pull_request — check_suite and
+    # workflow_run reach this code for fork PRs too, so it must decide here.
+    head_repo = (pr_data.get("head") or {}).get("repo") or {}
+    if (head_repo.get("full_name") or "") != f"{owner}/{repo}":
         return GateDecision("failure", "fork", "Fork PRs are out of scope.")
 
     required = fetch_required_contexts(owner, repo, base_branch, token)
