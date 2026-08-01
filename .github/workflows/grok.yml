@@ -172,12 +172,14 @@ jobs:
           # Never post an empty comment.
           [ -s /tmp/grok-reply.md ] || echo "_Grok returned no output (see workflow logs)._" > /tmp/grok-reply.md
 
-      - name: Fail closed on credential-shaped output
+      - name: Fail closed on credential leakage
         run: |
-          if grep -qE '(eyJ[A-Za-z0-9_-]{20,}|refresh_token|"key"[[:space:]]*:|principal_id)' /tmp/grok-reply.md; then
-            echo "::error::Reply contains credential-shaped content — refusing to post."
-            exit 1
-          fi
+          # Compares the reply against the ACTUAL secret values (plus a JWT
+          # shape check) rather than against scary words. The earlier
+          # word-matching version blocked a legitimate review OF this very
+          # PR, because a credential-handling review necessarily says
+          # "refresh_token". See the script header.
+          python3 .github/scripts/check-no-credential-leak.py /tmp/grok-reply.md
 
       - name: Post reply
         env:
