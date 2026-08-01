@@ -74,6 +74,11 @@ jobs:
             echo "   scenario (concrete inputs -> wrong behavior), and a suggested fix."
             echo "3. Skip style nits unless they hide a defect. If the diff is clean,"
             echo "   say so plainly instead of inventing findings."
+            echo
+            echo "IMPORTANT: your reply IS the posted review. This is a single-shot,"
+            echo "non-interactive run — nobody reads a statement of intent. Do not"
+            echo "narrate what you are about to do, do not ask questions, do not end"
+            echo "your turn until the complete verdict + findings are written out."
           } > /tmp/grok-prompt.md
 
       - name: Run Grok review
