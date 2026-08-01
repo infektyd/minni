@@ -53,7 +53,10 @@ test("model-facing MCP input schemas do not expose local path authority", async 
     await readFile(new URL("../src/server.ts", import.meta.url), "utf8"),
   );
   const schemas = extractInputSchemas(source);
-  assert.equal(schemas.length, 37, "expected one schema per registered MCP tool");
+  // 37 canonical registrations + 1 from the DEPRECATED_TOOL_ALIASES loop, which
+  // emits a single literal `inputSchema:` reused by all 11 aliases.
+  // Restore to 37 when the aliases drop.
+  assert.equal(schemas.length, 38, "expected one schema per registered MCP tool");
 
   const forbiddenFields = [
     "vaultPath",
@@ -123,19 +126,19 @@ test("minni_resolve_candidate no longer advertises the unenforced mark_* decisio
   }
 });
 
-test("minni_plan_create schema exposes shelf_ref so a passed shelf actually configures drift checking (punch-list §4b)", async () => {
+test("minni_thread_create schema exposes shelf_ref so a passed shelf actually configures drift checking (punch-list §4b)", async () => {
   const source = stripLineComments(
     await readFile(new URL("../src/server.ts", import.meta.url), "utf8"),
   );
-  const start = source.indexOf('"minni_plan_create"');
-  assert.notEqual(start, -1, "minni_plan_create tool registration not found");
+  const start = source.indexOf('"minni_thread_create"');
+  assert.notEqual(start, -1, "minni_thread_create tool registration not found");
   const nextTool = source.indexOf("server.registerTool(", start + 1);
   const block = source.slice(start, nextTool === -1 ? undefined : nextTool);
 
   const schemaStart = block.indexOf("inputSchema:");
   const handlerStart = block.indexOf("async");
   const schema = block.slice(schemaStart, handlerStart);
-  assert.match(schema, /shelf_ref\s*:/, "minni_plan_create must expose shelf_ref in its inputSchema");
+  assert.match(schema, /shelf_ref\s*:/, "minni_thread_create must expose shelf_ref in its inputSchema");
   assert.match(schema, /shelf_ref[\s\S]*?\.optional\(\)/, "shelf_ref must be optional (additive, back-compat schema evolution)");
 
   // The handler must actually thread shelf_ref through to createPlan, not just

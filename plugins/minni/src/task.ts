@@ -236,7 +236,7 @@ export function classifyIntent(task: string): string {
   if (/review|audit|risk/.test(text)) return "review";
   if (/debug|fix|broken|failing|error/.test(text)) return "debug";
   if (/test|verify|smoke/.test(text)) return "verify";
-  if (/plan|design|think|upgrade|architecture/.test(text)) return "plan";
+  if (/plan|thread|design|think|upgrade|architecture/.test(text)) return "plan";
   if (/build|implement|add|create/.test(text)) return "implement";
   return "work";
 }

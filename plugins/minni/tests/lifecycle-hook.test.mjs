@@ -69,7 +69,7 @@ test("c3: nothing-salient turn STILL emits the lifecycle line (~297 early-return
     ctx.includes(MINNI_LIFECYCLE_LINE),
     "the 4-surface line must ride a weak-recall / no-active-plan turn",
   );
-  for (const surface of ["prepare_task", "prepare_outcome", "plan", "learn"]) {
+  for (const surface of ["prepare_task", "prepare_outcome", "thread", "learn"]) {
     assert.ok(ctx.includes(surface), `names ${surface}`);
   }
 });
@@ -89,7 +89,8 @@ test("c4: planning intent adds the Plan focus, at most once per session", async 
   const ctx1 = additionalContext(out1);
   assert.ok(ctx1.includes(MINNI_LIFECYCLE_LINE), "persistent line present");
   assert.ok(ctx1.includes('"lifecycle_focus"'), "focus field present on a planning turn");
-  assert.ok(ctx1.includes(buildLifecycleEmphasis("plan")), "Plan focus names its options");
+  // the "plan" INTENT still maps to the renamed "thread" SURFACE
+  assert.ok(ctx1.includes(buildLifecycleEmphasis("thread")), "Thread focus names its options");
 
   // second planning turn in the SAME session: persistent line stays, focus is gone
   const out2 = await runUserPromptIn(fx, "plan the migration approach next");

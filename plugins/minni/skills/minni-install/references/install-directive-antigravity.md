@@ -1,9 +1,9 @@
 # Minni install directive — Antigravity (CLI `agy` + IDE) · gemini-cli
 
-Goal: Minni at Claude-Code parity across Antigravity surfaces (MCP `minni@minni` 26 tools · Layer-1 via GEMINI.md · memory-first · per-agent `gemini` vault). Audited 2026-05-30. All three surfaces are installed and share the `~/.gemini/` tree (there is no `~/.antigravity`).
+Goal: Minni at Claude-Code parity across Antigravity surfaces (MCP `minni@minni` 37 tools, 48 during the minni:threads alias window · Layer-1 via GEMINI.md · memory-first · per-agent `gemini` vault). Audited 2026-05-30. All three surfaces are installed and share the `~/.gemini/` tree (there is no `~/.antigravity`).
 
 ## Current state (broken)
-All MCP config views point at the **legacy `sovereign-memory`** server → dead `~/.sovereign-memory/run/sovrd.sock`; the IDE view has an outright broken `cwd: ~/sovereignMemory/...` (nonexistent). Only ~7 old `sovereign_*` tools are auto-granted, not the 26 `minni_*`. The repo `minni` plugin is NOT installed on any Gemini surface (no `~/.gemini/extensions/minni/`). `GEMINI.md` (`~/.agents/GEMINI.md`) is old-brand. Vault `~/.minni/gemini-vault` exists; envelope stale (`sovrd.sock`). Daemon up on `~/.minni/run/minnid.sock`.
+All MCP config views point at the **legacy `sovereign-memory`** server → dead `~/.sovereign-memory/run/sovrd.sock`; the IDE view has an outright broken `cwd: ~/sovereignMemory/...` (nonexistent). Only ~7 old `sovereign_*` tools are auto-granted, not the full `minni_*` set. The repo `minni` plugin is NOT installed on any Gemini surface (no `~/.gemini/extensions/minni/`). `GEMINI.md` (`~/.agents/GEMINI.md`) is old-brand. Vault `~/.minni/gemini-vault` exists; envelope stale (`sovrd.sock`). Daemon up on `~/.minni/run/minnid.sock`.
 
 ## Mechanism (official)
 - MCP (all 3 Antigravity surfaces): single shared `~/.gemini/config/mcp_config.json` (symlinked to `~/.agents/mcp-servers/views/.gemini__config__mcp_config.json.json`); `antigravity-cli/mcp/` + `antigravity-ide/mcp/` are *generated* from it. Stdio entry = `command`+`args`+`env`; IDE entries carry `"$typeName":"exa.cascade_plugins_pb.CascadePluginCommandTemplate"` (preserve on hand-edit). Remote key is `serverUrl` (n/a for Minni). gemini-cli (standalone) uses a DIFFERENT file: `~/.gemini/settings.json` → `mcpServers` (with `"trust": true`).
@@ -20,11 +20,13 @@ All MCP config views point at the **legacy `sovereign-memory`** server → dead 
    - `mcp(minni/minni_drill)`
    - `mcp(minni/minni_route)`
    - `mcp(minni/minni_prepare_task)`
-   - `mcp(minni/minni_plan_status)`
-   - `mcp(minni/minni_plan_history)`
+   - `mcp(minni/minni_thread_status)`
+   - `mcp(minni/minni_thread_history)`
+   - `mcp(minni/minni_plan_status)` (deprecated alias — drop when the aliases are removed)
+   - `mcp(minni/minni_plan_history)` (deprecated alias — drop when the aliases are removed)
    - `mcp(minni/minni_ping_agent_inbox)`
    - `mcp(minni/minni_ping_agent_status)`
-   Writes (`minni_learn`, `minni_vault_write`, `minni_resolve_candidate`, `minni_plan_update`, handoff/ping decide, etc.) must **not** appear in auto-grant — they require per-session prompt approval.
+   Writes (`minni_learn`, `minni_vault_write`, `minni_resolve_candidate`, `minni_thread_update` and its `minni_plan_update` alias, handoff/ping decide, etc.) must **not** appear in auto-grant — they require per-session prompt approval.
    Drop the old `sovereign-memory/sovereign_*` grants.
 4. (gemini-cli, optional) add the `minni` block to `~/.gemini/settings.json mcpServers` with `"trust": true`.
 5. Rebrand `~/.agents/GEMINI.md` → Minni, vault `~/.minni/gemini-vault`, server `minni`, tools `minni_*`; add "consult `minni_status` + `minni_recall` first" directive.
@@ -36,4 +38,4 @@ All MCP config views point at the **legacy `sovereign-memory`** server → dead 
 - Restart CLI + IDE so `antigravity-cli/mcp/minni` and `antigravity-ide/mcp/minni` regenerate.
 
 ## Verify
-`ls ~/.gemini/antigravity-{cli,ide}/mcp/minni` (generated dirs appear); fresh `agy` session + IDE agent panel show `minni` connected with 26 `minni_*` tools; `minni_status` reports the daemon on `minnid.sock`.
+`ls ~/.gemini/antigravity-{cli,ide}/mcp/minni` (generated dirs appear); fresh `agy` session + IDE agent panel show `minni` connected with the full `minni_*` tool set (37 canonical, 48 during the alias window); `minni_status` reports the daemon on `minnid.sock`.

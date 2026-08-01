@@ -58,9 +58,11 @@ the first failing layer; everything below it will look broken too.
   `MINNI_SOCKET_PATH=~/.minni/run/minnid.sock`, `MINNI_WORKSPACE_ID`.
 - Missing env = the platform may silently fall back to another agent's
   defaults. That is an identity-boundary failure, not a cosmetic one.
-- Tool count sanity: a current server registers **37 `minni_*` tools**
-  (including the 11 `minni_plan_*` tools). Far fewer visible = stale plugin
-  build or cache.
+- Tool count sanity: a current server registers **48 `minni_*` tools during the
+  minni:threads alias window** — 37 canonical registrations (including the 11
+  `minni_thread_*` tools) plus 11 deprecated `minni_plan_*` aliases. The count
+  returns to **37** when the aliases are dropped in the release after next.
+  Far fewer visible = stale plugin build or cache.
 
 ## Layer 4 — Hooks (per platform, shared semantics)
 
@@ -112,10 +114,10 @@ Healthy inboxes drain. PR #69 semantics:
 
 ## Layer 8 — Plans
 
-- An active plan (`minni_plan_*`) injects into SessionStart/UserPromptSubmit on
+- An active thread (`minni_thread_*`) injects into SessionStart/UserPromptSubmit on
   all four platforms and survives compaction. Active plan set but absent from
   envelopes = injection gap.
-- Plan updates must go through `minni_plan_update` (journaled); a plan note
+- Thread updates must go through `minni_thread_update` (journaled); a thread note
   edited by hand without journal events is drift.
 
 ## Test suites as health instruments

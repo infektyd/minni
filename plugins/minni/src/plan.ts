@@ -187,7 +187,7 @@ function parsePlanDigestTag(stored: string): { version: number; hex: string } | 
 /**
  * A note whose declared digest version is newer than this plugin understands.
  * Typed (not a bare Error) so recovery paths can tell it apart from a tamper:
- * minni_plan_restore must refuse to "heal" such a note — writing it back with
+ * minni_thread_restore must refuse to "heal" such a note — writing it back with
  * this plugin's older schema would silently downgrade newer fields.
  */
 export class PlanDigestVersionError extends Error {
@@ -237,7 +237,7 @@ function assertKnownDigestVersion(
 /**
  * Statuses a plan never returns from. Mirrors resolveActivePlanView's
  * injection-suppression set; shared by createPlan's displacement warning and
- * the minni_plan_activate terminal guard (#122).
+ * the minni_thread_activate terminal guard (#122).
  */
 export const TERMINAL_PLAN_STATUSES: ReadonlySet<string> = new Set([
   "accepted",
@@ -548,6 +548,12 @@ export async function createPlan(
 
   const nowDate = nowFn();
   const created = nowDate.toISOString();
+  // Ids stay 'plan-' prefixed after the minni:threads rename — the prefix is baked
+  // into existing filenames (wiki/artifacts/plan-<hex>.md), [[plan-<hex>]] wikilinks,
+  // journals, history siblings and audit history. The rename is tool/command-layer
+  // only. Changing this splits the vault's id space and orphans every inbound
+  // wikilink; it needs a real migration, not an edit here. Guarded by the
+  // "freeze guard" test in tests/plan.test.mjs.
   const plan_id = `plan-${createHash("sha256").update(input.goal + created).digest("hex").slice(0, 16)}`;
 
   const shelf_ref = normalizeShelfRef(input.shelf_ref);
@@ -951,7 +957,7 @@ export async function rehydratePlan(notePath: string): Promise<PlanArtifact> {
   // verification). A note declaring a NEWER version must throw the typed
   // PlanDigestVersionError immediately — this plugin cannot judge a newer
   // schema, and a generic validation error thrown first would be misread by
-  // recovery paths (minni_plan_restore) as recoverable corruption, letting an
+  // recovery paths (minni_thread_restore) as recoverable corruption, letting an
   // older plugin downgrade-write the newer note.
   const { storedTag, declaredVersion } = assertKnownDigestVersion(fm, notePath);
 
@@ -1066,7 +1072,7 @@ export async function rehydratePlan(notePath: string): Promise<PlanArtifact> {
  * skeleton PlanArtifact carrying the frontmatter scalars that restorePlan
  * consumes from `current` (plan_id, status, created, updated, plan_digest, rev)
  * plus leniently-parsed slices for the activate guard, with NO digest or
- * evidence validation — so minni_plan_restore can heal a note
+ * evidence validation — so minni_thread_restore can heal a note
  * whose strict rehydratePlan throws (the exact bricked state it exists to fix).
  * Every digest-covered field comes from the history snapshot, and persistPlan
  * recomputes the digest on write, so nothing corrupt survives the restore.
@@ -1343,13 +1349,13 @@ export async function activatePlanChecked(
   if (TERMINAL_PLAN_STATUSES.has(scalars.status)) {
     return {
       ok: false,
-      error: `plan ${plan_id} has terminal status '${scalars.status}' and cannot be re-activated; create a new plan (minni_plan_create) or restore a prior revision (minni_plan_restore) instead`,
+      error: `plan ${plan_id} has terminal status '${scalars.status}' and cannot be re-activated; create a new plan (minni_thread_create) or restore a prior revision (minni_thread_restore) instead`,
     };
   }
   if (allSlicesResolved(scalars.slices)) {
     return {
       ok: false,
-      error: `plan ${plan_id} has every slice resolved (done/superseded) and is effectively complete despite its '${scalars.status}' status; it cannot be re-activated — create a new plan (minni_plan_create) or restore a prior revision (minni_plan_restore) instead`,
+      error: `plan ${plan_id} has every slice resolved (done/superseded) and is effectively complete despite its '${scalars.status}' status; it cannot be re-activated — create a new plan (minni_thread_create) or restore a prior revision (minni_thread_restore) instead`,
     };
   }
   await setActivePlan(vaultPath, plan_id, notePath);
@@ -1403,7 +1409,7 @@ export async function clearActivePlan(vaultPath: string): Promise<void> {
  * open_questions array (~1.8 KB, static) and pending-slice list.
  *
  * Plan parity (audit C5): ALL hooks (claude-code, codex, grok, kilocode) MUST
- * build their UserPromptSubmit `active_plan_ref` through this function so the
+ * build their UserPromptSubmit `active_thread_ref` through this function so the
  * budget discipline cannot drift per hook.
  */
 export function compactPlanPointer(active: {
@@ -1429,7 +1435,7 @@ export function compactPlanPointer(active: {
     progress: v.progress,
     open_questions_count: Array.isArray(v.open_questions) ? v.open_questions.length : 0,
     scar_tissue: v.scar_tissue,
-    pull: "Full plan (goal, open_questions, slices) omitted to save context. Call minni_plan_status for detail on demand.",
+    pull: "Full plan (goal, open_questions, slices) omitted to save context. Call minni_thread_status for detail on demand.",
   };
 }
 
@@ -1449,7 +1455,7 @@ export async function resolvePlanIdOrActive(
   if (!active) {
     return {
       error:
-        "no plan_id provided and no active plan is set; pass plan_id explicitly or activate one with minni_plan_activate",
+        "no plan_id provided and no active plan is set; pass plan_id explicitly or activate one with minni_thread_activate",
     };
   }
   return { plan_id: active.plan_id };

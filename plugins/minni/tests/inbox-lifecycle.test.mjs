@@ -645,12 +645,23 @@ test("all four hooks inject the active plan through the shared plan helpers (C5 
       `${hook} must resolve the active plan`,
     );
     assert.ok(
-      /active_plan\s*=\s*activePlan/.test(source),
-      `${hook} SessionStart must inject the full active_plan view`,
+      /active_thread\s*=\s*activePlan/.test(source),
+      `${hook} SessionStart must inject the full active_thread view`,
     );
     assert.ok(
-      source.includes("active_plan_ref = compactPlanPointer("),
-      `${hook} UserPromptSubmit must inject the compact plan pointer (budget discipline)`,
+      source.includes("active_thread_ref = compactPlanPointer("),
+      `${hook} UserPromptSubmit must inject the compact thread pointer (budget discipline)`,
+    );
+    // minni:threads rename emits ONE key, not a dual key -- nothing parses these,
+    // so a second copy only costs envelope budget. Asserting the old keys are
+    // ABSENT catches a straggler emitter left on the pre-rename name.
+    assert.ok(
+      !/envelopeBody\.active_plan\b/.test(source),
+      `${hook} must not still emit the pre-rename active_plan key`,
+    );
+    assert.ok(
+      !/envelopeBody\.active_plan_ref\b/.test(source),
+      `${hook} must not still emit the pre-rename active_plan_ref key`,
     );
   }
 });

@@ -241,7 +241,7 @@ async function handleSessionStart(payload: Record<string, unknown>): Promise<Hoo
   }
 
   if (activePlan !== undefined) {
-    envelopeBody.active_plan = activePlan;
+    envelopeBody.active_thread = activePlan;
   }
 
   const budget = envelopeBudgetFor(CLAUDECODE_CONTEXT_WINDOW);
@@ -473,14 +473,14 @@ async function handleUserPromptSubmit(payload: Record<string, unknown>): Promise
     }).catch(() => {});
   }
 
-  let active_plan_ref: ReturnType<typeof compactPlanPointer> | undefined;
+  let active_thread_ref: ReturnType<typeof compactPlanPointer> | undefined;
   if (activePlan !== undefined) {
-    active_plan_ref = compactPlanPointer(activePlan);
+    active_thread_ref = compactPlanPointer(activePlan);
   }
 
   // Nothing salient to inject this turn: no strong recall, no stale fallback
   // pointer AND no active plan.
-  if (!strong && stalePointer === undefined && active_plan_ref === undefined) {
+  if (!strong && stalePointer === undefined && active_thread_ref === undefined) {
     await recordAudit(CLAUDECODE_VAULT_PATH, {
       tool: "hook_user_prompt_submit",
       summary: prompt.slice(0, 120),
@@ -534,12 +534,12 @@ async function handleUserPromptSubmit(payload: Record<string, unknown>): Promise
   // Option C: inject a compact plan POINTER per turn, not the full plan. The
   // headline + next_action are the actionable one-liners the agent needs every
   // turn; the full goal/open_questions/pending list is omitted (it barely changes
-  // turn-to-turn) and pulled on demand via minni_plan_status. SessionStart still
+  // turn-to-turn) and pulled on demand via minni_thread_status. SessionStart still
   // injects the full plan view for boot/rehydration.
   if (activePlan !== undefined) {
     // Plan parity (audit C5): inline the compact-pointer call so all four hooks
     // share the same wire shape.
-    envelopeBody.active_plan_ref = compactPlanPointer(activePlan);
+    envelopeBody.active_thread_ref = compactPlanPointer(activePlan);
   }
 
   const envelope = wrapEnvelope({

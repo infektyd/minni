@@ -1,3 +1,9 @@
+
+> **Superseded 2026-07-31:** the `minni_plan_*` tools and `/minni:plan` command described
+> below were renamed to `minni_thread_*` and `/minni:threads`. On-disk artifact naming
+> (`plan_id`, the `plan-<hex>` id prefix, `plan_*` frontmatter, `_active_plan.json`, the
+> `plan.*` gate keys) is unchanged. This document is a historical record, not current guidance.
+
 **Convergence status:** NOT CONVERGED (round cap hit — open findings may remain) after 3 round(s). Method: code-grounded adversarial design converge (Ground 5 readers / opus design / 4-lens review / skeptic verify / revise loop).
 
 ---

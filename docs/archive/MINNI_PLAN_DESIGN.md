@@ -1,5 +1,11 @@
 # `/minni:plan` — first-class durable planning + layer-1 continuity (design note)
 
+> **Superseded 2026-07-31:** the `minni_plan_*` tools and `/minni:plan` command described
+> below were renamed to `minni_thread_*` and `/minni:threads`. On-disk artifact naming
+> (`plan_id`, the `plan-<hex>` id prefix, `plan_*` frontmatter, `_active_plan.json`, the
+> `plan.*` gate keys) is unchanged. This document is a historical record, not current guidance.
+
+
 > Origin (Hans, 2026-06-04): make Minni more *part of* the agent via a first-class `/minni:plan` that
 > (A) survives crash/compaction (plan lives on disk, re-hydrates), and (B) keeps the layer-1 identity
 > shelf *reachable* across compactions WITHOUT force-injecting the ~4k-token shelf — the plan carries a

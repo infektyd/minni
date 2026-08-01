@@ -75,8 +75,8 @@ test("#122/1: restore path heals a digest-bricked note via bare-scalar rehydrate
   }
 });
 
-test("#122/1: minni_plan_restore handler falls back to rehydratePlanScalars (source pin)", () => {
-  const block = handlerBlock("minni_plan_restore");
+test("#122/1: minni_thread_restore handler falls back to rehydratePlanScalars (source pin)", () => {
+  const block = handlerBlock("minni_thread_restore");
   assert.match(
     block,
     /rehydratePlanScalars/,
@@ -182,8 +182,8 @@ test("#122/2: createPlan conservatively warns when the incumbent is a newer-vers
   }
 });
 
-test("#122/2: minni_plan_create handler returns displaced_active + warning (source pin)", () => {
-  const block = handlerBlock("minni_plan_create");
+test("#122/2: minni_thread_create handler returns displaced_active + warning (source pin)", () => {
+  const block = handlerBlock("minni_thread_create");
   assert.match(block, /displaced_active/, "create response must surface the displaced plan_id");
   assert.match(block, /warning/, "create response must carry a warning field when displacing");
 });
@@ -283,8 +283,8 @@ test("#122/3: terminal set mirrors resolveActivePlanView's suppression set", () 
   );
 });
 
-test("#122/3: minni_plan_activate handler routes through the guard (source pin)", () => {
-  const block = handlerBlock("minni_plan_activate");
+test("#122/3: minni_thread_activate handler routes through the guard (source pin)", () => {
+  const block = handlerBlock("minni_thread_activate");
   assert.match(block, /activatePlanChecked/, "activate handler must use the terminal-status guard");
 });
 
@@ -471,7 +471,7 @@ test("#122/4: newer-version gate fires BEFORE current-schema validations (eviden
   // Codex re-review round 3: a plan_digest_v: 3 note whose slice shape is
   // invalid under the CURRENT schema (e.g. v3 moved evidence elsewhere) must
   // throw the typed PlanDigestVersionError, not the generic evidence error —
-  // otherwise minni_plan_restore's downgrade guard (which keys on the typed
+  // otherwise minni_thread_restore's downgrade guard (which keys on the typed
   // error) falls through to the bare-scalar heal path and can persist a v2
   // restore over a newer writer's note.
   const root = await mkdtemp(path.join(tmpdir(), "i122-digest-newer-schema-"));
@@ -574,8 +574,8 @@ test("#122/4: dual declaration that AGREES ('v2:' prefix + plan_digest_v: 2) sti
   }
 });
 
-test("#122/4: minni_plan_restore handler re-throws PlanDigestVersionError (source pin)", () => {
-  const block = handlerBlock("minni_plan_restore");
+test("#122/4: minni_thread_restore handler re-throws PlanDigestVersionError (source pin)", () => {
+  const block = handlerBlock("minni_thread_restore");
   assert.match(
     block,
     /PlanDigestVersionError/,

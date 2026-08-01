@@ -1,5 +1,9 @@
 import path from "node:path";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import {
+  McpServer,
+  type RegisteredTool,
+  type ToolCallback,
+} from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import {
@@ -1210,7 +1214,7 @@ const planSliceInputSchema = z.object({
 });
 
 // Punch-list §4b: shelf_ref was accepted end-to-end by createPlan/normalizeShelfRef
-// already, but never exposed on the MCP schema, so shelfDrift() (minni_plan_status)
+// already, but never exposed on the MCP schema, so shelfDrift() (minni_thread_status)
 // always reported configured:false. Additive/optional nested object (no union) —
 // existing callers that omit shelf_ref are unaffected.
 const planShelfRefInputSchema = z.object({
@@ -1222,10 +1226,10 @@ const planShelfRefInputSchema = z.object({
   shelf_content: z.string().optional(),
 });
 
-server.registerTool(
-  "minni_plan_create",
+const threadCreateTool = server.registerTool(
+  "minni_thread_create",
   {
-    title: "Minni Plan Create",
+    title: "Minni Thread Create",
     description:
       "Create a proposal-first Minni plan artifact in the vault (draft slices, constraints, open questions).",
     inputSchema: {
@@ -1262,7 +1266,7 @@ server.registerTool(
           ...(displaced_active
             ? {
                 displaced_active,
-                warning: `active plan ${displaced_active} was in-flight and has been displaced by this new plan; id-less plan tools now target the new plan. Re-activate it with minni_plan_activate if that was unintended.`,
+                warning: `active plan ${displaced_active} was in-flight and has been displaced by this new plan; id-less plan tools now target the new plan. Re-activate it with minni_thread_activate if that was unintended.`,
               }
             : {}),
         },
@@ -1297,10 +1301,10 @@ async function resolvePlanTarget(
   return { ok: true, plan_id, notePath };
 }
 
-server.registerTool(
-  "minni_plan_update",
+const threadUpdateTool = server.registerTool(
+  "minni_thread_update",
   {
-    title: "Minni Plan Update",
+    title: "Minni Thread Update",
     description:
       "Update one plan slice status (evidence required for done). Persists vault note and appends journal event. plan_id defaults to the active plan.",
     inputSchema: {
@@ -1365,10 +1369,10 @@ server.registerTool(
   },
 );
 
-server.registerTool(
-  "minni_plan_scar",
+const threadScarTool = server.registerTool(
+  "minni_thread_scar",
   {
-    title: "Minni Plan Scar",
+    title: "Minni Thread Scar",
     description:
       "Record a dead-end, failed command, or rejected hypothesis during plan execution to prevent retries. plan_id defaults to the active plan.",
     inputSchema: {
@@ -1398,10 +1402,10 @@ server.registerTool(
   },
 );
 
-server.registerTool(
-  "minni_plan_status",
+const threadStatusTool = server.registerTool(
+  "minni_thread_status",
   {
-    title: "Minni Plan Status",
+    title: "Minni Thread Status",
     description:
       "Compact plan view for agent context; optional live shelf content surfaces drift only (never auto-pull). plan_id defaults to the active plan.",
     inputSchema: {
@@ -1429,10 +1433,10 @@ server.registerTool(
   },
 );
 
-server.registerTool(
-  "minni_plan_replan",
+const threadReplanTool = server.registerTool(
+  "minni_thread_replan",
   {
-    title: "Minni Plan Replan",
+    title: "Minni Thread Replan",
     description:
       "Replan preserving slice history: supersede dropped non-final slices, append new proposals, persist + journal. plan_id defaults to the active plan.",
     inputSchema: {
@@ -1469,10 +1473,10 @@ server.registerTool(
   },
 );
 
-server.registerTool(
-  "minni_plan_history",
+const threadHistoryTool = server.registerTool(
+  "minni_thread_history",
   {
-    title: "Minni Plan History",
+    title: "Minni Thread History",
     description: "Read revision history of a Minni plan. plan_id defaults to the active plan.",
     inputSchema: {
       plan_id: z.string().min(1).optional(),
@@ -1495,10 +1499,10 @@ server.registerTool(
   },
 );
 
-server.registerTool(
-  "minni_plan_revision",
+const threadRevisionTool = server.registerTool(
+  "minni_thread_revision",
   {
-    title: "Minni Plan Revision",
+    title: "Minni Thread Revision",
     description: "Get a specific plan revision snapshot from history.",
     inputSchema: {
       plan_id: z.string().min(1),
@@ -1521,10 +1525,10 @@ server.registerTool(
   },
 );
 
-server.registerTool(
-  "minni_plan_diff",
+const threadDiffTool = server.registerTool(
+  "minni_thread_diff",
   {
-    title: "Minni Plan Diff",
+    title: "Minni Thread Diff",
     description: "Compare two plan revisions and return the differences.",
     inputSchema: {
       plan_id: z.string().min(1),
@@ -1553,10 +1557,10 @@ server.registerTool(
   },
 );
 
-server.registerTool(
-  "minni_plan_restore",
+const threadRestoreTool = server.registerTool(
+  "minni_thread_restore",
   {
-    title: "Minni Plan Restore",
+    title: "Minni Thread Restore",
     description: "Restore plan state to a previous revision (forward revert).",
     inputSchema: {
       plan_id: z.string().min(1),
@@ -1605,10 +1609,10 @@ server.registerTool(
   },
 );
 
-server.registerTool(
-  "minni_plan_activate",
+const threadActivateTool = server.registerTool(
+  "minni_thread_activate",
   {
-    title: "Minni Plan Activate",
+    title: "Minni Thread Activate",
     description: "Explicitly set a plan as the active plan for the vault.",
     inputSchema: {
       plan_id: z.string().min(1),
@@ -1632,10 +1636,10 @@ server.registerTool(
   },
 );
 
-server.registerTool(
-  "minni_plan_deactivate",
+const threadDeactivateTool = server.registerTool(
+  "minni_thread_deactivate",
   {
-    title: "Minni Plan Deactivate",
+    title: "Minni Thread Deactivate",
     description: "Clear the active plan pointer for the vault.",
     inputSchema: {},
   },
@@ -1647,6 +1651,47 @@ server.registerTool(
     return textResult(JSON.stringify({ active: null }, null, 2));
   },
 );
+
+// ── Deprecation shim: minni_plan_* → minni_thread_* ────────────────────────
+// One-release alias window for the minni:plan → minni:threads rename. Each old
+// name re-registers the CANONICAL tool's own handler and schema, so behaviour
+// is byte-identical — only the description differs, leading with "DEPRECATED"
+// so the model reads the migration notice on every turn.
+//
+// REMOVE IN THE RELEASE AFTER NEXT: delete this block, the 11 `const
+// thread*Tool =` bindings above (back to bare `server.registerTool(`), and
+// tests/thread-alias.test.mjs; restore the tool-schema-boundary count to 37.
+//
+// The `as unknown as` casts are load-bearing: RegisteredTool.inputSchema is a
+// COMPILED zod schema (AnySchema), while registerTool's config is generic over
+// a raw shape. The SDK's getZodSchemaObject() passes a compiled schema through
+// unchanged (mcp.js:861), so this is a type-level bridge only, not a runtime
+// reinterpretation.
+const DEPRECATED_TOOL_ALIASES: ReadonlyArray<readonly [string, string, RegisteredTool]> = [
+  ["minni_plan_create", "minni_thread_create", threadCreateTool],
+  ["minni_plan_update", "minni_thread_update", threadUpdateTool],
+  ["minni_plan_scar", "minni_thread_scar", threadScarTool],
+  ["minni_plan_status", "minni_thread_status", threadStatusTool],
+  ["minni_plan_replan", "minni_thread_replan", threadReplanTool],
+  ["minni_plan_history", "minni_thread_history", threadHistoryTool],
+  ["minni_plan_revision", "minni_thread_revision", threadRevisionTool],
+  ["minni_plan_diff", "minni_thread_diff", threadDiffTool],
+  ["minni_plan_restore", "minni_thread_restore", threadRestoreTool],
+  ["minni_plan_activate", "minni_thread_activate", threadActivateTool],
+  ["minni_plan_deactivate", "minni_thread_deactivate", threadDeactivateTool],
+];
+
+for (const [oldName, newName, canonical] of DEPRECATED_TOOL_ALIASES) {
+  server.registerTool(
+    oldName,
+    {
+      title: canonical.title,
+      description: `DEPRECATED — renamed to ${newName}. This alias is removed in the next release; call the new name. ${canonical.description ?? ""}`,
+      inputSchema: canonical.inputSchema as unknown as Record<string, z.ZodTypeAny>,
+    },
+    canonical.handler as ToolCallback<Record<string, z.ZodTypeAny>>,
+  );
+}
 
 async function main() {
   const transport = new StdioServerTransport();
