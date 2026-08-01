@@ -284,6 +284,14 @@ jobs:
 
    Bind nothing until that prints the JSON. A 403 means the permission grant
    has not been accepted on the installation yet.
+
+   Caveat, proven by execution: `workflow_dispatch` only registers workflows
+   that exist on the **default branch** — dispatching this file from a topic
+   branch returns 404. Either land the throwaway on main (and delete it after
+   use, as above), or skip the throwaway entirely: a gate run on a real PR
+   exercises the same mint + protection read and reports the same failure
+   modes by name (`no app token` at the mint step, `cannot read protection`
+   for a 403), so one canary PR is an equivalent probe.
 2. **Bind the required context to the App's `app_id`**, not a bare name.
 
 Classic branch protection already supports this and this repo already uses it:
