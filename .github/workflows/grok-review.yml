@@ -5,9 +5,12 @@ name: Grok Code Review
 # Grok subscription (device-auth OAuth secret GROK_CI_AUTH_JSON — minting and
 # rotation notes in .github/workflows/grok.yml).
 #
-# Formal Reviews API events (REQUEST_CHANGES / COMMENT only — never LLM
-# APPROVE) require the user-owned GitHub App. Setup: docs/ops/grok-reviewer-app.md
-# When vars.GROK_APP_ID is unset, this workflow degrades to a PR comment.
+# Formal Reviews API events: REQUEST_CHANGES / COMMENT only. VERDICT: APPROVE
+# is posted as COMMENT plus an eligibility marker for the mechanical check-run
+# gate (grok-approve-gate.yml) — bot Reviews API APPROVE does not clear
+# reviewDecision on this user-owned repo (measured #222). Setup:
+# docs/ops/grok-reviewer-app.md. When vars.GROK_APP_ID is unset, degrades to
+# a PR comment.
 #
 # Scope guards:
 # * Same-repo PRs only — `pull_request` from forks gets no secrets from
@@ -15,37 +18,148 @@ name: Grok Code Review
 # * Skips draft PRs. Concurrency group cancels in-progress runs if a second
 #   trigger fires for the same PR (e.g. ready_for_review while opened runs).
 
+# METERING MODEL: exactly one subscription-metered review per deliberate
+# request. Those are: opened / ready_for_review / reopened, and an explicit
+# `/grok-review` comment from a collaborator. Deliberately NOT `synchronize` —
+# that would bill a review per push.
+#
+# The comment command exists because eligibility is bound to the head SHA: once
+# agents push fixes, the previous review's stamp is worthless and the only ways
+# to re-earn it used to be close/reopen or dismissing the review without
+# re-earning anything. Both are worse than asking for a review explicitly.
+#
+# BOOTSTRAP: `issue_comment` is not a PR event — GitHub runs the workflow file
+# from the DEFAULT branch, so the command does nothing until this lands on
+# main. It cannot be exercised on the PR that introduces it. That default-branch
+# execution is also the trust-anchor property we want, and it is why the
+# resolver reads the head SHA from the API instead of a payload.
 on:
   pull_request:
     types: [opened, ready_for_review, reopened]
-    # Deliberately NOT on `synchronize`: one subscription-metered review per
-    # open/ready/reopen, not per push. A formal App REQUEST_CHANGES stays sticky
-    # until dismissed (v1 App never APPROVEs; a later COMMENT does not clear it).
-    # draft→ready / close→reopen only re-fire the job for fresh findings.
+  issue_comment:
+    types: [created]
 
 permissions:
   contents: read
   pull-requests: write
+  # Reacting to the command comment (/issues/comments/{id}/reactions) is an
+  # issues-scoped write even when the comment lives on a PR.
+  issues: write
 
 concurrency:
-  group: grok-review-${{ github.event.pull_request.number }}
+  # issue_comment carries no pull_request payload; both events land on the PR
+  # number so two rapid commands coalesce instead of double-billing.
+  group: grok-review-${{ github.event.pull_request.number || github.event.issue.number }}
   cancel-in-progress: true
 
 jobs:
   grok-review:
+    # Cheap pre-filter only. The authoritative command match is the exact
+    # trimmed comparison in `Resolve PR`; `startsWith` here just avoids spinning
+    # a runner for every comment on the repo. Neither path spends a metered
+    # review before those checks pass.
     if: |
-      github.event.pull_request.head.repo.full_name == github.repository &&
-      github.event.pull_request.draft == false
+      (github.event_name == 'pull_request' &&
+       github.event.pull_request.head.repo.full_name == github.repository &&
+       github.event.pull_request.draft == false) ||
+      (github.event_name == 'issue_comment' &&
+       github.event.issue.pull_request != null &&
+       contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'),
+                github.event.comment.author_association) &&
+       startsWith(github.event.comment.body, '/grok-review'))
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
+      # issue_comment runs from the DEFAULT branch and its payload has no PR
+      # head, so resolve the CURRENT head SHA from the API. Reviewing a stale
+      # SHA would stamp eligibility that the gate then rejects.
+      - name: Resolve PR
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+        run: |
+          set -euo pipefail
+          skip() { echo "skip=true" >> "$GITHUB_OUTPUT"; echo "reason=$1" >> "$GITHUB_OUTPUT"; echo "$1"; exit 0; }
+
+          if [ "${{ github.event_name }}" = "issue_comment" ]; then
+            # Exact command, not a substring: prose that merely mentions
+            # /grok-review must not burn a metered review.
+            BODY="$(printf '%s' "$COMMENT_BODY" | tr -d '\r' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+            if [ "$BODY" != "/grok-review" ]; then
+              skip "comment is not exactly /grok-review"
+            fi
+            NUM="${{ github.event.issue.number }}"
+          else
+            # NOT steps.resolve.outputs.pr: the steps context only holds
+            # COMPLETED steps, so referencing this step's own output from
+            # inside it expands empty and kills auto-review.
+            NUM="${{ github.event.pull_request.number }}"
+          fi
+
+          META="$(gh api "repos/${{ github.repository }}/pulls/${NUM}")"
+          SHA="$(printf '%s' "$META" | jq -r '.head.sha')"
+          REF="$(printf '%s' "$META" | jq -r '.head.ref')"
+          SAME="$(printf '%s' "$META" | jq -r '.head.repo.full_name // ""')"
+          DRAFT="$(printf '%s' "$META" | jq -r '.draft')"
+          STATE="$(printf '%s' "$META" | jq -r '.state')"
+
+          [ "$STATE" = "open" ] || skip "PR is not open"
+          [ "$SAME" = "${{ github.repository }}" ] || skip "fork PRs are out of scope"
+          [ "$DRAFT" != "true" ] || skip "PR is a draft"
+
+          # Dedup: an App review already covering this SHA means a repeat
+          # command would double-bill for the same diff.
+          # Deliberately counts DISMISSED reviews too. Agents can dismiss, so
+          # keying on non-dismissed reviews would let dismiss + /grok-review
+          # re-roll the model on identical code until it happens to say yes.
+          # Same SHA reviewed before = skip, whatever became of that review.
+          # Piped to jq, NOT `gh api --jq`: --arg is a jq flag and gh rejects it
+          # ("accepts 1 arg(s), received 4"), which would leave SEEN empty and
+          # silently disable the dedup.
+          SEEN="$(gh api "repos/${{ github.repository }}/pulls/${NUM}/reviews?per_page=100" \
+            | jq --arg sha "$SHA" \
+              '[.[] | select(.user.login=="infektydgrokreviewer[bot]")
+                    | select(.commit_id==$sha)] | length')"
+          case "$SEEN" in
+            0)           : ;;
+            ''|*[!0-9]*) skip "could not check for a prior review of ${SHA}" ;;
+            *)           skip "already reviewed ${SHA} - push a change first" ;;
+          esac
+
+          {
+            echo "skip=false"
+            echo "pr=${NUM}"
+            echo "sha=${SHA}"
+            echo "ref=${REF}"
+          } >> "$GITHUB_OUTPUT"
+
+      # Tell the requester it was accepted or skipped. A command that silently
+      # does nothing is indistinguishable from a broken workflow.
+      - name: Acknowledge the command
+        if: always() && github.event_name == 'issue_comment'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${{ steps.resolve.outputs.skip }}" = "false" ]; then
+            gh api -X POST --silent \
+              "repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions" \
+              -f content=eyes || true
+          else
+            gh pr comment "${{ github.event.issue.number }}" \
+              --repo "${{ github.repository }}" \
+              --body "\`/grok-review\` skipped: ${{ steps.resolve.outputs.reason || 'could not resolve the PR' }}" || true
+          fi
+
       - name: Checkout PR head
+        if: steps.resolve.outputs.skip == 'false'
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.head.ref }}
+          ref: ${{ steps.resolve.outputs.sha }}
           fetch-depth: 0
 
       - name: Install sandbox prerequisites
+        if: steps.resolve.outputs.skip == 'false'
         run: |
           # The Grok sandbox enforces its deny set via a mount namespace and
           # REFUSES TO START without bubblewrap ("Refusing to start with
@@ -63,11 +177,13 @@ jobs:
           bwrap --ro-bind / / --dev /dev true && echo "bwrap namespace OK"
 
       - name: Install Grok Build CLI
+        if: steps.resolve.outputs.skip == 'false'
         run: |
           curl -fsSL https://x.ai/cli/install.sh | bash
           echo "$HOME/.grok/bin" >> "$GITHUB_PATH"
 
       - name: Restore Grok subscription auth
+        if: steps.resolve.outputs.skip == 'false'
         env:
           GROK_CI_AUTH_JSON: ${{ secrets.GROK_CI_AUTH_JSON }}
         run: |
@@ -76,6 +192,7 @@ jobs:
           chmod 600 "$HOME/.grok/auth.json"
 
       - name: Configure the sandbox profile
+        if: steps.resolve.outputs.skip == 'false'
         run: |
           # THE THREAT, MEASURED (grok 0.2.117, 2026-08-01): with
           # --always-approve the built-in `read_file` tool reads
@@ -106,10 +223,11 @@ jobs:
           EOF
 
       - name: Build review prompt
+        if: steps.resolve.outputs.skip == 'false'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          NUM="${{ github.event.pull_request.number }}"
+          NUM="${{ steps.resolve.outputs.pr }}"
           {
             echo "You are Grok performing an adversarial code review of a pull request"
             echo "on ${{ github.repository }}. The PR head is checked out in the current"
@@ -126,12 +244,15 @@ jobs:
             echo "   VERDICT: REQUEST_CHANGES"
             echo "   or"
             echo "   VERDICT: COMMENT"
-            echo "   (Do NOT emit VERDICT: APPROVE — v1 forbids LLM approve; it is"
-            echo "   downgraded to COMMENT if present.)"
+            echo "   or"
+            echo "   VERDICT: APPROVE"
+            echo "   APPROVE is necessary but not sufficient for merge: a separate"
+            echo "   mechanical check-run gate turns green only when required CI is"
+            echo "   success. This job never posts a Reviews API APPROVE."
             echo "2. Findings ranked by severity, each with file:line, the failure"
             echo "   scenario (concrete inputs -> wrong behavior), and a suggested fix."
             echo "3. Skip style nits unless they hide a defect. If the diff is clean,"
-            echo "   say so plainly and use VERDICT: COMMENT."
+            echo "   say so plainly and use VERDICT: APPROVE or VERDICT: COMMENT."
             echo
             echo "IMPORTANT: your reply IS the posted review. This is a single-shot,"
             echo "non-interactive run — nobody reads a statement of intent. Do not"
@@ -148,6 +269,7 @@ jobs:
           } > /tmp/grok-prompt.md
 
       - name: Run Grok review
+        if: steps.resolve.outputs.skip == 'false'
         run: |
           # --always-approve keeps the tool loop unstarved (dontAsk cancels the
           # whole prompt on the first approval-needing tool). The boundary that
@@ -166,6 +288,7 @@ jobs:
           [ -s /tmp/grok-reply.md ] || echo "_Grok returned no output (see workflow logs)._" > /tmp/grok-reply.md
 
       - name: Fail closed on credential leakage
+        if: steps.resolve.outputs.skip == 'false'
         env:
           # The DEFAULT branch, never github.base_ref: the base of a PR is
           # chosen by its author, so anchoring trust there lets someone push a
@@ -199,26 +322,31 @@ jobs:
           fi
           python3 /tmp/leak-gate.py /tmp/grok-reply.md
 
-      # App identity posts formal Reviews API events (REQUEST_CHANGES / COMMENT).
-      # GITHUB_TOKEN cannot satisfy required reviews on this repo
-      # (can_approve_pull_request_reviews=false). v1 never emits APPROVE.
+      # App identity posts REQUEST_CHANGES / COMMENT only. Merge trust is the
+      # grok-mechanical-approve check run (see grok-approve-gate.yml). Bot
+      # Reviews API APPROVE does not clear reviewDecision on this repo (#222).
       - name: Mint GitHub App installation token
         id: app-token
-        if: ${{ vars.GROK_APP_ID != '' }}
+        if: steps.resolve.outputs.skip == 'false' && vars.GROK_APP_ID != ''
         uses: actions/create-github-app-token@v2
         with:
           app-id: ${{ vars.GROK_APP_ID }}
           private-key: ${{ secrets.GROK_APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
           repositories: ${{ github.event.repository.name }}
+          # Least privilege: this token only submits a PR review. Without a
+          # permission-* input the minted token carries every installation
+          # permission, including checks:write.
+          permission-pull-requests: write
 
       - name: Post review
+        if: steps.resolve.outputs.skip == 'false'
         env:
           APP_TOKEN: ${{ steps.app-token.outputs.token }}
           GH_TOKEN: ${{ github.token }}
           TRUST_REF: ${{ github.event.repository.default_branch }}
         run: |
-          NUM="${{ github.event.pull_request.number }}"
+          NUM="${{ steps.resolve.outputs.pr }}"
           # Same trust model as the leak gate: prefer DEFAULT branch so a PR
           # cannot neuter the VERDICT→event mapping. Fall back to head only
           # while the script is still landing; head-sourced parsers must not
@@ -237,12 +365,39 @@ jobs:
             echo "::error::parse_grok_verdict.py missing on head and origin/$TRUST_REF"
             exit 1
           fi
+          # Default path never emits Reviews API APPROVE. Detect raw APPROVE
+          # with --allow-approve solely to stamp eligibility for the check-run gate.
           EVENT=$(python3 "$PARSER" --event-only /tmp/grok-reply.md)
           NOTE=$(python3 "$PARSER" /tmp/grok-reply.md | cut -f2-)
+          # A default-branch parser predating this flag exits 2; treat that as
+          # "no eligibility" rather than failing the job. Withholding the stamp
+          # only ever keeps the mechanical gate red.
+          RAW=$(python3 "$PARSER" --event-only --allow-approve /tmp/grok-reply.md 2>/dev/null) || RAW=COMMENT
           if [ "$PARSER_TRUST" = head ] && [ "$EVENT" = REQUEST_CHANGES ]; then
             EVENT=COMMENT
             NOTE="head-parser fallback: REQUEST_CHANGES downgraded to COMMENT"
+            RAW=COMMENT
           fi
+          # Head-sourced parser must never mint eligibility either.
+          if [ "$PARSER_TRUST" = head ] && [ "$RAW" = APPROVE ]; then
+            RAW=COMMENT
+            NOTE="${NOTE}; head-parser: APPROVE eligibility suppressed"
+          fi
+          # LOAD-BEARING. Do not delete as redundant with the gate's own
+          # marker check. Defangs any eligibility marker the model echoed out
+          # of the diff: the reply is pasted verbatim below, and only THIS
+          # script may stamp eligibility. Left visible so a planted marker is
+          # obvious to a human.
+          #
+          # Why it is not redundant: _has_marker() in
+          # .github/scripts/grok_approve_gate.py rejects quoted/indented/
+          # blockquoted echoes, but a BARE marker line on its own is still
+          # accepted there. Measured 2026-08-01: with this sed removed, a reply
+          # containing a bare marker line yields eligible=True even though the
+          # parser returned COMMENT. This sed is the only thing closing that
+          # case, so removing it reopens marker injection.
+          sed -i 's/grok-mechanical-eligibility/grok-mechanical-eligibility(quoted)/g' \
+            /tmp/grok-reply.md
           {
             echo "## Grok review"
             echo
@@ -250,22 +405,42 @@ jobs:
             echo
             cat /tmp/grok-reply.md
             echo
+            if [ "$RAW" = APPROVE ]; then
+              echo "<!-- grok-mechanical-eligibility: APPROVE -->"
+              echo
+            fi
             echo "---"
             echo "_Grok Build (headless) auto-review · [workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})_"
           } > /tmp/grok-comment.md
 
           if [ -n "${APP_TOKEN:-}" ]; then
             export GH_TOKEN="$APP_TOKEN"
+            SHA="${{ steps.resolve.outputs.sha }}"
+
+            # The review record must be bound to the SHA that was ACTUALLY
+            # reviewed. `gh pr review` has no commit flag, and the REST default
+            # is "the most recent commit AT SUBMISSION TIME" — so a push landing
+            # during the review (up to 20 minutes) would bind this review, and
+            # its eligibility marker, to code the model never saw. That reopens
+            # the SHA-binding the gate depends on, through the submission path.
+            LIVE="$(gh api "repos/${{ github.repository }}/pulls/${NUM}" --jq .head.sha)"
+            if [ "$LIVE" != "$SHA" ]; then
+              echo "::warning::head moved ${SHA} -> ${LIVE}; refusing to submit."
+              gh pr comment "$NUM" --repo "${{ github.repository }}" --body \
+                "Grok reviewed \`${SHA}\` but the head is now \`${LIVE}\`. No review was submitted, because it would have been recorded against code the model never saw. Comment \`/grok-review\` to review the new head."
+              exit 0
+            fi
+
             case "$EVENT" in
-              REQUEST_CHANGES)
-                gh pr review "$NUM" --repo "${{ github.repository }}" \
-                  --request-changes --body-file /tmp/grok-comment.md
-                ;;
-              *)
-                gh pr review "$NUM" --repo "${{ github.repository }}" \
-                  --comment --body-file /tmp/grok-comment.md
-                ;;
+              REQUEST_CHANGES) REVIEW_EVENT=REQUEST_CHANGES ;;
+              # APPROVE raw → still COMMENT (eligibility marker in body).
+              *)               REVIEW_EVENT=COMMENT ;;
             esac
+            jq -n --arg c "$SHA" --arg e "$REVIEW_EVENT" \
+              --rawfile b /tmp/grok-comment.md \
+              '{commit_id: $c, event: $e, body: $b}' > /tmp/review.json
+            gh api -X POST "repos/${{ github.repository }}/pulls/${NUM}/reviews" \
+              --input /tmp/review.json --silent
           else
             echo "::notice::vars.GROK_APP_ID unset — falling back to PR comment via GITHUB_TOKEN (no formal review event)."
             gh pr comment "$NUM" \

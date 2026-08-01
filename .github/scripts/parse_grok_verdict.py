@@ -2,22 +2,26 @@
 """Parse a machine VERDICT line from a Grok review reply (fail-closed).
 
 Usage:
-  parse_grok_verdict.py <reply-file>           # prints: <event>\\t<note>
-  parse_grok_verdict.py --event-only <file>   # prints event only
+  parse_grok_verdict.py <reply-file>                # prints: <event>\\t<note>
+  parse_grok_verdict.py --event-only <file>         # prints event only
+  parse_grok_verdict.py --allow-approve <file>      # may emit APPROVE (gate only)
 
-v1 policy (Design Crucible 2026-08-01): the GitHub App may post
-REQUEST_CHANGES or COMMENT review events. A model line of VERDICT: APPROVE
-is *downgraded* to COMMENT — LLM output must never mint merge trust.
+Default (v1 callers / grok-review post path): Reviews API events are only
+REQUEST_CHANGES or COMMENT. VERDICT: APPROVE is downgraded to COMMENT — the
+LLM must never mint merge trust via the Reviews API.
+
+v2 mechanical merge trust is a *required check run* (`grok-mechanical-approve`),
+not App APPROVE (measured 2026-08-01: bot APPROVE does not clear
+reviewDecision on this user-owned repo). The gate may call --allow-approve
+when reading a stored reply; grok-review still posts COMMENT and stamps an
+eligibility marker when the raw line was APPROVE.
 
 Accepted last-line forms (case-sensitive enum after the colon). Only the
 last non-empty line of the reply is parsed — mid-body / echoed VERDICT
 lines are ignored (matches the review prompt contract):
   VERDICT: REQUEST_CHANGES
   VERDICT: COMMENT
-  VERDICT: APPROVE          # → event COMMENT + downgrade note
-
-Anything else (missing, trailing prose after VERDICT, prose "LGTM",
-substring "approve") → COMMENT. Never APPROVE as the Reviews API event.
+  VERDICT: APPROVE          # → COMMENT unless --allow-approve
 """
 
 from __future__ import annotations
@@ -32,8 +36,8 @@ VERDICT_RE = re.compile(
     r"^VERDICT:\s*(REQUEST_CHANGES|COMMENT|APPROVE)\s*$",
 )
 
-# Reviews API `event` values we will actually send in v1.
-ALLOWED_EVENTS = frozenset({"REQUEST_CHANGES", "COMMENT"})
+# Reviews API `event` values safe for the default (no --allow-approve) path.
+DEFAULT_EVENTS = frozenset({"REQUEST_CHANGES", "COMMENT"})
 
 
 def _last_nonempty_line(text: str) -> str:
@@ -43,19 +47,24 @@ def _last_nonempty_line(text: str) -> str:
     return ""
 
 
-def parse_verdict(text: str) -> tuple[str, str]:
-    """Return (reviews_api_event, note). event is never APPROVE."""
+def parse_verdict(text: str, *, allow_approve: bool = False) -> tuple[str, str]:
+    """Return (event_token, note).
+
+    event_token is never APPROVE unless allow_approve=True.
+    """
     last = _last_nonempty_line(text)
     m = VERDICT_RE.match(last)
     if not m:
         return "COMMENT", "no VERDICT line; defaulted to COMMENT"
     raw = m.group(1)
     if raw == "APPROVE":
+        if allow_approve:
+            return "APPROVE", "VERDICT: APPROVE"
         return (
             "COMMENT",
-            "VERDICT: APPROVE downgraded to COMMENT (v1: LLM cannot APPROVE)",
+            "VERDICT: APPROVE downgraded to COMMENT (Reviews API; use check-run gate)",
         )
-    if raw in ALLOWED_EVENTS:
+    if raw in DEFAULT_EVENTS:
         return raw, f"VERDICT: {raw}"
     return "COMMENT", f"unknown VERDICT {raw!r}; defaulted to COMMENT"
 
@@ -66,11 +75,16 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument(
         "--event-only",
         action="store_true",
-        help="Print only the Reviews API event token",
+        help="Print only the event token",
+    )
+    p.add_argument(
+        "--allow-approve",
+        action="store_true",
+        help="Permit APPROVE token (mechanical gate / eligibility readers only)",
     )
     args = p.parse_args(argv)
     text = args.reply_file.read_text(encoding="utf-8", errors="replace")
-    event, note = parse_verdict(text)
+    event, note = parse_verdict(text, allow_approve=args.allow_approve)
     if args.event_only:
         print(event)
     else:
