@@ -73,6 +73,9 @@ PACKAGE_DATA_GLOBS = [
     "plugin_payload/skills/minni-install/references/*",
     "plugin_payload/skills/minni-install/scripts/*",
     "plugin_payload/skills/minni-install/templates/distill/*",
+    "plugin_payload/skills/readme-audit/*",
+    "plugin_payload/skills/readme-audit/references/*",
+    "plugin_payload/skills/readme-audit/scripts/*",
 ]
 
 

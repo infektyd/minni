@@ -8,6 +8,24 @@ pre-1.0: minor versions may contain breaking changes until v1.0.0.
 
 ## [Unreleased]
 
+### Added
+
+- **`readme-audit` skill** (`plugins/minni/skills/readme-audit/`): a repo skill
+  any agent can run to check the README against the actual code and land the
+  fixes as a PR. Verifies every factual claim and every Mermaid node/edge with
+  `file:line` evidence (verdicts CORRECT / STALE / UNVERIFIABLE), sweeps
+  CHANGELOG, merged PRs, `docs/`, and the skill/tool registries for capabilities
+  that should be represented but are not, and applies a three-part worthiness bar
+  so the README does not accrete. Enforces a per-section line/word/row budget
+  with a total cap below the sum of the sections, plus a retirement rule
+  (one-in-one-out, prioritised destinations, no silent deletion, protected floor
+  for the honest caveats) — measured mechanically by
+  `scripts/readme_budget.py`, which also counts diagram nodes and edges against
+  their own ceiling. Layout redesign proposals are produced every run and never
+  auto-applied. `references/budget-rationale.md` documents the numbers and
+  `references/example-audit-2026-08-01.md` is a real run against this repo's
+  README (67 items checked; 3 stale, 4 unverifiable).
+
 ### Fixed
 
 - **Distill ritual artifacts are now seeded**: `bootstrap-vault` (and therefore

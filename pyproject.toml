@@ -62,7 +62,11 @@ Security = "https://github.com/infektyd/minni/blob/main/docs/archive/SECURITY_PL
 # Kilo "environment" key that bricks the host CLI when wrong -- passed locally
 # and ran nowhere. Collect both roots; CI runs bare `pytest` so this list is the
 # single source of truth.
-testpaths = ["tests", "plugins/minni/skills/minni-install/scripts"]
+testpaths = [
+    "tests",
+    "plugins/minni/skills/minni-install/scripts",
+    "plugins/minni/skills/readme-audit/scripts",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -110,4 +114,7 @@ minni = [
     "plugin_payload/skills/minni-install/references/*",
     "plugin_payload/skills/minni-install/scripts/*",
     "plugin_payload/skills/minni-install/templates/distill/*",
+    "plugin_payload/skills/readme-audit/*",
+    "plugin_payload/skills/readme-audit/references/*",
+    "plugin_payload/skills/readme-audit/scripts/*",
 ]

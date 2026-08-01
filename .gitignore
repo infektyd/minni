@@ -179,6 +179,9 @@ plugins/minni/skills/*/scripts/
 # (propagate.py). The pre-commit public-boundary guard checks .gitignore with
 # --no-index, so tracked files here need this explicit re-include.
 !plugins/minni/skills/minni-install/scripts/
+# ...and readme-audit/scripts: the README budget meter (readme_budget.py) plus
+# its tests. Pure stdlib text measurement, no model backend, nothing private.
+!plugins/minni/skills/readme-audit/scripts/
 
 # --- pruned from tip 2026-06-09: process artifacts kept locally (data is our value) ---
 /patch.diff
