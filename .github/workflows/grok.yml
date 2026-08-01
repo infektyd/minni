@@ -21,9 +21,12 @@ name: Grok
 #     base64 -i /tmp/grok-ci/.grok/auth.json | gh secret set GROK_CI_AUTH_JSON
 #
 # Trigger gating: only comments/issues authored by the repo owner or a
-# collaborator run the job — /grok in a drive-by comment does nothing. The
-# job never checks out or executes fork code with the secret in scope: for PR
-# comments it checks out the PR head only when the PR is same-repo.
+# collaborator are considered — drive-by comments do nothing. Matching is
+# command-token shaped (`/grok` at a boundary), not a raw substring, so a
+# comment that merely cites `.github/workflows/grok.yml` does not burn the
+# metered agent. The paid job never checks out or executes fork code with
+# the secret in scope: for PR comments it checks out the PR head only when
+# the PR is same-repo.
 
 on:
   issue_comment:
@@ -43,11 +46,35 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  grok:
+  # Cheap collaborator + token gate. Must not restore GROK_CI_AUTH_JSON.
+  # A raw contains('/grok') would also match path text (workflows/grok.yml);
+  # the regex below requires a command boundary.
+  decide:
     if: |
-      contains(github.event.comment.body || github.event.issue.body, '/grok') &&
       contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'),
                github.event.comment.author_association || github.event.issue.author_association)
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      run: ${{ steps.cmd.outputs.run }}
+    steps:
+      - name: Require /grok command token
+        id: cmd
+        env:
+          BODY: ${{ github.event.comment.body || github.event.issue.body }}
+        run: |
+          # Command form: start-or-whitespace, "/grok", then end/space/punct —
+          # not a path segment like workflows/grok.yml or src/grok-hook.ts.
+          if printf '%s' "$BODY" | grep -qE '(^|[[:space:]])/grok([[:space:][:punct:]]|$)'; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "No /grok command token; skipping paid agent."
+          fi
+
+  grok:
+    needs: decide
+    if: needs.decide.outputs.run == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -135,7 +162,7 @@ jobs:
         run: |
           NUM="${{ github.event.issue.number || github.event.pull_request.number }}"
           {
-            echo "You are Grok, responding to a GitHub mention on ${{ github.repository }}."
+            echo "You are Grok, responding to a /grok slash-command on ${{ github.repository }}."
             echo "The repository is checked out in the current directory."
             echo
             if [ -n "${{ steps.target.outputs.pr }}" ]; then
