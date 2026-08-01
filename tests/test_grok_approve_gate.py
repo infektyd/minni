@@ -563,6 +563,13 @@ def test_any_app_sentinel_is_not_treated_as_a_binding(mod, monkeypatch):
         "tests/test_grok_approve_gate_workflow.py",
         "tests/test_parse_grok_verdict.py",
         "pyproject.toml",
+        "pytest.ini",
+        ".pytest.ini",
+        "pytest.toml",
+        ".pytest.toml",
+        "tox.ini",
+        "setup.cfg",
+        "conftest.py",
         "tests/conftest.py",
     ],
 )

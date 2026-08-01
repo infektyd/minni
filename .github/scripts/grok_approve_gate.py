@@ -64,9 +64,19 @@ PATH_DENY_PREFIXES = (
     "tests/test_grok_approve_gate_workflow.py",
     "tests/test_parse_grok_verdict.py",
     # Collection config can disable every tripwire above without touching a
-    # single test file: pyproject `addopts = "--ignore=..."` or dropping
-    # `testpaths`, or conftest `collect_ignore_glob`.
+    # single test file: `addopts = "--ignore=..."`, dropping `testpaths`, or
+    # `collect_ignore_glob`. CI runs bare pytest inside the proposed-required
+    # "Free public cloud smoke" context, and pytest.ini wins over pyproject.toml
+    # even when empty — so every rootdir config file has to be denied, not just
+    # the one this repo happens to use today.
     "pyproject.toml",
+    "pytest.ini",
+    ".pytest.ini",
+    "pytest.toml",
+    ".pytest.toml",
+    "tox.ini",
+    "setup.cfg",
+    "conftest.py",
     "tests/conftest.py",
 )
 

@@ -91,7 +91,10 @@ jobs:
             fi
             NUM="${{ github.event.issue.number }}"
           else
-            NUM="${{ steps.resolve.outputs.pr }}"
+            # NOT steps.resolve.outputs.pr: the steps context only holds
+            # COMPLETED steps, so referencing this step's own output from
+            # inside it expands empty and kills auto-review.
+            NUM="${{ github.event.pull_request.number }}"
           fi
 
           META="$(gh api "repos/${{ github.repository }}/pulls/${NUM}")"
@@ -107,12 +110,22 @@ jobs:
 
           # Dedup: the newest non-dismissed App review already covering this
           # SHA means a repeat command would double-bill for the same diff.
-          LAST="$(gh api "repos/${{ github.repository }}/pulls/${NUM}/reviews?per_page=100" \
-            --jq '[.[] | select(.user.login=="infektydgrokreviewer[bot]")
-                       | select(.state!="DISMISSED")] | last | .commit_id // ""')"
-          if [ "$LAST" = "$SHA" ]; then
-            skip "already reviewed ${SHA} - push a change first"
-          fi
+          # Deliberately counts DISMISSED reviews too. Agents can dismiss, so
+          # keying on non-dismissed reviews would let dismiss + /grok-review
+          # re-roll the model on identical code until it happens to say yes.
+          # Same SHA reviewed before = skip, whatever became of that review.
+          # Piped to jq, NOT `gh api --jq`: --arg is a jq flag and gh rejects it
+          # ("accepts 1 arg(s), received 4"), which would leave SEEN empty and
+          # silently disable the dedup.
+          SEEN="$(gh api "repos/${{ github.repository }}/pulls/${NUM}/reviews?per_page=100" \
+            | jq --arg sha "$SHA" \
+              '[.[] | select(.user.login=="infektydgrokreviewer[bot]")
+                    | select(.commit_id==$sha)] | length')"
+          case "$SEEN" in
+            0)           : ;;
+            ''|*[!0-9]*) skip "could not check for a prior review of ${SHA}" ;;
+            *)           skip "already reviewed ${SHA} - push a change first" ;;
+          esac
 
           {
             echo "skip=false"
@@ -402,17 +415,32 @@ jobs:
 
           if [ -n "${APP_TOKEN:-}" ]; then
             export GH_TOKEN="$APP_TOKEN"
+            SHA="${{ steps.resolve.outputs.sha }}"
+
+            # The review record must be bound to the SHA that was ACTUALLY
+            # reviewed. `gh pr review` has no commit flag, and the REST default
+            # is "the most recent commit AT SUBMISSION TIME" — so a push landing
+            # during the review (up to 20 minutes) would bind this review, and
+            # its eligibility marker, to code the model never saw. That reopens
+            # the SHA-binding the gate depends on, through the submission path.
+            LIVE="$(gh api "repos/${{ github.repository }}/pulls/${NUM}" --jq .head.sha)"
+            if [ "$LIVE" != "$SHA" ]; then
+              echo "::warning::head moved ${SHA} -> ${LIVE}; refusing to submit."
+              gh pr comment "$NUM" --repo "${{ github.repository }}" --body \
+                "Grok reviewed \`${SHA}\` but the head is now \`${LIVE}\`. No review was submitted, because it would have been recorded against code the model never saw. Comment \`/grok-review\` to review the new head."
+              exit 0
+            fi
+
             case "$EVENT" in
-              REQUEST_CHANGES)
-                gh pr review "$NUM" --repo "${{ github.repository }}" \
-                  --request-changes --body-file /tmp/grok-comment.md
-                ;;
-              *)
-                # APPROVE raw → still COMMENT (eligibility marker in body).
-                gh pr review "$NUM" --repo "${{ github.repository }}" \
-                  --comment --body-file /tmp/grok-comment.md
-                ;;
+              REQUEST_CHANGES) REVIEW_EVENT=REQUEST_CHANGES ;;
+              # APPROVE raw → still COMMENT (eligibility marker in body).
+              *)               REVIEW_EVENT=COMMENT ;;
             esac
+            jq -n --arg c "$SHA" --arg e "$REVIEW_EVENT" \
+              --rawfile b /tmp/grok-comment.md \
+              '{commit_id: $c, event: $e, body: $b}' > /tmp/review.json
+            gh api -X POST "repos/${{ github.repository }}/pulls/${NUM}/reviews" \
+              --input /tmp/review.json --silent
           else
             echo "::notice::vars.GROK_APP_ID unset — falling back to PR comment via GITHUB_TOKEN (no formal review event)."
             gh pr comment "$NUM" \

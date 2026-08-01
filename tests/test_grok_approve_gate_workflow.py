@@ -188,7 +188,12 @@ def test_repeat_command_is_deduped_by_head_sha(review):
     """Without this a repeated command double-bills for an identical diff."""
     run = _resolve_step(review)["run"]
     assert 'infektydgrokreviewer[bot]' in run
-    assert '"$LAST" = "$SHA"' in run
+    assert "select(.commit_id==$sha)" in run
+    # Piped to jq: `gh api --jq` rejects --arg, which would leave the result
+    # empty and silently disable the dedup.
+    assert "| jq --arg sha" in run
+    # An unparseable result must skip, not proceed.
+    assert "''|*[!0-9]*)" in run
 
 
 def test_draft_and_fork_prs_are_skipped(review):
@@ -229,3 +234,60 @@ def test_metered_steps_never_run_on_a_skip(review):
     for name in ("Run Grok review", "Post review", "Build review prompt"):
         step = next(s for s in steps if s.get("name") == name)
         assert step["if"] == "steps.resolve.outputs.skip == 'false'", name
+
+
+def _code(run: str) -> str:
+    """Shell body with comment lines stripped.
+
+    Absence assertions must not be satisfied or defeated by prose: several of
+    these comments legitimately name the very construct being banned.
+    """
+    return "\n".join(
+        ln for ln in run.splitlines() if not ln.lstrip().startswith("#")
+    )
+
+
+def _step(review: dict, name: str) -> dict:
+    return next(
+        s for s in review["jobs"]["grok-review"]["steps"] if s.get("name") == name
+    )
+
+
+def test_review_is_submitted_bound_to_the_reviewed_sha(review):
+    """`gh pr review` has no commit flag and the REST default is "most recent
+    commit AT SUBMISSION TIME", so a push landing during the review would bind
+    the review — and its eligibility marker — to code the model never saw.
+    Pinning the CHECKOUT is not enough; this pins the review RECORD."""
+    run = _code(_step(review, "Post review")["run"])
+    assert "gh pr review" not in run, "gh pr review cannot set commit_id"
+    assert "commit_id: $c" in run
+    assert "/reviews" in run and "gh api -X POST" in run
+
+
+def test_submission_aborts_if_head_moved_during_the_review(review):
+    """Belt to the commit_id brace: a review bound to a stale SHA is useless,
+    so say so visibly rather than posting one nobody can act on."""
+    run = _step(review, "Post review")["run"]
+    assert '"$LIVE" != "$SHA"' in run
+    assert "refusing to submit" in run
+
+
+def test_resolve_step_does_not_reference_its_own_outputs(review):
+    """The steps context only holds COMPLETED steps. Referencing
+    steps.resolve.outputs.* from inside `resolve` expands empty, which under
+    `set -euo pipefail` kills the step and silently disables auto-review."""
+    resolve = _code(_resolve_step(review)["run"])
+    assert "steps.resolve.outputs" not in resolve, (
+        "resolve cannot read its own outputs"
+    )
+    assert "github.event.pull_request.number" in resolve, (
+        "the pull_request path must take the PR number from the payload"
+    )
+
+
+def test_dedup_counts_dismissed_reviews_too(review):
+    """Agents can dismiss reviews. Keying dedup on non-dismissed ones would let
+    dismiss + /grok-review re-roll the model on identical code until it agrees."""
+    run = _code(_resolve_step(review)["run"])
+    assert 'select(.state!="DISMISSED")' not in run
+    assert "select(.commit_id==$sha)" in run
