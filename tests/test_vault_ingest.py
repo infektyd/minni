@@ -410,3 +410,82 @@ def test_vault_slug_map_resolves_to_the_authored_agent_id():
         if mapped is not None and mapped != agent_id:
             mismatched[slug] = (mapped, agent_id)
     assert not mismatched, f"slug -> agent_id disagrees with AGENT_VAULT_DIRS: {mismatched}"
+
+
+def _parse_python_slug_map(path: Path) -> dict:
+    """Read a module-level `_VAULT_SLUG_TO_AGENT_ID` literal without importing.
+
+    `scripts/inbox_cleanup.py` is a standalone script by contract, so it must be
+    read rather than imported.
+    """
+    import ast
+
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    for node in tree.body:
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+            continue
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        for target in targets:
+            if isinstance(target, ast.Name) and target.id == "_VAULT_SLUG_TO_AGENT_ID":
+                return ast.literal_eval(node.value)
+    raise AssertionError(f"no _VAULT_SLUG_TO_AGENT_ID literal found in {path}")
+
+
+def _parse_ts_slug_map(path: Path) -> dict:
+    """Read the `VAULT_SLUG_TO_AGENT_ID` object literal out of the TS mirror."""
+    import re
+
+    source = path.read_text(encoding="utf-8")
+    match = re.search(
+        r"VAULT_SLUG_TO_AGENT_ID[^=]*=\s*\{(.*?)\n\};", source, re.DOTALL
+    )
+    assert match, f"no VAULT_SLUG_TO_AGENT_ID object literal found in {path}"
+    pairs = re.findall(
+        r'(?:"([^"]+)"|([A-Za-z_][\w-]*))\s*:\s*"([^"]+)"', match.group(1)
+    )
+    return {quoted or bare: value for quoted, bare, value in pairs}
+
+
+def test_all_three_vault_slug_maps_agree():
+    """The canonical slug map and BOTH mirrors must carry identical entries.
+
+    `inbox_ingest._VAULT_SLUG_TO_AGENT_ID` is duplicated into a TypeScript
+    mirror (hook-utils.ts) and a standalone-script mirror (inbox_cleanup.py).
+    The other slug tests import only the canonical map, so a mirror that falls
+    behind is invisible to them -- and a mirror missing a slug attributes that
+    vault's inbox to the wrong principal. This drift is not hypothetical:
+    `cursor` was added to the canonical map after cursor-vault silently
+    accumulated 141 unreachable wiki pages, and both mirrors still lacked it.
+
+    Compared as dicts, so ordering and formatting differences are fine and only
+    a real content difference fails.
+
+    All three are parsed from source rather than imported: `minni` is installed
+    editable, so an import resolves to whatever checkout the install points at
+    -- which is NOT this one when the tests run from a git worktree. Reading the
+    files under this test's own repo root keeps the comparison hermetic.
+    """
+    root = Path(__file__).resolve().parents[1]
+    canonical = _parse_python_slug_map(
+        root / "src" / "minni" / "afm_passes" / "inbox_ingest.py"
+    )
+    mirrors = {
+        "scripts/inbox_cleanup.py": _parse_python_slug_map(
+            root / "scripts" / "inbox_cleanup.py"
+        ),
+        "plugins/minni/src/hook-utils.ts": _parse_ts_slug_map(
+            root / "plugins" / "minni" / "src" / "hook-utils.ts"
+        ),
+    }
+
+    drifted = {}
+    for name, mirror in mirrors.items():
+        missing = {k: v for k, v in canonical.items() if mirror.get(k) != v}
+        extra = {k: v for k, v in mirror.items() if k not in canonical}
+        if missing or extra:
+            drifted[name] = {"missing_or_wrong": missing, "extra": extra}
+
+    assert not drifted, (
+        "vault slug map mirrors have drifted from "
+        f"inbox_ingest._VAULT_SLUG_TO_AGENT_ID: {drifted}"
+    )

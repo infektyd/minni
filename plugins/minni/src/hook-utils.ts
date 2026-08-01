@@ -377,7 +377,9 @@ export function workspaceFromPayload(
  */
 const VAULT_SLUG_TO_AGENT_ID: Readonly<Record<string, string>> = {
   claudecode: "claude-code",
+  "claude-science": "claude-science",
   codex: "codex",
+  cursor: "cursor",
   gemini: "gemini",
   hermes: "hermes",
   kilocode: "kilocode",
