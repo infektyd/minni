@@ -45,6 +45,16 @@ def redact_health_report_for_recovery(report: dict) -> dict:
         items = report.get(key) or []
         redacted[f"{key}_count"] = len(items)
         redacted[key] = []
+    # grok-review (PR #242): malformed_timestamps.examples carries per-doc
+    # doc_id + value repr. It is a nested dict, not a flat list, so the
+    # _HEALTH_REPORT_SENSITIVE_KEYS loop above (which counts list length)
+    # cannot cover it — do it explicitly. Aggregate fields (stored_rows,
+    # read_skips, by_field, remediation) are counts/labels only and stay.
+    malformed = report.get("malformed_timestamps")
+    if isinstance(malformed, dict) and malformed.get("examples"):
+        redacted_malformed = dict(malformed)
+        redacted_malformed["examples"] = {}
+        redacted["malformed_timestamps"] = redacted_malformed
     redacted["redacted"] = (
         "pre-identity diagnostic: per-record detail withheld until a principal is stamped"
     )

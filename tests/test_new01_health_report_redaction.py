@@ -61,6 +61,40 @@ def test_redact_health_report_strips_paths_and_content():
     assert report["stale_docs"][0]["path"] == "/Users/x/secret.md"
 
 
+def test_redact_health_report_strips_malformed_timestamp_examples():
+    """grok-review (PR #242): malformed_timestamps.examples carries per-doc
+    doc_id + value repr in a nested dict, not a flat list, so it needs its own
+    redaction rather than riding the _HEALTH_REPORT_SENSITIVE_KEYS loop."""
+    import minni.minnid as minnid
+
+    report = {
+        "malformed_timestamps": {
+            "stored_rows": 1,
+            "read_skips": 2,
+            "by_field": {"decay.run_decay.indexed_at": 2},
+            "examples": {
+                "decay.run_decay.indexed_at": [
+                    {"doc_id": 590, "value": "'2026-06-19T22:55:32.509Z'"}
+                ]
+            },
+            "remediation": "migration 016 normalizes stored timestamps",
+        },
+    }
+
+    red = minnid._redact_health_report_for_recovery(report)
+    blob = json.dumps(red)
+
+    assert "2026-06-19T22:55:32.509Z" not in blob
+    assert red["malformed_timestamps"]["examples"] == {}
+    # Aggregate fields survive — they carry no per-record detail.
+    assert red["malformed_timestamps"]["stored_rows"] == 1
+    assert red["malformed_timestamps"]["read_skips"] == 2
+    assert red["malformed_timestamps"]["by_field"] == {"decay.run_decay.indexed_at": 2}
+
+    # The input report is not mutated in place.
+    assert report["malformed_timestamps"]["examples"]["decay.run_decay.indexed_at"]
+
+
 class _FakeCursor:
     def __enter__(self):
         return self

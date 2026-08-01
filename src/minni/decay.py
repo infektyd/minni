@@ -76,11 +76,15 @@ class MemoryDecay:
                 if row["indexed_at"] is not None and indexed_at is None:
                     stats["skipped_bad_timestamp"] += 1
                     continue
-                if row["last_accessed"] is not None and last_accessed is None:
-                    stats["skipped_bad_timestamp"] += 1
-                    continue
                 if indexed_at is None:
                     indexed_at = now
+                # Audit R0 (grok-review): a poisoned last_accessed used to
+                # `continue` past the whole document, even though the normal
+                # NULL-last_accessed path already falls back to indexed_at.
+                # parse_epoch_or_report already counted/logged the bad value;
+                # here it just becomes "no last_accessed", same as NULL.
+                if row["last_accessed"] is not None and last_accessed is None:
+                    stats["skipped_bad_timestamp"] += 1
                 access_count = row["access_count"] or 0
 
                 reference_time = last_accessed if last_accessed else indexed_at

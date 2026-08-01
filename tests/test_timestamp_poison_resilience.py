@@ -30,6 +30,21 @@ POISON_EPOCH = 1781909732.509          # Python parse, sub-second preserved
 POISON_EPOCH_SECONDS = 1781909732.0    # SQL repair, strftime('%s') truncates
 # Not recoverable by any parser — this is what "skip and report" is for.
 POISON_GARBAGE = "not a timestamp"
+# grok-review (PR #242): a numeric-TEXT epoch (e.g. a caller that stored
+# str(time.time())) is recoverable by parse_epoch's first branch (float(text))
+# but, before the fix, fell through the SQL repair's strftime path — which
+# returns NULL for a bare numeric string on this SQLite build (it is not read
+# as a Julian day) — into the 0.0 "needs attention" sentinel. That destroyed a
+# perfectly good value.
+POISON_NUMERIC_TEXT = "1700000000.5"
+POISON_NUMERIC_TEXT_EPOCH = 1700000000.5
+# Offset-qualified ISO-8601 (as opposed to the naive/'Z' form already covered
+# above). Confirmed to already round-trip correctly through both
+# minni.timestamps.parse_epoch and migration 016's strftime path on this
+# SQLite build (3.53+); pinned here as a regression lock, not a fix.
+POISON_ISO_OFFSET = "2026-08-01T12:00:00.123456+00:00"
+POISON_ISO_OFFSET_EPOCH = 1785585600.123456
+POISON_ISO_OFFSET_EPOCH_SECONDS = 1785585600.0
 
 
 def _make_db(tmp_path):
@@ -109,6 +124,83 @@ def test_migration_016_triggers_normalize_a_poisoned_write(tmp_path):
             "WHERE path = 'poison://insert'"
         ).fetchone()
     assert row["ti"] == "real" and row["indexed_at"] == POISON_EPOCH_SECONDS
+
+
+def test_migration_016_triggers_recover_a_numeric_text_epoch(tmp_path):
+    """grok-review, High: numeric-TEXT epochs must be recovered, not swept to
+    the 0.0 sentinel alongside genuine garbage — parse_epoch already recovers
+    them, the SQL side must match."""
+    db_obj, _ = _make_db(tmp_path)
+    with db_obj.transaction() as c:
+        c.execute(
+            "INSERT INTO documents (path, indexed_at, last_modified) VALUES (?, ?, ?)",
+            ("poison://numeric-text", POISON_NUMERIC_TEXT, POISON_NUMERIC_TEXT),
+        )
+    with db_obj.cursor() as c:
+        row = c.execute(
+            "SELECT typeof(indexed_at) ti, indexed_at FROM documents "
+            "WHERE path = 'poison://numeric-text'"
+        ).fetchone()
+    assert row["ti"] == "real"
+    assert row["indexed_at"] == POISON_NUMERIC_TEXT_EPOCH
+
+    with db_obj.transaction() as c:
+        c.execute(
+            "UPDATE documents SET last_modified = ? WHERE path = 'poison://numeric-text'",
+            (POISON_NUMERIC_TEXT,),
+        )
+    with db_obj.cursor() as c:
+        row = c.execute(
+            "SELECT typeof(last_modified) tm, last_modified FROM documents "
+            "WHERE path = 'poison://numeric-text'"
+        ).fetchone()
+    assert row["tm"] == "real"
+    assert row["last_modified"] == POISON_NUMERIC_TEXT_EPOCH
+
+
+def test_migration_016_triggers_recover_an_offset_iso_epoch(tmp_path):
+    """grok-review, Medium (refuted for this SQLite build, locked in as a
+    regression test): offset-qualified ISO-8601 must match parse_epoch's
+    reading, not silently fall to the 0.0 sentinel."""
+    db_obj, _ = _make_db(tmp_path)
+    with db_obj.transaction() as c:
+        c.execute(
+            "INSERT INTO documents (path, indexed_at) VALUES (?, ?)",
+            ("poison://iso-offset", POISON_ISO_OFFSET),
+        )
+    with db_obj.cursor() as c:
+        row = c.execute(
+            "SELECT typeof(indexed_at) ti, indexed_at FROM documents "
+            "WHERE path = 'poison://iso-offset'"
+        ).fetchone()
+    assert row["ti"] == "real"
+    assert row["indexed_at"] == POISON_ISO_OFFSET_EPOCH_SECONDS
+
+
+def test_migration_016_numeric_text_matches_python_parse_epoch(tmp_path):
+    from minni.migrations import run_migrations
+    from minni.timestamps import parse_epoch
+
+    db_path = tmp_path / "legacy_numeric.db"
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        "CREATE TABLE documents ("
+        " doc_id INTEGER PRIMARY KEY AUTOINCREMENT, path TEXT UNIQUE NOT NULL,"
+        " last_modified REAL, indexed_at REAL, last_accessed REAL)"
+    )
+    conn.execute(
+        "INSERT INTO documents (path, indexed_at) VALUES (?, ?)",
+        ("legacy://numeric", POISON_NUMERIC_TEXT),
+    )
+    conn.commit()
+
+    run_migrations(conn)
+
+    stored = conn.execute(
+        "SELECT indexed_at FROM documents WHERE path = 'legacy://numeric'"
+    ).fetchone()[0]
+    assert stored == parse_epoch(POISON_NUMERIC_TEXT) == POISON_NUMERIC_TEXT_EPOCH
+    conn.close()
 
 
 # --- (b) read path ----------------------------------------------------------
@@ -232,6 +324,48 @@ def test_decay_pass_skips_and_reports_an_unparseable_row(tmp_path):
         }
     assert rows["ok://doc"] < 1.0, "healthy doc decayed"
     assert rows["poison://garbage"] == 1.0, "poisoned doc left alone, not guessed at"
+    reset_malformed_timestamps()
+
+
+def test_decay_falls_back_to_indexed_at_on_bad_last_accessed(tmp_path):
+    """grok-review, Low: a poisoned last_accessed alone used to `continue` past
+    the whole document, even though the ordinary NULL-last_accessed path
+    already falls back to indexed_at. A bad last_accessed must degrade to that
+    same fallback, not skip the document outright."""
+    from minni.decay import MemoryDecay
+    from minni.timestamps import (
+        malformed_timestamp_report,
+        reset_malformed_timestamps,
+    )
+
+    db_obj, cfg = _make_db(tmp_path)
+    now = time.time()
+    with db_obj.transaction() as c:
+        c.execute(
+            "INSERT INTO documents (path, indexed_at, access_count, decay_score)"
+            " VALUES (?, ?, ?, ?)",
+            ("ok://doc", now - 86400 * 30, 0, 1.0),
+        )
+    _poison_bypassing_triggers(
+        cfg, "poison://bad-last-accessed",
+        indexed_at=now - 86400 * 5, last_accessed=POISON_GARBAGE,
+        access_count=0, decay_score=1.0,
+    )
+
+    reset_malformed_timestamps()
+    stats = MemoryDecay(db_obj, cfg).run_decay()
+
+    assert stats["skipped_bad_timestamp"] == 1, "bad last_accessed still counted"
+    assert malformed_timestamp_report()["total"] >= 1
+
+    with db_obj.cursor() as c:
+        rows = {
+            r["path"]: r["decay_score"]
+            for r in c.execute("SELECT path, decay_score FROM documents")
+        }
+    assert rows["poison://bad-last-accessed"] != 1.0, (
+        "must decay from indexed_at instead of being skipped entirely"
+    )
     reset_malformed_timestamps()
 
 
