@@ -277,7 +277,7 @@ def _has_marker(body: str | None) -> bool:
 
 
 def analyze_reviews(
-    reviews: list[dict[str, Any]], head_sha: str = ""
+    reviews: list[dict[str, Any]], head_sha: str
 ) -> tuple[bool, bool]:
     """Return (eligible, blocked_by_request_changes).
 
@@ -293,7 +293,11 @@ def analyze_reviews(
       old marker, sees green CI on the NEW sha, and mints success for code the
       reviewer never saw.
 
-    Passing head_sha="" disables the binding and is for tests only.
+    head_sha is REQUIRED and the binding is unconditional. It previously
+    defaulted to "" and "" skipped the comparison, which meant any call
+    site that forgot the argument silently restored the pre-fix mint.
+    A fail-open default on the invariant this function exists to enforce
+    is not acceptable; omit the argument and you get a TypeError.
     """
     blocked = False
     for rev in reviews:
@@ -312,7 +316,7 @@ def analyze_reviews(
         if not _is_app_bot(user):
             continue
         if state != "CHANGES_REQUESTED" and _has_marker(rev.get("body")):
-            eligible = not head_sha or (rev.get("commit_id") or "") == head_sha
+            eligible = (rev.get("commit_id") or "") == head_sha
         # First App-bot review seen wins, marker or not. Do not fall through to
         # older reviews.
         break

@@ -9,6 +9,9 @@ from pathlib import Path
 
 import pytest
 
+# Any head sha; analyze_reviews now REQUIRES it and binds unconditionally.
+HEAD_SHA = "deadbeefcafe"
+
 SCRIPT = (
     Path(__file__).resolve().parents[1]
     / ".github"
@@ -100,10 +103,11 @@ def test_analyze_reviews_eligibility_marker(mod):
         {
             "user": {"login": "infektydgrokreviewer[bot]"},
             "state": "COMMENTED",
+            "commit_id": HEAD_SHA,
             "body": f"ok\n{marker}\n",
         }
     ]
-    eligible, blocked = mod.analyze_reviews(reviews)
+    eligible, blocked = mod.analyze_reviews(reviews, HEAD_SHA)
     assert eligible is True
     assert blocked is False
 
@@ -122,7 +126,7 @@ def test_analyze_reviews_request_changes_clears_eligibility(mod):
             "body": "nope",
         },
     ]
-    eligible, blocked = mod.analyze_reviews(reviews)
+    eligible, blocked = mod.analyze_reviews(reviews, HEAD_SHA)
     assert blocked is True
     assert eligible is False
 
@@ -136,7 +140,7 @@ def test_analyze_reviews_ignores_human_planted_marker_without_bot(mod):
             "body": marker,
         }
     ]
-    eligible, blocked = mod.analyze_reviews(reviews)
+    eligible, blocked = mod.analyze_reviews(reviews, HEAD_SHA)
     assert eligible is False
     assert blocked is False
 
@@ -155,7 +159,7 @@ def test_other_bots_cannot_stamp_eligibility(mod, login):
             "body": mod.ELIGIBILITY_MARKER,
         }
     ]
-    eligible, _ = mod.analyze_reviews(reviews)
+    eligible, _ = mod.analyze_reviews(reviews, HEAD_SHA)
     assert eligible is False
 
 
@@ -173,7 +177,7 @@ def test_marker_quoted_inside_reply_is_not_eligibility(mod):
             ),
         }
     ]
-    eligible, _ = mod.analyze_reviews(reviews)
+    eligible, _ = mod.analyze_reviews(reviews, HEAD_SHA)
     assert eligible is False
 
 
@@ -241,10 +245,11 @@ def test_outstanding_request_changes_survives_a_later_marker(mod):
         {
             "user": {"login": "infektydgrokreviewer[bot]"},
             "state": "COMMENTED",
+            "commit_id": HEAD_SHA,
             "body": f"fixed now\n{mod.ELIGIBILITY_MARKER}\n",
         },
     ]
-    eligible, blocked = mod.analyze_reviews(reviews)
+    eligible, blocked = mod.analyze_reviews(reviews, HEAD_SHA)
     assert eligible is True
     assert blocked is True
     assert mod.decide(_inp(mod, eligible=eligible,
@@ -397,9 +402,10 @@ def test_dismissed_request_changes_does_not_block(mod):
         {
             "user": {"login": "infektydgrokreviewer[bot]"},
             "state": "COMMENTED",
+            "commit_id": HEAD_SHA,
             "body": f"ok\n{mod.ELIGIBILITY_MARKER}\n",
         },
     ]
-    eligible, blocked = mod.analyze_reviews(reviews)
+    eligible, blocked = mod.analyze_reviews(reviews, HEAD_SHA)
     assert eligible is True
     assert blocked is False

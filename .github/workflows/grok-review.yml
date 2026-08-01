@@ -261,9 +261,19 @@ jobs:
             RAW=COMMENT
             NOTE="${NOTE}; head-parser: APPROVE eligibility suppressed"
           fi
-          # Defang any eligibility marker the model echoed out of the diff: the
-          # reply is pasted verbatim below, and only THIS script may stamp
-          # eligibility. Left visible so a planted marker is obvious to a human.
+          # LOAD-BEARING. Do not delete as redundant with the gate's own
+          # marker check. Defangs any eligibility marker the model echoed out
+          # of the diff: the reply is pasted verbatim below, and only THIS
+          # script may stamp eligibility. Left visible so a planted marker is
+          # obvious to a human.
+          #
+          # Why it is not redundant: _has_marker() in
+          # .github/scripts/grok_approve_gate.py rejects quoted/indented/
+          # blockquoted echoes, but a BARE marker line on its own is still
+          # accepted there. Measured 2026-08-01: with this sed removed, a reply
+          # containing a bare marker line yields eligible=True even though the
+          # parser returned COMMENT. This sed is the only thing closing that
+          # case, so removing it reopens marker injection.
           sed -i 's/grok-mechanical-eligibility/grok-mechanical-eligibility(quoted)/g' \
             /tmp/grok-reply.md
           {
