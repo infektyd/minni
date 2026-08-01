@@ -1,7 +1,14 @@
-"""§8 / §9.6: check-versions script passes and catches stale literals."""
+"""§8 / §9.6: check-versions script passes and catches stale literals.
+
+Extended 2026-08-01 (audit R1): the script grew an installed layer and a
+deployed layer, and marketplace.json joined the repo layer. The regression the
+new tests pin is the one that let a three-way split (marketplace 0.1.0, deployed
+0.3.0, repo 0.4.1) report "all versions agree at 0.4.1".
+"""
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -11,13 +18,21 @@ REPO = Path(__file__).resolve().parent.parent
 SCRIPT = REPO / "scripts" / "check_versions.py"
 
 
-def test_check_versions_passes_on_current_tree():
-    proc = subprocess.run(
-        [sys.executable, str(SCRIPT)],
+def _run(*args, env_extra=None):
+    return subprocess.run(
+        [sys.executable, str(SCRIPT), *args],
         cwd=REPO,
+        env={**os.environ, **(env_extra or {})},
         capture_output=True,
         text=True,
     )
+
+
+def test_check_versions_passes_on_current_tree():
+    # --repo-only: the repo layer is the only one whose truth lives in this
+    # commit. The installed/deployed layers describe the machine, and a machine
+    # with a stale deployment must fail the tool, not the test suite.
+    proc = _run("--repo-only")
     assert proc.returncode == 0, proc.stderr or proc.stdout
 
 
@@ -28,12 +43,98 @@ def test_check_versions_fails_on_injected_literal(tmp_path):
     text += '\nSTALE = "~/.minni/plugin/0.9.9/dist/cli.js"\n'
     copy.write_text(text, encoding="utf-8")
 
-    proc = subprocess.run(
-        [sys.executable, str(SCRIPT)],
-        cwd=REPO,
-        env={**os.environ, "MINNI_CHECK_VERSIONS_PROPAGATE": str(copy)},
-        capture_output=True,
-        text=True,
-    )
+    proc = _run("--repo-only", env_extra={"MINNI_CHECK_VERSIONS_PROPAGATE": str(copy)})
     assert proc.returncode == 1
     assert "0.9.9" in (proc.stdout + proc.stderr)
+
+
+def test_repo_layer_catches_a_drifted_marketplace(tmp_path):
+    """The split that survived: marketplace.json nests its version under
+    plugins[].version, so the flat manifest reader saw nothing at all and the
+    file sat three minor versions behind while the check printed 'all agree'."""
+    src = REPO / ".claude-plugin" / "marketplace.json"
+    data = json.loads(src.read_text(encoding="utf-8"))
+    for entry in data["plugins"]:
+        entry["version"] = "0.1.0"
+    copy = tmp_path / "marketplace.json"
+    copy.write_text(json.dumps(data), encoding="utf-8")
+
+    proc = _run("--repo-only", env_extra={"MINNI_CHECK_VERSIONS_MARKETPLACE": str(copy)})
+    assert proc.returncode == 1, proc.stdout
+    assert "0.1.0" in (proc.stdout + proc.stderr)
+    assert "plugins[minni].version" in (proc.stdout + proc.stderr)
+
+
+def test_marketplace_version_agrees_with_pyproject():
+    market = json.loads((REPO / ".claude-plugin" / "marketplace.json").read_text(encoding="utf-8"))
+    entry = next(p for p in market["plugins"] if p["name"] == "minni")
+    pyproject = (REPO / "pyproject.toml").read_text(encoding="utf-8")
+    import re
+
+    canonical = re.search(r'^version\s*=\s*["\']([^"\']+)["\']', pyproject, re.M).group(1)
+    assert entry["version"] == canonical, (
+        "marketplace.json is the manifest a fresh `/plugin install` reads; "
+        "it drifted to 0.1.0 while the repo was at 0.4.1 and check-versions could not see it"
+    )
+
+
+def _fake_home_with_deployment(tmp_path: Path, version: str) -> Path:
+    home = tmp_path / "home"
+    root = home / ".config" / "kilo" / "plugins" / "minni"
+    (root / "dist").mkdir(parents=True)
+    (root / ".claude-plugin").mkdir()
+    (root / ".claude-plugin" / "plugin.json").write_text(
+        json.dumps({"name": "minni", "version": version}), encoding="utf-8"
+    )
+    return home
+
+
+def test_deployed_layer_fails_on_a_stale_deployment(tmp_path):
+    home = _fake_home_with_deployment(tmp_path, "0.3.0")
+    proc = _run(env_extra={"MINNI_CHECK_VERSIONS_HOME": str(home)})
+    assert proc.returncode == 1, proc.stdout
+    assert "deployed:" in (proc.stdout + proc.stderr)
+    assert "0.3.0" in (proc.stdout + proc.stderr)
+
+
+def test_deployed_layer_passes_when_the_deployment_agrees(tmp_path):
+    import re
+
+    canonical = re.search(
+        r'^version\s*=\s*["\']([^"\']+)["\']',
+        (REPO / "pyproject.toml").read_text(encoding="utf-8"),
+        re.M,
+    ).group(1)
+    home = _fake_home_with_deployment(tmp_path, canonical)
+    proc = _run(env_extra={"MINNI_CHECK_VERSIONS_HOME": str(home)})
+    assert proc.returncode == 0, proc.stderr or proc.stdout
+    assert "(agrees)" in proc.stdout
+
+
+def test_manifestless_deployment_is_uninspectable_not_clean(tmp_path):
+    """A tree we cannot establish a version for must fail loudly. Treating it as
+    clean is the exact failure this whole slice exists to remove."""
+    home = tmp_path / "home"
+    (home / ".config" / "kilo" / "plugins" / "minni" / "dist").mkdir(parents=True)
+    proc = _run(env_extra={"MINNI_CHECK_VERSIONS_HOME": str(home)})
+    assert proc.returncode == 1, proc.stdout
+    assert "UNINSPECTABLE" in (proc.stdout + proc.stderr)
+
+
+def test_unparseable_deployed_manifest_is_uninspectable(tmp_path):
+    home = tmp_path / "home"
+    root = home / ".config" / "kilo" / "plugins" / "minni"
+    (root / "dist").mkdir(parents=True)
+    (root / ".claude-plugin").mkdir()
+    (root / ".claude-plugin" / "plugin.json").write_text("{not json", encoding="utf-8")
+    proc = _run(env_extra={"MINNI_CHECK_VERSIONS_HOME": str(home)})
+    assert proc.returncode == 1, proc.stdout
+    assert "UNINSPECTABLE" in (proc.stdout + proc.stderr)
+
+
+def test_no_deployments_is_reported_but_not_a_failure(tmp_path):
+    home = tmp_path / "empty-home"
+    home.mkdir()
+    proc = _run(env_extra={"MINNI_CHECK_VERSIONS_HOME": str(home)})
+    assert proc.returncode == 0, proc.stderr or proc.stdout
+    assert "no deployments discovered" in proc.stdout

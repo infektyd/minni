@@ -392,6 +392,14 @@ def handle_daemon_compile(params: dict, request_id: Any, context: AFMContext) ->
             context.default_config,
             **run_kwargs,
         )
+        if not dry_run:
+            # Liveness, recorded whether or not the pass produced drafts. Without
+            # it the only evidence a pass ever ran is _LAST_RUN_PER_PASS, which
+            # a healthy no-op pass never sets — so health could not tell "ran,
+            # found nothing" from "has been failing for days".
+            from minni.afm_writer import record_pass_attempt
+
+            record_pass_attempt(pass_name)
         if not dry_run and result.get("drafts"):
             from minni.afm_writer import submit_drafts
 
