@@ -97,7 +97,16 @@ def test_gauges_reference_layer1_when_present(tmp_path, monkeypatch, capsys):
     assert "layer1/core.md present" in gauges
 
 
-def test_gauges_report_missing_layer1_honestly(vault):
+def test_gauges_report_missing_layer1_honestly(tmp_path, monkeypatch, capsys):
+    """With Layer 1 seeding unavailable, the meter must not claim identity exists."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("MINNI_VAULT_PATH", raising=False)
+    monkeypatch.setattr(propagate, "LAYER1_TEMPLATE_DIR", tmp_path / "absent")
+
+    propagate.bootstrap_vault(argparse.Namespace(agent="test-agent"))
+    capsys.readouterr()
+
+    vault = tmp_path / ".minni" / "test-agent-vault"
     assert 'identity_present: "not seeded"' in (vault / "distill" / "gauges.md").read_text()
 
 

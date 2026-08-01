@@ -257,6 +257,22 @@ The script may create/update local identity source files and DB identity rows.
 It should not write public git files unless explicitly pointed at a tracked
 workspace artifact.
 
+### Layer 1 workspace seeding
+
+`bootstrap-vault` seeds `<vault>/layer1/` with `core.md` and `budget.md` from
+`templates/layer1/`, parameterized by agent id, vault path, workspace, and
+socket path. This is the agent-curated durable identity workspace the Layer 1
+contract assumes: read first on wake, edited by the agent, kept under a strict
+4096-token budget. Without it the doctrine points at files that do not exist.
+
+Pass `--workspace` to record the agent's primary workspace (defaults to
+`$MINNI_WORKSPACE_ID`, else a placeholder for the agent to fill in).
+
+Seeding is idempotent — these files are agent-owned living state, so an existing
+file is never overwritten. The JSON output reports `layer1.created` /
+`layer1.kept`. Layer 1 is seeded before `distill/`, so a fresh vault's gauges
+report the identity workspace as present.
+
 ### Distill ritual seeding
 
 `bootstrap-vault` (also run implicitly by `update-plugin`) seeds
