@@ -53,10 +53,10 @@ ALL_SKIPS = {
     "gemini": GEMINI_SKIP_WARNING,
     "antigravity": (
         "run `minni wire antigravity` or `propagate.py update-plugin "
-        "--platform antigravity` explicitly (shared ~/.gemini tree; excluded "
-        "from `wire all` so bulk wire and propagate do not fight). Do not use "
-        "`propagate --platform all` after a wire-primary fleet — that rewrites "
-        "codex/kilocode/grok MCP paths onto legacy cache trees"
+        "--platform antigravity` (or `--platform cursor`) explicitly — "
+        "shared ~/.gemini tree; excluded from `wire all` so bulk wire and "
+        "propagate do not fight. Prefer `make sync-root` for the full D7 "
+        "fleet (wire-primary hosts + antigravity/cursor)"
     ),
     "cursor": (
         "propagate-managed: run `propagate.py update-plugin --platform cursor`"

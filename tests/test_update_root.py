@@ -171,8 +171,8 @@ def test_dry_run_fast_forwards_nothing(cloned, tmp_path):
     assert _git(clone, "rev-parse", "HEAD") == before, "dry run must not move HEAD"
     remote_ref = _git(clone, "rev-parse", "origin/main")
     assert remote_ref != before, "fetch must have updated the remote-tracking ref"
-    # Round-5 High: redeploy plan must wire the fleet, not claude-only +
-    # propagate --platform all (which undoes wire-primary MCP paths).
+    # D7: redeploy plan must wire the fleet + explicit antigravity/cursor,
+    # not a bulk propagate --platform all (sync-root uses explicit targets).
     assert "wire all" in proc.stdout
     assert "--prune" in proc.stdout
     assert "update-plugin --platform antigravity" in proc.stdout

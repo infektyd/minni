@@ -1517,7 +1517,11 @@ def update_plugin(args: argparse.Namespace) -> int:
         args.no_build = restore_no_build
 
     attempted = {str(r["status"]) for r in results if r["status"] != "skipped"}
-    if not attempted or attempted == {"updated"}:
+    # D5 parity with wire: nothing attempted (all skipped / empty expansion)
+    # is not success — exit 1 so bulk "updated" never green-washes a no-op.
+    if not attempted:
+        overall = "skipped"
+    elif attempted == {"updated"}:
         overall = "updated"
     elif "failed" not in attempted:
         overall = "degraded"

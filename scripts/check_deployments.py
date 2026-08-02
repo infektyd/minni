@@ -214,12 +214,16 @@ def _home() -> Path:
 
 
 def _active_wire_plugin_roots(home: Path) -> set[Path]:
-    """Live wire install roots under ~/.minni/plugin (latest per platform + current).
+    """Live wire install roots under ~/.minni/plugin (latest per platform).
 
     Mirrors scripts/check_versions.py so --strict sync-root verify uses the
     same active set. Latest ``wired_at`` *per platform* stays active (a codex
     root that is still that platform's newest record may still be the live MCP
     target); only superseded rows for the same platform are dropped.
+
+    ``current`` is fallback only when no valid wire records exist — local
+    (+git.*) installs never move it, so always-including a zombie release
+    symlink permanently fails --strict after --from-repo adoption.
     """
     base = home / ".minni" / "plugin"
     actives: set[Path] = set()
@@ -245,6 +249,8 @@ def _active_wire_plugin_roots(home: Path) -> set[Path]:
             actives.add(root)
     except (OSError, json.JSONDecodeError, TypeError):
         pass
+    if actives:
+        return actives
     current = base / "current"
     try:
         if current.exists():

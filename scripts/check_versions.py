@@ -246,11 +246,15 @@ def _active_wire_plugin_roots(home: Path) -> set[Path]:
     """Install roots under ~/.minni/plugin that are the *live* wire targets.
 
     ``wired.json`` is append-ish history. Keep a root active if it is the
-    **latest ``wired_at`` for any platform** (plus ``current``). Drop only
-    superseded rows for the *same* platform — a codex root that is still that
-    platform's newest record may still be the live MCP target even when a
-    fresher claude-code wire exists. Historical duplicates of one platform are
-    ignored so non-interactive wire leftovers do not pile up forever.
+    **latest ``wired_at`` for any platform**. Drop only superseded rows for
+    the *same* platform — a codex root that is still that platform's newest
+    record may still be the live MCP target even when a fresher claude-code
+    wire exists. Historical duplicates of one platform are ignored so
+    non-interactive wire leftovers do not pile up forever.
+
+    ``current`` is fallback only when no valid wire records exist (release-only
+    / pre-wire). Local (+git.*) installs never move it; always-including a
+    zombie release symlink permanently fails sync-root after --from-repo.
     """
     base = home / ".minni" / "plugin"
     actives: set[Path] = set()
@@ -276,6 +280,8 @@ def _active_wire_plugin_roots(home: Path) -> set[Path]:
             actives.add(root)
     except (OSError, json.JSONDecodeError, TypeError):
         pass
+    if actives:
+        return actives
     current = base / "current"
     try:
         if current.exists():

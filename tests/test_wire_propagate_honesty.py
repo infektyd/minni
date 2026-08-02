@@ -110,6 +110,25 @@ def test_update_plugin_all_failed_is_failed(monkeypatch, capsys):
     assert doc["status"] == "failed"
 
 
+def test_update_plugin_nothing_attempted_is_skipped_not_updated(monkeypatch, capsys):
+    """Round-2 Low / D5: empty attempted set (all skips, no expansions) must
+    not green-wash as status=updated / exit 0."""
+    monkeypatch.setattr(propagate, "ALL_PLATFORMS", ())
+    monkeypatch.setattr(
+        propagate, "ALL_SKIPS",
+        {"codex": "wire-managed", "cursor": "example skip"},
+    )
+    monkeypatch.setattr(
+        propagate, "update_one_plugin",
+        lambda platform, args: (_ for _ in ()).throw(AssertionError("must not run")),
+    )
+    rc = propagate.update_plugin(_update_args("all"))
+    doc = json.loads(capsys.readouterr().out)
+    assert rc == 1
+    assert doc["status"] == "skipped"
+    assert all(r["status"] == "skipped" for r in doc["results"])
+
+
 def test_update_plugin_clean_run_is_updated(monkeypatch, capsys):
     monkeypatch.setattr(
         propagate, "update_one_plugin",

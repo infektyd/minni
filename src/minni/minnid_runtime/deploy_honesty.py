@@ -90,12 +90,17 @@ def capture_start_state() -> dict:
 
 
 def _active_payload_roots() -> list[tuple[Path, str]]:
-    """Active wire install roots (latest wired_at per platform + current).
+    """Active wire install roots (latest wired_at per platform).
 
     Reading only the global-newest root greens a partial rewire: codex moves
     to a fresh tree while claude-code still points at an older root, and the
     newest root alone matches HEAD. Mirror check_deployments / check_versions:
     every platform's latest record stays active.
+
+    ``current`` is fallback only when *no* valid wire records exist
+    (release-only / pre-wire). Local (+git.*) installs never move ``current``
+    (see wire/install.update_current_symlink); treating a leftover release
+    symlink as always-active permanently fails sync-root after --from-repo.
     """
     base = Path("~/.minni/plugin").expanduser()
     actives: list[tuple[Path, str]] = []
@@ -123,17 +128,16 @@ def _active_payload_roots() -> list[tuple[Path, str]]:
                 seen.add(root)
     except (OSError, json.JSONDecodeError, TypeError):
         pass
+    if actives:
+        return actives
+    # Fallback: release-only machines with no usable wired.json records.
     current = base / "current"
     if (current / "payload-manifest.json").is_file():
         try:
             resolved = current.resolve()
         except OSError:
             resolved = current
-        if resolved not in seen:
-            actives.append((resolved, "current"))
-            seen.add(resolved)
-    if actives:
-        return actives
+        return [(resolved, "current")]
     try:
         candidates = [
             d for d in base.iterdir()
@@ -188,6 +192,7 @@ def _plugin_dist_status(checkout_head: Optional[str]) -> dict:
         out["reason"] = "no checkout HEAD or manifest sha to compare against"
     elif lagging:
         out["stale"] = True
+        out["lagging"] = lagging
         out["reason"] = (
             f"active wire root(s) lag checkout HEAD {checkout_head[:12]}: "
             f"{'; '.join(lagging)} — re-run `minni wire all` / `make sync-root`"

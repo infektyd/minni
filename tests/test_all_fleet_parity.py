@@ -68,10 +68,14 @@ def test_antigravity_is_inside_at_least_one_all_expansion():
 
 
 def test_wire_all_skips_antigravity_does_not_recommend_propagate_platform_all():
-    """Round-8 Med: skip text must not steer operators to
-    ``propagate --platform all`` after a wire-primary fleet (rewrites
-    codex/kilo/grok onto legacy cache)."""
+    """Round-2 Med: skip text must point at explicit antigravity/cursor or
+    make sync-root — not claim that ``propagate --platform all`` rewrites
+    wire MCP onto legacy trees (D7: all expands only antigravity+cursor)."""
     reason = wire_platform.ALL_SKIPS["antigravity"]
     assert "--platform antigravity" in reason
-    # May warn *against* --platform all, but must not recommend running it.
+    assert "make sync-root" in reason or "--platform cursor" in reason
+    # Must not recommend bulk all as a synonym for the full fleet, and must
+    # not assert the pre-D7 "rewrites legacy" footgun for --platform all.
     assert "or `propagate.py update-plugin --platform all`" not in reason
+    assert "rewrites" not in reason.lower()
+    assert "legacy cache" not in reason.lower()

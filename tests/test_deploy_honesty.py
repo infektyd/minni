@@ -185,9 +185,10 @@ def test_plugin_dist_tracks_wired_local_payload_without_current(
 def test_plugin_dist_prefers_wired_record_over_zombie_current(
     checkout, monkeypatch, tmp_path,
 ):
-    """Round-1 High, second shape: a `current` symlink stuck on an old release
-    must not out-vote the newer from-repo install wire recorded — that would
-    report stale=True forever while the live surfaces run fresh code."""
+    """Round-2 High: when wired.json has valid latest-per-platform roots,
+    a leftover release `current` symlink must NOT join the active set.
+    Local (+git.*) installs never move current; always-including it would
+    report stale=True forever and brick make sync-root after --from-repo."""
     import json as _json
 
     home = tmp_path / "home"
@@ -224,12 +225,52 @@ def test_plugin_dist_prefers_wired_record_over_zombie_current(
     deploy_honesty.capture_start_state()
 
     out = deploy_honesty.deploy_status()
-    # Zombie `current` (old release) is still an active root; multi-root
-    # honesty must report stale=true because that payload lags HEAD even
-    # while the fresher wired.json root matches.
-    assert out["plugin_dist"]["stale"] is True
-    assert "lag" in (out["plugin_dist"].get("reason") or "").lower() or "0.4.0" in str(out["plugin_dist"])
+    assert out["plugin_dist"]["stale"] is False, out["plugin_dist"]
+    assert out["plugin_dist"]["dist_version"] == local_ver
+    assert "current" not in out["plugin_dist"]["resolved_via"]
+    assert out["plugin_dist"]["active_roots"] == 1
 
+
+def test_plugin_dist_stale_if_any_platform_root_lags(checkout, monkeypatch, tmp_path):
+    """Latest-per-platform: judging only the global-newest root hides a lagging
+    peer still executing an older payload after a partial rewire."""
+    import json as _json
+
+    home = tmp_path / "home"
+    plugin = home / ".minni" / "plugin"
+    head = _git(checkout, "rev-parse", "HEAD")
+    old = plugin / "0.4.1+git.oldroot"
+    new = plugin / "0.4.1+git.newroot"
+    old.mkdir(parents=True)
+    new.mkdir(parents=True)
+    (old / "payload-manifest.json").write_text(
+        _json.dumps({"git_sha": "0" * 40, "version": "0.4.1+git.oldroot"}),
+        encoding="utf-8",
+    )
+    (new / "payload-manifest.json").write_text(
+        _json.dumps({"git_sha": head, "version": "0.4.1+git.newroot"}),
+        encoding="utf-8",
+    )
+    (plugin / "wired.json").write_text(
+        _json.dumps({
+            "schema": 1,
+            "wires": [
+                {"platform": "claude-code", "install_root": str(old),
+                 "wired_at": "2026-07-01T00:00:00Z"},
+                {"platform": "codex", "install_root": str(new),
+                 "wired_at": "2026-08-02T00:00:00Z"},
+            ],
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(deploy_honesty, "_source_checkout", lambda: checkout)
+    deploy_honesty.capture_start_state()
+    out = deploy_honesty.deploy_status()
+    assert out["plugin_dist"]["stale"] is True
+    assert out["plugin_dist"]["active_roots"] == 2
+    assert any("oldroot" in x for x in out["plugin_dist"].get("lagging", []))
+    assert out["stale"] is True
 
 def test_top_level_stale_rolls_up_plugin_dist(checkout, monkeypatch, tmp_path):
     """Round-5 Med: top-level deploy.stale must be true when plugin_dist is
