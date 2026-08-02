@@ -575,6 +575,89 @@ def test_await_handoff_polls_file_channel_until_ack_when_db_broken(monkeypatch, 
     assert elapsed < 1.5, f"should return soon after mid-wait ack, got {elapsed:.3f}s"
 
 
+def test_await_handoff_clears_store_error_after_recovery(monkeypatch, tmp_path):
+    """Transient store blip must not sticky-poison a later healthy timeout.
+
+    First poll raises HandoffStoreError; subsequent polls succeed with no row
+    and empty file channel → status=timeout, not -32000.
+    """
+    from minni.minnid_runtime.handoff import HandoffStoreError
+
+    _patch_handoff_db(monkeypatch, tmp_path)
+    recipient = tmp_path / "claudecode-vault"
+    monkeypatch.setenv(
+        "MINNI_AGENT_VAULTS",
+        json.dumps({"claude-code": str(recipient)}),
+    )
+
+    calls = {"n": 0}
+
+    def _flaky_status(lease_id, *, context):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise HandoffStoreError(
+                f"handoff lease store failed while reading lease {lease_id!r}: blip"
+            )
+        return None  # healthy empty / unknown
+
+    monkeypatch.setattr(minnid, "_runtime_handoff_lease_status", _flaky_status)
+    # Also patch the symbol used if dispatch goes through runtime package directly.
+    import minni.minnid_runtime.handoff as handoff_mod
+
+    monkeypatch.setattr(handoff_mod, "handoff_lease_status", _flaky_status)
+
+    response = minnid._dispatch_sync({
+        "jsonrpc": "2.0",
+        "id": 2316,
+        "method": "minni_await_handoff",
+        "params": {"lease_id": "lease-recovered", "timeout_ms": 150},
+    })
+
+    assert "error" not in response, f"recovered store must timeout cleanly: {response!r}"
+    assert response["result"]["status"] == "timeout"
+    assert response["result"]["lease_id"] == "lease-recovered"
+    assert calls["n"] >= 2, "expected multiple polls after recovery"
+
+
+def test_await_handoff_logs_store_failure_once_not_per_poll(monkeypatch, tmp_path, caplog):
+    """Broken store + multi-poll await must not flood WARNING per 50ms tick."""
+    import logging
+
+    _patch_handoff_db(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        minnid, "_lazy_writeback", lambda: types.SimpleNamespace(db=_BrokenHandoffDB())
+    )
+    recipient = tmp_path / "claudecode-vault"
+    monkeypatch.setenv(
+        "MINNI_AGENT_VAULTS",
+        json.dumps({"claude-code": str(recipient)}),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="minnid"):
+        response = minnid._dispatch_sync({
+            "jsonrpc": "2.0",
+            "id": 2317,
+            "method": "minni_await_handoff",
+            "params": {"lease_id": "lease-log-flood", "timeout_ms": 200},
+        })
+
+    assert response.get("error", {}).get("code") == -32000
+    store_warns = [
+        r
+        for r in caplog.records
+        if r.levelno >= logging.WARNING
+        and (
+            "lease store failed" in r.getMessage()
+            or "Could not read handoff lease" in r.getMessage()
+            or "polling file channel" in r.getMessage()
+        )
+    ]
+    assert len(store_warns) == 1, (
+        f"expected exactly one store-failure WARNING, got {len(store_warns)}: "
+        f"{[r.getMessage() for r in store_warns]!r}"
+    )
+
+
 def test_pending_handoff_leases_raises_handoff_store_error(monkeypatch, tmp_path):
     """Unit-level: empty list is reserved for genuine empty; store failure raises."""
     from dataclasses import replace

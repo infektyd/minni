@@ -558,6 +558,12 @@ def pending_handoff_leases(agent_id: str, *, context: HandoffContext) -> list[di
 
 
 def handoff_lease_status(lease_id: str, *, context: HandoffContext) -> Optional[dict]:
+    """Read lease status from SQLite.
+
+    Raises ``HandoffStoreError`` on store failure (does not log — callers that
+    poll this in a tight loop, e.g. ``handle_await_handoff``, must rate-limit
+    their own diagnostics so a dual-channel wait does not flood WARNING logs).
+    """
     try:
         db = context.lazy_writeback().db
         with db.cursor() as c:
@@ -570,7 +576,6 @@ def handoff_lease_status(lease_id: str, *, context: HandoffContext) -> Optional[
         return {"lease_id": row["lease_id"], "status": row["status"]}
     except Exception as exc:
         # PLUMB-T7 / #231: None means "unknown lease", not "store is broken".
-        context.logger.warning("Could not read handoff lease %r: %s", lease_id, exc)
         raise HandoffStoreError(
             f"handoff lease store failed while reading lease {lease_id!r}: {exc}"
         ) from exc
@@ -738,13 +743,27 @@ async def handle_await_handoff(params: dict, request_id: Any, context: HandoffCo
     timeout_ms = max(0, min(int(params.get("timeout_ms", 30000)), 300000))
     deadline = time.time() + (timeout_ms / 1000.0)
     # Dual-channel: a broken SQLite read must not abort file-channel waiting.
-    # Remember the store failure, keep polling _file_channel_terminal_ack until
-    # deadline, then fail-loud with -32000 (not status=timeout / PLUMB-T7).
+    # store_error tracks the *latest* poll only (cleared on recovery) so a
+    # transient blip does not poison a later healthy timeout as -32000.
+    # Log once on None→set (and once on recovery); never per-poll.
     store_error: Optional[HandoffStoreError] = None
     while True:
         try:
             lease = handoff_lease_status(lease_id, context=context)
+            if store_error is not None:
+                context.logger.info(
+                    "await_handoff: lease store recovered for %r after prior failure (%s)",
+                    lease_id,
+                    store_error,
+                )
+            store_error = None
         except HandoffStoreError as exc:
+            if store_error is None:
+                context.logger.warning(
+                    "await_handoff: lease store failed for %r; polling file channel until deadline: %s",
+                    lease_id,
+                    exc,
+                )
             store_error = exc
             lease = None
         if lease is not None and lease.get("status") not in {None, "pending"}:
