@@ -219,6 +219,13 @@ def test_explicit_backend_branches_use_the_flagging_encoder():
         "an explicit-backend branch is bypassing _encode_query and therefore "
         "the P0-B degradation flag"
     )
+    # Round 7: the DEFAULT semantic path must go through the same encoder —
+    # an encode-side degrade fixed only in _encode_query would otherwise
+    # miss the default path.
+    sem = source.index("def _semantic_search")
+    assert "_encode_query" in source[sem:sem + 1500], (
+        "the default FAISS path must route through _encode_query too"
+    )
 
 
 # ── #226 R4(c): a bad backend value is -32602, not -32000 ────────────────────
@@ -946,6 +953,9 @@ def test_loop_consults_the_returned_status_not_only_exceptions():
     # Round 5: rpc_error responses skip handle_daemon_compile's recording,
     # so the loop itself must record the attempt and the failure.
     assert "record_rpc_error(name, res)" in source
+    # Round 7: an rpc_error's message lives in the top-level `error`, not
+    # result.reason — reading only the latter logged "rpc_error: None".
+    assert '(res.get("error") or {}).get("message")' in source
 
 
 # ── #230 AFM-9: dropped distillation groups must be counted ──────────────────

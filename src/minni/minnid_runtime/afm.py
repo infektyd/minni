@@ -817,10 +817,15 @@ async def afm_loop_runner(context: AFMContext):
                             tick_failure = failure
                             if failure == "rpc_error":
                                 record_rpc_error(name, res)
+                            # Round 7: an rpc_error carries its message in the
+                            # top-level `error`, not result.reason — reading
+                            # only the latter logged "rpc_error: None".
                             context.logger.warning(
                                 "AFM loop: consolidation batch %d returned %s: %s",
                                 batches + 1, failure,
-                                (res.get("result") or {}).get("reason"),
+                                (res.get("error") or {}).get("message")
+                                if failure == "rpc_error"
+                                else (res.get("result") or {}).get("reason"),
                             )
                             break
                         last_summ = (res.get("result") or {}).get("summary") if isinstance(res, dict) else None
@@ -846,7 +851,10 @@ async def afm_loop_runner(context: AFMContext):
                             record_rpc_error(name, res)
                         context.logger.warning(
                             "AFM loop: pass '%s' returned %s: %s",
-                            name, failure, (res.get("result") or {}).get("reason"),
+                            name, failure,
+                            (res.get("error") or {}).get("message")
+                            if failure == "rpc_error"
+                            else (res.get("result") or {}).get("reason"),
                         )
                     else:
                         summ = (res.get("result") or {}).get("summary") if isinstance(res, dict) else None

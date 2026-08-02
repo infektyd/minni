@@ -1453,7 +1453,54 @@ export async function recordUnroutedEvent(
   }
 }
 
+/**
+ * P6 (#228): a native bridge (Kilo) has no vault handle of its own — it
+ * reaches the vault only by spawning this hook. This is that channel: it
+ * carries a bridge failure into the audit log so a persistently failing
+ * bridge is distinguishable from an idle one. It is a diagnostic, not an
+ * envelope event, and never reaches a handler.
+ *
+ * Round 7 (PR #260): the EXIT CODE is the delivery signal. The bridge
+ * restores its coalesced eviction counts only when this child errors or
+ * exits non-zero — so an audit that did not land must not exit clean, or
+ * the parent clears counts that were never written anywhere durable.
+ */
+async function runBridgeFailureDiagnostic(
+  config: AgentHookConfig,
+  payload: Record<string, unknown>,
+): Promise<void> {
+  const failedEvent = asString(payload.failed_event) || "(unknown)";
+  const bridge = asString(payload.bridge) || "(unknown)";
+  try {
+    await recordAudit(config.vaultPath, {
+      tool: `${config.auditPrefix}_bridge_failure`,
+      summary: `${bridge} bridge: ${failedEvent} failed: ${asString(payload.error)}`,
+      // Bucket per failed event, for the same reason _intent_dropped does:
+      // one throttle across all of them would hide every failure after the
+      // first and report the bridge as healthier than it is.
+      throttleKey: `${config.auditPrefix}_bridge_failure__${failedEvent}`,
+    });
+  } catch {
+    emit({ continue: true });
+    process.exitCode = 1;
+    return;
+  }
+  emit({ continue: true });
+}
+
 export async function runHookMain(config: AgentHookConfig): Promise<void> {
+  // Round 7 (PR #260): the bridge diagnostic is routed BEFORE the
+  // hooksEnabled gate — disabling memory hooks must not also disable the one
+  // surface that says the bridge is broken. The early return here used to
+  // exit 0 first, which the parent read as "audit delivered". argv is the
+  // bridge's invocation contract (spawn(HOOK_SCRIPT, ["BridgeFailure"])), so
+  // the route is decided before stdin is consumed.
+  if ((process.argv[2] ?? "").trim() === BRIDGE_FAILURE_EVENT) {
+    const payload = (await readStdin()) as Record<string, unknown>;
+    await runBridgeFailureDiagnostic(config, payload);
+    return;
+  }
+
   if (!config.hooksEnabled) {
     emit({ continue: true });
     return;
@@ -1464,28 +1511,11 @@ export async function runHookMain(config: AgentHookConfig): Promise<void> {
   const eventFromPayload = asString(payload.hook_event_name);
   const event = (eventArg || eventFromPayload || "").trim();
 
-  // P6 (#228): a native bridge (Kilo) has no vault handle of its own — it
-  // reaches the vault only by spawning this hook. This is that channel: it
-  // carries a bridge failure into the audit log so a persistently failing
-  // bridge is distinguishable from an idle one. It is a diagnostic, not an
-  // envelope event, so it is routed BEFORE the VALID_EVENTS gate and never
-  // reaches a handler.
+  // Payload-only form (hook_event_name with no argv): same diagnostic
+  // channel, still routed BEFORE the VALID_EVENTS gate so it is never
+  // recorded as a dropped intent.
   if (event === BRIDGE_FAILURE_EVENT) {
-    const failedEvent = asString(payload.failed_event) || "(unknown)";
-    const bridge = asString(payload.bridge) || "(unknown)";
-    try {
-      await recordAudit(config.vaultPath, {
-        tool: `${config.auditPrefix}_bridge_failure`,
-        summary: `${bridge} bridge: ${failedEvent} failed: ${asString(payload.error)}`,
-        // Bucket per failed event, for the same reason _intent_dropped does:
-        // one throttle across all of them would hide every failure after the
-        // first and report the bridge as healthier than it is.
-        throttleKey: `${config.auditPrefix}_bridge_failure__${failedEvent}`,
-      });
-    } catch {
-      // Audit unavailable; nothing further to try from a failure path.
-    }
-    emit({ continue: true });
+    await runBridgeFailureDiagnostic(config, payload);
     return;
   }
   // PreToolUse is dispatched here too but is NOT an EnvelopeEvent (its output is

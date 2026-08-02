@@ -100,6 +100,10 @@ function reportSessionEvictions(label, max, evicted) {
         cur.max = info.max;
         evictionsSinceReport.set(name, cur);
       }
+      // Round 7: rewind the coalesce clock too. It advanced on spawn, so a
+      // one-shot wave whose audit failed sat restored-but-console-only until
+      // some FUTURE eviction reopened the window — which may never come.
+      lastEvictionReportAt = 0;
       console.warn(
         `[minni] session-evict audit child died before writing; ` +
           `restored counts: ${detail}`,

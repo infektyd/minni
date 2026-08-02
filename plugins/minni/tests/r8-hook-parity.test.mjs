@@ -12,11 +12,13 @@
 // Each test below fails against the pre-R8 behavior.
 
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 
 import { CURSOR_EVENTS } from "../dist/cursor-adapter.js";
 import { AGY_EVENTS } from "../dist/gemini-adapter.js";
@@ -246,6 +248,14 @@ test("P5: an eviction is reported, not silent — and coalesced, not budget-burn
     /cur\.count \+= info\.count/,
     "an undelivered audit must restore the flushed eviction counts",
   );
+  // Round 7: restoring counts is not enough — the coalesce clock advanced on
+  // spawn, so a one-shot failed wave sat console-only until a FUTURE eviction
+  // reopened the window. The clock must rewind with the counts.
+  assert.match(
+    cWindow,
+    /lastEvictionReportAt = 0/,
+    "an undelivered audit must also reopen the coalesce window",
+  );
 });
 
 test("P6: a suppressed diagnostic reports itself as NOT delivered", async () => {
@@ -358,6 +368,62 @@ test("P6: bridge failures bucket per failed event so the second is not throttled
       log,
       /SessionStart failed/,
       "a second failed event within the throttle window must still be recorded",
+    );
+  });
+});
+
+const execFileAsync = promisify(execFile);
+const KILOCODE_HOOK = path.join(PLUGIN_ROOT, "dist", "kilocode-hook.js");
+
+async function runBridgeFailureChild(vaultPath, extraEnv = {}) {
+  const child = execFileAsync(process.execPath, [KILOCODE_HOOK, "BridgeFailure"], {
+    env: { ...process.env, MINNI_KILOCODE_VAULT_PATH: vaultPath, ...extraEnv },
+  });
+  child.child.stdin.end(
+    JSON.stringify({
+      hook_event_name: "BridgeFailure",
+      bridge: "kilo",
+      failed_event: "Stop",
+      error: "hook timed out",
+    }),
+  );
+  try {
+    await child;
+    return 0;
+  } catch (error) {
+    return error.code ?? 1;
+  }
+}
+
+test("P6 round 7: an audit that cannot write exits non-zero", async () => {
+  // The parent's whole delivery contract is the exit code: it restores its
+  // coalesced eviction counts only on error/non-zero exit. A clean exit
+  // after a swallowed recordAudit throw cleared counts that never landed
+  // anywhere durable. Vault path UNDER a plain file = guaranteed write fail.
+  const root = await mkdtemp(path.join(tmpdir(), "minni-r8-badvault-"));
+  try {
+    const file = path.join(root, "not-a-dir");
+    await writeFile(file, "occupied");
+    const code = await runBridgeFailureChild(path.join(file, "vault"));
+    assert.notEqual(code, 0, "a failed audit write must not report delivered");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("P6 round 7: hooks disabled does not disable the bridge-failure surface", async () => {
+  // The hooksEnabled early-return used to exit 0 BEFORE the BridgeFailure
+  // branch — turning memory hooks off also silently turned off the one
+  // surface that says the bridge is broken, while the parent read the clean
+  // exit as delivered.
+  await withVault(async (root) => {
+    const code = await runBridgeFailureChild(root, { MINNI_KILOCODE_HOOKS: "off" });
+    assert.equal(code, 0, "a delivered diagnostic exits clean");
+    const log = await readFile(path.join(root, "log.md"), "utf8");
+    assert.match(
+      log,
+      /bridge_failure/,
+      "the diagnostic must land even with memory hooks disabled",
     );
   });
 });

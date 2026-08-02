@@ -743,12 +743,13 @@ class RetrievalEngine:
         Semantic search via FAISS index.
         Returns best-chunk-per-doc with chunk text and heading context.
         """
-        if not self.model:
-            self._note_vector_model_down()
+        # Round 7 (PR #260): route through _encode_query like every explicit
+        # backend path — an encode-side degrade fixed only there would
+        # otherwise miss the default path. Empty vector = encoder down, flag
+        # already raised.
+        query_emb = self._encode_query(query)
+        if query_emb.size == 0:
             return []
-        self.vector_model_down = False
-
-        query_emb = self.model.encode(query).astype(np.float32)
 
         # Search FAISS for top candidates
         search_limit = limit * 5  # Over-fetch for doc dedup
