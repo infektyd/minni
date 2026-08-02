@@ -16,15 +16,18 @@ Separately, store-time semantic indexing writes synthetic document paths under
 Stat-checking them as "dangling" is a false positive; true orphans are rows
 with no FTS content (and for non-virtual paths, missing files).
 
-Winner rule (stated, applied by ``repair_duplicate_candidate_pairs``)
---------------------------------------------------------------------
-1. Prefer ``accepted`` over any other status (preserves the twin that produced
-   the durable learning; never rewrites ``learnings``).
-2. Else prefer any terminal status over ``proposed``.
-3. Else keep the lowest ``candidate_id`` (oldest insert).
-4. The loser is **deleted** from ``candidate_packets`` after an audit row is
-   written to ``consolidation_actions`` (when that table exists). Learnings,
-   FTS, and embeddings are never touched by the dual-candidate repair.
+Winner / collapse rule (applied by ``repair_duplicate_candidate_pairs``)
+------------------------------------------------------------------------
+1. If any row is ``accepted`` → keep the lowest-id accepted; hard-delete only
+   non-``accepted`` twins (the real #239 promote-then-dedup shape). Never
+   rewrites ``learnings``.
+2. If any row is still ``proposed`` and none are ``accepted`` → **do not
+   delete**; report ``needs_operator`` (must not let ``rejected`` win over an
+   open proposed twin and block re-ingest).
+3. Else collapse all-terminal or all-``proposed`` groups under lowest
+   ``candidate_id`` (oldest insert).
+4. Losers are **deleted** after an audit row in ``consolidation_actions``
+   (when present). Learnings, FTS, and embeddings are never touched.
 
 Collapse scope (byte-identical only)
 ------------------------------------
@@ -68,7 +71,9 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger("minni.repair_dual_candidates")
 
-# Higher is better. ``accepted`` must beat ``rejected`` so the promote twin wins.
+# Reporting preference only (divergent samples / choose_winner). Hard-delete
+# eligibility is decided by ``collapse_decision`` — rejected must NOT beat an
+# open proposed twin (see issue #239 formal RC).
 _STATUS_RANK: Dict[str, int] = {
     "accepted": 100,
     "merged": 40,
@@ -80,6 +85,9 @@ _STATUS_RANK: Dict[str, int] = {
     "rejected": 10,
     "proposed": 0,
 }
+
+_PROPOSED_STATUS = "proposed"
+_ACCEPTED_STATUS = "accepted"
 
 REPAIR_ACTION_TYPE = "issue239_dual_resolve"
 VIRTUAL_DURABLE_MARKER = "/_durable/"
@@ -150,16 +158,16 @@ def _digest_content(content: Any) -> Optional[str]:
 def _collapse_digest(
     derived: Dict[str, Any], content: Any = None
 ) -> Optional[str]:
-    """Byte-identity digest for collapse: prefer stored sha, else content column.
+    """Byte-identity digest for collapse: content column is authoritative.
 
-    Missing/empty ``derived_from.content_sha1`` must **not** collapse different
-    bodies under the same app key. When the stored sha is absent, derive the
-    same SHA1 inbox_ingest writes so peers only group when bodies match.
+    When content is present, always key on ``sha1(content)`` so a stale/copied
+    ``derived_from.content_sha1`` cannot group divergent bodies as twins.
+    Stored sha is audit metadata only; used only when content is unavailable.
     """
-    stored = _content_sha1_of(derived)
-    if stored is not None:
-        return stored
-    return _digest_content(content)
+    content_digest = _digest_content(content)
+    if content_digest is not None:
+        return content_digest
+    return _content_sha1_of(derived)
 
 
 def _collapse_key(
@@ -177,10 +185,15 @@ def status_rank(status: Optional[str]) -> int:
     return _STATUS_RANK.get(str(status or "").strip().lower(), 1)
 
 
-def choose_winner(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
-    """Apply the stated winner rule to a group of duplicate rows.
+def _norm_status(status: Any) -> str:
+    return str(status or "").strip().lower()
 
-    Sort key: higher status_rank first, then lower candidate_id.
+
+def choose_winner(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    """Reporting preference: higher status_rank first, then lower candidate_id.
+
+    **Not** the hard-delete eligibility rule. Use ``collapse_decision`` before
+    deleting so rejected cannot beat an open proposed twin.
     """
     if not rows:
         raise ValueError("choose_winner requires at least one row")
@@ -188,6 +201,89 @@ def choose_winner(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         rows,
         key=lambda r: (-status_rank(r.get("status")), int(r["candidate_id"])),
     )
+
+
+def collapse_decision(
+    rows: Sequence[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Decide whether a byte-identical dual group may hard-delete losers.
+
+    Returns dict with:
+      * ``action``: ``"collapse"`` | ``"needs_operator"``
+      * ``winner``: winning row when action is collapse (else None)
+      * ``reason``: short machine-readable cause
+      * ``losers``: rows that would be deleted under collapse (empty if not)
+
+    Rules:
+      1. Any ``accepted`` → keep lowest-id accepted; delete non-accepted.
+      2. Any ``proposed`` and no ``accepted`` → needs-operator (no delete).
+      3. All-terminal or all-proposed → keep lowest candidate_id.
+    """
+    if not rows:
+        raise ValueError("collapse_decision requires at least one row")
+    by_status: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for r in rows:
+        by_status[_norm_status(r.get("status"))].append(r)
+
+    accepted = by_status.get(_ACCEPTED_STATUS) or []
+    proposed = by_status.get(_PROPOSED_STATUS) or []
+
+    if accepted:
+        winner = min(accepted, key=lambda r: int(r["candidate_id"]))
+        win_id = int(winner["candidate_id"])
+        losers = [
+            r
+            for r in rows
+            if int(r["candidate_id"]) != win_id
+            and _norm_status(r.get("status")) != _ACCEPTED_STATUS
+        ]
+        # Extra accepted twins stay (hard guard) — reported via skipped later.
+        return {
+            "action": "collapse",
+            "winner": winner,
+            "reason": "accepted_present",
+            "losers": losers,
+            "extra_accepted": [
+                r
+                for r in accepted
+                if int(r["candidate_id"]) != win_id
+            ],
+        }
+
+    if proposed:
+        # Mixed proposed + any terminal non-accepted → operator must decide.
+        non_proposed = [
+            r for r in rows if _norm_status(r.get("status")) != _PROPOSED_STATUS
+        ]
+        if non_proposed:
+            return {
+                "action": "needs_operator",
+                "winner": None,
+                "reason": "proposed_with_terminal",
+                "losers": [],
+                "extra_accepted": [],
+            }
+        # All proposed: collapse under lowest id.
+        winner = min(rows, key=lambda r: int(r["candidate_id"]))
+        win_id = int(winner["candidate_id"])
+        return {
+            "action": "collapse",
+            "winner": winner,
+            "reason": "all_proposed",
+            "losers": [r for r in rows if int(r["candidate_id"]) != win_id],
+            "extra_accepted": [],
+        }
+
+    # All terminal, no accepted: lowest id.
+    winner = min(rows, key=lambda r: int(r["candidate_id"]))
+    win_id = int(winner["candidate_id"])
+    return {
+        "action": "collapse",
+        "winner": winner,
+        "reason": "all_terminal",
+        "losers": [r for r in rows if int(r["candidate_id"]) != win_id],
+        "extra_accepted": [],
+    }
 
 
 def _iter_inbox_candidates(db) -> List[Dict[str, Any]]:
@@ -217,43 +313,92 @@ def _iter_inbox_candidates(db) -> List[Dict[str, Any]]:
     return items
 
 
-def _group_summary(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
-    winner = choose_winner(rows)
-    losers = [r for r in rows if r["candidate_id"] != winner["candidate_id"]]
+def _group_key_dict(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     ckey = rows[0]["_key"]
     return {
-        "key": {
-            "inbox_file": ckey[0],
-            "candidate_index": ckey[1],
-            "content_sha1": ckey[2],
-        },
-        "winner_id": int(winner["candidate_id"]),
-        "winner_status": winner.get("status"),
-        "loser_ids": [int(r["candidate_id"]) for r in losers],
-        "statuses": sorted({str(r.get("status")) for r in rows}),
-        "row_count": len(rows),
+        "inbox_file": ckey[0],
+        "candidate_index": ckey[1],
+        "content_sha1": ckey[2],
     }
 
 
-def find_duplicate_candidate_groups(db) -> List[Dict[str, Any]]:
-    """Group inbox candidates by (inbox_file, candidate_index, content_sha1).
+def _group_summary(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    """Summarize a byte-identical dual group with collapse eligibility."""
+    decision = collapse_decision(rows)
+    statuses = sorted({str(r.get("status")) for r in rows})
+    base = {
+        "key": _group_key_dict(rows),
+        "statuses": statuses,
+        "row_count": len(rows),
+        "candidate_ids": sorted(int(r["candidate_id"]) for r in rows),
+        "collapse_action": decision["action"],
+        "collapse_reason": decision["reason"],
+    }
+    if decision["action"] == "collapse" and decision["winner"] is not None:
+        winner = decision["winner"]
+        losers = decision["losers"]
+        base.update(
+            {
+                "winner_id": int(winner["candidate_id"]),
+                "winner_status": winner.get("status"),
+                "loser_ids": [int(r["candidate_id"]) for r in losers],
+            }
+        )
+    else:
+        base.update(
+            {
+                "winner_id": None,
+                "winner_status": None,
+                "loser_ids": [],
+            }
+        )
+    return base
 
-    Returns only **byte-identical** groups with 2+ rows — the #239 dual shape.
-    App-key peers with different ``content_sha1`` are reported separately via
-    ``find_divergent_content_groups`` and are not hard-deleted by default.
-    """
+
+def _byte_identical_row_groups(db) -> List[List[Dict[str, Any]]]:
     groups: Dict[Tuple[str, int, Optional[str]], List[Dict[str, Any]]] = defaultdict(
         list
     )
     for item in _iter_inbox_candidates(db):
         groups[item["_key"]].append(item)
+    return [rows for rows in groups.values() if len(rows) >= 2]
 
+
+def find_duplicate_candidate_groups(db) -> List[Dict[str, Any]]:
+    """Group inbox candidates by (inbox_file, candidate_index, content digest).
+
+    Returns only **byte-identical collapsible** groups with 2+ rows — the #239
+    dual shape that hard-delete may act on. Groups that need an operator
+    (proposed + terminal, no accepted) are reported via
+    ``find_needs_operator_groups`` and are not hard-deleted.
+    """
     out: List[Dict[str, Any]] = []
-    for rows in groups.values():
-        if len(rows) < 2:
+    for rows in _byte_identical_row_groups(db):
+        summary = _group_summary(rows)
+        if summary["collapse_action"] != "collapse":
             continue
-        out.append(_group_summary(rows))
-    out.sort(key=lambda g: g["winner_id"])
+        # Skip groups where collapse would delete nothing (e.g. dual accepted).
+        if not summary["loser_ids"] and not summary.get("row_count", 0) > 1:
+            continue
+        out.append(summary)
+    out.sort(key=lambda g: (g["winner_id"] is None, g["winner_id"] or 0))
+    return out
+
+
+def find_needs_operator_groups(db) -> List[Dict[str, Any]]:
+    """Byte-identical duals that must not auto-delete (proposed + terminal)."""
+    out: List[Dict[str, Any]] = []
+    for rows in _byte_identical_row_groups(db):
+        summary = _group_summary(rows)
+        if summary["collapse_action"] == "needs_operator":
+            out.append(summary)
+    out.sort(
+        key=lambda g: (
+            g["key"]["inbox_file"],
+            g["key"]["candidate_index"],
+            g["candidate_ids"][0] if g.get("candidate_ids") else 0,
+        )
+    )
     return out
 
 
@@ -420,7 +565,7 @@ def _audit_drop(
         "loser_id": loser_id,
         "kept_id": winner_id,
         "kept_status": winner_status,
-        "rule": "accepted>terminal>oldest",
+        "rule": "accepted|all_terminal|all_proposed>lowest_id; never proposed+terminal",
     }
     if loser is not None:
         content = loser.get("content")
@@ -438,7 +583,7 @@ def _audit_drop(
     except Exception:
         detail = (
             f"deleted dual twin #{loser_id}; kept #{winner_id} "
-            f"(status={winner_status}); rule=accepted>terminal>oldest"
+            f"(status={winner_status}); rule=accepted|all_terminal|all_proposed"
         )
     try:
         c.execute(
@@ -493,6 +638,7 @@ def repair_duplicate_candidate_pairs(
     ``accepted`` are never hard-deleted.
     """
     groups = find_duplicate_candidate_groups(db)
+    needs_operator = find_needs_operator_groups(db)
     divergent = find_divergent_content_groups(db)
     if limit is not None:
         groups = groups[: max(0, int(limit))]
@@ -506,12 +652,14 @@ def repair_duplicate_candidate_pairs(
                 "delete": g["loser_ids"],
                 "key": g["key"],
                 "statuses": g["statuses"],
+                "collapse_reason": g.get("collapse_reason"),
             }
         )
 
     deleted = 0
     groups_applied = 0
     groups_skipped_stale = 0
+    groups_needs_operator_live = 0
     skipped_accepted_guard = 0
     winner_replanned = 0
     fk_nulled = 0
@@ -530,29 +678,29 @@ def repair_duplicate_candidate_pairs(
             if not has_contradiction:
                 has_contradiction = _table_exists_on_cursor(c, "contradiction_log")
             for item in plan:
-                # High #1: re-validate under the write lock — never trust the
-                # pre-txn plan for deletes (concurrent AFM can promote the
-                # planned "loser" to accepted between plan and BEGIN).
+                # Re-validate under the write lock — never trust the pre-txn
+                # plan for deletes (concurrent AFM can change status between
+                # plan and BEGIN IMMEDIATE).
                 live_rows = _load_collapse_group_on_cursor(c, item["key"])
                 if len(live_rows) < 2:
                     groups_skipped_stale += 1
                     continue
-                live_winner = choose_winner(live_rows)
+                decision = collapse_decision(live_rows)
+                if decision["action"] != "collapse" or decision["winner"] is None:
+                    groups_needs_operator_live += 1
+                    continue
+                live_winner = decision["winner"]
                 live_keep = int(live_winner["candidate_id"])
                 live_status = str(live_winner.get("status") or "")
-                if live_keep != int(item["keep"]):
+                if item.get("keep") is not None and live_keep != int(item["keep"]):
                     winner_replanned += 1
-                live_losers = [
-                    r
-                    for r in live_rows
-                    if int(r["candidate_id"]) != live_keep
-                ]
+                live_losers = list(decision["losers"])
                 group_deleted = 0
                 for loser in live_losers:
                     loser_id = int(loser["candidate_id"])
-                    loser_status = str(loser.get("status") or "").strip().lower()
+                    loser_status = _norm_status(loser.get("status"))
                     # Hard guard: never delete an accepted twin (provenance).
-                    if loser_status == "accepted":
+                    if loser_status == _ACCEPTED_STATUS:
                         skipped_accepted_guard += 1
                         continue
                     if has_contradiction:
@@ -578,6 +726,9 @@ def repair_duplicate_candidate_pairs(
                 elif live_losers:
                     # All losers were accepted-guarded — group unresolved.
                     groups_skipped_stale += 1
+                elif decision.get("extra_accepted"):
+                    skipped_accepted_guard += len(decision["extra_accepted"])
+                    groups_skipped_stale += 1
 
     return {
         "dry_run": dry_run,
@@ -586,17 +737,33 @@ def repair_duplicate_candidate_pairs(
         "deleted": deleted if not dry_run else 0,
         "groups_applied": groups_applied if not dry_run else 0,
         "groups_skipped_stale": groups_skipped_stale if not dry_run else 0,
+        "groups_needs_operator_live": (
+            groups_needs_operator_live if not dry_run else 0
+        ),
+        "needs_operator_groups": len(needs_operator),
+        "needs_operator_sample": [
+            {
+                "key": g["key"],
+                "statuses": g["statuses"],
+                "candidate_ids": g.get("candidate_ids", [])[:8],
+                "reason": g.get("collapse_reason"),
+            }
+            for g in needs_operator[:5]
+        ],
         "winner_replanned": winner_replanned if not dry_run else 0,
         "skipped_accepted_guard": skipped_accepted_guard if not dry_run else 0,
         "fk_resolution_nulled": fk_nulled if not dry_run else 0,
         "divergent_content_groups": len(divergent),
         "divergent_sample": divergent[:5],
         "collapse_scope": (
-            "byte-identical only (inbox_file, candidate_index, content_sha1); "
-            "divergent content under the same app key is reported, not deleted"
+            "byte-identical only (inbox_file, candidate_index, sha1(content)); "
+            "divergent content under the same app key is reported, not deleted; "
+            "proposed+terminal (no accepted) is needs-operator, not deleted"
         ),
         "winner_rule": (
-            "accepted > other terminal > proposed; tie-break lowest candidate_id; "
+            "if any accepted → keep accepted, delete non-accepted; "
+            "if any proposed and none accepted → needs-operator (no delete); "
+            "else all-terminal or all-proposed → lowest candidate_id; "
             "re-validated inside write txn; never delete status=accepted"
         ),
         "learnings_touched": False,
@@ -604,7 +771,9 @@ def repair_duplicate_candidate_pairs(
         "operator_note": (
             "Stop AFM/daemon writers before --apply when possible. "
             "Inbox unique index is operator-only (not a migration); re-run "
-            "this repair after candidate_packets schema rebuilds."
+            "this repair after candidate_packets schema rebuilds. "
+            "needs_operator groups (proposed + terminal, no accepted) require "
+            "manual resolution before unique-index creation can proceed."
         ),
     }
 
@@ -879,25 +1048,34 @@ def find_missing_document_rows(
 
 
 def find_orphan_virtual_durable(db) -> List[Dict[str, Any]]:
-    """Virtual ``_durable`` rows with no FTS content — true index garbage.
+    """Virtual ``_durable`` rows with neither FTS nor chunks — true index garbage.
 
-    A healthy virtual durable row always has a ``vault_fts`` row (lexical
-    recall). Rows without FTS (and optionally without chunks) are safe to prune.
+    Mirrors non-virtual missing-path protection: a row is only an orphan when
+    **both** lexical (``vault_fts``) and semantic (``chunk_embeddings``) recall
+    are absent. Chunk-only virtual rows (partial/legacy index damage) are kept.
     """
-    orphans: List[Dict[str, Any]] = []
+    candidates: List[Dict[str, Any]] = []
     with db.cursor() as c:
+        # Escape '_' so SQLite LIKE does not treat it as a single-char wildcard
+        # (is_virtual_durable_path uses a Python substring of '/_durable/').
         c.execute(
-            """
+            r"""
             SELECT d.doc_id, d.path, d.agent, d.page_status
             FROM documents d
-            WHERE d.path LIKE '%/_durable/%'
-              AND NOT EXISTS (
-                  SELECT 1 FROM vault_fts f WHERE f.doc_id = d.doc_id
-              )
+            WHERE d.path LIKE '%/\_durable/%' ESCAPE '\'
             """
         )
-        orphans = [dict(r) for r in c.fetchall()]
-    return orphans
+        candidates = [dict(r) for r in c.fetchall()]
+    if not candidates:
+        return []
+    doc_ids = [int(r["doc_id"]) for r in candidates]
+    fts_backed = _doc_ids_with_fts(db, doc_ids)
+    chunk_backed = _doc_ids_with_chunks(db, doc_ids)
+    return [
+        r
+        for r in candidates
+        if int(r["doc_id"]) not in fts_backed and int(r["doc_id"]) not in chunk_backed
+    ]
 
 
 def _purge_semantic_side_effects(
@@ -1070,7 +1248,7 @@ def repair_index_disk_divergence(
     Safe to remove:
       * non-virtual document paths missing on disk after vault-root resolution
         **and** without FTS/chunk content (unless ``force_prune_indexed``)
-      * virtual ``_durable`` rows with no ``vault_fts`` content
+      * virtual ``_durable`` rows with neither ``vault_fts`` nor chunks
 
     NOT removed (by design):
       * virtual ``_durable`` / ``learning://`` / URI / ``page_type=learning``
@@ -1085,16 +1263,17 @@ def repair_index_disk_divergence(
         force_prune_indexed=force_prune_indexed,
     )
     orphan_virtual = find_orphan_virtual_durable(db)
+    # Healthy = virtual durable path that is not an orphan (has FTS and/or chunks).
     virtual_healthy = 0
     with db.cursor() as c:
         c.execute(
-            """
+            r"""
             SELECT COUNT(*) AS n FROM documents d
-            WHERE d.path LIKE '%/_durable/%'
-              AND EXISTS (SELECT 1 FROM vault_fts f WHERE f.doc_id = d.doc_id)
+            WHERE d.path LIKE '%/\_durable/%' ESCAPE '\'
             """
         )
-        virtual_healthy = int(c.fetchone()["n"])
+        virtual_total = int(c.fetchone()["n"])
+    virtual_healthy = max(0, virtual_total - len(orphan_virtual))
 
     to_prune = [r["doc_id"] for r in missing_real] + [
         r["doc_id"] for r in orphan_virtual

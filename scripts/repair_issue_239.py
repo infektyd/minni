@@ -166,15 +166,22 @@ def main(argv: list[str] | None = None) -> int:
                 f"  divergent content groups (not deleted): "
                 f"{dual['divergent_content_groups']}"
             )
+        if dual.get("needs_operator_groups"):
+            print(
+                f"  needs-operator groups (proposed+terminal, not deleted): "
+                f"{dual['needs_operator_groups']}"
+            )
         if args.apply and (
             dual.get("winner_replanned")
             or dual.get("skipped_accepted_guard")
             or dual.get("groups_skipped_stale")
+            or dual.get("groups_needs_operator_live")
         ):
             print(
                 f"  in-txn revalidate: replanned={dual.get('winner_replanned', 0)}  "
                 f"accepted_guard={dual.get('skipped_accepted_guard', 0)}  "
-                f"stale_skip={dual.get('groups_skipped_stale', 0)}"
+                f"stale_skip={dual.get('groups_skipped_stale', 0)}  "
+                f"needs_operator_live={dual.get('groups_needs_operator_live', 0)}"
             )
         if idx.get("skipped"):
             print(

@@ -108,6 +108,52 @@ def test_choose_winner_tie_break_lowest_id():
     assert winner["candidate_id"] == 3
 
 
+def test_collapse_decision_rejected_does_not_beat_proposed():
+    """High: rejected rank must not hard-delete an open proposed twin."""
+    from minni.repair_dual_candidates import collapse_decision
+
+    decision = collapse_decision(
+        [
+            {"candidate_id": 100, "status": "rejected"},
+            {"candidate_id": 101, "status": "proposed"},
+        ]
+    )
+    assert decision["action"] == "needs_operator"
+    assert decision["reason"] == "proposed_with_terminal"
+    assert decision["losers"] == []
+    assert decision["winner"] is None
+
+
+def test_collapse_decision_accepted_deletes_non_accepted():
+    from minni.repair_dual_candidates import collapse_decision
+
+    decision = collapse_decision(
+        [
+            {"candidate_id": 10, "status": "rejected"},
+            {"candidate_id": 2, "status": "accepted"},
+            {"candidate_id": 11, "status": "proposed"},
+        ]
+    )
+    assert decision["action"] == "collapse"
+    assert decision["winner"]["candidate_id"] == 2
+    loser_ids = {r["candidate_id"] for r in decision["losers"]}
+    assert loser_ids == {10, 11}
+
+
+def test_collapse_decision_all_proposed_lowest_id():
+    from minni.repair_dual_candidates import collapse_decision
+
+    decision = collapse_decision(
+        [
+            {"candidate_id": 9, "status": "proposed"},
+            {"candidate_id": 3, "status": "proposed"},
+        ]
+    )
+    assert decision["action"] == "collapse"
+    assert decision["reason"] == "all_proposed"
+    assert decision["winner"]["candidate_id"] == 3
+
+
 def test_repair_keeps_accepted_deletes_rejected_twin_leaves_learnings(tmp_path):
     from minni.repair_dual_candidates import (
         find_duplicate_candidate_groups,
@@ -899,13 +945,54 @@ def test_never_deletes_accepted_when_two_accepted(tmp_path):
     assert a < b
 
     result = repair_duplicate_candidate_pairs(db, dry_run=False)
-    # choose_winner would prefer lowest id, but hard guard blocks deleting b.
-    assert result["skipped_accepted_guard"] >= 1
+    # collapse keeps lowest accepted; extra accepted is never deleted.
     assert result["deleted"] == 0
     with db.cursor() as c:
         c.execute("SELECT candidate_id FROM candidate_packets ORDER BY candidate_id")
         ids = [dict(r)["candidate_id"] for r in c.fetchall()]
     assert ids == [a, b]
+
+
+def test_rejected_plus_proposed_needs_operator_no_delete(tmp_path):
+    """High RC: rejected must not hard-delete open proposed (blocks re-ingest)."""
+    from minni.repair_dual_candidates import (
+        find_duplicate_candidate_groups,
+        find_needs_operator_groups,
+        repair_duplicate_candidate_pairs,
+    )
+
+    db, _cfg = _make_db(tmp_path)
+    content = "operator rejected one twin; other still open"
+    rej = _insert_candidate(db, content=content, status="rejected")
+    prop = _insert_candidate(db, content=content, status="proposed")
+    assert rej < prop
+
+    # Not a collapsible dual — must surface as needs-operator.
+    assert find_duplicate_candidate_groups(db) == []
+    needs = find_needs_operator_groups(db)
+    assert len(needs) == 1
+    assert set(needs[0]["statuses"]) == {"proposed", "rejected"}
+    assert set(needs[0]["candidate_ids"]) == {rej, prop}
+
+    dry = repair_duplicate_candidate_pairs(db, dry_run=True)
+    assert dry["groups_found"] == 0
+    assert dry["would_delete"] == 0
+    assert dry["needs_operator_groups"] == 1
+    assert dry["needs_operator_sample"]
+
+    applied = repair_duplicate_candidate_pairs(db, dry_run=False)
+    assert applied["deleted"] == 0
+    assert applied["needs_operator_groups"] == 1
+    with db.cursor() as c:
+        c.execute(
+            "SELECT candidate_id, status FROM candidate_packets ORDER BY candidate_id"
+        )
+        rows = [dict(r) for r in c.fetchall()]
+    assert len(rows) == 2
+    assert {rows[0]["candidate_id"], rows[1]["candidate_id"]} == {rej, prop}
+    by_id = {r["candidate_id"]: r["status"] for r in rows}
+    assert by_id[rej] == "rejected"
+    assert by_id[prop] == "proposed"
 
 
 def test_divergent_content_same_app_key_not_deleted(tmp_path):
@@ -1123,6 +1210,91 @@ def test_missing_sha_identical_bodies_still_collapsed(tmp_path):
         c.execute("SELECT candidate_id FROM candidate_packets")
         ids = [dict(r)["candidate_id"] for r in c.fetchall()]
     assert ids == [keep]
+
+
+def test_stale_stored_sha_divergent_bodies_not_collapsed(tmp_path):
+    """Medium: present-but-wrong content_sha1 must not group different bodies."""
+    import hashlib
+
+    from minni.repair_dual_candidates import (
+        find_divergent_content_groups,
+        find_duplicate_candidate_groups,
+        repair_duplicate_candidate_pairs,
+    )
+
+    db, _cfg = _make_db(tmp_path)
+    # Same stale/copied metadata sha for two different bodies.
+    fake_sha = hashlib.sha1(b"unrelated body").hexdigest()
+    id_a = _insert_candidate(
+        db,
+        content="real body alpha",
+        status="accepted",
+        inbox_file="stale-sha.json",
+        candidate_index=0,
+        content_sha1=fake_sha,
+    )
+    id_b = _insert_candidate(
+        db,
+        content="real body beta totally different",
+        status="rejected",
+        inbox_file="stale-sha.json",
+        candidate_index=0,
+        content_sha1=fake_sha,
+    )
+
+    assert find_duplicate_candidate_groups(db) == []
+    divergent = find_divergent_content_groups(db)
+    assert len(divergent) == 1
+    assert set(divergent[0]["candidate_ids"]) == {id_a, id_b}
+
+    result = repair_duplicate_candidate_pairs(db, dry_run=False)
+    assert result["deleted"] == 0
+    assert result["groups_found"] == 0
+    assert result["divergent_content_groups"] == 1
+    with db.cursor() as c:
+        c.execute("SELECT candidate_id FROM candidate_packets ORDER BY candidate_id")
+        ids = [dict(r)["candidate_id"] for r in c.fetchall()]
+    assert ids == [id_a, id_b]
+
+
+def test_virtual_durable_chunk_only_not_orphan(tmp_path):
+    """Medium: virtual _durable with chunks but no FTS is not pruned as orphan."""
+    from minni.repair_dual_candidates import (
+        find_orphan_virtual_durable,
+        repair_index_disk_divergence,
+    )
+
+    db, cfg = _make_db(tmp_path)
+    path = os.path.join(cfg.vault_path, "_durable", "codex__chunkonly.md")
+    with db.transaction() as c:
+        c.execute(
+            """
+            INSERT INTO documents
+            (path, agent, last_modified, indexed_at, page_status, privacy_level)
+            VALUES (?, 'codex', 0, 0, 'accepted', 'safe')
+            """,
+            (path,),
+        )
+        doc_id = c.lastrowid
+        c.execute(
+            """
+            INSERT INTO chunk_embeddings
+            (doc_id, chunk_index, chunk_text, embedding, computed_at)
+            VALUES (?, 0, 'semantic only body', X'00', 0)
+            """,
+            (doc_id,),
+        )
+
+    assert find_orphan_virtual_durable(db) == []
+    result = repair_index_disk_divergence(db, dry_run=False)
+    assert result["orphan_virtual_durable"] == 0
+    assert result["prune"]["deleted"] == 0
+    assert result["healthy_virtual_durable_kept"] == 1
+    with db.cursor() as c:
+        c.execute("SELECT COUNT(*) AS n FROM documents")
+        assert dict(c.fetchone())["n"] == 1
+        c.execute("SELECT COUNT(*) AS n FROM chunk_embeddings")
+        assert dict(c.fetchone())["n"] == 1
 
 
 def test_prune_document_rows_invalidates_faiss_and_rerank(tmp_path):

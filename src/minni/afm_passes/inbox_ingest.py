@@ -76,7 +76,7 @@ import re
 import sqlite3
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from minni.safety import is_instruction_like
 
@@ -207,6 +207,23 @@ def _coerce_candidate_index(raw: Any) -> Optional[int]:
     return idx
 
 
+def _parse_inbox_key_from_derived(df: Any) -> Optional[Tuple[str, int]]:
+    """Parse (inbox_file, candidate_index) from a derived_from JSON blob."""
+    if not df:
+        return None
+    try:
+        obj = json.loads(df) if isinstance(df, str) else df
+    except Exception:
+        return None
+    if not isinstance(obj, dict) or obj.get("source") != "inbox":
+        return None
+    f = obj.get("inbox_file")
+    i = _coerce_candidate_index(obj.get("candidate_index"))
+    if isinstance(f, str) and i is not None:
+        return (f, i)
+    return None
+
+
 def _existing_keys(db, principals: set | None = None) -> set:
     """(inbox_file, candidate_index) pairs already present in candidate_packets.
 
@@ -226,19 +243,45 @@ def _existing_keys(db, principals: set | None = None) -> set:
         rows = c.fetchall()
     for row in rows:
         df = row["derived_from"] if isinstance(row, dict) or hasattr(row, "keys") else row[0]
-        if not df:
-            continue
-        try:
-            obj = json.loads(df)
-        except Exception:
-            continue
-        if not isinstance(obj, dict) or obj.get("source") != "inbox":
-            continue
-        f = obj.get("inbox_file")
-        i = _coerce_candidate_index(obj.get("candidate_index"))
-        if isinstance(f, str) and i is not None:
-            keys.add((f, i))
+        key = _parse_inbox_key_from_derived(df)
+        if key is not None:
+            keys.add(key)
     return keys
+
+
+def _existing_keys_for_on_cursor(c, wanted: set) -> set:
+    """Return which of ``wanted`` keys already exist — narrow scan under txn.
+
+    Avoids full-table ``SELECT derived_from`` under ``BEGIN IMMEDIATE`` when
+    only a small ``to_insert`` key set needs checking. Scopes SQL to distinct
+    inbox_file names in ``wanted``.
+    """
+    if not wanted:
+        return set()
+    by_file: Dict[str, set] = {}
+    for f, i in wanted:
+        by_file.setdefault(f, set()).add(i)
+    found: set = set()
+    for inbox_file, indices in by_file.items():
+        c.execute(
+            """
+            SELECT derived_from FROM candidate_packets
+            WHERE derived_from IS NOT NULL
+              AND json_extract(derived_from, '$.source') = 'inbox'
+              AND json_extract(derived_from, '$.inbox_file') = ?
+            """,
+            (inbox_file,),
+        )
+        for row in c.fetchall():
+            df = (
+                row["derived_from"]
+                if isinstance(row, dict) or hasattr(row, "keys")
+                else row[0]
+            )
+            key = _parse_inbox_key_from_derived(df)
+            if key is not None and key[0] == inbox_file and key[1] in indices:
+                found.add(key)
+    return found
 
 
 def _is_stop_candidate_shape(doc: Dict[str, Any]) -> bool:
@@ -425,30 +468,12 @@ def ingest(db, config, inboxes: Optional[List[Path]] = None,
     inserted = 0
     if not dry_run and to_insert:
         with db.transaction() as c:
-            # Issue #239: re-load keys inside the write txn so concurrent
-            # ingest processes cannot both pass the pre-txn check and insert
-            # twin rows. Also tolerate a UNIQUE index on the inbox key if the
-            # operator has applied ensure_inbox_dedup_index.
-            txn_existing = set()
-            c.execute("SELECT derived_from FROM candidate_packets")
-            for row in c.fetchall():
-                df = (
-                    row["derived_from"]
-                    if isinstance(row, dict) or hasattr(row, "keys")
-                    else row[0]
-                )
-                if not df:
-                    continue
-                try:
-                    obj = json.loads(df)
-                except Exception:
-                    continue
-                if not isinstance(obj, dict) or obj.get("source") != "inbox":
-                    continue
-                f = obj.get("inbox_file")
-                i = _coerce_candidate_index(obj.get("candidate_index"))
-                if isinstance(f, str) and i is not None:
-                    txn_existing.add((f, i))
+            # Issue #239: re-load only the keys we intend to insert (not the
+            # full table) under BEGIN IMMEDIATE so concurrent ingest cannot
+            # both pass the pre-txn check and create twins. UNIQUE swallow
+            # remains the last backstop if the operator applied the index.
+            wanted = {(r["inbox_file"], r["candidate_index"]) for r in to_insert}
+            txn_existing = _existing_keys_for_on_cursor(c, wanted)
 
             for r in to_insert:
                 key = (r["inbox_file"], r["candidate_index"])

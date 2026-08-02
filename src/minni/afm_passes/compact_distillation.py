@@ -80,6 +80,7 @@ from minni.afm_passes.inbox_ingest import (
     _coerce_candidate_index,
     _content_sha1,
     _existing_keys,
+    _existing_keys_for_on_cursor,
     _is_unique_integrity_error,
     _principal_for_inbox,
     discover_inboxes,
@@ -403,30 +404,11 @@ def distill(db, config, inboxes: Optional[List[Path]] = None,
     if not dry_run and to_insert:
         now = time.time()
         with db.transaction() as c:
-            # Issue #239: re-load keys inside the write txn so concurrent
-            # distill (or distill+ingest) processes cannot both pass the
-            # pre-txn check and insert twin rows. Mirror inbox_ingest:
-            # in-txn key set + UNIQUE swallow.
-            txn_existing: set = set()
-            c.execute("SELECT derived_from FROM candidate_packets")
-            for row in c.fetchall():
-                df = (
-                    row["derived_from"]
-                    if isinstance(row, dict) or hasattr(row, "keys")
-                    else row[0]
-                )
-                if not df:
-                    continue
-                try:
-                    obj = json.loads(df)
-                except Exception:
-                    continue
-                if not isinstance(obj, dict) or obj.get("source") != "inbox":
-                    continue
-                f = obj.get("inbox_file")
-                i = _coerce_candidate_index(obj.get("candidate_index"))
-                if isinstance(f, str) and i is not None:
-                    txn_existing.add((f, i))
+            # Issue #239: re-load only to_insert keys under BEGIN IMMEDIATE
+            # (not full-table scan). Mirror inbox_ingest: narrow in-txn check
+            # + UNIQUE swallow.
+            wanted = {(r["inbox_file"], r["candidate_index"]) for r in to_insert}
+            txn_existing = _existing_keys_for_on_cursor(c, wanted)
 
             for r in to_insert:
                 key = (r["inbox_file"], r["candidate_index"])
