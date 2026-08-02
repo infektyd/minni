@@ -928,3 +928,113 @@ def test_skip_path_canonicalizes_a_non_canonical_row(tmp_path, monkeypatch):
 
     rows = [p for p in _indexed_paths(cfg.db_path) if p.endswith(page.name)]
     assert rows == [str(page)], f"row not canonicalized on the skip path: {rows}"
+
+
+# ── Round 6: findings from the fifth Grok review of #256 ───────────────────
+
+
+def test_purge_only_sweep_invalidates_the_live_faiss(tmp_path, monkeypatch):
+    """Grok round 5 #1. _enforce_embed_policy DELETEs chunk rows on the
+    mtime-skip path, where indexed and pruned are both 0. The invalidation gate
+    only looked at those two, so a purge-only sweep left the warm engine's FAISS
+    serving chunk_ids whose rows are gone -- ghost hits that punch holes in the
+    fixed candidate window until the process restarts."""
+    import minni.minnid as minnid
+    from minni.index_all import index_shared_vault
+
+    _install_fake_embedder(monkeypatch)
+    cfg = _make_cfg(tmp_path)
+    monkeypatch.setattr(minnid, "DEFAULT_CONFIG", cfg)
+    vault = Path(cfg.vault_path)
+    page = vault / "wiki" / "concepts" / "legacy.md"
+    _write_page(page, "accepted", "legacy embedded body " * 40)
+    index_shared_vault(cfg)
+
+    # Legacy state: unendorsed row, embeddings present, mtime unchanged.
+    conn = sqlite3.connect(cfg.db_path)
+    try:
+        conn.execute(
+            "UPDATE documents SET page_status='draft' WHERE path = ?",
+            (str(page.resolve()),),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    class _WarmEngine:
+        def __init__(self):
+            self.faiss_index = self
+
+        count = 5
+        invalidated = False
+
+        def invalidate(self):
+            type(self).invalidated = True
+
+    monkeypatch.setattr(minnid, "_retrieval", _WarmEngine())
+
+    stats = minnid._vault_watch_sweep_once()[str(cfg.vault_path)]
+
+    assert stats["chunks_purged"] > 0, "test did not reach the purge path"
+    assert stats["indexed"] == 0 and stats["pruned"] == 0, (
+        "purge must be the ONLY change, or the test proves nothing"
+    )
+    assert _WarmEngine.invalidated, "purge-only sweep left the live FAISS stale"
+
+
+def test_duplicate_rows_for_one_file_are_collapsed(tmp_path, monkeypatch):
+    """Grok round 5 #2. documents.path is UNIQUE per string, not per resolved
+    file, so an earlier indexer could leave BOTH spellings as separate rows.
+    Adoption never reaches that state (the exact match wins) and the prune keeps
+    both, since both resolve to a file that exists."""
+    from minni.afm_writer import _write_one
+    from minni.index_all import index_shared_vault
+
+    _install_fake_embedder(monkeypatch)
+    cfg = _make_cfg(tmp_path)
+    vault = Path(cfg.vault_path)
+    written = _write_one(vault, _draft())
+    index_shared_vault(cfg)
+
+    page = (vault / written["path"]).resolve()
+    noncanonical = str(page.parent / ".." / page.parent.name / page.name)
+    # Seed the historical state: canonical row PLUS a non-canonical twin.
+    _seed_row(cfg.db_path, noncanonical)
+    assert len([p for p in _indexed_paths(cfg.db_path) if p.endswith(page.name)]) == 2
+
+    index_shared_vault(cfg)
+
+    rows = [p for p in _indexed_paths(cfg.db_path) if p.endswith(page.name)]
+    assert rows == [str(page)], f"duplicate rows for one file survived: {rows}"
+
+
+def test_chronological_can_reach_unembedded_pages(tmp_path, monkeypatch):
+    """Grok round 5 #3. _chronological_search inner-joined chunk_embeddings, so
+    the no-embed policy made drafts unreachable by chronological recall even
+    with include_drafts=True. Lifecycle, not the presence of a vector, decides."""
+    from minni.index_all import index_shared_vault
+
+    _install_fake_embedder(monkeypatch)
+    cfg = _make_cfg(tmp_path)
+    vault = Path(cfg.vault_path)
+    _write_page(vault / "wiki" / "concepts" / "only-draft.md", "draft",
+                "chronologically findable marker phrase " * 12)
+    index_shared_vault(cfg)
+
+    eng = _engine(cfg)
+    try:
+        eng.config.reranker_enabled = False
+        hidden = eng.retrieve(
+            "chronologically findable marker phrase", limit=5, sort="chronological"
+        )
+        assert hidden == [], "default recall must still hide drafts"
+
+        shown = eng.retrieve(
+            "chronologically findable marker phrase", limit=5,
+            sort="chronological", include_drafts=True,
+        )
+        assert any(r.get("filename", "").endswith("only-draft.md") for r in shown), (
+            f"include_drafts=True still could not reach an unembedded page: {shown}"
+        )
+    finally:
+        eng.db.close()

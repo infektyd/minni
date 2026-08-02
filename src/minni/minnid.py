@@ -1092,7 +1092,21 @@ def _vault_watch_sweep_once() -> dict:
         shared = index_shared_vault(DEFAULT_CONFIG)
         stats.update(shared)
         for s in shared.values():
-            if isinstance(s, dict) and ((s.get("indexed") or 0) or (s.get("pruned") or 0)):
+            if not isinstance(s, dict):
+                continue
+            # chunks_purged counts as a change: _enforce_embed_policy DELETEs
+            # chunk rows on the mtime-skip path, where indexed and pruned are
+            # both 0. Without it here, a purge-only sweep leaves the live FAISS
+            # index serving chunk_ids whose rows are gone — the join finds
+            # nothing and those ghosts punch holes in the fixed candidate
+            # window until the process restarts.
+            if (s.get("indexed") or 0) or (s.get("pruned") or 0) or (s.get("chunks_purged") or 0):
+                logger.info(
+                    "Vault watch: shared vault changed (indexed=%s pruned=%s "
+                    "chunks_purged=%s)",
+                    s.get("indexed") or 0, s.get("pruned") or 0,
+                    s.get("chunks_purged") or 0,
+                )
                 _invalidate_shared_faiss()
                 break
     except Exception:

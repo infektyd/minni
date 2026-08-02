@@ -1922,8 +1922,16 @@ class RetrievalEngine:
             def _match(match_expr: str):
                 # Fetch happens inside the retry helper (review r3): the
                 # vtable race can also fire while stepping the SELECT.
+                # LEFT JOIN, not JOIN: unendorsed pages are deliberately not
+                # embedded (see indexer.UNEMBEDDED_STATUSES), and an inner join
+                # made them unreachable by chronological recall even when the
+                # caller passed include_drafts=True. The lifecycle filter, not
+                # the presence of a vector, decides what comes back. Pages with
+                # no chunk fall back to the FTS row's own content.
                 return _fts_execute_with_retry(c, f"""
-                    SELECT ce.chunk_id, ce.doc_id, ce.chunk_text, ce.heading_context,
+                    SELECT ce.chunk_id, d.doc_id,
+                           COALESCE(ce.chunk_text, f.content) AS chunk_text,
+                           ce.heading_context,
                            d.path, d.agent, d.sigil, d.decay_score,
                            d.page_status, d.privacy_level, d.page_type,
                            d.evidence_refs, d.indexed_at,
@@ -1931,7 +1939,7 @@ class RetrievalEngine:
                            COALESCE(d.indexed_at, d.last_modified, ce.computed_at, 0) AS created_at
                     FROM vault_fts f
                     JOIN documents d ON d.doc_id = f.doc_id
-                    JOIN chunk_embeddings ce ON ce.doc_id = d.doc_id
+                    LEFT JOIN chunk_embeddings ce ON ce.doc_id = d.doc_id
                     WHERE {" AND ".join(clauses)}
                     ORDER BY created_at ASC, ce.chunk_id ASC
                     LIMIT ?

@@ -155,6 +155,21 @@ class VaultIndexer:
             return "artifact"
         return "knowledge"
 
+    def _delete_doc_rows(self, doc_id: int) -> int:
+        """Drop one document and everything keyed to it. Returns rows deleted (0 or 1)."""
+        with self.db.cursor() as c:
+            c.execute(
+                "SELECT chunk_id FROM chunk_embeddings WHERE doc_id = ?", (doc_id,)
+            )
+            stale = [r["chunk_id"] for r in c.fetchall()]
+        with self.db.transaction() as c:
+            c.execute("DELETE FROM vault_fts WHERE doc_id = ?", (doc_id,))
+            c.execute("DELETE FROM chunk_embeddings WHERE doc_id = ?", (doc_id,))
+            c.execute("DELETE FROM documents WHERE doc_id = ?", (doc_id,))
+        if stale:
+            self._invalidate_rerank_chunks(stale)
+        return 1
+
     def _enforce_embed_policy(self, row, stats: Dict) -> None:
         """Strip embeddings from an unendorsed page that still has them.
 
@@ -267,6 +282,7 @@ class VaultIndexer:
                         (path,),
                     )
                     row = c.fetchone()
+                other = noncanonical_rows.get(path)
                 if row is None:
                     # `path` is resolved, but a historical row may store a
                     # non-canonical spelling of the SAME file. Matching only the
@@ -274,7 +290,15 @@ class VaultIndexer:
                     # prune below (which accepts either form) would keep both.
                     # Adopt the existing row instead; the UPDATE normalizes its
                     # path on the way through.
-                    row = noncanonical_rows.get(path)
+                    row = other
+                elif other is not None and other["doc_id"] != row["doc_id"]:
+                    # BOTH spellings exist as separate rows -- the state an
+                    # earlier version of this indexer could produce, since
+                    # documents.path is UNIQUE per string, not per resolved
+                    # file. Adoption alone never reaches it (the exact match
+                    # wins) and the prune keeps both, because both resolve to a
+                    # file that exists. Collapse to the canonical row.
+                    stats["deleted"] += self._delete_doc_rows(other["doc_id"])
 
                 # Audit R0 (grok-review): last_modified is a REAL-affinity
                 # column an out-of-tree writer could poison with TEXT, same
