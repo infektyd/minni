@@ -390,3 +390,17 @@ def test_wire_status_parser_tolerates_npm_noise(tmp_path):
         )
         assert proc.returncode == 0, f"{label}: {proc.stderr}"
         assert proc.stdout.strip() == "skipped", f"{label}: {proc.stdout!r} stderr={proc.stderr!r}"
+
+    # Two WireOutput-shaped objects: last match must win (comment + recovery
+    # walk agree — earlier partial/status fragment must not stick).
+    dual = tmp_path / "dual.out"
+    first = json.dumps({"schema": 1, "status": "failed", "results": [{"platform": "x"}]})
+    second = json.dumps({"schema": 1, "status": "skipped", "results": []})
+    dual.write_text(banner + first + "\n" + second + "\n", encoding="utf-8")
+    proc = subprocess.run(
+        [sys.executable, "-c", recovery_py, str(dual)],
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == "skipped", proc.stdout

@@ -266,9 +266,10 @@ def _is_versioned_wire_plugin_dist(dist: Path, home: Path) -> bool:
 
 
 def _marketplace_cache_platform(dist: Path, home: Path) -> str | None:
-    """Return the platform that owns this marketplace cache dist, or None.
+    """Return the platform that owns this wire-superseded legacy dist, or None.
 
-    Claude marketplace cache → claude-code; Codex marketplace cache → codex.
+    Claude marketplace cache → claude-code; Codex marketplace cache → codex;
+    Kilo plugins tree → kilocode (wire owns MCP at ~/.minni/plugin/<ver>).
     """
     try:
         rel = str(dist.resolve().relative_to(home.resolve()))
@@ -278,6 +279,9 @@ def _marketplace_cache_platform(dist: Path, home: Path) -> str | None:
         return "claude-code"
     if rel.startswith(".codex/plugins/cache/"):
         return "codex"
+    # Pre-wire Kilo install root; wire-primary points kilo.json at ~/.minni/plugin.
+    if rel.startswith(".config/kilo/plugins/"):
+        return "kilocode"
     return None
 
 

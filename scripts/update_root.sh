@@ -215,7 +215,8 @@ def _is_wire_output(d):
     )
 
 # Prefer pure JSON; else walk brace positions for a WireOutput-shaped dict
-# (pretty emit ends with 'gc': {} — last '{' alone is wrong).
+# (pretty emit ends with 'gc': {} — last '{' alone is wrong). Prefer the *last*
+# WireOutput-shaped object when noise embeds an earlier partial/JSON fragment.
 try:
     cand = json.loads(text)
     if _is_wire_output(cand):
@@ -228,8 +229,7 @@ if doc is None:
         try:
             cand = json.loads(text[idx:])
             if _is_wire_output(cand):
-                doc = cand
-                break
+                doc = cand  # keep scanning; last match wins
         except Exception:
             pass
         idx = text.find('{', idx + 1)

@@ -657,6 +657,105 @@ def test_marketplace_cache_skip_is_per_platform(tmp_path):
     assert "STALE" in proc.stdout or proc.returncode != 0, proc.stdout
 
 
+def test_kilo_plugins_tree_skipped_when_kilocode_wire_active(tmp_path):
+    """Wire owns kilocode MCP under ~/.minni/plugin; leftover
+    ~/.config/kilo/plugins/minni must not fail --strict / sync-root.
+    """
+    home = tmp_path / "home"
+    home.mkdir()
+    plugin = home / ".minni" / "plugin"
+    fresh = plugin / "0.4.1+git.deadbeef"
+    fresh.mkdir(parents=True)
+    for sub in ("hooks", "commands", "skills", ".claude-plugin", ".codex-plugin",
+                ".cursor-plugin", ".kilocode-plugin", ".gemini-plugin"):
+        src = SOURCE / sub
+        if src.is_dir():
+            _copytree(src, fresh / sub)
+    _artifact_dist(fresh)
+    (fresh / "payload-manifest.json").write_text(
+        json.dumps({"version": "0.4.1+git.deadbeef", "git_sha": "a" * 40}),
+        encoding="utf-8",
+    )
+    (plugin / "wired.json").write_text(
+        json.dumps({
+            "schema": 1,
+            "wires": [{
+                "platform": "kilocode",
+                "install_root": str(fresh),
+                "wired_at": "2026-08-02T00:00:00Z",
+            }],
+        }),
+        encoding="utf-8",
+    )
+    # Stale pre-wire kilo plugins tree (would STALE without skip).
+    kilo_root = home / ".config" / "kilo" / "plugins" / "minni"
+    kilo_root.mkdir(parents=True)
+    for sub in ("hooks", "commands", "skills", ".claude-plugin", ".codex-plugin",
+                ".cursor-plugin", ".kilocode-plugin", ".gemini-plugin"):
+        src = SOURCE / sub
+        if src.is_dir():
+            _copytree(src, kilo_root / sub)
+    (kilo_root / "dist").mkdir()
+    (kilo_root / "dist" / "server.js").write_text("// old kilo plugins\n", encoding="utf-8")
+    (kilo_root / "dist" / "build-manifest.json").write_text(
+        json.dumps({"git_sha": "c" * 40, "built_at": "2026-06-01T00:00:00Z"}),
+        encoding="utf-8",
+    )
+
+    proc = _run("--strict", home=home, repo_root=_isolated_repo_root(tmp_path))
+    assert "legacy marketplace cache for kilocode" in proc.stdout, proc.stdout
+    assert proc.returncode == 0, proc.stdout
+    assert "STALE" not in proc.stdout
+
+
+def test_kilo_plugins_tree_judged_when_kilocode_not_wire_active(tmp_path):
+    """Without a kilocode wire record, ~/.config/kilo/plugins/minni is still live."""
+    home = tmp_path / "home"
+    home.mkdir()
+    plugin = home / ".minni" / "plugin"
+    fresh = plugin / "0.4.1+git.deadbeef"
+    fresh.mkdir(parents=True)
+    for sub in ("hooks", "commands", "skills", ".claude-plugin", ".codex-plugin",
+                ".cursor-plugin", ".kilocode-plugin", ".gemini-plugin"):
+        src = SOURCE / sub
+        if src.is_dir():
+            _copytree(src, fresh / sub)
+    _artifact_dist(fresh)
+    (fresh / "payload-manifest.json").write_text(
+        json.dumps({"version": "0.4.1+git.deadbeef", "git_sha": "a" * 40}),
+        encoding="utf-8",
+    )
+    # Only claude-code is wire-active — must not silence the kilo plugins tree.
+    (plugin / "wired.json").write_text(
+        json.dumps({
+            "schema": 1,
+            "wires": [{
+                "platform": "claude-code",
+                "install_root": str(fresh),
+                "wired_at": "2026-08-02T00:00:00Z",
+            }],
+        }),
+        encoding="utf-8",
+    )
+    kilo_root = home / ".config" / "kilo" / "plugins" / "minni"
+    kilo_root.mkdir(parents=True)
+    for sub in ("hooks", "commands", "skills", ".claude-plugin", ".codex-plugin",
+                ".cursor-plugin", ".kilocode-plugin", ".gemini-plugin"):
+        src = SOURCE / sub
+        if src.is_dir():
+            _copytree(src, kilo_root / sub)
+    (kilo_root / "dist").mkdir()
+    (kilo_root / "dist" / "server.js").write_text("// live kilo plugins\n", encoding="utf-8")
+    (kilo_root / "dist" / "build-manifest.json").write_text(
+        json.dumps({"git_sha": "d" * 40, "built_at": "2026-06-01T00:00:00Z"}),
+        encoding="utf-8",
+    )
+
+    proc = _run("--strict", home=home, repo_root=_isolated_repo_root(tmp_path))
+    assert "legacy marketplace cache for kilocode" not in proc.stdout, proc.stdout
+    assert "STALE" in proc.stdout or proc.returncode != 0, proc.stdout
+
+
 def test_plugin_current_skipped_when_wire_active(tmp_path):
     """Release-era plugin/current must not fail --strict after wire-primary."""
     home = tmp_path / "home"

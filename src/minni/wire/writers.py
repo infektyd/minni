@@ -243,11 +243,15 @@ def update_kilo_config(
 ) -> Path:
     path = Path("~/.config/kilo/kilo.json").expanduser()
     data = load_json(path)
+    # Kilo's McpLocal schema is strict and names this key "environment", not
+    # "env" (Claude/Codex spelling). Writing "env" makes Kilo reject the whole
+    # config file with ConfigInvalidError and refuse to start AT ALL — it takes
+    # down the entire CLI, not just Minni. Parity with propagate.update_kilo_config.
     data.setdefault("mcp", {})["minni"] = {
         "type": "local",
         "command": ["node", str(server_path)],
         "enabled": True,
-        "env": {
+        "environment": {
             "MINNI_AGENT_ID": agent,
             "MINNI_VAULT_PATH": str(vault),
             "MINNI_SOCKET_PATH": str(socket_path),

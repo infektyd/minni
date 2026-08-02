@@ -455,7 +455,9 @@ def test_wire_kilocode_non_dry_run(wire_env, monkeypatch, capsys):
     kilo = json.loads((home / ".config" / "kilo" / "kilo.json").read_text(encoding="utf-8"))
     entry = kilo["mcp"]["minni"]
     assert entry["command"] == ["node", str(server)]
-    assert entry["env"]["MINNI_AGENT_ID"] == "kilocode"
+    # Kilo schema requires "environment", not "env" (ConfigInvalidError otherwise).
+    assert "env" not in entry, "wire must not stamp Claude-style env key for Kilo"
+    assert entry["environment"]["MINNI_AGENT_ID"] == "kilocode"
     assert entry["enabled"] is True
 
 

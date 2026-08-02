@@ -273,7 +273,7 @@ def _is_versioned_wire_plugin_root(root: Path, home: Path) -> bool:
 
 
 def _marketplace_cache_platform(root: Path, home: Path) -> str | None:
-    """Platform that owns this marketplace cache root, or None.
+    """Platform that owns this wire-superseded legacy root, or None.
 
     Parity with scripts/check_deployments._marketplace_cache_platform.
     """
@@ -285,6 +285,9 @@ def _marketplace_cache_platform(root: Path, home: Path) -> str | None:
         return "claude-code"
     if rel.startswith(".codex/plugins/cache/"):
         return "codex"
+    # Pre-wire Kilo install root; wire-primary points kilo.json at ~/.minni/plugin.
+    if rel.startswith(".config/kilo/plugins/"):
+        return "kilocode"
     return None
 
 
