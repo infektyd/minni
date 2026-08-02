@@ -130,7 +130,7 @@ another checkout's editable install (#258). If you invoke bare pytest, export
 ```bash
 make test-engine                              # preferred; sets PYTHONPATH=src
 # or:
-PYTHONPATH=src .venv/bin/python -m pytest -q tests/   # bare form needs PYTHONPATH=src (#258)
+PYTHONPATH=src .venv/bin/python -m pytest -q tests/   # bare form needs PYTHONPATH=src (#258); expect 538 passed, 5 skipped
 cd plugins/minni && npm run build && npm test # expect 327 passed
 bash scripts/repro-smoke.sh                   # hermetic daemon smoke
 ```

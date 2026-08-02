@@ -33,10 +33,12 @@ MAKEFILE = REPO_ROOT / "Makefile"
 # Targets whose recipes must prepend this tree's src (#258).
 _PYTHONPATH_PINNED_TARGETS = ("test-engine", "coverage-engine", "check")
 
-# Same recipe line: tab + PYTHONPATH=src… + pytest (Make applies env only to
-# that command; a split PYTHONPATH=src true / pytest line would false-green).
+# Same recipe line: tab + PYTHONPATH=src[optional :$$PYTHONPATH] + $(VENV_PY)
+# -m pytest (Make applies env only to that command). Rejects decoys like
+# ``PYTHONPATH=src true; $(VENV_PY) -m pytest`` (``;`` before -m pytest) and
+# ``PYTHONPATH=src echo pytest`` (no ``$(VENV_PY) -m pytest``).
 _SAME_LINE_PYTHONPATH_PYTEST = re.compile(
-    r"(?m)^\tPYTHONPATH=src\S*\s+\S.*pytest"
+    r"(?m)^\tPYTHONPATH=src(?::\$\$PYTHONPATH)?\s+\$\(VENV_PY\)\s+-m\s+pytest\b"
 )
 
 
@@ -224,7 +226,8 @@ def test_pythonpath_src_wins_over_site_packages_editable(tmp_path):
         check=False,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
-    assert "ok" in proc.stdout
+    # "ok" is a substring of "foreign-ok"; require the this-arm token only.
+    assert "foreign-ok" not in proc.stdout and "ok" in proc.stdout
 
     # Without PYTHONPATH, the forced competitor must win (proves the win arm
     # actually needed PYTHONPATH — not a same-tree editable false-green).
