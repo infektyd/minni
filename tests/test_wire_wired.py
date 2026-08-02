@@ -7,12 +7,54 @@ from pathlib import Path
 
 import pytest
 
-from minni.wire.wired import WireRecord, _detect_out_of_band, upsert_wire
+from minni.wire.wired import (
+    WireRecord,
+    _detect_out_of_band,
+    retire_platform,
+    upsert_wire,
+)
 
 
 def test_detect_out_of_band_helper():
     assert _detect_out_of_band(1, 0) is not None
     assert _detect_out_of_band(0, 0) is None
+
+
+def test_retire_platform_removes_rows_for_platform(tmp_path, monkeypatch):
+    base = tmp_path / "plugin"
+    base.mkdir()
+    monkeypatch.setattr("minni.wire.wired.plugin_base", lambda: base)
+    (base / "wired.json").write_text(
+        json.dumps({
+            "schema": 1,
+            "generation": 3,
+            "wires": [
+                {
+                    "platform": "codex",
+                    "install_root": str(base / "old"),
+                    "wired_at": "2026-08-01T00:00:00Z",
+                },
+                {
+                    "platform": "claude-code",
+                    "install_root": str(base / "fresh"),
+                    "wired_at": "2026-08-02T00:00:00Z",
+                },
+            ],
+        })
+        + "\n",
+        encoding="utf-8",
+    )
+    data, n = retire_platform("codex")
+    assert n == 1
+    assert data["generation"] == 4
+    platforms = [w["platform"] for w in data["wires"]]
+    assert platforms == ["claude-code"]
+    on_disk = json.loads((base / "wired.json").read_text(encoding="utf-8"))
+    assert [w["platform"] for w in on_disk["wires"]] == ["claude-code"]
+
+    data2, n2 = retire_platform("codex")
+    assert n2 == 0
+    assert data2["generation"] == 4
 
 
 def test_upsert_wire_happy_path_no_warning(tmp_path, monkeypatch):

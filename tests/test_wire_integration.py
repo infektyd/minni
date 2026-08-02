@@ -644,6 +644,56 @@ def test_wire_missing_config_root_is_skipped(wire_env, monkeypatch, capsys):
         assert rc == 1
 
 
+def test_wire_missing_config_root_retires_zombie_wired_rows(
+    wire_env, monkeypatch, capsys,
+):
+    """Skip-on-missing-root must retire prior wired.json rows for that platform."""
+    _patch_payload(wire_env, monkeypatch)
+    home = wire_env[0]
+    plugin = home / ".minni" / "plugin"
+    plugin.mkdir(parents=True, exist_ok=True)
+    lagging = plugin / "0.4.0-old"
+    lagging.mkdir(parents=True, exist_ok=True)
+    (lagging / "payload-manifest.json").write_text(
+        '{"git_sha": "0000000000000000000000000000000000000000", "version": "0.4.0"}\n',
+        encoding="utf-8",
+    )
+    (plugin / "wired.json").write_text(
+        json.dumps({
+            "schema": 1,
+            "generation": 1,
+            "wires": [
+                {
+                    "platform": "kilocode",
+                    "install_root": str(lagging),
+                    "wired_at": "2026-08-01T00:00:00Z",
+                },
+                {
+                    "platform": "claude-code",
+                    "install_root": str(plugin / "keep"),
+                    "wired_at": "2026-08-02T00:00:00Z",
+                },
+            ],
+        })
+        + "\n",
+        encoding="utf-8",
+    )
+    kilo = home / ".config" / "kilo"
+    if kilo.exists():
+        import shutil
+        shutil.rmtree(kilo)
+
+    rc = run_wire(_args("kilocode", home, dry_run=False))
+    out = json.loads(capsys.readouterr().out)
+    by = {r["platform"]: r for r in out["results"]}
+    assert by["kilocode"]["status"] == "skipped", out
+    assert rc == 1
+    wired = json.loads((plugin / "wired.json").read_text(encoding="utf-8"))
+    platforms = [w["platform"] for w in wired.get("wires", [])]
+    assert "kilocode" not in platforms, wired
+    assert "claude-code" in platforms, wired
+
+
 def test_from_repo_run_redirects_child_stdout_to_stderr(tmp_path, monkeypatch):
     """Build children must not write to stdout (wire JSON contract)."""
     import subprocess as sp

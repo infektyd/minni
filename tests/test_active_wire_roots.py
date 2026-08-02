@@ -23,8 +23,13 @@ def _stamp(root: Path, *, version: str = "0.4.1") -> None:
     )
 
 
-def test_half_written_root_not_active(tmp_path):
+def test_half_written_root_not_active(tmp_path, monkeypatch):
     home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    # Host config roots must exist or platforms are dropped as retired.
+    (home / ".claude.json").write_text("{}", encoding="utf-8")
+    (home / ".codex").mkdir()
     plugin = home / ".minni" / "plugin"
     half = plugin / "0.4.1+git.half"
     half.mkdir(parents=True)  # dir only — no payload-manifest
@@ -57,8 +62,11 @@ def test_half_written_root_not_active(tmp_path):
     assert half.resolve() not in {r for r, _ in ordered}
 
 
-def test_latest_per_platform_and_current_fallback(tmp_path):
+def test_latest_per_platform_and_current_fallback(tmp_path, monkeypatch):
     home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    (home / ".claude.json").write_text("{}", encoding="utf-8")
     plugin = home / ".minni" / "plugin"
     older = plugin / "0.3.0"
     newer = plugin / "0.4.1"
@@ -88,6 +96,7 @@ def test_latest_per_platform_and_current_fallback(tmp_path):
 
     # No usable wire records → current with manifest.
     empty_home = tmp_path / "empty"
+    empty_home.mkdir()
     plugin2 = empty_home / ".minni" / "plugin"
     release = plugin2 / "0.4.1"
     _stamp(release)
@@ -100,7 +109,7 @@ def test_latest_per_platform_and_current_fallback(tmp_path):
     assert ordered2[0][1] == "current"
 
 
-def test_scripts_import_same_helper(tmp_path):
+def test_scripts_import_same_helper(tmp_path, monkeypatch):
     """check_versions / check_deployments must not re-implement is_dir-only logic."""
     import importlib.util
     from pathlib import Path as P
@@ -116,6 +125,10 @@ def test_scripts_import_same_helper(tmp_path):
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
         home = tmp_path / name
+        home.mkdir()
+        monkeypatch.setenv("HOME", str(home))
+        (home / ".claude.json").write_text("{}", encoding="utf-8")
+        (home / ".codex").mkdir()
         half = home / ".minni" / "plugin" / "half"
         half.mkdir(parents=True)
         full = home / ".minni" / "plugin" / "full"
