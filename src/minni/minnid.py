@@ -1122,6 +1122,34 @@ def _vault_watch_sweep_once() -> dict:
     return stats
 
 
+def _report_sweep(stats: dict) -> bool:
+    """Log per-vault sweep activity; True if any vault actually changed.
+
+    Only speak when something actually changed; an idle sweep is noise.
+    """
+    changed = False
+    for vault, s in (stats or {}).items():
+        if not isinstance(s, dict):
+            continue
+        indexed = s.get("indexed") or 0
+        pruned = s.get("pruned") or 0
+        errors = s.get("errors") or 0
+        # chunks_purged counts as a change here for the same reason it does in
+        # the FAISS invalidation gate: a purge-only sweep is real work, and
+        # treating it as idle makes it invisible in the logs while the index
+        # it invalidated quietly rebuilds.
+        chunks_purged = s.get("chunks_purged") or 0
+        if indexed or pruned or chunks_purged:
+            changed = True
+        if indexed or pruned or chunks_purged or errors:
+            logger.info(
+                "Vault watch: %s indexed=%s pruned=%s chunks_purged=%s "
+                "errors=%s",
+                vault, indexed, pruned, chunks_purged, errors,
+            )
+    return changed
+
+
 async def _vault_watch_runner():
     interval = _vault_watch_interval()
     logger.info("Vault watch enabled: incremental ingest every %ss", interval)
@@ -1132,22 +1160,7 @@ async def _vault_watch_runner():
     while True:
         try:
             stats = await asyncio.to_thread(_vault_watch_sweep_once)
-            # Only speak when something actually changed; an idle sweep is noise.
-            changed = False
-            for vault, s in (stats or {}).items():
-                if not isinstance(s, dict):
-                    continue
-                indexed = s.get("indexed") or 0
-                pruned = s.get("pruned") or 0
-                errors = s.get("errors") or 0
-                if indexed or pruned:
-                    changed = True
-                if indexed or pruned or errors:
-                    logger.info(
-                        "Vault watch: %s indexed=%s pruned=%s errors=%s",
-                        vault, indexed, pruned, errors,
-                    )
-            if changed:
+            if _report_sweep(stats):
                 # Indexing the file on disk is not enough. _agent_vault_retrieval
                 # memoizes a RetrievalEngine per vault, so a live daemon keeps
                 # answering from the engine it built at startup and newly indexed

@@ -1499,10 +1499,10 @@ def test_ensure_faiss_loaded_rebuilds_once_across_workers(tmp_path, monkeypatch)
             lambda self, db_conn=None: (time.sleep(0.3), False)[1],
         )
         builds = []
-        real_build = FAISSIndex.build_from_vectors
+        real_stage = FAISSIndex.stage_build
         monkeypatch.setattr(
-            FAISSIndex, "build_from_vectors",
-            lambda self, ids, vecs: (builds.append(1), real_build(self, ids, vecs))[1],
+            FAISSIndex, "stage_build",
+            lambda self, ids, vecs: (builds.append(1), real_stage(self, ids, vecs))[1],
         )
 
         threads = [threading.Thread(target=eng._ensure_faiss_loaded) for _ in range(2)]
@@ -1604,17 +1604,17 @@ def test_ensure_picks_up_rows_inserted_mid_rebuild(tmp_path, monkeypatch):
     eng = _engine(cfg)
     try:
         # The durable insert lands exactly between the ensure's SELECT and its
-        # build: the first build call commits a new row before building.
-        real_build = FAISSIndex.build_from_vectors
+        # build: the first staged build commits a new row before building.
+        real_stage = FAISSIndex.stage_build
         calls = {"n": 0}
 
-        def racing_build(self, ids, vecs):
+        def racing_stage(self, ids, vecs):
             calls["n"] += 1
             if calls["n"] == 1:
                 insert_row()
-            return real_build(self, ids, vecs)
+            return real_stage(self, ids, vecs)
 
-        monkeypatch.setattr(FAISSIndex, "build_from_vectors", racing_build)
+        monkeypatch.setattr(FAISSIndex, "stage_build", racing_stage)
         eng._ensure_faiss_loaded()
 
         assert eng.faiss_index.count == base + 1, (
@@ -1678,6 +1678,190 @@ def test_durable_refresh_survives_an_ensure_that_missed_its_rows(tmp_path, monke
         assert eng.faiss_index.count == n, "add_batch duplicated an existing id"
     finally:
         eng.db.close()
+
+
+# ── Round 11: findings from the tenth Grok review of #256 ──────────────────
+
+
+def test_rebuild_retry_never_publishes_a_partial_index(tmp_path, monkeypatch):
+    """Grok round 11 #1 (High). The round-10 retry loop called
+    build_from_vectors BEFORE the checksum re-check, so between a mismatch and
+    the next attempt the live index was warm with the stale snapshot — and the
+    unlocked count>0 early return let every concurrent worker adopt it. The
+    rebuild now stages off to the side and commits only a validated build:
+    while an ensure is mid-retry, a concurrent search must see an EMPTY
+    semantic leg (degrading to lexical), never a partial set."""
+    import minni.faiss_persist as persist
+    from minni.index_all import index_shared_vault
+
+    _install_fake_embedder(monkeypatch)
+    cfg = _make_cfg(tmp_path)
+    _write_page(Path(cfg.vault_path) / "wiki" / "concepts" / "p.md", "accepted",
+                "body text " * 60)
+    index_shared_vault(cfg)
+
+    eng = _engine(cfg)
+    try:
+        eng.faiss_index.invalidate()
+        manifest = eng.faiss_index._manifest_path()
+        if os.path.exists(manifest):
+            os.remove(manifest)
+
+        # Checksums: one probe belongs to try_load_from_disk (it samples the
+        # checksum even on a manifest miss), then attempt 1 sees the DB move
+        # under it (s0 -> s1) and attempt 2 is stable. At every probe, record
+        # what a concurrent worker's search would see of the live index.
+        observed = []
+        probe = np.random.rand(cfg.embedding_dim).astype(np.float32)
+        seq = iter(["t", "s0", "s1", "s1", "s1"])
+
+        def fake_checksum(conn):
+            observed.append((eng.faiss_index.count,
+                             len(eng.faiss_index.search(probe, top_k=5))))
+            return next(seq)
+
+        monkeypatch.setattr(persist, "compute_db_checksum", fake_checksum)
+        eng._ensure_faiss_loaded()
+
+        assert eng.faiss_index.count > 0, "stable attempt 2 did not warm the index"
+        assert len(observed) == 5, f"unexpected checksum probe count: {len(observed)}"
+        # Probes 3 and 4 run between attempt 1's build and attempt 2's commit —
+        # exactly where the round-10 code had already published the stale build.
+        for count, hits in observed[2:4]:
+            assert count == 0 and hits == 0, (
+                f"a concurrent search saw a partial index mid-retry: "
+                f"count={count} hits={hits}"
+            )
+    finally:
+        eng.db.close()
+
+
+def test_purge_to_empty_mid_rebuild_does_not_leave_a_stale_warm_index(tmp_path, monkeypatch):
+    """Grok round 11 #1, the empty-retry hole. If a later retry iteration
+    finds chunk_embeddings EMPTY (say a purge landed mid-flight), the round-10
+    loop returned with the previous attempt's build still warm. Empty must
+    mean cold, not 'keep serving the snapshot a purge just deleted'."""
+    import minni.faiss_persist as persist
+    from minni.index_all import index_shared_vault
+
+    _install_fake_embedder(monkeypatch)
+    cfg = _make_cfg(tmp_path)
+    _write_page(Path(cfg.vault_path) / "wiki" / "concepts" / "p.md", "accepted",
+                "body text " * 60)
+    index_shared_vault(cfg)
+
+    eng = _engine(cfg)
+    try:
+        eng.faiss_index.invalidate()
+        manifest = eng.faiss_index._manifest_path()
+        if os.path.exists(manifest):
+            os.remove(manifest)
+
+        # Call 1 is try_load_from_disk's probe (manifest miss), call 2 is
+        # attempt 1's pre-SELECT sample. Attempt 1's re-check (call 3) reports
+        # a moved DB AND deletes every chunk row, so attempt 2's SELECT — which
+        # runs after a build already succeeded — comes back empty.
+        calls = {"n": 0}
+
+        def fake_checksum(conn):
+            calls["n"] += 1
+            if calls["n"] == 3:
+                c = sqlite3.connect(cfg.db_path)
+                try:
+                    c.execute("DELETE FROM chunk_embeddings")
+                    c.commit()
+                finally:
+                    c.close()
+                return "moved"
+            return "s0"
+
+        monkeypatch.setattr(persist, "compute_db_checksum", fake_checksum)
+        eng._ensure_faiss_loaded()
+
+        assert calls["n"] >= 3, "the moved-DB re-check was never reached"
+
+        assert eng.faiss_index.count == 0, (
+            "ensure kept a warm index built from rows a purge deleted mid-flight"
+        )
+    finally:
+        eng.db.close()
+
+
+def test_disk_restore_is_fenced_against_a_mid_load_mutation(tmp_path, monkeypatch):
+    """Grok round 11 #2. try_load_from_disk sampled the checksum once, before
+    the slow disk read, and committed unconditionally. A vault-watch write
+    landing during the read meant the S0 cache was applied over an S1 DB —
+    warm on stale data, with the new rows invisible until the next invalidate.
+    The restore must re-check checksum and generation under the FAISS lock
+    immediately before applying, and miss into the DB rebuild otherwise."""
+    import minni.faiss_persist as persist
+    from minni.index_all import index_shared_vault
+
+    _install_fake_embedder(monkeypatch)
+    cfg = _make_cfg(tmp_path)
+    _write_page(Path(cfg.vault_path) / "wiki" / "concepts" / "p.md", "accepted",
+                "body text " * 60)
+    index_shared_vault(cfg)
+
+    eng = _engine(cfg)
+    try:
+        # Warm once so a checksum-matching disk cache exists, then go cold.
+        eng._ensure_faiss_loaded()
+        base = eng.faiss_index.count
+        assert base > 0 and os.path.exists(eng.faiss_index._manifest_path())
+        eng.faiss_index.invalidate()
+
+        conn = sqlite3.connect(cfg.db_path)
+        try:
+            doc_id = conn.execute("SELECT doc_id FROM documents LIMIT 1").fetchone()[0]
+        finally:
+            conn.close()
+
+        # The durable write lands DURING the disk read: after the checksum was
+        # sampled and the manifest validated, before the restore is applied.
+        real_load = persist.load
+
+        def racing_load(*args, **kwargs):
+            result = real_load(*args, **kwargs)
+            if result is not None:
+                c = sqlite3.connect(cfg.db_path)
+                try:
+                    c.execute(
+                        """INSERT INTO chunk_embeddings
+                           (doc_id, chunk_index, chunk_text, embedding,
+                            heading_context, model_name, computed_at, layer)
+                           VALUES (?,?,?,?,?,?,?,?)""",
+                        (doc_id, 998, "written mid disk read",
+                         np.zeros(cfg.embedding_dim, dtype=np.float32).tobytes(),
+                         "", cfg.embedding_model, time.time(), "knowledge"),
+                    )
+                    c.commit()
+                finally:
+                    c.close()
+            return result
+
+        monkeypatch.setattr(persist, "load", racing_load)
+        eng._ensure_faiss_loaded()
+
+        assert eng.faiss_index.count == base + 1, (
+            f"disk restore applied a stale cache over a moved DB: index has "
+            f"{eng.faiss_index.count} vectors, DB has {base + 1}"
+        )
+    finally:
+        eng.db.close()
+
+
+def test_purge_only_sweep_counts_as_changed_in_the_runner(tmp_path):
+    """Grok round 11 #3 (Low). The outer runner's changed flag and log only
+    looked at indexed/pruned/errors, so a purge-only sweep — which DOES
+    invalidate FAISS — read as idle in the logs and skipped the per-vault
+    cache clear."""
+    import minni.minnid as minnid
+
+    assert minnid._report_sweep({"v": {"chunks_purged": 3}}) is True
+    assert minnid._report_sweep({"v": {"indexed": 0, "pruned": 0, "errors": 1}}) is False
+    assert minnid._report_sweep({"v": {"indexed": 0}}) is False
+    assert minnid._report_sweep({}) is False
 
 
 def test_agent_vault_failure_does_not_darken_the_shared_vault(tmp_path, monkeypatch):

@@ -59,8 +59,18 @@ class FAISSIndex:
         # restore. While set, single adds are no-ops: the DB is the source of
         # truth and the next ensure-load rebuilds fully. Without it, an add
         # that interleaves with invalidate() leaves a tiny non-zero index that
-        # count>0 gates then treat as warm — a semantic blackout until restart.
+        # warm gates then treat as valid — a semantic blackout until restart.
         self._invalidated = False
+        # "Warm" for control flow means _ready, not count>0: True only after
+        # a VALIDATED full build (build_from_vectors, a committed staged
+        # build, or a fenced disk restore). count>0 as the warm test is what
+        # let every partially-published state become permanent.
+        self._ready = False
+        # Monotonic invalidation counter. A staged build commits only if the
+        # generation it started from is still current, so an invalidate that
+        # lands during the (unlocked) staging window can never be clobbered
+        # by the stale build it interrupted.
+        self._generation = 0
 
         self._load_faiss()
 
@@ -90,6 +100,18 @@ class FAISSIndex:
         """Number of vectors in the index."""
         return len(self._chunk_ids)
 
+    @property
+    def ready(self) -> bool:
+        """True only while the index holds a complete, validated build."""
+        with self._lock:
+            return self._ready
+
+    @property
+    def generation(self) -> int:
+        """Current invalidation generation (bumped by invalidate())."""
+        with self._lock:
+            return self._generation
+
     def build_from_vectors(
         self,
         chunk_ids: List[int],
@@ -113,19 +135,35 @@ class FAISSIndex:
         chunk_ids: List[int],
         embeddings: np.ndarray,
     ) -> None:
-        self._invalidated = False
-        self._chunk_ids = list(chunk_ids)
-        self._vectors = [embeddings[i] for i in range(len(chunk_ids))]
-        self._id_map = {i: cid for i, cid in enumerate(chunk_ids)}
-        self._reverse_map = {cid: i for i, cid in enumerate(chunk_ids)}
+        self._apply_state_locked(self._construct_state(chunk_ids, embeddings))
+
+    def _construct_state(
+        self,
+        chunk_ids: List[int],
+        embeddings: np.ndarray,
+    ) -> Dict:
+        """Build a complete index state WITHOUT touching the live fields.
+
+        Pure computation over the inputs (reads only config and the faiss
+        module), so it is safe to run off the lock. The result is published
+        atomically by _apply_state_locked / commit_staged — intermediate
+        build states must never be observable as a warm index.
+        """
+        state = {
+            "chunk_ids": list(chunk_ids),
+            "vectors": [embeddings[i] for i in range(len(chunk_ids))],
+            "id_map": {i: cid for i, cid in enumerate(chunk_ids)},
+            "reverse_map": {cid: i for i, cid in enumerate(chunk_ids)},
+            "index": None,
+            "type": "numpy",
+        }
 
         n = len(chunk_ids)
 
         if self._faiss is None:
             # No FAISS — will use numpy fallback in search()
-            self._current_type = "numpy"
             logger.info("Built numpy fallback index: %d vectors", n)
-            return
+            return state
 
         faiss = self._faiss
 
@@ -133,8 +171,10 @@ class FAISSIndex:
         normalized = self._normalize(embeddings)
 
         if getattr(self.config, "embedding_quantization", "fp32") == "int8":
-            if self._build_quantized_index(faiss, normalized, n):
-                return
+            quantized = self._build_quantized_index(faiss, normalized, n)
+            if quantized is not None:
+                state["index"], state["type"] = quantized
+                return state
             logger.warning(
                 "embedding_quantization=int8 requested, but this FAISS build "
                 "does not support the required scalar quantized index; using fp32"
@@ -151,17 +191,54 @@ class FAISSIndex:
             index.hnsw.efConstruction = self.config.hnsw_ef_construction
             index.hnsw.efSearch = self.config.hnsw_ef_search
             index.add(normalized)
-            self._index = index
-            self._current_type = "hnsw"
+            state["index"] = index
+            state["type"] = "hnsw"
             logger.info("Built HNSW index: %d vectors (M=%d, ef=%d)",
                         n, self.config.hnsw_m, self.config.hnsw_ef_construction)
         else:
             # Flat index (exact search)
             index = faiss.IndexFlatIP(self.dim)  # Inner product on normalized = cosine
             index.add(normalized)
-            self._index = index
-            self._current_type = "flat"
+            state["index"] = index
+            state["type"] = "flat"
             logger.info("Built Flat index: %d vectors", n)
+
+        return state
+
+    def _apply_state_locked(self, state: Dict) -> None:
+        """Publish a constructed state as the live index, atomically."""
+        self._invalidated = False
+        self._ready = True
+        self._chunk_ids = state["chunk_ids"]
+        self._vectors = state["vectors"]
+        self._id_map = state["id_map"]
+        self._reverse_map = state["reverse_map"]
+        self._index = state["index"]
+        self._current_type = state["type"]
+
+    def stage_build(self, chunk_ids: List[int], embeddings: np.ndarray) -> Dict:
+        """Construct a full index state off to the side, without the lock.
+
+        The live index is untouched: a concurrent search during staging sees
+        the previous state (usually cold), never a half-built one. Commit the
+        result with commit_staged.
+        """
+        return self._construct_state(chunk_ids, embeddings)
+
+    def commit_staged(self, state: Dict, expected_generation: int) -> bool:
+        """Publish a staged build, unless the world moved since it started.
+
+        Returns False (leaving the index untouched) when an invalidate()
+        advanced the generation after the caller sampled it — the staged
+        vectors were built from a snapshot that invalidate declared stale,
+        and publishing them would resurrect exactly the warm-incomplete
+        state the generation flag exists to prevent.
+        """
+        with self._lock:
+            if self._generation != expected_generation:
+                return False
+            self._apply_state_locked(state)
+            return True
 
     @staticmethod
     def _normalize(embeddings: np.ndarray) -> np.ndarray:
@@ -169,13 +246,17 @@ class FAISSIndex:
         norms = np.where(norms < 1e-8, 1.0, norms)
         return (embeddings / norms).astype(np.float32)
 
-    def _build_quantized_index(self, faiss, normalized: np.ndarray, n: int) -> bool:
-        """Build optional int8 scalar quantization, with fp32 fallback on failure."""
+    def _build_quantized_index(self, faiss, normalized: np.ndarray, n: int):
+        """Build optional int8 scalar quantization, with fp32 fallback on failure.
+
+        Returns (index, type_label) on success, None if unsupported — the
+        caller publishes it; nothing is bound to live state here.
+        """
         quantizer = getattr(faiss, "ScalarQuantizer", None)
         quantizer_type = getattr(quantizer, "QT_8bit", None)
         metric = getattr(faiss, "METRIC_INNER_PRODUCT", 0)
         if quantizer_type is None:
-            return False
+            return None
 
         hnsw_sq = getattr(faiss, "IndexHNSWSQ", None)
         if hnsw_sq is not None:
@@ -185,13 +266,11 @@ class FAISSIndex:
                     index.hnsw.efConstruction = self.config.hnsw_ef_construction
                     index.hnsw.efSearch = self.config.hnsw_ef_search
                 index.add(normalized)
-                self._index = index
-                self._current_type = "hnsw-sq-int8"
                 logger.info(
                     "Built int8 HNSW scalar-quantized index: %d vectors (M=%d)",
                     n, self.config.hnsw_m,
                 )
-                return True
+                return index, "hnsw-sq-int8"
             except Exception as exc:
                 logger.warning("IndexHNSWSQ unavailable or failed: %s", exc)
 
@@ -202,14 +281,12 @@ class FAISSIndex:
                 if hasattr(index, "is_trained") and not index.is_trained:
                     index.train(normalized)
                 index.add(normalized)
-                self._index = index
-                self._current_type = "sq-int8"
                 logger.info("Built int8 scalar-quantized index: %d vectors", n)
-                return True
+                return index, "sq-int8"
             except Exception as exc:
                 logger.warning("IndexScalarQuantizer unavailable or failed: %s", exc)
 
-        return False
+        return None
 
     def add(self, chunk_id: int, embedding: np.ndarray) -> None:
         """
@@ -270,7 +347,7 @@ class FAISSIndex:
         ensure-load rebuilds fully.
         """
         with self._lock:
-            if self._invalidated or not self._chunk_ids:
+            if not self._ready:
                 return False
             for cid, emb in zip(chunk_ids, embeddings):
                 # Idempotent: a retrying caller may race a rebuild that
@@ -287,7 +364,7 @@ class FAISSIndex:
         lock, and the whole multi-id operation holds it.
         """
         with self._lock:
-            if self._invalidated or not self._chunk_ids:
+            if not self._ready:
                 return False
             for cid in chunk_ids:
                 if cid in self._reverse_map:
@@ -389,6 +466,7 @@ class FAISSIndex:
                 all_vecs = np.array(live_vecs, dtype=np.float32)
                 self.build_from_vectors(live_ids, all_vecs)
             else:
+                self._ready = False
                 self._chunk_ids = []
                 self._vectors = []
                 self._id_map = {}
@@ -410,6 +488,8 @@ class FAISSIndex:
         """
         with self._lock:
             self._invalidated = True
+            self._ready = False
+            self._generation += 1
             self._chunk_ids = []
             self._vectors = []
             self._id_map = {}
@@ -454,6 +534,7 @@ class FAISSIndex:
             logger.debug("No DB connection for checksum; skipping disk load")
             return False
 
+        generation = self.generation
         checksum = compute_db_checksum(db_conn)
         result = load(
             manifest,
@@ -472,9 +553,23 @@ class FAISSIndex:
         # index/id-map state. _lock is an RLock, so build_from_vectors below
         # re-acquiring it is fine.
         with self._lock:
+            # Fence: the cache was validated against the checksum sampled
+            # BEFORE the slow disk read. If the DB moved or an invalidate()
+            # advanced the generation since, applying would clear the cold
+            # state on data that is already stale — warm-and-wrong, which
+            # count/ready gates then protect. Miss instead; the caller falls
+            # through to a DB rebuild that sees the current rows.
+            if (self._generation != generation
+                    or compute_db_checksum(db_conn) != checksum):
+                logger.info(
+                    "FAISS disk cache discarded: DB or generation moved "
+                    "during the load"
+                )
+                return False
             if faiss_index is not None:
                 # Restore from FAISS index: rebuild id maps from chunk_id_order
                 self._invalidated = False
+                self._ready = True
                 self._index = faiss_index
                 self._chunk_ids = list(chunk_ids)
                 self._id_map = {i: cid for i, cid in enumerate(chunk_ids)}
@@ -525,8 +620,8 @@ class FAISSIndex:
         # files, not a consistent-but-wrong one assembled while a concurrent
         # invalidate/build/add was replacing the state mid-save.
         with self._lock:
-            if self.count == 0:
-                logger.debug("Skipping FAISS save: index is empty")
+            if self.count == 0 or not self._ready:
+                logger.debug("Skipping FAISS save: index is empty or not validated")
                 return False
 
             checksum = db_checksum

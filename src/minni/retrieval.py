@@ -710,17 +710,24 @@ class RetrievalEngine:
         PR-2: Attempt disk cache first (cold-start <500ms).
         On miss, rebuild from DB then save to disk.
         """
-        if self.faiss_index.count > 0:
+        # "Warm" is READINESS — a validated, generation-current build — never
+        # bare count>0. A count-based gate is what let every partially
+        # published state become permanent: whatever raced its way to a
+        # non-zero count was suddenly the index of record.
+        if self.faiss_index.ready:
             return
 
         # One worker rebuilds; the rest wait here and find it warm. Without
         # this, every RPC worker that arrives after an invalidate runs its own
         # full-table SELECT + build, from potentially different DB snapshots.
         with self._faiss_load_lock:
-            if self.faiss_index.count > 0:
+            if self.faiss_index.ready:
                 return
 
-            # PR-2: Try disk cache first
+            # PR-2: Try disk cache first. try_load_from_disk re-checks the
+            # checksum and generation under the FAISS lock immediately before
+            # applying, so a vault-watch invalidate during the disk read
+            # makes this a miss, not a stale warm restore.
             try:
                 conn = self.db._get_conn()
                 if self.faiss_index.try_load_from_disk(db_conn=conn):
@@ -728,17 +735,19 @@ class RetrievalEngine:
             except Exception as e:
                 logger.debug("Disk cache load failed (non-fatal): %s", e)
 
-            # Rebuild from DB. The checksum is taken BEFORE each SELECT and
-            # re-checked after the build. A build whose snapshot the DB moved
-            # under must not become final: warm-but-incomplete is the one
-            # state nothing recovers from, because count>0 gates every later
-            # rebuild. Retry bounded; if the DB will not sit still, leave the
-            # index COLD — a cold index rebuilds on the next search, a
-            # warm-stale one serves holes until the next invalidate.
+            # Rebuild from DB, into a STAGED structure. The live index stays
+            # cold while the build is unvalidated — a concurrent search sees
+            # count==0 and degrades to lexical, never a partial semantic set.
+            # The staged build is committed only if (a) the checksum is the
+            # same one the SELECT ran under and (b) no invalidate() advanced
+            # the generation since. Retry bounded; if the DB will not sit
+            # still, leave the index COLD — cold is honest and self-heals on
+            # the next search, warm-partial does not.
             from minni.faiss_persist import compute_db_checksum
             conn = self.db._get_conn()
 
             for _ in range(3):
+                generation = self.faiss_index.generation
                 checksum_before = compute_db_checksum(conn)
 
                 chunk_ids = []
@@ -752,13 +761,19 @@ class RetrievalEngine:
                             embeddings.append(vec)
 
                 if not chunk_ids:
+                    # Nothing to serve; make sure no earlier state lingers.
+                    self.faiss_index.invalidate()
                     return
 
                 all_vecs = np.array(embeddings, dtype=np.float32)
-                self.faiss_index.build_from_vectors(chunk_ids, all_vecs)
+                staged = self.faiss_index.stage_build(chunk_ids, all_vecs)
 
                 if compute_db_checksum(conn) != checksum_before:
                     logger.debug("DB changed during FAISS rebuild; retrying")
+                    continue
+
+                if not self.faiss_index.commit_staged(staged, generation):
+                    logger.debug("FAISS invalidated during rebuild; retrying")
                     continue
 
                 logger.info("FAISS index loaded from DB: %d vectors", len(chunk_ids))
