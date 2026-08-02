@@ -20,12 +20,15 @@ Winner / collapse rule (applied by ``repair_duplicate_candidate_pairs``)
 ------------------------------------------------------------------------
 1. If any row is ``accepted`` → keep the lowest-id accepted; hard-delete only
    non-``accepted`` twins (the real #239 promote-then-dedup shape). Never
-   rewrites ``learnings``.
+   rewrites ``learnings``. Dual-``accepted`` (no non-accepted loser) is
+   ``needs_operator`` — never auto-deleted; surfaces loudly for UNIQUE.
 2. If any row is still ``proposed`` and none are ``accepted`` → **do not
-   delete**; report ``needs_operator`` (must not let ``rejected`` win over an
-   open proposed twin and block re-ingest).
-3. Else collapse all-terminal or all-``proposed`` groups under lowest
-   ``candidate_id`` (oldest insert).
+   delete** when mixed with terminal; report ``needs_operator`` (must not let
+   ``rejected`` win over an open proposed twin and block re-ingest).
+3. All-``proposed``: consult active ``afm_review`` markers (same fence as
+   consolidation). Prefer an **unfenced** proposed as winner so collapse
+   cannot strand the only processable twin behind a fence. All-terminal
+   groups collapse under lowest ``candidate_id``.
 4. Losers are **deleted** after an audit row in ``consolidation_actions``
    (when present). Learnings, FTS, and embeddings are never touched.
 
@@ -205,6 +208,8 @@ def choose_winner(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
 
 def collapse_decision(
     rows: Sequence[Dict[str, Any]],
+    *,
+    fenced_ids: Optional[Iterable[int]] = None,
 ) -> Dict[str, Any]:
     """Decide whether a byte-identical dual group may hard-delete losers.
 
@@ -216,8 +221,16 @@ def collapse_decision(
 
     Rules:
       1. Any ``accepted`` → keep lowest-id accepted; delete non-accepted.
-      2. Any ``proposed`` and no ``accepted`` → needs-operator (no delete).
-      3. All-terminal or all-proposed → keep lowest candidate_id.
+         Dual-accepted (only accepted twins, no non-accepted loser) →
+         ``needs_operator`` / ``dual_accepted`` (no auto-delete path).
+      2. Any ``proposed`` mixed with terminal and no ``accepted`` →
+         needs-operator (no delete).
+      3. All-proposed → prefer unfenced (no active ``afm_review``) as winner
+         so the only processable twin is never deleted behind a fence;
+         otherwise lowest candidate_id. All-terminal → lowest candidate_id.
+
+    ``fenced_ids``: candidate_ids with an active (non-superseded) ``afm_review``
+    consolidation_actions row — same fence consolidation uses to skip review.
     """
     if not rows:
         raise ValueError("collapse_decision requires at least one row")
@@ -227,27 +240,43 @@ def collapse_decision(
 
     accepted = by_status.get(_ACCEPTED_STATUS) or []
     proposed = by_status.get(_PROPOSED_STATUS) or []
+    fenced: set = set()
+    if fenced_ids:
+        for x in fenced_ids:
+            try:
+                fenced.add(int(x))
+            except (TypeError, ValueError):
+                continue
 
     if accepted:
         winner = min(accepted, key=lambda r: int(r["candidate_id"]))
         win_id = int(winner["candidate_id"])
+        extra_accepted = [
+            r for r in accepted if int(r["candidate_id"]) != win_id
+        ]
         losers = [
             r
             for r in rows
             if int(r["candidate_id"]) != win_id
             and _norm_status(r.get("status")) != _ACCEPTED_STATUS
         ]
-        # Extra accepted twins stay (hard guard) — reported via skipped later.
+        # Dual/multi accepted with nothing safe to delete — operator path.
+        # (Hard guard never deletes accepted; empty losers would be a no-op
+        # that still blocks UNIQUE without a loud signal.)
+        if not losers and extra_accepted:
+            return {
+                "action": "needs_operator",
+                "winner": None,
+                "reason": "dual_accepted",
+                "losers": [],
+                "extra_accepted": list(accepted),
+            }
         return {
             "action": "collapse",
             "winner": winner,
             "reason": "accepted_present",
             "losers": losers,
-            "extra_accepted": [
-                r
-                for r in accepted
-                if int(r["candidate_id"]) != win_id
-            ],
+            "extra_accepted": extra_accepted,
         }
 
     if proposed:
@@ -263,13 +292,26 @@ def collapse_decision(
                 "losers": [],
                 "extra_accepted": [],
             }
-        # All proposed: collapse under lowest id.
-        winner = min(rows, key=lambda r: int(r["candidate_id"]))
+        # All proposed: prefer unfenced so we do not strand the only twin
+        # consolidation would still process behind an afm_review fence.
+        unfenced = [
+            r for r in rows if int(r["candidate_id"]) not in fenced
+        ]
+        if unfenced:
+            winner = min(unfenced, key=lambda r: int(r["candidate_id"]))
+            any_fenced = any(int(r["candidate_id"]) in fenced for r in rows)
+            reason = (
+                "all_proposed_prefer_unfenced" if any_fenced else "all_proposed"
+            )
+        else:
+            # All fenced equally — lowest id (same as historical rule).
+            winner = min(rows, key=lambda r: int(r["candidate_id"]))
+            reason = "all_proposed"
         win_id = int(winner["candidate_id"])
         return {
             "action": "collapse",
             "winner": winner,
-            "reason": "all_proposed",
+            "reason": reason,
             "losers": [r for r in rows if int(r["candidate_id"]) != win_id],
             "extra_accepted": [],
         }
@@ -284,6 +326,38 @@ def collapse_decision(
         "losers": [r for r in rows if int(r["candidate_id"]) != win_id],
         "extra_accepted": [],
     }
+
+
+def _active_afm_review_ids_on_cursor(c) -> set:
+    """Candidate ids with a non-superseded ``afm_review`` marker (claim column)."""
+    try:
+        c.execute(
+            """
+            SELECT claim FROM consolidation_actions
+            WHERE action_type = 'afm_review'
+              AND COALESCE(status, '') != 'superseded'
+            """
+        )
+    except Exception:
+        return set()
+    out: set = set()
+    for row in c.fetchall():
+        claim = row["claim"] if hasattr(row, "keys") else row[0]
+        if claim is None:
+            continue
+        try:
+            out.add(int(str(claim).strip()))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _active_afm_review_ids(db) -> set:
+    """Load active afm_review fences; empty if table missing."""
+    if not _table_exists(db, "consolidation_actions"):
+        return set()
+    with db.cursor() as c:
+        return _active_afm_review_ids_on_cursor(c)
 
 
 def _iter_inbox_candidates(db) -> List[Dict[str, Any]]:
@@ -322,9 +396,13 @@ def _group_key_dict(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
-def _group_summary(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+def _group_summary(
+    rows: Sequence[Dict[str, Any]],
+    *,
+    fenced_ids: Optional[Iterable[int]] = None,
+) -> Dict[str, Any]:
     """Summarize a byte-identical dual group with collapse eligibility."""
-    decision = collapse_decision(rows)
+    decision = collapse_decision(rows, fenced_ids=fenced_ids)
     statuses = sorted({str(r.get("status")) for r in rows})
     base = {
         "key": _group_key_dict(rows),
@@ -369,18 +447,19 @@ def find_duplicate_candidate_groups(db) -> List[Dict[str, Any]]:
 
     Returns only **byte-identical collapsible** groups with 2+ rows — the #239
     dual shape that hard-delete may act on. Groups that need an operator
-    (proposed + terminal, no accepted) are reported via
+    (proposed + terminal, dual accepted) are reported via
     ``find_needs_operator_groups`` and are not hard-deleted.
     """
+    fenced = _active_afm_review_ids(db)
     out: List[Dict[str, Any]] = []
     for rows in _byte_identical_row_groups(db):
-        summary = _group_summary(rows)
+        summary = _group_summary(rows, fenced_ids=fenced)
         if summary["collapse_action"] != "collapse":
             continue
-        # Skip groups where collapse would delete nothing (e.g. dual accepted).
+        # Skip groups where collapse would delete nothing.
         # Empty loser_ids alone is enough — groups always have row_count >= 2
         # from _byte_identical_row_groups, so a row_count>1 conjunct was dead
-        # (comparison binds tighter than not) and never skipped dual accepted.
+        # (comparison binds tighter than not).
         if not summary["loser_ids"]:
             continue
         out.append(summary)
@@ -389,10 +468,14 @@ def find_duplicate_candidate_groups(db) -> List[Dict[str, Any]]:
 
 
 def find_needs_operator_groups(db) -> List[Dict[str, Any]]:
-    """Byte-identical duals that must not auto-delete (proposed + terminal)."""
+    """Byte-identical duals that must not auto-delete.
+
+    Covers proposed+terminal (no accepted) and dual-accepted (no safe loser).
+    """
+    fenced = _active_afm_review_ids(db)
     out: List[Dict[str, Any]] = []
     for rows in _byte_identical_row_groups(db):
-        summary = _group_summary(rows)
+        summary = _group_summary(rows, fenced_ids=fenced)
         if summary["collapse_action"] == "needs_operator":
             out.append(summary)
     out.sort(
@@ -667,6 +750,10 @@ def repair_duplicate_candidate_pairs(
     winner_replanned = 0
     fk_nulled = 0
 
+    dual_accepted = [
+        g for g in needs_operator if g.get("collapse_reason") == "dual_accepted"
+    ]
+
     if not dry_run and plan:
         now = time.time()
         # Probe once outside the write loop so we never open db.cursor()
@@ -680,6 +767,10 @@ def repair_duplicate_candidate_pairs(
                 has_audit = _table_exists_on_cursor(c, "consolidation_actions")
             if not has_contradiction:
                 has_contradiction = _table_exists_on_cursor(c, "contradiction_log")
+            # Fence set for all-proposed prefer-unfenced (same as consolidation).
+            live_fenced = (
+                _active_afm_review_ids_on_cursor(c) if has_audit else set()
+            )
             for item in plan:
                 # Re-validate under the write lock — never trust the pre-txn
                 # plan for deletes (concurrent AFM can change status between
@@ -688,7 +779,7 @@ def repair_duplicate_candidate_pairs(
                 if len(live_rows) < 2:
                     groups_skipped_stale += 1
                     continue
-                decision = collapse_decision(live_rows)
+                decision = collapse_decision(live_rows, fenced_ids=live_fenced)
                 if decision["action"] != "collapse" or decision["winner"] is None:
                     groups_needs_operator_live += 1
                     continue
@@ -753,6 +844,16 @@ def repair_duplicate_candidate_pairs(
             }
             for g in needs_operator[:5]
         ],
+        "dual_accepted_groups": len(dual_accepted),
+        "dual_accepted_sample": [
+            {
+                "key": g["key"],
+                "statuses": g["statuses"],
+                "candidate_ids": g.get("candidate_ids", [])[:8],
+                "reason": g.get("collapse_reason"),
+            }
+            for g in dual_accepted[:5]
+        ],
         "winner_replanned": winner_replanned if not dry_run else 0,
         "skipped_accepted_guard": skipped_accepted_guard if not dry_run else 0,
         "fk_resolution_nulled": fk_nulled if not dry_run else 0,
@@ -761,12 +862,15 @@ def repair_duplicate_candidate_pairs(
         "collapse_scope": (
             "byte-identical only (inbox_file, candidate_index, sha1(content)); "
             "divergent content under the same app key is reported, not deleted; "
-            "proposed+terminal (no accepted) is needs-operator, not deleted"
+            "proposed+terminal and dual-accepted are needs-operator, not deleted; "
+            "all-proposed prefers unfenced (no active afm_review) as winner"
         ),
         "winner_rule": (
             "if any accepted → keep accepted, delete non-accepted; "
-            "if any proposed and none accepted → needs-operator (no delete); "
-            "else all-terminal or all-proposed → lowest candidate_id; "
+            "dual-accepted → needs-operator (no auto-delete); "
+            "if any proposed and none accepted → needs-operator when mixed "
+            "with terminal; all-proposed → prefer unfenced over afm_review "
+            "fence, else lowest candidate_id; all-terminal → lowest id; "
             "re-validated inside write txn; never delete status=accepted"
         ),
         "learnings_touched": False,
@@ -775,7 +879,7 @@ def repair_duplicate_candidate_pairs(
             "Stop AFM/daemon writers before --apply when possible. "
             "Inbox unique index is operator-only (not a migration); re-run "
             "this repair after candidate_packets schema rebuilds. "
-            "needs_operator groups (proposed + terminal, no accepted) require "
+            "needs_operator groups (proposed+terminal, dual-accepted) require "
             "manual resolution before unique-index creation can proceed."
         ),
     }

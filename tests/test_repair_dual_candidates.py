@@ -154,6 +154,40 @@ def test_collapse_decision_all_proposed_lowest_id():
     assert decision["winner"]["candidate_id"] == 3
 
 
+def test_collapse_decision_all_proposed_prefers_unfenced_over_afm_review():
+    """Medium: do not keep fenced lowest-id and delete the only unfenced twin."""
+    from minni.repair_dual_candidates import collapse_decision
+
+    decision = collapse_decision(
+        [
+            {"candidate_id": 3, "status": "proposed"},  # fenced (afm_review)
+            {"candidate_id": 9, "status": "proposed"},  # unfenced processable
+        ],
+        fenced_ids={3},
+    )
+    assert decision["action"] == "collapse"
+    assert decision["reason"] == "all_proposed_prefer_unfenced"
+    assert decision["winner"]["candidate_id"] == 9
+    loser_ids = {r["candidate_id"] for r in decision["losers"]}
+    assert loser_ids == {3}
+
+
+def test_collapse_decision_dual_accepted_needs_operator():
+    """Medium: dual accepted has no auto-delete path — loud needs_operator."""
+    from minni.repair_dual_candidates import collapse_decision
+
+    decision = collapse_decision(
+        [
+            {"candidate_id": 2, "status": "accepted"},
+            {"candidate_id": 5, "status": "accepted"},
+        ]
+    )
+    assert decision["action"] == "needs_operator"
+    assert decision["reason"] == "dual_accepted"
+    assert decision["losers"] == []
+    assert decision["winner"] is None
+
+
 def test_repair_keeps_accepted_deletes_rejected_twin_leaves_learnings(tmp_path):
     from minni.repair_dual_candidates import (
         find_duplicate_candidate_groups,
@@ -1010,11 +1044,12 @@ def test_in_txn_revalidate_keeps_accepted_promoted_under_stale_plan(
 def test_never_deletes_accepted_when_two_accepted(tmp_path):
     """Hard guard: status=accepted is never hard-deleted as a loser.
 
-    Medium pin: dual accepted has empty loser_ids — must not appear in
-    collapsible groups (dead skip guard used to always no-op).
+    Medium pin: dual accepted is needs_operator (not collapsible); still never
+    deletes either accepted twin.
     """
     from minni.repair_dual_candidates import (
         find_duplicate_candidate_groups,
+        find_needs_operator_groups,
         repair_duplicate_candidate_pairs,
     )
 
@@ -1024,14 +1059,19 @@ def test_never_deletes_accepted_when_two_accepted(tmp_path):
     b = _insert_candidate(db, content=content, status="accepted")
     assert a < b
 
-    # Empty losers → not a collapsible group (reporting noise fixed).
+    # Dual accepted → not collapsible; surfaces as needs_operator.
     assert find_duplicate_candidate_groups(db) == []
+    needs = find_needs_operator_groups(db)
+    assert len(needs) == 1
+    assert needs[0]["collapse_reason"] == "dual_accepted"
+    assert set(needs[0]["candidate_ids"]) == {a, b}
 
     result = repair_duplicate_candidate_pairs(db, dry_run=False)
-    # collapse keeps lowest accepted; extra accepted is never deleted.
     assert result["deleted"] == 0
     assert result["groups_found"] == 0
     assert result["would_delete"] == 0
+    assert result["needs_operator_groups"] == 1
+    assert result["dual_accepted_groups"] == 1
     with db.cursor() as c:
         c.execute("SELECT candidate_id FROM candidate_packets ORDER BY candidate_id")
         ids = [dict(r)["candidate_id"] for r in c.fetchall()]
@@ -1481,3 +1521,103 @@ def test_prune_document_rows_invalidates_faiss_and_rerank(tmp_path):
         assert c.execute(
             "SELECT COUNT(*) AS n FROM vault_fts WHERE doc_id=?", (doc_id,)
         ).fetchone()["n"] == 0
+
+
+def _insert_afm_review_fence(db, candidate_id: int, *, status: str = "pending"):
+    """Insert an active afm_review marker (same fence consolidation consults)."""
+    with db.transaction() as c:
+        c.execute(
+            """
+            INSERT INTO consolidation_actions
+            (action_type, claim, category, status, detail, created_at)
+            VALUES ('afm_review', ?, 'general', ?, 'test fence', ?)
+            """,
+            (str(candidate_id), status, time.time()),
+        )
+
+
+def test_all_proposed_collapse_keeps_unfenced_when_lowest_fenced(tmp_path):
+    """Medium #1: fence insert on lowest id must not strand the unfenced twin."""
+    from minni.repair_dual_candidates import (
+        find_duplicate_candidate_groups,
+        repair_duplicate_candidate_pairs,
+    )
+
+    db, _cfg = _make_db(tmp_path)
+    content = "proposed twins one fenced by afm_review"
+    low = _insert_candidate(db, content=content, status="proposed")
+    high = _insert_candidate(db, content=content, status="proposed")
+    assert low < high
+    _insert_afm_review_fence(db, low, status="pending")
+
+    groups = find_duplicate_candidate_groups(db)
+    assert len(groups) == 1
+    assert groups[0]["winner_id"] == high
+    assert groups[0]["collapse_reason"] == "all_proposed_prefer_unfenced"
+    assert groups[0]["loser_ids"] == [low]
+
+    applied = repair_duplicate_candidate_pairs(db, dry_run=False)
+    assert applied["deleted"] == 1
+    with db.cursor() as c:
+        c.execute(
+            "SELECT candidate_id, status FROM candidate_packets ORDER BY candidate_id"
+        )
+        rows = [dict(r) for r in c.fetchall()]
+    assert len(rows) == 1
+    assert rows[0]["candidate_id"] == high
+    assert rows[0]["status"] == "proposed"
+
+
+def test_all_proposed_superseded_fence_does_not_prefer(tmp_path):
+    """Superseded afm_review is not an active fence — fall back to lowest id."""
+    from minni.repair_dual_candidates import find_duplicate_candidate_groups
+
+    db, _cfg = _make_db(tmp_path)
+    content = "proposed with superseded fence"
+    low = _insert_candidate(db, content=content, status="proposed")
+    high = _insert_candidate(db, content=content, status="proposed")
+    _insert_afm_review_fence(db, low, status="superseded")
+
+    groups = find_duplicate_candidate_groups(db)
+    assert len(groups) == 1
+    assert groups[0]["winner_id"] == low
+    assert groups[0]["collapse_reason"] == "all_proposed"
+    assert groups[0]["loser_ids"] == [high]
+
+
+def test_cli_warns_on_dual_accepted_groups(tmp_path, capsys):
+    """Medium #2: dual accepted surfaces needs_operator + CLI WARNING."""
+    import importlib.util
+    from pathlib import Path
+
+    script = (
+        Path(__file__).resolve().parents[1] / "scripts" / "repair_issue_239.py"
+    )
+    spec = importlib.util.spec_from_file_location("repair_issue_239_cli_warn", script)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    db, cfg = _make_db(tmp_path)
+    content = "dual accepted loud path"
+    _insert_candidate(db, content=content, status="accepted")
+    _insert_candidate(db, content=content, status="accepted")
+    if hasattr(db, "close"):
+        try:
+            db.close()
+        except Exception:
+            pass
+
+    # Dry-run should still warn; --apply with index stays exit 3 (blocked).
+    rc_dry = mod.main(["--db", cfg.db_path])
+    captured = capsys.readouterr()
+    assert rc_dry == 0
+    assert "dual-accepted" in captured.out.lower() or "dual_accepted" in captured.err
+    assert "WARNING" in captured.err
+    assert "dual_accepted" in captured.err
+
+    rc_apply = mod.main(["--db", cfg.db_path, "--apply"])
+    captured2 = capsys.readouterr()
+    assert rc_apply == 3
+    assert "WARNING" in captured2.err
+    assert "dual_accepted" in captured2.err

@@ -174,9 +174,21 @@ def main(argv: list[str] | None = None) -> int:
             )
         if dual.get("needs_operator_groups"):
             print(
-                f"  needs-operator groups (proposed+terminal, not deleted): "
-                f"{dual['needs_operator_groups']}"
+                f"  needs-operator groups (proposed+terminal / dual-accepted, "
+                f"not deleted): {dual['needs_operator_groups']}"
             )
+        dual_acc = int(dual.get("dual_accepted_groups") or 0)
+        if dual_acc > 0:
+            print(
+                f"  dual-accepted groups (block UNIQUE; no auto-delete): "
+                f"{dual_acc}"
+            )
+            samples = dual.get("dual_accepted_sample") or []
+            for s in samples[:3]:
+                print(
+                    f"    ids={s.get('candidate_ids')} "
+                    f"key={s.get('key')}"
+                )
         if args.apply and (
             dual.get("winner_replanned")
             or dual.get("skipped_accepted_guard")
@@ -188,6 +200,24 @@ def main(argv: list[str] | None = None) -> int:
                 f"accepted_guard={dual.get('skipped_accepted_guard', 0)}  "
                 f"stale_skip={dual.get('groups_skipped_stale', 0)}  "
                 f"needs_operator_live={dual.get('groups_needs_operator_live', 0)}"
+            )
+        # Loud operator signals (stderr) — dual-accepted has no repair path
+        # other than manual resolution; UNIQUE install will stay blocked.
+        if dual_acc > 0 and not args.json:
+            print(
+                f"WARNING: dual_accepted_groups={dual_acc} — multiple "
+                f"status=accepted twins share an inbox key; repair never "
+                f"hard-deletes accepted rows. Resolve manually (keep one, "
+                f"retire extras) before UNIQUE index can be installed.",
+                file=sys.stderr,
+            )
+        skipped_guard = int(dual.get("skipped_accepted_guard") or 0)
+        if skipped_guard > 0 and not args.json:
+            print(
+                f"WARNING: skipped_accepted_guard={skipped_guard} — in-txn "
+                f"refused to delete accepted twin(s). Remaining accepted "
+                f"collisions still block the inbox UNIQUE backstop.",
+                file=sys.stderr,
             )
         if idx.get("skipped"):
             print(
