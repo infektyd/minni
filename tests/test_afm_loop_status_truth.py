@@ -184,6 +184,8 @@ def test_writer_status_derives_rather_than_asserts(tmp_path, monkeypatch):
 
     monkeypatch.setattr(afm_writer, "_LAST_RUN_PER_PASS", {}, raising=False)
     monkeypatch.setattr(afm_writer, "_LAST_ATTEMPT_PER_PASS", {}, raising=False)
+    monkeypatch.setattr(afm_writer, "_FAILURES_PER_PASS", {}, raising=False)
+    monkeypatch.setattr(afm_writer, "_LAST_FAILURE_PER_PASS", {}, raising=False)
     status = afm_writer.writer_status(str(tmp_path), schedule=SCHEDULE)
     assert status["status"] == "unknown"
     assert status["status_reasons"]
@@ -198,6 +200,8 @@ def test_quoted_created_dates_are_read(tmp_path, monkeypatch):
 
     monkeypatch.setattr(afm_writer, "_LAST_RUN_PER_PASS", {}, raising=False)
     monkeypatch.setattr(afm_writer, "_LAST_ATTEMPT_PER_PASS", {}, raising=False)
+    monkeypatch.setattr(afm_writer, "_FAILURES_PER_PASS", {}, raising=False)
+    monkeypatch.setattr(afm_writer, "_LAST_FAILURE_PER_PASS", {}, raising=False)
     page = tmp_path / "wiki" / "sessions" / "d.md"
     page.parent.mkdir(parents=True)
     page.write_text(
@@ -222,6 +226,8 @@ def test_body_text_containing_created_is_not_read_as_the_date(tmp_path, monkeypa
 
     monkeypatch.setattr(afm_writer, "_LAST_RUN_PER_PASS", {}, raising=False)
     monkeypatch.setattr(afm_writer, "_LAST_ATTEMPT_PER_PASS", {}, raising=False)
+    monkeypatch.setattr(afm_writer, "_FAILURES_PER_PASS", {}, raising=False)
+    monkeypatch.setattr(afm_writer, "_LAST_FAILURE_PER_PASS", {}, raising=False)
     page = tmp_path / "wiki" / "sessions" / "d.md"
     page.parent.mkdir(parents=True)
     page.write_text(
@@ -243,6 +249,8 @@ def test_unparseable_created_value_counts_as_undated(tmp_path, monkeypatch):
 
     monkeypatch.setattr(afm_writer, "_LAST_RUN_PER_PASS", {}, raising=False)
     monkeypatch.setattr(afm_writer, "_LAST_ATTEMPT_PER_PASS", {}, raising=False)
+    monkeypatch.setattr(afm_writer, "_FAILURES_PER_PASS", {}, raising=False)
+    monkeypatch.setattr(afm_writer, "_LAST_FAILURE_PER_PASS", {}, raising=False)
     page = tmp_path / "wiki" / "sessions" / "d.md"
     page.parent.mkdir(parents=True)
     page.write_text(
@@ -260,6 +268,8 @@ def test_record_pass_attempt_moves_the_needle(monkeypatch):
     import minni.afm_writer as afm_writer
 
     monkeypatch.setattr(afm_writer, "_LAST_ATTEMPT_PER_PASS", {}, raising=False)
+    monkeypatch.setattr(afm_writer, "_FAILURES_PER_PASS", {}, raising=False)
+    monkeypatch.setattr(afm_writer, "_LAST_FAILURE_PER_PASS", {}, raising=False)
     afm_writer.record_pass_attempt("synthesis", now=NOW)
     assert afm_writer._LAST_ATTEMPT_PER_PASS["synthesis"] == NOW
 

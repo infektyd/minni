@@ -72,7 +72,15 @@ _FAILURE_RETRY_SECONDS = 300
 # so a pass failing instantly still burned the full 24h interval while status
 # read "failing". The tick decision has to read the RESPONSE, not rely on an
 # exception that never arrives.
-_COMPILE_FAILURE_STATUSES = frozenset({"afm_unavailable", "write_failed"})
+#
+# Review round 2 on PR #260: "write_timeout" belongs here too. A hung writer
+# does not raise — submit_drafts waits out its 30s and RETURNS that status, so
+# handle_daemon_compile merges it into a non-exception response. Leaving it
+# out of this set scheduled the next attempt a full interval later: the same
+# AFM-8 hole, one status name over.
+_COMPILE_FAILURE_STATUSES = frozenset(
+    {"afm_unavailable", "write_failed", "write_timeout"}
+)
 
 
 def compile_failure_status(res: Any) -> Optional[str]:

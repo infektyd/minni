@@ -147,7 +147,13 @@ def _degradation_for(retrieval_engine: Any, src: str) -> dict:
     "the field is absent" can never be mistaken for "nothing degraded".
     """
     config = getattr(retrieval_engine, "config", None)
-    vector_down = bool(getattr(retrieval_engine, "vector_model_down", False))
+    # Review round 2 on PR #260: read the THREAD-LOCAL per-request verdict, not
+    # the process-global vector_model_down bool — one engine serves concurrent
+    # search workers, and a racing request could flip the global between this
+    # request's retrieve() returning and this read, reporting a lexical-only
+    # answer as healthy (or the inverse). The global stays for the health
+    # surface, where encoder presence is a process-wide fact.
+    vector_down = bool(getattr(retrieval_engine, "last_vector_degraded", None))
     entry: dict = {
         "src": src,
         "vector_model": getattr(config, "embedding_model", None),

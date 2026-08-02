@@ -262,21 +262,27 @@ def reset_afm_generation_probe_cache() -> None:
 
 
 def note_afm_generation_failure(url: Optional[str] = None) -> None:
-    """Invalidate cached generation probes after a live call failure."""
-    if url is None:
-        _generation_probe_cache.clear()
-        _persist_probe_mutation(lambda entries: entries.clear())
-        return
-    for key in list(_generation_probe_cache):
-        if key.endswith(f"|{url}"):
-            del _generation_probe_cache[key]
+    """Invalidate cached generation probes after a live call failure.
 
-    def _drop(entries: Dict[str, Dict[str, Any]]) -> None:
-        for key in list(entries):
+    Review round 2 on PR #260: the L1 iterate-and-delete ran outside
+    _probe_cache_lock while _remember_probe mutated under it. The lock is an
+    RLock, so the whole L1+persistent RMW is serialized here as one unit.
+    """
+    with _probe_cache_lock:
+        if url is None:
+            _generation_probe_cache.clear()
+            _persist_probe_mutation(lambda entries: entries.clear())
+            return
+        for key in list(_generation_probe_cache):
             if key.endswith(f"|{url}"):
-                del entries[key]
+                del _generation_probe_cache[key]
 
-    _persist_probe_mutation(_drop)
+        def _drop(entries: Dict[str, Dict[str, Any]]) -> None:
+            for key in list(entries):
+                if key.endswith(f"|{url}"):
+                    del entries[key]
+
+        _persist_probe_mutation(_drop)
 
 
 def note_afm_generation_success(url: str, mode: str = "bridge", now: Callable[[], float] = time.time) -> None:
@@ -287,18 +293,21 @@ def note_afm_generation_success(url: str, mode: str = "bridge", now: Callable[[]
     even while real calls succeed (mirror of afm.ts noteAfmGenerationSuccess).
     """
     entry = {"reachable": True, "generation_verified": True, "detail": None, "probed_at": now()}
-    _remember_probe(f"{mode}|{url}", entry)
-    for key in list(_generation_probe_cache):
-        if key.endswith(f"|{url}"):
-            _remember_probe(key, dict(entry))
-
-    def _upsert(entries: Dict[str, Dict[str, Any]]) -> None:
-        entries[f"{mode}|{url}"] = _to_persisted_entry(entry)
-        for key in list(entries):
+    # Round 2 (PR #260): one lock scope for the whole multi-key RMW — the
+    # iteration used to run outside the lock the individual writes took.
+    with _probe_cache_lock:
+        _remember_probe(f"{mode}|{url}", entry)
+        for key in list(_generation_probe_cache):
             if key.endswith(f"|{url}"):
-                entries[key] = _to_persisted_entry(entry)
+                _remember_probe(key, dict(entry))
 
-    _persist_probe_mutation(_upsert)
+        def _upsert(entries: Dict[str, Dict[str, Any]]) -> None:
+            entries[f"{mode}|{url}"] = _to_persisted_entry(entry)
+            for key in list(entries):
+                if key.endswith(f"|{url}"):
+                    entries[key] = _to_persisted_entry(entry)
+
+        _persist_probe_mutation(_upsert)
 
 
 def _chat_completion_content(data: Dict[str, Any]) -> Optional[str]:

@@ -340,10 +340,18 @@ test("P6: the bridge diagnostic is killed on a timer and capped in flight", asyn
   assert.match(source, /const DIAGNOSTIC_MAX_IN_FLIGHT = \d+/);
 
   const report = source.indexOf("function reportBridgeFailure");
-  const window = source.slice(report, report + 1600);
+  const window = source.slice(report, report + 2400);
   assert.match(window, /setTimeout\(/, "the diagnostic child needs a kill timer");
   assert.match(window, /child\.unref\(\)/);
   assert.match(window, /diagnosticsInFlight/);
+  // Review round 2: a failed spawn can fire BOTH `error` and `close`; an
+  // unguarded settle decrements twice, drives the counter negative, and the
+  // in-flight cap stops binding.
+  assert.match(
+    window,
+    /if \(settled\) return;/,
+    "settle must be idempotent — error+close both firing must not double-decrement",
+  );
 });
 
 // ── helper ─────────────────────────────────────────────────────────────────

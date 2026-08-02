@@ -467,6 +467,22 @@ class RetrievalEngine:
         self._set_degradation_flag("query_expand", value)
 
     @property
+    def last_vector_degraded(self) -> Optional[str]:
+        """P0-B, per request: whether THIS thread's last retrieve() lost its
+        semantic leg. Review round 2 on PR #260: R4(a) reported the plain
+        process-wide ``vector_model_down`` bool per RESPONSE, so a concurrent
+        request flipping it in the set-in-retrieve()/read-in-handler window
+        could report a lexical-only answer as healthy (or a healthy one as
+        degraded). The response envelope reads this thread-local instead; the
+        global bool stays as the process-level outage signal for the health
+        surface and the log-once guard."""
+        return self._degradation_flag("vector")
+
+    @last_vector_degraded.setter
+    def last_vector_degraded(self, value: Optional[str]) -> None:
+        self._set_degradation_flag("vector", value)
+
+    @property
     def model(self):
         """Return the process-wide embedding model singleton."""
         from minni.models import get_embedder
@@ -1882,6 +1898,10 @@ class RetrievalEngine:
                 "degraded to lexical (FTS) only until the encoder loads"
             )
         self.vector_model_down = True
+        # Per-request verdict for the response envelope (round 2, PR #260).
+        self.last_vector_degraded = (
+            "embedding model unavailable; lexical (FTS) only"
+        )
 
     def _encode_query(self, query: str) -> np.ndarray:
         """Encode ``query``, raising the P0-B flag when the encoder is down.
@@ -2612,6 +2632,7 @@ class RetrievalEngine:
         # earlier comment here claimed no re-clearing happened. It did.)
         self.last_rerank_degraded = None
         self.last_query_expand_degraded = None
+        self.last_vector_degraded = None
         query_variants = self._resolve_query_variants(query, expand)
         if len(query_variants) > 1:
             total_t0 = time.perf_counter()
@@ -2625,6 +2646,7 @@ class RetrievalEngine:
             # Same aggregation, same reason: the recursion clears these on entry.
             variant_rerank_degraded: List[str] = []
             variant_expand_degraded: List[str] = []
+            variant_vector_degraded: List[str] = []
             for variant in query_variants:
                 per_variant.append(self.retrieve(
                     query=variant,
@@ -2663,6 +2685,10 @@ class RetrievalEngine:
                     variant_expand_degraded.append(
                         f"{variant}: {self.last_query_expand_degraded}"
                     )
+                if self.last_vector_degraded:
+                    variant_vector_degraded.append(
+                        f"{variant}: {self.last_vector_degraded}"
+                    )
             results = self._merge_expanded_results(per_variant, query_variants, limit)
             # A degrade in ANY variant degrades the merge — the merged ordering
             # mixed a leg that was not reranked. Set AFTER the loop, because the
@@ -2672,6 +2698,9 @@ class RetrievalEngine:
             )
             self.last_query_expand_degraded = (
                 "; ".join(variant_expand_degraded) if variant_expand_degraded else None
+            )
+            self.last_vector_degraded = (
+                "; ".join(variant_vector_degraded) if variant_vector_degraded else None
             )
             # Aggregate: any variant whose non-empty candidate set was gated to
             # zero keeps the blackout visible, regardless of variant order.

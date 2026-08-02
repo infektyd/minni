@@ -137,7 +137,14 @@ function reportBridgeFailure(event, error) {
     });
     diagnosticsInFlight += 1;
     const kill = setTimeout(() => child.kill("SIGKILL"), DIAGNOSTIC_TIMEOUT_MS);
+    // `once` guards each event individually, but a failed spawn can fire BOTH
+    // `error` and `close`. Double-decrementing drives the counter negative and
+    // the in-flight cap stops binding — under exactly the failure storm it
+    // exists to bound (review round 2 on PR #260).
+    let settled = false;
     const settle = () => {
+      if (settled) return;
+      settled = true;
       clearTimeout(kill);
       diagnosticsInFlight -= 1;
     };

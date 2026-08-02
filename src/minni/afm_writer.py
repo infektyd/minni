@@ -57,6 +57,15 @@ _LAST_FAILURE_PER_PASS: dict[str, dict] = {}
 # AFM-8: submissions the bounded queue refused. Drafts counted here were never
 # written and never will be.
 _WRITES_DROPPED = 0
+# Review round 2 on PR #260: _WRITES_DROPPED is cumulative and nothing clears
+# it, so deriving `backlogged` from `if dropped` latched the verdict for the
+# process lifetime — one full-queue burst months ago and a fully drained,
+# healthy writer still read backlogged. The verdict must reflect the CURRENT
+# state; the cumulative count stays visible as its own metric. A drop inside
+# this window still counts (it covers the gap while the queue drains back
+# under the backlog threshold); older ones are history, not status.
+_LAST_DROP_AT: Optional[float] = None
+WRITES_DROPPED_RECENT_SECONDS = 3600.0
 
 # A pass is stale once it has been silent for this multiple of its configured
 # interval. 2x, not 1x: a tick that lands a few seconds late is not a fault, and
@@ -123,12 +132,13 @@ def record_pass_failure(
 
 def reset_pass_counters() -> None:
     """Clear the in-memory liveness/failure counters (tests)."""
-    global _WRITES_DROPPED
+    global _WRITES_DROPPED, _LAST_DROP_AT
     _LAST_RUN_PER_PASS.clear()
     _LAST_ATTEMPT_PER_PASS.clear()
     _FAILURES_PER_PASS.clear()
     _LAST_FAILURE_PER_PASS.clear()
     _WRITES_DROPPED = 0
+    _LAST_DROP_AT = None
 
 
 def _parse_iso_utc(value: str) -> Optional[float]:
@@ -276,8 +286,18 @@ def derive_loop_status(
             f"{WRITER_QUEUE_BACKLOG}, hard bound {WRITER_QUEUE_MAX}); "
             "the writer thread is not draining"
         )
+    # Review round 2 on PR #260: the cumulative drop count used to drive the
+    # verdict directly, so one long-past burst latched `backlogged` until
+    # daemon restart. Only a RECENT drop is a live condition; the lifetime
+    # count stays reported as writes_dropped in the state. Unknown recency
+    # (a state with no last_drop_at) keeps the alarm — better a stale reason
+    # than a suppressed loss.
     dropped = int(state.get("writes_dropped", 0) or 0)
-    if dropped:
+    drop_at = state.get("last_drop_at")
+    dropped_recently = bool(dropped) and (
+        drop_at is None or now - float(drop_at) <= WRITES_DROPPED_RECENT_SECONDS
+    )
+    if dropped_recently:
         reasons.append(
             f"{dropped} write job(s) REJECTED because the queue was full — "
             "those drafts were never written"
@@ -286,8 +306,26 @@ def derive_loop_status(
     # GA4-3: a pass failing on every tick used to reach this function looking
     # exactly like a healthy one, because only the fact that it ran was
     # recorded. Failures are their own reason and their own status.
+    # Review round 2 on PR #260: the counter is cumulative and nothing clears
+    # it, so `if count` latched `failing` for the process lifetime — one
+    # transient fault and every clean tick after it still read failing, the
+    # exact learned-to-ignore alarm this status exists to kill. A pass is
+    # failing only while its LAST outcome was a fault: the recorders stamp the
+    # attempt first, then the failure, so fail_at >= attempt_at means the last
+    # attempt faulted, and a later successful attempt moves attempt_at past
+    # it. A nonzero count with no failure timestamp keeps the alarm (unknown
+    # recency is not recovery). The cumulative count stays visible as
+    # failures_per_pass in the state.
     failures = state.get("failures_per_pass") or {}
-    failing = [f"{name} ({count}x)" for name, count in sorted(failures.items()) if count]
+    last_failures = state.get("last_failure_per_pass") or {}
+    failing = []
+    for name, count in sorted(failures.items()):
+        if not count:
+            continue
+        fail_at = (last_failures.get(name) or {}).get("at")
+        attempt_at = float(last_attempt.get(name, 0.0) or 0.0)
+        if fail_at is None or float(fail_at) >= attempt_at:
+            failing.append(f"{name} ({count}x)")
     if failing:
         reasons.append("passes raising: " + ", ".join(failing))
 
@@ -298,7 +336,7 @@ def derive_loop_status(
     if (
         pending >= DRAFTS_PENDING_BACKLOG
         or queue_backlogged
-        or dropped
+        or dropped_recently
         or (oldest_ts is not None and (now - oldest_ts) / 86400.0 > ttl_days)
     ):
         return "backlogged", reasons
@@ -661,8 +699,9 @@ def submit_drafts(job: dict, wait: bool = True, timeout: Optional[float] = 30.0)
         # Drop policy: reject at the door and count it, rather than block the
         # caller or silently grow. The drafts are NOT written; saying so is the
         # whole point.
-        global _WRITES_DROPPED
+        global _WRITES_DROPPED, _LAST_DROP_AT
         _WRITES_DROPPED += 1
+        _LAST_DROP_AT = time.time()
         logger.error(
             "AFM writer queue full (%d jobs); REJECTED %d draft(s) from pass %r — "
             "not written",
@@ -769,6 +808,7 @@ def writer_status(
         "queue_depth": _WORK_QUEUE.qsize(),
         "queue_max": WRITER_QUEUE_MAX,
         "writes_dropped": _WRITES_DROPPED,
+        "last_drop_at": _LAST_DROP_AT,
         "failures_per_pass": dict(_FAILURES_PER_PASS),
         "last_failure_per_pass": dict(_LAST_FAILURE_PER_PASS),
     }

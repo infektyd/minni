@@ -66,6 +66,9 @@ def test_search_response_always_carries_vector_model_and_degraded():
     class _Engine:
         config = _Config()
         vector_model_down = True  # semantic leg is DOWN
+        # Round 2 (PR #260): the response reads the per-request thread-local,
+        # not the racy process-global bool. A real engine sets both.
+        last_vector_degraded = "embedding model unavailable; lexical (FTS) only"
         last_rerank_degraded = None
         last_query_expand_degraded = None
         last_auth_suppression = None
@@ -112,6 +115,41 @@ def test_healthy_search_reports_degradation_field_as_false_not_absent():
     assert payload["degradation"][0]["vector_degraded"] is False
 
 
+def test_vector_degradation_is_read_per_request_not_from_the_global():
+    """Review round 2 (PR #260): one process-wide engine serves concurrent
+    search workers, so the plain `vector_model_down` bool could be flipped by
+    a racing request between this request's retrieve() and the handler's read
+    — reporting a lexical-only answer as healthy, or a healthy one as
+    degraded. The response must be driven by the per-request thread-local
+    verdict, with the global left to the health surface."""
+    from minni.minnid_runtime import recall as recall_mod
+
+    class _Config:
+        embedding_model = "all-MiniLM-L6-v2"
+
+    class _StaleGlobal:
+        # A concurrent request left the global raised; THIS request's semantic
+        # leg was fine.
+        config = _Config()
+        vector_model_down = True
+        last_vector_degraded = None
+
+    class _StaleClear:
+        # The inverse race: a concurrent success cleared the global after THIS
+        # request degraded to lexical-only.
+        config = _Config()
+        vector_model_down = False
+        last_vector_degraded = "embedding model unavailable; lexical (FTS) only"
+
+    healthy = recall_mod._degradation_for(_StaleGlobal(), "vault")
+    assert healthy["vector_degraded"] is False
+    assert healthy["degraded"] is False
+
+    degraded = recall_mod._degradation_for(_StaleClear(), "vault")
+    assert degraded["vector_degraded"] is True
+    assert degraded["degraded"] is True
+
+
 # ── #226 R4(b): explicit-backend branches must not bypass the P0-B flag ──────
 
 
@@ -131,6 +169,9 @@ def test_encode_query_raises_the_degradation_flag_when_encoder_down(tmp_path, mo
         "the explicit-backend path must raise the SAME degradation flag as the "
         "default branch — otherwise lexical-only results are indistinguishable "
         "from a healthy hybrid search"
+    )
+    assert engine.last_vector_degraded is not None, (
+        "the per-request verdict the response envelope reads must be raised too"
     )
 
 
@@ -421,6 +462,41 @@ def test_failing_pass_reads_as_failing_not_ok():
     assert any("raising" in reason for reason in reasons)
 
 
+def test_failing_clears_when_the_pass_recovers():
+    """Review round 2 (PR #260): the failure counter is cumulative and nothing
+    clears it, so `failing` was latched for the process lifetime — one
+    transient fault and 500 clean ticks later the primary health surface still
+    screamed. Failure must be CURRENT: the recorders stamp the attempt first
+    and the failure second, so a later successful attempt (attempt_at past the
+    last fail_at) means the pass recovered."""
+    from minni.afm_writer import derive_loop_status
+
+    now = 1_000_000.0
+    schedule = {"passes": {"consolidation": {"interval_seconds": 3600}}}
+    failed_then_recovered = {
+        "last_attempt_per_pass": {"consolidation": now - 60},
+        "failures_per_pass": {"consolidation": 1},
+        "last_failure_per_pass": {"consolidation": {"at": now - 600, "error": "blip"}},
+    }
+    status, reasons = derive_loop_status(failed_then_recovered, schedule=schedule, now=now)
+    assert status == "ok", (
+        "a pass whose LAST outcome succeeded is not failing — a one-way latch "
+        "is an alarm operators learn to ignore"
+    )
+    assert not any("raising" in reason for reason in reasons)
+
+    # The counterpart: the last outcome WAS the fault — still failing, and the
+    # cumulative count stays visible in the reason.
+    still_failing = {
+        "last_attempt_per_pass": {"consolidation": now - 60},
+        "failures_per_pass": {"consolidation": 3},
+        "last_failure_per_pass": {"consolidation": {"at": now - 60, "error": "boom"}},
+    }
+    status, reasons = derive_loop_status(still_failing, schedule=schedule, now=now)
+    assert status == "failing"
+    assert any("3x" in reason for reason in reasons)
+
+
 def test_healthy_pass_still_reads_ok():
     """The counterpart: no failures means the verdict is unchanged."""
     from minni.afm_writer import derive_loop_status
@@ -472,12 +548,47 @@ def test_dropped_writes_reach_the_status_verdict():
     assert any("REJECTED" in reason for reason in reasons)
 
 
+def test_an_old_drop_does_not_latch_backlogged_forever():
+    """Review round 2 (PR #260): writes_dropped is cumulative, so any drop —
+    ever — held the verdict at `backlogged` until daemon restart. A recent
+    drop is a live condition; an old one is history, kept visible as the
+    counter but no longer the status."""
+    from minni.afm_writer import WRITES_DROPPED_RECENT_SECONDS, derive_loop_status
+
+    now = 1_000_000.0
+    schedule = {"passes": {"consolidation": {"interval_seconds": 3600}}}
+    old_drop = {
+        "last_attempt_per_pass": {"consolidation": now - 60},
+        "writes_dropped": 3,
+        "last_drop_at": now - WRITES_DROPPED_RECENT_SECONDS - 60,
+    }
+    status, reasons = derive_loop_status(old_drop, schedule=schedule, now=now)
+    assert status == "ok", "a drained writer with a months-old drop is not backlogged NOW"
+    assert not any("REJECTED" in reason for reason in reasons)
+
+    recent_drop = {
+        "last_attempt_per_pass": {"consolidation": now - 60},
+        "writes_dropped": 3,
+        "last_drop_at": now - 60,
+    }
+    status, reasons = derive_loop_status(recent_drop, schedule=schedule, now=now)
+    assert status == "backlogged"
+    assert any("REJECTED" in reason for reason in reasons)
+
+
 def test_writer_status_exposes_the_fields_the_verdict_reads():
     """The state dict and the derivation must not drift apart again."""
     from minni.afm_writer import writer_status
 
     state = writer_status()
-    for key in ("queue_depth", "queue_max", "writes_dropped", "failures_per_pass"):
+    for key in (
+        "queue_depth",
+        "queue_max",
+        "writes_dropped",
+        "last_drop_at",
+        "failures_per_pass",
+        "last_failure_per_pass",
+    ):
         assert key in state, f"writer_status must report {key}"
 
 
@@ -556,6 +667,11 @@ def test_a_returned_failure_status_counts_as_a_failed_tick():
 
     assert compile_failure_status({"result": {"status": "afm_unavailable"}}) == "afm_unavailable"
     assert compile_failure_status({"result": {"status": "write_failed"}}) == "write_failed"
+    # Round 2 (PR #260): a hung writer does not raise — submit_drafts waits
+    # out its timeout and RETURNS write_timeout, which handle_daemon_compile
+    # merges into a non-exception response. Missing it here scheduled the next
+    # attempt a full interval later: the same AFM-8 hole, one status name over.
+    assert compile_failure_status({"result": {"status": "write_timeout"}}) == "write_timeout"
     # A successful compile must not be mistaken for a failure.
     assert compile_failure_status({"result": {"status": "ok", "summary": {}}}) is None
     assert compile_failure_status({"result": {"summary": {"examined": 3}}}) is None
@@ -647,6 +763,7 @@ def test_degrade_flags_are_thread_local_like_auth_suppression(tmp_path, monkeypa
     engine = _engine_without_model(tmp_path, monkeypatch)
     engine.last_rerank_degraded = "this thread's failure"
     engine.last_query_expand_degraded = "this thread's expand failure"
+    engine.last_vector_degraded = "this thread's vector failure"
 
     seen = {}
 
@@ -654,6 +771,7 @@ def test_degrade_flags_are_thread_local_like_auth_suppression(tmp_path, monkeypa
         # A concurrent request clearing its own flags, as retrieve() does on entry.
         engine.last_rerank_degraded = None
         engine.last_query_expand_degraded = None
+        engine.last_vector_degraded = None
         seen["other_reads"] = engine.last_rerank_degraded
 
     thread = threading.Thread(target=_other_thread)
@@ -666,6 +784,7 @@ def test_degrade_flags_are_thread_local_like_auth_suppression(tmp_path, monkeypa
         "flag — that reports a degraded search as healthy"
     )
     assert engine.last_query_expand_degraded == "this thread's expand failure"
+    assert engine.last_vector_degraded == "this thread's vector failure"
 
 
 def test_degrade_flags_work_on_instances_that_bypass_init():
