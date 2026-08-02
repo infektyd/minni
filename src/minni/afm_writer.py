@@ -309,9 +309,17 @@ def derive_loop_status(
         drop_at is None or now - float(drop_at) <= WRITES_DROPPED_RECENT_SECONDS
     )
     if dropped_recently:
+        # Round 4: name the recency, don't present the lifetime total as the
+        # size of the current incident — "900 REJECTED" over a single fresh
+        # drop reads as a live flood.
+        drop_seen = (
+            "recency unknown"
+            if drop_at is None
+            else f"most recent {int(now - float(drop_at))}s ago"
+        )
         reasons.append(
-            f"{dropped} write job(s) REJECTED because the queue was full — "
-            "those drafts were never written"
+            f"write job(s) REJECTED because the queue was full ({drop_seen}; "
+            f"{dropped} over the process lifetime) — those drafts were never written"
         )
     # Review round 3 on PR #260: a chronic write_timeout (writer alive but
     # outliving every caller's wait) left every other signal green — attempts
@@ -324,9 +332,15 @@ def derive_loop_status(
         timeout_at is None or now - float(timeout_at) <= WRITE_TIMEOUTS_RECENT_SECONDS
     )
     if timed_out_recently:
+        timeout_seen = (
+            "recency unknown"
+            if timeout_at is None
+            else f"most recent {int(now - float(timeout_at))}s ago"
+        )
         reasons.append(
-            f"{timeouts} write job(s) timed out waiting on the writer — "
-            "outcomes unobserved; the writer is not draining within the wait window"
+            f"write job(s) timed out waiting on the writer ({timeout_seen}; "
+            f"{timeouts} over the process lifetime) — outcomes unobserved; "
+            "the writer is not draining within the wait window"
         )
 
     # GA4-3: a pass failing on every tick used to reach this function looking

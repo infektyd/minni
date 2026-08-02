@@ -245,6 +245,31 @@ def test_documented_faiss_disk_backend_value_resolves_instead_of_crashing():
     assert resolve_backend("faiss-disk") == ["faiss-disk"]
 
 
+def test_unknown_backend_in_list_form_is_invalid_params_not_internal_error():
+    """Review round 4 (PR #260): R4(c) validated only the bare-string form.
+    The equally documented LIST form passed through unchecked, raised inside
+    retrieve(), and surfaced as -32000 — the same caller mistake answered
+    with two different codes ("nope" -> -32602, ["nope"] -> -32000). Fails
+    pre-round-4: resolve_backend returned the list unchanged."""
+    from minni.minnid_runtime.recall import resolve_backend
+
+    for bad in (["faiss-dsk"], ["faiss-disk", "nope"]):
+        with pytest.raises(ValueError) as excinfo:
+            resolve_backend(bad)
+        message = str(excinfo.value)
+        assert "faiss-disk" in message, "the error must name the valid values"
+
+    with pytest.raises(ValueError):
+        resolve_backend([])
+    # A wire value that is neither string nor list is a caller mistake too.
+    with pytest.raises(ValueError):
+        resolve_backend(42)
+
+    # The valid list form still resolves.
+    assert resolve_backend(["faiss-mem"]) == ["faiss-mem"]
+    assert resolve_backend(["faiss-disk", "faiss-mem"]) == ["faiss-disk", "faiss-mem"]
+
+
 # ── #226 R5: a per-engine rerank failure must be reported ────────────────────
 
 
@@ -606,6 +631,9 @@ def test_an_old_drop_does_not_latch_backlogged_forever():
     status, reasons = derive_loop_status(recent_drop, schedule=schedule, now=now)
     assert status == "backlogged"
     assert any("REJECTED" in reason for reason in reasons)
+    # Round 4: the reason must present the lifetime count AS a lifetime count,
+    # not as the size of the current incident.
+    assert any("lifetime" in reason for reason in reasons)
 
 
 def test_write_timeout_is_counted_and_stamped(monkeypatch):
@@ -643,6 +671,8 @@ def test_recent_write_timeouts_reach_the_status_verdict():
     status, reasons = derive_loop_status(recent, schedule=schedule, now=now)
     assert status == "backlogged"
     assert any("timed out" in reason for reason in reasons)
+    # Round 4: lifetime count labeled as lifetime, recency named explicitly.
+    assert any("lifetime" in reason for reason in reasons)
 
     old = {
         "last_attempt_per_pass": {"consolidation": now - 60},

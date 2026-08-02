@@ -201,9 +201,70 @@ test("P5: an eviction is reported, not silent — and coalesced, not budget-burn
   );
   const coalesce = source.indexOf("function reportSessionEvictions(");
   assert.ok(coalesce !== -1, "the coalescing reporter is missing");
-  const cWindow = source.slice(coalesce, coalesce + 900);
+  const cWindow = source.slice(coalesce, coalesce + 1800);
   assert.match(cWindow, /EVICTION_DIAGNOSTIC_INTERVAL_MS/);
   assert.match(cWindow, /reportBridgeFailure/, "coalesced evictions still reach the audit channel");
+  // Round 4: the coalesce state must not pretend a SUPPRESSED diagnostic was
+  // delivered. Clearing the counts is gated on the spawn actually happening,
+  // so a full in-flight cap (the failure storm this shares a budget with)
+  // carries the loss to the next free slot instead of zeroing it.
+  assert.match(
+    cWindow,
+    /const accepted = reportBridgeFailure/,
+    "the reporter must observe whether the diagnostic was accepted",
+  );
+  assert.match(
+    cWindow,
+    /if \(accepted\) \{/,
+    "counts may only be cleared when the diagnostic actually spawned",
+  );
+  // Round 4: per-label counts — a mixed pending+booted wave must not report
+  // the whole count under the last wave's label and bound.
+  assert.match(
+    cWindow,
+    /evictionsSinceReport\.get\(label\)/,
+    "eviction counts must be tracked per label, not as one scalar",
+  );
+});
+
+test("P6: a suppressed diagnostic reports itself as NOT delivered", async () => {
+  // reportBridgeFailure's boolean is what keeps the eviction coalescer honest;
+  // pin both verdict paths so a refactor cannot quietly make it void again.
+  const source = await readFile(
+    path.join(PLUGIN_ROOT, "kilo", "minni-plugin.js"),
+    "utf8",
+  );
+  const report = source.indexOf("function reportBridgeFailure");
+  const window = source.slice(report, report + 2400);
+  const suppress = window.indexOf("diagnosticsSuppressed += 1");
+  assert.ok(suppress !== -1);
+  assert.match(
+    window.slice(suppress, suppress + 300),
+    /return false;/,
+    "the suppressed path must say the diagnostic was NOT delivered",
+  );
+  assert.match(window, /return true;/, "the spawned path must say it was");
+});
+
+test("P5: queued context per session is bounded by volume, not only by session count", async () => {
+  // Round 4: PENDING_MAX bounds sessions; one session with a delayed delivery
+  // transform grew its context array without limit — and P5 correctly removed
+  // the accidental reset on premature session.deleted, so nothing else
+  // truncated it either.
+  const source = await readFile(
+    path.join(PLUGIN_ROOT, "kilo", "minni-plugin.js"),
+    "utf8",
+  );
+  assert.match(source, /const PENDING_CONTEXTS_PER_SESSION_MAX = \d+/);
+  const queue = source.indexOf("function queueContext(");
+  const window = source.slice(queue, queue + 900);
+  assert.match(window, /PENDING_CONTEXTS_PER_SESSION_MAX/);
+  assert.match(
+    window,
+    /reportSessionEvictions/,
+    "a dropped context chunk is lost memory injection and must be reported "
+      + "through the same eviction path as the maps",
+  );
 });
 
 // ── P6: bridge failures must reach the audit log ───────────────────────────
@@ -344,7 +405,7 @@ test("P5: pending and booted are bounded at insert, not only on session.deleted"
   const queue = source.indexOf("function queueContext(");
   assert.ok(queue !== -1);
   assert.match(
-    source.slice(queue, queue + 700),
+    source.slice(queue, queue + 1400),
     /evictOldest\(pending/,
     "pending must be bounded where it GROWS",
   );

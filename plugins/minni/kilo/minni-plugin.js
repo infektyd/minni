@@ -62,27 +62,47 @@ let diagnosticsSuppressed = 0;
 // failure path going dark to pay for bound maintenance. Coalesce: at most one
 // session-evict diagnostic per interval, carrying the count it stands for.
 const EVICTION_DIAGNOSTIC_INTERVAL_MS = 60_000;
-let evictionsSinceReport = 0;
+// Per-LABEL pending counts (review round 4): a single scalar let a mixed wave
+// (pending then booted) report the whole count under the LAST wave's label and
+// bound, sending an operator to remediate the wrong map.
+const evictionsSinceReport = new Map();
 let lastEvictionReportAt = 0;
 
 function reportSessionEvictions(label, max, evicted) {
-  evictionsSinceReport += evicted;
+  const entry = evictionsSinceReport.get(label) || { count: 0, max };
+  entry.count += evicted;
+  entry.max = max;
+  evictionsSinceReport.set(label, entry);
   const now = Date.now();
   if (now - lastEvictionReportAt < EVICTION_DIAGNOSTIC_INTERVAL_MS) {
     // Still visible per wave — just no spawn.
     console.warn(
       `[minni] evicted ${evicted} ${label} entr(y|ies) (bound ${max}); ` +
-        `${evictionsSinceReport} since last diagnostic`,
+        `${entry.count} pending for the next diagnostic`,
     );
     return;
   }
-  lastEvictionReportAt = now;
-  const count = evictionsSinceReport;
-  evictionsSinceReport = 0;
-  reportBridgeFailure(
+  const detail = [...evictionsSinceReport.entries()]
+    .map(([name, info]) => `${info.count} ${name} entr(y|ies) (bound ${info.max})`)
+    .join("; ");
+  const accepted = reportBridgeFailure(
     "session-evict",
-    new Error(`evicted ${count} ${label} entr(y|ies) for old sessions (bound ${max})`),
+    new Error(`evicted for old sessions: ${detail}`),
   );
+  // Review round 4: only advance the window and clear the counts when the
+  // diagnostic actually spawned. The in-flight cap being full is exactly the
+  // failure storm this shares a budget with — zeroing the count on a
+  // suppressed spawn silently discarded the loss while the coalesce state
+  // pretended it was reported. Kept counts ride to the next free slot.
+  if (accepted) {
+    lastEvictionReportAt = now;
+    evictionsSinceReport.clear();
+  } else {
+    console.warn(
+      `[minni] session-evict diagnostic suppressed (budget full); ` +
+        `carrying forward: ${detail}`,
+    );
+  }
 }
 
 function evictOldest(collection, max, label) {
@@ -144,6 +164,10 @@ function runHook(event, payload) {
 // fire-and-forget BridgeFailure event. Deliberately not awaited and fully
 // fail-silent: this runs on the failure path, and a second failure here must
 // not turn a degraded bridge into a broken session.
+// Returns true when a diagnostic child was actually spawned, false when the
+// in-flight cap (or a spawn error) suppressed it — callers coalescing their
+// own reports (reportSessionEvictions) must not treat a suppressed diagnostic
+// as delivered (review round 4).
 function reportBridgeFailure(event, error) {
   const detail = error instanceof Error ? error.message : String(error);
   console.warn(`[minni] ${event} hook unavailable; continuing: ${detail}`);
@@ -158,7 +182,7 @@ function reportBridgeFailure(event, error) {
       `[minni] bridge diagnostic suppressed (${diagnosticsInFlight} in flight, ` +
         `${diagnosticsSuppressed} suppressed since start)`,
     );
-    return;
+    return false;
   }
   try {
     const child = spawn("node", [HOOK_SCRIPT, "BridgeFailure"], {
@@ -192,8 +216,10 @@ function reportBridgeFailure(event, error) {
         error: detail.slice(0, 400),
       }),
     );
+    return true;
   } catch {
     // The console line above is the last resort; never throw from here.
+    return false;
   }
 }
 
@@ -206,11 +232,32 @@ async function runHookFailOpen(event, payload) {
   }
 }
 
+// Review round 4 (PR #260): PENDING_MAX bounds the number of SESSIONS, not
+// the volume queued per session — one live session whose delivery transform
+// is delayed or missing grew its context array without limit (and P5
+// correctly removed the accidental reset on premature session.deleted). A
+// bounded map that still grows without bound through its values is the same
+// silent-bound defect one box smaller.
+const PENDING_CONTEXTS_PER_SESSION_MAX = 8;
+
 function queueContext(sessionID, result) {
   const context = hookContext(result);
   if (!context) return;
   const contexts = pending.get(sessionID) || [];
   contexts.push(context);
+  let overflow = 0;
+  while (contexts.length > PENDING_CONTEXTS_PER_SESSION_MAX) {
+    // Oldest first, reported through the same eviction path as the maps.
+    contexts.shift();
+    overflow += 1;
+  }
+  if (overflow) {
+    reportSessionEvictions(
+      "queued-context (per-session)",
+      PENDING_CONTEXTS_PER_SESSION_MAX,
+      overflow,
+    );
+  }
   // Re-inserting moves it to the end, so the eviction below is LRU-ish —
   // same shape as lastPrompt.
   pending.delete(sessionID);

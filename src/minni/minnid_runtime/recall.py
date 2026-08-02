@@ -134,7 +134,41 @@ def resolve_backend(backend_param, config=None):
                 f"{sorted(known)} (or \"auto\")"
             )
         return [backend_param]
-    return backend_param
+    if isinstance(backend_param, (list, tuple)):
+        # Review round 4 on PR #260: R4(c) validated only the bare-string
+        # form. The equally documented LIST form passed through unchecked,
+        # so its unknown names raised inside retrieve() and surfaced as a
+        # -32000 internal error — the same caller mistake answered with two
+        # different codes ("nope" -> -32602, ["nope"] -> -32000). Mirror the
+        # engine's member/size checks here so both shapes hit the handler's
+        # -32602 branch; retrieve() still dedups and re-validates.
+        from minni.retrieval import RetrievalEngine
+
+        known = RetrievalEngine._KNOWN_BACKENDS
+        names = [str(item) for item in backend_param]
+        if not names:
+            raise ValueError(
+                f"backend list must not be empty; valid values: "
+                f"{sorted(known)} (or \"auto\")"
+            )
+        unknown = sorted({name for name in names if name not in known})
+        if unknown:
+            raise ValueError(
+                f"unknown backend(s) {unknown}; valid values: "
+                f"{sorted(known)} (or \"auto\")"
+            )
+        deduped_count = len(dict.fromkeys(names))
+        if deduped_count > RetrievalEngine._MAX_BACKENDS:
+            raise ValueError(
+                f"too many backends ({deduped_count}); "
+                f"max {RetrievalEngine._MAX_BACKENDS}"
+            )
+        return names
+    # Anything else on the wire (number, object, bool) is a caller mistake,
+    # not a server fault — same -32602 contract as an unknown name.
+    raise ValueError(
+        'backend must be "auto", a backend name, or a list of backend names'
+    )
 
 
 def _degradation_for(retrieval_engine: Any, src: str) -> dict:
