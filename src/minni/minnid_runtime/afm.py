@@ -537,8 +537,18 @@ def handle_daemon_compile(params: dict, request_id: Any, context: AFMContext) ->
             # Ownership transfers to the worker via defer_lifecycle_to_worker
             # so a late success applies once without a full re-run minting
             # duplicate drafts.
+            #
+            # Round 16: lifecycle_recovered means the writer re-applied a
+            # *prior* deferred decision set and deliberately did NOT enqueue
+            # THIS batch's drafts (AFM-8 anti-duplicate). Applying the NEW
+            # result's promote/dedup/review ids here would terminalize a
+            # decision set whose review drafts were never written.
             write_status = write_result.get("status")
-            write_refused = write_status in {"write_in_flight", "write_timeout"}
+            write_refused = write_status in {
+                "write_in_flight",
+                "write_timeout",
+                "lifecycle_recovered",
+            }
         else:
             result.setdefault("drafts_written", [])
 

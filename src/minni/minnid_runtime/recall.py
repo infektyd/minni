@@ -410,15 +410,53 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
             return retrieve_shared()
 
         def retrieve_combined() -> list:
+            # Round 16: mirror personal-leg hardening — one agent vault throw
+            # must not JSON-RPC −32000 the whole combined search. Per-engine
+            # try/except, degradation entry, continue with partial hits.
             result_sets = []
-            for vault_engine, _source_agent, _source_db_path in context.all_vault_retrievals():
-                result_sets.append(
-                    retrieve_from(
-                        vault_engine,
-                        src="c",
-                        principal_for_documents=principal,
+            for vault_engine, source_agent, _source_db_path in context.all_vault_retrievals():
+                try:
+                    result_sets.append(
+                        retrieve_from(
+                            vault_engine,
+                            src="c",
+                            principal_for_documents=principal,
+                        )
                     )
-                )
+                except Exception as exc:
+                    detail = (
+                        f"combined vault index failed"
+                        f"{f' ({source_agent})' if source_agent else ''}: {exc}"
+                    )[:400]
+                    context.logger.warning(
+                        "search: combined vault index failed for %s (%s); continuing with partial results",
+                        source_agent,
+                        exc,
+                    )
+                    emb_model = None
+                    try:
+                        emb_model = getattr(
+                            vault_engine.config, "embedding_model", None
+                        )
+                    except Exception:
+                        emb_model = None
+                    if emb_model is None:
+                        emb_model = getattr(
+                            getattr(context, "default_config", None),
+                            "embedding_model",
+                            None,
+                        )
+                    degradations.append(
+                        {
+                            "src": "c",
+                            "vector_model": emb_model,
+                            "vector_degraded": False,
+                            "degraded": True,
+                            "combined_index_failed": detail,
+                            "reason": detail,
+                            "source_agent": source_agent,
+                        }
+                    )
             result_sets.append(retrieve_shared())
             return merge_document_results(result_sets, limit)
 

@@ -140,14 +140,21 @@ function createStormReporter({ hookScript, logPath }) {
     }
   }
 
-  function reportBridgeFailure(event, error) {
+  function reportBridgeFailure(event, error, onUndelivered) {
     const detail = error instanceof Error ? error.message : String(error);
     if (diagnosticsInFlight >= DIAGNOSTIC_MAX_IN_FLIGHT) {
       diagnosticsSuppressed += 1;
       queueSuppressedFailure(event, detail);
       return false;
     }
-    const accepted = spawnBridgeDiagnostic(event, detail);
+    // Round 16: undelivered without caller onUndelivered still queues (P6).
+    const accepted = spawnBridgeDiagnostic(event, detail, () => {
+      if (onUndelivered) onUndelivered();
+      else {
+        diagnosticsSuppressed += 1;
+        queueSuppressedFailure(event, detail);
+      }
+    });
     // Round 13: sync spawn failure must queue, not console-only.
     if (!accepted) {
       diagnosticsSuppressed += 1;
@@ -364,6 +371,92 @@ test("P6 behavioral: undelivered restore re-spawns on free slot (ordering pin)",
     assert.match(log, /coalesced bridge failures|suppressed_since_last_report/);
     // Med: zero diagnosticsSuppressed only after confirmed delivery (exit 0).
     assert.equal(final.diagnosticsSuppressed, 0);
+  } finally {
+    delete process.env.MINNI_STORM_FAIL_COUNTER;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("P6 behavioral: ordinary hook undelivered queues suppress map and re-spawns", async () => {
+  // Round 16 High: runHookFailOpen calls reportBridgeFailure without
+  // onUndelivered. Spawn accepted + child exit ≠ 0 must still land in the
+  // suppress map so a free slot re-spawns the audit (not console-only).
+  const root = await mkdtemp(path.join(tmpdir(), "minni-storm-hook-undel-"));
+  const logPath = path.join(root, "bridge-audit.jsonl");
+  const hookScript = path.join(root, "fake-hook.mjs");
+  const failCounter = path.join(root, "fail-left");
+  // First diagnostic child dies; subsequent children deliver.
+  await writeFile(failCounter, "1", "utf8");
+  await writeFile(
+    hookScript,
+    [
+      "import { appendFileSync, readFileSync, writeFileSync, existsSync } from 'node:fs';",
+      "const chunks = [];",
+      "for await (const c of process.stdin) chunks.push(c);",
+      "const body = Buffer.concat(chunks).toString('utf8');",
+      "const counter = process.env.MINNI_STORM_FAIL_COUNTER;",
+      "if (counter && existsSync(counter)) {",
+      "  const left = Number(readFileSync(counter, 'utf8') || '0');",
+      "  if (left > 0) {",
+      "    writeFileSync(counter, String(left - 1));",
+      "    process.exit(1);",
+      "  }",
+      "}",
+      "await new Promise((r) => setTimeout(r, 30));",
+      "appendFileSync(process.env.MINNI_STORM_LOG, body + '\\n');",
+      "process.exit(0);",
+    ].join("\n"),
+    "utf8",
+  );
+
+  process.env.MINNI_STORM_FAIL_COUNTER = failCounter;
+  try {
+    const reporter = createStormReporter({ hookScript, logPath });
+
+    // Single ordinary failure (no onUndelivered) — spawn accepted, then dies.
+    assert.equal(
+      reporter.reportBridgeFailure("Stop", new Error("hook timed out")),
+      true,
+      "first failure must take a budget slot",
+    );
+
+    // Wait until the undelivered path has queued (or drain finishes).
+    const start = Date.now();
+    let mid;
+    while (Date.now() - start < 5_000) {
+      mid = reporter.getState();
+      if (mid.pending.has("Stop") || mid.pending.size > 0 || mid.delivered.length > 0) {
+        break;
+      }
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    // After exit ≠ 0 without onUndelivered, suppress map must carry the event
+    // (or it already re-spawned and delivered — either proves the queue path).
+    mid = reporter.getState();
+    const queuedOrDelivered =
+      (mid.pending.get("Stop")?.count ?? 0) >= 1 ||
+      mid.delivered.some((p) => p.failed_event === "Stop" || p.failed_event === "bridge-storm");
+    assert.ok(
+      queuedOrDelivered || mid.diagnosticsSuppressed >= 1,
+      `undelivered ordinary hook must queue suppress map, got state=${JSON.stringify({
+        pending: Object.fromEntries(mid.pending),
+        suppressed: mid.diagnosticsSuppressed,
+        delivered: mid.delivered.length,
+        inFlight: mid.diagnosticsInFlight,
+      })}`,
+    );
+
+    await reporter.waitForIdle(10_000);
+
+    const final = reporter.getState();
+    assert.equal(final.pending.size, 0, "suppress queue must drain after re-spawn");
+    assert.equal(final.diagnosticsInFlight, 0);
+    assert.ok(
+      final.delivered.length >= 1,
+      `free-slot re-spawn must deliver at least one audit, got ${final.delivered.length}`,
+    );
+    const log = await readFile(logPath, "utf8");
+    assert.match(log, /Stop|hook timed out|coalesced bridge failures/);
   } finally {
     delete process.env.MINNI_STORM_FAIL_COUNTER;
     await rm(root, { recursive: true, force: true });

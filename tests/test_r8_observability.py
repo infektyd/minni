@@ -858,6 +858,30 @@ def test_write_timeout_does_not_apply_lifecycle_mutations(monkeypatch, tmp_path)
     )
 
 
+def test_lifecycle_recovered_does_not_apply_outer_lifecycle_mutations(
+    monkeypatch, tmp_path
+):
+    """Round 16: lifecycle_recovered re-applies a PRIOR deferred decision set
+    inside the writer and deliberately does not enqueue THIS batch's drafts.
+    The outer compile gate must not apply the NEW result's promote/dedup/
+    review ids (AFM-8 class: terminal candidates with no review drafts)."""
+    captured, applied = _compile_consolidation_with_write_status(
+        monkeypatch,
+        tmp_path,
+        {
+            "status": "lifecycle_recovered",
+            "drafts_written": [],
+            "drafts_deferred": 1,
+            "lifecycle_recovered": True,
+        },
+    )
+    assert captured["status"] == "lifecycle_recovered"
+    assert applied["called"] is False, (
+        "outer apply must not run on a NEW decision set when the writer only "
+        "recovered a prior lifecycle and never wrote this batch's drafts"
+    )
+
+
 def test_a_late_write_failure_is_counted_even_with_no_waiter(monkeypatch):
     """Round 8: a batch failing AFTER its submitter timed out had no observer
     at all — no DraftWriteError (waiter gone), no pass failure, no counter.
@@ -1049,6 +1073,91 @@ def test_personal_vault_index_failure_is_in_degradation():
         or personal_entries[0].get("reason")
         or ""
     ).lower() or "corrupt" in str(personal_entries[0]).lower()
+
+
+def test_combined_vault_index_failure_returns_partial_and_degraded():
+    """Round 16: one agent vault throw in retrieve_combined hard-failed the
+    whole search with JSON-RPC −32000. Mirror personal: per-engine try/except,
+    degradation entry, continue — response returns, degraded true, other hits
+    present."""
+    from types import SimpleNamespace
+
+    from minni.minnid_runtime import recall as recall_mod
+
+    captured = {}
+
+    class _Shared:
+        config = SimpleNamespace(embedding_model="m")
+        last_vector_degraded = None
+        last_rerank_degraded = None
+        last_query_expand_degraded = None
+        last_auth_suppression = None
+
+        def retrieve(self, **kwargs):
+            return [{"doc_id": 1, "path": "wiki/shared.md"}]
+
+    class _HealthyVault:
+        config = SimpleNamespace(embedding_model="m")
+        last_vector_degraded = None
+        last_rerank_degraded = None
+        last_query_expand_degraded = None
+        last_auth_suppression = None
+
+        def retrieve(self, **kwargs):
+            return [{"doc_id": 2, "path": "wiki/agent-b.md"}]
+
+    class _BoomVault:
+        config = SimpleNamespace(embedding_model="m")
+
+        def retrieve(self, **kwargs):
+            raise RuntimeError("agent-a index corrupt")
+
+    shared = _Shared()
+    boom = _BoomVault()
+    healthy = _HealthyVault()
+    context = _make_context(shared, captured)
+    principal = SimpleNamespace(agent_id="agent-a", workspace_id="default")
+    object.__setattr__(
+        context,
+        "handler_principal",
+        lambda params, request_id: (principal, None),
+    )
+    object.__setattr__(
+        context,
+        "all_vault_retrievals",
+        lambda: [
+            (boom, "agent-a", "/tmp/a.db"),
+            (healthy, "agent-b", "/tmp/b.db"),
+        ],
+    )
+    recall_mod.handle_search(
+        {"query": "anything", "scope": "combined"},
+        request_id=1,
+        context=context,
+    )
+    assert "error" not in captured, (
+        f"one vault throw must not hard-fail combined search: {captured.get('error')!r}"
+    )
+    payload = captured["response"]
+    assert payload["count"] >= 1, "healthy vault + shared must still return hits"
+    paths = {r.get("path") for r in payload.get("results") or []}
+    assert "wiki/agent-b.md" in paths or "wiki/shared.md" in paths, (
+        f"expected partial hits from non-failing engines, got {paths!r}"
+    )
+    assert payload["degraded"] is True, (
+        "a combined leg failure must not look like a healthy hybrid search"
+    )
+    combined_entries = [
+        d
+        for d in payload.get("degradation") or []
+        if d.get("combined_index_failed")
+        or "combined vault" in str(d.get("reason") or "").lower()
+        or d.get("source_agent") == "agent-a"
+    ]
+    assert combined_entries, (
+        f"expected combined degradation entry, got {payload.get('degradation')!r}"
+    )
+    assert combined_entries[0].get("degraded") is True
 
 
 def test_write_timeout_then_worker_success_applies_lifecycle_once(monkeypatch):

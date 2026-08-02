@@ -265,13 +265,21 @@ test("P6: a suppressed diagnostic reports itself as NOT delivered", async () => 
     "utf8",
   );
   const report = source.indexOf("function reportBridgeFailure");
-  const reportWindow = source.slice(report, report + 1200);
+  // Round 16: reportBridgeFailure grew (undelivered queue for ordinary hooks).
+  const reportWindow = source.slice(report, report + 1800);
   const suppress = reportWindow.indexOf("diagnosticsSuppressed += 1");
   assert.ok(suppress !== -1);
   assert.match(
     reportWindow.slice(suppress, suppress + 400),
     /return false;/,
     "the suppressed path must say the diagnostic was NOT delivered",
+  );
+  // Round 16: accepted-but-undelivered without onUndelivered must still queue
+  // (runHookFailOpen path) — not console-only P6 for ordinary hook failures.
+  assert.match(
+    reportWindow,
+    /if \(onUndelivered\) onUndelivered\(\);\s*else \{[\s\S]*queueSuppressedFailure/,
+    "ordinary undelivered diagnostics must queue for free-slot re-spawn",
   );
   const spawn = source.indexOf("function spawnBridgeDiagnostic");
   assert.ok(spawn !== -1, "spawn path must live in spawnBridgeDiagnostic");

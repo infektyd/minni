@@ -361,7 +361,18 @@ function reportBridgeFailure(event, error, onUndelivered) {
     );
     return false;
   }
-  const accepted = spawnBridgeDiagnostic(event, detail, onUndelivered);
+  // Round 16: undelivered after an *accepted* spawn used to be a no-op when
+  // the caller omitted onUndelivered (runHookFailOpen). Budget-full and sync
+  // spawn-fail already queue; session-evict passes its own restore. Ordinary
+  // hook failures that spawn then die (exit ≠ 0 / error) re-opened P6 —
+  // console.warn only, no suppress map, no free-slot re-spawn.
+  const accepted = spawnBridgeDiagnostic(event, detail, () => {
+    if (onUndelivered) onUndelivered();
+    else {
+      diagnosticsSuppressed += 1;
+      queueSuppressedFailure(event, detail);
+    }
+  });
   // Round 13: sync spawn failure (EMFILE, bad hook path) used to die at
   // console.warn only — same P6 hole as budget-full, without the coalesce.
   if (!accepted) {
