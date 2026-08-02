@@ -1471,10 +1471,22 @@ async function runBridgeFailureDiagnostic(
 ): Promise<void> {
   const failedEvent = asString(payload.failed_event) || "(unknown)";
   const bridge = asString(payload.bridge) || "(unknown)";
+  // Round 9 (PR #260): storm suppress carries counts forward and flushes on
+  // settle — name the dark interval so the audit row is not a silent single.
+  const suppressed = payload.suppressed_since_last_report;
+  const coalesced = payload.coalesced_count;
+  const extras: string[] = [];
+  if (typeof coalesced === "number" && coalesced > 1) {
+    extras.push(`coalesced=${coalesced}`);
+  }
+  if (typeof suppressed === "number" && suppressed > 0) {
+    extras.push(`suppressed_since_last_report=${suppressed}`);
+  }
+  const suffix = extras.length ? ` [${extras.join(", ")}]` : "";
   try {
     await recordAudit(config.vaultPath, {
       tool: `${config.auditPrefix}_bridge_failure`,
-      summary: `${bridge} bridge: ${failedEvent} failed: ${asString(payload.error)}`,
+      summary: `${bridge} bridge: ${failedEvent} failed: ${asString(payload.error)}${suffix}`,
       // Bucket per failed event, for the same reason _intent_dropped does:
       // one throttle across all of them would hide every failure after the
       // first and report the bridge as healthier than it is.

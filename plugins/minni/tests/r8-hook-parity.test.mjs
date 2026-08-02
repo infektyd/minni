@@ -261,26 +261,31 @@ test("P5: an eviction is reported, not silent — and coalesced, not budget-burn
 test("P6: a suppressed diagnostic reports itself as NOT delivered", async () => {
   // reportBridgeFailure's boolean is what keeps the eviction coalescer honest;
   // pin both verdict paths so a refactor cannot quietly make it void again.
+  // Round 9: the spawn body lives in spawnBridgeDiagnostic; suppress stays
+  // on reportBridgeFailure and returns false after queueing.
   const source = await readFile(
     path.join(PLUGIN_ROOT, "kilo", "minni-plugin.js"),
     "utf8",
   );
   const report = source.indexOf("function reportBridgeFailure");
-  const window = source.slice(report, report + 2400);
-  const suppress = window.indexOf("diagnosticsSuppressed += 1");
+  const reportWindow = source.slice(report, report + 1200);
+  const suppress = reportWindow.indexOf("diagnosticsSuppressed += 1");
   assert.ok(suppress !== -1);
   assert.match(
-    window.slice(suppress, suppress + 300),
+    reportWindow.slice(suppress, suppress + 400),
     /return false;/,
     "the suppressed path must say the diagnostic was NOT delivered",
   );
-  assert.match(window, /return true;/, "the spawned path must say it was spawned");
+  const spawn = source.indexOf("function spawnBridgeDiagnostic");
+  assert.ok(spawn !== -1, "spawn path must live in spawnBridgeDiagnostic");
+  const spawnWindow = source.slice(spawn, spawn + 2800);
+  assert.match(spawnWindow, /return true;/, "the spawned path must say it was spawned");
   // Round 5: spawned is still not DELIVERED — a child that errors or exits
   // non-zero before writing the audit must tell the caller, so coalesced
   // counts can be restored instead of vanishing with only a console line.
-  assert.match(window, /onUndelivered/, "delivery failure must be observable");
+  assert.match(spawnWindow, /onUndelivered/, "delivery failure must be observable");
   assert.match(
-    window,
+    spawnWindow,
     /if \(code !== 0\) undelivered\(\)/,
     "a non-zero exit is a failed audit write",
   );
@@ -560,8 +565,11 @@ test("P6: the bridge diagnostic is killed on a timer and capped in flight", asyn
   assert.match(source, /const DIAGNOSTIC_TIMEOUT_MS = [\d_]+/);
   assert.match(source, /const DIAGNOSTIC_MAX_IN_FLIGHT = \d+/);
 
-  const report = source.indexOf("function reportBridgeFailure");
-  const window = source.slice(report, report + 2400);
+  // Round 9: timer / settle live on spawnBridgeDiagnostic (reportBridgeFailure
+  // is the suppress/coalesce gate that calls it).
+  const spawn = source.indexOf("function spawnBridgeDiagnostic");
+  assert.ok(spawn !== -1);
+  const window = source.slice(spawn, spawn + 2800);
   assert.match(window, /setTimeout\(/, "the diagnostic child needs a kill timer");
   assert.match(window, /child\.unref\(\)/);
   assert.match(window, /diagnosticsInFlight/);
@@ -572,6 +580,34 @@ test("P6: the bridge diagnostic is killed on a timer and capped in flight", asyn
     window,
     /if \(settled\) return;/,
     "settle must be idempotent — error+close both firing must not double-decrement",
+  );
+});
+
+test("P6: storm suppress coalesces real failures and flushes on settle", async () => {
+  // Round 9: under a full DIAGNOSTIC_MAX_IN_FLIGHT budget, further hook
+  // failures used to console.warn only — the original P6 defect reintroduced
+  // for the high-load path. Suppress must carry counts forward; settle must
+  // flush; the audit payload names the dark interval.
+  const source = await readFile(
+    path.join(PLUGIN_ROOT, "kilo", "minni-plugin.js"),
+    "utf8",
+  );
+  assert.match(source, /pendingSuppressedFailures/);
+  assert.match(source, /function queueSuppressedFailure/);
+  assert.match(source, /function flushPendingSuppressedFailures/);
+  assert.match(
+    source,
+    /flushPendingSuppressedFailures\(\)/,
+    "settle must attempt a flush when a diagnostic slot frees",
+  );
+  assert.match(source, /suppressed_since_last_report/);
+  assert.match(source, /coalesced_count/);
+  // session-evict already has its own carry-forward; do not double-queue it.
+  const queue = source.indexOf("function queueSuppressedFailure");
+  assert.match(
+    source.slice(queue, queue + 400),
+    /session-evict/,
+    "session-evict must not be double-queued into the suppress map",
   );
 });
 

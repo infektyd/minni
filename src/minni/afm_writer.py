@@ -85,6 +85,13 @@ WRITE_TIMEOUTS_RECENT_SECONDS = 3600.0
 _WRITE_FAILURES = 0
 _LAST_WRITE_FAILURE_AT: Optional[float] = None
 WRITE_FAILURES_RECENT_SECONDS = 3600.0
+# Review round 9 (PR #260): a write that fails AFTER submit_drafts already
+# returned write_timeout has no waiter and no lifecycle rollback. The recency-
+# windowed _WRITE_FAILURES counter ages into "ok" while the drafts are gone
+# forever. A non-aging residue keeps the status surface out of ok until the
+# process is reset (or an operator clears counters) — permanent damage must
+# not wear a temporary badge.
+_UNRECOVERED_WRITE_FAILURES = 0
 # Review round 5 on PR #260: at most ONE queued job per pass. A write_timeout
 # response means the job is STILL queued and will land when the writer drains
 # — but the loop's failure backoff re-fired the pass while it waited, and each
@@ -170,9 +177,10 @@ def reset_pass_counters() -> None:
     _LAST_DROP_AT = None
     _WRITE_TIMEOUTS = 0
     _LAST_WRITE_TIMEOUT_AT = None
-    global _WRITE_FAILURES, _LAST_WRITE_FAILURE_AT
+    global _WRITE_FAILURES, _LAST_WRITE_FAILURE_AT, _UNRECOVERED_WRITE_FAILURES
     _WRITE_FAILURES = 0
     _LAST_WRITE_FAILURE_AT = None
+    _UNRECOVERED_WRITE_FAILURES = 0
     with _IN_FLIGHT_LOCK:
         _IN_FLIGHT_PER_PASS.clear()
 
@@ -385,6 +393,14 @@ def derive_loop_status(
             f"write job(s) FAILED in the writer ({wfail_seen}; {wfails} over "
             "the process lifetime) — those drafts were never written"
         )
+    # Round 9: non-aging residue of write failures. Recency-windowed counts
+    # alone let permanent draft loss age into "ok"; this does not.
+    unrecovered = int(state.get("unrecovered_write_failures", 0) or 0)
+    if unrecovered:
+        reasons.append(
+            f"{unrecovered} unrecovered write failure(s) — drafts never "
+            "landed; status stays out of ok until counters are reset"
+        )
     # Round 6 (PR #260): a job in flight NOW is current truth — no recency
     # window. Neither of the other writer signals covers a hung mid-job write:
     # queue_depth is 0 once the worker dequeues, and the timeout stamp ages
@@ -435,6 +451,7 @@ def derive_loop_status(
         or dropped_recently
         or timed_out_recently
         or write_failed_recently
+        or unrecovered
         or jobs_in_flight
         or (oldest_ts is not None and (now - oldest_ts) / 86400.0 > ttl_days)
     ):
@@ -765,10 +782,13 @@ def _process_job(job: dict, done: threading.Event, out: dict) -> None:
         # records a pass failure, and the drafts silently never land. A waiter
         # that is still present raises too, but that is a different metric
         # for the same event, not double-counting this one.
-        global _WRITE_FAILURES, _LAST_WRITE_FAILURE_AT
+        # Round 9: also stamp a non-aging unrecovered counter so the status
+        # surface cannot return to ok while those drafts are permanently gone.
+        global _WRITE_FAILURES, _LAST_WRITE_FAILURE_AT, _UNRECOVERED_WRITE_FAILURES
         with _IN_FLIGHT_LOCK:
             _WRITE_FAILURES += 1
             _LAST_WRITE_FAILURE_AT = time.time()
+            _UNRECOVERED_WRITE_FAILURES += 1
         logger.error(
             "AFM writer: batch for pass %r FAILED (%d draft(s) not written): %s",
             job.get("pass_name"), len(job.get("drafts") or []), exc,
@@ -970,6 +990,7 @@ def writer_status(
         "last_write_timeout_at": _LAST_WRITE_TIMEOUT_AT,
         "write_failures": _WRITE_FAILURES,
         "last_write_failure_at": _LAST_WRITE_FAILURE_AT,
+        "unrecovered_write_failures": _UNRECOVERED_WRITE_FAILURES,
         "failures_per_pass": dict(_FAILURES_PER_PASS),
         "last_failure_per_pass": dict(_LAST_FAILURE_PER_PASS),
     }

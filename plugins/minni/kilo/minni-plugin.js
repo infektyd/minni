@@ -55,6 +55,13 @@ const DIAGNOSTIC_TIMEOUT_MS = 5_000;
 const DIAGNOSTIC_MAX_IN_FLIGHT = 4;
 let diagnosticsInFlight = 0;
 let diagnosticsSuppressed = 0;
+// Review round 9 (PR #260): real hook failures suppressed by the in-flight
+// cap used to die at console.warn — the original P6 defect, reintroduced for
+// the high-load path the budget exists for. Coalesce per failed_event (same
+// shape as session-evict), and flush when a diagnostic child settles and frees
+// a slot. session-evict keeps its own carry-forward when suppressed; this map
+// is for every other failed_event that reportBridgeFailure swallows.
+const pendingSuppressedFailures = new Map();
 // Review round 3 (PR #260): evictions must not exhaust the diagnostic budget
 // real hook failures need. Under session churn one insert can evict a whole
 // wave, and a spawn per eviction eats the DIAGNOSTIC_MAX_IN_FLIGHT slots in
@@ -190,22 +197,61 @@ function runHook(event, payload) {
 // Spawned is NOT delivered (round 5): the child is fire-and-forget, so a
 // caller that needs to know its audit never landed passes `onUndelivered`,
 // invoked once if the child errors or exits non-zero before writing.
-function reportBridgeFailure(event, error, onUndelivered) {
-  const detail = error instanceof Error ? error.message : String(error);
-  console.warn(`[minni] ${event} hook unavailable; continuing: ${detail}`);
-  // Bounded on BOTH axes. This runs on the failure path, where failures arrive
-  // in storms: without a concurrency cap a burst of hook timeouts spawns a
-  // diagnostic per failure, and without a kill timer each one can hang exactly
-  // the way the call it is reporting hung. Either way the degraded bridge
-  // becomes a pile of stuck node processes.
-  if (diagnosticsInFlight >= DIAGNOSTIC_MAX_IN_FLIGHT) {
-    diagnosticsSuppressed += 1;
-    console.warn(
-      `[minni] bridge diagnostic suppressed (${diagnosticsInFlight} in flight, ` +
-        `${diagnosticsSuppressed} suppressed since start)`,
-    );
-    return false;
+//
+// Review round 9: when the in-flight cap suppresses a spawn, the loss is
+// coalesced (per failed_event) and flushed when a child settles — not
+// console-only forever. session-evict already carries its own counts on
+// suppress; every other caller rides this path.
+function queueSuppressedFailure(event, detail) {
+  // session-evict owns its carry-forward in evictionsSinceReport; re-queueing
+  // it here would double-report once a slot frees.
+  if (event === "session-evict") return;
+  const entry = pendingSuppressedFailures.get(event) || { count: 0, lastError: "" };
+  entry.count += 1;
+  entry.lastError = detail;
+  pendingSuppressedFailures.set(event, entry);
+}
+
+function restoreSuppressedFailures(flushed) {
+  for (const [name, info] of flushed) {
+    const cur = pendingSuppressedFailures.get(name) || { count: 0, lastError: "" };
+    cur.count += info.count;
+    cur.lastError = info.lastError || cur.lastError;
+    pendingSuppressedFailures.set(name, cur);
   }
+}
+
+function flushPendingSuppressedFailures() {
+  if (pendingSuppressedFailures.size === 0) return false;
+  if (diagnosticsInFlight >= DIAGNOSTIC_MAX_IN_FLIGHT) return false;
+  const flushed = [...pendingSuppressedFailures.entries()];
+  const totalCount = flushed.reduce((sum, [, info]) => sum + info.count, 0);
+  const detail = flushed
+    .map(([name, info]) => `${info.count}x ${name}: ${info.lastError}`)
+    .join("; ");
+  const suppressedAtFlush = diagnosticsSuppressed;
+  const failedEvent = flushed.length === 1 ? flushed[0][0] : "bridge-storm";
+  // Snapshot then clear; restore if the spawn is suppressed or undelivered.
+  pendingSuppressedFailures.clear();
+  const accepted = spawnBridgeDiagnostic(
+    failedEvent,
+    `coalesced bridge failures: ${detail}`,
+    () => restoreSuppressedFailures(flushed),
+    {
+      coalesced_count: totalCount,
+      suppressed_since_last_report: suppressedAtFlush,
+    },
+  );
+  if (accepted) {
+    diagnosticsSuppressed = 0;
+    return true;
+  }
+  restoreSuppressedFailures(flushed);
+  return false;
+}
+
+function spawnBridgeDiagnostic(event, detail, onUndelivered, extras = {}) {
+  if (diagnosticsInFlight >= DIAGNOSTIC_MAX_IN_FLIGHT) return false;
   try {
     const child = spawn("node", [HOOK_SCRIPT, "BridgeFailure"], {
       env: { ...process.env, ...HOOK_ENV },
@@ -224,6 +270,9 @@ function reportBridgeFailure(event, error, onUndelivered) {
       settled = true;
       clearTimeout(kill);
       diagnosticsInFlight -= 1;
+      // Round 9: a free slot must drain the suppress queue — otherwise the
+      // budget that exists for storms re-silences everything after the 4th.
+      flushPendingSuppressedFailures();
     };
     // Round 5: the same idempotence guard for delivery-failure reporting —
     // a failed spawn can fire both `error` and `close`.
@@ -244,14 +293,19 @@ function reportBridgeFailure(event, error, onUndelivered) {
     child.unref();
     child.on("error", () => {});
     child.stdin.on("error", () => {});
-    child.stdin.end(
-      JSON.stringify({
-        hook_event_name: "BridgeFailure",
-        bridge: "kilo",
-        failed_event: event,
-        error: detail.slice(0, 400),
-      }),
-    );
+    const payload = {
+      hook_event_name: "BridgeFailure",
+      bridge: "kilo",
+      failed_event: event,
+      error: detail.slice(0, 400),
+    };
+    if (extras.coalesced_count != null) {
+      payload.coalesced_count = extras.coalesced_count;
+    }
+    if (extras.suppressed_since_last_report != null) {
+      payload.suppressed_since_last_report = extras.suppressed_since_last_report;
+    }
+    child.stdin.end(JSON.stringify(payload));
     return true;
   } catch {
     // The console line above is the last resort; never throw from here.
@@ -259,10 +313,33 @@ function reportBridgeFailure(event, error, onUndelivered) {
   }
 }
 
+function reportBridgeFailure(event, error, onUndelivered) {
+  const detail = error instanceof Error ? error.message : String(error);
+  console.warn(`[minni] ${event} hook unavailable; continuing: ${detail}`);
+  // Bounded on BOTH axes. This runs on the failure path, where failures arrive
+  // in storms: without a concurrency cap a burst of hook timeouts spawns a
+  // diagnostic per failure, and without a kill timer each one can hang exactly
+  // the way the call it is reporting hung. Either way the degraded bridge
+  // becomes a pile of stuck node processes.
+  if (diagnosticsInFlight >= DIAGNOSTIC_MAX_IN_FLIGHT) {
+    diagnosticsSuppressed += 1;
+    queueSuppressedFailure(event, detail);
+    console.warn(
+      `[minni] bridge diagnostic suppressed (${diagnosticsInFlight} in flight, ` +
+        `${diagnosticsSuppressed} suppressed since start); carrying forward for flush`,
+    );
+    return false;
+  }
+  return spawnBridgeDiagnostic(event, detail, onUndelivered);
+}
+
 async function runHookFailOpen(event, payload) {
   try {
     return await runHook(event, payload);
   } catch (error) {
+    // Round 9: ignore the boolean — suppress coalesces + flushes on settle.
+    // A silent drop of the return value is only safe because the suppress
+    // path no longer discards the loss.
     reportBridgeFailure(event, error);
     return null;
   }

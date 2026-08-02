@@ -513,10 +513,15 @@ def handle_daemon_compile(params: dict, request_id: Any, context: AFMContext) ->
             # the lifecycle apply below because they jump to the except path;
             # the non-raising refusal must skip it too, or candidates get
             # promoted/dedup'd/marked-reviewed while the review drafts that
-            # explain those mutations do not exist anywhere. write_timeout
-            # stays eligible: that batch IS queued and lands when the writer
-            # drains.
-            write_refused = write_result.get("status") == "write_in_flight"
+            # explain those mutations do not exist anywhere.
+            #
+            # Round 9: write_timeout is also refused for lifecycle. The job
+            # may still be queued, but a late worker failure then ages the
+            # status surface back to "ok" while candidates are already
+            # terminal with no review drafts. Treat timeout like in-flight:
+            # skip apply; re-run after the writer drains and drafts land.
+            write_status = write_result.get("status")
+            write_refused = write_status in {"write_in_flight", "write_timeout"}
         else:
             result.setdefault("drafts_written", [])
 
@@ -528,8 +533,10 @@ def handle_daemon_compile(params: dict, request_id: Any, context: AFMContext) ->
             if write_refused:
                 context.logger.warning(
                     "daemon.compile: consolidation lifecycle apply SKIPPED — "
-                    "this batch's drafts were refused (write_in_flight); "
-                    "candidates stay proposed and re-run after the writer drains"
+                    "this batch's drafts are not yet observed "
+                    "(%s); candidates stay proposed and re-run after the "
+                    "writer drains",
+                    write_status or "write_refused",
                 )
             else:
                 apply_consolidation_result(result, context)

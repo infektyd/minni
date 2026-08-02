@@ -793,8 +793,7 @@ def test_refused_drafts_do_not_apply_lifecycle_mutations(monkeypatch, tmp_path):
 
 
 def test_accepted_writes_still_apply_lifecycle_mutations(monkeypatch, tmp_path):
-    """The counterparts: a successful write applies, and write_timeout — that
-    batch IS queued and lands when the writer drains — stays eligible."""
+    """A successful write still applies lifecycle mutations."""
     _captured, applied = _compile_consolidation_with_write_status(
         monkeypatch,
         tmp_path,
@@ -802,20 +801,29 @@ def test_accepted_writes_still_apply_lifecycle_mutations(monkeypatch, tmp_path):
     )
     assert applied["called"] is True
 
-    _captured, applied = _compile_consolidation_with_write_status(
+
+def test_write_timeout_does_not_apply_lifecycle_mutations(monkeypatch, tmp_path):
+    """Round 9: write_timeout used to apply lifecycle optimistically. A late
+    worker failure then left candidates terminal with no review drafts, and
+    the recency-windowed failure counter aged status back to ok. Treat
+    timeout like write_in_flight — skip apply until drafts are observed."""
+    captured, applied = _compile_consolidation_with_write_status(
         monkeypatch,
         tmp_path,
         {"status": "write_timeout", "drafts_written": [], "drafts_in_flight": 1},
     )
-    assert applied["called"] is True, (
-        "a write_timeout batch is queued and will land; its mutations apply"
+    assert captured["status"] == "write_timeout"
+    assert applied["called"] is False, (
+        "lifecycle mutations must not run while drafts are only in-flight "
+        "and unobserved"
     )
 
 
 def test_a_late_write_failure_is_counted_even_with_no_waiter(monkeypatch):
     """Round 8: a batch failing AFTER its submitter timed out had no observer
     at all — no DraftWriteError (waiter gone), no pass failure, no counter.
-    The worker itself now counts every batch failure."""
+    The worker itself now counts every batch failure.
+    Round 9: also stamps a non-aging unrecovered counter."""
     import threading
 
     from minni import afm_writer
@@ -834,12 +842,13 @@ def test_a_late_write_failure_is_counted_even_with_no_waiter(monkeypatch):
     assert "error" in out
     assert afm_writer._WRITE_FAILURES == 1
     assert afm_writer._LAST_WRITE_FAILURE_AT is not None
+    assert afm_writer._UNRECOVERED_WRITE_FAILURES == 1
     afm_writer.reset_pass_counters()
 
 
 def test_recent_write_failures_reach_the_status_verdict():
     """The late failure must reach the verdict like timeouts do — and age out
-    the same way instead of latching."""
+    the same way instead of latching (unless unrecovered residue is set)."""
     from minni.afm_writer import WRITE_FAILURES_RECENT_SECONDS, derive_loop_status
 
     now = 1_000_000.0
@@ -860,6 +869,24 @@ def test_recent_write_failures_reach_the_status_verdict():
     }
     status, reasons = derive_loop_status(old, schedule=schedule, now=now)
     assert status == "ok"
+
+
+def test_unrecovered_write_failures_never_age_into_ok():
+    """Round 9: recency-windowed write_failures alone aged into ok over a
+    permanently broken vault. unrecovered_write_failures has no window."""
+    from minni.afm_writer import WRITE_FAILURES_RECENT_SECONDS, derive_loop_status
+
+    now = 1_000_000.0
+    schedule = {"passes": {"consolidation": {"interval_seconds": 3600}}}
+    state = {
+        "last_attempt_per_pass": {"consolidation": now - 60},
+        "write_failures": 2,
+        "last_write_failure_at": now - WRITE_FAILURES_RECENT_SECONDS - 60,
+        "unrecovered_write_failures": 2,
+    }
+    status, reasons = derive_loop_status(state, schedule=schedule, now=now)
+    assert status == "backlogged"
+    assert any("unrecovered write failure" in reason for reason in reasons)
 
 
 def test_recent_write_timeouts_reach_the_status_verdict():

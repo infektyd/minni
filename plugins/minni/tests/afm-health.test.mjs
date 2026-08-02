@@ -13,9 +13,12 @@ import test from "node:test";
 import {
   callAfmJson,
   daemonAfmToProviderHealth,
+  evictProbeEntries,
   generationProbeTimeoutMs,
   getAfmProviderHealth,
   noteAfmGenerationFailure,
+  noteAfmGenerationSuccess,
+  PROBE_CACHE_MAX_ENTRIES,
   resetAfmGenerationProbeCache,
   resolveAfmProvider,
 } from "../dist/afm.js";
@@ -382,6 +385,40 @@ test("persistent cache: a failed live call invalidates the file entry too", asyn
     });
     const persisted = JSON.parse(await readFile(cacheFile, "utf8"));
     assert.equal(persisted.entries[PROBE_CACHE_KEY], undefined, "poisoned/stale entries must not survive a live failure");
+  });
+});
+
+test("AFM-4: probe cache eviction drops oldest probed_at_ms first", () => {
+  // Round 9: plugin twin of Python PROBE_CACHE_MAX_ENTRIES bound.
+  const entries = {};
+  for (let i = 0; i < PROBE_CACHE_MAX_ENTRIES + 10; i += 1) {
+    entries[`bridge|http://127.0.0.1:${1000 + i}/v1`] = {
+      reachable: true,
+      generation_verified: true,
+      detail: null,
+      probed_at_ms: 1_000 + i,
+    };
+  }
+  evictProbeEntries(entries);
+  assert.equal(Object.keys(entries).length, PROBE_CACHE_MAX_ENTRIES);
+  const survivors = Object.values(entries).map((e) => e.probed_at_ms).sort((a, b) => a - b);
+  assert.equal(survivors[0], 1_000 + 10, "oldest ten probes must be gone");
+  assert.equal(survivors[survivors.length - 1], 1_000 + PROBE_CACHE_MAX_ENTRIES + 9);
+});
+
+test("AFM-4: persistProbeMutation bounds the on-disk cache", async () => {
+  await withProbeCacheFile(async (cacheFile) => {
+    // Fill past the bound via the public success path (each URL is a key).
+    for (let i = 0; i < PROBE_CACHE_MAX_ENTRIES + 8; i += 1) {
+      noteAfmGenerationSuccess(`http://127.0.0.1:${2000 + i}/v1/chat/completions`, "bridge");
+    }
+    const persisted = JSON.parse(await readFile(cacheFile, "utf8"));
+    assert.ok(persisted.entries);
+    assert.equal(
+      Object.keys(persisted.entries).length,
+      PROBE_CACHE_MAX_ENTRIES,
+      "plugin-side writes must evict to the same bound as Python",
+    );
   });
 });
 

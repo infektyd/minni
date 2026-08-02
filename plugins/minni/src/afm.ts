@@ -1,4 +1,15 @@
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import {
+  closeSync,
+  constants as fsConstants,
+  existsSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { spawn } from "node:child_process";
@@ -492,7 +503,14 @@ function generationProbeKey(options: AfmGenerationProbeOptions): string {
 // generation probe. A small atomic-write JSON file under ~/.minni/run/ (same
 // schema in engine/afm_provider.py) lets a hook reuse a recent verified probe.
 // Trivial versioned schema; any read/parse problem degrades to "no cache".
+//
+// AFM-4 (#230) / PR #260 round 9: Python already bounds + serializes RMW on
+// this file; the plugin twin used to grow without bound and lost concurrent
+// updates. Mirror both: oldest-probed_at eviction, exclusive lockfile around
+// the full read-mutate-write, and the same bound on the L1 Map.
 const PROBE_CACHE_FILE_VERSION = 1;
+/** Shared with Python `PROBE_CACHE_MAX_ENTRIES` — oldest `probed_at_ms` first. */
+export const PROBE_CACHE_MAX_ENTRIES = 32;
 
 interface PersistedProbeEntry {
   reachable: boolean;
@@ -504,6 +522,38 @@ interface PersistedProbeEntry {
 /** MINNI_AFM_PROBE_CACHE override exists so tests never touch live ~/.minni. */
 function probeCacheFilePath(): string {
   return process.env.MINNI_AFM_PROBE_CACHE ?? path.join(minniHome(), "run", "afm-probe-cache.json");
+}
+
+function probeCacheLockPath(): string {
+  return `${probeCacheFilePath()}.lock`;
+}
+
+/** Trim to PROBE_CACHE_MAX_ENTRIES, oldest probe first (undated sorts oldest). */
+export function evictProbeEntries(entries: Record<string, PersistedProbeEntry>): void {
+  const keys = Object.keys(entries);
+  if (keys.length <= PROBE_CACHE_MAX_ENTRIES) return;
+  const sorted = keys.sort((a, b) => {
+    const aT = entries[a]?.probed_at_ms;
+    const bT = entries[b]?.probed_at_ms;
+    const aN = typeof aT === "number" ? aT : Number.NEGATIVE_INFINITY;
+    const bN = typeof bT === "number" ? bT : Number.NEGATIVE_INFINITY;
+    return aN - bN;
+  });
+  for (const key of sorted.slice(0, keys.length - PROBE_CACHE_MAX_ENTRIES)) {
+    delete entries[key];
+  }
+}
+
+function rememberL1Probe(key: string, entry: GenerationProbeEntry): void {
+  generationProbeCache.set(key, entry);
+  if (generationProbeCache.size <= PROBE_CACHE_MAX_ENTRIES) return;
+  const ordered = [...generationProbeCache.entries()].sort(
+    (a, b) => (a[1].probedAt ?? 0) - (b[1].probedAt ?? 0),
+  );
+  const drop = generationProbeCache.size - PROBE_CACHE_MAX_ENTRIES;
+  for (let i = 0; i < drop; i += 1) {
+    generationProbeCache.delete(ordered[i][0]);
+  }
 }
 
 function readPersistentProbeEntries(): Record<string, PersistedProbeEntry> {
@@ -545,10 +595,76 @@ function writePersistentProbeEntries(entries: Record<string, PersistedProbeEntry
   }
 }
 
+/**
+ * Cross-process exclusive lock via O_EXCL lockfile. Best-effort: if the lock
+ * cannot be acquired after a short spin, still run the mutation (same honesty
+ * bar as an unlocked write — never fail the health path for a lock).
+ */
+function withProbeCacheLock(fn: () => void): void {
+  const lockPath = probeCacheLockPath();
+  const maxAttempts = 40;
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    let fd: number | undefined;
+    try {
+      mkdirSync(path.dirname(lockPath), { recursive: true });
+      fd = openSync(lockPath, fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY, 0o600);
+      try {
+        fn();
+      } finally {
+        try {
+          closeSync(fd);
+        } catch {
+          /* ignore */
+        }
+        try {
+          unlinkSync(lockPath);
+        } catch {
+          /* ignore */
+        }
+      }
+      return;
+    } catch (err) {
+      if (fd != null) {
+        try {
+          closeSync(fd);
+        } catch {
+          /* ignore */
+        }
+      }
+      const code = (err as NodeJS.ErrnoException | undefined)?.code;
+      if (code !== "EEXIST") {
+        // Unexpected lock error — still try the mutation unlocked.
+        try {
+          fn();
+        } catch {
+          /* never break health */
+        }
+        return;
+      }
+      // Brief busy-wait; hooks are short-lived and the critical section is tiny.
+      const start = Date.now();
+      while (Date.now() - start < 5) {
+        /* spin */
+      }
+    }
+  }
+  try {
+    fn();
+  } catch {
+    /* never break health */
+  }
+}
+
 function persistProbeMutation(mutate: (entries: Record<string, PersistedProbeEntry>) => void): void {
-  const entries = readPersistentProbeEntries();
-  mutate(entries);
-  writePersistentProbeEntries(entries);
+  // AFM-4: serialize RMW under an exclusive lock and bound entries. Without
+  // both, concurrent SessionStart hooks (and hook + daemon) reintroduce the
+  // unbounded / lost-update residue the Python half already fixed.
+  withProbeCacheLock(() => {
+    const entries = readPersistentProbeEntries();
+    mutate(entries);
+    evictProbeEntries(entries);
+    writePersistentProbeEntries(entries);
+  });
 }
 
 function toPersistedEntry(entry: GenerationProbeEntry): PersistedProbeEntry {
@@ -608,9 +724,9 @@ export function noteAfmGenerationFailure(chatUrl?: string): void {
  */
 export function noteAfmGenerationSuccess(chatUrl: string, mode: AfmProviderMode = "bridge"): void {
   const entry: GenerationProbeEntry = { reachable: true, generationVerified: true, probedAt: Date.now() };
-  generationProbeCache.set(`${mode}|${chatUrl}`, entry);
+  rememberL1Probe(`${mode}|${chatUrl}`, entry);
   for (const key of [...generationProbeCache.keys()]) {
-    if (key.endsWith(`|${chatUrl}`)) generationProbeCache.set(key, { ...entry });
+    if (key.endsWith(`|${chatUrl}`)) rememberL1Probe(key, { ...entry });
   }
   persistProbeMutation((entries) => {
     entries[`${mode}|${chatUrl}`] = toPersistedEntry(entry);
@@ -852,7 +968,7 @@ export async function getAfmProviderHealth(options: AfmGenerationProbeOptions = 
     // Stale or missing/corrupt file entries fall through to a normal probe.
     const persisted = loadPersistedProbeEntry(key);
     if (persisted && Math.max(0, now() - persisted.probedAt) < ttlMs) {
-      generationProbeCache.set(key, persisted);
+      rememberL1Probe(key, persisted);
       cached = persisted;
     }
   }
@@ -861,7 +977,7 @@ export async function getAfmProviderHealth(options: AfmGenerationProbeOptions = 
     if (ageMs >= ttlMs && !generationProbeInFlight.has(key)) {
       const refresh = runGenerationProbe(options, now)
         .then((entry) => {
-          generationProbeCache.set(key, entry);
+          rememberL1Probe(key, entry);
           persistProbeMutation((entries) => {
             entries[key] = toPersistedEntry(entry);
           });
@@ -879,7 +995,7 @@ export async function getAfmProviderHealth(options: AfmGenerationProbeOptions = 
   if (!probe) {
     probe = runGenerationProbe(options, now)
       .then((entry) => {
-        generationProbeCache.set(key, entry);
+        rememberL1Probe(key, entry);
         persistProbeMutation((entries) => {
           entries[key] = toPersistedEntry(entry);
         });
