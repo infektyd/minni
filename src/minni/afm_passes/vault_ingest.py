@@ -16,6 +16,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 
 from minni.afm_passes.inbox_ingest import _VAULT_SLUG_TO_AGENT_ID
+from minni.indexer import VaultIndexer
 from minni.principal import validate_agent_id
 from minni.timestamps import parse_epoch_or_report
 from minni.vault_index import open_vault_index, vault_index_paths
@@ -238,6 +239,18 @@ def _index_changed_pages(
                 now = time.time()
                 page_status = page.frontmatter.status
                 page_type = page.frontmatter.page_type
+                # GA6-1: this pass used to hardcode layer='knowledge' on all
+                # three writes below, while VaultIndexer._extract_metadata
+                # infers it — so every artifact-typed page ingested here was
+                # stamped 'knowledge' and became invisible to layer-scoped
+                # recall (88 such documents across 5 vault DBs). Infer it the
+                # same way the indexer does, so the two writers agree.
+                #
+                # agent_id is derived from the vault directory slug and passed
+                # through validate_agent_id, NOT read from page frontmatter, so
+                # the untrusted-'identity:'-prefix path _extract_metadata has to
+                # defend against cannot arise here.
+                layer = VaultIndexer._infer_layer(agent=agent_id, page_type=page_type)
 
                 if row:
                     doc_id = int(row["doc_id"])
@@ -255,7 +268,7 @@ def _index_changed_pages(
                             page_status,
                             page.frontmatter.privacy,
                             page_type,
-                            "knowledge",
+                            layer,
                             doc_id,
                         ),
                     )
@@ -274,7 +287,7 @@ def _index_changed_pages(
                             page_status,
                             page.frontmatter.privacy,
                             page_type,
-                            "knowledge",
+                            layer,
                         ),
                     )
                     doc_id = int(c.lastrowid)
@@ -304,7 +317,7 @@ def _index_changed_pages(
                                 f"{heading_prefix}{chunk.heading_path}",
                                 indexer.config.embedding_model,
                                 now,
-                                "knowledge",
+                                layer,
                             ),
                         )
                         stats["chunks"] += 1

@@ -24,6 +24,7 @@ from minni.config import SovereignConfig, DEFAULT_CONFIG
 from minni.db import SovereignDB
 from minni.chunker import MarkdownChunker
 from minni.faiss_index import FAISSIndex
+from minni.indexer import VaultIndexer
 from minni.timestamps import parse_epoch_or_report
 
 logger = logging.getLogger("sovereign.wiki_indexer")
@@ -398,15 +399,33 @@ class WikiIndexer:
                     privacy_level = page.frontmatter.privacy if not is_meta else "safe"
                     page_type = page.frontmatter.page_type if not is_meta else None
 
+                    # GA7-2: layer was omitted on both writes below, leaving it
+                    # NULL on 601 chunks. Readers mask that with
+                    # COALESCE(layer, 'knowledge'), so an artifact-typed wiki
+                    # page silently read back as knowledge and never matched a
+                    # layer-scoped recall for its own layer.
+                    #
+                    # whole_document=0 is passed explicitly, not defaulted: for
+                    # a session page `agent_tag` is `page.frontmatter.raw['agent']`
+                    # — untrusted on-disk markdown that could declare
+                    # `agent: identity:codex`. _infer_layer grants the identity
+                    # layer only when whole_document == 1, and this indexer
+                    # never writes whole-document rows, so pinning it to 0 makes
+                    # the identity branch structurally unreachable from
+                    # frontmatter rather than relying on a prefix strip.
+                    layer = VaultIndexer._infer_layer(
+                        agent=agent_tag, page_type=page_type, whole_document=0
+                    )
+
                     if row:
                         doc_id = row["doc_id"]
                         c.execute(
                             """UPDATE documents
                                SET agent=?, sigil=?, last_modified=?, indexed_at=?,
-                                   page_status=?, privacy_level=?, page_type=?
+                                   page_status=?, privacy_level=?, page_type=?, layer=?
                                WHERE doc_id=?""",
                             (agent_tag, "📖", mtime, now,
-                             page_status, privacy_level, page_type, doc_id),
+                             page_status, privacy_level, page_type, layer, doc_id),
                         )
                         # Clean old FTS + embeddings for re-index
                         c.execute("DELETE FROM vault_fts WHERE doc_id = ?", (doc_id,))
@@ -414,10 +433,10 @@ class WikiIndexer:
                     else:
                         c.execute(
                             """INSERT INTO documents (path, agent, sigil, last_modified, indexed_at,
-                                   page_status, privacy_level, page_type)
-                               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                                   page_status, privacy_level, page_type, layer)
+                               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                             (path, agent_tag, "📖", mtime, now,
-                             page_status, privacy_level, page_type),
+                             page_status, privacy_level, page_type, layer),
                         )
                         doc_id = c.lastrowid
 
@@ -448,12 +467,12 @@ class WikiIndexer:
                             c.execute(
                                 """INSERT INTO chunk_embeddings
                                    (doc_id, chunk_index, chunk_text, embedding,
-                                    heading_context, model_name, computed_at)
-                                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                                    heading_context, model_name, computed_at, layer)
+                                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                                 (
                                     doc_id, chunk.chunk_index, chunk.text,
                                     emb_bytes, enriched_heading,
-                                    self.config.embedding_model, now,
+                                    self.config.embedding_model, now, layer,
                                 ),
                             )
                             stats["chunks"] += 1

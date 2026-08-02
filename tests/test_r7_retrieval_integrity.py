@@ -213,6 +213,119 @@ class TestEpisodicIsReachable:
 
 
 # ---------------------------------------------------------------------------
+# GA6-1 / GA7-2 — every document writer must stamp the layer it infers
+# ---------------------------------------------------------------------------
+
+class TestLayerStamping:
+    """Three writers disagreed with indexer._infer_layer: vault_ingest
+    hardcoded 'knowledge', and seed_identity + wiki_indexer omitted layer
+    entirely (NULL, masked by COALESCE(layer,'knowledge') on read)."""
+
+    def test_vault_ingest_no_longer_hardcodes_knowledge(self):
+        """GA6-1: the literal must be gone from the writer's parameters."""
+        import inspect
+
+        import minni.afm_passes.vault_ingest as vi
+
+        src = inspect.getsource(vi._index_changed_pages)
+        assert "_infer_layer" in src, "vault_ingest must infer the layer"
+        assert '"knowledge",' not in src, (
+            "a hardcoded layer='knowledge' makes every artifact-typed page "
+            "invisible to layer-scoped recall"
+        )
+
+    def test_artifact_page_type_infers_the_artifact_layer(self):
+        from minni.indexer import VaultIndexer
+
+        assert VaultIndexer._infer_layer(agent="codex", page_type="artifact") == "artifact"
+        assert VaultIndexer._infer_layer(agent="codex", page_type="concept") == "knowledge"
+
+    def test_wiki_indexer_cannot_self_assign_identity_from_frontmatter(self):
+        """wiki_indexer's agent_tag can come from untrusted page frontmatter, so
+        the identity layer must be unreachable there regardless of what a file
+        declares."""
+        from minni.indexer import VaultIndexer
+
+        assert VaultIndexer._infer_layer(
+            agent="identity:codex", page_type="concept", whole_document=0
+        ) != "identity"
+
+    def test_wiki_indexer_stamps_layer_on_all_writes(self):
+        import inspect
+
+        import minni.wiki_indexer as wi
+
+        src = inspect.getsource(wi.WikiIndexer)
+        assert "whole_document=0" in src, (
+            "the identity branch must be closed structurally, not by a strip"
+        )
+        assert "computed_at, layer" in src, "chunk_embeddings must carry layer"
+
+    def test_seed_identity_stamps_the_identity_layer(self):
+        import inspect
+
+        import minni.seed_identity as si
+
+        src = inspect.getsource(si)
+        assert "'identity')" in src or "'identity'" in src
+        assert "whole_document, layer" in src, (
+            "identity envelopes left layer NULL and read back as KNOWLEDGE — "
+            "the one layer they must never be"
+        )
+
+    def test_migration_backfills_mislabeled_artifact_rows(self, tmp_path):
+        """GA6-1 backfill: the writer fix only helps re-ingested pages, and
+        vault_ingest skips unchanged files by mtime — so the already-stored
+        rows must be repaired too."""
+        import minni.db as db_mod
+        from minni.migrations import run_migrations
+
+        db_obj, _cfg = _make_db(tmp_path)
+
+        with db_obj.cursor() as c:
+            c.execute(
+                """INSERT INTO documents (path, agent, sigil, page_type, layer)
+                   VALUES ('art.md', 'codex', 'vault', 'artifact', 'knowledge')"""
+            )
+            mislabeled = c.lastrowid
+            c.execute(
+                """INSERT INTO documents (path, agent, sigil, page_type, layer)
+                   VALUES ('note.md', 'codex', 'vault', 'concept', 'knowledge')"""
+            )
+            untouched = c.lastrowid
+            c.execute(
+                """INSERT INTO documents (path, agent, sigil, page_type, layer)
+                   VALUES ('id.md', 'identity:codex', 'vault', 'artifact', 'identity')"""
+            )
+            identity_doc = c.lastrowid
+
+        # Reproduce a real upgrade: rows already exist, 017 has not been applied
+        # to this file yet. Migrations are tracked by version, so un-record 017
+        # and re-run — the same path an existing install takes.
+        conn = db_obj._get_conn()
+        conn.execute("DELETE FROM schema_migrations WHERE version = 17")
+        conn.commit()
+        run_migrations(conn)
+        conn.commit()
+
+        with db_obj.cursor() as c:
+            rows = {
+                r["doc_id"]: r["layer"]
+                for r in c.execute(
+                    "SELECT doc_id, layer FROM documents"
+                ).fetchall()
+            }
+        assert rows[mislabeled] == "artifact", (
+            "an artifact-typed row stamped 'knowledge' must be repaired"
+        )
+        assert rows[untouched] == "knowledge", "non-artifact rows are untouched"
+        assert rows[identity_doc] == "identity", (
+            "the migration must never overwrite a non-knowledge layer"
+        )
+        db_obj.close()
+
+
+# ---------------------------------------------------------------------------
 # #225-R2 — decay must actually be scheduled, not CLI-only
 # ---------------------------------------------------------------------------
 

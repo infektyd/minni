@@ -232,10 +232,17 @@ def seed_identity():
                 doc_path = source_path
 
                 # Insert into documents table
+                # GA7-2: layer was omitted here, leaving it NULL. Readers mask
+                # that with COALESCE(layer, 'knowledge'), so these Layer 1
+                # identity envelopes read back as KNOWLEDGE — the one layer
+                # they must never be. This is the trusted seed path, the only
+                # place the identity layer is legitimately assignable, and it
+                # matches what VaultIndexer._infer_layer returns for an
+                # 'identity:'-prefixed agent with whole_document=1.
                 c.execute(
                     """INSERT INTO documents
-                       (path, agent, sigil, last_modified, indexed_at, whole_document)
-                       VALUES (?, ?, ?, ?, ?, 1)""",
+                       (path, agent, sigil, last_modified, indexed_at, whole_document, layer)
+                       VALUES (?, ?, ?, ?, ?, 1, 'identity')""",
                     (doc_path, f"identity:{agent_id}", sigil, now, now)
                 )
                 doc_id = c.lastrowid
@@ -246,8 +253,9 @@ def seed_identity():
                 # Insert into chunk_embeddings as a single whole chunk
                 c.execute(
                     """INSERT INTO chunk_embeddings
-                       (doc_id, chunk_index, chunk_text, embedding, model_name, computed_at)
-                       VALUES (?, 0, ?, ?, 'all-MiniLM-L6-v2', ?)""",
+                       (doc_id, chunk_index, chunk_text, embedding, model_name,
+                        computed_at, layer)
+                       VALUES (?, 0, ?, ?, 'all-MiniLM-L6-v2', ?, 'identity')""",
                     (doc_id, content, emb_bytes, now)
                 )
 
