@@ -266,6 +266,24 @@ def _is_versioned_wire_plugin_dist(dist: Path, home: Path) -> bool:
     )
 
 
+def _is_legacy_marketplace_cache_dist(dist: Path, home: Path) -> bool:
+    """Claude/Codex marketplace cache dists superseded by wire-primary installs.
+
+    ``make sync-root`` deliberately does not refresh these (wire points MCP at
+    ``~/.minni/plugin``). After wire adoption they stay STALE/DRIFT forever if
+    ``--strict`` still gates on them — the same mid-migration failure mode as
+    historical version dirs under the wire tree.
+    """
+    try:
+        rel = str(dist.resolve().relative_to(home.resolve()))
+    except (OSError, ValueError):
+        rel = str(dist)
+    return (
+        rel.startswith(".claude/plugins/cache/")
+        or rel.startswith(".codex/plugins/cache/")
+    )
+
+
 def discover() -> list[Path]:
     home = _home()
     found: list[Path] = []
@@ -279,21 +297,34 @@ def discover() -> list[Path]:
 
 
 def discover_active() -> tuple[list[Path], list[str]]:
-    """(dists to judge, skip notes). Historical wire version dirs are notes."""
+    """(dists to judge, skip notes).
+
+    Historical wire version dirs and wire-superseded marketplace cache trees
+    become notes only — they must not fail ``--strict`` / sync-root after a
+    successful wire-primary redeploy.
+    """
     home = _home()
     active = _active_wire_plugin_roots(home)
     kept: list[Path] = []
     notes: list[str] = []
     for dist in discover():
+        label = str(dist.parent).replace(str(home), "~")
         if active and _is_versioned_wire_plugin_dist(dist, home):
             root = dist.parent.resolve()
             if root not in active:
-                label = str(dist.parent).replace(str(home), "~")
                 notes.append(
                     f"{label}: skipped (not an active wire install; "
                     "historical version dir)"
                 )
                 continue
+        # Only skip marketplace caches once wire is live on this host —
+        # otherwise a pure-cache install still needs --strict signal.
+        if active and _is_legacy_marketplace_cache_dist(dist, home):
+            notes.append(
+                f"{label}: skipped (legacy marketplace cache; "
+                "wire-primary — not managed by sync-root)"
+            )
+            continue
         kept.append(dist)
     return kept, notes
 

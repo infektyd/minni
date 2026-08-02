@@ -317,7 +317,21 @@ for i in range(45):
                 buf += chunk
         msg = json.loads(buf.decode("utf-8", errors="replace").splitlines()[0])
         result = msg.get("result") or {}
-        deploy = (result.get("daemon") or {}).get("deploy") or result.get("deploy") or {}
+        # Do not default missing deploy to {} — empty would soft-ok on stale=None.
+        deploy = (result.get("daemon") or {}).get("deploy") or result.get("deploy")
+        if not isinstance(deploy, dict) or not deploy:
+            print(
+                "update-root: daemon status missing deploy block after restart "
+                f"(result keys={list((result.get('daemon') or result or {}).keys())!r})",
+                file=sys.stderr,
+            )
+            sys.exit(4)
+        if deploy.get("error"):
+            print(
+                f"update-root: daemon deploy honesty errored after restart: {deploy!r}",
+                file=sys.stderr,
+            )
+            sys.exit(5)
         stale = deploy.get("stale")
         plugin = deploy.get("plugin_dist") if isinstance(deploy.get("plugin_dist"), dict) else {}
         plugin_stale = plugin.get("stale")
@@ -327,22 +341,12 @@ for i in range(45):
                 file=sys.stderr,
             )
             sys.exit(2)
-        if deploy.get("error"):
-            print(
-                f"update-root: daemon deploy block errored after restart: {deploy!r}",
-                file=sys.stderr,
-            )
-            sys.exit(4)
-        if not deploy:
-            print(
-                "update-root: daemon status missing deploy block after restart",
-                file=sys.stderr,
-            )
-            sys.exit(4)
         if stale is None:
-            # Soft: socket is up; honesty unmeasurable (manifest race / layout).
+            # Soft only when honesty ran and returned a real deploy block with
+            # unmeasurable stale (manifest race). Missing/errored deploy hard-fails above.
             print(
                 f"daemon deploy probe soft-ok (stale unmeasurable): {deploy!r}",
+                file=sys.stderr,
             )
             sys.exit(0)
         print(f"daemon deploy probe ok (stale={stale!r}, plugin_dist.stale={plugin_stale!r})")

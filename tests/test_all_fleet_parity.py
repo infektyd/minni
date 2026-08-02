@@ -65,3 +65,13 @@ def test_antigravity_is_inside_at_least_one_all_expansion():
         "antigravity" in propagate.ALL_PLATFORMS
         or "antigravity" in wire_platform.ALL_EXPANSION_V03
     )
+
+
+def test_wire_all_skips_antigravity_does_not_recommend_propagate_platform_all():
+    """Round-8 Med: skip text must not steer operators to
+    ``propagate --platform all`` after a wire-primary fleet (rewrites
+    codex/kilo/grok onto legacy cache)."""
+    reason = wire_platform.ALL_SKIPS["antigravity"]
+    assert "--platform antigravity" in reason
+    # May warn *against* --platform all, but must not recommend running it.
+    assert "or `propagate.py update-plugin --platform all`" not in reason

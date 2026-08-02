@@ -502,3 +502,53 @@ def test_inactive_wire_version_dist_is_skipped_not_strict_failed(tmp_path):
     # Old tree must not force STALE failure by itself.
     # Fresh kilo deployment may still DRIFT/UNKNOWN; pin is the skip note + no crash.
     assert "0.3.0" in proc.stdout
+
+
+def test_legacy_marketplace_cache_skipped_when_wire_active(tmp_path):
+    """Round-8 High: leftover ~/.claude|codex/plugins/cache trees must not
+    fail --strict after wire-primary adoption (sync-root never refreshes them)."""
+    home = tmp_path / "home"
+    home.mkdir()
+    plugin = home / ".minni" / "plugin"
+    fresh = plugin / "0.4.1+git.deadbeef"
+    fresh.mkdir(parents=True)
+    for sub in ("hooks", "commands", "skills", ".claude-plugin", ".codex-plugin",
+                ".cursor-plugin", ".kilocode-plugin", ".gemini-plugin"):
+        src = SOURCE / sub
+        if src.is_dir():
+            _copytree(src, fresh / sub)
+    _artifact_dist(fresh)
+    (plugin / "wired.json").write_text(
+        json.dumps({
+            "schema": 1,
+            "wires": [{
+                "platform": "claude-code",
+                "install_root": str(fresh),
+                "wired_at": "2026-08-02T00:00:00Z",
+            }],
+        }),
+        encoding="utf-8",
+    )
+    # Stale marketplace cache left from pre-wire era.
+    cache_root = (
+        home / ".claude" / "plugins" / "cache" / "minni" / "minni" / "0.3.0"
+    )
+    cache_root.mkdir(parents=True)
+    for sub in ("hooks", "commands", "skills", ".claude-plugin", ".codex-plugin",
+                ".cursor-plugin", ".kilocode-plugin", ".gemini-plugin"):
+        src = SOURCE / sub
+        if src.is_dir():
+            _copytree(src, cache_root / sub)
+    (cache_root / "dist").mkdir()
+    (cache_root / "dist" / "server.js").write_text("// old cache\n", encoding="utf-8")
+    (cache_root / "dist" / "build-manifest.json").write_text(
+        json.dumps({"git_sha": "f" * 40, "built_at": "2026-07-01T00:00:00Z"}),
+        encoding="utf-8",
+    )
+
+    proc = _run("--strict", home=home, repo_root=_isolated_repo_root(tmp_path))
+    assert "legacy marketplace cache" in proc.stdout, proc.stdout
+    assert "0.3.0" in proc.stdout
+    # Active wire + skipped cache only: --strict must stay green.
+    assert proc.returncode == 0, proc.stdout
+    assert "STALE" not in proc.stdout
