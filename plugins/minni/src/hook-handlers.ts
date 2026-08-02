@@ -421,17 +421,26 @@ export interface AgentHookHandlers {
 }
 
 /**
- * Runtimes that always attach `transcript_path`/`transcriptPath` on SessionStart
- * and never send `source`. Path-only compact harvest would tax every cold boot
- * (agy/gemini: non–Claude-shaped JSONL → always `no_summary_found`).
+ * Path-only compact harvest (no `source`, non-empty transcript path) is
+ * **opt-in**. Default off so a new host that always attaches a path and never
+ * sends `source` (agy/gemini shape) does not rediscover the every-cold-boot
+ * tail-read tax. Only runtimes known to omit `source` *and* possibly emit
+ * Claude-shaped `isCompactSummary` entries are listed.
  * Matched against `config.runtime ?? config.agentId`.
  */
-const PATH_ONLY_COMPACT_HARVEST_DENY = new Set(["gemini"]);
+const PATH_ONLY_COMPACT_HARVEST_ALLOW = new Set(["codex", "cursor", "grok-build"]);
 
-/** True when path-only (no `source`) SessionStart must not start a tail-read. */
-export function isPathOnlyCompactHarvestDenied(platform: string | undefined): boolean {
+/** Explicit wait caps for SessionStart harvest (ms). Tighter for path-only —
+ * that residual is almost always a miss and must not burn the boot budget
+ * before identity/corrections RPCs. `withBudget` only bounds wait time; it
+ * does not cancel work or reserve later RPC budget. */
+const COMPACT_HARVEST_PATH_ONLY_BUDGET_MS = 250;
+const COMPACT_HARVEST_SOURCE_BUDGET_MS = 2_000;
+
+/** True when path-only (no `source`) SessionStart may start a tail-read. */
+export function isPathOnlyCompactHarvestAllowed(platform: string | undefined): boolean {
   const id = (platform ?? "").trim().toLowerCase();
-  return id.length > 0 && PATH_ONLY_COMPACT_HARVEST_DENY.has(id);
+  return id.length > 0 && PATH_ONLY_COMPACT_HARVEST_ALLOW.has(id);
 }
 
 export function createHookHandlers(
@@ -508,15 +517,15 @@ export function createHookHandlers(
     // Gate:
     //  1. compact|resume `source` — Claude parity (any runtime).
     //  2. path-only residual — only when `source` is absent entirely AND the
-    //     runtime is not known to always attach a transcript path. agy/gemini
-    //     SessionStart always carries transcriptPath and never sends `source`,
-    //     so path-only would fire on every cold boot for a guaranteed
-    //     no_summary_found (non–Claude-shaped JSONL) against the tightest
-    //     budget (10s harness → ~6s effective). Deny path-only there.
-    // Harvest is raced against remainingMs so a wedged/large tail-read cannot
-    // starve identity/corrections RPCs (withBudget abandons, does not cancel).
-    // Content-hash dedup keeps dual delivery safe. Fail-open, raw only —
-    // daemon compact_distillation organizes later.
+    //     runtime is on PATH_ONLY_COMPACT_HARVEST_ALLOW (opt-in). Default
+    //     off: hosts that always attach a path and never send `source`
+    //     (agy/gemini) would otherwise tax every cold boot for a guaranteed
+    //     no_summary_found against the tightest budget.
+    // Harvest is raced against a *sub-budget* of remainingMs (tighter for
+    // path-only). withBudget only bounds how long we wait — it does not
+    // cancel the tail-read or reserve budget for later identity/corrections
+    // RPCs. Content-hash dedup keeps dual delivery safe. Fail-open, raw only
+    // — daemon compact_distillation organizes later.
     const bootSource = asString(payload.source);
     const transcriptPath =
       asString(payload.transcript_path) || asString(payload.transcriptPath);
@@ -524,10 +533,19 @@ export function createHookHandlers(
     const pathOnlyAllowed =
       !bootSource &&
       Boolean(transcriptPath) &&
-      !isPathOnlyCompactHarvestDenied(platform);
+      isPathOnlyCompactHarvestAllowed(platform);
     const shouldHarvestCompact =
       bootSource === "compact" || bootSource === "resume" || pathOnlyAllowed;
     if (shouldHarvestCompact) {
+      // Cap wait so a large/slow transcript cannot exhaust the whole boot
+      // budget before status/identity/recall. Path-only is almost always a
+      // miss → 250ms; compact|resume source is the real harvest → 2s.
+      const harvestBudgetMs = Math.min(
+        remainingMs(),
+        pathOnlyAllowed
+          ? COMPACT_HARVEST_PATH_ONLY_BUDGET_MS
+          : COMPACT_HARVEST_SOURCE_BUDGET_MS,
+      );
       await withBudget(
         harvestCompactSummary(
           {
@@ -541,7 +559,7 @@ export function createHookHandlers(
             sessionId,
           },
         ),
-        remainingMs(),
+        harvestBudgetMs,
         { harvested: false, reason: "harvest_error" },
       );
     }

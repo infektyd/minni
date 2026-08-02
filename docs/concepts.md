@@ -198,10 +198,13 @@ Minni harvests it in two stages, split across the boot/daemon boundary
    Platforms that share `createHookHandlers` (codex, grok-build, cursor, gemini)
    run the SessionStart transcript backstop when the payload marks `source` as
    compact/resume. A path-only residual (no `source`, non-empty
-   `transcript_path`) remains for hosts that omit `source` entirely — **except**
-   runtimes known to always attach a transcript path and never send `source`
-   (agy/gemini): path-only there would tax every cold boot for a guaranteed
-   miss against the tightest SessionStart budget ([#227](https://github.com/infektyd/minni/issues/227)).
+   `transcript_path`) is **opt-in** via an allowlist of runtimes known to omit
+   `source` and possibly emit Claude-shaped summaries (codex, cursor,
+   grok-build). Default off: hosts that always attach a path and never send
+   `source` (agy/gemini) would tax every cold boot for a guaranteed miss
+   against the tightest SessionStart budget ([#227](https://github.com/infektyd/minni/issues/227)).
+   Harvest waits are sub-budgeted (tighter for path-only) so a slow tail-read
+   cannot exhaust the whole boot budget before identity/corrections RPCs.
    Kilo Code uses the shared handler too, but its bridge SessionStart sends
    neither `transcript_path` nor `source`, so that backstop is dead for real
    Kilo boots (primary remains `CompactSummary` from the SDK). Both live paths
@@ -219,17 +222,18 @@ Minni harvests it in two stages, split across the boot/daemon boundary
    |----------|------------------|----------------------------------|-------|
    | Claude Code | `PostCompact` → `harvestSummaryText` | yes (`source` compact/resume only) | full path |
    | Kilo Code | `session.compacted` SDK read-back → `CompactSummary` | no (bridge supplies no transcript_path / source) | primary only |
-   | Codex | — | compact/resume `source`, or path-only when `source` omitted | Claude-shaped transcript entries only; otherwise no-op |
-   | Grok Build | — | same gate as Codex | harvest is a side effect (SessionStart is not injectable) |
-   | Cursor | — | same gate as Codex | cold boots with path + non-compact `source` skip the tail-read |
-   | Gemini / agy | — | compact/resume `source` only (path-only denied) | always attaches `transcriptPath`, never `source`; path-only would I/O every cold boot for zero yield (non–Claude-shaped transcript) |
+   | Codex | — | compact/resume `source`, or path-only (allowlisted) | Claude-shaped transcript entries only; otherwise no-op; path-only sub-budgeted |
+   | Grok Build | — | same gate as Codex (allowlisted path-only) | harvest is a side effect (SessionStart is not injectable) |
+   | Cursor | — | same gate as Codex (allowlisted path-only) | cold boots with path + non-compact `source` skip the tail-read |
+   | Gemini / agy | — | compact/resume `source` only (path-only not allowlisted) | always attaches `transcriptPath`, never `source`; path-only would I/O every cold boot for zero yield (non–Claude-shaped transcript) |
 
    Platforms without a Claude-shaped `isCompactSummary` transcript entry still
    *have* a harvest path when the gate fires (they no longer drop the event on
    the floor by absence of code), but capture is a no-op until the platform
    emits a compatible summary shape or a direct `CompactSummary`/`summary_text`
-   delivery. Gemini/agy path-only is denied so the residual is not paid as an
-   every-boot I/O cost. That residual is declared here rather than discovered.
+   delivery. Path-only is allowlisted so the residual is not paid as an
+   every-boot I/O cost on unknown hosts. That residual is declared here rather
+   than discovered.
 2. **Daemon-side distillation (`compact_distillation` AFM pass).** The same
    consolidation timer that ingests stop-candidate learnings picks up
    `compact_summary` inbox files (`src/minni/afm_passes/compact_distillation.py`).

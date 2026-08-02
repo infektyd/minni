@@ -147,7 +147,7 @@ test("shared SessionStart skips harvest on cold boot with non-compact source + p
 });
 
 // Platforms that omit `source` entirely still need the path-only signal —
-// but only when the runtime is not known to always attach a path (codex/…).
+// but only when the runtime is on the path-only allowlist (codex/cursor/…).
 test("shared SessionStart harvests when transcript_path is the only signal", async () => {
   const vault = await tmpVault();
   const file = await tmpTranscript([
@@ -165,9 +165,33 @@ test("shared SessionStart harvests when transcript_path is the only signal", asy
   assert.equal(harvested[0].platform, "codex");
 });
 
+// Path-only is opt-in. Unknown / non-allowlisted runtimes default off so a
+// new always-path host does not rediscover the every-cold-boot tail-read tax.
+test("shared SessionStart skips path-only harvest on non-allowlisted runtime", async () => {
+  const vault = await tmpVault();
+  const file = await tmpTranscript([
+    transcriptLine({ type: "user", message: { role: "user", content: "hello" } }),
+    transcriptLine(summaryEntry("uuid-unknown-path-only", SUMMARY_TEXT)),
+  ]);
+  const handlers = sharedHandlers(vault, {
+    agentId: "some-new-host",
+    runtime: "some-new-host",
+    auditPrefix: "hook_new",
+  });
+  await handlers.handleSessionStart({
+    session_id: "s-unknown-path-only",
+    transcript_path: file,
+  });
+  assert.equal(
+    (await listCompactSummaries(vault)).length,
+    0,
+    "non-allowlisted path-only cold boot must not harvest",
+  );
+});
+
 // agy/gemini always attaches transcriptPath and never sends `source`. Path-only
-// would turn every cold boot into an unbudgeted ≤4 MiB tail-read for a
-// guaranteed no_summary_found (non–Claude-shaped JSONL). Gate must skip.
+// would turn every cold boot into a ≤4 MiB tail-read for a guaranteed
+// no_summary_found (non–Claude-shaped JSONL). Not on allowlist → skip.
 test("shared SessionStart skips path-only harvest on gemini (always-path, no source)", async () => {
   const vault = await tmpVault();
   const file = await tmpTranscript([
@@ -227,12 +251,44 @@ test("CompactSummary and SessionStart harvest share runtime ?? agentId platform 
     summary_text: SUMMARY_TEXT,
     summary_id: "sum-dual-1",
   });
-  const harvested = await listCompactSummaries(vault);
-  assert.equal(harvested.length, 1);
+  const fromCompact = await listCompactSummaries(vault);
+  assert.equal(fromCompact.length, 1);
   assert.equal(
-    harvested[0].platform,
+    fromCompact[0].platform,
     "kilocode",
     "CompactSummary path must use runtime ?? agentId, not agentId alone",
+  );
+
+  // SessionStart arm: same config, compact source + transcript (kilocode is
+  // not path-only allowlisted; source gate is universal). Content-hash dedup
+  // means a second write of the same body is a no-op — assert the stamp via a
+  // second vault so both arms are independently exercised.
+  const vaultSs = await tmpVault();
+  const file = await tmpTranscript([
+    transcriptLine({ type: "user", message: { role: "user", content: "hello" } }),
+    transcriptLine(summaryEntry("uuid-dual-ss", SUMMARY_TEXT)),
+  ]);
+  const handlersSs = sharedHandlers(vaultSs, {
+    agentId: "kilocode-principal",
+    runtime: "kilocode",
+    auditPrefix: "hook_kilocode",
+  });
+  await handlersSs.handleSessionStart({
+    session_id: "s-dual-ss",
+    transcript_path: file,
+    source: "compact",
+  });
+  const fromSessionStart = await listCompactSummaries(vaultSs);
+  assert.equal(fromSessionStart.length, 1, "SessionStart arm must harvest");
+  assert.equal(
+    fromSessionStart[0].platform,
+    "kilocode",
+    "SessionStart path must use runtime ?? agentId, matching CompactSummary",
+  );
+  assert.equal(
+    fromCompact[0].platform,
+    fromSessionStart[0].platform,
+    "dual delivery paths must agree on platform stamp",
   );
 });
 
