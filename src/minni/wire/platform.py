@@ -203,6 +203,19 @@ def default_config_scan_paths() -> dict[str, Path]:
         ).expanduser(),
         "kilocode": Path("~/.config/kilo/kilo.json").expanduser(),
         "grok": Path("~/.grok/config.toml").expanduser(),
+        # Gemini/antigravity MCP views hold versioned install paths. D11
+        # hard-fail can leave views rewritten without a wired.json row;
+        # scan them so GC cannot orphan a live MCP pointer.
+        "gemini-mcp": Path("~/.gemini/config/mcp_config.json").expanduser(),
+        "antigravity-mcp": Path(
+            "~/.gemini/antigravity/mcp_config.json",
+        ).expanduser(),
+        "antigravity-ide-mcp": Path(
+            "~/.gemini/antigravity-ide/mcp_config.json",
+        ).expanduser(),
+        "antigravity-cli-mcp": Path(
+            "~/.gemini/antigravity-cli/plugins/minni/mcp_config.json",
+        ).expanduser(),
     }
 
 

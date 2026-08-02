@@ -406,6 +406,25 @@ def run_wire(args) -> int:
                             "`minni wire antigravity` is re-run"
                         )
                     else:
+                        # MCP views already rewritten — record the install root
+                        # so GC / honesty still protect the live payload even
+                        # though hook registration failed (D11 half-state).
+                        if not dry_run:
+                            try:
+                                upsert_wire(
+                                    make_record(
+                                        platform,
+                                        config_path or install_root / ".mcp.json",
+                                        install_root,
+                                        version,
+                                        str(workspace) if workspace else None,
+                                    ),
+                                    dry_run=False,
+                                )
+                            except Exception as rec_exc:  # never hide the fail
+                                extras["wired_record_error"] = (
+                                    f"{type(rec_exc).__name__}: {rec_exc}"
+                                )
                         out.results.append(PlatformResult(
                             platform, "failed",
                             config_path=str(config_path) if config_path else None,
@@ -414,8 +433,9 @@ def run_wire(args) -> int:
                             workspace=str(workspace) if workspace else None,
                             reason=(
                                 f"agy hook registration failed: {agy_reason} "
-                                "(MCP views/configs were already updated; re-run "
-                                "`minni wire antigravity` once resolved)"
+                                "(MCP views/configs were already updated; "
+                                "install root recorded for GC protection; "
+                                "re-run `minni wire antigravity` once resolved)"
                             ),
                             extra=extras,
                         ))

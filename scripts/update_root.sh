@@ -236,21 +236,26 @@ root = None
 wired = base / "wired.json"
 try:
     data = json.loads(wired.read_text(encoding="utf-8"))
-    entries = [
+    # Prefer the latest *grok* wire only — global max wired_at after a partial
+    # wire all can pick codex/claude-code's new root while grok MCP still
+    # points at an older tree (hooks would stamp the wrong dist paths).
+    grok_entries = [
         (str(w.get("wired_at") or ""), Path(str(w.get("install_root"))))
         for w in data.get("wires", [])
-        if isinstance(w, dict) and w.get("install_root")
+        if isinstance(w, dict)
+        and w.get("install_root")
+        and str(w.get("platform") or "") == "grok"
     ]
-    entries = [(t, p) for t, p in entries if p.is_dir()]
-    if entries:
-        root = max(entries, key=lambda t: t[0])[1]
+    grok_entries = [(t, p) for t, p in grok_entries if p.is_dir()]
+    if grok_entries:
+        root = max(grok_entries, key=lambda t: t[0])[1]
 except Exception:
     root = None
 if root is None:
     current = base / "current"
     root = current.resolve() if current.exists() else None
 if root is None:
-    print("no wire install root for grok hooks", file=sys.stderr)
+    print("no grok wire install root for hooks refresh", file=sys.stderr)
     sys.exit(1)
 hooks = mod.update_grok_hooks(root)
 rules = mod.write_grok_rules()
@@ -375,13 +380,22 @@ for i in range(45):
             )
             sys.exit(2)
         if stale is None:
-            # Soft only when honesty ran and returned a real deploy block with
-            # unmeasurable stale (manifest race). Missing/errored deploy hard-fails above.
+            # Wheel installs have no local checkout — unmeasurable is expected.
+            # Editable checkout after kickstart must report a boolean; null means
+            # the honesty path could not measure (git race / unreadable) and must
+            # not green-wash "daemon came back clean".
+            if deploy.get("install_kind") == "wheel":
+                print(
+                    f"daemon deploy probe soft-ok (wheel, stale unmeasurable): {deploy!r}",
+                    file=sys.stderr,
+                )
+                sys.exit(0)
             print(
-                f"daemon deploy probe soft-ok (stale unmeasurable): {deploy!r}",
+                f"update-root: daemon deploy honesty unmeasurable after restart "
+                f"(expected boolean for editable checkout): {deploy!r}",
                 file=sys.stderr,
             )
-            sys.exit(0)
+            sys.exit(3)
         print(f"daemon deploy probe ok (stale={stale!r}, plugin_dist.stale={plugin_stale!r})")
         sys.exit(0)
     except Exception as exc:

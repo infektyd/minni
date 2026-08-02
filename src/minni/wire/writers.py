@@ -134,6 +134,24 @@ def write_json(path: Path, data: dict) -> None:
     path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
 
 
+def _mirror_codex_hook_env(env: dict, agent: str) -> None:
+    """Mirror resolved generic identity into MINNI_CODEX_* for codex.
+
+    The Codex hook entrypoint reads only MINNI_CODEX_* (never generic MINNI_*
+    the MCP server uses). Without the mirror, a custom MINNI_VAULT_PATH leaves
+    hooks writing audit/inbox under ~/.minni/codex-vault while MCP points at
+    the configured vault. Called after surface preservation so hooks track
+    whatever vault the install actually resolved.
+    """
+    if agent != "codex":
+        return
+    env.setdefault("MINNI_CODEX_AGENT_ID", env.get("MINNI_AGENT_ID", "codex"))
+    if "MINNI_VAULT_PATH" in env:
+        env.setdefault("MINNI_CODEX_VAULT_PATH", env["MINNI_VAULT_PATH"])
+    if "MINNI_WORKSPACE_ID" in env:
+        env.setdefault("MINNI_CODEX_WORKSPACE_ID", env["MINNI_WORKSPACE_ID"])
+
+
 def mcp_json(
     server_path: Path,
     agent: str,
@@ -168,11 +186,15 @@ def mcp_json(
         for key in (
             "MINNI_AGENT_ID", "MINNI_VAULT_PATH", "MINNI_SOCKET_PATH",
             "MINNI_AFM_PROVIDER_MODE", "MINNI_AFM_NATIVE_HELPER",
+            # Preserve previously stamped codex hook mirrors when still present.
+            "MINNI_CODEX_AGENT_ID", "MINNI_CODEX_VAULT_PATH",
+            "MINNI_CODEX_WORKSPACE_ID",
         ):
             if key in ex_env:
                 env[key] = ex_env[key]
         if "MINNI_WORKSPACE_ID" in ex_env and not explicit_workspace:
             env["MINNI_WORKSPACE_ID"] = ex_env["MINNI_WORKSPACE_ID"]
+    _mirror_codex_hook_env(env, agent)
     cwd = server_path.parent.parent if server_path.parent.name == "dist" else server_path.parent
     return {
         "mcpServers": {
@@ -519,6 +541,8 @@ def replace_toml_sections(
             for key in (
                 "MINNI_AGENT_ID", "MINNI_VAULT_PATH", "MINNI_SOCKET_PATH",
                 "MINNI_WORKSPACE_ID", "MINNI_AFM_PROVIDER_MODE", "MINNI_AFM_NATIVE_HELPER",
+                "MINNI_CODEX_AGENT_ID", "MINNI_CODEX_VAULT_PATH",
+                "MINNI_CODEX_WORKSPACE_ID",
             ):
                 if key in ex_env:
                     val = ex_env[key]
@@ -528,6 +552,24 @@ def replace_toml_sections(
                     continue
                 preserved_lines.append(f'{key} = "{_toml_basic_str(val)}"')
             if preserved_lines:
+                # If agent is codex and CODEX mirrors were missing from both
+                # existing and fresh, stamp them from the resolved MINNI_*.
+                resolved: dict = {}
+                for key in (
+                    "MINNI_AGENT_ID", "MINNI_VAULT_PATH", "MINNI_SOCKET_PATH",
+                    "MINNI_WORKSPACE_ID", "MINNI_AFM_PROVIDER_MODE",
+                    "MINNI_AFM_NATIVE_HELPER", "MINNI_CODEX_AGENT_ID",
+                    "MINNI_CODEX_VAULT_PATH", "MINNI_CODEX_WORKSPACE_ID",
+                ):
+                    if key in ex_env:
+                        resolved[key] = ex_env[key]
+                    elif key in fresh_env:
+                        resolved[key] = fresh_env[key]
+                if str(resolved.get("MINNI_AGENT_ID") or "") == "codex":
+                    _mirror_codex_hook_env(resolved, "codex")
+                    preserved_lines = [
+                        f'{k} = "{_toml_basic_str(v)}"' for k, v in resolved.items()
+                    ]
                 sections["mcp_servers.minni.env"] = (
                     "[mcp_servers.minni.env]\n" + "\n".join(preserved_lines)
                 )
@@ -550,6 +592,22 @@ def update_toml_mcp_config(
     explicit_workspace: bool = False,
     afm_env: dict[str, str] | None = None,
 ) -> None:
+    ws = normalize_workspace_id(str(workspace))
+    env_lines = [
+        f'MINNI_AGENT_ID = "{_toml_basic_str(agent)}"',
+        f'MINNI_VAULT_PATH = "{_toml_basic_str(vault)}"',
+        f'MINNI_SOCKET_PATH = "{_toml_basic_str(socket_path)}"',
+        f'MINNI_WORKSPACE_ID = "{_toml_basic_str(ws)}"',
+    ]
+    for k, v in (afm_env or {}).items():
+        env_lines.append(f'{k} = "{_toml_basic_str(v)}"')
+    if agent == "codex":
+        # Codex hooks read only MINNI_CODEX_*; stamp mirrors from resolved identity.
+        env_lines.extend([
+            f'MINNI_CODEX_AGENT_ID = "{_toml_basic_str(agent)}"',
+            f'MINNI_CODEX_VAULT_PATH = "{_toml_basic_str(vault)}"',
+            f'MINNI_CODEX_WORKSPACE_ID = "{_toml_basic_str(ws)}"',
+        ])
     replace_toml_sections(
         path,
         {
@@ -560,14 +618,7 @@ def update_toml_mcp_config(
                 "enabled = true"
             ),
             "mcp_servers.minni.env": (
-                "[mcp_servers.minni.env]\n"
-                f'MINNI_AGENT_ID = "{_toml_basic_str(agent)}"\n'
-                f'MINNI_VAULT_PATH = "{_toml_basic_str(vault)}"\n'
-                f'MINNI_SOCKET_PATH = "{_toml_basic_str(socket_path)}"\n'
-                f'MINNI_WORKSPACE_ID = "{_toml_basic_str(normalize_workspace_id(str(workspace)))}"'
-                + "".join(
-                    f'\n{k} = "{_toml_basic_str(v)}"' for k, v in (afm_env or {}).items()
-                )
+                "[mcp_servers.minni.env]\n" + "\n".join(env_lines)
             ),
         },
         preserve_surface_env=not explicit_workspace,
