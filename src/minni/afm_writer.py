@@ -91,6 +91,11 @@ WRITE_FAILURES_RECENT_SECONDS = 3600.0
 # forever. A non-aging residue keeps the status surface out of ok until the
 # process is reset (or an operator clears counters) — permanent damage must
 # not wear a temporary badge.
+# Round 13: stamp unrecovered ONLY when the waiter already left
+# (``waiter_timed_out``). An observed DraftWriteError already has loud
+# surfaces (write_failed + pass failure + recency-windowed write_failures);
+# counting those as unrecovered latched `backlogged` for the process lifetime
+# after a single transient vault blip — the same latch class rounds 2–3 killed.
 _UNRECOVERED_WRITE_FAILURES = 0
 # Review round 5 on PR #260: at most ONE queued job per pass. A write_timeout
 # response means the job is STILL queued and will land when the writer drains
@@ -107,6 +112,12 @@ _IN_FLIGHT_LOCK = threading.Lock()
 # still succeed. The worker then runs the per-job lifecycle_handler once —
 # apply exactly once without regenerating drafts. (Process-global handler was
 # last-writer-wins under concurrent compiles; the applier lives on the job.)
+# Round 13: if deferred lifecycle apply fails after drafts landed, candidates
+# stay proposed and a concurrent resubmit would mint a second draft set. Count
+# the failure and block the pass until apply succeeds (retry on next submit).
+_LIFECYCLE_APPLY_FAILURES = 0
+_LAST_LIFECYCLE_APPLY_FAILURE_AT: Optional[float] = None
+_PENDING_LIFECYCLE: dict[str, dict] = {}
 
 
 # A pass is stale once it has been silent for this multiple of its configured
@@ -184,11 +195,15 @@ def reset_pass_counters() -> None:
     _WRITE_TIMEOUTS = 0
     _LAST_WRITE_TIMEOUT_AT = None
     global _WRITE_FAILURES, _LAST_WRITE_FAILURE_AT, _UNRECOVERED_WRITE_FAILURES
+    global _LIFECYCLE_APPLY_FAILURES, _LAST_LIFECYCLE_APPLY_FAILURE_AT
     _WRITE_FAILURES = 0
     _LAST_WRITE_FAILURE_AT = None
     _UNRECOVERED_WRITE_FAILURES = 0
+    _LIFECYCLE_APPLY_FAILURES = 0
+    _LAST_LIFECYCLE_APPLY_FAILURE_AT = None
     with _IN_FLIGHT_LOCK:
         _IN_FLIGHT_PER_PASS.clear()
+        _PENDING_LIFECYCLE.clear()
 
 
 def _parse_iso_utc(value: str) -> Optional[float]:
@@ -399,13 +414,24 @@ def derive_loop_status(
             f"write job(s) FAILED in the writer ({wfail_seen}; {wfails} over "
             "the process lifetime) — those drafts were never written"
         )
-    # Round 9: non-aging residue of write failures. Recency-windowed counts
-    # alone let permanent draft loss age into "ok"; this does not.
+    # Round 9/13: non-aging residue of unobserved write failures (waiter gone).
     unrecovered = int(state.get("unrecovered_write_failures", 0) or 0)
     if unrecovered:
         reasons.append(
             f"{unrecovered} unrecovered write failure(s) — drafts never "
-            "landed; status stays out of ok until counters are reset"
+            "landed after write_timeout; status stays out of ok until counters "
+            "are reset"
+        )
+    # Round 13: deferred lifecycle failed after drafts landed — candidates
+    # still proposed; refuse/status while any pass is still pending apply.
+    # Lifetime lifecycle_apply_failures is data only (not a status latch).
+    pending_lc = int(state.get("pending_lifecycle_passes", 0) or 0)
+    lc_fails = int(state.get("lifecycle_apply_failures", 0) or 0)
+    if pending_lc:
+        reasons.append(
+            f"deferred lifecycle apply incomplete "
+            f"({pending_lc} pass(es) pending; {lc_fails} failure(s) lifetime) "
+            "— resubmit refused until apply succeeds or counters are reset"
         )
     # Round 6 (PR #260): a job in flight NOW is current truth — no recency
     # window. Neither of the other writer signals covers a hung mid-job write:
@@ -458,6 +484,7 @@ def derive_loop_status(
         or timed_out_recently
         or write_failed_recently
         or unrecovered
+        or pending_lc
         or jobs_in_flight
         or (oldest_ts is not None and (now - oldest_ts) / 86400.0 > ttl_days)
     ):
@@ -776,42 +803,61 @@ def _write_batch(job: dict) -> dict:
     return result
 
 
-def _maybe_apply_deferred_lifecycle(job: dict) -> None:
+def _maybe_apply_deferred_lifecycle(job: dict) -> bool:
     """If the waiter timed out and left lifecycle to us, apply it once.
 
     Round 12: claim ownership under the in-flight lock *before* invoking the
     handler so waiter and worker cannot both run the applier.
+
+    Returns True when lifecycle is fully applied (or there was nothing to do),
+    False when apply was required and failed — caller must keep the pass busy.
     """
     lifecycle = job.get("lifecycle") or {}
-    if not (
+    has_ops = bool(
         lifecycle.get("promote_candidate_ids")
         or lifecycle.get("dedup_candidate_ids")
         or lifecycle.get("review_candidate_ids")
-    ):
-        return
+    )
+    if not has_ops:
+        return True
     handler = job.get("lifecycle_handler")
     with _IN_FLIGHT_LOCK:
         if not job.get("defer_lifecycle_to_worker"):
-            return
-        if job.get("lifecycle_applied") or job.get("lifecycle_applying"):
-            return
+            return True
+        if job.get("lifecycle_applied"):
+            return True
+        if job.get("lifecycle_applying"):
+            return False
         if not callable(handler):
             logger.warning(
                 "AFM writer: deferred lifecycle for pass %r has no handler; "
                 "candidates stay proposed until a later pass",
                 job.get("pass_name"),
             )
-            return
+            return False
         # Claim before invoke so a concurrent waiter cannot double-enter.
         job["lifecycle_applying"] = True
     try:
         handler(lifecycle)
         job["lifecycle_applied"] = True
+        pass_name = str(job.get("pass_name") or "unknown")
+        with _IN_FLIGHT_LOCK:
+            _PENDING_LIFECYCLE.pop(pass_name, None)
+        return True
     except Exception:
+        global _LIFECYCLE_APPLY_FAILURES, _LAST_LIFECYCLE_APPLY_FAILURE_AT
+        pass_name = str(job.get("pass_name") or "unknown")
+        with _IN_FLIGHT_LOCK:
+            _LIFECYCLE_APPLY_FAILURES += 1
+            _LAST_LIFECYCLE_APPLY_FAILURE_AT = time.time()
+            _PENDING_LIFECYCLE[pass_name] = dict(lifecycle)
+        job["lifecycle_apply_failed"] = True
         logger.exception(
-            "AFM writer: deferred lifecycle apply failed for pass %r",
+            "AFM writer: deferred lifecycle apply failed for pass %r — "
+            "holding resubmit until apply succeeds",
             job.get("pass_name"),
         )
+        return False
     finally:
         job["lifecycle_applying"] = False
 
@@ -819,6 +865,7 @@ def _maybe_apply_deferred_lifecycle(job: dict) -> None:
 def _process_job(job: dict, done: threading.Event, out: dict) -> None:
     """One queued batch, start to Event. Extracted from the worker loop so the
     failure accounting is testable without driving the daemon thread."""
+    lifecycle_hold = False
     try:
         out["result"] = _write_batch(job)
         # Round 12: deferred lifecycle runs BEFORE done.set() so the in-flight
@@ -826,7 +873,10 @@ def _process_job(job: dict, done: threading.Event, out: dict) -> None:
         # candidates are no longer proposed. Clearing in-flight first opened a
         # window where a second wet compile minted a new draft set for the
         # same decision (the exact AFM-8 duplicate the guard exists to stop).
-        _maybe_apply_deferred_lifecycle(job)
+        # Round 13: if apply fails, keep the pass busy (done stays unset) and
+        # record sticky pending lifecycle so status stays out of ok.
+        if not _maybe_apply_deferred_lifecycle(job):
+            lifecycle_hold = True
     except Exception as exc:
         out["error"] = str(exc)
         # Round 8: count HERE, unconditionally. A waiter that already timed
@@ -834,19 +884,31 @@ def _process_job(job: dict, done: threading.Event, out: dict) -> None:
         # records a pass failure, and the drafts silently never land. A waiter
         # that is still present raises too, but that is a different metric
         # for the same event, not double-counting this one.
-        # Round 9: also stamp a non-aging unrecovered counter so the status
-        # surface cannot return to ok while those drafts are permanently gone.
+        # Round 9/13: unrecovered only when the waiter already left — observed
+        # failures already surface as write_failed + pass failure.
         global _WRITE_FAILURES, _LAST_WRITE_FAILURE_AT, _UNRECOVERED_WRITE_FAILURES
         with _IN_FLIGHT_LOCK:
             _WRITE_FAILURES += 1
             _LAST_WRITE_FAILURE_AT = time.time()
-            _UNRECOVERED_WRITE_FAILURES += 1
+            # Unobserved only: waiter already returned write_timeout.
+            if job.get("waiter_timed_out") or job.get("defer_lifecycle_to_worker"):
+                _UNRECOVERED_WRITE_FAILURES += 1
         logger.error(
             "AFM writer: batch for pass %r FAILED (%d draft(s) not written): %s",
             job.get("pass_name"), len(job.get("drafts") or []), exc,
         )
     finally:
-        done.set()
+        if not lifecycle_hold:
+            done.set()
+        else:
+            # Sticky refuse: leave Event unset so submit_drafts returns
+            # write_in_flight. Operator must clear counters / restart, or a
+            # later successful re-apply path can clear pending (see submit).
+            logger.error(
+                "AFM writer: pass %r holding in-flight after deferred "
+                "lifecycle failure — resubmit refused",
+                job.get("pass_name"),
+            )
 
 
 def _worker() -> None:
@@ -887,6 +949,21 @@ def submit_drafts(job: dict, wait: bool = True, timeout: Optional[float] = 30.0)
     done = threading.Event()
     out: dict = {}
     with _IN_FLIGHT_LOCK:
+        # Round 13: sticky pending lifecycle (apply failed after drafts
+        # landed) refuses a new batch so we do not mint a second draft set.
+        if pass_name in _PENDING_LIFECYCLE:
+            logger.warning(
+                "AFM writer: pass %r has pending deferred lifecycle; REFUSED "
+                "%d draft(s) — apply must succeed before a new batch",
+                pass_name, len(job.get("drafts") or []),
+            )
+            return {
+                "status": "write_in_flight",
+                "queue_depth": _WORK_QUEUE.qsize(),
+                "drafts_written": [],
+                "drafts_deferred": len(job.get("drafts") or []),
+                "lifecycle_pending": True,
+            }
         prior = _IN_FLIGHT_PER_PASS.get(pass_name)
         if prior is not None and not prior.is_set():
             # Round 5: the previous batch for this pass is still queued and
@@ -938,6 +1015,9 @@ def submit_drafts(job: dict, wait: bool = True, timeout: Optional[float] = 30.0)
                 # return write_timeout (not when a result is already present).
                 _WRITE_TIMEOUTS += 1
                 _LAST_WRITE_TIMEOUT_AT = time.time()
+                # Round 13: mark waiter gone so a later worker-side write
+                # failure stamps unrecovered (not observed DraftWriteError).
+                job["waiter_timed_out"] = True
                 if job.get("lifecycle"):
                     job["defer_lifecycle_to_worker"] = True
         if err is not None:
@@ -1051,6 +1131,10 @@ def writer_status(
         "write_failures": _WRITE_FAILURES,
         "last_write_failure_at": _LAST_WRITE_FAILURE_AT,
         "unrecovered_write_failures": _UNRECOVERED_WRITE_FAILURES,
+        "pending_lifecycle_passes": len(_PENDING_LIFECYCLE),
+        "pending_lifecycle_pass_names": sorted(_PENDING_LIFECYCLE),
+        "lifecycle_apply_failures": _LIFECYCLE_APPLY_FAILURES,
+        "last_lifecycle_apply_failure_at": _LAST_LIFECYCLE_APPLY_FAILURE_AT,
         "failures_per_pass": dict(_FAILURES_PER_PASS),
         "last_failure_per_pass": dict(_LAST_FAILURE_PER_PASS),
     }

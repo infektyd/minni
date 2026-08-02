@@ -823,7 +823,7 @@ def test_a_late_write_failure_is_counted_even_with_no_waiter(monkeypatch):
     """Round 8: a batch failing AFTER its submitter timed out had no observer
     at all — no DraftWriteError (waiter gone), no pass failure, no counter.
     The worker itself now counts every batch failure.
-    Round 9: also stamps a non-aging unrecovered counter."""
+    Round 9/13: unrecovered stamps only when the waiter already left."""
     import threading
 
     from minni import afm_writer
@@ -836,12 +836,30 @@ def test_a_late_write_failure_is_counted_even_with_no_waiter(monkeypatch):
     monkeypatch.setattr(afm_writer, "_write_batch", _explode)
     done = threading.Event()
     out: dict = {}
+    # Observed failure (waiter still present): write_failures++, no unrecovered.
     afm_writer._process_job({"pass_name": "p", "drafts": [{"title": "t"}]}, done, out)
-
     assert done.is_set(), "the Event must settle so in-flight state clears"
     assert "error" in out
     assert afm_writer._WRITE_FAILURES == 1
     assert afm_writer._LAST_WRITE_FAILURE_AT is not None
+    assert afm_writer._UNRECOVERED_WRITE_FAILURES == 0, (
+        "observed failures already have write_failed; unrecovered is for "
+        "waiter-gone only"
+    )
+
+    # Unobserved failure (waiter_timed_out — waiter already left): unrecovered.
+    done2 = threading.Event()
+    out2: dict = {}
+    afm_writer._process_job(
+        {
+            "pass_name": "p",
+            "drafts": [{"title": "t2"}],
+            "waiter_timed_out": True,
+        },
+        done2,
+        out2,
+    )
+    assert afm_writer._WRITE_FAILURES == 2
     assert afm_writer._UNRECOVERED_WRITE_FAILURES == 1
     afm_writer.reset_pass_counters()
 
@@ -1035,6 +1053,67 @@ def test_deferred_lifecycle_holds_in_flight_until_handler_returns(monkeypatch):
     t.join(timeout=5)
     assert done.is_set()
     assert len(applied) == 1
+    afm_writer.reset_pass_counters()
+
+
+def test_deferred_lifecycle_failure_refuses_resubmit_and_surfaces(monkeypatch):
+    """Round 13: deferred apply raises after drafts land → sticky refuse + status."""
+    import threading
+    import queue as queue_mod
+
+    from minni import afm_writer
+
+    afm_writer.reset_pass_counters()
+    monkeypatch.setattr(afm_writer, "_ensure_worker", lambda: None)
+    monkeypatch.setattr(afm_writer, "_WORK_QUEUE", queue_mod.Queue(maxsize=4))
+    monkeypatch.setattr(
+        afm_writer,
+        "_write_batch",
+        lambda job: {"drafts_written": [{"page_id": "d1"}], "inbox_path": "x"},
+    )
+
+    def _boom(life):
+        raise RuntimeError("db blip during lifecycle")
+
+    done = threading.Event()
+    out: dict = {}
+    job = {
+        "pass_name": "consolidation",
+        "drafts": [{"title": "t"}],
+        "lifecycle": {
+            "promote_candidate_ids": [1],
+            "dedup_candidate_ids": [],
+            "review_candidate_ids": [],
+        },
+        "lifecycle_handler": _boom,
+        "defer_lifecycle_to_worker": True,
+    }
+    with afm_writer._IN_FLIGHT_LOCK:
+        afm_writer._IN_FLIGHT_PER_PASS["consolidation"] = done
+
+    afm_writer._process_job(job, done, out)
+    assert not done.is_set(), "lifecycle failure must keep in-flight set"
+    assert afm_writer._LIFECYCLE_APPLY_FAILURES == 1
+    assert "consolidation" in afm_writer._PENDING_LIFECYCLE
+
+    second = afm_writer.submit_drafts(
+        {"pass_name": "consolidation", "drafts": [{"title": "dup"}]},
+        timeout=0.05,
+    )
+    assert second["status"] == "write_in_flight"
+    assert second.get("lifecycle_pending") is True
+
+    status, reasons = afm_writer.derive_loop_status(
+        {
+            "last_attempt_per_pass": {"consolidation": 1_000_000.0},
+            "pending_lifecycle_passes": 1,
+            "lifecycle_apply_failures": 1,
+        },
+        schedule={"passes": {"consolidation": {"interval_seconds": 3600}}},
+        now=1_000_000.0,
+    )
+    assert status == "backlogged"
+    assert any("deferred lifecycle" in r for r in reasons)
     afm_writer.reset_pass_counters()
 
 

@@ -371,10 +371,27 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
                         principal_for_documents=principal,
                     )
                 except Exception as exc:
+                    # Round 13 (PR #260): personal leg failure was log-only while
+                    # the shared fallback could still report degraded:false —
+                    # personal memory never ran, response looked healthy.
+                    detail = f"personal vault index failed: {exc}"[:400]
                     context.logger.warning(
                         "search: personal vault index failed for %s (%s); falling back to shared",
                         agent_id,
                         exc,
+                    )
+                    degradations.append(
+                        {
+                            "src": "p",
+                            "vector_model": getattr(
+                                getattr(context, "config", None),
+                                "embedding_model",
+                                None,
+                            ),
+                            "vector_degraded": False,
+                            "degraded": True,
+                            "personal_index_failed": detail,
+                        }
                     )
             return retrieve_shared()
 

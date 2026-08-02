@@ -339,7 +339,18 @@ function reportBridgeFailure(event, error, onUndelivered) {
     );
     return false;
   }
-  return spawnBridgeDiagnostic(event, detail, onUndelivered);
+  const accepted = spawnBridgeDiagnostic(event, detail, onUndelivered);
+  // Round 13: sync spawn failure (EMFILE, bad hook path) used to die at
+  // console.warn only — same P6 hole as budget-full, without the coalesce.
+  if (!accepted) {
+    diagnosticsSuppressed += 1;
+    queueSuppressedFailure(event, detail);
+    console.warn(
+      `[minni] bridge diagnostic spawn failed; carrying forward for flush ` +
+        `(${diagnosticsSuppressed} suppressed since start)`,
+    );
+  }
+  return accepted;
 }
 
 async function runHookFailOpen(event, payload) {
