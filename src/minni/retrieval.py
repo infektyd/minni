@@ -513,11 +513,19 @@ class RetrievalEngine:
             def _match(match_expr: str):
                 # Fetch happens inside the retry helper (review r3): the
                 # vtable race can also fire while stepping the SELECT.
+                # f.content AS chunk_text: an FTS-only hit carried no body at
+                # all, so `text` came back empty. That was survivable while
+                # every indexed page also had chunks; it is not now that
+                # unendorsed pages are deliberately unembedded, which makes FTS
+                # their ONLY body path. A draft returned to an include_drafts
+                # caller with no text is a hollow hit. Snippet depth truncates,
+                # and document depth wants the whole page anyway.
                 return _fts_execute_with_retry(c, f"""
                     SELECT f.doc_id, d.path, d.agent, d.sigil,
                            rank AS bm25_rank, d.decay_score,
                            d.page_status, d.privacy_level, d.page_type,
-                           d.evidence_refs, d.indexed_at, d.layer
+                           d.evidence_refs, d.indexed_at, d.layer,
+                           f.content AS chunk_text
                     FROM vault_fts f
                     JOIN documents d ON d.doc_id = f.doc_id
                     WHERE vault_fts MATCH ?
@@ -555,6 +563,7 @@ class RetrievalEngine:
                     "evidence_refs": row["evidence_refs"],
                     "indexed_at": row["indexed_at"],
                     "layer": row["layer"] or "knowledge",
+                    "chunk_text": row["chunk_text"] or "",
                 })
 
         return results
@@ -1567,9 +1576,14 @@ class RetrievalEngine:
                 ORDER BY chunk_id
             """, (doc_id,))
             rows = c.fetchall()
-        if not rows:
-            return None
-        return "\n".join(row["chunk_text"] for row in rows)
+            if rows:
+                return "\n".join(row["chunk_text"] for row in rows)
+            # No chunks is the NORMAL state for an unendorsed page (see
+            # indexer.UNEMBEDDED_STATUSES), not a missing document. Fall back to
+            # the FTS copy so document depth returns the page instead of None.
+            c.execute("SELECT content FROM vault_fts WHERE doc_id = ?", (doc_id,))
+            fts_row = c.fetchone()
+        return fts_row["content"] if fts_row and fts_row["content"] else None
 
     # ── Public API ─────────────────────────────────────────────
 

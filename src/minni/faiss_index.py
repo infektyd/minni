@@ -17,6 +17,8 @@ import logging
 import sqlite3
 from typing import Dict, List, Optional, Tuple
 
+import threading
+
 import numpy as np
 
 from minni.config import SovereignConfig, DEFAULT_CONFIG
@@ -45,6 +47,13 @@ class FAISSIndex:
         self._chunk_ids: List[int] = []
         self._current_type = "flat"
         self._faiss = None
+        # Guards every read/replace of the index state below. invalidate() is
+        # called from the daemon's vault-watch thread while searches run on RPC
+        # worker threads: clearing _index / _id_map / _chunk_ids in place under
+        # a concurrent search let that search see a half-cleared structure --
+        # dropped ids, empty hits, or an attribute error on a None index.
+        # Reentrant because search() can fall through to a rebuild.
+        self._lock = threading.RLock()
 
         self._load_faiss()
 
@@ -89,6 +98,14 @@ class FAISSIndex:
         if len(chunk_ids) == 0:
             return
 
+        with self._lock:
+            self._build_from_vectors_locked(chunk_ids, embeddings)
+
+    def _build_from_vectors_locked(
+        self,
+        chunk_ids: List[int],
+        embeddings: np.ndarray,
+    ) -> None:
         self._chunk_ids = list(chunk_ids)
         self._vectors = [embeddings[i] for i in range(len(chunk_ids))]
         self._id_map = {i: cid for i, cid in enumerate(chunk_ids)}
@@ -191,6 +208,10 @@ class FAISSIndex:
         Add a single vector to the index.
         For bulk operations, use build_from_vectors() instead.
         """
+        with self._lock:
+            self._add_locked(chunk_id, embedding)
+
+    def _add_locked(self, chunk_id: int, embedding: np.ndarray) -> None:
         self._chunk_ids.append(chunk_id)
         self._vectors.append(embedding.copy())
         idx = len(self._chunk_ids) - 1
@@ -218,9 +239,10 @@ class FAISSIndex:
         Remove a vector by chunk_id.
         Marks it for exclusion — actual removal happens on next rebuild.
         """
-        if chunk_id in self._reverse_map:
-            idx = self._reverse_map.pop(chunk_id)
-            self._id_map.pop(idx, None)
+        with self._lock:
+            if chunk_id in self._reverse_map:
+                idx = self._reverse_map.pop(chunk_id)
+                self._id_map.pop(idx, None)
             # Note: FAISS doesn't support true deletion for HNSW.
             # We filter results in search() instead. Periodic rebuild cleans up.
 
@@ -239,6 +261,17 @@ class FAISSIndex:
         Returns:
             List of (chunk_id, similarity_score) sorted by score descending.
         """
+        # Held for the whole read: the index and the id maps must be observed
+        # as one consistent snapshot, or a concurrent invalidate()/rebuild
+        # resolves internal indices against maps that no longer match them.
+        with self._lock:
+            return self._search_locked(query_embedding, top_k)
+
+    def _search_locked(
+        self,
+        query_embedding: np.ndarray,
+        top_k: int = 20,
+    ) -> List[Tuple[int, float]]:
         if self.count == 0:
             return []
 
@@ -290,6 +323,10 @@ class FAISSIndex:
 
     def rebuild(self) -> None:
         """Force a full rebuild from stored vectors (cleans up deletions)."""
+        with self._lock:
+            self._rebuild_locked()
+
+    def _rebuild_locked(self) -> None:
         if self._chunk_ids and self._vectors:
             # Filter out removed
             live_ids = []
@@ -317,12 +354,17 @@ class FAISSIndex:
         ``RetrievalEngine._ensure_faiss_loaded`` uses to decide to rebuild — so
         an out-of-process writer that added chunk rows can make a warm engine
         pick them up without a restart.
+
+        Taken under the lock, and as a single rebind of each attribute rather
+        than in-place mutation, so a concurrent search sees either the old
+        index or an empty one -- never a partly cleared one.
         """
-        self._chunk_ids = []
-        self._vectors = []
-        self._id_map = {}
-        self._reverse_map = {}
-        self._index = None
+        with self._lock:
+            self._chunk_ids = []
+            self._vectors = []
+            self._id_map = {}
+            self._reverse_map = {}
+            self._index = None
 
     def get_stats(self) -> Dict:
         """Return index statistics."""

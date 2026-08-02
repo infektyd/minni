@@ -1093,3 +1093,133 @@ def test_drafts_cannot_crowd_the_chronological_window(tmp_path, monkeypatch):
         assert not any(r.get("review_state") in {"draft", "expired"} for r in results)
     finally:
         eng.db.close()
+
+
+# ── Round 8: findings from the seventh Grok review of #256 ─────────────────
+
+
+def test_unembedded_draft_returns_its_body_not_an_empty_hit(tmp_path, monkeypatch):
+    """Grok round 7 #1. Unendorsed pages are deliberately unembedded, so FTS is
+    their ONLY body path. _fts_search carried no chunk_text at all, so an
+    include_drafts caller on the default sort got a hit with empty `text` --
+    'indexed and lexically searchable' was true of the row and false of the
+    content. The round-2 test only asserted filename, so empty bodies passed."""
+    from minni.index_all import index_shared_vault
+
+    _install_fake_embedder(monkeypatch)
+    cfg = _make_cfg(tmp_path)
+    vault = Path(cfg.vault_path)
+    _write_page(vault / "wiki" / "concepts" / "only-draft.md", "draft",
+                "singular findable phrase herein and a distinctive body sentence")
+    index_shared_vault(cfg)
+
+    eng = _engine(cfg)
+    try:
+        eng.config.reranker_enabled = False
+        hits = eng.retrieve("singular findable phrase herein", limit=5, include_drafts=True)
+        assert hits, "include_drafts did not reach the draft at all"
+        hit = next(h for h in hits if h.get("filename", "").endswith("only-draft.md"))
+        # Snippet depth truncates to _SNIPPET_MAX_CHARS, and the EVIDENCE
+        # envelope plus the page's frontmatter can fill that budget, so assert
+        # the body is PRESENT rather than that a specific sentence survived.
+        assert hit.get("text", "").strip(), "draft came back as a hollow hit with no body"
+        assert "only-draft" in hit["text"]
+
+        # Document depth is not truncated: the whole page must come back, which
+        # is the assertion that would have failed while _fetch_full_document
+        # read chunk_embeddings alone and returned None for an unembedded page.
+        deep = eng.retrieve(
+            "singular findable phrase herein", limit=5,
+            include_drafts=True, depth="document",
+        )
+        doc = next(h for h in deep if h.get("filename", "").endswith("only-draft.md"))
+        assert "distinctive body sentence" in doc.get("text", ""), (
+            "document depth returned no body for an unembedded page"
+        )
+    finally:
+        eng.db.close()
+
+
+def test_faiss_invalidate_is_atomic_against_concurrent_search(tmp_path, monkeypatch):
+    """Grok round 7 #2. invalidate() runs on the vault-watch thread while
+    searches run on RPC workers. Clearing the index and id maps in place under a
+    concurrent search let that search resolve internal indices against maps that
+    no longer matched them."""
+    import threading
+
+    import numpy as np
+    from minni.config import SovereignConfig
+    from minni.faiss_index import FAISSIndex
+
+    cfg = SovereignConfig(
+        db_path=str(tmp_path / "s" / "m.db"), vault_path=str(tmp_path / "vault"),
+        graph_export_dir=str(tmp_path / "g"), faiss_index_path=str(tmp_path / "f.faiss"),
+        writeback_enabled=False,
+    )
+    idx = FAISSIndex(cfg)
+    n = 400
+    ids = list(range(1, n + 1))
+    vecs = np.random.rand(n, cfg.embedding_dim).astype(np.float32)
+    idx.build_from_vectors(ids, vecs)
+
+    errors = []
+    stop = threading.Event()
+
+    def searcher():
+        q = np.random.rand(cfg.embedding_dim).astype(np.float32)
+        while not stop.is_set():
+            try:
+                for cid, _ in idx.search(q, top_k=10):
+                    # A chunk_id must always be one we actually put in.
+                    if cid not in set(ids):
+                        errors.append(f"unknown chunk_id {cid}")
+            except Exception as exc:
+                errors.append(repr(exc))
+
+    def churner():
+        for _ in range(40):
+            idx.invalidate()
+            idx.build_from_vectors(ids, vecs)
+
+    threads = [threading.Thread(target=searcher) for _ in range(3)]
+    for t in threads:
+        t.start()
+    try:
+        churner()
+    finally:
+        stop.set()
+        for t in threads:
+            t.join(timeout=10)
+
+    assert not errors, f"concurrent search saw a torn index: {errors[:5]}"
+
+
+def test_idle_sweep_skips_the_faiss_rebuild(tmp_path, monkeypatch):
+    """Grok round 7 #3. Phase 3 re-read every embedding in the shared DB and
+    rebuilt a throwaway index on every 300s tick, even when phase 1 was all
+    skips. Cost scales with the whole table rather than with the work done."""
+    from minni.index_all import index_shared_vault
+    from minni.indexer import VaultIndexer
+
+    _install_fake_embedder(monkeypatch)
+    cfg = _make_cfg(tmp_path)
+    _write_page(Path(cfg.vault_path) / "wiki" / "concepts" / "p.md", "accepted",
+                "body text " * 40)
+    index_shared_vault(cfg)
+
+    calls = []
+    real = VaultIndexer._rebuild_faiss_index
+    monkeypatch.setattr(
+        VaultIndexer, "_rebuild_faiss_index",
+        lambda self: (calls.append(1), real(self))[1],
+    )
+
+    stats = index_shared_vault(cfg)[str(cfg.vault_path)]
+    assert stats["indexed"] == 0 and stats["deleted"] == 0, "not an idle sweep"
+    assert calls == [], "idle sweep still rebuilt the FAISS index"
+
+    # ...but a sweep that DOES change something must still rebuild.
+    page = Path(cfg.vault_path) / "wiki" / "concepts" / "q.md"
+    _write_page(page, "accepted", "new body text " * 40)
+    index_shared_vault(cfg)
+    assert calls, "a sweep that indexed a new page skipped the rebuild"

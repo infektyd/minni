@@ -510,9 +510,15 @@ class VaultIndexer:
                 c.executemany("DELETE FROM vault_fts WHERE doc_id = ?", to_delete)
                 c.executemany("DELETE FROM documents WHERE doc_id = ?", to_delete)
 
-        # Phase 3: Rebuild FAISS index from all embeddings
-        self._rebuild_faiss_index()
-        self._sync_vector_backends()
+        # Phase 3: Rebuild FAISS index from all embeddings -- but only if this
+        # run actually touched any. On the daemon's 300s timer an idle vault
+        # otherwise re-SELECTed every embedding in the shared DB and rebuilt an
+        # index on an instance that is discarded when this call returns, purely
+        # to discover nothing had changed. Cheap at today's chunk count, but it
+        # scales with the whole table rather than with the work done.
+        if stats["indexed"] or stats["deleted"] or stats["chunks"] or stats["chunks_purged"]:
+            self._rebuild_faiss_index()
+            self._sync_vector_backends()
 
         return {"status": "success", **stats}
 
