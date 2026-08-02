@@ -357,8 +357,19 @@ def main(argv: list[str] | None = None) -> int:
         is_worktree_link = False
         if dist.is_symlink():
             target = dist.resolve()
-            repo = REPO_ROOT.resolve()
-            if target == SOURCE_DIST.resolve() or str(target).startswith(str(repo) + os.sep):
+            # Only the live plugins/minni/dist working tree is WORKTREE — a
+            # symlink into some other path under the repo (e.g. a frozen
+            # release-artifacts/.../dist) is a reproducible artifact and is
+            # judged by its manifest like any copy. Prefix-matching the whole
+            # repo over-fired on those.
+            source_dist = SOURCE_DIST.resolve()
+            same_as_source = target == source_dist
+            if not same_as_source:
+                try:
+                    same_as_source = target.samefile(source_dist)
+                except OSError:
+                    same_as_source = False
+            if same_as_source:
                 rows.append((
                     "WORKTREE",
                     "dist -> repo working tree (executes uncommitted state)",

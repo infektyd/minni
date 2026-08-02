@@ -395,7 +395,11 @@ def run_wire(args) -> int:
                 agy_hooks = extras.get("agy_hooks")
                 if isinstance(agy_hooks, dict) and agy_hooks.get("installed") is False:
                     agy_reason = str(agy_hooks.get("reason", "unknown"))
-                    if "not found on path" in agy_reason.lower():
+                    # Prefer structured error_class from update_agy_plugin_hooks;
+                    # do not classify by substring (a real registration failure
+                    # can mention "path" in nested tool text).
+                    missing_cli = agy_hooks.get("error_class") == "missing_cli"
+                    if missing_cli:
                         hook_gap_reason = (
                             f"wired WITHOUT agy hooks: {agy_reason} — lifecycle "
                             "hooks will not fire until agy is installed and "

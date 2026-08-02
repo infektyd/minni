@@ -403,6 +403,7 @@ def update_agy_plugin_hooks(install_root: Path) -> dict[str, object]:
     if not agy:
         return {
             "installed": False,
+            "error_class": "missing_cli",
             "reason": "agy CLI not found on PATH; hook registration skipped",
         }
     hooks_data = json.loads(template.read_text(encoding="utf-8"))

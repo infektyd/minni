@@ -131,3 +131,22 @@ def test_refuses_non_git_directory(tmp_path):
     assert proc.returncode == 1
     assert "REFUSING" in proc.stderr
     assert "not a git checkout" in proc.stderr
+
+
+def test_accepts_worktree_git_file(cloned, tmp_path):
+    """Round-2 Med: a linked worktree has `.git` as a *file* (gitdir: …).
+    `-d .git` alone refused every worktree as 'not a git checkout'."""
+    _origin, clone = cloned
+    wt = tmp_path / "linked-wt"
+    # Detached HEAD worktree: main is already checked out in `clone`.
+    head = _git(clone, "rev-parse", "HEAD")
+    _git(clone, "worktree", "add", "--detach", str(wt), head)
+    assert (wt / ".git").is_file(), "fixture must be a linked worktree"
+    # Dry-run only: real run would refuse non-main / non-launchd. We only
+    # need to prove the script gets past the git-checkout gate.
+    proc = _run(wt, "--dry-run")
+    combined = proc.stdout + proc.stderr
+    assert "not a git checkout" not in combined, combined
+    assert "is not a git checkout" not in combined
+    # Detached HEAD is not main — refusal after the git gate is expected.
+    assert "REFUSING" in proc.stderr or "not main" in combined

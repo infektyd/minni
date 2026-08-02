@@ -113,6 +113,27 @@ def test_dist_symlinked_at_working_tree_fails_strict(tmp_path):
     assert "LINKED" not in proc.stdout
 
 
+def test_dist_symlinked_to_frozen_artifact_under_repo_is_not_worktree(tmp_path):
+    """Round-2 Low: prefix-matching any path under the repo flagged a dist
+    symlink to release-artifacts/.../dist as WORKTREE. Only the live
+    plugins/minni/dist working tree is the defect."""
+    home = tmp_path / "home"
+    home.mkdir()
+    repo = _isolated_repo_root(tmp_path)
+    frozen = repo / "release-artifacts" / "0.4.1" / "dist"
+    frozen.mkdir(parents=True)
+    (frozen / "server.js").write_text("// frozen\n", encoding="utf-8")
+    (frozen / "build-manifest.json").write_text(
+        json.dumps({"git_sha": "unknown", "built_at": "2026-08-01T00:00:00Z"}),
+        encoding="utf-8",
+    )
+    root = _deployment(home, link_dist_to=frozen)
+    # Faithful non-dist copies so content check is clean.
+    proc = _run("--strict", home=home, repo_root=repo)
+    assert "WORKTREE" not in proc.stdout, proc.stdout
+    # May still be DRIFT/UNKNOWN depending on hooks fidelity; the pin is WORKTREE.
+
+
 def test_hooks_drift_behind_a_symlinked_dist_is_reported(tmp_path):
     """The measured 2026-08-01 condition: dist/ linked, hooks.json stale."""
     home = tmp_path / "home"

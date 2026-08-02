@@ -215,6 +215,75 @@ def check_installed(canonical: str) -> tuple[list[str], list[str]]:
     return [], [f"installed: minni {installed} (agrees)"]
 
 
+def _public_version(version: str) -> str:
+    """Strip PEP 440 local segment (+…) so from-repo stamps agree with pyproject.
+
+    ``minni wire --from-repo`` / ``make sync-root`` write
+    ``0.4.1+git.<short>`` into every plugin manifest (see
+    ``wire.from_repo.dev_version``). Exact string equality against the public
+    pyproject version then makes a successful redeploy fail its own verify
+    step. Public/base agreement still catches real drift (``0.3.0`` vs
+    ``0.4.1``). Falls back to a cheap split when packaging is unavailable.
+    """
+    text = str(version or "").strip()
+    if not text:
+        return text
+    try:
+        from packaging.version import Version
+
+        return Version(text).base_version
+    except Exception:
+        return text.split("+", 1)[0].split("-", 1)[0]
+
+
+def _version_agrees(deployed: str, canonical: str) -> bool:
+    if deployed == canonical:
+        return True
+    return bool(deployed) and _public_version(deployed) == _public_version(canonical)
+
+
+def _active_wire_plugin_roots(home: Path) -> set[Path]:
+    """Install roots under ~/.minni/plugin that wire currently records as live.
+
+    Non-interactive wire skips GC prune, so historical ``~/.minni/plugin/<old>/``
+    trees linger on the deployment globs. Version-checking every historical
+    dir makes ``make sync-root`` fail on its own leftovers. Prefer what wire
+    recorded (wired.json) and the ``current`` symlink when present.
+    """
+    base = home / ".minni" / "plugin"
+    actives: set[Path] = set()
+    wired = base / "wired.json"
+    try:
+        data = json.loads(wired.read_text(encoding="utf-8"))
+        for entry in data.get("wires", []) or []:
+            if not isinstance(entry, dict):
+                continue
+            root_str = entry.get("install_root")
+            if not root_str:
+                continue
+            root = Path(str(root_str))
+            if root.is_dir():
+                actives.add(root.resolve())
+    except (OSError, json.JSONDecodeError, TypeError):
+        pass
+    current = base / "current"
+    try:
+        if current.exists():
+            actives.add(current.resolve())
+    except OSError:
+        pass
+    return actives
+
+
+def _is_versioned_wire_plugin_root(root: Path, home: Path) -> bool:
+    """True for ~/.minni/plugin/<version> (not the plugin base itself)."""
+    try:
+        rel = root.resolve().relative_to((home / ".minni" / "plugin").resolve())
+    except (OSError, ValueError):
+        return False
+    return len(rel.parts) == 1 and rel.parts[0] not in {"current", "cache"}
+
+
 def check_deployed(canonical: str) -> tuple[list[str], list[str]]:
     """(mismatches, notes). Every deployed plugin manifest under $HOME."""
     mismatches: list[str] = []
@@ -223,8 +292,20 @@ def check_deployed(canonical: str) -> tuple[list[str], list[str]]:
     roots = deployment_roots()
     if not roots:
         return [], ["deployed: no deployments discovered under $HOME"]
+    active_wire = _active_wire_plugin_roots(home)
     for root in roots:
         label = str(root).replace(str(home), "~")
+        # Inactive historical wire version dirs: note + skip, do not fail.
+        if (
+            active_wire
+            and _is_versioned_wire_plugin_root(root, home)
+            and root.resolve() not in active_wire
+        ):
+            notes.append(
+                f"deployed: {label} skipped (not an active wire install; "
+                "historical version dir left by non-interactive wire)"
+            )
+            continue
         versions: dict[str, list[str]] = {}
         for rel in MANIFEST_RELPATHS:
             path = root / rel
@@ -244,11 +325,19 @@ def check_deployed(canonical: str) -> tuple[list[str], list[str]]:
                 "its version cannot be established"
             )
             continue
-        # One line per deployment when its manifests agree with each other; the
-        # per-file breakdown only appears when they do not.
-        off = {v: files for v, files in versions.items() if v != canonical}
+        # Public/base agreement: from-repo local stamps (+git.<sha>) match the
+        # pyproject public version; real public drift still fails.
+        off = {
+            v: files for v, files in versions.items() if not _version_agrees(v, canonical)
+        }
         if not off:
-            notes.append(f"deployed: {label} at {canonical} (agrees)")
+            shown = next(iter(versions))
+            if shown == canonical:
+                notes.append(f"deployed: {label} at {canonical} (agrees)")
+            else:
+                notes.append(
+                    f"deployed: {label} at {shown!r} (public version agrees with {canonical})"
+                )
         elif len(versions) == 1:
             mismatches.append(f"deployed: {label} at {next(iter(versions))!r} != {canonical!r}")
         else:

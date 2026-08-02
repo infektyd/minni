@@ -1140,6 +1140,7 @@ def update_agy_plugin_hooks(install_root: Path) -> dict[str, object]:
     if not agy:
         return {
             "installed": False,
+            "error_class": "missing_cli",
             "reason": "agy CLI not found on PATH; hook registration skipped (re-run after installing agy)",
         }
 
@@ -1457,7 +1458,9 @@ def _subresult_problems(result: dict) -> tuple[list[str], list[str]]:
         sub = result.get(key)
         if isinstance(sub, dict) and sub.get("installed") is False:
             reason = str(sub.get("reason", "not installed"))
-            if "not found on path" in reason.lower():
+            # Structured flag from update_* helpers; substring matching is
+            # fragile (registration failures can mention "path" in tool text).
+            if sub.get("error_class") == "missing_cli":
                 notes.append(f"{key}: {reason}")
             else:
                 problems.append(f"{key}: {reason}")

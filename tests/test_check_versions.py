@@ -179,3 +179,78 @@ def test_no_deployments_is_reported_but_not_a_failure(tmp_path):
     )
     assert proc.returncode == 0, proc.stderr or proc.stdout
     assert "no deployments discovered" in proc.stdout
+
+
+def test_deployed_layer_accepts_from_repo_local_version(tmp_path):
+    """Round-2 High: --from-repo / sync-root stamps 0.4.1+git.<short>. Exact
+    equality against the public pyproject version made a successful redeploy
+    fail its own verify step."""
+    canonical = _canonical()
+    local = f"{canonical}+git.abc1234"
+    home = _fake_home_with_deployment(tmp_path, local)
+    proc = _run(
+        env_extra={
+            "MINNI_CHECK_VERSIONS_HOME": str(home),
+            "MINNI_CHECK_VERSIONS_INSTALLED_OVERRIDE": canonical,
+        }
+    )
+    assert proc.returncode == 0, proc.stderr or proc.stdout
+    assert "public version agrees" in proc.stdout or "(agrees)" in proc.stdout
+    assert "0.3.0" not in proc.stdout
+
+
+def test_deployed_layer_still_fails_on_public_drift_with_local_suffix(tmp_path):
+    """Local suffix must not paper over a real public-version drift."""
+    home = _fake_home_with_deployment(tmp_path, "0.3.0+git.deadbeef")
+    proc = _run(
+        env_extra={
+            "MINNI_CHECK_VERSIONS_HOME": str(home),
+            "MINNI_CHECK_VERSIONS_INSTALLED_OVERRIDE": _canonical(),
+        }
+    )
+    assert proc.returncode == 1, proc.stdout
+    assert "0.3.0+git.deadbeef" in (proc.stdout + proc.stderr)
+
+
+def test_inactive_wire_version_dir_is_skipped_not_failed(tmp_path):
+    """Round-2 compounder: non-interactive wire leaves historical
+    ~/.minni/plugin/<old>/ trees; only active wired/current roots are judged."""
+    canonical = _canonical()
+    home = tmp_path / "home"
+    plugin = home / ".minni" / "plugin"
+    old = plugin / "0.3.0"
+    old.mkdir(parents=True)
+    (old / "dist").mkdir()
+    (old / ".claude-plugin").mkdir()
+    (old / ".claude-plugin" / "plugin.json").write_text(
+        json.dumps({"name": "minni", "version": "0.3.0"}), encoding="utf-8",
+    )
+    fresh_ver = f"{canonical}+git.abc1234"
+    fresh = plugin / fresh_ver
+    fresh.mkdir(parents=True)
+    (fresh / "dist").mkdir()
+    (fresh / ".claude-plugin").mkdir()
+    (fresh / ".claude-plugin" / "plugin.json").write_text(
+        json.dumps({"name": "minni", "version": fresh_ver}), encoding="utf-8",
+    )
+    (plugin / "wired.json").write_text(
+        json.dumps({
+            "schema": 1,
+            "wires": [{
+                "platform": "claude-code",
+                "install_root": str(fresh),
+                "version": fresh_ver,
+                "wired_at": "2026-08-02T00:00:00Z",
+            }],
+        }),
+        encoding="utf-8",
+    )
+    proc = _run(
+        env_extra={
+            "MINNI_CHECK_VERSIONS_HOME": str(home),
+            "MINNI_CHECK_VERSIONS_INSTALLED_OVERRIDE": canonical,
+        }
+    )
+    assert proc.returncode == 0, proc.stderr or proc.stdout
+    assert "skipped (not an active wire install" in proc.stdout
+    assert "public version agrees" in proc.stdout or fresh_ver in proc.stdout

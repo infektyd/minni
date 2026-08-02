@@ -53,7 +53,9 @@ act()  {
 }
 refuse() { printf 'update-root: REFUSING: %s\n' "$*" >&2; exit 1; }
 
-[ -d .git ] || refuse "$REPO is not a git checkout"
+# `.git` is a directory in a normal clone and a *file* (gitdir pointer) in a
+# linked worktree. `-d` alone refuses every worktree checkout.
+[ -e .git ] || refuse "$REPO is not a git checkout"
 
 VENV_PY="$REPO/.venv/bin/python"
 [ -x "$VENV_PY" ] || VENV_PY="python3"
@@ -110,15 +112,69 @@ act "$VENV_PY" plugins/minni/skills/minni-install/scripts/propagate.py \
 # ── 5. restart the daemon ────────────────────────────────────────────────────
 say "step 5/6: restart minnid"
 LABEL="com.minni.minnid"
+SOCKET="${MINNI_SOCKET:-$HOME/.minni/run/minnid.sock}"
+DAEMON_RESTARTED=0
 if launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; then
   act launchctl kickstart -k "gui/$(id -u)/$LABEL"
+  DAEMON_RESTARTED=1
 else
-  echo "launchd agent $LABEL is not loaded — restart minnid however you run it"
+  # Do not claim "sync complete" when the live process was not bounced —
+  # checkout/plugin trees may be current while minnid still runs pre-sync code
+  # (the GA1-3 failure mode this path exists to close).
+  if [ "$DRY_RUN" = 1 ]; then
+    echo "would fail: launchd agent $LABEL is not loaded — daemon would not be restarted"
+  else
+    refuse "launchd agent $LABEL is not loaded — daemon was not restarted; start/restart minnid yourself (or load the launchd agent) and re-run"
+  fi
 fi
 
 # ── 6. verify ────────────────────────────────────────────────────────────────
 say "step 6/6: verify versions + deployments"
 act "$VENV_PY" scripts/check_versions.py
 act "$VENV_PY" scripts/check_deployments.py --strict
+
+# After a real restart, require the socket to answer and report deploy.stale
+# is not True. Skip under dry-run (kickstart was not executed).
+if [ "$DRY_RUN" != 1 ] && [ "$DAEMON_RESTARTED" = 1 ]; then
+  say "step 6b: probe daemon deploy honesty after restart"
+  if ! "$VENV_PY" - "$SOCKET" <<'PY'
+import json, socket, sys, time
+sock_path = sys.argv[1]
+last = None
+for _ in range(15):
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(2.0)
+            s.connect(sock_path)
+            req = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "status"}).encode()
+            s.sendall(req + b"\n")
+            buf = b""
+            while b"\n" not in buf and len(buf) < 1_000_000:
+                chunk = s.recv(65536)
+                if not chunk:
+                    break
+                buf += chunk
+        msg = json.loads(buf.decode("utf-8", errors="replace").splitlines()[0])
+        result = msg.get("result") or {}
+        deploy = (result.get("daemon") or {}).get("deploy") or result.get("deploy") or {}
+        stale = deploy.get("stale")
+        if stale is True:
+            print(
+                f"update-root: daemon deploy.stale is True after restart: {deploy!r}",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        print(f"daemon deploy probe ok (stale={stale!r})")
+        sys.exit(0)
+    except Exception as exc:
+        last = exc
+        time.sleep(0.4)
+print(f"update-root: daemon socket unreachable after restart ({sock_path}): {last}", file=sys.stderr)
+sys.exit(1)
+PY
+  then
+    refuse "daemon did not come back clean after launchd kickstart (socket $SOCKET)"
+  fi
+fi
 
 say "sync complete at $(git rev-parse --short HEAD)"

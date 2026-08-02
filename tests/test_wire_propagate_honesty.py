@@ -147,6 +147,7 @@ def test_update_plugin_absent_cli_is_note_not_problem(monkeypatch, capsys):
             "platform": platform,
             "agy_hooks": {
                 "installed": False,
+                "error_class": "missing_cli",
                 "reason": "agy CLI not found on PATH; hook registration skipped",
             },
         },
@@ -156,6 +157,29 @@ def test_update_plugin_absent_cli_is_note_not_problem(monkeypatch, capsys):
     assert rc == 0
     assert doc["status"] == "updated"
     assert doc["results"][0]["notes"]
+
+
+def test_update_plugin_path_in_failure_reason_is_still_a_problem(monkeypatch, capsys):
+    """Round-2 Low: a real registration failure whose text mentions 'path'
+    must not be reclassified as a missing-CLI note via substring match."""
+    monkeypatch.setattr(
+        propagate, "update_one_plugin",
+        lambda platform, args: {
+            "platform": platform,
+            "agy_hooks": {
+                "installed": False,
+                "reason": (
+                    "agy plugin install failed: hooks.json was not found on path "
+                    "/tmp/staging (registration rejected)"
+                ),
+            },
+        },
+    )
+    rc = propagate.update_plugin(_update_args("gemini"))
+    doc = json.loads(capsys.readouterr().out)
+    assert rc != 0
+    problems = doc["results"][0].get("problems") or []
+    assert any("agy_hooks" in p for p in problems), doc
 
 
 # ── D10 ──────────────────────────────────────────────────────────────────────

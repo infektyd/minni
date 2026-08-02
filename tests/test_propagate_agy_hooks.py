@@ -87,6 +87,7 @@ def test_agy_missing_is_a_graceful_skip(tmp_path, monkeypatch):
     result = propagate.update_agy_plugin_hooks(install_root)
 
     assert result["installed"] is False
+    assert result.get("error_class") == "missing_cli"
     assert "agy CLI not found" in str(result["reason"])
 
 
