@@ -259,6 +259,39 @@ def test_inactive_wire_version_dir_is_skipped_not_failed(tmp_path):
     assert "public version agrees" in proc.stdout or fresh_ver in proc.stdout
 
 
+def test_empty_wires_skips_historical_plugin_dirs(tmp_path):
+    """CR Medium twin: post-retire wires:[] must skip abandoned version dirs.
+
+    Empty active must not re-judge historical ~/.minni/plugin/<ver> as live
+    deployments (would fail --strict / sync-root step 6).
+    """
+    canonical = _canonical()
+    home = tmp_path / "home"
+    plugin = home / ".minni" / "plugin"
+    old = plugin / "0.3.0"
+    old.mkdir(parents=True)
+    (old / "dist").mkdir()
+    (old / ".claude-plugin").mkdir()
+    (old / ".claude-plugin" / "plugin.json").write_text(
+        json.dumps({"name": "minni", "version": "0.3.0"}), encoding="utf-8",
+    )
+    (old / "payload-manifest.json").write_text(
+        json.dumps({"version": "0.3.0", "git_sha": "c" * 40}), encoding="utf-8",
+    )
+    (plugin / "wired.json").write_text(
+        json.dumps({"schema": 1, "wires": []}), encoding="utf-8",
+    )
+    proc = _run(
+        env_extra={
+            "MINNI_CHECK_VERSIONS_HOME": str(home),
+            "MINNI_CHECK_VERSIONS_INSTALLED_OVERRIDE": canonical,
+        }
+    )
+    assert proc.returncode == 0, proc.stderr or proc.stdout
+    assert "skipped (not an active wire install" in proc.stdout
+    assert "0.3.0" not in proc.stdout or "skipped" in proc.stdout
+
+
 def test_latest_per_platform_root_stays_active_even_if_older_than_peer(tmp_path):
     """COMMENT-round Med: a platform's latest wire root stays active even when
     another platform has a newer wired_at. Codex still on 0.3.0 must be judged
