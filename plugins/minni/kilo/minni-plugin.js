@@ -44,6 +44,21 @@ const lastPrompt = new Map();
 // simply does NOT honor the premature delete is correct and cannot cross
 // sessions. Bounded so a long-lived process cannot grow it without limit.
 const LAST_PROMPT_MAX = 64;
+// P5: same bound, same reason — `session.deleted` no longer clears these, so
+// they need their own ceiling. Insertion order is arrival order, so dropping
+// from the front drops the oldest session.
+const PENDING_MAX = 64;
+const BOOTED_MAX = 256;
+
+function evictOldest(collection, max, label) {
+  while (collection.size > max) {
+    const oldest = collection.keys().next().value;
+    collection.delete(oldest);
+    // Evicting queued context IS losing memory injection for that session.
+    // A bound that discards silently is the same defect in a smaller box.
+    reportBridgeFailure("session-evict", new Error(`evicted ${label} for an old session (bound ${max})`));
+  }
+}
 
 function hookContext(result) {
   return result?.hookSpecificOutput?.additionalContext || result?.systemMessage || "";
@@ -82,11 +97,45 @@ function runHook(event, payload) {
   });
 }
 
+// P6 (#228): bridge failures were `console.warn` only and never reached the
+// audit log, so there was no surface on which a persistently failing Kilo
+// bridge was distinguishable from one that simply had no traffic — the health
+// signal overstated the bridge's coverage for as long as it stayed broken.
+//
+// The bridge has no direct vault handle (it spawns the hook to reach it), so
+// the failure is reported through the hook's OWN audit channel via a
+// fire-and-forget BridgeFailure event. Deliberately not awaited and fully
+// fail-silent: this runs on the failure path, and a second failure here must
+// not turn a degraded bridge into a broken session.
+function reportBridgeFailure(event, error) {
+  const detail = error instanceof Error ? error.message : String(error);
+  console.warn(`[minni] ${event} hook unavailable; continuing: ${detail}`);
+  try {
+    const child = spawn("node", [HOOK_SCRIPT, "BridgeFailure"], {
+      env: { ...process.env, ...HOOK_ENV },
+      stdio: ["pipe", "ignore", "ignore"],
+      detached: false,
+    });
+    child.on("error", () => {});
+    child.stdin.on("error", () => {});
+    child.stdin.end(
+      JSON.stringify({
+        hook_event_name: "BridgeFailure",
+        bridge: "kilo",
+        failed_event: event,
+        error: detail.slice(0, 400),
+      }),
+    );
+  } catch {
+    // The console line above is the last resort; never throw from here.
+  }
+}
+
 async function runHookFailOpen(event, payload) {
   try {
     return await runHook(event, payload);
   } catch (error) {
-    console.warn(`[minni] ${event} hook unavailable; continuing: ${error instanceof Error ? error.message : error}`);
+    reportBridgeFailure(event, error);
     return null;
   }
 }
@@ -202,8 +251,19 @@ const MinniPlugin = async ({ directory, client }) => ({
     } else if (event?.type === "session.compacted") {
       await harvestCompactedSummary(client, sessionID, directory);
     } else if (event?.type === "session.deleted") {
-      booted.delete(sessionID);
-      pending.delete(sessionID);
+      // P5 (#228): this used to clear `booted` and `pending` outright. Kilo
+      // fires session.deleted while the session is STILL LIVE — the hazard
+      // already documented above for `lastPrompt`, where the fix was applied
+      // and then never extended here. Clearing `pending` drops queued boot
+      // context that experimental.chat.system.transform has not yet handed to
+      // the model, so that session's memory injection is lost; clearing
+      // `booted` re-runs SessionStart on a session that already booted.
+      //
+      // Same remedy as lastPrompt: do NOT honor the premature delete, and
+      // bound the maps instead so a long-lived process cannot grow them. The
+      // eviction is what is counted, because that is the only real loss.
+      evictOldest(pending, PENDING_MAX, "pending context");
+      evictOldest(booted, BOOTED_MAX, "booted session");
     }
   },
 });

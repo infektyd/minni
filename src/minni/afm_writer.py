@@ -20,7 +20,20 @@ from minni.safety import is_instruction_like
 
 logger = logging.getLogger("sovereign.afm.afm_writer")
 
-_WORK_QUEUE: "queue.Queue[tuple[dict, threading.Event, dict]]" = queue.Queue()
+# AFM-8 (#230): the queue was unbounded. A stalled writer thread (a vault on a
+# hung mount, a permissions fault) grew it without limit while every submitter
+# saw status "queued" and nothing anywhere counted the backlog. Bounded with a
+# stated drop policy: submissions past the bound are REJECTED at the door and
+# counted, because a caller told "rejected, queue full" can retry, and a caller
+# told "queued" about a job that will never run cannot.
+WRITER_QUEUE_MAX = 256
+# Backlog threshold for the health verdict. Well under the bound: by the time
+# submissions are being dropped, the status surface should have been saying
+# "backlogged" for a while.
+WRITER_QUEUE_BACKLOG = 32
+_WORK_QUEUE: "queue.Queue[tuple[dict, threading.Event, dict]]" = queue.Queue(
+    maxsize=WRITER_QUEUE_MAX
+)
 _WORKER_STARTED = False
 _WORKER_LOCK = threading.Lock()
 _PAGE_LOCKS: dict[str, threading.Lock] = {}
@@ -33,6 +46,17 @@ _LAST_RUN_PER_PASS: dict[str, float] = {}
 # Set when a pass completed a wet run at all, drafts or not. This is the
 # liveness signal; _LAST_RUN_PER_PASS is the productivity signal.
 _LAST_ATTEMPT_PER_PASS: dict[str, float] = {}
+# GA4-3: a pass that RAISES has, until now, left no trace on any surface. It
+# skipped record_pass_attempt, so it read as "never invoked" (silent) or went
+# stale — both of which a merely-idle pass also reads as. No failure counter
+# existed anywhere in the codebase. These two are the distinct failure signal:
+# when a pass ran and threw, both the attempt (liveness) and the failure
+# (health) are recorded, so "failing every tick" is loud and unmistakable.
+_FAILURES_PER_PASS: dict[str, int] = {}
+_LAST_FAILURE_PER_PASS: dict[str, dict] = {}
+# AFM-8: submissions the bounded queue refused. Drafts counted here were never
+# written and never will be.
+_WRITES_DROPPED = 0
 
 # A pass is stale once it has been silent for this multiple of its configured
 # interval. 2x, not 1x: a tick that lands a few seconds late is not a fault, and
@@ -78,6 +102,33 @@ def record_pass_attempt(pass_name: str, now: Optional[float] = None) -> None:
     _LAST_ATTEMPT_PER_PASS[str(pass_name or "unknown")] = (
         time.time() if now is None else now
     )
+
+
+def record_pass_failure(
+    pass_name: str, error: str, now: Optional[float] = None
+) -> None:
+    """Record that ``pass_name`` was invoked and raised (GA4-3).
+
+    Deliberately does NOT also call :func:`record_pass_attempt` — the caller
+    records the attempt first, so liveness stays true even for a pass that only
+    ever fails, and this adds the fault on top of it.
+    """
+    name = str(pass_name or "unknown")
+    _FAILURES_PER_PASS[name] = _FAILURES_PER_PASS.get(name, 0) + 1
+    _LAST_FAILURE_PER_PASS[name] = {
+        "at": time.time() if now is None else now,
+        "error": str(error)[:500],
+    }
+
+
+def reset_pass_counters() -> None:
+    """Clear the in-memory liveness/failure counters (tests)."""
+    global _WRITES_DROPPED
+    _LAST_RUN_PER_PASS.clear()
+    _LAST_ATTEMPT_PER_PASS.clear()
+    _FAILURES_PER_PASS.clear()
+    _LAST_FAILURE_PER_PASS.clear()
+    _WRITES_DROPPED = 0
 
 
 def _parse_iso_utc(value: str) -> Optional[float]:
@@ -144,7 +195,10 @@ def derive_loop_status(
     Returns ``(status, reasons)``. Every condition found lands in ``reasons``;
     ``status`` is the worst of them, ordered
 
-        stale > backlogged > unknown > ok
+        failing > stale > backlogged > unknown > ok
+
+    ``failing`` outranks ``stale``: a pass raising on every tick is a known
+    fault, whereas ``stale`` is an inference from silence.
 
     ``unknown`` is deliberately not ``ok``. Where the loop cannot be inspected
     -- a pass with no recorded run at all, drafts whose age cannot be read --
@@ -209,9 +263,44 @@ def derive_loop_status(
     if unreadable:
         reasons.append(f"{unreadable} vault page(s) could not be read; draft count is a lower bound")
 
+    # GA2-1: queue_depth has been recorded in writer_status since the queue
+    # existed and was never read by anything. An orphaned metric is worse than
+    # no metric — it reads as coverage that is not there. Either consult it or
+    # delete it; a writer thread that has stopped draining is exactly the kind
+    # of fault this status is for, so consult it.
+    queue_depth = int(state.get("queue_depth", 0) or 0)
+    queue_backlogged = queue_depth >= WRITER_QUEUE_BACKLOG
+    if queue_backlogged:
+        reasons.append(
+            f"{queue_depth} write job(s) queued (backlog threshold "
+            f"{WRITER_QUEUE_BACKLOG}, hard bound {WRITER_QUEUE_MAX}); "
+            "the writer thread is not draining"
+        )
+    dropped = int(state.get("writes_dropped", 0) or 0)
+    if dropped:
+        reasons.append(
+            f"{dropped} write job(s) REJECTED because the queue was full — "
+            "those drafts were never written"
+        )
+
+    # GA4-3: a pass failing on every tick used to reach this function looking
+    # exactly like a healthy one, because only the fact that it ran was
+    # recorded. Failures are their own reason and their own status.
+    failures = state.get("failures_per_pass") or {}
+    failing = [f"{name} ({count}x)" for name, count in sorted(failures.items()) if count]
+    if failing:
+        reasons.append("passes raising: " + ", ".join(failing))
+
+    if failing:
+        return "failing", reasons
     if stale:
         return "stale", reasons
-    if pending >= DRAFTS_PENDING_BACKLOG or (oldest_ts is not None and (now - oldest_ts) / 86400.0 > ttl_days):
+    if (
+        pending >= DRAFTS_PENDING_BACKLOG
+        or queue_backlogged
+        or dropped
+        or (oldest_ts is not None and (now - oldest_ts) / 86400.0 > ttl_days)
+    ):
         return "backlogged", reasons
     if reasons:
         return "unknown", reasons
@@ -548,17 +637,62 @@ def _ensure_worker() -> None:
             _WORKER_STARTED = True
 
 
+class DraftWriteError(RuntimeError):
+    """A draft batch reached the writer and failed to be written.
+
+    AFM-8 (#230): the writer used to raise a bare ``RuntimeError``, which the
+    daemon's blanket handler reported as ``afm_unavailable`` — attributing a
+    durable-storage problem to the model provider. A distinct type lets that
+    handler tell "the vault could not be written" from "AFM was not there".
+    """
+
+
+class DraftQueueFull(RuntimeError):
+    """The bounded writer queue rejected a submission (AFM-8 drop policy)."""
+
+
 def submit_drafts(job: dict, wait: bool = True, timeout: Optional[float] = 30.0) -> dict:
     _ensure_worker()
     done = threading.Event()
     out: dict = {}
-    _WORK_QUEUE.put((job, done, out))
+    try:
+        _WORK_QUEUE.put_nowait((job, done, out))
+    except queue.Full:
+        # Drop policy: reject at the door and count it, rather than block the
+        # caller or silently grow. The drafts are NOT written; saying so is the
+        # whole point.
+        global _WRITES_DROPPED
+        _WRITES_DROPPED += 1
+        logger.error(
+            "AFM writer queue full (%d jobs); REJECTED %d draft(s) from pass %r — "
+            "not written",
+            WRITER_QUEUE_MAX, len(job.get("drafts") or []), job.get("pass_name"),
+        )
+        raise DraftQueueFull(
+            f"writer queue full ({WRITER_QUEUE_MAX} jobs); "
+            f"{len(job.get('drafts') or [])} draft(s) rejected, not written"
+        )
     if not wait:
         return {"status": "queued", "queue_depth": _WORK_QUEUE.qsize()}
     if not done.wait(timeout):
-        return {"status": "queued", "queue_depth": _WORK_QUEUE.qsize(), "timeout": True}
+        # AFM-8: the job is still in flight and WILL be written by the worker;
+        # the caller just did not get to see the outcome. Saying "queued" alone
+        # left the caller with no way to know its result was never observed, so
+        # the drafts read as landed. Name it.
+        logger.warning(
+            "AFM writer timed out after %.1fs waiting on pass %r; %d draft(s) "
+            "still in flight — outcome unobserved",
+            timeout or 0.0, job.get("pass_name"), len(job.get("drafts") or []),
+        )
+        return {
+            "status": "write_timeout",
+            "queue_depth": _WORK_QUEUE.qsize(),
+            "timeout": True,
+            "drafts_written": [],
+            "drafts_in_flight": len(job.get("drafts") or []),
+        }
     if "error" in out:
-        raise RuntimeError(out["error"])
+        raise DraftWriteError(out["error"])
     return out["result"]
 
 
@@ -633,6 +767,10 @@ def writer_status(
         "drafts_unreadable": unreadable,
         "afm_latency_p95": p95,
         "queue_depth": _WORK_QUEUE.qsize(),
+        "queue_max": WRITER_QUEUE_MAX,
+        "writes_dropped": _WRITES_DROPPED,
+        "failures_per_pass": dict(_FAILURES_PER_PASS),
+        "last_failure_per_pass": dict(_LAST_FAILURE_PER_PASS),
     }
     status, reasons = derive_loop_status(state, schedule=schedule, now=now)
     state["status"] = status

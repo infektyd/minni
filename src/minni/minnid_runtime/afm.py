@@ -60,6 +60,12 @@ def loop_principal() -> EffectivePrincipal:
     )
 
 
+# AFM-8 (#230): how soon a pass that RAISED is retried. Short enough that a
+# transient fault is not punished with the full interval, long enough that a
+# pass failing instantly cannot spin the loop.
+_FAILURE_RETRY_SECONDS = 300
+
+
 def afm_loop_enabled(config=DEFAULT_CONFIG) -> bool:
     if os.environ.get("MINNI_AFM_LOOP", "").lower() == "off":
         return False
@@ -442,8 +448,35 @@ def handle_daemon_compile(params: dict, request_id: Any, context: AFMContext) ->
         return context.make_response(result, request_id)
     except Exception as exc:
         context.logger.exception("daemon.compile failed")
+        # GA4-3: a pass that raises used to skip record_pass_attempt entirely,
+        # so a pass failing on every single tick read as "never invoked" or
+        # went stale — indistinguishable from an idle one, and no failure
+        # counter existed anywhere. Record the attempt (it DID run) and the
+        # failure (it DID fault), so health can say which.
+        if not dry_run:
+            try:
+                from minni.afm_writer import record_pass_attempt, record_pass_failure
+
+                record_pass_attempt(pass_name)
+                record_pass_failure(pass_name, str(exc))
+            except Exception:  # noqa: BLE001 - bookkeeping must not mask the fault
+                context.logger.exception(
+                    "daemon.compile: failed to record the pass failure"
+                )
+        obs.incr("afm_pass_failures_total")
+        obs.incr(f"afm_pass_failures.{pass_name}")
+        obs.record_error(f"daemon.compile.{pass_name}", exc)
+        # AFM-8: a draft-WRITE failure was reported as "afm_unavailable", which
+        # blames the model provider for a durable-storage fault. They need
+        # different remediation, so they get different statuses.
+        from minni.afm_writer import DraftQueueFull, DraftWriteError
+
+        if isinstance(exc, (DraftWriteError, DraftQueueFull)):
+            status = "write_failed"
+        else:
+            status = "afm_unavailable"
         return context.make_response({
-            "status": "afm_unavailable",
+            "status": status,
             "reason": str(exc),
             "pass_name": pass_name,
             "dry_run": dry_run,
@@ -543,11 +576,20 @@ async def afm_loop_runner(context: AFMContext):
                                     "AFM loop: inbox ingest skipped_by_kind=%s",
                                     _skips,
                                 )
-                        except Exception:
+                        except Exception as exc:
                             context.logger.exception(
                                 "AFM loop: inbox ingest raised (skipped; "
                                 "consolidation continues)"
                             )
+                            # GA6-2: these four sub-ops counted only their
+                            # successes, so a sub-op failing on every tick was
+                            # indistinguishable from one that had no work — the
+                            # counter simply stopped climbing either way. Each
+                            # failure now has its own counter and reaches the
+                            # error ring, which record_error was previously
+                            # only ever fed from dispatch.
+                            obs.incr("inbox_ingest_failures_total")
+                            obs.record_error("afm_loop.inbox_ingest", exc)
                         # W3 (audit §4 / consolidation inbox residue): an
                         # _agent_mismatch skip is PERMANENT — the same file
                         # produces the identical skip on every future tick, so
@@ -581,11 +623,13 @@ async def afm_loop_runner(context: AFMContext):
                                         "_agent_mismatch inbox file(s): %s",
                                         _q["quarantined"], _q["quarantined_files"],
                                     )
-                            except Exception:
+                            except Exception as exc:
                                 context.logger.exception(
                                     "AFM loop: inbox quarantine raised (skipped; "
                                     "consolidation continues)"
                                 )
+                                obs.incr("inbox_quarantine_failures_total")
+                                obs.record_error("afm_loop.inbox_quarantine", exc)
                         # Inert-file sweep (2026-08 pile-up): a stop-candidate
                         # file whose EVERY candidate ingest rejects (audit
                         # echo / log_only / do_not_store / blank) can never
@@ -617,11 +661,13 @@ async def afm_loop_runner(context: AFMContext):
                                         "file(s) (%s)",
                                         _ia["archived"], _ia.get("reasons"),
                                     )
-                            except Exception:
+                            except Exception as exc:
                                 context.logger.exception(
                                     "AFM loop: inert inbox archive raised "
                                     "(skipped; consolidation continues)"
                                 )
+                                obs.incr("inbox_archive_failures_total")
+                                obs.record_error("afm_loop.inbox_archive", exc)
                     # Distill harvested raw compaction summaries (inbox kind
                     # 'compact_summary', written by the platform hooks'
                     # compact harvest) into proposed candidates on the same
@@ -656,11 +702,13 @@ async def afm_loop_runner(context: AFMContext):
                                     _dc["vault_notes_written"],
                                     _dc["archived_zero_shared"] + _dc["archived_with_shared"],
                                 )
-                        except Exception:
+                        except Exception as exc:
                             context.logger.exception(
                                 "AFM loop: compact distillation raised "
                                 "(skipped; consolidation continues)"
                             )
+                            obs.incr("compact_distillation_failures_total")
+                            obs.record_error("afm_loop.compact_distillation", exc)
                     max_batches = int((cfg or {}).get("max_batches_per_tick", 40))
                     batches = total_examined = 0
                     last_summ = None
@@ -683,8 +731,23 @@ async def afm_loop_runner(context: AFMContext):
                     res = handle_daemon_compile(params, request_id=None, context=context)
                     summ = (res.get("result") or {}).get("summary") if isinstance(res, dict) else None
                     context.logger.info("AFM loop: pass '%s' done: %s", name, summ)
-            except Exception:
+            except Exception as exc:
                 context.logger.exception("AFM loop: pass '%s' raised (skipped)", name)
+                obs.incr("afm_loop_tick_failures_total")
+                obs.incr(f"afm_loop_tick_failures.{name}")
+                obs.record_error(f"afm_loop.{name}", exc)
+                from minni.afm_writer import record_pass_attempt, record_pass_failure
+
+                record_pass_attempt(name)
+                record_pass_failure(name, str(exc))
+                # AFM-8 (#230): last_run used to advance here unconditionally,
+                # so a tick that accomplished nothing consumed the whole
+                # interval — a pass failing instantly retried only once every
+                # 24h and looked, from outside, exactly like a pass that ran
+                # and had nothing to do. Back off instead of skipping the
+                # retry entirely: a fast-failing pass must not spin the loop.
+                last_run[name] = time.time() - max(0, interval - _FAILURE_RETRY_SECONDS)
+                continue
             last_run[name] = time.time()
         await asyncio.sleep(idle_seconds)
     context.logger.info("AFM loop runner stopped.")

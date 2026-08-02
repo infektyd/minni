@@ -181,17 +181,25 @@ def _fallback_candidate(title: str, content: str) -> str:
     return flattened[:FALLBACK_CANDIDATE_MAX_CHARS]
 
 
-def _distill_file(doc: Dict[str, Any], afm_chain) -> Tuple[List[Tuple[str, bool]], int]:
-    """``([(candidate_text, afm_distilled)], personal_section_count)`` for one
-    compact_summary document. Only shared-audience sections yield candidates;
-    personal ones are merely counted (their content reaches the agent's own
-    vault via the session note, never the shared proposal queue)."""
+def _distill_file(
+    doc: Dict[str, Any], afm_chain
+) -> Tuple[List[Tuple[str, bool]], int, Dict[str, int]]:
+    """``([(candidate_text, afm_distilled)], personal_sections, dropped)`` for
+    one compact_summary document. Only shared-audience sections yield
+    candidates; personal ones are merely counted (their content reaches the
+    agent's own vault via the session note, never the shared proposal queue).
+
+    AFM-9 (#230): ``dropped`` counts shared sections that were discarded
+    mid-distillation. They used to vanish on a bare ``continue`` — no counter,
+    no log line — so there was no surface anywhere that could say how much
+    distillation input was being thrown away."""
     body = str(doc.get("summary_text") or "")
     sections = _split_sections(body)
     unsectioned = len(sections) == 1 and sections[0][0] == UNSECTIONED_TITLE
     candidates: List[Tuple[str, bool]] = []
     personal = 0
-    for title, content in sections:
+    dropped: Dict[str, int] = {}
+    for section_index, (title, content) in enumerate(sections):
         if _SKIP_SECTION_TITLES.match(title):
             continue
         shared = bool(_SHARED_SECTION_TITLES.match(title))
@@ -215,11 +223,17 @@ def _distill_file(doc: Dict[str, Any], afm_chain) -> Tuple[List[Tuple[str, bool]
         # Post-redaction substance floor: a section that was ONLY paths/keys
         # scrubs to placeholders and teaches nothing.
         if len(re.sub(r"\[(?:local-path|redacted(?:-key)?)\]", "", candidate).strip()) < 20:
+            dropped["_below_substance_floor"] = dropped.get("_below_substance_floor", 0) + 1
             continue
         candidates.append((candidate[:CONTENT_CAP], afm_used))
         if len(candidates) >= MAX_CANDIDATES_PER_FILE:
+            # Sections past the cap are not distilled at all. Counting them
+            # keeps the cap from reading as "the file only had this much".
+            remaining = len(sections) - section_index - 1
+            if remaining > 0:
+                dropped["_over_candidate_cap"] = remaining
             break
-    return candidates, personal
+    return candidates, personal, dropped
 
 
 _ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}")
@@ -317,6 +331,7 @@ def distill(db, config, inboxes: Optional[List[Path]] = None,
 
     scanned_files = 0
     skipped: Dict[str, int] = {}
+    dropped_sections: Dict[str, int] = {}
     to_insert: List[Dict[str, Any]] = []
     already = 0
     afm_sections = 0
@@ -332,9 +347,28 @@ def distill(db, config, inboxes: Optional[List[Path]] = None,
         for path in sorted(inbox.glob("*.json")):
             try:
                 doc = json.loads(path.read_text(encoding="utf-8"))
-            except Exception:
+            except Exception as exc:
+                # AFM-9 (#230): a malformed payload used to be dropped on a
+                # bare `continue` — no counter, no log line, no way to know
+                # from any surface how much input was being discarded.
+                skipped["_unreadable"] = skipped.get("_unreadable", 0) + 1
+                logger.warning(
+                    "compact distill: dropping unreadable inbox file %s: %s",
+                    path.name, exc,
+                )
                 continue
-            if not isinstance(doc, dict) or doc.get("kind") != COMPACT_SUMMARY_KIND:
+            if not isinstance(doc, dict):
+                skipped["_malformed"] = skipped.get("_malformed", 0) + 1
+                logger.warning(
+                    "compact distill: dropping malformed inbox file %s "
+                    "(payload is %s, expected object)",
+                    path.name, type(doc).__name__,
+                )
+                continue
+            if doc.get("kind") != COMPACT_SUMMARY_KIND:
+                # Not a drop: other kinds legitimately share this inbox and are
+                # drained by their own pass. Counted, not warned.
+                skipped["_other_kind"] = skipped.get("_other_kind", 0) + 1
                 continue
             scanned_files += 1
             file_agent = str(doc.get("agent_id") or "").strip()
@@ -360,9 +394,11 @@ def distill(db, config, inboxes: Optional[List[Path]] = None,
                 if not dry_run and archive_inbox_file(path):
                     archived_with_shared += 1
                 continue
-            candidates, personal = _distill_file(doc, afm_chain)
+            candidates, personal, file_dropped = _distill_file(doc, afm_chain)
             afm_sections += sum(1 for _, used in candidates if used)
             personal_sections += personal
+            for reason, count in file_dropped.items():
+                dropped_sections[reason] = dropped_sections.get(reason, 0) + count
             if not dry_run:
                 # Personal leg runs for EVERY processed file, whatever the
                 # audience mix — the vault note is the only place the full
@@ -487,5 +523,6 @@ def distill(db, config, inboxes: Optional[List[Path]] = None,
         "archived_zero_shared": archived_zero_shared,
         "archived_with_shared": archived_with_shared,
         "skipped": skipped,
+        "dropped_sections": dropped_sections,
         "dry_run": dry_run,
     }

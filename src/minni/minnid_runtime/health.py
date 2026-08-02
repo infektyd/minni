@@ -302,6 +302,18 @@ def handle_health_report(params: dict, request_id: Any, context: HealthContext) 
         # transition is reported. Counts and labels only — no scores — so it
         # stays outside _HEALTH_REPORT_SENSITIVE_KEYS.
         "score_calibration": {},
+        # GA6-2: the four consolidation-tick sub-ops (inbox ingest, quarantine,
+        # inert archive, compact distillation) incremented a counter ONLY on
+        # their success paths and swallowed every exception, so a sub-op broken
+        # for days was indistinguishable from one that simply had no work —
+        # health had no ingest-failure field and no inbox-backlog field at all.
+        # Both live here. Aggregate-only, so it stays outside
+        # _HEALTH_REPORT_SENSITIVE_KEYS alongside inbox_quarantine.
+        "consolidation_ingest": {
+            "failures": {},
+            "inbox_backlog": 0,
+            "status": "unknown",
+        },
         # W2: last-N dispatch exceptions so a climbing errors.<method> counter is
         # attributable. Sensitive (messages can embed paths/payloads) — redacted
         # to a count for any non-operator caller via _HEALTH_REPORT_SENSITIVE_KEYS.
@@ -534,6 +546,41 @@ def handle_health_report(params: dict, request_id: Any, context: HealthContext) 
             # contract), so a raw str(exc) would survive recovery/non-operator
             # redaction and leak local paths.
             report["inbox_quarantine"] = {
+                "status": "unknown",
+                "error": type(exc).__name__,
+            }
+
+        try:
+            # GA6-2: failures come from the global counters the sub-ops now
+            # increment on their exception paths; backlog is the count of
+            # undrained inbox files. A climbing backlog with zero failures and
+            # a climbing failure count are different faults, so both are
+            # reported rather than collapsed into one "ingest is unhappy".
+            from minni.afm_passes.inbox_ingest import discover_inboxes
+
+            # metrics_snapshot(), not metrics_delta_snapshot(): this is a plain
+            # copy of the counters. The delta variant advances a baseline, and
+            # a report must never consume the deltas a status poll is reading.
+            counters = context.metrics_snapshot()
+            failures = {
+                name: value
+                for name, value in counters.items()
+                if name.endswith("_failures_total") and value
+            }
+            backlog = 0
+            for inbox in discover_inboxes(context.default_config):
+                if inbox.is_dir():
+                    backlog += sum(1 for _ in inbox.glob("*.json"))
+            report["consolidation_ingest"] = {
+                "failures": failures,
+                "inbox_backlog": backlog,
+                "status": "failing" if failures else "ok",
+            }
+        except Exception as exc:
+            # Exception class only, for the same reason as inbox_quarantine
+            # above: this block is aggregate-only and outside the redaction set,
+            # so an OSError message would leak an inbox filesystem path.
+            report["consolidation_ingest"] = {
                 "status": "unknown",
                 "error": type(exc).__name__,
             }

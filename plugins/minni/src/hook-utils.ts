@@ -20,6 +20,14 @@ export interface HookOutput {
   systemMessage?: string;
 }
 
+/**
+ * P6 (#228): the diagnostic channel a native bridge uses to get a failure of
+ * its own into the audit log. Deliberately NOT an EnvelopeEvent and NOT in
+ * VALID_EVENTS — it carries no memory and reaches no handler; it exists so a
+ * persistently failing bridge is distinguishable from an idle one.
+ */
+export const BRIDGE_FAILURE_EVENT = "BridgeFailure";
+
 export const VALID_EVENTS: ReadonlyArray<EnvelopeEvent> = [
   "SessionStart",
   "UserPromptSubmit",

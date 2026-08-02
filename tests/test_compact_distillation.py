@@ -215,7 +215,16 @@ def test_skips_agent_mismatch_and_empty_and_foreign_kinds(tmp_path, monkeypatch)
 
     res = distill(db_obj, cfg, inboxes=[inbox], dry_run=False)
     assert res["inserted"] == 0
-    assert res["skipped"] == {"_agent_mismatch": 1, "_empty_summary": 1}
+    # AFM-9 (#230): `_other_kind` is new. A foreign-kind file used to be dropped
+    # on a bare `continue` with no counter at all, which is what made "how much
+    # distillation input is being discarded?" unanswerable from any surface.
+    # Foreign kinds are a legitimate skip, not a fault — but they are now
+    # counted rather than invisible.
+    assert res["skipped"] == {
+        "_agent_mismatch": 1,
+        "_empty_summary": 1,
+        "_other_kind": 1,
+    }
     assert res["files_scanned"] == 2  # foreign kinds are not compact files at all
 
 

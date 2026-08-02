@@ -374,6 +374,14 @@ class RetrievalEngine:
         # model comes back. Surfaced by status/recall so an FTS-only session is
         # visible instead of masquerading as healthy.
         self.vector_model_down: bool = False
+        # R5 (#226): _rerank swallows a reranker failure and returns candidates
+        # carrying no rerank_score, which drops that corpus to raw RRF
+        # magnitude. Recorded per-retrieve so the merged response can say the
+        # ordering is not what it claims to be.
+        self.last_rerank_degraded: Optional[str] = None
+        # AFM-6 (#230): set when expand_query raised and recall silently fell
+        # back to the bare query.
+        self.last_query_expand_degraded: Optional[str] = None
         # P0-A contract: when the read-authorization gate suppresses a
         # non-empty candidate set to zero, the reason is recorded so the caller
         # can return a diagnostic envelope instead of a bare [].
@@ -678,15 +686,7 @@ class RetrievalEngine:
         Returns best-chunk-per-doc with chunk text and heading context.
         """
         if not self.model:
-            # P0-B: fail loud. A missing encoder degrades every recall to
-            # lexical-only; logging once per outage (not per query) keeps the
-            # signal visible without flooding.
-            if not self.vector_model_down:
-                logger.warning(
-                    "semantic leg DOWN: embedding model unavailable — recall "
-                    "degraded to lexical (FTS) only until the encoder loads"
-                )
-            self.vector_model_down = True
+            self._note_vector_model_down()
             return []
         self.vector_model_down = False
 
@@ -1359,6 +1359,12 @@ class RetrievalEngine:
             candidates.sort(key=lambda x: x.get("rerank_score", 0), reverse=True)
         except Exception as e:
             logger.warning("Re-ranking failed: %s — falling back to RRF scores", e)
+            # R5 (#226): the fallback leaves these candidates with no
+            # rerank_score, so in a combined/both merge this corpus competes at
+            # raw RRF magnitude against reranked corpora and is silently evicted.
+            # Record it; the caller reports it rather than presenting the merge
+            # as a clean cross-corpus ordering.
+            self.last_rerank_degraded = str(e)
 
         return candidates
 
@@ -1826,6 +1832,32 @@ class RetrievalEngine:
     _KNOWN_BACKENDS = ("faiss-disk", "faiss-mem", "qdrant", "lance")
     _MAX_BACKENDS = 4
 
+    def _note_vector_model_down(self) -> None:
+        """Raise the P0-B degradation flag, logging once per outage."""
+        if not self.vector_model_down:
+            logger.warning(
+                "semantic leg DOWN: embedding model unavailable — recall "
+                "degraded to lexical (FTS) only until the encoder loads"
+            )
+        self.vector_model_down = True
+
+    def _encode_query(self, query: str) -> np.ndarray:
+        """Encode ``query``, raising the P0-B flag when the encoder is down.
+
+        R4(b) (#226): the explicit-backend branches used to inline
+        ``self.model.encode(q) if self.model else np.array([])``, which fed an
+        EMPTY query vector into the backend with no log line and no flag. The
+        request succeeded and returned lexical-only results indistinguishable
+        from a healthy hybrid search. Every path that needs a query vector now
+        goes through here, so degradation is reported on the same code path as
+        the default branch.
+        """
+        if not self.model:
+            self._note_vector_model_down()
+            return np.array([], dtype=np.float32)
+        self.vector_model_down = False
+        return self.model.encode(query).astype(np.float32)
+
     def _normalize_backend_names(self, backend_names: list) -> list:
         """Dedup (order-preserving), cap length, and reject unknown members."""
         seen: set = set()
@@ -2279,6 +2311,10 @@ class RetrievalEngine:
             variants = expand_query(query, mode=str(mode).lower())
         except Exception as exc:  # noqa: BLE001 - recall must not raise here
             logger.warning("Query expansion failed: %s — using original query", exc)
+            # AFM-6 (#230): the log line alone is not reachable from the call
+            # site. Recorded so the response can say the search ran on the bare
+            # query rather than presenting it as an expanded one.
+            self.last_query_expand_degraded = str(exc)
             variants = [query]
         return variants or [query]
 
@@ -2525,6 +2561,12 @@ class RetrievalEngine:
         With backend=None (default), results are bit-identical to pre-PR-3.
         """
         claim_text = str(claim or "").strip()
+        # R5 (#226): per-retrieve, so a stale flag from an earlier call never
+        # reports this one as degraded. The multi-variant branch below recurses,
+        # and a degrade in ANY variant degrades the merge, so it is deliberately
+        # NOT cleared again after the recursion.
+        self.last_rerank_degraded = None
+        self.last_query_expand_degraded = None
         query_variants = self._resolve_query_variants(query, expand)
         if len(query_variants) > 1:
             total_t0 = time.perf_counter()
@@ -2750,20 +2792,20 @@ class RetrievalEngine:
                 resolved = self._resolve_backends(backend)
                 if len(resolved) == 1:
                     semantic_results = self._backend_search(
-                        self.model.encode(query).astype(np.float32) if self.model else np.array([]),
+                        self._encode_query(query),
                         rerank_k,
                         resolved[0],
                     )
                 else:
                     multi = MultiBackend(resolved)
-                    query_emb = self.model.encode(query).astype(np.float32) if self.model else np.array([])
+                    query_emb = self._encode_query(query)
                     hits = multi.search(query_emb, k=rerank_k)
                     # Convert VectorHit list to the dict format expected by _rrf_merge
                     semantic_results = self._hits_to_dicts(hits, query_emb)
                 trace["backends"] = [getattr(b, "name", str(b)) for b in resolved]
             else:
                 # Single explicit backend object
-                query_emb = self.model.encode(query).astype(np.float32) if self.model else np.array([])
+                query_emb = self._encode_query(query)
                 semantic_results = self._backend_search(query_emb, rerank_k, backend)
                 trace["backends"] = [getattr(backend, "name", "custom")]
             timing["semantic_ms"] = round((time.perf_counter() - semantic_t0) * 1000, 3)
@@ -2916,10 +2958,25 @@ class RetrievalEngine:
                                 r.get("doc_id") for r in hyde_merged
                             ]
                         else:
+                            # AFM-6 (#230): the leg was attempted and produced
+                            # nothing. `triggered` above records the DECISION to
+                            # run; `completed` records whether it actually did.
+                            # Reading `triggered` alone told anyone debugging a
+                            # bad result that the enrichment ran when it had not.
+                            trace["hyde"]["completed"] = False
                             trace["hyde"]["skipped"] = "afm_unavailable"
+                            logger.warning(
+                                "HyDE leg degraded: AFM produced no hypothetical "
+                                "answer — results are the un-enriched first pass"
+                            )
+                        trace["hyde"].setdefault("completed", True)
                 except Exception as exc:  # noqa: BLE001 - recall must not stack trace.
-                    logger.debug("HyDE skipped after retrieval pass: %s", exc)
+                    # Was DEBUG — invisible at normal log levels, so a HyDE leg
+                    # that failed on every query left no trace anyone would see.
+                    logger.warning("HyDE leg failed after retrieval pass: %s", exc)
+                    trace["hyde"]["completed"] = False
                     trace["hyde"]["skipped"] = "error"
+                    trace["hyde"]["error"] = str(exc)
 
         # G19 gate (below, after status filter) is the single source of truth for visibility.
         # The prior ad-hoc "agent_id or unknown" filter is removed; legacy principal=None

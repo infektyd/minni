@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import threading
 import time
 import urllib.request
 from typing import Any, Callable, Dict, Literal, Optional
@@ -113,6 +114,37 @@ def _generation_probe_timeout_seconds() -> float:
 _GENERATION_PROBE_TIMEOUT_SECONDS = _generation_probe_timeout_seconds()
 _generation_probe_cache: Dict[str, Dict[str, Any]] = {}
 
+# AFM-4 (#230): the cache had no eviction policy at all. Measured live at 22
+# entries, 21 of them stale residue from test runs against throwaway URLs —
+# each one an unbounded-growth key that nothing would ever read again. Keys are
+# "mode|url", so an operator cycling through endpoints (or any test suite)
+# grows it without limit. Bound it and evict the oldest probe first.
+PROBE_CACHE_MAX_ENTRIES = 32
+# AFM-4: the persistent cache was a read-modify-write with no mutual exclusion,
+# so two concurrent probes could each read the same entries dict and the second
+# write would drop the first one's entry. Serializes the whole read-mutate-write.
+_probe_cache_lock = threading.RLock()
+
+
+def _evict_probe_entries(entries: Dict[str, Dict[str, Any]], probed_at_key: str) -> None:
+    """Trim ``entries`` to :data:`PROBE_CACHE_MAX_ENTRIES`, oldest probe first.
+
+    Entries with no usable timestamp sort oldest — an entry we cannot date is
+    not one we can justify keeping over one we can.
+    """
+    if len(entries) <= PROBE_CACHE_MAX_ENTRIES:
+        return
+
+    def _age_key(item: Any) -> float:
+        value = item[1].get(probed_at_key)
+        return float(value) if isinstance(value, (int, float)) else float("-inf")
+
+    for key, _ in sorted(entries.items(), key=_age_key)[
+        : len(entries) - PROBE_CACHE_MAX_ENTRIES
+    ]:
+        del entries[key]
+
+
 # --- cross-process persistent probe cache (L2) -------------------------------
 #
 # The in-memory dict above (L1) only benefits long-lived processes; SessionStart
@@ -181,9 +213,22 @@ def _write_persistent_probe_entries(entries: Dict[str, Dict[str, Any]]) -> None:
 
 
 def _persist_probe_mutation(mutate: Callable[[Dict[str, Dict[str, Any]]], None]) -> None:
-    entries = _read_persistent_probe_entries()
-    mutate(entries)
-    _write_persistent_probe_entries(entries)
+    # AFM-4 (#230): read-mutate-write under one lock. Unserialized, two
+    # concurrent probes both read the same entries and the second write dropped
+    # the first one's entry — a lost update on the very cache that exists to
+    # stop redundant probes.
+    with _probe_cache_lock:
+        entries = _read_persistent_probe_entries()
+        mutate(entries)
+        _evict_probe_entries(entries, "probed_at_ms")
+        _write_persistent_probe_entries(entries)
+
+
+def _remember_probe(key: str, entry: Dict[str, Any]) -> None:
+    """Store an L1 probe entry, bounding the cache (AFM-4)."""
+    with _probe_cache_lock:
+        _generation_probe_cache[key] = entry
+        _evict_probe_entries(_generation_probe_cache, "probed_at")
 
 
 def _to_persisted_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
@@ -242,10 +287,10 @@ def note_afm_generation_success(url: str, mode: str = "bridge", now: Callable[[]
     even while real calls succeed (mirror of afm.ts noteAfmGenerationSuccess).
     """
     entry = {"reachable": True, "generation_verified": True, "detail": None, "probed_at": now()}
-    _generation_probe_cache[f"{mode}|{url}"] = entry
+    _remember_probe(f"{mode}|{url}", entry)
     for key in list(_generation_probe_cache):
         if key.endswith(f"|{url}"):
-            _generation_probe_cache[key] = dict(entry)
+            _remember_probe(key, dict(entry))
 
     def _upsert(entries: Dict[str, Dict[str, Any]]) -> None:
         entries[f"{mode}|{url}"] = _to_persisted_entry(entry)
@@ -347,11 +392,11 @@ def verify_afm_generation(
         # fall through to a normal probe.
         persisted = _load_persisted_probe_entry(key)
         if persisted is not None and (now() - persisted["probed_at"]) < ttl_seconds:
-            _generation_probe_cache[key] = persisted
+            _remember_probe(key, persisted)
             cached = persisted
     if cached is None or (now() - cached["probed_at"]) >= ttl_seconds:
         cached = _run_generation_probe(resolved, target, timeout, client, now)
-        _generation_probe_cache[key] = cached
+        _remember_probe(key, cached)
         fresh = cached
 
         def _store(entries: Dict[str, Dict[str, Any]]) -> None:
