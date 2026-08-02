@@ -69,6 +69,47 @@ const HARVEST_CONFIG = (vaultPath) => ({
   platform: "claude-code",
 });
 
+// P3 / #227: shared SessionStart (codex/grok/cursor/…) must harvest when a
+// transcript path is present — not only the claude-code hook.ts entrypoint.
+test("shared SessionStart harvests compact_summary for codex when transcript has a summary", async () => {
+  const { createHookHandlers } = await import("../dist/hook-handlers.js");
+  const vault = await tmpVault();
+  const file = await tmpTranscript([
+    transcriptLine({ type: "user", message: { role: "user", content: "hello" } }),
+    transcriptLine(summaryEntry("uuid-shared-p3", SUMMARY_TEXT)),
+  ]);
+  const handlers = createHookHandlers({
+    agentId: "codex",
+    vaultPath: vault,
+    defaultWorkspaceId: "workspace-test",
+    contextWindow: 200_000,
+    hooksEnabled: true,
+    runtime: "codex",
+    auditPrefix: "hook_codex",
+    // Keep boot RPCs from stalling the suite if no daemon is up.
+    sessionStartHookTimeoutMs: 2_000,
+  });
+  await handlers.handleSessionStart({
+    session_id: "s-p3",
+    transcript_path: file,
+    source: "compact",
+  });
+  const inboxDir = path.join(vault, "inbox");
+  const files = await readdir(inboxDir);
+  const harvested = [];
+  for (const name of files) {
+    if (!name.endsWith(".json")) continue;
+    const raw = JSON.parse(await readFile(path.join(inboxDir, name), "utf8"));
+    if (raw.kind === COMPACT_SUMMARY_KIND) harvested.push(raw);
+  }
+  assert.equal(harvested.length, 1, "expected one compact_summary inbox file");
+  assert.equal(harvested[0].platform, "codex");
+  assert.ok(
+    String(harvested[0].summary_text ?? "").includes("Primary Request"),
+    "inbox payload must carry the summary body",
+  );
+});
+
 test("extractLatestCompactSummary finds the newest summary entry", async () => {
   const file = await tmpTranscript([
     transcriptLine({ type: "user", message: { role: "user", content: "hello" } }),

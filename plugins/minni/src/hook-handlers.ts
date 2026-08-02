@@ -42,7 +42,7 @@ import {
   failAndExit,
   markOutputDropped,
 } from "./hook-delivery.js";
-import { harvestSummaryText } from "./compact-harvest.js";
+import { harvestCompactSummary, harvestSummaryText } from "./compact-harvest.js";
 import { injectIntent, noIntent, noteIntent } from "./hook-intent.js";
 import type { HookIntent } from "./hook-intent.js";
 import { canInject, renderIntent, wireFor } from "./hook-platform.js";
@@ -476,13 +476,46 @@ export function createHookHandlers(
     // the envelope — and, critically, the corrections below — still ship.
     //
     // The clock starts at handler ENTRY: the harness deadline runs from process
-    // start, so any setup done first (vault creation, and on claude-code the
-    // compaction harvest) is time already spent against it.
+    // start, so any setup done first (vault creation + compaction harvest) is
+    // time already spent against it.
     const budgetMs = effectiveHookBudgetMs(config.sessionStartHookTimeoutMs);
     const deadline = Date.now() + budgetMs;
     const remainingMs = (): number => Math.max(0, deadline - Date.now());
     const rpcTimedOut = { ok: false as const, error: JSON_RPC_TIMEOUT_ERROR };
     await ensureVault(config.vaultPath);
+
+    // Compaction-summary harvest backstop (P3 / #227). Claude Code's primary
+    // path is PostCompact in hook.ts; Kilo delivers via CompactSummary. Every
+    // other platform that boots through this shared handler (codex, grok-build,
+    // cursor, gemini, kilocode SessionStart) had no harvest path at all — the
+    // summary was discarded. When the platform supplies a transcript path (or
+    // marks the boot as compact/resume), tail-read for a Claude-shaped summary
+    // entry and store it as kind=compact_summary. Content-hash dedup keeps this
+    // safe if a platform later gains a direct-delivery path. Fail-open, raw
+    // only — daemon compact_distillation organizes it later. Platforms whose
+    // transcripts are not Claude-shaped no-op with reason no_summary_found;
+    // that absence is declared in docs/concepts.md's platform table.
+    const bootSource = asString(payload.source);
+    const transcriptPath =
+      asString(payload.transcript_path) || asString(payload.transcriptPath);
+    if (
+      transcriptPath ||
+      bootSource === "compact" ||
+      bootSource === "resume"
+    ) {
+      await harvestCompactSummary(
+        {
+          vaultPath: config.vaultPath,
+          workspaceId,
+          auditPrefix: config.auditPrefix,
+          platform: config.runtime ?? config.agentId,
+        },
+        {
+          transcriptPath,
+          sessionId,
+        },
+      );
+    }
 
     // TTL-reap stale file handoffs BEFORE the honest read so they neither occupy
     // the capped slice nor inflate totals; they surface once below as 'expired'.
