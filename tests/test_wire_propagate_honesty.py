@@ -253,3 +253,23 @@ def test_toml_preservation_still_works_on_valid_file(tmp_path):
     text = path.read_text(encoding="utf-8")
     assert "codex-vault" in text
     assert "/wrong/fresh/vault" not in text
+
+
+def test_toml_basic_str_parity_with_wire():
+    """Propagate and wire must escape the same control/meta characters (D10 dual-maintain)."""
+    from minni.wire.writers import _toml_basic_str as wire_esc
+
+    samples = (
+        "plain",
+        'quote"here',
+        "back\\slash",
+        "new\nline",
+        "tab\there",
+        "carr\riage",
+        "nul\x00byte",
+        "unit\x1fsep",
+        "del\x7f",
+        'mix\\"\n\t\r\x01',
+    )
+    for raw in samples:
+        assert propagate._toml_basic_str(raw) == wire_esc(raw), repr(raw)
