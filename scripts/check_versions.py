@@ -245,24 +245,19 @@ def _version_agrees(deployed: str, canonical: str) -> bool:
 def _active_wire_plugin_roots(home: Path) -> set[Path]:
     """Install roots under ~/.minni/plugin that are the *live* wire targets.
 
-    ``wired.json`` is append-ish history. Older platform rows (e.g.
-    ``codex → …/0.3.0``) can remain even after a fresher ``wire all`` generation.
-    Treating the full union as active makes sync fail its own verify on those
-    zombies.
-
-    Match deploy honesty: prefer the **newest ``wired_at`` install root that
-    still exists** (global, not per-platform history), then fall back to
-    **latest ``wired_at`` per platform**, always union ``current`` when present.
-    Per-platform latest is only added when it shares the same root as the
-    global newest or when no global newest was resolved — so a stale codex
-    row at 0.3.0 cannot veto a fresher claude-code wire.
+    ``wired.json`` is append-ish history. Keep a root active if it is the
+    **latest ``wired_at`` for any platform** (plus ``current``). Drop only
+    superseded rows for the *same* platform — a codex root that is still that
+    platform's newest record may still be the live MCP target even when a
+    fresher claude-code wire exists. Historical duplicates of one platform are
+    ignored so non-interactive wire leftovers do not pile up forever.
     """
     base = home / ".minni" / "plugin"
     actives: set[Path] = set()
     wired = base / "wired.json"
     try:
         data = json.loads(wired.read_text(encoding="utf-8"))
-        entries: list[tuple[str, str, Path]] = []
+        latest_by_platform: dict[str, tuple[str, Path]] = {}
         for entry in data.get("wires", []) or []:
             if not isinstance(entry, dict):
                 continue
@@ -272,26 +267,13 @@ def _active_wire_plugin_roots(home: Path) -> set[Path]:
             root = Path(str(root_str))
             if not root.is_dir():
                 continue
-            entries.append((
-                str(entry.get("wired_at") or ""),
-                str(entry.get("platform") or "_"),
-                root.resolve(),
-            ))
-        if entries:
-            # Global newest first (deploy_honesty order).
-            newest_at, _plat, newest_root = max(entries, key=lambda t: t[0])
-            actives.add(newest_root)
-            # Latest per platform, but only roots that are not older zombies:
-            # keep a per-platform root only when its wired_at equals the global
-            # newest (same generation) or points at the same install tree.
-            latest_by_platform: dict[str, tuple[str, Path]] = {}
-            for wired_at, platform, root in entries:
-                prev = latest_by_platform.get(platform)
-                if prev is None or wired_at >= prev[0]:
-                    latest_by_platform[platform] = (wired_at, root)
-            for wired_at, root in latest_by_platform.values():
-                if root == newest_root or wired_at == newest_at:
-                    actives.add(root)
+            platform = str(entry.get("platform") or "_")
+            wired_at = str(entry.get("wired_at") or "")
+            prev = latest_by_platform.get(platform)
+            if prev is None or wired_at >= prev[0]:
+                latest_by_platform[platform] = (wired_at, root.resolve())
+        for _wired_at, root in latest_by_platform.values():
+            actives.add(root)
     except (OSError, json.JSONDecodeError, TypeError):
         pass
     current = base / "current"

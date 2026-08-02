@@ -214,18 +214,19 @@ def _home() -> Path:
 
 
 def _active_wire_plugin_roots(home: Path) -> set[Path]:
-    """Live wire install roots under ~/.minni/plugin (global-newest + current).
+    """Live wire install roots under ~/.minni/plugin (latest per platform + current).
 
-    Mirrors scripts/check_versions.py so --strict sync-root verify does not
-    fail on historical ~/.minni/plugin/<old>/ trees left by non-interactive
-    wire without prune.
+    Mirrors scripts/check_versions.py so --strict sync-root verify uses the
+    same active set. Latest ``wired_at`` *per platform* stays active (a codex
+    root that is still that platform's newest record may still be the live MCP
+    target); only superseded rows for the same platform are dropped.
     """
     base = home / ".minni" / "plugin"
     actives: set[Path] = set()
     wired = base / "wired.json"
     try:
         data = json.loads(wired.read_text(encoding="utf-8"))
-        entries: list[tuple[str, Path]] = []
+        latest_by_platform: dict[str, tuple[str, Path]] = {}
         for entry in data.get("wires", []) or []:
             if not isinstance(entry, dict):
                 continue
@@ -233,15 +234,15 @@ def _active_wire_plugin_roots(home: Path) -> set[Path]:
             if not root_str:
                 continue
             root = Path(str(root_str))
-            if root.is_dir():
-                entries.append((str(entry.get("wired_at") or ""), root.resolve()))
-        if entries:
-            newest_at, newest_root = max(entries, key=lambda t: t[0])
-            actives.add(newest_root)
-            # Same generation only (same wired_at or same tree).
-            for wired_at, root in entries:
-                if root == newest_root or wired_at == newest_at:
-                    actives.add(root)
+            if not root.is_dir():
+                continue
+            platform = str(entry.get("platform") or "_")
+            wired_at = str(entry.get("wired_at") or "")
+            prev = latest_by_platform.get(platform)
+            if prev is None or wired_at >= prev[0]:
+                latest_by_platform[platform] = (wired_at, root.resolve())
+        for _wired_at, root in latest_by_platform.values():
+            actives.add(root)
     except (OSError, json.JSONDecodeError, TypeError):
         pass
     current = base / "current"

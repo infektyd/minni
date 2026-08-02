@@ -1434,9 +1434,17 @@ def update_one_plugin(platform: str, args: argparse.Namespace) -> dict[str, obje
 CANONICAL_FLEET = (
     "codex", "claude-code", "kilocode", "gemini", "antigravity", "grok", "cursor",
 )
-ALL_PLATFORMS = ("codex", "kilocode", "antigravity", "grok", "cursor")
+# Wire-primary fleet: codex/kilocode/grok MCP roots live under
+# ~/.minni/plugin via `minni wire`. Expanding them in propagate `all` rewrites
+# those paths onto legacy cache/agents trees and undoes wire adoption.
+# Explicit single-platform propagate still works for recovery; `all` only
+# covers surfaces wire deliberately skips (antigravity, cursor).
+ALL_PLATFORMS = ("antigravity", "cursor")
 ALL_SKIPS = {
     "claude-code": "wire-managed: run `minni wire claude-code`",
+    "codex": "wire-managed: run `minni wire codex` (propagate would rewrite MCP onto the codex cache tree)",
+    "kilocode": "wire-managed: run `minni wire kilocode`",
+    "grok": "wire-managed: run `minni wire grok` (hooks/rules: make sync-root refreshes against the wire root)",
     "gemini": (
         "covered by `antigravity` (same install root; antigravity also writes "
         "the gemini-extension manifest)"

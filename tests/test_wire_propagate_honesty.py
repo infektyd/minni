@@ -77,8 +77,8 @@ def test_update_plugin_isolates_platform_failures(monkeypatch, capsys):
     """One platform raising must not abort the rest, and the overall status
     must be derived — 'partial', not a hardcoded 'updated'."""
     def fake_update_one(platform, args):
-        if platform == "kilocode":
-            raise RuntimeError("boom: kilocode exploded")
+        if platform == "antigravity":
+            raise RuntimeError("boom: antigravity exploded")
         return {"platform": platform, "agent": "x", "install_root": "/tmp/x"}
 
     monkeypatch.setattr(propagate, "update_one_plugin", fake_update_one)
@@ -87,11 +87,11 @@ def test_update_plugin_isolates_platform_failures(monkeypatch, capsys):
     assert rc == 1
     assert doc["status"] == "partial"
     by_platform = {r["platform"]: r for r in doc["results"]}
-    assert by_platform["kilocode"]["status"] == "failed"
-    assert "boom" in by_platform["kilocode"]["error"]
+    assert by_platform["antigravity"]["status"] == "failed"
+    assert "boom" in by_platform["antigravity"]["error"]
     # The platforms after the failure still ran.
     for plat in propagate.ALL_PLATFORMS:
-        if plat != "kilocode":
+        if plat != "antigravity":
             assert by_platform[plat]["status"] == "updated"
     # D7: the deliberate exclusions are named in the output.
     for plat, reason in propagate.ALL_SKIPS.items():

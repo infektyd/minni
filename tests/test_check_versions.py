@@ -256,10 +256,10 @@ def test_inactive_wire_version_dir_is_skipped_not_failed(tmp_path):
     assert "public version agrees" in proc.stdout or fresh_ver in proc.stdout
 
 
-def test_zombie_wired_json_row_for_other_platform_is_not_active(tmp_path):
-    """Round-3 High: sync-root only rewires claude-code; wired.json keeps a
-    zombie codex→0.3.0 row as that platform's latest. Global-newest + current
-    must win so verify stays green after a claude-only sync."""
+def test_latest_per_platform_root_stays_active_even_if_older_than_peer(tmp_path):
+    """COMMENT-round Med: a platform's latest wire root stays active even when
+    another platform has a newer wired_at. Codex still on 0.3.0 must be judged
+    (fail), not skipped as historical."""
     canonical = _canonical()
     home = tmp_path / "home"
     plugin = home / ".minni" / "plugin"
@@ -305,9 +305,9 @@ def test_zombie_wired_json_row_for_other_platform_is_not_active(tmp_path):
         }
     )
     out = proc.stdout + proc.stderr
-    assert proc.returncode == 0, out
-    assert "skipped (not an active wire install" in proc.stdout
-    assert "!= '0.4" not in out and "0.3.0" in proc.stdout  # skipped note mentions path
+    assert proc.returncode == 1, out
+    assert "0.3.0" in out
+    assert "skipped (not an active wire install" not in out or "0.3.0" in out
 
 
 def test_legacy_marketplace_cache_skipped_when_wire_active(tmp_path):
