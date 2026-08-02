@@ -726,6 +726,46 @@ def test_recent_write_timeouts_reach_the_status_verdict():
     assert not any("timed out" in reason for reason in reasons)
 
 
+def test_a_hung_in_flight_job_never_ages_off_the_status_surface(monkeypatch):
+    """Round 6: a worker hung MID-JOB has queue_depth 0 (already dequeued),
+    and later ticks return write_in_flight without refreshing the timeout
+    stamp — so after WRITE_TIMEOUTS_RECENT_SECONDS the surface read `ok`
+    while every submit was still refused. A job in flight NOW is current
+    truth: no recency window."""
+    import time as time_mod
+
+    from minni import afm_writer
+
+    afm_writer.reset_pass_counters()
+    monkeypatch.setattr(afm_writer, "_ensure_worker", lambda: None)
+    monkeypatch.setattr(afm_writer, "_WORK_QUEUE", queue.Queue(maxsize=4))
+
+    first = afm_writer.submit_drafts(
+        {"pass_name": "p", "drafts": [{"title": "t"}]}, timeout=0.01
+    )
+    assert first["status"] == "write_timeout", "precondition: the job is hung"
+    # The worker dequeues the job it is hung inside of; depth goes to 0.
+    afm_writer._WORK_QUEUE.get_nowait()
+
+    later = time_mod.time() + afm_writer.WRITE_TIMEOUTS_RECENT_SECONDS + 60
+    state = afm_writer.writer_status(schedule={"passes": {}}, now=later)
+    assert state["jobs_in_flight"] == 1
+    assert state["in_flight_passes"] == ["p"]
+    assert state["status"] != "ok", (
+        "an unfinished write job is a CURRENT fault; it must not age off the "
+        "surface with the timeout stamp"
+    )
+    assert state["status"] == "backlogged"
+    assert any("in flight" in r for r in state["status_reasons"])
+
+    # The moment the job lands, the same aged state reads ok again.
+    afm_writer._IN_FLIGHT_PER_PASS["p"].set()
+    state = afm_writer.writer_status(schedule={"passes": {}}, now=later)
+    assert state["jobs_in_flight"] == 0
+    assert state["status"] == "ok"
+    afm_writer.reset_pass_counters()
+
+
 def test_writer_status_exposes_the_fields_the_verdict_reads():
     """The state dict and the derivation must not drift apart again."""
     from minni.afm_writer import writer_status
@@ -738,6 +778,8 @@ def test_writer_status_exposes_the_fields_the_verdict_reads():
         "last_drop_at",
         "write_timeouts",
         "last_write_timeout_at",
+        "jobs_in_flight",
+        "in_flight_passes",
         "failures_per_pass",
         "last_failure_per_pass",
     ):
@@ -929,6 +971,33 @@ def test_unreadable_distillation_file_is_counted_and_logged(tmp_path, caplog, mo
     assert res["skipped"].get("_unreadable") == 1, "a discarded group must be counted"
     assert any("unreadable" in record.message for record in caplog.records), (
         "and visible above DEBUG"
+    )
+
+
+def test_over_candidate_cap_counts_only_candidate_eligible_sections():
+    """Round 6: the cap-break count was `len(sections) - i - 1`, which swept
+    in personal and skip-titled sections that were never distillation input —
+    overstating how much SHARED input the cap threw away, the exact number
+    AFM-9 exists to answer."""
+    import minni.afm_passes.compact_distillation as mod
+
+    filler = "durable transferable learning content, well past the floor."
+    shared = [
+        f"{i}. Key Learnings:\n{filler} section {i}\n"
+        for i in range(1, mod.MAX_CANDIDATES_PER_FILE + 2)
+    ]
+    tail = [
+        f"{len(shared) + 1}. Random Notes:\n{filler}\n",
+        f"{len(shared) + 2}. All User Messages:\n{filler}\n",
+        f"{len(shared) + 3}. Current Work:\n{filler}\n",
+    ]
+    doc = {"summary_text": "".join(shared + tail)}
+
+    candidates, _personal, dropped = mod._distill_file(doc, afm_chain=None)
+    assert len(candidates) == mod.MAX_CANDIDATES_PER_FILE, "precondition: cap hit"
+    assert dropped["_over_candidate_cap"] == 1, (
+        "only the ONE remaining shared section was candidate-eligible; the "
+        "personal and skip-titled tail was never distillation input"
     )
 
 

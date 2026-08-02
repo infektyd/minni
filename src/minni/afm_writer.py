@@ -354,6 +354,19 @@ def derive_loop_status(
             f"{timeouts} over the process lifetime) — outcomes unobserved; "
             "the writer is not draining within the wait window"
         )
+    # Round 6 (PR #260): a job in flight NOW is current truth — no recency
+    # window. Neither of the other writer signals covers a hung mid-job write:
+    # queue_depth is 0 once the worker dequeues, and the timeout stamp ages
+    # out while later ticks return write_in_flight without refreshing it, so
+    # after an hour the surface read `ok` while every submit was still refused.
+    jobs_in_flight = int(state.get("jobs_in_flight", 0) or 0)
+    if jobs_in_flight:
+        stalled_passes = ", ".join(str(p) for p in (state.get("in_flight_passes") or []))
+        reasons.append(
+            f"{jobs_in_flight} write job(s) still in flight"
+            + (f" ({stalled_passes})" if stalled_passes else "")
+            + " — new submits for those passes are refused until they land"
+        )
 
     # GA4-3: a pass failing on every tick used to reach this function looking
     # exactly like a healthy one, because only the fact that it ran was
@@ -390,6 +403,7 @@ def derive_loop_status(
         or queue_backlogged
         or dropped_recently
         or timed_out_recently
+        or jobs_in_flight
         or (oldest_ts is not None and (now - oldest_ts) / 86400.0 > ttl_days)
     ):
         return "backlogged", reasons
@@ -793,8 +807,11 @@ def submit_drafts(job: dict, wait: bool = True, timeout: Optional[float] = 30.0)
         # that outlives every caller's wait is chronic, and without a counter
         # the status surface reads ok while nothing is ever observed landing.
         global _WRITE_TIMEOUTS, _LAST_WRITE_TIMEOUT_AT
-        _WRITE_TIMEOUTS += 1
-        _LAST_WRITE_TIMEOUT_AT = time.time()
+        # Round 6: same lock as the drop counters — a bare RMW loses
+        # increments when the loop and a wire daemon.compile time out at once.
+        with _IN_FLIGHT_LOCK:
+            _WRITE_TIMEOUTS += 1
+            _LAST_WRITE_TIMEOUT_AT = time.time()
         logger.warning(
             "AFM writer timed out after %.1fs waiting on pass %r; %d draft(s) "
             "still in flight — outcome unobserved",
@@ -874,9 +891,19 @@ def writer_status(
                     oldest = value if oldest is None else min(oldest, value)
                 else:
                     undated += 1
+    # Round 6 (PR #260): live in-flight state, read fresh per status call.
+    # While the worker is mid-job the queue is EMPTY, and the timeout stamp
+    # ages out after an hour — without this a hung write vanished from the
+    # surface while every new tick was still refused with write_in_flight.
+    with _IN_FLIGHT_LOCK:
+        in_flight_passes = sorted(
+            name for name, event in _IN_FLIGHT_PER_PASS.items() if not event.is_set()
+        )
     state = {
         "last_run_per_pass": dict(_LAST_RUN_PER_PASS),
         "last_attempt_per_pass": dict(_LAST_ATTEMPT_PER_PASS),
+        "jobs_in_flight": len(in_flight_passes),
+        "in_flight_passes": in_flight_passes,
         "drafts_pending": pending,
         "drafts_pending_oldest": oldest,
         "drafts_pending_undated": undated,

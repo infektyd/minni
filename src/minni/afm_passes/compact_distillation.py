@@ -229,7 +229,18 @@ def _distill_file(
         if len(candidates) >= MAX_CANDIDATES_PER_FILE:
             # Sections past the cap are not distilled at all. Counting them
             # keeps the cap from reading as "the file only had this much".
-            remaining = len(sections) - section_index - 1
+            # Round 6 (PR #260): count only the candidate-ELIGIBLE tail —
+            # shared, not skip-titled, the same predicate the loop applies.
+            # The raw tail also held personal/skip sections that were never
+            # distillation input, and counting those overstated how much
+            # shared input the cap threw away — the exact number AFM-9
+            # exists to answer.
+            remaining = sum(
+                1
+                for title, _content in sections[section_index + 1:]
+                if not _SKIP_SECTION_TITLES.match(title)
+                and _SHARED_SECTION_TITLES.match(title)
+            )
             if remaining > 0:
                 dropped["_over_candidate_cap"] = remaining
             break
