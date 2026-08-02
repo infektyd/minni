@@ -198,13 +198,20 @@ minni wire-adopt claude-code            # one-time cutover; dry-run by default
 minni wire-adopt claude-code --apply
 ```
 
+**D7 fleet partition (post-R10):** wire owns MCP for codex / claude-code /
+kilocode / grok (`minni wire <platform>` or `minni wire all`). propagate
+`update-plugin --platform all` expands **only** to antigravity + cursor
+(surfaces wire deliberately skips). Prefer `make sync-root` for a full
+checkout redeploy. Do **not** re-run explicit
+`update-plugin --platform codex|kilocode|grok` after wire adoption — that
+rewrites MCP onto legacy cache/agents trees.
+
 ```bash
-.venv/bin/python plugins/minni/skills/minni-install/scripts/propagate.py update-plugin --platform codex
-.venv/bin/python plugins/minni/skills/minni-install/scripts/propagate.py update-plugin --platform kilocode
-.venv/bin/python plugins/minni/skills/minni-install/scripts/propagate.py update-plugin --platform gemini
+minni wire all --from-repo .                 # codex, claude-code, kilocode, grok
 .venv/bin/python plugins/minni/skills/minni-install/scripts/propagate.py update-plugin --platform antigravity
-.venv/bin/python plugins/minni/skills/minni-install/scripts/propagate.py update-plugin --platform grok
-.venv/bin/python plugins/minni/skills/minni-install/scripts/propagate.py update-plugin --platform all
+.venv/bin/python plugins/minni/skills/minni-install/scripts/propagate.py update-plugin --platform cursor
+.venv/bin/python plugins/minni/skills/minni-install/scripts/propagate.py update-plugin --platform all   # = antigravity+cursor only
+make sync-root                               # preferred full operator path
 ```
 
 ### Rebranding / reinstalling a Claude Code plugin identity

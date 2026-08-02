@@ -26,9 +26,11 @@ Runs `scripts/update_root.sh`, which loudly and idempotently:
 4. Redeploys the platform surfaces with the D7 fleet partition:
    `minni wire all --from-repo` (codex, claude-code, kilocode, grok), then
    `propagate.py update-plugin` for **antigravity** and **cursor** only, plus
-   a grok hooks/rules refresh against the active wire install root. It does
-   **not** run `propagate --platform all` (that would rewrite wire-managed
-   MCP paths back onto legacy cache trees).
+   a grok hooks/rules refresh against the active wire install root.
+   `propagate --platform all` expands only to antigravity+cursor (wire-managed
+   platforms are skipped). Do **not** re-run explicit
+   `update-plugin --platform codex|kilocode|grok` after wire adoption — that
+   still rewrites MCP onto legacy cache/agents trees.
 5. Restarts `minnid` via `launchctl kickstart` when the
    `com.minni.minnid` agent is loaded. If the agent is **not** loaded, the
    script still runs step 6 (so you see WORKTREE/BADCONFIG from this run) and

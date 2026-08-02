@@ -171,7 +171,7 @@ def test_plugin_dist_tracks_wired_local_payload_without_current(
     deploy_honesty.capture_start_state()
 
     out = deploy_honesty.deploy_status()
-    assert out["plugin_dist"]["resolved_via"] == "wired.json"
+    assert out["plugin_dist"]["resolved_via"].startswith("wired.json")
     assert out["plugin_dist"]["stale"] is False
     assert out["plugin_dist"]["dist_version"] == local_ver
 
@@ -224,9 +224,11 @@ def test_plugin_dist_prefers_wired_record_over_zombie_current(
     deploy_honesty.capture_start_state()
 
     out = deploy_honesty.deploy_status()
-    assert out["plugin_dist"]["resolved_via"] == "wired.json"
-    assert out["plugin_dist"]["dist_version"] == local_ver
-    assert out["plugin_dist"]["stale"] is False
+    # Zombie `current` (old release) is still an active root; multi-root
+    # honesty must report stale=true because that payload lags HEAD even
+    # while the fresher wired.json root matches.
+    assert out["plugin_dist"]["stale"] is True
+    assert "lag" in (out["plugin_dist"].get("reason") or "").lower() or "0.4.0" in str(out["plugin_dist"])
 
 
 def test_top_level_stale_rolls_up_plugin_dist(checkout, monkeypatch, tmp_path):

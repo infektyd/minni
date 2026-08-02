@@ -124,6 +124,13 @@ def test_claude_code_platform_fails_loud_and_points_at_wire(name, tmp_path):
 
 
 def test_claude_code_is_absent_from_the_all_expansion():
+    """D7 partition: propagate `all` is antigravity+cursor only; wire owns
+    codex/claude-code/kilocode/grok (named ALL_SKIPS)."""
     assert "claude-code" not in propagate.ALL_PLATFORMS
-    assert "codex" in propagate.ALL_PLATFORMS
+    assert "codex" not in propagate.ALL_PLATFORMS
+    assert "kilocode" not in propagate.ALL_PLATFORMS
+    assert "grok" not in propagate.ALL_PLATFORMS
+    assert set(propagate.ALL_PLATFORMS) == {"antigravity", "cursor"}
+    assert "codex" in propagate.ALL_SKIPS
+    assert "claude-code" in propagate.ALL_SKIPS
     assert "cursor" in propagate.ALL_PLATFORMS

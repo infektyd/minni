@@ -89,38 +89,51 @@ def capture_start_state() -> dict:
     return state
 
 
-def _active_payload_root() -> tuple[Optional[Path], str]:
-    """(root, how) for the wire-managed payload actually in use.
+def _active_payload_roots() -> list[tuple[Path, str]]:
+    """Active wire install roots (latest wired_at per platform + current).
 
-    Reading `current` alone is blind on the --from-repo / sync-root path:
-    local (+git.*) installs deliberately never move `current` (see
-    wire/install.update_current_symlink and its pins), so a machine wired
-    from a checkout would report stale=None forever — or judge a zombie
-    `current` left behind by an old release install. Prefer what wire
-    actually RECORDED (the newest wired.json entry whose install root still
-    carries a manifest), then `current`, then the newest manifest-carrying
-    version dir.
+    Reading only the global-newest root greens a partial rewire: codex moves
+    to a fresh tree while claude-code still points at an older root, and the
+    newest root alone matches HEAD. Mirror check_deployments / check_versions:
+    every platform's latest record stays active.
     """
     base = Path("~/.minni/plugin").expanduser()
+    actives: list[tuple[Path, str]] = []
+    seen: set[Path] = set()
     try:
         data = json.loads((base / "wired.json").read_text(encoding="utf-8"))
-        entries = sorted(
-            (
-                (str(w.get("wired_at") or ""), str(w.get("install_root") or ""))
-                for w in data.get("wires", [])
-                if isinstance(w, dict) and w.get("install_root")
-            ),
-            reverse=True,
-        )
-        for _wired_at, root_str in entries:
-            root = Path(root_str)
-            if (root / "payload-manifest.json").is_file():
-                return root, "wired.json"
+        latest_by_platform: dict[str, tuple[str, Path]] = {}
+        for entry in data.get("wires", []) or []:
+            if not isinstance(entry, dict):
+                continue
+            root_str = entry.get("install_root")
+            if not root_str:
+                continue
+            root = Path(str(root_str))
+            if not (root / "payload-manifest.json").is_file():
+                continue
+            platform = str(entry.get("platform") or "_")
+            wired_at = str(entry.get("wired_at") or "")
+            prev = latest_by_platform.get(platform)
+            if prev is None or wired_at >= prev[0]:
+                latest_by_platform[platform] = (wired_at, root.resolve())
+        for platform, (_wired_at, root) in sorted(latest_by_platform.items()):
+            if root not in seen:
+                actives.append((root, f"wired.json:{platform}"))
+                seen.add(root)
     except (OSError, json.JSONDecodeError, TypeError):
         pass
     current = base / "current"
     if (current / "payload-manifest.json").is_file():
-        return current, "current"
+        try:
+            resolved = current.resolve()
+        except OSError:
+            resolved = current
+        if resolved not in seen:
+            actives.append((resolved, "current"))
+            seen.add(resolved)
+    if actives:
+        return actives
     try:
         candidates = [
             d for d in base.iterdir()
@@ -130,41 +143,57 @@ def _active_payload_root() -> tuple[Optional[Path], str]:
         candidates = []
     if candidates:
         newest = max(candidates, key=lambda d: d.stat().st_mtime)
-        return newest, "version-dir scan"
-    return None, "none"
+        return [(newest, "version-dir scan")]
+    return []
 
 
 def _plugin_dist_status(checkout_head: Optional[str]) -> dict:
-    """Staleness of the wire-managed plugin payload, by its manifest git_sha."""
-    root, how = _active_payload_root()
-    if root is None:
+    """Staleness of active wire-managed plugin payloads, by manifest git_sha.
+
+    ``stale: true`` if *any* active root lags checkout HEAD.
+    """
+    roots = _active_payload_roots()
+    if not roots:
         return {"stale": None, "reason": "no wire-managed plugin payload found"}
-    manifest_path = root / "payload-manifest.json"
-    try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        return {
-            "stale": None,
-            "resolved_via": how,
-            "reason": f"payload-manifest unreadable: {type(exc).__name__}",
-        }
-    dist_sha = str(manifest.get("git_sha") or "unknown")
+    lagging: list[str] = []
+    first_sha = "unknown"
+    first_ver = "unknown"
+    hows: list[str] = []
+    for root, how in roots:
+        hows.append(how)
+        try:
+            manifest = json.loads(
+                (root / "payload-manifest.json").read_text(encoding="utf-8")
+            )
+        except (OSError, json.JSONDecodeError) as exc:
+            return {
+                "stale": None,
+                "resolved_via": ",".join(hows),
+                "reason": f"payload-manifest unreadable: {type(exc).__name__}",
+            }
+        dist_sha = str(manifest.get("git_sha") or "unknown")
+        if first_sha == "unknown":
+            first_sha = dist_sha
+            first_ver = str(manifest.get("version") or "unknown")
+        if checkout_head is not None and dist_sha not in ("unknown", checkout_head):
+            lagging.append(f"{root.name}@{dist_sha[:12]} via {how}")
     out: dict = {
-        "dist_git_sha": dist_sha[:12],
-        "dist_version": str(manifest.get("version") or "unknown"),
-        "resolved_via": how,
+        "dist_git_sha": first_sha[:12],
+        "dist_version": first_ver,
+        "resolved_via": ",".join(hows),
+        "active_roots": len(roots),
     }
-    if checkout_head is None or dist_sha == "unknown":
+    if checkout_head is None or first_sha == "unknown":
         out["stale"] = None
         out["reason"] = "no checkout HEAD or manifest sha to compare against"
-    elif dist_sha == checkout_head:
-        out["stale"] = False
-    else:
+    elif lagging:
         out["stale"] = True
         out["reason"] = (
-            f"deployed plugin dist is from {dist_sha[:12]}, checkout HEAD is "
-            f"{checkout_head[:12]} — re-run `minni wire` / `make sync-root`"
+            f"active wire root(s) lag checkout HEAD {checkout_head[:12]}: "
+            f"{'; '.join(lagging)} — re-run `minni wire all` / `make sync-root`"
         )
+    else:
+        out["stale"] = False
     return out
 
 
