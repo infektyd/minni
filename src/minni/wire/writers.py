@@ -488,41 +488,48 @@ def replace_toml_sections(
 ) -> None:
     text = path.read_text(encoding="utf-8") if path.exists() else ""
     if preserve_surface_env and path.exists() and "mcp_servers.minni.env" in sections:
+        # D10 (#232): an unparseable existing config is a hard error, never a
+        # silent fall-through — swallowing it here rewrote the env section
+        # WITHOUT the surface's preserved values while reporting success.
         try:
             data = tomllib.loads(text)
-            ex_env = data.get("mcp_servers", {}).get("minni", {}).get("env", {}) or {}
-            if ex_env:
-                try:
-                    fresh_env = (
-                        tomllib.loads(sections["mcp_servers.minni.env"])
-                        .get("mcp_servers", {})
-                        .get("minni", {})
-                        .get("env", {})
-                        or {}
-                    )
-                except Exception:
-                    fresh_env = {}
-                expected_agent = fresh_env.get("MINNI_AGENT_ID")
-                if expected_agent:
-                    ex_env = _validate_preserved_identity(ex_env, expected_agent)
-                preserved_lines = []
-                for key in (
-                    "MINNI_AGENT_ID", "MINNI_VAULT_PATH", "MINNI_SOCKET_PATH",
-                    "MINNI_WORKSPACE_ID", "MINNI_AFM_PROVIDER_MODE", "MINNI_AFM_NATIVE_HELPER",
-                ):
-                    if key in ex_env:
-                        val = ex_env[key]
-                    elif key in fresh_env:
-                        val = fresh_env[key]
-                    else:
-                        continue
-                    preserved_lines.append(f'{key} = "{_toml_basic_str(val)}"')
-                if preserved_lines:
-                    sections["mcp_servers.minni.env"] = (
-                        "[mcp_servers.minni.env]\n" + "\n".join(preserved_lines)
-                    )
-        except Exception:
-            pass
+        except tomllib.TOMLDecodeError as exc:
+            raise ValueError(
+                f"cannot parse existing TOML at {path}: {exc}. Refusing to "
+                "rewrite [mcp_servers.minni.env] — the surface's preserved env "
+                "would be silently dropped. Fix or remove the file, then re-run."
+            ) from exc
+        ex_env = data.get("mcp_servers", {}).get("minni", {}).get("env", {}) or {}
+        if ex_env:
+            try:
+                fresh_env = (
+                    tomllib.loads(sections["mcp_servers.minni.env"])
+                    .get("mcp_servers", {})
+                    .get("minni", {})
+                    .get("env", {})
+                    or {}
+                )
+            except Exception:
+                fresh_env = {}
+            expected_agent = fresh_env.get("MINNI_AGENT_ID")
+            if expected_agent:
+                ex_env = _validate_preserved_identity(ex_env, expected_agent)
+            preserved_lines = []
+            for key in (
+                "MINNI_AGENT_ID", "MINNI_VAULT_PATH", "MINNI_SOCKET_PATH",
+                "MINNI_WORKSPACE_ID", "MINNI_AFM_PROVIDER_MODE", "MINNI_AFM_NATIVE_HELPER",
+            ):
+                if key in ex_env:
+                    val = ex_env[key]
+                elif key in fresh_env:
+                    val = fresh_env[key]
+                else:
+                    continue
+                preserved_lines.append(f'{key} = "{_toml_basic_str(val)}"')
+            if preserved_lines:
+                sections["mcp_servers.minni.env"] = (
+                    "[mcp_servers.minni.env]\n" + "\n".join(preserved_lines)
+                )
     for name in sections:
         pattern = re.compile(rf"(?ms)^\[{re.escape(name)}\]\n.*?(?=^\[|\Z)")
         text = pattern.sub("", text)

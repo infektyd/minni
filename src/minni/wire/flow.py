@@ -384,6 +384,39 @@ def run_wire(args) -> int:
                     )
                     continue
 
+                # D11 (#232): the antigravity surface only fully participates
+                # when its agy hook plugin actually registered. Reporting
+                # "wired" with a failed registration buried in extras claimed a
+                # surface that would never fire a hook. An absent agy CLI is
+                # different: the MCP views were genuinely wired, so the result
+                # stays "wired" with the hook gap NAMED in the primary reason
+                # field rather than buried.
+                hook_gap_reason: str | None = None
+                agy_hooks = extras.get("agy_hooks")
+                if isinstance(agy_hooks, dict) and agy_hooks.get("installed") is False:
+                    agy_reason = str(agy_hooks.get("reason", "unknown"))
+                    if "not found on path" in agy_reason.lower():
+                        hook_gap_reason = (
+                            f"wired WITHOUT agy hooks: {agy_reason} — lifecycle "
+                            "hooks will not fire until agy is installed and "
+                            "`minni wire antigravity` is re-run"
+                        )
+                    else:
+                        out.results.append(PlatformResult(
+                            platform, "failed",
+                            config_path=str(config_path) if config_path else None,
+                            server_path=str(install_root / "dist" / "server.js"),
+                            agent=spec.agent,
+                            workspace=str(workspace) if workspace else None,
+                            reason=(
+                                f"agy hook registration failed: {agy_reason} "
+                                "(MCP views/configs were already updated; re-run "
+                                "`minni wire antigravity` once resolved)"
+                            ),
+                            extra=extras,
+                        ))
+                        continue
+
                 server_path = str(install_root / "dist" / "server.js")
                 verify = None
                 if not dry_run:
@@ -498,12 +531,13 @@ def run_wire(args) -> int:
                         )
 
                 out.results.append(PlatformResult(
-                    platform, "wired" if not dry_run else "wired",
+                    platform, "wired",
                     config_path=str(config_path) if config_path else None,
                     server_path=server_path,
                     agent=spec.agent,
                     workspace=str(workspace) if workspace else None,
                     verify=verify,
+                    reason=hook_gap_reason,
                     extra=extras,
                 ))
 

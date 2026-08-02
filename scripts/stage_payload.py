@@ -47,37 +47,26 @@ MANIFEST_STAMP_PATHS = (
     ".gemini-plugin/gemini-extension.json",
 )
 
-# §4.2 step 5 — flat per-directory package-data globs (authoritative list).
-PACKAGE_DATA_GLOBS = [
-    "plugin_payload/*",
-    "plugin_payload/dist/*",
-    "plugin_payload/hooks/*",
-    "plugin_payload/.claude-plugin/*",
-    "plugin_payload/.codex-plugin/*",
-    "plugin_payload/.cursor-plugin/*",
-    "plugin_payload/.gemini-plugin/*",
-    "plugin_payload/.gemini-plugin/skills/sovereign-memory/*",
-    "plugin_payload/.kilocode-plugin/*",
-    "plugin_payload/.kilocode-plugin/commands/*",
-    "plugin_payload/.kilocode-plugin/hooks/*",
-    "plugin_payload/.kilocode-plugin/skills/sovereign-memory/*",
-    "plugin_payload/commands/*",
-    "plugin_payload/skills/minni/*",
-    "plugin_payload/skills/minni-consolidation/*",
-    "plugin_payload/skills/minni-consolidation/scripts/*",
-    "plugin_payload/skills/minni-doctor/*",
-    "plugin_payload/skills/minni-engine/*",
-    "plugin_payload/skills/minni-health-check/*",
-    "plugin_payload/skills/minni-ingestion/*",
-    "plugin_payload/skills/minni-install/*",
-    "plugin_payload/skills/minni-install/references/*",
-    "plugin_payload/skills/minni-install/scripts/*",
-    "plugin_payload/skills/minni-install/templates/distill/*",
-    "plugin_payload/skills/minni-install/templates/layer1/*",
-    "plugin_payload/skills/readme-audit/*",
-    "plugin_payload/skills/readme-audit/references/*",
-    "plugin_payload/skills/readme-audit/scripts/*",
-]
+# §4.2 step 5 — the package-data globs come from pyproject.toml itself (D9,
+# #233): this file used to carry its own hand-maintained copy of the list,
+# making a third manifest copy nothing cross-checked. setuptools reads
+# pyproject, so pyproject is the only source of truth worth checking against.
+def package_data_globs() -> list[str]:
+    text = PYPROJECT.read_text(encoding="utf-8")
+    block = re.search(
+        r"\[tool\.setuptools\.package-data\]\s*\nminni\s*=\s*\[(.*?)\]",
+        text,
+        re.DOTALL,
+    )
+    if not block:
+        raise SystemExit(f"Cannot find [tool.setuptools.package-data] in {PYPROJECT}")
+    globs = [
+        g for g in re.findall(r'"([^"]+)"', block.group(1))
+        if g.startswith("plugin_payload/")
+    ]
+    if not globs:
+        raise SystemExit(f"No plugin_payload/ package-data globs in {PYPROJECT}")
+    return globs
 
 
 def read_pyproject_version() -> str:
@@ -159,25 +148,34 @@ def copy_payload_tree(version: str) -> dict[str, str]:
 
 
 def glob_matches(rel_path: str, pattern: str) -> bool:
-    """Match a payload-relative path against a package-data glob line."""
+    """Match a payload-relative path against a package-data glob line, with
+    the semantics setuptools actually uses.
+
+    setuptools expands package-data patterns with stdlib ``glob``, where a
+    wildcard component never matches a name starting with ``.`` — a dotfile is
+    only included when a pattern component names it (or starts with ``.``).
+    This checker used to model ``*`` as matching dotfiles (D8, #233): a new
+    payload dotfile passed the gate green while silently dropping from the
+    built wheel. Component-wise match, no ``**`` support (none is used).
+    """
     inner = pattern.removeprefix("plugin_payload/")
-    if inner == "*":
-        return "/" not in rel_path
-    if inner.endswith("/*"):
-        dir_prefix = inner[:-2]
-        if not dir_prefix:
-            return "/" not in rel_path
-        if not rel_path.startswith(dir_prefix + "/"):
+    names = rel_path.split("/")
+    pats = inner.split("/")
+    if len(names) != len(pats):
+        return False
+    for name, pat in zip(names, pats):
+        if name.startswith(".") and not pat.startswith("."):
             return False
-        suffix = rel_path[len(dir_prefix) + 1:]
-        return "/" not in suffix
-    return fnmatch.fnmatch(rel_path, inner)
+        if not fnmatch.fnmatchcase(name, pat):
+            return False
+    return True
 
 
 def check_glob_coverage(file_hashes: dict[str, str]) -> None:
+    globs = package_data_globs()
     unmatched: list[str] = []
     for rel in sorted(file_hashes):
-        if not any(glob_matches(rel, g) for g in PACKAGE_DATA_GLOBS):
+        if not any(glob_matches(rel, g) for g in globs):
             unmatched.append(rel)
     if unmatched:
         print("stage-payload: files with no matching package-data glob:", file=sys.stderr)

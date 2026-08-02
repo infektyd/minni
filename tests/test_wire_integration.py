@@ -260,11 +260,16 @@ def test_all_expansion_platform_set(wire_env, monkeypatch, capsys):
     out = json.loads(capsys.readouterr().out)
     attempted = {r["platform"] for r in out["results"]}
     assert set(ALL_EXPANSION_V03) <= attempted
-    assert "gemini" in attempted
-    assert "antigravity" not in attempted
     assert "generic" not in attempted
-    gemini = next(r for r in out["results"] if r["platform"] == "gemini")
-    assert gemini["status"] == "skipped"
+    # D7 (#232): every canonical-fleet member `wire all` does not execute is
+    # present as an explicit skip with a named reason — never silently absent.
+    from minni.wire.platform import ALL_SKIPS
+
+    for plat in ("gemini", "antigravity", "cursor"):
+        assert plat in attempted
+        entry = next(r for r in out["results"] if r["platform"] == plat)
+        assert entry["status"] == "skipped"
+        assert entry["reason"] == ALL_SKIPS[plat]
 
 
 def _patch_node_only(wire_env, monkeypatch):
@@ -458,6 +463,53 @@ def test_wire_antigravity_alternate_surface(wire_env, monkeypatch, capsys):
     result = out["results"][0]
     assert result["status"] == "wired"
     assert result["config_path"] == str(alt.resolve())
+
+
+def test_wire_antigravity_hook_registration_failure_is_failed(
+    wire_env, monkeypatch, capsys,
+):
+    """D11 (#232): a REAL agy hook-registration failure (agy present, install
+    failed) must fail the platform, not report 'wired' with the failure buried
+    in extras. (An absent agy CLI stays 'wired' with a named hook-gap reason —
+    covered by the surrounding antigravity tests, whose sandbox has no agy.)"""
+    home, payload_root, manifest = wire_env
+    gemini_cfg = home / ".gemini" / "config"
+    gemini_cfg.mkdir(parents=True)
+    (gemini_cfg / "mcp_config.json").write_text(
+        '{"mcpServers": {}}', encoding="utf-8",
+    )
+    _patch_payload(wire_env, monkeypatch)
+    monkeypatch.setattr(
+        "minni.wire.flow.update_agy_plugin_hooks",
+        lambda install_root: {
+            "installed": False,
+            "reason": "agy plugin install failed: staging rejected",
+        },
+    )
+    rc = run_wire(_args("antigravity", home, no_prune=True))
+    assert rc == 1
+    out = json.loads(capsys.readouterr().out)
+    result = out["results"][0]
+    assert result["status"] == "failed"
+    assert "agy hook registration failed" in result["reason"]
+
+
+def test_wire_antigravity_absent_agy_names_hook_gap(wire_env, monkeypatch, capsys):
+    """D11 (#232): with agy genuinely absent, the result stays 'wired' but the
+    hook gap is NAMED in the primary reason field, not buried in extras."""
+    home, payload_root, manifest = wire_env
+    gemini_cfg = home / ".gemini" / "config"
+    gemini_cfg.mkdir(parents=True)
+    (gemini_cfg / "mcp_config.json").write_text(
+        '{"mcpServers": {}}', encoding="utf-8",
+    )
+    _patch_payload(wire_env, monkeypatch)
+    rc = run_wire(_args("antigravity", home, no_prune=True))
+    assert rc == 0
+    out = json.loads(capsys.readouterr().out)
+    result = out["results"][0]
+    assert result["status"] == "wired"
+    assert result["reason"] and "WITHOUT agy hooks" in result["reason"]
 
 
 def test_wire_generic_missing_install_root(wire_env, monkeypatch, capsys):

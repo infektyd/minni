@@ -84,8 +84,81 @@ COMPARED_SUBTREES = (
 #                and vault), so it is a template output, not a copy.
 #   node_modules/frontend/src/tests/scripts  build inputs, not runtime surface.
 NOT_COMPARED = {
-    ".mcp.json": "host-materialized (absolute paths + per-agent env), not a copy",
+    ".mcp.json": "host-materialized (absolute paths + per-agent env), not a copy"
+                 " — but its agent stamp and recorded paths ARE validated",
 }
+
+# D14 (#234): which MINNI_AGENT_ID stamps are legitimate for each deployment
+# root. The live finding was a shared agents-tree deployment stamped
+# `agent=cursor`: anything keying off that stamp attributes activity to the
+# wrong agent, and nothing reported it. None = skip the agent check (the wire
+# tree at ~/.minni/plugin is shared: whichever platform wired last stamped it).
+EXPECTED_AGENT_STAMPS: list[tuple[str, frozenset[str] | None]] = [
+    (".minni/plugin/", None),
+    (".claude/plugins/cache/", frozenset({"claude-code"})),
+    (".codex/plugins/cache/", frozenset({"codex"})),
+    (".config/kilo/", frozenset({"kilocode"})),
+    (".agents/plugins/", frozenset({"gemini", "grok-build"})),
+    (".cursor/", frozenset({"cursor"})),
+]
+
+# .mcp.json env keys whose values are filesystem paths a runtime will execute
+# or load; a recorded path that does not exist is a dead deployment pointer.
+# (MINNI_VAULT_PATH is deliberately absent: vaults are created lazily.)
+PATH_ENV_KEYS = ("MINNI_AFM_NATIVE_HELPER",)
+
+
+def _expected_agents(rel_root: str) -> frozenset[str] | None:
+    for prefix, agents in EXPECTED_AGENT_STAMPS:
+        if rel_root.startswith(prefix):
+            return agents
+    return None
+
+
+def check_mcp_config(root: Path, home: Path) -> list[str]:
+    """D14 (#234): validate a deployment's .mcp.json stamp and recorded paths.
+
+    Returns problem strings. An unparseable .mcp.json is a problem (never
+    assumed fine); a missing one is not (not every root materializes it).
+    """
+    mcp = root / ".mcp.json"
+    if not mcp.is_file():
+        return []
+    try:
+        data = json.loads(mcp.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return [f".mcp.json unreadable/unparseable: {type(exc).__name__}: {exc}"]
+    entry = (data.get("mcpServers") or {}).get("minni")
+    if not isinstance(entry, dict):
+        return []
+    problems: list[str] = []
+
+    try:
+        rel_root = str(root.relative_to(home))
+    except ValueError:
+        rel_root = str(root)
+    expected = _expected_agents(rel_root + "/")
+    env = entry.get("env") or {}
+    agent = env.get("MINNI_AGENT_ID")
+    if expected is not None and agent and agent not in expected:
+        problems.append(
+            f".mcp.json agent stamp {agent!r} is wrong for this root "
+            f"(expected one of {sorted(expected)})"
+        )
+
+    dead: list[str] = []
+    for arg in entry.get("args") or []:
+        if isinstance(arg, str) and os.path.isabs(arg) and not Path(arg).exists():
+            dead.append(f"args: {arg}")
+    cwd = entry.get("cwd")
+    if isinstance(cwd, str) and cwd and not Path(cwd).is_dir():
+        dead.append(f"cwd: {cwd}")
+    for key in PATH_ENV_KEYS:
+        val = env.get(key)
+        if isinstance(val, str) and val and not Path(val).exists():
+            dead.append(f"env {key}: {val}")
+    problems.extend(f".mcp.json dead path — {entry_}" for entry_ in dead)
+    return problems
 
 # Editor/interpreter droppings. Excluded because they are not part of the
 # plugin: they are generated on both sides independently and are gitignored.
@@ -261,15 +334,32 @@ def main(argv: list[str] | None = None) -> int:
     rows: list[tuple[str, str, str]] = []
     details: list[tuple[str, list[str]]] = []
     stale = unknown = drifted_count = unreadable_count = 0
+    worktree_linked = badconfig_count = 0
     for dist in discover():
         root = dist.parent
         label = str(root).replace(str(home), "~")
 
-        # dist/ vintage. A symlink at the source dist genuinely cannot drift --
-        # but that is a fact about dist/ only, and no longer skips the rest.
-        if dist.is_symlink() and dist.resolve() == SOURCE_DIST.resolve():
-            rows.append(("LINKED", "dist -> source", label))
-        else:
+        # dist/ vintage. D14 (#234): a dist symlinked at the repo WORKING TREE
+        # is a deployment defect, not a neutral fact — the runtime executes
+        # whatever uncommitted state the working tree holds, so the deployed
+        # surface has no reproducible version and a `git stash` changes live
+        # behavior. (This used to print a reassuring "LINKED".) A symlink to an
+        # installed, manifest-carrying artifact is fine and judged by its
+        # manifest like any copy.
+        is_worktree_link = False
+        if dist.is_symlink():
+            target = dist.resolve()
+            repo = REPO_ROOT.resolve()
+            if target == SOURCE_DIST.resolve() or str(target).startswith(str(repo) + os.sep):
+                rows.append((
+                    "WORKTREE",
+                    "dist -> repo working tree (executes uncommitted state)",
+                    label,
+                ))
+                worktree_linked += 1
+                is_worktree_link = True
+            dist = target
+        if not is_worktree_link:
             m = read_manifest(dist)
             if m is None:
                 rows.append(("UNKNOWN", "dist: no manifest", label))
@@ -283,6 +373,12 @@ def main(argv: list[str] | None = None) -> int:
                 else:
                     rows.append(("STALE", f"dist {sha[:8]}{dirty} built {built}", label))
                     stale += 1
+
+        config_problems = check_mcp_config(root, home)
+        if config_problems:
+            badconfig_count += 1
+            rows.append(("BADCONFIG", f"{len(config_problems)} config problem(s)", label))
+            details.append((f"{label} (.mcp.json)", config_problems))
 
         drift, bad = compare_content(root, source)
         if bad:
@@ -315,13 +411,21 @@ def main(argv: list[str] | None = None) -> int:
     else:
         print(
             f"{roots} deployment(s): {stale} stale dist, {drifted_count} with content drift, "
-            f"{unknown} unknown vintage, {unreadable_count} partly unreadable."
+            f"{unknown} unknown vintage, {unreadable_count} partly unreadable, "
+            f"{worktree_linked} dist symlinked at the working tree, "
+            f"{badconfig_count} with .mcp.json problems."
         )
-    failed = stale or unknown or drifted_count or unreadable_count or source_bad
+    failed = (
+        stale or unknown or drifted_count or unreadable_count or source_bad
+        or worktree_linked or badconfig_count
+    )
     if failed:
         print("\nRefresh with: make stage-payload  (payload)  /  npm run build  (source dist)")
         print("Content drift is a propagation problem, not a build one: re-run the installer")
         print("(minni wire / propagate.py) so hooks, skills, commands and manifests are recopied.")
+        if worktree_linked:
+            print("A WORKTREE dist executes uncommitted state and has no reproducible version:")
+            print("replace the symlink with a built artifact (minni wire / propagate.py).")
     return 1 if args.strict and failed else 0
 
 

@@ -67,14 +67,50 @@ def _copytree(src: Path, dst: Path) -> None:
     shutil.copytree(src, dst)
 
 
-def test_faithful_copy_behind_a_symlinked_dist_is_clean(tmp_path):
+def _artifact_dist(root: Path, *, git_sha: str = "unknown") -> None:
+    """Replace a deployment's dist with a real built-artifact-shaped copy.
+
+    The isolated repo root is not a git repository, so source HEAD reads
+    "unknown"; a manifest stamped the same way reports OK vintage, which is
+    what these fixtures need as a clean baseline.
+    """
+    if (root / "dist").is_symlink() or (root / "dist").exists():
+        import shutil
+
+        if (root / "dist").is_symlink():
+            (root / "dist").unlink()
+        else:
+            shutil.rmtree(root / "dist")
+    (root / "dist").mkdir()
+    (root / "dist" / "server.js").write_text("// built\n", encoding="utf-8")
+    (root / "dist" / "build-manifest.json").write_text(
+        json.dumps({"git_sha": git_sha, "built_at": "2026-08-01T00:00:00Z"}),
+        encoding="utf-8",
+    )
+
+
+def test_faithful_copy_with_artifact_dist_is_clean(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    root = _deployment(home, link_dist_to=SOURCE / "dist")
+    _artifact_dist(root)
+    proc = _run("--strict", home=home, repo_root=_isolated_repo_root(tmp_path))
+    assert proc.returncode == 0, proc.stdout
+    assert "DRIFT" not in proc.stdout
+    assert "WORKTREE" not in proc.stdout
+
+
+def test_dist_symlinked_at_working_tree_fails_strict(tmp_path):
+    """D14 (#234): a dist symlinked at the repo working tree executes
+    uncommitted state and has no reproducible version. The old check printed a
+    reassuring LINKED and passed it."""
     home = tmp_path / "home"
     home.mkdir()
     _deployment(home, link_dist_to=SOURCE / "dist")
     proc = _run("--strict", home=home, repo_root=_isolated_repo_root(tmp_path))
-    assert proc.returncode == 0, proc.stdout
-    assert "LINKED" in proc.stdout
-    assert "DRIFT" not in proc.stdout
+    assert proc.returncode == 1, proc.stdout
+    assert "WORKTREE" in proc.stdout
+    assert "LINKED" not in proc.stdout
 
 
 def test_hooks_drift_behind_a_symlinked_dist_is_reported(tmp_path):
@@ -87,9 +123,9 @@ def test_hooks_drift_behind_a_symlinked_dist_is_reported(tmp_path):
 
     proc = _run("--strict", home=home, repo_root=_isolated_repo_root(tmp_path))
     assert proc.returncode == 1, proc.stdout
-    # LINKED is still stated -- it is a true fact about dist/ -- but it no
-    # longer decides the deployment's verdict.
-    assert "LINKED" in proc.stdout
+    # The worktree link is stated AND the content drift is still reported —
+    # neither hides the other.
+    assert "WORKTREE" in proc.stdout
     assert "DRIFT" in proc.stdout
     assert "hooks/hooks.json" in proc.stdout
 
@@ -111,6 +147,7 @@ def test_manifest_version_alone_is_not_content_drift(tmp_path):
     home = tmp_path / "home"
     home.mkdir()
     root = _deployment(home, link_dist_to=SOURCE / "dist")
+    _artifact_dist(root)
     manifest = root / ".claude-plugin" / "plugin.json"
     data = json.loads(manifest.read_text(encoding="utf-8"))
     data["version"] = "0.4.0+git.deadbee"
@@ -191,6 +228,7 @@ def test_editor_droppings_are_not_drift(tmp_path):
     home = tmp_path / "home"
     home.mkdir()
     root = _deployment(home, link_dist_to=SOURCE / "dist")
+    _artifact_dist(root)
     (root / "hooks" / ".DS_Store").write_bytes(b"\x00")
     (root / "skills" / "__pycache__").mkdir(exist_ok=True)
     (root / "skills" / "__pycache__" / "x.cpython-314.pyc").write_bytes(b"\x00")
@@ -243,3 +281,102 @@ def test_deployment_globs_cover_the_known_trees():
     assert all(g.endswith("/dist") for g in globs), (
         "check_versions strips a trailing /dist to reach the plugin root"
     )
+
+
+def _write_mcp(root: Path, *, agent: str, server: Path, helper: Path | None = None):
+    env = {"MINNI_AGENT_ID": agent}
+    if helper is not None:
+        env["MINNI_AFM_NATIVE_HELPER"] = str(helper)
+    (root / ".mcp.json").write_text(
+        json.dumps({
+            "mcpServers": {
+                "minni": {
+                    "command": "node",
+                    "args": [str(server)],
+                    "cwd": str(root),
+                    "env": env,
+                }
+            }
+        }),
+        encoding="utf-8",
+    )
+
+
+def _agents_tree_deployment(home: Path) -> Path:
+    """A deployment in the shared agents tree (the D14 live location)."""
+    root = home / ".agents" / "plugins" / "minni@minni"
+    root.mkdir(parents=True)
+    for sub in ("hooks", "commands", "skills", ".claude-plugin", ".codex-plugin",
+                ".cursor-plugin", ".kilocode-plugin", ".gemini-plugin"):
+        src = SOURCE / sub
+        if src.is_dir():
+            _copytree(src, root / sub)
+    _artifact_dist(root)
+    return root
+
+
+def test_wrong_agent_stamp_is_reported(tmp_path):
+    """D14 (#234): the shared agents-tree deployment stamped `agent=cursor`
+    attributes activity to the wrong agent; nothing used to flag it."""
+    home = tmp_path / "home"
+    home.mkdir()
+    root = _agents_tree_deployment(home)
+    _write_mcp(root, agent="cursor", server=root / "dist" / "server.js")
+
+    proc = _run("--strict", home=home, repo_root=_isolated_repo_root(tmp_path))
+    assert proc.returncode == 1, proc.stdout
+    assert "BADCONFIG" in proc.stdout
+    assert "agent stamp 'cursor'" in proc.stdout
+
+
+def test_correct_agent_stamp_passes(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    root = _agents_tree_deployment(home)
+    _write_mcp(root, agent="gemini", server=root / "dist" / "server.js")
+
+    proc = _run("--strict", home=home, repo_root=_isolated_repo_root(tmp_path))
+    assert proc.returncode == 0, proc.stdout
+    assert "BADCONFIG" not in proc.stdout
+
+
+def test_dead_helper_path_is_reported(tmp_path):
+    """D14 (#234): a helper path recorded in a deployed config that does not
+    exist must be detected here, not found by hand."""
+    home = tmp_path / "home"
+    home.mkdir()
+    root = _agents_tree_deployment(home)
+    _write_mcp(
+        root,
+        agent="gemini",
+        server=root / "dist" / "server.js",
+        helper=home / "nonexistent" / "native_afm_helper",
+    )
+
+    proc = _run("--strict", home=home, repo_root=_isolated_repo_root(tmp_path))
+    assert proc.returncode == 1, proc.stdout
+    assert "BADCONFIG" in proc.stdout
+    assert "dead path" in proc.stdout
+    assert "MINNI_AFM_NATIVE_HELPER" in proc.stdout
+
+
+def test_dead_server_path_is_reported(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    root = _agents_tree_deployment(home)
+    _write_mcp(root, agent="gemini", server=root / "dist" / "gone.js")
+
+    proc = _run("--strict", home=home, repo_root=_isolated_repo_root(tmp_path))
+    assert proc.returncode == 1, proc.stdout
+    assert "dead path" in proc.stdout
+
+
+def test_unparseable_mcp_json_is_reported(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    root = _agents_tree_deployment(home)
+    (root / ".mcp.json").write_text("{not json", encoding="utf-8")
+
+    proc = _run("--strict", home=home, repo_root=_isolated_repo_root(tmp_path))
+    assert proc.returncode == 1, proc.stdout
+    assert "BADCONFIG" in proc.stdout

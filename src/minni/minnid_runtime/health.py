@@ -231,6 +231,12 @@ def handle_status(params: dict, request_id: Any, context: HealthContext) -> dict
     started_at = datetime.fromtimestamp(
         context.start_time(), tz=timezone.utc
     ).isoformat()
+    # Deploy honesty (GA1-3/GA5-1): report when the RUNNING code is stale
+    # relative to the checkout it was installed from. Local comparison only;
+    # deploy_status() never raises.
+    from minni.minnid_runtime.deploy_honesty import deploy_status
+
+    deploy = deploy_status()
     return context.make_response({
         "daemon": {
             "version": context.version,
@@ -244,6 +250,7 @@ def handle_status(params: dict, request_id: Any, context: HealthContext) -> dict
             "counters": metrics,
             "counter_deltas": deltas,
             "health_flags": flags,
+            "deploy": deploy,
         },
         "engine": {
             "db_ok": db_ok,

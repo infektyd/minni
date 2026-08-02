@@ -493,60 +493,67 @@ def replace_toml_sections(path: Path, sections: dict[str, str], *, preserve_surf
     """
     text = path.read_text(encoding="utf-8") if path.exists() else ""
     if preserve_surface_env and path.exists() and "mcp_servers.minni.env" in sections:
+        # D10 (#232): an unparseable existing config is a hard error, never a
+        # silent fall-through — swallowing it here rewrote the env section
+        # WITHOUT the surface's preserved values while reporting success.
         try:
             data = tomllib.loads(text)
-            ex_env = data.get("mcp_servers", {}).get("minni", {}).get("env", {}) or {}
-            if ex_env:
-                # Parse the freshly-computed env section so we can MERGE in AFM
-                # defaults this run detected but the existing surface lacks.
-                # Without this, a surface that already has the identity keys but
-                # predates native-AFM wiring would silently drop the newly
-                # computed MINNI_AFM_* defaults (existing surface value still
-                # wins when present, so per-agent wiring is never clobbered).
-                try:
-                    fresh_env = (
-                        tomllib.loads(sections["mcp_servers.minni.env"])
-                        .get("mcp_servers", {})
-                        .get("minni", {})
-                        .get("env", {})
-                        or {}
-                    )
-                except Exception:
-                    fresh_env = {}
-                # X2: never carry preserved identity keys forward unvalidated — a
-                # stale/attacker-planted MINNI_VAULT_PATH/SOCKET_PATH/AGENT_ID in
-                # the target config must not be re-stamped. Validate against the
-                # freshly-computed agent id (which the fresh section always carries).
-                expected_agent = fresh_env.get("MINNI_AGENT_ID")
-                if expected_agent:
-                    ex_env = _validate_preserved_identity(ex_env, expected_agent)
-                resolved_env: dict = {}
-                for k in (
-                    "MINNI_AGENT_ID",
-                    "MINNI_VAULT_PATH",
-                    "MINNI_SOCKET_PATH",
-                    "MINNI_WORKSPACE_ID",
-                    "MINNI_AFM_PROVIDER_MODE",
-                    "MINNI_AFM_NATIVE_HELPER",
-                ):
-                    if k in ex_env:
-                        resolved_env[k] = ex_env[k]
-                    elif k in fresh_env:
-                        resolved_env[k] = fresh_env[k]
-                # Codex hook mirror survives flagless upgrades: the fresh
-                # section carries MINNI_CODEX_* only for the codex surface, so
-                # its presence is the surface signal. Re-derive from the
-                # RESOLVED generic identity (never carried raw from ex_env —
-                # X2) so hooks track whatever vault survived preservation.
-                if any(k.startswith("MINNI_CODEX_") for k in fresh_env):
-                    _mirror_codex_hook_env(resolved_env, "codex")
-                preserved_lines = [
-                    f'{k} = "{_toml_basic_str(v)}"' for k, v in resolved_env.items()
-                ]
-                if preserved_lines:
-                    sections["mcp_servers.minni.env"] = "[mcp_servers.minni.env]\n" + "\n".join(preserved_lines)
-        except Exception:
-            pass
+        except tomllib.TOMLDecodeError as exc:
+            raise ValueError(
+                f"cannot parse existing TOML at {path}: {exc}. Refusing to "
+                "rewrite [mcp_servers.minni.env] — the surface's preserved env "
+                "would be silently dropped. Fix or remove the file, then re-run."
+            ) from exc
+        ex_env = data.get("mcp_servers", {}).get("minni", {}).get("env", {}) or {}
+        if ex_env:
+            # Parse the freshly-computed env section so we can MERGE in AFM
+            # defaults this run detected but the existing surface lacks.
+            # Without this, a surface that already has the identity keys but
+            # predates native-AFM wiring would silently drop the newly
+            # computed MINNI_AFM_* defaults (existing surface value still
+            # wins when present, so per-agent wiring is never clobbered).
+            try:
+                fresh_env = (
+                    tomllib.loads(sections["mcp_servers.minni.env"])
+                    .get("mcp_servers", {})
+                    .get("minni", {})
+                    .get("env", {})
+                    or {}
+                )
+            except Exception:
+                fresh_env = {}
+            # X2: never carry preserved identity keys forward unvalidated — a
+            # stale/attacker-planted MINNI_VAULT_PATH/SOCKET_PATH/AGENT_ID in
+            # the target config must not be re-stamped. Validate against the
+            # freshly-computed agent id (which the fresh section always carries).
+            expected_agent = fresh_env.get("MINNI_AGENT_ID")
+            if expected_agent:
+                ex_env = _validate_preserved_identity(ex_env, expected_agent)
+            resolved_env: dict = {}
+            for k in (
+                "MINNI_AGENT_ID",
+                "MINNI_VAULT_PATH",
+                "MINNI_SOCKET_PATH",
+                "MINNI_WORKSPACE_ID",
+                "MINNI_AFM_PROVIDER_MODE",
+                "MINNI_AFM_NATIVE_HELPER",
+            ):
+                if k in ex_env:
+                    resolved_env[k] = ex_env[k]
+                elif k in fresh_env:
+                    resolved_env[k] = fresh_env[k]
+            # Codex hook mirror survives flagless upgrades: the fresh
+            # section carries MINNI_CODEX_* only for the codex surface, so
+            # its presence is the surface signal. Re-derive from the
+            # RESOLVED generic identity (never carried raw from ex_env —
+            # X2) so hooks track whatever vault survived preservation.
+            if any(k.startswith("MINNI_CODEX_") for k in fresh_env):
+                _mirror_codex_hook_env(resolved_env, "codex")
+            preserved_lines = [
+                f'{k} = "{_toml_basic_str(v)}"' for k, v in resolved_env.items()
+            ]
+            if preserved_lines:
+                sections["mcp_servers.minni.env"] = "[mcp_servers.minni.env]\n" + "\n".join(preserved_lines)
     for name in sections:
         pattern = re.compile(rf"(?ms)^\[{re.escape(name)}\]\n.*?(?=^\[|\Z)")
         text = pattern.sub("", text)
@@ -1417,32 +1424,98 @@ def update_one_plugin(platform: str, args: argparse.Namespace) -> dict[str, obje
     return base
 
 
-# claude-code is deliberately absent: its plugin surface is wire-managed (see
-# platform_spec). Keeping it here would abort every `all` run on a platform
-# propagate no longer owns; dropping it silently would be worse, hence the notice.
-# Note this list and wire's own ALL_EXPANSION_V03 still disagree in both
-# directions -- reconciling them is tracked separately.
-ALL_PLATFORMS = ("codex", "kilocode", "gemini", "grok", "cursor")
+# D7 (#232): ONE canonical fleet, shared with `minni wire` (which imports its
+# copy from src/minni/wire/platform.py CANONICAL_FLEET); the two are pinned
+# equal by tests/test_all_fleet_parity.py so they can never silently disagree
+# about what "all" means again. Each command expands `all` to the fleet members
+# it owns; every other member is named explicitly in the output with the reason
+# it is excluded — no platform is ever silently absent.
+CANONICAL_FLEET = (
+    "codex", "claude-code", "kilocode", "gemini", "antigravity", "grok", "cursor",
+)
+ALL_PLATFORMS = ("codex", "kilocode", "antigravity", "grok", "cursor")
+ALL_SKIPS = {
+    "claude-code": "wire-managed: run `minni wire claude-code`",
+    "gemini": (
+        "covered by `antigravity` (same install root; antigravity also writes "
+        "the gemini-extension manifest)"
+    ),
+}
+
+
+def _subresult_problems(result: dict) -> tuple[list[str], list[str]]:
+    """D6 (#232): collect honesty (problems, notes) from a platform's sub-steps.
+
+    A platform whose copy/config landed but whose hook/rules sub-step reported
+    installed=False must not be summarized as a clean update. A missing host
+    CLI (e.g. agy not on PATH) is an environment absence, not a failure: the
+    config work was real, so it is a named NOTE rather than a problem.
+    """
+    problems: list[str] = []
+    notes: list[str] = []
+    for key in ("agy_hooks", "grok_hooks", "grok_rules", "cursor_hooks"):
+        sub = result.get(key)
+        if isinstance(sub, dict) and sub.get("installed") is False:
+            reason = str(sub.get("reason", "not installed"))
+            if "not found on path" in reason.lower():
+                notes.append(f"{key}: {reason}")
+            else:
+                problems.append(f"{key}: {reason}")
+    anti = result.get("antigravity")
+    if isinstance(anti, dict) and not anti.get("views_written"):
+        notes.append("antigravity: no surface views present to write")
+    return problems, notes
 
 
 def update_plugin(args: argparse.Namespace) -> int:
-    if args.platform == "all":
-        print(
-            "[propagate] claude-code is excluded from `all`: it is wired by "
-            "`minni wire claude-code`.",
-            file=sys.stderr,
-        )
     platforms = list(ALL_PLATFORMS) if args.platform == "all" else [args.platform]
+    results: list[dict[str, object]] = []
+    if args.platform == "all":
+        for plat, reason in ALL_SKIPS.items():
+            print(
+                f"[propagate] {plat} is excluded from `all`: {reason}",
+                file=sys.stderr,
+            )
+            results.append({"platform": plat, "status": "skipped", "reason": reason})
     restore_no_build = args.no_build
     if len(platforms) > 1 and not args.no_build:
         run(["npm", "run", "build"], cwd=plugin_source(Path(args.repo).expanduser()))
         args.no_build = True
     try:
-        results = [update_one_plugin(platform, args) for platform in platforms]
+        # D6 (#232): per-platform isolation — one platform raising must not
+        # abort the rest of the fleet silently, and each status is DERIVED
+        # from what actually happened, never a hardcoded literal.
+        for platform in platforms:
+            try:
+                result = update_one_plugin(platform, args)
+            except (Exception, SystemExit) as exc:
+                results.append({
+                    "platform": canonical_platform(platform),
+                    "status": "failed",
+                    "error": str(exc),
+                })
+                continue
+            problems, notes = _subresult_problems(result)
+            result["status"] = "degraded" if problems else "updated"
+            if problems:
+                result["problems"] = problems
+            if notes:
+                result["notes"] = notes
+            results.append(result)
     finally:
         args.no_build = restore_no_build
-    print(json.dumps({"status": "updated", "results": results}, indent=2))
-    return 0
+
+    attempted = {str(r["status"]) for r in results if r["status"] != "skipped"}
+    if not attempted or attempted == {"updated"}:
+        overall = "updated"
+    elif "failed" not in attempted:
+        overall = "degraded"
+    elif attempted == {"failed"}:
+        overall = "failed"
+    else:
+        overall = "partial"
+    print(json.dumps({"status": overall, "results": results}, indent=2))
+    return 0 if overall == "updated" else 1
 
 
 DISTILL_TEMPLATE_DIR = Path(__file__).resolve().parent.parent / "templates" / "distill"

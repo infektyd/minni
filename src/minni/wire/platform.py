@@ -30,6 +30,16 @@ VALID_PLATFORMS = frozenset({
     "grok", "generic", "all",
 })
 
+# D7 (#232): ONE canonical fleet, shared with propagate.py (which carries its
+# own copy — it ships standalone inside the plugin payload and cannot import
+# this package); tests/test_all_fleet_parity.py pins the two copies equal so
+# the commands can never silently disagree about what "all" means. Each
+# command expands `all` to the members it owns and names every excluded
+# member explicitly in its output.
+CANONICAL_FLEET = (
+    "codex", "claude-code", "kilocode", "gemini", "antigravity", "grok", "cursor",
+)
+
 ALL_EXPANSION_V03 = ("codex", "claude-code", "kilocode", "grok")
 GEMINI_SKIP_WARNING = (
     "gemini wiring is provisional; run `minni wire gemini` explicitly to attempt it"
@@ -37,6 +47,19 @@ GEMINI_SKIP_WARNING = (
 GEMINI_PROVISIONAL_REASON = (
     "gemini extension-manifest wiring is not yet implemented (open question 8)"
 )
+# Every CANONICAL_FLEET member absent from ALL_EXPANSION_V03 must appear here
+# with the reason, so `wire all` accounts for the whole fleet in its output.
+ALL_SKIPS = {
+    "gemini": GEMINI_SKIP_WARNING,
+    "antigravity": (
+        "run `minni wire antigravity` explicitly, or `propagate.py update-plugin "
+        "--platform all` (shared ~/.gemini tree; excluded from `wire all` so the "
+        "two installers do not fight over the same surface in bulk runs)"
+    ),
+    "cursor": (
+        "propagate-managed: run `propagate.py update-plugin --platform cursor`"
+    ),
+}
 
 def config_root_candidates() -> dict[str, tuple[Path, ...]]:
     """Ordered config-root candidates for preflight probes (§6.4).
@@ -83,7 +106,7 @@ def expand_platforms(platform: str) -> tuple[list[str], list[tuple[str, str]]]:
     """Return (platforms_to_wire, warnings) for the given platform arg."""
     platform = canonical_platform(platform)
     if platform == "all":
-        return list(ALL_EXPANSION_V03), [("gemini", GEMINI_SKIP_WARNING)]
+        return list(ALL_EXPANSION_V03), list(ALL_SKIPS.items())
     if platform not in VALID_PLATFORMS:
         raise ValueError(
             f"unknown platform {platform!r}; use codex, claude-code, kilocode, "
