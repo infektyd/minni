@@ -21,6 +21,8 @@
 
     <key>ProgramArguments</key>
     <array>
+        <!-- Invoke via bash so a missing +x bit cannot break unattended sync. -->
+        <string>/bin/bash</string>
         <string>__REPO__/scripts/update_root.sh</string>
         <string>--repo</string>
         <string>__REPO__</string>

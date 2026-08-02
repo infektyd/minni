@@ -195,6 +195,28 @@ def test_wire_version_mismatch(wire_env, monkeypatch, capsys):
     assert rc == 2
 
 
+def test_wire_all_payload_wireerror_status_is_failed_not_skipped(wire_env, monkeypatch, capsys):
+    """Round-4 Low: WireError after ALL_SKIPS pre-append must not finalize as
+    status=skipped (D5) — automation keying on status==failed would miss it."""
+    home, payload_root, manifest = wire_env
+    from minni.wire.flow import WireError
+
+    @contextmanager
+    def boom_tree(*, from_repo=None, use_version=None):
+        raise WireError("from-repo install exploded", exit_code=1)
+        yield payload_root, manifest, False  # pragma: no cover
+
+    monkeypatch.setattr("minni.wire.flow.payload_tree", boom_tree)
+    monkeypatch.setattr(
+        "minni.wire.preflight.check_node", lambda min_version=20: (True, "v22.0.0"),
+    )
+    rc = run_wire(_args("all", home))
+    assert rc == 1
+    doc = json.loads(capsys.readouterr().out)
+    assert doc["status"] == "failed", doc
+    assert any(r.get("status") == "failed" for r in doc.get("results", []))
+
+
 def test_wire_missing_node(tmp_path, monkeypatch, capsys):
     home = tmp_path / "home"
     home.mkdir()

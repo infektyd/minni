@@ -74,10 +74,19 @@ def _fake_launchctl(tmp_path: Path, *, loaded: bool) -> Path:
     return bindir
 
 
-def _run(repo: Path, *args: str, path_prefix: Path | None = None) -> subprocess.CompletedProcess:
+def _run(
+    repo: Path,
+    *args: str,
+    path_prefix: Path | None = None,
+    lockdir: Path | None = None,
+) -> subprocess.CompletedProcess:
     env = dict(_ENV)
     if path_prefix is not None:
         env["PATH"] = f"{path_prefix}{os.pathsep}{env.get('PATH', '')}"
+    # Isolate the sync lock from the host machine and parallel tests.
+    if lockdir is None:
+        lockdir = repo.parent / f"sync-lock-{repo.name}"
+    env["MINNI_SYNC_LOCKDIR"] = str(lockdir)
     return subprocess.run(
         ["bash", str(SCRIPT), "--repo", str(repo), *args],
         capture_output=True, text=True, env=env,
@@ -161,6 +170,17 @@ def test_dry_run_exits_nonzero_when_daemon_would_not_restart(cloned, tmp_path):
     combined = proc.stdout + proc.stderr
     assert "would fail" in combined
     assert "sync complete" not in combined
+
+
+def test_refuses_when_another_sync_holds_the_lock(cloned, tmp_path):
+    """Round-4 Low: concurrent sync-root must not interleave writers."""
+    _origin, clone = cloned
+    lockdir = tmp_path / "held-lock"
+    lockdir.mkdir()
+    proc = _run(clone, "--dry-run", lockdir=lockdir,
+                path_prefix=_fake_launchctl(tmp_path, loaded=True))
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "already running" in (proc.stdout + proc.stderr)
 
 
 def test_refuses_non_git_directory(tmp_path):

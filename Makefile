@@ -232,4 +232,4 @@ check-versions:
 # version/deployment checkers. `make sync-root DRY_RUN=1` prints the plan.
 .PHONY: sync-root
 sync-root:
-	scripts/update_root.sh $(if $(filter 1 yes true,$(DRY_RUN)),--dry-run,)
+	bash scripts/update_root.sh $(if $(filter 1 yes true,$(DRY_RUN)),--dry-run,)

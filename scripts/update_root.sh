@@ -57,6 +57,16 @@ refuse() { printf 'update-root: REFUSING: %s\n' "$*" >&2; exit 1; }
 # linked worktree. `-d` alone refuses every worktree checkout.
 [ -e .git ] || refuse "$REPO is not a git checkout"
 
+# Mutual exclusion: concurrent syncs interleave pip/npm/wire/kickstart.
+# mkdir is atomic and portable (macOS has no util-linux flock by default).
+LOCKDIR="${MINNI_SYNC_LOCKDIR:-$HOME/.minni/run/sync-root.lockdir}"
+mkdir -p "$(dirname "$LOCKDIR")"
+if ! mkdir "$LOCKDIR" 2>/dev/null; then
+  refuse "another sync-root is already running (lock $LOCKDIR)"
+fi
+# shellcheck disable=SC2064
+trap 'rmdir "$LOCKDIR" 2>/dev/null || true' EXIT INT TERM
+
 VENV_PY="$REPO/.venv/bin/python"
 [ -x "$VENV_PY" ] || VENV_PY="python3"
 
@@ -116,8 +126,17 @@ SOCKET="${MINNI_SOCKET:-$HOME/.minni/run/minnid.sock}"
 DAEMON_RESTARTED=0
 DAEMON_MISSING=0
 if launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; then
-  act launchctl kickstart -k "gui/$(id -u)/$LABEL"
-  DAEMON_RESTARTED=1
+  # kickstart must not abort under set -e before step 6 — a failed bounce
+  # still needs version/deployment verify (same as the missing-agent path).
+  if [ "$DRY_RUN" = 1 ]; then
+    echo "would run: launchctl kickstart -k gui/$(id -u)/$LABEL"
+    DAEMON_RESTARTED=1
+  elif launchctl kickstart -k "gui/$(id -u)/$LABEL"; then
+    DAEMON_RESTARTED=1
+  else
+    echo "update-root: launchctl kickstart failed — continuing to verify (will not report sync complete)" >&2
+    DAEMON_MISSING=1
+  fi
 else
   # Still run step 6 (versions + D14 deployment gates) so the operator sees
   # WORKTREE/BADCONFIG from this run. Do NOT claim "sync complete" later —
@@ -170,13 +189,22 @@ for _ in range(15):
         result = msg.get("result") or {}
         deploy = (result.get("daemon") or {}).get("deploy") or result.get("deploy") or {}
         stale = deploy.get("stale")
-        if stale is True:
+        plugin = deploy.get("plugin_dist") if isinstance(deploy.get("plugin_dist"), dict) else {}
+        plugin_stale = plugin.get("stale")
+        if stale is True or plugin_stale is True:
             print(
-                f"update-root: daemon deploy.stale is True after restart: {deploy!r}",
+                f"update-root: daemon deploy honesty still stale after restart: {deploy!r}",
                 file=sys.stderr,
             )
             sys.exit(2)
-        print(f"daemon deploy probe ok (stale={stale!r})")
+        # After a restart we forced, unmeasurable honesty is not "ok".
+        if stale is None:
+            print(
+                f"update-root: daemon deploy.stale is unmeasurable after restart: {deploy!r}",
+                file=sys.stderr,
+            )
+            sys.exit(3)
+        print(f"daemon deploy probe ok (stale={stale!r}, plugin_dist.stale={plugin_stale!r})")
         sys.exit(0)
     except Exception as exc:
         last = exc

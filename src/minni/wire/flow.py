@@ -571,10 +571,12 @@ def run_wire(args) -> int:
 
     except WireError as exc:
         print(str(exc), file=sys.stderr)
-        out.status = "failed"
-        if not out.results:
-            out.results.append(PlatformResult("?", "failed", reason=str(exc)))
+        # Always record a failed result. Pre-appended ALL_SKIPS rows alone would
+        # make finalize_status recompute status="skipped" (D5) and hide a hard
+        # payload/install failure from automation that keys on status=="failed".
+        out.results.append(PlatformResult("?", "failed", reason=str(exc)))
         out.finalize_status(dry_run=dry_run)
+        out.status = "failed"
         out.emit()
         return getattr(exc, "exit_code", 1)
 
