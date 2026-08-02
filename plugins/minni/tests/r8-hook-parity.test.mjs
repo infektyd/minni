@@ -215,46 +215,43 @@ test("P5: an eviction is reported, not silent — and coalesced, not budget-burn
     /reportBridgeFailure\(/,
     "evictions must not spawn a diagnostic per evicted key",
   );
-  const coalesce = source.indexOf("function reportSessionEvictions(");
-  assert.ok(coalesce !== -1, "the coalescing reporter is missing");
-  const cWindow = source.slice(coalesce, coalesce + 3200);
-  assert.match(cWindow, /EVICTION_DIAGNOSTIC_INTERVAL_MS/);
-  assert.match(cWindow, /reportBridgeFailure/, "coalesced evictions still reach the audit channel");
-  // Round 4: the coalesce state must not pretend a SUPPRESSED diagnostic was
-  // delivered. Clearing the counts is gated on the spawn actually happening,
-  // so a full in-flight cap (the failure storm this shares a budget with)
-  // carries the loss to the next free slot instead of zeroing it.
+  // Round 10: flush lives in flushPendingSessionEvictions; reportSessionEvictions
+  // accumulates + rate-limits, then delegates.
+  const flush = source.indexOf("function flushPendingSessionEvictions(");
+  assert.ok(flush !== -1, "the session-evict flusher is missing");
+  const fWindow = source.slice(flush, flush + 2800);
+  assert.match(fWindow, /reportBridgeFailure/, "coalesced evictions still reach the audit channel");
   assert.match(
-    cWindow,
+    fWindow,
     /const accepted = reportBridgeFailure/,
     "the reporter must observe whether the diagnostic was accepted",
   );
   assert.match(
-    cWindow,
+    fWindow,
     /if \(accepted\) \{/,
     "counts may only be cleared when the diagnostic actually spawned",
   );
+  assert.match(
+    fWindow,
+    /cur\.count \+= info\.count/,
+    "an undelivered audit must restore the flushed eviction counts",
+  );
+  assert.match(
+    fWindow,
+    /lastEvictionReportAt = 0/,
+    "an undelivered audit must also reopen the coalesce window",
+  );
+  const coalesce = source.indexOf("function reportSessionEvictions(");
+  assert.ok(coalesce !== -1, "the coalescing reporter is missing");
+  const cWindow = source.slice(coalesce, coalesce + 1200);
+  assert.match(cWindow, /EVICTION_DIAGNOSTIC_INTERVAL_MS/);
+  assert.match(cWindow, /flushPendingSessionEvictions/);
   // Round 4: per-label counts — a mixed pending+booted wave must not report
   // the whole count under the last wave's label and bound.
   assert.match(
     cWindow,
     /evictionsSinceReport\.get\(label\)/,
     "eviction counts must be tracked per label, not as one scalar",
-  );
-  // Round 5: if the audit child dies before writing, the flushed counts are
-  // restored so the loss reaches the next slot instead of vanishing.
-  assert.match(
-    cWindow,
-    /cur\.count \+= info\.count/,
-    "an undelivered audit must restore the flushed eviction counts",
-  );
-  // Round 7: restoring counts is not enough — the coalesce clock advanced on
-  // spawn, so a one-shot failed wave sat console-only until a FUTURE eviction
-  // reopened the window. The clock must rewind with the counts.
-  assert.match(
-    cWindow,
-    /lastEvictionReportAt = 0/,
-    "an undelivered audit must also reopen the coalesce window",
   );
 });
 
@@ -608,6 +605,25 @@ test("P6: storm suppress coalesces real failures and flushes on settle", async (
     source.slice(queue, queue + 400),
     /session-evict/,
     "session-evict must not be double-queued into the suppress map",
+  );
+});
+
+test("P6: session-evict carried counts flush when a diagnostic slot frees", async () => {
+  // Round 10: settle used to only flush pendingSuppressedFailures; session-evict
+  // counts sat until more churn. free slot must also call flushPendingSessionEvictions.
+  const source = await readFile(
+    path.join(PLUGIN_ROOT, "kilo", "minni-plugin.js"),
+    "utf8",
+  );
+  assert.match(source, /function flushPendingSessionEvictions/);
+  const settle = source.indexOf("const settle = () =>");
+  assert.ok(settle !== -1);
+  const settleWindow = source.slice(settle, settle + 800);
+  assert.match(settleWindow, /flushPendingSuppressedFailures\(\)/);
+  assert.match(
+    settleWindow,
+    /flushPendingSessionEvictions\(\)/,
+    "settle must deliver carried session-evict counts without waiting for more churn",
   );
 });
 

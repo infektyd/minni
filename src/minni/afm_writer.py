@@ -12,7 +12,7 @@ import threading
 import time
 from contextlib import nullcontext
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import yaml  # RCM-011: for safe_dump of title/tags to prevent newline key injection
 
@@ -102,6 +102,20 @@ _UNRECOVERED_WRITE_FAILURES = 0
 # honest refusal instead of a duplicate enqueue.
 _IN_FLIGHT_PER_PASS: dict[str, threading.Event] = {}
 _IN_FLIGHT_LOCK = threading.Lock()
+# Round 10 (PR #260): when submit_drafts returns write_timeout the waiter is
+# gone, so lifecycle apply is skipped in handle_daemon_compile. The job may
+# still succeed. The worker then runs this handler once with the lifecycle
+# payload attached to the job — apply exactly once without regenerating drafts.
+_DEFERRED_LIFECYCLE_HANDLER: Optional[Callable[[dict], None]] = None
+
+
+def set_deferred_lifecycle_handler(
+    handler: Optional[Callable[[dict], None]],
+) -> None:
+    """Install (or clear) the worker-side lifecycle applier for timed-out waits."""
+    global _DEFERRED_LIFECYCLE_HANDLER
+    _DEFERRED_LIFECYCLE_HANDLER = handler
+
 
 # A pass is stale once it has been silent for this multiple of its configured
 # interval. 2x, not 1x: a tick that lands a few seconds late is not a fault, and
@@ -178,9 +192,11 @@ def reset_pass_counters() -> None:
     _WRITE_TIMEOUTS = 0
     _LAST_WRITE_TIMEOUT_AT = None
     global _WRITE_FAILURES, _LAST_WRITE_FAILURE_AT, _UNRECOVERED_WRITE_FAILURES
+    global _DEFERRED_LIFECYCLE_HANDLER
     _WRITE_FAILURES = 0
     _LAST_WRITE_FAILURE_AT = None
     _UNRECOVERED_WRITE_FAILURES = 0
+    _DEFERRED_LIFECYCLE_HANDLER = None
     with _IN_FLIGHT_LOCK:
         _IN_FLIGHT_PER_PASS.clear()
 
@@ -770,11 +786,46 @@ def _write_batch(job: dict) -> dict:
     return result
 
 
+def _maybe_apply_deferred_lifecycle(job: dict) -> None:
+    """If the waiter timed out and left lifecycle to us, apply it once."""
+    if not job.get("defer_lifecycle_to_worker"):
+        return
+    if job.get("lifecycle_applied"):
+        return
+    lifecycle = job.get("lifecycle") or {}
+    if not (
+        lifecycle.get("promote_candidate_ids")
+        or lifecycle.get("dedup_candidate_ids")
+        or lifecycle.get("review_candidate_ids")
+    ):
+        return
+    handler = _DEFERRED_LIFECYCLE_HANDLER
+    if handler is None:
+        logger.warning(
+            "AFM writer: deferred lifecycle for pass %r has no handler; "
+            "candidates stay proposed until a later pass",
+            job.get("pass_name"),
+        )
+        return
+    try:
+        handler(lifecycle)
+        job["lifecycle_applied"] = True
+    except Exception:
+        logger.exception(
+            "AFM writer: deferred lifecycle apply failed for pass %r",
+            job.get("pass_name"),
+        )
+
+
 def _process_job(job: dict, done: threading.Event, out: dict) -> None:
     """One queued batch, start to Event. Extracted from the worker loop so the
     failure accounting is testable without driving the daemon thread."""
     try:
         out["result"] = _write_batch(job)
+        # Round 10: waiter may have returned write_timeout and skipped
+        # lifecycle; if drafts landed, finish that batch's decision set here
+        # so the next pass does not mint duplicate drafts.
+        _maybe_apply_deferred_lifecycle(job)
     except Exception as exc:
         out["error"] = str(exc)
         # Round 8: count HERE, unconditionally. A waiter that already timed
@@ -873,6 +924,15 @@ def submit_drafts(job: dict, wait: bool = True, timeout: Optional[float] = 30.0)
     if not wait:
         return {"status": "queued", "queue_depth": _WORK_QUEUE.qsize()}
     if not done.wait(timeout):
+        # Race window: the worker may have finished in the same instant the
+        # wait timed out. Prefer the real outcome when it is already present
+        # so lifecycle stays on the waiter path (no double-apply, no false
+        # timeout counter for a job that actually landed).
+        if done.is_set():
+            if "error" in out:
+                raise DraftWriteError(out["error"])
+            if "result" in out:
+                return out["result"]
         # AFM-8: the job is still in flight and WILL be written by the worker;
         # the caller just did not get to see the outcome. Saying "queued" alone
         # left the caller with no way to know its result was never observed, so
@@ -885,6 +945,17 @@ def submit_drafts(job: dict, wait: bool = True, timeout: Optional[float] = 30.0)
         with _IN_FLIGHT_LOCK:
             _WRITE_TIMEOUTS += 1
             _LAST_WRITE_TIMEOUT_AT = time.time()
+        # Round 10: transfer lifecycle ownership to the worker. Set the flag
+        # only after confirming the worker has not already finished (above).
+        # Worker checks after _write_batch; lifecycle_applied prevents double.
+        if job.get("lifecycle"):
+            job["defer_lifecycle_to_worker"] = True
+            # If the worker finished between the done check and the flag set,
+            # apply from the waiter side so the decision is not dropped.
+            if done.is_set() and "error" not in out:
+                _maybe_apply_deferred_lifecycle(job)
+                if job.get("lifecycle_applied") and "result" in out:
+                    return out["result"]
         logger.warning(
             "AFM writer timed out after %.1fs waiting on pass %r; %d draft(s) "
             "still in flight — outcome unobserved",
@@ -896,6 +967,7 @@ def submit_drafts(job: dict, wait: bool = True, timeout: Optional[float] = 30.0)
             "timeout": True,
             "drafts_written": [],
             "drafts_in_flight": len(job.get("drafts") or []),
+            "lifecycle_deferred": bool(job.get("lifecycle")),
         }
     if "error" in out:
         raise DraftWriteError(out["error"])

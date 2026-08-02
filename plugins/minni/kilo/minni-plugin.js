@@ -75,20 +75,13 @@ const EVICTION_DIAGNOSTIC_INTERVAL_MS = 60_000;
 const evictionsSinceReport = new Map();
 let lastEvictionReportAt = 0;
 
-function reportSessionEvictions(label, max, evicted) {
-  const entry = evictionsSinceReport.get(label) || { count: 0, max };
-  entry.count += evicted;
-  entry.max = max;
-  evictionsSinceReport.set(label, entry);
-  const now = Date.now();
-  if (now - lastEvictionReportAt < EVICTION_DIAGNOSTIC_INTERVAL_MS) {
-    // Still visible per wave — just no spawn.
-    console.warn(
-      `[minni] evicted ${evicted} ${label} entr(y|ies) (bound ${max}); ` +
-        `${entry.count} pending for the next diagnostic`,
-    );
-    return;
-  }
+function flushPendingSessionEvictions() {
+  // Round 10: when a diagnostic slot frees, deliver carried session-evict
+  // counts even if no new eviction arrives. Without this, a storm that
+  // suppressed session-evict left the loss console-only until further churn
+  // (or process death).
+  if (evictionsSinceReport.size === 0) return false;
+  if (diagnosticsInFlight >= DIAGNOSTIC_MAX_IN_FLIGHT) return false;
   const flushed = [...evictionsSinceReport.entries()];
   const detail = flushed
     .map(([name, info]) => `${info.count} ${name} entr(y|ies) (bound ${info.max})`)
@@ -117,20 +110,33 @@ function reportSessionEvictions(label, max, evicted) {
       );
     },
   );
-  // Review round 4: only advance the window and clear the counts when the
-  // diagnostic actually spawned. The in-flight cap being full is exactly the
-  // failure storm this shares a budget with — zeroing the count on a
-  // suppressed spawn silently discarded the loss while the coalesce state
-  // pretended it was reported. Kept counts ride to the next free slot.
   if (accepted) {
-    lastEvictionReportAt = now;
+    lastEvictionReportAt = Date.now();
     evictionsSinceReport.clear();
-  } else {
-    console.warn(
-      `[minni] session-evict diagnostic suppressed (budget full); ` +
-        `carrying forward: ${detail}`,
-    );
+    return true;
   }
+  console.warn(
+    `[minni] session-evict diagnostic suppressed (budget full); ` +
+      `carrying forward: ${detail}`,
+  );
+  return false;
+}
+
+function reportSessionEvictions(label, max, evicted) {
+  const entry = evictionsSinceReport.get(label) || { count: 0, max };
+  entry.count += evicted;
+  entry.max = max;
+  evictionsSinceReport.set(label, entry);
+  const now = Date.now();
+  if (now - lastEvictionReportAt < EVICTION_DIAGNOSTIC_INTERVAL_MS) {
+    // Still visible per wave — just no spawn.
+    console.warn(
+      `[minni] evicted ${evicted} ${label} entr(y|ies) (bound ${max}); ` +
+        `${entry.count} pending for the next diagnostic`,
+    );
+    return;
+  }
+  flushPendingSessionEvictions();
 }
 
 function evictOldest(collection, max, label) {
@@ -273,6 +279,9 @@ function spawnBridgeDiagnostic(event, detail, onUndelivered, extras = {}) {
       // Round 9: a free slot must drain the suppress queue — otherwise the
       // budget that exists for storms re-silences everything after the 4th.
       flushPendingSuppressedFailures();
+      // Round 10: session-evict has its own carry-forward (not the suppress
+      // map); free the same slot for that wave without waiting for more churn.
+      flushPendingSessionEvictions();
     };
     // Round 5: the same idempotence guard for delivery-failure reporting —
     // a failed spawn can fire both `error` and `close`.

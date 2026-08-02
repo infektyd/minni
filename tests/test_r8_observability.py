@@ -889,6 +889,90 @@ def test_unrecovered_write_failures_never_age_into_ok():
     assert any("unrecovered write failure" in reason for reason in reasons)
 
 
+def test_write_timeout_then_worker_success_applies_lifecycle_once(monkeypatch):
+    """Round 10: timeout skips apply in compile, but a late successful write
+    must apply lifecycle once (not mint a second draft set on re-run)."""
+    import threading
+
+    from minni import afm_writer
+
+    afm_writer.reset_pass_counters()
+    applied = []
+
+    afm_writer.set_deferred_lifecycle_handler(lambda life: applied.append(dict(life)))
+
+    release = threading.Event()
+    started = threading.Event()
+
+    def _slow_write(job):
+        started.set()
+        release.wait(timeout=5)
+        return {"drafts_written": [{"page_id": "d1"}], "inbox_path": "x"}
+
+    monkeypatch.setattr(afm_writer, "_write_batch", _slow_write)
+    monkeypatch.setattr(afm_writer, "_ensure_worker", lambda: None)
+    # Drive _process_job on a side thread like the real worker.
+    done = threading.Event()
+    out: dict = {}
+    job = {
+        "pass_name": "consolidation",
+        "drafts": [{"title": "t"}],
+        "lifecycle": {
+            "promote_candidate_ids": [1],
+            "dedup_candidate_ids": [],
+            "review_candidate_ids": [2],
+        },
+    }
+
+    def _worker():
+        afm_writer._process_job(job, done, out)
+
+    t = threading.Thread(target=_worker)
+    t.start()
+    assert started.wait(2), "worker must enter the write"
+    # Simulate submit_drafts timeout path: transfer ownership, then release write.
+    job["defer_lifecycle_to_worker"] = True
+    release.set()
+    t.join(timeout=5)
+    assert done.is_set()
+    assert "result" in out
+    assert len(applied) == 1, f"lifecycle must apply exactly once, got {applied!r}"
+    assert applied[0]["promote_candidate_ids"] == [1]
+    assert applied[0]["review_candidate_ids"] == [2]
+    assert job.get("lifecycle_applied") is True
+    # Second call must be a no-op (idempotent).
+    afm_writer._maybe_apply_deferred_lifecycle(job)
+    assert len(applied) == 1
+    afm_writer.reset_pass_counters()
+
+
+def test_probe_cache_file_lock_is_shared_protocol():
+    """Round 10: Python must use the same lock sibling path as afm.ts."""
+    from minni import afm_provider
+
+    path = afm_provider._probe_cache_file_path()
+    assert afm_provider._probe_cache_lock_path() == path + ".lock"
+    assert afm_provider.PROBE_CACHE_LOCK_STALE_SECONDS == 10.0
+
+
+def test_stale_probe_cache_lock_is_reclaimed(tmp_path, monkeypatch):
+    """Round 10: an orphan lockfile must not wedge every later write unlocked."""
+    import os
+    import time as time_mod
+
+    from minni import afm_provider
+
+    cache = tmp_path / "afm-probe-cache.json"
+    lock = tmp_path / "afm-probe-cache.json.lock"
+    monkeypatch.setenv("MINNI_AFM_PROBE_CACHE", str(cache))
+    lock.write_text("orphan", encoding="utf-8")
+    # Backdate mtime past the stale threshold.
+    old = time_mod.time() - afm_provider.PROBE_CACHE_LOCK_STALE_SECONDS - 5
+    os.utime(lock, (old, old))
+    assert afm_provider._reclaim_stale_probe_cache_lock() is True
+    assert not lock.exists()
+
+
 def test_recent_write_timeouts_reach_the_status_verdict():
     """The chronic-timeout writer must not read `ok`; an old timeout must not
     latch `backlogged` (same recency discipline as drops)."""

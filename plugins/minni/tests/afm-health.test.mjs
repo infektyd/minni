@@ -18,10 +18,13 @@ import {
   getAfmProviderHealth,
   noteAfmGenerationFailure,
   noteAfmGenerationSuccess,
+  PROBE_CACHE_LOCK_STALE_MS,
   PROBE_CACHE_MAX_ENTRIES,
+  reclaimStaleProbeCacheLock,
   resetAfmGenerationProbeCache,
   resolveAfmProvider,
 } from "../dist/afm.js";
+import { utimesSync, writeFileSync, existsSync as fsExistsSync } from "node:fs";
 import { afmHealth, buildStatusReport } from "../dist/sovereign.js";
 
 const HEALTH_UP = { ok: true, data: { status: "ok", adapter: null } };
@@ -419,6 +422,22 @@ test("AFM-4: persistProbeMutation bounds the on-disk cache", async () => {
       PROBE_CACHE_MAX_ENTRIES,
       "plugin-side writes must evict to the same bound as Python",
     );
+  });
+});
+
+test("AFM-4: a stale lockfile is reclaimed so later mutations stay exclusive", async () => {
+  await withProbeCacheFile(async (cacheFile) => {
+    const lockPath = `${cacheFile}.lock`;
+    writeFileSync(lockPath, "orphan", { mode: 0o600 });
+    const staleAt = (Date.now() - PROBE_CACHE_LOCK_STALE_MS - 1000) / 1000;
+    utimesSync(lockPath, staleAt, staleAt);
+    assert.equal(reclaimStaleProbeCacheLock(), true);
+    assert.equal(fsExistsSync(lockPath), false, "orphan lock must be unlinked");
+    // A subsequent mutation must succeed and not leave a wedged lock behind.
+    noteAfmGenerationSuccess("http://127.0.0.1:3141/v1/chat/completions", "bridge");
+    assert.equal(fsExistsSync(lockPath), false, "successful RMW must release the lock");
+    const persisted = JSON.parse(await readFile(cacheFile, "utf8"));
+    assert.ok(Object.keys(persisted.entries).length >= 1);
   });
 });
 

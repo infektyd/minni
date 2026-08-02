@@ -7,6 +7,7 @@ import {
   readFileSync,
   renameSync,
   rmSync,
+  statSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -595,14 +596,40 @@ function writePersistentProbeEntries(entries: Record<string, PersistedProbeEntry
   }
 }
 
+/** Lockfiles older than this are treated as abandoned (SIGKILL mid-RMW). */
+export const PROBE_CACHE_LOCK_STALE_MS = 10_000;
+
 /**
- * Cross-process exclusive lock via O_EXCL lockfile. Best-effort: if the lock
- * cannot be acquired after a short spin, still run the mutation (same honesty
- * bar as an unlocked write — never fail the health path for a lock).
+ * Reclaim a lockfile whose mtime is older than PROBE_CACHE_LOCK_STALE_MS.
+ * Round 10: a SIGKILL'd SessionStart left the lock forever; every later write
+ * spun then fell through unlocked — permanent lost-update after one kill.
+ * Returns true when an orphan was removed.
+ */
+export function reclaimStaleProbeCacheLock(nowMs: number = Date.now()): boolean {
+  const lockPath = probeCacheLockPath();
+  try {
+    const st = statSync(lockPath);
+    if (nowMs - st.mtimeMs >= PROBE_CACHE_LOCK_STALE_MS) {
+      unlinkSync(lockPath);
+      return true;
+    }
+  } catch {
+    /* missing or unreadable — nothing to reclaim */
+  }
+  return false;
+}
+
+/**
+ * Cross-process exclusive lock via O_EXCL lockfile (same path as Python
+ * `afm_provider._probe_cache_lock_path`). Best-effort: if the lock cannot be
+ * acquired after a short spin + stale reclaim, still run the mutation (never
+ * fail the health path for a lock).
  */
 function withProbeCacheLock(fn: () => void): void {
   const lockPath = probeCacheLockPath();
   const maxAttempts = 40;
+  // Always try reclaim once up front so a wedged lock does not tax every write.
+  reclaimStaleProbeCacheLock();
   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
     let fd: number | undefined;
     try {
@@ -641,12 +668,39 @@ function withProbeCacheLock(fn: () => void): void {
         }
         return;
       }
+      // Mid-spin reclaim: a peer may have been killed after we started waiting.
+      if (attempt > 0 && attempt % 5 === 0) {
+        reclaimStaleProbeCacheLock();
+      }
       // Brief busy-wait; hooks are short-lived and the critical section is tiny.
       const start = Date.now();
       while (Date.now() - start < 5) {
         /* spin */
       }
     }
+  }
+  // Last chance: reclaim then one more exclusive attempt before unlocked write.
+  reclaimStaleProbeCacheLock();
+  try {
+    mkdirSync(path.dirname(lockPath), { recursive: true });
+    const fd = openSync(lockPath, fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY, 0o600);
+    try {
+      fn();
+    } finally {
+      try {
+        closeSync(fd);
+      } catch {
+        /* ignore */
+      }
+      try {
+        unlinkSync(lockPath);
+      } catch {
+        /* ignore */
+      }
+    }
+    return;
+  } catch {
+    /* fall through to unlocked best-effort */
   }
   try {
     fn();

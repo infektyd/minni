@@ -496,15 +496,36 @@ def handle_daemon_compile(params: dict, request_id: Any, context: AFMContext) ->
 
             record_pass_attempt(pass_name)
         write_refused = False
+        write_status = None
         if not dry_run and result.get("drafts"):
-            from minni.afm_writer import submit_drafts
+            from minni.afm_writer import (
+                set_deferred_lifecycle_handler,
+                submit_drafts,
+            )
 
+            # Round 10: ensure the worker can apply lifecycle if the waiter
+            # times out and the write later succeeds (one draft set, apply once).
+            lifecycle = {
+                "promote_candidate_ids": list(
+                    result.get("promote_candidate_ids") or []
+                ),
+                "dedup_candidate_ids": list(result.get("dedup_candidate_ids") or []),
+                "review_candidate_ids": list(
+                    result.get("review_candidate_ids") or []
+                ),
+            }
+            # Handler closes over this request's context; safe for the daemon
+            # process (one writer thread serializes jobs).
+            set_deferred_lifecycle_handler(
+                lambda life, _ctx=context: apply_consolidation_result(life, _ctx)
+            )
             write_result = submit_drafts({
                 "pass_name": pass_name,
                 "trace_id": trace_id,
                 "vault_path": vault_path,
                 "drafts": result["drafts"],
                 "writeback": context.writeback_ref(),
+                "lifecycle": lifecycle,
             })
             result.update(write_result)
             # Review round 8 on PR #260: write_in_flight means THIS batch's
@@ -515,11 +536,10 @@ def handle_daemon_compile(params: dict, request_id: Any, context: AFMContext) ->
             # promoted/dedup'd/marked-reviewed while the review drafts that
             # explain those mutations do not exist anywhere.
             #
-            # Round 9: write_timeout is also refused for lifecycle. The job
-            # may still be queued, but a late worker failure then ages the
-            # status surface back to "ok" while candidates are already
-            # terminal with no review drafts. Treat timeout like in-flight:
-            # skip apply; re-run after the writer drains and drafts land.
+            # Round 9/10: write_timeout skips apply HERE (drafts unobserved).
+            # Ownership transfers to the worker via defer_lifecycle_to_worker
+            # so a late success applies once without a full re-run minting
+            # duplicate drafts.
             write_status = write_result.get("status")
             write_refused = write_status in {"write_in_flight", "write_timeout"}
         else:
@@ -531,13 +551,19 @@ def handle_daemon_compile(params: dict, request_id: Any, context: AFMContext) ->
             or result.get("review_candidate_ids")
         ):
             if write_refused:
-                context.logger.warning(
-                    "daemon.compile: consolidation lifecycle apply SKIPPED — "
-                    "this batch's drafts are not yet observed "
-                    "(%s); candidates stay proposed and re-run after the "
-                    "writer drains",
-                    write_status or "write_refused",
-                )
+                if write_status == "write_timeout":
+                    context.logger.warning(
+                        "daemon.compile: consolidation lifecycle DEFERRED to "
+                        "writer — write_timeout; worker applies once if drafts "
+                        "land (no duplicate re-run for this batch)"
+                    )
+                else:
+                    context.logger.warning(
+                        "daemon.compile: consolidation lifecycle apply SKIPPED — "
+                        "this batch's drafts were refused (%s); candidates stay "
+                        "proposed and re-run after the writer drains",
+                        write_status or "write_refused",
+                    )
             else:
                 apply_consolidation_result(result, context)
 
