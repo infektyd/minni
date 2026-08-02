@@ -131,7 +131,13 @@ function createStormReporter({ hookScript, logPath }) {
       queueSuppressedFailure(event, detail);
       return false;
     }
-    return spawnBridgeDiagnostic(event, detail);
+    const accepted = spawnBridgeDiagnostic(event, detail);
+    // Round 13: sync spawn failure must queue, not console-only.
+    if (!accepted) {
+      diagnosticsSuppressed += 1;
+      queueSuppressedFailure(event, detail);
+    }
+    return accepted;
   }
 
   return {

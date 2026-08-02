@@ -907,6 +907,106 @@ def test_unrecovered_write_failures_never_age_into_ok():
     assert any("unrecovered write failure" in reason for reason in reasons)
 
 
+def test_observed_write_failure_does_not_latch_unrecovered_backlogged(monkeypatch):
+    """Round 13: observed DraftWriteError must not stamp unrecovered — a later
+    successful write leaves status free of unrecovered-backlogged."""
+    import threading
+
+    from minni import afm_writer
+    from minni.afm_writer import WRITE_FAILURES_RECENT_SECONDS, derive_loop_status
+
+    afm_writer.reset_pass_counters()
+
+    def _explode(job):
+        raise RuntimeError("transient vault blip")
+
+    monkeypatch.setattr(afm_writer, "_write_batch", _explode)
+    done = threading.Event()
+    out: dict = {}
+    # Waiter still present — observed failure path.
+    afm_writer._process_job(
+        {"pass_name": "consolidation", "drafts": [{"title": "t"}]}, done, out
+    )
+    assert afm_writer._WRITE_FAILURES == 1
+    assert afm_writer._UNRECOVERED_WRITE_FAILURES == 0
+
+    now = 1_000_000.0
+    # Age the recency-windowed write_failures out; unrecovered must stay 0.
+    status, reasons = derive_loop_status(
+        {
+            "last_attempt_per_pass": {"consolidation": now - 60},
+            "write_failures": afm_writer._WRITE_FAILURES,
+            "last_write_failure_at": now - WRITE_FAILURES_RECENT_SECONDS - 60,
+            "unrecovered_write_failures": afm_writer._UNRECOVERED_WRITE_FAILURES,
+        },
+        schedule={"passes": {"consolidation": {"interval_seconds": 3600}}},
+        now=now,
+    )
+    assert status == "ok", f"observed failure must not latch unrecovered: {reasons}"
+    afm_writer.reset_pass_counters()
+
+
+def test_personal_vault_index_failure_is_in_degradation():
+    """Round 13: personal leg exception was log-only; shared hits looked healthy."""
+    from types import SimpleNamespace
+
+    from minni.minnid_runtime import recall as recall_mod
+
+    captured = {}
+
+    class _Shared:
+        config = SimpleNamespace(embedding_model="m")
+        last_vector_degraded = None
+        last_rerank_degraded = None
+        last_query_expand_degraded = None
+        last_auth_suppression = None
+
+        def retrieve(self, **kwargs):
+            return [{"doc_id": 9, "path": "wiki/shared.md"}]
+
+    class _PersonalBoom:
+        config = SimpleNamespace(embedding_model="m")
+
+        def retrieve(self, **kwargs):
+            raise RuntimeError("personal index corrupt")
+
+    shared = _Shared()
+    personal = _PersonalBoom()
+    context = _make_context(shared, captured)
+    # principal required for personal scope
+    principal = SimpleNamespace(agent_id="agent-a", workspace_id="default")
+    object.__setattr__(
+        context,
+        "handler_principal",
+        lambda params, request_id: (principal, None),
+    )
+    object.__setattr__(
+        context,
+        "agent_vault_retrieval",
+        lambda agent_id: (personal, agent_id, "/tmp/p.db"),
+    )
+    recall_mod.handle_search(
+        {"query": "anything", "scope": "personal"},
+        request_id=1,
+        context=context,
+    )
+    payload = captured["response"]
+    assert payload["count"] >= 1, "shared fallback still returns hits"
+    assert payload["degraded"] is True, (
+        "personal index failure must not look like a healthy hybrid search"
+    )
+    personal_entries = [
+        d for d in payload["degradation"] if d.get("src") == "p"
+    ]
+    assert personal_entries, f"expected personal degradation, got {payload['degradation']!r}"
+    assert personal_entries[0].get("degraded") is True
+    assert "personal index" in str(
+        personal_entries[0].get("personal_index_failed")
+        or personal_entries[0].get("reason")
+        or ""
+    ).lower() or "corrupt" in str(personal_entries[0]).lower()
+
+
 def test_write_timeout_then_worker_success_applies_lifecycle_once(monkeypatch):
     """Round 10: timeout skips apply in compile, but a late successful write
     must apply lifecycle once (not mint a second draft set on re-run)."""
