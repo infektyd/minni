@@ -1708,7 +1708,10 @@ class TestShortDocumentBackfill:
         stats = backfill_document_vectors(db_obj, cfg)
         assert stats["documents"] == 1
         assert stats["chunks"] == 1
-        assert stats["skipped_no_content"] == 0
+        # grok-review round 7 (finding 3): the short-content floor made this
+        # counter permanently zero, so the key is gone — a stat that can never
+        # be nonzero reads as a signal and lies.
+        assert "skipped_no_content" not in stats
         with db_obj.cursor() as c:
             row = c.execute(
                 "SELECT chunk_text FROM chunk_embeddings WHERE doc_id = ?",
@@ -2628,3 +2631,84 @@ class TestProvenanceReportsEffectiveDecay:
         floor = float(cfg.correction_decay_floor)
         for r in results:
             assert r["decay_factor"] == pytest.approx(floor)
+
+
+# ---------------------------------------------------------------------------
+# grok-review round 7 — carrier rides every tier, final_score clamps decay
+# ---------------------------------------------------------------------------
+
+class TestEveryTierCarriesTheCalibrationCarrier:
+    """Round-7 finding 1: the headline branch hand-rolls its dict and dropped
+    confidence_raw, so headline hits never fed score_distribution and never
+    got rewritten onto the shared basis — while the same query at snippet
+    depth did both. The carrier must ride every advertised tier."""
+
+    @pytest.mark.parametrize("depth", ["headline", "snippet", "chunk", "document"])
+    def test_every_depth_tier_carries_the_calibration_carrier(self, tmp_path,
+                                                              depth):
+        engine, _db, _cfg = _make_engine(tmp_path)
+        out = engine._apply_depth({"confidence_raw": 0.42, "confidence": 0.5},
+                                  depth)
+        assert out.get("confidence_raw") == pytest.approx(0.42), (
+            f"depth={depth} must carry the GA4-1 carrier; a tier that drops it "
+            "silently exempts itself from calibration"
+        )
+
+    def test_headline_search_feeds_the_window_and_pops_the_carrier(
+        self, tmp_path, monkeypatch, hermetic_principals
+    ):
+        _engine, db_obj, _cfg = _patch_engine_and_writeback(tmp_path, monkeypatch)
+        body = "the deployment rollback procedure is documented here. " * 20
+        with db_obj.cursor() as c:
+            c.execute(
+                "INSERT INTO documents (path, agent, sigil, layer) "
+                "VALUES ('a.md', 'codex', 'vault', 'knowledge')"
+            )
+            doc_id = c.lastrowid
+            c.execute(
+                "INSERT INTO vault_fts (doc_id, path, content, agent, sigil) "
+                "VALUES (?, 'a.md', ?, 'codex', 'vault')",
+                (doc_id, body),
+            )
+        resp = _dispatch("search", {
+            "query": "deployment rollback", "agent_id": "codex",
+            "expand": False, "depth": "headline",
+        })
+        assert "error" not in resp
+        results = resp["result"]["results"]
+        assert results
+        assert all("confidence_raw" not in r for r in results), (
+            "the carrier must be popped at the boundary, not shipped"
+        )
+        with db_obj.cursor() as c:
+            n = c.execute(
+                "SELECT COUNT(*) AS n FROM score_distribution"
+            ).fetchone()["n"]
+        assert n == len(results), (
+            "headline hits must feed the calibration window exactly like "
+            "snippet hits; on the old code the tier silently recorded nothing"
+        )
+
+
+class TestFinalScoreClampsDecay:
+    """Round-7 finding 2: _score_merged_doc stamped the clamped decay_applied
+    but multiplied the RAW decay into final_score — a poison decay_score of
+    2.0 promoted (rrf * 2) on the non-rerank leg while the rerank leg, the
+    stamp, provenance, and confidence all treated it as 1.0."""
+
+    def test_decay_above_one_cannot_promote_final_score(self, tmp_path):
+        engine, _db, _cfg = _make_engine(tmp_path)
+        d = {"rrf_score": 0.02, "decay_score": 2.0, "page_type": "note"}
+        engine._score_merged_doc(d)
+        assert d["decay_applied"] == pytest.approx(1.0)
+        assert d["final_score"] == pytest.approx(0.02), (
+            "final_score must multiply the clamped decay; the raw 2.0 turned "
+            "a poison decay into a promotion channel on the non-rerank leg"
+        )
+
+    def test_negative_decay_clamps_to_zero_not_negative_score(self, tmp_path):
+        engine, _db, _cfg = _make_engine(tmp_path)
+        d = {"rrf_score": 0.02, "decay_score": -0.5, "page_type": "note"}
+        engine._score_merged_doc(d)
+        assert d["decay_applied"] == pytest.approx(0.0)
+        assert d["final_score"] == pytest.approx(0.0)

@@ -1537,7 +1537,12 @@ class RetrievalEngine:
         # clamp as the rerank leg) so confidence reads the value ranking used —
         # a correction floored to 0.5 must not rank semi-fresh while its
         # confidence and recorded calibration sample say near-dead 0.01.
-        d["decay_applied"] = max(0.0, min(1.0, decay))
+        # Round 7 (finding 2): final_score multiplies the SAME clamped value —
+        # multiplying the raw decay let a poison decay_score of 2.0 promote
+        # (rrf * 2) on the non-rerank leg while the rerank leg, the stamp, and
+        # confidence all treated it as 1.0.
+        decay = max(0.0, min(1.0, float(decay)))
+        d["decay_applied"] = decay
         d["final_score"] = d["rrf_score"] * decay * (1.0 + boost)
 
     def _rrf_merge(
@@ -1704,6 +1709,13 @@ class RetrievalEngine:
                 "doc_id": result.get("doc_id"),
                 "chunk_id": result.get("chunk_id"),
                 "confidence": result.get("confidence"),
+                # grok-review round 7 (finding 1): the GA4-1 carrier must ride
+                # EVERY tier — omitting it here meant headline hits never fed
+                # score_distribution and never got rewritten onto the shared
+                # basis while the same query at snippet depth did both.
+                # test_every_depth_tier_carries_the_calibration_carrier pins
+                # all four tiers so they cannot drift again.
+                "confidence_raw": result.get("confidence_raw"),
                 "age_days": result.get("age_days"),
                 "layer": result.get("layer"),
                 "decay_factor": _effective_decay(result, result.get("decay_factor")),

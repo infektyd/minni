@@ -283,7 +283,7 @@ def backfill_document_vectors(
     engine-agnostic; the caller owns the index.
     """
     stats = {"candidates": 0, "documents": 0, "chunks": 0, "failed": 0,
-             "skipped_no_model": 0, "skipped_no_content": 0, "unrecoverable": 0}
+             "skipped_no_model": 0, "unrecoverable": 0}
     np = _numpy()
 
     try:
