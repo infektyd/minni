@@ -1663,6 +1663,12 @@ def test_a_returned_failure_status_counts_as_a_failed_tick():
     # Round 5: the writer refusing a duplicate submit while the previous batch
     # is still queued is a failed tick too.
     assert compile_failure_status({"result": {"status": "write_in_flight"}}) == "write_in_flight"
+    # Round 17: lifecycle_recovered re-applied a prior deferred lifecycle and
+    # did NOT enqueue this batch's drafts — soft failure for scheduling so
+    # max_batches=1 cannot burn a full interval after discarded wet work.
+    assert compile_failure_status(
+        {"result": {"status": "lifecycle_recovered", "drafts_deferred": 2}}
+    ) == "lifecycle_recovered"
     # Round 5: handle_daemon_compile's make_error paths (unsupported
     # pass_name, vault-guard denial) return a top-level `error` with no
     # `result` — reading only result.status made those SUCCESSFUL ticks.
@@ -1743,6 +1749,41 @@ def test_loop_consults_the_returned_status_not_only_exceptions():
     # Round 7: an rpc_error's message lives in the top-level `error`, not
     # result.reason — reading only the latter logged "rpc_error: None".
     assert '(res.get("error") or {}).get("message")' in source
+    # Round 17: lifecycle_recovered is a soft failure — short backoff, but
+    # multi-batch consolidation continues so review pages can still land.
+    assert "lifecycle_recovered" in source
+    assert 'failure == "lifecycle_recovered"' in source
+
+
+def test_lifecycle_recovered_is_soft_failure_not_full_interval():
+    """Round 17: a tick that only re-applied a prior deferred lifecycle and
+    discarded this batch's drafts must not consume the full pass interval —
+    especially under max_batches_per_tick == 1 where multi-batch drain cannot
+    mask the honesty gap."""
+    from minni.minnid_runtime.afm import (
+        _FAILURE_RETRY_SECONDS,
+        _WRITE_STALL_STATUSES,
+        compile_failure_status,
+        next_last_run,
+    )
+
+    status = compile_failure_status(
+        {
+            "result": {
+                "status": "lifecycle_recovered",
+                "drafts_deferred": 4,
+                "lifecycle_recovered": True,
+            }
+        }
+    )
+    assert status == "lifecycle_recovered"
+    # Soft failure uses the recoverable backoff, not the write-stall class.
+    assert status not in _WRITE_STALL_STATUSES
+
+    interval = 24 * 60 * 60
+    now = 2_000_000.0
+    stamped = next_last_run(interval, now, failed=True)
+    assert stamped + interval - now == _FAILURE_RETRY_SECONDS
 
 
 # ── #230 AFM-9: dropped distillation groups must be counted ──────────────────

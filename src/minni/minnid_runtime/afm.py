@@ -81,8 +81,19 @@ _FAILURE_RETRY_SECONDS = 300
 # Round 5: "write_in_flight" is the writer refusing a re-submit while the
 # previous job for the same pass is still queued (see afm_writer.submit_drafts)
 # — a failed tick for scheduling, and proof the earlier batch has not landed.
+# Round 17: "lifecycle_recovered" re-applies a PRIOR deferred lifecycle and
+# deliberately does NOT enqueue THIS batch's drafts. Treating it as success
+# burned the full interval after a tick that threw away wet work (especially
+# under max_batches_per_tick == 1). Soft failure → short backoff; multi-batch
+# drain continues so a subsequent batch can still write review pages.
 _COMPILE_FAILURE_STATUSES = frozenset(
-    {"afm_unavailable", "write_failed", "write_timeout", "write_in_flight"}
+    {
+        "afm_unavailable",
+        "write_failed",
+        "write_timeout",
+        "write_in_flight",
+        "lifecycle_recovered",
+    }
 )
 
 # Review round 5 on PR #260: write_timeout / write_in_flight are NOT the same
@@ -878,13 +889,34 @@ async def afm_loop_runner(context: AFMContext):
                             # Round 7: an rpc_error carries its message in the
                             # top-level `error`, not result.reason — reading
                             # only the latter logged "rpc_error: None".
-                            context.logger.warning(
-                                "AFM loop: consolidation batch %d returned %s: %s",
-                                batches + 1, failure,
+                            # Round 17: lifecycle_recovered surfaces via status
+                            # (no reason); log drafts_deferred for honesty.
+                            payload = (res.get("result") or {}) if isinstance(res, dict) else {}
+                            detail = (
                                 (res.get("error") or {}).get("message")
                                 if failure == "rpc_error"
-                                else (res.get("result") or {}).get("reason"),
+                                else payload.get("reason")
+                                or (
+                                    f"drafts_deferred={payload.get('drafts_deferred')}"
+                                    if failure == "lifecycle_recovered"
+                                    else None
+                                )
                             )
+                            context.logger.warning(
+                                "AFM loop: consolidation batch %d returned %s: %s",
+                                batches + 1, failure, detail,
+                            )
+                            # Soft: sticky lifecycle was cleared; keep draining
+                            # so this tick can still produce review pages.
+                            if failure == "lifecycle_recovered":
+                                last_summ = payload.get("summary") if isinstance(payload, dict) else None
+                                batches += 1
+                                examined = (last_summ or {}).get("examined", 0)
+                                total_examined += examined
+                                if examined == 0:
+                                    break
+                                await asyncio.sleep(0)
+                                continue
                             break
                         last_summ = (res.get("result") or {}).get("summary") if isinstance(res, dict) else None
                         batches += 1

@@ -4,6 +4,9 @@
 // Model of the coalesce+flush control flow in kilo/minni-plugin.js, driven
 // with real child processes so "after children exit, audit accounts for
 // suppressed events" is an observable fact rather than a source-grep hope.
+//
+// Round 17: also pins undelivered backoff (no tight-loop spawn storm) and
+// session-evict console visibility when the diagnostic budget is full.
 
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
@@ -15,16 +18,32 @@ import { fileURLToPath } from "node:url";
 
 const DIAGNOSTIC_MAX_IN_FLIGHT = 4;
 const DIAGNOSTIC_TIMEOUT_MS = 2_000;
+// Production uses 1s base / 60s max; tests use a short backoff so re-spawn
+// still happens within waitForIdle without allowing a tight loop.
+const TEST_UNDELIVERED_BACKOFF_MS = 80;
+const TEST_UNDELIVERED_BACKOFF_MAX_MS = 400;
 
 /**
- * Faithful extract of the round-9 suppress coalesce + settle flush.
+ * Faithful extract of the round-9+17 suppress coalesce + settle flush.
  * Uses the same return contract as reportBridgeFailure (spawned vs not).
  */
-function createStormReporter({ hookScript, logPath }) {
+function createStormReporter({
+  hookScript,
+  logPath,
+  undeliveredBackoffMs = TEST_UNDELIVERED_BACKOFF_MS,
+  undeliveredBackoffMaxMs = TEST_UNDELIVERED_BACKOFF_MAX_MS,
+  nowFn = () => Date.now(),
+}) {
   let diagnosticsInFlight = 0;
   let diagnosticsSuppressed = 0;
   const pendingSuppressedFailures = new Map();
+  const evictionsSinceReport = new Map();
   const delivered = [];
+  const consoleWarns = [];
+  let diagnosticUndeliveredStreak = 0;
+  let diagnosticFlushNotBefore = 0;
+  let diagnosticFlushTimer = null;
+  let spawnCount = 0;
 
   function queueSuppressedFailure(event, detail) {
     if (event === "session-evict") return;
@@ -43,6 +62,97 @@ function createStormReporter({ hookScript, logPath }) {
     }
   }
 
+  function noteDiagnosticUndelivered() {
+    diagnosticUndeliveredStreak += 1;
+    const exp = Math.min(diagnosticUndeliveredStreak - 1, 6);
+    const backoff = Math.min(
+      undeliveredBackoffMaxMs,
+      undeliveredBackoffMs * (2 ** exp),
+    );
+    diagnosticFlushNotBefore = Math.max(
+      diagnosticFlushNotBefore,
+      nowFn() + backoff,
+    );
+  }
+
+  function noteDiagnosticDelivered() {
+    diagnosticUndeliveredStreak = 0;
+    diagnosticFlushNotBefore = 0;
+  }
+
+  function scheduleDiagnosticFlush() {
+    const delay = Math.max(0, diagnosticFlushNotBefore - nowFn());
+    if (delay === 0) {
+      flushDiagnosticQueues();
+      return;
+    }
+    if (diagnosticFlushTimer != null) return;
+    diagnosticFlushTimer = setTimeout(() => {
+      diagnosticFlushTimer = null;
+      flushDiagnosticQueues();
+    }, delay);
+    if (typeof diagnosticFlushTimer.unref === "function") {
+      diagnosticFlushTimer.unref();
+    }
+  }
+
+  function flushDiagnosticQueues() {
+    if (nowFn() < diagnosticFlushNotBefore) {
+      scheduleDiagnosticFlush();
+      return false;
+    }
+    let progressed = false;
+    if (evictionsSinceReport.size > 0) {
+      progressed = flushPendingSessionEvictions() || progressed;
+    }
+    if (
+      pendingSuppressedFailures.size > 0
+      && diagnosticsInFlight < DIAGNOSTIC_MAX_IN_FLIGHT
+    ) {
+      progressed = flushPendingSuppressedFailures() || progressed;
+    }
+    return progressed;
+  }
+
+  function flushPendingSessionEvictions() {
+    if (evictionsSinceReport.size === 0) return false;
+    if (diagnosticsInFlight >= DIAGNOSTIC_MAX_IN_FLIGHT) {
+      const detail = [...evictionsSinceReport.entries()]
+        .map(([name, info]) => `${info.count} ${name} entr(y|ies) (bound ${info.max})`)
+        .join("; ");
+      const msg =
+        `[minni] session-evict diagnostic suppressed (budget full); ` +
+        `carrying forward: ${detail}`;
+      consoleWarns.push(msg);
+      return false;
+    }
+    const flushed = [...evictionsSinceReport.entries()];
+    const detail = flushed
+      .map(([name, info]) => `${info.count} ${name} entr(y|ies) (bound ${info.max})`)
+      .join("; ");
+    const accepted = reportBridgeFailure(
+      "session-evict",
+      new Error(`evicted for old sessions: ${detail}`),
+      () => {
+        for (const [name, info] of flushed) {
+          const cur = evictionsSinceReport.get(name) || { count: 0, max: info.max };
+          cur.count += info.count;
+          cur.max = info.max;
+          evictionsSinceReport.set(name, cur);
+        }
+      },
+    );
+    if (accepted) {
+      evictionsSinceReport.clear();
+      return true;
+    }
+    consoleWarns.push(
+      `[minni] session-evict diagnostic suppressed (budget full); ` +
+        `carrying forward: ${detail}`,
+    );
+    return false;
+  }
+
   function flushPendingSuppressedFailures() {
     if (pendingSuppressedFailures.size === 0) return false;
     if (diagnosticsInFlight >= DIAGNOSTIC_MAX_IN_FLIGHT) return false;
@@ -59,13 +169,11 @@ function createStormReporter({ hookScript, logPath }) {
       `coalesced bridge failures: ${detail}`,
       () => {
         restoreSuppressedFailures(flushed);
-        // Round 14: restore suppressed count when the audit never lands.
         diagnosticsSuppressed = Math.max(diagnosticsSuppressed, suppressedAtFlush);
       },
       {
         coalesced_count: totalCount,
         suppressed_since_last_report: suppressedAtFlush,
-        // Subtract the snapshot on delivery (not hard-zero).
         onDelivered: () => {
           diagnosticsSuppressed = Math.max(
             0,
@@ -89,17 +197,24 @@ function createStormReporter({ hookScript, logPath }) {
         stdio: ["pipe", "ignore", "ignore"],
         detached: false,
       });
+      spawnCount += 1;
       diagnosticsInFlight += 1;
       const kill = setTimeout(() => child.kill("SIGKILL"), DIAGNOSTIC_TIMEOUT_MS);
       let settled = false;
+      let undeliveredReported = false;
       const settle = () => {
         if (settled) return;
         settled = true;
         clearTimeout(kill);
         diagnosticsInFlight -= 1;
-        flushPendingSuppressedFailures();
+        if (undeliveredReported) {
+          noteDiagnosticUndelivered();
+          scheduleDiagnosticFlush();
+        } else {
+          noteDiagnosticDelivered();
+          flushDiagnosticQueues();
+        }
       };
-      let undeliveredReported = false;
       const undelivered = () => {
         if (undeliveredReported) return;
         undeliveredReported = true;
@@ -163,13 +278,27 @@ function createStormReporter({ hookScript, logPath }) {
     return accepted;
   }
 
+  function reportSessionEvictions(label, max, evicted) {
+    const entry = evictionsSinceReport.get(label) || { count: 0, max };
+    entry.count += evicted;
+    entry.max = max;
+    evictionsSinceReport.set(label, entry);
+    flushPendingSessionEvictions();
+  }
+
   return {
     reportBridgeFailure,
+    reportSessionEvictions,
     getState: () => ({
       diagnosticsInFlight,
       diagnosticsSuppressed,
       pending: new Map(pendingSuppressedFailures),
+      evictions: new Map(evictionsSinceReport),
       delivered: [...delivered],
+      consoleWarns: [...consoleWarns],
+      spawnCount,
+      undeliveredStreak: diagnosticUndeliveredStreak,
+      flushNotBefore: diagnosticFlushNotBefore,
     }),
     waitForIdle: async (timeoutMs = 5_000) => {
       const start = Date.now();
@@ -177,14 +306,22 @@ function createStormReporter({ hookScript, logPath }) {
         const s = {
           diagnosticsInFlight,
           pending: pendingSuppressedFailures.size,
+          timer: diagnosticFlushTimer != null,
         };
-        if (s.diagnosticsInFlight === 0 && s.pending === 0) return;
+        if (s.diagnosticsInFlight === 0 && s.pending === 0 && !s.timer) return;
         await new Promise((r) => setTimeout(r, 25));
       }
       throw new Error(
         `storm reporter did not drain: inFlight=${diagnosticsInFlight} ` +
-          `pending=${pendingSuppressedFailures.size} suppressed=${diagnosticsSuppressed}`,
+          `pending=${pendingSuppressedFailures.size} suppressed=${diagnosticsSuppressed} ` +
+          `timer=${diagnosticFlushTimer != null}`,
       );
+    },
+    dispose: () => {
+      if (diagnosticFlushTimer != null) {
+        clearTimeout(diagnosticFlushTimer);
+        diagnosticFlushTimer = null;
+      }
     },
   };
 }
@@ -209,9 +346,8 @@ test("P6 behavioral: suppressed hook failures flush to audit after storm drains"
     "utf8",
   );
 
+  const reporter = createStormReporter({ hookScript, logPath });
   try {
-    const reporter = createStormReporter({ hookScript, logPath });
-
     // Fill the budget with 4 immediate failures (each spawns a hanging child).
     for (let i = 0; i < DIAGNOSTIC_MAX_IN_FLIGHT; i += 1) {
       const accepted = reporter.reportBridgeFailure("Stop", new Error(`timeout #${i}`));
@@ -260,11 +396,12 @@ test("P6 behavioral: suppressed hook failures flush to audit after storm drains"
     assert.match(log, /coalesced bridge failures|suppressed_since_last_report/);
     assert.match(log, /Stop/);
   } finally {
+    reporter.dispose();
     await rm(root, { recursive: true, force: true });
   }
 });
 
-test("P6 source: minni-plugin.js wires settle → flushPendingSuppressedFailures", async () => {
+test("P6 source: minni-plugin.js wires settle → flush with undelivered backoff", async () => {
   const pluginPath = path.join(
     path.dirname(fileURLToPath(import.meta.url)),
     "..",
@@ -274,13 +411,17 @@ test("P6 source: minni-plugin.js wires settle → flushPendingSuppressedFailures
   const source = await readFile(pluginPath, "utf8");
   assert.match(source, /pendingSuppressedFailures/);
   assert.match(source, /function flushPendingSuppressedFailures/);
-  // The settle body must call the flusher — not only define it.
+  assert.match(source, /function scheduleDiagnosticFlush/);
+  assert.match(source, /function flushDiagnosticQueues/);
+  assert.match(source, /function noteDiagnosticUndelivered/);
+  assert.match(source, /DIAGNOSTIC_UNDELIVERED_BACKOFF_MS/);
+  // The settle body must branch undelivered → schedule, delivered → drain.
   const settle = source.indexOf("const settle = () =>");
   assert.ok(settle !== -1);
-  assert.match(
-    source.slice(settle, settle + 350),
-    /flushPendingSuppressedFailures\(\)/,
-  );
+  const settleWindow = source.slice(settle, settle + 900);
+  assert.match(settleWindow, /noteDiagnosticUndelivered/);
+  assert.match(settleWindow, /scheduleDiagnosticFlush\(\)/);
+  assert.match(settleWindow, /flushDiagnosticQueues\(\)/);
   // Round 14: undelivered must run before settle on close/error paths.
   const closeHandler = source.indexOf('child.once("close"');
   assert.ok(closeHandler !== -1);
@@ -295,6 +436,24 @@ test("P6 source: minni-plugin.js wires settle → flushPendingSuppressedFailures
   assert.doesNotMatch(
     source,
     /if \(accepted\) \{\s*diagnosticsSuppressed\s*=\s*0/,
+  );
+  // Round 17: budget-full early return on session-evict must console.warn.
+  const flushEvict = source.indexOf("function flushPendingSessionEvictions");
+  assert.ok(flushEvict !== -1);
+  const flushEvictWindow = source.slice(flushEvict, flushEvict + 900);
+  assert.match(
+    flushEvictWindow,
+    /diagnosticsInFlight >= DIAGNOSTIC_MAX_IN_FLIGHT[\s\S]*console\.warn/,
+    "budget-full session-evict early return must console.warn (not silent)",
+  );
+  // Fair drain: session-evict before suppress in flushDiagnosticQueues.
+  const drain = source.indexOf("function flushDiagnosticQueues");
+  const drainWindow = source.slice(drain, drain + 700);
+  const evictCall = drainWindow.indexOf("flushPendingSessionEvictions");
+  const suppressCall = drainWindow.indexOf("flushPendingSuppressedFailures");
+  assert.ok(
+    evictCall !== -1 && suppressCall !== -1 && evictCall < suppressCall,
+    "flushDiagnosticQueues must try session-evict before suppress storm",
   );
 });
 
@@ -334,9 +493,8 @@ test("P6 behavioral: undelivered restore re-spawns on free slot (ordering pin)",
   );
 
   process.env.MINNI_STORM_FAIL_COUNTER = failCounter;
+  const reporter = createStormReporter({ hookScript, logPath });
   try {
-    const reporter = createStormReporter({ hookScript, logPath });
-
     for (let i = 0; i < DIAGNOSTIC_MAX_IN_FLIGHT; i += 1) {
       assert.equal(
         reporter.reportBridgeFailure("Stop", new Error(`hold #${i}`)),
@@ -373,6 +531,7 @@ test("P6 behavioral: undelivered restore re-spawns on free slot (ordering pin)",
     assert.equal(final.diagnosticsSuppressed, 0);
   } finally {
     delete process.env.MINNI_STORM_FAIL_COUNTER;
+    reporter.dispose();
     await rm(root, { recursive: true, force: true });
   }
 });
@@ -410,9 +569,8 @@ test("P6 behavioral: ordinary hook undelivered queues suppress map and re-spawns
   );
 
   process.env.MINNI_STORM_FAIL_COUNTER = failCounter;
+  const reporter = createStormReporter({ hookScript, logPath });
   try {
-    const reporter = createStormReporter({ hookScript, logPath });
-
     // Single ordinary failure (no onUndelivered) — spawn accepted, then dies.
     assert.equal(
       reporter.reportBridgeFailure("Stop", new Error("hook timed out")),
@@ -459,6 +617,114 @@ test("P6 behavioral: ordinary hook undelivered queues suppress map and re-spawns
     assert.match(log, /Stop|hook timed out|coalesced bridge failures/);
   } finally {
     delete process.env.MINNI_STORM_FAIL_COUNTER;
+    reporter.dispose();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("P6 behavioral: permanent undelivered does not tight-loop spawn storm", async () => {
+  // Round 17 High: child always exit 1 → undelivered → re-queue → settle flush
+  // used to re-spawn immediately forever. DIAGNOSTIC_MAX_IN_FLIGHT only bounds
+  // concurrency, not attempt rate. Backoff must cap spawns over a window.
+  const root = await mkdtemp(path.join(tmpdir(), "minni-storm-perm-"));
+  const logPath = path.join(root, "bridge-audit.jsonl");
+  const hookScript = path.join(root, "fake-hook.mjs");
+  await writeFile(
+    hookScript,
+    [
+      "const chunks = [];",
+      "for await (const c of process.stdin) chunks.push(c);",
+      "process.exit(1);",
+    ].join("\n"),
+    "utf8",
+  );
+
+  // 200ms base / 800ms max — still exponential, never immediate.
+  const reporter = createStormReporter({
+    hookScript,
+    logPath,
+    undeliveredBackoffMs: 200,
+    undeliveredBackoffMaxMs: 800,
+  });
+  try {
+    assert.equal(
+      reporter.reportBridgeFailure("Stop", new Error("permanently broken hook")),
+      true,
+    );
+
+    // Observe for ~1.2s of wall clock. Without backoff this is dozens of
+    // spawns (tight loop); with backoff it is a small handful.
+    await new Promise((r) => setTimeout(r, 1_200));
+    const state = reporter.getState();
+    // First spawn + maybe 2–3 backoff retries in 1.2s with 200/400/800ms.
+    assert.ok(
+      state.spawnCount <= 6,
+      `permanent undelivered must not tight-loop: spawnCount=${state.spawnCount}`,
+    );
+    assert.ok(
+      state.spawnCount >= 1,
+      "at least the original spawn must have happened",
+    );
+    // Counts must still be carried — not discarded to silence.
+    assert.ok(
+      (state.pending.get("Stop")?.count ?? 0) >= 1
+        || state.diagnosticsSuppressed >= 1
+        || state.diagnosticsInFlight >= 1,
+      "permanent undelivered must keep loss on a P6 surface (pending or in-flight)",
+    );
+    assert.ok(
+      state.undeliveredStreak >= 1 || state.flushNotBefore > 0 || state.spawnCount === 1,
+      "backoff gate must engage after undelivered",
+    );
+  } finally {
+    reporter.dispose();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("P6 behavioral: session-evict warns when diagnostic budget is full", async () => {
+  // Round 17 High: under a sustained hook-failure storm, flushPendingSessionEvictions
+  // early-returned with no console.warn while lastEvictionReportAt stayed 0 —
+  // P5 eviction loss was fully silent in process memory.
+  const root = await mkdtemp(path.join(tmpdir(), "minni-storm-evict-"));
+  const logPath = path.join(root, "bridge-audit.jsonl");
+  const hookScript = path.join(root, "fake-hook.mjs");
+  // Hang so the budget stays full for the eviction check.
+  await writeFile(
+    hookScript,
+    [
+      "const chunks = [];",
+      "for await (const c of process.stdin) chunks.push(c);",
+      "await new Promise((r) => setTimeout(r, 800));",
+      "process.exit(0);",
+    ].join("\n"),
+    "utf8",
+  );
+
+  const reporter = createStormReporter({ hookScript, logPath });
+  try {
+    for (let i = 0; i < DIAGNOSTIC_MAX_IN_FLIGHT; i += 1) {
+      assert.equal(
+        reporter.reportBridgeFailure("Stop", new Error(`hold #${i}`)),
+        true,
+      );
+    }
+    assert.equal(reporter.getState().diagnosticsInFlight, DIAGNOSTIC_MAX_IN_FLIGHT);
+
+    reporter.reportSessionEvictions("pending", 64, 3);
+    const mid = reporter.getState();
+    assert.equal(mid.evictions.get("pending")?.count, 3, "counts must be retained");
+    assert.ok(
+      mid.consoleWarns.some((w) => w.includes("session-evict") && w.includes("budget full")),
+      `budget-full eviction must console.warn, got: ${JSON.stringify(mid.consoleWarns)}`,
+    );
+    // No session-evict spawn while budget is full.
+    assert.ok(
+      !mid.delivered.some((p) => p.failed_event === "session-evict"),
+      "must not steal a budget slot while full",
+    );
+  } finally {
+    reporter.dispose();
     await rm(root, { recursive: true, force: true });
   }
 });

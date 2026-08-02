@@ -652,19 +652,31 @@ test("P6: storm suppress coalesces real failures and flushes on settle", async (
 test("P6: session-evict carried counts flush when a diagnostic slot frees", async () => {
   // Round 10: settle used to only flush pendingSuppressedFailures; session-evict
   // counts sat until more churn. free slot must also call flushPendingSessionEvictions.
+  // Round 17: settle drains via flushDiagnosticQueues (fair order + backoff).
   const source = await readFile(
     path.join(PLUGIN_ROOT, "kilo", "minni-plugin.js"),
     "utf8",
   );
   assert.match(source, /function flushPendingSessionEvictions/);
+  assert.match(source, /function flushDiagnosticQueues/);
   const settle = source.indexOf("const settle = () =>");
   assert.ok(settle !== -1);
-  const settleWindow = source.slice(settle, settle + 800);
-  assert.match(settleWindow, /flushPendingSuppressedFailures\(\)/);
+  const settleWindow = source.slice(settle, settle + 900);
   assert.match(
     settleWindow,
-    /flushPendingSessionEvictions\(\)/,
-    "settle must deliver carried session-evict counts without waiting for more churn",
+    /flushDiagnosticQueues\(\)/,
+    "settle must drain diagnostic queues on free slot",
+  );
+  // Fair drain: session-evict before suppress so storms cannot starve P5.
+  const drain = source.indexOf("function flushDiagnosticQueues");
+  const drainWindow = source.slice(drain, drain + 700);
+  assert.match(drainWindow, /flushPendingSessionEvictions/);
+  assert.match(drainWindow, /flushPendingSuppressedFailures/);
+  const evictAt = drainWindow.indexOf("flushPendingSessionEvictions");
+  const suppressAt = drainWindow.indexOf("flushPendingSuppressedFailures");
+  assert.ok(
+    evictAt !== -1 && suppressAt !== -1 && evictAt < suppressAt,
+    "session-evict must drain before suppress storm under shared budget",
   );
 });
 

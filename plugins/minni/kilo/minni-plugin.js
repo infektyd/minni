@@ -62,6 +62,15 @@ let diagnosticsSuppressed = 0;
 // a slot. session-evict keeps its own carry-forward when suppressed; this map
 // is for every other failed_event that reportBridgeFailure swallows.
 const pendingSuppressedFailures = new Map();
+// Round 17: undelivered → immediate settle flush is an unbounded spawn storm
+// when the diagnostic child permanently fails (exit ≠ 0 forever). The in-flight
+// cap only bounds concurrency (1 steady-state), not attempt rate. Back off
+// before free-slot re-spawn; exponential per consecutive undelivered streak.
+const DIAGNOSTIC_UNDELIVERED_BACKOFF_MS = 1_000;
+const DIAGNOSTIC_UNDELIVERED_BACKOFF_MAX_MS = 60_000;
+let diagnosticUndeliveredStreak = 0;
+let diagnosticFlushNotBefore = 0;
+let diagnosticFlushTimer = null;
 // Review round 3 (PR #260): evictions must not exhaust the diagnostic budget
 // real hook failures need. Under session churn one insert can evict a whole
 // wave, and a spawn per eviction eats the DIAGNOSTIC_MAX_IN_FLIGHT slots in
@@ -75,13 +84,85 @@ const EVICTION_DIAGNOSTIC_INTERVAL_MS = 60_000;
 const evictionsSinceReport = new Map();
 let lastEvictionReportAt = 0;
 
+function sessionEvictDetail() {
+  return [...evictionsSinceReport.entries()]
+    .map(([name, info]) => `${info.count} ${name} entr(y|ies) (bound ${info.max})`)
+    .join("; ");
+}
+
+function noteDiagnosticUndelivered() {
+  diagnosticUndeliveredStreak += 1;
+  const exp = Math.min(diagnosticUndeliveredStreak - 1, 6);
+  const backoff = Math.min(
+    DIAGNOSTIC_UNDELIVERED_BACKOFF_MAX_MS,
+    DIAGNOSTIC_UNDELIVERED_BACKOFF_MS * (2 ** exp),
+  );
+  diagnosticFlushNotBefore = Math.max(
+    diagnosticFlushNotBefore,
+    Date.now() + backoff,
+  );
+}
+
+function noteDiagnosticDelivered() {
+  diagnosticUndeliveredStreak = 0;
+  // Success clears the gate so free-slot drain is immediate again.
+  diagnosticFlushNotBefore = 0;
+}
+
+function scheduleDiagnosticFlush() {
+  const delay = Math.max(0, diagnosticFlushNotBefore - Date.now());
+  if (delay === 0) {
+    flushDiagnosticQueues();
+    return;
+  }
+  if (diagnosticFlushTimer != null) return;
+  diagnosticFlushTimer = setTimeout(() => {
+    diagnosticFlushTimer = null;
+    flushDiagnosticQueues();
+  }, delay);
+  // Don't pin the Kilo process open solely for a retry of a broken audit path.
+  if (typeof diagnosticFlushTimer.unref === "function") {
+    diagnosticFlushTimer.unref();
+  }
+}
+
+function flushDiagnosticQueues() {
+  // Honor undelivered backoff — never tight-loop re-spawn.
+  if (Date.now() < diagnosticFlushNotBefore) {
+    scheduleDiagnosticFlush();
+    return false;
+  }
+  // Round 17 fair drain: session-evict first so a sustained suppress storm
+  // cannot starve P5 eviction loss under the shared budget.
+  let progressed = false;
+  if (evictionsSinceReport.size > 0) {
+    progressed = flushPendingSessionEvictions() || progressed;
+  }
+  if (
+    pendingSuppressedFailures.size > 0
+    && diagnosticsInFlight < DIAGNOSTIC_MAX_IN_FLIGHT
+  ) {
+    progressed = flushPendingSuppressedFailures() || progressed;
+  }
+  return progressed;
+}
+
 function flushPendingSessionEvictions() {
   // Round 10: when a diagnostic slot frees, deliver carried session-evict
   // counts even if no new eviction arrives. Without this, a storm that
   // suppressed session-evict left the loss console-only until further churn
   // (or process death).
   if (evictionsSinceReport.size === 0) return false;
-  if (diagnosticsInFlight >= DIAGNOSTIC_MAX_IN_FLIGHT) return false;
+  // Round 17: budget-full must always console.warn — lastEvictionReportAt only
+  // advances on successful flush, so the within-interval path never fired while
+  // suppress storms kept the budget full and this early return was silent.
+  if (diagnosticsInFlight >= DIAGNOSTIC_MAX_IN_FLIGHT) {
+    console.warn(
+      `[minni] session-evict diagnostic suppressed (budget full); ` +
+        `carrying forward: ${sessionEvictDetail()}`,
+    );
+    return false;
+  }
   const flushed = [...evictionsSinceReport.entries()];
   const detail = flushed
     .map(([name, info]) => `${info.count} ${name} entr(y|ies) (bound ${info.max})`)
@@ -283,21 +364,27 @@ function spawnBridgeDiagnostic(event, detail, onUndelivered, extras = {}) {
     // the in-flight cap stops binding — under exactly the failure storm it
     // exists to bound (review round 2 on PR #260).
     let settled = false;
+    // Round 5: the same idempotence guard for delivery-failure reporting —
+    // a failed spawn can fire both `error` and `close`. Declared before settle
+    // so the free-slot path can branch on undelivered vs delivered.
+    let undeliveredReported = false;
     const settle = () => {
       if (settled) return;
       settled = true;
       clearTimeout(kill);
       diagnosticsInFlight -= 1;
-      // Round 9: a free slot must drain the suppress queue — otherwise the
-      // budget that exists for storms re-silences everything after the 4th.
-      flushPendingSuppressedFailures();
-      // Round 10: session-evict has its own carry-forward (not the suppress
-      // map); free the same slot for that wave without waiting for more churn.
-      flushPendingSessionEvictions();
+      // Round 17: undelivered + immediate flush = permanent-fail spawn storm.
+      // Back off and schedule; a successful delivery drains free slots now.
+      if (undeliveredReported) {
+        noteDiagnosticUndelivered();
+        scheduleDiagnosticFlush();
+      } else {
+        noteDiagnosticDelivered();
+        // Round 9/10 via flushDiagnosticQueues: free slot drains suppress
+        // queue and session-evict carry-forward (session-evict first).
+        flushDiagnosticQueues();
+      }
     };
-    // Round 5: the same idempotence guard for delivery-failure reporting —
-    // a failed spawn can fire both `error` and `close`.
-    let undeliveredReported = false;
     const undelivered = () => {
       if (undeliveredReported) return;
       undeliveredReported = true;
