@@ -41,6 +41,13 @@ Runs `scripts/update_root.sh`, which loudly and idempotently:
    fleet still disagrees afterward. After a successful kickstart it also
    probes the daemon socket for `deploy.stale`.
 
+**Antigravity half-state (D11):** if `wire antigravity` fails on hook
+registration (`agy` is on PATH but `agy plugin install` fails), MCP views may
+already be updated while hooks are not. Fix `agy`, then re-run
+`minni wire antigravity --from-repo .` (or `make sync-root`) to complete hooks.
+Wire records the install root for GC protection and names the hook gap in the
+platform result.
+
 The daemon's `status` response carries a `deploy` block
 (`src/minni/minnid_runtime/deploy_honesty.py`) that reports when the running
 process or the deployed plugin dist is stale relative to the checkout — that

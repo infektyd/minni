@@ -237,6 +237,9 @@ def test_plugin_dist_stale_if_any_platform_root_lags(checkout, monkeypatch, tmp_
     import json as _json
 
     home = tmp_path / "home"
+    home.mkdir()
+    (home / ".claude.json").write_text("{}", encoding="utf-8")
+    (home / ".codex").mkdir()
     plugin = home / ".minni" / "plugin"
     head = _git(checkout, "rev-parse", "HEAD")
     old = plugin / "0.4.1+git.oldroot"
@@ -342,6 +345,9 @@ def test_plugin_dist_unknown_first_plus_lagging_is_stale(checkout, monkeypatch, 
     import json as _json
 
     home = tmp_path / "home"
+    home.mkdir()
+    (home / ".gemini").mkdir()
+    (home / ".codex").mkdir()
     plugin = home / ".minni" / "plugin"
     head = _git(checkout, "rev-parse", "HEAD")
     unk = plugin / "0.4.1+git.unknown"
@@ -379,6 +385,9 @@ def test_plugin_dist_unreadable_peer_keeps_lag_evidence(checkout, monkeypatch, t
     import json as _json
 
     home = tmp_path / "home"
+    home.mkdir()
+    (home / ".claude.json").write_text("{}", encoding="utf-8")
+    (home / ".codex").mkdir()
     plugin = home / ".minni" / "plugin"
     head = _git(checkout, "rev-parse", "HEAD")
     lag = plugin / "0.4.0"
@@ -448,3 +457,70 @@ def test_source_checkout_accepts_editable_src_layout(tmp_path, monkeypatch):
     fake.__file__ = str(init)
     monkeypatch.setitem(__import__("sys").modules, "minni", fake)
     assert deploy_honesty._source_checkout() == repo.resolve()
+
+
+def test_zombie_wire_platform_without_config_root_not_active(tmp_path, monkeypatch):
+    """codex wired but ~/.codex gone must not keep lagging root active."""
+    import json as _json
+    from minni.wire.active_roots import active_wire_plugin_roots_ordered
+    from minni.minnid_runtime import deploy_honesty
+
+    home = tmp_path / "home"
+    home.mkdir()
+    plugin = home / ".minni" / "plugin"
+    old = plugin / "0.4.0"
+    old.mkdir(parents=True)
+    (old / "payload-manifest.json").write_text(
+        _json.dumps({"git_sha": "0" * 40, "version": "0.4.0"}), encoding="utf-8",
+    )
+    # claude-code needs HOME as config root; create a dummy .claude.json
+    (home / ".claude.json").write_text("{}", encoding="utf-8")
+    fresh = plugin / "0.4.1+git.bbbbbbb"
+    fresh.mkdir(parents=True)
+    head = "a" * 40
+    (fresh / "payload-manifest.json").write_text(
+        _json.dumps({"git_sha": head, "version": "0.4.1"}), encoding="utf-8",
+    )
+    (plugin / "wired.json").write_text(
+        _json.dumps({
+            "schema": 1,
+            "wires": [
+                {
+                    "platform": "codex",
+                    "install_root": str(old),
+                    "wired_at": "2026-08-01T00:00:00Z",
+                },
+                {
+                    "platform": "claude-code",
+                    "install_root": str(fresh),
+                    "wired_at": "2026-08-02T00:00:00Z",
+                },
+            ],
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(home))
+    # No ~/.codex → codex config root missing
+    ordered = active_wire_plugin_roots_ordered(home)
+    platforms = [how for _r, how in ordered]
+    assert any("claude-code" in h for h in platforms), ordered
+    assert not any("codex" in h for h in platforms), ordered
+
+    monkeypatch.setattr(deploy_honesty, "_source_checkout", lambda: None)
+    # Use plugin dist path via real active roots + fake head
+    monkeypatch.setattr(
+        deploy_honesty, "_active_payload_roots",
+        lambda: active_wire_plugin_roots_ordered(home),
+    )
+    out = deploy_honesty._plugin_dist_status(head)
+    assert out["stale"] is False, out
+
+
+def test_no_plugin_payload_is_stale_false_not_null(monkeypatch):
+    """Measurable absence of a wire payload must not roll up to null stale."""
+    from minni.minnid_runtime import deploy_honesty
+
+    monkeypatch.setattr(deploy_honesty, "_active_payload_roots", lambda: [])
+    out = deploy_honesty._plugin_dist_status("abc")
+    assert out["stale"] is False
+    assert "no wire-managed" in out["reason"]

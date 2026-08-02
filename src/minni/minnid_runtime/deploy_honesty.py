@@ -131,7 +131,13 @@ def _plugin_dist_status(checkout_head: Optional[str]) -> dict:
     """
     roots = _active_payload_roots()
     if not roots:
-        return {"stale": None, "reason": "no wire-managed plugin payload found"}
+        # Measurable absence: no live wire payload is not "unmeasurable" —
+        # process HEAD can still be honest, and sync-root must not hard-fail
+        # the probe for hosts that only use propagate-managed surfaces.
+        return {
+            "stale": False,
+            "reason": "no wire-managed plugin payload found",
+        }
     lagging: list[str] = []
     unreadable: list[str] = []
     first_sha = "unknown"

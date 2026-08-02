@@ -376,6 +376,27 @@ def run_wire(args) -> int:
                     if plat_errors and all(
                         e.startswith(NO_CONFIG_ROOT_MARKER) for e in plat_errors
                     ):
+                        # Retire any prior wire rows for this platform so a
+                        # removed host surface cannot leave a lagging root
+                        # active in honesty / --strict forever.
+                        try:
+                            from minni.wire.wired import retire_platform
+
+                            _data, n = retire_platform(
+                                platform, dry_run=dry_run,
+                            )
+                            if n:
+                                print(
+                                    f"[wire] retired {n} wired.json row(s) "
+                                    f"for {platform} (no config root)",
+                                    file=sys.stderr,
+                                )
+                        except Exception as exc:  # best-effort; skip still wins
+                            print(
+                                f"[wire] warning: could not retire "
+                                f"{platform} wire rows: {exc}",
+                                file=sys.stderr,
+                            )
                         out.results.append(
                             PlatformResult(
                                 platform, "skipped",

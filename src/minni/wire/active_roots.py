@@ -64,7 +64,25 @@ def active_wire_plugin_roots_ordered(home: Path) -> list[tuple[Path, str]]:
                 except OSError:
                     continue
                 latest_by_platform[platform] = (wired_at, resolved)
+        # Drop platforms whose host config root is gone. A retired surface
+        # (e.g. ~/.codex removed after an earlier wire) must not stay "active"
+        # forever and force deploy.stale / sync-root probe fail while other
+        # platforms rewire successfully.
+        try:
+            from minni.wire.platform import (
+                config_root_candidates,
+                config_root_exists,
+            )
+        except Exception:  # pragma: no cover — package always present in tree
+            config_root_candidates = None  # type: ignore[assignment]
+            config_root_exists = None  # type: ignore[assignment]
         for platform, (_wired_at, root) in sorted(latest_by_platform.items()):
+            if config_root_exists is not None and config_root_candidates is not None:
+                candidates = config_root_candidates().get(platform)
+                if candidates is not None:
+                    ok, _probed = config_root_exists(platform)
+                    if not ok:
+                        continue
             if root not in seen:
                 actives.append((root, f"wired.json:{platform}"))
                 seen.add(root)
