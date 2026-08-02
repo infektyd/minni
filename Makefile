@@ -21,8 +21,10 @@
 # Python 3.14 path for this repo; when system python3 is older than 3.14 and uv
 # is installed, setup provisions a uv-managed Python 3.14 instead (the version
 # floor itself never changes). The editable install (`pip install -e .`) is what
-# makes `import minni` and the `minni`/`minnid` console scripts work — no
-# PYTHONPATH splicing anywhere. Ruff runs from that venv so local hooks, CI, and
+# makes `import minni` and the `minni`/`minnid` console scripts work for normal
+# single-checkout use. Test targets additionally set PYTHONPATH=src so a
+# worktree's pytest does not silently import minni from another checkout's
+# editable install (#258). Ruff runs from that venv so local hooks, CI, and
 # agent shells share the same dependency set.
 
 VENV_PY ?= .venv/bin/python
@@ -34,7 +36,7 @@ SOCKET ?= $(HOME)/.minni/run/minnid.sock
 # Scoped engine pytest for `make check`: a fast, model-free core that exercises
 # daemon import, dispatch, status, learn/read, and the observability surface.
 # Override to widen, e.g. `make check CHECK_PYTEST="tests -q"` for the full suite.
-CHECK_PYTEST ?= tests/test_g01_numpy_env.py tests/test_obs.py tests/test_pr11_observability.py tests/test_minni_cli.py -q
+CHECK_PYTEST ?= tests/test_g01_numpy_env.py tests/test_obs.py tests/test_pr11_observability.py tests/test_minni_cli.py tests/test_worktree_import_resolution.py -q
 
 .DEFAULT_GOAL := help
 
@@ -112,9 +114,10 @@ test: test-engine test-plugin
 # Full engine suite is heavy (loads embedding/FAISS models). Override the scope
 # with ENGINE_PYTEST, e.g. `make test-engine ENGINE_PYTEST="tests/test_obs.py -q"`.
 # PYTHONPATH=src (#258): an editable install from another checkout must not win
-# over this tree when pytest runs from a git worktree. conftest.py also enforces
-# this; the env var covers direct `python -m pytest` without relying on import
-# order alone.
+# over this tree when pytest is launched via Make from a git worktree. Bare
+# `python -m pytest` (no Make / no PYTHONPATH) can still hit a wrong-tree
+# editable; that path is not covered here (conftest/pyproject pythonpath are
+# mechanical-gate surfaces for a follow-up).
 test-engine:
 	PYTHONPATH=src:$$PYTHONPATH $(VENV_PY) -m pytest $(ENGINE_PYTEST)
 

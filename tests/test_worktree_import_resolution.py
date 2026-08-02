@@ -1,51 +1,68 @@
-"""#258 — pytest must import minni from *this* tree, not an editable main.
+"""#258 — Make-driven pytest must import minni from *this* tree.
 
 Mechanical gate denies edits to ``tests/conftest.py``, so the load-bearing
-contract for CI / ``make check`` is ``PYTHONPATH=src`` (Makefile). This module
-pins that env contract and proves a competing ``minni`` on PYTHONPATH loses when
-this tree's ``src`` is prepended the same way Make does.
+contract for ``make test-engine`` / ``make check`` / ``make coverage-engine`` is
+``PYTHONPATH=src`` in the Makefile recipes. This module pins that contract
+(fail-closed on Makefile text) and proves a competing ``minni`` on PYTHONPATH
+loses when this tree's ``src`` is prepended the same way Make does.
+
+Bare ``python -m pytest`` without Make (or without PYTHONPATH=src) can still
+resolve an editable install from another checkout — that is outside this PR's
+non-conftest surface; agents should use the Make targets above.
 """
 
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
 import textwrap
 from pathlib import Path
 
-import pytest
-
-
 REPO_ROOT = Path(__file__).resolve().parent.parent
 REPO_SRC = (REPO_ROOT / "src").resolve()
+MAKEFILE = REPO_ROOT / "Makefile"
+
+# Targets whose recipes must prepend this tree's src (#258).
+_PYTHONPATH_PINNED_TARGETS = ("test-engine", "coverage-engine", "check")
 
 
-def test_makefile_pythonpath_contract_in_this_process():
-    """When Make exports PYTHONPATH=src, import resolves under this tree.
+def _recipe_block(makefile_text: str, target: str) -> str:
+    """Return tab-indented recipe lines for a simple Make target.
 
-    Bare pytest without PYTHONPATH may still hit an editable install — that is
-    outside this PR's non-conftest surface; agents should use ``make test-engine``.
+    Matches ``target:`` (with optional prerequisites) then consecutive recipe
+    lines (tab-prefixed). Stops at the next non-recipe line.
     """
-    pythonpath = os.environ.get("PYTHONPATH", "")
-    parts = [Path(p).resolve() for p in pythonpath.split(os.pathsep) if p]
-    if REPO_SRC not in parts:
-        pytest.skip(
-            "PYTHONPATH does not include this tree's src/ — run via "
-            "`make test-engine` / `make check` (the #258 contract)"
-        )
-    import minni
-
-    package_file = Path(minni.__file__).resolve()
-    assert str(package_file).startswith(str(REPO_SRC) + os.sep), (
-        f"minni.__file__={package_file} is not under {REPO_SRC} despite "
-        f"PYTHONPATH containing it (PYTHONPATH={pythonpath!r})"
+    pattern = re.compile(
+        rf"(?m)^{re.escape(target)}:[^\n]*\n((?:[ \t].*\n|\n)*)"
     )
+    match = pattern.search(makefile_text)
+    assert match is not None, f"Makefile missing target {target!r}"
+    return match.group(1)
+
+
+def test_makefile_pythonpath_src_contract():
+    """Fail closed if Make drops PYTHONPATH=src from the #258 test targets.
+
+    Does **not** skip when the current process lacks PYTHONPATH — that fails
+    open and lets the suite stay green after the contract is removed. The pin
+    is the Makefile recipe text itself.
+    """
+    text = MAKEFILE.read_text(encoding="utf-8")
+    for target in _PYTHONPATH_PINNED_TARGETS:
+        recipe = _recipe_block(text, target)
+        assert "PYTHONPATH=src" in recipe, (
+            f"Makefile target {target!r} must set PYTHONPATH=src in its recipe "
+            f"(#258 worktree import contract). Recipe was:\n{recipe!r}"
+        )
 
 
 def test_pythonpath_src_wins_over_competing_minni(tmp_path):
-    """Simulated wrong-tree: fake minni ahead of empty path still loses when
-    this tree's src is first on PYTHONPATH (Make's prepend order).
+    """Simulated wrong-tree: fake minni loses when this tree's src is first.
+
+    Self-supplies PYTHONPATH the same way Make does; does not read the Makefile
+    (that pin is ``test_makefile_pythonpath_src_contract``).
     """
     fake = tmp_path / "fake_site"
     (fake / "minni").mkdir(parents=True)
