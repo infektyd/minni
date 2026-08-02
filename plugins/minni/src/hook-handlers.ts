@@ -422,13 +422,17 @@ export interface AgentHookHandlers {
 
 /**
  * Path-only compact harvest (no `source`, non-empty transcript path) is
- * **opt-in**. Default off so a new host that always attaches a path and never
- * sends `source` (agy/gemini shape) does not rediscover the every-cold-boot
- * tail-read tax. Only runtimes known to omit `source` *and* possibly emit
- * Claude-shaped `isCompactSummary` entries are listed.
- * Matched against `config.runtime ?? config.agentId`.
+ * **opt-in**. Default off so a host that always attaches a path and never
+ * sends `source` (agy/gemini shape, and any unverified host) does not
+ * rediscover the every-cold-boot tail-read tax.
+ *
+ * Empty by design until a live transcript is verified Claude-shaped
+ * (`isCompactSummary: true`). Cursor's contract explicitly warns not to mine
+ * `transcript_path` blind; codex / grok-build shapes are also unverified for
+ * this extractor. Universal `source === "compact" | "resume"` still harvests
+ * on every runtime. Matched against `config.runtime ?? config.agentId`.
  */
-const PATH_ONLY_COMPACT_HARVEST_ALLOW = new Set(["codex", "cursor", "grok-build"]);
+const PATH_ONLY_COMPACT_HARVEST_ALLOW = new Set<string>([]);
 
 /** Explicit wait caps for SessionStart harvest (ms). Tighter for path-only —
  * that residual is almost always a miss and must not burn the boot budget

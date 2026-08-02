@@ -146,9 +146,11 @@ test("shared SessionStart skips harvest on cold boot with non-compact source + p
   );
 });
 
-// Platforms that omit `source` entirely still need the path-only signal —
-// but only when the runtime is on the path-only allowlist (codex/cursor/…).
-test("shared SessionStart harvests when transcript_path is the only signal", async () => {
+// Path-only allowlist is empty until a live transcript is verified
+// Claude-shaped. Codex/cursor/grok-build omit-source boots must not blind-mine
+// transcript_path (Cursor contract: "do not mine it blind"). Universal
+// compact|resume source gate still harvests (covered above/below).
+test("shared SessionStart skips path-only harvest on codex (allowlist empty / unverified)", async () => {
   const vault = await tmpVault();
   const file = await tmpTranscript([
     transcriptLine({ type: "user", message: { role: "user", content: "hello" } }),
@@ -160,9 +162,11 @@ test("shared SessionStart harvests when transcript_path is the only signal", asy
     transcript_path: file,
     // no source
   });
-  const harvested = await listCompactSummaries(vault);
-  assert.equal(harvested.length, 1, "path-only boots must still harvest");
-  assert.equal(harvested[0].platform, "codex");
+  assert.equal(
+    (await listCompactSummaries(vault)).length,
+    0,
+    "codex path-only cold boot must not harvest until shape verified",
+  );
 });
 
 // Path-only is opt-in. Unknown / non-allowlisted runtimes default off so a
@@ -186,6 +190,74 @@ test("shared SessionStart skips path-only harvest on non-allowlisted runtime", a
     (await listCompactSummaries(vault)).length,
     0,
     "non-allowlisted path-only cold boot must not harvest",
+  );
+});
+
+// Cursor: platform contract forbids blind transcript mining; not on allowlist.
+test("shared SessionStart skips path-only harvest on cursor (do not mine transcript blind)", async () => {
+  const vault = await tmpVault();
+  const file = await tmpTranscript([
+    transcriptLine({ type: "user", message: { role: "user", content: "hello" } }),
+    transcriptLine(summaryEntry("uuid-cursor-path-only", SUMMARY_TEXT)),
+  ]);
+  const handlers = sharedHandlers(vault, {
+    agentId: "cursor",
+    runtime: "cursor",
+    auditPrefix: "hook_cursor",
+  });
+  await handlers.handleSessionStart({
+    session_id: "s-cursor-path-only",
+    transcript_path: file,
+  });
+  assert.equal(
+    (await listCompactSummaries(vault)).length,
+    0,
+    "cursor path-only cold boot must not harvest / mine transcript",
+  );
+});
+
+// Explicit compact source still harvests on cursor (universal source gate).
+test("shared SessionStart harvests on cursor when source is compact", async () => {
+  const vault = await tmpVault();
+  const file = await tmpTranscript([
+    transcriptLine({ type: "user", message: { role: "user", content: "hello" } }),
+    transcriptLine(summaryEntry("uuid-cursor-compact", SUMMARY_TEXT)),
+  ]);
+  const handlers = sharedHandlers(vault, {
+    agentId: "cursor",
+    runtime: "cursor",
+    auditPrefix: "hook_cursor",
+  });
+  await handlers.handleSessionStart({
+    session_id: "s-cursor-compact",
+    transcript_path: file,
+    source: "compact",
+  });
+  const harvested = await listCompactSummaries(vault);
+  assert.equal(harvested.length, 1, "cursor compact source must still harvest");
+  assert.equal(harvested[0].platform, "cursor");
+});
+
+// grok-build: same path-only deny (unverified Claude-shaped JSONL).
+test("shared SessionStart skips path-only harvest on grok-build (unverified shape)", async () => {
+  const vault = await tmpVault();
+  const file = await tmpTranscript([
+    transcriptLine({ type: "user", message: { role: "user", content: "hello" } }),
+    transcriptLine(summaryEntry("uuid-grok-path-only", SUMMARY_TEXT)),
+  ]);
+  const handlers = sharedHandlers(vault, {
+    agentId: "grok-build",
+    runtime: "grok-build",
+    auditPrefix: "hook_grok",
+  });
+  await handlers.handleSessionStart({
+    session_id: "s-grok-path-only",
+    transcript_path: file,
+  });
+  assert.equal(
+    (await listCompactSummaries(vault)).length,
+    0,
+    "grok-build path-only cold boot must not harvest until shape verified",
   );
 });
 
