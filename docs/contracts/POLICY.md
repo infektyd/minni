@@ -82,11 +82,15 @@ layouts (including `/home/...` used by the Docker image) are **not** rewritten
 by the current patterns. Within the local installation, full paths are
 preserved for indexing and recall.
 
-### 2.3 Adapter and launchd filenames
+### 2.3 Adapter and launchd filenames (PARTIAL)
 
-Internal infrastructure filenames — daemon socket paths, launchd plist names,
-adapter configuration files — are redacted from cross-process envelopes to
-avoid fingerprinting the local installation.
+Path-shaped socket or file locations under the macOS layouts in §2.2
+(`/Users`, `/Volumes`, `/private`) may be rewritten to `[REDACTED_PATH]` by
+`redaction.py`. Bare infrastructure names — launchd plist basenames
+(e.g. `com.minni.minnid.plist`), bare socket filenames (e.g. `minnid.sock`),
+and non-macOS path forms (e.g. `path=/tmp/minni.db`) — are **not** rewritten
+by the current redactor. This clause does not claim a fingerprinting shield
+for bare adapter/plist/socket names.
 
 ### 2.4 `blocked` privacy level
 

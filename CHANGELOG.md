@@ -16,9 +16,13 @@ pre-1.0: minor versions may contain breaking changes until v1.0.0.
   "AFM never ran / off / failed" and from "tier not invoked". Fail-open
   behavior is unchanged; only observability is added.
 - **POLICY.md §2 redaction contract (#237 / SEC-G7):** docs no longer claim a
-  MUST-redact guarantee for JSON-quoted secrets or all absolute paths. §2.1/§2.2
+  MUST-redact guarantee for JSON-quoted secrets or all absolute paths. §2.1/§2.2/§2.3
   are marked PARTIAL and aligned with `redaction.py` plus
-  `THREAT_MODEL.md` residual language.
+  `THREAT_MODEL.md` residual language; bare plist/socket names are not claimed
+  as rewritten.
+- **Learn-gate unknown AFM verdict fail-open:** non-enumerated classifier
+  returns no longer hard-block with `semanticTier: "ran"`; they fail-open as
+  `unavailable` (credential / prose / unavailable remain explicit).
 
 ## [0.4.1] - 2026-08-01
 

@@ -529,13 +529,17 @@ export async function assessLearningQualityAsync(
     verdict = "unavailable";
   }
 
-  // Fail-open: prose and unavailable leave the regex result unchanged, but
-  // they are no longer byte-identical in the report — `semanticTier` carries
-  // whether the classifier actually examined the spans.
+  // Explicit branches only. Production AFM returns prose | unavailable |
+  // credential; non-enumerated values (runtime-injected classifiers, future
+  // parse drift) must fail-open and report unavailable — never hard-block
+  // under a mislabeled semanticTier: "ran".
   if (verdict === "prose") {
     return { ...base, semanticTier: "ran" };
   }
   if (verdict === "unavailable") {
+    return { ...base, semanticTier: "unavailable" };
+  }
+  if (verdict !== "credential") {
     return { ...base, semanticTier: "unavailable" };
   }
 

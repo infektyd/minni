@@ -330,6 +330,18 @@ test("AFM classifier throw fails open", async () => {
   assert.equal(report.semanticTier, "unavailable");
 });
 
+test("non-enumerated AFM verdict fails open with semanticTier unavailable", async () => {
+  // Defensive: untyped JS injectors / future parse drift must not hard-block
+  // under a mislabeled semanticTier: "ran".
+  const report = await assessLearningQualityAsync(
+    { ...GOOD_INPUT, content: pad("password: correct horse battery staple") },
+    { classifyInconclusive: async () => "maybe-secret" },
+  );
+  assert.equal(report.ok, true, "unknown verdict must fail-open");
+  assert.equal(report.semanticTier, "unavailable");
+  assert.ok(!report.warnings.some((w) => w.includes("sensitive material")));
+});
+
 test("semanticTier distinguishes prose-cleared from unavailable/throw (#237 SEC-G6)", async () => {
   // Reproduction from issue #237: same input, four injected verdicts — three
   // non-blocking outcomes were previously byte-identical in every field.
