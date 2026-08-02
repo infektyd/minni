@@ -1680,6 +1680,151 @@ def test_durable_refresh_survives_an_ensure_that_missed_its_rows(tmp_path, monke
         eng.db.close()
 
 
+# ── Round 12: findings from the eleventh Grok review of #256 ───────────────
+
+
+def test_draft_review_is_not_drowned_by_the_expired_backlog(tmp_path, monkeypatch):
+    """Grok round 12 #1. `expired` piggy-backed on include_drafts: the skip
+    only ran when include_drafts was False, so the first live sweep — which
+    creates ~900 expired pages — turned draft review into a black hole.
+    Chronological is the worst case: ascending age puts the months-old expired
+    backlog first, and limit=5 returned five expired, zero active drafts.
+    expired is terminal and needs its own include_expired flag."""
+    from minni.index_all import index_shared_vault
+
+    _install_fake_embedder(monkeypatch)
+    cfg = _make_cfg(tmp_path)
+    vault = Path(cfg.vault_path)
+
+    for i in range(60):
+        _write_page(vault / "wiki" / "concepts" / f"exp{i}.md", "expired",
+                    "quantum widget calibration " * 12)
+    for i in range(3):
+        _write_page(vault / "wiki" / "concepts" / f"live{i}.md", "draft",
+                    "quantum widget calibration under review " * 12)
+    index_shared_vault(cfg)
+
+    # The expired backlog is the OLDEST, exactly as on the live install.
+    conn = sqlite3.connect(cfg.db_path)
+    try:
+        conn.execute(
+            "UPDATE documents SET indexed_at = 1000 WHERE page_status = 'expired'"
+        )
+        conn.execute(
+            "UPDATE documents SET indexed_at = 9999999999 WHERE page_status = 'draft'"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    eng = _engine(cfg)
+    try:
+        eng.config.reranker_enabled = False
+        results = eng.retrieve(
+            "quantum widget calibration", limit=5, sort="chronological",
+            include_drafts=True,
+        )
+        assert results, "draft review returned nothing at all"
+        states = [r.get("review_state") for r in results]
+        assert "expired" not in states, (
+            f"include_drafts admitted the expired backlog: {states}"
+        )
+        assert any(s == "draft" for s in states), (
+            f"no active draft made the window: {states}"
+        )
+
+        # The backlog stays reachable, but only on explicit request.
+        tombs = eng.retrieve(
+            "quantum widget calibration", limit=5, sort="chronological",
+            include_drafts=True, include_expired=True,
+        )
+        assert any(r.get("review_state") == "expired" for r in tombs), (
+            "include_expired=True cannot reach expired pages"
+        )
+    finally:
+        eng.db.close()
+
+
+def test_writer_status_counts_frontmatter_drafts_only(tmp_path):
+    """Grok round 12 #2. The pending count gated on whole-file substrings
+    while expiry became frontmatter-only, so a page whose body quotes another
+    draft's frontmatter kept counting as pending after expiry flipped its real
+    status — health reporting a backlog the expiry engine had drained."""
+    from minni.afm_writer import writer_status
+
+    wiki = tmp_path / "wiki" / "concepts"
+    wiki.mkdir(parents=True)
+    # Expired page whose body quotes a draft's frontmatter. The counter and
+    # the expiry engine must agree this is NOT pending.
+    (wiki / "expired-quoting.md").write_text(
+        "---\ntitle: t\nstatus: expired\nagent: afm-loop\n"
+        "created: '2026-01-01T00:00:00Z'\n---\n\n"
+        "The original read:\n\n    status: draft\n    agent: afm-loop\n",
+        encoding="utf-8",
+    )
+    # One real draft, so the count has a truth to report.
+    (wiki / "real-draft.md").write_text(
+        "---\ntitle: r\nstatus: draft\nagent: afm-loop\n"
+        "created: '2026-07-01T00:00:00Z'\n---\n\nbody\n",
+        encoding="utf-8",
+    )
+
+    status = writer_status(str(tmp_path))
+    assert status["drafts_pending"] == 1, (
+        f"pending counted body prose as frontmatter: {status['drafts_pending']}"
+    )
+
+
+def test_endorse_refuses_a_page_that_is_no_longer_a_draft(tmp_path):
+    """Grok round 12 #3 (Low). endorse_draft gated on a whole-file substring
+    and rewrote the FIRST occurrence. A page already expired (or endorsed)
+    whose body quotes `status: draft` was treated as an active draft: the
+    body prose got rewritten, success was reported, and the frontmatter never
+    changed. Endorse must decide and rewrite frontmatter-only, like expiry."""
+    from minni.afm_writer import (
+        _FM_DRAFT_STATUS,
+        _extract_frontmatter,
+        _write_one,
+        endorse_draft,
+    )
+    import pytest
+
+    vault = tmp_path / "vault"
+    quoted_body = "As the draft said:\n\n    status: draft\n\nend quote."
+
+    # A page whose FM already expired but whose body quotes draft frontmatter.
+    dead = _draft(page_id="page-dead", title="dead one")
+    dead["body"] = quoted_body
+    dead_path = vault / _write_one(vault, dead)["path"]
+    text = dead_path.read_text(encoding="utf-8")
+    fm = _extract_frontmatter(text)
+    dead_path.write_text(
+        _FM_DRAFT_STATUS.sub("status: expired", fm, count=1) + text[len(fm):],
+        encoding="utf-8",
+    )
+    before = dead_path.read_text(encoding="utf-8")
+
+    with pytest.raises(ValueError):
+        endorse_draft(str(vault), "page-dead", "accept")
+    assert dead_path.read_text(encoding="utf-8") == before, (
+        "a refused endorsement still rewrote the page"
+    )
+
+    # Happy path: a REAL draft whose body also quotes `status: draft` gets its
+    # frontmatter endorsed and its body left alone.
+    live = _draft(page_id="page-live", title="live one")
+    live["body"] = quoted_body
+    live_path = vault / _write_one(vault, live)["path"]
+    endorse_draft(str(vault), "page-live", "accept")
+    after = live_path.read_text(encoding="utf-8")
+    after_fm = _extract_frontmatter(after)
+    assert "status: accepted" in after_fm
+    assert "status: draft" not in after_fm
+    assert "status: draft" in after[len(after_fm):], (
+        "endorse rewrote body prose instead of leaving it alone"
+    )
+
+
 # ── Round 11: findings from the tenth Grok review of #256 ──────────────────
 
 

@@ -552,13 +552,19 @@ def writer_status(
                 # A draft we cannot read is not a draft we know to be fine.
                 unreadable += 1
                 continue
-            if "status: draft" in text and "agent: afm-loop" in text:
+            # Gate on the frontmatter block only, with the SAME predicates the
+            # expiry engine uses. The whole-file substring test counted a page
+            # whose body merely quotes another draft's frontmatter — so after
+            # expiry flips the real status to `expired`, the pending count
+            # kept reporting a backlog the expiry engine had already drained.
+            frontmatter = _extract_frontmatter(text)
+            if (_FM_DRAFT_STATUS.search(frontmatter)
+                    and _FM_AFM_AGENT.search(frontmatter)):
                 pending += 1
                 # Search only the frontmatter block (between the leading `---`
                 # fences), not the whole file: a draft's body is free-form prose
                 # and may itself contain the substring "created:", which must
                 # not be read as the draft's own creation date.
-                frontmatter = _extract_frontmatter(text)
                 # The value is yaml.safe_dump'd, so it arrives quoted:
                 # `created: '2026-06-20T00:07:39Z'`. The unquoted-only pattern
                 # matched nothing, which is why drafts_pending_oldest was null
@@ -610,9 +616,16 @@ def endorse_draft(vault_path: str, page_id: str, decision: str) -> dict:
     status = {"accept": "accepted", "reject": "rejected", "edit": "edit_requested"}[decision]
     with _page_lock(page_id):
         text = target.read_text(encoding="utf-8")
-        if "status: draft" not in text:
+        # Decide from the frontmatter block only, and rewrite inside it — the
+        # same contract as _expire_stale_drafts, which shares this lock. The
+        # whole-file test accepted a page whose FM was already expired (or
+        # endorsed) as long as its body quoted "status: draft" somewhere, and
+        # then rewrote that body prose while reporting success.
+        frontmatter = _extract_frontmatter(text)
+        if not _FM_DRAFT_STATUS.search(frontmatter):
             raise ValueError(f"page is not an active draft: {page_id}")
-        target.write_text(text.replace("status: draft", f"status: {status}", 1), encoding="utf-8")
+        rewritten = _FM_DRAFT_STATUS.sub(f"status: {status}", frontmatter, count=1)
+        target.write_text(rewritten + text[len(frontmatter):], encoding="utf-8")
     rel = target.relative_to(vault)
     result = {"status": status, "page_id": page_id, "path": str(rel), "decision": decision}
     _append_audit(vault, "afm_endorse", f"{decision}: {page_id}", result)

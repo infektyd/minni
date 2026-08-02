@@ -2288,6 +2288,7 @@ class RetrievalEngine:
         include_superseded: bool = False,
         include_rejected: bool = False,
         include_drafts: bool = False,
+        include_expired: bool = False,
         backend=None,
         layers: Optional[Sequence[str]] = None,
         sort: Literal["semantic", "chronological"] = "semantic",
@@ -2367,6 +2368,7 @@ class RetrievalEngine:
                     include_superseded=include_superseded,
                     include_rejected=include_rejected,
                     include_drafts=include_drafts,
+                    include_expired=include_expired,
                     backend=backend,
                     layers=layers,
                     sort=sort,
@@ -2496,6 +2498,12 @@ class RetrievalEngine:
             skip_statuses.add("rejected")
         if not include_drafts:
             skip_statuses.add("draft")
+        # expired is terminal (same bucket as rejected in _recommended_action)
+        # and gets its own flag: piggy-backing on include_drafts meant that
+        # once expiry actually ran, a draft-review call drowned in the months-
+        # old expired backlog — chronological order is ascending by age, so
+        # the backlog fills the window before any active draft.
+        if not include_expired:
             skip_statuses.add("expired")
         skip_list = sorted(skip_statuses)
 
