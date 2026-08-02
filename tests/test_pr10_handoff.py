@@ -1,5 +1,6 @@
 import json
 import os
+import threading
 import types
 from pathlib import Path
 
@@ -397,7 +398,12 @@ def test_list_pending_handoffs_fails_loud_on_db_error(monkeypatch, tmp_path):
 
 
 def test_await_handoff_fails_loud_on_db_error_not_timeout(monkeypatch, tmp_path):
-    """PLUMB-T7: await must not burn its timeout when the lease store is broken."""
+    """PLUMB-T7: broken store + no file ack → -32000 after wait, not status=timeout.
+
+    Dual-channel: we still poll the file channel until the deadline (recipient
+    may ack mid-wait). Only after the wait expires with no terminal file ack
+    do we fail loud — never collapse to a silent timeout.
+    """
     _patch_handoff_db(monkeypatch, tmp_path)
     monkeypatch.setattr(
         minnid, "_lazy_writeback", lambda: types.SimpleNamespace(db=_BrokenHandoffDB())
@@ -408,12 +414,14 @@ def test_await_handoff_fails_loud_on_db_error_not_timeout(monkeypatch, tmp_path)
         json.dumps({"claude-code": str(recipient)}),
     )
 
+    started = time.monotonic()
     response = minnid._dispatch_sync({
         "jsonrpc": "2.0",
         "id": 2312,
         "method": "minni_await_handoff",
-        "params": {"lease_id": "lease-whatever", "timeout_ms": 5000},
+        "params": {"lease_id": "lease-whatever", "timeout_ms": 150},
     })
+    elapsed = time.monotonic() - started
 
     assert "error" in response, (
         "store failure must not degrade to a silent timeout: "
@@ -423,6 +431,8 @@ def test_await_handoff_fails_loud_on_db_error_not_timeout(monkeypatch, tmp_path)
     assert response["error"]["code"] == -32000
     assert "handoff lease store failed" in response["error"]["message"]
     assert "reading lease" in response["error"]["message"]
+    # Must have waited roughly the timeout (file-channel poll), not fail-fast (~0).
+    assert elapsed >= 0.12, f"expected ~timeout wait, got {elapsed:.3f}s"
 
 
 def test_list_pending_handoffs_uses_file_channel_when_db_broken(monkeypatch, tmp_path):
@@ -501,6 +511,68 @@ def test_await_handoff_uses_file_ack_when_db_broken(monkeypatch, tmp_path):
     assert result["lease_id"] == lease_id
     assert result["status"] == "accepted"
     assert result["acked_at"] == "2026-08-02T12:00:00Z"
+
+
+def test_await_handoff_polls_file_channel_until_ack_when_db_broken(monkeypatch, tmp_path):
+    """Dual-channel: broken DB + pending packet; ack lands mid-wait → accepted.
+
+    Must not -32000 on the first HandoffStoreError while the file lease is still
+    pending — keep polling until deadline (mirrors list dual-channel).
+    """
+    _patch_handoff_db(monkeypatch, tmp_path)
+    sender = tmp_path / "codex-vault"
+    recipient = tmp_path / "claudecode-vault"
+    outbox = sender / "outbox"
+    outbox.mkdir(parents=True)
+    lease_id = "handoff-file-ack-mid-wait"
+    packet_path = outbox / f"{lease_id}.json"
+    pending = {
+        "lease_id": lease_id,
+        "from_agent": "codex",
+        "to_agent": "claude-code",
+        "task": "file-channel mid-wait",
+        "requires_ack": True,
+    }
+    packet_path.write_text(json.dumps(pending), encoding="utf-8")
+    monkeypatch.setenv(
+        "MINNI_AGENT_VAULTS",
+        json.dumps({"codex": str(sender), "claude-code": str(recipient)}),
+    )
+    monkeypatch.setattr(
+        minnid, "_lazy_writeback", lambda: types.SimpleNamespace(db=_BrokenHandoffDB())
+    )
+
+    def _ack_after_delay() -> None:
+        time.sleep(0.08)
+        acked = {
+            **pending,
+            "ack_status": "accepted",
+            "acked_at": "2026-08-02T12:30:00Z",
+        }
+        packet_path.write_text(json.dumps(acked), encoding="utf-8")
+
+    writer = threading.Thread(target=_ack_after_delay, daemon=True)
+    writer.start()
+    try:
+        started = time.monotonic()
+        response = minnid._dispatch_sync({
+            "jsonrpc": "2.0",
+            "id": 2315,
+            "method": "minni_await_handoff",
+            "params": {"lease_id": lease_id, "timeout_ms": 2000},
+        })
+        elapsed = time.monotonic() - started
+    finally:
+        writer.join(timeout=2.0)
+
+    assert "error" not in response, f"mid-wait file ack must succeed: {response!r}"
+    result = response["result"]
+    assert result["lease_id"] == lease_id
+    assert result["status"] == "accepted"
+    assert result["acked_at"] == "2026-08-02T12:30:00Z"
+    # Must have waited for the mid-wait write, not returned immediately with -32000.
+    assert elapsed >= 0.05, f"expected poll delay, got {elapsed:.3f}s"
+    assert elapsed < 1.5, f"should return soon after mid-wait ack, got {elapsed:.3f}s"
 
 
 def test_pending_handoff_leases_raises_handoff_store_error(monkeypatch, tmp_path):

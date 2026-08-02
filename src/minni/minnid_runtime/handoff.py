@@ -737,17 +737,16 @@ async def handle_await_handoff(params: dict, request_id: Any, context: HandoffCo
         return context.make_error(-32602, "lease_id is required", request_id)
     timeout_ms = max(0, min(int(params.get("timeout_ms", 30000)), 300000))
     deadline = time.time() + (timeout_ms / 1000.0)
+    # Dual-channel: a broken SQLite read must not abort file-channel waiting.
+    # Remember the store failure, keep polling _file_channel_terminal_ack until
+    # deadline, then fail-loud with -32000 (not status=timeout / PLUMB-T7).
+    store_error: Optional[HandoffStoreError] = None
     while True:
         try:
             lease = handoff_lease_status(lease_id, context=context)
         except HandoffStoreError as exc:
-            # Dual-channel (mirror lease_to_agent): terminal ack may already be on disk.
-            # Fail-loud only when the file channel also has nothing terminal — do not
-            # spin the full timeout pretending the lease is merely unknown.
-            file_ack = _file_channel_terminal_ack(lease_id, context=context)
-            if file_ack is not None:
-                return context.make_response(file_ack, request_id)
-            return context.make_error(-32000, str(exc), request_id)
+            store_error = exc
+            lease = None
         if lease is not None and lease.get("status") not in {None, "pending"}:
             return context.make_response({
                 "lease_id": lease_id,
@@ -757,5 +756,7 @@ async def handle_await_handoff(params: dict, request_id: Any, context: HandoffCo
         if file_ack is not None:
             return context.make_response(file_ack, request_id)
         if time.time() >= deadline:
+            if store_error is not None:
+                return context.make_error(-32000, str(store_error), request_id)
             return context.make_response({"lease_id": lease_id, "status": "timeout"}, request_id)
         await asyncio.sleep(0.05)
