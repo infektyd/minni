@@ -417,34 +417,39 @@ class FAISSIndex:
 
         faiss_index, chunk_ids, vectors = result
 
-        if faiss_index is not None:
-            # Restore from FAISS index: rebuild id maps from chunk_id_order
-            self._index = faiss_index
-            self._chunk_ids = list(chunk_ids)
-            self._id_map = {i: cid for i, cid in enumerate(chunk_ids)}
-            self._reverse_map = {cid: i for i, cid in enumerate(chunk_ids)}
-            # We do not have raw vectors; set to empty (rebuild will re-load if needed)
-            self._vectors = []
-            quantization = getattr(self.config, "embedding_quantization", "fp32")
-            if quantization == "int8" and hasattr(faiss_index, "hnsw"):
-                self._current_type = "hnsw-sq-int8"
-            elif quantization == "int8":
-                self._current_type = "sq-int8"
-            else:
-                self._current_type = "flat" if not hasattr(faiss_index, "hnsw") else "hnsw"
-            logger.info(
-                "FAISS index restored from disk cache: %d vectors", len(chunk_ids)
-            )
-            return True
+        # Hold the lock for the whole restore: concurrent searches (e.g. after
+        # invalidate() triggers a reload) must never observe a half-applied
+        # index/id-map state. _lock is an RLock, so build_from_vectors below
+        # re-acquiring it is fine.
+        with self._lock:
+            if faiss_index is not None:
+                # Restore from FAISS index: rebuild id maps from chunk_id_order
+                self._index = faiss_index
+                self._chunk_ids = list(chunk_ids)
+                self._id_map = {i: cid for i, cid in enumerate(chunk_ids)}
+                self._reverse_map = {cid: i for i, cid in enumerate(chunk_ids)}
+                # We do not have raw vectors; set to empty (rebuild will re-load if needed)
+                self._vectors = []
+                quantization = getattr(self.config, "embedding_quantization", "fp32")
+                if quantization == "int8" and hasattr(faiss_index, "hnsw"):
+                    self._current_type = "hnsw-sq-int8"
+                elif quantization == "int8":
+                    self._current_type = "sq-int8"
+                else:
+                    self._current_type = "flat" if not hasattr(faiss_index, "hnsw") else "hnsw"
+                logger.info(
+                    "FAISS index restored from disk cache: %d vectors", len(chunk_ids)
+                )
+                return True
 
-        if vectors:
-            # numpy fallback: have raw vectors, rebuild index from them
-            arr = np.array(vectors, dtype=np.float32)
-            self.build_from_vectors(list(chunk_ids), arr)
-            logger.info(
-                "FAISS index rebuilt from numpy cache: %d vectors", len(chunk_ids)
-            )
-            return True
+            if vectors:
+                # numpy fallback: have raw vectors, rebuild index from them
+                arr = np.array(vectors, dtype=np.float32)
+                self.build_from_vectors(list(chunk_ids), arr)
+                logger.info(
+                    "FAISS index rebuilt from numpy cache: %d vectors", len(chunk_ids)
+                )
+                return True
 
         return False
 

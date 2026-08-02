@@ -1223,3 +1223,155 @@ def test_idle_sweep_skips_the_faiss_rebuild(tmp_path, monkeypatch):
     _write_page(page, "accepted", "new body text " * 40)
     index_shared_vault(cfg)
     assert calls, "a sweep that indexed a new page skipped the rebuild"
+
+
+def test_dual_hit_prefers_the_semantic_chunk_over_the_fts_full_page(tmp_path, monkeypatch):
+    """Grok round 8 #1. The hollow-hit fix gave _fts_search the whole file
+    (frontmatter first) as chunk_text. Both RRF merges filled chunk_text
+    first-non-empty-wins and the FTS stream runs first, so on the common
+    dual-hit path the full page permanently shadowed the semantic chunk:
+    re-ranker, envelope, and budget all ran on multi-KB YAML-led text."""
+    _install_fake_embedder(monkeypatch)
+    cfg = _make_cfg(tmp_path)
+    eng = _engine(cfg)
+    try:
+        full_page = "---\ntitle: t\nstatus: accepted\n---\n\n" + "body words " * 400
+        chunk = "the matching passage of the accepted page"
+        base = {"doc_id": 1, "path": "a.md", "agent": "afm-loop", "sigil": "s",
+                "page_status": "accepted"}
+        fts = [{**base, "chunk_text": full_page}]
+        sem = [{**base, "chunk_text": chunk, "heading_context": "## H"}]
+        extra = [{**base, "chunk_text": "extra backend chunk"}]
+
+        merged = eng._rrf_merge(fts, sem, limit=5)
+        assert merged[0]["chunk_text"] == chunk, "FTS full page shadowed the semantic chunk"
+        assert merged[0]["heading_context"] == "## H"
+
+        multi = eng._rrf_merge_multi(fts, sem, [extra], limit=5)
+        assert multi[0]["chunk_text"] == chunk, (
+            "multi-merge let the FTS full page shadow the semantic chunk"
+        )
+        assert "_sem_chunk" not in multi[0], "internal merge flag leaked into results"
+
+        # An extra backend stream must also beat the FTS dump when it is the
+        # only semantic stream that saw the doc.
+        extra_wins = eng._rrf_merge_multi(fts, [], [extra], limit=5)
+        assert extra_wins[0]["chunk_text"] == "extra backend chunk"
+
+        # The FTS full file stays as the fallback body for unembedded rows.
+        fts_only = eng._rrf_merge(fts, [], limit=5)
+        assert fts_only[0]["chunk_text"] == full_page
+        fts_only_multi = eng._rrf_merge_multi(fts, [], [], limit=5)
+        assert fts_only_multi[0]["chunk_text"] == full_page
+    finally:
+        eng.db.close()
+
+
+def test_dual_hit_limit_still_fills_under_the_default_budget(tmp_path, monkeypatch):
+    """Grok round 8 #1, end to end. Five multi-KB accepted pages that dual-hit
+    FTS and FAISS: with the full page shadowing the chunk, ~1.6k-token pages
+    exhaust the 4096-token default budget after two hits, so a limit=5 caller
+    silently gets a fraction of what they asked for."""
+    from minni.index_all import index_shared_vault
+
+    _install_fake_embedder(monkeypatch)
+    cfg = _make_cfg(tmp_path)
+    vault = Path(cfg.vault_path)
+    for i in range(5):
+        _write_page(vault / "wiki" / "concepts" / f"big{i}.md", "accepted",
+                    f"unique{i} " + "quantum widget calibration lore " * 300)
+    index_shared_vault(cfg)
+
+    eng = _engine(cfg)
+    try:
+        eng.config.reranker_enabled = False
+        # Preconditions: BOTH legs see every page, or the dual-hit path is not
+        # actually exercised and the assertions below are vacuous.
+        fts = eng._fts_search("quantum widget calibration", 20,
+                              exclude_statuses=["draft", "expired"])
+        sem = eng._semantic_search("quantum widget calibration", 5)
+        assert len({r["doc_id"] for r in fts}) == 5, "FTS leg missed pages"
+        assert len({r["doc_id"] for r in sem}) == 5, "semantic leg missed pages"
+
+        hits = eng.retrieve("quantum widget calibration", limit=5)
+        assert len(hits) == 5, (
+            f"limit=5 returned {len(hits)} hits: full-page bodies exhausted "
+            "the context budget"
+        )
+    finally:
+        eng.db.close()
+
+
+def test_faiss_disk_reload_is_atomic_against_concurrent_search(tmp_path):
+    """Grok round 8 #2. try_load_from_disk assigned _index/_chunk_ids/_id_map/
+    _reverse_map/_vectors without _lock. The invalidate() path this PR put on
+    the vault-watch thread makes that live: the sweep invalidates, an RPC
+    search sees count==0 and reloads from disk while another search resolves
+    internal indices against the half-applied maps."""
+    import sqlite3 as sql
+    import threading
+
+    import numpy as np
+    from minni.config import SovereignConfig
+    from minni.faiss_index import FAISSIndex
+
+    cfg = SovereignConfig(
+        db_path=str(tmp_path / "s" / "m.db"), vault_path=str(tmp_path / "vault"),
+        graph_export_dir=str(tmp_path / "g"), faiss_index_path=str(tmp_path / "f.faiss"),
+        writeback_enabled=False,
+    )
+    # A minimal chunk_embeddings table gives save and load the same stable
+    # checksum, so try_load_from_disk always reaches the restore path.
+    db_file = tmp_path / "checksum.db"
+    conn = sql.connect(str(db_file))
+    conn.execute("CREATE TABLE chunk_embeddings (chunk_id INTEGER, computed_at REAL)")
+    conn.commit()
+
+    idx = FAISSIndex(cfg)
+    n = 400
+    ids = list(range(1, n + 1))
+    known = set(ids)
+    vecs = np.random.rand(n, cfg.embedding_dim).astype(np.float32)
+    idx.build_from_vectors(ids, vecs)
+    assert idx.save_to_disk(conn), "disk save failed; cannot exercise the reload path"
+
+    errors = []
+    stop = threading.Event()
+
+    def searcher():
+        q = np.random.rand(cfg.embedding_dim).astype(np.float32)
+        while not stop.is_set():
+            try:
+                for cid, _ in idx.search(q, top_k=10):
+                    if cid not in known:
+                        errors.append(f"unknown chunk_id {cid}")
+            except Exception as exc:
+                errors.append(repr(exc))
+
+    def reloader():
+        local = sql.connect(str(db_file))
+        try:
+            while not stop.is_set():
+                try:
+                    idx.try_load_from_disk(local)
+                except Exception as exc:
+                    errors.append(repr(exc))
+        finally:
+            local.close()
+
+    threads = [threading.Thread(target=searcher) for _ in range(3)]
+    threads += [threading.Thread(target=reloader) for _ in range(2)]
+    for t in threads:
+        t.start()
+    try:
+        # The path invalidate() made live: sweep invalidates, searches go
+        # empty, reload threads race each other and the searches.
+        for _ in range(40):
+            idx.invalidate()
+            idx.try_load_from_disk(conn)
+    finally:
+        stop.set()
+        for t in threads:
+            t.join(timeout=10)
+
+    assert not errors, f"concurrent disk reload tore the index: {errors[:5]}"

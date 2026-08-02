@@ -1394,8 +1394,10 @@ class RetrievalEngine:
             doc_scores[did]["rrf_score"] += self.config.semantic_weight / (k + rank)
             if doc_scores[did]["sem_rank"] is None:
                 doc_scores[did]["sem_rank"] = rank
-            # Carry forward chunk_text from semantic results (FTS doesn't have it)
-            if r.get("chunk_text") and not doc_scores[did].get("chunk_text"):
+            # Prefer the semantic chunk over FTS full-page content: FTS now
+            # carries the whole file (frontmatter first) as a fallback body,
+            # which must not shadow the matching passage on dual hits.
+            if r.get("chunk_text"):
                 doc_scores[did]["chunk_text"] = r["chunk_text"]
                 doc_scores[did]["heading_context"] = r.get("heading_context", "")
             # Carry forward page metadata from semantic if FTS didn't provide it
@@ -1806,9 +1808,14 @@ class RetrievalEngine:
                     doc_scores[did]["fts_rank"] = rank
                 elif stream_label == "sem" and doc_scores[did]["sem_rank"] is None:
                     doc_scores[did]["sem_rank"] = rank
-                if r.get("chunk_text") and not doc_scores[did].get("chunk_text"):
+                # Semantic streams overwrite FTS full-page content (the FTS
+                # body is only a fallback for unembedded rows); the first
+                # semantic stream to land keeps its chunk.
+                if r.get("chunk_text") and not doc_scores[did].get("_sem_chunk"):
                     doc_scores[did]["chunk_text"] = r["chunk_text"]
                     doc_scores[did]["heading_context"] = r.get("heading_context", "")
+                    if stream_label != "fts":
+                        doc_scores[did]["_sem_chunk"] = True
                 if not doc_scores[did].get("page_type") and r.get("page_type"):
                     doc_scores[did]["page_type"] = r["page_type"]
                 if not doc_scores[did].get("evidence_refs") and r.get("evidence_refs"):
@@ -1824,6 +1831,7 @@ class RetrievalEngine:
             _add_stream(extra, self.config.semantic_weight, "extra")
 
         for d in doc_scores.values():
+            d.pop("_sem_chunk", None)
             self._score_merged_doc(d)
 
         ranked = sorted(doc_scores.values(), key=lambda x: x["final_score"], reverse=True)
