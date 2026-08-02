@@ -319,6 +319,29 @@ test("P5: queued context per session is bounded by volume, not only by session c
   );
 });
 
+test("P5: lastPrompt eviction is reported, not silent", async () => {
+  // Round 15: lastPrompt was a silent while-delete bound; Stop then learned
+  // with empty last_user_message and no P6 surface.
+  const source = await readFile(
+    path.join(PLUGIN_ROOT, "kilo", "minni-plugin.js"),
+    "utf8",
+  );
+  assert.match(source, /const LAST_PROMPT_MAX = \d+/);
+  const setAt = source.indexOf("lastPrompt.set(");
+  assert.ok(setAt !== -1);
+  const afterSet = source.slice(setAt, setAt + 350);
+  assert.match(
+    afterSet,
+    /evictOldest\(\s*lastPrompt\s*,\s*LAST_PROMPT_MAX\s*,\s*["']last prompt["']\s*\)/,
+    "lastPrompt overflow must use the same reported eviction path as pending/booted",
+  );
+  assert.doesNotMatch(
+    afterSet,
+    /while\s*\(\s*lastPrompt\.size\s*>\s*LAST_PROMPT_MAX/,
+    "silent while-delete on lastPrompt reopens the P5 hole",
+  );
+});
+
 // ── P6: bridge failures must reach the audit log ───────────────────────────
 
 test("P6: the Kilo bridge reports failures to the audit channel, not just console", async () => {

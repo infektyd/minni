@@ -483,6 +483,17 @@ class RetrievalEngine:
         self._set_degradation_flag("vector", value)
 
     @property
+    def last_hyde_degraded(self) -> Optional[str]:
+        """Round 15 (PR #260): HyDE was triggered but did not complete on THIS
+        thread's last retrieve(). Without this the response envelope could
+        look healthy while enrichment never ran (trace-only signal)."""
+        return self._degradation_flag("hyde")
+
+    @last_hyde_degraded.setter
+    def last_hyde_degraded(self, value: Optional[str]) -> None:
+        self._set_degradation_flag("hyde", value)
+
+    @property
     def model(self):
         """Return the process-wide embedding model singleton."""
         from minni.models import get_embedder
@@ -2641,6 +2652,7 @@ class RetrievalEngine:
         self.last_rerank_degraded = None
         self.last_query_expand_degraded = None
         self.last_vector_degraded = None
+        self.last_hyde_degraded = None
         query_variants = self._resolve_query_variants(query, expand)
         if len(query_variants) > 1:
             total_t0 = time.perf_counter()
@@ -2655,6 +2667,7 @@ class RetrievalEngine:
             variant_rerank_degraded: List[str] = []
             variant_expand_degraded: List[str] = []
             variant_vector_degraded: List[str] = []
+            variant_hyde_degraded: List[str] = []
             for variant in query_variants:
                 per_variant.append(self.retrieve(
                     query=variant,
@@ -2697,6 +2710,10 @@ class RetrievalEngine:
                     variant_vector_degraded.append(
                         f"{variant}: {self.last_vector_degraded}"
                     )
+                if self.last_hyde_degraded:
+                    variant_hyde_degraded.append(
+                        f"{variant}: {self.last_hyde_degraded}"
+                    )
             results = self._merge_expanded_results(per_variant, query_variants, limit)
             # A degrade in ANY variant degrades the merge — the merged ordering
             # mixed a leg that was not reranked. Set AFTER the loop, because the
@@ -2709,6 +2726,9 @@ class RetrievalEngine:
             )
             self.last_vector_degraded = (
                 "; ".join(variant_vector_degraded) if variant_vector_degraded else None
+            )
+            self.last_hyde_degraded = (
+                "; ".join(variant_hyde_degraded) if variant_hyde_degraded else None
             )
             # Aggregate: any variant whose non-empty candidate set was gated to
             # zero keeps the blackout visible, regardless of variant order.
@@ -3069,6 +3089,7 @@ class RetrievalEngine:
                             # bad result that the enrichment ran when it had not.
                             trace["hyde"]["completed"] = False
                             trace["hyde"]["skipped"] = "afm_unavailable"
+                            self.last_hyde_degraded = "afm_unavailable"
                             logger.warning(
                                 "HyDE leg degraded: AFM produced no hypothetical "
                                 "answer — results are the un-enriched first pass"
@@ -3081,6 +3102,7 @@ class RetrievalEngine:
                     trace["hyde"]["completed"] = False
                     trace["hyde"]["skipped"] = "error"
                     trace["hyde"]["error"] = str(exc)
+                    self.last_hyde_degraded = str(exc)[:400]
 
         # G19 gate (below, after status filter) is the single source of truth for visibility.
         # The prior ad-hoc "agent_id or unknown" filter is removed; legacy principal=None

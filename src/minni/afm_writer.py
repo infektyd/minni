@@ -979,9 +979,21 @@ def submit_drafts(job: dict, wait: bool = True, timeout: Optional[float] = 30.0)
                         prior_ev.set()
                     logger.info(
                         "AFM writer: re-applied pending lifecycle for pass %r; "
-                        "accepting new batch",
+                        "NOT enqueueing a second draft batch",
                         pass_name,
                     )
+                    # Round 15: return without put_nowait. Falling through
+                    # enqueued the NEW job's drafts (new page_ids) after the
+                    # first batch already landed — reopening AFM-8 duplicates
+                    # on the recovery path. Candidates are now terminal; the
+                    # next tick will not regenerate the same decision set.
+                    return {
+                        "status": "lifecycle_recovered",
+                        "queue_depth": _WORK_QUEUE.qsize(),
+                        "drafts_written": [],
+                        "drafts_deferred": len(job.get("drafts") or []),
+                        "lifecycle_recovered": True,
+                    }
                 except Exception:
                     global _LIFECYCLE_APPLY_FAILURES, _LAST_LIFECYCLE_APPLY_FAILURE_AT
                     _LIFECYCLE_APPLY_FAILURES += 1

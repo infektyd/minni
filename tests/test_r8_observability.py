@@ -380,6 +380,45 @@ def test_hyde_trace_distinguishes_triggered_from_completed():
     assert 'logger.debug("HyDE skipped after retrieval pass' not in source, (
         "a HyDE failure logged at DEBUG is invisible at normal log levels"
     )
+    assert "last_hyde_degraded" in source, (
+        "HyDE incomplete must set a thread-local flag for the response envelope"
+    )
+
+
+def test_hyde_failure_surfaces_on_search_degradation_envelope():
+    """Round 15: HyDE fail was trace-only; response looked healthy hybrid."""
+    from types import SimpleNamespace
+
+    from minni.minnid_runtime import recall as recall_mod
+
+    class _Engine:
+        config = SimpleNamespace(embedding_model="m")
+        last_vector_degraded = None
+        last_rerank_degraded = None
+        last_query_expand_degraded = None
+        last_hyde_degraded = "afm_unavailable"
+        last_auth_suppression = None
+
+        def retrieve(self, **kwargs):
+            return [{"doc_id": 1, "path": "wiki/a.md"}]
+
+    captured = {}
+    engine = _Engine()
+    context = _make_context(engine, captured)
+    recall_mod.handle_search(
+        {"query": "anything", "scope": "shared"},
+        request_id=1,
+        context=context,
+    )
+    payload = captured["response"]
+    assert payload.get("degraded") is True, (
+        f"HyDE incomplete must mark response degraded, got {payload!r}"
+    )
+    hyde_entries = [
+        d for d in payload.get("degradation") or [] if d.get("hyde_degraded")
+    ]
+    assert hyde_entries, f"expected hyde_degraded in degradation: {payload!r}"
+    assert "afm_unavailable" in str(hyde_entries[0]["hyde_degraded"])
 
 
 def test_query_expansion_failure_is_reachable_from_the_call_site(tmp_path, monkeypatch):
@@ -1210,7 +1249,15 @@ def test_deferred_lifecycle_failure_refuses_resubmit_and_surfaces(monkeypatch):
     assert "consolidation" in afm_writer._PENDING_LIFECYCLE
     assert writes == ["consolidation"]
 
-    # Re-apply succeeds on submit without a second _write_batch.
+    # Round 15: re-apply succeeds and MUST NOT enqueue a second draft batch.
+    put_calls = []
+    real_put = afm_writer._WORK_QUEUE.put_nowait
+
+    def _spy_put(item):
+        put_calls.append(item)
+        return real_put(item)
+
+    monkeypatch.setattr(afm_writer._WORK_QUEUE, "put_nowait", _spy_put)
     second = afm_writer.submit_drafts(
         {
             "pass_name": "consolidation",
@@ -1219,28 +1266,16 @@ def test_deferred_lifecycle_failure_refuses_resubmit_and_surfaces(monkeypatch):
         },
         timeout=0.05,
     )
-    # After re-apply, pending clears and a new batch may proceed (no worker →
-    # write_timeout is fine; lifecycle_pending refuse is not).
+    assert second.get("status") == "lifecycle_recovered"
+    assert second.get("lifecycle_recovered") is True
     assert "consolidation" not in afm_writer._PENDING_LIFECYCLE
     assert len(calls["applied"]) == 1
     assert calls["applied"][0]["promote_candidate_ids"] == [1]
-    # Only the original write — re-apply must not mint a second draft set.
     assert writes == ["consolidation"], f"unexpected writes: {writes}"
-    assert second.get("lifecycle_pending") is not True
-    assert second.get("status") != "write_in_flight", (
-        f"after successful re-apply, submit must not sticky-refuse: {second!r}"
-    )
-    # Prior hold Event must be released so a later submit is not write_in_flight.
+    assert put_calls == [], "re-apply must not enqueue a second draft job"
     assert done.is_set(), "re-apply must clear the sticky in-flight Event"
 
-    # Second submit enqueued a new batch with no worker → still "in flight".
-    # Release that Event so the third submit proves the lifecycle gate (not
-    # ordinary pass-busy de-dupe) is what used to block forever.
-    with afm_writer._IN_FLIGHT_LOCK:
-        mid = afm_writer._IN_FLIGHT_PER_PASS.get("consolidation")
-        if mid is not None and not mid.is_set():
-            mid.set()
-
+    # A later submit (after recovery) may enqueue normally.
     third = afm_writer.submit_drafts(
         {
             "pass_name": "consolidation",
@@ -1253,6 +1288,7 @@ def test_deferred_lifecycle_failure_refuses_resubmit_and_surfaces(monkeypatch):
     assert third.get("status") != "write_in_flight", (
         f"third submit after re-apply must not be refused: {third!r}"
     )
+    assert len(put_calls) == 1, f"third submit should enqueue once: {put_calls!r}"
 
     # Synthetic status surface still names deferred lifecycle when counters say so.
     status, reasons = afm_writer.derive_loop_status(

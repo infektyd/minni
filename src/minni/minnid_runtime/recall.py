@@ -202,6 +202,10 @@ def _degradation_for(retrieval_engine: Any, src: str) -> dict:
     if expand_degraded:
         entry["query_expand_degraded"] = expand_degraded
         entry["degraded"] = True
+    hyde_degraded = getattr(retrieval_engine, "last_hyde_degraded", None)
+    if hyde_degraded:
+        entry["hyde_degraded"] = hyde_degraded
+        entry["degraded"] = True
     return entry
 
 

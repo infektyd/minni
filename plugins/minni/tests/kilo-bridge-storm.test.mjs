@@ -65,9 +65,12 @@ function createStormReporter({ hookScript, logPath }) {
       {
         coalesced_count: totalCount,
         suppressed_since_last_report: suppressedAtFlush,
-        // Zero only on confirmed delivery (exit 0), not on mere spawn.
+        // Subtract the snapshot on delivery (not hard-zero).
         onDelivered: () => {
-          diagnosticsSuppressed = 0;
+          diagnosticsSuppressed = Math.max(
+            0,
+            diagnosticsSuppressed - suppressedAtFlush,
+          );
         },
       },
     );
@@ -279,8 +282,9 @@ test("P6 source: minni-plugin.js wires settle → flushPendingSuppressedFailures
   const settleAt = closeSlice.indexOf("settle()");
   assert.ok(undeliveredAt !== -1 && settleAt !== -1 && undeliveredAt < settleAt,
     "close handler must call undelivered() before settle()");
-  // diagnosticsSuppressed zero only via onDelivered, not on spawn accept.
-  assert.match(source, /onDelivered:\s*\(\)\s*=>\s*\{[^}]*diagnosticsSuppressed\s*=\s*0/s);
+  // diagnosticsSuppressed adjusted only via onDelivered (subtract snapshot).
+  assert.match(source, /onDelivered:\s*\(\)\s*=>\s*\{/s);
+  assert.match(source, /diagnosticsSuppressed\s*-\s*suppressedAtFlush/);
   assert.doesNotMatch(
     source,
     /if \(accepted\) \{\s*diagnosticsSuppressed\s*=\s*0/,

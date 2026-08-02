@@ -251,9 +251,13 @@ function flushPendingSuppressedFailures() {
     {
       coalesced_count: totalCount,
       suppressed_since_last_report: suppressedAtFlush,
-      // Zero only on confirmed delivery (exit 0), not on mere spawn.
+      // Round 15: subtract the snapshot, don't hard-zero — mid-flight
+      // suppressions after this spawn must remain attributed.
       onDelivered: () => {
-        diagnosticsSuppressed = 0;
+        diagnosticsSuppressed = Math.max(
+          0,
+          diagnosticsSuppressed - suppressedAtFlush,
+        );
       },
     },
   );
@@ -478,9 +482,9 @@ const MinniPlugin = async ({ directory, client }) => ({
       // Re-inserting moves it to the end, so the eviction below is LRU-ish.
       lastPrompt.delete(input.sessionID);
       lastPrompt.set(input.sessionID, prompt.slice(0, 400));
-      while (lastPrompt.size > LAST_PROMPT_MAX) {
-        lastPrompt.delete(lastPrompt.keys().next().value);
-      }
+      // Round 15: same reported eviction path as pending/booted — a silent
+      // lastPrompt bound dropped Stop learn-candidate text with no audit.
+      evictOldest(lastPrompt, LAST_PROMPT_MAX, "last prompt");
     }
     const result = await runHookFailOpen("UserPromptSubmit", {
       session_id: input.sessionID,
