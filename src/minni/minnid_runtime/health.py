@@ -287,6 +287,14 @@ def handle_health_report(params: dict, request_id: Any, context: HealthContext) 
         # no paths and no learning text, so it stays outside
         # _HEALTH_REPORT_SENSITIVE_KEYS like vector_backend_lag.
         "embedding_coverage": {},
+        # GA4-1 guardrail: wiring record_score means score_distribution fills
+        # during normal retrieval, and crossing the activation threshold changes
+        # what `confidence` MEANS for every caller (raw blend -> percentile
+        # rank). A feature that switches semantics on a row count with nothing
+        # observable is the silent-degrade class this audit removes, so the
+        # transition is reported. Counts and labels only — no scores — so it
+        # stays outside _HEALTH_REPORT_SENSITIVE_KEYS.
+        "score_calibration": {},
         # W2: last-N dispatch exceptions so a climbing errors.<method> counter is
         # attributable. Sensitive (messages can embed paths/payloads) — redacted
         # to a count for any non-operator caller via _HEALTH_REPORT_SENSITIVE_KEYS.
@@ -335,6 +343,13 @@ def handle_health_report(params: dict, request_id: Any, context: HealthContext) 
             report["embedding_coverage"] = embedding_coverage(db)
         except Exception as exc:
             report["embedding_coverage"] = {"error": str(exc)}
+
+        try:
+            from minni.scoring import calibration_status
+
+            report["score_calibration"] = calibration_status(db)
+        except Exception as exc:
+            report["score_calibration"] = {"error": str(exc)}
 
         with db.cursor() as c:
             c.execute(

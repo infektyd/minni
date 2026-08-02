@@ -270,15 +270,126 @@ class TestScoreCalibrationIsWired:
             "the stored sample must be the raw blend, not the calibrated output"
         )
 
-    def test_retrieval_passes_record_at_the_formatting_site(self):
+    def test_retrieval_actually_records_through_the_public_path(self, tmp_path,
+                                                                monkeypatch,
+                                                                hermetic_principals):
+        """Behavioral, not a source grep: drive the real search RPC and assert
+        score_distribution gained rows. A grep for `record=True` would stay green
+        over dead code."""
+        _engine, db_obj, _cfg = _patch_engine_and_writeback(tmp_path, monkeypatch)
+        body = "the deployment rollback procedure is documented here. " * 20
+        with db_obj.cursor() as c:
+            c.execute(
+                "INSERT INTO documents (path, agent, sigil, layer) "
+                "VALUES ('a.md', 'codex', 'vault', 'knowledge')"
+            )
+            doc_id = c.lastrowid
+            c.execute(
+                "INSERT INTO vault_fts (doc_id, path, content, agent, sigil) "
+                "VALUES (?, 'a.md', ?, 'codex', 'vault')",
+                (doc_id, body),
+            )
+
+        resp = _dispatch("search", {
+            "query": "deployment rollback", "agent_id": "codex", "expand": False,
+        })
+        assert "error" not in resp
+        assert resp["result"]["count"] >= 1, "need a hit for a score to exist"
+
+        with db_obj.cursor() as c:
+            n = c.execute(
+                "SELECT COUNT(*) AS n FROM score_distribution"
+            ).fetchone()["n"]
+        assert n >= 1, (
+            "a real search must feed the calibration window; on the old code "
+            "score_distribution stayed empty forever"
+        )
+
+
+class TestCalibrationActivationIsObservable:
+    """GA4-1 guardrail. Wiring record_score means the window fills during normal
+    retrieval, and crossing the threshold changes what `confidence` MEANS for
+    every caller — raw blend before, percentile rank after. A feature that
+    switches semantics on a row count with nothing observable is the same
+    silent-degrade class this audit exists to remove."""
+
+    def _fill(self, db_obj, n):
+        from minni.scoring import record_score
+
+        for i in range(n):
+            record_score(0.01 * (i + 1), "combined", db_obj)
+
+    def test_pre_activation_confidence_is_the_raw_blend(self, tmp_path):
+        """Below the threshold _calibrate must pass the raw score through."""
+        from minni.scoring import _ACTIVATION_THRESHOLD, calibration_status, compute_confidence
+
+        db_obj, _cfg = _make_db(tmp_path)
+        self._fill(db_obj, _ACTIVATION_THRESHOLD - 1)
+
+        status = calibration_status(db_obj)
+        assert status["active"] is False
+        assert status["confidence_basis"] == "raw_blend"
+        assert status["samples_until_active"] == 1
+
+        with_db = compute_confidence(0.02, 1.0, 1.0, db=db_obj)
+        without_db = compute_confidence(0.02, 1.0, 1.0, db=None)
+        assert abs(with_db - without_db) < 1e-9, (
+            "below the threshold, calibration must be a no-op"
+        )
+
+    def test_post_activation_confidence_is_a_percentile(self, tmp_path):
+        """At/above the threshold the SAME inputs yield a different number —
+        this is the semantic shift the surface exists to announce."""
+        from minni.scoring import _ACTIVATION_THRESHOLD, calibration_status, compute_confidence
+
+        db_obj, _cfg = _make_db(tmp_path)
+        raw_only = compute_confidence(0.02, 1.0, 1.0, db=None)
+
+        self._fill(db_obj, _ACTIVATION_THRESHOLD)
+        status = calibration_status(db_obj)
+        assert status["active"] is True
+        assert status["confidence_basis"] == "percentile_rank"
+        assert status["samples_until_active"] == 0
+
+        calibrated = compute_confidence(0.02, 1.0, 1.0, db=db_obj)
+        assert abs(calibrated - raw_only) > 1e-9, (
+            "crossing the threshold must actually change the number — if it "
+            "did not, the surface would be announcing a no-op"
+        )
+
+    def test_the_surface_flips_exactly_at_the_threshold(self, tmp_path):
+        """The reported boundary must be the one _calibrate actually uses; a
+        surface that disagreed with the behaviour would be worse than none."""
+        from minni.scoring import _ACTIVATION_THRESHOLD, calibration_status
+
+        db_obj, _cfg = _make_db(tmp_path)
+        self._fill(db_obj, _ACTIVATION_THRESHOLD - 1)
+        assert calibration_status(db_obj)["active"] is False
+        self._fill(db_obj, 1)
+        assert calibration_status(db_obj)["active"] is True
+
+    def test_health_report_carries_the_calibration_surface(self):
         import inspect
 
-        from minni.retrieval import RetrievalEngine
+        import minni.minnid_runtime.health as health
 
-        src = inspect.getsource(RetrievalEngine.retrieve)
-        assert "record=True" in src, (
-            "the final formatted result set is the one site that feeds the window"
+        src = inspect.getsource(health.handle_health_report)
+        assert "score_calibration" in src
+        assert "calibration_status" in src
+
+    def test_calibration_surface_is_not_redacted_away(self):
+        """Counts and labels only — it must stay readable pre-identity, like
+        the other aggregate liveness fields."""
+        from minni.minnid_runtime.health import (
+            _HEALTH_REPORT_SENSITIVE_KEYS,
+            redact_health_report_for_recovery,
         )
+
+        assert "score_calibration" not in _HEALTH_REPORT_SENSITIVE_KEYS
+        report = {"score_calibration": {"active": True, "window_rows": 42}}
+        assert redact_health_report_for_recovery(report)["score_calibration"] == {
+            "active": True, "window_rows": 42,
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -805,17 +916,87 @@ class TestLayerStamping:
     hardcoded 'knowledge', and seed_identity + wiki_indexer omitted layer
     entirely (NULL, masked by COALESCE(layer,'knowledge') on read)."""
 
-    def test_vault_ingest_no_longer_hardcodes_knowledge(self):
-        """GA6-1: the literal must be gone from the writer's parameters."""
-        import inspect
+    def test_vault_ingest_stamps_the_inferred_layer_on_disk(self, tmp_path,
+                                                            monkeypatch):
+        """GA6-1, behaviorally: run the real ingest over an artifact-typed page
+        and read the stored rows back. A source grep for `_infer_layer` would
+        stay green even if the value never reached the INSERT."""
+        import sqlite3
 
-        import minni.afm_passes.vault_ingest as vi
+        import minni.db as db_mod
+        import minni.models as models
+        from minni.afm_passes.inbox_ingest import _VAULT_SLUG_TO_AGENT_ID
+        from minni.afm_passes.vault_ingest import run as run_vault_ingest
+        from minni.config import SovereignConfig
+        from minni.vault_index import vault_index_paths
 
-        src = inspect.getsource(vi._index_changed_pages)
-        assert "_infer_layer" in src, "vault_ingest must infer the layer"
-        assert '"knowledge",' not in src, (
-            "a hardcoded layer='knowledge' makes every artifact-typed page "
-            "invisible to layer-scoped recall"
+        class _FakeEmbedder:
+            def encode(self, text):
+                import numpy as np
+
+                vec = np.zeros(384, dtype="float32")
+                vec[sum(text.encode("utf-8")) % 384] = 1.0
+                return vec
+
+        monkeypatch.setattr(models, "get_embedder", lambda: _FakeEmbedder())
+
+        slug = next(iter(_VAULT_SLUG_TO_AGENT_ID))
+        vault = tmp_path / f"{slug}-vault"
+        wiki = vault / "wiki"
+        wiki.mkdir(parents=True)
+
+        def _page(name, page_type):
+            (wiki / name).write_text(
+                "\n".join([
+                    "---", f"title: {name}", f"type: {page_type}",
+                    "status: accepted", "privacy: safe", "---", "",
+                    " ".join(f"{name}-{i}" for i in range(90)),
+                ]),
+                encoding="utf-8",
+            )
+
+        _page("art.md", "artifact")
+        _page("note.md", "concept")
+
+        cfg = SovereignConfig(
+            db_path=str(tmp_path / "shared" / "minni.db"),
+            vault_path=str(tmp_path / "shared-vault"),
+            writeback_enabled=False,
+        )
+        old = db_mod._migrations_run
+        db_mod._migrations_run = False
+        try:
+            shared = db_mod.SovereignDB(cfg)
+            shared._get_conn()
+        finally:
+            db_mod._migrations_run = old
+
+        run_vault_ingest(shared, cfg, vault_path=str(vault), dry_run=False)
+
+        conn = sqlite3.connect(str(vault_index_paths(vault).db_path))
+        conn.row_factory = sqlite3.Row
+        try:
+            layers = {
+                os.path.basename(r["path"]): r["layer"]
+                for r in conn.execute("SELECT path, layer FROM documents")
+            }
+            chunk_layers = {
+                r["layer"] for r in conn.execute(
+                    "SELECT DISTINCT ce.layer FROM chunk_embeddings ce "
+                    "JOIN documents d ON d.doc_id = ce.doc_id "
+                    "WHERE d.path LIKE '%art.md'"
+                )
+            }
+        finally:
+            conn.close()
+
+        assert layers.get("art.md") == "artifact", (
+            "an artifact-typed page must be STORED on the artifact layer; the "
+            "old writer hardcoded 'knowledge' and made it unrecallable"
+        )
+        assert layers.get("note.md") == "knowledge"
+        assert chunk_layers == {"artifact"}, (
+            "chunk_embeddings must carry the same layer as their document"
         )
 
     def test_artifact_page_type_infers_the_artifact_layer(self):
@@ -834,28 +1015,181 @@ class TestLayerStamping:
             agent="identity:codex", page_type="concept", whole_document=0
         ) != "identity"
 
-    def test_wiki_indexer_stamps_layer_on_all_writes(self):
-        import inspect
+    def test_wiki_indexer_stamps_layer_on_disk(self, tmp_path, monkeypatch):
+        """GA7-2, behaviorally: index a real artifact-typed wiki page and read
+        the stored layer back. The old writer omitted the column entirely,
+        leaving NULL — masked on read by COALESCE(layer, 'knowledge')."""
+        import minni.models as models
+        from minni.wiki_indexer import WikiIndexer
 
-        import minni.wiki_indexer as wi
+        class _FakeEmbedder:
+            def encode(self, text):
+                import numpy as np
 
-        src = inspect.getsource(wi.WikiIndexer)
-        assert "whole_document=0" in src, (
-            "the identity branch must be closed structurally, not by a strip"
+                vec = np.zeros(384, dtype="float32")
+                vec[sum(text.encode("utf-8")) % 384] = 1.0
+                return vec
+
+        monkeypatch.setattr(models, "get_embedder", lambda: _FakeEmbedder())
+        db_obj, cfg = _make_db(tmp_path)
+
+        wiki_dir = tmp_path / "wiki" / "pages"
+        wiki_dir.mkdir(parents=True)
+        (wiki_dir / "art.md").write_text(
+            "---\ntitle: Art\nstatus: accepted\nprivacy: safe\ntype: artifact\n---\n\n"
+            + " ".join(f"art-{i}" for i in range(90)),
+            encoding="utf-8",
         )
-        assert "computed_at, layer" in src, "chunk_embeddings must carry layer"
+
+        WikiIndexer(db=db_obj, config=cfg).index_wiki(str(wiki_dir.parent))
+
+        with db_obj.cursor() as c:
+            row = c.execute(
+                "SELECT doc_id, layer FROM documents WHERE path LIKE '%art.md'"
+            ).fetchone()
+            assert row is not None, "the page must have been indexed"
+            chunk_layers = {
+                r["layer"] for r in c.execute(
+                    "SELECT DISTINCT layer FROM chunk_embeddings WHERE doc_id = ?",
+                    (row["doc_id"],),
+                ).fetchall()
+            }
+
+        assert row["layer"] == "artifact", (
+            "an artifact-typed wiki page must be stored on the artifact layer; "
+            "the old writer left layer NULL"
+        )
+        assert chunk_layers and None not in chunk_layers, (
+            "chunk_embeddings must carry a non-NULL layer (601 NULL chunks live)"
+        )
+        db_obj.close()
+
+    def test_wiki_indexer_never_stores_the_identity_layer_from_frontmatter(
+        self, tmp_path, monkeypatch
+    ):
+        """A session page's agent_tag comes from untrusted on-disk frontmatter.
+        Even declaring `agent: identity:codex` must not yield an identity row."""
+        import minni.models as models
+        from minni.wiki_indexer import WikiIndexer
+
+        class _FakeEmbedder:
+            def encode(self, text):
+                import numpy as np
+
+                vec = np.zeros(384, dtype="float32")
+                vec[sum(text.encode("utf-8")) % 384] = 1.0
+                return vec
+
+        monkeypatch.setattr(models, "get_embedder", lambda: _FakeEmbedder())
+        db_obj, cfg = _make_db(tmp_path)
+
+        wiki_dir = tmp_path / "wiki" / "pages"
+        wiki_dir.mkdir(parents=True)
+        (wiki_dir / "sneaky.md").write_text(
+            "---\ntitle: Sneaky\nstatus: accepted\nprivacy: safe\ntype: session\n"
+            "agent: identity:codex\n---\n\n"
+            + " ".join(f"sneaky-{i}" for i in range(90)),
+            encoding="utf-8",
+        )
+
+        WikiIndexer(db=db_obj, config=cfg).index_wiki(str(wiki_dir.parent))
+
+        with db_obj.cursor() as c:
+            rows = c.execute(
+                "SELECT layer FROM documents WHERE path LIKE '%sneaky.md'"
+            ).fetchall()
+        assert rows, "the page must have been indexed"
+        assert all(r["layer"] != "identity" for r in rows), (
+            "frontmatter must never be able to self-assign the identity layer"
+        )
+        db_obj.close()
 
     def test_seed_identity_stamps_the_identity_layer(self):
+        """STRUCTURAL, deliberately — and the reason is worth stating rather
+        than leaving as an unexplained weaker test. seed_identity.seed_identity()
+        is a top-level script bound to a module-level DB_PATH under the real
+        ~/.openclaw, and it reads each agent's SOUL.md/IDENTITY.md from live
+        home directories. Driving it behaviorally would write to live machine
+        state, which this campaign forbids.
+
+        So this asserts the two SQL statements carry the layer, and the
+        migration test below covers the stored-row half behaviorally — an
+        envelope that reaches the DB with layer NULL is repaired there.
+        """
+        import ast
         import inspect
 
         import minni.seed_identity as si
 
-        src = inspect.getsource(si)
-        assert "'identity')" in src or "'identity'" in src
-        assert "whole_document, layer" in src, (
+        src = inspect.getsource(si.seed_identity)
+        # Parse rather than substring-match, so a stray 'identity' in a comment
+        # or log line cannot make this pass over an unstamped INSERT.
+        statements = [
+            node.value
+            for node in ast.walk(ast.parse(src.strip()))
+            if isinstance(node, ast.Constant) and isinstance(node.value, str)
+        ]
+        doc_insert = [s for s in statements if "INSERT INTO documents" in s]
+        chunk_insert = [s for s in statements if "INSERT INTO chunk_embeddings" in s]
+        assert doc_insert and chunk_insert, "both INSERTs must still be present"
+        assert all("layer" in s for s in doc_insert), (
             "identity envelopes left layer NULL and read back as KNOWLEDGE — "
             "the one layer they must never be"
         )
+        assert all("layer" in s for s in chunk_insert)
+        assert all("'identity'" in s for s in doc_insert)
+
+    def test_artifact_layer_recall_returns_repaired_rows_end_to_end(
+        self, tmp_path, monkeypatch, hermetic_principals
+    ):
+        """The coherence check for the artifact half: writer fix + migration
+        must combine so that a layers=['artifact'] recall actually RETURNS a
+        previously-mislabeled document. Each piece passing in isolation would
+        not prove the day-one behaviour."""
+        import minni.db as db_mod
+        from minni.migrations import run_migrations
+
+        _engine, db_obj, _cfg = _patch_engine_and_writeback(tmp_path, monkeypatch)
+        body = "the deployment rollback procedure is documented here. " * 20
+
+        # A document as vault_ingest USED to write it: artifact-typed, but
+        # stamped knowledge, hence invisible to layer-scoped artifact recall.
+        with db_obj.cursor() as c:
+            c.execute(
+                """INSERT INTO documents (path, agent, sigil, page_type, layer)
+                   VALUES ('artifact.md', 'codex', 'vault', 'artifact', 'knowledge')"""
+            )
+            doc_id = c.lastrowid
+            c.execute(
+                "INSERT INTO vault_fts (doc_id, path, content, agent, sigil) "
+                "VALUES (?, 'artifact.md', ?, 'codex', 'vault')",
+                (doc_id, body),
+            )
+
+        before = _dispatch("search", {
+            "query": "deployment rollback", "agent_id": "codex",
+            "layers": ["artifact"], "expand": False,
+        })
+        assert before["result"]["count"] == 0, (
+            "precondition: the mislabeled row must be invisible to artifact recall"
+        )
+
+        # Apply the migration exactly as an upgrade would.
+        conn = db_obj._get_conn()
+        conn.execute("DELETE FROM schema_migrations WHERE version = 17")
+        conn.commit()
+        run_migrations(conn)
+        conn.commit()
+
+        after = _dispatch("search", {
+            "query": "deployment rollback", "agent_id": "codex",
+            "layers": ["artifact"], "expand": False,
+        })
+        assert after["result"]["count"] >= 1, (
+            "after migration 017 a layers=['artifact'] recall must return the "
+            "repaired document — that is what 'the day this merges' means"
+        )
+        assert any(r.get("doc_id") == doc_id for r in after["result"]["results"])
 
     def test_migration_backfills_mislabeled_artifact_rows(self, tmp_path):
         """GA6-1 backfill: the writer fix only helps re-ingested pages, and

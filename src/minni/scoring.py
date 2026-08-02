@@ -19,6 +19,53 @@ logger = logging.getLogger("sovereign.scoring")
 # Rolling window size for percentile calibration
 _WINDOW_SIZE = 1000
 
+# Samples required before _calibrate stops returning the raw score. Crossing it
+# CHANGES CONFIDENCE SEMANTICS for every caller — from a raw blend to a
+# percentile rank — so it is a named constant shared with calibration_status()
+# below rather than a literal buried in _calibrate. The surface and the
+# behaviour must not be able to drift apart.
+_ACTIVATION_THRESHOLD = 10
+
+
+def calibration_status(db) -> dict:
+    """Whether percentile calibration is live, and how close it is to becoming so.
+
+    GA4-1 guardrail. Wiring record_score means score_distribution fills up during
+    normal retrieval, and the moment it crosses _ACTIVATION_THRESHOLD every
+    caller's `confidence` silently changes meaning — raw blend before, percentile
+    rank after. A feature that switches semantics on a row count with nothing
+    observable is the same silent-degrade class this audit exists to remove, so
+    the transition gets a surface: health_report can say which side of the
+    threshold the index is on, and when it flipped.
+
+    Counts only, no scores — safe for the pre-identity health report.
+    """
+    try:
+        with db.cursor() as c:
+            rows = c.execute(
+                """SELECT COUNT(*) AS n FROM (
+                       SELECT raw_score FROM score_distribution
+                       WHERE kind = 'combined' ORDER BY id DESC LIMIT ?
+                   )""",
+                (_WINDOW_SIZE,),
+            ).fetchone()["n"]
+    except Exception as exc:
+        logger.debug("calibration_status unavailable: %s", exc)
+        return {"error": str(exc)}
+
+    active = rows >= _ACTIVATION_THRESHOLD
+    return {
+        "window_rows": rows,
+        "window_size": _WINDOW_SIZE,
+        "activation_threshold": _ACTIVATION_THRESHOLD,
+        "active": active,
+        # Spell out the consequence rather than making a reader infer it from
+        # a boolean: this is the field that explains why a confidence number
+        # changed meaning between two health reports.
+        "confidence_basis": "percentile_rank" if active else "raw_blend",
+        "samples_until_active": max(0, _ACTIVATION_THRESHOLD - rows),
+    }
+
 
 def compute_confidence(
     rrf_score: Optional[float],
@@ -128,7 +175,7 @@ def _calibrate(raw: float, db) -> float:
             )
             total = c.fetchone()["cnt"]
 
-        if total < 10:
+        if total < _ACTIVATION_THRESHOLD:
             # Not enough data for meaningful calibration
             return raw
 
