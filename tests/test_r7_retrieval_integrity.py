@@ -1593,12 +1593,11 @@ class TestDecayIsAppliedOnce:
             )
 
         real = scoring.compute_confidence
-        recorded = []
+        seen = []
 
         def _spy(rrf_score, cross_encoder_score, decay_factor, db=None,
                  record=False):
-            if record:
-                recorded.append((cross_encoder_score, decay_factor))
+            seen.append((cross_encoder_score, decay_factor, record))
             return real(rrf_score, cross_encoder_score, decay_factor, db=db,
                         record=record)
 
@@ -1609,12 +1608,18 @@ class TestDecayIsAppliedOnce:
         })
         assert "error" not in resp
         assert resp["result"]["count"] >= 1
-        assert recorded, "the formatted result set must record confidence"
-        ce, decay = recorded[0]
-        assert abs(decay - 0.5) < 1e-9
-        assert abs(ce - 2.0) < 1e-9, (
-            "confidence must get the raw logit; 1.0 here means the decayed "
-            "rerank_score leaked in and decay was applied twice"
+        decayed = [(ce, d) for ce, d, _rec in seen if d == pytest.approx(0.5)]
+        assert decayed, "the formatted result set must compute confidence"
+        for ce, _d in decayed:
+            assert abs(ce - 2.0) < 1e-9, (
+                "confidence must get the raw logit; 1.0 here means the decayed "
+                "rerank_score leaked in and decay was applied twice"
+            )
+        # Round 4 (finding 1): formatting itself must not record — the RPC
+        # boundary records the final merged set via record_score instead.
+        assert not any(rec for _ce, _d, rec in seen), (
+            "compute_confidence(record=True) inside formatting re-pollutes the "
+            "calibration window on multi-call searches"
         )
 
 
@@ -2038,3 +2043,190 @@ class TestCoverageCoversEveryIndex:
             "health must aggregate per-vault coverage, not sample only the "
             "shared DB while the drain covers every index"
         )
+
+
+# ---------------------------------------------------------------------------
+# grok-review round 4 — calibration boundary, warm-add desync, string layers
+# ---------------------------------------------------------------------------
+
+class TestCalibrationWindowIsBoundaryFed:
+    """Round-4 finding 1: _format_results recorded on every engine call, but
+    production search is multi-call (scope=both fans out personal+combined;
+    expansion recurses per variant), so one default RPC could insert 2x rows —
+    enough to cross _ACTIVATION_THRESHOLD alone on a window padded with
+    duplicate/intermediate scores. Recording now happens once, at the RPC
+    boundary, over the final merged caller-visible set."""
+
+    def test_scope_both_records_count_rows_not_double(self, tmp_path, monkeypatch,
+                                                      hermetic_principals):
+        _engine, db_obj, _cfg = _patch_engine_and_writeback(tmp_path, monkeypatch)
+        body = "the deployment rollback procedure is documented here. " * 20
+        with db_obj.cursor() as c:
+            c.execute(
+                "INSERT INTO documents (path, agent, sigil, layer) "
+                "VALUES ('a.md', 'codex', 'vault', 'knowledge')"
+            )
+            doc_id = c.lastrowid
+            c.execute(
+                "INSERT INTO vault_fts (doc_id, path, content, agent, sigil) "
+                "VALUES (?, 'a.md', ?, 'codex', 'vault')",
+                (doc_id, body),
+            )
+
+        # scope defaults to "both": personal (no vault → shared fallback) plus
+        # combined (shared) — the same hit formatted twice.
+        resp = _dispatch("search", {
+            "query": "deployment rollback", "agent_id": "codex", "expand": False,
+        })
+        assert "error" not in resp
+        count = resp["result"]["count"]
+        assert count >= 1
+
+        with db_obj.cursor() as c:
+            n = c.execute(
+                "SELECT COUNT(*) AS n FROM score_distribution"
+            ).fetchone()["n"]
+        assert n == count, (
+            f"one search must record exactly the {count} caller-visible "
+            f"result(s), not {n}; double-recording pads the window toward the "
+            "activation threshold with scores no caller saw"
+        )
+
+    def test_confidence_raw_does_not_leak_into_the_response(
+        self, tmp_path, monkeypatch, hermetic_principals
+    ):
+        """The recording carrier is popped at the boundary; the transport
+        surface must be unchanged."""
+        _engine, db_obj, _cfg = _patch_engine_and_writeback(tmp_path, monkeypatch)
+        body = "the deployment rollback procedure is documented here. " * 20
+        with db_obj.cursor() as c:
+            c.execute(
+                "INSERT INTO documents (path, agent, sigil, layer) "
+                "VALUES ('a.md', 'codex', 'vault', 'knowledge')"
+            )
+            doc_id = c.lastrowid
+            c.execute(
+                "INSERT INTO vault_fts (doc_id, path, content, agent, sigil) "
+                "VALUES (?, 'a.md', ?, 'codex', 'vault')",
+                (doc_id, body),
+            )
+        resp = _dispatch("search", {
+            "query": "deployment rollback", "agent_id": "codex", "expand": False,
+        })
+        assert "error" not in resp
+        results = resp["result"]["results"]
+        assert results
+        assert all("confidence_raw" not in r for r in results)
+        # confidence itself must still be served.
+        assert all("confidence" in r for r in results)
+
+
+class TestWarmAddAfterFailedReconstruct:
+    """Round-4 finding 2: a warm-started index whose reconstruct failed has
+    _chunk_ids populated and _vectors == []. add() appended to BOTH arrays, so
+    the first backfilled vector created a partial _vectors that satisfies
+    rebuild()'s `_chunk_ids and _vectors` guard while the arrays are mispaired
+    — IndexError or silently mispaired rebuild."""
+
+    def _warm_index_without_vectors(self, tmp_path):
+        import numpy as np
+
+        from minni.faiss_index import FAISSIndex
+
+        _db, cfg = _make_db(tmp_path)
+        idx = FAISSIndex(cfg)
+        seed = np.zeros((2, cfg.embedding_dim), dtype="float32")
+        seed[0][0] = 1.0
+        seed[1][1] = 1.0
+        idx.build_from_vectors([101, 102], seed)
+        # The disk-restore state: index + ids live, raw vectors gone.
+        idx._vectors = []
+        return idx, cfg
+
+    def test_add_after_failed_reconstruct_keeps_rebuild_honest(
+        self, tmp_path, monkeypatch
+    ):
+        import numpy as np
+
+        idx, cfg = self._warm_index_without_vectors(tmp_path)
+        monkeypatch.setattr(idx, "_reconstruct_vectors_from_index", lambda: False)
+
+        vec = np.zeros(cfg.embedding_dim, dtype="float32")
+        vec[2] = 1.0
+        idx.add(103, vec)
+
+        assert idx._chunk_ids == [101, 102, 103]
+        assert idx._vectors == [], (
+            "an orphan append to _vectors defeats the GA4-4 empty-vectors "
+            "rebuild guard; the honest state after a failed reconstruct is "
+            "NO raw vectors"
+        )
+        # The live index must still have gained the vector (search works).
+        assert idx._index.ntotal == 3
+        # And rebuild must take its logged skip path, not raise or mispair.
+        idx.rebuild()
+        assert idx._chunk_ids == [101, 102, 103]
+
+    def test_add_recovers_vectors_when_reconstruct_succeeds(self, tmp_path):
+        """A flat index CAN reconstruct — add() must heal _vectors instead of
+        skipping, so rebuild keeps working at full fidelity."""
+        import numpy as np
+
+        idx, cfg = self._warm_index_without_vectors(tmp_path)
+        vec = np.zeros(cfg.embedding_dim, dtype="float32")
+        vec[2] = 1.0
+        idx.add(103, vec)
+        assert len(idx._vectors) == 3, (
+            "reconstructable vectors must be recovered before the append so "
+            "the parallel arrays stay paired"
+        )
+        assert len(idx._chunk_ids) == 3
+        idx.rebuild()
+        assert idx._index.ntotal == 3
+
+
+class TestStringLayersScopeDocuments:
+    """Round-4 finding 3: layers="episodic" (bare string) enabled the episodic
+    channel but _normalize_layers iterated the STRING's characters into an
+    empty set — no document filter at all — so knowledge/identity documents
+    still came back from an episodic-scoped search."""
+
+    def _seed_doc(self, db_obj):
+        body = "the deployment rollback procedure is documented here. " * 20
+        with db_obj.cursor() as c:
+            c.execute(
+                "INSERT INTO documents (path, agent, sigil, layer) "
+                "VALUES ('a.md', 'codex', 'vault', 'knowledge')"
+            )
+            doc_id = c.lastrowid
+            c.execute(
+                "INSERT INTO vault_fts (doc_id, path, content, agent, sigil) "
+                "VALUES (?, 'a.md', ?, 'codex', 'vault')",
+                (doc_id, body),
+            )
+
+    def test_string_episodic_layer_excludes_documents(self, tmp_path, monkeypatch,
+                                                      hermetic_principals):
+        _engine, db_obj, _cfg = _patch_engine_and_writeback(tmp_path, monkeypatch)
+        self._seed_doc(db_obj)
+        resp = _dispatch("search", {
+            "query": "deployment rollback", "agent_id": "codex",
+            "expand": False, "layers": "episodic",
+        })
+        assert "error" not in resp
+        assert resp["result"]["count"] == 0, (
+            "layers='episodic' must scope documents out, not fail open to an "
+            "unfiltered document search"
+        )
+
+    def test_string_layer_still_admits_its_own_layer(self, tmp_path, monkeypatch,
+                                                     hermetic_principals):
+        """The string form must select the named layer, not filter everything."""
+        _engine, db_obj, _cfg = _patch_engine_and_writeback(tmp_path, monkeypatch)
+        self._seed_doc(db_obj)
+        resp = _dispatch("search", {
+            "query": "deployment rollback", "agent_id": "codex",
+            "expand": False, "layers": "knowledge",
+        })
+        assert "error" not in resp
+        assert resp["result"]["count"] >= 1

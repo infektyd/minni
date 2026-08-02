@@ -1651,6 +1651,10 @@ class RetrievalEngine:
         def _pr2_fields(result: Dict, existing: Optional[Dict] = None) -> Dict:
             fields = {
                 "confidence": result.get("confidence"),
+                # Survives every depth tier so the daemon RPC boundary can
+                # record (then pop) the pre-calibration raw for the final
+                # merged set — GA4-1, grok-review round 4 (finding 1).
+                "confidence_raw": result.get("confidence_raw"),
                 "rationale": result.get("rationale"),
                 "privacy_level": result.get("privacy_level"),
                 "source_authority": result.get("source_authority"),
@@ -2996,25 +3000,39 @@ class RetrievalEngine:
 
             # Compute confidence
             try:
+                from minni.scoring import raw_confidence
+
+                # grok-review round 2: raw logit, not the decay-attenuated
+                # rerank_score — decay_factor below already applies decay
+                # once; the attenuated value would apply it twice and bias
+                # the calibration window low for aged docs.
+                ce_for_confidence = r.get(
+                    "raw_rerank_score", r.get("rerank_score")
+                )
                 confidence = compute_confidence(
                     rrf_score=r.get("rrf_score"),
-                    # grok-review round 2: raw logit, not the decay-attenuated
-                    # rerank_score — decay_factor below already applies decay
-                    # once; the attenuated value would apply it twice and bias
-                    # the calibration window low for aged docs.
-                    cross_encoder_score=r.get(
-                        "raw_rerank_score", r.get("rerank_score")
-                    ),
+                    cross_encoder_score=ce_for_confidence,
                     decay_factor=r.get("decay_score"),
                     db=self.db,
-                    # GA4-1: this is the one site that feeds the calibration
-                    # window — the final, formatted, caller-visible result set.
-                    # The HyDE probe above deliberately does not record: it
-                    # scores candidates it may discard.
-                    record=True,
+                    # GA4-1 / grok-review round 4 (finding 1): formatting does
+                    # NOT record. Production search is multi-call — scope=both
+                    # fans out personal+combined and query expansion recurses
+                    # per variant — so recording here fed the calibration
+                    # window duplicate and discarded intermediate scores; one
+                    # default RPC could cross _ACTIVATION_THRESHOLD alone and
+                    # silently flip every caller to percentile_rank. The RPC
+                    # boundary (recall.handle_search) records the final merged
+                    # set via confidence_raw below.
+                    record=False,
+                )
+                confidence_raw = raw_confidence(
+                    r.get("rrf_score"),
+                    ce_for_confidence,
+                    r.get("decay_score"),
                 )
             except Exception:
                 confidence = None
+                confidence_raw = None
 
             # Detect injection in chunk text
             chunk_text = r.get("chunk_text", "")
@@ -3090,6 +3108,10 @@ class RetrievalEngine:
                 "token_count": r.get("token_count", 0),
                 # PR-2 envelope fields
                 "confidence": confidence,
+                # Pre-calibration raw blend for the RPC boundary to record
+                # (and pop) over the final merged result set — see the GA4-1
+                # note on compute_confidence above.
+                "confidence_raw": confidence_raw,
                 "age_days": age_days,
                 "provenance": provenance,
                 "privacy_level": privacy_level,

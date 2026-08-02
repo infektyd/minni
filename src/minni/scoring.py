@@ -67,6 +67,40 @@ def calibration_status(db) -> dict:
     }
 
 
+def raw_confidence(
+    rrf_score: Optional[float],
+    cross_encoder_score: Optional[float],
+    decay_factor: Optional[float],
+) -> float:
+    """The pre-calibration raw blend — the value the rolling window stores.
+
+    Extracted from compute_confidence (grok-review round 4, finding 1) so the
+    RPC boundary can record exactly this value for the final caller-visible
+    result set without re-running calibration.
+    """
+    rrf = rrf_score or 0.0
+    decay = decay_factor if decay_factor is not None else 1.0
+
+    # Cross-encoder logit → sigmoid probability if present
+    ce_prob: Optional[float] = None
+    if cross_encoder_score is not None:
+        try:
+            ce_prob = 1.0 / (1.0 + math.exp(-float(cross_encoder_score)))
+        except (OverflowError, ValueError):
+            ce_prob = None
+
+    # Blend: prefer cross-encoder when available
+    if ce_prob is not None:
+        # 60% cross-encoder, 40% RRF (normalised to 0-1)
+        rrf_norm = min(1.0, rrf * 20.0)  # RRF scores are typically ~0.01-0.05
+        raw = 0.6 * ce_prob + 0.4 * rrf_norm
+    else:
+        raw = min(1.0, rrf * 20.0)
+
+    # Apply decay
+    return raw * max(0.0, min(1.0, decay))
+
+
 def compute_confidence(
     rrf_score: Optional[float],
     cross_encoder_score: Optional[float],
@@ -90,36 +124,19 @@ def compute_confidence(
         db: Optional SovereignDB for percentile calibration. None → uncalibrated.
         record: Append this call's PRE-calibration raw score to the rolling
             window (GA4-1). Opt-in, and deliberately not the default: only the
-            final formatted result set should feed the distribution. Speculative
-            paths that score candidates they may discard — the HyDE probe in
-            retrieval.py is the live example — would otherwise inflate the
-            window with scores no caller ever saw.
+            final caller-visible result set should feed the distribution.
+            Speculative paths that score candidates they may discard — the
+            HyDE probe in retrieval.py is the live example — would otherwise
+            inflate the window with scores no caller ever saw. grok-review
+            round 4 (finding 1): the daemon search path no longer records via
+            this flag at all — formatting runs once per engine per variant, so
+            recall.handle_search records the final merged set through
+            record_score at the RPC boundary instead.
 
     Returns:
         float in [0, 1].
     """
-    # Defaults
-    rrf = rrf_score or 0.0
-    decay = decay_factor if decay_factor is not None else 1.0
-
-    # Cross-encoder logit → sigmoid probability if present
-    ce_prob: Optional[float] = None
-    if cross_encoder_score is not None:
-        try:
-            ce_prob = 1.0 / (1.0 + math.exp(-float(cross_encoder_score)))
-        except (OverflowError, ValueError):
-            ce_prob = None
-
-    # Blend: prefer cross-encoder when available
-    if ce_prob is not None:
-        # 60% cross-encoder, 40% RRF (normalised to 0-1)
-        rrf_norm = min(1.0, rrf * 20.0)  # RRF scores are typically ~0.01-0.05
-        raw = 0.6 * ce_prob + 0.4 * rrf_norm
-    else:
-        raw = min(1.0, rrf * 20.0)
-
-    # Apply decay
-    raw = raw * max(0.0, min(1.0, decay))
+    raw = raw_confidence(rrf_score, cross_encoder_score, decay_factor)
 
     # GA4-1: record BEFORE calibrating. record_score had zero production call
     # sites, so score_distribution stayed empty, _calibrate always fell through

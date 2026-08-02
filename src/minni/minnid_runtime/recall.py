@@ -198,6 +198,13 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
     budget_tokens_param = params.get("budget_tokens")
     backend_param = params.get("backend", "auto")
     layers = params.get("layers")
+    # grok-review round 4 (finding 3): normalize a bare-string `layers` ONCE at
+    # the RPC edge. _episodic_layer_requested handles the string form, but
+    # retrieval._normalize_layers iterates it character by character — an empty
+    # layer set, i.e. NO document filter — so layers="episodic" ran an
+    # episodic-scoped search that still returned knowledge/identity documents.
+    if isinstance(layers, str):
+        layers = [layers]
     sort = str(params.get("sort", "semantic"))
     start_date = params.get("start_date")
     end_date = params.get("end_date")
@@ -306,6 +313,32 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
                 results = pack_results(results, budget_tokens=budget, depth=depth)
             except Exception as pack_exc:
                 context.logger.warning("pack_results failed: %s - returning unbudgeted results", pack_exc)
+
+        # GA4-1 / grok-review round 4 (finding 1): feed the calibration window
+        # HERE, over the final merged caller-visible set — and only here.
+        # _format_results used to record, but production search is multi-call:
+        # scope=both fans out personal+combined (the same hits recorded twice
+        # when both resolve to the shared index) and query expansion recurses
+        # per variant, so one default limit=5 RPC could insert 10 rows — enough
+        # to cross _ACTIVATION_THRESHOLD alone and silently flip every caller
+        # from raw_blend to percentile_rank on a polluted window. confidence_raw
+        # is the pre-calibration blend each result's confidence came from; pop
+        # it so the transport surface is unchanged.
+        try:
+            from minni.scoring import record_score
+
+            for r in results:
+                if not isinstance(r, dict):
+                    continue
+                raw_score = r.pop("confidence_raw", None)
+                if raw_score is None:
+                    continue
+                try:
+                    record_score(float(raw_score), "combined", engine.db)
+                except Exception as exc:
+                    context.logger.debug("search: score record failed: %s", exc)
+        except Exception as exc:
+            context.logger.warning("search: score recording failed: %s", exc)
 
         learnings: list = []
         try:

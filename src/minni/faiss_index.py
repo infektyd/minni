@@ -302,19 +302,32 @@ class FAISSIndex:
         # gate in _ensure_faiss_loaded would then never rebuild from the DB.
         if self._invalidated:
             return
+        # GA4-4 follow-up (grok-review round 4, finding 2): a warm start whose
+        # reconstruct failed leaves _chunk_ids populated and _vectors empty.
+        # Appending to BOTH here would create a partial _vectors that satisfies
+        # rebuild()'s `_chunk_ids and _vectors` guard while the arrays are
+        # mispaired — the exact desync the empty-_vectors skip path exists to
+        # prevent, and the scheduled backfill makes this the steady-state add
+        # path on such an index. Recover the raw vectors first; if that fails,
+        # update only the live index and id maps and keep _vectors honestly
+        # empty so rebuild() keeps taking its logged skip path.
+        if self._chunk_ids and len(self._vectors) != len(self._chunk_ids):
+            if not self._reconstruct_vectors_from_index():
+                self._vectors = []
+                self._chunk_ids.append(chunk_id)
+                idx = len(self._chunk_ids) - 1
+                self._id_map[idx] = chunk_id
+                self._reverse_map[chunk_id] = idx
+                self._index_add_normalized(embedding)
+                return
+
         self._chunk_ids.append(chunk_id)
         self._vectors.append(embedding.copy())
         idx = len(self._chunk_ids) - 1
         self._id_map[idx] = chunk_id
         self._reverse_map[chunk_id] = idx
 
-        if self._faiss and self._index is not None:
-            vec = embedding.astype(np.float32).reshape(1, -1)
-            norm = np.linalg.norm(vec)
-            if norm > 1e-8:
-                vec = vec / norm
-            self._index.add(vec)
-
+        if self._index_add_normalized(embedding):
             # Check if we need to upgrade to HNSW
             if (self._current_type == "flat"
                     and self.config.faiss_index_type == "auto"
@@ -323,6 +336,17 @@ class FAISSIndex:
                             self.count)
                 all_vecs = np.array(self._vectors, dtype=np.float32)
                 self.build_from_vectors(self._chunk_ids, all_vecs)
+
+    def _index_add_normalized(self, embedding: np.ndarray) -> bool:
+        """Append one normalized vector to the live FAISS index, if any."""
+        if not (self._faiss and self._index is not None):
+            return False
+        vec = embedding.astype(np.float32).reshape(1, -1)
+        norm = np.linalg.norm(vec)
+        if norm > 1e-8:
+            vec = vec / norm
+        self._index.add(vec)
+        return True
 
     def remove(self, chunk_id: int) -> None:
         """
