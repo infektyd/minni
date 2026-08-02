@@ -710,6 +710,8 @@ server.registerTool(
       source,
       agentId: DEFAULT_AGENT_ID, // G11: server-side default only
       storeResult: { ok: store.ok, data: store.data, error: store.error },
+      // SEC-G6: successful learn audit must carry semanticTier (fail-open path).
+      quality,
     });
     // #132 P1: an identity-recovery denial must never read as "learned" —
     // name it distinctly so the remediation route (in store.data) is acted on.

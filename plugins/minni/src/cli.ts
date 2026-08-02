@@ -252,6 +252,8 @@ async function main() {
           vaultPath: DEFAULT_VAULT_PATH,
           title,
           content,
+          // SEC-G6: successful learn audit must carry semanticTier.
+          quality,
         }),
         null,
         2,

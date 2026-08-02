@@ -121,6 +121,56 @@ test("vaultFirstLearn writes a note, updates index, and appends audit logs", asy
   }
 });
 
+// SEC-G6 / #237: successful minni_learn audits were audit-dark on quality —
+// fail-open (AFM unavailable) writes looked identical to never-assessed in the
+// durable log. Quality-blocked paths already carry details.quality; the write
+// path must too so operators can grep semanticTier.
+test("fail-open async assess + learn audit carries semanticTier unavailable (SEC-G6)", async () => {
+  const { assessLearningQualityAsync } = await import("../dist/policy.js");
+  const root = await mkdtemp(path.join(tmpdir(), "sm-learn-audit-tier-"));
+  try {
+    const content =
+      "password: correct horse battery staple — documented so the quality score clears the short-content floor for this gate test.";
+    const quality = await assessLearningQualityAsync(
+      {
+        title: "Staging box rotation note for the on-call",
+        content,
+        category: "ops",
+        source: "unit-test",
+      },
+      { classifyInconclusive: async () => "unavailable" },
+    );
+    assert.equal(quality.ok, true, "control: unavailable must fail-open");
+    assert.equal(quality.semanticTier, "unavailable");
+
+    await vaultFirstLearn({
+      vaultPath: root,
+      title: "Staging box rotation note for the on-call",
+      content,
+      category: "ops",
+      source: "unit-test",
+      agentId: "codex",
+      storeResult: { ok: true },
+      quality,
+    });
+
+    const log = await readFile(path.join(root, "log.md"), "utf8");
+    assert.match(log, /minni_learn/);
+    // Durable audit must embed quality.semanticTier so AFM-unavailable writes
+    // are distinguishable from never-ran / examined-and-cleared.
+    assert.match(log, /"semanticTier":\s*"unavailable"/);
+    assert.match(log, /"quality"/);
+    // Warnings already avoid echoing secret values; pin that the passphrase
+    // does not leak via the quality block either.
+    assert.ok(
+      !log.includes("correct horse battery staple"),
+      "learn audit must not echo the inconclusive passphrase",
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("writeVaultPage supports raw and wiki pages without treating them as learnings", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "sm-page-"));
   try {

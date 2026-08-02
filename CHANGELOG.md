@@ -20,9 +20,9 @@ pre-1.0: minor versions may contain breaking changes until v1.0.0.
   are marked PARTIAL and aligned with `redaction.py` plus
   `THREAT_MODEL.md` residual language; bare plist/socket names are not claimed
   as rewritten.
-- **Learn-gate unknown AFM verdict fail-open:** non-enumerated classifier
-  returns no longer hard-block with `semanticTier: "ran"`; they fail-open as
-  `unavailable` (credential / prose / unavailable remain explicit).
+- **Learn-gate unknown AFM verdict observability:** non-enumerated classifier
+  returns are labeled `semanticTier: "unavailable"` (not mislabeled `"ran"`);
+  hard-block remains credential-only — fail-open behavior is unchanged.
 
 ## [0.4.1] - 2026-08-01
 
