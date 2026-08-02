@@ -498,13 +498,10 @@ def handle_daemon_compile(params: dict, request_id: Any, context: AFMContext) ->
         write_refused = False
         write_status = None
         if not dry_run and result.get("drafts"):
-            from minni.afm_writer import (
-                set_deferred_lifecycle_handler,
-                submit_drafts,
-            )
+            from minni.afm_writer import submit_drafts
 
-            # Round 10: ensure the worker can apply lifecycle if the waiter
-            # times out and the write later succeeds (one draft set, apply once).
+            # Round 10/11: per-job lifecycle + handler so a timed-out waiter
+            # still applies once if the write lands (no process-global slot).
             lifecycle = {
                 "promote_candidate_ids": list(
                     result.get("promote_candidate_ids") or []
@@ -514,11 +511,6 @@ def handle_daemon_compile(params: dict, request_id: Any, context: AFMContext) ->
                     result.get("review_candidate_ids") or []
                 ),
             }
-            # Handler closes over this request's context; safe for the daemon
-            # process (one writer thread serializes jobs).
-            set_deferred_lifecycle_handler(
-                lambda life, _ctx=context: apply_consolidation_result(life, _ctx)
-            )
             write_result = submit_drafts({
                 "pass_name": pass_name,
                 "trace_id": trace_id,
@@ -526,6 +518,11 @@ def handle_daemon_compile(params: dict, request_id: Any, context: AFMContext) ->
                 "drafts": result["drafts"],
                 "writeback": context.writeback_ref(),
                 "lifecycle": lifecycle,
+                # Close over this request's context; job-scoped so concurrent
+                # compiles cannot steal each other's applier (round 11).
+                "lifecycle_handler": (
+                    lambda life, _ctx=context: apply_consolidation_result(life, _ctx)
+                ),
             })
             result.update(write_result)
             # Review round 8 on PR #260: write_in_flight means THIS batch's
