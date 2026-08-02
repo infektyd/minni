@@ -1208,9 +1208,13 @@ class RetrievalEngine:
 
         Correction-class candidates get the same recall-F4 decay floor they get
         in _score_merged_doc, so the two legs agree on what a correction's
-        effective decay is. Runs BEFORE the correction boost so a correction's
-        zero-logit lift is the last word, mirroring the multiplicative order
-        final_score = rrf * decay * (1 + boost).
+        effective decay is. Runs AFTER the correction boost (grok-review
+        round 3, finding 3): running decay first mapped a raw 0.0 logit to the
+        negative decay - 1.0, so the boost's zero-logit special case never
+        fired and a decayed zero-logit correction sank BELOW an undecayed
+        zero-logit non-correction. The non-zero branches are commutative
+        multiplications, so only the zero dispatch depends on the order — and
+        it must see the model-pure logit.
 
         The rerank cache stores the raw model score BEFORE this adjustment, so
         cached entries stay model-pure and attenuation is re-derived every call.
@@ -1241,8 +1245,8 @@ class RetrievalEngine:
                 c["rerank_score"] = decay - 1.0
 
     def _apply_rerank_score_adjustments(self, candidates: List[Dict]) -> None:
-        """Both post-model adjustments, in the order the final_score leg
-        multiplies them. Single call site so the two legs cannot drift.
+        """Both post-model adjustments. Single call site so the two legs
+        cannot drift.
 
         grok-review round 2 (finding 1): preserve the model-pure logit as
         raw_rerank_score BEFORE any adjustment. compute_confidence takes
@@ -1250,11 +1254,20 @@ class RetrievalEngine:
         rerank_score applies decay twice — biasing the HyDE trigger, the
         calibration window (record=True), and provenance for aged docs.
         Ranking sorts on the adjusted rerank_score; confidence and provenance
-        read raw_rerank_score."""
+        read raw_rerank_score.
+
+        grok-review round 3 (finding 3): boost BEFORE decay. Both adjustments
+        special-case a 0.0 score, and only the boost-first order lets each
+        special case see the score it was written for: the boost dispatches on
+        the model-pure logit (zero-logit corrections lift to +boost, which
+        decay then attenuates to boost * decay > 0), while decay's zero case
+        keeps handling genuinely-zero non-corrections. The non-zero branches
+        multiply commutatively, so the two legs still agree with
+        final_score = rrf * decay * (1 + boost)."""
         for c in candidates:
             c["raw_rerank_score"] = float(c.get("rerank_score") or 0.0)
-        self._apply_decay_rerank_attenuation(candidates)
         self._apply_correction_rerank_boost(candidates)
+        self._apply_decay_rerank_attenuation(candidates)
 
     def _rerank(self, query: str, candidates: List[Dict]) -> List[Dict]:
         """

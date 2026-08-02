@@ -338,9 +338,20 @@ def handle_health_report(params: dict, request_id: Any, context: HealthContext) 
         # ratios. Best-effort — a coverage query must never cost the operator
         # the rest of the health report.
         try:
-            from minni.backfill import embedding_coverage
+            from minni.backfill import embedding_coverage, vault_embedding_coverage
 
-            report["embedding_coverage"] = embedding_coverage(db)
+            coverage = embedding_coverage(db)
+            # grok-review round 3 (finding 4): the drain covers every index
+            # (run_backfill_all_indexes) but this surface sampled only the
+            # shared DB, so "coverage fine" could mask a still-gapped vault.
+            # Counts-only per-vault rollup, same best-effort contract.
+            try:
+                coverage["vaults"] = vault_embedding_coverage(
+                    base_config=context.default_config
+                )
+            except Exception as exc:
+                coverage["vaults"] = {"error": str(exc)}
+            report["embedding_coverage"] = coverage
         except Exception as exc:
             report["embedding_coverage"] = {"error": str(exc)}
 

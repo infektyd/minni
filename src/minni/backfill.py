@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 from minni.config import DEFAULT_CONFIG, SovereignConfig
 from minni.db import SovereignDB
@@ -47,6 +47,30 @@ def _numpy():
     return np
 
 
+# grok-review round 3 (finding 1): per-(db, queue) batch cursors. The batch
+# SELECTs had no ORDER BY and no cursor, so >=limit rows whose encode PERMANENTLY
+# raises (OOM, corrupt payload, model reject) would occupy every LIMIT head
+# forever — the third form of the stuck-queue class (empty content and short
+# docs are excluded by static predicates; encode-raisers cannot be). Each pass
+# now starts after the last id it attempted, so failures advance the cursor and
+# recoverable rows behind them still drain; when a fetch comes back empty the
+# cursor wraps to the head, so transiently-failing rows are retried on the next
+# cycle rather than excluded forever. In-process state only: a restart retries
+# everything, which is exactly right for transient encoder faults.
+_batch_cursors: Dict[Tuple[str, str], int] = {}
+
+
+def _cursor_batch(c, sql: str, key: Tuple[str, str], limit: int):
+    """Fetch the next ordered LIMIT batch after the stored cursor, wrapping to
+    the head when the tail is exhausted. ``sql`` takes (after_id, limit)."""
+    after = _batch_cursors.get(key, 0)
+    rows = c.execute(sql, (after, limit)).fetchall()
+    if not rows and after:
+        after = 0
+        rows = c.execute(sql, (after, limit)).fetchall()
+    return rows
+
+
 def embedding_coverage(db: SovereignDB) -> Dict[str, object]:
     """Document- and learning-level vector coverage.
 
@@ -62,12 +86,30 @@ def embedding_coverage(db: SovereignDB) -> Dict[str, object]:
             docs_with_vectors = c.execute(
                 "SELECT COUNT(DISTINCT doc_id) AS n FROM chunk_embeddings"
             ).fetchone()["n"]
+            # grok-review round 3 (finding 2): align eligibility with what
+            # backfill and semantic recall actually touch. Terminal learnings
+            # (rejected/expired/superseded status) are skipped by both, so
+            # counting their NULL embeddings here manufactured a permanent
+            # phantom gap no scheduled drain could ever close — the same
+            # health-signal overstatement the empty-index None-ratio refuses.
+            _active = (
+                "superseded_by IS NULL AND (status IS NULL OR "
+                "status NOT IN ('rejected','expired','superseded'))"
+            )
             total_learnings = c.execute(
-                "SELECT COUNT(*) AS n FROM learnings WHERE superseded_by IS NULL"
+                f"SELECT COUNT(*) AS n FROM learnings WHERE {_active}"
             ).fetchone()["n"]
             learnings_with_embedding = c.execute(
+                f"SELECT COUNT(*) AS n FROM learnings "
+                f"WHERE {_active} AND embedding IS NOT NULL"
+            ).fetchone()["n"]
+            # Surfaced separately so the excluded rows stay visible instead of
+            # silently vanishing from the ratio.
+            learnings_terminal_null = c.execute(
                 "SELECT COUNT(*) AS n FROM learnings "
-                "WHERE superseded_by IS NULL AND embedding IS NOT NULL"
+                "WHERE superseded_by IS NULL "
+                "AND status IN ('rejected','expired','superseded') "
+                "AND embedding IS NULL"
             ).fetchone()["n"]
     except Exception as exc:
         logger.debug("embedding_coverage unavailable: %s", exc)
@@ -93,7 +135,41 @@ def embedding_coverage(db: SovereignDB) -> Dict[str, object]:
     coverage["learnings_embedding_ratio"] = _ratio(
         learnings_with_embedding, total_learnings
     )
+    coverage["learnings_terminal_null_embedding"] = learnings_terminal_null
     return coverage
+
+
+def vault_embedding_coverage(
+    minni_home=None,
+    base_config: SovereignConfig = DEFAULT_CONFIG,
+) -> Dict[str, Dict]:
+    """Per-vault embedding_coverage, keyed by vault name.
+
+    grok-review round 3 (finding 4): the drain is multi-index
+    (run_backfill_all_indexes) but the health surface sampled only the shared
+    DB, so an operator could read "coverage fine" while a vault's semantic
+    recall was still gapped. Same per-index isolation as the drain: one
+    unreadable vault reports its own error entry.
+    """
+    from minni.index_all import discover_agent_vaults
+    from minni.vault_index import build_vault_index_config
+
+    out: Dict[str, Dict] = {}
+    for vault in discover_agent_vaults(minni_home):
+        vault_db = None
+        try:
+            vault_config = build_vault_index_config(vault, base_config=base_config)
+            vault_db = SovereignDB(vault_config)
+            out[vault.name] = embedding_coverage(vault_db)
+        except Exception as exc:
+            out[vault.name] = {"error": str(exc)}
+        finally:
+            if vault_db is not None:
+                try:
+                    vault_db.close()
+                except Exception:
+                    pass
+    return out
 
 
 def backfill_learning_embeddings(
@@ -131,15 +207,23 @@ def backfill_learning_embeddings(
     # bounded drain silently becomes a stuck queue. They are still counted
     # (below) and still reported as missing by embedding_coverage, so excluding
     # them from the batch hides nothing; it only stops them holding the queue.
+    # grok-review round 3 (finding 1): ordered, cursor-advanced batches — see
+    # _batch_cursors. A learning whose encode permanently raises stays
+    # embedding=NULL and would otherwise re-match the head of every pass.
+    cursor_key = (str(config.db_path), "learnings")
     with db.cursor() as c:
-        rows = c.execute(
+        rows = _cursor_batch(
+            c,
             """SELECT learning_id, content FROM learnings
                WHERE embedding IS NULL AND superseded_by IS NULL
                  AND (status IS NULL OR status NOT IN ('rejected','expired','superseded'))
                  AND content IS NOT NULL AND TRIM(content) != ''
+                 AND learning_id > ?
+               ORDER BY learning_id
                LIMIT ?""",
-            (limit,),
-        ).fetchall()
+            cursor_key, limit,
+        )
+        _batch_cursors[cursor_key] = rows[-1]["learning_id"] if rows else 0
         stats["unrecoverable"] = c.execute(
             """SELECT COUNT(*) AS n FROM learnings
                WHERE embedding IS NULL AND superseded_by IS NULL
@@ -224,8 +308,13 @@ def backfill_document_vectors(
     # forever and recoverable documents behind them would never enter one. They
     # are counted below and still reported missing by embedding_coverage, so
     # nothing is hidden — they just stop holding the queue.
+    # grok-review round 3 (finding 1): ordered, cursor-advanced batches — see
+    # _batch_cursors. A document whose encode permanently raises gains no
+    # chunk_embeddings rows and would otherwise re-match the head of every pass.
+    cursor_key = (str(config.db_path), "documents")
     with db.cursor() as c:
-        rows = c.execute(
+        rows = _cursor_batch(
+            c,
             """SELECT d.doc_id, d.layer, f.content
                FROM documents d
                JOIN vault_fts f ON f.doc_id = d.doc_id
@@ -233,9 +322,12 @@ def backfill_document_vectors(
                    SELECT 1 FROM chunk_embeddings ce WHERE ce.doc_id = d.doc_id
                )
                AND f.content IS NOT NULL AND TRIM(f.content) != ''
+               AND d.doc_id > ?
+               ORDER BY d.doc_id
                LIMIT ?""",
-            (limit,),
-        ).fetchall()
+            cursor_key, limit,
+        )
+        _batch_cursors[cursor_key] = rows[-1]["doc_id"] if rows else 0
         stats["unrecoverable"] = c.execute(
             """SELECT COUNT(*) AS n
                FROM documents d

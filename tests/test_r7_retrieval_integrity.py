@@ -1756,3 +1756,285 @@ class TestShortDocumentBackfill:
                 (good_id,),
             ).fetchone()["n"]
         assert n >= 1, "the recoverable long document must be reachable"
+
+
+# ---------------------------------------------------------------------------
+# grok-review round 3 — residual stuck-queue and honesty holes
+# ---------------------------------------------------------------------------
+
+class _PoisonEmbedder:
+    """Raises for poison content — the permanent-encode-failure shape."""
+
+    def encode(self, text):
+        import numpy as np
+
+        if "POISONROW" in text:
+            raise RuntimeError("model reject")
+        vec = np.zeros(384, dtype="float32")
+        vec[len(text) % 384] = 1.0
+        return vec
+
+
+class TestEncodeFailureCannotWedgeTheDrain:
+    """Round-3 finding 1: empty content and short docs are excluded by static
+    predicates, but a row whose encode PERMANENTLY raises stays eligible and
+    re-matched the head of every un-ordered LIMIT batch — the third form of
+    the stuck queue. Batches are now ordered and cursor-advanced, so failures
+    are stepped past and retried only after the cursor wraps."""
+
+    def _stub_encoder(self, monkeypatch):
+        import minni.models as models
+
+        monkeypatch.setattr(models, "get_embedder", lambda: _PoisonEmbedder())
+
+    def test_encode_failures_cannot_wedge_the_learning_drain(
+        self, tmp_path, monkeypatch
+    ):
+        from minni.backfill import backfill_learning_embeddings
+
+        self._stub_encoder(monkeypatch)
+        db_obj, cfg = _make_db(tmp_path)
+        now = time.time()
+        with db_obj.cursor() as c:
+            for i in range(3):
+                c.execute(
+                    """INSERT INTO learnings (agent_id, category, content,
+                                              confidence, created_at, embedding)
+                       VALUES ('codex', 'fix', ?, 1.0, ?, NULL)""",
+                    (f"POISONROW {i} always fails to encode", now),
+                )
+            c.execute(
+                """INSERT INTO learnings (agent_id, category, content,
+                                          confidence, created_at, embedding)
+                   VALUES ('codex', 'fix', 'websocket backoff is 500ms', 1.0, ?, NULL)""",
+                (now,),
+            )
+
+        embedded = 0
+        for _ in range(2):
+            embedded += backfill_learning_embeddings(db_obj, cfg, limit=2)["embedded"]
+        assert embedded == 1, (
+            "the recoverable learning must drain despite >=limit permanently "
+            "failing rows ahead of it; the old un-ordered batch re-served the "
+            "same failing head every pass"
+        )
+
+    def test_encode_failures_cannot_wedge_the_document_drain(
+        self, tmp_path, monkeypatch
+    ):
+        from minni.backfill import backfill_document_vectors
+
+        self._stub_encoder(monkeypatch)
+        db_obj, cfg = _make_db(tmp_path)
+        with db_obj.cursor() as c:
+            for i in range(3):
+                c.execute(
+                    "INSERT INTO documents (path, agent, sigil) VALUES (?, 'c', 'v')",
+                    (f"bad{i}.md",),
+                )
+                c.execute(
+                    "INSERT INTO vault_fts (doc_id, path, content, agent, sigil) "
+                    "VALUES (?, ?, ?, 'c', 'v')",
+                    (c.lastrowid, f"bad{i}.md",
+                     "# Bad\n\n" + (f"POISONROW {i} corrupt payload. " * 40)),
+                )
+            c.execute(
+                "INSERT INTO documents (path, agent, sigil) "
+                "VALUES ('good.md', 'codex', 'vault')"
+            )
+            good_id = c.lastrowid
+            c.execute(
+                "INSERT INTO vault_fts (doc_id, path, content, agent, sigil) "
+                "VALUES (?, 'good.md', ?, 'codex', 'vault')",
+                (good_id, "# Title\n\n" + ("the deployment rollback procedure. " * 40)),
+            )
+
+        drained = 0
+        for _ in range(2):
+            drained += backfill_document_vectors(db_obj, cfg, limit=2)["documents"]
+        assert drained == 1
+        with db_obj.cursor() as c:
+            n = c.execute(
+                "SELECT COUNT(*) AS n FROM chunk_embeddings WHERE doc_id = ?",
+                (good_id,),
+            ).fetchone()["n"]
+        assert n >= 1, (
+            "the recoverable document must gain vectors despite encode-raising "
+            "rows occupying the head of the queue"
+        )
+
+    def test_failed_rows_are_retried_after_the_cursor_wraps(
+        self, tmp_path, monkeypatch
+    ):
+        """Failures must be stepped past, not excluded forever — a transient
+        encoder fault (OOM) heals, and the wrap is what re-offers the row."""
+        from minni.backfill import backfill_learning_embeddings
+
+        self._stub_encoder(monkeypatch)
+        db_obj, cfg = _make_db(tmp_path)
+        with db_obj.cursor() as c:
+            c.execute(
+                """INSERT INTO learnings (agent_id, category, content,
+                                          confidence, created_at, embedding)
+                   VALUES ('codex', 'fix', 'POISONROW transient', 1.0, ?, NULL)""",
+                (time.time(),),
+            )
+
+        first = backfill_learning_embeddings(db_obj, cfg, limit=2)
+        assert first["failed"] == 1
+        # Tail exhausted → cursor wraps to the head and re-attempts the row.
+        again = backfill_learning_embeddings(db_obj, cfg, limit=2)
+        assert again["failed"] == 1, (
+            "a failed row must come back after the wrap; permanent exclusion "
+            "would turn every transient fault into a silent hole"
+        )
+
+
+class TestCoverageMatchesDrainEligibility:
+    """Round-3 finding 2: coverage counted terminal learnings (rejected /
+    expired / superseded status, embedding NULL) that both backfill and
+    semantic recall skip — a permanent phantom gap no drain could close."""
+
+    def test_terminal_learnings_do_not_dent_the_ratio(self, tmp_path):
+        from minni.backfill import embedding_coverage
+
+        db_obj, _cfg = _make_db(tmp_path)
+        now = time.time()
+        with db_obj.cursor() as c:
+            c.execute(
+                """INSERT INTO learnings (agent_id, category, content,
+                                          confidence, created_at, embedding, status)
+                   VALUES ('codex', 'fix', 'active learning', 1.0, ?, ?, 'active')""",
+                (now, b"\x00" * 4),
+            )
+            c.execute(
+                """INSERT INTO learnings (agent_id, category, content,
+                                          confidence, created_at, embedding, status)
+                   VALUES ('codex', 'fix', 'dead learning', 1.0, ?, NULL, 'rejected')""",
+                (now,),
+            )
+
+        cov = embedding_coverage(db_obj)
+        assert cov["learnings_total"] == 1
+        assert cov["learnings_missing_embedding"] == 0, (
+            "a rejected NULL-embedding learning is untouchable by backfill and "
+            "invisible to recall; counting it as missing makes health lie"
+        )
+        assert cov["learnings_embedding_ratio"] == 1.0
+        assert cov["learnings_terminal_null_embedding"] == 1, (
+            "the excluded rows must stay visible as their own count"
+        )
+
+
+class TestCorrectionZeroLogitSurvivesDecay:
+    """Round-3 finding 3: decay-first mapped a raw 0.0 logit to decay - 1.0
+    (negative), so the boost's zero-logit special case never fired and a
+    decayed zero-logit correction ranked BELOW an undecayed zero-logit
+    non-correction. Boost now runs first, dispatching on the model-pure logit;
+    the non-zero branches are commutative so nothing else moves."""
+
+    def test_decayed_zero_logit_correction_outranks_zero_non_correction(
+        self, tmp_path
+    ):
+        engine, _db, cfg = _make_engine(tmp_path)
+        correction_type = sorted(engine._correction_types)[0]
+        candidates = [
+            {"doc_id": 1, "rerank_score": 0.0, "decay_score": 1.0,
+             "page_type": "note"},
+            {"doc_id": 2, "rerank_score": 0.0, "decay_score": 0.10,
+             "page_type": correction_type},
+        ]
+        engine._apply_rerank_score_adjustments(candidates)
+        candidates.sort(key=lambda x: x.get("rerank_score", 0), reverse=True)
+        assert [c["doc_id"] for c in candidates] == [2, 1], (
+            "a decayed zero-logit correction must keep its lift; decay-first "
+            "turned it negative and sank it below the habitual hit"
+        )
+        boost = float(cfg.correction_salience_boost)
+        floor = float(cfg.correction_decay_floor)
+        expected = boost * max(0.10, floor)
+        assert abs(candidates[0]["rerank_score"] - expected) < 1e-9, (
+            "the lift must be the boosted zero attenuated once by the floored "
+            "decay: boost * decay"
+        )
+
+    def test_nonzero_logits_are_unmoved_by_the_reorder(self, tmp_path):
+        """Positive and negative branches must compose identically in either
+        order: raw * decay * (1 + boost) and raw / (decay * (1 + boost))."""
+        engine, _db, cfg = _make_engine(tmp_path)
+        correction_type = sorted(engine._correction_types)[0]
+        boost = float(cfg.correction_salience_boost)
+        decay = max(0.6, float(cfg.correction_decay_floor))
+        candidates = [
+            {"doc_id": 1, "rerank_score": 2.0, "decay_score": decay,
+             "page_type": correction_type},
+            {"doc_id": 2, "rerank_score": -1.0, "decay_score": decay,
+             "page_type": correction_type},
+        ]
+        engine._apply_rerank_score_adjustments(candidates)
+        assert abs(candidates[0]["rerank_score"]
+                   - 2.0 * decay * (1.0 + boost)) < 1e-9
+        assert abs(candidates[1]["rerank_score"]
+                   - (-1.0 / (decay * (1.0 + boost)))) < 1e-9
+
+
+class TestCoverageCoversEveryIndex:
+    """Round-3 finding 4: the drain is multi-index but health's
+    embedding_coverage sampled only the shared DB — "coverage fine" could mask
+    a still-gapped vault."""
+
+    def test_vault_coverage_reports_per_vault_counts(self, tmp_path, monkeypatch):
+        import minni.index_all as index_all
+        import minni.vault_index as vault_index
+        from minni.backfill import vault_embedding_coverage
+
+        # A real vault-shaped DB with one vectorless document.
+        vault_db, vault_cfg = _make_db(tmp_path)
+        with vault_db.cursor() as c:
+            c.execute(
+                "INSERT INTO documents (path, agent, sigil) "
+                "VALUES ('a.md', 'codex', 'vault')"
+            )
+        vault_db.close()
+
+        vault = tmp_path / "codex-vault"
+        vault.mkdir()
+        monkeypatch.setattr(
+            index_all, "discover_agent_vaults", lambda home=None: [vault]
+        )
+        monkeypatch.setattr(
+            vault_index, "build_vault_index_config",
+            lambda v, base_config=None: vault_cfg,
+        )
+
+        out = vault_embedding_coverage()
+        assert out["codex-vault"]["documents_missing_vectors"] == 1
+
+    def test_an_unreadable_vault_reports_its_own_error(self, tmp_path, monkeypatch):
+        import minni.index_all as index_all
+        import minni.vault_index as vault_index
+        from minni.backfill import vault_embedding_coverage
+
+        broken = tmp_path / "broken-vault"
+        broken.mkdir()
+        monkeypatch.setattr(
+            index_all, "discover_agent_vaults", lambda home=None: [broken]
+        )
+
+        def _explode(*_a, **_kw):
+            raise RuntimeError("vault index unreadable")
+
+        monkeypatch.setattr(vault_index, "build_vault_index_config", _explode)
+        out = vault_embedding_coverage()
+        assert "error" in out["broken-vault"]
+
+    def test_health_report_carries_the_vault_rollup(self):
+        import inspect
+
+        import minni.minnid_runtime.health as health
+
+        src = inspect.getsource(health.handle_health_report)
+        assert "vault_embedding_coverage" in src, (
+            "health must aggregate per-vault coverage, not sample only the "
+            "shared DB while the drain covers every index"
+        )
