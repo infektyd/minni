@@ -15,6 +15,7 @@ before the fix:
 from __future__ import annotations
 
 import os
+import re
 import sqlite3
 import sys
 import time
@@ -645,10 +646,13 @@ def test_prune_keeps_a_row_stored_under_a_non_canonical_path(tmp_path, monkeypat
 
     index_shared_vault(cfg)
 
-    survivors = _indexed_paths(cfg.db_path)
-    assert noncanonical in survivors, (
+    # The row must SURVIVE -- the file it names exists. It is also canonicalized
+    # on the way through (round 4 #3), so assert the file is still represented
+    # exactly once rather than asserting the non-canonical spelling persists.
+    survivors = [p for p in _indexed_paths(cfg.db_path) if p.endswith(page.name)]
+    assert survivors == [str(page)], (
         "prune deleted a row whose file exists, because the stored path was "
-        "not in canonical form"
+        f"not in canonical form: {survivors}"
     )
 
 
@@ -775,3 +779,152 @@ def test_reindex_adopts_a_non_canonical_row_instead_of_duplicating(tmp_path, mon
     rows = [p for p in _indexed_paths(cfg.db_path) if p.endswith(page.name)]
     assert len(rows) == 1, f"duplicate rows for one file: {rows}"
     assert rows[0] == str(page), "row was not normalized to the canonical path"
+
+
+# ── Round 5: findings from the fourth Grok review of #256 ──────────────────
+
+
+def test_unchanged_draft_with_stale_embeddings_is_stripped(tmp_path, monkeypatch):
+    """Grok round 4 #1. The no-embed invariant was enforced only on the reindex
+    path. An install that ever hand-ran the old index_all has draft rows WITH
+    chunks and a current mtime, so the sweep skips them and those vectors keep
+    occupying the FAISS window for the rest of the TTL. Nothing on disk will
+    change to trigger a reindex, so the policy must be enforced from the row."""
+    from minni.index_all import index_shared_vault
+
+    _install_fake_embedder(monkeypatch)
+    cfg = _make_cfg(tmp_path)
+    vault = Path(cfg.vault_path)
+    page = vault / "wiki" / "concepts" / "legacy-draft.md"
+    _write_page(page, "accepted", "legacy embedded body " * 40)
+    index_shared_vault(cfg)  # embeds it, as the old indexer did for drafts
+
+    def chunks():
+        conn = sqlite3.connect(cfg.db_path)
+        try:
+            return conn.execute(
+                "SELECT COUNT(*) FROM chunk_embeddings ce JOIN documents d"
+                " ON d.doc_id = ce.doc_id WHERE d.path = ?",
+                (str(page.resolve()),),
+            ).fetchone()[0]
+        finally:
+            conn.close()
+
+    assert chunks() > 0
+
+    # Flip the ROW to draft without touching the file, reproducing the legacy
+    # state: unendorsed page, embeddings present, mtime unchanged.
+    conn = sqlite3.connect(cfg.db_path)
+    try:
+        conn.execute(
+            "UPDATE documents SET page_status = 'draft' WHERE path = ?",
+            (str(page.resolve()),),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    stats = index_shared_vault(cfg)[str(cfg.vault_path)]
+
+    assert stats["skipped"] >= 1, "file should still be mtime-skipped"
+    assert chunks() == 0, "stale draft vectors survived the sweep"
+    assert stats["chunks_purged"] > 0
+    # The page itself stays indexed and lexically findable.
+    assert str(page.resolve()) in _indexed_paths(cfg.db_path)
+
+
+def test_endorsed_page_keeps_its_embeddings_on_skip(tmp_path, monkeypatch):
+    """The purge must key on lifecycle state, not fire on every skip."""
+    from minni.index_all import index_shared_vault
+
+    _install_fake_embedder(monkeypatch)
+    cfg = _make_cfg(tmp_path)
+    vault = Path(cfg.vault_path)
+    page = vault / "wiki" / "concepts" / "kept.md"
+    _write_page(page, "accepted", "durable body " * 40)
+    index_shared_vault(cfg)
+
+    stats = index_shared_vault(cfg)[str(cfg.vault_path)]
+
+    conn = sqlite3.connect(cfg.db_path)
+    try:
+        n = conn.execute(
+            "SELECT COUNT(*) FROM chunk_embeddings ce JOIN documents d"
+            " ON d.doc_id = ce.doc_id WHERE d.path = ?",
+            (str(page.resolve()),),
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert n > 0, "an accepted page lost its embeddings on a no-op sweep"
+    assert stats["chunks_purged"] == 0
+
+
+def test_expiry_respects_a_ttl_extension_made_under_the_race(tmp_path, monkeypatch):
+    """Grok round 4 #2. Status was re-validated under the lock but expires_at
+    was not, so a concurrent re-stamp that pushed the TTL out -- leaving the
+    page a draft -- was expired anyway on the strength of the stale read."""
+    from minni.afm_writer import (
+        DRAFT_TTL_SECONDS,
+        _expire_stale_drafts,
+        _extract_frontmatter,
+        _write_one,
+    )
+
+    vault = tmp_path / "vault"
+    now = time.time()
+    page = vault / _write_one(
+        vault, _draft(page_id="page-ttl"), now=now - DRAFT_TTL_SECONDS - 86400
+    )["path"]
+
+    import minni.afm_writer as writer
+
+    real_extract = writer._extract_frontmatter
+    fired = {"done": False}
+    future = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now + 86400))
+
+    def extract_then_extend(text):
+        out = real_extract(text)
+        if not fired["done"] and "status: draft" in out:
+            fired["done"] = True
+            current = page.read_text(encoding="utf-8")
+            page.write_text(
+                re.sub(r"expires_at: '[^']+'", f"expires_at: '{future}'", current, count=1),
+                encoding="utf-8",
+            )
+        return out
+
+    monkeypatch.setattr(writer, "_extract_frontmatter", extract_then_extend)
+
+    _expire_stale_drafts(vault, now=now)
+
+    fm = _extract_frontmatter(page.read_text(encoding="utf-8"))
+    assert "status: draft" in fm, f"TTL extension was ignored and the page expired:\n{fm}"
+    assert "status: expired" not in fm
+
+
+def test_skip_path_canonicalizes_a_non_canonical_row(tmp_path, monkeypatch):
+    """Grok round 4 #3. Normalizing only on the reindex path leaves an
+    up-to-date row non-canonical forever."""
+    from minni.afm_writer import _write_one
+    from minni.index_all import index_shared_vault
+
+    _install_fake_embedder(monkeypatch)
+    cfg = _make_cfg(tmp_path)
+    vault = Path(cfg.vault_path)
+    written = _write_one(vault, _draft())
+    index_shared_vault(cfg)
+
+    page = (vault / written["path"]).resolve()
+    noncanonical = str(page.parent / ".." / page.parent.name / page.name)
+    conn = sqlite3.connect(cfg.db_path)
+    try:
+        conn.execute("UPDATE documents SET path = ? WHERE path = ?", (noncanonical, str(page)))
+        conn.commit()
+    finally:
+        conn.close()
+
+    # No mtime bump: this is the SKIP path, not the reindex path.
+    index_shared_vault(cfg)
+
+    rows = [p for p in _indexed_paths(cfg.db_path) if p.endswith(page.name)]
+    assert rows == [str(page)], f"row not canonicalized on the skip path: {rows}"

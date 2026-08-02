@@ -155,6 +155,30 @@ class VaultIndexer:
             return "artifact"
         return "knowledge"
 
+    def _enforce_embed_policy(self, row, stats: Dict) -> None:
+        """Strip embeddings from an unendorsed page that still has them.
+
+        Reached only on the mtime-skip path, where the file has not changed and
+        would otherwise never be revisited. Purging the chunks is enough --
+        ``documents`` and ``vault_fts`` rows are correct and stay, so the page
+        remains indexed and lexically findable, exactly as a freshly indexed
+        draft would be.
+        """
+        if (row["page_status"] or "candidate") not in UNEMBEDDED_STATUSES:
+            return
+        doc_id = row["doc_id"]
+        with self.db.cursor() as c:
+            c.execute(
+                "SELECT chunk_id FROM chunk_embeddings WHERE doc_id = ?", (doc_id,)
+            )
+            stale = [r["chunk_id"] for r in c.fetchall()]
+        if not stale:
+            return
+        with self.db.transaction() as c:
+            c.execute("DELETE FROM chunk_embeddings WHERE doc_id = ?", (doc_id,))
+        self._invalidate_rerank_chunks(stale)
+        stats["chunks_purged"] += len(stale)
+
     def _noncanonical_rows(self, vault_root: Path) -> Dict[str, Dict]:
         """Map resolved path -> row, for vault-owned rows stored non-canonically.
 
@@ -168,7 +192,7 @@ class VaultIndexer:
 
         out: Dict[str, Dict] = {}
         with self.db.cursor() as c:
-            c.execute("SELECT doc_id, last_modified, path FROM documents")
+            c.execute("SELECT doc_id, last_modified, path, page_status FROM documents")
             for row in c.fetchall():
                 stored = row["path"]
                 try:
@@ -215,7 +239,12 @@ class VaultIndexer:
                     full_resolved = str(full.resolve())
                     disk_files[full_resolved] = full.stat().st_mtime
 
-        stats = {"indexed": 0, "skipped": 0, "deleted": 0, "chunks": 0, "errors": 0}
+        stats = {
+            "indexed": 0, "skipped": 0, "deleted": 0, "chunks": 0,
+            # Vectors removed from pages that should never have had them (see
+            # _enforce_embed_policy); distinct from `deleted`, which is rows.
+            "chunks_purged": 0, "errors": 0,
+        }
         noncanonical_rows = self._noncanonical_rows(vault_root)
 
         # Phase 1: index new/changed files.
@@ -233,7 +262,8 @@ class VaultIndexer:
             try:
                 with self.db.cursor() as c:
                     c.execute(
-                        "SELECT doc_id, last_modified, path FROM documents WHERE path = ?",
+                        "SELECT doc_id, last_modified, path, page_status"
+                        " FROM documents WHERE path = ?",
                         (path,),
                     )
                     row = c.fetchone()
@@ -262,6 +292,24 @@ class VaultIndexer:
                     ) or 0.0
                 ) if row else 0.0
                 if row and last_modified >= mtime:
+                    # The FILE is unchanged, but that does not mean the row
+                    # satisfies the no-embed invariant. An install that ever
+                    # hand-ran the old index_all embedded every page, drafts
+                    # included; those vectors keep occupying the FAISS window
+                    # (retrieve() discards draft/expired only after it is
+                    # filled) and nothing on disk will change to trigger a
+                    # reindex until the TTL runs out. Enforce the policy from
+                    # the row rather than waiting for an mtime bump.
+                    self._enforce_embed_policy(row, stats)
+                    # Same reasoning for a row adopted under a non-canonical
+                    # spelling: normalizing only on the reindex path would
+                    # leave an up-to-date row non-canonical indefinitely.
+                    if row["path"] != path:
+                        with self.db.transaction() as c:
+                            c.execute(
+                                "UPDATE documents SET path=? WHERE doc_id=?",
+                                (path, row["doc_id"]),
+                            )
                     stats["skipped"] += 1
                     continue
 

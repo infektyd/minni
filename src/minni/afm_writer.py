@@ -52,6 +52,20 @@ _FM_AFM_AGENT = re.compile(r"^agent:\s*['\"]?afm-loop['\"]?\s*$", re.MULTILINE)
 _FM_PAGE_ID = re.compile(r"^page_id:\s*['\"]?([^'\"\s]+)", re.MULTILINE)
 
 
+def _expires_at_of(frontmatter: str) -> Optional[float]:
+    """The page's own ``expires_at`` as a UTC epoch, or None if unusable.
+
+    Tolerates the quotes yaml.safe_dump puts on the value
+    (`expires_at: '2026-06-22T…Z'`); the old unquoted-only pattern matched
+    nothing a writer had ever produced, which is why the live vault expired 0
+    of 1,213 drafts. Parsed with calendar.timegm via _parse_iso_utc, not
+    time.mktime, which reads a struct_time as LOCAL time and shifted every
+    comparison by the machine's UTC offset.
+    """
+    match = re.search(r"^expires_at:\s*['\"]?([0-9T:.Z-]+)", frontmatter, re.MULTILINE)
+    return _parse_iso_utc(match.group(1)) if match else None
+
+
 def _page_id_of(frontmatter: str) -> Optional[str]:
     """The page's own ``page_id``, used to share endorse_draft's per-page lock."""
     match = _FM_PAGE_ID.search(frontmatter)
@@ -396,21 +410,7 @@ def _expire_stale_drafts(vault: Path, now: Optional[float] = None) -> int:
             continue
         if not _FM_AFM_AGENT.search(frontmatter):
             continue
-        # Tolerate the quotes yaml.safe_dump puts on the value
-        # (`expires_at: '2026-06-22T…Z'`). The old unquoted-only pattern matched
-        # nothing a writer had ever produced, so on the live vault this expired
-        # zero of 1,213 drafts, the oldest of them months past TTL.
-        match = re.search(
-            r"^expires_at:\s*['\"]?([0-9T:.Z-]+)",
-            frontmatter,
-            re.MULTILINE,
-        )
-        if not match:
-            continue
-        # calendar.timegm, not time.mktime: the value is UTC (trailing Z) and
-        # mktime reads a struct_time as LOCAL time, which shifted every
-        # comparison by the machine's UTC offset.
-        expires = _parse_iso_utc(match.group(1))
+        expires = _expires_at_of(frontmatter)
         if expires is None:
             continue
         if expires < now:
@@ -431,6 +431,14 @@ def _expire_stale_drafts(vault: Path, now: Optional[float] = None) -> int:
                     # Endorsed (or already expired) while we were deciding.
                     continue
                 if not _FM_AFM_AGENT.search(current_fm):
+                    continue
+                # Re-check the TTL too, not just the status. A concurrent
+                # writer may have re-stamped this page with a LATER expires_at
+                # while still leaving it a draft (a TTL extension or manual
+                # edit); expiring it on the strength of the value we read
+                # before taking the lock would silently undo that.
+                current_expires = _expires_at_of(current_fm)
+                if current_expires is None or current_expires >= now:
                     continue
                 # Rewrite inside the frontmatter slice and splice it back, so
                 # the substitution can never land on body text that merely
