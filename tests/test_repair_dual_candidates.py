@@ -163,7 +163,10 @@ def test_repair_keeps_accepted_deletes_rejected_twin_leaves_learnings(tmp_path):
 
 
 def test_ensure_inbox_dedup_index_blocks_reinsert(tmp_path):
+    import sqlite3
+
     from minni.repair_dual_candidates import (
+        INBOX_DEDUP_INDEX,
         ensure_inbox_dedup_index,
         repair_duplicate_candidate_pairs,
     )
@@ -179,12 +182,22 @@ def test_ensure_inbox_dedup_index_blocks_reinsert(tmp_path):
     repair_duplicate_candidate_pairs(db, dry_run=False)
     created = ensure_inbox_dedup_index(db)
     assert created["status"] == "created"
+    assert created["index"] == INBOX_DEDUP_INDEX
     exists = ensure_inbox_dedup_index(db)
     assert exists["status"] == "exists"
 
     # Second insert with same inbox key must fail the unique index.
-    with pytest.raises(Exception):
+    with pytest.raises(sqlite3.IntegrityError):
         _insert_candidate(db, content=content, status="proposed")
+
+    # Medium #3: same (file, index) with a *different* content_sha1 is also blocked.
+    with pytest.raises(sqlite3.IntegrityError):
+        _insert_candidate(
+            db,
+            content="different body same key",
+            status="proposed",
+            content_sha1="deadbeef" * 5,
+        )
 
 
 def test_virtual_durable_not_flagged_missing_when_fts_present(tmp_path):
@@ -522,3 +535,234 @@ def test_ingest_skips_key_present_under_other_principal(tmp_path):
     with db.cursor() as c:
         c.execute("SELECT COUNT(*) AS n FROM candidate_packets")
         assert dict(c.fetchone())["n"] == 1
+
+
+def test_learning_uri_survives_prune_index(tmp_path):
+    """High #1: learning:// synthetic docs must not be pruned as missing-on-disk."""
+    from minni.repair_dual_candidates import (
+        find_missing_document_rows,
+        is_virtual_identity_path,
+        repair_index_disk_divergence,
+        run_full_repair,
+    )
+
+    db, cfg = _make_db(tmp_path)
+    vault = Path(cfg.vault_path)
+    vault.mkdir(parents=True, exist_ok=True)
+    evidence_file = vault / "wiki" / "evidence.md"
+    evidence_file.parent.mkdir(parents=True)
+    evidence_file.write_text("evidence body\n", encoding="utf-8")
+    learning_path = "learning://42"
+    assert is_virtual_identity_path(learning_path)
+    assert is_virtual_identity_path(learning_path, page_type="learning")
+
+    with db.transaction() as c:
+        c.execute(
+            """
+            INSERT INTO documents
+            (path, agent, sigil, last_modified, indexed_at, page_status,
+             privacy_level, page_type, layer, whole_document)
+            VALUES (?, 'learning:codex', 'L', 0, 0, 'accepted', 'safe',
+                    'learning', 'knowledge', 0)
+            """,
+            (learning_path,),
+        )
+        learning_doc_id = c.lastrowid
+        # memory_links off the learning identity (writeback graph edges).
+        # Evidence path is on-disk so only learning:// is the prune subject.
+        c.execute(
+            """
+            INSERT INTO documents
+            (path, agent, last_modified, indexed_at, page_status, privacy_level)
+            VALUES (?, 'codex', 0, 0, 'accepted', 'safe')
+            """,
+            (str(evidence_file),),
+        )
+        evidence_id = c.lastrowid
+        c.execute(
+            """
+            INSERT INTO memory_links
+            (source_doc_id, target_doc_id, link_type, weight, created_at)
+            VALUES (?, ?, 'derived_from', 1.0, 0)
+            """,
+            (learning_doc_id, evidence_id),
+        )
+
+    # No FTS by design for learning:// graph nodes — still must not be missing.
+    assert find_missing_document_rows(db, vault_roots=[cfg.vault_path]) == []
+
+    result = repair_index_disk_divergence(
+        db, dry_run=False, vault_roots=[cfg.vault_path]
+    )
+    assert result["missing_on_disk_non_virtual"] == 0
+    assert result["prune"]["deleted"] == 0
+
+    full = run_full_repair(
+        db,
+        dry_run=False,
+        create_index=False,
+        prune_index=True,
+        vault_roots=[cfg.vault_path],
+    )
+    assert full["index_disk"]["prune"]["deleted"] == 0
+
+    with db.cursor() as c:
+        c.execute("SELECT path FROM documents WHERE path=?", (learning_path,))
+        assert c.fetchone() is not None
+        c.execute(
+            "SELECT COUNT(*) AS n FROM memory_links WHERE source_doc_id=?",
+            (learning_doc_id,),
+        )
+        assert dict(c.fetchone())["n"] == 1
+
+
+def test_absolute_fts_backed_path_survives_missing_file(tmp_path):
+    """High #2: absolute FTS-backed vault paths survive home/NFS move."""
+    from minni.repair_dual_candidates import (
+        find_missing_document_rows,
+        repair_index_disk_divergence,
+    )
+
+    db, cfg = _make_db(tmp_path)
+    # Absolute path that never existed on disk (simulates moved home prefix).
+    abs_path = str(tmp_path / "old-home" / ".minni" / "codex-vault" / "wiki" / "foo.md")
+    assert not os.path.isfile(abs_path)
+
+    with db.transaction() as c:
+        c.execute(
+            """
+            INSERT INTO documents
+            (path, agent, last_modified, indexed_at, page_status, privacy_level)
+            VALUES (?, 'codex', 0, 0, 'accepted', 'safe')
+            """,
+            (abs_path,),
+        )
+        doc_id = c.lastrowid
+        c.execute(
+            """
+            INSERT INTO vault_fts (doc_id, path, content, agent, sigil)
+            VALUES (?, ?, 'last remaining recall body', 'codex', '❓')
+            """,
+            (doc_id, abs_path),
+        )
+
+    assert find_missing_document_rows(db, vault_roots=[cfg.vault_path]) == []
+    result = repair_index_disk_divergence(
+        db, dry_run=False, vault_roots=[cfg.vault_path]
+    )
+    assert result["missing_on_disk_non_virtual"] == 0
+    assert result["prune"]["deleted"] == 0
+    with db.cursor() as c:
+        c.execute("SELECT COUNT(*) AS n FROM documents")
+        assert dict(c.fetchone())["n"] == 1
+        c.execute("SELECT COUNT(*) AS n FROM vault_fts")
+        assert dict(c.fetchone())["n"] == 1
+
+    # Explicit force may prune recallable rows when the operator insists.
+    forced_missing = find_missing_document_rows(
+        db, vault_roots=[cfg.vault_path], force_prune_indexed=True
+    )
+    assert len(forced_missing) == 1
+    forced = repair_index_disk_divergence(
+        db,
+        dry_run=False,
+        vault_roots=[cfg.vault_path],
+        force_prune_indexed=True,
+    )
+    assert forced["missing_on_disk_non_virtual"] == 1
+    assert forced["prune"]["deleted"] == 1
+
+
+def test_absolute_chunk_backed_path_survives_missing_file(tmp_path):
+    """High #2: chunk-backed absolute paths also protected without FTS."""
+    from minni.repair_dual_candidates import find_missing_document_rows
+
+    db, cfg = _make_db(tmp_path)
+    abs_path = str(tmp_path / "moved" / "wiki" / "chunked.md")
+    with db.transaction() as c:
+        c.execute(
+            """
+            INSERT INTO documents
+            (path, agent, last_modified, indexed_at, page_status, privacy_level)
+            VALUES (?, 'codex', 0, 0, 'accepted', 'safe')
+            """,
+            (abs_path,),
+        )
+        doc_id = c.lastrowid
+        c.execute(
+            """
+            INSERT INTO chunk_embeddings
+            (doc_id, chunk_index, chunk_text, embedding, computed_at)
+            VALUES (?, 0, 'chunk body', X'00', 0)
+            """,
+            (doc_id,),
+        )
+
+    assert find_missing_document_rows(db, vault_roots=[cfg.vault_path]) == []
+
+
+def test_ingest_mid_batch_unique_still_commits_later(tmp_path, monkeypatch):
+    """Medium #4: IntegrityError on mid-batch UNIQUE does not abort later inserts."""
+    import sqlite3
+
+    from minni.afm_passes import inbox_ingest as ii
+    from minni.repair_dual_candidates import ensure_inbox_dedup_index
+
+    db, cfg = _make_db(tmp_path)
+    ensure_inbox_dedup_index(db)
+
+    # Pre-seed key (file=a.json, index=0) so the first insert hits UNIQUE.
+    _insert_candidate(
+        db,
+        content="pre-existing twin",
+        status="accepted",
+        inbox_file="a.json",
+        candidate_index=0,
+        principal="codex",
+    )
+
+    # Force the insert path to attempt both keys (bypass pre-txn existing set).
+    monkeypatch.setattr(ii, "_existing_keys", lambda db, principals=None: set())
+
+    # Craft to_insert-equivalent via a synthetic scan: two candidates in one file.
+    inbox = tmp_path / "codex-vault" / "inbox"
+    inbox.mkdir(parents=True)
+    (inbox / "a.json").write_text(
+        json.dumps(
+            {
+                "slug": "s",
+                "createdAt": "2026-06-06T12:00:00.000Z",
+                "kind": "codex_stop_candidates",
+                "agent_id": "codex",
+                "workspace_id": "default",
+                "candidates": [
+                    "pre-existing twin",  # index 0 → UNIQUE / already present
+                    "brand new second lesson",  # index 1 → must still insert
+                ],
+                "log_only": [],
+                "expires": [],
+                "do_not_store": [],
+                "last_task": "t",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    res = ii.ingest(db, cfg, inboxes=[inbox], dry_run=False)
+    assert res["inserted"] == 1
+    assert res["already_present"] >= 1
+    with db.cursor() as c:
+        c.execute("SELECT content FROM candidate_packets ORDER BY candidate_id")
+        contents = [dict(r)["content"] for r in c.fetchall()]
+    assert "brand new second lesson" in contents
+    assert len(contents) == 2
+
+    # Sanity: IntegrityError is the type raised by the unique index itself.
+    with pytest.raises(sqlite3.IntegrityError):
+        _insert_candidate(
+            db,
+            content="another clash",
+            status="proposed",
+            inbox_file="a.json",
+            candidate_index=1,
+        )

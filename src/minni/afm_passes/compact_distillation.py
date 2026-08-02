@@ -64,6 +64,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import sqlite3
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -465,13 +466,11 @@ def distill(db, config, inboxes: Optional[List[Path]] = None,
                             now,
                         ),
                     )
-                except Exception as exc:
+                except sqlite3.IntegrityError:
                     # Unique-index collision (post-#239 repair) or rare race:
                     # treat as already_present rather than aborting the batch.
-                    if "UNIQUE" in str(exc).upper():
-                        already += 1
-                        continue
-                    raise
+                    already += 1
+                    continue
                 txn_existing.add(key)
                 inserted += 1
 

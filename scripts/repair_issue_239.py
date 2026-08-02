@@ -88,6 +88,14 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
+        "--force-prune-indexed",
+        action="store_true",
+        help=(
+            "with --prune-index, also prune FTS/chunk-backed document rows "
+            "whose files are missing (default keeps recallable rows)"
+        ),
+    )
+    parser.add_argument(
         "--vault",
         action="append",
         default=[],
@@ -122,6 +130,7 @@ def main(argv: list[str] | None = None) -> int:
             dry_run=not args.apply,
             create_index=not args.no_index,
             prune_index=args.prune_index,
+            force_prune_indexed=args.force_prune_indexed,
             vault_roots=vault_roots,
         )
     finally:

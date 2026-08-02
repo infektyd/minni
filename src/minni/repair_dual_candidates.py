@@ -34,6 +34,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
 from collections import defaultdict
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -55,6 +56,12 @@ _STATUS_RANK: Dict[str, int] = {
 
 REPAIR_ACTION_TYPE = "issue239_dual_resolve"
 VIRTUAL_DURABLE_MARKER = "/_durable/"
+# Non-filesystem document identities (writeback learning nodes, future schemes).
+_URI_SCHEME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.\-]*://")
+# App-level inbox idempotency key (matches inbox_ingest / compact_distillation).
+INBOX_DEDUP_INDEX = "idx_candidate_packets_inbox_key_unique"
+# Legacy weaker index that included content_sha1; dropped on ensure.
+LEGACY_INBOX_DEDUP_INDEX = "idx_candidate_packets_inbox_sha1_unique"
 
 
 def _parse_derived(raw: Any) -> Optional[Dict[str, Any]]:
@@ -71,13 +78,16 @@ def _parse_derived(raw: Any) -> Optional[Dict[str, Any]]:
     return obj if isinstance(obj, dict) else None
 
 
-def _inbox_key(derived: Dict[str, Any]) -> Optional[Tuple[str, int, str]]:
-    """Return (inbox_file, candidate_index, content_sha1) for inbox-sourced rows."""
+def _inbox_key(derived: Dict[str, Any]) -> Optional[Tuple[str, int]]:
+    """Return (inbox_file, candidate_index) for inbox-sourced rows.
+
+    Matches app-level idempotency in ``inbox_ingest`` / ``compact_distillation``
+    (file + index only). ``content_sha1`` is audit metadata, not part of the key.
+    """
     if derived.get("source") != "inbox":
         return None
     inbox_file = derived.get("inbox_file")
     idx = derived.get("candidate_index")
-    sha = derived.get("content_sha1")
     if not isinstance(inbox_file, str) or not inbox_file:
         return None
     if isinstance(idx, bool) or not isinstance(idx, (int, float)):
@@ -85,10 +95,7 @@ def _inbox_key(derived: Dict[str, Any]) -> Optional[Tuple[str, int, str]]:
     idx_i = int(idx)
     if idx_i != idx:  # reject non-integral floats
         return None
-    if not isinstance(sha, str) or not sha:
-        # Fall back to empty marker so pre-sha1 rows still group by file+index.
-        sha = ""
-    return (inbox_file, idx_i, sha)
+    return (inbox_file, idx_i)
 
 
 def status_rank(status: Optional[str]) -> int:
@@ -109,11 +116,13 @@ def choose_winner(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 def find_duplicate_candidate_groups(db) -> List[Dict[str, Any]]:
-    """Group inbox-sourced candidates by (inbox_file, index, content_sha1).
+    """Group inbox-sourced candidates by (inbox_file, candidate_index).
 
     Returns only groups with 2+ rows. Each group dict has ``key`` and ``rows``.
+    Grouping matches app-level idempotency (file + index); ``content_sha1`` is
+    not part of the collapse key.
     """
-    groups: Dict[Tuple[str, int, str], List[Dict[str, Any]]] = defaultdict(list)
+    groups: Dict[Tuple[str, int], List[Dict[str, Any]]] = defaultdict(list)
     with db.cursor() as c:
         c.execute(
             """
@@ -132,6 +141,7 @@ def find_duplicate_candidate_groups(db) -> List[Dict[str, Any]]:
             if key is None:
                 continue
             item["_key"] = key
+            item["_content_sha1"] = derived.get("content_sha1")
             groups[key].append(item)
 
     out: List[Dict[str, Any]] = []
@@ -145,7 +155,7 @@ def find_duplicate_candidate_groups(db) -> List[Dict[str, Any]]:
                 "key": {
                     "inbox_file": key[0],
                     "candidate_index": key[1],
-                    "content_sha1": key[2],
+                    "content_sha1": winner.get("_content_sha1"),
                 },
                 "winner_id": int(winner["candidate_id"]),
                 "winner_status": winner.get("status"),
@@ -271,18 +281,28 @@ def repair_duplicate_candidate_pairs(
 
 
 def ensure_inbox_dedup_index(db) -> Dict[str, Any]:
-    """Create a partial unique index that blocks re-insertion of dual inbox keys.
+    """Create a partial unique index matching app-level inbox idempotency.
 
-    Requires duplicates to already be collapsed (call repair first). Returns
-    status describing whether the index exists / was created / failed.
+    Key is ``(inbox_file, candidate_index)`` for ``source='inbox'`` — the same
+    key ``inbox_ingest`` / ``compact_distillation`` use. ``content_sha1`` is
+    not part of the constraint (it is audit/grouping metadata only).
+
+    Requires (file, index) duplicates to already be collapsed (call repair
+    first). Migrates off the legacy weaker ``…_inbox_sha1_unique`` index if
+    present. Returns status describing whether the index exists / was created
+    / failed.
     """
-    index_name = "idx_candidate_packets_inbox_sha1_unique"
+    index_name = INBOX_DEDUP_INDEX
     with db.cursor() as c:
         c.execute(
             "SELECT 1 FROM sqlite_master WHERE type='index' AND name=? LIMIT 1",
             (index_name,),
         )
         if c.fetchone():
+            # Drop legacy weaker index if both somehow exist.
+            c.execute(
+                f"DROP INDEX IF EXISTS {LEGACY_INBOX_DEDUP_INDEX}"
+            )
             return {"status": "exists", "index": index_name}
 
     remaining = find_duplicate_candidate_groups(db)
@@ -295,21 +315,22 @@ def ensure_inbox_dedup_index(db) -> Dict[str, Any]:
 
     try:
         with db.transaction() as c:
-            # Expression unique index: same inbox file + index + content_sha1
-            # may only appear once when source=inbox. SQLite 3.9+ (macOS/homebrew
-            # well above that). NULL content_sha1 rows are excluded by the
-            # json_extract IS NOT NULL guard.
+            # Drop the weaker (file, index, sha1) index so the stronger
+            # (file, index) constraint is the only inbox uniqueness backstop.
+            c.execute(f"DROP INDEX IF EXISTS {LEGACY_INBOX_DEDUP_INDEX}")
+            # Expression unique index: same inbox file + candidate_index may
+            # only appear once when source=inbox. SQLite 3.9+ (macOS/homebrew
+            # well above that).
             c.execute(
                 f"""
                 CREATE UNIQUE INDEX IF NOT EXISTS {index_name}
                 ON candidate_packets (
                     json_extract(derived_from, '$.inbox_file'),
-                    CAST(json_extract(derived_from, '$.candidate_index') AS INTEGER),
-                    json_extract(derived_from, '$.content_sha1')
+                    CAST(json_extract(derived_from, '$.candidate_index') AS INTEGER)
                 )
                 WHERE json_extract(derived_from, '$.source') = 'inbox'
                   AND json_extract(derived_from, '$.inbox_file') IS NOT NULL
-                  AND json_extract(derived_from, '$.content_sha1') IS NOT NULL
+                  AND json_extract(derived_from, '$.candidate_index') IS NOT NULL
                 """
             )
         return {"status": "created", "index": index_name}
@@ -325,6 +346,25 @@ def is_virtual_durable_path(path: str) -> bool:
     # Normalize so Windows and doubled separators still match.
     norm = path.replace("\\", "/")
     return VIRTUAL_DURABLE_MARKER in norm
+
+
+def is_virtual_identity_path(
+    path: str, page_type: Optional[str] = None
+) -> bool:
+    """True for non-filesystem document identities that must not be disk-pruned.
+
+    Covers:
+      * virtual ``_durable`` store-time paths
+      * URI identities such as ``learning://<id>`` (writeback graph nodes)
+      * rows with ``page_type='learning'`` (synthetic learning docs)
+    """
+    if is_virtual_durable_path(path):
+        return True
+    if page_type is not None and str(page_type).strip().lower() == "learning":
+        return True
+    if path and _URI_SCHEME_RE.match(path):
+        return True
+    return False
 
 
 def _normalize_vault_roots(
@@ -393,34 +433,65 @@ def _doc_ids_with_fts(db, doc_ids: Sequence[int]) -> set:
     return found
 
 
+def _doc_ids_with_chunks(db, doc_ids: Sequence[int]) -> set:
+    """Return the subset of doc_ids that still have chunk_embeddings rows."""
+    if not doc_ids:
+        return set()
+    found: set = set()
+    ids = [int(x) for x in doc_ids]
+    with db.cursor() as c:
+        for i in range(0, len(ids), 400):
+            chunk = ids[i : i + 400]
+            placeholders = ",".join("?" * len(chunk))
+            try:
+                c.execute(
+                    f"SELECT DISTINCT doc_id FROM chunk_embeddings "
+                    f"WHERE doc_id IN ({placeholders})",
+                    chunk,
+                )
+            except Exception:
+                # Table may be missing on partial schemas / mid-migration.
+                return found
+            for row in c.fetchall():
+                found.add(int(row["doc_id"] if hasattr(row, "keys") else row[0]))
+    return found
+
+
 def find_missing_document_rows(
     db,
     *,
     include_virtual_durable: bool = False,
     vault_roots: Optional[Sequence[str]] = None,
+    force_prune_indexed: bool = False,
 ) -> List[Dict[str, Any]]:
     """Document rows whose path is missing on disk after vault-root resolution.
 
-    By default **excludes** virtual ``_durable`` paths (they are not files).
-    Set ``include_virtual_durable=True`` only for diagnostics.
+    By default **excludes** virtual identities (``_durable``, ``learning://``,
+    other ``scheme://`` URIs, ``page_type='learning'``). Set
+    ``include_virtual_durable=True`` only for diagnostics.
 
     Relative ``documents.path`` values (vault bridge) are resolved against
-    ``vault_roots`` before the existence check. Relative paths that still
-    carry FTS/chunk content are **never** classified missing unless every
-    resolved absolute candidate is confirmed absent — this prevents an
-    operator running repair from the wrong CWD from wiping healthy index
-    rows.
+    ``vault_roots`` before the existence check.
+
+    FTS-backed and chunk-backed rows (relative **or** absolute) are **never**
+    classified missing unless ``force_prune_indexed=True``. That prevents an
+    operator from wiping the last recall copy when a vault moves, NFS blips,
+    or home prefix changes — the file may be gone but the index still holds
+    the content.
     """
     roots = _normalize_vault_roots(vault_roots)
     missing: List[Dict[str, Any]] = []
     with db.cursor() as c:
-        c.execute("SELECT doc_id, path, agent, page_status FROM documents")
+        c.execute(
+            "SELECT doc_id, path, agent, page_status, page_type FROM documents"
+        )
         rows = [dict(r) for r in c.fetchall()]
 
     candidates: List[Dict[str, Any]] = []
     for row in rows:
         path = row.get("path") or ""
-        if is_virtual_durable_path(path) and not include_virtual_durable:
+        page_type = row.get("page_type")
+        if is_virtual_identity_path(path, page_type) and not include_virtual_durable:
             continue
         if not path:
             continue
@@ -431,18 +502,19 @@ def find_missing_document_rows(
     if not candidates:
         return []
 
-    # Protect relative FTS-backed rows when we could not resolve them: without
-    # a confirmed absolute miss under a known vault root, treating them as
-    # missing is unsafe (wrong CWD / NFS blip / multi-vault layout).
+    # Protect recallable rows: FTS/chunk content is the last remaining copy
+    # when the on-disk file is gone (home move, NFS unmount, wrong vault root).
     fts_backed = _doc_ids_with_fts(db, [r["doc_id"] for r in candidates])
+    chunk_backed = _doc_ids_with_chunks(db, [r["doc_id"] for r in candidates])
     for row in candidates:
         path = row.get("path") or ""
         is_rel = not os.path.isabs(path)
-        if is_rel and int(row["doc_id"]) in fts_backed:
-            # Relative + still recallable → keep unless roots were provided
-            # and every root was checked (resolve already returned None).
-            # Even with roots, a relative FTS-backed row may live under a
-            # vault we were not told about; refuse to prune.
+        doc_id = int(row["doc_id"])
+        if not force_prune_indexed and (
+            doc_id in fts_backed or doc_id in chunk_backed
+        ):
+            # Still recallable via FTS/chunks — refuse to prune unless the
+            # operator explicitly opts into --force-prune-indexed.
             continue
         if is_rel and not roots:
             # No vault roots + relative path: cannot prove absence.
@@ -515,22 +587,26 @@ def repair_index_disk_divergence(
     *,
     dry_run: bool = True,
     vault_roots: Optional[Sequence[str]] = None,
+    force_prune_indexed: bool = False,
 ) -> Dict[str, Any]:
     """Prune safe-to-remove index rows; report virtual durable separately.
 
     Safe to remove:
       * non-virtual document paths missing on disk after vault-root resolution
-        (relative FTS-backed paths are never pruned — see
-        ``find_missing_document_rows``)
+        **and** without FTS/chunk content (unless ``force_prune_indexed``)
       * virtual ``_durable`` rows with no ``vault_fts`` content
 
     NOT removed (by design):
-      * virtual ``_durable`` rows that still carry FTS/chunk content — these
-        are the store-time semantic index for durable learnings.
-      * relative non-virtual paths that still have FTS content
+      * virtual ``_durable`` / ``learning://`` / URI / ``page_type=learning``
+        identities
+      * any path (relative **or** absolute) that still has FTS or chunk content
+        — unless ``force_prune_indexed=True``
     """
     missing_real = find_missing_document_rows(
-        db, include_virtual_durable=False, vault_roots=vault_roots
+        db,
+        include_virtual_durable=False,
+        vault_roots=vault_roots,
+        force_prune_indexed=force_prune_indexed,
     )
     orphan_virtual = find_orphan_virtual_durable(db)
     virtual_healthy = 0
@@ -554,10 +630,12 @@ def repair_index_disk_divergence(
         "missing_on_disk_non_virtual": len(missing_real),
         "orphan_virtual_durable": len(orphan_virtual),
         "healthy_virtual_durable_kept": virtual_healthy,
+        "force_prune_indexed": force_prune_indexed,
         "virtual_durable_note": (
-            "paths under /_durable/ are synthetic index identities; missing "
-            "files are expected when FTS content is present. Relative "
-            "non-virtual paths with FTS content are never pruned."
+            "paths under /_durable/ and URI identities (learning://, etc.) "
+            "are synthetic; missing files are expected. FTS/chunk-backed "
+            "rows (relative or absolute) are never pruned unless "
+            "--force-prune-indexed is set."
         ),
         "prune": prune_result,
         "sample_missing": [
@@ -575,6 +653,7 @@ def run_full_repair(
     dry_run: bool = True,
     create_index: bool = True,
     prune_index: bool = False,
+    force_prune_indexed: bool = False,
     vault_roots: Optional[Sequence[str]] = None,
 ) -> Dict[str, Any]:
     """Run dual-candidate repair (+ optional unique index / index prune).
@@ -582,12 +661,16 @@ def run_full_repair(
     Default is dual-candidates only. Destructive document-index pruning
     requires ``prune_index=True`` (CLI: ``--prune-index``) so operators cannot
     accidentally wipe relative-path or offline-vault index rows while fixing
-    dual-resolution twins.
+    dual-resolution twins. Even with prune enabled, FTS/chunk-backed rows are
+    kept unless ``force_prune_indexed=True``.
     """
     dual = repair_duplicate_candidate_pairs(db, dry_run=dry_run)
     if prune_index:
         index: Dict[str, Any] = repair_index_disk_divergence(
-            db, dry_run=dry_run, vault_roots=vault_roots
+            db,
+            dry_run=dry_run,
+            vault_roots=vault_roots,
+            force_prune_indexed=force_prune_indexed,
         )
     else:
         index = {
@@ -597,6 +680,7 @@ def run_full_repair(
             "missing_on_disk_non_virtual": 0,
             "orphan_virtual_durable": 0,
             "healthy_virtual_durable_kept": 0,
+            "force_prune_indexed": force_prune_indexed,
             "virtual_durable_note": (
                 "index prune skipped by default; dual-candidate repair does "
                 "not touch documents/vault_fts/chunk_embeddings"
@@ -615,4 +699,5 @@ def run_full_repair(
         "index_disk": index,
         "inbox_dedup_index": index_status,
         "prune_index": prune_index,
+        "force_prune_indexed": force_prune_indexed,
     }

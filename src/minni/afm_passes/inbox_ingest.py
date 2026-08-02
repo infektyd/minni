@@ -73,6 +73,7 @@ import hashlib
 import json
 import os
 import re
+import sqlite3
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -471,13 +472,11 @@ def ingest(db, config, inboxes: Optional[List[Path]] = None,
                             r["proposed_at"],
                         ),
                     )
-                except Exception as exc:
+                except sqlite3.IntegrityError:
                     # Unique-index collision (post-#239 repair) or rare race:
                     # treat as already_present rather than aborting the batch.
-                    if "UNIQUE" in str(exc).upper():
-                        already += 1
-                        continue
-                    raise
+                    already += 1
+                    continue
                 txn_existing.add(key)
                 inserted += 1
 
