@@ -946,84 +946,12 @@ def test_write_timeout_then_worker_success_applies_lifecycle_once(monkeypatch):
 
 
 def test_write_finishes_before_defer_flag_still_applies_or_returns_result(monkeypatch):
-    """Round 11: the race Grok named — _write_batch done, out['result'] set,
-    but defer flag not yet set and done not yet set when the waiter times out.
-    Must not drop lifecycle or count a false timeout."""
-    import threading
-
+    """Round 11: result present in out before done.is_set — must not count timeout."""
     from minni import afm_writer
 
     afm_writer.reset_pass_counters()
     applied = []
-    write_done = threading.Event()
-    # Block after out["result"] is published but before done.set() would matter —
-    # we drive the boundary by calling _process_job pieces carefully.
-
-    real_write_batch = None
-
-    def _write_then_pause(job):
-        result = {"drafts_written": [{"page_id": "d1"}], "inbox_path": "x"}
-        write_done.set()
-        return result
-
-    monkeypatch.setattr(afm_writer, "_write_batch", _write_then_pause)
-    monkeypatch.setattr(afm_writer, "_ensure_worker", lambda: None)
-
-    # Scenario A: write completes before waiter sets defer — out has result,
-    # submit_drafts timeout path must return the result and NOT bump timeouts.
-    done = threading.Event()
-    out: dict = {}
     job = {
-        "pass_name": "consolidation",
-        "drafts": [{"title": "t"}],
-        "lifecycle": {
-            "promote_candidate_ids": [9],
-            "dedup_candidate_ids": [],
-            "review_candidate_ids": [],
-        },
-        "lifecycle_handler": lambda life: applied.append(dict(life)),
-    }
-
-    # Simulate worker: write, publish result, but delay done.set() so the
-    # old bug (require done.is_set()) would miss the result.
-    def _worker_publish_before_done():
-        try:
-            out["result"] = afm_writer._write_batch(job)
-        finally:
-            # Waiter races here with result present and done still clear.
-            time.sleep(0.05)
-            done.set()
-            if "result" in out:
-                afm_writer._maybe_apply_deferred_lifecycle(job)
-
-    import time
-
-    t = threading.Thread(target=_worker_publish_before_done)
-    t.start()
-    assert write_done.wait(2)
-
-    # Waiter sees result in out without done — must return success, no timeout.
-    assert "result" in out
-    assert not done.is_set() or True  # may race; the out check is the pin
-    # Mirror the fixed timeout branch:
-    if "result" in out:
-        returned = out["result"]
-    else:
-        returned = None
-    assert returned is not None
-    assert returned["drafts_written"]
-    assert afm_writer._WRITE_TIMEOUTS == 0, "landed write must not count as timeout"
-    # No defer was set (waiter got the result) — lifecycle stays on compile path.
-    # Ensure we did not spuriously apply via worker without defer:
-    # (handler only runs with defer flag)
-    assert applied == [] or job.get("defer_lifecycle_to_worker")
-    t.join(timeout=2)
-
-    # Scenario B: write finished, defer set after result published — apply once.
-    applied.clear()
-    done2 = threading.Event()
-    out2: dict = {}
-    job2 = {
         "pass_name": "consolidation",
         "drafts": [{"title": "t2"}],
         "lifecycle": {
@@ -1032,15 +960,130 @@ def test_write_finishes_before_defer_flag_still_applies_or_returns_result(monkey
             "review_candidate_ids": [4],
         },
         "lifecycle_handler": lambda life: applied.append(dict(life)),
+        "defer_lifecycle_to_worker": True,
     }
-    # Publish result first (write done), THEN set defer, THEN done + apply
-    # — the ordering _process_job now uses, with defer already true.
-    out2["result"] = {"drafts_written": [{"page_id": "d2"}]}
-    job2["defer_lifecycle_to_worker"] = True
-    done2.set()
-    afm_writer._maybe_apply_deferred_lifecycle(job2)
+    afm_writer._maybe_apply_deferred_lifecycle(job)
     assert len(applied) == 1
     assert applied[0]["promote_candidate_ids"] == [3]
+    # Claim-before-invoke: second call is a no-op.
+    afm_writer._maybe_apply_deferred_lifecycle(job)
+    assert len(applied) == 1
+    afm_writer.reset_pass_counters()
+
+
+def test_deferred_lifecycle_holds_in_flight_until_handler_returns(monkeypatch):
+    """Round 12: in-flight must not clear before deferred lifecycle finishes,
+    or a concurrent resubmit mints a second draft set for the same candidates."""
+    import threading
+    import queue as queue_mod
+
+    from minni import afm_writer
+
+    afm_writer.reset_pass_counters()
+    monkeypatch.setattr(afm_writer, "_ensure_worker", lambda: None)
+    monkeypatch.setattr(afm_writer, "_WORK_QUEUE", queue_mod.Queue(maxsize=4))
+
+    handler_entered = threading.Event()
+    handler_release = threading.Event()
+    applied = []
+
+    def _slow_handler(life):
+        handler_entered.set()
+        handler_release.wait(timeout=5)
+        applied.append(dict(life))
+
+    def _fast_write(job):
+        return {"drafts_written": [{"page_id": "d1"}], "inbox_path": "x"}
+
+    monkeypatch.setattr(afm_writer, "_write_batch", _fast_write)
+
+    done = threading.Event()
+    out: dict = {}
+    job = {
+        "pass_name": "consolidation",
+        "drafts": [{"title": "t"}],
+        "lifecycle": {
+            "promote_candidate_ids": [1],
+            "dedup_candidate_ids": [],
+            "review_candidate_ids": [],
+        },
+        "lifecycle_handler": _slow_handler,
+        "defer_lifecycle_to_worker": True,
+    }
+    # Manually register in-flight the way submit_drafts does.
+    with afm_writer._IN_FLIGHT_LOCK:
+        afm_writer._IN_FLIGHT_PER_PASS["consolidation"] = done
+
+    def _worker():
+        afm_writer._process_job(job, done, out)
+
+    t = threading.Thread(target=_worker)
+    t.start()
+    assert handler_entered.wait(2), "lifecycle handler must start before done.set"
+    assert not done.is_set(), (
+        "in-flight Event must stay unset while deferred lifecycle runs"
+    )
+    # Concurrent resubmit must still be refused.
+    second = afm_writer.submit_drafts(
+        {"pass_name": "consolidation", "drafts": [{"title": "dup"}]},
+        timeout=0.05,
+    )
+    assert second["status"] == "write_in_flight", (
+        f"resubmit during deferred lifecycle must be refused, got {second!r}"
+    )
+    handler_release.set()
+    t.join(timeout=5)
+    assert done.is_set()
+    assert len(applied) == 1
+    afm_writer.reset_pass_counters()
+
+
+def test_timeout_counter_not_bumped_when_result_present_under_lock(monkeypatch):
+    """Round 12: if out already has a result when the wait times out, do not
+    stamp write_timeouts (phantom backlogged on a landed write)."""
+    import threading
+    import queue as queue_mod
+
+    from minni import afm_writer
+
+    afm_writer.reset_pass_counters()
+    monkeypatch.setattr(afm_writer, "_ensure_worker", lambda: None)
+    monkeypatch.setattr(afm_writer, "_WORK_QUEUE", queue_mod.Queue(maxsize=4))
+
+    # Publish result into out immediately; never set done until after submit
+    # would have timed out — but out has the result so the lock path returns it.
+    hold = threading.Event()
+
+    def _write_publish_then_hold(job):
+        # The real worker path is not used; we inject via a custom process.
+        return {"drafts_written": [{"page_id": "late"}], "inbox_path": "x"}
+
+    monkeypatch.setattr(afm_writer, "_write_batch", _write_publish_then_hold)
+
+    # Drive submit_drafts with a fake worker that fills out before wait ends.
+    original_put = afm_writer._WORK_QUEUE.put_nowait
+
+    def _put_and_prefill(item):
+        job, done, out = item
+        out["result"] = {"drafts_written": [{"page_id": "prefilled"}]}
+        # Do not set done — waiter times out, but result is under lock.
+        # Leave done unset so wait() returns False.
+        original_put(item)
+
+    monkeypatch.setattr(afm_writer._WORK_QUEUE, "put_nowait", _put_and_prefill)
+
+    res = afm_writer.submit_drafts(
+        {
+            "pass_name": "p-late",
+            "drafts": [{"title": "t"}],
+            "lifecycle": {"promote_candidate_ids": [1]},
+        },
+        timeout=0.05,
+    )
+    assert "drafts_written" in res, f"expected success result, got {res!r}"
+    assert afm_writer._WRITE_TIMEOUTS == 0, (
+        "a result present under the lock must not count as write_timeout"
+    )
     afm_writer.reset_pass_counters()
 
 
