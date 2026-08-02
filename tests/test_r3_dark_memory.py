@@ -1519,11 +1519,15 @@ def test_ensure_faiss_loaded_rebuilds_once_across_workers(tmp_path, monkeypatch)
         eng.db.close()
 
 
-def test_disk_save_skipped_when_db_moves_mid_rebuild(tmp_path, monkeypatch):
-    """Grok round 9 #3, checksum half. A durable insert between the ensure's
+def test_db_moving_mid_rebuild_leaves_the_index_complete_or_cold(tmp_path, monkeypatch):
+    """Grok round 9 #3 / round 10 #1. A durable insert between the ensure's
     SELECT and the save used to produce a disk cache whose checksum matches
-    the new DB while the vectors omit the new rows. If the checksum moved
-    during the rebuild, the save must be skipped."""
+    the new DB while the vectors omit the new rows. Round 9 skipped the save —
+    but left the IN-MEMORY index warm and incomplete, which count>0 gates then
+    protect until the next invalidate: the in-memory twin of the same bug (the
+    round-9 version of this test asserted count>0 here, codifying it). Under a
+    DB that will not sit still, ensure must end complete or COLD — never
+    warm-partial."""
     import minni.faiss_persist as persist
     from minni.index_all import index_shared_vault
 
@@ -1536,7 +1540,8 @@ def test_disk_save_skipped_when_db_moves_mid_rebuild(tmp_path, monkeypatch):
     eng = _engine(cfg)
     try:
         eng.faiss_index.invalidate()
-        # Every checksum probe sees a different value — the moving-DB case.
+        # Every checksum probe sees a different value — a DB that never
+        # stabilizes, so no build's snapshot can ever be trusted as complete.
         ticks = iter(range(1000))
         monkeypatch.setattr(
             persist, "compute_db_checksum", lambda conn: f"gen-{next(ticks)}"
@@ -1547,12 +1552,163 @@ def test_disk_save_skipped_when_db_moves_mid_rebuild(tmp_path, monkeypatch):
 
         eng._ensure_faiss_loaded()
 
-        assert eng.faiss_index.count > 0, "rebuild did not warm the index"
+        assert eng.faiss_index.count == 0, (
+            "ensure left a warm index built from a snapshot the DB moved "
+            "under — semantically invisible rows until the next invalidate"
+        )
         assert not os.path.exists(manifest), (
             "a disk cache was written from a rebuild the DB moved under"
         )
     finally:
         eng.db.close()
+
+
+def test_ensure_picks_up_rows_inserted_mid_rebuild(tmp_path, monkeypatch):
+    """Grok round 10 #1, the recovery half. A durable insert that lands
+    between the ensure's SELECT and its build must end up in the warm index:
+    the checksum re-check retries the SELECT instead of finalizing a build
+    that omits the new rows."""
+    from minni.faiss_index import FAISSIndex
+    from minni.index_all import index_shared_vault
+
+    _install_fake_embedder(monkeypatch)
+    cfg = _make_cfg(tmp_path)
+    _write_page(Path(cfg.vault_path) / "wiki" / "concepts" / "p.md", "accepted",
+                "body text " * 60)
+    index_shared_vault(cfg)
+
+    conn = sqlite3.connect(cfg.db_path)
+    try:
+        base = conn.execute("SELECT COUNT(*) FROM chunk_embeddings").fetchone()[0]
+        doc_id = conn.execute("SELECT doc_id FROM documents LIMIT 1").fetchone()[0]
+    finally:
+        conn.close()
+    assert base > 0
+
+    def insert_row():
+        c = sqlite3.connect(cfg.db_path)
+        try:
+            c.execute(
+                """INSERT INTO chunk_embeddings
+                   (doc_id, chunk_index, chunk_text, embedding, heading_context,
+                    model_name, computed_at, layer)
+                   VALUES (?,?,?,?,?,?,?,?)""",
+                (doc_id, 999, "late arrival",
+                 np.zeros(cfg.embedding_dim, dtype=np.float32).tobytes(),
+                 "", cfg.embedding_model, time.time(), "knowledge"),
+            )
+            c.commit()
+        finally:
+            c.close()
+
+    eng = _engine(cfg)
+    try:
+        # The durable insert lands exactly between the ensure's SELECT and its
+        # build: the first build call commits a new row before building.
+        real_build = FAISSIndex.build_from_vectors
+        calls = {"n": 0}
+
+        def racing_build(self, ids, vecs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                insert_row()
+            return real_build(self, ids, vecs)
+
+        monkeypatch.setattr(FAISSIndex, "build_from_vectors", racing_build)
+        eng._ensure_faiss_loaded()
+
+        assert eng.faiss_index.count == base + 1, (
+            f"warm index has {eng.faiss_index.count} vectors, DB has "
+            f"{base + 1}: a row inserted mid-rebuild stayed semantically "
+            "invisible"
+        )
+    finally:
+        eng.db.close()
+
+
+def test_durable_refresh_survives_an_ensure_that_missed_its_rows(tmp_path, monkeypatch):
+    """Grok round 10 #1, durable-side belt. add_batch returning False (cold /
+    invalidated) was ignored. If an ensure was already mid-flight when the
+    durable rows committed, its build omits them and lands warm — so the
+    refresh must retry behind the load lock: either the index is warm by then
+    (the add lands) or it is still cold (the next ensure sees the DB rows)."""
+    import threading
+
+    import numpy as np
+    from minni.config import SovereignConfig
+    from minni.db import SovereignDB
+    from minni.retrieval import RetrievalEngine
+
+    cfg = SovereignConfig(
+        db_path=str(tmp_path / "s" / "m.db"), vault_path=str(tmp_path / "vault"),
+        graph_export_dir=str(tmp_path / "g"), faiss_index_path=str(tmp_path / "f.faiss"),
+        writeback_enabled=False,
+    )
+    eng = RetrievalEngine(SovereignDB(cfg), cfg)
+    try:
+        dim = cfg.embedding_dim
+        ids = list(range(1, 51))
+        vecs = np.random.rand(len(ids), dim).astype(np.float32)
+        eng.faiss_index.build_from_vectors(ids, vecs)
+
+        # The vault-watch invalidates while an ensure is "mid-flight" — held
+        # here as the acquired load lock — and a durable store refreshes.
+        eng._faiss_load_lock.acquire()
+        eng.faiss_index.invalidate()
+        t = threading.Thread(
+            target=eng._refresh_live_faiss,
+            args=([9001], [np.random.rand(dim).astype(np.float32)]),
+        )
+        t.start()
+        time.sleep(0.2)  # let the refresh hit the cold add_batch and block
+        # The ensure finishes from a SELECT that predates the durable row.
+        eng.faiss_index.build_from_vectors(ids, vecs)
+        eng._faiss_load_lock.release()
+        t.join(timeout=10)
+
+        assert 9001 in eng.faiss_index._reverse_map, (
+            "durable chunk stranded: the refresh gave up on a cold index and "
+            "the ensure that landed warm never saw its row"
+        )
+
+        # And the retry is idempotent: re-adding the same id must not grow
+        # the index.
+        n = eng.faiss_index.count
+        eng.faiss_index.add_batch([9001], [np.random.rand(dim).astype(np.float32)])
+        assert eng.faiss_index.count == n, "add_batch duplicated an existing id"
+    finally:
+        eng.db.close()
+
+
+def test_agent_vault_failure_does_not_darken_the_shared_vault(tmp_path, monkeypatch):
+    """Grok round 10 #2 (Low). _vault_watch_sweep_once ran index_agent_vaults
+    OUTSIDE any try/except, ahead of shared-vault expiry and indexing. A
+    sticky agent-vault fault therefore kept the shared vault dark on every
+    tick — the original defect of this PR, reintroduced as coupling."""
+    import minni.index_all as index_all
+    import minni.minnid as minnid
+    from minni.afm_writer import _write_one
+
+    _install_fake_embedder(monkeypatch)
+    cfg = _make_cfg(tmp_path)
+    monkeypatch.setattr(minnid, "DEFAULT_CONFIG", cfg)
+
+    vault = Path(cfg.vault_path)
+    written = _write_one(vault, _draft())
+    expected = str((vault / written["path"]).resolve())
+
+    def broken_agent_vaults(*args, **kwargs):
+        raise RuntimeError("sticky agent-vault fault")
+
+    monkeypatch.setattr(index_all, "index_agent_vaults", broken_agent_vaults)
+
+    stats = minnid._vault_watch_sweep_once()
+
+    assert str(cfg.vault_path) in stats, (
+        "shared vault went dark behind a broken agent vault: "
+        f"{sorted(stats)}"
+    )
+    assert expected in _indexed_paths(cfg.db_path)
 
 
 def test_multiple_noncanonical_spellings_collapse_to_one_row(tmp_path, monkeypatch):

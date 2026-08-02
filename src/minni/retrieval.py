@@ -728,46 +728,55 @@ class RetrievalEngine:
             except Exception as e:
                 logger.debug("Disk cache load failed (non-fatal): %s", e)
 
-            # Rebuild from DB. The checksum is taken BEFORE the SELECT and
-            # re-checked after the build: the disk cache must only ever record
-            # a checksum for the exact snapshot the vectors came from, or a
-            # later cold load trusts a manifest whose vectors omit rows a
-            # concurrent durable insert added mid-build.
+            # Rebuild from DB. The checksum is taken BEFORE each SELECT and
+            # re-checked after the build. A build whose snapshot the DB moved
+            # under must not become final: warm-but-incomplete is the one
+            # state nothing recovers from, because count>0 gates every later
+            # rebuild. Retry bounded; if the DB will not sit still, leave the
+            # index COLD — a cold index rebuilds on the next search, a
+            # warm-stale one serves holes until the next invalidate.
             from minni.faiss_persist import compute_db_checksum
             conn = self.db._get_conn()
-            checksum_before = compute_db_checksum(conn)
 
-            chunk_ids = []
-            embeddings = []
+            for _ in range(3):
+                checksum_before = compute_db_checksum(conn)
 
-            with self.db.cursor() as c:
-                c.execute("SELECT chunk_id, embedding FROM chunk_embeddings")
-                for row in c.fetchall():
-                    vec = np.frombuffer(row["embedding"], dtype=np.float32)
-                    if vec.shape[0] == self.config.embedding_dim:
-                        chunk_ids.append(row["chunk_id"])
-                        embeddings.append(vec)
+                chunk_ids = []
+                embeddings = []
+                with self.db.cursor() as c:
+                    c.execute("SELECT chunk_id, embedding FROM chunk_embeddings")
+                    for row in c.fetchall():
+                        vec = np.frombuffer(row["embedding"], dtype=np.float32)
+                        if vec.shape[0] == self.config.embedding_dim:
+                            chunk_ids.append(row["chunk_id"])
+                            embeddings.append(vec)
 
-            if chunk_ids:
+                if not chunk_ids:
+                    return
+
                 all_vecs = np.array(embeddings, dtype=np.float32)
                 self.faiss_index.build_from_vectors(chunk_ids, all_vecs)
-                logger.info("FAISS index loaded from DB: %d vectors", len(chunk_ids))
 
-                # PR-2: Save to disk for next cold start — skipped if the DB
-                # moved during the build; the next cold start rebuilds instead
-                # of inheriting a checksum-aligned lie.
+                if compute_db_checksum(conn) != checksum_before:
+                    logger.debug("DB changed during FAISS rebuild; retrying")
+                    continue
+
+                logger.info("FAISS index loaded from DB: %d vectors", len(chunk_ids))
+                # PR-2: Save to disk for next cold start, pinned to the
+                # checksum of the exact snapshot the vectors came from.
                 try:
-                    conn = self.db._get_conn()
-                    if compute_db_checksum(conn) == checksum_before:
-                        self.faiss_index.save_to_disk(
-                            db_conn=conn, db_checksum=checksum_before
-                        )
-                    else:
-                        logger.debug(
-                            "FAISS disk save skipped: DB changed during rebuild"
-                        )
+                    self.faiss_index.save_to_disk(
+                        db_conn=conn, db_checksum=checksum_before
+                    )
                 except Exception as e:
                     logger.debug("FAISS disk save failed (non-fatal): %s", e)
+                return
+
+            logger.warning(
+                "FAISS rebuild could not get a stable DB snapshot; leaving the "
+                "index cold for the next search"
+            )
+            self.faiss_index.invalidate()
 
     # ── Store-time semantic indexing (durable recall) ─────────
 
@@ -1071,7 +1080,17 @@ class RetrievalEngine:
             # vault-watch thread's invalidate() land between two adds, leaving
             # a residual index of only the new chunks that count>0 gates then
             # treated as warm: a semantic blackout until restart.
-            self.faiss_index.add_batch(chunk_ids, vectors)
+            if not self.faiss_index.add_batch(chunk_ids, vectors):
+                # Cold or invalidated. Usually fine — the rows are in the DB
+                # and the next ensure-load rebuilds. But an ensure that was
+                # mid-SELECT when these rows committed builds WITHOUT them and
+                # lands warm, and count>0 then gates every later rebuild. The
+                # retry behind the load lock waits that ensure out: either the
+                # index is now warm (add lands; idempotent if the rebuild
+                # already picked the rows up) or it is still cold and the next
+                # ensure sees the rows in the DB.
+                with self._faiss_load_lock:
+                    self.faiss_index.add_batch(chunk_ids, vectors)
         except Exception as exc:
             logger.warning(
                 "durable-index: live FAISS refresh failed (%s) — invalidating "

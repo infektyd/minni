@@ -273,6 +273,10 @@ class FAISSIndex:
             if self._invalidated or not self._chunk_ids:
                 return False
             for cid, emb in zip(chunk_ids, embeddings):
+                # Idempotent: a retrying caller may race a rebuild that
+                # already picked these rows up from the DB.
+                if cid in self._reverse_map:
+                    continue
                 self._add_locked(cid, emb)
             return True
 

@@ -1073,7 +1073,15 @@ def _vault_watch_sweep_once() -> dict:
     """Blocking incremental ingest of every discovered vault. Runs off-loop."""
     from minni.index_all import index_agent_vaults, index_shared_vault
 
-    stats = index_agent_vaults(DEFAULT_CONFIG, dry_run=False, verbose=False)
+    # Isolated like the shared-vault steps below: a sticky agent-vault fault
+    # (corrupt sidecar DB, bad path) must not keep the shared vault dark on
+    # every tick — going dark on daemon schedule is the defect this whole
+    # slice exists to fix.
+    stats: dict = {}
+    try:
+        stats = index_agent_vaults(DEFAULT_CONFIG, dry_run=False, verbose=False)
+    except Exception:
+        logger.exception("Vault watch: agent-vault sweep failed")
     # The shared vault is the AFM loop's own output directory and is NOT one of
     # the per-agent vaults (see discover_agent_vaults), so without this it was
     # indexed by nothing on a running daemon. Isolated: a failure here must not
