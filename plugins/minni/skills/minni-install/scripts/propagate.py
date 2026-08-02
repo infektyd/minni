@@ -1395,11 +1395,28 @@ def update_one_plugin(platform: str, args: argparse.Namespace) -> dict[str, obje
                 "silently dropped. Fix or remove the file, then re-run."
             ) from exc
 
+    # D10 for host TOML: parse before copy_tree so a broken ~/.codex/config.toml
+    # cannot leave a half-updated install tree with an untouched broken MCP env.
+    config_kind = str(spec["config_kind"])
+    if config_kind == "toml":
+        host_toml = Path(spec["config"]).expanduser()
+        if host_toml.is_file():
+            try:
+                import tomllib
+
+                tomllib.loads(host_toml.read_text(encoding="utf-8"))
+            except Exception as exc:
+                raise ValueError(
+                    f"cannot parse existing TOML at {host_toml}: {exc}. "
+                    "Refusing to overwrite install_root — host MCP env would "
+                    "be left broken after a partial copy. Fix or remove the "
+                    "file, then re-run."
+                ) from exc
+
     copy_tree(source, install_root)
     server_path = install_root / "dist" / "server.js"
     write_json(mcp_target, mcp_json(server_path, agent, vault, Path(args.socket).expanduser(), stamp_workspace, target_path=None, explicit_workspace=explicit_workspace, pre_existing_env=pre_mcp_env, afm_env=afm_env))
 
-    config_kind = str(spec["config_kind"])
     if config_kind == "toml":
         update_toml_mcp_config(Path(spec["config"]).expanduser(), server_path, agent, vault, Path(args.socket).expanduser(), stamp_workspace, explicit_workspace=explicit_workspace, afm_env=afm_env)
     # No "claude-json" branch: no platform spec produces that kind any more, and

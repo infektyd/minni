@@ -140,6 +140,7 @@ def _plugin_dist_status(checkout_head: Optional[str]) -> dict:
         }
     lagging: list[str] = []
     unreadable: list[str] = []
+    readable = 0
     first_sha = "unknown"
     first_ver = "unknown"
     hows: list[str] = []
@@ -153,6 +154,7 @@ def _plugin_dist_status(checkout_head: Optional[str]) -> dict:
             # Do not discard lag evidence from peers already inspected.
             unreadable.append(f"{root.name} via {how}: {type(exc).__name__}")
             continue
+        readable += 1
         dist_sha = str(manifest.get("git_sha") or "unknown")
         if first_sha == "unknown" and dist_sha != "unknown":
             first_sha = dist_sha
@@ -181,7 +183,17 @@ def _plugin_dist_status(checkout_head: Optional[str]) -> dict:
             reason += f"; also unreadable: {'; '.join(unreadable)}"
             out["unreadable"] = unreadable
         out["reason"] = reason
-    elif unreadable:
+    elif readable > 0 and checkout_head is not None and first_sha != "unknown":
+        # At least one root compared cleanly and none lag — healthy even if a
+        # peer manifest is unreadable (note the unreadable, do not null out).
+        out["stale"] = False
+        if unreadable:
+            out["unreadable"] = unreadable
+            out["reason"] = (
+                "active wire roots match HEAD; unreadable peer(s): "
+                + "; ".join(unreadable)
+            )
+    elif unreadable and readable == 0:
         out["stale"] = None
         out["unreadable"] = unreadable
         out["reason"] = (
@@ -190,6 +202,8 @@ def _plugin_dist_status(checkout_head: Optional[str]) -> dict:
     elif checkout_head is None or first_sha == "unknown":
         out["stale"] = None
         out["reason"] = "no checkout HEAD or manifest sha to compare against"
+        if unreadable:
+            out["unreadable"] = unreadable
     else:
         out["stale"] = False
     return out

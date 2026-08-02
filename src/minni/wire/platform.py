@@ -63,21 +63,22 @@ ALL_SKIPS = {
     ),
 }
 
-def config_root_candidates() -> dict[str, tuple[Path, ...]]:
+def config_root_candidates(home: Path | None = None) -> dict[str, tuple[Path, ...]]:
     """Ordered config-root candidates for preflight probes (§6.4).
 
-    Computed per call from the current HOME — never at import time — so a
-    caller (or sandboxed test) that sets HOME after import probes the right
-    home, matching platform_spec()'s late binding.
+    Computed per call from ``home`` (or ambient HOME) — never at import time —
+    so sandboxed tests / MINNI_CHECK_*_HOME snapshots probe the right tree.
     """
-    home = Path(os.environ.get("HOME") or Path.home())
+    base = Path(home) if home is not None else Path(
+        os.environ.get("HOME") or Path.home()
+    )
     return {
-        "codex": (home / ".codex",),
-        "claude-code": (home,),
-        "kilocode": (home / ".config/kilo",),
-        "grok": (home / ".grok",),
-        "gemini": (home / ".gemini",),
-        "antigravity": (home / ".gemini",),
+        "codex": (base / ".codex",),
+        "claude-code": (base,),
+        "kilocode": (base / ".config/kilo",),
+        "grok": (base / ".grok",),
+        "gemini": (base / ".gemini",),
+        "antigravity": (base / ".gemini",),
     }
 
 HOOK_ENTRYPOINTS: dict[str, str] = {
@@ -219,8 +220,13 @@ def default_config_scan_paths() -> dict[str, Path]:
     }
 
 
-def config_root_exists(platform: str) -> tuple[bool, list[str]]:
-    candidates = config_root_candidates().get(canonical_platform(platform), ())
+def config_root_exists(
+    platform: str, home: Path | None = None,
+) -> tuple[bool, list[str]]:
+    candidates = config_root_candidates(home).get(
+        canonical_platform(platform), (),
+    )
     probed = [str(p) for p in candidates]
     ok = any(p.exists() for p in candidates) if candidates else True
     return ok, probed
+

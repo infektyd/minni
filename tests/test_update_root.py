@@ -301,9 +301,9 @@ def test_sync_root_skips_repo_plugin_payload_on_strict_verify():
 
 
 def test_grok_hooks_refresh_skips_when_no_grok_surface():
-    """Optional grok surface: no wire root and no ~/.grok is a skip, not fail."""
+    """Optional grok surface: no wire root is a skip, not fail."""
     text = SCRIPT.read_text(encoding="utf-8")
-    assert "no grok wire install root and no ~/.grok" in text
+    assert "no grok wire install root" in text
     assert "hooks refresh not needed" in text
 
 

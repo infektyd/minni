@@ -78,9 +78,10 @@ def active_wire_plugin_roots_ordered(home: Path) -> list[tuple[Path, str]]:
             config_root_exists = None  # type: ignore[assignment]
         for platform, (_wired_at, root) in sorted(latest_by_platform.items()):
             if config_root_exists is not None and config_root_candidates is not None:
-                candidates = config_root_candidates().get(platform)
+                # Probe under the *same* home as wired.json (not ambient $HOME).
+                candidates = config_root_candidates(home).get(platform)
                 if candidates is not None:
-                    ok, _probed = config_root_exists(platform)
+                    ok, _probed = config_root_exists(platform, home=home)
                     if not ok:
                         continue
             if root not in seen:

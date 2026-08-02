@@ -111,3 +111,36 @@ def test_missing_config_root_only_is_skipped_status_contract():
     out.finalize_status(dry_run=False)
     assert out.status == "ok"
     assert out.emit() == 0
+
+
+def test_config_root_exists_respects_home_arg(tmp_path, monkeypatch):
+    # Probe the *passed* home, not ambient $HOME.
+    alien = tmp_path / "alien"
+    alien.mkdir()
+    (alien / ".codex").mkdir()
+    # Ambient HOME has no codex
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    monkeypatch.setenv("HOME", str(empty))
+    ok, _ = wire_platform.config_root_exists("codex", home=alien)
+    assert ok is True
+    ok2, _ = wire_platform.config_root_exists("codex", home=empty)
+    assert ok2 is False
+    # active_roots must use the same home binding
+    from minni.wire.active_roots import active_wire_plugin_roots_ordered
+    import json
+    plugin = alien / ".minni" / "plugin"
+    root = plugin / "0.4.0"
+    root.mkdir(parents=True)
+    (root / "payload-manifest.json").write_text(json.dumps({"git_sha": "a"*40}), encoding="utf-8")
+    (plugin / "wired.json").write_text(json.dumps({"schema":1,"wires":[{"platform":"codex","install_root":str(root),"wired_at":"2026-08-02T00:00:00Z"}]}), encoding="utf-8")
+    ordered = active_wire_plugin_roots_ordered(alien)
+    assert any("codex" in how for _r, how in ordered), ordered
+    # same wired under empty home probe would drop codex
+    plugin2 = empty / ".minni" / "plugin"
+    root2 = plugin2 / "0.4.0"
+    root2.mkdir(parents=True)
+    (root2 / "payload-manifest.json").write_text(json.dumps({"git_sha": "a"*40}), encoding="utf-8")
+    (plugin2 / "wired.json").write_text(json.dumps({"schema":1,"wires":[{"platform":"codex","install_root":str(root2),"wired_at":"2026-08-02T00:00:00Z"}]}), encoding="utf-8")
+    ordered2 = active_wire_plugin_roots_ordered(empty)
+    assert not any("codex" in how for _r, how in ordered2), ordered2

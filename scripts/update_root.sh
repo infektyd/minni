@@ -291,15 +291,14 @@ if root is None:
     current = base / "current"
     root = current.resolve() if current.exists() else None
 if root is None:
-    # No grok wire and no ~/.minni/plugin/current — host is not running grok.
-    # Do not fail redeploy for an optional surface (same class as wire "no
-    # config root" → skipped).
-    grok_cfg = home / ".grok"
-    if not grok_cfg.exists():
-        print("skip: no grok wire install root and no ~/.grok — hooks refresh not needed")
-        sys.exit(0)
-    print("no grok wire install root for hooks refresh (~/.grok present)", file=sys.stderr)
-    sys.exit(1)
+    # No usable grok wire install root (and no current). Leftover ~/.grok
+    # alone is not enough to require hooks refresh — skip loud, do not fail
+    # redeploy for an optional surface.
+    print(
+        "skip: no grok wire install root (and no ~/.minni/plugin/current) "
+        "— hooks refresh not needed"
+    )
+    sys.exit(0)
 hooks = mod.update_grok_hooks(root)
 rules = mod.write_grok_rules()
 print("grok hooks:", hooks)
