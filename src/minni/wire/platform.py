@@ -27,7 +27,7 @@ PLATFORM_ALIASES = {
 
 VALID_PLATFORMS = frozenset({
     "codex", "claude-code", "kilocode", "gemini", "antigravity",
-    "grok", "generic", "all",
+    "grok", "cursor", "generic", "all",
 })
 
 # D7 (#232): ONE canonical fleet, shared with propagate.py (which carries its
@@ -113,8 +113,12 @@ def expand_platforms(platform: str) -> tuple[list[str], list[tuple[str, str]]]:
     if platform not in VALID_PLATFORMS:
         raise ValueError(
             f"unknown platform {platform!r}; use codex, claude-code, kilocode, "
-            "gemini, antigravity, grok, generic, or all",
+            "gemini, antigravity, grok, cursor, generic, or all",
         )
+    # cursor is fleet-known but propagate-managed only — same skip reason as
+    # `wire all`, not "unknown platform". gemini/antigravity stay wireable.
+    if platform == "cursor":
+        return [], [(platform, ALL_SKIPS["cursor"])]
     return [platform], []
 
 

@@ -305,9 +305,9 @@ def check_deployed(canonical: str) -> tuple[list[str], list[str]]:
     for root in roots:
         label = str(root).replace(str(home), "~")
         # Inactive historical wire version dirs: note + skip, do not fail.
+        # Empty active (post-retire wires:[]) must skip *all* such trees.
         if (
-            active_wire
-            and _is_versioned_wire_plugin_root(root, home)
+            _is_versioned_wire_plugin_root(root, home)
             and root.resolve() not in active_wire
         ):
             notes.append(
@@ -315,9 +315,9 @@ def check_deployed(canonical: str) -> tuple[list[str], list[str]]:
                 "historical version dir left by non-interactive wire)"
             )
             continue
-        # Release-era plugin/current is not moved by --from-repo; once any
-        # wire-active root exists, skip it (parity with check_deployments).
-        if active_wire and root.name == "current":
+        # Release-era plugin/current: always skip the logical path (parity
+        # with check_deployments); live payload is the versioned active root.
+        if root.name == "current":
             try:
                 if root.parent.resolve() == (home / ".minni" / "plugin").resolve():
                     notes.append(

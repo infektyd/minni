@@ -152,7 +152,7 @@ def test_scripts_import_same_helper(tmp_path, monkeypatch):
 
 
 def test_fallback_prefers_newer_version_dir_over_lagging_current(tmp_path, monkeypatch):
-    """CR High: empty wires + lagging current must not hide a fresher +git dir."""
+    """Pre-wire (no wired.json): lagging current must not hide a fresher +git dir."""
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
@@ -164,12 +164,59 @@ def test_fallback_prefers_newer_version_dir_over_lagging_current(tmp_path, monke
     time.sleep(0.02)
     fresh = plugin / "0.4.1+git.deadbeef"
     _stamp(fresh, version="0.4.1+git.deadbeef")
-    (plugin / "wired.json").write_text(
-        json.dumps({"schema": 1, "wires": []}), encoding="utf-8",
-    )
+    # No wired.json: pre-wire / release-era layout only.
     ordered = active_wire_plugin_roots_ordered(home)
     assert ordered, ordered
     root, how = ordered[0]
     assert root == fresh.resolve(), (root, how, ordered)
     assert how == "version-dir scan"
+
+
+def test_empty_wires_after_retire_does_not_reanimate_version_dirs(
+    tmp_path, monkeypatch,
+):
+    """Parsed wires:[] (retirement) must not promote historical plugin dirs.
+
+    Re-animating abandoned trees after the last wire host is gone bricks
+    make sync-root on propagate-only machines (cursor/antigravity leftovers).
+    """
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    plugin = home / ".minni" / "plugin"
+    old = plugin / "0.4.0"
+    _stamp(old, version="0.4.0")
+    (plugin / "current").symlink_to(old)
+    (plugin / "wired.json").write_text(
+        json.dumps({"schema": 1, "wires": []}), encoding="utf-8",
+    )
+    ordered = active_wire_plugin_roots_ordered(home)
+    assert ordered == [], ordered
+    roots, platforms = active_wire_plugin_state(home)
+    assert roots == set()
+    assert platforms == set()
+
+
+def test_zombie_platform_does_not_fallback_to_version_dir(tmp_path, monkeypatch):
+    """Host root gone + retired filter must yield empty, not version-dir scan."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    # No ~/.codex — platform is zombie.
+    plugin = home / ".minni" / "plugin"
+    ver = plugin / "0.4.0"
+    _stamp(ver, version="0.4.0")
+    (plugin / "wired.json").write_text(
+        json.dumps({
+            "schema": 1,
+            "wires": [{
+                "platform": "codex",
+                "install_root": str(ver),
+                "wired_at": "2020-01-01T00:00:00Z",
+            }],
+        }),
+        encoding="utf-8",
+    )
+    ordered = active_wire_plugin_roots_ordered(home)
+    assert ordered == [], ordered
 

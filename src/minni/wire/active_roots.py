@@ -36,12 +36,22 @@ def active_wire_plugin_roots_ordered(home: Path) -> list[tuple[Path, str]]:
     """Active roots as ``(resolved_root, how)`` for honesty/status reporting.
 
     ``how`` is ``wired.json:<platform>``, ``current``, or ``version-dir scan``.
+
+    Fallback (version-dir / ``current``) is only for *pre-wire* hosts where
+    ``wired.json`` is missing or unreadable. Once the file exists and parses —
+    including empty ``wires: []`` after ``retire_platform`` — a zero-row result
+    means "no wire-managed payload", not "scan historical version dirs".
+    Re-promoting abandoned trees after retirement would brick ``make sync-root``
+    on propagate-only hosts (cursor/antigravity leftovers).
     """
     base = Path(home).expanduser() / ".minni" / "plugin"
     actives: list[tuple[Path, str]] = []
     seen: set[Path] = set()
+    wired_path = base / "wired.json"
+    wired_parsed = False
     try:
-        data = json.loads((base / "wired.json").read_text(encoding="utf-8"))
+        data = json.loads(wired_path.read_text(encoding="utf-8"))
+        wired_parsed = True
         latest_by_platform: dict[str, tuple[str, Path]] = {}
         for entry in data.get("wires", []) or []:
             if not isinstance(entry, dict):
@@ -91,10 +101,12 @@ def active_wire_plugin_roots_ordered(home: Path) -> list[tuple[Path, str]]:
         pass
     if actives:
         return actives
-    # Fallback when no usable wired.json rows: prefer the newest *version*
-    # dir with a payload-manifest. Do not let a lagging release-era
-    # ``current`` symlink blind a fresher from-repo ``+git.*`` install that
-    # never moves current (local versions leave the symlink alone).
+    # Parsed wired.json with zero surviving platforms = intentional empty
+    # (retirement / all zombies). Do not re-animate historical version dirs.
+    if wired_parsed:
+        return []
+    # Pre-wire / missing wired.json only: prefer newest version dir over a
+    # lagging release-era ``current`` (local versions never move the symlink).
     try:
         candidates = [
             d for d in base.iterdir()

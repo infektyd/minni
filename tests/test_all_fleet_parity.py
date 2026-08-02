@@ -57,6 +57,17 @@ def test_wire_expand_platforms_names_every_exclusion():
     assert all(reason for _plat, reason in warnings)
 
 
+def test_wire_cursor_is_known_skip_not_unknown_platform():
+    """cursor is fleet-known; explicit `wire cursor` must match all's skip."""
+    platforms, warnings = wire_platform.expand_platforms("cursor")
+    assert platforms == []
+    assert len(warnings) == 1
+    plat, reason = warnings[0]
+    assert plat == "cursor"
+    assert reason == wire_platform.ALL_SKIPS["cursor"]
+    assert "cursor" in wire_platform.VALID_PLATFORMS
+
+
 def test_antigravity_is_inside_at_least_one_all_expansion():
     """The live corroboration behind D7: agy surfaces were stale because
     antigravity sat outside BOTH expansions. It must be executed by at least

@@ -709,3 +709,46 @@ def test_plugin_current_skipped_when_wire_active(tmp_path):
     assert "plugin/current" in proc.stdout and "skipped" in proc.stdout, proc.stdout
     assert "STALE" not in proc.stdout, proc.stdout
     assert proc.returncode == 0, proc.stdout
+
+
+def test_empty_wires_skips_all_historical_plugin_dirs(tmp_path):
+    """Post-retire wires:[] must not let abandoned version dirs fail --strict."""
+    home = tmp_path / "home"
+    home.mkdir()
+    plugin = home / ".minni" / "plugin"
+    old = plugin / "0.4.0"
+    old.mkdir(parents=True)
+    for sub in ("hooks", "commands", "skills", ".claude-plugin", ".codex-plugin",
+                ".cursor-plugin", ".kilocode-plugin", ".gemini-plugin"):
+        src = SOURCE / sub
+        if src.is_dir():
+            _copytree(src, old / sub)
+    (old / "dist").mkdir()
+    (old / "dist" / "server.js").write_text("// old\n", encoding="utf-8")
+    (old / "dist" / "build-manifest.json").write_text(
+        json.dumps({"git_sha": "d" * 40, "built_at": "2026-01-01T00:00:00Z"}),
+        encoding="utf-8",
+    )
+    (old / "payload-manifest.json").write_text(
+        json.dumps({"git_sha": "d" * 40, "version": "0.4.0"}),
+        encoding="utf-8",
+    )
+    (plugin / "current").symlink_to(old, target_is_directory=True)
+    (plugin / "wired.json").write_text(
+        json.dumps({"schema": 1, "wires": []}), encoding="utf-8",
+    )
+    # Cursor/propagate-only surface (not wire-managed) so --strict has a
+    # clean deploy to report without inventing a wire root.
+    cursor = home / ".cursor" / "plugins" / "local" / "minni"
+    cursor.mkdir(parents=True)
+    for sub in ("hooks", "commands", "skills", ".claude-plugin", ".codex-plugin",
+                ".cursor-plugin", ".kilocode-plugin", ".gemini-plugin"):
+        src = SOURCE / sub
+        if src.is_dir():
+            _copytree(src, cursor / sub)
+    _artifact_dist(cursor)
+
+    proc = _run("--strict", home=home, repo_root=_isolated_repo_root(tmp_path))
+    assert "historical version dir" in proc.stdout or "skipped" in proc.stdout, proc.stdout
+    assert "STALE" not in proc.stdout, proc.stdout
+    assert proc.returncode == 0, (proc.returncode, proc.stdout, proc.stderr)

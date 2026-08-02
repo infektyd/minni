@@ -318,7 +318,10 @@ def discover_active() -> tuple[list[Path], list[str]]:
     notes: list[str] = []
     for dist in discover():
         label = str(dist.parent).replace(str(home), "~")
-        if active and _is_versioned_wire_plugin_dist(dist, home):
+        # Versioned wire trees only when they are live active roots. Empty
+        # active (post-retire wires:[]) must skip *all* historical dirs —
+        # not re-judge them just because nothing else is live.
+        if _is_versioned_wire_plugin_dist(dist, home):
             root = dist.parent.resolve()
             if root not in active:
                 notes.append(
@@ -327,9 +330,10 @@ def discover_active() -> tuple[list[Path], list[str]]:
                 )
                 continue
         # Release-era ~/.minni/plugin/current is not moved by --from-repo local
-        # installs; once any wire-active root exists it is superseded (same
-        # class as historical version dirs / marketplace caches).
-        if active and _is_plugin_current_dist(dist, home):
+        # installs. Always skip the logical current path: live payload is
+        # judged via the versioned root when active (wired or pre-wire
+        # fallback); empty active after retirement leaves nothing to manage.
+        if _is_plugin_current_dist(dist, home):
             notes.append(
                 f"{label}: skipped (legacy plugin/current; "
                 "wire-primary — not managed by sync-root)"
