@@ -1190,6 +1190,62 @@ class RetrievalEngine:
                 c["rerank_score"] = boost
             c["salience_boost"] = boost
 
+    def _apply_decay_rerank_attenuation(self, candidates: List[Dict]) -> None:
+        """GA4-2 (reranker leg): propagate memory decay into the cross-encoder
+        ordering. Exactly the bypass class _apply_correction_rerank_boost above
+        was written to close: decay_score only ever entered final_score
+        (_score_merged_doc), but the DEFAULT path (reranker_enabled=True) sorts
+        and reports rerank_score, so a scheduled decay pass changed nothing an
+        operator could observe on default config.
+
+        Same sign-safe treatment as the correction boost, since rerank_score is
+        a raw logit: a positive logit is scaled DOWN by decay, a negative logit
+        is pushed further down (divided by decay), so attenuation always moves a
+        stale candidate down relative to its raw logit. A logit of exactly 0.0
+        maps to (decay - 1.0) — zero when undecayed, negative once decayed —
+        because a multiplicative attenuation of zero is a no-op that would leave
+        a fully-decayed candidate tied with a fresh one.
+
+        Correction-class candidates get the same recall-F4 decay floor they get
+        in _score_merged_doc, so the two legs agree on what a correction's
+        effective decay is. Runs BEFORE the correction boost so a correction's
+        zero-logit lift is the last word, mirroring the multiplicative order
+        final_score = rrf * decay * (1 + boost).
+
+        The rerank cache stores the raw model score BEFORE this adjustment, so
+        cached entries stay model-pure and attenuation is re-derived every call.
+        """
+        floor = float(self.config.correction_decay_floor)
+        for c in candidates:
+            decay = c.get("decay_score")
+            if decay is None:
+                decay = 1.0
+            decay = float(decay)
+            page_type = str(c.get("page_type") or "").lower()
+            if page_type in self._correction_types:
+                decay = max(decay, floor)
+            # Clamp to the (0, 1] the decay pass is contracted to produce; a
+            # decay > 1 would silently become a promotion channel.
+            decay = max(0.0, min(1.0, decay))
+            c["decay_applied"] = decay
+            if decay == 1.0:
+                continue
+            score = float(c.get("rerank_score") or 0.0)
+            if score > 0:
+                c["rerank_score"] = score * decay
+            elif score < 0:
+                # decay == 0.0 would divide by zero; a fully decayed negative
+                # logit is already as low as the ordering needs it to be.
+                c["rerank_score"] = score / decay if decay > 0 else score * 2.0
+            else:
+                c["rerank_score"] = decay - 1.0
+
+    def _apply_rerank_score_adjustments(self, candidates: List[Dict]) -> None:
+        """Both post-model adjustments, in the order the final_score leg
+        multiplies them. Single call site so the two legs cannot drift."""
+        self._apply_decay_rerank_attenuation(candidates)
+        self._apply_correction_rerank_boost(candidates)
+
     def _rerank(self, query: str, candidates: List[Dict]) -> List[Dict]:
         """
         Re-rank candidates using a cross-encoder.
@@ -1232,7 +1288,7 @@ class RetrievalEngine:
         if not missing:
             for i, c in enumerate(candidates):
                 c["rerank_score"] = float(all_scores[i])
-            self._apply_correction_rerank_boost(candidates)
+            self._apply_rerank_score_adjustments(candidates)
             candidates.sort(key=lambda x: x.get("rerank_score", 0), reverse=True)
             return candidates
 
@@ -1260,7 +1316,7 @@ class RetrievalEngine:
                 c["rerank_score"] = float(all_scores[i] or 0.0)
 
             # Sort by cross-encoder score (correction salience applied first)
-            self._apply_correction_rerank_boost(candidates)
+            self._apply_rerank_score_adjustments(candidates)
             candidates.sort(key=lambda x: x.get("rerank_score", 0), reverse=True)
         except Exception as e:
             logger.warning("Re-ranking failed: %s — falling back to RRF scores", e)
