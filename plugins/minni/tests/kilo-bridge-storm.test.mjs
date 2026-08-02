@@ -95,13 +95,14 @@ function createStormReporter({ hookScript, logPath }) {
         undeliveredReported = true;
         if (onUndelivered) onUndelivered();
       };
+      // Round 14: undelivered before settle (same as production plugin).
       child.once("close", (code) => {
-        settle();
         if (code !== 0) undelivered();
+        settle();
       });
       child.once("error", () => {
-        settle();
         undelivered();
+        settle();
       });
       child.unref();
       child.on("error", () => {});

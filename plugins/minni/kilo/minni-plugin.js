@@ -242,14 +242,22 @@ function flushPendingSuppressedFailures() {
   const accepted = spawnBridgeDiagnostic(
     failedEvent,
     `coalesced bridge failures: ${detail}`,
-    () => restoreSuppressedFailures(flushed),
+    () => {
+      restoreSuppressedFailures(flushed);
+      // Round 14: undelivered means the dark interval is still unreported —
+      // restore the suppressed count that would have been in the payload.
+      diagnosticsSuppressed = Math.max(diagnosticsSuppressed, suppressedAtFlush);
+    },
     {
       coalesced_count: totalCount,
       suppressed_since_last_report: suppressedAtFlush,
+      // Zero only on confirmed delivery (exit 0), not on mere spawn.
+      onDelivered: () => {
+        diagnosticsSuppressed = 0;
+      },
     },
   );
   if (accepted) {
-    diagnosticsSuppressed = 0;
     return true;
   }
   restoreSuppressedFailures(flushed);
@@ -291,13 +299,20 @@ function spawnBridgeDiagnostic(event, detail, onUndelivered, extras = {}) {
       undeliveredReported = true;
       if (onUndelivered) onUndelivered();
     };
+    const delivered = () => {
+      if (extras.onDelivered) extras.onDelivered();
+    };
+    // Round 14: undelivered BEFORE settle. settle() free-slot flushes; if
+    // restore ran after flush, restored counts sat console-only with no
+    // re-spawn (P6 hole under one-shot undelivered waves).
     child.once("close", (code) => {
-      settle();
       if (code !== 0) undelivered();
+      else delivered();
+      settle();
     });
     child.once("error", () => {
-      settle();
       undelivered();
+      settle();
     });
     child.unref();
     child.on("error", () => {});

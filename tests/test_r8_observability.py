@@ -1157,7 +1157,8 @@ def test_deferred_lifecycle_holds_in_flight_until_handler_returns(monkeypatch):
 
 
 def test_deferred_lifecycle_failure_refuses_resubmit_and_surfaces(monkeypatch):
-    """Round 13: deferred apply raises after drafts land → sticky refuse + status."""
+    """Round 13: deferred apply raises after drafts land → sticky refuse + status.
+    Round 14: a later submit re-applies without a second write, then accepts."""
     import threading
     import queue as queue_mod
 
@@ -1166,14 +1167,21 @@ def test_deferred_lifecycle_failure_refuses_resubmit_and_surfaces(monkeypatch):
     afm_writer.reset_pass_counters()
     monkeypatch.setattr(afm_writer, "_ensure_worker", lambda: None)
     monkeypatch.setattr(afm_writer, "_WORK_QUEUE", queue_mod.Queue(maxsize=4))
-    monkeypatch.setattr(
-        afm_writer,
-        "_write_batch",
-        lambda job: {"drafts_written": [{"page_id": "d1"}], "inbox_path": "x"},
-    )
+    writes = []
 
-    def _boom(life):
-        raise RuntimeError("db blip during lifecycle")
+    def _write(job):
+        writes.append(job.get("pass_name"))
+        return {"drafts_written": [{"page_id": "d1"}], "inbox_path": "x"}
+
+    monkeypatch.setattr(afm_writer, "_write_batch", _write)
+
+    calls = {"n": 0, "applied": []}
+
+    def _handler(life):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("db blip during lifecycle")
+        calls["applied"].append(dict(life))
 
     done = threading.Event()
     out: dict = {}
@@ -1185,7 +1193,7 @@ def test_deferred_lifecycle_failure_refuses_resubmit_and_surfaces(monkeypatch):
             "dedup_candidate_ids": [],
             "review_candidate_ids": [],
         },
-        "lifecycle_handler": _boom,
+        "lifecycle_handler": _handler,
         "defer_lifecycle_to_worker": True,
     }
     with afm_writer._IN_FLIGHT_LOCK:
@@ -1195,13 +1203,26 @@ def test_deferred_lifecycle_failure_refuses_resubmit_and_surfaces(monkeypatch):
     assert not done.is_set(), "lifecycle failure must keep in-flight set"
     assert afm_writer._LIFECYCLE_APPLY_FAILURES == 1
     assert "consolidation" in afm_writer._PENDING_LIFECYCLE
+    assert writes == ["consolidation"]
 
+    # Re-apply succeeds on submit without a second _write_batch.
     second = afm_writer.submit_drafts(
-        {"pass_name": "consolidation", "drafts": [{"title": "dup"}]},
+        {
+            "pass_name": "consolidation",
+            "drafts": [{"title": "dup"}],
+            "lifecycle_handler": _handler,
+        },
         timeout=0.05,
     )
-    assert second["status"] == "write_in_flight"
-    assert second.get("lifecycle_pending") is True
+    # After re-apply, a new batch may proceed (write may timeout with no worker).
+    assert "consolidation" not in afm_writer._PENDING_LIFECYCLE
+    assert len(calls["applied"]) == 1
+    assert calls["applied"][0]["promote_candidate_ids"] == [1]
+    # Only the original write — re-apply must not mint a second draft set.
+    assert writes == ["consolidation"], f"unexpected writes: {writes}"
+    # second may be write_timeout (no worker) or a result — not lifecycle_pending
+    assert second.get("lifecycle_pending") is not True
+    assert second.get("status") != "write_in_flight" or "timeout" in str(second)
 
     status, reasons = afm_writer.derive_loop_status(
         {

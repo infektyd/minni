@@ -847,10 +847,15 @@ def _maybe_apply_deferred_lifecycle(job: dict) -> bool:
     except Exception:
         global _LIFECYCLE_APPLY_FAILURES, _LAST_LIFECYCLE_APPLY_FAILURE_AT
         pass_name = str(job.get("pass_name") or "unknown")
+        stored = dict(lifecycle)
+        # Round 14: keep the handler so submit_drafts can re-apply without a
+        # process restart (and without minting a second draft set).
+        if callable(handler):
+            stored["_handler"] = handler
         with _IN_FLIGHT_LOCK:
             _LIFECYCLE_APPLY_FAILURES += 1
             _LAST_LIFECYCLE_APPLY_FAILURE_AT = time.time()
-            _PENDING_LIFECYCLE[pass_name] = dict(lifecycle)
+            _PENDING_LIFECYCLE[pass_name] = stored
         job["lifecycle_apply_failed"] = True
         logger.exception(
             "AFM writer: deferred lifecycle apply failed for pass %r — "
@@ -949,21 +954,63 @@ def submit_drafts(job: dict, wait: bool = True, timeout: Optional[float] = 30.0)
     done = threading.Event()
     out: dict = {}
     with _IN_FLIGHT_LOCK:
-        # Round 13: sticky pending lifecycle (apply failed after drafts
-        # landed) refuses a new batch so we do not mint a second draft set.
-        if pass_name in _PENDING_LIFECYCLE:
-            logger.warning(
-                "AFM writer: pass %r has pending deferred lifecycle; REFUSED "
-                "%d draft(s) — apply must succeed before a new batch",
-                pass_name, len(job.get("drafts") or []),
-            )
-            return {
-                "status": "write_in_flight",
-                "queue_depth": _WORK_QUEUE.qsize(),
-                "drafts_written": [],
-                "drafts_deferred": len(job.get("drafts") or []),
-                "lifecycle_pending": True,
-            }
+        # Round 13/14: pending lifecycle after a failed deferred apply.
+        # Re-apply the stored decision set (no new drafts) before refusing
+        # forever / restarting into a second draft generation.
+        pending_life = _PENDING_LIFECYCLE.get(pass_name)
+        if pending_life is not None:
+            handler = job.get("lifecycle_handler")
+            # Prefer the handler on the new job (fresh context); fall back to
+            # whatever was stored with the pending payload.
+            if not callable(handler):
+                handler = pending_life.get("_handler")
+            if callable(handler):
+                try:
+                    # Drop internal bookkeeping keys before apply.
+                    payload = {
+                        k: v
+                        for k, v in pending_life.items()
+                        if not str(k).startswith("_")
+                    }
+                    handler(payload)
+                    _PENDING_LIFECYCLE.pop(pass_name, None)
+                    prior_ev = _IN_FLIGHT_PER_PASS.get(pass_name)
+                    if prior_ev is not None and not prior_ev.is_set():
+                        prior_ev.set()
+                    logger.info(
+                        "AFM writer: re-applied pending lifecycle for pass %r; "
+                        "accepting new batch",
+                        pass_name,
+                    )
+                except Exception:
+                    global _LIFECYCLE_APPLY_FAILURES, _LAST_LIFECYCLE_APPLY_FAILURE_AT
+                    _LIFECYCLE_APPLY_FAILURES += 1
+                    _LAST_LIFECYCLE_APPLY_FAILURE_AT = time.time()
+                    logger.exception(
+                        "AFM writer: re-apply of pending lifecycle for pass %r "
+                        "failed; still refusing new drafts",
+                        pass_name,
+                    )
+                    return {
+                        "status": "write_in_flight",
+                        "queue_depth": _WORK_QUEUE.qsize(),
+                        "drafts_written": [],
+                        "drafts_deferred": len(job.get("drafts") or []),
+                        "lifecycle_pending": True,
+                    }
+            else:
+                logger.warning(
+                    "AFM writer: pass %r has pending deferred lifecycle but no "
+                    "handler to re-apply; REFUSED %d draft(s)",
+                    pass_name, len(job.get("drafts") or []),
+                )
+                return {
+                    "status": "write_in_flight",
+                    "queue_depth": _WORK_QUEUE.qsize(),
+                    "drafts_written": [],
+                    "drafts_deferred": len(job.get("drafts") or []),
+                    "lifecycle_pending": True,
+                }
         prior = _IN_FLIGHT_PER_PASS.get(pass_name)
         if prior is not None and not prior.is_set():
             # Round 5: the previous batch for this pass is still queued and

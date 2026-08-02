@@ -380,17 +380,27 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
                         agent_id,
                         exc,
                     )
+                    emb_model = None
+                    try:
+                        emb_model = getattr(
+                            vault_engine.config, "embedding_model", None
+                        )
+                    except Exception:
+                        emb_model = None
+                    if emb_model is None:
+                        emb_model = getattr(
+                            getattr(context, "default_config", None),
+                            "embedding_model",
+                            None,
+                        )
                     degradations.append(
                         {
                             "src": "p",
-                            "vector_model": getattr(
-                                getattr(context, "config", None),
-                                "embedding_model",
-                                None,
-                            ),
+                            "vector_model": emb_model,
                             "vector_degraded": False,
                             "degraded": True,
                             "personal_index_failed": detail,
+                            "reason": detail,
                         }
                     )
             return retrieve_shared()
