@@ -425,6 +425,84 @@ def test_await_handoff_fails_loud_on_db_error_not_timeout(monkeypatch, tmp_path)
     assert "reading lease" in response["error"]["message"]
 
 
+def test_list_pending_handoffs_uses_file_channel_when_db_broken(monkeypatch, tmp_path):
+    """Dual-channel: broken DB + pending inbox packet still lists the lease."""
+    _patch_handoff_db(monkeypatch, tmp_path)
+    sender = tmp_path / "codex-vault"
+    recipient = tmp_path / "claudecode-vault"
+    inbox = recipient / "inbox"
+    inbox.mkdir(parents=True)
+    lease_id = "handoff-file-only-pending"
+    packet = {
+        "lease_id": lease_id,
+        "from_agent": "codex",
+        "to_agent": "claude-code",
+        "task": "file-channel pending",
+        "requires_ack": True,
+        "expires_at": "2099-01-01T00:00:00Z",
+    }
+    (inbox / f"{lease_id}.json").write_text(json.dumps(packet), encoding="utf-8")
+    monkeypatch.setenv(
+        "MINNI_AGENT_VAULTS",
+        json.dumps({"codex": str(sender), "claude-code": str(recipient)}),
+    )
+    monkeypatch.setattr(
+        minnid, "_lazy_writeback", lambda: types.SimpleNamespace(db=_BrokenHandoffDB())
+    )
+
+    response = minnid._dispatch_sync({
+        "jsonrpc": "2.0",
+        "id": 2313,
+        "method": "minni_list_pending_handoffs",
+        "params": {"agent_id": "claude-code"},
+    })
+
+    assert "error" not in response, f"file channel must answer when DB is down: {response!r}"
+    result = response["result"]
+    assert [item["lease_id"] for item in result["handoffs"]] == [lease_id]
+    assert result["handoffs"][0]["task"] == "file-channel pending"
+
+
+def test_await_handoff_uses_file_ack_when_db_broken(monkeypatch, tmp_path):
+    """Dual-channel: broken DB + terminal file ack returns accepted, not -32000."""
+    _patch_handoff_db(monkeypatch, tmp_path)
+    sender = tmp_path / "codex-vault"
+    recipient = tmp_path / "claudecode-vault"
+    outbox = sender / "outbox"
+    outbox.mkdir(parents=True)
+    lease_id = "handoff-file-only-acked"
+    packet = {
+        "lease_id": lease_id,
+        "from_agent": "codex",
+        "to_agent": "claude-code",
+        "task": "file-channel acked",
+        "requires_ack": True,
+        "ack_status": "accepted",
+        "acked_at": "2026-08-02T12:00:00Z",
+    }
+    (outbox / f"{lease_id}.json").write_text(json.dumps(packet), encoding="utf-8")
+    monkeypatch.setenv(
+        "MINNI_AGENT_VAULTS",
+        json.dumps({"codex": str(sender), "claude-code": str(recipient)}),
+    )
+    monkeypatch.setattr(
+        minnid, "_lazy_writeback", lambda: types.SimpleNamespace(db=_BrokenHandoffDB())
+    )
+
+    response = minnid._dispatch_sync({
+        "jsonrpc": "2.0",
+        "id": 2314,
+        "method": "minni_await_handoff",
+        "params": {"lease_id": lease_id, "timeout_ms": 5000},
+    })
+
+    assert "error" not in response, f"file ack must win over broken DB: {response!r}"
+    result = response["result"]
+    assert result["lease_id"] == lease_id
+    assert result["status"] == "accepted"
+    assert result["acked_at"] == "2026-08-02T12:00:00Z"
+
+
 def test_pending_handoff_leases_raises_handoff_store_error(monkeypatch, tmp_path):
     """Unit-level: empty list is reserved for genuine empty; store failure raises."""
     from dataclasses import replace

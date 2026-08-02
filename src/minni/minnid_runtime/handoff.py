@@ -657,25 +657,8 @@ def handle_ack_handoff(params: dict, request_id: Any, context: HandoffContext) -
     }, request_id)
 
 
-def handle_list_pending_handoffs(params: dict, request_id: Any, context: HandoffContext) -> dict:
-    # G11 / RCM-003/009: EffectivePrincipal stamp + mismatch guard (closes last model-facing agent_id surfaces)
-    # Model-supplied agent_id is NEVER trusted; use stamped principal.agent_id for leases/queries.
-    principal, err = context.handler_principal(params, request_id)
-    if err:
-        return err
-    agent_id = principal.agent_id
-    if not agent_id:
-        return context.make_error(-32602, "agent_id is required", request_id)
-    try:
-        sqlite_handoffs = pending_handoff_leases(agent_id, context=context)
-    except HandoffStoreError as exc:
-        # PLUMB-T7: surface store failure as a JSON-RPC error, not empty handoffs.
-        return context.make_error(-32000, str(exc), request_id)
-    if sqlite_handoffs:
-        return context.make_response({"agent_id": agent_id, "handoffs": sqlite_handoffs}, request_id)
-
-    # DB channel healthy but empty: consult the file channel (PLUMB-T3 partial —
-    # full dual-channel merge when DB has *some* rows is a follow-up).
+def _file_channel_pending_handoffs(agent_id: str, *, context: HandoffContext) -> list[dict]:
+    """Pending leases visible only on the JSON packet channel (inbox/outbox)."""
     now = time.time()
     handoffs = []
     for _vault, path, packet in iter_handoff_files(agent_id, context=context):
@@ -696,6 +679,55 @@ def handle_list_pending_handoffs(params: dict, request_id: Any, context: Handoff
             "expires_at": packet.get("expires_at"),
             "path": str(path),
         })
+    return handoffs
+
+
+def _file_channel_terminal_ack(lease_id: str, *, context: HandoffContext) -> Optional[dict]:
+    """Terminal ack_status from JSON packets, if any (dual-channel await path)."""
+    for _vault, _path, packet in iter_handoff_files(context=context):
+        if packet.get("lease_id") == lease_id and packet.get("ack_status"):
+            return {
+                "lease_id": lease_id,
+                "status": packet.get("ack_status"),
+                "acked_at": packet.get("acked_at"),
+            }
+    return None
+
+
+def handle_list_pending_handoffs(params: dict, request_id: Any, context: HandoffContext) -> dict:
+    # G11 / RCM-003/009: EffectivePrincipal stamp + mismatch guard (closes last model-facing agent_id surfaces)
+    # Model-supplied agent_id is NEVER trusted; use stamped principal.agent_id for leases/queries.
+    principal, err = context.handler_principal(params, request_id)
+    if err:
+        return err
+    agent_id = principal.agent_id
+    if not agent_id:
+        return context.make_error(-32602, "agent_id is required", request_id)
+    store_error: Optional[HandoffStoreError] = None
+    try:
+        sqlite_handoffs = pending_handoff_leases(agent_id, context=context)
+    except HandoffStoreError as exc:
+        # Dual-channel: DB blew up — still consult file packets before fail-loud.
+        # Empty-on-store-failure would hide live inbox work; empty-on-both is -32000.
+        store_error = exc
+        sqlite_handoffs = None
+    if sqlite_handoffs:
+        return context.make_response({"agent_id": agent_id, "handoffs": sqlite_handoffs}, request_id)
+
+    # DB channel healthy but empty, or store failed: consult the file channel
+    # (PLUMB-T3 partial — full dual-channel merge when DB has *some* rows is a follow-up).
+    handoffs = _file_channel_pending_handoffs(agent_id, context=context)
+    if handoffs:
+        if store_error is not None:
+            context.logger.warning(
+                "list_pending_handoffs: store failed (%s); returning %d file-channel lease(s)",
+                store_error,
+                len(handoffs),
+            )
+        return context.make_response({"agent_id": agent_id, "handoffs": handoffs}, request_id)
+    if store_error is not None:
+        # PLUMB-T7: both channels cannot answer with pending work — not healthy empty.
+        return context.make_error(-32000, str(store_error), request_id)
     return context.make_response({"agent_id": agent_id, "handoffs": handoffs}, request_id)
 
 
@@ -709,20 +741,21 @@ async def handle_await_handoff(params: dict, request_id: Any, context: HandoffCo
         try:
             lease = handoff_lease_status(lease_id, context=context)
         except HandoffStoreError as exc:
-            # PLUMB-T7: do not spin until timeout pretending the lease is merely unknown.
+            # Dual-channel (mirror lease_to_agent): terminal ack may already be on disk.
+            # Fail-loud only when the file channel also has nothing terminal — do not
+            # spin the full timeout pretending the lease is merely unknown.
+            file_ack = _file_channel_terminal_ack(lease_id, context=context)
+            if file_ack is not None:
+                return context.make_response(file_ack, request_id)
             return context.make_error(-32000, str(exc), request_id)
         if lease is not None and lease.get("status") not in {None, "pending"}:
             return context.make_response({
                 "lease_id": lease_id,
                 "status": lease.get("status"),
             }, request_id)
-        for _vault, _path, packet in iter_handoff_files(context=context):
-            if packet.get("lease_id") == lease_id and packet.get("ack_status"):
-                return context.make_response({
-                    "lease_id": lease_id,
-                    "status": packet.get("ack_status"),
-                    "acked_at": packet.get("acked_at"),
-                }, request_id)
+        file_ack = _file_channel_terminal_ack(lease_id, context=context)
+        if file_ack is not None:
+            return context.make_response(file_ack, request_id)
         if time.time() >= deadline:
             return context.make_response({"lease_id": lease_id, "status": "timeout"}, request_id)
         await asyncio.sleep(0.05)
