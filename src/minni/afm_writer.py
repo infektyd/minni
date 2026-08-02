@@ -5,6 +5,7 @@ from __future__ import annotations
 import calendar
 import json
 import logging
+import os
 import queue
 import re
 import threading
@@ -94,11 +95,43 @@ def _extract_frontmatter(text: str) -> str:
     (they still get scanned) rather than silently treating them as having no
     ``created`` field; the parse-then-validate step in the caller is what
     actually rejects unusable values.
+
+    PERMISSIVE — read-only probes only. Anything that gates a rewrite or a
+    lifecycle decision must use _extract_frontmatter_block: the whole-text
+    fallback means an UNFENCED note whose body documents the AFM format
+    (quoting `status: draft`, `agent: afm-loop`, a past `expires_at`) reads
+    as a real draft, and expiry would destructively rewrite its prose.
     """
     if not text.startswith("---"):
         return text
     end = text.find("\n---", 3)
     return text if end == -1 else text[:end]
+
+
+def _extract_frontmatter_block(text: str) -> Optional[str]:
+    """The leading `---`-fenced YAML block, or None if there is no CLOSED one.
+
+    The strict twin of _extract_frontmatter, for every path that decides or
+    rewrites lifecycle state. No fence, or an unclosed fence, means the page
+    has no frontmatter — refuse, never scan the body. Real AFM drafts are
+    always written fenced by _write_one, so strictness costs nothing there.
+    """
+    if not text.startswith("---"):
+        return None
+    end = text.find("\n---", 3)
+    return None if end == -1 else text[:end]
+
+
+def _atomic_write_text(path: Path, data: str) -> None:
+    """Replace ``path`` with ``data`` atomically (same-directory temp + rename).
+
+    Path.write_text opens 'w' — truncate, then write — so a crash, a full
+    disk, or a concurrent reader mid-write leaves a torn page. The first live
+    expiry sweep rewrites ~900 pages in one pass; each must be all-or-nothing.
+    """
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(data, encoding="utf-8")
+    os.replace(tmp, path)
 
 
 def derive_loop_status(
@@ -405,7 +438,12 @@ def _expire_stale_drafts(vault: Path, now: Optional[float] = None) -> int:
         # another page's frontmatter is the ordinary case); letting it satisfy
         # the entry gate would drag non-AFM pages into the expiry path, and the
         # rewrite below would then edit that prose instead of the real status.
-        frontmatter = _extract_frontmatter(text)
+        # STRICT extractor: a page with no closed fence has no frontmatter at
+        # all — the permissive whole-text fallback would read an unfenced note
+        # that documents the AFM format as an expirable draft.
+        frontmatter = _extract_frontmatter_block(text)
+        if frontmatter is None:
+            continue
         if not _FM_DRAFT_STATUS.search(frontmatter):
             continue
         if not _FM_AFM_AGENT.search(frontmatter):
@@ -426,7 +464,9 @@ def _expire_stale_drafts(vault: Path, now: Optional[float] = None) -> int:
                     current = path.read_text(encoding="utf-8")
                 except Exception:
                     continue
-                current_fm = _extract_frontmatter(current)
+                current_fm = _extract_frontmatter_block(current)
+                if current_fm is None:
+                    continue
                 if not _FM_DRAFT_STATUS.search(current_fm):
                     # Endorsed (or already expired) while we were deciding.
                     continue
@@ -444,9 +484,7 @@ def _expire_stale_drafts(vault: Path, now: Optional[float] = None) -> int:
                 # the substitution can never land on body text that merely
                 # looks like frontmatter.
                 rewritten = _FM_DRAFT_STATUS.sub("status: expired", current_fm, count=1)
-                path.write_text(
-                    rewritten + current[len(current_fm):], encoding="utf-8"
-                )
+                _atomic_write_text(path, rewritten + current[len(current_fm):])
             expired += 1
     return expired
 
@@ -552,12 +590,15 @@ def writer_status(
                 # A draft we cannot read is not a draft we know to be fine.
                 unreadable += 1
                 continue
-            # Gate on the frontmatter block only, with the SAME predicates the
-            # expiry engine uses. The whole-file substring test counted a page
-            # whose body merely quotes another draft's frontmatter — so after
-            # expiry flips the real status to `expired`, the pending count
-            # kept reporting a backlog the expiry engine had already drained.
-            frontmatter = _extract_frontmatter(text)
+            # Gate on the frontmatter block only, with the SAME predicates AND
+            # the same strict extractor the expiry engine uses. The whole-file
+            # substring test counted a page whose body merely quotes another
+            # draft's frontmatter, and the permissive extractor would count an
+            # unfenced note expiry can never expire — either way the pending
+            # count reports a backlog the expiry engine will never drain.
+            frontmatter = _extract_frontmatter_block(text)
+            if frontmatter is None:
+                continue
             if (_FM_DRAFT_STATUS.search(frontmatter)
                     and _FM_AFM_AGENT.search(frontmatter)):
                 pending += 1
@@ -612,8 +653,10 @@ def endorse_draft(vault_path: str, page_id: str, decision: str) -> dict:
         # substring: a draft whose body quotes another page's frontmatter
         # would be discovered first, endorsed in the target's place, and the
         # audit would claim the requested id. Same body-quotation class as
-        # the status gate above, one field over.
-        if _page_id_of(_extract_frontmatter(text)) == page_id:
+        # the status gate above, one field over. Strict extractor: an
+        # unfenced page has no frontmatter and therefore no page_id.
+        fm = _extract_frontmatter_block(text)
+        if fm is not None and _page_id_of(fm) == page_id:
             target = path
             break
     if target is None:
@@ -626,17 +669,18 @@ def endorse_draft(vault_path: str, page_id: str, decision: str) -> dict:
         # whole-file test accepted a page whose FM was already expired (or
         # endorsed) as long as its body quoted "status: draft" somewhere, and
         # then rewrote that body prose while reporting success.
-        frontmatter = _extract_frontmatter(text)
+        frontmatter = _extract_frontmatter_block(text)
         # Re-validate the identity under the lock too: the discovery read ran
         # unlocked, and the per-page lock is keyed by the REQUESTED id — if
-        # the file's own id no longer matches, this write would not even be
-        # serialized against the page it is about to modify.
-        if _page_id_of(frontmatter) != page_id:
+        # the file's own id no longer matches (or its fences vanished), this
+        # write would not even be serialized against the page it is about to
+        # modify.
+        if frontmatter is None or _page_id_of(frontmatter) != page_id:
             raise FileNotFoundError(f"draft page_id not found: {page_id}")
         if not _FM_DRAFT_STATUS.search(frontmatter):
             raise ValueError(f"page is not an active draft: {page_id}")
         rewritten = _FM_DRAFT_STATUS.sub(f"status: {status}", frontmatter, count=1)
-        target.write_text(rewritten + text[len(frontmatter):], encoding="utf-8")
+        _atomic_write_text(target, rewritten + text[len(frontmatter):])
     rel = target.relative_to(vault)
     result = {"status": status, "page_id": page_id, "path": str(rel), "decision": decision}
     _append_audit(vault, "afm_endorse", f"{decision}: {page_id}", result)

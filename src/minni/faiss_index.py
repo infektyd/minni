@@ -476,11 +476,12 @@ class FAISSIndex:
     def invalidate(self) -> None:
         """Drop the in-memory index so the next search reloads it from the DB.
 
-        Not a delete: ``chunk_embeddings`` is untouched. Clearing the in-memory
-        state takes ``count`` to 0, which is the condition
-        ``RetrievalEngine._ensure_faiss_loaded`` uses to decide to rebuild — so
-        an out-of-process writer that added chunk rows can make a warm engine
-        pick them up without a restart.
+        Not a delete: ``chunk_embeddings`` is untouched. This clears ``ready``
+        and advances the generation, which is what
+        ``RetrievalEngine._ensure_faiss_loaded`` gates its rebuild on — so an
+        out-of-process writer that added chunk rows can make a warm engine
+        pick them up without a restart. The gate is READINESS, not count>0:
+        a partially re-populated index must never read as warm.
 
         Taken under the lock, and as a single rebind of each attribute rather
         than in-place mutation, so a concurrent search sees either the old

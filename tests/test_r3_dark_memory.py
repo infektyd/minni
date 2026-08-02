@@ -732,7 +732,7 @@ def test_expiry_does_not_clobber_a_concurrent_endorsement(tmp_path, monkeypatch)
     # Endorse in the window between expiry's read and its write.
     import minni.afm_writer as writer
 
-    real_extract = writer._extract_frontmatter
+    real_extract = writer._extract_frontmatter_block
     fired = {"done": False}
 
     def extract_then_endorse(text):
@@ -742,7 +742,7 @@ def test_expiry_does_not_clobber_a_concurrent_endorsement(tmp_path, monkeypatch)
             endorse_draft(str(vault), "page-racey", "accept")
         return out
 
-    monkeypatch.setattr(writer, "_extract_frontmatter", extract_then_endorse)
+    monkeypatch.setattr(writer, "_extract_frontmatter_block", extract_then_endorse)
 
     _expire_stale_drafts(vault, now=now)
 
@@ -878,7 +878,7 @@ def test_expiry_respects_a_ttl_extension_made_under_the_race(tmp_path, monkeypat
 
     import minni.afm_writer as writer
 
-    real_extract = writer._extract_frontmatter
+    real_extract = writer._extract_frontmatter_block
     fired = {"done": False}
     future = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now + 86400))
 
@@ -893,7 +893,7 @@ def test_expiry_respects_a_ttl_extension_made_under_the_race(tmp_path, monkeypat
             )
         return out
 
-    monkeypatch.setattr(writer, "_extract_frontmatter", extract_then_extend)
+    monkeypatch.setattr(writer, "_extract_frontmatter_block", extract_then_extend)
 
     _expire_stale_drafts(vault, now=now)
 
@@ -1678,6 +1678,126 @@ def test_durable_refresh_survives_an_ensure_that_missed_its_rows(tmp_path, monke
         assert eng.faiss_index.count == n, "add_batch duplicated an existing id"
     finally:
         eng.db.close()
+
+
+# ── Round 14: findings from the thirteenth Grok review of #256 ─────────────
+
+
+_UNFENCED_NOTE = (
+    "# AFM draft format\n\n"
+    "When the loop writes a draft the frontmatter looks like this:\n\n"
+    "status: draft\n"
+    "agent: afm-loop\n"
+    "page_id: page-ghost\n"
+    "expires_at: '2020-01-01T00:00:00Z'\n\n"
+    "None of the lines above are frontmatter — this file has no fences.\n"
+)
+
+
+def test_unfenced_page_is_never_expired(tmp_path):
+    """Grok round 14 #1. _extract_frontmatter falls back to the WHOLE text
+    when a file has no leading fence, so an ordinary unfenced wiki note that
+    documents the AFM format read as an overdue draft and was destructively
+    rewritten on the first live sweep. Dead pre-PR (expiry matched nothing);
+    activated the moment expiry started working. Destructive paths must
+    require a real CLOSED fenced block and never scan the body."""
+    from minni.afm_writer import DRAFT_TTL_SECONDS, _expire_stale_drafts, _write_one
+
+    vault = tmp_path / "vault"
+    wiki = vault / "wiki" / "concepts"
+    wiki.mkdir(parents=True)
+    unfenced = wiki / "afm-format-notes.md"
+    unfenced.write_text(_UNFENCED_NOTE, encoding="utf-8")
+    unclosed = wiki / "unclosed-fence.md"
+    unclosed.write_text(
+        "---\nstatus: draft\nagent: afm-loop\n"
+        "expires_at: '2020-01-01T00:00:00Z'\n\nno closing fence follows\n",
+        encoding="utf-8",
+    )
+    # A REAL overdue draft alongside, so the sweep is provably live.
+    now = time.time()
+    real = vault / _write_one(
+        vault, _draft(page_id="page-real"), now=now - DRAFT_TTL_SECONDS - 86400
+    )["path"]
+
+    expired = _expire_stale_drafts(vault, now=now)
+
+    assert expired == 1, f"sweep expired {expired} pages, expected the 1 real draft"
+    assert "status: expired" in real.read_text(encoding="utf-8")
+    assert unfenced.read_text(encoding="utf-8") == _UNFENCED_NOTE, (
+        "expiry rewrote an UNFENCED note whose body documents the AFM format"
+    )
+    assert "status: draft" in unclosed.read_text(encoding="utf-8"), (
+        "expiry rewrote a page whose fence never closes"
+    )
+
+
+def test_unfenced_page_is_neither_pending_nor_endorsable(tmp_path):
+    """Grok round 14 #1, the counter and endorse halves. The same whole-text
+    fallback made writer_status count an unfenced note as pending (a backlog
+    expiry can never drain) and let endorse_draft discover it by a page_id
+    its body merely mentions."""
+    from minni.afm_writer import endorse_draft, writer_status
+    import pytest
+
+    wiki = tmp_path / "wiki" / "concepts"
+    wiki.mkdir(parents=True)
+    page = wiki / "afm-format-notes.md"
+    page.write_text(_UNFENCED_NOTE, encoding="utf-8")
+
+    status = writer_status(str(tmp_path))
+    assert status["drafts_pending"] == 0, (
+        f"an unfenced note counted as pending: {status['drafts_pending']}"
+    )
+
+    with pytest.raises(FileNotFoundError):
+        endorse_draft(str(tmp_path), "page-ghost", "accept")
+    assert page.read_text(encoding="utf-8") == _UNFENCED_NOTE, (
+        "endorse rewrote an unfenced note"
+    )
+
+
+def test_lifecycle_rewrites_are_atomic(tmp_path, monkeypatch):
+    """Grok round 14 #2. Path.write_text truncates before writing, so a crash
+    or full disk mid-write during the ~900-page first sweep leaves torn pages
+    the indexer then persists. Expiry and endorse must write via same-dir
+    temp + os.replace: on failure the original page is byte-identical."""
+    from minni.afm_writer import (
+        DRAFT_TTL_SECONDS,
+        _expire_stale_drafts,
+        _write_one,
+        endorse_draft,
+    )
+    import pytest
+
+    vault = tmp_path / "vault"
+    now = time.time()
+    page = vault / _write_one(
+        vault, _draft(page_id="page-torn"), now=now - DRAFT_TTL_SECONDS - 86400
+    )["path"]
+    before = page.read_text(encoding="utf-8")
+
+    real_write = Path.write_text
+
+    def disk_full(self, data, *args, **kwargs):
+        with open(self, "w", encoding="utf-8") as f:
+            f.write(data[:12])
+        raise OSError("disk full")
+
+    monkeypatch.setattr(Path, "write_text", disk_full)
+    try:
+        with pytest.raises(OSError):
+            endorse_draft(str(vault), "page-torn", "accept")
+        assert page.read_text(encoding="utf-8") == before, (
+            "a failed endorse left a torn page behind"
+        )
+        with pytest.raises(OSError):
+            _expire_stale_drafts(vault, now=now)
+        assert page.read_text(encoding="utf-8") == before, (
+            "a failed expiry left a torn page behind"
+        )
+    finally:
+        monkeypatch.setattr(Path, "write_text", real_write)
 
 
 # ── Round 13: findings from the twelfth Grok review of #256 ────────────────
