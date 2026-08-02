@@ -650,3 +650,128 @@ def test_prune_keeps_a_row_stored_under_a_non_canonical_path(tmp_path, monkeypat
         "prune deleted a row whose file exists, because the stored path was "
         "not in canonical form"
     )
+
+
+# ── Round 4: findings from the third Grok review of #256 ───────────────────
+
+
+def test_indexing_does_not_hold_the_write_lock_across_the_walk(tmp_path, monkeypatch):
+    """Grok round 3 #1 (High). Phase 1 used to run inside a single
+    BEGIN IMMEDIATE, so the reserved lock was held for the whole sweep --
+    ~36s measured on this vault against db.py's 30s busy timeout. A concurrent
+    writer would get "database is locked". The lock must be released between
+    files, and model.encode must not run under it."""
+    import sqlite3 as sq
+
+    from minni.index_all import index_shared_vault
+
+    _install_fake_embedder(monkeypatch)
+    cfg = _make_cfg(tmp_path)
+    vault = Path(cfg.vault_path)
+    for i in range(8):
+        _write_page(vault / "wiki" / "concepts" / f"p{i}.md", "accepted", f"body {i} " * 40)
+
+    index_shared_vault(cfg)  # create schema
+
+    # A second connection tries to write DURING indexing, with a short timeout
+    # so it fails fast if the indexer is holding the lock across the walk.
+    other = sq.connect(cfg.db_path, timeout=0.5)
+    blocked = []
+
+    from minni.chunker import MarkdownChunker
+
+    real_chunk = MarkdownChunker.chunk_document
+    state = {"tried": False}
+
+    def chunk_and_probe(self, content):
+        # Runs mid-walk. If phase 1 still wrapped everything in one
+        # transaction, this write would block and raise.
+        if not state["tried"]:
+            state["tried"] = True
+            try:
+                other.execute("CREATE TABLE IF NOT EXISTS r3_lock_probe (x INTEGER)")
+                other.execute("INSERT INTO r3_lock_probe (x) VALUES (1)")
+                other.commit()
+            except Exception as exc:  # pragma: no cover - failure path
+                blocked.append(exc)
+        return real_chunk(self, content)
+
+    monkeypatch.setattr(MarkdownChunker, "chunk_document", chunk_and_probe)
+    for p in vault.rglob("*.md"):
+        os.utime(p, (time.time() + 5, time.time() + 5))  # force reindex
+
+    index_shared_vault(cfg)
+    other.close()
+
+    assert state["tried"], "probe never ran; test did not exercise the walk"
+    assert not blocked, f"concurrent writer was locked out during indexing: {blocked}"
+
+
+def test_expiry_does_not_clobber_a_concurrent_endorsement(tmp_path, monkeypatch):
+    """Grok round 3 #2. Expiry read the page, decided, then wrote -- with no
+    lock and no re-read. Now that it runs on the vault-watch thread alongside
+    RPC endorsement, an accept landing in that window was overwritten with
+    `status: expired` and lost."""
+    from minni.afm_writer import (
+        DRAFT_TTL_SECONDS,
+        _expire_stale_drafts,
+        _extract_frontmatter,
+        _write_one,
+        endorse_draft,
+    )
+
+    vault = tmp_path / "vault"
+    now = time.time()
+    draft = _draft(page_id="page-racey")
+    page = vault / _write_one(vault, draft, now=now - DRAFT_TTL_SECONDS - 86400)["path"]
+
+    # Endorse in the window between expiry's read and its write.
+    import minni.afm_writer as writer
+
+    real_extract = writer._extract_frontmatter
+    fired = {"done": False}
+
+    def extract_then_endorse(text):
+        out = real_extract(text)
+        if not fired["done"] and "status: draft" in out:
+            fired["done"] = True
+            endorse_draft(str(vault), "page-racey", "accept")
+        return out
+
+    monkeypatch.setattr(writer, "_extract_frontmatter", extract_then_endorse)
+
+    _expire_stale_drafts(vault, now=now)
+
+    fm = _extract_frontmatter(page.read_text(encoding="utf-8"))
+    assert "status: accepted" in fm, f"endorsement was clobbered by expiry:\n{fm}"
+    assert "status: expired" not in fm
+
+
+def test_reindex_adopts_a_non_canonical_row_instead_of_duplicating(tmp_path, monkeypatch):
+    """Grok round 3 #3. Keeping non-canonical rows in the prune was only half
+    the fix: phase 1 looked up by resolved path only, so it INSERTed a second
+    row for the same file and the prune then kept both."""
+    from minni.afm_writer import _write_one
+    from minni.index_all import index_shared_vault
+
+    _install_fake_embedder(monkeypatch)
+    cfg = _make_cfg(tmp_path)
+    vault = Path(cfg.vault_path)
+    written = _write_one(vault, _draft())
+    index_shared_vault(cfg)
+
+    page = (vault / written["path"]).resolve()
+    noncanonical = str(page.parent / ".." / page.parent.name / page.name)
+    conn = sqlite3.connect(cfg.db_path)
+    try:
+        conn.execute("UPDATE documents SET path = ? WHERE path = ?", (noncanonical, str(page)))
+        conn.commit()
+    finally:
+        conn.close()
+
+    os.utime(page, (time.time() + 10, time.time() + 10))  # force reindex
+    index_shared_vault(cfg)
+
+    rows = [p for p in _indexed_paths(cfg.db_path) if p.endswith(page.name)]
+    assert len(rows) == 1, f"duplicate rows for one file: {rows}"
+    assert rows[0] == str(page), "row was not normalized to the canonical path"

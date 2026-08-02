@@ -9,6 +9,7 @@ import queue
 import re
 import threading
 import time
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -48,6 +49,13 @@ DRAFT_TTL_SECONDS = 14 * 86400
 # page's own YAML keys can satisfy them, never body prose quoting the same text.
 _FM_DRAFT_STATUS = re.compile(r"^status:\s*['\"]?draft['\"]?\s*$", re.MULTILINE)
 _FM_AFM_AGENT = re.compile(r"^agent:\s*['\"]?afm-loop['\"]?\s*$", re.MULTILINE)
+_FM_PAGE_ID = re.compile(r"^page_id:\s*['\"]?([^'\"\s]+)", re.MULTILINE)
+
+
+def _page_id_of(frontmatter: str) -> Optional[str]:
+    """The page's own ``page_id``, used to share endorse_draft's per-page lock."""
+    match = _FM_PAGE_ID.search(frontmatter)
+    return match.group(1) if match else None
 
 
 def record_pass_attempt(pass_name: str, now: Optional[float] = None) -> None:
@@ -406,11 +414,31 @@ def _expire_stale_drafts(vault: Path, now: Optional[float] = None) -> int:
         if expires is None:
             continue
         if expires < now:
-            # Rewrite inside the frontmatter slice and splice it back, so the
-            # substitution can never land on body text that merely looks like
-            # frontmatter.
-            rewritten = _FM_DRAFT_STATUS.sub("status: expired", frontmatter, count=1)
-            path.write_text(rewritten + text[len(frontmatter):], encoding="utf-8")
+            # Re-read and re-validate under the SAME lock endorse_draft takes.
+            # Everything above ran against a buffer read outside any lock, and
+            # this now runs on the vault-watch thread concurrently with RPC
+            # endorsement: without this, an operator accepting a past-TTL draft
+            # between the read and the write would have their endorsement
+            # overwritten with `status: expired` and silently lost.
+            page_id = _page_id_of(frontmatter)
+            with _page_lock(page_id) if page_id else nullcontext():
+                try:
+                    current = path.read_text(encoding="utf-8")
+                except Exception:
+                    continue
+                current_fm = _extract_frontmatter(current)
+                if not _FM_DRAFT_STATUS.search(current_fm):
+                    # Endorsed (or already expired) while we were deciding.
+                    continue
+                if not _FM_AFM_AGENT.search(current_fm):
+                    continue
+                # Rewrite inside the frontmatter slice and splice it back, so
+                # the substitution can never land on body text that merely
+                # looks like frontmatter.
+                rewritten = _FM_DRAFT_STATUS.sub("status: expired", current_fm, count=1)
+                path.write_text(
+                    rewritten + current[len(current_fm):], encoding="utf-8"
+                )
             expired += 1
     return expired
 

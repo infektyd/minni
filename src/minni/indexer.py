@@ -155,6 +155,33 @@ class VaultIndexer:
             return "artifact"
         return "knowledge"
 
+    def _noncanonical_rows(self, vault_root: Path) -> Dict[str, Dict]:
+        """Map resolved path -> row, for vault-owned rows stored non-canonically.
+
+        Built ONCE per index run. The exact-path SELECT in phase 1 uses an
+        index; falling back to a table scan per miss would be O(files x rows)
+        -- and on a first index every file misses, so that scan is the common
+        case, not the rare one. Almost always empty: real writers store
+        resolved paths, so this only catches historical or symlinked rows.
+        """
+        from minni.path_safety import path_within_root
+
+        out: Dict[str, Dict] = {}
+        with self.db.cursor() as c:
+            c.execute("SELECT doc_id, last_modified, path FROM documents")
+            for row in c.fetchall():
+                stored = row["path"]
+                try:
+                    resolved = str(Path(stored).resolve())
+                except Exception:
+                    continue
+                if resolved == stored:
+                    continue
+                if not path_within_root(stored, vault_root):
+                    continue
+                out[resolved] = row
+        return out
+
     @staticmethod
     def _invalidate_rerank_chunks(chunk_ids: List[int]) -> None:
         try:
@@ -189,63 +216,107 @@ class VaultIndexer:
                     disk_files[full_resolved] = full.stat().st_mtime
 
         stats = {"indexed": 0, "skipped": 0, "deleted": 0, "chunks": 0, "errors": 0}
+        noncanonical_rows = self._noncanonical_rows(vault_root)
 
-        with self.db.transaction() as c:
-            # Phase 1: Index new/changed files
-            for path, mtime in disk_files.items():
-                try:
+        # Phase 1: index new/changed files.
+        #
+        # ONE SHORT TRANSACTION PER FILE, with every expensive step -- reading
+        # the file, chunking, model.encode -- performed OUTSIDE it. This used to
+        # be a single BEGIN IMMEDIATE wrapped around the entire walk, which
+        # holds SQLite's reserved lock for as long as the sweep runs: the
+        # measured first pass over this vault is ~36s against the 30s busy
+        # timeout in db.py, so any concurrent writer (learn, durable store)
+        # would have raised "database is locked". That was survivable while
+        # index_all was operator-initiated. It is not, now that the daemon runs
+        # this on a 300s timer against the shared DB.
+        for path, mtime in disk_files.items():
+            try:
+                with self.db.cursor() as c:
                     c.execute(
-                        "SELECT doc_id, last_modified FROM documents WHERE path = ?",
+                        "SELECT doc_id, last_modified, path FROM documents WHERE path = ?",
                         (path,),
                     )
                     row = c.fetchone()
+                if row is None:
+                    # `path` is resolved, but a historical row may store a
+                    # non-canonical spelling of the SAME file. Matching only the
+                    # canonical form would insert a second row for it, and the
+                    # prune below (which accepts either form) would keep both.
+                    # Adopt the existing row instead; the UPDATE normalizes its
+                    # path on the way through.
+                    row = noncanonical_rows.get(path)
 
-                    # Audit R0 (grok-review): last_modified is a REAL-affinity
-                    # column an out-of-tree writer could poison with TEXT, same
-                    # class as indexed_at. `>= mtime` on a TEXT value raises
-                    # TypeError, which the broad except below turned into a
-                    # permanent stats["errors"] — the row never got rewritten,
-                    # so it stayed stuck. Parse-or-treat-as-stale: an
-                    # unparseable value defaults to 0.0, which is always less
-                    # than mtime, so the row is reindexed (and thereby
-                    # repaired) instead of stuck.
-                    last_modified = (
-                        parse_epoch_or_report(
-                            row["last_modified"], field="last_modified",
-                            source="indexer.index_vault", doc_id=row["doc_id"],
-                        ) or 0.0
-                    ) if row else 0.0
-                    if row and last_modified >= mtime:
-                        stats["skipped"] += 1
-                        continue
+                # Audit R0 (grok-review): last_modified is a REAL-affinity
+                # column an out-of-tree writer could poison with TEXT, same
+                # class as indexed_at. `>= mtime` on a TEXT value raises
+                # TypeError, which the broad except below turned into a
+                # permanent stats["errors"] — the row never got rewritten,
+                # so it stayed stuck. Parse-or-treat-as-stale: an
+                # unparseable value defaults to 0.0, which is always less
+                # than mtime, so the row is reindexed (and thereby
+                # repaired) instead of stuck.
+                last_modified = (
+                    parse_epoch_or_report(
+                        row["last_modified"], field="last_modified",
+                        source="indexer.index_vault", doc_id=row["doc_id"],
+                    ) or 0.0
+                ) if row else 0.0
+                if row and last_modified >= mtime:
+                    stats["skipped"] += 1
+                    continue
 
-                    with open(path, "r", encoding="utf-8", errors="ignore") as f:
-                        content = f.read()
+                with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                    content = f.read()
 
-                    meta = self._extract_frontmatter(content)
-                    now = time.time()
+                meta = self._extract_frontmatter(content)
+                now = time.time()
 
-                    # PR-2: Skip pages with privacy: blocked — purge any stale index rows
-                    if meta.get("privacy_level") == "blocked":
-                        if row:
-                            doc_id = row["doc_id"]
+                # PR-2: Skip pages with privacy: blocked — purge any stale index rows
+                if meta.get("privacy_level") == "blocked":
+                    if row:
+                        doc_id = row["doc_id"]
+                        with self.db.transaction() as c:
                             c.execute("DELETE FROM vault_fts WHERE doc_id = ?", (doc_id,))
                             c.execute("DELETE FROM chunk_embeddings WHERE doc_id = ?", (doc_id,))
                             c.execute("DELETE FROM documents WHERE doc_id = ?", (doc_id,))
-                            stats["deleted"] += 1
-                        else:
-                            stats["skipped"] += 1
-                        continue
+                        stats["deleted"] += 1
+                    else:
+                        stats["skipped"] += 1
+                    continue
 
+                # Markdown-aware chunk embeddings, computed BEFORE the write
+                # transaction opens so model.encode never runs under the lock.
+                #
+                # Unendorsed pages get a document row and an FTS row but NO
+                # embedding. _semantic_search asks FAISS for a fixed limit*5
+                # window and retrieve() drops draft/expired only AFTER that
+                # window is filled, so embedding a vault that is ~95%
+                # unendorsed drafts lets them evict accepted pages from the
+                # candidate set and silently shrink recall. They stay lexically
+                # findable, and endorsing one rewrites the page — the next
+                # sweep sees the new mtime and embeds it.
+                unendorsed = (
+                    meta.get("page_status", "candidate") in UNEMBEDDED_STATUSES
+                )
+                prepared = []
+                if self.model and not unendorsed:
+                    for chunk in self.chunker.chunk_document(content):
+                        emb = self.model.encode(chunk.text)
+                        prepared.append((chunk, emb.astype(np.float32).tobytes()))
+
+                layer = meta.get("layer", "knowledge")
+                stale_chunk_ids: List[int] = []
+                with self.db.transaction() as c:
                     if row:
                         doc_id = row["doc_id"]
-                        layer = meta.get("layer", "knowledge")
+                        # path=? normalizes a row adopted under a non-canonical
+                        # spelling, so the next pass matches it exactly.
                         c.execute(
                             """UPDATE documents
-                               SET agent=?, sigil=?, last_modified=?, indexed_at=?,
+                               SET path=?, agent=?, sigil=?, last_modified=?, indexed_at=?,
                                    page_status=?, privacy_level=?, page_type=?, layer=?
                                WHERE doc_id=?""",
-                            (meta["agent"], meta["sigil"], mtime, now,
+                            (path, meta["agent"], meta["sigil"], mtime, now,
                              meta.get("page_status", "candidate"),
                              meta.get("privacy_level", "safe"),
                              meta.get("page_type"),
@@ -256,11 +327,10 @@ class VaultIndexer:
                             "SELECT chunk_id FROM chunk_embeddings WHERE doc_id = ?",
                             (doc_id,),
                         )
-                        self._invalidate_rerank_chunks([r["chunk_id"] for r in c.fetchall()])
+                        stale_chunk_ids = [r["chunk_id"] for r in c.fetchall()]
                         c.execute("DELETE FROM vault_fts WHERE doc_id = ?", (doc_id,))
                         c.execute("DELETE FROM chunk_embeddings WHERE doc_id = ?", (doc_id,))
                     else:
-                        layer = meta.get("layer", "knowledge")
                         c.execute(
                             """INSERT INTO documents (path, agent, sigil, last_modified, indexed_at,
                                    page_status, privacy_level, page_type, layer)
@@ -280,51 +350,39 @@ class VaultIndexer:
                         (doc_id, path, content, meta["agent"], meta["sigil"]),
                     )
 
-                    # Markdown-aware chunk embeddings.
-                    #
-                    # Unendorsed pages get a document row and an FTS row but NO
-                    # embedding. _semantic_search asks FAISS for a fixed
-                    # limit*5 window and retrieve() drops draft/expired only
-                    # AFTER that window is filled, so embedding a vault that is
-                    # ~95% unendorsed drafts lets them evict accepted pages
-                    # from the candidate set and silently shrink recall. They
-                    # stay lexically findable, and endorsing one rewrites the
-                    # page — the next sweep sees the new mtime and embeds it.
-                    unendorsed = (
-                        meta.get("page_status", "candidate") in UNEMBEDDED_STATUSES
-                    )
-                    if self.model and not unendorsed:
-                        chunks = self.chunker.chunk_document(content)
-                        for chunk in chunks:
-                            emb = self.model.encode(chunk.text)
-                            emb_bytes = emb.astype(np.float32).tobytes()
+                    for chunk, emb_bytes in prepared:
+                        c.execute(
+                            """INSERT INTO chunk_embeddings
+                               (doc_id, chunk_index, chunk_text, embedding,
+                                heading_context, model_name, computed_at, layer)
+                               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                            (
+                                doc_id, chunk.chunk_index, chunk.text,
+                                emb_bytes, chunk.heading_path,
+                                self.config.embedding_model, now, layer,
+                            ),
+                        )
+                        stats["chunks"] += 1
 
-                            c.execute(
-                                """INSERT INTO chunk_embeddings
-                                   (doc_id, chunk_index, chunk_text, embedding,
-                                    heading_context, model_name, computed_at, layer)
-                                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                                (
-                                    doc_id, chunk.chunk_index, chunk.text,
-                                    emb_bytes, chunk.heading_path,
-                                    self.config.embedding_model, now, layer,
-                                ),
-                            )
-                            stats["chunks"] += 1
+                # Cache invalidation is not a DB write; keep it off the lock.
+                if stale_chunk_ids:
+                    self._invalidate_rerank_chunks(stale_chunk_ids)
 
-                    stats["indexed"] += 1
-                    if verbose:
-                        n_chunks = len(self.chunker.chunk_document(content)) if self.model else 0
-                        logger.info("  ✓ %s [%s/%s] (%d chunks)",
-                                    os.path.basename(path),
-                                    meta["agent"], meta["sigil"], n_chunks)
+                stats["indexed"] += 1
+                if verbose:
+                    logger.info("  ✓ %s [%s/%s] (%d chunks)",
+                                os.path.basename(path),
+                                meta["agent"], meta["sigil"], len(prepared))
 
-                except Exception as e:
-                    stats["errors"] += 1
-                    if verbose:
-                        logger.error("  ✗ %s: %s", path, e)
+            except Exception as e:
+                stats["errors"] += 1
+                if verbose:
+                    logger.error("  ✗ %s: %s", path, e)
 
-            # Phase 2: Remove docs no longer on disk.
+        # Phase 2 gets its OWN short transaction, separate from the per-file
+        # writes above, so the prune never extends a lock across indexing work.
+        with self.db.transaction() as c:
+            # Remove docs no longer on disk.
             #
             # Two exemptions, both load-bearing. The SELECT is over the WHOLE
             # documents table while `disk_files` only ever holds this vault's
