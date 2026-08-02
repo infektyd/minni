@@ -1414,6 +1414,219 @@ def test_deferred_lifecycle_failure_refuses_resubmit_and_surfaces(monkeypatch):
     afm_writer.reset_pass_counters()
 
 
+def test_sticky_deferred_lifecycle_survives_process_restart_simulation(
+    tmp_path, monkeypatch
+):
+    """Round 18: sticky pending was process-memory only. After drafts land and
+    deferred apply fails, a daemon restart cleared _PENDING_LIFECYCLE → next
+    tick re-triaged proposed candidates and minted a second draft set.
+
+    Pin: write OK → apply fails → clear in-memory state (restart) → next
+    submit hydrates from the vault sidecar, re-applies, and does NOT enqueue
+    a second draft batch.
+    """
+    import threading
+    import queue as queue_mod
+
+    from minni import afm_writer
+
+    afm_writer.reset_pass_counters()
+    monkeypatch.setattr(afm_writer, "_ensure_worker", lambda: None)
+    monkeypatch.setattr(afm_writer, "_WORK_QUEUE", queue_mod.Queue(maxsize=4))
+
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    writes = []
+
+    def _write(job):
+        writes.append(list((job.get("lifecycle") or {}).get("review_candidate_ids") or []))
+        return {"drafts_written": [{"page_id": "d1"}], "inbox_path": "x"}
+
+    monkeypatch.setattr(afm_writer, "_write_batch", _write)
+
+    calls = {"n": 0, "applied": []}
+
+    def _handler(life):
+        calls["n"] += 1
+        # First apply (pre-restart) fails; post-restart re-apply succeeds.
+        if calls["n"] == 1:
+            raise RuntimeError("db blip during lifecycle")
+        calls["applied"].append(dict(life))
+
+    done = threading.Event()
+    out: dict = {}
+    job = {
+        "pass_name": "consolidation",
+        "vault_path": str(vault),
+        "drafts": [{"title": "review-c1", "page_id": "consolidation-review-1-t1"}],
+        "lifecycle": {
+            "promote_candidate_ids": [10],
+            "dedup_candidate_ids": [],
+            "review_candidate_ids": [1, 2],
+        },
+        "lifecycle_handler": _handler,
+        "defer_lifecycle_to_worker": True,
+    }
+    with afm_writer._IN_FLIGHT_LOCK:
+        afm_writer._IN_FLIGHT_PER_PASS["consolidation"] = done
+
+    afm_writer._process_job(job, done, out)
+    assert not done.is_set()
+    assert "consolidation" in afm_writer._PENDING_LIFECYCLE
+    side = afm_writer._pending_lifecycle_path(vault)
+    assert side.exists(), f"expected durable sticky file at {side}"
+    on_disk = afm_writer._read_pending_lifecycle_file(vault)
+    assert "consolidation" in on_disk
+    assert on_disk["consolidation"]["review_candidate_ids"] == [1, 2]
+    assert writes == [[1, 2]]
+
+    # Simulate process restart: memory gone, durable file remains.
+    with afm_writer._IN_FLIGHT_LOCK:
+        afm_writer._PENDING_LIFECYCLE.clear()
+        afm_writer._IN_FLIGHT_PER_PASS.clear()
+    assert "consolidation" not in afm_writer._PENDING_LIFECYCLE
+
+    put_calls = []
+    real_put = afm_writer._WORK_QUEUE.put_nowait
+
+    def _spy_put(item):
+        put_calls.append(item)
+        return real_put(item)
+
+    monkeypatch.setattr(afm_writer._WORK_QUEUE, "put_nowait", _spy_put)
+
+    # Post-restart submit: new drafts (new page_ids / new trace) must NOT land.
+    second = afm_writer.submit_drafts(
+        {
+            "pass_name": "consolidation",
+            "vault_path": str(vault),
+            "drafts": [
+                {"title": "review-c1-dup", "page_id": "consolidation-review-1-t2"},
+                {"title": "review-c2-dup", "page_id": "consolidation-review-2-t2"},
+            ],
+            "lifecycle_handler": _handler,
+        },
+        timeout=0.05,
+    )
+    assert second.get("status") == "lifecycle_recovered", second
+    assert second.get("lifecycle_recovered") is True
+    assert "consolidation" not in afm_writer._PENDING_LIFECYCLE
+    assert len(calls["applied"]) == 1
+    assert calls["applied"][0]["review_candidate_ids"] == [1, 2]
+    assert calls["applied"][0]["promote_candidate_ids"] == [10]
+    assert writes == [[1, 2]], f"must not write a second draft batch: {writes!r}"
+    assert put_calls == [], "post-restart re-apply must not enqueue drafts"
+    assert not side.exists(), "durable sticky must clear after successful re-apply"
+    afm_writer.reset_pass_counters()
+
+
+def test_shared_index_failure_returns_partial_and_degraded():
+    """Round 18: shared engine throw after agent-vault hits hard-failed the
+    whole search with −32000. Soft-fail shared like combined agent legs —
+    partial hits + degradation, not total loss.
+    """
+    from types import SimpleNamespace
+
+    from minni.minnid_runtime import recall as recall_mod
+
+    captured = {}
+
+    class _SharedBoom:
+        config = SimpleNamespace(embedding_model="m")
+
+        def retrieve(self, **kwargs):
+            raise RuntimeError("shared FTS locked")
+
+    class _HealthyVault:
+        config = SimpleNamespace(embedding_model="m")
+        last_vector_degraded = None
+        last_rerank_degraded = None
+        last_query_expand_degraded = None
+        last_auth_suppression = None
+
+        def retrieve(self, **kwargs):
+            return [{"doc_id": 2, "path": "wiki/agent-b.md"}]
+
+    shared = _SharedBoom()
+    healthy = _HealthyVault()
+    context = _make_context(shared, captured)
+    principal = SimpleNamespace(agent_id="agent-a", workspace_id="default")
+    object.__setattr__(
+        context,
+        "handler_principal",
+        lambda params, request_id: (principal, None),
+    )
+    object.__setattr__(
+        context,
+        "all_vault_retrievals",
+        lambda: [(healthy, "agent-b", "/tmp/b.db")],
+    )
+    recall_mod.handle_search(
+        {"query": "anything", "scope": "combined"},
+        request_id=1,
+        context=context,
+    )
+    assert "error" not in captured, (
+        f"shared throw must not hard-fail combined search: {captured.get('error')!r}"
+    )
+    payload = captured["response"]
+    assert payload["count"] >= 1, "agent vault hits must survive shared failure"
+    paths = {r.get("path") for r in payload.get("results") or []}
+    assert "wiki/agent-b.md" in paths, f"expected agent-b hits, got {paths!r}"
+    assert payload["degraded"] is True
+    shared_entries = [
+        d
+        for d in payload.get("degradation") or []
+        if d.get("shared_index_failed")
+        or "shared index" in str(d.get("reason") or "").lower()
+    ]
+    assert shared_entries, (
+        f"expected shared degradation entry, got {payload.get('degradation')!r}"
+    )
+    assert shared_entries[0].get("degraded") is True
+
+
+def test_encode_query_encode_raise_keeps_vector_down_and_empty_vector(
+    tmp_path, monkeypatch
+):
+    """Round 18: encode() raise after optimistic vector_model_down=False left
+    health reading encoder-up and hard-failed. Must keep down flag and return
+    empty vector for FTS-only degrade.
+    """
+    import minni.models as models_mod
+    import minni.retrieval as retrieval_mod
+
+    class _BoomModel:
+        def encode(self, query):
+            raise RuntimeError("OOM during encode")
+
+    boom = _BoomModel()
+    # model property always goes through get_embedder — plant a present-but-broken encoder.
+    monkeypatch.setattr(models_mod, "get_embedder", lambda: boom)
+    if hasattr(retrieval_mod, "get_embedder"):
+        monkeypatch.setattr(retrieval_mod, "get_embedder", lambda: boom)
+
+    engine = _engine_without_model(tmp_path, monkeypatch)
+    # Re-plant after helper (helper sets get_embedder → None).
+    monkeypatch.setattr(models_mod, "get_embedder", lambda: boom)
+    if hasattr(retrieval_mod, "get_embedder"):
+        monkeypatch.setattr(retrieval_mod, "get_embedder", lambda: boom)
+    engine.vector_model_down = False
+    import numpy as np
+
+    assert engine.model is boom, "precondition: encode path must see the boom model"
+    vec = engine._encode_query("hello")
+    assert isinstance(vec, np.ndarray)
+    assert vec.size == 0, "encode failure must return empty vector (FTS fallback)"
+    assert engine.vector_model_down is True, (
+        "process-wide down flag must stay set after encode throw"
+    )
+    assert engine.last_vector_degraded, "per-request vector degrade must be set"
+    assert "encode" in str(engine.last_vector_degraded).lower() or "oom" in str(
+        engine.last_vector_degraded
+    ).lower()
+
+
 def test_timeout_counter_not_bumped_when_result_present_under_lock(monkeypatch):
     """Round 12: if out already has a result when the wait times out, do not
     stamp write_timeouts (phantom backlogged on a landed write)."""

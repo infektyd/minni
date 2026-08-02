@@ -115,9 +115,15 @@ _IN_FLIGHT_LOCK = threading.Lock()
 # Round 13: if deferred lifecycle apply fails after drafts landed, candidates
 # stay proposed and a concurrent resubmit would mint a second draft set. Count
 # the failure and block the pass until apply succeeds (retry on next submit).
+# Round 18: process memory alone dies on daemon restart → candidates still
+# proposed → second draft set. Sticky state is also durably mirrored under the
+# vault so a cold start can re-apply without re-minting.
 _LIFECYCLE_APPLY_FAILURES = 0
 _LAST_LIFECYCLE_APPLY_FAILURE_AT: Optional[float] = None
 _PENDING_LIFECYCLE: dict[str, dict] = {}
+# Relative path under a vault for durable sticky deferred lifecycle.
+_PENDING_LIFECYCLE_REL = Path("inbox") / "afm-pending-lifecycle.json"
+_PENDING_LIFECYCLE_FILE_VERSION = 1
 
 
 # A pass is stale once it has been silent for this multiple of its configured
@@ -204,6 +210,164 @@ def reset_pass_counters() -> None:
     with _IN_FLIGHT_LOCK:
         _IN_FLIGHT_PER_PASS.clear()
         _PENDING_LIFECYCLE.clear()
+
+
+def _pending_lifecycle_path(vault_path: str | Path) -> Path:
+    return Path(vault_path).expanduser() / _PENDING_LIFECYCLE_REL
+
+
+def _serializable_lifecycle(lifecycle: dict) -> dict:
+    """JSON-safe lifecycle payload (drop callables / private bookkeeping keys)."""
+    out: dict = {}
+    for key, value in (lifecycle or {}).items():
+        if str(key).startswith("_"):
+            continue
+        if callable(value):
+            continue
+        out[str(key)] = value
+    return out
+
+
+def _atomic_write_json(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text(
+            json.dumps(payload, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(str(tmp), str(path))
+    except Exception:
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise
+
+
+def _read_pending_lifecycle_file(vault_path: str | Path) -> dict[str, dict]:
+    """Return pass_name → lifecycle from the vault sidecar (or empty)."""
+    path = _pending_lifecycle_path(vault_path)
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except Exception as exc:
+        logger.warning(
+            "AFM writer: could not read pending-lifecycle file %s: %s", path, exc
+        )
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    passes = raw.get("passes")
+    if not isinstance(passes, dict):
+        return {}
+    out: dict[str, dict] = {}
+    for name, life in passes.items():
+        if isinstance(life, dict):
+            stored = _serializable_lifecycle(life)
+            stored["_vault_path"] = str(Path(vault_path).expanduser())
+            out[str(name)] = stored
+    return out
+
+
+def _persist_pending_lifecycle(
+    pass_name: str, lifecycle: dict, vault_path: Optional[str]
+) -> None:
+    """Mirror sticky deferred lifecycle under the vault (survives restart)."""
+    if not vault_path:
+        logger.warning(
+            "AFM writer: cannot persist pending lifecycle for pass %r — "
+            "no vault_path on job",
+            pass_name,
+        )
+        return
+    path = _pending_lifecycle_path(vault_path)
+    try:
+        existing = _read_pending_lifecycle_file(vault_path)
+        # File payload must not include runtime-only keys.
+        file_passes = {
+            name: _serializable_lifecycle(life) for name, life in existing.items()
+        }
+        file_passes[str(pass_name)] = _serializable_lifecycle(lifecycle)
+        _atomic_write_json(
+            path,
+            {
+                "version": _PENDING_LIFECYCLE_FILE_VERSION,
+                "updated_at": time.strftime(
+                    "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
+                ),
+                "passes": file_passes,
+            },
+        )
+    except Exception:
+        logger.exception(
+            "AFM writer: failed to persist pending lifecycle for pass %r to %s",
+            pass_name,
+            path,
+        )
+
+
+def _clear_persisted_pending_lifecycle(
+    pass_name: str, vault_path: Optional[str]
+) -> None:
+    """Drop one pass from the vault sidecar once lifecycle is fully applied."""
+    if not vault_path:
+        return
+    path = _pending_lifecycle_path(vault_path)
+    try:
+        existing = _read_pending_lifecycle_file(vault_path)
+        if str(pass_name) not in existing and not path.exists():
+            return
+        file_passes = {
+            name: _serializable_lifecycle(life)
+            for name, life in existing.items()
+            if name != str(pass_name)
+        }
+        if not file_passes:
+            try:
+                path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            return
+        _atomic_write_json(
+            path,
+            {
+                "version": _PENDING_LIFECYCLE_FILE_VERSION,
+                "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "passes": file_passes,
+            },
+        )
+    except Exception:
+        logger.exception(
+            "AFM writer: failed to clear pending lifecycle for pass %r at %s",
+            pass_name,
+            path,
+        )
+
+
+def _hydrate_pending_lifecycle_from_vault(vault_path: Optional[str]) -> None:
+    """Load durable sticky lifecycle into process memory after a cold start.
+
+    Caller must hold ``_IN_FLIGHT_LOCK``. Only fills passes that are not already
+    held in memory (in-process sticky wins over a stale file race).
+    """
+    if not vault_path:
+        return
+    loaded = _read_pending_lifecycle_file(vault_path)
+    for name, life in loaded.items():
+        if name not in _PENDING_LIFECYCLE:
+            _PENDING_LIFECYCLE[name] = life
+            logger.info(
+                "AFM writer: hydrated sticky deferred lifecycle for pass %r "
+                "from vault (post-restart recovery)",
+                name,
+            )
+
+
+def _vault_path_from_pending(pending: dict) -> Optional[str]:
+    vp = pending.get("_vault_path")
+    return str(vp) if vp else None
 
 
 def _parse_iso_utc(value: str) -> Optional[float]:
@@ -841,21 +1005,35 @@ def _maybe_apply_deferred_lifecycle(job: dict) -> bool:
         handler(lifecycle)
         job["lifecycle_applied"] = True
         pass_name = str(job.get("pass_name") or "unknown")
+        vault_path = job.get("vault_path")
         with _IN_FLIGHT_LOCK:
-            _PENDING_LIFECYCLE.pop(pass_name, None)
+            prior = _PENDING_LIFECYCLE.pop(pass_name, None)
+            if vault_path is None and isinstance(prior, dict):
+                vault_path = prior.get("_vault_path")
+        _clear_persisted_pending_lifecycle(
+            pass_name, str(vault_path) if vault_path else None
+        )
         return True
     except Exception:
         global _LIFECYCLE_APPLY_FAILURES, _LAST_LIFECYCLE_APPLY_FAILURE_AT
         pass_name = str(job.get("pass_name") or "unknown")
+        vault_path = job.get("vault_path")
         stored = dict(lifecycle)
         # Round 14: keep the handler so submit_drafts can re-apply without a
         # process restart (and without minting a second draft set).
         if callable(handler):
             stored["_handler"] = handler
+        # Round 18: durable sticky — vault sidecar survives daemon restart so
+        # cold start re-applies instead of re-minting review drafts.
+        if vault_path:
+            stored["_vault_path"] = str(Path(vault_path).expanduser())
         with _IN_FLIGHT_LOCK:
             _LIFECYCLE_APPLY_FAILURES += 1
             _LAST_LIFECYCLE_APPLY_FAILURE_AT = time.time()
             _PENDING_LIFECYCLE[pass_name] = stored
+        _persist_pending_lifecycle(
+            pass_name, stored, str(vault_path) if vault_path else None
+        )
         job["lifecycle_apply_failed"] = True
         logger.exception(
             "AFM writer: deferred lifecycle apply failed for pass %r — "
@@ -954,6 +1132,10 @@ def submit_drafts(job: dict, wait: bool = True, timeout: Optional[float] = 30.0)
     done = threading.Event()
     out: dict = {}
     with _IN_FLIGHT_LOCK:
+        # Round 18: after a daemon restart process memory is empty but the
+        # vault sidecar still names the deferred decision set. Hydrate before
+        # the pending check so we re-apply instead of minting a second draft.
+        _hydrate_pending_lifecycle_from_vault(job.get("vault_path"))
         # Round 13/14: pending lifecycle after a failed deferred apply.
         # Re-apply the stored decision set (no new drafts) before refusing
         # forever / restarting into a second draft generation.
@@ -964,6 +1146,9 @@ def submit_drafts(job: dict, wait: bool = True, timeout: Optional[float] = 30.0)
             # whatever was stored with the pending payload.
             if not callable(handler):
                 handler = pending_life.get("_handler")
+            vault_for_pending = job.get("vault_path") or _vault_path_from_pending(
+                pending_life
+            )
             if callable(handler):
                 try:
                     # Drop internal bookkeeping keys before apply.
@@ -987,6 +1172,9 @@ def submit_drafts(job: dict, wait: bool = True, timeout: Optional[float] = 30.0)
                     # first batch already landed — reopening AFM-8 duplicates
                     # on the recovery path. Candidates are now terminal; the
                     # next tick will not regenerate the same decision set.
+                    # Round 18: also clear the vault sidecar so a later cold
+                    # start does not re-hold an already-applied decision set.
+                    _clear_persisted_pending_lifecycle(pass_name, vault_for_pending)
                     return {
                         "status": "lifecycle_recovered",
                         "queue_depth": _WORK_QUEUE.qsize(),
@@ -998,6 +1186,15 @@ def submit_drafts(job: dict, wait: bool = True, timeout: Optional[float] = 30.0)
                     global _LIFECYCLE_APPLY_FAILURES, _LAST_LIFECYCLE_APPLY_FAILURE_AT
                     _LIFECYCLE_APPLY_FAILURES += 1
                     _LAST_LIFECYCLE_APPLY_FAILURE_AT = time.time()
+                    # Keep durable mirror in sync (handler may have been lost
+                    # across restart; job still carries vault_path).
+                    if vault_for_pending and "_vault_path" not in pending_life:
+                        pending_life["_vault_path"] = str(
+                            Path(vault_for_pending).expanduser()
+                        )
+                    _persist_pending_lifecycle(
+                        pass_name, pending_life, vault_for_pending
+                    )
                     logger.exception(
                         "AFM writer: re-apply of pending lifecycle for pass %r "
                         "failed; still refusing new drafts",

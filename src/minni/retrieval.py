@@ -1929,8 +1929,26 @@ class RetrievalEngine:
         if not self.model:
             self._note_vector_model_down()
             return np.array([], dtype=np.float32)
+        # Round 18: only clear the process-wide down flag AFTER a successful
+        # encode. Clearing before encode() meant an OOM/runtime fault left
+        # health reading "encoder up" and hard-failed the request instead of
+        # FTS-only degrade with last_vector_degraded set (R4(b) throw path).
+        try:
+            vec = self.model.encode(query).astype(np.float32)
+        except Exception as exc:
+            if not self.vector_model_down:
+                logger.warning(
+                    "semantic leg DOWN: embedding encode failed (%s) — "
+                    "recall degraded to lexical (FTS) only",
+                    exc,
+                )
+            self.vector_model_down = True
+            self.last_vector_degraded = (
+                f"embedding encode failed: {exc}"[:200]
+            )
+            return np.array([], dtype=np.float32)
         self.vector_model_down = False
-        return self.model.encode(query).astype(np.float32)
+        return vec
 
     def _normalize_backend_names(self, backend_names: list) -> list:
         """Dedup (order-preserving), cap length, and reject unknown members."""

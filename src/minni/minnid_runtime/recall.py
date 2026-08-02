@@ -364,6 +364,47 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
                 principal_for_documents=principal,
             )
 
+        def retrieve_shared_soft() -> list:
+            """Shared leg that soft-fails when other corpora may already have hits.
+
+            Round 18 (PR #260): retrieve_combined / both-scope already soft-failed
+            per-agent vaults, but a throw from the shared engine still bubbled to
+            handle_search's outer except as −32000 and dropped every partial hit.
+            Mirror the agent-leg contract: log, record degradation, return [].
+            Sole-shared callers (principal is None / pure shared scope) still use
+            hard retrieve_shared so a total failure surfaces as an RPC error.
+            """
+            try:
+                return retrieve_shared()
+            except Exception as exc:
+                detail = f"shared index failed: {exc}"[:400]
+                context.logger.warning(
+                    "search: shared index failed (%s); continuing with partial results",
+                    exc,
+                )
+                emb_model = None
+                try:
+                    emb_model = getattr(engine.config, "embedding_model", None)
+                except Exception:
+                    emb_model = None
+                if emb_model is None:
+                    emb_model = getattr(
+                        getattr(context, "default_config", None),
+                        "embedding_model",
+                        None,
+                    )
+                degradations.append(
+                    {
+                        "src": "c",
+                        "vector_model": emb_model,
+                        "vector_degraded": False,
+                        "degraded": True,
+                        "shared_index_failed": detail,
+                        "reason": detail,
+                    }
+                )
+                return []
+
         def retrieve_personal() -> list:
             vault_retrieval = context.agent_vault_retrieval(agent_id) if agent_id else None
             if vault_retrieval is not None:
@@ -457,7 +498,9 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
                             "source_agent": source_agent,
                         }
                     )
-            result_sets.append(retrieve_shared())
+            # Round 18: soft-fail shared so agent-vault hits already collected
+            # are not erased by a shared-index throw (−32000).
+            result_sets.append(retrieve_shared_soft())
             return merge_document_results(result_sets, limit)
 
         if principal is None:
@@ -467,6 +510,9 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
         elif document_scope == "combined":
             results = retrieve_combined()
         else:
+            # scope "both": personal + combined. Combined already soft-fails
+            # shared; personal falls back to hard shared only when its vault
+            # path is absent / after personal degrade — leave that path alone.
             result_sets = [retrieve_personal(), retrieve_combined()]
             results = merge_document_results(result_sets, limit, prefer_personal=True)
 
