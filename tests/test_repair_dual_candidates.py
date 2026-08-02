@@ -42,19 +42,20 @@ def _insert_candidate(
     principal: str = "codex",
     content_sha1: str | None = None,
     resolved_by: str = "afm-consolidation",
+    omit_content_sha1: bool = False,
 ):
     import hashlib
 
-    sha = content_sha1 or hashlib.sha1(content.encode("utf-8")).hexdigest()
-    derived = json.dumps(
-        {
-            "source": "inbox",
-            "inbox_file": inbox_file,
-            "candidate_index": candidate_index,
-            "kind": None,
-            "content_sha1": sha,
-        }
-    )
+    derived_obj: dict = {
+        "source": "inbox",
+        "inbox_file": inbox_file,
+        "candidate_index": candidate_index,
+        "kind": None,
+    }
+    if not omit_content_sha1:
+        sha = content_sha1 or hashlib.sha1(content.encode("utf-8")).hexdigest()
+        derived_obj["content_sha1"] = sha
+    derived = json.dumps(derived_obj)
     now = time.time()
     with db.transaction() as c:
         c.execute(
@@ -178,6 +179,8 @@ def test_ensure_inbox_dedup_index_blocks_reinsert(tmp_path):
 
     blocked = ensure_inbox_dedup_index(db)
     assert blocked["status"] == "blocked_by_duplicates"
+    assert blocked["duplicate_groups"] >= 1
+    assert blocked.get("sample")
 
     repair_duplicate_candidate_pairs(db, dry_run=False)
     created = ensure_inbox_dedup_index(db)
@@ -190,7 +193,7 @@ def test_ensure_inbox_dedup_index_blocks_reinsert(tmp_path):
     with pytest.raises(sqlite3.IntegrityError):
         _insert_candidate(db, content=content, status="proposed")
 
-    # Medium #3: same (file, index) with a *different* content_sha1 is also blocked.
+    # Same (file, index) with a *different* content_sha1 is also blocked.
     with pytest.raises(sqlite3.IntegrityError):
         _insert_candidate(
             db,
@@ -198,6 +201,58 @@ def test_ensure_inbox_dedup_index_blocks_reinsert(tmp_path):
             status="proposed",
             content_sha1="deadbeef" * 5,
         )
+
+
+def test_ensure_inbox_dedup_index_blocks_divergent_app_key(tmp_path):
+    """Medium #1: app-key peers with different content_sha1 block unique index.
+
+    Dual repair leaves divergent peers alone; ensure must still return
+    blocked_by_duplicates (not fall through to CREATE UNIQUE IntegrityError).
+    """
+    from minni.repair_dual_candidates import (
+        ensure_inbox_dedup_index,
+        find_app_key_collisions,
+        find_duplicate_candidate_groups,
+        repair_duplicate_candidate_pairs,
+    )
+
+    db, _cfg = _make_db(tmp_path)
+    _insert_candidate(
+        db,
+        content="body alpha",
+        status="accepted",
+        inbox_file="div.json",
+        candidate_index=0,
+    )
+    _insert_candidate(
+        db,
+        content="body beta different",
+        status="rejected",
+        inbox_file="div.json",
+        candidate_index=0,
+    )
+
+    # No byte-identical duals — repair is a no-op.
+    assert find_duplicate_candidate_groups(db) == []
+    repair_duplicate_candidate_pairs(db, dry_run=False)
+    collisions = find_app_key_collisions(db)
+    assert len(collisions) == 1
+    assert collisions[0]["byte_identical"] is False
+
+    blocked = ensure_inbox_dedup_index(db)
+    assert blocked["status"] == "blocked_by_duplicates"
+    assert blocked["duplicate_groups"] == 1
+    assert blocked.get("divergent_groups", 0) >= 1
+    assert blocked.get("sample")
+    assert blocked["sample"][0]["key"]["inbox_file"] == "div.json"
+    # Must not have created the index.
+    assert blocked["status"] != "created"
+    with db.cursor() as c:
+        c.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='index' "
+            "AND name='idx_candidate_packets_inbox_key_unique'"
+        )
+        assert c.fetchone() is None
 
 
 def test_virtual_durable_not_flagged_missing_when_fts_present(tmp_path):
@@ -978,3 +1033,183 @@ def test_is_unique_integrity_error_narrow():
         sqlite3.IntegrityError("NOT NULL constraint failed: content")
     )
     assert not _is_unique_integrity_error(ValueError("nope"))
+
+
+def test_missing_sha_different_bodies_not_collapsed(tmp_path):
+    """Medium #2: absent content_sha1 digests from content; different bodies stay.
+
+    Legacy / non-ingest writers may omit derived_from.content_sha1. Collapse
+    must derive the digest from the content column so distinct bodies are
+    reported divergent and never hard-deleted.
+    """
+    from minni.repair_dual_candidates import (
+        find_divergent_content_groups,
+        find_duplicate_candidate_groups,
+        repair_duplicate_candidate_pairs,
+    )
+
+    db, _cfg = _make_db(tmp_path)
+    id_a = _insert_candidate(
+        db,
+        content="legacy body alpha — unique text",
+        status="accepted",
+        inbox_file="legacy.json",
+        candidate_index=0,
+        omit_content_sha1=True,
+    )
+    id_b = _insert_candidate(
+        db,
+        content="legacy body beta — different entirely",
+        status="rejected",
+        inbox_file="legacy.json",
+        candidate_index=0,
+        omit_content_sha1=True,
+    )
+
+    assert find_duplicate_candidate_groups(db) == []
+    divergent = find_divergent_content_groups(db)
+    assert len(divergent) == 1
+    assert set(divergent[0]["candidate_ids"]) == {id_a, id_b}
+    # Digests derived from content are distinct non-empty strings.
+    shas = [s for s in divergent[0]["content_sha1s"] if s]
+    assert len(shas) == 2
+
+    result = repair_duplicate_candidate_pairs(db, dry_run=False)
+    assert result["deleted"] == 0
+    assert result["groups_found"] == 0
+    assert result["divergent_content_groups"] == 1
+    with db.cursor() as c:
+        c.execute("SELECT candidate_id FROM candidate_packets ORDER BY candidate_id")
+        ids = [dict(r)["candidate_id"] for r in c.fetchall()]
+    assert ids == [id_a, id_b]
+
+
+def test_missing_sha_identical_bodies_still_collapsed(tmp_path):
+    """Medium #2 green path: no stored sha, same body → digest match → collapse."""
+    from minni.repair_dual_candidates import (
+        find_duplicate_candidate_groups,
+        repair_duplicate_candidate_pairs,
+    )
+
+    db, _cfg = _make_db(tmp_path)
+    body = "legacy twin with no content_sha1 field"
+    keep = _insert_candidate(
+        db,
+        content=body,
+        status="accepted",
+        inbox_file="legacy-same.json",
+        candidate_index=1,
+        omit_content_sha1=True,
+    )
+    lose = _insert_candidate(
+        db,
+        content=body,
+        status="rejected",
+        inbox_file="legacy-same.json",
+        candidate_index=1,
+        omit_content_sha1=True,
+    )
+
+    groups = find_duplicate_candidate_groups(db)
+    assert len(groups) == 1
+    assert groups[0]["winner_id"] == keep
+    assert lose in groups[0]["loser_ids"]
+    # Collapse key digest is non-None (derived from content).
+    assert groups[0]["key"]["content_sha1"]
+
+    result = repair_duplicate_candidate_pairs(db, dry_run=False)
+    assert result["deleted"] == 1
+    with db.cursor() as c:
+        c.execute("SELECT candidate_id FROM candidate_packets")
+        ids = [dict(r)["candidate_id"] for r in c.fetchall()]
+    assert ids == [keep]
+
+
+def test_prune_document_rows_invalidates_faiss_and_rerank(tmp_path):
+    """Medium #3: prune drops SQLite and tombstones FAISS + rerank cache."""
+    from minni.repair_dual_candidates import prune_document_rows
+    from minni.rerank_cache import GLOBAL_RERANK_CACHE, invalidate_chunks
+
+    class _FakeFaiss:
+        """Minimal FAISSIndex stand-in (avoids faiss/numpy env import issues)."""
+
+        def __init__(self):
+            self._reverse_map: dict[int, int] = {}
+            self.removed: list[int] = []
+
+        def add(self, chunk_id: int) -> None:
+            self._reverse_map[chunk_id] = len(self._reverse_map)
+
+        def remove(self, chunk_id: int) -> None:
+            self._reverse_map.pop(chunk_id, None)
+            self.removed.append(chunk_id)
+
+    db, _cfg = _make_db(tmp_path)
+    faiss = _FakeFaiss()
+    path = str(tmp_path / "vault" / "wiki" / "orphan.md")
+    now = time.time()
+    # 384 float32 zeros without importing numpy (env may have a broken numpy).
+    empty_emb = b"\x00" * (384 * 4)
+    with db.transaction() as c:
+        c.execute(
+            """
+            INSERT INTO documents
+            (path, agent, last_modified, indexed_at, page_status, privacy_level)
+            VALUES (?, 'main', 0, 0, 'accepted', 'safe')
+            """,
+            (path,),
+        )
+        doc_id = c.lastrowid
+        c.execute(
+            """
+            INSERT INTO chunk_embeddings
+            (doc_id, chunk_index, chunk_text, embedding, heading_context, computed_at)
+            VALUES (?, 0, 'stale chunk', ?, '', ?)
+            """,
+            (doc_id, empty_emb, now),
+        )
+        chunk_id = c.lastrowid
+        c.execute(
+            """
+            INSERT INTO vault_fts (doc_id, path, content, agent, sigil)
+            VALUES (?, ?, 'stale chunk', 'main', '?')
+            """,
+            (doc_id, path),
+        )
+
+    faiss.add(chunk_id)
+    assert chunk_id in faiss._reverse_map
+
+    # Seed rerank cache so we can observe invalidation.
+    try:
+        if hasattr(GLOBAL_RERANK_CACHE, "_by_chunk"):
+            GLOBAL_RERANK_CACHE._by_chunk[int(chunk_id)] = object()
+        elif hasattr(GLOBAL_RERANK_CACHE, "_cache"):
+            GLOBAL_RERANK_CACHE._cache[int(chunk_id)] = {"dummy": True}
+    except Exception:
+        pass
+
+    result = prune_document_rows(
+        db, [doc_id], dry_run=False, faiss_index=faiss
+    )
+    assert result["deleted"] == 1
+    assert result["semantic"]["chunk_ids"] == 1
+    assert result["semantic"]["faiss_status"] == "ok"
+    assert result["semantic"]["faiss_removed"] == 1
+    assert result["semantic"]["rerank_invalidated"] is True
+    assert chunk_id not in faiss._reverse_map
+    assert chunk_id in faiss.removed
+
+    # invalidate_chunks is the same path purge_durable_document uses.
+    assert callable(invalidate_chunks)
+
+    with db.cursor() as c:
+        assert c.execute(
+            "SELECT COUNT(*) AS n FROM documents WHERE doc_id=?", (doc_id,)
+        ).fetchone()["n"] == 0
+        assert c.execute(
+            "SELECT COUNT(*) AS n FROM chunk_embeddings WHERE doc_id=?", (doc_id,)
+        ).fetchone()["n"] == 0
+        assert c.execute(
+            "SELECT COUNT(*) AS n FROM vault_fts WHERE doc_id=?", (doc_id,)
+        ).fetchone()["n"] == 0

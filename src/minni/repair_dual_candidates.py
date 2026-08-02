@@ -57,6 +57,7 @@ This module is idempotent and safe to re-run. Default is dry-run.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -134,14 +135,42 @@ def _content_sha1_of(derived: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+def _digest_content(content: Any) -> Optional[str]:
+    """SHA1 hex of the content column (same algorithm as inbox_ingest)."""
+    if content is None:
+        return None
+    if not isinstance(content, str):
+        try:
+            content = str(content)
+        except Exception:
+            return None
+    return hashlib.sha1(content.encode("utf-8")).hexdigest()
+
+
+def _collapse_digest(
+    derived: Dict[str, Any], content: Any = None
+) -> Optional[str]:
+    """Byte-identity digest for collapse: prefer stored sha, else content column.
+
+    Missing/empty ``derived_from.content_sha1`` must **not** collapse different
+    bodies under the same app key. When the stored sha is absent, derive the
+    same SHA1 inbox_ingest writes so peers only group when bodies match.
+    """
+    stored = _content_sha1_of(derived)
+    if stored is not None:
+        return stored
+    return _digest_content(content)
+
+
 def _collapse_key(
     derived: Dict[str, Any],
+    content: Any = None,
 ) -> Optional[Tuple[str, int, Optional[str]]]:
-    """Byte-identical collapse key: app key + content_sha1 (#239 duals only)."""
+    """Byte-identical collapse key: app key + content digest (#239 duals only)."""
     app = _inbox_key(derived)
     if app is None:
         return None
-    return (app[0], app[1], _content_sha1_of(derived))
+    return (app[0], app[1], _collapse_digest(derived, content))
 
 
 def status_rank(status: Optional[str]) -> int:
@@ -178,7 +207,7 @@ def _iter_inbox_candidates(db) -> List[Dict[str, Any]]:
             derived = _parse_derived(item.get("derived_from"))
             if not derived:
                 continue
-            ckey = _collapse_key(derived)
+            ckey = _collapse_key(derived, item.get("content"))
             if ckey is None:
                 continue
             item["_key"] = ckey
@@ -265,6 +294,46 @@ def find_divergent_content_groups(db) -> List[Dict[str, Any]]:
     return out
 
 
+def find_app_key_collisions(db) -> List[Dict[str, Any]]:
+    """App-key groups with COUNT>1 — blocks the (file, index) unique index.
+
+    Stronger than ``find_duplicate_candidate_groups``: includes both
+    byte-identical duals **and** divergent-content peers under the same
+    ``(inbox_file, candidate_index)``. Used by ``ensure_inbox_dedup_index`` so
+    CREATE UNIQUE never falls through to a confusing IntegrityError.
+    """
+    by_app: Dict[Tuple[str, int], List[Dict[str, Any]]] = defaultdict(list)
+    for item in _iter_inbox_candidates(db):
+        by_app[item["_app_key"]].append(item)
+
+    out: List[Dict[str, Any]] = []
+    for app_key, rows in by_app.items():
+        if len(rows) < 2:
+            continue
+        shas = sorted({(r.get("_content_sha1") or "") for r in rows})
+        out.append(
+            {
+                "key": {
+                    "inbox_file": app_key[0],
+                    "candidate_index": app_key[1],
+                },
+                "row_count": len(rows),
+                "candidate_ids": sorted(int(r["candidate_id"]) for r in rows),
+                "content_sha1s": shas,
+                "statuses": sorted({str(r.get("status")) for r in rows}),
+                "byte_identical": len(shas) <= 1,
+            }
+        )
+    out.sort(
+        key=lambda g: (
+            g["key"]["inbox_file"],
+            g["key"]["candidate_index"],
+            g["candidate_ids"][0] if g["candidate_ids"] else 0,
+        )
+    )
+    return out
+
+
 def _load_collapse_group_on_cursor(
     c, key: Dict[str, Any]
 ) -> List[Dict[str, Any]]:
@@ -298,7 +367,7 @@ def _load_collapse_group_on_cursor(
         derived = _parse_derived(item.get("derived_from"))
         if not derived:
             continue
-        ckey = _collapse_key(derived)
+        ckey = _collapse_key(derived, item.get("content"))
         if ckey is None:
             continue
         row_sha = ckey[2]
@@ -333,8 +402,44 @@ def _table_exists_on_cursor(c, name: str) -> bool:
     return c.fetchone() is not None
 
 
-def _audit_drop(c, loser_id: int, winner_id: int, winner_status: str, now: float) -> None:
-    """Best-effort audit row; no-op if consolidation_actions is missing."""
+def _audit_drop(
+    c,
+    loser_id: int,
+    winner_id: int,
+    winner_status: str,
+    now: float,
+    *,
+    loser: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Best-effort audit row; no-op if consolidation_actions is missing.
+
+    Detail carries a compact JSON snapshot of the deleted twin (status, reason,
+    content digest, principal) so forensics survive the hard DELETE.
+    """
+    snapshot: Dict[str, Any] = {
+        "loser_id": loser_id,
+        "kept_id": winner_id,
+        "kept_status": winner_status,
+        "rule": "accepted>terminal>oldest",
+    }
+    if loser is not None:
+        content = loser.get("content")
+        digest = loser.get("_content_sha1") or _digest_content(content)
+        snapshot.update(
+            {
+                "loser_status": loser.get("status"),
+                "loser_reason": loser.get("resolution_reason"),
+                "loser_principal": loser.get("principal"),
+                "content_sha1": digest,
+            }
+        )
+    try:
+        detail = json.dumps(snapshot, separators=(",", ":"), default=str)
+    except Exception:
+        detail = (
+            f"deleted dual twin #{loser_id}; kept #{winner_id} "
+            f"(status={winner_status}); rule=accepted>terminal>oldest"
+        )
     try:
         c.execute(
             """
@@ -345,10 +450,7 @@ def _audit_drop(c, loser_id: int, winner_id: int, winner_status: str, now: float
             (
                 REPAIR_ACTION_TYPE,
                 str(loser_id),
-                (
-                    f"deleted dual twin #{loser_id}; kept #{winner_id} "
-                    f"(status={winner_status}); rule=accepted>terminal>oldest"
-                )[:500],
+                detail[:1000],
                 now,
             ),
         )
@@ -457,7 +559,14 @@ def repair_duplicate_candidate_pairs(
                         _null_contradiction_resolution(c, loser_id)
                         fk_nulled += 1
                     if has_audit:
-                        _audit_drop(c, loser_id, live_keep, live_status, now)
+                        _audit_drop(
+                            c,
+                            loser_id,
+                            live_keep,
+                            live_status,
+                            now,
+                            loser=loser,
+                        )
                     c.execute(
                         "DELETE FROM candidate_packets WHERE candidate_id=?",
                         (loser_id,),
@@ -530,12 +639,33 @@ def ensure_inbox_dedup_index(db) -> Dict[str, Any]:
             )
             return {"status": "exists", "index": index_name}
 
-    remaining = find_duplicate_candidate_groups(db)
-    if remaining:
+    # Pre-check must match the UNIQUE key (file, index), not only the weaker
+    # byte-identical (file, index, sha) dual groups. Divergent peers under the
+    # same app key also block CREATE UNIQUE — surface them as
+    # blocked_by_duplicates with samples instead of a raw IntegrityError.
+    collisions = find_app_key_collisions(db)
+    if collisions:
         return {
             "status": "blocked_by_duplicates",
             "index": index_name,
-            "duplicate_groups": len(remaining),
+            "duplicate_groups": len(collisions),
+            "app_key_collisions": len(collisions),
+            "byte_identical_groups": sum(
+                1 for g in collisions if g.get("byte_identical")
+            ),
+            "divergent_groups": sum(
+                1 for g in collisions if not g.get("byte_identical")
+            ),
+            "sample": [
+                {
+                    "key": g["key"],
+                    "row_count": g["row_count"],
+                    "candidate_ids": g["candidate_ids"][:8],
+                    "content_sha1s": g["content_sha1s"][:8],
+                    "byte_identical": g["byte_identical"],
+                }
+                for g in collisions[:5]
+            ],
         }
 
     try:
@@ -770,29 +900,139 @@ def find_orphan_virtual_durable(db) -> List[Dict[str, Any]]:
     return orphans
 
 
+def _purge_semantic_side_effects(
+    chunk_ids: Sequence[int],
+    *,
+    faiss_index: Any = None,
+) -> Dict[str, Any]:
+    """Mirror ``RetrievalEngine.purge_durable_document`` FAISS/rerank cleanup.
+
+    Best-effort and fail-open: SQLite is already the source of truth after
+    prune; stale warm-FAISS / rerank cache only delays correctness until the
+    next rebuild (disk FAISS is checksum-gated against chunk_embeddings).
+    """
+    ids = [int(x) for x in chunk_ids if x is not None]
+    result: Dict[str, Any] = {
+        "chunk_ids": len(ids),
+        "rerank_invalidated": False,
+        "faiss_removed": 0,
+        "faiss_status": "skipped_no_index",
+    }
+    if not ids:
+        result["faiss_status"] = "noop"
+        return result
+
+    try:
+        from minni.rerank_cache import invalidate_chunks
+
+        invalidate_chunks(ids)
+        result["rerank_invalidated"] = True
+    except Exception as exc:
+        logger.debug("prune: rerank invalidation skipped: %s", exc)
+
+    if faiss_index is None:
+        return result
+
+    removed = 0
+    try:
+        remove_fn = getattr(faiss_index, "remove", None)
+        if remove_fn is None:
+            result["faiss_status"] = "skipped_no_remove"
+            return result
+        # FAISSIndex.remove(chunk_id: int); backends.faiss_* take List[int].
+        # Probe with a single id; fall back to bulk list on TypeError.
+        if hasattr(faiss_index, "_reverse_map"):
+            for cid in ids:
+                try:
+                    remove_fn(cid)
+                    removed += 1
+                except Exception:
+                    pass
+        else:
+            try:
+                remove_fn(list(ids))
+                removed = len(ids)
+            except TypeError:
+                for cid in ids:
+                    try:
+                        remove_fn(cid)
+                        removed += 1
+                    except Exception:
+                        pass
+        result["faiss_removed"] = removed
+        result["faiss_status"] = "ok" if removed else "noop"
+        # Persist tombstones when the index supports it (optional).
+        save = getattr(faiss_index, "save_to_disk", None) or getattr(
+            faiss_index, "save_index", None
+        )
+        if save is not None and removed:
+            try:
+                save()
+            except TypeError:
+                try:
+                    save(None)
+                except Exception as exc:
+                    logger.debug("prune: FAISS save skipped: %s", exc)
+            except Exception as exc:
+                logger.debug("prune: FAISS save skipped: %s", exc)
+    except Exception as exc:
+        logger.debug("prune: live FAISS remove skipped: %s", exc)
+        result["faiss_status"] = f"error:{exc}"
+    return result
+
+
 def prune_document_rows(
     db,
     doc_ids: Iterable[int],
     *,
     dry_run: bool = True,
+    faiss_index: Any = None,
 ) -> Dict[str, Any]:
     """Delete documents + vault_fts + chunk_embeddings for the given doc_ids.
+
+    Also tombstones matching chunk_ids out of the live FAISS index (when
+    ``faiss_index`` is provided) and invalidates the rerank cache — the same
+    side-effect path as ``RetrievalEngine.purge_durable_document``. Without a
+    live index, SQLite deletes still change the FAISS disk-cache checksum so
+    the next cold load rebuilds from remaining ``chunk_embeddings``.
 
     Does not touch ``learnings``. Idempotent for already-absent ids.
     """
     ids = sorted({int(x) for x in doc_ids})
     if not ids:
-        return {"dry_run": dry_run, "requested": 0, "deleted": 0}
+        return {
+            "dry_run": dry_run,
+            "requested": 0,
+            "deleted": 0,
+            "semantic": {"chunk_ids": 0, "faiss_status": "noop"},
+        }
 
     if dry_run:
-        return {"dry_run": True, "requested": len(ids), "deleted": 0, "doc_ids": ids}
+        return {
+            "dry_run": True,
+            "requested": len(ids),
+            "deleted": 0,
+            "doc_ids": ids,
+            "semantic": {"chunk_ids": 0, "faiss_status": "dry_run"},
+        }
 
     deleted = 0
+    collected_chunk_ids: List[int] = []
     with db.transaction() as c:
         for doc_id in ids:
             c.execute("SELECT doc_id FROM documents WHERE doc_id=?", (doc_id,))
             if not c.fetchone():
                 continue
+            try:
+                for row in c.execute(
+                    "SELECT chunk_id FROM chunk_embeddings WHERE doc_id=?",
+                    (doc_id,),
+                ).fetchall():
+                    cid = row["chunk_id"] if hasattr(row, "keys") else row[0]
+                    collected_chunk_ids.append(int(cid))
+            except Exception:
+                # chunk_embeddings may be missing on partial schemas.
+                pass
             c.execute("DELETE FROM vault_fts WHERE doc_id=?", (doc_id,))
             c.execute("DELETE FROM chunk_embeddings WHERE doc_id=?", (doc_id,))
             try:
@@ -804,7 +1044,18 @@ def prune_document_rows(
                 pass  # table may not exist on older schemas
             c.execute("DELETE FROM documents WHERE doc_id=?", (doc_id,))
             deleted += 1
-    return {"dry_run": False, "requested": len(ids), "deleted": deleted}
+
+    # Outside the txn: live-index maintenance is best-effort (parity with
+    # purge_durable_document).
+    semantic = _purge_semantic_side_effects(
+        collected_chunk_ids, faiss_index=faiss_index
+    )
+    return {
+        "dry_run": False,
+        "requested": len(ids),
+        "deleted": deleted,
+        "semantic": semantic,
+    }
 
 
 def repair_index_disk_divergence(
