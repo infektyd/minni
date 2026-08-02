@@ -7,7 +7,8 @@ FIRST at any wind-down signal, and reads its explicit|auto|disabled toggle from
 bootstrapped by `propagate.py` ran the ritual blind against a missing meter.
 
 `mode` and `gauges.md` are living state that operators and the agent edit, so
-seeding must never overwrite an existing file.
+seeding must never wholesale-overwrite an existing file (issue #254: a frozen
+`identity_present: "not seeded"` line is surgically healed when layer1 arrives).
 
 These run against tmp fixtures so we never touch a live `~/.minni` vault.
 """
@@ -194,6 +195,13 @@ def test_frozen_not_seeded_gauges_refresh_when_layer1_arrives(tmp_path, monkeypa
 
     assert "layer1/core.md present" in gauges
     assert 'identity_present: "not seeded"' not in gauges
+    # Companion summary is rewritten to present-form when identity un-freezes
+    # (intentional: keep Layer 1 Reference consistent; not gated on missing-form).
+    assert (
+        "Layer 1 workspace present at layer1/ (core.md + budget.md, strict "
+        "<4096 token budget). Protect it during every distill."
+    ) in gauges
+    assert "No layer1/core.md in this vault yet" not in gauges
     assert "operator-owned living state — must survive refresh" in gauges
     assert "pressure_level: medium" in gauges
     assert 'recommended: "distill soon"' in gauges

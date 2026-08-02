@@ -1535,8 +1535,11 @@ _GAUGES_LAYER1_SUMMARY = re.compile(
 def _refresh_gauges_layer1_identity(gauges_path: Path, vault: Path) -> bool:
     """Heal a frozen identity_present lie when layer1/core.md is on disk.
 
-    Only patches the Layer 1 Reference lines that claim `"not seeded"` while
-    `layer1/core.md` exists. Other operator/agent-owned content is left alone.
+    Gate: only runs when gauges claim `identity_present: "not seeded"` *and*
+    `layer1/core.md` exists. When healing, rewrites both Layer 1 Reference
+    lines — the identity_present claim *and* its companion
+    `last_layer1_context_summary` — to the present-form template text so the
+    meter stays consistent. Other operator/agent-owned content is left alone.
     One-way heal only (not seeded → present); never downgrades a present claim.
     """
     layer1_core = vault / "layer1" / "core.md"
@@ -1580,8 +1583,10 @@ def seed_distill(vault: Path, agent: str) -> dict[str, object]:
 
     Exception (issue #254): if an existing `gauges.md` still claims
     `identity_present: "not seeded"` while `layer1/core.md` is on disk, the
-    Layer 1 Reference lines are surgically refreshed so the meter does not
-    permanently freeze a health signal that contradicts disk.
+    Layer 1 Reference lines (`identity_present` + companion
+    `last_layer1_context_summary`) are surgically refreshed so the meter does
+    not permanently freeze a health signal that contradicts disk. JSON may
+    include ``refreshed: ["gauges.md:layer1_identity"]``.
     """
     distill = vault / "distill"
     result: dict[str, object] = {"path": str(distill)}

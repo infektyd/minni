@@ -10,7 +10,9 @@ mode: explicit
 
 Live context meter for the Minni Distill Ritual V1. Read this file FIRST at any
 wind-down signal — do not reason about your own token usage. Maintained by the
-agent during each distill; seeded once by `minni-install` and never overwritten.
+agent during each distill; seeded once by `minni-install` and not wholesale-
+overwritten on re-seed (issue #254: a frozen `identity_present: "not seeded"`
+line is surgically healed when `layer1/core.md` is on disk).
 
 ## Pressure Signals
 - recent_turns: 0 (freshly seeded, no burst recorded yet)

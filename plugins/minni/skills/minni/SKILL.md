@@ -87,7 +87,7 @@ This is the "live context meter". It contains:
 
 The agent is trained to **read the gauges first** at any wind-down signal (end of plan, after major milestone, before deciding on compaction). The gauges remove all the hard modeling work. The canonical schema is the seed template shipped in the repo: `plugins/minni/skills/minni-install/templates/distill/gauges.md`.
 
-`distill/mode`, `distill/gauges.md`, and `distill/ritual.md` are seeded into every vault by `minni-install` (`bootstrap-vault`, also run by `update-plugin`). If your vault has no `distill/` directory, re-run `bootstrap-vault --agent <id>` rather than distilling blind; seeding never overwrites existing files.
+`distill/mode`, `distill/gauges.md`, and `distill/ritual.md` are seeded into every vault by `minni-install` (`bootstrap-vault`, also run by `update-plugin`). If your vault has no `distill/` directory, re-run `bootstrap-vault --agent <id>` rather than distilling blind; seeding never wholesale-overwrites existing files. Exception (issue #254): if gauges still claim `identity_present: "not seeded"` while `layer1/core.md` is present, re-run surgically refreshes that Layer 1 Reference (and companion summary); JSON may include `distill.refreshed`.
 
 ### Two Operating Modes (Controlled by `distill/mode` in your vault)
 - **Explicit mode** (default): When gauges indicate rising pressure, surface a short, clear yes/no gate to the user. On yes → execute the quick workflow. On no → log lightly.
