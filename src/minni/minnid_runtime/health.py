@@ -39,6 +39,12 @@ CONSOLIDATION_FAILURE_COUNTERS = (
     "inbox_archive_failures_total",
     "compact_distillation_failures_total",
 )
+# Review round 3 on PR #260: the ingest status was derived from the cumulative
+# totals, which nothing ages out — one boot-time failure read "failing" until
+# daemon restart, the same one-way latch round 2 removed from derive_loop_status
+# and writes_dropped. Only a failure inside this window is a live condition;
+# the lifetime totals stay reported as data.
+CONSOLIDATION_FAILURE_RECENT_SECONDS = 3600.0
 
 
 def redact_health_report_for_recovery(report: dict) -> dict:
@@ -83,6 +89,10 @@ class HealthContext:
     # ring buffer. Defaulted so tests/legacy wiring that construct a HealthContext
     # without them keep working (status just omits the self-diagnosing extras).
     metrics_delta_snapshot: Callable[[], dict] = lambda: {}
+    # Review round 3 (PR #260): recency source for latch-free status verdicts.
+    # Defaulted to "unknown" (None), which callers must treat as NOT recovered —
+    # a context wired without recency keeps the alarm rather than clearing it.
+    metrics_last_incremented_at: Callable[[str], Optional[float]] = lambda name: None
     health_flags: Callable[[dict], list] = lambda deltas: []
     recent_errors: Callable[[], list] = lambda: []
     increment_request_count: Callable[[], None] | None = None
@@ -584,14 +594,27 @@ def handle_health_report(params: dict, request_id: Any, context: HealthContext) 
                 for name in CONSOLIDATION_FAILURE_COUNTERS
                 if counters.get(name)
             }
+            # Review round 3 (PR #260): status from RECENCY, not lifetime
+            # totals — a counter bumped once at boot must not read "failing"
+            # forever (the latch class round 2 removed from derive_loop_status).
+            # Unknown recency (no stamp available) keeps the alarm: better a
+            # stale reason than a suppressed fault. The totals stay in
+            # `failures` as data either way.
+            now = time.time()
+            recent_failures = {}
+            for name, total in failures.items():
+                last_at = context.metrics_last_incremented_at(name)
+                if last_at is None or now - last_at <= CONSOLIDATION_FAILURE_RECENT_SECONDS:
+                    recent_failures[name] = total
             backlog = 0
             for inbox in discover_inboxes(context.default_config):
                 if inbox.is_dir():
                     backlog += sum(1 for _ in inbox.glob("*.json"))
             report["consolidation_ingest"] = {
                 "failures": failures,
+                "recent_failures": recent_failures,
                 "inbox_backlog": backlog,
-                "status": "failing" if failures else "ok",
+                "status": "failing" if recent_failures else "ok",
             }
         except Exception as exc:
             # Exception class only, for the same reason as inbox_quarantine

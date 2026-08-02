@@ -21,6 +21,7 @@ import {
   GEMINI_WORKSPACE_ID,
 } from "./config.js";
 import {
+  AGY_EVENTS,
   adaptAgyPayload,
   adaptPreToolUseOutput,
   agyAllow,
@@ -74,19 +75,6 @@ const CONFIG: AgentHookConfig = {
   // durable handoff file.
   recallGuardMode: GEMINI_GUARD_MODE,
   wire: geminiWire,
-};
-
-/**
- * agy's native event names -> Minni's internal EnvelopeEvent names.
- *
- * Declaring Claude Code's names in an agy manifest is what made this
- * integration dead config: `UserPromptSubmit` and `PreCompact` simply do not
- * exist on agy, so those entries never fired and never would have.
- */
-const AGY_EVENTS: Record<string, EnvelopeEvent> = {
-  SessionStart: "SessionStart",
-  PreInvocation: "UserPromptSubmit",
-  Stop: "Stop",
 };
 
 async function main(): Promise<void> {

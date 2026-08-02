@@ -2036,6 +2036,13 @@ class RetrievalEngine:
         Returns a list of dicts in the same format as _semantic_search(),
         with the 'backend_name' field populated from hit.backend.
         """
+        # Review round 3 (PR #260): an empty vector means the encoder is down —
+        # _encode_query already raised the P0-B flag. Feeding it to a live
+        # index raises a dimension mismatch, turning the degrade into a -32000
+        # error while the default `backend: auto` path degrades to FTS-only
+        # cleanly. Same outage, same outcome: skip the semantic leg.
+        if query_emb.size == 0:
+            return []
         search_k = limit * 5
         hits = backend.search(query_emb, k=search_k, filter=None)
 
@@ -2893,7 +2900,9 @@ class RetrievalEngine:
                 else:
                     multi = MultiBackend(resolved)
                     query_emb = self._encode_query(query)
-                    hits = multi.search(query_emb, k=rerank_k)
+                    # Same encoder-down guard as _backend_search (round 3,
+                    # PR #260): degrade to FTS-only instead of raising.
+                    hits = [] if query_emb.size == 0 else multi.search(query_emb, k=rerank_k)
                     # Convert VectorHit list to the dict format expected by _rrf_merge
                     semantic_results = self._hits_to_dicts(hits, query_emb)
                 trace["backends"] = [getattr(b, "name", str(b)) for b in resolved]

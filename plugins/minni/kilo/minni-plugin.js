@@ -55,15 +55,46 @@ const DIAGNOSTIC_TIMEOUT_MS = 5_000;
 const DIAGNOSTIC_MAX_IN_FLIGHT = 4;
 let diagnosticsInFlight = 0;
 let diagnosticsSuppressed = 0;
+// Review round 3 (PR #260): evictions must not exhaust the diagnostic budget
+// real hook failures need. Under session churn one insert can evict a whole
+// wave, and a spawn per eviction eats the DIAGNOSTIC_MAX_IN_FLIGHT slots in
+// exactly the window a real Stop/SessionStart timeout would need them — the
+// failure path going dark to pay for bound maintenance. Coalesce: at most one
+// session-evict diagnostic per interval, carrying the count it stands for.
+const EVICTION_DIAGNOSTIC_INTERVAL_MS = 60_000;
+let evictionsSinceReport = 0;
+let lastEvictionReportAt = 0;
+
+function reportSessionEvictions(label, max, evicted) {
+  evictionsSinceReport += evicted;
+  const now = Date.now();
+  if (now - lastEvictionReportAt < EVICTION_DIAGNOSTIC_INTERVAL_MS) {
+    // Still visible per wave — just no spawn.
+    console.warn(
+      `[minni] evicted ${evicted} ${label} entr(y|ies) (bound ${max}); ` +
+        `${evictionsSinceReport} since last diagnostic`,
+    );
+    return;
+  }
+  lastEvictionReportAt = now;
+  const count = evictionsSinceReport;
+  evictionsSinceReport = 0;
+  reportBridgeFailure(
+    "session-evict",
+    new Error(`evicted ${count} ${label} entr(y|ies) for old sessions (bound ${max})`),
+  );
+}
 
 function evictOldest(collection, max, label) {
+  // Evicting queued context IS losing memory injection for that session.
+  // A bound that discards silently is the same defect in a smaller box.
+  let evicted = 0;
   while (collection.size > max) {
     const oldest = collection.keys().next().value;
     collection.delete(oldest);
-    // Evicting queued context IS losing memory injection for that session.
-    // A bound that discards silently is the same defect in a smaller box.
-    reportBridgeFailure("session-evict", new Error(`evicted ${label} for an old session (bound ${max})`));
+    evicted += 1;
   }
+  if (evicted) reportSessionEvictions(label, max, evicted);
 }
 
 function hookContext(result) {

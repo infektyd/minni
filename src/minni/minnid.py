@@ -871,6 +871,7 @@ def _health_context() -> HealthContext:
         latency_snapshot=_latency_snapshot,
         metrics_snapshot=obs.metrics_snapshot,
         metrics_delta_snapshot=obs.metrics_delta_snapshot,
+        metrics_last_incremented_at=obs.metrics_last_incremented_at,
         health_flags=obs.health_flags,
         recent_errors=obs.recent_errors,
         afm_loop_enabled=_afm_loop_enabled,

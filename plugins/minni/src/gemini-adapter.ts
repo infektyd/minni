@@ -23,8 +23,26 @@
 //     outright with: unknown pre-tool hook decision "approve".
 import { open, stat } from "node:fs/promises";
 
+import type { EnvelopeEvent } from "./agent_envelope.js";
 import type { PreToolUseDecisionOutput } from "./recall-guard.js";
 import { asString } from "./hook-utils.js";
+
+/**
+ * agy's native event names -> Minni's internal EnvelopeEvent names.
+ *
+ * Declaring Claude Code's names in an agy manifest is what made this
+ * integration dead config: `UserPromptSubmit` and `PreCompact` simply do not
+ * exist on agy, so those entries never fired and never would have.
+ *
+ * Exported from the adapter (round 3, PR #260) so the P4 parity gate can
+ * read the routed set without importing the hook entry point, which executes
+ * on import.
+ */
+export const AGY_EVENTS: Record<string, EnvelopeEvent> = {
+  SessionStart: "SessionStart",
+  PreInvocation: "UserPromptSubmit",
+  Stop: "Stop",
+};
 
 /** agy tool names -> Claude Code tool names the recall guard understands. */
 const AGY_TOOL_NAMES: Record<string, string> = {

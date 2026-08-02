@@ -175,6 +175,38 @@ def test_encode_query_raises_the_degradation_flag_when_encoder_down(tmp_path, mo
     )
 
 
+class _LiveIndexBackend:
+    """Stands in for a populated FAISS index: a real one raises a dimension
+    mismatch when handed the (1, 0) reshape of an empty query vector."""
+
+    name = "faiss-disk"
+
+    def search(self, query_emb, k, filter=None):
+        raise AssertionError("an empty query vector must never reach a live index")
+
+
+def test_encoder_down_with_explicit_backend_degrades_instead_of_erroring(tmp_path, monkeypatch):
+    """Review round 3 (PR #260): with the encoder down, the default `auto`
+    path degrades to FTS-only cleanly, but the explicit-backend path fed the
+    empty query vector into the live index — a dim-mismatch raise that
+    surfaced as -32000 with no degradation envelope. Same outage, two honesty
+    outcomes. Fails pre-round-3: _backend_search called backend.search with
+    the empty vector."""
+    engine = _engine_without_model(tmp_path, monkeypatch)
+
+    results = engine._backend_search(engine._encode_query("some query"), 5, _LiveIndexBackend())
+    assert results == [], "the semantic leg is down; the leg's contribution is empty"
+    assert engine.last_vector_degraded is not None
+
+    # End to end through retrieve() on the explicit-backend path: a success
+    # payload with the degrade flag raised, not an internal error.
+    out = engine.retrieve("some query", limit=3, backend=_LiveIndexBackend(), expand=False)
+    assert isinstance(out, list)
+    assert engine.last_vector_degraded is not None, (
+        "the response envelope must be able to report the lexical-only degrade"
+    )
+
+
 def test_explicit_backend_branches_use_the_flagging_encoder():
     """Regression pin on the call sites themselves: no branch may re-introduce
     the unflagged inline encode. Fails pre-R8 — all three lines matched."""
@@ -576,6 +608,52 @@ def test_an_old_drop_does_not_latch_backlogged_forever():
     assert any("REJECTED" in reason for reason in reasons)
 
 
+def test_write_timeout_is_counted_and_stamped(monkeypatch):
+    """Review round 3 (PR #260): a slow-but-alive writer returns write_timeout
+    on every wet compile while every other signal stays green — attempts
+    fresh, no failures, queue one deep. Without a counter the condition never
+    reaches any surface."""
+    from minni import afm_writer
+
+    afm_writer.reset_pass_counters()
+    monkeypatch.setattr(afm_writer, "_ensure_worker", lambda: None)
+    monkeypatch.setattr(afm_writer, "_WORK_QUEUE", queue.Queue(maxsize=4))
+
+    res = afm_writer.submit_drafts(
+        {"pass_name": "p", "drafts": [{"title": "t"}]}, timeout=0.01
+    )
+    assert res["status"] == "write_timeout", "precondition: nobody drains the queue"
+    assert afm_writer._WRITE_TIMEOUTS == 1
+    assert afm_writer._LAST_WRITE_TIMEOUT_AT is not None
+    afm_writer.reset_pass_counters()
+
+
+def test_recent_write_timeouts_reach_the_status_verdict():
+    """The chronic-timeout writer must not read `ok`; an old timeout must not
+    latch `backlogged` (same recency discipline as drops)."""
+    from minni.afm_writer import WRITE_TIMEOUTS_RECENT_SECONDS, derive_loop_status
+
+    now = 1_000_000.0
+    schedule = {"passes": {"consolidation": {"interval_seconds": 3600}}}
+    recent = {
+        "last_attempt_per_pass": {"consolidation": now - 60},
+        "write_timeouts": 4,
+        "last_write_timeout_at": now - 60,
+    }
+    status, reasons = derive_loop_status(recent, schedule=schedule, now=now)
+    assert status == "backlogged"
+    assert any("timed out" in reason for reason in reasons)
+
+    old = {
+        "last_attempt_per_pass": {"consolidation": now - 60},
+        "write_timeouts": 4,
+        "last_write_timeout_at": now - WRITE_TIMEOUTS_RECENT_SECONDS - 60,
+    }
+    status, reasons = derive_loop_status(old, schedule=schedule, now=now)
+    assert status == "ok", "a long-recovered writer is not backlogged NOW"
+    assert not any("timed out" in reason for reason in reasons)
+
+
 def test_writer_status_exposes_the_fields_the_verdict_reads():
     """The state dict and the derivation must not drift apart again."""
     from minni.afm_writer import writer_status
@@ -586,6 +664,8 @@ def test_writer_status_exposes_the_fields_the_verdict_reads():
         "queue_max",
         "writes_dropped",
         "last_drop_at",
+        "write_timeouts",
+        "last_write_timeout_at",
         "failures_per_pass",
         "last_failure_per_pass",
     ):
@@ -855,6 +935,97 @@ def test_consolidation_ingest_failures_exclude_other_subsystems():
         "inbox_archive_failures_total",
         "compact_distillation_failures_total",
     }
+
+
+# ── Review round 3: the ingest verdict must not latch on lifetime totals ─────
+
+
+def test_counters_stamp_recency():
+    """The recency source for latch-free verdicts: every incr stamps a time."""
+    from minni.obs import Counters
+
+    counters = Counters()
+    assert counters.last_incremented_at("x") is None
+    counters.incr("x")
+    assert counters.last_incremented_at("x") is not None
+    counters.reset()
+    assert counters.last_incremented_at("x") is None
+
+
+class _HealthFakeCursor:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def execute(self, *a, **k):
+        return self
+
+    def fetchall(self):
+        return []
+
+    def fetchone(self):
+        return {"max_rowid": 0, "n": 0}
+
+
+class _HealthFakeDB:
+    def __init__(self, *a, **k):
+        pass
+
+    def cursor(self):
+        return _HealthFakeCursor()
+
+    def close(self):
+        pass
+
+
+def test_consolidation_ingest_status_does_not_latch_on_old_failures(tmp_path, monkeypatch):
+    """Review round 3 (PR #260): the ingest status was derived from cumulative
+    totals, which nothing ages out — a counter bumped once at boot read
+    `failing` until daemon restart, the same one-way latch round 2 removed
+    from derive_loop_status. Historical failure + no recent activity must be
+    `ok` (with the totals still reported as data); a recent failure must
+    still be `failing`."""
+    import minni.config as cfg_mod
+    import minni.minnid as minnid
+    from minni import obs
+    from minni.minnid_runtime.health import CONSOLIDATION_FAILURE_RECENT_SECONDS
+    from minni.principal import EffectivePrincipal
+
+    monkeypatch.setattr(minnid, "SovereignDB", _HealthFakeDB)
+    monkeypatch.setattr(
+        cfg_mod.DEFAULT_CONFIG, "CANONICAL_SOVEREIGN_HOME", str(tmp_path), raising=False
+    )
+    obs.METRICS.reset()
+    try:
+        obs.incr("inbox_ingest_failures_total")
+        op = EffectivePrincipal(agent_id="main", capabilities=["*"])
+
+        # Fresh failure: still failing, totals and recency agree.
+        rep = minnid._handle_health_report({"_recovery": False, "_principal": op}, 1)["result"]
+        ingest = rep["consolidation_ingest"]
+        assert ingest["status"] == "failing"
+        assert ingest["failures"] == {"inbox_ingest_failures_total": 1}
+        assert ingest["recent_failures"] == {"inbox_ingest_failures_total": 1}
+
+        # Same counter, aged past the window: history, not a live condition.
+        monkeypatch.setattr(
+            obs,
+            "metrics_last_incremented_at",
+            lambda name: time.time() - CONSOLIDATION_FAILURE_RECENT_SECONDS - 60,
+        )
+        rep = minnid._handle_health_report({"_recovery": False, "_principal": op}, 1)["result"]
+        ingest = rep["consolidation_ingest"]
+        assert ingest["status"] == "ok", (
+            "a boot-time failure with no recurrence must not read failing forever"
+        )
+        assert ingest["failures"] == {"inbox_ingest_failures_total": 1}, (
+            "the cumulative total stays visible as data"
+        )
+        assert ingest["recent_failures"] == {}
+    finally:
+        obs.METRICS.reset()
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────

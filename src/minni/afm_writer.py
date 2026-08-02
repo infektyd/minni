@@ -66,6 +66,15 @@ _WRITES_DROPPED = 0
 # under the backlog threshold); older ones are history, not status.
 _LAST_DROP_AT: Optional[float] = None
 WRITES_DROPPED_RECENT_SECONDS = 3600.0
+# Review round 3 on PR #260: a slow-but-alive writer (every job outliving the
+# caller's wait) returns "write_timeout" on every wet compile, the loop backs
+# off — and writer_status still read `ok`, because attempts stay fresh, no
+# failure is recorded, and a one-deep queue never crosses the backlog
+# threshold. Timeouts need their own counter and recency stamp so a chronic
+# condition reaches the verdict. Same recency window discipline as drops.
+_WRITE_TIMEOUTS = 0
+_LAST_WRITE_TIMEOUT_AT: Optional[float] = None
+WRITE_TIMEOUTS_RECENT_SECONDS = 3600.0
 
 # A pass is stale once it has been silent for this multiple of its configured
 # interval. 2x, not 1x: a tick that lands a few seconds late is not a fault, and
@@ -132,13 +141,15 @@ def record_pass_failure(
 
 def reset_pass_counters() -> None:
     """Clear the in-memory liveness/failure counters (tests)."""
-    global _WRITES_DROPPED, _LAST_DROP_AT
+    global _WRITES_DROPPED, _LAST_DROP_AT, _WRITE_TIMEOUTS, _LAST_WRITE_TIMEOUT_AT
     _LAST_RUN_PER_PASS.clear()
     _LAST_ATTEMPT_PER_PASS.clear()
     _FAILURES_PER_PASS.clear()
     _LAST_FAILURE_PER_PASS.clear()
     _WRITES_DROPPED = 0
     _LAST_DROP_AT = None
+    _WRITE_TIMEOUTS = 0
+    _LAST_WRITE_TIMEOUT_AT = None
 
 
 def _parse_iso_utc(value: str) -> Optional[float]:
@@ -302,6 +313,21 @@ def derive_loop_status(
             f"{dropped} write job(s) REJECTED because the queue was full — "
             "those drafts were never written"
         )
+    # Review round 3 on PR #260: a chronic write_timeout (writer alive but
+    # outliving every caller's wait) left every other signal green — attempts
+    # fresh, no failures, queue one deep. Recent timeouts are the writer not
+    # draining within the window callers can observe; same recency discipline
+    # as drops, with the lifetime count staying as write_timeouts data.
+    timeouts = int(state.get("write_timeouts", 0) or 0)
+    timeout_at = state.get("last_write_timeout_at")
+    timed_out_recently = bool(timeouts) and (
+        timeout_at is None or now - float(timeout_at) <= WRITE_TIMEOUTS_RECENT_SECONDS
+    )
+    if timed_out_recently:
+        reasons.append(
+            f"{timeouts} write job(s) timed out waiting on the writer — "
+            "outcomes unobserved; the writer is not draining within the wait window"
+        )
 
     # GA4-3: a pass failing on every tick used to reach this function looking
     # exactly like a healthy one, because only the fact that it ran was
@@ -337,6 +363,7 @@ def derive_loop_status(
         pending >= DRAFTS_PENDING_BACKLOG
         or queue_backlogged
         or dropped_recently
+        or timed_out_recently
         or (oldest_ts is not None and (now - oldest_ts) / 86400.0 > ttl_days)
     ):
         return "backlogged", reasons
@@ -717,7 +744,12 @@ def submit_drafts(job: dict, wait: bool = True, timeout: Optional[float] = 30.0)
         # AFM-8: the job is still in flight and WILL be written by the worker;
         # the caller just did not get to see the outcome. Saying "queued" alone
         # left the caller with no way to know its result was never observed, so
-        # the drafts read as landed. Name it.
+        # the drafts read as landed. Name it — and count it (round 3): a writer
+        # that outlives every caller's wait is chronic, and without a counter
+        # the status surface reads ok while nothing is ever observed landing.
+        global _WRITE_TIMEOUTS, _LAST_WRITE_TIMEOUT_AT
+        _WRITE_TIMEOUTS += 1
+        _LAST_WRITE_TIMEOUT_AT = time.time()
         logger.warning(
             "AFM writer timed out after %.1fs waiting on pass %r; %d draft(s) "
             "still in flight — outcome unobserved",
@@ -809,6 +841,8 @@ def writer_status(
         "queue_max": WRITER_QUEUE_MAX,
         "writes_dropped": _WRITES_DROPPED,
         "last_drop_at": _LAST_DROP_AT,
+        "write_timeouts": _WRITE_TIMEOUTS,
+        "last_write_timeout_at": _LAST_WRITE_TIMEOUT_AT,
         "failures_per_pass": dict(_FAILURES_PER_PASS),
         "last_failure_per_pass": dict(_LAST_FAILURE_PER_PASS),
     }

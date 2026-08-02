@@ -18,6 +18,8 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
+import { CURSOR_EVENTS } from "../dist/cursor-adapter.js";
+import { AGY_EVENTS } from "../dist/gemini-adapter.js";
 import * as hookUtils from "../dist/hook-utils.js";
 import { ensureVault, recordAudit } from "../dist/vault.js";
 
@@ -69,6 +71,30 @@ test("P4: every event a platform manifest declares is routed by the hook it invo
       assert.ok(
         consumed.has(event),
         `${relative} declares "${event}" but the hook it invokes does not route it — ` +
+          "a declared-but-unhandled event exits clean and carries nothing",
+      );
+    }
+  }
+
+  // Round 3 (PR #260): cursor and gemini are real platform entry points with
+  // their OWN declared→routed maps, not the generic envelope set — omitting
+  // them meant a declared-but-unhandled event on either platform passed this
+  // gate. Their adapters export the routed maps precisely so this check can
+  // read them without importing an entry point (which executes on import).
+  const platformManifests = [
+    ["hooks/hooks-cursor.json", new Set(Object.keys(CURSOR_EVENTS))],
+    ["hooks/hooks-gemini.json", new Set([...Object.keys(AGY_EVENTS), "PreToolUse"])],
+  ];
+  for (const [relative, routed] of platformManifests) {
+    const raw = await readFile(path.join(PLUGIN_ROOT, relative), "utf8");
+    const parsed = JSON.parse(raw);
+    // Gemini nests its event map under a `minni` wrapper; cursor uses `hooks`.
+    const declared = Object.keys(parsed.minni ?? parsed.hooks ?? parsed);
+    assert.ok(declared.length > 0, `${relative} declares no events`);
+    for (const event of declared) {
+      assert.ok(
+        routed.has(event),
+        `${relative} declares "${event}" but the platform hook does not route it — ` +
           "a declared-but-unhandled event exits clean and carries nothing",
       );
     }
@@ -156,7 +182,7 @@ test("P5: pending and booted are bounded, so not honoring the delete cannot leak
   );
 });
 
-test("P5: an eviction is reported, not silent", async () => {
+test("P5: an eviction is reported, not silent — and coalesced, not budget-burning", async () => {
   // A bound that discards silently is the same defect in a smaller box.
   const source = await readFile(
     path.join(PLUGIN_ROOT, "kilo", "minni-plugin.js"),
@@ -164,7 +190,20 @@ test("P5: an eviction is reported, not silent", async () => {
   );
   const evict = source.indexOf("function evictOldest(");
   const window = source.slice(evict, evict + 600);
-  assert.match(window, /reportBridgeFailure/);
+  assert.match(window, /reportSessionEvictions/);
+  // Round 3 (PR #260): a diagnostic SPAWN per evicted key shared — and under
+  // session churn exhausted — the DIAGNOSTIC_MAX_IN_FLIGHT budget real hook
+  // failures need, silencing exactly the diagnostics P6 exists to keep alive.
+  assert.doesNotMatch(
+    window,
+    /reportBridgeFailure\(/,
+    "evictions must not spawn a diagnostic per evicted key",
+  );
+  const coalesce = source.indexOf("function reportSessionEvictions(");
+  assert.ok(coalesce !== -1, "the coalescing reporter is missing");
+  const cWindow = source.slice(coalesce, coalesce + 900);
+  assert.match(cWindow, /EVICTION_DIAGNOSTIC_INTERVAL_MS/);
+  assert.match(cWindow, /reportBridgeFailure/, "coalesced evictions still reach the audit channel");
 });
 
 // ── P6: bridge failures must reach the audit log ───────────────────────────
