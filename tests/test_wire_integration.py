@@ -644,18 +644,36 @@ def test_wire_missing_config_root_is_skipped(wire_env, monkeypatch, capsys):
         assert rc == 1
 
 
-def test_wire_missing_config_root_retires_zombie_wired_rows(
+def test_wire_skip_missing_config_retires_zombie_and_honesty_green(
     wire_env, monkeypatch, capsys,
 ):
-    """Skip-on-missing-root must retire prior wired.json rows for that platform."""
+    """High pin: codex lagging in wired.json with no ~/.codex must not keep
+    plugin_dist.stale true after wire skip + active claude payload.
+
+    wired.json has {codex: old_root, claude-code: fresh_root}
+    HOME has no ~/.codex, has claude surface
+    wire codex → skipped + retired
+    deploy_status plugin_dist.stale is False  # codex must not count
+    """
+    import shutil
+
+    from minni.minnid_runtime import deploy_honesty
+    from minni.wire.active_roots import active_wire_plugin_roots_ordered
+
     _patch_payload(wire_env, monkeypatch)
     home = wire_env[0]
     plugin = home / ".minni" / "plugin"
-    plugin.mkdir(parents=True, exist_ok=True)
-    lagging = plugin / "0.4.0-old"
-    lagging.mkdir(parents=True, exist_ok=True)
-    (lagging / "payload-manifest.json").write_text(
-        '{"git_sha": "0000000000000000000000000000000000000000", "version": "0.4.0"}\n',
+    old = plugin / "0.4.0"
+    old.mkdir(parents=True)
+    (old / "payload-manifest.json").write_text(
+        json.dumps({"git_sha": "0" * 40, "version": "0.4.0"}),
+        encoding="utf-8",
+    )
+    head = "b" * 40
+    fresh = plugin / "0.4.1+git.bbbbbbb"
+    fresh.mkdir(parents=True)
+    (fresh / "payload-manifest.json").write_text(
+        json.dumps({"git_sha": head, "version": "0.4.1+git.bbbbbbb"}),
         encoding="utf-8",
     )
     (plugin / "wired.json").write_text(
@@ -664,34 +682,45 @@ def test_wire_missing_config_root_retires_zombie_wired_rows(
             "generation": 1,
             "wires": [
                 {
-                    "platform": "kilocode",
-                    "install_root": str(lagging),
+                    "platform": "codex",
+                    "install_root": str(old),
                     "wired_at": "2026-08-01T00:00:00Z",
                 },
                 {
                     "platform": "claude-code",
-                    "install_root": str(plugin / "keep"),
+                    "install_root": str(fresh),
                     "wired_at": "2026-08-02T00:00:00Z",
                 },
             ],
-        })
-        + "\n",
+        }),
         encoding="utf-8",
     )
-    kilo = home / ".config" / "kilo"
-    if kilo.exists():
-        import shutil
-        shutil.rmtree(kilo)
+    # Abandon codex host surface (zombie wire record remains until skip).
+    shutil.rmtree(home / ".codex")
 
-    rc = run_wire(_args("kilocode", home, dry_run=False))
+    rc = run_wire(_args("codex", home))
     out = json.loads(capsys.readouterr().out)
     by = {r["platform"]: r for r in out["results"]}
-    assert by["kilocode"]["status"] == "skipped", out
+    assert by["codex"]["status"] == "skipped"
+    assert "no config root" in by["codex"].get("reason", "")
+    # Single-platform skip → D5 exit 1; retirement still must land on disk.
     assert rc == 1
+
     wired = json.loads((plugin / "wired.json").read_text(encoding="utf-8"))
-    platforms = [w["platform"] for w in wired.get("wires", [])]
-    assert "kilocode" not in platforms, wired
-    assert "claude-code" in platforms, wired
+    plats = [w.get("platform") for w in wired.get("wires", [])]
+    assert "codex" not in plats, wired
+    assert "claude-code" in plats
+
+    ordered = active_wire_plugin_roots_ordered(home)
+    assert not any("codex" in how for _r, how in ordered), ordered
+    assert any("claude-code" in how for _r, how in ordered), ordered
+
+    monkeypatch.setattr(
+        deploy_honesty, "_active_payload_roots",
+        lambda: active_wire_plugin_roots_ordered(home),
+    )
+    status = deploy_honesty._plugin_dist_status(head)
+    assert status["stale"] is False, status
 
 
 def test_from_repo_run_redirects_child_stdout_to_stderr(tmp_path, monkeypatch):

@@ -518,9 +518,29 @@ def test_zombie_wire_platform_without_config_root_not_active(tmp_path, monkeypat
 
 def test_no_plugin_payload_is_stale_false_not_null(monkeypatch):
     """Measurable absence of a wire payload must not roll up to null stale."""
+    from pathlib import Path
+
     from minni.minnid_runtime import deploy_honesty
 
     monkeypatch.setattr(deploy_honesty, "_active_payload_roots", lambda: [])
     out = deploy_honesty._plugin_dist_status("abc")
     assert out["stale"] is False
     assert "no wire-managed" in out["reason"]
+
+    # Rollup: process clean + no payload → top-level stale false (not null).
+    monkeypatch.setattr(
+        deploy_honesty,
+        "_START_STATE",
+        {
+            "install_kind": "editable-checkout",
+            "checkout": "/tmp/not-used",
+            "git_sha": "abc",
+            "git_dirty": False,
+            "captured_at": 0.0,
+        },
+    )
+    monkeypatch.setattr(deploy_honesty, "_current_head", lambda _c: "abc")
+    monkeypatch.setattr(deploy_honesty, "_source_checkout", lambda: Path("/tmp/not-used"))
+    full = deploy_honesty.deploy_status()
+    assert full["plugin_dist"]["stale"] is False
+    assert full["stale"] is False, full

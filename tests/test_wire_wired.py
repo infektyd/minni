@@ -7,54 +7,12 @@ from pathlib import Path
 
 import pytest
 
-from minni.wire.wired import (
-    WireRecord,
-    _detect_out_of_band,
-    retire_platform,
-    upsert_wire,
-)
+from minni.wire.wired import WireRecord, _detect_out_of_band, upsert_wire
 
 
 def test_detect_out_of_band_helper():
     assert _detect_out_of_band(1, 0) is not None
     assert _detect_out_of_band(0, 0) is None
-
-
-def test_retire_platform_removes_rows_for_platform(tmp_path, monkeypatch):
-    base = tmp_path / "plugin"
-    base.mkdir()
-    monkeypatch.setattr("minni.wire.wired.plugin_base", lambda: base)
-    (base / "wired.json").write_text(
-        json.dumps({
-            "schema": 1,
-            "generation": 3,
-            "wires": [
-                {
-                    "platform": "codex",
-                    "install_root": str(base / "old"),
-                    "wired_at": "2026-08-01T00:00:00Z",
-                },
-                {
-                    "platform": "claude-code",
-                    "install_root": str(base / "fresh"),
-                    "wired_at": "2026-08-02T00:00:00Z",
-                },
-            ],
-        })
-        + "\n",
-        encoding="utf-8",
-    )
-    data, n = retire_platform("codex")
-    assert n == 1
-    assert data["generation"] == 4
-    platforms = [w["platform"] for w in data["wires"]]
-    assert platforms == ["claude-code"]
-    on_disk = json.loads((base / "wired.json").read_text(encoding="utf-8"))
-    assert [w["platform"] for w in on_disk["wires"]] == ["claude-code"]
-
-    data2, n2 = retire_platform("codex")
-    assert n2 == 0
-    assert data2["generation"] == 4
 
 
 def test_upsert_wire_happy_path_no_warning(tmp_path, monkeypatch):
@@ -74,6 +32,40 @@ def test_upsert_wire_happy_path_no_warning(tmp_path, monkeypatch):
     assert data["generation"] == 1
     on_disk = json.loads((base / "wired.json").read_text(encoding="utf-8"))
     assert on_disk["generation"] == 1
+
+
+def test_retire_platform_removes_all_rows(tmp_path, monkeypatch):
+    """Missing host config root path must be able to drop zombie platform rows."""
+    from minni.wire.wired import retire_platform
+
+    base = tmp_path / "plugin"
+    base.mkdir()
+    monkeypatch.setattr("minni.wire.wired.plugin_base", lambda: base)
+    (base / "wired.json").write_text(
+        json.dumps({
+            "schema": 1,
+            "generation": 3,
+            "wires": [
+                {"platform": "codex", "install_root": "/old/codex",
+                 "wired_at": "2026-08-01T00:00:00Z"},
+                {"platform": "claude-code", "install_root": "/old/claude",
+                 "wired_at": "2026-08-01T00:00:00Z"},
+                {"platform": "codex", "install_root": "/older/codex",
+                 "wired_at": "2026-07-01T00:00:00Z"},
+            ],
+        }) + "\n",
+        encoding="utf-8",
+    )
+    data, n = retire_platform("codex")
+    assert n == 2
+    assert data["generation"] == 4
+    assert all(w["platform"] == "claude-code" for w in data["wires"])
+    on_disk = json.loads((base / "wired.json").read_text(encoding="utf-8"))
+    assert [w["platform"] for w in on_disk["wires"]] == ["claude-code"]
+
+    data2, n2 = retire_platform("codex")
+    assert n2 == 0
+    assert data2["generation"] == 4
 
 
 def test_upsert_wire_oob_warning(tmp_path, monkeypatch):
