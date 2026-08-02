@@ -1281,7 +1281,28 @@ def _backfill_sweep_once() -> dict:
         engine = _lazy_retrieval()
         engine._refresh_live_faiss(chunk_ids, vectors)
 
-    return run_backfill_all_indexes(DEFAULT_CONFIG, on_vectors=_refresh)
+    results = run_backfill_all_indexes(DEFAULT_CONFIG, on_vectors=_refresh)
+
+    # grok-review round 2 (finding 2): on_vectors covers the SHARED index only.
+    # Vault engines memoized in _vault_retrieval_cache keep their warm FAISS
+    # index (count > 0 → _ensure_faiss_loaded early-returns), so backfilled
+    # vault rows would stay invisible to semantic recall until restart — the
+    # same blindness the shared-index refresh above exists to prevent. Drop the
+    # cache when any vault made progress, exactly as the vault watch does; the
+    # next search rebuilds the engine and loads the new rows.
+    for name, s in results.items():
+        if name == "shared" or not isinstance(s, dict):
+            continue
+        docs = s.get("documents")
+        if isinstance(docs, dict) and (docs.get("documents") or 0) > 0:
+            _vault_retrieval_cache.clear()
+            logger.info(
+                "Backfill: vault %s gained vectors — cleared per-vault "
+                "retrieval cache", name,
+            )
+            break
+
+    return results
 
 
 async def _backfill_runner():

@@ -1476,3 +1476,283 @@ class TestDecayRerankParity:
                        "page_type": "note"}]
         engine._apply_decay_rerank_attenuation(candidates)
         assert candidates[0]["rerank_score"] == 1.0
+
+
+# ---------------------------------------------------------------------------
+# grok-review round 2 — the three reopened failure classes
+# ---------------------------------------------------------------------------
+
+class TestDecayIsAppliedOnce:
+    """Round-2 finding 1: _apply_decay_rerank_attenuation mutated rerank_score
+    in place, and compute_confidence then received that attenuated logit PLUS
+    decay_factor — applying decay twice on the confidence/calibration/HyDE leg.
+    Ranking keeps sorting on the adjusted score; confidence and provenance must
+    read the model-pure raw_rerank_score."""
+
+    def test_adjustments_preserve_the_raw_logit(self, tmp_path):
+        engine, _db, _cfg = _make_engine(tmp_path)
+        candidates = [
+            {"doc_id": 1, "rerank_score": 2.0, "decay_score": 0.5, "page_type": "note"},
+            {"doc_id": 2, "rerank_score": 2.0, "decay_score": 1.0, "page_type": "note"},
+        ]
+        engine._apply_rerank_score_adjustments(candidates)
+        assert candidates[0]["raw_rerank_score"] == 2.0, (
+            "the model-pure logit must survive attenuation; without it every "
+            "downstream consumer only sees the decayed value"
+        )
+        assert candidates[1]["raw_rerank_score"] == 2.0
+        assert abs(candidates[0]["rerank_score"] - 1.0) < 1e-9, (
+            "ranking itself must still see the decayed score"
+        )
+
+    def test_rerank_public_path_carries_the_raw_logit(self, tmp_path):
+        engine, _db, _cfg = _make_engine(tmp_path)
+
+        class _StubReranker:
+            def predict(self, pairs):
+                return [2.0] * len(pairs)
+
+        engine._reranker = _StubReranker()
+        candidates = [
+            {"doc_id": 1, "chunk_id": None, "chunk_text": "alpha",
+             "rerank_score": None, "decay_score": 0.5, "page_type": "note"},
+        ]
+        ranked = engine._rerank("alpha", candidates)
+        assert ranked[0]["raw_rerank_score"] == 2.0
+        assert abs(ranked[0]["rerank_score"] - 1.0) < 1e-9
+
+    def test_confidence_math_is_single_application(self, tmp_path):
+        """Equal raw logits, decay 0.5: the confidence the search path computes
+        must equal compute_confidence(raw, decay) — single application — and
+        not compute_confidence(raw * decay, decay), the double-applied value
+        the round-2 review measured (~0.384 vs ~0.299)."""
+        from minni.scoring import compute_confidence
+
+        engine, _db, _cfg = _make_engine(tmp_path)
+        candidates = [
+            {"doc_id": 1, "rerank_score": 2.0, "decay_score": 0.5, "page_type": "note"},
+        ]
+        engine._apply_rerank_score_adjustments(candidates)
+        r = candidates[0]
+
+        # The exact expression the two call sites now use.
+        got = compute_confidence(
+            rrf_score=0.02,
+            cross_encoder_score=r.get("raw_rerank_score", r.get("rerank_score")),
+            decay_factor=r.get("decay_score"),
+        )
+        single = compute_confidence(
+            rrf_score=0.02, cross_encoder_score=2.0, decay_factor=0.5,
+        )
+        double = compute_confidence(
+            rrf_score=0.02, cross_encoder_score=1.0, decay_factor=0.5,
+        )
+        assert abs(got - single) < 1e-12
+        assert got > double, (
+            "single-application confidence must exceed the double-decayed one; "
+            "equality here means decay leaked into the logit again"
+        )
+
+    def test_search_rpc_feeds_confidence_the_raw_logit(self, tmp_path, monkeypatch,
+                                                       hermetic_principals):
+        """Behavioral pin through the production search RPC: with a stub
+        cross-encoder returning logit 2.0 and a document decayed to 0.5, the
+        record=True confidence call must receive cross_encoder_score=2.0 —
+        NOT the attenuated 1.0."""
+        import minni.minnid as minnid
+        import minni.scoring as scoring
+        import minni.writeback as wb_mod
+        from minni.retrieval import RetrievalEngine
+        from minni.writeback import WriteBackMemory
+
+        db_obj, cfg = _make_db(tmp_path, hyde_enabled=False)  # reranker stays ON
+        wb = WriteBackMemory(db_obj, cfg)
+        monkeypatch.setattr(minnid, "_writeback", wb)
+        monkeypatch.setattr(wb_mod.WriteBackMemory, "model", property(lambda self: None))
+        engine = RetrievalEngine(db_obj, cfg, faiss_index=object())
+        monkeypatch.setattr(RetrievalEngine, "model", property(lambda self: None))
+        monkeypatch.setattr(minnid, "_retrieval", engine)
+
+        class _StubReranker:
+            def predict(self, pairs):
+                return [2.0] * len(pairs)
+
+        engine._reranker = _StubReranker()
+
+        body = "the deployment rollback procedure is documented here. " * 20
+        with db_obj.cursor() as c:
+            c.execute(
+                "INSERT INTO documents (path, agent, sigil, layer, decay_score) "
+                "VALUES ('a.md', 'codex', 'vault', 'knowledge', 0.5)"
+            )
+            doc_id = c.lastrowid
+            c.execute(
+                "INSERT INTO vault_fts (doc_id, path, content, agent, sigil) "
+                "VALUES (?, 'a.md', ?, 'codex', 'vault')",
+                (doc_id, body),
+            )
+
+        real = scoring.compute_confidence
+        recorded = []
+
+        def _spy(rrf_score, cross_encoder_score, decay_factor, db=None,
+                 record=False):
+            if record:
+                recorded.append((cross_encoder_score, decay_factor))
+            return real(rrf_score, cross_encoder_score, decay_factor, db=db,
+                        record=record)
+
+        monkeypatch.setattr(scoring, "compute_confidence", _spy)
+
+        resp = _dispatch("search", {
+            "query": "deployment rollback", "agent_id": "codex", "expand": False,
+        })
+        assert "error" not in resp
+        assert resp["result"]["count"] >= 1
+        assert recorded, "the formatted result set must record confidence"
+        ce, decay = recorded[0]
+        assert abs(decay - 0.5) < 1e-9
+        assert abs(ce - 2.0) < 1e-9, (
+            "confidence must get the raw logit; 1.0 here means the decayed "
+            "rerank_score leaked in and decay was applied twice"
+        )
+
+
+class TestVaultBackfillRefreshesWarmEngines:
+    """Round-2 finding 2: on_vectors covers the shared index only. A vault
+    engine memoized in _vault_retrieval_cache keeps its warm FAISS index, so
+    backfilled vault rows stayed invisible to semantic recall until restart.
+    The sweep must drop the per-vault cache when a vault gains vectors."""
+
+    def _sweep_with(self, monkeypatch, results):
+        import minni.backfill as backfill_mod
+        import minni.minnid as minnid
+
+        monkeypatch.setattr(
+            backfill_mod, "run_backfill_all_indexes", lambda *a, **kw: results
+        )
+        return minnid._backfill_sweep_once()
+
+    def test_vault_progress_clears_the_vault_retrieval_cache(self, monkeypatch):
+        import minni.minnid as minnid
+
+        minnid._vault_retrieval_cache["stale"] = ("engine", "codex", "db")
+        try:
+            self._sweep_with(monkeypatch, {
+                "shared": {"documents": {"documents": 0, "chunks": 0}},
+                "codex-vault": {"documents": {"documents": 2, "chunks": 5}},
+            })
+            assert not minnid._vault_retrieval_cache, (
+                "a vault that gained vectors must evict its warm cached "
+                "engine; on the old code the engine early-returned in "
+                "_ensure_faiss_loaded and the new rows never reached FAISS"
+            )
+        finally:
+            minnid._vault_retrieval_cache.clear()
+
+    def test_idle_sweep_keeps_the_warm_engines(self, monkeypatch):
+        """No vault progress → no eviction; warm engines are worth keeping."""
+        import minni.minnid as minnid
+
+        sentinel = ("engine", "codex", "db")
+        minnid._vault_retrieval_cache["warm"] = sentinel
+        try:
+            self._sweep_with(monkeypatch, {
+                "shared": {"documents": {"documents": 3, "chunks": 9}},
+                "codex-vault": {"documents": {"documents": 0, "chunks": 0}},
+                "broken-vault": {"error": "vault index unreadable"},
+            })
+            assert minnid._vault_retrieval_cache.get("warm") is sentinel, (
+                "shared-only progress (already covered by on_vectors) and "
+                "vault errors must not churn the vault engine cache"
+            )
+        finally:
+            minnid._vault_retrieval_cache.clear()
+
+
+class TestShortDocumentBackfill:
+    """Round-2 finding 3: content below the chunker's min_tokens chunked to
+    nothing and was skipped — but the row still matched the batch predicate,
+    so >=limit short docs re-wedged the LIMIT head (finding 2's stuck queue,
+    new predicate hole) AND short memories stayed vectorless forever while
+    index_durable_document embeds them as one whole-body chunk."""
+
+    def _stub_encoder(self, monkeypatch):
+        import minni.models as models
+
+        monkeypatch.setattr(models, "get_embedder", lambda: _StubEmbedder())
+
+    def test_short_document_gets_a_whole_body_vector(self, tmp_path, monkeypatch):
+        from minni.backfill import backfill_document_vectors
+
+        self._stub_encoder(monkeypatch)
+        db_obj, cfg = _make_db(tmp_path)
+        short = "the lock code is 4711"
+        with db_obj.cursor() as c:
+            c.execute(
+                "INSERT INTO documents (path, agent, sigil) "
+                "VALUES ('short.md', 'codex', 'vault')"
+            )
+            doc_id = c.lastrowid
+            c.execute(
+                "INSERT INTO vault_fts (doc_id, path, content, agent, sigil) "
+                "VALUES (?, 'short.md', ?, 'codex', 'vault')",
+                (doc_id, short),
+            )
+
+        stats = backfill_document_vectors(db_obj, cfg)
+        assert stats["documents"] == 1
+        assert stats["chunks"] == 1
+        assert stats["skipped_no_content"] == 0
+        with db_obj.cursor() as c:
+            row = c.execute(
+                "SELECT chunk_text FROM chunk_embeddings WHERE doc_id = ?",
+                (doc_id,),
+            ).fetchone()
+        assert row is not None and row["chunk_text"] == short, (
+            "the whole short body must be the embedded chunk, mirroring the "
+            "durable-path short-content floor"
+        )
+
+    def test_short_documents_cannot_wedge_the_drain(self, tmp_path, monkeypatch):
+        """Three sub-min_tokens docs ahead of a long one, limit=2: the old skip
+        left them matching every batch, so the long doc never entered one."""
+        from minni.backfill import backfill_document_vectors
+
+        self._stub_encoder(monkeypatch)
+        db_obj, cfg = _make_db(tmp_path)
+        long_body = "# Title\n\n" + ("the deployment rollback procedure. " * 40)
+        with db_obj.cursor() as c:
+            for i in range(3):
+                c.execute(
+                    "INSERT INTO documents (path, agent, sigil) VALUES (?, 'c', 'v')",
+                    (f"stub{i}.md",),
+                )
+                c.execute(
+                    "INSERT INTO vault_fts (doc_id, path, content, agent, sigil) "
+                    "VALUES (?, ?, ?, 'c', 'v')",
+                    (c.lastrowid, f"stub{i}.md", f"short decision stub {i}"),
+                )
+            c.execute(
+                "INSERT INTO documents (path, agent, sigil) "
+                "VALUES ('good.md', 'codex', 'vault')"
+            )
+            good_id = c.lastrowid
+            c.execute(
+                "INSERT INTO vault_fts (doc_id, path, content, agent, sigil) "
+                "VALUES (?, 'good.md', ?, 'codex', 'vault')",
+                (good_id, long_body),
+            )
+
+        # Two bounded passes must drain all four rows; on the old code every
+        # pass returned the same two short heads and made zero progress.
+        total = 0
+        for _ in range(2):
+            total += backfill_document_vectors(db_obj, cfg, limit=2)["documents"]
+        assert total == 4
+        with db_obj.cursor() as c:
+            n = c.execute(
+                "SELECT COUNT(*) AS n FROM chunk_embeddings WHERE doc_id = ?",
+                (good_id,),
+            ).fetchone()["n"]
+        assert n >= 1, "the recoverable long document must be reachable"

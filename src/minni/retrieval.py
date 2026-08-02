@@ -1242,7 +1242,17 @@ class RetrievalEngine:
 
     def _apply_rerank_score_adjustments(self, candidates: List[Dict]) -> None:
         """Both post-model adjustments, in the order the final_score leg
-        multiplies them. Single call site so the two legs cannot drift."""
+        multiplies them. Single call site so the two legs cannot drift.
+
+        grok-review round 2 (finding 1): preserve the model-pure logit as
+        raw_rerank_score BEFORE any adjustment. compute_confidence takes
+        decay_factor as its own input, so feeding it the decay-attenuated
+        rerank_score applies decay twice — biasing the HyDE trigger, the
+        calibration window (record=True), and provenance for aged docs.
+        Ranking sorts on the adjusted rerank_score; confidence and provenance
+        read raw_rerank_score."""
+        for c in candidates:
+            c["raw_rerank_score"] = float(c.get("rerank_score") or 0.0)
         self._apply_decay_rerank_attenuation(candidates)
         self._apply_correction_rerank_boost(candidates)
 
@@ -1697,7 +1707,11 @@ class RetrievalEngine:
                 "fts_rank": result.get("fts_rank"),
                 "semantic_rank": result.get("sem_rank"),
                 "rrf_score": result.get("rrf_score"),
-                "cross_encoder_score": result.get("rerank_score"),
+                # Raw logit: provenance also exposes decay_factor, so a
+                # consumer re-blending the two must not get a pre-decayed score.
+                "cross_encoder_score": result.get(
+                    "raw_rerank_score", result.get("rerank_score")
+                ),
                 "decay_factor": result.get("decay_score"),
                 "doc_id": result.get("doc_id"),
                 "chunk_id": result.get("chunk_id"),
@@ -2765,7 +2779,12 @@ class RetrievalEngine:
                         probe = dict(r)
                         probe["confidence"] = compute_confidence(
                             rrf_score=r.get("rrf_score"),
-                            cross_encoder_score=r.get("rerank_score"),
+                            # grok-review round 2: the raw logit — rerank_score
+                            # is already decay-attenuated and decay_factor is
+                            # passed separately below.
+                            cross_encoder_score=r.get(
+                                "raw_rerank_score", r.get("rerank_score")
+                            ),
                             decay_factor=r.get("decay_score"),
                             db=self.db,
                         )
@@ -2966,7 +2985,13 @@ class RetrievalEngine:
             try:
                 confidence = compute_confidence(
                     rrf_score=r.get("rrf_score"),
-                    cross_encoder_score=r.get("rerank_score"),
+                    # grok-review round 2: raw logit, not the decay-attenuated
+                    # rerank_score — decay_factor below already applies decay
+                    # once; the attenuated value would apply it twice and bias
+                    # the calibration window low for aged docs.
+                    cross_encoder_score=r.get(
+                        "raw_rerank_score", r.get("rerank_score")
+                    ),
                     decay_factor=r.get("decay_score"),
                     db=self.db,
                     # GA4-1: this is the one site that feeds the calibration
@@ -3008,7 +3033,11 @@ class RetrievalEngine:
                 "fts_rank": r.get("fts_rank"),
                 "semantic_rank": r.get("sem_rank"),
                 "rrf_score": r.get("rrf_score"),
-                "cross_encoder_score": r.get("rerank_score"),
+                # Raw logit: provenance also exposes decay_factor, so a
+                # consumer re-blending the two must not get a pre-decayed score.
+                "cross_encoder_score": r.get(
+                    "raw_rerank_score", r.get("rerank_score")
+                ),
                 "decay_factor": r.get("decay_score"),
                 "agent_origin": r.get("agent", ""),
                 "age_days": age_days,

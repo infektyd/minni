@@ -254,12 +254,23 @@ def backfill_document_vectors(
         try:
             chunks = chunker.chunk_document(content)
             if not chunks:
-                # Content that chunks to nothing (e.g. below min_tokens). Not a
-                # queue hazard — the row keeps matching the batch predicate, but
-                # counting it keeps the residue visible rather than letting the
-                # backfill look complete.
-                stats["skipped_no_content"] += 1
-                continue
+                # grok-review round 2 (finding 3): mirror the short-content
+                # floor of index_durable_document. Content below the chunker's
+                # min_tokens chunks to nothing, but the row still matches the
+                # batch predicate — skipping it both reopens the stuck-queue
+                # hazard (short rows hold the LIMIT head forever) and leaves
+                # short memories permanently vectorless while the live durable
+                # path embeds them as one whole-body chunk. Do the same here.
+                from minni.chunker import Chunk
+
+                chunks = [
+                    Chunk(
+                        text=content,
+                        heading="",
+                        heading_path="",
+                        chunk_index=0,
+                    )
+                ]
             # grok-review round 1 (finding 3): encode BEFORE opening the write
             # transaction. Encoding inside db.transaction() held BEGIN IMMEDIATE
             # across every model.encode call, so live recall writers blocked for
@@ -357,8 +368,11 @@ def run_backfill_all_indexes(
 
     ``on_vectors`` applies to the SHARED index only. Each vault has its own
     FAISS index behind its own RetrievalEngine, and handing the shared engine a
-    vault's chunk_ids would corrupt the mapping — vault indexes pick their new
-    rows up on their next load instead.
+    vault's chunk_ids would corrupt the mapping. grok-review round 2
+    (finding 2): "next load" alone is NOT enough on a warm daemon — cached
+    vault engines early-return in _ensure_faiss_loaded while count > 0 — so
+    the daemon caller must drop its per-vault engine cache whenever a vault
+    made progress (minnid._backfill_sweep_once does).
     """
     from minni.index_all import discover_agent_vaults
     from minni.vault_index import build_vault_index_config
