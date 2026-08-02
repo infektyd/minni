@@ -2448,3 +2448,183 @@ class TestCorrectionFloorReachesConfidence:
             f"confidence must see the floored decay {floor}, not the raw 0.01 "
             "that disagrees with both ranking legs"
         )
+
+
+# ---------------------------------------------------------------------------
+# grok-review round 6 — basis uniform within one response, calibration-blind
+# HyDE probe, provenance reports effective decay
+# ---------------------------------------------------------------------------
+
+class TestBasisIsUniformWithinOneResponse:
+    """Round-6 finding 1: recording and calibrating row-by-row let the window
+    cross _ACTIVATION_THRESHOLD mid-response — hit 1 served raw_blend, hits
+    2..n percentile_rank, in one payload. Recording now completes for every
+    final row before any row is calibrated."""
+
+    def test_mid_response_activation_cannot_split_the_basis(
+        self, tmp_path, monkeypatch, hermetic_principals
+    ):
+        from minni.scoring import _ACTIVATION_THRESHOLD
+
+        _engine, db_obj, _cfg = _patch_engine_and_writeback(tmp_path, monkeypatch)
+        body = "the deployment rollback procedure is documented here. "
+        with db_obj.cursor() as c:
+            for i in range(3):
+                c.execute(
+                    "INSERT INTO documents (path, agent, sigil, layer) "
+                    "VALUES (?, 'codex', 'vault', 'knowledge')",
+                    (f"doc{i}.md",),
+                )
+                doc_id = c.lastrowid
+                c.execute(
+                    "INSERT INTO vault_fts (doc_id, path, content, agent, sigil) "
+                    "VALUES (?, ?, ?, 'codex', 'vault')",
+                    (doc_id, f"doc{i}.md", body * (20 + i)),
+                )
+            # threshold - 2: recording the first final row leaves the window
+            # one short of activation; the second row crosses it mid-response.
+            for _ in range(_ACTIVATION_THRESHOLD - 2):
+                c.execute(
+                    "INSERT INTO score_distribution (raw_score, kind, created_at) "
+                    "VALUES (0.0, 'combined', ?)",
+                    (time.time(),),
+                )
+
+        resp = _dispatch("search", {
+            "query": "deployment rollback", "agent_id": "codex", "expand": False,
+        })
+        assert "error" not in resp
+        results = resp["result"]["results"]
+        assert len(results) >= 3, "the pin needs enough hits to cross mid-response"
+        confidences = [r["confidence"] for r in results]
+        assert all(c is not None and c >= 0.8 for c in confidences), (
+            f"every confidence must be calibrated against the same post-record "
+            f"window; got {confidences} — a sub-0.8 value is a row that was "
+            "calibrated before the window crossed the activation threshold "
+            "(raw_blend) while later rows in the SAME response got percentile "
+            "ranks"
+        )
+
+
+class TestHydeProbeIsCalibrationBlind:
+    """Round-6 finding 2: the HyDE probe calibrated per-engine (db=self.db),
+    so shared-window activation silently retuned when HyDE fires — the
+    hyde_confidence_floor is tuned for raw blends — while vault engines kept
+    comparing raw. A speculative trigger must not depend on calibration
+    semantics, the same rule that keeps it record-free."""
+
+    def test_probe_confidence_never_sees_a_calibration_db(
+        self, tmp_path, monkeypatch
+    ):
+        import minni.hyde as hyde
+        import minni.scoring as scoring
+        from minni.retrieval import RetrievalEngine
+
+        db_obj, cfg = _make_db(tmp_path, reranker_enabled=False,
+                               hyde_enabled=True)
+        monkeypatch.setattr(RetrievalEngine, "model", property(lambda self: None))
+        engine = RetrievalEngine(db_obj, cfg, faiss_index=object())
+        body = "the deployment rollback procedure is documented here. " * 20
+        with db_obj.cursor() as c:
+            c.execute(
+                "INSERT INTO documents (path, agent, sigil, layer) "
+                "VALUES ('a.md', 'codex', 'vault', 'knowledge')"
+            )
+            doc_id = c.lastrowid
+            c.execute(
+                "INSERT INTO vault_fts (doc_id, path, content, agent, sigil) "
+                "VALUES (?, 'a.md', ?, 'codex', 'vault')",
+                (doc_id, body),
+            )
+
+        probed = []
+        monkeypatch.setattr(
+            hyde, "should_trigger_hyde",
+            lambda results, **kw: (probed.append(len(results)), False)[1],
+        )
+        real = scoring.compute_confidence
+        dbs_seen = []
+
+        def _spy(rrf_score=None, cross_encoder_score=None, decay_factor=None,
+                 db=None, record=False):
+            dbs_seen.append(db)
+            return real(rrf_score, cross_encoder_score, decay_factor, db=db,
+                        record=record)
+
+        monkeypatch.setattr(scoring, "compute_confidence", _spy)
+
+        out = engine.retrieve(query="deployment rollback", expand=False)
+        assert out, "the pin needs at least one hit for the probe to score"
+        assert probed and probed[0] >= 1, "the HyDE probe must have run"
+        assert dbs_seen and all(db is None for db in dbs_seen), (
+            "the speculative HyDE probe must compute raw blends only; a "
+            "non-None db means activation of that engine's window silently "
+            "retunes when HyDE fires"
+        )
+
+
+class TestProvenanceReportsEffectiveDecay:
+    """Round-6 finding 3: ranking, confidence, and the recorded calibration
+    sample all use the floored decay_applied, but provenance still reported
+    the raw decay_score — 0.01 on a correction every leg treated as 0.5."""
+
+    def test_provenance_decay_factor_matches_the_ranking_legs(
+        self, tmp_path, monkeypatch, hermetic_principals
+    ):
+        _engine, db_obj, cfg = _patch_engine_and_writeback(tmp_path, monkeypatch)
+        correction_type = sorted(_engine._correction_types)[0]
+        body = "the deployment rollback procedure is documented here. " * 20
+        with db_obj.cursor() as c:
+            c.execute(
+                "INSERT INTO documents (path, agent, sigil, layer, decay_score, "
+                "page_type) VALUES ('c.md', 'codex', 'vault', 'knowledge', 0.01, ?)",
+                (correction_type,),
+            )
+            doc_id = c.lastrowid
+            c.execute(
+                "INSERT INTO vault_fts (doc_id, path, content, agent, sigil) "
+                "VALUES (?, 'c.md', ?, 'codex', 'vault')",
+                (doc_id, body),
+            )
+
+        resp = _dispatch("search", {
+            "query": "deployment rollback", "agent_id": "codex",
+            "expand": False, "depth": "chunk",
+        })
+        assert "error" not in resp
+        results = resp["result"]["results"]
+        assert results
+        floor = float(cfg.correction_decay_floor)
+        for r in results:
+            assert r["provenance"]["decay_factor"] == pytest.approx(floor), (
+                "provenance must report the effective decay every leg used, "
+                "not the raw 0.01 the floor overrode"
+            )
+
+    def test_headline_decay_factor_matches_too(self, tmp_path, monkeypatch,
+                                               hermetic_principals):
+        _engine, db_obj, cfg = _patch_engine_and_writeback(tmp_path, monkeypatch)
+        correction_type = sorted(_engine._correction_types)[0]
+        body = "the deployment rollback procedure is documented here. " * 20
+        with db_obj.cursor() as c:
+            c.execute(
+                "INSERT INTO documents (path, agent, sigil, layer, decay_score, "
+                "page_type) VALUES ('c.md', 'codex', 'vault', 'knowledge', 0.01, ?)",
+                (correction_type,),
+            )
+            doc_id = c.lastrowid
+            c.execute(
+                "INSERT INTO vault_fts (doc_id, path, content, agent, sigil) "
+                "VALUES (?, 'c.md', ?, 'codex', 'vault')",
+                (doc_id, body),
+            )
+        resp = _dispatch("search", {
+            "query": "deployment rollback", "agent_id": "codex",
+            "expand": False, "depth": "headline",
+        })
+        assert "error" not in resp
+        results = resp["result"]["results"]
+        assert results
+        floor = float(cfg.correction_decay_floor)
+        for r in results:
+            assert r["decay_factor"] == pytest.approx(floor)

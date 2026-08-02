@@ -182,6 +182,22 @@ def _page_type_to_authority(page_type: Optional[str], agent: str) -> Optional[st
 _correction_class_page_types = correction_class_page_types
 
 
+def _effective_decay(r: Dict, fallback: Optional[float] = None) -> Optional[float]:
+    """The decay the ranking and confidence legs actually used.
+
+    grok-review round 6 (finding 3): decay_applied carries the correction
+    floor + clamp both scoring legs apply (_score_merged_doc and
+    _apply_decay_rerank_attenuation). Provenance must report that value, not
+    the raw decay_score column — a correction floored to 0.5 that provenance
+    reports as 0.01 is a lie to any consumer re-blending the fields. `is not
+    None` checks, not `or`: a legitimate 0.0 decay must survive.
+    """
+    for value in (r.get("decay_applied"), r.get("decay_score"), fallback):
+        if value is not None:
+            return value
+    return None
+
+
 def _path_to_wikilink(path: str) -> Optional[str]:
     """Convert an absolute path to a [[wikilink]] style reference."""
     if not path:
@@ -1690,7 +1706,7 @@ class RetrievalEngine:
                 "confidence": result.get("confidence"),
                 "age_days": result.get("age_days"),
                 "layer": result.get("layer"),
-                "decay_factor": result.get("decay_score") or result.get("decay_factor"),
+                "decay_factor": _effective_decay(result, result.get("decay_factor")),
                 "privacy_level": result.get("privacy_level"),
                 "review_state": result.get("review_state"),
                 "instruction_like": result.get("instruction_like"),
@@ -1734,7 +1750,11 @@ class RetrievalEngine:
                 "cross_encoder_score": result.get(
                     "raw_rerank_score", result.get("rerank_score")
                 ),
-                "decay_factor": result.get("decay_score"),
+                # round 6 (finding 3): the EFFECTIVE decay ranking/confidence
+                # used (correction floor + clamp), or provenance lies for
+                # correction-class docs (reports 0.01 while everything ranked
+                # on 0.5).
+                "decay_factor": _effective_decay(result),
                 "doc_id": result.get("doc_id"),
                 "chunk_id": result.get("chunk_id"),
                 "agent_origin": result.get("agent", ""),
@@ -2827,7 +2847,14 @@ class RetrievalEngine:
                             decay_factor=r.get(
                                 "decay_applied", r.get("decay_score")
                             ),
-                            db=self.db,
+                            # round 6 (finding 2): raw blend ONLY. Calibrating
+                            # against self.db meant shared-window activation
+                            # silently retuned when HyDE fires (the floor is
+                            # tuned for raw blends) while vault engines kept
+                            # comparing raw — a speculative trigger must not
+                            # depend on calibration semantics, same rule as
+                            # record.
+                            db=None,
                         )
                         probe_results.append(probe)
 
@@ -3101,7 +3128,12 @@ class RetrievalEngine:
                 "cross_encoder_score": r.get(
                     "raw_rerank_score", r.get("rerank_score")
                 ),
-                "decay_factor": r.get("decay_score"),
+                # round 6 (finding 3): the EFFECTIVE decay ranking and
+                # confidence used (correction floor + clamp) — reporting the
+                # raw 0.01 while every leg ranked on 0.5 made provenance lie
+                # for correction-class docs. The raw column stays available as
+                # decay_score on the full-depth envelope.
+                "decay_factor": _effective_decay(r),
                 "agent_origin": r.get("agent", ""),
                 "age_days": age_days,
                 "doc_id": r["doc_id"],
@@ -3134,6 +3166,10 @@ class RetrievalEngine:
                 "rrf_score": r.get("rrf_score"),
                 "rerank_score": r.get("rerank_score"),
                 "decay_score": r.get("decay_score"),
+                # round 6 (finding 3): carry the effective decay so
+                # _apply_depth's headline decay_factor reports what the legs
+                # actually used, not the raw column.
+                "decay_applied": r.get("decay_applied"),
                 "layer": r.get("layer", "knowledge"),
                 "chunk_text": chunk_text,
                 "heading_context": r.get("heading_context", ""),

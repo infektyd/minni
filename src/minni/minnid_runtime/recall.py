@@ -329,6 +329,13 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
         try:
             from minni.scoring import calibrated_confidence, record_score
 
+            # grok-review round 6 (finding 1): TWO passes. Recording and
+            # calibrating row-by-row let the window cross
+            # _ACTIVATION_THRESHOLD mid-response — hit 1 served raw_blend,
+            # hits 2..n percentile_rank, inside one payload. Record everything
+            # first, then calibrate every row against the same post-record
+            # window so the whole response shares one basis.
+            recorded: list = []
             for r in results:
                 if not isinstance(r, dict):
                     continue
@@ -337,12 +344,16 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
                     continue
                 try:
                     record_score(float(raw_score), "combined", engine.db)
-                    if r.get("confidence") is not None:
-                        r["confidence"] = calibrated_confidence(
-                            raw_score, engine.db
-                        )
+                    recorded.append((r, float(raw_score)))
                 except Exception as exc:
                     context.logger.debug("search: score record failed: %s", exc)
+            for r, raw_score in recorded:
+                if r.get("confidence") is None:
+                    continue
+                try:
+                    r["confidence"] = calibrated_confidence(raw_score, engine.db)
+                except Exception as exc:
+                    context.logger.debug("search: calibration failed: %s", exc)
         except Exception as exc:
             context.logger.warning("search: score recording failed: %s", exc)
 
