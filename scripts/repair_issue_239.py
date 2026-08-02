@@ -20,6 +20,12 @@ this CLI after ``candidate_packets`` rebuilds (e.g. migration 015).
   python3 scripts/repair_issue_239.py --apply --prune-index --vault /path/to/vault
   python3 scripts/repair_issue_239.py --db /path/to/minni.db --apply
 
+Exit codes:
+  0  success (dry-run always; apply when dual repair ran and index ok/skipped)
+  2  database file not found
+  3  --apply requested inbox UNIQUE index but status is blocked/error
+     (status not in {exists, created, skipped})
+
 Never touches ``learnings``. See ``minni.repair_dual_candidates`` for the
 winner rule and virtual-``_durable`` policy.
 """
@@ -209,6 +215,23 @@ def main(argv: list[str] | None = None) -> int:
             print("  (re-run with --apply to mutate dual candidates)")
             if not args.prune_index:
                 print("  (add --prune-index only if you intend document prune)")
+
+    # --apply + index requested: surface blocked/error so automation does not
+    # treat prevention as complete when the UNIQUE backstop was not installed.
+    if args.apply and not args.no_index:
+        idx_status = str(
+            (result.get("inbox_dedup_index") or {}).get("status") or ""
+        )
+        if idx_status not in {"exists", "created", "skipped"}:
+            if not args.json:
+                print(
+                    f"ERROR: inbox dedup index status={idx_status!r} "
+                    f"(expected exists|created|skipped); UNIQUE backstop not "
+                    f"installed. Resolve residual app-key collisions / "
+                    f"needs-operator groups and re-run --apply.",
+                    file=sys.stderr,
+                )
+            return 3
     return 0
 
 

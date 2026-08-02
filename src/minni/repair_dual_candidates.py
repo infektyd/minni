@@ -378,7 +378,10 @@ def find_duplicate_candidate_groups(db) -> List[Dict[str, Any]]:
         if summary["collapse_action"] != "collapse":
             continue
         # Skip groups where collapse would delete nothing (e.g. dual accepted).
-        if not summary["loser_ids"] and not summary.get("row_count", 0) > 1:
+        # Empty loser_ids alone is enough — groups always have row_count >= 2
+        # from _byte_identical_row_groups, so a row_count>1 conjunct was dead
+        # (comparison binds tighter than not) and never skipped dual accepted.
+        if not summary["loser_ids"]:
             continue
         out.append(summary)
     out.sort(key=lambda g: (g["winner_id"] is None, g["winner_id"] or 0))
@@ -1302,6 +1305,43 @@ def repair_index_disk_divergence(
     }
 
 
+def _dry_run_inbox_dedup_index_status(db) -> Dict[str, Any]:
+    """Preflight UNIQUE index without CREATE — exists / would_create / would_block."""
+    index_name = INBOX_DEDUP_INDEX
+    with db.cursor() as c:
+        c.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='index' AND name=? LIMIT 1",
+            (index_name,),
+        )
+        if c.fetchone():
+            return {"status": "exists", "index": index_name, "dry_run": True}
+    collisions = find_app_key_collisions(db)
+    if collisions:
+        return {
+            "status": "would_block",
+            "index": index_name,
+            "dry_run": True,
+            "app_key_collisions": len(collisions),
+            "byte_identical_groups": sum(
+                1 for g in collisions if g.get("byte_identical")
+            ),
+            "divergent_groups": sum(
+                1 for g in collisions if not g.get("byte_identical")
+            ),
+            "sample": [
+                {
+                    "key": g["key"],
+                    "row_count": g["row_count"],
+                    "candidate_ids": g["candidate_ids"][:8],
+                    "content_sha1s": g["content_sha1s"][:8],
+                    "byte_identical": g["byte_identical"],
+                }
+                for g in collisions[:5]
+            ],
+        }
+    return {"status": "would_create", "index": index_name, "dry_run": True}
+
+
 def run_full_repair(
     db,
     *,
@@ -1348,7 +1388,9 @@ def run_full_repair(
     if create_index and not dry_run:
         index_status = ensure_inbox_dedup_index(db)
     elif create_index and dry_run:
-        index_status = {"status": "would_create_if_clean", "dry_run": True}
+        # Preflight without mutating: report exists / would_create / would_block
+        # so operators don't assume the UNIQUE backstop is installable.
+        index_status = _dry_run_inbox_dedup_index_status(db)
     return {
         "dual_candidates": dual,
         "index_disk": index,

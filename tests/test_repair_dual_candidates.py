@@ -301,6 +301,79 @@ def test_ensure_inbox_dedup_index_blocks_divergent_app_key(tmp_path):
         assert c.fetchone() is None
 
 
+def test_dry_run_index_preflight_reports_would_block(tmp_path):
+    """Low: dry-run must not always claim would_create_if_clean when blocked."""
+    from minni.repair_dual_candidates import run_full_repair
+
+    db, _cfg = _make_db(tmp_path)
+    _insert_candidate(
+        db, content="body alpha", status="accepted", inbox_file="div.json"
+    )
+    _insert_candidate(
+        db,
+        content="body beta different",
+        status="rejected",
+        inbox_file="div.json",
+    )
+
+    result = run_full_repair(db, dry_run=True, create_index=True)
+    idx = result["inbox_dedup_index"]
+    assert idx["status"] == "would_block"
+    assert idx.get("dry_run") is True
+    assert idx.get("app_key_collisions", 0) >= 1
+    assert idx.get("sample")
+
+
+def test_dry_run_index_preflight_reports_would_create_when_clean(tmp_path):
+    from minni.repair_dual_candidates import run_full_repair
+
+    db, _cfg = _make_db(tmp_path)
+    _insert_candidate(db, content="solo clean row", status="accepted")
+
+    result = run_full_repair(db, dry_run=True, create_index=True)
+    idx = result["inbox_dedup_index"]
+    assert idx["status"] == "would_create"
+    assert idx.get("dry_run") is True
+
+
+def test_cli_exits_nonzero_when_apply_index_blocked(tmp_path):
+    """Medium #2: --apply must not exit 0 when UNIQUE index is blocked/error."""
+    import importlib.util
+    from pathlib import Path
+
+    script = (
+        Path(__file__).resolve().parents[1] / "scripts" / "repair_issue_239.py"
+    )
+    spec = importlib.util.spec_from_file_location("repair_issue_239_cli", script)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    db, cfg = _make_db(tmp_path)
+    # Divergent app-key peers: dual repair is a no-op; index stays blocked.
+    _insert_candidate(
+        db, content="body alpha", status="accepted", inbox_file="div.json"
+    )
+    _insert_candidate(
+        db,
+        content="body beta different",
+        status="rejected",
+        inbox_file="div.json",
+    )
+    if hasattr(db, "close"):
+        try:
+            db.close()
+        except Exception:
+            pass
+
+    rc = mod.main(["--db", cfg.db_path, "--apply"])
+    assert rc == 3
+
+    # --no-index: dual repair alone may succeed with exit 0.
+    rc_skip = mod.main(["--db", cfg.db_path, "--apply", "--no-index"])
+    assert rc_skip == 0
+
+
 def test_virtual_durable_not_flagged_missing_when_fts_present(tmp_path):
     from minni.repair_dual_candidates import (
         find_missing_document_rows,
@@ -935,8 +1008,15 @@ def test_in_txn_revalidate_keeps_accepted_promoted_under_stale_plan(
 
 
 def test_never_deletes_accepted_when_two_accepted(tmp_path):
-    """Hard guard: status=accepted is never hard-deleted as a loser."""
-    from minni.repair_dual_candidates import repair_duplicate_candidate_pairs
+    """Hard guard: status=accepted is never hard-deleted as a loser.
+
+    Medium pin: dual accepted has empty loser_ids — must not appear in
+    collapsible groups (dead skip guard used to always no-op).
+    """
+    from minni.repair_dual_candidates import (
+        find_duplicate_candidate_groups,
+        repair_duplicate_candidate_pairs,
+    )
 
     db, _cfg = _make_db(tmp_path)
     content = "two accepted twins"
@@ -944,13 +1024,29 @@ def test_never_deletes_accepted_when_two_accepted(tmp_path):
     b = _insert_candidate(db, content=content, status="accepted")
     assert a < b
 
+    # Empty losers → not a collapsible group (reporting noise fixed).
+    assert find_duplicate_candidate_groups(db) == []
+
     result = repair_duplicate_candidate_pairs(db, dry_run=False)
     # collapse keeps lowest accepted; extra accepted is never deleted.
     assert result["deleted"] == 0
+    assert result["groups_found"] == 0
+    assert result["would_delete"] == 0
     with db.cursor() as c:
         c.execute("SELECT candidate_id FROM candidate_packets ORDER BY candidate_id")
         ids = [dict(r)["candidate_id"] for r in c.fetchall()]
     assert ids == [a, b]
+
+
+def test_empty_loser_ids_skipped_from_collapsible_groups(tmp_path):
+    """Medium #1: empty loser_ids alone skips (no dead row_count conjunct)."""
+    from minni.repair_dual_candidates import find_duplicate_candidate_groups
+
+    db, _cfg = _make_db(tmp_path)
+    content = "accepted pair only"
+    _insert_candidate(db, content=content, status="accepted")
+    _insert_candidate(db, content=content, status="accepted")
+    assert find_duplicate_candidate_groups(db) == []
 
 
 def test_rejected_plus_proposed_needs_operator_no_delete(tmp_path):
