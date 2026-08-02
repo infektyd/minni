@@ -134,3 +134,17 @@ def test_claude_code_is_absent_from_the_all_expansion():
     assert "codex" in propagate.ALL_SKIPS
     assert "claude-code" in propagate.ALL_SKIPS
     assert "cursor" in propagate.ALL_PLATFORMS
+
+
+def test_toml_basic_str_escapes_control_chars():
+    """Propagate escaper must match wire: raw newlines cannot break TOML strings."""
+    import importlib.util
+    from pathlib import Path
+    p = Path(__file__).resolve().parent / "propagate.py"
+    spec = importlib.util.spec_from_file_location("_prop_toml", p)
+    mod = importlib.util.module_from_spec(spec)
+    assert spec and spec.loader
+    spec.loader.exec_module(mod)
+    escaped = mod._toml_basic_str("a\nb")
+    assert "\\n" in escaped
+    assert "\n" not in escaped

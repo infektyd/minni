@@ -283,3 +283,12 @@ def test_deploy_probe_hard_fails_null_stale_for_editable():
     assert 'install_kind") == "wheel"' in text
     assert "expected boolean for editable checkout" in text
     assert "sys.exit(3)" in text
+
+
+def test_kickstart_failure_not_misdiagnosed_as_not_loaded():
+    """Kickstart failure and agent-not-loaded must use distinct refuse text."""
+    text = SCRIPT.read_text(encoding="utf-8")
+    assert "DAEMON_NOT_LOADED" in text
+    assert "DAEMON_RESTART_FAILED" in text
+    assert "launchctl kickstart failed (agent" in text
+    assert "DAEMON_MISSING" not in text or text.count("DAEMON_MISSING") == 0

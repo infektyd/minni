@@ -160,6 +160,7 @@ def _plugin_dist_status(checkout_head: Optional[str]) -> dict:
     if not roots:
         return {"stale": None, "reason": "no wire-managed plugin payload found"}
     lagging: list[str] = []
+    unreadable: list[str] = []
     first_sha = "unknown"
     first_ver = "unknown"
     hows: list[str] = []
@@ -170,15 +171,15 @@ def _plugin_dist_status(checkout_head: Optional[str]) -> dict:
                 (root / "payload-manifest.json").read_text(encoding="utf-8")
             )
         except (OSError, json.JSONDecodeError) as exc:
-            return {
-                "stale": None,
-                "resolved_via": ",".join(hows),
-                "reason": f"payload-manifest unreadable: {type(exc).__name__}",
-            }
+            # Do not discard lag evidence from peers already inspected.
+            unreadable.append(f"{root.name} via {how}: {type(exc).__name__}")
+            continue
         dist_sha = str(manifest.get("git_sha") or "unknown")
-        if first_sha == "unknown":
+        if first_sha == "unknown" and dist_sha != "unknown":
             first_sha = dist_sha
             first_ver = str(manifest.get("version") or "unknown")
+        elif first_sha == "unknown":
+            first_ver = str(manifest.get("version") or first_ver)
         if checkout_head is not None and dist_sha not in ("unknown", checkout_head):
             lagging.append(f"{root.name}@{dist_sha[:12]} via {how}")
     out: dict = {
@@ -187,16 +188,29 @@ def _plugin_dist_status(checkout_head: Optional[str]) -> dict:
         "resolved_via": ",".join(hows),
         "active_roots": len(roots),
     }
-    if checkout_head is None or first_sha == "unknown":
-        out["stale"] = None
-        out["reason"] = "no checkout HEAD or manifest sha to compare against"
-    elif lagging:
+    # Known lag always wins over "unmeasurable" — any proven lagging root is
+    # stale even when a peer has unknown/unreadable sha.
+    if lagging:
         out["stale"] = True
         out["lagging"] = lagging
-        out["reason"] = (
-            f"active wire root(s) lag checkout HEAD {checkout_head[:12]}: "
+        reason = (
+            f"active wire root(s) lag checkout HEAD "
+            f"{(checkout_head or 'unknown')[:12]}: "
             f"{'; '.join(lagging)} — re-run `minni wire all` / `make sync-root`"
         )
+        if unreadable:
+            reason += f"; also unreadable: {'; '.join(unreadable)}"
+            out["unreadable"] = unreadable
+        out["reason"] = reason
+    elif unreadable:
+        out["stale"] = None
+        out["unreadable"] = unreadable
+        out["reason"] = (
+            "payload-manifest unreadable: " + "; ".join(unreadable)
+        )
+    elif checkout_head is None or first_sha == "unknown":
+        out["stale"] = None
+        out["reason"] = "no checkout HEAD or manifest sha to compare against"
     else:
         out["stale"] = False
     return out

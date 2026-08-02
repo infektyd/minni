@@ -335,3 +335,76 @@ def test_status_surface_carries_deploy_block(monkeypatch, tmp_path):
     deploy = resp["result"]["daemon"]["deploy"]
     assert "stale" in deploy
     assert deploy["install_kind"] == "wheel"
+
+
+def test_plugin_dist_unknown_first_plus_lagging_is_stale(checkout, monkeypatch, tmp_path):
+    """Known lag must not be masked by a peer with unknown git_sha."""
+    import json as _json
+
+    home = tmp_path / "home"
+    plugin = home / ".minni" / "plugin"
+    head = _git(checkout, "rev-parse", "HEAD")
+    unk = plugin / "0.4.1+git.unknown"
+    lag = plugin / "0.4.0"
+    unk.mkdir(parents=True)
+    lag.mkdir(parents=True)
+    (unk / "payload-manifest.json").write_text(
+        _json.dumps({"version": "0.4.1+git.unknown"}), encoding="utf-8",
+    )
+    (lag / "payload-manifest.json").write_text(
+        _json.dumps({"git_sha": "0" * 40, "version": "0.4.0"}), encoding="utf-8",
+    )
+    (plugin / "wired.json").write_text(
+        _json.dumps({
+            "schema": 1,
+            "wires": [
+                {"platform": "antigravity", "install_root": str(unk),
+                 "wired_at": "2026-08-02T00:00:00Z"},
+                {"platform": "codex", "install_root": str(lag),
+                 "wired_at": "2026-08-02T01:00:00Z"},
+            ],
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(deploy_honesty, "_source_checkout", lambda: checkout)
+    deploy_honesty.capture_start_state()
+    out = deploy_honesty.deploy_status()
+    assert out["plugin_dist"]["stale"] is True, out["plugin_dist"]
+    assert out["stale"] is True, out
+
+
+def test_plugin_dist_unreadable_peer_keeps_lag_evidence(checkout, monkeypatch, tmp_path):
+    """Unreadable peer must not discard lag already proven on another root."""
+    import json as _json
+
+    home = tmp_path / "home"
+    plugin = home / ".minni" / "plugin"
+    head = _git(checkout, "rev-parse", "HEAD")
+    lag = plugin / "0.4.0"
+    bad = plugin / "0.4.1+git.broken"
+    lag.mkdir(parents=True)
+    bad.mkdir(parents=True)
+    (lag / "payload-manifest.json").write_text(
+        _json.dumps({"git_sha": "0" * 40, "version": "0.4.0"}), encoding="utf-8",
+    )
+    (bad / "payload-manifest.json").write_text("{not-json", encoding="utf-8")
+    (plugin / "wired.json").write_text(
+        _json.dumps({
+            "schema": 1,
+            "wires": [
+                {"platform": "claude-code", "install_root": str(lag),
+                 "wired_at": "2026-08-02T00:00:00Z"},
+                {"platform": "codex", "install_root": str(bad),
+                 "wired_at": "2026-08-02T01:00:00Z"},
+            ],
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(deploy_honesty, "_source_checkout", lambda: checkout)
+    deploy_honesty.capture_start_state()
+    out = deploy_honesty.deploy_status()
+    assert out["plugin_dist"]["stale"] is True, out["plugin_dist"]
+    assert out["plugin_dist"].get("lagging"), out["plugin_dist"]
+    assert out["stale"] is True

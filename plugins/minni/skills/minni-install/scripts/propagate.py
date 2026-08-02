@@ -1204,9 +1204,26 @@ def update_agy_plugin_hooks(install_root: Path) -> dict[str, object]:
 
 def _toml_basic_str(value: object) -> str:
     # Escape a value for embedding in a TOML basic (double-quoted) string.
-    # Critically: backslashes must be doubled first, else Windows paths like
-    # C:\Users\... are read back as invalid TOML escape sequences.
-    return str(value).replace("\\", "\\\\").replace('"', '\\"')
+    # Match wire/writers.py: backslashes first, then quotes, then control
+    # characters so a corrupt/hostile MINNI_WORKSPACE_ID cannot break out of
+    # the string or inject TOML sections on preserve rewrite.
+    out: list[str] = []
+    for ch in str(value):
+        if ch == "\\":
+            out.append("\\\\")
+        elif ch == '"':
+            out.append('\\"')
+        elif ch == "\n":
+            out.append("\\n")
+        elif ch == "\t":
+            out.append("\\t")
+        elif ch == "\r":
+            out.append("\\r")
+        elif ord(ch) < 0x20 or ord(ch) == 0x7F:
+            out.append(f"\\u{ord(ch):04X}")
+        else:
+            out.append(ch)
+    return "".join(out)
 
 
 def update_toml_mcp_config(path: Path, server_path: Path, agent: str, vault: Path, socket_path: Path, workspace: Path, explicit_workspace: bool = False, afm_env: dict[str, str] | None = None) -> None:

@@ -275,7 +275,8 @@ say "step 5/6: restart minnid"
 LABEL="com.minni.minnid"
 SOCKET="${MINNI_SOCKET:-$HOME/.minni/run/minnid.sock}"
 DAEMON_RESTARTED=0
-DAEMON_MISSING=0
+DAEMON_NOT_LOADED=0
+DAEMON_RESTART_FAILED=0
 if launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; then
   # kickstart must not abort under set -e before step 6 — a failed bounce
   # still needs version/deployment verify (same as the missing-agent path).
@@ -285,14 +286,14 @@ if launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; then
   elif launchctl kickstart -k "gui/$(id -u)/$LABEL"; then
     DAEMON_RESTARTED=1
   else
-    echo "update-root: launchctl kickstart failed — continuing to verify (will not report sync complete)" >&2
-    DAEMON_MISSING=1
+    echo "update-root: launchctl kickstart failed (agent is loaded) — will probe existing socket and continue verify (will not report sync complete)" >&2
+    DAEMON_RESTART_FAILED=1
   fi
 else
   # Still run step 6 (versions + D14 deployment gates) so the operator sees
   # WORKTREE/BADCONFIG from this run. Do NOT claim "sync complete" later —
   # checkout/plugin trees may be current while minnid still runs pre-sync code.
-  DAEMON_MISSING=1
+  DAEMON_NOT_LOADED=1
   if [ "$DRY_RUN" = 1 ]; then
     echo "would fail: launchd agent $LABEL is not loaded — daemon would not be restarted"
   else
@@ -330,10 +331,11 @@ else
   fi
 fi
 
-# After a real restart, require the socket to answer and report known-stale
-# is not True. Unmeasurable (None) is a soft warning — kickstart can race
-# slow imports. Skip under dry-run (kickstart was not executed).
-if [ "$DRY_RUN" != 1 ] && [ "$DAEMON_RESTARTED" = 1 ]; then
+# After a real restart (or a failed kickstart with agent still loaded), require
+# the socket to answer and report known-stale is not True. For editable
+# checkouts, unmeasurable stale hard-fails; wheel installs soft-ok. Skip under
+# dry-run (kickstart was not executed).
+if [ "$DRY_RUN" != 1 ] && { [ "$DAEMON_RESTARTED" = 1 ] || [ "$DAEMON_RESTART_FAILED" = 1 ]; }; then
   say "step 6b: probe daemon deploy honesty after restart"
   if ! "$VENV_PY" - "$SOCKET" <<'PY'
 import json, socket, sys, time
@@ -414,8 +416,8 @@ fi
 # verify all succeeded. Dry-run exits non-zero only when the *plan* would fail
 # (e.g. launchd agent not loaded) — not because pre-sync hygiene is dirty.
 if [ "$DRY_RUN" = 1 ]; then
-  if [ "$DAEMON_MISSING" = 1 ]; then
-    echo "dry-run plan would FAIL (daemon would not be restarted)" >&2
+  if [ "$DAEMON_NOT_LOADED" = 1 ]; then
+    echo "dry-run plan would FAIL (launchd agent not loaded — daemon would not be restarted)" >&2
     exit 1
   fi
   say "dry-run plan complete (no changes applied; current-state checkers are informational)"
@@ -430,8 +432,12 @@ if [ "$VERIFY_EXIT" != 0 ]; then
   refuse "verification failed after redeploy"
 fi
 
-if [ "$DAEMON_MISSING" = 1 ]; then
+if [ "$DAEMON_NOT_LOADED" = 1 ]; then
   refuse "redeployed and verified, but daemon was not restarted (launchd agent $LABEL not loaded) — bounce minnid yourself"
+fi
+
+if [ "$DAEMON_RESTART_FAILED" = 1 ]; then
+  refuse "redeployed and verified, but launchctl kickstart failed (agent $LABEL is loaded) — bounce minnid yourself; deploy probe above reports whether the still-running process is stale"
 fi
 
 say "sync complete at $(git rev-parse --short HEAD)"
