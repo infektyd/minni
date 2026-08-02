@@ -327,6 +327,8 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
         # into the SHARED window and rewrites its confidence onto that one
         # basis, then pops the carrier so the transport surface is unchanged.
         try:
+            from minni.rationale import explain
+            from minni.retrieval import _recommended_action
             from minni.scoring import calibrated_confidence, record_score
 
             # grok-review round 6 (finding 1): TWO passes. Recording and
@@ -354,6 +356,32 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
                     r["confidence"] = calibrated_confidence(raw_score, engine.db)
                 except Exception as exc:
                     context.logger.debug("search: calibration failed: %s", exc)
+                    continue
+                # grok-review round 8 (finding 1): formatting freezes
+                # recommended_action and rationale from the PRE-calibration
+                # blend. Rewriting confidence alone left the envelope
+                # disagreeing with itself after activation — e.g. confidence
+                # 0.85 with recommended_action "follow_up" and rationale
+                # "…; confidence 0.15.". Re-derive anything that consumed the
+                # old value so one payload has one meaning of confidence.
+                if "recommended_action" in r:
+                    try:
+                        r["recommended_action"] = _recommended_action(
+                            r.get("review_state"),
+                            r.get("instruction_like"),
+                            r.get("confidence"),
+                        )
+                    except Exception as exc:
+                        context.logger.debug(
+                            "search: recommended_action refresh failed: %s", exc
+                        )
+                if "rationale" in r:
+                    try:
+                        r["rationale"] = explain(r)
+                    except Exception as exc:
+                        context.logger.debug(
+                            "search: rationale refresh failed: %s", exc
+                        )
         except Exception as exc:
             context.logger.warning("search: score recording failed: %s", exc)
 

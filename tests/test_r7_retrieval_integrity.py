@@ -2712,3 +2712,66 @@ class TestFinalScoreClampsDecay:
         engine._score_merged_doc(d)
         assert d["decay_applied"] == pytest.approx(0.0)
         assert d["final_score"] == pytest.approx(0.0)
+
+
+# ---------------------------------------------------------------------------
+# grok-review round 8 — post-activation envelope agrees with itself
+# ---------------------------------------------------------------------------
+
+class TestPostActivationEnvelopeAgrees:
+    """Round-8 finding 1: formatting freezes recommended_action and rationale
+    from the pre-calibration blend; the boundary rewrote confidence alone.
+    After activation a raw 0.15 hit can ship confidence 0.85 with
+    recommended_action "follow_up" and rationale "...; confidence 0.15." —
+    the same silent-envelope class GA4-1 is about, inside one payload."""
+
+    def test_recommended_action_and_rationale_track_calibrated_confidence(
+        self, tmp_path, monkeypatch, hermetic_principals
+    ):
+        from minni.scoring import _ACTIVATION_THRESHOLD
+
+        _engine, db_obj, _cfg = _patch_engine_and_writeback(tmp_path, monkeypatch)
+        body = "the deployment rollback procedure is documented here. " * 20
+        with db_obj.cursor() as c:
+            # decay 0.4 keeps the raw blend under the 0.2 follow_up threshold
+            # (rrf≈0.016 → raw≈0.13) while still outranking a window of zeros.
+            c.execute(
+                "INSERT INTO documents (path, agent, sigil, layer, decay_score) "
+                "VALUES ('a.md', 'codex', 'vault', 'knowledge', 0.4)"
+            )
+            doc_id = c.lastrowid
+            c.execute(
+                "INSERT INTO vault_fts (doc_id, path, content, agent, sigil) "
+                "VALUES (?, 'a.md', ?, 'codex', 'vault')",
+                (doc_id, body),
+            )
+            for _ in range(_ACTIVATION_THRESHOLD):
+                c.execute(
+                    "INSERT INTO score_distribution (raw_score, kind, created_at) "
+                    "VALUES (0.0, 'combined', ?)",
+                    (time.time(),),
+                )
+
+        resp = _dispatch("search", {
+            "query": "deployment rollback", "agent_id": "codex",
+            "expand": False, "depth": "snippet",
+        })
+        assert "error" not in resp
+        results = resp["result"]["results"]
+        assert results
+        for r in results:
+            conf = r.get("confidence")
+            assert conf is not None and conf >= 0.8, (
+                f"expected percentile-ranked confidence after activation; "
+                f"got {conf}"
+            )
+            assert r.get("recommended_action") == "cite", (
+                f"recommended_action must re-derive from calibrated "
+                f"confidence={conf}; freeze-from-format left 'follow_up' "
+                f"(raw < 0.2) while confidence was rewritten high"
+            )
+            rationale = r.get("rationale") or ""
+            assert f"confidence {conf:.2f}" in rationale, (
+                f"rationale must embed the calibrated confidence {conf:.2f}, "
+                f"not the pre-calibration blend; got {rationale!r}"
+            )
