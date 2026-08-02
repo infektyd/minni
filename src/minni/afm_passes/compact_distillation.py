@@ -80,6 +80,7 @@ from minni.afm_passes.inbox_ingest import (
     _coerce_candidate_index,
     _content_sha1,
     _existing_keys,
+    _is_unique_integrity_error,
     _principal_for_inbox,
     discover_inboxes,
 )
@@ -466,9 +467,12 @@ def distill(db, config, inboxes: Optional[List[Path]] = None,
                             now,
                         ),
                     )
-                except sqlite3.IntegrityError:
+                except sqlite3.IntegrityError as exc:
                     # Unique-index collision (post-#239 repair) or rare race:
                     # treat as already_present rather than aborting the batch.
+                    # Re-raise CHECK/NOT NULL/FK integrity failures.
+                    if not _is_unique_integrity_error(exc):
+                        raise
                     already += 1
                     continue
                 txn_existing.add(key)

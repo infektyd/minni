@@ -26,6 +26,32 @@ Winner rule (stated, applied by ``repair_duplicate_candidate_pairs``)
    written to ``consolidation_actions`` (when that table exists). Learnings,
    FTS, and embeddings are never touched by the dual-candidate repair.
 
+Collapse scope (byte-identical only)
+------------------------------------
+Hard-delete only runs for twins that share the same
+``(inbox_file, candidate_index, content_sha1)`` — the #239 dual-resolution
+shape. App-key groups with **divergent** ``content_sha1`` are reported as
+``divergent_content_groups`` and left untouched (prefer-accepted is a
+governance signal, not a delete license for different bodies).
+
+Concurrency
+-----------
+The dry-run plan is advisory. On ``--apply``, each group is **re-loaded and
+re-winnered inside** ``BEGIN IMMEDIATE`` immediately before delete. Rows whose
+current status is ``accepted`` are never deleted (hard guard). Stop the AFM
+daemon / writers before ``--apply`` when possible.
+
+FK hygiene
+----------
+Before deleting a loser, ``contradiction_log.resolution_id`` pointing at that
+id is set to NULL (FK from migration 009; ``PRAGMA foreign_keys=ON``).
+
+Inbox unique index
+------------------
+``ensure_inbox_dedup_index`` is **operator-only** (this CLI / ``run_full_repair``),
+not a normal migration. Schema rebuilds of ``candidate_packets`` (e.g. 015)
+drop it; re-run the repair CLI after cleanup to recreate.
+
 This module is idempotent and safe to re-run. Default is dry-run.
 """
 
@@ -82,7 +108,7 @@ def _inbox_key(derived: Dict[str, Any]) -> Optional[Tuple[str, int]]:
     """Return (inbox_file, candidate_index) for inbox-sourced rows.
 
     Matches app-level idempotency in ``inbox_ingest`` / ``compact_distillation``
-    (file + index only). ``content_sha1`` is audit metadata, not part of the key.
+    (file + index only). ``content_sha1`` is not part of the app key.
     """
     if derived.get("source") != "inbox":
         return None
@@ -96,6 +122,26 @@ def _inbox_key(derived: Dict[str, Any]) -> Optional[Tuple[str, int]]:
     if idx_i != idx:  # reject non-integral floats
         return None
     return (inbox_file, idx_i)
+
+
+def _content_sha1_of(derived: Dict[str, Any]) -> Optional[str]:
+    """Normalize content_sha1 from derived_from (None if missing/empty)."""
+    sha = derived.get("content_sha1")
+    if sha is None:
+        return None
+    if isinstance(sha, str) and sha.strip():
+        return sha.strip().lower()
+    return None
+
+
+def _collapse_key(
+    derived: Dict[str, Any],
+) -> Optional[Tuple[str, int, Optional[str]]]:
+    """Byte-identical collapse key: app key + content_sha1 (#239 duals only)."""
+    app = _inbox_key(derived)
+    if app is None:
+        return None
+    return (app[0], app[1], _content_sha1_of(derived))
 
 
 def status_rank(status: Optional[str]) -> int:
@@ -115,14 +161,9 @@ def choose_winner(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     )
 
 
-def find_duplicate_candidate_groups(db) -> List[Dict[str, Any]]:
-    """Group inbox-sourced candidates by (inbox_file, candidate_index).
-
-    Returns only groups with 2+ rows. Each group dict has ``key`` and ``rows``.
-    Grouping matches app-level idempotency (file + index); ``content_sha1`` is
-    not part of the collapse key.
-    """
-    groups: Dict[Tuple[str, int], List[Dict[str, Any]]] = defaultdict(list)
+def _iter_inbox_candidates(db) -> List[Dict[str, Any]]:
+    """Load inbox-sourced candidate rows with parsed collapse metadata."""
+    items: List[Dict[str, Any]] = []
     with db.cursor() as c:
         c.execute(
             """
@@ -137,35 +178,136 @@ def find_duplicate_candidate_groups(db) -> List[Dict[str, Any]]:
             derived = _parse_derived(item.get("derived_from"))
             if not derived:
                 continue
-            key = _inbox_key(derived)
-            if key is None:
+            ckey = _collapse_key(derived)
+            if ckey is None:
                 continue
-            item["_key"] = key
-            item["_content_sha1"] = derived.get("content_sha1")
-            groups[key].append(item)
+            item["_key"] = ckey
+            item["_app_key"] = (ckey[0], ckey[1])
+            item["_content_sha1"] = ckey[2]
+            items.append(item)
+    return items
+
+
+def _group_summary(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    winner = choose_winner(rows)
+    losers = [r for r in rows if r["candidate_id"] != winner["candidate_id"]]
+    ckey = rows[0]["_key"]
+    return {
+        "key": {
+            "inbox_file": ckey[0],
+            "candidate_index": ckey[1],
+            "content_sha1": ckey[2],
+        },
+        "winner_id": int(winner["candidate_id"]),
+        "winner_status": winner.get("status"),
+        "loser_ids": [int(r["candidate_id"]) for r in losers],
+        "statuses": sorted({str(r.get("status")) for r in rows}),
+        "row_count": len(rows),
+    }
+
+
+def find_duplicate_candidate_groups(db) -> List[Dict[str, Any]]:
+    """Group inbox candidates by (inbox_file, candidate_index, content_sha1).
+
+    Returns only **byte-identical** groups with 2+ rows — the #239 dual shape.
+    App-key peers with different ``content_sha1`` are reported separately via
+    ``find_divergent_content_groups`` and are not hard-deleted by default.
+    """
+    groups: Dict[Tuple[str, int, Optional[str]], List[Dict[str, Any]]] = defaultdict(
+        list
+    )
+    for item in _iter_inbox_candidates(db):
+        groups[item["_key"]].append(item)
 
     out: List[Dict[str, Any]] = []
-    for key, rows in groups.items():
+    for rows in groups.values():
         if len(rows) < 2:
             continue
-        winner = choose_winner(rows)
-        losers = [r for r in rows if r["candidate_id"] != winner["candidate_id"]]
+        out.append(_group_summary(rows))
+    out.sort(key=lambda g: g["winner_id"])
+    return out
+
+
+def find_divergent_content_groups(db) -> List[Dict[str, Any]]:
+    """App-key groups whose rows do not share a single content_sha1.
+
+    These are **not** collapsed by default: different bodies under the same
+    inbox key are left for a separate operator policy (not #239 duals).
+    """
+    by_app: Dict[Tuple[str, int], List[Dict[str, Any]]] = defaultdict(list)
+    for item in _iter_inbox_candidates(db):
+        by_app[item["_app_key"]].append(item)
+
+    out: List[Dict[str, Any]] = []
+    for app_key, rows in by_app.items():
+        if len(rows) < 2:
+            continue
+        shas = {r.get("_content_sha1") for r in rows}
+        if len(shas) <= 1:
+            continue
+        # Prefer accepted for reporting only — no delete.
+        preferred = choose_winner(rows)
         out.append(
             {
                 "key": {
-                    "inbox_file": key[0],
-                    "candidate_index": key[1],
-                    "content_sha1": winner.get("_content_sha1"),
+                    "inbox_file": app_key[0],
+                    "candidate_index": app_key[1],
                 },
-                "winner_id": int(winner["candidate_id"]),
-                "winner_status": winner.get("status"),
-                "loser_ids": [int(r["candidate_id"]) for r in losers],
-                "statuses": sorted({str(r.get("status")) for r in rows}),
+                "content_sha1s": sorted(s or "" for s in shas),
                 "row_count": len(rows),
+                "candidate_ids": sorted(int(r["candidate_id"]) for r in rows),
+                "preferred_id": int(preferred["candidate_id"]),
+                "preferred_status": preferred.get("status"),
+                "statuses": sorted({str(r.get("status")) for r in rows}),
             }
         )
-    out.sort(key=lambda g: g["winner_id"])
+    out.sort(key=lambda g: g["preferred_id"])
     return out
+
+
+def _load_collapse_group_on_cursor(
+    c, key: Dict[str, Any]
+) -> List[Dict[str, Any]]:
+    """Re-read byte-identical twins for one collapse key under an open txn."""
+    inbox_file = key.get("inbox_file")
+    candidate_index = key.get("candidate_index")
+    content_sha1 = key.get("content_sha1")
+    if not isinstance(inbox_file, str) or candidate_index is None:
+        return []
+    # Filter in SQL on app key; match sha in Python so NULL/missing sha is ok.
+    c.execute(
+        """
+        SELECT candidate_id, principal, status, content, derived_from,
+               proposed_at, resolved_at, resolved_by, resolution_reason
+        FROM candidate_packets
+        WHERE derived_from IS NOT NULL
+          AND json_extract(derived_from, '$.source') = 'inbox'
+          AND json_extract(derived_from, '$.inbox_file') = ?
+          AND CAST(json_extract(derived_from, '$.candidate_index') AS INTEGER) = ?
+        """,
+        (inbox_file, int(candidate_index)),
+    )
+    want_sha = (
+        content_sha1.strip().lower()
+        if isinstance(content_sha1, str) and content_sha1.strip()
+        else None
+    )
+    rows: List[Dict[str, Any]] = []
+    for row in c.fetchall():
+        item = dict(row)
+        derived = _parse_derived(item.get("derived_from"))
+        if not derived:
+            continue
+        ckey = _collapse_key(derived)
+        if ckey is None:
+            continue
+        row_sha = ckey[2]
+        if row_sha != want_sha:
+            continue
+        item["_key"] = ckey
+        item["_content_sha1"] = row_sha
+        rows.append(item)
+    return rows
 
 
 def _table_exists(db, name: str) -> bool:
@@ -214,14 +356,42 @@ def _audit_drop(c, loser_id: int, winner_id: int, winner_status: str, now: float
         logger.debug("audit insert skipped for loser %s: %s", loser_id, exc)
 
 
+def _null_contradiction_resolution(c, loser_id: int) -> None:
+    """Clear contradiction_log.resolution_id FK before deleting a loser.
+
+    Migration 009 defines
+    ``FOREIGN KEY (resolution_id) REFERENCES candidate_packets(candidate_id)``
+    with no ON DELETE SET NULL; with ``PRAGMA foreign_keys=ON`` a bare DELETE
+    of a referenced candidate aborts the whole repair transaction.
+    """
+    try:
+        c.execute(
+            "UPDATE contradiction_log SET resolution_id = NULL WHERE resolution_id = ?",
+            (loser_id,),
+        )
+    except Exception as exc:
+        # Table missing on partial schemas — non-fatal.
+        logger.debug(
+            "contradiction_log resolution_id null-out skipped for %s: %s",
+            loser_id,
+            exc,
+        )
+
+
 def repair_duplicate_candidate_pairs(
     db, *, dry_run: bool = True, limit: Optional[int] = None
 ) -> Dict[str, Any]:
-    """Collapse duplicate inbox candidate groups to one row each.
+    """Collapse **byte-identical** dual inbox candidate groups to one row each.
 
     Never touches ``learnings``. Idempotent: a second run finds zero groups.
+
+    On apply, each group is re-loaded and re-winnered **inside** the write
+    transaction so concurrent consolidation cannot leave a stale plan that
+    deletes the twin that just became ``accepted``. Rows currently
+    ``accepted`` are never hard-deleted.
     """
     groups = find_duplicate_candidate_groups(db)
+    divergent = find_divergent_content_groups(db)
     if limit is not None:
         groups = groups[: max(0, int(limit))]
 
@@ -238,45 +408,95 @@ def repair_duplicate_candidate_pairs(
         )
 
     deleted = 0
+    groups_applied = 0
+    groups_skipped_stale = 0
+    skipped_accepted_guard = 0
+    winner_replanned = 0
+    fk_nulled = 0
+
     if not dry_run and plan:
         now = time.time()
         # Probe once outside the write loop so we never open db.cursor()
         # (which commits) while BEGIN IMMEDIATE is held.
         has_audit = _table_exists(db, "consolidation_actions")
+        has_contradiction = _table_exists(db, "contradiction_log")
         with db.transaction() as c:
             # Re-probe on the txn cursor as a belt-and-suspenders check
             # without committing mid-batch.
             if not has_audit:
                 has_audit = _table_exists_on_cursor(c, "consolidation_actions")
+            if not has_contradiction:
+                has_contradiction = _table_exists_on_cursor(c, "contradiction_log")
             for item in plan:
-                for loser_id in item["delete"]:
-                    # Re-check existence inside the txn.
-                    c.execute(
-                        "SELECT candidate_id FROM candidate_packets WHERE candidate_id=?",
-                        (loser_id,),
-                    )
-                    if not c.fetchone():
+                # High #1: re-validate under the write lock — never trust the
+                # pre-txn plan for deletes (concurrent AFM can promote the
+                # planned "loser" to accepted between plan and BEGIN).
+                live_rows = _load_collapse_group_on_cursor(c, item["key"])
+                if len(live_rows) < 2:
+                    groups_skipped_stale += 1
+                    continue
+                live_winner = choose_winner(live_rows)
+                live_keep = int(live_winner["candidate_id"])
+                live_status = str(live_winner.get("status") or "")
+                if live_keep != int(item["keep"]):
+                    winner_replanned += 1
+                live_losers = [
+                    r
+                    for r in live_rows
+                    if int(r["candidate_id"]) != live_keep
+                ]
+                group_deleted = 0
+                for loser in live_losers:
+                    loser_id = int(loser["candidate_id"])
+                    loser_status = str(loser.get("status") or "").strip().lower()
+                    # Hard guard: never delete an accepted twin (provenance).
+                    if loser_status == "accepted":
+                        skipped_accepted_guard += 1
                         continue
+                    if has_contradiction:
+                        _null_contradiction_resolution(c, loser_id)
+                        fk_nulled += 1
                     if has_audit:
-                        _audit_drop(
-                            c, loser_id, item["keep"], str(item["keep_status"]), now
-                        )
+                        _audit_drop(c, loser_id, live_keep, live_status, now)
                     c.execute(
                         "DELETE FROM candidate_packets WHERE candidate_id=?",
                         (loser_id,),
                     )
                     deleted += 1
+                    group_deleted += 1
+                if group_deleted:
+                    groups_applied += 1
+                elif live_losers:
+                    # All losers were accepted-guarded — group unresolved.
+                    groups_skipped_stale += 1
 
     return {
         "dry_run": dry_run,
         "groups_found": len(groups),
         "would_delete": sum(len(p["delete"]) for p in plan),
         "deleted": deleted if not dry_run else 0,
+        "groups_applied": groups_applied if not dry_run else 0,
+        "groups_skipped_stale": groups_skipped_stale if not dry_run else 0,
+        "winner_replanned": winner_replanned if not dry_run else 0,
+        "skipped_accepted_guard": skipped_accepted_guard if not dry_run else 0,
+        "fk_resolution_nulled": fk_nulled if not dry_run else 0,
+        "divergent_content_groups": len(divergent),
+        "divergent_sample": divergent[:5],
+        "collapse_scope": (
+            "byte-identical only (inbox_file, candidate_index, content_sha1); "
+            "divergent content under the same app key is reported, not deleted"
+        ),
         "winner_rule": (
-            "accepted > other terminal > proposed; tie-break lowest candidate_id"
+            "accepted > other terminal > proposed; tie-break lowest candidate_id; "
+            "re-validated inside write txn; never delete status=accepted"
         ),
         "learnings_touched": False,
         "sample": plan[:5],
+        "operator_note": (
+            "Stop AFM/daemon writers before --apply when possible. "
+            "Inbox unique index is operator-only (not a migration); re-run "
+            "this repair after candidate_packets schema rebuilds."
+        ),
     }
 
 
@@ -291,6 +511,11 @@ def ensure_inbox_dedup_index(db) -> Dict[str, Any]:
     first). Migrates off the legacy weaker ``…_inbox_sha1_unique`` index if
     present. Returns status describing whether the index exists / was created
     / failed.
+
+    **Operator-only, not a migration.** Schema rebuilds of
+    ``candidate_packets`` (e.g. migration 015) drop this index; re-run
+    ``scripts/repair_issue_239.py --apply`` after cleanup to recreate it.
+    In-txn key reload on ingest/distill is the primary dual-prevention path.
     """
     index_name = INBOX_DEDUP_INDEX
     with db.cursor() as c:

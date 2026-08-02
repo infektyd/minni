@@ -140,6 +140,18 @@ def _content_sha1(text: str) -> str:
     return hashlib.sha1(text.encode("utf-8")).hexdigest()
 
 
+def _is_unique_integrity_error(exc: BaseException) -> bool:
+    """True only for UNIQUE / unique-index IntegrityError (idempotent hits).
+
+    Other integrity failures (CHECK, NOT NULL, FK) must not be counted as
+    ``already_present`` and silently dropped.
+    """
+    if not isinstance(exc, sqlite3.IntegrityError):
+        return False
+    msg = " ".join(str(a) for a in exc.args).lower()
+    return "unique" in msg
+
+
 def _as_str_set(v: Any) -> set:
     return {x for x in v if isinstance(x, str)} if isinstance(v, list) else set()
 
@@ -472,9 +484,12 @@ def ingest(db, config, inboxes: Optional[List[Path]] = None,
                             r["proposed_at"],
                         ),
                     )
-                except sqlite3.IntegrityError:
+                except sqlite3.IntegrityError as exc:
                     # Unique-index collision (post-#239 repair) or rare race:
                     # treat as already_present rather than aborting the batch.
+                    # Re-raise CHECK/NOT NULL/FK integrity failures.
+                    if not _is_unique_integrity_error(exc):
+                        raise
                     already += 1
                     continue
                 txn_existing.add(key)

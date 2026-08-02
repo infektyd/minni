@@ -766,3 +766,215 @@ def test_ingest_mid_batch_unique_still_commits_later(tmp_path, monkeypatch):
             inbox_file="a.json",
             candidate_index=1,
         )
+
+
+def test_in_txn_revalidate_keeps_accepted_promoted_under_stale_plan(
+    tmp_path, monkeypatch
+):
+    """High #1: concurrent accept of planned 'loser' must not be deleted.
+
+    Plan outside txn sees both proposed → keep lowest id. Between plan and
+    apply, consolidation promotes the higher id to accepted. Apply must
+    re-choose under BEGIN IMMEDIATE and keep the accepted twin.
+    """
+    from minni import repair_dual_candidates as mod
+
+    db, _cfg = _make_db(tmp_path)
+    content = "race content same body"
+    low_id = _insert_candidate(db, content=content, status="proposed")
+    high_id = _insert_candidate(db, content=content, status="proposed")
+    assert low_id < high_id
+
+    # Capture the pre-txn plan shape (lowest id wins while both proposed).
+    groups = mod.find_duplicate_candidate_groups(db)
+    assert len(groups) == 1
+    assert groups[0]["winner_id"] == low_id
+    assert high_id in groups[0]["loser_ids"]
+
+    real_find = mod.find_duplicate_candidate_groups
+
+    def find_then_promote(db_arg):
+        groups_out = real_find(db_arg)
+        # Simulate concurrent consolidation AFTER plan, BEFORE write txn:
+        # promote the planned loser (high_id) and reject the planned winner.
+        with db_arg.transaction() as c:
+            c.execute(
+                """
+                UPDATE candidate_packets
+                SET status='accepted', resolved_at=?, resolved_by='afm-consolidation',
+                    resolution_reason='afm-consolidation'
+                WHERE candidate_id=?
+                """,
+                (time.time(), high_id),
+            )
+            c.execute(
+                """
+                UPDATE candidate_packets
+                SET status='rejected', resolved_at=?, resolved_by='afm-consolidation',
+                    resolution_reason='duplicate of existing learning'
+                WHERE candidate_id=?
+                """,
+                (time.time(), low_id),
+            )
+        return groups_out
+
+    monkeypatch.setattr(mod, "find_duplicate_candidate_groups", find_then_promote)
+
+    result = mod.repair_duplicate_candidate_pairs(db, dry_run=False)
+    assert result["deleted"] == 1
+    assert result["winner_replanned"] >= 1
+    with db.cursor() as c:
+        c.execute(
+            "SELECT candidate_id, status FROM candidate_packets ORDER BY candidate_id"
+        )
+        rows = [dict(r) for r in c.fetchall()]
+    assert len(rows) == 1
+    assert rows[0]["candidate_id"] == high_id
+    assert rows[0]["status"] == "accepted"
+
+
+def test_never_deletes_accepted_when_two_accepted(tmp_path):
+    """Hard guard: status=accepted is never hard-deleted as a loser."""
+    from minni.repair_dual_candidates import repair_duplicate_candidate_pairs
+
+    db, _cfg = _make_db(tmp_path)
+    content = "two accepted twins"
+    a = _insert_candidate(db, content=content, status="accepted")
+    b = _insert_candidate(db, content=content, status="accepted")
+    assert a < b
+
+    result = repair_duplicate_candidate_pairs(db, dry_run=False)
+    # choose_winner would prefer lowest id, but hard guard blocks deleting b.
+    assert result["skipped_accepted_guard"] >= 1
+    assert result["deleted"] == 0
+    with db.cursor() as c:
+        c.execute("SELECT candidate_id FROM candidate_packets ORDER BY candidate_id")
+        ids = [dict(r)["candidate_id"] for r in c.fetchall()]
+    assert ids == [a, b]
+
+
+def test_divergent_content_same_app_key_not_deleted(tmp_path):
+    """Medium #2: different content_sha1 under same app key is not collapsed."""
+    from minni.repair_dual_candidates import (
+        find_divergent_content_groups,
+        find_duplicate_candidate_groups,
+        repair_duplicate_candidate_pairs,
+    )
+
+    db, _cfg = _make_db(tmp_path)
+    id_a = _insert_candidate(
+        db,
+        content="body alpha",
+        status="accepted",
+        inbox_file="same.json",
+        candidate_index=0,
+    )
+    id_b = _insert_candidate(
+        db,
+        content="body beta completely different",
+        status="rejected",
+        inbox_file="same.json",
+        candidate_index=0,
+    )
+
+    # Not a byte-identical dual group.
+    assert find_duplicate_candidate_groups(db) == []
+    divergent = find_divergent_content_groups(db)
+    assert len(divergent) == 1
+    assert set(divergent[0]["candidate_ids"]) == {id_a, id_b}
+
+    result = repair_duplicate_candidate_pairs(db, dry_run=False)
+    assert result["groups_found"] == 0
+    assert result["deleted"] == 0
+    assert result["divergent_content_groups"] == 1
+    with db.cursor() as c:
+        c.execute("SELECT COUNT(*) AS n FROM candidate_packets")
+        assert dict(c.fetchone())["n"] == 2
+
+
+def test_byte_identical_still_collapsed_when_app_peers_exist(tmp_path):
+    """Same-sha twins collapse; a third divergent peer under the key is kept."""
+    from minni.repair_dual_candidates import repair_duplicate_candidate_pairs
+
+    db, _cfg = _make_db(tmp_path)
+    body = "exact twin body"
+    acc = _insert_candidate(
+        db, content=body, status="accepted", inbox_file="mix.json", candidate_index=1
+    )
+    rej = _insert_candidate(
+        db, content=body, status="rejected", inbox_file="mix.json", candidate_index=1
+    )
+    other = _insert_candidate(
+        db,
+        content="different body same key",
+        status="proposed",
+        inbox_file="mix.json",
+        candidate_index=1,
+    )
+
+    result = repair_duplicate_candidate_pairs(db, dry_run=False)
+    assert result["deleted"] == 1
+    assert result["divergent_content_groups"] >= 1
+    with db.cursor() as c:
+        c.execute(
+            "SELECT candidate_id, status FROM candidate_packets ORDER BY candidate_id"
+        )
+        rows = {dict(r)["candidate_id"]: dict(r)["status"] for r in c.fetchall()}
+    assert rej not in rows
+    assert rows[acc] == "accepted"
+    assert other in rows
+
+
+def test_contradiction_log_fk_nulled_before_delete(tmp_path):
+    """Medium #3: resolution_id FK must not blow the repair transaction."""
+    from minni.repair_dual_candidates import repair_duplicate_candidate_pairs
+
+    db, _cfg = _make_db(tmp_path)
+    content = "fk twin body"
+    keep_id = _insert_candidate(db, content=content, status="accepted")
+    lose_id = _insert_candidate(db, content=content, status="rejected")
+
+    with db.transaction() as c:
+        c.execute(
+            """
+            INSERT INTO contradiction_log
+            (memory_a_id, memory_b_id, detected_at, detection_method, resolution_id)
+            VALUES (?, ?, ?, 'test', ?)
+            """,
+            (1, 2, time.time(), lose_id),
+        )
+
+    result = repair_duplicate_candidate_pairs(db, dry_run=False)
+    assert result["deleted"] == 1
+    assert result["fk_resolution_nulled"] >= 1
+
+    with db.cursor() as c:
+        c.execute("SELECT candidate_id FROM candidate_packets")
+        ids = [dict(r)["candidate_id"] for r in c.fetchall()]
+        c.execute(
+            "SELECT resolution_id FROM contradiction_log WHERE memory_a_id=1"
+        )
+        row = dict(c.fetchone())
+    assert ids == [keep_id]
+    assert row["resolution_id"] is None
+
+
+def test_is_unique_integrity_error_narrow():
+    """Low #4: only UNIQUE IntegrityError is treated as already_present."""
+    import sqlite3
+
+    from minni.afm_passes.inbox_ingest import _is_unique_integrity_error
+
+    assert _is_unique_integrity_error(
+        sqlite3.IntegrityError("UNIQUE constraint failed: index")
+    )
+    assert _is_unique_integrity_error(
+        sqlite3.IntegrityError("unique constraint failed: candidate_packets")
+    )
+    assert not _is_unique_integrity_error(
+        sqlite3.IntegrityError("CHECK constraint failed: status")
+    )
+    assert not _is_unique_integrity_error(
+        sqlite3.IntegrityError("NOT NULL constraint failed: content")
+    )
+    assert not _is_unique_integrity_error(ValueError("nope"))

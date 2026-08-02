@@ -3,9 +3,17 @@
 
 Dry-run by default. Pass ``--apply`` to mutate the DB.
 
-Default ``--apply`` only collapses dual-resolution ``candidate_packets``
-twins (+ optional inbox dedup unique index). Destructive document-index
-pruning requires an explicit ``--prune-index``.
+Default ``--apply`` only collapses **byte-identical** dual-resolution
+``candidate_packets`` twins (same inbox_file + candidate_index + content_sha1)
+(+ optional inbox dedup unique index). Destructive document-index pruning
+requires an explicit ``--prune-index``.
+
+Prefer stopping the AFM/minnid daemon (or other writers) before ``--apply`` so
+consolidation cannot race the repair plan; apply still re-validates winners
+inside the write transaction and never deletes ``status=accepted`` rows.
+
+The inbox unique index is **operator-only** (not a schema migration). Re-run
+this CLI after ``candidate_packets`` rebuilds (e.g. migration 015).
 
   python3 scripts/repair_issue_239.py
   python3 scripts/repair_issue_239.py --apply
@@ -149,10 +157,25 @@ def main(argv: list[str] | None = None) -> int:
         print(f"issue #239 repair [{mode}] db={db_path}")
         print(f"  winner rule: {dual['winner_rule']}")
         print(
-            f"  dual groups: {dual['groups_found']}  "
+            f"  dual groups (byte-identical): {dual['groups_found']}  "
             f"would_delete={dual['would_delete']}  deleted={dual['deleted']}  "
             f"learnings_touched={dual['learnings_touched']}"
         )
+        if dual.get("divergent_content_groups"):
+            print(
+                f"  divergent content groups (not deleted): "
+                f"{dual['divergent_content_groups']}"
+            )
+        if args.apply and (
+            dual.get("winner_replanned")
+            or dual.get("skipped_accepted_guard")
+            or dual.get("groups_skipped_stale")
+        ):
+            print(
+                f"  in-txn revalidate: replanned={dual.get('winner_replanned', 0)}  "
+                f"accepted_guard={dual.get('skipped_accepted_guard', 0)}  "
+                f"stale_skip={dual.get('groups_skipped_stale', 0)}"
+            )
         if idx.get("skipped"):
             print(
                 "  index prune: SKIPPED (default). "
