@@ -420,6 +420,20 @@ export interface AgentHookHandlers {
   ): Promise<HookOutput | PreToolUseDecisionOutput>;
 }
 
+/**
+ * Runtimes that always attach `transcript_path`/`transcriptPath` on SessionStart
+ * and never send `source`. Path-only compact harvest would tax every cold boot
+ * (agy/gemini: non–Claude-shaped JSONL → always `no_summary_found`).
+ * Matched against `config.runtime ?? config.agentId`.
+ */
+const PATH_ONLY_COMPACT_HARVEST_DENY = new Set(["gemini"]);
+
+/** True when path-only (no `source`) SessionStart must not start a tail-read. */
+export function isPathOnlyCompactHarvestDenied(platform: string | undefined): boolean {
+  const id = (platform ?? "").trim().toLowerCase();
+  return id.length > 0 && PATH_ONLY_COMPACT_HARVEST_DENY.has(id);
+}
+
 export function createHookHandlers(
   config: AgentHookConfig,
   deps: AgentHookDeps = {},
@@ -489,33 +503,46 @@ export function createHookHandlers(
     // bridge SessionStart supplies neither transcript_path nor source — so
     // this backstop is dead for real Kilo boots). Platforms that share this
     // handler (codex, grok-build, cursor, gemini) previously had no harvest
-    // path at all. Gate mirrors Claude when `source` is present (only
-    // compact/resume): a cold boot that still carries a transcript path must
-    // not pay the unbudgeted 4 MiB tail-read. When the platform omits `source`
-    // entirely, a non-empty transcript path is the only signal — harvest then.
+    // path at all.
+    //
+    // Gate:
+    //  1. compact|resume `source` — Claude parity (any runtime).
+    //  2. path-only residual — only when `source` is absent entirely AND the
+    //     runtime is not known to always attach a transcript path. agy/gemini
+    //     SessionStart always carries transcriptPath and never sends `source`,
+    //     so path-only would fire on every cold boot for a guaranteed
+    //     no_summary_found (non–Claude-shaped JSONL) against the tightest
+    //     budget (10s harness → ~6s effective). Deny path-only there.
+    // Harvest is raced against remainingMs so a wedged/large tail-read cannot
+    // starve identity/corrections RPCs (withBudget abandons, does not cancel).
     // Content-hash dedup keeps dual delivery safe. Fail-open, raw only —
-    // daemon compact_distillation organizes later. Non–Claude-shaped
-    // transcripts no-op with no_summary_found (docs/concepts.md table).
+    // daemon compact_distillation organizes later.
     const bootSource = asString(payload.source);
     const transcriptPath =
       asString(payload.transcript_path) || asString(payload.transcriptPath);
     const platform = config.runtime ?? config.agentId;
+    const pathOnlyAllowed =
+      !bootSource &&
+      Boolean(transcriptPath) &&
+      !isPathOnlyCompactHarvestDenied(platform);
     const shouldHarvestCompact =
-      bootSource === "compact" ||
-      bootSource === "resume" ||
-      (!bootSource && Boolean(transcriptPath));
+      bootSource === "compact" || bootSource === "resume" || pathOnlyAllowed;
     if (shouldHarvestCompact) {
-      await harvestCompactSummary(
-        {
-          vaultPath: config.vaultPath,
-          workspaceId,
-          auditPrefix: config.auditPrefix,
-          platform,
-        },
-        {
-          transcriptPath,
-          sessionId,
-        },
+      await withBudget(
+        harvestCompactSummary(
+          {
+            vaultPath: config.vaultPath,
+            workspaceId,
+            auditPrefix: config.auditPrefix,
+            platform,
+          },
+          {
+            transcriptPath,
+            sessionId,
+          },
+        ),
+        remainingMs(),
+        { harvested: false, reason: "harvest_error" },
       );
     }
 

@@ -196,9 +196,12 @@ Minni harvests it in two stages, split across the boot/daemon boundary
    fires too early — before the summary exists — so the plugin fetches it
    afterward via the SDK client; see `plugins/minni/kilo/minni-plugin.js`).
    Platforms that share `createHookHandlers` (codex, grok-build, cursor, gemini)
-   run the same SessionStart transcript backstop when the payload marks
-   `source` as compact/resume, or — only if `source` is absent entirely —
-   when a `transcript_path` is the only signal ([#227](https://github.com/infektyd/minni/issues/227)).
+   run the SessionStart transcript backstop when the payload marks `source` as
+   compact/resume. A path-only residual (no `source`, non-empty
+   `transcript_path`) remains for hosts that omit `source` entirely — **except**
+   runtimes known to always attach a transcript path and never send `source`
+   (agy/gemini): path-only there would tax every cold boot for a guaranteed
+   miss against the tightest SessionStart budget ([#227](https://github.com/infektyd/minni/issues/227)).
    Kilo Code uses the shared handler too, but its bridge SessionStart sends
    neither `transcript_path` nor `source`, so that backstop is dead for real
    Kilo boots (primary remains `CompactSummary` from the SDK). Both live paths
@@ -216,16 +219,17 @@ Minni harvests it in two stages, split across the boot/daemon boundary
    |----------|------------------|----------------------------------|-------|
    | Claude Code | `PostCompact` → `harvestSummaryText` | yes (`source` compact/resume only) | full path |
    | Kilo Code | `session.compacted` SDK read-back → `CompactSummary` | no (bridge supplies no transcript_path / source) | primary only |
-   | Codex | — | yes on compact/resume `source`, or path-only when `source` omitted | Claude-shaped transcript entries only; otherwise no-op |
+   | Codex | — | compact/resume `source`, or path-only when `source` omitted | Claude-shaped transcript entries only; otherwise no-op |
    | Grok Build | — | same gate as Codex | harvest is a side effect (SessionStart is not injectable) |
    | Cursor | — | same gate as Codex | cold boots with path + non-compact `source` skip the tail-read |
-   | Gemini / agy | — | same gate as Codex | same |
+   | Gemini / agy | — | compact/resume `source` only (path-only denied) | always attaches `transcriptPath`, never `source`; path-only would I/O every cold boot for zero yield (non–Claude-shaped transcript) |
 
    Platforms without a Claude-shaped `isCompactSummary` transcript entry still
-   *have* a harvest path (they no longer drop the event on the floor by
-   absence of code), but capture is a no-op until the platform emits a
-   compatible summary shape or a direct `CompactSummary`/`summary_text`
-   delivery. That residual is declared here rather than discovered.
+   *have* a harvest path when the gate fires (they no longer drop the event on
+   the floor by absence of code), but capture is a no-op until the platform
+   emits a compatible summary shape or a direct `CompactSummary`/`summary_text`
+   delivery. Gemini/agy path-only is denied so the residual is not paid as an
+   every-boot I/O cost. That residual is declared here rather than discovered.
 2. **Daemon-side distillation (`compact_distillation` AFM pass).** The same
    consolidation timer that ingests stop-candidate learnings picks up
    `compact_summary` inbox files (`src/minni/afm_passes/compact_distillation.py`).

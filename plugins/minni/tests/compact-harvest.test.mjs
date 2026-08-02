@@ -146,7 +146,8 @@ test("shared SessionStart skips harvest on cold boot with non-compact source + p
   );
 });
 
-// Platforms that omit `source` entirely still need the path-only signal.
+// Platforms that omit `source` entirely still need the path-only signal —
+// but only when the runtime is not known to always attach a path (codex/…).
 test("shared SessionStart harvests when transcript_path is the only signal", async () => {
   const vault = await tmpVault();
   const file = await tmpTranscript([
@@ -162,6 +163,55 @@ test("shared SessionStart harvests when transcript_path is the only signal", asy
   const harvested = await listCompactSummaries(vault);
   assert.equal(harvested.length, 1, "path-only boots must still harvest");
   assert.equal(harvested[0].platform, "codex");
+});
+
+// agy/gemini always attaches transcriptPath and never sends `source`. Path-only
+// would turn every cold boot into an unbudgeted ≤4 MiB tail-read for a
+// guaranteed no_summary_found (non–Claude-shaped JSONL). Gate must skip.
+test("shared SessionStart skips path-only harvest on gemini (always-path, no source)", async () => {
+  const vault = await tmpVault();
+  const file = await tmpTranscript([
+    transcriptLine({ type: "user", message: { role: "user", content: "hello" } }),
+    transcriptLine(summaryEntry("uuid-gemini-path-only", SUMMARY_TEXT)),
+  ]);
+  const handlers = sharedHandlers(vault, {
+    agentId: "gemini",
+    runtime: "gemini",
+    auditPrefix: "hook_gemini",
+    sessionStartHookTimeoutMs: 10_000,
+  });
+  await handlers.handleSessionStart({
+    session_id: "s-gemini-cold",
+    // agy live shape: camelCase path, no source field
+    transcriptPath: file,
+  });
+  assert.equal(
+    (await listCompactSummaries(vault)).length,
+    0,
+    "gemini path-only cold boot must not harvest / tail-read",
+  );
+});
+
+// Explicit compact|resume still harvests on gemini if a host ever sends it.
+test("shared SessionStart harvests on gemini when source is compact", async () => {
+  const vault = await tmpVault();
+  const file = await tmpTranscript([
+    transcriptLine({ type: "user", message: { role: "user", content: "hello" } }),
+    transcriptLine(summaryEntry("uuid-gemini-compact", SUMMARY_TEXT)),
+  ]);
+  const handlers = sharedHandlers(vault, {
+    agentId: "gemini",
+    runtime: "gemini",
+    auditPrefix: "hook_gemini",
+  });
+  await handlers.handleSessionStart({
+    session_id: "s-gemini-compact",
+    transcriptPath: file,
+    source: "compact",
+  });
+  const harvested = await listCompactSummaries(vault);
+  assert.equal(harvested.length, 1, "gemini compact source must still harvest");
+  assert.equal(harvested[0].platform, "gemini");
 });
 
 // Dual delivery paths must stamp the same platform provenance.
