@@ -1410,7 +1410,7 @@ export function createHookHandlers(
         // PostCompact is exactly that case on this generic path: it is a valid
         // envelope event, so it gets in here, and then falls through to a
         // silent success. Record it, then continue as before.
-        await recordUnroutedEvent(config, event);
+        await recordUnroutedEvent(config.vaultPath, config.auditPrefix, event);
         return render(noIntent);
     }
   }
@@ -1437,15 +1437,16 @@ export function createHookHandlers(
  *
  * Best-effort: losing the audit record must never also lose the event.
  */
-async function recordUnroutedEvent(
-  config: AgentHookConfig,
+export async function recordUnroutedEvent(
+  vaultPath: string,
+  auditPrefix: string,
   event: string,
 ): Promise<void> {
   try {
-    await recordAudit(config.vaultPath, {
-      tool: `${config.auditPrefix}_intent_dropped`,
+    await recordAudit(vaultPath, {
+      tool: `${auditPrefix}_intent_dropped`,
       summary: `${event || "(empty)"}: event not routed by this hook (no handler)`,
-      throttleKey: `${config.auditPrefix}_intent_dropped__unrouted__${event}`,
+      throttleKey: `${auditPrefix}_intent_dropped__unrouted__${event}`,
     });
   } catch {
     // Audit unavailable. The drop is still correct behavior.
@@ -1496,7 +1497,7 @@ export async function runHookMain(config: AgentHookConfig): Promise<void> {
     // whole clean-continue swallow: the manifest says the event is wired, the
     // exit code says it went fine, and nothing anywhere records that it was
     // dropped on the floor. Count it before continuing.
-    await recordUnroutedEvent(config, event);
+    await recordUnroutedEvent(config.vaultPath, config.auditPrefix, event);
     emit({ continue: true });
     return;
   }

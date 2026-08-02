@@ -6,7 +6,7 @@ import {
   CURSOR_WORKSPACE_ID,
 } from "./config.js";
 import { adaptCursorOutput, adaptCursorPayload, CURSOR_EVENTS } from "./cursor-adapter.js";
-import { createHookHandlers } from "./hook-handlers.js";
+import { createHookHandlers, recordUnroutedEvent } from "./hook-handlers.js";
 import { cursorWire } from "./hook-platform.js";
 import { asString, emit, readStdin } from "./hook-utils.js";
 import {
@@ -50,6 +50,12 @@ async function main(): Promise<void> {
   const cursorEvent = (process.argv[2] ?? asString(raw.hook_event_name)).trim();
   const event = CURSOR_EVENTS[cursorEvent];
   if (!CONFIG.hooksEnabled || !event) {
+    // P4 (#228): hooks-disabled is a deliberate no-op and stays silent; an
+    // UNKNOWN event is a drop and must be recorded, or a Cursor event Minni
+    // does not map reads exactly like one that was never sent.
+    if (CONFIG.hooksEnabled) {
+      await recordUnroutedEvent(CONFIG.vaultPath, CONFIG.auditPrefix, cursorEvent);
+    }
     emit(cursorEvent === "preToolUse" ? { permission: "allow" } : { continue: true });
     return;
   }

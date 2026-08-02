@@ -27,7 +27,7 @@ import {
   enrichAgyPromptPayload,
   enrichAgyStopPayload,
 } from "./gemini-adapter.js";
-import { createHookHandlers } from "./hook-handlers.js";
+import { createHookHandlers, recordUnroutedEvent } from "./hook-handlers.js";
 import { geminiWire } from "./hook-platform.js";
 import type { AgentHookConfig } from "./hook-handlers.js";
 import { VALID_EVENTS, asString, emit, readStdin } from "./hook-utils.js";
@@ -106,6 +106,8 @@ async function main(): Promise<void> {
   const raw = (await readStdin()) as Record<string, unknown>;
   const event = eventArg || asString(raw.hook_event_name).trim();
   if (event !== PRE_TOOL_USE_EVENT && !VALID_EVENTS.includes(event as EnvelopeEvent)) {
+    // P4 (#228): record the drop instead of exiting clean and silent.
+    await recordUnroutedEvent(CONFIG.vaultPath, CONFIG.auditPrefix, event);
     emitNoop();
     return;
   }

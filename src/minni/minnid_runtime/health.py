@@ -31,6 +31,16 @@ _HEALTH_REPORT_SENSITIVE_KEYS = (
 )
 
 
+# GA6-2: the four consolidation-tick sub-ops, named explicitly so this field
+# stays scoped to the subsystem it describes.
+CONSOLIDATION_FAILURE_COUNTERS = (
+    "inbox_ingest_failures_total",
+    "inbox_quarantine_failures_total",
+    "inbox_archive_failures_total",
+    "compact_distillation_failures_total",
+)
+
+
 def redact_health_report_for_recovery(report: dict) -> dict:
     """Strip document paths and learning contents from a pre-identity health_report.
 
@@ -562,10 +572,17 @@ def handle_health_report(params: dict, request_id: Any, context: HealthContext) 
             # copy of the counters. The delta variant advances a baseline, and
             # a report must never consume the deltas a status poll is reading.
             counters = context.metrics_snapshot()
+            # Whitelisted, not suffix-matched. A bare `_failures_total` filter
+            # also swept in afm_pass_failures_total and
+            # afm_loop_tick_failures_total, so a synthesis-pass fault flipped
+            # THIS field to "failing" — a different subsystem's problem
+            # reported as an ingest problem, which is exactly the kind of
+            # mis-attribution this whole slice exists to end. (Review round 1
+            # on PR #260.)
             failures = {
-                name: value
-                for name, value in counters.items()
-                if name.endswith("_failures_total") and value
+                name: counters[name]
+                for name in CONSOLIDATION_FAILURE_COUNTERS
+                if counters.get(name)
             }
             backlog = 0
             for inbox in discover_inboxes(context.default_config):

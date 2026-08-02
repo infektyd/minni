@@ -49,6 +49,12 @@ const LAST_PROMPT_MAX = 64;
 // from the front drops the oldest session.
 const PENDING_MAX = 64;
 const BOOTED_MAX = 256;
+// #7 (review round 1): the diagnostic path needs its own bounds — see
+// reportBridgeFailure.
+const DIAGNOSTIC_TIMEOUT_MS = 5_000;
+const DIAGNOSTIC_MAX_IN_FLIGHT = 4;
+let diagnosticsInFlight = 0;
+let diagnosticsSuppressed = 0;
 
 function evictOldest(collection, max, label) {
   while (collection.size > max) {
@@ -110,12 +116,34 @@ function runHook(event, payload) {
 function reportBridgeFailure(event, error) {
   const detail = error instanceof Error ? error.message : String(error);
   console.warn(`[minni] ${event} hook unavailable; continuing: ${detail}`);
+  // Bounded on BOTH axes. This runs on the failure path, where failures arrive
+  // in storms: without a concurrency cap a burst of hook timeouts spawns a
+  // diagnostic per failure, and without a kill timer each one can hang exactly
+  // the way the call it is reporting hung. Either way the degraded bridge
+  // becomes a pile of stuck node processes.
+  if (diagnosticsInFlight >= DIAGNOSTIC_MAX_IN_FLIGHT) {
+    diagnosticsSuppressed += 1;
+    console.warn(
+      `[minni] bridge diagnostic suppressed (${diagnosticsInFlight} in flight, ` +
+        `${diagnosticsSuppressed} suppressed since start)`,
+    );
+    return;
+  }
   try {
     const child = spawn("node", [HOOK_SCRIPT, "BridgeFailure"], {
       env: { ...process.env, ...HOOK_ENV },
       stdio: ["pipe", "ignore", "ignore"],
       detached: false,
     });
+    diagnosticsInFlight += 1;
+    const kill = setTimeout(() => child.kill("SIGKILL"), DIAGNOSTIC_TIMEOUT_MS);
+    const settle = () => {
+      clearTimeout(kill);
+      diagnosticsInFlight -= 1;
+    };
+    child.once("close", settle);
+    child.once("error", settle);
+    child.unref();
     child.on("error", () => {});
     child.stdin.on("error", () => {});
     child.stdin.end(
@@ -145,7 +173,15 @@ function queueContext(sessionID, result) {
   if (!context) return;
   const contexts = pending.get(sessionID) || [];
   contexts.push(context);
+  // Re-inserting moves it to the end, so the eviction below is LRU-ish —
+  // same shape as lastPrompt.
+  pending.delete(sessionID);
   pending.set(sessionID, contexts);
+  // P5 (review round 1): bound at INSERT, exactly as lastPrompt does. Bounding
+  // only inside the session.deleted branch left the maps unbounded whenever
+  // that event is missing or delayed (version skew, bus drop) — the very leak
+  // class the lastPrompt fix already solved correctly.
+  evictOldest(pending, PENDING_MAX, "pending context");
 }
 
 // Post-compaction summary read-back (plan-3e5a410b9ab6f715). Kilo's
@@ -195,6 +231,7 @@ const MinniPlugin = async ({ directory, client }) => ({
       if (boot) {
         queueContext(input.sessionID, boot);
         booted.add(input.sessionID);
+        evictOldest(booted, BOOTED_MAX, "booted session");
       }
     }
     const prompt = output.parts
@@ -262,8 +299,9 @@ const MinniPlugin = async ({ directory, client }) => ({
       // Same remedy as lastPrompt: do NOT honor the premature delete, and
       // bound the maps instead so a long-lived process cannot grow them. The
       // eviction is what is counted, because that is the only real loss.
-      evictOldest(pending, PENDING_MAX, "pending context");
-      evictOldest(booted, BOOTED_MAX, "booted session");
+      // Deliberately a no-op for THIS session: the maps are bounded at insert
+      // (above), so there is nothing left for this branch to do beyond not
+      // destroying live state.
     }
   },
 });

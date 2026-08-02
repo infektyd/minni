@@ -524,18 +524,57 @@ def test_consolidation_sub_op_failures_reach_the_error_ring():
 def test_failed_tick_does_not_consume_the_full_retry_window():
     """AFM-8: `last_run[name] = time.time()` sat OUTSIDE the try, so a run that
     accomplished nothing consumed the whole 24h window — a failing pass looked
-    exactly like one that ran and had nothing to do. Fails pre-R8: the source
-    advanced last_run unconditionally."""
+    exactly like one that ran and had nothing to do.
+
+    Behavioral, not a source grep. Review round 1 on PR #260 caught that the
+    first version of this fix put the backoff in the loop's `except`, which
+    handle_daemon_compile never reaches because it swallows the exception and
+    RETURNS — so the line was dead and a grep-based test passed anyway.
+    """
+    from minni.minnid_runtime.afm import _FAILURE_RETRY_SECONDS, next_last_run
+
+    interval = 24 * 60 * 60
+    now = 1_000_000.0
+
+    healthy = next_last_run(interval, now, failed=False)
+    assert healthy == now, "a successful tick records now"
+
+    failed = next_last_run(interval, now, failed=True)
+    retry_in = failed + interval - now
+    assert retry_in == _FAILURE_RETRY_SECONDS, (
+        "a failed tick must be retried after the backoff, not after the full "
+        f"interval (got {retry_in}s, expected {_FAILURE_RETRY_SECONDS}s)"
+    )
+    assert _FAILURE_RETRY_SECONDS < interval
+
+
+def test_a_returned_failure_status_counts_as_a_failed_tick():
+    """The load-bearing half of the fix: handle_daemon_compile does NOT raise,
+    it RETURNS a failure status. If the loop does not read the response, the
+    backoff above never fires and the original defect is still live."""
+    from minni.minnid_runtime.afm import compile_failure_status
+
+    assert compile_failure_status({"result": {"status": "afm_unavailable"}}) == "afm_unavailable"
+    assert compile_failure_status({"result": {"status": "write_failed"}}) == "write_failed"
+    # A successful compile must not be mistaken for a failure.
+    assert compile_failure_status({"result": {"status": "ok", "summary": {}}}) is None
+    assert compile_failure_status({"result": {"summary": {"examined": 3}}}) is None
+    assert compile_failure_status(None) is None
+
+
+def test_loop_consults_the_returned_status_not_only_exceptions():
+    """Pins the wiring itself: a tick's last_run decision must be reachable
+    from a RETURNED failure, which is the route real pass failures take."""
     from pathlib import Path
 
     import minni.minnid_runtime.afm as afm_mod
 
     source = Path(afm_mod.__file__).read_text(encoding="utf-8")
-    assert "_FAILURE_RETRY_SECONDS" in source
-    assert "last_run[name] = time.time() - max(0, interval - _FAILURE_RETRY_SECONDS)" in source, (
-        "a failed tick must back off, not consume the whole interval"
+    assert "compile_failure_status(res)" in source, (
+        "the loop must inspect the compile response — the exception path alone "
+        "is dead code for the failure mode AFM-8 is about"
     )
-    assert afm_mod._FAILURE_RETRY_SECONDS < 24 * 60 * 60
+    assert "next_last_run(interval, time.time(), tick_failed)" in source
 
 
 # ── #230 AFM-9: dropped distillation groups must be counted ──────────────────
@@ -591,6 +630,112 @@ def test_health_report_declares_consolidation_ingest_fields():
     source = Path(health_mod.__file__).read_text(encoding="utf-8")
     assert '"consolidation_ingest"' in source
     assert '"inbox_backlog"' in source
+
+
+# ── Review round 1 (PR #260): the degrade flags must be thread-safe ─────────
+
+
+def test_degrade_flags_are_thread_local_like_auth_suppression(tmp_path, monkeypatch):
+    """The daemon hands every `search` RPC the SAME process-wide engine on its
+    own worker thread. A plain instance attribute lets a concurrent request
+    clear this one's flag between retrieve() returning and the handler reading
+    it — reporting a degraded search as healthy, or pinning one caller's
+    failure on another. last_auth_suppression already solved this; the new
+    flags must use the same pattern."""
+    import threading
+
+    engine = _engine_without_model(tmp_path, monkeypatch)
+    engine.last_rerank_degraded = "this thread's failure"
+    engine.last_query_expand_degraded = "this thread's expand failure"
+
+    seen = {}
+
+    def _other_thread():
+        # A concurrent request clearing its own flags, as retrieve() does on entry.
+        engine.last_rerank_degraded = None
+        engine.last_query_expand_degraded = None
+        seen["other_reads"] = engine.last_rerank_degraded
+
+    thread = threading.Thread(target=_other_thread)
+    thread.start()
+    thread.join()
+
+    assert seen["other_reads"] is None, "the other thread sees its own state"
+    assert engine.last_rerank_degraded == "this thread's failure", (
+        "a concurrent request must not be able to clear THIS request's degrade "
+        "flag — that reports a degraded search as healthy"
+    )
+    assert engine.last_query_expand_degraded == "this thread's expand failure"
+
+
+def test_degrade_flags_work_on_instances_that_bypass_init():
+    """Test fakes built via object.__new__ must still get a working store —
+    the same lazy-init guarantee the auth-suppression setter makes."""
+    from minni.retrieval import RetrievalEngine
+
+    engine = object.__new__(RetrievalEngine)
+    assert engine.last_rerank_degraded is None
+    engine.last_rerank_degraded = "boom"
+    assert engine.last_rerank_degraded == "boom"
+
+
+# ── Review round 1: a degrade in ANY query variant degrades the merge ───────
+
+
+def test_rerank_degrade_survives_a_later_healthy_variant(tmp_path, monkeypatch):
+    """Each recursive retrieve() clears the flags on entry, so an early
+    variant's failure was wiped by a later healthy one and the merged response
+    reported a clean cross-corpus ordering it did not have. Auth suppressions
+    were already aggregated for exactly this reason; these were not."""
+    import minni.retrieval as retrieval_mod
+
+    engine = _engine_without_model(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        retrieval_mod, "expand_query", lambda query, mode="rule": ["v1", "v2"]
+    )
+
+    # _filter_candidates runs once per variant on the single-variant path, so
+    # it is a reliable place to stand in for "this variant degraded" without
+    # needing a live reranker configured.
+    calls = {"n": 0}
+    real_filter = engine._filter_candidates
+
+    def _degrade_on_first_variant(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            engine.last_rerank_degraded = "reranker died on v1"
+        return real_filter(*args, **kwargs)
+
+    monkeypatch.setattr(engine, "_filter_candidates", _degrade_on_first_variant)
+    engine.retrieve(query="anything", limit=3)
+
+    assert calls["n"] >= 2, "precondition: both variants ran"
+
+    assert engine.last_rerank_degraded is not None, (
+        "a degrade in the FIRST variant must survive a healthy second variant — "
+        "the merge still mixed a leg that was not reranked"
+    )
+    assert "v1" in engine.last_rerank_degraded
+
+
+# ── Review round 1: the ingest health field must stay ingest-scoped ─────────
+
+
+def test_consolidation_ingest_failures_exclude_other_subsystems():
+    """A bare `_failures_total` suffix filter also swept in
+    afm_pass_failures_total and afm_loop_tick_failures_total, so a synthesis
+    pass fault flipped the INGEST field to failing — one subsystem's problem
+    reported as another's."""
+    from minni.minnid_runtime.health import CONSOLIDATION_FAILURE_COUNTERS
+
+    assert "afm_pass_failures_total" not in CONSOLIDATION_FAILURE_COUNTERS
+    assert "afm_loop_tick_failures_total" not in CONSOLIDATION_FAILURE_COUNTERS
+    assert set(CONSOLIDATION_FAILURE_COUNTERS) == {
+        "inbox_ingest_failures_total",
+        "inbox_quarantine_failures_total",
+        "inbox_archive_failures_total",
+        "compact_distillation_failures_total",
+    }
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────

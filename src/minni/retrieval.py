@@ -378,10 +378,14 @@ class RetrievalEngine:
         # carrying no rerank_score, which drops that corpus to raw RRF
         # magnitude. Recorded per-retrieve so the merged response can say the
         # ordering is not what it claims to be.
-        self.last_rerank_degraded: Optional[str] = None
-        # AFM-6 (#230): set when expand_query raised and recall silently fell
-        # back to the bare query.
-        self.last_query_expand_degraded: Optional[str] = None
+        # Thread-local for exactly the reason last_auth_suppression is (see the
+        # comment on _auth_suppression_local below): dispatch runs each `search`
+        # RPC on its own worker thread against ONE process-wide engine, so a
+        # plain instance attribute would let a concurrent request clear this in
+        # the window between retrieve() returning and the handler reading it —
+        # reporting a degraded search as healthy, or pinning one caller's
+        # failure on another. Review round 1 on PR #260 caught this.
+        self._degradation_local = threading.local()
         # P0-A contract: when the read-authorization gate suppresses a
         # non-empty candidate set to zero, the reason is recorded so the caller
         # can return a diagnostic envelope instead of a bare [].
@@ -423,6 +427,44 @@ class RetrievalEngine:
             local = threading.local()
             self._auth_suppression_local = local
         local.value = value
+
+    def _degradation_flag(self, name: str) -> Optional[str]:
+        local = getattr(self, "_degradation_local", None)
+        return getattr(local, name, None) if local is not None else None
+
+    def _set_degradation_flag(self, name: str, value: Optional[str]) -> None:
+        # Lazy-init like the auth-suppression setter, so instances built via
+        # object.__new__ (test fakes bypassing __init__) still work.
+        local = getattr(self, "_degradation_local", None)
+        if local is None:
+            local = threading.local()
+            self._degradation_local = local
+        setattr(local, name, value)
+
+    @property
+    def last_rerank_degraded(self) -> Optional[str]:
+        """R5 (#226): why the reranker failed on THIS thread's last retrieve().
+
+        A rerank failure leaves candidates with no rerank_score, so in a
+        combined/both merge this corpus competes at raw RRF magnitude against
+        reranked corpora and is silently evicted. Per-thread, so concurrent
+        searches never read each other's verdict.
+        """
+        return self._degradation_flag("rerank")
+
+    @last_rerank_degraded.setter
+    def last_rerank_degraded(self, value: Optional[str]) -> None:
+        self._set_degradation_flag("rerank", value)
+
+    @property
+    def last_query_expand_degraded(self) -> Optional[str]:
+        """AFM-6 (#230): why expansion failed and recall fell back to the bare
+        query, for THIS thread's last retrieve()."""
+        return self._degradation_flag("query_expand")
+
+    @last_query_expand_degraded.setter
+    def last_query_expand_degraded(self, value: Optional[str]) -> None:
+        self._set_degradation_flag("query_expand", value)
 
     @property
     def model(self):
@@ -2561,10 +2603,13 @@ class RetrievalEngine:
         With backend=None (default), results are bit-identical to pre-PR-3.
         """
         claim_text = str(claim or "").strip()
-        # R5 (#226): per-retrieve, so a stale flag from an earlier call never
-        # reports this one as degraded. The multi-variant branch below recurses,
-        # and a degrade in ANY variant degrades the merge, so it is deliberately
-        # NOT cleared again after the recursion.
+        # R5 (#226) / AFM-6 (#230): cleared per-retrieve so a stale flag from an
+        # earlier call never reports this one as degraded. The multi-variant
+        # branch below RECURSES, and each recursive call clears these again on
+        # entry — so a degrade in an early variant would be wiped by a later
+        # healthy one. Aggregated explicitly after the merge, exactly as
+        # variant_suppressions already does. (Review round 1 on PR #260: an
+        # earlier comment here claimed no re-clearing happened. It did.)
         self.last_rerank_degraded = None
         self.last_query_expand_degraded = None
         query_variants = self._resolve_query_variants(query, expand)
@@ -2577,6 +2622,9 @@ class RetrievalEngine:
             # run last. Collect per-variant suppressions and re-aggregate after
             # the merge.
             variant_suppressions: List[Dict] = []
+            # Same aggregation, same reason: the recursion clears these on entry.
+            variant_rerank_degraded: List[str] = []
+            variant_expand_degraded: List[str] = []
             for variant in query_variants:
                 per_variant.append(self.retrieve(
                     query=variant,
@@ -2607,7 +2655,24 @@ class RetrievalEngine:
                     variant_suppressions.append(
                         {**self.last_auth_suppression, "variant": variant}
                     )
+                if self.last_rerank_degraded:
+                    variant_rerank_degraded.append(
+                        f"{variant}: {self.last_rerank_degraded}"
+                    )
+                if self.last_query_expand_degraded:
+                    variant_expand_degraded.append(
+                        f"{variant}: {self.last_query_expand_degraded}"
+                    )
             results = self._merge_expanded_results(per_variant, query_variants, limit)
+            # A degrade in ANY variant degrades the merge — the merged ordering
+            # mixed a leg that was not reranked. Set AFTER the loop, because the
+            # last variant's clear would otherwise decide the whole verdict.
+            self.last_rerank_degraded = (
+                "; ".join(variant_rerank_degraded) if variant_rerank_degraded else None
+            )
+            self.last_query_expand_degraded = (
+                "; ".join(variant_expand_degraded) if variant_expand_degraded else None
+            )
             # Aggregate: any variant whose non-empty candidate set was gated to
             # zero keeps the blackout visible, regardless of variant order.
             # (recall.py only surfaces it when the merged result is empty.)

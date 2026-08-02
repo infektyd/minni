@@ -60,10 +60,47 @@ def loop_principal() -> EffectivePrincipal:
     )
 
 
-# AFM-8 (#230): how soon a pass that RAISED is retried. Short enough that a
+# AFM-8 (#230): how soon a pass that FAILED is retried. Short enough that a
 # transient fault is not punished with the full interval, long enough that a
 # pass failing instantly cannot spin the loop.
 _FAILURE_RETRY_SECONDS = 300
+
+# handle_daemon_compile does NOT re-raise: it catches every exception and
+# RETURNS one of these statuses. Review round 1 on PR #260 caught that a
+# backoff placed only in the loop's `except` was therefore dead code for the
+# exact failure mode AFM-8 is about — the loop's try never sees the exception,
+# so a pass failing instantly still burned the full 24h interval while status
+# read "failing". The tick decision has to read the RESPONSE, not rely on an
+# exception that never arrives.
+_COMPILE_FAILURE_STATUSES = frozenset({"afm_unavailable", "write_failed"})
+
+
+def compile_failure_status(res: Any) -> Optional[str]:
+    """The failure status carried by a handle_daemon_compile response, if any.
+
+    Returns None for a successful (or unrecognizable) response, so a caller can
+    treat "not a known failure" as success without guessing.
+    """
+    if not isinstance(res, dict):
+        return None
+    payload = res.get("result")
+    if not isinstance(payload, dict):
+        return None
+    status = payload.get("status")
+    return status if status in _COMPILE_FAILURE_STATUSES else None
+
+
+def next_last_run(interval: float, now: float, failed: bool) -> float:
+    """The ``last_run`` stamp a just-finished tick should record.
+
+    A failed tick backs off to :data:`_FAILURE_RETRY_SECONDS` instead of
+    consuming the whole interval; a successful one records now. Pulled out as a
+    pure function so the scheduling decision is testable without driving the
+    async loop — the behavior, not the source text, is what needs pinning.
+    """
+    if not failed:
+        return now
+    return now - max(0, interval - _FAILURE_RETRY_SECONDS)
 
 
 def afm_loop_enabled(config=DEFAULT_CONFIG) -> bool:
@@ -518,6 +555,10 @@ async def afm_loop_runner(context: AFMContext):
             interval = int((cfg or {}).get("interval_seconds", 24 * 60 * 60))
             if now - last_run.get(name, 0.0) < interval:
                 continue
+            # AFM-8: set by ANY compile in this tick that came back with a
+            # failure status. handle_daemon_compile swallows the exception and
+            # returns, so this is the only place the failure is observable.
+            tick_failed = False
             try:
                 context.logger.info("AFM loop: running pass '%s'", name)
                 params = {
@@ -714,6 +755,15 @@ async def afm_loop_runner(context: AFMContext):
                     last_summ = None
                     while batches < max_batches:
                         res = handle_daemon_compile(params, request_id=None, context=context)
+                        failure = compile_failure_status(res)
+                        if failure:
+                            tick_failed = True
+                            context.logger.warning(
+                                "AFM loop: consolidation batch %d returned %s: %s",
+                                batches + 1, failure,
+                                (res.get("result") or {}).get("reason"),
+                            )
+                            break
                         last_summ = (res.get("result") or {}).get("summary") if isinstance(res, dict) else None
                         batches += 1
                         examined = (last_summ or {}).get("examined", 0)
@@ -729,8 +779,16 @@ async def afm_loop_runner(context: AFMContext):
                     )
                 else:
                     res = handle_daemon_compile(params, request_id=None, context=context)
-                    summ = (res.get("result") or {}).get("summary") if isinstance(res, dict) else None
-                    context.logger.info("AFM loop: pass '%s' done: %s", name, summ)
+                    failure = compile_failure_status(res)
+                    if failure:
+                        tick_failed = True
+                        context.logger.warning(
+                            "AFM loop: pass '%s' returned %s: %s",
+                            name, failure, (res.get("result") or {}).get("reason"),
+                        )
+                    else:
+                        summ = (res.get("result") or {}).get("summary") if isinstance(res, dict) else None
+                        context.logger.info("AFM loop: pass '%s' done: %s", name, summ)
             except Exception as exc:
                 context.logger.exception("AFM loop: pass '%s' raised (skipped)", name)
                 obs.incr("afm_loop_tick_failures_total")
@@ -740,15 +798,15 @@ async def afm_loop_runner(context: AFMContext):
 
                 record_pass_attempt(name)
                 record_pass_failure(name, str(exc))
-                # AFM-8 (#230): last_run used to advance here unconditionally,
-                # so a tick that accomplished nothing consumed the whole
-                # interval — a pass failing instantly retried only once every
-                # 24h and looked, from outside, exactly like a pass that ran
-                # and had nothing to do. Back off instead of skipping the
-                # retry entirely: a fast-failing pass must not spin the loop.
-                last_run[name] = time.time() - max(0, interval - _FAILURE_RETRY_SECONDS)
-                continue
-            last_run[name] = time.time()
+                tick_failed = True
+            # AFM-8 (#230): last_run used to advance unconditionally, so a tick
+            # that accomplished nothing consumed the whole interval — a pass
+            # failing instantly retried only once every 24h and looked, from
+            # outside, exactly like a pass that ran and had nothing to do.
+            # `tick_failed` covers BOTH routes a failure can take: an exception
+            # the loop sees, and (the common one) a failure status returned by
+            # handle_daemon_compile, which never raises.
+            last_run[name] = next_last_run(interval, time.time(), tick_failed)
         await asyncio.sleep(idle_seconds)
     context.logger.info("AFM loop runner stopped.")
 

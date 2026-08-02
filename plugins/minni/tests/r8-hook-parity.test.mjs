@@ -247,6 +247,105 @@ test("P6: the hook routes BridgeFailure before the VALID_EVENTS gate", async () 
   );
 });
 
+// ── Review round 1 (PR #260): P4 must cover every entry point ─────────────
+
+test("P4: every hook entry point records an unrouted event, not just the factory", async () => {
+  // The first version of this fix only covered hook-handlers.ts. Claude Code
+  // is the PRIMARY manifest and runs hook.ts, which had its own clean-continue
+  // swallow in both the VALID_EVENTS gate and the dispatch default; Gemini and
+  // Cursor had theirs too. A fix that misses the primary path is not a fix.
+  for (const entry of [
+    "hook.ts",
+    "gemini-hook.ts",
+    "cursor-hook.ts",
+    "hook-handlers.ts",
+  ]) {
+    const source = await readFile(path.join(PLUGIN_ROOT, "src", entry), "utf8");
+    assert.match(
+      source,
+      /recordUnroutedEvent\(/,
+      `${entry} still exits clean and silent on an event it does not route`,
+    );
+  }
+});
+
+test("P4: hook.ts records the drop on BOTH of its swallow paths", async () => {
+  const source = await readFile(path.join(PLUGIN_ROOT, "src", "hook.ts"), "utf8");
+  const calls = [...source.matchAll(/recordUnroutedEvent\(/g)];
+  assert.ok(
+    calls.length >= 2,
+    "the VALID_EVENTS gate and the dispatch default are two separate swallows",
+  );
+});
+
+test("P4: Cursor stays silent when hooks are DISABLED, loud on an unknown event", async () => {
+  // A deliberate opt-out is not a drop; conflating them would make the signal
+  // noise and train people to ignore it.
+  const source = await readFile(
+    path.join(PLUGIN_ROOT, "src", "cursor-hook.ts"),
+    "utf8",
+  );
+  const branch = source.indexOf("if (!CONFIG.hooksEnabled || !event)");
+  assert.ok(branch !== -1);
+  const window = source.slice(branch, branch + 700);
+  assert.match(window, /if \(CONFIG\.hooksEnabled\)/);
+});
+
+// ── Review round 1: P5 must bound at INSERT, not only on session.deleted ──
+
+test("P5: pending and booted are bounded at insert, not only on session.deleted", async () => {
+  // Bounding only inside the session.deleted branch left the maps unbounded
+  // whenever that event is missing or delayed (version skew, bus drop) — the
+  // exact leak class the lastPrompt fix already solved correctly.
+  const source = await readFile(
+    path.join(PLUGIN_ROOT, "kilo", "minni-plugin.js"),
+    "utf8",
+  );
+
+  const queue = source.indexOf("function queueContext(");
+  assert.ok(queue !== -1);
+  assert.match(
+    source.slice(queue, queue + 700),
+    /evictOldest\(pending/,
+    "pending must be bounded where it GROWS",
+  );
+
+  const boot = source.indexOf("booted.add(input.sessionID)");
+  assert.ok(boot !== -1);
+  assert.match(source.slice(boot, boot + 200), /evictOldest\(booted/);
+});
+
+test("P5: the session.deleted branch no longer carries the only bound", async () => {
+  const source = await readFile(
+    path.join(PLUGIN_ROOT, "kilo", "minni-plugin.js"),
+    "utf8",
+  );
+  const branch = source.indexOf('event?.type === "session.deleted"');
+  const window = source.slice(branch, branch + 800);
+  assert.doesNotMatch(window, /pending\.delete\(sessionID\)/);
+  assert.doesNotMatch(window, /booted\.delete\(sessionID\)/);
+});
+
+// ── Review round 1: the diagnostic spawn must be bounded ─────────────────
+
+test("P6: the bridge diagnostic is killed on a timer and capped in flight", async () => {
+  // It runs on the failure path, where failures arrive in storms. Unbounded,
+  // a burst of hook timeouts leaves a pile of hung node processes, each
+  // hanging exactly the way the call it is reporting hung.
+  const source = await readFile(
+    path.join(PLUGIN_ROOT, "kilo", "minni-plugin.js"),
+    "utf8",
+  );
+  assert.match(source, /const DIAGNOSTIC_TIMEOUT_MS = [\d_]+/);
+  assert.match(source, /const DIAGNOSTIC_MAX_IN_FLIGHT = \d+/);
+
+  const report = source.indexOf("function reportBridgeFailure");
+  const window = source.slice(report, report + 1600);
+  assert.match(window, /setTimeout\(/, "the diagnostic child needs a kill timer");
+  assert.match(window, /child\.unref\(\)/);
+  assert.match(window, /diagnosticsInFlight/);
+});
+
 // ── helper ─────────────────────────────────────────────────────────────────
 
 /** The set of events a hook entry point actually routes (its switch cases). */

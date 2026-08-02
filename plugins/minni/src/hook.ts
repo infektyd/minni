@@ -37,7 +37,7 @@ import {
 import { harvestCompactSummary, harvestSummaryText } from "./compact-harvest.js";
 import { claudeCodeWire } from "./hook-platform.js";
 import type { HookOutput } from "./hook-utils.js";
-import { handleStopCore } from "./hook-handlers.js";
+import { handleStopCore, recordUnroutedEvent } from "./hook-handlers.js";
 import type { StopCoreConfig } from "./hook-handlers.js";
 import { routeMemoryIntent } from "./policy.js";
 import {
@@ -953,6 +953,9 @@ async function dispatch(
     case PRE_TOOL_USE_EVENT:
       return handlePreToolUse(payload);
     default:
+      // P4 (#228): a valid event with no case here used to exit clean with no
+      // marker, so a drop was indistinguishable from an event never sent.
+      await recordUnroutedEvent(CLAUDECODE_VAULT_PATH, "hook", event);
       return { continue: true };
   }
 }
@@ -969,6 +972,9 @@ async function main(): Promise<void> {
   // PreToolUse is dispatched here too but is NOT an EnvelopeEvent (its output is
   // the permissionDecision shape), so it is gated alongside VALID_EVENTS.
   if (event !== PRE_TOOL_USE_EVENT && !VALID_EVENTS.includes(event as EnvelopeEvent)) {
+    // P4 (#228): same clean-continue swallow as the dispatch default. Claude
+    // Code is the primary manifest, so this is the path that mattered most.
+    await recordUnroutedEvent(CLAUDECODE_VAULT_PATH, "hook", event);
     emit({ continue: true });
     return;
   }
