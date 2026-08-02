@@ -111,8 +111,12 @@ test: test-engine test-plugin
 
 # Full engine suite is heavy (loads embedding/FAISS models). Override the scope
 # with ENGINE_PYTEST, e.g. `make test-engine ENGINE_PYTEST="tests/test_obs.py -q"`.
+# PYTHONPATH=src (#258): an editable install from another checkout must not win
+# over this tree when pytest runs from a git worktree. conftest.py also enforces
+# this; the env var covers direct `python -m pytest` without relying on import
+# order alone.
 test-engine:
-	$(VENV_PY) -m pytest $(ENGINE_PYTEST)
+	PYTHONPATH=src:$$PYTHONPATH $(VENV_PY) -m pytest $(ENGINE_PYTEST)
 
 test-plugin:
 	cd $(PLUGIN_DIR) && npm test
@@ -132,7 +136,7 @@ coverage-plugin:
 	cd $(PLUGIN_DIR) && npm run coverage
 
 coverage-engine:
-	$(VENV_PY) -m pytest --cov=minni --cov-report=term-missing $(COV_PYTEST)
+	PYTHONPATH=src:$$PYTHONPATH $(VENV_PY) -m pytest --cov=minni --cov-report=term-missing $(COV_PYTEST)
 
 # ── Validation gate ────────────────────────────────────────────────────────
 # Fast, deterministic gate suitable for pre-push / CI. Runs both surfaces'
@@ -140,7 +144,7 @@ coverage-engine:
 .PHONY: check
 check: lint typecheck build
 	cd $(PLUGIN_DIR) && npm test
-	$(VENV_PY) -m pytest $(CHECK_PYTEST)
+	PYTHONPATH=src:$$PYTHONPATH $(VENV_PY) -m pytest $(CHECK_PYTEST)
 
 # ── Engine runtime ─────────────────────────────────────────────────────────
 .PHONY: smoke

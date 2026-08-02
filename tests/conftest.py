@@ -1,6 +1,13 @@
 """Engine test hygiene.
 
-Two isolation guarantees are established here:
+Three isolation guarantees are established here:
+
+0. Worktree import resolution (#258). An editable install from a *primary*
+   checkout puts that checkout's ``src/`` on ``sys.path`` via a ``.pth`` entry.
+   pytest run from a git worktree would then resolve ``import minni`` to
+   **main**, not the branch under test — green means the wrong tree passed.
+   Before any engine import, prepend *this* tree's ``src/`` so it wins, and
+   fail loudly if a later import still lands outside the running repo root.
 
 1. MINNI_HOME isolation (PR92-4). ``config.py`` freezes ``CANONICAL_SOVEREIGN_HOME``
    and the ``SovereignConfig`` field defaults (``db_path`` / ``vault_path`` /
@@ -19,7 +26,18 @@ Two isolation guarantees are established here:
 """
 
 import os
+import sys
 import tempfile
+
+# --- (0) This-tree src/ must win over an editable install from another checkout.
+# tests/conftest.py → repo root is parent of tests/; package lives in src/minni.
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
+_SRC_ROOT = os.path.join(_REPO_ROOT, "src")
+if os.path.isdir(os.path.join(_SRC_ROOT, "minni")):
+    # Insert even if already present later on sys.path — path[0] must be ours.
+    while _SRC_ROOT in sys.path:
+        sys.path.remove(_SRC_ROOT)
+    sys.path.insert(0, _SRC_ROOT)
 
 # --- (1) MINNI_HOME isolation: established at IMPORT, before engine modules load.
 _LIVE_MINNI_HOME = os.path.abspath(os.path.expanduser("~/.minni"))
@@ -33,6 +51,32 @@ if not _configured_home or os.path.abspath(_configured_home) == _LIVE_MINNI_HOME
     atexit.register(shutil.rmtree, _session_home, ignore_errors=True)
 
 import pytest  # noqa: E402  (import after MINNI_HOME redirect, by design)
+
+
+def _assert_minni_from_this_tree() -> None:
+    """Fail if ``import minni`` resolved outside the repo that owns this conftest.
+
+    Realpath both sides so symlinked worktrees still compare equal when the
+    package really is under this tree.
+    """
+    import minni  # noqa: PLC0415 — intentional late import after path fix
+
+    package_file = os.path.realpath(getattr(minni, "__file__", "") or "")
+    expected_prefix = os.path.realpath(_SRC_ROOT) + os.sep
+    if not package_file.startswith(expected_prefix):
+        raise RuntimeError(
+            "import minni resolved outside this tree's src/ — worktree tests "
+            "would validate the editable install's checkout, not the branch "
+            f"under test.\n  minni.__file__={package_file!r}\n"
+            f"  expected under={expected_prefix!r}\n"
+            "Fix: run via `make test-engine` / `make check` (PYTHONPATH=src) "
+            "or ensure tests/conftest.py prepends this tree's src/."
+        )
+
+
+# Run once at collection time so a wrong-tree condition fails before any test
+# body can pass against the primary checkout by accident.
+_assert_minni_from_this_tree()
 
 
 @pytest.fixture(autouse=True)
