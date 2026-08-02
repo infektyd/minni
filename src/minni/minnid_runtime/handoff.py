@@ -20,6 +20,14 @@ HANDOFF_KINDS = frozenset({"handoff", "candidate_learning", "request", "answer"}
 HANDOFF_ACK_STATUSES = {"accepted", "rejected_stale", "rejected_contradicts", "rejected_scope"}
 
 
+class HandoffStoreError(RuntimeError):
+    """SQLite handoff-lease read failed.
+
+    Must not be collapsed into an empty result: callers polling for handoffs
+    would otherwise wait out a timeout as if nothing were pending (PLUMB-T7 / #231).
+    """
+
+
 def agent_env_key(agent_id: str) -> str:
     return re.sub(r"[^A-Z0-9]+", "_", agent_id.upper()).strip("_")
 
@@ -542,8 +550,11 @@ def pending_handoff_leases(agent_id: str, *, context: HandoffContext) -> list[di
             for row in rows
         ]
     except Exception as exc:
+        # PLUMB-T7 / #231: never collapse a store failure into "no handoffs".
         context.logger.warning("Could not list SQLite handoff leases for %r: %s", agent_id, exc)
-        return []
+        raise HandoffStoreError(
+            f"handoff lease store failed while listing pending leases for {agent_id!r}: {exc}"
+        ) from exc
 
 
 def handoff_lease_status(lease_id: str, *, context: HandoffContext) -> Optional[dict]:
@@ -558,8 +569,11 @@ def handoff_lease_status(lease_id: str, *, context: HandoffContext) -> Optional[
             return None
         return {"lease_id": row["lease_id"], "status": row["status"]}
     except Exception as exc:
+        # PLUMB-T7 / #231: None means "unknown lease", not "store is broken".
         context.logger.warning("Could not read handoff lease %r: %s", lease_id, exc)
-        return None
+        raise HandoffStoreError(
+            f"handoff lease store failed while reading lease {lease_id!r}: {exc}"
+        ) from exc
 
 
 def lease_to_agent(lease_id: str, *, context: HandoffContext) -> Optional[str]:
@@ -652,10 +666,16 @@ def handle_list_pending_handoffs(params: dict, request_id: Any, context: Handoff
     agent_id = principal.agent_id
     if not agent_id:
         return context.make_error(-32602, "agent_id is required", request_id)
-    sqlite_handoffs = pending_handoff_leases(agent_id, context=context)
+    try:
+        sqlite_handoffs = pending_handoff_leases(agent_id, context=context)
+    except HandoffStoreError as exc:
+        # PLUMB-T7: surface store failure as a JSON-RPC error, not empty handoffs.
+        return context.make_error(-32000, str(exc), request_id)
     if sqlite_handoffs:
         return context.make_response({"agent_id": agent_id, "handoffs": sqlite_handoffs}, request_id)
 
+    # DB channel healthy but empty: consult the file channel (PLUMB-T3 partial —
+    # full dual-channel merge when DB has *some* rows is a follow-up).
     now = time.time()
     handoffs = []
     for _vault, path, packet in iter_handoff_files(agent_id, context=context):
@@ -686,7 +706,11 @@ async def handle_await_handoff(params: dict, request_id: Any, context: HandoffCo
     timeout_ms = max(0, min(int(params.get("timeout_ms", 30000)), 300000))
     deadline = time.time() + (timeout_ms / 1000.0)
     while True:
-        lease = handoff_lease_status(lease_id, context=context)
+        try:
+            lease = handoff_lease_status(lease_id, context=context)
+        except HandoffStoreError as exc:
+            # PLUMB-T7: do not spin until timeout pretending the lease is merely unknown.
+            return context.make_error(-32000, str(exc), request_id)
         if lease is not None and lease.get("status") not in {None, "pending"}:
             return context.make_response({
                 "lease_id": lease_id,

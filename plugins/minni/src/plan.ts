@@ -3,7 +3,7 @@ import { appendFile, readFile, readdir, writeFile, unlink } from "node:fs/promis
 import path from "node:path";
 
 import { DEFAULT_VAULT_PATH } from "./config.js";
-import { writeVaultPage, appendFileWithFsync, type VaultWriteResult } from "./vault.js";
+import { writeVaultPage, appendFileWithFsync, writeFileAtomic, type VaultWriteResult } from "./vault.js";
 import type { PageStatus } from "./vault.js";
 import type { ScarTissueEntry } from "./task.js";
 import { stableStringify } from "./agent_envelope.js";
@@ -1328,7 +1328,9 @@ export async function setActivePlan(
     null,
     2
   );
-  await writeFile(pointerPath, data, "utf8");
+  // PLUMB-T4 / #231: atomic temp+rename so a crash mid-write cannot leave a
+  // truncated active-thread pointer. writeFileAtomic already lives in vault.ts.
+  await writeFileAtomic(pointerPath, data);
 }
 
 /**

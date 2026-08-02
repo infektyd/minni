@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, writeFile, readFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, rm, writeFile, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -734,6 +734,55 @@ test("createPlan without shelf_ref leaves shelfDrift unconfigured (regression gu
     const drift = shelfDrift(plan, "anything");
     assert.equal(drift.configured, false);
     assert.equal(drift.note, "no shelf attached");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+// ── PLUMB-T4 / #231: active pointer is written atomically ───────────────────
+//
+// A crash mid-write used to leave a truncated `_active_plan.json` because
+// setActivePlan called plain writeFile. It must go through writeFileAtomic
+// (temp + fsync + rename) which already exists in vault.ts.
+test("setActivePlan writes _active_plan.json via writeFileAtomic (PLUMB-T4 / #231)", async () => {
+  const src = await readFile(new URL("../src/plan.ts", import.meta.url), "utf8");
+  assert.match(
+    src,
+    /writeFileAtomic/,
+    "plan.ts must import/use writeFileAtomic for the active pointer",
+  );
+  // The pointer write itself must call writeFileAtomic(pointerPath, ...), not
+  // a bare writeFile on the same path.
+  assert.match(
+    src,
+    /await writeFileAtomic\(\s*pointerPath/,
+    "setActivePlan must write the pointer through writeFileAtomic",
+  );
+  assert.doesNotMatch(
+    src,
+    /await writeFile\(\s*pointerPath/,
+    "setActivePlan must not use non-atomic writeFile for the pointer",
+  );
+
+  const root = await mkdtemp(path.join(tmpdir(), "sm-plan-atomic-pointer-"));
+  try {
+    await ensureVault(root);
+    const { plan, write } = await createPlan(
+      { goal: "atomic active pointer", vaultPath: root },
+      { vaultPath: root },
+    );
+    await setActivePlan(root, plan.plan_id, write.notePath);
+    const pointerPath = path.join(root, "wiki", "artifacts", "_active_plan.json");
+    const pointer = JSON.parse(await readFile(pointerPath, "utf8"));
+    assert.equal(pointer.plan_id, plan.plan_id);
+    assert.equal(pointer.notePath, write.notePath);
+    // No leftover temp siblings from a half-finished atomic write.
+    const artifacts = await readdir(path.dirname(pointerPath));
+    assert.equal(
+      artifacts.filter((name) => name.startsWith("_active_plan.json.") && name.endsWith(".tmp")).length,
+      0,
+      "atomic write must not leave .tmp siblings",
+    );
   } finally {
     await rm(root, { recursive: true, force: true });
   }

@@ -345,3 +345,97 @@ def test_handle_await_handoff_does_not_block_other_clients(monkeypatch, tmp_path
 
     # Run the async test body from sync pytest
     asyncio.run(run_concurrent())
+
+
+# ── PLUMB-T7 / #231: handoff DB errors must not look like empty results ─────
+
+
+class _BrokenHandoffCursor:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def execute(self, *_args, **_kwargs):
+        raise RuntimeError("sqlite handoff store exploded")
+
+
+class _BrokenHandoffDB:
+    def cursor(self):
+        return _BrokenHandoffCursor()
+
+
+def test_list_pending_handoffs_fails_loud_on_db_error(monkeypatch, tmp_path):
+    """PLUMB-T7: a lease-store failure is a JSON-RPC error, not handoffs=[]."""
+    _patch_handoff_db(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        minnid, "_lazy_writeback", lambda: types.SimpleNamespace(db=_BrokenHandoffDB())
+    )
+    recipient = tmp_path / "claudecode-vault"
+    monkeypatch.setenv(
+        "MINNI_AGENT_VAULTS",
+        json.dumps({"claude-code": str(recipient)}),
+    )
+
+    response = minnid._dispatch_sync({
+        "jsonrpc": "2.0",
+        "id": 2311,
+        "method": "minni_list_pending_handoffs",
+        "params": {"agent_id": "claude-code"},
+    })
+
+    assert "error" in response, (
+        "store failure must surface as error, not success-with-empty handoffs: "
+        f"{response!r}"
+    )
+    assert "result" not in response
+    assert response["error"]["code"] == -32000
+    msg = response["error"]["message"]
+    assert "handoff lease store failed" in msg
+    assert "listing pending leases" in msg
+
+
+def test_await_handoff_fails_loud_on_db_error_not_timeout(monkeypatch, tmp_path):
+    """PLUMB-T7: await must not burn its timeout when the lease store is broken."""
+    _patch_handoff_db(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        minnid, "_lazy_writeback", lambda: types.SimpleNamespace(db=_BrokenHandoffDB())
+    )
+    recipient = tmp_path / "claudecode-vault"
+    monkeypatch.setenv(
+        "MINNI_AGENT_VAULTS",
+        json.dumps({"claude-code": str(recipient)}),
+    )
+
+    response = minnid._dispatch_sync({
+        "jsonrpc": "2.0",
+        "id": 2312,
+        "method": "minni_await_handoff",
+        "params": {"lease_id": "lease-whatever", "timeout_ms": 5000},
+    })
+
+    assert "error" in response, (
+        "store failure must not degrade to a silent timeout: "
+        f"{response!r}"
+    )
+    assert response.get("result") is None or "status" not in response.get("result", {})
+    assert response["error"]["code"] == -32000
+    assert "handoff lease store failed" in response["error"]["message"]
+    assert "reading lease" in response["error"]["message"]
+
+
+def test_pending_handoff_leases_raises_handoff_store_error(monkeypatch, tmp_path):
+    """Unit-level: empty list is reserved for genuine empty; store failure raises."""
+    from dataclasses import replace
+
+    from minni.minnid_runtime.handoff import HandoffStoreError, pending_handoff_leases
+
+    _patch_handoff_db(monkeypatch, tmp_path)
+    broken_ctx = replace(
+        minnid._handoff_context(),
+        lazy_writeback=lambda: types.SimpleNamespace(db=_BrokenHandoffDB()),
+    )
+
+    with pytest.raises(HandoffStoreError, match="listing pending leases"):
+        pending_handoff_leases("claude-code", context=broken_ctx)
