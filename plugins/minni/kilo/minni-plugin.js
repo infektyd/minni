@@ -571,6 +571,13 @@ const MinniPlugin = async ({ directory, client }) => ({
         booted.add(input.sessionID);
         evictOldest(booted, BOOTED_MAX, "booted session");
       }
+    } else {
+      // Round 19: re-touch so the bound is activity-ordered LRU, not FIFO.
+      // Without delete+add, a long-lived active session stays first-in and is
+      // the first evicted when BOOTED_MAX fills with one-shot sessions —
+      // forcing a redundant SessionStart (and re-inject) on the next message.
+      booted.delete(input.sessionID);
+      booted.add(input.sessionID);
     }
     const prompt = output.parts
       .filter((part) => part?.type === "text" && typeof part.text === "string")

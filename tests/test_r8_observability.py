@@ -1520,6 +1520,151 @@ def test_sticky_deferred_lifecycle_survives_process_restart_simulation(
     afm_writer.reset_pass_counters()
 
 
+def test_sticky_persist_cannot_resurrect_after_concurrent_reapply(
+    tmp_path, monkeypatch
+):
+    """Round 19: fail deferred apply → set memory under lock → persist was
+    outside the lock. Concurrent submit_drafts re-applied + cleared, then the
+    worker's stale persist rewrote the sidecar → phantom sticky after restart
+    (drops wet drafts on recovery).
+
+    Pin: fail apply → block inside persist RMW → concurrent re-apply clears →
+    release gate → sidecar stays empty; following submit enqueues.
+    """
+    import threading
+    import queue as queue_mod
+
+    from minni import afm_writer
+
+    afm_writer.reset_pass_counters()
+    monkeypatch.setattr(afm_writer, "_ensure_worker", lambda: None)
+    monkeypatch.setattr(afm_writer, "_WORK_QUEUE", queue_mod.Queue(maxsize=4))
+
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    side = afm_writer._pending_lifecycle_path(vault)
+
+    entered_persist = threading.Event()
+    persist_gate = threading.Event()
+    real_persist = afm_writer._persist_pending_lifecycle
+
+    def _gated_persist(pass_name, lifecycle, vault_path):
+        entered_persist.set()
+        # Hold the critical section if the implementation keeps persist under
+        # the same lock as the memory set (the fix). A concurrent re-apply
+        # must then wait until we finish, then clear — never interleave a
+        # clear between set and a late write that resurrects the file.
+        assert persist_gate.wait(timeout=5.0), "persist gate timed out"
+        return real_persist(pass_name, lifecycle, vault_path)
+
+    monkeypatch.setattr(afm_writer, "_persist_pending_lifecycle", _gated_persist)
+
+    def _write(job):
+        return {"drafts_written": [{"page_id": "d1"}], "inbox_path": "x"}
+
+    monkeypatch.setattr(afm_writer, "_write_batch", _write)
+
+    calls = {"n": 0, "applied": []}
+
+    def _handler(life):
+        calls["n"] += 1
+        # Worker deferred apply fails once; re-apply succeeds.
+        if calls["n"] == 1:
+            raise RuntimeError("db blip during lifecycle")
+        calls["applied"].append(dict(life))
+
+    done = threading.Event()
+    out: dict = {}
+    job = {
+        "pass_name": "consolidation",
+        "vault_path": str(vault),
+        "drafts": [{"title": "t", "page_id": "c-1"}],
+        "lifecycle": {
+            "promote_candidate_ids": [1],
+            "dedup_candidate_ids": [],
+            "review_candidate_ids": [9],
+        },
+        "lifecycle_handler": _handler,
+        "defer_lifecycle_to_worker": True,
+    }
+    with afm_writer._IN_FLIGHT_LOCK:
+        afm_writer._IN_FLIGHT_PER_PASS["consolidation"] = done
+
+    worker_done = threading.Event()
+
+    def _run_worker():
+        try:
+            afm_writer._process_job(job, done, out)
+        finally:
+            worker_done.set()
+
+    t = threading.Thread(target=_run_worker, name="sticky-race-worker")
+    t.start()
+    assert entered_persist.wait(timeout=5.0), "worker never entered persist"
+    # Concurrent re-apply while worker is mid-persist (or mid set+persist CS).
+    reapply_result: dict = {}
+
+    def _run_reapply():
+        reapply_result["r"] = afm_writer.submit_drafts(
+            {
+                "pass_name": "consolidation",
+                "vault_path": str(vault),
+                "drafts": [{"title": "dup", "page_id": "c-2"}],
+                "lifecycle_handler": _handler,
+            },
+            timeout=0.05,
+        )
+
+    re_t = threading.Thread(target=_run_reapply, name="sticky-race-reapply")
+    re_t.start()
+    # Give re-apply a moment to either block on the lock (fix) or race past
+    # a released lock (bug). Either way release the gate so progress continues.
+    time.sleep(0.05)
+    persist_gate.set()
+    t.join(timeout=5.0)
+    re_t.join(timeout=5.0)
+    assert worker_done.is_set()
+    assert re_t.is_alive() is False
+
+    assert reapply_result.get("r", {}).get("status") == "lifecycle_recovered", (
+        reapply_result
+    )
+    assert "consolidation" not in afm_writer._PENDING_LIFECYCLE
+    assert not side.exists(), (
+        "sidecar must stay empty after re-apply; a late worker persist must "
+        f"not resurrect sticky state (file={side}, exists={side.exists()})"
+    )
+    if side.exists():
+        on_disk = afm_writer._read_pending_lifecycle_file(vault)
+        assert "consolidation" not in on_disk
+
+    put_calls = []
+    real_put = afm_writer._WORK_QUEUE.put_nowait
+
+    def _spy_put(item):
+        put_calls.append(item)
+        return real_put(item)
+
+    monkeypatch.setattr(afm_writer._WORK_QUEUE, "put_nowait", _spy_put)
+    # Following submit (post-recovery) must enqueue — not hit phantom sticky.
+    follow = afm_writer.submit_drafts(
+        {
+            "pass_name": "consolidation",
+            "vault_path": str(vault),
+            "drafts": [{"title": "after", "page_id": "c-3"}],
+            "lifecycle_handler": _handler,
+        },
+        timeout=0.05,
+    )
+    assert follow.get("lifecycle_pending") is not True, follow
+    assert follow.get("status") != "write_in_flight", follow
+    assert follow.get("status") != "lifecycle_recovered", (
+        f"phantom sticky re-held pass after clear: {follow!r}"
+    )
+    assert len(put_calls) == 1, f"following submit must enqueue: {put_calls!r}"
+    afm_writer.reset_pass_counters()
+
+
 def test_shared_index_failure_returns_partial_and_degraded():
     """Round 18: shared engine throw after agent-vault hits hard-failed the
     whole search with −32000. Soft-fail shared like combined agent legs —
@@ -1584,6 +1729,84 @@ def test_shared_index_failure_returns_partial_and_degraded():
         f"expected shared degradation entry, got {payload.get('degradation')!r}"
     )
     assert shared_entries[0].get("degraded") is True
+
+
+def test_both_scope_soft_fails_personal_shared_fallback():
+    """Round 19: scope 'both' ran retrieve_personal() first; personal vault
+    boom fell through to hard retrieve_shared(), which −32000'd before
+    retrieve_combined() could return other agent-vault hits.
+
+    Pin: personal boom + shared boom + healthy combined vault → response
+    returns combined hits, degraded, no JSON-RPC error.
+    """
+    from types import SimpleNamespace
+
+    from minni.minnid_runtime import recall as recall_mod
+
+    captured = {}
+
+    class _SharedBoom:
+        config = SimpleNamespace(embedding_model="m")
+
+        def retrieve(self, **kwargs):
+            raise RuntimeError("shared FTS locked")
+
+    class _PersonalBoom:
+        config = SimpleNamespace(embedding_model="m")
+
+        def retrieve(self, **kwargs):
+            raise RuntimeError("personal index corrupt")
+
+    class _HealthyCombined:
+        config = SimpleNamespace(embedding_model="m")
+        last_vector_degraded = None
+        last_rerank_degraded = None
+        last_query_expand_degraded = None
+        last_auth_suppression = None
+
+        def retrieve(self, **kwargs):
+            return [{"doc_id": 7, "path": "wiki/agent-b.md"}]
+
+    shared = _SharedBoom()
+    personal = _PersonalBoom()
+    healthy = _HealthyCombined()
+    context = _make_context(shared, captured)
+    principal = SimpleNamespace(agent_id="agent-a", workspace_id="default")
+    object.__setattr__(
+        context,
+        "handler_principal",
+        lambda params, request_id: (principal, None),
+    )
+    object.__setattr__(
+        context,
+        "agent_vault_retrieval",
+        lambda agent_id: (personal, agent_id, "/tmp/p.db"),
+    )
+    object.__setattr__(
+        context,
+        "all_vault_retrievals",
+        lambda: [(healthy, "agent-b", "/tmp/b.db")],
+    )
+    recall_mod.handle_search(
+        {"query": "anything", "scope": "both"},
+        request_id=1,
+        context=context,
+    )
+    assert "error" not in captured, (
+        f"scope both must not −32000 when personal+shared boom but combined "
+        f"has hits: {captured.get('error')!r}"
+    )
+    payload = captured["response"]
+    assert payload["count"] >= 1, "combined agent hits must survive personal path boom"
+    paths = {r.get("path") for r in payload.get("results") or []}
+    assert "wiki/agent-b.md" in paths, f"expected agent-b hits, got {paths!r}"
+    assert payload["degraded"] is True
+    personal_entries = [
+        d for d in payload.get("degradation") or [] if d.get("src") == "p"
+    ]
+    assert personal_entries, (
+        f"expected personal degradation, got {payload.get('degradation')!r}"
+    )
 
 
 def test_encode_query_encode_raise_keeps_vector_down_and_empty_vector(

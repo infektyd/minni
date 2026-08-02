@@ -405,7 +405,14 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
                 )
                 return []
 
-        def retrieve_personal() -> list:
+        def retrieve_personal(*, soft: bool = False) -> list:
+            """Personal vault leg; optional soft shared fallback for multi-leg scopes.
+
+            Sole personal scope keeps a hard shared fallback so total failure
+            still surfaces as −32000. Scope "both" (and any path where other
+            corpora may already contribute) soft-fails shared so a personal
+            boom + shared boom cannot erase combined hits with −32000.
+            """
             vault_retrieval = context.agent_vault_retrieval(agent_id) if agent_id else None
             if vault_retrieval is not None:
                 vault_engine, _source_agent, _source_db_path = vault_retrieval
@@ -448,6 +455,9 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
                             "reason": detail,
                         }
                     )
+            # Round 19: soft shared when other legs may still run (scope both).
+            if soft:
+                return retrieve_shared_soft()
             return retrieve_shared()
 
         def retrieve_combined() -> list:
@@ -511,9 +521,10 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
             results = retrieve_combined()
         else:
             # scope "both": personal + combined. Combined already soft-fails
-            # shared; personal falls back to hard shared only when its vault
-            # path is absent / after personal degrade — leave that path alone.
-            result_sets = [retrieve_personal(), retrieve_combined()]
+            # shared; personal must soft-fail its shared fallback too — a hard
+            # shared throw here (−32000) ran before combined and dropped every
+            # agent-vault hit that combined would have returned.
+            result_sets = [retrieve_personal(soft=True), retrieve_combined()]
             results = merge_document_results(result_sets, limit, prefer_personal=True)
 
         if budget_tokens_param is not None:

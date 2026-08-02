@@ -274,7 +274,12 @@ def _read_pending_lifecycle_file(vault_path: str | Path) -> dict[str, dict]:
 def _persist_pending_lifecycle(
     pass_name: str, lifecycle: dict, vault_path: Optional[str]
 ) -> None:
-    """Mirror sticky deferred lifecycle under the vault (survives restart)."""
+    """Mirror sticky deferred lifecycle under the vault (survives restart).
+
+    Caller must hold ``_IN_FLIGHT_LOCK`` for the whole memory-set + this RMW
+    so a concurrent re-apply/clear cannot clear the sidecar and then lose to
+    a stale persist that resurrects a phantom sticky after restart.
+    """
     if not vault_path:
         logger.warning(
             "AFM writer: cannot persist pending lifecycle for pass %r — "
@@ -311,7 +316,12 @@ def _persist_pending_lifecycle(
 def _clear_persisted_pending_lifecycle(
     pass_name: str, vault_path: Optional[str]
 ) -> None:
-    """Drop one pass from the vault sidecar once lifecycle is fully applied."""
+    """Drop one pass from the vault sidecar once lifecycle is fully applied.
+
+    Caller must hold ``_IN_FLIGHT_LOCK`` for the whole memory-clear + this RMW
+    so a concurrent failed-apply persist cannot rewrite a stale snapshot after
+    a successful re-apply has already cleared the file.
+    """
     if not vault_path:
         return
     path = _pending_lifecycle_path(vault_path)
@@ -1006,13 +1016,17 @@ def _maybe_apply_deferred_lifecycle(job: dict) -> bool:
         job["lifecycle_applied"] = True
         pass_name = str(job.get("pass_name") or "unknown")
         vault_path = job.get("vault_path")
+        # Round 19: memory pop + sidecar clear must be one critical section.
+        # Pop-then-clear outside the lock let a concurrent fail-path persist
+        # resurrect a stale sticky after a successful clear (phantom pending
+        # after restart → drop wet drafts on the recovery path).
         with _IN_FLIGHT_LOCK:
             prior = _PENDING_LIFECYCLE.pop(pass_name, None)
             if vault_path is None and isinstance(prior, dict):
                 vault_path = prior.get("_vault_path")
-        _clear_persisted_pending_lifecycle(
-            pass_name, str(vault_path) if vault_path else None
-        )
+            _clear_persisted_pending_lifecycle(
+                pass_name, str(vault_path) if vault_path else None
+            )
         return True
     except Exception:
         global _LIFECYCLE_APPLY_FAILURES, _LAST_LIFECYCLE_APPLY_FAILURE_AT
@@ -1027,13 +1041,17 @@ def _maybe_apply_deferred_lifecycle(job: dict) -> bool:
         # cold start re-applies instead of re-minting review drafts.
         if vault_path:
             stored["_vault_path"] = str(Path(vault_path).expanduser())
+        # Round 19: memory set + sidecar persist one critical section. Set under
+        # lock then persist outside left a window where concurrent submit_drafts
+        # re-applied+cleared, then this worker's stale persist rewrote the
+        # sidecar → phantom sticky after restart.
         with _IN_FLIGHT_LOCK:
             _LIFECYCLE_APPLY_FAILURES += 1
             _LAST_LIFECYCLE_APPLY_FAILURE_AT = time.time()
             _PENDING_LIFECYCLE[pass_name] = stored
-        _persist_pending_lifecycle(
-            pass_name, stored, str(vault_path) if vault_path else None
-        )
+            _persist_pending_lifecycle(
+                pass_name, stored, str(vault_path) if vault_path else None
+            )
         job["lifecycle_apply_failed"] = True
         logger.exception(
             "AFM writer: deferred lifecycle apply failed for pass %r — "

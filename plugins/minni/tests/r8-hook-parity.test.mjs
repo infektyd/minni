@@ -579,6 +579,54 @@ test("P5: pending and booted are bounded at insert, not only on session.deleted"
   assert.match(source.slice(boot, boot + 200), /evictOldest\(booted/);
 });
 
+test("P5: booted is re-touched on chat.message so the bound is LRU not FIFO", async () => {
+  // Round 19: insert-only made BOOTED_MAX FIFO. An active long-lived session
+  // stayed first-in and was the first evicted when one-shot sessions filled
+  // the bound — forcing a redundant SessionStart on the next message.
+  const source = await readFile(
+    path.join(PLUGIN_ROOT, "kilo", "minni-plugin.js"),
+    "utf8",
+  );
+  const chat = source.indexOf('"chat.message"');
+  assert.ok(chat !== -1);
+  // Window covers the boot branch + the already-booted re-touch.
+  const window = source.slice(chat, chat + 1200);
+  assert.match(
+    window,
+    /booted\.delete\(\s*input\.sessionID\s*\)/,
+    "already-booted sessions must delete+add (re-touch) like lastPrompt",
+  );
+  assert.match(
+    window,
+    /booted\.add\(\s*input\.sessionID\s*\)/,
+    "re-touch must re-insert so insertion order reflects activity",
+  );
+
+  // Behavioral pin of the Set LRU pattern the bridge uses (delete+add +
+  // front-evict). fill BOOTED_MAX, activity-touch the oldest, insert one more
+  // → touched survives, untouched first-in is gone.
+  const BOOTED_MAX = 3;
+  const booted = new Set();
+  function touchBooted(id) {
+    booted.delete(id);
+    booted.add(id);
+    while (booted.size > BOOTED_MAX) {
+      const oldest = booted.keys().next().value;
+      booted.delete(oldest);
+    }
+  }
+  touchBooted("s0");
+  touchBooted("s1");
+  touchBooted("s2");
+  assert.deepEqual([...booted], ["s0", "s1", "s2"]);
+  touchBooted("s0"); // activity on the oldest
+  assert.deepEqual([...booted], ["s1", "s2", "s0"]);
+  touchBooted("s3"); // insert one more → s1 (untouched first-in) evicted
+  assert.deepEqual([...booted], ["s2", "s0", "s3"]);
+  assert.ok(booted.has("s0"), "activity-touched session must not be FIFO-evicted");
+  assert.equal(booted.has("s1"), false, "untouched oldest must be the eviction victim");
+});
+
 test("P5: the session.deleted branch no longer carries the only bound", async () => {
   const source = await readFile(
     path.join(PLUGIN_ROOT, "kilo", "minni-plugin.js"),
