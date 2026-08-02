@@ -4,15 +4,17 @@ Mechanical gate denies edits to ``tests/conftest.py``, so the load-bearing
 contract for ``make test-engine`` / ``make check`` / ``make coverage-engine`` is
 ``PYTHONPATH=src`` in the Makefile recipes. This module:
 
-1. Pins that Makefile recipe text (fail-closed, active assignment only)
+1. Pins that Makefile recipe text (fail-closed, active assignment on the same
+   line as pytest)
 2. Runtime-pins that *this* process imported ``minni`` from this worktree's
    ``src/`` (fail-closed for worktree + foreign-editable)
-3. Proves ``PYTHONPATH=src`` (Make shape) beats a site-packages/.pth-style
-   editable competitor — the real #258 failure mode
+3. Proves ``PYTHONPATH=src`` (Make shape) is the reason this tree wins over a
+   site-packages/.pth-style editable competitor — the real #258 failure mode
 
 Bare ``python -m pytest`` without Make (or without ``PYTHONPATH=src``) can still
 resolve an editable install from another checkout when the pin below is not
-enforced by the process env — agents should use the Make targets above.
+enforced by the process env — agents should use the Make targets above, or
+export ``PYTHONPATH=src`` for scoped bare pytest.
 """
 
 from __future__ import annotations
@@ -31,8 +33,11 @@ MAKEFILE = REPO_ROOT / "Makefile"
 # Targets whose recipes must prepend this tree's src (#258).
 _PYTHONPATH_PINNED_TARGETS = ("test-engine", "coverage-engine", "check")
 
-# Active recipe assignment (not a comment): tab + PYTHONPATH=src then :/$$/space
-_ACTIVE_PYTHONPATH_SRC = re.compile(r"(?m)^\tPYTHONPATH=src(?::|\$\$| )")
+# Same recipe line: tab + PYTHONPATH=src… + pytest (Make applies env only to
+# that command; a split PYTHONPATH=src true / pytest line would false-green).
+_SAME_LINE_PYTHONPATH_PYTEST = re.compile(
+    r"(?m)^\tPYTHONPATH=src\S*\s+\S.*pytest"
+)
 
 
 def _recipe_block(makefile_text: str, target: str) -> str:
@@ -50,22 +55,19 @@ def _recipe_block(makefile_text: str, target: str) -> str:
 
 
 def test_makefile_pythonpath_src_contract():
-    """Fail closed if Make drops active PYTHONPATH=src from #258 test targets.
+    """Fail closed if Make drops same-line PYTHONPATH=src + pytest (#258).
 
-    Requires a tab-indented assignment line (not a comment substring) and that
-    the same recipe block invokes pytest.
+    Requires a single tab-indented line that both assigns PYTHONPATH=src and
+    invokes pytest (not a comment, not a split-line assignment that only
+    covers ``true``).
     """
     text = MAKEFILE.read_text(encoding="utf-8")
     for target in _PYTHONPATH_PINNED_TARGETS:
         recipe = _recipe_block(text, target)
-        assert _ACTIVE_PYTHONPATH_SRC.search(recipe), (
-            f"Makefile target {target!r} must have an active recipe line "
-            f"assigning PYTHONPATH=src (not merely a comment). Recipe was:\n"
-            f"{recipe!r}"
-        )
-        assert "pytest" in recipe, (
-            f"Makefile target {target!r} must invoke pytest in the same "
-            f"recipe block as PYTHONPATH=src. Recipe was:\n{recipe!r}"
+        assert _SAME_LINE_PYTHONPATH_PYTEST.search(recipe), (
+            f"Makefile target {target!r} must have a single recipe line that "
+            f"both assigns PYTHONPATH=src and invokes pytest (Make applies "
+            f"assignment only to that command). Recipe was:\n{recipe!r}"
         )
 
 
@@ -87,17 +89,100 @@ def test_import_minni_resolves_under_this_repo_src():
     )
 
 
+def _competitor_probe_script(
+    *,
+    this_src: str,
+    foreign_src: str,
+    site_packages: str,
+    expected_root: str,
+    foreign_root: str,
+    expect_tree: str,
+) -> str:
+    """Child script: force editable-competitor shape after site init.
+
+    CI/same-tree editable already maps ``minni`` → this tree before the child
+    runs. A late ``addsitedir`` alone does not prove PYTHONPATH won. After site
+    init we:
+
+    1. Drop this tree's ``src`` from ``sys.path`` (same-tree editable path)
+    2. Put foreign first as a foreign editable would
+    3. Re-introduce this tree *only* via env ``PYTHONPATH`` entries
+
+    Then ``import minni``: with ``PYTHONPATH=src`` this tree must win; with
+    PYTHONPATH absent foreign must win.
+    """
+    return textwrap.dedent(
+        f"""
+        import os, site, sys
+
+        this_src = {this_src!r}
+        foreign_src = {foreign_src!r}
+        site_packages = {site_packages!r}
+        expected_root = {expected_root!r}
+        foreign_root = {foreign_root!r}
+        expect_tree = {expect_tree!r}
+
+        # Site-packages/.pth editable competitor (pip editable shape).
+        site.addsitedir(site_packages)
+
+        def _real(p):
+            return os.path.realpath(p) if p else p
+
+        this_real = _real(this_src)
+        foreign_real = _real(foreign_src)
+
+        # 1. Drop this tree's src wherever the editable / prior path put it.
+        sys.path = [
+            p for p in sys.path
+            if p and _real(p) != this_real
+        ]
+        # 2. Foreign first — real competitor when PYTHONPATH lacks this tree.
+        sys.path = [p for p in sys.path if p and _real(p) != foreign_real]
+        sys.path.insert(0, foreign_src)
+
+        # 3. Re-introduce this tree only via env PYTHONPATH (Make shape).
+        #    Python prepends PYTHONPATH at startup; we re-apply after the forced
+        #    competitor reshape so a missing env cannot false-green on editable.
+        pp = os.environ.get("PYTHONPATH", "") or ""
+        entries = []
+        for raw in pp.split(os.pathsep):
+            if not raw:
+                continue
+            abs_entry = raw if os.path.isabs(raw) else os.path.realpath(
+                os.path.join(os.getcwd(), raw)
+            )
+            entries.append(abs_entry)
+        for path in reversed(entries):
+            sys.path = [p for p in sys.path if p and _real(p) != _real(path)]
+            sys.path.insert(0, path)
+
+        import minni
+        path = os.path.realpath(minni.__file__)
+        tree = getattr(minni, "TREE", None)
+
+        if expect_tree == "this":
+            assert path.startswith(expected_root), (path, expected_root, sys.path[:8])
+            assert not path.startswith(foreign_root), path
+            assert tree != "foreign", tree
+            print("ok", path)
+        elif expect_tree == "foreign":
+            assert path.startswith(foreign_root), (path, foreign_root, sys.path[:8])
+            assert tree == "foreign", tree
+            print("foreign-ok", path)
+        else:
+            raise SystemExit(f"bad expect_tree={{expect_tree!r}}")
+        """
+    )
+
+
 def test_pythonpath_src_wins_over_site_packages_editable(tmp_path):
     """Make-shape PYTHONPATH=src beats site-packages/.pth editable competitor.
 
-    Models the real #258 competitor: foreign ``minni`` reachable via a ``.pth``
-    processed by ``site.addsitedir`` (pip editable), *not* a second PYTHONPATH
-    entry. Path ordering between two PYTHONPATH entries would pass even if Make
-    never set ``PYTHONPATH=src``.
-
-    Subprocess env only sets relative ``PYTHONPATH=src`` with ``cwd=REPO_ROOT``
-    (Make recipe shape). The competitor is injected via ``addsitedir``, so the
-    only win condition is this tree's ``src`` beating site/editable resolution.
+    Models the real #258 competitor: foreign ``minni`` via a ``.pth`` processed
+    by ``site.addsitedir`` (pip editable). Under same-tree editable (CI after
+    ``make setup``) a late addsitedir alone is not enough — the child drops
+    this tree's src from ``sys.path`` and only re-adds it via env PYTHONPATH,
+    so deleting ``PYTHONPATH=src`` makes foreign win (no false-green).
     """
     expected_root = str(REPO_SRC.resolve()) + os.sep
 
@@ -113,26 +198,23 @@ def test_pythonpath_src_wins_over_site_packages_editable(tmp_path):
         str(foreign_src.resolve()) + "\n", encoding="utf-8"
     )
     foreign_root = str(foreign_src.resolve()) + os.sep
+    this_src_s = str(REPO_SRC.resolve())
+    foreign_src_s = str(foreign_src.resolve())
     site_packages_s = str(site_packages.resolve())
 
-    # Make shape: relative PYTHONPATH=src only (no second PYTHONPATH competitor).
+    common = dict(
+        this_src=this_src_s,
+        foreign_src=foreign_src_s,
+        site_packages=site_packages_s,
+        expected_root=expected_root,
+        foreign_root=foreign_root,
+    )
+
+    # Make shape: relative PYTHONPATH=src only, cwd=REPO_ROOT.
     env_make = os.environ.copy()
     env_make["PYTHONPATH"] = "src"
     env_make.pop("MINNI_HOME", None)
-    make_shape = textwrap.dedent(
-        f"""
-        import os, site
-        site.addsitedir({site_packages_s!r})
-        import minni
-        path = os.path.realpath(minni.__file__)
-        expected = {expected_root!r}
-        foreign = {foreign_root!r}
-        assert path.startswith(expected), (path, expected)
-        assert not path.startswith(foreign), path
-        assert getattr(minni, "TREE", None) != "foreign"
-        print("ok", path)
-        """
-    )
+    make_shape = _competitor_probe_script(**common, expect_tree="this")
     proc = subprocess.run(
         [sys.executable, "-c", make_shape],
         env=env_make,
@@ -144,36 +226,16 @@ def test_pythonpath_src_wins_over_site_packages_editable(tmp_path):
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "ok" in proc.stdout
 
-    # Document failure mode: without this tree's src on PYTHONPATH, a foreign
-    # path entry ahead of site resolution loads the competitor marker.
-    # Uses a single non-this-src path entry (not dual-PYTHONPATH ordering).
+    # Without PYTHONPATH, the forced competitor must win (proves the win arm
+    # actually needed PYTHONPATH — not a same-tree editable false-green).
     env_bare = os.environ.copy()
     env_bare.pop("PYTHONPATH", None)
     env_bare.pop("MINNI_HOME", None)
-    this_src = str(REPO_SRC.resolve())
-    foreign_src_s = str(foreign_src.resolve())
-    baseline = textwrap.dedent(
-        f"""
-        import os, sys
-        this_src = {this_src!r}
-        foreign_src = {foreign_src_s!r}
-        # Competitor first; strip this worktree src so it cannot win by accident.
-        sys.path = [foreign_src] + [
-            p for p in sys.path
-            if p and os.path.realpath(p) != os.path.realpath(this_src)
-        ]
-        import minni
-        path = os.path.realpath(minni.__file__)
-        foreign = {foreign_root!r}
-        assert path.startswith(foreign), (path, foreign)
-        assert getattr(minni, "TREE", None) == "foreign"
-        print("foreign-ok", path)
-        """
-    )
+    baseline = _competitor_probe_script(**common, expect_tree="foreign")
     proc_f = subprocess.run(
         [sys.executable, "-c", baseline],
         env=env_bare,
-        cwd=str(tmp_path),
+        cwd=str(REPO_ROOT),
         capture_output=True,
         text=True,
         check=False,

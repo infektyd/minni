@@ -122,10 +122,15 @@ Healthy inboxes drain. PR #69 semantics:
 
 ## Test suites as health instruments
 
-On a source checkout, these are the ground truth (counts as of 2026-06-11):
+On a source checkout, these are the ground truth (counts as of 2026-06-11).
+Prefer Make targets so worktree checkouts do not silently import `minni` from
+another checkout's editable install (#258). If you invoke bare pytest, export
+`PYTHONPATH=src` (repo root) so this tree wins:
 
 ```bash
-.venv/bin/python -m pytest -q tests/          # expect 538 passed, 5 skipped
+make test-engine                              # preferred; sets PYTHONPATH=src
+# or:
+PYTHONPATH=src .venv/bin/python -m pytest -q tests/   # bare form needs PYTHONPATH=src (#258)
 cd plugins/minni && npm run build && npm test # expect 327 passed
 bash scripts/repro-smoke.sh                   # hermetic daemon smoke
 ```
