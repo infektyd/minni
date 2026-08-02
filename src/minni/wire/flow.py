@@ -168,9 +168,16 @@ def _wire_platform(
             pre_mcp_env = (
                 pre_doc.get("mcpServers", {}).get("minni", {}).get("env", {}) or {}
             )
-        except Exception:
-            pre_doc = {}
-            pre_mcp_env = {}
+        except Exception as exc:
+            # D10 twin for JSON: refuse before rewrite so a corrupt surface
+            # is left byte-identical (wire must not silently drop env / other
+            # servers). Callers map ValueError → platform "failed".
+            raise ValueError(
+                f"cannot parse existing .mcp.json at {mcp_target}: {exc}. "
+                "Refusing to rewrite mcpServers.minni — the surface's "
+                "preserved env (and any sibling MCP servers) would be "
+                "silently dropped. Fix or remove the file, then re-run."
+            ) from exc
 
     if not dry_run:
         generated = mcp_json(

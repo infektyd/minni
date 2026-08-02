@@ -342,7 +342,6 @@ def test_codex_mirror_overwrites_stale_like_wire():
 
 def test_unparseable_mcp_json_is_hard_error_not_silent_env_drop(tmp_path):
     """D10 twin: corrupt .mcp.json must refuse preserve rewrite (both sides)."""
-    import pytest
     from minni.wire.writers import mcp_json as wire_mcp_json
 
     path = tmp_path / ".mcp.json"
@@ -368,3 +367,91 @@ def test_unparseable_mcp_json_is_hard_error_not_silent_env_drop(tmp_path):
             target_path=path,
         )
     assert path.read_text(encoding="utf-8") == original
+
+
+def test_wire_flow_unparseable_mcp_json_fails_and_leaves_file(tmp_path, monkeypatch):
+    """Wire hot path (_wire_platform) must not swallow corrupt .mcp.json into {}."""
+    from minni.wire.flow import _wire_platform
+    from minni.wire.platform import platform_spec
+
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    install_root = tmp_path / "install"
+    (install_root / "dist").mkdir(parents=True)
+    (install_root / "dist" / "server.js").write_text("//\n", encoding="utf-8")
+    mcp_target = install_root / ".mcp.json"
+    original = (
+        '{"mcpServers": {"minni": {"env": {"MINNI_WORKSPACE_ID": "keep-me"}},'
+        ' "other": {"command": "x"}}, "top": true}, BROKEN'
+    )
+    mcp_target.write_text(original, encoding="utf-8")
+
+    spec = platform_spec(
+        "generic", install_root=str(install_root), agent="testagent",
+    )
+    with pytest.raises(ValueError, match="cannot parse existing .mcp.json"):
+        _wire_platform(
+            spec, install_root, "0.0.0",
+            socket=tmp_path / "sock",
+            workspace=tmp_path / "ws",
+            repo_root=None,
+            explicit_workspace=False,
+            dry_run=False,
+        )
+    assert mcp_target.read_text(encoding="utf-8") == original
+
+
+def test_propagate_snapshot_unparseable_mcp_json_refuses_before_copy(
+    tmp_path, monkeypatch,
+):
+    """Propagate update_one_plugin must raise before copy_tree on corrupt .mcp.json."""
+    install_root = tmp_path / "cursor-plugin"
+    install_root.mkdir()
+    mcp_target = install_root / ".mcp.json"
+    original = '{"mcpServers": {"minni": {"env": {"MINNI_WORKSPACE_ID": "keep-me"}}}, BROKEN'
+    mcp_target.write_text(original, encoding="utf-8")
+
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(
+        propagate, "plugin_source",
+        lambda repo_root: tmp_path / "source",
+    )
+    monkeypatch.setattr(
+        propagate, "native_afm_env",
+        lambda repo_root: {},
+    )
+    monkeypatch.setattr(
+        propagate, "bootstrap_vault",
+        lambda args: None,
+    )
+    monkeypatch.setattr(
+        propagate, "vault_for",
+        lambda agent: tmp_path / "vault",
+    )
+    monkeypatch.setattr(
+        propagate, "platform_spec",
+        lambda platform, repo_root, install_root=None: {
+            "agent": "cursor",
+            "install": Path(install_root) if install_root else install_root,
+            "config_kind": "mcp-json-only",
+            "config": None,
+        },
+    )
+    copy_calls: list[object] = []
+    monkeypatch.setattr(
+        propagate, "copy_tree",
+        lambda *a, **k: copy_calls.append((a, k)),
+    )
+
+    args = argparse.Namespace(
+        platform="cursor",
+        agent=None,
+        install_root=str(install_root),
+        workspace=None,
+        no_build=True,
+        repo=str(REPO),
+        socket=str(tmp_path / "sock"),
+    )
+    with pytest.raises(ValueError, match="cannot parse existing .mcp.json"):
+        propagate.update_one_plugin("cursor", args)
+    assert copy_calls == [], "copy_tree must not run after corrupt snapshot"
+    assert mcp_target.read_text(encoding="utf-8") == original
