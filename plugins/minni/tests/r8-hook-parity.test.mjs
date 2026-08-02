@@ -55,8 +55,22 @@ test("P4: every event a platform manifest declares is routed by the hook it invo
     [".kilocode-plugin/hooks/hooks.json", null],
   ];
 
-  const generic = new Set([...VALID_EVENTS, "PreToolUse"]);
+  // Round 5 (PR #260): the generic set used to be VALID_EVENTS ∪ {PreToolUse},
+  // which only proves an event gets past the envelope GATE. VALID_EVENTS
+  // includes PostCompact/CompactSummary, but the factory dispatch has no
+  // PostCompact case — a manifest declaring it passed this gate while the
+  // hook only audited a drop. "Routed" must mean an actual dispatch arm, so
+  // the consumed set is read from createHookHandlers' switch, same as hook.ts.
+  const generic = await routedEventsFor(
+    path.join(PLUGIN_ROOT, "src", "hook-handlers.ts"),
+  );
   const claudeRouted = await routedEventsFor(path.join(PLUGIN_ROOT, "src", "hook.ts"));
+  assert.ok(
+    VALID_EVENTS.includes("PostCompact") && !generic.has("PostCompact"),
+    "precondition: PostCompact passes the envelope gate but has no factory " +
+      "dispatch arm — the exact gap that made the old VALID_EVENTS-based " +
+      "check overstate routing",
+  );
 
   for (const [relative, entry] of manifests) {
     const raw = await readFile(path.join(PLUGIN_ROOT, relative), "utf8");
@@ -201,7 +215,7 @@ test("P5: an eviction is reported, not silent — and coalesced, not budget-burn
   );
   const coalesce = source.indexOf("function reportSessionEvictions(");
   assert.ok(coalesce !== -1, "the coalescing reporter is missing");
-  const cWindow = source.slice(coalesce, coalesce + 1800);
+  const cWindow = source.slice(coalesce, coalesce + 3200);
   assert.match(cWindow, /EVICTION_DIAGNOSTIC_INTERVAL_MS/);
   assert.match(cWindow, /reportBridgeFailure/, "coalesced evictions still reach the audit channel");
   // Round 4: the coalesce state must not pretend a SUPPRESSED diagnostic was
@@ -225,6 +239,13 @@ test("P5: an eviction is reported, not silent — and coalesced, not budget-burn
     /evictionsSinceReport\.get\(label\)/,
     "eviction counts must be tracked per label, not as one scalar",
   );
+  // Round 5: if the audit child dies before writing, the flushed counts are
+  // restored so the loss reaches the next slot instead of vanishing.
+  assert.match(
+    cWindow,
+    /cur\.count \+= info\.count/,
+    "an undelivered audit must restore the flushed eviction counts",
+  );
 });
 
 test("P6: a suppressed diagnostic reports itself as NOT delivered", async () => {
@@ -243,7 +264,16 @@ test("P6: a suppressed diagnostic reports itself as NOT delivered", async () => 
     /return false;/,
     "the suppressed path must say the diagnostic was NOT delivered",
   );
-  assert.match(window, /return true;/, "the spawned path must say it was");
+  assert.match(window, /return true;/, "the spawned path must say it was spawned");
+  // Round 5: spawned is still not DELIVERED — a child that errors or exits
+  // non-zero before writing the audit must tell the caller, so coalesced
+  // counts can be restored instead of vanishing with only a console line.
+  assert.match(window, /onUndelivered/, "delivery failure must be observable");
+  assert.match(
+    window,
+    /if \(code !== 0\) undelivered\(\)/,
+    "a non-zero exit is a failed audit write",
+  );
 });
 
 test("P5: queued context per session is bounded by volume, not only by session count", async () => {

@@ -82,12 +82,29 @@ function reportSessionEvictions(label, max, evicted) {
     );
     return;
   }
-  const detail = [...evictionsSinceReport.entries()]
+  const flushed = [...evictionsSinceReport.entries()];
+  const detail = flushed
     .map(([name, info]) => `${info.count} ${name} entr(y|ies) (bound ${info.max})`)
     .join("; ");
   const accepted = reportBridgeFailure(
     "session-evict",
     new Error(`evicted for old sessions: ${detail}`),
+    () => {
+      // Round 5: "accepted" only means a child spawned. If it dies before
+      // writing the audit, restore the flushed counts so the next slot
+      // carries them — otherwise the loss vanishes from the P6 surface with
+      // only a console line to show for it.
+      for (const [name, info] of flushed) {
+        const cur = evictionsSinceReport.get(name) || { count: 0, max: info.max };
+        cur.count += info.count;
+        cur.max = info.max;
+        evictionsSinceReport.set(name, cur);
+      }
+      console.warn(
+        `[minni] session-evict audit child died before writing; ` +
+          `restored counts: ${detail}`,
+      );
+    },
   );
   // Review round 4: only advance the window and clear the counts when the
   // diagnostic actually spawned. The in-flight cap being full is exactly the
@@ -164,11 +181,12 @@ function runHook(event, payload) {
 // fire-and-forget BridgeFailure event. Deliberately not awaited and fully
 // fail-silent: this runs on the failure path, and a second failure here must
 // not turn a degraded bridge into a broken session.
-// Returns true when a diagnostic child was actually spawned, false when the
-// in-flight cap (or a spawn error) suppressed it — callers coalescing their
-// own reports (reportSessionEvictions) must not treat a suppressed diagnostic
-// as delivered (review round 4).
-function reportBridgeFailure(event, error) {
+// Returns true when a diagnostic child was actually SPAWNED (a budget slot
+// was taken), false when the in-flight cap or a spawn error suppressed it.
+// Spawned is NOT delivered (round 5): the child is fire-and-forget, so a
+// caller that needs to know its audit never landed passes `onUndelivered`,
+// invoked once if the child errors or exits non-zero before writing.
+function reportBridgeFailure(event, error, onUndelivered) {
   const detail = error instanceof Error ? error.message : String(error);
   console.warn(`[minni] ${event} hook unavailable; continuing: ${detail}`);
   // Bounded on BOTH axes. This runs on the failure path, where failures arrive
@@ -203,8 +221,22 @@ function reportBridgeFailure(event, error) {
       clearTimeout(kill);
       diagnosticsInFlight -= 1;
     };
-    child.once("close", settle);
-    child.once("error", settle);
+    // Round 5: the same idempotence guard for delivery-failure reporting —
+    // a failed spawn can fire both `error` and `close`.
+    let undeliveredReported = false;
+    const undelivered = () => {
+      if (undeliveredReported) return;
+      undeliveredReported = true;
+      if (onUndelivered) onUndelivered();
+    };
+    child.once("close", (code) => {
+      settle();
+      if (code !== 0) undelivered();
+    });
+    child.once("error", () => {
+      settle();
+      undelivered();
+    });
     child.unref();
     child.on("error", () => {});
     child.stdin.on("error", () => {});

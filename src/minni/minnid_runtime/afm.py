@@ -78,9 +78,23 @@ _FAILURE_RETRY_SECONDS = 300
 # handle_daemon_compile merges it into a non-exception response. Leaving it
 # out of this set scheduled the next attempt a full interval later: the same
 # AFM-8 hole, one status name over.
+# Round 5: "write_in_flight" is the writer refusing a re-submit while the
+# previous job for the same pass is still queued (see afm_writer.submit_drafts)
+# — a failed tick for scheduling, and proof the earlier batch has not landed.
 _COMPILE_FAILURE_STATUSES = frozenset(
-    {"afm_unavailable", "write_failed", "write_timeout"}
+    {"afm_unavailable", "write_failed", "write_timeout", "write_in_flight"}
 )
+
+# Review round 5 on PR #260: write_timeout / write_in_flight are NOT the same
+# failure mode as afm_unavailable / write_failed. The latter mean nothing
+# durable is in flight, so the 300s retry is pure recovery; the former mean
+# the previous batch is still queued and may yet land — retrying those every
+# 300s re-ran the whole pass (LLM compute) 288x more often than the old
+# schedule while the writer was stuck. The writer's in-flight guard is what
+# prevents duplicate drafts; this longer backoff (well past the 30s wait plus
+# drain margin) keeps the loop from burning compute against a blocked queue.
+_WRITE_STALL_STATUSES = frozenset({"write_timeout", "write_in_flight"})
+_WRITE_STALL_RETRY_SECONDS = 1800
 
 
 def compile_failure_status(res: Any) -> Optional[str]:
@@ -91,6 +105,13 @@ def compile_failure_status(res: Any) -> Optional[str]:
     """
     if not isinstance(res, dict):
         return None
+    # Review round 5 on PR #260: handle_daemon_compile's make_error paths
+    # (unsupported pass_name, vault-guard denial) return a top-level JSON-RPC
+    # `error` with no `result` at all. Reading only result.status made those
+    # look like SUCCESSFUL ticks — a misconfigured pass burned the full
+    # interval silently and recorded neither attempt nor failure.
+    if "error" in res:
+        return "rpc_error"
     payload = res.get("result")
     if not isinstance(payload, dict):
         return None
@@ -98,17 +119,40 @@ def compile_failure_status(res: Any) -> Optional[str]:
     return status if status in _COMPILE_FAILURE_STATUSES else None
 
 
-def next_last_run(interval: float, now: float, failed: bool) -> float:
+def record_rpc_error(pass_name: str, res: Any) -> None:
+    """GA4-3 for the make_error paths (round 5, PR #260).
+
+    A top-level JSON-RPC error returns BEFORE handle_daemon_compile's try
+    body, so neither record_pass_attempt nor record_pass_failure ran — a pass
+    failing its argument/guard checks on every tick left no trace on any
+    health surface. The loop records both here for its wet runs.
+    """
+    from minni.afm_writer import record_pass_attempt, record_pass_failure
+
+    err = res.get("error") if isinstance(res, dict) else None
+    message = str((err or {}).get("message") or "JSON-RPC error")
+    record_pass_attempt(pass_name)
+    record_pass_failure(pass_name, message)
+
+
+def next_last_run(
+    interval: float,
+    now: float,
+    failed: bool,
+    retry_seconds: Optional[float] = None,
+) -> float:
     """The ``last_run`` stamp a just-finished tick should record.
 
-    A failed tick backs off to :data:`_FAILURE_RETRY_SECONDS` instead of
-    consuming the whole interval; a successful one records now. Pulled out as a
-    pure function so the scheduling decision is testable without driving the
-    async loop — the behavior, not the source text, is what needs pinning.
+    A failed tick backs off to ``retry_seconds`` (default
+    :data:`_FAILURE_RETRY_SECONDS`) instead of consuming the whole interval; a
+    successful one records now. Pulled out as a pure function so the
+    scheduling decision is testable without driving the async loop — the
+    behavior, not the source text, is what needs pinning.
     """
     if not failed:
         return now
-    return now - max(0, interval - _FAILURE_RETRY_SECONDS)
+    retry = _FAILURE_RETRY_SECONDS if retry_seconds is None else retry_seconds
+    return now - max(0, interval - retry)
 
 
 def afm_loop_enabled(config=DEFAULT_CONFIG) -> bool:
@@ -567,6 +611,10 @@ async def afm_loop_runner(context: AFMContext):
             # failure status. handle_daemon_compile swallows the exception and
             # returns, so this is the only place the failure is observable.
             tick_failed = False
+            # Round 5: WHICH failure decides the backoff class — a write stall
+            # (previous batch still in flight) backs off much longer than a
+            # recoverable fault (see _WRITE_STALL_STATUSES).
+            tick_failure: Optional[str] = None
             try:
                 context.logger.info("AFM loop: running pass '%s'", name)
                 params = {
@@ -766,6 +814,9 @@ async def afm_loop_runner(context: AFMContext):
                         failure = compile_failure_status(res)
                         if failure:
                             tick_failed = True
+                            tick_failure = failure
+                            if failure == "rpc_error":
+                                record_rpc_error(name, res)
                             context.logger.warning(
                                 "AFM loop: consolidation batch %d returned %s: %s",
                                 batches + 1, failure,
@@ -790,6 +841,9 @@ async def afm_loop_runner(context: AFMContext):
                     failure = compile_failure_status(res)
                     if failure:
                         tick_failed = True
+                        tick_failure = failure
+                        if failure == "rpc_error":
+                            record_rpc_error(name, res)
                         context.logger.warning(
                             "AFM loop: pass '%s' returned %s: %s",
                             name, failure, (res.get("result") or {}).get("reason"),
@@ -813,8 +867,19 @@ async def afm_loop_runner(context: AFMContext):
             # outside, exactly like a pass that ran and had nothing to do.
             # `tick_failed` covers BOTH routes a failure can take: an exception
             # the loop sees, and (the common one) a failure status returned by
-            # handle_daemon_compile, which never raises.
-            last_run[name] = next_last_run(interval, time.time(), tick_failed)
+            # handle_daemon_compile, which never raises. A write stall backs
+            # off longer (round 5) — the previous batch is still queued, and a
+            # 300s re-fire re-ran the whole pass against a blocked writer.
+            last_run[name] = next_last_run(
+                interval,
+                time.time(),
+                tick_failed,
+                retry_seconds=(
+                    _WRITE_STALL_RETRY_SECONDS
+                    if tick_failure in _WRITE_STALL_STATUSES
+                    else None
+                ),
+            )
         await asyncio.sleep(idle_seconds)
     context.logger.info("AFM loop runner stopped.")
 

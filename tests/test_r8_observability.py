@@ -656,6 +656,48 @@ def test_write_timeout_is_counted_and_stamped(monkeypatch):
     afm_writer.reset_pass_counters()
 
 
+def test_resubmit_while_prior_job_in_flight_is_refused_not_duplicated(monkeypatch):
+    """Round 5: a write_timeout response means the job is STILL queued and
+    will land when the writer drains. Re-submitting the pass before then used
+    to enqueue a second generation of the same batch — new trace_id, new
+    page_ids, duplicate wiki files once the queue drained, and a bounded
+    queue filling 288x faster. The writer must refuse, not duplicate."""
+    from minni import afm_writer
+
+    afm_writer.reset_pass_counters()
+    monkeypatch.setattr(afm_writer, "_ensure_worker", lambda: None)
+    monkeypatch.setattr(afm_writer, "_WORK_QUEUE", queue.Queue(maxsize=4))
+
+    first = afm_writer.submit_drafts(
+        {"pass_name": "p", "drafts": [{"title": "t"}]}, timeout=0.01
+    )
+    assert first["status"] == "write_timeout", "precondition: job queued, nobody draining"
+    depth = afm_writer._WORK_QUEUE.qsize()
+
+    second = afm_writer.submit_drafts(
+        {"pass_name": "p", "drafts": [{"title": "t2"}]}, timeout=0.01
+    )
+    assert second["status"] == "write_in_flight"
+    assert second["drafts_written"] == []
+    assert afm_writer._WORK_QUEUE.qsize() == depth, (
+        "the duplicate batch must be REFUSED, not enqueued behind the stuck one"
+    )
+
+    # Another pass is not blocked by this pass's stall.
+    other = afm_writer.submit_drafts(
+        {"pass_name": "q", "drafts": [{"title": "t3"}]}, timeout=0.01
+    )
+    assert other["status"] == "write_timeout"
+
+    # Once the prior job lands (its Event sets), the pass may submit again.
+    afm_writer._IN_FLIGHT_PER_PASS["p"].set()
+    third = afm_writer.submit_drafts(
+        {"pass_name": "p", "drafts": [{"title": "t4"}]}, timeout=0.01
+    )
+    assert third["status"] == "write_timeout", "a landed batch unblocks the pass"
+    afm_writer.reset_pass_counters()
+
+
 def test_recent_write_timeouts_reach_the_status_verdict():
     """The chronic-timeout writer must not read `ok`; an old timeout must not
     latch `backlogged` (same recency discipline as drops)."""
@@ -782,10 +824,65 @@ def test_a_returned_failure_status_counts_as_a_failed_tick():
     # merges into a non-exception response. Missing it here scheduled the next
     # attempt a full interval later: the same AFM-8 hole, one status name over.
     assert compile_failure_status({"result": {"status": "write_timeout"}}) == "write_timeout"
+    # Round 5: the writer refusing a duplicate submit while the previous batch
+    # is still queued is a failed tick too.
+    assert compile_failure_status({"result": {"status": "write_in_flight"}}) == "write_in_flight"
+    # Round 5: handle_daemon_compile's make_error paths (unsupported
+    # pass_name, vault-guard denial) return a top-level `error` with no
+    # `result` — reading only result.status made those SUCCESSFUL ticks.
+    assert compile_failure_status(
+        {"jsonrpc": "2.0", "id": None, "error": {"code": -32602, "message": "unsupported pass_name: nope"}}
+    ) == "rpc_error"
     # A successful compile must not be mistaken for a failure.
     assert compile_failure_status({"result": {"status": "ok", "summary": {}}}) is None
     assert compile_failure_status({"result": {"summary": {"examined": 3}}}) is None
     assert compile_failure_status(None) is None
+
+
+def test_an_rpc_error_records_attempt_and_failure():
+    """Round 5: a make_error response returns BEFORE handle_daemon_compile's
+    try body, so neither record_pass_attempt nor record_pass_failure ran — a
+    misconfigured pass failing its argument checks on every tick left the
+    GA4-3 counters silent. The loop records both through record_rpc_error."""
+    from minni import afm_writer
+    from minni.minnid_runtime.afm import record_rpc_error
+
+    afm_writer.reset_pass_counters()
+    record_rpc_error(
+        "synthesis",
+        {"jsonrpc": "2.0", "id": None, "error": {"code": -32602, "message": "unsupported pass_name: synthesis"}},
+    )
+    assert afm_writer._FAILURES_PER_PASS["synthesis"] == 1
+    assert afm_writer._LAST_ATTEMPT_PER_PASS["synthesis"] > 0
+    assert "unsupported pass_name" in afm_writer._LAST_FAILURE_PER_PASS["synthesis"]["error"]
+    afm_writer.reset_pass_counters()
+
+
+def test_a_write_stall_backs_off_longer_than_a_recoverable_fault():
+    """Round 5: write_timeout/write_in_flight mean the previous batch is
+    STILL QUEUED and may yet land — not the nothing-durable-in-flight failure
+    modes the 300s retry was built for. Re-firing the whole pass every 300s
+    against a blocked writer burned LLM compute 288x faster than the old
+    schedule; the writer's in-flight guard stops the duplicates, and this
+    dedicated backoff stops the compute storm."""
+    from minni.minnid_runtime.afm import (
+        _FAILURE_RETRY_SECONDS,
+        _WRITE_STALL_RETRY_SECONDS,
+        _WRITE_STALL_STATUSES,
+        next_last_run,
+    )
+
+    interval = 24 * 60 * 60
+    now = 1_000_000.0
+
+    assert _WRITE_STALL_STATUSES == {"write_timeout", "write_in_flight"}
+    assert _WRITE_STALL_RETRY_SECONDS > _FAILURE_RETRY_SECONDS
+    assert _WRITE_STALL_RETRY_SECONDS > 30.0, "must exceed the writer wait timeout plus drain margin"
+
+    stalled = next_last_run(interval, now, True, retry_seconds=_WRITE_STALL_RETRY_SECONDS)
+    assert stalled + interval - now == _WRITE_STALL_RETRY_SECONDS
+    # The default (recoverable-fault) backoff is unchanged.
+    assert next_last_run(interval, now, True) + interval - now == _FAILURE_RETRY_SECONDS
 
 
 def test_loop_consults_the_returned_status_not_only_exceptions():
@@ -800,7 +897,13 @@ def test_loop_consults_the_returned_status_not_only_exceptions():
         "the loop must inspect the compile response — the exception path alone "
         "is dead code for the failure mode AFM-8 is about"
     )
-    assert "next_last_run(interval, time.time(), tick_failed)" in source
+    assert "tick_failed" in source and "next_last_run(" in source
+    # Round 5: the backoff class must depend on WHICH failure came back —
+    # a write stall (previous batch still queued) backs off longer.
+    assert "tick_failure in _WRITE_STALL_STATUSES" in source
+    # Round 5: rpc_error responses skip handle_daemon_compile's recording,
+    # so the loop itself must record the attempt and the failure.
+    assert "record_rpc_error(name, res)" in source
 
 
 # ── #230 AFM-9: dropped distillation groups must be counted ──────────────────

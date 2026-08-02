@@ -75,6 +75,16 @@ WRITES_DROPPED_RECENT_SECONDS = 3600.0
 _WRITE_TIMEOUTS = 0
 _LAST_WRITE_TIMEOUT_AT: Optional[float] = None
 WRITE_TIMEOUTS_RECENT_SECONDS = 3600.0
+# Review round 5 on PR #260: at most ONE queued job per pass. A write_timeout
+# response means the job is STILL queued and will land when the writer drains
+# — but the loop's failure backoff re-fired the pass while it waited, and each
+# re-fire minted a new trace_id and new page_ids. Once the queue drained, every
+# queued generation of the same batch landed as its own set of wiki files, and
+# a stuck writer filled the bounded queue ~288x faster than the old schedule.
+# The guard makes a re-submit for a pass with an unfinished job a cheap,
+# honest refusal instead of a duplicate enqueue.
+_IN_FLIGHT_PER_PASS: dict[str, threading.Event] = {}
+_IN_FLIGHT_LOCK = threading.Lock()
 
 # A pass is stale once it has been silent for this multiple of its configured
 # interval. 2x, not 1x: a tick that lands a few seconds late is not a fault, and
@@ -150,6 +160,8 @@ def reset_pass_counters() -> None:
     _LAST_DROP_AT = None
     _WRITE_TIMEOUTS = 0
     _LAST_WRITE_TIMEOUT_AT = None
+    with _IN_FLIGHT_LOCK:
+        _IN_FLIGHT_PER_PASS.clear()
 
 
 def _parse_iso_utc(value: str) -> Optional[float]:
@@ -732,26 +744,45 @@ class DraftQueueFull(RuntimeError):
 
 def submit_drafts(job: dict, wait: bool = True, timeout: Optional[float] = 30.0) -> dict:
     _ensure_worker()
+    pass_name = str(job.get("pass_name") or "unknown")
     done = threading.Event()
     out: dict = {}
-    try:
-        _WORK_QUEUE.put_nowait((job, done, out))
-    except queue.Full:
-        # Drop policy: reject at the door and count it, rather than block the
-        # caller or silently grow. The drafts are NOT written; saying so is the
-        # whole point.
-        global _WRITES_DROPPED, _LAST_DROP_AT
-        _WRITES_DROPPED += 1
-        _LAST_DROP_AT = time.time()
-        logger.error(
-            "AFM writer queue full (%d jobs); REJECTED %d draft(s) from pass %r — "
-            "not written",
-            WRITER_QUEUE_MAX, len(job.get("drafts") or []), job.get("pass_name"),
-        )
-        raise DraftQueueFull(
-            f"writer queue full ({WRITER_QUEUE_MAX} jobs); "
-            f"{len(job.get('drafts') or [])} draft(s) rejected, not written"
-        )
+    with _IN_FLIGHT_LOCK:
+        prior = _IN_FLIGHT_PER_PASS.get(pass_name)
+        if prior is not None and not prior.is_set():
+            # Round 5: the previous batch for this pass is still queued and
+            # WILL land. Enqueuing another job now duplicates it — these
+            # drafts are refused, not queued, and the caller is told so.
+            logger.warning(
+                "AFM writer: pass %r already has a job in flight; REFUSED "
+                "%d draft(s) — resubmit after the previous batch lands",
+                pass_name, len(job.get("drafts") or []),
+            )
+            return {
+                "status": "write_in_flight",
+                "queue_depth": _WORK_QUEUE.qsize(),
+                "drafts_written": [],
+                "drafts_deferred": len(job.get("drafts") or []),
+            }
+        try:
+            _WORK_QUEUE.put_nowait((job, done, out))
+        except queue.Full:
+            # Drop policy: reject at the door and count it, rather than block
+            # the caller or silently grow. The drafts are NOT written; saying
+            # so is the whole point.
+            global _WRITES_DROPPED, _LAST_DROP_AT
+            _WRITES_DROPPED += 1
+            _LAST_DROP_AT = time.time()
+            logger.error(
+                "AFM writer queue full (%d jobs); REJECTED %d draft(s) from pass %r — "
+                "not written",
+                WRITER_QUEUE_MAX, len(job.get("drafts") or []), job.get("pass_name"),
+            )
+            raise DraftQueueFull(
+                f"writer queue full ({WRITER_QUEUE_MAX} jobs); "
+                f"{len(job.get('drafts') or [])} draft(s) rejected, not written"
+            )
+        _IN_FLIGHT_PER_PASS[pass_name] = done
     if not wait:
         return {"status": "queued", "queue_depth": _WORK_QUEUE.qsize()}
     if not done.wait(timeout):
