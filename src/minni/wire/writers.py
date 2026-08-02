@@ -181,8 +181,14 @@ def mcp_json(
         try:
             ex = load_json(target_path)
             ex_env = ex.get("mcpServers", {}).get("minni", {}).get("env", {}) or {}
-        except Exception:
-            pass
+        except Exception as exc:
+            # D10 twin: unparseable .mcp.json must not drop surface env.
+            raise ValueError(
+                f"cannot parse existing .mcp.json at {target_path}: {exc}. "
+                "Refusing to rewrite mcpServers.minni.env — the surface's "
+                "preserved env would be silently dropped. Fix or remove the "
+                "file, then re-run."
+            ) from exc
     if ex_env:
         ex_env = _validate_preserved_identity(ex_env, agent)
         # Never carry raw MINNI_CODEX_* from the surface — re-derive after

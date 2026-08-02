@@ -338,3 +338,33 @@ def test_codex_mirror_overwrites_stale_like_wire():
         assert env["MINNI_CODEX_VAULT_PATH"] == "/vault-new", mirror
         assert env["MINNI_CODEX_WORKSPACE_ID"] == "ws-new", mirror
         assert env["MINNI_CODEX_AGENT_ID"] == "codex", mirror
+
+
+def test_unparseable_mcp_json_is_hard_error_not_silent_env_drop(tmp_path):
+    """D10 twin: corrupt .mcp.json must refuse preserve rewrite (both sides)."""
+    import pytest
+    from minni.wire.writers import mcp_json as wire_mcp_json
+
+    path = tmp_path / ".mcp.json"
+    original = '{"mcpServers": {"minni": {"env": {"MINNI_WORKSPACE_ID": "keep-me"}}}, BROKEN'
+    path.write_text(original, encoding="utf-8")
+    server = tmp_path / "dist" / "server.js"
+    server.parent.mkdir(parents=True)
+    server.write_text("//\n", encoding="utf-8")
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    sock = tmp_path / "sock"
+
+    with pytest.raises(ValueError, match="cannot parse existing .mcp.json"):
+        propagate.mcp_json(
+            server, "cursor", vault, sock, tmp_path / "ws",
+            target_path=path,
+        )
+    assert path.read_text(encoding="utf-8") == original
+
+    with pytest.raises(ValueError, match="cannot parse existing .mcp.json"):
+        wire_mcp_json(
+            server, "cursor", vault, sock, tmp_path / "ws",
+            target_path=path,
+        )
+    assert path.read_text(encoding="utf-8") == original

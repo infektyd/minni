@@ -587,8 +587,15 @@ def mcp_json(server_path: Path, agent: str, vault: Path, socket_path: Path, work
         try:
             ex = load_json(target_path)
             ex_env = ex.get("mcpServers", {}).get("minni", {}).get("env", {}) or {}
-        except Exception:
-            pass
+        except Exception as exc:
+            # D10 twin: unparseable .mcp.json must not drop surface env by
+            # rewriting with defaults. Leave the file to the caller (no write).
+            raise ValueError(
+                f"cannot parse existing .mcp.json at {target_path}: {exc}. "
+                "Refusing to rewrite mcpServers.minni.env — the surface's "
+                "preserved env would be silently dropped. Fix or remove the "
+                "file, then re-run."
+            ) from exc
     if ex_env:
         # X2: validate preserved identity keys before carrying them forward, so a
         # stale/attacker-planted MINNI_VAULT_PATH/SOCKET_PATH/AGENT_ID in the
@@ -1379,8 +1386,14 @@ def update_one_plugin(platform: str, args: argparse.Namespace) -> dict[str, obje
         try:
             pre = load_json(mcp_target)
             pre_mcp_env = pre.get("mcpServers", {}).get("minni", {}).get("env", {}) or {}
-        except Exception:
-            pre_mcp_env = {}
+        except Exception as exc:
+            # D10 twin for JSON: refuse before copy_tree so a corrupt surface
+            # is left byte-identical (sync-root must not silently drop env).
+            raise ValueError(
+                f"cannot parse existing .mcp.json at {mcp_target}: {exc}. "
+                "Refusing to overwrite install_root — surface env would be "
+                "silently dropped. Fix or remove the file, then re-run."
+            ) from exc
 
     copy_tree(source, install_root)
     server_path = install_root / "dist" / "server.js"
