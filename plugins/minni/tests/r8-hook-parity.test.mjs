@@ -275,7 +275,9 @@ test("P6: a suppressed diagnostic reports itself as NOT delivered", async () => 
   );
   const spawn = source.indexOf("function spawnBridgeDiagnostic");
   assert.ok(spawn !== -1, "spawn path must live in spawnBridgeDiagnostic");
-  const spawnWindow = source.slice(spawn, spawn + 2800);
+  // Round 14: function grew (onDelivered + undelivered-before-settle comments);
+  // keep a window that still covers return true and the close/error handlers.
+  const spawnWindow = source.slice(spawn, spawn + 4500);
   assert.match(spawnWindow, /return true;/, "the spawned path must say it was spawned");
   // Round 5: spawned is still not DELIVERED — a child that errors or exits
   // non-zero before writing the audit must tell the caller, so coalesced
@@ -285,6 +287,14 @@ test("P6: a suppressed diagnostic reports itself as NOT delivered", async () => 
     spawnWindow,
     /if \(code !== 0\) undelivered\(\)/,
     "a non-zero exit is a failed audit write",
+  );
+  // Round 14: free-slot flush must see restored counts — undelivered before settle.
+  const closeAt = spawnWindow.indexOf('child.once("close"');
+  assert.ok(closeAt !== -1);
+  const closeSlice = spawnWindow.slice(closeAt, closeAt + 220);
+  assert.ok(
+    closeSlice.indexOf("undelivered()") < closeSlice.indexOf("settle()"),
+    "close handler must undelivered() before settle()",
   );
 });
 

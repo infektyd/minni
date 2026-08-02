@@ -300,6 +300,9 @@ function spawnBridgeDiagnostic(event, detail, onUndelivered, extras = {}) {
       if (onUndelivered) onUndelivered();
     };
     const delivered = () => {
+      // Never mark delivered after undelivered: a failed spawn can fire both
+      // `error` and a subsequent `close` (sometimes with code 0).
+      if (undeliveredReported) return;
       if (extras.onDelivered) extras.onDelivered();
     };
     // Round 14: undelivered BEFORE settle. settle() free-slot flushes; if

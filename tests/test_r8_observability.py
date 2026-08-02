@@ -1000,6 +1000,11 @@ def test_personal_vault_index_failure_is_in_degradation():
     ]
     assert personal_entries, f"expected personal degradation, got {payload['degradation']!r}"
     assert personal_entries[0].get("degraded") is True
+    # Round 14: vector_model from vault engine config / default_config — not
+    # the missing context.config attribute (always null before this fix).
+    assert personal_entries[0].get("vector_model") == "m", (
+        f"expected embedding model on personal degrade, got {personal_entries[0]!r}"
+    )
     assert "personal index" in str(
         personal_entries[0].get("personal_index_failed")
         or personal_entries[0].get("reason")
@@ -1214,16 +1219,42 @@ def test_deferred_lifecycle_failure_refuses_resubmit_and_surfaces(monkeypatch):
         },
         timeout=0.05,
     )
-    # After re-apply, a new batch may proceed (write may timeout with no worker).
+    # After re-apply, pending clears and a new batch may proceed (no worker →
+    # write_timeout is fine; lifecycle_pending refuse is not).
     assert "consolidation" not in afm_writer._PENDING_LIFECYCLE
     assert len(calls["applied"]) == 1
     assert calls["applied"][0]["promote_candidate_ids"] == [1]
     # Only the original write — re-apply must not mint a second draft set.
     assert writes == ["consolidation"], f"unexpected writes: {writes}"
-    # second may be write_timeout (no worker) or a result — not lifecycle_pending
     assert second.get("lifecycle_pending") is not True
-    assert second.get("status") != "write_in_flight" or "timeout" in str(second)
+    assert second.get("status") != "write_in_flight", (
+        f"after successful re-apply, submit must not sticky-refuse: {second!r}"
+    )
+    # Prior hold Event must be released so a later submit is not write_in_flight.
+    assert done.is_set(), "re-apply must clear the sticky in-flight Event"
 
+    # Second submit enqueued a new batch with no worker → still "in flight".
+    # Release that Event so the third submit proves the lifecycle gate (not
+    # ordinary pass-busy de-dupe) is what used to block forever.
+    with afm_writer._IN_FLIGHT_LOCK:
+        mid = afm_writer._IN_FLIGHT_PER_PASS.get("consolidation")
+        if mid is not None and not mid.is_set():
+            mid.set()
+
+    third = afm_writer.submit_drafts(
+        {
+            "pass_name": "consolidation",
+            "drafts": [{"title": "after-reapply"}],
+            "lifecycle_handler": _handler,
+        },
+        timeout=0.05,
+    )
+    assert third.get("lifecycle_pending") is not True
+    assert third.get("status") != "write_in_flight", (
+        f"third submit after re-apply must not be refused: {third!r}"
+    )
+
+    # Synthetic status surface still names deferred lifecycle when counters say so.
     status, reasons = afm_writer.derive_loop_status(
         {
             "last_attempt_per_pass": {"consolidation": 1_000_000.0},

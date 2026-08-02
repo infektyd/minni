@@ -57,14 +57,21 @@ function createStormReporter({ hookScript, logPath }) {
     const accepted = spawnBridgeDiagnostic(
       failedEvent,
       `coalesced bridge failures: ${detail}`,
-      () => restoreSuppressedFailures(flushed),
+      () => {
+        restoreSuppressedFailures(flushed);
+        // Round 14: restore suppressed count when the audit never lands.
+        diagnosticsSuppressed = Math.max(diagnosticsSuppressed, suppressedAtFlush);
+      },
       {
         coalesced_count: totalCount,
         suppressed_since_last_report: suppressedAtFlush,
+        // Zero only on confirmed delivery (exit 0), not on mere spawn.
+        onDelivered: () => {
+          diagnosticsSuppressed = 0;
+        },
       },
     );
     if (accepted) {
-      diagnosticsSuppressed = 0;
       return true;
     }
     restoreSuppressedFailures(flushed);
@@ -95,9 +102,14 @@ function createStormReporter({ hookScript, logPath }) {
         undeliveredReported = true;
         if (onUndelivered) onUndelivered();
       };
+      const markDelivered = () => {
+        if (undeliveredReported) return;
+        if (extras.onDelivered) extras.onDelivered();
+      };
       // Round 14: undelivered before settle (same as production plugin).
       child.once("close", (code) => {
         if (code !== 0) undelivered();
+        else markDelivered();
         settle();
       });
       child.once("error", () => {
@@ -259,4 +271,97 @@ test("P6 source: minni-plugin.js wires settle → flushPendingSuppressedFailures
     source.slice(settle, settle + 350),
     /flushPendingSuppressedFailures\(\)/,
   );
+  // Round 14: undelivered must run before settle on close/error paths.
+  const closeHandler = source.indexOf('child.once("close"');
+  assert.ok(closeHandler !== -1);
+  const closeSlice = source.slice(closeHandler, closeHandler + 220);
+  const undeliveredAt = closeSlice.indexOf("undelivered()");
+  const settleAt = closeSlice.indexOf("settle()");
+  assert.ok(undeliveredAt !== -1 && settleAt !== -1 && undeliveredAt < settleAt,
+    "close handler must call undelivered() before settle()");
+  // diagnosticsSuppressed zero only via onDelivered, not on spawn accept.
+  assert.match(source, /onDelivered:\s*\(\)\s*=>\s*\{[^}]*diagnosticsSuppressed\s*=\s*0/s);
+  assert.doesNotMatch(
+    source,
+    /if \(accepted\) \{\s*diagnosticsSuppressed\s*=\s*0/,
+  );
+});
+
+test("P6 behavioral: undelivered restore re-spawns on free slot (ordering pin)", async () => {
+  // Grok R14 High: if settle() runs before undelivered(), free-slot flush
+  // sees empty maps and never re-spawns — restored counts sit console-only.
+  // Scenario: storm fills budget → suppress coalesces → free-slot flush spawns
+  // a coalesced audit that dies once → restore+re-flush must deliver without
+  // further reportBridgeFailure calls.
+  const root = await mkdtemp(path.join(tmpdir(), "minni-storm-undel-"));
+  const logPath = path.join(root, "bridge-audit.jsonl");
+  const hookScript = path.join(root, "fake-hook.mjs");
+  const failCounter = path.join(root, "coalesced-fail-left");
+  // Individual diagnostics deliver; the first coalesced audit exits 1 once.
+  await writeFile(failCounter, "1", "utf8");
+  await writeFile(
+    hookScript,
+    [
+      "import { appendFileSync, readFileSync, writeFileSync, existsSync } from 'node:fs';",
+      "const chunks = [];",
+      "for await (const c of process.stdin) chunks.push(c);",
+      "const body = Buffer.concat(chunks).toString('utf8');",
+      "const isCoalesced = body.includes('coalesced') || body.includes('bridge-storm');",
+      "const counter = process.env.MINNI_STORM_FAIL_COUNTER;",
+      "if (isCoalesced && counter && existsSync(counter)) {",
+      "  const left = Number(readFileSync(counter, 'utf8') || '0');",
+      "  if (left > 0) {",
+      "    writeFileSync(counter, String(left - 1));",
+      "    process.exit(1);",
+      "  }",
+      "}",
+      "await new Promise((r) => setTimeout(r, 40));",
+      "appendFileSync(process.env.MINNI_STORM_LOG, body + '\\n');",
+      "process.exit(0);",
+    ].join("\n"),
+    "utf8",
+  );
+
+  process.env.MINNI_STORM_FAIL_COUNTER = failCounter;
+  try {
+    const reporter = createStormReporter({ hookScript, logPath });
+
+    for (let i = 0; i < DIAGNOSTIC_MAX_IN_FLIGHT; i += 1) {
+      assert.equal(
+        reporter.reportBridgeFailure("Stop", new Error(`hold #${i}`)),
+        true,
+      );
+    }
+    const EXTRA = 3;
+    for (let i = 0; i < EXTRA; i += 1) {
+      assert.equal(
+        reporter.reportBridgeFailure("Stop", new Error(`storm #${i}`)),
+        false,
+      );
+    }
+    const mid = reporter.getState();
+    assert.equal(mid.pending.get("Stop")?.count, EXTRA);
+
+    await reporter.waitForIdle(10_000);
+
+    const final = reporter.getState();
+    assert.equal(final.pending.size, 0, "pending must drain after re-spawn delivery");
+    assert.equal(final.diagnosticsInFlight, 0);
+    const coalesced = final.delivered.filter(
+      (p) => p.coalesced_count != null || String(p.error).includes("coalesced"),
+    );
+    // First coalesced attempt undelivered + second attempt spawned = ≥2 coalesced payloads.
+    assert.ok(
+      coalesced.length >= 2,
+      `expected re-spawn after undelivered coalesced audit, got ${coalesced.length}: ` +
+        JSON.stringify(coalesced),
+    );
+    const log = await readFile(logPath, "utf8");
+    assert.match(log, /coalesced bridge failures|suppressed_since_last_report/);
+    // Med: zero diagnosticsSuppressed only after confirmed delivery (exit 0).
+    assert.equal(final.diagnosticsSuppressed, 0);
+  } finally {
+    delete process.env.MINNI_STORM_FAIL_COUNTER;
+    await rm(root, { recursive: true, force: true });
+  }
 });
