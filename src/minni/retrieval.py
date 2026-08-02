@@ -478,8 +478,18 @@ class RetrievalEngine:
         query: str,
         limit: int,
         agent_filter: Optional[Sequence[str]] = None,
+        exclude_statuses: Optional[Sequence[str]] = None,
     ) -> List[Dict]:
-        """FTS5 search using BM25 ranking."""
+        """FTS5 search using BM25 ranking.
+
+        ``exclude_statuses`` filters in SQL rather than after the fact. The
+        LIMIT below is a fixed window, so a lifecycle state the caller is going
+        to discard anyway must not be allowed to occupy it — a post-filter
+        cannot recover rows that were never fetched. This matters most on a
+        vault dominated by unendorsed drafts, where an unfiltered window fills
+        with pages nobody asked for and the accepted answer never enters the
+        merge.
+        """
         results = []
         safe_query = self._sanitize_fts_query(query)
         if not safe_query:
@@ -492,6 +502,13 @@ class RetrievalEngine:
             if agent_scope:
                 agent_clause = f" AND d.agent IN ({','.join('?' * len(agent_scope))})"
                 scope_params.extend(agent_scope)
+            skip = [str(s) for s in (exclude_statuses or [])]
+            if skip:
+                agent_clause += (
+                    " AND COALESCE(d.page_status, 'candidate') NOT IN "
+                    f"({','.join('?' * len(skip))})"
+                )
+                scope_params.extend(skip)
 
             def _match(match_expr: str):
                 # Fetch happens inside the retry helper (review r3): the
@@ -2353,6 +2370,31 @@ class RetrievalEngine:
             logger.warning("Unknown sort=%r, falling back to 'semantic'", sort)
             sort = "semantic"
 
+        # Lifecycle exclusions are decided HERE, before any candidate window is
+        # filled, and reused by every leg below. They used to be computed only
+        # after merge + rerank + truncate, which meant states the caller had
+        # already opted out of could occupy the FTS LIMIT, survive into the RRF
+        # pool, consume final slots, and only then be dropped — returning fewer
+        # than `limit` usable results. The late filter is still applied as
+        # defense in depth (and for privacy), but it is no longer the only gate.
+        skip_statuses = set()
+        if not include_superseded:
+            skip_statuses.add("superseded")
+        if not include_rejected:
+            skip_statuses.add("rejected")
+        if not include_drafts:
+            skip_statuses.add("draft")
+            skip_statuses.add("expired")
+        skip_list = sorted(skip_statuses)
+
+        def _drop_skipped(rows: List[Dict]) -> List[Dict]:
+            if not skip_statuses:
+                return rows
+            return [
+                r for r in rows
+                if (r.get("page_status") or "candidate") not in skip_statuses
+            ]
+
         rerank_k = self.config.reranker_top_k if self.config.reranker_enabled else limit
 
         if sort == "chronological":
@@ -2365,10 +2407,13 @@ class RetrievalEngine:
             # Step 1-2: Dual retrieval
             fts_t0 = time.perf_counter()
             if document_agent_filter is None:
-                fts_results = self._fts_search(query, rerank_k)
+                fts_results = self._fts_search(
+                    query, rerank_k, exclude_statuses=skip_list
+                )
             else:
                 fts_results = self._fts_search(
-                    query, rerank_k, agent_filter=document_agent_filter
+                    query, rerank_k, agent_filter=document_agent_filter,
+                    exclude_statuses=skip_list,
                 )
             timing["fts_ms"] = round((time.perf_counter() - fts_t0) * 1000, 3)
             trace["fts_hits"] = [
@@ -2432,6 +2477,13 @@ class RetrievalEngine:
                 }
                 for idx, r in enumerate(semantic_results, start=1)
             ]
+
+            # Drop excluded lifecycle states on BOTH legs before they can win
+            # slots in the fusion pool. FTS is already filtered in SQL; the
+            # vector legs are filtered here, since a chunk embedded before its
+            # page changed status can still be returned by FAISS.
+            semantic_results = _drop_skipped(semantic_results)
+            extra_backend_results = [_drop_skipped(rows) for rows in extra_backend_results]
 
             # Step 3: RRF merge — with extra streams if multi-backend
             if extra_backend_results:
@@ -2512,15 +2564,19 @@ class RetrievalEngine:
                         if hypothetical:
                             trace["hyde"]["hypothetical_chars"] = len(hypothetical)
                             if document_agent_filter is None:
-                                hyde_fts = self._fts_search(hypothetical, rerank_k)
+                                hyde_fts = self._fts_search(
+                                    hypothetical, rerank_k, exclude_statuses=skip_list
+                                )
                                 hyde_semantic = self._semantic_search(hypothetical, rerank_k)
                             else:
                                 hyde_fts = self._fts_search(
-                                    hypothetical, rerank_k, agent_filter=document_agent_filter
+                                    hypothetical, rerank_k, agent_filter=document_agent_filter,
+                                    exclude_statuses=skip_list,
                                 )
                                 hyde_semantic = self._semantic_search(
                                     hypothetical, rerank_k, agent_filter=document_agent_filter
                                 )
+                            hyde_semantic = _drop_skipped(hyde_semantic)
                             hyde_merged = self._rrf_merge(hyde_fts, hyde_semantic, rerank_k)
                             hyde_merged = self._filter_candidates(
                                 hyde_merged, layers, start_date, end_date
@@ -2559,14 +2615,10 @@ class RetrievalEngine:
         # default: skip superseded, rejected, draft, expired
         # callers can opt back in with include_* kwargs
         _ALWAYS_EXCLUDED = {"blocked"}  # privacy_level=blocked is always excluded
-        _SKIP_STATUSES = set()
-        if not include_superseded:
-            _SKIP_STATUSES.add("superseded")
-        if not include_rejected:
-            _SKIP_STATUSES.add("rejected")
-        if not include_drafts:
-            _SKIP_STATUSES.add("draft")
-            _SKIP_STATUSES.add("expired")
+        # Same set the legs were filtered with above (computed once, near the
+        # top of retrieve). Kept here as defense in depth and because privacy
+        # exclusion has always been enforced at this point.
+        _SKIP_STATUSES = skip_statuses
 
         if _SKIP_STATUSES or _ALWAYS_EXCLUDED:
             filtered = []

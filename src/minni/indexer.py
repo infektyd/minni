@@ -348,7 +348,16 @@ class VaultIndexer:
             to_delete = []
             for row in c.fetchall():
                 path = row["path"]
-                if path in disk_files:
+                # Resolve before the membership test (same as wiki_indexer):
+                # disk_files is keyed on resolved paths, so a row stored under a
+                # non-canonical spelling of a file that DOES exist -- a symlink,
+                # an unnormalized absolute path -- would miss the raw comparison,
+                # pass the ownership check, and be deleted. Compare both forms.
+                try:
+                    resolved = str(Path(path).resolve())
+                except Exception:
+                    resolved = path
+                if path in disk_files or resolved in disk_files:
                     continue
                 if not path_within_root(path, vault_root):
                     continue

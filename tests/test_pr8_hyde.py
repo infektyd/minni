@@ -152,7 +152,7 @@ def test_retrieve_runs_one_hyde_pass_for_low_confidence_results(monkeypatch, tmp
             "heading_context": "",
         }
 
-    def fake_fts(query, limit):
+    def fake_fts(query, limit, **_kwargs):
         calls.append(query)
         if query == "hypothetical answer":
             return [hit(2, "hyde result")]

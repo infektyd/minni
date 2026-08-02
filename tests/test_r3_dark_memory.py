@@ -485,3 +485,168 @@ def test_expiry_rewrite_lands_in_frontmatter_not_body(tmp_path):
 
     assert "status: expired" in _extract_frontmatter(text)
     assert "mentions status: draft in passing" in text
+
+
+# ── Round 3: findings from the second Grok review of #256 ──────────────────
+
+
+def _write_page(path: Path, status: str, body: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        f"---\ntitle: {path.stem}\nstatus: {status}\nagent: afm-loop\nprivacy: safe\n---\n\n{body}\n",
+        encoding="utf-8",
+    )
+
+
+def _engine(cfg):
+    from minni.db import SovereignDB
+    from minni.retrieval import RetrievalEngine
+
+    return RetrievalEngine(SovereignDB(cfg), cfg)
+
+
+def test_drafts_cannot_crowd_the_fts_window(tmp_path, monkeypatch):
+    """Grok round 2 #1 (High). Un-darkening the vault put ~1,214 drafts into
+    vault_fts. _fts_search takes a fixed LIMIT and retrieve() dropped
+    draft/expired only afterwards, so a query the drafts match fills the window
+    with pages nobody asked for and the accepted answer never enters the merge.
+    A post-filter cannot recover rows that were never fetched."""
+    from minni.index_all import index_shared_vault
+
+    _install_fake_embedder(monkeypatch)
+    cfg = _make_cfg(tmp_path)
+    vault = Path(cfg.vault_path)
+
+    # Many drafts that all match the query term, and one accepted page that
+    # also matches. Without SQL-side exclusion the drafts own the window.
+    for i in range(60):
+        _write_page(vault / "wiki" / "concepts" / f"draft{i}.md", "draft",
+                    "quantum widget calibration " * 12)
+    _write_page(vault / "wiki" / "concepts" / "the-answer.md", "accepted",
+                "quantum widget calibration procedure of record " * 12)
+    index_shared_vault(cfg)
+
+    eng = _engine(cfg)
+    try:
+        rows = eng._fts_search("quantum widget calibration", 20,
+                               exclude_statuses=["draft", "expired"])
+        statuses = {(r.get("page_status") or "candidate") for r in rows}
+        assert "draft" not in statuses and "expired" not in statuses
+        assert any(r["path"].endswith("the-answer.md") for r in rows), (
+            "the accepted page was crowded out of the FTS window"
+        )
+    finally:
+        eng.db.close()
+
+
+def test_accepted_page_survives_a_draft_heavy_corpus_with_semantic_down(tmp_path, monkeypatch):
+    """The failure the reviewer called out explicitly: with the embedder
+    unavailable the semantic leg returns nothing, so if FTS is all drafts the
+    post-filter empties the result and recall reads as broken."""
+    from minni.index_all import index_shared_vault
+
+    _install_fake_embedder(monkeypatch)
+    cfg = _make_cfg(tmp_path)
+    vault = Path(cfg.vault_path)
+    for i in range(60):
+        _write_page(vault / "wiki" / "concepts" / f"d{i}.md", "draft",
+                    "sovereign ledger reconciliation " * 12)
+    _write_page(vault / "wiki" / "concepts" / "keeper.md", "accepted",
+                "sovereign ledger reconciliation runbook " * 12)
+    index_shared_vault(cfg)
+
+    import minni.models as models
+
+    monkeypatch.setattr(models, "get_embedder", lambda: None)  # semantic leg down
+    eng = _engine(cfg)
+    try:
+        eng.config.reranker_enabled = False
+        results = eng.retrieve("sovereign ledger reconciliation", limit=5)
+        names = [r.get("filename", "") for r in results]
+        assert results, "recall was empty: drafts filled the window and were then dropped"
+        assert any(n.endswith("keeper.md") for n in names), names
+        assert not any(r.get("review_state") in {"draft", "expired"} for r in results)
+    finally:
+        eng.db.close()
+
+
+def test_excluded_statuses_do_not_consume_the_final_limit(tmp_path, monkeypatch):
+    """Grok round 2 #2. The filter ran after merge+rerank+truncate, so excluded
+    pages could take final slots and then vanish, returning fewer than `limit`."""
+    from minni.index_all import index_shared_vault
+
+    _install_fake_embedder(monkeypatch)
+    cfg = _make_cfg(tmp_path)
+    vault = Path(cfg.vault_path)
+    for i in range(40):
+        _write_page(vault / "wiki" / "concepts" / f"x{i}.md", "draft",
+                    "harmonic drift compensation " * 12)
+    for i in range(4):
+        _write_page(vault / "wiki" / "concepts" / f"ok{i}.md", "accepted",
+                    "harmonic drift compensation " * 12)
+    index_shared_vault(cfg)
+
+    eng = _engine(cfg)
+    try:
+        eng.config.reranker_enabled = False
+        results = eng.retrieve("harmonic drift compensation", limit=4)
+        assert len(results) == 4, f"limit not filled with usable rows: {len(results)}"
+        assert all(r.get("review_state") not in {"draft", "expired"} for r in results)
+    finally:
+        eng.db.close()
+
+
+def test_include_drafts_still_reaches_drafts(tmp_path, monkeypatch):
+    """SQL-side exclusion must be opt-out, not a permanent ban."""
+    from minni.index_all import index_shared_vault
+
+    _install_fake_embedder(monkeypatch)
+    cfg = _make_cfg(tmp_path)
+    vault = Path(cfg.vault_path)
+    _write_page(vault / "wiki" / "concepts" / "only-draft.md", "draft",
+                "singular findable phrase herein " * 12)
+    index_shared_vault(cfg)
+
+    eng = _engine(cfg)
+    try:
+        eng.config.reranker_enabled = False
+        assert eng.retrieve("singular findable phrase herein", limit=5) == []
+        opened = eng.retrieve("singular findable phrase herein", limit=5, include_drafts=True)
+        assert any(r.get("filename", "").endswith("only-draft.md") for r in opened), opened
+    finally:
+        eng.db.close()
+
+
+def test_prune_keeps_a_row_stored_under_a_non_canonical_path(tmp_path, monkeypatch):
+    """Grok round 2 #3. disk_files is keyed on resolved paths; the prune tested
+    the raw string only, so a row written under a symlinked or unnormalized
+    spelling of a file that EXISTS would be deleted once the sweep runs on a
+    timer."""
+    from minni.afm_writer import _write_one
+    from minni.index_all import index_shared_vault
+
+    _install_fake_embedder(monkeypatch)
+    cfg = _make_cfg(tmp_path)
+    vault = Path(cfg.vault_path)
+    written = _write_one(vault, _draft())
+    index_shared_vault(cfg)
+
+    page = (vault / written["path"]).resolve()
+    # Same file, non-canonical spelling. pathlib collapses a "." segment on its
+    # own, so use ".." — which it preserves and only resolve() normalizes.
+    noncanonical = str(page.parent / ".." / page.parent.name / page.name)
+    assert noncanonical != str(page) and Path(noncanonical).resolve() == page
+    conn = sqlite3.connect(cfg.db_path)
+    try:
+        conn.execute("UPDATE documents SET path = ? WHERE path = ?", (noncanonical, str(page)))
+        conn.commit()
+    finally:
+        conn.close()
+
+    index_shared_vault(cfg)
+
+    survivors = _indexed_paths(cfg.db_path)
+    assert noncanonical in survivors, (
+        "prune deleted a row whose file exists, because the stored path was "
+        "not in canonical form"
+    )
