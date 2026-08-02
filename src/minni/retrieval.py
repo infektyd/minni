@@ -333,6 +333,11 @@ class RetrievalEngine:
         # handler pair runs on a single thread, so each request sees only its own
         # suppression regardless of what concurrent requests do on other threads.
         self._auth_suppression_local = threading.local()
+        # Serializes _ensure_faiss_loaded. invalidate() turned "rare cold
+        # start" into "every worker after every vault change", and the ensure
+        # path is a multi-step read-build-save that must not run twice
+        # concurrently against moving DB state.
+        self._faiss_load_lock = threading.Lock()
         # recall-F3: the correction-class type set is config-invariant — compute
         # it once here instead of once per scored doc in _score_merged_doc.
         self._correction_types = _correction_class_page_types(config)
@@ -708,37 +713,61 @@ class RetrievalEngine:
         if self.faiss_index.count > 0:
             return
 
-        # PR-2: Try disk cache first
-        try:
-            conn = self.db._get_conn()
-            if self.faiss_index.try_load_from_disk(db_conn=conn):
+        # One worker rebuilds; the rest wait here and find it warm. Without
+        # this, every RPC worker that arrives after an invalidate runs its own
+        # full-table SELECT + build, from potentially different DB snapshots.
+        with self._faiss_load_lock:
+            if self.faiss_index.count > 0:
                 return
-        except Exception as e:
-            logger.debug("Disk cache load failed (non-fatal): %s", e)
 
-        # Rebuild from DB
-        chunk_ids = []
-        embeddings = []
-
-        with self.db.cursor() as c:
-            c.execute("SELECT chunk_id, embedding FROM chunk_embeddings")
-            for row in c.fetchall():
-                vec = np.frombuffer(row["embedding"], dtype=np.float32)
-                if vec.shape[0] == self.config.embedding_dim:
-                    chunk_ids.append(row["chunk_id"])
-                    embeddings.append(vec)
-
-        if chunk_ids:
-            all_vecs = np.array(embeddings, dtype=np.float32)
-            self.faiss_index.build_from_vectors(chunk_ids, all_vecs)
-            logger.info("FAISS index loaded from DB: %d vectors", len(chunk_ids))
-
-            # PR-2: Save to disk for next cold start
+            # PR-2: Try disk cache first
             try:
                 conn = self.db._get_conn()
-                self.faiss_index.save_to_disk(db_conn=conn)
+                if self.faiss_index.try_load_from_disk(db_conn=conn):
+                    return
             except Exception as e:
-                logger.debug("FAISS disk save failed (non-fatal): %s", e)
+                logger.debug("Disk cache load failed (non-fatal): %s", e)
+
+            # Rebuild from DB. The checksum is taken BEFORE the SELECT and
+            # re-checked after the build: the disk cache must only ever record
+            # a checksum for the exact snapshot the vectors came from, or a
+            # later cold load trusts a manifest whose vectors omit rows a
+            # concurrent durable insert added mid-build.
+            from minni.faiss_persist import compute_db_checksum
+            conn = self.db._get_conn()
+            checksum_before = compute_db_checksum(conn)
+
+            chunk_ids = []
+            embeddings = []
+
+            with self.db.cursor() as c:
+                c.execute("SELECT chunk_id, embedding FROM chunk_embeddings")
+                for row in c.fetchall():
+                    vec = np.frombuffer(row["embedding"], dtype=np.float32)
+                    if vec.shape[0] == self.config.embedding_dim:
+                        chunk_ids.append(row["chunk_id"])
+                        embeddings.append(vec)
+
+            if chunk_ids:
+                all_vecs = np.array(embeddings, dtype=np.float32)
+                self.faiss_index.build_from_vectors(chunk_ids, all_vecs)
+                logger.info("FAISS index loaded from DB: %d vectors", len(chunk_ids))
+
+                # PR-2: Save to disk for next cold start — skipped if the DB
+                # moved during the build; the next cold start rebuilds instead
+                # of inheriting a checksum-aligned lie.
+                try:
+                    conn = self.db._get_conn()
+                    if compute_db_checksum(conn) == checksum_before:
+                        self.faiss_index.save_to_disk(
+                            db_conn=conn, db_checksum=checksum_before
+                        )
+                    else:
+                        logger.debug(
+                            "FAISS disk save skipped: DB changed during rebuild"
+                        )
+                except Exception as e:
+                    logger.debug("FAISS disk save failed (non-fatal): %s", e)
 
     # ── Store-time semantic indexing (durable recall) ─────────
 
@@ -1015,9 +1044,10 @@ class RetrievalEngine:
         if not chunk_ids:
             return
         try:
-            if self.faiss_index.count > 0:
-                for cid in chunk_ids:
-                    self.faiss_index.remove(cid)
+            # Warm check and all removals happen atomically inside the FAISS
+            # lock — an unlocked count>0 snapshot followed by per-id calls can
+            # interleave with the vault-watch thread's invalidate().
+            self.faiss_index.remove_batch(chunk_ids)
         except Exception as exc:
             logger.debug("durable-index: live FAISS remove skipped: %s", exc)
 
@@ -1035,9 +1065,13 @@ class RetrievalEngine:
         if not chunk_ids:
             return
         try:
-            if self.faiss_index.count > 0:
-                for cid, vec in zip(chunk_ids, vectors):
-                    self.faiss_index.add(cid, vec)
+            # add_batch re-checks warm/invalidated under the FAISS lock and
+            # holds it for the whole batch. The previous shape — an unlocked
+            # count>0 snapshot, then one lock acquisition per add — let the
+            # vault-watch thread's invalidate() land between two adds, leaving
+            # a residual index of only the new chunks that count>0 gates then
+            # treated as warm: a semantic blackout until restart.
+            self.faiss_index.add_batch(chunk_ids, vectors)
         except Exception as exc:
             logger.warning(
                 "durable-index: live FAISS refresh failed (%s) — invalidating "

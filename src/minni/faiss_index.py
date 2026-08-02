@@ -54,6 +54,13 @@ class FAISSIndex:
         # dropped ids, empty hits, or an attribute error on a None index.
         # Reentrant because search() can fall through to a rebuild.
         self._lock = threading.RLock()
+        # Cold/invalidated generation flag. Set only by invalidate(), cleared
+        # only by a full rebuild (build_from_vectors) or a successful disk
+        # restore. While set, single adds are no-ops: the DB is the source of
+        # truth and the next ensure-load rebuilds fully. Without it, an add
+        # that interleaves with invalidate() leaves a tiny non-zero index that
+        # count>0 gates then treat as warm — a semantic blackout until restart.
+        self._invalidated = False
 
         self._load_faiss()
 
@@ -106,6 +113,7 @@ class FAISSIndex:
         chunk_ids: List[int],
         embeddings: np.ndarray,
     ) -> None:
+        self._invalidated = False
         self._chunk_ids = list(chunk_ids)
         self._vectors = [embeddings[i] for i in range(len(chunk_ids))]
         self._id_map = {i: cid for i, cid in enumerate(chunk_ids)}
@@ -212,6 +220,11 @@ class FAISSIndex:
             self._add_locked(chunk_id, embedding)
 
     def _add_locked(self, chunk_id: int, embedding: np.ndarray) -> None:
+        # An invalidated index must stay empty until a full rebuild: appending
+        # here would resurrect count>0 with only this chunk, and the count>0
+        # gate in _ensure_faiss_loaded would then never rebuild from the DB.
+        if self._invalidated:
+            return
         self._chunk_ids.append(chunk_id)
         self._vectors.append(embedding.copy())
         idx = len(self._chunk_ids) - 1
@@ -245,6 +258,38 @@ class FAISSIndex:
                 self._id_map.pop(idx, None)
             # Note: FAISS doesn't support true deletion for HNSW.
             # We filter results in search() instead. Periodic rebuild cleans up.
+
+    def add_batch(self, chunk_ids: List[int], embeddings: List[np.ndarray]) -> bool:
+        """Add several vectors as one atomic operation, only while warm.
+
+        The warm check happens under the lock, so invalidate() can run either
+        before the whole batch (nothing lands) or after it (everything is
+        cleared together) — never between two adds, which is the interleave
+        that leaves a partial residual index. Returns False when cold or
+        invalidated: the caller's rows are already in the DB, and the next
+        ensure-load rebuilds fully.
+        """
+        with self._lock:
+            if self._invalidated or not self._chunk_ids:
+                return False
+            for cid, emb in zip(chunk_ids, embeddings):
+                self._add_locked(cid, emb)
+            return True
+
+    def remove_batch(self, chunk_ids: List[int]) -> bool:
+        """Tombstone several chunk_ids as one atomic operation, only while warm.
+
+        Same contract as add_batch: warm/invalidated is re-checked under the
+        lock, and the whole multi-id operation holds it.
+        """
+        with self._lock:
+            if self._invalidated or not self._chunk_ids:
+                return False
+            for cid in chunk_ids:
+                if cid in self._reverse_map:
+                    idx = self._reverse_map.pop(cid)
+                    self._id_map.pop(idx, None)
+            return True
 
     def search(
         self,
@@ -360,6 +405,7 @@ class FAISSIndex:
         index or an empty one -- never a partly cleared one.
         """
         with self._lock:
+            self._invalidated = True
             self._chunk_ids = []
             self._vectors = []
             self._id_map = {}
@@ -424,6 +470,7 @@ class FAISSIndex:
         with self._lock:
             if faiss_index is not None:
                 # Restore from FAISS index: rebuild id maps from chunk_id_order
+                self._invalidated = False
                 self._index = faiss_index
                 self._chunk_ids = list(chunk_ids)
                 self._id_map = {i: cid for i, cid in enumerate(chunk_ids)}
@@ -453,34 +500,45 @@ class FAISSIndex:
 
         return False
 
-    def save_to_disk(self, db_conn=None) -> bool:
+    def save_to_disk(self, db_conn=None, db_checksum: str = None) -> bool:
         """
         Save the current index to disk.
 
         Args:
             db_conn: An open sqlite3.Connection for computing the DB checksum.
+            db_checksum: Precomputed checksum to record instead. Callers that
+                built the index from a known DB snapshot pass the checksum of
+                THAT snapshot, so the manifest can never claim a checksum the
+                saved vectors do not correspond to.
 
         Returns:
             True on success, False if save is skipped or fails.
         """
-        if self.count == 0:
-            logger.debug("Skipping FAISS save: index is empty")
-            return False
-
         from minni.faiss_persist import compute_db_checksum, save
 
-        checksum = "unknown"
-        if db_conn is not None:
-            checksum = compute_db_checksum(db_conn)
+        # Held across the whole save: _index/_vectors/_chunk_ids must be
+        # written as one consistent snapshot. Atomic rename prevents torn
+        # files, not a consistent-but-wrong one assembled while a concurrent
+        # invalidate/build/add was replacing the state mid-save.
+        with self._lock:
+            if self.count == 0:
+                logger.debug("Skipping FAISS save: index is empty")
+                return False
 
-        manifest = self._manifest_path()
-        return save(
-            index=self._index,
-            vectors=self._vectors,
-            chunk_ids=self._chunk_ids,
-            manifest_path=manifest,
-            embedding_model=self.config.embedding_model,
-            vector_dim=self.config.embedding_dim,
-            embedding_quantization=getattr(self.config, "embedding_quantization", "fp32"),
-            db_checksum=checksum,
-        )
+            checksum = db_checksum
+            if checksum is None:
+                checksum = "unknown"
+                if db_conn is not None:
+                    checksum = compute_db_checksum(db_conn)
+
+            manifest = self._manifest_path()
+            return save(
+                index=self._index,
+                vectors=self._vectors,
+                chunk_ids=self._chunk_ids,
+                manifest_path=manifest,
+                embedding_model=self.config.embedding_model,
+                vector_dim=self.config.embedding_dim,
+                embedding_quantization=getattr(self.config, "embedding_quantization", "fp32"),
+                db_checksum=checksum,
+            )

@@ -1375,3 +1375,221 @@ def test_faiss_disk_reload_is_atomic_against_concurrent_search(tmp_path):
             t.join(timeout=10)
 
     assert not errors, f"concurrent disk reload tore the index: {errors[:5]}"
+
+
+# ── Round 9: findings from the eighth Grok review of #256 ──────────────────
+
+
+def test_invalidate_mid_refresh_leaves_no_partial_residual(tmp_path, monkeypatch):
+    """Grok round 9 #1 (High). _refresh_live_faiss checked count>0 unlocked,
+    then took the FAISS lock once PER add. The vault-watch thread's
+    invalidate() could land between two adds: the earlier adds are wiped, the
+    later ones append onto the emptied structure, and the end state is a
+    warm-looking index holding only the new chunk(s). _ensure_faiss_loaded
+    early-returns on count>0, so semantic recall stays reduced to those few
+    vectors until the process restarts."""
+    from minni.faiss_index import FAISSIndex
+    from minni.index_all import index_shared_vault
+
+    _install_fake_embedder(monkeypatch)
+    cfg = _make_cfg(tmp_path)
+    _write_page(Path(cfg.vault_path) / "wiki" / "concepts" / "warm.md", "accepted",
+                "warm body text " * 60)
+    index_shared_vault(cfg)
+
+    eng = _engine(cfg)
+    try:
+        eng._ensure_faiss_loaded()
+        full = eng.faiss_index.count
+        assert full > 0, "engine did not warm up"
+
+        # Deterministic interleave: the vault-watch invalidate lands exactly
+        # between the first and second add of a durable-store refresh.
+        real_add = FAISSIndex._add_locked
+        calls = {"n": 0}
+
+        def racing_add(self, chunk_id, embedding):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                self.invalidate()
+            real_add(self, chunk_id, embedding)
+
+        monkeypatch.setattr(FAISSIndex, "_add_locked", racing_add)
+        dim = cfg.embedding_dim
+        new_ids = [9001, 9002, 9003]
+        new_vecs = [np.random.rand(dim).astype(np.float32) for _ in new_ids]
+        eng._refresh_live_faiss(new_ids, new_vecs)
+        monkeypatch.setattr(FAISSIndex, "_add_locked", real_add)
+
+        # Either the whole batch landed before the invalidate (then was
+        # cleared with everything else) or none of it did — never a tiny
+        # residual set that count>0 gates would treat as a warm index.
+        assert eng.faiss_index.count in (0, full + len(new_ids)), (
+            f"partial residual index: {eng.faiss_index.count} vectors survived "
+            "an invalidate that interleaved with a refresh"
+        )
+
+        # And the next ensure-load must restore the full DB set.
+        eng._ensure_faiss_loaded()
+        assert eng.faiss_index.count == full, "rebuild did not restore the index"
+
+        # The simplest pin on the generation flag: a single add against an
+        # invalidated index must not resurrect count>0.
+        eng.faiss_index.invalidate()
+        eng.faiss_index.add(9004, np.random.rand(dim).astype(np.float32))
+        assert eng.faiss_index.count == 0, (
+            "add() on an invalidated index resurrected a partial warm state"
+        )
+    finally:
+        eng.db.close()
+
+
+def test_save_to_disk_records_the_callers_checksum(tmp_path):
+    """Grok round 9 #2. save_to_disk read _index/_vectors/_chunk_ids unlocked
+    and always recomputed the checksum at save time, so a rebuild racing a
+    durable insert could persist a manifest whose checksum matches the NEW DB
+    while the vectors omit the new rows — a consistent-but-wrong cache a later
+    cold load trusts. The caller can now pin the checksum of the snapshot the
+    vectors actually came from."""
+    import json
+
+    import numpy as np
+    from minni.config import SovereignConfig
+    from minni.faiss_index import FAISSIndex
+
+    cfg = SovereignConfig(
+        db_path=str(tmp_path / "s" / "m.db"), vault_path=str(tmp_path / "vault"),
+        graph_export_dir=str(tmp_path / "g"), faiss_index_path=str(tmp_path / "f.faiss"),
+        writeback_enabled=False,
+    )
+    idx = FAISSIndex(cfg)
+    idx.build_from_vectors([1, 2], np.random.rand(2, cfg.embedding_dim).astype(np.float32))
+
+    assert idx.save_to_disk(db_conn=None, db_checksum="pinned-snapshot")
+    with open(idx._manifest_path(), encoding="utf-8") as f:
+        manifest = json.load(f)
+    assert manifest["db_checksum"] == "pinned-snapshot", (
+        "manifest recorded a recomputed checksum, not the build snapshot's"
+    )
+
+
+def test_ensure_faiss_loaded_rebuilds_once_across_workers(tmp_path, monkeypatch):
+    """Grok round 9 #3. _ensure_faiss_loaded was not a critical section:
+    count>0 check, disk probe, full-table SELECT, build and save were separate
+    steps. invalidate() turned cold start from rare into every-worker-after-
+    every-vault-change, so concurrent workers each ran their own full rebuild
+    from potentially different DB snapshots."""
+    import threading
+
+    from minni.faiss_index import FAISSIndex
+    from minni.index_all import index_shared_vault
+
+    _install_fake_embedder(monkeypatch)
+    cfg = _make_cfg(tmp_path)
+    _write_page(Path(cfg.vault_path) / "wiki" / "concepts" / "p.md", "accepted",
+                "body text " * 60)
+    index_shared_vault(cfg)
+
+    eng = _engine(cfg)
+    try:
+        # Slow, missing disk cache: both workers reach the rebuild window at
+        # the same time unless something serializes them.
+        monkeypatch.setattr(
+            FAISSIndex, "try_load_from_disk",
+            lambda self, db_conn=None: (time.sleep(0.3), False)[1],
+        )
+        builds = []
+        real_build = FAISSIndex.build_from_vectors
+        monkeypatch.setattr(
+            FAISSIndex, "build_from_vectors",
+            lambda self, ids, vecs: (builds.append(1), real_build(self, ids, vecs))[1],
+        )
+
+        threads = [threading.Thread(target=eng._ensure_faiss_loaded) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+
+        assert eng.faiss_index.count > 0, "no worker warmed the index"
+        assert len(builds) == 1, (
+            f"{len(builds)} concurrent workers each rebuilt the index"
+        )
+    finally:
+        eng.db.close()
+
+
+def test_disk_save_skipped_when_db_moves_mid_rebuild(tmp_path, monkeypatch):
+    """Grok round 9 #3, checksum half. A durable insert between the ensure's
+    SELECT and the save used to produce a disk cache whose checksum matches
+    the new DB while the vectors omit the new rows. If the checksum moved
+    during the rebuild, the save must be skipped."""
+    import minni.faiss_persist as persist
+    from minni.index_all import index_shared_vault
+
+    _install_fake_embedder(monkeypatch)
+    cfg = _make_cfg(tmp_path)
+    _write_page(Path(cfg.vault_path) / "wiki" / "concepts" / "p.md", "accepted",
+                "body text " * 60)
+    index_shared_vault(cfg)
+
+    eng = _engine(cfg)
+    try:
+        eng.faiss_index.invalidate()
+        # Every checksum probe sees a different value — the moving-DB case.
+        ticks = iter(range(1000))
+        monkeypatch.setattr(
+            persist, "compute_db_checksum", lambda conn: f"gen-{next(ticks)}"
+        )
+        manifest = eng.faiss_index._manifest_path()
+        if os.path.exists(manifest):
+            os.remove(manifest)
+
+        eng._ensure_faiss_loaded()
+
+        assert eng.faiss_index.count > 0, "rebuild did not warm the index"
+        assert not os.path.exists(manifest), (
+            "a disk cache was written from a rebuild the DB moved under"
+        )
+    finally:
+        eng.db.close()
+
+
+def test_multiple_noncanonical_spellings_collapse_to_one_row(tmp_path, monkeypatch):
+    """Grok round 9 #4 (Low). _noncanonical_rows kept out[resolved] = row,
+    last wins. With TWO non-canonical spellings of one file and no canonical
+    row, phase 1 adopts one and the other survives the prune (it resolves to a
+    file that exists) — the round-5 duplicate collapse only covered the case
+    where one spelling was already canonical."""
+    from minni.afm_writer import _write_one
+    from minni.index_all import index_shared_vault
+
+    _install_fake_embedder(monkeypatch)
+    cfg = _make_cfg(tmp_path)
+    vault = Path(cfg.vault_path)
+    written = _write_one(vault, _draft())
+    index_shared_vault(cfg)
+
+    page = (vault / written["path"]).resolve()
+    spelling_a = str(page.parent / ".." / page.parent.name / page.name)
+    spelling_b = str(
+        page.parent / ".." / ".." / page.parent.parent.name / page.parent.name / page.name
+    )
+    assert Path(spelling_a).resolve() == page and Path(spelling_b).resolve() == page
+    assert spelling_a != spelling_b
+    # Seed the historical state: two non-canonical twins, NO canonical row.
+    conn = sqlite3.connect(cfg.db_path)
+    try:
+        conn.execute("UPDATE documents SET path = ? WHERE path = ?", (spelling_a, str(page)))
+        conn.commit()
+    finally:
+        conn.close()
+    _seed_row(cfg.db_path, spelling_b)
+    assert len([p for p in _indexed_paths(cfg.db_path) if p.endswith(page.name)]) == 2
+
+    index_shared_vault(cfg)
+
+    rows = [p for p in _indexed_paths(cfg.db_path) if p.endswith(page.name)]
+    assert rows == [str(page)], (
+        f"extra non-canonical spelling survived the collapse: {rows}"
+    )

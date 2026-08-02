@@ -194,7 +194,7 @@ class VaultIndexer:
         self._invalidate_rerank_chunks(stale)
         stats["chunks_purged"] += len(stale)
 
-    def _noncanonical_rows(self, vault_root: Path) -> Dict[str, Dict]:
+    def _noncanonical_rows(self, vault_root: Path, stats: Dict) -> Dict[str, Dict]:
         """Map resolved path -> row, for vault-owned rows stored non-canonically.
 
         Built ONCE per index run. The exact-path SELECT in phase 1 uses an
@@ -202,23 +202,33 @@ class VaultIndexer:
         -- and on a first index every file misses, so that scan is the common
         case, not the rare one. Almost always empty: real writers store
         resolved paths, so this only catches historical or symlinked rows.
+
+        When SEVERAL non-canonical spellings resolve to the same file, only
+        one can be adopted — a last-wins map silently kept the others as rows,
+        and the prune spares them because they resolve to a file that exists.
+        The extras are deleted here, counted in stats["deleted"].
         """
         from minni.path_safety import path_within_root
 
         out: Dict[str, Dict] = {}
         with self.db.cursor() as c:
             c.execute("SELECT doc_id, last_modified, path, page_status FROM documents")
-            for row in c.fetchall():
-                stored = row["path"]
-                try:
-                    resolved = str(Path(stored).resolve())
-                except Exception:
-                    continue
-                if resolved == stored:
-                    continue
-                if not path_within_root(stored, vault_root):
-                    continue
-                out[resolved] = row
+            rows = c.fetchall()
+        for row in rows:
+            stored = row["path"]
+            try:
+                resolved = str(Path(stored).resolve())
+            except Exception:
+                continue
+            if resolved == stored:
+                continue
+            if not path_within_root(stored, vault_root):
+                continue
+            prior = out.get(resolved)
+            if prior is not None and prior["doc_id"] != row["doc_id"]:
+                stats["deleted"] += self._delete_doc_rows(row["doc_id"])
+                continue
+            out[resolved] = row
         return out
 
     @staticmethod
@@ -260,7 +270,7 @@ class VaultIndexer:
             # _enforce_embed_policy); distinct from `deleted`, which is rows.
             "chunks_purged": 0, "errors": 0,
         }
-        noncanonical_rows = self._noncanonical_rows(vault_root)
+        noncanonical_rows = self._noncanonical_rows(vault_root, stats)
 
         # Phase 1: index new/changed files.
         #
