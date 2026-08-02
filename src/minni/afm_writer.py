@@ -75,6 +75,16 @@ WRITES_DROPPED_RECENT_SECONDS = 3600.0
 _WRITE_TIMEOUTS = 0
 _LAST_WRITE_TIMEOUT_AT: Optional[float] = None
 WRITE_TIMEOUTS_RECENT_SECONDS = 3600.0
+# Review round 8 on PR #260: a write that fails AFTER its submitter timed out
+# had no observer at all — the waiter was gone, so no DraftWriteError raised,
+# no pass failure recorded, no counter moved, and the drafts silently never
+# landed. The worker counts every batch failure itself (a waiter that IS
+# still present also raises DraftWriteError — two different metrics for one
+# event, not the same metric twice — because the worker cannot know race-free
+# whether the waiter is still there).
+_WRITE_FAILURES = 0
+_LAST_WRITE_FAILURE_AT: Optional[float] = None
+WRITE_FAILURES_RECENT_SECONDS = 3600.0
 # Review round 5 on PR #260: at most ONE queued job per pass. A write_timeout
 # response means the job is STILL queued and will land when the writer drains
 # — but the loop's failure backoff re-fired the pass while it waited, and each
@@ -160,6 +170,9 @@ def reset_pass_counters() -> None:
     _LAST_DROP_AT = None
     _WRITE_TIMEOUTS = 0
     _LAST_WRITE_TIMEOUT_AT = None
+    global _WRITE_FAILURES, _LAST_WRITE_FAILURE_AT
+    _WRITE_FAILURES = 0
+    _LAST_WRITE_FAILURE_AT = None
     with _IN_FLIGHT_LOCK:
         _IN_FLIGHT_PER_PASS.clear()
 
@@ -354,6 +367,24 @@ def derive_loop_status(
             f"{timeouts} over the process lifetime) — outcomes unobserved; "
             "the writer is not draining within the wait window"
         )
+    # Round 8 (PR #260): a batch that failed AFTER its waiter gave up had no
+    # observer — same recency discipline as timeouts, same honesty: those
+    # drafts never landed and never will.
+    wfails = int(state.get("write_failures", 0) or 0)
+    wfail_at = state.get("last_write_failure_at")
+    write_failed_recently = bool(wfails) and (
+        wfail_at is None or now - float(wfail_at) <= WRITE_FAILURES_RECENT_SECONDS
+    )
+    if write_failed_recently:
+        wfail_seen = (
+            "recency unknown"
+            if wfail_at is None
+            else f"most recent {int(now - float(wfail_at))}s ago"
+        )
+        reasons.append(
+            f"write job(s) FAILED in the writer ({wfail_seen}; {wfails} over "
+            "the process lifetime) — those drafts were never written"
+        )
     # Round 6 (PR #260): a job in flight NOW is current truth — no recency
     # window. Neither of the other writer signals covers a hung mid-job write:
     # queue_depth is 0 once the worker dequeues, and the timeout stamp ages
@@ -403,6 +434,7 @@ def derive_loop_status(
         or queue_backlogged
         or dropped_recently
         or timed_out_recently
+        or write_failed_recently
         or jobs_in_flight
         or (oldest_ts is not None and (now - oldest_ts) / 86400.0 > ttl_days)
     ):
@@ -721,15 +753,36 @@ def _write_batch(job: dict) -> dict:
     return result
 
 
+def _process_job(job: dict, done: threading.Event, out: dict) -> None:
+    """One queued batch, start to Event. Extracted from the worker loop so the
+    failure accounting is testable without driving the daemon thread."""
+    try:
+        out["result"] = _write_batch(job)
+    except Exception as exc:
+        out["error"] = str(exc)
+        # Round 8: count HERE, unconditionally. A waiter that already timed
+        # out (write_timeout) is gone — nobody raises DraftWriteError, nothing
+        # records a pass failure, and the drafts silently never land. A waiter
+        # that is still present raises too, but that is a different metric
+        # for the same event, not double-counting this one.
+        global _WRITE_FAILURES, _LAST_WRITE_FAILURE_AT
+        with _IN_FLIGHT_LOCK:
+            _WRITE_FAILURES += 1
+            _LAST_WRITE_FAILURE_AT = time.time()
+        logger.error(
+            "AFM writer: batch for pass %r FAILED (%d draft(s) not written): %s",
+            job.get("pass_name"), len(job.get("drafts") or []), exc,
+        )
+    finally:
+        done.set()
+
+
 def _worker() -> None:
     while True:
         job, done, out = _WORK_QUEUE.get()
         try:
-            out["result"] = _write_batch(job)
-        except Exception as exc:
-            out["error"] = str(exc)
+            _process_job(job, done, out)
         finally:
-            done.set()
             _WORK_QUEUE.task_done()
 
 
@@ -915,6 +968,8 @@ def writer_status(
         "last_drop_at": _LAST_DROP_AT,
         "write_timeouts": _WRITE_TIMEOUTS,
         "last_write_timeout_at": _LAST_WRITE_TIMEOUT_AT,
+        "write_failures": _WRITE_FAILURES,
+        "last_write_failure_at": _LAST_WRITE_FAILURE_AT,
         "failures_per_pass": dict(_FAILURES_PER_PASS),
         "last_failure_per_pass": dict(_LAST_FAILURE_PER_PASS),
     }

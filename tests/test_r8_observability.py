@@ -705,6 +705,163 @@ def test_resubmit_while_prior_job_in_flight_is_refused_not_duplicated(monkeypatc
     afm_writer.reset_pass_counters()
 
 
+def _compile_consolidation_with_write_status(monkeypatch, tmp_path, write_result):
+    """Drive handle_daemon_compile wet through a consolidation run that
+    produces review candidates + drafts, with submit_drafts stubbed to return
+    ``write_result``. Returns (captured_response, applied_spy)."""
+    import minni.afm_passes.consolidation as consolidation_mod
+    import minni.afm_writer as afm_writer
+    import minni.db as db_mod
+    import minni.minnid_runtime.afm as afm_mod
+    from minni.config import SovereignConfig
+    from minni.principal import EffectivePrincipal
+
+    def _run(db, config, **kwargs):
+        return {
+            "drafts": [{"page_id": "d1", "title": "t", "body": "b"}],
+            "review_candidate_ids": [42],
+        }
+
+    monkeypatch.setattr(consolidation_mod, "run", _run)
+    monkeypatch.setattr(afm_writer, "submit_drafts", lambda job, **kw: dict(write_result))
+
+    applied = {"called": False}
+    monkeypatch.setattr(
+        afm_mod,
+        "apply_consolidation_result",
+        lambda result, context: applied.__setitem__("called", True),
+    )
+
+    captured = {}
+
+    def _make_response(payload, request_id):
+        if isinstance(payload, dict):
+            captured.update(payload)
+        return {"result": payload}
+
+    cfg = SovereignConfig(
+        db_path=str(tmp_path / "afm.db"),
+        vault_path=str(tmp_path / "vault"),
+        graph_export_dir=str(tmp_path / "graphs"),
+        faiss_index_path=str(tmp_path / "faiss.index"),
+        writeback_enabled=False,
+        afm_loop_schedule={"enabled": True, "idle_seconds": 300, "passes": {}},
+    )
+    context = afm_mod.AFMContext(
+        make_error=lambda code, message, request_id: {"error": {"code": code}},
+        make_response=_make_response,
+        guard_vault_root=lambda *a, **k: None,
+        lazy_writeback=lambda: None,
+        trace_ring=lambda: _NullRing(),
+        record_latency=lambda name, elapsed: None,
+        maybe_archive_inbox_source=lambda db, cid: None,
+        sovereign_db=lambda config, *a, **k: _fresh_db(db_mod, cfg),
+        default_config=cfg,
+    )
+    params = {
+        "pass_name": "consolidation",
+        "dry_run": False,
+        "vault_path": str(tmp_path / "vault"),
+        "_principal": EffectivePrincipal(
+            agent_id="operator",
+            workspace_id="default",
+            transport="internal",
+            capabilities=["govern"],
+            allowed_vault_roots=[],
+        ),
+    }
+    afm_mod.handle_daemon_compile(params, request_id=1, context=context)
+    return captured, applied
+
+
+def test_refused_drafts_do_not_apply_lifecycle_mutations(monkeypatch, tmp_path):
+    """Round 8: write_in_flight returns WITHOUT raising and the drafts were
+    never enqueued — but apply_consolidation_result ran unconditionally, so
+    candidates were promoted/marked-reviewed while the review drafts that
+    explain those mutations will never exist. The raising failures already
+    skip apply via the except path; the non-raising refusal must too."""
+    captured, applied = _compile_consolidation_with_write_status(
+        monkeypatch,
+        tmp_path,
+        {"status": "write_in_flight", "drafts_written": [], "drafts_deferred": 1},
+    )
+    assert captured["status"] == "write_in_flight", "precondition: the refusal surfaced"
+    assert applied["called"] is False, (
+        "lifecycle mutations must not be applied for a batch whose drafts "
+        "were refused"
+    )
+
+
+def test_accepted_writes_still_apply_lifecycle_mutations(monkeypatch, tmp_path):
+    """The counterparts: a successful write applies, and write_timeout — that
+    batch IS queued and lands when the writer drains — stays eligible."""
+    _captured, applied = _compile_consolidation_with_write_status(
+        monkeypatch,
+        tmp_path,
+        {"drafts_written": [{"page_id": "d1"}], "inbox_path": "inbox/x.json"},
+    )
+    assert applied["called"] is True
+
+    _captured, applied = _compile_consolidation_with_write_status(
+        monkeypatch,
+        tmp_path,
+        {"status": "write_timeout", "drafts_written": [], "drafts_in_flight": 1},
+    )
+    assert applied["called"] is True, (
+        "a write_timeout batch is queued and will land; its mutations apply"
+    )
+
+
+def test_a_late_write_failure_is_counted_even_with_no_waiter(monkeypatch):
+    """Round 8: a batch failing AFTER its submitter timed out had no observer
+    at all — no DraftWriteError (waiter gone), no pass failure, no counter.
+    The worker itself now counts every batch failure."""
+    import threading
+
+    from minni import afm_writer
+
+    afm_writer.reset_pass_counters()
+
+    def _explode(job):
+        raise RuntimeError("vault vanished mid-write")
+
+    monkeypatch.setattr(afm_writer, "_write_batch", _explode)
+    done = threading.Event()
+    out: dict = {}
+    afm_writer._process_job({"pass_name": "p", "drafts": [{"title": "t"}]}, done, out)
+
+    assert done.is_set(), "the Event must settle so in-flight state clears"
+    assert "error" in out
+    assert afm_writer._WRITE_FAILURES == 1
+    assert afm_writer._LAST_WRITE_FAILURE_AT is not None
+    afm_writer.reset_pass_counters()
+
+
+def test_recent_write_failures_reach_the_status_verdict():
+    """The late failure must reach the verdict like timeouts do — and age out
+    the same way instead of latching."""
+    from minni.afm_writer import WRITE_FAILURES_RECENT_SECONDS, derive_loop_status
+
+    now = 1_000_000.0
+    schedule = {"passes": {"consolidation": {"interval_seconds": 3600}}}
+    recent = {
+        "last_attempt_per_pass": {"consolidation": now - 60},
+        "write_failures": 2,
+        "last_write_failure_at": now - 60,
+    }
+    status, reasons = derive_loop_status(recent, schedule=schedule, now=now)
+    assert status == "backlogged"
+    assert any("FAILED in the writer" in reason for reason in reasons)
+
+    old = {
+        "last_attempt_per_pass": {"consolidation": now - 60},
+        "write_failures": 2,
+        "last_write_failure_at": now - WRITE_FAILURES_RECENT_SECONDS - 60,
+    }
+    status, reasons = derive_loop_status(old, schedule=schedule, now=now)
+    assert status == "ok"
+
+
 def test_recent_write_timeouts_reach_the_status_verdict():
     """The chronic-timeout writer must not read `ok`; an old timeout must not
     latch `backlogged` (same recency discipline as drops)."""
@@ -785,6 +942,8 @@ def test_writer_status_exposes_the_fields_the_verdict_reads():
         "last_drop_at",
         "write_timeouts",
         "last_write_timeout_at",
+        "write_failures",
+        "last_write_failure_at",
         "jobs_in_flight",
         "in_flight_passes",
         "failures_per_pass",

@@ -495,6 +495,7 @@ def handle_daemon_compile(params: dict, request_id: Any, context: AFMContext) ->
             from minni.afm_writer import record_pass_attempt
 
             record_pass_attempt(pass_name)
+        write_refused = False
         if not dry_run and result.get("drafts"):
             from minni.afm_writer import submit_drafts
 
@@ -506,6 +507,16 @@ def handle_daemon_compile(params: dict, request_id: Any, context: AFMContext) ->
                 "writeback": context.writeback_ref(),
             })
             result.update(write_result)
+            # Review round 8 on PR #260: write_in_flight means THIS batch's
+            # drafts were REFUSED — never enqueued, never going to land. The
+            # raising failures (DraftWriteError/DraftQueueFull) already skip
+            # the lifecycle apply below because they jump to the except path;
+            # the non-raising refusal must skip it too, or candidates get
+            # promoted/dedup'd/marked-reviewed while the review drafts that
+            # explain those mutations do not exist anywhere. write_timeout
+            # stays eligible: that batch IS queued and lands when the writer
+            # drains.
+            write_refused = write_result.get("status") == "write_in_flight"
         else:
             result.setdefault("drafts_written", [])
 
@@ -514,7 +525,14 @@ def handle_daemon_compile(params: dict, request_id: Any, context: AFMContext) ->
             or result.get("dedup_candidate_ids")
             or result.get("review_candidate_ids")
         ):
-            apply_consolidation_result(result, context)
+            if write_refused:
+                context.logger.warning(
+                    "daemon.compile: consolidation lifecycle apply SKIPPED — "
+                    "this batch's drafts were refused (write_in_flight); "
+                    "candidates stay proposed and re-run after the writer drains"
+                )
+            else:
+                apply_consolidation_result(result, context)
 
         try:
             # R8: bind the compile trace to the calling principal (present in

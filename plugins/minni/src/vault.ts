@@ -987,7 +987,15 @@ async function withAuditLock<T>(vaultPath: string, fn: () => Promise<T>): Promis
  * frequency ceiling is set by the harness, not by the agent's tool loop.
  */
 function isExemptFromAuditThrottle(entry: AuditEntry): boolean {
-  return entry.tool.endsWith("_stop");
+  // Round 8 (PR #260): bridge_failure joins the exemption. Round 7 made the
+  // diagnostic child's exit code the delivery signal, but a throttled
+  // recordAudit returns success WITHOUT appending — so a retry within the 5s
+  // window exited 0 and the bridge cleared its coalesced eviction counts as
+  // "delivered" while nothing reached log.md. Exempting cannot flood: the
+  // diagnostic spawns are budget-capped (DIAGNOSTIC_MAX_IN_FLIGHT, kill
+  // timer) and session-evict is coalesced to one spawn per interval, so the
+  // frequency ceiling is set upstream of the audit call.
+  return entry.tool.endsWith("_stop") || entry.tool.endsWith("_bridge_failure");
 }
 
 function shouldThrottleAudit(entry: AuditEntry): boolean {

@@ -377,7 +377,13 @@ const KILOCODE_HOOK = path.join(PLUGIN_ROOT, "dist", "kilocode-hook.js");
 
 async function runBridgeFailureChild(vaultPath, extraEnv = {}) {
   const child = execFileAsync(process.execPath, [KILOCODE_HOOK, "BridgeFailure"], {
-    env: { ...process.env, MINNI_KILOCODE_VAULT_PATH: vaultPath, ...extraEnv },
+    env: {
+      ...process.env,
+      MINNI_KILOCODE_VAULT_PATH: vaultPath,
+      // Keep the audit throttle timestamps inside the test sandbox.
+      MINNI_HOME: path.join(vaultPath, ".minni-home"),
+      ...extraEnv,
+    },
   });
   child.child.stdin.end(
     JSON.stringify({
@@ -424,6 +430,25 @@ test("P6 round 7: hooks disabled does not disable the bridge-failure surface", a
       log,
       /bridge_failure/,
       "the diagnostic must land even with memory hooks disabled",
+    );
+  });
+});
+
+test("P6 round 8: a throttled non-write cannot report delivered", async () => {
+  // Round 7 made the exit code the delivery signal; recordAudit's 5s throttle
+  // returned success WITHOUT appending, so an immediate retry — exactly what
+  // the eviction coalescer does after an undelivered wave — exited 0 while
+  // nothing reached log.md, and the parent cleared its counts as delivered.
+  // bridge_failure audits are now throttle-exempt like *_stop: every
+  // diagnostic that spawned writes a row.
+  await withVault(async (root) => {
+    assert.equal(await runBridgeFailureChild(root), 0);
+    assert.equal(await runBridgeFailureChild(root), 0);
+    const log = await readFile(path.join(root, "log.md"), "utf8");
+    const rows = log.match(/bridge_failure/g) || [];
+    assert.ok(
+      rows.length >= 2,
+      `both diagnostics exited 0, so both must have written (got ${rows.length} row(s))`,
     );
   });
 });
