@@ -204,17 +204,35 @@ else
 import json, sys
 text = open(sys.argv[1], encoding='utf-8', errors='replace').read()
 doc = None
-# Prefer pure JSON; else last top-level object (defense in depth).
+
+def _is_wire_output(d):
+    # WireOutput.emit shape (pretty or compact). Nested 'gc':{} must not win.
+    return (
+        isinstance(d, dict)
+        and 'schema' in d
+        and 'status' in d
+        and 'results' in d
+    )
+
+# Prefer pure JSON; else walk brace positions for a WireOutput-shaped dict
+# (pretty emit ends with 'gc': {} — last '{' alone is wrong).
 try:
-    doc = json.loads(text)
+    cand = json.loads(text)
+    if _is_wire_output(cand):
+        doc = cand
 except Exception:
-    idx = text.rfind('{')
+    pass
+if doc is None:
+    idx = text.find('{')
     while idx >= 0:
         try:
-            doc = json.loads(text[idx:])
-            break
+            cand = json.loads(text[idx:])
+            if _is_wire_output(cand):
+                doc = cand
+                break
         except Exception:
-            idx = text.rfind('{', 0, idx)
+            pass
+        idx = text.find('{', idx + 1)
 if not isinstance(doc, dict):
     print('unparseable')
 else:

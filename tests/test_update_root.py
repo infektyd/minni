@@ -332,37 +332,59 @@ def test_wire_all_skipped_is_not_redeploy_failure():
 
 
 def test_wire_status_parser_tolerates_npm_noise(tmp_path):
-    """Last-JSON decode must recover status=skipped after npm banner on stdout."""
+    """Recover status=skipped from pretty WireOutput after npm banner.
+
+    Production emit is indent=2 and ends with "gc": {} — last-brace recovery
+    must not parse the nested gc object as the top-level document.
+    """
     import json
+    import re
     import subprocess
     import sys
 
-    polluted = tmp_path / "wire.out"
+    # Keep the recovery algorithm in lock-step with scripts/update_root.sh.
+    script = SCRIPT.read_text(encoding="utf-8")
+    m = re.search(
+        r'_WIRE_STATUS="\$\("\$VENV_PY" -c "\n(.*?)\n" "\$_WIRE_JSON"',
+        script,
+        re.S,
+    )
+    assert m, "wire status recovery python not found in update_root.sh"
+    recovery = m.group(1)
+    # Unescape shell-quoted string into a python snippet
+    recovery_py = recovery.replace('\\"', '"').replace("\\n", "\n")
+    # The embedded snippet prints status to stdout; wrap as module that takes argv.
+    # It already uses sys.argv[1] for the path.
+
     banner = (
         "> minni-multi-plugin@0.4.1 build:server\n"
         "build manifest: 0.4.1 abcd -> plugins/minni/dist/build-manifest.json\n"
     )
-    body = json.dumps({"schema": 1, "status": "skipped", "results": []})
-    polluted.write_text(banner + body + "\n", encoding="utf-8")
-    code = (
-        "import json, sys\n"
-        "text = open(sys.argv[1], encoding='utf-8', errors='replace').read()\n"
-        "doc = None\n"
-        "try:\n"
-        "    doc = json.loads(text)\n"
-        "except Exception:\n"
-        "    idx = text.rfind('{')\n"
-        "    while idx >= 0:\n"
-        "        try:\n"
-        "            doc = json.loads(text[idx:])\n"
-        "            break\n"
-        "        except Exception:\n"
-        "            idx = text.rfind('{', 0, idx)\n"
-        "assert isinstance(doc, dict) and doc.get('status') == 'skipped'\n"
+    # Compact (legacy pin)
+    compact = tmp_path / "compact.out"
+    compact.write_text(
+        banner + json.dumps({"schema": 1, "status": "skipped", "results": []}) + "\n",
+        encoding="utf-8",
     )
-    proc = subprocess.run(
-        [sys.executable, "-c", code, str(polluted)],
-        capture_output=True,
-        text=True,
-    )
-    assert proc.returncode == 0, proc.stderr
+    # Pretty real WireOutput shape with nested gc brace
+    pretty_doc = {
+        "schema": 1,
+        "status": "skipped",
+        "payload_version": "0.4.1+git.deadbeef",
+        "install_root": "/tmp/plugin/0.4.1+git.deadbeef",
+        "results": [
+            {"platform": "gemini", "status": "skipped", "reason": "provisional"},
+        ],
+        "gc": {},
+    }
+    pretty = tmp_path / "pretty.out"
+    pretty.write_text(banner + json.dumps(pretty_doc, indent=2) + "\n", encoding="utf-8")
+
+    for path, label in ((compact, "compact"), (pretty, "pretty")):
+        proc = subprocess.run(
+            [sys.executable, "-c", recovery_py, str(path)],
+            capture_output=True,
+            text=True,
+        )
+        assert proc.returncode == 0, f"{label}: {proc.stderr}"
+        assert proc.stdout.strip() == "skipped", f"{label}: {proc.stdout!r} stderr={proc.stderr!r}"

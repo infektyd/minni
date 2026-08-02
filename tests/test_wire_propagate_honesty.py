@@ -557,3 +557,12 @@ def test_wire_unparseable_host_toml_refuses_before_mcp_write(tmp_path, monkeypat
         )
     assert mcp_target.read_text(encoding="utf-8") == original
 
+
+def test_propagate_load_json_empty_is_empty_dict(tmp_path):
+    """D10 twin parity: empty .mcp.json is {}, not a hard parse error."""
+    path = tmp_path / ".mcp.json"
+    path.write_text("", encoding="utf-8")
+    assert propagate.load_json(path) == {}
+    path.write_text("   \n", encoding="utf-8")
+    assert propagate.load_json(path) == {}
+

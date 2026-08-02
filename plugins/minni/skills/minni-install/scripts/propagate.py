@@ -480,7 +480,11 @@ def _mirror_codex_hook_env(env: dict, agent: str) -> None:
 def load_json(path: Path) -> dict:
     if not path.exists():
         return {}
-    return json.loads(path.read_text(encoding="utf-8"))
+    text = path.read_text(encoding="utf-8")
+    # Mirror wire writers: empty/whitespace is {} not a parse error (D10 twin).
+    if not text.strip():
+        return {}
+    return json.loads(text)
 
 
 def replace_toml_sections(path: Path, sections: dict[str, str], *, preserve_surface_env: bool = False) -> None:
