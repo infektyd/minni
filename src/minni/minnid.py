@@ -1265,11 +1265,23 @@ def _backfill_interval() -> int:
 
 
 def _backfill_sweep_once() -> dict:
-    """Blocking bounded backfill pass over the shared index. Runs off-loop."""
-    from minni.backfill import run_backfill
+    """Blocking bounded backfill pass over every index. Runs off-loop.
 
-    db = SovereignDB.shared(DEFAULT_CONFIG)
-    return run_backfill(db, DEFAULT_CONFIG)
+    grok-review round 1 (finding 1): committing chunk_embeddings rows is not
+    enough to make a document searchable on a WARM daemon —
+    retrieval._ensure_faiss_loaded early-returns while faiss_index.count > 0, so
+    the live semantic index never sees rows written underneath it and coverage
+    would climb while the documents stayed invisible to the semantic leg until a
+    restart. Push each backfilled document into the live index through the same
+    path store-time indexing uses.
+    """
+    from minni.backfill import run_backfill_all_indexes
+
+    def _refresh(chunk_ids, vectors):
+        engine = _lazy_retrieval()
+        engine._refresh_live_faiss(chunk_ids, vectors)
+
+    return run_backfill_all_indexes(DEFAULT_CONFIG, on_vectors=_refresh)
 
 
 async def _backfill_runner():
@@ -1292,13 +1304,22 @@ async def _backfill_runner():
     while True:
         try:
             stats = await asyncio.to_thread(_backfill_sweep_once)
-            docs = (stats or {}).get("documents") or {}
-            learnings = (stats or {}).get("learnings") or {}
-            if docs.get("documents") or learnings.get("embedded"):
-                logger.info(
-                    "Backfill: %s document(s), %s learning(s) embedded",
-                    docs.get("documents", 0), learnings.get("embedded", 0),
-                )
+            for index_name, result in (stats or {}).items():
+                if not isinstance(result, dict):
+                    continue
+                if result.get("error"):
+                    logger.warning(
+                        "Backfill: %s failed: %s", index_name, result["error"]
+                    )
+                    continue
+                docs = result.get("documents") or {}
+                learnings = result.get("learnings") or {}
+                if docs.get("documents") or learnings.get("embedded"):
+                    logger.info(
+                        "Backfill: %s — %s document(s), %s learning(s) embedded",
+                        index_name, docs.get("documents", 0),
+                        learnings.get("embedded", 0),
+                    )
         except asyncio.CancelledError:
             raise
         except Exception:

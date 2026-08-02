@@ -399,8 +399,10 @@ class TestEmbeddingBackfillAndCoverage:
         self, tmp_path, monkeypatch
     ):
         """Never fix a signal by suppressing it: an unbackfillable document is
-        counted, not quietly treated as done."""
-        from minni.backfill import backfill_document_vectors
+        counted, not quietly treated as done. After grok-review finding 2 it is
+        excluded from the BATCH (so it cannot wedge the drain) but still
+        counted, and still reported missing by embedding_coverage."""
+        from minni.backfill import backfill_document_vectors, embedding_coverage
 
         self._stub_encoder(monkeypatch)
         db_obj, cfg = _make_db(tmp_path)
@@ -412,7 +414,10 @@ class TestEmbeddingBackfillAndCoverage:
 
         stats = backfill_document_vectors(db_obj, cfg)
         assert stats["documents"] == 0
-        assert stats["skipped_no_content"] == 1
+        assert stats["unrecoverable"] == 1
+        assert embedding_coverage(db_obj)["documents_missing_vectors"] == 1, (
+            "excluding it from the batch must not hide it from coverage"
+        )
 
     def test_backfill_without_an_encoder_reports_rather_than_claiming_success(
         self, tmp_path, monkeypatch
@@ -425,6 +430,278 @@ class TestEmbeddingBackfillAndCoverage:
         stats = backfill_learning_embeddings(db_obj, cfg)
         assert stats["skipped_no_model"] == 1
         assert stats["embedded"] == 0
+
+    def test_backfilled_chunks_reach_a_warm_live_index(self, tmp_path, monkeypatch):
+        """grok-review finding 1: committing chunk_embeddings rows is not enough.
+        _ensure_faiss_loaded early-returns while count > 0, so a WARM daemon
+        never sees rows written underneath it — coverage would climb while the
+        documents stayed invisible to the semantic leg until a restart."""
+        from minni.backfill import backfill_document_vectors
+
+        self._stub_encoder(monkeypatch)
+        db_obj, cfg = _make_db(tmp_path)
+        body = "# Title\n\n" + ("the deployment rollback procedure. " * 40)
+        with db_obj.cursor() as c:
+            c.execute(
+                "INSERT INTO documents (path, agent, sigil) "
+                "VALUES ('a.md', 'codex', 'vault')"
+            )
+            doc_id = c.lastrowid
+            c.execute(
+                "INSERT INTO vault_fts (doc_id, path, content, agent, sigil) "
+                "VALUES (?, 'a.md', ?, 'codex', 'vault')",
+                (doc_id, body),
+            )
+
+        pushed: list = []
+        backfill_document_vectors(
+            db_obj, cfg,
+            on_vectors=lambda ids, vecs: pushed.append((ids, vecs)),
+        )
+        assert pushed, "the live index must be offered the backfilled vectors"
+        ids, vecs = pushed[0]
+        assert len(ids) == len(vecs) and len(ids) >= 1
+
+        # The ids handed out must be the real chunk_ids a search resolves.
+        with db_obj.cursor() as c:
+            stored = [
+                r["chunk_id"] for r in c.execute(
+                    "SELECT chunk_id FROM chunk_embeddings WHERE doc_id = ? "
+                    "ORDER BY chunk_index", (doc_id,)
+                ).fetchall()
+            ]
+        assert ids == stored, (
+            "handing the live index anything but the stored chunk_ids would "
+            "corrupt the id mapping"
+        )
+
+    def test_warm_faiss_index_gains_backfilled_chunks_without_restart(
+        self, tmp_path, monkeypatch
+    ):
+        """The end-to-end form of grok-review finding 1: a REAL warm FAISSIndex
+        behind a real RetrievalEngine must grow by the backfilled chunks, with
+        no process restart and no cold reload."""
+        import numpy as np
+
+        from minni.faiss_index import FAISSIndex
+        from minni.backfill import backfill_document_vectors
+        from minni.retrieval import RetrievalEngine
+
+        self._stub_encoder(monkeypatch)
+        db_obj, cfg = _make_db(tmp_path)
+
+        # A warm index: count > 0 is exactly what makes _ensure_faiss_loaded
+        # early-return and never notice new DB rows.
+        faiss_index = FAISSIndex(cfg)
+        seed = np.zeros((1, cfg.embedding_dim), dtype="float32")
+        seed[0][0] = 1.0
+        faiss_index.build_from_vectors([999], seed)
+        engine = RetrievalEngine(db_obj, cfg, faiss_index=faiss_index)
+        assert faiss_index.count == 1
+
+        body = "# Title\n\n" + ("the deployment rollback procedure. " * 40)
+        with db_obj.cursor() as c:
+            c.execute(
+                "INSERT INTO documents (path, agent, sigil) "
+                "VALUES ('a.md', 'codex', 'vault')"
+            )
+            doc_id = c.lastrowid
+            c.execute(
+                "INSERT INTO vault_fts (doc_id, path, content, agent, sigil) "
+                "VALUES (?, 'a.md', ?, 'codex', 'vault')",
+                (doc_id, body),
+            )
+
+        stats = backfill_document_vectors(
+            db_obj, cfg, on_vectors=engine._refresh_live_faiss
+        )
+        assert stats["chunks"] >= 1
+        assert faiss_index.count == 1 + stats["chunks"], (
+            "the warm live index must gain the backfilled chunks; on the first "
+            "cut coverage climbed while the documents stayed invisible to the "
+            "semantic leg until a restart"
+        )
+
+    def test_live_refresh_failure_does_not_lose_the_backfill(
+        self, tmp_path, monkeypatch
+    ):
+        """The rows are durably committed; only immediacy is at stake."""
+        from minni.backfill import backfill_document_vectors
+
+        self._stub_encoder(monkeypatch)
+        db_obj, cfg = _make_db(tmp_path)
+        body = "# Title\n\n" + ("the deployment rollback procedure. " * 40)
+        with db_obj.cursor() as c:
+            c.execute(
+                "INSERT INTO documents (path, agent, sigil) "
+                "VALUES ('a.md', 'codex', 'vault')"
+            )
+            doc_id = c.lastrowid
+            c.execute(
+                "INSERT INTO vault_fts (doc_id, path, content, agent, sigil) "
+                "VALUES (?, 'a.md', ?, 'codex', 'vault')",
+                (doc_id, body),
+            )
+
+        def _explode(_ids, _vecs):
+            raise RuntimeError("live index unavailable")
+
+        stats = backfill_document_vectors(db_obj, cfg, on_vectors=_explode)
+        assert stats["documents"] == 1
+        with db_obj.cursor() as c:
+            n = c.execute(
+                "SELECT COUNT(*) AS n FROM chunk_embeddings WHERE doc_id = ?",
+                (doc_id,),
+            ).fetchone()["n"]
+        assert n >= 1, "a failed live refresh must not cost the durable rows"
+
+    def test_unrecoverable_documents_cannot_wedge_the_drain(
+        self, tmp_path, monkeypatch
+    ):
+        """grok-review finding 2: taking the LIMIT head unfiltered let >=limit
+        contentless documents occupy every batch forever, so recoverable
+        documents behind them never entered one — a bounded drain silently
+        becomes a stuck queue."""
+        from minni.backfill import backfill_document_vectors
+
+        self._stub_encoder(monkeypatch)
+        db_obj, cfg = _make_db(tmp_path)
+        body = "# Title\n\n" + ("the deployment rollback procedure. " * 40)
+        with db_obj.cursor() as c:
+            # Three contentless documents FIRST (lower doc_ids), then a good one.
+            for i in range(3):
+                c.execute(
+                    "INSERT INTO documents (path, agent, sigil) VALUES (?, 'c', 'v')",
+                    (f"empty{i}.md",),
+                )
+            c.execute(
+                "INSERT INTO documents (path, agent, sigil) "
+                "VALUES ('good.md', 'codex', 'vault')"
+            )
+            good_id = c.lastrowid
+            c.execute(
+                "INSERT INTO vault_fts (doc_id, path, content, agent, sigil) "
+                "VALUES (?, 'good.md', ?, 'codex', 'vault')",
+                (good_id, body),
+            )
+
+        # A batch smaller than the contentless backlog: the old query would
+        # have returned only the three empties and made zero progress forever.
+        stats = backfill_document_vectors(db_obj, cfg, limit=2)
+        assert stats["documents"] == 1, (
+            "the recoverable document must be reachable despite a backlog of "
+            "unrecoverable rows ahead of it"
+        )
+        assert stats["unrecoverable"] == 3, (
+            "unrecoverable rows must stay COUNTED, not silently dropped"
+        )
+
+    def test_unrecoverable_learnings_cannot_wedge_the_drain(
+        self, tmp_path, monkeypatch
+    ):
+        from minni.backfill import backfill_learning_embeddings
+
+        self._stub_encoder(monkeypatch)
+        db_obj, cfg = _make_db(tmp_path)
+        now = time.time()
+        with db_obj.cursor() as c:
+            for i in range(3):
+                c.execute(
+                    """INSERT INTO learnings (agent_id, category, content,
+                                              confidence, created_at, embedding)
+                       VALUES ('codex', 'fix', '', 1.0, ?, NULL)""",
+                    (now,),
+                )
+            c.execute(
+                """INSERT INTO learnings (agent_id, category, content,
+                                          confidence, created_at, embedding)
+                   VALUES ('codex', 'fix', 'websocket backoff is 500ms', 1.0, ?, NULL)""",
+                (now,),
+            )
+
+        stats = backfill_learning_embeddings(db_obj, cfg, limit=2)
+        assert stats["embedded"] == 1
+        assert stats["unrecoverable"] == 3
+
+    def test_document_encode_happens_outside_the_write_transaction(self):
+        """grok-review finding 3: encoding inside db.transaction() held
+        BEGIN IMMEDIATE across every model.encode call, blocking live writers
+        for the encode duration rather than the INSERT duration."""
+        import inspect
+
+        from minni.backfill import backfill_document_vectors
+
+        src = inspect.getsource(backfill_document_vectors)
+        encode_pos = src.index("model.encode")
+        txn_pos = src.index("with db.transaction()")
+        assert encode_pos < txn_pos, (
+            "all chunk vectors must be encoded before the write transaction opens"
+        )
+
+    def test_backfill_covers_every_index_like_decay_does(self, tmp_path, monkeypatch):
+        """grok-review finding 5: draining only the shared index while decay
+        covered every index would leave any vault-side gap undrained forever."""
+        import minni.backfill as backfill_mod
+        import minni.index_all as index_all
+        import minni.vault_index as vault_index
+
+        self._stub_encoder(monkeypatch)
+        db_obj, cfg = _make_db(tmp_path)
+        db_obj.close()
+
+        broken = tmp_path / "broken-vault"
+        broken.mkdir()
+        monkeypatch.setattr(
+            index_all, "discover_agent_vaults", lambda home=None: [broken]
+        )
+
+        def _explode(*_a, **_kw):
+            raise RuntimeError("vault index unreadable")
+
+        monkeypatch.setattr(vault_index, "build_vault_index_config", _explode)
+
+        results = backfill_mod.run_backfill_all_indexes(cfg)
+        assert "error" not in results["shared"], (
+            "a failing vault must not cost the shared index its pass"
+        )
+        assert "error" in results["broken-vault"]
+
+    def test_migration_repairs_null_layer_identity_envelopes(self, tmp_path):
+        """grok-review finding 4: seed_identity skips already-seeded agents, so
+        the writer fix never revisits an existing envelope. An envelope seeded
+        after migration 004 kept layer=NULL and read back as KNOWLEDGE — the one
+        layer it must never be."""
+        from minni.migrations import run_migrations
+
+        db_obj, _cfg = _make_db(tmp_path)
+        with db_obj.cursor() as c:
+            c.execute(
+                """INSERT INTO documents (path, agent, sigil, whole_document, layer)
+                   VALUES ('SOUL.md', 'identity:codex', 'C', 1, NULL)"""
+            )
+            envelope = c.lastrowid
+            # A non-whole-document row with the same agent prefix must NOT be
+            # promoted — whole_document is half the trusted rule.
+            c.execute(
+                """INSERT INTO documents (path, agent, sigil, whole_document, layer)
+                   VALUES ('chunked.md', 'identity:codex', 'C', 0, 'knowledge')"""
+            )
+            not_whole = c.lastrowid
+
+        conn = db_obj._get_conn()
+        conn.execute("DELETE FROM schema_migrations WHERE version = 17")
+        conn.commit()
+        run_migrations(conn)
+        conn.commit()
+
+        with db_obj.cursor() as c:
+            rows = {
+                r["doc_id"]: r["layer"]
+                for r in c.execute("SELECT doc_id, layer FROM documents").fetchall()
+            }
+        assert rows[envelope] == "identity"
+        assert rows[not_whole] == "knowledge"
+        db_obj.close()
 
     def test_daemon_schedules_the_backfill(self):
         import inspect

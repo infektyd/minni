@@ -23,14 +23,27 @@
 --      already says 'artifact' is correct, and a row saying anything else was
 --      set by a path this migration knows nothing about.
 --
---   2. The identity layer is never assigned here. _infer_layer grants identity
---      only for an 'identity:'-prefixed agent, which is assignable solely
---      through the trusted seed path — inferring it from stored frontmatter is
---      exactly the self-assignment indexer.py:95-104 strips as untrusted.
+--   2. The identity repair below keys on whole_document + the 'identity:' agent
+--      prefix as STORED, never on page frontmatter. That distinction is the
+--      whole point: inferring identity from frontmatter is the self-assignment
+--      indexer.py:95-104 strips as untrusted, but a stored whole_document row
+--      with an 'identity:' agent can only have come from the trusted seed path.
 --
 --   3. chunk_embeddings rows follow their parent document rather than being
 --      re-derived, so a chunk can never end up on a different layer than the
 --      document it belongs to.
+--
+-- grok-review round 1 (finding 4): the first cut repaired artifact rows only and
+-- explicitly declined to touch identity. That was over-cautious and left a real
+-- hole. seed_identity skips agents that are already seeded, so its writer fix
+-- never revisits an existing envelope — and any envelope seeded AFTER migration
+-- 004's one-shot backfill kept layer=NULL, which COALESCE(layer,'knowledge')
+-- reads back as knowledge. A layers=['identity'] recall still missed them. The
+-- rule below is not new: it is verbatim the trusted mapping migration 004
+-- already applied (`WHEN whole_document = 1 AND agent LIKE 'identity:%' THEN
+-- 'identity'`), re-run over the rows written since. The PR's own argument —
+-- knowledge is the one layer an identity envelope must never be — applies to
+-- stored rows exactly as it applies to new seeds.
 
 UPDATE documents
    SET layer = 'artifact'
@@ -41,3 +54,18 @@ UPDATE chunk_embeddings
    SET layer = 'artifact'
  WHERE COALESCE(layer, 'knowledge') = 'knowledge'
    AND doc_id IN (SELECT doc_id FROM documents WHERE layer = 'artifact');
+
+-- Identity repair (grok-review finding 4). Ordered AFTER the artifact pass so
+-- an identity envelope that also carries page_type='artifact' ends on the
+-- identity layer: identity is the stronger claim, and it is the one
+-- _infer_layer itself checks first.
+UPDATE documents
+   SET layer = 'identity'
+ WHERE whole_document = 1
+   AND agent LIKE 'identity:%'
+   AND COALESCE(layer, 'knowledge') IN ('knowledge', 'artifact');
+
+UPDATE chunk_embeddings
+   SET layer = 'identity'
+ WHERE COALESCE(layer, 'knowledge') != 'identity'
+   AND doc_id IN (SELECT doc_id FROM documents WHERE layer = 'identity');
