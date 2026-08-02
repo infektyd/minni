@@ -15,8 +15,9 @@
 #   4. Redeploy with the D7 fleet partition: `minni wire all --from-repo`
 #      (codex/claude-code/kilocode/grok), then `propagate update-plugin` for
 #      antigravity + cursor only, plus grok hooks/rules against the active
-#      wire install root — never `propagate --platform all` (that rewrites
-#      wire-managed MCP paths back onto legacy cache trees).
+#      wire install root. `propagate --platform all` expands only those two
+#      (wire platforms are named skips); avoid explicit codex|kilocode|grok
+#      propagate after wire (those still rewrite MCP onto legacy trees).
 #   5. Restart the minni daemon (launchd kickstart when the agent is loaded).
 #   6. Verify: check_versions.py + check_deployments.py --strict
 #      (also evaluated read-only under --dry-run).
@@ -66,6 +67,10 @@ refuse() { printf 'update-root: REFUSING: %s\n' "$*" >&2; exit 1; }
 # Stale recovery: if the lock holds a PID that is no longer alive (SIGKILL /
 # OOM / sleep-kill skipped the EXIT trap), reclaim so unattended sync cannot
 # brick itself forever.
+# Reclaim is race-safe: never `rm -rf` a live peer's lock. Move the stale
+# dir aside (atomic rename), verify the moved pid was still dead/empty, then
+# claim and re-read `$LOCKDIR/pid` must equal `$$`. EXIT releases only if we
+# still own the lock (so concurrent reclaimers cannot wipe a winner).
 LOCKDIR="${MINNI_SYNC_LOCKDIR:-$HOME/.minni/run/sync-root.lockdir}"
 mkdir -p "$(dirname "$LOCKDIR")"
 _claim_lock() {
@@ -74,6 +79,15 @@ _claim_lock() {
     return 0
   fi
   return 1
+}
+_own_lock() {
+  [ -f "$LOCKDIR/pid" ] || return 1
+  [ "$(cat "$LOCKDIR/pid" 2>/dev/null || true)" = "$$" ]
+}
+_release_lock() {
+  if _own_lock; then
+    rm -rf "$LOCKDIR" 2>/dev/null || true
+  fi
 }
 if ! _claim_lock; then
   old_pid=""
@@ -84,13 +98,31 @@ if ! _claim_lock; then
     refuse "another sync-root is already running (pid $old_pid, lock $LOCKDIR)"
   fi
   echo "update-root: reclaiming stale sync lock${old_pid:+ (dead pid $old_pid)} at $LOCKDIR" >&2
-  rm -rf "$LOCKDIR"
+  # Atomic rename beats rm-then-mkdir: only one reclaimer moves the dir;
+  # the other either claims the free name or sees the winner's live pid.
+  stale_bak="${LOCKDIR}.reclaim.$$"
+  if [ -d "$LOCKDIR" ]; then
+    if mv "$LOCKDIR" "$stale_bak" 2>/dev/null; then
+      moved_pid="$(cat "$stale_bak/pid" 2>/dev/null || true)"
+      # If we accidentally moved a live holder's lock (TOCTOU after the
+      # kill -0 check), put it back and refuse.
+      if [ -n "$moved_pid" ] && [ "$moved_pid" != "$$" ] \
+          && kill -0 "$moved_pid" 2>/dev/null; then
+        mv "$stale_bak" "$LOCKDIR" 2>/dev/null || true
+        refuse "another sync-root is already running (pid $moved_pid, lock $LOCKDIR)"
+      fi
+      rm -rf "$stale_bak" 2>/dev/null || true
+    fi
+  fi
   if ! _claim_lock; then
     refuse "another sync-root is already running (lock $LOCKDIR)"
   fi
+  if ! _own_lock; then
+    refuse "failed to confirm sync lock ownership at $LOCKDIR"
+  fi
 fi
 # shellcheck disable=SC2064
-trap 'rm -rf "$LOCKDIR" 2>/dev/null || true' EXIT INT TERM
+trap '_release_lock' EXIT INT TERM
 
 VENV_PY="$REPO/.venv/bin/python"
 [ -x "$VENV_PY" ] || VENV_PY="python3"
@@ -140,9 +172,10 @@ act npm --prefix plugins/minni run build
 
 # ── 4. redeploy platform surfaces ────────────────────────────────────────────
 # Fleet partition (D7): wire owns codex/claude-code/kilocode/grok (points MCP
-# at ~/.minni/plugin/<ver>). propagate owns antigravity + cursor. Never run
-# `propagate --platform all` after a partial wire — that rewrites codex/kilo/
-# grok back onto legacy cache trees and undoes wire adoption every sync.
+# at ~/.minni/plugin/<ver>). propagate owns antigravity + cursor. `all` expands
+# only those two (wire platforms are named skips). Do not re-run explicit
+# update-plugin --platform codex|kilocode|grok after wire — those still
+# rewrite MCP onto legacy cache trees and undo wire adoption.
 #
 # wire all partial (missing config root for one host) must NOT abort under
 # set -e: still propagate antigravity/cursor, restart, and verify, then refuse
