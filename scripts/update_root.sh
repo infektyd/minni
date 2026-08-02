@@ -150,10 +150,12 @@ act npm --prefix plugins/minni run build
 say "step 4/6: redeploy platform surfaces (wire all + propagate antigravity/cursor)"
 REDEPLOY_EXIT=0
 if [ "$DRY_RUN" = 1 ]; then
-  act "$VENV_PY" -m minni.minni_cli wire all --from-repo "$REPO"
+  act "$VENV_PY" -m minni.minni_cli wire all --from-repo "$REPO" --prune
 else
-  printf 'running:   %s -m minni.minni_cli wire all --from-repo %s\n' "$VENV_PY" "$REPO"
-  if ! "$VENV_PY" -m minni.minni_cli wire all --from-repo "$REPO"; then
+  # --prune: non-TTY automation otherwise skips GC and leaves historical
+  # +git.* dirs that make check_deployments --strict fail forever.
+  printf 'running:   %s -m minni.minni_cli wire all --from-repo %s --prune\n' "$VENV_PY" "$REPO"
+  if ! "$VENV_PY" -m minni.minni_cli wire all --from-repo "$REPO" --prune; then
     echo "update-root: wire all reported failures — continuing redeploy/verify" >&2
     REDEPLOY_EXIT=1
   fi
@@ -325,6 +327,18 @@ for i in range(45):
                 file=sys.stderr,
             )
             sys.exit(2)
+        if deploy.get("error"):
+            print(
+                f"update-root: daemon deploy block errored after restart: {deploy!r}",
+                file=sys.stderr,
+            )
+            sys.exit(4)
+        if not deploy:
+            print(
+                "update-root: daemon status missing deploy block after restart",
+                file=sys.stderr,
+            )
+            sys.exit(4)
         if stale is None:
             # Soft: socket is up; honesty unmeasurable (manifest race / layout).
             print(

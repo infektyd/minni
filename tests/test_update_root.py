@@ -174,6 +174,7 @@ def test_dry_run_fast_forwards_nothing(cloned, tmp_path):
     # Round-5 High: redeploy plan must wire the fleet, not claude-only +
     # propagate --platform all (which undoes wire-primary MCP paths).
     assert "wire all" in proc.stdout
+    assert "--prune" in proc.stdout
     assert "update-plugin --platform antigravity" in proc.stdout
     assert "update-plugin --platform cursor" in proc.stdout
     assert "update-plugin --platform all" not in proc.stdout

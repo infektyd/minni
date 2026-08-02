@@ -213,6 +213,59 @@ def _home() -> Path:
     return Path(override) if override else Path.home()
 
 
+def _active_wire_plugin_roots(home: Path) -> set[Path]:
+    """Live wire install roots under ~/.minni/plugin (global-newest + current).
+
+    Mirrors scripts/check_versions.py so --strict sync-root verify does not
+    fail on historical ~/.minni/plugin/<old>/ trees left by non-interactive
+    wire without prune.
+    """
+    base = home / ".minni" / "plugin"
+    actives: set[Path] = set()
+    wired = base / "wired.json"
+    try:
+        data = json.loads(wired.read_text(encoding="utf-8"))
+        entries: list[tuple[str, Path]] = []
+        for entry in data.get("wires", []) or []:
+            if not isinstance(entry, dict):
+                continue
+            root_str = entry.get("install_root")
+            if not root_str:
+                continue
+            root = Path(str(root_str))
+            if root.is_dir():
+                entries.append((str(entry.get("wired_at") or ""), root.resolve()))
+        if entries:
+            newest_at, newest_root = max(entries, key=lambda t: t[0])
+            actives.add(newest_root)
+            # Same generation only (same wired_at or same tree).
+            for wired_at, root in entries:
+                if root == newest_root or wired_at == newest_at:
+                    actives.add(root)
+    except (OSError, json.JSONDecodeError, TypeError):
+        pass
+    current = base / "current"
+    try:
+        if current.exists():
+            actives.add(current.resolve())
+    except OSError:
+        pass
+    return actives
+
+
+def _is_versioned_wire_plugin_dist(dist: Path, home: Path) -> bool:
+    """True for ~/.minni/plugin/<version>/dist (not current/cache)."""
+    try:
+        rel = dist.resolve().relative_to((home / ".minni" / "plugin").resolve())
+    except (OSError, ValueError):
+        return False
+    return (
+        len(rel.parts) == 2
+        and rel.parts[1] == "dist"
+        and rel.parts[0] not in {"current", "cache"}
+    )
+
+
 def discover() -> list[Path]:
     home = _home()
     found: list[Path] = []
@@ -223,6 +276,26 @@ def discover() -> list[Path]:
         if p.is_dir():
             found.append(p)
     return found
+
+
+def discover_active() -> tuple[list[Path], list[str]]:
+    """(dists to judge, skip notes). Historical wire version dirs are notes."""
+    home = _home()
+    active = _active_wire_plugin_roots(home)
+    kept: list[Path] = []
+    notes: list[str] = []
+    for dist in discover():
+        if active and _is_versioned_wire_plugin_dist(dist, home):
+            root = dist.parent.resolve()
+            if root not in active:
+                label = str(dist.parent).replace(str(home), "~")
+                notes.append(
+                    f"{label}: skipped (not an active wire install; "
+                    "historical version dir)"
+                )
+                continue
+        kept.append(dist)
+    return kept, notes
 
 
 def read_manifest(dist: Path) -> dict | None:
@@ -350,7 +423,12 @@ def main(argv: list[str] | None = None) -> int:
     details: list[tuple[str, list[str]]] = []
     stale = unknown = drifted_count = unreadable_count = 0
     worktree_linked = badconfig_count = 0
-    for dist in discover():
+    dists, skip_notes = discover_active()
+    for note in skip_notes:
+        print(f"NOTE  {note}")
+    if skip_notes:
+        print()
+    for dist in dists:
         root = dist.parent
         label = str(root).replace(str(home), "~")
 

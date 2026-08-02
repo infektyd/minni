@@ -450,3 +450,55 @@ def test_unparseable_mcp_json_is_reported(tmp_path):
     proc = _run("--strict", home=home, repo_root=_isolated_repo_root(tmp_path))
     assert proc.returncode == 1, proc.stdout
     assert "BADCONFIG" in proc.stdout
+
+
+def test_inactive_wire_version_dist_is_skipped_not_strict_failed(tmp_path):
+    """Round-7 High: historical ~/.minni/plugin/<old>/dist must not fail
+    --strict after a fresher wire (same active-set logic as check_versions)."""
+    home = tmp_path / "home"
+    home.mkdir()
+    plugin = home / ".minni" / "plugin"
+    old = plugin / "0.3.0"
+    old.mkdir(parents=True)
+    (old / "dist").mkdir()
+    (old / "dist" / "server.js").write_text("// old\n", encoding="utf-8")
+    (old / "dist" / "build-manifest.json").write_text(
+        json.dumps({"git_sha": "0" * 40, "built_at": "2026-07-01T00:00:00Z"}),
+        encoding="utf-8",
+    )
+    for sub in ("hooks", "commands", "skills", ".claude-plugin", ".codex-plugin",
+                ".cursor-plugin", ".kilocode-plugin", ".gemini-plugin"):
+        src = SOURCE / sub
+        if src.is_dir():
+            _copytree(src, old / sub)
+
+    fresh = plugin / "0.4.1+git.abc1234"
+    root = _deployment(home, link_dist_to=SOURCE / "dist")
+    # Point _deployment at kilo path; also create active wire under plugin/
+    # Use artifact dist under fresh versioned wire root.
+    import shutil
+    if fresh.exists():
+        shutil.rmtree(fresh)
+    fresh.mkdir(parents=True)
+    for sub in ("hooks", "commands", "skills", ".claude-plugin", ".codex-plugin",
+                ".cursor-plugin", ".kilocode-plugin", ".gemini-plugin"):
+        src = SOURCE / sub
+        if src.is_dir():
+            _copytree(src, fresh / sub)
+    _artifact_dist(fresh)
+    (plugin / "wired.json").write_text(
+        json.dumps({
+            "schema": 1,
+            "wires": [{
+                "platform": "claude-code",
+                "install_root": str(fresh),
+                "wired_at": "2026-08-02T00:00:00Z",
+            }],
+        }),
+        encoding="utf-8",
+    )
+    proc = _run("--strict", home=home, repo_root=_isolated_repo_root(tmp_path))
+    assert "skipped (not an active wire install" in proc.stdout, proc.stdout
+    # Old tree must not force STALE failure by itself.
+    # Fresh kilo deployment may still DRIFT/UNKNOWN; pin is the skip note + no crash.
+    assert "0.3.0" in proc.stdout

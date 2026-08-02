@@ -52,9 +52,11 @@ GEMINI_PROVISIONAL_REASON = (
 ALL_SKIPS = {
     "gemini": GEMINI_SKIP_WARNING,
     "antigravity": (
-        "run `minni wire antigravity` explicitly, or `propagate.py update-plugin "
-        "--platform all` (shared ~/.gemini tree; excluded from `wire all` so the "
-        "two installers do not fight over the same surface in bulk runs)"
+        "run `minni wire antigravity` or `propagate.py update-plugin "
+        "--platform antigravity` explicitly (shared ~/.gemini tree; excluded "
+        "from `wire all` so bulk wire and propagate do not fight). Do not use "
+        "`propagate --platform all` after a wire-primary fleet — that rewrites "
+        "codex/kilocode/grok MCP paths onto legacy cache trees"
     ),
     "cursor": (
         "propagate-managed: run `propagate.py update-plugin --platform cursor`"

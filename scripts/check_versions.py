@@ -245,10 +245,10 @@ def _version_agrees(deployed: str, canonical: str) -> bool:
 def _active_wire_plugin_roots(home: Path) -> set[Path]:
     """Install roots under ~/.minni/plugin that are the *live* wire targets.
 
-    ``wired.json`` is append-ish history. ``make sync-root`` only rewires
-    ``claude-code``, so older platform rows (e.g. ``codex → …/0.3.0``) remain
-    forever even when nothing loads that tree. Treating the full union as
-    active makes sync fail its own verify on those zombies.
+    ``wired.json`` is append-ish history. Older platform rows (e.g.
+    ``codex → …/0.3.0``) can remain even after a fresher ``wire all`` generation.
+    Treating the full union as active makes sync fail its own verify on those
+    zombies.
 
     Match deploy honesty: prefer the **newest ``wired_at`` install root that
     still exists** (global, not per-platform history), then fall back to
