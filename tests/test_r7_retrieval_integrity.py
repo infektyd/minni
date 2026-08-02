@@ -50,6 +50,168 @@ def _make_engine(tmp_path, **cfg_overrides):
     return engine, db_obj, cfg
 
 
+# Hermetic principal setup — same pattern as test_correction_reinjection.py, so
+# the dispatch tests below exercise the real search RPC with no live ~/.minni.
+@pytest.fixture
+def hermetic_principals(tmp_path, monkeypatch):
+    import json
+
+    import minni.minnid as minnid
+    import minni.principal as principal
+
+    pdir = tmp_path / "principals"
+    pdir.mkdir(exist_ok=True)
+    original_resolve = principal.resolve_effective_principal
+
+    def _patched_resolve(*, supplied_agent_id=None, transport="uds",
+                         principals_dir=None, operator_context=False):
+        target_dir = principals_dir or pdir
+        target_agent = str(supplied_agent_id or "").strip()
+        if target_agent:
+            fname, file_agent = f"{target_agent}.json", target_agent
+        else:
+            fname, file_agent = "local.json", "main"
+        f = target_dir / fname
+        f.write_text(json.dumps({
+            "agent_id": file_agent, "workspace_id": "default",
+            "capabilities": ["*"],
+        }), encoding="utf-8")
+        os.chmod(f, 0o600)
+        op_ctx = operator_context or (
+            target_agent in principal.OPERATOR_RESERVED_AGENT_IDS
+        )
+        return original_resolve(
+            supplied_agent_id=supplied_agent_id, transport=transport,
+            principals_dir=target_dir, operator_context=op_ctx,
+        )
+
+    monkeypatch.setattr(principal, "resolve_effective_principal", _patched_resolve)
+    monkeypatch.setattr(minnid, "resolve_effective_principal", _patched_resolve)
+
+
+def _patch_engine_and_writeback(tmp_path, monkeypatch):
+    """Wire ONE test DB into both minnid singletons so dispatch tests hit the
+    production search RPC end to end."""
+    import minni.minnid as minnid
+    import minni.writeback as wb_mod
+    from minni.retrieval import RetrievalEngine
+    from minni.writeback import WriteBackMemory
+
+    db_obj, cfg = _make_db(tmp_path, reranker_enabled=False, hyde_enabled=False)
+    wb = WriteBackMemory(db_obj, cfg)
+    monkeypatch.setattr(minnid, "_writeback", wb)
+    monkeypatch.setattr(wb_mod.WriteBackMemory, "model", property(lambda self: None))
+    engine = RetrievalEngine(db_obj, cfg, faiss_index=object())
+    monkeypatch.setattr(RetrievalEngine, "model", property(lambda self: None))
+    monkeypatch.setattr(minnid, "_retrieval", engine)
+    return engine, db_obj, cfg
+
+
+def _dispatch(method, params):
+    from minni.minnid import _dispatch_sync
+
+    return _dispatch_sync(
+        {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
+    )
+
+
+def _add_event(db_obj, content, event_type="observation", agent="codex"):
+    with db_obj.cursor() as c:
+        c.execute(
+            """INSERT INTO episodic_events (agent_id, event_type, content, created_at)
+               VALUES (?, ?, ?, ?)""",
+            (agent, event_type, content, time.time()),
+        )
+        return c.lastrowid
+
+
+# ---------------------------------------------------------------------------
+# #225-R1 — the episodic layer must be reachable, not merely advertised
+# ---------------------------------------------------------------------------
+
+class TestEpisodicIsReachable:
+    """search_episodic had zero production call sites while the `layer` enum
+    and BOOT_RECALL_LAYERS both advertised episodic. 2,178 captured events
+    were unretrievable: document retrieval cannot reach episodic_events."""
+
+    def test_search_rpc_returns_episodic_hits(self, tmp_path, monkeypatch,
+                                              hermetic_principals):
+        _engine, db_obj, _cfg = _patch_engine_and_writeback(tmp_path, monkeypatch)
+        _add_event(db_obj, "deployment rollback completed on the edge fleet")
+
+        resp = _dispatch("search", {
+            "query": "deployment rollback", "agent_id": "codex", "expand": False,
+        })
+        assert "error" not in resp
+        episodic = resp["result"].get("episodic")
+        assert episodic, (
+            "the search RPC must surface episodic events; on the old code the "
+            "response had no episodic channel at all and the layer was dead"
+        )
+        assert "rollback" in episodic[0]["content"]
+        assert resp["result"]["episodic_count"] == len(episodic)
+
+    def test_explicit_episodic_layer_is_answered(self, tmp_path, monkeypatch,
+                                                 hermetic_principals):
+        """layers=['episodic'] is the exact request the enum advertises."""
+        _engine, db_obj, _cfg = _patch_engine_and_writeback(tmp_path, monkeypatch)
+        _add_event(db_obj, "cache invalidation bug traced to a stale manifest")
+
+        resp = _dispatch("search", {
+            "query": "cache invalidation", "agent_id": "codex",
+            "layers": ["episodic"], "expand": False,
+        })
+        assert "error" not in resp
+        assert resp["result"]["episodic"], "layers=['episodic'] must not be empty"
+
+    def test_non_episodic_layer_filter_skips_the_channel(self, tmp_path, monkeypatch,
+                                                         hermetic_principals):
+        _engine, db_obj, _cfg = _patch_engine_and_writeback(tmp_path, monkeypatch)
+        _add_event(db_obj, "deployment rollback completed")
+
+        resp = _dispatch("search", {
+            "query": "deployment rollback", "agent_id": "codex",
+            "layers": ["knowledge"], "expand": False,
+        })
+        assert "error" not in resp
+        assert resp["result"]["episodic"] == [], (
+            "an explicit non-episodic filter must not leak episodic hits"
+        )
+
+    def test_recall_traces_are_not_surfaced_as_memory(self, tmp_path, monkeypatch,
+                                                      hermetic_principals):
+        """The daemon writes a TTL'd `recall` event per search for observability.
+        Surfacing those would make episodic search return a log of its own past
+        searches instead of memory."""
+        _engine, db_obj, _cfg = _patch_engine_and_writeback(tmp_path, monkeypatch)
+        _add_event(db_obj, "deployment rollback trace", event_type="recall")
+        kept = _add_event(db_obj, "deployment rollback postmortem",
+                          event_type="observation")
+
+        resp = _dispatch("search", {
+            "query": "deployment rollback", "agent_id": "codex", "expand": False,
+        })
+        ids = [e["event_id"] for e in resp["result"]["episodic"]]
+        assert ids == [kept]
+
+    def test_direct_callers_keep_every_event_type(self, tmp_path):
+        """exclude_event_types defaults to None — no change for direct callers."""
+        engine, db_obj, _cfg = _make_engine(tmp_path)
+        _add_event(db_obj, "deployment rollback trace", event_type="recall")
+        results = engine.search_episodic("deployment rollback", agent_id="codex")
+        assert len(results) == 1
+
+    def test_layer_scope_helper(self):
+        from minni.minnid_runtime.recall import _episodic_layer_requested
+
+        assert _episodic_layer_requested(None) is True
+        assert _episodic_layer_requested(["episodic"]) is True
+        assert _episodic_layer_requested(["knowledge", "EPISODIC"]) is True
+        assert _episodic_layer_requested("episodic") is True
+        assert _episodic_layer_requested(["knowledge"]) is False
+        assert _episodic_layer_requested([]) is False
+
+
 # ---------------------------------------------------------------------------
 # #225-R2 — decay must actually be scheduled, not CLI-only
 # ---------------------------------------------------------------------------

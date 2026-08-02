@@ -130,6 +130,23 @@ def backend_badge(backends: Any) -> str:
     return "+".join(names)
 
 
+def _episodic_layer_requested(layers: Any) -> bool:
+    """True when the episodic layer is in scope for this search.
+
+    No ``layers`` filter means every advertised layer, episodic included — the
+    same convention retrieval._filter_candidates uses (a None layer_set filters
+    nothing). An explicit filter must name it.
+    """
+    if layers is None:
+        return True
+    if isinstance(layers, str):
+        return layers.strip().lower() == "episodic"
+    try:
+        return any(str(layer).strip().lower() == "episodic" for layer in layers)
+    except TypeError:
+        return False
+
+
 def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict:
     """Search Minni via hybrid retrieval.
 
@@ -302,6 +319,26 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
         except Exception as exc:
             context.logger.warning("search: learnings surfacing/tracking failed: %s", exc)
 
+        # Audit #225-R1: the episodic layer was advertised (the `layer` enum and
+        # BOOT_RECALL_LAYERS both expose it) but search_episodic had ZERO
+        # production call sites, so 2,178 captured events were unretrievable —
+        # document retrieval can never reach them, because episodic events live
+        # in episodic_events/episodic_fts, not in `documents`. Surfaced as their
+        # own array for the same reason learnings are: they are not documents
+        # and must not be merged into a result set whose consumers assume a
+        # doc_id.
+        episodic_hits: list = []
+        if _episodic_layer_requested(layers):
+            try:
+                episodic_hits = engine.search_episodic(
+                    query,
+                    agent_id=None if learnings_cross_agent else agent_id,
+                    limit=limit,
+                    exclude_event_types=engine.EPISODIC_NON_MEMORY_TYPES,
+                )
+            except Exception as exc:
+                context.logger.warning("search: episodic surfacing failed: %s", exc)
+
         # Durable recall trace (observability, config.recall_trace): a TTL'd
         # episodic event per search so `minni watch` can show raw-RPC recalls
         # too, not just plugin-mediated ones. Best-effort — a trace failure
@@ -356,6 +393,8 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
             ),
             "results": results,
             "learnings": learnings,
+            "episodic": episodic_hits,
+            "episodic_count": len(episodic_hits),
         }
         if not results and auth_suppressions:
             response_payload["auth_suppression"] = auth_suppressions

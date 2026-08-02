@@ -45,6 +45,12 @@ export interface RecallResponse {
   /** Learnings surface separately from document `results`/`count`; a
    *  learnings-only reply is still a live scoped answer. */
   learnings?: unknown[];
+  /** Audit #225-R1: episodic events live in episodic_events, never in
+   *  `documents`, so they can only arrive as their own array — document
+   *  `results`/`count` structurally cannot carry them. An episodic-only reply
+   *  is a live scoped answer, exactly like a learnings-only one. */
+  episodic?: unknown[];
+  episodic_count?: number;
 }
 
 export interface ReadContextResponse {
@@ -727,6 +733,33 @@ function formatVaultContext(results: VaultSearchResult[]): string {
     .join("\n");
 }
 
+/**
+ * #225-R1: render the episodic channel. Episodic events are not documents —
+ * they carry event_id/event_type/content, never a wikilink — so they get their
+ * own section rather than being merged into "Daemon Results" where every
+ * consumer assumes a document shape.
+ */
+export function formatEpisodic(response: RecallResponse, limit = 5): string | undefined {
+  const events = Array.isArray(response.episodic) ? response.episodic : [];
+  if (events.length === 0) return undefined;
+  const lean = events.slice(0, limit).map((e) => {
+    const r = (e ?? {}) as Record<string, unknown>;
+    const content = typeof r.content === "string" ? r.content.replace(/\s+/g, " ").slice(0, 200) : "";
+    return {
+      event_id: r.event_id,
+      event_type: r.event_type,
+      thread_id: r.thread_id ?? undefined,
+      content,
+    };
+  });
+  const omitted = events.length - lean.length;
+  return (
+    "## Episodic Events\n" +
+    JSON.stringify(lean, null, 2) +
+    (omitted > 0 ? `\n(${omitted} further episodic hit(s) omitted.)` : "")
+  );
+}
+
 export function formatRecall(query: string, response: RecallResponse, vaultResults: VaultSearchResult[] = []): string {
   const backendBadge = response.backend ?? response.backend_badge;
   const results = Array.isArray(response.results)
@@ -749,6 +782,7 @@ export function formatRecall(query: string, response: RecallResponse, vaultResul
     daemonLead ? `Daemon lead: ${daemonLead}` : undefined,
     "## Daemon Results",
     results,
+    formatEpisodic(response),
   ].filter(Boolean);
   return sections.join("\n\n");
 }
@@ -799,6 +833,10 @@ export function isDaemonResultEmpty(response: RecallResponse | undefined): boole
   // the suppression diagnostic under local markdown snippets.
   if (Array.isArray(response.auth_suppression) && response.auth_suppression.length > 0) return false;
   if (Array.isArray(response.learnings) && response.learnings.length > 0) return false;
+  // #225-R1: same argument as learnings — `count` covers documents only, and
+  // episodic hits can never appear there. An episodic-only answer that reported
+  // "empty" would trigger the workspace-unscoped vault pre-scan and bury it.
+  if (Array.isArray(response.episodic) && response.episodic.length > 0) return false;
   if (typeof response.count === "number") return response.count === 0;
   const { results } = response;
   if (Array.isArray(results)) return results.length === 0;
@@ -1029,6 +1067,9 @@ export function formatRecallLean(
       ? "## Daemon Results (wikilink + headline; full provenance and identity-shelf hits omitted to save context — pull via minni_recall if needed)\n" +
         JSON.stringify(lean, null, 2)
       : "No non-identity daemon recall results.",
+    // BOOT_RECALL_LAYERS asks for episodic, so the boot path must be able to
+    // render what it asked for — otherwise the layer is still dead here.
+    formatEpisodic(response, limit),
     omitted > 0
       ? `(${omitted} identity-shelf/extra hit(s) omitted; identity shelf is loaded at SessionStart.)`
       : undefined,

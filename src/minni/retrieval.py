@@ -3355,39 +3355,61 @@ class RetrievalEngine:
 
         return self._apply_depth(raw, depth)
 
+    #: Event types that exist for observability, not as recallable memory.
+    #: `recall` rows are the durable recall trace (minnid_runtime.recall writes
+    #: one per search, TTL'd by trim_recall_traces) — surfacing them would make
+    #: every episodic search return a log of its own past searches.
+    EPISODIC_NON_MEMORY_TYPES: tuple = ("recall",)
+
     def search_episodic(
         self,
         query: str,
         agent_id: Optional[str] = None,
         limit: int = 10,
+        exclude_event_types: Optional[Sequence[str]] = None,
     ) -> List[Dict]:
-        """Search episodic events via FTS5."""
+        """Search episodic events via FTS5.
+
+        ``exclude_event_types`` drops observability-only rows; the search RPC
+        passes EPISODIC_NON_MEMORY_TYPES. Default None keeps every event, so
+        existing direct callers see no change.
+        """
         safe_q = self._sanitize_fts_query(query)
         if not safe_q:
             return []
 
+        excluded = [str(t) for t in (exclude_event_types or ())]
+        type_clause = ""
+        type_params: list = []
+        if excluded:
+            type_clause = (
+                " AND (e.event_type IS NULL OR e.event_type NOT IN "
+                f"({','.join('?' * len(excluded))}))"
+            )
+            type_params = excluded
+
         results = []
         with self.db.cursor() as c:
             if agent_id:
-                c.execute("""
+                c.execute(f"""
                     SELECT ef.event_id, ef.agent_id, ef.content, e.event_type,
                            e.task_id, e.thread_id, e.created_at
                     FROM episodic_fts ef
                     JOIN episodic_events e ON e.event_id = ef.event_id
-                    WHERE episodic_fts MATCH ? AND ef.agent_id = ?
+                    WHERE episodic_fts MATCH ? AND ef.agent_id = ?{type_clause}
                     ORDER BY rank
                     LIMIT ?
-                """, (safe_q, agent_id, limit))
+                """, (safe_q, agent_id, *type_params, limit))
             else:
-                c.execute("""
+                c.execute(f"""
                     SELECT ef.event_id, ef.agent_id, ef.content, e.event_type,
                            e.task_id, e.thread_id, e.created_at
                     FROM episodic_fts ef
                     JOIN episodic_events e ON e.event_id = ef.event_id
-                    WHERE episodic_fts MATCH ?
+                    WHERE episodic_fts MATCH ?{type_clause}
                     ORDER BY rank
                     LIMIT ?
-                """, (safe_q, limit))
+                """, (safe_q, *type_params, limit))
 
             for row in c.fetchall():
                 results.append(dict(row))
