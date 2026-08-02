@@ -184,20 +184,32 @@ def discover_inboxes(config) -> List[Path]:
     return out
 
 
-def _existing_keys(db, principals: set) -> set:
-    """(inbox_file, candidate_index) pairs already present for the given
-    principals. Matches on derived_from regardless of status so re-runs are
-    no-ops even after the loop resolves a previously-ingested row."""
+def _coerce_candidate_index(raw: Any) -> Optional[int]:
+    """Normalize JSON candidate_index to int (rejects bools / non-integral floats)."""
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return None
+    idx = int(raw)
+    if idx != raw:
+        return None
+    return idx
+
+
+def _existing_keys(db, principals: set | None = None) -> set:
+    """(inbox_file, candidate_index) pairs already present in candidate_packets.
+
+    Issue #239: dual-resolution pairs came from double-ingest of the same
+    inbox key. Matching is **global** (not principal-scoped) so a re-run under
+    any principal cannot re-insert a key already present under another.
+    Matches on derived_from regardless of status so re-runs are no-ops even
+    after the loop resolves a previously-ingested row.
+
+    ``principals`` is retained for call-site compatibility but ignored — the
+    principal filter was the weaker historical behaviour.
+    """
+    del principals  # intentionally unused; see docstring
     keys: set = set()
     with db.cursor() as c:
-        if principals:
-            qmarks = ",".join("?" for _ in principals)
-            c.execute(
-                f"SELECT derived_from FROM candidate_packets WHERE principal IN ({qmarks})",
-                tuple(principals),
-            )
-        else:
-            c.execute("SELECT derived_from FROM candidate_packets")
+        c.execute("SELECT derived_from FROM candidate_packets")
         rows = c.fetchall()
     for row in rows:
         df = row["derived_from"] if isinstance(row, dict) or hasattr(row, "keys") else row[0]
@@ -209,8 +221,9 @@ def _existing_keys(db, principals: set) -> set:
             continue
         if not isinstance(obj, dict) or obj.get("source") != "inbox":
             continue
-        f, i = obj.get("inbox_file"), obj.get("candidate_index")
-        if isinstance(f, str) and isinstance(i, int):
+        f = obj.get("inbox_file")
+        i = _coerce_candidate_index(obj.get("candidate_index"))
+        if isinstance(f, str) and i is not None:
             keys.add((f, i))
     return keys
 
@@ -384,8 +397,7 @@ def ingest(db, config, inboxes: Optional[List[Path]] = None,
         for label, count in skipped.items():
             skipped_by_kind[label] = skipped_by_kind.get(label, 0) + count
 
-    principals = {r["principal"] for r in scanned}
-    existing = _existing_keys(db, principals)
+    existing = _existing_keys(db)
 
     to_insert: List[Dict[str, Any]] = []
     already = 0
@@ -400,7 +412,36 @@ def ingest(db, config, inboxes: Optional[List[Path]] = None,
     inserted = 0
     if not dry_run and to_insert:
         with db.transaction() as c:
+            # Issue #239: re-load keys inside the write txn so concurrent
+            # ingest processes cannot both pass the pre-txn check and insert
+            # twin rows. Also tolerate a UNIQUE index on the inbox key if the
+            # operator has applied ensure_inbox_dedup_index.
+            txn_existing = set()
+            c.execute("SELECT derived_from FROM candidate_packets")
+            for row in c.fetchall():
+                df = (
+                    row["derived_from"]
+                    if isinstance(row, dict) or hasattr(row, "keys")
+                    else row[0]
+                )
+                if not df:
+                    continue
+                try:
+                    obj = json.loads(df)
+                except Exception:
+                    continue
+                if not isinstance(obj, dict) or obj.get("source") != "inbox":
+                    continue
+                f = obj.get("inbox_file")
+                i = _coerce_candidate_index(obj.get("candidate_index"))
+                if isinstance(f, str) and i is not None:
+                    txn_existing.add((f, i))
+
             for r in to_insert:
+                key = (r["inbox_file"], r["candidate_index"])
+                if key in txn_existing:
+                    already += 1
+                    continue
                 derived_from = json.dumps(
                     {
                         "source": "inbox",
@@ -410,25 +451,34 @@ def ingest(db, config, inboxes: Optional[List[Path]] = None,
                         "content_sha1": _content_sha1(r["content"]),
                     }
                 )
-                c.execute(
-                    """
-                    INSERT INTO candidate_packets
-                    (principal, workspace_id, layer, privacy_level, content,
-                     evidence_refs, derived_from, instruction_like, status, proposed_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'proposed', ?)
-                    """,
-                    (
-                        r["principal"],
-                        r["workspace_id"],
-                        None,
-                        r["privacy_level"],
-                        r["content"],
-                        json.dumps([]),
-                        derived_from,
-                        1 if is_instruction_like(r["content"]) else 0,
-                        r["proposed_at"],
-                    ),
-                )
+                try:
+                    c.execute(
+                        """
+                        INSERT INTO candidate_packets
+                        (principal, workspace_id, layer, privacy_level, content,
+                         evidence_refs, derived_from, instruction_like, status, proposed_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'proposed', ?)
+                        """,
+                        (
+                            r["principal"],
+                            r["workspace_id"],
+                            None,
+                            r["privacy_level"],
+                            r["content"],
+                            json.dumps([]),
+                            derived_from,
+                            1 if is_instruction_like(r["content"]) else 0,
+                            r["proposed_at"],
+                        ),
+                    )
+                except Exception as exc:
+                    # Unique-index collision (post-#239 repair) or rare race:
+                    # treat as already_present rather than aborting the batch.
+                    if "UNIQUE" in str(exc).upper():
+                        already += 1
+                        continue
+                    raise
+                txn_existing.add(key)
                 inserted += 1
 
     return {
