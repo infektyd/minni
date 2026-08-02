@@ -9,11 +9,23 @@ export interface MemoryIntent {
   suggestedQuery?: string;
 }
 
+/**
+ * Observability for the #147 AFM inconclusive tier (#237 / SEC-G6).
+ * Fail-open behavior is unchanged; this field only records whether the
+ * semantic tier actually examined spans, was unavailable, or was never invoked.
+ * - `ran`: classifier returned `prose` or `credential`
+ * - `unavailable`: AFM off / call failed / parse failed / classifier threw
+ * - `skipped`: no inconclusive spans, or regex already hard-blocked
+ */
+export type SemanticTierState = "ran" | "unavailable" | "skipped";
+
 export interface LearningQualityReport {
   ok: boolean;
   score: number;
   warnings: string[];
   summary: string;
+  /** Which state the AFM semantic learn-gate tier reached (audit-visible). */
+  semanticTier: SemanticTierState;
 }
 
 const RECALL_TERMS = [
@@ -459,6 +471,8 @@ export function assessLearningQuality(input: LearningInput): LearningQualityRepo
     score: normalized,
     warnings,
     summary: warnings.length === 0 ? "Learning looks durable and specific." : warnings.join(" "),
+    // Sync path never invokes the AFM semantic tier.
+    semanticTier: "skipped",
   };
 }
 
@@ -470,6 +484,10 @@ export function assessLearningQuality(input: LearningInput): LearningQualityRepo
  * multi-word tail, run `classifyInconclusive` (default: local AFM). A
  * `credential` verdict hard-blocks; `prose` / `unavailable` leave the
  * regex result unchanged (fail-open — AFM enhances, it does not replace).
+ *
+ * `semanticTier` records whether that slow path ran, was unavailable, or was
+ * skipped so audit consumers can distinguish "examined and cleared" from
+ * "never ran" (SEC-G6 / #237). Fail-open behavior is unchanged.
  */
 export async function assessLearningQualityAsync(
   input: LearningInput,
@@ -479,7 +497,8 @@ export async function assessLearningQualityAsync(
 ): Promise<LearningQualityReport> {
   const base = assessLearningQuality(input);
   if (!base.ok && flagsSensitiveMaterial(base)) {
-    return base;
+    // Regex already hard-blocked; AFM tier is not invoked.
+    return { ...base, semanticTier: "skipped" };
   }
 
   // Each persisted channel is scanned separately rather than concatenated:
@@ -493,7 +512,9 @@ export async function assessLearningQualityAsync(
     }))
     .filter((channel) => channel.spans.length > 0);
   const spans = flagged.flatMap((channel) => channel.spans);
-  if (spans.length === 0) return base;
+  if (spans.length === 0) {
+    return { ...base, semanticTier: "skipped" };
+  }
 
   // Lazy default import keeps the sync path free of AFM for unit tests /
   // callers that only need regex. Injection overrides for deterministic tests.
@@ -508,7 +529,15 @@ export async function assessLearningQualityAsync(
     verdict = "unavailable";
   }
 
-  if (verdict !== "credential") return base;
+  // Fail-open: prose and unavailable leave the regex result unchanged, but
+  // they are no longer byte-identical in the report — `semanticTier` carries
+  // whether the classifier actually examined the spans.
+  if (verdict === "prose") {
+    return { ...base, semanticTier: "ran" };
+  }
+  if (verdict === "unavailable") {
+    return { ...base, semanticTier: "unavailable" };
+  }
 
   const keywords = [...new Set(spans.map((s) => s.keyword))];
   const keywordLabel = keywords.length === 1 ? keywords[0] : keywords.join("/");
@@ -528,5 +557,6 @@ export async function assessLearningQualityAsync(
     score,
     warnings,
     summary: warnings.join(" "),
+    semanticTier: "ran",
   };
 }

@@ -8,6 +8,18 @@ pre-1.0: minor versions may contain breaking changes until v1.0.0.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Learn-gate semantic tier observability (#237 / SEC-G6):**
+  `LearningQualityReport` now carries `semanticTier: "ran" | "unavailable" |
+  "skipped"` so audit records can distinguish "AFM examined and cleared" from
+  "AFM never ran / off / failed" and from "tier not invoked". Fail-open
+  behavior is unchanged; only observability is added.
+- **POLICY.md §2 redaction contract (#237 / SEC-G7):** docs no longer claim a
+  MUST-redact guarantee for JSON-quoted secrets or all absolute paths. §2.1/§2.2
+  are marked PARTIAL and aligned with `redaction.py` plus
+  `THREAT_MODEL.md` residual language.
+
 ## [0.4.1] - 2026-08-01
 
 ### Added

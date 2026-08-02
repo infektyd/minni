@@ -295,6 +295,7 @@ test("AFM inconclusive tier blocks credential verdict (#147)", async () => {
   assert.ok(report.warnings.some((w) => w.includes("unquoted multi-word")));
   // Must not echo the passphrase into the warning text.
   assert.ok(!report.summary.includes("correct horse battery staple"));
+  assert.equal(report.semanticTier, "ran");
 });
 
 test("AFM inconclusive tier allows prose verdict (#147)", async () => {
@@ -303,6 +304,8 @@ test("AFM inconclusive tier allows prose verdict (#147)", async () => {
     { classifyInconclusive: async () => "prose" },
   );
   assert.equal(report.ok, true, report.summary);
+  // #237 / SEC-G6: "examined and cleared" is observable, not just fail-open.
+  assert.equal(report.semanticTier, "ran");
 });
 
 test("AFM unavailable fails open (enhancement tier, not replacement)", async () => {
@@ -311,6 +314,7 @@ test("AFM unavailable fails open (enhancement tier, not replacement)", async () 
     { classifyInconclusive: async () => "unavailable" },
   );
   assert.equal(report.ok, true, "unavailable must not hard-block");
+  assert.equal(report.semanticTier, "unavailable");
 });
 
 test("AFM classifier throw fails open", async () => {
@@ -323,6 +327,58 @@ test("AFM classifier throw fails open", async () => {
     },
   );
   assert.equal(report.ok, true);
+  assert.equal(report.semanticTier, "unavailable");
+});
+
+test("semanticTier distinguishes prose-cleared from unavailable/throw (#237 SEC-G6)", async () => {
+  // Reproduction from issue #237: same input, four injected verdicts — three
+  // non-blocking outcomes were previously byte-identical in every field.
+  const input = {
+    title: "Ops runbook for the prod cluster",
+    content: pad(
+      "For the staging box the password: correct horse battery staple was rotated on Tuesday by the on-call.",
+    ),
+    category: "ops",
+    source: "session",
+  };
+
+  const credential = await assessLearningQualityAsync(input, {
+    classifyInconclusive: async () => "credential",
+  });
+  const prose = await assessLearningQualityAsync(input, {
+    classifyInconclusive: async () => "prose",
+  });
+  const unavailable = await assessLearningQualityAsync(input, {
+    classifyInconclusive: async () => "unavailable",
+  });
+  const threw = await assessLearningQualityAsync(input, {
+    classifyInconclusive: async () => {
+      throw new Error("classifier boom");
+    },
+  });
+
+  assert.equal(credential.ok, false);
+  assert.equal(credential.semanticTier, "ran");
+
+  assert.equal(prose.ok, true);
+  assert.equal(prose.semanticTier, "ran");
+
+  assert.equal(unavailable.ok, true);
+  assert.equal(unavailable.semanticTier, "unavailable");
+
+  assert.equal(threw.ok, true);
+  assert.equal(threw.semanticTier, "unavailable");
+
+  // The defect was that prose / unavailable / throw were indistinguishable.
+  // ok+score alone still match for fail-open paths; semanticTier must differ.
+  assert.equal(prose.ok, unavailable.ok);
+  assert.equal(prose.score, unavailable.score);
+  assert.notEqual(
+    prose.semanticTier,
+    unavailable.semanticTier,
+    "prose-cleared must not look identical to unavailable in the audit field",
+  );
+  assert.equal(unavailable.semanticTier, threw.semanticTier);
 });
 
 test("AFM tier is skipped when regex already hard-blocked", async () => {
@@ -341,6 +397,7 @@ test("AFM tier is skipped when regex already hard-blocked", async () => {
   );
   assert.equal(report.ok, false);
   assert.equal(called, 0, "must not call AFM after regex hard-block");
+  assert.equal(report.semanticTier, "skipped");
 });
 
 test("AFM tier is skipped when no inconclusive spans exist", async () => {
@@ -359,6 +416,15 @@ test("AFM tier is skipped when no inconclusive spans exist", async () => {
   );
   assert.equal(report.ok, true);
   assert.equal(called, 0);
+  assert.equal(report.semanticTier, "skipped");
+});
+
+test("sync assessLearningQuality always reports semanticTier skipped", () => {
+  const report = assessLearningQuality({
+    ...GOOD_INPUT,
+    content: pad("password: correct horse battery staple"),
+  });
+  assert.equal(report.semanticTier, "skipped");
 });
 
 test("same-line buried passphrase still reaches AFM as its own span", async () => {

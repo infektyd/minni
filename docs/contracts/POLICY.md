@@ -1,7 +1,7 @@
 # Minni — Privacy and Policy Contract
 
-**Contract version:** 1.0.0 (IMPLEMENTED — baseline)
-**Last updated:** 2026-04-26 (PARTIAL — G03 matrix update)
+**Contract version:** 1.0.1 (IMPLEMENTED — baseline; §2 redaction PARTIAL)
+**Last updated:** 2026-08-02 (SEC-G7 / #237 — align §2 with engine coverage; G03 matrix tags retained)
 
 This document defines the default privacy posture, redaction rules, retention
 rules, and cross-agent data sharing rules for Minni. All agents,
@@ -49,32 +49,38 @@ See `docs/contracts/VAULT.md` Section 7 for the full privacy level definitions.
 
 ## 2. Redaction Rules
 
-The following categories of content MUST be redacted from any envelope that
-crosses a process boundary (including daemon JSON-RPC responses, handoff packets,
-and any future network transport).
+The daemon applies **best-effort, label-oriented redaction** to envelopes that
+cross a process boundary (JSON-RPC responses, handoff packets, and any future
+network transport). This is an incomplete Medium control: it reduces accidental
+leakage of keyword-labelled secrets and some local paths; it is **not** a
+guarantee that every secret or absolute path is stripped. Residual gaps match
+`docs/contracts/THREAT_MODEL.md` ("JSON-quoted and bare high-entropy secrets
+often missed").
 
-### 2.1 Secret patterns
+### 2.1 Secret patterns (PARTIAL)
 
-Any chunk text matching one or more of the following patterns is redacted to
-`[REDACTED]` before leaving the engine process:
+`src/minni/minnid_runtime/redaction.py` rewrites matched forms to
+`keyword=[REDACTED]` (or `[REDACTED]` for PEM blocks) before the daemon
+serialises results. Matching is case-insensitive and keyword-assignment shaped
+(`keyword` + `:`/`=` + unquoted value charset `[^\s,;<>"']+`).
 
-| Pattern | Examples |
-|---------|---------|
-| `api_key` | `api_key=...`, `"api_key": "..."` |
-| `token` | Bearer tokens, access tokens, refresh tokens |
-| `password` | Plaintext passwords in any format |
-| `private key` / `private_key` | PEM-encoded private keys, SSH private keys |
-| `secret` | Generic secret values |
-| `credential` | Credential objects or values |
+| Pattern class | Matched examples (implemented) | Known misses (not claimed) |
+|---------------|--------------------------------|----------------------------|
+| `api_key` / `password` / `secret` / `credential` / `private_key` | `api_key=sk-…`, `password: hunter2` | JSON-quoted `"api_key": "…"`, bare high-entropy tokens without a label |
+| `token` / `bearer` / `access_token` / `refresh_token` | `token=…`, `Bearer: …` | Bare `ghp_…` / `sk-…` with no keyword, JSON-quoted forms |
+| PEM private keys | `-----BEGIN … PRIVATE KEY-----` blocks | — |
 
-These patterns are matched case-insensitively. The redaction is applied by the
-daemon before serialising results to JSON-RPC callers.
+Operators and agents MUST NOT treat redaction markers as proof that all secret
+material was removed. Learn-gate credential blocking (plugin policy) is a
+separate write-path control and does not expand this read-path redactor.
 
-### 2.2 Local filesystem paths
+### 2.2 Local filesystem paths (PARTIAL)
 
-Absolute paths that identify local filesystem layout (home directory, username,
-internal project paths) are redacted from envelopes sent to external consumers.
-Within the local installation, full paths are preserved for indexing and recall.
+Path redaction currently covers macOS-style absolute layouts under `/Users`,
+`/Volumes`, and `/private`, rewritten to `[REDACTED_PATH]`. Other absolute
+layouts (including `/home/...` used by the Docker image) are **not** rewritten
+by the current patterns. Within the local installation, full paths are
+preserved for indexing and recall.
 
 ### 2.3 Adapter and launchd filenames
 
