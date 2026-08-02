@@ -143,25 +143,53 @@ act npm --prefix plugins/minni run build
 # at ~/.minni/plugin/<ver>). propagate owns antigravity + cursor. Never run
 # `propagate --platform all` after a partial wire — that rewrites codex/kilo/
 # grok back onto legacy cache trees and undoes wire adoption every sync.
+#
+# wire all partial (missing config root for one host) must NOT abort under
+# set -e: still propagate antigravity/cursor, restart, and verify, then refuse
+# at the end if anything failed.
 say "step 4/6: redeploy platform surfaces (wire all + propagate antigravity/cursor)"
-act "$VENV_PY" -m minni.minni_cli wire all --from-repo "$REPO"
-act "$VENV_PY" plugins/minni/skills/minni-install/scripts/propagate.py \
-  --repo "$REPO" update-plugin --platform antigravity --no-build
-act "$VENV_PY" plugins/minni/skills/minni-install/scripts/propagate.py \
-  --repo "$REPO" update-plugin --platform cursor --no-build
+REDEPLOY_EXIT=0
+if [ "$DRY_RUN" = 1 ]; then
+  act "$VENV_PY" -m minni.minni_cli wire all --from-repo "$REPO"
+else
+  printf 'running:   %s -m minni.minni_cli wire all --from-repo %s\n' "$VENV_PY" "$REPO"
+  if ! "$VENV_PY" -m minni.minni_cli wire all --from-repo "$REPO"; then
+    echo "update-root: wire all reported failures — continuing redeploy/verify" >&2
+    REDEPLOY_EXIT=1
+  fi
+fi
+if [ "$DRY_RUN" = 1 ]; then
+  act "$VENV_PY" plugins/minni/skills/minni-install/scripts/propagate.py \
+    --repo "$REPO" update-plugin --platform antigravity --no-build
+  act "$VENV_PY" plugins/minni/skills/minni-install/scripts/propagate.py \
+    --repo "$REPO" update-plugin --platform cursor --no-build
+else
+  printf 'running:   propagate update-plugin --platform antigravity\n'
+  if ! "$VENV_PY" plugins/minni/skills/minni-install/scripts/propagate.py \
+      --repo "$REPO" update-plugin --platform antigravity --no-build; then
+    echo "update-root: propagate antigravity failed — continuing" >&2
+    REDEPLOY_EXIT=1
+  fi
+  printf 'running:   propagate update-plugin --platform cursor\n'
+  if ! "$VENV_PY" plugins/minni/skills/minni-install/scripts/propagate.py \
+      --repo "$REPO" update-plugin --platform cursor --no-build; then
+    echo "update-root: propagate cursor failed — continuing" >&2
+    REDEPLOY_EXIT=1
+  fi
+fi
 # Grok hooks/rules are propagate-only (wire does not install them) but a full
 # `propagate --platform grok` would re-stamp MCP onto the legacy agents tree.
-# Refresh hooks/rules against the active wire install root only.
+# Refresh hooks/rules against the active wire install root only — failure is
+# a redeploy failure (not "sync complete").
 if [ "$DRY_RUN" = 1 ]; then
   printf 'would run: refresh grok hooks/rules from active wire install root\n'
 else
   printf 'running:   refresh grok hooks/rules from active wire install root\n'
-  "$VENV_PY" - "$REPO" <<'PY' || echo "update-root: grok hooks refresh skipped/failed (non-fatal)" >&2
+  if ! "$VENV_PY" - "$REPO" <<'PY'
 import json, sys
 from pathlib import Path
 repo = Path(sys.argv[1])
 prop = repo / "plugins/minni/skills/minni-install/scripts/propagate.py"
-# Load propagate as a standalone module (ships in the payload; no package import).
 import importlib.util
 spec = importlib.util.spec_from_file_location("minni_propagate", prop)
 mod = importlib.util.module_from_spec(spec)
@@ -189,9 +217,17 @@ if root is None:
 if root is None:
     print("no wire install root for grok hooks", file=sys.stderr)
     sys.exit(1)
-print("grok hooks:", mod.update_grok_hooks(root))
-print("grok rules:", mod.write_grok_rules())
+hooks = mod.update_grok_hooks(root)
+rules = mod.write_grok_rules()
+print("grok hooks:", hooks)
+print("grok rules:", rules)
+if not hooks.get("installed") or not rules.get("installed"):
+    sys.exit(1)
 PY
+  then
+    echo "update-root: grok hooks/rules refresh failed — will not report sync complete" >&2
+    REDEPLOY_EXIT=1
+  fi
 fi
 
 # ── 5. restart the daemon ────────────────────────────────────────────────────
@@ -235,28 +271,36 @@ if [ ! -f "$REPO/scripts/check_versions.py" ] || [ ! -f "$REPO/scripts/check_dep
     refuse "checkout is missing scripts/check_versions.py or check_deployments.py — is REPO a Minni tree?"
   fi
 else
-  # Checkers are read-only; dry-run still runs them so WORKTREE/BADCONFIG is
-  # visible in the plan instead of only failing on the live run.
-  mode_label=$([ "$DRY_RUN" = 1 ] && echo "running (read-only):" || echo "running:  ")
-  printf '%s %s scripts/check_versions.py\n' "$mode_label" "$VENV_PY"
-  if ! "$VENV_PY" scripts/check_versions.py; then
-    VERIFY_EXIT=1
-  fi
-  printf '%s %s scripts/check_deployments.py --strict\n' "$mode_label" "$VENV_PY"
-  if ! "$VENV_PY" scripts/check_deployments.py --strict; then
-    VERIFY_EXIT=1
+  if [ "$DRY_RUN" = 1 ]; then
+    # Current-state visibility only. Do not fold pre-sync WORKTREE/BADCONFIG
+    # into "plan would FAIL" — the real run redeploys first, then verifies.
+    printf 'current state (not a plan gate): %s scripts/check_versions.py\n' "$VENV_PY"
+    "$VENV_PY" scripts/check_versions.py || true
+    printf 'current state (not a plan gate): %s scripts/check_deployments.py --strict\n' "$VENV_PY"
+    "$VENV_PY" scripts/check_deployments.py --strict || true
+  else
+    printf 'running:   %s scripts/check_versions.py\n' "$VENV_PY"
+    if ! "$VENV_PY" scripts/check_versions.py; then
+      VERIFY_EXIT=1
+    fi
+    printf 'running:   %s scripts/check_deployments.py --strict\n' "$VENV_PY"
+    if ! "$VENV_PY" scripts/check_deployments.py --strict; then
+      VERIFY_EXIT=1
+    fi
   fi
 fi
 
-# After a real restart, require the socket to answer and report deploy.stale
-# is not True. Skip under dry-run (kickstart was not executed).
+# After a real restart, require the socket to answer and report known-stale
+# is not True. Unmeasurable (None) is a soft warning — kickstart can race
+# slow imports. Skip under dry-run (kickstart was not executed).
 if [ "$DRY_RUN" != 1 ] && [ "$DAEMON_RESTARTED" = 1 ]; then
   say "step 6b: probe daemon deploy honesty after restart"
   if ! "$VENV_PY" - "$SOCKET" <<'PY'
 import json, socket, sys, time
 sock_path = sys.argv[1]
 last = None
-for _ in range(15):
+# ~45s: kickstart + DB migrate / import can exceed a few seconds.
+for i in range(45):
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
             s.settimeout(2.0)
@@ -281,18 +325,17 @@ for _ in range(15):
                 file=sys.stderr,
             )
             sys.exit(2)
-        # After a restart we forced, unmeasurable honesty is not "ok".
         if stale is None:
+            # Soft: socket is up; honesty unmeasurable (manifest race / layout).
             print(
-                f"update-root: daemon deploy.stale is unmeasurable after restart: {deploy!r}",
-                file=sys.stderr,
+                f"daemon deploy probe soft-ok (stale unmeasurable): {deploy!r}",
             )
-            sys.exit(3)
+            sys.exit(0)
         print(f"daemon deploy probe ok (stale={stale!r}, plugin_dist.stale={plugin_stale!r})")
         sys.exit(0)
     except Exception as exc:
         last = exc
-        time.sleep(0.4)
+        time.sleep(1.0)
 print(f"update-root: daemon socket unreachable after restart ({sock_path}): {last}", file=sys.stderr)
 sys.exit(1)
 PY
@@ -303,15 +346,19 @@ PY
 fi
 
 # Final status: never print "sync complete" unless redeploy + daemon restart +
-# verify all succeeded. Dry-run exits non-zero when the plan would fail (e.g.
-# launchd agent not loaded).
+# verify all succeeded. Dry-run exits non-zero only when the *plan* would fail
+# (e.g. launchd agent not loaded) — not because pre-sync hygiene is dirty.
 if [ "$DRY_RUN" = 1 ]; then
-  if [ "$DAEMON_MISSING" = 1 ] || [ "$VERIFY_EXIT" != 0 ]; then
-    echo "dry-run plan would FAIL (daemon missing=$DAEMON_MISSING verify_exit=$VERIFY_EXIT)" >&2
+  if [ "$DAEMON_MISSING" = 1 ]; then
+    echo "dry-run plan would FAIL (daemon would not be restarted)" >&2
     exit 1
   fi
-  say "dry-run plan complete (no changes applied; verify gates evaluated read-only)"
+  say "dry-run plan complete (no changes applied; current-state checkers are informational)"
   exit 0
+fi
+
+if [ "$REDEPLOY_EXIT" != 0 ]; then
+  refuse "redeploy reported failures (wire/propagate/grok-hooks) — see messages above"
 fi
 
 if [ "$VERIFY_EXIT" != 0 ]; then

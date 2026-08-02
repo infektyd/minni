@@ -138,7 +138,14 @@ def check_mcp_config(root: Path, home: Path) -> list[str]:
     except ValueError:
         rel_root = str(root)
     expected = _expected_agents(rel_root + "/")
-    env = entry.get("env") or {}
+    env_raw = entry.get("env")
+    if env_raw is None:
+        env: dict = {}
+    elif not isinstance(env_raw, dict):
+        problems.append(".mcp.json env is not an object")
+        env = {}
+    else:
+        env = env_raw
     agent = env.get("MINNI_AGENT_ID")
     if expected is not None:
         if not agent:
