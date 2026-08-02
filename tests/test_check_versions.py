@@ -265,6 +265,11 @@ def test_latest_per_platform_root_stays_active_even_if_older_than_peer(tmp_path)
     (fail), not skipped as historical."""
     canonical = _canonical()
     home = tmp_path / "home"
+    home.mkdir()
+    # Host surfaces must exist or active_roots correctly drops the platform
+    # (zombie filter) — this test is about dual-platform *live* hosts.
+    (home / ".codex").mkdir()
+    (home / ".claude.json").write_text("{}", encoding="utf-8")
     plugin = home / ".minni" / "plugin"
     old = plugin / "0.3.0"
     old.mkdir(parents=True)
