@@ -455,3 +455,61 @@ def test_propagate_snapshot_unparseable_mcp_json_refuses_before_copy(
         propagate.update_one_plugin("cursor", args)
     assert copy_calls == [], "copy_tree must not run after corrupt snapshot"
     assert mcp_target.read_text(encoding="utf-8") == original
+
+
+def test_propagate_unparseable_host_toml_refuses_before_copy(tmp_path, monkeypatch):
+    """CR Med D10: corrupt host config.toml must refuse before copy_tree."""
+    home = tmp_path / "home"
+    home.mkdir()
+    codex = home / ".codex"
+    codex.mkdir()
+    toml_path = codex / "config.toml"
+    original_toml = "this is not [valid toml"
+    toml_path.write_text(original_toml, encoding="utf-8")
+
+    install_root = tmp_path / "codex-plugin"
+    install_root.mkdir()
+    (install_root / ".mcp.json").write_text(
+        json.dumps({"mcpServers": {"minni": {"env": {}}}}), encoding="utf-8",
+    )
+    marker = install_root / "PRE_EXISTING"
+    marker.write_text("keep", encoding="utf-8")
+
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(
+        propagate, "plugin_source",
+        lambda repo_root: tmp_path / "source",
+    )
+    monkeypatch.setattr(propagate, "native_afm_env", lambda repo_root: {})
+    monkeypatch.setattr(propagate, "bootstrap_vault", lambda args: None)
+    monkeypatch.setattr(propagate, "vault_for", lambda agent: tmp_path / "vault")
+    monkeypatch.setattr(
+        propagate, "platform_spec",
+        lambda platform, repo_root, install_root=None: {
+            "agent": "codex",
+            "install": Path(install_root) if install_root else install_root,
+            "config_kind": "toml",
+            "config": toml_path,
+        },
+    )
+    copy_calls: list[object] = []
+    monkeypatch.setattr(
+        propagate, "copy_tree",
+        lambda *a, **k: copy_calls.append((a, k)),
+    )
+
+    args = argparse.Namespace(
+        platform="codex",
+        agent=None,
+        install_root=str(install_root),
+        workspace=None,
+        no_build=True,
+        repo=str(REPO),
+        socket=str(tmp_path / "sock"),
+    )
+    with pytest.raises(ValueError, match="cannot parse existing TOML"):
+        propagate.update_one_plugin("codex", args)
+    assert copy_calls == [], "copy_tree must not run after corrupt host TOML"
+    assert toml_path.read_text(encoding="utf-8") == original_toml
+    assert marker.read_text(encoding="utf-8") == "keep"
+

@@ -544,3 +544,33 @@ def test_no_plugin_payload_is_stale_false_not_null(monkeypatch):
     full = deploy_honesty.deploy_status()
     assert full["plugin_dist"]["stale"] is False
     assert full["stale"] is False, full
+
+
+def test_plugin_dist_unreadable_peer_with_healthy_match_is_not_null(
+    monkeypatch, tmp_path,
+):
+    """CR Med: healthy peer match must win over unreadable peer (not null)."""
+    import json as _json
+    from minni.minnid_runtime import deploy_honesty
+
+    head = "a" * 40
+    good = tmp_path / "good"
+    bad = tmp_path / "bad"
+    good.mkdir()
+    bad.mkdir()
+    (good / "payload-manifest.json").write_text(
+        _json.dumps({"git_sha": head, "version": "0.4.1"}), encoding="utf-8",
+    )
+    (bad / "payload-manifest.json").write_text("{not-json", encoding="utf-8")
+    monkeypatch.setattr(
+        deploy_honesty,
+        "_active_payload_roots",
+        lambda: [
+            (good, "wired.json:claude-code"),
+            (bad, "wired.json:codex"),
+        ],
+    )
+    out = deploy_honesty._plugin_dist_status(head)
+    assert out["stale"] is False, out
+    assert out.get("unreadable"), out
+

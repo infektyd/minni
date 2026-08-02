@@ -301,10 +301,22 @@ def test_sync_root_skips_repo_plugin_payload_on_strict_verify():
 
 
 def test_grok_hooks_refresh_skips_when_no_grok_surface():
-    """Optional grok surface: no wire root is a skip, not fail."""
+    """Optional grok surface: no wire root is a skip, not fail (even if ~/.grok)."""
     text = SCRIPT.read_text(encoding="utf-8")
     assert "no grok wire install root" in text
     assert "hooks refresh not needed" in text
+    # CR Low: the no-root branch must soft-exit 0 (leftover ~/.grok must not fail).
+    idx = text.find("if root is None:")
+    # Prefer the second occurrence (after current-fallback) when two exist.
+    idx2 = text.find("if root is None:", idx + 1)
+    if idx2 != -1:
+        idx = idx2
+    assert idx != -1
+    end = text.find("hooks = mod.update_grok_hooks", idx)
+    assert end != -1
+    block = text[idx:end]
+    assert "sys.exit(0)" in block
+    assert "sys.exit(1)" not in block
 
 
 def test_wire_all_skipped_is_not_redeploy_failure():
