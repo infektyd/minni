@@ -315,3 +315,42 @@ def test_wire_all_skipped_is_not_redeploy_failure():
     # Must distinguish skipped from other non-zero exits.
     assert 'REDEPLOY_EXIT=1' in text
     assert '_WIRE_STATUS' in text
+    # Defense in depth: last-JSON recovery for polluted --from-repo stdout.
+    assert "rfind('{')" in text or 'rfind("{"' in text or "rfind('{')" in text
+
+
+def test_wire_status_parser_tolerates_npm_noise(tmp_path):
+    """Last-JSON decode must recover status=skipped after npm banner on stdout."""
+    import json
+    import subprocess
+    import sys
+
+    polluted = tmp_path / "wire.out"
+    banner = (
+        "> minni-multi-plugin@0.4.1 build:server\n"
+        "build manifest: 0.4.1 abcd -> plugins/minni/dist/build-manifest.json\n"
+    )
+    body = json.dumps({"schema": 1, "status": "skipped", "results": []})
+    polluted.write_text(banner + body + "\n", encoding="utf-8")
+    code = (
+        "import json, sys\n"
+        "text = open(sys.argv[1], encoding='utf-8', errors='replace').read()\n"
+        "doc = None\n"
+        "try:\n"
+        "    doc = json.loads(text)\n"
+        "except Exception:\n"
+        "    idx = text.rfind('{')\n"
+        "    while idx >= 0:\n"
+        "        try:\n"
+        "            doc = json.loads(text[idx:])\n"
+        "            break\n"
+        "        except Exception:\n"
+        "            idx = text.rfind('{', 0, idx)\n"
+        "assert isinstance(doc, dict) and doc.get('status') == 'skipped'\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", code, str(polluted)],
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, proc.stderr

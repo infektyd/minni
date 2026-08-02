@@ -468,11 +468,13 @@ def _mirror_codex_hook_env(env: dict, agent: str) -> None:
     """
     if agent != "codex":
         return
-    env.setdefault("MINNI_CODEX_AGENT_ID", env.get("MINNI_AGENT_ID", "codex"))
+    # Match wire/writers.py: always re-derive (assignment, not setdefault) so
+    # a stale MINNI_CODEX_* cannot split hooks from MCP.
+    env["MINNI_CODEX_AGENT_ID"] = env.get("MINNI_AGENT_ID", "codex")
     if "MINNI_VAULT_PATH" in env:
-        env.setdefault("MINNI_CODEX_VAULT_PATH", env["MINNI_VAULT_PATH"])
+        env["MINNI_CODEX_VAULT_PATH"] = env["MINNI_VAULT_PATH"]
     if "MINNI_WORKSPACE_ID" in env:
-        env.setdefault("MINNI_CODEX_WORKSPACE_ID", env["MINNI_WORKSPACE_ID"])
+        env["MINNI_CODEX_WORKSPACE_ID"] = env["MINNI_WORKSPACE_ID"]
 
 
 def load_json(path: Path) -> dict:

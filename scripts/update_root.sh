@@ -198,14 +198,27 @@ else
   set -e
   cat "$_WIRE_JSON" || true
   if [ "$_WIRE_RC" -ne 0 ]; then
+    # Decode the *last* JSON object: --from-repo may still leave noise on
+    # stdout if an older from_repo path leaks npm banners before WireOutput.
     _WIRE_STATUS="$("$VENV_PY" -c "
 import json, sys
+text = open(sys.argv[1], encoding='utf-8', errors='replace').read()
+doc = None
+# Prefer pure JSON; else last top-level object (defense in depth).
 try:
-    doc = json.load(open(sys.argv[1], encoding='utf-8'))
+    doc = json.loads(text)
 except Exception:
+    idx = text.rfind('{')
+    while idx >= 0:
+        try:
+            doc = json.loads(text[idx:])
+            break
+        except Exception:
+            idx = text.rfind('{', 0, idx)
+if not isinstance(doc, dict):
     print('unparseable')
-    raise SystemExit(0)
-print(doc.get('status') or 'unknown')
+else:
+    print(doc.get('status') or 'unknown')
 " "$_WIRE_JSON" 2>/dev/null || echo unparseable)"
     if [ "$_WIRE_STATUS" = "skipped" ]; then
       echo "update-root: wire all status=skipped (no wire-managed host surfaces) — continuing with propagate" >&2

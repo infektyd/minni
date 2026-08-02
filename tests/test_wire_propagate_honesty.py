@@ -320,3 +320,21 @@ def test_propagate_codex_preserve_rederives_mirror_when_agent_is_codex(tmp_path,
     assert env["MINNI_CODEX_WORKSPACE_ID"] == "ws-preserved"
     assert env["MINNI_CODEX_AGENT_ID"] == "codex"
     assert env["MINNI_CODEX_VAULT_PATH"] == str(vault)
+
+
+def test_codex_mirror_overwrites_stale_like_wire():
+    """Propagate must force-reassign CODEX mirrors (not setdefault) like wire."""
+    from minni.wire.writers import _mirror_codex_hook_env as wire_mirror
+
+    for mirror in (propagate._mirror_codex_hook_env, wire_mirror):
+        env = {
+            "MINNI_AGENT_ID": "codex",
+            "MINNI_VAULT_PATH": "/vault-new",
+            "MINNI_WORKSPACE_ID": "ws-new",
+            "MINNI_CODEX_VAULT_PATH": "/vault-stale",
+            "MINNI_CODEX_WORKSPACE_ID": "ws-stale",
+        }
+        mirror(env, "codex")
+        assert env["MINNI_CODEX_VAULT_PATH"] == "/vault-new", mirror
+        assert env["MINNI_CODEX_WORKSPACE_ID"] == "ws-new", mirror
+        assert env["MINNI_CODEX_AGENT_ID"] == "codex", mirror

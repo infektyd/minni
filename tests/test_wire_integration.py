@@ -642,3 +642,21 @@ def test_wire_missing_config_root_is_skipped(wire_env, monkeypatch, capsys):
     assert out["status"] in ("skipped", "dry-run"), out
     if out["status"] == "skipped":
         assert rc == 1
+
+
+def test_from_repo_run_redirects_child_stdout_to_stderr(tmp_path, monkeypatch):
+    """Build children must not write to stdout (wire JSON contract)."""
+    import subprocess as sp
+    import sys
+
+    from minni.wire import from_repo
+
+    calls: dict = {}
+
+    def fake_run(cmd, cwd=None, check=True, stdout=None, **kwargs):
+        calls["stdout"] = stdout
+        return sp.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(from_repo.subprocess, "run", fake_run)
+    from_repo._run(["echo", "hi"], tmp_path)
+    assert calls.get("stdout") is sys.stderr
