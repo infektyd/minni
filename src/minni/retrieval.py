@@ -1898,6 +1898,7 @@ class RetrievalEngine:
         layers: Optional[Sequence[str]],
         start_date: Optional[str],
         end_date: Optional[str],
+        exclude_statuses: Optional[Sequence[str]] = None,
     ) -> List[Dict]:
         safe_query = self._sanitize_fts_query(query)
         if not safe_query:
@@ -1917,6 +1918,19 @@ class RetrievalEngine:
         if end_ts is not None:
             clauses.append("COALESCE(d.indexed_at, d.last_modified, ce.computed_at, 0) <= ?")
             filter_params.append(end_ts)
+        # Same rule as _fts_search, for the same reason: the LIMIT below is a
+        # fixed window, and dropping a lifecycle state after it has been spent
+        # cannot recover the rows that never got fetched. This path needs it
+        # MORE than the others -- it orders by age ascending over a vault whose
+        # oldest pages are precisely the expired backlog, so an unfiltered
+        # window is drafts almost by construction.
+        skip = [str(s) for s in (exclude_statuses or [])]
+        if skip:
+            clauses.append(
+                "COALESCE(d.page_status, 'candidate') NOT IN "
+                f"({','.join('?' * len(skip))})"
+            )
+            filter_params.extend(skip)
 
         with self.db.cursor() as c:
             def _match(match_expr: str):
@@ -2407,7 +2421,10 @@ class RetrievalEngine:
 
         if sort == "chronological":
             chrono_t0 = time.perf_counter()
-            merged = self._chronological_search(query, rerank_k, layers, start_date, end_date)
+            merged = self._chronological_search(
+                query, rerank_k, layers, start_date, end_date,
+                exclude_statuses=skip_list,
+            )
             timing["semantic_ms"] = round((time.perf_counter() - chrono_t0) * 1000, 3)
             trace["backends"] = ["chronological-sql"]
             merged = merged[:limit]

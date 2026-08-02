@@ -1038,3 +1038,58 @@ def test_chronological_can_reach_unembedded_pages(tmp_path, monkeypatch):
         )
     finally:
         eng.db.close()
+
+
+# ── Round 7: finding from the sixth Grok review of #256 ────────────────────
+
+
+def test_drafts_cannot_crowd_the_chronological_window(tmp_path, monkeypatch):
+    """Grok round 6. The twin of test_drafts_cannot_crowd_the_fts_window, for
+    the sort this PR changed. Round 5 widened _chronological_search's join to a
+    LEFT JOIN so include_drafts=True could reach unembedded pages -- which also
+    let drafts into a window they previously could not enter at all, with the
+    lifecycle filter still running after the SQL LIMIT.
+
+    This path is the worst case for that bug: it orders by age ascending over a
+    vault whose oldest pages ARE the expired backlog, so an unfiltered window is
+    drafts almost by construction and the post-filter returns empty.
+    """
+    from minni.index_all import index_shared_vault
+
+    _install_fake_embedder(monkeypatch)
+    cfg = _make_cfg(tmp_path)
+    vault = Path(cfg.vault_path)
+
+    for i in range(60):
+        _write_page(vault / "wiki" / "concepts" / f"old{i}.md", "draft",
+                    "quantum widget calibration " * 12)
+    _write_page(vault / "wiki" / "concepts" / "the-answer.md", "accepted",
+                "quantum widget calibration procedure of record " * 12)
+    index_shared_vault(cfg)
+
+    # Make the drafts the OLDEST rows, so ascending order puts them first.
+    conn = sqlite3.connect(cfg.db_path)
+    try:
+        conn.execute(
+            "UPDATE documents SET indexed_at = 1000 WHERE page_status = 'draft'"
+        )
+        conn.execute(
+            "UPDATE documents SET indexed_at = 9999999999 WHERE page_status = 'accepted'"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    eng = _engine(cfg)
+    try:
+        eng.config.reranker_enabled = False
+        results = eng.retrieve(
+            "quantum widget calibration", limit=5, sort="chronological"
+        )
+        assert results, "chronological recall was empty: drafts filled the window"
+        assert any(r.get("filename", "").endswith("the-answer.md") for r in results), (
+            f"the accepted page was crowded out: {[r.get('filename') for r in results]}"
+        )
+        assert not any(r.get("review_state") in {"draft", "expired"} for r in results)
+    finally:
+        eng.db.close()
