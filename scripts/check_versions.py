@@ -245,45 +245,16 @@ def _version_agrees(deployed: str, canonical: str) -> bool:
 def _active_wire_plugin_state(home: Path) -> tuple[set[Path], set[str]]:
     """Live wire install roots + platforms under ~/.minni/plugin.
 
-    Latest ``wired_at`` *per platform* stays active. Platforms are returned so
-    marketplace-cache skip matches check_deployments (per-surface, not
-    host-global). ``current`` is fallback only when no valid wire records exist.
+    Shared with check_deployments + deploy honesty (``minni.wire.active_roots``):
+    latest ``wired_at`` per platform; root must be a dir with
+    ``payload-manifest.json``; marketplace-cache skip is per-surface.
     """
-    base = home / ".minni" / "plugin"
-    actives: set[Path] = set()
-    platforms: set[str] = set()
-    wired = base / "wired.json"
-    try:
-        data = json.loads(wired.read_text(encoding="utf-8"))
-        latest_by_platform: dict[str, tuple[str, Path]] = {}
-        for entry in data.get("wires", []) or []:
-            if not isinstance(entry, dict):
-                continue
-            root_str = entry.get("install_root")
-            if not root_str:
-                continue
-            root = Path(str(root_str))
-            if not root.is_dir():
-                continue
-            platform = str(entry.get("platform") or "_")
-            wired_at = str(entry.get("wired_at") or "")
-            prev = latest_by_platform.get(platform)
-            if prev is None or wired_at >= prev[0]:
-                latest_by_platform[platform] = (wired_at, root.resolve())
-        for platform, (_wired_at, root) in latest_by_platform.items():
-            actives.add(root)
-            platforms.add(platform)
-    except (OSError, json.JSONDecodeError, TypeError):
-        pass
-    if actives:
-        return actives, platforms
-    current = base / "current"
-    try:
-        if current.exists():
-            actives.add(current.resolve())
-    except OSError:
-        pass
-    return actives, platforms
+    _src = Path(__file__).resolve().parent.parent / "src"
+    if _src.is_dir() and str(_src) not in sys.path:
+        sys.path.insert(0, str(_src))
+    from minni.wire.active_roots import active_wire_plugin_state
+
+    return active_wire_plugin_state(home)
 
 
 def _active_wire_plugin_roots(home: Path) -> set[Path]:

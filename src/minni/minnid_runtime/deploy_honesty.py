@@ -114,63 +114,14 @@ def capture_start_state() -> dict:
 def _active_payload_roots() -> list[tuple[Path, str]]:
     """Active wire install roots (latest wired_at per platform).
 
-    Reading only the global-newest root greens a partial rewire: codex moves
-    to a fresh tree while claude-code still points at an older root, and the
-    newest root alone matches HEAD. Mirror check_deployments / check_versions:
-    every platform's latest record stays active.
-
-    ``current`` is fallback only when *no* valid wire records exist
-    (release-only / pre-wire). Local (+git.*) installs never move ``current``
-    (see wire/install.update_current_symlink); treating a leftover release
-    symlink as always-active permanently fails sync-root after --from-repo.
+    Shared with scripts/check_versions.py and scripts/check_deployments.py via
+    ``minni.wire.active_roots`` so a half-written install root cannot be
+    "active" for one surface and invisible for another. ``current`` is
+    fallback only when *no* valid wire records exist (release-only / pre-wire).
     """
-    base = Path("~/.minni/plugin").expanduser()
-    actives: list[tuple[Path, str]] = []
-    seen: set[Path] = set()
-    try:
-        data = json.loads((base / "wired.json").read_text(encoding="utf-8"))
-        latest_by_platform: dict[str, tuple[str, Path]] = {}
-        for entry in data.get("wires", []) or []:
-            if not isinstance(entry, dict):
-                continue
-            root_str = entry.get("install_root")
-            if not root_str:
-                continue
-            root = Path(str(root_str))
-            if not (root / "payload-manifest.json").is_file():
-                continue
-            platform = str(entry.get("platform") or "_")
-            wired_at = str(entry.get("wired_at") or "")
-            prev = latest_by_platform.get(platform)
-            if prev is None or wired_at >= prev[0]:
-                latest_by_platform[platform] = (wired_at, root.resolve())
-        for platform, (_wired_at, root) in sorted(latest_by_platform.items()):
-            if root not in seen:
-                actives.append((root, f"wired.json:{platform}"))
-                seen.add(root)
-    except (OSError, json.JSONDecodeError, TypeError):
-        pass
-    if actives:
-        return actives
-    # Fallback: release-only machines with no usable wired.json records.
-    current = base / "current"
-    if (current / "payload-manifest.json").is_file():
-        try:
-            resolved = current.resolve()
-        except OSError:
-            resolved = current
-        return [(resolved, "current")]
-    try:
-        candidates = [
-            d for d in base.iterdir()
-            if d.is_dir() and (d / "payload-manifest.json").is_file()
-        ]
-    except OSError:
-        candidates = []
-    if candidates:
-        newest = max(candidates, key=lambda d: d.stat().st_mtime)
-        return [(newest, "version-dir scan")]
-    return []
+    from minni.wire.active_roots import active_wire_plugin_roots_ordered
+
+    return active_wire_plugin_roots_ordered(Path.home())
 
 
 def _plugin_dist_status(checkout_head: Optional[str]) -> dict:

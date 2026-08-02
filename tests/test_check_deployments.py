@@ -488,6 +488,10 @@ def test_inactive_wire_version_dist_is_skipped_not_strict_failed(tmp_path):
         if src.is_dir():
             _copytree(src, fresh / sub)
     _artifact_dist(fresh)
+    (fresh / "payload-manifest.json").write_text(
+        json.dumps({"version": "0.4.1+git.abc1234", "git_sha": "a" * 40}),
+        encoding="utf-8",
+    )
     (plugin / "wired.json").write_text(
         json.dumps({
             "schema": 1,
@@ -520,6 +524,10 @@ def test_legacy_marketplace_cache_skipped_when_wire_active(tmp_path):
         if src.is_dir():
             _copytree(src, fresh / sub)
     _artifact_dist(fresh)
+    (fresh / "payload-manifest.json").write_text(
+        json.dumps({"version": "0.4.1+git.deadbeef", "git_sha": "a" * 40}),
+        encoding="utf-8",
+    )
     (plugin / "wired.json").write_text(
         json.dumps({
             "schema": 1,
@@ -610,6 +618,10 @@ def test_marketplace_cache_skip_is_per_platform(tmp_path):
         if src.is_dir():
             _copytree(src, fresh / sub)
     _artifact_dist(fresh)
+    (fresh / "payload-manifest.json").write_text(
+        json.dumps({"version": "0.4.1+git.deadbeef", "git_sha": "a" * 40}),
+        encoding="utf-8",
+    )
     (plugin / "wired.json").write_text(
         json.dumps({
             "schema": 1,

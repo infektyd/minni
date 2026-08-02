@@ -233,6 +233,9 @@ def test_inactive_wire_version_dir_is_skipped_not_failed(tmp_path):
     (fresh / ".claude-plugin" / "plugin.json").write_text(
         json.dumps({"name": "minni", "version": fresh_ver}), encoding="utf-8",
     )
+    (fresh / "payload-manifest.json").write_text(
+        json.dumps({"version": fresh_ver, "git_sha": "a" * 40}), encoding="utf-8",
+    )
     (plugin / "wired.json").write_text(
         json.dumps({
             "schema": 1,
@@ -270,6 +273,9 @@ def test_latest_per_platform_root_stays_active_even_if_older_than_peer(tmp_path)
     (old / ".claude-plugin" / "plugin.json").write_text(
         json.dumps({"name": "minni", "version": "0.3.0"}), encoding="utf-8",
     )
+    (old / "payload-manifest.json").write_text(
+        json.dumps({"version": "0.3.0", "git_sha": "b" * 40}), encoding="utf-8",
+    )
     fresh_ver = f"{canonical}+git.abc1234"
     fresh = plugin / fresh_ver
     fresh.mkdir(parents=True)
@@ -277,6 +283,9 @@ def test_latest_per_platform_root_stays_active_even_if_older_than_peer(tmp_path)
     (fresh / ".claude-plugin").mkdir()
     (fresh / ".claude-plugin" / "plugin.json").write_text(
         json.dumps({"name": "minni", "version": fresh_ver}), encoding="utf-8",
+    )
+    (fresh / "payload-manifest.json").write_text(
+        json.dumps({"version": fresh_ver, "git_sha": "a" * 40}), encoding="utf-8",
     )
     (plugin / "wired.json").write_text(
         json.dumps({
@@ -325,6 +334,9 @@ def test_legacy_marketplace_cache_skipped_when_wire_active(tmp_path):
     (fresh / ".claude-plugin" / "plugin.json").write_text(
         json.dumps({"name": "minni", "version": fresh_ver}), encoding="utf-8",
     )
+    (fresh / "payload-manifest.json").write_text(
+        json.dumps({"version": fresh_ver, "git_sha": "a" * 40}), encoding="utf-8",
+    )
     (plugin / "wired.json").write_text(
         json.dumps({
             "schema": 1,
@@ -372,6 +384,9 @@ def test_marketplace_cache_skip_is_per_platform(tmp_path):
     (fresh / ".claude-plugin").mkdir()
     (fresh / ".claude-plugin" / "plugin.json").write_text(
         json.dumps({"name": "minni", "version": fresh_ver}), encoding="utf-8",
+    )
+    (fresh / "payload-manifest.json").write_text(
+        json.dumps({"version": fresh_ver, "git_sha": "a" * 40}), encoding="utf-8",
     )
     (plugin / "wired.json").write_text(
         json.dumps({
