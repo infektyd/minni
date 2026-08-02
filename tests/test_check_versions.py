@@ -308,3 +308,53 @@ def test_zombie_wired_json_row_for_other_platform_is_not_active(tmp_path):
     assert proc.returncode == 0, out
     assert "skipped (not an active wire install" in proc.stdout
     assert "!= '0.4" not in out and "0.3.0" in proc.stdout  # skipped note mentions path
+
+
+def test_legacy_marketplace_cache_skipped_when_wire_active(tmp_path):
+    """Round-9 High: parity with check_deployments — leftover
+    ~/.claude|codex/plugins/cache trees must not fail check_versions after
+    wire-primary adoption (sync-root runs both checkers)."""
+    canonical = _canonical()
+    home = tmp_path / "home"
+    plugin = home / ".minni" / "plugin"
+    fresh_ver = f"{canonical}+git.abc1234"
+    fresh = plugin / fresh_ver
+    fresh.mkdir(parents=True)
+    (fresh / "dist").mkdir()
+    (fresh / ".claude-plugin").mkdir()
+    (fresh / ".claude-plugin" / "plugin.json").write_text(
+        json.dumps({"name": "minni", "version": fresh_ver}), encoding="utf-8",
+    )
+    (plugin / "wired.json").write_text(
+        json.dumps({
+            "schema": 1,
+            "wires": [{
+                "platform": "claude-code",
+                "install_root": str(fresh),
+                "version": fresh_ver,
+                "wired_at": "2026-08-02T00:00:00Z",
+            }],
+        }),
+        encoding="utf-8",
+    )
+    # Leftover marketplace cache at public 0.3.0 — would fail without skip.
+    cache = home / ".claude" / "plugins" / "cache" / "minni" / "minni" / "0.3.0"
+    cache.mkdir(parents=True)
+    (cache / "dist").mkdir()
+    (cache / ".claude-plugin").mkdir()
+    (cache / ".claude-plugin" / "plugin.json").write_text(
+        json.dumps({"name": "minni", "version": "0.3.0"}), encoding="utf-8",
+    )
+    proc = _run(
+        env_extra={
+            "MINNI_CHECK_VERSIONS_HOME": str(home),
+            "MINNI_CHECK_VERSIONS_INSTALLED_OVERRIDE": canonical,
+        }
+    )
+    out = proc.stdout + proc.stderr
+    assert proc.returncode == 0, out
+    assert "legacy marketplace cache" in proc.stdout
+    # Must not report 0.3.0 as a hard mismatch.
+    assert "!= " not in out or "0.3.0" not in [
+        line for line in out.splitlines() if "!=" in line
+    ]

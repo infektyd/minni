@@ -312,6 +312,22 @@ def _is_versioned_wire_plugin_root(root: Path, home: Path) -> bool:
     return len(rel.parts) == 1 and rel.parts[0] not in {"current", "cache"}
 
 
+def _is_legacy_marketplace_cache_root(root: Path, home: Path) -> bool:
+    """Claude/Codex marketplace cache trees superseded by wire-primary installs.
+
+    Parity with scripts/check_deployments._is_legacy_marketplace_cache_dist:
+    when wire is live, leftover cache trees must not fail sync-root verify.
+    """
+    try:
+        rel = str(root.resolve().relative_to(home.resolve()))
+    except (OSError, ValueError):
+        rel = str(root)
+    return (
+        rel.startswith(".claude/plugins/cache/")
+        or rel.startswith(".codex/plugins/cache/")
+    )
+
+
 def check_deployed(canonical: str) -> tuple[list[str], list[str]]:
     """(mismatches, notes). Every deployed plugin manifest under $HOME."""
     mismatches: list[str] = []
@@ -332,6 +348,13 @@ def check_deployed(canonical: str) -> tuple[list[str], list[str]]:
             notes.append(
                 f"deployed: {label} skipped (not an active wire install; "
                 "historical version dir left by non-interactive wire)"
+            )
+            continue
+        # Wire-superseded marketplace caches (same skip as check_deployments).
+        if active_wire and _is_legacy_marketplace_cache_root(root, home):
+            notes.append(
+                f"deployed: {label} skipped (legacy marketplace cache; "
+                "wire-primary — not managed by sync-root)"
             )
             continue
         versions: dict[str, list[str]] = {}
