@@ -655,3 +655,57 @@ def test_marketplace_cache_skip_is_per_platform(tmp_path):
     assert "legacy marketplace cache for codex" not in proc.stdout, proc.stdout
     assert "0.2.9" in proc.stdout
     assert "STALE" in proc.stdout or proc.returncode != 0, proc.stdout
+
+
+def test_plugin_current_skipped_when_wire_active(tmp_path):
+    """Release-era plugin/current must not fail --strict after wire-primary."""
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / ".claude.json").write_text("{}", encoding="utf-8")
+    plugin = home / ".minni" / "plugin"
+    fresh = plugin / "0.4.1+git.deadbeef"
+    fresh.mkdir(parents=True)
+    for sub in ("hooks", "commands", "skills", ".claude-plugin", ".codex-plugin",
+                ".cursor-plugin", ".kilocode-plugin", ".gemini-plugin"):
+        src = SOURCE / sub
+        if src.is_dir():
+            _copytree(src, fresh / sub)
+    _artifact_dist(fresh)
+    (fresh / "payload-manifest.json").write_text(
+        json.dumps({"git_sha": "unknown", "version": "0.4.1+git.deadbeef"}),
+        encoding="utf-8",
+    )
+    (plugin / "wired.json").write_text(
+        json.dumps({
+            "schema": 1,
+            "wires": [{
+                "platform": "claude-code",
+                "install_root": str(fresh),
+                "wired_at": "2026-08-02T00:00:00Z",
+            }],
+        }),
+        encoding="utf-8",
+    )
+    # Lagging release current symlink target.
+    old = plugin / "0.3.0"
+    old.mkdir()
+    for sub in ("hooks", "commands", "skills", ".claude-plugin", ".codex-plugin",
+                ".cursor-plugin", ".kilocode-plugin", ".gemini-plugin"):
+        src = SOURCE / sub
+        if src.is_dir():
+            _copytree(src, old / sub)
+    (old / "dist").mkdir()
+    (old / "dist" / "server.js").write_text("// old\n", encoding="utf-8")
+    (old / "dist" / "build-manifest.json").write_text(
+        json.dumps({"git_sha": "c" * 40, "built_at": "2026-01-01T00:00:00Z"}),
+        encoding="utf-8",
+    )
+    cur = plugin / "current"
+    cur.symlink_to(old, target_is_directory=True)
+
+    proc = _run("--strict", home=home, repo_root=_isolated_repo_root(tmp_path))
+    # current is skipped either as legacy plugin/current or (when symlink
+    # resolves into a historical version dir) as inactive wire install.
+    assert "plugin/current" in proc.stdout and "skipped" in proc.stdout, proc.stdout
+    assert "STALE" not in proc.stdout, proc.stdout
+    assert proc.returncode == 0, proc.stdout

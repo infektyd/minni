@@ -237,6 +237,21 @@ def _active_wire_plugin_roots(home: Path) -> set[Path]:
     return roots
 
 
+def _is_plugin_current_dist(dist: Path, home: Path) -> bool:
+    """True for ~/.minni/plugin/current/dist (unresolved path shape)."""
+    try:
+        logical = dist if not dist.is_absolute() else dist
+        plugin = home / ".minni" / "plugin"
+        # dist is .../plugin/current/dist — do not resolve current (symlink).
+        return (
+            logical.name == "dist"
+            and logical.parent.name == "current"
+            and logical.parent.parent.resolve() == plugin.resolve()
+        )
+    except (OSError, ValueError):
+        return False
+
+
 def _is_versioned_wire_plugin_dist(dist: Path, home: Path) -> bool:
     """True for ~/.minni/plugin/<version>/dist (not current/cache)."""
     try:
@@ -311,6 +326,15 @@ def discover_active() -> tuple[list[Path], list[str]]:
                     "historical version dir)"
                 )
                 continue
+        # Release-era ~/.minni/plugin/current is not moved by --from-repo local
+        # installs; once any wire-active root exists it is superseded (same
+        # class as historical version dirs / marketplace caches).
+        if active and _is_plugin_current_dist(dist, home):
+            notes.append(
+                f"{label}: skipped (legacy plugin/current; "
+                "wire-primary — not managed by sync-root)"
+            )
+            continue
         # Skip marketplace caches only for platforms that have an active wire
         # record. Host-global skip would silence a still-live Codex cache when
         # only claude-code is wire-active (mid-migration).

@@ -315,6 +315,18 @@ def check_deployed(canonical: str) -> tuple[list[str], list[str]]:
                 "historical version dir left by non-interactive wire)"
             )
             continue
+        # Release-era plugin/current is not moved by --from-repo; once any
+        # wire-active root exists, skip it (parity with check_deployments).
+        if active_wire and root.name == "current":
+            try:
+                if root.parent.resolve() == (home / ".minni" / "plugin").resolve():
+                    notes.append(
+                        f"deployed: {label} skipped (legacy plugin/current; "
+                        "wire-primary — not managed by sync-root)"
+                    )
+                    continue
+            except OSError:
+                pass
         # Per-platform marketplace skip (parity with check_deployments).
         cache_plat = _marketplace_cache_platform(root, home)
         if cache_plat is not None and cache_plat in active_platforms:

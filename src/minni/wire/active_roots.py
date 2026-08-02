@@ -91,18 +91,16 @@ def active_wire_plugin_roots_ordered(home: Path) -> list[tuple[Path, str]]:
         pass
     if actives:
         return actives
-    # Fallback: release-only machines with no usable wired.json records.
-    current = base / "current"
-    if current.exists() and (current / "payload-manifest.json").is_file():
-        try:
-            resolved = current.resolve()
-        except OSError:
-            resolved = current
-        return [(resolved, "current")]
+    # Fallback when no usable wired.json rows: prefer the newest *version*
+    # dir with a payload-manifest. Do not let a lagging release-era
+    # ``current`` symlink blind a fresher from-repo ``+git.*`` install that
+    # never moves current (local versions leave the symlink alone).
     try:
         candidates = [
             d for d in base.iterdir()
-            if d.is_dir() and (d / "payload-manifest.json").is_file()
+            if d.is_dir()
+            and d.name not in {"current", "cache"}
+            and (d / "payload-manifest.json").is_file()
         ]
     except OSError:
         candidates = []
@@ -113,4 +111,11 @@ def active_wire_plugin_roots_ordered(home: Path) -> list[tuple[Path, str]]:
         except OSError:
             resolved = newest
         return [(resolved, "version-dir scan")]
+    current = base / "current"
+    if current.exists() and (current / "payload-manifest.json").is_file():
+        try:
+            resolved = current.resolve()
+        except OSError:
+            resolved = current
+        return [(resolved, "current")]
     return []
