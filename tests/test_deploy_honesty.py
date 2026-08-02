@@ -40,27 +40,62 @@ def _reset_state(monkeypatch):
     monkeypatch.setattr(deploy_honesty, "_HEAD_CACHE", {})
 
 
-def test_matching_head_is_not_stale(checkout, monkeypatch):
+def _matching_plugin(home: Path, head: str) -> None:
+    """Install a wire payload whose manifest matches *head* (process+plugin green)."""
+    import json as _json
+
+    root = home / ".minni" / "plugin" / "0.4.1"
+    root.mkdir(parents=True)
+    (root / "payload-manifest.json").write_text(
+        _json.dumps({"git_sha": head, "version": "0.4.1"}), encoding="utf-8",
+    )
+    (home / ".minni" / "plugin" / "wired.json").write_text(
+        _json.dumps({
+            "schema": 1,
+            "wires": [{
+                "platform": "claude-code",
+                "install_root": str(root),
+                "wired_at": "2026-08-02T00:00:00Z",
+            }],
+        }),
+        encoding="utf-8",
+    )
+
+
+def test_matching_head_is_not_stale(checkout, monkeypatch, tmp_path):
+    home = tmp_path / "home"
+    head = _git(checkout, "rev-parse", "HEAD")
+    _matching_plugin(home, head)
+    monkeypatch.setenv("HOME", str(home))
     monkeypatch.setattr(deploy_honesty, "_source_checkout", lambda: checkout)
     deploy_honesty.capture_start_state()
     out = deploy_honesty.deploy_status()
     assert out["install_kind"] == "editable-checkout"
     assert out["stale"] is False
+    assert out["plugin_dist"]["stale"] is False
     assert out["started_git_sha"] == out["current_git_sha"]
 
 
-def test_moved_head_is_reported_stale(checkout, monkeypatch):
+def test_moved_head_is_reported_stale(checkout, monkeypatch, tmp_path):
+    home = tmp_path / "home"
+    head = _git(checkout, "rev-parse", "HEAD")
+    _matching_plugin(home, head)
+    monkeypatch.setenv("HOME", str(home))
     monkeypatch.setattr(deploy_honesty, "_source_checkout", lambda: checkout)
     deploy_honesty.capture_start_state()
     (checkout / "f.txt").write_text("two\n", encoding="utf-8")
     _git(checkout, "commit", "-aqm", "two")
     out = deploy_honesty.deploy_status()
     assert out["stale"] is True
-    assert "stale" in out["reason"]
+    assert "stale" in out["reason"] or "stale" in out.get("plugin_dist", {}).get("reason", "")
     assert out["started_git_sha"] != out["current_git_sha"]
 
 
-def test_dirty_start_is_named_not_guessed(checkout, monkeypatch):
+def test_dirty_start_is_named_not_guessed(checkout, monkeypatch, tmp_path):
+    home = tmp_path / "home"
+    head = _git(checkout, "rev-parse", "HEAD")
+    _matching_plugin(home, head)
+    monkeypatch.setenv("HOME", str(home))
     monkeypatch.setattr(deploy_honesty, "_source_checkout", lambda: checkout)
     (checkout / "f.txt").write_text("uncommitted\n", encoding="utf-8")
     deploy_honesty.capture_start_state()
@@ -192,6 +227,40 @@ def test_plugin_dist_prefers_wired_record_over_zombie_current(
     assert out["plugin_dist"]["resolved_via"] == "wired.json"
     assert out["plugin_dist"]["dist_version"] == local_ver
     assert out["plugin_dist"]["stale"] is False
+
+
+def test_top_level_stale_rolls_up_plugin_dist(checkout, monkeypatch, tmp_path):
+    """Round-5 Med: top-level deploy.stale must be true when plugin_dist is
+    stale even if the daemon process still matches start HEAD."""
+    import json as _json
+
+    home = tmp_path / "home"
+    head = _git(checkout, "rev-parse", "HEAD")
+    # Process matches HEAD (not process-stale) but plugin lags.
+    old_sha = "0" * 40
+    root = home / ".minni" / "plugin" / "0.4.0"
+    root.mkdir(parents=True)
+    (root / "payload-manifest.json").write_text(
+        _json.dumps({"git_sha": old_sha, "version": "0.4.0"}), encoding="utf-8",
+    )
+    (home / ".minni" / "plugin" / "wired.json").write_text(
+        _json.dumps({
+            "schema": 1,
+            "wires": [{
+                "platform": "claude-code",
+                "install_root": str(root),
+                "wired_at": "2026-08-02T00:00:00Z",
+            }],
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(deploy_honesty, "_source_checkout", lambda: checkout)
+    deploy_honesty.capture_start_state()
+    out = deploy_honesty.deploy_status()
+    assert out["plugin_dist"]["stale"] is True
+    assert out["stale"] is True, out
+    assert "plugin" in (out.get("reason") or "").lower() or "dist" in (out.get("reason") or "").lower()
 
 
 def test_deploy_status_never_raises(monkeypatch):

@@ -12,10 +12,14 @@
 #   2. Refresh locked dependencies (requirements.lock) and the editable
 #      pip install.
 #   3. Rebuild the plugin (npm run build).
-#   4. Redeploy the platform surfaces: `minni wire claude-code --from-repo`
-#      plus `propagate.py update-plugin --platform all`.
+#   4. Redeploy with the D7 fleet partition: `minni wire all --from-repo`
+#      (codex/claude-code/kilocode/grok), then `propagate update-plugin` for
+#      antigravity + cursor only, plus grok hooks/rules against the active
+#      wire install root — never `propagate --platform all` (that rewrites
+#      wire-managed MCP paths back onto legacy cache trees).
 #   5. Restart the minni daemon (launchd kickstart when the agent is loaded).
-#   6. Verify: check_versions.py + check_deployments.py --strict.
+#   6. Verify: check_versions.py + check_deployments.py --strict
+#      (also evaluated read-only under --dry-run).
 #
 # Idempotent: a second run on an already-synced checkout does no harm and says
 # so. Every step is announced; --dry-run prints the plan without executing.
@@ -59,13 +63,34 @@ refuse() { printf 'update-root: REFUSING: %s\n' "$*" >&2; exit 1; }
 
 # Mutual exclusion: concurrent syncs interleave pip/npm/wire/kickstart.
 # mkdir is atomic and portable (macOS has no util-linux flock by default).
+# Stale recovery: if the lock holds a PID that is no longer alive (SIGKILL /
+# OOM / sleep-kill skipped the EXIT trap), reclaim so unattended sync cannot
+# brick itself forever.
 LOCKDIR="${MINNI_SYNC_LOCKDIR:-$HOME/.minni/run/sync-root.lockdir}"
 mkdir -p "$(dirname "$LOCKDIR")"
-if ! mkdir "$LOCKDIR" 2>/dev/null; then
-  refuse "another sync-root is already running (lock $LOCKDIR)"
+_claim_lock() {
+  if mkdir "$LOCKDIR" 2>/dev/null; then
+    printf '%s\n' "$$" >"$LOCKDIR/pid"
+    return 0
+  fi
+  return 1
+}
+if ! _claim_lock; then
+  old_pid=""
+  if [ -f "$LOCKDIR/pid" ]; then
+    old_pid="$(cat "$LOCKDIR/pid" 2>/dev/null || true)"
+  fi
+  if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
+    refuse "another sync-root is already running (pid $old_pid, lock $LOCKDIR)"
+  fi
+  echo "update-root: reclaiming stale sync lock${old_pid:+ (dead pid $old_pid)} at $LOCKDIR" >&2
+  rm -rf "$LOCKDIR"
+  if ! _claim_lock; then
+    refuse "another sync-root is already running (lock $LOCKDIR)"
+  fi
 fi
 # shellcheck disable=SC2064
-trap 'rmdir "$LOCKDIR" 2>/dev/null || true' EXIT INT TERM
+trap 'rm -rf "$LOCKDIR" 2>/dev/null || true' EXIT INT TERM
 
 VENV_PY="$REPO/.venv/bin/python"
 [ -x "$VENV_PY" ] || VENV_PY="python3"
@@ -114,10 +139,60 @@ say "step 3/6: rebuild plugin"
 act npm --prefix plugins/minni run build
 
 # ── 4. redeploy platform surfaces ────────────────────────────────────────────
-say "step 4/6: redeploy platform surfaces"
-act "$VENV_PY" -m minni.minni_cli wire claude-code --from-repo "$REPO"
+# Fleet partition (D7): wire owns codex/claude-code/kilocode/grok (points MCP
+# at ~/.minni/plugin/<ver>). propagate owns antigravity + cursor. Never run
+# `propagate --platform all` after a partial wire — that rewrites codex/kilo/
+# grok back onto legacy cache trees and undoes wire adoption every sync.
+say "step 4/6: redeploy platform surfaces (wire all + propagate antigravity/cursor)"
+act "$VENV_PY" -m minni.minni_cli wire all --from-repo "$REPO"
 act "$VENV_PY" plugins/minni/skills/minni-install/scripts/propagate.py \
-  --repo "$REPO" update-plugin --platform all --no-build
+  --repo "$REPO" update-plugin --platform antigravity --no-build
+act "$VENV_PY" plugins/minni/skills/minni-install/scripts/propagate.py \
+  --repo "$REPO" update-plugin --platform cursor --no-build
+# Grok hooks/rules are propagate-only (wire does not install them) but a full
+# `propagate --platform grok` would re-stamp MCP onto the legacy agents tree.
+# Refresh hooks/rules against the active wire install root only.
+if [ "$DRY_RUN" = 1 ]; then
+  printf 'would run: refresh grok hooks/rules from active wire install root\n'
+else
+  printf 'running:   refresh grok hooks/rules from active wire install root\n'
+  "$VENV_PY" - "$REPO" <<'PY' || echo "update-root: grok hooks refresh skipped/failed (non-fatal)" >&2
+import json, sys
+from pathlib import Path
+repo = Path(sys.argv[1])
+prop = repo / "plugins/minni/skills/minni-install/scripts/propagate.py"
+# Load propagate as a standalone module (ships in the payload; no package import).
+import importlib.util
+spec = importlib.util.spec_from_file_location("minni_propagate", prop)
+mod = importlib.util.module_from_spec(spec)
+assert spec.loader is not None
+spec.loader.exec_module(mod)
+home = Path.home()
+base = home / ".minni" / "plugin"
+root = None
+wired = base / "wired.json"
+try:
+    data = json.loads(wired.read_text(encoding="utf-8"))
+    entries = [
+        (str(w.get("wired_at") or ""), Path(str(w.get("install_root"))))
+        for w in data.get("wires", [])
+        if isinstance(w, dict) and w.get("install_root")
+    ]
+    entries = [(t, p) for t, p in entries if p.is_dir()]
+    if entries:
+        root = max(entries, key=lambda t: t[0])[1]
+except Exception:
+    root = None
+if root is None:
+    current = base / "current"
+    root = current.resolve() if current.exists() else None
+if root is None:
+    print("no wire install root for grok hooks", file=sys.stderr)
+    sys.exit(1)
+print("grok hooks:", mod.update_grok_hooks(root))
+print("grok rules:", mod.write_grok_rules())
+PY
+fi
 
 # ── 5. restart the daemon ────────────────────────────────────────────────────
 say "step 5/6: restart minnid"
@@ -152,13 +227,22 @@ fi
 # ── 6. verify ────────────────────────────────────────────────────────────────
 say "step 6/6: verify versions + deployments"
 VERIFY_EXIT=0
-if [ "$DRY_RUN" = 1 ]; then
-  act "$VENV_PY" scripts/check_versions.py
-  act "$VENV_PY" scripts/check_deployments.py --strict
+if [ ! -f "$REPO/scripts/check_versions.py" ] || [ ! -f "$REPO/scripts/check_deployments.py" ]; then
+  # Throwaway test clones (and any non-minni tree) lack these scripts.
+  if [ "$DRY_RUN" = 1 ]; then
+    echo "would run: check_versions + check_deployments --strict (scripts not present in this checkout — skipped)"
+  else
+    refuse "checkout is missing scripts/check_versions.py or check_deployments.py — is REPO a Minni tree?"
+  fi
 else
+  # Checkers are read-only; dry-run still runs them so WORKTREE/BADCONFIG is
+  # visible in the plan instead of only failing on the live run.
+  mode_label=$([ "$DRY_RUN" = 1 ] && echo "running (read-only):" || echo "running:  ")
+  printf '%s %s scripts/check_versions.py\n' "$mode_label" "$VENV_PY"
   if ! "$VENV_PY" scripts/check_versions.py; then
     VERIFY_EXIT=1
   fi
+  printf '%s %s scripts/check_deployments.py --strict\n' "$mode_label" "$VENV_PY"
   if ! "$VENV_PY" scripts/check_deployments.py --strict; then
     VERIFY_EXIT=1
   fi
@@ -222,11 +306,11 @@ fi
 # verify all succeeded. Dry-run exits non-zero when the plan would fail (e.g.
 # launchd agent not loaded).
 if [ "$DRY_RUN" = 1 ]; then
-  if [ "$DAEMON_MISSING" = 1 ]; then
-    echo "dry-run plan would FAIL (daemon not restarted)" >&2
+  if [ "$DAEMON_MISSING" = 1 ] || [ "$VERIFY_EXIT" != 0 ]; then
+    echo "dry-run plan would FAIL (daemon missing=$DAEMON_MISSING verify_exit=$VERIFY_EXIT)" >&2
     exit 1
   fi
-  say "dry-run plan complete (no changes applied)"
+  say "dry-run plan complete (no changes applied; verify gates evaluated read-only)"
   exit 0
 fi
 

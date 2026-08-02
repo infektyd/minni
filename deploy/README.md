@@ -23,8 +23,12 @@ Runs `scripts/update_root.sh`, which loudly and idempotently:
    `origin/main` lacks — it never discards or rewrites local state.
 2. Refreshes the editable pip install.
 3. Rebuilds the plugin (`npm run build`).
-4. Redeploys the platform surfaces: `minni wire claude-code --from-repo` plus
-   `propagate.py update-plugin --platform all`.
+4. Redeploys the platform surfaces with the D7 fleet partition:
+   `minni wire all --from-repo` (codex, claude-code, kilocode, grok), then
+   `propagate.py update-plugin` for **antigravity** and **cursor** only, plus
+   a grok hooks/rules refresh against the active wire install root. It does
+   **not** run `propagate --platform all` (that would rewrite wire-managed
+   MCP paths back onto legacy cache trees).
 5. Restarts `minnid` via `launchctl kickstart` when the
    `com.minni.minnid` agent is loaded. If the agent is **not** loaded, the
    script still runs step 6 (so you see WORKTREE/BADCONFIG from this run) and

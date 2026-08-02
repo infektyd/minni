@@ -205,6 +205,26 @@ def deploy_status() -> dict:
             else:
                 out["stale"] = False
         out["plugin_dist"] = _plugin_dist_status(checkout_head)
+        # Roll up process + plugin honesty: callers that only read top-level
+        # `deploy.stale` must see plugin lag too (README: "process or plugin
+        # dist is stale"). Nested plugin_dist remains for detail.
+        proc_stale = out.get("stale")
+        plugin_stale = out["plugin_dist"].get("stale")
+        if proc_stale is True or plugin_stale is True:
+            out["stale"] = True
+            if proc_stale is not True and plugin_stale is True:
+                out["reason"] = (
+                    "deployed plugin dist lags checkout HEAD — re-run "
+                    "`minni wire` / `make sync-root` "
+                    f"({out['plugin_dist'].get('reason', 'plugin_dist stale')})"
+                )
+        elif proc_stale is False and plugin_stale is False:
+            out["stale"] = False
+        else:
+            # Neither side is known-true; any unmeasurable side keeps null.
+            out["stale"] = None
+            if "reason" not in out:
+                out["reason"] = "process and/or plugin dist staleness unmeasurable"
         return out
     except Exception as exc:  # status must never break on this block
         return {"stale": None, "error": f"{type(exc).__name__}: {exc}"}

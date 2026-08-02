@@ -87,6 +87,18 @@ def _run(
     if lockdir is None:
         lockdir = repo.parent / f"sync-lock-{repo.name}"
     env["MINNI_SYNC_LOCKDIR"] = str(lockdir)
+    # Dry-run now evaluates verify gates read-only; point them at an empty
+    # home so host drift cannot fail the plan tests.
+    empty_home = repo.parent / f"check-home-{repo.name}"
+    empty_home.mkdir(exist_ok=True)
+    env["MINNI_CHECK_VERSIONS_HOME"] = str(empty_home)
+    env["MINNI_CHECK_DEPLOYMENTS_HOME"] = str(empty_home)
+    # Hold installed layer at a known value (matches pyproject or any override).
+    import re
+    pyproject = (REPO / "pyproject.toml").read_text(encoding="utf-8")
+    can = re.search(r'^version\s*=\s*["\']([^"\']+)["\']', pyproject, re.M)
+    if can:
+        env["MINNI_CHECK_VERSIONS_INSTALLED_OVERRIDE"] = can.group(1)
     return subprocess.run(
         ["bash", str(SCRIPT), "--repo", str(repo), *args],
         capture_output=True, text=True, env=env,
@@ -159,6 +171,12 @@ def test_dry_run_fast_forwards_nothing(cloned, tmp_path):
     assert _git(clone, "rev-parse", "HEAD") == before, "dry run must not move HEAD"
     remote_ref = _git(clone, "rev-parse", "origin/main")
     assert remote_ref != before, "fetch must have updated the remote-tracking ref"
+    # Round-5 High: redeploy plan must wire the fleet, not claude-only +
+    # propagate --platform all (which undoes wire-primary MCP paths).
+    assert "wire all" in proc.stdout
+    assert "update-plugin --platform antigravity" in proc.stdout
+    assert "update-plugin --platform cursor" in proc.stdout
+    assert "update-plugin --platform all" not in proc.stdout
 
 
 def test_dry_run_exits_nonzero_when_daemon_would_not_restart(cloned, tmp_path):
@@ -177,10 +195,24 @@ def test_refuses_when_another_sync_holds_the_lock(cloned, tmp_path):
     _origin, clone = cloned
     lockdir = tmp_path / "held-lock"
     lockdir.mkdir()
+    (lockdir / "pid").write_text(str(os.getpid()), encoding="utf-8")
     proc = _run(clone, "--dry-run", lockdir=lockdir,
                 path_prefix=_fake_launchctl(tmp_path, loaded=True))
     assert proc.returncode == 1, proc.stdout + proc.stderr
     assert "already running" in (proc.stdout + proc.stderr)
+
+
+def test_reclaims_stale_lock_from_dead_pid(cloned, tmp_path):
+    """Round-5 Med: a SIGKILL'd run must not freeze all future syncs."""
+    _origin, clone = cloned
+    lockdir = tmp_path / "stale-lock"
+    lockdir.mkdir()
+    (lockdir / "pid").write_text("999999999", encoding="utf-8")  # not a live pid
+    proc = _run(clone, "--dry-run", lockdir=lockdir,
+                path_prefix=_fake_launchctl(tmp_path, loaded=True))
+    # Gets past the lock gate (may still fail later for other dry-run reasons).
+    assert "already running" not in (proc.stdout + proc.stderr)
+    assert "reclaiming stale sync lock" in (proc.stdout + proc.stderr)
 
 
 def test_refuses_non_git_directory(tmp_path):
