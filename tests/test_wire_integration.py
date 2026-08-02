@@ -514,6 +514,14 @@ def test_wire_antigravity_hook_registration_failure_is_failed(
     result = out["results"][0]
     assert result["status"] == "failed"
     assert "agy hook registration failed" in result["reason"]
+    # D11 half-state: MCP already rewritten — install root must still be
+    # recorded so GC / honesty protect the live payload.
+    from minni.wire.wired import wired_record
+
+    rec = wired_record("antigravity")
+    assert rec is not None
+    assert "install_root" in rec
+    assert "GC protection" in result["reason"] or "already updated" in result["reason"]
 
 
 def test_wire_antigravity_absent_agy_names_hook_gap(wire_env, monkeypatch, capsys):

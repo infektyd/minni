@@ -243,6 +243,7 @@ def test_accepts_worktree_git_file(cloned, tmp_path):
     # Detached HEAD is not main — refusal after the git gate is expected.
     assert "REFUSING" in proc.stderr or "not main" in combined
 
+
 def test_grok_hooks_root_selection_prefers_platform_grok():
     """Partial wire all can leave codex on a newer root than grok; hooks must
     stamp the *grok* install root, not global max wired_at."""
@@ -250,7 +251,7 @@ def test_grok_hooks_root_selection_prefers_platform_grok():
 
     text = SCRIPT.read_text(encoding="utf-8")
     assert 'str(w.get("platform") or "") == "grok"' in text
-    assert "global max" in text or "Prefer the latest *grok*" in text
+    assert "Prefer the latest *grok*" in text
 
     # Mirror the selection logic used by the embedded Python block.
     wires = [
@@ -279,5 +280,6 @@ def test_grok_hooks_root_selection_prefers_platform_grok():
 def test_deploy_probe_hard_fails_null_stale_for_editable():
     """Post-kickstart probe: stale=null is soft only for wheel installs."""
     text = SCRIPT.read_text(encoding="utf-8")
-    assert 'install_kind") == "wheel"' in text or "install_kind\" == \"wheel\"" in text
+    assert 'install_kind") == "wheel"' in text
     assert "expected boolean for editable checkout" in text
+    assert "sys.exit(3)" in text

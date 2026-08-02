@@ -145,11 +145,13 @@ def _mirror_codex_hook_env(env: dict, agent: str) -> None:
     """
     if agent != "codex":
         return
-    env.setdefault("MINNI_CODEX_AGENT_ID", env.get("MINNI_AGENT_ID", "codex"))
+    # Always re-derive from the resolved generic identity so a stale
+    # MINNI_CODEX_* cannot split hooks from MCP (never raw-preserve CODEX_*).
+    env["MINNI_CODEX_AGENT_ID"] = env.get("MINNI_AGENT_ID", "codex")
     if "MINNI_VAULT_PATH" in env:
-        env.setdefault("MINNI_CODEX_VAULT_PATH", env["MINNI_VAULT_PATH"])
+        env["MINNI_CODEX_VAULT_PATH"] = env["MINNI_VAULT_PATH"]
     if "MINNI_WORKSPACE_ID" in env:
-        env.setdefault("MINNI_CODEX_WORKSPACE_ID", env["MINNI_WORKSPACE_ID"])
+        env["MINNI_CODEX_WORKSPACE_ID"] = env["MINNI_WORKSPACE_ID"]
 
 
 def mcp_json(
@@ -183,12 +185,11 @@ def mcp_json(
             pass
     if ex_env:
         ex_env = _validate_preserved_identity(ex_env, agent)
+        # Never carry raw MINNI_CODEX_* from the surface — re-derive after
+        # generic identity resolves (parity with propagate X2).
         for key in (
             "MINNI_AGENT_ID", "MINNI_VAULT_PATH", "MINNI_SOCKET_PATH",
             "MINNI_AFM_PROVIDER_MODE", "MINNI_AFM_NATIVE_HELPER",
-            # Preserve previously stamped codex hook mirrors when still present.
-            "MINNI_CODEX_AGENT_ID", "MINNI_CODEX_VAULT_PATH",
-            "MINNI_CODEX_WORKSPACE_ID",
         ):
             if key in ex_env:
                 env[key] = ex_env[key]
@@ -537,39 +538,27 @@ def replace_toml_sections(
             expected_agent = fresh_env.get("MINNI_AGENT_ID")
             if expected_agent:
                 ex_env = _validate_preserved_identity(ex_env, expected_agent)
-            preserved_lines = []
+            # Resolve generic identity only — never carry raw MINNI_CODEX_*
+            # from the surface (X2). Re-derive mirrors from the resolved
+            # identity when the fresh section is for codex.
+            resolved_env: dict = {}
             for key in (
                 "MINNI_AGENT_ID", "MINNI_VAULT_PATH", "MINNI_SOCKET_PATH",
-                "MINNI_WORKSPACE_ID", "MINNI_AFM_PROVIDER_MODE", "MINNI_AFM_NATIVE_HELPER",
-                "MINNI_CODEX_AGENT_ID", "MINNI_CODEX_VAULT_PATH",
-                "MINNI_CODEX_WORKSPACE_ID",
+                "MINNI_WORKSPACE_ID", "MINNI_AFM_PROVIDER_MODE",
+                "MINNI_AFM_NATIVE_HELPER",
             ):
                 if key in ex_env:
-                    val = ex_env[key]
+                    resolved_env[key] = ex_env[key]
                 elif key in fresh_env:
-                    val = fresh_env[key]
-                else:
-                    continue
-                preserved_lines.append(f'{key} = "{_toml_basic_str(val)}"')
-            if preserved_lines:
-                # If agent is codex and CODEX mirrors were missing from both
-                # existing and fresh, stamp them from the resolved MINNI_*.
-                resolved: dict = {}
-                for key in (
-                    "MINNI_AGENT_ID", "MINNI_VAULT_PATH", "MINNI_SOCKET_PATH",
-                    "MINNI_WORKSPACE_ID", "MINNI_AFM_PROVIDER_MODE",
-                    "MINNI_AFM_NATIVE_HELPER", "MINNI_CODEX_AGENT_ID",
-                    "MINNI_CODEX_VAULT_PATH", "MINNI_CODEX_WORKSPACE_ID",
-                ):
-                    if key in ex_env:
-                        resolved[key] = ex_env[key]
-                    elif key in fresh_env:
-                        resolved[key] = fresh_env[key]
-                if str(resolved.get("MINNI_AGENT_ID") or "") == "codex":
-                    _mirror_codex_hook_env(resolved, "codex")
-                    preserved_lines = [
-                        f'{k} = "{_toml_basic_str(v)}"' for k, v in resolved.items()
-                    ]
+                    resolved_env[key] = fresh_env[key]
+            if any(k.startswith("MINNI_CODEX_") for k in fresh_env) or (
+                str(resolved_env.get("MINNI_AGENT_ID") or "") == "codex"
+            ):
+                _mirror_codex_hook_env(resolved_env, "codex")
+            if resolved_env:
+                preserved_lines = [
+                    f'{k} = "{_toml_basic_str(v)}"' for k, v in resolved_env.items()
+                ]
                 sections["mcp_servers.minni.env"] = (
                     "[mcp_servers.minni.env]\n" + "\n".join(preserved_lines)
                 )

@@ -80,9 +80,12 @@ def test_wire_all_skips_antigravity_does_not_recommend_propagate_platform_all():
     assert "rewrites" not in reason.lower()
     assert "legacy cache" not in reason.lower()
 
+
 def test_default_config_scan_includes_gemini_surfaces():
     """D11 half-state: gemini/antigravity MCP views must be GC-scanned."""
     paths = wire_platform.default_config_scan_paths()
     joined = " ".join(str(p) for p in paths.values())
     assert "mcp_config.json" in joined
     assert any("gemini" in str(p) for p in paths.values())
+    assert "gemini-mcp" in paths
+    assert "antigravity-mcp" in paths
