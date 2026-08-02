@@ -114,24 +114,36 @@ say "step 5/6: restart minnid"
 LABEL="com.minni.minnid"
 SOCKET="${MINNI_SOCKET:-$HOME/.minni/run/minnid.sock}"
 DAEMON_RESTARTED=0
+DAEMON_MISSING=0
 if launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; then
   act launchctl kickstart -k "gui/$(id -u)/$LABEL"
   DAEMON_RESTARTED=1
 else
-  # Do not claim "sync complete" when the live process was not bounced —
-  # checkout/plugin trees may be current while minnid still runs pre-sync code
-  # (the GA1-3 failure mode this path exists to close).
+  # Still run step 6 (versions + D14 deployment gates) so the operator sees
+  # WORKTREE/BADCONFIG from this run. Do NOT claim "sync complete" later —
+  # checkout/plugin trees may be current while minnid still runs pre-sync code.
+  DAEMON_MISSING=1
   if [ "$DRY_RUN" = 1 ]; then
     echo "would fail: launchd agent $LABEL is not loaded — daemon would not be restarted"
   else
-    refuse "launchd agent $LABEL is not loaded — daemon was not restarted; start/restart minnid yourself (or load the launchd agent) and re-run"
+    echo "update-root: launchd agent $LABEL is not loaded — restart minnid however you run it; continuing to verify (will not report sync complete)" >&2
   fi
 fi
 
 # ── 6. verify ────────────────────────────────────────────────────────────────
 say "step 6/6: verify versions + deployments"
-act "$VENV_PY" scripts/check_versions.py
-act "$VENV_PY" scripts/check_deployments.py --strict
+VERIFY_EXIT=0
+if [ "$DRY_RUN" = 1 ]; then
+  act "$VENV_PY" scripts/check_versions.py
+  act "$VENV_PY" scripts/check_deployments.py --strict
+else
+  if ! "$VENV_PY" scripts/check_versions.py; then
+    VERIFY_EXIT=1
+  fi
+  if ! "$VENV_PY" scripts/check_deployments.py --strict; then
+    VERIFY_EXIT=1
+  fi
+fi
 
 # After a real restart, require the socket to answer and report deploy.stale
 # is not True. Skip under dry-run (kickstart was not executed).
@@ -173,8 +185,29 @@ print(f"update-root: daemon socket unreachable after restart ({sock_path}): {las
 sys.exit(1)
 PY
   then
-    refuse "daemon did not come back clean after launchd kickstart (socket $SOCKET)"
+    VERIFY_EXIT=1
+    echo "update-root: daemon did not come back clean after launchd kickstart (socket $SOCKET)" >&2
   fi
+fi
+
+# Final status: never print "sync complete" unless redeploy + daemon restart +
+# verify all succeeded. Dry-run exits non-zero when the plan would fail (e.g.
+# launchd agent not loaded).
+if [ "$DRY_RUN" = 1 ]; then
+  if [ "$DAEMON_MISSING" = 1 ]; then
+    echo "dry-run plan would FAIL (daemon not restarted)" >&2
+    exit 1
+  fi
+  say "dry-run plan complete (no changes applied)"
+  exit 0
+fi
+
+if [ "$VERIFY_EXIT" != 0 ]; then
+  refuse "verification failed after redeploy"
+fi
+
+if [ "$DAEMON_MISSING" = 1 ]; then
+  refuse "redeployed and verified, but daemon was not restarted (launchd agent $LABEL not loaded) — bounce minnid yourself"
 fi
 
 say "sync complete at $(git rev-parse --short HEAD)"

@@ -44,8 +44,18 @@
 
     <key>EnvironmentVariables</key>
     <dict>
+        <!--
+          Unattended sync needs git + npm + (optionally) a credential agent.
+          __REPO__/.venv/bin is prepended so `python`/`pip` resolve to the
+          checkout venv if a step ever shells out without an absolute path;
+          update_root.sh already prefers $REPO/.venv/bin/python explicitly.
+          Homebrew prefixes cover the usual macOS Node/git installs. If you
+          use nvm/fnm/asdf for Node, append that bin dir here after install.
+          For private git remotes, also set SSH_AUTH_SOCK (or a credential
+          helper) — launchd does not inherit your interactive shell's agent.
+        -->
         <key>PATH</key>
-        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <string>__REPO__/.venv/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
     </dict>
 </dict>
 </plist>

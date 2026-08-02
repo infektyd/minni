@@ -26,11 +26,14 @@ Runs `scripts/update_root.sh`, which loudly and idempotently:
 4. Redeploys the platform surfaces: `minni wire claude-code --from-repo` plus
    `propagate.py update-plugin --platform all`.
 5. Restarts `minnid` via `launchctl kickstart` when the
-   `com.minni.minnid` agent is loaded (otherwise it tells you to restart
-   however you run it).
+   `com.minni.minnid` agent is loaded. If the agent is **not** loaded, the
+   script still runs step 6 (so you see WORKTREE/BADCONFIG from this run) and
+   then exits non-zero with “redeployed … but daemon was not restarted” —
+   it never prints `sync complete` without a bounced daemon.
 6. Verifies with `scripts/check_versions.py` and
    `scripts/check_deployments.py --strict`, so the run fails loudly if the
-   fleet still disagrees afterward.
+   fleet still disagrees afterward. After a successful kickstart it also
+   probes the daemon socket for `deploy.stale`.
 
 The daemon's `status` response carries a `deploy` block
 (`src/minni/minnid_runtime/deploy_honesty.py`) that reports when the running
@@ -66,3 +69,22 @@ rm "$HOME/Library/LaunchAgents/com.minni.sync-root.plist"
 
 Logs land in `$HOME/.minni/logs/sync-root.log` / `sync-root.err.log`. A run
 that refused (dirty/diverged checkout) exits 1 and says why in the err log.
+
+### Scheduled environment (PATH / SSH / Node)
+
+launchd does **not** inherit your interactive shell. The template sets:
+
+```
+PATH=__REPO__/.venv/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin
+```
+
+That is enough when `git` and `npm` come from Homebrew (or `/usr/bin`). If
+Node lives under nvm/fnm/asdf, append that bin directory to the template’s
+`PATH` before loading. For private `origin` remotes, either:
+
+- use a credential helper that does not need an interactive SSH agent, or
+- add an `SSH_AUTH_SOCK` (or equivalent) `EnvironmentVariables` entry that
+  points at a long-lived agent socket the scheduled job can read.
+
+Without those, unattended runs fail at `git fetch` or `npm run build` and
+spam the err log every interval.

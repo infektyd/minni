@@ -51,10 +51,36 @@ def cloned(tmp_path):
     return origin, clone
 
 
-def _run(repo: Path, *args: str) -> subprocess.CompletedProcess:
+def _fake_launchctl(tmp_path: Path, *, loaded: bool) -> Path:
+    """Stub launchctl so dry-run / daemon tests are host-independent."""
+    bindir = tmp_path / ("launchctl-loaded" if loaded else "launchctl-missing")
+    bindir.mkdir(exist_ok=True)
+    path = bindir / "launchctl"
+    if loaded:
+        path.write_text(
+            "#!/bin/sh\n"
+            "# print: pretend agent is loaded; kickstart: no-op success\n"
+            "exit 0\n",
+            encoding="utf-8",
+        )
+    else:
+        path.write_text(
+            "#!/bin/sh\n"
+            "if [ \"$1\" = print ]; then exit 1; fi\n"
+            "exit 1\n",
+            encoding="utf-8",
+        )
+    path.chmod(0o755)
+    return bindir
+
+
+def _run(repo: Path, *args: str, path_prefix: Path | None = None) -> subprocess.CompletedProcess:
+    env = dict(_ENV)
+    if path_prefix is not None:
+        env["PATH"] = f"{path_prefix}{os.pathsep}{env.get('PATH', '')}"
     return subprocess.run(
         ["bash", str(SCRIPT), "--repo", str(repo), *args],
-        capture_output=True, text=True, env=_ENV,
+        capture_output=True, text=True, env=env,
     )
 
 
@@ -101,7 +127,7 @@ def test_refuses_non_main_branch(cloned):
     assert "feature" in proc.stderr
 
 
-def test_dry_run_fast_forwards_nothing(cloned):
+def test_dry_run_fast_forwards_nothing(cloned, tmp_path):
     origin, clone = cloned
     other = origin.parent / "other2"
     subprocess.check_call(["git", "clone", "-q", str(origin), str(other)], env=_ENV)
@@ -112,7 +138,9 @@ def test_dry_run_fast_forwards_nothing(cloned):
     _git(other, "push", "-q", "origin", "main")
     before = _git(clone, "rev-parse", "HEAD")
 
-    proc = _run(clone, "--dry-run")
+    # Host-independent: pretend launchd agent is loaded so a clean dry-run
+    # plan exits 0 (would kickstart, not "would fail").
+    proc = _run(clone, "--dry-run", path_prefix=_fake_launchctl(tmp_path, loaded=True))
     assert proc.returncode == 0, proc.stdout + proc.stderr
     # Round-1 finding: fetch must run even in dry-run (it never touches the
     # local branch/worktree) so the plan for a BEHIND clone truthfully shows
@@ -122,6 +150,17 @@ def test_dry_run_fast_forwards_nothing(cloned):
     assert _git(clone, "rev-parse", "HEAD") == before, "dry run must not move HEAD"
     remote_ref = _git(clone, "rev-parse", "origin/main")
     assert remote_ref != before, "fetch must have updated the remote-tracking ref"
+
+
+def test_dry_run_exits_nonzero_when_daemon_would_not_restart(cloned, tmp_path):
+    """Round-3 Med: dry-run must not exit 0 when the plan would refuse at
+    daemon restart (launchd agent not loaded)."""
+    _origin, clone = cloned
+    proc = _run(clone, "--dry-run", path_prefix=_fake_launchctl(tmp_path, loaded=False))
+    assert proc.returncode != 0, proc.stdout + proc.stderr
+    combined = proc.stdout + proc.stderr
+    assert "would fail" in combined
+    assert "sync complete" not in combined
 
 
 def test_refuses_non_git_directory(tmp_path):

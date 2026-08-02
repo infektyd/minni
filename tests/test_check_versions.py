@@ -254,3 +254,57 @@ def test_inactive_wire_version_dir_is_skipped_not_failed(tmp_path):
     assert proc.returncode == 0, proc.stderr or proc.stdout
     assert "skipped (not an active wire install" in proc.stdout
     assert "public version agrees" in proc.stdout or fresh_ver in proc.stdout
+
+
+def test_zombie_wired_json_row_for_other_platform_is_not_active(tmp_path):
+    """Round-3 High: sync-root only rewires claude-code; wired.json keeps a
+    zombie codex→0.3.0 row as that platform's latest. Global-newest + current
+    must win so verify stays green after a claude-only sync."""
+    canonical = _canonical()
+    home = tmp_path / "home"
+    plugin = home / ".minni" / "plugin"
+    old = plugin / "0.3.0"
+    old.mkdir(parents=True)
+    (old / "dist").mkdir()
+    (old / ".claude-plugin").mkdir()
+    (old / ".claude-plugin" / "plugin.json").write_text(
+        json.dumps({"name": "minni", "version": "0.3.0"}), encoding="utf-8",
+    )
+    fresh_ver = f"{canonical}+git.abc1234"
+    fresh = plugin / fresh_ver
+    fresh.mkdir(parents=True)
+    (fresh / "dist").mkdir()
+    (fresh / ".claude-plugin").mkdir()
+    (fresh / ".claude-plugin" / "plugin.json").write_text(
+        json.dumps({"name": "minni", "version": fresh_ver}), encoding="utf-8",
+    )
+    (plugin / "wired.json").write_text(
+        json.dumps({
+            "schema": 1,
+            "wires": [
+                {
+                    "platform": "codex",
+                    "install_root": str(old),
+                    "version": "0.3.0",
+                    "wired_at": "2026-07-01T00:00:00Z",
+                },
+                {
+                    "platform": "claude-code",
+                    "install_root": str(fresh),
+                    "version": fresh_ver,
+                    "wired_at": "2026-08-02T00:00:00Z",
+                },
+            ],
+        }),
+        encoding="utf-8",
+    )
+    proc = _run(
+        env_extra={
+            "MINNI_CHECK_VERSIONS_HOME": str(home),
+            "MINNI_CHECK_VERSIONS_INSTALLED_OVERRIDE": canonical,
+        }
+    )
+    out = proc.stdout + proc.stderr
+    assert proc.returncode == 0, out
+    assert "skipped (not an active wire install" in proc.stdout
+    assert "!= '0.4" not in out and "0.3.0" in proc.stdout  # skipped note mentions path
