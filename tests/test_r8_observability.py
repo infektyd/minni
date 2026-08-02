@@ -406,13 +406,13 @@ def test_hyde_failure_surfaces_on_search_degradation_envelope():
     engine = _Engine()
     context = _make_context(engine, captured)
     recall_mod.handle_search(
-        {"query": "anything", "scope": "shared"},
+        {"query": "anything"},
         request_id=1,
         context=context,
     )
-    payload = captured["response"]
+    payload = captured.get("response") or {}
     assert payload.get("degraded") is True, (
-        f"HyDE incomplete must mark response degraded, got {payload!r}"
+        f"HyDE incomplete must mark response degraded, got {captured!r}"
     )
     hyde_entries = [
         d for d in payload.get("degradation") or [] if d.get("hyde_degraded")
