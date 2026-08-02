@@ -242,22 +242,16 @@ def _version_agrees(deployed: str, canonical: str) -> bool:
     return bool(deployed) and _public_version(deployed) == _public_version(canonical)
 
 
-def _active_wire_plugin_roots(home: Path) -> set[Path]:
-    """Install roots under ~/.minni/plugin that are the *live* wire targets.
+def _active_wire_plugin_state(home: Path) -> tuple[set[Path], set[str]]:
+    """Live wire install roots + platforms under ~/.minni/plugin.
 
-    ``wired.json`` is append-ish history. Keep a root active if it is the
-    **latest ``wired_at`` for any platform**. Drop only superseded rows for
-    the *same* platform — a codex root that is still that platform's newest
-    record may still be the live MCP target even when a fresher claude-code
-    wire exists. Historical duplicates of one platform are ignored so
-    non-interactive wire leftovers do not pile up forever.
-
-    ``current`` is fallback only when no valid wire records exist (release-only
-    / pre-wire). Local (+git.*) installs never move it; always-including a
-    zombie release symlink permanently fails sync-root after --from-repo.
+    Latest ``wired_at`` *per platform* stays active. Platforms are returned so
+    marketplace-cache skip matches check_deployments (per-surface, not
+    host-global). ``current`` is fallback only when no valid wire records exist.
     """
     base = home / ".minni" / "plugin"
     actives: set[Path] = set()
+    platforms: set[str] = set()
     wired = base / "wired.json"
     try:
         data = json.loads(wired.read_text(encoding="utf-8"))
@@ -276,19 +270,26 @@ def _active_wire_plugin_roots(home: Path) -> set[Path]:
             prev = latest_by_platform.get(platform)
             if prev is None or wired_at >= prev[0]:
                 latest_by_platform[platform] = (wired_at, root.resolve())
-        for _wired_at, root in latest_by_platform.values():
+        for platform, (_wired_at, root) in latest_by_platform.items():
             actives.add(root)
+            platforms.add(platform)
     except (OSError, json.JSONDecodeError, TypeError):
         pass
     if actives:
-        return actives
+        return actives, platforms
     current = base / "current"
     try:
         if current.exists():
             actives.add(current.resolve())
     except OSError:
         pass
-    return actives
+    return actives, platforms
+
+
+def _active_wire_plugin_roots(home: Path) -> set[Path]:
+    """Live wire install roots (latest per platform)."""
+    roots, _platforms = _active_wire_plugin_state(home)
+    return roots
 
 
 def _is_versioned_wire_plugin_root(root: Path, home: Path) -> bool:
@@ -300,20 +301,25 @@ def _is_versioned_wire_plugin_root(root: Path, home: Path) -> bool:
     return len(rel.parts) == 1 and rel.parts[0] not in {"current", "cache"}
 
 
-def _is_legacy_marketplace_cache_root(root: Path, home: Path) -> bool:
-    """Claude/Codex marketplace cache trees superseded by wire-primary installs.
+def _marketplace_cache_platform(root: Path, home: Path) -> str | None:
+    """Platform that owns this marketplace cache root, or None.
 
-    Parity with scripts/check_deployments._is_legacy_marketplace_cache_dist:
-    when wire is live, leftover cache trees must not fail sync-root verify.
+    Parity with scripts/check_deployments._marketplace_cache_platform.
     """
     try:
         rel = str(root.resolve().relative_to(home.resolve()))
     except (OSError, ValueError):
         rel = str(root)
-    return (
-        rel.startswith(".claude/plugins/cache/")
-        or rel.startswith(".codex/plugins/cache/")
-    )
+    if rel.startswith(".claude/plugins/cache/"):
+        return "claude-code"
+    if rel.startswith(".codex/plugins/cache/"):
+        return "codex"
+    return None
+
+
+def _is_legacy_marketplace_cache_root(root: Path, home: Path) -> bool:
+    """Claude/Codex marketplace cache trees (path shape only)."""
+    return _marketplace_cache_platform(root, home) is not None
 
 
 def check_deployed(canonical: str) -> tuple[list[str], list[str]]:
@@ -324,7 +330,7 @@ def check_deployed(canonical: str) -> tuple[list[str], list[str]]:
     roots = deployment_roots()
     if not roots:
         return [], ["deployed: no deployments discovered under $HOME"]
-    active_wire = _active_wire_plugin_roots(home)
+    active_wire, active_platforms = _active_wire_plugin_state(home)
     for root in roots:
         label = str(root).replace(str(home), "~")
         # Inactive historical wire version dirs: note + skip, do not fail.
@@ -338,11 +344,12 @@ def check_deployed(canonical: str) -> tuple[list[str], list[str]]:
                 "historical version dir left by non-interactive wire)"
             )
             continue
-        # Wire-superseded marketplace caches (same skip as check_deployments).
-        if active_wire and _is_legacy_marketplace_cache_root(root, home):
+        # Per-platform marketplace skip (parity with check_deployments).
+        cache_plat = _marketplace_cache_platform(root, home)
+        if cache_plat is not None and cache_plat in active_platforms:
             notes.append(
-                f"deployed: {label} skipped (legacy marketplace cache; "
-                "wire-primary — not managed by sync-root)"
+                f"deployed: {label} skipped (legacy marketplace cache for "
+                f"{cache_plat}; wire-primary — not managed by sync-root)"
             )
             continue
         versions: dict[str, list[str]] = {}

@@ -358,3 +358,48 @@ def test_legacy_marketplace_cache_skipped_when_wire_active(tmp_path):
     assert "!= " not in out or "0.3.0" not in [
         line for line in out.splitlines() if "!=" in line
     ]
+
+
+def test_marketplace_cache_skip_is_per_platform(tmp_path):
+    """claude-code wire alone must not skip a still-live Codex marketplace cache."""
+    canonical = _canonical()
+    home = tmp_path / "home"
+    plugin = home / ".minni" / "plugin"
+    fresh_ver = f"{canonical}+git.abc1234"
+    fresh = plugin / fresh_ver
+    fresh.mkdir(parents=True)
+    (fresh / "dist").mkdir()
+    (fresh / ".claude-plugin").mkdir()
+    (fresh / ".claude-plugin" / "plugin.json").write_text(
+        json.dumps({"name": "minni", "version": fresh_ver}), encoding="utf-8",
+    )
+    (plugin / "wired.json").write_text(
+        json.dumps({
+            "schema": 1,
+            "wires": [{
+                "platform": "claude-code",
+                "install_root": str(fresh),
+                "version": fresh_ver,
+                "wired_at": "2026-08-02T00:00:00Z",
+            }],
+        }),
+        encoding="utf-8",
+    )
+    codex_cache = home / ".codex" / "plugins" / "cache" / "minni" / "minni" / "0.3.0"
+    codex_cache.mkdir(parents=True)
+    (codex_cache / "dist").mkdir()
+    (codex_cache / ".codex-plugin").mkdir()
+    (codex_cache / ".codex-plugin" / "plugin.json").write_text(
+        json.dumps({"name": "minni", "version": "0.3.0"}), encoding="utf-8",
+    )
+    proc = _run(
+        env_extra={
+            "MINNI_CHECK_VERSIONS_HOME": str(home),
+            "MINNI_CHECK_VERSIONS_INSTALLED_OVERRIDE": canonical,
+        }
+    )
+    out = proc.stdout + proc.stderr
+    assert "legacy marketplace cache for codex" not in proc.stdout, out
+    assert "0.3.0" in out
+    # Version honesty: still-live cache must mismatch, not be skipped.
+    assert proc.returncode != 0, out

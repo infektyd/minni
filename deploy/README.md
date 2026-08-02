@@ -13,7 +13,7 @@ second is optional automation that only an operator may activate.
 
 ```
 make sync-root            # do it
-make sync-root DRY_RUN=1  # print the plan, execute nothing
+make sync-root DRY_RUN=1  # plan only (still runs `git fetch` for honest diverge checks; no local installs/rewrites)
 ```
 
 Runs `scripts/update_root.sh`, which loudly and idempotently:
