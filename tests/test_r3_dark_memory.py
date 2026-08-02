@@ -2315,3 +2315,167 @@ def test_multiple_noncanonical_spellings_collapse_to_one_row(tmp_path, monkeypat
     assert rows == [str(page)], (
         f"extra non-canonical spelling survived the collapse: {rows}"
     )
+
+
+# ── Round 15: findings from the fourteenth Grok review of #256 ─────────────
+
+
+def test_fts_only_limit_still_fills_under_the_default_budget(tmp_path, monkeypatch):
+    """Grok round 14 #1 (Medium). Round 8 closed dual-hit shadowing, but the
+    FTS-only path still attached the whole markdown file as chunk_text. With
+    the encoder down (first-class degraded mode), five multi-KB accepted pages
+    exhaust the 4096-token default budget after two hits — limit=5 silently
+    returns a fraction. Mirror test_dual_hit_limit_still_fills_under_the_default_budget
+    with the semantic leg forced off."""
+    from minni.index_all import index_shared_vault
+
+    _install_fake_embedder(monkeypatch)
+    cfg = _make_cfg(tmp_path)
+    vault = Path(cfg.vault_path)
+    for i in range(5):
+        _write_page(vault / "wiki" / "concepts" / f"big{i}.md", "accepted",
+                    f"unique{i} " + "quantum widget calibration lore " * 300)
+    index_shared_vault(cfg)
+
+    eng = _engine(cfg)
+    try:
+        eng.config.reranker_enabled = False
+        # Force the semantic-down path used in production when the encoder is
+        # unavailable: model property always re-calls get_embedder(), so patch
+        # that to None so _semantic_search returns [] and FTS is the only body.
+        import minni.models as models
+        monkeypatch.setattr(models, "get_embedder", lambda: None)
+        fts = eng._fts_search("quantum widget calibration", 20,
+                              exclude_statuses=["draft", "expired"])
+        assert len({r["doc_id"] for r in fts}) == 5, "FTS leg missed pages"
+        # Each FTS body must be a chunk (or body-only excerpt), not the raw
+        # multi-KB fenced file (~9k chars for these fixtures).
+        for row in fts:
+            text = row.get("chunk_text") or ""
+            assert not text.lstrip().startswith("---"), (
+                "FTS chunk_text still ships the raw fenced file"
+            )
+            assert len(text) < 7000, (
+                f"FTS chunk_text looks like a full multi-KB page ({len(text)} chars)"
+            )
+
+        hits = eng.retrieve("quantum widget calibration", limit=5)
+        assert eng.vector_model_down is True, "semantic-down flag not raised"
+        assert len(hits) == 5, (
+            f"limit=5 returned {len(hits)} hits under FTS-only: full-page "
+            "bodies exhausted the context budget"
+        )
+    finally:
+        eng.db.close()
+
+
+def test_fts_unembedded_draft_snippet_is_body_not_frontmatter(tmp_path, monkeypatch):
+    """Grok round 14 #1, snippet half. Default snippet depth (280 chars) on a
+    real AFM page with a long FM header was almost entirely YAML; include_drafts
+    "body" looked like frontmatter soup. Body prose must lead the FTS text."""
+    from minni.index_all import index_shared_vault
+
+    _install_fake_embedder(monkeypatch)
+    cfg = _make_cfg(tmp_path)
+    vault = Path(cfg.vault_path)
+    # Long FM keys so a raw-file excerpt would fill the 280-char snippet.
+    path = vault / "wiki" / "concepts" / "only-draft.md"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "---\n"
+        "title: only-draft long title that burns chars\n"
+        "type: concept\n"
+        "status: draft\n"
+        "agent: afm-loop\n"
+        "privacy: safe\n"
+        "trace_id: trace-r15-snippet\n"
+        "page_id: page-r15snip\n"
+        "created: 2026-08-01T00:00:00Z\n"
+        "expires_at: '2026-08-15T00:00:00Z'\n"
+        "gate_status: ready_for_review\n"
+        "sources:\n  - '`probe`'\n"
+        "---\n\n"
+        "singular findable phrase herein and a distinctive body sentence\n",
+        encoding="utf-8",
+    )
+    index_shared_vault(cfg)
+
+    eng = _engine(cfg)
+    try:
+        eng.config.reranker_enabled = False
+        import minni.models as models
+        monkeypatch.setattr(models, "get_embedder", lambda: None)
+        # FTS leg is the body source for unembedded drafts; assert there before
+        # the evidence envelope + 280-char snippet truncation can hide it.
+        fts = eng._fts_search(
+            "singular findable phrase herein", 5, exclude_statuses=["expired"],
+        )
+        assert fts, "FTS did not reach the draft"
+        body = fts[0].get("chunk_text") or ""
+        assert "distinctive body sentence" in body, (
+            f"FTS body has no prose after FM strip: {body[:200]!r}"
+        )
+        assert "expires_at:" not in body and "gate_status:" not in body, (
+            f"FTS chunk_text still carries YAML frontmatter: {body[:200]!r}"
+        )
+
+        # chunk depth still wraps in EVIDENCE but must not be FM-led.
+        hits = eng.retrieve(
+            "singular findable phrase herein", limit=5, include_drafts=True,
+            depth="chunk",
+        )
+        assert hits, "include_drafts did not reach the draft"
+        hit = next(h for h in hits if h.get("filename", "").endswith("only-draft.md"))
+        text = hit.get("text", "")
+        assert "distinctive body sentence" in text, (
+            f"chunk-depth text has no body prose: {text!r}"
+        )
+        assert "expires_at:" not in text and "gate_status:" not in text, (
+            f"chunk-depth text still carries YAML frontmatter: {text!r}"
+        )
+    finally:
+        eng.db.close()
+
+
+def test_write_one_is_atomic_against_mid_write_failure(tmp_path, monkeypatch):
+    """Grok round 14 #2 (Low). Expiry/endorse already used same-dir temp +
+    os.replace; new draft creation via _write_one still used Path.write_text
+    truncate-in-place. Vault-watch indexes concurrently — a crash mid-write
+    must not leave a torn page for the next sweep."""
+    from minni.afm_writer import _write_one
+    import pytest
+
+    vault = tmp_path / "vault"
+    real_write = Path.write_text
+    calls = {"n": 0}
+
+    def flaky_write(self, data, *args, **kwargs):
+        # _atomic_write_text writes the temp file first; fail that write so the
+        # target path is never replaced (and never truncated in place).
+        calls["n"] += 1
+        if self.name.endswith(".tmp"):
+            with open(self, "w", encoding="utf-8") as f:
+                f.write(data[:12])
+            raise OSError("disk full")
+        return real_write(self, data, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", flaky_write)
+    with pytest.raises(OSError):
+        _write_one(vault, _draft(page_id="page-atomic"))
+
+    # No durable page under wiki/ should exist after a failed atomic create.
+    wiki = vault / "wiki"
+    leftovers = list(wiki.rglob("*.md")) if wiki.exists() else []
+    assert leftovers == [], f"failed _write_one left a torn page: {leftovers}"
+    # Temp may remain or be partial; that is fine — not the durable target.
+    assert calls["n"] >= 1
+
+
+def test_include_expired_is_on_the_eval_kwargs_allowlist():
+    """Grok round 14 #3 (Low). Eval/search harness drops unknown retrieve
+    kwargs after a warning. Tombstone-recall eval passing include_expired=True
+    was silently no-op'd because the flag was missing from the allowlist."""
+    from minni.eval.metrics import KNOWN_RETRIEVE_KWARGS
+
+    assert "include_expired" in KNOWN_RETRIEVE_KWARGS
+    assert "include_drafts" in KNOWN_RETRIEVE_KWARGS

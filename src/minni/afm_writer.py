@@ -396,9 +396,11 @@ def _write_one(
                 body += f"- quality-blocked: {blocker}\n"
             for item in contradictions[:5]:
                 body += f"- contradiction-candidate: `{item}`\n"
-        # Only write if not forged (forged bodies are blocked but note is still produced in return)
+        # Only write if not forged (forged bodies are blocked but note is still produced in return).
+        # Same atomic path as expiry/endorse: vault-watch indexes concurrently, so a
+        # truncate-in-place crash mid-write must not leave a torn page for the next sweep.
         if not forged:
-            path.write_text(body, encoding="utf-8")
+            _atomic_write_text(path, body)
     # RCM-010: forged cases return null path/wikilink + written:false (callers see refusal shape; no fabricated draft loc)
     if forged:
         return {

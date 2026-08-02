@@ -76,6 +76,45 @@ _FTS_RETRY_ATTEMPTS = 3
 _FTS_RETRY_BACKOFFS = (0.05, 0.1, 0.2)
 _FTS_TRANSIENT_MARKERS = ("vtable constructor failed", "schema has changed")
 
+# Prefer a real embedded chunk over the raw vault_fts row. Unendorsed pages are
+# deliberately unembedded, so FTS is their only body path — but vault_fts stores
+# the whole markdown file (YAML first). Using that full file as chunk_text makes
+# the FTS-only path (encoder down / dual-hit absent) burn the context budget on
+# multi-KB pages and fills the default snippet with frontmatter soup.
+_FTS_CHUNK_TEXT_EXPR = """COALESCE(
+  (SELECT ce.chunk_text FROM chunk_embeddings ce
+   WHERE ce.doc_id = d.doc_id
+   ORDER BY ce.chunk_index LIMIT 1),
+  f.content
+)"""
+
+
+def _strip_leading_frontmatter(text: str) -> str:
+    """Drop a leading closed ``---`` YAML block from FTS/chunk body text.
+
+    ``vault_fts`` stores the whole markdown file (YAML first). The first
+    ``chunk_embeddings`` row often still opens with the same fence because the
+    chunker folds the document top-down and joins lines with spaces. Snippet
+    depth and the token budget must see body prose, not the FM header.
+
+    Handles both the on-disk form (``---\\nkey: val\\n---\\n\\nbody``) and the
+    chunker-collapsed form (``--- key: val --- body``).
+    """
+    if not text or not text.startswith("---"):
+        return text
+    # On-disk / FTS full-file: closing fence on its own line.
+    end = text.find("\n---", 3)
+    if end != -1:
+        rest = text[end + 4 :]  # past the closing fence line
+        if rest.startswith("\n"):
+            rest = rest[1:]
+        return rest
+    # Chunker-collapsed: second ``---`` closes the header, body follows.
+    collapsed = re.match(r"^---\s+.+?\s+---\s*", text, flags=re.DOTALL)
+    if collapsed:
+        return text[collapsed.end() :]
+    return text
+
 
 def _fts_execute_with_retry(cursor, sql, params, *, attempts: int = _FTS_RETRY_ATTEMPTS):
     """Execute a vault_fts MATCH select on ``cursor`` AND fetch its rows, with
@@ -518,19 +557,18 @@ class RetrievalEngine:
             def _match(match_expr: str):
                 # Fetch happens inside the retry helper (review r3): the
                 # vtable race can also fire while stepping the SELECT.
-                # f.content AS chunk_text: an FTS-only hit carried no body at
-                # all, so `text` came back empty. That was survivable while
-                # every indexed page also had chunks; it is not now that
-                # unendorsed pages are deliberately unembedded, which makes FTS
-                # their ONLY body path. A draft returned to an include_drafts
-                # caller with no text is a hollow hit. Snippet depth truncates,
-                # and document depth wants the whole page anyway.
+                # Prefer the first embedded chunk when the doc has one; fall
+                # back to vault_fts content for deliberately unembedded rows
+                # (draft/expired). The hollow-hit fix used f.content alone,
+                # which made FTS-only (encoder down) attach multi-KB YAML-led
+                # files as chunk_text and exhaust the default budget after a
+                # couple of hits. Body-only post-strip is applied below.
                 return _fts_execute_with_retry(c, f"""
                     SELECT f.doc_id, d.path, d.agent, d.sigil,
                            rank AS bm25_rank, d.decay_score,
                            d.page_status, d.privacy_level, d.page_type,
                            d.evidence_refs, d.indexed_at, d.layer,
-                           f.content AS chunk_text
+                           {_FTS_CHUNK_TEXT_EXPR} AS chunk_text
                     FROM vault_fts f
                     JOIN documents d ON d.doc_id = f.doc_id
                     WHERE vault_fts MATCH ?
@@ -568,7 +606,7 @@ class RetrievalEngine:
                     "evidence_refs": row["evidence_refs"],
                     "indexed_at": row["indexed_at"],
                     "layer": row["layer"] or "knowledge",
-                    "chunk_text": row["chunk_text"] or "",
+                    "chunk_text": _strip_leading_frontmatter(row["chunk_text"] or ""),
                 })
 
         return results
@@ -2030,11 +2068,12 @@ class RetrievalEngine:
                 # embedded (see indexer.UNEMBEDDED_STATUSES), and an inner join
                 # made them unreachable by chronological recall even when the
                 # caller passed include_drafts=True. The lifecycle filter, not
-                # the presence of a vector, decides what comes back. Pages with
-                # no chunk fall back to the FTS row's own content.
+                # the presence of a vector, decides what comes back. Prefer a
+                # real chunk (first by chunk_index); unembedded pages fall back
+                # to the FTS row's content, body-only after the strip below.
                 return _fts_execute_with_retry(c, f"""
                     SELECT ce.chunk_id, d.doc_id,
-                           COALESCE(ce.chunk_text, f.content) AS chunk_text,
+                           {_FTS_CHUNK_TEXT_EXPR} AS chunk_text,
                            ce.heading_context,
                            d.path, d.agent, d.sigil, d.decay_score,
                            d.page_status, d.privacy_level, d.page_type,
@@ -2072,7 +2111,7 @@ class RetrievalEngine:
                 "rrf_score": None,
                 "fts_rank": None,
                 "sem_rank": None,
-                "chunk_text": row["chunk_text"],
+                "chunk_text": _strip_leading_frontmatter(row["chunk_text"] or ""),
                 "heading_context": row["heading_context"] or "",
                 "decay_score": row["decay_score"] or 1.0,
                 "page_status": row["page_status"] or "candidate",
