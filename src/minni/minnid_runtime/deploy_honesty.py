@@ -89,21 +89,71 @@ def capture_start_state() -> dict:
     return state
 
 
+def _active_payload_root() -> tuple[Optional[Path], str]:
+    """(root, how) for the wire-managed payload actually in use.
+
+    Reading `current` alone is blind on the --from-repo / sync-root path:
+    local (+git.*) installs deliberately never move `current` (see
+    wire/install.update_current_symlink and its pins), so a machine wired
+    from a checkout would report stale=None forever — or judge a zombie
+    `current` left behind by an old release install. Prefer what wire
+    actually RECORDED (the newest wired.json entry whose install root still
+    carries a manifest), then `current`, then the newest manifest-carrying
+    version dir.
+    """
+    base = Path("~/.minni/plugin").expanduser()
+    try:
+        data = json.loads((base / "wired.json").read_text(encoding="utf-8"))
+        entries = sorted(
+            (
+                (str(w.get("wired_at") or ""), str(w.get("install_root") or ""))
+                for w in data.get("wires", [])
+                if isinstance(w, dict) and w.get("install_root")
+            ),
+            reverse=True,
+        )
+        for _wired_at, root_str in entries:
+            root = Path(root_str)
+            if (root / "payload-manifest.json").is_file():
+                return root, "wired.json"
+    except (OSError, json.JSONDecodeError, TypeError):
+        pass
+    current = base / "current"
+    if (current / "payload-manifest.json").is_file():
+        return current, "current"
+    try:
+        candidates = [
+            d for d in base.iterdir()
+            if d.is_dir() and (d / "payload-manifest.json").is_file()
+        ]
+    except OSError:
+        candidates = []
+    if candidates:
+        newest = max(candidates, key=lambda d: d.stat().st_mtime)
+        return newest, "version-dir scan"
+    return None, "none"
+
+
 def _plugin_dist_status(checkout_head: Optional[str]) -> dict:
     """Staleness of the wire-managed plugin payload, by its manifest git_sha."""
-    current = Path("~/.minni/plugin/current").expanduser()
-    manifest_path = current / "payload-manifest.json"
-    if not manifest_path.is_file():
+    root, how = _active_payload_root()
+    if root is None:
         return {"stale": None, "reason": "no wire-managed plugin payload found"}
+    manifest_path = root / "payload-manifest.json"
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         return {
             "stale": None,
+            "resolved_via": how,
             "reason": f"payload-manifest unreadable: {type(exc).__name__}",
         }
     dist_sha = str(manifest.get("git_sha") or "unknown")
-    out: dict = {"dist_git_sha": dist_sha[:12]}
+    out: dict = {
+        "dist_git_sha": dist_sha[:12],
+        "dist_version": str(manifest.get("version") or "unknown"),
+        "resolved_via": how,
+    }
     if checkout_head is None or dist_sha == "unknown":
         out["stale"] = None
         out["reason"] = "no checkout HEAD or manifest sha to compare against"

@@ -22,9 +22,13 @@ minni wire antigravity                                 # v0.3+ wheel
 .venv/bin/minni wire antigravity --from-repo .         # v0.2 wheel / checkout
 ```
 
-Note: neither propagate.py's `--platform all` nor `minni wire all` includes
-antigravity (`minni wire all` = codex, claude-code, kilocode, grok); run the
-antigravity target explicitly.
+Note: propagate.py's `--platform all` (and therefore `make sync-root`) now
+includes antigravity (#232 D7 — one canonical fleet, pinned by
+tests/test_all_fleet_parity.py). `minni wire all` still expands to codex,
+claude-code, kilocode, grok and names antigravity as an explicit skip in its
+output, so the two installers do not fight over the shared ~/.gemini tree in
+bulk runs; run `minni wire antigravity` explicitly to wire it from the
+versioned payload instead.
 
 The adapter (`plugins/minni/.gemini-plugin/gemini-extension.json`) launches
 the MCP server via the extension path; Antigravity surfaces get their MCP

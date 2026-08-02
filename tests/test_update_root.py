@@ -114,8 +114,14 @@ def test_dry_run_fast_forwards_nothing(cloned):
 
     proc = _run(clone, "--dry-run")
     assert proc.returncode == 0, proc.stdout + proc.stderr
-    assert "would run" in proc.stdout
+    # Round-1 finding: fetch must run even in dry-run (it never touches the
+    # local branch/worktree) so the plan for a BEHIND clone truthfully shows
+    # the merge step instead of "already at origin/main" off stale refs.
+    assert "would run: git merge --ff-only origin/main" in proc.stdout
+    assert "already at origin/main" not in proc.stdout
     assert _git(clone, "rev-parse", "HEAD") == before, "dry run must not move HEAD"
+    remote_ref = _git(clone, "rev-parse", "origin/main")
+    assert remote_ref != before, "fetch must have updated the remote-tracking ref"
 
 
 def test_refuses_non_git_directory(tmp_path):

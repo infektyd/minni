@@ -140,11 +140,19 @@ def check_mcp_config(root: Path, home: Path) -> list[str]:
     expected = _expected_agents(rel_root + "/")
     env = entry.get("env") or {}
     agent = env.get("MINNI_AGENT_ID")
-    if expected is not None and agent and agent not in expected:
-        problems.append(
-            f".mcp.json agent stamp {agent!r} is wrong for this root "
-            f"(expected one of {sorted(expected)})"
-        )
+    if expected is not None:
+        if not agent:
+            # A wiped/partial config is as wrong as a cross-stamped one: the
+            # server would run with no identity, or inherit one ambiently.
+            problems.append(
+                ".mcp.json has a minni entry but no MINNI_AGENT_ID stamp "
+                f"(expected one of {sorted(expected)})"
+            )
+        elif agent not in expected:
+            problems.append(
+                f".mcp.json agent stamp {agent!r} is wrong for this root "
+                f"(expected one of {sorted(expected)})"
+            )
 
     dead: list[str] = []
     for arg in entry.get("args") or []:

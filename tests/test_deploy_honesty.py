@@ -102,6 +102,98 @@ def test_plugin_dist_staleness(checkout, monkeypatch, tmp_path):
     assert "sync-root" in out["plugin_dist"]["reason"] or "wire" in out["plugin_dist"]["reason"]
 
 
+def test_plugin_dist_tracks_wired_local_payload_without_current(
+    checkout, monkeypatch, tmp_path,
+):
+    """Round-1 High: --from-repo / sync-root installs local (+git.*) versions
+    and update_current_symlink deliberately never moves `current` for those.
+    The honesty signal must resolve the payload wire RECORDED, not go blind
+    (stale=None forever) because `current` is absent."""
+    import json as _json
+
+    home = tmp_path / "home"
+    head = _git(checkout, "rev-parse", "HEAD")
+    local_ver = f"0.4.1+git.{head[:7]}"
+    root = home / ".minni" / "plugin" / local_ver
+    root.mkdir(parents=True)
+    (root / "payload-manifest.json").write_text(
+        _json.dumps({"git_sha": head, "version": local_ver}), encoding="utf-8",
+    )
+    (home / ".minni" / "plugin" / "wired.json").write_text(
+        _json.dumps({
+            "schema": 1, "generation": 1,
+            "wires": [{
+                "platform": "claude-code",
+                "install_root": str(root),
+                "version": local_ver,
+                "wired_at": "2026-08-02T00:00:00Z",
+            }],
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(deploy_honesty, "_source_checkout", lambda: checkout)
+    deploy_honesty.capture_start_state()
+
+    out = deploy_honesty.deploy_status()
+    assert out["plugin_dist"]["resolved_via"] == "wired.json"
+    assert out["plugin_dist"]["stale"] is False
+    assert out["plugin_dist"]["dist_version"] == local_ver
+
+    (checkout / "f.txt").write_text("moved\n", encoding="utf-8")
+    _git(checkout, "commit", "-aqm", "moved")
+    monkeypatch.setattr(deploy_honesty, "_HEAD_CACHE", {})
+    out = deploy_honesty.deploy_status()
+    assert out["plugin_dist"]["stale"] is True
+
+
+def test_plugin_dist_prefers_wired_record_over_zombie_current(
+    checkout, monkeypatch, tmp_path,
+):
+    """Round-1 High, second shape: a `current` symlink stuck on an old release
+    must not out-vote the newer from-repo install wire recorded — that would
+    report stale=True forever while the live surfaces run fresh code."""
+    import json as _json
+
+    home = tmp_path / "home"
+    head = _git(checkout, "rev-parse", "HEAD")
+    plugin = home / ".minni" / "plugin"
+
+    old = plugin / "0.4.0"
+    old.mkdir(parents=True)
+    (old / "payload-manifest.json").write_text(
+        _json.dumps({"git_sha": "0" * 40, "version": "0.4.0"}), encoding="utf-8",
+    )
+    (plugin / "current").symlink_to(old)
+
+    local_ver = f"0.4.1+git.{head[:7]}"
+    fresh = plugin / local_ver
+    fresh.mkdir()
+    (fresh / "payload-manifest.json").write_text(
+        _json.dumps({"git_sha": head, "version": local_ver}), encoding="utf-8",
+    )
+    (plugin / "wired.json").write_text(
+        _json.dumps({
+            "schema": 1, "generation": 2,
+            "wires": [
+                {"platform": "claude-code", "install_root": str(old),
+                 "version": "0.4.0", "wired_at": "2026-07-01T00:00:00Z"},
+                {"platform": "claude-code", "install_root": str(fresh),
+                 "version": local_ver, "wired_at": "2026-08-02T00:00:00Z"},
+            ],
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(deploy_honesty, "_source_checkout", lambda: checkout)
+    deploy_honesty.capture_start_state()
+
+    out = deploy_honesty.deploy_status()
+    assert out["plugin_dist"]["resolved_via"] == "wired.json"
+    assert out["plugin_dist"]["dist_version"] == local_ver
+    assert out["plugin_dist"]["stale"] is False
+
+
 def test_deploy_status_never_raises(monkeypatch):
     def boom():
         raise RuntimeError("git exploded")

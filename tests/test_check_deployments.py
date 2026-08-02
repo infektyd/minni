@@ -371,6 +371,32 @@ def test_dead_server_path_is_reported(tmp_path):
     assert "dead path" in proc.stdout
 
 
+def test_missing_agent_stamp_is_reported(tmp_path):
+    """Round-1 finding: a wiped/partial .mcp.json (minni entry, no
+    MINNI_AGENT_ID) used to pass the agent check silently."""
+    home = tmp_path / "home"
+    home.mkdir()
+    root = _agents_tree_deployment(home)
+    (root / ".mcp.json").write_text(
+        json.dumps({
+            "mcpServers": {
+                "minni": {
+                    "command": "node",
+                    "args": [str(root / "dist" / "server.js")],
+                    "cwd": str(root),
+                    "env": {},
+                }
+            }
+        }),
+        encoding="utf-8",
+    )
+
+    proc = _run("--strict", home=home, repo_root=_isolated_repo_root(tmp_path))
+    assert proc.returncode == 1, proc.stdout
+    assert "BADCONFIG" in proc.stdout
+    assert "no MINNI_AGENT_ID" in proc.stdout
+
+
 def test_unparseable_mcp_json_is_reported(tmp_path):
     home = tmp_path / "home"
     home.mkdir()

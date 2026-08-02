@@ -9,7 +9,8 @@
 #   1. git fetch origin, then fast-forward the checkout to origin/main.
 #      REFUSES on a dirty tree or a diverged branch — it never discards
 #      local state; you resolve, it retries.
-#   2. Refresh the editable pip install (dependency/metadata changes).
+#   2. Refresh locked dependencies (requirements.lock) and the editable
+#      pip install.
 #   3. Rebuild the plugin (npm run build).
 #   4. Redeploy the platform surfaces: `minni wire claude-code --from-repo`
 #      plus `propagate.py update-plugin --platform all`.
@@ -61,7 +62,12 @@ say "sync $REPO -> origin/main$([ "$DRY_RUN" = 1 ] && echo '  [DRY RUN]')"
 
 # ── 1. fetch + fast-forward, refusing to touch local state ───────────────────
 say "step 1/6: git fetch + fast-forward"
-act git fetch origin
+# fetch runs even under --dry-run: it only updates remote-tracking refs (never
+# the local branch or worktree), and without it the LOCAL/REMOTE comparison
+# below reads stale refs — a behind clone would print a plan that omits the
+# merge step entirely.
+printf 'running:   git fetch origin\n'
+git fetch origin
 
 if [ -n "$(git status --porcelain)" ]; then
   git status --short >&2
@@ -83,8 +89,12 @@ else
   act git merge --ff-only origin/main
 fi
 
-# ── 2. editable install refresh ──────────────────────────────────────────────
-say "step 2/6: refresh editable pip install"
+# ── 2. dependency + editable install refresh ─────────────────────────────────
+say "step 2/6: refresh locked dependencies + editable pip install"
+# Both halves, matching the Makefile's setup pattern: --no-deps alone would
+# skip a dependency main just added to requirements.lock, and the daemon
+# restarted below would then fail to import it.
+act "$VENV_PY" -m pip install -q -r requirements.lock
 act "$VENV_PY" -m pip install --no-deps -q -e .
 
 # ── 3. plugin build ──────────────────────────────────────────────────────────
