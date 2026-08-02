@@ -125,6 +125,58 @@ test("shared SessionStart harvests compact_summary for codex when transcript has
   );
 });
 
+// resume is the same gate arm as compact (Claude parity); pin both sources.
+test("shared SessionStart harvests compact_summary on source=resume", async () => {
+  const vault = await tmpVault();
+  const file = await tmpTranscript([
+    transcriptLine({ type: "user", message: { role: "user", content: "hello" } }),
+    transcriptLine(summaryEntry("uuid-shared-resume", SUMMARY_TEXT)),
+  ]);
+  const handlers = sharedHandlers(vault);
+  await handlers.handleSessionStart({
+    session_id: "s-resume",
+    transcript_path: file,
+    source: "resume",
+  });
+  const harvested = await listCompactSummaries(vault);
+  assert.equal(harvested.length, 1, "resume source must harvest (same arm as compact)");
+  assert.equal(harvested[0].platform, "codex");
+});
+
+// Structural pin: compact|resume is the only capture write on shared platforms.
+// withBudget races rather than cancels; exitAfterDelivery then kills mid-flight
+// → permanent loss. Path-only residual (still default-off) may stay wait-capped.
+test("shared SessionStart awaits compact/resume harvest; path-only stays withBudget", async () => {
+  const source = await readFile(new URL("../src/hook-handlers.ts", import.meta.url), "utf8");
+  // compact|resume arm: bare await harvestCompactSummary (Claude parity).
+  assert.match(
+    source,
+    /isCompactOrResume[\s\S]{0,500}await harvestCompactSummary\s*\(/,
+    "compact|resume must fully await harvestCompactSummary",
+  );
+  // Must not race the source harvest: no withBudget(harvestCompactSummary) on
+  // the isCompactOrResume arm. The only withBudget(harvest…) should be path-only.
+  const pathOnlyBudgeted = /pathOnlyAllowed[\s\S]{0,600}withBudget\(\s*harvestCompactSummary\s*\(/.test(
+    source,
+  );
+  assert.ok(
+    pathOnlyBudgeted,
+    "path-only residual (if re-enabled) must remain withBudget wait-capped",
+  );
+  // Source harvest must not use the removed 2s withBudget cap constant.
+  assert.doesNotMatch(
+    source,
+    /COMPACT_HARVEST_SOURCE_BUDGET_MS/,
+    "compact|resume must not be wait-capped via COMPACT_HARVEST_SOURCE_BUDGET_MS",
+  );
+  // Guard: never withBudget the whole shouldHarvestCompact blob again.
+  assert.doesNotMatch(
+    source,
+    /shouldHarvestCompact[\s\S]{0,200}withBudget\(\s*harvestCompactSummary/,
+    "must not reintroduce a unified withBudget harvest gate",
+  );
+});
+
 // Cold boots that still carry a transcript path (Cursor/agy) must not pay the
 // unbudgeted tail-read when `source` is present and not compact/resume.
 test("shared SessionStart skips harvest on cold boot with non-compact source + path", async () => {

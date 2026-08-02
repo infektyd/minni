@@ -207,10 +207,14 @@ Minni harvests it in two stages, split across the boot/daemon boundary
    requires `source` absent entirely. Default off also protects hosts that
    always attach a path and never send `source` (agy/gemini) from every-cold-boot
    I/O for a guaranteed miss against the tightest SessionStart budget
-   ([#227](https://github.com/infektyd/minni/issues/227)). Harvest waits are
-   wait-capped (tighter for path-only); `withBudget` does not cancel the
-   tail-read, so path-only is not budget-safe concurrent I/O — only wait-capped
-   before identity/corrections RPCs. Kilo Code uses the shared handler too, but
+   ([#227](https://github.com/infektyd/minni/issues/227)). On shared platforms
+   this SessionStart path is the **only** capture write (no `PostCompact`), so
+   compact|resume harvest is **fully awaited** — matching Claude Code — rather
+   than raced with `withBudget` (a race + `exitAfterDelivery` would kill
+   mid-flight and permanently drop the write). Path-only residual stays
+   wait-capped; `withBudget` does not cancel the tail-read, so path-only is not
+   budget-safe concurrent I/O — only wait-capped before identity/corrections
+   RPCs. Kilo Code uses the shared handler too, but
    its bridge SessionStart sends neither `transcript_path` nor `source`, so that
    backstop is dead for real Kilo boots (primary remains `CompactSummary` from
    the SDK). Both live paths converge on `harvestSummaryText`: the

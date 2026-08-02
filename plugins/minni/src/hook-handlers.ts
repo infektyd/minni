@@ -434,12 +434,11 @@ export interface AgentHookHandlers {
  */
 const PATH_ONLY_COMPACT_HARVEST_ALLOW = new Set<string>([]);
 
-/** Explicit wait caps for SessionStart harvest (ms). Tighter for path-only —
- * that residual is almost always a miss and must not burn the boot budget
- * before identity/corrections RPCs. `withBudget` only bounds wait time; it
- * does not cancel work or reserve later RPC budget. */
+/** Wait cap for path-only residual SessionStart harvest (ms). That residual is
+ * almost always a miss and must not burn the boot budget before
+ * identity/corrections RPCs. `withBudget` only bounds wait time; it does not
+ * cancel work. compact|resume is NOT wait-capped — see harvest block below. */
 const COMPACT_HARVEST_PATH_ONLY_BUDGET_MS = 250;
-const COMPACT_HARVEST_SOURCE_BUDGET_MS = 2_000;
 
 /** True when path-only (no `source`) SessionStart may start a tail-read. */
 export function isPathOnlyCompactHarvestAllowed(platform: string | undefined): boolean {
@@ -516,40 +515,53 @@ export function createHookHandlers(
     // bridge SessionStart supplies neither transcript_path nor source — so
     // this backstop is dead for real Kilo boots). Platforms that share this
     // handler (codex, grok-build, cursor, gemini) previously had no harvest
-    // path at all.
+    // path at all — and on those hosts this SessionStart path is the ONLY
+    // capture write (no PostCompact).
     //
     // Gate:
-    //  1. compact|resume `source` — Claude parity (any runtime).
+    //  1. compact|resume `source` — Claude parity (any runtime). FULLY
+    //     awaited: withBudget races rather than cancels, and exitAfterDelivery
+    //     then kills the process, so a budget-cut harvest is permanent loss of
+    //     the only write path. Match hook.ts: bare await.
     //  2. path-only residual — only when `source` is absent entirely AND the
     //     runtime is on PATH_ONLY_COMPACT_HARVEST_ALLOW (opt-in). Default
     //     off: hosts that always attach a path and never send `source`
     //     (agy/gemini) would otherwise tax every cold boot for a guaranteed
-    //     no_summary_found against the tightest budget.
-    // Harvest is raced against a *sub-budget* of remainingMs (tighter for
-    // path-only). withBudget only bounds how long we wait — it does not
-    // cancel the tail-read or reserve budget for later identity/corrections
-    // RPCs. Content-hash dedup keeps dual delivery safe. Fail-open, raw only
-    // — daemon compact_distillation organizes later.
+    //     no_summary_found. Wait-capped only (still not cancel-safe).
+    // Content-hash dedup keeps dual delivery safe. Fail-open, raw only —
+    // daemon compact_distillation organizes later.
     const bootSource = asString(payload.source);
     const transcriptPath =
       asString(payload.transcript_path) || asString(payload.transcriptPath);
     const platform = config.runtime ?? config.agentId;
+    const isCompactOrResume = bootSource === "compact" || bootSource === "resume";
     const pathOnlyAllowed =
       !bootSource &&
       Boolean(transcriptPath) &&
       isPathOnlyCompactHarvestAllowed(platform);
-    const shouldHarvestCompact =
-      bootSource === "compact" || bootSource === "resume" || pathOnlyAllowed;
-    if (shouldHarvestCompact) {
-      // Cap wait so a large/slow transcript cannot exhaust the whole boot
-      // budget before status/identity/recall. Path-only is almost always a
-      // miss → 250ms; compact|resume source is the real harvest → 2s.
-      const harvestBudgetMs = Math.min(
-        remainingMs(),
-        pathOnlyAllowed
-          ? COMPACT_HARVEST_PATH_ONLY_BUDGET_MS
-          : COMPACT_HARVEST_SOURCE_BUDGET_MS,
-      );
+    if (isCompactOrResume) {
+      // Do not start when the boot budget is already spent — a late start is
+      // more likely to overrun the harness than to land a durable write. Once
+      // started, await fully (never withBudget-race this path).
+      if (remainingMs() > 0) {
+        await harvestCompactSummary(
+          {
+            vaultPath: config.vaultPath,
+            workspaceId,
+            auditPrefix: config.auditPrefix,
+            platform,
+          },
+          {
+            transcriptPath,
+            sessionId,
+          },
+        );
+      }
+    } else if (pathOnlyAllowed && remainingMs() > 0) {
+      // Residual is almost always a miss → tight wait-cap so it cannot exhaust
+      // identity/corrections RPCs. withBudget only bounds wait time; it does
+      // not cancel the tail-read. Acceptable for opt-in residual; not for the
+      // only write path above.
       await withBudget(
         harvestCompactSummary(
           {
@@ -563,7 +575,7 @@ export function createHookHandlers(
             sessionId,
           },
         ),
-        harvestBudgetMs,
+        Math.min(remainingMs(), COMPACT_HARVEST_PATH_ONLY_BUDGET_MS),
         { harvested: false, reason: "harvest_error" },
       );
     }
