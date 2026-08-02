@@ -2230,3 +2230,221 @@ class TestStringLayersScopeDocuments:
         })
         assert "error" not in resp
         assert resp["result"]["count"] >= 1
+
+
+# ---------------------------------------------------------------------------
+# grok-review round 5 — one confidence basis, layers fail closed at the root,
+# correction floor reaches confidence
+# ---------------------------------------------------------------------------
+
+class TestConfidenceSharesOneBasis:
+    """Round-5 finding 1: default scope=both is multi-ENGINE. Vault hits used
+    to calibrate against their own forever-empty vault windows (raw_blend)
+    while shared hits used the shared window (percentile_rank after
+    activation), and the boundary recorded every row into the SHARED window
+    regardless. One response, two meanings of confidence. Formatting is now
+    raw-only; the RPC boundary records into the shared window and rewrites
+    every final confidence onto that single basis."""
+
+    def test_scope_both_returns_one_calibration_basis(self, tmp_path, monkeypatch,
+                                                      hermetic_principals):
+        import minni.minnid as minnid
+        from minni.retrieval import RetrievalEngine
+
+        _engine, shared_db, _cfg = _patch_engine_and_writeback(tmp_path, monkeypatch)
+
+        # A separate vault-shaped DB behind its own engine (personal scope).
+        vault_dir = tmp_path / "vault"
+        vault_dir.mkdir()
+        vault_db, vault_cfg = _make_db(vault_dir, reranker_enabled=False,
+                                       hyde_enabled=False)
+        vault_engine = RetrievalEngine(vault_db, vault_cfg, faiss_index=object())
+
+        shared_body = "the deployment rollback procedure is documented here. " * 20
+        vault_body = "deployment rollback happened on the edge fleet vault. " * 20
+        with shared_db.cursor() as c:
+            c.execute(
+                "INSERT INTO documents (path, agent, sigil, layer) "
+                "VALUES ('shared.md', 'codex', 'vault', 'knowledge')"
+            )
+            doc_id = c.lastrowid
+            c.execute(
+                "INSERT INTO vault_fts (doc_id, path, content, agent, sigil) "
+                "VALUES (?, 'shared.md', ?, 'codex', 'vault')",
+                (doc_id, shared_body),
+            )
+            # Activate the SHARED window: ten floor samples, every real raw
+            # blend percentile-ranks above them.
+            for _ in range(10):
+                c.execute(
+                    "INSERT INTO score_distribution (raw_score, kind, created_at) "
+                    "VALUES (0.0, 'combined', ?)",
+                    (time.time(),),
+                )
+        with vault_db.cursor() as c:
+            # Filler row first so the vault doc_id cannot collide with shared.
+            c.execute(
+                "INSERT INTO documents (path, agent, sigil) "
+                "VALUES ('filler.md', 'codex', 'vault')"
+            )
+            c.execute(
+                "INSERT INTO documents (path, agent, sigil, layer) "
+                "VALUES ('personal.md', 'codex', 'vault', 'knowledge')"
+            )
+            doc_id = c.lastrowid
+            c.execute(
+                "INSERT INTO vault_fts (doc_id, path, content, agent, sigil) "
+                "VALUES (?, 'personal.md', ?, 'codex', 'vault')",
+                (doc_id, vault_body),
+            )
+
+        monkeypatch.setattr(
+            minnid, "_agent_vault_retrieval",
+            lambda agent_id: (vault_engine, "codex", str(vault_cfg.db_path)),
+        )
+        monkeypatch.setattr(minnid, "_all_vault_retrievals", lambda: [])
+
+        resp = _dispatch("search", {
+            "query": "deployment rollback", "agent_id": "codex", "expand": False,
+        })
+        assert "error" not in resp
+        results = resp["result"]["results"]
+        sources = {r.get("source") for r in results}
+        assert "personal.md" in sources and "shared.md" in sources, (
+            "the pin needs one vault hit and one shared hit in a single response"
+        )
+        confidences = [r["confidence"] for r in results]
+        assert all(c is not None and c >= 0.85 for c in confidences), (
+            f"every confidence must share the shared percentile basis after "
+            f"activation; got {confidences} — a sub-0.85 value is a vault hit "
+            "still served on the raw_blend basis while shared hits are "
+            "percentile ranks"
+        )
+        # And every final row fed the SHARED window.
+        with shared_db.cursor() as c:
+            n = c.execute(
+                "SELECT COUNT(*) AS n FROM score_distribution"
+            ).fetchone()["n"]
+        assert n == 10 + len(results)
+
+
+class TestLayersFailClosedAtTheRoot:
+    """Round-5 finding 2: the RPC edge wrap papered over _normalize_layers,
+    which still iterated a bare string into an empty set — and empty sets fell
+    OPEN to an unscoped document search. The function that owns the contract
+    now coerces strings and filtering fails closed on explicit-but-empty
+    filters, for every caller, not just the daemon edge."""
+
+    def _direct_engine(self, tmp_path, monkeypatch):
+        from minni.retrieval import RetrievalEngine
+
+        db_obj, cfg = _make_db(tmp_path, reranker_enabled=False,
+                               hyde_enabled=False)
+        monkeypatch.setattr(RetrievalEngine, "model", property(lambda self: None))
+        engine = RetrievalEngine(db_obj, cfg, faiss_index=object())
+        body = "the deployment rollback procedure is documented here. " * 20
+        with db_obj.cursor() as c:
+            c.execute(
+                "INSERT INTO documents (path, agent, sigil, layer) "
+                "VALUES ('a.md', 'codex', 'vault', 'knowledge')"
+            )
+            doc_id = c.lastrowid
+            c.execute(
+                "INSERT INTO vault_fts (doc_id, path, content, agent, sigil) "
+                "VALUES (?, 'a.md', ?, 'codex', 'vault')",
+                (doc_id, body),
+            )
+        return engine
+
+    def test_direct_string_layers_scope_documents(self, tmp_path, monkeypatch):
+        engine = self._direct_engine(tmp_path, monkeypatch)
+        assert engine.retrieve(
+            query="deployment rollback", expand=False, layers="episodic",
+        ) == [], (
+            "a bare-string layer must scope the search at the engine root, "
+            "not only behind the daemon's edge wrap"
+        )
+        assert engine.retrieve(
+            query="deployment rollback", expand=False, layers="knowledge",
+        ), "the string form must admit its own layer"
+
+    def test_explicit_invalid_or_empty_filters_fail_closed(self, tmp_path,
+                                                           monkeypatch):
+        engine = self._direct_engine(tmp_path, monkeypatch)
+        assert engine.retrieve(
+            query="deployment rollback", expand=False, layers=["nope"],
+        ) == [], (
+            "an explicit filter with zero valid layers must match nothing; "
+            "falling open serves the unscoped corpus under a scoped request"
+        )
+        assert engine.retrieve(
+            query="deployment rollback", expand=False, layers=[],
+        ) == []
+
+    def test_chronological_sort_fails_closed_too(self, tmp_path, monkeypatch):
+        engine = self._direct_engine(tmp_path, monkeypatch)
+        assert engine.retrieve(
+            query="deployment rollback", expand=False, layers=["nope"],
+            sort="chronological",
+        ) == []
+
+
+class TestCorrectionFloorReachesConfidence:
+    """Round-5 finding 3: both ranking legs floor a correction's decay
+    (recall-F4), but confidence still used the raw decay_score — a correction
+    at decay 0.01 ranked semi-fresh while its confidence and its recorded
+    calibration sample said near-dead. Confidence now reads the stamped
+    effective decay."""
+
+    def test_score_merged_doc_stamps_effective_decay(self, tmp_path):
+        engine, _db, cfg = _make_engine(tmp_path)
+        correction_type = sorted(engine._correction_types)[0]
+        d = {"rrf_score": 0.02, "decay_score": 0.01, "page_type": correction_type}
+        engine._score_merged_doc(d)
+        assert d["decay_applied"] == pytest.approx(
+            float(cfg.correction_decay_floor)
+        )
+        plain = {"rrf_score": 0.02, "decay_score": 0.3, "page_type": "note"}
+        engine._score_merged_doc(plain)
+        assert plain["decay_applied"] == pytest.approx(0.3)
+
+    def test_confidence_reads_the_floored_decay_end_to_end(self, tmp_path,
+                                                           monkeypatch,
+                                                           hermetic_principals):
+        import minni.scoring as scoring
+
+        _engine, db_obj, cfg = _patch_engine_and_writeback(tmp_path, monkeypatch)
+        correction_type = sorted(_engine._correction_types)[0]
+        body = "the deployment rollback procedure is documented here. " * 20
+        with db_obj.cursor() as c:
+            c.execute(
+                "INSERT INTO documents (path, agent, sigil, layer, decay_score, "
+                "page_type) VALUES ('c.md', 'codex', 'vault', 'knowledge', 0.01, ?)",
+                (correction_type,),
+            )
+            doc_id = c.lastrowid
+            c.execute(
+                "INSERT INTO vault_fts (doc_id, path, content, agent, sigil) "
+                "VALUES (?, 'c.md', ?, 'codex', 'vault')",
+                (doc_id, body),
+            )
+
+        real = scoring.raw_confidence
+        seen = []
+
+        def _spy(rrf_score, cross_encoder_score, decay_factor):
+            seen.append(decay_factor)
+            return real(rrf_score, cross_encoder_score, decay_factor)
+
+        monkeypatch.setattr(scoring, "raw_confidence", _spy)
+        resp = _dispatch("search", {
+            "query": "deployment rollback", "agent_id": "codex", "expand": False,
+        })
+        assert "error" not in resp
+        assert resp["result"]["count"] >= 1
+        assert seen, "the format path must derive confidence_raw"
+        floor = float(cfg.correction_decay_floor)
+        assert all(d == pytest.approx(floor) for d in seen), (
+            f"confidence must see the floored decay {floor}, not the raw 0.01 "
+            "that disagrees with both ranking legs"
+        )

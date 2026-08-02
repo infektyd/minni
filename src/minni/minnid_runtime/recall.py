@@ -314,18 +314,20 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
             except Exception as pack_exc:
                 context.logger.warning("pack_results failed: %s - returning unbudgeted results", pack_exc)
 
-        # GA4-1 / grok-review round 4 (finding 1): feed the calibration window
-        # HERE, over the final merged caller-visible set — and only here.
-        # _format_results used to record, but production search is multi-call:
-        # scope=both fans out personal+combined (the same hits recorded twice
-        # when both resolve to the shared index) and query expansion recurses
-        # per variant, so one default limit=5 RPC could insert 10 rows — enough
-        # to cross _ACTIVATION_THRESHOLD alone and silently flip every caller
-        # from raw_blend to percentile_rank on a polluted window. confidence_raw
-        # is the pre-calibration blend each result's confidence came from; pop
-        # it so the transport surface is unchanged.
+        # GA4-1 / grok-review rounds 4-5 (finding 1): the calibration window is
+        # fed HERE, over the final merged caller-visible set — and only here.
+        # _format_results used to record, but production search is multi-call
+        # (scope=both fans out personal+combined; expansion recurses per
+        # variant), so one default limit=5 RPC could insert 10 rows — enough to
+        # cross _ACTIVATION_THRESHOLD alone on a padded window. It is also
+        # multi-ENGINE: vault hits used to calibrate against their own
+        # forever-empty vault windows while shared hits used the shared one, so
+        # a single response mixed raw blends with percentile ranks. Formatting
+        # is now raw-only (db=None); this loop records every final row's raw
+        # into the SHARED window and rewrites its confidence onto that one
+        # basis, then pops the carrier so the transport surface is unchanged.
         try:
-            from minni.scoring import record_score
+            from minni.scoring import calibrated_confidence, record_score
 
             for r in results:
                 if not isinstance(r, dict):
@@ -335,6 +337,10 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
                     continue
                 try:
                     record_score(float(raw_score), "combined", engine.db)
+                    if r.get("confidence") is not None:
+                        r["confidence"] = calibrated_confidence(
+                            raw_score, engine.db
+                        )
                 except Exception as exc:
                     context.logger.debug("search: score record failed: %s", exc)
         except Exception as exc:

@@ -1517,6 +1517,11 @@ class RetrievalEngine:
             floor = float(self.config.correction_decay_floor)
             decay = max(decay, floor)
         d["salience_boost"] = boost
+        # grok-review round 5 (finding 3): stamp the EFFECTIVE decay (same
+        # clamp as the rerank leg) so confidence reads the value ranking used —
+        # a correction floored to 0.5 must not rank semi-fresh while its
+        # confidence and recorded calibration sample say near-dead 0.01.
+        d["decay_applied"] = max(0.0, min(1.0, decay))
         d["final_score"] = d["rrf_score"] * decay * (1.0 + boost)
 
     def _rrf_merge(
@@ -2031,8 +2036,18 @@ class RetrievalEngine:
         return ranked[:limit]
 
     def _normalize_layers(self, layers: Optional[Sequence[str]]) -> Optional[set]:
+        """None → no filter. grok-review round 5 (finding 2): a bare string is
+        ONE layer, not an iterable of its characters — iterating "episodic"
+        produced an empty set, and empty sets fell open to an unscoped search.
+        The RPC edge coerces strings too, but the function that owns the
+        contract must not depend on every caller remembering to. An explicit
+        filter that normalizes to zero valid layers stays an EMPTY set;
+        filtering callers fail closed on it (match nothing), because a request
+        that asked for a scope must never silently get the unscoped corpus."""
         if layers is None:
             return None
+        if isinstance(layers, str):
+            layers = [layers]
         valid = {"identity", "episodic", "knowledge", "artifact"}
         return {str(layer).lower() for layer in layers if str(layer).lower() in valid}
 
@@ -2062,11 +2077,13 @@ class RetrievalEngine:
         layer_set = self._normalize_layers(layers)
         start_ts = self._parse_iso_date(start_date)
         end_ts = self._parse_iso_date(end_date, end_of_day=True)
-        if not layer_set and start_ts is None and end_ts is None:
+        # `is None`, not falsy: an explicit filter with zero valid layers must
+        # fail CLOSED (empty set → no candidate matches), not fall open.
+        if layer_set is None and start_ts is None and end_ts is None:
             return candidates
         filtered = []
         for r in candidates:
-            if layer_set and (r.get("layer") or "knowledge") not in layer_set:
+            if layer_set is not None and (r.get("layer") or "knowledge") not in layer_set:
                 continue
             if start_ts is None and end_ts is None:
                 filtered.append(r)
@@ -2123,6 +2140,9 @@ class RetrievalEngine:
         end_ts = self._parse_iso_date(end_date, end_of_day=True)
         filter_params: list = []
         clauses = ["vault_fts MATCH ?"]
+        if layer_set is not None and not layer_set:
+            # Explicit filter, zero valid layers — fail closed, not unscoped.
+            return []
         if layer_set:
             placeholders = ",".join("?" * len(layer_set))
             clauses.append(f"COALESCE(ce.layer, d.layer, 'knowledge') IN ({placeholders})")
@@ -2802,7 +2822,11 @@ class RetrievalEngine:
                             cross_encoder_score=r.get(
                                 "raw_rerank_score", r.get("rerank_score")
                             ),
-                            decay_factor=r.get("decay_score"),
+                            # round 5 (finding 3): the effective decay ranking
+                            # used (correction floor + clamp), not the raw one.
+                            decay_factor=r.get(
+                                "decay_applied", r.get("decay_score")
+                            ),
                             db=self.db,
                         )
                         probe_results.append(probe)
@@ -3009,26 +3033,34 @@ class RetrievalEngine:
                 ce_for_confidence = r.get(
                     "raw_rerank_score", r.get("rerank_score")
                 )
+                # round 5 (finding 3): the effective decay ranking used
+                # (correction floor + clamp), not the raw decay_score — the
+                # legs must not disagree about how fresh a correction is.
+                decay_for_confidence = r.get(
+                    "decay_applied", r.get("decay_score")
+                )
                 confidence = compute_confidence(
                     rrf_score=r.get("rrf_score"),
                     cross_encoder_score=ce_for_confidence,
-                    decay_factor=r.get("decay_score"),
-                    db=self.db,
-                    # GA4-1 / grok-review round 4 (finding 1): formatting does
-                    # NOT record. Production search is multi-call — scope=both
-                    # fans out personal+combined and query expansion recurses
-                    # per variant — so recording here fed the calibration
-                    # window duplicate and discarded intermediate scores; one
-                    # default RPC could cross _ACTIVATION_THRESHOLD alone and
-                    # silently flip every caller to percentile_rank. The RPC
-                    # boundary (recall.handle_search) records the final merged
-                    # set via confidence_raw below.
+                    decay_factor=decay_for_confidence,
+                    # GA4-1 / grok-review rounds 4-5 (finding 1): formatting
+                    # neither records NOR calibrates. Production search is
+                    # multi-call AND multi-engine — scope=both fans out
+                    # personal (vault db) + combined (vaults + shared) — so
+                    # per-engine calibration made one response mix percentile
+                    # ranks (shared window) with raw blends (vault windows,
+                    # never fed), and per-call recording padded the window
+                    # with duplicate/discarded scores. The RPC boundary
+                    # (recall.handle_search) records confidence_raw into the
+                    # SHARED window and rewrites confidence onto that single
+                    # basis for the whole payload.
+                    db=None,
                     record=False,
                 )
                 confidence_raw = raw_confidence(
                     r.get("rrf_score"),
                     ce_for_confidence,
-                    r.get("decay_score"),
+                    decay_for_confidence,
                 )
             except Exception:
                 confidence = None

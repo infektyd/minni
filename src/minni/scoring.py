@@ -101,6 +101,19 @@ def raw_confidence(
     return raw * max(0.0, min(1.0, decay))
 
 
+def calibrated_confidence(raw_score: float, db) -> float:
+    """Percentile-calibrate a pre-computed raw blend against ``db``'s window.
+
+    grok-review round 5 (finding 1): default search is multi-ENGINE
+    (scope=both merges vault + shared hits), and per-engine calibration gave
+    one response two meanings of confidence — percentile ranks for shared
+    hits, raw blends for vault hits whose windows never fill. The RPC boundary
+    calls this against the SHARED db for every final result so the whole
+    payload shares one basis. Same clamp/round contract as compute_confidence.
+    """
+    return round(max(0.0, min(1.0, _calibrate(float(raw_score), db))), 4)
+
+
 def compute_confidence(
     rrf_score: Optional[float],
     cross_encoder_score: Optional[float],
