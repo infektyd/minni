@@ -280,6 +280,13 @@ def handle_health_report(params: dict, request_id: Any, context: HealthContext) 
         # breakdown + oldest timestamp) — no file paths, so this stays
         # outside _HEALTH_REPORT_SENSITIVE_KEYS like vector_backend_lag.
         "inbox_quarantine": {"count": 0, "oldest_quarantined_at": None, "by_reason": {}},
+        # #225-R6 / GA1-1: health never compared document count against vector
+        # count, so a 43% document-vector gap (381/879, all knowledge layer) and
+        # 409 NULL-embedding learnings were invisible to every status surface —
+        # only a manual query could find them. Aggregate counts and ratios only,
+        # no paths and no learning text, so it stays outside
+        # _HEALTH_REPORT_SENSITIVE_KEYS like vector_backend_lag.
+        "embedding_coverage": {},
         # W2: last-N dispatch exceptions so a climbing errors.<method> counter is
         # attributable. Sensitive (messages can embed paths/payloads) — redacted
         # to a count for any non-operator caller via _HEALTH_REPORT_SENSITIVE_KEYS.
@@ -318,6 +325,17 @@ def handle_health_report(params: dict, request_id: Any, context: HealthContext) 
             report["afm_loop"]["error"] = str(exc)
 
         db = context.sovereign_db(context.default_config)
+
+        # #225-R6 / GA1-1: the document-to-vector and learning-to-embedding
+        # ratios. Best-effort — a coverage query must never cost the operator
+        # the rest of the health report.
+        try:
+            from minni.backfill import embedding_coverage
+
+            report["embedding_coverage"] = embedding_coverage(db)
+        except Exception as exc:
+            report["embedding_coverage"] = {"error": str(exc)}
+
         with db.cursor() as c:
             c.execute(
                 """

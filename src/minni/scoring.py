@@ -25,6 +25,7 @@ def compute_confidence(
     cross_encoder_score: Optional[float],
     decay_factor: Optional[float],
     db=None,
+    record: bool = False,
 ) -> float:
     """
     Compute a calibrated confidence score in [0, 1].
@@ -40,6 +41,12 @@ def compute_confidence(
         cross_encoder_score: Cross-encoder logit (may be negative). None → ignored.
         decay_factor: Memory decay multiplier in (0, 1]. None → 1.0.
         db: Optional SovereignDB for percentile calibration. None → uncalibrated.
+        record: Append this call's PRE-calibration raw score to the rolling
+            window (GA4-1). Opt-in, and deliberately not the default: only the
+            final formatted result set should feed the distribution. Speculative
+            paths that score candidates they may discard — the HyDE probe in
+            retrieval.py is the live example — would otherwise inflate the
+            window with scores no caller ever saw.
 
     Returns:
         float in [0, 1].
@@ -66,6 +73,15 @@ def compute_confidence(
 
     # Apply decay
     raw = raw * max(0.0, min(1.0, decay))
+
+    # GA4-1: record BEFORE calibrating. record_score had zero production call
+    # sites, so score_distribution stayed empty, _calibrate always fell through
+    # its `total < 10` guard, and calibration was permanently inert — the
+    # docstring above ("written during retrieval") described a wire that did not
+    # exist. Recording the calibrated value instead would feed the distribution
+    # its own output and make the percentiles converge on themselves.
+    if db is not None and record:
+        record_score(raw, "combined", db)
 
     # Percentile calibration against rolling window
     if db is not None:

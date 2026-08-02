@@ -213,6 +213,313 @@ class TestEpisodicIsReachable:
 
 
 # ---------------------------------------------------------------------------
+# GA4-1 — score calibration must be fed, or it is permanently inert
+# ---------------------------------------------------------------------------
+
+class TestScoreCalibrationIsWired:
+    """record_score had zero production call sites, so score_distribution held
+    0 rows, _calibrate always tripped its `total < 10` guard, and calibration
+    returned the raw score forever. Decision: WIRE it — the machinery is
+    complete and was inert only for want of one call."""
+
+    def test_compute_confidence_records_when_asked(self, tmp_path):
+        from minni.scoring import compute_confidence
+
+        db_obj, _cfg = _make_db(tmp_path)
+        compute_confidence(0.02, 1.0, 1.0, db=db_obj, record=True)
+
+        with db_obj.cursor() as c:
+            n = c.execute(
+                "SELECT COUNT(*) AS n FROM score_distribution"
+            ).fetchone()["n"]
+        assert n == 1, (
+            "the retrieval path must feed the calibration window; on the old "
+            "code score_distribution stayed empty forever"
+        )
+
+    def test_recording_is_opt_in(self, tmp_path):
+        """Speculative paths (the HyDE probe) must not inflate the window with
+        scores no caller ever saw."""
+        from minni.scoring import compute_confidence
+
+        db_obj, _cfg = _make_db(tmp_path)
+        compute_confidence(0.02, 1.0, 1.0, db=db_obj)
+
+        with db_obj.cursor() as c:
+            n = c.execute(
+                "SELECT COUNT(*) AS n FROM score_distribution"
+            ).fetchone()["n"]
+        assert n == 0
+
+    def test_recorded_value_is_pre_calibration(self, tmp_path):
+        """Recording the calibrated output would feed the distribution its own
+        result and make the percentiles converge on themselves."""
+        from minni.scoring import compute_confidence
+
+        db_obj, _cfg = _make_db(tmp_path)
+        # Seed enough samples that _calibrate is live (its guard is total < 10).
+        for _ in range(20):
+            compute_confidence(0.02, 1.0, 1.0, db=db_obj, record=True)
+
+        returned = compute_confidence(0.02, 1.0, 1.0, db=db_obj, record=True)
+        with db_obj.cursor() as c:
+            last = c.execute(
+                "SELECT raw_score FROM score_distribution ORDER BY id DESC LIMIT 1"
+            ).fetchone()["raw_score"]
+        assert abs(last - returned) > 1e-9, (
+            "the stored sample must be the raw blend, not the calibrated output"
+        )
+
+    def test_retrieval_passes_record_at_the_formatting_site(self):
+        import inspect
+
+        from minni.retrieval import RetrievalEngine
+
+        src = inspect.getsource(RetrievalEngine.retrieve)
+        assert "record=True" in src, (
+            "the final formatted result set is the one site that feeds the window"
+        )
+
+
+# ---------------------------------------------------------------------------
+# #225-R6 / GA1-1 — the vector gap needs a retry AND a visible ratio
+# ---------------------------------------------------------------------------
+
+class _StubEmbedder:
+    """Deterministic encoder — the backfill only needs a vector, not a good one."""
+
+    def encode(self, text):
+        import numpy as np
+
+        vec = np.zeros(384, dtype="float32")
+        vec[len(text) % 384] = 1.0
+        return vec
+
+
+class TestEmbeddingBackfillAndCoverage:
+    def _stub_encoder(self, monkeypatch):
+        import minni.models as models
+
+        monkeypatch.setattr(models, "get_embedder", lambda: _StubEmbedder())
+
+    def test_coverage_reports_the_document_vector_ratio(self, tmp_path):
+        from minni.backfill import embedding_coverage
+
+        db_obj, _cfg = _make_db(tmp_path)
+        with db_obj.cursor() as c:
+            for i in range(4):
+                c.execute(
+                    "INSERT INTO documents (path, agent, sigil) VALUES (?, 'a', 'v')",
+                    (f"d{i}.md",),
+                )
+            # Only one of the four has a vector.
+            c.execute(
+                """INSERT INTO chunk_embeddings
+                   (doc_id, chunk_index, chunk_text, embedding)
+                   VALUES (1, 0, 'x', X'00')"""
+            )
+
+        cov = embedding_coverage(db_obj)
+        assert cov["documents_total"] == 4
+        assert cov["documents_with_vectors"] == 1
+        assert cov["documents_missing_vectors"] == 3
+        assert abs(cov["documents_vector_ratio"] - 0.25) < 1e-9
+
+    def test_empty_index_reports_no_ratio_rather_than_perfect(self, tmp_path):
+        """Claiming 100% coverage for zero documents is exactly the
+        health-signal overstatement this audit exists to remove."""
+        from minni.backfill import embedding_coverage
+
+        db_obj, _cfg = _make_db(tmp_path)
+        cov = embedding_coverage(db_obj)
+        assert cov["documents_vector_ratio"] is None
+        assert cov["learnings_embedding_ratio"] is None
+
+    def test_learning_embedding_backfill_fills_nulls(self, tmp_path, monkeypatch):
+        from minni.backfill import backfill_learning_embeddings
+
+        self._stub_encoder(monkeypatch)
+        db_obj, cfg = _make_db(tmp_path)
+        with db_obj.cursor() as c:
+            c.execute(
+                """INSERT INTO learnings (agent_id, category, content, confidence,
+                                          created_at, embedding)
+                   VALUES ('codex', 'fix', 'websocket backoff is 500ms', 1.0, ?, NULL)""",
+                (time.time(),),
+            )
+            lid = c.lastrowid
+
+        stats = backfill_learning_embeddings(db_obj, cfg)
+        assert stats["embedded"] == 1
+
+        with db_obj.cursor() as c:
+            emb = c.execute(
+                "SELECT embedding FROM learnings WHERE learning_id = ?", (lid,)
+            ).fetchone()["embedding"]
+        assert emb is not None, (
+            "promote_candidate_durable stores embedding=NULL on encode failure "
+            "and search hard-filters on IS NOT NULL — with no backfill those "
+            "learnings were permanently unreachable"
+        )
+
+    def test_document_vector_backfill_creates_chunks(self, tmp_path, monkeypatch):
+        from minni.backfill import backfill_document_vectors
+
+        self._stub_encoder(monkeypatch)
+        db_obj, cfg = _make_db(tmp_path)
+        body = "# Title\n\n" + ("the deployment rollback procedure. " * 40)
+        with db_obj.cursor() as c:
+            c.execute(
+                "INSERT INTO documents (path, agent, sigil, layer) "
+                "VALUES ('a.md', 'codex', 'vault', 'artifact')"
+            )
+            doc_id = c.lastrowid
+            c.execute(
+                "INSERT INTO vault_fts (doc_id, path, content, agent, sigil) "
+                "VALUES (?, 'a.md', ?, 'codex', 'vault')",
+                (doc_id, body),
+            )
+
+        stats = backfill_document_vectors(db_obj, cfg)
+        assert stats["documents"] == 1
+        assert stats["chunks"] >= 1
+
+        with db_obj.cursor() as c:
+            layers = {
+                r["layer"] for r in c.execute(
+                    "SELECT layer FROM chunk_embeddings WHERE doc_id = ?", (doc_id,)
+                ).fetchall()
+            }
+        assert layers == {"artifact"}, (
+            "backfilled chunks must inherit the document's layer, not default "
+            "to knowledge — that is the GA6-1 bug in a new place"
+        )
+
+    def test_backfill_leaves_a_document_with_no_indexed_text_visible(
+        self, tmp_path, monkeypatch
+    ):
+        """Never fix a signal by suppressing it: an unbackfillable document is
+        counted, not quietly treated as done."""
+        from minni.backfill import backfill_document_vectors
+
+        self._stub_encoder(monkeypatch)
+        db_obj, cfg = _make_db(tmp_path)
+        with db_obj.cursor() as c:
+            c.execute(
+                "INSERT INTO documents (path, agent, sigil) "
+                "VALUES ('empty.md', 'codex', 'vault')"
+            )
+
+        stats = backfill_document_vectors(db_obj, cfg)
+        assert stats["documents"] == 0
+        assert stats["skipped_no_content"] == 1
+
+    def test_backfill_without_an_encoder_reports_rather_than_claiming_success(
+        self, tmp_path, monkeypatch
+    ):
+        import minni.models as models
+        from minni.backfill import backfill_learning_embeddings
+
+        monkeypatch.setattr(models, "get_embedder", lambda: None)
+        db_obj, cfg = _make_db(tmp_path)
+        stats = backfill_learning_embeddings(db_obj, cfg)
+        assert stats["skipped_no_model"] == 1
+        assert stats["embedded"] == 0
+
+    def test_daemon_schedules_the_backfill(self):
+        import inspect
+
+        import minni.minnid as minnid
+
+        assert hasattr(minnid, "_backfill_runner")
+        src = inspect.getsource(minnid.main)
+        assert "_backfill_runner()" in src, (
+            "the degraded status was logged but no retry was queued — a log "
+            "line is not a queue"
+        )
+        assert "backfill_task.cancel()" in src
+
+    def test_health_report_declares_the_coverage_field(self):
+        import inspect
+
+        import minni.minnid_runtime.health as health
+
+        src = inspect.getsource(health.handle_health_report)
+        assert "embedding_coverage" in src, (
+            "health never compared document count against vector count, so the "
+            "gap was invisible to every status surface"
+        )
+
+
+# ---------------------------------------------------------------------------
+# GA4-4 — a disk-restored FAISS index must still be rebuildable
+# ---------------------------------------------------------------------------
+
+class TestFaissWarmStartRebuild:
+    """load_from_disk restored the index but set _vectors = [], and every
+    rebuild path is guarded on _vectors — so after a warm start rebuild() was
+    a silent no-op and chunks removed since the snapshot stayed searchable."""
+
+    def _index(self, tmp_path):
+        from minni.config import SovereignConfig
+        from minni.faiss_index import FAISSIndex
+
+        cfg = SovereignConfig(db_path=str(tmp_path / "f.db"))
+        return FAISSIndex(cfg)
+
+    def _vecs(self, n, dim):
+        import numpy as np
+
+        arr = np.zeros((n, dim), dtype="float32")
+        for i in range(n):
+            arr[i][i % dim] = 1.0
+        return arr
+
+    def test_reconstruct_recovers_raw_vectors(self, tmp_path):
+        idx = self._index(tmp_path)
+        dim = idx.config.embedding_dim
+        idx.build_from_vectors([10, 11, 12], self._vecs(3, dim))
+
+        # Simulate exactly what load_from_disk leaves behind: a live index with
+        # id maps, and no raw vectors.
+        idx._vectors = []
+        assert idx._reconstruct_vectors_from_index() is True
+        assert len(idx._vectors) == 3
+
+    def test_rebuild_after_a_warm_start_compacts_removals(self, tmp_path):
+        idx = self._index(tmp_path)
+        dim = idx.config.embedding_dim
+        idx.build_from_vectors([10, 11, 12], self._vecs(3, dim))
+
+        idx._vectors = []          # the warm-start state
+        idx.remove(11)
+        idx.rebuild()
+
+        assert 11 not in idx._chunk_ids, (
+            "rebuild must compact a removed chunk out of a disk-restored "
+            "index; on the old code it returned without doing anything"
+        )
+        assert sorted(idx._chunk_ids) == [10, 12]
+
+    def test_rebuild_reports_when_it_cannot_recover(self, tmp_path, caplog):
+        """Never fix a signal by suppressing it: if reconstruction is
+        impossible the skip must be visible, not silent."""
+        import logging
+
+        idx = self._index(tmp_path)
+        dim = idx.config.embedding_dim
+        idx.build_from_vectors([10, 11], self._vecs(2, dim))
+        idx._vectors = []
+        idx._index = None  # nothing left to reconstruct from
+
+        with caplog.at_level(logging.WARNING):
+            idx.rebuild()
+        assert any("rebuild skipped" in r.message.lower() or
+                   "rebuild skipped" in r.getMessage().lower()
+                   for r in caplog.records), "the skip must be logged"
+
+
+# ---------------------------------------------------------------------------
 # GA6-1 / GA7-2 — every document writer must stamp the layer it infers
 # ---------------------------------------------------------------------------
 

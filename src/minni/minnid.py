@@ -1251,6 +1251,64 @@ async def _decay_runner():
             raise
 
 
+def _backfill_enabled() -> bool:
+    """Drain the embedding backlog (MINNI_BACKFILL=off to disable)."""
+    return (os.environ.get("MINNI_BACKFILL", "on") or "on").strip().lower() != "off"
+
+
+def _backfill_interval() -> int:
+    try:
+        raw = int(os.environ.get("MINNI_BACKFILL_INTERVAL", "3600"))
+    except (TypeError, ValueError):
+        return 3600
+    return max(300, raw)
+
+
+def _backfill_sweep_once() -> dict:
+    """Blocking bounded backfill pass over the shared index. Runs off-loop."""
+    from minni.backfill import run_backfill
+
+    db = SovereignDB.shared(DEFAULT_CONFIG)
+    return run_backfill(db, DEFAULT_CONFIG)
+
+
+async def _backfill_runner():
+    """Audit #225-R6 / GA1-1: two write paths degrade to "no vector" and neither
+    ever retried. 381 of 879 shared-index documents had no chunk_embeddings rows
+    and 409 learnings had a NULL embedding — both permanently excluded from
+    semantic recall, because the degraded status was logged and nothing queued a
+    retry. A log line is not a queue; this is the queue.
+
+    Bounded per pass (backfill.DEFAULT_BATCH) so the drain never holds a long
+    write lock against live recall — the backlog empties over several passes.
+    """
+    interval = _backfill_interval()
+    logger.info("Embedding backfill enabled: every %ss", interval)
+    initial_delay = min(600, interval)
+    try:
+        await asyncio.sleep(initial_delay)
+    except asyncio.CancelledError:
+        raise
+    while True:
+        try:
+            stats = await asyncio.to_thread(_backfill_sweep_once)
+            docs = (stats or {}).get("documents") or {}
+            learnings = (stats or {}).get("learnings") or {}
+            if docs.get("documents") or learnings.get("embedded"):
+                logger.info(
+                    "Backfill: %s document(s), %s learning(s) embedded",
+                    docs.get("documents", 0), learnings.get("embedded", 0),
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Embedding backfill pass failed")
+        try:
+            await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            raise
+
+
 def _handle_daemon_endorse(params: dict, request_id: Any) -> dict:
     return _runtime_handle_daemon_endorse(params, request_id, _afm_context())
 
@@ -1759,6 +1817,12 @@ def main():
     if _decay_enabled():
         decay_task = loop.create_task(_decay_runner())
 
+    # Embedding backfill (MINNI_BACKFILL=off to disable). Without it the
+    # document/learning vector gap is permanent — nothing else retries.
+    backfill_task = None
+    if _backfill_enabled():
+        backfill_task = loop.create_task(_backfill_runner())
+
     # Model warmup. Scheduled AFTER the socket is being served, so the daemon is
     # answerable during the load: an early caller still gets the lazy path, it
     # just no longer has to be the one that pays for it.
@@ -1782,6 +1846,8 @@ def main():
             vault_watch_task.cancel()
         if decay_task is not None:
             decay_task.cancel()
+        if backfill_task is not None:
+            backfill_task.cancel()
         if warmup_task is not None:
             warmup_task.cancel()
 

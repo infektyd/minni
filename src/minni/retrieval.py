@@ -2969,6 +2969,11 @@ class RetrievalEngine:
                     cross_encoder_score=r.get("rerank_score"),
                     decay_factor=r.get("decay_score"),
                     db=self.db,
+                    # GA4-1: this is the one site that feeds the calibration
+                    # window — the final, formatted, caller-visible result set.
+                    # The HyDE probe above deliberately does not record: it
+                    # scores candidates it may discard.
+                    record=True,
                 )
             except Exception:
                 confidence = None
