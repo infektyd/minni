@@ -542,12 +542,13 @@ def replace_toml_sections(path: Path, sections: dict[str, str], *, preserve_surf
                     resolved_env[k] = ex_env[k]
                 elif k in fresh_env:
                     resolved_env[k] = fresh_env[k]
-            # Codex hook mirror survives flagless upgrades: the fresh
-            # section carries MINNI_CODEX_* only for the codex surface, so
-            # its presence is the surface signal. Re-derive from the
-            # RESOLVED generic identity (never carried raw from ex_env —
-            # X2) so hooks track whatever vault survived preservation.
-            if any(k.startswith("MINNI_CODEX_") for k in fresh_env):
+            # Codex hook mirror: match wire/writers.py — re-derive when the
+            # fresh section already carries MINNI_CODEX_* *or* the resolved
+            # agent is codex (so a preserve rewrite cannot drop the mirrors
+            # if a caller built a codex fresh section without them).
+            if any(k.startswith("MINNI_CODEX_") for k in fresh_env) or (
+                str(resolved_env.get("MINNI_AGENT_ID") or "") == "codex"
+            ):
                 _mirror_codex_hook_env(resolved_env, "codex")
             preserved_lines = [
                 f'{k} = "{_toml_basic_str(v)}"' for k, v in resolved_env.items()

@@ -273,3 +273,50 @@ def test_toml_basic_str_parity_with_wire():
     )
     for raw in samples:
         assert propagate._toml_basic_str(raw) == wire_esc(raw), repr(raw)
+
+
+def test_propagate_codex_preserve_rederives_mirror_when_agent_is_codex(tmp_path, monkeypatch):
+    """Match wire: MINNI_AGENT_ID=codex alone must re-derive MINNI_CODEX_* on preserve."""
+    import tomllib
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    vault = tmp_path / ".minni" / "codex-vault"
+    vault.mkdir(parents=True)
+    sock = tmp_path / ".minni" / "run" / "minnid.sock"
+    sock.parent.mkdir(parents=True, exist_ok=True)
+    path = tmp_path / "config.toml"
+    path.write_text(
+        "[mcp_servers.minni]\n"
+        'command = "node"\n'
+        'args = ["/old.js"]\n'
+        "enabled = true\n\n"
+        "[mcp_servers.minni.env]\n"
+        'MINNI_AGENT_ID = "codex"\n'
+        f'MINNI_VAULT_PATH = "{vault}"\n'
+        f'MINNI_SOCKET_PATH = "{sock}"\n'
+        'MINNI_WORKSPACE_ID = "ws-preserved"\n'
+        'MINNI_CODEX_WORKSPACE_ID = "ws-stale"\n',
+        encoding="utf-8",
+    )
+    # Fresh section has agent=codex but deliberately omits MINNI_CODEX_* keys.
+    sections = {
+        "mcp_servers.minni": (
+            "[mcp_servers.minni]\n"
+            'command = "node"\n'
+            'args = ["/new.js"]\n'
+            "enabled = true\n"
+        ),
+        "mcp_servers.minni.env": (
+            "[mcp_servers.minni.env]\n"
+            'MINNI_AGENT_ID = "codex"\n'
+            f'MINNI_VAULT_PATH = "{vault}"\n'
+            f'MINNI_SOCKET_PATH = "{sock}"\n'
+            'MINNI_WORKSPACE_ID = "ws-fresh"\n'
+        ),
+    }
+    propagate.replace_toml_sections(path, sections, preserve_surface_env=True)
+    env = tomllib.loads(path.read_text(encoding="utf-8"))["mcp_servers"]["minni"]["env"]
+    assert env["MINNI_WORKSPACE_ID"] == "ws-preserved"
+    assert env["MINNI_CODEX_WORKSPACE_ID"] == "ws-preserved"
+    assert env["MINNI_CODEX_AGENT_ID"] == "codex"
+    assert env["MINNI_CODEX_VAULT_PATH"] == str(vault)

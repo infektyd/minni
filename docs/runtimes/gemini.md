@@ -9,9 +9,10 @@ Wire Gemini to a running Minni daemon from your checkout:
 
 Standalone Gemini wiring is **provisional** in `minni wire` (the
 `${extensionPath}` extension-manifest mechanism is still being verified —
-issue #142's open question 8), so `minni wire gemini` reports a provisional
-failure and `minni wire all` skips gemini with a warning; use the propagate.py
-command above from a checkout for now.
+issue #142's open question 8), so `minni wire gemini` reports status
+`skipped` (exit 1 when nothing else wired) and `minni wire all` includes
+gemini as a named skip with a warning; use the propagate.py command above
+from a checkout for now.
 
 Antigravity rides the same `~/.gemini` surface (shared agent identity
 `gemini`, vault `~/.minni/gemini-vault`) but is wired **individually**, and

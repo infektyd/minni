@@ -619,3 +619,26 @@ def test_wire_from_repo_relative_path_resolved(wire_env, monkeypatch):
     rc = run_wire(_args("claude-code", home, from_repo="."))
     assert rc == 0
     assert captured["repo_root"].is_absolute()
+
+
+def test_wire_missing_config_root_is_skipped(wire_env, monkeypatch, capsys):
+    """Optional fleet members without a host config root skip, not fail."""
+    _patch_payload(wire_env, monkeypatch)
+    home = wire_env[0]
+    # Remove kilocode surface so preflight reports no config root.
+    kilo = home / ".config" / "kilo"
+    if kilo.exists():
+        import shutil
+        shutil.rmtree(kilo)
+    rc = run_wire(_args("kilocode", home, dry_run=True))
+    # dry-run with only skipped platforms: emit path still dry-run if it
+    # reaches finalize before wiring; missing root skips before dry-run body.
+    out = json.loads(capsys.readouterr().out)
+    by = {r["platform"]: r for r in out["results"]}
+    assert "kilocode" in by, out
+    assert by["kilocode"]["status"] == "skipped", out
+    assert "no config root" in by["kilocode"].get("reason", "")
+    # Single-platform all-skipped is exit 1 (D5); status is skipped not failed.
+    assert out["status"] in ("skipped", "dry-run"), out
+    if out["status"] == "skipped":
+        assert rc == 1

@@ -213,20 +213,17 @@ def _home() -> Path:
     return Path(override) if override else Path.home()
 
 
-def _active_wire_plugin_roots(home: Path) -> set[Path]:
-    """Live wire install roots under ~/.minni/plugin (latest per platform).
+def _active_wire_plugin_state(home: Path) -> tuple[set[Path], set[str]]:
+    """Live wire install roots + platforms under ~/.minni/plugin.
 
-    Mirrors scripts/check_versions.py so --strict sync-root verify uses the
-    same active set. Latest ``wired_at`` *per platform* stays active (a codex
-    root that is still that platform's newest record may still be the live MCP
-    target); only superseded rows for the same platform are dropped.
-
-    ``current`` is fallback only when no valid wire records exist — local
-    (+git.*) installs never move it, so always-including a zombie release
-    symlink permanently fails --strict after --from-repo adoption.
+    Latest ``wired_at`` *per platform* stays active. Platforms are returned so
+    marketplace-cache skip is per-surface (claude-code wire must not silence a
+    still-live Codex cache). ``current`` is fallback only when no valid wire
+    records exist.
     """
     base = home / ".minni" / "plugin"
     actives: set[Path] = set()
+    platforms: set[str] = set()
     wired = base / "wired.json"
     try:
         data = json.loads(wired.read_text(encoding="utf-8"))
@@ -245,19 +242,26 @@ def _active_wire_plugin_roots(home: Path) -> set[Path]:
             prev = latest_by_platform.get(platform)
             if prev is None or wired_at >= prev[0]:
                 latest_by_platform[platform] = (wired_at, root.resolve())
-        for _wired_at, root in latest_by_platform.values():
+        for platform, (_wired_at, root) in latest_by_platform.items():
             actives.add(root)
+            platforms.add(platform)
     except (OSError, json.JSONDecodeError, TypeError):
         pass
     if actives:
-        return actives
+        return actives, platforms
     current = base / "current"
     try:
         if current.exists():
             actives.add(current.resolve())
     except OSError:
         pass
-    return actives
+    return actives, platforms
+
+
+def _active_wire_plugin_roots(home: Path) -> set[Path]:
+    """Live wire install roots (latest per platform)."""
+    roots, _platforms = _active_wire_plugin_state(home)
+    return roots
 
 
 def _is_versioned_wire_plugin_dist(dist: Path, home: Path) -> bool:
@@ -273,22 +277,25 @@ def _is_versioned_wire_plugin_dist(dist: Path, home: Path) -> bool:
     )
 
 
-def _is_legacy_marketplace_cache_dist(dist: Path, home: Path) -> bool:
-    """Claude/Codex marketplace cache dists superseded by wire-primary installs.
+def _marketplace_cache_platform(dist: Path, home: Path) -> str | None:
+    """Return the platform that owns this marketplace cache dist, or None.
 
-    ``make sync-root`` deliberately does not refresh these (wire points MCP at
-    ``~/.minni/plugin``). After wire adoption they stay STALE/DRIFT forever if
-    ``--strict`` still gates on them — the same mid-migration failure mode as
-    historical version dirs under the wire tree.
+    Claude marketplace cache → claude-code; Codex marketplace cache → codex.
     """
     try:
         rel = str(dist.resolve().relative_to(home.resolve()))
     except (OSError, ValueError):
         rel = str(dist)
-    return (
-        rel.startswith(".claude/plugins/cache/")
-        or rel.startswith(".codex/plugins/cache/")
-    )
+    if rel.startswith(".claude/plugins/cache/"):
+        return "claude-code"
+    if rel.startswith(".codex/plugins/cache/"):
+        return "codex"
+    return None
+
+
+def _is_legacy_marketplace_cache_dist(dist: Path, home: Path) -> bool:
+    """Claude/Codex marketplace cache dists (path shape only)."""
+    return _marketplace_cache_platform(dist, home) is not None
 
 
 def discover() -> list[Path]:
@@ -296,10 +303,17 @@ def discover() -> list[Path]:
     found: list[Path] = []
     for pattern in DEPLOYMENT_GLOBS:
         found.extend(sorted(home.glob(pattern)))
-    for rel in REPO_DEPLOYMENTS:
-        p = REPO_ROOT / rel
-        if p.is_dir():
-            found.append(p)
+    # Day-to-day sync-root must not gate on a leftover `make stage-payload`
+    # tree under src/minni/plugin_payload/ (release artifact, not a live
+    # host surface). Set MINNI_CHECK_DEPLOYMENTS_SKIP_REPO=1 from update_root.
+    skip_repo = os.environ.get("MINNI_CHECK_DEPLOYMENTS_SKIP_REPO", "").strip() in {
+        "1", "true", "yes",
+    }
+    if not skip_repo:
+        for rel in REPO_DEPLOYMENTS:
+            p = REPO_ROOT / rel
+            if p.is_dir():
+                found.append(p)
     return found
 
 
@@ -311,7 +325,7 @@ def discover_active() -> tuple[list[Path], list[str]]:
     successful wire-primary redeploy.
     """
     home = _home()
-    active = _active_wire_plugin_roots(home)
+    active, active_platforms = _active_wire_plugin_state(home)
     kept: list[Path] = []
     notes: list[str] = []
     for dist in discover():
@@ -324,11 +338,13 @@ def discover_active() -> tuple[list[Path], list[str]]:
                     "historical version dir)"
                 )
                 continue
-        # Only skip marketplace caches once wire is live on this host —
-        # otherwise a pure-cache install still needs --strict signal.
-        if active and _is_legacy_marketplace_cache_dist(dist, home):
+        # Skip marketplace caches only for platforms that have an active wire
+        # record. Host-global skip would silence a still-live Codex cache when
+        # only claude-code is wire-active (mid-migration).
+        cache_plat = _marketplace_cache_platform(dist, home)
+        if cache_plat is not None and cache_plat in active_platforms:
             notes.append(
-                f"{label}: skipped (legacy marketplace cache; "
+                f"{label}: skipped (legacy marketplace cache for {cache_plat}; "
                 "wire-primary — not managed by sync-root)"
             )
             continue

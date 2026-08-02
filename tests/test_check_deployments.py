@@ -33,12 +33,14 @@ def _isolated_repo_root(tmp_path: Path) -> Path:
     return root
 
 
-def _run(*args, home: Path, repo_root: Path):
+def _run(*args, home: Path, repo_root: Path, extra_env: dict | None = None):
     env = {
         **os.environ,
         "MINNI_CHECK_DEPLOYMENTS_HOME": str(home),
         "MINNI_CHECK_DEPLOYMENTS_REPO_ROOT": str(repo_root),
     }
+    if extra_env:
+        env.update(extra_env)
     return subprocess.run(
         [sys.executable, str(SCRIPT), *args],
         cwd=REPO,
@@ -552,3 +554,92 @@ def test_legacy_marketplace_cache_skipped_when_wire_active(tmp_path):
     # Active wire + skipped cache only: --strict must stay green.
     assert proc.returncode == 0, proc.stdout
     assert "STALE" not in proc.stdout
+
+
+def test_repo_plugin_payload_skipped_when_env_set(tmp_path):
+    """sync-root must not gate on leftover stage-payload under plugin_payload."""
+    home = tmp_path / "home"
+    home.mkdir()
+    # Real-shaped repo root with a stale in-repo payload dist (would STALE).
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "plugins").symlink_to(REPO / "plugins")
+    payload = root / "src" / "minni" / "plugin_payload"
+    payload.mkdir(parents=True)
+    for sub in ("hooks", "commands", "skills", ".claude-plugin", ".codex-plugin",
+                ".cursor-plugin", ".kilocode-plugin", ".gemini-plugin"):
+        src = SOURCE / sub
+        if src.is_dir():
+            _copytree(src, payload / sub)
+    (payload / "dist").mkdir()
+    (payload / "dist" / "server.js").write_text("// staged\n", encoding="utf-8")
+    (payload / "dist" / "build-manifest.json").write_text(
+        json.dumps({"git_sha": "a" * 40, "built_at": "2026-01-01T00:00:00Z"}),
+        encoding="utf-8",
+    )
+
+    marker = "src/minni/plugin_payload"
+    # Without skip: in-repo payload is discovered (may STALE/DRIFT).
+    bare = _run("--strict", home=home, repo_root=root)
+    assert marker in bare.stdout, bare.stdout
+
+    # With skip (what update_root sets): not discovered at all.
+    skipped = _run(
+        "--strict",
+        home=home,
+        repo_root=root,
+        extra_env={"MINNI_CHECK_DEPLOYMENTS_SKIP_REPO": "1"},
+    )
+    assert marker not in skipped.stdout, skipped.stdout
+    assert skipped.returncode == 0, skipped.stdout
+
+
+def test_marketplace_cache_skip_is_per_platform(tmp_path):
+    """Only the platform that is wire-active should silence its marketplace cache.
+
+    claude-code wire alone must not skip a still-live Codex cache (mid-migration).
+    """
+    home = tmp_path / "home"
+    home.mkdir()
+    plugin = home / ".minni" / "plugin"
+    fresh = plugin / "0.4.1+git.deadbeef"
+    fresh.mkdir(parents=True)
+    for sub in ("hooks", "commands", "skills", ".claude-plugin", ".codex-plugin",
+                ".cursor-plugin", ".kilocode-plugin", ".gemini-plugin"):
+        src = SOURCE / sub
+        if src.is_dir():
+            _copytree(src, fresh / sub)
+    _artifact_dist(fresh)
+    (plugin / "wired.json").write_text(
+        json.dumps({
+            "schema": 1,
+            "wires": [{
+                "platform": "claude-code",
+                "install_root": str(fresh),
+                "wired_at": "2026-08-02T00:00:00Z",
+            }],
+        }),
+        encoding="utf-8",
+    )
+    # Stale Codex marketplace cache — still the live path if Codex was never wired.
+    codex_cache = (
+        home / ".codex" / "plugins" / "cache" / "minni" / "minni" / "0.2.9"
+    )
+    codex_cache.mkdir(parents=True)
+    for sub in ("hooks", "commands", "skills", ".claude-plugin", ".codex-plugin",
+                ".cursor-plugin", ".kilocode-plugin", ".gemini-plugin"):
+        src = SOURCE / sub
+        if src.is_dir():
+            _copytree(src, codex_cache / sub)
+    (codex_cache / "dist").mkdir()
+    (codex_cache / "dist" / "server.js").write_text("// codex cache\n", encoding="utf-8")
+    (codex_cache / "dist" / "build-manifest.json").write_text(
+        json.dumps({"git_sha": "b" * 40, "built_at": "2026-06-01T00:00:00Z"}),
+        encoding="utf-8",
+    )
+
+    proc = _run("--strict", home=home, repo_root=_isolated_repo_root(tmp_path))
+    # Must still judge the codex cache (not skip it under claude-only wire).
+    assert "legacy marketplace cache for codex" not in proc.stdout, proc.stdout
+    assert "0.2.9" in proc.stdout
+    assert "STALE" in proc.stdout or proc.returncode != 0, proc.stdout

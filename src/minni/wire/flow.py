@@ -358,11 +358,27 @@ def run_wire(args) -> int:
 
                 plat_errors = preflight_platform(platform)
                 if plat_errors:
-                    out.results.append(
-                        PlatformResult(
-                            platform, "failed", reason="; ".join(plat_errors),
-                        ),
-                    )
+                    # Missing config root is a host-surface skip (optional
+                    # platform not installed), not a hard failure. Without this
+                    # `wire all` / sync-root fails on hosts that only run a
+                    # subset of the fleet. Real preflight defects (node, etc.)
+                    # still fail the platform.
+                    if plat_errors and all(
+                        "no config root found" in e for e in plat_errors
+                    ):
+                        out.results.append(
+                            PlatformResult(
+                                platform, "skipped",
+                                reason="; ".join(plat_errors),
+                            ),
+                        )
+                    else:
+                        out.results.append(
+                            PlatformResult(
+                                platform, "failed",
+                                reason="; ".join(plat_errors),
+                            ),
+                        )
                     continue
 
                 mcp_root = None

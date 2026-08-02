@@ -292,3 +292,16 @@ def test_kickstart_failure_not_misdiagnosed_as_not_loaded():
     assert "DAEMON_RESTART_FAILED" in text
     assert "launchctl kickstart failed (agent" in text
     assert "DAEMON_MISSING" not in text or text.count("DAEMON_MISSING") == 0
+
+
+def test_sync_root_skips_repo_plugin_payload_on_strict_verify():
+    """Leftover stage-payload must not fail day-to-day sync-root --strict."""
+    text = SCRIPT.read_text(encoding="utf-8")
+    assert "MINNI_CHECK_DEPLOYMENTS_SKIP_REPO=1" in text
+
+
+def test_grok_hooks_refresh_skips_when_no_grok_surface():
+    """Optional grok surface: no wire root and no ~/.grok is a skip, not fail."""
+    text = SCRIPT.read_text(encoding="utf-8")
+    assert "no grok wire install root and no ~/.grok" in text
+    assert "hooks refresh not needed" in text

@@ -89,3 +89,25 @@ def test_config_root_candidates_follow_current_home(tmp_path, monkeypatch):
     assert wire_platform.config_root_candidates()["codex"] == (home_a / ".codex",)
     monkeypatch.setenv("HOME", str(home_b))
     assert wire_platform.config_root_candidates()["codex"] == (home_b / ".codex",)
+
+def test_missing_config_root_only_is_skipped_status_contract():
+    """Pure "no config root" preflight must finalize as skip, not fail.
+
+    Combined with at least one wired platform, overall status stays ok so
+    partial-fleet hosts can complete wire all / sync-root.
+    """
+    from minni.wire.output import PlatformResult, WireOutput
+
+    errors = [
+        "no config root found for kilocode (probed: /x); "
+        "create the platform config or use --install-root"
+    ]
+    assert all("no config root found" in e for e in errors)
+    out = WireOutput(status="ok")
+    out.results.append(PlatformResult("claude-code", "wired", reason="ok"))
+    out.results.append(
+        PlatformResult("kilocode", "skipped", reason="; ".join(errors)),
+    )
+    out.finalize_status(dry_run=False)
+    assert out.status == "ok"
+    assert out.emit() == 0

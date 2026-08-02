@@ -255,7 +255,14 @@ if root is None:
     current = base / "current"
     root = current.resolve() if current.exists() else None
 if root is None:
-    print("no grok wire install root for hooks refresh", file=sys.stderr)
+    # No grok wire and no ~/.minni/plugin/current — host is not running grok.
+    # Do not fail redeploy for an optional surface (same class as wire "no
+    # config root" → skipped).
+    grok_cfg = home / ".grok"
+    if not grok_cfg.exists():
+        print("skip: no grok wire install root and no ~/.grok — hooks refresh not needed")
+        sys.exit(0)
+    print("no grok wire install root for hooks refresh (~/.grok present)", file=sys.stderr)
     sys.exit(1)
 hooks = mod.update_grok_hooks(root)
 rules = mod.write_grok_rules()
@@ -318,14 +325,18 @@ else
     printf 'current state (not a plan gate): %s scripts/check_versions.py\n' "$VENV_PY"
     "$VENV_PY" scripts/check_versions.py || true
     printf 'current state (not a plan gate): %s scripts/check_deployments.py --strict\n' "$VENV_PY"
-    "$VENV_PY" scripts/check_deployments.py --strict || true
+    # Skip in-repo stage-payload tree: sync does not refresh it; leftover
+    # src/minni/plugin_payload must not fail day-to-day root sync.
+    MINNI_CHECK_DEPLOYMENTS_SKIP_REPO=1 \
+      "$VENV_PY" scripts/check_deployments.py --strict || true
   else
     printf 'running:   %s scripts/check_versions.py\n' "$VENV_PY"
     if ! "$VENV_PY" scripts/check_versions.py; then
       VERIFY_EXIT=1
     fi
     printf 'running:   %s scripts/check_deployments.py --strict\n' "$VENV_PY"
-    if ! "$VENV_PY" scripts/check_deployments.py --strict; then
+    if ! MINNI_CHECK_DEPLOYMENTS_SKIP_REPO=1 \
+        "$VENV_PY" scripts/check_deployments.py --strict; then
       VERIFY_EXIT=1
     fi
   fi
