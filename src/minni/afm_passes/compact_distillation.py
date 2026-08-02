@@ -76,6 +76,7 @@ from minni.safety import is_instruction_like
 from minni.afm_passes.inbox_archive import archive_inbox_file
 from minni.afm_passes.inbox_ingest import (
     CONTENT_CAP,
+    _coerce_candidate_index,
     _content_sha1,
     _existing_keys,
     _principal_for_inbox,
@@ -400,7 +401,36 @@ def distill(db, config, inboxes: Optional[List[Path]] = None,
     if not dry_run and to_insert:
         now = time.time()
         with db.transaction() as c:
+            # Issue #239: re-load keys inside the write txn so concurrent
+            # distill (or distill+ingest) processes cannot both pass the
+            # pre-txn check and insert twin rows. Mirror inbox_ingest:
+            # in-txn key set + UNIQUE swallow.
+            txn_existing: set = set()
+            c.execute("SELECT derived_from FROM candidate_packets")
+            for row in c.fetchall():
+                df = (
+                    row["derived_from"]
+                    if isinstance(row, dict) or hasattr(row, "keys")
+                    else row[0]
+                )
+                if not df:
+                    continue
+                try:
+                    obj = json.loads(df)
+                except Exception:
+                    continue
+                if not isinstance(obj, dict) or obj.get("source") != "inbox":
+                    continue
+                f = obj.get("inbox_file")
+                i = _coerce_candidate_index(obj.get("candidate_index"))
+                if isinstance(f, str) and i is not None:
+                    txn_existing.add((f, i))
+
             for r in to_insert:
+                key = (r["inbox_file"], r["candidate_index"])
+                if key in txn_existing:
+                    already += 1
+                    continue
                 derived_from = json.dumps({
                     # 'inbox' + inbox_file is the inbox_archive lifecycle key —
                     # keep it EXACTLY this shape (see module docstring).
@@ -415,25 +445,34 @@ def distill(db, config, inboxes: Optional[List[Path]] = None,
                     "afm_distilled": r["afm_distilled"],
                     "content_sha1": _content_sha1(r["content"]),
                 })
-                c.execute(
-                    """
-                    INSERT INTO candidate_packets
-                    (principal, workspace_id, layer, privacy_level, content,
-                     evidence_refs, derived_from, instruction_like, status, proposed_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'proposed', ?)
-                    """,
-                    (
-                        r["principal"],
-                        r["workspace_id"],
-                        None,
-                        r["privacy_level"],
-                        r["content"],
-                        json.dumps([]),
-                        derived_from,
-                        1 if is_instruction_like(r["content"]) else 0,
-                        now,
-                    ),
-                )
+                try:
+                    c.execute(
+                        """
+                        INSERT INTO candidate_packets
+                        (principal, workspace_id, layer, privacy_level, content,
+                         evidence_refs, derived_from, instruction_like, status, proposed_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'proposed', ?)
+                        """,
+                        (
+                            r["principal"],
+                            r["workspace_id"],
+                            None,
+                            r["privacy_level"],
+                            r["content"],
+                            json.dumps([]),
+                            derived_from,
+                            1 if is_instruction_like(r["content"]) else 0,
+                            now,
+                        ),
+                    )
+                except Exception as exc:
+                    # Unique-index collision (post-#239 repair) or rare race:
+                    # treat as already_present rather than aborting the batch.
+                    if "UNIQUE" in str(exc).upper():
+                        already += 1
+                        continue
+                    raise
+                txn_existing.add(key)
                 inserted += 1
 
     # Archive only after the insert transaction above has committed — the

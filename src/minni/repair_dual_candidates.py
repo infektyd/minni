@@ -159,12 +159,26 @@ def find_duplicate_candidate_groups(db) -> List[Dict[str, Any]]:
 
 
 def _table_exists(db, name: str) -> bool:
+    """Probe via auto-commit cursor — never call inside ``db.transaction()``.
+
+    ``db.cursor()`` commits on exit; using it mid-transaction would end the
+    outer ``BEGIN IMMEDIATE`` early and commit deletes piecewise.
+    """
     with db.cursor() as c:
         c.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1",
             (name,),
         )
         return c.fetchone() is not None
+
+
+def _table_exists_on_cursor(c, name: str) -> bool:
+    """Probe using an open transaction cursor (no commit)."""
+    c.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1",
+        (name,),
+    )
+    return c.fetchone() is not None
 
 
 def _audit_drop(c, loser_id: int, winner_id: int, winner_status: str, now: float) -> None:
@@ -216,7 +230,14 @@ def repair_duplicate_candidate_pairs(
     deleted = 0
     if not dry_run and plan:
         now = time.time()
+        # Probe once outside the write loop so we never open db.cursor()
+        # (which commits) while BEGIN IMMEDIATE is held.
+        has_audit = _table_exists(db, "consolidation_actions")
         with db.transaction() as c:
+            # Re-probe on the txn cursor as a belt-and-suspenders check
+            # without committing mid-batch.
+            if not has_audit:
+                has_audit = _table_exists_on_cursor(c, "consolidation_actions")
             for item in plan:
                 for loser_id in item["delete"]:
                     # Re-check existence inside the txn.
@@ -226,7 +247,7 @@ def repair_duplicate_candidate_pairs(
                     )
                     if not c.fetchone():
                         continue
-                    if _table_exists(db, "consolidation_actions"):
+                    if has_audit:
                         _audit_drop(
                             c, loser_id, item["keep"], str(item["keep_status"]), now
                         )
@@ -306,24 +327,127 @@ def is_virtual_durable_path(path: str) -> bool:
     return VIRTUAL_DURABLE_MARKER in norm
 
 
+def _normalize_vault_roots(
+    vault_roots: Optional[Sequence[str]] = None,
+) -> List[str]:
+    """Return absolute, existing vault root directories."""
+    roots: List[str] = []
+    seen: set = set()
+    for raw in vault_roots or ():
+        if not raw:
+            continue
+        expanded = os.path.abspath(os.path.expanduser(str(raw)))
+        if expanded in seen:
+            continue
+        seen.add(expanded)
+        if os.path.isdir(expanded):
+            roots.append(expanded)
+    return roots
+
+
+def resolve_document_path(
+    path: str, vault_roots: Optional[Sequence[str]] = None
+) -> Optional[str]:
+    """Resolve a documents.path to an absolute filesystem path if it exists.
+
+    Absolute paths are used as-is. Relative paths (vault-bridge style
+    identities like ``wiki/decisions/foo.md``) are tried under each
+    configured vault root. Returns the first existing file path, or None
+    if no candidate exists on disk.
+    """
+    if not path:
+        return None
+    if os.path.isabs(path):
+        return path if os.path.isfile(path) else None
+    # Relative identity: try each vault root.
+    norm = path.replace("\\", "/").lstrip("/")
+    if not norm or ".." in norm.split("/"):
+        return None
+    for root in _normalize_vault_roots(vault_roots):
+        candidate = os.path.join(root, *norm.split("/"))
+        if os.path.isfile(candidate):
+            return candidate
+    # Also accept CWD-relative existence (legacy absolute-miswritten-as-rel).
+    if os.path.isfile(path):
+        return os.path.abspath(path)
+    return None
+
+
+def _doc_ids_with_fts(db, doc_ids: Sequence[int]) -> set:
+    """Return the subset of doc_ids that still have vault_fts content."""
+    if not doc_ids:
+        return set()
+    found: set = set()
+    # Chunk to stay under SQLite variable limits on huge DBs.
+    ids = [int(x) for x in doc_ids]
+    with db.cursor() as c:
+        for i in range(0, len(ids), 400):
+            chunk = ids[i : i + 400]
+            placeholders = ",".join("?" * len(chunk))
+            c.execute(
+                f"SELECT DISTINCT doc_id FROM vault_fts WHERE doc_id IN ({placeholders})",
+                chunk,
+            )
+            for row in c.fetchall():
+                found.add(int(row["doc_id"] if hasattr(row, "keys") else row[0]))
+    return found
+
+
 def find_missing_document_rows(
-    db, *, include_virtual_durable: bool = False
+    db,
+    *,
+    include_virtual_durable: bool = False,
+    vault_roots: Optional[Sequence[str]] = None,
 ) -> List[Dict[str, Any]]:
-    """Document rows whose path is missing on disk.
+    """Document rows whose path is missing on disk after vault-root resolution.
 
     By default **excludes** virtual ``_durable`` paths (they are not files).
     Set ``include_virtual_durable=True`` only for diagnostics.
+
+    Relative ``documents.path`` values (vault bridge) are resolved against
+    ``vault_roots`` before the existence check. Relative paths that still
+    carry FTS/chunk content are **never** classified missing unless every
+    resolved absolute candidate is confirmed absent — this prevents an
+    operator running repair from the wrong CWD from wiping healthy index
+    rows.
     """
+    roots = _normalize_vault_roots(vault_roots)
     missing: List[Dict[str, Any]] = []
     with db.cursor() as c:
         c.execute("SELECT doc_id, path, agent, page_status FROM documents")
         rows = [dict(r) for r in c.fetchall()]
+
+    candidates: List[Dict[str, Any]] = []
     for row in rows:
         path = row.get("path") or ""
         if is_virtual_durable_path(path) and not include_virtual_durable:
             continue
-        if path and not os.path.isfile(path):
-            missing.append(row)
+        if not path:
+            continue
+        if resolve_document_path(path, roots) is not None:
+            continue
+        candidates.append(row)
+
+    if not candidates:
+        return []
+
+    # Protect relative FTS-backed rows when we could not resolve them: without
+    # a confirmed absolute miss under a known vault root, treating them as
+    # missing is unsafe (wrong CWD / NFS blip / multi-vault layout).
+    fts_backed = _doc_ids_with_fts(db, [r["doc_id"] for r in candidates])
+    for row in candidates:
+        path = row.get("path") or ""
+        is_rel = not os.path.isabs(path)
+        if is_rel and int(row["doc_id"]) in fts_backed:
+            # Relative + still recallable → keep unless roots were provided
+            # and every root was checked (resolve already returned None).
+            # Even with roots, a relative FTS-backed row may live under a
+            # vault we were not told about; refuse to prune.
+            continue
+        if is_rel and not roots:
+            # No vault roots + relative path: cannot prove absence.
+            continue
+        missing.append(row)
     return missing
 
 
@@ -387,19 +511,27 @@ def prune_document_rows(
 
 
 def repair_index_disk_divergence(
-    db, *, dry_run: bool = True
+    db,
+    *,
+    dry_run: bool = True,
+    vault_roots: Optional[Sequence[str]] = None,
 ) -> Dict[str, Any]:
     """Prune safe-to-remove index rows; report virtual durable separately.
 
     Safe to remove:
-      * non-virtual document paths missing on disk
+      * non-virtual document paths missing on disk after vault-root resolution
+        (relative FTS-backed paths are never pruned — see
+        ``find_missing_document_rows``)
       * virtual ``_durable`` rows with no ``vault_fts`` content
 
     NOT removed (by design):
       * virtual ``_durable`` rows that still carry FTS/chunk content — these
         are the store-time semantic index for durable learnings.
+      * relative non-virtual paths that still have FTS content
     """
-    missing_real = find_missing_document_rows(db, include_virtual_durable=False)
+    missing_real = find_missing_document_rows(
+        db, include_virtual_durable=False, vault_roots=vault_roots
+    )
     orphan_virtual = find_orphan_virtual_durable(db)
     virtual_healthy = 0
     with db.cursor() as c:
@@ -424,7 +556,8 @@ def repair_index_disk_divergence(
         "healthy_virtual_durable_kept": virtual_healthy,
         "virtual_durable_note": (
             "paths under /_durable/ are synthetic index identities; missing "
-            "files are expected when FTS content is present"
+            "files are expected when FTS content is present. Relative "
+            "non-virtual paths with FTS content are never pruned."
         ),
         "prune": prune_result,
         "sample_missing": [
@@ -437,11 +570,41 @@ def repair_index_disk_divergence(
 
 
 def run_full_repair(
-    db, *, dry_run: bool = True, create_index: bool = True
+    db,
+    *,
+    dry_run: bool = True,
+    create_index: bool = True,
+    prune_index: bool = False,
+    vault_roots: Optional[Sequence[str]] = None,
 ) -> Dict[str, Any]:
-    """Run dual-candidate repair + safe index prune (+ optional unique index)."""
+    """Run dual-candidate repair (+ optional unique index / index prune).
+
+    Default is dual-candidates only. Destructive document-index pruning
+    requires ``prune_index=True`` (CLI: ``--prune-index``) so operators cannot
+    accidentally wipe relative-path or offline-vault index rows while fixing
+    dual-resolution twins.
+    """
     dual = repair_duplicate_candidate_pairs(db, dry_run=dry_run)
-    index = repair_index_disk_divergence(db, dry_run=dry_run)
+    if prune_index:
+        index: Dict[str, Any] = repair_index_disk_divergence(
+            db, dry_run=dry_run, vault_roots=vault_roots
+        )
+    else:
+        index = {
+            "dry_run": dry_run,
+            "skipped": True,
+            "reason": "prune_index not requested; pass prune_index=True / --prune-index",
+            "missing_on_disk_non_virtual": 0,
+            "orphan_virtual_durable": 0,
+            "healthy_virtual_durable_kept": 0,
+            "virtual_durable_note": (
+                "index prune skipped by default; dual-candidate repair does "
+                "not touch documents/vault_fts/chunk_embeddings"
+            ),
+            "prune": {"dry_run": dry_run, "requested": 0, "deleted": 0, "skipped": True},
+            "sample_missing": [],
+            "sample_orphan_virtual": [],
+        }
     index_status: Dict[str, Any] = {"status": "skipped"}
     if create_index and not dry_run:
         index_status = ensure_inbox_dedup_index(db)
@@ -451,4 +614,5 @@ def run_full_repair(
         "dual_candidates": dual,
         "index_disk": index,
         "inbox_dedup_index": index_status,
+        "prune_index": prune_index,
     }

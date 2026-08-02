@@ -3,8 +3,13 @@
 
 Dry-run by default. Pass ``--apply`` to mutate the DB.
 
+Default ``--apply`` only collapses dual-resolution ``candidate_packets``
+twins (+ optional inbox dedup unique index). Destructive document-index
+pruning requires an explicit ``--prune-index``.
+
   python3 scripts/repair_issue_239.py
   python3 scripts/repair_issue_239.py --apply
+  python3 scripts/repair_issue_239.py --apply --prune-index --vault /path/to/vault
   python3 scripts/repair_issue_239.py --db /path/to/minni.db --apply
 
 Never touches ``learnings``. See ``minni.repair_dual_candidates`` for the
@@ -26,6 +31,37 @@ if _SRC.is_dir() and str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
 
+def _discover_vault_roots(cfg, extra: list[str] | None = None) -> list[str]:
+    """Collect vault roots from config + optional CLI overrides + *-vault dirs."""
+    import glob
+
+    roots: list[str] = []
+    seen: set[str] = set()
+
+    def _add(raw: str | None) -> None:
+        if not raw:
+            return
+        expanded = os.path.abspath(os.path.expanduser(str(raw)))
+        if expanded in seen:
+            return
+        seen.add(expanded)
+        if os.path.isdir(expanded):
+            roots.append(expanded)
+
+    for r in extra or []:
+        _add(r)
+    _add(getattr(cfg, "vault_path", None))
+    home = getattr(cfg, "CANONICAL_SOVEREIGN_HOME", None)
+    if not home:
+        vp = getattr(cfg, "vault_path", None) or "~/.minni/vault"
+        home = str(Path(vp).expanduser().parent)
+    home = os.path.expanduser(home)
+    for path in glob.glob(os.path.join(home, "*-vault")):
+        _add(path)
+    _add(os.path.join(home, "vault"))
+    return roots
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -36,12 +72,30 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--apply",
         action="store_true",
-        help="apply repairs (default is dry-run)",
+        help="apply dual-candidate repair (default is dry-run)",
     )
     parser.add_argument(
         "--no-index",
         action="store_true",
         help="skip creating the inbox dedup unique index after repair",
+    )
+    parser.add_argument(
+        "--prune-index",
+        action="store_true",
+        help=(
+            "also prune missing/orphan document index rows "
+            "(destructive; default is dual-candidates only)"
+        ),
+    )
+    parser.add_argument(
+        "--vault",
+        action="append",
+        default=[],
+        metavar="DIR",
+        help=(
+            "vault root for resolving relative documents.path rows when "
+            "pruning (repeatable); also discovers ~/.minni/*-vault"
+        ),
     )
     parser.add_argument(
         "--json",
@@ -60,10 +114,15 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     cfg = SovereignConfig(db_path=db_path)
+    vault_roots = _discover_vault_roots(cfg, args.vault)
     db = SovereignDB(cfg)
     try:
         result = run_full_repair(
-            db, dry_run=not args.apply, create_index=not args.no_index
+            db,
+            dry_run=not args.apply,
+            create_index=not args.no_index,
+            prune_index=args.prune_index,
+            vault_roots=vault_roots,
         )
     finally:
         if hasattr(db, "close"):
@@ -85,17 +144,32 @@ def main(argv: list[str] | None = None) -> int:
             f"would_delete={dual['would_delete']}  deleted={dual['deleted']}  "
             f"learnings_touched={dual['learnings_touched']}"
         )
-        print(
-            f"  missing on-disk (non-virtual): {idx['missing_on_disk_non_virtual']}"
-        )
-        print(
-            f"  orphan virtual _durable: {idx['orphan_virtual_durable']}  "
-            f"healthy virtual kept: {idx['healthy_virtual_durable_kept']}"
-        )
-        print(f"  note: {idx['virtual_durable_note']}")
+        if idx.get("skipped"):
+            print(
+                "  index prune: SKIPPED (default). "
+                "Re-run with --prune-index to remove missing/orphan docs."
+            )
+        else:
+            print(
+                f"  missing on-disk (non-virtual): {idx['missing_on_disk_non_virtual']}"
+            )
+            print(
+                f"  orphan virtual _durable: {idx['orphan_virtual_durable']}  "
+                f"healthy virtual kept: {idx['healthy_virtual_durable_kept']}"
+            )
+            samples = idx.get("sample_missing") or []
+            if samples:
+                print("  sample missing paths to prune:")
+                for s in samples:
+                    print(f"    doc_id={s['doc_id']} path={s['path']}")
+            print(f"  note: {idx['virtual_durable_note']}")
+            if vault_roots:
+                print(f"  vault roots for path resolve: {vault_roots}")
         print(f"  inbox dedup index: {result['inbox_dedup_index']}")
         if not args.apply:
-            print("  (re-run with --apply to mutate)")
+            print("  (re-run with --apply to mutate dual candidates)")
+            if not args.prune_index:
+                print("  (add --prune-index only if you intend document prune)")
     return 0
 
 
