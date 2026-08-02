@@ -327,8 +327,10 @@ def test_wire_all_skipped_is_not_redeploy_failure():
     # Must distinguish skipped from other non-zero exits.
     assert 'REDEPLOY_EXIT=1' in text
     assert '_WIRE_STATUS' in text
-    # Defense in depth: last-JSON recovery for polluted --from-repo stdout.
-    assert "rfind('{')" in text or 'rfind("{"' in text or "rfind('{')" in text
+    # Defense in depth: WireOutput-shaped recovery for polluted stdout
+    # (pretty emit ends with nested gc braces — not last-{ alone).
+    assert "_is_wire_output" in text or "schema" in text
+    assert "status" in text and "results" in text
 
 
 def test_wire_status_parser_tolerates_npm_noise(tmp_path):
