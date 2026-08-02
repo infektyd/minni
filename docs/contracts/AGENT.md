@@ -292,7 +292,7 @@ Page-status lifecycle (see VAULT.md Section 4 for full transition rules):
 | `accepted` | Included. | Endorsed by a peer agent or human. |
 | `superseded` | Excluded by default. | Replaced by a newer page. |
 | `rejected` | Excluded. | Flagged as incorrect or retracted. |
-| `expired` | Excluded. | Passed `expires` timestamp. |
+| `expired` | Excluded by default; `include_expired=true` opt-in. | Passed `expires` timestamp. Terminal — separate flag, does not ride on `include_drafts`. |
 
 ### instruction_like
 

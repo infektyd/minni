@@ -1680,6 +1680,123 @@ def test_durable_refresh_survives_an_ensure_that_missed_its_rows(tmp_path, monke
         eng.db.close()
 
 
+# ── Round 13: findings from the twelfth Grok review of #256 ────────────────
+
+
+def test_endorse_resolves_pages_by_frontmatter_id_not_body_quotation(tmp_path):
+    """Grok round 12 #1 (round 13 review). Page discovery was still a
+    whole-file substring: a draft whose body quotes another page's frontmatter
+    was discovered FIRST, endorsed in the target's place, and the audit
+    claimed the requested id. Same body-quotation class as the status gate,
+    one field over."""
+    from minni.afm_writer import _extract_frontmatter, _page_id_of, _write_one, endorse_draft
+    import pytest
+
+    vault = tmp_path / "vault"
+    # The deterministic half: ONLY the quoting page exists. A substring
+    # resolver finds it and endorses it under the wrong identity; a
+    # frontmatter resolver correctly reports the id as absent.
+    quoting = _draft(page_id="page-quoter", title="quoter")
+    quoting["body"] = (
+        "For the record, the other page's frontmatter read:\n\n"
+        "    page_id: page-target\n    status: draft\n"
+    )
+    quoting_path = vault / _write_one(vault, quoting)["path"]
+    before = quoting_path.read_text(encoding="utf-8")
+
+    with pytest.raises(FileNotFoundError):
+        endorse_draft(str(vault), "page-target", "accept")
+    assert quoting_path.read_text(encoding="utf-8") == before, (
+        "endorse rewrote a page that merely QUOTED the requested page_id"
+    )
+
+    # And with the real target present, the endorsement lands on it — the
+    # quoting page stays a draft.
+    target = _draft(page_id="page-target", title="the real one")
+    target_path = vault / _write_one(vault, target)["path"]
+    result = endorse_draft(str(vault), "page-target", "accept")
+    assert result["path"].endswith(target_path.name)
+    assert "status: accepted" in _extract_frontmatter(
+        target_path.read_text(encoding="utf-8")
+    )
+    assert "status: draft" in _extract_frontmatter(
+        quoting_path.read_text(encoding="utf-8")
+    )
+    assert _page_id_of(_extract_frontmatter(
+        quoting_path.read_text(encoding="utf-8"))) == "page-quoter"
+
+
+def test_endorse_rechecks_the_page_identity_under_the_lock(tmp_path, monkeypatch):
+    """Grok round 13 #1, the lock half. The per-page lock is keyed by the
+    REQUESTED id, and the discovery read runs unlocked — if the file's own id
+    changes before the lock lands, the write is not serialized against the
+    page it is about to modify and must refuse."""
+    import minni.afm_writer as writer
+    from minni.afm_writer import _extract_frontmatter, _FM_PAGE_ID, _write_one, endorse_draft
+    import pytest
+
+    vault = tmp_path / "vault"
+    draft = _draft(page_id="page-swap", title="swapper")
+    page = vault / _write_one(vault, draft)["path"]
+
+    # Swap the file's identity in the window between discovery and the lock.
+    real_lock = writer._page_lock
+
+    def swapping_lock(page_id):
+        text = page.read_text(encoding="utf-8")
+        fm = _extract_frontmatter(text)
+        rewritten = _FM_PAGE_ID.sub("page_id: page-somebody-else", fm, count=1)
+        page.write_text(rewritten + text[len(fm):], encoding="utf-8")
+        return real_lock(page_id)
+
+    monkeypatch.setattr(writer, "_page_lock", swapping_lock)
+    with pytest.raises(FileNotFoundError):
+        endorse_draft(str(vault), "page-swap", "accept")
+    assert "status: draft" in _extract_frontmatter(page.read_text(encoding="utf-8")), (
+        "endorse rewrote a page whose identity changed under it"
+    )
+
+
+def test_skip_path_normalizes_the_fts_row_too(tmp_path, monkeypatch):
+    """Grok round 13 #3 (Low, flagged twice). The mtime-skip path normalized
+    documents.path but left vault_fts.path at the old spelling until a content
+    reindex. Recall joins d.path so it was latent — but the two rows describe
+    the same file and must not diverge."""
+    from minni.afm_writer import _write_one
+    from minni.index_all import index_shared_vault
+
+    _install_fake_embedder(monkeypatch)
+    cfg = _make_cfg(tmp_path)
+    vault = Path(cfg.vault_path)
+    written = _write_one(vault, _draft())
+    index_shared_vault(cfg)
+
+    page = (vault / written["path"]).resolve()
+    noncanonical = str(page.parent / ".." / page.parent.name / page.name)
+    conn = sqlite3.connect(cfg.db_path)
+    try:
+        conn.execute("UPDATE documents SET path = ? WHERE path = ?",
+                     (noncanonical, str(page)))
+        conn.execute("UPDATE vault_fts SET path = ? WHERE path = ?",
+                     (noncanonical, str(page)))
+        conn.commit()
+    finally:
+        conn.close()
+
+    # No mtime bump: this is the SKIP path, not the reindex path.
+    index_shared_vault(cfg)
+
+    conn = sqlite3.connect(cfg.db_path)
+    try:
+        fts_paths = [r[0] for r in conn.execute(
+            "SELECT path FROM vault_fts").fetchall() if r[0].endswith(page.name)]
+    finally:
+        conn.close()
+    assert fts_paths == [str(page)], (
+        f"vault_fts.path left stale on the skip path: {fts_paths}"
+    )
+
+
 # ── Round 12: findings from the eleventh Grok review of #256 ───────────────
 
 

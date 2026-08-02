@@ -608,7 +608,12 @@ def endorse_draft(vault_path: str, page_id: str, decision: str) -> dict:
             text = path.read_text(encoding="utf-8")
         except Exception:
             continue
-        if f"page_id: {page_id}" in text:
+        # Resolve by the page's OWN frontmatter page_id, never a whole-file
+        # substring: a draft whose body quotes another page's frontmatter
+        # would be discovered first, endorsed in the target's place, and the
+        # audit would claim the requested id. Same body-quotation class as
+        # the status gate above, one field over.
+        if _page_id_of(_extract_frontmatter(text)) == page_id:
             target = path
             break
     if target is None:
@@ -622,6 +627,12 @@ def endorse_draft(vault_path: str, page_id: str, decision: str) -> dict:
         # endorsed) as long as its body quoted "status: draft" somewhere, and
         # then rewrote that body prose while reporting success.
         frontmatter = _extract_frontmatter(text)
+        # Re-validate the identity under the lock too: the discovery read ran
+        # unlocked, and the per-page lock is keyed by the REQUESTED id — if
+        # the file's own id no longer matches, this write would not even be
+        # serialized against the page it is about to modify.
+        if _page_id_of(frontmatter) != page_id:
+            raise FileNotFoundError(f"draft page_id not found: {page_id}")
         if not _FM_DRAFT_STATUS.search(frontmatter):
             raise ValueError(f"page is not an active draft: {page_id}")
         rewritten = _FM_DRAFT_STATUS.sub(f"status: {status}", frontmatter, count=1)

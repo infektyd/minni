@@ -338,10 +338,18 @@ class VaultIndexer:
                     # Same reasoning for a row adopted under a non-canonical
                     # spelling: normalizing only on the reindex path would
                     # leave an up-to-date row non-canonical indefinitely.
+                    # vault_fts.path is normalized in the SAME transaction:
+                    # recall joins d.path today, but a direct reader of the
+                    # FTS row would otherwise see the stale spelling until a
+                    # content reindex rewrites it.
                     if row["path"] != path:
                         with self.db.transaction() as c:
                             c.execute(
                                 "UPDATE documents SET path=? WHERE doc_id=?",
+                                (path, row["doc_id"]),
+                            )
+                            c.execute(
+                                "UPDATE vault_fts SET path=? WHERE doc_id=?",
                                 (path, row["doc_id"]),
                             )
                     stats["skipped"] += 1
