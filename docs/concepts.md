@@ -195,14 +195,18 @@ Minni harvests it in two stages, split across the boot/daemon boundary
    fires after the native `session.compacted` bus event (`experimental.session.compacting`
    fires too early — before the summary exists — so the plugin fetches it
    afterward via the SDK client; see `plugins/minni/kilo/minni-plugin.js`).
-   Platforms that share `createHookHandlers` (codex, grok-build, cursor, gemini,
-   kilocode) run the same SessionStart transcript backstop whenever the payload
-   carries a `transcript_path` or a compact/resume `source` ([#227](https://github.com/infektyd/minni/issues/227)).
-   Both paths converge on `harvestSummaryText`: the continuation-frame
-   boilerplate is stripped, the text is capped, and it is written verbatim to
-   the agent's vault `inbox/` as one file with `kind: "compact_summary"`.
-   Dedup is keyed on a **content sha1** of the frame-stripped summary (not the
-   platform's summary id), persisted under
+   Platforms that share `createHookHandlers` (codex, grok-build, cursor, gemini)
+   run the same SessionStart transcript backstop when the payload marks
+   `source` as compact/resume, or — only if `source` is absent entirely —
+   when a `transcript_path` is the only signal ([#227](https://github.com/infektyd/minni/issues/227)).
+   Kilo Code uses the shared handler too, but its bridge SessionStart sends
+   neither `transcript_path` nor `source`, so that backstop is dead for real
+   Kilo boots (primary remains `CompactSummary` from the SDK). Both live paths
+   converge on `harvestSummaryText`: the continuation-frame boilerplate is
+   stripped, the text is capped, and it is written verbatim to the agent's
+   vault `inbox/` as one file with `kind: "compact_summary"`. Dedup is keyed
+   on a **content sha1** of the frame-stripped summary (not the platform's
+   summary id), persisted under
    `<vault>/.runtime/compact-harvest-state.json` — a content key is what lets
    two delivery paths coexist on Claude Code without double-harvesting.
 
@@ -210,12 +214,12 @@ Minni harvests it in two stages, split across the boot/daemon boundary
 
    | Platform | Primary delivery | SessionStart transcript backstop | Notes |
    |----------|------------------|----------------------------------|-------|
-   | Claude Code | `PostCompact` → `harvestSummaryText` | yes (`source` compact/resume) | full path |
-   | Kilo Code | `session.compacted` SDK read-back → `CompactSummary` | yes (shared handler) | full path |
-   | Codex | — | yes when payload has `transcript_path` | Claude-shaped transcript entries only; otherwise no-op |
-   | Grok Build | — | yes when payload has `transcript_path` | harvest is a side effect (SessionStart is not injectable) |
-   | Cursor | — | yes when payload has `transcript_path` | same Claude-shaped entry contract |
-   | Gemini / agy | — | yes when payload has `transcript_path` | same |
+   | Claude Code | `PostCompact` → `harvestSummaryText` | yes (`source` compact/resume only) | full path |
+   | Kilo Code | `session.compacted` SDK read-back → `CompactSummary` | no (bridge supplies no transcript_path / source) | primary only |
+   | Codex | — | yes on compact/resume `source`, or path-only when `source` omitted | Claude-shaped transcript entries only; otherwise no-op |
+   | Grok Build | — | same gate as Codex | harvest is a side effect (SessionStart is not injectable) |
+   | Cursor | — | same gate as Codex | cold boots with path + non-compact `source` skip the tail-read |
+   | Gemini / agy | — | same gate as Codex | same |
 
    Platforms without a Claude-shaped `isCompactSummary` transcript entry still
    *have* a harvest path (they no longer drop the event on the floor by

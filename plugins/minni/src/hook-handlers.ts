@@ -485,30 +485,32 @@ export function createHookHandlers(
     await ensureVault(config.vaultPath);
 
     // Compaction-summary harvest backstop (P3 / #227). Claude Code's primary
-    // path is PostCompact in hook.ts; Kilo delivers via CompactSummary. Every
-    // other platform that boots through this shared handler (codex, grok-build,
-    // cursor, gemini, kilocode SessionStart) had no harvest path at all — the
-    // summary was discarded. When the platform supplies a transcript path (or
-    // marks the boot as compact/resume), tail-read for a Claude-shaped summary
-    // entry and store it as kind=compact_summary. Content-hash dedup keeps this
-    // safe if a platform later gains a direct-delivery path. Fail-open, raw
-    // only — daemon compact_distillation organizes it later. Platforms whose
-    // transcripts are not Claude-shaped no-op with reason no_summary_found;
-    // that absence is declared in docs/concepts.md's platform table.
+    // path is PostCompact in hook.ts; Kilo delivers via CompactSummary (its
+    // bridge SessionStart supplies neither transcript_path nor source — so
+    // this backstop is dead for real Kilo boots). Platforms that share this
+    // handler (codex, grok-build, cursor, gemini) previously had no harvest
+    // path at all. Gate mirrors Claude when `source` is present (only
+    // compact/resume): a cold boot that still carries a transcript path must
+    // not pay the unbudgeted 4 MiB tail-read. When the platform omits `source`
+    // entirely, a non-empty transcript path is the only signal — harvest then.
+    // Content-hash dedup keeps dual delivery safe. Fail-open, raw only —
+    // daemon compact_distillation organizes later. Non–Claude-shaped
+    // transcripts no-op with no_summary_found (docs/concepts.md table).
     const bootSource = asString(payload.source);
     const transcriptPath =
       asString(payload.transcript_path) || asString(payload.transcriptPath);
-    if (
-      transcriptPath ||
+    const platform = config.runtime ?? config.agentId;
+    const shouldHarvestCompact =
       bootSource === "compact" ||
-      bootSource === "resume"
-    ) {
+      bootSource === "resume" ||
+      (!bootSource && Boolean(transcriptPath));
+    if (shouldHarvestCompact) {
       await harvestCompactSummary(
         {
           vaultPath: config.vaultPath,
           workspaceId,
           auditPrefix: config.auditPrefix,
-          platform: config.runtime ?? config.agentId,
+          platform,
         },
         {
           transcriptPath,
@@ -1202,12 +1204,14 @@ export function createHookHandlers(
   async function handleCompactSummary(payload: Record<string, unknown>): Promise<HookOutput> {
     await ensureVault(config.vaultPath);
     const sessionId = asString(payload.session_id) || asString(payload.sessionId) || "session";
+    // Same provenance stamp as SessionStart harvest — dual delivery paths
+    // must not disagree on `platform` when runtime and agentId differ.
     await harvestSummaryText(
       {
         vaultPath: config.vaultPath,
         workspaceId: workspaceFor(payload),
         auditPrefix: config.auditPrefix,
-        platform: config.agentId,
+        platform: config.runtime ?? config.agentId,
       },
       {
         summaryText: asString(payload.summary_text),

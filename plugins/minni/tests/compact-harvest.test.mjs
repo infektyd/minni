@@ -12,6 +12,7 @@ import {
   harvestSummaryText,
   stripContinuationFrame,
 } from "../dist/compact-harvest.js";
+import { createHookHandlers } from "../dist/hook-handlers.js";
 import { ensureVault } from "../dist/vault.js";
 
 // Hermetic guard: recordAudit writes per-agent rate-limit state under
@@ -69,16 +70,25 @@ const HARVEST_CONFIG = (vaultPath) => ({
   platform: "claude-code",
 });
 
-// P3 / #227: shared SessionStart (codex/grok/cursor/…) must harvest when a
-// transcript path is present — not only the claude-code hook.ts entrypoint.
-test("shared SessionStart harvests compact_summary for codex when transcript has a summary", async () => {
-  const { createHookHandlers } = await import("../dist/hook-handlers.js");
-  const vault = await tmpVault();
-  const file = await tmpTranscript([
-    transcriptLine({ type: "user", message: { role: "user", content: "hello" } }),
-    transcriptLine(summaryEntry("uuid-shared-p3", SUMMARY_TEXT)),
-  ]);
-  const handlers = createHookHandlers({
+async function listCompactSummaries(vault) {
+  const inboxDir = path.join(vault, "inbox");
+  let names;
+  try {
+    names = await readdir(inboxDir);
+  } catch {
+    return [];
+  }
+  const harvested = [];
+  for (const name of names) {
+    if (!name.endsWith(".json")) continue;
+    const raw = JSON.parse(await readFile(path.join(inboxDir, name), "utf8"));
+    if (raw.kind === COMPACT_SUMMARY_KIND) harvested.push(raw);
+  }
+  return harvested;
+}
+
+function sharedHandlers(vault, overrides = {}) {
+  return createHookHandlers({
     agentId: "codex",
     vaultPath: vault,
     defaultWorkspaceId: "workspace-test",
@@ -88,25 +98,91 @@ test("shared SessionStart harvests compact_summary for codex when transcript has
     auditPrefix: "hook_codex",
     // Keep boot RPCs from stalling the suite if no daemon is up.
     sessionStartHookTimeoutMs: 2_000,
+    ...overrides,
   });
+}
+
+// P3 / #227: shared SessionStart (codex/grok/cursor/…) harvests on compact
+// boots — not only the claude-code hook.ts entrypoint.
+test("shared SessionStart harvests compact_summary for codex when transcript has a summary", async () => {
+  const vault = await tmpVault();
+  const file = await tmpTranscript([
+    transcriptLine({ type: "user", message: { role: "user", content: "hello" } }),
+    transcriptLine(summaryEntry("uuid-shared-p3", SUMMARY_TEXT)),
+  ]);
+  const handlers = sharedHandlers(vault);
   await handlers.handleSessionStart({
     session_id: "s-p3",
     transcript_path: file,
     source: "compact",
   });
-  const inboxDir = path.join(vault, "inbox");
-  const files = await readdir(inboxDir);
-  const harvested = [];
-  for (const name of files) {
-    if (!name.endsWith(".json")) continue;
-    const raw = JSON.parse(await readFile(path.join(inboxDir, name), "utf8"));
-    if (raw.kind === COMPACT_SUMMARY_KIND) harvested.push(raw);
-  }
+  const harvested = await listCompactSummaries(vault);
   assert.equal(harvested.length, 1, "expected one compact_summary inbox file");
   assert.equal(harvested[0].platform, "codex");
   assert.ok(
     String(harvested[0].summary_text ?? "").includes("Primary Request"),
     "inbox payload must carry the summary body",
+  );
+});
+
+// Cold boots that still carry a transcript path (Cursor/agy) must not pay the
+// unbudgeted tail-read when `source` is present and not compact/resume.
+test("shared SessionStart skips harvest on cold boot with non-compact source + path", async () => {
+  const vault = await tmpVault();
+  const file = await tmpTranscript([
+    transcriptLine({ type: "user", message: { role: "user", content: "hello" } }),
+    transcriptLine(summaryEntry("uuid-cold-skip", SUMMARY_TEXT)),
+  ]);
+  const handlers = sharedHandlers(vault);
+  await handlers.handleSessionStart({
+    session_id: "s-cold",
+    transcript_path: file,
+    source: "startup",
+  });
+  assert.equal(
+    (await listCompactSummaries(vault)).length,
+    0,
+    "cold boot with source=startup must not tail-read / harvest",
+  );
+});
+
+// Platforms that omit `source` entirely still need the path-only signal.
+test("shared SessionStart harvests when transcript_path is the only signal", async () => {
+  const vault = await tmpVault();
+  const file = await tmpTranscript([
+    transcriptLine({ type: "user", message: { role: "user", content: "hello" } }),
+    transcriptLine(summaryEntry("uuid-path-only", SUMMARY_TEXT)),
+  ]);
+  const handlers = sharedHandlers(vault);
+  await handlers.handleSessionStart({
+    session_id: "s-path-only",
+    transcript_path: file,
+    // no source
+  });
+  const harvested = await listCompactSummaries(vault);
+  assert.equal(harvested.length, 1, "path-only boots must still harvest");
+  assert.equal(harvested[0].platform, "codex");
+});
+
+// Dual delivery paths must stamp the same platform provenance.
+test("CompactSummary and SessionStart harvest share runtime ?? agentId platform stamp", async () => {
+  const vault = await tmpVault();
+  const handlers = sharedHandlers(vault, {
+    agentId: "kilocode-principal",
+    runtime: "kilocode",
+    auditPrefix: "hook_kilocode",
+  });
+  await handlers.handleCompactSummary({
+    session_id: "s-dual",
+    summary_text: SUMMARY_TEXT,
+    summary_id: "sum-dual-1",
+  });
+  const harvested = await listCompactSummaries(vault);
+  assert.equal(harvested.length, 1);
+  assert.equal(
+    harvested[0].platform,
+    "kilocode",
+    "CompactSummary path must use runtime ?? agentId, not agentId alone",
   );
 });
 
