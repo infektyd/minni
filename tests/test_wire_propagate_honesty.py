@@ -513,3 +513,47 @@ def test_propagate_unparseable_host_toml_refuses_before_copy(tmp_path, monkeypat
     assert toml_path.read_text(encoding="utf-8") == original_toml
     assert marker.read_text(encoding="utf-8") == "keep"
 
+
+def test_wire_unparseable_host_toml_refuses_before_mcp_write(tmp_path, monkeypatch):
+    """CR Med: wire must pre-parse host TOML before rewriting install .mcp.json."""
+    from minni.wire import flow as wire_flow
+    from minni.wire.platform import PlatformSpec
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    codex = home / ".codex"
+    codex.mkdir()
+    toml_path = codex / "config.toml"
+    toml_path.write_text("not valid [toml", encoding="utf-8")
+
+    install_root = tmp_path / "plugin" / "0.4.1"
+    install_root.mkdir(parents=True)
+    (install_root / "dist").mkdir()
+    (install_root / "dist" / "server.js").write_text("//x\n", encoding="utf-8")
+    mcp_target = install_root / ".mcp.json"
+    original = json.dumps({"mcpServers": {"other": {"command": "keep"}}})
+    mcp_target.write_text(original, encoding="utf-8")
+
+    spec = PlatformSpec(
+        platform="codex",
+        agent="codex",
+        config_path=toml_path,
+        config_kind="toml",
+        hook_entry="dist/codex-hook.js",
+    )
+    monkeypatch.setattr(wire_flow, "bootstrap_vault", lambda agent: tmp_path / "vault")
+    monkeypatch.setattr(wire_flow, "vault_for", lambda agent: tmp_path / "vault")
+    monkeypatch.setattr(wire_flow, "native_afm_env", lambda repo: {})
+
+    with pytest.raises(ValueError, match="cannot parse existing host TOML"):
+        wire_flow._wire_platform(
+            spec, install_root, "0.4.1",
+            socket=tmp_path / "sock",
+            workspace=None,
+            repo_root=REPO,
+            explicit_workspace=False,
+            dry_run=False,
+        )
+    assert mcp_target.read_text(encoding="utf-8") == original
+

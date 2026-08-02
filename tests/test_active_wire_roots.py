@@ -149,3 +149,27 @@ def test_scripts_import_same_helper(tmp_path, monkeypatch):
         assert full.resolve() in roots
         assert half.resolve() not in roots
         assert platforms == {"codex"}
+
+
+def test_fallback_prefers_newer_version_dir_over_lagging_current(tmp_path, monkeypatch):
+    """CR High: empty wires + lagging current must not hide a fresher +git dir."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    plugin = home / ".minni" / "plugin"
+    old = plugin / "0.3.0"
+    _stamp(old, version="0.3.0")
+    (plugin / "current").symlink_to(old)
+    import time
+    time.sleep(0.02)
+    fresh = plugin / "0.4.1+git.deadbeef"
+    _stamp(fresh, version="0.4.1+git.deadbeef")
+    (plugin / "wired.json").write_text(
+        json.dumps({"schema": 1, "wires": []}), encoding="utf-8",
+    )
+    ordered = active_wire_plugin_roots_ordered(home)
+    assert ordered, ordered
+    root, how = ordered[0]
+    assert root == fresh.resolve(), (root, how, ordered)
+    assert how == "version-dir scan"
+

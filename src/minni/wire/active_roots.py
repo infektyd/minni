@@ -104,15 +104,23 @@ def active_wire_plugin_roots_ordered(home: Path) -> list[tuple[Path, str]]:
         ]
     except OSError:
         candidates = []
+    current = base / "current"
+    current_ok = current.exists() and (current / "payload-manifest.json").is_file()
     if candidates:
         newest = max(candidates, key=lambda d: d.stat().st_mtime)
         try:
             resolved = newest.resolve()
         except OSError:
             resolved = newest
+        if current_ok:
+            try:
+                cur_res = current.resolve()
+            except OSError:
+                cur_res = current
+            if cur_res == resolved:
+                return [(resolved, "current")]
         return [(resolved, "version-dir scan")]
-    current = base / "current"
-    if current.exists() and (current / "payload-manifest.json").is_file():
+    if current_ok:
         try:
             resolved = current.resolve()
         except OSError:

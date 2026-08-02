@@ -179,6 +179,28 @@ def _wire_platform(
                 "silently dropped. Fix or remove the file, then re-run."
             ) from exc
 
+    # D10 for host TOML: parse before any surface write (mcp.json or host
+    # config). Propagate already preflights before copy_tree; wire must not
+    # rewrite install_root/.mcp.json and then fail on corrupt host TOML.
+    if (
+        not dry_run
+        and spec.config_kind == "toml"
+        and spec.config_path is not None
+        and Path(spec.config_path).expanduser().is_file()
+    ):
+        import tomllib
+
+        host_toml = Path(spec.config_path).expanduser()
+        try:
+            tomllib.loads(host_toml.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise ValueError(
+                f"cannot parse existing host TOML at {host_toml}: {exc}. "
+                "Refusing to rewrite surface config — host MCP env would "
+                "be left broken after a partial write. Fix or remove the "
+                "file, then re-run."
+            ) from exc
+
     if not dry_run:
         generated = mcp_json(
             server_path, agent, vault, socket, stamp_workspace,
