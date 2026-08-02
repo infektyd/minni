@@ -408,3 +408,43 @@ def test_plugin_dist_unreadable_peer_keeps_lag_evidence(checkout, monkeypatch, t
     assert out["plugin_dist"]["stale"] is True, out["plugin_dist"]
     assert out["plugin_dist"].get("lagging"), out["plugin_dist"]
     assert out["stale"] is True
+
+
+def test_source_checkout_rejects_unrelated_git_ancestor(tmp_path, monkeypatch):
+    """Wheel under a project venv must not inherit myapp's .git as Minni."""
+    import types
+    from minni.minnid_runtime import deploy_honesty
+
+    # Fake package path: <app>/.venv/lib/pythonX/site-packages/minni/__init__.py
+    app = tmp_path / "myapp"
+    app.mkdir()
+    (app / ".git").mkdir()
+    pkg = app / ".venv" / "lib" / "python3.12" / "site-packages" / "minni"
+    pkg.mkdir(parents=True)
+    init = pkg / "__init__.py"
+    init.write_text("# fake wheel\n", encoding="utf-8")
+    fake = types.ModuleType("minni")
+    fake.__file__ = str(init)
+    monkeypatch.setitem(__import__("sys").modules, "minni", fake)
+    assert deploy_honesty._source_checkout() is None
+
+
+def test_source_checkout_accepts_editable_src_layout(tmp_path, monkeypatch):
+    """Standard editable layout <repo>/src/minni + pyproject name=minni."""
+    import types
+    from minni.minnid_runtime import deploy_honesty
+
+    repo = tmp_path / "minni-src"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    (repo / "pyproject.toml").write_text(
+        '[project]\nname = "minni"\n', encoding="utf-8",
+    )
+    pkg = repo / "src" / "minni"
+    pkg.mkdir(parents=True)
+    init = pkg / "__init__.py"
+    init.write_text("# editable\n", encoding="utf-8")
+    fake = types.ModuleType("minni")
+    fake.__file__ = str(init)
+    monkeypatch.setitem(__import__("sys").modules, "minni", fake)
+    assert deploy_honesty._source_checkout() == repo.resolve()

@@ -305,3 +305,13 @@ def test_grok_hooks_refresh_skips_when_no_grok_surface():
     text = SCRIPT.read_text(encoding="utf-8")
     assert "no grok wire install root and no ~/.grok" in text
     assert "hooks refresh not needed" in text
+
+
+def test_wire_all_skipped_is_not_redeploy_failure():
+    """All-skipped wire (no wire-managed hosts) must not set REDEPLOY_EXIT."""
+    text = SCRIPT.read_text(encoding="utf-8")
+    assert 'status=skipped' in text or 'status"] = "skipped"' in text or 'status=skipped' in text
+    assert 'no wire-managed host surfaces' in text
+    # Must distinguish skipped from other non-zero exits.
+    assert 'REDEPLOY_EXIT=1' in text
+    assert '_WIRE_STATUS' in text

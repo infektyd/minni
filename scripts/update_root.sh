@@ -188,10 +188,33 @@ else
   # --prune: non-TTY automation otherwise skips GC and leaves historical
   # +git.* dirs that make check_deployments --strict fail forever.
   printf 'running:   %s -m minni.minni_cli wire all --from-repo %s --prune\n' "$VENV_PY" "$REPO"
-  if ! "$VENV_PY" -m minni.minni_cli wire all --from-repo "$REPO" --prune; then
-    echo "update-root: wire all reported failures — continuing redeploy/verify" >&2
-    REDEPLOY_EXIT=1
+  # Capture JSON so an all-skipped run (D5 exit 1: no wire-managed hosts on
+  # this machine) is not treated as redeploy failure — propagate still owns
+  # antigravity/cursor. failed/partial still set REDEPLOY_EXIT.
+  _WIRE_JSON="$(mktemp "${TMPDIR:-/tmp}/minni-wire.XXXXXX")"
+  set +e
+  "$VENV_PY" -m minni.minni_cli wire all --from-repo "$REPO" --prune >"$_WIRE_JSON"
+  _WIRE_RC=$?
+  set -e
+  cat "$_WIRE_JSON" || true
+  if [ "$_WIRE_RC" -ne 0 ]; then
+    _WIRE_STATUS="$("$VENV_PY" -c "
+import json, sys
+try:
+    doc = json.load(open(sys.argv[1], encoding='utf-8'))
+except Exception:
+    print('unparseable')
+    raise SystemExit(0)
+print(doc.get('status') or 'unknown')
+" "$_WIRE_JSON" 2>/dev/null || echo unparseable)"
+    if [ "$_WIRE_STATUS" = "skipped" ]; then
+      echo "update-root: wire all status=skipped (no wire-managed host surfaces) — continuing with propagate" >&2
+    else
+      echo "update-root: wire all reported failures (status=${_WIRE_STATUS}) — continuing redeploy/verify" >&2
+      REDEPLOY_EXIT=1
+    fi
   fi
+  rm -f "$_WIRE_JSON"
 fi
 if [ "$DRY_RUN" = 1 ]; then
   act "$VENV_PY" plugins/minni/skills/minni-install/scripts/propagate.py \

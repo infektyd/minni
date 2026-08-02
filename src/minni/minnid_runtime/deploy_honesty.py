@@ -47,14 +47,36 @@ def _git(args: list[str], cwd: Path) -> Optional[str]:
 
 
 def _source_checkout() -> Optional[Path]:
-    """The git checkout the running `minni` package was imported from, if any."""
+    """Git checkout of an *editable Minni* install, or None for wheels.
+
+    Must not treat any ancestor ``.git`` as Minni: a wheel living under a
+    project venv (``~/myapp/.venv/.../site-packages/minni``) or under a
+    git-tracked ``$HOME`` would otherwise report ``editable-checkout`` and
+    measure *that* repo's HEAD — false ``deploy.stale: true`` on every
+    unrelated commit. Only accept the standard editable layout:
+
+      <repo>/src/minni/__init__.py  +  <repo>/pyproject.toml names ``minni``
+      +  <repo> is a git checkout
+    """
+    import re
     import minni
 
-    root = Path(minni.__file__).resolve().parent
-    for parent in (root, *root.parents):
-        if (parent / ".git").exists():
-            return parent
-    return None
+    pkg = Path(minni.__file__).resolve().parent
+    if pkg.name != "minni" or pkg.parent.name != "src":
+        return None
+    repo = pkg.parent.parent
+    if not (repo / ".git").exists():
+        return None
+    pyproject = repo / "pyproject.toml"
+    if not pyproject.is_file():
+        return None
+    try:
+        text = pyproject.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    if not re.search(r'(?m)^name\s*=\s*["\']minni["\']', text):
+        return None
+    return repo
 
 
 def _current_head(checkout: Path) -> Optional[str]:

@@ -362,9 +362,12 @@ def run_wire(args) -> int:
                     # platform not installed), not a hard failure. Without this
                     # `wire all` / sync-root fails on hosts that only run a
                     # subset of the fleet. Real preflight defects (node, etc.)
-                    # still fail the platform.
+                    # still fail the platform. Classify by the stable marker
+                    # from preflight.NO_CONFIG_ROOT_MARKER (not free prose).
+                    from minni.wire.preflight import NO_CONFIG_ROOT_MARKER
+
                     if plat_errors and all(
-                        "no config root found" in e for e in plat_errors
+                        e.startswith(NO_CONFIG_ROOT_MARKER) for e in plat_errors
                     ):
                         out.results.append(
                             PlatformResult(
