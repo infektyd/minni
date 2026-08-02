@@ -186,6 +186,59 @@ class MemoryDecay:
             }
 
 
+def run_decay_all_indexes(
+    config: SovereignConfig = DEFAULT_CONFIG,
+    *,
+    minni_home=None,
+) -> Dict[str, Dict]:
+    """Run one decay pass over the shared index AND every per-agent vault index.
+
+    Audit #225-R2: run_decay was reachable only from the manual CLI, which
+    decays the shared DB alone — but documents live across every vault index
+    too, so even a hand-run pass left most of the corpus at decay_score=1.0.
+    The scheduler (minnid._decay_runner) calls this, not run_decay directly.
+
+    Per-index isolation is the point: one unreadable or locked vault index must
+    not cost every other index its decay pass, so each is caught and reported
+    as its own ``error`` entry rather than raised.
+    """
+    from minni.index_all import discover_agent_vaults
+    from minni.vault_index import build_vault_index_config
+
+    results: Dict[str, Dict] = {}
+
+    db = SovereignDB(config)
+    try:
+        results["shared"] = MemoryDecay(db, config).run_decay()
+    except Exception as exc:
+        logger.exception("Decay pass failed for the shared index")
+        results["shared"] = {"error": str(exc)}
+    finally:
+        db.close()
+
+    for vault in discover_agent_vaults(minni_home):
+        name = vault.name
+        vault_db = None
+        try:
+            # Inside the try: building the config resolves paths on disk and can
+            # fail on its own, and that failure must be isolated to this vault
+            # exactly like a failed pass is.
+            vault_config = build_vault_index_config(vault, base_config=config)
+            vault_db = SovereignDB(vault_config)
+            results[name] = MemoryDecay(vault_db, vault_config).run_decay()
+        except Exception as exc:
+            logger.warning("Decay pass failed for vault %s: %s", name, exc)
+            results[name] = {"error": str(exc)}
+        finally:
+            if vault_db is not None:
+                try:
+                    vault_db.close()
+                except Exception:
+                    pass
+
+    return results
+
+
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     db = SovereignDB()

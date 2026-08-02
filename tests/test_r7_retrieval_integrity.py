@@ -51,6 +51,138 @@ def _make_engine(tmp_path, **cfg_overrides):
 
 
 # ---------------------------------------------------------------------------
+# #225-R2 — decay must actually be scheduled, not CLI-only
+# ---------------------------------------------------------------------------
+
+class TestDecayIsScheduled:
+    """run_decay was reachable only from the manual CLI and no launchd job
+    called it, so every document sat at decay_score=1.0 against a declared
+    7-day half-life."""
+
+    def test_daemon_registers_a_decay_runner(self):
+        import minni.minnid as minnid
+
+        assert hasattr(minnid, "_decay_runner"), (
+            "the daemon must schedule a decay pass; on the old code decay was "
+            "reachable only from sovereign_memory's manual CLI"
+        )
+        assert hasattr(minnid, "_decay_enabled")
+        assert hasattr(minnid, "_decay_sweep_once")
+
+    def test_decay_runner_is_started_by_main(self):
+        """A runner nobody creates a task for is the same dead channel."""
+        import inspect
+        import minni.minnid as minnid
+
+        src = inspect.getsource(minnid.main)
+        assert "_decay_runner()" in src, "main() must create the decay task"
+        assert "decay_task.cancel()" in src, "shutdown must cancel the decay task"
+
+    def test_decay_enabled_by_default_and_env_disablable(self, monkeypatch):
+        import minni.minnid as minnid
+
+        monkeypatch.delenv("MINNI_DECAY", raising=False)
+        assert minnid._decay_enabled() is True
+        monkeypatch.setenv("MINNI_DECAY", "off")
+        assert minnid._decay_enabled() is False
+
+    def test_decay_interval_defaults_daily_with_a_floor(self, monkeypatch):
+        import minni.minnid as minnid
+
+        monkeypatch.delenv("MINNI_DECAY_INTERVAL", raising=False)
+        assert minnid._decay_interval() == 86400
+        monkeypatch.setenv("MINNI_DECAY_INTERVAL", "5")
+        assert minnid._decay_interval() == 3600, "sub-hour sweeps are pointless"
+        monkeypatch.setenv("MINNI_DECAY_INTERVAL", "not-a-number")
+        assert minnid._decay_interval() == 86400
+
+    def test_a_stale_document_actually_decays(self, tmp_path):
+        """The acceptance check from issue #225: a non-1.0 decay_score on an
+        old document. Proves the pass does the thing, not merely that it runs."""
+        from minni.decay import MemoryDecay
+
+        db_obj, cfg = _make_db(tmp_path)
+        old = time.time() - (90 * 86400)  # 90 days, ~13 half-lives
+        with db_obj.cursor() as c:
+            c.execute(
+                """INSERT INTO documents (path, agent, sigil, indexed_at,
+                                          last_accessed, access_count, decay_score)
+                   VALUES ('stale.md', 'codex', 'vault', ?, ?, 0, 1.0)""",
+                (old, old),
+            )
+            doc_id = c.lastrowid
+
+        stats = MemoryDecay(db_obj, cfg).run_decay()
+        assert stats["updated"] == 1
+
+        with db_obj.cursor() as c:
+            score = c.execute(
+                "SELECT decay_score FROM documents WHERE doc_id = ?", (doc_id,)
+            ).fetchone()["decay_score"]
+        assert score < 1.0, "a 90-day-old document must not still score 1.0"
+
+    def test_decay_pass_is_idempotent(self, tmp_path):
+        """Restart-heavy machines sweep more often than planned; scores must
+        converge, not compound."""
+        from minni.decay import MemoryDecay
+
+        db_obj, cfg = _make_db(tmp_path)
+        old = time.time() - (30 * 86400)
+        with db_obj.cursor() as c:
+            c.execute(
+                """INSERT INTO documents (path, agent, sigil, indexed_at,
+                                          last_accessed, access_count, decay_score)
+                   VALUES ('stale.md', 'codex', 'vault', ?, ?, 0, 1.0)""",
+                (old, old),
+            )
+            doc_id = c.lastrowid
+
+        decay = MemoryDecay(db_obj, cfg)
+        decay.run_decay()
+        with db_obj.cursor() as c:
+            first = c.execute(
+                "SELECT decay_score FROM documents WHERE doc_id = ?", (doc_id,)
+            ).fetchone()["decay_score"]
+        second_stats = decay.run_decay()
+        with db_obj.cursor() as c:
+            second = c.execute(
+                "SELECT decay_score FROM documents WHERE doc_id = ?", (doc_id,)
+            ).fetchone()["decay_score"]
+
+        assert second_stats["updated"] == 0, "a converged pass rewrites nothing"
+        assert abs(first - second) < 1e-9
+
+    def test_all_indexes_sweep_isolates_a_failing_vault(self, tmp_path, monkeypatch):
+        """One unreadable vault index must not cost every other index its pass."""
+        import minni.decay as decay_mod
+        import minni.index_all as index_all
+        import minni.vault_index as vault_index
+
+        db_obj, cfg = _make_db(tmp_path)
+        db_obj.close()
+
+        broken = tmp_path / "broken-vault"
+        broken.mkdir()
+        # run_decay_all_indexes imports both helpers inside the function, so the
+        # patches must land on the SOURCE modules, not on minni.decay.
+        monkeypatch.setattr(
+            index_all, "discover_agent_vaults", lambda home=None: [broken]
+        )
+
+        def _explode(*_a, **_kw):
+            raise RuntimeError("vault index unreadable")
+
+        monkeypatch.setattr(vault_index, "build_vault_index_config", _explode)
+
+        results = decay_mod.run_decay_all_indexes(cfg)
+        assert "shared" in results
+        assert "error" not in results["shared"], (
+            "the shared index must still be decayed when a vault fails"
+        )
+        assert "error" in results["broken-vault"]
+
+
+# ---------------------------------------------------------------------------
 # GA4-2 — decay must reach the reranker ordering, not only final_score
 # ---------------------------------------------------------------------------
 

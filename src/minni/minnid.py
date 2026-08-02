@@ -1180,6 +1180,77 @@ async def _vault_watch_runner():
             raise
 
 
+def _decay_enabled() -> bool:
+    """Run the scheduled decay pass (MINNI_DECAY=off to disable)."""
+    return (os.environ.get("MINNI_DECAY", "on") or "on").strip().lower() != "off"
+
+
+def _decay_interval() -> int:
+    try:
+        raw = int(os.environ.get("MINNI_DECAY_INTERVAL", "86400"))
+    except (TypeError, ValueError):
+        return 86400
+    # decay.run_decay's own contract is "should be called daily"; below an hour
+    # the pass costs more than the freshness it buys, since decay_score moves
+    # on a multi-day half-life.
+    return max(3600, raw)
+
+
+def _decay_sweep_once() -> dict:
+    """Blocking decay pass over the shared index and every vault. Runs off-loop."""
+    from minni.decay import run_decay_all_indexes
+
+    return run_decay_all_indexes(DEFAULT_CONFIG)
+
+
+async def _decay_runner():
+    """Audit #225-R2: run_decay was reachable ONLY from the manual CLI and no
+    launchd job ever called it, so every document sat at decay_score=1.0 —
+    including documents indexed months earlier, against a declared 7-day
+    half-life. Recall was scoring a corpus with decay structurally disabled.
+
+    The pass is idempotent by construction: new_score is recomputed from
+    absolute timestamps and access_count, never from the previous score, so a
+    restart-heavy machine that sweeps more often than planned converges to the
+    same scores rather than compounding them.
+
+    Same shutdown contract as _vault_watch_runner: `while True` plus explicit
+    task cancellation, because the `_running` global is still False when main()
+    creates this task.
+    """
+    interval = _decay_interval()
+    logger.info("Decay pass enabled: every %ss", interval)
+    # First sweep is deferred: daemon start is already paying for socket setup,
+    # migrations and model warmup, and decay is never urgent to the second.
+    initial_delay = min(300, interval)
+    try:
+        await asyncio.sleep(initial_delay)
+    except asyncio.CancelledError:
+        raise
+    while True:
+        try:
+            stats = await asyncio.to_thread(_decay_sweep_once)
+            for index_name, s in (stats or {}).items():
+                if not isinstance(s, dict):
+                    continue
+                if s.get("error"):
+                    logger.warning("Decay: %s failed: %s", index_name, s["error"])
+                elif s.get("updated"):
+                    logger.info(
+                        "Decay: %s updated=%s reinforced=%s",
+                        index_name, s.get("updated"), s.get("reinforced"),
+                    )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # A failed pass must never take the daemon down; retry next tick.
+            logger.exception("Decay pass failed")
+        try:
+            await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            raise
+
+
 def _handle_daemon_endorse(params: dict, request_id: Any) -> dict:
     return _runtime_handle_daemon_endorse(params, request_id, _afm_context())
 
@@ -1682,6 +1753,12 @@ def main():
     if _vault_watch_enabled():
         vault_watch_task = loop.create_task(_vault_watch_runner())
 
+    # Scheduled decay pass (MINNI_DECAY=off to disable). Nothing else calls
+    # run_decay outside the manual CLI, so without this the corpus never decays.
+    decay_task = None
+    if _decay_enabled():
+        decay_task = loop.create_task(_decay_runner())
+
     # Model warmup. Scheduled AFTER the socket is being served, so the daemon is
     # answerable during the load: an early caller still gets the lazy path, it
     # just no longer has to be the one that pays for it.
@@ -1703,6 +1780,8 @@ def main():
             afm_task.cancel()
         if vault_watch_task is not None:
             vault_watch_task.cancel()
+        if decay_task is not None:
+            decay_task.cancel()
         if warmup_task is not None:
             warmup_task.cancel()
 
