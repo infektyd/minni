@@ -112,10 +112,11 @@ itself runs with `MINNI_LOCAL_OPERATOR` set. Named agents (`claude-code`,
 [Provision agent identities](install.md#provision-agent-identities-principals).
 
 Alongside the four verbs, sessions carry a lifecycle spine —
-`prepare_task → prepare_outcome → plan → learn` — injected via the
+`prepare_task → prepare_outcome → thread → learn` — injected via the
 `<minni:context>` envelope so agents orient before ambitious work and distill
-before context is flushed. Durable, evidence-gated plans
-(`minni_thread_*`) survive sessions and compaction.
+before context is flushed (`plan` / `minni_plan_*` remain deprecated aliases).
+Durable, evidence-gated threads (`minni_thread_*`) survive sessions and
+compaction.
 
 ## Recall is evidence, not instruction
 

@@ -26,6 +26,14 @@ MCP readiness tripwire) under the same stamp; not a new product theme.
   behaviour change; documents host negotiation gaps (Claude Code host still
   pre-spec).
 
+### Changed
+
+- **Plugin lockfile transitive refresh (CI):** `plugins/minni/package-lock.json`
+  re-resolved advisory-hit packages (`brace-expansion`, `fast-uri`, `hono`,
+  `ip-address`, `postcss`) so Public CI `npm audit --audit-level=moderate`
+  stays green, and aligned the lock root version with `package.json` **0.4.2**.
+  No direct dependency range change in `package.json`.
+
 ### Fixed
 
 - **R10 deploy honesty and root update propagation (#261 / #232–#234):** wire

@@ -33,9 +33,10 @@ minni wire claude-code        # or: codex, kilocode, grok, generic, all
 - `all` wires codex, claude-code, kilocode, and grok (`ALL_EXPANSION_V03`).
   Cursor and antigravity are fleet-known but skipped from bulk wire
   (cursor is propagate-managed; antigravity shares the Gemini tree and is
-  explicit-only). Gemini wiring is provisional (skipped with a warning; use
-  the checkout's `propagate.py update-plugin --platform gemini` for now).
-  `generic` requires `--agent` and `--install-root`.
+  explicit-only). **Gemini family:** prefer `minni wire antigravity` or
+  `propagate --platform antigravity` (also covered by `make sync-root`); pure
+  `gemini` remains provisional-skip on wire (`gemini-provisional`), not the
+  day-to-day install path. `generic` requires `--agent` and `--install-root`.
 - Every wire ends with verification probes (MCP handshake, hook dry-run,
   config readback); the same probes run in `minni doctor`. Output is a single
   JSON document on stdout with per-platform results; exit code 0 = all
@@ -212,9 +213,10 @@ layout), bring your checkout current:
    .venv/bin/minni wire <yours> --from-repo .
    ```
    Prefer `minni wire` for codex/claude-code/kilocode/grok after wire adoption;
-   `propagate.py update-plugin` remains the path for cursor (and gemini while
-   its wiring is provisional). Do not bulk-propagate wire-primary platforms
-   expecting a fleet refresh — see [deploy/README.md](../deploy/README.md).
+   `propagate.py update-plugin` remains the path for cursor and for the Gemini
+   family via **antigravity** (pure `gemini` is provisional). Do not
+   bulk-propagate wire-primary platforms expecting a fleet refresh — see
+   [deploy/README.md](../deploy/README.md).
 4. For launchd users: update the plist's three paths — python interpreter →
    `/path/to/repo/.venv/bin/python`, script args → `-m minni.minnid`,
    `WorkingDirectory` → repo root — then run:
