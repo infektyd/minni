@@ -121,6 +121,10 @@ _IN_FLIGHT_LOCK = threading.Lock()
 _LIFECYCLE_APPLY_FAILURES = 0
 _LAST_LIFECYCLE_APPLY_FAILURE_AT: Optional[float] = None
 _PENDING_LIFECYCLE: dict[str, dict] = {}
+# Round 20: passes currently re-applying sticky lifecycle *outside* the
+# in-flight lock. Claim under the lock, invoke the handler outside (DB/embed
+# work must not freeze writer coordination), then clear under the lock.
+_REAPPLYING_LIFECYCLE: set[str] = set()
 # Relative path under a vault for durable sticky deferred lifecycle.
 _PENDING_LIFECYCLE_REL = Path("inbox") / "afm-pending-lifecycle.json"
 _PENDING_LIFECYCLE_FILE_VERSION = 1
@@ -210,6 +214,7 @@ def reset_pass_counters() -> None:
     with _IN_FLIGHT_LOCK:
         _IN_FLIGHT_PER_PASS.clear()
         _PENDING_LIFECYCLE.clear()
+        _REAPPLYING_LIFECYCLE.clear()
 
 
 def _pending_lifecycle_path(vault_path: str | Path) -> Path:
@@ -1149,6 +1154,14 @@ def submit_drafts(job: dict, wait: bool = True, timeout: Optional[float] = 30.0)
     pass_name = str(job.get("pass_name") or "unknown")
     done = threading.Event()
     out: dict = {}
+    # Round 20: sticky re-apply claims under the lock, invokes outside it.
+    # Holding _IN_FLIGHT_LOCK across handler(payload) froze every other
+    # submit_drafts / status / worker claim for the duration of DB+embed work.
+    reapply_handler = None
+    reapply_payload: Optional[dict] = None
+    vault_for_pending: Optional[str] = None
+    drafts_deferred = len(job.get("drafts") or [])
+
     with _IN_FLIGHT_LOCK:
         # Round 18: after a daemon restart process memory is empty but the
         # vault sidecar still names the deferred decision set. Hydrate before
@@ -1159,6 +1172,14 @@ def submit_drafts(job: dict, wait: bool = True, timeout: Optional[float] = 30.0)
         # forever / restarting into a second draft generation.
         pending_life = _PENDING_LIFECYCLE.get(pass_name)
         if pending_life is not None:
+            if pass_name in _REAPPLYING_LIFECYCLE:
+                return {
+                    "status": "write_in_flight",
+                    "queue_depth": _WORK_QUEUE.qsize(),
+                    "drafts_written": [],
+                    "drafts_deferred": drafts_deferred,
+                    "lifecycle_pending": True,
+                }
             handler = job.get("lifecycle_handler")
             # Prefer the handler on the new job (fresh context); fall back to
             # whatever was stored with the pending payload.
@@ -1168,111 +1189,124 @@ def submit_drafts(job: dict, wait: bool = True, timeout: Optional[float] = 30.0)
                 pending_life
             )
             if callable(handler):
-                try:
-                    # Drop internal bookkeeping keys before apply.
-                    payload = {
-                        k: v
-                        for k, v in pending_life.items()
-                        if not str(k).startswith("_")
-                    }
-                    handler(payload)
-                    _PENDING_LIFECYCLE.pop(pass_name, None)
-                    prior_ev = _IN_FLIGHT_PER_PASS.get(pass_name)
-                    if prior_ev is not None and not prior_ev.is_set():
-                        prior_ev.set()
-                    logger.info(
-                        "AFM writer: re-applied pending lifecycle for pass %r; "
-                        "NOT enqueueing a second draft batch",
-                        pass_name,
-                    )
-                    # Round 15: return without put_nowait. Falling through
-                    # enqueued the NEW job's drafts (new page_ids) after the
-                    # first batch already landed — reopening AFM-8 duplicates
-                    # on the recovery path. Candidates are now terminal; the
-                    # next tick will not regenerate the same decision set.
-                    # Round 18: also clear the vault sidecar so a later cold
-                    # start does not re-hold an already-applied decision set.
-                    _clear_persisted_pending_lifecycle(pass_name, vault_for_pending)
-                    return {
-                        "status": "lifecycle_recovered",
-                        "queue_depth": _WORK_QUEUE.qsize(),
-                        "drafts_written": [],
-                        "drafts_deferred": len(job.get("drafts") or []),
-                        "lifecycle_recovered": True,
-                    }
-                except Exception:
-                    global _LIFECYCLE_APPLY_FAILURES, _LAST_LIFECYCLE_APPLY_FAILURE_AT
-                    _LIFECYCLE_APPLY_FAILURES += 1
-                    _LAST_LIFECYCLE_APPLY_FAILURE_AT = time.time()
-                    # Keep durable mirror in sync (handler may have been lost
-                    # across restart; job still carries vault_path).
-                    if vault_for_pending and "_vault_path" not in pending_life:
-                        pending_life["_vault_path"] = str(
-                            Path(vault_for_pending).expanduser()
-                        )
-                    _persist_pending_lifecycle(
-                        pass_name, pending_life, vault_for_pending
-                    )
-                    logger.exception(
-                        "AFM writer: re-apply of pending lifecycle for pass %r "
-                        "failed; still refusing new drafts",
-                        pass_name,
-                    )
-                    return {
-                        "status": "write_in_flight",
-                        "queue_depth": _WORK_QUEUE.qsize(),
-                        "drafts_written": [],
-                        "drafts_deferred": len(job.get("drafts") or []),
-                        "lifecycle_pending": True,
-                    }
+                # Claim + snapshot under lock; invoke outside (mirror worker).
+                reapply_payload = {
+                    k: v
+                    for k, v in pending_life.items()
+                    if not str(k).startswith("_")
+                }
+                reapply_handler = handler
+                _REAPPLYING_LIFECYCLE.add(pass_name)
             else:
                 logger.warning(
                     "AFM writer: pass %r has pending deferred lifecycle but no "
                     "handler to re-apply; REFUSED %d draft(s)",
-                    pass_name, len(job.get("drafts") or []),
+                    pass_name, drafts_deferred,
                 )
                 return {
                     "status": "write_in_flight",
                     "queue_depth": _WORK_QUEUE.qsize(),
                     "drafts_written": [],
-                    "drafts_deferred": len(job.get("drafts") or []),
+                    "drafts_deferred": drafts_deferred,
                     "lifecycle_pending": True,
                 }
-        prior = _IN_FLIGHT_PER_PASS.get(pass_name)
-        if prior is not None and not prior.is_set():
-            # Round 5: the previous batch for this pass is still queued and
-            # WILL land. Enqueuing another job now duplicates it — these
-            # drafts are refused, not queued, and the caller is told so.
-            logger.warning(
-                "AFM writer: pass %r already has a job in flight; REFUSED "
-                "%d draft(s) — resubmit after the previous batch lands",
-                pass_name, len(job.get("drafts") or []),
+        else:
+            prior = _IN_FLIGHT_PER_PASS.get(pass_name)
+            if prior is not None and not prior.is_set():
+                # Round 5: the previous batch for this pass is still queued and
+                # WILL land. Enqueuing another job now duplicates it — these
+                # drafts are refused, not queued, and the caller is told so.
+                logger.warning(
+                    "AFM writer: pass %r already has a job in flight; REFUSED "
+                    "%d draft(s) — resubmit after the previous batch lands",
+                    pass_name, drafts_deferred,
+                )
+                return {
+                    "status": "write_in_flight",
+                    "queue_depth": _WORK_QUEUE.qsize(),
+                    "drafts_written": [],
+                    "drafts_deferred": drafts_deferred,
+                }
+            try:
+                _WORK_QUEUE.put_nowait((job, done, out))
+            except queue.Full:
+                # Drop policy: reject at the door and count it, rather than block
+                # the caller or silently grow. The drafts are NOT written; saying
+                # so is the whole point.
+                global _WRITES_DROPPED, _LAST_DROP_AT
+                _WRITES_DROPPED += 1
+                _LAST_DROP_AT = time.time()
+                logger.error(
+                    "AFM writer queue full (%d jobs); REJECTED %d draft(s) from pass %r — "
+                    "not written",
+                    WRITER_QUEUE_MAX, drafts_deferred, job.get("pass_name"),
+                )
+                raise DraftQueueFull(
+                    f"writer queue full ({WRITER_QUEUE_MAX} jobs); "
+                    f"{drafts_deferred} draft(s) rejected, not written"
+                )
+            _IN_FLIGHT_PER_PASS[pass_name] = done
+
+    if reapply_handler is not None:
+        try:
+            reapply_handler(reapply_payload)
+            with _IN_FLIGHT_LOCK:
+                _PENDING_LIFECYCLE.pop(pass_name, None)
+                prior_ev = _IN_FLIGHT_PER_PASS.get(pass_name)
+                if prior_ev is not None and not prior_ev.is_set():
+                    prior_ev.set()
+                # Round 15: return without put_nowait. Falling through
+                # enqueued the NEW job's drafts (new page_ids) after the
+                # first batch already landed — reopening AFM-8 duplicates
+                # on the recovery path. Candidates are now terminal; the
+                # next tick will not regenerate the same decision set.
+                # Round 18: also clear the vault sidecar so a later cold
+                # start does not re-hold an already-applied decision set.
+                _clear_persisted_pending_lifecycle(pass_name, vault_for_pending)
+            logger.info(
+                "AFM writer: re-applied pending lifecycle for pass %r; "
+                "NOT enqueueing a second draft batch",
+                pass_name,
+            )
+            return {
+                "status": "lifecycle_recovered",
+                "queue_depth": _WORK_QUEUE.qsize(),
+                "drafts_written": [],
+                "drafts_deferred": drafts_deferred,
+                "lifecycle_recovered": True,
+            }
+        except Exception:
+            global _LIFECYCLE_APPLY_FAILURES, _LAST_LIFECYCLE_APPLY_FAILURE_AT
+            with _IN_FLIGHT_LOCK:
+                _LIFECYCLE_APPLY_FAILURES += 1
+                _LAST_LIFECYCLE_APPLY_FAILURE_AT = time.time()
+                # Keep durable mirror in sync (handler may have been lost
+                # across restart; job still carries vault_path).
+                pending_now = _PENDING_LIFECYCLE.get(pass_name)
+                if pending_now is not None:
+                    if vault_for_pending and "_vault_path" not in pending_now:
+                        pending_now["_vault_path"] = str(
+                            Path(vault_for_pending).expanduser()
+                        )
+                    _persist_pending_lifecycle(
+                        pass_name, pending_now, vault_for_pending
+                    )
+            logger.exception(
+                "AFM writer: re-apply of pending lifecycle for pass %r "
+                "failed; still refusing new drafts",
+                pass_name,
             )
             return {
                 "status": "write_in_flight",
                 "queue_depth": _WORK_QUEUE.qsize(),
                 "drafts_written": [],
-                "drafts_deferred": len(job.get("drafts") or []),
+                "drafts_deferred": drafts_deferred,
+                "lifecycle_pending": True,
             }
-        try:
-            _WORK_QUEUE.put_nowait((job, done, out))
-        except queue.Full:
-            # Drop policy: reject at the door and count it, rather than block
-            # the caller or silently grow. The drafts are NOT written; saying
-            # so is the whole point.
-            global _WRITES_DROPPED, _LAST_DROP_AT
-            _WRITES_DROPPED += 1
-            _LAST_DROP_AT = time.time()
-            logger.error(
-                "AFM writer queue full (%d jobs); REJECTED %d draft(s) from pass %r — "
-                "not written",
-                WRITER_QUEUE_MAX, len(job.get("drafts") or []), job.get("pass_name"),
-            )
-            raise DraftQueueFull(
-                f"writer queue full ({WRITER_QUEUE_MAX} jobs); "
-                f"{len(job.get('drafts') or [])} draft(s) rejected, not written"
-            )
-        _IN_FLIGHT_PER_PASS[pass_name] = done
+        finally:
+            with _IN_FLIGHT_LOCK:
+                _REAPPLYING_LIFECYCLE.discard(pass_name)
+
     if not wait:
         return {"status": "queued", "queue_depth": _WORK_QUEUE.qsize()}
     if not done.wait(timeout):
@@ -1382,10 +1416,18 @@ def writer_status(
     # While the worker is mid-job the queue is EMPTY, and the timeout stamp
     # ages out after an hour — without this a hung write vanished from the
     # surface while every new tick was still refused with write_in_flight.
+    # Round 20: also hydrate durable sticky from the vault so a post-restart
+    # health sample does not report pending_lifecycle_passes=0 / status ok
+    # while the sidecar still names an incomplete apply. Read-only hydrate —
+    # never re-apply from status.
     with _IN_FLIGHT_LOCK:
+        if vault_path:
+            _hydrate_pending_lifecycle_from_vault(vault_path)
         in_flight_passes = sorted(
             name for name, event in _IN_FLIGHT_PER_PASS.items() if not event.is_set()
         )
+        pending_lifecycle_passes = len(_PENDING_LIFECYCLE)
+        pending_lifecycle_pass_names = sorted(_PENDING_LIFECYCLE)
     state = {
         "last_run_per_pass": dict(_LAST_RUN_PER_PASS),
         "last_attempt_per_pass": dict(_LAST_ATTEMPT_PER_PASS),
@@ -1405,8 +1447,8 @@ def writer_status(
         "write_failures": _WRITE_FAILURES,
         "last_write_failure_at": _LAST_WRITE_FAILURE_AT,
         "unrecovered_write_failures": _UNRECOVERED_WRITE_FAILURES,
-        "pending_lifecycle_passes": len(_PENDING_LIFECYCLE),
-        "pending_lifecycle_pass_names": sorted(_PENDING_LIFECYCLE),
+        "pending_lifecycle_passes": pending_lifecycle_passes,
+        "pending_lifecycle_pass_names": pending_lifecycle_pass_names,
         "lifecycle_apply_failures": _LIFECYCLE_APPLY_FAILURES,
         "last_lifecycle_apply_failure_at": _LAST_LIFECYCLE_APPLY_FAILURE_AT,
         "failures_per_pass": dict(_FAILURES_PER_PASS),

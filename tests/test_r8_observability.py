@@ -1665,6 +1665,150 @@ def test_sticky_persist_cannot_resurrect_after_concurrent_reapply(
     afm_writer.reset_pass_counters()
 
 
+def test_sticky_reapply_does_not_hold_inflight_lock_across_handler(
+    tmp_path, monkeypatch
+):
+    """Round 20 High: submit_drafts re-applied sticky lifecycle while holding
+    _IN_FLIGHT_LOCK across handler(payload) (DB/embed work). Concurrent
+    submit_drafts for a *different* pass blocked on the lock for the whole
+    re-apply, freezing writer coordination.
+
+    Pin: slow re-apply handler for consolidation; concurrent synthesis submit
+    must enqueue within a short deadline (not wait on the slow handler).
+    """
+    import threading
+    import queue as queue_mod
+
+    from minni import afm_writer
+
+    afm_writer.reset_pass_counters()
+    monkeypatch.setattr(afm_writer, "_ensure_worker", lambda: None)
+    monkeypatch.setattr(afm_writer, "_WORK_QUEUE", queue_mod.Queue(maxsize=4))
+
+    vault = tmp_path / "vault"
+    vault.mkdir()
+
+    entered_handler = threading.Event()
+    release_handler = threading.Event()
+
+    def _slow_handler(_life):
+        entered_handler.set()
+        assert release_handler.wait(timeout=5.0), "slow handler gate timed out"
+
+    with afm_writer._IN_FLIGHT_LOCK:
+        afm_writer._PENDING_LIFECYCLE["consolidation"] = {
+            "promote_candidate_ids": [1],
+            "dedup_candidate_ids": [],
+            "review_candidate_ids": [2],
+            "_vault_path": str(vault),
+        }
+
+    put_calls = []
+    real_put = afm_writer._WORK_QUEUE.put_nowait
+
+    def _spy_put(item):
+        put_calls.append(item)
+        return real_put(item)
+
+    monkeypatch.setattr(afm_writer._WORK_QUEUE, "put_nowait", _spy_put)
+
+    reapply_result: dict = {}
+
+    def _run_reapply():
+        reapply_result["r"] = afm_writer.submit_drafts(
+            {
+                "pass_name": "consolidation",
+                "vault_path": str(vault),
+                "drafts": [{"title": "dup", "page_id": "c-dup"}],
+                "lifecycle_handler": _slow_handler,
+            },
+            timeout=0.05,
+        )
+
+    re_t = threading.Thread(target=_run_reapply, name="slow-reapply")
+    re_t.start()
+    assert entered_handler.wait(timeout=2.0), "re-apply never entered handler"
+
+    # While consolidation re-apply is mid-handler (outside the lock), a
+    # different pass must still be able to enqueue.
+    other = afm_writer.submit_drafts(
+        {
+            "pass_name": "synthesis",
+            "vault_path": str(vault),
+            "drafts": [{"title": "other", "page_id": "s-1"}],
+        },
+        wait=False,
+    )
+    assert other.get("status") == "queued", (
+        f"other pass blocked on sticky re-apply lock: {other!r}"
+    )
+    assert any(
+        (item[0].get("pass_name") if isinstance(item, tuple) else None) == "synthesis"
+        or (
+            isinstance(item, tuple)
+            and isinstance(item[0], dict)
+            and item[0].get("pass_name") == "synthesis"
+        )
+        for item in put_calls
+    ), f"synthesis must enqueue while re-apply runs: {put_calls!r}"
+
+    release_handler.set()
+    re_t.join(timeout=5.0)
+    assert re_t.is_alive() is False
+    assert reapply_result.get("r", {}).get("status") == "lifecycle_recovered", (
+        reapply_result
+    )
+    assert "consolidation" not in afm_writer._PENDING_LIFECYCLE
+    assert "consolidation" not in afm_writer._REAPPLYING_LIFECYCLE
+    afm_writer.reset_pass_counters()
+
+
+def test_writer_status_hydrates_durable_sticky_after_restart(tmp_path, monkeypatch):
+    """Round 20 Medium: durable sticky lived in the vault sidecar, but
+    writer_status only read process memory. After restart, health reported
+    pending_lifecycle_passes=0 / ok until the next wet submit hydrated.
+
+    Pin: clear memory, leave sidecar, writer_status must report pending >= 1
+    and a non-ok status naming deferred lifecycle.
+    """
+    from minni import afm_writer
+
+    afm_writer.reset_pass_counters()
+    monkeypatch.setattr(afm_writer, "_ensure_worker", lambda: None)
+
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    life = {
+        "promote_candidate_ids": [3],
+        "dedup_candidate_ids": [],
+        "review_candidate_ids": [7, 8],
+        "_vault_path": str(vault),
+    }
+    with afm_writer._IN_FLIGHT_LOCK:
+        afm_writer._PENDING_LIFECYCLE["consolidation"] = life
+        afm_writer._persist_pending_lifecycle("consolidation", life, str(vault))
+        # Simulate cold start: memory gone, durable file remains.
+        afm_writer._PENDING_LIFECYCLE.clear()
+
+    assert "consolidation" not in afm_writer._PENDING_LIFECYCLE
+    assert afm_writer._pending_lifecycle_path(vault).exists()
+
+    state = afm_writer.writer_status(
+        vault_path=str(vault),
+        schedule={"passes": {"consolidation": {"interval_seconds": 3600}}},
+        now=1_000_000.0,
+    )
+    assert state.get("pending_lifecycle_passes", 0) >= 1, state
+    assert "consolidation" in (state.get("pending_lifecycle_pass_names") or [])
+    assert state.get("status") != "ok", state
+    assert any(
+        "deferred lifecycle" in r for r in (state.get("status_reasons") or [])
+    ), state
+    # Hydrate is read-only from status — sticky must remain until re-apply.
+    assert "consolidation" in afm_writer._PENDING_LIFECYCLE
+    afm_writer.reset_pass_counters()
+
+
 def test_shared_index_failure_returns_partial_and_degraded():
     """Round 18: shared engine throw after agent-vault hits hard-failed the
     whole search with −32000. Soft-fail shared like combined agent legs —
