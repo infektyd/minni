@@ -72,10 +72,14 @@ refuse() { printf 'update-root: REFUSING: %s\n' "$*" >&2; exit 1; }
 # claim and re-read `$LOCKDIR/pid` must equal `$$`. EXIT releases only if we
 # still own the lock (so concurrent reclaimers cannot wipe a winner).
 LOCKDIR="${MINNI_SYNC_LOCKDIR:-$HOME/.minni/run/sync-root.lockdir}"
+# Token written into the lock so a reused PID that is *not* this script does
+# not brick unattended sync forever (kill -0 alone is insufficient).
+_LOCK_MARKER="update_root.sh"
 mkdir -p "$(dirname "$LOCKDIR")"
 _claim_lock() {
   if mkdir "$LOCKDIR" 2>/dev/null; then
     printf '%s\n' "$$" >"$LOCKDIR/pid"
+    printf '%s\n' "$_LOCK_MARKER" >"$LOCKDIR/cmd"
     return 0
   fi
   return 1
@@ -89,15 +93,44 @@ _release_lock() {
     rm -rf "$LOCKDIR" 2>/dev/null || true
   fi
 }
+# True when pid is alive *and* looks like a real sync-root holder.
+# A live PID whose argv is not update_root.sh is treated as PID reuse (stale).
+_lock_holder_is_live_sync() {
+  local pid="$1"
+  [ -n "$pid" ] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  # Prefer the marker we wrote; fall back to ps argv fingerprint.
+  local marker
+  marker="$(cat "$LOCKDIR/cmd" 2>/dev/null || true)"
+  if [ -n "$marker" ] && [ "$marker" != "$_LOCK_MARKER" ]; then
+    return 1
+  fi
+  local cmd
+  # portable: macOS/BSD and Linux both accept -p/-o command=
+  cmd="$(ps -p "$pid" -o command= 2>/dev/null || true)"
+  case "$cmd" in
+    *update_root.sh*|*sync-root*) return 0 ;;
+    "")
+      # ps failed (permission / race): if marker matches and pid lives, assume holder
+      [ "$marker" = "$_LOCK_MARKER" ]
+      return $?
+      ;;
+    *) return 1 ;;
+  esac
+}
 if ! _claim_lock; then
   old_pid=""
   if [ -f "$LOCKDIR/pid" ]; then
     old_pid="$(cat "$LOCKDIR/pid" 2>/dev/null || true)"
   fi
-  if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
+  if _lock_holder_is_live_sync "$old_pid"; then
     refuse "another sync-root is already running (pid $old_pid, lock $LOCKDIR)"
   fi
-  echo "update-root: reclaiming stale sync lock${old_pid:+ (dead pid $old_pid)} at $LOCKDIR" >&2
+  if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
+    echo "update-root: reclaiming stale sync lock (pid $old_pid live but not update_root.sh — PID reuse) at $LOCKDIR" >&2
+  else
+    echo "update-root: reclaiming stale sync lock${old_pid:+ (dead pid $old_pid)} at $LOCKDIR" >&2
+  fi
   # Atomic rename beats rm-then-mkdir: only one reclaimer moves the dir;
   # the other either claims the free name or sees the winner's live pid.
   stale_bak="${LOCKDIR}.reclaim.$$"
@@ -106,10 +139,15 @@ if ! _claim_lock; then
       moved_pid="$(cat "$stale_bak/pid" 2>/dev/null || true)"
       # If we accidentally moved a live holder's lock (TOCTOU after the
       # kill -0 check), put it back and refuse.
-      if [ -n "$moved_pid" ] && [ "$moved_pid" != "$$" ] \
-          && kill -0 "$moved_pid" 2>/dev/null; then
-        mv "$stale_bak" "$LOCKDIR" 2>/dev/null || true
-        refuse "another sync-root is already running (pid $moved_pid, lock $LOCKDIR)"
+      if [ -n "$moved_pid" ] && [ "$moved_pid" != "$$" ]; then
+        # Temporarily restore path so _lock_holder_is_live_sync can read marker
+        if mv "$stale_bak" "$LOCKDIR" 2>/dev/null; then
+          if _lock_holder_is_live_sync "$moved_pid"; then
+            refuse "another sync-root is already running (pid $moved_pid, lock $LOCKDIR)"
+          fi
+          # Not a real holder — re-move and reclaim
+          mv "$LOCKDIR" "$stale_bak" 2>/dev/null || true
+        fi
       fi
       rm -rf "$stale_bak" 2>/dev/null || true
     fi

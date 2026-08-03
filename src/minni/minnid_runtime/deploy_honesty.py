@@ -238,10 +238,14 @@ def deploy_status() -> dict:
                     "stale; restart the daemon (make sync-root does this)"
                 )
             elif started.get("git_dirty"):
-                out["stale"] = False
+                # Dirty-at-start is not green: callers that only read the
+                # boolean (including sync-root's post-kickstart probe) must
+                # not treat "running uncommitted tree" as clean.
+                out["stale"] = True
                 out["reason"] = (
                     "checkout was dirty at daemon start: the running code "
-                    "does not correspond exactly to any commit"
+                    "does not correspond exactly to any commit; restart from "
+                    "a clean checkout (make sync-root refuses dirty trees)"
                 )
             else:
                 out["stale"] = False

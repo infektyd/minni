@@ -369,6 +369,47 @@ def test_unparseable_mcp_json_is_hard_error_not_silent_env_drop(tmp_path):
     assert path.read_text(encoding="utf-8") == original
 
 
+def test_dead_afm_helper_healed_by_live_afm_env_both_sides(tmp_path):
+    """D14 heal: dead preserved helper must not re-stamp; live afm_env wins.
+
+    Wire + propagate dual-copy: sync-root cannot clear check_deployments
+    --strict if redeploy re-poisons MINNI_AFM_NATIVE_HELPER.
+    """
+    from minni.wire.writers import mcp_json as wire_mcp_json
+
+    server = tmp_path / "dist" / "server.js"
+    server.parent.mkdir(parents=True)
+    server.write_text("//\n", encoding="utf-8")
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    sock = tmp_path / "sock"
+    live = tmp_path / "live" / "native_afm_helper"
+    live.parent.mkdir(parents=True)
+    live.write_text("#!/bin/sh\n", encoding="utf-8")
+    dead = str(tmp_path / "missing" / "native_afm_helper")
+    afm_env = {
+        "MINNI_AFM_PROVIDER_MODE": "native",
+        "MINNI_AFM_NATIVE_HELPER": str(live),
+    }
+    pre = {
+        "MINNI_AFM_PROVIDER_MODE": "native",
+        "MINNI_AFM_NATIVE_HELPER": dead,
+    }
+
+    for builder, label in (
+        (propagate.mcp_json, "propagate"),
+        (wire_mcp_json, "wire"),
+    ):
+        manifest = builder(
+            server, "cursor", vault, sock, tmp_path / "ws",
+            pre_existing_env=pre,
+            afm_env=afm_env,
+        )
+        env = manifest["mcpServers"]["minni"]["env"]
+        assert env["MINNI_AFM_NATIVE_HELPER"] == str(live), label
+        assert Path(env["MINNI_AFM_NATIVE_HELPER"]).is_file(), label
+
+
 def test_wire_flow_unparseable_mcp_json_fails_and_leaves_file(tmp_path, monkeypatch):
     """Wire hot path (_wire_platform) must not swallow corrupt .mcp.json into {}."""
     from minni.wire.flow import _wire_platform

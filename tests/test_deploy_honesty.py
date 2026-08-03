@@ -100,7 +100,9 @@ def test_dirty_start_is_named_not_guessed(checkout, monkeypatch, tmp_path):
     (checkout / "f.txt").write_text("uncommitted\n", encoding="utf-8")
     deploy_honesty.capture_start_state()
     out = deploy_honesty.deploy_status()
-    assert out["stale"] is False
+    # Dirty-at-start is non-green: boolean-only callers (sync-root probe) must
+    # not treat "running uncommitted tree" as clean.
+    assert out["stale"] is True
     assert out["started_dirty"] is True
     assert "dirty" in out["reason"]
 

@@ -346,6 +346,28 @@ def _vault_path_is_safe(value: str, agent: str) -> bool:
     return True
 
 
+def _filter_dead_afm_helper(ex_env: dict) -> dict:
+    """Drop a preserved AFM helper path that is gone on disk.
+
+    Surface preserve must not re-stamp MINNI_AFM_NATIVE_HELPER when the path no
+    longer exists — otherwise update-plugin / wire redeploy re-poisons the
+    field that check_deployments --strict gates on (D14), and make sync-root
+    can never heal without a hand-edit. When helper is dead and mode was
+    ``native``, also drop mode so a live native_afm_env() can replace both.
+    """
+    out = dict(ex_env)
+    helper = out.get("MINNI_AFM_NATIVE_HELPER")
+    if helper is None:
+        return out
+    helper_path = Path(str(helper)).expanduser()
+    if helper_path.is_file():
+        return out
+    out.pop("MINNI_AFM_NATIVE_HELPER", None)
+    if str(out.get("MINNI_AFM_PROVIDER_MODE", "")).lower() == "native":
+        out.pop("MINNI_AFM_PROVIDER_MODE", None)
+    return out
+
+
 def _validate_preserved_identity(ex_env: dict, agent: str) -> dict:
     """X2: return a copy of `ex_env` with the security-sensitive identity keys
     replaced by the freshly-computed correct values whenever the preserved value
@@ -535,6 +557,8 @@ def replace_toml_sections(path: Path, sections: dict[str, str], *, preserve_surf
             expected_agent = fresh_env.get("MINNI_AGENT_ID")
             if expected_agent:
                 ex_env = _validate_preserved_identity(ex_env, expected_agent)
+            # Drop dead AFM helper before merge so fresh_env (live helper) wins.
+            ex_env = _filter_dead_afm_helper(ex_env)
             resolved_env: dict = {}
             for k in (
                 "MINNI_AGENT_ID",
@@ -604,7 +628,10 @@ def mcp_json(server_path: Path, agent: str, vault: Path, socket_path: Path, work
         # X2: validate preserved identity keys before carrying them forward, so a
         # stale/attacker-planted MINNI_VAULT_PATH/SOCKET_PATH/AGENT_ID in the
         # target config is replaced with the freshly-computed correct value.
-        ex_env = _validate_preserved_identity(ex_env, agent)
+        # Drop a dead AFM helper so live afm_env can heal D14 without hand-edit.
+        ex_env = _filter_dead_afm_helper(
+            _validate_preserved_identity(ex_env, agent),
+        )
         for k in ("MINNI_AGENT_ID", "MINNI_VAULT_PATH", "MINNI_SOCKET_PATH", "MINNI_AFM_PROVIDER_MODE", "MINNI_AFM_NATIVE_HELPER"):
             if k in ex_env:
                 env[k] = ex_env[k]

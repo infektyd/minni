@@ -118,6 +118,29 @@ def _validate_preserved_identity(ex_env: dict, agent: str) -> dict:
     return validated
 
 
+def _filter_dead_afm_helper(ex_env: dict) -> dict:
+    """Drop a preserved AFM helper path that is gone on disk.
+
+    Surface preserve must not re-stamp MINNI_AFM_NATIVE_HELPER when the path no
+    longer exists — otherwise wire/propagate redeploy re-poisons the field
+    that check_deployments --strict / sync-root step 6 gate on (D14), and
+    make sync-root can never heal the live machine without a hand-edit.
+    When the helper is dead and mode was ``native``, also drop mode so a live
+    ``native_afm_env()`` result can replace both keys.
+    """
+    out = dict(ex_env)
+    helper = out.get("MINNI_AFM_NATIVE_HELPER")
+    if helper is None:
+        return out
+    helper_path = Path(str(helper)).expanduser()
+    if helper_path.is_file():
+        return out
+    out.pop("MINNI_AFM_NATIVE_HELPER", None)
+    if str(out.get("MINNI_AFM_PROVIDER_MODE", "")).lower() == "native":
+        out.pop("MINNI_AFM_PROVIDER_MODE", None)
+    return out
+
+
 def load_json(path: Path) -> dict:
     if not path.exists():
         return {}
@@ -190,7 +213,9 @@ def mcp_json(
                 "file, then re-run."
             ) from exc
     if ex_env:
-        ex_env = _validate_preserved_identity(ex_env, agent)
+        ex_env = _filter_dead_afm_helper(
+            _validate_preserved_identity(ex_env, agent),
+        )
         # Never carry raw MINNI_CODEX_* from the surface — re-derive after
         # generic identity resolves (parity with propagate X2).
         for key in (
@@ -548,6 +573,8 @@ def replace_toml_sections(
             expected_agent = fresh_env.get("MINNI_AGENT_ID")
             if expected_agent:
                 ex_env = _validate_preserved_identity(ex_env, expected_agent)
+            # Drop dead AFM helper before merge so fresh_env (live helper) wins.
+            ex_env = _filter_dead_afm_helper(ex_env)
             # Resolve generic identity only — never carry raw MINNI_CODEX_*
             # from the surface (X2). Re-derive mirrors from the resolved
             # identity when the fresh section is for codex.

@@ -192,15 +192,28 @@ def test_dry_run_exits_nonzero_when_daemon_would_not_restart(cloned, tmp_path):
 
 
 def test_refuses_when_another_sync_holds_the_lock(cloned, tmp_path):
-    """Round-4 Low: concurrent sync-root must not interleave writers."""
+    """Round-4 Low: concurrent sync-root must not interleave writers.
+
+    Holder must look like a real update_root.sh process (PID + argv fingerprint);
+    a random live PID is no longer enough (see PID-reuse reclaim test).
+    """
     _origin, clone = cloned
     lockdir = tmp_path / "held-lock"
     lockdir.mkdir()
-    (lockdir / "pid").write_text(str(os.getpid()), encoding="utf-8")
-    proc = _run(clone, "--dry-run", lockdir=lockdir,
-                path_prefix=_fake_launchctl(tmp_path, loaded=True))
-    assert proc.returncode == 1, proc.stdout + proc.stderr
-    assert "already running" in (proc.stdout + proc.stderr)
+    holder_script = tmp_path / "update_root.sh"
+    holder_script.write_text("#!/bin/sh\nsleep 120\n", encoding="utf-8")
+    holder_script.chmod(0o755)
+    holder = subprocess.Popen([str(holder_script)])
+    try:
+        (lockdir / "pid").write_text(str(holder.pid), encoding="utf-8")
+        (lockdir / "cmd").write_text("update_root.sh\n", encoding="utf-8")
+        proc = _run(clone, "--dry-run", lockdir=lockdir,
+                    path_prefix=_fake_launchctl(tmp_path, loaded=True))
+        assert proc.returncode == 1, proc.stdout + proc.stderr
+        assert "already running" in (proc.stdout + proc.stderr)
+    finally:
+        holder.kill()
+        holder.wait(timeout=5)
 
 
 def test_reclaims_stale_lock_from_dead_pid(cloned, tmp_path):
@@ -209,11 +222,28 @@ def test_reclaims_stale_lock_from_dead_pid(cloned, tmp_path):
     lockdir = tmp_path / "stale-lock"
     lockdir.mkdir()
     (lockdir / "pid").write_text("999999999", encoding="utf-8")  # not a live pid
+    (lockdir / "cmd").write_text("update_root.sh\n", encoding="utf-8")
     proc = _run(clone, "--dry-run", lockdir=lockdir,
                 path_prefix=_fake_launchctl(tmp_path, loaded=True))
     # Gets past the lock gate (may still fail later for other dry-run reasons).
     assert "already running" not in (proc.stdout + proc.stderr)
     assert "reclaiming stale sync lock" in (proc.stdout + proc.stderr)
+
+
+def test_reclaims_lock_when_live_pid_is_not_update_root(cloned, tmp_path):
+    """PID reuse: live process that is not update_root.sh must not brick sync."""
+    _origin, clone = cloned
+    lockdir = tmp_path / "reused-pid-lock"
+    lockdir.mkdir()
+    # This test process is live but is not update_root.sh.
+    (lockdir / "pid").write_text(str(os.getpid()), encoding="utf-8")
+    (lockdir / "cmd").write_text("update_root.sh\n", encoding="utf-8")
+    proc = _run(clone, "--dry-run", lockdir=lockdir,
+                path_prefix=_fake_launchctl(tmp_path, loaded=True))
+    combined = proc.stdout + proc.stderr
+    assert "already running" not in combined
+    assert "reclaiming stale sync lock" in combined
+    assert "PID reuse" in combined or "not update_root" in combined
 
 
 def test_refuses_non_git_directory(tmp_path):
