@@ -933,8 +933,6 @@ def ensure_inbox_dedup_index(db) -> Dict[str, Any]:
     ``scripts/repair_issue_239.py --apply`` after cleanup to recreate it.
     """
     index_name = INBOX_DEDUP_INDEX
-    # If a pre-principal (file,index-only) index exists, drop and recreate
-    # with principal so multi-vault basenames are legal.
     with db.cursor() as c:
         c.execute(
             "SELECT sql FROM sqlite_master WHERE type='index' AND name=? LIMIT 1",
@@ -947,8 +945,8 @@ def ensure_inbox_dedup_index(db) -> Dict[str, Any]:
             if "principal" in sql_s.lower():
                 c.execute(f"DROP INDEX IF EXISTS {LEGACY_INBOX_DEDUP_INDEX}")
                 return {"status": "exists", "index": index_name}
-            # Stale global (file, index) index — replace with principal-scoped.
-            c.execute(f"DROP INDEX IF EXISTS {index_name}")
+            # Stale global (file, index) index exists — do NOT drop until we
+            # know principal-scoped CREATE can succeed (collision preflight).
 
     collisions = find_app_key_collisions(db)
     if collisions:
@@ -973,16 +971,21 @@ def ensure_inbox_dedup_index(db) -> Dict[str, Any]:
                 }
                 for g in collisions[:5]
             ],
+            "note": (
+                "Existing UNIQUE index left in place until collisions clear; "
+                "stale global (file,index) indexes are only replaced on CREATE."
+            ),
         }
 
     try:
         with db.transaction() as c:
+            # Drop legacy + any stale global index inside the same txn as CREATE
+            # so we never leave zero uniqueness backstop on a failed upgrade.
             c.execute(f"DROP INDEX IF EXISTS {LEGACY_INBOX_DEDUP_INDEX}")
-            # Principal-scoped unique index: same basename across agent vaults
-            # is allowed; double-ingest within one principal is not.
+            c.execute(f"DROP INDEX IF EXISTS {index_name}")
             c.execute(
                 f"""
-                CREATE UNIQUE INDEX IF NOT EXISTS {index_name}
+                CREATE UNIQUE INDEX {index_name}
                 ON candidate_packets (
                     principal,
                     json_extract(derived_from, '$.inbox_file'),
