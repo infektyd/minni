@@ -622,6 +622,26 @@ def derive_loop_status(
             f"({pending_lc} pass(es) pending; {lc_fails} failure(s) lifetime) "
             "— resubmit refused until apply succeeds or counters are reset"
         )
+    # Round 24/25: lifecycle_recovered discards the current wet LLM batch.
+    # Counter alone is an orphaned metric (GA2-1 class) — consult recency so
+    # writer_status cannot read ok while drafts were thrown away.
+    recovered_dropped = int(state.get("lifecycle_recovered_drafts_dropped", 0) or 0)
+    recovered_at = state.get("last_lifecycle_recovered_drop_at")
+    recovered_recently = bool(recovered_dropped) and (
+        recovered_at is None
+        or now - float(recovered_at) <= LIFECYCLE_RECOVERED_DROP_RECENT_SECONDS
+    )
+    if recovered_recently:
+        recovered_seen = (
+            "recency unknown"
+            if recovered_at is None
+            else f"most recent {int(now - float(recovered_at))}s ago"
+        )
+        reasons.append(
+            f"wet draft(s) discarded after sticky lifecycle recovery "
+            f"({recovered_seen}; {recovered_dropped} over the process lifetime) "
+            "— a full LLM batch was not enqueued"
+        )
     # Round 6 (PR #260): a job in flight NOW is current truth — no recency
     # window. Neither of the other writer signals covers a hung mid-job write:
     # queue_depth is 0 once the worker dequeues, and the timeout stamp ages
@@ -674,6 +694,7 @@ def derive_loop_status(
         or write_failed_recently
         or unrecovered
         or pending_lc
+        or recovered_recently
         or jobs_in_flight
         or (oldest_ts is not None and (now - oldest_ts) / 86400.0 > ttl_days)
     ):

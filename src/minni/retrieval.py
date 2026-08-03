@@ -2681,6 +2681,12 @@ class RetrievalEngine:
         self.last_vector_degraded = None
         self.last_hyde_degraded = None
         query_variants = self._resolve_query_variants(query, expand)
+        # Round 25: expand soft-fail (mode=afm → afm_unavailable) is set on the
+        # parent by _resolve_query_variants *before* multi-variant recursion.
+        # Children run with expand=False and clear flags on entry, so the
+        # parent signal must be captured here or the merge wipes AFM-6 honesty
+        # exactly when rule fallback yields ≥2 variants (the common case).
+        parent_expand_degraded = self.last_query_expand_degraded
         if len(query_variants) > 1:
             total_t0 = time.perf_counter()
             per_variant = []
@@ -2748,9 +2754,15 @@ class RetrievalEngine:
             self.last_rerank_degraded = (
                 "; ".join(variant_rerank_degraded) if variant_rerank_degraded else None
             )
-            self.last_query_expand_degraded = (
+            child_expand = (
                 "; ".join(variant_expand_degraded) if variant_expand_degraded else None
             )
+            if parent_expand_degraded and child_expand:
+                self.last_query_expand_degraded = (
+                    f"{parent_expand_degraded}; {child_expand}"
+                )
+            else:
+                self.last_query_expand_degraded = parent_expand_degraded or child_expand
             self.last_vector_degraded = (
                 "; ".join(variant_vector_degraded) if variant_vector_degraded else None
             )

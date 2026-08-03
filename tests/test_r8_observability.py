@@ -3200,6 +3200,7 @@ def test_lifecycle_recovered_counts_discarded_wet_drafts(monkeypatch):
     """Medium #3: lifecycle_recovered must not silently drop an LLM batch."""
     import queue as queue_mod
     import threading
+    import time as time_mod
 
     from minni import afm_writer
 
@@ -3255,4 +3256,52 @@ def test_lifecycle_recovered_counts_discarded_wet_drafts(monkeypatch):
     assert afm_writer._LIFECYCLE_RECOVERED_DRAFTS_DROPPED == 2
     status = afm_writer.writer_status()
     assert status["lifecycle_recovered_drafts_dropped"] == 2
+    # Round 25: counter must drive the verdict (not an orphaned metric).
+    assert status["status"] != "ok", status
+    assert any("discarded" in r or "lifecycle recovery" in r for r in status["status_reasons"]), (
+        status["status_reasons"]
+    )
+    # Aged stamp may return to ok when otherwise healthy.
+    aged = {
+        "lifecycle_recovered_drafts_dropped": 2,
+        "last_lifecycle_recovered_drop_at": time_mod.time()
+        - afm_writer.LIFECYCLE_RECOVERED_DROP_RECENT_SECONDS
+        - 10,
+        "last_run_per_pass": {},
+        "last_attempt_per_pass": {},
+        "drafts_pending": 0,
+        "queue_depth": 0,
+        "writes_dropped": 0,
+        "write_timeouts": 0,
+        "write_failures": 0,
+        "unrecovered_write_failures": 0,
+        "pending_lifecycle_passes": 0,
+        "jobs_in_flight": 0,
+        "failures_per_pass": {},
+    }
+    aged_status, aged_reasons = afm_writer.derive_loop_status(aged, schedule={"passes": {}})
+    assert aged_status == "ok", (aged_status, aged_reasons)
     afm_writer.reset_pass_counters()
+
+
+def test_afm_expand_soft_fail_survives_multi_variant_retrieve(tmp_path, monkeypatch):
+    """High (PR #260 tip RC): parent last_query_expand_degraded must survive
+    multi-variant recursion that clears flags on each child entry.
+    """
+    import minni.retrieval as retrieval_mod
+    import minni.query_expand as qe
+
+    engine = _engine_without_model(tmp_path, monkeypatch)
+    monkeypatch.setattr(qe, "_afm_expand", lambda query: [])
+    # Force multi-variant rule fallback so the recursive path runs.
+    monkeypatch.setattr(
+        retrieval_mod,
+        "expand_query_with_status",
+        lambda query, mode="rule": (["v1", "v2"], "afm_unavailable"),
+    )
+    engine.last_query_expand_degraded = None
+    engine.retrieve(query="AFM recall", limit=3, expand="afm")
+    assert engine.last_query_expand_degraded is not None, (
+        "multi-variant merge must not wipe parent expand soft-fail"
+    )
+    assert "afm_unavailable" in engine.last_query_expand_degraded
