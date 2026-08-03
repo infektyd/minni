@@ -107,7 +107,16 @@ def resolve_document_scope(params: dict) -> str:
 
 
 def resolve_backend(backend_param, config=None):
-    """Resolve the backend parameter for a search request."""
+    """Resolve the backend parameter for a search request.
+
+    R4(c): a *named* backend (the documented `backend: "faiss-disk"` form)
+    is normalized to a single-element list so it takes the validated
+    ``_resolve_backends`` path. Passed through bare it reached the
+    "explicit backend object" branch and had ``.search`` called on a ``str``,
+    which surfaced as a -32000 internal error — a caller mistake reported as
+    a server fault. Unknown names raise ValueError so the handler can answer
+    -32602 with the valid values named.
+    """
     cfg = config or DEFAULT_CONFIG
 
     if backend_param is None or backend_param == "auto":
@@ -115,7 +124,89 @@ def resolve_backend(backend_param, config=None):
         if not backends or backends == ["faiss-disk"]:
             return None
         return backends
-    return backend_param
+    if isinstance(backend_param, str):
+        from minni.retrieval import RetrievalEngine
+
+        known = RetrievalEngine._KNOWN_BACKENDS
+        if backend_param not in known:
+            raise ValueError(
+                f"unknown backend {backend_param!r}; valid values: "
+                f"{sorted(known)} (or \"auto\")"
+            )
+        return [backend_param]
+    if isinstance(backend_param, (list, tuple)):
+        # Review round 4 on PR #260: R4(c) validated only the bare-string
+        # form. The equally documented LIST form passed through unchecked,
+        # so its unknown names raised inside retrieve() and surfaced as a
+        # -32000 internal error — the same caller mistake answered with two
+        # different codes ("nope" -> -32602, ["nope"] -> -32000). Mirror the
+        # engine's member/size checks here so both shapes hit the handler's
+        # -32602 branch; retrieve() still dedups and re-validates.
+        from minni.retrieval import RetrievalEngine
+
+        known = RetrievalEngine._KNOWN_BACKENDS
+        names = [str(item) for item in backend_param]
+        if not names:
+            raise ValueError(
+                f"backend list must not be empty; valid values: "
+                f"{sorted(known)} (or \"auto\")"
+            )
+        unknown = sorted({name for name in names if name not in known})
+        if unknown:
+            raise ValueError(
+                f"unknown backend(s) {unknown}; valid values: "
+                f"{sorted(known)} (or \"auto\")"
+            )
+        deduped_count = len(dict.fromkeys(names))
+        if deduped_count > RetrievalEngine._MAX_BACKENDS:
+            raise ValueError(
+                f"too many backends ({deduped_count}); "
+                f"max {RetrievalEngine._MAX_BACKENDS}"
+            )
+        return names
+    # Anything else on the wire (number, object, bool) is a caller mistake,
+    # not a server fault — same -32602 contract as an unknown name.
+    raise ValueError(
+        'backend must be "auto", a backend name, or a list of backend names'
+    )
+
+
+def _degradation_for(retrieval_engine: Any, src: str) -> dict:
+    """Describe what degraded on one corpus during this request.
+
+    R4(a) (#226): the search response carried no ``vector_model`` or
+    ``degraded`` field at all, so a caller had no way to learn the semantic leg
+    was unavailable — a lexical-only answer was indistinguishable from a
+    healthy hybrid one. Always reported (not only when something is wrong) so
+    "the field is absent" can never be mistaken for "nothing degraded".
+    """
+    config = getattr(retrieval_engine, "config", None)
+    # Review round 2 on PR #260: read the THREAD-LOCAL per-request verdict, not
+    # the process-global vector_model_down bool — one engine serves concurrent
+    # search workers, and a racing request could flip the global between this
+    # request's retrieve() returning and this read, reporting a lexical-only
+    # answer as healthy (or the inverse). The global stays for the health
+    # surface, where encoder presence is a process-wide fact.
+    vector_down = bool(getattr(retrieval_engine, "last_vector_degraded", None))
+    entry: dict = {
+        "src": src,
+        "vector_model": getattr(config, "embedding_model", None),
+        "vector_degraded": vector_down,
+        "degraded": vector_down,
+    }
+    rerank_degraded = getattr(retrieval_engine, "last_rerank_degraded", None)
+    if rerank_degraded:
+        entry["rerank_degraded"] = rerank_degraded
+        entry["degraded"] = True
+    expand_degraded = getattr(retrieval_engine, "last_query_expand_degraded", None)
+    if expand_degraded:
+        entry["query_expand_degraded"] = expand_degraded
+        entry["degraded"] = True
+    hyde_degraded = getattr(retrieval_engine, "last_hyde_degraded", None)
+    if hyde_degraded:
+        entry["hyde_degraded"] = hyde_degraded
+        entry["degraded"] = True
+    return entry
 
 
 def backend_badge(backends: Any) -> str:
@@ -215,7 +306,10 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
     if depth == "auto":
         depth = "snippet"
 
-    resolved_backend = resolve_backend(backend_param, context.default_config)
+    try:
+        resolved_backend = resolve_backend(backend_param, context.default_config)
+    except ValueError as exc:
+        return context.make_error(-32602, str(exc), request_id)
 
     try:
         engine = context.lazy_retrieval()
@@ -224,6 +318,11 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
         # non-empty candidate set to zero must be visible in the response —
         # a scope blackout and "nothing matched" are different answers.
         auth_suppressions: list = []
+        # R4/R5 (#226): every corpus this request touched, with whatever
+        # degraded on it. Collected per-src for the same reason auth
+        # suppressions are: "combined" recall fans out over independently
+        # scored engines, and a degrade on one of them is not a degrade on all.
+        degradations: list = []
 
         def retrieve_from(
             retrieval_engine,
@@ -255,6 +354,7 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
             suppression = getattr(retrieval_engine, "last_auth_suppression", None)
             if suppression:
                 auth_suppressions.append({"src": src, **suppression})
+            degradations.append(_degradation_for(retrieval_engine, src))
             return tag_document_results(rows, src=src)
 
         def retrieve_shared() -> list:
@@ -264,7 +364,60 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
                 principal_for_documents=principal,
             )
 
-        def retrieve_personal() -> list:
+        def retrieve_shared_soft() -> list:
+            """Shared leg that soft-fails when other corpora may already have hits.
+
+            Round 18 (PR #260): retrieve_combined / both-scope already soft-failed
+            per-agent vaults, but a throw from the shared engine still bubbled to
+            handle_search's outer except as −32000 and dropped every partial hit.
+            Mirror the agent-leg contract: log, record degradation, return [].
+            Sole-shared callers (principal is None / pure shared scope) still use
+            hard retrieve_shared so a total failure surfaces as an RPC error.
+            """
+            try:
+                return retrieve_shared()
+            except Exception as exc:
+                detail = f"shared index failed: {exc}"[:400]
+                context.logger.warning(
+                    "search: shared index failed (%s); continuing with partial results",
+                    exc,
+                )
+                emb_model = None
+                try:
+                    emb_model = getattr(engine.config, "embedding_model", None)
+                except Exception:
+                    emb_model = None
+                if emb_model is None:
+                    emb_model = getattr(
+                        getattr(context, "default_config", None),
+                        "embedding_model",
+                        None,
+                    )
+                degradations.append(
+                    {
+                        "src": "c",
+                        "vector_model": emb_model,
+                        "vector_degraded": False,
+                        "degraded": True,
+                        "shared_index_failed": detail,
+                        "reason": detail,
+                    }
+                )
+                return []
+
+        def retrieve_personal(*, soft: bool = False) -> list:
+            """Personal vault leg; optional soft shared fallback for multi-leg scopes.
+
+            When the personal vault never ran (no agent vault), sole personal
+            scope still uses a hard shared fallback so total shared failure
+            surfaces as −32000. Once a personal-leg exception has been recorded
+            into ``degradations``, shared is always soft — a hard shared throw
+            would −32000 and drop the personal degrade that Round 13 added
+            (dual-corpus total failure is exactly when that signal matters).
+            Scope "both" also soft-fails shared so a personal boom + shared boom
+            cannot erase combined hits with −32000.
+            """
+            personal_failed = False
             vault_retrieval = context.agent_vault_retrieval(agent_id) if agent_id else None
             if vault_retrieval is not None:
                 vault_engine, _source_agent, _source_db_path = vault_retrieval
@@ -275,24 +428,98 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
                         principal_for_documents=principal,
                     )
                 except Exception as exc:
+                    # Round 13 (PR #260): personal leg failure was log-only while
+                    # the shared fallback could still report degraded:false —
+                    # personal memory never ran, response looked healthy.
+                    personal_failed = True
+                    detail = f"personal vault index failed: {exc}"[:400]
                     context.logger.warning(
                         "search: personal vault index failed for %s (%s); falling back to shared",
                         agent_id,
                         exc,
                     )
+                    emb_model = None
+                    try:
+                        emb_model = getattr(
+                            vault_engine.config, "embedding_model", None
+                        )
+                    except Exception:
+                        emb_model = None
+                    if emb_model is None:
+                        emb_model = getattr(
+                            getattr(context, "default_config", None),
+                            "embedding_model",
+                            None,
+                        )
+                    degradations.append(
+                        {
+                            "src": "p",
+                            "vector_model": emb_model,
+                            "vector_degraded": False,
+                            "degraded": True,
+                            "personal_index_failed": detail,
+                            "reason": detail,
+                        }
+                    )
+            # Round 19: soft shared when other legs may still run (scope both).
+            # Round 22: also soft when personal already failed — dual-corpus
+            # total failure must keep personal_index_failed on the 200 body,
+            # not discard it via outer −32000.
+            if soft or personal_failed:
+                return retrieve_shared_soft()
             return retrieve_shared()
 
         def retrieve_combined() -> list:
+            # Round 16: mirror personal-leg hardening — one agent vault throw
+            # must not JSON-RPC −32000 the whole combined search. Per-engine
+            # try/except, degradation entry, continue with partial hits.
             result_sets = []
-            for vault_engine, _source_agent, _source_db_path in context.all_vault_retrievals():
-                result_sets.append(
-                    retrieve_from(
-                        vault_engine,
-                        src="c",
-                        principal_for_documents=principal,
+            for vault_engine, source_agent, _source_db_path in context.all_vault_retrievals():
+                try:
+                    result_sets.append(
+                        retrieve_from(
+                            vault_engine,
+                            src="c",
+                            principal_for_documents=principal,
+                        )
                     )
-                )
-            result_sets.append(retrieve_shared())
+                except Exception as exc:
+                    detail = (
+                        f"combined vault index failed"
+                        f"{f' ({source_agent})' if source_agent else ''}: {exc}"
+                    )[:400]
+                    context.logger.warning(
+                        "search: combined vault index failed for %s (%s); continuing with partial results",
+                        source_agent,
+                        exc,
+                    )
+                    emb_model = None
+                    try:
+                        emb_model = getattr(
+                            vault_engine.config, "embedding_model", None
+                        )
+                    except Exception:
+                        emb_model = None
+                    if emb_model is None:
+                        emb_model = getattr(
+                            getattr(context, "default_config", None),
+                            "embedding_model",
+                            None,
+                        )
+                    degradations.append(
+                        {
+                            "src": "c",
+                            "vector_model": emb_model,
+                            "vector_degraded": False,
+                            "degraded": True,
+                            "combined_index_failed": detail,
+                            "reason": detail,
+                            "source_agent": source_agent,
+                        }
+                    )
+            # Round 18: soft-fail shared so agent-vault hits already collected
+            # are not erased by a shared-index throw (−32000).
+            result_sets.append(retrieve_shared_soft())
             return merge_document_results(result_sets, limit)
 
         if principal is None:
@@ -302,7 +529,11 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
         elif document_scope == "combined":
             results = retrieve_combined()
         else:
-            result_sets = [retrieve_personal(), retrieve_combined()]
+            # scope "both": personal + combined. Combined already soft-fails
+            # shared; personal must soft-fail its shared fallback too — a hard
+            # shared throw here (−32000) ran before combined and dropped every
+            # agent-vault hit that combined would have returned.
+            result_sets = [retrieve_personal(soft=True), retrieve_combined()]
             results = merge_document_results(result_sets, limit, prefer_personal=True)
 
         if budget_tokens_param is not None:
@@ -474,8 +705,17 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
             "episodic": episodic_hits,
             "episodic_count": len(episodic_hits),
         }
-        if not results and auth_suppressions:
+        # R3 (#226): this used to be `if not results and auth_suppressions`. A
+        # vault entirely blacked out by authorization was therefore reported as
+        # normal whenever ANY other leg returned hits, and the caller could not
+        # tell "this vault had nothing" from "this vault was fully suppressed".
+        # Per-corpus suppression is per-corpus news; report it on its own terms.
+        if auth_suppressions:
             response_payload["auth_suppression"] = auth_suppressions
+        # R4/R5 (#226): always present, so a caller reading the response can
+        # always answer "was this a healthy hybrid search?" without inferring it.
+        response_payload["degradation"] = degradations
+        response_payload["degraded"] = any(d.get("degraded") for d in degradations)
         return context.make_response(response_payload, request_id)
     except Exception as exc:
         context.logger.exception("search failed")

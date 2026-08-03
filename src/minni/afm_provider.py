@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import threading
 import time
 import urllib.request
 from typing import Any, Callable, Dict, Literal, Optional
@@ -113,6 +114,37 @@ def _generation_probe_timeout_seconds() -> float:
 _GENERATION_PROBE_TIMEOUT_SECONDS = _generation_probe_timeout_seconds()
 _generation_probe_cache: Dict[str, Dict[str, Any]] = {}
 
+# AFM-4 (#230): the cache had no eviction policy at all. Measured live at 22
+# entries, 21 of them stale residue from test runs against throwaway URLs —
+# each one an unbounded-growth key that nothing would ever read again. Keys are
+# "mode|url", so an operator cycling through endpoints (or any test suite)
+# grows it without limit. Bound it and evict the oldest probe first.
+PROBE_CACHE_MAX_ENTRIES = 32
+# AFM-4: the persistent cache was a read-modify-write with no mutual exclusion,
+# so two concurrent probes could each read the same entries dict and the second
+# write would drop the first one's entry. Serializes the whole read-mutate-write.
+_probe_cache_lock = threading.RLock()
+
+
+def _evict_probe_entries(entries: Dict[str, Dict[str, Any]], probed_at_key: str) -> None:
+    """Trim ``entries`` to :data:`PROBE_CACHE_MAX_ENTRIES`, oldest probe first.
+
+    Entries with no usable timestamp sort oldest — an entry we cannot date is
+    not one we can justify keeping over one we can.
+    """
+    if len(entries) <= PROBE_CACHE_MAX_ENTRIES:
+        return
+
+    def _age_key(item: Any) -> float:
+        value = item[1].get(probed_at_key)
+        return float(value) if isinstance(value, (int, float)) else float("-inf")
+
+    for key, _ in sorted(entries.items(), key=_age_key)[
+        : len(entries) - PROBE_CACHE_MAX_ENTRIES
+    ]:
+        del entries[key]
+
+
 # --- cross-process persistent probe cache (L2) -------------------------------
 #
 # The in-memory dict above (L1) only benefits long-lived processes; SessionStart
@@ -132,6 +164,104 @@ def _probe_cache_file_path() -> str:
         return os.path.expanduser(override)
     home = os.path.expanduser(os.environ.get("MINNI_HOME", "~/.minni"))
     return os.path.join(home, "run", "afm-probe-cache.json")
+
+
+def _probe_cache_lock_path() -> str:
+    """Same lock sibling the plugin uses (afm.ts probeCacheLockPath)."""
+    return _probe_cache_file_path() + ".lock"
+
+
+# Lockfiles older than this are treated as abandoned (SIGKILL mid-RMW).
+# Must match plugins/minni/src/afm.ts PROBE_CACHE_LOCK_STALE_MS.
+PROBE_CACHE_LOCK_STALE_SECONDS = 10.0
+
+
+def _reclaim_stale_probe_cache_lock(now: Optional[float] = None) -> bool:
+    """Unlink an orphan lockfile. Returns True when one was removed."""
+    lock_path = _probe_cache_lock_path()
+    try:
+        age = (time.time() if now is None else now) - os.path.getmtime(lock_path)
+    except OSError:
+        return False
+    if age < PROBE_CACHE_LOCK_STALE_SECONDS:
+        return False
+    try:
+        os.unlink(lock_path)
+        return True
+    except OSError:
+        return False
+
+
+def _with_probe_cache_file_lock(fn: Callable[[], None]) -> None:
+    """Cross-process exclusive lock via O_EXCL lockfile (shared with afm.ts).
+
+    threading.RLock alone is invisible to Node SessionStart hooks. Without a
+    shared lock path, daemon + plugin both RMW the cache and last-writer wins
+    drops a probe (AFM-4 / PR #260 round 10).
+    """
+    lock_path = _probe_cache_lock_path()
+    _reclaim_stale_probe_cache_lock()
+    max_attempts = 40
+    for attempt in range(max_attempts):
+        fd: Optional[int] = None
+        try:
+            os.makedirs(os.path.dirname(lock_path) or ".", exist_ok=True)
+            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            try:
+                fn()
+            finally:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                fd = None
+                try:
+                    os.unlink(lock_path)
+                except OSError:
+                    pass
+            return
+        except FileExistsError:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            if attempt > 0 and attempt % 5 == 0:
+                _reclaim_stale_probe_cache_lock()
+            time.sleep(0.005)
+        except OSError:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            # Unexpected lock error — still try the mutation unlocked.
+            try:
+                fn()
+            except Exception:
+                pass
+            return
+    _reclaim_stale_probe_cache_lock()
+    try:
+        fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        try:
+            fn()
+        finally:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            try:
+                os.unlink(lock_path)
+            except OSError:
+                pass
+        return
+    except OSError:
+        pass
+    try:
+        fn()
+    except Exception:
+        pass
 
 
 def _read_persistent_probe_entries() -> Dict[str, Dict[str, Any]]:
@@ -181,9 +311,25 @@ def _write_persistent_probe_entries(entries: Dict[str, Dict[str, Any]]) -> None:
 
 
 def _persist_probe_mutation(mutate: Callable[[Dict[str, Dict[str, Any]]], None]) -> None:
-    entries = _read_persistent_probe_entries()
-    mutate(entries)
-    _write_persistent_probe_entries(entries)
+    # AFM-4 (#230): read-mutate-write under in-process RLock AND a cross-process
+    # O_EXCL lockfile shared with plugins/minni/src/afm.ts. Thread lock alone
+    # left daemon vs SessionStart racing the same file; file lock alone would
+    # still race two daemon threads. Both are required.
+    def _rmw() -> None:
+        entries = _read_persistent_probe_entries()
+        mutate(entries)
+        _evict_probe_entries(entries, "probed_at_ms")
+        _write_persistent_probe_entries(entries)
+
+    with _probe_cache_lock:
+        _with_probe_cache_file_lock(_rmw)
+
+
+def _remember_probe(key: str, entry: Dict[str, Any]) -> None:
+    """Store an L1 probe entry, bounding the cache (AFM-4)."""
+    with _probe_cache_lock:
+        _generation_probe_cache[key] = entry
+        _evict_probe_entries(_generation_probe_cache, "probed_at")
 
 
 def _to_persisted_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
@@ -217,21 +363,27 @@ def reset_afm_generation_probe_cache() -> None:
 
 
 def note_afm_generation_failure(url: Optional[str] = None) -> None:
-    """Invalidate cached generation probes after a live call failure."""
-    if url is None:
-        _generation_probe_cache.clear()
-        _persist_probe_mutation(lambda entries: entries.clear())
-        return
-    for key in list(_generation_probe_cache):
-        if key.endswith(f"|{url}"):
-            del _generation_probe_cache[key]
+    """Invalidate cached generation probes after a live call failure.
 
-    def _drop(entries: Dict[str, Dict[str, Any]]) -> None:
-        for key in list(entries):
+    Review round 2 on PR #260: the L1 iterate-and-delete ran outside
+    _probe_cache_lock while _remember_probe mutated under it. The lock is an
+    RLock, so the whole L1+persistent RMW is serialized here as one unit.
+    """
+    with _probe_cache_lock:
+        if url is None:
+            _generation_probe_cache.clear()
+            _persist_probe_mutation(lambda entries: entries.clear())
+            return
+        for key in list(_generation_probe_cache):
             if key.endswith(f"|{url}"):
-                del entries[key]
+                del _generation_probe_cache[key]
 
-    _persist_probe_mutation(_drop)
+        def _drop(entries: Dict[str, Dict[str, Any]]) -> None:
+            for key in list(entries):
+                if key.endswith(f"|{url}"):
+                    del entries[key]
+
+        _persist_probe_mutation(_drop)
 
 
 def note_afm_generation_success(url: str, mode: str = "bridge", now: Callable[[], float] = time.time) -> None:
@@ -242,18 +394,21 @@ def note_afm_generation_success(url: str, mode: str = "bridge", now: Callable[[]
     even while real calls succeed (mirror of afm.ts noteAfmGenerationSuccess).
     """
     entry = {"reachable": True, "generation_verified": True, "detail": None, "probed_at": now()}
-    _generation_probe_cache[f"{mode}|{url}"] = entry
-    for key in list(_generation_probe_cache):
-        if key.endswith(f"|{url}"):
-            _generation_probe_cache[key] = dict(entry)
-
-    def _upsert(entries: Dict[str, Dict[str, Any]]) -> None:
-        entries[f"{mode}|{url}"] = _to_persisted_entry(entry)
-        for key in list(entries):
+    # Round 2 (PR #260): one lock scope for the whole multi-key RMW — the
+    # iteration used to run outside the lock the individual writes took.
+    with _probe_cache_lock:
+        _remember_probe(f"{mode}|{url}", entry)
+        for key in list(_generation_probe_cache):
             if key.endswith(f"|{url}"):
-                entries[key] = _to_persisted_entry(entry)
+                _remember_probe(key, dict(entry))
 
-    _persist_probe_mutation(_upsert)
+        def _upsert(entries: Dict[str, Dict[str, Any]]) -> None:
+            entries[f"{mode}|{url}"] = _to_persisted_entry(entry)
+            for key in list(entries):
+                if key.endswith(f"|{url}"):
+                    entries[key] = _to_persisted_entry(entry)
+
+        _persist_probe_mutation(_upsert)
 
 
 def _chat_completion_content(data: Dict[str, Any]) -> Optional[str]:
@@ -347,11 +502,11 @@ def verify_afm_generation(
         # fall through to a normal probe.
         persisted = _load_persisted_probe_entry(key)
         if persisted is not None and (now() - persisted["probed_at"]) < ttl_seconds:
-            _generation_probe_cache[key] = persisted
+            _remember_probe(key, persisted)
             cached = persisted
     if cached is None or (now() - cached["probed_at"]) >= ttl_seconds:
         cached = _run_generation_probe(resolved, target, timeout, client, now)
-        _generation_probe_cache[key] = cached
+        _remember_probe(key, cached)
         fresh = cached
 
         def _store(entries: Dict[str, Dict[str, Any]]) -> None:

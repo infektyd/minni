@@ -169,7 +169,14 @@ def test_backend_resolver_preserves_default_bit_identical_path():
 
     assert _resolve_backend("auto", SovereignConfig(vector_backends=["faiss-disk"])) is None
     assert _resolve_backend(None, SovereignConfig(vector_backends=["faiss-disk"])) is None
-    assert _resolve_backend("faiss-mem", SovereignConfig()) == "faiss-mem"
+    # R4(c) (#226): this used to assert the bare string was passed through
+    # unchanged. That WAS the defect — a bare string reached the "explicit
+    # backend object" branch in retrieve() and had `.search` called on a `str`,
+    # which surfaced to the caller as JSON-RPC -32000 (internal error) for what
+    # is a perfectly documented parameter value. A named backend is now
+    # normalized to the validated single-element list form.
+    # The default paths asserted above are unchanged and still bit-identical.
+    assert _resolve_backend("faiss-mem", SovereignConfig()) == ["faiss-mem"]
     assert _resolve_backend("auto", SovereignConfig(vector_backends=["faiss-disk", "faiss-mem"])) == [
         "faiss-disk",
         "faiss-mem",

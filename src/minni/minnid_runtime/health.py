@@ -31,6 +31,22 @@ _HEALTH_REPORT_SENSITIVE_KEYS = (
 )
 
 
+# GA6-2: the four consolidation-tick sub-ops, named explicitly so this field
+# stays scoped to the subsystem it describes.
+CONSOLIDATION_FAILURE_COUNTERS = (
+    "inbox_ingest_failures_total",
+    "inbox_quarantine_failures_total",
+    "inbox_archive_failures_total",
+    "compact_distillation_failures_total",
+)
+# Review round 3 on PR #260: the ingest status was derived from the cumulative
+# totals, which nothing ages out — one boot-time failure read "failing" until
+# daemon restart, the same one-way latch round 2 removed from derive_loop_status
+# and writes_dropped. Only a failure inside this window is a live condition;
+# the lifetime totals stay reported as data.
+CONSOLIDATION_FAILURE_RECENT_SECONDS = 3600.0
+
+
 def redact_health_report_for_recovery(report: dict) -> dict:
     """Strip document paths and learning contents from a pre-identity health_report.
 
@@ -73,6 +89,10 @@ class HealthContext:
     # ring buffer. Defaulted so tests/legacy wiring that construct a HealthContext
     # without them keep working (status just omits the self-diagnosing extras).
     metrics_delta_snapshot: Callable[[], dict] = lambda: {}
+    # Review round 3 (PR #260): recency source for latch-free status verdicts.
+    # Defaulted to "unknown" (None), which callers must treat as NOT recovered —
+    # a context wired without recency keeps the alarm rather than clearing it.
+    metrics_last_incremented_at: Callable[[str], Optional[float]] = lambda name: None
     health_flags: Callable[[dict], list] = lambda deltas: []
     recent_errors: Callable[[], list] = lambda: []
     increment_request_count: Callable[[], None] | None = None
@@ -302,6 +322,18 @@ def handle_health_report(params: dict, request_id: Any, context: HealthContext) 
         # transition is reported. Counts and labels only — no scores — so it
         # stays outside _HEALTH_REPORT_SENSITIVE_KEYS.
         "score_calibration": {},
+        # GA6-2: the four consolidation-tick sub-ops (inbox ingest, quarantine,
+        # inert archive, compact distillation) incremented a counter ONLY on
+        # their success paths and swallowed every exception, so a sub-op broken
+        # for days was indistinguishable from one that simply had no work —
+        # health had no ingest-failure field and no inbox-backlog field at all.
+        # Both live here. Aggregate-only, so it stays outside
+        # _HEALTH_REPORT_SENSITIVE_KEYS alongside inbox_quarantine.
+        "consolidation_ingest": {
+            "failures": {},
+            "inbox_backlog": 0,
+            "status": "unknown",
+        },
         # W2: last-N dispatch exceptions so a climbing errors.<method> counter is
         # attributable. Sensitive (messages can embed paths/payloads) — redacted
         # to a count for any non-operator caller via _HEALTH_REPORT_SENSITIVE_KEYS.
@@ -534,6 +566,61 @@ def handle_health_report(params: dict, request_id: Any, context: HealthContext) 
             # contract), so a raw str(exc) would survive recovery/non-operator
             # redaction and leak local paths.
             report["inbox_quarantine"] = {
+                "status": "unknown",
+                "error": type(exc).__name__,
+            }
+
+        try:
+            # GA6-2: failures come from the global counters the sub-ops now
+            # increment on their exception paths; backlog is the count of
+            # undrained inbox files. A climbing backlog with zero failures and
+            # a climbing failure count are different faults, so both are
+            # reported rather than collapsed into one "ingest is unhappy".
+            from minni.afm_passes.inbox_ingest import discover_inboxes
+
+            # metrics_snapshot(), not metrics_delta_snapshot(): this is a plain
+            # copy of the counters. The delta variant advances a baseline, and
+            # a report must never consume the deltas a status poll is reading.
+            counters = context.metrics_snapshot()
+            # Whitelisted, not suffix-matched. A bare `_failures_total` filter
+            # also swept in afm_pass_failures_total and
+            # afm_loop_tick_failures_total, so a synthesis-pass fault flipped
+            # THIS field to "failing" — a different subsystem's problem
+            # reported as an ingest problem, which is exactly the kind of
+            # mis-attribution this whole slice exists to end. (Review round 1
+            # on PR #260.)
+            failures = {
+                name: counters[name]
+                for name in CONSOLIDATION_FAILURE_COUNTERS
+                if counters.get(name)
+            }
+            # Review round 3 (PR #260): status from RECENCY, not lifetime
+            # totals — a counter bumped once at boot must not read "failing"
+            # forever (the latch class round 2 removed from derive_loop_status).
+            # Unknown recency (no stamp available) keeps the alarm: better a
+            # stale reason than a suppressed fault. The totals stay in
+            # `failures` as data either way.
+            now = time.time()
+            recent_failures = {}
+            for name, total in failures.items():
+                last_at = context.metrics_last_incremented_at(name)
+                if last_at is None or now - last_at <= CONSOLIDATION_FAILURE_RECENT_SECONDS:
+                    recent_failures[name] = total
+            backlog = 0
+            for inbox in discover_inboxes(context.default_config):
+                if inbox.is_dir():
+                    backlog += sum(1 for _ in inbox.glob("*.json"))
+            report["consolidation_ingest"] = {
+                "failures": failures,
+                "recent_failures": recent_failures,
+                "inbox_backlog": backlog,
+                "status": "failing" if recent_failures else "ok",
+            }
+        except Exception as exc:
+            # Exception class only, for the same reason as inbox_quarantine
+            # above: this block is aggregate-only and outside the redaction set,
+            # so an OSError message would leak an inbox filesystem path.
+            report["consolidation_ingest"] = {
                 "status": "unknown",
                 "error": type(exc).__name__,
             }

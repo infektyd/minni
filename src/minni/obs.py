@@ -30,7 +30,7 @@ import sys
 import threading
 import time
 from collections import deque
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 LOGGER_NAME = "minnid"
 
@@ -136,10 +136,22 @@ class Counters:
         # caller sees change-since-last-look rather than a bare cumulative int
         # (a monotonic counter conflates "never happened" with "long ago").
         self._previous: Dict[str, int] = {}
+        # Review round 3 on PR #260: a monotonic total also conflates "failing
+        # NOW" with "failed once at boot", which let health verdicts derived
+        # from it latch for the process lifetime. The stamp makes recency a
+        # first-class property of every counter without a second bookkeeping
+        # call at the increment sites.
+        self._last_incr_at: Dict[str, float] = {}
 
     def incr(self, name: str, amount: int = 1) -> None:
         with self._lock:
             self._counts[name] = self._counts.get(name, 0) + int(amount)
+            self._last_incr_at[name] = time.time()
+
+    def last_incremented_at(self, name: str) -> Optional[float]:
+        """Epoch seconds of the most recent ``incr`` for ``name``, or None."""
+        with self._lock:
+            return self._last_incr_at.get(name)
 
     def get(self, name: str) -> int:
         with self._lock:
@@ -174,6 +186,7 @@ class Counters:
         with self._lock:
             self._counts.clear()
             self._previous.clear()
+            self._last_incr_at.clear()
 
 
 # Named health flags raised when a counter's delta since the previous snapshot
@@ -247,6 +260,11 @@ def incr(name: str, amount: int = 1) -> None:
 def metrics_snapshot() -> Dict[str, int]:
     """Return a copy of all global counters for status/diagnostics surfaces."""
     return METRICS.snapshot()
+
+
+def metrics_last_incremented_at(name: str) -> Optional[float]:
+    """Epoch seconds of the most recent increment of ``name``, or None."""
+    return METRICS.last_incremented_at(name)
 
 
 def metrics_delta_snapshot(consume: bool = True) -> Dict[str, Dict[str, int]]:

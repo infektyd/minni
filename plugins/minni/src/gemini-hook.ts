@@ -21,13 +21,14 @@ import {
   GEMINI_WORKSPACE_ID,
 } from "./config.js";
 import {
+  AGY_EVENTS,
   adaptAgyPayload,
   adaptPreToolUseOutput,
   agyAllow,
   enrichAgyPromptPayload,
   enrichAgyStopPayload,
 } from "./gemini-adapter.js";
-import { createHookHandlers } from "./hook-handlers.js";
+import { createHookHandlers, recordUnroutedEvent } from "./hook-handlers.js";
 import { geminiWire } from "./hook-platform.js";
 import type { AgentHookConfig } from "./hook-handlers.js";
 import { VALID_EVENTS, asString, emit, readStdin } from "./hook-utils.js";
@@ -76,19 +77,6 @@ const CONFIG: AgentHookConfig = {
   wire: geminiWire,
 };
 
-/**
- * agy's native event names -> Minni's internal EnvelopeEvent names.
- *
- * Declaring Claude Code's names in an agy manifest is what made this
- * integration dead config: `UserPromptSubmit` and `PreCompact` simply do not
- * exist on agy, so those entries never fired and never would have.
- */
-const AGY_EVENTS: Record<string, EnvelopeEvent> = {
-  SessionStart: "SessionStart",
-  PreInvocation: "UserPromptSubmit",
-  Stop: "Stop",
-};
-
 async function main(): Promise<void> {
   const rawEventArg = (process.argv[2] ?? "").trim();
   const eventArg =
@@ -106,6 +94,8 @@ async function main(): Promise<void> {
   const raw = (await readStdin()) as Record<string, unknown>;
   const event = eventArg || asString(raw.hook_event_name).trim();
   if (event !== PRE_TOOL_USE_EVENT && !VALID_EVENTS.includes(event as EnvelopeEvent)) {
+    // P4 (#228): record the drop instead of exiting clean and silent.
+    await recordUnroutedEvent(CONFIG.vaultPath, CONFIG.auditPrefix, event);
     emitNoop();
     return;
   }

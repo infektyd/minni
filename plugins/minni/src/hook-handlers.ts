@@ -22,6 +22,7 @@ import {
 } from "./agent_envelope.js";
 import type { EnvelopeEvent } from "./agent_envelope.js";
 import {
+  BRIDGE_FAILURE_EVENT,
   VALID_EVENTS,
   asString,
   effectiveHookBudgetMs,
@@ -1403,6 +1404,13 @@ export function createHookHandlers(
       case "Stop":
         return handleStop(payload);
       default:
+        // P4 (#228): `render(noIntent)` reports a clean, successful no-op —
+        // which is honest for "ran fine, nothing to say" but a lie for "this
+        // event passed the VALID_EVENTS gate and then found no handler".
+        // PostCompact is exactly that case on this generic path: it is a valid
+        // envelope event, so it gets in here, and then falls through to a
+        // silent success. Record it, then continue as before.
+        await recordUnroutedEvent(config.vaultPath, config.auditPrefix, event);
         return render(noIntent);
     }
   }
@@ -1418,19 +1426,127 @@ export function createHookHandlers(
   };
 }
 
+/**
+ * P4 (#228): record an event that reached the hook and was not routed.
+ *
+ * Shares the `_intent_dropped` tool name with the wire-drop path in `render`
+ * so every "the hook was reached and nothing was carried" case is countable
+ * from one place, and buckets by event for the same reason that one does — a
+ * throttle keyed on the bare tool name would collapse two different events'
+ * drops into one record and report the second as written.
+ *
+ * Best-effort: losing the audit record must never also lose the event.
+ */
+export async function recordUnroutedEvent(
+  vaultPath: string,
+  auditPrefix: string,
+  event: string,
+): Promise<void> {
+  try {
+    await recordAudit(vaultPath, {
+      tool: `${auditPrefix}_intent_dropped`,
+      summary: `${event || "(empty)"}: event not routed by this hook (no handler)`,
+      throttleKey: `${auditPrefix}_intent_dropped__unrouted__${event}`,
+    });
+  } catch {
+    // Audit unavailable. The drop is still correct behavior.
+  }
+}
+
+/**
+ * P6 (#228): a native bridge (Kilo) has no vault handle of its own — it
+ * reaches the vault only by spawning this hook. This is that channel: it
+ * carries a bridge failure into the audit log so a persistently failing
+ * bridge is distinguishable from an idle one. It is a diagnostic, not an
+ * envelope event, and never reaches a handler.
+ *
+ * Round 7 (PR #260): the EXIT CODE is the delivery signal. The bridge
+ * restores its coalesced eviction counts only when this child errors or
+ * exits non-zero — so an audit that did not land must not exit clean, or
+ * the parent clears counts that were never written anywhere durable.
+ */
+async function runBridgeFailureDiagnostic(
+  config: AgentHookConfig,
+  payload: Record<string, unknown>,
+): Promise<never> {
+  const failedEvent = asString(payload.failed_event) || "(unknown)";
+  const bridge = asString(payload.bridge) || "(unknown)";
+  // Round 9 (PR #260): storm suppress carries counts forward and flushes on
+  // settle — name the dark interval so the audit row is not a silent single.
+  const suppressed = payload.suppressed_since_last_report;
+  const coalesced = payload.coalesced_count;
+  const extras: string[] = [];
+  if (typeof coalesced === "number" && coalesced > 1) {
+    extras.push(`coalesced=${coalesced}`);
+  }
+  if (typeof suppressed === "number" && suppressed > 0) {
+    extras.push(`suppressed_since_last_report=${suppressed}`);
+  }
+  const suffix = extras.length ? ` [${extras.join(", ")}]` : "";
+  try {
+    await recordAudit(config.vaultPath, {
+      tool: `${config.auditPrefix}_bridge_failure`,
+      summary: `${bridge} bridge: ${failedEvent} failed: ${asString(payload.error)}${suffix}`,
+      // Bucket per failed event, for the same reason _intent_dropped does:
+      // one throttle across all of them would hide every failure after the
+      // first and report the bridge as healthier than it is.
+      throttleKey: `${config.auditPrefix}_bridge_failure__${failedEvent}`,
+    });
+  } catch {
+    // Round 26: delivery is the EXIT CODE. Parent treats close(null)/non-zero
+    // as undelivered. Setting exitCode and returning left the event loop
+    // alive until SIGKILL → close(null) after a successful audit, reopening
+    // P6 as "never delivered" after a durable write. Force exit.
+    try {
+      emit({ continue: true });
+    } catch {
+      /* best-effort envelope */
+    }
+    process.exit(1);
+  }
+  emit({ continue: true });
+  // Same "delivery is exit" contract as every other settled hook path.
+  exitAfterDelivery();
+}
+
 export async function runHookMain(config: AgentHookConfig): Promise<void> {
+  // Round 7/26 (PR #260): the bridge diagnostic is routed BEFORE the
+  // hooksEnabled gate — disabling memory hooks must not also disable the one
+  // surface that says the bridge is broken. The early return here used to
+  // exit 0 first, which the parent read as "audit delivered".
+  //
+  // Argv form is the Kilo spawn contract. Payload-only form
+  // (hook_event_name: BridgeFailure, no argv) is the same diagnostic
+  // channel and must also bypass hooksEnabled — read stdin once, then route
+  // both before any hooks-disabled early return.
+  const eventArg = (process.argv[2] ?? "").trim();
+  if (eventArg === BRIDGE_FAILURE_EVENT) {
+    const payload = (await readStdin()) as Record<string, unknown>;
+    await runBridgeFailureDiagnostic(config, payload);
+  }
+
+  const payload = (await readStdin()) as Record<string, unknown>;
+  const eventFromPayload = asString(payload.hook_event_name);
+  if ((eventFromPayload || "").trim() === BRIDGE_FAILURE_EVENT) {
+    await runBridgeFailureDiagnostic(config, payload);
+  }
+
   if (!config.hooksEnabled) {
     emit({ continue: true });
     return;
   }
 
-  const eventArg = process.argv[2];
-  const payload = (await readStdin()) as Record<string, unknown>;
-  const eventFromPayload = asString(payload.hook_event_name);
   const event = (eventArg || eventFromPayload || "").trim();
   // PreToolUse is dispatched here too but is NOT an EnvelopeEvent (its output is
   // the permissionDecision shape), so it is gated alongside VALID_EVENTS.
   if (event !== PRE_TOOL_USE_EVENT && !VALID_EVENTS.includes(event as EnvelopeEvent)) {
+    // P4 (#228): this exited with a SUCCESS status and no marker of any kind,
+    // so an event the platform declared and sent but Minni does not route was
+    // indistinguishable from an event that was never sent at all. That is the
+    // whole clean-continue swallow: the manifest says the event is wired, the
+    // exit code says it went fine, and nothing anywhere records that it was
+    // dropped on the floor. Count it before continuing.
+    await recordUnroutedEvent(config.vaultPath, config.auditPrefix, event);
     emit({ continue: true });
     return;
   }

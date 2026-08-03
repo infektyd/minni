@@ -35,6 +35,7 @@ from minni.config import SovereignConfig, DEFAULT_CONFIG, correction_class_page_
 from minni.db import SovereignDB
 from minni.faiss_index import FAISSIndex
 from minni.query_expand import expand as expand_query
+from minni.query_expand import expand_with_status as expand_query_with_status
 from minni.query_expand import summarize_with_afm
 
 # G19/G20/G22: read gate + evidence envelopes
@@ -374,6 +375,18 @@ class RetrievalEngine:
         # model comes back. Surfaced by status/recall so an FTS-only session is
         # visible instead of masquerading as healthy.
         self.vector_model_down: bool = False
+        # R5 (#226): _rerank swallows a reranker failure and returns candidates
+        # carrying no rerank_score, which drops that corpus to raw RRF
+        # magnitude. Recorded per-retrieve so the merged response can say the
+        # ordering is not what it claims to be.
+        # Thread-local for exactly the reason last_auth_suppression is (see the
+        # comment on _auth_suppression_local below): dispatch runs each `search`
+        # RPC on its own worker thread against ONE process-wide engine, so a
+        # plain instance attribute would let a concurrent request clear this in
+        # the window between retrieve() returning and the handler reading it —
+        # reporting a degraded search as healthy, or pinning one caller's
+        # failure on another. Review round 1 on PR #260 caught this.
+        self._degradation_local = threading.local()
         # P0-A contract: when the read-authorization gate suppresses a
         # non-empty candidate set to zero, the reason is recorded so the caller
         # can return a diagnostic envelope instead of a bare [].
@@ -415,6 +428,71 @@ class RetrievalEngine:
             local = threading.local()
             self._auth_suppression_local = local
         local.value = value
+
+    def _degradation_flag(self, name: str) -> Optional[str]:
+        local = getattr(self, "_degradation_local", None)
+        return getattr(local, name, None) if local is not None else None
+
+    def _set_degradation_flag(self, name: str, value: Optional[str]) -> None:
+        # Lazy-init like the auth-suppression setter, so instances built via
+        # object.__new__ (test fakes bypassing __init__) still work.
+        local = getattr(self, "_degradation_local", None)
+        if local is None:
+            local = threading.local()
+            self._degradation_local = local
+        setattr(local, name, value)
+
+    @property
+    def last_rerank_degraded(self) -> Optional[str]:
+        """R5 (#226): why the reranker failed on THIS thread's last retrieve().
+
+        A rerank failure leaves candidates with no rerank_score, so in a
+        combined/both merge this corpus competes at raw RRF magnitude against
+        reranked corpora and is silently evicted. Per-thread, so concurrent
+        searches never read each other's verdict.
+        """
+        return self._degradation_flag("rerank")
+
+    @last_rerank_degraded.setter
+    def last_rerank_degraded(self, value: Optional[str]) -> None:
+        self._set_degradation_flag("rerank", value)
+
+    @property
+    def last_query_expand_degraded(self) -> Optional[str]:
+        """AFM-6 (#230): why expansion failed and recall fell back to the bare
+        query, for THIS thread's last retrieve()."""
+        return self._degradation_flag("query_expand")
+
+    @last_query_expand_degraded.setter
+    def last_query_expand_degraded(self, value: Optional[str]) -> None:
+        self._set_degradation_flag("query_expand", value)
+
+    @property
+    def last_vector_degraded(self) -> Optional[str]:
+        """P0-B, per request: whether THIS thread's last retrieve() lost its
+        semantic leg. Review round 2 on PR #260: R4(a) reported the plain
+        process-wide ``vector_model_down`` bool per RESPONSE, so a concurrent
+        request flipping it in the set-in-retrieve()/read-in-handler window
+        could report a lexical-only answer as healthy (or a healthy one as
+        degraded). The response envelope reads this thread-local instead; the
+        global bool stays as the process-level outage signal for the health
+        surface and the log-once guard."""
+        return self._degradation_flag("vector")
+
+    @last_vector_degraded.setter
+    def last_vector_degraded(self, value: Optional[str]) -> None:
+        self._set_degradation_flag("vector", value)
+
+    @property
+    def last_hyde_degraded(self) -> Optional[str]:
+        """Round 15 (PR #260): HyDE was triggered but did not complete on THIS
+        thread's last retrieve(). Without this the response envelope could
+        look healthy while enrichment never ran (trace-only signal)."""
+        return self._degradation_flag("hyde")
+
+    @last_hyde_degraded.setter
+    def last_hyde_degraded(self, value: Optional[str]) -> None:
+        self._set_degradation_flag("hyde", value)
 
     @property
     def model(self):
@@ -677,20 +755,13 @@ class RetrievalEngine:
         Semantic search via FAISS index.
         Returns best-chunk-per-doc with chunk text and heading context.
         """
-        if not self.model:
-            # P0-B: fail loud. A missing encoder degrades every recall to
-            # lexical-only; logging once per outage (not per query) keeps the
-            # signal visible without flooding.
-            if not self.vector_model_down:
-                logger.warning(
-                    "semantic leg DOWN: embedding model unavailable — recall "
-                    "degraded to lexical (FTS) only until the encoder loads"
-                )
-            self.vector_model_down = True
+        # Round 7 (PR #260): route through _encode_query like every explicit
+        # backend path — an encode-side degrade fixed only there would
+        # otherwise miss the default path. Empty vector = encoder down, flag
+        # already raised.
+        query_emb = self._encode_query(query)
+        if query_emb.size == 0:
             return []
-        self.vector_model_down = False
-
-        query_emb = self.model.encode(query).astype(np.float32)
 
         # Search FAISS for top candidates
         search_limit = limit * 5  # Over-fetch for doc dedup
@@ -1359,6 +1430,12 @@ class RetrievalEngine:
             candidates.sort(key=lambda x: x.get("rerank_score", 0), reverse=True)
         except Exception as e:
             logger.warning("Re-ranking failed: %s — falling back to RRF scores", e)
+            # R5 (#226): the fallback leaves these candidates with no
+            # rerank_score, so in a combined/both merge this corpus competes at
+            # raw RRF magnitude against reranked corpora and is silently evicted.
+            # Record it; the caller reports it rather than presenting the merge
+            # as a clean cross-corpus ordering.
+            self.last_rerank_degraded = str(e)
 
         return candidates
 
@@ -1826,6 +1903,54 @@ class RetrievalEngine:
     _KNOWN_BACKENDS = ("faiss-disk", "faiss-mem", "qdrant", "lance")
     _MAX_BACKENDS = 4
 
+    def _note_vector_model_down(self) -> None:
+        """Raise the P0-B degradation flag, logging once per outage."""
+        if not self.vector_model_down:
+            logger.warning(
+                "semantic leg DOWN: embedding model unavailable — recall "
+                "degraded to lexical (FTS) only until the encoder loads"
+            )
+        self.vector_model_down = True
+        # Per-request verdict for the response envelope (round 2, PR #260).
+        self.last_vector_degraded = (
+            "embedding model unavailable; lexical (FTS) only"
+        )
+
+    def _encode_query(self, query: str) -> np.ndarray:
+        """Encode ``query``, raising the P0-B flag when the encoder is down.
+
+        R4(b) (#226): the explicit-backend branches used to inline
+        ``self.model.encode(q) if self.model else np.array([])``, which fed an
+        EMPTY query vector into the backend with no log line and no flag. The
+        request succeeded and returned lexical-only results indistinguishable
+        from a healthy hybrid search. Every path that needs a query vector now
+        goes through here, so degradation is reported on the same code path as
+        the default branch.
+        """
+        if not self.model:
+            self._note_vector_model_down()
+            return np.array([], dtype=np.float32)
+        # Round 18: only clear the process-wide down flag AFTER a successful
+        # encode. Clearing before encode() meant an OOM/runtime fault left
+        # health reading "encoder up" and hard-failed the request instead of
+        # FTS-only degrade with last_vector_degraded set (R4(b) throw path).
+        try:
+            vec = self.model.encode(query).astype(np.float32)
+        except Exception as exc:
+            if not self.vector_model_down:
+                logger.warning(
+                    "semantic leg DOWN: embedding encode failed (%s) — "
+                    "recall degraded to lexical (FTS) only",
+                    exc,
+                )
+            self.vector_model_down = True
+            self.last_vector_degraded = (
+                f"embedding encode failed: {exc}"[:200]
+            )
+            return np.array([], dtype=np.float32)
+        self.vector_model_down = False
+        return vec
+
     def _normalize_backend_names(self, backend_names: list) -> list:
         """Dedup (order-preserving), cap length, and reject unknown members."""
         seen: set = set()
@@ -1942,6 +2067,13 @@ class RetrievalEngine:
         Returns a list of dicts in the same format as _semantic_search(),
         with the 'backend_name' field populated from hit.backend.
         """
+        # Review round 3 (PR #260): an empty vector means the encoder is down —
+        # _encode_query already raised the P0-B flag. Feeding it to a live
+        # index raises a dimension mismatch, turning the degrade into a -32000
+        # error while the default `backend: auto` path degrades to FTS-only
+        # cleanly. Same outage, same outcome: skip the semantic leg.
+        if query_emb.size == 0:
+            return []
         search_k = limit * 5
         hits = backend.search(query_emb, k=search_k, filter=None)
 
@@ -2276,9 +2408,21 @@ class RetrievalEngine:
         elif expand is True and str(mode).lower() not in {"rule", "afm"}:
             mode = "rule"
         try:
-            variants = expand_query(query, mode=str(mode).lower())
+            # Prefer expand_with_status so mode=afm soft-fail (empty AFM, rule
+            # fallback) is visible on the search envelope — not only hard
+            # exceptions. HyDE sets last_hyde_degraded = "afm_unavailable" on
+            # the analogous miss; query expand was still silent on that path.
+            variants, degraded = expand_query_with_status(
+                query, mode=str(mode).lower()
+            )
+            if degraded:
+                self.last_query_expand_degraded = degraded
         except Exception as exc:  # noqa: BLE001 - recall must not raise here
             logger.warning("Query expansion failed: %s — using original query", exc)
+            # AFM-6 (#230): the log line alone is not reachable from the call
+            # site. Recorded so the response can say the search ran on the bare
+            # query rather than presenting it as an expanded one.
+            self.last_query_expand_degraded = str(exc)
             variants = [query]
         return variants or [query]
 
@@ -2525,7 +2669,24 @@ class RetrievalEngine:
         With backend=None (default), results are bit-identical to pre-PR-3.
         """
         claim_text = str(claim or "").strip()
+        # R5 (#226) / AFM-6 (#230): cleared per-retrieve so a stale flag from an
+        # earlier call never reports this one as degraded. The multi-variant
+        # branch below RECURSES, and each recursive call clears these again on
+        # entry — so a degrade in an early variant would be wiped by a later
+        # healthy one. Aggregated explicitly after the merge, exactly as
+        # variant_suppressions already does. (Review round 1 on PR #260: an
+        # earlier comment here claimed no re-clearing happened. It did.)
+        self.last_rerank_degraded = None
+        self.last_query_expand_degraded = None
+        self.last_vector_degraded = None
+        self.last_hyde_degraded = None
         query_variants = self._resolve_query_variants(query, expand)
+        # Round 25: expand soft-fail (mode=afm → afm_unavailable) is set on the
+        # parent by _resolve_query_variants *before* multi-variant recursion.
+        # Children run with expand=False and clear flags on entry, so the
+        # parent signal must be captured here or the merge wipes AFM-6 honesty
+        # exactly when rule fallback yields ≥2 variants (the common case).
+        parent_expand_degraded = self.last_query_expand_degraded
         if len(query_variants) > 1:
             total_t0 = time.perf_counter()
             per_variant = []
@@ -2535,6 +2696,11 @@ class RetrievalEngine:
             # run last. Collect per-variant suppressions and re-aggregate after
             # the merge.
             variant_suppressions: List[Dict] = []
+            # Same aggregation, same reason: the recursion clears these on entry.
+            variant_rerank_degraded: List[str] = []
+            variant_expand_degraded: List[str] = []
+            variant_vector_degraded: List[str] = []
+            variant_hyde_degraded: List[str] = []
             for variant in query_variants:
                 per_variant.append(self.retrieve(
                     query=variant,
@@ -2565,7 +2731,44 @@ class RetrievalEngine:
                     variant_suppressions.append(
                         {**self.last_auth_suppression, "variant": variant}
                     )
+                if self.last_rerank_degraded:
+                    variant_rerank_degraded.append(
+                        f"{variant}: {self.last_rerank_degraded}"
+                    )
+                if self.last_query_expand_degraded:
+                    variant_expand_degraded.append(
+                        f"{variant}: {self.last_query_expand_degraded}"
+                    )
+                if self.last_vector_degraded:
+                    variant_vector_degraded.append(
+                        f"{variant}: {self.last_vector_degraded}"
+                    )
+                if self.last_hyde_degraded:
+                    variant_hyde_degraded.append(
+                        f"{variant}: {self.last_hyde_degraded}"
+                    )
             results = self._merge_expanded_results(per_variant, query_variants, limit)
+            # A degrade in ANY variant degrades the merge — the merged ordering
+            # mixed a leg that was not reranked. Set AFTER the loop, because the
+            # last variant's clear would otherwise decide the whole verdict.
+            self.last_rerank_degraded = (
+                "; ".join(variant_rerank_degraded) if variant_rerank_degraded else None
+            )
+            child_expand = (
+                "; ".join(variant_expand_degraded) if variant_expand_degraded else None
+            )
+            if parent_expand_degraded and child_expand:
+                self.last_query_expand_degraded = (
+                    f"{parent_expand_degraded}; {child_expand}"
+                )
+            else:
+                self.last_query_expand_degraded = parent_expand_degraded or child_expand
+            self.last_vector_degraded = (
+                "; ".join(variant_vector_degraded) if variant_vector_degraded else None
+            )
+            self.last_hyde_degraded = (
+                "; ".join(variant_hyde_degraded) if variant_hyde_degraded else None
+            )
             # Aggregate: any variant whose non-empty candidate set was gated to
             # zero keeps the blackout visible, regardless of variant order.
             # (recall.py only surfaces it when the merged result is empty.)
@@ -2750,20 +2953,22 @@ class RetrievalEngine:
                 resolved = self._resolve_backends(backend)
                 if len(resolved) == 1:
                     semantic_results = self._backend_search(
-                        self.model.encode(query).astype(np.float32) if self.model else np.array([]),
+                        self._encode_query(query),
                         rerank_k,
                         resolved[0],
                     )
                 else:
                     multi = MultiBackend(resolved)
-                    query_emb = self.model.encode(query).astype(np.float32) if self.model else np.array([])
-                    hits = multi.search(query_emb, k=rerank_k)
+                    query_emb = self._encode_query(query)
+                    # Same encoder-down guard as _backend_search (round 3,
+                    # PR #260): degrade to FTS-only instead of raising.
+                    hits = [] if query_emb.size == 0 else multi.search(query_emb, k=rerank_k)
                     # Convert VectorHit list to the dict format expected by _rrf_merge
                     semantic_results = self._hits_to_dicts(hits, query_emb)
                 trace["backends"] = [getattr(b, "name", str(b)) for b in resolved]
             else:
                 # Single explicit backend object
-                query_emb = self.model.encode(query).astype(np.float32) if self.model else np.array([])
+                query_emb = self._encode_query(query)
                 semantic_results = self._backend_search(query_emb, rerank_k, backend)
                 trace["backends"] = [getattr(backend, "name", "custom")]
             timing["semantic_ms"] = round((time.perf_counter() - semantic_t0) * 1000, 3)
@@ -2916,10 +3121,27 @@ class RetrievalEngine:
                                 r.get("doc_id") for r in hyde_merged
                             ]
                         else:
+                            # AFM-6 (#230): the leg was attempted and produced
+                            # nothing. `triggered` above records the DECISION to
+                            # run; `completed` records whether it actually did.
+                            # Reading `triggered` alone told anyone debugging a
+                            # bad result that the enrichment ran when it had not.
+                            trace["hyde"]["completed"] = False
                             trace["hyde"]["skipped"] = "afm_unavailable"
+                            self.last_hyde_degraded = "afm_unavailable"
+                            logger.warning(
+                                "HyDE leg degraded: AFM produced no hypothetical "
+                                "answer — results are the un-enriched first pass"
+                            )
+                        trace["hyde"].setdefault("completed", True)
                 except Exception as exc:  # noqa: BLE001 - recall must not stack trace.
-                    logger.debug("HyDE skipped after retrieval pass: %s", exc)
+                    # Was DEBUG — invisible at normal log levels, so a HyDE leg
+                    # that failed on every query left no trace anyone would see.
+                    logger.warning("HyDE leg failed after retrieval pass: %s", exc)
+                    trace["hyde"]["completed"] = False
                     trace["hyde"]["skipped"] = "error"
+                    trace["hyde"]["error"] = str(exc)
+                    self.last_hyde_degraded = str(exc)[:400]
 
         # G19 gate (below, after status filter) is the single source of truth for visibility.
         # The prior ad-hoc "agent_id or unknown" filter is removed; legacy principal=None

@@ -60,6 +60,112 @@ def loop_principal() -> EffectivePrincipal:
     )
 
 
+# AFM-8 (#230): how soon a pass that FAILED is retried. Short enough that a
+# transient fault is not punished with the full interval, long enough that a
+# pass failing instantly cannot spin the loop.
+_FAILURE_RETRY_SECONDS = 300
+
+# handle_daemon_compile does NOT re-raise: it catches every exception and
+# RETURNS one of these statuses. Review round 1 on PR #260 caught that a
+# backoff placed only in the loop's `except` was therefore dead code for the
+# exact failure mode AFM-8 is about — the loop's try never sees the exception,
+# so a pass failing instantly still burned the full 24h interval while status
+# read "failing". The tick decision has to read the RESPONSE, not rely on an
+# exception that never arrives.
+#
+# Review round 2 on PR #260: "write_timeout" belongs here too. A hung writer
+# does not raise — submit_drafts waits out its 30s and RETURNS that status, so
+# handle_daemon_compile merges it into a non-exception response. Leaving it
+# out of this set scheduled the next attempt a full interval later: the same
+# AFM-8 hole, one status name over.
+# Round 5: "write_in_flight" is the writer refusing a re-submit while the
+# previous job for the same pass is still queued (see afm_writer.submit_drafts)
+# — a failed tick for scheduling, and proof the earlier batch has not landed.
+# Round 17: "lifecycle_recovered" re-applies a PRIOR deferred lifecycle and
+# deliberately does NOT enqueue THIS batch's drafts. Treating it as success
+# burned the full interval after a tick that threw away wet work (especially
+# under max_batches_per_tick == 1). Soft failure → short backoff; multi-batch
+# drain continues so a subsequent batch can still write review pages.
+_COMPILE_FAILURE_STATUSES = frozenset(
+    {
+        "afm_unavailable",
+        "write_failed",
+        "write_timeout",
+        "write_in_flight",
+        "lifecycle_recovered",
+    }
+)
+
+# Review round 5 on PR #260: write_timeout / write_in_flight are NOT the same
+# failure mode as afm_unavailable / write_failed. The latter mean nothing
+# durable is in flight, so the 300s retry is pure recovery; the former mean
+# the previous batch is still queued and may yet land — retrying those every
+# 300s re-ran the whole pass (LLM compute) 288x more often than the old
+# schedule while the writer was stuck. The writer's in-flight guard is what
+# prevents duplicate drafts; this longer backoff (well past the 30s wait plus
+# drain margin) keeps the loop from burning compute against a blocked queue.
+_WRITE_STALL_STATUSES = frozenset({"write_timeout", "write_in_flight"})
+_WRITE_STALL_RETRY_SECONDS = 1800
+
+
+def compile_failure_status(res: Any) -> Optional[str]:
+    """The failure status carried by a handle_daemon_compile response, if any.
+
+    Returns None for a successful (or unrecognizable) response, so a caller can
+    treat "not a known failure" as success without guessing.
+    """
+    if not isinstance(res, dict):
+        return None
+    # Review round 5 on PR #260: handle_daemon_compile's make_error paths
+    # (unsupported pass_name, vault-guard denial) return a top-level JSON-RPC
+    # `error` with no `result` at all. Reading only result.status made those
+    # look like SUCCESSFUL ticks — a misconfigured pass burned the full
+    # interval silently and recorded neither attempt nor failure.
+    if "error" in res:
+        return "rpc_error"
+    payload = res.get("result")
+    if not isinstance(payload, dict):
+        return None
+    status = payload.get("status")
+    return status if status in _COMPILE_FAILURE_STATUSES else None
+
+
+def record_rpc_error(pass_name: str, res: Any) -> None:
+    """GA4-3 for the make_error paths (round 5, PR #260).
+
+    A top-level JSON-RPC error returns BEFORE handle_daemon_compile's try
+    body, so neither record_pass_attempt nor record_pass_failure ran — a pass
+    failing its argument/guard checks on every tick left no trace on any
+    health surface. The loop records both here for its wet runs.
+    """
+    from minni.afm_writer import record_pass_attempt, record_pass_failure
+
+    err = res.get("error") if isinstance(res, dict) else None
+    message = str((err or {}).get("message") or "JSON-RPC error")
+    record_pass_attempt(pass_name)
+    record_pass_failure(pass_name, message)
+
+
+def next_last_run(
+    interval: float,
+    now: float,
+    failed: bool,
+    retry_seconds: Optional[float] = None,
+) -> float:
+    """The ``last_run`` stamp a just-finished tick should record.
+
+    A failed tick backs off to ``retry_seconds`` (default
+    :data:`_FAILURE_RETRY_SECONDS`) instead of consuming the whole interval; a
+    successful one records now. Pulled out as a pure function so the
+    scheduling decision is testable without driving the async loop — the
+    behavior, not the source text, is what needs pinning.
+    """
+    if not failed:
+        return now
+    retry = _FAILURE_RETRY_SECONDS if retry_seconds is None else retry_seconds
+    return now - max(0, interval - retry)
+
+
 def afm_loop_enabled(config=DEFAULT_CONFIG) -> bool:
     if os.environ.get("MINNI_AFM_LOOP", "").lower() == "off":
         return False
@@ -260,32 +366,100 @@ def mark_candidate_review(candidate_id: int, reason: str, context: AFMContext) -
 
 
 def apply_consolidation_result(result: dict, context: AFMContext) -> None:
-    """Apply durable promotes, dedup rejections, and review routing."""
+    """Apply durable promotes, dedup rejections, and review routing.
+
+    Round 24 (PR #260): report *errors* and *remaining_proposed* so sticky
+    lifecycle re-apply can refuse to clear the hold on partial/soft success.
+    Clearing sticky after terminalizing only a subset reopens AFM-8 dual-mint
+    for the candidates that stayed ``proposed``.
+    """
     promoted = deduped = reviewed = 0
-    for cid in (result.get("promote_candidate_ids") or []):
+    errors = 0
+    promote_ids = [int(cid) for cid in (result.get("promote_candidate_ids") or [])]
+    dedup_ids = [int(cid) for cid in (result.get("dedup_candidate_ids") or [])]
+    review_ids = [int(cid) for cid in (result.get("review_candidate_ids") or [])]
+    for cid in promote_ids:
         try:
-            if promote_candidate_durable(int(cid), "afm-consolidation", context):
+            if promote_candidate_durable(cid, "afm-consolidation", context):
                 promoted += 1
         except Exception:
+            errors += 1
             context.logger.exception("consolidation: promote candidate %s failed", cid)
-    for cid in (result.get("dedup_candidate_ids") or []):
+    for cid in dedup_ids:
         try:
-            if reject_candidate_dedup(int(cid), context):
+            if reject_candidate_dedup(cid, context):
                 deduped += 1
         except Exception:
+            errors += 1
             context.logger.exception("consolidation: dedup candidate %s failed", cid)
-    for cid in (result.get("review_candidate_ids") or []):
+    for cid in review_ids:
         try:
-            if mark_candidate_review(int(cid), "afm-consolidation review", context):
+            if mark_candidate_review(cid, "afm-consolidation review", context):
                 reviewed += 1
         except Exception:
+            errors += 1
             context.logger.exception("consolidation: review-mark candidate %s failed", cid)
+
+    remaining_proposed: list[int] = []
+    try:
+        wb = context.lazy_writeback()
+        with wb.db.cursor() as c:
+            # Promote/dedup targets must leave "proposed". Review routing is
+            # intentional leave-proposed + fence; incomplete only when the
+            # review mark did not land (counted via reviewed vs requested).
+            for cid in promote_ids + dedup_ids:
+                c.execute(
+                    "SELECT status FROM candidate_packets WHERE candidate_id=?",
+                    (cid,),
+                )
+                row = c.fetchone()
+                if row and (row["status"] if not isinstance(row, tuple) else row[0]) == "proposed":
+                    remaining_proposed.append(cid)
+            for cid in review_ids:
+                c.execute(
+                    """SELECT 1 FROM consolidation_actions
+                       WHERE action_type='afm_review' AND claim=?
+                         AND COALESCE(status, '') != 'superseded' LIMIT 1""",
+                    (str(cid),),
+                )
+                if not c.fetchone():
+                    # No fence and still the deferred review target → incomplete.
+                    c.execute(
+                        "SELECT status FROM candidate_packets WHERE candidate_id=?",
+                        (cid,),
+                    )
+                    row = c.fetchone()
+                    status = None
+                    if row is not None:
+                        status = row["status"] if not isinstance(row, tuple) else row[0]
+                    if status == "proposed":
+                        remaining_proposed.append(cid)
+    except Exception:
+        # Fail closed: if we cannot prove remaining is empty, keep sticky.
+        errors += 1
+        context.logger.exception(
+            "consolidation: remaining-proposed probe failed after apply"
+        )
+        remaining_proposed = list(dict.fromkeys(promote_ids + dedup_ids + review_ids))
+
     if promoted or deduped or reviewed:
         context.logger.info(
-            "AFM consolidation applied: promoted=%d deduped=%d reviewed=%d",
-            promoted, deduped, reviewed,
+            "AFM consolidation applied: promoted=%d deduped=%d reviewed=%d "
+            "errors=%d remaining_proposed=%d",
+            promoted, deduped, reviewed, errors, len(remaining_proposed),
         )
-    result["applied"] = {"promoted": promoted, "deduped": deduped, "reviewed": reviewed}
+    result["applied"] = {
+        "promoted": promoted,
+        "deduped": deduped,
+        "reviewed": reviewed,
+        "errors": errors,
+        "remaining_proposed": remaining_proposed,
+        "requested": {
+            "promote": len(promote_ids),
+            "dedup": len(dedup_ids),
+            "review": len(review_ids),
+        },
+    }
 
 
 def handle_daemon_compile(params: dict, request_id: Any, context: AFMContext) -> dict:
@@ -400,17 +574,60 @@ def handle_daemon_compile(params: dict, request_id: Any, context: AFMContext) ->
             from minni.afm_writer import record_pass_attempt
 
             record_pass_attempt(pass_name)
+        write_refused = False
+        write_status = None
         if not dry_run and result.get("drafts"):
             from minni.afm_writer import submit_drafts
 
+            # Round 10/11: per-job lifecycle + handler so a timed-out waiter
+            # still applies once if the write lands (no process-global slot).
+            lifecycle = {
+                "promote_candidate_ids": list(
+                    result.get("promote_candidate_ids") or []
+                ),
+                "dedup_candidate_ids": list(result.get("dedup_candidate_ids") or []),
+                "review_candidate_ids": list(
+                    result.get("review_candidate_ids") or []
+                ),
+            }
             write_result = submit_drafts({
                 "pass_name": pass_name,
                 "trace_id": trace_id,
                 "vault_path": vault_path,
                 "drafts": result["drafts"],
                 "writeback": context.writeback_ref(),
+                "lifecycle": lifecycle,
+                # Close over this request's context; job-scoped so concurrent
+                # compiles cannot steal each other's applier (round 11).
+                "lifecycle_handler": (
+                    lambda life, _ctx=context: apply_consolidation_result(life, _ctx)
+                ),
             })
             result.update(write_result)
+            # Review round 8 on PR #260: write_in_flight means THIS batch's
+            # drafts were REFUSED — never enqueued, never going to land. The
+            # raising failures (DraftWriteError/DraftQueueFull) already skip
+            # the lifecycle apply below because they jump to the except path;
+            # the non-raising refusal must skip it too, or candidates get
+            # promoted/dedup'd/marked-reviewed while the review drafts that
+            # explain those mutations do not exist anywhere.
+            #
+            # Round 9/10: write_timeout skips apply HERE (drafts unobserved).
+            # Ownership transfers to the worker via defer_lifecycle_to_worker
+            # so a late success applies once without a full re-run minting
+            # duplicate drafts.
+            #
+            # Round 16: lifecycle_recovered means the writer re-applied a
+            # *prior* deferred decision set and deliberately did NOT enqueue
+            # THIS batch's drafts (AFM-8 anti-duplicate). Applying the NEW
+            # result's promote/dedup/review ids here would terminalize a
+            # decision set whose review drafts were never written.
+            write_status = write_result.get("status")
+            write_refused = write_status in {
+                "write_in_flight",
+                "write_timeout",
+                "lifecycle_recovered",
+            }
         else:
             result.setdefault("drafts_written", [])
 
@@ -419,7 +636,22 @@ def handle_daemon_compile(params: dict, request_id: Any, context: AFMContext) ->
             or result.get("dedup_candidate_ids")
             or result.get("review_candidate_ids")
         ):
-            apply_consolidation_result(result, context)
+            if write_refused:
+                if write_status == "write_timeout":
+                    context.logger.warning(
+                        "daemon.compile: consolidation lifecycle DEFERRED to "
+                        "writer — write_timeout; worker applies once if drafts "
+                        "land (no duplicate re-run for this batch)"
+                    )
+                else:
+                    context.logger.warning(
+                        "daemon.compile: consolidation lifecycle apply SKIPPED — "
+                        "this batch's drafts were refused (%s); candidates stay "
+                        "proposed and re-run after the writer drains",
+                        write_status or "write_refused",
+                    )
+            else:
+                apply_consolidation_result(result, context)
 
         try:
             # R8: bind the compile trace to the calling principal (present in
@@ -442,8 +674,35 @@ def handle_daemon_compile(params: dict, request_id: Any, context: AFMContext) ->
         return context.make_response(result, request_id)
     except Exception as exc:
         context.logger.exception("daemon.compile failed")
+        # GA4-3: a pass that raises used to skip record_pass_attempt entirely,
+        # so a pass failing on every single tick read as "never invoked" or
+        # went stale — indistinguishable from an idle one, and no failure
+        # counter existed anywhere. Record the attempt (it DID run) and the
+        # failure (it DID fault), so health can say which.
+        if not dry_run:
+            try:
+                from minni.afm_writer import record_pass_attempt, record_pass_failure
+
+                record_pass_attempt(pass_name)
+                record_pass_failure(pass_name, str(exc))
+            except Exception:  # noqa: BLE001 - bookkeeping must not mask the fault
+                context.logger.exception(
+                    "daemon.compile: failed to record the pass failure"
+                )
+        obs.incr("afm_pass_failures_total")
+        obs.incr(f"afm_pass_failures.{pass_name}")
+        obs.record_error(f"daemon.compile.{pass_name}", exc)
+        # AFM-8: a draft-WRITE failure was reported as "afm_unavailable", which
+        # blames the model provider for a durable-storage fault. They need
+        # different remediation, so they get different statuses.
+        from minni.afm_writer import DraftQueueFull, DraftWriteError
+
+        if isinstance(exc, (DraftWriteError, DraftQueueFull)):
+            status = "write_failed"
+        else:
+            status = "afm_unavailable"
         return context.make_response({
-            "status": "afm_unavailable",
+            "status": status,
             "reason": str(exc),
             "pass_name": pass_name,
             "dry_run": dry_run,
@@ -485,6 +744,14 @@ async def afm_loop_runner(context: AFMContext):
             interval = int((cfg or {}).get("interval_seconds", 24 * 60 * 60))
             if now - last_run.get(name, 0.0) < interval:
                 continue
+            # AFM-8: set by ANY compile in this tick that came back with a
+            # failure status. handle_daemon_compile swallows the exception and
+            # returns, so this is the only place the failure is observable.
+            tick_failed = False
+            # Round 5: WHICH failure decides the backoff class — a write stall
+            # (previous batch still in flight) backs off much longer than a
+            # recoverable fault (see _WRITE_STALL_STATUSES).
+            tick_failure: Optional[str] = None
             try:
                 context.logger.info("AFM loop: running pass '%s'", name)
                 params = {
@@ -543,11 +810,20 @@ async def afm_loop_runner(context: AFMContext):
                                     "AFM loop: inbox ingest skipped_by_kind=%s",
                                     _skips,
                                 )
-                        except Exception:
+                        except Exception as exc:
                             context.logger.exception(
                                 "AFM loop: inbox ingest raised (skipped; "
                                 "consolidation continues)"
                             )
+                            # GA6-2: these four sub-ops counted only their
+                            # successes, so a sub-op failing on every tick was
+                            # indistinguishable from one that had no work — the
+                            # counter simply stopped climbing either way. Each
+                            # failure now has its own counter and reaches the
+                            # error ring, which record_error was previously
+                            # only ever fed from dispatch.
+                            obs.incr("inbox_ingest_failures_total")
+                            obs.record_error("afm_loop.inbox_ingest", exc)
                         # W3 (audit §4 / consolidation inbox residue): an
                         # _agent_mismatch skip is PERMANENT — the same file
                         # produces the identical skip on every future tick, so
@@ -581,11 +857,13 @@ async def afm_loop_runner(context: AFMContext):
                                         "_agent_mismatch inbox file(s): %s",
                                         _q["quarantined"], _q["quarantined_files"],
                                     )
-                            except Exception:
+                            except Exception as exc:
                                 context.logger.exception(
                                     "AFM loop: inbox quarantine raised (skipped; "
                                     "consolidation continues)"
                                 )
+                                obs.incr("inbox_quarantine_failures_total")
+                                obs.record_error("afm_loop.inbox_quarantine", exc)
                         # Inert-file sweep (2026-08 pile-up): a stop-candidate
                         # file whose EVERY candidate ingest rejects (audit
                         # echo / log_only / do_not_store / blank) can never
@@ -617,11 +895,13 @@ async def afm_loop_runner(context: AFMContext):
                                         "file(s) (%s)",
                                         _ia["archived"], _ia.get("reasons"),
                                     )
-                            except Exception:
+                            except Exception as exc:
                                 context.logger.exception(
                                     "AFM loop: inert inbox archive raised "
                                     "(skipped; consolidation continues)"
                                 )
+                                obs.incr("inbox_archive_failures_total")
+                                obs.record_error("afm_loop.inbox_archive", exc)
                     # Distill harvested raw compaction summaries (inbox kind
                     # 'compact_summary', written by the platform hooks'
                     # compact harvest) into proposed candidates on the same
@@ -656,17 +936,62 @@ async def afm_loop_runner(context: AFMContext):
                                     _dc["vault_notes_written"],
                                     _dc["archived_zero_shared"] + _dc["archived_with_shared"],
                                 )
-                        except Exception:
+                        except Exception as exc:
                             context.logger.exception(
                                 "AFM loop: compact distillation raised "
                                 "(skipped; consolidation continues)"
                             )
+                            obs.incr("compact_distillation_failures_total")
+                            obs.record_error("afm_loop.compact_distillation", exc)
                     max_batches = int((cfg or {}).get("max_batches_per_tick", 40))
                     batches = total_examined = 0
                     last_summ = None
                     while batches < max_batches:
                         res = handle_daemon_compile(params, request_id=None, context=context)
+                        failure = compile_failure_status(res)
+                        if failure:
+                            tick_failed = True
+                            tick_failure = failure
+                            if failure == "rpc_error":
+                                record_rpc_error(name, res)
+                            # Round 7: an rpc_error carries its message in the
+                            # top-level `error`, not result.reason — reading
+                            # only the latter logged "rpc_error: None".
+                            # Round 17: lifecycle_recovered surfaces via status
+                            # (no reason); log drafts_deferred for honesty.
+                            payload = (res.get("result") or {}) if isinstance(res, dict) else {}
+                            detail = (
+                                (res.get("error") or {}).get("message")
+                                if failure == "rpc_error"
+                                else payload.get("reason")
+                                or (
+                                    f"drafts_deferred={payload.get('drafts_deferred')}"
+                                    if failure == "lifecycle_recovered"
+                                    else None
+                                )
+                            )
+                            context.logger.warning(
+                                "AFM loop: consolidation batch %d returned %s: %s",
+                                batches + 1, failure, detail,
+                            )
+                            # Soft: sticky lifecycle was cleared; keep draining
+                            # so this tick can still produce review pages.
+                            if failure == "lifecycle_recovered":
+                                last_summ = payload.get("summary") if isinstance(payload, dict) else None
+                                batches += 1
+                                examined = (last_summ or {}).get("examined", 0)
+                                total_examined += examined
+                                if examined == 0:
+                                    break
+                                await asyncio.sleep(0)
+                                continue
+                            break
                         last_summ = (res.get("result") or {}).get("summary") if isinstance(res, dict) else None
+                        # Round 26: a mid-tick lifecycle_recovered soft-fail must
+                        # not latch tick_failed across later successful batches —
+                        # that forced a 300s re-fire after a productive drain.
+                        tick_failed = False
+                        tick_failure = None
                         batches += 1
                         examined = (last_summ or {}).get("examined", 0)
                         total_examined += examined
@@ -681,11 +1006,51 @@ async def afm_loop_runner(context: AFMContext):
                     )
                 else:
                     res = handle_daemon_compile(params, request_id=None, context=context)
-                    summ = (res.get("result") or {}).get("summary") if isinstance(res, dict) else None
-                    context.logger.info("AFM loop: pass '%s' done: %s", name, summ)
-            except Exception:
+                    failure = compile_failure_status(res)
+                    if failure:
+                        tick_failed = True
+                        tick_failure = failure
+                        if failure == "rpc_error":
+                            record_rpc_error(name, res)
+                        context.logger.warning(
+                            "AFM loop: pass '%s' returned %s: %s",
+                            name, failure,
+                            (res.get("error") or {}).get("message")
+                            if failure == "rpc_error"
+                            else (res.get("result") or {}).get("reason"),
+                        )
+                    else:
+                        summ = (res.get("result") or {}).get("summary") if isinstance(res, dict) else None
+                        context.logger.info("AFM loop: pass '%s' done: %s", name, summ)
+            except Exception as exc:
                 context.logger.exception("AFM loop: pass '%s' raised (skipped)", name)
-            last_run[name] = time.time()
+                obs.incr("afm_loop_tick_failures_total")
+                obs.incr(f"afm_loop_tick_failures.{name}")
+                obs.record_error(f"afm_loop.{name}", exc)
+                from minni.afm_writer import record_pass_attempt, record_pass_failure
+
+                record_pass_attempt(name)
+                record_pass_failure(name, str(exc))
+                tick_failed = True
+            # AFM-8 (#230): last_run used to advance unconditionally, so a tick
+            # that accomplished nothing consumed the whole interval — a pass
+            # failing instantly retried only once every 24h and looked, from
+            # outside, exactly like a pass that ran and had nothing to do.
+            # `tick_failed` covers BOTH routes a failure can take: an exception
+            # the loop sees, and (the common one) a failure status returned by
+            # handle_daemon_compile, which never raises. A write stall backs
+            # off longer (round 5) — the previous batch is still queued, and a
+            # 300s re-fire re-ran the whole pass against a blocked writer.
+            last_run[name] = next_last_run(
+                interval,
+                time.time(),
+                tick_failed,
+                retry_seconds=(
+                    _WRITE_STALL_RETRY_SECONDS
+                    if tick_failure in _WRITE_STALL_STATUSES
+                    else None
+                ),
+            )
         await asyncio.sleep(idle_seconds)
     context.logger.info("AFM loop runner stopped.")
 
