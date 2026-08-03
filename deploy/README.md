@@ -32,14 +32,18 @@ Runs `scripts/update_root.sh`, which loudly and idempotently:
    `update-plugin --platform codex|kilocode|grok` after wire adoption — that
    still rewrites MCP onto legacy cache/agents trees.
 5. Restarts `minnid` via `launchctl kickstart` when the
-   `com.minni.minnid` agent is loaded. If the agent is **not** loaded, the
-   script still runs step 6 (so you see WORKTREE/BADCONFIG from this run) and
-   then exits non-zero with “redeployed … but daemon was not restarted” —
-   it never prints `sync complete` without a bounced daemon.
+   `com.minni.minnid` agent is loaded. If the agent is **not** loaded
+   (Linux, `minni up`, manual process), the script still runs step 6 and
+   **probes the daemon socket** for `deploy.stale`. A green probe (operator
+   already bounced the process) allows `sync complete`; a stale or missing
+   socket exits non-zero with an explicit restart recipe
+   (`minni down && minni up` / `systemctl --user restart …`). Optional:
+   `MINNI_SYNC_RESTART_CMD` is not wired yet — use launchd or bounce by hand.
 6. Verifies with `scripts/check_versions.py` and
    `scripts/check_deployments.py --strict`, so the run fails loudly if the
-   fleet still disagrees afterward. After a successful kickstart it also
-   probes the daemon socket for `deploy.stale`.
+   fleet still disagrees afterward. The post-redeploy socket probe retries
+   semantic failures (stale True / missing deploy) for ~45s so a dying
+   pre-restart process does not fail a successful kickstart.
 
 **Antigravity half-state (D11):** if `wire antigravity` fails on hook
 registration (`agy` is on PATH but `agy plugin install` fails), MCP views may

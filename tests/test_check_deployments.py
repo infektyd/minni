@@ -383,6 +383,24 @@ def test_dead_helper_path_is_reported(tmp_path):
     assert "MINNI_AFM_NATIVE_HELPER" in proc.stdout
 
 
+def test_helper_must_be_file_not_directory(tmp_path):
+    """AFM helper liveness matches wire/propagate is_file() (dirs are dead)."""
+    home = tmp_path / "home"
+    home.mkdir()
+    root = _agents_tree_deployment(home)
+    helper_dir = home / "helper-dir"
+    helper_dir.mkdir()
+    _write_mcp(
+        root,
+        agent="gemini",
+        server=root / "dist" / "server.js",
+        helper=helper_dir,
+    )
+    proc = _run("--strict", home=home, repo_root=_isolated_repo_root(tmp_path))
+    assert proc.returncode == 1, proc.stdout
+    assert "MINNI_AFM_NATIVE_HELPER" in proc.stdout
+
+
 def test_dead_server_path_is_reported(tmp_path):
     home = tmp_path / "home"
     home.mkdir()

@@ -388,14 +388,14 @@ if launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; then
     DAEMON_RESTART_FAILED=1
   fi
 else
-  # Still run step 6 (versions + D14 deployment gates) so the operator sees
-  # WORKTREE/BADCONFIG from this run. Do NOT claim "sync complete" later —
-  # checkout/plugin trees may be current while minnid still runs pre-sync code.
+  # Still run step 6 (versions + D14). Without launchd we cannot kickstart, but
+  # a socket that already answers deploy.stale=false (operator bounced via
+  # minni up / systemctl / manual) may still allow "sync complete".
   DAEMON_NOT_LOADED=1
   if [ "$DRY_RUN" = 1 ]; then
-    echo "would fail: launchd agent $LABEL is not loaded — daemon would not be restarted"
+    echo "would probe: launchd agent $LABEL is not loaded — will check socket deploy.stale; green allows sync complete without kickstart"
   else
-    echo "update-root: launchd agent $LABEL is not loaded — restart minnid however you run it; continuing to verify (will not report sync complete)" >&2
+    echo "update-root: launchd agent $LABEL is not loaded — will probe socket for deploy honesty; if stale, bounce minnid yourself (minni down && minni up / systemctl --user restart …)" >&2
   fi
 fi
 
@@ -433,17 +433,23 @@ else
   fi
 fi
 
-# After a real restart (or a failed kickstart with agent still loaded), require
-# the socket to answer and report known-stale is not True. For editable
-# checkouts, unmeasurable stale hard-fails; wheel installs soft-ok. Skip under
-# dry-run (kickstart was not executed).
-if [ "$DRY_RUN" != 1 ] && { [ "$DAEMON_RESTARTED" = 1 ] || [ "$DAEMON_RESTART_FAILED" = 1 ]; }; then
-  say "step 6b: probe daemon deploy honesty after restart"
-  if ! "$VENV_PY" - "$SOCKET" <<'PY'
+# Probe daemon deploy honesty when we restarted, kickstart failed, or launchd
+# is absent (socket may still be live from minni up / systemd / manual).
+# Skip under dry-run (no real kickstart / no live-gate on plan).
+DAEMON_PROBE_OK=0
+if [ "$DRY_RUN" != 1 ] && {
+  [ "$DAEMON_RESTARTED" = 1 ] || [ "$DAEMON_RESTART_FAILED" = 1 ] || [ "$DAEMON_NOT_LOADED" = 1 ]
+}; then
+  say "step 6b: probe daemon deploy honesty"
+  if "$VENV_PY" - "$SOCKET" <<'PY'
 import json, socket, sys, time
 sock_path = sys.argv[1]
-last = None
+last_err = None
+last_semantic = None
 # ~45s: kickstart + DB migrate / import can exceed a few seconds.
+# Semantic failures (stale True, missing deploy, unmeasurable) RETRY for the
+# full window — a dying pre-restart process or half-ready status must not
+# abort on the first successful UDS connect.
 for i in range(45):
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
@@ -462,65 +468,75 @@ for i in range(45):
         # Do not default missing deploy to {} — empty would soft-ok on stale=None.
         deploy = (result.get("daemon") or {}).get("deploy") or result.get("deploy")
         if not isinstance(deploy, dict) or not deploy:
-            print(
-                "update-root: daemon status missing deploy block after restart "
-                f"(result keys={list((result.get('daemon') or result or {}).keys())!r})",
-                file=sys.stderr,
+            last_semantic = (
+                "missing deploy block "
+                f"(result keys={list((result.get('daemon') or result or {}).keys())!r})"
             )
-            sys.exit(4)
+            time.sleep(1.0)
+            continue
         if deploy.get("error"):
-            print(
-                f"update-root: daemon deploy honesty errored after restart: {deploy!r}",
-                file=sys.stderr,
-            )
-            sys.exit(5)
+            # Permanent shape for this attempt — still retry briefly in case
+            # a dying process answered first.
+            last_semantic = f"deploy honesty errored: {deploy!r}"
+            time.sleep(1.0)
+            continue
         stale = deploy.get("stale")
         plugin = deploy.get("plugin_dist") if isinstance(deploy.get("plugin_dist"), dict) else {}
         plugin_stale = plugin.get("stale")
         if stale is True or plugin_stale is True:
-            print(
-                f"update-root: daemon deploy honesty still stale after restart: {deploy!r}",
-                file=sys.stderr,
-            )
-            sys.exit(2)
+            last_semantic = f"still stale: {deploy!r}"
+            time.sleep(1.0)
+            continue
         if stale is None:
             # Wheel installs have no local checkout — unmeasurable is expected.
             # Editable checkout after kickstart must report a boolean; null means
-            # the honesty path could not measure (git race / unreadable) and must
-            # not green-wash "daemon came back clean".
+            # the honesty path could not measure (git race / unreadable) — retry.
             if deploy.get("install_kind") == "wheel":
                 print(
                     f"daemon deploy probe soft-ok (wheel, stale unmeasurable): {deploy!r}",
                     file=sys.stderr,
                 )
                 sys.exit(0)
-            print(
-                f"update-root: daemon deploy honesty unmeasurable after restart "
-                f"(expected boolean for editable checkout): {deploy!r}",
-                file=sys.stderr,
+            last_semantic = (
+                "unmeasurable after restart "
+                f"(expected boolean for editable checkout): {deploy!r}"
             )
-            sys.exit(3)
+            time.sleep(1.0)
+            continue
         print(f"daemon deploy probe ok (stale={stale!r}, plugin_dist.stale={plugin_stale!r})")
         sys.exit(0)
     except Exception as exc:
-        last = exc
+        last_err = exc
         time.sleep(1.0)
-print(f"update-root: daemon socket unreachable after restart ({sock_path}): {last}", file=sys.stderr)
+if last_semantic is not None:
+    print(
+        f"update-root: daemon deploy honesty not green after retries: {last_semantic}",
+        file=sys.stderr,
+    )
+    sys.exit(2)
+print(
+    f"update-root: daemon socket unreachable after retries ({sock_path}): {last_err}",
+    file=sys.stderr,
+)
 sys.exit(1)
 PY
   then
+    DAEMON_PROBE_OK=1
+  else
     VERIFY_EXIT=1
-    echo "update-root: daemon did not come back clean after launchd kickstart (socket $SOCKET)" >&2
+    if [ "$DAEMON_NOT_LOADED" = 1 ]; then
+      echo "update-root: daemon not current (launchd agent $LABEL not loaded; socket $SOCKET not green) — bounce minnid (minni down && minni up / systemctl --user restart minnid) then re-run" >&2
+    else
+      echo "update-root: daemon did not come back clean after launchd kickstart (socket $SOCKET)" >&2
+    fi
   fi
 fi
 
-# Final status: never print "sync complete" unless redeploy + daemon restart +
-# verify all succeeded. Dry-run exits non-zero only when the *plan* would fail
-# (e.g. launchd agent not loaded) — not because pre-sync hygiene is dirty.
+# Final status: never print "sync complete" unless redeploy + daemon is current
+# (kickstart or already-green socket) + verify all succeeded.
 if [ "$DRY_RUN" = 1 ]; then
   if [ "$DAEMON_NOT_LOADED" = 1 ]; then
-    echo "dry-run plan would FAIL (launchd agent not loaded — daemon would not be restarted)" >&2
-    exit 1
+    echo "dry-run note: launchd agent not loaded — real run probes socket; green deploy.stale allows sync complete without kickstart" >&2
   fi
   say "dry-run plan complete (no changes applied; current-state checkers are informational)"
   exit 0
@@ -534,12 +550,16 @@ if [ "$VERIFY_EXIT" != 0 ]; then
   refuse "verification failed after redeploy"
 fi
 
-if [ "$DAEMON_NOT_LOADED" = 1 ]; then
-  refuse "redeployed and verified, but daemon was not restarted (launchd agent $LABEL not loaded) — bounce minnid yourself"
+if [ "$DAEMON_NOT_LOADED" = 1 ] && [ "$DAEMON_PROBE_OK" != 1 ]; then
+  refuse "redeployed, but daemon is not current (launchd agent $LABEL not loaded and socket probe not green) — bounce minnid yourself (minni down && minni up / systemctl --user restart …) then re-run"
 fi
 
-if [ "$DAEMON_RESTART_FAILED" = 1 ]; then
-  refuse "redeployed and verified, but launchctl kickstart failed (agent $LABEL is loaded) — bounce minnid yourself; deploy probe above reports whether the still-running process is stale"
+if [ "$DAEMON_RESTART_FAILED" = 1 ] && [ "$DAEMON_PROBE_OK" != 1 ]; then
+  refuse "redeployed and verified, but launchctl kickstart failed (agent $LABEL is loaded) and deploy probe is not green — bounce minnid yourself"
+fi
+
+if [ "$DAEMON_RESTARTED" = 1 ] && [ "$DAEMON_PROBE_OK" != 1 ]; then
+  refuse "redeployed but post-kickstart deploy probe is not green — see messages above"
 fi
 
 say "sync complete at $(git rev-parse --short HEAD)"

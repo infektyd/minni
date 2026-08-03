@@ -180,15 +180,19 @@ def test_dry_run_fast_forwards_nothing(cloned, tmp_path):
     assert "update-plugin --platform all" not in proc.stdout
 
 
-def test_dry_run_exits_nonzero_when_daemon_would_not_restart(cloned, tmp_path):
-    """Round-3 Med: dry-run must not exit 0 when the plan would refuse at
-    daemon restart (launchd agent not loaded)."""
+def test_dry_run_notes_socket_probe_when_launchd_missing(cloned, tmp_path):
+    """Non-launchd hosts: dry-run must not hard-fail; real run probes socket.
+
+    Green deploy.stale (operator already bounced) allows sync complete without
+    kickstart; stale/unreachable still refuses on the real path.
+    """
     _origin, clone = cloned
     proc = _run(clone, "--dry-run", path_prefix=_fake_launchctl(tmp_path, loaded=False))
-    assert proc.returncode != 0, proc.stdout + proc.stderr
+    assert proc.returncode == 0, proc.stdout + proc.stderr
     combined = proc.stdout + proc.stderr
-    assert "would fail" in combined
-    assert "sync complete" not in combined
+    assert "would probe" in combined or "probes socket" in combined
+    # Dry-run must not claim a real sync finished.
+    assert "sync complete at" not in combined
 
 
 def test_refuses_when_another_sync_holds_the_lock(cloned, tmp_path):
@@ -312,7 +316,27 @@ def test_deploy_probe_hard_fails_null_stale_for_editable():
     text = SCRIPT.read_text(encoding="utf-8")
     assert 'install_kind") == "wheel"' in text
     assert "expected boolean for editable checkout" in text
-    assert "sys.exit(3)" in text
+    # Semantic failures retry for the full window (no early sys.exit mid-loop).
+    assert "last_semantic" in text
+    assert "still stale" in text or "still stale:" in text
+    assert "not green after retries" in text
+
+
+def test_deploy_probe_retries_semantic_failures():
+    """Dying pre-restart process must not abort probe on first UDS answer."""
+    text = SCRIPT.read_text(encoding="utf-8")
+    # Extract the embedded probe heredoc roughly.
+    assert "for i in range(45):" in text
+    assert "time.sleep(1.0)" in text
+    assert "continue" in text
+    # Must not sys.exit(2/3/4) inside the success-path before the loop ends.
+    idx = text.find("step 6b: probe daemon deploy honesty")
+    assert idx != -1
+    block = text[idx: idx + 3500]
+    # Early exits for green/wheel only; semantic fails use continue + last_semantic.
+    assert "last_semantic" in block
+    assert "sys.exit(2)" in block  # only after retries
+    assert block.find("continue") < block.rfind("sys.exit(2)")
 
 
 def test_kickstart_failure_not_misdiagnosed_as_not_loaded():

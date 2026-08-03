@@ -170,7 +170,15 @@ def check_mcp_config(root: Path, home: Path) -> list[str]:
         dead.append(f"cwd: {cwd}")
     for key in PATH_ENV_KEYS:
         val = env.get(key)
-        if isinstance(val, str) and val and not Path(val).exists():
+        if not isinstance(val, str) or not val:
+            continue
+        # Match wire/propagate _filter_dead_afm_helper: expanduser + is_file
+        # (bare exists() misses ~ and treats a directory as live).
+        p = Path(val).expanduser()
+        if key == "MINNI_AFM_NATIVE_HELPER":
+            if not p.is_file():
+                dead.append(f"env {key}: {val}")
+        elif not p.exists():
             dead.append(f"env {key}: {val}")
     problems.extend(f".mcp.json dead path — {entry_}" for entry_ in dead)
     return problems
