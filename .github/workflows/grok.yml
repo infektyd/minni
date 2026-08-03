@@ -203,7 +203,7 @@ jobs:
           grok --prompt-file /tmp/grok-prompt.md \
             --always-approve \
             --no-subagents \
-            --max-turns 30 \
+            --max-turns 60 \
             --sandbox ci \
             --disable-web-search \
             --output-format plain > /tmp/grok-reply.md
