@@ -246,6 +246,23 @@ test("P5: an eviction is reported, not silent — and coalesced, not budget-burn
   const cWindow = source.slice(coalesce, coalesce + 1200);
   assert.match(cWindow, /EVICTION_DIAGNOSTIC_INTERVAL_MS/);
   assert.match(cWindow, /flushPendingSessionEvictions/);
+  // Round 21: within-interval branch must schedule a deferred flush so counts
+  // are not console-only forever when no later churn reopens the window.
+  assert.match(
+    cWindow,
+    /scheduleSessionEvictFlush/,
+    "within-interval session-evict must arm a deferred flush timer",
+  );
+  assert.match(
+    source,
+    /function scheduleSessionEvictFlush/,
+    "scheduleSessionEvictFlush must exist",
+  );
+  assert.match(
+    source,
+    /sessionEvictFlushTimer\.unref/,
+    "deferred session-evict timer must unref so it does not pin the process",
+  );
   // Round 4: per-label counts — a mixed pending+booted wave must not report
   // the whole count under the last wave's label and bound.
   assert.match(

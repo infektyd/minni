@@ -83,11 +83,43 @@ const EVICTION_DIAGNOSTIC_INTERVAL_MS = 60_000;
 // bound, sending an operator to remediate the wrong map.
 const evictionsSinceReport = new Map();
 let lastEvictionReportAt = 0;
+// Round 21: within-interval eviction counts used to stay console-only forever
+// when no later churn reopened the coalesce window. Schedule an unref one-shot
+// at lastEvictionReportAt + interval so the audit channel still fires.
+let sessionEvictFlushTimer = null;
 
 function sessionEvictDetail() {
   return [...evictionsSinceReport.entries()]
     .map(([name, info]) => `${info.count} ${name} entr(y|ies) (bound ${info.max})`)
     .join("; ");
+}
+
+function clearSessionEvictFlushTimer() {
+  if (sessionEvictFlushTimer == null) return;
+  clearTimeout(sessionEvictFlushTimer);
+  sessionEvictFlushTimer = null;
+}
+
+function scheduleSessionEvictFlush() {
+  if (evictionsSinceReport.size === 0) return;
+  if (sessionEvictFlushTimer != null) return;
+  const delay = Math.max(
+    0,
+    lastEvictionReportAt + EVICTION_DIAGNOSTIC_INTERVAL_MS - Date.now(),
+  );
+  if (delay === 0) {
+    flushPendingSessionEvictions();
+    return;
+  }
+  sessionEvictFlushTimer = setTimeout(() => {
+    sessionEvictFlushTimer = null;
+    if (evictionsSinceReport.size === 0) return;
+    flushPendingSessionEvictions();
+  }, delay);
+  // Don't pin the Kilo process open solely for a deferred eviction audit.
+  if (typeof sessionEvictFlushTimer.unref === "function") {
+    sessionEvictFlushTimer.unref();
+  }
 }
 
 function noteDiagnosticUndelivered() {
@@ -194,12 +226,16 @@ function flushPendingSessionEvictions() {
   if (accepted) {
     lastEvictionReportAt = Date.now();
     evictionsSinceReport.clear();
+    clearSessionEvictFlushTimer();
     return true;
   }
   console.warn(
     `[minni] session-evict diagnostic suppressed (budget full); ` +
       `carrying forward: ${detail}`,
   );
+  // Budget full — free-slot drain retries when a diagnostic settles.
+  // Do not re-arm the timer here: if the coalesce window is already open,
+  // delay would be 0 and we'd recurse through flushPendingSessionEvictions.
   return false;
 }
 
@@ -210,11 +246,14 @@ function reportSessionEvictions(label, max, evicted) {
   evictionsSinceReport.set(label, entry);
   const now = Date.now();
   if (now - lastEvictionReportAt < EVICTION_DIAGNOSTIC_INTERVAL_MS) {
-    // Still visible per wave — just no spawn.
+    // Still visible per wave — just no spawn. Round 21: schedule a one-shot
+    // so these counts still reach the audit channel when the window opens,
+    // even if no further churn arrives.
     console.warn(
       `[minni] evicted ${evicted} ${label} entr(y|ies) (bound ${max}); ` +
         `${entry.count} pending for the next diagnostic`,
     );
+    scheduleSessionEvictFlush();
     return;
   }
   flushPendingSessionEvictions();
@@ -440,6 +479,9 @@ function reportBridgeFailure(event, error, onUndelivered) {
   // the way the call it is reporting hung. Either way the degraded bridge
   // becomes a pile of stuck node processes.
   if (diagnosticsInFlight >= DIAGNOSTIC_MAX_IN_FLIGHT) {
+    // session-evict owns carry-forward in evictionsSinceReport; do not inflate
+    // diagnosticsSuppressed (would mis-attribute on a later unrelated flush).
+    if (event === "session-evict") return false;
     diagnosticsSuppressed += 1;
     queueSuppressedFailure(event, detail);
     console.warn(
@@ -463,6 +505,7 @@ function reportBridgeFailure(event, error, onUndelivered) {
   // Round 13: sync spawn failure (EMFILE, bad hook path) used to die at
   // console.warn only — same P6 hole as budget-full, without the coalesce.
   if (!accepted) {
+    if (event === "session-evict") return false;
     diagnosticsSuppressed += 1;
     queueSuppressedFailure(event, detail);
     console.warn(

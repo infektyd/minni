@@ -22,6 +22,9 @@ const DIAGNOSTIC_TIMEOUT_MS = 2_000;
 // still happens within waitForIdle without allowing a tight loop.
 const TEST_UNDELIVERED_BACKOFF_MS = 80;
 const TEST_UNDELIVERED_BACKOFF_MAX_MS = 400;
+// Production uses 60s; tests use a short coalesce window so the deferred
+// flush pin finishes without a minute-long wait.
+const TEST_EVICTION_DIAGNOSTIC_INTERVAL_MS = 80;
 
 /**
  * Faithful extract of the round-9+17 suppress coalesce + settle flush.
@@ -32,6 +35,7 @@ function createStormReporter({
   logPath,
   undeliveredBackoffMs = TEST_UNDELIVERED_BACKOFF_MS,
   undeliveredBackoffMaxMs = TEST_UNDELIVERED_BACKOFF_MAX_MS,
+  evictionIntervalMs = TEST_EVICTION_DIAGNOSTIC_INTERVAL_MS,
   nowFn = () => Date.now(),
 }) {
   let diagnosticsInFlight = 0;
@@ -43,6 +47,8 @@ function createStormReporter({
   let diagnosticUndeliveredStreak = 0;
   let diagnosticFlushNotBefore = 0;
   let diagnosticFlushTimer = null;
+  let sessionEvictFlushTimer = null;
+  let lastEvictionReportAt = 0;
   let spawnCount = 0;
 
   function queueSuppressedFailure(event, detail) {
@@ -114,6 +120,33 @@ function createStormReporter({
     return progressed;
   }
 
+  function clearSessionEvictFlushTimer() {
+    if (sessionEvictFlushTimer == null) return;
+    clearTimeout(sessionEvictFlushTimer);
+    sessionEvictFlushTimer = null;
+  }
+
+  function scheduleSessionEvictFlush() {
+    if (evictionsSinceReport.size === 0) return;
+    if (sessionEvictFlushTimer != null) return;
+    const delay = Math.max(
+      0,
+      lastEvictionReportAt + evictionIntervalMs - nowFn(),
+    );
+    if (delay === 0) {
+      flushPendingSessionEvictions();
+      return;
+    }
+    sessionEvictFlushTimer = setTimeout(() => {
+      sessionEvictFlushTimer = null;
+      if (evictionsSinceReport.size === 0) return;
+      flushPendingSessionEvictions();
+    }, delay);
+    if (typeof sessionEvictFlushTimer.unref === "function") {
+      sessionEvictFlushTimer.unref();
+    }
+  }
+
   function flushPendingSessionEvictions() {
     if (evictionsSinceReport.size === 0) return false;
     if (diagnosticsInFlight >= DIAGNOSTIC_MAX_IN_FLIGHT) {
@@ -140,10 +173,13 @@ function createStormReporter({
           cur.max = info.max;
           evictionsSinceReport.set(name, cur);
         }
+        lastEvictionReportAt = 0;
       },
     );
     if (accepted) {
+      lastEvictionReportAt = nowFn();
       evictionsSinceReport.clear();
+      clearSessionEvictFlushTimer();
       return true;
     }
     consoleWarns.push(
@@ -258,6 +294,8 @@ function createStormReporter({
   function reportBridgeFailure(event, error, onUndelivered) {
     const detail = error instanceof Error ? error.message : String(error);
     if (diagnosticsInFlight >= DIAGNOSTIC_MAX_IN_FLIGHT) {
+      // session-evict owns carry-forward; do not inflate diagnosticsSuppressed.
+      if (event === "session-evict") return false;
       diagnosticsSuppressed += 1;
       queueSuppressedFailure(event, detail);
       return false;
@@ -272,6 +310,7 @@ function createStormReporter({
     });
     // Round 13: sync spawn failure must queue, not console-only.
     if (!accepted) {
+      if (event === "session-evict") return false;
       diagnosticsSuppressed += 1;
       queueSuppressedFailure(event, detail);
     }
@@ -283,6 +322,15 @@ function createStormReporter({
     entry.count += evicted;
     entry.max = max;
     evictionsSinceReport.set(label, entry);
+    const now = nowFn();
+    if (now - lastEvictionReportAt < evictionIntervalMs) {
+      consoleWarns.push(
+        `[minni] evicted ${evicted} ${label} entr(y|ies) (bound ${max}); ` +
+          `${entry.count} pending for the next diagnostic`,
+      );
+      scheduleSessionEvictFlush();
+      return;
+    }
     flushPendingSessionEvictions();
   }
 
@@ -299,6 +347,8 @@ function createStormReporter({
       spawnCount,
       undeliveredStreak: diagnosticUndeliveredStreak,
       flushNotBefore: diagnosticFlushNotBefore,
+      lastEvictionReportAt,
+      sessionEvictTimer: sessionEvictFlushTimer != null,
     }),
     waitForIdle: async (timeoutMs = 5_000) => {
       const start = Date.now();
@@ -307,14 +357,26 @@ function createStormReporter({
           diagnosticsInFlight,
           pending: pendingSuppressedFailures.size,
           timer: diagnosticFlushTimer != null,
+          evictTimer: sessionEvictFlushTimer != null,
+          evictions: evictionsSinceReport.size,
         };
-        if (s.diagnosticsInFlight === 0 && s.pending === 0 && !s.timer) return;
+        if (
+          s.diagnosticsInFlight === 0
+          && s.pending === 0
+          && !s.timer
+          && !s.evictTimer
+          && s.evictions === 0
+        ) {
+          return;
+        }
         await new Promise((r) => setTimeout(r, 25));
       }
       throw new Error(
         `storm reporter did not drain: inFlight=${diagnosticsInFlight} ` +
           `pending=${pendingSuppressedFailures.size} suppressed=${diagnosticsSuppressed} ` +
-          `timer=${diagnosticFlushTimer != null}`,
+          `timer=${diagnosticFlushTimer != null} ` +
+          `evictTimer=${sessionEvictFlushTimer != null} ` +
+          `evictions=${evictionsSinceReport.size}`,
       );
     },
     dispose: () => {
@@ -322,6 +384,7 @@ function createStormReporter({
         clearTimeout(diagnosticFlushTimer);
         diagnosticFlushTimer = null;
       }
+      clearSessionEvictFlushTimer();
     },
   };
 }
@@ -723,6 +786,110 @@ test("P6 behavioral: session-evict warns when diagnostic budget is full", async 
       !mid.delivered.some((p) => p.failed_event === "session-evict"),
       "must not steal a budget slot while full",
     );
+    // Round 21 Low: session-evict budget-full must not inflate diagnosticsSuppressed.
+    assert.equal(
+      mid.diagnosticsSuppressed,
+      0,
+      "session-evict must not inflate diagnosticsSuppressed (owns its own carry-forward)",
+    );
+  } finally {
+    reporter.dispose();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("P5 behavioral: within-interval session-evict flushes after window opens (no further churn)", async () => {
+  // Round 21 Medium: after a successful diagnostic, a second eviction inside
+  // EVICTION_DIAGNOSTIC_INTERVAL_MS used to console.warn only — and if no
+  // later churn arrived, those counts never reached the audit channel.
+  // The deferred unref timer must fire flushPendingSessionEvictions when the
+  // window opens, even with zero further traffic.
+  const root = await mkdtemp(path.join(tmpdir(), "minni-storm-evict-timer-"));
+  const logPath = path.join(root, "bridge-audit.jsonl");
+  const hookScript = path.join(root, "fake-hook.mjs");
+  await writeFile(
+    hookScript,
+    [
+      "import { appendFileSync } from 'node:fs';",
+      "const chunks = [];",
+      "for await (const c of process.stdin) chunks.push(c);",
+      "const body = Buffer.concat(chunks).toString('utf8');",
+      "appendFileSync(process.env.MINNI_STORM_LOG, body + '\\n');",
+      "process.exit(0);",
+    ].join("\n"),
+    "utf8",
+  );
+
+  // Long enough that settle (~tens of ms) stays inside the window; short
+  // enough the deferred flush pin finishes quickly.
+  const INTERVAL = 400;
+  const reporter = createStormReporter({
+    hookScript,
+    logPath,
+    evictionIntervalMs: INTERVAL,
+  });
+  try {
+    // Wave 1: interval open (lastEvictionReportAt=0) → immediate spawn.
+    reporter.reportSessionEvictions("pending", 64, 2);
+    let mid = reporter.getState();
+    assert.ok(
+      mid.delivered.some((p) => p.failed_event === "session-evict"),
+      "first wave must spawn a session-evict diagnostic",
+    );
+    assert.equal(mid.evictions.size, 0, "accepted flush clears the map");
+    assert.ok(mid.lastEvictionReportAt > 0, "coalesce clock advances on spawn");
+
+    // Let the first diagnostic settle so free-slot drain does not race the
+    // second wave (and so we prove the TIMER path, not free-slot drain).
+    // Must finish well inside INTERVAL.
+    const settleDeadline = Date.now() + INTERVAL - 80;
+    while (Date.now() < settleDeadline) {
+      mid = reporter.getState();
+      if (mid.diagnosticsInFlight === 0) break;
+      await new Promise((r) => setTimeout(r, 15));
+    }
+    mid = reporter.getState();
+    assert.equal(mid.diagnosticsInFlight, 0, "first diagnostic must settle inside window");
+    const deliveredAfterFirst = mid.delivered.length;
+    const elapsed = Date.now() - mid.lastEvictionReportAt;
+    assert.ok(
+      elapsed < INTERVAL,
+      `wave 2 setup must stay inside coalesce window (elapsed=${elapsed}ms, interval=${INTERVAL}ms)`,
+    );
+
+    // Wave 2: still inside the coalesce window → console only + arm timer.
+    reporter.reportSessionEvictions("pending", 64, 5);
+    mid = reporter.getState();
+    assert.equal(mid.evictions.get("pending")?.count, 5, "within-interval counts retained");
+    assert.equal(
+      mid.delivered.length,
+      deliveredAfterFirst,
+      "within-interval must not spawn immediately",
+    );
+    assert.ok(mid.sessionEvictTimer, "must schedule deferred flush");
+    assert.ok(
+      mid.consoleWarns.some((w) => w.includes("pending for the next diagnostic")),
+      "within-interval must still console.warn per wave",
+    );
+
+    // No further churn. Wait past the interval for the one-shot to fire.
+    await reporter.waitForIdle(3_000);
+
+    const final = reporter.getState();
+    assert.equal(final.evictions.size, 0, "deferred flush must clear carried counts");
+    const sessionEvicts = final.delivered.filter((p) => p.failed_event === "session-evict");
+    assert.ok(
+      sessionEvicts.length >= 2,
+      `expected deferred session-evict audit after interval, got ${sessionEvicts.length}: ` +
+        JSON.stringify(sessionEvicts),
+    );
+    assert.ok(
+      sessionEvicts.some((p) => String(p.error).includes("5 pending")),
+      "deferred audit must carry the within-interval count",
+    );
+    const log = await readFile(logPath, "utf8");
+    assert.match(log, /session-evict/);
+    assert.match(log, /5 pending/);
   } finally {
     reporter.dispose();
     await rm(root, { recursive: true, force: true });
