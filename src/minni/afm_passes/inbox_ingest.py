@@ -73,9 +73,10 @@ import hashlib
 import json
 import os
 import re
+import sqlite3
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from minni.safety import is_instruction_like
 
@@ -139,6 +140,18 @@ def _content_sha1(text: str) -> str:
     return hashlib.sha1(text.encode("utf-8")).hexdigest()
 
 
+def _is_unique_integrity_error(exc: BaseException) -> bool:
+    """True only for UNIQUE / unique-index IntegrityError (idempotent hits).
+
+    Other integrity failures (CHECK, NOT NULL, FK) must not be counted as
+    ``already_present`` and silently dropped.
+    """
+    if not isinstance(exc, sqlite3.IntegrityError):
+        return False
+    msg = " ".join(str(a) for a in exc.args).lower()
+    return "unique" in msg
+
+
 def _as_str_set(v: Any) -> set:
     return {x for x in v if isinstance(x, str)} if isinstance(v, list) else set()
 
@@ -184,35 +197,130 @@ def discover_inboxes(config) -> List[Path]:
     return out
 
 
-def _existing_keys(db, principals: set) -> set:
-    """(inbox_file, candidate_index) pairs already present for the given
-    principals. Matches on derived_from regardless of status so re-runs are
-    no-ops even after the loop resolves a previously-ingested row."""
+def _coerce_candidate_index(raw: Any) -> Optional[int]:
+    """Normalize JSON candidate_index to int (rejects bools / non-integral floats)."""
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return None
+    idx = int(raw)
+    if idx != raw:
+        return None
+    return idx
+
+
+def _parse_file_index_from_derived(df: Any) -> Optional[Tuple[str, int]]:
+    """Parse (inbox_file, candidate_index) from a derived_from JSON blob."""
+    if not df:
+        return None
+    try:
+        obj = json.loads(df) if isinstance(df, str) else df
+    except Exception:
+        return None
+    if not isinstance(obj, dict) or obj.get("source") != "inbox":
+        return None
+    f = obj.get("inbox_file")
+    i = _coerce_candidate_index(obj.get("candidate_index"))
+    if isinstance(f, str) and i is not None:
+        return (f, i)
+    return None
+
+
+# Back-compat alias (tests / older call sites).
+_parse_inbox_key_from_derived = _parse_file_index_from_derived
+
+
+def _make_inbox_key(
+    principal: Any, inbox_file: str, candidate_index: int
+) -> Tuple[str, str, int]:
+    """App-level inbox idempotency key: principal-scoped file + index.
+
+    Issue #239 duals were double-ingest of the **same** agent vault. Scoping
+    by ``principal`` (derived from ``<agent>-vault/inbox``) prevents those
+    twins without blocking legitimate same-basename files in other vaults
+    (see ``test_cross_vault_live_sibling_does_not_block_other_vaults_copy``).
+    """
+    return (str(principal or ""), inbox_file, int(candidate_index))
+
+
+def _parse_inbox_key(
+    principal: Any, df: Any
+) -> Optional[Tuple[str, str, int]]:
+    """Full app key (principal, inbox_file, candidate_index) from a row."""
+    fi = _parse_file_index_from_derived(df)
+    if fi is None:
+        return None
+    return _make_inbox_key(principal, fi[0], fi[1])
+
+
+def _existing_keys(db, principals: set | None = None) -> set:
+    """(principal, inbox_file, candidate_index) already in candidate_packets.
+
+    Principal-scoped: same basename in two agent vaults may both insert.
+    Status-agnostic so re-runs are no-ops after resolution.
+
+    ``principals`` optionally restricts the scan (compact_distillation per-inbox).
+    """
     keys: set = set()
     with db.cursor() as c:
         if principals:
-            qmarks = ",".join("?" for _ in principals)
+            placeholders = ",".join("?" for _ in principals)
             c.execute(
-                f"SELECT derived_from FROM candidate_packets WHERE principal IN ({qmarks})",
+                f"SELECT principal, derived_from FROM candidate_packets "
+                f"WHERE principal IN ({placeholders})",
                 tuple(principals),
             )
         else:
-            c.execute("SELECT derived_from FROM candidate_packets")
+            c.execute("SELECT principal, derived_from FROM candidate_packets")
         rows = c.fetchall()
     for row in rows:
-        df = row["derived_from"] if isinstance(row, dict) or hasattr(row, "keys") else row[0]
-        if not df:
-            continue
-        try:
-            obj = json.loads(df)
-        except Exception:
-            continue
-        if not isinstance(obj, dict) or obj.get("source") != "inbox":
-            continue
-        f, i = obj.get("inbox_file"), obj.get("candidate_index")
-        if isinstance(f, str) and isinstance(i, int):
-            keys.add((f, i))
+        if isinstance(row, dict) or hasattr(row, "keys"):
+            principal = row["principal"]
+            df = row["derived_from"]
+        else:
+            principal, df = row[0], row[1]
+        key = _parse_inbox_key(principal, df)
+        if key is not None:
+            keys.add(key)
     return keys
+
+
+def _existing_keys_for_on_cursor(c, wanted: set) -> set:
+    """Return which of ``wanted`` keys already exist — narrow scan under txn.
+
+    ``wanted`` entries are ``(principal, inbox_file, candidate_index)``.
+    Avoids full-table scan under ``BEGIN IMMEDIATE``.
+    """
+    if not wanted:
+        return set()
+    # Group by (principal, inbox_file) → indices
+    by_scope: Dict[Tuple[str, str], set] = {}
+    for principal, inbox_file, idx in wanted:
+        by_scope.setdefault((principal, inbox_file), set()).add(idx)
+    found: set = set()
+    for (principal, inbox_file), indices in by_scope.items():
+        c.execute(
+            """
+            SELECT principal, derived_from FROM candidate_packets
+            WHERE principal = ?
+              AND derived_from IS NOT NULL
+              AND json_extract(derived_from, '$.source') = 'inbox'
+              AND json_extract(derived_from, '$.inbox_file') = ?
+            """,
+            (principal, inbox_file),
+        )
+        for row in c.fetchall():
+            if isinstance(row, dict) or hasattr(row, "keys"):
+                p, df = row["principal"], row["derived_from"]
+            else:
+                p, df = row[0], row[1]
+            key = _parse_inbox_key(p, df)
+            if (
+                key is not None
+                and key[0] == principal
+                and key[1] == inbox_file
+                and key[2] in indices
+            ):
+                found.add(key)
+    return found
 
 
 def _is_stop_candidate_shape(doc: Dict[str, Any]) -> bool:
@@ -384,13 +492,12 @@ def ingest(db, config, inboxes: Optional[List[Path]] = None,
         for label, count in skipped.items():
             skipped_by_kind[label] = skipped_by_kind.get(label, 0) + count
 
-    principals = {r["principal"] for r in scanned}
-    existing = _existing_keys(db, principals)
+    existing = _existing_keys(db)
 
     to_insert: List[Dict[str, Any]] = []
     already = 0
     for r in scanned:
-        key = (r["inbox_file"], r["candidate_index"])
+        key = _make_inbox_key(r["principal"], r["inbox_file"], r["candidate_index"])
         if key in existing:
             already += 1
             continue
@@ -400,7 +507,24 @@ def ingest(db, config, inboxes: Optional[List[Path]] = None,
     inserted = 0
     if not dry_run and to_insert:
         with db.transaction() as c:
+            # Issue #239: re-load only the keys we intend to insert (not the
+            # full table) under BEGIN IMMEDIATE so concurrent ingest cannot
+            # both pass the pre-txn check and create twins. UNIQUE swallow
+            # remains the last backstop if the operator applied the index.
+            # Key is principal-scoped so multi-vault same basenames coexist.
+            wanted = {
+                _make_inbox_key(r["principal"], r["inbox_file"], r["candidate_index"])
+                for r in to_insert
+            }
+            txn_existing = _existing_keys_for_on_cursor(c, wanted)
+
             for r in to_insert:
+                key = _make_inbox_key(
+                    r["principal"], r["inbox_file"], r["candidate_index"]
+                )
+                if key in txn_existing:
+                    already += 1
+                    continue
                 derived_from = json.dumps(
                     {
                         "source": "inbox",
@@ -410,25 +534,35 @@ def ingest(db, config, inboxes: Optional[List[Path]] = None,
                         "content_sha1": _content_sha1(r["content"]),
                     }
                 )
-                c.execute(
-                    """
-                    INSERT INTO candidate_packets
-                    (principal, workspace_id, layer, privacy_level, content,
-                     evidence_refs, derived_from, instruction_like, status, proposed_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'proposed', ?)
-                    """,
-                    (
-                        r["principal"],
-                        r["workspace_id"],
-                        None,
-                        r["privacy_level"],
-                        r["content"],
-                        json.dumps([]),
-                        derived_from,
-                        1 if is_instruction_like(r["content"]) else 0,
-                        r["proposed_at"],
-                    ),
-                )
+                try:
+                    c.execute(
+                        """
+                        INSERT INTO candidate_packets
+                        (principal, workspace_id, layer, privacy_level, content,
+                         evidence_refs, derived_from, instruction_like, status, proposed_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'proposed', ?)
+                        """,
+                        (
+                            r["principal"],
+                            r["workspace_id"],
+                            None,
+                            r["privacy_level"],
+                            r["content"],
+                            json.dumps([]),
+                            derived_from,
+                            1 if is_instruction_like(r["content"]) else 0,
+                            r["proposed_at"],
+                        ),
+                    )
+                except sqlite3.IntegrityError as exc:
+                    # Unique-index collision (post-#239 repair) or rare race:
+                    # treat as already_present rather than aborting the batch.
+                    # Re-raise CHECK/NOT NULL/FK integrity failures.
+                    if not _is_unique_integrity_error(exc):
+                        raise
+                    already += 1
+                    continue
+                txn_existing.add(key)
                 inserted += 1
 
     return {

@@ -118,17 +118,32 @@ def _derived_inbox_file(derived_from: Any) -> Optional[str]:
     return name
 
 
-def _rows_for_inbox_file(db, inbox_file: str) -> List[dict]:
-    """Every candidate row derived from ``inbox_file`` as
-    ``{status, candidate_index, content_sha1, content}``. The LIKE is a cheap
-    pre-filter; rows are confirmed by parsing ``derived_from``."""
+def _rows_for_inbox_file(
+    db, inbox_file: str, *, principal: Optional[str] = None
+) -> List[dict]:
+    """Candidate rows derived from ``inbox_file`` as
+    ``{status, candidate_index, content_sha1, content, principal}``.
+
+    The LIKE is a cheap pre-filter; rows are confirmed by parsing
+    ``derived_from``. When ``principal`` is set, only that agent's rows
+    count — principal-scoped ingest can create same-basename peers in other
+    vaults; archive must not treat those as open siblings of this inbox.
+    """
     like = f'%"inbox_file": "{inbox_file}"%'
     with db.cursor() as c:
-        c.execute(
-            "SELECT status, content, derived_from FROM candidate_packets "
-            "WHERE derived_from LIKE ?",
-            (like,),
-        )
+        if principal is not None:
+            c.execute(
+                "SELECT principal, status, content, derived_from "
+                "FROM candidate_packets "
+                "WHERE COALESCE(principal, '') = ? AND derived_from LIKE ?",
+                (str(principal), like),
+            )
+        else:
+            c.execute(
+                "SELECT principal, status, content, derived_from "
+                "FROM candidate_packets WHERE derived_from LIKE ?",
+                (like,),
+            )
         rows = c.fetchall()
     out: List[dict] = []
     for row in rows:
@@ -140,6 +155,7 @@ def _rows_for_inbox_file(db, inbox_file: str) -> List[dict]:
             df = {}
         out.append(
             {
+                "principal": row["principal"] if "principal" in row.keys() else None,
                 "status": row["status"],
                 "candidate_index": df.get("candidate_index"),
                 "content_sha1": df.get("content_sha1"),
@@ -222,7 +238,8 @@ def maybe_archive_for_candidate(db, config, candidate_id: int) -> Optional[str]:
     file already gone)."""
     with db.cursor() as c:
         c.execute(
-            "SELECT derived_from FROM candidate_packets WHERE candidate_id=?",
+            "SELECT principal, derived_from FROM candidate_packets "
+            "WHERE candidate_id=?",
             (int(candidate_id),),
         )
         row = c.fetchone()
@@ -231,16 +248,23 @@ def maybe_archive_for_candidate(db, config, candidate_id: int) -> Optional[str]:
     inbox_file = _derived_inbox_file(row["derived_from"])
     if not inbox_file:
         return None
-    rows = _rows_for_inbox_file(db, inbox_file)
+    # Scope siblings to the resolved candidate's principal so multi-vault
+    # same-basename peers (allowed by principal-scoped ingest) do not block
+    # archive of a fully-terminal agent vault copy.
+    owner_principal = str(row["principal"] or "")
+    rows = _rows_for_inbox_file(db, inbox_file, principal=owner_principal)
     if not rows:
         return None
-    # derived_from records only the filename; find it across the known inboxes
-    # (mirrors inbox_ingest's name-keyed idempotency semantics) — but archive a
-    # file ONLY when the rows provably correspond to ITS content and every
-    # matching row is terminal. A same-named file in another vault (or a
-    # never-ingested file targeted by a forged derived_from) fails the
-    # correspondence check and stays live.
+    # Only consider inboxes owned by the resolved candidate's principal.
+    # Content-matching alone is insufficient: byte-identical candidates under
+    # the same basename in another vault would otherwise archive the wrong
+    # agent's still-live file when discover order visits them first.
+    from minni.afm_passes.inbox_ingest import _principal_for_inbox
+
     for inbox in discover_inboxes(config):
+        inbox_owner = _principal_for_inbox(inbox, fallback_principal="unknown")
+        if str(inbox_owner or "") != owner_principal:
+            continue
         source = inbox / inbox_file
         try:
             # Belt-and-braces containment: the joined path must stay inside
@@ -259,8 +283,7 @@ def maybe_archive_for_candidate(db, config, candidate_id: int) -> Optional[str]:
         if matched is None:
             continue
         if any(r["status"] not in TERMINAL_STATUSES for r in matched):
-            continue  # a sibling candidate from THIS copy is still live; other
-            # inboxes may hold a same-named file whose rows are all terminal
+            continue  # a sibling candidate from THIS principal/copy is still live
         archived = archive_inbox_file(source)
         if archived:
             logger.info(

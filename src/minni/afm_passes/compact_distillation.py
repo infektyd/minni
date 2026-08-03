@@ -64,6 +64,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import sqlite3
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -76,8 +77,11 @@ from minni.safety import is_instruction_like
 from minni.afm_passes.inbox_archive import archive_inbox_file
 from minni.afm_passes.inbox_ingest import (
     CONTENT_CAP,
+    _coerce_candidate_index,
     _content_sha1,
     _existing_keys,
+    _existing_keys_for_on_cursor,
+    _is_unique_integrity_error,
     _principal_for_inbox,
     discover_inboxes,
 )
@@ -301,8 +305,9 @@ def distill(db, config, inboxes: Optional[List[Path]] = None,
             fallback_principal: str = "unknown", dry_run: bool = False) -> Dict[str, Any]:
     """Distill eligible compact_summary inbox files into candidate_packets.
 
-    Returns a summary dict. Idempotent at (inbox_file, candidate_index) level;
-    never deletes. ``dry_run=True`` reports counts without writing.
+    Returns a summary dict. Idempotent at
+    (principal, inbox_file, candidate_index) level; never deletes.
+    ``dry_run=True`` reports counts without writing.
     """
     if inboxes is None:
         inboxes = discover_inboxes(config)
@@ -343,7 +348,8 @@ def distill(db, config, inboxes: Optional[List[Path]] = None,
             # file, so its presence marks the whole file as done. This also
             # holds the AFM/fallback split stable per file — a re-run with a
             # different AFM availability must not append a second variant set.
-            if (path.name, 0) in existing:
+            file_key0 = (principal, path.name, 0)
+            if file_key0 in existing:
                 already += 1
                 # Legacy sweep: a file processed by a pre-fix daemon build has
                 # its candidate rows sitting in the DB already but was never
@@ -383,7 +389,7 @@ def distill(db, config, inboxes: Optional[List[Path]] = None,
             privacy = str(raw_privacy).strip() if raw_privacy and str(raw_privacy).strip() else "safe"
             workspace = doc.get("workspace_id") or "default"
             for idx, (content, afm_used) in enumerate(candidates):
-                existing.add((path.name, idx))
+                existing.add((principal, path.name, idx))
                 to_insert.append({
                     "principal": principal,
                     "workspace_id": workspace,
@@ -400,7 +406,20 @@ def distill(db, config, inboxes: Optional[List[Path]] = None,
     if not dry_run and to_insert:
         now = time.time()
         with db.transaction() as c:
+            # Issue #239: re-load only to_insert keys under BEGIN IMMEDIATE
+            # (not full-table scan). Mirror inbox_ingest: narrow in-txn check
+            # + UNIQUE swallow. Principal-scoped keys allow multi-vault peers.
+            wanted = {
+                (r["principal"], r["inbox_file"], r["candidate_index"])
+                for r in to_insert
+            }
+            txn_existing = _existing_keys_for_on_cursor(c, wanted)
+
             for r in to_insert:
+                key = (r["principal"], r["inbox_file"], r["candidate_index"])
+                if key in txn_existing:
+                    already += 1
+                    continue
                 derived_from = json.dumps({
                     # 'inbox' + inbox_file is the inbox_archive lifecycle key —
                     # keep it EXACTLY this shape (see module docstring).
@@ -415,25 +434,35 @@ def distill(db, config, inboxes: Optional[List[Path]] = None,
                     "afm_distilled": r["afm_distilled"],
                     "content_sha1": _content_sha1(r["content"]),
                 })
-                c.execute(
-                    """
-                    INSERT INTO candidate_packets
-                    (principal, workspace_id, layer, privacy_level, content,
-                     evidence_refs, derived_from, instruction_like, status, proposed_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'proposed', ?)
-                    """,
-                    (
-                        r["principal"],
-                        r["workspace_id"],
-                        None,
-                        r["privacy_level"],
-                        r["content"],
-                        json.dumps([]),
-                        derived_from,
-                        1 if is_instruction_like(r["content"]) else 0,
-                        now,
-                    ),
-                )
+                try:
+                    c.execute(
+                        """
+                        INSERT INTO candidate_packets
+                        (principal, workspace_id, layer, privacy_level, content,
+                         evidence_refs, derived_from, instruction_like, status, proposed_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'proposed', ?)
+                        """,
+                        (
+                            r["principal"],
+                            r["workspace_id"],
+                            None,
+                            r["privacy_level"],
+                            r["content"],
+                            json.dumps([]),
+                            derived_from,
+                            1 if is_instruction_like(r["content"]) else 0,
+                            now,
+                        ),
+                    )
+                except sqlite3.IntegrityError as exc:
+                    # Unique-index collision (post-#239 repair) or rare race:
+                    # treat as already_present rather than aborting the batch.
+                    # Re-raise CHECK/NOT NULL/FK integrity failures.
+                    if not _is_unique_integrity_error(exc):
+                        raise
+                    already += 1
+                    continue
+                txn_existing.add(key)
                 inserted += 1
 
     # Archive only after the insert transaction above has committed — the
