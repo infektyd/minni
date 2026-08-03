@@ -144,12 +144,14 @@ an explicit runtime telemetry/API signal is cited in the same finding.
 The Codex/Claude/Gemini/Kilo plugin exposes a coordinator-side Minni Team Runtime
 for temporary helper agents:
 
-- `sovereign_team_runtime` builds temporary profiles, a task ledger, hydration
+- `minni_team_runtime` builds temporary profiles, a task ledger, hydration
   packets, gates, and non-goals.
-- `sovereign_team_evidence` summarizes helper-agent reports and identifies
+- `minni_team_evidence` summarizes helper-agent reports and identifies
   promotion candidates for human review.
+- `minni_team_promotion` drafts a permanent-profile review artifact only after
+  explicit approval (still dry-run; does not write durable memory).
 
 This layer is deliberately non-executing. It does not spawn agents, write
 durable learnings, promote profiles, or bypass cross-agent vault boundaries.
-Each hydration packet is derived from `sovereign_prepare_task`, so the same
+Each hydration packet is derived from `minni_prepare_task`, so the same
 recall-only default and public repository boundary apply.

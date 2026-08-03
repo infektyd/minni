@@ -1,14 +1,20 @@
 # Cursor
 
-Cursor is not yet wired by the `minni wire` CLI (`cursor` is not in its
-`VALID_PLATFORMS`) — it installs through the `minni-install` skill's
-`propagate.py`, which owns a Cursor-specific hook path:
+Cursor is a **fleet-known, propagate-managed** platform: `cursor` is in wire's
+`VALID_PLATFORMS`, but `minni wire cursor` and `minni wire all` expand to a
+skip (`ALL_SKIPS["cursor"]`) rather than installing under `~/.minni/plugin/`.
+Install and refresh go through the `minni-install` skill's `propagate.py`,
+which owns the Cursor-specific hook path. `make sync-root` (see
+[deploy/README.md](../../deploy/README.md)) also runs
+`propagate update-plugin --platform cursor` as part of the D7 fleet partition.
 
 ```bash
 git clone https://github.com/infektyd/minni.git && cd minni
 make setup          # venv + deps + plugin build
 .venv/bin/python plugins/minni/skills/minni-install/scripts/propagate.py \
   update-plugin --platform cursor
+# or, for the full live fleet (wire-primary hosts + antigravity/cursor):
+# make sync-root
 ```
 
 This builds/copies the plugin to `~/.cursor/plugins/local/minni`, registers

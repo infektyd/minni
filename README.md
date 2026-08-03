@@ -90,10 +90,10 @@ Swap the platform for any of these:
 
 | Platform | `minni wire` | Notes |
 |---|---|---|
-| `claude-code` · `codex` · `kilocode` · `grok` | yes | exactly what `all` expands to |
-| `antigravity` · `generic` | yes, individually | not covered by `all` |
-| `gemini` | provisional | `all` skips it with a warning — see [docs/runtimes/gemini.md](docs/runtimes/gemini.md) |
-| `cursor` | not yet | installs via the `minni-install` skill — see [docs/runtimes/cursor.md](docs/runtimes/cursor.md) |
+| `claude-code` · `codex` · `kilocode` · `grok` | yes | exactly what `wire all` expands to |
+| `antigravity` · `generic` | yes, individually | not covered by `wire all` |
+| `gemini` | provisional | `wire all` skips it with a warning — see [docs/runtimes/gemini.md](docs/runtimes/gemini.md) |
+| `cursor` | fleet-known, skip | in `VALID_PLATFORMS` but wire expands to skip; install via `propagate.py` / `make sync-root` — [docs/runtimes/cursor.md](docs/runtimes/cursor.md) |
 
 Every wire ends with verification probes — an MCP handshake against the installed server, a hook dry-run, and a config readback — and the same checks live on in `minni doctor`. Old payload versions are garbage-collected only when no agent's config still references them; `--use-version` re-wires a platform to a previous install for rollback. This registers the MCP server, the per-agent vault path, and that host's hook entrypoint; the agent-driven `minni-install` skill handles first-time identity and vault seeding. Per-runtime pages: [Claude Code](docs/runtimes/claude-code.md) · [Codex](docs/runtimes/codex.md) · [Gemini / Antigravity](docs/runtimes/gemini.md) · [Grok](docs/runtimes/grok.md) · [Kilo Code](docs/runtimes/kilocode.md) · [Cursor](docs/runtimes/cursor.md).
 
@@ -119,6 +119,10 @@ the receiver acks before the sender releases it...
 Prefer a container? The eval image runs the daemon with zero local setup: `docker run --rm -it -v minni-data:/home/minni ghcr.io/infektyd/minni:latest` (see [docs/install.md](docs/install.md)).
 
 Want proof agents are actually using memory? `minni watch` tails every recall, learn, and guard decision live in the terminal ([docs](docs/runtime-integration.md#observability-minni-watch)), and the web console (`npm run console` in `plugins/minni`) serves the Memory Board — an infinite canvas over live daemon data: staged learnings, session receipts, traffic pulses ([docs](docs/runtime-integration.md#console-observability)).
+
+### Keep the live install current
+
+If you run Minni from a source checkout (editable engine + wire-managed plugin tree), **`make sync-root`** is the operator refresh path: fast-forward to `origin/main`, reinstall, rebuild the plugin, redeploy with the D7 fleet partition, restart the daemon, verify. Watch `minni status` for the `deploy` block — top-level `deploy.stale` includes nested `plugin_dist.stale`. **`minni wire all` ≠ `propagate --platform all`**: wire covers codex/claude-code/kilocode/grok; propagate's `all` is only antigravity + cursor (and post-wire propagate of codex/kilo/grok rewrites MCP onto legacy trees). Full story: [deploy/README.md](deploy/README.md).
 
 ## Architecture at a glance
 
@@ -176,6 +180,7 @@ What "works" is not asserted, it is *executed in public*: CI stands the daemon u
 |---|---|
 | Concepts — four verbs, two-tier storage, governance gate | [docs/concepts.md](docs/concepts.md) |
 | Install & troubleshooting (incl. Docker eval image) | [docs/install.md](docs/install.md) |
+| Keep live checkout current (`make sync-root`, fleet partition) | [deploy/README.md](deploy/README.md) |
 | Per-runtime setup | [docs/runtimes/](docs/runtimes/) |
 | Architecture — components, data model, MCP tools | [docs/architecture.md](docs/architecture.md) |
 | Security model | [docs/security.md](docs/security.md) · [SECURITY_PLAN.md](docs/archive/SECURITY_PLAN.md) |

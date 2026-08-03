@@ -82,20 +82,21 @@ same audit trail:
    vaults — so scope capabilities (and `allowed_vault_roots`, if you use it)
    to what the delegation actually needs.
 
-3. **The background consolidation pass** *(designed, currently broken —
-   [#119](https://github.com/infektyd/minni/issues/119))*. With
-   `MINNI_AFM_LOOP=on` the AFM consolidation pass is meant to drain staged
-   candidates roughly every 15 minutes, auto-promoting the low-risk subset —
-   explicitly safe privacy level, not instruction-like, not a duplicate,
-   passing the deterministic quality gate — into durable learnings with no
-   human in the loop, routing everything spicier to review. The gate and the
-   promotion write are implemented and tested, but as of v0.1.0 the assembled
-   path does not function: the background loop's wet run is rejected by the
-   daemon's own operator gate, and fresh installs are missing the
-   `consolidation_actions` table. Until #119 lands, treat this path as a
-   design commitment, not a working toggle. (The loop is off by default
-   regardless, and `MINNI_AFM_MODE` is unrelated — mode only toggles an
-   advisory triage annotation that the promotion gate never consults.)
+3. **The background consolidation pass** *(opt-in; functional since
+   [#119](https://github.com/infektyd/minni/issues/119) closed)*. Set
+   `MINNI_AFM_LOOP=on` (also `1`/`true`/`yes`) to enable the daemon's AFM
+   loop; default is **off**, and `MINNI_AFM_LOOP=off` is an explicit kill
+   switch. When enabled, consolidation drains staged candidates on a schedule,
+   auto-promoting the low-risk subset — explicitly safe privacy level, not
+   instruction-like, not a duplicate, passing the deterministic quality gate —
+   into durable learnings with `resolved_by=afm-consolidation`, and routing
+   everything spicier to review. The gate, promotion write, and loop path are
+   implemented and covered by regression tests (`tests/test_afm_loop_promotion.py`).
+   `minni doctor` does **not** fully wet-exercise this pass (it stays green
+   whether the loop is on or off), so enable deliberately and watch daemon logs
+   / `consolidation_actions` if you rely on it. (`MINNI_AFM_MODE` is unrelated
+   — mode only toggles an advisory triage annotation that the promotion gate
+   never consults.)
 
 One operational caveat: creating your **first** `principals/*.json` file flips
 the daemon into strict identity mode, where the anonymous local caller is no

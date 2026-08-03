@@ -34,11 +34,16 @@ first-time identity and vault seeding.
 Claude Code is the most deeply integrated runtime:
 
 - Session hooks inject the `<minni:context>` envelope with identity, active
-  plan state, correction re-assertions, and the lifecycle spine
+  thread/plan state, correction re-assertions, and the lifecycle spine
   (`prepare_task → prepare_outcome → plan → learn`).
-- A deny-capable `PreToolUse` **recall guard** nudges recall before tool use —
-  Claude Code is currently the only host that exposes a pre-tool hook that can
-  deny. Knobs: `MINNI_RECALL_GUARD_MODE` (`off`/`soft`/`strict`),
+- A deny-capable `PreToolUse` **recall guard** nudges recall before tool use.
+  Claude is **not** the only deny-capable host — Kilo, Cursor, Grok, and
+  Antigravity (agy) also expose pre-tool deny with different depth and
+  decision enums (Codex has deny but only on Bash, so the guard cannot gate
+  `Read`/`Grep`/`Glob` there). Claude remains the deepest integration: all-tool
+  coverage plus live recall-state in the shared guard path. Full matrix:
+  [docs/contracts/hook-platforms.md](../contracts/hook-platforms.md). Knobs:
+  `MINNI_RECALL_GUARD_MODE` (`off`/`soft`/`strict`),
   `MINNI_LIFECYCLE_NUDGE_MODE` (`off` disables). The guard fails open.
 
 Verify: in a Claude Code session, call `minni_status` (or `/minni:status`) and
