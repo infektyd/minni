@@ -42,7 +42,7 @@ import {
   failAndExit,
   markOutputDropped,
 } from "./hook-delivery.js";
-import { harvestSummaryText } from "./compact-harvest.js";
+import { harvestCompactSummary, harvestSummaryText } from "./compact-harvest.js";
 import { injectIntent, noIntent, noteIntent } from "./hook-intent.js";
 import type { HookIntent } from "./hook-intent.js";
 import { canInject, renderIntent, wireFor } from "./hook-platform.js";
@@ -421,6 +421,32 @@ export interface AgentHookHandlers {
   ): Promise<HookOutput | PreToolUseDecisionOutput>;
 }
 
+/**
+ * Path-only compact harvest (no `source`, non-empty transcript path) is
+ * **opt-in**. Default off so a host that always attaches a path and never
+ * sends `source` (agy/gemini shape, and any unverified host) does not
+ * rediscover the every-cold-boot tail-read tax.
+ *
+ * Empty by design until a live transcript is verified Claude-shaped
+ * (`isCompactSummary: true`). Cursor's contract explicitly warns not to mine
+ * `transcript_path` blind; codex / grok-build shapes are also unverified for
+ * this extractor. Universal `source === "compact" | "resume"` still harvests
+ * on every runtime. Matched against `config.runtime ?? config.agentId`.
+ */
+const PATH_ONLY_COMPACT_HARVEST_ALLOW = new Set<string>([]);
+
+/** Wait cap for path-only residual SessionStart harvest (ms). That residual is
+ * almost always a miss and must not burn the boot budget before
+ * identity/corrections RPCs. `withBudget` only bounds wait time; it does not
+ * cancel work. compact|resume is NOT wait-capped — see harvest block below. */
+const COMPACT_HARVEST_PATH_ONLY_BUDGET_MS = 250;
+
+/** True when path-only (no `source`) SessionStart may start a tail-read. */
+export function isPathOnlyCompactHarvestAllowed(platform: string | undefined): boolean {
+  const id = (platform ?? "").trim().toLowerCase();
+  return id.length > 0 && PATH_ONLY_COMPACT_HARVEST_ALLOW.has(id);
+}
+
 export function createHookHandlers(
   config: AgentHookConfig,
   deps: AgentHookDeps = {},
@@ -477,13 +503,83 @@ export function createHookHandlers(
     // the envelope — and, critically, the corrections below — still ship.
     //
     // The clock starts at handler ENTRY: the harness deadline runs from process
-    // start, so any setup done first (vault creation, and on claude-code the
-    // compaction harvest) is time already spent against it.
+    // start, so any setup done first (vault creation + compaction harvest) is
+    // time already spent against it.
     const budgetMs = effectiveHookBudgetMs(config.sessionStartHookTimeoutMs);
     const deadline = Date.now() + budgetMs;
     const remainingMs = (): number => Math.max(0, deadline - Date.now());
     const rpcTimedOut = { ok: false as const, error: JSON_RPC_TIMEOUT_ERROR };
     await ensureVault(config.vaultPath);
+
+    // Compaction-summary harvest backstop (P3 / #227). Claude Code's primary
+    // path is PostCompact in hook.ts; Kilo delivers via CompactSummary (its
+    // bridge SessionStart supplies neither transcript_path nor source — so
+    // this backstop is dead for real Kilo boots). Platforms that share this
+    // handler (codex, grok-build, cursor, gemini) previously had no harvest
+    // path at all — and on those hosts this SessionStart path is the ONLY
+    // capture write (no PostCompact).
+    //
+    // Gate:
+    //  1. compact|resume `source` — Claude parity (any runtime). FULLY
+    //     awaited: withBudget races rather than cancels, and exitAfterDelivery
+    //     then kills the process, so a budget-cut harvest is permanent loss of
+    //     the only write path. Match hook.ts: bare await.
+    //  2. path-only residual — only when `source` is absent entirely AND the
+    //     runtime is on PATH_ONLY_COMPACT_HARVEST_ALLOW (opt-in). Default
+    //     off: hosts that always attach a path and never send `source`
+    //     (agy/gemini) would otherwise tax every cold boot for a guaranteed
+    //     no_summary_found. Wait-capped only (still not cancel-safe).
+    // Content-hash dedup keeps dual delivery safe. Fail-open, raw only —
+    // daemon compact_distillation organizes later.
+    const bootSource = asString(payload.source);
+    const transcriptPath =
+      asString(payload.transcript_path) || asString(payload.transcriptPath);
+    const platform = config.runtime ?? config.agentId;
+    const isCompactOrResume = bootSource === "compact" || bootSource === "resume";
+    const pathOnlyAllowed =
+      !bootSource &&
+      Boolean(transcriptPath) &&
+      isPathOnlyCompactHarvestAllowed(platform);
+    if (isCompactOrResume) {
+      // Do not start when the boot budget is already spent — a late start is
+      // more likely to overrun the harness than to land a durable write. Once
+      // started, await fully (never withBudget-race this path).
+      if (remainingMs() > 0) {
+        await harvestCompactSummary(
+          {
+            vaultPath: config.vaultPath,
+            workspaceId,
+            auditPrefix: config.auditPrefix,
+            platform,
+          },
+          {
+            transcriptPath,
+            sessionId,
+          },
+        );
+      }
+    } else if (pathOnlyAllowed && remainingMs() > 0) {
+      // Residual is almost always a miss → tight wait-cap so it cannot exhaust
+      // identity/corrections RPCs. withBudget only bounds wait time; it does
+      // not cancel the tail-read. Acceptable for opt-in residual; not for the
+      // only write path above.
+      await withBudget(
+        harvestCompactSummary(
+          {
+            vaultPath: config.vaultPath,
+            workspaceId,
+            auditPrefix: config.auditPrefix,
+            platform,
+          },
+          {
+            transcriptPath,
+            sessionId,
+          },
+        ),
+        Math.min(remainingMs(), COMPACT_HARVEST_PATH_ONLY_BUDGET_MS),
+        { harvested: false, reason: "harvest_error" },
+      );
+    }
 
     // TTL-reap stale file handoffs BEFORE the honest read so they neither occupy
     // the capped slice nor inflate totals; they surface once below as 'expired'.
@@ -1172,12 +1268,14 @@ export function createHookHandlers(
   async function handleCompactSummary(payload: Record<string, unknown>): Promise<HookOutput> {
     await ensureVault(config.vaultPath);
     const sessionId = asString(payload.session_id) || asString(payload.sessionId) || "session";
+    // Same provenance stamp as SessionStart harvest — dual delivery paths
+    // must not disagree on `platform` when runtime and agentId differ.
     await harvestSummaryText(
       {
         vaultPath: config.vaultPath,
         workspaceId: workspaceFor(payload),
         auditPrefix: config.auditPrefix,
-        platform: config.agentId,
+        platform: config.runtime ?? config.agentId,
       },
       {
         summaryText: asString(payload.summary_text),

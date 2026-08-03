@@ -195,13 +195,54 @@ Minni harvests it in two stages, split across the boot/daemon boundary
    fires after the native `session.compacted` bus event (`experimental.session.compacting`
    fires too early — before the summary exists — so the plugin fetches it
    afterward via the SDK client; see `plugins/minni/kilo/minni-plugin.js`).
-   Both paths converge on `harvestSummaryText`: the continuation-frame
-   boilerplate is stripped, the text is capped, and it is written verbatim to
-   the agent's vault `inbox/` as one file with `kind: "compact_summary"`.
-   Dedup is keyed on a **content sha1** of the frame-stripped summary (not the
-   platform's summary id), persisted under
+   Platforms that share `createHookHandlers` (codex, grok-build, cursor, gemini)
+   run the SessionStart transcript backstop when the payload marks `source` as
+   compact/resume. A path-only residual (no `source`, non-empty
+   `transcript_path`) is **opt-in** via an allowlist that is **empty until a
+   live transcript is verified Claude-shaped** (`isCompactSummary: true`).
+   Cursor's platform contract warns not to mine `transcript_path` blind; codex
+   and grok-build transcript shapes are also unverified for this extractor, so
+   they are not allowlisted either. Hosts that always stamp a non-compact
+   `source` (e.g. `startup`) never hit path-only either — path residual
+   requires `source` absent entirely. Default off also protects hosts that
+   always attach a path and never send `source` (agy/gemini) from every-cold-boot
+   I/O for a guaranteed miss against the tightest SessionStart budget
+   ([#227](https://github.com/infektyd/minni/issues/227)). On shared platforms
+   this SessionStart path is the **only** capture write (no `PostCompact`), so
+   compact|resume harvest is **fully awaited** — matching Claude Code — rather
+   than raced with `withBudget` (a race + `exitAfterDelivery` would kill
+   mid-flight and permanently drop the write). Path-only residual stays
+   wait-capped; `withBudget` does not cancel the tail-read, so path-only is not
+   budget-safe concurrent I/O — only wait-capped before identity/corrections
+   RPCs. Kilo Code uses the shared handler too, but
+   its bridge SessionStart sends neither `transcript_path` nor `source`, so that
+   backstop is dead for real Kilo boots (primary remains `CompactSummary` from
+   the SDK). Both live paths converge on `harvestSummaryText`: the
+   continuation-frame boilerplate is stripped, the text is capped, and it is
+   written verbatim to the agent's vault `inbox/` as one file with
+   `kind: "compact_summary"`. Dedup is keyed on a **content sha1** of the
+   frame-stripped summary (not the platform's summary id), persisted under
    `<vault>/.runtime/compact-harvest-state.json` — a content key is what lets
    two delivery paths coexist on Claude Code without double-harvesting.
+
+   **Platform capability table (compaction-summary harvest):**
+
+   | Platform | Primary delivery | SessionStart transcript backstop | Notes |
+   |----------|------------------|----------------------------------|-------|
+   | Claude Code | `PostCompact` → `harvestSummaryText` | yes (`source` compact/resume only) | full path |
+   | Kilo Code | `session.compacted` SDK read-back → `CompactSummary` | no (bridge supplies no transcript_path / source) | primary only |
+   | Codex | — | compact/resume `source` only | path-only not allowlisted (Claude-shaped JSONL unverified); capture no-op until shape or direct delivery |
+   | Grok Build | — | compact/resume `source` only | harvest is a side effect (SessionStart is not injectable); path-only not allowlisted |
+   | Cursor | — | compact/resume `source` only | do not mine `transcript_path` blind (undocumented schema); cold boots with non-compact `source` skip; path-only not allowlisted |
+   | Gemini / agy | — | compact/resume `source` only | always attaches `transcriptPath`, never `source`; path-only would I/O every cold boot for zero yield (non–Claude-shaped transcript) |
+
+   Platforms without a Claude-shaped `isCompactSummary` transcript entry still
+   *have* a harvest path when the gate fires (they no longer drop the event on
+   the floor by absence of code), but capture is a no-op until the platform
+   emits a compatible summary shape or a direct `CompactSummary`/`summary_text`
+   delivery. Path-only stays empty-allowlist so the residual is not paid as an
+   every-boot I/O cost on unverified hosts. That residual is declared here
+   rather than discovered.
 2. **Daemon-side distillation (`compact_distillation` AFM pass).** The same
    consolidation timer that ingests stop-candidate learnings picks up
    `compact_summary` inbox files (`src/minni/afm_passes/compact_distillation.py`).
