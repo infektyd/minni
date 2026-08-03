@@ -3072,6 +3072,77 @@ def test_expand_with_status_rule_mode_never_degrades():
     assert degraded is None
 
 
+def test_deferred_worker_soft_partial_keeps_sticky_and_hold(monkeypatch):
+    """High (PR #260 tip RC): first deferred apply soft-partial must sticky-hold
+    the same way as re-apply — not only after a raising first apply.
+    """
+    import queue as queue_mod
+    import threading
+
+    from minni import afm_writer
+
+    afm_writer.reset_pass_counters()
+    monkeypatch.setattr(afm_writer, "_ensure_worker", lambda: None)
+    monkeypatch.setattr(afm_writer, "_WORK_QUEUE", queue_mod.Queue(maxsize=4))
+    monkeypatch.setattr(
+        afm_writer,
+        "_write_batch",
+        lambda job: {"drafts_written": [{"page_id": "d1"}], "inbox_path": "x"},
+    )
+
+    def _soft_partial(life):
+        # No raise — remaining_proposed proves incompleteness.
+        life["applied"] = {
+            "promoted": 1,
+            "deduped": 0,
+            "reviewed": 0,
+            "errors": 0,
+            "remaining_proposed": [2, 3],
+            "requested": {"promote": 3, "dedup": 0, "review": 0},
+        }
+
+    done = threading.Event()
+    job = {
+        "pass_name": "consolidation",
+        "drafts": [{"title": "t"}],
+        "lifecycle": {
+            "promote_candidate_ids": [1, 2, 3],
+            "dedup_candidate_ids": [],
+            "review_candidate_ids": [],
+        },
+        "lifecycle_handler": _soft_partial,
+        "defer_lifecycle_to_worker": True,
+    }
+    with afm_writer._IN_FLIGHT_LOCK:
+        afm_writer._IN_FLIGHT_PER_PASS["consolidation"] = done
+    afm_writer._process_job(job, done, {})
+    assert not done.is_set(), "soft partial must keep in-flight hold"
+    assert "consolidation" in afm_writer._PENDING_LIFECYCLE
+    assert job.get("lifecycle_applied") is not True
+
+    put_calls = []
+    real_put = afm_writer._WORK_QUEUE.put_nowait
+
+    def _spy(item):
+        put_calls.append(item)
+        return real_put(item)
+
+    monkeypatch.setattr(afm_writer._WORK_QUEUE, "put_nowait", _spy)
+    second = afm_writer.submit_drafts(
+        {
+            "pass_name": "consolidation",
+            "drafts": [{"title": "dup-mint-risk"}],
+            "lifecycle_handler": _soft_partial,
+        },
+        timeout=0.05,
+    )
+    assert second.get("lifecycle_pending") is True or second.get("status") == "write_in_flight", (
+        second
+    )
+    assert put_calls == [], "must not enqueue a second wet draft batch"
+    afm_writer.reset_pass_counters()
+
+
 def test_partial_sticky_reapply_keeps_hold_and_refuses_wet(monkeypatch):
     """High #1 (PR #260 tip RC): sticky re-apply that terminalizes only a
     subset of deferred IDs must NOT clear sticky or dual-mint the rest.

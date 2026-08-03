@@ -1013,6 +1013,49 @@ def _write_batch(job: dict) -> dict:
     return result
 
 
+def _lifecycle_apply_complete(
+    applied: object, lifecycle: dict
+) -> tuple[bool, bool]:
+    """Return ``(complete, did_work)`` for a lifecycle handler's applied report.
+
+    Round 24/27: shared by sticky *re-apply* and the first deferred worker
+    apply. Soft partial success (``remaining_proposed`` non-empty, or partial
+    counts without remaining) must keep sticky — clearing on any(promoted)>0
+    reopens AFM-8 dual-mint for peers still proposed.
+    """
+    if not isinstance(applied, dict):
+        # Handlers that omit applied: conservative full (cannot prove partial).
+        return True, True
+    remaining = applied.get("remaining_proposed")
+    errors = int(applied.get("errors") or 0)
+    terminalized = sum(
+        int(applied.get(k) or 0) for k in ("promoted", "deduped", "reviewed")
+    )
+    did_work = terminalized > 0
+    if remaining is not None:
+        return (errors == 0 and len(remaining) == 0), did_work
+    # Legacy applied shape without remaining_proposed.
+    req = applied.get("requested")
+    if isinstance(req, dict):
+        requested = sum(int(req.get(k) or 0) for k in ("promote", "dedup", "review"))
+    else:
+        requested = sum(
+            len(lifecycle.get(k) or [])
+            for k in (
+                "promote_candidate_ids",
+                "dedup_candidate_ids",
+                "review_candidate_ids",
+            )
+        )
+    if errors > 0:
+        return False, did_work
+    if terminalized == 0:
+        return True, False  # stale / already-resolved no-op
+    if requested > 0 and terminalized >= requested:
+        return True, True
+    return False, did_work  # partial terminalize
+
+
 def _maybe_apply_deferred_lifecycle(job: dict) -> bool:
     """If the waiter timed out and left lifecycle to us, apply it once.
 
@@ -1068,9 +1111,40 @@ def _maybe_apply_deferred_lifecycle(job: dict) -> bool:
         job["lifecycle_applying"] = True
     try:
         handler(lifecycle)
-        job["lifecycle_applied"] = True
+        # Round 27: soft partial success (remaining_proposed non-empty) must
+        # sticky-hold the same way as a raise — apply_consolidation_result
+        # does not raise on partial terminalize. Unconditional lifecycle_applied
+        # + sticky clear here reopened AFM-8 dual-mint on the *first* deferred
+        # apply while re-apply already enforced completeness.
+        applied = lifecycle.get("applied") if isinstance(lifecycle, dict) else None
+        complete, _did_work = _lifecycle_apply_complete(applied, lifecycle)
         pass_name = str(job.get("pass_name") or "unknown")
         vault_path = job.get("vault_path")
+        if not complete:
+            stored = {
+                k: v
+                for k, v in dict(lifecycle).items()
+                if not str(k).startswith("_") and k != "applied"
+            }
+            if callable(handler):
+                stored["_handler"] = handler
+            if vault_path:
+                stored["_vault_path"] = str(Path(vault_path).expanduser())
+            with _IN_FLIGHT_LOCK:
+                _LIFECYCLE_APPLY_FAILURES += 1
+                _LAST_LIFECYCLE_APPLY_FAILURE_AT = time.time()
+                _PENDING_LIFECYCLE[pass_name] = stored
+                _persist_pending_lifecycle(
+                    pass_name, stored, str(vault_path) if vault_path else None
+                )
+            job["lifecycle_apply_failed"] = True
+            logger.warning(
+                "AFM writer: deferred lifecycle for pass %r incomplete "
+                "(applied=%r) — sticky hold, no dual-mint",
+                pass_name, applied,
+            )
+            return False
+        job["lifecycle_applied"] = True
         # Round 19: memory pop + sidecar clear must be one critical section.
         # Pop-then-clear outside the lock let a concurrent fail-path persist
         # resurrect a stale sticky after a successful clear (phantom pending
@@ -1302,63 +1376,15 @@ def submit_drafts(job: dict, wait: bool = True, timeout: Optional[float] = 30.0)
     if reapply_handler is not None:
         try:
             reapply_handler(reapply_payload)
-            # Round 22/24: clear sticky only when the deferred ID set is fully
-            # done. Partial terminalize (any(promoted)>0 while peers stay
-            # proposed) used to pop sticky and dual-mint the remainder —
-            # reopening AFM-8. apply_consolidation_result reports
-            # remaining_proposed + errors; legacy handlers without that
-            # shape stay on the conservative "any count > 0" path only when
-            # remaining is absent AND no errors key.
+            # Round 22/24/27: same completeness helper as first deferred apply.
             applied = (
                 reapply_payload.get("applied")
                 if isinstance(reapply_payload, dict)
                 else None
             )
-            complete = False
-            did_work = False
-            if isinstance(applied, dict):
-                remaining = applied.get("remaining_proposed")
-                errors = int(applied.get("errors") or 0)
-                terminalized = sum(
-                    int(applied.get(k) or 0)
-                    for k in ("promoted", "deduped", "reviewed")
-                )
-                did_work = terminalized > 0
-                if remaining is not None:
-                    # Authoritative path (apply_consolidation_result round 24).
-                    complete = errors == 0 and len(remaining) == 0
-                else:
-                    # Legacy applied shape without remaining_proposed:
-                    # - full (terminalized >= requested) → complete + did_work
-                    # - zero work → complete no-op (stale sticky → enqueue wet)
-                    # - partial (0 < terminalized < requested) → INCOMPLETE
-                    #   (this is the High AFM-8 reopen the review caught)
-                    req = applied.get("requested")
-                    if isinstance(req, dict):
-                        requested = sum(
-                            int(req.get(k) or 0) for k in ("promote", "dedup", "review")
-                        )
-                    else:
-                        requested = sum(
-                            len(reapply_payload.get(k) or [])
-                            for k in (
-                                "promote_candidate_ids",
-                                "dedup_candidate_ids",
-                                "review_candidate_ids",
-                            )
-                        )
-                    if errors > 0:
-                        complete = False
-                    elif terminalized == 0:
-                        complete = True  # stale / already-resolved no-op
-                    elif requested > 0 and terminalized >= requested:
-                        complete = True
-                    else:
-                        complete = False  # partial terminalize
-            else:
-                # Handlers that omit applied: conservative discard (assume full).
-                complete = True
-                did_work = True
+            complete, did_work = _lifecycle_apply_complete(
+                applied, reapply_payload or {}
+            )
 
             if not complete:
                 # Partial / soft failure: keep sticky + hold, refuse wet batch.
