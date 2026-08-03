@@ -5,10 +5,12 @@ from __future__ import annotations
 import calendar
 import json
 import logging
+import os
 import queue
 import re
 import threading
 import time
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -40,6 +42,35 @@ STALE_INTERVAL_MULTIPLE = 2.0
 # Pending drafts nobody has endorsed. The loop keeps producing regardless, so
 # depth is the only thing that reveals a review queue that has stopped draining.
 DRAFTS_PENDING_BACKLOG = 200
+# How far ahead a freshly written draft's `expires_at` is stamped. Matches the
+# `draft_ttl_days` default derive_loop_status judges backlog age against.
+DRAFT_TTL_SECONDS = 14 * 86400
+
+# Frontmatter-anchored gates for the expiry sweep. Line-anchored so only a
+# page's own YAML keys can satisfy them, never body prose quoting the same text.
+_FM_DRAFT_STATUS = re.compile(r"^status:\s*['\"]?draft['\"]?\s*$", re.MULTILINE)
+_FM_AFM_AGENT = re.compile(r"^agent:\s*['\"]?afm-loop['\"]?\s*$", re.MULTILINE)
+_FM_PAGE_ID = re.compile(r"^page_id:\s*['\"]?([^'\"\s]+)", re.MULTILINE)
+
+
+def _expires_at_of(frontmatter: str) -> Optional[float]:
+    """The page's own ``expires_at`` as a UTC epoch, or None if unusable.
+
+    Tolerates the quotes yaml.safe_dump puts on the value
+    (`expires_at: '2026-06-22T…Z'`); the old unquoted-only pattern matched
+    nothing a writer had ever produced, which is why the live vault expired 0
+    of 1,213 drafts. Parsed with calendar.timegm via _parse_iso_utc, not
+    time.mktime, which reads a struct_time as LOCAL time and shifted every
+    comparison by the machine's UTC offset.
+    """
+    match = re.search(r"^expires_at:\s*['\"]?([0-9T:.Z-]+)", frontmatter, re.MULTILINE)
+    return _parse_iso_utc(match.group(1)) if match else None
+
+
+def _page_id_of(frontmatter: str) -> Optional[str]:
+    """The page's own ``page_id``, used to share endorse_draft's per-page lock."""
+    match = _FM_PAGE_ID.search(frontmatter)
+    return match.group(1) if match else None
 
 
 def record_pass_attempt(pass_name: str, now: Optional[float] = None) -> None:
@@ -64,11 +95,43 @@ def _extract_frontmatter(text: str) -> str:
     (they still get scanned) rather than silently treating them as having no
     ``created`` field; the parse-then-validate step in the caller is what
     actually rejects unusable values.
+
+    PERMISSIVE — read-only probes only. Anything that gates a rewrite or a
+    lifecycle decision must use _extract_frontmatter_block: the whole-text
+    fallback means an UNFENCED note whose body documents the AFM format
+    (quoting `status: draft`, `agent: afm-loop`, a past `expires_at`) reads
+    as a real draft, and expiry would destructively rewrite its prose.
     """
     if not text.startswith("---"):
         return text
     end = text.find("\n---", 3)
     return text if end == -1 else text[:end]
+
+
+def _extract_frontmatter_block(text: str) -> Optional[str]:
+    """The leading `---`-fenced YAML block, or None if there is no CLOSED one.
+
+    The strict twin of _extract_frontmatter, for every path that decides or
+    rewrites lifecycle state. No fence, or an unclosed fence, means the page
+    has no frontmatter — refuse, never scan the body. Real AFM drafts are
+    always written fenced by _write_one, so strictness costs nothing there.
+    """
+    if not text.startswith("---"):
+        return None
+    end = text.find("\n---", 3)
+    return None if end == -1 else text[:end]
+
+
+def _atomic_write_text(path: Path, data: str) -> None:
+    """Replace ``path`` with ``data`` atomically (same-directory temp + rename).
+
+    Path.write_text opens 'w' — truncate, then write — so a crash, a full
+    disk, or a concurrent reader mid-write leaves a torn page. The first live
+    expiry sweep rewrites ~900 pages in one pass; each must be all-or-nothing.
+    """
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(data, encoding="utf-8")
+    os.replace(tmp, path)
 
 
 def derive_loop_status(
@@ -266,10 +329,19 @@ def _frontmatter(draft: dict, created: str, expires_at: str, gate_status: str, i
     return "---\n" + header + "---\n\n"
 
 
-def _write_one(vault: Path, draft: dict, writeback: Any = None) -> dict:
+def _write_one(
+    vault: Path,
+    draft: dict,
+    writeback: Any = None,
+    now: Optional[float] = None,
+) -> dict:
     """Write one AFM draft (or refuse for forged). Return shape:
     - normal/quality-blocked: path/wikilink/status present, written implied by file
     - forged-frontmatter: path=None, wikilink=None, status="blocked", written=False (RCM-010 security)
+
+    ``now`` overrides the wall clock stamped into ``created``/``expires_at`` so
+    the writer and :func:`_expire_stale_drafts` can be round-tripped over a
+    real TTL boundary without patching the time module.
     """
     blockers = _quality_blockers(draft)
     forged = _contains_forged_frontmatter(draft.get("body", ""))
@@ -297,12 +369,13 @@ def _write_one(vault: Path, draft: dict, writeback: Any = None) -> dict:
             draft.get("title"), draft.get("page_id"),
         )
 
+    stamp = time.time() if now is None else now
+    created = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(stamp))
     section = draft.get("section") or f"{draft.get('kind', 'concept')}s"
-    rel = Path("wiki") / section / f"{_utc()[:10].replace('-', '')}-{_slugify(draft['title'])}-{draft['page_id'][-6:]}.md"
+    rel = Path("wiki") / section / f"{created[:10].replace('-', '')}-{_slugify(draft['title'])}-{draft['page_id'][-6:]}.md"
     path = vault / rel
     path.parent.mkdir(parents=True, exist_ok=True)
-    created = _utc()
-    expires_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 14 * 86400))
+    expires_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(stamp + DRAFT_TTL_SECONDS))
     with _page_lock(draft["page_id"]):
         # Title in markdown heading: minimal hygiene sanitize (newlines/# could mangle ATX; not a YAML key injection
         # vector — that is fully protected by safe_dump in _frontmatter per RCM-011). Out of RCM-010/011 YAML scope.
@@ -323,9 +396,11 @@ def _write_one(vault: Path, draft: dict, writeback: Any = None) -> dict:
                 body += f"- quality-blocked: {blocker}\n"
             for item in contradictions[:5]:
                 body += f"- contradiction-candidate: `{item}`\n"
-        # Only write if not forged (forged bodies are blocked but note is still produced in return)
+        # Only write if not forged (forged bodies are blocked but note is still produced in return).
+        # Same atomic path as expiry/endorse: vault-watch indexes concurrently, so a
+        # truncate-in-place crash mid-write must not leave a torn page for the next sweep.
         if not forged:
-            path.write_text(body, encoding="utf-8")
+            _atomic_write_text(path, body)
     # RCM-010: forged cases return null path/wikilink + written:false (callers see refusal shape; no fabricated draft loc)
     if forged:
         return {
@@ -352,32 +427,66 @@ def _write_one(vault: Path, draft: dict, writeback: Any = None) -> dict:
     }
 
 
-def _expire_stale_drafts(vault: Path) -> int:
-    # KNOWN DEFECT, deliberately not fixed here (audit R1 is health-truth only):
-    # the expires_at pattern below has the same unquoted-only bug that
-    # writer_status just had, and yaml.safe_dump quotes the value -- so on the
-    # live vault this expires nothing and 1,210 drafts sit months past their
-    # TTL. Fixing it rewrites vault files in bulk, which is a remediation
-    # change, not a reporting one. writer_status now REPORTS the backlog and
-    # its age, so the condition is visible while it waits its turn.
+def _expire_stale_drafts(vault: Path, now: Optional[float] = None) -> int:
     expired = 0
-    now = time.time()
+    now = time.time() if now is None else now
     for path in (vault / "wiki").glob("**/*.md"):
         try:
             text = path.read_text(encoding="utf-8")
         except Exception:
             continue
-        if "status: draft" not in text or "agent: afm-loop" not in text:
+        # EVERY decision below reads the frontmatter block only. Body prose is
+        # free-form and can contain any of these lines verbatim (a page quoting
+        # another page's frontmatter is the ordinary case); letting it satisfy
+        # the entry gate would drag non-AFM pages into the expiry path, and the
+        # rewrite below would then edit that prose instead of the real status.
+        # STRICT extractor: a page with no closed fence has no frontmatter at
+        # all — the permissive whole-text fallback would read an unfenced note
+        # that documents the AFM format as an expirable draft.
+        frontmatter = _extract_frontmatter_block(text)
+        if frontmatter is None:
             continue
-        match = re.search(r"expires_at:\s*([0-9T:Z-]+)", text)
-        if not match:
+        if not _FM_DRAFT_STATUS.search(frontmatter):
             continue
-        try:
-            expires = time.mktime(time.strptime(match.group(1), "%Y-%m-%dT%H:%M:%SZ"))
-        except ValueError:
+        if not _FM_AFM_AGENT.search(frontmatter):
+            continue
+        expires = _expires_at_of(frontmatter)
+        if expires is None:
             continue
         if expires < now:
-            path.write_text(text.replace("status: draft", "status: expired", 1), encoding="utf-8")
+            # Re-read and re-validate under the SAME lock endorse_draft takes.
+            # Everything above ran against a buffer read outside any lock, and
+            # this now runs on the vault-watch thread concurrently with RPC
+            # endorsement: without this, an operator accepting a past-TTL draft
+            # between the read and the write would have their endorsement
+            # overwritten with `status: expired` and silently lost.
+            page_id = _page_id_of(frontmatter)
+            with _page_lock(page_id) if page_id else nullcontext():
+                try:
+                    current = path.read_text(encoding="utf-8")
+                except Exception:
+                    continue
+                current_fm = _extract_frontmatter_block(current)
+                if current_fm is None:
+                    continue
+                if not _FM_DRAFT_STATUS.search(current_fm):
+                    # Endorsed (or already expired) while we were deciding.
+                    continue
+                if not _FM_AFM_AGENT.search(current_fm):
+                    continue
+                # Re-check the TTL too, not just the status. A concurrent
+                # writer may have re-stamped this page with a LATER expires_at
+                # while still leaving it a draft (a TTL extension or manual
+                # edit); expiring it on the strength of the value we read
+                # before taking the lock would silently undo that.
+                current_expires = _expires_at_of(current_fm)
+                if current_expires is None or current_expires >= now:
+                    continue
+                # Rewrite inside the frontmatter slice and splice it back, so
+                # the substitution can never land on body text that merely
+                # looks like frontmatter.
+                rewritten = _FM_DRAFT_STATUS.sub("status: expired", current_fm, count=1)
+                _atomic_write_text(path, rewritten + current[len(current_fm):])
             expired += 1
     return expired
 
@@ -483,13 +592,22 @@ def writer_status(
                 # A draft we cannot read is not a draft we know to be fine.
                 unreadable += 1
                 continue
-            if "status: draft" in text and "agent: afm-loop" in text:
+            # Gate on the frontmatter block only, with the SAME predicates AND
+            # the same strict extractor the expiry engine uses. The whole-file
+            # substring test counted a page whose body merely quotes another
+            # draft's frontmatter, and the permissive extractor would count an
+            # unfenced note expiry can never expire — either way the pending
+            # count reports a backlog the expiry engine will never drain.
+            frontmatter = _extract_frontmatter_block(text)
+            if frontmatter is None:
+                continue
+            if (_FM_DRAFT_STATUS.search(frontmatter)
+                    and _FM_AFM_AGENT.search(frontmatter)):
                 pending += 1
                 # Search only the frontmatter block (between the leading `---`
                 # fences), not the whole file: a draft's body is free-form prose
                 # and may itself contain the substring "created:", which must
                 # not be read as the draft's own creation date.
-                frontmatter = _extract_frontmatter(text)
                 # The value is yaml.safe_dump'd, so it arrives quoted:
                 # `created: '2026-06-20T00:07:39Z'`. The unquoted-only pattern
                 # matched nothing, which is why drafts_pending_oldest was null
@@ -533,7 +651,14 @@ def endorse_draft(vault_path: str, page_id: str, decision: str) -> dict:
             text = path.read_text(encoding="utf-8")
         except Exception:
             continue
-        if f"page_id: {page_id}" in text:
+        # Resolve by the page's OWN frontmatter page_id, never a whole-file
+        # substring: a draft whose body quotes another page's frontmatter
+        # would be discovered first, endorsed in the target's place, and the
+        # audit would claim the requested id. Same body-quotation class as
+        # the status gate above, one field over. Strict extractor: an
+        # unfenced page has no frontmatter and therefore no page_id.
+        fm = _extract_frontmatter_block(text)
+        if fm is not None and _page_id_of(fm) == page_id:
             target = path
             break
     if target is None:
@@ -541,9 +666,23 @@ def endorse_draft(vault_path: str, page_id: str, decision: str) -> dict:
     status = {"accept": "accepted", "reject": "rejected", "edit": "edit_requested"}[decision]
     with _page_lock(page_id):
         text = target.read_text(encoding="utf-8")
-        if "status: draft" not in text:
+        # Decide from the frontmatter block only, and rewrite inside it — the
+        # same contract as _expire_stale_drafts, which shares this lock. The
+        # whole-file test accepted a page whose FM was already expired (or
+        # endorsed) as long as its body quoted "status: draft" somewhere, and
+        # then rewrote that body prose while reporting success.
+        frontmatter = _extract_frontmatter_block(text)
+        # Re-validate the identity under the lock too: the discovery read ran
+        # unlocked, and the per-page lock is keyed by the REQUESTED id — if
+        # the file's own id no longer matches (or its fences vanished), this
+        # write would not even be serialized against the page it is about to
+        # modify.
+        if frontmatter is None or _page_id_of(frontmatter) != page_id:
+            raise FileNotFoundError(f"draft page_id not found: {page_id}")
+        if not _FM_DRAFT_STATUS.search(frontmatter):
             raise ValueError(f"page is not an active draft: {page_id}")
-        target.write_text(text.replace("status: draft", f"status: {status}", 1), encoding="utf-8")
+        rewritten = _FM_DRAFT_STATUS.sub(f"status: {status}", frontmatter, count=1)
+        _atomic_write_text(target, rewritten + text[len(frontmatter):])
     rel = target.relative_to(vault)
     result = {"status": status, "page_id": page_id, "path": str(rel), "decision": decision}
     _append_audit(vault, "afm_endorse", f"{decision}: {page_id}", result)

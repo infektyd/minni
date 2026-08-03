@@ -216,8 +216,8 @@ def test_negative_feedback_demotes_matching_agent_query_and_doc(monkeypatch, tmp
             "privacy_level": "safe",
         },
     ]
-    monkeypatch.setattr(engine, "_fts_search", lambda query, limit: list(fts_hits))
-    monkeypatch.setattr(engine, "_semantic_search", lambda query, limit: [])
+    monkeypatch.setattr(engine, "_fts_search", lambda query, limit, **_kw: list(fts_hits))
+    monkeypatch.setattr(engine, "_semantic_search", lambda query, limit, **_kw: [])
 
     results = engine.retrieve(
         "auth migration",
@@ -244,7 +244,7 @@ def test_feedback_toggle_disables_demotion(monkeypatch, tmp_path):
             ("unused", "auth migration", doc1, "main", int(time.time())),
         )
 
-    monkeypatch.setattr(engine, "_fts_search", lambda query, limit: [
+    monkeypatch.setattr(engine, "_fts_search", lambda query, limit, **_kw: [
         {
             "doc_id": doc1,
             "path": "/wiki/first.md",
@@ -266,7 +266,7 @@ def test_feedback_toggle_disables_demotion(monkeypatch, tmp_path):
             "privacy_level": "safe",
         },
     ])
-    monkeypatch.setattr(engine, "_semantic_search", lambda query, limit: [])
+    monkeypatch.setattr(engine, "_semantic_search", lambda query, limit, **_kw: [])
 
     results = engine.retrieve(
         "auth migration",
@@ -296,7 +296,7 @@ def test_daemon_trace_round_trip(monkeypatch, tmp_path):
 
     engine, db_obj, _ = _make_engine(tmp_path)
     doc_id, _ = _seed_doc(db_obj, "/wiki/auth.md", "main", "auth migration")
-    monkeypatch.setattr(engine, "_fts_search", lambda query, limit: [
+    monkeypatch.setattr(engine, "_fts_search", lambda query, limit, **_kw: [
         {
             "doc_id": doc_id,
             "path": "/wiki/auth.md",
@@ -308,7 +308,7 @@ def test_daemon_trace_round_trip(monkeypatch, tmp_path):
             "privacy_level": "safe",
         }
     ])
-    monkeypatch.setattr(engine, "_semantic_search", lambda query, limit: [])
+    monkeypatch.setattr(engine, "_semantic_search", lambda query, limit, **_kw: [])
     monkeypatch.setattr(minnid, "_retrieval", engine)
 
     search_response = minnid._dispatch_sync({

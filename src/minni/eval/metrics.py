@@ -13,6 +13,7 @@ logger = logging.getLogger("sovereign.eval")
 KNOWN_RETRIEVE_KWARGS = {
     "limit", "agent_id", "update_access", "budget_tokens",
     "depth", "include_superseded", "include_rejected", "include_drafts",
+    "include_expired",
     "expand", "use_hyde",
 }
 

@@ -145,7 +145,7 @@ def test_retrieve_expands_variants_and_merges_by_rrf(monkeypatch, tmp_path):
 
     calls = []
 
-    def fake_fts(query, limit):
+    def fake_fts(query, limit, **_kwargs):
         calls.append(query)
         if "Apple Foundation Models" in query:
             return [{

@@ -156,7 +156,7 @@ draft → candidate → accepted
 | `accepted` | Included | Page has been endorsed. Authoritative. |
 | `superseded` | Excluded by default | Page has been replaced by a newer page (linked via `superseded_by`). |
 | `rejected` | Excluded | Page has been flagged as incorrect, harmful, or retracted. |
-| `expired` | Excluded | Page has passed its `expires` timestamp. |
+| `expired` | Excluded (opt-in with `include_expired=true`) | Page has passed its `expires` timestamp. Terminal; the opt-in exists for tombstone/audit recall and does not ride on `include_drafts`. |
 
 ### Transition rules
 

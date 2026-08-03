@@ -1032,11 +1032,122 @@ def _vault_watch_interval() -> int:
     return max(60, raw)
 
 
+def _expire_shared_vault_drafts() -> int:
+    """Expire drafts past their TTL in the shared vault. Returns the count.
+
+    Expiry otherwise runs ONLY inside afm_writer._write_batch, and the AFM loop
+    submits a batch only when a pass actually produced drafts — so a loop that
+    is healthy but quiet never expires anything, and a backlog can sit past TTL
+    indefinitely. Driving it from the sweep makes expiry depend on the clock
+    rather than on new work arriving.
+    """
+    from minni.afm_writer import _expire_stale_drafts
+
+    return _expire_stale_drafts(Path(DEFAULT_CONFIG.vault_path).expanduser())
+
+
+def _invalidate_shared_faiss() -> None:
+    """Make chunks the sweep just wrote visible to the live engine's semantic leg.
+
+    index_shared_vault writes through its OWN short-lived SovereignDB and
+    VaultIndexer, so its FAISS rebuild lands on a throwaway instance. The
+    daemon's process-wide RetrievalEngine keeps the in-memory index it built at
+    startup, and _ensure_faiss_loaded returns early while count > 0 — so new
+    chunks stayed invisible to semantic recall until restart even though FTS
+    could see them. Invalidating forces the next search to rebuild from the DB.
+
+    Deliberately does NOT call _lazy_retrieval(): if the engine has not been
+    constructed yet there is nothing stale to fix, and constructing one here
+    would drag model loading onto the sweep thread.
+    """
+    if _retrieval is None:
+        return
+    try:
+        _retrieval.faiss_index.invalidate()
+        logger.info("Vault watch: invalidated live FAISS; next search rebuilds from DB")
+    except Exception:
+        logger.exception("Vault watch: FAISS invalidation failed")
+
+
 def _vault_watch_sweep_once() -> dict:
     """Blocking incremental ingest of every discovered vault. Runs off-loop."""
-    from minni.index_all import index_agent_vaults
+    from minni.index_all import index_agent_vaults, index_shared_vault
 
-    return index_agent_vaults(DEFAULT_CONFIG, dry_run=False, verbose=False)
+    # Isolated like the shared-vault steps below: a sticky agent-vault fault
+    # (corrupt sidecar DB, bad path) must not keep the shared vault dark on
+    # every tick — going dark on daemon schedule is the defect this whole
+    # slice exists to fix.
+    stats: dict = {}
+    try:
+        stats = index_agent_vaults(DEFAULT_CONFIG, dry_run=False, verbose=False)
+    except Exception:
+        logger.exception("Vault watch: agent-vault sweep failed")
+    # The shared vault is the AFM loop's own output directory and is NOT one of
+    # the per-agent vaults (see discover_agent_vaults), so without this it was
+    # indexed by nothing on a running daemon. Isolated: a failure here must not
+    # cost the agent-vault results already in hand.
+    #
+    # Expire BEFORE indexing so a page that crosses its TTL this tick is indexed
+    # with the status it now has, instead of going in as a draft and waiting a
+    # whole interval to be corrected.
+    try:
+        expired = _expire_shared_vault_drafts()
+        if expired:
+            logger.info("Vault watch: expired %s draft(s) past TTL", expired)
+    except Exception:
+        logger.exception("Vault watch: draft expiry failed")
+    try:
+        shared = index_shared_vault(DEFAULT_CONFIG)
+        stats.update(shared)
+        for s in shared.values():
+            if not isinstance(s, dict):
+                continue
+            # chunks_purged counts as a change: _enforce_embed_policy DELETEs
+            # chunk rows on the mtime-skip path, where indexed and pruned are
+            # both 0. Without it here, a purge-only sweep leaves the live FAISS
+            # index serving chunk_ids whose rows are gone — the join finds
+            # nothing and those ghosts punch holes in the fixed candidate
+            # window until the process restarts.
+            if (s.get("indexed") or 0) or (s.get("pruned") or 0) or (s.get("chunks_purged") or 0):
+                logger.info(
+                    "Vault watch: shared vault changed (indexed=%s pruned=%s "
+                    "chunks_purged=%s)",
+                    s.get("indexed") or 0, s.get("pruned") or 0,
+                    s.get("chunks_purged") or 0,
+                )
+                _invalidate_shared_faiss()
+                break
+    except Exception:
+        logger.exception("Vault watch: shared vault sweep failed")
+    return stats
+
+
+def _report_sweep(stats: dict) -> bool:
+    """Log per-vault sweep activity; True if any vault actually changed.
+
+    Only speak when something actually changed; an idle sweep is noise.
+    """
+    changed = False
+    for vault, s in (stats or {}).items():
+        if not isinstance(s, dict):
+            continue
+        indexed = s.get("indexed") or 0
+        pruned = s.get("pruned") or 0
+        errors = s.get("errors") or 0
+        # chunks_purged counts as a change here for the same reason it does in
+        # the FAISS invalidation gate: a purge-only sweep is real work, and
+        # treating it as idle makes it invisible in the logs while the index
+        # it invalidated quietly rebuilds.
+        chunks_purged = s.get("chunks_purged") or 0
+        if indexed or pruned or chunks_purged:
+            changed = True
+        if indexed or pruned or chunks_purged or errors:
+            logger.info(
+                "Vault watch: %s indexed=%s pruned=%s chunks_purged=%s "
+                "errors=%s",
+                vault, indexed, pruned, chunks_purged, errors,
+            )
+    return changed
 
 
 async def _vault_watch_runner():
@@ -1049,22 +1160,7 @@ async def _vault_watch_runner():
     while True:
         try:
             stats = await asyncio.to_thread(_vault_watch_sweep_once)
-            # Only speak when something actually changed; an idle sweep is noise.
-            changed = False
-            for vault, s in (stats or {}).items():
-                if not isinstance(s, dict):
-                    continue
-                indexed = s.get("indexed") or 0
-                pruned = s.get("pruned") or 0
-                errors = s.get("errors") or 0
-                if indexed or pruned:
-                    changed = True
-                if indexed or pruned or errors:
-                    logger.info(
-                        "Vault watch: %s indexed=%s pruned=%s errors=%s",
-                        vault, indexed, pruned, errors,
-                    )
-            if changed:
+            if _report_sweep(stats):
                 # Indexing the file on disk is not enough. _agent_vault_retrieval
                 # memoizes a RetrievalEngine per vault, so a live daemon keeps
                 # answering from the engine it built at startup and newly indexed

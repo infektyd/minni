@@ -76,6 +76,45 @@ _FTS_RETRY_ATTEMPTS = 3
 _FTS_RETRY_BACKOFFS = (0.05, 0.1, 0.2)
 _FTS_TRANSIENT_MARKERS = ("vtable constructor failed", "schema has changed")
 
+# Prefer a real embedded chunk over the raw vault_fts row. Unendorsed pages are
+# deliberately unembedded, so FTS is their only body path — but vault_fts stores
+# the whole markdown file (YAML first). Using that full file as chunk_text makes
+# the FTS-only path (encoder down / dual-hit absent) burn the context budget on
+# multi-KB pages and fills the default snippet with frontmatter soup.
+_FTS_CHUNK_TEXT_EXPR = """COALESCE(
+  (SELECT ce.chunk_text FROM chunk_embeddings ce
+   WHERE ce.doc_id = d.doc_id
+   ORDER BY ce.chunk_index LIMIT 1),
+  f.content
+)"""
+
+
+def _strip_leading_frontmatter(text: str) -> str:
+    """Drop a leading closed ``---`` YAML block from FTS/chunk body text.
+
+    ``vault_fts`` stores the whole markdown file (YAML first). The first
+    ``chunk_embeddings`` row often still opens with the same fence because the
+    chunker folds the document top-down and joins lines with spaces. Snippet
+    depth and the token budget must see body prose, not the FM header.
+
+    Handles both the on-disk form (``---\\nkey: val\\n---\\n\\nbody``) and the
+    chunker-collapsed form (``--- key: val --- body``).
+    """
+    if not text or not text.startswith("---"):
+        return text
+    # On-disk / FTS full-file: closing fence on its own line.
+    end = text.find("\n---", 3)
+    if end != -1:
+        rest = text[end + 4 :]  # past the closing fence line
+        if rest.startswith("\n"):
+            rest = rest[1:]
+        return rest
+    # Chunker-collapsed: second ``---`` closes the header, body follows.
+    collapsed = re.match(r"^---\s+.+?\s+---\s*", text, flags=re.DOTALL)
+    if collapsed:
+        return text[collapsed.end() :]
+    return text
+
 
 def _fts_execute_with_retry(cursor, sql, params, *, attempts: int = _FTS_RETRY_ATTEMPTS):
     """Execute a vault_fts MATCH select on ``cursor`` AND fetch its rows, with
@@ -333,6 +372,11 @@ class RetrievalEngine:
         # handler pair runs on a single thread, so each request sees only its own
         # suppression regardless of what concurrent requests do on other threads.
         self._auth_suppression_local = threading.local()
+        # Serializes _ensure_faiss_loaded. invalidate() turned "rare cold
+        # start" into "every worker after every vault change", and the ensure
+        # path is a multi-step read-build-save that must not run twice
+        # concurrently against moving DB state.
+        self._faiss_load_lock = threading.Lock()
         # recall-F3: the correction-class type set is config-invariant — compute
         # it once here instead of once per scored doc in _score_merged_doc.
         self._correction_types = _correction_class_page_types(config)
@@ -478,8 +522,18 @@ class RetrievalEngine:
         query: str,
         limit: int,
         agent_filter: Optional[Sequence[str]] = None,
+        exclude_statuses: Optional[Sequence[str]] = None,
     ) -> List[Dict]:
-        """FTS5 search using BM25 ranking."""
+        """FTS5 search using BM25 ranking.
+
+        ``exclude_statuses`` filters in SQL rather than after the fact. The
+        LIMIT below is a fixed window, so a lifecycle state the caller is going
+        to discard anyway must not be allowed to occupy it — a post-filter
+        cannot recover rows that were never fetched. This matters most on a
+        vault dominated by unendorsed drafts, where an unfiltered window fills
+        with pages nobody asked for and the accepted answer never enters the
+        merge.
+        """
         results = []
         safe_query = self._sanitize_fts_query(query)
         if not safe_query:
@@ -492,15 +546,29 @@ class RetrievalEngine:
             if agent_scope:
                 agent_clause = f" AND d.agent IN ({','.join('?' * len(agent_scope))})"
                 scope_params.extend(agent_scope)
+            skip = [str(s) for s in (exclude_statuses or [])]
+            if skip:
+                agent_clause += (
+                    " AND COALESCE(d.page_status, 'candidate') NOT IN "
+                    f"({','.join('?' * len(skip))})"
+                )
+                scope_params.extend(skip)
 
             def _match(match_expr: str):
                 # Fetch happens inside the retry helper (review r3): the
                 # vtable race can also fire while stepping the SELECT.
+                # Prefer the first embedded chunk when the doc has one; fall
+                # back to vault_fts content for deliberately unembedded rows
+                # (draft/expired). The hollow-hit fix used f.content alone,
+                # which made FTS-only (encoder down) attach multi-KB YAML-led
+                # files as chunk_text and exhaust the default budget after a
+                # couple of hits. Body-only post-strip is applied below.
                 return _fts_execute_with_retry(c, f"""
                     SELECT f.doc_id, d.path, d.agent, d.sigil,
                            rank AS bm25_rank, d.decay_score,
                            d.page_status, d.privacy_level, d.page_type,
-                           d.evidence_refs, d.indexed_at, d.layer
+                           d.evidence_refs, d.indexed_at, d.layer,
+                           {_FTS_CHUNK_TEXT_EXPR} AS chunk_text
                     FROM vault_fts f
                     JOIN documents d ON d.doc_id = f.doc_id
                     WHERE vault_fts MATCH ?
@@ -538,6 +606,7 @@ class RetrievalEngine:
                     "evidence_refs": row["evidence_refs"],
                     "indexed_at": row["indexed_at"],
                     "layer": row["layer"] or "knowledge",
+                    "chunk_text": _strip_leading_frontmatter(row["chunk_text"] or ""),
                 })
 
         return results
@@ -679,40 +748,88 @@ class RetrievalEngine:
         PR-2: Attempt disk cache first (cold-start <500ms).
         On miss, rebuild from DB then save to disk.
         """
-        if self.faiss_index.count > 0:
+        # "Warm" is READINESS — a validated, generation-current build — never
+        # bare count>0. A count-based gate is what let every partially
+        # published state become permanent: whatever raced its way to a
+        # non-zero count was suddenly the index of record.
+        if self.faiss_index.ready:
             return
 
-        # PR-2: Try disk cache first
-        try:
-            conn = self.db._get_conn()
-            if self.faiss_index.try_load_from_disk(db_conn=conn):
+        # One worker rebuilds; the rest wait here and find it warm. Without
+        # this, every RPC worker that arrives after an invalidate runs its own
+        # full-table SELECT + build, from potentially different DB snapshots.
+        with self._faiss_load_lock:
+            if self.faiss_index.ready:
                 return
-        except Exception as e:
-            logger.debug("Disk cache load failed (non-fatal): %s", e)
 
-        # Rebuild from DB
-        chunk_ids = []
-        embeddings = []
-
-        with self.db.cursor() as c:
-            c.execute("SELECT chunk_id, embedding FROM chunk_embeddings")
-            for row in c.fetchall():
-                vec = np.frombuffer(row["embedding"], dtype=np.float32)
-                if vec.shape[0] == self.config.embedding_dim:
-                    chunk_ids.append(row["chunk_id"])
-                    embeddings.append(vec)
-
-        if chunk_ids:
-            all_vecs = np.array(embeddings, dtype=np.float32)
-            self.faiss_index.build_from_vectors(chunk_ids, all_vecs)
-            logger.info("FAISS index loaded from DB: %d vectors", len(chunk_ids))
-
-            # PR-2: Save to disk for next cold start
+            # PR-2: Try disk cache first. try_load_from_disk re-checks the
+            # checksum and generation under the FAISS lock immediately before
+            # applying, so a vault-watch invalidate during the disk read
+            # makes this a miss, not a stale warm restore.
             try:
                 conn = self.db._get_conn()
-                self.faiss_index.save_to_disk(db_conn=conn)
+                if self.faiss_index.try_load_from_disk(db_conn=conn):
+                    return
             except Exception as e:
-                logger.debug("FAISS disk save failed (non-fatal): %s", e)
+                logger.debug("Disk cache load failed (non-fatal): %s", e)
+
+            # Rebuild from DB, into a STAGED structure. The live index stays
+            # cold while the build is unvalidated — a concurrent search sees
+            # count==0 and degrades to lexical, never a partial semantic set.
+            # The staged build is committed only if (a) the checksum is the
+            # same one the SELECT ran under and (b) no invalidate() advanced
+            # the generation since. Retry bounded; if the DB will not sit
+            # still, leave the index COLD — cold is honest and self-heals on
+            # the next search, warm-partial does not.
+            from minni.faiss_persist import compute_db_checksum
+            conn = self.db._get_conn()
+
+            for _ in range(3):
+                generation = self.faiss_index.generation
+                checksum_before = compute_db_checksum(conn)
+
+                chunk_ids = []
+                embeddings = []
+                with self.db.cursor() as c:
+                    c.execute("SELECT chunk_id, embedding FROM chunk_embeddings")
+                    for row in c.fetchall():
+                        vec = np.frombuffer(row["embedding"], dtype=np.float32)
+                        if vec.shape[0] == self.config.embedding_dim:
+                            chunk_ids.append(row["chunk_id"])
+                            embeddings.append(vec)
+
+                if not chunk_ids:
+                    # Nothing to serve; make sure no earlier state lingers.
+                    self.faiss_index.invalidate()
+                    return
+
+                all_vecs = np.array(embeddings, dtype=np.float32)
+                staged = self.faiss_index.stage_build(chunk_ids, all_vecs)
+
+                if compute_db_checksum(conn) != checksum_before:
+                    logger.debug("DB changed during FAISS rebuild; retrying")
+                    continue
+
+                if not self.faiss_index.commit_staged(staged, generation):
+                    logger.debug("FAISS invalidated during rebuild; retrying")
+                    continue
+
+                logger.info("FAISS index loaded from DB: %d vectors", len(chunk_ids))
+                # PR-2: Save to disk for next cold start, pinned to the
+                # checksum of the exact snapshot the vectors came from.
+                try:
+                    self.faiss_index.save_to_disk(
+                        db_conn=conn, db_checksum=checksum_before
+                    )
+                except Exception as e:
+                    logger.debug("FAISS disk save failed (non-fatal): %s", e)
+                return
+
+            logger.warning(
+                "FAISS rebuild could not get a stable DB snapshot; leaving the "
+                "index cold for the next search"
+            )
+            self.faiss_index.invalidate()
 
     # ── Store-time semantic indexing (durable recall) ─────────
 
@@ -989,9 +1106,10 @@ class RetrievalEngine:
         if not chunk_ids:
             return
         try:
-            if self.faiss_index.count > 0:
-                for cid in chunk_ids:
-                    self.faiss_index.remove(cid)
+            # Warm check and all removals happen atomically inside the FAISS
+            # lock — an unlocked count>0 snapshot followed by per-id calls can
+            # interleave with the vault-watch thread's invalidate().
+            self.faiss_index.remove_batch(chunk_ids)
         except Exception as exc:
             logger.debug("durable-index: live FAISS remove skipped: %s", exc)
 
@@ -1009,26 +1127,32 @@ class RetrievalEngine:
         if not chunk_ids:
             return
         try:
-            if self.faiss_index.count > 0:
-                for cid, vec in zip(chunk_ids, vectors):
-                    self.faiss_index.add(cid, vec)
+            # add_batch re-checks warm/invalidated under the FAISS lock and
+            # holds it for the whole batch. The previous shape — an unlocked
+            # count>0 snapshot, then one lock acquisition per add — let the
+            # vault-watch thread's invalidate() land between two adds, leaving
+            # a residual index of only the new chunks that count>0 gates then
+            # treated as warm: a semantic blackout until restart.
+            if not self.faiss_index.add_batch(chunk_ids, vectors):
+                # Cold or invalidated. Usually fine — the rows are in the DB
+                # and the next ensure-load rebuilds. But an ensure that was
+                # mid-SELECT when these rows committed builds WITHOUT them and
+                # lands warm, and count>0 then gates every later rebuild. The
+                # retry behind the load lock waits that ensure out: either the
+                # index is now warm (add lands; idempotent if the rebuild
+                # already picked the rows up) or it is still cold and the next
+                # ensure sees the rows in the DB.
+                with self._faiss_load_lock:
+                    self.faiss_index.add_batch(chunk_ids, vectors)
         except Exception as exc:
             logger.warning(
                 "durable-index: live FAISS refresh failed (%s) — invalidating "
                 "so next search reloads from DB", exc,
             )
             # Force a cold reload on the next search so the new DB rows are
-            # picked up even if the in-place add path failed. Clearing the
-            # in-memory state drops count to 0, which makes the next search's
-            # _ensure_faiss_loaded rebuild the full set from chunk_embeddings
-            # (now including these rows).
+            # picked up even if the in-place add path failed.
             try:
-                fi = self.faiss_index
-                fi._chunk_ids = []
-                fi._vectors = []
-                fi._id_map = {}
-                fi._reverse_map = {}
-                fi._index = None
+                self.faiss_index.invalidate()
             except Exception:
                 pass
 
@@ -1376,8 +1500,10 @@ class RetrievalEngine:
             doc_scores[did]["rrf_score"] += self.config.semantic_weight / (k + rank)
             if doc_scores[did]["sem_rank"] is None:
                 doc_scores[did]["sem_rank"] = rank
-            # Carry forward chunk_text from semantic results (FTS doesn't have it)
-            if r.get("chunk_text") and not doc_scores[did].get("chunk_text"):
+            # Prefer the semantic chunk over FTS full-page content: FTS now
+            # carries the whole file (frontmatter first) as a fallback body,
+            # which must not shadow the matching passage on dual hits.
+            if r.get("chunk_text"):
                 doc_scores[did]["chunk_text"] = r["chunk_text"]
                 doc_scores[did]["heading_context"] = r.get("heading_context", "")
             # Carry forward page metadata from semantic if FTS didn't provide it
@@ -1558,9 +1684,14 @@ class RetrievalEngine:
                 ORDER BY chunk_id
             """, (doc_id,))
             rows = c.fetchall()
-        if not rows:
-            return None
-        return "\n".join(row["chunk_text"] for row in rows)
+            if rows:
+                return "\n".join(row["chunk_text"] for row in rows)
+            # No chunks is the NORMAL state for an unendorsed page (see
+            # indexer.UNEMBEDDED_STATUSES), not a missing document. Fall back to
+            # the FTS copy so document depth returns the page instead of None.
+            c.execute("SELECT content FROM vault_fts WHERE doc_id = ?", (doc_id,))
+            fts_row = c.fetchone()
+        return fts_row["content"] if fts_row and fts_row["content"] else None
 
     # ── Public API ─────────────────────────────────────────────
 
@@ -1783,9 +1914,14 @@ class RetrievalEngine:
                     doc_scores[did]["fts_rank"] = rank
                 elif stream_label == "sem" and doc_scores[did]["sem_rank"] is None:
                     doc_scores[did]["sem_rank"] = rank
-                if r.get("chunk_text") and not doc_scores[did].get("chunk_text"):
+                # Semantic streams overwrite FTS full-page content (the FTS
+                # body is only a fallback for unembedded rows); the first
+                # semantic stream to land keeps its chunk.
+                if r.get("chunk_text") and not doc_scores[did].get("_sem_chunk"):
                     doc_scores[did]["chunk_text"] = r["chunk_text"]
                     doc_scores[did]["heading_context"] = r.get("heading_context", "")
+                    if stream_label != "fts":
+                        doc_scores[did]["_sem_chunk"] = True
                 if not doc_scores[did].get("page_type") and r.get("page_type"):
                     doc_scores[did]["page_type"] = r["page_type"]
                 if not doc_scores[did].get("evidence_refs") and r.get("evidence_refs"):
@@ -1801,6 +1937,7 @@ class RetrievalEngine:
             _add_stream(extra, self.config.semantic_weight, "extra")
 
         for d in doc_scores.values():
+            d.pop("_sem_chunk", None)
             self._score_merged_doc(d)
 
         ranked = sorted(doc_scores.values(), key=lambda x: x["final_score"], reverse=True)
@@ -1889,6 +2026,7 @@ class RetrievalEngine:
         layers: Optional[Sequence[str]],
         start_date: Optional[str],
         end_date: Optional[str],
+        exclude_statuses: Optional[Sequence[str]] = None,
     ) -> List[Dict]:
         safe_query = self._sanitize_fts_query(query)
         if not safe_query:
@@ -1908,13 +2046,35 @@ class RetrievalEngine:
         if end_ts is not None:
             clauses.append("COALESCE(d.indexed_at, d.last_modified, ce.computed_at, 0) <= ?")
             filter_params.append(end_ts)
+        # Same rule as _fts_search, for the same reason: the LIMIT below is a
+        # fixed window, and dropping a lifecycle state after it has been spent
+        # cannot recover the rows that never got fetched. This path needs it
+        # MORE than the others -- it orders by age ascending over a vault whose
+        # oldest pages are precisely the expired backlog, so an unfiltered
+        # window is drafts almost by construction.
+        skip = [str(s) for s in (exclude_statuses or [])]
+        if skip:
+            clauses.append(
+                "COALESCE(d.page_status, 'candidate') NOT IN "
+                f"({','.join('?' * len(skip))})"
+            )
+            filter_params.extend(skip)
 
         with self.db.cursor() as c:
             def _match(match_expr: str):
                 # Fetch happens inside the retry helper (review r3): the
                 # vtable race can also fire while stepping the SELECT.
+                # LEFT JOIN, not JOIN: unendorsed pages are deliberately not
+                # embedded (see indexer.UNEMBEDDED_STATUSES), and an inner join
+                # made them unreachable by chronological recall even when the
+                # caller passed include_drafts=True. The lifecycle filter, not
+                # the presence of a vector, decides what comes back. Prefer a
+                # real chunk (first by chunk_index); unembedded pages fall back
+                # to the FTS row's content, body-only after the strip below.
                 return _fts_execute_with_retry(c, f"""
-                    SELECT ce.chunk_id, ce.doc_id, ce.chunk_text, ce.heading_context,
+                    SELECT ce.chunk_id, d.doc_id,
+                           {_FTS_CHUNK_TEXT_EXPR} AS chunk_text,
+                           ce.heading_context,
                            d.path, d.agent, d.sigil, d.decay_score,
                            d.page_status, d.privacy_level, d.page_type,
                            d.evidence_refs, d.indexed_at,
@@ -1922,7 +2082,7 @@ class RetrievalEngine:
                            COALESCE(d.indexed_at, d.last_modified, ce.computed_at, 0) AS created_at
                     FROM vault_fts f
                     JOIN documents d ON d.doc_id = f.doc_id
-                    JOIN chunk_embeddings ce ON ce.doc_id = d.doc_id
+                    LEFT JOIN chunk_embeddings ce ON ce.doc_id = d.doc_id
                     WHERE {" AND ".join(clauses)}
                     ORDER BY created_at ASC, ce.chunk_id ASC
                     LIMIT ?
@@ -1951,7 +2111,7 @@ class RetrievalEngine:
                 "rrf_score": None,
                 "fts_rank": None,
                 "sem_rank": None,
-                "chunk_text": row["chunk_text"],
+                "chunk_text": _strip_leading_frontmatter(row["chunk_text"] or ""),
                 "heading_context": row["heading_context"] or "",
                 "decay_score": row["decay_score"] or 1.0,
                 "page_status": row["page_status"] or "candidate",
@@ -2167,6 +2327,7 @@ class RetrievalEngine:
         include_superseded: bool = False,
         include_rejected: bool = False,
         include_drafts: bool = False,
+        include_expired: bool = False,
         backend=None,
         layers: Optional[Sequence[str]] = None,
         sort: Literal["semantic", "chronological"] = "semantic",
@@ -2246,6 +2407,7 @@ class RetrievalEngine:
                     include_superseded=include_superseded,
                     include_rejected=include_rejected,
                     include_drafts=include_drafts,
+                    include_expired=include_expired,
                     backend=backend,
                     layers=layers,
                     sort=sort,
@@ -2361,11 +2523,45 @@ class RetrievalEngine:
             logger.warning("Unknown sort=%r, falling back to 'semantic'", sort)
             sort = "semantic"
 
+        # Lifecycle exclusions are decided HERE, before any candidate window is
+        # filled, and reused by every leg below. They used to be computed only
+        # after merge + rerank + truncate, which meant states the caller had
+        # already opted out of could occupy the FTS LIMIT, survive into the RRF
+        # pool, consume final slots, and only then be dropped — returning fewer
+        # than `limit` usable results. The late filter is still applied as
+        # defense in depth (and for privacy), but it is no longer the only gate.
+        skip_statuses = set()
+        if not include_superseded:
+            skip_statuses.add("superseded")
+        if not include_rejected:
+            skip_statuses.add("rejected")
+        if not include_drafts:
+            skip_statuses.add("draft")
+        # expired is terminal (same bucket as rejected in _recommended_action)
+        # and gets its own flag: piggy-backing on include_drafts meant that
+        # once expiry actually ran, a draft-review call drowned in the months-
+        # old expired backlog — chronological order is ascending by age, so
+        # the backlog fills the window before any active draft.
+        if not include_expired:
+            skip_statuses.add("expired")
+        skip_list = sorted(skip_statuses)
+
+        def _drop_skipped(rows: List[Dict]) -> List[Dict]:
+            if not skip_statuses:
+                return rows
+            return [
+                r for r in rows
+                if (r.get("page_status") or "candidate") not in skip_statuses
+            ]
+
         rerank_k = self.config.reranker_top_k if self.config.reranker_enabled else limit
 
         if sort == "chronological":
             chrono_t0 = time.perf_counter()
-            merged = self._chronological_search(query, rerank_k, layers, start_date, end_date)
+            merged = self._chronological_search(
+                query, rerank_k, layers, start_date, end_date,
+                exclude_statuses=skip_list,
+            )
             timing["semantic_ms"] = round((time.perf_counter() - chrono_t0) * 1000, 3)
             trace["backends"] = ["chronological-sql"]
             merged = merged[:limit]
@@ -2373,10 +2569,13 @@ class RetrievalEngine:
             # Step 1-2: Dual retrieval
             fts_t0 = time.perf_counter()
             if document_agent_filter is None:
-                fts_results = self._fts_search(query, rerank_k)
+                fts_results = self._fts_search(
+                    query, rerank_k, exclude_statuses=skip_list
+                )
             else:
                 fts_results = self._fts_search(
-                    query, rerank_k, agent_filter=document_agent_filter
+                    query, rerank_k, agent_filter=document_agent_filter,
+                    exclude_statuses=skip_list,
                 )
             timing["fts_ms"] = round((time.perf_counter() - fts_t0) * 1000, 3)
             trace["fts_hits"] = [
@@ -2440,6 +2639,13 @@ class RetrievalEngine:
                 }
                 for idx, r in enumerate(semantic_results, start=1)
             ]
+
+            # Drop excluded lifecycle states on BOTH legs before they can win
+            # slots in the fusion pool. FTS is already filtered in SQL; the
+            # vector legs are filtered here, since a chunk embedded before its
+            # page changed status can still be returned by FAISS.
+            semantic_results = _drop_skipped(semantic_results)
+            extra_backend_results = [_drop_skipped(rows) for rows in extra_backend_results]
 
             # Step 3: RRF merge — with extra streams if multi-backend
             if extra_backend_results:
@@ -2520,15 +2726,19 @@ class RetrievalEngine:
                         if hypothetical:
                             trace["hyde"]["hypothetical_chars"] = len(hypothetical)
                             if document_agent_filter is None:
-                                hyde_fts = self._fts_search(hypothetical, rerank_k)
+                                hyde_fts = self._fts_search(
+                                    hypothetical, rerank_k, exclude_statuses=skip_list
+                                )
                                 hyde_semantic = self._semantic_search(hypothetical, rerank_k)
                             else:
                                 hyde_fts = self._fts_search(
-                                    hypothetical, rerank_k, agent_filter=document_agent_filter
+                                    hypothetical, rerank_k, agent_filter=document_agent_filter,
+                                    exclude_statuses=skip_list,
                                 )
                                 hyde_semantic = self._semantic_search(
                                     hypothetical, rerank_k, agent_filter=document_agent_filter
                                 )
+                            hyde_semantic = _drop_skipped(hyde_semantic)
                             hyde_merged = self._rrf_merge(hyde_fts, hyde_semantic, rerank_k)
                             hyde_merged = self._filter_candidates(
                                 hyde_merged, layers, start_date, end_date
@@ -2567,14 +2777,10 @@ class RetrievalEngine:
         # default: skip superseded, rejected, draft, expired
         # callers can opt back in with include_* kwargs
         _ALWAYS_EXCLUDED = {"blocked"}  # privacy_level=blocked is always excluded
-        _SKIP_STATUSES = set()
-        if not include_superseded:
-            _SKIP_STATUSES.add("superseded")
-        if not include_rejected:
-            _SKIP_STATUSES.add("rejected")
-        if not include_drafts:
-            _SKIP_STATUSES.add("draft")
-            _SKIP_STATUSES.add("expired")
+        # Same set the legs were filtered with above (computed once, near the
+        # top of retrieve). Kept here as defense in depth and because privacy
+        # exclusion has always been enforced at this point.
+        _SKIP_STATUSES = skip_statuses
 
         if _SKIP_STATUSES or _ALWAYS_EXCLUDED:
             filtered = []
