@@ -405,40 +405,52 @@ function flushPendingSuppressedFailures() {
 
 function spawnBridgeDiagnostic(event, detail, onUndelivered, extras = {}) {
   if (diagnosticsInFlight >= DIAGNOSTIC_MAX_IN_FLIGHT) return false;
+  // Round 23: claim the in-flight slot only after spawn succeeds, and always
+  // release it if anything between increment and settle-handler registration
+  // throws (null stdin, destroyed stream, payload assembly). A permanent leak
+  // shrinks DIAGNOSTIC_MAX_IN_FLIGHT until all BridgeFailure diagnostics are
+  // suppressed — reintroducing P6 silence under the storm the budget exists for.
+  let claimed = false;
+  let settled = false;
+  let undeliveredReported = false;
+  let kill = null;
+  let child = null;
+  const settle = () => {
+    if (settled) return;
+    settled = true;
+    if (kill != null) clearTimeout(kill);
+    if (claimed) {
+      claimed = false;
+      diagnosticsInFlight -= 1;
+    }
+    // Round 17: undelivered + immediate flush = permanent-fail spawn storm.
+    // Back off and schedule; a successful delivery drains free slots now.
+    if (undeliveredReported) {
+      noteDiagnosticUndelivered();
+      scheduleDiagnosticFlush();
+    } else {
+      noteDiagnosticDelivered();
+      // Round 9/10 via flushDiagnosticQueues: free slot drains suppress
+      // queue and session-evict carry-forward (session-evict first).
+      flushDiagnosticQueues();
+    }
+  };
   try {
-    const child = spawn("node", [HOOK_SCRIPT, "BridgeFailure"], {
+    child = spawn("node", [HOOK_SCRIPT, "BridgeFailure"], {
       env: { ...process.env, ...HOOK_ENV },
       stdio: ["pipe", "ignore", "ignore"],
       detached: false,
     });
     diagnosticsInFlight += 1;
-    const kill = setTimeout(() => child.kill("SIGKILL"), DIAGNOSTIC_TIMEOUT_MS);
+    claimed = true;
+    kill = setTimeout(() => child.kill("SIGKILL"), DIAGNOSTIC_TIMEOUT_MS);
     // `once` guards each event individually, but a failed spawn can fire BOTH
     // `error` and `close`. Double-decrementing drives the counter negative and
     // the in-flight cap stops binding — under exactly the failure storm it
     // exists to bound (review round 2 on PR #260).
-    let settled = false;
     // Round 5: the same idempotence guard for delivery-failure reporting —
     // a failed spawn can fire both `error` and `close`. Declared before settle
     // so the free-slot path can branch on undelivered vs delivered.
-    let undeliveredReported = false;
-    const settle = () => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(kill);
-      diagnosticsInFlight -= 1;
-      // Round 17: undelivered + immediate flush = permanent-fail spawn storm.
-      // Back off and schedule; a successful delivery drains free slots now.
-      if (undeliveredReported) {
-        noteDiagnosticUndelivered();
-        scheduleDiagnosticFlush();
-      } else {
-        noteDiagnosticDelivered();
-        // Round 9/10 via flushDiagnosticQueues: free slot drains suppress
-        // queue and session-evict carry-forward (session-evict first).
-        flushDiagnosticQueues();
-      }
-    };
     const undelivered = () => {
       if (undeliveredReported) return;
       undeliveredReported = true;
@@ -453,6 +465,9 @@ function spawnBridgeDiagnostic(event, detail, onUndelivered, extras = {}) {
     // Round 14: undelivered BEFORE settle. settle() free-slot flushes; if
     // restore ran after flush, restored counts sat console-only with no
     // re-spawn (P6 hole under one-shot undelivered waves).
+    // Register settle handlers BEFORE any post-spawn work that can throw so
+    // a later sync exception still has a path that decrements via settle(),
+    // and the catch path below can still release if handlers never attached.
     child.once("close", (code) => {
       if (code !== 0) undelivered();
       else delivered();
@@ -480,6 +495,25 @@ function spawnBridgeDiagnostic(event, detail, onUndelivered, extras = {}) {
     child.stdin.end(JSON.stringify(payload));
     return true;
   } catch {
+    // Sync throw after claim: release the slot. Prefer settle() so undelivered
+    // accounting and free-slot flush still run when handlers were attached;
+    // if we never claimed, this is a pure no-op decrement guard.
+    if (claimed && !settled) {
+      // Always treat post-claim sync failure as undelivered — never credit a
+      // delivery that never left the process, or the free-slot flush path
+      // would under-count storm pressure.
+      if (!undeliveredReported) {
+        undeliveredReported = true;
+        if (onUndelivered) {
+          try {
+            onUndelivered();
+          } catch {
+            /* never throw from diagnostic path */
+          }
+        }
+      }
+      settle();
+    }
     // The console line above is the last resort; never throw from here.
     return false;
   }

@@ -685,7 +685,7 @@ test("P6: the bridge diagnostic is killed on a timer and capped in flight", asyn
   // is the suppress/coalesce gate that calls it).
   const spawn = source.indexOf("function spawnBridgeDiagnostic");
   assert.ok(spawn !== -1);
-  const window = source.slice(spawn, spawn + 2800);
+  const window = source.slice(spawn, spawn + 4200);
   assert.match(window, /setTimeout\(/, "the diagnostic child needs a kill timer");
   assert.match(window, /child\.unref\(\)/);
   assert.match(window, /diagnosticsInFlight/);
@@ -696,6 +696,17 @@ test("P6: the bridge diagnostic is killed on a timer and capped in flight", asyn
     window,
     /if \(settled\) return;/,
     "settle must be idempotent — error+close both firing must not double-decrement",
+  );
+  // Round 23: post-spawn sync throw must not permanently leak the budget.
+  assert.match(
+    window,
+    /let claimed = false/,
+    "claim flag required so catch can release the in-flight slot",
+  );
+  assert.match(
+    window,
+    /if \(claimed\)/,
+    "settle/catch must only decrement when the slot was claimed",
   );
 });
 

@@ -431,6 +431,9 @@ def test_query_expansion_failure_is_reachable_from_the_call_site(tmp_path, monke
     def _explode(query, mode="rule"):
         raise RuntimeError("expansion died")
 
+    # Round 23: retrieval uses expand_with_status; hard failures still surface
+    # via the exception path on that entry point.
+    monkeypatch.setattr(retrieval_mod, "expand_query_with_status", _explode)
     monkeypatch.setattr(retrieval_mod, "expand_query", _explode)
     engine.last_query_expand_degraded = None
     variants = engine._resolve_query_variants("a query", True)
@@ -2945,3 +2948,117 @@ def _compile_with_pass_error(monkeypatch, tmp_path, error):
 class _NullRing:
     def put(self, *args, **kwargs):
         return None
+
+
+# ── Round 23: tip App RC on #260 — sticky missing-handler + AFM expand soft-fail ──
+
+
+def test_deferred_lifecycle_missing_handler_records_sticky_and_is_recoverable(
+    tmp_path, monkeypatch,
+):
+    """Medium #1 (PR #260 tip RC): deferred lifecycle with no handler used to
+    hold the pass forever without sticky — log claimed 'later pass' recovery
+    but re-apply never armed. Sticky + next submit with a handler must clear.
+    """
+    import queue as queue_mod
+    import threading
+
+    from minni import afm_writer
+
+    afm_writer.reset_pass_counters()
+    monkeypatch.setattr(afm_writer, "_ensure_worker", lambda: None)
+    monkeypatch.setattr(afm_writer, "_WORK_QUEUE", queue_mod.Queue(maxsize=4))
+    writes = []
+
+    def _write(job):
+        writes.append(job.get("pass_name"))
+        return {"drafts_written": [{"page_id": "d1"}], "inbox_path": "x"}
+
+    monkeypatch.setattr(afm_writer, "_write_batch", _write)
+
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    done = threading.Event()
+    out: dict = {}
+    job = {
+        "pass_name": "consolidation",
+        "drafts": [{"title": "t"}],
+        "vault_path": str(vault),
+        "lifecycle": {
+            "promote_candidate_ids": [7],
+            "dedup_candidate_ids": [],
+            "review_candidate_ids": [],
+        },
+        # Intentionally absent / non-callable — the defect surface.
+        "lifecycle_handler": None,
+        "defer_lifecycle_to_worker": True,
+    }
+    with afm_writer._IN_FLIGHT_LOCK:
+        afm_writer._IN_FLIGHT_PER_PASS["consolidation"] = done
+
+    afm_writer._process_job(job, done, out)
+    assert not done.is_set(), "missing handler must keep in-flight set (hold)"
+    assert "consolidation" in afm_writer._PENDING_LIFECYCLE, (
+        "sticky must be recorded so a later pass with a handler can re-apply"
+    )
+    assert afm_writer._LIFECYCLE_APPLY_FAILURES >= 1
+    pending = afm_writer._PENDING_LIFECYCLE["consolidation"]
+    assert pending.get("promote_candidate_ids") == [7]
+    assert writes == ["consolidation"], "drafts already landed before lifecycle"
+
+    applied = []
+
+    def _handler(life):
+        life["applied"] = {"promoted": 1, "deduped": 0, "reviewed": 0}
+        applied.append(dict(life))
+
+    second = afm_writer.submit_drafts(
+        {
+            "pass_name": "consolidation",
+            "drafts": [{"title": "dup"}],
+            "lifecycle_handler": _handler,
+            "vault_path": str(vault),
+        },
+        timeout=0.05,
+    )
+    assert second.get("status") == "lifecycle_recovered", second
+    assert second.get("lifecycle_recovered") is True
+    assert "consolidation" not in afm_writer._PENDING_LIFECYCLE
+    assert done.is_set(), "re-apply must clear the sticky in-flight Event"
+    assert len(applied) == 1
+    assert applied[0]["promote_candidate_ids"] == [7]
+
+
+def test_afm_query_expand_soft_fail_sets_degraded_flag(tmp_path, monkeypatch):
+    """Low #3 (PR #260 tip RC): mode=afm with empty AFM used to fall back to
+    rules with degraded=false. Must surface afm_unavailable on the engine flag
+    (parity with HyDE)."""
+    import minni.retrieval as retrieval_mod
+    import minni.query_expand as qe
+
+    engine = _engine_without_model(tmp_path, monkeypatch)
+    monkeypatch.setattr(qe, "_afm_expand", lambda query: [])
+    # expand_with_status is bound at import on retrieval; patch the retrieval
+    # module's reference so _resolve_query_variants sees the soft-fail path.
+    monkeypatch.setattr(
+        retrieval_mod,
+        "expand_query_with_status",
+        lambda query, mode="rule": qe.expand_with_status(query, mode=mode),
+    )
+    engine.last_query_expand_degraded = None
+    variants = engine._resolve_query_variants("AFM recall", "afm")
+
+    assert variants, "rule fallback must still produce variants"
+    assert engine.last_query_expand_degraded == "afm_unavailable", (
+        f"soft AFM miss must be reachable from the call site, got "
+        f"{engine.last_query_expand_degraded!r}"
+    )
+
+
+def test_expand_with_status_rule_mode_never_degrades():
+    """Rule mode is local and complete — no afm_unavailable noise."""
+    from minni.query_expand import expand_with_status
+
+    variants, degraded = expand_with_status("minni recall", mode="rule")
+    assert variants
+    assert degraded is None

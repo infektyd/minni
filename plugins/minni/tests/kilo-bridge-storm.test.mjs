@@ -237,30 +237,38 @@ function createStormReporter({
 
   function spawnBridgeDiagnostic(event, detail, onUndelivered, extras = {}) {
     if (diagnosticsInFlight >= DIAGNOSTIC_MAX_IN_FLIGHT) return false;
+    // Round 23: claim + catch release (mirrors production minni-plugin.js).
+    let claimed = false;
+    let settled = false;
+    let undeliveredReported = false;
+    let kill = null;
+    let child = null;
+    const settle = () => {
+      if (settled) return;
+      settled = true;
+      if (kill != null) clearTimeout(kill);
+      if (claimed) {
+        claimed = false;
+        diagnosticsInFlight -= 1;
+      }
+      if (undeliveredReported) {
+        noteDiagnosticUndelivered();
+        scheduleDiagnosticFlush();
+      } else {
+        noteDiagnosticDelivered();
+        flushDiagnosticQueues();
+      }
+    };
     try {
-      const child = spawn("node", [hookScript, "BridgeFailure"], {
+      child = spawn("node", [hookScript, "BridgeFailure"], {
         env: { ...process.env, MINNI_STORM_LOG: logPath },
         stdio: ["pipe", "ignore", "ignore"],
         detached: false,
       });
       spawnCount += 1;
       diagnosticsInFlight += 1;
-      const kill = setTimeout(() => child.kill("SIGKILL"), DIAGNOSTIC_TIMEOUT_MS);
-      let settled = false;
-      let undeliveredReported = false;
-      const settle = () => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(kill);
-        diagnosticsInFlight -= 1;
-        if (undeliveredReported) {
-          noteDiagnosticUndelivered();
-          scheduleDiagnosticFlush();
-        } else {
-          noteDiagnosticDelivered();
-          flushDiagnosticQueues();
-        }
-      };
+      claimed = true;
+      kill = setTimeout(() => child.kill("SIGKILL"), DIAGNOSTIC_TIMEOUT_MS);
       const undelivered = () => {
         if (undeliveredReported) return;
         undeliveredReported = true;
@@ -297,6 +305,17 @@ function createStormReporter({
       child.stdin.end(JSON.stringify(payload));
       return true;
     } catch {
+      if (claimed && !settled) {
+        if (onUndelivered && !undeliveredReported) {
+          undeliveredReported = true;
+          try {
+            onUndelivered();
+          } catch {
+            /* never throw from diagnostic path */
+          }
+        }
+        settle();
+      }
       return false;
     }
   }

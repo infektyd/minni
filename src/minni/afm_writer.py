@@ -991,6 +991,7 @@ def _maybe_apply_deferred_lifecycle(job: dict) -> bool:
     Returns True when lifecycle is fully applied (or there was nothing to do),
     False when apply was required and failed — caller must keep the pass busy.
     """
+    global _LIFECYCLE_APPLY_FAILURES, _LAST_LIFECYCLE_APPLY_FAILURE_AT
     lifecycle = job.get("lifecycle") or {}
     has_ops = bool(
         lifecycle.get("promote_candidate_ids")
@@ -1008,10 +1009,28 @@ def _maybe_apply_deferred_lifecycle(job: dict) -> bool:
         if job.get("lifecycle_applying"):
             return False
         if not callable(handler):
+            # Sticky refuse (parity with the handler-raises path). Leaving the
+            # in-flight Event unset *without* a _PENDING_LIFECYCLE entry made
+            # every later submit return write_in_flight forever: the log line
+            # claimed "until a later pass" but no sticky meant re-apply never
+            # armed. Store serializable lifecycle (+ vault sidecar) so the next
+            # submit_drafts with a real handler can re-apply and clear the hold.
+            pass_name = str(job.get("pass_name") or "unknown")
+            vault_path = job.get("vault_path")
+            stored = dict(lifecycle)
+            if vault_path:
+                stored["_vault_path"] = str(Path(vault_path).expanduser())
+            _LIFECYCLE_APPLY_FAILURES += 1
+            _LAST_LIFECYCLE_APPLY_FAILURE_AT = time.time()
+            _PENDING_LIFECYCLE[pass_name] = stored
+            _persist_pending_lifecycle(
+                pass_name, stored, str(vault_path) if vault_path else None
+            )
+            job["lifecycle_apply_failed"] = True
             logger.warning(
                 "AFM writer: deferred lifecycle for pass %r has no handler; "
-                "candidates stay proposed until a later pass",
-                job.get("pass_name"),
+                "sticky pending recorded — resubmit with a handler to re-apply",
+                pass_name,
             )
             return False
         # Claim before invoke so a concurrent waiter cannot double-enter.
@@ -1034,7 +1053,6 @@ def _maybe_apply_deferred_lifecycle(job: dict) -> bool:
             )
         return True
     except Exception:
-        global _LIFECYCLE_APPLY_FAILURES, _LAST_LIFECYCLE_APPLY_FAILURE_AT
         pass_name = str(job.get("pass_name") or "unknown")
         vault_path = job.get("vault_path")
         stored = dict(lifecycle)

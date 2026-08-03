@@ -25,20 +25,42 @@ _MAX_VARIANTS = 4
 
 
 def expand(query: str, mode: str = "rule") -> List[str]:
-    """Return query variants with the original query first."""
+    """Return query variants with the original query first.
+
+    Soft-fail (AFM unavailable under mode=afm) still returns rule variants so
+    callers that only need strings keep working. Prefer
+    :func:`expand_with_status` when the call site must surface degradation.
+    """
+    variants, _degraded = expand_with_status(query, mode=mode)
+    return variants
+
+
+def expand_with_status(
+    query: str, mode: str = "rule"
+) -> tuple[List[str], Optional[str]]:
+    """Return ``(variants, degraded_reason)``.
+
+    When ``mode == "afm"`` and the AFM bridge/native path yields no variants,
+    falls back to rule expansion and sets *degraded_reason* to
+    ``\"afm_unavailable\"`` (parity with HyDE's AFM miss). Rule mode never
+    degrades on this axis.
+    """
     query = (query or "").strip()
     if not query:
-        return []
+        return [], None
 
     mode = (mode or "rule").lower()
     rule_variants = _rule_expand(query)
     if mode != "afm":
-        return rule_variants
+        return rule_variants, None
 
     afm_variants = _afm_expand(query)
     if not afm_variants:
-        return rule_variants
-    return _dedupe([query, *afm_variants, *rule_variants])[:_MAX_VARIANTS]
+        return rule_variants, "afm_unavailable"
+    return (
+        _dedupe([query, *afm_variants, *rule_variants])[:_MAX_VARIANTS],
+        None,
+    )
 
 
 def _build_neighborhood_summary_reduce_payload(partials: List[Dict[str, Any]]) -> Dict[str, Any]:

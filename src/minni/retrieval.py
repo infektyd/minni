@@ -35,6 +35,7 @@ from minni.config import SovereignConfig, DEFAULT_CONFIG, correction_class_page_
 from minni.db import SovereignDB
 from minni.faiss_index import FAISSIndex
 from minni.query_expand import expand as expand_query
+from minni.query_expand import expand_with_status as expand_query_with_status
 from minni.query_expand import summarize_with_afm
 
 # G19/G20/G22: read gate + evidence envelopes
@@ -2407,7 +2408,15 @@ class RetrievalEngine:
         elif expand is True and str(mode).lower() not in {"rule", "afm"}:
             mode = "rule"
         try:
-            variants = expand_query(query, mode=str(mode).lower())
+            # Prefer expand_with_status so mode=afm soft-fail (empty AFM, rule
+            # fallback) is visible on the search envelope — not only hard
+            # exceptions. HyDE sets last_hyde_degraded = "afm_unavailable" on
+            # the analogous miss; query expand was still silent on that path.
+            variants, degraded = expand_query_with_status(
+                query, mode=str(mode).lower()
+            )
+            if degraded:
+                self.last_query_expand_degraded = degraded
         except Exception as exc:  # noqa: BLE001 - recall must not raise here
             logger.warning("Query expansion failed: %s — using original query", exc)
             # AFM-6 (#230): the log line alone is not reachable from the call
