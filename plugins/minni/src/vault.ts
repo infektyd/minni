@@ -13,6 +13,7 @@ import {
 import path from "node:path";
 import os from "node:os";
 import * as fs from "node:fs"; // RCM-005: for realpathSync in assertUnder (G23 equivalent)
+import type { LearningQualityReport } from "./policy.js";
 
 export type VaultSection =
   | "raw"
@@ -101,6 +102,13 @@ export interface LearnInput {
   source?: string;
   agentId?: string;
   storeResult?: Record<string, unknown>;
+  /**
+   * SEC-G6 / #237: successful minni_learn audits must carry quality so
+   * operators can tell AFM examined-and-cleared from never-ran/failed
+   * (semanticTier). Blocked paths already audit `details.quality`; the
+   * fail-open write path is the one that previously stayed audit-dark.
+   */
+  quality?: LearningQualityReport;
 }
 
 export interface VaultWriteResult {
@@ -1233,6 +1241,8 @@ export async function vaultFirstLearn(
       category: input.category ?? "general",
       source: input.source,
       storeResult: input.storeResult,
+      // Match quality-blocked audits: full report (ok/score/warnings/semanticTier).
+      ...(input.quality ? { quality: input.quality } : {}),
     },
   });
 
