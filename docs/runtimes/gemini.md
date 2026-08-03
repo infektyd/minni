@@ -56,27 +56,25 @@ with a reason otherwise — re-run after installing agy). The entrypoint is
 `dist/gemini-hook.js`, driven by `hooks-gemini.json` and the agy payload
 adapter (`src/gemini-adapter.ts`).
 
-What actually fires on agy 1.0.15 (verified live):
+Verified against **agy 1.1.7** (and `docs/contracts/hook-platforms.md`). Older
+“1.0.15 inert PreToolUse / no UPS” notes were stale:
 
+- **`SessionStart`** — fires; context via agy `injectSteps` when the hook has
+  something to inject (same fail-open rules as other surfaces).
+- **`PreInvocation`** — agy’s prompt-submit analogue (there is **no** Claude
+  `UserPromptSubmit` name on agy). The adapter maps it to the shared UPS path
+  and mines the last user message from agy’s transcript when stdin has no
+  task text, so file-backed recall-state can be written for the guard.
+- **`PreToolUse`** — s6 recall guard via agy’s deny-capable protocol. Decision
+  enum is **`allow` / `deny` / `ask` / `force_ask`** — Claude’s `approve` /
+  `block` are **rejected** by agy. On this surface the guard defaults to
+  **strict** mode (override with `MINNI_RECALL_GUARD_MODE`): agy funnels
+  shell/search through `run_command` → Bash, and shared default “soft” would
+  ignore Bash. Empty decisions error; the adapter always emits an explicit
+  `allow` or `deny`.
 - **`Stop`** — drafts candidate learnings into `~/.minni/gemini-vault/inbox/`
-  (the same governed propose→approve loop as every other platform). The agy
-  payload carries no task text, so the hook reads the last explicit user
-  message out of agy's own transcript (`transcript_full.jsonl`) so drafts are
-  about the actual task; when the transcript is unreadable it degrades to the
-  shared fallback chain.
-- **`PreToolUse`** — carries the s6 recall guard through agy's deny-capable
-  decision protocol. On this surface the guard defaults to **strict** mode
-  (override with `MINNI_RECALL_GUARD_MODE`): agy funnels every shell/search
-  through `run_command`, which maps to Bash — and the shared default "soft"
-  mode deliberately ignores Bash, so it would guard nothing here. Inert for
-  now regardless: agy has no `UserPromptSubmit` event, so no recall-state
-  exists for the guard to act on. Every invocation answers with an explicit
-  `{"decision": "approve"}` — agy 1.0.15's permission manager errors on empty
-  decisions.
-- `SessionStart` / `UserPromptSubmit` / `PreCompact` are **pre-declared** in
-  the manifest but agy 1.0.15 does not dispatch them — no boot injection and
-  no per-prompt recall pointer on this surface yet. They activate without a
-  reinstall once agy adds the events.
+  (same governed propose→approve loop). Payload often lacks task text; the
+  hook reads the last user message from `transcript_full.jsonl` when needed.
 
 The installed plugin lives at `~/.gemini/config/plugins/minni/` (real files:
 `plugin.json` + a hooks.json stamped with absolute paths — agy does not expand

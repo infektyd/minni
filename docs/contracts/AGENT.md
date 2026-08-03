@@ -375,8 +375,8 @@ decision enums: `docs/contracts/hook-platforms.md`.
 | `claude-code` | Yes — all tools (`allow`/`deny`/`ask`/`defer`) | Fully live: `hooks.json` + `UserPromptSubmit` writes the recall-state the guard acts on. |
 | `kilocode` | Yes — throw from `tool.execute.before` (or permission.ask) | Wired via the bridge plugin; broad coverage. |
 | `cursor` | Yes — `preToolUse` (`allow`/`deny`; `ask` unenforced) | Wired via Cursor adapters; broad coverage. Session injection has known vendor limits (see hook-platforms). |
-| `grok-build` | Yes — broad tool coverage (`allow`/`deny`) | `PreToolUse` registered (`hooks-grok.json`). Passive hook stdout is ignored on Grok, so recall-state written on passive events is discarded — guard is weaker than Claude without a live pointer. |
-| `antigravity` / agy | Yes — broad (`allow`/`deny`/`ask`/`force_ask`; rejects `approve`/`block`) | Wired in `hooks-gemini.json` via the agy adapter. Current agy dispatches SessionStart / PreToolUse / Stop etc.; depth still lags Claude’s live recall-state path. |
+| `grok-build` | Yes — broad tool coverage (`allow`/`deny`) | `PreToolUse` + `UserPromptSubmit` registered (`hooks-grok.json`). Passive **stdout injection** is ignored on Grok (no prompt-time envelope to the model). That does **not** discard the on-disk recall-state file: `UserPromptSubmit` still `writeRecallState`s when recall is strong, and `PreToolUse` `readRecallState`s it — so the file-backed guard can still deny. What is weaker than Claude is prompt-time *injection*, not the guard pointer. |
+| `antigravity` / agy | Yes — broad (`allow`/`deny`/`ask`/`force_ask`; rejects `approve`/`block`) | Wired in `hooks-gemini.json` via the agy adapter. Current agy (1.1.7+) dispatches SessionStart, PreInvocation (UPS analogue), PreToolUse, Stop; PreInvocation can write file-backed recall-state when transcript enrichment succeeds. Depth still lags Claude’s full envelope + live pointer path. |
 | `codex` | Yes — **Bash interception only** | Guard gates `Read`/`Grep`/`Glob`, which never fire `PreToolUse` on Codex. Not wireable **for those tools**. |
 
 If another surface later changes deny coverage or event set, update
