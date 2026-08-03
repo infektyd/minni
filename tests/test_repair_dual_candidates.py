@@ -1649,3 +1649,31 @@ def test_cli_warns_on_dual_accepted_groups(tmp_path, capsys):
     assert rc_apply == 3
     assert "WARNING" in captured2.err
     assert "dual_accepted" in captured2.err
+
+
+def test_empty_principal_reload_does_not_delete_other_principal(tmp_path):
+    """Empty-principal duals must not pull same-basename peers from other agents."""
+    from minni.repair_dual_candidates import (
+        _load_collapse_group_on_cursor,
+        repair_duplicate_candidate_pairs,
+    )
+
+    db, cfg = _make_db(tmp_path)
+    content = "same body X"
+    # Empty-principal twins (byte-identical dual).
+    a = _insert_candidate(db, content=content, status="accepted", inbox_file="a.json", principal="")
+    b = _insert_candidate(db, content=content, status="rejected", inbox_file="a.json", principal="")
+    # Other principal same basename — must survive apply.
+    c = _insert_candidate(db, content=content, status="proposed", inbox_file="a.json", principal="codex")
+
+    res = repair_duplicate_candidate_pairs(db, dry_run=False)
+    assert res["deleted"] == 1
+    with db.cursor() as cur:
+        cur.execute("SELECT candidate_id, principal, status FROM candidate_packets ORDER BY candidate_id")
+        rows = [dict(r) for r in cur.fetchall()]
+    ids = {r["candidate_id"] for r in rows}
+    assert a in ids
+    assert b not in ids
+    assert c in ids, "codex peer must not be hard-deleted"
+    principals = {r["candidate_id"]: r["principal"] for r in rows}
+    assert principals[c] == "codex"

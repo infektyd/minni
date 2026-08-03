@@ -588,41 +588,31 @@ def find_app_key_collisions(db) -> List[Dict[str, Any]]:
 def _load_collapse_group_on_cursor(
     c, key: Dict[str, Any]
 ) -> List[Dict[str, Any]]:
-    """Re-read byte-identical twins for one collapse key under an open txn."""
-    principal = key.get("principal")
+    """Re-read byte-identical twins for one collapse key under an open txn.
+
+    Always scopes by principal (including empty-string principal) so a
+    same-basename peer under another agent cannot be hard-deleted.
+    """
+    principal = str(key.get("principal") or "")
     inbox_file = key.get("inbox_file")
     candidate_index = key.get("candidate_index")
     content_sha1 = key.get("content_sha1")
     if not isinstance(inbox_file, str) or candidate_index is None:
         return []
-    # Filter in SQL on principal-scoped app key; match sha in Python.
-    if principal is None or principal == "":
-        c.execute(
-            """
-            SELECT candidate_id, principal, status, content, derived_from,
-                   proposed_at, resolved_at, resolved_by, resolution_reason
-            FROM candidate_packets
-            WHERE derived_from IS NOT NULL
-              AND json_extract(derived_from, '$.source') = 'inbox'
-              AND json_extract(derived_from, '$.inbox_file') = ?
-              AND CAST(json_extract(derived_from, '$.candidate_index') AS INTEGER) = ?
-            """,
-            (inbox_file, int(candidate_index)),
-        )
-    else:
-        c.execute(
-            """
-            SELECT candidate_id, principal, status, content, derived_from,
-                   proposed_at, resolved_at, resolved_by, resolution_reason
-            FROM candidate_packets
-            WHERE principal = ?
-              AND derived_from IS NOT NULL
-              AND json_extract(derived_from, '$.source') = 'inbox'
-              AND json_extract(derived_from, '$.inbox_file') = ?
-              AND CAST(json_extract(derived_from, '$.candidate_index') AS INTEGER) = ?
-            """,
-            (str(principal), inbox_file, int(candidate_index)),
-        )
+    # COALESCE so empty-string principal matches rows with '' or NULL.
+    c.execute(
+        """
+        SELECT candidate_id, principal, status, content, derived_from,
+               proposed_at, resolved_at, resolved_by, resolution_reason
+        FROM candidate_packets
+        WHERE COALESCE(principal, '') = ?
+          AND derived_from IS NOT NULL
+          AND json_extract(derived_from, '$.source') = 'inbox'
+          AND json_extract(derived_from, '$.inbox_file') = ?
+          AND CAST(json_extract(derived_from, '$.candidate_index') AS INTEGER) = ?
+        """,
+        (principal, inbox_file, int(candidate_index)),
+    )
     want_sha = (
         content_sha1.strip().lower()
         if isinstance(content_sha1, str) and content_sha1.strip()
@@ -638,6 +628,9 @@ def _load_collapse_group_on_cursor(
             item.get("principal"), derived, item.get("content")
         )
         if ckey is None:
+            continue
+        # Defense-in-depth: never accept a row from another principal.
+        if ckey[0] != principal:
             continue
         row_sha = ckey[3]
         if row_sha != want_sha:
@@ -1445,28 +1438,70 @@ def repair_index_disk_divergence(
     }
 
 
-def _dry_run_inbox_dedup_index_status(db) -> Dict[str, Any]:
-    """Preflight UNIQUE index without CREATE — exists / would_create / would_block."""
+def _dry_run_inbox_dedup_index_status(
+    db, *, dual_plan: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
+    """Preflight UNIQUE index without CREATE — exists / would_create / would_block.
+
+    When ``dual_plan`` is provided (from a dry-run dual repair), residual
+    collisions exclude ``loser_ids`` the plan would delete so dry-run matches
+    post-apply index installability.
+    """
     index_name = INBOX_DEDUP_INDEX
     with db.cursor() as c:
         c.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='index' AND name=? LIMIT 1",
+            "SELECT sql FROM sqlite_master WHERE type='index' AND name=? LIMIT 1",
             (index_name,),
         )
-        if c.fetchone():
-            return {"status": "exists", "index": index_name, "dry_run": True}
+        row = c.fetchone()
+        if row:
+            sql = str((row["sql"] if hasattr(row, "keys") else row[0]) or "")
+            if "principal" in sql.lower():
+                return {"status": "exists", "index": index_name, "dry_run": True}
+            # Stale global index — would be replaced on apply.
+    loser_ids: set = set()
+    if dual_plan:
+        # repair_duplicate_candidate_pairs dry-run exposes plan in ``sample``
+        # (and full list is only partial); also accept ``plan`` if present.
+        for g in dual_plan.get("plan") or dual_plan.get("sample") or []:
+            for lid in g.get("delete") or g.get("loser_ids") or []:
+                try:
+                    loser_ids.add(int(lid))
+                except (TypeError, ValueError):
+                    continue
+        # When sample is truncated, still use groups_found/would_delete only as
+        # a heuristic: rebuild from find_duplicate if sample is incomplete.
+        would_delete = int(dual_plan.get("would_delete") or 0)
+        if would_delete and len(loser_ids) < would_delete:
+            # Full plan not in summary — re-enumerate collapsible losers.
+            for g in find_duplicate_candidate_groups(db):
+                for lid in g.get("loser_ids") or []:
+                    try:
+                        loser_ids.add(int(lid))
+                    except (TypeError, ValueError):
+                        continue
+
     collisions = find_app_key_collisions(db)
-    if collisions:
+    residual: List[Dict[str, Any]] = []
+    for g in collisions:
+        remaining = [
+            cid for cid in g["candidate_ids"] if int(cid) not in loser_ids
+        ]
+        if len(remaining) >= 2:
+            residual.append({**g, "candidate_ids": remaining, "row_count": len(remaining)})
+    if residual:
         return {
             "status": "would_block",
             "index": index_name,
             "dry_run": True,
-            "app_key_collisions": len(collisions),
+            "post_plan": bool(dual_plan),
+            "app_key_collisions": len(residual),
+            "pre_plan_collisions": len(collisions),
             "byte_identical_groups": sum(
-                1 for g in collisions if g.get("byte_identical")
+                1 for g in residual if g.get("byte_identical")
             ),
             "divergent_groups": sum(
-                1 for g in collisions if not g.get("byte_identical")
+                1 for g in residual if not g.get("byte_identical")
             ),
             "sample": [
                 {
@@ -1476,10 +1511,16 @@ def _dry_run_inbox_dedup_index_status(db) -> Dict[str, Any]:
                     "content_sha1s": g["content_sha1s"][:8],
                     "byte_identical": g["byte_identical"],
                 }
-                for g in collisions[:5]
+                for g in residual[:5]
             ],
         }
-    return {"status": "would_create", "index": index_name, "dry_run": True}
+    return {
+        "status": "would_create",
+        "index": index_name,
+        "dry_run": True,
+        "post_plan": bool(dual_plan),
+        "pre_plan_collisions": len(collisions),
+    }
 
 
 def run_full_repair(
@@ -1528,9 +1569,9 @@ def run_full_repair(
     if create_index and not dry_run:
         index_status = ensure_inbox_dedup_index(db)
     elif create_index and dry_run:
-        # Preflight without mutating: report exists / would_create / would_block
-        # so operators don't assume the UNIQUE backstop is installable.
-        index_status = _dry_run_inbox_dedup_index_status(db)
+        # Preflight without mutating: project residual collisions *after*
+        # the dual plan would delete losers so dry-run matches apply order.
+        index_status = _dry_run_inbox_dedup_index_status(db, dual_plan=dual)
     return {
         "dual_candidates": dual,
         "index_disk": index,
