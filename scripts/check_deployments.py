@@ -84,8 +84,104 @@ COMPARED_SUBTREES = (
 #                and vault), so it is a template output, not a copy.
 #   node_modules/frontend/src/tests/scripts  build inputs, not runtime surface.
 NOT_COMPARED = {
-    ".mcp.json": "host-materialized (absolute paths + per-agent env), not a copy",
+    ".mcp.json": "host-materialized (absolute paths + per-agent env), not a copy"
+                 " — but its agent stamp and recorded paths ARE validated",
 }
+
+# D14 (#234): which MINNI_AGENT_ID stamps are legitimate for each deployment
+# root. The live finding was a shared agents-tree deployment stamped
+# `agent=cursor`: anything keying off that stamp attributes activity to the
+# wrong agent, and nothing reported it. None = skip the agent check (the wire
+# tree at ~/.minni/plugin is shared: whichever platform wired last stamped it).
+EXPECTED_AGENT_STAMPS: list[tuple[str, frozenset[str] | None]] = [
+    (".minni/plugin/", None),
+    (".claude/plugins/cache/", frozenset({"claude-code"})),
+    (".codex/plugins/cache/", frozenset({"codex"})),
+    (".config/kilo/", frozenset({"kilocode"})),
+    (".agents/plugins/", frozenset({"gemini", "grok-build"})),
+    (".cursor/", frozenset({"cursor"})),
+]
+
+# .mcp.json env keys whose values are filesystem paths a runtime will execute
+# or load; a recorded path that does not exist is a dead deployment pointer.
+# (MINNI_VAULT_PATH is deliberately absent: vaults are created lazily.)
+PATH_ENV_KEYS = ("MINNI_AFM_NATIVE_HELPER",)
+
+
+def _expected_agents(rel_root: str) -> frozenset[str] | None:
+    for prefix, agents in EXPECTED_AGENT_STAMPS:
+        if rel_root.startswith(prefix):
+            return agents
+    return None
+
+
+def check_mcp_config(root: Path, home: Path) -> list[str]:
+    """D14 (#234): validate a deployment's .mcp.json stamp and recorded paths.
+
+    Returns problem strings. An unparseable .mcp.json is a problem (never
+    assumed fine); a missing one is not (not every root materializes it).
+    """
+    mcp = root / ".mcp.json"
+    if not mcp.is_file():
+        return []
+    try:
+        data = json.loads(mcp.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return [f".mcp.json unreadable/unparseable: {type(exc).__name__}: {exc}"]
+    entry = (data.get("mcpServers") or {}).get("minni")
+    if not isinstance(entry, dict):
+        return []
+    problems: list[str] = []
+
+    try:
+        rel_root = str(root.relative_to(home))
+    except ValueError:
+        rel_root = str(root)
+    expected = _expected_agents(rel_root + "/")
+    env_raw = entry.get("env")
+    if env_raw is None:
+        env: dict = {}
+    elif not isinstance(env_raw, dict):
+        problems.append(".mcp.json env is not an object")
+        env = {}
+    else:
+        env = env_raw
+    agent = env.get("MINNI_AGENT_ID")
+    if expected is not None:
+        if not agent:
+            # A wiped/partial config is as wrong as a cross-stamped one: the
+            # server would run with no identity, or inherit one ambiently.
+            problems.append(
+                ".mcp.json has a minni entry but no MINNI_AGENT_ID stamp "
+                f"(expected one of {sorted(expected)})"
+            )
+        elif agent not in expected:
+            problems.append(
+                f".mcp.json agent stamp {agent!r} is wrong for this root "
+                f"(expected one of {sorted(expected)})"
+            )
+
+    dead: list[str] = []
+    for arg in entry.get("args") or []:
+        if isinstance(arg, str) and os.path.isabs(arg) and not Path(arg).exists():
+            dead.append(f"args: {arg}")
+    cwd = entry.get("cwd")
+    if isinstance(cwd, str) and cwd and not Path(cwd).is_dir():
+        dead.append(f"cwd: {cwd}")
+    for key in PATH_ENV_KEYS:
+        val = env.get(key)
+        if not isinstance(val, str) or not val:
+            continue
+        # Match wire/propagate _filter_dead_afm_helper: expanduser + is_file
+        # (bare exists() misses ~ and treats a directory as live).
+        p = Path(val).expanduser()
+        if key == "MINNI_AFM_NATIVE_HELPER":
+            if not p.is_file():
+                dead.append(f"env {key}: {val}")
+        elif not p.exists():
+            dead.append(f"env {key}: {val}")
+    problems.extend(f".mcp.json dead path — {entry_}" for entry_ in dead)
+    return problems
 
 # Editor/interpreter droppings. Excluded because they are not part of the
 # plugin: they are generated on both sides independently and are gitignored.
@@ -125,16 +221,148 @@ def _home() -> Path:
     return Path(override) if override else Path.home()
 
 
+def _active_wire_plugin_state(home: Path) -> tuple[set[Path], set[str]]:
+    """Live wire install roots + platforms under ~/.minni/plugin.
+
+    Shared with check_versions + deploy honesty (``minni.wire.active_roots``):
+    latest ``wired_at`` per platform; root must be a dir with
+    ``payload-manifest.json``; ``current`` only when no usable wire records.
+    Platforms scope marketplace-cache skip per surface.
+    """
+    # Prefer the checkout's src/ so scripts run against the tree under test
+    # even when a different editable install is on sys.path.
+    _src = Path(__file__).resolve().parent.parent / "src"
+    if _src.is_dir() and str(_src) not in sys.path:
+        sys.path.insert(0, str(_src))
+    from minni.wire.active_roots import active_wire_plugin_state
+
+    return active_wire_plugin_state(home)
+
+
+def _active_wire_plugin_roots(home: Path) -> set[Path]:
+    """Live wire install roots (latest per platform)."""
+    roots, _platforms = _active_wire_plugin_state(home)
+    return roots
+
+
+def _is_plugin_current_dist(dist: Path, home: Path) -> bool:
+    """True for ~/.minni/plugin/current/dist (unresolved path shape)."""
+    try:
+        logical = dist if not dist.is_absolute() else dist
+        plugin = home / ".minni" / "plugin"
+        # dist is .../plugin/current/dist — do not resolve current (symlink).
+        return (
+            logical.name == "dist"
+            and logical.parent.name == "current"
+            and logical.parent.parent.resolve() == plugin.resolve()
+        )
+    except (OSError, ValueError):
+        return False
+
+
+def _is_versioned_wire_plugin_dist(dist: Path, home: Path) -> bool:
+    """True for ~/.minni/plugin/<version>/dist (not current/cache)."""
+    try:
+        rel = dist.resolve().relative_to((home / ".minni" / "plugin").resolve())
+    except (OSError, ValueError):
+        return False
+    return (
+        len(rel.parts) == 2
+        and rel.parts[1] == "dist"
+        and rel.parts[0] not in {"current", "cache"}
+    )
+
+
+def _marketplace_cache_platform(dist: Path, home: Path) -> str | None:
+    """Return the platform that owns this wire-superseded legacy dist, or None.
+
+    Claude marketplace cache → claude-code; Codex marketplace cache → codex;
+    Kilo plugins tree → kilocode (wire owns MCP at ~/.minni/plugin/<ver>).
+    """
+    try:
+        rel = str(dist.resolve().relative_to(home.resolve()))
+    except (OSError, ValueError):
+        rel = str(dist)
+    if rel.startswith(".claude/plugins/cache/"):
+        return "claude-code"
+    if rel.startswith(".codex/plugins/cache/"):
+        return "codex"
+    # Pre-wire Kilo install root; wire-primary points kilo.json at ~/.minni/plugin.
+    if rel.startswith(".config/kilo/plugins/"):
+        return "kilocode"
+    return None
+
+
+def _is_legacy_marketplace_cache_dist(dist: Path, home: Path) -> bool:
+    """Claude/Codex marketplace cache dists (path shape only)."""
+    return _marketplace_cache_platform(dist, home) is not None
+
+
 def discover() -> list[Path]:
     home = _home()
     found: list[Path] = []
     for pattern in DEPLOYMENT_GLOBS:
         found.extend(sorted(home.glob(pattern)))
-    for rel in REPO_DEPLOYMENTS:
-        p = REPO_ROOT / rel
-        if p.is_dir():
-            found.append(p)
+    # Day-to-day sync-root must not gate on a leftover `make stage-payload`
+    # tree under src/minni/plugin_payload/ (release artifact, not a live
+    # host surface). Set MINNI_CHECK_DEPLOYMENTS_SKIP_REPO=1 from update_root.
+    skip_repo = os.environ.get("MINNI_CHECK_DEPLOYMENTS_SKIP_REPO", "").strip() in {
+        "1", "true", "yes",
+    }
+    if not skip_repo:
+        for rel in REPO_DEPLOYMENTS:
+            p = REPO_ROOT / rel
+            if p.is_dir():
+                found.append(p)
     return found
+
+
+def discover_active() -> tuple[list[Path], list[str]]:
+    """(dists to judge, skip notes).
+
+    Historical wire version dirs and wire-superseded marketplace cache trees
+    become notes only — they must not fail ``--strict`` / sync-root after a
+    successful wire-primary redeploy.
+    """
+    home = _home()
+    active, active_platforms = _active_wire_plugin_state(home)
+    kept: list[Path] = []
+    notes: list[str] = []
+    for dist in discover():
+        label = str(dist.parent).replace(str(home), "~")
+        # Versioned wire trees only when they are live active roots. Empty
+        # active (post-retire wires:[]) must skip *all* historical dirs —
+        # not re-judge them just because nothing else is live.
+        if _is_versioned_wire_plugin_dist(dist, home):
+            root = dist.parent.resolve()
+            if root not in active:
+                notes.append(
+                    f"{label}: skipped (not an active wire install; "
+                    "historical version dir)"
+                )
+                continue
+        # Release-era ~/.minni/plugin/current is not moved by --from-repo local
+        # installs. Always skip the logical current path: live payload is
+        # judged via the versioned root when active (wired or pre-wire
+        # fallback); empty active after retirement leaves nothing to manage.
+        if _is_plugin_current_dist(dist, home):
+            notes.append(
+                f"{label}: skipped (legacy plugin/current; "
+                "wire-primary — not managed by sync-root)"
+            )
+            continue
+        # Skip marketplace caches only for platforms that have an active wire
+        # record. Host-global skip would silence a still-live Codex cache when
+        # only claude-code is wire-active (mid-migration).
+        cache_plat = _marketplace_cache_platform(dist, home)
+        if cache_plat is not None and cache_plat in active_platforms:
+            notes.append(
+                f"{label}: skipped (legacy marketplace cache for {cache_plat}; "
+                "wire-primary — not managed by sync-root)"
+            )
+            continue
+        kept.append(dist)
+    return kept, notes
 
 
 def read_manifest(dist: Path) -> dict | None:
@@ -261,15 +489,48 @@ def main(argv: list[str] | None = None) -> int:
     rows: list[tuple[str, str, str]] = []
     details: list[tuple[str, list[str]]] = []
     stale = unknown = drifted_count = unreadable_count = 0
-    for dist in discover():
+    worktree_linked = badconfig_count = 0
+    dists, skip_notes = discover_active()
+    for note in skip_notes:
+        print(f"NOTE  {note}")
+    if skip_notes:
+        print()
+    for dist in dists:
         root = dist.parent
         label = str(root).replace(str(home), "~")
 
-        # dist/ vintage. A symlink at the source dist genuinely cannot drift --
-        # but that is a fact about dist/ only, and no longer skips the rest.
-        if dist.is_symlink() and dist.resolve() == SOURCE_DIST.resolve():
-            rows.append(("LINKED", "dist -> source", label))
-        else:
+        # dist/ vintage. D14 (#234): a dist symlinked at the repo WORKING TREE
+        # is a deployment defect, not a neutral fact — the runtime executes
+        # whatever uncommitted state the working tree holds, so the deployed
+        # surface has no reproducible version and a `git stash` changes live
+        # behavior. (This used to print a reassuring "LINKED".) A symlink to an
+        # installed, manifest-carrying artifact is fine and judged by its
+        # manifest like any copy.
+        is_worktree_link = False
+        if dist.is_symlink():
+            target = dist.resolve()
+            # Only the live plugins/minni/dist working tree is WORKTREE — a
+            # symlink into some other path under the repo (e.g. a frozen
+            # release-artifacts/.../dist) is a reproducible artifact and is
+            # judged by its manifest like any copy. Prefix-matching the whole
+            # repo over-fired on those.
+            source_dist = SOURCE_DIST.resolve()
+            same_as_source = target == source_dist
+            if not same_as_source:
+                try:
+                    same_as_source = target.samefile(source_dist)
+                except OSError:
+                    same_as_source = False
+            if same_as_source:
+                rows.append((
+                    "WORKTREE",
+                    "dist -> repo working tree (executes uncommitted state)",
+                    label,
+                ))
+                worktree_linked += 1
+                is_worktree_link = True
+            dist = target
+        if not is_worktree_link:
             m = read_manifest(dist)
             if m is None:
                 rows.append(("UNKNOWN", "dist: no manifest", label))
@@ -283,6 +544,12 @@ def main(argv: list[str] | None = None) -> int:
                 else:
                     rows.append(("STALE", f"dist {sha[:8]}{dirty} built {built}", label))
                     stale += 1
+
+        config_problems = check_mcp_config(root, home)
+        if config_problems:
+            badconfig_count += 1
+            rows.append(("BADCONFIG", f"{len(config_problems)} config problem(s)", label))
+            details.append((f"{label} (.mcp.json)", config_problems))
 
         drift, bad = compare_content(root, source)
         if bad:
@@ -315,13 +582,21 @@ def main(argv: list[str] | None = None) -> int:
     else:
         print(
             f"{roots} deployment(s): {stale} stale dist, {drifted_count} with content drift, "
-            f"{unknown} unknown vintage, {unreadable_count} partly unreadable."
+            f"{unknown} unknown vintage, {unreadable_count} partly unreadable, "
+            f"{worktree_linked} dist symlinked at the working tree, "
+            f"{badconfig_count} with .mcp.json problems."
         )
-    failed = stale or unknown or drifted_count or unreadable_count or source_bad
+    failed = (
+        stale or unknown or drifted_count or unreadable_count or source_bad
+        or worktree_linked or badconfig_count
+    )
     if failed:
         print("\nRefresh with: make stage-payload  (payload)  /  npm run build  (source dist)")
         print("Content drift is a propagation problem, not a build one: re-run the installer")
         print("(minni wire / propagate.py) so hooks, skills, commands and manifests are recopied.")
+        if worktree_linked:
+            print("A WORKTREE dist executes uncommitted state and has no reproducible version:")
+            print("replace the symlink with a built artifact (minni wire / propagate.py).")
     return 1 if args.strict and failed else 0
 
 

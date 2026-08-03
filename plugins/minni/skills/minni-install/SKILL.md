@@ -103,11 +103,11 @@ system/developer instructions, safety policy, and active user request.
    - KiloCode vault default: `~/.minni/kilocode-vault`.
    - Gemini vault default: `~/.minni/gemini-vault`.
    - Grok vault default: `~/.minni/grok-build-vault` (agent id `grok-build`). Grok is
-     not special: it installs the standard minni plugin at `~/.agents/plugins/minni@minni`
-     and is wired via `~/.grok/config.toml` `[mcp_servers.minni]`, exactly like the other
-     platforms (`propagate.py update-plugin --platform grok`). Flagless update-plugin
-     now preserves any existing correct surface env in the target's toml/.mcp.json
-     (see preservation note in Platform Plugin Update Workflow).
+     not special: it installs the standard minni plugin under the wire-managed tree
+     and is wired via `~/.grok/config.toml` `[mcp_servers.minni]`. **Wire owns grok
+     MCP** — use `minni wire grok` (or `minni wire all` / `make sync-root`), not
+     `propagate.py update-plugin --platform grok` (that rewrites legacy cache/agents
+     trees after wire adoption; recovery/pre-wire only).
    - New/unknown agents default to `~/.minni/<agent-id>-vault`.
    - The vault must be an actual directory owned by that agent surface, not a
      symlink and not a copy of another agent's vault. If an agent was pointed at
@@ -182,7 +182,7 @@ functionality and configuration:
    agent.
 6. Verify the platform's config points to the refreshed `dist/server.js`.
 
-**Belt-and-suspenders preservation (post-2026-06 fix):** `update-plugin` (and the .mcp.json writer + replace_toml_sections) will, when the *target* config already contains surface env keys (MINNI_AGENT_ID / VAULT_PATH / SOCKET_PATH / WORKSPACE_ID), preserve the target's values for those keys instead of overwriting with the --repo / Minni source root. Only the plugin server pointer (command/args/cwd) is refreshed. This means a flagless `update-plugin --platform grok|all` can no longer reintroduce the "Minni source as workspace" artifact for any surface. Use `--workspace /your/project` as the explicit override when you *do* want to set it. A fresh target (no env keys) falls back to --workspace (if given) or the repo default (old behavior). See propagate.py --help for update-plugin and the code comments in replace_toml_sections / mcp_json / platform_spec.
+**Belt-and-suspenders preservation (post-2026-06 fix):** `update-plugin` (and the .mcp.json writer + replace_toml_sections) will, when the *target* config already contains surface env keys (MINNI_AGENT_ID / VAULT_PATH / SOCKET_PATH / WORKSPACE_ID), preserve the target's values for those keys instead of overwriting with the --repo / Minni source root. Only the plugin server pointer (command/args/cwd) is refreshed. This means a flagless `update-plugin --platform antigravity|cursor|all` (propagate-owned surfaces; `all` = antigravity+cursor only) can no longer reintroduce the "Minni source as workspace" artifact for those surfaces. Use `--workspace /your/project` as the explicit override when you *do* want to set it. A fresh target (no env keys) falls back to --workspace (if given) or the repo default (old behavior). See propagate.py --help for update-plugin and the code comments in replace_toml_sections / mcp_json / platform_spec. **Do not** use `update-plugin --platform codex|kilocode|grok|claude-code` after wire adoption — see D7 fleet partition below.
 
 Known platform update commands (run from your Minni checkout; the script ships
 with this skill at `plugins/minni/skills/minni-install/scripts/propagate.py`):
@@ -198,13 +198,20 @@ minni wire-adopt claude-code            # one-time cutover; dry-run by default
 minni wire-adopt claude-code --apply
 ```
 
+**D7 fleet partition (post-R10):** wire owns MCP for codex / claude-code /
+kilocode / grok (`minni wire <platform>` or `minni wire all`). propagate
+`update-plugin --platform all` expands **only** to antigravity + cursor
+(surfaces wire deliberately skips). Prefer `make sync-root` for a full
+checkout redeploy. Do **not** re-run explicit
+`update-plugin --platform codex|kilocode|grok` after wire adoption — that
+rewrites MCP onto legacy cache/agents trees.
+
 ```bash
-.venv/bin/python plugins/minni/skills/minni-install/scripts/propagate.py update-plugin --platform codex
-.venv/bin/python plugins/minni/skills/minni-install/scripts/propagate.py update-plugin --platform kilocode
-.venv/bin/python plugins/minni/skills/minni-install/scripts/propagate.py update-plugin --platform gemini
+minni wire all --from-repo .                 # codex, claude-code, kilocode, grok
 .venv/bin/python plugins/minni/skills/minni-install/scripts/propagate.py update-plugin --platform antigravity
-.venv/bin/python plugins/minni/skills/minni-install/scripts/propagate.py update-plugin --platform grok
-.venv/bin/python plugins/minni/skills/minni-install/scripts/propagate.py update-plugin --platform all
+.venv/bin/python plugins/minni/skills/minni-install/scripts/propagate.py update-plugin --platform cursor
+.venv/bin/python plugins/minni/skills/minni-install/scripts/propagate.py update-plugin --platform all   # = antigravity+cursor only
+make sync-root                               # preferred full operator path
 ```
 
 ### Rebranding / reinstalling a Claude Code plugin identity
@@ -265,8 +272,16 @@ propagation. Run `--help` first.
 Common commands (from your Minni checkout):
 
 ```bash
+# Wire-primary MCP (codex / claude-code / kilocode / grok) — preferred
+minni wire codex
+minni wire all --from-repo .
+make sync-root
+
+# Propagate: status / seed / verify (any agent); update-plugin only for
+# antigravity|cursor (or recovery on a pre-wire host — never after wire adopt)
 python3 plugins/minni/skills/minni-install/scripts/propagate.py status --agent codex
-python3 plugins/minni/skills/minni-install/scripts/propagate.py update-plugin --platform codex
+python3 plugins/minni/skills/minni-install/scripts/propagate.py update-plugin --platform antigravity
+python3 plugins/minni/skills/minni-install/scripts/propagate.py update-plugin --platform cursor
 python3 plugins/minni/skills/minni-install/scripts/propagate.py seed-hosted --agent codex --workspace <your-checkout>
 python3 plugins/minni/skills/minni-install/scripts/propagate.py verify --agent codex --workspace <your-checkout>
 ```

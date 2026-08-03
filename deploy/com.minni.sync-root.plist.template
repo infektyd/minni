@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Minni root-sync launchd agent — TEMPLATE, deliberately not installed.
+
+  Loading this is an OPERATOR decision: it makes the machine pull and deploy
+  origin/main on a schedule. Nothing in this repo installs it for you; see
+  deploy/README.md for the activation steps and how to disable it again.
+
+  Substitutions before loading (launchd expands neither ~ nor $HOME):
+    __REPO__   absolute path to the Minni checkout (e.g. $HOME/Projects/Minni)
+    __HOME__   your home directory (for the log paths)
+
+  The script it runs, scripts/update_root.sh, REFUSES on a dirty or diverged
+  checkout — an unattended run can fast-forward and redeploy, but it can never
+  discard local state. Check the logs when a run refuses.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.minni.sync-root</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <!-- Invoke via bash so a missing +x bit cannot break unattended sync. -->
+        <string>/bin/bash</string>
+        <string>__REPO__/scripts/update_root.sh</string>
+        <string>--repo</string>
+        <string>__REPO__</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__REPO__</string>
+
+    <!-- Every 6 hours. Adjust or replace with StartCalendarInterval. -->
+    <key>StartInterval</key>
+    <integer>21600</integer>
+
+    <!-- Do not fire immediately at load; wait for the first interval. -->
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>__HOME__/.minni/logs/sync-root.log</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/.minni/logs/sync-root.err.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <!--
+          Unattended sync needs git + npm + (optionally) a credential agent.
+          __REPO__/.venv/bin is prepended so `python`/`pip` resolve to the
+          checkout venv if a step ever shells out without an absolute path;
+          update_root.sh already prefers $REPO/.venv/bin/python explicitly.
+          Homebrew prefixes cover the usual macOS Node/git installs. If you
+          use nvm/fnm/asdf for Node, append that bin dir here after install.
+          For private git remotes, also set SSH_AUTH_SOCK (or a credential
+          helper) — launchd does not inherit your interactive shell's agent.
+        -->
+        <key>PATH</key>
+        <string>__REPO__/.venv/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+</dict>
+</plist>

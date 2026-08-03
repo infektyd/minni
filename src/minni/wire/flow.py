@@ -168,9 +168,38 @@ def _wire_platform(
             pre_mcp_env = (
                 pre_doc.get("mcpServers", {}).get("minni", {}).get("env", {}) or {}
             )
-        except Exception:
-            pre_doc = {}
-            pre_mcp_env = {}
+        except Exception as exc:
+            # D10 twin for JSON: refuse before rewrite so a corrupt surface
+            # is left byte-identical (wire must not silently drop env / other
+            # servers). Callers map ValueError → platform "failed".
+            raise ValueError(
+                f"cannot parse existing .mcp.json at {mcp_target}: {exc}. "
+                "Refusing to rewrite mcpServers.minni — the surface's "
+                "preserved env (and any sibling MCP servers) would be "
+                "silently dropped. Fix or remove the file, then re-run."
+            ) from exc
+
+    # D10 for host TOML: parse before any surface write (mcp.json or host
+    # config). Propagate already preflights before copy_tree; wire must not
+    # rewrite install_root/.mcp.json and then fail on corrupt host TOML.
+    if (
+        not dry_run
+        and spec.config_kind == "toml"
+        and spec.config_path is not None
+        and Path(spec.config_path).expanduser().is_file()
+    ):
+        import tomllib
+
+        host_toml = Path(spec.config_path).expanduser()
+        try:
+            tomllib.loads(host_toml.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise ValueError(
+                f"cannot parse existing host TOML at {host_toml}: {exc}. "
+                "Refusing to rewrite surface config — host MCP env would "
+                "be left broken after a partial write. Fix or remove the "
+                "file, then re-run."
+            ) from exc
 
     if not dry_run:
         generated = mcp_json(
@@ -358,11 +387,51 @@ def run_wire(args) -> int:
 
                 plat_errors = preflight_platform(platform)
                 if plat_errors:
-                    out.results.append(
-                        PlatformResult(
-                            platform, "failed", reason="; ".join(plat_errors),
-                        ),
-                    )
+                    # Missing config root is a host-surface skip (optional
+                    # platform not installed), not a hard failure. Without this
+                    # `wire all` / sync-root fails on hosts that only run a
+                    # subset of the fleet. Real preflight defects (node, etc.)
+                    # still fail the platform. Classify by the stable marker
+                    # from preflight.NO_CONFIG_ROOT_MARKER (not free prose).
+                    from minni.wire.preflight import NO_CONFIG_ROOT_MARKER
+
+                    if plat_errors and all(
+                        e.startswith(NO_CONFIG_ROOT_MARKER) for e in plat_errors
+                    ):
+                        # Retire any prior wire rows for this platform so a
+                        # removed host surface cannot leave a lagging root
+                        # active in honesty / --strict forever.
+                        try:
+                            from minni.wire.wired import retire_platform
+
+                            _data, n = retire_platform(
+                                platform, dry_run=dry_run,
+                            )
+                            if n:
+                                print(
+                                    f"[wire] retired {n} wired.json row(s) "
+                                    f"for {platform} (no config root)",
+                                    file=sys.stderr,
+                                )
+                        except Exception as exc:  # best-effort; skip still wins
+                            print(
+                                f"[wire] warning: could not retire "
+                                f"{platform} wire rows: {exc}",
+                                file=sys.stderr,
+                            )
+                        out.results.append(
+                            PlatformResult(
+                                platform, "skipped",
+                                reason="; ".join(plat_errors),
+                            ),
+                        )
+                    else:
+                        out.results.append(
+                            PlatformResult(
+                                platform, "failed",
+                                reason="; ".join(plat_errors),
+                            ),
+                        )
                     continue
 
                 mcp_root = None
@@ -383,6 +452,63 @@ def run_wire(args) -> int:
                         PlatformResult(platform, "failed", reason=str(exc)),
                     )
                     continue
+
+                # D11 (#232): the antigravity surface only fully participates
+                # when its agy hook plugin actually registered. Reporting
+                # "wired" with a failed registration buried in extras claimed a
+                # surface that would never fire a hook. An absent agy CLI is
+                # different: the MCP views were genuinely wired, so the result
+                # stays "wired" with the hook gap NAMED in the primary reason
+                # field rather than buried.
+                hook_gap_reason: str | None = None
+                agy_hooks = extras.get("agy_hooks")
+                if isinstance(agy_hooks, dict) and agy_hooks.get("installed") is False:
+                    agy_reason = str(agy_hooks.get("reason", "unknown"))
+                    # Prefer structured error_class from update_agy_plugin_hooks;
+                    # do not classify by substring (a real registration failure
+                    # can mention "path" in nested tool text).
+                    missing_cli = agy_hooks.get("error_class") == "missing_cli"
+                    if missing_cli:
+                        hook_gap_reason = (
+                            f"wired WITHOUT agy hooks: {agy_reason} — lifecycle "
+                            "hooks will not fire until agy is installed and "
+                            "`minni wire antigravity` is re-run"
+                        )
+                    else:
+                        # MCP views already rewritten — record the install root
+                        # so GC / honesty still protect the live payload even
+                        # though hook registration failed (D11 half-state).
+                        if not dry_run:
+                            try:
+                                upsert_wire(
+                                    make_record(
+                                        platform,
+                                        config_path or install_root / ".mcp.json",
+                                        install_root,
+                                        version,
+                                        str(workspace) if workspace else None,
+                                    ),
+                                    dry_run=False,
+                                )
+                            except Exception as rec_exc:  # never hide the fail
+                                extras["wired_record_error"] = (
+                                    f"{type(rec_exc).__name__}: {rec_exc}"
+                                )
+                        out.results.append(PlatformResult(
+                            platform, "failed",
+                            config_path=str(config_path) if config_path else None,
+                            server_path=str(install_root / "dist" / "server.js"),
+                            agent=spec.agent,
+                            workspace=str(workspace) if workspace else None,
+                            reason=(
+                                f"agy hook registration failed: {agy_reason} "
+                                "(MCP views/configs were already updated; "
+                                "install root recorded for GC protection; "
+                                "re-run `minni wire antigravity` once resolved)"
+                            ),
+                            extra=extras,
+                        ))
+                        continue
 
                 server_path = str(install_root / "dist" / "server.js")
                 verify = None
@@ -498,12 +624,13 @@ def run_wire(args) -> int:
                         )
 
                 out.results.append(PlatformResult(
-                    platform, "wired" if not dry_run else "wired",
+                    platform, "wired",
                     config_path=str(config_path) if config_path else None,
                     server_path=server_path,
                     agent=spec.agent,
                     workspace=str(workspace) if workspace else None,
                     verify=verify,
+                    reason=hook_gap_reason,
                     extra=extras,
                 ))
 
@@ -533,10 +660,12 @@ def run_wire(args) -> int:
 
     except WireError as exc:
         print(str(exc), file=sys.stderr)
-        out.status = "failed"
-        if not out.results:
-            out.results.append(PlatformResult("?", "failed", reason=str(exc)))
+        # Always record a failed result. Pre-appended ALL_SKIPS rows alone would
+        # make finalize_status recompute status="skipped" (D5) and hide a hard
+        # payload/install failure from automation that keys on status=="failed".
+        out.results.append(PlatformResult("?", "failed", reason=str(exc)))
         out.finalize_status(dry_run=dry_run)
+        out.status = "failed"
         out.emit()
         return getattr(exc, "exit_code", 1)
 

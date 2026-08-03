@@ -215,6 +215,87 @@ def check_installed(canonical: str) -> tuple[list[str], list[str]]:
     return [], [f"installed: minni {installed} (agrees)"]
 
 
+def _public_version(version: str) -> str:
+    """Strip PEP 440 local segment (+…) so from-repo stamps agree with pyproject.
+
+    ``minni wire --from-repo`` / ``make sync-root`` write
+    ``0.4.1+git.<short>`` into every plugin manifest (see
+    ``wire.from_repo.dev_version``). Exact string equality against the public
+    pyproject version then makes a successful redeploy fail its own verify
+    step. Public/base agreement still catches real drift (``0.3.0`` vs
+    ``0.4.1``). Falls back to a cheap split when packaging is unavailable.
+    """
+    text = str(version or "").strip()
+    if not text:
+        return text
+    try:
+        from packaging.version import Version
+
+        return Version(text).base_version
+    except Exception:
+        return text.split("+", 1)[0].split("-", 1)[0]
+
+
+def _version_agrees(deployed: str, canonical: str) -> bool:
+    if deployed == canonical:
+        return True
+    return bool(deployed) and _public_version(deployed) == _public_version(canonical)
+
+
+def _active_wire_plugin_state(home: Path) -> tuple[set[Path], set[str]]:
+    """Live wire install roots + platforms under ~/.minni/plugin.
+
+    Shared with check_deployments + deploy honesty (``minni.wire.active_roots``):
+    latest ``wired_at`` per platform; root must be a dir with
+    ``payload-manifest.json``; marketplace-cache skip is per-surface.
+    """
+    _src = Path(__file__).resolve().parent.parent / "src"
+    if _src.is_dir() and str(_src) not in sys.path:
+        sys.path.insert(0, str(_src))
+    from minni.wire.active_roots import active_wire_plugin_state
+
+    return active_wire_plugin_state(home)
+
+
+def _active_wire_plugin_roots(home: Path) -> set[Path]:
+    """Live wire install roots (latest per platform)."""
+    roots, _platforms = _active_wire_plugin_state(home)
+    return roots
+
+
+def _is_versioned_wire_plugin_root(root: Path, home: Path) -> bool:
+    """True for ~/.minni/plugin/<version> (not the plugin base itself)."""
+    try:
+        rel = root.resolve().relative_to((home / ".minni" / "plugin").resolve())
+    except (OSError, ValueError):
+        return False
+    return len(rel.parts) == 1 and rel.parts[0] not in {"current", "cache"}
+
+
+def _marketplace_cache_platform(root: Path, home: Path) -> str | None:
+    """Platform that owns this wire-superseded legacy root, or None.
+
+    Parity with scripts/check_deployments._marketplace_cache_platform.
+    """
+    try:
+        rel = str(root.resolve().relative_to(home.resolve()))
+    except (OSError, ValueError):
+        rel = str(root)
+    if rel.startswith(".claude/plugins/cache/"):
+        return "claude-code"
+    if rel.startswith(".codex/plugins/cache/"):
+        return "codex"
+    # Pre-wire Kilo install root; wire-primary points kilo.json at ~/.minni/plugin.
+    if rel.startswith(".config/kilo/plugins/"):
+        return "kilocode"
+    return None
+
+
+def _is_legacy_marketplace_cache_root(root: Path, home: Path) -> bool:
+    """Claude/Codex marketplace cache trees (path shape only)."""
+    return _marketplace_cache_platform(root, home) is not None
+
+
 def check_deployed(canonical: str) -> tuple[list[str], list[str]]:
     """(mismatches, notes). Every deployed plugin manifest under $HOME."""
     mismatches: list[str] = []
@@ -223,8 +304,40 @@ def check_deployed(canonical: str) -> tuple[list[str], list[str]]:
     roots = deployment_roots()
     if not roots:
         return [], ["deployed: no deployments discovered under $HOME"]
+    active_wire, active_platforms = _active_wire_plugin_state(home)
     for root in roots:
         label = str(root).replace(str(home), "~")
+        # Inactive historical wire version dirs: note + skip, do not fail.
+        # Empty active (post-retire wires:[]) must skip *all* such trees.
+        if (
+            _is_versioned_wire_plugin_root(root, home)
+            and root.resolve() not in active_wire
+        ):
+            notes.append(
+                f"deployed: {label} skipped (not an active wire install; "
+                "historical version dir left by non-interactive wire)"
+            )
+            continue
+        # Release-era plugin/current: always skip the logical path (parity
+        # with check_deployments); live payload is the versioned active root.
+        if root.name == "current":
+            try:
+                if root.parent.resolve() == (home / ".minni" / "plugin").resolve():
+                    notes.append(
+                        f"deployed: {label} skipped (legacy plugin/current; "
+                        "wire-primary — not managed by sync-root)"
+                    )
+                    continue
+            except OSError:
+                pass
+        # Per-platform marketplace skip (parity with check_deployments).
+        cache_plat = _marketplace_cache_platform(root, home)
+        if cache_plat is not None and cache_plat in active_platforms:
+            notes.append(
+                f"deployed: {label} skipped (legacy marketplace cache for "
+                f"{cache_plat}; wire-primary — not managed by sync-root)"
+            )
+            continue
         versions: dict[str, list[str]] = {}
         for rel in MANIFEST_RELPATHS:
             path = root / rel
@@ -244,11 +357,19 @@ def check_deployed(canonical: str) -> tuple[list[str], list[str]]:
                 "its version cannot be established"
             )
             continue
-        # One line per deployment when its manifests agree with each other; the
-        # per-file breakdown only appears when they do not.
-        off = {v: files for v, files in versions.items() if v != canonical}
+        # Public/base agreement: from-repo local stamps (+git.<sha>) match the
+        # pyproject public version; real public drift still fails.
+        off = {
+            v: files for v, files in versions.items() if not _version_agrees(v, canonical)
+        }
         if not off:
-            notes.append(f"deployed: {label} at {canonical} (agrees)")
+            shown = next(iter(versions))
+            if shown == canonical:
+                notes.append(f"deployed: {label} at {canonical} (agrees)")
+            else:
+                notes.append(
+                    f"deployed: {label} at {shown!r} (public version agrees with {canonical})"
+                )
         elif len(versions) == 1:
             mismatches.append(f"deployed: {label} at {next(iter(versions))!r} != {canonical!r}")
         else:

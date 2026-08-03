@@ -25,7 +25,10 @@ JUNK = {".DS_Store", "__pycache__", ".pytest_cache"}
 
 
 def _run(cmd: list[str], cwd: Path) -> None:
-    subprocess.run(cmd, cwd=str(cwd), check=True)
+    # Keep wire's stdout contract machine-parseable: child build tools
+    # (npm, emit_build_manifest) must not pollute stdout ahead of WireOutput
+    # JSON. Progress goes to stderr; operators still see it on a TTY.
+    subprocess.run(cmd, cwd=str(cwd), check=True, stdout=sys.stderr)
 
 
 def build_from_repo(repo_root: Path) -> tuple[Path, PayloadManifest]:

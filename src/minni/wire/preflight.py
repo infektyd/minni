@@ -39,13 +39,18 @@ def check_node(min_version: int = 20) -> tuple[bool, str]:
     return True, out.strip()
 
 
+# Stable token for "host surface absent" — wire flow classifies this as skip,
+# not fail. Do not embed this phrase in unrelated preflight failures.
+NO_CONFIG_ROOT_MARKER = "no config root found"
+
+
 def check_config_root(platform: str) -> tuple[bool, str]:
     ok, probed = config_root_exists(platform)
     if ok:
         return True, ""
     paths = ", ".join(probed)
     return False, (
-        f"no config root found for {platform} (probed: {paths}); "
+        f"{NO_CONFIG_ROOT_MARKER} for {platform} (probed: {paths}); "
         "create the platform config or use --install-root"
     )
 

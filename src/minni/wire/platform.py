@@ -27,8 +27,18 @@ PLATFORM_ALIASES = {
 
 VALID_PLATFORMS = frozenset({
     "codex", "claude-code", "kilocode", "gemini", "antigravity",
-    "grok", "generic", "all",
+    "grok", "cursor", "generic", "all",
 })
+
+# D7 (#232): ONE canonical fleet, shared with propagate.py (which carries its
+# own copy — it ships standalone inside the plugin payload and cannot import
+# this package); tests/test_all_fleet_parity.py pins the two copies equal so
+# the commands can never silently disagree about what "all" means. Each
+# command expands `all` to the members it owns and names every excluded
+# member explicitly in its output.
+CANONICAL_FLEET = (
+    "codex", "claude-code", "kilocode", "gemini", "antigravity", "grok", "cursor",
+)
 
 ALL_EXPANSION_V03 = ("codex", "claude-code", "kilocode", "grok")
 GEMINI_SKIP_WARNING = (
@@ -37,22 +47,38 @@ GEMINI_SKIP_WARNING = (
 GEMINI_PROVISIONAL_REASON = (
     "gemini extension-manifest wiring is not yet implemented (open question 8)"
 )
+# Every CANONICAL_FLEET member absent from ALL_EXPANSION_V03 must appear here
+# with the reason, so `wire all` accounts for the whole fleet in its output.
+ALL_SKIPS = {
+    "gemini": GEMINI_SKIP_WARNING,
+    "antigravity": (
+        "run `minni wire antigravity` or `propagate.py update-plugin "
+        "--platform antigravity` (or `--platform cursor`) explicitly — "
+        "shared ~/.gemini tree; excluded from `wire all` so bulk wire and "
+        "propagate do not fight. Prefer `make sync-root` for the full D7 "
+        "fleet (wire-primary hosts + antigravity/cursor)"
+    ),
+    "cursor": (
+        "propagate-managed: run `propagate.py update-plugin --platform cursor`"
+    ),
+}
 
-def config_root_candidates() -> dict[str, tuple[Path, ...]]:
+def config_root_candidates(home: Path | None = None) -> dict[str, tuple[Path, ...]]:
     """Ordered config-root candidates for preflight probes (§6.4).
 
-    Computed per call from the current HOME — never at import time — so a
-    caller (or sandboxed test) that sets HOME after import probes the right
-    home, matching platform_spec()'s late binding.
+    Computed per call from ``home`` (or ambient HOME) — never at import time —
+    so sandboxed tests / MINNI_CHECK_*_HOME snapshots probe the right tree.
     """
-    home = Path(os.environ.get("HOME") or Path.home())
+    base = Path(home) if home is not None else Path(
+        os.environ.get("HOME") or Path.home()
+    )
     return {
-        "codex": (home / ".codex",),
-        "claude-code": (home,),
-        "kilocode": (home / ".config/kilo",),
-        "grok": (home / ".grok",),
-        "gemini": (home / ".gemini",),
-        "antigravity": (home / ".gemini",),
+        "codex": (base / ".codex",),
+        "claude-code": (base,),
+        "kilocode": (base / ".config/kilo",),
+        "grok": (base / ".grok",),
+        "gemini": (base / ".gemini",),
+        "antigravity": (base / ".gemini",),
     }
 
 HOOK_ENTRYPOINTS: dict[str, str] = {
@@ -83,12 +109,16 @@ def expand_platforms(platform: str) -> tuple[list[str], list[tuple[str, str]]]:
     """Return (platforms_to_wire, warnings) for the given platform arg."""
     platform = canonical_platform(platform)
     if platform == "all":
-        return list(ALL_EXPANSION_V03), [("gemini", GEMINI_SKIP_WARNING)]
+        return list(ALL_EXPANSION_V03), list(ALL_SKIPS.items())
     if platform not in VALID_PLATFORMS:
         raise ValueError(
             f"unknown platform {platform!r}; use codex, claude-code, kilocode, "
-            "gemini, antigravity, grok, generic, or all",
+            "gemini, antigravity, grok, cursor, generic, or all",
         )
+    # cursor is fleet-known but propagate-managed only — same skip reason as
+    # `wire all`, not "unknown platform". gemini/antigravity stay wireable.
+    if platform == "cursor":
+        return [], [(platform, ALL_SKIPS["cursor"])]
     return [platform], []
 
 
@@ -178,11 +208,29 @@ def default_config_scan_paths() -> dict[str, Path]:
         ).expanduser(),
         "kilocode": Path("~/.config/kilo/kilo.json").expanduser(),
         "grok": Path("~/.grok/config.toml").expanduser(),
+        # Gemini/antigravity MCP views hold versioned install paths. D11
+        # hard-fail can leave views rewritten without a wired.json row;
+        # scan them so GC cannot orphan a live MCP pointer.
+        "gemini-mcp": Path("~/.gemini/config/mcp_config.json").expanduser(),
+        "antigravity-mcp": Path(
+            "~/.gemini/antigravity/mcp_config.json",
+        ).expanduser(),
+        "antigravity-ide-mcp": Path(
+            "~/.gemini/antigravity-ide/mcp_config.json",
+        ).expanduser(),
+        "antigravity-cli-mcp": Path(
+            "~/.gemini/antigravity-cli/plugins/minni/mcp_config.json",
+        ).expanduser(),
     }
 
 
-def config_root_exists(platform: str) -> tuple[bool, list[str]]:
-    candidates = config_root_candidates().get(canonical_platform(platform), ())
+def config_root_exists(
+    platform: str, home: Path | None = None,
+) -> tuple[bool, list[str]]:
+    candidates = config_root_candidates(home).get(
+        canonical_platform(platform), (),
+    )
     probed = [str(p) for p in candidates]
     ok = any(p.exists() for p in candidates) if candidates else True
     return ok, probed
+
