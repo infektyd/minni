@@ -287,6 +287,21 @@ def handle_health_report(params: dict, request_id: Any, context: HealthContext) 
         # breakdown + oldest timestamp) — no file paths, so this stays
         # outside _HEALTH_REPORT_SENSITIVE_KEYS like vector_backend_lag.
         "inbox_quarantine": {"count": 0, "oldest_quarantined_at": None, "by_reason": {}},
+        # #225-R6 / GA1-1: health never compared document count against vector
+        # count, so a 43% document-vector gap (381/879, all knowledge layer) and
+        # 409 NULL-embedding learnings were invisible to every status surface —
+        # only a manual query could find them. Aggregate counts and ratios only,
+        # no paths and no learning text, so it stays outside
+        # _HEALTH_REPORT_SENSITIVE_KEYS like vector_backend_lag.
+        "embedding_coverage": {},
+        # GA4-1 guardrail: wiring record_score means score_distribution fills
+        # during normal retrieval, and crossing the activation threshold changes
+        # what `confidence` MEANS for every caller (raw blend -> percentile
+        # rank). A feature that switches semantics on a row count with nothing
+        # observable is the silent-degrade class this audit removes, so the
+        # transition is reported. Counts and labels only — no scores — so it
+        # stays outside _HEALTH_REPORT_SENSITIVE_KEYS.
+        "score_calibration": {},
         # W2: last-N dispatch exceptions so a climbing errors.<method> counter is
         # attributable. Sensitive (messages can embed paths/payloads) — redacted
         # to a count for any non-operator caller via _HEALTH_REPORT_SENSITIVE_KEYS.
@@ -325,6 +340,35 @@ def handle_health_report(params: dict, request_id: Any, context: HealthContext) 
             report["afm_loop"]["error"] = str(exc)
 
         db = context.sovereign_db(context.default_config)
+
+        # #225-R6 / GA1-1: the document-to-vector and learning-to-embedding
+        # ratios. Best-effort — a coverage query must never cost the operator
+        # the rest of the health report.
+        try:
+            from minni.backfill import embedding_coverage, vault_embedding_coverage
+
+            coverage = embedding_coverage(db)
+            # grok-review round 3 (finding 4): the drain covers every index
+            # (run_backfill_all_indexes) but this surface sampled only the
+            # shared DB, so "coverage fine" could mask a still-gapped vault.
+            # Counts-only per-vault rollup, same best-effort contract.
+            try:
+                coverage["vaults"] = vault_embedding_coverage(
+                    base_config=context.default_config
+                )
+            except Exception as exc:
+                coverage["vaults"] = {"error": str(exc)}
+            report["embedding_coverage"] = coverage
+        except Exception as exc:
+            report["embedding_coverage"] = {"error": str(exc)}
+
+        try:
+            from minni.scoring import calibration_status
+
+            report["score_calibration"] = calibration_status(db)
+        except Exception as exc:
+            report["score_calibration"] = {"error": str(exc)}
+
         with db.cursor() as c:
             c.execute(
                 """

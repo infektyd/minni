@@ -302,19 +302,32 @@ class FAISSIndex:
         # gate in _ensure_faiss_loaded would then never rebuild from the DB.
         if self._invalidated:
             return
+        # GA4-4 follow-up (grok-review round 4, finding 2): a warm start whose
+        # reconstruct failed leaves _chunk_ids populated and _vectors empty.
+        # Appending to BOTH here would create a partial _vectors that satisfies
+        # rebuild()'s `_chunk_ids and _vectors` guard while the arrays are
+        # mispaired — the exact desync the empty-_vectors skip path exists to
+        # prevent, and the scheduled backfill makes this the steady-state add
+        # path on such an index. Recover the raw vectors first; if that fails,
+        # update only the live index and id maps and keep _vectors honestly
+        # empty so rebuild() keeps taking its logged skip path.
+        if self._chunk_ids and len(self._vectors) != len(self._chunk_ids):
+            if not self._reconstruct_vectors_from_index():
+                self._vectors = []
+                self._chunk_ids.append(chunk_id)
+                idx = len(self._chunk_ids) - 1
+                self._id_map[idx] = chunk_id
+                self._reverse_map[chunk_id] = idx
+                self._index_add_normalized(embedding)
+                return
+
         self._chunk_ids.append(chunk_id)
         self._vectors.append(embedding.copy())
         idx = len(self._chunk_ids) - 1
         self._id_map[idx] = chunk_id
         self._reverse_map[chunk_id] = idx
 
-        if self._faiss and self._index is not None:
-            vec = embedding.astype(np.float32).reshape(1, -1)
-            norm = np.linalg.norm(vec)
-            if norm > 1e-8:
-                vec = vec / norm
-            self._index.add(vec)
-
+        if self._index_add_normalized(embedding):
             # Check if we need to upgrade to HNSW
             if (self._current_type == "flat"
                     and self.config.faiss_index_type == "auto"
@@ -323,6 +336,17 @@ class FAISSIndex:
                             self.count)
                 all_vecs = np.array(self._vectors, dtype=np.float32)
                 self.build_from_vectors(self._chunk_ids, all_vecs)
+
+    def _index_add_normalized(self, embedding: np.ndarray) -> bool:
+        """Append one normalized vector to the live FAISS index, if any."""
+        if not (self._faiss and self._index is not None):
+            return False
+        vec = embedding.astype(np.float32).reshape(1, -1)
+        norm = np.linalg.norm(vec)
+        if norm > 1e-8:
+            vec = vec / norm
+        self._index.add(vec)
+        return True
 
     def remove(self, chunk_id: int) -> None:
         """
@@ -447,12 +471,58 @@ class FAISSIndex:
 
             return results
 
+    def _reconstruct_vectors_from_index(self) -> bool:
+        """Recover raw vectors from the live FAISS index. Returns True on success.
+
+        GA4-4: load_from_disk restores the FAISS index but sets _vectors = [],
+        and every rebuild path is guarded on _vectors being non-empty — so after
+        a warm start rebuild() silently did nothing and chunks removed since the
+        snapshot stayed searchable. FAISS can hand the vectors back via
+        reconstruct_n, which makes the warm-start index rebuildable again.
+
+        Best-effort by contract: a quantized index reconstructs lossily and some
+        index types cannot reconstruct at all. Callers must treat False as "no
+        raw vectors", never as "no vectors exist".
+        """
+        if self._index is None or not self._chunk_ids:
+            return False
+        try:
+            count = int(self._index.ntotal)
+            if count <= 0:
+                return False
+            restored = self._index.reconstruct_n(0, count)
+            vectors = [np.array(restored[i], dtype=np.float32) for i in range(count)]
+            if len(vectors) != len(self._chunk_ids):
+                logger.warning(
+                    "FAISS reconstruct returned %d vectors for %d chunk ids; "
+                    "leaving raw vectors empty rather than mispairing them",
+                    len(vectors), len(self._chunk_ids),
+                )
+                return False
+            self._vectors = vectors
+            return True
+        except Exception as exc:
+            logger.debug("FAISS vector reconstruction unavailable: %s", exc)
+            return False
+
     def rebuild(self) -> None:
         """Force a full rebuild from stored vectors (cleans up deletions)."""
         with self._lock:
             self._rebuild_locked()
 
     def _rebuild_locked(self) -> None:
+        if self._chunk_ids and not self._vectors:
+            # GA4-4: a disk-restored index has chunk ids but no raw vectors.
+            # Try to recover them rather than falling through to a silent
+            # no-op that leaves removed chunks searchable.
+            if not self._reconstruct_vectors_from_index():
+                logger.warning(
+                    "FAISS rebuild skipped: %d chunk id(s) but no raw vectors, "
+                    "and the index could not reconstruct them. Removals will "
+                    "not be compacted until the index is rebuilt from the DB.",
+                    len(self._chunk_ids),
+                )
+                return
         if self._chunk_ids and self._vectors:
             # Filter out removed
             live_ids = []
@@ -575,8 +645,14 @@ class FAISSIndex:
                 self._chunk_ids = list(chunk_ids)
                 self._id_map = {i: cid for i, cid in enumerate(chunk_ids)}
                 self._reverse_map = {cid: i for i, cid in enumerate(chunk_ids)}
-                # We do not have raw vectors; set to empty (rebuild will re-load if needed)
+                # GA4-4: this used to set _vectors = [] and leave it there, which
+                # made the warm-started index permanently un-rebuildable — every
+                # rebuild path is guarded on _vectors, so removals were never
+                # compacted and deleted chunks stayed searchable. Recover the raw
+                # vectors from the index itself; if this index type cannot
+                # reconstruct, rebuild() now says so out loud instead of no-opping.
                 self._vectors = []
+                self._reconstruct_vectors_from_index()
                 quantization = getattr(self.config, "embedding_quantization", "fp32")
                 if quantization == "int8" and hasattr(faiss_index, "hnsw"):
                     self._current_type = "hnsw-sq-int8"

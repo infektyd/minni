@@ -182,6 +182,22 @@ def _page_type_to_authority(page_type: Optional[str], agent: str) -> Optional[st
 _correction_class_page_types = correction_class_page_types
 
 
+def _effective_decay(r: Dict, fallback: Optional[float] = None) -> Optional[float]:
+    """The decay the ranking and confidence legs actually used.
+
+    grok-review round 6 (finding 3): decay_applied carries the correction
+    floor + clamp both scoring legs apply (_score_merged_doc and
+    _apply_decay_rerank_attenuation). Provenance must report that value, not
+    the raw decay_score column — a correction floored to 0.5 that provenance
+    reports as 0.01 is a lie to any consumer re-blending the fields. `is not
+    None` checks, not `or`: a legitimate 0.0 decay must survive.
+    """
+    for value in (r.get("decay_applied"), r.get("decay_score"), fallback):
+        if value is not None:
+            return value
+    return None
+
+
 def _path_to_wikilink(path: str) -> Optional[str]:
     """Convert an absolute path to a [[wikilink]] style reference."""
     if not path:
@@ -1190,6 +1206,85 @@ class RetrievalEngine:
                 c["rerank_score"] = boost
             c["salience_boost"] = boost
 
+    def _apply_decay_rerank_attenuation(self, candidates: List[Dict]) -> None:
+        """GA4-2 (reranker leg): propagate memory decay into the cross-encoder
+        ordering. Exactly the bypass class _apply_correction_rerank_boost above
+        was written to close: decay_score only ever entered final_score
+        (_score_merged_doc), but the DEFAULT path (reranker_enabled=True) sorts
+        and reports rerank_score, so a scheduled decay pass changed nothing an
+        operator could observe on default config.
+
+        Same sign-safe treatment as the correction boost, since rerank_score is
+        a raw logit: a positive logit is scaled DOWN by decay, a negative logit
+        is pushed further down (divided by decay), so attenuation always moves a
+        stale candidate down relative to its raw logit. A logit of exactly 0.0
+        maps to (decay - 1.0) — zero when undecayed, negative once decayed —
+        because a multiplicative attenuation of zero is a no-op that would leave
+        a fully-decayed candidate tied with a fresh one.
+
+        Correction-class candidates get the same recall-F4 decay floor they get
+        in _score_merged_doc, so the two legs agree on what a correction's
+        effective decay is. Runs AFTER the correction boost (grok-review
+        round 3, finding 3): running decay first mapped a raw 0.0 logit to the
+        negative decay - 1.0, so the boost's zero-logit special case never
+        fired and a decayed zero-logit correction sank BELOW an undecayed
+        zero-logit non-correction. The non-zero branches are commutative
+        multiplications, so only the zero dispatch depends on the order — and
+        it must see the model-pure logit.
+
+        The rerank cache stores the raw model score BEFORE this adjustment, so
+        cached entries stay model-pure and attenuation is re-derived every call.
+        """
+        floor = float(self.config.correction_decay_floor)
+        for c in candidates:
+            decay = c.get("decay_score")
+            if decay is None:
+                decay = 1.0
+            decay = float(decay)
+            page_type = str(c.get("page_type") or "").lower()
+            if page_type in self._correction_types:
+                decay = max(decay, floor)
+            # Clamp to the (0, 1] the decay pass is contracted to produce; a
+            # decay > 1 would silently become a promotion channel.
+            decay = max(0.0, min(1.0, decay))
+            c["decay_applied"] = decay
+            if decay == 1.0:
+                continue
+            score = float(c.get("rerank_score") or 0.0)
+            if score > 0:
+                c["rerank_score"] = score * decay
+            elif score < 0:
+                # decay == 0.0 would divide by zero; a fully decayed negative
+                # logit is already as low as the ordering needs it to be.
+                c["rerank_score"] = score / decay if decay > 0 else score * 2.0
+            else:
+                c["rerank_score"] = decay - 1.0
+
+    def _apply_rerank_score_adjustments(self, candidates: List[Dict]) -> None:
+        """Both post-model adjustments. Single call site so the two legs
+        cannot drift.
+
+        grok-review round 2 (finding 1): preserve the model-pure logit as
+        raw_rerank_score BEFORE any adjustment. compute_confidence takes
+        decay_factor as its own input, so feeding it the decay-attenuated
+        rerank_score applies decay twice — biasing the HyDE trigger, the
+        calibration window (record=True), and provenance for aged docs.
+        Ranking sorts on the adjusted rerank_score; confidence and provenance
+        read raw_rerank_score.
+
+        grok-review round 3 (finding 3): boost BEFORE decay. Both adjustments
+        special-case a 0.0 score, and only the boost-first order lets each
+        special case see the score it was written for: the boost dispatches on
+        the model-pure logit (zero-logit corrections lift to +boost, which
+        decay then attenuates to boost * decay > 0), while decay's zero case
+        keeps handling genuinely-zero non-corrections. The non-zero branches
+        multiply commutatively, so the two legs still agree with
+        final_score = rrf * decay * (1 + boost)."""
+        for c in candidates:
+            c["raw_rerank_score"] = float(c.get("rerank_score") or 0.0)
+        self._apply_correction_rerank_boost(candidates)
+        self._apply_decay_rerank_attenuation(candidates)
+
     def _rerank(self, query: str, candidates: List[Dict]) -> List[Dict]:
         """
         Re-rank candidates using a cross-encoder.
@@ -1232,7 +1327,7 @@ class RetrievalEngine:
         if not missing:
             for i, c in enumerate(candidates):
                 c["rerank_score"] = float(all_scores[i])
-            self._apply_correction_rerank_boost(candidates)
+            self._apply_rerank_score_adjustments(candidates)
             candidates.sort(key=lambda x: x.get("rerank_score", 0), reverse=True)
             return candidates
 
@@ -1260,7 +1355,7 @@ class RetrievalEngine:
                 c["rerank_score"] = float(all_scores[i] or 0.0)
 
             # Sort by cross-encoder score (correction salience applied first)
-            self._apply_correction_rerank_boost(candidates)
+            self._apply_rerank_score_adjustments(candidates)
             candidates.sort(key=lambda x: x.get("rerank_score", 0), reverse=True)
         except Exception as e:
             logger.warning("Re-ranking failed: %s — falling back to RRF scores", e)
@@ -1438,6 +1533,16 @@ class RetrievalEngine:
             floor = float(self.config.correction_decay_floor)
             decay = max(decay, floor)
         d["salience_boost"] = boost
+        # grok-review round 5 (finding 3): stamp the EFFECTIVE decay (same
+        # clamp as the rerank leg) so confidence reads the value ranking used —
+        # a correction floored to 0.5 must not rank semi-fresh while its
+        # confidence and recorded calibration sample say near-dead 0.01.
+        # Round 7 (finding 2): final_score multiplies the SAME clamped value —
+        # multiplying the raw decay let a poison decay_score of 2.0 promote
+        # (rrf * 2) on the non-rerank leg while the rerank leg, the stamp, and
+        # confidence all treated it as 1.0.
+        decay = max(0.0, min(1.0, float(decay)))
+        d["decay_applied"] = decay
         d["final_score"] = d["rrf_score"] * decay * (1.0 + boost)
 
     def _rrf_merge(
@@ -1572,6 +1677,10 @@ class RetrievalEngine:
         def _pr2_fields(result: Dict, existing: Optional[Dict] = None) -> Dict:
             fields = {
                 "confidence": result.get("confidence"),
+                # Survives every depth tier so the daemon RPC boundary can
+                # record (then pop) the pre-calibration raw for the final
+                # merged set — GA4-1, grok-review round 4 (finding 1).
+                "confidence_raw": result.get("confidence_raw"),
                 "rationale": result.get("rationale"),
                 "privacy_level": result.get("privacy_level"),
                 "source_authority": result.get("source_authority"),
@@ -1600,9 +1709,16 @@ class RetrievalEngine:
                 "doc_id": result.get("doc_id"),
                 "chunk_id": result.get("chunk_id"),
                 "confidence": result.get("confidence"),
+                # grok-review round 7 (finding 1): the GA4-1 carrier must ride
+                # EVERY tier — omitting it here meant headline hits never fed
+                # score_distribution and never got rewritten onto the shared
+                # basis while the same query at snippet depth did both.
+                # test_every_depth_tier_carries_the_calibration_carrier pins
+                # all four tiers so they cannot drift again.
+                "confidence_raw": result.get("confidence_raw"),
                 "age_days": result.get("age_days"),
                 "layer": result.get("layer"),
-                "decay_factor": result.get("decay_score") or result.get("decay_factor"),
+                "decay_factor": _effective_decay(result, result.get("decay_factor")),
                 "privacy_level": result.get("privacy_level"),
                 "review_state": result.get("review_state"),
                 "instruction_like": result.get("instruction_like"),
@@ -1641,8 +1757,16 @@ class RetrievalEngine:
                 "fts_rank": result.get("fts_rank"),
                 "semantic_rank": result.get("sem_rank"),
                 "rrf_score": result.get("rrf_score"),
-                "cross_encoder_score": result.get("rerank_score"),
-                "decay_factor": result.get("decay_score"),
+                # Raw logit: provenance also exposes decay_factor, so a
+                # consumer re-blending the two must not get a pre-decayed score.
+                "cross_encoder_score": result.get(
+                    "raw_rerank_score", result.get("rerank_score")
+                ),
+                # round 6 (finding 3): the EFFECTIVE decay ranking/confidence
+                # used (correction floor + clamp), or provenance lies for
+                # correction-class docs (reports 0.01 while everything ranked
+                # on 0.5).
+                "decay_factor": _effective_decay(result),
                 "doc_id": result.get("doc_id"),
                 "chunk_id": result.get("chunk_id"),
                 "agent_origin": result.get("agent", ""),
@@ -1944,8 +2068,18 @@ class RetrievalEngine:
         return ranked[:limit]
 
     def _normalize_layers(self, layers: Optional[Sequence[str]]) -> Optional[set]:
+        """None → no filter. grok-review round 5 (finding 2): a bare string is
+        ONE layer, not an iterable of its characters — iterating "episodic"
+        produced an empty set, and empty sets fell open to an unscoped search.
+        The RPC edge coerces strings too, but the function that owns the
+        contract must not depend on every caller remembering to. An explicit
+        filter that normalizes to zero valid layers stays an EMPTY set;
+        filtering callers fail closed on it (match nothing), because a request
+        that asked for a scope must never silently get the unscoped corpus."""
         if layers is None:
             return None
+        if isinstance(layers, str):
+            layers = [layers]
         valid = {"identity", "episodic", "knowledge", "artifact"}
         return {str(layer).lower() for layer in layers if str(layer).lower() in valid}
 
@@ -1975,11 +2109,13 @@ class RetrievalEngine:
         layer_set = self._normalize_layers(layers)
         start_ts = self._parse_iso_date(start_date)
         end_ts = self._parse_iso_date(end_date, end_of_day=True)
-        if not layer_set and start_ts is None and end_ts is None:
+        # `is None`, not falsy: an explicit filter with zero valid layers must
+        # fail CLOSED (empty set → no candidate matches), not fall open.
+        if layer_set is None and start_ts is None and end_ts is None:
             return candidates
         filtered = []
         for r in candidates:
-            if layer_set and (r.get("layer") or "knowledge") not in layer_set:
+            if layer_set is not None and (r.get("layer") or "knowledge") not in layer_set:
                 continue
             if start_ts is None and end_ts is None:
                 filtered.append(r)
@@ -2036,6 +2172,9 @@ class RetrievalEngine:
         end_ts = self._parse_iso_date(end_date, end_of_day=True)
         filter_params: list = []
         clauses = ["vault_fts MATCH ?"]
+        if layer_set is not None and not layer_set:
+            # Explicit filter, zero valid layers — fail closed, not unscoped.
+            return []
         if layer_set:
             placeholders = ",".join("?" * len(layer_set))
             clauses.append(f"COALESCE(ce.layer, d.layer, 'knowledge') IN ({placeholders})")
@@ -2709,9 +2848,25 @@ class RetrievalEngine:
                         probe = dict(r)
                         probe["confidence"] = compute_confidence(
                             rrf_score=r.get("rrf_score"),
-                            cross_encoder_score=r.get("rerank_score"),
-                            decay_factor=r.get("decay_score"),
-                            db=self.db,
+                            # grok-review round 2: the raw logit — rerank_score
+                            # is already decay-attenuated and decay_factor is
+                            # passed separately below.
+                            cross_encoder_score=r.get(
+                                "raw_rerank_score", r.get("rerank_score")
+                            ),
+                            # round 5 (finding 3): the effective decay ranking
+                            # used (correction floor + clamp), not the raw one.
+                            decay_factor=r.get(
+                                "decay_applied", r.get("decay_score")
+                            ),
+                            # round 6 (finding 2): raw blend ONLY. Calibrating
+                            # against self.db meant shared-window activation
+                            # silently retuned when HyDE fires (the floor is
+                            # tuned for raw blends) while vault engines kept
+                            # comparing raw — a speculative trigger must not
+                            # depend on calibration semantics, same rule as
+                            # record.
+                            db=None,
                         )
                         probe_results.append(probe)
 
@@ -2908,14 +3063,47 @@ class RetrievalEngine:
 
             # Compute confidence
             try:
+                from minni.scoring import raw_confidence
+
+                # grok-review round 2: raw logit, not the decay-attenuated
+                # rerank_score — decay_factor below already applies decay
+                # once; the attenuated value would apply it twice and bias
+                # the calibration window low for aged docs.
+                ce_for_confidence = r.get(
+                    "raw_rerank_score", r.get("rerank_score")
+                )
+                # round 5 (finding 3): the effective decay ranking used
+                # (correction floor + clamp), not the raw decay_score — the
+                # legs must not disagree about how fresh a correction is.
+                decay_for_confidence = r.get(
+                    "decay_applied", r.get("decay_score")
+                )
                 confidence = compute_confidence(
                     rrf_score=r.get("rrf_score"),
-                    cross_encoder_score=r.get("rerank_score"),
-                    decay_factor=r.get("decay_score"),
-                    db=self.db,
+                    cross_encoder_score=ce_for_confidence,
+                    decay_factor=decay_for_confidence,
+                    # GA4-1 / grok-review rounds 4-5 (finding 1): formatting
+                    # neither records NOR calibrates. Production search is
+                    # multi-call AND multi-engine — scope=both fans out
+                    # personal (vault db) + combined (vaults + shared) — so
+                    # per-engine calibration made one response mix percentile
+                    # ranks (shared window) with raw blends (vault windows,
+                    # never fed), and per-call recording padded the window
+                    # with duplicate/discarded scores. The RPC boundary
+                    # (recall.handle_search) records confidence_raw into the
+                    # SHARED window and rewrites confidence onto that single
+                    # basis for the whole payload.
+                    db=None,
+                    record=False,
+                )
+                confidence_raw = raw_confidence(
+                    r.get("rrf_score"),
+                    ce_for_confidence,
+                    decay_for_confidence,
                 )
             except Exception:
                 confidence = None
+                confidence_raw = None
 
             # Detect injection in chunk text
             chunk_text = r.get("chunk_text", "")
@@ -2947,8 +3135,17 @@ class RetrievalEngine:
                 "fts_rank": r.get("fts_rank"),
                 "semantic_rank": r.get("sem_rank"),
                 "rrf_score": r.get("rrf_score"),
-                "cross_encoder_score": r.get("rerank_score"),
-                "decay_factor": r.get("decay_score"),
+                # Raw logit: provenance also exposes decay_factor, so a
+                # consumer re-blending the two must not get a pre-decayed score.
+                "cross_encoder_score": r.get(
+                    "raw_rerank_score", r.get("rerank_score")
+                ),
+                # round 6 (finding 3): the EFFECTIVE decay ranking and
+                # confidence used (correction floor + clamp) — reporting the
+                # raw 0.01 while every leg ranked on 0.5 made provenance lie
+                # for correction-class docs. The raw column stays available as
+                # decay_score on the full-depth envelope.
+                "decay_factor": _effective_decay(r),
                 "agent_origin": r.get("agent", ""),
                 "age_days": age_days,
                 "doc_id": r["doc_id"],
@@ -2981,12 +3178,20 @@ class RetrievalEngine:
                 "rrf_score": r.get("rrf_score"),
                 "rerank_score": r.get("rerank_score"),
                 "decay_score": r.get("decay_score"),
+                # round 6 (finding 3): carry the effective decay so
+                # _apply_depth's headline decay_factor reports what the legs
+                # actually used, not the raw column.
+                "decay_applied": r.get("decay_applied"),
                 "layer": r.get("layer", "knowledge"),
                 "chunk_text": chunk_text,
                 "heading_context": r.get("heading_context", ""),
                 "token_count": r.get("token_count", 0),
                 # PR-2 envelope fields
                 "confidence": confidence,
+                # Pre-calibration raw blend for the RPC boundary to record
+                # (and pop) over the final merged result set — see the GA4-1
+                # note on compute_confidence above.
+                "confidence_raw": confidence_raw,
                 "age_days": age_days,
                 "provenance": provenance,
                 "privacy_level": privacy_level,
@@ -3299,39 +3504,61 @@ class RetrievalEngine:
 
         return self._apply_depth(raw, depth)
 
+    #: Event types that exist for observability, not as recallable memory.
+    #: `recall` rows are the durable recall trace (minnid_runtime.recall writes
+    #: one per search, TTL'd by trim_recall_traces) — surfacing them would make
+    #: every episodic search return a log of its own past searches.
+    EPISODIC_NON_MEMORY_TYPES: tuple = ("recall",)
+
     def search_episodic(
         self,
         query: str,
         agent_id: Optional[str] = None,
         limit: int = 10,
+        exclude_event_types: Optional[Sequence[str]] = None,
     ) -> List[Dict]:
-        """Search episodic events via FTS5."""
+        """Search episodic events via FTS5.
+
+        ``exclude_event_types`` drops observability-only rows; the search RPC
+        passes EPISODIC_NON_MEMORY_TYPES. Default None keeps every event, so
+        existing direct callers see no change.
+        """
         safe_q = self._sanitize_fts_query(query)
         if not safe_q:
             return []
 
+        excluded = [str(t) for t in (exclude_event_types or ())]
+        type_clause = ""
+        type_params: list = []
+        if excluded:
+            type_clause = (
+                " AND (e.event_type IS NULL OR e.event_type NOT IN "
+                f"({','.join('?' * len(excluded))}))"
+            )
+            type_params = excluded
+
         results = []
         with self.db.cursor() as c:
             if agent_id:
-                c.execute("""
+                c.execute(f"""
                     SELECT ef.event_id, ef.agent_id, ef.content, e.event_type,
                            e.task_id, e.thread_id, e.created_at
                     FROM episodic_fts ef
                     JOIN episodic_events e ON e.event_id = ef.event_id
-                    WHERE episodic_fts MATCH ? AND ef.agent_id = ?
+                    WHERE episodic_fts MATCH ? AND ef.agent_id = ?{type_clause}
                     ORDER BY rank
                     LIMIT ?
-                """, (safe_q, agent_id, limit))
+                """, (safe_q, agent_id, *type_params, limit))
             else:
-                c.execute("""
+                c.execute(f"""
                     SELECT ef.event_id, ef.agent_id, ef.content, e.event_type,
                            e.task_id, e.thread_id, e.created_at
                     FROM episodic_fts ef
                     JOIN episodic_events e ON e.event_id = ef.event_id
-                    WHERE episodic_fts MATCH ?
+                    WHERE episodic_fts MATCH ?{type_clause}
                     ORDER BY rank
                     LIMIT ?
-                """, (safe_q, limit))
+                """, (safe_q, *type_params, limit))
 
             for row in c.fetchall():
                 results.append(dict(row))

@@ -1180,6 +1180,177 @@ async def _vault_watch_runner():
             raise
 
 
+def _decay_enabled() -> bool:
+    """Run the scheduled decay pass (MINNI_DECAY=off to disable)."""
+    return (os.environ.get("MINNI_DECAY", "on") or "on").strip().lower() != "off"
+
+
+def _decay_interval() -> int:
+    try:
+        raw = int(os.environ.get("MINNI_DECAY_INTERVAL", "86400"))
+    except (TypeError, ValueError):
+        return 86400
+    # decay.run_decay's own contract is "should be called daily"; below an hour
+    # the pass costs more than the freshness it buys, since decay_score moves
+    # on a multi-day half-life.
+    return max(3600, raw)
+
+
+def _decay_sweep_once() -> dict:
+    """Blocking decay pass over the shared index and every vault. Runs off-loop."""
+    from minni.decay import run_decay_all_indexes
+
+    return run_decay_all_indexes(DEFAULT_CONFIG)
+
+
+async def _decay_runner():
+    """Audit #225-R2: run_decay was reachable ONLY from the manual CLI and no
+    launchd job ever called it, so every document sat at decay_score=1.0 —
+    including documents indexed months earlier, against a declared 7-day
+    half-life. Recall was scoring a corpus with decay structurally disabled.
+
+    The pass is idempotent by construction: new_score is recomputed from
+    absolute timestamps and access_count, never from the previous score, so a
+    restart-heavy machine that sweeps more often than planned converges to the
+    same scores rather than compounding them.
+
+    Same shutdown contract as _vault_watch_runner: `while True` plus explicit
+    task cancellation, because the `_running` global is still False when main()
+    creates this task.
+    """
+    interval = _decay_interval()
+    logger.info("Decay pass enabled: every %ss", interval)
+    # First sweep is deferred: daemon start is already paying for socket setup,
+    # migrations and model warmup, and decay is never urgent to the second.
+    initial_delay = min(300, interval)
+    try:
+        await asyncio.sleep(initial_delay)
+    except asyncio.CancelledError:
+        raise
+    while True:
+        try:
+            stats = await asyncio.to_thread(_decay_sweep_once)
+            for index_name, s in (stats or {}).items():
+                if not isinstance(s, dict):
+                    continue
+                if s.get("error"):
+                    logger.warning("Decay: %s failed: %s", index_name, s["error"])
+                elif s.get("updated"):
+                    logger.info(
+                        "Decay: %s updated=%s reinforced=%s",
+                        index_name, s.get("updated"), s.get("reinforced"),
+                    )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # A failed pass must never take the daemon down; retry next tick.
+            logger.exception("Decay pass failed")
+        try:
+            await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            raise
+
+
+def _backfill_enabled() -> bool:
+    """Drain the embedding backlog (MINNI_BACKFILL=off to disable)."""
+    return (os.environ.get("MINNI_BACKFILL", "on") or "on").strip().lower() != "off"
+
+
+def _backfill_interval() -> int:
+    try:
+        raw = int(os.environ.get("MINNI_BACKFILL_INTERVAL", "3600"))
+    except (TypeError, ValueError):
+        return 3600
+    return max(300, raw)
+
+
+def _backfill_sweep_once() -> dict:
+    """Blocking bounded backfill pass over every index. Runs off-loop.
+
+    grok-review round 1 (finding 1): committing chunk_embeddings rows is not
+    enough to make a document searchable on a WARM daemon —
+    retrieval._ensure_faiss_loaded early-returns while faiss_index.count > 0, so
+    the live semantic index never sees rows written underneath it and coverage
+    would climb while the documents stayed invisible to the semantic leg until a
+    restart. Push each backfilled document into the live index through the same
+    path store-time indexing uses.
+    """
+    from minni.backfill import run_backfill_all_indexes
+
+    def _refresh(chunk_ids, vectors):
+        engine = _lazy_retrieval()
+        engine._refresh_live_faiss(chunk_ids, vectors)
+
+    results = run_backfill_all_indexes(DEFAULT_CONFIG, on_vectors=_refresh)
+
+    # grok-review round 2 (finding 2): on_vectors covers the SHARED index only.
+    # Vault engines memoized in _vault_retrieval_cache keep their warm FAISS
+    # index (count > 0 → _ensure_faiss_loaded early-returns), so backfilled
+    # vault rows would stay invisible to semantic recall until restart — the
+    # same blindness the shared-index refresh above exists to prevent. Drop the
+    # cache when any vault made progress, exactly as the vault watch does; the
+    # next search rebuilds the engine and loads the new rows.
+    for name, s in results.items():
+        if name == "shared" or not isinstance(s, dict):
+            continue
+        docs = s.get("documents")
+        if isinstance(docs, dict) and (docs.get("documents") or 0) > 0:
+            _vault_retrieval_cache.clear()
+            logger.info(
+                "Backfill: vault %s gained vectors — cleared per-vault "
+                "retrieval cache", name,
+            )
+            break
+
+    return results
+
+
+async def _backfill_runner():
+    """Audit #225-R6 / GA1-1: two write paths degrade to "no vector" and neither
+    ever retried. 381 of 879 shared-index documents had no chunk_embeddings rows
+    and 409 learnings had a NULL embedding — both permanently excluded from
+    semantic recall, because the degraded status was logged and nothing queued a
+    retry. A log line is not a queue; this is the queue.
+
+    Bounded per pass (backfill.DEFAULT_BATCH) so the drain never holds a long
+    write lock against live recall — the backlog empties over several passes.
+    """
+    interval = _backfill_interval()
+    logger.info("Embedding backfill enabled: every %ss", interval)
+    initial_delay = min(600, interval)
+    try:
+        await asyncio.sleep(initial_delay)
+    except asyncio.CancelledError:
+        raise
+    while True:
+        try:
+            stats = await asyncio.to_thread(_backfill_sweep_once)
+            for index_name, result in (stats or {}).items():
+                if not isinstance(result, dict):
+                    continue
+                if result.get("error"):
+                    logger.warning(
+                        "Backfill: %s failed: %s", index_name, result["error"]
+                    )
+                    continue
+                docs = result.get("documents") or {}
+                learnings = result.get("learnings") or {}
+                if docs.get("documents") or learnings.get("embedded"):
+                    logger.info(
+                        "Backfill: %s — %s document(s), %s learning(s) embedded",
+                        index_name, docs.get("documents", 0),
+                        learnings.get("embedded", 0),
+                    )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Embedding backfill pass failed")
+        try:
+            await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            raise
+
+
 def _handle_daemon_endorse(params: dict, request_id: Any) -> dict:
     return _runtime_handle_daemon_endorse(params, request_id, _afm_context())
 
@@ -1692,6 +1863,18 @@ def main():
     if _vault_watch_enabled():
         vault_watch_task = loop.create_task(_vault_watch_runner())
 
+    # Scheduled decay pass (MINNI_DECAY=off to disable). Nothing else calls
+    # run_decay outside the manual CLI, so without this the corpus never decays.
+    decay_task = None
+    if _decay_enabled():
+        decay_task = loop.create_task(_decay_runner())
+
+    # Embedding backfill (MINNI_BACKFILL=off to disable). Without it the
+    # document/learning vector gap is permanent — nothing else retries.
+    backfill_task = None
+    if _backfill_enabled():
+        backfill_task = loop.create_task(_backfill_runner())
+
     # Model warmup. Scheduled AFTER the socket is being served, so the daemon is
     # answerable during the load: an early caller still gets the lazy path, it
     # just no longer has to be the one that pays for it.
@@ -1713,6 +1896,10 @@ def main():
             afm_task.cancel()
         if vault_watch_task is not None:
             vault_watch_task.cancel()
+        if decay_task is not None:
+            decay_task.cancel()
+        if backfill_task is not None:
+            backfill_task.cancel()
         if warmup_task is not None:
             warmup_task.cancel()
 

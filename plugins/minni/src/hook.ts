@@ -64,6 +64,7 @@ import type { PreToolUseDecisionOutput } from "./recall-guard.js";
 import {
   ackHandoff,
   BOOT_RECALL_LAYERS,
+  buildBootRecallSlice,
   buildStatusReport,
   extractIdentityBody,
   extractLearningsSection,
@@ -421,13 +422,7 @@ async function handleSessionStart(payload: Record<string, unknown>): Promise<Hoo
         : { ok: false, status: "error", error: contradictions.error },
     recall:
       recall.ok && recall.data
-        ? {
-            ok: true,
-            results: recall.data.results,
-            agent_origin: recall.data.agent_id ?? CLAUDECODE_AGENT_ID,
-            layer: recall.data.layer,
-            layers: BOOT_RECALL_LAYERS,
-          }
+        ? buildBootRecallSlice(recall.data, CLAUDECODE_AGENT_ID)
         : { ok: false, error: recall.error },
     recent_learnings:
       recentLearnings.ok && recentLearnings.data?.context

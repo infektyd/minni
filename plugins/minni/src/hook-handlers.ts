@@ -73,6 +73,7 @@ import type {
 } from "./recall-guard.js";
 import {
   BOOT_RECALL_LAYERS,
+  buildBootRecallSlice,
   buildStatusReport,
   extractIdentityBody,
   extractLearningsSection,
@@ -831,13 +832,7 @@ export function createHookHandlers(
           : { ok: false, status: "error", error: contradictions.error },
       recall:
         recall.ok && recall.data
-          ? {
-              ok: true,
-              results: recall.data.results,
-              agent_origin: recall.data.agent_id ?? config.agentId,
-              layer: recall.data.layer,
-              layers: BOOT_RECALL_LAYERS,
-            }
+          ? buildBootRecallSlice(recall.data, config.agentId)
           : { ok: false, error: recall.error },
       ...(tail !== undefined
         ? { audit_tail: tail.entries.slice(-5).map((entry) => entry.split("\n")[0]) }

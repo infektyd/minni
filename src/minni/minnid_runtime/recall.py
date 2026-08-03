@@ -130,6 +130,23 @@ def backend_badge(backends: Any) -> str:
     return "+".join(names)
 
 
+def _episodic_layer_requested(layers: Any) -> bool:
+    """True when the episodic layer is in scope for this search.
+
+    No ``layers`` filter means every advertised layer, episodic included — the
+    same convention retrieval._filter_candidates uses (a None layer_set filters
+    nothing). An explicit filter must name it.
+    """
+    if layers is None:
+        return True
+    if isinstance(layers, str):
+        return layers.strip().lower() == "episodic"
+    try:
+        return any(str(layer).strip().lower() == "episodic" for layer in layers)
+    except TypeError:
+        return False
+
+
 def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict:
     """Search Minni via hybrid retrieval.
 
@@ -181,6 +198,13 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
     budget_tokens_param = params.get("budget_tokens")
     backend_param = params.get("backend", "auto")
     layers = params.get("layers")
+    # grok-review round 4 (finding 3): normalize a bare-string `layers` ONCE at
+    # the RPC edge. _episodic_layer_requested handles the string form, but
+    # retrieval._normalize_layers iterates it character by character — an empty
+    # layer set, i.e. NO document filter — so layers="episodic" ran an
+    # episodic-scoped search that still returned knowledge/identity documents.
+    if isinstance(layers, str):
+        layers = [layers]
     sort = str(params.get("sort", "semantic"))
     start_date = params.get("start_date")
     end_date = params.get("end_date")
@@ -290,6 +314,77 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
             except Exception as pack_exc:
                 context.logger.warning("pack_results failed: %s - returning unbudgeted results", pack_exc)
 
+        # GA4-1 / grok-review rounds 4-5 (finding 1): the calibration window is
+        # fed HERE, over the final merged caller-visible set — and only here.
+        # _format_results used to record, but production search is multi-call
+        # (scope=both fans out personal+combined; expansion recurses per
+        # variant), so one default limit=5 RPC could insert 10 rows — enough to
+        # cross _ACTIVATION_THRESHOLD alone on a padded window. It is also
+        # multi-ENGINE: vault hits used to calibrate against their own
+        # forever-empty vault windows while shared hits used the shared one, so
+        # a single response mixed raw blends with percentile ranks. Formatting
+        # is now raw-only (db=None); this loop records every final row's raw
+        # into the SHARED window and rewrites its confidence onto that one
+        # basis, then pops the carrier so the transport surface is unchanged.
+        try:
+            from minni.rationale import explain
+            from minni.retrieval import _recommended_action
+            from minni.scoring import calibrated_confidence, record_score
+
+            # grok-review round 6 (finding 1): TWO passes. Recording and
+            # calibrating row-by-row let the window cross
+            # _ACTIVATION_THRESHOLD mid-response — hit 1 served raw_blend,
+            # hits 2..n percentile_rank, inside one payload. Record everything
+            # first, then calibrate every row against the same post-record
+            # window so the whole response shares one basis.
+            recorded: list = []
+            for r in results:
+                if not isinstance(r, dict):
+                    continue
+                raw_score = r.pop("confidence_raw", None)
+                if raw_score is None:
+                    continue
+                try:
+                    record_score(float(raw_score), "combined", engine.db)
+                    recorded.append((r, float(raw_score)))
+                except Exception as exc:
+                    context.logger.debug("search: score record failed: %s", exc)
+            for r, raw_score in recorded:
+                if r.get("confidence") is None:
+                    continue
+                try:
+                    r["confidence"] = calibrated_confidence(raw_score, engine.db)
+                except Exception as exc:
+                    context.logger.debug("search: calibration failed: %s", exc)
+                    continue
+                # grok-review round 8 (finding 1): formatting freezes
+                # recommended_action and rationale from the PRE-calibration
+                # blend. Rewriting confidence alone left the envelope
+                # disagreeing with itself after activation — e.g. confidence
+                # 0.85 with recommended_action "follow_up" and rationale
+                # "…; confidence 0.15.". Re-derive anything that consumed the
+                # old value so one payload has one meaning of confidence.
+                if "recommended_action" in r:
+                    try:
+                        r["recommended_action"] = _recommended_action(
+                            r.get("review_state"),
+                            r.get("instruction_like"),
+                            r.get("confidence"),
+                        )
+                    except Exception as exc:
+                        context.logger.debug(
+                            "search: recommended_action refresh failed: %s", exc
+                        )
+                if "rationale" in r:
+                    try:
+                        r["rationale"] = explain(r)
+                    except Exception as exc:
+                        context.logger.debug(
+                            "search: rationale refresh failed: %s", exc
+                        )
+        except Exception as exc:
+            context.logger.warning("search: score recording failed: %s", exc)
+
         learnings: list = []
         try:
             learnings = engine.search_learnings(
@@ -301,6 +396,26 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
             )
         except Exception as exc:
             context.logger.warning("search: learnings surfacing/tracking failed: %s", exc)
+
+        # Audit #225-R1: the episodic layer was advertised (the `layer` enum and
+        # BOOT_RECALL_LAYERS both expose it) but search_episodic had ZERO
+        # production call sites, so 2,178 captured events were unretrievable —
+        # document retrieval can never reach them, because episodic events live
+        # in episodic_events/episodic_fts, not in `documents`. Surfaced as their
+        # own array for the same reason learnings are: they are not documents
+        # and must not be merged into a result set whose consumers assume a
+        # doc_id.
+        episodic_hits: list = []
+        if _episodic_layer_requested(layers):
+            try:
+                episodic_hits = engine.search_episodic(
+                    query,
+                    agent_id=None if learnings_cross_agent else agent_id,
+                    limit=limit,
+                    exclude_event_types=engine.EPISODIC_NON_MEMORY_TYPES,
+                )
+            except Exception as exc:
+                context.logger.warning("search: episodic surfacing failed: %s", exc)
 
         # Durable recall trace (observability, config.recall_trace): a TTL'd
         # episodic event per search so `minni watch` can show raw-RPC recalls
@@ -356,6 +471,8 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
             ),
             "results": results,
             "learnings": learnings,
+            "episodic": episodic_hits,
+            "episodic_count": len(episodic_hits),
         }
         if not results and auth_suppressions:
             response_payload["auth_suppression"] = auth_suppressions
