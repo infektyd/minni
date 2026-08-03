@@ -96,6 +96,7 @@ import {
   formatSessionReceiptLine,
   readInboxStatus,
   parkUndeliverableInboxEntries,
+  readParkedUndeliverablePending,
   readReassertPending,
   recordAudit,
   resolveInboxHandoffContext,
@@ -628,9 +629,10 @@ export function createHookHandlers(
         // out of the window, still on disk, and audited, so the backlog is
         // countable rather than either silently destroyed or infinite.
         //
-        // Parking is the BOUND, not the delivery fix. Routing these to Stop —
-        // the only injectable event on such a wire — is tracked in issue #253
-        // and deliberately not attempted here; the two must not drift apart.
+        // Delivery is issue #253: handleStop reads inbox/.undeliverable and
+        // injects at Stop (the only injectable event on such a wire). Parking
+        // here is the bound; Stop is the route. Do not archive until Stop
+        // confirms delivery — same deliver-before-consume rule as boot.
         const parkPaths = [
           ...reassertContributing,
           ...reassertDeferred.map((tail) => tail.filePath),
@@ -641,11 +643,12 @@ export function createHookHandlers(
           tool: `${config.auditPrefix}_undeliverable_on_wire`,
           summary: `SessionStart: ${wire.id} cannot inject at SessionStart; parked ${parked.length} correction entr${
             parked.length === 1 ? "y" : "ies"
-          } to inbox/.undeliverable (see issue #253 for delivery)`,
+          } to inbox/.undeliverable for Stop delivery (issue #253)`,
           details: {
             wire: wire.id,
             parked: parked.length,
             events: correctionsReassert.length,
+            delivery: "stop_routed",
           },
         }).catch(() => {});
       }
@@ -1189,8 +1192,100 @@ export function createHookHandlers(
   // Stop lives in the shared handleStopCore (above) so the governance posture
   // has exactly one implementation across all five entrypoints — see its
   // doc comment for why hook.ts routes here too.
+  //
+  // Issue #253: after the stop breadcrumb / candidate write, deliver any
+  // corrections SessionStart parked under inbox/.undeliverable (wires that
+  // cannot inject at boot). Ordering is intentional:
+  //   1. handleStopCore first — inbox write / receipt is independent of
+  //      correction delivery and must not be gated on the park dir;
+  //   2. then inject corrections_reassert at Stop when the wire can carry it.
+  // "Re-assert at end of turn" is the honest semantics on a platform whose
+  // only injectable event is Stop: the model sees the correction before the
+  // next turn begins, not at session boot. Prefer acting on them next turn.
   async function handleStop(payload: Record<string, unknown>): Promise<HookOutput> {
     const result = await handleStopCore(config, payload, prepareOutcomeFn);
+
+    let correctionsEnvelope = "";
+    // Only attempt when Stop can actually inject — parking only happens when
+    // SessionStart cannot, and today that is Grok Build; probing canInject
+    // keeps the route honest if another wire gains a structural SessionStart
+    // drop later.
+    if (canInject(wire, "Stop")) {
+      // Unbudgeted local FS: same as SessionStart reassert. Absence loses data.
+      const parkedPending = await readParkedUndeliverablePending(config.vaultPath, 3);
+      if (parkedPending.length > 0) {
+        const {
+          events: parkedEvents,
+          consumedPaths: parkedConsumed,
+          contributingPaths: parkedContributing,
+          deferredTails: parkedDeferred,
+        } = collectCorrectionsReassert(parkedPending);
+
+        // Empty parked stashes (should not be parked today — SessionStart
+        // settles empties eagerly) still clear without waiting on delivery.
+        const parkedEmpty = parkedConsumed.filter(
+          (filePath) => !parkedContributing.includes(filePath),
+        );
+        if (parkedEmpty.length > 0) {
+          await settleReassertedInboxEntries(config.vaultPath, {
+            consumedPaths: parkedEmpty,
+            deferredTails: [],
+          });
+        }
+
+        if (parkedEvents.length > 0) {
+          correctionsEnvelope = wrapEnvelope({
+            event: "Stop",
+            agent: config.agentId,
+            budget: envelopeBudgetFor(config.contextWindow),
+            body: {
+              corrections_reassert: parkedEvents,
+              // Named so operators / the model can tell this is not a boot
+              // reassert: delivery was deferred from a structurally silent
+              // SessionStart to the first injectable event.
+              delivery: "stop_routed",
+              note:
+                "Corrections parked at SessionStart (this platform cannot inject there) are re-asserted at Stop — act on them before the next turn.",
+            },
+          });
+
+          // Deliver-before-consume: archive only after emitAndCommit confirms
+          // the inject reached the host. A failed Stop leaves the park intact
+          // for the next end_turn (at-least-once).
+          if (parkedContributing.length > 0 || parkedDeferred.length > 0) {
+            deferUntilDelivered(() =>
+              settleReassertedInboxEntries(config.vaultPath, {
+                consumedPaths: parkedContributing,
+                deferredTails: parkedDeferred,
+              }),
+            );
+          }
+
+          await recordAudit(config.vaultPath, {
+            tool: `${config.auditPrefix}_stop_corrections_reassert`,
+            summary: `Stop: delivering ${parkedEvents.length} SessionStart-parked correction(s) (issue #253)`,
+            details: {
+              wire: wire.id,
+              corrections_reassert: parkedEvents.length,
+              reassert_entries_pending_clear: parkedContributing.length,
+              reassert_tails_pending_defer: parkedDeferred.length,
+              delivery: "stop_routed",
+            },
+          }).catch(() => {});
+        }
+      }
+    }
+
+    if (correctionsEnvelope) {
+      // Inject is the model-facing channel; append any stop note (receipt /
+      // candidates CTA) so both land in one Stop output. Prefer inject over
+      // note alone — on Grok both channels work at Stop, but inject is what
+      // carries structured memory.
+      const text = [correctionsEnvelope, result.systemMessage]
+        .filter((part): part is string => Boolean(part && part.trim()))
+        .join("\n\n");
+      return render(injectIntent("Stop", text));
+    }
     if (result.systemMessage) {
       return render(noteIntent("Stop", result.systemMessage));
     }

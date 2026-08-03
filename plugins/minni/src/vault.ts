@@ -2103,13 +2103,13 @@ export function collectCorrectionsReassert(
 }
 
 /**
- * After a boot has consumed stashed stale_belief_events (corrections_reassert),
- * settle the inbox: remove exactly the entries collectCorrectionsReassert
- * reported as consumed (so they re-inject exactly once and do not accumulate
- * across compaction cycles), and rewrite partially-injected entries with
- * their un-injected valid tail (so cap overflow defers to the next boot
- * instead of being lost). Entries whose events were all malformed or all
- * cap-deferred are untouched and survive as-is.
+ * After a boot (or a Stop-routed delivery) has consumed stashed
+ * stale_belief_events (corrections_reassert), settle the inbox: remove exactly
+ * the entries collectCorrectionsReassert reported as consumed (so they re-inject
+ * exactly once and do not accumulate across compaction cycles), and rewrite
+ * partially-injected entries with their un-injected valid tail (so cap overflow
+ * defers to the next delivery instead of being lost). Entries whose events were
+ * all malformed or all cap-deferred are untouched and survive as-is.
  */
 export async function settleReassertedInboxEntries(
   vaultPath: string,
@@ -2119,11 +2119,16 @@ export async function settleReassertedInboxEntries(
   // from the (attacker-writable) tail.filePath. Passing path.dirname(tail.filePath)
   // would compare the target's own parent against itself and defeat the check.
   const inboxRoot = path.join(vaultPath, "inbox");
+  // Always land under inbox/.archive — even when the source lives in
+  // inbox/.undeliverable/ (Stop delivery of a SessionStart structural drop).
+  // archiveInboxEntry alone would put parked files into .undeliverable/.archive
+  // and hide them from operators grepping the normal archive.
+  const archiveDir = path.join(inboxRoot, ".archive");
   for (const filePath of outcome.consumedPaths) {
     // Inbox lifecycle policy (audit C2): archive, never unlink — the entry
     // moves to inbox/.archive/, which is invisible to readInboxStatus and the
     // engine's inbox_ingest glob, so the exactly-once contract still holds.
-    await archiveInboxEntry(filePath);
+    await archiveInboxEntry(filePath, { archiveDir });
   }
   for (const tail of outcome.deferredTails) {
     try {
@@ -2257,14 +2262,20 @@ export async function resolveInboxHandoffContext(
 }
 
 /**
- * Archive (never delete) an inbox entry: rename it into the sibling
- * `inbox/.archive/` dir, preserving the filename (timestamp prefix on
- * collision). `.archive/` is invisible to readInboxStatus and to the engine's
- * inbox_ingest glob, so archived entries stop re-surfacing. Best-effort:
- * returns the archived path, or undefined when the file was already gone.
+ * Archive (never delete) an inbox entry: rename it into an archive dir,
+ * preserving the filename (timestamp prefix on collision). Default archive is
+ * the sibling `.archive/` of the file's parent; callers that settle entries
+ * from `inbox/.undeliverable/` pass `archiveDir: inbox/.archive` so consumption
+ * always lands in the canonical archive. `.archive/` is invisible to
+ * readInboxStatus and to the engine's inbox_ingest glob, so archived entries
+ * stop re-surfacing. Best-effort: returns the archived path, or undefined when
+ * the file was already gone.
  */
-export async function archiveInboxEntry(filePath: string): Promise<string | undefined> {
-  const archiveDir = path.join(path.dirname(filePath), ".archive");
+export async function archiveInboxEntry(
+  filePath: string,
+  options?: { archiveDir?: string },
+): Promise<string | undefined> {
+  const archiveDir = options?.archiveDir ?? path.join(path.dirname(filePath), ".archive");
   const base = path.basename(filePath);
   let target = path.join(archiveDir, base);
   try {
@@ -2418,11 +2429,12 @@ export async function expireStaleInboxHandoffs(
  * that COULD be delivered.
  *
  * Parking is deliberately not archiving. `.archive/` means consumed; these were
- * not. `.undeliverable/` means "kept, not delivered, and not retryable on this
- * wire" — invisible to readInboxStatus and the reassert window (both read the
- * inbox's top level only), so the window stays clear, while the correction
- * itself survives on disk for the Stop-routing delivery path tracked in
- * issue #253. Bounded and audited beats both silent loss and infinite retention.
+ * not. `.undeliverable/` means "kept, not delivered at SessionStart, pending
+ * Stop delivery" — invisible to readInboxStatus and the SessionStart reassert
+ * window (both read the inbox's top level only), so the window stays clear,
+ * while the correction itself survives for `readParkedUndeliverablePending` +
+ * Stop injection (issue #253). Bounded and audited beats both silent loss and
+ * infinite retention.
  *
  * Returns the paths that were parked.
  */
@@ -2447,6 +2459,53 @@ export async function parkUndeliverableInboxEntries(
     }
   }
   return parked;
+}
+
+/**
+ * Issue #253: read corrections parked under `inbox/.undeliverable/` so Stop
+ * (the only injectable event on platforms like Grok Build) can deliver them.
+ *
+ * Same eligibility rules as `readReassertPending` (schema-valid stale-belief
+ * events or empty stashes; newest-`limit` window), but against the park dir
+ * rather than the live inbox top level. Malformed-only files are skipped and
+ * left for inspection.
+ */
+export async function readParkedUndeliverablePending(
+  vaultPath: string,
+  limit = 3,
+): Promise<InboxEntry[]> {
+  const parkDir = path.join(vaultPath, "inbox", ".undeliverable");
+  let names: string[] = [];
+  try {
+    names = (await readdir(parkDir)).filter((name) => name.endsWith(".json"));
+  } catch {
+    return [];
+  }
+  const stamped = names.map((name) => ({ name, ts: parseInboxTimestamp(name) }));
+  stamped.sort(
+    (a, b) => (b.ts ?? 0) - (a.ts ?? 0) || b.name.localeCompare(a.name),
+  );
+  const eligible: InboxEntry[] = [];
+  for (const { name } of stamped) {
+    if (eligible.length >= limit) break;
+    const filePath = path.join(parkDir, name);
+    let parsed: Record<string, unknown>;
+    try {
+      parsed = JSON.parse(await readFile(filePath, "utf8")) as Record<string, unknown>;
+    } catch {
+      continue; // unreadable/corrupt file: never occupies a reassert slot
+    }
+    const stashed = parsed.stale_belief_events;
+    const emptyStash = Array.isArray(stashed) && stashed.length === 0;
+    if (!emptyStash && !payloadHasValidStaleBeliefEvent(parsed)) continue;
+    eligible.push({
+      slug: typeof parsed.slug === "string" ? parsed.slug : name,
+      filePath,
+      createdAt: typeof parsed.createdAt === "string" ? parsed.createdAt : "",
+      payload: parsed,
+    });
+  }
+  return eligible;
 }
 
 /**

@@ -287,7 +287,7 @@ export interface RenderedIntent {
  * a STRUCTURAL "never", not a transient failure — which is the distinction a
  * caller needs before deciding whether retrying is worth anything. Grok Build
  * declares only Stop injectable, so a correction re-asserted at its SessionStart
- * can never reach the model no matter how many boots it survives.
+ * is parked (not archived) and delivered at Stop instead (issue #253).
  *
  * Probes with empty text on purpose: `inject` answers from the event alone, and
  * an empty probe cannot be mistaken for real content if a wire ever logs it.

@@ -597,7 +597,7 @@ test(
     assert.equal(
       parked.filter((f) => f.endsWith(".json")).length,
       1,
-      "the correction must be preserved on disk for the issue #253 delivery path",
+      "the correction must be preserved on disk for Stop delivery (issue #253)",
     );
     assert.match(
       await auditText(fixture),
@@ -608,6 +608,216 @@ test(
     // And the window is genuinely clear: a second boot re-reads nothing.
     await runGrokSessionStart(fixture);
     assert.deepEqual(await pendingEntries(fixture), []);
+  },
+);
+
+// ---------------------------------------------------------------------------
+// Issue #253: route parked SessionStart corrections to Stop (Grok's only
+// injectable event). Deliver-before-consume still holds.
+// ---------------------------------------------------------------------------
+
+function grokHookEnv(fixture) {
+  return {
+    ...process.env,
+    MINNI_HOME: fixture.home,
+    MINNI_SOCKET_PATH: path.join(fixture.home, "missing.sock"),
+    MINNI_AFM_HEALTH_URL: "http://127.0.0.1:1/health",
+    MINNI_BYPASS_AUDIT_LIMIT: "true",
+    MINNI_GROK_VAULT_PATH: fixture.vault,
+    MINNI_GROK_HOOKS: "on",
+  };
+}
+
+/** Grok Stop: injectable; must carry parked corrections_reassert. */
+function runGrokStop(fixture, payload = {}) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [GROK_HOOK_JS, "Stop"], {
+      env: grokHookEnv(fixture),
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    let stdout = "";
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk;
+    });
+    child.stderr.resume();
+    child.on("error", reject);
+    child.on("close", (code) => {
+      const line = stdout.trim().split("\n").pop();
+      const output = line ? JSON.parse(line) : {};
+      resolve({ code, output, stdout });
+    });
+    child.stdin.end(
+      JSON.stringify({
+        session_id: "grok-fixture",
+        reason: "end_turn",
+        ...payload,
+      }),
+    );
+  });
+}
+
+/** Stop whose output never reaches the host (EPIPE on stdout). */
+function runGrokStopUndelivered(fixture) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [GROK_HOOK_JS, "Stop"], {
+      env: grokHookEnv(fixture),
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    let stderr = "";
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk;
+    });
+    child.on("error", reject);
+    child.on("close", (code) => resolve({ code, stderr }));
+    child.stdin.end(
+      JSON.stringify({ session_id: "grok-fixture", reason: "end_turn" }),
+    );
+    child.stdout.destroy();
+  });
+}
+
+async function parkedEntries(fixture) {
+  try {
+    return (await readdir(path.join(fixture.inbox, ".undeliverable"))).filter((f) =>
+      f.endsWith(".json"),
+    );
+  } catch {
+    return [];
+  }
+}
+
+test(
+  "issue #253: Grok Stop delivers SessionStart-parked corrections and then archives them",
+  { timeout: 120_000 },
+  async (t) => {
+    const root = await mkdtemp(path.join(tmpdir(), "sm-253-stop-deliver-"));
+    const fixture = {
+      root,
+      vault: path.join(root, "grok-build-vault"),
+      home: path.join(root, "home"),
+    };
+    fixture.inbox = path.join(fixture.vault, "inbox");
+    await mkdir(fixture.inbox, { recursive: true });
+    await mkdir(fixture.home, { recursive: true });
+    const stamp = Date.now() - 86_400_000;
+    await writeFile(
+      path.join(fixture.inbox, inboxName(stamp, "grok-precompact-handoff")),
+      JSON.stringify({
+        slug: "grok-precompact-handoff",
+        kind: "grok_precompact_handoff",
+        agent_id: "grok-build",
+        createdAt: new Date(stamp).toISOString(),
+        stale_belief_events: [CORRECTION],
+      }),
+      "utf8",
+    );
+    t.after(() => rm(root, { recursive: true, force: true }));
+
+    // Boot parks (structural SessionStart drop).
+    await runGrokSessionStart(fixture);
+    assert.equal((await parkedEntries(fixture)).length, 1, "precondition: parked at boot");
+    assert.equal((await archivedEntries(fixture)).length, 0);
+
+    const { code, output } = await runGrokStop(fixture);
+    assert.equal(code, 0, "Stop must exit cleanly");
+
+    // THE GATE: Stop injects the parked correction via additionalContext.
+    const context = output.hookSpecificOutput?.additionalContext ?? "";
+    assert.match(
+      context,
+      /corrections_reassert/,
+      "Stop must inject corrections_reassert so the model can see them",
+    );
+    assert.match(context, /stop_routed/, "envelope must mark delivery as stop-routed");
+    assert.match(
+      context,
+      /"superseded_learning_id":\s*11/,
+      "the parked correction event must be in the Stop envelope",
+    );
+
+    // Deliver-before-consume settled: park cleared, canonical archive filled.
+    assert.deepEqual(
+      await parkedEntries(fixture),
+      [],
+      "delivered corrections must leave .undeliverable",
+    );
+    assert.equal(
+      (await archivedEntries(fixture)).length,
+      1,
+      "consumption must land in inbox/.archive (not .undeliverable/.archive)",
+    );
+    assert.match(
+      await auditText(fixture),
+      /stop_corrections_reassert/,
+      "Stop delivery must be audited",
+    );
+
+    // Second Stop is a no-op on corrections (exactly-once after successful delivery).
+    const second = await runGrokStop(fixture);
+    const secondCtx = second.output.hookSpecificOutput?.additionalContext ?? "";
+    assert.equal(
+      /corrections_reassert/.test(secondCtx),
+      false,
+      "a second Stop must not re-inject already-archived corrections",
+    );
+  },
+);
+
+test(
+  "issue #253: an undelivered Grok Stop leaves parked corrections re-deliverable",
+  { timeout: 120_000 },
+  async (t) => {
+    const root = await mkdtemp(path.join(tmpdir(), "sm-253-stop-epipe-"));
+    const fixture = {
+      root,
+      vault: path.join(root, "grok-build-vault"),
+      home: path.join(root, "home"),
+    };
+    fixture.inbox = path.join(fixture.vault, "inbox");
+    await mkdir(fixture.inbox, { recursive: true });
+    await mkdir(fixture.home, { recursive: true });
+    const stamp = Date.now() - 86_400_000;
+    await writeFile(
+      path.join(fixture.inbox, inboxName(stamp, "grok-precompact-handoff")),
+      JSON.stringify({
+        slug: "grok-precompact-handoff",
+        kind: "grok_precompact_handoff",
+        agent_id: "grok-build",
+        createdAt: new Date(stamp).toISOString(),
+        stale_belief_events: [CORRECTION],
+      }),
+      "utf8",
+    );
+    t.after(() => rm(root, { recursive: true, force: true }));
+
+    await runGrokSessionStart(fixture);
+    assert.equal((await parkedEntries(fixture)).length, 1);
+
+    const undelivered = await runGrokStopUndelivered(fixture);
+    assert.equal(
+      undelivered.code,
+      0,
+      `undelivered Stop must exit cleanly (not crash on EPIPE): ${undelivered.stderr.slice(0, 400)}`,
+    );
+    assert.equal(
+      (await parkedEntries(fixture)).length,
+      1,
+      "failed Stop delivery must NOT consume the parked correction",
+    );
+    assert.equal(
+      (await archivedEntries(fixture)).length,
+      0,
+      "failed Stop delivery must not archive",
+    );
+
+    // Recovery: a later successful Stop still delivers.
+    const recovered = await runGrokStop(fixture);
+    const context = recovered.output.hookSpecificOutput?.additionalContext ?? "";
+    assert.match(context, /corrections_reassert/, "next Stop must still deliver the park");
+    assert.deepEqual(await parkedEntries(fixture), []);
+    assert.equal((await archivedEntries(fixture)).length, 1);
   },
 );
 
