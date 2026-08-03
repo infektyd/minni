@@ -103,9 +103,13 @@ function clearSessionEvictFlushTimer() {
 function scheduleSessionEvictFlush() {
   if (evictionsSinceReport.size === 0) return;
   if (sessionEvictFlushTimer != null) return;
+  // Round 22: delay is the max of coalesce window and undelivered backoff.
+  // Without notBefore, delay===0 + flushPendingSessionEvictions' notBefore
+  // gate would re-enter scheduleSessionEvictFlush and recurse forever.
   const delay = Math.max(
     0,
     lastEvictionReportAt + EVICTION_DIAGNOSTIC_INTERVAL_MS - Date.now(),
+    diagnosticFlushNotBefore - Date.now(),
   );
   if (delay === 0) {
     flushPendingSessionEvictions();
@@ -185,6 +189,16 @@ function flushPendingSessionEvictions() {
   // suppressed session-evict left the loss console-only until further churn
   // (or process death).
   if (evictionsSinceReport.size === 0) return false;
+  // Round 22: honor undelivered backoff the same way flushDiagnosticQueues
+  // does. Rewinding lastEvictionReportAt=0 on undelivered used to let a later
+  // eviction wave bypass diagnosticFlushNotBefore and re-spawn on every churn
+  // wave (still capped by DIAGNOSTIC_MAX_IN_FLIGHT, but reopening the "bound
+  // maintenance eats the failure budget" mode under permanent audit failure).
+  if (Date.now() < diagnosticFlushNotBefore) {
+    scheduleSessionEvictFlush();
+    scheduleDiagnosticFlush();
+    return false;
+  }
   // Round 17: budget-full must always console.warn — lastEvictionReportAt only
   // advances on successful flush, so the within-interval path never fired while
   // suppress storms kept the budget full and this early return was silent.
@@ -213,10 +227,11 @@ function flushPendingSessionEvictions() {
         cur.max = info.max;
         evictionsSinceReport.set(name, cur);
       }
-      // Round 7: rewind the coalesce clock too. It advanced on spawn, so a
-      // one-shot wave whose audit failed sat restored-but-console-only until
-      // some FUTURE eviction reopened the window — which may never come.
-      lastEvictionReportAt = 0;
+      // Round 22: keep lastEvictionReportAt (advanced on accepted spawn).
+      // Rewinding to 0 let reportSessionEvictions treat the window as open
+      // and flush immediately, bypassing undelivered backoff. Retry via the
+      // deferred coalesce timer + diagnosticFlushNotBefore gate instead.
+      scheduleSessionEvictFlush();
       console.warn(
         `[minni] session-evict audit child died before writing; ` +
           `restored counts: ${detail}`,

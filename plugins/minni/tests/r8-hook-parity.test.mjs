@@ -236,10 +236,23 @@ test("P5: an eviction is reported, not silent — and coalesced, not budget-burn
     /cur\.count \+= info\.count/,
     "an undelivered audit must restore the flushed eviction counts",
   );
-  assert.match(
+  // Round 22: undelivered must NOT rewind lastEvictionReportAt to 0 (that
+  // bypassed undelivered backoff on the next eviction wave). Retry via
+  // scheduleSessionEvictFlush + diagnosticFlushNotBefore instead.
+  assert.doesNotMatch(
     fWindow,
     /lastEvictionReportAt = 0/,
-    "an undelivered audit must also reopen the coalesce window",
+    "undelivered must not rewind coalesce clock (bypasses undelivered backoff)",
+  );
+  assert.match(
+    fWindow,
+    /diagnosticFlushNotBefore/,
+    "session-evict flush must honor undelivered backoff",
+  );
+  assert.match(
+    fWindow,
+    /scheduleSessionEvictFlush/,
+    "undelivered session-evict must schedule a deferred retry",
   );
   const coalesce = source.indexOf("function reportSessionEvictions(");
   assert.ok(coalesce !== -1, "the coalescing reporter is missing");

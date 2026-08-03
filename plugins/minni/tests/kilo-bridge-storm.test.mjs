@@ -129,9 +129,12 @@ function createStormReporter({
   function scheduleSessionEvictFlush() {
     if (evictionsSinceReport.size === 0) return;
     if (sessionEvictFlushTimer != null) return;
+    // Round 22: max(coalesce, undelivered backoff) — avoid delay=0 recursion
+    // when flushPendingSessionEvictions is gated on diagnosticFlushNotBefore.
     const delay = Math.max(
       0,
       lastEvictionReportAt + evictionIntervalMs - nowFn(),
+      diagnosticFlushNotBefore - nowFn(),
     );
     if (delay === 0) {
       flushPendingSessionEvictions();
@@ -149,6 +152,12 @@ function createStormReporter({
 
   function flushPendingSessionEvictions() {
     if (evictionsSinceReport.size === 0) return false;
+    // Round 22: honor undelivered backoff (mirror production plugin).
+    if (nowFn() < diagnosticFlushNotBefore) {
+      scheduleSessionEvictFlush();
+      scheduleDiagnosticFlush();
+      return false;
+    }
     if (diagnosticsInFlight >= DIAGNOSTIC_MAX_IN_FLIGHT) {
       const detail = [...evictionsSinceReport.entries()]
         .map(([name, info]) => `${info.count} ${name} entr(y|ies) (bound ${info.max})`)
@@ -173,7 +182,8 @@ function createStormReporter({
           cur.max = info.max;
           evictionsSinceReport.set(name, cur);
         }
-        lastEvictionReportAt = 0;
+        // Round 22: keep lastEvictionReportAt; schedule deferred retry.
+        scheduleSessionEvictFlush();
       },
     );
     if (accepted) {
@@ -501,9 +511,15 @@ test("P6 source: minni-plugin.js wires settle → flush with undelivered backoff
     /if \(accepted\) \{\s*diagnosticsSuppressed\s*=\s*0/,
   );
   // Round 17: budget-full early return on session-evict must console.warn.
+  // Round 22: window widened — undelivered-backoff gate precedes budget-full.
   const flushEvict = source.indexOf("function flushPendingSessionEvictions");
   assert.ok(flushEvict !== -1);
-  const flushEvictWindow = source.slice(flushEvict, flushEvict + 900);
+  const flushEvictWindow = source.slice(flushEvict, flushEvict + 2200);
+  assert.match(
+    flushEvictWindow,
+    /diagnosticFlushNotBefore/,
+    "session-evict flush must honor undelivered backoff",
+  );
   assert.match(
     flushEvictWindow,
     /diagnosticsInFlight >= DIAGNOSTIC_MAX_IN_FLIGHT[\s\S]*console\.warn/,

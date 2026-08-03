@@ -1250,31 +1250,80 @@ def submit_drafts(job: dict, wait: bool = True, timeout: Optional[float] = 30.0)
     if reapply_handler is not None:
         try:
             reapply_handler(reapply_payload)
+            # Round 22: only discard the wet batch when re-apply actually
+            # terminalized candidates (anti-duplicate). A pure no-op re-apply
+            # means sticky was stale (operator already resolved / apply landed
+            # but sidecar clear failed) — throwing away a full LLM pass for a
+            # NEW decision set is uncounted loss. apply_consolidation_result
+            # always writes result["applied"]; handlers that omit it keep the
+            # conservative discard so we never dual-mint when we cannot prove
+            # the re-apply was a no-op.
+            applied = (
+                reapply_payload.get("applied")
+                if isinstance(reapply_payload, dict)
+                else None
+            )
+            if isinstance(applied, dict):
+                did_terminalize = any(
+                    int(applied.get(k) or 0) > 0
+                    for k in ("promoted", "deduped", "reviewed")
+                )
+            else:
+                did_terminalize = True
             with _IN_FLIGHT_LOCK:
                 _PENDING_LIFECYCLE.pop(pass_name, None)
                 prior_ev = _IN_FLIGHT_PER_PASS.get(pass_name)
                 if prior_ev is not None and not prior_ev.is_set():
                     prior_ev.set()
+                # Round 18: also clear the vault sidecar so a later cold
+                # start does not re-hold an already-applied decision set.
+                _clear_persisted_pending_lifecycle(pass_name, vault_for_pending)
+                if not did_terminalize:
+                    # Stale sticky: enqueue THIS job's wet drafts under the
+                    # same lock so a concurrent submit cannot race us.
+                    try:
+                        _WORK_QUEUE.put_nowait((job, done, out))
+                    except queue.Full:
+                        # global declared once on the earlier queue-full path
+                        _WRITES_DROPPED += 1
+                        _LAST_DROP_AT = time.time()
+                        logger.error(
+                            "AFM writer queue full (%d jobs); REJECTED %d draft(s) "
+                            "from pass %r after no-op sticky re-apply — not written",
+                            WRITER_QUEUE_MAX, drafts_deferred, pass_name,
+                        )
+                        raise DraftQueueFull(
+                            f"writer queue full ({WRITER_QUEUE_MAX} jobs); "
+                            f"{drafts_deferred} draft(s) rejected, not written"
+                        )
+                    _IN_FLIGHT_PER_PASS[pass_name] = done
+            if did_terminalize:
                 # Round 15: return without put_nowait. Falling through
                 # enqueued the NEW job's drafts (new page_ids) after the
                 # first batch already landed — reopening AFM-8 duplicates
                 # on the recovery path. Candidates are now terminal; the
                 # next tick will not regenerate the same decision set.
-                # Round 18: also clear the vault sidecar so a later cold
-                # start does not re-hold an already-applied decision set.
-                _clear_persisted_pending_lifecycle(pass_name, vault_for_pending)
+                logger.info(
+                    "AFM writer: re-applied pending lifecycle for pass %r; "
+                    "NOT enqueueing a second draft batch",
+                    pass_name,
+                )
+                return {
+                    "status": "lifecycle_recovered",
+                    "queue_depth": _WORK_QUEUE.qsize(),
+                    "drafts_written": [],
+                    "drafts_deferred": drafts_deferred,
+                    "lifecycle_recovered": True,
+                    "lifecycle_applied": dict(applied) if isinstance(applied, dict) else True,
+                }
             logger.info(
-                "AFM writer: re-applied pending lifecycle for pass %r; "
-                "NOT enqueueing a second draft batch",
-                pass_name,
+                "AFM writer: pending lifecycle re-apply was a no-op for pass %r; "
+                "enqueueing wet batch (%d draft(s))",
+                pass_name, drafts_deferred,
             )
-            return {
-                "status": "lifecycle_recovered",
-                "queue_depth": _WORK_QUEUE.qsize(),
-                "drafts_written": [],
-                "drafts_deferred": drafts_deferred,
-                "lifecycle_recovered": True,
-            }
+            # Fall through to the wait path with the job already enqueued.
+        except DraftQueueFull:
+            raise
         except Exception:
             global _LIFECYCLE_APPLY_FAILURES, _LAST_LIFECYCLE_APPLY_FAILURE_AT
             with _IN_FLIGHT_LOCK:

@@ -408,11 +408,16 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
         def retrieve_personal(*, soft: bool = False) -> list:
             """Personal vault leg; optional soft shared fallback for multi-leg scopes.
 
-            Sole personal scope keeps a hard shared fallback so total failure
-            still surfaces as −32000. Scope "both" (and any path where other
-            corpora may already contribute) soft-fails shared so a personal
-            boom + shared boom cannot erase combined hits with −32000.
+            When the personal vault never ran (no agent vault), sole personal
+            scope still uses a hard shared fallback so total shared failure
+            surfaces as −32000. Once a personal-leg exception has been recorded
+            into ``degradations``, shared is always soft — a hard shared throw
+            would −32000 and drop the personal degrade that Round 13 added
+            (dual-corpus total failure is exactly when that signal matters).
+            Scope "both" also soft-fails shared so a personal boom + shared boom
+            cannot erase combined hits with −32000.
             """
+            personal_failed = False
             vault_retrieval = context.agent_vault_retrieval(agent_id) if agent_id else None
             if vault_retrieval is not None:
                 vault_engine, _source_agent, _source_db_path = vault_retrieval
@@ -426,6 +431,7 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
                     # Round 13 (PR #260): personal leg failure was log-only while
                     # the shared fallback could still report degraded:false —
                     # personal memory never ran, response looked healthy.
+                    personal_failed = True
                     detail = f"personal vault index failed: {exc}"[:400]
                     context.logger.warning(
                         "search: personal vault index failed for %s (%s); falling back to shared",
@@ -456,7 +462,10 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
                         }
                     )
             # Round 19: soft shared when other legs may still run (scope both).
-            if soft:
+            # Round 22: also soft when personal already failed — dual-corpus
+            # total failure must keep personal_index_failed on the 200 body,
+            # not discard it via outer −32000.
+            if soft or personal_failed:
                 return retrieve_shared_soft()
             return retrieve_shared()
 

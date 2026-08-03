@@ -1075,6 +1075,77 @@ def test_personal_vault_index_failure_is_in_degradation():
     ).lower() or "corrupt" in str(personal_entries[0]).lower()
 
 
+def test_personal_and_shared_dual_failure_keeps_degradation():
+    """Round 22 Medium: personal boom + hard shared fallback both raised →
+    outer handle_search −32000 dropped the Round 13 personal_index_failed
+    entry. Dual-corpus total failure is exactly when that signal matters.
+
+    Pin: scope personal, both engines raise → 200 body (not error), empty
+    hits, degraded true, personal + shared failure entries present.
+    """
+    from types import SimpleNamespace
+
+    from minni.minnid_runtime import recall as recall_mod
+
+    captured = {}
+
+    class _SharedBoom:
+        config = SimpleNamespace(embedding_model="m")
+
+        def retrieve(self, **kwargs):
+            raise RuntimeError("shared FTS locked")
+
+    class _PersonalBoom:
+        config = SimpleNamespace(embedding_model="m")
+
+        def retrieve(self, **kwargs):
+            raise RuntimeError("personal index corrupt")
+
+    shared = _SharedBoom()
+    personal = _PersonalBoom()
+    context = _make_context(shared, captured)
+    principal = SimpleNamespace(agent_id="agent-a", workspace_id="default")
+    object.__setattr__(
+        context,
+        "handler_principal",
+        lambda params, request_id: (principal, None),
+    )
+    object.__setattr__(
+        context,
+        "agent_vault_retrieval",
+        lambda agent_id: (personal, agent_id, "/tmp/p.db"),
+    )
+    recall_mod.handle_search(
+        {"query": "anything", "scope": "personal"},
+        request_id=1,
+        context=context,
+    )
+    assert "error" not in captured, (
+        f"dual-corpus failure must not −32000 (drops personal degrade): "
+        f"{captured.get('error')!r}"
+    )
+    payload = captured["response"]
+    assert payload["count"] == 0
+    assert payload["degraded"] is True
+    degs = payload.get("degradation") or []
+    personal_entries = [
+        d
+        for d in degs
+        if d.get("personal_index_failed")
+        or (d.get("src") == "p" and d.get("degraded"))
+    ]
+    shared_entries = [
+        d
+        for d in degs
+        if d.get("shared_index_failed")
+        or "shared index" in str(d.get("reason") or "").lower()
+    ]
+    assert personal_entries, f"expected personal degrade entry, got {degs!r}"
+    assert shared_entries, f"expected shared degrade entry, got {degs!r}"
+    assert personal_entries[0].get("degraded") is True
+    assert shared_entries[0].get("degraded") is True
+
+
 def test_combined_vault_index_failure_returns_partial_and_degraded():
     """Round 16: one agent vault throw in retrieve_combined hard-failed the
     whole search with JSON-RPC −32000. Mirror personal: per-engine try/except,
@@ -1311,7 +1382,8 @@ def test_deferred_lifecycle_holds_in_flight_until_handler_returns(monkeypatch):
 
 def test_deferred_lifecycle_failure_refuses_resubmit_and_surfaces(monkeypatch):
     """Round 13: deferred apply raises after drafts land → sticky refuse + status.
-    Round 14: a later submit re-applies without a second write, then accepts."""
+    Round 14: a later submit re-applies without a second write, then accepts.
+    Round 22: re-apply that terminalizes (applied non-zero) still discards wet batch."""
     import threading
     import queue as queue_mod
 
@@ -1334,6 +1406,9 @@ def test_deferred_lifecycle_failure_refuses_resubmit_and_surfaces(monkeypatch):
         calls["n"] += 1
         if calls["n"] == 1:
             raise RuntimeError("db blip during lifecycle")
+        # Round 22: production apply_consolidation_result always writes applied;
+        # non-zero = terminalized candidates → anti-duplicate discard.
+        life["applied"] = {"promoted": 1, "deduped": 0, "reviewed": 0}
         calls["applied"].append(dict(life))
 
     done = threading.Event()
@@ -1411,6 +1486,86 @@ def test_deferred_lifecycle_failure_refuses_resubmit_and_surfaces(monkeypatch):
     )
     assert status == "backlogged"
     assert any("deferred lifecycle" in r for r in reasons)
+    afm_writer.reset_pass_counters()
+
+
+def test_stale_sticky_noop_reapply_enqueues_wet_batch(monkeypatch):
+    """Round 22 Medium: sticky re-apply that terminalizes nothing (applied
+    all-zero) must NOT discard a wet batch for a new decision set.
+
+    Live sticky (applied non-zero) still returns lifecycle_recovered without
+    enqueue — covered by test_deferred_lifecycle_failure_refuses_resubmit.
+    This arm pins the stale-sticky path: clear + put_nowait.
+    """
+    import threading
+    import queue as queue_mod
+
+    from minni import afm_writer
+
+    afm_writer.reset_pass_counters()
+    monkeypatch.setattr(afm_writer, "_ensure_worker", lambda: None)
+    monkeypatch.setattr(afm_writer, "_WORK_QUEUE", queue_mod.Queue(maxsize=4))
+
+    def _write(job):
+        return {"drafts_written": [{"page_id": "d1"}], "inbox_path": "x"}
+
+    monkeypatch.setattr(afm_writer, "_write_batch", _write)
+
+    calls = {"n": 0}
+
+    def _handler(life):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("db blip during lifecycle")
+        # Candidates already terminal (operator resolved / apply landed but
+        # sidecar clear failed) → pure no-op.
+        life["applied"] = {"promoted": 0, "deduped": 0, "reviewed": 0}
+
+    done = threading.Event()
+    out: dict = {}
+    job = {
+        "pass_name": "consolidation",
+        "drafts": [{"title": "t"}],
+        "lifecycle": {
+            "promote_candidate_ids": [1],
+            "dedup_candidate_ids": [],
+            "review_candidate_ids": [],
+        },
+        "lifecycle_handler": _handler,
+        "defer_lifecycle_to_worker": True,
+    }
+    with afm_writer._IN_FLIGHT_LOCK:
+        afm_writer._IN_FLIGHT_PER_PASS["consolidation"] = done
+
+    afm_writer._process_job(job, done, out)
+    assert "consolidation" in afm_writer._PENDING_LIFECYCLE
+
+    put_calls = []
+    real_put = afm_writer._WORK_QUEUE.put_nowait
+
+    def _spy_put(item):
+        put_calls.append(item)
+        return real_put(item)
+
+    monkeypatch.setattr(afm_writer._WORK_QUEUE, "put_nowait", _spy_put)
+    second = afm_writer.submit_drafts(
+        {
+            "pass_name": "consolidation",
+            "drafts": [{"title": "new-decision-set"}],
+            "lifecycle_handler": _handler,
+        },
+        timeout=0.05,
+    )
+    assert second.get("status") != "lifecycle_recovered", (
+        f"stale sticky no-op must not discard wet batch: {second!r}"
+    )
+    assert second.get("lifecycle_recovered") is not True
+    assert "consolidation" not in afm_writer._PENDING_LIFECYCLE
+    assert len(put_calls) == 1, (
+        f"stale sticky must enqueue wet batch once, got {put_calls!r}"
+    )
+    enqueued_job = put_calls[0][0]
+    assert enqueued_job.get("drafts") == [{"title": "new-decision-set"}]
     afm_writer.reset_pass_counters()
 
 
