@@ -126,9 +126,43 @@ def test_review_workflow_defangs_the_marker_before_embedding_the_reply(review):
     steps = review["jobs"]["grok-review"]["steps"]
     post = next(s for s in steps if s.get("name") == "Post review")
     run = post["run"]
-    defang = run.index("sed -i 's/grok-mechanical-eligibility")
+    defang = run.index("/usr/bin/sed -i 's/grok-mechanical-eligibility")
     stamp = run.index('echo "<!-- grok-mechanical-eligibility: APPROVE -->"')
     assert defang < stamp, "defang must run before the workflow stamps its own marker"
+
+
+def test_leak_gate_steps_pin_path_binaries_and_pipe_isolated(review):
+    """#252: after GITHUB_PATH prepends $HOME/.grok/bin, gate/parser steps must
+    not resolve git/python3 via PATH, and the leak gate must not re-open a
+    /tmp file after hashing (pipe + python3 -I)."""
+    grok_yml = (ROOT / ".github" / "workflows" / "grok.yml").read_text(encoding="utf-8")
+    review_yml = REVIEW_YML.read_text(encoding="utf-8")
+    for name, text in (("grok.yml", grok_yml), ("grok-review.yml", review_yml)):
+        assert "/usr/bin/git fetch" in text, f"{name}: git fetch must be path-pinned"
+        assert "/usr/bin/git show" in text, f"{name}: git show must be path-pinned"
+        assert "/usr/bin/python3 -I -" in text, (
+            f"{name}: leak gate must run as isolated stdin script"
+        )
+        # Unpinned forms that #246 closed on boundary-test and #252 extends here.
+        assert "python3 /tmp/leak-gate.py" not in text, (
+            f"{name}: must not exec a /tmp gate file via unpinned python3"
+        )
+    # Parser path in grok-review: pinned interpreter, no PATH `cut`/`sed`,
+    # default parser via pipe (no /tmp re-open after git show).
+    post = next(s for s in review["jobs"]["grok-review"]["steps"] if s.get("name") == "Post review")
+    run = post["run"]
+    assert "/usr/bin/python3 -I" in run
+    assert "| cut " not in run and " | cut" not in run
+    assert "/usr/bin/sed -i" in run, "defang sed must be path-pinned"
+    # Bare `sed` (not /usr/bin/sed) must not appear as a command — PATH plant.
+    assert not any(
+        line.lstrip().startswith("sed ") for line in run.splitlines()
+    ), "Post review must not resolve bare sed on PATH"
+    assert "PARSER_BYTES=$(/usr/bin/git show" in run or 'PARSER_BYTES=$(/usr/bin/git show' in run
+    assert "printf '%s' \"$PARSER_BYTES\" | /usr/bin/python3 -I -" in run
+    assert "/tmp/parse_grok_verdict.py" not in run, (
+        "default parser must not re-open trusted bytes from /tmp"
+    )
 
 
 def test_app_tokens_are_minted_least_privilege(gate, review):

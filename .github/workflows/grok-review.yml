@@ -312,15 +312,22 @@ jobs:
           #     HEAD. Any branch cut before the script existed (e.g. a release
           #     branch) therefore had the workflow calling a file its tree did
           #     not contain: "can't open file ... check-no-credential-leak.py".
-          git fetch --depth=1 origin "$TRUST_REF"
-          git show "origin/$TRUST_REF:.github/scripts/check-no-credential-leak.py" \
-            > /tmp/leak-gate.py
+          # Trust plumbing (#252 / #246 follow-up): pin git + python3 so a
+          # PATH entry planted earlier in the job (e.g. $HOME/.grok/bin via
+          # GITHUB_PATH) cannot shadow the gate or the object fetch. Pipe the
+          # gate bytes into `python3 -I -` so nothing under /tmp is re-opened
+          # after the fetch (verify-then-exec residual) and so sys.path cannot
+          # pick up CWD/PR-checkout modules (-I drops script dir, PYTHONPATH,
+          # and user site).
+          set -euo pipefail
+          /usr/bin/git fetch --depth=1 origin "$TRUST_REF"
+          GATE_BYTES=$(/usr/bin/git show "origin/$TRUST_REF:.github/scripts/check-no-credential-leak.py")
           # Fail CLOSED: an unavailable or empty gate must never read as "clean".
-          if [ ! -s /tmp/leak-gate.py ]; then
+          if [ -z "$GATE_BYTES" ]; then
             echo "::error::Could not load the leak gate from origin/$TRUST_REF — refusing to post."
             exit 1
           fi
-          python3 /tmp/leak-gate.py /tmp/grok-reply.md
+          printf '%s' "$GATE_BYTES" | /usr/bin/python3 -I - /tmp/grok-reply.md
 
       # App identity posts REQUEST_CHANGES / COMMENT only. Merge trust is the
       # grok-mechanical-approve check run (see grok-approve-gate.yml). Bot
@@ -351,12 +358,20 @@ jobs:
           # cannot neuter the VERDICT→event mapping. Fall back to head only
           # while the script is still landing; head-sourced parsers must not
           # mint REQUEST_CHANGES (grief → sticky block with no synchronize).
-          git fetch --depth=1 origin "$TRUST_REF"
+          # Pin git + python3 + sed (#252): same PATH-shadow rationale as the
+          # leak gate. `cut` is intentionally not used — a faked cut on PATH
+          # could rewrite the note field; bash parameter expansion is a builtin.
+          # Default-branch parser runs via pipe (no /tmp re-open after git show),
+          # matching the leak-gate shape. Head fallback still uses a file path
+          # and is already trust-downgraded (no REQUEST_CHANGES / no stamp).
+          set -euo pipefail
+          /usr/bin/git fetch --depth=1 origin "$TRUST_REF"
           PARSER_TRUST=default
-          if git cat-file -e "origin/$TRUST_REF:.github/scripts/parse_grok_verdict.py" 2>/dev/null; then
-            git show "origin/$TRUST_REF:.github/scripts/parse_grok_verdict.py" \
-              > /tmp/parse_grok_verdict.py
-            PARSER=/tmp/parse_grok_verdict.py
+          PARSER_BYTES=
+          PARSER=
+          if /usr/bin/git cat-file -e "origin/$TRUST_REF:.github/scripts/parse_grok_verdict.py" 2>/dev/null; then
+            PARSER_BYTES=$(/usr/bin/git show "origin/$TRUST_REF:.github/scripts/parse_grok_verdict.py")
+            PARSER_TRUST=default
           elif [ -f .github/scripts/parse_grok_verdict.py ]; then
             echo "::warning::parse_grok_verdict.py not on origin/$TRUST_REF yet; using PR head copy (COMMENT-only)"
             PARSER=.github/scripts/parse_grok_verdict.py
@@ -367,12 +382,23 @@ jobs:
           fi
           # Default path never emits Reviews API APPROVE. Detect raw APPROVE
           # with --allow-approve solely to stamp eligibility for the check-run gate.
-          EVENT=$(python3 "$PARSER" --event-only /tmp/grok-reply.md)
-          NOTE=$(python3 "$PARSER" /tmp/grok-reply.md | cut -f2-)
+          if [ "$PARSER_TRUST" = default ]; then
+            EVENT=$(printf '%s' "$PARSER_BYTES" | /usr/bin/python3 -I - --event-only /tmp/grok-reply.md)
+            NOTE_LINE=$(printf '%s' "$PARSER_BYTES" | /usr/bin/python3 -I - /tmp/grok-reply.md)
+          else
+            EVENT=$(/usr/bin/python3 -I "$PARSER" --event-only /tmp/grok-reply.md)
+            NOTE_LINE=$(/usr/bin/python3 -I "$PARSER" /tmp/grok-reply.md)
+          fi
+          # event\tnote → drop the first field and the separating tab.
+          NOTE="${NOTE_LINE#*$'\t'}"
           # A default-branch parser predating this flag exits 2; treat that as
           # "no eligibility" rather than failing the job. Withholding the stamp
           # only ever keeps the mechanical gate red.
-          RAW=$(python3 "$PARSER" --event-only --allow-approve /tmp/grok-reply.md 2>/dev/null) || RAW=COMMENT
+          if [ "$PARSER_TRUST" = default ]; then
+            RAW=$(printf '%s' "$PARSER_BYTES" | /usr/bin/python3 -I - --event-only --allow-approve /tmp/grok-reply.md 2>/dev/null) || RAW=COMMENT
+          else
+            RAW=$(/usr/bin/python3 -I "$PARSER" --event-only --allow-approve /tmp/grok-reply.md 2>/dev/null) || RAW=COMMENT
+          fi
           if [ "$PARSER_TRUST" = head ] && [ "$EVENT" = REQUEST_CHANGES ]; then
             EVENT=COMMENT
             NOTE="head-parser fallback: REQUEST_CHANGES downgraded to COMMENT"
@@ -396,7 +422,10 @@ jobs:
           # containing a bare marker line yields eligible=True even though the
           # parser returned COMMENT. This sed is the only thing closing that
           # case, so removing it reopens marker injection.
-          sed -i 's/grok-mechanical-eligibility/grok-mechanical-eligibility(quoted)/g' \
+          # Pin /usr/bin/sed: after Install Grok Build CLI prepends
+          # $HOME/.grok/bin to PATH, a planted sed could no-op the defang and
+          # leave a bare eligibility marker into the posted review body.
+          /usr/bin/sed -i 's/grok-mechanical-eligibility/grok-mechanical-eligibility(quoted)/g' \
             /tmp/grok-reply.md
           {
             echo "## Grok review"
