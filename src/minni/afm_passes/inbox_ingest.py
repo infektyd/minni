@@ -207,7 +207,7 @@ def _coerce_candidate_index(raw: Any) -> Optional[int]:
     return idx
 
 
-def _parse_inbox_key_from_derived(df: Any) -> Optional[Tuple[str, int]]:
+def _parse_file_index_from_derived(df: Any) -> Optional[Tuple[str, int]]:
     """Parse (inbox_file, candidate_index) from a derived_from JSON blob."""
     if not df:
         return None
@@ -224,26 +224,60 @@ def _parse_inbox_key_from_derived(df: Any) -> Optional[Tuple[str, int]]:
     return None
 
 
-def _existing_keys(db, principals: set | None = None) -> set:
-    """(inbox_file, candidate_index) pairs already present in candidate_packets.
+# Back-compat alias (tests / older call sites).
+_parse_inbox_key_from_derived = _parse_file_index_from_derived
 
-    Issue #239: dual-resolution pairs came from double-ingest of the same
-    inbox key. Matching is **global** (not principal-scoped) so a re-run under
-    any principal cannot re-insert a key already present under another.
-    Matches on derived_from regardless of status so re-runs are no-ops even
-    after the loop resolves a previously-ingested row.
 
-    ``principals`` is retained for call-site compatibility but ignored — the
-    principal filter was the weaker historical behaviour.
+def _make_inbox_key(
+    principal: Any, inbox_file: str, candidate_index: int
+) -> Tuple[str, str, int]:
+    """App-level inbox idempotency key: principal-scoped file + index.
+
+    Issue #239 duals were double-ingest of the **same** agent vault. Scoping
+    by ``principal`` (derived from ``<agent>-vault/inbox``) prevents those
+    twins without blocking legitimate same-basename files in other vaults
+    (see ``test_cross_vault_live_sibling_does_not_block_other_vaults_copy``).
     """
-    del principals  # intentionally unused; see docstring
+    return (str(principal or ""), inbox_file, int(candidate_index))
+
+
+def _parse_inbox_key(
+    principal: Any, df: Any
+) -> Optional[Tuple[str, str, int]]:
+    """Full app key (principal, inbox_file, candidate_index) from a row."""
+    fi = _parse_file_index_from_derived(df)
+    if fi is None:
+        return None
+    return _make_inbox_key(principal, fi[0], fi[1])
+
+
+def _existing_keys(db, principals: set | None = None) -> set:
+    """(principal, inbox_file, candidate_index) already in candidate_packets.
+
+    Principal-scoped: same basename in two agent vaults may both insert.
+    Status-agnostic so re-runs are no-ops after resolution.
+
+    ``principals`` optionally restricts the scan (compact_distillation per-inbox).
+    """
     keys: set = set()
     with db.cursor() as c:
-        c.execute("SELECT derived_from FROM candidate_packets")
+        if principals:
+            placeholders = ",".join("?" for _ in principals)
+            c.execute(
+                f"SELECT principal, derived_from FROM candidate_packets "
+                f"WHERE principal IN ({placeholders})",
+                tuple(principals),
+            )
+        else:
+            c.execute("SELECT principal, derived_from FROM candidate_packets")
         rows = c.fetchall()
     for row in rows:
-        df = row["derived_from"] if isinstance(row, dict) or hasattr(row, "keys") else row[0]
-        key = _parse_inbox_key_from_derived(df)
+        if isinstance(row, dict) or hasattr(row, "keys"):
+            principal = row["principal"]
+            df = row["derived_from"]
+        else:
+            principal, df = row[0], row[1]
+        key = _parse_inbox_key(principal, df)
         if key is not None:
             keys.add(key)
     return keys
@@ -252,34 +286,39 @@ def _existing_keys(db, principals: set | None = None) -> set:
 def _existing_keys_for_on_cursor(c, wanted: set) -> set:
     """Return which of ``wanted`` keys already exist — narrow scan under txn.
 
-    Avoids full-table ``SELECT derived_from`` under ``BEGIN IMMEDIATE`` when
-    only a small ``to_insert`` key set needs checking. Scopes SQL to distinct
-    inbox_file names in ``wanted``.
+    ``wanted`` entries are ``(principal, inbox_file, candidate_index)``.
+    Avoids full-table scan under ``BEGIN IMMEDIATE``.
     """
     if not wanted:
         return set()
-    by_file: Dict[str, set] = {}
-    for f, i in wanted:
-        by_file.setdefault(f, set()).add(i)
+    # Group by (principal, inbox_file) → indices
+    by_scope: Dict[Tuple[str, str], set] = {}
+    for principal, inbox_file, idx in wanted:
+        by_scope.setdefault((principal, inbox_file), set()).add(idx)
     found: set = set()
-    for inbox_file, indices in by_file.items():
+    for (principal, inbox_file), indices in by_scope.items():
         c.execute(
             """
-            SELECT derived_from FROM candidate_packets
-            WHERE derived_from IS NOT NULL
+            SELECT principal, derived_from FROM candidate_packets
+            WHERE principal = ?
+              AND derived_from IS NOT NULL
               AND json_extract(derived_from, '$.source') = 'inbox'
               AND json_extract(derived_from, '$.inbox_file') = ?
             """,
-            (inbox_file,),
+            (principal, inbox_file),
         )
         for row in c.fetchall():
-            df = (
-                row["derived_from"]
-                if isinstance(row, dict) or hasattr(row, "keys")
-                else row[0]
-            )
-            key = _parse_inbox_key_from_derived(df)
-            if key is not None and key[0] == inbox_file and key[1] in indices:
+            if isinstance(row, dict) or hasattr(row, "keys"):
+                p, df = row["principal"], row["derived_from"]
+            else:
+                p, df = row[0], row[1]
+            key = _parse_inbox_key(p, df)
+            if (
+                key is not None
+                and key[0] == principal
+                and key[1] == inbox_file
+                and key[2] in indices
+            ):
                 found.add(key)
     return found
 
@@ -458,7 +497,7 @@ def ingest(db, config, inboxes: Optional[List[Path]] = None,
     to_insert: List[Dict[str, Any]] = []
     already = 0
     for r in scanned:
-        key = (r["inbox_file"], r["candidate_index"])
+        key = _make_inbox_key(r["principal"], r["inbox_file"], r["candidate_index"])
         if key in existing:
             already += 1
             continue
@@ -472,11 +511,17 @@ def ingest(db, config, inboxes: Optional[List[Path]] = None,
             # full table) under BEGIN IMMEDIATE so concurrent ingest cannot
             # both pass the pre-txn check and create twins. UNIQUE swallow
             # remains the last backstop if the operator applied the index.
-            wanted = {(r["inbox_file"], r["candidate_index"]) for r in to_insert}
+            # Key is principal-scoped so multi-vault same basenames coexist.
+            wanted = {
+                _make_inbox_key(r["principal"], r["inbox_file"], r["candidate_index"])
+                for r in to_insert
+            }
             txn_existing = _existing_keys_for_on_cursor(c, wanted)
 
             for r in to_insert:
-                key = (r["inbox_file"], r["candidate_index"])
+                key = _make_inbox_key(
+                    r["principal"], r["inbox_file"], r["candidate_index"]
+                )
                 if key in txn_existing:
                     already += 1
                     continue

@@ -703,8 +703,13 @@ def test_distill_in_txn_recheck_skips_existing_key(tmp_path, monkeypatch):
         assert dict(c.fetchone())["n"] == 1
 
 
-def test_ingest_skips_key_present_under_other_principal(tmp_path):
-    """Prevention: global key check so dual-ingest cannot recur across principals."""
+def test_ingest_allows_same_basename_under_other_principal(tmp_path):
+    """Principal-scoped key: multi-vault same basename is legitimate.
+
+    Issue #239 duals are double-ingest *within* one agent vault. A global
+    (file, index) key starved cross-vault peers and failed public smoke
+    (test_cross_vault_live_sibling…). Same principal must still be idempotent.
+    """
     from minni.afm_passes.inbox_ingest import ingest
 
     db, cfg = _make_db(tmp_path)
@@ -717,9 +722,10 @@ def test_ingest_skips_key_present_under_other_principal(tmp_path):
         principal="claude-code",
     )
 
-    inbox = tmp_path / "codex-vault" / "inbox"
-    inbox.mkdir(parents=True)
-    (inbox / "shared.json").write_text(
+    # Different principal (codex-vault → codex): must insert.
+    inbox_other = tmp_path / "codex-vault" / "inbox"
+    inbox_other.mkdir(parents=True)
+    (inbox_other / "shared.json").write_text(
         json.dumps(
             {
                 "slug": "s",
@@ -736,13 +742,35 @@ def test_ingest_skips_key_present_under_other_principal(tmp_path):
         ),
         encoding="utf-8",
     )
+    res_other = ingest(db, cfg, inboxes=[inbox_other], dry_run=False)
+    assert res_other["inserted"] == 1
 
-    res = ingest(db, cfg, inboxes=[inbox], dry_run=False)
-    assert res["inserted"] == 0
-    assert res["already_present"] >= 1
+    # Same principal re-ingest: still a no-op.
+    inbox_same = tmp_path / "claudecode-vault" / "inbox"
+    inbox_same.mkdir(parents=True)
+    (inbox_same / "shared.json").write_text(
+        json.dumps(
+            {
+                "slug": "s2",
+                "createdAt": "2026-06-06T12:00:00.000Z",
+                "kind": "codex_stop_candidates",
+                "agent_id": "claude-code",
+                "workspace_id": "default",
+                "candidates": [content],
+                "log_only": [],
+                "expires": [],
+                "do_not_store": [],
+                "last_task": "t",
+            }
+        ),
+        encoding="utf-8",
+    )
+    res_same = ingest(db, cfg, inboxes=[inbox_same], dry_run=False)
+    assert res_same["inserted"] == 0
+    assert res_same["already_present"] >= 1
     with db.cursor() as c:
         c.execute("SELECT COUNT(*) AS n FROM candidate_packets")
-        assert dict(c.fetchone())["n"] == 1
+        assert dict(c.fetchone())["n"] == 2
 
 
 def test_learning_uri_survives_prune_index(tmp_path):

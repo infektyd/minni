@@ -116,12 +116,8 @@ def _parse_derived(raw: Any) -> Optional[Dict[str, Any]]:
     return obj if isinstance(obj, dict) else None
 
 
-def _inbox_key(derived: Dict[str, Any]) -> Optional[Tuple[str, int]]:
-    """Return (inbox_file, candidate_index) for inbox-sourced rows.
-
-    Matches app-level idempotency in ``inbox_ingest`` / ``compact_distillation``
-    (file + index only). ``content_sha1`` is not part of the app key.
-    """
+def _file_index_key(derived: Dict[str, Any]) -> Optional[Tuple[str, int]]:
+    """Return (inbox_file, candidate_index) for inbox-sourced rows."""
     if derived.get("source") != "inbox":
         return None
     inbox_file = derived.get("inbox_file")
@@ -134,6 +130,21 @@ def _inbox_key(derived: Dict[str, Any]) -> Optional[Tuple[str, int]]:
     if idx_i != idx:  # reject non-integral floats
         return None
     return (inbox_file, idx_i)
+
+
+def _inbox_key(
+    principal: Any, derived: Dict[str, Any]
+) -> Optional[Tuple[str, str, int]]:
+    """App key: (principal, inbox_file, candidate_index).
+
+    Matches ``inbox_ingest`` / ``compact_distillation`` principal-scoped
+    idempotency. Same basename in two agent vaults is not a dual.
+    ``content_sha1`` is not part of the app key.
+    """
+    fi = _file_index_key(derived)
+    if fi is None:
+        return None
+    return (str(principal or ""), fi[0], fi[1])
 
 
 def _content_sha1_of(derived: Dict[str, Any]) -> Optional[str]:
@@ -174,14 +185,15 @@ def _collapse_digest(
 
 
 def _collapse_key(
+    principal: Any,
     derived: Dict[str, Any],
     content: Any = None,
-) -> Optional[Tuple[str, int, Optional[str]]]:
-    """Byte-identical collapse key: app key + content digest (#239 duals only)."""
-    app = _inbox_key(derived)
+) -> Optional[Tuple[str, str, int, Optional[str]]]:
+    """Byte-identical collapse key: principal-scoped app key + content digest."""
+    app = _inbox_key(principal, derived)
     if app is None:
         return None
-    return (app[0], app[1], _collapse_digest(derived, content))
+    return (app[0], app[1], app[2], _collapse_digest(derived, content))
 
 
 def status_rank(status: Optional[str]) -> int:
@@ -377,12 +389,14 @@ def _iter_inbox_candidates(db) -> List[Dict[str, Any]]:
             derived = _parse_derived(item.get("derived_from"))
             if not derived:
                 continue
-            ckey = _collapse_key(derived, item.get("content"))
+            ckey = _collapse_key(
+                item.get("principal"), derived, item.get("content")
+            )
             if ckey is None:
                 continue
             item["_key"] = ckey
-            item["_app_key"] = (ckey[0], ckey[1])
-            item["_content_sha1"] = ckey[2]
+            item["_app_key"] = (ckey[0], ckey[1], ckey[2])
+            item["_content_sha1"] = ckey[3]
             items.append(item)
     return items
 
@@ -390,9 +404,10 @@ def _iter_inbox_candidates(db) -> List[Dict[str, Any]]:
 def _group_key_dict(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     ckey = rows[0]["_key"]
     return {
-        "inbox_file": ckey[0],
-        "candidate_index": ckey[1],
-        "content_sha1": ckey[2],
+        "principal": ckey[0],
+        "inbox_file": ckey[1],
+        "candidate_index": ckey[2],
+        "content_sha1": ckey[3],
     }
 
 
@@ -434,9 +449,9 @@ def _group_summary(
 
 
 def _byte_identical_row_groups(db) -> List[List[Dict[str, Any]]]:
-    groups: Dict[Tuple[str, int, Optional[str]], List[Dict[str, Any]]] = defaultdict(
-        list
-    )
+    groups: Dict[
+        Tuple[str, str, int, Optional[str]], List[Dict[str, Any]]
+    ] = defaultdict(list)
     for item in _iter_inbox_candidates(db):
         groups[item["_key"]].append(item)
     return [rows for rows in groups.values() if len(rows) >= 2]
@@ -480,6 +495,7 @@ def find_needs_operator_groups(db) -> List[Dict[str, Any]]:
             out.append(summary)
     out.sort(
         key=lambda g: (
+            g["key"].get("principal", ""),
             g["key"]["inbox_file"],
             g["key"]["candidate_index"],
             g["candidate_ids"][0] if g.get("candidate_ids") else 0,
@@ -494,7 +510,7 @@ def find_divergent_content_groups(db) -> List[Dict[str, Any]]:
     These are **not** collapsed by default: different bodies under the same
     inbox key are left for a separate operator policy (not #239 duals).
     """
-    by_app: Dict[Tuple[str, int], List[Dict[str, Any]]] = defaultdict(list)
+    by_app: Dict[Tuple[str, str, int], List[Dict[str, Any]]] = defaultdict(list)
     for item in _iter_inbox_candidates(db):
         by_app[item["_app_key"]].append(item)
 
@@ -510,8 +526,9 @@ def find_divergent_content_groups(db) -> List[Dict[str, Any]]:
         out.append(
             {
                 "key": {
-                    "inbox_file": app_key[0],
-                    "candidate_index": app_key[1],
+                    "principal": app_key[0],
+                    "inbox_file": app_key[1],
+                    "candidate_index": app_key[2],
                 },
                 "content_sha1s": sorted(s or "" for s in shas),
                 "row_count": len(rows),
@@ -526,14 +543,15 @@ def find_divergent_content_groups(db) -> List[Dict[str, Any]]:
 
 
 def find_app_key_collisions(db) -> List[Dict[str, Any]]:
-    """App-key groups with COUNT>1 — blocks the (file, index) unique index.
+    """App-key groups with COUNT>1 — blocks the principal-scoped unique index.
 
     Stronger than ``find_duplicate_candidate_groups``: includes both
     byte-identical duals **and** divergent-content peers under the same
-    ``(inbox_file, candidate_index)``. Used by ``ensure_inbox_dedup_index`` so
-    CREATE UNIQUE never falls through to a confusing IntegrityError.
+    ``(principal, inbox_file, candidate_index)``. Used by
+    ``ensure_inbox_dedup_index`` so CREATE UNIQUE never falls through to a
+    confusing IntegrityError.
     """
-    by_app: Dict[Tuple[str, int], List[Dict[str, Any]]] = defaultdict(list)
+    by_app: Dict[Tuple[str, str, int], List[Dict[str, Any]]] = defaultdict(list)
     for item in _iter_inbox_candidates(db):
         by_app[item["_app_key"]].append(item)
 
@@ -545,8 +563,9 @@ def find_app_key_collisions(db) -> List[Dict[str, Any]]:
         out.append(
             {
                 "key": {
-                    "inbox_file": app_key[0],
-                    "candidate_index": app_key[1],
+                    "principal": app_key[0],
+                    "inbox_file": app_key[1],
+                    "candidate_index": app_key[2],
                 },
                 "row_count": len(rows),
                 "candidate_ids": sorted(int(r["candidate_id"]) for r in rows),
@@ -557,6 +576,7 @@ def find_app_key_collisions(db) -> List[Dict[str, Any]]:
         )
     out.sort(
         key=lambda g: (
+            g["key"].get("principal", ""),
             g["key"]["inbox_file"],
             g["key"]["candidate_index"],
             g["candidate_ids"][0] if g["candidate_ids"] else 0,
@@ -569,24 +589,40 @@ def _load_collapse_group_on_cursor(
     c, key: Dict[str, Any]
 ) -> List[Dict[str, Any]]:
     """Re-read byte-identical twins for one collapse key under an open txn."""
+    principal = key.get("principal")
     inbox_file = key.get("inbox_file")
     candidate_index = key.get("candidate_index")
     content_sha1 = key.get("content_sha1")
     if not isinstance(inbox_file, str) or candidate_index is None:
         return []
-    # Filter in SQL on app key; match sha in Python so NULL/missing sha is ok.
-    c.execute(
-        """
-        SELECT candidate_id, principal, status, content, derived_from,
-               proposed_at, resolved_at, resolved_by, resolution_reason
-        FROM candidate_packets
-        WHERE derived_from IS NOT NULL
-          AND json_extract(derived_from, '$.source') = 'inbox'
-          AND json_extract(derived_from, '$.inbox_file') = ?
-          AND CAST(json_extract(derived_from, '$.candidate_index') AS INTEGER) = ?
-        """,
-        (inbox_file, int(candidate_index)),
-    )
+    # Filter in SQL on principal-scoped app key; match sha in Python.
+    if principal is None or principal == "":
+        c.execute(
+            """
+            SELECT candidate_id, principal, status, content, derived_from,
+                   proposed_at, resolved_at, resolved_by, resolution_reason
+            FROM candidate_packets
+            WHERE derived_from IS NOT NULL
+              AND json_extract(derived_from, '$.source') = 'inbox'
+              AND json_extract(derived_from, '$.inbox_file') = ?
+              AND CAST(json_extract(derived_from, '$.candidate_index') AS INTEGER) = ?
+            """,
+            (inbox_file, int(candidate_index)),
+        )
+    else:
+        c.execute(
+            """
+            SELECT candidate_id, principal, status, content, derived_from,
+                   proposed_at, resolved_at, resolved_by, resolution_reason
+            FROM candidate_packets
+            WHERE principal = ?
+              AND derived_from IS NOT NULL
+              AND json_extract(derived_from, '$.source') = 'inbox'
+              AND json_extract(derived_from, '$.inbox_file') = ?
+              AND CAST(json_extract(derived_from, '$.candidate_index') AS INTEGER) = ?
+            """,
+            (str(principal), inbox_file, int(candidate_index)),
+        )
     want_sha = (
         content_sha1.strip().lower()
         if isinstance(content_sha1, str) and content_sha1.strip()
@@ -598,10 +634,12 @@ def _load_collapse_group_on_cursor(
         derived = _parse_derived(item.get("derived_from"))
         if not derived:
             continue
-        ckey = _collapse_key(derived, item.get("content"))
+        ckey = _collapse_key(
+            item.get("principal"), derived, item.get("content")
+        )
         if ckey is None:
             continue
-        row_sha = ckey[2]
+        row_sha = ckey[3]
         if row_sha != want_sha:
             continue
         item["_key"] = ckey
@@ -888,37 +926,37 @@ def repair_duplicate_candidate_pairs(
 def ensure_inbox_dedup_index(db) -> Dict[str, Any]:
     """Create a partial unique index matching app-level inbox idempotency.
 
-    Key is ``(inbox_file, candidate_index)`` for ``source='inbox'`` — the same
-    key ``inbox_ingest`` / ``compact_distillation`` use. ``content_sha1`` is
-    not part of the constraint (it is audit/grouping metadata only).
+    Key is ``(principal, inbox_file, candidate_index)`` for ``source='inbox'``
+    — the same key ``inbox_ingest`` / ``compact_distillation`` use.
+    ``content_sha1`` is not part of the constraint.
 
-    Requires (file, index) duplicates to already be collapsed (call repair
-    first). Migrates off the legacy weaker ``…_inbox_sha1_unique`` index if
-    present. Returns status describing whether the index exists / was created
-    / failed.
+    Requires principal-scoped (file, index) duplicates to already be collapsed
+    (call repair first). Migrates off the legacy weaker
+    ``…_inbox_sha1_unique`` and any pre-principal ``…_inbox_key_unique``
+    (file, index only) index if present.
 
     **Operator-only, not a migration.** Schema rebuilds of
-    ``candidate_packets`` (e.g. migration 015) drop this index; re-run
+    ``candidate_packets`` drop this index; re-run
     ``scripts/repair_issue_239.py --apply`` after cleanup to recreate it.
-    In-txn key reload on ingest/distill is the primary dual-prevention path.
     """
     index_name = INBOX_DEDUP_INDEX
+    # If a pre-principal (file,index-only) index exists, drop and recreate
+    # with principal so multi-vault basenames are legal.
     with db.cursor() as c:
         c.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='index' AND name=? LIMIT 1",
+            "SELECT sql FROM sqlite_master WHERE type='index' AND name=? LIMIT 1",
             (index_name,),
         )
-        if c.fetchone():
-            # Drop legacy weaker index if both somehow exist.
-            c.execute(
-                f"DROP INDEX IF EXISTS {LEGACY_INBOX_DEDUP_INDEX}"
-            )
-            return {"status": "exists", "index": index_name}
+        row = c.fetchone()
+        if row:
+            sql = row["sql"] if hasattr(row, "keys") else row[0]
+            sql_s = str(sql or "")
+            if "principal" in sql_s.lower():
+                c.execute(f"DROP INDEX IF EXISTS {LEGACY_INBOX_DEDUP_INDEX}")
+                return {"status": "exists", "index": index_name}
+            # Stale global (file, index) index — replace with principal-scoped.
+            c.execute(f"DROP INDEX IF EXISTS {index_name}")
 
-    # Pre-check must match the UNIQUE key (file, index), not only the weaker
-    # byte-identical (file, index, sha) dual groups. Divergent peers under the
-    # same app key also block CREATE UNIQUE — surface them as
-    # blocked_by_duplicates with samples instead of a raw IntegrityError.
     collisions = find_app_key_collisions(db)
     if collisions:
         return {
@@ -946,16 +984,14 @@ def ensure_inbox_dedup_index(db) -> Dict[str, Any]:
 
     try:
         with db.transaction() as c:
-            # Drop the weaker (file, index, sha1) index so the stronger
-            # (file, index) constraint is the only inbox uniqueness backstop.
             c.execute(f"DROP INDEX IF EXISTS {LEGACY_INBOX_DEDUP_INDEX}")
-            # Expression unique index: same inbox file + candidate_index may
-            # only appear once when source=inbox. SQLite 3.9+ (macOS/homebrew
-            # well above that).
+            # Principal-scoped unique index: same basename across agent vaults
+            # is allowed; double-ingest within one principal is not.
             c.execute(
                 f"""
                 CREATE UNIQUE INDEX IF NOT EXISTS {index_name}
                 ON candidate_packets (
+                    principal,
                     json_extract(derived_from, '$.inbox_file'),
                     CAST(json_extract(derived_from, '$.candidate_index') AS INTEGER)
                 )

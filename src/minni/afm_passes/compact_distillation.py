@@ -305,8 +305,9 @@ def distill(db, config, inboxes: Optional[List[Path]] = None,
             fallback_principal: str = "unknown", dry_run: bool = False) -> Dict[str, Any]:
     """Distill eligible compact_summary inbox files into candidate_packets.
 
-    Returns a summary dict. Idempotent at (inbox_file, candidate_index) level;
-    never deletes. ``dry_run=True`` reports counts without writing.
+    Returns a summary dict. Idempotent at
+    (principal, inbox_file, candidate_index) level; never deletes.
+    ``dry_run=True`` reports counts without writing.
     """
     if inboxes is None:
         inboxes = discover_inboxes(config)
@@ -347,7 +348,8 @@ def distill(db, config, inboxes: Optional[List[Path]] = None,
             # file, so its presence marks the whole file as done. This also
             # holds the AFM/fallback split stable per file — a re-run with a
             # different AFM availability must not append a second variant set.
-            if (path.name, 0) in existing:
+            file_key0 = (principal, path.name, 0)
+            if file_key0 in existing:
                 already += 1
                 # Legacy sweep: a file processed by a pre-fix daemon build has
                 # its candidate rows sitting in the DB already but was never
@@ -387,7 +389,7 @@ def distill(db, config, inboxes: Optional[List[Path]] = None,
             privacy = str(raw_privacy).strip() if raw_privacy and str(raw_privacy).strip() else "safe"
             workspace = doc.get("workspace_id") or "default"
             for idx, (content, afm_used) in enumerate(candidates):
-                existing.add((path.name, idx))
+                existing.add((principal, path.name, idx))
                 to_insert.append({
                     "principal": principal,
                     "workspace_id": workspace,
@@ -406,12 +408,15 @@ def distill(db, config, inboxes: Optional[List[Path]] = None,
         with db.transaction() as c:
             # Issue #239: re-load only to_insert keys under BEGIN IMMEDIATE
             # (not full-table scan). Mirror inbox_ingest: narrow in-txn check
-            # + UNIQUE swallow.
-            wanted = {(r["inbox_file"], r["candidate_index"]) for r in to_insert}
+            # + UNIQUE swallow. Principal-scoped keys allow multi-vault peers.
+            wanted = {
+                (r["principal"], r["inbox_file"], r["candidate_index"])
+                for r in to_insert
+            }
             txn_existing = _existing_keys_for_on_cursor(c, wanted)
 
             for r in to_insert:
-                key = (r["inbox_file"], r["candidate_index"])
+                key = (r["principal"], r["inbox_file"], r["candidate_index"])
                 if key in txn_existing:
                     already += 1
                     continue
