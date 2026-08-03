@@ -29,6 +29,11 @@ make test    # full suites (engine pytest + plugin test) — heavier, loads embe
 make smoke   # hermetic daemon smoke (scripts/repro-smoke.sh), isolated MINNI_HOME
 ```
 
+Prefer the Make targets above: they set `PYTHONPATH=src` so a git worktree
+does not silently import `minni` from another checkout's editable install
+(#258). If you run bare pytest, use `PYTHONPATH=src .venv/bin/python -m pytest …`
+from the repo root (scoped agent runs included).
+
 `make check` is what the pre-push hook runs, and it's the fast gate CI expects
 to pass before review. Run it before you push. `make test` runs the full
 engine and plugin suites and is slower. `make smoke` runs the daemon in an
