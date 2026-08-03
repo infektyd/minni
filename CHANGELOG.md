@@ -8,21 +8,87 @@ pre-1.0: minor versions may contain breaking changes until v1.0.0.
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-08-03
+
+Campaign release: integrity, observability, deploy honesty, and CI trust
+hardening landed on `main` after v0.4.1. No new product surface — patch
+version, same pattern as v0.4.1.
+
+### Added
+
+- **`claude-science` vault registration (#257):** registers Claude Science as a
+  Minni-known agent and repairs drifted vault-slug mirrors so ingest no longer
+  skips the live vault. Without a registered slug, `vault_ingest` skips the
+  path entirely.
+- **MCP 2026-07-28 readiness plan + protocol tripwire (#255):** assessment and
+  a tripwire test for the 2026-07-28 MCP spec revision. No plugin-server
+  behaviour change; documents host negotiation gaps (Claude Code host still
+  pre-spec).
+
 ### Fixed
 
-- **Learn-gate semantic tier observability (#237 / SEC-G6):**
-  `LearningQualityReport` now carries `semanticTier: "ran" | "unavailable" |
-  "skipped"` so audit records can distinguish "AFM examined and cleared" from
-  "AFM never ran / off / failed" and from "tier not invoked". Fail-open
-  behavior is unchanged; only observability is added.
-- **POLICY.md §2 redaction contract (#237 / SEC-G7):** docs no longer claim a
-  MUST-redact guarantee for JSON-quoted secrets or all absolute paths. §2.1/§2.2/§2.3
-  are marked PARTIAL and aligned with `redaction.py` plus
-  `THREAT_MODEL.md` residual language; bare plist/socket names are not claimed
-  as rewritten.
-- **Learn-gate unknown AFM verdict observability:** non-enumerated classifier
-  returns are labeled `semanticTier: "unavailable"` (not mislabeled `"ran"`);
-  hard-block remains credential-only — fail-open behavior is unchanged.
+- **R10 deploy honesty and root update propagation (#261 / #232–#234):** wire
+  and health surfaces stop reporting success they did not achieve; `wired.json`
+  tracks active roots (latest-per-platform); `make sync-root` / `update_root.sh`
+  propagate merged fixes into the live install; deploy status surfaces stale
+  plugin-dist honestly instead of silent lag.
+- **R8 observability degrade paths (#260 / #226, #228, #230):** every silent
+  degrade path now visible at the call site — lifecycle recovered signals,
+  `BridgeFailure`, `expand_with_status`, and related counters. Every change
+  adds a signal; none quiets one.
+- **R7 retrieval integrity (#259 / #225 + gap-audit GA\*):** episodic memory is
+  reachable on the default path; decay is scheduled and participates in
+  ordering; the vector gap is drained and surfaced. Slice gate: working with a
+  coverage count, or removed from the declared surface.
+- **R3 dark memory / shared vault index (#256):** indexes the daemon's own vault
+  (AFM loop no longer dark to recall) and expires drafts past TTL so
+  `drafts_pending` and operator gauges match reality.
+- **Dual `candidate_packets` resolution + virtual `_durable` hygiene (#269 /
+  #239):** idempotent repair for backfill-era exact-duplicate
+  `candidate_packets` rows that left governance seeing contradictory terminal
+  pairs after accept+reject twins; virtual `_durable` hygiene kept consistent.
+- **Handoff fail-loud lease store (#265 / #231):** handoff DB read errors no
+  longer look like empty results (PLUMB-T7); `_active_plan.json` active pointer
+  written atomically (PLUMB-T4 partial).
+- **SessionStart compact-harvest shared platforms (#264 / #227 / P3):**
+  `harvestCompactSummary` runs from shared `handleSessionStart` on
+  compact/resume for Codex, Grok Build, Cursor, and other
+  `createHookHandlers` platforms — not Claude Code only.
+- **Grok SessionStart→Stop corrections delivery (#268 / #253):** follow-up to
+  #247. Grok parks non-empty correction stashes under `inbox/.undeliverable/`
+  (SessionStart is not injectable); Stop (the only injectable event) now reads
+  the park and injects `corrections_reassert`.
+- **SessionStart corrections delivery before archive (#247):** stop SessionStart
+  losing corrections — deliver before archiving, budget the boot envelope
+  (R2 data-loss).
+- **Learn-gate multi-channel scan (#245):** credential / quality scan covers
+  every persisted channel (`title`, `content`, `category`, `source`), not
+  content alone.
+- **Learn-gate semantic tier observability + POLICY redaction honesty (#270 /
+  #237 / SEC-G6, SEC-G7):** `LearningQualityReport` carries
+  `semanticTier: "ran" | "unavailable" | "skipped"` so audits distinguish AFM
+  cleared vs never-ran vs not-invoked; unknown AFM verdicts label
+  `unavailable` (not mislabeled `ran`); hard-block remains credential-only.
+  POLICY.md §2 no longer claims MUST-redact for JSON-quoted secrets or all
+  absolute paths — §2.1/§2.2/§2.3 marked PARTIAL and aligned with
+  `redaction.py` / residual threat-model language.
+- **Gauges identity unfreeze (#267 / #254):** `identity_present: "not seeded"`
+  no longer freezes permanently after Layer 1 arrives; residual path after
+  seed_layer1 → seed_distill order.
+- **Worktree pytest resolve (#262 / #258):** Make-driven test entry points
+  resolve `minni` from the worktree under test, not a stale editable install
+  of the primary checkout.
+- **CI grok-review max-turns 30 → 60 (#266):** formal Grok Code Review no
+  longer dies mid-slice before posting a Reviews API event on large PRs.
+- **CI PATH pins in grok-review / grok leak gates (#263 / #252):** leak-gate and
+  verdict-parser steps use absolute `/usr/bin/git` and `/usr/bin/python3 -I`
+  (follow-up to #246 base-branch gate anchoring).
+- **Boundary leak gate anchored to default branch (#246):** load the leak gate
+  from the base branch, not the PR's checkout, so a PR cannot rewrite its own
+  gate.
+- **Mechanical APPROVE moves to the relay user (#248):** App-identity approvals
+  do not count toward `reviewDecision`; mechanical APPROVE runs as the relay
+  user so dual-lane gate eligibility is real.
 
 ## [0.4.1] - 2026-08-01
 
@@ -297,6 +363,7 @@ commit.
   model-download notices, contributor/security hygiene files, and a rewritten
   README with a `docs/` tree.
 
-[Unreleased]: https://github.com/infektyd/minni/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/infektyd/minni/compare/v0.4.2...HEAD
+[0.4.2]: https://github.com/infektyd/minni/releases/tag/v0.4.2
 [0.4.1]: https://github.com/infektyd/minni/releases/tag/v0.4.1
 [0.1.0]: https://github.com/infektyd/minni/releases/tag/v0.1.0

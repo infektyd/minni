@@ -54,7 +54,7 @@ Honest caveats: Minni is **early (v0.4)**, with tiny adoption, no published benc
 
 ## Quickstart
 
-Minni is two pieces: the **daemon + CLI** (PyPI) and the **agent wiring** (the MCP plugin and per-runtime hooks), which `minni wire <platform>` installs. Step 1 gives you a working, verifiable memory daemon; step 2 is what actually connects your agents to it. Wheels have shipped the plugin payload bundled inside the package since **v0.3** (current release: **v0.4.1**), so both steps are `pipx install minni` and nothing else — a source checkout (`--from-repo`) is only needed for contributors working from `main`.
+Minni is two pieces: the **daemon + CLI** (PyPI) and the **agent wiring** (the MCP plugin and per-runtime hooks), which `minni wire <platform>` installs. Step 1 gives you a working, verifiable memory daemon; step 2 is what actually connects your agents to it. Wheels have shipped the plugin payload bundled inside the package since **v0.3** (current release: **v0.4.2**), so both steps are `pipx install minni` and nothing else — a source checkout (`--from-repo`) is only needed for contributors working from `main`.
 
 ### 1. Install the daemon + CLI (PyPI)
 
@@ -166,7 +166,7 @@ Two things reach the daemon that are not the same thing. **Agents call** MCP too
 
 ## Status
 
-Minni is at **v0.4.1**, live on [PyPI](https://pypi.org/project/minni/): the daemon and CLI install with one `pipx install minni`, releases publish via OIDC trusted publishing from tagged builds, and hook support covers Claude Code, Codex, Gemini / Antigravity, Grok, Cursor, and Kilo Code. Interfaces can still change before 1.0, adoption is small, and the public contract is intentionally smaller than the implementation. How each release got here is in [CHANGELOG.md](CHANGELOG.md); this section only says what state the project is in today.
+Minni is at **v0.4.2**, live on [PyPI](https://pypi.org/project/minni/): the daemon and CLI install with one `pipx install minni`, releases publish via OIDC trusted publishing from tagged builds, and hook support covers Claude Code, Codex, Gemini / Antigravity, Grok, Cursor, and Kilo Code. Interfaces can still change before 1.0, adoption is small, and the public contract is intentionally smaller than the implementation. How each release got here is in [CHANGELOG.md](CHANGELOG.md); this section only says what state the project is in today.
 
 What "works" is not asserted, it is *executed in public*: CI stands the daemon up from nothing on a clean Linux runner and proves status, recall, and home-directory isolation on every push — the same check `minni doctor` gives you locally. A benchmark harness (`bench/membench`, byte-reproducible scorecards) exists, but no headline numbers are published until real-model runs are: when in doubt, this project under-claims. In that spirit: the core multi-agent loop — multiple approved agents sharing one governed daemon — is dogfooded daily (Minni is developed using Minni), while the temporary-team orchestration surface (`minni_team_*`) has unit tests but no real-world mileage yet.
 
