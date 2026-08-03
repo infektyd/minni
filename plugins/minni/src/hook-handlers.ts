@@ -1468,7 +1468,7 @@ export async function recordUnroutedEvent(
 async function runBridgeFailureDiagnostic(
   config: AgentHookConfig,
   payload: Record<string, unknown>,
-): Promise<void> {
+): Promise<never> {
   const failedEvent = asString(payload.failed_event) || "(unknown)";
   const bridge = asString(payload.bridge) || "(unknown)";
   // Round 9 (PR #260): storm suppress carries counts forward and flushes on
@@ -1493,24 +1493,42 @@ async function runBridgeFailureDiagnostic(
       throttleKey: `${config.auditPrefix}_bridge_failure__${failedEvent}`,
     });
   } catch {
-    emit({ continue: true });
-    process.exitCode = 1;
-    return;
+    // Round 26: delivery is the EXIT CODE. Parent treats close(null)/non-zero
+    // as undelivered. Setting exitCode and returning left the event loop
+    // alive until SIGKILL → close(null) after a successful audit, reopening
+    // P6 as "never delivered" after a durable write. Force exit.
+    try {
+      emit({ continue: true });
+    } catch {
+      /* best-effort envelope */
+    }
+    process.exit(1);
   }
   emit({ continue: true });
+  // Same "delivery is exit" contract as every other settled hook path.
+  exitAfterDelivery();
 }
 
 export async function runHookMain(config: AgentHookConfig): Promise<void> {
-  // Round 7 (PR #260): the bridge diagnostic is routed BEFORE the
+  // Round 7/26 (PR #260): the bridge diagnostic is routed BEFORE the
   // hooksEnabled gate — disabling memory hooks must not also disable the one
   // surface that says the bridge is broken. The early return here used to
-  // exit 0 first, which the parent read as "audit delivered". argv is the
-  // bridge's invocation contract (spawn(HOOK_SCRIPT, ["BridgeFailure"])), so
-  // the route is decided before stdin is consumed.
-  if ((process.argv[2] ?? "").trim() === BRIDGE_FAILURE_EVENT) {
+  // exit 0 first, which the parent read as "audit delivered".
+  //
+  // Argv form is the Kilo spawn contract. Payload-only form
+  // (hook_event_name: BridgeFailure, no argv) is the same diagnostic
+  // channel and must also bypass hooksEnabled — read stdin once, then route
+  // both before any hooks-disabled early return.
+  const eventArg = (process.argv[2] ?? "").trim();
+  if (eventArg === BRIDGE_FAILURE_EVENT) {
     const payload = (await readStdin()) as Record<string, unknown>;
     await runBridgeFailureDiagnostic(config, payload);
-    return;
+  }
+
+  const payload = (await readStdin()) as Record<string, unknown>;
+  const eventFromPayload = asString(payload.hook_event_name);
+  if ((eventFromPayload || "").trim() === BRIDGE_FAILURE_EVENT) {
+    await runBridgeFailureDiagnostic(config, payload);
   }
 
   if (!config.hooksEnabled) {
@@ -1518,18 +1536,7 @@ export async function runHookMain(config: AgentHookConfig): Promise<void> {
     return;
   }
 
-  const eventArg = process.argv[2];
-  const payload = (await readStdin()) as Record<string, unknown>;
-  const eventFromPayload = asString(payload.hook_event_name);
   const event = (eventArg || eventFromPayload || "").trim();
-
-  // Payload-only form (hook_event_name with no argv): same diagnostic
-  // channel, still routed BEFORE the VALID_EVENTS gate so it is never
-  // recorded as a dropped intent.
-  if (event === BRIDGE_FAILURE_EVENT) {
-    await runBridgeFailureDiagnostic(config, payload);
-    return;
-  }
   // PreToolUse is dispatched here too but is NOT an EnvelopeEvent (its output is
   // the permissionDecision shape), so it is gated alongside VALID_EVENTS.
   if (event !== PRE_TOOL_USE_EVENT && !VALID_EVENTS.includes(event as EnvelopeEvent)) {

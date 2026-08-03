@@ -1406,6 +1406,12 @@ def submit_drafts(job: dict, wait: bool = True, timeout: Optional[float] = 30.0)
                 # Round 18: also clear the vault sidecar so a later cold
                 # start does not re-hold an already-applied decision set.
                 _clear_persisted_pending_lifecycle(pass_name, vault_for_pending)
+                # Round 26: recovered-drop metric under the same lock as sticky
+                # clear so concurrent recoveries cannot lose increments/recency
+                # on a counter derive_loop_status consults for backlogged.
+                if did_work and drafts_deferred:
+                    _LIFECYCLE_RECOVERED_DRAFTS_DROPPED += int(drafts_deferred)
+                    _LAST_LIFECYCLE_RECOVERED_DROP_AT = time.time()
                 if not did_work:
                     # Stale sticky: every deferred ID already terminal / fenced
                     # with zero work this pass — enqueue THIS job's wet drafts
@@ -1429,9 +1435,6 @@ def submit_drafts(job: dict, wait: bool = True, timeout: Optional[float] = 30.0)
             if did_work:
                 # Round 15/24: return without put_nowait. Count discarded wet
                 # drafts so lifecycle_recovered is not silent LLM loss.
-                if drafts_deferred:
-                    _LIFECYCLE_RECOVERED_DRAFTS_DROPPED += int(drafts_deferred)
-                    _LAST_LIFECYCLE_RECOVERED_DROP_AT = time.time()
                 logger.info(
                     "AFM writer: re-applied pending lifecycle for pass %r; "
                     "NOT enqueueing a second draft batch (discarded %d wet draft(s))",

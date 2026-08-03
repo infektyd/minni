@@ -507,6 +507,68 @@ test("P6 round 7: hooks disabled does not disable the bridge-failure surface", a
   });
 });
 
+async function runBridgeFailurePayloadOnly(vaultPath, extraEnv = {}) {
+  // Payload-only form: no argv BridgeFailure — hook_event_name in stdin only.
+  const child = execFileAsync(process.execPath, [KILOCODE_HOOK], {
+    env: {
+      ...process.env,
+      MINNI_KILOCODE_VAULT_PATH: vaultPath,
+      MINNI_HOME: path.join(vaultPath, ".minni-home"),
+      ...extraEnv,
+    },
+  });
+  child.child.stdin.end(
+    JSON.stringify({
+      hook_event_name: "BridgeFailure",
+      bridge: "kilo",
+      failed_event: "Stop",
+      error: "hook timed out",
+    }),
+  );
+  try {
+    await child;
+    return 0;
+  } catch (error) {
+    return error.code ?? 1;
+  }
+}
+
+test("P6 round 26: payload-only BridgeFailure bypasses hooksEnabled", async () => {
+  // Argv form was already before the gate; payload-only used to run after
+  // hooksEnabled and exit clean with no audit when hooks were off.
+  await withVault(async (root) => {
+    const code = await runBridgeFailurePayloadOnly(root, {
+      MINNI_KILOCODE_HOOKS: "off",
+    });
+    assert.equal(code, 0, "payload-only delivered diagnostic exits clean");
+    const log = await readFile(path.join(root, "log.md"), "utf8");
+    assert.match(
+      log,
+      /bridge_failure/,
+      "payload-only BridgeFailure must audit with hooks disabled",
+    );
+  });
+});
+
+test("P6 round 26: BridgeFailure forces process.exit (delivery is exit)", async () => {
+  // Source pin: audit success must exitAfterDelivery / process.exit(0); failure
+  // must process.exit(1) — not exitCode=1 + return (parent SIGKILL → undelivered).
+  const source = await readFile(
+    path.join(PLUGIN_ROOT, "src", "hook-handlers.ts"),
+    "utf8",
+  );
+  const start = source.indexOf("async function runBridgeFailureDiagnostic");
+  assert.ok(start !== -1);
+  const window = source.slice(start, start + 2800);
+  assert.match(window, /exitAfterDelivery\(\)/, "success must force exit 0");
+  assert.match(window, /process\.exit\(1\)/, "audit failure must force exit 1");
+  assert.doesNotMatch(
+    window,
+    /process\.exitCode\s*=\s*1/,
+    "exitCode alone is not delivery — parent kills and treats as undelivered",
+  );
+});
+
 test("P6 round 8: a throttled non-write cannot report delivered", async () => {
   // Round 7 made the exit code the delivery signal; recordAudit's 5s throttle
   // returned success WITHOUT appending, so an immediate retry — exactly what
@@ -531,13 +593,24 @@ test("P6: the hook routes BridgeFailure before the VALID_EVENTS gate", async () 
     path.join(PLUGIN_ROOT, "src", "hook-handlers.ts"),
     "utf8",
   );
-  const bridge = source.indexOf("event === BRIDGE_FAILURE_EVENT");
+  // Round 26: argv + payload-only routes both use BRIDGE_FAILURE_EVENT before
+  // hooksEnabled and before VALID_EVENTS.
+  const bridgeArgv = source.indexOf("eventArg === BRIDGE_FAILURE_EVENT");
+  const bridgePayload = source.indexOf(
+    "eventFromPayload || \"\").trim() === BRIDGE_FAILURE_EVENT",
+  );
   const gate = source.indexOf("!VALID_EVENTS.includes(event as EnvelopeEvent)");
-  assert.ok(bridge !== -1, "BridgeFailure is not routed");
+  const hooksGate = source.indexOf("if (!config.hooksEnabled)");
+  assert.ok(bridgeArgv !== -1, "argv BridgeFailure is not routed");
+  assert.ok(bridgePayload !== -1, "payload-only BridgeFailure is not routed");
   assert.ok(
-    bridge < gate,
+    bridgeArgv < gate && bridgePayload < gate,
     "BridgeFailure must be handled before the envelope-event gate, or the " +
       "diagnostic itself gets recorded as a dropped intent",
+  );
+  assert.ok(
+    bridgeArgv < hooksGate && bridgePayload < hooksGate,
+    "both BridgeFailure forms must run before hooksEnabled early-return",
   );
 });
 

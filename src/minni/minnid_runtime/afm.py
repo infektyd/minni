@@ -987,6 +987,11 @@ async def afm_loop_runner(context: AFMContext):
                                 continue
                             break
                         last_summ = (res.get("result") or {}).get("summary") if isinstance(res, dict) else None
+                        # Round 26: a mid-tick lifecycle_recovered soft-fail must
+                        # not latch tick_failed across later successful batches —
+                        # that forced a 300s re-fire after a productive drain.
+                        tick_failed = False
+                        tick_failure = None
                         batches += 1
                         examined = (last_summ or {}).get("examined", 0)
                         total_examined += examined
