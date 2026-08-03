@@ -255,10 +255,16 @@ def maybe_archive_for_candidate(db, config, candidate_id: int) -> Optional[str]:
     rows = _rows_for_inbox_file(db, inbox_file, principal=owner_principal)
     if not rows:
         return None
-    # derived_from records only the filename; find it across the known inboxes
-    # — but archive a file ONLY when the rows provably correspond to ITS
-    # content and every matching row for THIS principal is terminal.
+    # Only consider inboxes owned by the resolved candidate's principal.
+    # Content-matching alone is insufficient: byte-identical candidates under
+    # the same basename in another vault would otherwise archive the wrong
+    # agent's still-live file when discover order visits them first.
+    from minni.afm_passes.inbox_ingest import _principal_for_inbox
+
     for inbox in discover_inboxes(config):
+        inbox_owner = _principal_for_inbox(inbox, fallback_principal="unknown")
+        if str(inbox_owner or "") != owner_principal:
+            continue
         source = inbox / inbox_file
         try:
             # Belt-and-braces containment: the joined path must stay inside

@@ -540,3 +540,35 @@ def test_cross_vault_same_content_does_not_block_archive(tmp_path, monkeypatch):
     assert archived == str(inbox_b / ".archive" / "same.json")
     assert not (inbox_b / "same.json").exists()
     assert (inbox_a / "same.json").is_file()
+
+
+def test_identical_cross_vault_archives_only_owner(tmp_path, monkeypatch):
+    """Same basename + identical candidate set: only the owner vault is archived.
+
+    Regression for High: principal-scoped rows + content-match must not archive
+    a peer vault when discover_inboxes visits the peer first.
+    """
+    import minni.afm_passes.inbox_archive as archive_mod
+    from minni.afm_passes.inbox_archive import maybe_archive_for_candidate
+    from minni.afm_passes.inbox_ingest import ingest
+
+    db_obj, cfg = _make_db(tmp_path)
+    inbox_a = tmp_path / "codex-vault" / "inbox"
+    inbox_b = tmp_path / "grok-vault" / "inbox"
+    shared = ["identical shared lesson"]
+    _write_inbox_file(inbox_a, "same.json", _stop_doc(shared))
+    _write_inbox_file(
+        inbox_b, "same.json",
+        _stop_doc(shared, agent_id="grok-build"),
+    )
+    assert ingest(db_obj, cfg, inboxes=[inbox_a], dry_run=False)["inserted"] == 1
+    assert ingest(db_obj, cfg, inboxes=[inbox_b], dry_run=False)["inserted"] == 1
+    _set_status(db_obj, "accepted", principal="grok-build")
+    # codex remains proposed
+    (cid_b,) = _candidate_ids(db_obj, principal="grok-build")
+    # Peer (codex) first — would mis-archive without ownership filter
+    monkeypatch.setattr(archive_mod, "discover_inboxes", lambda _cfg: [inbox_a, inbox_b])
+    archived = maybe_archive_for_candidate(db_obj, cfg, cid_b)
+    assert archived == str(inbox_b / ".archive" / "same.json")
+    assert not (inbox_b / "same.json").exists()
+    assert (inbox_a / "same.json").is_file(), "peer vault must stay live while proposed"
