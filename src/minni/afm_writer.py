@@ -120,6 +120,13 @@ _IN_FLIGHT_LOCK = threading.Lock()
 # vault so a cold start can re-apply without re-minting.
 _LIFECYCLE_APPLY_FAILURES = 0
 _LAST_LIFECYCLE_APPLY_FAILURE_AT: Optional[float] = None
+# Round 24: wet drafts discarded because sticky re-apply recovered a prior
+# decision set (lifecycle_recovered). Soft scheduling is correct, but the
+# loss must be a first-class metric — not an invisible throw-away of an LLM
+# batch while writer_status can still read ok.
+_LIFECYCLE_RECOVERED_DRAFTS_DROPPED = 0
+_LAST_LIFECYCLE_RECOVERED_DROP_AT: Optional[float] = None
+LIFECYCLE_RECOVERED_DROP_RECENT_SECONDS = 3600.0
 _PENDING_LIFECYCLE: dict[str, dict] = {}
 # Round 20: passes currently re-applying sticky lifecycle *outside* the
 # in-flight lock. Claim under the lock, invoke the handler outside (DB/embed
@@ -206,11 +213,14 @@ def reset_pass_counters() -> None:
     _LAST_WRITE_TIMEOUT_AT = None
     global _WRITE_FAILURES, _LAST_WRITE_FAILURE_AT, _UNRECOVERED_WRITE_FAILURES
     global _LIFECYCLE_APPLY_FAILURES, _LAST_LIFECYCLE_APPLY_FAILURE_AT
+    global _LIFECYCLE_RECOVERED_DRAFTS_DROPPED, _LAST_LIFECYCLE_RECOVERED_DROP_AT
     _WRITE_FAILURES = 0
     _LAST_WRITE_FAILURE_AT = None
     _UNRECOVERED_WRITE_FAILURES = 0
     _LIFECYCLE_APPLY_FAILURES = 0
     _LAST_LIFECYCLE_APPLY_FAILURE_AT = None
+    _LIFECYCLE_RECOVERED_DRAFTS_DROPPED = 0
+    _LAST_LIFECYCLE_RECOVERED_DROP_AT = None
     with _IN_FLIGHT_LOCK:
         _IN_FLIGHT_PER_PASS.clear()
         _PENDING_LIFECYCLE.clear()
@@ -1168,6 +1178,10 @@ class DraftQueueFull(RuntimeError):
 
 
 def submit_drafts(job: dict, wait: bool = True, timeout: Optional[float] = 30.0) -> dict:
+    global _WRITES_DROPPED, _LAST_DROP_AT
+    global _WRITE_TIMEOUTS, _LAST_WRITE_TIMEOUT_AT
+    global _LIFECYCLE_APPLY_FAILURES, _LAST_LIFECYCLE_APPLY_FAILURE_AT
+    global _LIFECYCLE_RECOVERED_DRAFTS_DROPPED, _LAST_LIFECYCLE_RECOVERED_DROP_AT
     _ensure_worker()
     pass_name = str(job.get("pass_name") or "unknown")
     done = threading.Event()
@@ -1251,7 +1265,6 @@ def submit_drafts(job: dict, wait: bool = True, timeout: Optional[float] = 30.0)
                 # Drop policy: reject at the door and count it, rather than block
                 # the caller or silently grow. The drafts are NOT written; saying
                 # so is the whole point.
-                global _WRITES_DROPPED, _LAST_DROP_AT
                 _WRITES_DROPPED += 1
                 _LAST_DROP_AT = time.time()
                 logger.error(
@@ -1268,26 +1281,102 @@ def submit_drafts(job: dict, wait: bool = True, timeout: Optional[float] = 30.0)
     if reapply_handler is not None:
         try:
             reapply_handler(reapply_payload)
-            # Round 22: only discard the wet batch when re-apply actually
-            # terminalized candidates (anti-duplicate). A pure no-op re-apply
-            # means sticky was stale (operator already resolved / apply landed
-            # but sidecar clear failed) — throwing away a full LLM pass for a
-            # NEW decision set is uncounted loss. apply_consolidation_result
-            # always writes result["applied"]; handlers that omit it keep the
-            # conservative discard so we never dual-mint when we cannot prove
-            # the re-apply was a no-op.
+            # Round 22/24: clear sticky only when the deferred ID set is fully
+            # done. Partial terminalize (any(promoted)>0 while peers stay
+            # proposed) used to pop sticky and dual-mint the remainder —
+            # reopening AFM-8. apply_consolidation_result reports
+            # remaining_proposed + errors; legacy handlers without that
+            # shape stay on the conservative "any count > 0" path only when
+            # remaining is absent AND no errors key.
             applied = (
                 reapply_payload.get("applied")
                 if isinstance(reapply_payload, dict)
                 else None
             )
+            complete = False
+            did_work = False
             if isinstance(applied, dict):
-                did_terminalize = any(
-                    int(applied.get(k) or 0) > 0
+                remaining = applied.get("remaining_proposed")
+                errors = int(applied.get("errors") or 0)
+                terminalized = sum(
+                    int(applied.get(k) or 0)
                     for k in ("promoted", "deduped", "reviewed")
                 )
+                did_work = terminalized > 0
+                if remaining is not None:
+                    # Authoritative path (apply_consolidation_result round 24).
+                    complete = errors == 0 and len(remaining) == 0
+                else:
+                    # Legacy applied shape without remaining_proposed:
+                    # - full (terminalized >= requested) → complete + did_work
+                    # - zero work → complete no-op (stale sticky → enqueue wet)
+                    # - partial (0 < terminalized < requested) → INCOMPLETE
+                    #   (this is the High AFM-8 reopen the review caught)
+                    req = applied.get("requested")
+                    if isinstance(req, dict):
+                        requested = sum(
+                            int(req.get(k) or 0) for k in ("promote", "dedup", "review")
+                        )
+                    else:
+                        requested = sum(
+                            len(reapply_payload.get(k) or [])
+                            for k in (
+                                "promote_candidate_ids",
+                                "dedup_candidate_ids",
+                                "review_candidate_ids",
+                            )
+                        )
+                    if errors > 0:
+                        complete = False
+                    elif terminalized == 0:
+                        complete = True  # stale / already-resolved no-op
+                    elif requested > 0 and terminalized >= requested:
+                        complete = True
+                    else:
+                        complete = False  # partial terminalize
             else:
-                did_terminalize = True
+                # Handlers that omit applied: conservative discard (assume full).
+                complete = True
+                did_work = True
+
+            if not complete:
+                # Partial / soft failure: keep sticky + hold, refuse wet batch.
+                with _IN_FLIGHT_LOCK:
+                    _LIFECYCLE_APPLY_FAILURES += 1
+                    _LAST_LIFECYCLE_APPLY_FAILURE_AT = time.time()
+                    # Refresh serializable sticky from reapply_payload (minus
+                    # applied report) so a later pass retries the same IDs.
+                    stored = {
+                        k: v
+                        for k, v in (reapply_payload or {}).items()
+                        if not str(k).startswith("_") and k != "applied"
+                    }
+                    if callable(reapply_handler):
+                        stored["_handler"] = reapply_handler
+                    if vault_for_pending:
+                        stored["_vault_path"] = str(
+                            Path(vault_for_pending).expanduser()
+                        )
+                    _PENDING_LIFECYCLE[pass_name] = stored
+                    _persist_pending_lifecycle(
+                        pass_name, stored, vault_for_pending
+                    )
+                    # Do not clear the prior in-flight Event — hold remains.
+                logger.warning(
+                    "AFM writer: sticky re-apply for pass %r incomplete "
+                    "(applied=%r); holding lifecycle_pending, no wet enqueue",
+                    pass_name, applied,
+                )
+                return {
+                    "status": "write_in_flight",
+                    "queue_depth": _WORK_QUEUE.qsize(),
+                    "drafts_written": [],
+                    "drafts_deferred": drafts_deferred,
+                    "lifecycle_pending": True,
+                    "lifecycle_partial": True,
+                    "lifecycle_applied": dict(applied) if isinstance(applied, dict) else applied,
+                }
+
             with _IN_FLIGHT_LOCK:
                 _PENDING_LIFECYCLE.pop(pass_name, None)
                 prior_ev = _IN_FLIGHT_PER_PASS.get(pass_name)
@@ -1296,9 +1385,10 @@ def submit_drafts(job: dict, wait: bool = True, timeout: Optional[float] = 30.0)
                 # Round 18: also clear the vault sidecar so a later cold
                 # start does not re-hold an already-applied decision set.
                 _clear_persisted_pending_lifecycle(pass_name, vault_for_pending)
-                if not did_terminalize:
-                    # Stale sticky: enqueue THIS job's wet drafts under the
-                    # same lock so a concurrent submit cannot race us.
+                if not did_work:
+                    # Stale sticky: every deferred ID already terminal / fenced
+                    # with zero work this pass — enqueue THIS job's wet drafts
+                    # under the same lock so a concurrent submit cannot race us.
                     try:
                         _WORK_QUEUE.put_nowait((job, done, out))
                     except queue.Full:
@@ -1315,16 +1405,16 @@ def submit_drafts(job: dict, wait: bool = True, timeout: Optional[float] = 30.0)
                             f"{drafts_deferred} draft(s) rejected, not written"
                         )
                     _IN_FLIGHT_PER_PASS[pass_name] = done
-            if did_terminalize:
-                # Round 15: return without put_nowait. Falling through
-                # enqueued the NEW job's drafts (new page_ids) after the
-                # first batch already landed — reopening AFM-8 duplicates
-                # on the recovery path. Candidates are now terminal; the
-                # next tick will not regenerate the same decision set.
+            if did_work:
+                # Round 15/24: return without put_nowait. Count discarded wet
+                # drafts so lifecycle_recovered is not silent LLM loss.
+                if drafts_deferred:
+                    _LIFECYCLE_RECOVERED_DRAFTS_DROPPED += int(drafts_deferred)
+                    _LAST_LIFECYCLE_RECOVERED_DROP_AT = time.time()
                 logger.info(
                     "AFM writer: re-applied pending lifecycle for pass %r; "
-                    "NOT enqueueing a second draft batch",
-                    pass_name,
+                    "NOT enqueueing a second draft batch (discarded %d wet draft(s))",
+                    pass_name, drafts_deferred,
                 )
                 return {
                     "status": "lifecycle_recovered",
@@ -1333,6 +1423,7 @@ def submit_drafts(job: dict, wait: bool = True, timeout: Optional[float] = 30.0)
                     "drafts_deferred": drafts_deferred,
                     "lifecycle_recovered": True,
                     "lifecycle_applied": dict(applied) if isinstance(applied, dict) else True,
+                    "lifecycle_recovered_drafts_dropped": int(drafts_deferred),
                 }
             logger.info(
                 "AFM writer: pending lifecycle re-apply was a no-op for pass %r; "
@@ -1343,7 +1434,6 @@ def submit_drafts(job: dict, wait: bool = True, timeout: Optional[float] = 30.0)
         except DraftQueueFull:
             raise
         except Exception:
-            global _LIFECYCLE_APPLY_FAILURES, _LAST_LIFECYCLE_APPLY_FAILURE_AT
             with _IN_FLIGHT_LOCK:
                 _LIFECYCLE_APPLY_FAILURES += 1
                 _LAST_LIFECYCLE_APPLY_FAILURE_AT = time.time()
@@ -1381,7 +1471,6 @@ def submit_drafts(job: dict, wait: bool = True, timeout: Optional[float] = 30.0)
         # counters and the defer flag. Counting a timeout then returning a
         # late success (phantom write_timeout) made derive_loop_status read
         # backlogged for an hour after a write that actually landed.
-        global _WRITE_TIMEOUTS, _LAST_WRITE_TIMEOUT_AT
         with _IN_FLIGHT_LOCK:
             err = out.get("error") if "error" in out else None
             result = out.get("result") if "result" in out else None
@@ -1518,6 +1607,8 @@ def writer_status(
         "pending_lifecycle_pass_names": pending_lifecycle_pass_names,
         "lifecycle_apply_failures": _LIFECYCLE_APPLY_FAILURES,
         "last_lifecycle_apply_failure_at": _LAST_LIFECYCLE_APPLY_FAILURE_AT,
+        "lifecycle_recovered_drafts_dropped": _LIFECYCLE_RECOVERED_DRAFTS_DROPPED,
+        "last_lifecycle_recovered_drop_at": _LAST_LIFECYCLE_RECOVERED_DROP_AT,
         "failures_per_pass": dict(_FAILURES_PER_PASS),
         "last_failure_per_pass": dict(_LAST_FAILURE_PER_PASS),
     }

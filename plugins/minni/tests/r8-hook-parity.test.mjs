@@ -708,6 +708,13 @@ test("P6: the bridge diagnostic is killed on a timer and capped in flight", asyn
     /if \(claimed\)/,
     "settle/catch must only decrement when the slot was claimed",
   );
+  // Round 24: post-claim failure is accepted (return true) so callers do not
+  // double-queue, and the child is SIGKILL'd because settle clears the timer.
+  assert.match(
+    window,
+    /return true;\s*\}\s*\/\/ Pre-claim|return true;\s*\}\s*$|child\.kill\("SIGKILL"\)[\s\S]*return true/,
+    "post-claim sync failure must SIGKILL and return true (no double-queue)",
+  );
 });
 
 test("P6: storm suppress coalesces real failures and flushes on settle", async () => {

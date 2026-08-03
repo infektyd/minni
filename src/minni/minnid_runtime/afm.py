@@ -366,32 +366,100 @@ def mark_candidate_review(candidate_id: int, reason: str, context: AFMContext) -
 
 
 def apply_consolidation_result(result: dict, context: AFMContext) -> None:
-    """Apply durable promotes, dedup rejections, and review routing."""
+    """Apply durable promotes, dedup rejections, and review routing.
+
+    Round 24 (PR #260): report *errors* and *remaining_proposed* so sticky
+    lifecycle re-apply can refuse to clear the hold on partial/soft success.
+    Clearing sticky after terminalizing only a subset reopens AFM-8 dual-mint
+    for the candidates that stayed ``proposed``.
+    """
     promoted = deduped = reviewed = 0
-    for cid in (result.get("promote_candidate_ids") or []):
+    errors = 0
+    promote_ids = [int(cid) for cid in (result.get("promote_candidate_ids") or [])]
+    dedup_ids = [int(cid) for cid in (result.get("dedup_candidate_ids") or [])]
+    review_ids = [int(cid) for cid in (result.get("review_candidate_ids") or [])]
+    for cid in promote_ids:
         try:
-            if promote_candidate_durable(int(cid), "afm-consolidation", context):
+            if promote_candidate_durable(cid, "afm-consolidation", context):
                 promoted += 1
         except Exception:
+            errors += 1
             context.logger.exception("consolidation: promote candidate %s failed", cid)
-    for cid in (result.get("dedup_candidate_ids") or []):
+    for cid in dedup_ids:
         try:
-            if reject_candidate_dedup(int(cid), context):
+            if reject_candidate_dedup(cid, context):
                 deduped += 1
         except Exception:
+            errors += 1
             context.logger.exception("consolidation: dedup candidate %s failed", cid)
-    for cid in (result.get("review_candidate_ids") or []):
+    for cid in review_ids:
         try:
-            if mark_candidate_review(int(cid), "afm-consolidation review", context):
+            if mark_candidate_review(cid, "afm-consolidation review", context):
                 reviewed += 1
         except Exception:
+            errors += 1
             context.logger.exception("consolidation: review-mark candidate %s failed", cid)
+
+    remaining_proposed: list[int] = []
+    try:
+        wb = context.lazy_writeback()
+        with wb.db.cursor() as c:
+            # Promote/dedup targets must leave "proposed". Review routing is
+            # intentional leave-proposed + fence; incomplete only when the
+            # review mark did not land (counted via reviewed vs requested).
+            for cid in promote_ids + dedup_ids:
+                c.execute(
+                    "SELECT status FROM candidate_packets WHERE candidate_id=?",
+                    (cid,),
+                )
+                row = c.fetchone()
+                if row and (row["status"] if not isinstance(row, tuple) else row[0]) == "proposed":
+                    remaining_proposed.append(cid)
+            for cid in review_ids:
+                c.execute(
+                    """SELECT 1 FROM consolidation_actions
+                       WHERE action_type='afm_review' AND claim=?
+                         AND COALESCE(status, '') != 'superseded' LIMIT 1""",
+                    (str(cid),),
+                )
+                if not c.fetchone():
+                    # No fence and still the deferred review target → incomplete.
+                    c.execute(
+                        "SELECT status FROM candidate_packets WHERE candidate_id=?",
+                        (cid,),
+                    )
+                    row = c.fetchone()
+                    status = None
+                    if row is not None:
+                        status = row["status"] if not isinstance(row, tuple) else row[0]
+                    if status == "proposed":
+                        remaining_proposed.append(cid)
+    except Exception:
+        # Fail closed: if we cannot prove remaining is empty, keep sticky.
+        errors += 1
+        context.logger.exception(
+            "consolidation: remaining-proposed probe failed after apply"
+        )
+        remaining_proposed = list(dict.fromkeys(promote_ids + dedup_ids + review_ids))
+
     if promoted or deduped or reviewed:
         context.logger.info(
-            "AFM consolidation applied: promoted=%d deduped=%d reviewed=%d",
-            promoted, deduped, reviewed,
+            "AFM consolidation applied: promoted=%d deduped=%d reviewed=%d "
+            "errors=%d remaining_proposed=%d",
+            promoted, deduped, reviewed, errors, len(remaining_proposed),
         )
-    result["applied"] = {"promoted": promoted, "deduped": deduped, "reviewed": reviewed}
+    result["applied"] = {
+        "promoted": promoted,
+        "deduped": deduped,
+        "reviewed": reviewed,
+        "errors": errors,
+        "remaining_proposed": remaining_proposed,
+        "requested": {
+            "promote": len(promote_ids),
+            "dedup": len(dedup_ids),
+            "review": len(review_ids),
+        },
+    }
 
 
 def handle_daemon_compile(params: dict, request_id: Any, context: AFMContext) -> dict:

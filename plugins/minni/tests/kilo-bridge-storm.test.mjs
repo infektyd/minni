@@ -305,16 +305,28 @@ function createStormReporter({
       child.stdin.end(JSON.stringify(payload));
       return true;
     } catch {
-      if (claimed && !settled) {
-        if (onUndelivered && !undeliveredReported) {
+      // Round 24: post-claim = spawned-but-undelivered; return true so the
+      // caller does not double-queue (mirrors production minni-plugin.js).
+      if (claimed) {
+        if (!undeliveredReported) {
           undeliveredReported = true;
+          if (onUndelivered) {
+            try {
+              onUndelivered();
+            } catch {
+              /* never throw from diagnostic path */
+            }
+          }
+        }
+        if (child) {
           try {
-            onUndelivered();
+            child.kill("SIGKILL");
           } catch {
-            /* never throw from diagnostic path */
+            /* already dead */
           }
         }
         settle();
+        return true;
       }
       return false;
     }

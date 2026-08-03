@@ -3070,3 +3070,189 @@ def test_expand_with_status_rule_mode_never_degrades():
     variants, degraded = expand_with_status("minni recall", mode="rule")
     assert variants
     assert degraded is None
+
+
+def test_partial_sticky_reapply_keeps_hold_and_refuses_wet(monkeypatch):
+    """High #1 (PR #260 tip RC): sticky re-apply that terminalizes only a
+    subset of deferred IDs must NOT clear sticky or dual-mint the rest.
+    """
+    import queue as queue_mod
+    import threading
+
+    from minni import afm_writer
+
+    afm_writer.reset_pass_counters()
+    monkeypatch.setattr(afm_writer, "_ensure_worker", lambda: None)
+    monkeypatch.setattr(afm_writer, "_WORK_QUEUE", queue_mod.Queue(maxsize=4))
+    monkeypatch.setattr(
+        afm_writer,
+        "_write_batch",
+        lambda job: {"drafts_written": [{"page_id": "d1"}], "inbox_path": "x"},
+    )
+
+    def _handler(life):
+        # Partial: 1 of 3 promotes — remaining_proposed proves incompleteness.
+        life["applied"] = {
+            "promoted": 1,
+            "deduped": 0,
+            "reviewed": 0,
+            "errors": 0,
+            "remaining_proposed": [2, 3],
+            "requested": {"promote": 3, "dedup": 0, "review": 0},
+        }
+
+    done = threading.Event()
+    job = {
+        "pass_name": "consolidation",
+        "drafts": [{"title": "t"}],
+        "lifecycle": {
+            "promote_candidate_ids": [1, 2, 3],
+            "dedup_candidate_ids": [],
+            "review_candidate_ids": [],
+        },
+        "lifecycle_handler": lambda life: (_ for _ in ()).throw(
+            RuntimeError("first apply fails → sticky")
+        ),
+        "defer_lifecycle_to_worker": True,
+    }
+    with afm_writer._IN_FLIGHT_LOCK:
+        afm_writer._IN_FLIGHT_PER_PASS["consolidation"] = done
+    afm_writer._process_job(job, done, {})
+    assert "consolidation" in afm_writer._PENDING_LIFECYCLE
+
+    put_calls = []
+    real_put = afm_writer._WORK_QUEUE.put_nowait
+
+    def _spy(item):
+        put_calls.append(item)
+        return real_put(item)
+
+    monkeypatch.setattr(afm_writer._WORK_QUEUE, "put_nowait", _spy)
+    second = afm_writer.submit_drafts(
+        {
+            "pass_name": "consolidation",
+            "drafts": [{"title": "dup-mint-risk"}],
+            "lifecycle_handler": _handler,
+        },
+        timeout=0.05,
+    )
+    assert second.get("lifecycle_pending") is True, second
+    assert second.get("lifecycle_partial") is True, second
+    assert second.get("status") == "write_in_flight", second
+    assert "consolidation" in afm_writer._PENDING_LIFECYCLE, (
+        "partial re-apply must keep sticky for the remaining proposed IDs"
+    )
+    assert put_calls == [], "must not enqueue a second wet draft batch"
+    assert not done.is_set(), "in-flight hold must remain until full recovery"
+    afm_writer.reset_pass_counters()
+
+
+def test_legacy_partial_applied_without_remaining_keeps_sticky(monkeypatch):
+    """Legacy handlers that only set promoted=1 of N (no remaining_proposed)
+    must still be treated as incomplete — any() was the High reopen."""
+    import queue as queue_mod
+    import threading
+
+    from minni import afm_writer
+
+    afm_writer.reset_pass_counters()
+    monkeypatch.setattr(afm_writer, "_ensure_worker", lambda: None)
+    monkeypatch.setattr(afm_writer, "_WORK_QUEUE", queue_mod.Queue(maxsize=4))
+    monkeypatch.setattr(
+        afm_writer,
+        "_write_batch",
+        lambda job: {"drafts_written": [{"page_id": "d1"}], "inbox_path": "x"},
+    )
+
+    def _handler(life):
+        life["applied"] = {"promoted": 1, "deduped": 0, "reviewed": 0}
+
+    done = threading.Event()
+    job = {
+        "pass_name": "consolidation",
+        "drafts": [{"title": "t"}],
+        "lifecycle": {
+            "promote_candidate_ids": [1, 2, 3],
+            "dedup_candidate_ids": [],
+            "review_candidate_ids": [],
+        },
+        "lifecycle_handler": lambda life: (_ for _ in ()).throw(RuntimeError("blip")),
+        "defer_lifecycle_to_worker": True,
+    }
+    with afm_writer._IN_FLIGHT_LOCK:
+        afm_writer._IN_FLIGHT_PER_PASS["consolidation"] = done
+    afm_writer._process_job(job, done, {})
+
+    second = afm_writer.submit_drafts(
+        {
+            "pass_name": "consolidation",
+            "drafts": [{"title": "x"}],
+            "lifecycle_handler": _handler,
+        },
+        timeout=0.05,
+    )
+    assert second.get("lifecycle_pending") is True, second
+    assert "consolidation" in afm_writer._PENDING_LIFECYCLE
+    afm_writer.reset_pass_counters()
+
+
+def test_lifecycle_recovered_counts_discarded_wet_drafts(monkeypatch):
+    """Medium #3: lifecycle_recovered must not silently drop an LLM batch."""
+    import queue as queue_mod
+    import threading
+
+    from minni import afm_writer
+
+    afm_writer.reset_pass_counters()
+    monkeypatch.setattr(afm_writer, "_ensure_worker", lambda: None)
+    monkeypatch.setattr(afm_writer, "_WORK_QUEUE", queue_mod.Queue(maxsize=4))
+    monkeypatch.setattr(
+        afm_writer,
+        "_write_batch",
+        lambda job: {"drafts_written": [{"page_id": "d1"}], "inbox_path": "x"},
+    )
+
+    def _handler(life):
+        if not hasattr(_handler, "n"):
+            _handler.n = 0
+        _handler.n += 1
+        if _handler.n == 1:
+            raise RuntimeError("blip")
+        life["applied"] = {
+            "promoted": 1,
+            "deduped": 0,
+            "reviewed": 0,
+            "errors": 0,
+            "remaining_proposed": [],
+        }
+
+    done = threading.Event()
+    job = {
+        "pass_name": "consolidation",
+        "drafts": [{"title": "t"}],
+        "lifecycle": {
+            "promote_candidate_ids": [1],
+            "dedup_candidate_ids": [],
+            "review_candidate_ids": [],
+        },
+        "lifecycle_handler": _handler,
+        "defer_lifecycle_to_worker": True,
+    }
+    with afm_writer._IN_FLIGHT_LOCK:
+        afm_writer._IN_FLIGHT_PER_PASS["consolidation"] = done
+    afm_writer._process_job(job, done, {})
+
+    second = afm_writer.submit_drafts(
+        {
+            "pass_name": "consolidation",
+            "drafts": [{"title": "a"}, {"title": "b"}],
+            "lifecycle_handler": _handler,
+        },
+        timeout=0.05,
+    )
+    assert second.get("status") == "lifecycle_recovered", second
+    assert second.get("lifecycle_recovered_drafts_dropped") == 2
+    assert afm_writer._LIFECYCLE_RECOVERED_DRAFTS_DROPPED == 2
+    status = afm_writer.writer_status()
+    assert status["lifecycle_recovered_drafts_dropped"] == 2
+    afm_writer.reset_pass_counters()

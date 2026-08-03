@@ -495,13 +495,14 @@ function spawnBridgeDiagnostic(event, detail, onUndelivered, extras = {}) {
     child.stdin.end(JSON.stringify(payload));
     return true;
   } catch {
-    // Sync throw after claim: release the slot. Prefer settle() so undelivered
-    // accounting and free-slot flush still run when handlers were attached;
-    // if we never claimed, this is a pure no-op decrement guard.
-    if (claimed && !settled) {
-      // Always treat post-claim sync failure as undelivered — never credit a
-      // delivery that never left the process, or the free-slot flush path
-      // would under-count storm pressure.
+    // Round 24: post-claim sync failure (null stdin / EPIPE / payload throw).
+    // This is "spawned-but-undelivered", not "never spawned":
+    // 1) onUndelivered once (caller must not also queue on !accepted)
+    // 2) SIGKILL the child — settle() clears the kill timer; without an
+    //    explicit kill a hung stdin-reader survives with no deadline
+    // 3) settle() releases the budget slot
+    // 4) return true so reportBridgeFailure does not double-queue suppress
+    if (claimed) {
       if (!undeliveredReported) {
         undeliveredReported = true;
         if (onUndelivered) {
@@ -512,9 +513,20 @@ function spawnBridgeDiagnostic(event, detail, onUndelivered, extras = {}) {
           }
         }
       }
+      if (child) {
+        try {
+          child.kill("SIGKILL");
+        } catch {
+          /* child may already be dead */
+        }
+      }
+      // Prefer letting close→settle run after kill; if settle has not fired
+      // yet (sync kill path with no event loop tick), settle now so the
+      // budget is never permanently claimed. settle is idempotent.
       settle();
+      return true;
     }
-    // The console line above is the last resort; never throw from here.
+    // Pre-claim failure (spawn itself threw): pure refuse, caller queues.
     return false;
   }
 }
