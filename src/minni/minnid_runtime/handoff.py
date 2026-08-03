@@ -20,6 +20,14 @@ HANDOFF_KINDS = frozenset({"handoff", "candidate_learning", "request", "answer"}
 HANDOFF_ACK_STATUSES = {"accepted", "rejected_stale", "rejected_contradicts", "rejected_scope"}
 
 
+class HandoffStoreError(RuntimeError):
+    """SQLite handoff-lease read failed.
+
+    Must not be collapsed into an empty result: callers polling for handoffs
+    would otherwise wait out a timeout as if nothing were pending (PLUMB-T7 / #231).
+    """
+
+
 def agent_env_key(agent_id: str) -> str:
     return re.sub(r"[^A-Z0-9]+", "_", agent_id.upper()).strip("_")
 
@@ -542,11 +550,20 @@ def pending_handoff_leases(agent_id: str, *, context: HandoffContext) -> list[di
             for row in rows
         ]
     except Exception as exc:
+        # PLUMB-T7 / #231: never collapse a store failure into "no handoffs".
         context.logger.warning("Could not list SQLite handoff leases for %r: %s", agent_id, exc)
-        return []
+        raise HandoffStoreError(
+            f"handoff lease store failed while listing pending leases for {agent_id!r}: {exc}"
+        ) from exc
 
 
 def handoff_lease_status(lease_id: str, *, context: HandoffContext) -> Optional[dict]:
+    """Read lease status from SQLite.
+
+    Raises ``HandoffStoreError`` on store failure (does not log — callers that
+    poll this in a tight loop, e.g. ``handle_await_handoff``, must rate-limit
+    their own diagnostics so a dual-channel wait does not flood WARNING logs).
+    """
     try:
         db = context.lazy_writeback().db
         with db.cursor() as c:
@@ -558,8 +575,10 @@ def handoff_lease_status(lease_id: str, *, context: HandoffContext) -> Optional[
             return None
         return {"lease_id": row["lease_id"], "status": row["status"]}
     except Exception as exc:
-        context.logger.warning("Could not read handoff lease %r: %s", lease_id, exc)
-        return None
+        # PLUMB-T7 / #231: None means "unknown lease", not "store is broken".
+        raise HandoffStoreError(
+            f"handoff lease store failed while reading lease {lease_id!r}: {exc}"
+        ) from exc
 
 
 def lease_to_agent(lease_id: str, *, context: HandoffContext) -> Optional[str]:
@@ -643,19 +662,8 @@ def handle_ack_handoff(params: dict, request_id: Any, context: HandoffContext) -
     }, request_id)
 
 
-def handle_list_pending_handoffs(params: dict, request_id: Any, context: HandoffContext) -> dict:
-    # G11 / RCM-003/009: EffectivePrincipal stamp + mismatch guard (closes last model-facing agent_id surfaces)
-    # Model-supplied agent_id is NEVER trusted; use stamped principal.agent_id for leases/queries.
-    principal, err = context.handler_principal(params, request_id)
-    if err:
-        return err
-    agent_id = principal.agent_id
-    if not agent_id:
-        return context.make_error(-32602, "agent_id is required", request_id)
-    sqlite_handoffs = pending_handoff_leases(agent_id, context=context)
-    if sqlite_handoffs:
-        return context.make_response({"agent_id": agent_id, "handoffs": sqlite_handoffs}, request_id)
-
+def _file_channel_pending_handoffs(agent_id: str, *, context: HandoffContext) -> list[dict]:
+    """Pending leases visible only on the JSON packet channel (inbox/outbox)."""
     now = time.time()
     handoffs = []
     for _vault, path, packet in iter_handoff_files(agent_id, context=context):
@@ -676,6 +684,55 @@ def handle_list_pending_handoffs(params: dict, request_id: Any, context: Handoff
             "expires_at": packet.get("expires_at"),
             "path": str(path),
         })
+    return handoffs
+
+
+def _file_channel_terminal_ack(lease_id: str, *, context: HandoffContext) -> Optional[dict]:
+    """Terminal ack_status from JSON packets, if any (dual-channel await path)."""
+    for _vault, _path, packet in iter_handoff_files(context=context):
+        if packet.get("lease_id") == lease_id and packet.get("ack_status"):
+            return {
+                "lease_id": lease_id,
+                "status": packet.get("ack_status"),
+                "acked_at": packet.get("acked_at"),
+            }
+    return None
+
+
+def handle_list_pending_handoffs(params: dict, request_id: Any, context: HandoffContext) -> dict:
+    # G11 / RCM-003/009: EffectivePrincipal stamp + mismatch guard (closes last model-facing agent_id surfaces)
+    # Model-supplied agent_id is NEVER trusted; use stamped principal.agent_id for leases/queries.
+    principal, err = context.handler_principal(params, request_id)
+    if err:
+        return err
+    agent_id = principal.agent_id
+    if not agent_id:
+        return context.make_error(-32602, "agent_id is required", request_id)
+    store_error: Optional[HandoffStoreError] = None
+    try:
+        sqlite_handoffs = pending_handoff_leases(agent_id, context=context)
+    except HandoffStoreError as exc:
+        # Dual-channel: DB blew up — still consult file packets before fail-loud.
+        # Empty-on-store-failure would hide live inbox work; empty-on-both is -32000.
+        store_error = exc
+        sqlite_handoffs = None
+    if sqlite_handoffs:
+        return context.make_response({"agent_id": agent_id, "handoffs": sqlite_handoffs}, request_id)
+
+    # DB channel healthy but empty, or store failed: consult the file channel
+    # (PLUMB-T3 partial — full dual-channel merge when DB has *some* rows is a follow-up).
+    handoffs = _file_channel_pending_handoffs(agent_id, context=context)
+    if handoffs:
+        if store_error is not None:
+            context.logger.warning(
+                "list_pending_handoffs: store failed (%s); returning %d file-channel lease(s)",
+                store_error,
+                len(handoffs),
+            )
+        return context.make_response({"agent_id": agent_id, "handoffs": handoffs}, request_id)
+    if store_error is not None:
+        # PLUMB-T7: both channels cannot answer with pending work — not healthy empty.
+        return context.make_error(-32000, str(store_error), request_id)
     return context.make_response({"agent_id": agent_id, "handoffs": handoffs}, request_id)
 
 
@@ -685,20 +742,40 @@ async def handle_await_handoff(params: dict, request_id: Any, context: HandoffCo
         return context.make_error(-32602, "lease_id is required", request_id)
     timeout_ms = max(0, min(int(params.get("timeout_ms", 30000)), 300000))
     deadline = time.time() + (timeout_ms / 1000.0)
+    # Dual-channel: a broken SQLite read must not abort file-channel waiting.
+    # store_error tracks the *latest* poll only (cleared on recovery) so a
+    # transient blip does not poison a later healthy timeout as -32000.
+    # Log once on None→set (and once on recovery); never per-poll.
+    store_error: Optional[HandoffStoreError] = None
     while True:
-        lease = handoff_lease_status(lease_id, context=context)
+        try:
+            lease = handoff_lease_status(lease_id, context=context)
+            if store_error is not None:
+                context.logger.info(
+                    "await_handoff: lease store recovered for %r after prior failure (%s)",
+                    lease_id,
+                    store_error,
+                )
+            store_error = None
+        except HandoffStoreError as exc:
+            if store_error is None:
+                context.logger.warning(
+                    "await_handoff: lease store failed for %r; polling file channel until deadline: %s",
+                    lease_id,
+                    exc,
+                )
+            store_error = exc
+            lease = None
         if lease is not None and lease.get("status") not in {None, "pending"}:
             return context.make_response({
                 "lease_id": lease_id,
                 "status": lease.get("status"),
             }, request_id)
-        for _vault, _path, packet in iter_handoff_files(context=context):
-            if packet.get("lease_id") == lease_id and packet.get("ack_status"):
-                return context.make_response({
-                    "lease_id": lease_id,
-                    "status": packet.get("ack_status"),
-                    "acked_at": packet.get("acked_at"),
-                }, request_id)
+        file_ack = _file_channel_terminal_ack(lease_id, context=context)
+        if file_ack is not None:
+            return context.make_response(file_ack, request_id)
         if time.time() >= deadline:
+            if store_error is not None:
+                return context.make_error(-32000, str(store_error), request_id)
             return context.make_response({"lease_id": lease_id, "status": "timeout"}, request_id)
         await asyncio.sleep(0.05)

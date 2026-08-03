@@ -1,5 +1,6 @@
 import json
 import os
+import threading
 import types
 from pathlib import Path
 
@@ -345,3 +346,329 @@ def test_handle_await_handoff_does_not_block_other_clients(monkeypatch, tmp_path
 
     # Run the async test body from sync pytest
     asyncio.run(run_concurrent())
+
+
+# ── PLUMB-T7 / #231: handoff DB errors must not look like empty results ─────
+
+
+class _BrokenHandoffCursor:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def execute(self, *_args, **_kwargs):
+        raise RuntimeError("sqlite handoff store exploded")
+
+
+class _BrokenHandoffDB:
+    def cursor(self):
+        return _BrokenHandoffCursor()
+
+
+def test_list_pending_handoffs_fails_loud_on_db_error(monkeypatch, tmp_path):
+    """PLUMB-T7: a lease-store failure is a JSON-RPC error, not handoffs=[]."""
+    _patch_handoff_db(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        minnid, "_lazy_writeback", lambda: types.SimpleNamespace(db=_BrokenHandoffDB())
+    )
+    recipient = tmp_path / "claudecode-vault"
+    monkeypatch.setenv(
+        "MINNI_AGENT_VAULTS",
+        json.dumps({"claude-code": str(recipient)}),
+    )
+
+    response = minnid._dispatch_sync({
+        "jsonrpc": "2.0",
+        "id": 2311,
+        "method": "minni_list_pending_handoffs",
+        "params": {"agent_id": "claude-code"},
+    })
+
+    assert "error" in response, (
+        "store failure must surface as error, not success-with-empty handoffs: "
+        f"{response!r}"
+    )
+    assert "result" not in response
+    assert response["error"]["code"] == -32000
+    msg = response["error"]["message"]
+    assert "handoff lease store failed" in msg
+    assert "listing pending leases" in msg
+
+
+def test_await_handoff_fails_loud_on_db_error_not_timeout(monkeypatch, tmp_path):
+    """PLUMB-T7: broken store + no file ack → -32000 after wait, not status=timeout.
+
+    Dual-channel: we still poll the file channel until the deadline (recipient
+    may ack mid-wait). Only after the wait expires with no terminal file ack
+    do we fail loud — never collapse to a silent timeout.
+    """
+    _patch_handoff_db(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        minnid, "_lazy_writeback", lambda: types.SimpleNamespace(db=_BrokenHandoffDB())
+    )
+    recipient = tmp_path / "claudecode-vault"
+    monkeypatch.setenv(
+        "MINNI_AGENT_VAULTS",
+        json.dumps({"claude-code": str(recipient)}),
+    )
+
+    started = time.monotonic()
+    response = minnid._dispatch_sync({
+        "jsonrpc": "2.0",
+        "id": 2312,
+        "method": "minni_await_handoff",
+        "params": {"lease_id": "lease-whatever", "timeout_ms": 150},
+    })
+    elapsed = time.monotonic() - started
+
+    assert "error" in response, (
+        "store failure must not degrade to a silent timeout: "
+        f"{response!r}"
+    )
+    assert response.get("result") is None or "status" not in response.get("result", {})
+    assert response["error"]["code"] == -32000
+    assert "handoff lease store failed" in response["error"]["message"]
+    assert "reading lease" in response["error"]["message"]
+    # Must have waited roughly the timeout (file-channel poll), not fail-fast (~0).
+    assert elapsed >= 0.12, f"expected ~timeout wait, got {elapsed:.3f}s"
+
+
+def test_list_pending_handoffs_uses_file_channel_when_db_broken(monkeypatch, tmp_path):
+    """Dual-channel: broken DB + pending inbox packet still lists the lease."""
+    _patch_handoff_db(monkeypatch, tmp_path)
+    sender = tmp_path / "codex-vault"
+    recipient = tmp_path / "claudecode-vault"
+    inbox = recipient / "inbox"
+    inbox.mkdir(parents=True)
+    lease_id = "handoff-file-only-pending"
+    packet = {
+        "lease_id": lease_id,
+        "from_agent": "codex",
+        "to_agent": "claude-code",
+        "task": "file-channel pending",
+        "requires_ack": True,
+        "expires_at": "2099-01-01T00:00:00Z",
+    }
+    (inbox / f"{lease_id}.json").write_text(json.dumps(packet), encoding="utf-8")
+    monkeypatch.setenv(
+        "MINNI_AGENT_VAULTS",
+        json.dumps({"codex": str(sender), "claude-code": str(recipient)}),
+    )
+    monkeypatch.setattr(
+        minnid, "_lazy_writeback", lambda: types.SimpleNamespace(db=_BrokenHandoffDB())
+    )
+
+    response = minnid._dispatch_sync({
+        "jsonrpc": "2.0",
+        "id": 2313,
+        "method": "minni_list_pending_handoffs",
+        "params": {"agent_id": "claude-code"},
+    })
+
+    assert "error" not in response, f"file channel must answer when DB is down: {response!r}"
+    result = response["result"]
+    assert [item["lease_id"] for item in result["handoffs"]] == [lease_id]
+    assert result["handoffs"][0]["task"] == "file-channel pending"
+
+
+def test_await_handoff_uses_file_ack_when_db_broken(monkeypatch, tmp_path):
+    """Dual-channel: broken DB + terminal file ack returns accepted, not -32000."""
+    _patch_handoff_db(monkeypatch, tmp_path)
+    sender = tmp_path / "codex-vault"
+    recipient = tmp_path / "claudecode-vault"
+    outbox = sender / "outbox"
+    outbox.mkdir(parents=True)
+    lease_id = "handoff-file-only-acked"
+    packet = {
+        "lease_id": lease_id,
+        "from_agent": "codex",
+        "to_agent": "claude-code",
+        "task": "file-channel acked",
+        "requires_ack": True,
+        "ack_status": "accepted",
+        "acked_at": "2026-08-02T12:00:00Z",
+    }
+    (outbox / f"{lease_id}.json").write_text(json.dumps(packet), encoding="utf-8")
+    monkeypatch.setenv(
+        "MINNI_AGENT_VAULTS",
+        json.dumps({"codex": str(sender), "claude-code": str(recipient)}),
+    )
+    monkeypatch.setattr(
+        minnid, "_lazy_writeback", lambda: types.SimpleNamespace(db=_BrokenHandoffDB())
+    )
+
+    response = minnid._dispatch_sync({
+        "jsonrpc": "2.0",
+        "id": 2314,
+        "method": "minni_await_handoff",
+        "params": {"lease_id": lease_id, "timeout_ms": 5000},
+    })
+
+    assert "error" not in response, f"file ack must win over broken DB: {response!r}"
+    result = response["result"]
+    assert result["lease_id"] == lease_id
+    assert result["status"] == "accepted"
+    assert result["acked_at"] == "2026-08-02T12:00:00Z"
+
+
+def test_await_handoff_polls_file_channel_until_ack_when_db_broken(monkeypatch, tmp_path):
+    """Dual-channel: broken DB + pending packet; ack lands mid-wait → accepted.
+
+    Must not -32000 on the first HandoffStoreError while the file lease is still
+    pending — keep polling until deadline (mirrors list dual-channel).
+    """
+    _patch_handoff_db(monkeypatch, tmp_path)
+    sender = tmp_path / "codex-vault"
+    recipient = tmp_path / "claudecode-vault"
+    outbox = sender / "outbox"
+    outbox.mkdir(parents=True)
+    lease_id = "handoff-file-ack-mid-wait"
+    packet_path = outbox / f"{lease_id}.json"
+    pending = {
+        "lease_id": lease_id,
+        "from_agent": "codex",
+        "to_agent": "claude-code",
+        "task": "file-channel mid-wait",
+        "requires_ack": True,
+    }
+    packet_path.write_text(json.dumps(pending), encoding="utf-8")
+    monkeypatch.setenv(
+        "MINNI_AGENT_VAULTS",
+        json.dumps({"codex": str(sender), "claude-code": str(recipient)}),
+    )
+    monkeypatch.setattr(
+        minnid, "_lazy_writeback", lambda: types.SimpleNamespace(db=_BrokenHandoffDB())
+    )
+
+    def _ack_after_delay() -> None:
+        time.sleep(0.08)
+        acked = {
+            **pending,
+            "ack_status": "accepted",
+            "acked_at": "2026-08-02T12:30:00Z",
+        }
+        packet_path.write_text(json.dumps(acked), encoding="utf-8")
+
+    writer = threading.Thread(target=_ack_after_delay, daemon=True)
+    writer.start()
+    try:
+        started = time.monotonic()
+        response = minnid._dispatch_sync({
+            "jsonrpc": "2.0",
+            "id": 2315,
+            "method": "minni_await_handoff",
+            "params": {"lease_id": lease_id, "timeout_ms": 2000},
+        })
+        elapsed = time.monotonic() - started
+    finally:
+        writer.join(timeout=2.0)
+
+    assert "error" not in response, f"mid-wait file ack must succeed: {response!r}"
+    result = response["result"]
+    assert result["lease_id"] == lease_id
+    assert result["status"] == "accepted"
+    assert result["acked_at"] == "2026-08-02T12:30:00Z"
+    # Must have waited for the mid-wait write, not returned immediately with -32000.
+    assert elapsed >= 0.05, f"expected poll delay, got {elapsed:.3f}s"
+    assert elapsed < 1.5, f"should return soon after mid-wait ack, got {elapsed:.3f}s"
+
+
+def test_await_handoff_clears_store_error_after_recovery(monkeypatch, tmp_path):
+    """Transient store blip must not sticky-poison a later healthy timeout.
+
+    First poll raises HandoffStoreError; subsequent polls succeed with no row
+    and empty file channel → status=timeout, not -32000.
+    """
+    from minni.minnid_runtime.handoff import HandoffStoreError
+
+    _patch_handoff_db(monkeypatch, tmp_path)
+    recipient = tmp_path / "claudecode-vault"
+    monkeypatch.setenv(
+        "MINNI_AGENT_VAULTS",
+        json.dumps({"claude-code": str(recipient)}),
+    )
+
+    calls = {"n": 0}
+
+    def _flaky_status(lease_id, *, context):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise HandoffStoreError(
+                f"handoff lease store failed while reading lease {lease_id!r}: blip"
+            )
+        return None  # healthy empty / unknown
+
+    monkeypatch.setattr(minnid, "_runtime_handoff_lease_status", _flaky_status)
+    # Also patch the symbol used if dispatch goes through runtime package directly.
+    import minni.minnid_runtime.handoff as handoff_mod
+
+    monkeypatch.setattr(handoff_mod, "handoff_lease_status", _flaky_status)
+
+    response = minnid._dispatch_sync({
+        "jsonrpc": "2.0",
+        "id": 2316,
+        "method": "minni_await_handoff",
+        "params": {"lease_id": "lease-recovered", "timeout_ms": 150},
+    })
+
+    assert "error" not in response, f"recovered store must timeout cleanly: {response!r}"
+    assert response["result"]["status"] == "timeout"
+    assert response["result"]["lease_id"] == "lease-recovered"
+    assert calls["n"] >= 2, "expected multiple polls after recovery"
+
+
+def test_await_handoff_logs_store_failure_once_not_per_poll(monkeypatch, tmp_path, caplog):
+    """Broken store + multi-poll await must not flood WARNING per 50ms tick."""
+    import logging
+
+    _patch_handoff_db(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        minnid, "_lazy_writeback", lambda: types.SimpleNamespace(db=_BrokenHandoffDB())
+    )
+    recipient = tmp_path / "claudecode-vault"
+    monkeypatch.setenv(
+        "MINNI_AGENT_VAULTS",
+        json.dumps({"claude-code": str(recipient)}),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="minnid"):
+        response = minnid._dispatch_sync({
+            "jsonrpc": "2.0",
+            "id": 2317,
+            "method": "minni_await_handoff",
+            "params": {"lease_id": "lease-log-flood", "timeout_ms": 200},
+        })
+
+    assert response.get("error", {}).get("code") == -32000
+    store_warns = [
+        r
+        for r in caplog.records
+        if r.levelno >= logging.WARNING
+        and (
+            "lease store failed" in r.getMessage()
+            or "Could not read handoff lease" in r.getMessage()
+            or "polling file channel" in r.getMessage()
+        )
+    ]
+    assert len(store_warns) == 1, (
+        f"expected exactly one store-failure WARNING, got {len(store_warns)}: "
+        f"{[r.getMessage() for r in store_warns]!r}"
+    )
+
+
+def test_pending_handoff_leases_raises_handoff_store_error(monkeypatch, tmp_path):
+    """Unit-level: empty list is reserved for genuine empty; store failure raises."""
+    from dataclasses import replace
+
+    from minni.minnid_runtime.handoff import HandoffStoreError, pending_handoff_leases
+
+    _patch_handoff_db(monkeypatch, tmp_path)
+    broken_ctx = replace(
+        minnid._handoff_context(),
+        lazy_writeback=lambda: types.SimpleNamespace(db=_BrokenHandoffDB()),
+    )
+
+    with pytest.raises(HandoffStoreError, match="listing pending leases"):
+        pending_handoff_leases("claude-code", context=broken_ctx)
