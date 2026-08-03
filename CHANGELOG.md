@@ -11,8 +11,9 @@ pre-1.0: minor versions may contain breaking changes until v1.0.0.
 ## [0.4.2] - 2026-08-03
 
 Campaign release: integrity, observability, deploy honesty, and CI trust
-hardening landed on `main` after v0.4.1. No new product surface — patch
-version, same pattern as v0.4.1.
+hardening landed on `main` after v0.4.1 — **patch** version, same pattern as
+v0.4.1. Includes small **Added** items (claude-science vault registration,
+MCP readiness tripwire) under the same stamp; not a new product theme.
 
 ### Added
 

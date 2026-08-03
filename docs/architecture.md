@@ -130,14 +130,15 @@ counts unless the caller is a stamped operator. The `minni status` CLI and
 
 ## Continuity
 
-Startup hooks inject compact identity, active plan state, correction
-re-assertions, and bounded inbox/candidate state. On Claude Code, the
-`<minni:context>` envelope carries the lifecycle spine
-(`prepare_task → prepare_outcome → plan → learn`), backed by a deny-capable
-`PreToolUse` recall-guard backstop. Claude is the deepest integration
-(all-tool coverage plus live recall-state), not the only deny-capable host —
-Kilo, Cursor, Grok, and Antigravity also deny with different depth; Codex
-deny is Bash-only. Full matrix:
+Startup hooks inject compact identity, active **thread** state
+(`active_thread` / `active_thread_ref`; on-disk `_active_plan.json` remains
+the frozen pointer filename), correction re-assertions, and bounded
+inbox/candidate state. On Claude Code, the `<minni:context>` envelope carries
+the lifecycle spine (`prepare_task → prepare_outcome → plan → learn`), backed
+by a deny-capable `PreToolUse` recall-guard backstop. Claude is the deepest
+integration (all-tool coverage plus live recall-state), not the only
+deny-capable host — Kilo, Cursor, Grok, and Antigravity also deny with
+different depth; Codex deny is Bash-only. Full matrix:
 [docs/contracts/hook-platforms.md](contracts/hook-platforms.md). Operator
 knobs: `MINNI_LIFECYCLE_NUDGE_MODE` (`off` disables) and
 `MINNI_RECALL_GUARD_MODE` (`off` / `soft` / `strict`); the guard fails open —

@@ -51,8 +51,9 @@ with a random mix of `git pull`, single-platform wire, and bulk propagate.
 ```bash
 make sync-root              # fast-forward main, reinstall, rebuild, redeploy, verify
 make sync-root DRY_RUN=1    # plan only
-make check-versions         # read-only: process vs checkout
+make check-versions         # read-only: pyproject / manifests / marketplace / install / deploy version agreement
 make check-deployments      # --strict fleet surface check (also run by sync-root)
+# process vs checkout tip (stale daemon / plugin_dist): minni status → deploy block
 ```
 
 Fleet partition (D7): `minni wire all` covers codex / claude-code / kilocode /
