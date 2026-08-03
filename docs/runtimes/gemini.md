@@ -1,27 +1,32 @@
 # Gemini / Antigravity
 
-Wire Gemini to a running Minni daemon from your checkout:
+**Day-to-day Gemini family path is Antigravity**, not pure `gemini`. Prefer:
+
+```bash
+minni wire antigravity                                 # v0.3+ wheel
+.venv/bin/minni wire antigravity --from-repo .         # v0.2 wheel / checkout
+# or from a dogfood checkout after wire adoption:
+# propagate.py update-plugin --platform antigravity
+# (also covered by `make sync-root`)
+```
+
+Antigravity rides `~/.gemini` (shared agent identity `gemini`, vault
+`~/.minni/gemini-vault`) and is the fleet path that also writes surface MCP
+views + agy hook registration. Propagate’s D7 skip table marks pure `gemini`
+as covered by antigravity.
+
+Pure `gemini` is **provisional** in `minni wire` (`${extensionPath}` still
+under verification — issue #142 open question 8): `minni wire gemini` reports
+`skipped`, and `minni wire all` names it as a skip with a warning. Checkout
+recovery only:
 
 ```bash
 .venv/bin/minni up   # if the daemon isn't already running
 .venv/bin/python plugins/minni/skills/minni-install/scripts/propagate.py update-plugin --platform gemini
 ```
 
-Standalone Gemini wiring is **provisional** in `minni wire` (the
-`${extensionPath}` extension-manifest mechanism is still being verified —
-issue #142's open question 8), so `minni wire gemini` reports status
-`skipped` (exit 1 when nothing else wired) and `minni wire all` includes
-gemini as a named skip with a warning; use the propagate.py command above
-from a checkout for now.
-
-Antigravity rides the same `~/.gemini` surface (shared agent identity
-`gemini`, vault `~/.minni/gemini-vault`) but is wired **individually**, and
-its surface-view + agy-hook wiring is supported by `minni wire`:
-
-```bash
-minni wire antigravity                                 # v0.3+ wheel
-.venv/bin/minni wire antigravity --from-repo .         # v0.2 wheel / checkout
-```
+That pure-gemini path installs the extension manifest only — it is **not** the
+supported Antigravity surface + hooks path.
 
 Note: `make sync-root` uses the D7 fleet partition — `minni wire all
 --from-repo` for codex/claude-code/kilocode/grok, then
