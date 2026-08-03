@@ -135,10 +135,12 @@ directory or impersonate another `agent_id` when calling `learn` or `log_event`.
 
 ### Temporary team profiles
 
-The plugin may create temporary team profiles through `sovereign_team_runtime`.
-These profiles are coordination packets, not durable identities. They can carry
-role, focus, ownership, permissions, and hydration context, but they do not
-grant cross-agent vault writes, automatic learning, daemon-side execution, or
+The plugin may create temporary team profiles through `minni_team_runtime`
+(with `minni_team_evidence` for helper-report summaries and
+`minni_team_promotion` for post-approval promotion drafts). These profiles are
+coordination packets, not durable identities. They can carry role, focus,
+ownership, permissions, and hydration context, but they do not grant
+cross-agent vault writes, automatic learning, daemon-side execution, or
 identity promotion. Promotion from temporary profile to reusable agent identity
 requires explicit operator approval after evidence review.
 

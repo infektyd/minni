@@ -134,7 +134,11 @@ Startup hooks inject compact identity, active plan state, correction
 re-assertions, and bounded inbox/candidate state. On Claude Code, the
 `<minni:context>` envelope carries the lifecycle spine
 (`prepare_task → prepare_outcome → plan → learn`), backed by a deny-capable
-`PreToolUse` recall-guard backstop (Claude Code is currently the only host
-exposing one). Operator knobs: `MINNI_LIFECYCLE_NUDGE_MODE` (`off` disables)
-and `MINNI_RECALL_GUARD_MODE` (`off` / `soft` / `strict`); the guard fails
-open — a state-write failure never blocks the turn.
+`PreToolUse` recall-guard backstop. Claude is the deepest integration
+(all-tool coverage plus live recall-state), not the only deny-capable host —
+Kilo, Cursor, Grok, and Antigravity also deny with different depth; Codex
+deny is Bash-only. Full matrix:
+[docs/contracts/hook-platforms.md](contracts/hook-platforms.md). Operator
+knobs: `MINNI_LIFECYCLE_NUDGE_MODE` (`off` disables) and
+`MINNI_RECALL_GUARD_MODE` (`off` / `soft` / `strict`); the guard fails open —
+a state-write failure never blocks the turn.
