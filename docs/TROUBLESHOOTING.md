@@ -218,10 +218,15 @@ primary names are `minni_thread_*`.
 
 ### Symptom
 
-AFM consolidation or inbox ingest leaves **byte-identical** twin rows in
-`candidate_packets` (same inbox file + candidate index + content hash) so the
-queue looks noisier than the vault, or repair tooling reports dual-resolution
-candidates.
+**Primary:** the same candidate resolves twice with **contradictory terminal
+status** (accept+reject twins) — same inbox file + candidate index + content
+hash, two governance outcomes. That is the issue #239 / dual-resolution failure
+mode.
+
+**Secondary:** AFM consolidation or inbox ingest also leaves **byte-identical**
+twin rows in `candidate_packets` so the queue looks noisier than the vault, or
+repair tooling reports dual-resolution candidates even without a visible
+accept+reject pair.
 
 ### Fix (operator)
 
