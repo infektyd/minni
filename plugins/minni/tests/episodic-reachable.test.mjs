@@ -8,6 +8,7 @@ import test from "node:test";
 
 import {
   BOOT_RECALL_LAYERS,
+  buildBootRecallSlice,
   formatEpisodic,
   formatRecall,
   formatRecallLean,
@@ -55,9 +56,29 @@ test("formatRecall surfaces the episodic section", () => {
   );
 });
 
-test("formatRecallLean surfaces the episodic section (the boot path)", () => {
+test("formatRecallLean still surfaces episodic when called", () => {
+  // Defensive wire for any lean consumer; SessionStart boot does NOT call
+  // this — see buildBootRecallSlice, the real boot envelope path.
   const out = formatRecallLean("rollback", { results: [], count: 0, episodic: [EVENT] });
   assert.ok(out.includes("deployment rollback"));
+});
+
+test("SessionStart boot envelope forwards episodic (not just document results)", () => {
+  // The production boot path (hook.ts / hook-handlers.ts) builds the
+  // SessionStart envelope via buildBootRecallSlice — not formatRecallLean.
+  // An episodic-only daemon answer must not become results:[] with the
+  // episodic channel discarded while layers still claim "episodic".
+  const slice = buildBootRecallSlice(
+    { results: [], count: 0, episodic: [EVENT], episodic_count: 1 },
+    "claude-code",
+  );
+  assert.equal(slice.ok, true);
+  assert.deepEqual(slice.results, []);
+  assert.equal(slice.episodic.length, 1);
+  assert.equal(slice.episodic_count, 1);
+  assert.equal(slice.episodic[0].content, EVENT.content);
+  assert.ok(slice.layers.includes("episodic"));
+  assert.equal(slice.agent_origin, "claude-code");
 });
 
 test("an episodic-only answer is NOT treated as an empty daemon result", () => {

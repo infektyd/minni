@@ -198,6 +198,41 @@ export async function socketHealth(timeoutMs?: number): Promise<JsonResult> {
  */
 export const BOOT_RECALL_LAYERS: ReadonlyArray<string> = ["identity", "knowledge", "episodic"];
 
+/**
+ * SessionStart boot envelope slice for a successful daemon recall.
+ *
+ * #225-R1: BOOT_RECALL_LAYERS includes episodic, and the daemon returns
+ * episodic hits on their own channel (`episodic` / `episodic_count`), never
+ * inside document `results`. Forwarding only `results` dropped the channel
+ * this surface asked for — the same "advertised but dead" class the RPC
+ * wire already closed. Keep the document fields AND the episodic channel.
+ */
+export function buildBootRecallSlice(
+  data: RecallResponse,
+  agentFallback: string,
+): {
+  ok: true;
+  results: RecallResponse["results"];
+  episodic: unknown[];
+  episodic_count: number;
+  agent_origin: string;
+  layer: RecallResponse["layer"];
+  layers: ReadonlyArray<string>;
+} {
+  const episodic = Array.isArray(data.episodic) ? data.episodic : [];
+  const episodic_count =
+    typeof data.episodic_count === "number" ? data.episodic_count : episodic.length;
+  return {
+    ok: true,
+    results: data.results,
+    episodic,
+    episodic_count,
+    agent_origin: data.agent_id ?? agentFallback,
+    layer: data.layer,
+    layers: BOOT_RECALL_LAYERS,
+  };
+}
+
 export async function recallMemory(input: {
   query: string;
   agentId?: string;
