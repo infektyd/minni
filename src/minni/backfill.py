@@ -32,6 +32,12 @@ from typing import Dict, Optional, Tuple
 
 from minni.config import DEFAULT_CONFIG, SovereignConfig
 from minni.db import SovereignDB
+# Share the indexer's deliberate no-embed contract — do not fork the set.
+# draft/expired pages are written to documents + vault_fts without vectors so
+# they cannot occupy the fixed FAISS top-k window; retrieve drops them only
+# AFTER the window is filled. A default-on backfill that re-embeds them would
+# undo that policy and re-pollute semantic recall.
+from minni.indexer import UNEMBEDDED_STATUSES
 
 logger = logging.getLogger("sovereign.backfill")
 
@@ -45,6 +51,27 @@ def _numpy():
     import numpy as np
 
     return np
+
+
+def _sql_in_literals(values) -> str:
+    """Quote a set of SQL string literals for an IN (...) clause."""
+    return ", ".join("'" + str(v).replace("'", "''") + "'" for v in sorted(values))
+
+
+def _embed_eligible_doc_sql(alias: str = "d") -> str:
+    """SQL predicate: document is eligible for chunk embeddings.
+
+    Mirrors ``indexer.UNEMBEDDED_STATUSES`` (draft/expired stay lexical-only).
+    NULL page_status is treated as ``candidate`` — the column default.
+    """
+    col = f"{alias}.page_status" if alias else "page_status"
+    return f"COALESCE({col}, 'candidate') NOT IN ({_sql_in_literals(UNEMBEDDED_STATUSES)})"
+
+
+def _deliberate_unembed_doc_sql(alias: str = "d") -> str:
+    """SQL predicate: document is deliberately left without vectors."""
+    col = f"{alias}.page_status" if alias else "page_status"
+    return f"COALESCE({col}, 'candidate') IN ({_sql_in_literals(UNEMBEDDED_STATUSES)})"
 
 
 # grok-review round 3 (finding 1): per-(db, queue) batch cursors. The batch
@@ -76,15 +103,35 @@ def embedding_coverage(db: SovereignDB) -> Dict[str, object]:
 
     Counts only — no paths, no learning text — so this is safe to expose in the
     pre-identity health report alongside the other aggregate liveness fields.
+
+    Document totals are **embed-eligible** only (not draft/expired): those
+    statuses are a deliberate no-embed policy shared with the indexer, and
+    counting them as "missing vectors" would invent a permanent phantom gap
+    the drain must not close.
     """
     coverage: Dict[str, object] = {}
     try:
         with db.cursor() as c:
+            # grok-review (post-rebase tip, finding 1): align document coverage
+            # with indexer.UNEMBEDDED_STATUSES — same honesty class as the
+            # terminal-learnings filter below.
+            _doc_eligible = _embed_eligible_doc_sql("d")
             total_docs = c.execute(
-                "SELECT COUNT(*) AS n FROM documents"
+                f"SELECT COUNT(*) AS n FROM documents d WHERE {_doc_eligible}"
             ).fetchone()["n"]
             docs_with_vectors = c.execute(
-                "SELECT COUNT(DISTINCT doc_id) AS n FROM chunk_embeddings"
+                f"""SELECT COUNT(DISTINCT d.doc_id) AS n
+                    FROM documents d
+                    JOIN chunk_embeddings ce ON ce.doc_id = d.doc_id
+                    WHERE {_doc_eligible}"""
+            ).fetchone()["n"]
+            docs_deliberately_unembedded = c.execute(
+                f"""SELECT COUNT(*) AS n
+                    FROM documents d
+                    WHERE {_deliberate_unembed_doc_sql("d")}
+                    AND NOT EXISTS (
+                        SELECT 1 FROM chunk_embeddings ce WHERE ce.doc_id = d.doc_id
+                    )"""
             ).fetchone()["n"]
             # grok-review round 3 (finding 2): align eligibility with what
             # backfill and semantic recall actually touch. Terminal learnings
@@ -127,6 +174,7 @@ def embedding_coverage(db: SovereignDB) -> Dict[str, object]:
     coverage["documents_with_vectors"] = docs_with_vectors
     coverage["documents_missing_vectors"] = max(0, total_docs - docs_with_vectors)
     coverage["documents_vector_ratio"] = _ratio(docs_with_vectors, total_docs)
+    coverage["documents_deliberately_unembedded"] = docs_deliberately_unembedded
     coverage["learnings_total"] = total_learnings
     coverage["learnings_with_embedding"] = learnings_with_embedding
     coverage["learnings_missing_embedding"] = max(
@@ -311,17 +359,22 @@ def backfill_document_vectors(
     # grok-review round 3 (finding 1): ordered, cursor-advanced batches — see
     # _batch_cursors. A document whose encode permanently raises gains no
     # chunk_embeddings rows and would otherwise re-match the head of every pass.
+    # grok-review (post-rebase tip, finding 1): also exclude draft/expired —
+    # indexer.UNEMBEDDED_STATUSES deliberately leaves those without vectors so
+    # they cannot fill the FAISS window; backfill must not undo that policy.
+    _eligible = _embed_eligible_doc_sql("d")
     cursor_key = (str(config.db_path), "documents")
     with db.cursor() as c:
         rows = _cursor_batch(
             c,
-            """SELECT d.doc_id, d.layer, f.content
+            f"""SELECT d.doc_id, d.layer, f.content
                FROM documents d
                JOIN vault_fts f ON f.doc_id = d.doc_id
                WHERE NOT EXISTS (
                    SELECT 1 FROM chunk_embeddings ce WHERE ce.doc_id = d.doc_id
                )
                AND f.content IS NOT NULL AND TRIM(f.content) != ''
+               AND {_eligible}
                AND d.doc_id > ?
                ORDER BY d.doc_id
                LIMIT ?""",
@@ -329,12 +382,13 @@ def backfill_document_vectors(
         )
         _batch_cursors[cursor_key] = rows[-1]["doc_id"] if rows else 0
         stats["unrecoverable"] = c.execute(
-            """SELECT COUNT(*) AS n
+            f"""SELECT COUNT(*) AS n
                FROM documents d
                LEFT JOIN vault_fts f ON f.doc_id = d.doc_id
                WHERE NOT EXISTS (
                    SELECT 1 FROM chunk_embeddings ce WHERE ce.doc_id = d.doc_id
                )
+               AND {_eligible}
                AND (f.content IS NULL OR TRIM(f.content) = '')"""
         ).fetchone()["n"]
 

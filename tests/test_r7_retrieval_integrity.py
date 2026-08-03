@@ -530,6 +530,86 @@ class TestEmbeddingBackfillAndCoverage:
             "excluding it from the batch must not hide it from coverage"
         )
 
+    def test_backfill_skips_draft_and_expired_per_unembedded_statuses(
+        self, tmp_path, monkeypatch
+    ):
+        """grok-review tip finding 1: draft/expired must stay vectorless.
+
+        The indexer deliberately writes documents + vault_fts without
+        chunk_embeddings for UNEMBEDDED_STATUSES so unendorsed rows cannot
+        occupy the fixed FAISS top-k window. A default-on backfill that
+        re-embeds them undoes that policy and invents a phantom coverage gap.
+        """
+        from minni.backfill import backfill_document_vectors, embedding_coverage
+        from minni.indexer import UNEMBEDDED_STATUSES
+
+        self._stub_encoder(monkeypatch)
+        db_obj, cfg = _make_db(tmp_path)
+        body = "# Note\n\n" + ("accepted rollback procedure text. " * 40)
+        draft_body = "# Draft\n\n" + ("draft only content not for faiss. " * 40)
+        with db_obj.cursor() as c:
+            c.execute(
+                "INSERT INTO documents (path, agent, sigil, page_status) "
+                "VALUES ('ok.md', 'codex', 'vault', 'accepted')"
+            )
+            accepted_id = c.lastrowid
+            c.execute(
+                "INSERT INTO vault_fts (doc_id, path, content, agent, sigil) "
+                "VALUES (?, 'ok.md', ?, 'codex', 'vault')",
+                (accepted_id, body),
+            )
+            c.execute(
+                "INSERT INTO documents (path, agent, sigil, page_status) "
+                "VALUES ('draft.md', 'codex', 'vault', 'draft')"
+            )
+            draft_id = c.lastrowid
+            c.execute(
+                "INSERT INTO vault_fts (doc_id, path, content, agent, sigil) "
+                "VALUES (?, 'draft.md', ?, 'codex', 'vault')",
+                (draft_id, draft_body),
+            )
+            c.execute(
+                "INSERT INTO documents (path, agent, sigil, page_status) "
+                "VALUES ('expired.md', 'codex', 'vault', 'expired')"
+            )
+            expired_id = c.lastrowid
+            c.execute(
+                "INSERT INTO vault_fts (doc_id, path, content, agent, sigil) "
+                "VALUES (?, 'expired.md', ?, 'codex', 'vault')",
+                (expired_id, draft_body),
+            )
+
+        assert "draft" in UNEMBEDDED_STATUSES and "expired" in UNEMBEDDED_STATUSES
+        stats = backfill_document_vectors(db_obj, cfg)
+        assert stats["documents"] == 1, (
+            f"only the accepted/embed-eligible doc should drain; got {stats}"
+        )
+
+        with db_obj.cursor() as c:
+            n_accepted = c.execute(
+                "SELECT COUNT(*) AS n FROM chunk_embeddings WHERE doc_id = ?",
+                (accepted_id,),
+            ).fetchone()["n"]
+            n_draft = c.execute(
+                "SELECT COUNT(*) AS n FROM chunk_embeddings WHERE doc_id = ?",
+                (draft_id,),
+            ).fetchone()["n"]
+            n_expired = c.execute(
+                "SELECT COUNT(*) AS n FROM chunk_embeddings WHERE doc_id = ?",
+                (expired_id,),
+            ).fetchone()["n"]
+        assert n_accepted >= 1
+        assert n_draft == 0
+        assert n_expired == 0
+
+        cov = embedding_coverage(db_obj)
+        assert cov["documents_total"] == 1, (
+            "draft/expired must not count in embed-eligible totals"
+        )
+        assert cov["documents_missing_vectors"] == 0
+        assert cov["documents_deliberately_unembedded"] == 2
+        assert abs(cov["documents_vector_ratio"] - 1.0) < 1e-9
+
     def test_backfill_without_an_encoder_reports_rather_than_claiming_success(
         self, tmp_path, monkeypatch
     ):
