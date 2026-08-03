@@ -51,6 +51,10 @@ def test_mcp_json_preserves_existing_afm_env_over_repo_default(tmp_path):
     server = tmp_path / "install" / "dist" / "server.js"
     server.parent.mkdir(parents=True)
     server.write_text("", encoding="utf-8")
+    # Live custom helper on disk — preserve must still win over repo default.
+    custom = tmp_path / "custom" / "helper"
+    custom.parent.mkdir(parents=True)
+    custom.write_text("#!/bin/sh\n", encoding="utf-8")
 
     manifest = propagate.mcp_json(
         server,
@@ -60,7 +64,7 @@ def test_mcp_json_preserves_existing_afm_env_over_repo_default(tmp_path):
         tmp_path / "workspace",
         pre_existing_env={
             "MINNI_AFM_PROVIDER_MODE": "off",
-            "MINNI_AFM_NATIVE_HELPER": "/custom/helper",
+            "MINNI_AFM_NATIVE_HELPER": str(custom),
         },
         afm_env={
             "MINNI_AFM_PROVIDER_MODE": "native",
@@ -71,7 +75,39 @@ def test_mcp_json_preserves_existing_afm_env_over_repo_default(tmp_path):
     env = manifest["mcpServers"]["minni"]["env"]
     assert env["MINNI_AGENT_ID"] == "codex"
     assert env["MINNI_AFM_PROVIDER_MODE"] == "off"
-    assert env["MINNI_AFM_NATIVE_HELPER"] == "/custom/helper"
+    assert env["MINNI_AFM_NATIVE_HELPER"] == str(custom)
+
+
+def test_mcp_json_heals_dead_afm_helper_from_live_afm_env(tmp_path):
+    """D14 heal: dead preserved helper must not re-poison; live afm_env wins."""
+    server = tmp_path / "install" / "dist" / "server.js"
+    server.parent.mkdir(parents=True)
+    server.write_text("", encoding="utf-8")
+    live = tmp_path / "repo" / "src" / "minni" / "native_afm_helper"
+    live.parent.mkdir(parents=True)
+    live.write_text("#!/bin/sh\n", encoding="utf-8")
+    dead = tmp_path / "gone" / "native_afm_helper"  # never created
+
+    manifest = propagate.mcp_json(
+        server,
+        "codex",
+        tmp_path / "codex-vault",
+        tmp_path / "minnid.sock",
+        tmp_path / "workspace",
+        pre_existing_env={
+            "MINNI_AFM_PROVIDER_MODE": "native",
+            "MINNI_AFM_NATIVE_HELPER": str(dead),
+        },
+        afm_env={
+            "MINNI_AFM_PROVIDER_MODE": "native",
+            "MINNI_AFM_NATIVE_HELPER": str(live),
+        },
+    )
+
+    env = manifest["mcpServers"]["minni"]["env"]
+    assert env["MINNI_AFM_NATIVE_HELPER"] == str(live)
+    assert Path(env["MINNI_AFM_NATIVE_HELPER"]).is_file()
+    assert env["MINNI_AFM_PROVIDER_MODE"] == "native"
 
 
 def _good_checks():

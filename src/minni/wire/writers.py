@@ -118,6 +118,29 @@ def _validate_preserved_identity(ex_env: dict, agent: str) -> dict:
     return validated
 
 
+def _filter_dead_afm_helper(ex_env: dict) -> dict:
+    """Drop a preserved AFM helper path that is gone on disk.
+
+    Surface preserve must not re-stamp MINNI_AFM_NATIVE_HELPER when the path no
+    longer exists — otherwise wire/propagate redeploy re-poisons the field
+    that check_deployments --strict / sync-root step 6 gate on (D14), and
+    make sync-root can never heal the live machine without a hand-edit.
+    When the helper is dead and mode was ``native``, also drop mode so a live
+    ``native_afm_env()`` result can replace both keys.
+    """
+    out = dict(ex_env)
+    helper = out.get("MINNI_AFM_NATIVE_HELPER")
+    if helper is None:
+        return out
+    helper_path = Path(str(helper)).expanduser()
+    if helper_path.is_file():
+        return out
+    out.pop("MINNI_AFM_NATIVE_HELPER", None)
+    if str(out.get("MINNI_AFM_PROVIDER_MODE", "")).lower() == "native":
+        out.pop("MINNI_AFM_PROVIDER_MODE", None)
+    return out
+
+
 def load_json(path: Path) -> dict:
     if not path.exists():
         return {}
@@ -132,6 +155,26 @@ def load_json(path: Path) -> dict:
 def write_json(path: Path, data: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+
+
+def _mirror_codex_hook_env(env: dict, agent: str) -> None:
+    """Mirror resolved generic identity into MINNI_CODEX_* for codex.
+
+    The Codex hook entrypoint reads only MINNI_CODEX_* (never generic MINNI_*
+    the MCP server uses). Without the mirror, a custom MINNI_VAULT_PATH leaves
+    hooks writing audit/inbox under ~/.minni/codex-vault while MCP points at
+    the configured vault. Called after surface preservation so hooks track
+    whatever vault the install actually resolved.
+    """
+    if agent != "codex":
+        return
+    # Always re-derive from the resolved generic identity so a stale
+    # MINNI_CODEX_* cannot split hooks from MCP (never raw-preserve CODEX_*).
+    env["MINNI_CODEX_AGENT_ID"] = env.get("MINNI_AGENT_ID", "codex")
+    if "MINNI_VAULT_PATH" in env:
+        env["MINNI_CODEX_VAULT_PATH"] = env["MINNI_VAULT_PATH"]
+    if "MINNI_WORKSPACE_ID" in env:
+        env["MINNI_CODEX_WORKSPACE_ID"] = env["MINNI_WORKSPACE_ID"]
 
 
 def mcp_json(
@@ -161,10 +204,20 @@ def mcp_json(
         try:
             ex = load_json(target_path)
             ex_env = ex.get("mcpServers", {}).get("minni", {}).get("env", {}) or {}
-        except Exception:
-            pass
+        except Exception as exc:
+            # D10 twin: unparseable .mcp.json must not drop surface env.
+            raise ValueError(
+                f"cannot parse existing .mcp.json at {target_path}: {exc}. "
+                "Refusing to rewrite mcpServers.minni.env — the surface's "
+                "preserved env would be silently dropped. Fix or remove the "
+                "file, then re-run."
+            ) from exc
     if ex_env:
-        ex_env = _validate_preserved_identity(ex_env, agent)
+        ex_env = _filter_dead_afm_helper(
+            _validate_preserved_identity(ex_env, agent),
+        )
+        # Never carry raw MINNI_CODEX_* from the surface — re-derive after
+        # generic identity resolves (parity with propagate X2).
         for key in (
             "MINNI_AGENT_ID", "MINNI_VAULT_PATH", "MINNI_SOCKET_PATH",
             "MINNI_AFM_PROVIDER_MODE", "MINNI_AFM_NATIVE_HELPER",
@@ -173,6 +226,7 @@ def mcp_json(
                 env[key] = ex_env[key]
         if "MINNI_WORKSPACE_ID" in ex_env and not explicit_workspace:
             env["MINNI_WORKSPACE_ID"] = ex_env["MINNI_WORKSPACE_ID"]
+    _mirror_codex_hook_env(env, agent)
     cwd = server_path.parent.parent if server_path.parent.name == "dist" else server_path.parent
     return {
         "mcpServers": {
@@ -214,11 +268,15 @@ def update_kilo_config(
 ) -> Path:
     path = Path("~/.config/kilo/kilo.json").expanduser()
     data = load_json(path)
+    # Kilo's McpLocal schema is strict and names this key "environment", not
+    # "env" (Claude/Codex spelling). Writing "env" makes Kilo reject the whole
+    # config file with ConfigInvalidError and refuse to start AT ALL — it takes
+    # down the entire CLI, not just Minni. Parity with propagate.update_kilo_config.
     data.setdefault("mcp", {})["minni"] = {
         "type": "local",
         "command": ["node", str(server_path)],
         "enabled": True,
-        "env": {
+        "environment": {
             "MINNI_AGENT_ID": agent,
             "MINNI_VAULT_PATH": str(vault),
             "MINNI_SOCKET_PATH": str(socket_path),
@@ -403,6 +461,7 @@ def update_agy_plugin_hooks(install_root: Path) -> dict[str, object]:
     if not agy:
         return {
             "installed": False,
+            "error_class": "missing_cli",
             "reason": "agy CLI not found on PATH; hook registration skipped",
         }
     hooks_data = json.loads(template.read_text(encoding="utf-8"))
@@ -488,41 +547,58 @@ def replace_toml_sections(
 ) -> None:
     text = path.read_text(encoding="utf-8") if path.exists() else ""
     if preserve_surface_env and path.exists() and "mcp_servers.minni.env" in sections:
+        # D10 (#232): an unparseable existing config is a hard error, never a
+        # silent fall-through — swallowing it here rewrote the env section
+        # WITHOUT the surface's preserved values while reporting success.
         try:
             data = tomllib.loads(text)
-            ex_env = data.get("mcp_servers", {}).get("minni", {}).get("env", {}) or {}
-            if ex_env:
-                try:
-                    fresh_env = (
-                        tomllib.loads(sections["mcp_servers.minni.env"])
-                        .get("mcp_servers", {})
-                        .get("minni", {})
-                        .get("env", {})
-                        or {}
-                    )
-                except Exception:
-                    fresh_env = {}
-                expected_agent = fresh_env.get("MINNI_AGENT_ID")
-                if expected_agent:
-                    ex_env = _validate_preserved_identity(ex_env, expected_agent)
-                preserved_lines = []
-                for key in (
-                    "MINNI_AGENT_ID", "MINNI_VAULT_PATH", "MINNI_SOCKET_PATH",
-                    "MINNI_WORKSPACE_ID", "MINNI_AFM_PROVIDER_MODE", "MINNI_AFM_NATIVE_HELPER",
-                ):
-                    if key in ex_env:
-                        val = ex_env[key]
-                    elif key in fresh_env:
-                        val = fresh_env[key]
-                    else:
-                        continue
-                    preserved_lines.append(f'{key} = "{_toml_basic_str(val)}"')
-                if preserved_lines:
-                    sections["mcp_servers.minni.env"] = (
-                        "[mcp_servers.minni.env]\n" + "\n".join(preserved_lines)
-                    )
-        except Exception:
-            pass
+        except tomllib.TOMLDecodeError as exc:
+            raise ValueError(
+                f"cannot parse existing TOML at {path}: {exc}. Refusing to "
+                "rewrite [mcp_servers.minni.env] — the surface's preserved env "
+                "would be silently dropped. Fix or remove the file, then re-run."
+            ) from exc
+        ex_env = data.get("mcp_servers", {}).get("minni", {}).get("env", {}) or {}
+        if ex_env:
+            try:
+                fresh_env = (
+                    tomllib.loads(sections["mcp_servers.minni.env"])
+                    .get("mcp_servers", {})
+                    .get("minni", {})
+                    .get("env", {})
+                    or {}
+                )
+            except Exception:
+                fresh_env = {}
+            expected_agent = fresh_env.get("MINNI_AGENT_ID")
+            if expected_agent:
+                ex_env = _validate_preserved_identity(ex_env, expected_agent)
+            # Drop dead AFM helper before merge so fresh_env (live helper) wins.
+            ex_env = _filter_dead_afm_helper(ex_env)
+            # Resolve generic identity only — never carry raw MINNI_CODEX_*
+            # from the surface (X2). Re-derive mirrors from the resolved
+            # identity when the fresh section is for codex.
+            resolved_env: dict = {}
+            for key in (
+                "MINNI_AGENT_ID", "MINNI_VAULT_PATH", "MINNI_SOCKET_PATH",
+                "MINNI_WORKSPACE_ID", "MINNI_AFM_PROVIDER_MODE",
+                "MINNI_AFM_NATIVE_HELPER",
+            ):
+                if key in ex_env:
+                    resolved_env[key] = ex_env[key]
+                elif key in fresh_env:
+                    resolved_env[key] = fresh_env[key]
+            if any(k.startswith("MINNI_CODEX_") for k in fresh_env) or (
+                str(resolved_env.get("MINNI_AGENT_ID") or "") == "codex"
+            ):
+                _mirror_codex_hook_env(resolved_env, "codex")
+            if resolved_env:
+                preserved_lines = [
+                    f'{k} = "{_toml_basic_str(v)}"' for k, v in resolved_env.items()
+                ]
+                sections["mcp_servers.minni.env"] = (
+                    "[mcp_servers.minni.env]\n" + "\n".join(preserved_lines)
+                )
     for name in sections:
         pattern = re.compile(rf"(?ms)^\[{re.escape(name)}\]\n.*?(?=^\[|\Z)")
         text = pattern.sub("", text)
@@ -542,6 +618,22 @@ def update_toml_mcp_config(
     explicit_workspace: bool = False,
     afm_env: dict[str, str] | None = None,
 ) -> None:
+    ws = normalize_workspace_id(str(workspace))
+    env_lines = [
+        f'MINNI_AGENT_ID = "{_toml_basic_str(agent)}"',
+        f'MINNI_VAULT_PATH = "{_toml_basic_str(vault)}"',
+        f'MINNI_SOCKET_PATH = "{_toml_basic_str(socket_path)}"',
+        f'MINNI_WORKSPACE_ID = "{_toml_basic_str(ws)}"',
+    ]
+    for k, v in (afm_env or {}).items():
+        env_lines.append(f'{k} = "{_toml_basic_str(v)}"')
+    if agent == "codex":
+        # Codex hooks read only MINNI_CODEX_*; stamp mirrors from resolved identity.
+        env_lines.extend([
+            f'MINNI_CODEX_AGENT_ID = "{_toml_basic_str(agent)}"',
+            f'MINNI_CODEX_VAULT_PATH = "{_toml_basic_str(vault)}"',
+            f'MINNI_CODEX_WORKSPACE_ID = "{_toml_basic_str(ws)}"',
+        ])
     replace_toml_sections(
         path,
         {
@@ -552,14 +644,7 @@ def update_toml_mcp_config(
                 "enabled = true"
             ),
             "mcp_servers.minni.env": (
-                "[mcp_servers.minni.env]\n"
-                f'MINNI_AGENT_ID = "{_toml_basic_str(agent)}"\n'
-                f'MINNI_VAULT_PATH = "{_toml_basic_str(vault)}"\n'
-                f'MINNI_SOCKET_PATH = "{_toml_basic_str(socket_path)}"\n'
-                f'MINNI_WORKSPACE_ID = "{_toml_basic_str(normalize_workspace_id(str(workspace)))}"'
-                + "".join(
-                    f'\n{k} = "{_toml_basic_str(v)}"' for k, v in (afm_env or {}).items()
-                )
+                "[mcp_servers.minni.env]\n" + "\n".join(env_lines)
             ),
         },
         preserve_surface_env=not explicit_workspace,

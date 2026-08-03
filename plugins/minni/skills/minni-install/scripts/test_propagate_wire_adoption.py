@@ -124,6 +124,55 @@ def test_claude_code_platform_fails_loud_and_points_at_wire(name, tmp_path):
 
 
 def test_claude_code_is_absent_from_the_all_expansion():
+    """D7 partition: propagate `all` is antigravity+cursor only; wire owns
+    codex/claude-code/kilocode/grok (named ALL_SKIPS)."""
     assert "claude-code" not in propagate.ALL_PLATFORMS
-    assert "codex" in propagate.ALL_PLATFORMS
+    assert "codex" not in propagate.ALL_PLATFORMS
+    assert "kilocode" not in propagate.ALL_PLATFORMS
+    assert "grok" not in propagate.ALL_PLATFORMS
+    assert set(propagate.ALL_PLATFORMS) == {"antigravity", "cursor"}
+    assert "codex" in propagate.ALL_SKIPS
+    assert "claude-code" in propagate.ALL_SKIPS
     assert "cursor" in propagate.ALL_PLATFORMS
+
+
+def test_toml_basic_str_escapes_control_chars():
+    """Propagate escaper must match wire: raw newlines cannot break TOML strings."""
+    import importlib.util
+    from pathlib import Path
+    p = Path(__file__).resolve().parent / "propagate.py"
+    spec = importlib.util.spec_from_file_location("_prop_toml", p)
+    mod = importlib.util.module_from_spec(spec)
+    assert spec and spec.loader
+    spec.loader.exec_module(mod)
+    escaped = mod._toml_basic_str("a\nb")
+    assert "\\n" in escaped
+    assert "\n" not in escaped
+
+
+def test_toml_basic_str_matches_wire_writers():
+    """Dual-maintained escapers must stay byte-identical on control/meta chars."""
+    import importlib.util
+    from pathlib import Path
+
+    from minni.wire.writers import _toml_basic_str as wire_esc
+
+    p = Path(__file__).resolve().parent / "propagate.py"
+    spec = importlib.util.spec_from_file_location("_prop_toml_parity", p)
+    mod = importlib.util.module_from_spec(spec)
+    assert spec and spec.loader
+    spec.loader.exec_module(mod)
+    samples = (
+        "plain",
+        'quote"here',
+        "back\\slash",
+        "new\nline",
+        "tab\there",
+        "carr\riage",
+        "nul\x00byte",
+        "unit\x1fsep",
+        "del\x7f",
+        'mix\\"\n\t\r\x01',
+    )
+    for raw in samples:
+        assert mod._toml_basic_str(raw) == wire_esc(raw), repr(raw)

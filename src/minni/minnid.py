@@ -1591,6 +1591,16 @@ def main():
 
     _start_time = time.time()
 
+    # Deploy honesty (GA1-3): snapshot which code this process is running —
+    # checkout + HEAD sha at start — so `status` can later report truthfully
+    # when the checkout has moved on and the daemon is executing stale code.
+    try:
+        from minni.minnid_runtime.deploy_honesty import capture_start_state
+
+        capture_start_state()
+    except Exception:
+        pass  # the lazy fallback in deploy_status() still answers
+
     parser = argparse.ArgumentParser(
         description="minnid — Minni Memory Daemon",
     )

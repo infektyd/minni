@@ -126,6 +126,46 @@ def wired_install_roots() -> set[str]:
     }
 
 
+def retire_platform(platform: str, *, dry_run: bool = False) -> tuple[dict, int]:
+    """Remove all wired.json rows for ``platform``. Return (data, removed_count).
+
+    Used when wire skips a platform for missing host config root so a zombie
+    record cannot keep a lagging install_root "active" forever.
+    """
+    wired_json = plugin_base() / "wired.json"
+    wired_lock = plugin_base() / "wired.lock"
+    wired_json.parent.mkdir(parents=True, exist_ok=True)
+    lock_fd = os.open(str(wired_lock), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        data = _load_wired(wired_json)
+        start_gen = int(data.get("generation", 0))
+        wires: list[dict] = list(data.get("wires", []))
+        kept = [w for w in wires if str(w.get("platform") or "") != platform]
+        removed = len(wires) - len(kept)
+        if removed == 0 or dry_run:
+            data["wires"] = kept
+            return data, removed
+        data["wires"] = kept
+        data["generation"] = start_gen + 1
+        tmp_fd, tmp_path = tempfile.mkstemp(
+            dir=wired_json.parent, prefix=".wired-", suffix=".json",
+        )
+        os.close(tmp_fd)
+        try:
+            Path(tmp_path).write_text(
+                json.dumps(data, indent=2) + "\n", encoding="utf-8",
+            )
+            os.replace(tmp_path, wired_json)
+        finally:
+            if Path(tmp_path).exists():
+                Path(tmp_path).unlink(missing_ok=True)
+        return data, removed
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
+
+
 def make_record(
     platform: str,
     config_path: Path,

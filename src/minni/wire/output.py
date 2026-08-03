@@ -62,6 +62,10 @@ class WireOutput:
             return 1
         if self.status == "partial":
             return 1
+        # D5 (#232): a run that wired NOTHING must not exit 0 "ok" — the
+        # operator asked for wiring and none happened.
+        if self.status == "skipped":
+            return 1
         wired_or_skipped = all(
             r.status in ("wired", "skipped") for r in self.results
         )
@@ -88,7 +92,9 @@ class WireOutput:
         if not self.results:
             self.status = "failed"
         elif statuses <= {"skipped"}:
-            self.status = "ok"
+            # D5 (#232): "ok" here reported success for work not done. A run
+            # where every platform was skipped wired nothing; say so.
+            self.status = "skipped"
         elif "failed" in statuses and "wired" in statuses:
             self.status = "partial"
         elif "failed" in statuses:

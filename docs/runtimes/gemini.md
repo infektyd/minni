@@ -9,9 +9,10 @@ Wire Gemini to a running Minni daemon from your checkout:
 
 Standalone Gemini wiring is **provisional** in `minni wire` (the
 `${extensionPath}` extension-manifest mechanism is still being verified —
-issue #142's open question 8), so `minni wire gemini` reports a provisional
-failure and `minni wire all` skips gemini with a warning; use the propagate.py
-command above from a checkout for now.
+issue #142's open question 8), so `minni wire gemini` reports status
+`skipped` (exit 1 when nothing else wired) and `minni wire all` includes
+gemini as a named skip with a warning; use the propagate.py command above
+from a checkout for now.
 
 Antigravity rides the same `~/.gemini` surface (shared agent identity
 `gemini`, vault `~/.minni/gemini-vault`) but is wired **individually**, and
@@ -22,9 +23,24 @@ minni wire antigravity                                 # v0.3+ wheel
 .venv/bin/minni wire antigravity --from-repo .         # v0.2 wheel / checkout
 ```
 
-Note: neither propagate.py's `--platform all` nor `minni wire all` includes
-antigravity (`minni wire all` = codex, claude-code, kilocode, grok); run the
-antigravity target explicitly.
+Note: `make sync-root` uses the D7 fleet partition — `minni wire all
+--from-repo` for codex/claude-code/kilocode/grok, then
+`propagate.py update-plugin --platform antigravity` and `--platform cursor`
+only (plus a grok hooks/rules refresh). `propagate --platform all` expands
+only to antigravity+cursor (codex/kilocode/grok are named wire-managed skips).
+After wire adoption, do **not** re-run explicit
+`update-plugin --platform codex|kilocode|grok` — those still rewrite MCP onto
+legacy cache trees. Prefer:
+
+```
+propagate.py update-plugin --platform antigravity
+propagate.py update-plugin --platform cursor
+```
+
+`minni wire all` expands to codex, claude-code, kilocode, grok and names
+antigravity as an explicit skip so bulk wire does not fight over the shared
+~/.gemini tree; run `minni wire antigravity` or the antigravity propagate
+target explicitly.
 
 The adapter (`plugins/minni/.gemini-plugin/gemini-extension.json`) launches
 the MCP server via the extension path; Antigravity surfaces get their MCP

@@ -195,6 +195,28 @@ def test_wire_version_mismatch(wire_env, monkeypatch, capsys):
     assert rc == 2
 
 
+def test_wire_all_payload_wireerror_status_is_failed_not_skipped(wire_env, monkeypatch, capsys):
+    """Round-4 Low: WireError after ALL_SKIPS pre-append must not finalize as
+    status=skipped (D5) — automation keying on status==failed would miss it."""
+    home, payload_root, manifest = wire_env
+    from minni.wire.flow import WireError
+
+    @contextmanager
+    def boom_tree(*, from_repo=None, use_version=None):
+        raise WireError("from-repo install exploded", exit_code=1)
+        yield payload_root, manifest, False  # pragma: no cover
+
+    monkeypatch.setattr("minni.wire.flow.payload_tree", boom_tree)
+    monkeypatch.setattr(
+        "minni.wire.preflight.check_node", lambda min_version=20: (True, "v22.0.0"),
+    )
+    rc = run_wire(_args("all", home))
+    assert rc == 1
+    doc = json.loads(capsys.readouterr().out)
+    assert doc["status"] == "failed", doc
+    assert any(r.get("status") == "failed" for r in doc.get("results", []))
+
+
 def test_wire_missing_node(tmp_path, monkeypatch, capsys):
     home = tmp_path / "home"
     home.mkdir()
@@ -260,11 +282,16 @@ def test_all_expansion_platform_set(wire_env, monkeypatch, capsys):
     out = json.loads(capsys.readouterr().out)
     attempted = {r["platform"] for r in out["results"]}
     assert set(ALL_EXPANSION_V03) <= attempted
-    assert "gemini" in attempted
-    assert "antigravity" not in attempted
     assert "generic" not in attempted
-    gemini = next(r for r in out["results"] if r["platform"] == "gemini")
-    assert gemini["status"] == "skipped"
+    # D7 (#232): every canonical-fleet member `wire all` does not execute is
+    # present as an explicit skip with a named reason — never silently absent.
+    from minni.wire.platform import ALL_SKIPS
+
+    for plat in ("gemini", "antigravity", "cursor"):
+        assert plat in attempted
+        entry = next(r for r in out["results"] if r["platform"] == plat)
+        assert entry["status"] == "skipped"
+        assert entry["reason"] == ALL_SKIPS[plat]
 
 
 def _patch_node_only(wire_env, monkeypatch):
@@ -428,7 +455,9 @@ def test_wire_kilocode_non_dry_run(wire_env, monkeypatch, capsys):
     kilo = json.loads((home / ".config" / "kilo" / "kilo.json").read_text(encoding="utf-8"))
     entry = kilo["mcp"]["minni"]
     assert entry["command"] == ["node", str(server)]
-    assert entry["env"]["MINNI_AGENT_ID"] == "kilocode"
+    # Kilo schema requires "environment", not "env" (ConfigInvalidError otherwise).
+    assert "env" not in entry, "wire must not stamp Claude-style env key for Kilo"
+    assert entry["environment"]["MINNI_AGENT_ID"] == "kilocode"
     assert entry["enabled"] is True
 
 
@@ -458,6 +487,61 @@ def test_wire_antigravity_alternate_surface(wire_env, monkeypatch, capsys):
     result = out["results"][0]
     assert result["status"] == "wired"
     assert result["config_path"] == str(alt.resolve())
+
+
+def test_wire_antigravity_hook_registration_failure_is_failed(
+    wire_env, monkeypatch, capsys,
+):
+    """D11 (#232): a REAL agy hook-registration failure (agy present, install
+    failed) must fail the platform, not report 'wired' with the failure buried
+    in extras. (An absent agy CLI stays 'wired' with a named hook-gap reason —
+    covered by the surrounding antigravity tests, whose sandbox has no agy.)"""
+    home, payload_root, manifest = wire_env
+    gemini_cfg = home / ".gemini" / "config"
+    gemini_cfg.mkdir(parents=True)
+    (gemini_cfg / "mcp_config.json").write_text(
+        '{"mcpServers": {}}', encoding="utf-8",
+    )
+    _patch_payload(wire_env, monkeypatch)
+    monkeypatch.setattr(
+        "minni.wire.flow.update_agy_plugin_hooks",
+        lambda install_root: {
+            "installed": False,
+            "reason": "agy plugin install failed: staging rejected",
+        },
+    )
+    rc = run_wire(_args("antigravity", home, no_prune=True))
+    assert rc == 1
+    out = json.loads(capsys.readouterr().out)
+    result = out["results"][0]
+    assert result["status"] == "failed"
+    assert "agy hook registration failed" in result["reason"]
+    # D11 half-state: MCP already rewritten — install root must still be
+    # recorded so GC / honesty protect the live payload.
+    from minni.wire.wired import wired_record
+
+    rec = wired_record("antigravity")
+    assert rec is not None
+    assert "install_root" in rec
+    assert "GC protection" in result["reason"] or "already updated" in result["reason"]
+
+
+def test_wire_antigravity_absent_agy_names_hook_gap(wire_env, monkeypatch, capsys):
+    """D11 (#232): with agy genuinely absent, the result stays 'wired' but the
+    hook gap is NAMED in the primary reason field, not buried in extras."""
+    home, payload_root, manifest = wire_env
+    gemini_cfg = home / ".gemini" / "config"
+    gemini_cfg.mkdir(parents=True)
+    (gemini_cfg / "mcp_config.json").write_text(
+        '{"mcpServers": {}}', encoding="utf-8",
+    )
+    _patch_payload(wire_env, monkeypatch)
+    rc = run_wire(_args("antigravity", home, no_prune=True))
+    assert rc == 0
+    out = json.loads(capsys.readouterr().out)
+    result = out["results"][0]
+    assert result["status"] == "wired"
+    assert result["reason"] and "WITHOUT agy hooks" in result["reason"]
 
 
 def test_wire_generic_missing_install_root(wire_env, monkeypatch, capsys):
@@ -537,3 +621,123 @@ def test_wire_from_repo_relative_path_resolved(wire_env, monkeypatch):
     rc = run_wire(_args("claude-code", home, from_repo="."))
     assert rc == 0
     assert captured["repo_root"].is_absolute()
+
+
+def test_wire_missing_config_root_is_skipped(wire_env, monkeypatch, capsys):
+    """Optional fleet members without a host config root skip, not fail."""
+    _patch_payload(wire_env, monkeypatch)
+    home = wire_env[0]
+    # Remove kilocode surface so preflight reports no config root.
+    kilo = home / ".config" / "kilo"
+    if kilo.exists():
+        import shutil
+        shutil.rmtree(kilo)
+    rc = run_wire(_args("kilocode", home, dry_run=True))
+    # dry-run with only skipped platforms: emit path still dry-run if it
+    # reaches finalize before wiring; missing root skips before dry-run body.
+    out = json.loads(capsys.readouterr().out)
+    by = {r["platform"]: r for r in out["results"]}
+    assert "kilocode" in by, out
+    assert by["kilocode"]["status"] == "skipped", out
+    assert "no config root" in by["kilocode"].get("reason", "")
+    # Single-platform all-skipped is exit 1 (D5); status is skipped not failed.
+    assert out["status"] in ("skipped", "dry-run"), out
+    if out["status"] == "skipped":
+        assert rc == 1
+
+
+def test_wire_skip_missing_config_retires_zombie_and_honesty_green(
+    wire_env, monkeypatch, capsys,
+):
+    """High pin: codex lagging in wired.json with no ~/.codex must not keep
+    plugin_dist.stale true after wire skip + active claude payload.
+
+    wired.json has {codex: old_root, claude-code: fresh_root}
+    HOME has no ~/.codex, has claude surface
+    wire codex → skipped + retired
+    deploy_status plugin_dist.stale is False  # codex must not count
+    """
+    import shutil
+
+    from minni.minnid_runtime import deploy_honesty
+    from minni.wire.active_roots import active_wire_plugin_roots_ordered
+
+    _patch_payload(wire_env, monkeypatch)
+    home = wire_env[0]
+    plugin = home / ".minni" / "plugin"
+    old = plugin / "0.4.0"
+    old.mkdir(parents=True)
+    (old / "payload-manifest.json").write_text(
+        json.dumps({"git_sha": "0" * 40, "version": "0.4.0"}),
+        encoding="utf-8",
+    )
+    head = "b" * 40
+    fresh = plugin / "0.4.1+git.bbbbbbb"
+    fresh.mkdir(parents=True)
+    (fresh / "payload-manifest.json").write_text(
+        json.dumps({"git_sha": head, "version": "0.4.1+git.bbbbbbb"}),
+        encoding="utf-8",
+    )
+    (plugin / "wired.json").write_text(
+        json.dumps({
+            "schema": 1,
+            "generation": 1,
+            "wires": [
+                {
+                    "platform": "codex",
+                    "install_root": str(old),
+                    "wired_at": "2026-08-01T00:00:00Z",
+                },
+                {
+                    "platform": "claude-code",
+                    "install_root": str(fresh),
+                    "wired_at": "2026-08-02T00:00:00Z",
+                },
+            ],
+        }),
+        encoding="utf-8",
+    )
+    # Abandon codex host surface (zombie wire record remains until skip).
+    shutil.rmtree(home / ".codex")
+
+    rc = run_wire(_args("codex", home))
+    out = json.loads(capsys.readouterr().out)
+    by = {r["platform"]: r for r in out["results"]}
+    assert by["codex"]["status"] == "skipped"
+    assert "no config root" in by["codex"].get("reason", "")
+    # Single-platform skip → D5 exit 1; retirement still must land on disk.
+    assert rc == 1
+
+    wired = json.loads((plugin / "wired.json").read_text(encoding="utf-8"))
+    plats = [w.get("platform") for w in wired.get("wires", [])]
+    assert "codex" not in plats, wired
+    assert "claude-code" in plats
+
+    ordered = active_wire_plugin_roots_ordered(home)
+    assert not any("codex" in how for _r, how in ordered), ordered
+    assert any("claude-code" in how for _r, how in ordered), ordered
+
+    monkeypatch.setattr(
+        deploy_honesty, "_active_payload_roots",
+        lambda: active_wire_plugin_roots_ordered(home),
+    )
+    status = deploy_honesty._plugin_dist_status(head)
+    assert status["stale"] is False, status
+
+
+def test_from_repo_run_redirects_child_stdout_to_stderr(tmp_path, monkeypatch):
+    """Build children must not write to stdout (wire JSON contract)."""
+    import subprocess as sp
+    import sys
+
+    from minni.wire import from_repo
+
+    calls: dict = {}
+
+    def fake_run(cmd, cwd=None, check=True, stdout=None, **kwargs):
+        calls["stdout"] = stdout
+        return sp.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(from_repo.subprocess, "run", fake_run)
+    from_repo._run(["echo", "hi"], tmp_path)
+    assert calls.get("stdout") is sys.stderr

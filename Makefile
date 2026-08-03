@@ -224,3 +224,12 @@ release-wheel: stage-payload
 
 check-versions:
 	$(VENV_PY) scripts/check_versions.py
+
+# ── Root sync (issue #232-#234 follow-through; audit GA1-3/GA5-1) ──────────
+# Bring the LIVE install up to origin/main: fetch + ff-only (refuses on dirty
+# or diverged local state), refresh the editable install, rebuild the plugin,
+# redeploy every platform surface, restart minnid, then verify with the
+# version/deployment checkers. `make sync-root DRY_RUN=1` prints the plan.
+.PHONY: sync-root
+sync-root:
+	bash scripts/update_root.sh $(if $(filter 1 yes true,$(DRY_RUN)),--dry-run,)
