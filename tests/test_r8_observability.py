@@ -2667,6 +2667,14 @@ def test_rerank_degrade_survives_a_later_healthy_variant(tmp_path, monkeypatch):
     import minni.retrieval as retrieval_mod
 
     engine = _engine_without_model(tmp_path, monkeypatch)
+    # Round 23: retrieval expands via expand_query_with_status; patching the
+    # legacy expand_query alone leaves the real rule expander (often 1 variant
+    # for short queries) and this test never exercises multi-variant merge.
+    monkeypatch.setattr(
+        retrieval_mod,
+        "expand_query_with_status",
+        lambda query, mode="rule": (["v1", "v2"], None),
+    )
     monkeypatch.setattr(
         retrieval_mod, "expand_query", lambda query, mode="rule": ["v1", "v2"]
     )
