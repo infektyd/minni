@@ -21,7 +21,7 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
 import { createHookHandlers } from "../dist/hook-handlers.js";
-import { LAYER1_SHELF_MAX_BYTES, readLayer1Shelf } from "../dist/vault.js";
+import { LAYER1_SHELF_MAX_BYTES, readFullOrEof, readLayer1Shelf } from "../dist/vault.js";
 
 const execFileAsync = promisify(execFile);
 const PLUGIN_ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -229,6 +229,81 @@ test(
     } finally {
       await rm(fixture.root, { recursive: true, force: true });
     }
+  },
+);
+
+// ---------------------------------------------------------------------------
+// Bugbot round 2 on PR #282: a single `handle.read` call is permitted by
+// POSIX to return FEWER bytes than requested even on an ordinary regular
+// file (a short read is not EOF). readLayer1Shelf's probe read used to be
+// one call; a short read <= cap on a file actually larger than the cap
+// would have reported truncated:false over incomplete content — H5 one
+// layer deeper than the fstat race fixed in round 1. The fix loops the read
+// (readFullOrEof) until the buffer fills or a read genuinely returns 0.
+// These pin the loop directly against a fake short-read producer, since
+// real filesystem reads rarely short-read in a test environment and would
+// not actually exercise the accumulation path.
+// ---------------------------------------------------------------------------
+
+test(
+  "readFullOrEof: accumulates across multiple short reads until the buffer is full",
+  async () => {
+    const length = 10;
+    const buffer = Buffer.alloc(length);
+    // Every call hands back at most 3 bytes, regardless of how much room is
+    // left in the buffer — the shape of a real POSIX short read.
+    const chunks = [3, 3, 3, 1]; // sums to 10
+    let call = 0;
+    const fakeRead = async (buf, offset, len, pos) => {
+      const bytesRead = Math.min(chunks[call], len);
+      call += 1;
+      buf.fill(0x41 + offset, offset, offset + bytesRead); // distinct byte per call, for eyeballing
+      return { bytesRead };
+    };
+
+    const totalRead = await readFullOrEof(fakeRead, buffer, length);
+
+    assert.equal(totalRead, length, "short reads must accumulate to the full requested length");
+    assert.equal(call, chunks.length, "the loop must keep calling read until the buffer is full");
+  },
+);
+
+test(
+  "readFullOrEof: stops at a genuine EOF (read returns 0) short of the target length",
+  async () => {
+    const length = 10;
+    const buffer = Buffer.alloc(length);
+    // The file only has 5 bytes: two short reads of varying size, then EOF.
+    const chunks = [2, 3, 0];
+    let call = 0;
+    const fakeRead = async (buf, offset, len) => {
+      const bytesRead = Math.min(chunks[call] ?? 0, len);
+      call += 1;
+      return { bytesRead };
+    };
+
+    const totalRead = await readFullOrEof(fakeRead, buffer, length);
+
+    assert.equal(totalRead, 5, "the loop must stop at EOF, not pad past what the file actually had");
+    assert.equal(call, 3, "the loop must stop calling read once it sees bytesRead === 0");
+  },
+);
+
+test(
+  "readFullOrEof: a read that fills the buffer in one call still terminates (no extra call past length)",
+  async () => {
+    const length = 4;
+    const buffer = Buffer.alloc(length);
+    let call = 0;
+    const fakeRead = async (buf, offset, len) => {
+      call += 1;
+      return { bytesRead: len };
+    };
+
+    const totalRead = await readFullOrEof(fakeRead, buffer, length);
+
+    assert.equal(totalRead, length);
+    assert.equal(call, 1, "a full single read must not trigger a spurious extra call");
   },
 );
 

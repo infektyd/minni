@@ -2610,7 +2610,7 @@ export interface Layer1ShelfResult {
  * probe buffer is LAYER1_SHELF_MAX_BYTES + 1: if the read fills all of it,
  * the file had at least one byte beyond the cap AT THE MOMENT OF THE READ —
  * the only claim `truncated` needs to make. Sizing the cap off an earlier
- * `fstat` instead (the original version of this function) let a file that
+ * `fstat` instead (an earlier version of this function) let a file that
  * GREW between stat and read produce silently-incomplete content with
  * `truncated: false` (the exact H5 failure this field exists to prevent),
  * and a file that SHRANK produce a false `truncated: true` with a wrong
@@ -2619,11 +2619,61 @@ export interface Layer1ShelfResult {
  * atomic, snapshot — and clamps to a 1-byte floor so it is always an honest
  * lower bound even if that snapshot disagrees with what was actually read.
  *
+ * THE PROBE READ ITSELF IS LOOPED, NOT A SINGLE `handle.read` CALL. POSIX
+ * (and Node's fs.read, which is a thin wrapper over it) permits a SHORT read
+ * on a perfectly normal regular file — nothing guarantees one call fills the
+ * buffer even when more bytes are available. A single-call version (an
+ * earlier revision of this function) could read some bytesRead <= cap on a
+ * file actually larger than the cap and report `truncated: false` on
+ * incomplete content — the H5 failure one layer deeper than the fstat one
+ * above. The loop keeps reading into the buffer at the current offset until
+ * either the buffer is full (cap+1 bytes seen — truncated) or a read
+ * returns 0 (genuine EOF — not truncated, whatever was accumulated is the
+ * whole file).
+ *
  * Known limitation: the byte cut is not UTF-8-boundary-aware, so a cap that
  * lands mid multi-byte character renders as U+FFFD in `content`. Acceptable
  * for ASCII-heavy markdown shelves; revisit if core.md content routinely
  * carries non-ASCII near the cap.
  */
+
+/** Signature shared with `FileHandle.read` — narrowed to what `readFullOrEof`
+ * needs so it can be driven by a real handle or a test double. */
+export type BufferReadFn = (
+  buffer: Buffer,
+  offset: number,
+  length: number,
+  position: number,
+) => Promise<{ bytesRead: number }>;
+
+/**
+ * Read repeatedly into `buffer` (from `buffer` offset 0, file position 0)
+ * until `length` bytes have landed or `read` reports EOF (`bytesRead === 0`).
+ * Exists because a single call to `FileHandle.read` is permitted by POSIX to
+ * return FEWER bytes than requested even on an ordinary regular file — a
+ * short read is not EOF, and treating it as the whole file is the same H5
+ * silent-truncation failure one layer below the fstat-vs-read race
+ * `readLayer1Shelf` already closed. Exported as its own function (not
+ * inlined into `readLayer1Shelf`) so the accumulation logic can be pinned
+ * directly against a fake short-read producer, not only through real
+ * filesystem calls that rarely short-read in a test environment. Returns
+ * the number of bytes actually accumulated, which may be less than `length`
+ * on genuine EOF.
+ */
+export async function readFullOrEof(
+  read: BufferReadFn,
+  buffer: Buffer,
+  length: number,
+): Promise<number> {
+  let totalRead = 0;
+  while (totalRead < length) {
+    const { bytesRead } = await read(buffer, totalRead, length - totalRead, totalRead);
+    if (bytesRead === 0) break; // genuine EOF — a short read alone means nothing
+    totalRead += bytesRead;
+  }
+  return totalRead;
+}
+
 export async function readLayer1Shelf(vaultPath: string): Promise<Layer1ShelfResult> {
   const corePath = path.join(vaultPath, "layer1", "core.md");
   let handle;
@@ -2644,18 +2694,22 @@ export async function readLayer1Shelf(vaultPath: string): Promise<Layer1ShelfRes
     if (!info.isFile()) {
       return { ok: false, reason: "absent: layer1/core.md is not a regular file" };
     }
-    // One byte beyond the cap: reading it (or not) is what tells `truncated`
-    // apart, not a size fetched before this read even started.
+    // One byte beyond the cap: filling the probe buffer (or not) is what
+    // tells `truncated` apart, not a size fetched before reading started.
     const probe = LAYER1_SHELF_MAX_BYTES + 1;
     const buffer = Buffer.alloc(probe);
-    const { bytesRead } = await handle.read(buffer, 0, probe, 0);
-    // Emptiness read off the ACTUAL read result, not the pre-read fstat
+    const totalRead = await readFullOrEof(
+      (buf, offset, len, pos) => handle!.read(buf, offset, len, pos),
+      buffer,
+      probe,
+    );
+    // Emptiness read off the ACTUAL accumulated read, not the pre-read fstat
     // above — same TOCTOU posture as the truncation decision below.
-    if (bytesRead === 0) {
+    if (totalRead === 0) {
       return { ok: false, reason: "absent: layer1/core.md is empty" };
     }
-    const truncated = bytesRead > LAYER1_SHELF_MAX_BYTES;
-    const contentBytes = truncated ? LAYER1_SHELF_MAX_BYTES : bytesRead;
+    const truncated = totalRead > LAYER1_SHELF_MAX_BYTES;
+    const contentBytes = truncated ? LAYER1_SHELF_MAX_BYTES : totalRead;
     const content = buffer.subarray(0, contentBytes).toString("utf8");
     if (!truncated) {
       return { ok: true, content, truncated: false };
