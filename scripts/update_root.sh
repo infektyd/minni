@@ -221,17 +221,20 @@ act npm --prefix plugins/minni run build
 say "step 4/6: redeploy platform surfaces (wire all + propagate antigravity/cursor)"
 REDEPLOY_EXIT=0
 if [ "$DRY_RUN" = 1 ]; then
-  act "$VENV_PY" -m minni.minni_cli wire all --from-repo "$REPO" --prune
+  act "$VENV_PY" -m minni.minni_cli wire all --from-repo "$REPO" --prune --force-reinstall
 else
   # --prune: non-TTY automation otherwise skips GC and leaves historical
   # +git.* dirs that make check_deployments --strict fail forever.
-  printf 'running:   %s -m minni.minni_cli wire all --from-repo %s --prune\n' "$VENV_PY" "$REPO"
+  # --force-reinstall: same version string after npm rebuild still changes
+  # payload hashes; without force, wire aborts on hash mismatch and the fleet
+  # silently stays on the previous tree (customer footgun after every sync).
+  printf 'running:   %s -m minni.minni_cli wire all --from-repo %s --prune --force-reinstall\n' "$VENV_PY" "$REPO"
   # Capture JSON so an all-skipped run (D5 exit 1: no wire-managed hosts on
   # this machine) is not treated as redeploy failure — propagate still owns
   # antigravity/cursor. failed/partial still set REDEPLOY_EXIT.
   _WIRE_JSON="$(mktemp "${TMPDIR:-/tmp}/minni-wire.XXXXXX")"
   set +e
-  "$VENV_PY" -m minni.minni_cli wire all --from-repo "$REPO" --prune >"$_WIRE_JSON"
+  "$VENV_PY" -m minni.minni_cli wire all --from-repo "$REPO" --prune --force-reinstall >"$_WIRE_JSON"
   _WIRE_RC=$?
   set -e
   cat "$_WIRE_JSON" || true

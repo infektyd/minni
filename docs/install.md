@@ -12,6 +12,42 @@ minni doctor
 
 This gives you the `minni` and `minnid` commands and the full engine.
 
+## Keep every agent host current (`minni sync`)
+
+After you upgrade the package **or** pull a newer `main` in a dogfood
+checkout, the **daemon can move while each agent host still points at last
+week's plugin tree**. That is a product failure mode, not a power-user tip.
+
+```bash
+minni sync              # redeploy plugin payload to all wire-primary hosts
+                        # + refresh cursor/antigravity (D7 partition)
+minni doctor            # WARN fleet if still stale; always names `minni sync`
+```
+
+| You installed via… | After the product moves… |
+|---|---|
+| **PyPI / pipx** | `pipx upgrade minni` then **`minni sync`** |
+| **Editable checkout** (contributor dogfood) | `git pull` (clean `main`) then **`minni sync`**, or **`minni sync --full`** for pull + rebuild + redeploy (same as `make sync-root`) |
+
+`minni sync` always force-reinstalls the active version dir so a same-version
+payload rebuild cannot leave hosts on old hashes. Restart agent apps after a
+successful sync so they reload MCP/`server.js`.
+
+### Optional: unattended checkout sync (macOS)
+
+If this machine dogfoods an editable checkout of Minni and you want
+`origin/main` to redeploy itself without remembering:
+
+```bash
+minni sync --install-auto    # launchd every 6h → update_root.sh
+minni sync --auto-status
+minni sync --uninstall-auto
+```
+
+Unattended runs **refuse** a dirty or diverged tree (they never discard your
+work). Prefer a clean dedicated checkout for timers. Details:
+[deploy/README.md](../deploy/README.md).
+
 ## Wire agent runtimes (`minni wire`)
 
 Agents reach the daemon through the MCP plugin, which `minni wire <platform>`

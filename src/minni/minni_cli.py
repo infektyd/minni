@@ -9,6 +9,7 @@ Unix socket is.
     minni doctor    verify the install end to end (same probes as CI's smoke)
     minni wire      wire the plugin payload to an agent platform
     minni wire-adopt cut a platform's plugin surface over to the wire tree
+    minni sync      redeploy the plugin to every wired agent (keep hosts current)
     minni watch     live tail of memory activity (audit trail + daemon events)
     minni down      stop the daemon
 
@@ -259,6 +260,44 @@ def cmd_wire(args: argparse.Namespace) -> int:
     return run_wire(args)
 
 
+def cmd_sync(args: argparse.Namespace) -> int:
+    """Keep every Minni-serviced agent host on this install's plugin payload.
+
+    Product answer to "main/package moved but Claude/Codex/Grok still run last
+    week's server.js". See docs/install.md § Fleet sync and deploy/README.md.
+    """
+    from minni.fleet_sync import (
+        auto_sync_status,
+        install_auto_sync_agent,
+        run_fleet_sync,
+        uninstall_auto_sync_agent,
+    )
+
+    if getattr(args, "install_auto", False):
+        result = install_auto_sync_agent()
+    elif getattr(args, "uninstall_auto", False):
+        result = uninstall_auto_sync_agent()
+    elif getattr(args, "auto_status", False):
+        result = auto_sync_status()
+    else:
+        result = run_fleet_sync(
+            dry_run=bool(getattr(args, "dry_run", False)),
+            full=bool(getattr(args, "full", False)),
+            force_reinstall=not bool(getattr(args, "no_force", False)),
+            prune=not bool(getattr(args, "no_prune", False)),
+            restart_daemon=not bool(getattr(args, "no_restart", False)),
+            propagate_hosts=not bool(getattr(args, "wire_only", False)),
+        )
+
+    print(json.dumps(result.to_dict(), indent=2))
+    print(f"\n{result.message}")
+    if result.next_actions:
+        print("Next:")
+        for line in result.next_actions:
+            print(f"  - {line}")
+    return 0 if result.ok else 1
+
+
 def cmd_wire_adopt(args: argparse.Namespace) -> int:
     """One-time cutover of Claude Code's plugin surface onto the wire tree."""
     import json as _json
@@ -383,6 +422,24 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         print(f"  [PASS] models: all {len(EXPECTED_MODELS)} embedding/rerank "
               "models cached")
 
+    # 6. Fleet freshness (WARN): plugin/host lag is the #1 "I merged but agents
+    # still run old hooks" footgun. Never fail doctor on it — customers may be
+    # mid-session — but always name the product command that fixes it.
+    try:
+        from minni.minnid_runtime.deploy_honesty import deploy_status
+        deploy = deploy_status()
+        plugin = (deploy or {}).get("plugin_dist") or {}
+        if deploy.get("stale") is True or plugin.get("stale") is True:
+            reason = deploy.get("reason") or plugin.get("reason") or "deploy lag"
+            print(f"  [WARN] fleet: install is stale relative to this package/checkout")
+            print(f"         {reason}")
+            print("         Fix: minni sync          # redeploy plugin to all wired hosts")
+            print("              minni sync --full   # editable checkout: also git pull + rebuild")
+        else:
+            print("  [PASS] fleet: plugin/daemon not reporting deploy lag")
+    except Exception as exc:  # pragma: no cover — optional surface
+        print(f"  [WARN] fleet: could not read deploy status ({exc})")
+
     if failures:
         print(f"\n{failures} check(s) failed. If the daemon is not running, "
               "start it with: minni up")
@@ -437,6 +494,41 @@ def main(argv: list[str] | None = None) -> int:
     adopt.add_argument("--keep-legacy-cache", action="store_true",
                        help="leave ~/.claude/plugins/cache/minni in place")
 
+    sync = sub.add_parser(
+        "sync",
+        help="redeploy the Minni plugin to every wired agent host "
+             "(keep Claude/Codex/Grok/Kilo/Cursor current after upgrade or git pull)")
+    sync.add_argument(
+        "--full", action="store_true",
+        help="editable checkout only: fast-forward main + rebuild + fleet "
+             "redeploy (same as make sync-root / update_root.sh)")
+    sync.add_argument(
+        "--dry-run", action="store_true",
+        help="show the plan without writing configs or reinstalling")
+    sync.add_argument(
+        "--wire-only", action="store_true",
+        help="skip propagate-managed hosts (cursor/antigravity)")
+    sync.add_argument(
+        "--no-force", action="store_true",
+        help="do not pass --force-reinstall to wire (default: force, so "
+             "same-version rebuilds still land)")
+    sync.add_argument(
+        "--no-prune", action="store_true",
+        help="keep old ~/.minni/plugin version dirs")
+    sync.add_argument(
+        "--no-restart", action="store_true",
+        help="do not kickstart minnid after redeploy")
+    sync.add_argument(
+        "--install-auto", action="store_true",
+        help="macOS: install launchd timer that runs full checkout sync "
+             "every 6h (opt-in; refuses dirty trees)")
+    sync.add_argument(
+        "--uninstall-auto", action="store_true",
+        help="macOS: remove the com.minni.sync-root launchd agent")
+    sync.add_argument(
+        "--auto-status", action="store_true",
+        help="macOS: print whether com.minni.sync-root is loaded")
+
     watch = sub.add_parser(
         "watch",
         help="live tail of memory activity (audit trail + daemon events)")
@@ -468,7 +560,7 @@ def main(argv: list[str] | None = None) -> int:
 
     dispatch = {"up": cmd_up, "down": cmd_down,
                 "status": cmd_status, "doctor": cmd_doctor, "wire": cmd_wire,
-                "wire-adopt": cmd_wire_adopt, "watch": cmd_watch}
+                "wire-adopt": cmd_wire_adopt, "sync": cmd_sync, "watch": cmd_watch}
     return dispatch[args.command](args)
 
 
