@@ -49,13 +49,14 @@ See `docs/contracts/VAULT.md` Section 7 for the full privacy level definitions.
 
 ## 2. Redaction Rules
 
-The daemon applies **best-effort, label-oriented redaction** to envelopes that
-cross a process boundary (JSON-RPC responses, handoff packets, and any future
-network transport). This is an incomplete Medium control: it reduces accidental
-leakage of keyword-labelled secrets and some local paths; it is **not** a
+The daemon applies **best-effort redaction** to envelopes that cross a process
+boundary (JSON-RPC responses, handoff packets, and any future network
+transport). This is an incomplete Medium control: it reduces accidental leakage
+of keyword-labelled secrets (assignment + JSON-quoted forms), common bare
+provider token prefixes, and common local absolute paths; it is **not** a
 guarantee that every secret or absolute path is stripped. Residual gaps match
-`docs/contracts/THREAT_MODEL.md` ("JSON-quoted and bare high-entropy secrets
-often missed").
+`docs/contracts/THREAT_MODEL.md` (unknown-prefix high-entropy blobs;
+non-`/Users|/Volumes|/private|/home` path layouts).
 
 ### 2.1 Secret patterns (PARTIAL)
 
@@ -66,8 +67,9 @@ serialises results. Matching is case-insensitive and keyword-assignment shaped
 
 | Pattern class | Matched examples (implemented) | Known misses (not claimed) |
 |---------------|--------------------------------|----------------------------|
-| `api_key` / `password` / `secret` / `credential` / `private_key` | `api_key=sk-…`, `password: hunter2` | JSON-quoted `"api_key": "…"`, bare high-entropy tokens without a label |
-| `token` / `bearer` / `access_token` / `refresh_token` | `token=…`, `Bearer: …` | Bare `ghp_…` / `sk-…` with no keyword, JSON-quoted forms |
+| `api_key` / `password` / `secret` / `credential` / `private_key` | `api_key=sk-…`, `password: hunter2`, JSON `"api_key": "…"` | Other labels; quoted assignment `password="…"` (not unquoted charset, not JSON `:`) |
+| `token` / `bearer` / `access_token` / `refresh_token` | `token=…`, `Bearer: …`, JSON `"token": "…"` | — |
+| Bare provider prefixes | `sk-…` (≥16 trailing), `ghp_`/`gho_`/…, `github_pat_…`, `AKIA…`, `xox[baprs]-…` | Arbitrary high-entropy blobs with no known prefix |
 | PEM private keys | `-----BEGIN … PRIVATE KEY-----` blocks | — |
 
 Operators and agents MUST NOT treat redaction markers as proof that all secret
@@ -76,11 +78,12 @@ separate write-path control and does not expand this read-path redactor.
 
 ### 2.2 Local filesystem paths (PARTIAL)
 
-Path redaction currently covers macOS-style absolute layouts under `/Users`,
-`/Volumes`, and `/private`, rewritten to `[REDACTED_PATH]`. Other absolute
-layouts (including `/home/...` used by the Docker image) are **not** rewritten
-by the current patterns. Within the local installation, full paths are
-preserved for indexing and recall.
+Path redaction covers absolute layouts under `/Users`, `/Volumes`, `/private`,
+and `/home` (Docker/Linux), rewritten to `[REDACTED_PATH]`. Other absolute
+layouts (e.g. bare `/tmp/...`, Windows drive letters without a dedicated
+pattern) are **not** rewritten by the current patterns. Within the local
+installation, full paths are preserved for indexing and recall where redaction
+does not match.
 
 ### 2.3 Adapter and launchd filenames (PARTIAL)
 

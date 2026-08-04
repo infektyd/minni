@@ -177,7 +177,7 @@ evidence/citation never system/developer/user instruction.
 | Vector / learnings leakage | Private/blocked via semantic or learning search. | Retrieval filters `privacy_level`/`lifecycle`; FAISS post-filters via SQLite. | Missing privacy → `safe`; `handle_read` hardcodes safe meta; `search_learnings` has no privacy dimension; frontmatter `page_type`/`agent` substring cross-share. |
 | Console / Deep Research | Local browser or process drives privileged actions; vault→cloud. | Loopback bind, Host/Origin/Sec-Fetch, bearer by default; Deep Research opt-in. | Token-in-URL leak; `/api/health` unauth; `NO_AUTH=1`; Deep Research egress/exec when enabled. |
 | Plugin-local vault writes | Durable notes without daemon gate. | Schema-pinned vault path (SEC-003/G12). | `gate.shared` attribution only; proceeds when daemon down. |
-| Secret redaction gaps | Tokens leave process in audit/status/ping/DR output. | Label-oriented redaction (`key: value`, PEM). | JSON-quoted and bare high-entropy secrets often missed — incomplete Medium control. |
+| Secret redaction gaps | Tokens leave process in audit/status/ping/DR output. | Label-oriented + common bare prefixes (`sk-`, `ghp_`, `github_pat_`, `AKIA`, Slack `xox*`) + PEM + common absolute paths. | Unknown-prefix high-entropy blobs still missed — incomplete Medium control. |
 
 **Daemon IPC / identity — residual stories to test:** same-uid peer via mediated
 APIs; cross-uid if chmod fails; HTTP enabled; zero-config wildcard main;
