@@ -302,3 +302,85 @@ test("X10: auditReport omits the full 'latest' entry by default (automatic path)
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("X10: buildStatusReport audit.latest is headline-only (no body paths)", async () => {
+  const { buildStatusReport } = await import("../dist/sovereign.js");
+  const root = await mkdtemp(path.join(tmpdir(), "slice-g-x10-status-"));
+  try {
+    await ensureVault(root);
+    await recordAudit(root, {
+      tool: "minni_learn",
+      summary: "sensitive summary with secret path",
+      details: { path: "/Users/secret/op/.minni/auth.json", error: "stack trace here" },
+    });
+    const status = await buildStatusReport({ vaultPath: root });
+    const latest = status.audit?.latest;
+    assert.ok(typeof latest === "string" && latest.length > 0, "status exposes a latest headline");
+    assert.ok(!latest.includes("\n"), "latest must be a single line");
+    assert.ok(
+      !latest.includes("/Users/secret") && !latest.includes("auth.json"),
+      "latest must not contain detail paths",
+    );
+    assert.ok(
+      !latest.includes("stack trace") && !latest.includes("```"),
+      "latest must not contain details body",
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("X10: status.audit.entries is a real count (not 0|1 from limit=1)", async () => {
+  const { buildStatusReport } = await import("../dist/sovereign.js");
+  const root = await mkdtemp(path.join(tmpdir(), "slice-g-x10-count-"));
+  try {
+    await ensureVault(root);
+    for (const i of [1, 2, 3]) {
+      await recordAudit(root, {
+        tool: `minni_tool_${i}`,
+        summary: `entry ${i}`,
+        details: { n: i },
+      });
+    }
+    const status = await buildStatusReport({ vaultPath: root });
+    assert.equal(status.audit.entries, 3, "entries must count all ## headers in active log");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("X10: statusAndAudit details are scalar allowlist only", async () => {
+  const { statusAndAudit } = await import("../dist/sovereign.js");
+  const { auditTail } = await import("../dist/vault.js");
+  const root = await mkdtemp(path.join(tmpdir(), "slice-g-x10-saudit-"));
+  try {
+    await ensureVault(root);
+    await recordAudit(root, {
+      tool: "minni_learn",
+      summary: "seed with path",
+      details: { path: "/Users/secret/seed-path.json" },
+    });
+    await statusAndAudit(root);
+    const tail = await auditTail(root, 5);
+    const last = tail.entries.at(-1) ?? "";
+    assert.ok(last.includes("minni_status"), "statusAndAudit writes a minni_status audit row");
+    // Details are fenced JSON after the header; parse the last fenced block.
+    const m = last.match(/```json\n([\s\S]*?)\n```/);
+    assert.ok(m, "status audit should include a details json block");
+    const details = JSON.parse(m[1]);
+    const allowed = new Set([
+      "socket_ok",
+      "afm_ok",
+      "audit_entries",
+      "audit_volume",
+      "audit_latest_headline",
+    ]);
+    for (const key of Object.keys(details)) {
+      assert.ok(allowed.has(key), `unexpected details key: ${key}`);
+    }
+    assert.ok(!("vault" in details) && !("path" in details));
+    assert.ok(!JSON.stringify(details).includes("/Users/secret/seed-path.json"));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});

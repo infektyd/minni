@@ -1300,11 +1300,11 @@ export async function auditReport(
     tools,
     recentSummaries: recentSummaries.slice(-10),
   };
-  // X10: the audit-report intent routes automaticAllowed:true, so the default
-  // path must be aggregate-only. The `latest` field is the full markdown audit
-  // entry (paths, metadata, error strings) and only ships when a caller
-  // explicitly opts in (a confirmed / operator path), never on the automatic
-  // path.
+  // X10: default auditReport is aggregate-only. The `latest` field is the full
+  // markdown audit entry (paths, metadata, error strings) and only ships when a
+  // caller explicitly opts in via includeLatest (operator/confirmed path).
+  // Note: automatic audit *intent* in policy maps to minni_audit_tail (full
+  // bodies by design for that tool), not minni_audit_report.
   if (options.includeLatest) {
     report.latest = tail.entries.at(-1);
   }
