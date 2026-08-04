@@ -106,6 +106,13 @@ jobs:
         with:
           ref: ${{ steps.target.outputs.ref }}
           fetch-depth: 0
+          # See grok-review.yml for the full rationale. Short version: without
+          # this, checkout leaves the installation token in .git/config as an
+          # http extraheader, and the agent that reads this tree has its reply
+          # posted publicly. Nothing downstream needs the persisted credential
+          # — `gh` authenticates from env, and the trust-ref fetch below is
+          # anonymous because the repo is public.
+          persist-credentials: false
 
       - name: Install sandbox prerequisites
         run: |
@@ -257,9 +264,9 @@ jobs:
         run: |
           NUM="${{ github.event.issue.number || github.event.pull_request.number }}"
           {
-            cat /tmp/grok-reply.md
+            /usr/bin/cat /tmp/grok-reply.md
             echo
             echo "---"
             echo "_Grok Build (headless) via \`grok --single\` · [workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})_"
           } > /tmp/grok-comment.md
-          gh issue comment "$NUM" --repo "${{ github.repository }}" --body-file /tmp/grok-comment.md
+          /usr/bin/gh issue comment "$NUM" --repo "${{ github.repository }}" --body-file /tmp/grok-comment.md

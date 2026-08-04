@@ -197,6 +197,22 @@ def test_ci_paths_are_denied(mod, path):
     assert mod.path_denied(path) is True
 
 
+@pytest.mark.parametrize(
+    "path",
+    [
+        ".grok/sandbox.toml",
+        ".grok/workflows/gap-audit.rhai",
+        ".grok/AGENTS.md",
+    ],
+)
+def test_reviewer_agent_config_is_denied(mod, path):
+    """.grok/ is the reviewing agent's own config surface AND executable —
+    grok-review.yml writes its sandbox profile to $HOME specifically so a PR
+    cannot supply .grok/sandbox.toml. A PR that changes what the reviewer runs
+    must not be able to earn a green check from that reviewer's own APPROVE."""
+    assert mod.path_denied(path) is True
+
+
 @pytest.mark.parametrize("path", ["src/minni/cli.py", "docs/ops/grok-reviewer-app.md"])
 def test_ordinary_paths_are_not_denied(mod, path):
     assert mod.path_denied(path) is False

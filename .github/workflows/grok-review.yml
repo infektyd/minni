@@ -157,6 +157,19 @@ jobs:
         with:
           ref: ${{ steps.resolve.outputs.sha }}
           fetch-depth: 0
+          # LOAD-BEARING, same threat model as the sandbox profile above. By
+          # default checkout persists the installation token into .git/config
+          # as an http.<url>.extraheader ("AUTHORIZATION: basic
+          # base64(x-access-token:ghs_...)"), and this job then hands the
+          # checkout to an agent that (measured, see `Configure the sandbox
+          # profile`) can read any file it likes and whose reply is posted
+          # publicly. Egress is blocked, but the reply itself is the exit —
+          # so the token must not be on disk at all. Nothing here needs it:
+          # every `gh` call authenticates from its own env, and the
+          # trust-ref `git fetch` below is anonymous over HTTPS because the
+          # repo is public. If this repo is ever made private, that fetch is
+          # what breaks first.
+          persist-credentials: false
 
       - name: Install sandbox prerequisites
         if: steps.resolve.outputs.skip == 'false'
@@ -425,6 +438,12 @@ jobs:
           # Pin /usr/bin/sed: after Install Grok Build CLI prepends
           # $HOME/.grok/bin to PATH, a planted sed could no-op the defang and
           # leave a bare eligibility marker into the posted review body.
+          # Every other command below is pinned for the same reason and not as
+          # tidiness: a planted `cat` re-inserts the marker after the defang, a
+          # planted `jq` rewrites commit_id or event, and a planted `gh`
+          # submits a body nobody assembled. The workflow test asserts that no
+          # bare command name survives in this step, so a new one cannot creep
+          # back in unpinned the way cat/jq/gh did.
           /usr/bin/sed -i 's/grok-mechanical-eligibility/grok-mechanical-eligibility(quoted)/g' \
             /tmp/grok-reply.md
           {
@@ -432,7 +451,7 @@ jobs:
             echo
             echo "_${NOTE}_"
             echo
-            cat /tmp/grok-reply.md
+            /usr/bin/cat /tmp/grok-reply.md
             echo
             if [ "$RAW" = APPROVE ]; then
               echo "<!-- grok-mechanical-eligibility: APPROVE -->"
@@ -452,10 +471,10 @@ jobs:
             # during the review (up to 20 minutes) would bind this review, and
             # its eligibility marker, to code the model never saw. That reopens
             # the SHA-binding the gate depends on, through the submission path.
-            LIVE="$(gh api "repos/${{ github.repository }}/pulls/${NUM}" --jq .head.sha)"
+            LIVE="$(/usr/bin/gh api "repos/${{ github.repository }}/pulls/${NUM}" --jq .head.sha)"
             if [ "$LIVE" != "$SHA" ]; then
               echo "::warning::head moved ${SHA} -> ${LIVE}; refusing to submit."
-              gh pr comment "$NUM" --repo "${{ github.repository }}" --body \
+              /usr/bin/gh pr comment "$NUM" --repo "${{ github.repository }}" --body \
                 "Grok reviewed \`${SHA}\` but the head is now \`${LIVE}\`. No review was submitted, because it would have been recorded against code the model never saw. Comment \`/grok-review\` to review the new head."
               exit 0
             fi
@@ -465,13 +484,13 @@ jobs:
               # APPROVE raw → still COMMENT (eligibility marker in body).
               *)               REVIEW_EVENT=COMMENT ;;
             esac
-            jq -n --arg c "$SHA" --arg e "$REVIEW_EVENT" \
+            /usr/bin/jq -n --arg c "$SHA" --arg e "$REVIEW_EVENT" \
               --rawfile b /tmp/grok-comment.md \
               '{commit_id: $c, event: $e, body: $b}' > /tmp/review.json
-            gh api -X POST "repos/${{ github.repository }}/pulls/${NUM}/reviews" \
+            /usr/bin/gh api -X POST "repos/${{ github.repository }}/pulls/${NUM}/reviews" \
               --input /tmp/review.json --silent
           else
             echo "::notice::vars.GROK_APP_ID unset — falling back to PR comment via GITHUB_TOKEN (no formal review event)."
-            gh pr comment "$NUM" \
+            /usr/bin/gh pr comment "$NUM" \
               --repo "${{ github.repository }}" --body-file /tmp/grok-comment.md
           fi

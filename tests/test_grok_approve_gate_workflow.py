@@ -6,6 +6,7 @@ see, and each one corresponds to a defect that minted a false success.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -129,6 +130,165 @@ def test_review_workflow_defangs_the_marker_before_embedding_the_reply(review):
     defang = run.index("/usr/bin/sed -i 's/grok-mechanical-eligibility")
     stamp = run.index('echo "<!-- grok-mechanical-eligibility: APPROVE -->"')
     assert defang < stamp, "defang must run before the workflow stamps its own marker"
+
+
+# Words bash resolves itself — builtins, keywords, and reserved punctuation.
+# None of them go through PATH, so a planted binary cannot intercept them and
+# they need no absolute path.
+_SHELL_WORDS = frozenset({
+    "!", ":", ".", "[", "[[", "]]", "break", "case", "cd", "continue", "do",
+    "done", "echo", "elif", "else", "esac", "eval", "exec", "exit", "export",
+    "false", "fi", "for", "function", "getopts", "if", "in", "local",
+    "printf", "pwd", "read", "readonly", "return", "set", "shift", "source",
+    "test", "then", "time", "trap", "true", "type", "umask", "unset",
+    "until", "wait", "while", "{", "}",
+})
+
+_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\[[^]]*\])?\+?=")
+_CASE_LABEL = re.compile(r"^(\s*)\(?[^\s()]*\)(\s)")
+
+
+def _command_heads(script: str) -> list[str]:
+    """Every word bash would resolve as a command in `script`.
+
+    Quote-aware, and it descends into `$(...)`: a planted PATH binary
+    intercepts a command substitution exactly as it intercepts a pipeline
+    segment, so both have to be walked. `case` labels (`APPROVE)`) are
+    stripped first — they are patterns, not commands.
+    """
+    lines, in_case = [], False
+    for line in script.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("case "):
+            in_case = True
+        elif stripped == "esac":
+            in_case = False
+        lines.append(_CASE_LABEL.sub(r"\1\2", line) if in_case else line)
+    script = "\n".join(lines)
+
+    heads: list[str] = []
+    buf: list[str] = []
+    stack: list[str] = []          # quote mode to restore when $(...) closes
+    mode = "normal"
+    pending = True                 # the next word is a command head
+    skip_word = False              # ...unless it is a redirect target
+    prev = "\n"
+    i = 0
+    while i < len(script):
+        char = script[i]
+        if mode == "normal" and char == "#" and prev in " \t\n;|&()":
+            while i < len(script) and script[i] != "\n":
+                i += 1
+            continue
+        prev = char
+        if mode == "single":
+            if char == "'":
+                mode = "normal"
+            i += 1
+            continue
+        if char == "\\":
+            i += 2
+            continue
+        if char == "$" and script[i + 1:i + 2] == "(":
+            if buf:
+                heads.append("".join(buf))
+                buf = []
+            stack.append(mode)
+            mode, pending, skip_word = "normal", True, False
+            i += 2
+            continue
+        if mode == "double":
+            if char == '"':
+                mode = "normal"
+            elif pending and not skip_word:
+                buf.append(char)
+            i += 1
+            continue
+        if char in "'\"":
+            mode = "single" if char == "'" else "double"
+            i += 1
+            continue
+        if char == ")" and stack:
+            mode = stack.pop()
+            if buf:
+                heads.append("".join(buf))
+                buf = []
+            pending, skip_word = False, False
+            i += 1
+            continue
+        if char in "|&;\n()`{}":
+            if buf:
+                heads.append("".join(buf))
+                buf = []
+            pending, skip_word = True, False
+            i += 1
+            continue
+        if char in "<>":
+            if buf:
+                heads.append("".join(buf))
+                buf = []
+            skip_word = True           # the next word names a file
+            i += 1
+            continue
+        if char in " \t":
+            if buf:
+                heads.append("".join(buf))
+                buf = []
+                pending = False
+            elif skip_word:
+                skip_word = False
+            i += 1
+            continue
+        if pending and not skip_word:
+            buf.append(char)
+        i += 1
+    if buf:
+        heads.append("".join(buf))
+    return heads
+
+
+def _unpinned_commands(script: str) -> list[str]:
+    """Command heads that bash would look up on PATH rather than run by path."""
+    bare = []
+    for head in _command_heads(script):
+        if not head or head in _SHELL_WORDS:
+            continue
+        if head.startswith(("/", "$", "-", "\"", "'")):
+            continue
+        if _ASSIGNMENT.match(head):
+            continue
+        bare.append(head)
+    return bare
+
+
+# Steps that decide whether a reply is safe, or that put it on the PR. A
+# command shadowed here rewrites the verdict or the posted body; anywhere else
+# in these workflows it cannot.
+TRUST_STEPS = {
+    "grok-review.yml": ("Fail closed on credential leakage", "Post review"),
+    "grok.yml": ("Fail closed on credential leakage", "Post reply"),
+}
+
+
+def test_trust_steps_run_no_unpinned_command(review):
+    """#263's own threat model (grok-review.yml:425-427) is that `Install Grok
+    Build CLI` prepends $HOME/.grok/bin to PATH, so ANY bare command in a
+    trust-relevant step is a shadowing target — not just the three this test
+    used to enumerate. Enumeration certified an incomplete state as complete:
+    git/python3/sed were pinned while cat/jq/gh next to them were not."""
+    jobs = {
+        "grok-review.yml": review["jobs"]["grok-review"],
+        "grok.yml": _load(ROOT / ".github" / "workflows" / "grok.yml")["jobs"]["grok"],
+    }
+    for name, step_names in TRUST_STEPS.items():
+        steps = jobs[name]["steps"]
+        for step_name in step_names:
+            step = next(s for s in steps if s.get("name") == step_name)
+            bare = _unpinned_commands(step["run"])
+            assert not bare, (
+                f"{name}::{step_name} resolves {sorted(set(bare))} on PATH; "
+                "pin the absolute path (/usr/bin/...) as git/python3/sed already are"
+            )
 
 
 def test_leak_gate_steps_pin_path_binaries_and_pipe_isolated(review):

@@ -69,6 +69,12 @@ GATHER_ROUNDS = 3
 # it can weaken a required check the gate trusts, or post as github-actions[bot].
 PATH_DENY_PREFIXES = (
     ".github/",
+    # The reviewing agent's own configuration surface, and executable: #272
+    # landed 472 lines of agent-orchestration workflow here with capability
+    # mode "all". grok-review.yml deliberately writes its sandbox profile to
+    # $HOME precisely so a PR cannot supply .grok/sandbox.toml — denying the
+    # directory is the same reasoning applied to everything else under it.
+    ".grok/",
     # The gate's own tripwires. Not under .github/, so without these a PR could
     # delete the tests that pin every invariant above and still go green.
     "tests/test_grok_approve_gate.py",

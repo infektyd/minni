@@ -30,6 +30,19 @@ FAKE_TOKEN = (
 )
 FAKE_REFRESH = "FAKEREFRESHTOKENfortestingonly1234567890abcdefGHIJ"
 
+# GitHub-shaped fakes for the shape checks. Assembled from pieces on purpose:
+# spelled out as one literal these would match the gate's own patterns, so a
+# Grok review that quoted this file would be blocked from posting — the exact
+# false positive the module docstring warns about.
+FAKE_GHS = "ghs" + "_" + "FAKEinstallationtokenFORTESTS0123456"
+FAKE_GHP = "ghp" + "_" + "FAKEclassicpersonalaccesstokenFORTESTS01"
+FAKE_PAT = "github" + "_pat_" + "FAKEfinegrainedpersonalaccesstokenFORTESTSonly0123456789"
+# What actions/checkout writes into .git/config when persist-credentials is
+# left at its default: http.<url>.extraheader = "AUTHORIZATION: basic <b64>".
+FAKE_EXTRAHEADER = base64.b64encode(
+    f"x-access-token:{FAKE_GHS}".encode()
+).decode()
+
 
 @pytest.fixture
 def auth_file(tmp_path: Path) -> Path:
@@ -91,6 +104,37 @@ def test_jwt_shape_is_caught_without_any_auth_file(tmp_path):
     assert check(tmp_path, None, f"token: {jwt}") == 1
 
 
+# ── GitHub credentials: shaped, and never present in auth.json ─────────────
+# The value check cannot see these at all. Until persist-credentials: false
+# landed, actions/checkout left an installation token in .git/config of the
+# very checkout this agent reads, and the reply is posted publicly.
+
+
+@pytest.mark.parametrize("token", [FAKE_GHS, FAKE_GHP, FAKE_PAT])
+def test_github_token_shapes_are_caught_without_any_auth_file(tmp_path, token):
+    assert check(tmp_path, None, f"found in .git/config: {token}") == 1
+
+
+def test_base64_git_extraheader_is_caught(tmp_path):
+    """The live exfil path: paste the extraheader verbatim and every plaintext
+    pattern misses, because the token only exists inside the base64."""
+    reply = f"the config has AUTHORIZATION: basic {FAKE_EXTRAHEADER} in it"
+    assert check(tmp_path, None, reply) == 1
+
+
+def test_unaligned_base64_extraheader_is_caught(tmp_path):
+    """Quoting only part of the blob starts mid-quantum; an aligned-only
+    decode would read that as noise and pass it."""
+    assert check(tmp_path, None, f"partial: {FAKE_EXTRAHEADER[2:]}") == 1
+
+
+def test_base64url_extraheader_is_caught(tmp_path):
+    encoded = base64.urlsafe_b64encode(
+        f"x-access-token:{FAKE_GHS}".encode()
+    ).decode().rstrip("=")
+    assert check(tmp_path, None, f"b64url: {encoded}") == 1
+
+
 # ── clean: each of these must PASS ─────────────────────────────────────────
 
 def test_security_review_prose_passes(tmp_path, auth_file):
@@ -100,6 +144,31 @@ def test_security_review_prose_passes(tmp_path, auth_file):
         "needs changes — an injection could `cat auth.json` and dump the "
         'refresh_token into the reply; principal_id and "key": are readable. '
         "Fix: restrict_network plus a scan before posting. A JWT starts eyJ."
+    )
+    assert check(tmp_path, auth_file, reply) == 0
+
+
+def test_prose_about_the_extraheader_passes(tmp_path, auth_file):
+    """A review OF the persist-credentials fix names every string the gate
+    looks for. `x-access-token:` is matched only after base64-decoding for
+    exactly this reason — in plaintext it is vocabulary, not a credential."""
+    reply = (
+        "checkout persists the token as http.<url>.extraheader = "
+        "'AUTHORIZATION: basic base64(x-access-token:<token>)'. Installation "
+        "tokens use the ghs_ prefix, classic PATs ghp_, fine-grained "
+        "github_pat_. Setting persist-credentials: false drops all of it."
+    )
+    assert check(tmp_path, auth_file, reply) == 0
+
+
+def test_ordinary_base64_and_hashes_do_not_trip_the_decode_pass(tmp_path, auth_file):
+    """The decode pass rescans every base64-looking run, and reviews are full
+    of them — digests, lockfile hashes, embedded assets. Decoded noise must
+    not read as a credential or the gate becomes unusable."""
+    reply = (
+        "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08 "
+        "and integrity sha512-Gh1sVRVWnBFm9j8YQ9uYd0dCqtE0PJc7fSm0LmnAaZ0h "
+        "plus data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ"
     )
     assert check(tmp_path, auth_file, reply) == 0
 
