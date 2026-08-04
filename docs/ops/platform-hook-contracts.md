@@ -1,10 +1,10 @@
-# Platform hook contracts (product)
+# Platform hook contracts
 
 Minni is multi-host memory. Operator docs and
 [hook-platforms.md](../contracts/hook-platforms.md) advertise **which hosts
 can deny PreToolUse and whether Minni’s s6 cold-tool guard is live**.
 
-That is a **product contract**, not aspirational prose:
+That matrix is a **contract**, not aspirational prose:
 
 | Host | Contract (summary) | Implementation surface |
 |------|--------------------|-------------------------|
@@ -15,7 +15,7 @@ That is a **product contract**, not aspirational prose:
 | agy / Antigravity | Deny broad; guard live | `gemini-adapter.ts` |
 | Kilo | Deny broad; guard live | Bridge plugin |
 
-## Product rule
+## Rule
 
 If the matrix says **guard live** for a host, shipping without a working
 adapter is a **defect**, not a docs problem. Prefer **`implement_now`** (code
@@ -37,5 +37,5 @@ Then restart agent apps so they reload `server.js` / hook entrypoints.
 ## Related
 
 - Truth policy (honesty vs goals): [docs-truth-policy.md](docs-truth-policy.md)
-- Fleet update product: `minni sync` / [install.md](../install.md)
+- Fleet update: `minni sync` / [install.md](../install.md)
 - Grok App (personal CI gate): [grok-reviewer-app.md](grok-reviewer-app.md)

@@ -10,10 +10,9 @@ the versions in the table below, using each vendor's published docs plus the
 locally installed CLI. **Re-verify on upgrade: no vendor publishes a hook
 deprecation policy or changelog.**
 
-**Product framing:** when the matrix says a host has a live s6 cold-tool guard,
-shipping without a working adapter is a **defect** — fix code, do not cut the
-row. Operator summary and fleet redeploy: [platform-hook-contracts.md](../ops/platform-hook-contracts.md)
-(same product class as `minni sync` for install freshness).
+When the matrix says a host has a live s6 cold-tool guard, shipping without a
+working adapter is a **defect** — fix code, do not cut the row. Operator
+summary and fleet redeploy: [platform-hook-contracts.md](../ops/platform-hook-contracts.md).
 
 ## Rule
 

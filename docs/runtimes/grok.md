@@ -25,14 +25,12 @@ Like every wired runtime, Grok shares the daemon's memory pool under its own
 agent identity — recall is shared (scope-governed), durable writes go through
 the propose→approve gate, and cross-agent work moves via handoffs.
 
-## PreToolUse product (s6 cold-tool guard)
+## PreToolUse (s6 cold-tool guard)
 
-Customer problem: docs said Grok could deny cold-file tools, but the hook used
-bare Claude-shaped I/O. Grok speaks camelCase (`toolName` / `toolInput`), native
-tool names (`read_file`, `list_dir`, `grep`, `run_terminal_command`), and
+Docs said Grok could deny cold-file tools, but the hook used bare Claude-shaped
+I/O. Grok speaks camelCase (`toolName` / `toolInput`), native tool names
+(`read_file`, `list_dir`, `grep`, `run_terminal_command`), and
 `{decision, reason?}` stdout — so the shared guard never saw tools in scope.
-
-**Product surface** (same class as `minni sync` for fleet freshness):
 
 | Piece | Role |
 |-------|------|
