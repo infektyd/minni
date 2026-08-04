@@ -62,13 +62,15 @@ non-`/Users|/Volumes|/private|/home` path layouts).
 
 `src/minni/minnid_runtime/redaction.py` rewrites matched forms to
 `keyword=[REDACTED]` (or `[REDACTED]` for PEM blocks) before the daemon
-serialises results. Matching is case-insensitive and keyword-assignment shaped
-(`keyword` + `:`/`=` + unquoted value charset `[^\s,;<>"']+`).
+serialises results. Matching is case-insensitive and covers assignment forms
+(`keyword` + `:`/`=` + unquoted value charset `[^\s,;<>"']+`), JSON-quoted
+`"key": "…"` labels, bare known provider prefixes (length floors apply), and
+PEM blocks. Residuals remain PARTIAL — see the known-miss column.
 
 | Pattern class | Matched examples (implemented) | Known misses (not claimed) |
 |---------------|--------------------------------|----------------------------|
 | `api_key` / `password` / `secret` / `credential` / `private_key` | `api_key=sk-…`, `password: hunter2`, JSON `"api_key": "…"` | Other labels; quoted assignment `password="…"` (not unquoted charset, not JSON `:`) |
-| `token` / `bearer` / `access_token` / `refresh_token` | `token=…`, `Bearer: …`, JSON `"token": "…"` | — |
+| `token` / `bearer` / `access_token` / `refresh_token` | `token=…`, `Bearer: …`, JSON `"token": "…"` | Quoted assignment `token="…"` (same miss as password row) |
 | Bare provider prefixes | `sk-…` (≥16 trailing), `ghp_`/`gho_`/…, `github_pat_…`, `AKIA…`, `xox[baprs]-…` | Arbitrary high-entropy blobs with no known prefix |
 | PEM private keys | `-----BEGIN … PRIVATE KEY-----` blocks | — |
 
@@ -87,13 +89,13 @@ does not match.
 
 ### 2.3 Adapter and launchd filenames (PARTIAL)
 
-Path-shaped socket or file locations under the macOS layouts in §2.2
-(`/Users`, `/Volumes`, `/private`) may be rewritten to `[REDACTED_PATH]` by
-`redaction.py`. Bare infrastructure names — launchd plist basenames
-(e.g. `com.minni.minnid.plist`), bare socket filenames (e.g. `minnid.sock`),
-and non-macOS path forms (e.g. `path=/tmp/minni.db`) — are **not** rewritten
-by the current redactor. This clause does not claim a fingerprinting shield
-for bare adapter/plist/socket names.
+Path-shaped socket or file locations under the layouts in §2.2
+(`/Users`, `/Volumes`, `/private`, `/home`) may be rewritten to
+`[REDACTED_PATH]` by `redaction.py`. Bare infrastructure names — launchd plist
+basenames (e.g. `com.minni.minnid.plist`), bare socket filenames
+(e.g. `minnid.sock`), and path forms outside §2.2 (e.g. `path=/tmp/minni.db`)
+— are **not** rewritten by the current redactor. This clause does not claim a
+fingerprinting shield for bare adapter/plist/socket names.
 
 ### 2.4 `blocked` privacy level
 

@@ -1153,9 +1153,9 @@ export async function buildStatusReport(input?: {
     networkDeadline === undefined ? undefined : Math.max(0, networkDeadline - Date.now());
   const vaultPath = input?.vaultPath ?? DEFAULT_VAULT_PATH;
   await ensureVault(vaultPath);
-  // Latest headline from limit=1; entry *count* needs the full active log file
-  // (not tail.entries.length of a one-entry window — that was a 0|1 lie).
-  const latestTail = await auditTail(vaultPath, 1);
+  // One wide tail: entry *count* needs more than limit=1 (that was a 0|1 lie),
+  // and auditTail already readFile+splits the whole active log — don't pay it
+  // twice on this hot path. Headline comes from the last entry in the same window.
   const countedTail = await auditTail(vaultPath, 10_000);
 
   // Fetch the daemon socket status BEFORE computing our own AFM verdict: when
@@ -1343,7 +1343,7 @@ export async function buildStatusReport(input?: {
       // X10: never return the full last audit body on status (paths/metadata
       // in free-form markdown). Headline line only — same posture as hooks.
       latest: (() => {
-        const last = latestTail.entries.at(-1);
+        const last = countedTail.entries.at(-1);
         if (!last) return undefined;
         const headline = last.split("\n")[0]?.trim() ?? "";
         return headline.length > 0 ? headline : undefined;
