@@ -584,3 +584,88 @@ human attention on gate/workflow changes.
 - The gate also re-runs on `pull_request_review`, so a `REQUEST_CHANGES`
   submitted *after* the check went green revokes it. Without that trigger the
   veto would be advisory only: bot reviews do not move `reviewDecision` here.
+
+## Personal operator playbook (friction from live use)
+
+This App is **personal tooling for this repo**, not a published product.
+The notes below are measured friction from multi-PR agent campaigns (2026-08,
+especially #271). Use them so agents and humans stop thrashing the gate.
+
+### Re-earn `/grok-review` (read this before scripting agents)
+
+1. **Body must be exactly** `/grok-review` after trim (no markdown heading, no
+   trailing prose). Job `if` uses `startsWith`; Resolve step uses **exact**
+   equality — multi-line “re-request” comments **skip** and still look like
+   success in the UI.
+2. **One re-request owner per PR.** `concurrency` is
+   `grok-review-${PR}` with `cancel-in-progress: true`. Dual shepherd +
+   orchestrator comments cancel each other.
+3. **Freeze the tip** before the command. Eligibility is tip-bound (invariant
+   9). Push after APPROVE/ELIG → stamp dead; you pay another metered review.
+4. **Same SHA is not re-billed** (including dismissed reviews on that SHA).
+   Need a real code change (or accept dismiss is not a free re-roll).
+5. **`issue_comment` runs from `main`.** Actions UI often shows
+   `headBranch=main` / default-branch `headSha` even when the job reviewed the
+   PR tip. Trust the formal review’s `commit_id`, not the run list SHA, for
+   “what was reviewed.”
+6. **CI max-turns for the App path is 60** (workflow pin; not the retired
+   local `--max-turns 30` path in [grok-local-path-retired.md](grok-local-path-retired.md)).
+
+### Why `reviewDecision` still says REVIEW_REQUIRED
+
+App `APPROVE` does not count (settled above). Green path is:
+
+- App review body with `<!-- grok-mechanical-eligibility: APPROVE -->` on
+  **current head**, plus
+- `grok-mechanical-approve` **success**, plus
+- other required CI green.
+
+`gh pr view … reviewDecision` lagging on `REVIEW_REQUIRED` while the App
+posted ELIG is **normal** until the mechanical check and/or relay APPROVE
+land. Do not re-fire `/grok-review` just to “fix” reviewDecision.
+
+### PATH_DENY → mechanical stays red (use admin consciously)
+
+`PATH_DENY_PREFIXES` includes `.github/`, gate tests, **and** `pyproject.toml`
+/ pytest root configs (so collection config cannot silence tripwires).
+
+**Implication:** a PR that only *stamps* `pyproject.toml` for a release
+(e.g. 0.4.1 → 0.4.2) can be App-ELIG + Public CI green and still have
+`grok-mechanical-approve` **failure by design**. That is not a flaky gate.
+
+Personal rule:
+
+- Prefer **split** release-stamp PR vs large docs/code PR when possible.
+- When a stamp stack is intentional and App+CI are green: **`gh pr merge
+  --admin --squash`** is the honest path — not dismiss thrash or another
+  metered review.
+- Agent policy elsewhere: never self-admin unless the operator said so.
+
+### Campaign hygiene (reduces App bills)
+
+| Do | Don’t |
+|----|--------|
+| Local Cassandra / `docs-accuracy-converge` **before** first App review | Use App as the first accuracy pass |
+| One worktree owner for the PR tip | Parallel fixers on the same branch + dual `/grok-review` |
+| Fix Highs in one tip freeze window | Push every residual and re-earn each time (whack-a-mole) |
+| Trust `commit_id` on the formal review | Trust Actions `headSha` on `issue_comment` runs |
+
+Optional local friction sampler (not productized): session notes under
+`scratchpad/friction/` when dogfooding campaigns.
+
+### Assumptions that became (or become) next PR goals
+
+Docs-accuracy work treats **code / live behavior as truth** and rewrites
+docs that lie. When a doc describes a **product must** that code almost has
+but does not, that is a **code PR goal**, not a doc edit:
+
+| Assumption / claim | Direction | Status / next |
+|---|---|---|
+| Multi-host PreToolUse deny (incl. Grok file-backed guard) | code may need adapter work | `wright/dm-grok-adapter` (local) — open PR when ready |
+| `minni doctor` does wire verify probes | docs were wrong | fixed in accuracy docs; keep doctor scoped |
+| Fleet hosts track package/main automatically | product gap | **`minni sync`** (this PR #273) |
+| Stamp set includes marketplace + pyproject | release hygiene | stamp checklist; marketplace in 0.4.2 |
+| Grok App cheaper re-earn / clearer PATH_DENY text | personal App polish | optional later (O3/O5/O6 in friction log) |
+
+Do **not** “fix” overclaims by implementing scope creep in the accuracy
+PR itself unless the operator wants that High fixed as code.
