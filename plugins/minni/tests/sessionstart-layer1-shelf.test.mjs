@@ -21,7 +21,7 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
 import { createHookHandlers } from "../dist/hook-handlers.js";
-import { LAYER1_SHELF_MAX_BYTES } from "../dist/vault.js";
+import { LAYER1_SHELF_MAX_BYTES, readLayer1Shelf } from "../dist/vault.js";
 
 const execFileAsync = promisify(execFile);
 const PLUGIN_ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -229,6 +229,65 @@ test(
     } finally {
       await rm(fixture.root, { recursive: true, force: true });
     }
+  },
+);
+
+// ---------------------------------------------------------------------------
+// Bugbot finding on PR #282: truncated/omitted_bytes must derive from the
+// READ itself, never a pre-read fstat — a stale size (file grown or shrunk
+// between stat and read) previously produced either silently-incomplete
+// content with truncated:false (the exact H5 failure this field exists to
+// prevent) or a false truncated:true with a wrong omitted_bytes. The fixed
+// readLayer1Shelf probes LAYER1_SHELF_MAX_BYTES + 1 bytes and derives
+// `truncated` from bytesRead alone. These pin the boundary exactly: a file
+// sized precisely AT the cap must read whole, and one byte past it must
+// truncate — the two cases a pre-read-stat implementation could get right
+// by accident but a bytesRead-off-by-one would get wrong.
+// ---------------------------------------------------------------------------
+
+test(
+  "layer1_shelf boundary: a core.md sized EXACTLY at the cap is not truncated",
+  { timeout: 30_000 },
+  async (t) => {
+    const root = await mkdtemp(path.join(tmpdir(), "sm-layer1-shelf-boundary-exact-"));
+    const vault = path.join(root, "vault");
+    await mkdir(path.join(vault, "layer1"), { recursive: true });
+    t.after(() => rm(root, { recursive: true, force: true }));
+
+    const exact = "y".repeat(LAYER1_SHELF_MAX_BYTES);
+    await writeFile(path.join(vault, "layer1", "core.md"), exact, "utf8");
+
+    const result = await readLayer1Shelf(vault);
+
+    assert.equal(result.ok, true);
+    assert.equal(result.truncated, false, "a file of exactly the cap size must read whole");
+    assert.equal(result.content.length, LAYER1_SHELF_MAX_BYTES);
+    assert.equal(result.omittedBytes, undefined);
+  },
+);
+
+test(
+  "layer1_shelf boundary: one byte past the cap is truncated (derived from the read, not a stale stat)",
+  { timeout: 30_000 },
+  async (t) => {
+    const root = await mkdtemp(path.join(tmpdir(), "sm-layer1-shelf-boundary-over-"));
+    const vault = path.join(root, "vault");
+    await mkdir(path.join(vault, "layer1"), { recursive: true });
+    t.after(() => rm(root, { recursive: true, force: true }));
+
+    const overByOne = "z".repeat(LAYER1_SHELF_MAX_BYTES + 1);
+    await writeFile(path.join(vault, "layer1", "core.md"), overByOne, "utf8");
+
+    const result = await readLayer1Shelf(vault);
+
+    assert.equal(result.ok, true);
+    assert.equal(result.truncated, true, "one byte past the cap must trip truncation");
+    assert.equal(result.content.length, LAYER1_SHELF_MAX_BYTES);
+    assert.equal(
+      result.omittedBytes,
+      1,
+      "the omitted count for a static one-byte overflow must be exactly 1, not off by the probe byte",
+    );
   },
 );
 
