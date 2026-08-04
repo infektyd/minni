@@ -409,18 +409,26 @@ def test_hyde_that_completes_is_not_reported_as_degraded(tmp_path, monkeypatch):
     from minni.minnid_runtime import recall as recall_mod
 
     engine = _hyde_engine(tmp_path, monkeypatch)
-    monkeypatch.setattr(
-        hyde_mod,
-        "generate_hypothetical_answer",
-        lambda *a, **k: "The aetherkernel note describes the xHCI window.",
-    )
+    # Positive control: without this, "no hyde_degraded entry" would also be
+    # satisfied by a HyDE leg that never ran at all, and the test would keep
+    # passing against a broken trigger.
+    calls = []
+
+    def _answer(*args, **kwargs):
+        calls.append(1)
+        return "The aetherkernel note describes the xHCI window."
+
+    monkeypatch.setattr(hyde_mod, "generate_hypothetical_answer", _answer)
 
     captured = {}
     context = _make_context(engine, captured)
     recall_mod.handle_search({"query": "aetherkernel"}, request_id=1, context=context)
 
+    assert "error" not in captured, f"the search itself must succeed: {captured!r}"
+    assert calls, "precondition: the HyDE leg must actually have been reached"
     payload = captured.get("response") or {}
-    hyde_entries = [d for d in payload.get("degradation") or [] if d.get("hyde_degraded")]
+    assert payload.get("degradation"), "precondition: the report must be present at all"
+    hyde_entries = [d for d in payload["degradation"] if d.get("hyde_degraded")]
     assert not hyde_entries, (
         f"a completed HyDE leg must not be reported degraded: {hyde_entries!r}"
     )
@@ -2195,6 +2203,226 @@ def test_both_scope_reports_one_shared_failure_once():
         f"{payload.get('degradation')!r}"
     )
     assert payload["degraded"] is True
+
+
+def test_a_shared_leg_that_degrades_only_on_the_second_pass_is_still_reported():
+    """Review round 2: the first attempt at the F4 fix let the FIRST shared leg
+    claim the report and silenced the second unconditionally. On scope "both"
+    the shared engine runs twice, so leg one succeeding and leg two throwing
+    produced a response with `degraded: false` — a shared index that failed
+    mid-request, rendered to the agent as a healthy hybrid recall.
+
+    Suppressing a differing second outcome is a health overstatement, which is
+    strictly worse than the over-count it was fixing. Dedupe is by identity, so
+    a second report that DIFFERS is news and must land."""
+    from types import SimpleNamespace
+
+    from minni.minnid_runtime import recall as recall_mod
+
+    captured = {}
+
+    class _HealthyThenBoom:
+        """Leg one answers; leg two — the same engine, later in the request —
+        throws. This is a real shape: an index can be evicted, locked, or
+        rotated between two passes of one search."""
+
+        config = SimpleNamespace(embedding_model="m")
+        last_vector_degraded = None
+        last_rerank_degraded = None
+        last_query_expand_degraded = None
+        last_hyde_degraded = None
+        last_auth_suppression = None
+
+        def __init__(self):
+            self.calls = 0
+
+        def retrieve(self, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return [{"doc_id": 1, "path": "wiki/a.md"}]
+            raise RuntimeError("shared index vanished mid-request")
+
+    shared = _HealthyThenBoom()
+    context = _make_context(shared, captured)
+    principal = SimpleNamespace(agent_id="agent-a", workspace_id="default")
+    object.__setattr__(
+        context, "handler_principal", lambda params, request_id: (principal, None)
+    )
+    recall_mod.handle_search(
+        {"query": "anything", "scope": "both"}, request_id=1, context=context
+    )
+    payload = captured["response"]
+    assert shared.calls == 2, "precondition: scope both must reach the shared engine twice"
+    assert payload["degraded"] is True, (
+        "a shared index that threw on the second pass must not be reported as a "
+        f"healthy hybrid recall: {payload['degradation']!r}"
+    )
+    assert [d for d in payload["degradation"] if d.get("shared_index_failed")], (
+        f"the failure itself must be named: {payload['degradation']!r}"
+    )
+
+
+def test_one_shared_blackout_is_announced_to_the_agent_once():
+    """Review round 2: `auth_suppression` had the identical double-report on
+    the identical two-leg shared path, and this change is what makes it
+    visible — the plugin renders one line per entry, so one blackout of one
+    corpus was about to be announced to the agent twice."""
+    from types import SimpleNamespace
+
+    from minni.minnid_runtime import recall as recall_mod
+
+    captured = {}
+
+    class _Blacked:
+        config = SimpleNamespace(embedding_model="m")
+        last_vector_degraded = None
+        last_rerank_degraded = None
+        last_query_expand_degraded = None
+        last_hyde_degraded = None
+        last_auth_suppression = {"pre_gate": 4, "suppressed": 4, "reason": "scope"}
+
+        def retrieve(self, **kwargs):
+            return []
+
+    context = _make_context(_Blacked(), captured)
+    principal = SimpleNamespace(agent_id="agent-a", workspace_id="default")
+    object.__setattr__(
+        context, "handler_principal", lambda params, request_id: (principal, None)
+    )
+    recall_mod.handle_search(
+        {"query": "anything", "scope": "both"}, request_id=1, context=context
+    )
+    payload = captured["response"]
+    assert len(payload["auth_suppression"]) == 1, (
+        "one blackout of one corpus is one report: "
+        f"{payload['auth_suppression']!r}"
+    )
+
+
+def test_two_distinct_degraded_vaults_are_reported_separately():
+    """The inverse of the F4 fix, and the reason it is scoped to the shared leg
+    instead of deduping the whole report by content (review round 1).
+
+    retrieve_combined's per-vault entries are all src "c" and carry no vault
+    identity, so a content-level dedupe collapses N genuinely-degraded vaults
+    into one whenever they fail alike — and a dead embedder is process-wide, so
+    failing alike is the COMMON case. Under-reporting a fleet-wide outage as a
+    single corpus is the same class of lie as double-reporting one.
+    """
+    from types import SimpleNamespace
+
+    from minni.minnid_runtime import recall as recall_mod
+
+    captured = {}
+
+    def _vault():
+        # Byte-identical reports from two genuinely different corpora: same
+        # model, same process-wide encoder outage, no distinguishing field.
+        return SimpleNamespace(
+            config=SimpleNamespace(embedding_model="m"),
+            last_vector_degraded="embedding model unavailable",
+            last_rerank_degraded=None,
+            last_query_expand_degraded=None,
+            last_hyde_degraded=None,
+            last_auth_suppression=None,
+            retrieve=lambda **kwargs: [{"doc_id": 1, "path": "wiki/a.md"}],
+        )
+
+    class _HealthyShared:
+        config = SimpleNamespace(embedding_model="m")
+        last_vector_degraded = None
+        last_rerank_degraded = None
+        last_query_expand_degraded = None
+        last_hyde_degraded = None
+        last_auth_suppression = None
+
+        def retrieve(self, **kwargs):
+            return []
+
+    context = _make_context(_HealthyShared(), captured)
+    principal = SimpleNamespace(agent_id="agent-a", workspace_id="default")
+    object.__setattr__(
+        context, "handler_principal", lambda params, request_id: (principal, None)
+    )
+    object.__setattr__(
+        context,
+        "all_vault_retrievals",
+        lambda: [(_vault(), "agent-b", "/tmp/b.db"), (_vault(), "agent-c", "/tmp/c.db")],
+    )
+    recall_mod.handle_search(
+        {"query": "anything", "scope": "combined"},
+        request_id=1,
+        context=context,
+    )
+    payload = captured["response"]
+    degraded_entries = [d for d in payload["degradation"] if d.get("vector_degraded")]
+    assert len(degraded_entries) == 2, (
+        "two degraded corpora must be reported as two, not collapsed into one: "
+        f"{payload['degradation']!r}"
+    )
+    # Review round 3: without this the daemon-side `source_agent` stamp was
+    # deletable with zero failures across the whole suite — the plugin's
+    # attribution test builds its own fixture, so the two halves of the fix
+    # were tested independently and the wire contract between them was not
+    # pinned at all. Two entries that cannot be told apart are not two reports.
+    assert {d.get("source_agent") for d in degraded_entries} == {"agent-b", "agent-c"}, (
+        "each vault's report must name the vault: " f"{degraded_entries!r}"
+    )
+
+
+def test_provider_leg_degrade_details_are_redacted_too():
+    """Review round 1: `_degrade_detail` covered only the three index-failure
+    strings, while `_degradation_for` copied the rerank/query-expand/HyDE flags
+    onto the wire raw — and retrieval.py sets two of them from an UNTRUNCATED
+    `str(exc)`. Those are the provider-calling legs, so their exception text is
+    the likeliest to carry an echoed credential, and the plugin now renders it
+    into agent context."""
+    from types import SimpleNamespace
+
+    from minni.minnid_runtime import recall as recall_mod
+
+    leak = "/Users/operator/.minni/index.db AFM call failed (api_key=sk-live-abc123)"
+    captured = {}
+
+    class _Engine:
+        config = SimpleNamespace(embedding_model="m")
+        last_vector_degraded = None
+        last_auth_suppression = None
+        # All three provider legs failed with provider-echoed text.
+        last_rerank_degraded = leak
+        last_query_expand_degraded = leak
+        last_hyde_degraded = leak
+
+        def retrieve(self, **kwargs):
+            return [{"doc_id": 1, "path": "wiki/a.md"}]
+
+    context = _make_context(_Engine(), captured)
+    recall_mod.handle_search({"query": "anything"}, request_id=1, context=context)
+
+    entry = captured["response"]["degradation"][0]
+    for key in ("rerank_degraded", "query_expand_degraded", "hyde_degraded"):
+        assert "sk-live-abc123" not in str(entry[key]), f"{key} leaked a secret: {entry!r}"
+        assert "/Users/operator" not in str(entry[key]), f"{key} leaked a path: {entry!r}"
+        assert "[REDACTED]" in str(entry[key]) and "[REDACTED_PATH]" in str(entry[key])
+    # The two unbounded flags are also capped now — an exception can be huge.
+    long_engine = _Engine()
+    long_engine.last_rerank_degraded = "x" * 5000
+    context = _make_context(long_engine, captured)
+    recall_mod.handle_search({"query": "anything"}, request_id=1, context=context)
+    assert len(captured["response"]["degradation"][0]["rerank_degraded"]) <= 400
+
+    # Review round 3: scrubbing must not TYPE-cast. A bare True routed through
+    # str() ships as the string "True", which the renderer then prints as a
+    # failure detail — "rerank_degraded (True)" reads like an error message.
+    bool_engine = _Engine()
+    bool_engine.last_rerank_degraded = True
+    bool_engine.last_query_expand_degraded = None
+    bool_engine.last_hyde_degraded = None
+    context = _make_context(bool_engine, captured)
+    recall_mod.handle_search({"query": "anything"}, request_id=1, context=context)
+    assert captured["response"]["degradation"][0]["rerank_degraded"] is True, (
+        "a flag with no detail must stay a bool, not become the string 'True'"
+    )
 
 
 def test_degrade_details_are_redacted_before_they_leave_the_daemon():

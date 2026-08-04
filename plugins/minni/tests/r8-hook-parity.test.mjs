@@ -51,22 +51,51 @@ async function withVault(fn) {
  * the fixture — vault, MINNI_HOME, a missing daemon socket and a closed AFM
  * port — so the live ~/.minni is never read or written.
  */
-async function runCodexHook(event, vault, payload) {
-  const child = execFileAsync(process.execPath, [path.join(PLUGIN_ROOT, "dist", "codex-hook.js"), event], {
+async function runHookEntry(script, event, vault, extraEnv, payload) {
+  const child = execFileAsync(process.execPath, [path.join(PLUGIN_ROOT, "dist", script), event], {
     env: {
       ...process.env,
       MINNI_HOME: vault,
-      MINNI_CODEX_VAULT_PATH: vault,
-      MINNI_CODEX_HOOKS: "on",
       MINNI_SOCKET_PATH: path.join(vault, "missing.sock"),
       MINNI_AFM_HEALTH_URL: "http://127.0.0.1:1/health",
       MINNI_BYPASS_AUDIT_LIMIT: "true",
+      ...extraEnv,
     },
     timeout: 30_000,
   });
   child.child.stdin.end(JSON.stringify(payload ?? {}));
   const { stdout } = await child;
-  return JSON.parse(stdout.trim().split("\n").pop());
+  const last = stdout.trim().split("\n").pop();
+  try {
+    return JSON.parse(last);
+  } catch {
+    // A hook that emits nothing (or trailing non-JSON) is itself a failure
+    // worth naming — an opaque JSON.parse throw here hid which hook broke.
+    assert.fail(`${script} ${event}: expected a JSON hook output, got: ${JSON.stringify(last)}`);
+  }
+}
+
+/** Drive the codex entry point — runHookMain, the shared generic factory. */
+async function runCodexHook(event, vault, payload) {
+  return runHookEntry(
+    "codex-hook.js",
+    event,
+    vault,
+    { MINNI_CODEX_VAULT_PATH: vault, MINNI_CODEX_HOOKS: "on" },
+    payload,
+  );
+}
+
+/** Drive the Claude Code entry point — hook.ts, the PRIMARY manifest, which
+ *  carries its own copy of both swallows rather than using the factory. */
+async function runClaudeHook(event, vault, payload) {
+  return runHookEntry(
+    "hook.js",
+    event,
+    vault,
+    { MINNI_CLAUDECODE_VAULT_PATH: vault, MINNI_CLAUDECODE_HOOKS: "on" },
+    payload,
+  );
 }
 
 // ── P4: declared-vs-consumed parity is a CI gate, not a hope ────────────────
@@ -652,33 +681,57 @@ test("P6: the hook routes BridgeFailure before the VALID_EVENTS gate", async () 
 
 // ── Review round 1 (PR #260): P4 must cover every entry point ─────────────
 
-test("P4: every hook entry point records an unrouted event, not just the factory", async () => {
-  // The first version of this fix only covered hook-handlers.ts. Claude Code
-  // is the PRIMARY manifest and runs hook.ts, which had its own clean-continue
-  // swallow in both the VALID_EVENTS gate and the dispatch default; Gemini and
-  // Cursor had theirs too. A fix that misses the primary path is not a fix.
-  for (const entry of [
-    "hook.ts",
-    "gemini-hook.ts",
-    "cursor-hook.ts",
-    "hook-handlers.ts",
-  ]) {
-    const source = await readFile(path.join(PLUGIN_ROOT, "src", entry), "utf8");
-    assert.match(
-      source,
-      /recordUnroutedEvent\(/,
-      `${entry} still exits clean and silent on an event it does not route`,
-    );
+// Review round 1 of the F2/F3 fix: these two used to grep `recordUnroutedEvent(`
+// out of the entry-point sources. An adversarial pass proved they stay GREEN
+// with the call neutered to `if (false) await recordUnroutedEvent(...)` — they
+// were certifying a dead call in exactly the way the comment above claims a
+// grep cannot detect. Claude Code's hook.ts is the PRIMARY manifest, so it gets
+// the same behavioral drive the factory path does, on both of its swallows.
+test("P4: hook.js records the drop on the VALID_EVENTS gate (primary manifest)", async () => {
+  await withVault(async (vault) => {
+    const output = await runClaudeHook("NotAnEventMinniRoutes", vault, {});
+    assert.equal(output.continue, true, "the hook must still exit clean for the platform");
+    const tail = await auditTail(vault, 20);
+    assert.match(tail.text, /hook_intent_dropped/);
+    assert.match(tail.text, /NotAnEventMinniRoutes/);
+  });
+});
+
+// Review round 2: the grep this replaced at least NAMED gemini-hook.ts and
+// cursor-hook.ts. Converting only the two Claude/codex paths to behavioral
+// drives would have left those two with less coverage than before the fix —
+// a dead-call mutation on either was green again. Every entry point that has
+// its own gate gets its own drive.
+test("P4: every platform entry point with its own gate records the drop", async () => {
+  const entries = [
+    ["gemini-hook.js", { MINNI_GEMINI_VAULT_PATH: null, MINNI_GEMINI_HOOKS: "on" }, "hook_gemini"],
+    ["cursor-hook.js", { MINNI_CURSOR_VAULT_PATH: null, MINNI_CURSOR_HOOKS: "on" }, "hook_cursor"],
+  ];
+  for (const [script, envTemplate, prefix] of entries) {
+    await withVault(async (vault) => {
+      const env = Object.fromEntries(
+        Object.entries(envTemplate).map(([k, v]) => [k, v === null ? vault : v]),
+      );
+      await runHookEntry(script, "NotAnEventMinniRoutes", vault, env, {});
+      const tail = await auditTail(vault, 20);
+      assert.match(
+        tail.text,
+        new RegExp(`${prefix}_intent_dropped`),
+        `${script} exits clean and silent on an event it does not route`,
+      );
+      assert.match(tail.text, /NotAnEventMinniRoutes/);
+    });
   }
 });
 
-test("P4: hook.ts records the drop on BOTH of its swallow paths", async () => {
-  const source = await readFile(path.join(PLUGIN_ROOT, "src", "hook.ts"), "utf8");
-  const calls = [...source.matchAll(/recordUnroutedEvent\(/g)];
-  assert.ok(
-    calls.length >= 2,
-    "the VALID_EVENTS gate and the dispatch default are two separate swallows",
-  );
+test("P4: hook.js records the drop on its dispatch default too", async () => {
+  // Two separate swallows in hook.ts; the gate test above cannot reach this one.
+  await withVault(async (vault) => {
+    await runClaudeHook("CompactSummary", vault, {});
+    const tail = await auditTail(vault, 20);
+    assert.match(tail.text, /hook_intent_dropped/);
+    assert.match(tail.text, /CompactSummary/);
+  });
 });
 
 test("P4: Cursor stays silent when hooks are DISABLED, loud on an unknown event", async () => {
