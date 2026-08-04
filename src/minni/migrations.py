@@ -375,7 +375,23 @@ def _apply_migration_018_episodic_fts_backfill(conn: sqlite3.Connection) -> None
     """
     from minni.episodic import reconcile_episodic_fts
 
-    result = reconcile_episodic_fts(conn)
+    # A data repair must never gate schema evolution. _flush_batch runs every
+    # pending migration in ONE transaction, so an exception here would roll back
+    # 018 *and* every later version with it — and because the version is never
+    # recorded, 019/020/... would re-batch with the same failing repair on every
+    # start, freezing the ladder permanently behind one logged warning.
+    # _episodic_tables_present covers absent tables; this covers a table that is
+    # present but unwritable (wrong shape, corrupt index). An unindexed episodic
+    # log is a degraded search channel. A frozen migration ladder is worse.
+    try:
+        result = reconcile_episodic_fts(conn)
+    except Exception:
+        logger.warning(
+            "Migration 018: episodic FTS backfill failed — schema migration "
+            "continues; episodic_index_ratio in the health report will show "
+            "the gap.", exc_info=True,
+        )
+        return
     logger.info(
         "Migration 018: %d episodic event(s) backfilled into episodic_fts",
         result["inserted"],

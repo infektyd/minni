@@ -213,9 +213,15 @@ def episodic_index_coverage(db: SovereignDB) -> Dict[str, object]:
         placeholders = ",".join("?" * len(NON_MEMORY_EVENT_TYPES))
         # Trace rows are excluded from the ratio and reported on their own line,
         # the same honesty rule documents_deliberately_unembedded follows: they
-        # ARE indexed, they are simply not agent memory, and folding thousands
-        # of them into the denominator would drown the gap this field exists to
-        # expose (2597 traces against 43 real events on the operator's DB).
+        # are not agent memory, search_episodic filters them out by the same
+        # list, and folding thousands of them into the denominator would drown
+        # the gap this field exists to expose (2597 traces against 43 real
+        # events on the operator's DB).
+        #
+        # episodic_observability_events is a row count only — it deliberately
+        # does NOT claim anything about whether traces are themselves indexed,
+        # because that is not measured here. Their index state cannot move
+        # episodic_index_ratio in either direction.
         memory_only = (
             f"content IS NOT NULL AND (event_type IS NULL"
             f" OR event_type NOT IN ({placeholders}))"
@@ -243,15 +249,33 @@ def episodic_index_coverage(db: SovereignDB) -> Dict[str, object]:
             # search_episodic INNER JOINs episodic_events — but reported rather
             # than hidden, since a climbing count means a delete path is
             # skipping the index.
+            # A NULL event_id counts as an orphan too: it joins to no event and
+            # the backfill can never claim it. Excluding it would leave
+            # indexed + orphans failing to reconcile against the FTS row count,
+            # which is how index junk stays invisible.
             orphans = c.execute(
                 "SELECT COUNT(*) AS n FROM episodic_fts f"
-                " WHERE f.event_id IS NOT NULL"
-                " AND CAST(f.event_id AS INTEGER) NOT IN"
+                " WHERE f.event_id IS NULL"
+                " OR CAST(f.event_id AS INTEGER) NOT IN"
                 " (SELECT event_id FROM episodic_events)"
             ).fetchone()["n"]
     except Exception as exc:
-        logger.debug("episodic_index_coverage unavailable: %s", exc)
-        return {"episodic_error": str(exc)}
+        # warning, not debug: at the default level a debug line means a broken
+        # coverage query is indistinguishable from a healthy one.
+        logger.warning("episodic_index_coverage unavailable: %s", exc)
+        # The key set stays stable so "unknown" cannot be misread as "empty".
+        # Dropping the keys entirely would leave a consumer's
+        # coverage.get("episodic_index_ratio") returning None — the exact value
+        # this function uses to mean "no episodic events yet".
+        return {
+            "episodic_events_total": None,
+            "episodic_events_indexed": None,
+            "episodic_events_missing_index": None,
+            "episodic_index_ratio": None,
+            "episodic_observability_events": None,
+            "episodic_fts_orphans": None,
+            "episodic_error": str(exc),
+        }
 
     return {
         "episodic_events_total": total_events,

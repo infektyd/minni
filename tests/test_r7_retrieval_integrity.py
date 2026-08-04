@@ -64,9 +64,9 @@ def _make_engine(tmp_path, **cfg_overrides):
 
 class _RecordedTask:
     """Stands in for asyncio.Task: remembers the code object it was created
-    from and whether the shutdown path cancelled it."""
+    from, and appends every cancel to the loop's ordered event log."""
 
-    def __init__(self, coro):
+    def __init__(self, coro, loop):
         # Captured before close(): a closed coroutine still exposes cr_code,
         # but reading it first keeps the ordering obvious.
         self.code = coro.cr_code
@@ -74,25 +74,47 @@ class _RecordedTask:
         # main() never awaits these under the stub loop; closing them keeps
         # pytest from filling the run with "coroutine was never awaited".
         coro.close()
+        self._loop = loop
         self.cancelled = False
 
     def cancel(self):
         self.cancelled = True
+        self._loop.events.append(("cancel", self.name))
 
 
 class _StubLoop:
-    """Records create_task calls instead of running them."""
+    """Records create_task calls instead of running them.
+
+    ``events`` is an ordered log of ("create"|"cancel", name). Cancellation
+    ORDER is the point: a daemon that calls create_task and then cancels the
+    task on the next line has scheduled nothing, and an assertion that only
+    checks "was created" and "is cancelled after SIGTERM" passes against it.
+    A cassandra pass on this branch confirmed that mutation
+    (`backfill_task.cancel()` immediately after creation) survived the first
+    version of these tests — the same class of hole as the getsource
+    assertions they replaced. Tests therefore assert the cancel is causally
+    downstream of the signal handler, via ``cancels_since``.
+    """
 
     def __init__(self):
         self.tasks = []
+        self.events = []
 
     def set_default_executor(self, executor):
         executor.shutdown(wait=False)
 
     def create_task(self, coro):
-        task = _RecordedTask(coro)
+        task = _RecordedTask(coro, self)
         self.tasks.append(task)
+        self.events.append(("create", task.name))
         return task
+
+    def mark(self):
+        """Index into the event log, for asserting what happened after it."""
+        return len(self.events)
+
+    def cancels_since(self, mark):
+        return [name for kind, name in self.events[mark:] if kind == "cancel"]
 
     def run_until_complete(self, task):
         return None
@@ -142,7 +164,14 @@ def _run_main_with_stub_loop(monkeypatch, tmp_path):
     monkeypatch.setattr(minnid.obs, "configure_logging", lambda **k: None)
     monkeypatch.setattr(deploy_honesty, "capture_start_state", lambda: None)
 
+    # main() opens the shared DB inside a bare `except Exception`, so if a
+    # refactor ever reached the live ~/.minni/minni.db by another route this
+    # stub would simply stop being called and nothing would fail. The counter
+    # is asserted on, so "the guard is still load-bearing" is itself tested.
+    loop.live_db_attempts = []
+
     def _no_live_db(*args, **kwargs):
+        loop.live_db_attempts.append(True)
         raise RuntimeError("test: refusing to open the live database")
 
     monkeypatch.setattr(SovereignDB, "shared", staticmethod(_no_live_db))
@@ -1011,9 +1040,17 @@ class TestEmbeddingBackfillAndCoverage:
             "the degraded status was logged but no retry was queued — a log "
             f"line is not a queue (scheduled: {[t.name for t in loop.tasks]})"
         )
+        assert not task.cancelled, (
+            "main() returned with the backfill task already cancelled — a task "
+            "queued and then killed on the next line drains nothing"
+        )
 
+        mark = loop.mark()
         handlers[signal.SIGTERM](signal.SIGTERM, None)
         assert task.cancelled, "shutdown must cancel the backfill task"
+        assert "_backfill_runner" in loop.cancels_since(mark), (
+            "the cancel must be caused by the shutdown handler, not by main()"
+        )
 
     def test_backfill_is_not_scheduled_when_disabled(self, monkeypatch, tmp_path):
         """The env gate is real, not decorative — the same run harness proves
@@ -1478,9 +1515,29 @@ class TestDecayIsScheduled:
             "main() must create the decay task "
             f"(scheduled: {[t.name for t in loop.tasks]})"
         )
+        assert not task.cancelled, (
+            "main() returned with the decay task already cancelled — a task "
+            "queued and then killed on the next line sweeps nothing"
+        )
 
+        mark = loop.mark()
         handlers[signal.SIGTERM](signal.SIGTERM, None)
         assert task.cancelled, "shutdown must cancel the decay task"
+        assert "_decay_runner" in loop.cancels_since(mark), (
+            "the cancel must be caused by the shutdown handler, not by main()"
+        )
+
+    def test_the_harness_never_reaches_the_live_database(self, monkeypatch, tmp_path):
+        """main()'s eager startup migration opens SovereignDB.shared inside a
+        bare `except Exception`. The stub that intercepts it is the only thing
+        keeping this suite off the operator's real ~/.minni/minni.db, and a
+        stub that silently stopped being called would look identical."""
+        _, loop, _ = _run_main_with_stub_loop(monkeypatch, tmp_path)
+
+        assert loop.live_db_attempts, (
+            "main() no longer routes its startup DB open through "
+            "SovereignDB.shared — the live-database guard is not holding"
+        )
 
     def test_decay_is_not_scheduled_when_disabled(self, monkeypatch, tmp_path):
         """MINNI_DECAY=off must actually suppress the task, so the positive
@@ -3194,7 +3251,195 @@ class TestEpisodicFtsBackfill:
         assert coverage["episodic_events_total"] == len(self._PRE_TRIGGER) + 1, (
             "trace rows must stay out of the denominator"
         )
-        # One list, not two: a trace type added to the search filter must move
-        # this metric with it.
-        assert RetrievalEngine.EPISODIC_NON_MEMORY_TYPES == ("recall",)
+        db_obj.close()
+
+    def test_the_non_memory_type_list_has_one_definition(self):
+        """Identity, not equality. Asserting `== ("recall",)` would survive
+        someone re-hardcoding the literal back into retrieval.py — it pins the
+        value while the claim being made is about the LINK — and it would fail
+        the day a second trace type is legitimately added, inviting exactly the
+        edit that re-forks the list."""
+        import minni.episodic as episodic
+        from minni.retrieval import RetrievalEngine
+
+        assert (
+            RetrievalEngine.EPISODIC_NON_MEMORY_TYPES
+            is episodic.NON_MEMORY_EVENT_TYPES
+        ), "the search filter must READ the shared list, not copy its value"
+
+    def test_recent_activity_filters_traces_through_the_shared_list(
+        self, tmp_path, monkeypatch
+    ):
+        """recall.handle_read's Recent Activity query had its own hardcoded
+        `event_type != 'recall'` — a third copy of the list that a new trace
+        type would silently leave behind.
+
+        Driven through the real _handle_read RPC and asserted on the rendered
+        context, then re-run with an extra type in the shared list: if the
+        query still carried its own literal, the added type would keep showing
+        up in Recent Activity.
+        """
+        import minni.episodic as episodic
+        import minni.minnid as minnid
+
+        db_obj, _ = _make_db(tmp_path)
+        now = time.time()
+        with db_obj.cursor() as c:
+            for event_type, content in (
+                ("message", "genuine agent message"),
+                ("recall", "recall trace noise"),
+                ("audit_probe", "probe event text"),
+            ):
+                c.execute(
+                    "INSERT INTO episodic_events"
+                    " (agent_id, event_type, content, created_at)"
+                    " VALUES ('codex', ?, ?, ?)",
+                    (event_type, content, now),
+                )
+        monkeypatch.setattr(minnid, "SovereignDB", lambda: db_obj)
+
+        context = minnid._handle_read({"agent_id": "codex", "limit": 5}, 1)
+        context = context["result"]["context"]
+        assert "genuine agent message" in context
+        assert "recall trace noise" not in context, "traces must stay out"
+        assert "probe event text" in context
+
+        monkeypatch.setattr(
+            episodic,
+            "NON_MEMORY_EVENT_TYPES",
+            episodic.NON_MEMORY_EVENT_TYPES + ("audit_probe",),
+        )
+        context = minnid._handle_read({"agent_id": "codex", "limit": 5}, 1)
+        context = context["result"]["context"]
+        assert "genuine agent message" in context
+        assert "probe event text" not in context, (
+            "Recent Activity kept its own copy of the trace list — extending "
+            "NON_MEMORY_EVENT_TYPES did not move this filter"
+        )
+        db_obj.close()
+
+    def test_backfill_skips_null_content_events(self, tmp_path):
+        """The INSERT's `content IS NOT NULL` must match the trigger's
+        `WHEN NEW.content IS NOT NULL` (db.py). If they diverge, missing_before
+        and inserted disagree and the reconcile reports a success it did not
+        achieve."""
+        from minni.episodic import reconcile_episodic_fts
+
+        db_obj, _ = self._db_with_pre_trigger_events(tmp_path)
+        conn = db_obj._get_conn()
+        conn.execute(
+            "INSERT INTO episodic_events (agent_id, event_type, content, created_at)"
+            " VALUES ('claude-code', 'message', NULL, ?)",
+            (time.time(),),
+        )
+
+        result = reconcile_episodic_fts(conn)
+        assert result["inserted"] == result["missing_before"], (
+            "the count and the insert must use the same predicate"
+        )
+        assert result["inserted"] == len(self._PRE_TRIGGER)
+        assert conn.execute(
+            "SELECT COUNT(*) FROM episodic_fts WHERE content IS NULL"
+        ).fetchone()[0] == 0
+        db_obj.close()
+
+    def test_backfill_no_ops_when_only_one_episodic_table_exists(self, tmp_path):
+        """The half-schema case is the one the guard exists for — fixtures in
+        this repo build episodic_events with no episodic_fts. A bare :memory:
+        DB has neither and so does not exercise the branch."""
+        import sqlite3
+
+        from minni.episodic import reconcile_episodic_fts
+
+        conn = sqlite3.connect(str(tmp_path / "half.db"))
+        conn.execute(
+            "CREATE TABLE episodic_events ("
+            " event_id INTEGER PRIMARY KEY AUTOINCREMENT, agent_id TEXT,"
+            " event_type TEXT, content TEXT, created_at REAL)"
+        )
+        conn.execute(
+            "INSERT INTO episodic_events (agent_id, event_type, content, created_at)"
+            " VALUES ('a', 'message', 'text', 1.0)"
+        )
+
+        assert reconcile_episodic_fts(conn) == {"missing_before": 0, "inserted": 0}
+        conn.close()
+
+    def test_coverage_counts_orphaned_index_rows(self, tmp_path):
+        """episodic_fts_orphans is the compensating control migration 018 cites
+        as its reason for NOT deleting orphan rows. An unverified compensating
+        control is not one."""
+        from minni.backfill import episodic_index_coverage
+
+        db_obj, _ = self._db_with_pre_trigger_events(tmp_path)
+        assert episodic_index_coverage(db_obj)["episodic_fts_orphans"] == 0
+
+        conn = db_obj._get_conn()
+        conn.execute(
+            "INSERT INTO episodic_fts(event_id, agent_id, content)"
+            " VALUES (999999, 'claude-code', 'index row for a deleted event')"
+        )
+        conn.execute(
+            "INSERT INTO episodic_fts(event_id, agent_id, content)"
+            " VALUES (NULL, 'claude-code', 'index row with no id at all')"
+        )
+
+        coverage = episodic_index_coverage(db_obj)
+        assert coverage["episodic_fts_orphans"] == 2, (
+            "both the dangling id and the NULL id are unreachable index rows"
+        )
+        # Orphans must not be smuggled into the health numbers as coverage.
+        assert coverage["episodic_events_indexed"] == 1
+        db_obj.close()
+
+    def test_coverage_failure_reports_unknown_not_empty(self, tmp_path):
+        """A broken coverage query must not read as a healthy empty log. The
+        keys stay present and None, alongside an explicit episodic_error."""
+        from minni.backfill import episodic_index_coverage
+
+        db_obj, _ = self._db_with_pre_trigger_events(tmp_path)
+        db_obj._get_conn().execute("DROP TABLE episodic_fts")
+
+        coverage = episodic_index_coverage(db_obj)
+        assert "episodic_error" in coverage, "the failure must be stated"
+        assert coverage["episodic_index_ratio"] is None
+        assert "episodic_events_total" in coverage, (
+            "dropping the keys makes 'unknown' indistinguishable from 'empty'"
+        )
+        db_obj.close()
+
+    def test_a_failed_backfill_does_not_freeze_the_migration_ladder(self, tmp_path):
+        """_flush_batch runs all pending migrations in one transaction, so an
+        exception from this data repair would roll back every later schema
+        migration with it — and re-fail on every subsequent start."""
+        import sqlite3
+
+        import minni.episodic as episodic_mod
+        from minni.migrations import run_migrations
+
+        db_obj, _ = self._db_with_pre_trigger_events(tmp_path)
+        conn = db_obj._get_conn()
+        conn.execute("DELETE FROM schema_migrations WHERE version = 18")
+        conn.commit()
+
+        def _boom(_conn):
+            raise sqlite3.OperationalError(
+                "table episodic_fts has no column named event_id"
+            )
+
+        monkey = episodic_mod.reconcile_episodic_fts
+        episodic_mod.reconcile_episodic_fts = _boom
+        try:
+            run_migrations(conn)
+            conn.commit()
+        finally:
+            episodic_mod.reconcile_episodic_fts = monkey
+
+        applied = {
+            v for (v,) in conn.execute("SELECT version FROM schema_migrations")
+        }
+        assert 18 in applied, (
+            "a failed data repair must not block the schema ladder — 019 and "
+            "later would batch with it and roll back forever"
+        )
         db_obj.close()
