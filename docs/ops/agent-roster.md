@@ -25,7 +25,7 @@ Session can also set `/effort low|medium|high|xhigh` on the **parent**; workflow
 
 | Role key | Model | Effort guidance | Why |
 |----------|--------|-----------------|-----|
-| `thread` | inherit / `grok-build` | low | Minni bookkeeping |
+| `minni_thread` | inherit / `grok-build` | low | Minni bookkeeping |
 | `audit` | `grok-build` | low–medium | Wide fan-out, code-anchored greps |
 | `loom` | `grok-4.5` | high | Rank/dedupe conflicts |
 | `wright` | `grok-build` | medium | Apply plan; escalate via cass if fails |

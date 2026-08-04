@@ -12,7 +12,7 @@
 //   grok_review?: false,
 //   ghrepo?: "infektyd/minni",
 //   skip_minni_thread?: false,
-//   roster?: #{ audit, loom, wright, cassandra, thread, app_owner },  // model slugs
+//   roster?: #{ audit, loom, wright, cassandra, minni_thread, app_owner },  // model slugs
 // }
 
 let meta = #{
@@ -151,7 +151,7 @@ if skip_thread == () { skip_thread = false; }
 
 // --- Adaptive min/max roster (see docs/ops/agent-roster.md) ---
 // Defaults: cheap width (grok-build), heavy refute/synthesis (grok-4.5).
-let m_thread = "grok-build";
+let m_minni = "grok-build";
 let m_audit = "grok-build";
 let m_loom = "grok-4.5";
 let m_wright = "grok-build";
@@ -159,7 +159,7 @@ let m_cass = "grok-4.5";
 let m_app = "grok-build";
 let roster = a.roster;
 if roster != () {
-    if roster.thread != () { m_thread = roster.thread; }
+    if roster.minni_thread != () { m_minni = roster.minni_thread; }
     if roster.audit != () { m_audit = roster.audit; }
     if roster.loom != () { m_loom = roster.loom; }
     if roster.wright != () { m_wright = roster.wright; }
@@ -167,8 +167,8 @@ if roster != () {
     if roster.app_owner != () { m_app = roster.app_owner; }
 }
 let roster_line = "";
-roster_line += "thread=";
-roster_line += m_thread;
+roster_line += "minni_thread=";
+roster_line += m_minni;
 roster_line += " audit=";
 roster_line += m_audit;
 roster_line += " loom=";
@@ -200,7 +200,7 @@ if skip_thread == false {
         label: "minni-thread",
         capability_mode: "all",
         agent_type: "general-purpose",
-        model: m_thread,
+        model: m_minni,
         output_schema: thread_schema,
     });
     if t != () && t.success && t.output.plan_id != () {
