@@ -69,6 +69,14 @@ GATHER_ROUNDS = 3
 # it can weaken a required check the gate trusts, or post as github-actions[bot].
 PATH_DENY_PREFIXES = (
     ".github/",
+    # Approval policy and review rules. Cursor's approval agents and Bugbot
+    # read these from repository contents, so they are instructions to an
+    # approver in the same way .github/ is instructions to CI: a PR that can
+    # rewrite "never auto-approve trust paths" into "approve on green CI" has
+    # rewritten the merge gate, whatever the diff to the code looks like.
+    ".cursor/",
+    "APPROVAL_POLICY.md",
+    "tests/test_approval_policies.py",
     # The reviewing agent's own configuration surface, and executable: #272
     # landed 472 lines of agent-orchestration workflow here with capability
     # mode "all". grok-review.yml deliberately writes its sandbox profile to

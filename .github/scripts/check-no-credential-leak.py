@@ -50,7 +50,10 @@ CHECKS
 
 RESIDUAL RISK, STATED PLAINLY: this cannot be complete. A model asked to
 rot13, reverse, or describe a token in words will defeat any substring
-matcher. This gate is the last line, not the boundary — the boundary is that
+matcher. One residual is deliberate rather than merely unhandled: a token
+chunked character-by-character in PLAINTEXT (`g,h,s,_,F,...`) is not caught,
+because the only view that would catch it also collapses ordinary prose into
+token-shaped strings and blocked a review of this very file. This gate is the last line, not the boundary — the boundary is that
 child-process egress is blocked (verified on Linux) and the blast radius is
 small (short-lived token, collaborator-only triggers, ephemeral runner).
 
@@ -75,22 +78,29 @@ WINDOW = 24
 # prefix followed by token-length payload, so prose that merely names the
 # format ("tokens start with ghp_") does not match.
 #
-# The (?<![A-Za-z0-9_]) lookbehind requires the prefix to start at a delimiter.
-# Without it the whitespace-stripped variant produces false positives: strip
-# the spaces out of "...new highs_ and then twenty more characters..." and
-# `ghs_` + 20 alphanumerics matches inside an ordinary English sentence. A real
-# leaked token is always preceded by whitespace, a quote, `:` or `=`, so the
-# only detection this costs is a token welded to a word with no delimiter at
-# all — which the un-stripped `reply` variant still sees.
+# Two families of the SAME patterns. The anchored one requires the prefix to
+# start at a delimiter; the raw one does not.
+#
+# Which is used depends on the variant, and getting this wrong has already cost
+# a real detection once. On the untouched `reply`, prose keeps its spaces, so a
+# review that says "the ghs_ prefix marks installation tokens" cannot match
+# (a space follows the underscore) while a genuinely welded leak — an injection
+# told to print the token with no separator, `...retrieved wasghs_AAAA...` — is
+# caught. On variants WE created by joining text together, welding is an
+# artifact of our own normalisation rather than the attacker's choice, and the
+# anchored family is what stops the joined text of an ordinary review
+# ("...reaching new highs_ and then twenty more characters...") from matching.
 _START = r"(?<![A-Za-z0-9_])"
-SHAPE_PATTERNS = (
-    ("JWT-shaped token", re.compile(_START + r"eyJ[A-Za-z0-9_-]{30,}\.[A-Za-z0-9_-]{10,}")),
-    ("GitHub token", re.compile(_START + r"gh[pousr]_[A-Za-z0-9]{36,}")),
-    ("GitHub fine-grained PAT", re.compile(_START + r"github_pat_[A-Za-z0-9_]{50,}")),
+_SHAPES = (
+    ("JWT-shaped token", r"eyJ[A-Za-z0-9_-]{30,}\.[A-Za-z0-9_-]{10,}"),
+    ("GitHub token", r"gh[pousr]_[A-Za-z0-9]{36,}"),
+    ("GitHub fine-grained PAT", r"github_pat_[A-Za-z0-9_]{50,}"),
     # Installation tokens are the ones this repo actually mints, and short
     # ones exist, so they get a looser bound than the family pattern above.
-    ("GitHub installation token", re.compile(_START + r"ghs_[A-Za-z0-9]{20,}")),
+    ("GitHub installation token", r"ghs_[A-Za-z0-9]{20,}"),
 )
+SHAPE_PATTERNS = tuple((label, re.compile(_START + p)) for label, p in _SHAPES)
+RAW_SHAPE_PATTERNS = tuple((label, re.compile(p)) for label, p in _SHAPES)
 
 # The username half of the git credential `actions/checkout` persists. Only
 # ever evaluated on DECODED bytes (see CHECKS 4), and only when a token shape
@@ -111,13 +121,15 @@ _B64_URLSAFE = str.maketrans("-_", "+/")
 # "chunk the blob with commas / zero-width spaces", which neither the run
 # regex nor the whitespace-stripped variant catches on its own.
 _NOT_ENCODED_RE = re.compile(r"[^A-Za-z0-9+/=_-]+")
-# A decoded view is only re-decoded when it is ITSELF nothing but encoding
-# alphabet — the signature of double-encoding. Without this test the recursion
-# fans out across every garbage decode and the scan stops being bounded.
-_ALL_ENCODED_RE = re.compile(r"[A-Za-z0-9+/=_-]+")
 
 # Recursion depth for nested encodings (base64 of base64 of the credential).
-MAX_DECODE_DEPTH = 3
+# Deep enough that simply re-encoding N times is not a strategy; the byte
+# budget below is what actually bounds the work.
+MAX_DECODE_DEPTH = 8
+# A decoded view is re-decoded when it is MOSTLY encoding alphabet. An earlier
+# version required the whole view to be pure alphabet, which meant one interior
+# byte ended the descent: base64("note: " + base64(cred) + " end") walked out.
+MIN_ENCODED_DENSITY = 0.5
 # Total decoded bytes the scan will produce before giving up. A review is a
 # review, not a corpus; a reply that blows this budget is not something this
 # gate can honestly certify, so exceeding it FAILS CLOSED rather than
@@ -238,7 +250,10 @@ def decoded_views(text: str, budget: list[int]) -> list[str]:
                 # alphabet: that is what base64-of-base64 looks like, and it
                 # keeps the fan-out from exploding on ordinary garbage.
                 stripped = view.strip()
-                if len(stripped) >= MIN_B64_RUN and _ALL_ENCODED_RE.fullmatch(stripped):
+                alpha = len(_NOT_ENCODED_RE.sub("", stripped))
+                if (len(stripped) >= MIN_B64_RUN
+                        and alpha >= MIN_ENCODED_DENSITY * len(stripped)
+                        and alpha >= MIN_B64_RUN):
                     nxt.append(view)
         if not nxt:
             break
@@ -246,35 +261,92 @@ def decoded_views(text: str, budget: list[int]) -> list[str]:
     return views
 
 
-def shape_hits(haystacks: dict[str, str]) -> list[str]:
-    """Shape findings across every reply variant and every decoded view."""
-    hits: list[str] = []
+def all_views(reply: str) -> dict[str, str]:
+    """Every rendering of the reply that this gate is willing to certify.
+
+    Four plaintext variants plus, for each, one concatenation of everything
+    reachable by decoding it. Decoded material is concatenated rather than kept
+    per-run so that the value scan below stays linear in the number of secrets
+    instead of the number of runs; NUL separators keep a match from spanning
+    two unrelated decodes.
+
+    `runs-joined` is the answer to a blob split across ordinary prose. Stripping
+    non-alphabet characters in place does not help there — English between the
+    halves is itself alphabet characters and gets interleaved into the blob.
+    Joining only the RUNS discards the prose, and no English word reaches
+    MIN_B64_RUN, so nothing legitimate is ever welded together by it.
+    """
     budget = [MAX_DECODE_BYTES]
+    plaintext = {
+        "reply": reply,
+        "reply(no-whitespace)": re.sub(r"\s+", "", reply),
+        "reply(alphabet-only)": _NOT_ENCODED_RE.sub("", reply),
+        "reply(runs-joined)": "".join(m.group(0) for m in B64_RUN_RE.finditer(reply)),
+    }
+    views = dict(plaintext)
+    for label, text in plaintext.items():
+        decoded = decoded_views(text, budget)
+        if decoded:
+            views[f"decoded {label}"] = "\x00".join(decoded)
+    return views
 
-    for variant, text in haystacks.items():
-        for label, pattern in SHAPE_PATTERNS:
+
+# `alphabet-only` keeps `/`, `+`, `=`, `-` and `_` as well as alphanumerics, so
+# stripping an ordinary sentence welds words into token-shaped strings. Measured
+# on THIS FILE: the docstring phrase "GitHub only ever mints ghs_/ghp_ into that
+# header" collapses to ghp_ followed by 36 letters and matched. That view is
+# therefore a decode source and a value-scan target only — never a shape target.
+# The cost is that a token chunked character-by-character in PLAINTEXT is not
+# caught; that is the documented residual, and it is worth paying to keep every
+# review of this file postable.
+_NO_SHAPE_SCAN = ("reply(alphabet-only)",)
+
+
+def shape_hits(views: dict[str, str]) -> list[str]:
+    """Shape findings across every view, with the right pattern family."""
+    hits: list[str] = []
+    for label, text in views.items():
+        if label in _NO_SHAPE_SCAN:
+            continue
+        decoded = label.startswith("decoded ")
+        # Un-anchored on the untouched reply and on decoded bytes; anchored on
+        # the variants we produced by joining text. See _START for why.
+        patterns = (RAW_SHAPE_PATTERNS
+                    if decoded or label == "reply"
+                    else SHAPE_PATTERNS)
+        for name, pattern in patterns:
             if pattern.search(text):
-                hits.append(f"{label} in {variant}")
-
-    # Decode sources include an alphabet-only view of the reply, which is what
-    # defeats "chunk the blob with commas or zero-width spaces": those
-    # separators survive whitespace stripping but not this. It is a decode
-    # SOURCE only and never a shape-scan target — concatenating a whole review
-    # into one alphanumeric run would match token shapes by coincidence.
-    sources = dict(haystacks)
-    sources["reply(encoded-alphabet-only)"] = _NOT_ENCODED_RE.sub("", haystacks["reply"])
-
-    for variant, text in sources.items():
-        for decoded in decoded_views(text, budget):
-            for label, pattern in SHAPE_PATTERNS:
-                if pattern.search(decoded):
-                    hits.append(f"{label} in decoded {variant}")
-            # Co-located with a real token shape only — see DECODED_ONLY_MARKERS.
+                hits.append(f"{name} in {label}")
+        if decoded:
             for marker in DECODED_ONLY_MARKERS:
-                if marker in decoded and any(
-                    p.search(decoded) for _, p in SHAPE_PATTERNS
-                ):
-                    hits.append(f"{marker} with a token in decoded {variant}")
+                if marker in text and any(p.search(text) for _, p in patterns):
+                    hits.append(f"{marker} with a token in {label}")
+    return hits
+
+
+def value_hits(views: dict[str, str], auth: object) -> list[str]:
+    """Findings for the ACTUAL secret values in the local auth document.
+
+    Runs over decoded views too. Restricting this to plaintext is what let a
+    doubly-encoded refresh token through: `encoded_forms` only ever re-encoded
+    the secret ONCE and compared that against the raw reply.
+    """
+    hits: list[str] = []
+    for value in secret_values(auth):
+        redacted = f"{value[:6]}…({len(value)} chars)"
+        variant = contains(views, value)
+        if variant:
+            hits.append(f"full value {redacted} in {variant}")
+            continue
+        variant = windows_hit(views, value)
+        if variant:
+            hits.append(f"partial value {redacted} in {variant}")
+            continue
+        for label, needle in encoded_forms(value):
+            variant = contains(views, needle)
+            if variant:
+                hits.append(f"{label}-encoded value {redacted} in {variant}")
+                break
     return hits
 
 
@@ -295,13 +367,6 @@ def main() -> int:
         print(f"::error::Cannot read reply file {reply_path}: {exc}")
         return 1
 
-    # Variants defeat the cheapest obfuscations: spacing a token out, or
-    # wrapping it across lines.
-    haystacks = {
-        "reply": reply,
-        "reply(no-whitespace)": re.sub(r"\s+", "", reply),
-    }
-
     hits: list[str] = []
 
     try:
@@ -313,25 +378,11 @@ def main() -> int:
         # not evidence of a leak.
         auth = None
 
-    if auth is not None:
-        for value in secret_values(auth):
-            redacted = f"{value[:6]}…({len(value)} chars)"
-            variant = contains(haystacks, value)
-            if variant:
-                hits.append(f"full value {redacted} in {variant}")
-                continue
-            variant = windows_hit(haystacks, value)
-            if variant:
-                hits.append(f"partial value {redacted} in {variant}")
-                continue
-            for label, needle in encoded_forms(value):
-                variant = contains(haystacks, needle)
-                if variant:
-                    hits.append(f"{label}-encoded value {redacted} in {variant}")
-                    break
-
     try:
-        hits.extend(shape_hits(haystacks))
+        views = all_views(reply)
+        if auth is not None:
+            hits.extend(value_hits(views, auth))
+        hits.extend(shape_hits(views))
     except ScanBudgetExceeded:
         print("::error::Reply produced more decoded material than this gate "
               "will certify — refusing to post.")

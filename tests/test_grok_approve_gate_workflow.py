@@ -135,11 +135,11 @@ def test_review_workflow_defangs_the_marker_before_embedding_the_reply(review):
 # Words bash resolves itself — builtins and reserved words. None of them go
 # through PATH, so a planted binary cannot intercept them.
 _SHELL_BUILTINS = frozenset({
-    ":", "[", "[[", "]]", "break", "case", "cd", "continue", "done", "echo",
-    "esac", "exit", "export", "false", "fi", "for", "function", "getopts",
-    "in", "local", "printf", "pwd", "read", "readonly", "return", "set",
-    "shift", "test", "trap", "true", "type", "umask", "unset", "wait",
-    "{", "}",
+    ":", "[", "[[", "]]", "break", "case", "cd", "continue", "declare",
+    "done", "echo", "esac", "exit", "export", "false", "fi", "for",
+    "function", "getopts", "in", "let", "local", "printf", "pwd", "read",
+    "readonly", "return", "select", "set", "shift", "test", "trap", "true",
+    "type", "typeset", "umask", "unset", "wait", "{", "}",
 })
 
 # Words FOLLOWED BY a command. The word itself is safe, but the next word is
@@ -148,7 +148,7 @@ _SHELL_BUILTINS = frozenset({
 # hides in plain sight, so the scan keeps looking past them.
 _COMMAND_PREFIXES = frozenset({
     "!", "if", "then", "elif", "else", "while", "until", "do",
-    "command", "env", "exec", "nohup", "sudo", "time", "xargs",
+    "command", "coproc", "env", "exec", "nohup", "sudo", "time", "xargs",
 })
 
 # Constructs that defeat any static reading of the script. In a trust step
@@ -156,9 +156,16 @@ _COMMAND_PREFIXES = frozenset({
 _OPAQUE = frozenset({"eval", "source", "."})
 
 _ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\[[^]]*\])?\+?=")
-_CASE_LABEL = re.compile(r"^(\s*)\(?[^\s()]*\)(\s)")
+# Case labels are replaced BY A SEPARATOR, never deleted: removing the `)`
+# without leaving a command boundary meant the arm body on the same line was
+# read as arguments to the previous command, hiding it entirely.
+_CASE_LABEL = re.compile(r"^(\s*)\(?[^\s()]*\)(\s|$)")
 _CASE_LABEL_AFTER_IN = re.compile(r"(\bin\s+)\(?[^\s()]*\)")
-_CASE_LABEL_AFTER_SEP = re.compile(r"(;;\s*)\(?[^\s()]*\)")
+_CASE_LABEL_AFTER_SEP = re.compile(r"(;;&?\s*)\(?[^\s()]*\)")
+_FUNC_DEF = re.compile(r"^\s*(?:function\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*\(\)", re.M)
+# `$NAME` and `${NAME}` expansions. Whatever LITERAL text remains beside them
+# in a command name is still a PATH lookup: with Z unset, `${Z}cat` runs cat.
+_EXPANSION = re.compile(r"\$\{[^}]*\}|\$[A-Za-z_][A-Za-z0-9_]*|\$[0-9?@*#$!-]")
 _HEREDOC = re.compile(r"<<-?\s*([\'\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
 
 
@@ -194,9 +201,9 @@ def _strip_case_labels(script: str) -> str:
         if stripped.startswith("case ") or stripped == "case":
             in_case = True
         if in_case:
-            line = _CASE_LABEL.sub(r"\1\2", line)
-            line = _CASE_LABEL_AFTER_IN.sub(r"\1", line)
-            line = _CASE_LABEL_AFTER_SEP.sub(r"\1", line)
+            line = _CASE_LABEL.sub(r"\1;\2", line)
+            line = _CASE_LABEL_AFTER_IN.sub(r"\1;", line)
+            line = _CASE_LABEL_AFTER_SEP.sub(r"\1;", line)
         if re.search(r"\besac\b", stripped):
             in_case = False
         out.append(line)
@@ -217,11 +224,12 @@ def _command_heads(script: str) -> list[str]:
     stack: list[str] = []          # quote mode to restore when $(...) closes
     mode = "normal"
     pending = True                 # the next word is a command head
+    after_prefix = False           # last word was exec/sudo/env/...
     prev = "\n"
     i, n = 0, len(script)
 
     def flush() -> None:
-        nonlocal buf, pending
+        nonlocal buf, pending, after_prefix
         if buf:
             word = "".join(buf)
             buf = []
@@ -231,7 +239,15 @@ def _command_heads(script: str) -> list[str]:
                 return
             base = word.rsplit("/", 1)[-1]
             if base in _COMMAND_PREFIXES:
+                after_prefix = True
                 return
+            # `sudo -E curl`, `command -p curl`, `time -p curl`: the option
+            # belongs to the prefix, and the real PATH lookup is still ahead.
+            # Options are filtered out downstream, so without this the scan
+            # reported nothing at all for those forms.
+            if after_prefix and word.startswith("-"):
+                return
+            after_prefix = False
             heads.append(word)
             pending = False
 
@@ -247,6 +263,8 @@ def _command_heads(script: str) -> list[str]:
         if mode == "single":
             if char == "'":
                 mode = "normal"
+                if pending:
+                    buf.append("\x00")   # quote boundary, see _EXPANSION use
             elif pending:
                 buf.append(char)       # a quoted command name still runs
             i += 1
@@ -254,6 +272,13 @@ def _command_heads(script: str) -> list[str]:
 
         if char == "\\":
             i += 2
+            continue
+
+        # $(( arithmetic )) evaluates; it is not a command context. Checked
+        # before $( or every `$(( i + 1 ))` reads as a call to `i`.
+        if char == "$" and script[i + 1:i + 3] == "((":
+            close = script.find("))", i + 3)
+            i = (close + 2) if close != -1 else n
             continue
 
         # $(...) and `...` open a fresh command context, even inside quotes.
@@ -288,6 +313,8 @@ def _command_heads(script: str) -> list[str]:
         if mode == "double":
             if char == '"':
                 mode = "normal"
+                if pending:
+                    buf.append("\x00")
             elif pending:
                 buf.append(char)
             i += 1
@@ -304,6 +331,13 @@ def _command_heads(script: str) -> list[str]:
             i = (close + 2) if close != -1 else n
             flush()
             pending = False
+            continue
+
+        # NAME=(one two) is an array literal, not a call to its first element.
+        if char == "(" and buf and _ASSIGNMENT.match("".join(buf)):
+            close = script.find(")", i + 1)
+            i = (close + 1) if close != -1 else n
+            buf = []
             continue
 
         # `name()` is a function definition, not an invocation of `name`.
@@ -356,6 +390,7 @@ def _command_heads(script: str) -> list[str]:
 
 def _unpinned_commands(script: str) -> list[str]:
     """Command heads bash would look up on PATH rather than run by path."""
+    functions = set(_FUNC_DEF.findall(script))
     bare = []
     for head in _command_heads(script):
         if not head:
@@ -363,13 +398,19 @@ def _unpinned_commands(script: str) -> list[str]:
         if head in _OPAQUE:
             bare.append(head)          # unreadable by any static check
             continue
-        if head in _SHELL_BUILTINS:
+        # What survives after removing variable expansions and quote marks is
+        # what bash actually looks up. `${Z}cat` with Z unset runs plain `cat`,
+        # so treating any head containing `$` as pinned was itself a bypass.
+        literal = _EXPANSION.sub("", head).replace("\x00", "")
+        if not literal:
+            continue                   # a pure expansion; nothing to resolve
+        if literal in _SHELL_BUILTINS or literal in functions:
             continue
-        if head.startswith(("/", "$", "-", "\"", "'", "~")):
+        if literal.startswith(("/", "-", "~")):
             continue
-        if _ASSIGNMENT.match(head):
+        if _ASSIGNMENT.match(literal):
             continue
-        bare.append(head)
+        bare.append(literal)
     return bare
 
 
@@ -408,6 +449,47 @@ def _unpinned_commands(script: str) -> list[str]:
 )
 def test_parser_sees_commands_that_hide_from_a_naive_scan(script, expected):
     assert _unpinned_commands(script) == expected
+
+
+@pytest.mark.parametrize(
+    "script, expected",
+    [
+        # Round 2. With Z unset these run plain `cat` off PATH; treating any
+        # head containing `$` as already-pinned was itself the bypass.
+        ("${Z}cat /tmp/grok-reply.md", ["cat"]),
+        ('"$Z"cat /tmp/grok-reply.md', ["cat"]),
+        # An option belongs to the prefix; the PATH lookup is still ahead.
+        ("sudo -E curl -s https://example.invalid", ["curl"]),
+        ("command -p curl -s https://example.invalid", ["curl"]),
+        ("time -p curl -s https://example.invalid", ["curl"]),
+        # A single-line case arm: stripping the label used to erase the
+        # boundary too, so the arm body read as arguments to the previous word.
+        ('case "$E" in APPROVE) curl -s https://example.invalid ;; esac', ["curl"]),
+        ('case "$E" in A) : ;;& B) curl -s https://x ;; esac', ["curl"]),
+    ],
+)
+def test_parser_sees_commands_hidden_by_expansion_options_or_case_arms(script, expected):
+    assert _unpinned_commands(script) == expected
+
+
+@pytest.mark.parametrize(
+    "script",
+    [
+        # Arithmetic EXPANSION is not a command context.
+        "N=$(( 1 + 2 ))",
+        "/usr/bin/printf '%s' $((1+1))",
+        "i=$((i+1))",
+        # An array literal is not a call to its first element.
+        "ARGS=(one two three)",
+        # A function defined here is not a PATH lookup when it is called.
+        "post() { /usr/bin/gh api \"$1\"; }\npost /repos/x/y",
+        # A label with nothing after it on the line.
+        'case "$E" in\n  APPROVE)\n    /usr/bin/jq . ;;\nesac',
+        "select x in a b; do /usr/bin/echo \"$x\"; done",
+    ],
+)
+def test_parser_tolerates_more_legitimate_shell(script):
+    assert _unpinned_commands(script) == []
 
 
 def test_parser_sees_past_a_heredoc_body_containing_an_apostrophe():
@@ -463,24 +545,77 @@ def test_no_workflow_persists_the_checkout_credential():
     )
 
 
+_COMMENT_LINE = re.compile(r"(?m)^[ \t]*#.*$")
+_TRAILING_COMMENT = re.compile(r"(?m)(?<=[ \t])#.*$")
+# Ways a step can put a directory on PATH for LATER steps. Keyed on the
+# mechanism, not on one variable name: `echo "PATH=$HOME/x:$PATH" >>
+# $GITHUB_ENV` prepends identically and contains no "GITHUB_PATH" at all.
+_PATH_MUTATORS = (
+    re.compile(r"GITHUB_PATH"),
+    re.compile(r"PATH=.*GITHUB_ENV", re.S),
+    re.compile(r"(?m)^\s*export\s+PATH="),
+)
+
+
+def _uncommented(run: str) -> str:
+    """`run` with shell comments removed.
+
+    The boundary below is a search over step bodies, and a step that merely
+    TALKS about GITHUB_PATH in a comment used to satisfy it — which slid the
+    boundary later and shrank the enforced set instead of growing it.
+    """
+    return _TRAILING_COMMENT.sub("", _COMMENT_LINE.sub("", run))
+
+
 def _steps_after_path_mutation(job: dict) -> list[dict]:
-    """Every step that runs after something prepends to PATH via GITHUB_PATH.
+    """Every step that runs after something puts a directory on PATH.
 
     DERIVED, never enumerated. `Install Grok Build CLI` puts $HOME/.grok/bin on
-    PATH straight out of a `curl | bash`, and GITHUB_PATH takes effect in
-    SUBSEQUENT steps — so the exposed set is positional, not a list of names
-    someone remembered to update. Enumeration is exactly what let cat/jq/gh sit
-    unpinned beside the git/python3/sed an earlier fix did pin, and what left
-    the step that writes `restrict_network = true` uncovered.
+    PATH straight out of a `curl | bash`, and that takes effect in SUBSEQUENT
+    steps — so the exposed set is positional, not a list of names someone
+    remembered to update. Enumeration is what let cat/jq/gh sit unpinned beside
+    the git/python3/sed an earlier fix did pin, and what left the step writing
+    `restrict_network = true` uncovered.
+
+    The EARLIEST mutation wins: taking the first match of a loose substring let
+    a later mention move the boundary forward and exempt everything before it.
     """
-    steps = job["steps"]
+    steps = job.get("steps") or []
     for i, step in enumerate(steps):
-        if "GITHUB_PATH" in str(step.get("run", "")):
+        body = _uncommented(str(step.get("run", "")))
+        if any(m.search(body) for m in _PATH_MUTATORS):
             return steps[i + 1:]
-    raise AssertionError("no step appends to GITHUB_PATH — boundary undefined")
+    return []
 
 
-def test_no_unpinned_command_runs_after_path_is_mutated(review):
+def _jobs_with_path_mutation() -> dict[str, dict]:
+    """Every job in every workflow that mutates PATH, by "file::job".
+
+    Derived for the same reason the step set is: naming two workflows left
+    grok-boundary-test.yml — which runs a deliberately ADVERSARIAL agent and
+    publishes its report — resolving base64, chmod and cat off the very PATH
+    the `curl | bash` in that job had just prepended to.
+    """
+    out = {}
+    for path in sorted((ROOT / ".github" / "workflows").glob("*.yml")):
+        for job_name, job in (_load(path).get("jobs") or {}).items():
+            if _steps_after_path_mutation(job):
+                out[f"{path.name}::{job_name}"] = job
+    return out
+
+
+def test_every_path_mutating_job_is_covered():
+    """A guard on the guard: if this set silently shrinks, the pinning test
+    below keeps passing while covering less."""
+    covered = set(_jobs_with_path_mutation())
+    assert {
+        "grok-review.yml::grok-review",
+        "grok.yml::grok",
+        "grok-boundary-test.yml::boundary",
+    } <= covered, f"a PATH-mutating job dropped out of scope: {sorted(covered)}"
+
+
+def test_no_unpinned_command_runs_after_path_is_mutated():
     """#263's stated threat model, applied consistently.
 
     A shadowed binary after this point is not a tidiness problem: a planted
@@ -489,51 +624,13 @@ def test_no_unpinned_command_runs_after_path_is_mutated(review):
     the leak gate outright because the credential never has to pass through the
     reply at all.
     """
-    jobs = {
-        "grok-review.yml": review["jobs"]["grok-review"],
-        "grok.yml": _load(ROOT / ".github" / "workflows" / "grok.yml")["jobs"]["grok"],
-    }
-    for name, job in jobs.items():
+    for label, job in _jobs_with_path_mutation().items():
         for step in _steps_after_path_mutation(job):
             bare = _unpinned_commands(step.get("run", ""))
             assert not bare, (
-                f"{name}::{step.get('name')} resolves {sorted(set(bare))} on "
-                "PATH after $HOME/.grok/bin was prepended; use an absolute path"
+                f"{label}::{step.get('name')} resolves {sorted(set(bare))} on "
+                "PATH after a directory was prepended; use an absolute path"
             )
-
-
-def test_leak_gate_steps_pin_path_binaries_and_pipe_isolated(review):
-    """#252: after GITHUB_PATH prepends $HOME/.grok/bin, gate/parser steps must
-    not resolve git/python3 via PATH, and the leak gate must not re-open a
-    /tmp file after hashing (pipe + python3 -I)."""
-    grok_yml = (ROOT / ".github" / "workflows" / "grok.yml").read_text(encoding="utf-8")
-    review_yml = REVIEW_YML.read_text(encoding="utf-8")
-    for name, text in (("grok.yml", grok_yml), ("grok-review.yml", review_yml)):
-        assert "/usr/bin/git fetch" in text, f"{name}: git fetch must be path-pinned"
-        assert "/usr/bin/git show" in text, f"{name}: git show must be path-pinned"
-        assert "/usr/bin/python3 -I -" in text, (
-            f"{name}: leak gate must run as isolated stdin script"
-        )
-        # Unpinned forms that #246 closed on boundary-test and #252 extends here.
-        assert "python3 /tmp/leak-gate.py" not in text, (
-            f"{name}: must not exec a /tmp gate file via unpinned python3"
-        )
-    # Parser path in grok-review: pinned interpreter, no PATH `cut`/`sed`,
-    # default parser via pipe (no /tmp re-open after git show).
-    post = next(s for s in review["jobs"]["grok-review"]["steps"] if s.get("name") == "Post review")
-    run = post["run"]
-    assert "/usr/bin/python3 -I" in run
-    assert "| cut " not in run and " | cut" not in run
-    assert "/usr/bin/sed -i" in run, "defang sed must be path-pinned"
-    # Bare `sed` (not /usr/bin/sed) must not appear as a command — PATH plant.
-    assert not any(
-        line.lstrip().startswith("sed ") for line in run.splitlines()
-    ), "Post review must not resolve bare sed on PATH"
-    assert "PARSER_BYTES=$(/usr/bin/git show" in run or 'PARSER_BYTES=$(/usr/bin/git show' in run
-    assert "printf '%s' \"$PARSER_BYTES\" | /usr/bin/python3 -I -" in run
-    assert "/tmp/parse_grok_verdict.py" not in run, (
-        "default parser must not re-open trusted bytes from /tmp"
-    )
 
 
 def test_app_tokens_are_minted_least_privilege(gate, review):

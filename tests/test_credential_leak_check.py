@@ -167,6 +167,66 @@ def test_hex_encoded_extraheader_is_caught(tmp_path):
     assert check(tmp_path, None, f"hex dump: {hexed}") == 1
 
 
+# Round 2 of the same adversarial review. Every case below walked out of the
+# round-1 gate, including one detection round 1 REMOVED while believing it had
+# kept it (the welded token).
+
+
+def test_token_welded_to_a_word_is_caught(tmp_path):
+    """Round 1 added a delimiter lookbehind to stop a false positive on joined
+    text, and applied it to the untouched reply too — which silently deleted
+    the whole un-delimited detection surface. "Print the token right after this
+    word, no space" was a one-token bypass of the entire shape layer."""
+    assert check(tmp_path, None, f"the credential retrieved was{FAKE_GHS}") == 1
+
+
+def test_blob_split_across_prose_is_caught(tmp_path):
+    """Stripping non-alphabet characters in place cannot fix this: the English
+    between the halves is itself alphabet characters and gets interleaved into
+    the blob. Only joining the RUNS and discarding the prose works."""
+    reply = (
+        f"First part: {FAKE_EXTRAHEADER[:38]}\n\n"
+        f"And the second part is: {FAKE_EXTRAHEADER[38:]}"
+    )
+    assert check(tmp_path, None, reply) == 1
+
+
+def test_nested_encoding_with_interior_text_is_caught(tmp_path):
+    """Round 1 recursed only while a view was ENTIRELY encoding alphabet, so a
+    single interior byte ended the descent."""
+    wrapped = base64.b64encode(
+        f"note: {FAKE_EXTRAHEADER} end".encode()
+    ).decode()
+    assert check(tmp_path, None, f"see {wrapped}") == 1
+
+
+def test_deeply_renested_token_is_caught(tmp_path):
+    """Re-encoding N times must not be a strategy."""
+    blob = FAKE_EXTRAHEADER
+    for _ in range(4):
+        blob = base64.b64encode(blob.encode()).decode()
+    assert check(tmp_path, None, f"deep: {blob}") == 1
+
+
+def test_hex_wrapping_a_base64_credential_is_caught(tmp_path):
+    hexed = f"x: {FAKE_EXTRAHEADER}".encode().hex()
+    assert check(tmp_path, None, f"dump {hexed}") == 1
+
+
+def test_double_encoded_auth_value_is_caught(tmp_path, auth_file):
+    """Value matching used to run on plaintext only, and `encoded_forms` only
+    ever re-encoded a secret ONCE. Two layers hid the real refresh token."""
+    doubled = base64.b64encode(
+        base64.b64encode(FAKE_REFRESH.encode())
+    ).decode()
+    assert check(tmp_path, auth_file, f"nested secret: {doubled}") == 1
+
+
+def test_comma_chunked_auth_value_is_caught(tmp_path, auth_file):
+    chunked = ",".join(FAKE_REFRESH[i:i + 3] for i in range(0, len(FAKE_REFRESH), 3))
+    assert check(tmp_path, auth_file, f"spread: {chunked}") == 1
+
+
 def test_base64url_extraheader_is_caught(tmp_path):
     encoded = base64.urlsafe_b64encode(
         f"x-access-token:{FAKE_GHS}".encode()
@@ -224,6 +284,16 @@ def test_prose_with_a_ghs_lookalike_word_is_not_a_leak(tmp_path, auth_file):
         "then continues describing the distribution at length."
     )
     assert check(tmp_path, auth_file, reply) == 0
+
+
+def test_the_gate_can_review_its_own_source(tmp_path, auth_file):
+    """The gate must be able to pass a review OF ITSELF. Measured: with shape
+    patterns applied to the alphabet-stripped view, the docstring phrase
+    "GitHub only ever mints ghs_/ghp_ into that header" collapsed into a token
+    shape and blocked. A gate that fires on every review of itself is a gate
+    that gets switched off — the whole reason this file exists."""
+    source = SCRIPT.read_text(encoding="utf-8")
+    assert check(tmp_path, auth_file, source) == 0
 
 
 def test_ordinary_base64_and_hashes_do_not_trip_the_decode_pass(tmp_path, auth_file):

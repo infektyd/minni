@@ -13,7 +13,9 @@ with ancestors applying unless they conflict, and policy prompts override
 dashboard-level criteria.
 """
 
+import importlib.util
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -93,6 +95,28 @@ def test_trust_policies_forbid_auto_approval(directory):
     assert "NEVER auto-approve" in text
     assert "do not approve" in text
     assert "request human reviewers" in text
+
+
+def test_every_policy_is_path_denied_by_the_mechanical_gate():
+    """The two lists must not drift. A policy file that Cursor obeys but the
+    mechanical gate treats as ordinary code is a merge gate a PR can rewrite
+    and then be auto-approved under — the approval path and the merge path
+    have to agree about what counts as trust surface."""
+    spec = importlib.util.spec_from_file_location(
+        "grok_approve_gate", ROOT / ".github" / "scripts" / "grok_approve_gate.py"
+    )
+    gate = importlib.util.module_from_spec(spec)
+    # @dataclass resolves annotations through sys.modules, so the module has to
+    # be registered before it executes.
+    sys.modules[spec.name] = gate
+    spec.loader.exec_module(gate)
+
+    paths = [ROOT / "APPROVAL_POLICY.md", ROOT / ".cursor" / "BUGBOT.md", ROUTING]
+    paths += [ROOT / d / "APPROVAL_POLICY.md" for d in TRUST_DIRS]
+    paths.append(Path(__file__))
+    for path in paths:
+        rel = path.relative_to(ROOT).as_posix()
+        assert gate.path_denied(rel), f"{rel} is not in PATH_DENY_PREFIXES"
 
 
 def test_policy_basenames_are_exact():
