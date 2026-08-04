@@ -4,7 +4,7 @@ Nested multi-agent Grok Build workflow that fans out **outer audit lanes**, each
 
 **Truth policy:** [docs-truth-policy.md](docs-truth-policy.md) — honesty *now*
 without erasing **next PR goals**. Code is truth for *present-tense* claims;
-overclaims that describe wanted product surfaces become `goal_next_pr` /
+overclaims that describe wanted capabilities become `goal_next_pr` /
 `honesty_partial`, not silent cuts.
 
 ## Files

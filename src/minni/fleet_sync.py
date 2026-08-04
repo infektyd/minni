@@ -1,4 +1,4 @@
-"""Product fleet sync: keep every Minni-serviced agent host on this install.
+"""Fleet sync: keep every Minni-serviced agent host on this install.
 
 Customer problem: the daemon/CLI package can move (pipx upgrade or git pull)
 while each host still points at an old ``~/.minni/plugin/<version>`` tree.

@@ -263,8 +263,8 @@ def cmd_wire(args: argparse.Namespace) -> int:
 def cmd_sync(args: argparse.Namespace) -> int:
     """Keep every Minni-serviced agent host on this install's plugin payload.
 
-    Product answer to "main/package moved but Claude/Codex/Grok still run last
-    week's server.js". See docs/install.md § Fleet sync and deploy/README.md.
+    Fixes "main/package moved but Claude/Codex/Grok still run last week's
+    server.js". See docs/install.md § Fleet sync and deploy/README.md.
     """
     from minni.fleet_sync import (
         auto_sync_status,
@@ -424,7 +424,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
     # 6. Fleet freshness (WARN): plugin/host lag is the #1 "I merged but agents
     # still run old hooks" footgun. Never fail doctor on it — customers may be
-    # mid-session — but always name the product command that fixes it.
+    # mid-session — but always name the command that fixes it.
     try:
         from minni.minnid_runtime.deploy_honesty import deploy_status
         deploy = deploy_status()

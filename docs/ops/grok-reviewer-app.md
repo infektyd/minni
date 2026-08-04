@@ -650,7 +650,7 @@ Personal rule:
 | Fix Highs in one tip freeze window | Push every residual and re-earn each time (whack-a-mole) |
 | Trust `commit_id` on the formal review | Trust Actions `headSha` on `issue_comment` runs |
 
-Optional local friction sampler (not productized): session notes under
+Optional local friction sampler: session notes under
 `scratchpad/friction/` when dogfooding campaigns.
 
 ### Assumptions that became (or become) next PR goals
@@ -663,6 +663,6 @@ must **not** erase ambition: overclaims that describe wanted surfaces become
 |---|---|---|
 | Multi-host PreToolUse deny (incl. Grok file-backed guard) | implement_now / goal | `wright/dm-grok-adapter` — open PR when ready |
 | `minni doctor` runs wire verify probes | honesty_cut | fixed; keep doctor scoped |
-| Fleet hosts track package/main automatically | ops_product | **`minni sync`** (this PR #273) |
+| Fleet hosts track package/main automatically | ops_fleet | **`minni sync`** (this PR #273) |
 | Stamp set includes marketplace + pyproject | honesty + release hygiene | checklist; marketplace in 0.4.2 |
 | Grok App cheaper re-earn / clearer PATH_DENY text | goal_next_pr (personal) | optional later (O3/O5/O6) |

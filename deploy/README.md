@@ -1,4 +1,4 @@
-# deploy/ — root update propagation (product + operator)
+# deploy/ — root update propagation (operator)
 
 The live machine executes code from several places that all descend from this
 install: the engine package (wheel or editable), the wire-managed plugin tree
@@ -78,7 +78,7 @@ signal is what tells you a sync (and daemon restart) is due.
 ## 2. Scheduled sync (opt-in automation)
 
 Unattended deploy of `origin/main` is an **operator decision**. Prefer the
-product entry point (installs the same plist template):
+entry point (installs the same plist template):
 
 ```sh
 minni sync --install-auto

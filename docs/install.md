@@ -12,10 +12,10 @@ minni doctor
 
 This gives you the `minni` and `minnid` commands and the full engine.
 
-## Docs honesty vs product goals
+## Docs honesty vs next-PR goals
 
 Operator docs must not lie about **present** behavior. Accuracy work must
-**not** erase wanted product surfaces by only deleting overclaims — see
+**not** erase wanted capabilities by only deleting overclaims — see
 [docs/ops/docs-truth-policy.md](ops/docs-truth-policy.md) (honesty now +
 `goal_next_pr` / PARTIAL with a pointer).
 
@@ -23,7 +23,7 @@ Operator docs must not lie about **present** behavior. Accuracy work must
 
 After you upgrade the package **or** pull a newer `main` in a dogfood
 checkout, the **daemon can move while each agent host still points at last
-week's plugin tree**. That is a product failure mode, not a power-user tip.
+week's plugin tree**. That is a real failure mode, not a power-user tip.
 
 ```bash
 minni sync              # redeploy plugin payload to all wire-primary hosts
@@ -31,7 +31,7 @@ minni sync              # redeploy plugin payload to all wire-primary hosts
 minni doctor            # WARN fleet if still stale; always names `minni sync`
 ```
 
-| You installed via… | After the product moves… |
+| You installed via… | After the install moves… |
 |---|---|
 | **PyPI / pipx** | `pipx upgrade minni` then **`minni sync`** |
 | **Editable checkout** (contributor dogfood) | `git pull` (clean `main`) then **`minni sync`**, or **`minni sync --full`** for pull + rebuild + redeploy (same as `make sync-root`) |

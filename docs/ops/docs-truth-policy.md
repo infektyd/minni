@@ -2,7 +2,7 @@
 
 **Problem this solves:** If accuracy work always treats “code is truth” as
 “**delete every overclaim**,” we get honest docs *and* erase the **goal signal**
-that should have become the next product PR. Cutting the claim is only half a
+that should have become the next PR. Cutting the claim is only half a
 decision.
 
 ## Dual track (required)
@@ -12,7 +12,7 @@ Every mismatch is classified **twice**:
 | Track | Question | Output |
 |-------|----------|--------|
 | **A — Honesty now** | What may operator docs assert *today* without lying? | Doc edit: cut, mark `PARTIAL` / provisional, or add underclaim |
-| **B — Intent / goal** | Was the false claim describing a **wanted product surface**? | If yes: **keep a durable next-PR goal** (issue, plan slice, or `## Goals` in the report) — do **not** only delete the sentence |
+| **B — Intent / goal** | Was the false claim describing a **wanted capability**? | If yes: **keep a durable next-PR goal** (issue, plan slice, or `## Goals` in the report) — do **not** only delete the sentence |
 
 Silent erase of ambition is a process defect.
 
@@ -25,7 +25,7 @@ Silent erase of ambition is a process defect.
 | `implement_now` | Clear defect vs an **accepted** contract (hooks matrix, security must) | Fix **code** (+ tighten docs) | Stay scoped; no drive-by features |
 | `goal_next_pr` | Wanted capability; not this PR’s job | Minimal honesty so docs don’t overclaim | Write goal title + acceptance sketch |
 | `underclaim_add` | Code has feature docs omit | Add docs with anchors | — |
-| `ops_product` | Install/fleet lag, not prose | Point at product verb (`minni sync`, etc.) | — |
+| `ops_fleet` | Install/fleet lag, not prose | Point at the fix command (`minni sync`, etc.) | — |
 
 Default for “doc says X, code doesn’t”: prefer **`honesty_partial` + `goal_next_pr`**
 over bare **`honesty_cut`**, unless the claim is actively dangerous (security
@@ -36,7 +36,7 @@ if the *intent* was legitimate.
 
 - Operators must not be told a lie about **current** behavior.
 - Cassandra GREENLIGHT = no residual **false present-tense claims** on operator
-  paths — **not** “no product ambition left in the tree.”
+  paths — **not** “no ambition left in the tree.”
 - Goals may live in: GitHub issues, Minni plan slices, PR body “Follow-ups”,
   or `docs/ops/*` goal tables — not only in deleted git history.
 
