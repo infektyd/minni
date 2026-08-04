@@ -8,6 +8,16 @@ Nested multi-agent Grok Build workflow that fans out **outer audit lanes**, each
 |------|------|
 | `.grok/workflows/docs-accuracy-converge.rhai` | Project workflow (source of truth in repo) |
 | `~/.grok/workflows/docs-accuracy-converge.rhai` | User copy for global discovery |
+| `docs/ops/agent-roster.md` | **Adaptive** model min/max roster (update after runs) |
+
+## Adaptive model roster
+
+Defaults (v1): **`grok-build`** for audit/wright/thread/app_owner; **`grok-4.5`** for loom + cassandra.
+
+- One-off override: `args.roster = { "audit": "grok-4", "wright": "grok-4.5", ... }`
+- After a real run: edit `agent-roster.md` + sync defaults in the `.rhai` if the evidence says so
+- Report includes `roster=...` for learning
+- Effort is **prompt guidance** until the host supports per-agent effort pins
 
 ## What it does
 

@@ -2,14 +2,17 @@
 // Outer fan-out (audit lanes) → loom → wright → Cassandra ping/pong until tight.
 // Optional: freeze tip + bare /grok-review (one owner). NEVER merges.
 //
+// ADAPTIVE MODEL ROSTER (min/max) — defaults below; override via args.roster.
+// Living policy: docs/ops/agent-roster.md — update after real runs, then sync defaults.
+//
 // args: {
-//   base?: "origin/main",           // compare / truth base
-//   branch?: "docs/accuracy-converge-<ts>",
+//   base?: "origin/main",
 //   max_cass_rounds?: 4,
-//   open_pr?: false,                // if true, wright opens PR after first fix
-//   grok_review?: false,            // if true, post bare /grok-review once tip frozen
+//   open_pr?: false,
+//   grok_review?: false,
 //   ghrepo?: "infektyd/minni",
 //   skip_minni_thread?: false,
+//   roster?: #{ audit, loom, wright, cassandra, thread, app_owner },  // model slugs
 // }
 
 let meta = #{
@@ -146,6 +149,38 @@ if do_grok == () { do_grok = false; }
 let skip_thread = a.skip_minni_thread;
 if skip_thread == () { skip_thread = false; }
 
+// --- Adaptive min/max roster (see docs/ops/agent-roster.md) ---
+// Defaults: cheap width (grok-build), heavy refute/synthesis (grok-4.5).
+let m_thread = "grok-build";
+let m_audit = "grok-build";
+let m_loom = "grok-4.5";
+let m_wright = "grok-build";
+let m_cass = "grok-4.5";
+let m_app = "grok-build";
+let roster = a.roster;
+if roster != () {
+    if roster.thread != () { m_thread = roster.thread; }
+    if roster.audit != () { m_audit = roster.audit; }
+    if roster.loom != () { m_loom = roster.loom; }
+    if roster.wright != () { m_wright = roster.wright; }
+    if roster.cassandra != () { m_cass = roster.cassandra; }
+    if roster.app_owner != () { m_app = roster.app_owner; }
+}
+let roster_line = "";
+roster_line += "thread=";
+roster_line += m_thread;
+roster_line += " audit=";
+roster_line += m_audit;
+roster_line += " loom=";
+roster_line += m_loom;
+roster_line += " wright=";
+roster_line += m_wright;
+roster_line += " cassandra=";
+roster_line += m_cass;
+roster_line += " app_owner=";
+roster_line += m_app;
+log("roster " + roster_line);
+
 let pin = "";
 pin += "REPO ";
 pin += repo;
@@ -165,6 +200,7 @@ if skip_thread == false {
         label: "minni-thread",
         capability_mode: "all",
         agent_type: "general-purpose",
+        model: m_thread,
         output_schema: thread_schema,
     });
     if t != () && t.success && t.output.plan_id != () {
@@ -202,12 +238,14 @@ for lane in lanes {
     lp += lane.focus;
     lp += "\nMUST use grep/read_file/run git show on the live tree — do not answer from memory. ";
     lp += "For each real gap return severity High|Med|Low, exact false claim quote, doc_path, code_anchor file:line or symbol, fix_hint. ";
-    lp += "Empty gaps only if you grepped and confirmed absence of false claims in scope. Nested: mentally dual-check each High against code twice before reporting.";
+    lp += "Empty gaps only if you grepped and confirmed absence of false claims in scope. Nested: mentally dual-check each High against code twice before reporting. ";
+    lp += "Effort guidance: low-medium — prefer thorough greps over long essays.";
     audit_jobs.push(#{
         prompt: lp,
         label: "audit:" + lane.id,
         capability_mode: "read-only",
         agent_type: "explore",
+        model: m_audit,
         output_schema: lane_schema,
     });
     li += 1;
@@ -255,12 +293,13 @@ if n_gaps == 0 {
 // --- Phase: Loom ---
 phase("Loom");
 let loom_p = pin;
-loom_p += "You are LOOM. Deduplicate and rank these audit gaps into ordered_fixes for a single wright pass. Prefer High first, one action per fix, list all paths touched. Produce rg_banlist: exact false substrings that must be absent from operator docs after fix.\n\nGAPS:\n";
+loom_p += "You are LOOM. Deduplicate and rank these audit gaps into ordered_fixes for a single wright pass. Prefer High first, one action per fix, list all paths touched. Produce rg_banlist: exact false substrings that must be absent from operator docs after fix. Effort guidance: high — resolve conflicts carefully.\n\nGAPS:\n";
 loom_p += gap_blob;
 let loom = agent(loom_p, #{
     label: "loom-plan",
     capability_mode: "read-only",
     agent_type: "loom",
+    model: m_loom,
     output_schema: loom_schema,
 });
 if loom == () || loom.success == false || loom.output.ordered_fixes == () {
@@ -281,12 +320,13 @@ if open_pr == true {
 } else {
     imp += "OPEN_PR=false: commit locally on branch; pr_number=0; still return branch and head_sha. ";
 }
-imp += "Return files_changed, branch, head_sha, summary, pr_number, pushed.\n\nPLAN_JSON:\n";
+imp += "Return files_changed, branch, head_sha, summary, pr_number, pushed. Effort guidance: medium — follow the loom plan tightly.\n\nPLAN_JSON:\n";
 imp += fix_blob;
 let impl = agent(imp, #{
     label: "wright-implement",
     capability_mode: "all",
     agent_type: "wright",
+    model: m_wright,
     isolation_worktree: true,
     output_schema: implement_schema,
 });
@@ -317,11 +357,12 @@ while round < max_cass {
     cp += round.to_string();
     cp += "/";
     cp += max_cass.to_string();
-    cp += ".";
+    cp += ". Effort guidance: high — fail closed; require file:line for REAL.";
     let ping = agent(cp, #{
         label: "cass-ping-" + round.to_string(),
         capability_mode: "read-only",
         agent_type: "cassandra",
+        model: m_cass,
         output_schema: cass_schema,
     });
     if ping == () || ping.success == false {
@@ -345,11 +386,12 @@ while round < max_cass {
     pp += head;
     pp += ". Summary: ";
     pp += cass_summary;
-    pp += ". Fix professionally, commit, push if remote branch exists. Return pushed_fix, head_sha, summary. Never merge.";
+    pp += ". Fix professionally, commit, push if remote branch exists. Return pushed_fix, head_sha, summary. Never merge. Effort guidance: medium-high.";
     let pong = agent(pp, #{
         label: "cass-pong-" + round.to_string(),
         capability_mode: "all",
         agent_type: "wright",
+        model: m_wright,
         isolation_worktree: true,
         output_schema: pong_schema,
     });
@@ -365,11 +407,12 @@ if do_grok == true && pr_num > 0 {
     let ap = pin;
     ap += "You are the SINGLE re-request owner for PR #";
     ap += pr_num.to_string();
-    ap += ". FREEZE: no more pushes. Post a GitHub issue comment whose body is EXACTLY the six characters /grok-review with no other text (workflow exact match). Wait for App review if practical; report app_verdict if present. Never merge. commanded=true if comment posted.";
+    ap += ". FREEZE: no more pushes. Post a GitHub issue comment whose body is EXACTLY the six characters /grok-review with no other text (workflow exact match). Wait for App review if practical; report app_verdict if present. Never merge. commanded=true if comment posted. Effort guidance: low — mechanical only.";
     let app = agent(ap, #{
         label: "app-bare-review",
         capability_mode: "execute",
         agent_type: "general-purpose",
+        model: m_app,
         output_schema: app_schema,
     });
     if app != () && app.success {
@@ -387,6 +430,8 @@ let report = "";
 report += "# Docs accuracy converge report\n\n";
 report += "- plan_id: ";
 report += plan_id;
+report += "\n- roster: ";
+report += roster_line;
 report += "\n- branch: ";
 report += branch;
 report += "\n- head_sha: ";
@@ -403,7 +448,11 @@ report += "\n- audit_gaps_raw: ";
 report += n_gaps.to_string();
 report += "\n\n## Loom summary\n";
 report += loom.output.summary;
-report += "\n\n## Operator next\n";
+report += "\n\n## Adaptive roster feedback\n";
+report += "If audit missed Highs cass found: bump audit model (see docs/ops/agent-roster.md).\n";
+report += "If wright needed >2 pongs: bump wright. If spend high and clean: cheapen audit.\n";
+report += "Update agent-roster.md Changelog after this run.\n";
+report += "\n## Operator next\n";
 report += "1. Review PR/branch; do not agent-merge.\n";
 report += "2. If stamps touch pyproject, expect mechanical PATH_DENY — admin merge only if intentional.\n";
 report += "3. Tag/publish separately for PyPI truth.\n";
@@ -414,6 +463,7 @@ complete(#{
     summary: report,
     path: path,
     plan_id: plan_id,
+    roster: roster_line,
     branch: branch,
     head_sha: head,
     pr_number: pr_num,
