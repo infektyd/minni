@@ -655,17 +655,14 @@ Optional local friction sampler (not productized): session notes under
 
 ### Assumptions that became (or become) next PR goals
 
-Docs-accuracy work treats **code / live behavior as truth** and rewrites
-docs that lie. When a doc describes a **product must** that code almost has
-but does not, that is a **code PR goal**, not a doc edit:
+See **[docs-truth-policy.md](docs-truth-policy.md)**. Present-tense honesty
+must **not** erase ambition: overclaims that describe wanted surfaces become
+`goal_next_pr` / `honesty_partial`, not silent cuts.
 
-| Assumption / claim | Direction | Status / next |
+| Assumption / claim | Disposition | Status / next |
 |---|---|---|
-| Multi-host PreToolUse deny (incl. Grok file-backed guard) | code may need adapter work | `wright/dm-grok-adapter` (local) — open PR when ready |
-| `minni doctor` does wire verify probes | docs were wrong | fixed in accuracy docs; keep doctor scoped |
-| Fleet hosts track package/main automatically | product gap | **`minni sync`** (this PR #273) |
-| Stamp set includes marketplace + pyproject | release hygiene | stamp checklist; marketplace in 0.4.2 |
-| Grok App cheaper re-earn / clearer PATH_DENY text | personal App polish | optional later (O3/O5/O6 in friction log) |
-
-Do **not** “fix” overclaims by implementing scope creep in the accuracy
-PR itself unless the operator wants that High fixed as code.
+| Multi-host PreToolUse deny (incl. Grok file-backed guard) | implement_now / goal | `wright/dm-grok-adapter` — open PR when ready |
+| `minni doctor` runs wire verify probes | honesty_cut | fixed; keep doctor scoped |
+| Fleet hosts track package/main automatically | ops_product | **`minni sync`** (this PR #273) |
+| Stamp set includes marketplace + pyproject | honesty + release hygiene | checklist; marketplace in 0.4.2 |
+| Grok App cheaper re-earn / clearer PATH_DENY text | goal_next_pr (personal) | optional later (O3/O5/O6) |

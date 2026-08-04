@@ -2,13 +2,19 @@
 
 Nested multi-agent Grok Build workflow that fans out **outer audit lanes**, each with nested judgment, then **loom → wright → Cassandra ping/pong**, optional bare `/grok-review`. **Never merges.**
 
+**Truth policy:** [docs-truth-policy.md](docs-truth-policy.md) — honesty *now*
+without erasing **next PR goals**. Code is truth for *present-tense* claims;
+overclaims that describe wanted product surfaces become `goal_next_pr` /
+`honesty_partial`, not silent cuts.
+
 ## Files
 
 | Path | Role |
 |------|------|
-| `.grok/workflows/docs-accuracy-converge.rhai` | Project workflow (source of truth in repo) |
+| `.grok/workflows/docs-accuracy-converge.rhai` | Project workflow |
 | `~/.grok/workflows/docs-accuracy-converge.rhai` | User copy for global discovery |
-| `docs/ops/agent-roster.md` | **Adaptive** model min/max roster (update after runs) |
+| `docs/ops/agent-roster.md` | **Adaptive** model min/max roster |
+| `docs/ops/docs-truth-policy.md` | Dual-track honesty + goal preservation |
 
 ## Adaptive model roster
 
@@ -23,11 +29,13 @@ Defaults (v1): **`grok-build`** for audit/wright/thread/app_owner; **`grok-4.5`*
 
 1. **Discipline** — Minni `thread_create` + activate (skippable).
 2. **AuditFanout** — 6 parallel **explore** lanes (stamps, deny matrix, AFM/install, fleet/cursor, team rename, runtimes/release).
-3. **Loom** — dedupe/rank fixes + `rg` banlist.
-4. **Implement** — **wright** in isolated worktree; optional PR open.
-5. **Cassandra** — ping/pong until `GREENLIGHT` or `max_cass_rounds`.
-6. **AppOptional** — if `grok_review=true` and PR exists, **one** owner posts body **exactly** `/grok-review`.
-7. **Report** — scratch report; operator land (admin if stamp path-filter).
+3. **Loom** — dedupe/rank; split **honesty_now** vs **goal_next_pr** lists.
+4. **Implement** — **wright** applies honesty (+ scoped `implement_now` only);
+   goals preserved in report / plan slices, not deleted.
+5. **Cassandra** — GREENLIGHT = no false **present-tense** operator claims
+   (goals remaining is OK).
+6. **AppOptional** — if `grok_review=true` and PR exists, **one** bare `/grok-review`.
+7. **Report** — **Honesty shipped** + **Goals preserved for next PRs**.
 
 ## Run
 

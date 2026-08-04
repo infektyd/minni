@@ -12,6 +12,13 @@ minni doctor
 
 This gives you the `minni` and `minnid` commands and the full engine.
 
+## Docs honesty vs product goals
+
+Operator docs must not lie about **present** behavior. Accuracy work must
+**not** erase wanted product surfaces by only deleting overclaims — see
+[docs/ops/docs-truth-policy.md](ops/docs-truth-policy.md) (honesty now +
+`goal_next_pr` / PARTIAL with a pointer).
+
 ## Keep every agent host current (`minni sync`)
 
 After you upgrade the package **or** pull a newer `main` in a dogfood
