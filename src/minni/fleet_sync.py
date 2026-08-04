@@ -117,6 +117,8 @@ def _run_wire(
         force_reinstall=force_reinstall,
         from_repo=str(from_repo) if from_repo else None,
         use_version=None,
+        # run_wire reads root CLI --socket (same default as minni_cli)
+        socket=str(Path.home() / ".minni" / "run" / "minnid.sock"),
     )
     # run_wire prints JSON and returns exit code — capture via subprocess for isolation
     # of stdout? Prefer in-process for tests; wire emits to stdout.
