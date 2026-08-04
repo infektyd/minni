@@ -21,6 +21,9 @@ when ``full=True`` (that path shells to ``update_root.sh``).
 
 from __future__ import annotations
 
+import contextlib
+import importlib.util
+import io
 import json
 import os
 import platform as py_platform
@@ -31,6 +34,11 @@ from argparse import Namespace
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
+
+# update_root.sh pulls git, reinstalls deps, wires and propagates. The launchd
+# timer runs it unattended every 6h, so a hung child must not pin a sync
+# process forever — every other subprocess here is already bounded.
+UPDATE_ROOT_TIMEOUT = 1800
 
 
 @dataclass
@@ -96,6 +104,39 @@ def _propagate_py(repo: Optional[Path]) -> Optional[Path]:
     return None
 
 
+def _is_wire_output(doc: Any) -> bool:
+    """WireOutput.emit shape — a nested ``gc: {}`` must not win the scan."""
+    return (
+        isinstance(doc, dict)
+        and "schema" in doc
+        and "status" in doc
+        and "results" in doc
+    )
+
+
+def _wire_status(text: str) -> Optional[str]:
+    """Read ``status`` out of wire's emitted JSON, or None if unreadable.
+
+    Same decode as scripts/update_root.sh: a ``--from-repo`` run can leak npm
+    banners onto stdout ahead of the document, and the pretty emit ends with
+    ``"gc": {}`` so the last ``{`` is the wrong anchor. Walk brace positions
+    and keep the last WireOutput-shaped object.
+    """
+    with contextlib.suppress(Exception):
+        doc = json.loads(text)
+        if _is_wire_output(doc):
+            return str(doc.get("status") or "") or None
+    found: Optional[str] = None
+    idx = text.find("{")
+    while idx >= 0:
+        with contextlib.suppress(Exception):
+            doc = json.loads(text[idx:])
+            if _is_wire_output(doc):
+                found = str(doc.get("status") or "") or None
+        idx = text.find("{", idx + 1)
+    return found
+
+
 def _run_wire(
     *,
     from_repo: Optional[Path],
@@ -120,11 +161,32 @@ def _run_wire(
         # run_wire reads root CLI --socket (same default as minni_cli)
         socket=str(Path.home() / ".minni" / "run" / "minnid.sock"),
     )
-    # run_wire prints JSON and returns exit code — capture via subprocess for isolation
-    # of stdout? Prefer in-process for tests; wire emits to stdout.
-    # Call the same path as CLI.
-    code = run_wire(ns)
-    return {"name": "wire_all", "exit_code": code, "from_repo": str(from_repo) if from_repo else None}
+    # run_wire prints its JSON report and returns an exit code. Tee stdout so
+    # the operator still sees the report while we read the status out of it:
+    # exit 1 alone cannot tell "wired nothing here" from "wiring failed".
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            code = run_wire(ns)
+    finally:
+        report = buf.getvalue()
+        if report:
+            sys.stdout.write(report)
+    status = _wire_status(report)
+    step: dict[str, Any] = {
+        "name": "wire_all",
+        "exit_code": code,
+        "status": status,
+        "from_repo": str(from_repo) if from_repo else None,
+    }
+    if code != 0 and status == "skipped":
+        # D5: wire exits 1 when it wired nothing. On a host with no
+        # wire-managed surfaces that is expected — propagate still owns
+        # antigravity/cursor — so it is a skip, not a redeploy failure
+        # (scripts/update_root.sh makes the same distinction).
+        step["skipped"] = True
+        step["reason"] = "no wire-managed host surfaces on this machine"
+    return step
 
 
 def _run_propagate(platform: str, repo: Optional[Path], dry_run: bool) -> dict[str, Any]:
@@ -166,6 +228,87 @@ def _run_propagate(platform: str, repo: Optional[Path], dry_run: bool) -> dict[s
     }
 
 
+def _grok_install_root() -> Optional[Path]:
+    """Active wire install root for grok, or None.
+
+    Prefer the newest *grok* wire specifically: after a partial `wire all`, a
+    global max over ``wired.json`` can pick claude-code's fresh root while grok
+    still points at an older tree, and the hooks would then stamp dist paths
+    grok never loads.
+    """
+    base = Path.home() / ".minni" / "plugin"
+    entries: list[tuple[str, Path]] = []
+    with contextlib.suppress(Exception):
+        data = json.loads((base / "wired.json").read_text(encoding="utf-8"))
+        entries = [
+            (str(w.get("wired_at") or ""), Path(str(w.get("install_root"))))
+            for w in data.get("wires", [])
+            if isinstance(w, dict)
+            and w.get("install_root")
+            and str(w.get("platform") or "") == "grok"
+        ]
+    entries = [(when, path) for when, path in entries if path.is_dir()]
+    if entries:
+        return max(entries, key=lambda e: e[0])[1]
+    current = base / "current"
+    if current.exists():
+        with contextlib.suppress(OSError):
+            resolved = current.resolve()
+            if resolved.is_dir():
+                return resolved
+    return None
+
+
+def _restamp_grok_hooks(repo: Optional[Path], *, dry_run: bool) -> dict[str, Any]:
+    """Refresh ~/.grok hooks + rules against the active wire install root.
+
+    Grok hooks/rules are propagate-only — `wire` never installs them — so a
+    fleet sync that skips this leaves the old manifest pointing at a versioned
+    tree that wire's GC then prunes, and every Grok hook silently dies. A full
+    `propagate --platform grok` is the wrong hammer: it would re-stamp MCP onto
+    the legacy agents tree. update_root.sh does exactly this narrower refresh
+    and counts a failure as a redeploy failure.
+    """
+    step: dict[str, Any] = {"name": "grok_hooks_rules"}
+    if dry_run:
+        return {**step, "exit_code": 0, "skipped": True, "reason": "dry-run"}
+    script = _propagate_py(repo)
+    if script is None:
+        return {
+            **step,
+            "exit_code": 2,
+            "error": "propagate.py not found in package payload or checkout",
+        }
+    root = _grok_install_root()
+    if root is None:
+        # Leftover ~/.grok alone does not justify failing a redeploy for an
+        # optional surface — skip loud.
+        return {
+            **step,
+            "exit_code": 0,
+            "skipped": True,
+            "reason": "no grok wire install root (and no ~/.minni/plugin/current)",
+        }
+    try:
+        spec = importlib.util.spec_from_file_location("minni_propagate_grok", script)
+        if spec is None or spec.loader is None:
+            raise ImportError(f"cannot load {script}")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        hooks = mod.update_grok_hooks(root)
+        rules = mod.write_grok_rules()
+    except Exception as exc:
+        return {**step, "exit_code": 1, "install_root": str(root), "error": str(exc)}
+    installed = bool(hooks.get("installed")) and bool(rules.get("installed"))
+    return {
+        **step,
+        "exit_code": 0 if installed else 1,
+        "install_root": str(root),
+        "hooks": hooks,
+        "rules": rules,
+    }
+
+
 def _kickstart_daemon() -> dict[str, Any]:
     if py_platform.system() != "Darwin":
         return {
@@ -193,6 +336,11 @@ def _kickstart_daemon() -> dict[str, Any]:
             "hint": "launchd agent not loaded; use: minni down && minni up",
         }
     return {"name": "restart_daemon", "exit_code": 0, "via": "launchctl kickstart"}
+
+
+def _step_failed(step: dict[str, Any]) -> bool:
+    """A step failed unless it exited 0 or declared itself skipped."""
+    return not step.get("skipped") and step.get("exit_code", 0) != 0
 
 
 def run_fleet_sync(
@@ -237,7 +385,21 @@ def run_fleet_sync(
         if dry_run:
             cmd.append("--dry-run")
         try:
-            proc = subprocess.run(cmd, check=False)
+            proc = subprocess.run(cmd, check=False, timeout=UPDATE_ROOT_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            return SyncResult(
+                ok=False,
+                install_kind=kind,
+                steps=[{"name": "update_root", "exit_code": 1, "timeout": UPDATE_ROOT_TIMEOUT}],
+                message=(
+                    f"update_root.sh timed out after {UPDATE_ROOT_TIMEOUT}s — "
+                    "the checkout may be mid-pull or waiting on input"
+                ),
+                next_actions=[
+                    "Run it in the foreground to see where it hangs: "
+                    "bash scripts/update_root.sh --repo <checkout>",
+                ],
+            )
         except OSError as exc:
             return SyncResult(
                 ok=False, install_kind=kind, message=str(exc),
@@ -281,6 +443,10 @@ def run_fleet_sync(
             "reason": "dry-run",
         })
 
+    # Grok hooks/rules are propagate-only; wire never installs them. Without
+    # this the hook manifest keeps pointing at a pruned versioned tree.
+    steps.append(_restamp_grok_hooks(checkout, dry_run=dry_run))
+
     if restart_daemon and not dry_run:
         steps.append(_kickstart_daemon())
     elif restart_daemon and dry_run:
@@ -291,19 +457,11 @@ def run_fleet_sync(
             "reason": "dry-run",
         })
 
-    hard_fail = any(
-        s.get("exit_code", 0) not in (0, 1)  # wire may exit 1 for partial skip
-        and not s.get("skipped")
-        for s in steps
-        if s.get("name", "").startswith("propagate")
-        and s.get("exit_code", 0) not in (0,)
-    )
-    # Wire: 0 = success, 1 = partial/skip, 2 = usage — treat 2 as fail
-    wire_code = next(
-        (s.get("exit_code", 0) for s in steps if s.get("name") == "wire_all"),
-        0,
-    )
-    ok = wire_code in (0, 1) and not hard_fail
+    # Every step is load-bearing: a nonzero exit is a failed fleet redeploy,
+    # never "sync complete". Steps that legitimately did nothing mark
+    # themselves ``skipped`` (dry-run, absent surface) and are excluded.
+    failed = [s for s in steps if _step_failed(s)]
+    ok = not failed
 
     msg = (
         f"fleet sync ({kind}): plugin payload redeployed to wire-primary hosts"
@@ -320,11 +478,21 @@ def run_fleet_sync(
             "After a new PyPI release: pipx upgrade minni && minni sync",
         )
 
+    if not ok:
+        detail = ", ".join(
+            f"{s.get('name')} (exit {s.get('exit_code')})" for s in failed
+        )
+        msg = f"fleet sync ({kind}) FAILED — {len(failed)} step(s) failed: {detail}"
+        next_actions = [
+            "Re-run after fixing the failing step: minni sync",
+            *next_actions,
+        ]
+
     return SyncResult(
         ok=ok,
         install_kind=kind,
         steps=steps,
-        message=msg if ok else "fleet sync completed with failures — see steps",
+        message=msg,
         next_actions=next_actions,
     )
 
