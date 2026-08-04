@@ -30,11 +30,13 @@ minni wire claude-code        # or: codex, kilocode, grok, generic, all
   `minni wire <platform> --from-repo /path/to/minni` (builds with Node, then
   runs the identical install + verify path, versioned as
   `<version>+git.<sha>`).
-- `all` wires codex, claude-code, kilocode, and grok. Gemini wiring is
-  provisional (skipped with a warning; use the checkout's
-  `propagate.py update-plugin --platform gemini` for now), and
-  antigravity/`generic` are always explicit single-platform wires. `generic`
-  requires `--agent` and `--install-root`.
+- `all` wires codex, claude-code, kilocode, and grok (`ALL_EXPANSION_V03`).
+  Cursor and antigravity are fleet-known but skipped from bulk wire
+  (cursor is propagate-managed; antigravity shares the Gemini tree and is
+  explicit-only). **Gemini family:** prefer `minni wire antigravity` or
+  `propagate --platform antigravity` (also covered by `make sync-root`); pure
+  `gemini` remains provisional-skip on wire (`gemini-provisional`), not the
+  day-to-day install path. `generic` requires `--agent` and `--install-root`.
 - Every wire ends with verification probes (MCP handshake, hook dry-run,
   config readback); the same probes run in `minni doctor`. Output is a single
   JSON document on stdout with per-platform results; exit code 0 = all
@@ -46,6 +48,35 @@ minni wire claude-code        # or: codex, kilocode, grok, generic, all
   already-installed version — rollback without touching the Python package.
 - The agent-driven `minni-install` skill handles first-time identity and
   vault seeding after the wire.
+- **After wire adoption**, do **not** re-run
+  `propagate.py update-plugin --platform codex|kilocode|grok` (or bulk
+  `propagate --platform all` expecting those hosts). Propagate's `all` expands
+  only to antigravity + cursor; explicit codex/kilocode/grok propagate still
+  rewrites MCP onto legacy cache/agents trees. Prefer `minni wire <platform>`
+  (or `make sync-root` from a checkout) to refresh wire-primary hosts. See
+  [deploy/README.md](../deploy/README.md).
+
+## Keep a live install current (checkout operators)
+
+If you dogfood from a source checkout (editable install + wire-managed plugin
+tree), the day-to-day refresh path is **`make sync-root`**, not a hand-rolled
+mix of pull / wire / propagate. It fast-forwards to `origin/main`, refreshes
+the editable install, rebuilds the plugin, redeploys with the D7 fleet
+partition (`minni wire all --from-repo` then propagate for antigravity +
+cursor only), restarts the daemon when launchd is loaded, and verifies with
+`check_versions` / `check_deployments --strict`.
+
+```bash
+make sync-root            # do it
+make sync-root DRY_RUN=1  # plan only
+minni status              # look for the deploy block: deploy.stale / plugin_dist
+```
+
+`minni status` (and the daemon's status RPC) expose a `deploy` block
+(`deploy_honesty.py`) that reports when the running process or the deployed
+plugin dist lags the checkout — including nested `plugin_dist.stale`, which
+rolls up into top-level `deploy.stale`. Details:
+[deploy/README.md](../deploy/README.md).
 
 ## Source install (contributors + `--from-repo` wiring)
 
@@ -81,10 +112,10 @@ wraps the doctor. The daemon listens on a Unix socket at
 `minni doctor` runs the same probes CI's hermetic smoke runs on every push:
 interpreter floor, socket presence and permissions, `status` RPC shape
 (`daemon` + `engine`), a recall round-trip, and model-cache presence. If
-doctor passes, the daemon is up and answering recalls. It does not exercise
-the background AFM consolidation pass
-(see [#119](https://github.com/infektyd/minni/issues/119) for that path's
-history), so doctor stays green regardless of that path's health.
+doctor passes, the daemon is up and answering recalls. It does **not** fully
+wet-exercise the background AFM consolidation loop (`MINNI_AFM_LOOP`, default
+off; functional since [#119](https://github.com/infektyd/minni/issues/119)
+closed), so doctor stays green whether that opt-in path is healthy or not.
 
 For a login-persistent daemon on macOS, a launchd template ships at
 `src/minni/launchd/com.minni.minnid.plist.example` (restart with
@@ -142,9 +173,11 @@ docker run --rm -it -v minni-data:/home/minni ghcr.io/infektyd/minni:latest
 
 The image is engine-only, runs as a non-root user, downloads models lazily at
 runtime (announced), and persists memory in the `minni-data` volume. It is the
-demo/eval channel — the supported day-to-day install is the source checkout
-above, because Minni's value is vaults living on your machine next to your
-editors and agent runtimes.
+demo/eval channel — the supported day-to-day install is **`pipx install minni`**
+plus **`minni wire <platform>`** (vaults and agent wiring live on your
+machine). Source checkout is for contributors, `--from-repo` wiring when the
+wheel payload is missing or you are dogfooding `main`, and
+`make sync-root` / fleet redeploy — not the default operator path.
 
 ## Manual vault indexing
 
@@ -179,8 +212,11 @@ layout), bring your checkout current:
    ```bash
    .venv/bin/minni wire <yours> --from-repo .
    ```
-   (`propagate.py update-plugin --platform <yours>` still works and remains
-   the path for gemini while its wiring is provisional.)
+   Prefer `minni wire` for codex/claude-code/kilocode/grok after wire adoption;
+   `propagate.py update-plugin` remains the path for cursor and for the Gemini
+   family via **antigravity** (pure `gemini` is provisional). Do not
+   bulk-propagate wire-primary platforms expecting a fleet refresh — see
+   [deploy/README.md](../deploy/README.md).
 4. For launchd users: update the plist's three paths — python interpreter →
    `/path/to/repo/.venv/bin/python`, script args → `-m minni.minnid`,
    `WorkingDirectory` → repo root — then run:

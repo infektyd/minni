@@ -1,6 +1,8 @@
 # Kilo Code
 
-Wire Kilo Code to a running Minni daemon from your checkout:
+**Prefer `minni wire kilocode`.** Kilo is a wire-primary platform
+(`ALL_EXPANSION_V03` — included in `minni wire all` and in `make sync-root`'s
+wire pass).
 
 ```bash
 .venv/bin/minni up   # if the daemon isn't already running
@@ -8,14 +10,18 @@ minni wire kilocode                                   # v0.3+ wheel (bundled pay
 .venv/bin/minni wire kilocode --from-repo .           # source checkout
 ```
 
-(`propagate.py update-plugin --platform kilocode` from the checkout still works as
-the legacy path.) `kilocode` is also included in `minni wire all`.
+`propagate.py update-plugin --platform kilocode` is a **pre-wire recovery**
+path only. After wire adoption, re-running propagate for kilocode rewrites MCP
+onto legacy trees and can undo wire-managed roots. Propagate's
+`--platform all` does **not** include kilocode (only antigravity + cursor).
+Refresh with `minni wire kilocode --from-repo .` or `make sync-root` — see
+[deploy/README.md](../../deploy/README.md).
 
 This registers the MCP server (`plugins/minni/.kilocode-plugin/`,
 `~/.config/kilo/kilo.json`), pins the agent identity
 (`MINNI_KILOCODE_AGENT_ID=kilocode`), the per-agent vault
 (`~/.minni/kilocode-vault`), and installs the Kilo hook entrypoint
-(`dist/kilocode-hook.js`).
+(`dist/kilocode-hook.js`) from the wire-managed plugin tree.
 
 ## In-process bridge, not a manifest
 

@@ -135,10 +135,12 @@ directory or impersonate another `agent_id` when calling `learn` or `log_event`.
 
 ### Temporary team profiles
 
-The plugin may create temporary team profiles through `sovereign_team_runtime`.
-These profiles are coordination packets, not durable identities. They can carry
-role, focus, ownership, permissions, and hydration context, but they do not
-grant cross-agent vault writes, automatic learning, daemon-side execution, or
+The plugin may create temporary team profiles through `minni_team_runtime`
+(with `minni_team_evidence` for helper-report summaries and
+`minni_team_promotion` for post-approval promotion drafts). These profiles are
+coordination packets, not durable identities. They can carry role, focus,
+ownership, permissions, and hydration context, but they do not grant
+cross-agent vault writes, automatic learning, daemon-side execution, or
 identity promotion. Promotion from temporary profile to reusable agent identity
 requires explicit operator approval after evidence review.
 
@@ -364,39 +366,19 @@ before it merges.
 
 The s6 recall **guard** is a `PreToolUse` hook that can **deny** a tool call
 before it runs (deny-to-surface: the agent re-issues the call after consulting
-recall). Two surfaces expose a deny-capable pre-tool hook:
+recall). **Multiple hosts expose deny-capable pre-tool hooks** — Claude is
+deepest (all-tool coverage plus live recall-state), not unique. Full matrix and
+decision enums: `docs/contracts/hook-platforms.md`.
 
-- **Claude Code** — the guard is registered in `plugins/minni/hooks/hooks.json`
-  and fully live (its `UserPromptSubmit` hook writes the recall-state the guard
-  acts on).
-- **Gemini/Antigravity via the agy CLI** (#133) — agy's plugin hook system
-  dispatches `PreToolUse` with a deny-capable decision string, and the guard is
-  wired in `plugins/minni/hooks/hooks-gemini.json` through the agy payload
-  adapter (`gemini-adapter.ts`). It is **inert in practice** on agy 1.0.15:
-  agy dispatches only `PreToolUse`/`PostToolUse`/`Stop`, and without a
-  `UserPromptSubmit` event no recall-state is ever written, so the guard always
-  approves. It lights up automatically once agy adds prompt-level hooks.
-
-The reason the guard is not wired on every surface differs per platform, and
-the previous blanket claim here ("no equivalent deny-capable pre-tool event")
-was wrong for two of the three. Verified against the shipped vendor docs — see
-`docs/contracts/hook-platforms.md`:
-
-| Surface | Deny-capable pre-tool event? | Why the guard is / is not wired |
+| Surface | Deny-capable pre-tool? | Guard / recall-state reality |
 |---|---|---|
-| `codex` | Yes — but **Bash interception only** | The guard gates `Read`/`Grep`/`Glob`, which never fire `PreToolUse` on Codex. Not wireable **for these tools**. |
-| `grok-build` | Yes, broad tool coverage | Genuinely available; wiring it is open work, not a platform gap. |
-| `kilocode` | Yes — throw from `tool.execute.before` | Already wired through the bridge plugin. |
+| `claude-code` | Yes — all tools (`allow`/`deny`/`ask`/`defer`) | Fully live: `hooks.json` + `UserPromptSubmit` writes the recall-state the guard acts on. |
+| `kilocode` | Yes — throw from `tool.execute.before` (or permission.ask) | Wired via the bridge plugin; broad coverage. |
+| `cursor` | Yes — `preToolUse` (`allow`/`deny`; `ask` unenforced) | Wired via Cursor adapters; broad coverage. Session injection has known vendor limits (see hook-platforms). |
+| `grok-build` | Yes — broad tool coverage (`allow`/`deny`) | `PreToolUse` + `UserPromptSubmit` registered (`hooks-grok.json`). Passive **stdout injection** is ignored on Grok (no prompt-time envelope to the model). That does **not** discard the on-disk recall-state file: `UserPromptSubmit` still `writeRecallState`s when recall is strong, and `PreToolUse` `readRecallState`s it — so the file-backed guard can still deny. What is weaker than Claude is prompt-time *injection*, not the guard pointer. |
+| `antigravity` / agy | Yes — broad (`allow`/`deny`/`ask`/`force_ask`; rejects `approve`/`block`) | Wired in `hooks-gemini.json` via the agy adapter. Current agy (1.1.7+) dispatches SessionStart, PreInvocation (UPS analogue), PreToolUse, Stop; PreInvocation can write file-backed recall-state when transcript enrichment succeeds. Depth still lags Claude’s full envelope + live pointer path. |
+| `codex` | Yes — **Bash interception only** | Guard gates `Read`/`Grep`/`Glob`, which never fire `PreToolUse` on Codex. Not wireable **for those tools**. |
 
-Note also that `codex`, `grok-build` and `kilocode` do **not** all receive the
-`UserPromptSubmit` recall pointer: on Grok Build, hook stdout is ignored for
-passive events, so it is written and discarded.
-**Gemini's situation has changed**: agy 1.1.7 dispatches `SessionStart`,
-`PreInvocation`, `PostInvocation`, `PreToolUse`, `PostToolUse` and `Stop`, and
-injects context via `injectSteps`. The older note below described agy 1.0.15 and
-a manifest that agy was in fact rejecting outright;
-there is no boot injection and no per-prompt recall pointer until agy grows
-`SessionStart`/`UserPromptSubmit` events (they are pre-declared in
-`hooks-gemini.json` so they activate without a reinstall). If another surface
-later exposes a deny-capable pre-tool hook, wire it in `propagate.py` (see the
-note above `platform_spec`).
+If another surface later changes deny coverage or event set, update
+`hook-platforms.md` first and keep this section a thin summary. Wire new hosts
+in `propagate.py` / wire adapters (see the note above `platform_spec`).

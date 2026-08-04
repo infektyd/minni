@@ -9,7 +9,7 @@
     {
       "name": "minni",
       "description": "Local-first Minni spine for Claude Code with per-agent vaults, review-first learning, and native AFM provider support.",
-      "version": "0.4.1",
+      "version": "0.4.2",
       "source": "./plugins/minni",
       "author": {
         "name": "Minni"

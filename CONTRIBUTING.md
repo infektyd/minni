@@ -42,6 +42,27 @@ isolated `MINNI_HOME` and asserts no pollution of your real `~/.minni`.
 See the Makefile (`make help`) for the full target list, including `lint`,
 `typecheck`, `build`, `coverage`, and `daemon`.
 
+## Dogfooding the live machine
+
+If this checkout *is* the machine's live Minni install (editable pip +
+wire-managed plugin tree under `~/.minni/plugin/`), do not refresh by hand
+with a random mix of `git pull`, single-platform wire, and bulk propagate.
+
+```bash
+make sync-root              # fast-forward main, reinstall, rebuild, redeploy, verify
+make sync-root DRY_RUN=1    # plan only
+make check-versions         # read-only: pyproject / manifests / marketplace / install / deploy version agreement
+make check-deployments      # --strict fleet surface check (also run by sync-root)
+# process vs checkout tip (stale daemon / plugin_dist): minni status → deploy block
+```
+
+Fleet partition (D7): `minni wire all` covers codex / claude-code / kilocode /
+grok. `propagate --platform all` covers **only** antigravity + cursor. After
+wire adoption, **never bulk-propagate wire-primary platforms** and avoid
+explicit `propagate update-plugin --platform codex|kilocode|grok` — those paths
+still rewrite MCP onto legacy cache/agents trees. Prefer `minni wire …` or
+`make sync-root`. Operator reference: [deploy/README.md](deploy/README.md).
+
 ## Pull requests
 
 - **One concern per PR.** Keep the diff scoped to a single fix, feature, or

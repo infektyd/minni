@@ -54,7 +54,7 @@ Honest caveats: Minni is **early (v0.4)**, with tiny adoption, no published benc
 
 ## Quickstart
 
-Minni is two pieces: the **daemon + CLI** (PyPI) and the **agent wiring** (the MCP plugin and per-runtime hooks), which `minni wire <platform>` installs. Step 1 gives you a working, verifiable memory daemon; step 2 is what actually connects your agents to it. Wheels have shipped the plugin payload bundled inside the package since **v0.3** (current release: **v0.4.1**), so both steps are `pipx install minni` and nothing else — a source checkout (`--from-repo`) is only needed for contributors working from `main`.
+Minni is two pieces: the **daemon + CLI** (PyPI) and the **agent wiring** (the MCP plugin and per-runtime hooks), which `minni wire <platform>` installs. Step 1 gives you a working, verifiable memory daemon; step 2 is what actually connects your agents to it. Wheels have shipped the plugin payload bundled inside the package since **v0.3**. This tree is stamped **v0.4.2** (changelog ready); **PyPI still serves the last tagged release until `v0.4.2` is tagged and the release workflow publishes** — check [pypi.org/project/minni](https://pypi.org/project/minni/) for what `pipx install minni` installs today. A source checkout (`--from-repo`) is only needed for contributors working from `main`.
 
 ### 1. Install the daemon + CLI (PyPI)
 
@@ -90,10 +90,10 @@ Swap the platform for any of these:
 
 | Platform | `minni wire` | Notes |
 |---|---|---|
-| `claude-code` · `codex` · `kilocode` · `grok` | yes | exactly what `all` expands to |
-| `antigravity` · `generic` | yes, individually | not covered by `all` |
-| `gemini` | provisional | `all` skips it with a warning — see [docs/runtimes/gemini.md](docs/runtimes/gemini.md) |
-| `cursor` | not yet | installs via the `minni-install` skill — see [docs/runtimes/cursor.md](docs/runtimes/cursor.md) |
+| `claude-code` · `codex` · `kilocode` · `grok` | yes | exactly what `wire all` expands to |
+| `antigravity` · `generic` | yes, individually | not covered by `wire all` |
+| `gemini` | provisional | `wire all` skips it with a warning — see [docs/runtimes/gemini.md](docs/runtimes/gemini.md) |
+| `cursor` | fleet-known, skip | in `VALID_PLATFORMS` but wire expands to skip; install via `propagate.py` / `make sync-root` — [docs/runtimes/cursor.md](docs/runtimes/cursor.md) |
 
 Every wire ends with verification probes — an MCP handshake against the installed server, a hook dry-run, and a config readback — and the same checks live on in `minni doctor`. Old payload versions are garbage-collected only when no agent's config still references them; `--use-version` re-wires a platform to a previous install for rollback. This registers the MCP server, the per-agent vault path, and that host's hook entrypoint; the agent-driven `minni-install` skill handles first-time identity and vault seeding. Per-runtime pages: [Claude Code](docs/runtimes/claude-code.md) · [Codex](docs/runtimes/codex.md) · [Gemini / Antigravity](docs/runtimes/gemini.md) · [Grok](docs/runtimes/grok.md) · [Kilo Code](docs/runtimes/kilocode.md) · [Cursor](docs/runtimes/cursor.md).
 
@@ -119,6 +119,10 @@ the receiver acks before the sender releases it...
 Prefer a container? The eval image runs the daemon with zero local setup: `docker run --rm -it -v minni-data:/home/minni ghcr.io/infektyd/minni:latest` (see [docs/install.md](docs/install.md)).
 
 Want proof agents are actually using memory? `minni watch` tails every recall, learn, and guard decision live in the terminal ([docs](docs/runtime-integration.md#observability-minni-watch)), and the web console (`npm run console` in `plugins/minni`) serves the Memory Board — an infinite canvas over live daemon data: staged learnings, session receipts, traffic pulses ([docs](docs/runtime-integration.md#console-observability)).
+
+### Keep the live install current
+
+If you run Minni from a source checkout (editable engine + wire-managed plugin tree), **`make sync-root`** is the operator refresh path: fast-forward to `origin/main`, reinstall, rebuild the plugin, redeploy with the D7 fleet partition, then **restart when launchd is loaded** (`launchctl kickstart`); without launchd it only probes the socket — bounce minnid yourself (`minni down && minni up` / systemd) if `deploy.stale` stays true. Watch `minni status` for the `deploy` block — top-level `deploy.stale` includes nested `plugin_dist.stale`. **`minni wire all` ≠ `propagate --platform all`**: wire covers codex/claude-code/kilocode/grok; propagate's `all` is only antigravity + cursor (and post-wire propagate of codex/kilo/grok rewrites MCP onto legacy trees). Full story: [deploy/README.md](deploy/README.md).
 
 ## Architecture at a glance
 
@@ -166,7 +170,7 @@ Two things reach the daemon that are not the same thing. **Agents call** MCP too
 
 ## Status
 
-Minni is at **v0.4.1**, live on [PyPI](https://pypi.org/project/minni/): the daemon and CLI install with one `pipx install minni`, releases publish via OIDC trusted publishing from tagged builds, and hook support covers Claude Code, Codex, Gemini / Antigravity, Grok, Cursor, and Kilo Code. Interfaces can still change before 1.0, adoption is small, and the public contract is intentionally smaller than the implementation. How each release got here is in [CHANGELOG.md](CHANGELOG.md); this section only says what state the project is in today.
+Minni's **repo tip is stamped v0.4.2** ([CHANGELOG.md](CHANGELOG.md)); **PyPI lags until a `v0.4.2` GitHub tag triggers OIDC trusted publishing** — the badge above and [pypi.org/project/minni](https://pypi.org/project/minni/) show what installs today (currently the last published tag, often still 0.4.1). After publish, the daemon and CLI install with one `pipx install minni`. Hook support covers Claude Code, Codex, Gemini / Antigravity, Grok, Cursor, and Kilo Code. Interfaces can still change before 1.0, adoption is small, and the public contract is intentionally smaller than the implementation.
 
 What "works" is not asserted, it is *executed in public*: CI stands the daemon up from nothing on a clean Linux runner and proves status, recall, and home-directory isolation on every push — the same check `minni doctor` gives you locally. A benchmark harness (`bench/membench`, byte-reproducible scorecards) exists, but no headline numbers are published until real-model runs are: when in doubt, this project under-claims. In that spirit: the core multi-agent loop — multiple approved agents sharing one governed daemon — is dogfooded daily (Minni is developed using Minni), while the temporary-team orchestration surface (`minni_team_*`) has unit tests but no real-world mileage yet.
 
@@ -176,6 +180,7 @@ What "works" is not asserted, it is *executed in public*: CI stands the daemon u
 |---|---|
 | Concepts — four verbs, two-tier storage, governance gate | [docs/concepts.md](docs/concepts.md) |
 | Install & troubleshooting (incl. Docker eval image) | [docs/install.md](docs/install.md) |
+| Keep live checkout current (`make sync-root`, fleet partition) | [deploy/README.md](deploy/README.md) |
 | Per-runtime setup | [docs/runtimes/](docs/runtimes/) |
 | Architecture — components, data model, MCP tools | [docs/architecture.md](docs/architecture.md) |
 | Security model | [docs/security.md](docs/security.md) · [SECURITY_PLAN.md](docs/archive/SECURITY_PLAN.md) |
