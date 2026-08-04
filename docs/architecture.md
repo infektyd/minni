@@ -113,7 +113,7 @@ them exactly as written (there is no family/action dispatch layer):
 | Recall | `minni_recall`, `minni_drill`, `minni_route`, `minni_export_pack` |
 | Learning | `minni_learn`, `minni_learning_quality`, `minni_resolve_candidate` |
 | Vault | `minni_vault_write`, `minni_compile_vault` |
-| Threads | `minni_thread_create`, `minni_thread_update`, `minni_thread_status`, `minni_thread_activate`, `minni_thread_deactivate`, `minni_thread_replan`, `minni_thread_history`, `minni_thread_revision`, `minni_thread_diff`, `minni_thread_restore`, `minni_thread_scar` (the pre-rename `minni_plan_*` names remain registered as deprecated aliases until the release after next) |
+| Threads | `minni_thread_create`, `minni_thread_update`, `minni_thread_status`, `minni_thread_activate`, `minni_thread_deactivate`, `minni_thread_replan`, `minni_thread_history`, `minni_thread_revision`, `minni_thread_diff`, `minni_thread_restore`, `minni_thread_scar` (the pre-rename `minni_plan_*` aliases have been removed; only the `minni_thread_*` names are registered) |
 | Handoff | `minni_negotiate_handoff`, `minni_ack_handoff`, `minni_list_pending_handoffs`, `minni_await_handoff` |
 | Agent ping | `minni_ping_agent_request`, `minni_ping_agent_inbox`, `minni_ping_agent_decide`, `minni_ping_agent_status` |
 | Team mode | `minni_team_runtime`, `minni_team_evidence`, `minni_team_promotion` |
@@ -134,8 +134,7 @@ Startup hooks inject compact identity, active **thread** state
 (`active_thread` / `active_thread_ref`; on-disk `_active_plan.json` remains
 the frozen pointer filename), correction re-assertions, and bounded
 inbox/candidate state. On Claude Code, the `<minni:context>` envelope carries
-the lifecycle spine (`prepare_task → prepare_outcome → thread → learn`;
-`plan` / `minni_plan_*` remain deprecated aliases), backed
+the lifecycle spine (`prepare_task → prepare_outcome → thread → learn`), backed
 by a deny-capable `PreToolUse` recall-guard backstop. Several hosts expose
 pre-tool **deny capability** (Claude, Kilo, Cursor, Grok, Antigravity/agy;
 Codex is Bash-only). **Live Minni s6 cold-tool guard** (file-backed

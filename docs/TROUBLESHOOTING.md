@@ -207,9 +207,10 @@ rewrites MCP onto legacy trees. See [deploy/README.md](../deploy/README.md).
 
 The durable planning surface ships as **`minni_thread_*`** tools and envelope
 keys **`active_thread` / `active_thread_ref`**. Older docs and vault artifacts
-still say "active plan" / `_active_plan.json` / `minni_plan_*` — those plan
-names remain as **deprecated aliases** until a later release, and on-disk
-pointer files may still use the historical `_active_plan.json` path. When
+still say "active plan" / `_active_plan.json` / `minni_plan_*` — the
+`minni_plan_*` tool aliases have been **removed** (call `minni_thread_*`), and
+on-disk pointer files may still use the frozen historical `_active_plan.json`
+path. When
 debugging "no active plan" injection or id-less tool resolution, check both the
 envelope's `active_thread` field and the vault artifacts pointer; the MCP
 primary names are `minni_thread_*`.
