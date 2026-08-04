@@ -292,6 +292,16 @@ test("isToolInScope: soft scopes Grep/Read/Glob only; strict adds read Bash; off
   assert.equal(isToolInScope("soft", "Edit", {}), false);
 });
 
+test("isToolInScope: Grok native cold tools (read_file/grep/list_dir) are in soft CORE_SCOPE", () => {
+  assert.equal(isToolInScope("soft", "read_file", {}), true);
+  assert.equal(isToolInScope("soft", "grep", {}), true);
+  assert.equal(isToolInScope("soft", "list_dir", {}), true);
+  assert.equal(isToolInScope("soft", "run_terminal_command", { command: "rg x ." }), false);
+  assert.equal(isToolInScope("strict", "run_terminal_command", { command: "rg x ." }), true);
+  assert.equal(isToolInScope("strict", "run_terminal_command", { command: "npm test" }), false);
+  assert.equal(isToolInScope("off", "read_file", {}), false);
+});
+
 test("decideGuard: deny only when state+unconsumed+strong+in-scope+non-off", () => {
   const base = { mode: "soft", threshold: 0.55, toolName: "Grep", toolInput: {} };
   assert.equal(decideGuard({ ...base, state: STRONG_STATE }), "deny");

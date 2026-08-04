@@ -1,10 +1,12 @@
 // Gemini/Antigravity (agy CLI) hook entry point (#133). Handler logic lives
 // in the shared createHookHandlers factory (hook-handlers.ts); this file
-// supplies the gemini-specific constants and — unlike codex/grok/kilocode,
-// which speak Claude Code's hook protocol natively — wraps dispatch in the
-// agy payload/output adapters (gemini-adapter.ts).
+// supplies the gemini-specific constants and wraps dispatch in the agy
+// payload/output adapters (gemini-adapter.ts).
 //
-// It cannot reuse runHookMain: agy errors on an empty PreToolUse decision, so
+// Codex and kilocode (via bridge) can use bare runHookMain with Claude-shaped
+// PreToolUse. Grok Build does not — it has its own adapter (grok-adapter.ts /
+// grok-hook.ts) for camelCase toolName/toolInput and {decision,reason} output.
+// agy is a third non-Claude protocol: empty PreToolUse decisions error, so
 // EVERY exit path of a PreToolUse invocation — hooks disabled, unknown event,
 // handler error — must emit an explicit {"decision":"allow"} instead of
 // runHookMain's bare {continue:true}. See gemini-adapter.ts for the protocol.

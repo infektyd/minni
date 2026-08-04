@@ -28,8 +28,20 @@ export const PRE_TOOL_USE_EVENT = "PreToolUse";
 
 export type RecallGuardMode = "off" | "soft" | "strict";
 
-/** The bare cold search/read tools the guard scopes in every (non-off) mode. */
-const CORE_SCOPE_TOOLS = new Set(["Grep", "Read", "Glob"]);
+/**
+ * Bare cold search/read tools the guard scopes in every (non-off) mode.
+ * Includes Claude Code names and Grok Build natives (Read→read_file, Grep→grep,
+ * Glob/ListDir→list_dir). Adapters map hosts onto Claude names when they can;
+ * dual listing keeps the guard live if a native name still reaches decideGuard.
+ */
+const CORE_SCOPE_TOOLS = new Set([
+  "Grep",
+  "Read",
+  "Glob",
+  "grep",
+  "read_file",
+  "list_dir",
+]);
 
 /**
  * Resolve the guard mode from config. Default "soft" (Grep/Read/Glob only; Bash
@@ -125,8 +137,9 @@ export function isToolInScope(
 
   if (CORE_SCOPE_TOOLS.has(toolName)) return true;
 
-  if (toolName === "Bash") {
-    if (mode !== "strict") return false; // soft mode leaves Bash untouched
+  // Bash (Claude) and run_terminal_command (Grok native; adapter maps to Bash).
+  if (toolName === "Bash" || toolName === "run_terminal_command") {
+    if (mode !== "strict") return false; // soft mode leaves shell untouched
     const command =
       toolInput && typeof toolInput.command === "string" ? toolInput.command : "";
     return isReadSearchBashCommand(command);

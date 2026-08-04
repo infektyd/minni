@@ -66,7 +66,7 @@ minni up       # start the daemon in the background
 minni doctor   # verify the install end to end
 ```
 
-`doctor` runs the same probes CI uses on every push — daemon status shape, a recall round-trip, socket permissions, model cache — and reports in plain language. `minni down` stops the daemon.
+`doctor` checks the local install subset: interpreter floor, socket presence/permissions, daemon `status` shape, a recall round-trip, and model-cache presence. It does **not** run wire verify probes (MCP handshake, hook dry-run, config readback — those belong to `minni wire` re-run) and does **not** assert the CI hermetic smoke's throwaway-`MINNI_HOME` isolation. `minni down` stops the daemon.
 
 ### 2. Wire your agents
 
@@ -95,7 +95,7 @@ Swap the platform for any of these:
 | `gemini` | provisional | `wire all` skips it with a warning — see [docs/runtimes/gemini.md](docs/runtimes/gemini.md) |
 | `cursor` | fleet-known, skip | in `VALID_PLATFORMS` but wire expands to skip; install via `propagate.py` / `make sync-root` — [docs/runtimes/cursor.md](docs/runtimes/cursor.md) |
 
-Every wire ends with verification probes — an MCP handshake against the installed server, a hook dry-run, and a config readback — and the same checks live on in `minni doctor`. Old payload versions are garbage-collected only when no agent's config still references them; `--use-version` re-wires a platform to a previous install for rollback. This registers the MCP server, the per-agent vault path, and that host's hook entrypoint; the agent-driven `minni-install` skill handles first-time identity and vault seeding. Per-runtime pages: [Claude Code](docs/runtimes/claude-code.md) · [Codex](docs/runtimes/codex.md) · [Gemini / Antigravity](docs/runtimes/gemini.md) · [Grok](docs/runtimes/grok.md) · [Kilo Code](docs/runtimes/kilocode.md) · [Cursor](docs/runtimes/cursor.md).
+Every wire ends with verification probes — an MCP handshake against the installed server, a hook dry-run, and a config readback. Re-run `minni wire <platform>` to repeat those probes; `minni doctor` is interpreter/socket/status/recall/models only and never substitutes for wire verify. Old payload versions are garbage-collected only when no agent's config still references them; `--use-version` re-wires a platform to a previous install for rollback. This registers the MCP server, the per-agent vault path, and that host's hook entrypoint; the agent-driven `minni-install` skill handles first-time identity and vault seeding. Per-runtime pages: [Claude Code](docs/runtimes/claude-code.md) · [Codex](docs/runtimes/codex.md) · [Gemini / Antigravity](docs/runtimes/gemini.md) · [Grok](docs/runtimes/grok.md) · [Kilo Code](docs/runtimes/kilocode.md) · [Cursor](docs/runtimes/cursor.md).
 
 ### Poke at it
 
@@ -174,7 +174,7 @@ Two things reach the daemon that are not the same thing. **Agents call** MCP too
 
 Minni's **repo tip is stamped v0.4.2** ([CHANGELOG.md](CHANGELOG.md)); **PyPI lags until a `v0.4.2` GitHub tag triggers OIDC trusted publishing** — the badge above and [pypi.org/project/minni](https://pypi.org/project/minni/) show what installs today (currently the last published tag, often still 0.4.1). After publish, the daemon and CLI install with one `pipx install minni`. Hook support covers Claude Code, Codex, Gemini / Antigravity, Grok, Cursor, and Kilo Code. Interfaces can still change before 1.0, adoption is small, and the public contract is intentionally smaller than the implementation.
 
-What "works" is not asserted, it is *executed in public*: CI stands the daemon up from nothing on a clean Linux runner and proves status, recall, and home-directory isolation on every push — the same check `minni doctor` gives you locally. A benchmark harness (`bench/membench`, byte-reproducible scorecards) exists, but no headline numbers are published until real-model runs are: when in doubt, this project under-claims. In that spirit: the core multi-agent loop — multiple approved agents sharing one governed daemon — is dogfooded daily (Minni is developed using Minni), while the temporary-team orchestration surface (`minni_team_*`) has unit tests but no real-world mileage yet.
+What "works" is not asserted, it is *executed in public*: CI stands the daemon up from nothing on a clean Linux runner and proves status, recall, and home-directory isolation under a throwaway `MINNI_HOME` on every push. Locally, `minni doctor` covers a related subset (interpreter, socket, status, recall, models) without the home-isolation assert. A benchmark harness (`bench/membench`, byte-reproducible scorecards) exists, but no headline numbers are published until real-model runs are: when in doubt, this project under-claims. In that spirit: the core multi-agent loop — multiple approved agents sharing one governed daemon — is dogfooded daily (Minni is developed using Minni), while the temporary-team orchestration surface (`minni_team_*`) has unit tests but no real-world mileage yet.
 
 ## Documentation
 

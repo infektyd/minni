@@ -10,6 +10,10 @@ the versions in the table below, using each vendor's published docs plus the
 locally installed CLI. **Re-verify on upgrade: no vendor publishes a hook
 deprecation policy or changelog.**
 
+When the matrix says a host has a live s6 cold-tool guard, shipping without a
+working adapter is a **defect** — fix code, do not cut the row. Operator
+summary and fleet redeploy: [platform-hook-contracts.md](../ops/platform-hook-contracts.md).
+
 ## Rule
 
 > Core handlers express *intent*. Per-platform adapters translate intent to the
@@ -90,18 +94,20 @@ Load-bearing details:
 
 ## Pre-tool deny — enums differ, and coverage differs more
 
-| Platform | Decision values | Coverage |
-|---|---|---|
-| Claude Code | `allow` `deny` `ask` `defer` | all tools |
-| Codex | `allow` `deny` `ask` (**no `defer`**) | ⚠️ **Bash only** |
-| Grok Build | `allow` `deny` | broad (aliases `Read`→`read_file` etc.) |
-| Cursor | `allow` `deny` `ask` (`ask` unenforced on `preToolUse`) | broad |
-| agy | `allow` `deny` `ask` `force_ask` — **rejects `approve`/`block`** | broad |
-| Kilocode | throw from `tool.execute.before`, or `permission.ask` → `ask\|deny\|allow` | broad |
+| Platform | Decision values | Host coverage | Minni s6 cold-tool guard live? |
+|---|---|---|---|
+| Claude Code | `allow` `deny` `ask` `defer` | all tools | Yes — native Claude protocol + shared guard |
+| Codex | `allow` `deny` `ask` (**no `defer`**) | ⚠️ **Bash only** | No for Grep/Read/Glob — registration ≠ cold-file deny |
+| Grok Build | `allow` `deny` | broad (matcher aliases `Read`→`read_file` etc.) | Yes — `grok-adapter.ts` maps camelCase + natives; `{decision,reason}` out |
+| Cursor | `allow` `deny` `ask` (`ask` unenforced on `preToolUse`) | broad | Yes — Cursor adapters |
+| agy | `allow` `deny` `ask` `force_ask` — **rejects `approve`/`block`** | broad | Yes — `gemini-adapter.ts` |
+| Kilocode | throw from `tool.execute.before`, or `permission.ask` → `ask\|deny\|allow` | broad | Yes — bridge plugin |
 
-**Recall-guard consequence:** the guard gates `Read`/`Grep`/`Glob`. Codex's
-`PreToolUse` intercepts Bash only, so the guard **cannot** work there regardless
-of the deny capability. Grok Build, Cursor and agy can all support it.
+**Recall-guard consequence:** the guard gates `Read`/`Grep`/`Glob` (and Grok
+natives / shell under strict). Host **deny capability** is necessary but not
+sufficient: Codex's PreToolUse intercepts Bash only, so the guard **cannot**
+gate cold-file tools there even though deny exists. Minni-adapter-complete
+hosts for live s6 cold-tool guard: Claude Code, Cursor, agy, Kilo, Grok Build.
 
 ## Stop payload — the field that exists nowhere
 

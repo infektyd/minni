@@ -81,10 +81,11 @@ minni wire claude-code        # or: codex, kilocode, grok, generic, all
   `gemini` remains provisional-skip on wire (`gemini-provisional`), not the
   day-to-day install path. `generic` requires `--agent` and `--install-root`.
 - Every wire ends with verification probes (MCP handshake, hook dry-run,
-  config readback); the same probes run in `minni doctor`. Output is a single
-  JSON document on stdout with per-platform results; exit code 0 = all
-  attempted platforms wired, 1 = at least one failed, 2 = preflight/usage
-  error before any change.
+  config readback). Re-run `minni wire <platform>` to repeat them; `minni
+  doctor` never substitutes for wire verify (doctor is interpreter / socket /
+  status / recall / models only). Output is a single JSON document on stdout
+  with per-platform results; exit code 0 = all attempted platforms wired, 1 =
+  at least one failed, 2 = preflight/usage error before any change.
 - Old version dirs are pruned only when no runtime's config references them
   (`--prune` / `--no-prune`; prompts are skipped when stdin isn't a TTY).
   `--use-version <ver>` re-stamps a platform's config against an
@@ -152,13 +153,17 @@ Equivalents: `make daemon` runs the daemon in the foreground; `make doctor`
 wraps the doctor. The daemon listens on a Unix socket at
 `~/.minni/run/minnid.sock` (0600, in a 0700 run dir) — no TCP port by default.
 
-`minni doctor` runs the same probes CI's hermetic smoke runs on every push:
-interpreter floor, socket presence and permissions, `status` RPC shape
-(`daemon` + `engine`), a recall round-trip, and model-cache presence. If
-doctor passes, the daemon is up and answering recalls. It does **not** fully
-wet-exercise the background AFM consolidation loop (`MINNI_AFM_LOOP`, default
-off; functional since [#119](https://github.com/infektyd/minni/issues/119)
-closed), so doctor stays green whether that opt-in path is healthy or not.
+`minni doctor` is the local install subset: interpreter floor, socket
+presence and permissions, `status` RPC shape (`daemon` + `engine`), a recall
+round-trip, and model-cache presence. CI's hermetic smoke
+(`scripts/repro-smoke.sh` / `make smoke`) additionally proves status + recall
+under a throwaway `MINNI_HOME` (home isolation) — doctor does **not** assert
+that. Doctor also does **not** run wire verify probes (MCP handshake, hook
+dry-run, config readback). If doctor passes, the daemon is up and answering
+recalls. It does **not** fully wet-exercise the background AFM consolidation
+loop (`MINNI_AFM_LOOP`, default off; functional since
+[#119](https://github.com/infektyd/minni/issues/119) closed), so doctor stays
+green whether that opt-in path is healthy or not.
 
 For a login-persistent daemon on macOS, a launchd template ships at
 `src/minni/launchd/com.minni.minnid.plist.example` (restart with

@@ -136,10 +136,13 @@ the frozen pointer filename), correction re-assertions, and bounded
 inbox/candidate state. On Claude Code, the `<minni:context>` envelope carries
 the lifecycle spine (`prepare_task → prepare_outcome → thread → learn`;
 `plan` / `minni_plan_*` remain deprecated aliases), backed
-by a deny-capable `PreToolUse` recall-guard backstop. Claude is the deepest
-integration (all-tool coverage plus live recall-state), not the only
-deny-capable host — Kilo, Cursor, Grok, and Antigravity also deny with
-different depth; Codex deny is Bash-only. Full matrix:
+by a deny-capable `PreToolUse` recall-guard backstop. Several hosts expose
+pre-tool **deny capability** (Claude, Kilo, Cursor, Grok, Antigravity/agy;
+Codex is Bash-only). **Live Minni s6 cold-tool guard** (file-backed
+recall-state + adapter/tool map that actually denies Grep/Read/Glob-class
+calls) is complete on Claude Code, Cursor, agy, Kilo, and Grok Build (Grok
+via `grok-adapter.ts`). Registration or host deny alone is not enough — Codex
+registers PreToolUse but cannot gate cold-file tools. Full matrix:
 [docs/contracts/hook-platforms.md](contracts/hook-platforms.md). Operator
 knobs: `MINNI_LIFECYCLE_NUDGE_MODE` (`off` disables) and
 `MINNI_RECALL_GUARD_MODE` (`off` / `soft` / `strict`); the guard fails open —
