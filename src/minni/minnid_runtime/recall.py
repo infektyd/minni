@@ -209,6 +209,51 @@ def _degradation_for(retrieval_engine: Any, src: str) -> dict:
     return entry
 
 
+def _degrade_detail(message: str) -> str:
+    """Scrub an index-failure message before it goes on the wire.
+
+    The degrade details embed ``str(exc)`` from a retrieval engine, and those
+    exceptions routinely carry the failing index/db PATH — and, when the
+    failure came out of a provider call, whatever the provider echoed back.
+    The same module already scrubs the trace surface and the durable recall
+    trace; these three details bypassed it and shipped raw. Redact first, then
+    truncate, so a secret straddling the 400-char boundary cannot survive as a
+    prefix.
+    """
+    redacted, _ = redact_text(message)
+    return redacted[:400]
+
+
+def dedupe_degradations(entries: list[dict]) -> list[dict]:
+    """Collapse degradation entries that describe the identical corpus event.
+
+    F4: scope "both" runs the shared engine through TWO legs — the personal
+    leg's shared fallback (retrieve_personal soft) and retrieve_combined's own
+    shared tail. One shared-index failure therefore appended two byte-identical
+    ``{"src": "c", ...}`` entries, so a caller counting them read one broken
+    corpus as two, and the roll-up looked worse than the outage was. The legs
+    stay independent (each must still be able to soft-fail on its own); the
+    REPORT deduplicates, because two identical entries carry no information the
+    first one does not. Anything genuinely distinct — a different corpus, a
+    different failure, a different source_agent — differs in the entry and
+    survives. Order is preserved: the first report of a corpus wins.
+    """
+    seen: set[str] = set()
+    deduped: list[dict] = []
+    for entry in entries:
+        try:
+            key = json.dumps(entry, sort_keys=True, default=str)
+        except Exception:
+            # Unserializable entry: keep it rather than risk dropping a report.
+            deduped.append(entry)
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(entry)
+    return deduped
+
+
 def backend_badge(backends: Any) -> str:
     if backends is None:
         names = ["faiss-disk"]
@@ -377,7 +422,7 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
             try:
                 return retrieve_shared()
             except Exception as exc:
-                detail = f"shared index failed: {exc}"[:400]
+                detail = _degrade_detail(f"shared index failed: {exc}")
                 context.logger.warning(
                     "search: shared index failed (%s); continuing with partial results",
                     exc,
@@ -432,7 +477,7 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
                     # the shared fallback could still report degraded:false —
                     # personal memory never ran, response looked healthy.
                     personal_failed = True
-                    detail = f"personal vault index failed: {exc}"[:400]
+                    detail = _degrade_detail(f"personal vault index failed: {exc}")
                     context.logger.warning(
                         "search: personal vault index failed for %s (%s); falling back to shared",
                         agent_id,
@@ -484,10 +529,10 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
                         )
                     )
                 except Exception as exc:
-                    detail = (
+                    detail = _degrade_detail(
                         f"combined vault index failed"
                         f"{f' ({source_agent})' if source_agent else ''}: {exc}"
-                    )[:400]
+                    )
                     context.logger.warning(
                         "search: combined vault index failed for %s (%s); continuing with partial results",
                         source_agent,
@@ -714,6 +759,9 @@ def handle_search(params: dict, request_id: Any, context: RecallContext) -> dict
             response_payload["auth_suppression"] = auth_suppressions
         # R4/R5 (#226): always present, so a caller reading the response can
         # always answer "was this a healthy hybrid search?" without inferring it.
+        # F4: multi-leg scopes can touch one corpus twice (see
+        # dedupe_degradations) — one failure, one entry.
+        degradations = dedupe_degradations(degradations)
         response_payload["degradation"] = degradations
         response_payload["degraded"] = any(d.get("degraded") for d in degradations)
         return context.make_response(response_payload, request_id)

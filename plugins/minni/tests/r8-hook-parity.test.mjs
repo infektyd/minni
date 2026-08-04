@@ -23,7 +23,7 @@ import { promisify } from "node:util";
 import { CURSOR_EVENTS } from "../dist/cursor-adapter.js";
 import { AGY_EVENTS } from "../dist/gemini-adapter.js";
 import * as hookUtils from "../dist/hook-utils.js";
-import { ensureVault, recordAudit } from "../dist/vault.js";
+import { auditTail, ensureVault, recordAudit } from "../dist/vault.js";
 
 // Tolerant on purpose: pre-R8 dist has no BRIDGE_FAILURE_EVENT export, and a
 // bare named import would fail the whole FILE to load, collapsing eleven
@@ -43,6 +43,30 @@ async function withVault(fn) {
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+}
+
+/**
+ * Drive the real codex hook entry point (runHookMain, the shared factory the
+ * generic platforms use) against a fixture vault. Every env knob points inside
+ * the fixture — vault, MINNI_HOME, a missing daemon socket and a closed AFM
+ * port — so the live ~/.minni is never read or written.
+ */
+async function runCodexHook(event, vault, payload) {
+  const child = execFileAsync(process.execPath, [path.join(PLUGIN_ROOT, "dist", "codex-hook.js"), event], {
+    env: {
+      ...process.env,
+      MINNI_HOME: vault,
+      MINNI_CODEX_VAULT_PATH: vault,
+      MINNI_CODEX_HOOKS: "on",
+      MINNI_SOCKET_PATH: path.join(vault, "missing.sock"),
+      MINNI_AFM_HEALTH_URL: "http://127.0.0.1:1/health",
+      MINNI_BYPASS_AUDIT_LIMIT: "true",
+    },
+    timeout: 30_000,
+  });
+  child.child.stdin.end(JSON.stringify(payload ?? {}));
+  const { stdout } = await child;
+  return JSON.parse(stdout.trim().split("\n").pop());
 }
 
 // ── P4: declared-vs-consumed parity is a CI gate, not a hope ────────────────
@@ -129,33 +153,45 @@ test("P4: the bridge-failure diagnostic is deliberately NOT an envelope event", 
   assert.equal(VALID_EVENTS.includes(BRIDGE_FAILURE_EVENT), false);
 });
 
+// F2/H5: these two used to regex-match hook-handlers.ts for the string
+// "recordUnroutedEvent" inside a source window. That proves the identifier is
+// typed near the gate, not that a dropped event is recorded — and it re-broke
+// the very swallow P4 exists to close, because a source grep cannot tell a
+// live call from a dead one. Both now DRIVE the drop and read the audit log.
+
 test("P4: an unrouted event records a drop marker instead of exiting clean", async () => {
   // Pre-R8: `emit({continue:true}); return;` with no marker of any kind.
-  const source = await readFile(
-    path.join(PLUGIN_ROOT, "src", "hook-handlers.ts"),
-    "utf8",
-  );
-  const gate = source.indexOf("!VALID_EVENTS.includes(event as EnvelopeEvent)");
-  assert.ok(gate !== -1, "the VALID_EVENTS gate moved; re-point this test");
-  const window = source.slice(gate, gate + 800);
-  assert.match(
-    window,
-    /recordUnroutedEvent/,
-    "an event that reaches the hook and is not routed must be recorded, not swallowed",
-  );
+  await withVault(async (vault) => {
+    const output = await runCodexHook("NotAnEventMinniRoutes", vault, {});
+    assert.equal(output.continue, true, "the hook must still exit clean for the platform");
+    const tail = await auditTail(vault, 20);
+    assert.match(
+      tail.text,
+      /hook_codex_intent_dropped/,
+      "an event that reaches the hook and is not routed must be recorded, not swallowed",
+    );
+    assert.match(
+      tail.text,
+      /NotAnEventMinniRoutes/,
+      "the marker must name the event, or two different drops collapse into one record",
+    );
+  });
 });
 
 test("P4: a valid event with no dispatch case records a drop marker", async () => {
   // Pre-R8: `default: return render(noIntent)` — a clean, successful no-op for
   // an event that passed the VALID_EVENTS gate and then found no handler.
-  const source = await readFile(
-    path.join(PLUGIN_ROOT, "src", "hook-handlers.ts"),
-    "utf8",
-  );
-  const marker = source.indexOf("      default:\n");
-  assert.ok(marker !== -1, "the dispatch default moved; re-point this test");
-  const window = source.slice(marker, marker + 900);
-  assert.match(window, /recordUnroutedEvent/);
+  // PostCompact is exactly that shape: in VALID_EVENTS, no factory dispatch arm.
+  await withVault(async (vault) => {
+    assert.ok(
+      VALID_EVENTS.includes("PostCompact"),
+      "precondition: PostCompact passes the envelope gate, so it reaches dispatch",
+    );
+    await runCodexHook("PostCompact", vault, {});
+    const tail = await auditTail(vault, 20);
+    assert.match(tail.text, /hook_codex_intent_dropped/);
+    assert.match(tail.text, /PostCompact/);
+  });
 });
 
 // ── P5: a premature session.deleted must not drop queued context ────────────

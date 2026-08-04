@@ -42,6 +42,14 @@ export interface RecallResponse {
    *  filtered a non-empty candidate set to zero — a scoped ANSWER, not a
    *  miss. isDaemonResultEmpty must treat it as non-empty. */
   auth_suppression?: unknown[];
+  /** R4/R5 (#226): one entry per corpus this recall touched, always present on
+   *  a daemon reply (recall.py response_payload). Declared here because a
+   *  field the renderer never reads is a field the AGENT never sees: an
+   *  FTS-only or half-failed recall arrived looking exactly like a healthy
+   *  hybrid one. formatRecall/formatRecallLean render it. */
+  degradation?: unknown[];
+  /** Roll-up of `degradation[].degraded` — the daemon's own verdict. */
+  degraded?: boolean;
   /** Learnings surface separately from document `results`/`count`; a
    *  learnings-only reply is still a live scoped answer. */
   learnings?: unknown[];
@@ -795,6 +803,65 @@ export function formatEpisodic(response: RecallResponse, limit = 5): string | un
   );
 }
 
+/**
+ * The degrade kinds recall.py can put on a `degradation` entry, in the order
+ * they are rendered. Named explicitly rather than "every extra key" so a new
+ * daemon-side field cannot start leaking into the agent's context unreviewed.
+ */
+const DEGRADE_KINDS = [
+  "vector_degraded",
+  "rerank_degraded",
+  "query_expand_degraded",
+  "hyde_degraded",
+  "personal_index_failed",
+  "shared_index_failed",
+  "combined_index_failed",
+] as const;
+
+/**
+ * Render the daemon's per-corpus degrade report (#226 R4/R5).
+ *
+ * The daemon has written `degradation` on every search response since R8, but
+ * nothing on this side read it — so a lexical-only answer, a dead personal
+ * vault, or a failed HyDE leg reached the agent formatted exactly like a
+ * healthy hybrid recall. One line per degraded corpus, no line at all when
+ * everything is healthy (the daemon reports healthy corpora too, and echoing
+ * "all fine" every turn is pure context tax).
+ *
+ * `auth_suppression` gets the same treatment for the same reason: it was
+ * declared here only to keep isDaemonResultEmpty honest, never rendered, so a
+ * corpus blacked out by the read gate looked to the agent like a corpus that
+ * simply had nothing.
+ */
+export function formatDegradation(response: RecallResponse): string | undefined {
+  const lines: string[] = [];
+  const entries = Array.isArray(response.degradation) ? response.degradation : [];
+  for (const raw of entries) {
+    const entry = (raw ?? {}) as Record<string, unknown>;
+    if (entry.degraded !== true) continue;
+    const src = typeof entry.src === "string" ? entry.src : "?";
+    const kinds = DEGRADE_KINDS.filter((kind) => Boolean(entry[kind])).map((kind) => {
+      const value = entry[kind];
+      // Booleans carry no detail beyond the kind name; the failure strings do,
+      // and it is the detail that tells the agent whether to retry or re-scope.
+      if (typeof value !== "string") return kind;
+      return `${kind} (${value.replace(/\s+/g, " ").slice(0, 120)})`;
+    });
+    lines.push(`⚠ degraded: ${src}: ${kinds.length ? kinds.join("; ") : "unspecified"}`);
+  }
+  const suppressions = Array.isArray(response.auth_suppression) ? response.auth_suppression : [];
+  for (const raw of suppressions) {
+    const entry = (raw ?? {}) as Record<string, unknown>;
+    const src = typeof entry.src === "string" ? entry.src : "?";
+    const suppressed = typeof entry.suppressed === "number" ? entry.suppressed : undefined;
+    lines.push(
+      `⚠ auth-suppressed: ${src}: ${suppressed ?? "some"} candidate(s) withheld by the read gate`,
+    );
+  }
+  if (lines.length === 0) return undefined;
+  return lines.join("\n");
+}
+
 export function formatRecall(query: string, response: RecallResponse, vaultResults: VaultSearchResult[] = []): string {
   const backendBadge = response.backend ?? response.backend_badge;
   const results = Array.isArray(response.results)
@@ -812,6 +879,9 @@ export function formatRecall(query: string, response: RecallResponse, vaultResul
     "# Minni Recall",
     `Query: ${query}${backendBadge ? ` [${backendBadge}]` : ""}`,
     provenance ? `Provenance: ${provenance}` : undefined,
+    // Above the results, not below: a caller who stops reading at the first
+    // hit must still have been told the corpus it came from was degraded.
+    formatDegradation(response),
     "## AI Context Pack",
     formatVaultContext(vaultResults),
     daemonLead ? `Daemon lead: ${daemonLead}` : undefined,
@@ -1096,6 +1166,10 @@ export function formatRecallLean(
   const sections = [
     "# Recall (lean)",
     `Query: ${query}`,
+    // Lean drops provenance, never health: a per-turn recall served from a
+    // half-failed corpus is exactly the case the agent must not read as a
+    // complete answer. It costs one line, and only when something is wrong.
+    formatDegradation(response),
     "## AI Context Pack",
     formatVaultContext(vaultResults),
     lean.length
