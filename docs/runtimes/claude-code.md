@@ -38,11 +38,12 @@ Claude Code is the most deeply integrated runtime:
   (`prepare_task → prepare_outcome → thread → learn`; `plan` / `minni_plan_*`
   remain deprecated aliases).
 - A deny-capable `PreToolUse` **recall guard** nudges recall before tool use.
-  Claude is **not** the only deny-capable host — Kilo, Cursor, Grok, and
-  Antigravity (agy) also expose pre-tool deny with different depth and
-  decision enums (Codex has deny but only on Bash, so the guard cannot gate
-  `Read`/`Grep`/`Glob` there). Claude remains the deepest integration: all-tool
-  coverage plus live recall-state in the shared guard path. Full matrix:
+  Host **deny capability** is broader than Claude (Kilo, Cursor, Grok,
+  Antigravity/agy also expose pre-tool deny; Codex deny is Bash-only). **Live
+  Minni s6 cold-tool guard** (adapter + tool map + file-backed recall-state)
+  is complete on Claude Code, Cursor, agy, Kilo, and Grok Build — not on every
+  host that merely registers a PreToolUse hook. Claude remains the deepest
+  integration (all-tool coverage + full envelope). Full matrix:
   [docs/contracts/hook-platforms.md](../contracts/hook-platforms.md). Knobs:
   `MINNI_RECALL_GUARD_MODE` (`off`/`soft`/`strict`),
   `MINNI_LIFECYCLE_NUDGE_MODE` (`off` disables). The guard fails open.

@@ -84,5 +84,7 @@ uses.
 ## Verify
 
 From a Kilo Code session, call `minni_status` and check `socket.ok` and the
-vault path. `minni doctor` and `minni wire kilocode` (re-run) both give a
-config readback and hook dry-run without needing a live Kilo session.
+vault path. Re-run `minni wire kilocode` for MCP handshake, hook dry-run, and
+config readback without a live Kilo session. `minni doctor` only checks the
+local daemon subset (interpreter, socket, status, recall, models) — it does
+not run wire verify probes.

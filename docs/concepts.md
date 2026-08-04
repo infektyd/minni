@@ -160,7 +160,7 @@ packing, and progressive depth tiers (`headline` / `snippet` / `chunk` /
 
 ## The AFM pass pipeline
 
-Background curation runs as discrete passes under `engine/afm_passes/`:
+Background curation runs as discrete passes under `src/minni/afm_passes/`:
 
 | Pass | Role |
 |---|---|

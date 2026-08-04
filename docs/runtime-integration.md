@@ -86,13 +86,16 @@ already require `learn`.
 
 ## Recall Guard (verifiable memory use)
 
-Every wired runtime (claude-code, codex, grok, kilocode, gemini, cursor)
-registers a `PreToolUse` hook: when a turn has strong unconsumed recall and
-the agent reaches for a cold search tool instead, the guard denies that tool
-once and surfaces the recall. Tune with `MINNI_RECALL_GUARD_MODE`
-(`off` / `soft` / `strict`) and `MINNI_RECALL_POINTER_THRESHOLD` (default
-`0.55`). Guard decisions are audited per agent as `hook_*_pretooluse_guard`
-entries in the vault's `log.md`.
+Most platforms **register** a `PreToolUse` hook, but registration is not the
+same as a live cold-tool deny. The Minni s6 file-backed guard (strong
+unconsumed recall → deny Grep/Read/Glob-class tools once and surface the
+hits) is adapter-complete on **Claude Code, Cursor, agy, Kilo, and Grok
+Build**. Codex registers PreToolUse but intercepts **Bash only**, so it cannot
+gate cold-file tools. Host matcher aliases (e.g. Grok `Read`→`read_file`) are
+documented in [hook-platforms.md](contracts/hook-platforms.md). Tune with
+`MINNI_RECALL_GUARD_MODE` (`off` / `soft` / `strict`) and
+`MINNI_RECALL_POINTER_THRESHOLD` (default `0.55`). Guard decisions are audited
+per agent as `hook_*_pretooluse_guard` entries in the vault's `log.md`.
 
 ## Local AFM and Extraction
 

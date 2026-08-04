@@ -25,8 +25,11 @@ recovery only:
 .venv/bin/python plugins/minni/skills/minni-install/scripts/propagate.py update-plugin --platform gemini
 ```
 
-That pure-gemini path installs the extension manifest only — it is **not** the
-supported Antigravity surface + hooks path.
+That pure-gemini path writes `gemini-extension.json` and still registers **agy
+hooks** when `agy` is on PATH (same `update_agy_plugin_hooks` path as
+antigravity). It does **not** write Antigravity surface MCP views /
+permission grants (`update_antigravity_config`). Prefer antigravity as the
+supported day-to-day surface + hooks path.
 
 Note: `make sync-root` uses the D7 fleet partition — `minni wire all
 --from-repo` for codex/claude-code/kilocode/grok, then
