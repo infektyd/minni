@@ -1316,8 +1316,9 @@ def update_toml_mcp_config(path: Path, server_path: Path, agent: str, vault: Pat
 #     recall-state to act on.
 #   - codex: deny-capable, but PreToolUse intercepts BASH ONLY. The guard
 #     gates Read/Grep/Glob, which never reach it -- unwireable for these tools.
-#   - grok-build: deny-capable with broad tool coverage. Genuinely available;
-#     wiring it is open work, NOT a platform gap.
+#   - grok-build: deny-capable with broad tool coverage; PreToolUse + UserPromptSubmit
+#     registered (hooks-grok.json). Passive stdout injection is ignored; file-backed
+#     recall-state still works (writeRecallState / readRecallState). NOT a platform gap.
 #   - kilocode: wired through the bridge plugin (throw from
 #     tool.execute.before).
 # Lifecycle injection also is not uniform: on grok-build hook stdout is IGNORED
