@@ -128,6 +128,45 @@ def test_unaligned_base64_extraheader_is_caught(tmp_path):
     assert check(tmp_path, None, f"partial: {FAKE_EXTRAHEADER[2:]}") == 1
 
 
+# Each of the four below is a bypass an adversarial review REPRODUCED against
+# the first version of the decode pass. They are pinned so the gate cannot
+# regress to a state where a padded, chunked, or doubly-encoded blob walks out.
+
+
+def test_decoy_padding_cannot_push_the_blob_out_of_scan_range(tmp_path):
+    """The cap used to `break` after N runs, and finditer yields left to right,
+    so junk runs emitted FIRST buried the real blob. A security scan that
+    quietly stops early reports clean for material it never looked at."""
+    decoys = "!".join(["A" * 24] * 600)
+    assert check(tmp_path, None, f"{decoys}!{FAKE_EXTRAHEADER}") == 1
+
+
+def test_comma_chunked_extraheader_is_caught(tmp_path):
+    """Non-whitespace separators survive the whitespace-stripped variant and
+    break the base64 run into sub-minimum pieces."""
+    chunked = ",".join(
+        FAKE_EXTRAHEADER[i:i + 12] for i in range(0, len(FAKE_EXTRAHEADER), 12)
+    )
+    assert check(tmp_path, None, f"config: {chunked}") == 1
+
+
+def test_zero_width_space_chunked_extraheader_is_caught(tmp_path):
+    chunked = "​".join(FAKE_EXTRAHEADER[i:i + 4]
+                            for i in range(0, len(FAKE_EXTRAHEADER), 4))
+    assert check(tmp_path, None, f"config: {chunked}") == 1
+
+
+def test_double_base64_extraheader_is_caught(tmp_path):
+    """One decode yields more base64, not a token — the pass has to recurse."""
+    doubled = base64.b64encode(FAKE_EXTRAHEADER.encode()).decode()
+    assert check(tmp_path, None, f"nested: {doubled}") == 1
+
+
+def test_hex_encoded_extraheader_is_caught(tmp_path):
+    hexed = f"x-access-token:{FAKE_GHS}".encode().hex()
+    assert check(tmp_path, None, f"hex dump: {hexed}") == 1
+
+
 def test_base64url_extraheader_is_caught(tmp_path):
     encoded = base64.urlsafe_b64encode(
         f"x-access-token:{FAKE_GHS}".encode()
@@ -157,6 +196,32 @@ def test_prose_about_the_extraheader_passes(tmp_path, auth_file):
         "'AUTHORIZATION: basic base64(x-access-token:<token>)'. Installation "
         "tokens use the ghs_ prefix, classic PATs ghp_, fine-grained "
         "github_pat_. Setting persist-credentials: false drops all of it."
+    )
+    assert check(tmp_path, auth_file, reply) == 0
+
+
+def test_a_review_demonstrating_the_encoding_still_posts(tmp_path, auth_file):
+    """The exact false positive an adversarial review of this gate produced:
+    it explained the extraheader by showing a blob and its decoding. Because
+    the job runs the gate under `set -euo pipefail`, a block here fails the
+    step, posts nothing, and tells the author nothing — while still having
+    reacted to the command. `x-access-token:` alone must not be a trigger."""
+    demo = base64.b64encode(b"x-access-token:EXAMPLENOTAREALTOKEN").decode()
+    reply = (
+        "Finding (High): the marker is only matched AFTER base64 decoding. "
+        f"Demonstration — the extraheader value encodes to {demo}, which "
+        "decodes to x-access-token:EXAMPLENOTAREALTOKEN."
+    )
+    assert check(tmp_path, auth_file, reply) == 0
+
+
+def test_prose_with_a_ghs_lookalike_word_is_not_a_leak(tmp_path, auth_file):
+    """Whitespace stripping welds words together, so `ghs_` inside an ordinary
+    word ("highs_") followed by twenty run-together letters would match a token
+    shape. The delimiter lookbehind is what keeps this readable prose."""
+    reply = (
+        "The chart plots new highs_ and lows across the sampled window and "
+        "then continues describing the distribution at length."
     )
     assert check(tmp_path, auth_file, reply) == 0
 

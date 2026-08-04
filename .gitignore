@@ -5,7 +5,6 @@ _private/
 
 # Tool/IDE per-session state — never committed
 .antigravitycli/
-.cursor/
 
 # Local archives and reversible cleanup bins
 _archive/
@@ -72,8 +71,6 @@ faiss/
 /output/
 /reports/
 
-# Cursor IDE workspace state
-/.cursor/
 
 # Legacy bundles and local downloads
 archives/downloads/
@@ -109,9 +106,7 @@ htmlcov/
 .env.*
 !.env.example
 /.mcp.json
-.cursor/
 .claude/
-.cursor/
 .DS_Store
 **/.DS_Store
 ._*
@@ -222,3 +217,15 @@ scripts/run_harvest.py
 *.excalidraw
 .worktrees/
 .venv
+
+# Cursor: local IDE and session state stays out, but the approval/review
+# policies are repository trust surface and MUST be tracked — Cursor discovers
+# them from the repository contents at the PR head, so an ignored policy file
+# is an INERT policy file that still reads as protection. A directory-level
+# `.cursor/` exclude cannot be undone by a negation (git never descends into an
+# excluded directory), which is why this is `.cursor/*` plus explicit
+# re-includes rather than `.cursor/` plus `!`.
+.cursor/*
+!.cursor/APPROVAL_POLICY.md
+!.cursor/BUGBOT.md
+!.cursor/approval-policies/

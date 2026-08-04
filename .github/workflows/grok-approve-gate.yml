@@ -106,6 +106,11 @@ jobs:
         if: steps.meta.outputs.skip != 'true'
         uses: actions/checkout@v4
         with:
+          # Nothing here needs git auth: the gate talks to the API via gh/env tokens.
+          # Default checkout persists the token into .git/config as an http
+          # extraheader; nothing downstream needs it (the repo is public, so
+          # any git fetch here is anonymous).
+          persist-credentials: false
           ref: ${{ steps.meta.outputs.default_branch }}
           fetch-depth: 1
 

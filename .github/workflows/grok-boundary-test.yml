@@ -34,6 +34,13 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # This job runs an ADVERSARIAL agent and prints its output to a public log;
+          # a persisted token in .git/config is the single most valuable thing it could find.
+          # Default checkout persists the token into .git/config as an http
+          # extraheader; nothing downstream needs it (the repo is public, so
+          # any git fetch here is anonymous).
+          persist-credentials: false
 
       - name: Preflight the leak gate from the default branch
         id: gate-preflight

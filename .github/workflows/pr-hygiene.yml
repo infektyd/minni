@@ -19,6 +19,12 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
+          # This job runs git over PR-authored refs; merge-base/diff are local reads
+          # and need no credential.
+          # Default checkout persists the token into .git/config as an http
+          # extraheader; nothing downstream needs it (the repo is public, so
+          # any git fetch here is anonymous).
+          persist-credentials: false
           fetch-depth: 0
 
       - name: Scan PR for forbidden file additions

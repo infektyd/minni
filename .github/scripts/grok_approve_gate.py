@@ -80,6 +80,10 @@ PATH_DENY_PREFIXES = (
     "tests/test_grok_approve_gate.py",
     "tests/test_grok_approve_gate_workflow.py",
     "tests/test_parse_grok_verdict.py",
+    # The leak gate's only tripwire. Its three siblings above were denied and
+    # this one was not, which is the whole deny list's logic applied to every
+    # gate except the one guarding the credential path.
+    "tests/test_credential_leak_check.py",
     # Collection config can disable every tripwire above without touching a
     # single test file: `addopts = "--ignore=..."`, dropping `testpaths`, or
     # `collect_ignore_glob`. CI runs bare pytest inside the proposed-required

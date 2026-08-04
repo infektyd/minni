@@ -200,9 +200,9 @@ jobs:
         env:
           GROK_CI_AUTH_JSON: ${{ secrets.GROK_CI_AUTH_JSON }}
         run: |
-          mkdir -p "$HOME/.grok"
-          printf '%s' "$GROK_CI_AUTH_JSON" | base64 -d > "$HOME/.grok/auth.json"
-          chmod 600 "$HOME/.grok/auth.json"
+          /usr/bin/mkdir -p "$HOME/.grok"
+          printf '%s' "$GROK_CI_AUTH_JSON" | /usr/bin/base64 -d > "$HOME/.grok/auth.json"
+          /usr/bin/chmod 600 "$HOME/.grok/auth.json"
 
       - name: Configure the sandbox profile
         if: steps.resolve.outputs.skip == 'false'
@@ -229,7 +229,15 @@ jobs:
           #
           # Written to $HOME, NEVER to .grok/sandbox.toml in the checkout: a
           # per-project profile would be editable by the very PR under review.
-          cat > "$HOME/.grok/sandbox.toml" <<'EOF'
+          #
+          # /usr/bin/cat is pinned because THIS step writes the containment
+          # boundary. `Install Grok Build CLI` has already prepended
+          # $HOME/.grok/bin to PATH out of a `curl | bash`, so a shadowed `cat`
+          # here writes restrict_network = false and the credential leaves over
+          # the network — never passing through the reply the leak gate scans.
+          # Every command in every step after the GITHUB_PATH append is pinned
+          # for this reason, and the workflow test enforces it positionally.
+          /usr/bin/cat > "$HOME/.grok/sandbox.toml" <<'EOF'
           [profiles.ci]
           extends = "read-only"
           restrict_network = true
@@ -247,10 +255,10 @@ jobs:
             echo "directory. Review the diff below against the actual code in the checkout."
             echo
             echo "## PR #$NUM"
-            gh pr view "$NUM" --json title,body --jq '"Title: \(.title)\n\n\(.body)"'
+            /usr/bin/gh pr view "$NUM" --json title,body --jq '"Title: \(.title)\n\n\(.body)"'
             echo
             echo "## Diff"
-            gh pr diff "$NUM" | head -6000
+            /usr/bin/gh pr diff "$NUM" | /usr/bin/head -6000
             echo
             echo "Report format:"
             echo "1. End with exactly one machine line (last line of the reply):"
@@ -290,7 +298,7 @@ jobs:
           # the tool allowlist below is defense in depth, and the reply is
           # scanned for credential material before anything is posted.
           # No debug instrumentation: Actions logs are public on this repo.
-          grok --prompt-file /tmp/grok-prompt.md \
+          "$HOME/.grok/bin/grok" --prompt-file /tmp/grok-prompt.md \
             --always-approve \
             --no-subagents \
             --max-turns 60 \

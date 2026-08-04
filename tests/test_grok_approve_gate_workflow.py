@@ -132,128 +132,240 @@ def test_review_workflow_defangs_the_marker_before_embedding_the_reply(review):
     assert defang < stamp, "defang must run before the workflow stamps its own marker"
 
 
-# Words bash resolves itself — builtins, keywords, and reserved punctuation.
-# None of them go through PATH, so a planted binary cannot intercept them and
-# they need no absolute path.
-_SHELL_WORDS = frozenset({
-    "!", ":", ".", "[", "[[", "]]", "break", "case", "cd", "continue", "do",
-    "done", "echo", "elif", "else", "esac", "eval", "exec", "exit", "export",
-    "false", "fi", "for", "function", "getopts", "if", "in", "local",
-    "printf", "pwd", "read", "readonly", "return", "set", "shift", "source",
-    "test", "then", "time", "trap", "true", "type", "umask", "unset",
-    "until", "wait", "while", "{", "}",
+# Words bash resolves itself — builtins and reserved words. None of them go
+# through PATH, so a planted binary cannot intercept them.
+_SHELL_BUILTINS = frozenset({
+    ":", "[", "[[", "]]", "break", "case", "cd", "continue", "done", "echo",
+    "esac", "exit", "export", "false", "fi", "for", "function", "getopts",
+    "in", "local", "printf", "pwd", "read", "readonly", "return", "set",
+    "shift", "test", "trap", "true", "type", "umask", "unset", "wait",
+    "{", "}",
 })
+
+# Words FOLLOWED BY a command. The word itself is safe, but the next word is
+# still a PATH lookup — `exec curl`, `time curl`, `if curl`, `env curl` all
+# run curl off PATH. Treating these as terminal is how an unpinned command
+# hides in plain sight, so the scan keeps looking past them.
+_COMMAND_PREFIXES = frozenset({
+    "!", "if", "then", "elif", "else", "while", "until", "do",
+    "command", "env", "exec", "nohup", "sudo", "time", "xargs",
+})
+
+# Constructs that defeat any static reading of the script. In a trust step
+# they are themselves the finding, not something to see through.
+_OPAQUE = frozenset({"eval", "source", "."})
 
 _ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\[[^]]*\])?\+?=")
 _CASE_LABEL = re.compile(r"^(\s*)\(?[^\s()]*\)(\s)")
+_CASE_LABEL_AFTER_IN = re.compile(r"(\bin\s+)\(?[^\s()]*\)")
+_CASE_LABEL_AFTER_SEP = re.compile(r"(;;\s*)\(?[^\s()]*\)")
+_HEREDOC = re.compile(r"<<-?\s*([\'\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
+
+
+def _strip_heredocs(script: str) -> str:
+    """Drop heredoc BODIES, keeping the line that opens them.
+
+    A heredoc body is data, not shell. Parsing it as shell is not merely noisy:
+    a single apostrophe in the body flips the scanner into quoted mode for the
+    entire rest of the step, which hides every command after it.
+    """
+    lines, out, i = script.splitlines(), [], 0
+    while i < len(lines):
+        out.append(lines[i])
+        match = _HEREDOC.search(lines[i])
+        i += 1
+        if match:
+            terminator = match.group(2)
+            while i < len(lines) and lines[i].strip() != terminator:
+                i += 1
+            i += 1  # and the terminator line itself
+    return "\n".join(out)
+
+
+def _strip_case_labels(script: str) -> str:
+    """`APPROVE)` is a pattern, not a command.
+
+    Labels appear at the start of a line in the multi-line form, but also
+    straight after `in` or `;;` when the whole `case` sits on one line.
+    """
+    out, in_case = [], False
+    for line in script.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("case ") or stripped == "case":
+            in_case = True
+        if in_case:
+            line = _CASE_LABEL.sub(r"\1\2", line)
+            line = _CASE_LABEL_AFTER_IN.sub(r"\1", line)
+            line = _CASE_LABEL_AFTER_SEP.sub(r"\1", line)
+        if re.search(r"\besac\b", stripped):
+            in_case = False
+        out.append(line)
+    return "\n".join(out)
 
 
 def _command_heads(script: str) -> list[str]:
     """Every word bash would resolve as a command in `script`.
 
-    Quote-aware, and it descends into `$(...)`: a planted PATH binary
-    intercepts a command substitution exactly as it intercepts a pipeline
-    segment, so both have to be walked. `case` labels (`APPROVE)`) are
-    stripped first — they are patterns, not commands.
+    Quote-aware, and it descends into `$(...)` and backticks: a planted PATH
+    binary intercepts a command substitution exactly as it intercepts a
+    pipeline segment, so both have to be walked.
     """
-    lines, in_case = [], False
-    for line in script.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("case "):
-            in_case = True
-        elif stripped == "esac":
-            in_case = False
-        lines.append(_CASE_LABEL.sub(r"\1\2", line) if in_case else line)
-    script = "\n".join(lines)
+    script = _strip_case_labels(_strip_heredocs(script))
 
     heads: list[str] = []
     buf: list[str] = []
     stack: list[str] = []          # quote mode to restore when $(...) closes
     mode = "normal"
     pending = True                 # the next word is a command head
-    skip_word = False              # ...unless it is a redirect target
     prev = "\n"
-    i = 0
-    while i < len(script):
+    i, n = 0, len(script)
+
+    def flush() -> None:
+        nonlocal buf, pending
+        if buf:
+            word = "".join(buf)
+            buf = []
+            # A run of assignments may precede the command: `A=1 B=2 cmd`.
+            # Prefix words work the same way. Either keeps `pending` armed.
+            if _ASSIGNMENT.match(word):
+                return
+            base = word.rsplit("/", 1)[-1]
+            if base in _COMMAND_PREFIXES:
+                return
+            heads.append(word)
+            pending = False
+
+    while i < n:
         char = script[i]
+
         if mode == "normal" and char == "#" and prev in " \t\n;|&()":
-            while i < len(script) and script[i] != "\n":
+            while i < n and script[i] != "\n":
                 i += 1
             continue
         prev = char
+
         if mode == "single":
             if char == "'":
                 mode = "normal"
+            elif pending:
+                buf.append(char)       # a quoted command name still runs
             i += 1
             continue
+
         if char == "\\":
             i += 2
             continue
+
+        # $(...) and `...` open a fresh command context, even inside quotes.
         if char == "$" and script[i + 1:i + 2] == "(":
-            if buf:
-                heads.append("".join(buf))
-                buf = []
+            flush()
             stack.append(mode)
-            mode, pending, skip_word = "normal", True, False
+            mode, pending = "normal", True
             i += 2
             continue
+        if char == "`":
+            flush()
+            stack.append(mode)
+            mode, pending = "normal", True
+            i += 1
+            continue
+        # ${VAR} / ${VAR#glob} is an expansion, not a command group.
+        if char == "$" and script[i + 1:i + 2] == "{":
+            depth, j = 0, i + 1
+            while j < n:
+                if script[j] == "{":
+                    depth += 1
+                elif script[j] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                j += 1
+            if pending:
+                buf.append(script[i:j + 1])
+            i = j + 1
+            continue
+
         if mode == "double":
             if char == '"':
                 mode = "normal"
-            elif pending and not skip_word:
+            elif pending:
                 buf.append(char)
             i += 1
             continue
+
         if char in "'\"":
             mode = "single" if char == "'" else "double"
             i += 1
             continue
+
+        # (( arithmetic )) evaluates, it does not run a command.
+        if char == "(" and script[i + 1:i + 2] == "(":
+            close = script.find("))", i + 2)
+            i = (close + 2) if close != -1 else n
+            flush()
+            pending = False
+            continue
+
+        # `name()` is a function definition, not an invocation of `name`.
+        if char == "(" and buf and script[i + 1:i + 2] == ")":
+            buf = []
+            pending = True
+            i += 2
+            continue
+
         if char == ")" and stack:
+            flush()
             mode = stack.pop()
-            if buf:
-                heads.append("".join(buf))
-                buf = []
-            pending, skip_word = False, False
+            pending = False
             i += 1
             continue
-        if char in "|&;\n()`{}":
-            if buf:
-                heads.append("".join(buf))
-                buf = []
-            pending, skip_word = True, False
+
+        if char in "|&;\n(){}":
+            flush()
+            pending = True
             i += 1
             continue
-        if char in "<>":
-            if buf:
-                heads.append("".join(buf))
+
+        # Redirections: consume the operator AND its target, and do not let
+        # either be mistaken for a command. `> /tmp/out curl` still runs curl.
+        if char in "<>" or (char.isdigit() and script[i + 1:i + 2] in ("<", ">")):
+            if buf and not buf[-1].isdigit():
+                flush()
+            else:
                 buf = []
-            skip_word = True           # the next word names a file
-            i += 1
+            while i < n and (script[i] in "<>&" or script[i].isdigit()):
+                i += 1
+            while i < n and script[i] in " \t":
+                i += 1
+            while i < n and script[i] not in " \t\n;|&<>()":
+                i += 1
             continue
+
         if char in " \t":
-            if buf:
-                heads.append("".join(buf))
-                buf = []
-                pending = False
-            elif skip_word:
-                skip_word = False
+            flush()
             i += 1
             continue
-        if pending and not skip_word:
+
+        if pending:
             buf.append(char)
         i += 1
-    if buf:
-        heads.append("".join(buf))
+
+    flush()
     return heads
 
 
 def _unpinned_commands(script: str) -> list[str]:
-    """Command heads that bash would look up on PATH rather than run by path."""
+    """Command heads bash would look up on PATH rather than run by path."""
     bare = []
     for head in _command_heads(script):
-        if not head or head in _SHELL_WORDS:
+        if not head:
             continue
-        if head.startswith(("/", "$", "-", "\"", "'")):
+        if head in _OPAQUE:
+            bare.append(head)          # unreadable by any static check
+            continue
+        if head in _SHELL_BUILTINS:
+            continue
+        if head.startswith(("/", "$", "-", "\"", "'", "~")):
             continue
         if _ASSIGNMENT.match(head):
             continue
@@ -261,33 +373,132 @@ def _unpinned_commands(script: str) -> list[str]:
     return bare
 
 
-# Steps that decide whether a reply is safe, or that put it on the PR. A
-# command shadowed here rewrites the verdict or the posted body; anywhere else
-# in these workflows it cannot.
-TRUST_STEPS = {
-    "grok-review.yml": ("Fail closed on credential leakage", "Post review"),
-    "grok.yml": ("Fail closed on credential leakage", "Post reply"),
-}
+# --- the parser behind the pinning check ------------------------------------
+# This parser is load-bearing: if it mis-reads a construct, the pinning test
+# passes while a PATH-resolved command sits in a trust step. Every HIDES case
+# below was a working bypass found by an adversarial review of the first
+# version, and every FALSE-POSITIVE case is a legitimate construct that must
+# stay usable — a tripwire that blocks correct edits is a tripwire that gets
+# deleted.
 
 
-def test_trust_steps_run_no_unpinned_command(review):
-    """#263's own threat model (grok-review.yml:425-427) is that `Install Grok
-    Build CLI` prepends $HOME/.grok/bin to PATH, so ANY bare command in a
-    trust-relevant step is a shadowing target — not just the three this test
-    used to enumerate. Enumeration certified an incomplete state as complete:
-    git/python3/sed were pinned while cat/jq/gh next to them were not."""
+@pytest.mark.parametrize(
+    "script, expected",
+    [
+        # bash runs `cmd` after any run of assignments
+        ('GH_TOKEN="$APP_TOKEN" gh api repos/x/y', ["gh"]),
+        ("A=1 B=2 curl -s https://example.invalid", ["curl"]),
+        # quoting the command name changes nothing about the PATH lookup
+        ("'gh' pr comment 1 --body-file /tmp/x", ["gh"]),
+        ('"gh" pr comment 1', ["gh"]),
+        # words that take a command as their argument
+        ("exec curl -s https://example.invalid", ["curl"]),
+        ("time curl -s https://example.invalid", ["curl"]),
+        ("sudo curl -s https://example.invalid", ["curl"]),
+        ("/usr/bin/env gh api x", ["gh"]),
+        ("if gh api x; then /usr/bin/echo hi; fi", ["gh"]),
+        # leading redirection does not consume the command
+        ("> /tmp/out curl -s https://example.invalid", ["curl"]),
+        # command substitution, including backticks
+        ("LIVE=`curl -s https://example.invalid`", ["curl"]),
+        ('LIVE="$(gh api repos/x/y --jq .head.sha)"', ["gh"]),
+        # unreadable by any static check, so the construct is itself a finding
+        ('eval "$SOMETHING"', ["eval"]),
+    ],
+)
+def test_parser_sees_commands_that_hide_from_a_naive_scan(script, expected):
+    assert _unpinned_commands(script) == expected
+
+
+def test_parser_sees_past_a_heredoc_body_containing_an_apostrophe():
+    """An unbalanced quote inside heredoc DATA used to flip the scanner into
+    quoted mode for the rest of the step, hiding every later command."""
+    script = (
+        "/usr/bin/cat <<'EOF' > /tmp/body.md\n"
+        "don't parse this line as shell\n"
+        "EOF\n"
+        'gh pr comment "$NUM" --body-file /tmp/body.md\n'
+    )
+    assert _unpinned_commands(script) == ["gh"]
+
+
+@pytest.mark.parametrize(
+    "script",
+    [
+        "/usr/bin/mkdir -p ${HOME}/.grok",
+        'post() { /usr/bin/gh api "$1"; }',
+        "if (( n > 1 )); then /usr/bin/cat /tmp/f; fi",
+        "2>/dev/null /usr/bin/gh api x",
+        "/usr/bin/gh api x > /tmp/out 2>&1",
+        'case "$E" in APPROVE) /usr/bin/jq . ;; *) : ;; esac',
+        "printf '%s' \"$BYTES\" | /usr/bin/python3 -I - /tmp/reply.md",
+        "NOTE=\"${NOTE_LINE#*$'\\t'}\"",
+        "/usr/bin/cat <<'EOF' > \"$HOME/.grok/sandbox.toml\"\n"
+        "[profiles.ci]\nextends = \"read-only\"\nEOF",
+    ],
+)
+def test_parser_does_not_flag_legitimate_pinned_constructs(script):
+    assert _unpinned_commands(script) == []
+
+
+def test_no_workflow_persists_the_checkout_credential():
+    """actions/checkout defaults to writing the installation token into
+    .git/config as an http extraheader. Several of these jobs then hand that
+    tree to an agent whose reply is published, and grok-boundary-test.yml hands
+    it to a deliberately ADVERSARIAL one. Asserted across every workflow rather
+    than the two that prompted the fix: the gap was never that a specific file
+    was wrong, it was that the default is unsafe here and nothing checked."""
+    offenders = []
+    for path in sorted((ROOT / ".github" / "workflows").glob("*.yml")):
+        doc = _load(path)
+        for job_name, job in (doc.get("jobs") or {}).items():
+            for step in job.get("steps") or []:
+                if not str(step.get("uses", "")).startswith("actions/checkout"):
+                    continue
+                if (step.get("with") or {}).get("persist-credentials") is not False:
+                    offenders.append(f"{path.name}::{job_name}")
+    assert not offenders, (
+        f"checkout persists the token in {offenders}; "
+        "set persist-credentials: false"
+    )
+
+
+def _steps_after_path_mutation(job: dict) -> list[dict]:
+    """Every step that runs after something prepends to PATH via GITHUB_PATH.
+
+    DERIVED, never enumerated. `Install Grok Build CLI` puts $HOME/.grok/bin on
+    PATH straight out of a `curl | bash`, and GITHUB_PATH takes effect in
+    SUBSEQUENT steps — so the exposed set is positional, not a list of names
+    someone remembered to update. Enumeration is exactly what let cat/jq/gh sit
+    unpinned beside the git/python3/sed an earlier fix did pin, and what left
+    the step that writes `restrict_network = true` uncovered.
+    """
+    steps = job["steps"]
+    for i, step in enumerate(steps):
+        if "GITHUB_PATH" in str(step.get("run", "")):
+            return steps[i + 1:]
+    raise AssertionError("no step appends to GITHUB_PATH — boundary undefined")
+
+
+def test_no_unpinned_command_runs_after_path_is_mutated(review):
+    """#263's stated threat model, applied consistently.
+
+    A shadowed binary after this point is not a tidiness problem: a planted
+    `cat` in `Configure the sandbox profile` writes restrict_network = false
+    and opens the child-process egress the whole design leans on, which defeats
+    the leak gate outright because the credential never has to pass through the
+    reply at all.
+    """
     jobs = {
         "grok-review.yml": review["jobs"]["grok-review"],
         "grok.yml": _load(ROOT / ".github" / "workflows" / "grok.yml")["jobs"]["grok"],
     }
-    for name, step_names in TRUST_STEPS.items():
-        steps = jobs[name]["steps"]
-        for step_name in step_names:
-            step = next(s for s in steps if s.get("name") == step_name)
-            bare = _unpinned_commands(step["run"])
+    for name, job in jobs.items():
+        for step in _steps_after_path_mutation(job):
+            bare = _unpinned_commands(step.get("run", ""))
             assert not bare, (
-                f"{name}::{step_name} resolves {sorted(set(bare))} on PATH; "
-                "pin the absolute path (/usr/bin/...) as git/python3/sed already are"
+                f"{name}::{step.get('name')} resolves {sorted(set(bare))} on "
+                "PATH after $HOME/.grok/bin was prepended; use an absolute path"
             )
 
 

@@ -26,17 +26,30 @@ CHECKS
      is NOT the only credential on the runner — actions/checkout can leave an
      installation token in .git/config, which the value check above would
      never see because it never appears in auth.json.
-  4. DECODED MATCH — base64-looking runs in the reply are decoded and rescanned
-     for the same shapes, plus `x-access-token:`. That specific string is the
-     username half of the git credential checkout persists as
-     `AUTHORIZATION: basic base64(x-access-token:<token>)`, so it only ever
-     reads as a leak once DECODED. It is deliberately not matched in
-     plaintext: a security review of this very file says it out loud, and
-     blocking those reviews is exactly how the first version of this gate
-     earned its rewrite.
+  4. DECODED MATCH — base64 and hex runs are decoded and rescanned for the
+     same shapes, plus `x-access-token:` WHEN a token shape sits in the same
+     decoded view. That string is the username half of the git credential
+     checkout persists as `AUTHORIZATION: basic base64(x-access-token:<token>)`,
+     so it only ever reads as a leak once DECODED. It is deliberately not
+     matched in plaintext: a security review of this very file says it out
+     loud, and blocking those reviews is exactly how the first version of this
+     gate earned its rewrite. Requiring a token shape beside it extends that
+     same reasoning one layer down — a review that DEMONSTRATES the encoding
+     ("this blob decodes to x-access-token:<token>") must still get posted.
+
+     Three lessons here are REPRODUCED bypasses of the version that shipped
+     before this one, not hypotheticals:
+       * A cap that TRUNCATES is a bypass. Stopping after N base64 runs meant
+         padding the reply with junk runs first left the real blob unscanned.
+         Budget overrun now fails CLOSED (ScanBudgetExceeded).
+       * Separators that are not whitespace (commas, zero-width spaces) split a
+         blob so that neither the run regex nor the whitespace-stripped variant
+         sees it. Hence the alphabet-only decode source.
+       * One decode is not enough — base64 of base64 walked through. Decoding
+         now recurses while the output is still pure encoding alphabet.
 
 RESIDUAL RISK, STATED PLAINLY: this cannot be complete. A model asked to
-rot13, reverse, chunk, or describe a token in words will defeat any substring
+rot13, reverse, or describe a token in words will defeat any substring
 matcher. This gate is the last line, not the boundary — the boundary is that
 child-process egress is blocked (verified on Linux) and the blast radius is
 small (short-lived token, collaborator-only triggers, ephemeral runner).
@@ -61,25 +74,60 @@ WINDOW = 24
 # Credential SHAPES, independent of any local auth file. Each needs a literal
 # prefix followed by token-length payload, so prose that merely names the
 # format ("tokens start with ghp_") does not match.
+#
+# The (?<![A-Za-z0-9_]) lookbehind requires the prefix to start at a delimiter.
+# Without it the whitespace-stripped variant produces false positives: strip
+# the spaces out of "...new highs_ and then twenty more characters..." and
+# `ghs_` + 20 alphanumerics matches inside an ordinary English sentence. A real
+# leaked token is always preceded by whitespace, a quote, `:` or `=`, so the
+# only detection this costs is a token welded to a word with no delimiter at
+# all — which the un-stripped `reply` variant still sees.
+_START = r"(?<![A-Za-z0-9_])"
 SHAPE_PATTERNS = (
-    ("JWT-shaped token", re.compile(r"eyJ[A-Za-z0-9_-]{30,}\.[A-Za-z0-9_-]{10,}")),
-    ("GitHub token", re.compile(r"gh[pousr]_[A-Za-z0-9]{36,}")),
-    ("GitHub fine-grained PAT", re.compile(r"github_pat_[A-Za-z0-9_]{50,}")),
+    ("JWT-shaped token", re.compile(_START + r"eyJ[A-Za-z0-9_-]{30,}\.[A-Za-z0-9_-]{10,}")),
+    ("GitHub token", re.compile(_START + r"gh[pousr]_[A-Za-z0-9]{36,}")),
+    ("GitHub fine-grained PAT", re.compile(_START + r"github_pat_[A-Za-z0-9_]{50,}")),
     # Installation tokens are the ones this repo actually mints, and short
     # ones exist, so they get a looser bound than the family pattern above.
-    ("GitHub installation token", re.compile(r"ghs_[A-Za-z0-9]{20,}")),
+    ("GitHub installation token", re.compile(_START + r"ghs_[A-Za-z0-9]{20,}")),
 )
 
-# Only meaningful once decoded — see CHECKS 4 in the module docstring.
+# The username half of the git credential `actions/checkout` persists. Only
+# ever evaluated on DECODED bytes (see CHECKS 4), and only when a token shape
+# sits in the same decoded view: on its own this string is vocabulary, and a
+# review that DEMONSTRATES the encoding — "this blob decodes to
+# x-access-token:<token>" — is a legitimate review, not a leak. Requiring a
+# real token shape alongside it keeps the true positive (GitHub only ever
+# mints ghs_/ghp_ into that header) without blocking the explanation of it.
 DECODED_ONLY_MARKERS = ("x-access-token:",)
 
 # A run shorter than this decodes to too few bytes to carry a token prefix.
 MIN_B64_RUN = 24
-# Bound the decode pass: a reply is a review, not a corpus, and the gate runs
-# in the critical path of every posted review.
-MAX_B64_RUNS = 500
+MIN_HEX_RUN = 40
 B64_RUN_RE = re.compile(r"[A-Za-z0-9+/_-]{%d,}" % MIN_B64_RUN)
+HEX_RUN_RE = re.compile(r"[0-9a-fA-F]{%d,}" % MIN_HEX_RUN)
 _B64_URLSAFE = str.maketrans("-_", "+/")
+# Everything outside this class is separator noise. Stripping it defeats
+# "chunk the blob with commas / zero-width spaces", which neither the run
+# regex nor the whitespace-stripped variant catches on its own.
+_NOT_ENCODED_RE = re.compile(r"[^A-Za-z0-9+/=_-]+")
+# A decoded view is only re-decoded when it is ITSELF nothing but encoding
+# alphabet — the signature of double-encoding. Without this test the recursion
+# fans out across every garbage decode and the scan stops being bounded.
+_ALL_ENCODED_RE = re.compile(r"[A-Za-z0-9+/=_-]+")
+
+# Recursion depth for nested encodings (base64 of base64 of the credential).
+MAX_DECODE_DEPTH = 3
+# Total decoded bytes the scan will produce before giving up. A review is a
+# review, not a corpus; a reply that blows this budget is not something this
+# gate can honestly certify, so exceeding it FAILS CLOSED rather than
+# truncating. Truncation is what made the previous cap a bypass: an attacker
+# emitted junk runs first and the real blob was simply never reached.
+MAX_DECODE_BYTES = 8 << 20
+
+
+class ScanBudgetExceeded(Exception):
+    """The reply produced more decoded material than the gate will certify."""
 
 
 def secret_values(auth: object) -> list[str]:
@@ -133,17 +181,16 @@ def windows_hit(haystacks: dict[str, str], value: str) -> str | None:
     return None
 
 
-def decoded_runs(text: str) -> list[str]:
-    """Text views of every base64-looking run in `text`, at all four phases.
+def decode_once(text: str) -> list[bytes]:
+    """Every base64 and hex run in `text`, decoded at every plausible offset.
 
     Phase matters: a reply that quotes only PART of a blob starts mid-quantum,
-    and an aligned-only decode reads that as noise. Four offsets is cheap and
-    is the difference between catching a pasted extraheader and not.
+    and an aligned-only decode reads that as noise. Four offsets for base64 and
+    two for hex is cheap, and is the difference between catching a pasted
+    extraheader and not.
     """
-    views: list[str] = []
-    for count, match in enumerate(B64_RUN_RE.finditer(text)):
-        if count >= MAX_B64_RUNS:
-            break
+    out: list[bytes] = []
+    for match in B64_RUN_RE.finditer(text):
         run = match.group(0).translate(_B64_URLSAFE)
         for phase in range(4):
             chunk = run[phase:]
@@ -151,28 +198,83 @@ def decoded_runs(text: str) -> list[str]:
             if len(chunk) < MIN_B64_RUN:
                 continue
             try:
-                raw = base64.b64decode(chunk, validate=True)
+                out.append(base64.b64decode(chunk, validate=True))
             except ValueError:  # binascii.Error subclasses ValueError
                 continue
-            # latin-1 never raises, and the markers we look for are ASCII.
-            views.append(raw.decode("latin-1"))
+    for match in HEX_RUN_RE.finditer(text):
+        run = match.group(0)
+        for phase in (0, 1):
+            chunk = run[phase:]
+            chunk = chunk[:len(chunk) // 2 * 2]
+            if len(chunk) < MIN_HEX_RUN:
+                continue
+            try:
+                out.append(bytes.fromhex(chunk))
+            except ValueError:
+                continue
+    return out
+
+
+def decoded_views(text: str, budget: list[int]) -> list[str]:
+    """Decoded views of `text`, following nested encodings to a bounded depth.
+
+    `budget` is a one-element list of remaining bytes, shared across the whole
+    scan. Running out raises rather than truncating — a scan that quietly stops
+    early reports "clean" for material it never looked at.
+    """
+    views: list[str] = []
+    frontier = [text]
+    for _ in range(MAX_DECODE_DEPTH):
+        nxt: list[str] = []
+        for source in frontier:
+            for raw in decode_once(source):
+                budget[0] -= len(raw)
+                if budget[0] < 0:
+                    raise ScanBudgetExceeded
+                # latin-1 never raises, and every marker we look for is ASCII.
+                view = raw.decode("latin-1")
+                views.append(view)
+                # Recurse only into output that is itself pure encoding
+                # alphabet: that is what base64-of-base64 looks like, and it
+                # keeps the fan-out from exploding on ordinary garbage.
+                stripped = view.strip()
+                if len(stripped) >= MIN_B64_RUN and _ALL_ENCODED_RE.fullmatch(stripped):
+                    nxt.append(view)
+        if not nxt:
+            break
+        frontier = nxt
     return views
 
 
 def shape_hits(haystacks: dict[str, str]) -> list[str]:
-    """Shape and decoded-shape findings across every reply variant."""
+    """Shape findings across every reply variant and every decoded view."""
     hits: list[str] = []
+    budget = [MAX_DECODE_BYTES]
+
     for variant, text in haystacks.items():
         for label, pattern in SHAPE_PATTERNS:
             if pattern.search(text):
                 hits.append(f"{label} in {variant}")
-        for decoded in decoded_runs(text):
+
+    # Decode sources include an alphabet-only view of the reply, which is what
+    # defeats "chunk the blob with commas or zero-width spaces": those
+    # separators survive whitespace stripping but not this. It is a decode
+    # SOURCE only and never a shape-scan target — concatenating a whole review
+    # into one alphanumeric run would match token shapes by coincidence.
+    sources = dict(haystacks)
+    sources["reply(encoded-alphabet-only)"] = _NOT_ENCODED_RE.sub("", haystacks["reply"])
+
+    for variant, text in sources.items():
+        for decoded in decoded_views(text, budget):
             for label, pattern in SHAPE_PATTERNS:
                 if pattern.search(decoded):
-                    hits.append(f"{label} in base64-decoded {variant}")
+                    hits.append(f"{label} in decoded {variant}")
+            # Co-located with a real token shape only — see DECODED_ONLY_MARKERS.
             for marker in DECODED_ONLY_MARKERS:
-                if marker in decoded:
-                    hits.append(f"{marker} in base64-decoded {variant}")
+                if marker in decoded and any(
+                    p.search(decoded) for _, p in SHAPE_PATTERNS
+                ):
+                    hits.append(f"{marker} with a token in decoded {variant}")
     return hits
 
 
@@ -228,7 +330,12 @@ def main() -> int:
                     hits.append(f"{label}-encoded value {redacted} in {variant}")
                     break
 
-    hits.extend(shape_hits(haystacks))
+    try:
+        hits.extend(shape_hits(haystacks))
+    except ScanBudgetExceeded:
+        print("::error::Reply produced more decoded material than this gate "
+              "will certify — refusing to post.")
+        return 1
 
     if hits:
         print("::error::Credential material detected — refusing to post.")

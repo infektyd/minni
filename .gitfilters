@@ -8,6 +8,13 @@
 /.mcp.json
 /.kilo/**
 /.cursor/**
+# ...except the approval/review policies. These are repository TRUST surface,
+# not machine state: Cursor's approval agents and Bugbot discover them from
+# repository contents at the PR head, so a blocked policy file is an inert one
+# that still reads as protection. They contain no runtime state or secrets.
+!/.cursor/APPROVAL_POLICY.md
+!/.cursor/BUGBOT.md
+!/.cursor/approval-policies/**
 /.claude/**
 /.obsidian/**
 /.DS_Store
