@@ -1,0 +1,46 @@
+-- Migration 018: index the episodic events that predate the FTS trigger.
+--
+-- Slice R7. PR #259 fixed the episodic retrieval WIRE — search_episodic is
+-- called and the plugin renders the channel — but the wire was reading a
+-- half-empty index. trg_episodic_fts_insert mirrors episodic_events into
+-- episodic_fts AFTER INSERT, and a trigger only ever sees rows written after
+-- it exists. Every event logged before the trigger was added never entered
+-- episodic_fts, and no path reconciled them: search_episodic reads the FTS
+-- table alone, so that text was permanently unreachable while sitting in
+-- plain sight in episodic_events.
+--
+-- On the operator's own database that is 35 of the 43 non-trace events
+-- (event_ids 1-39, kinds message/query/task_start/task_end/finding): ~81% of
+-- real episodic memory unsearchable. The direct probe is
+-- `SELECT * FROM episodic_fts WHERE episodic_fts MATCH 'TurboQuant'` returning
+-- zero rows against three episodic_events rows that contain the word.
+--
+-- The backfill is implemented in Python (episodic.reconcile_episodic_fts, run
+-- from migrations._apply_migration_018_episodic_fts_backfill) rather than as
+-- SQL here, for two reasons:
+--
+--   1. _execute_tolerant forgives "no such table" for ALTER/CREATE/UPDATE/
+--      DELETE against a partial schema but NOT for INSERT. A plain INSERT here
+--      would take down the whole migration batch on any fixture DB built
+--      without the episodic tables. The Python path checks for both tables
+--      first and no-ops.
+--
+--   2. The same function is what health's episodic coverage metric is measured
+--      against, so the repair and the report cannot drift apart.
+--
+-- Idempotent: it inserts exactly the rows episodic_fts lacks, so re-running
+-- inserts nothing. This file is a no-op marker so the version stays
+-- discoverable and recorded in schema_migrations, matching migration 015.
+--
+-- Deliberately one-directional. episodic_fts also holds orphan rows whose
+-- events have been deleted (7 on the operator's DB — cleanup_expired removes
+-- both sides, but some earlier delete path did not). Those are NOT removed
+-- here: search_episodic INNER JOINs episodic_events, so an orphan can never
+-- surface as a result. It is index residue, not a correctness bug, and a
+-- migration that deletes rows to tidy residue is a worse trade than one that
+-- reports it. The count is surfaced as episodic_fts_orphans in the coverage
+-- report instead.
+--
+-- See migrations.py:_apply_migration_018_episodic_fts_backfill.
+
+SELECT 1;

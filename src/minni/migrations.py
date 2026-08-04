@@ -203,6 +203,8 @@ def run_migrations(conn: sqlite3.Connection) -> None:
                         _execute_tolerant(conn, statement)
                 if version == 13:
                     _apply_migration_013_legacy_main_rewrite(conn)
+                if version == 18:
+                    _apply_migration_018_episodic_fts_backfill(conn)
                 conn.execute(
                     "INSERT OR REPLACE INTO schema_migrations(version, name, applied_at) VALUES (?, ?, ?)",
                     (version, os.path.basename(filepath), now),
@@ -361,6 +363,23 @@ def _apply_migration_015_candidate_status_expand(conn: sqlite3.Connection) -> No
         raise
     finally:
         conn.execute("PRAGMA foreign_keys=ON")
+
+
+def _apply_migration_018_episodic_fts_backfill(conn: sqlite3.Connection) -> None:
+    """Index the episodic events written before trg_episodic_fts_insert existed.
+
+    Delegates to episodic.reconcile_episodic_fts so the repair and the
+    episodic coverage metric in health measure the same thing. No-op on a
+    schema without both episodic tables, and on a database already in step.
+    See migrations/018_backfill_episodic_fts.sql for the full rationale.
+    """
+    from minni.episodic import reconcile_episodic_fts
+
+    result = reconcile_episodic_fts(conn)
+    logger.info(
+        "Migration 018: %d episodic event(s) backfilled into episodic_fts",
+        result["inserted"],
+    )
 
 
 def _apply_migration_013_legacy_main_rewrite(conn: sqlite3.Connection) -> None:

@@ -99,7 +99,7 @@ def _cursor_batch(c, sql: str, key: Tuple[str, str], limit: int):
 
 
 def embedding_coverage(db: SovereignDB) -> Dict[str, object]:
-    """Document- and learning-level vector coverage.
+    """Document- and learning-level vector coverage, plus episodic FTS coverage.
 
     Counts only — no paths, no learning text — so this is safe to expose in the
     pre-identity health report alongside the other aggregate liveness fields.
@@ -184,7 +184,87 @@ def embedding_coverage(db: SovereignDB) -> Dict[str, object]:
         learnings_with_embedding, total_learnings
     )
     coverage["learnings_terminal_null_embedding"] = learnings_terminal_null
+    coverage.update(episodic_index_coverage(db))
     return coverage
+
+
+def episodic_index_coverage(db: SovereignDB) -> Dict[str, object]:
+    """Episodic events versus what episodic_fts can actually find.
+
+    Slice R7: embedding_coverage compared documents against vectors and
+    learnings against embeddings, and stopped there. Episodic memory has no
+    embeddings at all — search_episodic reads episodic_fts — so an events/FTS
+    desync was invisible to every health surface. It was also real: 35 of 43
+    non-trace events on the operator's database were absent from the index
+    because they predate the AFTER-INSERT trigger, and the only way to see that
+    was to write the join by hand. Migration 018 repairs the existing gap; this
+    is what stops the next one being silent.
+
+    Counts and ratios only — no event content — so it stays exposable next to
+    the document and learning fields.
+
+    Carries its own error boundary rather than joining embedding_coverage's:
+    a schema without episodic_fts must cost the caller the episodic fields, not
+    the document coverage it came for.
+    """
+    from minni.episodic import NON_MEMORY_EVENT_TYPES
+
+    try:
+        placeholders = ",".join("?" * len(NON_MEMORY_EVENT_TYPES))
+        # Trace rows are excluded from the ratio and reported on their own line,
+        # the same honesty rule documents_deliberately_unembedded follows: they
+        # ARE indexed, they are simply not agent memory, and folding thousands
+        # of them into the denominator would drown the gap this field exists to
+        # expose (2597 traces against 43 real events on the operator's DB).
+        memory_only = (
+            f"content IS NOT NULL AND (event_type IS NULL"
+            f" OR event_type NOT IN ({placeholders}))"
+        )
+        indexed_ids = (
+            "SELECT CAST(event_id AS INTEGER) FROM episodic_fts"
+            " WHERE event_id IS NOT NULL"
+        )
+        with db.cursor() as c:
+            total_events = c.execute(
+                f"SELECT COUNT(*) AS n FROM episodic_events WHERE {memory_only}",
+                NON_MEMORY_EVENT_TYPES,
+            ).fetchone()["n"]
+            indexed_events = c.execute(
+                f"SELECT COUNT(*) AS n FROM episodic_events"
+                f" WHERE {memory_only} AND event_id IN ({indexed_ids})",
+                NON_MEMORY_EVENT_TYPES,
+            ).fetchone()["n"]
+            observability_events = c.execute(
+                f"SELECT COUNT(*) AS n FROM episodic_events"
+                f" WHERE event_type IN ({placeholders})",
+                NON_MEMORY_EVENT_TYPES,
+            ).fetchone()["n"]
+            # Index residue: FTS rows whose event is gone. Harmless to recall —
+            # search_episodic INNER JOINs episodic_events — but reported rather
+            # than hidden, since a climbing count means a delete path is
+            # skipping the index.
+            orphans = c.execute(
+                "SELECT COUNT(*) AS n FROM episodic_fts f"
+                " WHERE f.event_id IS NOT NULL"
+                " AND CAST(f.event_id AS INTEGER) NOT IN"
+                " (SELECT event_id FROM episodic_events)"
+            ).fetchone()["n"]
+    except Exception as exc:
+        logger.debug("episodic_index_coverage unavailable: %s", exc)
+        return {"episodic_error": str(exc)}
+
+    return {
+        "episodic_events_total": total_events,
+        "episodic_events_indexed": indexed_events,
+        "episodic_events_missing_index": max(0, total_events - indexed_events),
+        # None rather than 1.0 on an empty table, matching _ratio above: an
+        # empty episodic log has no coverage to report.
+        "episodic_index_ratio": (
+            round(indexed_events / total_events, 4) if total_events > 0 else None
+        ),
+        "episodic_observability_events": observability_events,
+        "episodic_fts_orphans": orphans,
+    }
 
 
 def vault_embedding_coverage(

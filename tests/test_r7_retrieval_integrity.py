@@ -12,6 +12,7 @@ it red. Covers:
   #225-R6 the document/vector coverage ratio is surfaced in health
   GA4-1   score calibration is fed by the retrieval path (record_score wired)
   GA4-4   a FAISS index restored from disk can still rebuild (raw vectors kept)
+  R7      episodic events predating the FTS trigger are backfilled and counted
 
 All state is tmp_path-backed; no live ~/.minni access.
 """
@@ -48,6 +49,106 @@ def _make_engine(tmp_path, **cfg_overrides):
     db_obj, cfg = _make_db(tmp_path, **cfg_overrides)
     engine = RetrievalEngine(db_obj, cfg, faiss_index=object())
     return engine, db_obj, cfg
+
+
+# ---------------------------------------------------------------------------
+# Behavioural harness for minnid.main()'s scheduling
+#
+# Campaign scar: the scheduling tests here used inspect.getsource(minnid.main)
+# and asserted on substrings. Wrapping a runner's guard in `if False:` leaves
+# the source text untouched, so both tests passed against a daemon that
+# scheduled nothing. The harness below runs main() for real against a stub
+# event loop and records the coroutines actually handed to create_task, so the
+# assertion is on behaviour rather than on the text of the file.
+# ---------------------------------------------------------------------------
+
+class _RecordedTask:
+    """Stands in for asyncio.Task: remembers the code object it was created
+    from and whether the shutdown path cancelled it."""
+
+    def __init__(self, coro):
+        # Captured before close(): a closed coroutine still exposes cr_code,
+        # but reading it first keeps the ordering obvious.
+        self.code = coro.cr_code
+        self.name = coro.cr_code.co_name
+        # main() never awaits these under the stub loop; closing them keeps
+        # pytest from filling the run with "coroutine was never awaited".
+        coro.close()
+        self.cancelled = False
+
+    def cancel(self):
+        self.cancelled = True
+
+
+class _StubLoop:
+    """Records create_task calls instead of running them."""
+
+    def __init__(self):
+        self.tasks = []
+
+    def set_default_executor(self, executor):
+        executor.shutdown(wait=False)
+
+    def create_task(self, coro):
+        task = _RecordedTask(coro)
+        self.tasks.append(task)
+        return task
+
+    def run_until_complete(self, task):
+        return None
+
+    def close(self):
+        pass
+
+    def task_for(self, func):
+        """The recorded task created from *func*, or None.
+
+        Identity on the code object, not on a name string: this can only pass
+        if main() actually called create_task with that coroutine.
+        """
+        for task in self.tasks:
+            if task.code is func.__code__:
+                return task
+        return None
+
+
+def _run_main_with_stub_loop(monkeypatch, tmp_path):
+    """Run minnid.main() against a stub loop. Returns (minnid, loop, handlers).
+
+    ``handlers`` maps signal number -> the handler main() installed, so the
+    shutdown path can be invoked directly and its cancellations observed.
+
+    Everything that would touch the operator's machine is stubbed: the eager
+    SovereignDB.shared() startup migration (which would open the real
+    ~/.minni/minni.db), the fd-ceiling raise, logging reconfiguration, the
+    deploy-state git probe, and signal registration.
+    """
+    import asyncio as _asyncio
+    import signal as _signal
+
+    import minni.minnid as minnid
+    import minni.minnid_runtime.deploy_honesty as deploy_honesty
+    from minni.db import SovereignDB
+
+    loop = _StubLoop()
+    handlers = {}
+
+    monkeypatch.setattr(
+        sys, "argv", ["minnid", "--socket", str(tmp_path / "minnid.sock")]
+    )
+    monkeypatch.setattr(_asyncio, "new_event_loop", lambda: loop)
+    monkeypatch.setattr(_signal, "signal", lambda num, fn: handlers.__setitem__(num, fn))
+    monkeypatch.setattr(minnid, "_raise_fd_ceiling", lambda *a, **k: 0)
+    monkeypatch.setattr(minnid.obs, "configure_logging", lambda **k: None)
+    monkeypatch.setattr(deploy_honesty, "capture_start_state", lambda: None)
+
+    def _no_live_db(*args, **kwargs):
+        raise RuntimeError("test: refusing to open the live database")
+
+    monkeypatch.setattr(SovereignDB, "shared", staticmethod(_no_live_db))
+
+    minnid.main()
+    return minnid, loop, handlers
 
 
 # Hermetic principal setup — same pattern as test_correction_reinjection.py, so
@@ -894,18 +995,34 @@ class TestEmbeddingBackfillAndCoverage:
         assert rows[not_whole] == "knowledge"
         db_obj.close()
 
-    def test_daemon_schedules_the_backfill(self):
-        import inspect
+    def test_daemon_schedules_the_backfill(self, monkeypatch, tmp_path):
+        """main() must hand _backfill_runner to create_task, and cancel it on
+        shutdown. Asserted against a real main() run on a stub loop — the old
+        version of this test read inspect.getsource(main) for the substring
+        '_backfill_runner()', which survives wrapping the guard in `if False:`
+        and so passed against a daemon that queued nothing."""
+        import signal
 
-        import minni.minnid as minnid
+        monkeypatch.setenv("MINNI_BACKFILL", "on")
+        minnid, loop, handlers = _run_main_with_stub_loop(monkeypatch, tmp_path)
 
-        assert hasattr(minnid, "_backfill_runner")
-        src = inspect.getsource(minnid.main)
-        assert "_backfill_runner()" in src, (
+        task = loop.task_for(minnid._backfill_runner)
+        assert task is not None, (
             "the degraded status was logged but no retry was queued — a log "
-            "line is not a queue"
+            f"line is not a queue (scheduled: {[t.name for t in loop.tasks]})"
         )
-        assert "backfill_task.cancel()" in src
+
+        handlers[signal.SIGTERM](signal.SIGTERM, None)
+        assert task.cancelled, "shutdown must cancel the backfill task"
+
+    def test_backfill_is_not_scheduled_when_disabled(self, monkeypatch, tmp_path):
+        """The env gate is real, not decorative — the same run harness proves
+        the negative, so 'scheduled' above cannot be an unconditional artifact
+        of the stub loop."""
+        monkeypatch.setenv("MINNI_BACKFILL", "off")
+        minnid, loop, _ = _run_main_with_stub_loop(monkeypatch, tmp_path)
+
+        assert loop.task_for(minnid._backfill_runner) is None
 
     def test_health_report_declares_the_coverage_field(self):
         import inspect
@@ -1342,14 +1459,36 @@ class TestDecayIsScheduled:
         assert hasattr(minnid, "_decay_enabled")
         assert hasattr(minnid, "_decay_sweep_once")
 
-    def test_decay_runner_is_started_by_main(self):
-        """A runner nobody creates a task for is the same dead channel."""
-        import inspect
-        import minni.minnid as minnid
+    def test_decay_runner_is_started_by_main(self, monkeypatch, tmp_path):
+        """A runner nobody creates a task for is the same dead channel.
 
-        src = inspect.getsource(minnid.main)
-        assert "_decay_runner()" in src, "main() must create the decay task"
-        assert "decay_task.cancel()" in src, "shutdown must cancel the decay task"
+        Runs main() against a stub loop and asserts on the coroutine actually
+        passed to create_task. The previous version asserted that the string
+        '_decay_runner()' appeared in inspect.getsource(main), which stays true
+        when the scheduling guard is wrapped in `if False:` — the daemon
+        scheduled no decay pass and the test still passed.
+        """
+        import signal
+
+        monkeypatch.setenv("MINNI_DECAY", "on")
+        minnid, loop, handlers = _run_main_with_stub_loop(monkeypatch, tmp_path)
+
+        task = loop.task_for(minnid._decay_runner)
+        assert task is not None, (
+            "main() must create the decay task "
+            f"(scheduled: {[t.name for t in loop.tasks]})"
+        )
+
+        handlers[signal.SIGTERM](signal.SIGTERM, None)
+        assert task.cancelled, "shutdown must cancel the decay task"
+
+    def test_decay_is_not_scheduled_when_disabled(self, monkeypatch, tmp_path):
+        """MINNI_DECAY=off must actually suppress the task, so the positive
+        case above is testing the guard and not just the harness."""
+        monkeypatch.setenv("MINNI_DECAY", "off")
+        minnid, loop, _ = _run_main_with_stub_loop(monkeypatch, tmp_path)
+
+        assert loop.task_for(minnid._decay_runner) is None
 
     def test_decay_enabled_by_default_and_env_disablable(self, monkeypatch):
         import minni.minnid as minnid
@@ -2855,3 +2994,207 @@ class TestPostActivationEnvelopeAgrees:
                 f"rationale must embed the calibrated confidence {conf:.2f}, "
                 f"not the pre-calibration blend; got {rationale!r}"
             )
+
+
+# ---------------------------------------------------------------------------
+# R7 — episodic events written before the FTS trigger must still be findable
+# ---------------------------------------------------------------------------
+
+class TestEpisodicFtsBackfill:
+    """PR #259 wired search_episodic into recall, but the index it searches was
+    half empty. trg_episodic_fts_insert mirrors episodic_events into
+    episodic_fts AFTER INSERT, so every event logged before that trigger existed
+    stayed out of the index forever and nothing reconciled it — 35 of the 43
+    non-trace events on the operator's database, ~81% of real episodic memory,
+    sitting in episodic_events and unreachable through the only path that reads
+    it."""
+
+    _PRE_TRIGGER = [
+        ("task_start", "Starting: Build TurboQuant compression layer"),
+        ("query", "Query: 'Research graph visualization options' → 3 results"),
+        ("finding", "Successfully queried vault and retrieved relevant docs"),
+        ("message", "[user] How do I fix the websocket error?"),
+    ]
+
+    def _db_with_pre_trigger_events(self, tmp_path):
+        """A DB whose earliest events were written with the trigger absent —
+        the exact shape of the operator's database."""
+        db_obj, cfg = _make_db(tmp_path)
+        with db_obj.cursor() as c:
+            c.execute("DROP TRIGGER IF EXISTS trg_episodic_fts_insert")
+            for event_type, content in self._PRE_TRIGGER:
+                c.execute(
+                    "INSERT INTO episodic_events"
+                    " (agent_id, event_type, content, created_at)"
+                    " VALUES ('claude-code', ?, ?, ?)",
+                    (event_type, content, time.time()),
+                )
+            c.execute(
+                """CREATE TRIGGER trg_episodic_fts_insert
+                   AFTER INSERT ON episodic_events
+                   WHEN NEW.content IS NOT NULL
+                   BEGIN
+                       INSERT INTO episodic_fts(event_id, agent_id, content)
+                       VALUES (NEW.event_id, NEW.agent_id, NEW.content);
+                   END"""
+            )
+            # One event written with the trigger live, so the test distinguishes
+            # "backfill worked" from "everything happens to be indexed".
+            c.execute(
+                "INSERT INTO episodic_events"
+                " (agent_id, event_type, content, created_at)"
+                " VALUES ('claude-code', 'message', ?, ?)",
+                ("[assistant] indexed by the live trigger", time.time()),
+            )
+        return db_obj, cfg
+
+    def test_pre_trigger_events_are_unreachable_before_the_backfill(self, tmp_path):
+        """The bug itself: the text is in episodic_events and MATCH finds
+        nothing. Without this the repair below proves nothing."""
+        db_obj, _ = self._db_with_pre_trigger_events(tmp_path)
+        with db_obj.cursor() as c:
+            stored = c.execute(
+                "SELECT COUNT(*) AS n FROM episodic_events"
+                " WHERE content LIKE '%TurboQuant%'"
+            ).fetchone()["n"]
+            found = c.execute(
+                "SELECT COUNT(*) AS n FROM episodic_fts"
+                " WHERE episodic_fts MATCH 'TurboQuant'"
+            ).fetchone()["n"]
+        assert stored == 1
+        assert found == 0, "precondition: the pre-trigger row must start unindexed"
+        db_obj.close()
+
+    def test_backfill_makes_pre_trigger_events_searchable(self, tmp_path):
+        """Through search_episodic — the path recall actually uses — not
+        through a raw MATCH."""
+        from minni.episodic import reconcile_episodic_fts
+        from minni.retrieval import RetrievalEngine
+
+        db_obj, cfg = self._db_with_pre_trigger_events(tmp_path)
+        engine = RetrievalEngine(db_obj, cfg, faiss_index=object())
+
+        assert engine.search_episodic("TurboQuant") == []
+
+        result = reconcile_episodic_fts(db_obj._get_conn())
+        assert result["inserted"] == len(self._PRE_TRIGGER)
+
+        for term in ("TurboQuant", "websocket", "visualization"):
+            hits = engine.search_episodic(term)
+            assert hits, f"{term!r} is in episodic_events but recall cannot find it"
+        db_obj.close()
+
+    def test_backfill_is_idempotent(self, tmp_path):
+        from minni.episodic import reconcile_episodic_fts
+
+        db_obj, _ = self._db_with_pre_trigger_events(tmp_path)
+        conn = db_obj._get_conn()
+        reconcile_episodic_fts(conn)
+        after_first = conn.execute("SELECT COUNT(*) FROM episodic_fts").fetchone()[0]
+
+        assert reconcile_episodic_fts(conn)["inserted"] == 0
+        assert conn.execute("SELECT COUNT(*) FROM episodic_fts").fetchone()[0] == after_first
+        db_obj.close()
+
+    def test_backfill_survives_a_null_event_id_in_the_index(self, tmp_path):
+        """episodic_fts.event_id is an UNINDEXED fts5 column: no affinity, no
+        NOT NULL. A single NULL there makes `NOT IN` evaluate to NULL for every
+        candidate, and an unguarded backfill would insert nothing while
+        reporting success."""
+        from minni.episodic import reconcile_episodic_fts
+
+        db_obj, _ = self._db_with_pre_trigger_events(tmp_path)
+        conn = db_obj._get_conn()
+        conn.execute(
+            "INSERT INTO episodic_fts(event_id, agent_id, content)"
+            " VALUES (NULL, 'claude-code', 'orphaned index row')"
+        )
+
+        assert reconcile_episodic_fts(conn)["inserted"] == len(self._PRE_TRIGGER)
+        db_obj.close()
+
+    def test_backfill_is_safe_on_a_schema_without_episodic_tables(self):
+        """Migrations run against partial fixture schemas; the reconcile must
+        no-op there rather than take the batch down."""
+        import sqlite3
+
+        from minni.episodic import reconcile_episodic_fts
+
+        assert reconcile_episodic_fts(sqlite3.connect(":memory:")) == {
+            "missing_before": 0,
+            "inserted": 0,
+        }
+
+    def test_migration_018_runs_the_backfill(self, tmp_path):
+        """The repair ships as migration 018, so an existing install gets it on
+        the next daemon start without anyone running a command."""
+        from minni.migrations import run_migrations
+
+        db_obj, _ = self._db_with_pre_trigger_events(tmp_path)
+        conn = db_obj._get_conn()
+        conn.execute("DELETE FROM episodic_fts")
+        conn.execute("DELETE FROM schema_migrations WHERE version = 18")
+        conn.commit()
+
+        run_migrations(conn)
+        conn.commit()
+
+        indexed = conn.execute(
+            "SELECT COUNT(*) FROM episodic_fts WHERE episodic_fts MATCH 'TurboQuant'"
+        ).fetchone()[0]
+        assert indexed == 1, "migration 018 must index the pre-trigger events"
+        db_obj.close()
+
+    def test_coverage_report_exposes_the_episodic_gap(self, tmp_path):
+        """R7 deliverable 2: embedding_coverage compared documents to vectors
+        and learnings to embeddings and stopped there, so an events/FTS desync
+        was invisible to every health surface. It is a reported number now."""
+        from minni.backfill import embedding_coverage, episodic_index_coverage
+        from minni.episodic import reconcile_episodic_fts
+
+        db_obj, _ = self._db_with_pre_trigger_events(tmp_path)
+
+        gapped = episodic_index_coverage(db_obj)
+        assert gapped["episodic_events_total"] == len(self._PRE_TRIGGER) + 1
+        assert gapped["episodic_events_indexed"] == 1
+        assert gapped["episodic_events_missing_index"] == len(self._PRE_TRIGGER)
+        assert gapped["episodic_index_ratio"] < 1.0
+
+        reconcile_episodic_fts(db_obj._get_conn())
+
+        healed = episodic_index_coverage(db_obj)
+        assert healed["episodic_events_missing_index"] == 0
+        assert healed["episodic_index_ratio"] == 1.0
+
+        # And it rides along on the report health actually calls, next to the
+        # document and learning fields.
+        assert "episodic_index_ratio" in embedding_coverage(db_obj)
+        db_obj.close()
+
+    def test_coverage_excludes_recall_traces_from_the_ratio(self, tmp_path):
+        """Recall traces are observability rows, not memory. Folding thousands
+        of them into the denominator would drown the gap this field exists to
+        expose, so they are reported on their own line — the same honesty rule
+        documents_deliberately_unembedded follows."""
+        from minni.backfill import episodic_index_coverage
+        from minni.retrieval import RetrievalEngine
+
+        db_obj, _ = self._db_with_pre_trigger_events(tmp_path)
+        with db_obj.cursor() as c:
+            for i in range(5):
+                c.execute(
+                    "INSERT INTO episodic_events"
+                    " (agent_id, event_type, content, created_at)"
+                    " VALUES ('claude-code', 'recall', ?, ?)",
+                    (f"trace {i}", time.time()),
+                )
+
+        coverage = episodic_index_coverage(db_obj)
+        assert coverage["episodic_observability_events"] == 5
+        assert coverage["episodic_events_total"] == len(self._PRE_TRIGGER) + 1, (
+            "trace rows must stay out of the denominator"
+        )
+        # One list, not two: a trace type added to the search filter must move
+        # this metric with it.
+        assert RetrievalEngine.EPISODIC_NON_MEMORY_TYPES == ("recall",)
+        db_obj.close()
