@@ -1,15 +1,33 @@
-# deploy/ — root update propagation (operator-gated)
+# deploy/ — root update propagation (operator)
 
 The live machine executes code from several places that all descend from this
-checkout: the editable pip install, the wire-managed plugin tree
-(`~/.minni/plugin/<version>`), and per-platform hook dists. When `main` moves,
-none of them move by themselves — that gap is how a merged fix stayed unshipped
-for days (2026-08-01 audit, GA1-3/GA5-1), with every health surface silent.
+install: the engine package (wheel or editable), the wire-managed plugin tree
+(`~/.minni/plugin/<version>`), and per-platform hook dists. When the **package
+or `main` moves**, hosts do not automatically follow — Claude/Codex/Grok/Kilo
+can keep running last week's `server.js` while `minni doctor` still passes
+daemon probes.
 
-Two mechanisms close it. The first is on-demand and safe to run any time; the
-second is optional automation that only an operator may activate.
+## Product command (preferred)
 
-## 1. `make sync-root` (on demand)
+```bash
+minni sync              # redeploy fleet from *this* install
+minni sync --full       # editable checkout: git ff + rebuild + redeploy
+minni sync --install-auto   # macOS: schedule full checkout sync (opt-in)
+```
+
+Customer journeys:
+
+| Install | Update path |
+|---------|-------------|
+| `pipx install minni` | `pipx upgrade minni && minni sync` |
+| Editable dogfood | clean `main` + `minni sync` or `minni sync --full` |
+
+`minni doctor` **WARNs** when `deploy.stale` / `plugin_dist.stale` and names
+`minni sync`. Daemon `status.deploy` remains the machine-readable signal.
+
+Implementation: `src/minni/fleet_sync.py` + CLI `minni sync`.
+
+## 1. `make sync-root` (checkout dogfood / CI parity)
 
 ```
 make sync-root            # do it
@@ -57,35 +75,22 @@ The daemon's `status` response carries a `deploy` block
 process or the deployed plugin dist is stale relative to the checkout — that
 signal is what tells you a sync (and daemon restart) is due.
 
-## 2. Scheduled sync (`com.minni.sync-root.plist.template`) — NOT installed
+## 2. Scheduled sync (opt-in automation)
 
-The template in this directory runs the same script on an interval. It is
-**deliberately not installed by anything in this repo** — loading it means the
-machine deploys `origin/main` unattended, and only the operator gets to decide
-that. The refusal rules above still hold on every unattended run: dirt or
-divergence aborts the sync; it never force-updates.
-
-To activate (operator only):
+Unattended deploy of `origin/main` is an **operator decision**. Prefer the
+entry point (installs the same plist template):
 
 ```sh
-mkdir -p "$HOME/.minni/logs"
-sed -e "s|__REPO__|$HOME/Projects/Minni|g" \
-    -e "s|__HOME__|$HOME|g" \
-    deploy/com.minni.sync-root.plist.template \
-    > "$HOME/Library/LaunchAgents/com.minni.sync-root.plist"
-launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.minni.sync-root.plist"
+minni sync --install-auto
+minni sync --auto-status
+minni sync --uninstall-auto
 ```
 
-To check / disable:
+Manual template install (equivalent) remains in
+`deploy/com.minni.sync-root.plist.template`. The refusal rules still hold:
+dirt or divergence aborts the sync; it never force-updates.
 
-```sh
-launchctl print "gui/$(id -u)/com.minni.sync-root"   # status + last exit code
-launchctl bootout "gui/$(id -u)/com.minni.sync-root" # unload
-rm "$HOME/Library/LaunchAgents/com.minni.sync-root.plist"
-```
-
-Logs land in `$HOME/.minni/logs/sync-root.log` / `sync-root.err.log`. A run
-that refused (dirty/diverged checkout) exits 1 and says why in the err log.
+Logs: `$HOME/.minni/logs/sync-root.log` / `sync-root.err.log`.
 
 ### Scheduled environment (PATH / SSH / Node)
 
