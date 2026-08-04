@@ -96,7 +96,9 @@ import {
   expireStaleInboxHandoffs,
   expiredHandoffsBody,
   formatSessionReceiptLine,
+  layer1ShelfBody,
   readInboxStatus,
+  readLayer1Shelf,
   parkUndeliverableInboxEntries,
   readParkedUndeliverablePending,
   readReassertPending,
@@ -667,6 +669,14 @@ export function createHookHandlers(
     // Deliberately UNBUDGETED: this is cheap local FS, and it is the one read
     // whose absence loses data rather than context.
     const reassertPending = await readReassertPending(config.vaultPath, 3);
+    // Layer 1 shelf inline (operator scar: an envelope carrying only identity
+    // keys + a pointer meant every agent re-hit scars already recorded in
+    // layer1/core.md). SessionStart ONLY — UserPromptSubmit's envelope stays
+    // lean, see handleUserPromptSubmit below, which does not call this.
+    // Unbudgeted for the same reason as reassertPending above: cheap, bounded
+    // local FS (stat + a capped read, never unbounded I/O), no RPC — not the
+    // class of read the boot budget exists to bound.
+    const layer1Shelf = await readLayer1Shelf(config.vaultPath);
     const { events: correctionsReassert, consumedPaths: reassertConsumed, contributingPaths: reassertContributing, deferredTails: reassertDeferred } =
       collectCorrectionsReassert(reassertPending);
     // R2: settle AFTER the envelope reaches the host, never before. Archiving
@@ -838,6 +848,11 @@ export function createHookHandlers(
       ...(tail !== undefined
         ? { audit_tail: tail.entries.slice(-5).map((entry) => entry.split("\n")[0]) }
         : {}),
+      // Always present (H2: never a silently missing key) — ok:false carries
+      // an "absent: <reason>" string, ok:true carries the content plus an
+      // explicit truncation marker whenever the 8KB cap trimmed it (H5: no
+      // silent truncation). See vault.ts readLayer1Shelf / layer1ShelfBody.
+      layer1_shelf: layer1ShelfBody(layer1Shelf),
     };
 
     if (correctionsReassert.length > 0) {

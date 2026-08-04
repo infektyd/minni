@@ -85,7 +85,9 @@ import {
   buildPendingLearningsSection,
   expireStaleInboxHandoffs,
   expiredHandoffsBody,
+  layer1ShelfBody,
   readInboxStatus,
+  readLayer1Shelf,
   readReassertPending,
   recordAudit,
   resolveInboxHandoffContext,
@@ -344,6 +346,14 @@ async function handleSessionStart(payload: Record<string, unknown>): Promise<Hoo
   const reassertPending = await readReassertPending(CLAUDECODE_VAULT_PATH, 3);
   const { events: correctionsReassert, consumedPaths: reassertConsumed, contributingPaths: reassertContributing, deferredTails: reassertDeferred } =
     collectCorrectionsReassert(reassertPending);
+  // Layer 1 shelf inline (operator scar: an envelope carrying only identity
+  // keys + a pointer meant every agent re-hit scars already recorded in
+  // layer1/core.md). SessionStart ONLY — UserPromptSubmit's envelope stays
+  // lean and does not call this. Unbudgeted for the same reason as
+  // reassertPending above: cheap, bounded local FS (stat + a capped read,
+  // never unbounded I/O), no RPC — not the class of read the boot budget
+  // exists to bound. Parity with the shared factory's handleSessionStart.
+  const layer1Shelf = await readLayer1Shelf(CLAUDECODE_VAULT_PATH);
   // R2: settle AFTER the envelope reaches the host, never before. Archiving
   // here would consume the correction inside the window where the boot can
   // still be killed, losing it for good — see hook-delivery.ts.
@@ -436,6 +446,11 @@ async function handleSessionStart(payload: Record<string, unknown>): Promise<Hoo
     ...(tail !== undefined
       ? { audit_tail: tail.entries.slice(-5).map((entry) => entry.split("\n")[0]) }
       : {}),
+    // Always present (H2: never a silently missing key) — ok:false carries an
+    // "absent: <reason>" string, ok:true carries the content plus an explicit
+    // truncation marker whenever the 8KB cap trimmed it (H5: no silent
+    // truncation). See vault.ts readLayer1Shelf / layer1ShelfBody.
+    layer1_shelf: layer1ShelfBody(layer1Shelf),
   };
 
   if (degradedSections.length > 0) {

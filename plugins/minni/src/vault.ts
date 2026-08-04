@@ -2574,3 +2574,116 @@ export async function vaultExists(vaultPath: string): Promise<boolean> {
     return false;
   }
 }
+
+/**
+ * Cap on the Layer 1 shelf content inlined into the SessionStart envelope
+ * (bytes). SKILL.md documents a strict <4096 TOKEN budget for layer1/, but a
+ * well-curated, scar-laden core.md runs close to that in bytes too — an 8KB
+ * ceiling leaves headroom above a realistic full shelf while still bounding a
+ * pathological or over-curated file. Same posture as compact-harvest's
+ * SUMMARY_TEXT_MAX_CHARS: a safety ceiling, not a target.
+ */
+export const LAYER1_SHELF_MAX_BYTES = 8192;
+
+export interface Layer1ShelfResult {
+  ok: boolean;
+  content?: string;
+  truncated?: boolean;
+  omittedBytes?: number;
+  /** Set only when ok=false. Always prefixed "absent: " so a missing or
+   * unreadable shelf is grep-able and never a silently missing envelope key. */
+  reason?: string;
+}
+
+/**
+ * Read `<vault>/layer1/core.md` for inlining into the SessionStart envelope.
+ * ALWAYS a bounded read (never the unbounded `readFile` a "file fits under
+ * the cap" shortcut would tempt): one `open`, one `fstat` on that same
+ * descriptor, one `read` capped at LAYER1_SHELF_MAX_BYTES. Sizing off the
+ * open descriptor (not a separate pre-open `stat`) closes the TOCTOU window
+ * a grown-between-check-and-read file would otherwise slip through — the
+ * cap is a hard ceiling on every path, not just the "oversized" one.
+ * `bytesRead` (not the buffer's allocated length) is what becomes `content`,
+ * so a short read can never pad the boot envelope with trailing NUL bytes.
+ * No RPC, no timers — this is local FS only, same class of read as the
+ * reassert inbox scan the SessionStart handler already runs unbudgeted.
+ *
+ * Known limitation: the byte cut is not UTF-8-boundary-aware, so a cap that
+ * lands mid multi-byte character renders as U+FFFD in `content`. `omitted_bytes`
+ * stays byte-accurate regardless. Acceptable for ASCII-heavy markdown shelves;
+ * revisit if core.md content routinely carries non-ASCII near the cap.
+ */
+export async function readLayer1Shelf(vaultPath: string): Promise<Layer1ShelfResult> {
+  const corePath = path.join(vaultPath, "layer1", "core.md");
+  let handle;
+  try {
+    handle = await open(corePath, "r");
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException)?.code;
+    return {
+      ok: false,
+      reason:
+        code === "ENOENT"
+          ? "absent: no layer1/core.md in this vault"
+          : `absent: open failed (${code ?? String((err as Error)?.message ?? err)})`,
+    };
+  }
+  try {
+    const info = await handle.stat();
+    if (!info.isFile()) {
+      return { ok: false, reason: "absent: layer1/core.md is not a regular file" };
+    }
+    if (info.size === 0) {
+      return { ok: false, reason: "absent: layer1/core.md is empty" };
+    }
+    const buffer = Buffer.alloc(LAYER1_SHELF_MAX_BYTES);
+    const { bytesRead } = await handle.read(buffer, 0, LAYER1_SHELF_MAX_BYTES, 0);
+    const content = buffer.subarray(0, bytesRead).toString("utf8");
+    // Truncated whenever the read stopped short of the file's own reported
+    // size — covers both "file exceeds the cap" and a short read on a file
+    // that shrank between fstat and read (bytesRead < info.size either way).
+    const truncated = bytesRead < info.size;
+    return {
+      ok: true,
+      content,
+      truncated,
+      ...(truncated ? { omittedBytes: info.size - bytesRead } : {}),
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      reason: `absent: read failed (${String((err as Error)?.message ?? err)})`,
+    };
+  } finally {
+    await handle.close();
+  }
+}
+
+/**
+ * Envelope body for the `layer1_shelf` SessionStart section. Always present
+ * (never a silently missing key, defect class H2): ok:false carries the
+ * "absent: <reason>" string, ok:true carries the content plus an explicit
+ * truncation marker whenever the cap trimmed it (defect class H5 — no silent
+ * truncation).
+ */
+export function layer1ShelfBody(result: Layer1ShelfResult): Record<string, unknown> {
+  if (!result.ok) {
+    // JSON.stringify DROPS keys whose value is undefined — an unset `reason`
+    // would silently degrade to `{"ok":false}` with no "absent:" string,
+    // exactly the H2 failure mode this field exists to prevent. Every
+    // production path above sets one; this default only guards a future
+    // caller that forgets to.
+    return { ok: false, reason: result.reason ?? "absent: unknown (no reason recorded)" };
+  }
+  return {
+    ok: true,
+    content: result.content,
+    truncated: result.truncated ?? false,
+    ...(result.truncated
+      ? {
+          omitted_bytes: result.omittedBytes,
+          note: `layer1/core.md exceeds the ${LAYER1_SHELF_MAX_BYTES}-byte inline cap; ${result.omittedBytes} byte(s) omitted from the tail.`,
+        }
+      : {}),
+  };
+}
