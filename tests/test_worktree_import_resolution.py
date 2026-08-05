@@ -87,9 +87,17 @@ def test_import_minni_resolves_under_this_repo_src():
     """
     import minni
 
+    # #331: containment decided by the filesystem, not by comparing realpath
+    # STRINGS. This assertion carried the same case-spelling bug as the
+    # conftest hook — invoking pytest through a lowercase spelling of the repo
+    # path on case-insensitive APFS failed it as a false positive, and it was
+    # the LAST thing still failing after the hook was fixed. Shared helper
+    # rather than a second copy of the rule, so the two cannot drift.
+    from tests.conftest import _is_inside
+
     got = os.path.realpath(minni.__file__)
-    root = str(REPO_SRC.resolve()) + os.sep
-    assert got.startswith(root), (
+    root = str(REPO_SRC.resolve())
+    assert _is_inside(got, root), (
         f"import minni resolved outside this worktree: {got!r}; "
         f"expected under {root!r}. Use make test-engine/check/coverage-engine "
         f"or PYTHONPATH=src (#258)."
@@ -250,3 +258,132 @@ def test_pythonpath_src_wins_over_site_packages_editable(tmp_path):
     )
     assert proc_f.returncode == 0, proc_f.stdout + proc_f.stderr
     assert "foreign-ok" in proc_f.stdout
+
+
+# ---------------------------------------------------------------------------
+# #331 — the guard must decide containment on the FILESYSTEM, not on strings
+# ---------------------------------------------------------------------------
+
+
+def _case_variant(path: str) -> str | None:
+    """A different-case spelling of *path* that resolves to the same directory,
+    or None when this filesystem is case-sensitive.
+
+    Flips one alphabetic character in the last directory component and asks the
+    filesystem whether the result still exists. That is the only honest test:
+    case-insensitivity is a property of the mounted volume, not of the OS, and
+    APFS can be formatted either way.
+    """
+    head, tail = os.path.split(path.rstrip(os.sep))
+    for i, ch in enumerate(tail):
+        if ch.isalpha():
+            flipped = ch.lower() if ch.isupper() else ch.upper()
+            candidate = os.path.join(head, tail[:i] + flipped + tail[i + 1:])
+            return candidate if os.path.exists(candidate) else None
+    return None
+
+
+class TestGuardContainmentIsFilesystemAuthoritative:
+    """#331: the guard compared ``realpath`` STRINGS with ``startswith``.
+
+    ``realpath`` resolves symlinks but does not normalise case, so on
+    case-insensitive APFS — the macOS default — ``~/Projects/minni`` and
+    ``~/Projects/Minni`` are one directory that compares unequal. Invoking
+    pytest through the lowercase spelling tripped the guard as a false
+    positive and blocked a legitimate run. Observed live during PR
+    verification; the workaround was retyping the path in canonical case,
+    which is not something a guard should demand.
+    """
+
+    def test_a_different_case_spelling_of_the_same_dir_is_inside(self):
+        """The false positive itself. Skips on a case-sensitive volume, where
+        the two spellings genuinely are different directories."""
+        from tests.conftest import _REPO_SRC, _is_inside
+
+        variant = _case_variant(_REPO_SRC)
+        if variant is None:
+            import pytest as _pytest
+
+            _pytest.skip("filesystem is case-sensitive; no same-dir variant exists")
+
+        # Precondition: the two spellings differ as strings but are one
+        # directory. Without this the assertion below could pass vacuously.
+        assert variant != _REPO_SRC
+        assert os.path.samestat(os.stat(variant), os.stat(_REPO_SRC))
+        # And the old implementation's test really would have failed here.
+        probe = os.path.join(_REPO_SRC, "minni", "__init__.py")
+        assert not os.path.realpath(probe).startswith(variant + os.sep), (
+            "precondition: the string-prefix compare this replaced must be the "
+            "thing that fails on this spelling"
+        )
+
+        assert _is_inside(probe, variant) is True
+
+    def test_a_genuinely_different_directory_is_refused(self, tmp_path):
+        """The refusal half must stay load-bearing — a guard that accepts
+        everything is worse than no guard, because it reports safety."""
+        from tests.conftest import _is_inside
+
+        other = tmp_path / "not-the-repo"
+        (other / "minni").mkdir(parents=True)
+        intruder = other / "minni" / "__init__.py"
+        intruder.write_text("")
+
+        from tests.conftest import _REPO_SRC
+
+        assert _is_inside(str(intruder), _REPO_SRC) is False
+
+    def test_a_sibling_prefix_directory_is_refused(self, tmp_path):
+        """``/repo/src-other`` must not count as inside ``/repo/src``. The old
+        ``startswith(_REPO_SRC + os.sep)`` got this right via the separator;
+        a samestat walk must not regress it."""
+        from tests.conftest import _is_inside
+
+        src = tmp_path / "src"
+        src.mkdir()
+        sibling = tmp_path / "src-other"
+        sibling.mkdir()
+        leaf = sibling / "minni" / "__init__.py"
+        leaf.parent.mkdir()
+        leaf.write_text("")
+
+        assert _is_inside(str(leaf), str(src)) is False
+
+    def test_the_real_import_passes_the_guard(self):
+        """End-to-end through pytest_configure with the real, already-imported
+        minni — the session running this test is itself the evidence, but
+        assert it rather than assume it."""
+        from tests import conftest as conftest_mod
+
+        conftest_mod.pytest_configure(config=None)  # must not raise
+
+    def test_pytest_configure_refuses_a_foreign_src(self, tmp_path, monkeypatch):
+        """Drive the hook, not just the helper: with _REPO_SRC pointed at an
+        unrelated directory, the real minni import is genuinely outside it and
+        the session must abort."""
+        import pytest as _pytest
+
+        from tests import conftest as conftest_mod
+
+        foreign = tmp_path / "elsewhere" / "src"
+        foreign.mkdir(parents=True)
+        monkeypatch.setattr(conftest_mod, "_REPO_SRC", str(foreign))
+
+        with _pytest.raises(_pytest.UsageError, match="worktree import resolution"):
+            conftest_mod.pytest_configure(config=None)
+
+    def test_pytest_configure_accepts_a_case_variant_of_its_own_src(
+        self, monkeypatch
+    ):
+        """The #331 regression, driven through the hook. Before the fix this
+        raised UsageError purely because of how the path was spelled."""
+        import pytest as _pytest
+
+        from tests import conftest as conftest_mod
+
+        variant = _case_variant(conftest_mod._REPO_SRC)
+        if variant is None:
+            _pytest.skip("filesystem is case-sensitive; no same-dir variant exists")
+
+        monkeypatch.setattr(conftest_mod, "_REPO_SRC", variant)
+        conftest_mod.pytest_configure(config=None)  # must not raise
