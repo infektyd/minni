@@ -317,9 +317,26 @@ const PAGE_STATUSES: ReadonlyArray<PageStatus> = [
   "expired",
 ];
 
+// #312 cassandra finding: this anchor MUST be the single source of truth for
+// "where does frontmatter start/end" — frontmatterBlock (privacy/status/title
+// parsing) and snippetFor (the text handed to the heuristic scanner) used to
+// diverge: frontmatterBlock was anchored strictly at string offset 0 with no
+// tolerance for a leading BOM/blank line, while snippetFor's strip used `/m`
+// (matches `---` at the start of ANY line, not just the document). A note
+// with a leading blank line made frontmatterBlock return "" (so authored
+// `privacy: private` was silently ignored) while snippetFor still correctly
+// stripped the block before the heuristic scan saw it — both privacy layers
+// missed the same note for opposite reasons. One regex, tolerant of a
+// leading BOM/whitespace but still anchored at the true document start (not
+// per-line), closes both directions: a real leading frontmatter block is
+// found even with BOM/blank-line noise, and a `---` horizontal rule
+// appearing later in the body is never mistaken for frontmatter by either
+// function.
+const FRONTMATTER_RE = /^\uFEFF?\s*---\r?\n([\s\S]*?)\r?\n---/;
+
 /** First frontmatter block of a note (writeVaultPage emits `---\n...\n---`). */
 function frontmatterBlock(markdown: string): string {
-  return markdown.match(/^---\r?\n([\s\S]*?)\r?\n---/)?.[1] ?? "";
+  return markdown.match(FRONTMATTER_RE)?.[1] ?? "";
 }
 
 /**
@@ -408,7 +425,7 @@ function snippetFor(
   maxLength = 280,
 ): string {
   const plain = markdown
-    .replace(/^---[\s\S]*?---/m, "")
+    .replace(FRONTMATTER_RE, "")
     .replace(/^#+\s+/gm, "")
     .replace(/\s+/g, " ")
     .trim();
