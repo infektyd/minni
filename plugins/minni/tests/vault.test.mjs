@@ -256,6 +256,108 @@ test("#312: heuristic-only privacy (no frontmatter declaration) still gates a ha
   }
 });
 
+test("#340: withheldCount does not double-count the same note referenced under multiple spellings", async () => {
+  // Adversarial review finding: the ref-dedup Set stored the RAW string,
+  // but normalizeWikilinkRef (applied inside resolveVaultRef) strips
+  // "[[ ]]", "|alias", ".md", and a leading "/" — so "wiki/x",
+  // "[[wiki/x]]", "wiki/x.md", and "[[wiki/x|Alias]]" all name the SAME
+  // note but landed as four distinct Set entries, each independently
+  // resolved and each incrementing withheldCount. One gated note reported
+  // as 4 withheld — a wrong number published to the model-facing envelope,
+  // worse than the original silent-empty gap since it looked authoritative.
+  const root = await mkdtemp(path.join(tmpdir(), "sm-handoff-dedup-"));
+  try {
+    await ensureVault(root);
+    const decisionDir = path.join(root, "wiki", "decisions");
+    await mkdir(decisionDir, { recursive: true });
+    await writeFile(
+      path.join(decisionDir, "one-gated-note.md"),
+      "---\ntitle: One Gated Note\nprivacy: private\n---\n\nBoot priming marker phrase, CONFIDENTIAL-340-DEDUP body text.",
+      "utf8",
+    );
+
+    const { snippets, withheldCount } = await resolveInboxHandoffContext(root, [
+      {
+        slug: "dedup-handoff",
+        filePath: path.join(root, "inbox", "dedup.json"),
+        createdAt: "2026-04-26T00:00:00.000Z",
+        payload: {
+          kind: "handoff",
+          wikilink_refs: [
+            "wiki/decisions/one-gated-note",
+            "[[wiki/decisions/one-gated-note]]",
+            "wiki/decisions/one-gated-note.md",
+            "[[wiki/decisions/one-gated-note|Alias]]",
+          ],
+        },
+      },
+    ]);
+
+    assert.equal(snippets.length, 0);
+    assert.equal(
+      withheldCount,
+      1,
+      `#340: four spellings of the SAME note must count as one withheld, not ${withheldCount}`,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("#340: a gated ref beyond the snippet limit still increments withheldCount", async () => {
+  // Adversarial review finding: the old loop broke out entirely once
+  // snippets.length reached `limit`, so a gated ref that would only be
+  // reached AFTER 8 safe refs already filled the snippet array was never
+  // even looked at — withheldCount silently stayed 0, the exact false
+  // all-clear this field exists to prevent, just relocated past the limit.
+  const root = await mkdtemp(path.join(tmpdir(), "sm-handoff-limit-"));
+  try {
+    await ensureVault(root);
+    const decisionDir = path.join(root, "wiki", "decisions");
+    await mkdir(decisionDir, { recursive: true });
+    for (let i = 0; i < 8; i++) {
+      await writeFile(
+        path.join(decisionDir, `safe-${i}.md`),
+        `---\ntitle: Safe ${i}\nprivacy: safe\n---\n\nBoot priming marker phrase ${i}.`,
+        "utf8",
+      );
+    }
+    await writeFile(
+      path.join(decisionDir, "gated-past-limit.md"),
+      "---\ntitle: Gated Past Limit\nprivacy: private\n---\n\nBoot priming marker phrase, CONFIDENTIAL-340-LIMIT body text.",
+      "utf8",
+    );
+
+    const { snippets, withheldCount } = await resolveInboxHandoffContext(
+      root,
+      [
+        {
+          slug: "limit-handoff",
+          filePath: path.join(root, "inbox", "limit.json"),
+          createdAt: "2026-04-26T00:00:00.000Z",
+          payload: {
+            kind: "handoff",
+            wikilink_refs: [
+              ...Array.from({ length: 8 }, (_, i) => `wiki/decisions/safe-${i}`),
+              "wiki/decisions/gated-past-limit",
+            ],
+          },
+        },
+      ],
+      8, // limit
+    );
+
+    assert.equal(snippets.length, 8, "the snippet cap of 8 must still be honored");
+    assert.equal(
+      withheldCount,
+      1,
+      "#340: the gated ref must still be counted even though it was reached after the snippet limit filled up",
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("vaultFirstLearn writes a note, updates index, and appends audit logs", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "sm-learn-"));
   try {

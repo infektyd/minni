@@ -2395,16 +2395,33 @@ export async function resolveInboxHandoffContext(
     const rawRefs = entry.payload.wikilink_refs;
     if (!Array.isArray(rawRefs)) continue;
     for (const ref of rawRefs) {
-      if (typeof ref === "string" && ref.trim()) refs.add(ref.trim());
+      // #340 review: dedup on the NORMALIZED ref, not the raw string —
+      // "wiki/x", "[[wiki/x]]", "wiki/x.md", and "[[wiki/x|Alias]]" all name
+      // the same note. Deduping on the raw string let one gated note be
+      // counted multiple times in withheldCount (e.g. the RCM-005 symlink
+      // fixture's own ["evil", "[[evil]]"] pair) — a wrong count published
+      // to the model-facing envelope, worse than the original silent-empty
+      // gap since it looked authoritative.
+      if (typeof ref === "string" && ref.trim()) refs.add(normalizeWikilinkRef(ref.trim()));
     }
   }
   const snippets: HandoffContextSnippet[] = [];
   let withheldCount = 0;
+  // #340 review: iterate every ref for the WITHHELD count, only cap what
+  // gets pushed into `snippets`. The previous `break` on snippets.length
+  // reaching `limit` stopped resolving refs entirely once enough safe ones
+  // were found — a handoff with 8 safe refs followed by a 9th, gated ref
+  // never looked at the 9th at all, so withheldCount silently under-reported
+  // (0 instead of 1) exactly the case this field exists to surface. Handoffs
+  // name a small, bounded number of refs in practice; trading a little extra
+  // per-ref I/O for a correct count is the right side of that tradeoff here.
   for (const ref of refs) {
     const resolved = await resolveVaultRef(vaultPath, ref);
-    if (resolved.status === "resolved") snippets.push(resolved.snippet);
-    else if (resolved.status === "withheld") withheldCount += 1;
-    if (snippets.length >= limit) break;
+    if (resolved.status === "resolved") {
+      if (snippets.length < limit) snippets.push(resolved.snippet);
+    } else if (resolved.status === "withheld") {
+      withheldCount += 1;
+    }
   }
   return { snippets, withheldCount };
 }
