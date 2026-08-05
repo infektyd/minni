@@ -272,18 +272,54 @@ def test_recall_trace_content_is_redacted():
     assert "[REDACTED]" in recorded["content"]
 
 
-def test_handle_read_recent_activity_excludes_recall_traces():
+def test_handle_read_recent_activity_excludes_recall_traces(tmp_path, monkeypatch):
     """handle_read's Recent Activity (LIMIT 5) must not be crowded out by
-    recall-trace rows. Pinned at the SQL level: the episodic_events query in
-    handle_read must filter event_type != 'recall'."""
-    import inspect
+    recall-trace rows.
 
-    from minni.minnid_runtime import recall as recall_mod
+    Was pinned by grepping handle_read's source for the literal
+    `event_type != 'recall'`. That assertion tracked the spelling rather than
+    the behaviour: it broke when the filter was correctly re-pointed at
+    episodic.NON_MEMORY_EVENT_TYPES (R7), and it would equally have passed on a
+    query that carried the clause but never ran. Driven through the RPC now.
+    """
+    import time
 
-    source = inspect.getsource(recall_mod.handle_read)
-    start = source.index("FROM episodic_events")
-    window = source[start:start + 200]
-    assert "event_type != 'recall'" in window
+    import minni.minnid as minnid
+    from minni.config import SovereignConfig
+    import minni.db as db_mod
+
+    cfg = SovereignConfig(db_path=str(tmp_path / "obs.db"))
+    old_flag = db_mod._migrations_run
+    db_mod._migrations_run = False
+    try:
+        db_obj = db_mod.SovereignDB(cfg)
+        db_obj._get_conn()
+    finally:
+        db_mod._migrations_run = old_flag
+
+    now = time.time()
+    with db_obj.cursor() as c:
+        # Six traces against one real message: without the filter the LIMIT 5
+        # window is entirely trace rows and the message never appears.
+        for i in range(6):
+            c.execute(
+                "INSERT INTO episodic_events"
+                " (agent_id, event_type, content, created_at)"
+                " VALUES ('codex', 'recall', ?, ?)",
+                (f"recall trace {i}", now + i),
+            )
+        c.execute(
+            "INSERT INTO episodic_events"
+            " (agent_id, event_type, content, created_at)"
+            " VALUES ('codex', 'message', 'the real agent message', ?)",
+            (now - 100,),
+        )
+    monkeypatch.setattr(minnid, "SovereignDB", lambda: db_obj)
+
+    context = minnid._handle_read({"agent_id": "codex", "limit": 5}, 1)["result"]["context"]
+    assert "the real agent message" in context
+    assert "recall trace" not in context
+    db_obj.close()
 
 
 def test_format_event_strips_terminal_control_chars():

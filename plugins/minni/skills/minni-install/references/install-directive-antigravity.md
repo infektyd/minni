@@ -1,41 +1,109 @@
 # Minni install directive — Antigravity (CLI `agy` + IDE) · gemini-cli
 
-Goal: Minni at Claude-Code parity across Antigravity surfaces (MCP `minni@minni` 37 tools, 48 during the minni:threads alias window · Layer-1 via GEMINI.md · memory-first · per-agent `gemini` vault). Audited 2026-05-30. All three surfaces are installed and share the `~/.gemini/` tree (there is no `~/.antigravity`).
+Goal: Minni at Claude-Code parity across Antigravity surfaces (MCP `minni`
+tools · Layer-1 via GEMINI.md / hooks · memory-first · per-agent `gemini`
+vault at `~/.minni/gemini-vault`). All Antigravity surfaces share the
+`~/.gemini/` tree (there is no `~/.antigravity`).
 
-## Current state (broken)
-All MCP config views point at the **legacy `sovereign-memory`** server → dead `~/.sovereign-memory/run/sovrd.sock`; the IDE view has an outright broken `cwd: ~/sovereignMemory/...` (nonexistent). Only ~7 old `sovereign_*` tools are auto-granted, not the full `minni_*` set. The repo `minni` plugin is NOT installed on any Gemini surface (no `~/.gemini/extensions/minni/`). `GEMINI.md` (`~/.agents/GEMINI.md`) is old-brand. Vault `~/.minni/gemini-vault` exists; envelope stale (`sovrd.sock`). Daemon up on `~/.minni/run/minnid.sock`.
+## Current state (post-wire / post-`minni sync`)
+
+**Day-to-day path is Antigravity**, not pure `gemini`. Prefer:
+
+```bash
+minni wire antigravity
+# dogfood checkout:
+.venv/bin/minni wire antigravity --from-repo .
+# or after wire adoption (D7 fleet):
+# propagate.py update-plugin --platform antigravity
+# (also covered by minni sync / make sync-root)
+```
+
+On a healthy dogfood machine you should see:
+
+| Surface | Expected |
+|---------|----------|
+| MCP | `mcpServers.minni` in `~/.gemini/config/mcp_config.json` → stdio to `…/dist/server.js` (often via a small env-run wrapper), `MINNI_SOCKET_PATH=~/.minni/run/minnid.sock`, vault `~/.minni/gemini-vault` |
+| Legacy | **No** default `sovereign-memory` / `sovrd.sock` server (propagate removes it when wiring antigravity) |
+| agy hooks | `~/.gemini/config/plugins/minni/` (`hooks.json` + `plugin.json`); entry `dist/gemini-hook.js` / installed plugin under `~/.agents/plugins/minni@minni` |
+| Daemon | `minnid` on `~/.minni/run/minnid.sock` |
+| Pure gemini | **Provisional** — `minni wire gemini` is skipped (`gemini-provisional`); see [docs/runtimes/gemini.md](../../../../../docs/runtimes/gemini.md) |
+
+If MCP still points at `sovereign-memory` or `sovrd.sock`, treat that as **drift**
+and re-run antigravity wire/propagate — not as the default install story.
+
+**Historical (2026-05-30 audit):** early surfaces still had legacy
+`sovereign-memory` stdio + broken IDE `cwd` and only a handful of
+`sovereign_*` grants. That snapshot is **not** present-tense operator truth
+after wire-era propagate + `minni sync`.
 
 ## Mechanism (official)
-- MCP (all 3 Antigravity surfaces): single shared `~/.gemini/config/mcp_config.json` (symlinked to `~/.agents/mcp-servers/views/.gemini__config__mcp_config.json.json`); `antigravity-cli/mcp/` + `antigravity-ide/mcp/` are *generated* from it. Stdio entry = `command`+`args`+`env`; IDE entries carry `"$typeName":"exa.cascade_plugins_pb.CascadePluginCommandTemplate"` (preserve on hand-edit). Remote key is `serverUrl` (n/a for Minni). gemini-cli (standalone) uses a DIFFERENT file: `~/.gemini/settings.json` → `mcpServers` (with `"trust": true`).
-- Context/memory: `GEMINI.md` (hierarchical) is the Layer-1 substitute on pure gemini-cli. The **agy CLI** loads a Minni hook plugin from `~/.gemini/config/plugins/minni/` (`propagate.py update-plugin --platform gemini|antigravity`). Current agy (1.1.7+) dispatches SessionStart / PreInvocation (UPS analogue) / PreToolUse / Stop; PreToolUse is deny-capable via `gemini-adapter.ts` (`allow`/`deny`/…, not `approve`). Depth still lags Claude. Historical agy 1.0.15 only dispatched PreToolUse/PostToolUse/Stop — do not treat that as current. See `docs/runtimes/gemini.md` and `docs/contracts/hook-platforms.md`.
-- Memory-first: GEMINI.md directive + auto-grant tools (`~/.gemini/config/config.json globalPermissionGrants.allow` and `~/.gemini/antigravity-cli/settings.json permissions.allow`).
-- Auth: OAuth is per-surface (IDE and `agy` auth separately; token at `~/.gemini/antigravity-cli/credentials.enc`). Minni itself needs no OAuth (local stdio).
+
+- **MCP (Antigravity surfaces):** shared `~/.gemini/config/mcp_config.json`
+  (often symlinked into the agents view tree); `antigravity-cli/mcp/` +
+  `antigravity-ide/mcp/` are *generated* from it. Stdio entry =
+  `command`+`args`+`env`; IDE entries may carry
+  `"$typeName":"exa.cascade_plugins_pb.CascadePluginCommandTemplate"`
+  (preserve on hand-edit). Standalone gemini-cli uses a different file:
+  `~/.gemini/settings.json` → `mcpServers` (often with `"trust": true`).
+- **Context/memory:** `GEMINI.md` is the Layer-1 substitute on pure
+  gemini-cli. **agy** loads Minni hooks from
+  `~/.gemini/config/plugins/minni/` (`propagate.py update-plugin --platform
+  antigravity`). Current agy (**1.1.7+**) dispatches SessionStart /
+  PreInvocation (UPS analogue) / PreToolUse / Stop; PreToolUse is
+  deny-capable via `gemini-adapter.ts` (`allow`/`deny`/…, not `approve`).
+  Historical agy **1.0.15** only dispatched PreToolUse/PostToolUse/Stop —
+  do not treat that as current. See `docs/runtimes/gemini.md` and
+  `docs/contracts/hook-platforms.md`.
+- **Memory-first:** GEMINI.md directive + wire’s **read-only** auto-grants
+  (`MINNI_READONLY_TOOLS` in `propagate.py` → `globalPermissionGrants.allow` /
+  CLI `permissions.allow`). Wire adds only those RO tools and strips the
+  `mcp(minni/*)` wildcard + legacy `sovereign_*` grants; it does **not** purge
+  hand-added write grants operators may have left in config.
+- **Auth:** OAuth is per-surface (IDE and `agy` separately). Minni itself is
+  local stdio — no OAuth.
 
 ## AUTO (scriptable)
-1. **Add an `antigravity` target to propagate.py** (the named gap): writer injects `mcpServers.minni` (`command:node`, `args:[<install>/dist/server.js]`, `env:{MINNI_AGENT_ID:gemini, MINNI_VAULT_PATH:~/.minni/gemini-vault, MINNI_SOCKET_PATH:~/.minni/run/minnid.sock}`, `disabled:false`) into `~/.gemini/config/mcp_config.json` (resolve the symlink/view), preserving the IDE `$typeName` wrapper; and removes the legacy `sovereign-memory` entry from every view (incl. the broken IDE `cwd`).
-2. Install plugin: copy `plugins/minni/.gemini-plugin/` + built `dist/` → `~/.gemini/extensions/minni/`.
-3. Auto-grant **read-only** tools explicitly (no `mcp(minni/minni_*)` wildcard). Example allowlist for `~/.gemini/config/config.json globalPermissionGrants.allow` and `~/.gemini/antigravity-cli/settings.json permissions.allow`:
-   - `mcp(minni/minni_status)`
-   - `mcp(minni/minni_recall)`
-   - `mcp(minni/minni_drill)`
-   - `mcp(minni/minni_route)`
-   - `mcp(minni/minni_prepare_task)`
-   - `mcp(minni/minni_thread_status)`
-   - `mcp(minni/minni_thread_history)`
-   - `mcp(minni/minni_plan_status)` (deprecated alias — drop when the aliases are removed)
-   - `mcp(minni/minni_plan_history)` (deprecated alias — drop when the aliases are removed)
-   - `mcp(minni/minni_ping_agent_inbox)`
-   - `mcp(minni/minni_ping_agent_status)`
-   Writes (`minni_learn`, `minni_vault_write`, `minni_resolve_candidate`, `minni_thread_update` and its `minni_plan_update` alias, handoff/ping decide, etc.) must **not** appear in auto-grant — they require per-session prompt approval.
-   Drop the old `sovereign-memory/sovereign_*` grants.
-4. (gemini-cli, optional) add the `minni` block to `~/.gemini/settings.json mcpServers` with `"trust": true`.
-5. Rebrand `~/.agents/GEMINI.md` → Minni, vault `~/.minni/gemini-vault`, server `minni`, tools `minni_*`; add "consult `minni_status` + `minni_recall` first" directive.
-6. Refresh envelope `~/.minni/identities/gemini/GEMINI_HOSTED_AGENT_ENVELOPE.md` → socket `minnid.sock`, Minni brand (propagate.py `render_hosted_envelope`/`seed-hosted` already generates the correct one).
+
+1. **Wire / propagate antigravity** (preferred):
+   `minni wire antigravity` or
+   `propagate.py update-plugin --platform antigravity`.
+   Injects `mcpServers.minni`, env
+   (`MINNI_AGENT_ID=gemini`, vault, `MINNI_SOCKET_PATH`), drops legacy
+   `sovereign-memory`, refreshes grants and agy hooks.
+2. **Fleet refresh:** `minni sync` (or `make sync-root` on editable dogfood)
+   redeploys plugin payload and re-runs D7 propagate for antigravity + cursor.
+3. **Plugin tree:** wire/propagate installs built `dist/` into the active
+   install root (often `~/.agents/plugins/minni@minni` and/or extension paths).
+4. **Read-only auto-grants** — wire defaults are exactly
+   `MINNI_READONLY_TOOLS` in `propagate.py`:
+   `minni_recall`, `minni_drill`, `minni_status`, `minni_audit_tail`,
+   `minni_audit_report`, `minni_route`, `minni_list_pending_handoffs`,
+   `minni_ping_agent_inbox`, `minni_ping_agent_status`.
+   Do **not** auto-grant write/learn/thread-update tools in the wire path.
+   Drop any remaining `sovereign_*` grants.
+5. **(Optional pure gemini-cli)** add `minni` to `~/.gemini/settings.json`
+   `mcpServers` with `"trust": true` — provisional; prefer antigravity for
+   day-to-day.
+6. **Layer-1 / envelope:** rebrand `~/.agents/GEMINI.md` and hosted envelope
+   to Minni + `minnid.sock` if still on old brand (propagate seed paths
+   generate the correct envelope).
 
 ## MANUAL
-- OAuth per surface: run `agy` (CLI browser consent); sign in to the IDE separately.
-- Antigravity IDE: Settings → Customizations → Open MCP Config → confirm `minni`, reload MCP servers.
-- Restart CLI + IDE so `antigravity-cli/mcp/minni` and `antigravity-ide/mcp/minni` regenerate.
+
+- OAuth per surface: `agy` browser consent; IDE sign-in separately.
+- Antigravity IDE: Settings → Customizations → Open MCP Config → confirm
+  `minni`, reload MCP servers.
+- Restart CLI + IDE so generated `antigravity-*/mcp/minni` views refresh.
 
 ## Verify
-`ls ~/.gemini/antigravity-{cli,ide}/mcp/minni` (generated dirs appear); fresh `agy` session + IDE agent panel show `minni` connected with the full `minni_*` tool set (37 canonical, 48 during the alias window); `minni_status` reports the daemon on `minnid.sock`.
+
+```bash
+minni doctor                          # socket + daemon
+# MCP points at minni + minnid.sock (not sovrd):
+rg -n 'minni|sovereign|sovrd' ~/.gemini/config/mcp_config.json
+ls ~/.gemini/config/plugins/minni/    # hooks.json + plugin.json
+# Fresh agy / IDE session: minni tools connected; minni_status → minnid.sock
+```
+
+See also: [docs/runtimes/gemini.md](../../../../../docs/runtimes/gemini.md),
+fleet: `minni sync` / [docs/install.md](../../../../../docs/install.md).

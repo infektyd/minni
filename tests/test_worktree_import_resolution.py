@@ -1,8 +1,10 @@
 """#258 — Make-driven pytest must import minni from *this* tree.
 
-Mechanical gate denies edits to ``tests/conftest.py``, so the load-bearing
-contract for ``make test-engine`` / ``make check`` / ``make coverage-engine`` is
-``PYTHONPATH=src`` in the Makefile recipes. This module:
+Landing a ``tests/conftest.py`` edit forfeits the mechanical gate's automatic
+approval (``.github/scripts/grok_approve_gate.py`` path-denies it, along with
+``pyproject.toml`` and friends, since collection config can silently disable
+every tripwire below) — it needs operator/manual review instead, which is why
+the original #258 fix here avoided it. This module:
 
 1. Pins that Makefile recipe text (fail-closed, active assignment on the same
    line as pytest)
@@ -11,10 +13,13 @@ contract for ``make test-engine`` / ``make check`` / ``make coverage-engine`` is
 3. Proves ``PYTHONPATH=src`` (Make shape) is the reason this tree wins over a
    site-packages/.pth-style editable competitor — the real #258 failure mode
 
-Bare ``python -m pytest`` without Make (or without ``PYTHONPATH=src``) can still
-resolve an editable install from another checkout when the pin below is not
-enforced by the process env — agents should use the Make targets above, or
-export ``PYTHONPATH=src`` for scoped bare pytest.
+A ``pytest_configure`` hook in ``tests/conftest.py`` now closes the residual
+gap this module's own docstring used to describe: it runs unconditionally for
+every pytest invocation under this rootdir (unlike a collected test, it can't
+be skipped by scoping to one file or a ``-k`` filter) and fails the session
+before collection if ``import minni`` did not resolve under this rootdir's
+``src/``. Bare ``python -m pytest`` from a worktree, with no PYTHONPATH set,
+now fails loud instead of silently validating another checkout.
 """
 
 from __future__ import annotations

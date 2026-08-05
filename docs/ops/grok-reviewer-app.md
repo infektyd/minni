@@ -661,8 +661,8 @@ must **not** erase ambition: overclaims that describe wanted surfaces become
 
 | Assumption / claim | Disposition | Status / next |
 |---|---|---|
-| Multi-host PreToolUse deny (incl. Grok file-backed guard) | implement_now / goal | `wright/dm-grok-adapter` — open PR when ready |
+| Multi-host PreToolUse deny (incl. Grok file-backed guard) | implement_now | **landed #274** (`grok-adapter` + unit bar); wet session optional |
 | `minni doctor` runs wire verify probes | honesty_cut | fixed; keep doctor scoped |
-| Fleet hosts track package/main automatically | ops_fleet | **`minni sync`** (this PR #273) |
+| Fleet hosts track package/main automatically | ops_fleet | **landed #273** — use **`minni sync`** |
 | Stamp set includes marketplace + pyproject | honesty + release hygiene | checklist; marketplace in 0.4.2 |
 | Grok App cheaper re-earn / clearer PATH_DENY text | goal_next_pr (personal) | optional later (O3/O5/O6) |

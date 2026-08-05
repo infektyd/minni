@@ -53,10 +53,7 @@ test("model-facing MCP input schemas do not expose local path authority", async 
     await readFile(new URL("../src/server.ts", import.meta.url), "utf8"),
   );
   const schemas = extractInputSchemas(source);
-  // 37 canonical registrations + 1 from the DEPRECATED_TOOL_ALIASES loop, which
-  // emits a single literal `inputSchema:` reused by all 11 aliases.
-  // Restore to 37 when the aliases drop.
-  assert.equal(schemas.length, 38, "expected one schema per registered MCP tool");
+  assert.equal(schemas.length, 37, "expected one schema per registered MCP tool");
 
   const forbiddenFields = [
     "vaultPath",

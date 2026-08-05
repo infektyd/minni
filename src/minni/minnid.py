@@ -1303,6 +1303,43 @@ def _backfill_sweep_once() -> dict:
             )
             break
 
+    # R7: reconcile episodic_fts on every sweep, not only in migration 018.
+    # 018 catches its own exceptions so a failed data repair cannot roll back
+    # the schema batch — but that also stamps the version, so a transient
+    # failure (a locked DB on a contended start) would abandon the repair
+    # permanently and the pre-trigger events would stay unsearchable forever.
+    # A log line is not a queue; this is the same queue, and the reconcile is
+    # idempotent, so a healthy database pays only the count query.
+    #
+    # The commit belongs HERE, not inside reconcile_episodic_fts: the other
+    # caller is migration 018, which runs inside _flush_batch's BEGIN IMMEDIATE,
+    # and an inner commit there would prematurely commit the whole migration
+    # batch — the partial-batch hazard 018 is written to avoid. _get_conn()
+    # opts out of db.cursor()'s auto-commit contract, so without this the INSERT
+    # sits in an open transaction: invisible to every other connection (the
+    # backfill would report success while recall still found nothing) and
+    # holding a write lock that blocks every other daemon writer.
+    try:
+        from minni.db import SovereignDB
+        from minni.episodic import reconcile_episodic_fts
+
+        _conn = SovereignDB.shared(DEFAULT_CONFIG)._get_conn()
+        try:
+            episodic = reconcile_episodic_fts(_conn)
+            _conn.commit()
+        except Exception:
+            _conn.rollback()
+            raise
+        if episodic["inserted"]:
+            logger.info(
+                "Backfill: indexed %d episodic event(s) missing from episodic_fts",
+                episodic["inserted"],
+            )
+        results["episodic_fts"] = episodic
+    except Exception as exc:
+        logger.warning("Backfill: episodic FTS reconcile failed: %s", exc)
+        results["episodic_fts"] = {"error": str(exc)}
+
     return results
 
 

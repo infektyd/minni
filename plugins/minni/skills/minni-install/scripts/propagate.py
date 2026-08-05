@@ -175,8 +175,9 @@ GEMINI_LEGACY_GRANT_MARKERS = ("mcp(sovereign-memory", "mcp(sovereign_memory", "
 # so those would run without per-call confirmation. These names are verified
 # against the server.registerTool(...) registrations in src/server.ts. Write and
 # export tools are intentionally omitted so they still require a session prompt.
-# (minni_audit_report is safe here because X10 makes its automatic path
-# aggregate-only — the full latest entry is only returned on the confirmed path.)
+# minni_audit_report: aggregate-only by default (X10; no full `latest` body).
+# minni_audit_tail: FULL entry bodies by design — not an aggregate tool; keep
+# in RO grants for operators who need the trail, but do not confuse with X10.
 MINNI_READONLY_TOOLS = (
     "minni_recall",
     "minni_drill",

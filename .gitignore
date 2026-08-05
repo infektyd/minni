@@ -229,3 +229,6 @@ scripts/run_harvest.py
 !.cursor/APPROVAL_POLICY.md
 !.cursor/BUGBOT.md
 !.cursor/approval-policies/
+
+# local dogfood notes (not for remote)
+scratchpad/
