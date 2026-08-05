@@ -36,6 +36,37 @@ Three isolation guarantees are established here:
 import os
 import tempfile
 
+# --- (0) OMP/BLAS thread pinning: established at IMPORT, before ANY native
+# library can load (#321).
+#
+# This box loads two OpenMP runtimes in one process — PyTorch's bundled libomp
+# and FAISS's own — a double load that KMP_DUPLICATE_LIB_OK=TRUE in models.py
+# silences rather than resolves. Under thread churn the pair can hit a libomp
+# fork barrier and take the interpreter down with SIGSEGV, which is the daemon
+# crash-loop #299 fixed by pinning these vars in minnid.main().
+#
+# The suite hit the same crash from the other side: a full unpinned run
+# segfaulted in an unrelated victim (tests/test_pr2_envelope.py, ~54% in,
+# tqdm_monitor thread) once tests had accumulated both runtimes. Measured, same
+# worktree, back to back:
+#
+#     full suite, unpinned                                  -> SIGSEGV
+#     full suite, OMP/MKL/VECLIB=1 in the environment       -> 2243 passed, 7 skipped
+#
+# It must live HERE, at conftest import, for the same reason MINNI_HOME does
+# below: these variables are read by each math library when it LOADS. A fixture,
+# or anything that runs after the first `import torch`, is far too late — the
+# threads are already spun. That load-time binding is also exactly why
+# minnid.main()'s own setdefault cannot protect a pytest process, where the
+# imports have already happened by the time main() is called.
+#
+# setdefault, not assignment: an operator (or CI) who deliberately exports
+# OMP_NUM_THREADS keeps their choice, matching main()'s own contract. The cost
+# is that OMP-linked math runs single-threaded for the suite — measured at
+# 62.5s against ~61s unpinned, i.e. in the noise.
+for _omp_var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
+    os.environ.setdefault(_omp_var, "1")
+
 # --- (1) MINNI_HOME isolation: established at IMPORT, before engine modules load.
 _LIVE_MINNI_HOME = os.path.abspath(os.path.expanduser("~/.minni"))
 _configured_home = os.environ.get("MINNI_HOME")
