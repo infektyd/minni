@@ -441,8 +441,23 @@ def iter_handoff_files(agent_id: Optional[str] = None, *, context: HandoffContex
                     packet = json.loads(path.read_text(encoding="utf-8"))
                 except (OSError, json.JSONDecodeError):
                     continue
-                if isinstance(packet, dict) and packet.get("lease_id"):
-                    yield vault, path, packet
+                if not isinstance(packet, dict):
+                    continue
+                lease_id = packet.get("lease_id")
+                # #231: lease_id is used as a dict/set key downstream (the T3
+                # merge in handle_list_pending_handoffs hashes it via
+                # `in known_ids` / dict assignment). The file channel is an
+                # untrusted, possibly-malformed mirror by design — this loop
+                # already tolerates unreadable/non-JSON files, so a
+                # non-string lease_id (e.g. corrupted to a list/dict) must be
+                # skipped the same way instead of raising TypeError:
+                # unhashable type deep in the merge and crashing the whole
+                # RPC over one stray file. validate_handoff_packet's own
+                # contract already requires lease_id: str for anything this
+                # daemon writes.
+                if not isinstance(lease_id, str) or not lease_id:
+                    continue
+                yield vault, path, packet
 
 
 def write_matching_lease_packets(
@@ -479,8 +494,16 @@ def store_handoff_lease(packet: dict, inbox_path: Path, outbox_path: Path, conte
                      from_agent = excluded.from_agent,
                      to_agent = excluded.to_agent,
                      task = excluded.task,
+                     -- #231: a re-sent handoff reusing a lease_id (caller-
+                     -- supplied) must re-enter its freshly computed `status`,
+                     -- not keep a prior terminal status forever. Left unset
+                     -- before, this made a resend-after-ack invisible on
+                     -- BOTH channels once _known_lease_ids_for_agent started
+                     -- excluding any lease_id the DB has ever seen.
+                     status = excluded.status,
                      inbox_path = excluded.inbox_path,
                      outbox_path = excluded.outbox_path,
+                     created_at = excluded.created_at,
                      expires_at = excluded.expires_at""",
                 (
                     packet["lease_id"],
@@ -699,6 +722,43 @@ def _file_channel_terminal_ack(lease_id: str, *, context: HandoffContext) -> Opt
     return None
 
 
+def _known_lease_ids_for_agent(agent_id: str, *, context: HandoffContext) -> set:
+    """All lease_ids the DB has ever recorded for this agent, any status.
+
+    Used by the T3 merge below to stop a stale file-channel copy from
+    resurrecting a lease the DB already resolved (e.g. acked) as pending
+    again. This matters because the ack path (``write_matching_lease_packets``
+    -> ``iter_handoff_files`` with no ``agent_id``) sweeps vaults via
+    ``known_agent_vaults()``, while the file-channel read path here sweeps via
+    ``agent_vault()`` — a vault configured only through the per-agent
+    ``MINNI_<AGENT>_VAULT_PATH`` override (not ``MINNI_AGENT_VAULTS`` or a
+    ``MINNI_HOME/*-vault`` dir) is visible to the read side but not the ack
+    sweep, so its on-disk packet can be missing ``ack_status`` even though the
+    DB row is already terminal. Best-effort: a failure here must not turn
+    into a harder failure — it only means this extra resurrection guard is
+    unavailable, not that the response fails.
+    """
+    try:
+        db = context.lazy_writeback().db
+        with db.cursor() as c:
+            rows = c.execute(
+                "SELECT lease_id FROM handoff_leases WHERE to_agent = ?",
+                (agent_id,),
+            ).fetchall()
+        return {row["lease_id"] for row in rows}
+    except Exception as exc:
+        # Silent-except-for-a-log: the caller's fallback (pass every
+        # file-channel lease through unfiltered) is intentional and must not
+        # become a harder failure, but "the resurrection guard is disabled"
+        # must still be observable somewhere instead of vanishing.
+        context.logger.warning(
+            "Could not read known lease ids for %r; resurrection guard unavailable: %s",
+            agent_id,
+            exc,
+        )
+        return set()
+
+
 def handle_list_pending_handoffs(params: dict, request_id: Any, context: HandoffContext) -> dict:
     # G11 / RCM-003/009: EffectivePrincipal stamp + mismatch guard (closes last model-facing agent_id surfaces)
     # Model-supplied agent_id is NEVER trusted; use stamped principal.agent_id for leases/queries.
@@ -715,13 +775,36 @@ def handle_list_pending_handoffs(params: dict, request_id: Any, context: Handoff
         # Dual-channel: DB blew up — still consult file packets before fail-loud.
         # Empty-on-store-failure would hide live inbox work; empty-on-both is -32000.
         store_error = exc
-        sqlite_handoffs = None
-    if sqlite_handoffs:
-        return context.make_response({"agent_id": agent_id, "handoffs": sqlite_handoffs}, request_id)
+        sqlite_handoffs = []
 
-    # DB channel healthy but empty, or store failed: consult the file channel
-    # (PLUMB-T3 partial — full dual-channel merge when DB has *some* rows is a follow-up).
-    handoffs = _file_channel_pending_handoffs(agent_id, context=context)
+    # PLUMB-T3 / #231: always consult the file channel and merge, never
+    # early-return on a non-empty DB result. A lease can be file-only (e.g.
+    # store_handoff_lease degraded at write time for that one handoff) while
+    # the DB holds unrelated healthy leases for the same agent — the old
+    # early-return on `if sqlite_handoffs:` made that file-only lease
+    # permanently invisible as soon as any other DB lease existed.
+    #
+    # Merge is a lease_id-keyed dict, DB entries inserted first: (a) a lease
+    # present in both channels (the normal case) appears once, with the DB's
+    # fields — never twice, even if the file channel itself yields the same
+    # lease_id more than once (e.g. a self-handoff writes the identical
+    # packet to both its inbox and outbox in the same vault); (b) a lease the
+    # DB has already resolved to any non-pending status is excluded from the
+    # file channel entirely via `known_ids`, so a stale/un-synced file packet
+    # cannot resurrect it as pending (see `_known_lease_ids_for_agent`).
+    known_ids = _known_lease_ids_for_agent(agent_id, context=context) | {
+        h["lease_id"] for h in sqlite_handoffs
+    }
+    file_handoffs = _file_channel_pending_handoffs(agent_id, context=context)
+    merged: dict = {}
+    for h in sqlite_handoffs:
+        merged[h["lease_id"]] = h
+    for h in file_handoffs:
+        if h["lease_id"] in known_ids:
+            continue
+        merged.setdefault(h["lease_id"], h)
+    handoffs = list(merged.values())
+
     if handoffs:
         if store_error is not None:
             context.logger.warning(

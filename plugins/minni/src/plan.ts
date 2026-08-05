@@ -1383,6 +1383,13 @@ export async function getActivePlan(
       // tampered pointer must not be able to traverse outside the vault.
       const rel = path.relative(path.resolve(vaultPath), path.resolve(parsed.notePath));
       if (!rel || rel.startsWith("..") || path.isAbsolute(rel)) {
+        // PLUMB-T4 remainder / #231: this is a security-relevant refusal (a
+        // tampered or corrupted pointer trying to point outside the vault),
+        // not routine "no active plan" — audit it instead of discarding
+        // silently. stderr only: hook stdout is the JSON protocol channel.
+        console.error(
+          `minni: getActivePlan rejected a notePath outside the vault root (${vaultPath}): ${parsed.notePath}`,
+        );
         return undefined;
       }
       return parsed;
