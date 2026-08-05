@@ -250,14 +250,99 @@ test("RCM-004: ping lease expires after TTL and reaps files", async () => {
   // Advance time past TTL (5 min)
   const queryTime = new Date("2026-05-02T00:06:00.000Z");
 
-  // Status check reaps it
+  // Status check reaps it. #297: the first status check after expiry must
+  // report "expired", distinguishable from a request that never existed —
+  // not the generic "Request not found." the reap used to leave behind.
   await assert.rejects(
     () => getAgentPingStatus(created.contract.requestId, "codex", queryTime),
-    /Request not found/
+    /Request expired/
   );
 
   // Files should be reaped/removed
   await assert.rejects(readFile(leaseFile, "utf8"), /ENOENT/);
+});
+
+test("#297: expired-and-reaped is distinguishable from never-existed", async () => {
+  const now = new Date("2026-05-03T00:00:00.000Z");
+  const created = await createAgentPingRequest(
+    {
+      toAgent: "claude-code",
+      question: "Short lease for #297",
+      ttlMinutes: 5,
+      now,
+    },
+    "codex",
+  );
+
+  const queryTime = new Date("2026-05-03T00:06:00.000Z");
+
+  // The request genuinely existed and expired: distinguishable message.
+  await assert.rejects(
+    () => getAgentPingStatus(created.contract.requestId, "codex", queryTime),
+    /Request expired/,
+  );
+
+  // A requestId that was never created at all: the other message, not
+  // conflated with the expired case above.
+  const neverExisted = "00000000-0000-4000-8000-000000000000";
+  await assert.rejects(
+    () => getAgentPingStatus(neverExisted, "codex", queryTime),
+    /Request not found/,
+  );
+
+  // A second status check on the now fully-reaped (lease file gone) request
+  // falls back to "not found" — this is the honest limit of the fix (the
+  // pre-reap snapshot only survives the FIRST post-expiry call); it must
+  // not be conflated with "Request expired." either.
+  await assert.rejects(
+    () => getAgentPingStatus(created.contract.requestId, "codex", queryTime),
+    /Request not found/,
+  );
+});
+
+test("#297: an unauthorized actor cannot learn an expired request exists", async () => {
+  // Review round on this fix's first draft: it threw the normal-path
+  // "Only the requester or recipient..." authorization error for an
+  // unauthorized actor probing an EXPIRED request — a new existence oracle
+  // a third party didn't have before (pre-#297, they always landed on the
+  // same "Request not found." a genuinely nonexistent id produces, because
+  // the request is never materialized into a non-party's own vault).
+  // Assert message EQUALITY between the two cases, not just "isn't the
+  // distinguishing message" — a weaker assertion here already gave a false
+  // pass against that regression once.
+  const now = new Date("2026-05-04T00:00:00.000Z");
+  const created = await createAgentPingRequest(
+    {
+      toAgent: "claude-code",
+      question: "Short lease, third party should not see it",
+      ttlMinutes: 5,
+      now,
+    },
+    "codex",
+  );
+
+  const queryTime = new Date("2026-05-04T00:06:00.000Z");
+  const neverExisted = "11111111-1111-4111-8111-111111111111";
+
+  const expiredThirdPartyMessage = await getAgentPingStatus(
+    created.contract.requestId,
+    "some-other-agent",
+    queryTime,
+  ).then(
+    () => { throw new Error("expected getAgentPingStatus to reject"); },
+    (error) => error.message,
+  );
+  const neverExistedMessage = await getAgentPingStatus(
+    neverExisted,
+    "some-other-agent",
+    queryTime,
+  ).then(
+    () => { throw new Error("expected getAgentPingStatus to reject"); },
+    (error) => error.message,
+  );
+
+  assert.equal(expiredThirdPartyMessage, neverExistedMessage);
+  assert.equal(expiredThirdPartyMessage, "Request not found.");
 });
 
 test("RCM-004: ping materialization rejects wrong principal", async () => {

@@ -523,6 +523,22 @@ export async function getAgentPingStatus(requestId: string, actorAgent = DEFAULT
   // downstream checkAndReapLease/getLeasePath swallow the throw in a catch, so
   // validate explicitly here too.
   if (!REQUEST_ID_PATTERN.test(requestId)) throw new Error("Invalid requestId.");
+  // #297: checkAndReapLease deletes the lease record plus both inbox/outbox
+  // copies the moment a request is past expiry, so a caller asking about a
+  // request that just expired and a caller asking about one that never
+  // existed both fell through to the same generic "Request not found." —
+  // the evidence that distinguishes them was destroyed before this function
+  // ever looked at it. Snapshot the lease record BEFORE reaping so the first
+  // status check after expiry can still report "Request expired." from this
+  // snapshot, even though the reap that follows deletes the files.
+  let preReapLeaseContract: AgentPingContract | undefined;
+  try {
+    preReapLeaseContract = await readContract(getLeasePath(requestId));
+  } catch {
+    // No lease record: never existed, or already reaped by an earlier call.
+    // Falls through to the normal not-found path below if nothing else
+    // resolves it either.
+  }
   await checkAndReapLease(requestId, now);
   // Materialize the actor's inbox copy from any live lease addressed to them
   // before resolving status (RCM: recipient must see "pending" without first
@@ -540,7 +556,26 @@ export async function getAgentPingStatus(requestId: string, actorAgent = DEFAULT
       lastError = error;
     }
   }
-  if (!contract) throw new Error("Request not found.");
+  if (!contract) {
+    // #297 review: an EARLIER version of this branch threw the same
+    // "Only the requester or recipient..." authorization error the normal
+    // path uses when the actor wasn't a party to the expired request. That
+    // is a new existence oracle a third party didn't have before: pre-fix,
+    // an unrelated actor's own vault never had the file materialized into
+    // it (reconcileAndMaterializeLeases only copies to the recipient), so
+    // they always landed on the SAME "Request not found." a genuinely
+    // nonexistent id produces. An unauthorized actor must keep getting that
+    // identical message here too — never a message that differs by whether
+    // the request existed and expired.
+    if (
+      preReapLeaseContract &&
+      Date.parse(preReapLeaseContract.expiresAt) <= now.getTime() &&
+      (preReapLeaseContract.fromAgent === actorAgent || preReapLeaseContract.toAgent === actorAgent)
+    ) {
+      throw new Error("Request expired.");
+    }
+    throw new Error("Request not found.");
+  }
   if (contract.fromAgent !== actorAgent && contract.toAgent !== actorAgent) {
     throw new Error("Only the requester or recipient can view this request.");
   }
