@@ -10,14 +10,32 @@ on:
   pull_request_review:
     types: [submitted]
 
+concurrency:
+  # SEC-G9: the Grok pair has had this since #215; the Claude pair never did.
+  # Two rapid @claude mentions on the same issue otherwise run two metered
+  # agents concurrently over the same context.
+  group: claude-${{ github.event.issue.number || github.event.pull_request.number }}
+  cancel-in-progress: false
+
 jobs:
   claude:
+    # SEC-G9: author-association gate, mirroring grok.yml. Without it any
+    # drive-by commenter could spend the CLAUDE_CODE_OAUTH_TOKEN below.
+    # claude-code-action is believed to enforce an actor write-permission check
+    # internally, but that is UNVERIFIED here and is not a reason to omit the
+    # guard the Grok counterpart carries.
     if: |
-      (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
+      contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'),
+               github.event.comment.author_association
+               || github.event.review.author_association
+               || github.event.issue.author_association) &&
+      ((github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
       (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')) ||
       (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@claude')) ||
-      (github.event_name == 'issues' && (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')))
+      (github.event_name == 'issues' && (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude'))))
     runs-on: ubuntu-latest
+    # SEC-G9: an agent job with no timeout can sit at the 6h default.
+    timeout-minutes: 20
     permissions:
       contents: read
       pull-requests: read
