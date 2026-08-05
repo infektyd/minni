@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { buildAfmChatPayload, prepareOutcome, callAfmPrepareTask, prepareTask } from "../dist/task.js";
+import { buildAfmChatPayload, buildHandoffPacket, prepareOutcome, callAfmPrepareTask, prepareTask } from "../dist/task.js";
 import { ProviderChain } from "../dist/providers.js";
 
 const vaultMatch = {
@@ -174,6 +174,118 @@ test("prepareTask profile budgets shape source counts and snippets", async () =>
   assert.equal(deep.budgetTokens, 12000);
   assert.ok(compact.relevantSources.length < deep.relevantSources.length);
   assert.ok(compact.relevantSources[0].snippet.length < deep.relevantSources[0].snippet.length);
+});
+
+test("prepareTask (#339): a lexically-outranked schema-authority note is not discarded before re-ranking", async () => {
+  // taskSourcesFromVault already re-ranks by score + authority + freshness +
+  // privacy (a schema-authority note gets a flat +60 bonus) and only THEN
+  // slices to budget.sourceLimit — that logic was always correct. The bug
+  // was upstream: prepareTask asked searchVault for exactly `limit` (raw
+  // lexical score only, no authority/freshness/privacy awareness), so a
+  // note that would rank first once re-ranked could be truncated away
+  // before taskSourcesFromVault ever saw it. This mock mimics
+  // searchVaultNotes' own sort-then-slice(0, limit) behavior so the test
+  // actually exercises whether prepareTask requests a wide enough limit —
+  // it does not just capture the argument.
+  const rawPool = [
+    ...Array.from({ length: 12 }, (_, i) =>
+      vaultSource({
+        notePath: `/tmp/vault/wiki/artifacts/decoy-${i}.md`,
+        relativePath: `wiki/artifacts/decoy-${i}.md`,
+        wikilink: `[[wiki/artifacts/decoy-${i}]]`,
+        title: `Decoy ${i}`,
+        snippet: "shared 339 marker phrase",
+        score: 13 - i, // 13..2, strictly above the authority note's raw score
+      }),
+    ),
+    vaultSource({
+      notePath: "/tmp/vault/schema/AGENTS.md",
+      relativePath: "schema/AGENTS.md",
+      wikilink: "[[schema/AGENTS]]",
+      title: "AGENTS.md",
+      snippet: "shared 339 marker phrase",
+      score: 1, // lowest raw lexical score of all 13 candidates
+    }),
+  ];
+
+  const packet = await prepareTask(
+    {
+      task: "shared 339 marker phrase",
+      budgetTokens: 30000,
+      vaultPath: "/tmp/vault",
+      useAfm: false,
+    },
+    {
+      searchVault: async (_vaultPath, _query, limit) =>
+        rawPool
+          .slice()
+          .sort((a, b) => b.score - a.score)
+          .slice(0, limit),
+      recall: async () => ({ ok: true, data: { results: "", agent_id: "codex" } }),
+      audit: async () => "/tmp/vault/logs/today.md",
+    },
+  );
+
+  assert.equal(packet.profile, "standard"); // sourceLimit 6, old raw-fetch limit was 12
+  const paths = packet.relevantSources.map((s) => s.relativePath);
+  assert.ok(
+    paths.includes("schema/AGENTS.md"),
+    `#339: the schema-authority note must survive re-ranking even though it ranked 13th by raw lexical score alone (got: ${JSON.stringify(paths)})`,
+  );
+  assert.equal(
+    packet.relevantSources[0].relativePath,
+    "schema/AGENTS.md",
+    "the schema authority bonus (+60) must win it the top rank once re-ranking actually runs",
+  );
+});
+
+test("buildHandoffPacket (#339): a lexically-outranked schema-authority note is not discarded before re-ranking", async () => {
+  const rawPool = [
+    ...Array.from({ length: 12 }, (_, i) =>
+      vaultSource({
+        notePath: `/tmp/vault/wiki/artifacts/decoy-${i}.md`,
+        relativePath: `wiki/artifacts/decoy-${i}.md`,
+        wikilink: `[[wiki/artifacts/decoy-${i}]]`,
+        title: `Decoy ${i}`,
+        snippet: "shared 339 handoff marker phrase",
+        score: 13 - i,
+      }),
+    ),
+    vaultSource({
+      notePath: "/tmp/vault/schema/AGENTS.md",
+      relativePath: "schema/AGENTS.md",
+      wikilink: "[[schema/AGENTS]]",
+      title: "AGENTS.md",
+      snippet: "shared 339 handoff marker phrase",
+      score: 1,
+    }),
+  ];
+
+  const packet = await buildHandoffPacket(
+    {
+      task: "shared 339 handoff marker phrase",
+      vaultPath: "/tmp/vault",
+    },
+    {
+      searchVault: async (_vaultPath, _query, limit) =>
+        rawPool
+          .slice()
+          .sort((a, b) => b.score - a.score)
+          .slice(0, limit),
+      recall: async () => ({ ok: true, data: { results: "", agent_id: "codex" } }),
+    },
+  );
+
+  const paths = packet.topRecalls.map((s) => s.relativePath);
+  assert.ok(
+    paths.includes("schema/AGENTS.md"),
+    `#339: the schema-authority note must survive re-ranking even though it ranked 13th by raw lexical score alone (got: ${JSON.stringify(paths)})`,
+  );
+  assert.equal(
+    packet.topRecalls[0].relativePath,
+    "schema/AGENTS.md",
+    "the schema authority bonus must win it the top rank once re-ranking actually runs",
+  );
 });
 
 test("AFM payload omits blocked and private sources while keeping safe source reasons", () => {

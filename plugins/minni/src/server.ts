@@ -87,6 +87,12 @@ import {
 } from "./agent_ping.js";
 import { planHandoffDelivery } from "./handoff_guard.js";
 
+// #339: searchVaultNotes reads/scores/snippets every markdown file in the
+// vault's wiki tree regardless of `limit` — the limit is a post-scoring
+// slice only, so asking for more than the final cap costs nothing extra.
+// See minni_recall below for why the multiplier exists.
+const VAULT_SEARCH_OVERFETCH_MULTIPLIER = 3;
+
 function textResult(text: string) {
   return {
     content: [{ type: "text" as const, text }],
@@ -554,14 +560,27 @@ server.registerTool(
     // REFUSAL, not an empty, so it must never be OR'd into daemonEmpty above.
     const denial = identityDenialFrom(result.data);
     const identityDenied = recoveryRouteFrom(result.data) !== undefined || denial !== undefined;
+    // #339 (same shape as #313/PR #338): searchVaultNotes scores and sorts
+    // across the whole vault, then slices to its `limit` argument BEFORE
+    // privacy is considered beyond dropping `blocked` notes internally —
+    // `private`/`local-only` notes ride along. Asking for exactly the final
+    // cap here meant a private-heavy vault could fill every slot with
+    // non-safe notes that outscore a genuinely safe match, silently
+    // dropping it before filterSafeVaultResults ever saw it. Over-fetch a
+    // wider pre-filter set, filter, THEN slice to the cap this tool has
+    // always exposed — same external cap, same behavior for the common
+    // case. Narrows the gap, does not close it (a sufficiently private-
+    // heavy vault can still exceed the overfetch multiplier); see #339 for
+    // the durable fix (gate inside searchVaultNotes itself).
+    const vaultResultCap = Math.min(limit ?? 5, 8);
     const vaultResults = !identityDenied && shouldPrescanVault(daemonOk, includeVault !== false, daemonEmpty)
       ? filterSafeVaultResults(
           await searchVaultNotes(
             effectiveVaultPath,
             query,
-            Math.min(limit ?? 5, 8),
+            vaultResultCap * VAULT_SEARCH_OVERFETCH_MULTIPLIER,
           ),
-        )
+        ).slice(0, vaultResultCap)
       : [];
     // W5 (punch-list #4c): on a cross_agent capability denial specifically —
     // and only when the ORIGINAL request itself asked for cross_agent — retry
