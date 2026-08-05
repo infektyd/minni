@@ -369,3 +369,170 @@ def test_short_values_do_not_trip_the_gate(tmp_path, auth_file):
 
 def test_missing_auth_file_is_not_itself_a_failure(tmp_path):
     assert check(tmp_path, tmp_path / "nope.json", "A perfectly ordinary reply.") == 0
+
+
+# ── tier honesty (SEC-G12) ─────────────────────────────────────────────────
+# The success line used to name every tier unconditionally, so a run whose auth
+# file was unreadable — value and encoding never executed — was indistinguishable
+# from a full pass. `base64 -d` exits 0 on empty input, so an unset
+# GROK_CI_AUTH_JSON reaches exactly that state via a successful-looking restore.
+
+
+def _run(tmp_path: Path, auth: Path | None, reply: str, *flags: str):
+    reply_path = tmp_path / "reply.md"
+    reply_path.write_text(reply)
+    args = [sys.executable, str(SCRIPT), str(reply_path)]
+    if auth is not None:
+        args.append(str(auth))
+    args.extend(flags)
+    return subprocess.run(args, capture_output=True, text=True)
+
+
+def test_pass_message_names_only_the_checks_that_ran(tmp_path):
+    out = _run(tmp_path, tmp_path / "absent.json", "an ordinary review").stdout
+    assert "SKIPPED" in out and "value, encoding SKIPPED" in out
+    assert "value, encoding, shape, decoded checks passed" not in out
+
+
+def test_pass_message_claims_all_checks_only_when_all_ran(tmp_path, auth_file):
+    out = _run(tmp_path, auth_file, "an ordinary review").stdout
+    assert "value, encoding, shape, decoded checks passed" in out
+    assert "SKIPPED" not in out
+
+
+def test_unreadable_auth_warns_on_the_permissive_path(tmp_path):
+    """Still exit 0 — a missing credential file is not evidence of a leak —
+    but it must be visible, not silent."""
+    res = _run(tmp_path, tmp_path / "absent.json", "an ordinary review")
+    assert res.returncode == 0
+    assert "::warning::" in res.stdout
+
+
+def test_require_auth_fails_closed_when_the_auth_file_is_unreadable(tmp_path):
+    res = _run(tmp_path, tmp_path / "absent.json", "an ordinary review",
+               "--require-auth")
+    assert res.returncode == 1
+    assert "::error::" in res.stdout
+
+
+def test_require_auth_fails_closed_on_an_empty_auth_file(tmp_path):
+    """The exact shape `base64 -d` produces from an empty secret."""
+    empty = tmp_path / "auth.json"
+    empty.write_text("")
+    res = _run(tmp_path, empty, "an ordinary review", "--require-auth")
+    assert res.returncode == 1
+
+
+def test_require_auth_still_passes_a_clean_reply_with_valid_auth(tmp_path, auth_file):
+    res = _run(tmp_path, auth_file, "an ordinary review", "--require-auth")
+    assert res.returncode == 0
+
+
+def test_require_auth_still_blocks_a_leak(tmp_path, auth_file):
+    res = _run(tmp_path, auth_file, f"leaked {FAKE_REFRESH}", "--require-auth")
+    assert res.returncode == 1
+
+
+@pytest.mark.parametrize(
+    "document",
+    ['{}', '[]', 'null', '0', '{"k":"short"}', '{"a":{"b":[]}}'],
+)
+def test_require_auth_rejects_an_auth_document_with_nothing_to_compare(tmp_path, document):
+    """SEC-G12 one layer down. `auth is not None` is not the same as "there was
+    something to compare against": these documents parse fine and yield zero
+    comparison values, so the value and encoding checks iterate an empty list
+    and verify nothing — while the summary previously claimed both tiers ran
+    and --require-auth still certified the reply."""
+    auth = tmp_path / "auth.json"
+    auth.write_text(document)
+    res = _run(tmp_path, auth, "an ordinary review", "--require-auth")
+    assert res.returncode == 1, f"{document} certified as a full-coverage pass"
+
+
+@pytest.mark.parametrize("document", ['{}', 'null'])
+def test_valueless_auth_is_reported_as_skipped_on_the_permissive_path(tmp_path, document):
+    auth = tmp_path / "auth.json"
+    auth.write_text(document)
+    out = _run(tmp_path, auth, "an ordinary review").stdout
+    assert "value, encoding SKIPPED" in out
+    assert "::warning::" in out
+
+
+def test_usage_error_when_only_the_flag_is_given(tmp_path):
+    res = subprocess.run(
+        [sys.executable, str(SCRIPT), "--require-auth"],
+        capture_output=True, text=True,
+    )
+    assert res.returncode == 2, "should be a usage error, not a traceback"
+    assert "Traceback" not in res.stderr
+    assert "usage:" in res.stdout
+
+
+def test_pathologically_nested_auth_fails_closed_without_a_traceback(tmp_path):
+    """walk() is unbounded recursion. A deep document must produce the
+    annotation the module promises, not a stack trace."""
+    auth = tmp_path / "auth.json"
+    auth.write_text("[" * 100000 + "]" * 100000)
+    res = _run(tmp_path, auth, "an ordinary review", "--require-auth")
+    assert res.returncode == 1
+    assert "Traceback" not in res.stderr and "Traceback" not in res.stdout
+    assert "::error::" in res.stdout
+
+
+# ── auth-status wording (Bugbot, #304) ─────────────────────────────────────
+# The two paths carried two hand-written explanations of the same condition and
+# drifted: --require-auth distinguished "could not be parsed" from "parsed as
+# null", while the permissive warning collapsed them and described a file that
+# had parsed perfectly well as "unreadable (None)" — naming the ABSENCE of an
+# error as if it were the error. Both paths now share one helper, and these
+# tests pin the message CLASS for every auth state on BOTH paths, so the two
+# cannot drift again.
+
+AUTH_STATES = [
+    ("null", "parsed as null"),
+    ("{}", "parsed but yielded no comparison values"),
+    ("[]", "parsed but yielded no comparison values"),
+    ('{"k":"short"}', "parsed but yielded no comparison values"),
+]
+
+
+@pytest.mark.parametrize("document, expected", AUTH_STATES)
+def test_permissive_path_describes_the_auth_state_accurately(tmp_path, document, expected):
+    auth = tmp_path / "auth.json"
+    auth.write_text(document)
+    out = _run(tmp_path, auth, "an ordinary review").stdout
+    assert expected in out, f"{document}: expected {expected!r} in {out!r}"
+    # The conflated wording, and the tell that produced it.
+    assert "unreadable" not in out
+    assert "(None)" not in out
+
+
+@pytest.mark.parametrize("document, expected", AUTH_STATES)
+def test_require_auth_path_describes_the_auth_state_accurately(tmp_path, document, expected):
+    auth = tmp_path / "auth.json"
+    auth.write_text(document)
+    out = _run(tmp_path, auth, "an ordinary review", "--require-auth").stdout
+    assert expected in out
+    assert "(None)" not in out
+
+
+@pytest.mark.parametrize("document, _expected", AUTH_STATES)
+def test_both_paths_agree_on_why_the_checks_did_not_run(tmp_path, document, _expected):
+    """The drift itself is the defect, so pin the agreement rather than two
+    independent strings: a future edit to one path alone fails here."""
+    auth = tmp_path / "auth.json"
+    auth.write_text(document)
+    warning = _run(tmp_path, auth, "review").stdout
+    error = _run(tmp_path, auth, "review", "--require-auth").stdout
+    reason = next(line for line in warning.splitlines() if "::warning::" in line)
+    reason = reason.split("auth.json ", 1)[1].split(";")[0]
+    assert reason in error, (
+        f"permissive says {reason!r}; --require-auth path disagrees: {error!r}"
+    )
+
+
+def test_a_genuinely_unreadable_auth_file_still_says_so(tmp_path):
+    """The accurate case must survive the fix — an absent file IS unparseable."""
+    out = _run(tmp_path, tmp_path / "absent.json", "an ordinary review").stdout
+    assert "could not be parsed" in out
+    assert "No such file" in out

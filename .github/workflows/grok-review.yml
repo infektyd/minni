@@ -191,9 +191,58 @@ jobs:
 
       - name: Install Grok Build CLI
         if: steps.resolve.outputs.skip == 'false'
+        env:
+          GROK_CLI_VERSION: 0.2.118
+          # Pin the channel where the installer reads it, rather than trying
+          # to verify it after the fact from a cache file that may not exist.
+          GROK_CHANNEL: stable
         run: |
-          curl -fsSL https://x.ai/cli/install.sh | bash
+          # PINNED, not latest (SEC-G10). grok-boundary-test.yml's header says
+          # the boundary proof must re-run "whenever the sandbox profile, the
+          # CLI version, or the flag set changes" — but its trigger is a
+          # `paths` filter, and a paths filter can never observe a CLI release.
+          # An unpinned `| bash` therefore made the one axis the header names
+          # the one axis nothing could fire on. Pinning converts a CLI change
+          # into a FILE change, which the existing paths filter already
+          # catches. Bumping this line is the deliberate act of re-proving the
+          # boundary against a new CLI.
+          #
+          # Stable channel, not alpha: the installer defaults to stable and
+          # `grok models`/`--reasoning-effort` were verified present on this
+          # exact build before pinning.
+          curl -fsSL https://x.ai/cli/install.sh | bash -s "$GROK_CLI_VERSION"
           echo "$HOME/.grok/bin" >> "$GITHUB_PATH"
+          # Assert we got what we pinned. The installer silently falls back to
+          # the channel's latest when the version argument is absent or
+          # dropped, and a quietly-newer CLI is exactly what this pin exists to
+          # prevent — so a mismatch has to fail rather than proceed.
+          INSTALLED=$("$HOME/.grok/bin/grok" --version)
+          # EXACT compare, not a substring. `grok --version` prints
+          # "grok 0.2.118 (<sha>) [stable]", and a glob would let a pin of
+          # 0.2.12 accept 0.2.120 — the X.Y.Z / X.Y.Z0 collision is live in this
+          # CLI's own series, and it fails open in precisely the case the
+          # assertion exists for. Parameter expansion only: no PATH lookup.
+          INSTALLED_VERSION="${INSTALLED#grok }"
+          INSTALLED_VERSION="${INSTALLED_VERSION%% *}"
+          if [ "$INSTALLED_VERSION" != "$GROK_CLI_VERSION" ]; then
+            echo "::error::expected grok $GROK_CLI_VERSION, got: $INSTALLED"
+            exit 1
+          fi
+          # Channel: pinned at the SOURCE via GROK_CHANNEL above, not inferred
+          # from --version. The [stable]/[alpha] suffix is rendered from
+          # ~/.grok/version.json, which is an update-check CACHE that install.sh
+          # never writes — so on a fresh runner $HOME the tag is absent
+          # entirely, and requiring it would have failed every run of all three
+          # workflows. Measured on an isolated HOME: `grok 0.2.118 (1e1687c1cf6a)`
+          # with no suffix. Reject a known-bad tag if one is present; never
+          # require a good one.
+          case "$INSTALLED" in
+            *"[alpha]"*|*"[enterprise]"*)
+              echo "::error::expected a stable-channel build, got: $INSTALLED"
+              exit 1
+              ;;
+          esac
+          echo "grok CLI pinned at $GROK_CLI_VERSION"
 
       - name: Restore Grok subscription auth
         if: steps.resolve.outputs.skip == 'false'
@@ -352,7 +401,10 @@ jobs:
             echo "::error::Could not load the leak gate from origin/$TRUST_REF — refusing to post."
             exit 1
           fi
-          printf '%s' "$GATE_BYTES" | /usr/bin/python3 -I - /tmp/grok-reply.md
+          # --require-auth: see the note in grok.yml. An unreadable auth file
+          # means two of the four checks never ran, which must not read as a
+          # pass on the path that decides whether a reply is published.
+          printf '%s' "$GATE_BYTES" | /usr/bin/python3 -I - --require-auth /tmp/grok-reply.md
 
       # App identity posts REQUEST_CHANGES / COMMENT only. Merge trust is the
       # grok-mechanical-approve check run (see grok-approve-gate.yml). Bot

@@ -7,6 +7,8 @@ see, and each one corresponds to a defect that minted a false success.
 from __future__ import annotations
 
 import re
+import shlex
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -687,13 +689,161 @@ def test_grok_invocations_pin_model_and_effort(workflow):
             # read as a pin, and an unquoted invocation must not be skipped.
             body = _uncommented(str(step.get("run", "")))
             for call in re.finditer(r'"?\$HOME/\.grok/bin/grok"?((?:[^\n]*\\\n)*[^\n]*)', body):
-                calls.append(call.group(1))
+                flags = call.group(1)
+                # Only AGENT runs carry a model lane. `grok --version`, used by
+                # the install step to verify its pin, has no model to pin.
+                # Keyed on --version rather than on the presence of
+                # --prompt-file: an agent call written another way must still
+                # be checked, not silently skipped past the non-vacuity guard.
+                if "--version" in flags:
+                    continue
+                calls.append(flags)
     # Without this the loop below is vacuous whenever the regex matches
     # nothing — a green test that constrains exactly zero invocations.
     assert calls, f"{workflow}: no grok invocation found to check"
     for flags in calls:
         assert "--model grok-4.5" in flags, f"{workflow}: model not pinned"
         assert "--reasoning-effort high" in flags, f"{workflow}: effort not pinned"
+
+
+@pytest.mark.parametrize(
+    "workflow, reply",
+    [
+        ("grok-review.yml", "/tmp/grok-reply.md"),
+        ("grok.yml", "/tmp/grok-reply.md"),
+        ("grok-boundary-test.yml", "/tmp/attack-result.md"),
+    ],
+)
+def test_publish_gate_requires_a_parsed_auth_file(workflow, reply):
+    """SEC-G12: the step that decides whether a reply is published must not
+    accept a gate run that silently skipped two of its four checks. `base64 -d`
+    exits 0 on empty input, so an unset GROK_CI_AUTH_JSON reaches that state
+    through a restore step that looks like it succeeded."""
+    doc = _load(ROOT / ".github" / "workflows" / workflow)
+    call = f"/usr/bin/python3 -I - --require-auth {reply}"
+    # Uncommented step bodies, not raw file text: a commented-out `# was: ...
+    # --require-auth ...` line above a stripped invocation satisfied a plain
+    # substring match over the file.
+    bodies = [
+        _uncommented(str(step.get("run", "")))
+        for job in doc["jobs"].values() for step in job.get("steps") or []
+    ]
+    assert any(call in body for body in bodies), (
+        f"{workflow}: publish gate does not pass --require-auth"
+    )
+    # A step-level condition would disable the gate in CI while every string
+    # assertion above still passes.
+    gate_steps = [
+        step for job in doc["jobs"].values() for step in job.get("steps") or []
+        if call in _uncommented(str(step.get("run", "")))
+    ]
+    for step in gate_steps:
+        condition = str(step.get("if", "")).strip()
+        assert condition in ("", "steps.resolve.outputs.skip == 'false'"), (
+            f"{workflow}: publish gate carries a condition that could disable "
+            f"it: {condition!r}"
+        )
+
+
+def _extract_version_check(run: str) -> str:
+    """The pin-verification shell from an install step, minus the install.
+
+    Starts at the CAPTURE line, not at the comparison. Slicing from the
+    comparison left the capture untested, so inserting
+    `INSTALLED="grok $GROK_CLI_VERSION ..."` right after it — a tautology that
+    certifies any installed build — passed every assertion here.
+    """
+    start = run.index('INSTALLED=$("$HOME/.grok/bin/grok" --version)')
+    return "set -eu\n" + run[start:]
+
+
+def _stub_grok_home(tmp_path: Path, version_output: str) -> Path:
+    """A $HOME whose .grok/bin/grok prints `version_output`."""
+    binary = tmp_path / ".grok" / "bin" / "grok"
+    binary.parent.mkdir(parents=True, exist_ok=True)
+    binary.write_text(f'#!/bin/sh\nprintf "%s\\n" {shlex.quote(version_output)}\n')
+    binary.chmod(0o755)
+    return tmp_path
+
+
+GROK_CLI_WORKFLOWS = ("grok-review.yml", "grok.yml", "grok-boundary-test.yml")
+
+
+@pytest.mark.parametrize("workflow", GROK_CLI_WORKFLOWS)
+def test_grok_cli_install_is_version_pinned(workflow, tmp_path):
+    """SEC-G10: an unpinned `curl | bash` installs whatever is current at run
+    time, so "the CLI version changed" — the axis grok-boundary-test.yml's own
+    header says must re-prove the boundary — could never fire its `paths`
+    filter. Pinning makes a CLI change a FILE change, which that filter sees.
+    """
+    doc = _load(ROOT / ".github" / "workflows" / workflow)
+    steps = [s for job in doc["jobs"].values() for s in job.get("steps") or []
+             if "x.ai/cli/install.sh" in str(s.get("run", ""))]
+    assert steps, f"{workflow}: no CLI install step found to check"
+    for step in steps:
+        pin = (step.get("env") or {}).get("GROK_CLI_VERSION")
+        assert pin, f"{workflow}: install step declares no GROK_CLI_VERSION"
+        assert re.fullmatch(r"\d+\.\d+\.\d+", str(pin)), f"{workflow}: {pin!r}"
+        run = step["run"]
+        assert 'bash -s "$GROK_CLI_VERSION"' in run, (
+            f"{workflow}: install does not pass the pin to the installer"
+        )
+        # BEHAVIOURAL, not a grep: the version check is extracted and executed
+        # under bash with synthetic `grok --version` output. An earlier version
+        # of this test asserted only that the strings "--version" and
+        # "::error::expected grok" appeared, and passed after `exit 1` was
+        # removed from the mismatch branch — an annotation is not a failure.
+        # The capture line itself is outside the executed region below, so
+        # pin it exactly: replacing it with a hardcoded string, or with a
+        # PATH-resolved `grok --version`, would otherwise certify any build.
+        assert 'INSTALLED=$("$HOME/.grok/bin/grok" --version)' in run, (
+            f"{workflow}: version is not captured from the pinned binary"
+        )
+        check = _extract_version_check(run)
+        for installed, should_pass in (
+            # No channel tag at all — what a FRESH runner $HOME actually
+            # prints, because the [stable]/[alpha] suffix comes from an
+            # update-check cache install.sh never writes. Requiring the tag
+            # took all three workflows offline; this case pins that lesson.
+            (f"grok {pin} (abc1234)", True),
+            (f"grok {pin} (abc1234) [stable]", True),
+            (f"grok {pin}0 (abc1234)", False),            # X.Y.Z vs X.Y.Z0
+            ("grok 9.9.9 (abc1234)", False),
+            (f"grok {pin} (abc1234) [alpha]", False),     # wrong channel
+        ):
+            home = _stub_grok_home(tmp_path / installed.replace(" ", "_").replace("/", "_"),
+                                   installed)
+            rc = subprocess.run(
+                ["bash", "-c", check],
+                env={"GROK_CLI_VERSION": str(pin), "HOME": str(home),
+                     "PATH": "/usr/bin:/bin"},
+                capture_output=True, text=True,
+            ).returncode
+            assert (rc == 0) is should_pass, (
+                f"{workflow}: version check returned {rc} for {installed!r}; "
+                f"expected {'accept' if should_pass else 'reject'}"
+            )
+
+
+def test_every_grok_workflow_pins_the_same_cli_version():
+    """A boundary proven against one build says nothing about another."""
+    pins = set()
+    for workflow in GROK_CLI_WORKFLOWS:
+        doc = _load(ROOT / ".github" / "workflows" / workflow)
+        for job in doc["jobs"].values():
+            for step in job.get("steps") or []:
+                if "x.ai/cli/install.sh" in str(step.get("run", "")):
+                    pins.add((step.get("env") or {}).get("GROK_CLI_VERSION"))
+    assert len(pins) == 1, f"grok workflows disagree on the CLI version: {pins}"
+
+
+def test_boundary_test_has_a_trigger_that_does_not_need_a_diff():
+    """The pinned CLI covers repo-visible change; the sandbox's server-side
+    behaviour and the pinned artifact's availability can still move with no
+    diff at all, and the last green run would stand as current evidence."""
+    triggers = _triggers(_load(ROOT / ".github" / "workflows" / "grok-boundary-test.yml"))
+    assert "schedule" in triggers, "no trigger can fire without a file change"
+    assert triggers["schedule"], "schedule declared but empty"
 
 
 def test_every_path_mutating_job_is_covered():

@@ -59,9 +59,22 @@ were measured:
   * A separator containing DIGITS (a markdown numbered list) survives every
     collapse, because digits are valid base64 and stripping them would destroy
     the encoding the collapse exists to recover. Eleven other separator
-    classes — including `-`, `_`, `=`, `+`, `/` and bullet lists — are caught. This gate is the last line, not the boundary — the boundary is that
+    classes — including `-`, `_`, `=`, `+`, `/` and bullet lists — are caught.
+  * `runs-joined` only welds fragments that are each at least MIN_B64_RUN long,
+    so a blob split into SHORTER pieces separated by prose is not recovered.
+    Measured: fragments of 22 characters with a sentence between them pass.
+    This is a weaker residual than "chunked character-by-character" implies,
+    and it is an easy instruction for an injection to emit; lowering the join
+    threshold trades it against welding ordinary prose into token shapes. This gate is the last line, not the boundary — the boundary is that
 child-process egress is blocked (verified on Linux) and the blast radius is
 small (short-lived token, collaborator-only triggers, ephemeral runner).
+
+WHAT A PASS MEANS: the success line names the checks that ACTUALLY ran. An
+earlier version printed "value + encoding + shape checks passed" unconditionally,
+including on runs where the auth file was unreadable and the value and encoding
+checks never executed — a pass that overstated its own coverage (SEC-G12).
+Production callers additionally pass --require-auth, which makes an unparseable
+auth file a failure rather than a silent downgrade to shape-only.
 
 Nothing secret is ever printed: findings are reported as a redacted prefix.
 """
@@ -76,6 +89,9 @@ import sys
 
 # Shorter than this and a "secret" is not distinctive enough to match on
 # without false positives (short config values, ids that also appear in prose).
+# Opt-in strictness for production callers — see main().
+REQUIRE_AUTH_FLAG = "--require-auth"
+
 MIN_SECRET_LEN = 20
 # Any window this long is unmistakably token material rather than prose.
 WINDOW = 24
@@ -267,6 +283,26 @@ def decoded_views(text: str, budget: list[int]) -> list[str]:
     return views
 
 
+def auth_status(auth: object, auth_error: BaseException | None) -> str:
+    """Why the value and encoding checks could not run.
+
+    Shared by BOTH callers on purpose. These were two hand-written
+    explanations of the same condition and they drifted: the --require-auth
+    error distinguished "could not be parsed" from "parsed as null", while the
+    permissive warning collapsed them and reported a file that had parsed
+    perfectly well as "unreadable (None)" — naming the absence of an error as
+    if it were the error. A caller cannot get this wrong if there is only one
+    place to get it right.
+    """
+    if auth_error is not None:
+        return f"could not be parsed ({auth_error})"
+    if auth is None:
+        # `null` is valid JSON: the file was read and parsed, it just carries
+        # nothing. That is a different fact from an unreadable file.
+        return "parsed as null"
+    return "parsed but yielded no comparison values"
+
+
 def all_views(reply: str) -> dict[str, str]:
     """Every rendering of the reply that this gate is willing to certify.
 
@@ -371,12 +407,21 @@ def value_hits(views: dict[str, str], auth: object) -> list[str]:
 
 
 def main() -> int:
-    if len(sys.argv) < 2:
-        print("::error::usage: check-no-credential-leak.py <reply> [auth.json]")
+    args = [a for a in sys.argv[1:] if a != REQUIRE_AUTH_FLAG]
+    # Production callers pass --require-auth: for them an unreadable auth file
+    # is a broken run, not an absent credential. It lives here rather than in
+    # the workflow because this script is loaded from the default branch while
+    # the workflow YAML comes from the merge ref — a PR can delete a step it
+    # dislikes, but not this.
+    require_auth = REQUIRE_AUTH_FLAG in sys.argv[1:]
+    # After the filter, not before: `check-no-credential-leak.py --require-auth`
+    # otherwise passed a `len(sys.argv) < 2` guard and died on an IndexError.
+    if not args:
+        print("::error::usage: check-no-credential-leak.py <reply> "
+              f"[auth.json] [{REQUIRE_AUTH_FLAG}]")
         return 2
-
-    reply_path = sys.argv[1]
-    auth_path = sys.argv[2] if len(sys.argv) > 2 else os.path.expanduser(
+    reply_path = args[0]
+    auth_path = args[1] if len(args) > 1 else os.path.expanduser(
         "~/.grok/auth.json"
     )
 
@@ -392,15 +437,43 @@ def main() -> int:
     try:
         with open(auth_path, encoding="utf-8") as handle:
             auth = json.load(handle)
-    except (OSError, ValueError):
-        # No auth file to compare against (or unreadable): the shape check
-        # below still runs. Do not fail here — a missing credential file is
-        # not evidence of a leak.
-        auth = None
+        auth_error = None
+    except (OSError, ValueError, RecursionError) as exc:
+        # RecursionError included: a pathologically nested auth document must
+        # produce the annotation below, not a traceback out of walk().
+        # No auth file to compare against (or unreadable): the shape and
+        # decoded checks below still run. A missing credential file is not by
+        # itself evidence of a leak, so this is not a failure on its own —
+        # but it IS two of four checks not running, and saying so is the whole
+        # point of the tier reporting below.
+        auth, auth_error = None, exc
+
+    # SEC-G12 one layer down: `auth is not None` is not the same as "there was
+    # something to compare against". An auth document of {}, [], null, 0, or one
+    # whose strings are all shorter than MIN_SECRET_LEN yields no comparison
+    # values at all — the value and encoding checks then iterate an empty list
+    # and verify nothing, while the summary claimed both tiers ran. Coverage is
+    # derived from the VALUES from here on, never from the file parsing.
+    try:
+        values = secret_values(auth) if auth is not None else []
+    except RecursionError as exc:
+        # Same reasoning as the parse above: walk() is unbounded recursion, and
+        # a deep document must fail closed with an annotation, not a traceback.
+        auth, auth_error, values = None, exc, []
+
+    if not values and require_auth:
+        # `base64 -d` exits 0 on empty input, so an empty or unset
+        # GROK_CI_AUTH_JSON produces a successful-looking restore and an
+        # unparseable auth file. Without this, that misconfiguration silently
+        # downgraded the gate to shape-only and still reported a pass.
+        print(f"::error::Auth file {auth_path} {auth_status(auth, auth_error)}; "
+              "refusing to certify a reply against a credential set this gate "
+              "never loaded.")
+        return 1
 
     try:
         views = all_views(reply)
-        if auth is not None:
+        if values:
             hits.extend(value_hits(views, auth))
         hits.extend(shape_hits(views))
     except ScanBudgetExceeded:
@@ -414,8 +487,22 @@ def main() -> int:
             print(f"::error::  {hit}")
         return 1
 
-    print("No credential material in reply "
-          "(value + encoding + shape + decoded checks passed).")
+    # Name the checks that ACTUALLY ran. The previous message claimed every
+    # tier unconditionally, so a run with an unreadable auth file — where the
+    # value and encoding checks never executed — was indistinguishable from a
+    # full pass (SEC-G12).
+    ran = ["shape", "decoded"]
+    skipped = []
+    if values:
+        ran = ["value", "encoding", *ran]
+    else:
+        skipped = ["value", "encoding"]
+        print(f"::warning::Auth file {auth_path} "
+              f"{auth_status(auth, auth_error)}; "
+              f"the {' and '.join(skipped)} checks did NOT run.")
+    summary = f"No credential material in reply ({', '.join(ran)} checks passed"
+    summary += f"; {', '.join(skipped)} SKIPPED)." if skipped else ")."
+    print(summary)
     return 0
 
 

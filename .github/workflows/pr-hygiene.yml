@@ -14,6 +14,19 @@ concurrency:
 jobs:
   forbidden-files:
     name: Forbidden Files
+    # Consumes the content verdict so the split does not DE-REQUIRE it.
+    # "Forbidden Content" is not in branch protection's required set (checked:
+    # Forbidden Files, Free public cloud smoke, grok-mechanical-approve), so
+    # splitting alone would have moved a blocking failure onto a context nobody
+    # enforces — a content hit would then merge. `always()` is required because
+    # a skipped dependency otherwise skips this job too.
+    needs: forbidden-content
+    # NOT the bare default: a skipped dependency skips the dependent, and a
+    # skipped required check counts as SATISFIED — fork PRs would then get no
+    # hygiene gate at all. `!cancelled()` keeps this job running when the
+    # content job is skipped or failed, while letting a genuinely cancelled run
+    # stay cancelled instead of turning every superseded run red.
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 2
     steps:
@@ -119,6 +132,64 @@ jobs:
 
           echo "✓ No forbidden files in PR diff."
 
+      - name: Require the content gate verdict
+        # Deliberately NOT a duplicate of the content job: it re-publishes that
+        # job's conclusion through the context branch protection actually
+        # enforces. `skipped` is called out rather than passed silently —
+        # GitHub treats a skipped job as SATISFYING a required check, so a skip
+        # is honest reporting, never enforcement.
+        env:
+          CONTENT_RESULT: ${{ needs.forbidden-content.result }}
+        run: |
+          set -euo pipefail
+          case "$CONTENT_RESULT" in
+            success)
+              echo "✓ Content gate passed."
+              ;;
+            skipped)
+              echo "::warning::Content gate did not run: fork PRs get no access to the pattern secret. This check covers FILE ADDITIONS only for this PR — added lines were not scanned."
+              ;;
+            *)
+              echo "::error::Content gate concluded '$CONTENT_RESULT' — refusing to report success for a scan that did not pass."
+              exit 1
+              ;;
+          esac
+
+
+  # SPLIT OUT of forbidden-files deliberately (SEC-G4). This scan reads a repo
+  # SECRET, and GitHub withholds secrets from fork PRs — so while it lived
+  # inside `forbidden-files` it exited 0 on exactly the PRs it exists for,
+  # inside the ONLY check required for merge. A green "Forbidden Files" then
+  # meant two different things depending on who opened the PR.
+  #
+  # As its own job the fork case becomes a GitHub-level `skipped` conclusion,
+  # visible on the PR as a distinct outcome rather than a green tick for a scan
+  # that did not run.
+  #
+  # Be precise about what that buys: REPORTING honesty, not enforcement.
+  # GitHub counts a skipped job as SATISFYING a required check, so making this
+  # context required would not block a fork PR either. Enforcement for
+  # same-repo PRs is preserved by `forbidden-files` consuming this job's result
+  # through the context branch protection does enforce.
+  forbidden-content:
+    name: Forbidden Content
+    # Fork PRs get no secrets, so the scan cannot run. Skipping at job level
+    # reports that honestly; the alternative (exit 0 inside the step) reports
+    # success.
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # This job runs git over PR-authored refs; merge-base/diff are local reads
+          # and need no credential.
+          # Default checkout persists the token into .git/config as an http
+          # extraheader; nothing downstream needs it (the repo is public, so
+          # any git fetch here is anonymous).
+          persist-credentials: false
+          fetch-depth: 0
+
       - name: Scan PR added lines for forbidden content pattern
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
@@ -133,8 +204,13 @@ jobs:
           set -euo pipefail
 
           if [ -z "${FORBIDDEN_CONTENT_PATTERN:-}" ]; then
-            echo "::notice::FORBIDDEN_CONTENT_PATTERN repo secret is not set — skipping content gate."
-            exit 0
+            # Reached only on a SAME-REPO PR, because the job-level `if` above
+            # already skipped this check for forks. A same-repo PR that cannot
+            # read the secret is a misconfiguration, not an external
+            # contributor — and the standing rule is that a gate must never
+            # pass by not checking. Fail loudly instead of exiting 0.
+            echo "::error::FORBIDDEN_CONTENT_PATTERN is unset on a same-repo PR — the content gate cannot run, and will not report success for work it did not do."
+            exit 1
           fi
 
           MERGE_BASE=$(git merge-base "$BASE_SHA" "$HEAD_SHA")
