@@ -1179,7 +1179,7 @@ export function createHookHandlers(
     const budgetMs = effectiveHookBudgetMs(config.promptHookTimeoutMs);
     const deadline = Date.now() + budgetMs;
     const remainingMs = (): number => Math.max(0, deadline - Date.now());
-    const [vaultResults, recall] = await Promise.all([
+    const [vaultResultsRaw, recall] = await Promise.all([
       withBudget(searchVaultNotes(config.vaultPath, prompt, 6), remainingMs(), []),
       withBudget(
         recallMemory({
@@ -1196,6 +1196,18 @@ export function createHookHandlers(
         { ok: false as const, error: JSON_RPC_TIMEOUT_ERROR },
       ),
     ]);
+    // SEC-006 (found during #283 review): searchVaultNotes returns every
+    // match regardless of privacy level — only `filterSafeVaultResults` (not
+    // yet applied here) keeps `local-only`/`private` notes and privacy-
+    // heuristic escalations (secrets/tokens/paths, see task.ts
+    // privacyForSource) out of the model-facing recall pointer, the
+    // persisted recall-state top_hits, and the PreToolUse guard's deny-
+    // reason text (all three read from `strong`/`vaultResults` below). This
+    // filter existed in claude-code's pre-#283 hook.ts but was never ported
+    // here when codex/grok-build/cursor/gemini/kilocode were extracted onto
+    // this factory — every platform sharing this handler has been leaking
+    // non-safe notes into UserPromptSubmit. Fixed once, for all six.
+    const vaultResults = filterSafeVaultResults(vaultResultsRaw);
     // "Ran out of time" is NOT "there is nothing" — only a real answer may drive
     // the weak-turn path below, which CLEARS recall-state.
     const daemonTimedOut = !recall.ok && recall.error === JSON_RPC_TIMEOUT_ERROR;
@@ -1324,6 +1336,7 @@ export function createHookHandlers(
         task_signature: signature,
         workspace: workspaceId,
         recall_strong: Boolean(strong),
+        top_score: strong?.topScore,
         // RAW id only — see the weak-path comment above.
         ...(rawSessionId ? { session_id: rawSessionId } : {}),
       },

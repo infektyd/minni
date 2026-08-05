@@ -4,8 +4,8 @@
 // lifecycle-hook.test.mjs, sessionstart-delivery.test.mjs, identity-body-
 // delivery.test.mjs) — all of them continued to pass unmodified against the
 // migrated hook.js, which is the strongest evidence the migration preserved
-// behavior. This file covers the two pieces of claude-specific behavior that
-// had NO existing end-to-end coverage before the migration:
+// behavior. This file covers the pieces of behavior that had NO existing
+// end-to-end coverage before the migration:
 //
 //   1. handleSessionStart's PLUMB-only knob (ackPendingHandoffsAtBoot):
 //      listing and acking pending handoff leases at boot, and surfacing
@@ -13,10 +13,20 @@
 //   2. handlePostCompact (#227 near-free follow-through): claude-code's
 //      native post-compaction event, now a real factory dispatch case
 //      instead of falling through to the unrouted-event swallow.
+//   3. SEC-006 (found during review round 1 of this same PR): the shared
+//      factory's handleUserPromptSubmit imported filterSafeVaultResults but
+//      never called it — searchVaultNotes' raw output (including
+//      private/local-only notes and privacy-heuristic escalations) fed
+//      straight into the recall pointer, the persisted recall-state top
+//      hits, and the audit vault_matches list. This was ALREADY true for
+//      codex/grok-build/cursor/gemini/kilocode before this PR; migrating
+//      claude-code onto this factory would have been what took away
+//      claude's own (correct) filtering. Fixed once, in the factory, for
+//      every platform.
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import net from "node:net";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -51,7 +61,15 @@ function startFakeDaemon(socketPath, handlers = {}) {
       buffer = lines.pop() ?? "";
       for (const line of lines) {
         if (!line.trim()) continue;
-        const request = JSON.parse(line);
+        let request;
+        try {
+          request = JSON.parse(line);
+        } catch (error) {
+          // Fail loudly with a diagnosable message rather than an opaque
+          // uncaught exception inside a socket 'data' handler (which would
+          // otherwise crash the whole test runner, not just this test).
+          throw new Error(`fake daemon received non-JSON line: ${line} (${error.message})`);
+        }
         calls.push(request);
         const respond = (result) => {
           socket.write(`${JSON.stringify({ jsonrpc: "2.0", id: request.id, result })}\n`);
@@ -176,7 +194,7 @@ test("SessionStart acks a real pending handoff lease and reports handoff_acks", 
 
 test("SessionStart degrades handoff_leases when the list RPC fails, without breaking the boot", async () => {
   await withFixture(async (fixture) => {
-    const { server } = await startFakeDaemon(fixture.socketPath, {
+    const { server, calls } = await startFakeDaemon(fixture.socketPath, {
       minni_list_pending_handoffs: (_request, { respondError }) => {
         respondError("handoff lease store failed");
       },
@@ -185,6 +203,16 @@ test("SessionStart degrades handoff_leases when the list RPC fails, without brea
       const output = await runHook("SessionStart", BASE_ENV(fixture));
       assert.equal(output.continue, true, "a broken handoff list must not fail the whole boot");
       const body = envelopeJson(output.hookSpecificOutput.additionalContext);
+
+      // Confirms the RPC error path was actually exercised, not e.g. a
+      // socket-connection failure that would ALSO leave handoff_acks
+      // trivially empty and degraded.sections populated for an unrelated
+      // reason.
+      assert.equal(
+        calls.filter((c) => c.method === "minni_list_pending_handoffs").length,
+        1,
+        "the list RPC must actually have been attempted",
+      );
 
       // handoff_acks is unconditionally present when the knob is on (matches
       // the pre-migration hook.ts exactly) — empty because the list RPC
@@ -221,6 +249,11 @@ test("SessionStart handoff acking does not run for a platform without the knob (
       assert.equal(output.continue, true);
       const body = envelopeJson(output.hookSpecificOutput.additionalContext);
       assert.equal(body.handoff_acks, undefined, "codex must never surface handoff_acks");
+      // Prove the daemon connection actually worked (codex's other boot RPCs
+      // landed) — otherwise "0 list calls" could just as easily mean the
+      // socket never connected at all, which would pass this assertion
+      // vacuously regardless of whether the knob-off gate works.
+      assert.ok(calls.length > 0, "codex must actually reach the daemon for its other boot RPCs");
       assert.equal(
         calls.filter((c) => c.method === "minni_list_pending_handoffs").length,
         0,
@@ -251,19 +284,88 @@ test("PostCompact harvests compact_summary into the vault (primary delivery path
       "a real, long-enough summary must be recorded as harvested",
     );
     assert.match(tail.text, /pc-283/);
+    // "hook_compact_harvest" alone doesn't distinguish a real harvest from
+    // the empty_summary no-op branch (both share the same tool name). Only
+    // the success branch's audit details carry summary_sha1; the
+    // empty_summary branch's details carry `"reason": "empty_summary"` and
+    // nothing else. Assert both to pin the actual success path, not just
+    // "some compact_harvest audit row exists".
+    assert.match(tail.text, /summary_sha1/, "a real harvest must record the content-dedup key");
+    assert.doesNotMatch(
+      tail.text,
+      /empty_summary/,
+      "an 80-char summary must not take the too-short no-op branch",
+    );
   });
 });
 
 test("PostCompact is a genuine no-op (not an unrouted-event drop) when the summary is empty", async () => {
+  // harvestSummaryText's no_summary_found branch returns before writing
+  // ANYTHING to the audit log — so a fresh fixture's tail is empty on this
+  // path by design, not just free of an "hook_intent_dropped" string. Assert
+  // the tail is exactly empty (review round 1: asserting doesNotMatch alone
+  // against an already-empty tail is vacuous — it would pass identically if
+  // the hook crashed before touching the vault at all, not just on the
+  // intended no-op path). The "PostCompact is genuinely routed" claim itself
+  // is covered positively by the harvest test above and by the mutant check
+  // in this PR (removing the dispatch case makes both this and the harvest
+  // test fail with hook_intent_dropped in the tail).
   await withFixture(async (fixture) => {
     const output = await runHook("PostCompact", BASE_ENV(fixture), { session_id: "pc-283-empty" });
     assert.equal(output.continue, true);
 
     const tail = await auditTail(fixture.vault, 20);
+    assert.equal(
+      tail.text.trim(),
+      "",
+      "an empty compact_summary must write no audit row at all (no_summary_found is a silent no-op by design)",
+    );
+  });
+});
+
+// ── SEC-006: filterSafeVaultResults must actually be applied ───────────────
+
+test("UserPromptSubmit never surfaces a privacy:private vault note (SEC-006)", async () => {
+  await withFixture(async (fixture) => {
+    const dir = path.join(fixture.vault, "wiki", "concepts");
+    await mkdir(dir, { recursive: true });
+    const note = (name, privacy) =>
+      writeFile(
+        path.join(dir, name),
+        `---\ntitle: ${name}\nprivacy: ${privacy}\nstatus: accepted\n---\n\n# ${name}\n\nshared hook283 sec006 marker phrase\n`,
+        "utf8",
+      );
+    await note("safe-note.md", "safe");
+    await note("private-note.md", "private");
+
+    const output = await runHook("UserPromptSubmit", BASE_ENV(fixture), {
+      prompt: "shared hook283 sec006 marker phrase",
+    });
+    assert.equal(output.continue, true);
+
+    // Whether or not this turn crosses the "strong recall" threshold, the
+    // audit's vault_matches is built directly from the (post-filter)
+    // vaultResults array on BOTH the salient and nothing-salient paths — the
+    // most direct, threshold-independent signal that the filter actually ran.
+    const tail = await auditTail(fixture.vault, 20);
+    assert.match(tail.text, /safe-note\.md/, "the safe note must still be found and reported");
     assert.doesNotMatch(
       tail.text,
-      /hook_intent_dropped/,
-      "PostCompact has a real dispatch case now — an empty summary is a no-op harvest, not an unrouted event",
+      /private-note\.md/,
+      "SEC-006: a privacy:private note must never reach vault_matches, let alone the model-facing envelope",
     );
+
+    // If this turn happened to cross the strong-recall threshold on the safe
+    // note alone, the envelope's recall pointer / persisted recall-state must
+    // not name the private note either.
+    if (output.hookSpecificOutput?.additionalContext) {
+      const body = envelopeJson(output.hookSpecificOutput.additionalContext);
+      const pointer = body.recall_pointer ?? "";
+      assert.doesNotMatch(
+        pointer,
+        /private-note/,
+        "SEC-006: the private note must not leak into the model-facing recall pointer",
+      );
+    }
   });
 });
