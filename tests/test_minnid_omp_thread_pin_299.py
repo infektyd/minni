@@ -3,180 +3,287 @@ before any model import, plus the torch.set_num_threads(1) belt-and-suspenders
 pin in models.py — the fix for the libomp fork-barrier SIGSEGV crash-loop that
 #284's CPU pin exposed.
 
-These reuse the real _run_main_with_stub_loop harness from
-test_r7_retrieval_integrity.py (main() runs for real against a stub event
-loop; only DB/socket/signal/logging side effects are stubbed) rather than
-grepping main()'s source text — the same lesson that harness itself documents
-("Campaign scar") applies here: a setdefault call wrapped in `if False:`
-would still appear in the source but would set nothing.
+Every assertion here is about PROCESS-GLOBAL NATIVE STATE, so every test runs
+in a fresh child process (#321).
+
+The first cut of this file ran main() and loaded torch in-process, and that
+made the full suite segfault. The mechanism is the one #299 itself documents:
+env vars bind at native LOAD time, so `os.environ.setdefault("OMP_NUM_THREADS",
+"1")` is correct and sufficient in the daemon — main() runs before any model
+import — but inert in a pytest process where earlier tests have already
+imported torch and faiss, each carrying its own bundled libomp (the double load
+that KMP_DUPLICATE_LIB_OK=TRUE masks). These tests then drove
+torch.set_num_threads() up and down and loaded a real sentence-transformers
+model on top of that, and the process died later in the run:
+
+    full suite                                  -> Fatal Python error: Segmentation fault
+    full suite --ignore=<this file>             -> 2237 passed, 7 skipped
+    this file ALONE                             ->    6 passed
+    this file + tests/test_pr2_envelope.py      ->   60 passed
+
+That is, the file passed in isolation and killed the suite in aggregate — it
+needed the accumulated imports of the earlier tests. The crash surfaced in an
+unrelated victim (tests/test_pr2_envelope.py, ~54% in, tqdm_monitor thread).
+
+A child process is also the daemon's REAL shape: main() genuinely does run
+before any model import there, so asserting the pin in a fresh process tests
+what production does rather than an artifact of test ordering. The alternative
+— skipping when torch/faiss are already imported — would have quietly stopped
+testing anything on a normal full run, which is the silent-no-op class this
+campaign exists to remove.
+
+Assertions remain behavioural: the child's real os.environ and torch's real
+reported thread count, never a grep of main()'s source text.
 """
 
 from __future__ import annotations
 
+import json
 import os
+import subprocess
 import sys
+import textwrap
 
 import pytest
 
-sys.path.insert(0, os.path.dirname(__file__))
-from test_r7_retrieval_integrity import _run_main_with_stub_loop  # noqa: E402
-
+_TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
+_SRC_DIR = os.path.join(os.path.dirname(_TESTS_DIR), "src")
 _OMP_VARS = ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "VECLIB_MAXIMUM_THREADS")
 
+# Children may import torch / sentence-transformers against a cold model cache.
+_CHILD_TIMEOUT = 600
 
-@pytest.fixture(autouse=True)
-def _clear_omp_env():
-    """Every test in this file starts from a clean slate for the three vars,
-    and restores whatever this process had (usually absent) afterward.
 
-    monkeypatch.delenv(raising=False) does NOT register an undo entry when
-    the var was already absent, so a test that later calls the real main()
-    (which does os.environ.setdefault(...)) leaves the var set for every
-    test file that runs after this one in the same pytest process — a real
-    leak a cassandra pass caught. Snapshot/restore by hand instead.
+def _run_in_child(body: str, env_overrides: dict | None = None) -> dict:
+    """Run *body* in a fresh interpreter and return the dict it prints.
+
+    The body must print exactly one JSON object on a line prefixed with
+    ``RESULT:``. Anything else the child writes (model download chatter,
+    warnings) is ignored, so the contract does not depend on a clean stdout.
     """
-    saved = {name: os.environ.pop(name, None) for name in _OMP_VARS}
-    try:
-        yield
-    finally:
-        for name, value in saved.items():
-            if value is None:
-                os.environ.pop(name, None)
-            else:
-                os.environ[name] = value
+    preamble = textwrap.dedent(
+        """
+        import json, os, sys
+        sys.path.insert(0, {tests_dir!r})
+        sys.path.insert(0, {src_dir!r})
 
+        def emit(payload):
+            print("RESULT:" + json.dumps(payload))
 
-def test_main_pins_omp_threading_before_model_import(monkeypatch, tmp_path):
-    """main() must set OMP_NUM_THREADS / MKL_NUM_THREADS / VECLIB_MAXIMUM_THREADS
-    to "1" as real process env vars — proven by running main() for real and
-    reading os.environ afterward, not by inspecting its source text."""
+        """
+    ).format(tests_dir=_TESTS_DIR, src_dir=_SRC_DIR)
+    script = preamble + textwrap.dedent(body)
+
+    env = dict(os.environ)
+    # The parent's own pins must never leak in, or a child could pass by
+    # inheriting a value main() never set.
     for name in _OMP_VARS:
-        assert name not in os.environ, f"test setup: {name} leaked from another test"
+        env.pop(name, None)
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    if env_overrides:
+        env.update(env_overrides)
 
-    _run_main_with_stub_loop(monkeypatch, tmp_path)
+    proc = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=_CHILD_TIMEOUT,
+        env=env,
+    )
+    marker = [ln for ln in proc.stdout.splitlines() if ln.startswith("RESULT:")]
+    if not marker:
+        pytest.fail(
+            "child process produced no RESULT line "
+            f"(exit {proc.returncode})\nstdout:\n{proc.stdout[-2000:]}\n"
+            f"stderr:\n{proc.stderr[-2000:]}"
+        )
+    return json.loads(marker[-1][len("RESULT:"):])
+
+
+# ---------------------------------------------------------------------------
+# main() pins the three env vars
+# ---------------------------------------------------------------------------
+
+_MAIN_BODY = """
+    import pathlib, tempfile
+    import pytest
+    from test_r7_retrieval_integrity import _run_main_with_stub_loop
+
+    # The real harness — main() runs for real against a stub event loop, with
+    # only DB/socket/signal/logging side effects stubbed. Reused rather than
+    # reimplemented so this cannot drift from what the daemon actually does.
+    with pytest.MonkeyPatch.context() as mp:
+        _run_main_with_stub_loop(mp, pathlib.Path(tempfile.mkdtemp()))
+
+    emit({name: os.environ.get(name) for name in %r})
+""" % (_OMP_VARS,)
+
+
+def test_main_pins_omp_threading_before_model_import():
+    """main() must set all three vars to "1" as real process env vars, proven
+    by running main() for real in a fresh process and reading os.environ
+    there."""
+    seen = _run_in_child(_MAIN_BODY)
 
     for name in _OMP_VARS:
-        assert os.environ.get(name) == "1", (
+        assert seen.get(name) == "1", (
             f"main() must pin {name}=1 before any torch/faiss/sentence-transformers "
-            f"import can occur (#299 libomp fork-barrier SIGSEGV)"
+            f"import can occur (#299 libomp fork-barrier SIGSEGV); child saw {seen}"
         )
 
 
-def test_main_preserves_an_explicit_operator_override(monkeypatch, tmp_path):
+def test_main_preserves_an_explicit_operator_override():
     """setdefault, not a hard overwrite: an operator who set OMP_NUM_THREADS=4
     in the launchd plist env block must keep that choice."""
-    monkeypatch.setenv("OMP_NUM_THREADS", "4")
+    seen = _run_in_child(_MAIN_BODY, env_overrides={"OMP_NUM_THREADS": "4"})
 
-    _run_main_with_stub_loop(monkeypatch, tmp_path)
-
-    assert os.environ.get("OMP_NUM_THREADS") == "4", (
-        "main() must not clobber an explicit operator override with setdefault"
+    assert seen.get("OMP_NUM_THREADS") == "4", (
+        "main() must not clobber an explicit operator override with setdefault; "
+        f"child saw {seen}"
     )
-    # The other two vars were not overridden, so they still get pinned.
-    assert os.environ.get("MKL_NUM_THREADS") == "1"
-    assert os.environ.get("VECLIB_MAXIMUM_THREADS") == "1"
+    # The other two were not overridden, so they still get pinned.
+    assert seen.get("MKL_NUM_THREADS") == "1"
+    assert seen.get("VECLIB_MAXIMUM_THREADS") == "1"
 
 
-def test_pin_torch_threads_for_cpu_sets_single_thread(monkeypatch):
+def test_the_child_harness_would_notice_an_unpinned_main():
+    """Guards the guard. If a child ever stopped running main() — a swallowed
+    import error, a harness signature change — the assertions above would read
+    a clean env and could pass for the wrong reason. Here no main() runs, so
+    the vars must be absent; if this ever goes green with values set, the
+    parent's environment is leaking into children and the tests above are
+    vacuous."""
+    body = "emit({name: os.environ.get(name) for name in %r})" % (_OMP_VARS,)
+    seen = _run_in_child(body)
+
+    assert seen == {name: None for name in _OMP_VARS}, (
+        f"a child that never calls main() must see no pins; got {seen}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# models.py's torch pin
+# ---------------------------------------------------------------------------
+#
+# These do not call main(), but they assert torch's process-global thread pool
+# and one of them loads a real sentence-transformers model. Running them in the
+# parent is what put torch's libomp and faiss's libomp in one process under
+# thread churn, so they are children too.
+
+
+def _torch_child(body: str) -> dict:
+    """Run a torch-dependent body in a child, reporting unavailability back to
+    the parent rather than failing on an environment without torch."""
+    prelude = """
+    try:
+        import torch
+    except Exception as exc:
+        emit({"skip": "torch unavailable: %s" % exc})
+        raise SystemExit(0)
+    import minni.models as models
+"""
+    return _run_in_child(textwrap.dedent(prelude) + textwrap.dedent(body))
+
+
+def _skip_if_requested(result: dict) -> dict:
+    if "skip" in result:
+        pytest.skip(result["skip"])
+    return result
+
+
+def test_pin_torch_threads_for_cpu_sets_single_thread():
     """The models.py belt-and-suspenders pin: when CPU inference is actually
     resolved, torch.set_num_threads(1) is really called — checked against
     torch's own reported thread count, not a mock call assertion."""
-    torch = pytest.importorskip("torch")
-    import minni.models as models
+    result = _skip_if_requested(_torch_child("""
+    models._TORCH_THREADS_PINNED = False
+    torch.set_num_threads(3)  # fixed non-1 baseline
+    before = torch.get_num_threads()
 
-    monkeypatch.setattr(models, "_TORCH_THREADS_PINNED", False)
-    original = torch.get_num_threads()
-    try:
-        torch.set_num_threads(3)  # fixed non-1 baseline, not derived from `original`
-        assert torch.get_num_threads() != 1
+    models._pin_torch_threads_for_cpu_once("cpu")
 
-        models._pin_torch_threads_for_cpu_once("cpu")
+    emit({"before": before, "after": torch.get_num_threads()})
+"""))
 
-        assert torch.get_num_threads() == 1, (
-            "_pin_torch_threads_for_cpu_once('cpu') must actually call "
-            "torch.set_num_threads(1)"
-        )
-    finally:
-        torch.set_num_threads(original if original > 0 else 1)
+    assert result["before"] != 1, "test setup: the baseline must not already be 1"
+    assert result["after"] == 1, (
+        "_pin_torch_threads_for_cpu_once('cpu') must actually call "
+        f"torch.set_num_threads(1); got {result}"
+    )
 
 
-def test_pin_torch_threads_is_noop_when_not_cpu(monkeypatch):
+def test_pin_torch_threads_is_noop_when_not_cpu():
     """Batch tools (indexer/backfill) keep MPS auto-select and default
     threading — the pin must not fire when device is not 'cpu'."""
-    torch = pytest.importorskip("torch")
-    import minni.models as models
+    result = _skip_if_requested(_torch_child("""
+    models._TORCH_THREADS_PINNED = False
+    torch.set_num_threads(3)
+    before = torch.get_num_threads()
 
-    monkeypatch.setattr(models, "_TORCH_THREADS_PINNED", False)
-    original = torch.get_num_threads()
-    try:
-        torch.set_num_threads(3)
-        before = torch.get_num_threads()
+    models._pin_torch_threads_for_cpu_once("mps")
+    models._pin_torch_threads_for_cpu_once(None)
 
-        models._pin_torch_threads_for_cpu_once("mps")
-        models._pin_torch_threads_for_cpu_once(None)
+    emit({"before": before, "after": torch.get_num_threads()})
+"""))
 
-        assert torch.get_num_threads() == before, (
-            "the pin must be a no-op for non-CPU device resolutions"
-        )
-    finally:
-        torch.set_num_threads(original if original > 0 else 1)
+    assert result["after"] == result["before"], (
+        f"the pin must be a no-op for non-CPU device resolutions; got {result}"
+    )
 
 
-def test_get_embedder_actually_wires_the_pin_call(monkeypatch):
-    """The unit tests above call _pin_torch_threads_for_cpu_once directly,
-    which would stay green even if the call were deleted from get_embedder()
-    itself. This test goes through the real get_embedder() call site — the
-    thing #299 actually needs wired — and checks torch's real thread count
-    as a side effect, not a mock/spy assertion on the call."""
-    torch = pytest.importorskip("torch")
-    pytest.importorskip("sentence_transformers")
-    import minni.models as models
-
-    models.get_embedder.cache_clear()
-    monkeypatch.setattr(models, "_TORCH_THREADS_PINNED", False)
-    monkeypatch.setenv("MINNI_MODEL_DEVICE", "cpu")
-    original = torch.get_num_threads()
-    try:
-        # A fixed non-1 baseline, not max(2, original): if this process's
-        # thread pool were ever legitimately 1 already, max(2, 1) still
-        # works, but pin the baseline explicitly so the "!= 1" assertion
-        # below can't be vacuously true regardless of what torch reports.
-        torch.set_num_threads(3)
-        assert torch.get_num_threads() != 1
-
-        model = models.get_embedder()
-
-        if model is None:
-            pytest.skip("get_embedder() returned None (model load unavailable in this env)")
-        assert torch.get_num_threads() == 1, (
-            "get_embedder() resolved device='cpu' but did not wire the "
-            "_pin_torch_threads_for_cpu_once call — the belt-and-suspenders "
-            "pin never fired for real"
-        )
-    finally:
-        torch.set_num_threads(original if original > 0 else 1)
-        models.get_embedder.cache_clear()
-
-
-def test_pin_torch_threads_only_pins_once(monkeypatch):
+def test_pin_torch_threads_only_pins_once():
     """_TORCH_THREADS_PINNED must actually gate re-entry: a caller that resets
     torch's thread count after the first pin should not be silently re-pinned
     by a second get_embedder()-shaped call within the same process."""
-    torch = pytest.importorskip("torch")
-    import minni.models as models
+    result = _skip_if_requested(_torch_child("""
+    models._TORCH_THREADS_PINNED = False
 
-    monkeypatch.setattr(models, "_TORCH_THREADS_PINNED", False)
-    original = torch.get_num_threads()
+    models._pin_torch_threads_for_cpu_once("cpu")
+    first = torch.get_num_threads()
+
+    torch.set_num_threads(3)
+    models._pin_torch_threads_for_cpu_once("cpu")
+
+    emit({"first": first, "second": torch.get_num_threads()})
+"""))
+
+    assert result["first"] == 1, "the first call must pin"
+    assert result["second"] != 1, (
+        "a second call after the guard is set must be a no-op, proving "
+        f"_TORCH_THREADS_PINNED is actually read, not just written; got {result}"
+    )
+
+
+def test_get_embedder_actually_wires_the_pin_call():
+    """The unit tests above call _pin_torch_threads_for_cpu_once directly,
+    which would stay green even if the call were deleted from get_embedder()
+    itself. This goes through the real get_embedder() call site — the thing
+    #299 actually needs wired — and checks torch's real thread count as a side
+    effect, not a mock/spy assertion on the call."""
+    result = _skip_if_requested(_torch_child("""
     try:
-        models._pin_torch_threads_for_cpu_once("cpu")
-        assert torch.get_num_threads() == 1
+        import sentence_transformers  # noqa: F401
+    except Exception as exc:
+        emit({"skip": "sentence_transformers unavailable: %s" % exc})
+        raise SystemExit(0)
 
-        torch.set_num_threads(3)
-        models._pin_torch_threads_for_cpu_once("cpu")
+    models.get_embedder.cache_clear()
+    models._TORCH_THREADS_PINNED = False
+    os.environ["MINNI_MODEL_DEVICE"] = "cpu"
+    torch.set_num_threads(3)
+    before = torch.get_num_threads()
 
-        assert torch.get_num_threads() != 1, (
-            "a second call after the guard is set must be a no-op, proving "
-            "_TORCH_THREADS_PINNED is actually read, not just written"
-        )
-    finally:
-        torch.set_num_threads(original if original > 0 else 1)
+    model = models.get_embedder()
+    if model is None:
+        emit({"skip": "get_embedder() returned None (model load unavailable)"})
+        raise SystemExit(0)
+
+    emit({"before": before, "after": torch.get_num_threads()})
+"""))
+
+    assert result["before"] != 1, "test setup: the baseline must not already be 1"
+    assert result["after"] == 1, (
+        "get_embedder() resolved device='cpu' but did not wire the "
+        "_pin_torch_threads_for_cpu_once call — the belt-and-suspenders pin "
+        f"never fired for real; got {result}"
+    )
