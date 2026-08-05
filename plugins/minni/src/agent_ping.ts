@@ -94,7 +94,14 @@ function agentEnvKey(agentId: string): string {
   return agentId.toUpperCase().replace(/[^A-Z0-9]+/g, "_").replace(/^_+|_+$/g, "");
 }
 
-function defaultAgentVault(agentId: string): string {
+// #298 (June audit F8): exported so team-vault-bootstrap.ts's apprentice
+// promotion writer can compute the SAME slug this reader resolves to,
+// instead of maintaining its own independent transform. Two copies of a
+// slug algorithm drift the moment either one is edited alone — this was
+// exactly that: the writer wrote to sovereignRoot/agents/<its-own-slug>-vault
+// while every reader here resolved <homedir>/.minni/<this-slug>-vault, so a
+// promoted apprentice's vault was written where nothing reads it.
+export function agentIdToVaultSlug(agentId: string): string {
   const aliases: Record<string, string> = {
     "claude-code": "claudecode",
     claudecode: "claudecode",
@@ -110,13 +117,22 @@ function defaultAgentVault(agentId: string): string {
     "grok-beta": "grok-beta",
     grok: "grok",
   };
-  const slug = aliases[agentId] ?? (agentId.toLowerCase().replace(/[^a-z0-9]+/g, "") || "agent");
+  return aliases[agentId] ?? (agentId.toLowerCase().replace(/[^a-z0-9]+/g, "") || "agent");
+}
+
+function defaultAgentVault(agentId: string): string {
+  const slug = agentIdToVaultSlug(agentId);
   return path.join(os.homedir(), ".minni", `${slug}-vault`);
 }
 
-export function resolveAgentVaultPath(agentId: string): string {
-  if (agentId === DEFAULT_AGENT_ID) return DEFAULT_VAULT_PATH;
-
+// #298 review round: an operator-set MINNI_AGENT_VAULTS / MINNI_<ID>_VAULT_PATH
+// override was still invisible to bootstrapApprenticeVault even after the
+// slug/shape unification above — it would write to sovereignRoot/<slug>-vault
+// regardless, leaving the exact bug this issue is about alive under an
+// override. Exported so the writer can check for one BEFORE falling back to
+// its own sovereignRoot-relative default, the same precedence order
+// resolveAgentVaultPath itself uses below.
+export function resolveAgentVaultPathOverride(agentId: string): string | undefined {
   const mappingRaw = process.env.MINNI_AGENT_VAULTS;
   if (mappingRaw) {
     try {
@@ -132,7 +148,12 @@ export function resolveAgentVaultPath(agentId: string): string {
 
   const envValue = process.env[`MINNI_${agentEnvKey(agentId)}_VAULT_PATH`];
   if (envValue?.trim()) return path.resolve(envValue.replace(/^~(?=$|\/)/, os.homedir()));
-  return defaultAgentVault(agentId);
+  return undefined;
+}
+
+export function resolveAgentVaultPath(agentId: string): string {
+  if (agentId === DEFAULT_AGENT_ID) return DEFAULT_VAULT_PATH;
+  return resolveAgentVaultPathOverride(agentId) ?? defaultAgentVault(agentId);
 }
 
 function agentPingDir(vaultPath: string, box: "inbox" | "outbox"): string {
