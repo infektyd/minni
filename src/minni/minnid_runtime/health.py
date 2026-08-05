@@ -633,8 +633,19 @@ def handle_health_report(params: dict, request_id: Any, context: HealthContext) 
                 count_unusable_compact_files,
             )
 
+            # Same fallback the drain and the pass use — see
+            # count_unusable_compact_files' docstring on why this is required
+            # rather than defaulted.
+            _cons = (
+                (getattr(context.default_config, "afm_loop_schedule", {}) or {})
+                .get("passes", {})
+                .get("consolidation", {})
+            ) or {}
             lifecycle["compact_distillation_unusable"] = count_unusable_compact_files(
                 config=context.default_config,
+                fallback_principal=str(
+                    _cons.get("inbox_fallback_principal", "unknown")
+                ),
             )
         except Exception as exc:
             # Replace the sub-dict, matching the sibling blocks: leaving the

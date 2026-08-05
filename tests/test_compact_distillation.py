@@ -593,10 +593,10 @@ def test_unusable_count_clears_when_the_file_is_removed(tmp_path):
     inbox.mkdir(parents=True)
     bad = inbox / "c1.json"
     bad.write_text("{oops", encoding="utf-8")
-    assert count_unusable_compact_files([inbox])["files"] == 1
+    assert count_unusable_compact_files([inbox], fallback_principal="unknown")["files"] == 1
 
     bad.unlink()
-    assert count_unusable_compact_files([inbox])["files"] == 0
+    assert count_unusable_compact_files([inbox], fallback_principal="unknown")["files"] == 0
 
 
 def test_unusable_count_ignores_readable_files(tmp_path):
@@ -604,10 +604,17 @@ def test_unusable_count_ignores_readable_files(tmp_path):
 
     inbox = tmp_path / "codex-vault" / "inbox"
     inbox.mkdir(parents=True)
+    # summary_TEXT is the field the pass reads; a file carrying only
+    # "summary" has no usable content and is correctly counted (#336).
     (inbox / "ok.json").write_text(
-        json.dumps({"kind": "compact_summary", "summary": "x"}), encoding="utf-8",
+        json.dumps({
+            "kind": "compact_summary",
+            "agent_id": "codex",
+            "summary_text": "a real summary",
+        }),
+        encoding="utf-8",
     )
-    assert count_unusable_compact_files([inbox])["files"] == 0
+    assert count_unusable_compact_files([inbox], fallback_principal="codex")["files"] == 0
 
 
 def test_health_unusable_block_degrades_to_unknown_not_zero(tmp_path, monkeypatch):

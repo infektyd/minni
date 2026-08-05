@@ -637,6 +637,13 @@ def _real_lifecycle_db(tmp_path, monkeypatch):
     monkeypatch.setattr(
         cfg_mod.DEFAULT_CONFIG, "CANONICAL_SOVEREIGN_HOME", str(tmp_path), raising=False
     )
+    # discover_inboxes() also returns the daemon's OWN <vault_path>/inbox, and
+    # DEFAULT_CONFIG.vault_path is the real ~/.minni/vault — so without this a
+    # health test reads the operator's live inbox and its result depends on
+    # whatever is sitting there.
+    monkeypatch.setattr(
+        cfg_mod.DEFAULT_CONFIG, "vault_path", str(tmp_path / "vault"), raising=False
+    )
     monkeypatch.setattr(db_mod, "_migrations_run", False, raising=False)
     monkeypatch.setattr(minnid, "SovereignDB", db_mod.SovereignDB)
     return db_path
