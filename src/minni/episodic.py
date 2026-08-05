@@ -65,29 +65,57 @@ def reconcile_episodic_fts(conn: sqlite3.Connection) -> Dict[str, int]:
         logger.debug("reconcile_episodic_fts: episodic tables absent — no-op")
         return {"missing_before": 0, "inserted": 0}
 
-    # `event_id IS NOT NULL` is load-bearing, not defensive noise: episodic_fts
-    # stores event_id as an UNINDEXED fts5 column, which has no affinity and no
-    # NOT NULL constraint. A single NULL in that column makes `NOT IN` evaluate
-    # to NULL for every candidate row, and the backfill would silently insert
-    # nothing while reporting success.
-    indexed_ids = (
-        "SELECT CAST(event_id AS INTEGER) FROM episodic_fts"
-        " WHERE event_id IS NOT NULL"
+    # #287: "missing" is defined on event_id AND agent_id, matching
+    # episodic_index_coverage's "indexed" predicate exactly. Keying the repair
+    # set on event_id alone made the two disagree: an index row filed under the
+    # wrong agent_id counted as present here (nothing to repair) while the
+    # metric counted it as uncovered, so the ratio sat below 1.0 and no number
+    # of sweeps could move it — reproduced as missing_before: 0 against a stuck
+    # ratio of 0.0, with the event invisible to its owner through
+    # search_episodic and still returned to the wrong agent. A repair set that
+    # cannot close the gap its own metric reports is worse than no repair: it
+    # reports success forever.
+    #
+    # `agent_id IS e.agent_id` rather than `=`: episodic_fts.agent_id is an
+    # UNINDEXED fts5 column with no NOT NULL constraint, so a NULL there must
+    # compare false against a real agent rather than yielding NULL.
+    #
+    # The event_id NULL guard below is load-bearing for the same reason it was
+    # in the original: episodic_fts.event_id has no affinity and no NOT NULL, so
+    # a NULL would poison a NOT IN. This formulation uses NOT EXISTS, which is
+    # NULL-safe by construction, and the guard stays as documentation of the
+    # hazard for anyone who refactors it back.
+    unmatched = (
+        "NOT EXISTS (SELECT 1 FROM episodic_fts f"
+        "            WHERE f.event_id IS NOT NULL"
+        "              AND CAST(f.event_id AS INTEGER) = e.event_id"
+        "              AND f.agent_id IS e.agent_id)"
     )
     missing_before = conn.execute(
-        f"SELECT COUNT(*) FROM episodic_events"
-        f" WHERE content IS NOT NULL AND event_id NOT IN ({indexed_ids})"
+        f"SELECT COUNT(*) FROM episodic_events e"
+        f" WHERE e.content IS NOT NULL AND {unmatched}"
     ).fetchone()[0]
 
     if not missing_before:
         return {"missing_before": 0, "inserted": 0}
 
+    # Stale rows for the repaired events are removed first, so an event whose
+    # index row carries the wrong agent ends with exactly one correct row rather
+    # than two contradictory ones. Events already matching on both columns are
+    # not in the repair set, so their rows are never touched.
+    conn.execute(
+        f"""DELETE FROM episodic_fts
+             WHERE event_id IS NOT NULL
+               AND CAST(event_id AS INTEGER) IN (
+                   SELECT e.event_id FROM episodic_events e
+                    WHERE e.content IS NOT NULL AND {unmatched})"""
+    )
     cur = conn.execute(
         f"""INSERT INTO episodic_fts(event_id, agent_id, content)
-            SELECT event_id, agent_id, content
-              FROM episodic_events
-             WHERE content IS NOT NULL
-               AND event_id NOT IN ({indexed_ids})"""
+            SELECT e.event_id, e.agent_id, e.content
+              FROM episodic_events e
+             WHERE e.content IS NOT NULL
+               AND {unmatched}"""
     )
     inserted = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
     logger.info(
