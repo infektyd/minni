@@ -564,15 +564,21 @@ test("UserPromptSubmit (#313): a private-heavy vault must not crowd a lower-rank
     assert.equal(output.continue, true);
 
     const tail = await auditTail(fixture.vault, 30);
-    assert.match(
-      tail.text,
-      /outranked-safe-note\.md/,
-      "#313: the safe note must still surface even though 8 higher-scored private notes outrank it",
+    // Parse the actual vault_matches array rather than pattern-matching the
+    // raw audit text — a filename substring could in principle match some
+    // other field, so pin the assertion to the field this fix targets.
+    const entry = tail.entries.find((e) => e.includes("hook_user_prompt_submit"));
+    assert.ok(entry, "expected a hook_user_prompt_submit audit entry for this turn");
+    const jsonBlock = entry.match(/```json\n([\s\S]*?)\n```/)?.[1];
+    assert.ok(jsonBlock, "expected the audit entry to carry a JSON details block");
+    const details = JSON.parse(jsonBlock);
+    assert.ok(
+      Array.isArray(details.vault_matches) && details.vault_matches.includes("wiki/concepts/outranked-safe-note.md"),
+      `#313: the safe note must still surface even though 8 higher-scored private notes outrank it (got vault_matches: ${JSON.stringify(details.vault_matches)})`,
     );
     for (let i = 0; i < 8; i++) {
-      assert.doesNotMatch(
-        tail.text,
-        new RegExp(`decoy-${i}\\.md`),
+      assert.ok(
+        !details.vault_matches.includes(`wiki/concepts/decoy-${i}.md`),
         `SEC-006: decoy-${i}.md is privacy:private and must never reach vault_matches`,
       );
     }

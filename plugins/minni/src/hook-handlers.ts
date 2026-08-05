@@ -1214,8 +1214,17 @@ export function createHookHandlers(
     // truncation. Over-fetch a wider pre-filter set, filter, THEN slice to
     // the actual 6 this call site has always exposed downstream (recall
     // pointer, recall-state top_hits, PreToolUse deny-reason text) — same
-    // external cap, same behavior for the common case, closes the gap only
-    // when non-safe notes were crowding the raw top-N.
+    // external cap, same behavior for the common case.
+    //
+    // NARROWS the gap, does not close it: a vault where 19+ non-safe notes
+    // (frontmatter-authored OR heuristic-escalated — see task.ts
+    // privacyForSource, a materially larger population than just explicit
+    // `privacy: private` notes) all outscore the safe match reproduces the
+    // identical crowd-out, just needing more decoys. A durable fix would
+    // move the safe/non-safe gate inside searchVaultNotes itself, ahead of
+    // its own sort→slice, so no caller-side limit can ever crowd out a
+    // lower-scored safe note. Left as a follow-up (adversarial review
+    // finding) rather than expanding this fix's scope.
     const VAULT_RESULT_LIMIT = 6;
     const VAULT_SEARCH_OVERFETCH = 18;
     const [vaultResultsRaw, recall] = await Promise.all([
