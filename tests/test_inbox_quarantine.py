@@ -7,6 +7,7 @@ Follows the test_inbox_ingest.py / test_inbox_archive.py harness pattern
 """
 
 import json
+import sqlite3
 import os
 import sys
 from datetime import datetime, timezone
@@ -379,3 +380,473 @@ def test_health_report_quarantine_block_survives_recovery_redaction(tmp_path, mo
     rep = minnid._handle_health_report({"_recovery": True}, 1)["result"]
     assert "redacted" in rep
     assert rep["inbox_quarantine"]["count"] == 1, rep["inbox_quarantine"]
+
+
+# ── M4 (#229): the AFM dead-letter cohort gets a drain and a count ─────────
+
+import time as _time
+from pathlib import Path as _Path
+
+
+def _afm_file(inbox, name, *, age_days, payload=None):
+    inbox = _Path(inbox)
+    inbox.mkdir(parents=True, exist_ok=True)
+    path = inbox / name
+    body = payload if payload is not None else {
+        "trace_id": "t-1", "pass_name": "pruning", "proposals": [],
+    }
+    path.write_text(json.dumps(body), encoding="utf-8")
+    old = _time.time() - age_days * 86400
+    os.utime(path, (old, old))
+    return path
+
+
+def _moved(inbox):
+    return [q for q in (_Path(inbox) / "quarantine").glob("afm-*.json")
+            if not q.name.endswith(".reason.json")]
+
+
+def test_stale_afm_dead_letter_is_quarantined(tmp_path):
+    from minni.afm_passes.inbox_quarantine import quarantine_afm_dead_letter
+
+    inbox = tmp_path / "codex-vault" / "inbox"
+    _afm_file(inbox, "afm-pruning-2026-01-01.json", age_days=61.0)
+    _afm_file(inbox, "afm-drafts-2026-01-01.json", age_days=61.0)
+
+    result = quarantine_afm_dead_letter(None, [inbox], dry_run=False)
+
+    assert result["quarantined"] == 2
+    assert not list(inbox.glob("*.json"))
+    assert len(_moved(inbox)) == 2
+
+
+def test_fresh_afm_dead_letter_stays_inside_the_grace_window(tmp_path):
+    from minni.afm_passes.inbox_quarantine import quarantine_afm_dead_letter
+
+    inbox = tmp_path / "codex-vault" / "inbox"
+    _afm_file(inbox, "afm-pruning-2026-08-04.json", age_days=0.5)
+
+    assert quarantine_afm_dead_letter(None, [inbox], dry_run=False)["quarantined"] == 0
+    assert list(inbox.glob("*.json"))
+
+
+def test_afm_quarantine_writes_a_reason_sidecar(tmp_path):
+    from minni.afm_passes.inbox_quarantine import quarantine_afm_dead_letter
+
+    inbox = tmp_path / "codex-vault" / "inbox"
+    _afm_file(inbox, "afm-drafts-2026-01-01.json", age_days=61.0)
+    quarantine_afm_dead_letter(None, [inbox], dry_run=False)
+
+    sidecars = list((inbox / "quarantine").glob("*.reason.json"))
+    assert len(sidecars) == 1
+    assert json.loads(sidecars[0].read_text())["reason"] == "_afm_dead_letter"
+
+
+def test_afm_dead_letter_drain_never_deletes(tmp_path):
+    """Contract: os.replace only — the payload survives for inspection."""
+    from minni.afm_passes.inbox_quarantine import quarantine_afm_dead_letter
+
+    inbox = tmp_path / "codex-vault" / "inbox"
+    _afm_file(inbox, "afm-pruning-2026-01-01.json", age_days=61.0,
+              payload={"pass_name": "pruning", "proposals": [{"keep": "me"}]})
+    quarantine_afm_dead_letter(None, [inbox], dry_run=False)
+
+    assert json.loads(_moved(inbox)[0].read_text())["proposals"] == [{"keep": "me"}]
+
+
+def test_afm_named_file_with_a_reader_shape_is_left_alone(tmp_path):
+    """Kind-LESS on purpose: that is the branch _is_stop_candidate_shape
+    guards. Such a file IS ingested, so moving it would be data loss."""
+    from minni.afm_passes.inbox_quarantine import quarantine_afm_dead_letter
+
+    inbox = tmp_path / "codex-vault" / "inbox"
+    _afm_file(inbox, "afm-drafts-2026-01-01.json", age_days=61.0,
+              payload={"slug": "s", "last_task": "t", "candidates": ["c"]})
+
+    assert quarantine_afm_dead_letter(None, [inbox], dry_run=False)["quarantined"] == 0
+    assert list(inbox.glob("afm-drafts-*.json"))
+
+
+def test_afm_file_with_an_explicit_kind_is_left_alone(tmp_path):
+    from minni.afm_passes.inbox_quarantine import quarantine_afm_dead_letter
+
+    inbox = tmp_path / "codex-vault" / "inbox"
+    _afm_file(inbox, "afm-drafts-2026-01-01.json", age_days=61.0,
+              payload={"kind": "stop_candidates", "candidates": ["x"], "agent_id": "codex"})
+
+    assert quarantine_afm_dead_letter(None, [inbox], dry_run=False)["quarantined"] == 0
+
+
+def test_drain_is_scoped_to_the_afm_names_only(tmp_path):
+    """_unrecognized is not drained as a CLASS: an unknown kind is not proof a
+    file is unreadable."""
+    from minni.afm_passes.inbox_quarantine import (
+        count_afm_dead_letter,
+        quarantine_afm_dead_letter,
+    )
+
+    inbox = tmp_path / "codex-vault" / "inbox"
+    _afm_file(inbox, "some-other-writer-2026-01-01.json", age_days=61.0,
+              payload={"pass_name": "mystery", "rows": []})
+
+    assert quarantine_afm_dead_letter(None, [inbox], dry_run=False)["quarantined"] == 0
+    assert count_afm_dead_letter([inbox])["files"] == 0
+    assert list(inbox.glob("some-other-writer-*.json"))
+
+
+def test_afm_dead_letter_dry_run_moves_nothing(tmp_path):
+    from minni.afm_passes.inbox_quarantine import quarantine_afm_dead_letter
+
+    inbox = tmp_path / "codex-vault" / "inbox"
+    _afm_file(inbox, "afm-pruning-2026-01-01.json", age_days=61.0)
+
+    result = quarantine_afm_dead_letter(None, [inbox], dry_run=True)
+    assert result["would_quarantine"] == 1
+    assert result["quarantined"] == 0
+    assert list(inbox.glob("*.json"))
+
+
+def test_afm_backlog_is_countable_without_draining(tmp_path):
+    from minni.afm_passes.inbox_quarantine import count_afm_dead_letter
+
+    inbox = tmp_path / "codex-vault" / "inbox"
+    _afm_file(inbox, "afm-pruning-2026-01-01.json", age_days=61.0)
+    _afm_file(inbox, "afm-drafts-2026-08-04.json", age_days=0.5)
+
+    stats = count_afm_dead_letter([inbox])
+    assert stats["files"] == 2
+    assert stats["oldest_age_days"] >= 60.0
+    assert len(list(inbox.glob("*.json"))) == 2
+
+
+def test_afm_backlog_count_is_zero_on_a_clean_inbox(tmp_path):
+    from minni.afm_passes.inbox_quarantine import count_afm_dead_letter
+
+    inbox = tmp_path / "codex-vault" / "inbox"
+    inbox.mkdir(parents=True)
+    stats = count_afm_dead_letter([inbox])
+    assert stats["files"] == 0
+    assert stats["oldest_age_days"] is None
+
+
+def test_afm_backlog_count_ignores_already_quarantined_files(tmp_path):
+    """quarantine/ is out of the live inbox; counting it would leave the
+    backlog permanently non-zero after a successful drain."""
+    from minni.afm_passes.inbox_quarantine import (
+        count_afm_dead_letter,
+        quarantine_afm_dead_letter,
+    )
+
+    inbox = tmp_path / "codex-vault" / "inbox"
+    _afm_file(inbox, "afm-pruning-2026-01-01.json", age_days=61.0)
+    quarantine_afm_dead_letter(None, [inbox], dry_run=False)
+
+    assert count_afm_dead_letter([inbox])["files"] == 0
+
+
+def test_afm_loop_drains_the_dead_letter_and_increments_its_counter(tmp_path, monkeypatch):
+    """The drain must be WIRED, not merely importable: a mutant that
+    disconnects it from afm_loop_runner otherwise passes the whole suite,
+    while 'M4 now has a drain path' is the central claim."""
+    import asyncio
+
+    import minni.obs as obs
+    from minni.minnid_runtime.afm import afm_loop_runner
+
+    from test_afm_loop_promotion import _loop_context  # noqa: E402
+    from test_afm_loop_promotion import _make_db as _make_loop_db  # noqa: E402
+
+    monkeypatch.setenv("MINNI_AFM_LOOP", "on")
+    monkeypatch.delenv("MINNI_AFM_MODE", raising=False)
+    monkeypatch.delenv("MINNI_AFM_PROVIDER_MODE", raising=False)
+
+    db_obj, cfg = _make_loop_db(tmp_path)
+    cons_cfg = cfg.afm_loop_schedule["passes"]["consolidation"]
+    cons_cfg["ingest_inbox"] = True
+    cons_cfg["inbox_quarantine_ttl_days"] = 14
+
+    inbox = tmp_path / "unknown-vault" / "inbox"
+    _afm_file(inbox, "afm-pruning-2026-01-01.json", age_days=61.0)
+
+    obs.METRICS.reset()
+    try:
+        ctx, _traces = _loop_context(db_obj, cfg, ticks=1)
+        asyncio.run(afm_loop_runner(ctx))
+
+        assert not (inbox / "afm-pruning-2026-01-01.json").exists()
+        assert (inbox / "quarantine" / "afm-pruning-2026-01-01.json").is_file()
+        snap = obs.metrics_snapshot()
+        assert snap.get("inbox_afm_dead_letter_quarantined_total") == 1, snap
+    finally:
+        obs.METRICS.reset()
+
+
+def _real_lifecycle_db(tmp_path, monkeypatch):
+    """A REAL migrated DB behind the health handler.
+
+    The _FakeCursor used by the quarantine tests returns a dict from
+    fetchone(), so count_orphaned_afm_review raised KeyError and the queue
+    half of the block never actually ran — every assertion about it was
+    vacuous, and mutants hard-coding the counts survived.
+    """
+    import minni.config as cfg_mod
+    import minni.db as db_mod
+    import minni.minnid as minnid
+
+    # Build via SovereignDB, not raw run_migrations: health_report reads
+    # columns the full initializer creates (contradicts_id and friends), so a
+    # migrations-only fixture degrades the whole report and hides the block
+    # under test.
+    db_path = tmp_path / "health.db"
+    cfg = cfg_mod.SovereignConfig(
+        db_path=str(db_path),
+        vault_path=str(tmp_path / "vault"),
+        graph_export_dir=str(tmp_path / "graphs"),
+        faiss_index_path=str(tmp_path / "f.faiss"),
+        writeback_enabled=False,
+    )
+    old_flag = db_mod._migrations_run
+    db_mod._migrations_run = False
+    try:
+        seed = db_mod.SovereignDB(cfg)
+        seed._get_conn()
+    finally:
+        db_mod._migrations_run = old_flag
+    with seed.cursor() as c:
+        c.execute(
+            """INSERT INTO candidate_packets
+               (candidate_id, principal, content, status, proposed_at)
+               VALUES (1, 'test', 'c', 'proposed', ?)""",
+            (_time.time() - 40 * 86400,),
+        )
+        c.execute(
+            """INSERT INTO candidate_packets
+               (candidate_id, principal, content, status, proposed_at)
+               VALUES (2, 'test', 'c', 'accepted', ?)""",
+            (_time.time(),),
+        )
+        c.execute(
+            """INSERT INTO consolidation_actions
+               (action_type, claim, category, status, created_at)
+               VALUES ('afm_review', '2', 'general', 'pending', ?)""",
+            (_time.time(),),
+        )
+    seed.close()
+
+    monkeypatch.setattr(cfg_mod.DEFAULT_CONFIG, "db_path", str(db_path), raising=False)
+    monkeypatch.setattr(
+        cfg_mod.DEFAULT_CONFIG, "CANONICAL_SOVEREIGN_HOME", str(tmp_path), raising=False
+    )
+    monkeypatch.setattr(db_mod, "_migrations_run", False, raising=False)
+    monkeypatch.setattr(minnid, "SovereignDB", db_mod.SovereignDB)
+    return db_path
+
+
+def test_health_report_surfaces_the_memory_lifecycle_queues(tmp_path, monkeypatch):
+    """M4/M5 (#229): each queue must appear on a health surface with a REAL
+    count — the live dead-letter backlog is only visible before it is drained,
+    and an orphaned fence is only visible if the DB half actually runs."""
+    import minni.minnid as minnid
+    from minni.principal import EffectivePrincipal
+
+    _real_lifecycle_db(tmp_path, monkeypatch)
+    inbox = tmp_path / "unknown-vault" / "inbox"
+    _afm_file(inbox, "afm-pruning-2026-01-01.json", age_days=61.0)
+    _afm_file(inbox, "afm-drafts-2026-01-01.json", age_days=61.0)
+
+    op = EffectivePrincipal(agent_id="main", capabilities=["*"])
+    rep = minnid._handle_health_report({"_recovery": False, "_principal": op}, 1)["result"]
+
+    ml = rep["memory_lifecycle"]
+    assert ml["afm_dead_letter"]["files"] == 2, ml
+    assert ml["afm_dead_letter"]["oldest_age_days"] >= 60.0, ml
+    assert ml["afm_review_orphans"] == 1, ml
+    assert ml["proposed_queue"]["depth"] == 1, ml
+    assert ml["proposed_queue"]["stale"] == 1, ml
+
+
+def test_memory_lifecycle_reports_unknown_rather_than_a_healthy_zero(tmp_path, monkeypatch):
+    """A scan that never ran must not read as '0 files' / 'depth 0'. Leaving
+    the zero-valued default in place is the overstatement this block exists
+    to remove."""
+    import minni.minnid as minnid
+    from minni.principal import EffectivePrincipal
+
+    _real_lifecycle_db(tmp_path, monkeypatch)
+
+    def _boom(*a, **k):
+        raise RuntimeError("scan failed")
+
+    monkeypatch.setattr(
+        "minni.afm_passes.inbox_quarantine.count_afm_dead_letter", _boom,
+    )
+
+    op = EffectivePrincipal(agent_id="main", capabilities=["*"])
+    rep = minnid._handle_health_report({"_recovery": False, "_principal": op}, 1)["result"]
+
+    dead = rep["memory_lifecycle"]["afm_dead_letter"]
+    assert dead["status"] == "unknown"
+    assert dead["error"] == "RuntimeError"
+    assert dead["files"] is None, "a failed scan must not report zero files"
+    # The independent DB half still succeeded.
+    assert rep["memory_lifecycle"]["afm_review_orphans"] == 1
+
+
+def test_memory_lifecycle_block_reports_no_paths(tmp_path, monkeypatch):
+    """Aggregate-only is a hard contract: this block sits OUTSIDE
+    _HEALTH_REPORT_SENSITIVE_KEYS, so it must never carry a filesystem path."""
+    import json as _json
+
+    import minni.minnid as minnid
+    from minni.principal import EffectivePrincipal
+
+    _real_lifecycle_db(tmp_path, monkeypatch)
+    inbox = tmp_path / "unknown-vault" / "inbox"
+    _afm_file(inbox, "afm-pruning-2026-01-01.json", age_days=61.0)
+
+    op = EffectivePrincipal(agent_id="main", capabilities=["*"])
+    rep = minnid._handle_health_report({"_recovery": False, "_principal": op}, 1)["result"]
+
+    blob = _json.dumps(rep["memory_lifecycle"])
+    assert str(tmp_path) not in blob
+    assert "afm-pruning" not in blob
+
+
+def test_a_corrupt_dead_letter_file_is_counted_and_drainable(tmp_path):
+    """Both writers do a non-atomic read-modify-write on the same dated file,
+    so a crash mid-write leaves a truncated payload. Skipping those made them
+    invisible to the count AND undrainable — permanently stuck, which is the
+    exact class this drain exists to remove."""
+    from minni.afm_passes.inbox_quarantine import (
+        count_afm_dead_letter,
+        quarantine_afm_dead_letter,
+    )
+
+    inbox = tmp_path / "codex-vault" / "inbox"
+    inbox.mkdir(parents=True)
+    good = _afm_file(inbox, "afm-drafts-2026-01-01.json", age_days=61.0)
+    truncated = inbox / "afm-drafts-2026-01-02.json"
+    truncated.write_text('{"pass_name": "drafts", "dra', encoding="utf-8")
+    listish = inbox / "afm-pruning-2026-01-03.json"
+    listish.write_text("[]", encoding="utf-8")
+    for p in (truncated, listish):
+        old = _time.time() - 61 * 86400
+        os.utime(p, (old, old))
+
+    stats = count_afm_dead_letter([inbox])
+    assert stats["files"] == 3, stats
+    assert stats["unreadable"] == 2, stats
+
+    result = quarantine_afm_dead_letter(None, [inbox], dry_run=False)
+    assert result["quarantined"] == 3
+    assert not list(inbox.glob("*.json")), "nothing may be left stuck"
+    assert good.name in {p.name for p in _moved(inbox)}
+
+    reasons = {
+        json.loads(s.read_text())["reason"]
+        for s in (inbox / "quarantine").glob("*.reason.json")
+    }
+    assert reasons == {"_afm_dead_letter", "_afm_dead_letter_unreadable"}
+
+
+def test_a_different_afm_prefixed_writer_is_left_alone(tmp_path):
+    """Scoped to the two NAMES, not to the `afm-` prefix: a future afm-* writer
+    that does have a reader must not be swept up by this drain."""
+    from minni.afm_passes.inbox_quarantine import (
+        count_afm_dead_letter,
+        quarantine_afm_dead_letter,
+    )
+
+    inbox = tmp_path / "codex-vault" / "inbox"
+    _afm_file(inbox, "afm-handoffs-2026-01-01.json", age_days=61.0)
+
+    assert quarantine_afm_dead_letter(None, [inbox], dry_run=False)["quarantined"] == 0
+    assert count_afm_dead_letter([inbox])["files"] == 0
+    assert list(inbox.glob("afm-handoffs-*.json"))
+
+
+def test_a_corrupt_non_afm_file_is_still_left_alone(tmp_path):
+    """Claiming unreadable files must not widen the drain past the two names."""
+    from minni.afm_passes.inbox_quarantine import (
+        count_afm_dead_letter,
+        quarantine_afm_dead_letter,
+    )
+
+    inbox = tmp_path / "codex-vault" / "inbox"
+    inbox.mkdir(parents=True)
+    other = inbox / "some-other-writer-2026-01-01.json"
+    other.write_text('{"truncated', encoding="utf-8")
+    old = _time.time() - 61 * 86400
+    os.utime(other, (old, old))
+
+    assert count_afm_dead_letter([inbox])["files"] == 0
+    assert quarantine_afm_dead_letter(None, [inbox], dry_run=False)["quarantined"] == 0
+    assert other.exists()
+
+
+def test_degraded_queue_half_reports_unknown_not_zero(tmp_path, monkeypatch):
+    """The DB half's failure shape needs its own pin: only the dead-letter
+    twin was covered, and a mutant restoring `orphans = 0` survived."""
+    import minni.minnid as minnid
+    from minni.principal import EffectivePrincipal
+
+    _real_lifecycle_db(tmp_path, monkeypatch)
+
+    def _boom(*a, **k):
+        raise RuntimeError("queue scan failed")
+
+    monkeypatch.setattr("minni.afm_review_markers.count_orphaned_afm_review", _boom)
+
+    op = EffectivePrincipal(agent_id="main", capabilities=["*"])
+    rep = minnid._handle_health_report({"_recovery": False, "_principal": op}, 1)["result"]
+
+    ml = rep["memory_lifecycle"]
+    assert ml["afm_review_orphans"] is None, "a scan that never ran is not zero"
+    assert ml["proposed_queue"]["status"] == "unknown"
+    assert ml["proposed_queue"]["depth"] is None
+    # The independent filesystem half still succeeded.
+    assert ml["afm_dead_letter"]["files"] == 0
+
+
+def test_a_corrupt_only_backlog_still_reaches_the_drain(tmp_path, monkeypatch):
+    """Bugbot #305: a corrupt file hits inbox_ingest's bare `continue` and
+    increments NO skip counter, so a drain gated solely on _unrecognized never
+    fires. With only corrupt files left, the very files the drain was taught to
+    claim became unreachable — they accumulate past TTL forever."""
+    import asyncio
+
+    import minni.obs as obs
+    from minni.minnid_runtime.afm import afm_loop_runner
+
+    from test_afm_loop_promotion import _loop_context  # noqa: E402
+    from test_afm_loop_promotion import _make_db as _make_loop_db  # noqa: E402
+
+    monkeypatch.setenv("MINNI_AFM_LOOP", "on")
+    monkeypatch.delenv("MINNI_AFM_MODE", raising=False)
+    monkeypatch.delenv("MINNI_AFM_PROVIDER_MODE", raising=False)
+
+    db_obj, cfg = _make_loop_db(tmp_path)
+    cons_cfg = cfg.afm_loop_schedule["passes"]["consolidation"]
+    cons_cfg["ingest_inbox"] = True
+    cons_cfg["inbox_quarantine_ttl_days"] = 14
+
+    inbox = tmp_path / "unknown-vault" / "inbox"
+    inbox.mkdir(parents=True)
+    # ONLY corrupt files: nothing here can increment _unrecognized.
+    truncated = inbox / "afm-drafts-2026-01-01.json"
+    truncated.write_text('{"pass_name": "drafts", "dra', encoding="utf-8")
+    listish = inbox / "afm-pruning-2026-01-02.json"
+    listish.write_text("[]", encoding="utf-8")
+    old = _time.time() - 61 * 86400
+    for p in (truncated, listish):
+        os.utime(p, (old, old))
+
+    obs.METRICS.reset()
+    try:
+        ctx, _traces = _loop_context(db_obj, cfg, ticks=1)
+        asyncio.run(afm_loop_runner(ctx))
+
+        assert not list(inbox.glob("*.json")), "corrupt files must still be drained"
+        assert (inbox / "quarantine" / truncated.name).is_file()
+    finally:
+        obs.METRICS.reset()

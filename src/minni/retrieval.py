@@ -43,6 +43,7 @@ from minni.query_expand import summarize_with_afm
 from minni.principal import EffectivePrincipal, agent_scope_for, can_read_document  # type: ignore
 from minni.safety import is_instruction_like
 from minni.timestamps import parse_epoch_or_report
+from minni.wiki_indexer import WikiFrontmatter
 
 logger = logging.getLogger("sovereign.retrieval")
 
@@ -2904,6 +2905,13 @@ class RetrievalEngine:
         # the backlog fills the window before any active draft.
         if not include_expired:
             skip_statuses.add("expired")
+        # #229 M6: statuses that are valid but deliberately non-recallable
+        # (a completed plan). The excluded page keeps its documents row so
+        # wikilinks and doc_id references survive, so recall — not the
+        # indexer — is what must keep it out of results. No include_* flag:
+        # unlike superseded/rejected/draft/expired there is no review surface
+        # that wants them back.
+        skip_statuses.update(WikiFrontmatter.EXCLUDED_STATUSES)
         skip_list = sorted(skip_statuses)
 
         def _drop_skipped(rows: List[Dict]) -> List[Dict]:

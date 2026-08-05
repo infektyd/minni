@@ -319,6 +319,15 @@ def handle_health_report(params: dict, request_id: Any, context: HealthContext) 
         # breakdown + oldest timestamp) — no file paths, so this stays
         # outside _HEALTH_REPORT_SENSITIVE_KEYS like vector_backend_lag.
         "inbox_quarantine": {"count": 0, "oldest_quarantined_at": None, "by_reason": {}},
+        # M4/M5 (#229): the three memory-lifecycle queues that accumulated
+        # without a reader, without aging, or without any count on a health
+        # surface. Aggregate-only (depths and ages — no paths, no candidate
+        # content), so this stays outside _HEALTH_REPORT_SENSITIVE_KEYS.
+        "memory_lifecycle": {
+            "afm_dead_letter": {"files": 0, "oldest_age_days": None},
+            "afm_review_orphans": 0,
+            "proposed_queue": {"depth": 0, "oldest_age_days": None, "stale": 0},
+        },
         # #225-R6 / GA1-1: health never compared document count against vector
         # count, so a 43% document-vector gap (381/879, all knowledge layer) and
         # 409 NULL-embedding learnings were invisible to every status surface —
@@ -581,6 +590,60 @@ def handle_health_report(params: dict, request_id: Any, context: HealthContext) 
                 "status": "unknown",
                 "error": type(exc).__name__,
             }
+
+        # M4/M5 (#229). Each of these queues grew unbounded or drifted while
+        # every health surface stayed quiet: the dead letter had no reader and
+        # no count, review markers outlived their candidates with nothing
+        # reporting the orphan total, and the proposed queue sat at a constant
+        # depth with no staleness signal. A depth alone cannot tell a healthy
+        # queue from a parked one, so ages are reported alongside counts.
+        #
+        # The filesystem scan and the DB scan get their OWN try/except: they
+        # fail independently, and a DB fault must not blank out a dead-letter
+        # count that was read successfully (nor the reverse). Exception class
+        # only — same path-leak reasoning as the inbox_quarantine block.
+        lifecycle = dict(report["memory_lifecycle"])
+        try:
+            from minni.afm_passes.inbox_quarantine import count_afm_dead_letter
+
+            lifecycle["afm_dead_letter"] = count_afm_dead_letter(
+                config=context.default_config,
+            )
+        except Exception as exc:
+            # Replace the sub-dict rather than adding a sibling key: leaving
+            # the zero-valued default in place meant a scan that never ran
+            # read as "0 files", which is the health overstatement this block
+            # exists to remove. Mirrors the inbox_quarantine precedent above.
+            lifecycle["afm_dead_letter"] = {
+                "files": None,
+                "oldest_age_days": None,
+                "unreadable": None,
+                "status": "unknown",
+                "error": type(exc).__name__,
+            }
+        try:
+            from minni.afm_review_markers import (
+                count_orphaned_afm_review,
+                proposed_queue_stats,
+            )
+
+            # `db` is already open in this scope (line ~383) and closed in
+            # the finally below — opening a second SovereignDB here re-ran
+            # PRAGMA journal_mode=WAL on every health call for nothing.
+            with db.cursor() as c:
+                lifecycle["afm_review_orphans"] = count_orphaned_afm_review(c)
+                lifecycle["proposed_queue"] = proposed_queue_stats(c)
+        except Exception as exc:
+            lifecycle["afm_review_orphans"] = None
+            lifecycle["proposed_queue"] = {
+                "depth": None,
+                "oldest_age_days": None,
+                "stale": None,
+                "unparseable_proposed_at": None,
+                "status": "unknown",
+                "error": type(exc).__name__,
+            }
+        report["memory_lifecycle"] = lifecycle
 
         try:
             # GA6-2: failures come from the global counters the sub-ops now

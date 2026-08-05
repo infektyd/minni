@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
 import minni.obs as obs
+from minni.afm_review_markers import supersede_afm_review
 from minni.config import DEFAULT_CONFIG
 from minni.db import SovereignDB
 from minni.principal import (
@@ -288,6 +289,8 @@ def promote_candidate_durable(candidate_id: int, reason: str, context: AFMContex
             """,
             (now, reason[:500], candidate_id),
         )
+        # M5: retire the review fence with the candidate it fenced.
+        supersede_afm_review(c, candidate_id)
         c.execute(
             """
             INSERT INTO consolidation_actions
@@ -327,6 +330,8 @@ def reject_candidate_dedup(candidate_id: int, context: AFMContext) -> bool:
             """,
             (now, candidate_id),
         )
+        # M5: retire the review fence with the candidate it fenced.
+        supersede_afm_review(c, candidate_id)
         c.execute(
             """
             INSERT INTO consolidation_actions
@@ -867,6 +872,44 @@ async def afm_loop_runner(context: AFMContext):
                                 )
                                 obs.incr("inbox_quarantine_failures_total")
                                 obs.record_error("afm_loop.inbox_quarantine", exc)
+                        # M4 (#229): afm-drafts-*/afm-pruning-* have writers but
+                        # no reader anywhere in the repo, so every tick re-skips
+                        # them as _unrecognized and they accumulate forever (107
+                        # files, oldest 61 days). Same drain contract as above:
+                        # move, never delete, past a TTL grace window.
+                        # Both cohorts: a corrupt afm-drafts-*/afm-pruning-*
+                        # file counts as _unparseable, never _unrecognized, so
+                        # gating on the latter alone left a corrupt-only
+                        # backlog permanently unreachable — exactly the files
+                        # the drain was taught to claim.
+                        if (cfg or {}).get("ingest_inbox", True) and (
+                            _skips.get("_unrecognized") or _skips.get("_unparseable")
+                        ):
+                            try:
+                                from minni.afm_passes.inbox_quarantine import (
+                                    quarantine_afm_dead_letter,
+                                )
+                                _d = quarantine_afm_dead_letter(
+                                    context.default_config,
+                                    ttl_days=(cfg or {}).get("inbox_quarantine_ttl_days"),
+                                )
+                                if _d.get("quarantined"):
+                                    obs.incr(
+                                        "inbox_afm_dead_letter_quarantined_total",
+                                        _d["quarantined"],
+                                    )
+                                    context.logger.warning(
+                                        "AFM loop: quarantined %d stale AFM "
+                                        "dead-letter inbox file(s): %s",
+                                        _d["quarantined"], _d["quarantined_files"],
+                                    )
+                            except Exception as exc:
+                                context.logger.exception(
+                                    "AFM loop: AFM dead-letter drain raised "
+                                    "(skipped; consolidation continues)"
+                                )
+                                obs.incr("inbox_quarantine_failures_total")
+                                obs.record_error("afm_loop.afm_dead_letter", exc)
                         # Inert-file sweep (2026-08 pile-up): a stop-candidate
                         # file whose EVERY candidate ingest rejects (audit
                         # echo / log_only / do_not_store / blank) can never

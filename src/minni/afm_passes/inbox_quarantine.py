@@ -82,6 +82,21 @@ REASON_SUFFIX = ".reason.json"
 DEFAULT_RESIDUE_TTL_DAYS = 14.0
 
 
+# M4 (#229): the AFM dead-letter cohort. ``afm_writer._write_batch`` writes
+# ``afm-drafts-<date>.json`` and ``afm_passes.pruning._write_inbox`` writes
+# ``afm-pruning-<date>.json``. Neither carries a ``kind`` and neither matches
+# the stop-candidate shape, so ``_scan_inbox`` buckets both under
+# ``skipped_by_kind["_unrecognized"]`` on every tick — and no reader exists
+# for either name anywhere in the repo. A pure dead letter: 107 files, the
+# oldest 61 days, growing monotonically with nothing to age them and only a
+# log line to report them.
+#
+# Scoped to these two NAMES rather than to ``_unrecognized`` as a class: an
+# unrecognized kind is not by itself proof a file is unreadable, and a future
+# writer that does have a reader must not be swept up by this drain.
+AFM_DEAD_LETTER_PREFIXES = ("afm-drafts-", "afm-pruning-")
+
+
 def quarantine_inbox_file(file_path: Path, reason_payload: Dict[str, Any]) -> Optional[str]:
     """Move an inbox file into its sibling ``quarantine/`` dir, writing a
     ``<name>.reason.json`` sidecar alongside it. NEVER unlinks; the filename
@@ -202,6 +217,131 @@ def quarantine_stale_agent_mismatch(
             if dry_run:
                 continue
             target = quarantine_inbox_file(path, reason_payload)
+            if target:
+                quarantined_files.append(target)
+
+    return {
+        "inboxes": [str(p) for p in inboxes],
+        "would_quarantine": would_quarantine,
+        "quarantined": len(quarantined_files),
+        "quarantined_files": quarantined_files,
+        "ttl_days": ttl,
+        "dry_run": dry_run,
+    }
+
+
+def _afm_dead_letter_files(inbox: Path, now: float) -> List[Tuple[Path, float, bool]]:
+    """``(path, age_seconds, unreadable)`` for live AFM dead-letter files.
+
+    Non-recursive, so already-quarantined and archived files are invisible: a
+    drained backlog must report zero rather than stay permanently non-zero.
+
+    Defensive: a file is only claimed while it still looks like the unread
+    payload. If one ever grows a ``kind``, or matches the stop-candidate shape
+    the ingest pass reads, it has a reader and is left alone.
+    """
+    out: List[Tuple[Path, float, bool]] = []
+    for path in sorted(inbox.glob("*.json")):
+        if not path.name.startswith(AFM_DEAD_LETTER_PREFIXES):
+            continue
+        # Both writers do a non-atomic read-modify-write on the same dated
+        # file, so a crash mid-write leaves a truncated or list-shaped
+        # payload. Skipping those made them invisible to the count AND
+        # undrainable — a permanently stuck file, which is the exact class
+        # this drain exists to remove. Claim them as unreadable instead: the
+        # NAME already proves which writer produced them, and no reader
+        # exists for that name either way.
+        unreadable = False
+        doc: Any = None
+        try:
+            doc = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            unreadable = True
+        if not unreadable:
+            if not isinstance(doc, dict):
+                unreadable = True
+            elif doc.get("kind") is not None:
+                continue
+            elif _is_stop_candidate_shape(doc):
+                continue
+        created = None if unreadable else _file_createdat_epoch(doc)
+        if created is None:
+            try:
+                created = path.stat().st_mtime
+            except OSError:
+                continue
+        out.append((path, max(now - created, 0.0), unreadable))
+    return out
+
+
+def count_afm_dead_letter(
+    inboxes: Optional[List[Path]] = None,
+    *,
+    config: Any = None,
+    now: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Depth and oldest age of the AFM dead-letter backlog, without draining.
+
+    Half of M4 was that nothing reported the count, so counting must not
+    require moving anything — a health surface reads this on every call.
+    """
+    if inboxes is None:
+        inboxes = discover_inboxes(config)
+    now = time.time() if now is None else now
+    ages: List[float] = []
+    unreadable = 0
+    for inbox in inboxes:
+        for _path, age, is_unreadable in _afm_dead_letter_files(Path(inbox), now):
+            ages.append(age)
+            unreadable += 1 if is_unreadable else 0
+    return {
+        "files": len(ages),
+        "oldest_age_days": (max(ages) / 86400.0) if ages else None,
+        "unreadable": unreadable,
+    }
+
+
+def quarantine_afm_dead_letter(
+    config,
+    inboxes: Optional[List[Path]] = None,
+    *,
+    ttl_days: Optional[float] = None,
+    now: Optional[float] = None,
+    dry_run: bool = False,
+) -> Dict[str, Any]:
+    """Drain stale AFM dead-letter files into ``quarantine/``.
+
+    Same contract as :func:`quarantine_stale_agent_mismatch`: never unlinks,
+    always leaves a reason sidecar, and the TTL is a grace window rather than
+    an instant trigger.
+    """
+    if inboxes is None:
+        inboxes = discover_inboxes(config)
+    ttl = DEFAULT_RESIDUE_TTL_DAYS if ttl_days is None else float(ttl_days)
+    ttl_seconds = ttl * 86400.0
+    now = time.time() if now is None else now
+
+    would_quarantine = 0
+    quarantined_files: List[str] = []
+    for inbox in inboxes:
+        for path, age, unreadable in _afm_dead_letter_files(Path(inbox), now):
+            if age <= ttl_seconds:
+                continue
+            would_quarantine += 1
+            if dry_run:
+                continue
+            target = quarantine_inbox_file(path, {
+                "reason": (
+                    "_afm_dead_letter_unreadable" if unreadable else "_afm_dead_letter"
+                ),
+                "detail": (
+                    "written by afm_writer/afm_passes.pruning; no reader exists "
+                    "for this filename, so it can never be ingested"
+                ),
+                "quarantined_at": _iso(now),
+                "age_days": round(age / 86400.0, 6),
+                "ttl_days": round(ttl_seconds / 86400.0, 6),
+            })
             if target:
                 quarantined_files.append(target)
 

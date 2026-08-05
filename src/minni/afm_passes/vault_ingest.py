@@ -20,7 +20,7 @@ from minni.indexer import VaultIndexer
 from minni.principal import validate_agent_id
 from minni.timestamps import parse_epoch_or_report
 from minni.vault_index import open_vault_index, vault_index_paths
-from minni.wiki_indexer import WikiIndexer
+from minni.wiki_indexer import WikiFrontmatter, WikiIndexer
 
 logger = logging.getLogger("sovereign.afm.vault_ingest")
 
@@ -197,6 +197,7 @@ def _index_changed_pages(
         "wikilinks": 0,
         "errors": 0,
         "rejected": 0,
+        "excluded": 0,
     }
     target_map = indexer.parser.get_wikilink_targets(str(wiki_root))
 
@@ -220,10 +221,52 @@ def _index_changed_pages(
                     stats["errors"] += 1
                     continue
 
+                # Excluded by design (e.g. a completed plan). Checked before
+                # validation so an intentional exclusion is never reported as
+                # bad frontmatter. A page that was ALREADY indexed at an
+                # indexable status (accepted -> complete is the normal plan
+                # lifecycle) must be RETRACTED, not merely skipped: leaving
+                # the old row behind keeps a completed plan recallable, which
+                # is the exact H6 self-promotion the exclusion exists to stop.
+                if page.frontmatter.status in WikiFrontmatter.EXCLUDED_STATUSES:
+                    stats["excluded"] += 1
+                    if row:
+                        # Retract the PAYLOAD, not the row. Deleting the
+                        # documents row would CASCADE memory_links away and
+                        # mint a new doc_id on the way back — and
+                        # accepted -> complete -> accepted is a normal round
+                        # trip (plan.ts reconciles when a slice reopens), so
+                        # every inbound wikilink and every stored doc_id
+                        # reference would dangle permanently. Keep identity,
+                        # drop the searchable content, and stamp the status
+                        # so retrieval filters it exactly like superseded.
+                        doc_id = int(row["doc_id"])
+                        # Searchable payload only — NOT _delete_doc_payload,
+                        # which also drops memory_links in both directions.
+                        # The page still exists, so an inbound edge belongs to
+                        # the OTHER page and deleting it would corrupt that
+                        # page's graph without that page having changed.
+                        c.execute("DELETE FROM vault_fts WHERE doc_id = ?", (doc_id,))
+                        c.execute(
+                            "DELETE FROM chunk_embeddings WHERE doc_id = ?", (doc_id,)
+                        )
+                        c.execute(
+                            """UPDATE documents
+                               SET page_status=?, last_modified=?, indexed_at=?
+                               WHERE doc_id=?""",
+                            (page.frontmatter.status, mtime, time.time(), doc_id),
+                        )
+                        stats.setdefault("excluded_purged", 0)
+                        stats["excluded_purged"] += 1
+                    continue
+
                 errors = indexer.parser.validate_frontmatter(page.frontmatter, path)
                 if errors:
+                    # A rejection is "we refused to index this", which is a
+                    # different question from "we broke". Counting it as both
+                    # left `errors` permanently non-zero, so it carried no
+                    # information about real errors.
                     stats["rejected"] += 1
-                    stats["errors"] += 1
                     continue
                 if page.frontmatter.privacy == "blocked":
                     if row:
@@ -415,6 +458,9 @@ def run(db, config, vault_path=None, dry_run=False, trace_id=None) -> Dict[str, 
             "chunks": 0,
             "wikilinks": 0,
             "errors": 0,
+            "rejected": 0,
+            "excluded": 0,
+            "excluded_purged": 0,
             "faiss_saved": False,
         }
 
@@ -440,6 +486,8 @@ def run(db, config, vault_path=None, dry_run=False, trace_id=None) -> Dict[str, 
             "wikilinks": stats["wikilinks"],
             "errors": stats["errors"],
             "rejected": stats["rejected"],
+            "excluded": stats["excluded"],
+            "excluded_purged": stats.get("excluded_purged", 0),
             "faiss_saved": faiss_saved,
         }
     finally:
