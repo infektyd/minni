@@ -85,6 +85,55 @@ def _resolve_model_device() -> Optional[str]:
     return cfg_s or None
 
 
+_TORCH_THREADS_PINNED = False
+_TORCH_THREADS_PIN_LOCK = threading.Lock()
+
+
+def _pin_torch_threads_for_cpu_once(device: Optional[str]) -> None:
+    """#299: belt-and-suspenders API-level pin alongside minnid.main()'s
+    OMP_NUM_THREADS/MKL_NUM_THREADS/VECLIB_MAXIMUM_THREADS env pins.
+
+    The env pins must be set before torch imports (they are, in main(), at
+    process start) so libomp never spins up more than one worker thread —
+    that's what actually prevents the fork-barrier SIGSEGV from two OpenMP
+    runtimes (PyTorch's bundled libomp vs FAISS's bundled libomp; both are
+    already tolerated in-process by the pre-existing KMP_DUPLICATE_LIB_OK=TRUE
+    set in each getter below, which is why the collision manifests as a
+    fork-barrier crash rather than the loud "OMP: Error #15" abort that flag
+    suppresses) colliding. This call is a second line of defense at the API
+    level for whichever singleton first triggers the torch import, and is a
+    no-op unless CPU inference was actually resolved: MPS ops never touch
+    OpenMP, so there is nothing to pin when running on MPS, and batch tools
+    (indexer/backfill), which never enter minnid.main() and keep MPS
+    auto-select, must not have their multi-threaded math throttled by a
+    daemon-only crash workaround.
+
+    Comparison is case/suffix-normalized ("CPU", "cpu:0") since
+    ``_resolve_model_device`` passes the operator's raw env/config string
+    through unmodified to the ST constructor's ``device=`` kwarg — a
+    literal ``!= "cpu"`` here would silently skip the pin for a value the
+    constructor itself accepts as CPU.
+
+    Guarded by a lock: three getters (embedder/cross-encoder/attribution)
+    can race this check-then-set from concurrent daemon RPC threads before
+    the encode/predict locks in this module are ever acquired.
+    """
+    global _TORCH_THREADS_PINNED
+    normalized = (device or "").strip().lower().split(":")[0]
+    if normalized != "cpu":
+        return
+    with _TORCH_THREADS_PIN_LOCK:
+        if _TORCH_THREADS_PINNED:
+            return
+        try:
+            import torch
+
+            torch.set_num_threads(1)
+            _TORCH_THREADS_PINNED = True
+        except Exception:
+            pass  # best-effort; the env pins in main() are the primary defense
+
+
 def _announce_download_once(model_name: str, role: str) -> None:
     """Print a one-time notice if `model_name` is not in the local HF cache."""
     try:
@@ -123,6 +172,7 @@ def get_embedder():
         from sentence_transformers import SentenceTransformer
         _announce_download_once(DEFAULT_CONFIG.embedding_model, "embedding")
         device = _resolve_model_device()
+        _pin_torch_threads_for_cpu_once(device)
         kwargs = {}
         if device is not None:
             kwargs["device"] = device
@@ -158,6 +208,7 @@ def get_cross_encoder():
         from sentence_transformers import CrossEncoder
         _announce_download_once(DEFAULT_CONFIG.reranker_model, "reranker")
         device = _resolve_model_device()
+        _pin_torch_threads_for_cpu_once(device)
         kwargs = {}
         if device is not None:
             kwargs["device"] = device
@@ -193,6 +244,7 @@ def get_attribution_cross_encoder():
         from sentence_transformers import CrossEncoder
         _announce_download_once(DEFAULT_CONFIG.attribution_model, "attribution")
         device = _resolve_model_device()
+        _pin_torch_threads_for_cpu_once(device)
         kwargs = {}
         if device is not None:
             kwargs["device"] = device

@@ -2030,6 +2030,33 @@ def main():
     # keep library auto-select (MPS on Apple Silicon).
     os.environ.setdefault("MINNI_MODEL_DEVICE", "cpu")
 
+    # #299: the #284 CPU pin exposed a libomp SIGSEGV crash-loop — MPS
+    # inference never touches OpenMP worker threads, so #284 made CPU
+    # inference (and its OMP threading) live for the first time. Two OMP
+    # runtimes in one process (PyTorch's bundled libomp vs FAISS's own
+    # bundled libomp — this box's numpy/BLAS is Accelerate, not an
+    # OpenMP-linked BLAS, so FAISS is the actual second runtime, not numpy)
+    # collide at the fork barrier on macOS: EXC_BAD_ACCESS in
+    # __kmp_fork_barrier -> __kmp_launch_worker, ~30-60s after the first CPU
+    # encode. The pre-existing KMP_DUPLICATE_LIB_OK=TRUE in models.py's
+    # getters is what lets both runtimes coexist in-process at all instead
+    # of the loud "OMP: Error #15: Initializing libomp, but found libomp
+    # already initialized" abort that flag suppresses — undefined behavior
+    # from there, not a clean failure. This pin doesn't remove that
+    # tolerance (a separate, larger question); it starves the fork barrier
+    # of extra workers so the collision that flag permits stops crashing.
+    # encode()/predict() are already serialized by the #286 per-singleton
+    # lock, so intra-op OMP parallelism buys the daemon nothing — pin every
+    # OMP-linked math library to one thread before any of them can
+    # initialize. Must happen before torch/faiss/sentence-transformers
+    # import, hence here, at the top of main(), same as the device pin
+    # above. setdefault preserves an explicit operator override.
+    # Batch tools (indexer/backfill) never enter main(), so they keep
+    # default multi-threaded math.
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    os.environ.setdefault("MKL_NUM_THREADS", "1")
+    os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
+
     # Deploy honesty (GA1-3): snapshot which code this process is running —
     # checkout + HEAD sha at start — so `status` can later report truthfully
     # when the checkout has moved on and the daemon is executing stale code.
