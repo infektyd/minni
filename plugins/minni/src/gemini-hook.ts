@@ -76,9 +76,12 @@ const CONFIG: AgentHookConfig = {
   // stashes stale-belief events as a precompact_reassert entry instead of a
   // durable handoff file.
   recallGuardMode: GEMINI_GUARD_MODE,
-  // #296: SessionStart acks this agent's pending handoff leases at boot, the
-  // same as every other platform sharing this factory — was claude-only
-  // before #296, an unstated inconsistency rather than a deliberate choice.
+  // #296: SessionStart acks this agent's pending handoff leases at boot —
+  // was claude-only before #296, an unstated inconsistency rather than a
+  // deliberate choice. Every platform sharing this factory sets this
+  // EXCEPT grok-build (see grok-hook.ts's CONFIG for why: its wire cannot
+  // inject/note at SessionStart at all, so acking there would misreport
+  // acceptance to the sender before the content is ever actually surfaced).
   ackPendingHandoffsAtBoot: true,
   wire: geminiWire,
 };

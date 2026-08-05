@@ -39,9 +39,12 @@ const CONFIG = {
   sessionStartHookTimeoutMs: 30_000,
   precompactKind: "cursor_precompact_handoff",
   recallGuardMode: CURSOR_GUARD_MODE,
-  // #296: SessionStart acks this agent's pending handoff leases at boot, the
-  // same as every other platform sharing this factory — was claude-only
-  // before #296, an unstated inconsistency rather than a deliberate choice.
+  // #296: SessionStart acks this agent's pending handoff leases at boot —
+  // was claude-only before #296, an unstated inconsistency rather than a
+  // deliberate choice. Every platform sharing this factory sets this
+  // EXCEPT grok-build (see grok-hook.ts's CONFIG for why: its wire cannot
+  // inject/note at SessionStart at all, so acking there would misreport
+  // acceptance to the sender before the content is ever actually surfaced).
   ackPendingHandoffsAtBoot: true,
   // Without this, wireFor("cursor") fell through to the Claude profile and the
   // handlers emitted Claude envelopes that adaptCursorOutput then quietly threw

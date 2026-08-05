@@ -29,9 +29,12 @@ void runHookMain({
   auditPrefix: "hook_kilocode",
   bootIdentity: "identity-recall",
   stopCommitHint: "Use /minni:learn to commit.",
-  // #296: SessionStart acks this agent's pending handoff leases at boot, the
-  // same as every other platform sharing this factory — was claude-only
-  // before #296, an unstated inconsistency rather than a deliberate choice.
+  // #296: SessionStart acks this agent's pending handoff leases at boot —
+  // was claude-only before #296, an unstated inconsistency rather than a
+  // deliberate choice. Every platform sharing this factory sets this
+  // EXCEPT grok-build (see grok-hook.ts's CONFIG for why: its wire cannot
+  // inject/note at SessionStart at all, so acking there would misreport
+  // acceptance to the sender before the content is ever actually surfaced).
   ackPendingHandoffsAtBoot: true,
   // Review-panel fix (shared root cause of five findings): Stop previously
   // wrote an inbox file UNCONDITIONALLY (zero-candidate litter) and without

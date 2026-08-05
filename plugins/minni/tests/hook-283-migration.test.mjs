@@ -273,6 +273,47 @@ test("SessionStart handoff acking now runs for every platform sharing the factor
   });
 });
 
+test("SessionStart handoff acking deliberately does NOT run for grok-build (#296 carve-out)", async () => {
+  // grok-build is the one platform sharing this factory that does NOT set
+  // ackPendingHandoffsAtBoot (see grok-hook.ts's CONFIG comment): its wire
+  // can only inject/note at Stop, so acking a lease at SessionStart would
+  // tell the sending agent "grok accepted this" via the lease store before
+  // grok has ever actually surfaced the content anywhere it could act on
+  // it — a false acceptance signal. Confirms the carve-out is real and
+  // load-bearing, not just documented.
+  await withFixture(async (fixture) => {
+    const { server, calls } = await startFakeDaemon(fixture.socketPath, {
+      minni_list_pending_handoffs: (_request, { respond }) => {
+        respond({ handoffs: [{ lease_id: "should-not-be-acked", to_agent: "grok-build" }] });
+      },
+    });
+    try {
+      const output = await runHook("SessionStart", {
+        ...BASE_ENV(fixture),
+        MINNI_GROK_VAULT_PATH: fixture.vault,
+        MINNI_GROK_AGENT_ID: "grok-build",
+        MINNI_GROK_HOOKS: "on",
+      }, {}, "grok-hook.js");
+      // grokBuildWire cannot inject at SessionStart at all — the real
+      // observable output is the bare no-op, not an envelope.
+      assert.deepEqual(output, { continue: true });
+      assert.ok(calls.length > 0, "grok must actually reach the daemon for its other boot RPCs");
+      assert.equal(
+        calls.filter((c) => c.method === "minni_list_pending_handoffs").length,
+        0,
+        "grok must never even call minni_list_pending_handoffs",
+      );
+      assert.equal(
+        calls.filter((c) => c.method === "minni_ack_handoff").length,
+        0,
+        "grok must never ack a lease it cannot show the model",
+      );
+    } finally {
+      server.close();
+    }
+  });
+});
+
 test("ackPendingHandoffsAtBoot still gates correctly when a config genuinely omits it", async () => {
   // Regression guard for the underlying MECHANISM, now that no shipped
   // platform config exercises the off state: createHookHandlers itself must

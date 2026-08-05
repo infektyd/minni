@@ -27,9 +27,12 @@ void runHookMain({
   // Mirrors hooks/hooks-codex.json SessionStart "timeout": 30 — edit both.
   sessionStartHookTimeoutMs: 30_000,
   precompactKind: "codex_precompact_handoff",
-  // #296: SessionStart acks this agent's pending handoff leases at boot, the
-  // same as every other platform sharing this factory — was claude-only
-  // before #296, an unstated inconsistency rather than a deliberate choice.
+  // #296: SessionStart acks this agent's pending handoff leases at boot —
+  // was claude-only before #296, an unstated inconsistency rather than a
+  // deliberate choice. Every platform sharing this factory sets this
+  // EXCEPT grok-build (see grok-hook.ts's CONFIG for why: its wire cannot
+  // inject/note at SessionStart at all, so acking there would misreport
+  // acceptance to the sender before the content is ever actually surfaced).
   ackPendingHandoffsAtBoot: true,
   // Wire is the platform contract, not the memory principal. Agent id is
   // user-overridable; deriving the wire from it would fall through to the
