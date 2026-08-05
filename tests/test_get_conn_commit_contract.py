@@ -773,3 +773,226 @@ class TestTheRemainingCallSitesRunTheirOwnCode:
                 db.close()
             with SovereignDB._shared_lock:
                 SovereignDB._shared_instances.pop(key, None)
+
+
+# ---------------------------------------------------------------------------
+# #319 — the thread-locality blind spot, measured rather than asserted
+# ---------------------------------------------------------------------------
+
+
+class TestACrossThreadLeakIsOnlyVisibleToTheLockProbe:
+    """`_get_conn()` is thread-local, so a leak on an RPC worker thread lives
+    on a connection the main thread never sees.
+
+    The daemon dispatches sync handlers via asyncio.to_thread onto a BOUNDED,
+    long-lived executor, and each pooled worker accretes its own SQLite
+    connection per database file. The worker outlives the task, so its
+    connection is not garbage-collected when the work finishes — the open
+    transaction persists on a live connection nothing on the main thread holds
+    a reference to.
+
+    Measured here, not argued. #310 recorded that the lock probe is an
+    independent detector for exactly this shape; these tests are the
+    reproduction that claim was missing.
+    """
+
+    def _leak_on_a_pooled_worker(self, db_obj):
+        """Write without committing on a pooled worker, and leave the pool
+        running so the thread — and its thread-local connection — survives."""
+        import concurrent.futures
+
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+
+        def _leak():
+            worker_conn = db_obj._get_conn()
+            worker_conn.execute(
+                "INSERT INTO episodic_events"
+                " (agent_id, event_type, content, created_at)"
+                " VALUES ('worker', 'message', 'leaked from a pooled thread', 1.0)"
+            )
+            return worker_conn.in_transaction
+
+        assert pool.submit(_leak).result() is True, "the worker must be mid-write"
+        return pool
+
+    def test_the_in_transaction_assertion_cannot_see_a_worker_thread_leak(
+        self, tmp_path
+    ):
+        """The blind spot itself, pinned so nobody mistakes the main-thread
+        assertion for full coverage. If this ever starts failing, thread-local
+        connections have changed and the guard got STRONGER — read the change,
+        do not just delete the test."""
+        db_obj, cfg = _make_db(tmp_path)
+        main_conn = db_obj._get_conn()
+        pool = self._leak_on_a_pooled_worker(db_obj)
+        try:
+            assert main_conn.in_transaction is False, (
+                "the main thread's connection is a different object than the "
+                "worker's, so in_transaction is structurally blind here"
+            )
+        finally:
+            pool.shutdown(wait=True)
+            db_obj.close()
+
+    def test_the_lock_probe_does_see_a_worker_thread_leak(self, tmp_path):
+        """The half that works, and therefore the half worth protecting: an
+        independent connection cannot write while the worker holds the lock."""
+        import sqlite3 as _sqlite3
+
+        db_obj, cfg = _make_db(tmp_path)
+        pool = self._leak_on_a_pooled_worker(db_obj)
+        try:
+            other = _sqlite3.connect(cfg.db_path, timeout=2)
+            try:
+                with pytest.raises(_sqlite3.OperationalError, match="locked"):
+                    other.execute(
+                        "INSERT INTO episodic_events"
+                        " (agent_id, event_type, content, created_at)"
+                        " VALUES ('probe', 'message', 'probe', 1.0)"
+                    )
+                    other.commit()
+            finally:
+                other.close()
+        finally:
+            pool.shutdown(wait=True)
+            db_obj.close()
+
+    def test_a_worker_thread_leak_is_invisible_to_other_readers(self, tmp_path):
+        """The other half of the damage: the write is not merely uncommitted,
+        it is unreadable everywhere except the worker that made it."""
+        import sqlite3 as _sqlite3
+
+        db_obj, cfg = _make_db(tmp_path)
+        pool = self._leak_on_a_pooled_worker(db_obj)
+        try:
+            reader = _sqlite3.connect(cfg.db_path, timeout=2)
+            try:
+                seen = reader.execute(
+                    "SELECT COUNT(*) FROM episodic_events"
+                    " WHERE content LIKE '%leaked%'"
+                ).fetchone()[0]
+            finally:
+                reader.close()
+            assert seen == 0, (
+                "an independent reader must not see the uncommitted row — if "
+                "it does, the leak committed somewhere and this test is no "
+                "longer reproducing the hazard"
+            )
+        finally:
+            pool.shutdown(wait=True)
+            db_obj.close()
+
+    def test_the_assert_helper_therefore_needs_its_probe_half(self, tmp_path):
+        """_assert_connection_is_clean must FAIL on a worker-thread leak, and
+        the only thing that can make it fail is the probe. This is what makes
+        the probe load-bearing rather than decorative: delete it and this test
+        goes green while the daemon stalls."""
+        db_obj, cfg = _make_db(tmp_path)
+        main_conn = db_obj._get_conn()
+        pool = self._leak_on_a_pooled_worker(db_obj)
+        try:
+            with pytest.raises(BaseException) as caught:
+                _assert_connection_is_clean(main_conn, cfg, "worker-thread leak")
+            assert "write lock" in str(caught.value), (
+                "it must fail via the lock probe, not the in_transaction "
+                f"assertion, which is blind here; got {caught.value!r}"
+            )
+        finally:
+            pool.shutdown(wait=True)
+            db_obj.close()
+
+
+# ---------------------------------------------------------------------------
+# #319 — the raw sqlite3.connect() sites
+# ---------------------------------------------------------------------------
+
+
+class TestReadOnlyConnectSitesCannotWrite:
+    """Three sites bypass SovereignDB entirely and open sqlite3 directly.
+
+    Two of them (watch.py's EpisodicPoller, vault_ingest._read_index_state)
+    do it through a `file:...?mode=ro` URI, which is a stronger guarantee than
+    "this code happens not to write today": SQLite itself refuses the write.
+    These pin that, so the guarantee survives someone later adding a statement.
+    """
+
+    def test_episodic_poller_connection_refuses_writes(self, tmp_path):
+        """watch.py:259."""
+        import sqlite3 as _sqlite3
+        from pathlib import Path
+
+        from minni.watch import EpisodicPoller
+
+        db_obj, cfg = _make_db(tmp_path)
+        db_obj.close()
+
+        conn = EpisodicPoller(Path(cfg.db_path))._connect()
+        assert conn is not None, "precondition: the poller must have connected"
+        try:
+            with pytest.raises(_sqlite3.OperationalError, match="readonly"):
+                conn.execute(
+                    "INSERT INTO episodic_events"
+                    " (agent_id, event_type, content, created_at)"
+                    " VALUES ('x', 'message', 'y', 1.0)"
+                )
+            # Deliberately NOT asserting in_transaction is False here. Python's
+            # sqlite3 layer opens the implicit transaction before SQLite
+            # rejects the statement, so in_transaction reads True even though
+            # the write never happened. That is harmless — a mode=ro
+            # connection cannot take a write lock, which is the property that
+            # matters — but it is a good illustration of why in_transaction
+            # alone is a poor proxy for "is anything held".
+            other = _sqlite3.connect(cfg.db_path, timeout=2)
+            try:
+                other.execute(
+                    "INSERT INTO episodic_events"
+                    " (agent_id, event_type, content, created_at)"
+                    " VALUES ('probe', 'message', 'probe', 1.0)"
+                )
+                other.commit()
+            finally:
+                other.close()
+        finally:
+            conn.close()
+
+    def test_vault_ingest_index_state_read_leaves_nothing_open(self, tmp_path):
+        """afm_passes/vault_ingest.py:78 — read-only URI, and it closes."""
+        from pathlib import Path
+
+        from minni.afm_passes.vault_ingest import _read_index_state
+
+        db_obj, cfg = _make_db(tmp_path)
+        with db_obj.cursor() as c:
+            c.execute(
+                "INSERT INTO documents (path, agent, sigil, last_modified,"
+                " indexed_at, access_count, decay_score, whole_document)"
+                " VALUES ('/d.md', 'forge', 'F', 1.0, 1.0, 0, 1.0, 0)"
+            )
+        db_obj.close()
+
+        state = _read_index_state(Path(cfg.db_path))
+
+        assert "/d.md" in state, "precondition: the read must have returned rows"
+        # Nothing is holding the database: a writer can take it immediately.
+        _assert_connection_is_clean(
+            _make_db(tmp_path)[0]._get_conn(), cfg, "_read_index_state"
+        )
+
+    def test_faiss_status_checksum_read_leaves_nothing_open(self, tmp_path, capsys):
+        """sovereign_memory.py:328 — cmd_faiss('--status'). Read-only in
+        practice rather than by URI, so this pins the outcome, not the
+        mechanism."""
+        import minni.sovereign_memory as sm
+
+        db_obj, cfg = _make_db(tmp_path)
+
+        original = sm.DEFAULT_CONFIG
+        sm.DEFAULT_CONFIG = cfg
+        try:
+            sm.cmd_faiss(["--status"])
+        finally:
+            sm.DEFAULT_CONFIG = original
+
+        assert capsys.readouterr().out.strip(), "precondition: --status must report"
+        _assert_connection_is_clean(db_obj._get_conn(), cfg, "cmd_faiss --status")
+        db_obj.close()
