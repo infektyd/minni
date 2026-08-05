@@ -60,7 +60,12 @@ test("resolveInboxHandoffContext resolves wikilink refs for boot priming", async
     await mkdir(decisionDir, { recursive: true });
     await writeFile(
       path.join(decisionDir, "auth-migration.md"),
-      "---\ntitle: Auth Migration\n---\n\nUse the short-lived token exchange for auth migration.",
+      // #312: plain body text, deliberately free of any word
+      // heuristicPrivacyForSource (task.ts) escalates on — this test is
+      // about wikilink ref resolution, not the privacy gate; a body
+      // mentioning "token" would now be correctly excluded by the #312 fix
+      // and this fixture would stop testing what its name says.
+      "---\ntitle: Auth Migration\n---\n\nUse the short-lived credential exchange for auth migration.",
       "utf8",
     );
 
@@ -78,7 +83,162 @@ test("resolveInboxHandoffContext resolves wikilink refs for boot priming", async
 
     assert.equal(snippets.length, 1);
     assert.equal(snippets[0].ref, "wiki/decisions/auth-migration");
-    assert.match(snippets[0].snippet, /short-lived token exchange/);
+    assert.match(snippets[0].snippet, /short-lived credential exchange/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("#312: resolveInboxHandoffContext never surfaces a privacy:private note's body text", async () => {
+  // resolveInboxHandoffContext feeds hook-handlers.ts's SessionStart
+  // envelope handoff_context field directly (a 1:1 map, no filtering in
+  // between) — before this fix, a handoff's wikilink_refs could name ANY
+  // note in the vault, including privacy:private ones, and their BODY TEXT
+  // (a 520-char snippet) reached the model-facing envelope with zero
+  // gating. Worse than the SEC-006 gap #308 fixed for UserPromptSubmit's
+  // recall pointer, since that one only leaked titles/paths.
+  const root = await mkdtemp(path.join(tmpdir(), "sm-handoff-privacy-"));
+  try {
+    await ensureVault(root);
+    const decisionDir = path.join(root, "wiki", "decisions");
+    await mkdir(decisionDir, { recursive: true });
+    await writeFile(
+      path.join(decisionDir, "safe-migration.md"),
+      "---\ntitle: Safe Migration\nprivacy: safe\n---\n\nBoot priming marker phrase, safe note.",
+      "utf8",
+    );
+    await writeFile(
+      path.join(decisionDir, "private-migration.md"),
+      "---\ntitle: Private Migration\nprivacy: private\n---\n\nBoot priming marker phrase, CONFIDENTIAL body text that must never leave this vault.",
+      "utf8",
+    );
+
+    const snippets = await resolveInboxHandoffContext(root, [
+      {
+        slug: "mixed-handoff",
+        filePath: path.join(root, "inbox", "mixed.json"),
+        createdAt: "2026-04-26T00:00:00.000Z",
+        payload: {
+          kind: "handoff",
+          wikilink_refs: [
+            "wiki/decisions/safe-migration",
+            "wiki/decisions/private-migration",
+          ],
+        },
+      },
+    ]);
+
+    const refs = snippets.map((s) => s.ref);
+    assert.ok(refs.includes("wiki/decisions/safe-migration"), "the safe note must still resolve");
+    assert.ok(
+      !refs.includes("wiki/decisions/private-migration"),
+      "SEC (#312): a privacy:private note's ref must not resolve at all",
+    );
+    assert.ok(
+      !snippets.some((s) => /CONFIDENTIAL/.test(s.snippet)),
+      "SEC (#312): the private note's body text must never appear in any returned snippet",
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("#312: a leading blank line before the frontmatter delimiter must not bypass the privacy gate", async () => {
+  // Adversarial-review finding: frontmatterBlock (privacy/status/title
+  // parsing) used to be anchored strictly at string offset 0 with no `/m`
+  // flag, while snippetFor's frontmatter-strip used `/m` (matches `---` at
+  // the start of ANY line). A note with a leading blank line (or BOM, or
+  // CRLF line endings) made frontmatterBlock return "" — so the authored
+  // `privacy: private` was silently ignored — while snippetFor still
+  // correctly stripped the block before handing text to the heuristic
+  // scanner, so the heuristic layer never saw the word "private" either.
+  // Both privacy layers missed the same note for opposite reasons and its
+  // body text leaked in full. FRONTMATTER_RE is now the single shared
+  // anchor for both functions.
+  const root = await mkdtemp(path.join(tmpdir(), "sm-handoff-leadnl-"));
+  try {
+    await ensureVault(root);
+    const decisionDir = path.join(root, "wiki", "decisions");
+    await mkdir(decisionDir, { recursive: true });
+    const cases = {
+      "leading-newline": "\n---\ntitle: T\nprivacy: private\n---\n\nCONFIDENTIAL layoff list: Alice, Bob.",
+      "leading-space": " ---\ntitle: T\nprivacy: private\n---\n\nCONFIDENTIAL layoff list: Alice, Bob.",
+      "crlf-with-leading-newline": "\r\n---\r\ntitle: T\r\nprivacy: private\r\n---\r\n\r\nCONFIDENTIAL layoff list: Alice, Bob.",
+    };
+    for (const [name, body] of Object.entries(cases)) {
+      await writeFile(path.join(decisionDir, `${name}.md`), body, "utf8");
+    }
+
+    const snippets = await resolveInboxHandoffContext(root, [
+      {
+        slug: "leadnl-handoff",
+        filePath: path.join(root, "inbox", "leadnl.json"),
+        createdAt: "2026-04-26T00:00:00.000Z",
+        payload: {
+          kind: "handoff",
+          wikilink_refs: Object.keys(cases).map((name) => `wiki/decisions/${name}`),
+        },
+      },
+    ]);
+
+    assert.equal(
+      snippets.length,
+      0,
+      "SEC (#312): every case declares privacy: private in frontmatter — none may resolve, regardless of leading whitespace/BOM/CRLF noise before the delimiter",
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("#312: heuristic-only privacy (no frontmatter declaration) still gates a handoff ref", async () => {
+  // Coverage gap flagged in adversarial review: the earlier #312 tests only
+  // exercised the frontmatter-authored path (explicit `privacy: private`).
+  // task.ts's heuristicPrivacyForSource escalates on unlabelled body text
+  // too (defense-in-depth) — this note declares no privacy: field at all,
+  // so it must be caught purely by the heuristic scanning relativePath +
+  // title + snippet.
+  const root = await mkdtemp(path.join(tmpdir(), "sm-handoff-heuristic-"));
+  try {
+    await ensureVault(root);
+    const decisionDir = path.join(root, "wiki", "decisions");
+    await mkdir(decisionDir, { recursive: true });
+    await writeFile(
+      path.join(decisionDir, "safe-note.md"),
+      "---\ntitle: Safe Note\n---\n\nBoot priming marker phrase, nothing sensitive here.",
+      "utf8",
+    );
+    await writeFile(
+      path.join(decisionDir, "unlabelled-secret.md"),
+      "---\ntitle: Unlabelled\n---\n\nBoot priming marker phrase. The api_key for staging is embedded here.",
+      "utf8",
+    );
+
+    const snippets = await resolveInboxHandoffContext(root, [
+      {
+        slug: "heuristic-handoff",
+        filePath: path.join(root, "inbox", "heuristic.json"),
+        createdAt: "2026-04-26T00:00:00.000Z",
+        payload: {
+          kind: "handoff",
+          wikilink_refs: [
+            "wiki/decisions/safe-note",
+            "wiki/decisions/unlabelled-secret",
+          ],
+        },
+      },
+    ]);
+
+    const refs = snippets.map((s) => s.ref);
+    assert.ok(refs.includes("wiki/decisions/safe-note"), "the safe note must still resolve");
+    assert.ok(
+      !refs.includes("wiki/decisions/unlabelled-secret"),
+      "SEC (#312): heuristic-flagged content must be gated even with no privacy: frontmatter",
+    );
+    assert.ok(
+      !snippets.some((s) => /api_key/.test(s.snippet)),
+      "SEC (#312): the heuristically-blocked note's body text must never appear in any returned snippet",
+    );
   } finally {
     await rm(root, { recursive: true, force: true });
   }

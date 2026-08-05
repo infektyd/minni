@@ -51,6 +51,9 @@ import {
   replan,
   shelfDrift,
   updateSlice,
+  unmetDependencies,
+  diffDependsOn,
+  diffSupersededDependencies,
   applySliceDelta,
   readHistory,
   getRevision,
@@ -83,6 +86,12 @@ import {
   listAgentPingInbox,
 } from "./agent_ping.js";
 import { planHandoffDelivery } from "./handoff_guard.js";
+
+// #339: searchVaultNotes reads/scores/snippets every markdown file in the
+// vault's wiki tree regardless of `limit` — the limit is a post-scoring
+// slice only, so asking for more than the final cap costs nothing extra.
+// See minni_recall below for why the multiplier exists.
+const VAULT_SEARCH_OVERFETCH_MULTIPLIER = 3;
 
 function textResult(text: string) {
   return {
@@ -551,14 +560,28 @@ server.registerTool(
     // REFUSAL, not an empty, so it must never be OR'd into daemonEmpty above.
     const denial = identityDenialFrom(result.data);
     const identityDenied = recoveryRouteFrom(result.data) !== undefined || denial !== undefined;
+    // #339 (same shape as #313/PR #338): searchVaultNotes scores and sorts
+    // across the whole vault, then slices to its `limit` argument BEFORE
+    // privacy is considered beyond dropping `blocked` notes internally —
+    // `private`/`local-only` notes ride along. Asking for exactly the final
+    // cap here meant a private-heavy vault could fill every slot with
+    // non-safe notes that outscore a genuinely safe match, silently
+    // dropping it before filterSafeVaultResults ever saw it. Over-fetch a
+    // wider pre-filter set, filter, THEN slice to the cap this tool has
+    // always exposed — same external cap, same behavior for the common
+    // case. Narrows the gap, does not close it: the cap tops out at 8, so
+    // the widened fetch tops out at 24 — 25+ higher-scored non-safe notes
+    // outscoring a safe match still reproduce the crowd-out. See #339 for
+    // the durable fix (gate inside searchVaultNotes itself).
+    const vaultResultCap = Math.min(limit ?? 5, 8);
     const vaultResults = !identityDenied && shouldPrescanVault(daemonOk, includeVault !== false, daemonEmpty)
       ? filterSafeVaultResults(
           await searchVaultNotes(
             effectiveVaultPath,
             query,
-            Math.min(limit ?? 5, 8),
+            vaultResultCap * VAULT_SEARCH_OVERFETCH_MULTIPLIER,
           ),
-        )
+        ).slice(0, vaultResultCap)
       : [];
     // W5 (punch-list #4c): on a cross_agent capability denial specifically —
     // and only when the ORIGINAL request itself asked for cross_agent — retry
@@ -1318,16 +1341,23 @@ server.registerTool(
   {
     title: "Minni Thread Update",
     description:
-      "Update one plan slice status (evidence required for done). Persists vault note and appends journal event. plan_id defaults to the active plan.",
+      "Update one plan slice status (evidence required for done; depends_on is enforced — a slice with an unresolved dependency is blocked from becoming done unless force + force_reason are supplied, which is journaled). Persists vault note and appends journal event. plan_id defaults to the active plan.",
     inputSchema: {
       plan_id: z.string().min(1).optional(),
       slice_id: z.string().min(1),
       status: z.enum(["pending", "in_progress", "done", "blocked", "superseded"]),
       evidence: z.string().optional(),
+      force: z.boolean().optional(),
+      force_reason: z.string().optional(),
     },
   },
-  async ({ plan_id: planIdInput, slice_id, status, evidence }) => {
-    const gated = await requireSharedGate("plan.update", { plan_id: planIdInput, slice_id, status });
+  async ({ plan_id: planIdInput, slice_id, status, evidence, force, force_reason }) => {
+    // #291 round-1 cassandra finding 4: force/force_reason were previously
+    // absent from the shared-gate details, so an operator/daemon approval
+    // channel could not distinguish a routine update from a depends_on
+    // override — the only record was after the fact. Now the gate decision
+    // itself is made with the override visible.
+    const gated = await requireSharedGate("plan.update", { plan_id: planIdInput, slice_id, status, force, force_reason });
     if (gated) return gated;
     const effectiveVaultPath = DEFAULT_VAULT_PATH;
     const target = await resolvePlanTarget(planIdInput);
@@ -1336,9 +1366,34 @@ server.registerTool(
     const plan = await rehydratePlan(notePath);
     const targetSlice = plan.slices.find((s) => s.id === slice_id);
     const from = targetSlice?.status ?? ("pending" as const);
-    const next = updateSlice(plan, slice_id, status, evidence);
+    // #291: compute against the PRE-update plan — this is the only point
+    // that still has "what was unmet" available; updateSlice is pure and
+    // does no I/O, so it cannot journal the override itself.
+    const unmetBeforeUpdate = status === "done" ? unmetDependencies(plan, slice_id) : [];
+    const next = updateSlice(plan, slice_id, status, evidence, { force, forceReason: force_reason });
     await persistPlan(next, { vaultPath: effectiveVaultPath, notePath });
     const journalPath = path.join(path.dirname(notePath), `${plan_id}.log.md`);
+    // #291 round-1 cassandra finding 5: a force override past an unmet
+    // depends_on gate must never be silent. updateSlice already refuses to
+    // force without a force reason, so reaching here with
+    // unmetBeforeUpdate non-empty means the transition succeeded only
+    // because force+force_reason were both supplied. This used to be a
+    // SECOND appendJournal call after status_changed — reproduced with a
+    // mutant, but also true in the unmutated code: a crash between the two
+    // writes left "done" durable with no override record at all. Folded
+    // into the single status_changed write instead, so the override record
+    // can never be missing from the journal ENTRY that describes the
+    // transition (journal-vs-journal atomicity). This does NOT close the
+    // window between persistPlan (above) and this appendJournal call —
+    // round-2 cassandra finding MEDIUM-5 caught an earlier version of this
+    // comment overclaiming that it did. A crash in that window still
+    // leaves "done" durable in the vault note with no journal entry at
+    // all (state-vs-journal), the same pre-existing property every other
+    // status_changed write in this handler already has — not new to
+    // #291, and closing it is a separate, larger durability design
+    // (journal-before-persist + reconciliation on rehydrate), out of scope
+    // here. Who: server-stamped DEFAULT_AGENT_ID (G11 pattern elsewhere in
+    // this file — the model cannot spoof this).
     await appendJournal(journalPath, {
       kind: "status_changed",
       slice_id,
@@ -1346,6 +1401,9 @@ server.registerTool(
       to: status,
       evidence,
       at: new Date().toISOString(),
+      ...(unmetBeforeUpdate.length > 0
+        ? { depends_on_override: { unmet: unmetBeforeUpdate, reason: force_reason, forced_by: DEFAULT_AGENT_ID } }
+        : {}),
     });
     if (status === "done" && targetSlice && targetSlice.gate && targetSlice.gate.trim()) {
       await appendJournal(journalPath, {
@@ -1459,7 +1517,22 @@ server.registerTool(
     },
   },
   async ({ plan_id: planIdInput, new_slices, add_slices, drop_slice_ids }) => {
-    const gated = await requireSharedGate("plan.replan", { plan_id: planIdInput });
+    // #291 round-2 cassandra finding LOW-8: replan is now capable of
+    // silently satisfying a dependency via supersession (see
+    // diffSupersededDependencies below) — the shared-gate approval decision
+    // is made before that diff exists (it depends on the rehydrated plan),
+    // so it can only see the shape of the request, not its dependency
+    // impact. Surfacing drop_slice_ids/new_slices ids here at least lets an
+    // approval policy see WHAT is being dropped/replaced, even though the
+    // downstream consequence for other slices' depends_on isn't computed
+    // yet at this point. Accepted as a disclosed residual — moving the gate
+    // after the diff would change gate-ordering semantics for every other
+    // caller of requireSharedGate in this file, out of scope for #291.
+    const gated = await requireSharedGate("plan.replan", {
+      plan_id: planIdInput,
+      new_slice_ids: new_slices?.map((s) => s.id).filter(Boolean),
+      drop_slice_ids,
+    });
     if (gated) return gated;
     const effectiveVaultPath = DEFAULT_VAULT_PATH;
     const target = await resolvePlanTarget(planIdInput);
@@ -1475,11 +1548,34 @@ server.registerTool(
       }
       next = replan(plan, new_slices);
     }
+    // #291 round-1 cassandra finding 1 (HIGH, confirmed by independent
+    // reproduction against the real compiled server): replan()'s `??` on
+    // depends_on only guards null/undefined, not `[]` — a caller can wipe
+    // an existing slice's depends_on to an empty array and the hard block
+    // above has nothing left to enforce, with no journal trail at all. This
+    // does not re-gate the edit (replan's purpose is restructuring the
+    // plan; hard-blocking dependency edits themselves is a separate, larger
+    // design decision outside this fix's brief) — it makes the edit visible
+    // instead of silent, which is the actual invariant #291 requires.
+    const dependsOnChanged = diffDependsOn(plan, next);
+    // #291 round-2 cassandra finding HIGH-1 (confirmed by independent
+    // reproduction before trusting the review): diffDependsOn alone missed
+    // the ordinary, cheaper way to satisfy a dependency for free — omitting
+    // the dependency slice from new_slices (or listing it in
+    // drop_slice_ids) supersedes it, and unmetDependencies already treats
+    // superseded as resolved. That path produced zero journal trail before
+    // this. Journaled here, not blocked: replan's purpose is restructuring
+    // the plan, and hard-gating supersession itself is a separate, larger
+    // design decision outside this fix's brief (see diffSupersededDependencies'
+    // docstring).
+    const dependsOnSuperseded = diffSupersededDependencies(plan, next);
     await persistPlan(next, { vaultPath: effectiveVaultPath, notePath });
     const journalPath = path.join(path.dirname(notePath), `${plan_id}.log.md`);
     await appendJournal(journalPath, {
       kind: "replan",
       at: new Date().toISOString(),
+      ...(dependsOnChanged.length > 0 ? { depends_on_changed: dependsOnChanged } : {}),
+      ...(dependsOnSuperseded.length > 0 ? { depends_on_superseded: dependsOnSuperseded } : {}),
     });
     return textResult(JSON.stringify(next, null, 2));
   },

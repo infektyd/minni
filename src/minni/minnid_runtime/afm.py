@@ -105,6 +105,22 @@ _COMPILE_FAILURE_STATUSES = frozenset(
 # schedule while the writer was stuck. The writer's in-flight guard is what
 # prevents duplicate drafts; this longer backoff (well past the 30s wait plus
 # drain margin) keeps the loop from burning compute against a blocked queue.
+# #307: which compact_distillation skip buckets are genuine DROPS — input
+# discarded, unrecoverable, and never self-healing — rather than routine
+# routing or work that landed.
+#
+# Excluded and why: `_other_kind` is ROUTING (other kinds share that inbox and
+# are drained by their own pass, and the kind-less dead letters among them are
+# already surfaced by memory_lifecycle.afm_dead_letter); `_no_candidates` is
+# not loss at all (the note is written and the file archived).
+#
+# `_agent_mismatch` and `_empty_summary` ARE included: both `continue` with no
+# archive and no note, and both are deterministic — the same file produces the
+# identical skip forever — so they are exactly as lost as a corrupt payload.
+COMPACT_DROP_REASONS = (
+    "_unreadable", "_malformed", "_agent_mismatch", "_empty_summary",
+)
+
 _WRITE_STALL_STATUSES = frozenset({"write_timeout", "write_in_flight"})
 _WRITE_STALL_RETRY_SECONDS = 1800
 
@@ -982,6 +998,81 @@ async def afm_loop_runner(context: AFMContext):
                                     _dc["vault_notes_written"],
                                     _dc["archived_zero_shared"] + _dc["archived_with_shared"],
                                 )
+                            # #307: the pass counts every file it drops, but
+                            # this caller read only `inserted`, so the count
+                            # died here — a WARNING in the daemon log and
+                            # nothing on any counter or health surface. A
+                            # writer emitting corrupt payloads was findable
+                            # only by grepping the log.
+                            #
+                            # DROPS only. `_other_kind` is not a drop: other
+                            # kinds legitimately share this inbox and are
+                            # drained by their own pass, so counting it would
+                            # manufacture an alarm that never clears.
+                            # NOTE: this is a count of drop EVENTS, not of
+                            # files. A dropped file is never archived or
+                            # quarantined, so it is re-dropped on every tick;
+                            # the cumulative total is files x ticks. The
+                            # FILE count — the quantity that is true and that
+                            # clears when the file is removed — is reported
+                            # separately on health.
+                            _skipped = _dc.get("skipped") or {}
+                            _dropped = sum(
+                                int(_skipped.get(k) or 0)
+                                for k in COMPACT_DROP_REASONS
+                            )
+                            if _dropped:
+                                obs.incr("compact_distillation_dropped_total", _dropped)
+                                # Logged even when nothing was inserted: a tick
+                                # that ONLY dropped files used to say nothing
+                                # at all from this branch.
+                                context.logger.warning(
+                                    "AFM loop: compact distillation dropped %d "
+                                    "unusable inbox file(s): %s",
+                                    _dropped,
+                                    {
+                                        k: _skipped[k]
+                                        for k in COMPACT_DROP_REASONS
+                                        if _skipped.get(k)
+                                    },
+                                )
+                                # #336: give those files a DRAIN. Without one
+                                # they stay in the inbox and are re-dropped on
+                                # every tick (~96/day at a 900s interval), and
+                                # the health count could never reach zero.
+                                # Same fail-open contract as the sibling
+                                # drains: a failure here must not stop
+                                # consolidation.
+                                try:
+                                    from minni.afm_passes.inbox_quarantine import (
+                                        quarantine_unusable_compact_summaries,
+                                    )
+                                    _cq = quarantine_unusable_compact_summaries(
+                                        context.default_config,
+                                        fallback_principal=str((cfg or {}).get(
+                                            "inbox_fallback_principal", "unknown")),
+                                        ttl_days=(cfg or {}).get(
+                                            "inbox_quarantine_ttl_days"),
+                                    )
+                                    if _cq.get("quarantined"):
+                                        obs.incr(
+                                            "compact_summary_quarantined_total",
+                                            _cq["quarantined"],
+                                        )
+                                        context.logger.warning(
+                                            "AFM loop: quarantined %d unusable "
+                                            "compact-summary file(s): %s",
+                                            _cq["quarantined"], _cq["quarantined_files"],
+                                        )
+                                except Exception as exc:
+                                    context.logger.exception(
+                                        "AFM loop: compact-summary drain raised "
+                                        "(skipped; consolidation continues)"
+                                    )
+                                    obs.incr("inbox_quarantine_failures_total")
+                                    obs.record_error(
+                                        "afm_loop.compact_summary_drain", exc,
+                                    )
                         except Exception as exc:
                             context.logger.exception(
                                 "AFM loop: compact distillation raised "

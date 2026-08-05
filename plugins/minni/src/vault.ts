@@ -14,6 +14,12 @@ import path from "node:path";
 import os from "node:os";
 import * as fs from "node:fs"; // RCM-005: for realpathSync in assertUnder (G23 equivalent)
 import type { LearningQualityReport } from "./policy.js";
+// #312: task.ts already imports FROM this module (recordAudit,
+// searchVaultNotes, PrivacyLevel, VaultSearchResult) — this is a function-
+// scoped-use-only import (see resolveVaultRef below) so the circularity
+// resolves fine under Node's ESM live-binding semantics; neither module
+// touches the other's binding at top-level/module-evaluation time.
+import { filterSafeVaultResults } from "./task.js";
 
 export type VaultSection =
   | "raw"
@@ -311,9 +317,26 @@ const PAGE_STATUSES: ReadonlyArray<PageStatus> = [
   "expired",
 ];
 
+// #312 cassandra finding: this anchor MUST be the single source of truth for
+// "where does frontmatter start/end" — frontmatterBlock (privacy/status/title
+// parsing) and snippetFor (the text handed to the heuristic scanner) used to
+// diverge: frontmatterBlock was anchored strictly at string offset 0 with no
+// tolerance for a leading BOM/blank line, while snippetFor's strip used `/m`
+// (matches `---` at the start of ANY line, not just the document). A note
+// with a leading blank line made frontmatterBlock return "" (so authored
+// `privacy: private` was silently ignored) while snippetFor still correctly
+// stripped the block before the heuristic scan saw it — both privacy layers
+// missed the same note for opposite reasons. One regex, tolerant of a
+// leading BOM/whitespace but still anchored at the true document start (not
+// per-line), closes both directions: a real leading frontmatter block is
+// found even with BOM/blank-line noise, and a `---` horizontal rule
+// appearing later in the body is never mistaken for frontmatter by either
+// function.
+const FRONTMATTER_RE = /^\uFEFF?\s*---\r?\n([\s\S]*?)\r?\n---/;
+
 /** First frontmatter block of a note (writeVaultPage emits `---\n...\n---`). */
 function frontmatterBlock(markdown: string): string {
-  return markdown.match(/^---\r?\n([\s\S]*?)\r?\n---/)?.[1] ?? "";
+  return markdown.match(FRONTMATTER_RE)?.[1] ?? "";
 }
 
 /**
@@ -402,7 +425,7 @@ function snippetFor(
   maxLength = 280,
 ): string {
   const plain = markdown
-    .replace(/^---[\s\S]*?---/m, "")
+    .replace(FRONTMATTER_RE, "")
     .replace(/^#+\s+/gm, "")
     .replace(/\s+/g, " ")
     .trim();
@@ -2296,11 +2319,38 @@ async function resolveVaultRef(
       assertUnder(notePath, vaultPath);
       const markdown = await readFile(notePath, "utf8");
       const relativePath = path.relative(vaultPath, notePath);
+      // #312: a handoff's wikilink_refs can name ANY note in the vault,
+      // including one authored (or heuristically flagged) privacy:private —
+      // this read had no privacy gate at all before, worse than the SEC-006
+      // gap #308 fixed for UserPromptSubmit's recall pointer, since this one
+      // surfaces the note's BODY TEXT (a 520-char snippet), not just a
+      // title/path. Gate through the exact same filterSafeVaultResults
+      // machinery #308 already established (not a duplicated check), so the
+      // two call sites can't silently drift the way the pre-#308 gap did.
+      const candidate: VaultSearchResult = {
+        notePath,
+        relativePath,
+        wikilink: normalized,
+        title: titleFromMarkdown(relativePath, markdown),
+        snippet: snippetFor(markdown, queryTerms(normalized), 520),
+        score: 0,
+        privacy: privacyFromMarkdown(markdown),
+      };
+      if (filterSafeVaultResults([candidate]).length === 0) {
+        // Fail closed exactly like a containment reject below: this ref
+        // resolves to a real file, but it's not safe to surface, so it's
+        // treated as unresolved — same silent-omission precedent #308 set
+        // for vault_matches (H2 concern considered and rejected there: this
+        // is the system correctly declining to show content it was never
+        // entitled to show, not a degraded/error state masquerading as
+        // clean).
+        continue;
+      }
       return {
         ref: normalized,
         relativePath,
         notePath,
-        snippet: snippetFor(markdown, queryTerms(normalized), 520),
+        snippet: candidate.snippet,
       };
     } catch {
       // try the next (or containment reject -> fail closed, treat as absent)

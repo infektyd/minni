@@ -366,6 +366,14 @@ def handle_health_report(params: dict, request_id: Any, context: HealthContext) 
             # content, no principals), matching the rest of this block.
             "resolution_mix": {"auto_accept_own": 0, "manual": 0,
                                "afm_consolidation": 0},
+
+            # #307: how many inbox files the distillation pass currently
+            # cannot read. A LIVE count, not the cumulative drop counter — a
+            # dropped file is never archived, so it is re-dropped every tick
+            # and a cumulative total is files x ticks-since-boot, which would
+            # overstate corruption by ~96x/day per file. This clears when the
+            # file is removed.
+            "compact_distillation_unusable": {"files": 0},
         },
         # #225-R6 / GA1-1: health never compared document count against vector
         # count, so a 43% document-vector gap (381/879, all knowledge layer) and
@@ -657,6 +665,33 @@ def handle_health_report(params: dict, request_id: Any, context: HealthContext) 
                 "files": None,
                 "oldest_age_days": None,
                 "unreadable": None,
+                "status": "unknown",
+                "error": type(exc).__name__,
+            }
+        try:
+            from minni.afm_passes.compact_distillation import (
+                count_unusable_compact_files,
+            )
+
+            # Same fallback the drain and the pass use — see
+            # count_unusable_compact_files' docstring on why this is required
+            # rather than defaulted.
+            _cons = (
+                (getattr(context.default_config, "afm_loop_schedule", {}) or {})
+                .get("passes", {})
+                .get("consolidation", {})
+            ) or {}
+            lifecycle["compact_distillation_unusable"] = count_unusable_compact_files(
+                config=context.default_config,
+                fallback_principal=str(
+                    _cons.get("inbox_fallback_principal", "unknown")
+                ),
+            )
+        except Exception as exc:
+            # Replace the sub-dict, matching the sibling blocks: leaving the
+            # zero default would report a scan that never ran as "0 files".
+            lifecycle["compact_distillation_unusable"] = {
+                "files": None,
                 "status": "unknown",
                 "error": type(exc).__name__,
             }

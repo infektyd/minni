@@ -500,3 +500,241 @@ def test_dry_run_does_not_archive_file_with_shared_candidates(tmp_path, monkeypa
     assert res["archived_with_shared"] == 0
     assert (inbox / "shared.json").is_file()
     assert not (inbox / ".archive").exists()
+
+
+# ── #307: the pass counts its drops; the AFM caller must not discard them ───
+
+
+def test_afm_loop_surfaces_compact_distillation_drops(tmp_path, monkeypatch):
+    """compact_distillation counts _unreadable/_malformed correctly (AFM-9,
+    #230), but the AFM loop only logged when work LANDED and never read
+    _dc["skipped"] — no counter, nothing on any health surface. A writer that
+    starts emitting corrupt payloads was discoverable only by grepping the
+    daemon log for a warning string."""
+    import asyncio
+    import json as _json
+    import os as _os
+    import sys as _sys
+    import time as _time
+
+    import minni.obs as obs
+    from minni.minnid_runtime.afm import afm_loop_runner
+
+    _sys.path.insert(0, _os.path.dirname(__file__))
+    from test_afm_loop_promotion import _loop_context  # noqa: E402
+    from test_afm_loop_promotion import _make_db as _make_loop_db  # noqa: E402
+
+    monkeypatch.setenv("MINNI_AFM_LOOP", "on")
+    monkeypatch.delenv("MINNI_AFM_MODE", raising=False)
+    monkeypatch.delenv("MINNI_AFM_PROVIDER_MODE", raising=False)
+
+    db_obj, cfg = _make_loop_db(tmp_path)
+    cons_cfg = cfg.afm_loop_schedule["passes"]["consolidation"]
+    cons_cfg["distill_compact_summaries"] = True
+
+    inbox = tmp_path / "unknown-vault" / "inbox"
+    inbox.mkdir(parents=True)
+    (inbox / "compact-truncated.json").write_text(
+        '{"kind": "compact_summary", "summ', encoding="utf-8",
+    )
+    (inbox / "compact-listish.json").write_text("[]", encoding="utf-8")
+    old = _time.time() - 3600
+    for p in inbox.glob("*.json"):
+        _os.utime(p, (old, old))
+
+    obs.METRICS.reset()
+    try:
+        ctx, _traces = _loop_context(db_obj, cfg, ticks=1)
+        asyncio.run(afm_loop_runner(ctx))
+
+        snap = obs.metrics_snapshot()
+        assert snap.get("compact_distillation_dropped_total") == 2, snap
+    finally:
+        obs.METRICS.reset()
+        del _json
+
+
+def test_health_reports_a_live_unusable_file_count_not_a_tick_total(tmp_path, monkeypatch):
+    """The counter measures drop EVENTS: a dropped file is never archived, so
+    it is re-dropped every tick and a cumulative total is files x ticks
+    (~96/day/file at a 900s interval). Health must report the FILE count, or
+    it overstates corruption — the same health-overstatement class this fix
+    exists to close, relocated from the log to the surface."""
+    import minni.obs as obs
+
+    from test_inbox_quarantine import _real_lifecycle_db  # noqa: E402
+
+    import minni.minnid as minnid
+    from minni.principal import EffectivePrincipal
+
+    _real_lifecycle_db(tmp_path, monkeypatch)
+    inbox = tmp_path / "unknown-vault" / "inbox"
+    inbox.mkdir(parents=True, exist_ok=True)
+    (inbox / "c1.json").write_text('{"kind": "compact_summary", "su', encoding="utf-8")
+    (inbox / "c2.json").write_text("[]", encoding="utf-8")
+
+    obs.METRICS.reset()
+    try:
+        # A counter inflated by many ticks must NOT move the health number.
+        obs.incr("compact_distillation_dropped_total", 96)
+        op = EffectivePrincipal(agent_id="main", capabilities=["*"])
+        rep = minnid._handle_health_report({"_recovery": False, "_principal": op}, 1)["result"]
+        ml = rep["memory_lifecycle"]
+        assert ml["compact_distillation_unusable"]["files"] == 2, ml
+    finally:
+        obs.METRICS.reset()
+
+
+def test_unusable_count_clears_when_the_file_is_removed(tmp_path):
+    """Self-clearing is the property a cumulative counter cannot have."""
+    from minni.afm_passes.compact_distillation import count_unusable_compact_files
+
+    inbox = tmp_path / "codex-vault" / "inbox"
+    inbox.mkdir(parents=True)
+    bad = inbox / "c1.json"
+    bad.write_text("{oops", encoding="utf-8")
+    assert count_unusable_compact_files([inbox], fallback_principal="unknown")["files"] == 1
+
+    bad.unlink()
+    assert count_unusable_compact_files([inbox], fallback_principal="unknown")["files"] == 0
+
+
+def test_unusable_count_ignores_readable_files(tmp_path):
+    from minni.afm_passes.compact_distillation import count_unusable_compact_files
+
+    inbox = tmp_path / "codex-vault" / "inbox"
+    inbox.mkdir(parents=True)
+    # summary_TEXT is the field the pass reads; a file carrying only
+    # "summary" has no usable content and is correctly counted (#336).
+    (inbox / "ok.json").write_text(
+        json.dumps({
+            "kind": "compact_summary",
+            "agent_id": "codex",
+            "summary_text": "a real summary",
+        }),
+        encoding="utf-8",
+    )
+    assert count_unusable_compact_files([inbox], fallback_principal="codex")["files"] == 0
+
+
+def test_health_unusable_block_degrades_to_unknown_not_zero(tmp_path, monkeypatch):
+    from test_inbox_quarantine import _real_lifecycle_db  # noqa: E402
+
+    import minni.minnid as minnid
+    from minni.principal import EffectivePrincipal
+
+    _real_lifecycle_db(tmp_path, monkeypatch)
+
+    def _boom(*a, **k):
+        raise RuntimeError("scan failed")
+
+    monkeypatch.setattr(
+        "minni.afm_passes.compact_distillation.count_unusable_compact_files", _boom,
+    )
+    op = EffectivePrincipal(agent_id="main", capabilities=["*"])
+    rep = minnid._handle_health_report({"_recovery": False, "_principal": op}, 1)["result"]
+
+    block = rep["memory_lifecycle"]["compact_distillation_unusable"]
+    assert block["status"] == "unknown"
+    assert block["error"] == "RuntimeError"
+    assert block["files"] is None, "a failed scan must not report zero files"
+
+
+def test_health_report_does_not_consume_the_status_delta_baseline(tmp_path, monkeypatch):
+    """metrics_snapshot, never metrics_delta_snapshot: consuming the baseline
+    here would suppress a rising-error flag before handle_status showed it."""
+    import minni.obs as obs
+
+    from test_inbox_quarantine import _real_lifecycle_db  # noqa: E402
+
+    import minni.minnid as minnid
+    from minni.principal import EffectivePrincipal
+
+    _real_lifecycle_db(tmp_path, monkeypatch)
+    obs.METRICS.reset()
+    try:
+        obs.incr("compact_distillation_dropped_total", 5)
+        op = EffectivePrincipal(agent_id="main", capabilities=["*"])
+        minnid._handle_health_report({"_recovery": False, "_principal": op}, 1)
+        delta = obs.metrics_delta_snapshot()
+        entry = delta.get("compact_distillation_dropped_total") or {}
+        assert entry.get("delta") == 5, (
+            f"health_report must not have advanced the delta baseline: {delta}"
+        )
+    finally:
+        obs.METRICS.reset()
+
+
+def test_a_tick_that_only_dropped_files_still_logs(tmp_path, monkeypatch, caplog):
+    """The old caller logged only when work LANDED, so a tick that only
+    dropped files said nothing at all from that branch."""
+    import asyncio
+    import logging
+    import os as _os
+    import sys as _sys
+
+    import minni.obs as obs
+    from minni.minnid_runtime.afm import afm_loop_runner
+
+    _sys.path.insert(0, _os.path.dirname(__file__))
+    from test_afm_loop_promotion import _loop_context  # noqa: E402
+    from test_afm_loop_promotion import _make_db as _make_loop_db  # noqa: E402
+
+    monkeypatch.setenv("MINNI_AFM_LOOP", "on")
+    monkeypatch.delenv("MINNI_AFM_MODE", raising=False)
+    monkeypatch.delenv("MINNI_AFM_PROVIDER_MODE", raising=False)
+
+    db_obj, cfg = _make_loop_db(tmp_path)
+    cfg.afm_loop_schedule["passes"]["consolidation"]["distill_compact_summaries"] = True
+    inbox = tmp_path / "unknown-vault" / "inbox"
+    inbox.mkdir(parents=True)
+    (inbox / "c1.json").write_text("{oops", encoding="utf-8")
+
+    obs.METRICS.reset()
+    try:
+        ctx, _traces = _loop_context(db_obj, cfg, ticks=1)
+        with caplog.at_level(logging.WARNING):
+            asyncio.run(afm_loop_runner(ctx))
+        assert any(
+            "compact distillation dropped" in r.getMessage() for r in caplog.records
+        ), [r.getMessage() for r in caplog.records]
+    finally:
+        obs.METRICS.reset()
+
+
+def test_routine_other_kind_routing_is_not_counted_as_a_drop(tmp_path, monkeypatch):
+    """_other_kind is ROUTING, not loss: other kinds legitimately share this
+    inbox and are drained by their own pass (and the kind-less dead letters
+    among them are already surfaced by memory_lifecycle.afm_dead_letter).
+    Counting it would manufacture an alarm for healthy traffic."""
+    import asyncio
+    import os as _os
+    import sys as _sys
+
+    import minni.obs as obs
+    from minni.minnid_runtime.afm import afm_loop_runner
+
+    _sys.path.insert(0, _os.path.dirname(__file__))
+    from test_afm_loop_promotion import _loop_context  # noqa: E402
+    from test_afm_loop_promotion import _make_db as _make_loop_db  # noqa: E402
+
+    monkeypatch.setenv("MINNI_AFM_LOOP", "on")
+    monkeypatch.delenv("MINNI_AFM_MODE", raising=False)
+    monkeypatch.delenv("MINNI_AFM_PROVIDER_MODE", raising=False)
+
+    db_obj, cfg = _make_loop_db(tmp_path)
+    cfg.afm_loop_schedule["passes"]["consolidation"]["distill_compact_summaries"] = True
+    inbox = tmp_path / "unknown-vault" / "inbox"
+    inbox.mkdir(parents=True)
+    (inbox / "handoff.json").write_text(
+        json.dumps({"kind": "handoff", "task": "t"}), encoding="utf-8",
+    )
+
+    obs.METRICS.reset()
+    try:
+        ctx, _traces = _loop_context(db_obj, cfg, ticks=1)
+        asyncio.run(afm_loop_runner(ctx))
+        snap = obs.metrics_snapshot()
+        assert not snap.get("compact_distillation_dropped_total"), snap
+    finally:
+        obs.METRICS.reset()
