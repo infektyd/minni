@@ -210,6 +210,30 @@ def _load_raw_principal_file(
     return None
 
 
+def _auto_accept_flag(raw_value: Any, *, where: str) -> bool:
+    """Parse the #290 knob STRICTLY. Anything but JSON `true` is off.
+
+    `bool()` on a JSON scalar fails OPEN on this knob, which is exactly
+    backwards for the one field that disables the self-approval gate:
+    bool("false"), bool("0"), bool("no") and bool("False") are all True. An
+    operator writing `"auto_accept_own": "false"` — a natural JSON typo — would
+    have silently ENABLED unattended durable writes.
+
+    Only the boolean `True` enables it. A non-boolean is refused and logged, so
+    a typo is visible rather than silently doing the opposite of what it says.
+    """
+    if raw_value is True:
+        return True
+    if raw_value is False or raw_value is None:
+        return False
+    logger.warning(
+        "principal %s: auto_accept_own must be a JSON boolean, got %r (%s) — "
+        "treating as DISABLED. Write true, not \"true\".",
+        where, raw_value, type(raw_value).__name__,
+    )
+    return False
+
+
 def _principal_from_raw(
     raw: dict, *, transport: str, principals_dir: Path
 ) -> EffectivePrincipal:
@@ -237,7 +261,9 @@ def _principal_from_raw(
         transport=transport,
         capabilities=list(raw.get("capabilities", ["*"])),
         allowed_vault_roots=norm_roots,
-        auto_accept_own=bool(raw.get("auto_accept_own", False)),
+        auto_accept_own=_auto_accept_flag(
+            raw.get("auto_accept_own", False), where=aid
+        ),
     )
 
 
@@ -593,7 +619,10 @@ def resolve_effective_principal(
             platform_auto_map = (
                 platform_auto if isinstance(platform_auto, dict) else {}
             )
-            resolved_auto = bool(platform_auto_map.get(supplied, False))
+            resolved_auto = _auto_accept_flag(
+                platform_auto_map.get(supplied, False),
+                where=f"platform agent {supplied}",
+            )
             raw_ws = raw.get("workspace_id")
             resolved_ws = raw_ws if raw_ws is not None else stamped.workspace_id
             return EffectivePrincipal(

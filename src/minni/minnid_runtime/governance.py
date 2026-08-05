@@ -433,8 +433,14 @@ def handle_resolve_contradiction(params: dict, request_id: Any, context: Governa
         # the INSERT/UPDATE/event block silently ran in a separate deferred
         # transaction. Measured: a rollback after that point left rows behind,
         # and the docstring's "atomically supersede" had stopped being true.
+        # Fail-SOFT, matching stage_candidate: the INSERT below names
+        # content_hash unconditionally, so a failed column ensure (a transient
+        # SQLITE_BUSY on the DDL is enough) would otherwise make the whole
+        # CORRECTION fail. A correction is the mechanism for fixing poisoned
+        # memory; it must not be the thing that breaks when the DB is busy.
+        _have_hash_col = ensure_content_hash_column(wb.db)
         _chash = None
-        if ensure_content_hash_column(wb.db):
+        if _have_hash_col:
             from minni.afm_passes.consolidation import content_hash as _content_hash
 
             _chash = _content_hash(new_content)
@@ -478,20 +484,22 @@ def handle_resolve_contradiction(params: dict, request_id: Any, context: Governa
                         "explicitly allowed operator)",
                         request_id,
                     ))
-            c.execute("""
-                INSERT INTO learnings
-                (agent_id, category, content, source_doc_ids, source_query,
-                 confidence, embedding, created_at,
-                 assertion, applies_when, evidence_doc_ids, status, content_hash)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                agent_id, category, new_content,
-                None, None,
-                params.get("confidence", 1.0),
-                emb_bytes, now,
-                assertion, applies_when, doc_ids_json,
-                "active", _chash,
-            ))
+            _cols = ("agent_id, category, content, source_doc_ids, source_query, "
+                     "confidence, embedding, created_at, assertion, applies_when, "
+                     "evidence_doc_ids, status")
+            _vals = [
+                agent_id, category, new_content, None, None,
+                params.get("confidence", 1.0), emb_bytes, now,
+                assertion, applies_when, doc_ids_json, "active",
+            ]
+            if _have_hash_col:
+                _cols += ", content_hash"
+                _vals.append(_chash)
+            c.execute(
+                f"INSERT INTO learnings ({_cols}) VALUES "
+                f"({', '.join('?' * len(_vals))})",
+                _vals,
+            )
             new_lid = c.lastrowid
 
             for sid in supersede_ids:
@@ -698,6 +706,61 @@ def handle_log_event(params: dict, request_id: Any, context: GovernanceContext) 
         return context.make_error(-32000, f"Log event error: {exc}", request_id)
 
 
+def apply_accepted_candidate_effects(cursor: Any, candidate_id: int) -> None:
+    """In-transaction side effects of accepting a candidate. ONE definition.
+
+    Every accept path must run this: resolve_candidate (manual), the AFM
+    promotion, and #290's auto-accept. It exists as a shared function rather
+    than three copies because the copies drift — the auto-accept branch
+    originally skipped `supersede_afm_review` on the reasoning that a candidate
+    staged microseconds earlier cannot carry a review marker. That reasoning is
+    true today and is exactly the kind of thing that silently stops being true
+    (a future staging path that fences on write, or inbox ingest reaching this
+    code). #305's M5 fixed the orphaned-marker class once; parity should not
+    depend on anyone re-deriving that argument.
+
+    M5: the review fence must not outlive the candidate it fences. Same cursor,
+    same transaction — a rolled-back accept takes the marker change with it.
+    """
+    supersede_afm_review(cursor, candidate_id)
+
+
+def settle_accepted_candidate(
+    context: "GovernanceContext",
+    db: Any,
+    candidate_id: int,
+    agent_id: str,
+    content: str,
+    learning_id: int,
+) -> bool:
+    """Post-COMMIT side effects. Returns whether indexing succeeded.
+
+    Never raises: the row is already committed by the time this runs, so an
+    exception here reports a failure for a learn that in fact succeeded — the
+    caller then retries and duplicates it while the first copy sits durable and
+    unindexed.
+    """
+    indexed_ok = True
+    try:
+        context.index_durable_learning(
+            agent_id, content, key=f"learning:{learning_id}", db=db
+        )
+    except Exception as exc:
+        indexed_ok = False
+        context.logger.warning(
+            "candidate=%s learning=%s indexed=FAILED (%s); durable but not "
+            "recallable until reindexed (G15 audit)",
+            candidate_id, learning_id, exc,
+        )
+    try:
+        context.maybe_archive_inbox_source(db, candidate_id)
+    except Exception as exc:
+        context.logger.warning(
+            "candidate=%s inbox archive failed (%s; non-fatal)", candidate_id, exc,
+        )
+    return indexed_ok
+
+
 def auto_accept_blockers(
     content: str, instruction_like: bool, requested_privacy: str = "safe"
 ) -> list[str]:
@@ -888,16 +951,24 @@ def stage_candidate(params: dict, request_id: Any, context: GovernanceContext) -
                     raise RuntimeError("content_hash column unavailable")
                 chash = _content_hash(stored_content)
                 model = getattr(wb, "model", None)
-                if model is not None:
-                    import numpy as np
+                if model is None:
+                    # No embedder means no embedding, and detect_contradictions
+                    # filters `embedding IS NOT NULL` — an active learning
+                    # without one is invisible to the guard in front of this
+                    # channel, which is the F2 defect in a different costume.
+                    # Every other preparation failure stages as proposed; a
+                    # missing model must not be the one exception that writes
+                    # durable memory anyway.
+                    raise RuntimeError("embedder unavailable")
+                import numpy as np
 
-                    from minni.models import get_embedder_lock
+                from minni.models import get_embedder_lock
 
-                    with get_embedder_lock():
-                        emb = model.encode(
-                            stored_content, show_progress_bar=False
-                        ).astype(np.float32)
-                    emb_bytes = emb.tobytes()
+                with get_embedder_lock():
+                    emb = model.encode(
+                        stored_content, show_progress_bar=False
+                    ).astype(np.float32)
+                emb_bytes = emb.tobytes()
             except Exception as exc:
                 context.logger.warning(
                     "auto_accept_own: could not prepare the durable write (%s); "
@@ -937,9 +1008,13 @@ def stage_candidate(params: dict, request_id: Any, context: GovernanceContext) -
                 # agent's durable content, and the echoed "duplicate" reason
                 # confirms the hit — the same class this repo already closed on
                 # handle_learn's contradiction scan (R5, 2026-07-02 triage).
+                # status='active' matters: a superseded or rejected row is not
+                # a live duplicate, and matching it blocked re-learning content
+                # that no active learning carries any more — the correction
+                # machinery would have permanently poisoned the hash.
                 c.execute(
                     "SELECT 1 FROM learnings WHERE content_hash=? AND agent_id=? "
-                    "LIMIT 1",
+                    "AND status='active' LIMIT 1",
                     (chash, principal.agent_id),
                 )
                 if c.fetchone() is not None:
@@ -984,26 +1059,13 @@ def stage_candidate(params: dict, request_id: Any, context: GovernanceContext) -
                         cid,
                     ),
                 )
+                apply_accepted_candidate_effects(c, cid)
 
         indexed_ok = True
         if lid is not None:
-            # An unindexed durable learning is not recallable, which would make
-            # the feature look like it worked while delivering nothing — but the
-            # row is already COMMITTED by here. Letting this raise returned
-            # -32000 for a learn that had in fact succeeded, so the caller
-            # retried and staged a duplicate while the first copy sat durable
-            # and unindexed. Report the truth instead.
-            try:
-                context.index_durable_learning(
-                    principal.agent_id, stored_content, key=f"learning:{lid}", db=db,
-                )
-            except Exception as exc:
-                indexed_ok = False
-                context.logger.warning(
-                    "AUTO_ACCEPT_OWN_UNINDEXED candidate=%s learning=%s (%s); the "
-                    "learning is durable but not recallable until reindexed "
-                    "(G15 audit)", cid, lid, exc,
-                )
+            indexed_ok = settle_accepted_candidate(
+                context, db, cid, principal.agent_id, stored_content, lid,
+            )
             context.logger.warning(
                 "AUTO_ACCEPT_OWN candidate=%s learning=%s principal=%s "
                 "(operator-enabled; resolved_by=%s) (G15 audit)",
@@ -1313,25 +1375,21 @@ def resolve_candidate(params: dict, request_id: Any, context: GovernanceContext)
                 """,
                 (new_status, now, principal.agent_id, resolution_reason, cid),
             )
-            # M5: the review fence must not outlive the candidate it fences.
-            # Same cursor, same transaction — a rolled-back resolve takes the
-            # marker change with it.
-            supersede_afm_review(c, cid)
+            apply_accepted_candidate_effects(c, cid)
 
         if lid is not None:
-            context.index_durable_learning(
-                principal.agent_id,
-                str(rowd.get("content") or ""),
-                key=f"learning:{lid}",
-                db=db,
+            settle_accepted_candidate(
+                context, db, cid, principal.agent_id,
+                str(rowd.get("content") or ""), lid,
             )
+        else:
+            # A non-accept resolution still archives its inbox source.
+            context.maybe_archive_inbox_source(db, cid)
 
         context.logger.warning(
             "RESOLVE_CANDIDATE operator=%s candidate=%s decision=%s new_status=%s reason=%s (G15 audit)",
             principal.agent_id, cid, decision, new_status, reason[:80],
         )
-
-        context.maybe_archive_inbox_source(db, cid)
 
         return context.make_response(
             {

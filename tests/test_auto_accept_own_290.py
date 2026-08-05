@@ -892,3 +892,191 @@ def test_resolution_mix_requires_the_full_auto_stamp(db_path):
         conn.close()
     assert mix["auto_accept_own"] == 0, "a foreign auto_* stamp counted as this channel"
     assert mix["manual"] == 1
+
+
+# ── Bugbot round ───────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "value, expected",
+    [
+        (True, True),
+        (False, False),
+        ("true", False), ("false", False), ("True", False), ("False", False),
+        ("0", False), ("1", False), ("yes", False), ("no", False),
+        (1, False), (0, False), ([], False), ({}, False), (None, False),
+    ],
+)
+def test_the_knob_is_parsed_strictly(tmp_path, value, expected):
+    """`bool()` fails OPEN on this knob, which is backwards for the one field
+    that disables the self-approval gate: bool("false"), bool("0") and
+    bool("no") are all True. An operator writing `"auto_accept_own": "false"` —
+    a natural JSON typo — would have silently ENABLED unattended durable
+    writes. Only JSON `true` enables it; anything else is refused and logged."""
+    from minni.principal import from_operator_config
+
+    d = _write_principal(tmp_path, {
+        "agent_id": "claude-code", "capabilities": ["learn"],
+        "auto_accept_own": value,
+    })
+    p = from_operator_config("local", principals_dir=d)
+    assert p.auto_accept_own is expected, f"{value!r} parsed as {p.auto_accept_own}"
+
+
+def test_a_mistyped_platform_knob_also_fails_closed(tmp_path):
+    from minni.principal import resolve_effective_principal
+
+    d = _write_principal(tmp_path, {
+        "agent_id": "main", "capabilities": ["*"],
+        "platform_agent_ids": ["codex"],
+        "platform_agent_capabilities": {"codex": ["learn"]},
+        "platform_agent_auto_accept_own": {"codex": "true"},
+    })
+    p = resolve_effective_principal(
+        supplied_agent_id="codex", transport="uds", principals_dir=d
+    )
+    assert p.auto_accept_own is False
+
+
+def test_no_embedder_stages_instead_of_writing_a_blind_learning(db_path, monkeypatch):
+    """An active learning with a NULL embedding is invisible to
+    detect_contradictions, which filters `embedding IS NOT NULL` — the F2
+    defect in a different costume. Every other preparation failure stages as
+    proposed; a missing model must not be the one exception that writes durable
+    memory anyway."""
+    import minni.writeback
+
+    monkeypatch.setattr(
+        minni.writeback.WriteBackMemory, "model", property(lambda self: None)
+    )
+    res, _resp, _ = _learn(_principal(auto_accept_own=True), db_path)
+    assert res["status"] == "proposed", f"wrote a learning with no embedding: {res}"
+    assert _rows(db_path, "SELECT * FROM learnings") == []
+    assert _rows(db_path, "SELECT * FROM candidate_packets")
+
+
+def test_a_superseded_duplicate_does_not_block_relearning(db_path):
+    """The probe matched ANY row carrying the hash. A superseded or rejected
+    learning is not a live duplicate, so a correction permanently poisoned the
+    hash for content no active learning carries any more."""
+    principal = _principal(auto_accept_own=True, capabilities=["*"])
+    content = "Pin the CLI version so a release becomes a reviewable file change."
+    first, _r, _ = _learn(principal, db_path, content=content)
+    assert first["status"] == "accepted"
+
+    import sqlite3
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("UPDATE learnings SET status='superseded' WHERE learning_id=?",
+                     (first["learning_id"],))
+        conn.commit()
+    finally:
+        conn.close()
+
+    again = governance.handle_learn(
+        {"content": content, "contradicts_id": first["learning_id"]},
+        2, _context(principal, db_path)[0],
+    )
+    again = again.get("result") or again
+    assert again["status"] == "accepted", (
+        f"a superseded row blocked re-learning: {again}"
+    )
+
+
+def test_a_correction_survives_a_failed_hash_column_ensure(db_path, monkeypatch):
+    """#1: the INSERT names content_hash unconditionally, so a failed column
+    ensure made the whole CORRECTION fail. A correction is the mechanism for
+    fixing poisoned memory — it must not be what breaks when the DB is busy."""
+    # Own the learning WITHOUT auto-accept: that path creates content_hash as a
+    # side effect, which would have made the monkeypatch below vacuous.
+    author = _principal("codex", auto_accept_own=False, capabilities=["*"])
+    staged, _r, _ = _learn(author, db_path,
+                           content="Pin the CLI version so a release is a file change.")
+    assert staged["status"] == "proposed"
+    governance.resolve_candidate(
+        {"candidate_id": staged["candidate_id"], "decision": "accept", "reason": "ok"},
+        2, _context(_principal("operator", capabilities=["*"]), db_path)[0],
+    )
+    owned = {"learning_id": _rows(db_path, "SELECT learning_id FROM learnings")[0]["learning_id"]}
+    cols = [r["name"] for r in _rows(db_path, "PRAGMA table_info(learnings)")]
+    assert "content_hash" not in cols, "the column already exists; test is vacuous"
+
+    monkeypatch.setattr(
+        "minni.minnid_runtime.governance.ensure_content_hash_column", lambda db: False
+    )
+    # The manual accept recorded the RESOLVER as owner, so the operator is the
+    # principal that may supersede it.
+    context, _ = _context(_principal('operator', capabilities=['*']), db_path)
+    out = governance.handle_resolve_contradiction(
+        {"new_content": "A corrected and perfectly reasonable learning.",
+         "supersede_ids": [owned["learning_id"]]},
+        3, context,
+    )
+    assert "error" not in out, f"the correction failed on a busy DB: {out}"
+
+
+def test_auto_and_manual_acceptance_have_identical_side_effects(db_path, monkeypatch):
+    """5 + 6: the auto branch reimplemented the post-acceptance choreography
+    instead of sharing it, and the copies drift. Both routes now go through
+    apply_accepted_candidate_effects (in-txn) and settle_accepted_candidate
+    (post-commit), so this pins that they agree on the same candidate shape."""
+    calls = {"auto": [], "manual": []}
+    fenced = {"auto": [], "manual": []}
+    route_now = {"name": None}
+
+    # The in-transaction half of the choreography. Without spying on it,
+    # dropping the review fence from the auto branch survived the suite — the
+    # exact orphaned-marker class #305's M5 closed.
+    real_fence = governance.supersede_afm_review
+
+    def fence_spy(cursor, candidate_id):
+        fenced[route_now["name"]].append(candidate_id)
+        return real_fence(cursor, candidate_id)
+
+    monkeypatch.setattr(governance, "supersede_afm_review", fence_spy)
+
+    def make(route, principal):
+        route_now["name"] = route
+        from minni.db import SovereignDB
+        from minni.writeback import WriteBackMemory
+        import minni.config as cfg
+
+        class _Logger:
+            def __getattr__(self, _n):
+                return lambda *a, **k: None
+
+        return governance.GovernanceContext(
+            handler_principal=lambda p, r, **k: (principal, None),
+            lazy_writeback=lambda: WriteBackMemory(SovereignDB(), cfg.DEFAULT_CONFIG),
+            sovereign_db=SovereignDB,
+            make_response=lambda res, i: {"result": res},
+            make_error=lambda c, m, i: {"error": {"code": c, "message": m}},
+            logger=_Logger(),
+            index_durable_learning=lambda *a, **k: calls[route].append("indexed"),
+            maybe_archive_inbox_source=lambda *a, **k: calls[route].append("archived"),
+            lazy_episodic=lambda: None,
+            record_latency=lambda *a, **k: None,
+            increment_request_count=None,
+        )
+
+    content = "A durable learning that both routes will accept identically."
+    route_now["name"] = "auto"
+    auto = governance.handle_learn(
+        {"content": content}, 1, make("auto", _principal("agent-a", auto_accept_own=True))
+    )
+    auto = auto.get("result") or auto
+    assert auto["status"] == "accepted"
+
+    route_now["name"] = "manual"
+    staged = governance.handle_learn(
+        {"content": content + " Second."}, 2,
+        make("manual", _principal("agent-b", auto_accept_own=False)),
+    )
+    staged = staged.get("result") or staged
+    governance.resolve_candidate(
+        {"candidate_id": staged["candidate_id"], "decision": "accept", "reason": "ok"},
+        3, make("manual", _principal("operator", capabilities=["*"])),
+    )
+
+    assert calls["auto"] == calls["manual"] == ["indexed", "archived"], calls
+    assert len(fenced["auto"]) == 1 and len(fenced["manual"]) == 1, fenced
